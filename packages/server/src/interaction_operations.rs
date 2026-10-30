@@ -176,6 +176,84 @@ mod scoped_permission_tests {
         }
     }
 
+    #[test]
+    fn remembered_policy_survives_reopen_without_crossing_workspace_or_skill_identity() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("settings.db");
+        let key = SkillToolDecisionKey {
+            skill_ids: std::collections::BTreeSet::from([bcode_skill_models::SkillId(
+                "skill".into(),
+            )]),
+            tool_name: "filesystem.write".into(),
+            scope: bcode_skill_models::SkillToolDecisionScope::Workspace {
+                workspace_id: "workspace".into(),
+            },
+        };
+        for decision in [SkillToolDecision::Allow, SkillToolDecision::Deny] {
+            persist_skill_tool_decision(
+                &bcode_settings::SettingsStore::from_settings_db_path(&path),
+                key.clone(),
+                decision,
+            )
+            .unwrap();
+            let reopened = bcode_settings::SettingsStore::from_settings_db_path(&path);
+            let state = reopened.skill_tool_decisions().unwrap();
+            assert_eq!(state.decision_for(&key).unwrap().decision, decision);
+            let mut foreign = key.clone();
+            foreign.scope = bcode_skill_models::SkillToolDecisionScope::Workspace {
+                workspace_id: "other".into(),
+            };
+            assert!(state.decision_for(&foreign).is_none());
+            foreign = key.clone();
+            foreign
+                .skill_ids
+                .insert(bcode_skill_models::SkillId("other".into()));
+            assert!(state.decision_for(&foreign).is_none());
+            foreign = key.clone();
+            foreign.tool_name = "filesystem.read".into();
+            assert!(state.decision_for(&foreign).is_none());
+        }
+        // A directory cannot be opened as a settings database. Failure must be observable,
+        // and must not overwrite the previously committed remembered decision.
+        assert!(
+            persist_skill_tool_decision(
+                &bcode_settings::SettingsStore::from_settings_db_path(root.path()),
+                key.clone(),
+                SkillToolDecision::Allow
+            )
+            .is_err()
+        );
+        assert_eq!(
+            bcode_settings::SettingsStore::from_settings_db_path(path)
+                .skill_tool_decisions()
+                .unwrap()
+                .decision_for(&key)
+                .unwrap()
+                .decision,
+            SkillToolDecision::Deny
+        );
+    }
+
+    async fn register_checkpoint(state: &ServerState, permission: &PendingPermission) {
+        let summary = &permission.summary;
+        register_pending_permission(
+            state,
+            permission,
+            bcode_session_models::SessionEventKind::PermissionRequested {
+                permission_id: summary.permission_id.clone(),
+                tool_call_id: summary.tool_call_id.clone(),
+                producer_plugin_id: Some("test".into()),
+                tool_name: summary.tool_name.clone(),
+                arguments_json: summary.arguments_json.clone(),
+                batch: summary.batch.clone(),
+                policy_source: summary.policy_source.clone(),
+                policy_reason: summary.policy_reason.clone(),
+            },
+        )
+        .await
+        .expect("durable checkpoint admission");
+    }
+
     async fn fixture() -> (
         Arc<ServerState>,
         SessionId,
@@ -200,10 +278,8 @@ mod scoped_permission_tests {
         );
         let first = checkpoint(session.id, "first", 0, 2);
         let second = checkpoint(session.id, "second", 1, 2);
-        state.pending_permissions.lock().await.extend([
-            ("first".into(), first.clone()),
-            ("second".into(), second.clone()),
-        ]);
+        register_checkpoint(&state, &first).await;
+        register_checkpoint(&state, &second).await;
         (state, session.id, first, second)
     }
 
@@ -233,6 +309,74 @@ mod scoped_permission_tests {
                 .collect(),
             approved: true,
             remember: false,
+        }
+    }
+
+    #[tokio::test]
+    async fn conditional_individual_matches_native_decision_and_never_retries_a_commit() {
+        for approved in [false, true] {
+            let (state, session, _, _) = fixture().await;
+            let mut browser = checkpoint(session, "browser", 0, 1);
+            browser.summary.batch = None;
+            let mut native = browser.clone();
+            native.summary.permission_id = "native".into();
+            native.decision = Arc::new(Mutex::new(None));
+            register_checkpoint(&state, &browser).await;
+            register_checkpoint(&state, &native).await;
+            let ScopedPermissionLookup::Ready { checkpoints, .. } = scoped_permissions(
+                &state,
+                ScopedPermissionQuery {
+                    session_id: session,
+                    batch_id: None,
+                    after_permission_id: None,
+                    limit: MAX_SCOPED_PERMISSION_CHECKPOINTS,
+                },
+            )
+            .await
+            else {
+                panic!("canonical checkpoint observation");
+            };
+            let request = ConditionalPermissionDecision {
+                session_id: session,
+                batch_id: None,
+                expected: checkpoints
+                    .into_iter()
+                    .filter(|value| value.identity.permission_id == "browser")
+                    .map(|value| value.identity)
+                    .collect(),
+                approved,
+                remember: false,
+            };
+            assert_eq!(
+                resolve_permissions_conditional(&state, request.clone()).await,
+                ConditionalPermissionResult::Resolved { resolved: 1 }
+            );
+            assert!(resolve_permission(&state, "native", approved, false).await);
+            assert_eq!(*browser.decision.lock().await, Some(approved));
+            assert_eq!(*native.decision.lock().await, Some(approved));
+            let committed = state.sessions.session_history(session).await.unwrap();
+            for id in ["browser", "native"] {
+                assert_eq!(
+                    committed
+                        .iter()
+                        .filter(|event| matches!(
+                            &event.kind,
+                            bcode_session_models::SessionEventKind::PermissionResolved {
+                                permission_id, approved: decision,
+                            } if permission_id == id && *decision == approved
+                        ))
+                        .count(),
+                    1
+                );
+            }
+            assert_eq!(
+                resolve_permissions_conditional(&state, request).await,
+                ConditionalPermissionResult::Stale
+            );
+            assert_eq!(
+                state.sessions.session_history(session).await.unwrap(),
+                committed
+            );
         }
     }
 
@@ -910,17 +1054,26 @@ pub fn remembered_skill_tool_decision(key: &SkillToolDecisionKey) -> Option<Skil
 }
 
 fn remember_skill_tool_decision(key: SkillToolDecisionKey, decision: SkillToolDecision) {
-    let store = bcode_settings::SettingsStore::default();
-    let Ok(mut state) = store.skill_tool_decisions() else {
-        return;
-    };
+    if let Err(error) =
+        persist_skill_tool_decision(&bcode_settings::SettingsStore::default(), key, decision)
+    {
+        tracing::warn!(%error, "permission resolved but remember-policy persistence failed");
+    }
+}
+
+fn persist_skill_tool_decision(
+    store: &bcode_settings::SettingsStore,
+    key: SkillToolDecisionKey,
+    decision: SkillToolDecision,
+) -> bcode_settings::SettingsResult<()> {
+    let mut state = store.skill_tool_decisions()?;
     state.upsert(bcode_skill_models::SkillToolDecisionEntry {
         key,
         decision,
         remembered_at_ms: current_time_ms(),
         reason: Some("remembered from permission dialog".to_owned()),
     });
-    let _ = store.save_skill_tool_decisions(&state, current_time_ms());
+    store.save_skill_tool_decisions(&state, current_time_ms())
 }
 
 /// Allocate the next process-local pending permission identity.
@@ -1934,18 +2087,117 @@ async fn resolve_permission_batch_owned(
 
 /// Validate and execute one complete server-owned tool exchange lifecycle.
 ///
-/// Invocation identity is checked before registration, and absence of any compatible consumer is
-/// surfaced without creating pending state.
+/// Invocation identity is checked before registration. Explicit producer checkpoints
+/// commit before readiness; durable waits are not terminalized for consumer absence.
+/// With publication disabled, consumer admission retains the legacy behavior.
 ///
 /// # Errors
 ///
 /// Returns a normalized failure when the exchange identity is already pending.
 pub async fn execute_tool_exchange(
-    state: &ServerState,
+    state: &Arc<ServerState>,
     session_id: SessionId,
     tool_call_id: &str,
     request: &bcode_session_models::ToolExchangeRequest,
     cancel_state: &TurnCancelState,
+) -> Result<ToolExchangeResolution, String> {
+    Box::pin(execute_tool_exchange_inner(
+        state,
+        session_id,
+        tool_call_id,
+        request,
+        cancel_state,
+        None,
+    ))
+    .await
+}
+
+/// Execute an exchange whose canonical request append has already committed.
+/// Exact ID reads establish both source locators without a history scan.
+///
+/// # Errors
+/// Rejects duplicate registration. Unverifiable canonical admission preserves the
+/// unresolved invocation until explicit cancellation, never returning a false terminal failure.
+pub async fn execute_tool_exchange_committed(
+    state: &Arc<ServerState>,
+    session_id: SessionId,
+    tool_call_id: &str,
+    request: &bcode_session_models::ToolExchangeRequest,
+    cancel_state: &TurnCancelState,
+    exchange_sequence: u64,
+) -> Result<ToolExchangeResolution, String> {
+    if !crate::durable_interaction::PUBLICATION_ENABLED {
+        return Box::pin(execute_tool_exchange(
+            state,
+            session_id,
+            tool_call_id,
+            request,
+            cancel_state,
+        ))
+        .await;
+    }
+    let facts = state
+        .sessions
+        .durable_interaction_source(session_id, tool_call_id.into(), request.exchange_id.clone())
+        .await;
+    if let Ok(facts) = facts
+        && facts.exchange.sequence == exchange_sequence
+        && request.invocation_id == tool_call_id
+        && matches!(&facts.exchange.kind,
+                bcode_session_models::SessionEventKind::ToolExchangeRequested { request: original }
+                    if original == request)
+    {
+        return Box::pin(execute_tool_exchange_at(
+            state,
+            session_id,
+            tool_call_id,
+            request,
+            cancel_state,
+            facts.invocation.sequence,
+            facts.exchange.sequence,
+        ))
+        .await;
+    }
+    tracing::warn!(%session_id, exchange_id = %request.exchange_id,
+        "committed exchange source unavailable or conflicting; original invocation preserved");
+    cancel_state.cancelled().await;
+    Ok(ToolExchangeResolution::Cancelled)
+}
+
+/// Execute after the broker retained the exact canonical invocation/exchange sequences.
+/// These locators are re-read and compared with the complete original request before
+/// producer export; they are not execution authority or consumer-supplied proof.
+///
+/// # Errors
+/// Rejects duplicate registration. Durable admission failures preserve the original
+/// invocation wait until explicit cancellation rather than returning a terminal error.
+pub async fn execute_tool_exchange_at(
+    state: &Arc<ServerState>,
+    session_id: SessionId,
+    tool_call_id: &str,
+    request: &bcode_session_models::ToolExchangeRequest,
+    cancel_state: &TurnCancelState,
+    invocation_sequence: u64,
+    exchange_sequence: u64,
+) -> Result<ToolExchangeResolution, String> {
+    Box::pin(execute_tool_exchange_inner(
+        state,
+        session_id,
+        tool_call_id,
+        request,
+        cancel_state,
+        Some((invocation_sequence, exchange_sequence)),
+    ))
+    .await
+}
+
+async fn execute_tool_exchange_inner(
+    state: &Arc<ServerState>,
+    session_id: SessionId,
+    tool_call_id: &str,
+    request: &bcode_session_models::ToolExchangeRequest,
+    cancel_state: &TurnCancelState,
+    sequences: Option<(u64, u64)>,
 ) -> Result<ToolExchangeResolution, String> {
     if request.invocation_id != tool_call_id {
         return Ok(ToolExchangeResolution::Failed {
@@ -1953,10 +2205,32 @@ pub async fn execute_tool_exchange(
             message: "exchange does not belong to the active tool invocation".to_owned(),
         });
     }
-    if !has_exchange_consumer(state, request).await {
+    if !crate::durable_interaction::PUBLICATION_ENABLED
+        && !has_exchange_consumer(state, request).await
+    {
         return Ok(ToolExchangeResolution::NoCompatibleConsumer);
     }
-    request_tool_exchange(state, session_id, request, cancel_state).await
+    match sequences {
+        Some(sequences) => {
+            Box::pin(request_tool_exchange_inner(
+                state,
+                session_id,
+                request,
+                cancel_state,
+                Some(sequences),
+            ))
+            .await
+        }
+        None => {
+            Box::pin(request_tool_exchange(
+                state,
+                session_id,
+                request,
+                cancel_state,
+            ))
+            .await
+        }
+    }
 }
 
 /// Register, recheck consumer availability, and await one tool exchange terminal outcome.
@@ -1965,13 +2239,50 @@ pub async fn execute_tool_exchange(
 ///
 /// Returns a normalized failure when the exchange identity is already pending.
 pub async fn request_tool_exchange(
-    state: &ServerState,
+    state: &Arc<ServerState>,
     session_id: SessionId,
     request: &bcode_session_models::ToolExchangeRequest,
     cancel_state: &TurnCancelState,
 ) -> Result<ToolExchangeResolution, String> {
-    let (resolution, notify) = register_pending_tool_exchange(state, session_id, request).await?;
-    if !has_exchange_consumer(state, request).await {
+    Box::pin(request_tool_exchange_inner(
+        state,
+        session_id,
+        request,
+        cancel_state,
+        None,
+    ))
+    .await
+}
+
+async fn request_tool_exchange_inner(
+    state: &Arc<ServerState>,
+    session_id: SessionId,
+    request: &bcode_session_models::ToolExchangeRequest,
+    cancel_state: &TurnCancelState,
+    sequences: Option<(u64, u64)>,
+) -> Result<ToolExchangeResolution, String> {
+    let (resolution, notify, durable) = match Box::pin(register_pending_tool_exchange_inner(
+        state, session_id, request, sequences,
+    ))
+    .await
+    {
+        Ok(registration) => registration,
+        Err(ExchangeRegistrationError::Duplicate) => {
+            return Err(format!(
+                "duplicate interactive tool request id: {}",
+                request.exchange_id
+            ));
+        }
+        Err(ExchangeRegistrationError::Durability(error)) => {
+            // Returning an ordinary error would allow the broker to append a terminal
+            // failure. Keep original canonical work alive and expose a stable diagnostic.
+            tracing::warn!(%session_id, exchange_id = %request.exchange_id, error = error.message(),
+                "durable exchange admission deferred; canonical invocation preserved");
+            cancel_state.cancelled().await;
+            return Ok(ToolExchangeResolution::Cancelled);
+        }
+    };
+    if !retain_without_consumer(Ok(durable)) && !has_exchange_consumer(state, request).await {
         return Ok(abort_tool_exchange(
             state,
             &request.exchange_id,
@@ -1987,6 +2298,20 @@ pub async fn request_tool_exchange(
         cancel_state,
     )
     .await)
+}
+
+/// Absence is conclusive only after a successful canonical check. Storage or
+/// producer uncertainty preserves evidence; it never authorizes detach cancellation.
+fn retain_without_consumer(
+    proof: Result<bool, bcode_plugin_models::interaction_controller::InteractionControllerError>,
+) -> bool {
+    proof != Ok(false)
+}
+
+#[derive(Debug)]
+enum ExchangeRegistrationError {
+    Duplicate,
+    Durability(bcode_plugin_models::interaction_controller::InteractionControllerError),
 }
 
 /// Return whether one connected client advertised a compatible exchange adapter.
@@ -2082,8 +2407,9 @@ async fn exchange_has_controller(
 /// # Errors
 ///
 /// Returns a normalized failure when the exchange identity is already pending.
+#[cfg(test)]
 pub async fn register_pending_tool_exchange(
-    state: &ServerState,
+    state: &Arc<ServerState>,
     session_id: SessionId,
     request: &bcode_session_models::ToolExchangeRequest,
 ) -> Result<
@@ -2093,6 +2419,75 @@ pub async fn register_pending_tool_exchange(
     ),
     String,
 > {
+    Box::pin(register_pending_tool_exchange_inner(
+        state, session_id, request, None,
+    ))
+    .await
+    .map(|(resolution, notify, _)| (resolution, notify))
+    .map_err(|error| match error {
+        ExchangeRegistrationError::Duplicate => format!(
+            "duplicate interactive tool request id: {}",
+            request.exchange_id
+        ),
+        ExchangeRegistrationError::Durability(error) => error.message().into(),
+    })
+}
+
+async fn register_pending_tool_exchange_inner(
+    state: &Arc<ServerState>,
+    session_id: SessionId,
+    request: &bcode_session_models::ToolExchangeRequest,
+    sequences: Option<(u64, u64)>,
+) -> Result<
+    (
+        Arc<Mutex<Option<ToolExchangeResolution>>>,
+        Arc<tokio::sync::Notify>,
+        bool,
+    ),
+    ExchangeRegistrationError,
+> {
+    Box::pin(register_exchange_after_checkpoint(
+        state,
+        session_id,
+        request,
+        crate::durable_interaction::prepare_wait_before_ready(
+            state, session_id, request, sequences,
+        ),
+    ))
+    .await
+}
+
+async fn register_exchange_after_checkpoint(
+    state: &Arc<ServerState>,
+    session_id: SessionId,
+    request: &bcode_session_models::ToolExchangeRequest,
+    checkpoint: impl std::future::Future<
+        Output = Result<
+            bool,
+            bcode_plugin_models::interaction_controller::InteractionControllerError,
+        >,
+    >,
+) -> Result<
+    (
+        Arc<Mutex<Option<ToolExchangeResolution>>>,
+        Arc<tokio::sync::Notify>,
+        bool,
+    ),
+    ExchangeRegistrationError,
+> {
+    if state
+        .pending_tool_exchanges
+        .lock()
+        .await
+        .contains_key(&request.exchange_id)
+    {
+        return Err(ExchangeRegistrationError::Duplicate);
+    }
+    // Pure producer Open/Export and canonical CAS finish before registry insertion,
+    // notification, or returning readiness to the original tool.
+    let durable = checkpoint
+        .await
+        .map_err(ExchangeRegistrationError::Durability)?;
     let route = state
         .session_current_turn(session_id)
         .await
@@ -2110,19 +2505,37 @@ pub async fn register_pending_tool_exchange(
     let notify = Arc::clone(&pending.notify);
     let mut exchanges = state.pending_tool_exchanges.lock().await;
     if exchanges.contains_key(&request.exchange_id) {
-        return Err(format!(
-            "duplicate interactive tool request id: {}",
-            request.exchange_id
-        ));
+        return Err(ExchangeRegistrationError::Duplicate);
     }
     exchanges.insert(request.exchange_id.clone(), pending);
     drop(exchanges);
     notify_route_destination(state, route.as_ref()).await;
-    Ok((resolution, notify))
+    Ok((resolution, notify, durable))
 }
 
 /// Resolve pending exchanges that no longer have any compatible connected consumer.
-pub async fn resolve_exchanges_without_consumers(state: &ServerState) {
+pub async fn resolve_exchanges_without_consumers(state: &Arc<ServerState>) {
+    resolve_exchanges_with_retention(state, |candidate| async move {
+        crate::durable_interaction::retain_wait_on_detach(
+            state,
+            candidate.session_id,
+            &candidate.request,
+        )
+        .await
+    })
+    .await;
+}
+
+async fn resolve_exchanges_with_retention<F, Fut>(state: &Arc<ServerState>, retention: F)
+where
+    F: Fn(PendingToolExchangeSummary) -> Fut,
+    Fut: std::future::Future<
+            Output = Result<
+                bool,
+                bcode_plugin_models::interaction_controller::InteractionControllerError,
+            >,
+        >,
+{
     // Discovery runs outside all lifecycle/client/pending locks. Recheck current
     // connected capabilities at commit so a detached caller never confers authority.
     let candidates = state
@@ -2130,11 +2543,23 @@ pub async fn resolve_exchanges_without_consumers(state: &ServerState) {
         .lock()
         .await
         .values()
-        .map(|exchange| exchange.summary.request.clone())
+        .map(|exchange| exchange.summary.clone())
         .collect::<Vec<_>>();
+    let mut durable_retained = BTreeMap::new();
+    for candidate in &candidates {
+        let proof = retention(candidate.clone()).await;
+        if let Err(error) = proof {
+            tracing::warn!(session_id = %candidate.session_id,
+                exchange_id = %candidate.request.exchange_id, error = error.message(),
+                "durable detach verification deferred; canonical wait preserved");
+        }
+        if retain_without_consumer(proof) {
+            durable_retained.insert(candidate.request.exchange_id.clone(), candidate.clone());
+        }
+    }
     let candidate_ids = candidates
         .iter()
-        .map(|request| request.exchange_id.clone())
+        .map(|summary| summary.request.exchange_id.clone())
         .collect::<std::collections::BTreeSet<_>>();
     let mut controller_routes = std::collections::BTreeSet::new();
     let semantic = state
@@ -2149,7 +2574,8 @@ pub async fn resolve_exchanges_without_consumers(state: &ServerState) {
         });
     let mut inspected_routes = std::collections::BTreeSet::new();
     if semantic {
-        for request in &candidates {
+        for candidate in &candidates {
+            let request = &candidate.request;
             let identity = (
                 request.producer_id.clone(),
                 request.schema.clone(),
@@ -2171,7 +2597,11 @@ pub async fn resolve_exchanges_without_consumers(state: &ServerState) {
             let request = &exchange.summary.request;
             // Requests registered while discovery was in flight perform their own
             // consumer admission; this cleanup pass has no evidence about them.
-            if !candidate_ids.contains(&request.exchange_id) {
+            if !candidate_ids.contains(&request.exchange_id)
+                || durable_retained
+                    .get(&request.exchange_id)
+                    .is_some_and(|candidate| candidate == &exchange.summary)
+            {
                 return true;
             }
             contexts.values().any(|context| {
@@ -2436,7 +2866,9 @@ mod controller_consumer_tests {
 
     #[tokio::test]
     async fn settled_owner_cleanup_releases_abandoned_exchange_without_touching_sibling() {
-        let state = crate::tests::test_server_state(bcode_session::SessionManager::default());
+        let state = Arc::new(crate::tests::test_server_state(
+            bcode_session::SessionManager::default(),
+        ));
         let session = SessionId::new();
         let sibling = SessionId::new();
         let request = bcode_session_models::ToolExchangeRequest {
@@ -2507,8 +2939,227 @@ mod controller_consumer_tests {
     }
 
     #[tokio::test]
+    async fn committed_terminal_release_wakes_original_wait_without_reopening() {
+        let state = Arc::new(crate::tests::test_server_state(
+            bcode_session::SessionManager::default(),
+        ));
+        let request = bcode_session_models::ToolExchangeRequest {
+            invocation_id: "committed-call".into(),
+            exchange_id: "committed-exchange".into(),
+            producer_id: "test".into(),
+            schema: "test.request".into(),
+            schema_version: 1,
+            payload: serde_json::Value::Null,
+            response_policy: bcode_session_models::ToolExchangeResponsePolicy::Required,
+        };
+        let (resolution, notify) =
+            register_pending_tool_exchange(&state, SessionId::new(), &request)
+                .await
+                .unwrap();
+        let notified = notify.notified();
+        tokio::pin!(notified);
+        notified.as_mut().enable();
+        let controllers = state.interaction_controllers.lock().await;
+        assert!(
+            complete_tool_exchange_under_controller_lock(
+                &state,
+                &request.exchange_id,
+                ToolExchangeResolution::Cancelled
+            )
+            .await
+        );
+        assert_eq!(
+            *resolution.lock().await,
+            Some(ToolExchangeResolution::Cancelled)
+        );
+        tokio::time::timeout(std::time::Duration::from_millis(100), notified)
+            .await
+            .unwrap();
+        assert!(
+            !complete_tool_exchange_under_controller_lock(
+                &state,
+                &request.exchange_id,
+                ToolExchangeResolution::Responded {
+                    payload: serde_json::json!({"stale": true})
+                }
+            )
+            .await
+        );
+        assert_eq!(
+            *resolution.lock().await,
+            Some(ToolExchangeResolution::Cancelled)
+        );
+        assert!(state.pending_tool_exchanges.lock().await.is_empty());
+        drop(controllers);
+        drop(state);
+    }
+
+    #[tokio::test]
+    async fn durable_registration_is_invisible_until_checkpoint_commits() {
+        let state = Arc::new(crate::tests::test_server_state(
+            bcode_session::SessionManager::default(),
+        ));
+        let session = SessionId::new();
+        let request = bcode_session_models::ToolExchangeRequest {
+            invocation_id: "before-ready-call".into(),
+            exchange_id: "before-ready-wait".into(),
+            producer_id: "test".into(),
+            schema: "test.request".into(),
+            schema_version: 1,
+            payload: serde_json::Value::Null,
+            response_policy: bcode_session_models::ToolExchangeResponsePolicy::Required,
+        };
+        let (commit, checkpoint) = tokio::sync::oneshot::channel();
+        {
+            let registration =
+                register_exchange_after_checkpoint(&state, session, &request, async {
+                    checkpoint.await.unwrap()
+                });
+            tokio::pin!(registration);
+            assert!(
+                tokio::time::timeout(std::time::Duration::from_millis(10), &mut registration)
+                    .await
+                    .is_err()
+            );
+            assert!(list_pending_tool_exchanges(&state).await.is_empty());
+            commit.send(Ok(true)).unwrap();
+            let (_, _, durable) = registration.await.unwrap();
+            assert!(durable);
+            assert_eq!(list_pending_tool_exchanges(&state).await.len(), 1);
+        }
+        drop(state);
+    }
+
+    #[tokio::test]
+    async fn failed_durable_checkpoint_does_not_advertise_pending_request() {
+        let state = Arc::new(crate::tests::test_server_state(
+            bcode_session::SessionManager::default(),
+        ));
+        let request = bcode_session_models::ToolExchangeRequest {
+            invocation_id: "failed-call".into(),
+            exchange_id: "failed-wait".into(),
+            producer_id: "test".into(),
+            schema: "test.request".into(),
+            schema_version: 1,
+            payload: serde_json::Value::Null,
+            response_policy: bcode_session_models::ToolExchangeResponsePolicy::Required,
+        };
+        let result = register_exchange_after_checkpoint(&state, SessionId::new(), &request, async {
+            Err(bcode_plugin_models::interaction_controller::InteractionControllerError::Unavailable)
+        }).await;
+        assert!(matches!(
+            result,
+            Err(ExchangeRegistrationError::Durability(_))
+        ));
+        assert!(list_pending_tool_exchanges(&state).await.is_empty());
+        drop(state);
+    }
+
+    #[tokio::test]
+    async fn detach_preserves_durable_wait_and_legacy_wait_still_resolves() {
+        let state = Arc::new(crate::tests::test_server_state(
+            bcode_session::SessionManager::default(),
+        ));
+        let session = SessionId::new();
+        let durable = bcode_session_models::ToolExchangeRequest {
+            invocation_id: "durable-call".into(),
+            exchange_id: "durable-wait".into(),
+            producer_id: "test".into(),
+            schema: "test.request".into(),
+            schema_version: 1,
+            payload: serde_json::Value::Null,
+            response_policy: bcode_session_models::ToolExchangeResponsePolicy::Required,
+        };
+        let mut legacy = durable.clone();
+        legacy.invocation_id = "legacy-call".into();
+        legacy.exchange_id = "legacy-wait".into();
+        let (durable_resolution, _) = register_pending_tool_exchange(&state, session, &durable)
+            .await
+            .unwrap();
+        let (legacy_resolution, _) = register_pending_tool_exchange(&state, session, &legacy)
+            .await
+            .unwrap();
+        resolve_exchanges_with_retention(&state, |candidate| async move {
+            Ok(candidate.request.exchange_id == "durable-wait")
+        })
+        .await;
+        assert!(durable_resolution.lock().await.is_none());
+        assert_eq!(
+            *legacy_resolution.lock().await,
+            Some(ToolExchangeResolution::ConsumerDetached)
+        );
+        let pending = state.pending_tool_exchanges.lock().await;
+        assert!(pending.contains_key(&durable.exchange_id));
+        assert!(!pending.contains_key(&legacy.exchange_id));
+        drop(pending);
+        drop(state);
+    }
+
+    #[tokio::test]
+    async fn detach_unavailable_canonical_proof_preserves_wait_without_answering() {
+        let state = Arc::new(crate::tests::test_server_state(
+            bcode_session::SessionManager::default(),
+        ));
+        let session = SessionId::new();
+        let request = bcode_session_models::ToolExchangeRequest {
+            invocation_id: "uncertain-call".into(),
+            exchange_id: "uncertain-wait".into(),
+            producer_id: "test".into(),
+            schema: "test.request".into(),
+            schema_version: 1,
+            payload: serde_json::Value::Null,
+            response_policy: bcode_session_models::ToolExchangeResponsePolicy::Required,
+        };
+        let (resolution, _) = register_pending_tool_exchange(&state, session, &request)
+            .await
+            .unwrap();
+        resolve_exchanges_with_retention(&state, |_| async {
+            Err(bcode_plugin_models::interaction_controller::InteractionControllerError::Unavailable)
+        }).await;
+        assert!(resolution.lock().await.is_none());
+        assert!(
+            state
+                .pending_tool_exchanges
+                .lock()
+                .await
+                .contains_key(&request.exchange_id)
+        );
+    }
+
+    #[tokio::test]
+    async fn disabled_publication_keeps_legacy_no_consumer_outcome() {
+        let state = Arc::new(crate::tests::test_server_state(
+            bcode_session::SessionManager::default(),
+        ));
+        let request = bcode_session_models::ToolExchangeRequest {
+            invocation_id: "legacy-call".into(),
+            exchange_id: "legacy-wait".into(),
+            producer_id: "test".into(),
+            schema: "test.request".into(),
+            schema_version: 1,
+            payload: serde_json::Value::Null,
+            response_policy: bcode_session_models::ToolExchangeResponsePolicy::Required,
+        };
+        assert_eq!(
+            execute_tool_exchange(
+                &state,
+                SessionId::new(),
+                &request.invocation_id,
+                &request,
+                &TurnCancelState::default()
+            )
+            .await
+            .unwrap(),
+            ToolExchangeResolution::NoCompatibleConsumer
+        );
+        assert!(state.pending_tool_exchanges.lock().await.is_empty());
+    }
+
+    #[tokio::test]
     async fn canonical_cancel_notifies_pending_waiters_and_stale_effect_cannot_reopen() {
-        let state = crate::tests::test_server_state(bcode_session::SessionManager::default());
+        let state = Arc::new(crate::tests::test_server_state(
+            bcode_session::SessionManager::default(),
+        ));
         let session = SessionId::new();
         let request = bcode_session_models::ToolExchangeRequest {
             invocation_id: "cancel-invocation".into(),

@@ -1,0 +1,3966 @@
+use bcode_plugin_sdk::path::display;
+use bcode_plugin_sdk::prelude::*;
+use bcode_tool::{
+    ImageMetadata, ImageRefContent, ListToolsRequest, OP_INVOKE_TOOL, OP_LIST_TOOLS,
+    TOOL_SERVICE_INTERFACE_ID, ToolArtifact, ToolDefinition, ToolInvocationLifecycleEvent,
+    ToolInvocationLifecycleStage, ToolInvocationRequest, ToolInvocationResponse,
+    ToolInvocationResult, ToolList, ToolResultContent,
+};
+use serde::{Deserialize, Serialize};
+use serde_json::json;
+use std::fmt::Write as _;
+use std::io::Read;
+use std::path::{Path, PathBuf};
+use std::process::{Child, Command, ExitStatus, Stdio};
+use std::time::{Duration, Instant};
+
+#[cfg(unix)]
+use std::os::unix::process::CommandExt;
+
+const FILESYSTEM_INTERFACE_ID: &str = "bcode.filesystem/v1";
+const DEFAULT_SEARCH_TIMEOUT_MS: u64 = 30_000;
+const DEFAULT_GREP_MAX_MATCHES: usize = 100;
+const DEFAULT_FIND_MAX_RESULTS: usize = 1_000;
+const DEFAULT_LIST_MAX_ENTRIES: usize = 1_000;
+const MAX_EXTERNAL_OUTPUT_BYTES: usize = 4 * 1024 * 1024;
+const MAX_RUST_GREP_FILE_BYTES: u64 = 4 * 1024 * 1024;
+#[cfg(unix)]
+const TERMINATION_GRACE_MS: u64 = 500;
+const DEFAULT_READ_MAX_LINES: usize = 1_000;
+const DEFAULT_READ_MAX_BYTES: usize = 256 * 1024;
+const DEFAULT_ARTIFACT_READ_MAX_BYTES: usize = 64 * 1024;
+const DEFAULT_ARTIFACT_GREP_MAX_MATCHES: usize = 100;
+const FILESYSTEM_PLUGIN_ID: &str = "bcode.filesystem";
+const FILESYSTEM_REQUEST_SCHEMA: &str = "bcode.filesystem.request";
+
+/// filesystem plugin.
+#[derive(Default)]
+pub struct FilesystemPlugin;
+
+impl RustPlugin for FilesystemPlugin {
+    fn invoke_service(&mut self, context: NativeServiceContext) -> ServiceResponse {
+        match context.request.interface_id.as_str() {
+            FILESYSTEM_INTERFACE_ID => invoke_filesystem_service(&context),
+            TOOL_SERVICE_INTERFACE_ID => invoke_tool_service(&context),
+            _ => ServiceResponse::error(
+                "unsupported_interface",
+                "unsupported filesystem plugin service interface",
+            ),
+        }
+    }
+}
+
+struct ProgressReporter {
+    events: ServiceEventEmitter,
+    tool_call_id: String,
+    sequence: u64,
+    next_visited_report: usize,
+}
+
+fn progress_lifecycle_event(
+    invocation_id: &str,
+    sequence: u64,
+    message: String,
+) -> ToolInvocationLifecycleEvent {
+    ToolInvocationLifecycleEvent {
+        invocation_id: invocation_id.to_owned(),
+        sequence,
+        stage: ToolInvocationLifecycleStage::Progress,
+        message: Some(message),
+        metadata: serde_json::Value::Null,
+    }
+}
+
+impl ProgressReporter {
+    const fn new(events: ServiceEventEmitter, tool_call_id: String) -> Self {
+        Self {
+            events,
+            tool_call_id,
+            sequence: 0,
+            next_visited_report: 250,
+        }
+    }
+
+    fn emit(&mut self, message: impl Into<String>) {
+        self.sequence = self.sequence.saturating_add(1);
+        let event = progress_lifecycle_event(&self.tool_call_id, self.sequence, message.into());
+        if let Ok(payload) = serde_json::to_vec(&event) {
+            self.events.emit(&payload);
+        }
+    }
+
+    fn maybe_visited(&mut self, kind: &str, visited_entries: usize) {
+        if visited_entries >= self.next_visited_report {
+            self.emit(format!("{kind}: visited {visited_entries} entries"));
+            self.next_visited_report = self.next_visited_report.saturating_add(250);
+        }
+    }
+}
+
+#[derive(Default)]
+struct ProgressSummary {
+    matches: usize,
+    bytes_scanned: u64,
+}
+
+#[derive(Debug, Deserialize)]
+struct ReadRequest {
+    path: PathBuf,
+    #[serde(default)]
+    offset: Option<usize>,
+    #[serde(default)]
+    limit: Option<usize>,
+}
+
+#[derive(Debug, Serialize)]
+struct ReadResponse {
+    contents: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct WriteRequest {
+    path: PathBuf,
+    contents: String,
+}
+
+#[derive(Debug, Serialize)]
+struct WriteResponse {
+    bytes_written: usize,
+}
+
+#[derive(Debug, Deserialize)]
+struct EditRequest {
+    path: PathBuf,
+    old_text: String,
+    new_text: String,
+}
+
+#[derive(Debug, Serialize)]
+struct EditResponse {
+    replacements: usize,
+}
+
+#[derive(Debug, Deserialize)]
+struct ExistsRequest {
+    path: PathBuf,
+}
+
+#[derive(Debug, Serialize)]
+struct ExistsResponse {
+    exists: bool,
+}
+
+#[derive(Debug, Deserialize)]
+struct ListRequest {
+    path: PathBuf,
+    #[serde(default)]
+    recursive: bool,
+    #[serde(default)]
+    max_entries: Option<usize>,
+    #[serde(default)]
+    timeout_ms: Option<u64>,
+}
+
+#[derive(Debug, Serialize)]
+struct ListEntry {
+    path: String,
+    kind: String,
+}
+
+#[derive(Debug, Serialize)]
+struct ListResponse {
+    entries: Vec<ListEntry>,
+    backend: String,
+    timed_out: bool,
+    partial: bool,
+    visited_entries: usize,
+    message: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct FindRequest {
+    path: PathBuf,
+    pattern: String,
+    #[serde(default)]
+    max_results: Option<usize>,
+    #[serde(default)]
+    timeout_ms: Option<u64>,
+}
+
+#[derive(Debug, Serialize)]
+struct FindResponse {
+    paths: Vec<String>,
+    backend: String,
+    timed_out: bool,
+    partial: bool,
+    visited_entries: usize,
+    message: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct GrepRequest {
+    path: PathBuf,
+    pattern: String,
+    #[serde(default)]
+    glob: Option<String>,
+    #[serde(default)]
+    ignore_case: bool,
+    #[serde(default)]
+    max_matches: Option<usize>,
+    #[serde(default)]
+    timeout_ms: Option<u64>,
+}
+
+#[derive(Debug, Serialize)]
+struct GrepMatch {
+    path: String,
+    line_number: usize,
+    line: String,
+}
+
+#[derive(Debug, Serialize)]
+struct GrepResponse {
+    matches: Vec<GrepMatch>,
+    backend: String,
+    timed_out: bool,
+    partial: bool,
+    visited_entries: usize,
+    message: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ArtifactMetadataRequest {
+    path: PathBuf,
+}
+
+#[derive(Debug, Serialize)]
+struct ArtifactMetadataResponse {
+    path: String,
+    exists: bool,
+    kind: String,
+    byte_len: Option<u64>,
+    content_type: Option<String>,
+    complete: Option<bool>,
+    message: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ArtifactReadRequest {
+    path: PathBuf,
+    #[serde(default)]
+    offset_bytes: Option<u64>,
+    #[serde(default)]
+    max_bytes: Option<usize>,
+    #[serde(default)]
+    from_end: bool,
+}
+
+#[derive(Debug, Serialize)]
+struct ArtifactReadResponse {
+    path: String,
+    offset_bytes: u64,
+    returned_bytes: usize,
+    total_bytes: u64,
+    from_end: bool,
+    truncated: bool,
+    contents: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct ArtifactGrepRequest {
+    path: PathBuf,
+    pattern: String,
+    #[serde(default)]
+    ignore_case: bool,
+    #[serde(default)]
+    max_matches: Option<usize>,
+}
+
+#[derive(Debug, Serialize)]
+struct ArtifactGrepResponse {
+    path: String,
+    matches: Vec<GrepMatch>,
+    total_bytes: u64,
+    partial: bool,
+    message: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct StatRequest {
+    path: PathBuf,
+}
+
+#[derive(Debug, Serialize)]
+struct StatResponse {
+    exists: bool,
+    kind: String,
+    len: Option<u64>,
+}
+
+fn invoke_filesystem_service(context: &NativeServiceContext) -> ServiceResponse {
+    let request = &context.request;
+    #[cfg(unix)]
+    let _mutation_guard = if matches!(request.operation.as_str(), "write" | "edit") {
+        match coordination::acquire(&|| context.cancellation.is_cancelled()) {
+            Ok(guard) => Some(guard),
+            Err(error) => return io_error(&error),
+        }
+    } else {
+        None
+    };
+    match request.operation.as_str() {
+        path_search::OP_SEARCH_PATHS => path_search::invoke(context),
+        "read" => read_file(request),
+        "write" => write_file(request),
+        "edit" => edit_file(request),
+        "exists" => path_exists(request),
+        "list" => list_directory_service(request),
+        "find" => find_paths_service(request),
+        "grep" => grep_files_service(request),
+        "stat" => stat_path_service(request),
+        _ => ServiceResponse::error(
+            "unsupported_operation",
+            "unsupported filesystem service operation",
+        ),
+    }
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+struct FilesystemPreparationDescriptor {
+    #[serde(default)]
+    workspace_root: Option<PathBuf>,
+    #[serde(default)]
+    path: Option<PathBuf>,
+}
+
+fn filesystem_workspace_root(
+    request: &bcode_tool::ToolPreparationRequest,
+) -> Result<Option<PathBuf>, String> {
+    let mut matching = request
+        .host_context
+        .iter()
+        .filter(|entry| entry.schema == bcode_tool::TOOL_WORKSPACE_CONTEXT_SCHEMA);
+    let Some(entry) = matching.next() else {
+        return Ok(None);
+    };
+    if matching.next().is_some() {
+        return Err("duplicate Filesystem workspace host context".to_owned());
+    }
+    if entry.schema_version != bcode_tool::TOOL_WORKSPACE_CONTEXT_SCHEMA_VERSION {
+        return Err(format!(
+            "unsupported Filesystem workspace host context version {}; expected {}",
+            entry.schema_version,
+            bcode_tool::TOOL_WORKSPACE_CONTEXT_SCHEMA_VERSION
+        ));
+    }
+    let root = entry
+        .payload
+        .get("working_directory")
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| {
+            "Filesystem workspace host context working_directory is missing".to_owned()
+        })?;
+    let root = PathBuf::from(root);
+    if !root.is_absolute() {
+        return Err("Filesystem workspace working directory must be absolute".to_owned());
+    }
+    Ok(Some(root))
+}
+
+fn filesystem_prepared_path(
+    request: &bcode_tool::ToolPreparationRequest,
+    workspace_root: Option<&Path>,
+) -> Result<Option<PathBuf>, String> {
+    let Some(path) = request
+        .invocation
+        .arguments
+        .get("path")
+        .and_then(serde_json::Value::as_str)
+        .map(PathBuf::from)
+    else {
+        return Ok(None);
+    };
+    if path.is_absolute() {
+        return Ok(Some(path));
+    }
+    let root = workspace_root
+        .ok_or_else(|| "Filesystem relative path requires workspace host context".to_owned())?;
+    Ok(Some(root.join(path)))
+}
+
+fn filesystem_policy_operation(
+    request: &bcode_tool::ToolPreparationRequest,
+    definition: &ToolDefinition,
+) -> Result<bcode_plugin_sdk::ToolPolicyPreparation, String> {
+    let workspace_root = filesystem_workspace_root(request)?;
+    if definition.name == "filesystem.multi_edit" {
+        if request.invocation.arguments.is_null() {
+            return Ok(bcode_plugin_sdk::ToolPolicyPreparation::new(
+                true,
+                bcode_plugin_sdk::ToolPolicyOperation::Write {
+                    paths: Vec::new(),
+                    category: "edit".to_owned(),
+                },
+            )
+            .with_identity(path_policy(&["edit"], "edit")));
+        }
+        let batch =
+            batch_request::prepare(&request.invocation.arguments, workspace_root.as_deref())?;
+        return Ok(bcode_plugin_sdk::ToolPolicyPreparation::new(
+            true,
+            bcode_plugin_sdk::ToolPolicyOperation::Write {
+                paths: batch
+                    .targets
+                    .iter()
+                    .map(|target| target.path.display().to_string())
+                    .collect(),
+                category: "edit".to_owned(),
+            },
+        )
+        .with_identity(path_policy(&["edit"], "edit"))
+        .with_descriptor(serde_json::to_value(batch).map_err(|error| error.to_string())?));
+    }
+    let path = filesystem_prepared_path(request, workspace_root.as_deref())?;
+    let paths = path
+        .as_ref()
+        .map(|path| path.display().to_string())
+        .into_iter()
+        .collect::<Vec<_>>();
+    let (requires_permission, identity, operation) = match definition.name.as_str() {
+        "filesystem.write" => (
+            true,
+            path_policy(&["write"], "write"),
+            bcode_plugin_sdk::ToolPolicyOperation::Write {
+                paths,
+                category: "write".to_owned(),
+            },
+        ),
+        "filesystem.edit" => (
+            true,
+            path_policy(&["edit"], "edit"),
+            bcode_plugin_sdk::ToolPolicyOperation::Write {
+                paths,
+                category: "edit".to_owned(),
+            },
+        ),
+        "filesystem.read" | "filesystem.exists" => (
+            false,
+            path_policy(&["read"], "read"),
+            bcode_plugin_sdk::ToolPolicyOperation::Read { paths },
+        ),
+        "filesystem.list" => (
+            false,
+            path_policy(&["ls", "read"], "read"),
+            bcode_plugin_sdk::ToolPolicyOperation::Read { paths },
+        ),
+        "filesystem.find" => (
+            false,
+            path_policy(&["find", "read"], "read"),
+            bcode_plugin_sdk::ToolPolicyOperation::Read { paths },
+        ),
+        "filesystem.grep" => (
+            false,
+            path_policy(&["grep", "read"], "read"),
+            bcode_plugin_sdk::ToolPolicyOperation::Read { paths },
+        ),
+        "filesystem.stat" => (
+            false,
+            path_policy(&["stat", "read"], "read"),
+            bcode_plugin_sdk::ToolPolicyOperation::Read { paths },
+        ),
+        "artifact.metadata" | "artifact.read" | "artifact.grep" => (
+            false,
+            bcode_plugin_sdk::ToolPolicyIdentity::default(),
+            bcode_plugin_sdk::ToolPolicyOperation::ReadOnly,
+        ),
+        name => return Err(format!("unsupported filesystem policy operation: {name}")),
+    };
+    Ok(
+        bcode_plugin_sdk::ToolPolicyPreparation::new(requires_permission, operation)
+            .with_identity(identity)
+            .with_descriptor(
+                serde_json::to_value(FilesystemPreparationDescriptor {
+                    workspace_root,
+                    path,
+                })
+                .map_err(|error| error.to_string())?,
+            ),
+    )
+}
+
+fn apply_filesystem_preparation(
+    arguments: &mut serde_json::Value,
+    descriptor: &FilesystemPreparationDescriptor,
+) -> Result<(), String> {
+    let object = arguments
+        .as_object_mut()
+        .ok_or_else(|| "Filesystem tool arguments must be an object".to_owned())?;
+    if !object.contains_key("path") {
+        return Ok(());
+    }
+    let path = descriptor
+        .path
+        .as_ref()
+        .ok_or_else(|| "Filesystem preparation descriptor is missing path".to_owned())?;
+    object.insert(
+        "path".to_owned(),
+        serde_json::Value::String(path.display().to_string()),
+    );
+    Ok(())
+}
+
+fn invoke_tool_service(context: &NativeServiceContext) -> ServiceResponse {
+    let request = &context.request;
+    match request.operation.as_str() {
+        OP_LIST_TOOLS => list_tools(request),
+        bcode_tool::OP_PREPARE_TOOL => {
+            prepare_tool_service_response(request, tool_definitions(), filesystem_policy_operation)
+        }
+        OP_INVOKE_TOOL => invoke_tool(context),
+        _ => ServiceResponse::error(
+            "unsupported_operation",
+            "unsupported tool service operation",
+        ),
+    }
+}
+
+fn list_tools(request: &ServiceRequest) -> ServiceResponse {
+    if let Err(error) = request.payload_json::<ListToolsRequest>() {
+        return invalid_request(&error);
+    }
+    json_response(&ToolList::with_runtime_stable_discovery(
+        tool_definitions(),
+        |tool| {
+            bcode_tool::ToolDiscoveryPolicy::new(!matches!(
+                tool.name.as_str(),
+                "filesystem.write" | "filesystem.edit" | "filesystem.multi_edit"
+            ))
+        },
+    ))
+}
+
+fn tool_definitions() -> Vec<ToolDefinition> {
+    vec![
+        read_tool_definition(),
+        write_tool_definition(),
+        edit_tool_definition(),
+        multi_edit_tool_definition(),
+        exists_tool_definition(),
+        list_tool_definition(),
+        find_tool_definition(),
+        grep_tool_definition(),
+        stat_tool_definition(),
+        artifact_metadata_tool_definition(),
+        artifact_read_tool_definition(),
+        artifact_grep_tool_definition(),
+    ]
+}
+
+fn path_policy(aliases: &[&str], category: &str) -> bcode_plugin_sdk::ToolPolicyIdentity {
+    bcode_plugin_sdk::ToolPolicyIdentity {
+        aliases: aliases.iter().map(ToString::to_string).collect(),
+        compatibility_aliases: compatibility_aliases_for(aliases),
+        capabilities: aliases
+            .iter()
+            .map(|alias| format!("filesystem.{alias}"))
+            .collect(),
+        permission_category: Some(category.to_string()),
+    }
+}
+
+fn compatibility_aliases_for(aliases: &[&str]) -> Vec<bcode_tool::ToolCompatibilityAlias> {
+    aliases
+        .iter()
+        .filter_map(|alias| match *alias {
+            "read" => Some("Read"),
+            "write" => Some("Write"),
+            "edit" => Some("Edit"),
+            "grep" => Some("Grep"),
+            "find" => Some("Glob"),
+            "ls" => Some("LS"),
+            _ => None,
+        })
+        .map(|name| bcode_tool::ToolCompatibilityAlias::new("claude", name))
+        .collect()
+}
+
+fn read_tool_definition() -> ToolDefinition {
+    ToolDefinition {
+        name: "filesystem.read".to_string(),
+        description: "Read a file. Supports UTF-8 text files and images (PNG, JPEG, GIF, WebP). Image files are returned as model-visible image attachments with metadata. If the user asks what text an image or screenshot says, use ocr.extract instead of this tool.".to_string(),
+        input_schema: json!({
+            "type": "object",
+            "required": ["path"],
+            "properties": {
+                "path": { "type": "string" },
+                "offset": { "type": "integer", "minimum": 1, "description": "1-indexed line number to start reading from for text files" },
+                "limit": { "type": "integer", "minimum": 1, "description": "Maximum number of text lines to return" }
+            }
+        }),
+    }
+}
+
+fn write_tool_definition() -> ToolDefinition {
+    ToolDefinition {
+        name: "filesystem.write".to_string(),
+        description: "Write a UTF-8 text file, creating parent directories. Emit the path argument before contents so live previews can identify the file type.".to_string(),
+        input_schema: json!({
+            "type": "object",
+            "required": ["path", "contents"],
+            "properties": {
+                "path": {
+                    "type": "string",
+                    "description": "Target file path. Provide this before contents."
+                },
+                "contents": {
+                    "type": "string",
+                    "description": "Complete UTF-8 file contents. Provide after path."
+                }
+            }
+        }),
+    }
+}
+
+fn multi_edit_tool_definition() -> ToolDefinition {
+    ToolDefinition {
+        name: "filesystem.multi_edit".to_owned(),
+        description: "Replace unique exact matches across existing UTF-8 files. All edits match original snapshots, not earlier replacements. Overlaps and duplicate targets are rejected. Validates the whole batch before writing; publication is per-file, not transactional. Inspect partial or unknown outcomes before retrying.".to_owned(),
+        input_schema: json!({
+            "type": "object", "additionalProperties": false, "required": ["files"],
+            "properties": {"files": {
+                "type": "array", "minItems": 1, "maxItems": 64,
+                "items": {"type": "object", "additionalProperties": false, "required": ["path", "edits"],
+                    "properties": {
+                        "path": {"type": "string", "minLength": 1},
+                        "edits": {"type": "array", "minItems": 1, "maxItems": 1024,
+                            "items": {"type": "object", "additionalProperties": false,
+                                "required": ["old_text", "new_text"],
+                                "properties": {
+                                    "old_text": {"type": "string", "minLength": 1},
+                                    "new_text": {"type": "string"}
+                                }
+                            }
+                        }
+                    }
+                }
+            }}
+        }),
+    }
+}
+
+fn edit_tool_definition() -> ToolDefinition {
+    ToolDefinition {
+        name: "filesystem.edit".to_string(),
+        description: "Replace one unique text occurrence in a UTF-8 text file. Emit the path argument before old_text and new_text so live previews can identify the file type.".to_string(),
+        input_schema: json!({
+            "type": "object",
+            "required": ["path", "old_text", "new_text"],
+            "properties": {
+                "path": {
+                    "type": "string",
+                    "description": "Target file path. Provide this before old_text and new_text."
+                },
+                "old_text": {
+                    "type": "string",
+                    "description": "Exact existing text to replace. Provide after path."
+                },
+                "new_text": {
+                    "type": "string",
+                    "description": "Replacement text. Provide after path."
+                }
+            }
+        }),
+    }
+}
+
+fn exists_tool_definition() -> ToolDefinition {
+    ToolDefinition {
+        name: "filesystem.exists".to_string(),
+        description: "Check whether a path exists".to_string(),
+        input_schema: json!({
+            "type": "object",
+            "required": ["path"],
+            "properties": { "path": { "type": "string" } }
+        }),
+    }
+}
+
+fn list_tool_definition() -> ToolDefinition {
+    ToolDefinition {
+        name: "filesystem.list".to_string(),
+        description: "List directory entries".to_string(),
+        input_schema: json!({
+            "type": "object",
+            "required": ["path"],
+            "properties": {
+                "path": { "type": "string" },
+                "recursive": { "type": "boolean" },
+                "max_entries": { "type": "integer", "minimum": 1 },
+                "timeout_ms": { "type": "integer", "minimum": 1 }
+            }
+        }),
+    }
+}
+
+fn find_tool_definition() -> ToolDefinition {
+    ToolDefinition {
+        name: "filesystem.find".to_string(),
+        description: "Find paths by simple glob pattern".to_string(),
+        input_schema: json!({
+            "type": "object",
+            "required": ["path", "pattern"],
+            "properties": {
+                "path": { "type": "string" },
+                "pattern": { "type": "string" },
+                "max_results": { "type": "integer", "minimum": 1 },
+                "timeout_ms": { "type": "integer", "minimum": 1 }
+            }
+        }),
+    }
+}
+
+fn grep_tool_definition() -> ToolDefinition {
+    ToolDefinition {
+        name: "filesystem.grep".to_string(),
+        description: "Search UTF-8 files for a literal text pattern".to_string(),
+        input_schema: json!({
+            "type": "object",
+            "required": ["path", "pattern"],
+            "properties": {
+                "path": { "type": "string" },
+                "pattern": { "type": "string" },
+                "glob": { "type": "string" },
+                "ignore_case": { "type": "boolean" },
+                "max_matches": { "type": "integer", "minimum": 1 },
+                "timeout_ms": { "type": "integer", "minimum": 1 }
+            }
+        }),
+    }
+}
+
+fn stat_tool_definition() -> ToolDefinition {
+    ToolDefinition {
+        name: "filesystem.stat".to_string(),
+        description: "Read filesystem metadata for a path".to_string(),
+        input_schema: json!({
+            "type": "object",
+            "required": ["path"],
+            "properties": { "path": { "type": "string" } }
+        }),
+    }
+}
+
+fn artifact_metadata_tool_definition() -> ToolDefinition {
+    ToolDefinition {
+        name: "artifact.metadata".to_string(),
+        description: "Read metadata for a saved tool-output artifact or trace blob".to_string(),
+        input_schema: json!({
+            "type": "object",
+            "required": ["path"],
+            "properties": { "path": { "type": "string" } }
+        }),
+    }
+}
+
+fn artifact_read_tool_definition() -> ToolDefinition {
+    ToolDefinition {
+        name: "artifact.read".to_string(),
+        description: "Read a bounded UTF-8 slice from a saved tool-output artifact. Supports byte offsets and tail reads without loading the whole artifact into model context.".to_string(),
+        input_schema: json!({
+            "type": "object",
+            "required": ["path"],
+            "properties": {
+                "path": { "type": "string" },
+                "offset_bytes": { "type": "integer", "minimum": 0, "description": "0-indexed byte offset to start reading from" },
+                "max_bytes": { "type": "integer", "minimum": 1, "description": "Maximum bytes to return" },
+                "from_end": { "type": "boolean", "description": "Read the last max_bytes bytes of the artifact" }
+            }
+        }),
+    }
+}
+
+fn artifact_grep_tool_definition() -> ToolDefinition {
+    ToolDefinition {
+        name: "artifact.grep".to_string(),
+        description: "Search a saved UTF-8 tool-output artifact for a literal text pattern"
+            .to_string(),
+        input_schema: json!({
+            "type": "object",
+            "required": ["path", "pattern"],
+            "properties": {
+                "path": { "type": "string" },
+                "pattern": { "type": "string" },
+                "ignore_case": { "type": "boolean" },
+                "max_matches": { "type": "integer", "minimum": 1 }
+            }
+        }),
+    }
+}
+
+fn filesystem_request_payload(operation: &str, arguments: &serde_json::Value) -> serde_json::Value {
+    arguments.as_object().map_or_else(
+        || json!({"operation": operation, "arguments": arguments}),
+        |arguments| {
+            let mut payload = arguments.clone();
+            payload.insert(
+                "operation".to_owned(),
+                serde_json::Value::String(operation.to_owned()),
+            );
+            serde_json::Value::Object(payload)
+        },
+    )
+}
+
+fn publish_filesystem_result_presentation(
+    presentation: &mut PrimaryPresentationPublisher,
+    response: &ToolInvocationResponse,
+) {
+    if let Some(ToolInvocationResult::Artifact { artifact }) = &response.result {
+        let _ = presentation.replace_as(
+            artifact.schema.clone(),
+            artifact.schema_version,
+            &artifact.metadata,
+        );
+    } else {
+        let payload = json!({
+            "output": response.output,
+            "is_error": response.is_error,
+        });
+        let _ = presentation.replace_as("bcode.filesystem.result", 1, &payload);
+    }
+}
+
+fn invoke_tool(context: &NativeServiceContext) -> ServiceResponse {
+    let request = match context.request.payload_json::<ToolInvocationRequest>() {
+        Ok(request) => request,
+        Err(error) => return invalid_request(&error),
+    };
+    if context.cancellation.is_cancelled() {
+        return json_response(&ToolInvocationResponse {
+            output: "filesystem tool cancelled".to_string(),
+            is_error: true,
+            content: Vec::new(),
+            full_output: None,
+            result: None,
+        });
+    }
+    #[cfg(unix)]
+    let _mutation_guard = if matches!(
+        request.name.as_str(),
+        "filesystem.write" | "filesystem.edit" | "filesystem.multi_edit"
+    ) {
+        match coordination::acquire(&|| context.cancellation.is_cancelled()) {
+            Ok(guard) => Some(guard),
+            Err(error) => return json_response(&tool_io_error(&error)),
+        }
+    } else {
+        None
+    };
+    if request.name == "filesystem.multi_edit" {
+        return invoke_batch(context, &request);
+    }
+    let descriptor = match serde_json::from_value::<FilesystemPreparationDescriptor>(
+        request.preparation_descriptor.clone(),
+    ) {
+        Ok(descriptor) => descriptor,
+        Err(error) => {
+            return json_response(&tool_error(format!(
+                "invalid Filesystem preparation descriptor: {error}"
+            )));
+        }
+    };
+    let request_payload = filesystem_request_payload(&request.name, &request.arguments);
+    let mut presentation =
+        context.primary_presentation(&request.tool_call_id, FILESYSTEM_REQUEST_SCHEMA, 1);
+    let _ = presentation.replace(&request_payload);
+    let mut arguments = request.arguments;
+    if let Err(error) = apply_filesystem_preparation(&mut arguments, &descriptor) {
+        return json_response(&tool_error(error));
+    }
+    let cwd = descriptor.workspace_root.as_deref();
+    let response = match request.name.as_str() {
+        "filesystem.read" => tool_read(arguments, cwd, &request.tool_call_id, &context.bridge),
+        "filesystem.write" => tool_write(arguments, None, &request.tool_call_id),
+        "filesystem.edit" => tool_edit(arguments, None, &request.tool_call_id),
+        "filesystem.exists" => tool_exists(arguments, None, &request.tool_call_id),
+        "filesystem.list" => tool_list(
+            arguments,
+            None,
+            &context.cancellation,
+            context.events,
+            &request.tool_call_id,
+        ),
+        "filesystem.find" => tool_find(
+            arguments,
+            None,
+            &context.cancellation,
+            context.events,
+            &request.tool_call_id,
+        ),
+        "filesystem.grep" => tool_grep(
+            arguments,
+            None,
+            &context.cancellation,
+            context.events,
+            &request.tool_call_id,
+        ),
+        "filesystem.stat" => tool_stat(arguments, None, &request.tool_call_id),
+        "artifact.metadata" => tool_artifact_metadata(arguments, None, &request.tool_call_id),
+        "artifact.read" => tool_artifact_read(arguments, None, &request.tool_call_id),
+        "artifact.grep" => tool_artifact_grep(arguments, None, &request.tool_call_id),
+        _ => ToolInvocationResponse {
+            output: format!("unknown filesystem tool: {}", request.name),
+            is_error: true,
+            content: Vec::new(),
+            full_output: None,
+            result: None,
+        },
+    };
+    publish_filesystem_result_presentation(&mut presentation, &response);
+    json_response(&response)
+}
+
+fn invoke_batch(
+    context: &NativeServiceContext,
+    request: &ToolInvocationRequest,
+) -> ServiceResponse {
+    let mut presentation =
+        context.primary_presentation(&request.tool_call_id, FILESYSTEM_REQUEST_SCHEMA, 1);
+    let _ = presentation.replace(&filesystem_request_payload(
+        &request.name,
+        &request.arguments,
+    ));
+    let checked = serde_json::from_value::<batch_request::PreparedBatch>(
+        request.preparation_descriptor.clone(),
+    )
+    .map_err(|error| format!("invalid multi-edit preparation: {error}"))
+    .and_then(|descriptor| {
+        batch_request::execute_with_changes(
+            &request.arguments,
+            &descriptor,
+            &|| context.cancellation.is_cancelled(),
+            &mut |index, old, new| {
+                retain_batch_change(context, &request.tool_call_id, index, old, new)
+            },
+        )
+    });
+    let response = batch_tool_response(checked, &request.tool_call_id);
+    publish_filesystem_result_presentation(&mut presentation, &response);
+    json_response(&response)
+}
+
+fn retain_batch_change(
+    context: &NativeServiceContext,
+    invocation_id: &str,
+    index: usize,
+    old: &str,
+    new: &str,
+) -> serde_json::Value {
+    // Each source is already bounded by the batch snapshot budget. Store raw UTF-8
+    // separately to avoid JSON escaping amplification and allow bounded text reads.
+    let mut references = serde_json::Map::new();
+    let diff = batch_request::retained_diff(old, new);
+    for (side, text) in [("old", old), ("new", new), ("diff", diff.as_str())] {
+        let value = retain_source_parts(text.as_bytes(), &mut |part, bytes| {
+            let response = context.bridge.request(&ServiceBridgeRequest::WriteArtifact(
+                bcode_tool::ToolArtifactWriteRequest {
+                    invocation_id: invocation_id.to_owned(),
+                    artifact_id: format!("{invocation_id}-batch-{index}-{side}-{part}"),
+                    content_type: "application/octet-stream".to_owned(),
+                    bytes: bytes.to_vec(),
+                    metadata: json!({"schema":"bcode.filesystem.change-source", "version":1, "file_index":index, "side":side}),
+                },
+            ));
+            match response {
+                Ok(ServiceBridgeResponse::Artifact(resolution)) => {
+                    retained_source_value(resolution)
+                }
+                _ => json!({"unavailable":true,"reason":"bridge_unavailable"}),
+            }
+        });
+        references.insert(side.to_owned(), value);
+    }
+    serde_json::Value::Object(references)
+}
+
+fn retain_source_parts(
+    bytes: &[u8],
+    write: &mut impl FnMut(usize, &[u8]) -> serde_json::Value,
+) -> serde_json::Value {
+    let initial = write(0, bytes);
+    if initial["reason"] != "size_limit" {
+        return initial;
+    }
+    let Some(limit) = initial["max_bytes"]
+        .as_u64()
+        .and_then(|n| usize::try_from(n).ok())
+    else {
+        return initial;
+    };
+    if limit == 0 || bytes.len().div_ceil(limit) > 64 {
+        return initial;
+    }
+    let mut parts = Vec::new();
+    for (index, chunk) in bytes.chunks(limit).enumerate() {
+        let mut part = write(index + 1, chunk);
+        if part["unavailable"] == true {
+            return part;
+        }
+        part["offset"] = json!(index * limit);
+        parts.push(part);
+    }
+    json!({"version":1,"byte_len":bytes.len(),"parts":parts})
+}
+
+fn retained_source_value(resolution: bcode_tool::ToolArtifactWriteResolution) -> serde_json::Value {
+    use bcode_tool::ToolArtifactWriteResolution;
+    match resolution {
+        ToolArtifactWriteResolution::Written {
+            artifact_id,
+            byte_len,
+            reference,
+        } => {
+            json!({"artifact_id":artifact_id,"byte_len":byte_len,"reference":reference})
+        }
+        ToolArtifactWriteResolution::TooLarge { max_bytes } => {
+            json!({"unavailable":true,"reason":"size_limit","max_bytes":max_bytes})
+        }
+        ToolArtifactWriteResolution::Cancelled => json!({"unavailable":true,"reason":"cancelled"}),
+        // Do not propagate arbitrary host diagnostics into public result metadata.
+        ToolArtifactWriteResolution::Failed { .. } => {
+            json!({"unavailable":true,"reason":"storage_failure"})
+        }
+    }
+}
+
+fn batch_tool_response(
+    checked: Result<serde_json::Value, String>,
+    tool_call_id: &str,
+) -> ToolInvocationResponse {
+    match checked {
+        Ok(outcome) => ToolInvocationResponse {
+            output: compact_batch_output(&outcome),
+            is_error: outcome["is_error"].as_bool().unwrap_or(true),
+            content: Vec::new(),
+            full_output: None,
+            result: Some(batch_outcome_artifact(tool_call_id, outcome)),
+        },
+        Err(error) => tool_error(error),
+    }
+}
+
+/// Keep model-facing outcomes independent of potentially large presentation text.
+fn compact_batch_output(outcome: &serde_json::Value) -> String {
+    let files =
+        outcome["files"].as_array().map(|files| {
+            files.iter().map(|file| {
+            let change = &file["change"];
+            json!({
+                "path": file["path"],
+                "status": file["status"],
+                "error": file["error"],
+                "change": if change.is_null() { serde_json::Value::Null } else {
+                    json!({"available": change["omitted"] == false, "reason": change["reason"], "retained": change["retained"]})
+                }
+            })
+        }).collect::<Vec<_>>()
+        });
+    json!({"version": outcome["version"], "is_error": outcome["is_error"], "files": files})
+        .to_string()
+}
+
+/// Version one records ordered per-file publication outcomes, including unknown
+/// outcomes. Consumers must reject unsupported schema versions rather than infer
+/// success from unfamiliar statuses. The text response remains the generic fallback.
+fn batch_outcome_artifact(tool_call_id: &str, outcome: serde_json::Value) -> ToolInvocationResult {
+    let refs = outcome["files"].as_array().into_iter().flatten().enumerate().flat_map(|(index, file)| {
+        ["old", "new", "diff"].into_iter().flat_map(move |side| {
+            let retained = &file["change"]["retained"][side];
+            let parts = retained["parts"].as_array().map_or_else(|| vec![retained], |parts| parts.iter().collect());
+            parts.into_iter().enumerate().filter_map(move |(part_index, part)| {
+                let uri = part["reference"]["uri"].as_str()?;
+                Some(bcode_tool::ToolArtifactRef {
+                    key: if retained["parts"].is_array() { format!("file-{index}-{side}-{part_index}") } else { format!("file-{index}-{side}") },
+                    content_type: Some("application/octet-stream".to_owned()),
+                    storage_uri: Some(uri.to_owned()),
+                    byte_len: part["byte_len"].as_u64(),
+                    metadata: Some(json!({"file_index":index,"side":side,"path":file["path"],"artifact_id":part["artifact_id"],"offset":part["offset"]})),
+                })
+            })
+        })
+    }).collect();
+    ToolInvocationResult::Artifact {
+        artifact: Box::new(ToolArtifact {
+            artifact_id: format!("{tool_call_id}-filesystem-batch"),
+            producer_plugin_id: "bcode.filesystem".to_owned(),
+            schema: "bcode.filesystem.batch".to_owned(),
+            schema_version: 1,
+            tool_call_id: Some(tool_call_id.to_owned()),
+            title: Some("Batch file changes".to_owned()),
+            metadata: outcome,
+            refs,
+        }),
+    }
+}
+
+fn tool_read(
+    arguments: serde_json::Value,
+    cwd: Option<&Path>,
+    tool_call_id: &str,
+    bridge: &ServiceBridge,
+) -> ToolInvocationResponse {
+    match serde_json::from_value::<ReadRequest>(arguments) {
+        Ok(request) => read_path_for_tool(
+            &resolve_session_path(cwd, &request.path),
+            &request,
+            cwd.unwrap_or_else(|| Path::new(".")),
+            tool_call_id,
+            Some(bridge),
+        ),
+        Err(error) => tool_json_error(&error),
+    }
+}
+
+fn read_path_for_tool(
+    path: &Path,
+    request: &ReadRequest,
+    working_directory: &Path,
+    tool_call_id: &str,
+    bridge: Option<&ServiceBridge>,
+) -> ToolInvocationResponse {
+    match image_file_metadata(path) {
+        Ok(Some(image)) => {
+            image_tool_response(path, image, working_directory, tool_call_id, bridge)
+        }
+        Ok(None) => match std::fs::read(path) {
+            Ok(bytes) => text_tool_response(path, request, &bytes, working_directory, tool_call_id),
+            Err(error) => tool_io_error(&error),
+        },
+        Err(error) => tool_io_error(&error),
+    }
+}
+
+use sha2::Digest;
+
+fn text_tool_response(
+    path: &Path,
+    request: &ReadRequest,
+    bytes: &[u8],
+    working_directory: &Path,
+    tool_call_id: &str,
+) -> ToolInvocationResponse {
+    let Ok(contents) = std::str::from_utf8(bytes) else {
+        return ToolInvocationResponse {
+            output: format!(
+                "Binary file could not be decoded as UTF-8.\nPath: {}\nSize: {} bytes\nUse a specialized tool to inspect this file type.",
+                display(path, working_directory),
+                bytes.len()
+            ),
+            is_error: true,
+            content: Vec::new(),
+            full_output: None,
+            result: None,
+        };
+    };
+    let lines = contents.lines().collect::<Vec<_>>();
+    let total_lines = lines.len();
+    let start_line = request
+        .offset
+        .unwrap_or(1)
+        .saturating_sub(1)
+        .min(total_lines);
+    let max_lines = request.limit.unwrap_or(DEFAULT_READ_MAX_LINES);
+    let mut selected = Vec::new();
+    let mut retained_bytes = 0usize;
+    let mut byte_truncated = false;
+    for line in lines.iter().skip(start_line).take(max_lines) {
+        let line_bytes = line.len().saturating_add(1);
+        if retained_bytes.saturating_add(line_bytes) > DEFAULT_READ_MAX_BYTES {
+            byte_truncated = true;
+            break;
+        }
+        selected.push(*line);
+        retained_bytes = retained_bytes.saturating_add(line_bytes);
+    }
+    let content_sha256 = hex::encode(sha2::Sha256::digest(bytes));
+    let mut output = selected.join("\n");
+    let next_line = start_line.saturating_add(selected.len()).saturating_add(1);
+    if next_line <= total_lines || byte_truncated {
+        let _ = write!(
+            output,
+            "\n\n[Showing lines {}-{} of {total_lines}. Use offset={next_line} to continue.]",
+            start_line.saturating_add(1),
+            start_line.saturating_add(selected.len())
+        );
+    }
+    let _ = write!(
+        output,
+        "\n\n[Source bytes: {}; SHA-256: {content_sha256}. Digest covers the entire file, not only displayed lines.]",
+        bytes.len()
+    );
+    ToolInvocationResponse {
+        output: output.clone(),
+        is_error: false,
+        content: Vec::new(),
+        full_output: None,
+        result: Some(filesystem_artifact_result(
+            tool_call_id,
+            "read",
+            "bcode.filesystem.read",
+            "File contents",
+            json!({
+                "path": path.display().to_string(),
+                "start_line": start_line.saturating_add(1),
+                "end_line": start_line.saturating_add(selected.len()),
+                "total_lines": total_lines,
+                "returned_bytes": retained_bytes,
+                "total_bytes": bytes.len(),
+                "content_sha256": content_sha256,
+                "truncated": next_line <= total_lines || byte_truncated,
+                "contents": output,
+            }),
+        )),
+    }
+}
+
+fn tool_artifact_metadata(
+    arguments: serde_json::Value,
+    cwd: Option<&Path>,
+    tool_call_id: &str,
+) -> ToolInvocationResponse {
+    match serde_json::from_value::<ArtifactMetadataRequest>(arguments) {
+        Ok(request) => {
+            let path = resolve_session_path(cwd, &request.path);
+            json_tool_response_with_artifact(
+                serde_json::to_value(artifact_metadata_response(&path)),
+                tool_call_id,
+                "artifact-metadata",
+                "bcode.filesystem.artifact.metadata",
+                "Artifact metadata",
+            )
+        }
+        Err(error) => tool_json_error(&error),
+    }
+}
+
+fn artifact_metadata_response(path: &Path) -> ArtifactMetadataResponse {
+    match std::fs::metadata(path) {
+        Ok(metadata) => ArtifactMetadataResponse {
+            path: path.display().to_string(),
+            exists: true,
+            kind: metadata_kind(&metadata),
+            byte_len: Some(metadata.len()),
+            content_type: artifact_content_type(path),
+            complete: Some(true),
+            message: Some(
+                "Artifact byte length reflects retained bytes on disk; upstream tool capture may have been bounded."
+                    .to_string(),
+            ),
+        },
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => ArtifactMetadataResponse {
+            path: path.display().to_string(),
+            exists: false,
+            kind: "missing".to_string(),
+            byte_len: None,
+            content_type: None,
+            complete: None,
+            message: Some(error.to_string()),
+        },
+        Err(error) => ArtifactMetadataResponse {
+            path: path.display().to_string(),
+            exists: false,
+            kind: "error".to_string(),
+            byte_len: None,
+            content_type: None,
+            complete: None,
+            message: Some(error.to_string()),
+        },
+    }
+}
+
+fn tool_artifact_read(
+    arguments: serde_json::Value,
+    cwd: Option<&Path>,
+    tool_call_id: &str,
+) -> ToolInvocationResponse {
+    match serde_json::from_value::<ArtifactReadRequest>(arguments) {
+        Ok(request) => match read_artifact(&resolve_session_path(cwd, &request.path), &request) {
+            Ok(response) => json_tool_response_with_artifact(
+                serde_json::to_value(response),
+                tool_call_id,
+                "artifact-read",
+                "bcode.filesystem.artifact.read",
+                "Artifact bytes",
+            ),
+            Err(error) => ToolInvocationResponse {
+                output: error,
+                is_error: true,
+                content: Vec::new(),
+                full_output: None,
+                result: None,
+            },
+        },
+        Err(error) => tool_json_error(&error),
+    }
+}
+
+fn read_artifact(
+    path: &Path,
+    request: &ArtifactReadRequest,
+) -> Result<ArtifactReadResponse, String> {
+    let bytes = std::fs::read(path).map_err(|error| error.to_string())?;
+    let total_bytes = u64::try_from(bytes.len()).unwrap_or(u64::MAX);
+    let max_bytes = request.max_bytes.unwrap_or(DEFAULT_ARTIFACT_READ_MAX_BYTES);
+    let requested_offset = if request.from_end {
+        bytes.len().saturating_sub(max_bytes)
+    } else {
+        usize::try_from(request.offset_bytes.unwrap_or(0)).unwrap_or(usize::MAX)
+    };
+    let offset = requested_offset.min(bytes.len());
+    let end = offset.saturating_add(max_bytes).min(bytes.len());
+    let start = utf8_boundary_at_or_after_bytes(&bytes, offset);
+    let end = utf8_boundary_at_or_before_bytes(&bytes, end);
+    let contents = std::str::from_utf8(&bytes[start..end])
+        .map_err(|error| format!("artifact slice is not valid UTF-8: {error}"))?
+        .to_string();
+    Ok(ArtifactReadResponse {
+        path: path.display().to_string(),
+        offset_bytes: u64::try_from(start).unwrap_or(u64::MAX),
+        returned_bytes: end.saturating_sub(start),
+        total_bytes,
+        from_end: request.from_end,
+        truncated: start > 0 || end < bytes.len(),
+        contents,
+    })
+}
+
+fn tool_artifact_grep(
+    arguments: serde_json::Value,
+    cwd: Option<&Path>,
+    tool_call_id: &str,
+) -> ToolInvocationResponse {
+    match serde_json::from_value::<ArtifactGrepRequest>(arguments) {
+        Ok(request) => match grep_artifact(&resolve_session_path(cwd, &request.path), &request) {
+            Ok(response) => json_tool_response_with_artifact(
+                serde_json::to_value(response),
+                tool_call_id,
+                "artifact-grep",
+                "bcode.filesystem.artifact.grep",
+                "Artifact matches",
+            ),
+            Err(error) => ToolInvocationResponse {
+                output: error,
+                is_error: true,
+                content: Vec::new(),
+                full_output: None,
+                result: None,
+            },
+        },
+        Err(error) => tool_json_error(&error),
+    }
+}
+
+fn grep_artifact(
+    path: &Path,
+    request: &ArtifactGrepRequest,
+) -> Result<ArtifactGrepResponse, String> {
+    let contents = std::fs::read_to_string(path).map_err(|error| error.to_string())?;
+    let pattern = if request.ignore_case {
+        request.pattern.to_lowercase()
+    } else {
+        request.pattern.clone()
+    };
+    let max_matches = request
+        .max_matches
+        .unwrap_or(DEFAULT_ARTIFACT_GREP_MAX_MATCHES);
+    let mut matches = Vec::new();
+    for (index, line) in contents.lines().enumerate() {
+        let haystack = if request.ignore_case {
+            line.to_lowercase()
+        } else {
+            line.to_string()
+        };
+        if haystack.contains(&pattern) {
+            matches.push(GrepMatch {
+                path: path.display().to_string(),
+                line_number: index.saturating_add(1),
+                line: line.to_string(),
+            });
+            if matches.len() >= max_matches {
+                break;
+            }
+        }
+    }
+    let partial = matches.len() >= max_matches;
+    Ok(ArtifactGrepResponse {
+        path: path.display().to_string(),
+        matches,
+        total_bytes: u64::try_from(contents.len()).unwrap_or(u64::MAX),
+        partial,
+        message: partial.then(|| "maximum match count reached".to_string()),
+    })
+}
+
+fn artifact_content_type(path: &Path) -> Option<String> {
+    match path.extension().and_then(std::ffi::OsStr::to_str) {
+        Some("json") => Some("application/json".to_string()),
+        Some("txt") => Some("text/plain".to_string()),
+        _ => None,
+    }
+}
+
+fn utf8_boundary_at_or_after_bytes(bytes: &[u8], mut index: usize) -> usize {
+    while index < bytes.len() && std::str::from_utf8(&bytes[..index]).is_err() {
+        index = index.saturating_add(1);
+    }
+    index
+}
+
+fn utf8_boundary_at_or_before_bytes(bytes: &[u8], mut index: usize) -> usize {
+    while index > 0 && std::str::from_utf8(&bytes[..index]).is_err() {
+        index = index.saturating_sub(1);
+    }
+    index
+}
+
+fn image_tool_response(
+    path: &Path,
+    image: ImageFileMetadata,
+    working_directory: &Path,
+    tool_call_id: &str,
+    bridge: Option<&ServiceBridge>,
+) -> ToolInvocationResponse {
+    let metadata = std::fs::metadata(path);
+    let byte_len = metadata.as_ref().map_or(0, std::fs::Metadata::len);
+    let output = format!(
+        "Read image file [{}]\nPath: {}\nDimensions: {}x{}\nSize: {} bytes\nReturned image reference for visual inspection.",
+        image.mime_type,
+        display(path, working_directory),
+        image.width,
+        image.height,
+        byte_len
+    );
+    let mime_type = image.mime_type.clone();
+    let image_reference = bridge
+        .filter(|bridge| bridge.is_available())
+        .and_then(|bridge| {
+            let bytes = std::fs::read(path).ok()?;
+            let response = bridge
+                .request(&ServiceBridgeRequest::WriteArtifact(
+                    bcode_tool::ToolArtifactWriteRequest {
+                        invocation_id: tool_call_id.to_owned(),
+                        artifact_id: format!("{tool_call_id}-filesystem-image-bytes"),
+                        content_type: mime_type.clone(),
+                        bytes,
+                        metadata: json!({
+                            "width": image.width,
+                            "height": image.height,
+                            "source_path": path.display().to_string(),
+                        }),
+                    },
+                ))
+                .ok()?;
+            let ServiceBridgeResponse::Artifact(bcode_tool::ToolArtifactWriteResolution::Written {
+                artifact_id,
+                byte_len,
+                reference,
+            }) = response
+            else {
+                return None;
+            };
+            let storage_uri = reference
+                .get("uri")
+                .and_then(serde_json::Value::as_str)
+                .map(ToOwned::to_owned);
+            Some(bcode_tool::ToolArtifactRef {
+                key: "inline-image".to_owned(),
+                content_type: Some(mime_type.clone()),
+                storage_uri,
+                byte_len: Some(byte_len),
+                metadata: Some(json!({
+                    "artifact_id": artifact_id,
+                    "width": image.width,
+                    "height": image.height,
+                })),
+            })
+        });
+    let has_image_artifact = image_reference.is_some();
+    let image_artifact = ToolInvocationResult::Artifact {
+        artifact: Box::new(ToolArtifact {
+            artifact_id: format!("{tool_call_id}-filesystem-image"),
+            producer_plugin_id: FILESYSTEM_PLUGIN_ID.to_owned(),
+            schema: "bcode.filesystem.image".to_owned(),
+            schema_version: 1,
+            tool_call_id: Some(tool_call_id.to_owned()),
+            title: Some("Image file".to_owned()),
+            metadata: json!({
+                "path": path.display().to_string(),
+                "mime_type": mime_type,
+                "width": image.width,
+                "height": image.height,
+                "byte_len": byte_len,
+            }),
+            refs: image_reference.into_iter().collect(),
+        }),
+    };
+    ToolInvocationResponse {
+        output,
+        is_error: false,
+        content: vec![ToolResultContent::ImageRef {
+            image: ImageRefContent {
+                path: path.display().to_string(),
+                mime_type: image.mime_type,
+                artifact_id: has_image_artifact.then(|| format!("{tool_call_id}-filesystem-image")),
+                reference_key: has_image_artifact.then(|| "inline-image".to_owned()),
+                metadata: ImageMetadata {
+                    width: Some(image.width),
+                    height: Some(image.height),
+                    byte_len: Some(byte_len),
+                    source_path: Some(path.display().to_string()),
+                },
+            },
+        }],
+        full_output: None,
+        result: Some(image_artifact),
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ImageFileMetadata {
+    mime_type: String,
+    width: u32,
+    height: u32,
+}
+
+fn image_file_metadata(path: &Path) -> std::io::Result<Option<ImageFileMetadata>> {
+    let mut file = std::fs::File::open(path)?;
+    let mut header = [0_u8; 32];
+    let read = file.read(&mut header)?;
+    let Some(mime_type) = sniff_supported_image_mime(&header[..read]) else {
+        return Ok(None);
+    };
+    let Ok((width, height)) = image::image_dimensions(path) else {
+        return Ok(None);
+    };
+    Ok(Some(ImageFileMetadata {
+        mime_type: mime_type.to_string(),
+        width,
+        height,
+    }))
+}
+
+fn sniff_supported_image_mime(bytes: &[u8]) -> Option<&'static str> {
+    if bytes.starts_with(b"\x89PNG\r\n\x1a\n") {
+        Some("image/png")
+    } else if bytes.starts_with(b"\xff\xd8\xff") {
+        Some("image/jpeg")
+    } else if bytes.starts_with(b"GIF87a") || bytes.starts_with(b"GIF89a") {
+        Some("image/gif")
+    } else if bytes.len() >= 12 && &bytes[..4] == b"RIFF" && &bytes[8..12] == b"WEBP" {
+        Some("image/webp")
+    } else {
+        None
+    }
+}
+
+fn file_change_artifact(
+    tool_call_id: &str,
+    tool_name: &str,
+    summary: &str,
+    path: Option<&Path>,
+    old_text: &str,
+    new_text: &str,
+    start_line: Option<u32>,
+) -> ToolInvocationResult {
+    ToolInvocationResult::Artifact {
+        artifact: Box::new(ToolArtifact {
+            artifact_id: format!("{tool_call_id}-filesystem-change"),
+            producer_plugin_id: "bcode.filesystem".to_string(),
+            schema: "bcode.filesystem.change".to_string(),
+            schema_version: 1,
+            tool_call_id: Some(tool_call_id.to_string()),
+            title: Some("File change".to_string()),
+            metadata: json!({
+                "tool_name": tool_name,
+                "summary": summary,
+                "path": path.map(|path| path.display().to_string()),
+                "old_text": old_text,
+                "new_text": new_text,
+                "old_start_line": start_line,
+                "new_start_line": start_line,
+            }),
+            refs: Vec::new(),
+        }),
+    }
+}
+
+fn tool_write(
+    arguments: serde_json::Value,
+    cwd: Option<&Path>,
+    tool_call_id: &str,
+) -> ToolInvocationResponse {
+    match serde_json::from_value::<WriteRequest>(arguments) {
+        Ok(mut request) => {
+            request.path = resolve_session_path(cwd, &request.path);
+            write_file_inner(&request.path, &request.contents).map_or_else(
+                |error| tool_io_error(&error),
+                |bytes_written| {
+                    let summary = format!("wrote {bytes_written} bytes");
+                    ToolInvocationResponse {
+                        output: write_receipt::model_output(&summary, &request.contents),
+                        is_error: false,
+                        content: Vec::new(),
+                        full_output: None,
+                        result: Some(file_change_artifact(
+                            tool_call_id,
+                            "filesystem.write",
+                            &summary,
+                            Some(&request.path),
+                            "",
+                            &request.contents,
+                            Some(1),
+                        )),
+                    }
+                },
+            )
+        }
+        Err(error) => tool_json_error(&error),
+    }
+}
+
+fn tool_edit(
+    arguments: serde_json::Value,
+    cwd: Option<&Path>,
+    tool_call_id: &str,
+) -> ToolInvocationResponse {
+    match serde_json::from_value::<EditRequest>(arguments) {
+        Ok(mut request) => {
+            request.path = resolve_session_path(cwd, &request.path);
+            edit_file_inner(&request).map_or_else(
+                |error| ToolInvocationResponse {
+                    output: error,
+                    is_error: true,
+                    content: Vec::new(),
+                    full_output: None,
+                    result: None,
+                },
+                |(replacements, start_line)| {
+                    let summary = format!("applied {replacements} replacement");
+                    ToolInvocationResponse {
+                        output: summary.clone(),
+                        is_error: false,
+                        content: Vec::new(),
+                        full_output: None,
+                        result: Some(file_change_artifact(
+                            tool_call_id,
+                            "filesystem.edit",
+                            &summary,
+                            Some(&request.path),
+                            &request.old_text,
+                            &request.new_text,
+                            Some(start_line),
+                        )),
+                    }
+                },
+            )
+        }
+        Err(error) => tool_json_error(&error),
+    }
+}
+
+fn tool_exists(
+    arguments: serde_json::Value,
+    cwd: Option<&Path>,
+    tool_call_id: &str,
+) -> ToolInvocationResponse {
+    match serde_json::from_value::<ExistsRequest>(arguments) {
+        Ok(request) => {
+            let path = resolve_session_path(cwd, &request.path);
+            let exists = path.exists();
+            let output = exists.to_string();
+            ToolInvocationResponse {
+                output,
+                is_error: false,
+                content: Vec::new(),
+                full_output: None,
+                result: Some(filesystem_artifact_result(
+                    tool_call_id,
+                    "exists",
+                    "bcode.filesystem.exists",
+                    "Path exists",
+                    json!({
+                        "path": path.display().to_string(),
+                        "exists": exists,
+                    }),
+                )),
+            }
+        }
+        Err(error) => tool_json_error(&error),
+    }
+}
+
+fn tool_list(
+    arguments: serde_json::Value,
+    cwd: Option<&Path>,
+    cancellation: &bcode_plugin_sdk::ServiceCancellation,
+    events: ServiceEventEmitter,
+    tool_call_id: &str,
+) -> ToolInvocationResponse {
+    let result = serde_json::from_value::<ListRequest>(arguments)
+        .map(|mut request| {
+            request.path = resolve_session_path(cwd, &request.path);
+            request
+        })
+        .and_then(|request| {
+            let mut progress = ProgressReporter::new(events, tool_call_id.to_string());
+            progress.emit("list: scanning entries");
+            list_directory(&request, cancellation.clone(), Some(&mut progress))
+                .map_err(serde_json::Error::io)
+        });
+    json_tool_response_with_artifact(
+        result,
+        tool_call_id,
+        "list",
+        "bcode.filesystem.list",
+        "Directory entries",
+    )
+}
+
+fn tool_find(
+    arguments: serde_json::Value,
+    cwd: Option<&Path>,
+    cancellation: &bcode_plugin_sdk::ServiceCancellation,
+    events: ServiceEventEmitter,
+    tool_call_id: &str,
+) -> ToolInvocationResponse {
+    let result = serde_json::from_value::<FindRequest>(arguments)
+        .map(|mut request| {
+            request.path = resolve_session_path(cwd, &request.path);
+            request
+        })
+        .and_then(|request| {
+            let mut progress = ProgressReporter::new(events, tool_call_id.to_string());
+            progress.emit(format!("find: searching for {}", request.pattern));
+            find_paths_with_cancellation(&request, cancellation.clone(), Some(&mut progress))
+                .map_err(serde_json::Error::io)
+        });
+    json_tool_response_with_artifact(
+        result,
+        tool_call_id,
+        "find",
+        "bcode.filesystem.find",
+        "Path matches",
+    )
+}
+
+fn tool_grep(
+    arguments: serde_json::Value,
+    cwd: Option<&Path>,
+    cancellation: &bcode_plugin_sdk::ServiceCancellation,
+    events: ServiceEventEmitter,
+    tool_call_id: &str,
+) -> ToolInvocationResponse {
+    let result = serde_json::from_value::<GrepRequest>(arguments)
+        .map(|mut request| {
+            request.path = resolve_session_path(cwd, &request.path);
+            request
+        })
+        .and_then(|request| {
+            let mut progress = ProgressReporter::new(events, tool_call_id.to_string());
+            progress.emit(format!("grep: searching for {}", request.pattern));
+            grep_files_with_cancellation(&request, cancellation.clone(), Some(&mut progress))
+                .map_err(serde_json::Error::io)
+        });
+    if let Ok(response) = &result
+        && !cancellation.is_cancelled()
+    {
+        emit_grep_context_candidates(response, tool_call_id, events);
+    }
+    json_tool_response_with_artifact(
+        result,
+        tool_call_id,
+        "grep",
+        "bcode.filesystem.grep",
+        "Text matches",
+    )
+}
+
+fn grep_context_candidates(
+    response: &GrepResponse,
+    tool_call_id: &str,
+) -> Vec<bcode_session_models::JudgementContextCandidate> {
+    use bcode_session_models::{JudgementContextCandidate, JudgementContextSource};
+    response
+        .matches
+        .iter()
+        .take(32)
+        .enumerate()
+        .filter_map(|(index, found)| {
+            let candidate = JudgementContextCandidate {
+                id: format!("{tool_call_id}:grep:{index}"),
+                source: JudgementContextSource::Search,
+                provenance: format!(
+                    "filesystem.grep:{tool_call_id}:{}:line:{}",
+                    found.path, found.line_number
+                ),
+                snippet: found.line.clone(),
+                // Only the supplemental hit is optional. The explicit search request and
+                // its chronological tool response remain mandatory and untouched.
+                protected: false,
+            };
+            candidate.is_valid().then_some(candidate)
+        })
+        .collect()
+}
+
+fn emit_grep_context_candidates(
+    response: &GrepResponse,
+    tool_call_id: &str,
+    events: ServiceEventEmitter,
+) {
+    for candidate in grep_context_candidates(response, tool_call_id) {
+        let Ok(payload) = serde_json::to_value(&candidate) else {
+            continue;
+        };
+        let envelope = bcode_tool::ToolContributionEnvelope::new(
+            bcode_tool::ToolContributionPlacement::Hidden,
+            bcode_tool::ToolContributionEvent {
+                invocation_id: tool_call_id.to_owned(),
+                contribution_id: candidate.id,
+                sequence: 1,
+                producer_id: FILESYSTEM_PLUGIN_ID.to_owned(),
+                schema: bcode_session_models::JudgementContextCandidate::SCHEMA.to_owned(),
+                schema_version: 1,
+                operation: bcode_tool::ToolContributionOperation::Upsert,
+                persistence: bcode_tool::ToolContributionPersistence::Transient,
+                artifact: None,
+                payload,
+            },
+        );
+        if let Ok(bytes) = serde_json::to_vec(&envelope) {
+            events.emit(&bytes);
+        }
+    }
+}
+
+#[cfg(test)]
+mod judgement_context_producer_tests {
+    use super::*;
+    use std::sync::Mutex;
+
+    fn response(lines: &[&str]) -> GrepResponse {
+        GrepResponse {
+            matches: lines
+                .iter()
+                .enumerate()
+                .map(|(index, line)| GrepMatch {
+                    path: "/confined/parser.rs".into(),
+                    line_number: index + 1,
+                    line: (*line).into(),
+                })
+                .collect(),
+            backend: "rust".into(),
+            timed_out: false,
+            partial: false,
+            visited_entries: 1,
+            message: None,
+        }
+    }
+
+    extern "C" fn capture(payload: *const u8, len: usize, context: *mut std::ffi::c_void) {
+        // SAFETY: the emitter calls synchronously while this test's collector is alive.
+        let captured = unsafe { &*context.cast::<Mutex<Vec<Vec<u8>>>>() };
+        // SAFETY: the emitter supplies a valid payload pointer and byte length.
+        let bytes = unsafe { std::slice::from_raw_parts(payload, len) };
+        captured.lock().unwrap().push(bytes.to_vec());
+    }
+
+    #[test]
+    fn real_search_lines_emit_bounded_transient_correlated_evidence_without_mutating_response() {
+        let found = response(&[
+            "irrelevant release banner",
+            "parser token lookahead regression",
+        ]);
+        let original = serde_json::to_value(&found).unwrap();
+        let captured = Mutex::new(Vec::<Vec<u8>>::new());
+        let events = ServiceEventEmitter::new(
+            Some(capture),
+            std::ptr::from_ref(&captured).cast_mut().cast(),
+        );
+        emit_grep_context_candidates(&found, "call-a", events);
+        let messages = captured.lock().unwrap().clone();
+        assert_eq!(messages.len(), 2);
+        for (index, message) in messages.iter().enumerate() {
+            let envelope: bcode_tool::ToolContributionEnvelope =
+                serde_json::from_slice(message).unwrap();
+            let contribution = envelope.contribution;
+            assert_eq!(contribution.invocation_id, "call-a");
+            assert_eq!(contribution.producer_id, FILESYSTEM_PLUGIN_ID);
+            assert_eq!(
+                contribution.persistence,
+                bcode_tool::ToolContributionPersistence::Transient
+            );
+            assert_eq!(
+                contribution.schema,
+                bcode_session_models::JudgementContextCandidate::SCHEMA
+            );
+            assert_eq!(contribution.schema_version, 1);
+            assert!(contribution.artifact.is_none());
+            let candidate: bcode_session_models::JudgementContextCandidate =
+                serde_json::from_value(contribution.payload).unwrap();
+            assert!(candidate.is_valid());
+            assert_eq!(candidate.snippet, found.matches[index].line);
+            assert_eq!(
+                candidate.provenance,
+                format!(
+                    "filesystem.grep:call-a:/confined/parser.rs:line:{}",
+                    index + 1
+                )
+            );
+            assert!(!candidate.protected);
+        }
+        assert_eq!(serde_json::to_value(&found).unwrap(), original);
+    }
+
+    #[test]
+    fn oversize_and_blank_lines_are_declined_not_truncated_and_candidate_scan_is_bounded() {
+        let long = "界".repeat(683);
+        assert!(grep_context_candidates(&response(&[&long, " "]), "call-a").is_empty());
+        let many = response(&["original"; 40]);
+        assert_eq!(grep_context_candidates(&many, "call-a").len(), 32);
+        assert!(grep_context_candidates(&many, &"x".repeat(128)).is_empty());
+    }
+
+    #[test]
+    fn explicit_file_read_retains_original_protocol_content_and_no_optional_copy() {
+        let request: ReadRequest =
+            serde_json::from_value(json!({"path":"parser.rs", "offset":1, "limit":1})).unwrap();
+        let response = text_tool_response(
+            Path::new("parser.rs"),
+            &request,
+            b"required parser evidence\n",
+            Path::new("."),
+            "explicit-call",
+        );
+        assert!(!response.is_error);
+        assert!(response.output.contains("required parser evidence"));
+        assert!(response.result.is_some());
+    }
+}
+
+fn tool_stat(
+    arguments: serde_json::Value,
+    cwd: Option<&Path>,
+    tool_call_id: &str,
+) -> ToolInvocationResponse {
+    let result = serde_json::from_value::<StatRequest>(arguments)
+        .map(|mut request| {
+            request.path = resolve_session_path(cwd, &request.path);
+            request
+        })
+        .and_then(|request| stat_path(&request).map_err(serde_json::Error::io));
+    json_tool_response_with_artifact(
+        result,
+        tool_call_id,
+        "stat",
+        "bcode.filesystem.stat",
+        "Path metadata",
+    )
+}
+
+fn resolve_session_path(cwd: Option<&Path>, path: &Path) -> PathBuf {
+    if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        cwd.map_or_else(|| path.to_path_buf(), |cwd| cwd.join(path))
+    }
+}
+
+fn read_file(request: &ServiceRequest) -> ServiceResponse {
+    let request = match request.payload_json::<ReadRequest>() {
+        Ok(request) => request,
+        Err(error) => return invalid_request(&error),
+    };
+    match std::fs::read_to_string(&request.path) {
+        Ok(contents) => json_response(&ReadResponse { contents }),
+        Err(error) => io_error(&error),
+    }
+}
+
+fn write_file(request: &ServiceRequest) -> ServiceResponse {
+    let request = match request.payload_json::<WriteRequest>() {
+        Ok(request) => request,
+        Err(error) => return invalid_request(&error),
+    };
+    match write_file_inner(&request.path, &request.contents) {
+        Ok(bytes_written) => json_response(&WriteResponse { bytes_written }),
+        Err(error) => io_error(&error),
+    }
+}
+
+fn edit_file(request: &ServiceRequest) -> ServiceResponse {
+    let request = match request.payload_json::<EditRequest>() {
+        Ok(request) => request,
+        Err(error) => return invalid_request(&error),
+    };
+    match edit_file_inner(&request) {
+        Ok((replacements, _)) => json_response(&EditResponse { replacements }),
+        Err(error) => ServiceResponse::error("edit_error", error),
+    }
+}
+
+fn path_exists(request: &ServiceRequest) -> ServiceResponse {
+    let request = match request.payload_json::<ExistsRequest>() {
+        Ok(request) => request,
+        Err(error) => return invalid_request(&error),
+    };
+    json_response(&ExistsResponse {
+        exists: request.path.exists(),
+    })
+}
+
+fn list_directory_service(request: &ServiceRequest) -> ServiceResponse {
+    let request = match request.payload_json::<ListRequest>() {
+        Ok(request) => request,
+        Err(error) => return invalid_request(&error),
+    };
+    list_directory(
+        &request,
+        bcode_plugin_sdk::ServiceCancellation::default(),
+        None,
+    )
+    .map_or_else(
+        |error| io_error(&error),
+        |response| json_response(&response),
+    )
+}
+
+fn find_paths_service(request: &ServiceRequest) -> ServiceResponse {
+    let request = match request.payload_json::<FindRequest>() {
+        Ok(request) => request,
+        Err(error) => return invalid_request(&error),
+    };
+    find_paths(&request).map_or_else(
+        |error| io_error(&error),
+        |response| json_response(&response),
+    )
+}
+
+fn grep_files_service(request: &ServiceRequest) -> ServiceResponse {
+    let request = match request.payload_json::<GrepRequest>() {
+        Ok(request) => request,
+        Err(error) => return invalid_request(&error),
+    };
+    grep_files(&request).map_or_else(
+        |error| io_error(&error),
+        |response| json_response(&response),
+    )
+}
+
+fn stat_path_service(request: &ServiceRequest) -> ServiceResponse {
+    let request = match request.payload_json::<StatRequest>() {
+        Ok(request) => request,
+        Err(error) => return invalid_request(&error),
+    };
+    stat_path(&request).map_or_else(
+        |error| io_error(&error),
+        |response| json_response(&response),
+    )
+}
+
+#[derive(Debug)]
+struct SearchBudget {
+    started: Instant,
+    timeout: Duration,
+    visited_entries: usize,
+    timed_out: bool,
+    cancellation: bcode_plugin_sdk::ServiceCancellation,
+}
+
+impl SearchBudget {
+    fn new(timeout_ms: Option<u64>, cancellation: bcode_plugin_sdk::ServiceCancellation) -> Self {
+        Self {
+            started: Instant::now(),
+            timeout: Duration::from_millis(timeout_ms.unwrap_or(DEFAULT_SEARCH_TIMEOUT_MS)),
+            visited_entries: 0,
+            timed_out: false,
+            cancellation,
+        }
+    }
+
+    fn check(&mut self) -> bool {
+        if self.cancellation.is_cancelled() {
+            self.timed_out = true;
+            return false;
+        }
+        if self.started.elapsed() >= self.timeout {
+            self.timed_out = true;
+            return false;
+        }
+        true
+    }
+
+    fn visit(&mut self) -> bool {
+        self.visited_entries = self.visited_entries.saturating_add(1);
+        self.check()
+    }
+
+    fn elapsed_timeout_ms(&self) -> u64 {
+        u64::try_from(self.timeout.as_millis()).unwrap_or(u64::MAX)
+    }
+}
+
+fn timeout_message(kind: &str, timeout_ms: u64) -> String {
+    format!("{kind} timed out after {timeout_ms}ms; results are partial")
+}
+
+fn list_directory(
+    request: &ListRequest,
+    cancellation: bcode_plugin_sdk::ServiceCancellation,
+    mut progress: Option<&mut ProgressReporter>,
+) -> Result<ListResponse, std::io::Error> {
+    let mut budget = SearchBudget::new(request.timeout_ms, cancellation);
+    let max_entries = request.max_entries.unwrap_or(DEFAULT_LIST_MAX_ENTRIES);
+    let mut entries = Vec::new();
+    collect_entries(
+        &request.path,
+        request.recursive,
+        max_entries,
+        &mut budget,
+        &mut entries,
+        progress.as_deref_mut(),
+    )?;
+    if let Some(progress) = progress {
+        progress.emit(format!(
+            "list: visited {} entries; retained {}",
+            budget.visited_entries,
+            entries.len()
+        ));
+    }
+    entries.sort_by(|left, right| left.path.cmp(&right.path));
+    let partial = budget.timed_out || entries.len() >= max_entries;
+    Ok(ListResponse {
+        entries,
+        backend: "rust".to_string(),
+        timed_out: budget.timed_out,
+        partial,
+        visited_entries: budget.visited_entries,
+        message: budget
+            .timed_out
+            .then(|| timeout_message("list", budget.elapsed_timeout_ms())),
+    })
+}
+
+fn collect_entries(
+    path: &Path,
+    recursive: bool,
+    max_entries: usize,
+    budget: &mut SearchBudget,
+    entries: &mut Vec<ListEntry>,
+    mut progress: Option<&mut ProgressReporter>,
+) -> Result<(), std::io::Error> {
+    if entries.len() >= max_entries || !budget.check() {
+        return Ok(());
+    }
+    for entry in std::fs::read_dir(path)? {
+        if entries.len() >= max_entries || !budget.visit() {
+            break;
+        }
+        if let Some(progress) = progress.as_deref_mut() {
+            progress.maybe_visited("list", budget.visited_entries);
+        }
+        let entry = entry?;
+        let entry_path = entry.path();
+        let kind = path_kind(&entry_path)?;
+        entries.push(ListEntry {
+            path: entry_path.display().to_string(),
+            kind,
+        });
+        if recursive && entry_path.is_dir() {
+            collect_entries(
+                &entry_path,
+                recursive,
+                max_entries,
+                budget,
+                entries,
+                progress.as_deref_mut(),
+            )?;
+        }
+    }
+    Ok(())
+}
+
+fn find_paths(request: &FindRequest) -> Result<FindResponse, std::io::Error> {
+    find_paths_with_cancellation(
+        request,
+        bcode_plugin_sdk::ServiceCancellation::default(),
+        None,
+    )
+}
+
+fn find_paths_with_cancellation(
+    request: &FindRequest,
+    cancellation: bcode_plugin_sdk::ServiceCancellation,
+    progress: Option<&mut ProgressReporter>,
+) -> Result<FindResponse, std::io::Error> {
+    let max_results = request.max_results.unwrap_or(DEFAULT_FIND_MAX_RESULTS);
+    if let Some(response) = find_paths_with_fd(request, max_results)? {
+        return Ok(response);
+    }
+    if let Some(response) = find_paths_with_find(request, max_results)? {
+        return Ok(response);
+    }
+    find_paths_with_rust(request, max_results, cancellation, progress)
+}
+
+fn find_paths_with_rust(
+    request: &FindRequest,
+    max_results: usize,
+    cancellation: bcode_plugin_sdk::ServiceCancellation,
+    mut progress: Option<&mut ProgressReporter>,
+) -> Result<FindResponse, std::io::Error> {
+    let mut budget = SearchBudget::new(request.timeout_ms, cancellation);
+    let mut paths = Vec::new();
+    collect_find_matches(
+        &request.path,
+        &request.path,
+        &request.pattern,
+        max_results,
+        &mut budget,
+        &mut paths,
+        progress.as_deref_mut(),
+    )?;
+    if let Some(progress) = progress {
+        progress.emit(format!(
+            "find: visited {} entries; matched {}",
+            budget.visited_entries,
+            paths.len()
+        ));
+    }
+    paths.sort();
+    let partial = budget.timed_out || paths.len() >= max_results;
+    Ok(FindResponse {
+        paths,
+        backend: "rust".to_string(),
+        timed_out: budget.timed_out,
+        partial,
+        visited_entries: budget.visited_entries,
+        message: budget
+            .timed_out
+            .then(|| timeout_message("find", budget.elapsed_timeout_ms())),
+    })
+}
+
+fn collect_find_matches(
+    root: &Path,
+    path: &Path,
+    pattern: &str,
+    max_results: usize,
+    budget: &mut SearchBudget,
+    paths: &mut Vec<String>,
+    mut progress: Option<&mut ProgressReporter>,
+) -> Result<(), std::io::Error> {
+    if paths.len() >= max_results || !budget.check() {
+        return Ok(());
+    }
+    for entry in std::fs::read_dir(path)? {
+        if paths.len() >= max_results || !budget.visit() {
+            break;
+        }
+        if let Some(progress) = progress.as_deref_mut() {
+            progress.maybe_visited("find", budget.visited_entries);
+        }
+        let entry = entry?;
+        let entry_path = entry.path();
+        let relative = entry_path.strip_prefix(root).unwrap_or(&entry_path);
+        let relative = relative.to_string_lossy();
+        let file_name = entry.file_name().to_string_lossy().into_owned();
+        if simple_glob_matches(pattern, &relative) || simple_glob_matches(pattern, &file_name) {
+            paths.push(entry_path.display().to_string());
+        }
+        if entry_path.is_dir() {
+            collect_find_matches(
+                root,
+                &entry_path,
+                pattern,
+                max_results,
+                budget,
+                paths,
+                progress.as_deref_mut(),
+            )?;
+        }
+    }
+    Ok(())
+}
+
+fn grep_files(request: &GrepRequest) -> Result<GrepResponse, std::io::Error> {
+    grep_files_with_cancellation(
+        request,
+        bcode_plugin_sdk::ServiceCancellation::default(),
+        None,
+    )
+}
+
+fn grep_files_with_cancellation(
+    request: &GrepRequest,
+    cancellation: bcode_plugin_sdk::ServiceCancellation,
+    progress: Option<&mut ProgressReporter>,
+) -> Result<GrepResponse, std::io::Error> {
+    let max_matches = request.max_matches.unwrap_or(DEFAULT_GREP_MAX_MATCHES);
+    if let Some(response) = grep_files_with_rg(request, max_matches)? {
+        return Ok(response);
+    }
+    grep_files_with_rust(request, max_matches, cancellation, progress)
+}
+
+fn grep_files_with_rust(
+    request: &GrepRequest,
+    max_matches: usize,
+    cancellation: bcode_plugin_sdk::ServiceCancellation,
+    mut progress: Option<&mut ProgressReporter>,
+) -> Result<GrepResponse, std::io::Error> {
+    let mut budget = SearchBudget::new(request.timeout_ms, cancellation);
+    let mut matches = Vec::new();
+    let mut summary = ProgressSummary::default();
+    collect_grep_matches(
+        &request.path,
+        request,
+        max_matches,
+        &mut budget,
+        &mut matches,
+        &mut summary,
+        progress.as_deref_mut(),
+    )?;
+    if let Some(progress) = progress {
+        progress.emit(format!(
+            "grep: visited {} entries; matched {}; scanned {} bytes",
+            budget.visited_entries, summary.matches, summary.bytes_scanned
+        ));
+    }
+    let partial = budget.timed_out || matches.len() >= max_matches;
+    Ok(GrepResponse {
+        matches,
+        backend: "rust".to_string(),
+        timed_out: budget.timed_out,
+        partial,
+        visited_entries: budget.visited_entries,
+        message: budget
+            .timed_out
+            .then(|| timeout_message("grep", budget.elapsed_timeout_ms())),
+    })
+}
+
+fn collect_grep_matches(
+    path: &Path,
+    request: &GrepRequest,
+    max_matches: usize,
+    budget: &mut SearchBudget,
+    matches: &mut Vec<GrepMatch>,
+    summary: &mut ProgressSummary,
+    mut progress: Option<&mut ProgressReporter>,
+) -> Result<(), std::io::Error> {
+    if matches.len() >= max_matches || !budget.check() {
+        return Ok(());
+    }
+    if path.is_dir() {
+        for entry in std::fs::read_dir(path)? {
+            if matches.len() >= max_matches || !budget.visit() {
+                break;
+            }
+            if let Some(progress) = progress.as_deref_mut() {
+                progress.maybe_visited("grep", budget.visited_entries);
+            }
+            collect_grep_matches(
+                &entry?.path(),
+                request,
+                max_matches,
+                budget,
+                matches,
+                summary,
+                progress.as_deref_mut(),
+            )?;
+        }
+        return Ok(());
+    }
+    if !path.is_file() || !path_matches_optional_glob(path, request.glob.as_deref()) {
+        return Ok(());
+    }
+    let metadata = std::fs::metadata(path)?;
+    if metadata.len() > MAX_RUST_GREP_FILE_BYTES {
+        return Ok(());
+    }
+    summary.bytes_scanned = summary.bytes_scanned.saturating_add(metadata.len());
+    let Ok(contents) = std::fs::read_to_string(path) else {
+        return Ok(());
+    };
+    let needle = if request.ignore_case {
+        request.pattern.to_lowercase()
+    } else {
+        request.pattern.clone()
+    };
+    for (line_index, line) in contents.lines().enumerate() {
+        if matches.len() >= max_matches || !budget.check() {
+            break;
+        }
+        let haystack = if request.ignore_case {
+            line.to_lowercase()
+        } else {
+            line.to_string()
+        };
+        if haystack.contains(&needle) {
+            matches.push(GrepMatch {
+                path: path.display().to_string(),
+                line_number: line_index.saturating_add(1),
+                line: line.to_string(),
+            });
+            summary.matches = summary.matches.saturating_add(1);
+            if let Some(progress) = progress.as_deref_mut()
+                && summary.matches.is_multiple_of(25)
+            {
+                progress.emit(format!("grep: matched {} lines", summary.matches));
+            }
+        }
+    }
+    Ok(())
+}
+
+struct ExternalCommandOutput {
+    stdout: String,
+    stderr: String,
+    exit_code: Option<i32>,
+    timed_out: bool,
+}
+
+fn grep_files_with_rg(
+    request: &GrepRequest,
+    max_matches: usize,
+) -> Result<Option<GrepResponse>, std::io::Error> {
+    if !command_exists("rg") {
+        return Ok(None);
+    }
+    let mut command = Command::new("rg");
+    configure_command_for_timeout(&mut command);
+    command
+        .arg("--json")
+        .arg("--color")
+        .arg("never")
+        .arg("--fixed-strings")
+        .arg("--line-number");
+    if request.ignore_case {
+        command.arg("--ignore-case");
+    }
+    if let Some(glob) = &request.glob {
+        command.arg("--glob").arg(glob);
+    }
+    command.arg(&request.pattern).arg(&request.path);
+    let output = run_external_command(command, request.timeout_ms)?;
+    if output.exit_code == Some(127) {
+        return Ok(None);
+    }
+    let mut matches = parse_rg_json_matches(&output.stdout, max_matches);
+    let limit_reached = matches.len() >= max_matches;
+    if matches.len() > max_matches {
+        matches.truncate(max_matches);
+    }
+    let partial = output.timed_out || limit_reached;
+    Ok(Some(GrepResponse {
+        matches,
+        backend: "rg".to_string(),
+        timed_out: output.timed_out,
+        partial,
+        visited_entries: 0,
+        message: external_message("grep", &output, partial, max_matches, request.timeout_ms),
+    }))
+}
+
+fn parse_rg_json_matches(output: &str, max_matches: usize) -> Vec<GrepMatch> {
+    let mut matches = Vec::new();
+    for line in output.lines() {
+        if matches.len() >= max_matches {
+            break;
+        }
+        let Ok(value) = serde_json::from_str::<serde_json::Value>(line) else {
+            continue;
+        };
+        if value.get("type").and_then(serde_json::Value::as_str) != Some("match") {
+            continue;
+        }
+        let Some(data) = value.get("data") else {
+            continue;
+        };
+        let path = data
+            .get("path")
+            .and_then(|path| path.get("text"))
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or_default()
+            .to_string();
+        let line_number = data
+            .get("line_number")
+            .and_then(serde_json::Value::as_u64)
+            .and_then(|line| usize::try_from(line).ok())
+            .unwrap_or_default();
+        let line = data
+            .get("lines")
+            .and_then(|lines| lines.get("text"))
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or_default()
+            .trim_end_matches(['\r', '\n'])
+            .to_string();
+        matches.push(GrepMatch {
+            path,
+            line_number,
+            line,
+        });
+    }
+    matches
+}
+
+fn find_paths_with_fd(
+    request: &FindRequest,
+    max_results: usize,
+) -> Result<Option<FindResponse>, std::io::Error> {
+    if !command_exists("fd") {
+        return Ok(None);
+    }
+    let mut command = Command::new("fd");
+    configure_command_for_timeout(&mut command);
+    command
+        .arg("--color")
+        .arg("never")
+        .arg("--glob")
+        .arg("--max-results")
+        .arg(max_results.to_string())
+        .arg(&request.pattern)
+        .arg(&request.path);
+    let output = run_external_command(command, request.timeout_ms)?;
+    let paths = output
+        .stdout
+        .lines()
+        .take(max_results)
+        .map(ToString::to_string)
+        .collect::<Vec<_>>();
+    let partial = output.timed_out || paths.len() >= max_results;
+    Ok(Some(FindResponse {
+        paths,
+        backend: "fd".to_string(),
+        timed_out: output.timed_out,
+        partial,
+        visited_entries: 0,
+        message: external_message("find", &output, partial, max_results, request.timeout_ms),
+    }))
+}
+
+fn find_paths_with_find(
+    request: &FindRequest,
+    max_results: usize,
+) -> Result<Option<FindResponse>, std::io::Error> {
+    if !command_exists("find") {
+        return Ok(None);
+    }
+    let mut command = Command::new("find");
+    configure_command_for_timeout(&mut command);
+    command
+        .arg(&request.path)
+        .arg("(")
+        .arg("-name")
+        .arg(&request.pattern)
+        .arg("-o")
+        .arg("-path")
+        .arg(&request.pattern)
+        .arg(")")
+        .arg("-print");
+    let output = run_external_command(command, request.timeout_ms)?;
+    let mut paths = output
+        .stdout
+        .lines()
+        .take(max_results)
+        .map(ToString::to_string)
+        .collect::<Vec<_>>();
+    paths.sort();
+    let partial = output.timed_out || paths.len() >= max_results;
+    Ok(Some(FindResponse {
+        paths,
+        backend: "find".to_string(),
+        timed_out: output.timed_out,
+        partial,
+        visited_entries: 0,
+        message: external_message("find", &output, partial, max_results, request.timeout_ms),
+    }))
+}
+
+fn external_message(
+    kind: &str,
+    output: &ExternalCommandOutput,
+    partial: bool,
+    max_results: usize,
+    timeout_ms: Option<u64>,
+) -> Option<String> {
+    if output.timed_out {
+        return Some(timeout_message(
+            kind,
+            timeout_ms.unwrap_or(DEFAULT_SEARCH_TIMEOUT_MS),
+        ));
+    }
+    if partial {
+        return Some(format!(
+            "{kind} stopped after reaching limit {max_results}; results are partial"
+        ));
+    }
+    if !output.stderr.trim().is_empty() && !matches!(output.exit_code, Some(0 | 1)) {
+        return Some(output.stderr.trim().to_string());
+    }
+    None
+}
+
+fn command_exists(command: &str) -> bool {
+    Command::new(command)
+        .arg("--version")
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .is_ok()
+}
+
+fn run_external_command(
+    mut command: Command,
+    timeout_ms: Option<u64>,
+) -> Result<ExternalCommandOutput, std::io::Error> {
+    command.stdout(Stdio::piped()).stderr(Stdio::piped());
+    let mut child = command.spawn()?;
+    let stdout = child
+        .stdout
+        .take()
+        .ok_or_else(|| std::io::Error::other("failed to capture stdout"))?;
+    let stderr = child
+        .stderr
+        .take()
+        .ok_or_else(|| std::io::Error::other("failed to capture stderr"))?;
+    let stdout_reader = std::thread::spawn(move || read_limited(stdout, MAX_EXTERNAL_OUTPUT_BYTES));
+    let stderr_reader = std::thread::spawn(move || read_limited(stderr, MAX_EXTERNAL_OUTPUT_BYTES));
+    let timeout = Duration::from_millis(timeout_ms.unwrap_or(DEFAULT_SEARCH_TIMEOUT_MS));
+    let started = Instant::now();
+    let mut timed_out = false;
+    let status = loop {
+        if let Some(status) = child.try_wait()? {
+            break status;
+        }
+        if started.elapsed() >= timeout {
+            timed_out = true;
+            break terminate_child_after_timeout(&mut child)?;
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    };
+    Ok(ExternalCommandOutput {
+        stdout: join_reader(stdout_reader)?,
+        stderr: join_reader(stderr_reader)?,
+        exit_code: status.code(),
+        timed_out,
+    })
+}
+
+#[cfg(unix)]
+fn configure_command_for_timeout(command: &mut Command) {
+    command.process_group(0);
+}
+
+#[cfg(not(unix))]
+const fn configure_command_for_timeout(_command: &mut Command) {}
+
+#[cfg(unix)]
+fn terminate_child_after_timeout(child: &mut Child) -> Result<ExitStatus, std::io::Error> {
+    let process_group_id = i32::try_from(child.id()).map_err(std::io::Error::other)?;
+    send_signal_to_process_group(process_group_id, SIGTERM)?;
+    let grace_started = Instant::now();
+    let mut status = None;
+    loop {
+        if status.is_none() {
+            status = child.try_wait()?;
+        }
+        if status.is_some()
+            || grace_started.elapsed() >= Duration::from_millis(TERMINATION_GRACE_MS)
+        {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    send_signal_to_process_group(process_group_id, SIGKILL)?;
+    status.map_or_else(|| child.wait(), Ok)
+}
+
+#[cfg(not(unix))]
+fn terminate_child_after_timeout(child: &mut Child) -> Result<ExitStatus, std::io::Error> {
+    child.kill()?;
+    child.wait()
+}
+
+#[cfg(unix)]
+const SIGTERM: i32 = 15;
+#[cfg(unix)]
+const SIGKILL: i32 = 9;
+#[cfg(unix)]
+const ESRCH: i32 = 3;
+
+#[cfg(unix)]
+unsafe extern "C" {
+    fn kill(pid: i32, sig: i32) -> i32;
+}
+
+#[cfg(unix)]
+fn send_signal_to_process_group(process_group_id: i32, signal: i32) -> Result<(), std::io::Error> {
+    let target = process_group_id
+        .checked_neg()
+        .ok_or_else(|| std::io::Error::other("process group id cannot be negated"))?;
+    // SAFETY: `kill` targets the process group created by `CommandExt::process_group(0)`.
+    let result = unsafe { kill(target, signal) };
+    if result == 0 {
+        return Ok(());
+    }
+    let error = std::io::Error::last_os_error();
+    if error.raw_os_error() == Some(ESRCH) {
+        return Ok(());
+    }
+    Err(error)
+}
+
+fn read_limited<R>(mut reader: R, max_bytes: usize) -> Result<String, std::io::Error>
+where
+    R: Read,
+{
+    let mut bytes = Vec::new();
+    let limit = u64::try_from(max_bytes).map_err(std::io::Error::other)?;
+    reader.by_ref().take(limit).read_to_end(&mut bytes)?;
+    Ok(String::from_utf8_lossy(&bytes).into_owned())
+}
+
+fn join_reader(
+    handle: std::thread::JoinHandle<Result<String, std::io::Error>>,
+) -> Result<String, std::io::Error> {
+    handle
+        .join()
+        .map_err(|_| std::io::Error::other("output reader thread panicked"))?
+}
+
+fn metadata_kind(metadata: &std::fs::Metadata) -> String {
+    if metadata.is_dir() {
+        "directory".to_string()
+    } else if metadata.is_file() {
+        "file".to_string()
+    } else {
+        "other".to_string()
+    }
+}
+
+fn stat_path(request: &StatRequest) -> Result<StatResponse, std::io::Error> {
+    match std::fs::metadata(&request.path) {
+        Ok(metadata) => Ok(StatResponse {
+            exists: true,
+            kind: metadata_kind(&metadata),
+            len: metadata.is_file().then_some(metadata.len()),
+        }),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(StatResponse {
+            exists: false,
+            kind: "missing".to_string(),
+            len: None,
+        }),
+        Err(error) => Err(error),
+    }
+}
+
+fn path_kind(path: &Path) -> Result<String, std::io::Error> {
+    let metadata = std::fs::metadata(path)?;
+    Ok(if metadata.is_dir() {
+        "directory".to_string()
+    } else if metadata.is_file() {
+        "file".to_string()
+    } else {
+        "other".to_string()
+    })
+}
+
+fn path_matches_optional_glob(path: &Path, glob: Option<&str>) -> bool {
+    glob.is_none_or(|glob| {
+        path.file_name()
+            .and_then(std::ffi::OsStr::to_str)
+            .is_some_and(|file_name| simple_glob_matches(glob, file_name))
+            || simple_glob_matches(glob, &path.to_string_lossy())
+    })
+}
+
+fn simple_glob_matches(pattern: &str, value: &str) -> bool {
+    if pattern == "*" {
+        return true;
+    }
+    let mut remainder = value;
+    let mut first = true;
+    for part in pattern.split('*') {
+        if part.is_empty() {
+            continue;
+        }
+        if first && !pattern.starts_with('*') {
+            let Some(next) = remainder.strip_prefix(part) else {
+                return false;
+            };
+            remainder = next;
+        } else if let Some(index) = remainder.find(part) {
+            remainder = &remainder[index + part.len()..];
+        } else {
+            return false;
+        }
+        first = false;
+    }
+    pattern.ends_with('*') || remainder.is_empty()
+}
+
+fn write_file_inner(path: &std::path::Path, contents: &str) -> Result<usize, std::io::Error> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    std::fs::write(path, contents.as_bytes())?;
+    Ok(contents.len())
+}
+
+fn edit_file_inner(request: &EditRequest) -> Result<(usize, u32), String> {
+    let contents = std::fs::read_to_string(&request.path).map_err(|error| error.to_string())?;
+    let matches = contents.matches(&request.old_text).count();
+    if matches != 1 {
+        return Err(format!(
+            "old_text must match exactly once, found {matches} matches"
+        ));
+    }
+    // Retain legacy empty-search behavior for the existing single-edit interface.
+    let (updated, match_offset) = if request.old_text.is_empty() {
+        (
+            contents.replacen(&request.old_text, &request.new_text, 1),
+            0,
+        )
+    } else {
+        replacement::replace_snapshot(
+            &contents,
+            &[(&request.old_text, &request.new_text)],
+            usize::MAX,
+            true,
+        )?
+    };
+    let start_line = u32::try_from(
+        contents[..match_offset]
+            .bytes()
+            .filter(|byte| *byte == b'\n')
+            .count(),
+    )
+    .unwrap_or(u32::MAX)
+    .saturating_add(1);
+    std::fs::write(&request.path, updated.as_bytes()).map_err(|error| error.to_string())?;
+    Ok((1, start_line))
+}
+
+fn json_response<T: Serialize>(value: &T) -> ServiceResponse {
+    match ServiceResponse::json(value) {
+        Ok(response) => response,
+        Err(error) => ServiceResponse::error("encode_failed", error.to_string()),
+    }
+}
+
+fn invalid_request(error: &serde_json::Error) -> ServiceResponse {
+    ServiceResponse::error("invalid_request", error.to_string())
+}
+
+fn io_error(error: &std::io::Error) -> ServiceResponse {
+    ServiceResponse::error("io_error", error.to_string())
+}
+
+const fn tool_error(output: String) -> ToolInvocationResponse {
+    ToolInvocationResponse {
+        output,
+        is_error: true,
+        content: Vec::new(),
+        full_output: None,
+        result: None,
+    }
+}
+
+fn tool_io_error(error: &std::io::Error) -> ToolInvocationResponse {
+    ToolInvocationResponse {
+        output: error.to_string(),
+        is_error: true,
+        content: Vec::new(),
+        full_output: None,
+        result: None,
+    }
+}
+
+fn tool_json_error(error: &serde_json::Error) -> ToolInvocationResponse {
+    ToolInvocationResponse {
+        output: error.to_string(),
+        is_error: true,
+        content: Vec::new(),
+        full_output: None,
+        result: None,
+    }
+}
+
+fn json_tool_response_with_artifact<T>(
+    result: Result<T, serde_json::Error>,
+    tool_call_id: &str,
+    artifact_suffix: &str,
+    schema: &str,
+    title: &str,
+) -> ToolInvocationResponse
+where
+    T: Serialize,
+{
+    match result.and_then(|value| {
+        let payload = serde_json::to_value(&value)?;
+        let output = serde_json::to_string_pretty(&value)?;
+        Ok((output, payload))
+    }) {
+        Ok((output, payload)) => ToolInvocationResponse {
+            output,
+            is_error: false,
+            content: Vec::new(),
+            full_output: None,
+            result: Some(filesystem_artifact_result(
+                tool_call_id,
+                artifact_suffix,
+                schema,
+                title,
+                payload,
+            )),
+        },
+        Err(error) => ToolInvocationResponse {
+            output: error.to_string(),
+            is_error: true,
+            content: Vec::new(),
+            full_output: None,
+            result: None,
+        },
+    }
+}
+
+fn filesystem_artifact_result(
+    tool_call_id: &str,
+    artifact_suffix: &str,
+    schema: &str,
+    title: &str,
+    payload: serde_json::Value,
+) -> ToolInvocationResult {
+    ToolInvocationResult::Artifact {
+        artifact: Box::new(ToolArtifact {
+            artifact_id: format!("{tool_call_id}-filesystem-{artifact_suffix}"),
+            producer_plugin_id: FILESYSTEM_PLUGIN_ID.to_string(),
+            schema: schema.to_string(),
+            schema_version: 1,
+            tool_call_id: Some(tool_call_id.to_string()),
+            title: Some(title.to_string()),
+            metadata: payload,
+            refs: Vec::new(),
+        }),
+    }
+}
+
+#[cfg(feature = "static-bundled")]
+#[must_use]
+pub fn static_plugin() -> bcode_plugin_sdk::StaticPluginVtable {
+    bcode_plugin_sdk::static_plugin_vtable!(FilesystemPlugin, include_str!("../bcode-plugin.toml"))
+}
+
+#[cfg(feature = "static-bundled")]
+#[must_use]
+pub fn filesystem_tui_registry() -> bcode_plugin_sdk::tui::PluginTuiRegistry {
+    let mut registry = bcode_plugin_sdk::tui::PluginTuiRegistry::default();
+    registry.register_visual_adapter(
+        ["filesystem-change-card", "filesystem-batch-card"],
+        Box::new(file_change_tui::FileChangeTuiVisualAdapter::default()),
+    );
+    registry.register_visual_adapter(
+        [
+            "filesystem-write-request-draft",
+            "filesystem-edit-request-draft",
+            "filesystem-multi-edit-request-draft",
+            "filesystem-request-card",
+            "filesystem-read-card",
+            "filesystem-image-card",
+            "filesystem-exists-card",
+            "filesystem-list-card",
+            "filesystem-find-card",
+            "filesystem-grep-card",
+            "filesystem-stat-card",
+            "filesystem-artifact-metadata-card",
+            "filesystem-artifact-read-card",
+            "filesystem-artifact-grep-card",
+        ],
+        Box::<filesystem_tui::FilesystemTuiVisualAdapter>::default(),
+    );
+    registry
+}
+
+#[cfg(not(feature = "static-bundled"))]
+bcode_plugin_sdk::export_plugin!(FilesystemPlugin, include_str!("../bcode-plugin.toml"));
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn file_read_digest_covers_hidden_bytes_and_distinguishes_newlines() {
+        use sha2::Digest;
+        let request = super::ReadRequest {
+            path: "fixture.txt".into(),
+            offset: Some(1),
+            limit: Some(1),
+        };
+        let mut observed = Vec::new();
+        for bytes in [
+            b"line\nrest\n".as_slice(),
+            b"line\r\nrest\r\n".as_slice(),
+            b"line\nchanged\n".as_slice(),
+        ] {
+            let response = super::text_tool_response(
+                std::path::Path::new("fixture.txt"),
+                &request,
+                bytes,
+                std::path::Path::new("."),
+                "read",
+            );
+            let digest = hex::encode(sha2::Sha256::digest(bytes));
+            assert!(!response.is_error);
+            assert!(response.output.contains(&digest));
+            assert!(response.output.starts_with("line\n"));
+            observed.push(digest);
+        }
+        assert_ne!(observed[0], observed[1]);
+        assert_ne!(observed[0], observed[2]);
+    }
+
+    use super::*;
+    use std::ffi::c_void;
+    use std::sync::Mutex;
+
+    extern "C" fn capture_presentation_update(
+        payload: *const u8,
+        payload_len: usize,
+        user_data: *mut c_void,
+    ) {
+        // SAFETY: this test keeps the collector alive and the emitter invokes synchronously.
+        let updates = unsafe { &*(user_data.cast::<Mutex<Vec<Vec<u8>>>>()) };
+        // SAFETY: the emitter supplies a valid payload pointer and length for the callback.
+        let payload = unsafe { std::slice::from_raw_parts(payload, payload_len) };
+        updates
+            .lock()
+            .expect("update collector")
+            .push(payload.to_vec());
+    }
+
+    fn invoke_tool_with_captured_presentations(
+        tool_call_id: &str,
+        name: &str,
+        arguments: serde_json::Value,
+        workspace_root: &Path,
+    ) -> (
+        ToolInvocationResponse,
+        Vec<bcode_tool::ToolPresentationUpdate>,
+    ) {
+        let updates = Mutex::new(Vec::<Vec<u8>>::new());
+        let mut context = NativeServiceContext {
+            plugin_id: FILESYSTEM_PLUGIN_ID.to_owned(),
+            request: ServiceRequest {
+                interface_id: bcode_tool::TOOL_SERVICE_INTERFACE_ID.to_owned(),
+                operation: bcode_tool::OP_INVOKE_TOOL.to_owned(),
+                payload: serde_json::to_vec(&ToolInvocationRequest {
+                    tool_call_id: tool_call_id.to_owned(),
+                    name: name.to_owned(),
+                    arguments,
+                    preparation_descriptor: serde_json::Value::Null,
+                })
+                .expect("tool request"),
+            },
+            config: bcode_plugin_sdk::PluginConfigContext::default(),
+            events: ServiceEventEmitter::new(
+                Some(capture_presentation_update),
+                std::ptr::from_ref(&updates).cast_mut().cast(),
+            ),
+            cancellation: bcode_plugin_sdk::ServiceCancellation::default(),
+            bridge: bcode_plugin_sdk::ServiceBridge::default(),
+            transient_progress_limits: bcode_plugin_sdk::TransientProgressLimits::default(),
+        };
+        let invocation: ToolInvocationRequest =
+            serde_json::from_slice(&context.request.payload).unwrap();
+        context.request.operation = bcode_tool::OP_PREPARE_TOOL.to_owned();
+        context.request.payload = serde_json::to_vec(&bcode_tool::ToolPreparationRequest {
+            invocation: bcode_tool::ToolInvocationDescriptor {
+                invocation_id: tool_call_id.to_owned(),
+                tool_name: name.to_owned(),
+                arguments: invocation.arguments.clone(),
+            },
+            host_context: workspace_context(workspace_root),
+        })
+        .unwrap();
+        let prepared = invoke_tool_service(&context);
+        assert!(prepared.error.is_none(), "{:?}", prepared.error);
+        let prepared: bcode_tool::ToolPreparationResponse =
+            serde_json::from_slice(&prepared.payload).unwrap();
+        context.request.operation = bcode_tool::OP_INVOKE_TOOL.to_owned();
+        context.request.payload = serde_json::to_vec(&ToolInvocationRequest {
+            preparation_descriptor: prepared.descriptor,
+            ..invocation
+        })
+        .unwrap();
+        let response = invoke_tool_service(&context);
+        let response = serde_json::from_slice::<ToolInvocationResponse>(&response.payload)
+            .expect("tool response");
+        let updates = updates
+            .lock()
+            .expect("updates")
+            .iter()
+            .map(|payload| {
+                serde_json::from_slice::<bcode_tool::ToolPresentationUpdate>(payload)
+                    .expect("presentation update")
+            })
+            .collect();
+        (response, updates)
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn service_batch_validation_failure_preserves_every_target() {
+        let root = temp_dir("batch-service-invalid-tail");
+        let first = root.join("first.txt");
+        let second = root.join("second.txt");
+        std::fs::write(&first, "alpha\r\n").unwrap();
+        std::fs::write(&second, "beta\n").unwrap();
+        let (response, updates) = invoke_tool_with_captured_presentations(
+            "batch-invalid",
+            "filesystem.multi_edit",
+            json!({"files":[
+                {"path":first,"edits":[{"old_text":"alpha","new_text":"changed"}]},
+                {"path":second,"edits":[{"old_text":"missing","new_text":"changed"}]}
+            ]}),
+            &root,
+        );
+        assert!(response.is_error);
+        assert_eq!(std::fs::read(&first).unwrap(), b"alpha\r\n");
+        assert_eq!(std::fs::read(&second).unwrap(), b"beta\n");
+        assert_eq!(std::fs::read_dir(&root).unwrap().count(), 2);
+        assert_eq!(updates.len(), 2);
+        assert_eq!(updates[1].schema, "bcode.filesystem.result");
+        assert_eq!(updates[1].payload["is_error"], true);
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn batch_and_independent_single_edits_produce_identical_bytes() {
+        let root = temp_dir("batch-single-comparison");
+        // Representative source, escaped configuration, and mixed-newline Unicode text.
+        for (index, (original, edits)) in [
+            (
+                "fn old() { old_helper(); }\n",
+                [("fn old", "fn new"), ("old_helper", "new_helper")],
+            ),
+            (
+                "{\"path\":\"C:\\\\old\",\"enabled\":false}\n",
+                [("old", "new"), ("false", "true")],
+            ),
+            (
+                "\u{feff}日本語\r\nalpha\nbeta",
+                [("alpha", "α"), ("beta", "β")],
+            ),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let batch_path = root.join(format!("batch-{index}"));
+            let single_path = root.join(format!("single-{index}"));
+            std::fs::write(&batch_path, original).unwrap();
+            std::fs::write(&single_path, original).unwrap();
+            let replacements: Vec<_> = edits
+                .iter()
+                .map(|(old, new)| json!({"old_text":old,"new_text":new}))
+                .collect();
+            let (batch, _) = invoke_tool_with_captured_presentations(
+                "comparison-batch",
+                "filesystem.multi_edit",
+                json!({"files":[{"path":batch_path,"edits":replacements}]}),
+                &root,
+            );
+            assert!(!batch.is_error, "{}", batch.output);
+            let mut expected = original.to_owned();
+            for (old, new) in edits {
+                let (single, _) = invoke_tool_with_captured_presentations(
+                    "comparison-single",
+                    "filesystem.edit",
+                    json!({"path":single_path,"old_text":old,"new_text":new}),
+                    &root,
+                );
+                assert!(!single.is_error, "{}", single.output);
+                expected = expected.replace(old, new);
+            }
+            assert_eq!(std::fs::read(&batch_path).unwrap(), expected.as_bytes());
+            assert_eq!(std::fs::read(&single_path).unwrap(), expected.as_bytes());
+        }
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn listed_multi_edit_prepares_and_invokes_with_batch_presentation() {
+        let response = list_tools(&ServiceRequest {
+            interface_id: bcode_tool::TOOL_SERVICE_INTERFACE_ID.to_owned(),
+            operation: bcode_tool::OP_LIST_TOOLS.to_owned(),
+            payload: b"{}".to_vec(),
+        });
+        let list: ToolList = serde_json::from_slice(&response.payload).unwrap();
+        assert!(
+            list.tools
+                .iter()
+                .any(|tool| tool.name == "filesystem.multi_edit")
+        );
+        let root = temp_dir("batch-service-chain");
+        let first = root.join("first.txt");
+        let second = root.join("second.txt");
+        std::fs::write(&first, "alpha beta").unwrap();
+        std::fs::write(&second, "gamma").unwrap();
+        let (response, updates) = invoke_tool_with_captured_presentations(
+            "batch-chain",
+            "filesystem.multi_edit",
+            json!({"files":[
+                {"path":first,"edits":[{"old_text":"beta","new_text":"B"},{"old_text":"alpha","new_text":"A"}]},
+                {"path":second,"edits":[{"old_text":"gamma","new_text":"G"}]}
+            ]}),
+            &root,
+        );
+        assert!(!response.is_error, "{}", response.output);
+        assert_eq!(std::fs::read_to_string(first).unwrap(), "A B");
+        assert_eq!(std::fs::read_to_string(second).unwrap(), "G");
+        assert_eq!(updates.len(), 2);
+        assert_eq!(updates[1].schema, "bcode.filesystem.batch");
+        assert_eq!(updates[1].payload["files"][1]["status"], "committed");
+        let previews = &updates[1].payload["files"][0]["edit_previews"];
+        assert_eq!(previews["version"], 1);
+        assert_eq!(previews["edits"][0]["old_text"], "beta");
+        assert_eq!(previews["edits"][0]["new_text"], "B");
+        assert_eq!(previews["edits"][1]["old_text"], "alpha");
+        assert!(!response.output.contains("edit_previews"));
+    }
+
+    #[test]
+    fn filesystem_write_and_edit_services_replace_request_with_file_change() {
+        let root = temp_dir("service-presentation-chain");
+        let path = root.join("src/lib.rs");
+        for (tool_call_id, name, arguments, expected_old, expected_new) in [
+            (
+                "call-write",
+                "filesystem.write",
+                json!({"path": path, "contents": "before\n"}),
+                "",
+                "before\n",
+            ),
+            (
+                "call-edit",
+                "filesystem.edit",
+                json!({"path": path, "old_text": "before\n", "new_text": "after\n"}),
+                "before\n",
+                "after\n",
+            ),
+        ] {
+            let (response, updates) =
+                invoke_tool_with_captured_presentations(tool_call_id, name, arguments, &root);
+            assert!(!response.is_error, "{}", response.output);
+            assert_eq!(updates.len(), 2);
+            assert_eq!(updates[0].schema, FILESYSTEM_REQUEST_SCHEMA);
+            assert_eq!(updates[0].payload["operation"], name);
+            assert_eq!(updates[1].schema, "bcode.filesystem.change");
+            assert_eq!(updates[1].payload["old_text"], expected_old);
+            assert_eq!(updates[1].payload["new_text"], expected_new);
+            assert!(updates.iter().all(|update| {
+                update.invocation_id == tool_call_id
+                    && update.identity == bcode_tool::ToolPresentationIdentity::Primary
+                    && update.generation == 0
+            }));
+            assert_eq!(
+                updates
+                    .iter()
+                    .map(|update| update.revision)
+                    .collect::<Vec<_>>(),
+                vec![1, 2]
+            );
+        }
+    }
+
+    #[test]
+    #[cfg(feature = "static-bundled")]
+    fn registered_batch_adapter_is_reachable() {
+        let registry = filesystem_tui_registry();
+        assert!(
+            registry.supports_visual_adapter("filesystem-batch-card", "bcode.filesystem.batch")
+        );
+        assert!(
+            registry.supports_visual_adapter("filesystem-change-card", "bcode.filesystem.change")
+        );
+        assert!(!registry.supports_visual_adapter("filesystem-batch-card", "unrelated.schema"));
+    }
+
+    #[test]
+    #[cfg(feature = "static-bundled")]
+    fn registered_multi_edit_draft_projects_incomplete_arguments() {
+        let registry = filesystem_tui_registry();
+        let context = bcode_plugin_sdk::tui::PluginTuiVisualRenderContext::new(
+            80,
+            bcode_plugin_sdk::tui::PluginTuiDiffLayout::Unified,
+            None,
+        );
+        let preview = r#"{"files":[{"path":"first.rs","edits":[{"old_text":"original","new_text":"replacement"}]},{"path":"second.rs","edits":[{"new_text":"arriving"#;
+        let projection = registry
+            .visual_projection(
+                "filesystem-multi-edit-request-draft",
+                "bcode.filesystem.request-draft.multi-edit",
+                &json!({"preview": preview, "argument_bytes": preview.len()}),
+                &context,
+            )
+            .expect("registered draft adapter must produce a projection, not fallback");
+        let rendered = projection
+            .rows
+            .iter()
+            .flat_map(|line| line.spans.iter())
+            .map(|span| span.content.as_str())
+            .collect::<String>();
+        for expected in [
+            "first.rs",
+            "second.rs",
+            "original",
+            "replacement",
+            "arriving",
+            "not applied",
+        ] {
+            assert!(
+                rendered.contains(expected),
+                "missing {expected}: {rendered}"
+            );
+        }
+    }
+
+    #[test]
+    fn multipart_retention_stops_on_failure_without_claiming_partial_success() {
+        for reason in [
+            "cancelled",
+            "storage_failure",
+            "bridge_unavailable",
+            "size_limit",
+        ] {
+            let mut calls = Vec::new();
+            let result = super::retain_source_parts(b"abcdef", &mut |index, bytes| {
+                calls.push((index, bytes.to_vec()));
+                match index {
+                    0 => json!({"unavailable":true,"reason":"size_limit","max_bytes":2}),
+                    1 => json!({"byte_len":2,"reference":{"uri":"artifact://first"}}),
+                    2 => json!({"unavailable":true,"reason":reason}),
+                    _ => panic!("must stop after the first failed part"),
+                }
+            });
+            assert_eq!(result, json!({"unavailable":true,"reason":reason}));
+            assert_eq!(
+                calls,
+                vec![
+                    (0, b"abcdef".to_vec()),
+                    (1, b"ab".to_vec()),
+                    (2, b"cd".to_vec())
+                ]
+            );
+        }
+    }
+
+    #[test]
+    fn multipart_retention_rejects_invalid_or_excessive_partitioning() {
+        for limit in [json!(0), json!(1), json!(null), json!("invalid")] {
+            let mut calls = 0;
+            let failure = json!({"unavailable":true,"reason":"size_limit","max_bytes":limit});
+            let result = super::retain_source_parts(&[0; 65], &mut |_, _| {
+                calls += 1;
+                failure.clone()
+            });
+            assert_eq!(calls, 1);
+            assert_eq!(result, failure);
+        }
+        let mut calls = 0;
+        let result = super::retain_source_parts(&[0; 64], &mut |index, bytes| {
+            calls += 1;
+            if index == 0 {
+                json!({"unavailable":true,"reason":"size_limit","max_bytes":1})
+            } else {
+                json!({"byte_len":bytes.len(),"reference":{"uri":format!("artifact://{index}")}})
+            }
+        });
+        assert_eq!(calls, 65);
+        assert_eq!(result["parts"].as_array().unwrap().len(), 64);
+        assert_eq!(result["byte_len"], 64);
+    }
+
+    #[test]
+    fn retained_sources_split_at_host_limit_without_losing_utf8_bytes() {
+        let bytes = "🙂abc".repeat(10).into_bytes();
+        let mut stored = Vec::new();
+        let retained = super::retain_source_parts(&bytes, &mut |index, part| {
+            if part.len() > 5 {
+                return json!({"unavailable":true,"reason":"size_limit","max_bytes":5});
+            }
+            stored.extend_from_slice(part);
+            json!({"artifact_id":index.to_string(),"byte_len":part.len(),"reference":{"uri":format!("artifact://{index}")}})
+        });
+        assert_eq!(stored, bytes);
+        assert_eq!(retained["byte_len"], bytes.len());
+        for (index, part) in retained["parts"].as_array().unwrap().iter().enumerate() {
+            assert_eq!(part["offset"], index * 5);
+        }
+    }
+
+    #[test]
+    fn retained_source_failures_are_bounded_and_secret_safe() {
+        use bcode_tool::ToolArtifactWriteResolution;
+        assert_eq!(
+            super::retained_source_value(ToolArtifactWriteResolution::TooLarge { max_bytes: 1024 }),
+            json!({"unavailable":true,"reason":"size_limit","max_bytes":1024})
+        );
+        assert_eq!(
+            super::retained_source_value(ToolArtifactWriteResolution::Cancelled),
+            json!({"unavailable":true,"reason":"cancelled"})
+        );
+        assert_eq!(
+            super::retained_source_value(ToolArtifactWriteResolution::Failed {
+                code: "private-code".to_owned(),
+                message: "secret".repeat(10000)
+            }),
+            json!({"unavailable":true,"reason":"storage_failure"})
+        );
+    }
+
+    #[test]
+    fn batch_retained_sources_use_standard_artifact_references() {
+        let outcome = json!({"version":1,"files":[{"path":"large.rs","status":"committed","change":{"omitted":true,"retained":{
+            "old":{"artifact_id":"old-id","byte_len":20000,"reference":{"uri":"bcode-artifact://invocation/test/old"}},
+            "new":{"unavailable":true}
+        }}}]});
+        let ToolInvocationResult::Artifact { artifact } = batch_outcome_artifact("test", outcome)
+        else {
+            panic!("artifact expected")
+        };
+        assert_eq!(artifact.refs.len(), 1);
+        assert_eq!(artifact.refs[0].key, "file-0-old");
+        assert_eq!(artifact.refs[0].byte_len, Some(20000));
+        assert_eq!(
+            artifact.refs[0].storage_uri.as_deref(),
+            Some("bcode-artifact://invocation/test/old")
+        );
+        assert_eq!(artifact.metadata["files"][0]["status"], "committed");
+    }
+
+    #[test]
+    fn batch_response_publishes_versioned_outcomes() {
+        let updates = Mutex::new(Vec::<Vec<u8>>::new());
+        let events = ServiceEventEmitter::new(
+            Some(capture_presentation_update),
+            std::ptr::from_ref(&updates).cast_mut().cast(),
+        );
+        let mut presentation = PrimaryPresentationPublisher::with_limits_and_cancellation(
+            events,
+            "batch-call",
+            FILESYSTEM_PLUGIN_ID,
+            FILESYSTEM_REQUEST_SCHEMA,
+            1,
+            bcode_tool::ToolPresentationRetention::RetainLatest,
+            bcode_plugin_sdk::TransientProgressLimits::default(),
+            bcode_plugin_sdk::ServiceCancellation::default(),
+        );
+        let outcome = json!({"version":1,"is_error":true,"files":[{"path":"target","status":"unknown","error":"inspect before retrying","change":null}]});
+        let response = batch_tool_response(Ok(outcome), "batch-call");
+        assert!(response.is_error);
+        publish_filesystem_result_presentation(&mut presentation, &response);
+        let updates = updates.lock().unwrap();
+        assert_eq!(updates.len(), 1);
+        let update: bcode_tool::ToolPresentationUpdate =
+            serde_json::from_slice(&updates[0]).unwrap();
+        drop(updates);
+        assert_eq!(update.schema, "bcode.filesystem.batch");
+        assert_eq!(update.revision, 1);
+    }
+
+    #[test]
+    fn filesystem_primary_presentation_replaces_request_with_file_change() {
+        let updates = Mutex::new(Vec::<Vec<u8>>::new());
+        let events = ServiceEventEmitter::new(
+            Some(capture_presentation_update),
+            std::ptr::from_ref(&updates).cast_mut().cast(),
+        );
+        let mut presentation = PrimaryPresentationPublisher::with_limits_and_cancellation(
+            events,
+            "call-1",
+            FILESYSTEM_PLUGIN_ID,
+            FILESYSTEM_REQUEST_SCHEMA,
+            1,
+            bcode_tool::ToolPresentationRetention::RetainLatest,
+            bcode_plugin_sdk::TransientProgressLimits::default(),
+            bcode_plugin_sdk::ServiceCancellation::default(),
+        );
+        presentation
+            .replace(&filesystem_request_payload(
+                "filesystem.write",
+                &json!({"path": "new.rs", "contents": "fn main() {}"}),
+            ))
+            .expect("request presentation");
+        let response = ToolInvocationResponse {
+            output: "wrote 12 bytes".to_owned(),
+            is_error: false,
+            content: Vec::new(),
+            full_output: None,
+            result: Some(file_change_artifact(
+                "call-1",
+                "filesystem.write",
+                "wrote 12 bytes",
+                Some(Path::new("new.rs")),
+                "",
+                "fn main() {}",
+                Some(1),
+            )),
+        };
+        publish_filesystem_result_presentation(&mut presentation, &response);
+
+        let updates = updates
+            .lock()
+            .expect("update collector")
+            .iter()
+            .map(|payload| {
+                serde_json::from_slice::<bcode_tool::ToolPresentationUpdate>(payload)
+                    .expect("typed presentation update")
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(updates.len(), 2);
+        assert_eq!(updates[0].revision, 1);
+        assert_eq!(updates[0].schema, FILESYSTEM_REQUEST_SCHEMA);
+        assert_eq!(updates[1].revision, 2);
+        assert_eq!(updates[1].schema, "bcode.filesystem.change");
+        assert_eq!(updates[1].payload["new_text"], "fn main() {}");
+        assert!(updates.iter().all(|update| {
+            update.identity == bcode_tool::ToolPresentationIdentity::Primary
+                && update.retention == bcode_tool::ToolPresentationRetention::RetainLatest
+        }));
+    }
+
+    #[test]
+    fn filesystem_requests_use_durable_generic_contributions_without_legacy_visuals() {
+        let arguments = serde_json::json!({"path": "src/lib.rs", "offset": 2});
+        let payload = filesystem_request_payload("filesystem.read", &arguments);
+        assert_eq!(payload["operation"], "filesystem.read");
+        assert_eq!(payload["path"], "src/lib.rs");
+        let write_arguments = serde_json::json!({"path": "new.rs", "contents": "fn main() {}"});
+        let write = filesystem_request_payload("filesystem.write", &write_arguments);
+        assert_eq!(write["operation"], "filesystem.write");
+        assert_eq!(write["contents"], "fn main() {}");
+    }
+
+    #[test]
+    fn filesystem_catalog_preparation_accepts_missing_resources() {
+        for definition in tool_definitions() {
+            let request = bcode_tool::ToolPreparationRequest {
+                invocation: bcode_tool::ToolInvocationDescriptor {
+                    invocation_id: "catalog".to_owned(),
+                    tool_name: definition.name.clone(),
+                    arguments: serde_json::Value::Null,
+                },
+                host_context: Vec::new(),
+            };
+            filesystem_policy_operation(&request, &definition)
+                .expect("catalog policy preparation should remain total");
+        }
+    }
+
+    fn workspace_context(path: &Path) -> Vec<bcode_tool::ToolHostContextEntry> {
+        vec![bcode_tool::ToolHostContextEntry {
+            schema: bcode_tool::TOOL_WORKSPACE_CONTEXT_SCHEMA.to_owned(),
+            schema_version: bcode_tool::TOOL_WORKSPACE_CONTEXT_SCHEMA_VERSION,
+            payload: serde_json::json!({"working_directory": path}),
+        }]
+    }
+
+    #[test]
+    fn filesystem_owner_prepares_path_operations_without_generic_extractors() {
+        let workspace = std::env::temp_dir();
+        let path = workspace.join("src/lib.rs");
+        let operation = |definition: ToolDefinition, arguments| {
+            let request = bcode_tool::ToolPreparationRequest {
+                invocation: bcode_tool::ToolInvocationDescriptor {
+                    invocation_id: "call".to_owned(),
+                    tool_name: definition.name.clone(),
+                    arguments,
+                },
+                host_context: workspace_context(&workspace),
+            };
+            filesystem_policy_operation(&request, &definition).expect("filesystem policy")
+        };
+        let read = operation(read_tool_definition(), json!({"path": "src/lib.rs"}));
+        assert!(!read.requires_permission);
+        assert_eq!(read.identity.aliases, vec!["read"]);
+        assert_eq!(read.identity.capabilities, vec!["filesystem.read"]);
+        assert_eq!(read.identity.permission_category.as_deref(), Some("read"));
+        assert_eq!(
+            read.operation,
+            bcode_plugin_sdk::ToolPolicyOperation::Read {
+                paths: vec![path.display().to_string()],
+            }
+        );
+        let write = operation(write_tool_definition(), json!({"path": "src/lib.rs"}));
+        assert!(write.requires_permission);
+        assert_eq!(write.identity.aliases, vec!["write"]);
+        assert_eq!(write.identity.capabilities, vec!["filesystem.write"]);
+        assert_eq!(write.identity.permission_category.as_deref(), Some("write"));
+        assert_eq!(
+            write.operation,
+            bcode_plugin_sdk::ToolPolicyOperation::Write {
+                paths: vec![path.display().to_string()],
+                category: "write".to_owned(),
+            }
+        );
+        assert_eq!(
+            serde_json::from_value::<FilesystemPreparationDescriptor>(write.descriptor)
+                .expect("Filesystem descriptor"),
+            FilesystemPreparationDescriptor {
+                workspace_root: Some(workspace),
+                path: Some(path),
+            }
+        );
+    }
+
+    #[test]
+    fn filesystem_relative_path_requires_workspace_context() {
+        let definition = read_tool_definition();
+        let request = bcode_tool::ToolPreparationRequest {
+            invocation: bcode_tool::ToolInvocationDescriptor {
+                invocation_id: "call".to_owned(),
+                tool_name: definition.name.clone(),
+                arguments: json!({"path": "src/lib.rs"}),
+            },
+            host_context: Vec::new(),
+        };
+
+        let error = filesystem_policy_operation(&request, &definition)
+            .expect_err("relative path without workspace");
+
+        assert!(error.contains("requires workspace host context"));
+    }
+
+    #[test]
+    fn filesystem_invocation_replaces_path_with_owner_prepared_path() {
+        let mut arguments = json!({"path": "src/lib.rs", "offset": 2});
+        let descriptor = FilesystemPreparationDescriptor {
+            workspace_root: Some(PathBuf::from("/tmp/workspace")),
+            path: Some(PathBuf::from("/tmp/workspace/src/lib.rs")),
+        };
+
+        apply_filesystem_preparation(&mut arguments, &descriptor)
+            .expect("apply Filesystem preparation");
+
+        assert_eq!(arguments["path"], "/tmp/workspace/src/lib.rs");
+        assert_eq!(arguments["offset"], 2);
+    }
+
+    #[test]
+    fn filesystem_invocation_rejects_missing_path_descriptor() {
+        let mut arguments = json!({"path": "src/lib.rs"});
+
+        let error = apply_filesystem_preparation(
+            &mut arguments,
+            &FilesystemPreparationDescriptor::default(),
+        )
+        .expect_err("missing prepared path");
+
+        assert!(error.contains("missing path"));
+    }
+
+    #[test]
+    fn progress_uses_neutral_invocation_lifecycle_contract() {
+        let event = progress_lifecycle_event("filesystem-call", 4, "searching".to_owned());
+        let encoded = serde_json::to_vec(&event).expect("lifecycle should encode");
+        let decoded: ToolInvocationLifecycleEvent =
+            serde_json::from_slice(&encoded).expect("lifecycle should decode");
+        assert_eq!(decoded.invocation_id, "filesystem-call");
+        assert_eq!(decoded.sequence, 4);
+        assert_eq!(decoded.stage, ToolInvocationLifecycleStage::Progress);
+        assert_eq!(decoded.message.as_deref(), Some("searching"));
+    }
+
+    pub fn temp_dir(name: &str) -> PathBuf {
+        let path = std::env::temp_dir().join(format!(
+            "bcode-filesystem-plugin-{name}-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&path);
+        std::fs::create_dir_all(&path).expect("create temp dir");
+        path
+    }
+
+    #[test]
+    fn compact_batch_output_preserves_outcomes_without_copying_diff_text() {
+        let outcome = json!({"version":1,"is_error":true,"files":[
+            {"path":"first","status":"committed","error":null,"change":{"omitted":false,"old_text":"old".repeat(4096),"new_text":"new".repeat(4096)}},
+            {"path":"second","status":"unknown","error":"inspect before retrying","change":null},
+            {"path":"third","status":"committed","error":null,"change":{"omitted":true,"reason":"display_budget"}}
+        ]});
+        let output = compact_batch_output(&outcome);
+        assert!(output.len() < 1024);
+        let decoded: serde_json::Value = serde_json::from_str(&output).unwrap();
+        assert_eq!(decoded["files"][0]["change"]["available"], true);
+        assert!(decoded["files"][0]["change"].get("old_text").is_none());
+        assert_eq!(decoded["files"][1]["status"], "unknown");
+        assert_eq!(decoded["files"][1]["error"], "inspect before retrying");
+        assert_eq!(decoded["files"][2]["change"]["available"], false);
+        assert_eq!(decoded["files"][2]["change"]["reason"], "display_budget");
+        assert_eq!(
+            outcome["files"][0]["change"]["old_text"],
+            "old".repeat(4096)
+        );
+    }
+
+    #[test]
+    fn batch_artifact_preserves_ordered_partial_and_unknown_outcomes() {
+        let outcome = json!({"version":1,"is_error":true,"files":[
+            {"path":"first","status":"committed","error":null},
+            {"path":"second","status":"unknown","error":"inspect before retrying"},
+            {"path":"third","status":"not_attempted","error":null}
+        ]});
+        let result = batch_outcome_artifact("batch-call", outcome.clone());
+        let encoded = serde_json::to_value(&result).unwrap();
+        let decoded: ToolInvocationResult = serde_json::from_value(encoded).unwrap();
+        let ToolInvocationResult::Artifact { artifact } = decoded else {
+            panic!("expected batch artifact");
+        };
+        assert_eq!(artifact.schema, "bcode.filesystem.batch");
+        assert_eq!(artifact.schema_version, 1);
+        assert_eq!(artifact.producer_plugin_id, "bcode.filesystem");
+        assert_eq!(artifact.tool_call_id.as_deref(), Some("batch-call"));
+        assert_eq!(artifact.metadata, outcome);
+    }
+
+    #[test]
+    fn write_and_edit_responses_include_file_change_result() {
+        let root = temp_dir("presentation");
+        let write_response = tool_write(
+            serde_json::json!({
+                "path": root.join("file.txt"),
+                "contents": "hello",
+            }),
+            None,
+            "test",
+        );
+        assert_file_change_artifact(write_response.result, "filesystem.write", "wrote 5 bytes");
+
+        let edit_response = tool_edit(
+            serde_json::json!({
+                "path": root.join("file.txt"),
+                "old_text": "hello",
+                "new_text": "hello world",
+            }),
+            None,
+            "test",
+        );
+        assert_file_change_artifact(
+            edit_response.result,
+            "filesystem.edit",
+            "applied 1 replacement",
+        );
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    fn assert_file_change_artifact(
+        result: Option<ToolInvocationResult>,
+        tool_name: &str,
+        summary: &str,
+    ) {
+        let Some(ToolInvocationResult::Artifact { artifact }) = result else {
+            panic!("expected artifact result");
+        };
+        assert_eq!(artifact.schema, "bcode.filesystem.change");
+        assert_eq!(artifact.producer_plugin_id, "bcode.filesystem");
+        assert_eq!(artifact.metadata["tool_name"], tool_name);
+        assert_eq!(artifact.metadata["summary"], summary);
+        assert!(artifact.metadata["path"].is_string());
+    }
+
+    #[test]
+    fn rust_grep_enforces_timeout() {
+        let root = temp_dir("grep-timeout");
+        std::fs::write(root.join("file.txt"), "needle\n").expect("write file");
+
+        let response = grep_files_with_rust(
+            &GrepRequest {
+                path: root.clone(),
+                pattern: "needle".to_string(),
+                glob: None,
+                ignore_case: false,
+                max_matches: Some(10),
+                timeout_ms: Some(0),
+            },
+            10,
+            bcode_plugin_sdk::ServiceCancellation::default(),
+            None,
+        )
+        .expect("grep response");
+
+        assert_eq!(response.backend, "rust");
+        assert!(response.timed_out);
+        assert!(response.partial);
+        assert!(
+            response
+                .message
+                .as_deref()
+                .is_some_and(|message| message.contains("timed out"))
+        );
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn rust_find_uses_default_result_limit() {
+        let root = temp_dir("find-limit");
+        for index in 0..3 {
+            std::fs::write(root.join(format!("file-{index}.txt")), "x").expect("write file");
+        }
+
+        let response = find_paths_with_rust(
+            &FindRequest {
+                path: root.clone(),
+                pattern: "*.txt".to_string(),
+                max_results: Some(1),
+                timeout_ms: Some(30_000),
+            },
+            1,
+            bcode_plugin_sdk::ServiceCancellation::default(),
+            None,
+        )
+        .expect("find response");
+
+        assert_eq!(response.backend, "rust");
+        assert_eq!(response.paths.len(), 1);
+        assert!(response.partial);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn read_text_supports_offset_and_limit() {
+        let root = temp_dir("read-offset-limit");
+        let file = root.join("file.txt");
+        std::fs::write(&file, "one\ntwo\nthree\nfour\n").expect("write file");
+
+        let response = read_path_for_tool(
+            &file,
+            &ReadRequest {
+                path: file.clone(),
+                offset: Some(2),
+                limit: Some(2),
+            },
+            &root,
+            "test-read",
+            None,
+        );
+
+        assert!(!response.is_error);
+        assert!(response.output.starts_with("two\nthree"));
+        assert!(response.output.contains("Use offset=4 to continue"));
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn artifact_read_can_return_tail_without_full_read() {
+        let root = temp_dir("artifact-read-tail");
+        let file = root.join("artifact.txt");
+        std::fs::write(&file, "head-middle-tail").expect("write artifact");
+
+        let response = read_artifact(
+            &file,
+            &ArtifactReadRequest {
+                path: file.clone(),
+                offset_bytes: None,
+                max_bytes: Some(4),
+                from_end: true,
+            },
+        )
+        .expect("read artifact tail");
+
+        assert_eq!(response.contents, "tail");
+        assert_eq!(response.total_bytes, 16);
+        assert!(response.truncated);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn artifact_grep_searches_literal_matches() {
+        let root = temp_dir("artifact-grep");
+        let file = root.join("artifact.txt");
+        std::fs::write(&file, "alpha\nbeta\nALPHA\n").expect("write artifact");
+
+        let response = grep_artifact(
+            &file,
+            &ArtifactGrepRequest {
+                path: file.clone(),
+                pattern: "alpha".to_string(),
+                ignore_case: true,
+                max_matches: Some(10),
+            },
+        )
+        .expect("grep artifact");
+
+        assert_eq!(response.matches.len(), 2);
+        assert_eq!(response.matches[0].line_number, 1);
+        assert_eq!(response.matches[1].line_number, 3);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn read_image_returns_structured_image_content() {
+        let root = temp_dir("read-image");
+        let file = root.join("image.png");
+        let mut bytes = Vec::new();
+        {
+            let mut encoder = png::Encoder::new(&mut bytes, 1, 1);
+            encoder.set_color(png::ColorType::Rgba);
+            encoder.set_depth(png::BitDepth::Eight);
+            let mut writer = encoder.write_header().expect("write header");
+            writer
+                .write_image_data(&[255, 0, 0, 255])
+                .expect("write image");
+        }
+        std::fs::write(&file, bytes).expect("write image file");
+
+        let response = read_path_for_tool(
+            &file,
+            &ReadRequest {
+                path: file.clone(),
+                offset: None,
+                limit: None,
+            },
+            &root,
+            "test-image",
+            None,
+        );
+
+        assert!(!response.is_error);
+        assert!(response.output.contains("Read image file [image/png]"));
+        assert_eq!(response.content.len(), 1);
+        let ToolResultContent::ImageRef { image } = &response.content[0] else {
+            panic!("expected image reference content");
+        };
+        assert_eq!(image.mime_type, "image/png");
+        assert_eq!(image.path, file.display().to_string());
+        assert_eq!(image.metadata.width, Some(1));
+        assert_eq!(image.metadata.height, Some(1));
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn external_command_timeout_kills_process_group() {
+        let mut command = Command::new("sh");
+        configure_command_for_timeout(&mut command);
+        command
+            .arg("-c")
+            .arg("sh -c 'trap \"\" HUP TERM; sleep 5' | cat");
+        let started = Instant::now();
+
+        let output = run_external_command(command, Some(100)).expect("external output");
+
+        assert!(started.elapsed() < Duration::from_secs(2));
+        assert!(output.timed_out);
+    }
+}

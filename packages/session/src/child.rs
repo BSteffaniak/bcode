@@ -333,7 +333,7 @@ impl SessionManager {
         &self,
         request: SessionChildCreateRequest,
     ) -> Result<SessionSummary, SessionError> {
-        self.create_child_session_inner(request, None, None).await
+        Box::pin(self.create_child_session_inner(request, None, None)).await
     }
 
     /// Create a fresh child with an immutable composed spawning receipt in its creation prefix.
@@ -360,7 +360,7 @@ impl SessionManager {
         if request.admission.validate().is_err() {
             return Err(invalid("invalid composed spawning admission options"));
         }
-        self.create_child_session_inner(request.creation.clone(), None, Some(request))
+        Box::pin(self.create_child_session_inner(request.creation.clone(), None, Some(request)))
             .await
     }
 
@@ -380,8 +380,7 @@ impl SessionManager {
                 "explicit-parent execution creation currently supports fresh isolated context only",
             ));
         }
-        self.create_child_session_inner(request, Some(provenance), None)
-            .await
+        Box::pin(self.create_child_session_inner(request, Some(provenance), None)).await
     }
 
     /// Derive a context-preserving execution child from an admitted stable prefix, including worktrees.

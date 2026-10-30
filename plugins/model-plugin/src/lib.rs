@@ -735,7 +735,12 @@ mod tests {
     fn provider_auth_security_block_routes_semantic_host_inspection() {
         let manifest: bcode_plugin::PluginManifest =
             toml::from_str(include_str!("../bcode-plugin.toml")).expect("manifest");
-        let block = &manifest.services[0].workflow_blocks[0];
+        let block = manifest
+            .services
+            .iter()
+            .flat_map(|service| &service.workflow_blocks)
+            .find(|block| block.block_id == "provider_auth.security.inspect")
+            .expect("provider auth security workflow block");
         assert_eq!(block.block_id, "provider_auth.security.inspect");
         assert_eq!(block.effect, bcode_workflow::WorkflowBlockEffect::ReadOnly);
         assert_eq!(

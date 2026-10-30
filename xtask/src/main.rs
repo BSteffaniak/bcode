@@ -1383,6 +1383,23 @@ const BROWSER_BUNDLE_FILES: [&str; 7] = [
 
 /// Verify and snapshot publication bytes before staging; never copy a mutable tree.
 fn verified_browser_bundle(root: &Path) -> Result<BTreeMap<String, Vec<u8>>> {
+    if !fs::symlink_metadata(root)?.file_type().is_dir() {
+        return Err(format_error(
+            "browser bundle root must be a directory, not a link",
+        ));
+    }
+    let entries = fs::read_dir(root)?
+        .map(|entry| entry.map(|entry| entry.file_name()))
+        .collect::<std::io::Result<BTreeSet<_>>>()?;
+    let expected = BROWSER_BUNDLE_FILES
+        .into_iter()
+        .map(std::ffi::OsString::from)
+        .collect::<BTreeSet<_>>();
+    if entries != expected {
+        return Err(format_error(
+            "unexpected browser bundle directory inventory",
+        ));
+    }
     let mut files = BTreeMap::new();
     let mut total = 0_u64;
     for name in BROWSER_BUNDLE_FILES {
@@ -4094,6 +4111,29 @@ mod tests {
             fs::write(directory.path().join(name), bytes).expect("copy real asset");
         }
         let manifest_path = directory.path().join("manifest.json");
+        let unexpected = directory.path().join("unexpected.js");
+        fs::write(&unexpected, b"unmanifested asset").expect("unexpected asset");
+        assert!(verified_browser_bundle(directory.path()).is_err());
+        fs::remove_file(unexpected).expect("restore exact inventory");
+        let unexpected_directory = directory.path().join("unexpected");
+        fs::create_dir(&unexpected_directory).expect("unexpected directory");
+        assert!(verified_browser_bundle(directory.path()).is_err());
+        fs::remove_dir(unexpected_directory).expect("restore directory inventory");
+        #[cfg(unix)]
+        {
+            let link_root = tempfile::tempdir().expect("link directory");
+            let link = link_root.path().join("bundle");
+            std::os::unix::fs::symlink(directory.path(), &link).expect("root link");
+            assert!(verified_browser_bundle(&link).is_err());
+            let bootstrap = directory.path().join("bootstrap.js");
+            fs::remove_file(&bootstrap).expect("remove copied bootstrap");
+            std::os::unix::fs::symlink(source.join("bootstrap.js"), &bootstrap)
+                .expect("asset link");
+            assert!(verified_browser_bundle(directory.path()).is_err());
+            fs::remove_file(&bootstrap).expect("remove asset link");
+            fs::write(&bootstrap, &assets["bootstrap.js"]).expect("restore real bootstrap");
+        }
+        assert!(verified_browser_bundle(directory.path()).is_ok());
         let manifest: serde_json::Value =
             serde_json::from_slice(assets.get("manifest.json").expect("real manifest"))
                 .expect("manifest JSON");

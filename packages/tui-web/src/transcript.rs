@@ -10,6 +10,9 @@ use bmux_tui::paint::PaintCx;
 pub struct Transcript {
     pub accepted: AcceptedTranscript,
     pub rows: usize,
+    registry:
+        Option<bcode_tui_components::transcript::tool_visual::portable::PortableVisualRegistry>,
+    registry_generation: u64,
 }
 
 impl Transcript {
@@ -27,38 +30,148 @@ impl Transcript {
         self.rows = self.accepted.layout.total_rows();
     }
 
-    /// Run producer-owned portable adapters outside BMUX paint. The same
-    /// canonical visual envelope is used by native plugin dispatch.
-    pub fn prepare_question_visuals(
+    /// Rebuild the immutable registry only when effective native policy changes.
+    pub fn configure_visuals(
         &mut self,
-        theme: Option<bmux_tui_components::theme::ComponentTheme>,
-    ) {
-        use bcode_tui_components::transcript::{
-            tool_visual::CanonicalToolVisual, transcript_layout::TranscriptLayoutRows,
+        policy: &crate::policy::BrowserVisualPolicy,
+    ) -> Result<(), &'static str> {
+        use bcode_tui_components::transcript::tool_visual::portable::{
+            PortableVisualPolicy, PortableVisualRegistry,
         };
-        self.accepted.prepare_visuals(|item, _width| {
-            let CanonicalToolVisual::Plugin(visual) = CanonicalToolVisual::for_item(item, None)?;
-            if visual.producer_plugin_id.as_deref() != Some("bcode.question")
-                || visual.schema != "bcode.question.outcome"
-                || visual.schema_version != 1
-            {
-                return None;
-            }
-            let outcome = serde_json::from_value::<bcode_question_plugin::QuestionToolOutcome>(
-                visual.payload,
-            )
-            .ok()?;
-            let rows = bcode_question_plugin::presentation::question_outcome_rows(
-                &outcome,
-                bcode_tui_components::tool_card::ToolCardStyle::from_component_theme(theme),
-            );
-            Some((
-                visual.revision,
-                TranscriptLayoutRows::Rendered(rows),
-                Vec::new(),
-            ))
-        });
+        self.registry_generation = self.registry_generation.saturating_add(1);
+        let mut registrations = bcode_question_plugin::portable_visual_registrations();
+        registrations.extend(bcode_filesystem_plugin::portable_visual_registrations());
+        registrations.extend(bcode_shell_plugin::portable_visual_registrations());
+        self.registry = Some(PortableVisualRegistry::new(
+            self.registry_generation,
+            PortableVisualPolicy {
+                enabled_plugins: policy.enabled_plugins.clone(),
+                preferred: policy.preferred.clone(),
+                disabled: policy.disabled.clone(),
+            },
+            registrations,
+        )?);
+        Ok(())
+    }
+
+    /// Prepare producer-owned implementations outside BMUX paint, with one
+    /// atomic accepted geometry for rows, images, selections and narrow actions.
+    pub fn prepare_visuals(&mut self, theme: Option<bmux_tui_components::theme::ComponentTheme>) {
+        if let Some(registry) = &self.registry {
+            self.accepted
+                .prepare_portable_visuals(registry, theme.as_ref());
+        }
         self.rows = self.accepted.layout.total_rows();
+    }
+
+    /// Translate only a current accepted producer action; the caller owns the
+    /// committed-scene gate. No platform execution or geometry mutation occurs.
+    pub fn translate_action(
+        &self,
+        provenance: &bcode_tui_components::transcript::accepted::AcceptedActionProvenance,
+        theme: Option<&bmux_tui_components::theme::ComponentTheme>,
+    ) -> Option<bcode_tui_components::transcript::actions::TranscriptAction> {
+        use bcode_tui_components::transcript::tool_visual::{
+            CanonicalToolVisual, portable::PortableVisualContext,
+        };
+        let item = self
+            .accepted
+            .document
+            .get(self.accepted.document.source_index(&provenance.item_id)?)?;
+        if item.source_view_item_revision() != Some(provenance.item_revision) {
+            return None;
+        }
+        let CanonicalToolVisual::Plugin(visual) = CanonicalToolVisual::for_item(item, None)?;
+        self.registry.as_ref()?.translate_action(
+            &visual,
+            &PortableVisualContext {
+                width: provenance.width,
+                theme,
+            },
+            &provenance.action_id,
+        )
+    }
+
+    pub fn artifact_preview_limit(
+        &self,
+        item_id: &str,
+        width: u16,
+        reference_key: &str,
+        content_type: Option<&str>,
+    ) -> Option<u64> {
+        use bcode_tui_components::transcript::tool_visual::{
+            CanonicalToolVisual, portable::PortableVisualContext,
+        };
+        let id = bcode_session_view_models::TranscriptViewItemId::new(item_id);
+        let item = self
+            .accepted
+            .document
+            .get(self.accepted.document.source_index(&id)?)?;
+        let CanonicalToolVisual::Plugin(visual) = CanonicalToolVisual::for_item(item, None)?;
+        self.registry.as_ref()?.artifact_preview_limit(
+            &visual,
+            &PortableVisualContext { width, theme: None },
+            reference_key,
+            content_type,
+        )
+    }
+
+    pub fn has_visual(&self, item_id: &str, width: u16) -> bool {
+        use bcode_tui_components::transcript::tool_visual::{
+            CanonicalToolVisual, portable::PortableVisualContext,
+        };
+        let Some(registry) = &self.registry else {
+            return false;
+        };
+        let id = bcode_session_view_models::TranscriptViewItemId::new(item_id);
+        let Some(item) = self
+            .accepted
+            .document
+            .source_index(&id)
+            .and_then(|index| self.accepted.document.get(index))
+        else {
+            return false;
+        };
+        let Some(CanonicalToolVisual::Plugin(visual)) = CanonicalToolVisual::for_item(item, None)
+        else {
+            return false;
+        };
+        registry
+            .prepare(&visual, &PortableVisualContext { width, theme: None })
+            .is_some()
+    }
+
+    pub fn deliver_artifact(
+        &self,
+        item_id: &str,
+        width: u16,
+        chunk: &bcode_tui_components::transcript::tool_visual::portable::PortableArtifactChunk<'_>,
+    ) -> bool {
+        use bcode_tui_components::transcript::tool_visual::{
+            CanonicalToolVisual, portable::PortableVisualContext,
+        };
+        let Some(registry) = &self.registry else {
+            return false;
+        };
+        let id = bcode_session_view_models::TranscriptViewItemId::new(item_id);
+        let Some(item) = self
+            .accepted
+            .document
+            .source_index(&id)
+            .and_then(|index| self.accepted.document.get(index))
+        else {
+            return false;
+        };
+        let Some(CanonicalToolVisual::Plugin(visual)) = CanonicalToolVisual::for_item(item, None)
+        else {
+            return false;
+        };
+        let Some(prepared) =
+            registry.prepare(&visual, &PortableVisualContext { width, theme: None })
+        else {
+            return false;
+        };
+        registry.deliver_artifact(prepared.adapter_reference(), chunk)
     }
 
     pub fn anchor(&self, row: usize) -> Option<(String, usize)> {

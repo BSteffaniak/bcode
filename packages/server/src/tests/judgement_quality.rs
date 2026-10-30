@@ -2,7 +2,7 @@
 mod history_context;
 
 async fn run_capture_turn(
-    state: &ServerState,
+    state: &Arc<ServerState>,
     session: SessionId,
     text: String,
 ) -> ModelTurnCompletion {
@@ -16,7 +16,7 @@ async fn run_capture_turn(
 }
 
 async fn run_capture_turn_with_execution(
-    state: &ServerState,
+    state: &Arc<ServerState>,
     session: SessionId,
     text: String,
     execution: bcode_session_models::TurnExecutionOptions,
@@ -178,8 +178,11 @@ async fn normal_session_turn_captures_settled_tool_and_categorization() {
         QualityArm::AutoEligible,
     ] {
         REQUESTS.lock().unwrap().clear();
-        let mut state = state(arm, Feature::SessionCategorization);
-        configure_normal_turn(&mut state);
+        let state = Arc::new({
+            let mut state = state(arm, Feature::SessionCategorization);
+            configure_normal_turn(&mut state);
+            state
+        });
         let session = create_capture_session(&state, root.path()).await;
         let completion = run_capture_turn(
             &state,
@@ -273,8 +276,11 @@ async fn normal_session_failures_capture_triage_and_progress() {
             QualityArm::AutoEligible,
         ] {
             REQUESTS.lock().unwrap().clear();
-            let mut state = state(arm, feature);
-            configure_normal_turn(&mut state);
+            let state = Arc::new({
+                let mut state = state(arm, feature);
+                configure_normal_turn(&mut state);
+                state
+            });
             let session = create_capture_session(&state, root.path()).await;
             let directive = format!(
                 "tool-call-expect-error No such file or directory :: filesystem.read {}",
@@ -288,25 +294,7 @@ async fn normal_session_failures_capture_triage_and_progress() {
                 completion.message
             );
             let requests = REQUESTS.lock().unwrap().clone();
-            assert!(
-                requests.len() >= 5,
-                "four settled tool continuations required"
-            );
-            let results = requests
-                .last()
-                .unwrap()
-                .messages
-                .iter()
-                .flat_map(|message| &message.content)
-                .filter_map(|block| match block {
-                    ContentBlock::ToolResult { result } => Some(result),
-                    _ => None,
-                })
-                .collect::<Vec<_>>();
-            assert_eq!(results.len(), 4);
-            assert!(results.iter().all(
-                |result| result.is_error && result.output.contains("No such file or directory")
-            ));
+            let results = assert_four_settled_missing_file_failures(&requests);
             if feature == Feature::ProgressMonitoring {
                 assert!(
                     results
@@ -359,6 +347,33 @@ async fn normal_session_failures_capture_triage_and_progress() {
         }
     }
     println!("normal-session failures offline-correctness={captures:?}; live-improvement=unproven");
+}
+
+fn assert_four_settled_missing_file_failures(
+    requests: &[bcode_model::ModelTurnRequest],
+) -> Vec<&bcode_model::ToolResult> {
+    assert!(
+        requests.len() >= 5,
+        "four settled tool continuations required"
+    );
+    let results = requests
+        .last()
+        .unwrap()
+        .messages
+        .iter()
+        .flat_map(|message| &message.content)
+        .filter_map(|block| match block {
+            ContentBlock::ToolResult { result } => Some(result),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(results.len(), 4);
+    assert!(
+        results
+            .iter()
+            .all(|result| result.is_error && result.output.contains("No such file or directory"))
+    );
+    results
 }
 
 #[derive(Default)]
@@ -952,22 +967,25 @@ async fn normal_tool_catalog_recommendations_capture_original_permutation() {
         QualityArm::AutoEligible,
     ] {
         REQUESTS.lock().unwrap().clear();
-        let mut state = state(arm, Feature::Recommendations);
-        configure_normal_turn(&mut state);
-        if let Some(original) = &baseline {
-            let probabilities = original
-                .iter()
-                .take(32)
-                .enumerate()
-                .map(|(index, id): (usize, &String)| {
-                    (
-                        format!("candidate_{index}"),
-                        if id == "filesystem.grep" { 0.9 } else { 0.1 },
-                    )
-                })
-                .collect();
-            configure_probabilities(&mut state, &probabilities);
-        }
+        let state = Arc::new({
+            let mut state = state(arm, Feature::Recommendations);
+            configure_normal_turn(&mut state);
+            if let Some(original) = &baseline {
+                let probabilities = original
+                    .iter()
+                    .take(32)
+                    .enumerate()
+                    .map(|(index, id): (usize, &String)| {
+                        (
+                            format!("candidate_{index}"),
+                            if id == "filesystem.grep" { 0.9 } else { 0.1 },
+                        )
+                    })
+                    .collect();
+                configure_probabilities(&mut state, &probabilities);
+            }
+            state
+        });
         let session = create_capture_session(&state, root.path()).await;
         let completion = run_capture_turn(
             &state,

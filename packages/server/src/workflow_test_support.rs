@@ -59,9 +59,11 @@ async fn progress_retains_change_between_inspection_and_wait() {
     let state = crate::tests::test_server_state(crate::SessionManager::default());
     let mut progress = Progress::subscribe(&state);
     state.workflow_test_progress.send_replace(());
-    drop(state);
+    // Keep the channel owners alive: sender closure is not progress and would
+    // make has_changed() fail before this retained-notification check.
     // The acknowledgement is already present; this does not depend on a task winning a race.
     assert!(progress.driver.has_changed().unwrap());
     progress.changed().await;
     assert!(!progress.driver.has_changed().unwrap());
+    drop(state);
 }

@@ -1274,6 +1274,35 @@ fn verify_retained_database_identity(
     ))
 }
 
+/// An owned authority fence that prevents coordinator transfer while an external
+/// canonical write commits.
+///
+/// The transaction is deliberately never committed: this
+/// read-only fence rolls back on drop, releasing SQLite's reserved writer lock.
+pub struct WorkflowExecutionFence {
+    transaction: Box<dyn switchy_database::DatabaseTransaction>,
+    _ownership: std::sync::Arc<StoreOwnership>,
+    run_id: String,
+    authority: WorkflowExecutionAuthority,
+}
+
+impl std::fmt::Debug for WorkflowExecutionFence {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("WorkflowExecutionFence")
+            .field("run_id", &self.run_id)
+            .finish_non_exhaustive()
+    }
+}
+
+impl WorkflowExecutionFence {
+    /// Recheck the original authority inside the held transaction.
+    /// # Errors
+    /// Rejects authority mismatch or unavailable canonical storage.
+    pub fn validate(&self) -> Result<(), WorkflowStoreError> {
+        verify_execution_authority_in(&*self.transaction, &self.run_id, &self.authority)
+    }
+}
+
 /// Durable workflow database.
 #[derive(Debug)]
 pub struct WorkflowStore {
@@ -1540,6 +1569,35 @@ impl WorkflowStore {
             connection,
             ownership: Some(std::sync::Arc::clone(ownership)),
             read_identity: std::sync::Arc::new(()),
+        })
+    }
+
+    /// Hold current authority against concurrent transfers for an external canonical write.
+    ///
+    /// Acquire only after producer work and retain through the external commit. Callers
+    /// must not perform workflow writes while holding this fence.
+    /// # Errors
+    /// Rejects unverified stores, stale authority, replaced files and lock contention.
+    pub fn execution_fence(
+        &self,
+        run_id: &str,
+        authority: &WorkflowExecutionAuthority,
+    ) -> Result<WorkflowExecutionFence, WorkflowStoreError> {
+        let retained = self.retained_handle()?;
+        let transaction = database::begin(
+            &retained.connection,
+            switchy_database::TransactionMode::Immediate,
+        )?;
+        verify_store_schema(&*transaction)?;
+        verify_execution_authority_in(&*transaction, run_id, authority)?;
+        let ownership = retained.ownership.ok_or_else(|| {
+            WorkflowStoreError::InvalidData("authority fence requires verified ownership".into())
+        })?;
+        Ok(WorkflowExecutionFence {
+            transaction,
+            _ownership: ownership,
+            run_id: run_id.into(),
+            authority: authority.clone(),
         })
     }
 

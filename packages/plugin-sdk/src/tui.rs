@@ -1929,11 +1929,34 @@ impl PluginTuiFocusedTextFieldEditResult {
 
 /// Native Rust plugin surface rendered directly with `bmux_tui`.
 pub trait PluginTuiSurface: Send {
+    /// Take semantic input queued by an explicitly canonical terminal adapter.
+    fn take_canonical_input(&mut self) -> Option<InteractionInput> {
+        None
+    }
+
+    /// Replace presentation with a committed producer snapshot; never execute a controller.
+    ///
+    /// # Errors
+    /// Returns an error unless the surface explicitly supports canonical presentation.
+    fn apply_canonical_snapshot(&mut self, _snapshot: serde_json::Value) -> Result<(), String> {
+        Err("canonical terminal presentation unsupported".to_owned())
+    }
+
     /// Stable surface identifier.
     fn id(&self) -> &'static str;
 
     /// Human-readable surface title.
     fn title(&self) -> &'static str;
+
+    /// Classify an explicit gesture to retry delivery of a retained close proposal.
+    ///
+    /// This must not mutate or reopen the owner, create a new proposal, or perform
+    /// delivery. The host retains the exact proposal and checks its active identity.
+    /// Existing surfaces opt out by default; no raw-key fallback is implied.
+    #[must_use]
+    fn retry_resolution_event(&self, _event: &Event, _host: &dyn PluginTuiHost) -> bool {
+        false
+    }
 
     /// Prepare effective binding presentation before any geometry measurement or painting.
     /// Hosts call this before preferred height and focused row range queries, including reloads.
@@ -2127,6 +2150,19 @@ where
     /// Human-readable surface title.
     fn title(&self) -> &'static str;
 
+    /// Classify a delivery-retry gesture using owner-defined effective bindings.
+    /// This read-only predicate must not run controller input or reopen a closed
+    /// interaction. The default opts out of delivery retry gestures.
+    #[must_use]
+    fn retry_resolution_event(
+        &self,
+        _snapshot: &C::Snapshot,
+        _event: &Event,
+        _host: &dyn PluginTuiHost,
+    ) -> bool {
+        false
+    }
+
     /// Return preferred height for a snapshot at the given width.
     #[must_use]
     fn preferred_height(&mut self, snapshot: &C::Snapshot, width: u16) -> u16;
@@ -2277,12 +2313,16 @@ where
     ) -> TerminalInteractionInput;
 }
 
+type CanonicalSnapshotDecoder<T> = fn(serde_json::Value) -> Result<T, serde_json::Error>;
+
 struct TypedTerminalInteractionSurface<C, R>
 where
     C: PluginInteraction,
     R: TerminalInteractionRenderer<C>,
 {
-    controller: C,
+    controller: Option<C>,
+    canonical_input: Option<InteractionInput>,
+    decode_snapshot: Option<CanonicalSnapshotDecoder<C::Snapshot>>,
     snapshot: C::Snapshot,
     renderer: R,
     preferred_height: Option<(u16, u16)>,
@@ -2298,7 +2338,9 @@ where
     fn new(controller: C, renderer: R) -> Self {
         let snapshot = controller.snapshot();
         Self {
-            controller,
+            controller: Some(controller),
+            canonical_input: None,
+            decode_snapshot: None,
             snapshot,
             renderer,
             preferred_height: None,
@@ -2316,8 +2358,14 @@ where
     }
 
     fn apply_input(&mut self, input: InteractionInput) -> PluginTuiAction {
-        let output = self.controller.handle_input(input);
-        self.snapshot = self.controller.snapshot();
+        let Some(controller) = self.controller.as_mut() else {
+            if self.canonical_input.is_none() {
+                self.canonical_input = Some(input);
+            }
+            return PluginTuiAction::None;
+        };
+        let output = controller.handle_input(input);
+        self.snapshot = controller.snapshot();
         self.work_shape.snapshot_materializations =
             self.work_shape.snapshot_materializations.saturating_add(1);
         self.invalidate_measurement();
@@ -2355,12 +2403,30 @@ where
     C: PluginInteraction,
     R: TerminalInteractionRenderer<C>,
 {
+    fn take_canonical_input(&mut self) -> Option<InteractionInput> {
+        self.canonical_input.take()
+    }
+
+    fn apply_canonical_snapshot(&mut self, snapshot: serde_json::Value) -> Result<(), String> {
+        let decode = self
+            .decode_snapshot
+            .ok_or("canonical terminal presentation unsupported")?;
+        self.snapshot = decode(snapshot).map_err(|error| error.to_string())?;
+        self.invalidate_measurement();
+        Ok(())
+    }
+
     fn id(&self) -> &'static str {
         self.renderer.id()
     }
 
     fn title(&self) -> &'static str {
         self.renderer.title()
+    }
+
+    fn retry_resolution_event(&self, event: &Event, host: &dyn PluginTuiHost) -> bool {
+        self.renderer
+            .retry_resolution_event(&self.snapshot, event, host)
     }
 
     fn prepare_keymap(&mut self, host: &dyn PluginTuiHost) {
@@ -2982,6 +3048,22 @@ mod typed_interaction_surface_tests {
     }
 
     #[test]
+    fn existing_direct_and_typed_surfaces_do_not_opt_into_resolution_retry() {
+        let direct = LegacyCompletionSurface;
+        let typed = TypedTerminalInteractionSurface::new(
+            NoEffectController::new(()),
+            CompletionRenderer::default(),
+        );
+        for event in [
+            Event::Tick,
+            Event::Key(bmux_keyboard::parse_key_stroke("enter").unwrap()),
+        ] {
+            assert!(!direct.retry_resolution_event(&event, &TestHost));
+            assert!(!typed.retry_resolution_event(&event, &TestHost));
+        }
+    }
+
+    #[test]
     fn typed_completion_processes_owner_semantics_only_for_explicit_applied() {
         for edit_result in [
             FocusedTextFieldEditResult::Applied,
@@ -3036,6 +3118,81 @@ mod typed_interaction_surface_tests {
         assert_eq!(surface.preferred_height(4), 3);
         assert_eq!(surface.focused_row_range(4), Some(2..3));
         assert_eq!(surface.renderer.measurements, 2);
+    }
+
+    #[test]
+    fn canonical_terminal_registry_uses_exact_kind_and_snapshot_only() {
+        tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap()
+            .block_on(async {
+                let mut registry = PluginTuiRegistry::default();
+                registry
+                    .register_canonical_interactive_surface::<CountingController, CountingRenderer>(
+                    );
+                assert!(
+                    registry
+                        .open_canonical("other.producer.kind", serde_json::json!(7))
+                        .await
+                        .is_err()
+                );
+                assert!(
+                    registry
+                        .open_canonical(CountingController::KIND, serde_json::json!({}))
+                        .await
+                        .is_err()
+                );
+                let mut surface = registry
+                    .open_canonical(CountingController::KIND, serde_json::json!(7))
+                    .await
+                    .unwrap();
+                surface
+                    .apply_canonical_snapshot(serde_json::json!(8))
+                    .unwrap();
+                assert!(
+                    surface
+                        .apply_canonical_snapshot(serde_json::json!({}))
+                        .is_err()
+                );
+                assert_eq!(surface.take_canonical_input(), None);
+            });
+    }
+
+    #[test]
+    fn canonical_terminal_renderer_restores_acknowledged_snapshot_without_local_transition() {
+        let _guard = TEST_COUNTERS.lock().expect("test counter lock");
+        let mut surface = TypedTerminalInteractionSurface::<CountingController, CountingRenderer> {
+            controller: None,
+            canonical_input: None,
+            decode_snapshot: Some(serde_json::from_value::<usize>),
+            snapshot: 7,
+            renderer: CountingRenderer,
+            preferred_height: None,
+            focused_rows: None,
+            work_shape: PluginTuiWorkShape::default(),
+        };
+        let before = SNAPSHOTS.load(Ordering::Relaxed);
+        assert_eq!(
+            surface.apply_input(InteractionInput::Submit),
+            PluginTuiAction::None
+        );
+        assert_eq!(surface.snapshot, 7);
+        assert_eq!(
+            surface.take_canonical_input(),
+            Some(InteractionInput::Submit)
+        );
+        assert_eq!(surface.take_canonical_input(), None);
+        surface
+            .apply_canonical_snapshot(serde_json::json!(8))
+            .unwrap();
+        assert_eq!(surface.snapshot, 8);
+        assert_eq!(SNAPSHOTS.load(Ordering::Relaxed), before);
+        assert!(
+            surface
+                .apply_canonical_snapshot(serde_json::json!({}))
+                .is_err()
+        );
+        assert_eq!(surface.snapshot, 8);
     }
 
     #[test]
@@ -3193,6 +3350,40 @@ fn plugin_tui_action_from_interaction_output(output: InteractionOutput) -> Plugi
     }
 }
 
+struct CanonicalTerminalFactory<C, R>(PhantomData<fn() -> (C, R)>);
+
+impl<C, R> PluginTuiSurfaceFactory for CanonicalTerminalFactory<C, R>
+where
+    C: PluginInteraction,
+    C::Snapshot: DeserializeOwned,
+    R: TerminalInteractionRenderer<C>,
+{
+    fn surface_kind(&self) -> &'static str {
+        R::SURFACE_KIND
+    }
+    fn canonical_interaction_kind(&self) -> Option<&'static str> {
+        Some(C::KIND)
+    }
+    fn open(&self, request: PluginTuiSurfaceOpenRequest) -> PluginTuiSurfaceFuture {
+        TypedTerminalInteractionSurfaceFactory::<C, R>::new().open(request)
+    }
+    fn open_canonical(&self, snapshot: serde_json::Value) -> PluginTuiSurfaceFuture {
+        Box::pin(async move {
+            let snapshot = serde_json::from_value::<C::Snapshot>(snapshot)?;
+            Ok(Box::new(TypedTerminalInteractionSurface::<C, R> {
+                controller: None,
+                canonical_input: None,
+                decode_snapshot: Some(serde_json::from_value::<C::Snapshot>),
+                snapshot,
+                renderer: R::default(),
+                preferred_height: None,
+                focused_rows: None,
+                work_shape: PluginTuiWorkShape::default(),
+            }) as BoxedPluginTuiSurface)
+        })
+    }
+}
+
 /// Parameters used to open a native plugin TUI surface.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PluginTuiSurfaceOpenRequest {
@@ -3212,6 +3403,16 @@ pub struct PluginTuiSurfaceOpenRequest {
 
 /// Factory for plugin-owned native TUI surfaces.
 pub trait PluginTuiSurfaceFactory: Send + Sync {
+    /// Exact semantic interaction kind, only for explicitly registered canonical adapters.
+    fn canonical_interaction_kind(&self) -> Option<&'static str> {
+        None
+    }
+
+    /// Open renderer-only presentation from an acknowledged canonical snapshot.
+    fn open_canonical(&self, _snapshot: serde_json::Value) -> PluginTuiSurfaceFuture {
+        Box::pin(async { Err("canonical terminal adapter unavailable".into()) })
+    }
+
     /// Stable surface kind identifier.
     fn surface_kind(&self) -> &'static str;
 
@@ -3417,6 +3618,33 @@ impl PluginTuiRegistry {
         self.register_factory(Box::new(
             TypedTerminalInteractionSurfaceFactory::<C, R>::new(),
         ));
+    }
+
+    /// Register a renderer that can display canonical snapshots without a local controller.
+    pub fn register_canonical_interactive_surface<C, R>(&mut self)
+    where
+        C: PluginInteraction,
+        C::Snapshot: DeserializeOwned,
+        R: TerminalInteractionRenderer<C>,
+    {
+        self.register_factory(Box::new(CanonicalTerminalFactory::<C, R>(PhantomData)));
+    }
+
+    /// Open only the exact producer interaction kind from public canonical semantics.
+    ///
+    /// # Errors
+    /// Rejects missing adapters or incompatible snapshots without request reconstruction.
+    pub async fn open_canonical(
+        &self,
+        interaction_kind: &str,
+        snapshot: serde_json::Value,
+    ) -> Result<BoxedPluginTuiSurface, PluginTuiError> {
+        let factory = self
+            .factories
+            .values()
+            .find(|factory| factory.canonical_interaction_kind() == Some(interaction_kind))
+            .ok_or("canonical terminal adapter unavailable")?;
+        factory.open_canonical(snapshot).await
     }
 
     /// Register a native TUI visual adapter under one or more manifest adapter IDs.

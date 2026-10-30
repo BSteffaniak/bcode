@@ -1,29 +1,29 @@
 //! One measured, source-backed command presentation for every lifecycle state.
 
-use super::{
-    argument_style, command_style, flag_style, muted_style, operator_style, prompt_spans,
-    prompt_style, string_style,
-};
 use crate::presentation::document::{Document, Provenance, Role, SourceOrigin};
 use bmux_tui::component::{Component, Constraints, LayoutCx};
 use bmux_tui::composition::TextBlock;
 use bmux_tui::prelude::{Line, Span};
 use bmux_tui::text::{Text, TextWrap};
 use std::ops::Range;
+#[cfg(feature = "static-bundled")]
 use std::sync::{Arc, Mutex};
 
 /// One retained semantic document; rendering geometry remains BMUX-owned and width-specific.
+#[cfg(feature = "static-bundled")]
 #[derive(Default)]
 pub(super) struct PresentationState {
     state: Mutex<AcceptedDocument>,
 }
 
+#[cfg(feature = "static-bundled")]
 #[derive(Default)]
 struct AcceptedDocument {
     generation: u64,
     accepted: Option<(bcode_config::ShellOutputPresentationPolicy, Arc<Document>)>,
 }
 
+#[cfg(feature = "static-bundled")]
 impl PresentationState {
     pub(super) fn invalidate(&self) {
         if let Ok(mut state) = self.state.lock() {
@@ -75,7 +75,7 @@ impl PresentationState {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "static-bundled"))]
 use super::{partial_json_string, shell_command_projection};
 
 struct Segment {
@@ -83,7 +83,7 @@ struct Segment {
     provenance: Provenance,
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "static-bundled"))]
 pub(super) fn project(
     command: &str,
     cwd: Option<&str>,
@@ -96,7 +96,7 @@ pub(super) fn project(
     project_with_policy(command, cwd, &policy, width, context)
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "static-bundled"))]
 pub(super) fn project_with_policy(
     command: &str,
     cwd: Option<&str>,
@@ -114,6 +114,7 @@ pub(super) fn project_with_policy(
     )
 }
 
+#[cfg(feature = "static-bundled")]
 pub(super) fn project_with_state(
     command: &str,
     cwd: Option<&str>,
@@ -122,12 +123,29 @@ pub(super) fn project_with_state(
     context: &bcode_plugin_sdk::tui::PluginTuiVisualRenderContext,
     state: &PresentationState,
 ) -> bcode_plugin_sdk::tui::PluginTuiVisualProjection {
-    let mut result = bcode_plugin_sdk::tui::PluginTuiVisualProjection::default();
+    let document = state.prepare(command, policy);
+    let context = crate::shell_portable::CommandContext::from_native(context);
+    let projection = project_document(command, cwd, width, &context, &document);
+    bcode_plugin_sdk::tui::PluginTuiVisualProjection {
+        rows: projection.rows,
+        anchors: projection.anchors,
+        selection: projection.selection,
+    }
+}
+
+/// Project the exact producer semantic document through BMUX once.
+pub fn project_document(
+    command: &str,
+    cwd: Option<&str>,
+    width: u16,
+    context: &crate::shell_portable::CommandContext,
+    document: &Document,
+) -> crate::shell_portable::CommandProjection {
+    let mut result = crate::shell_portable::CommandProjection::default();
     if width == 0 || command.is_empty() {
         return result;
     }
-    let document = state.prepare(command, policy);
-    let (logical, segments) = logical_document(&document, cwd, width, context);
+    let (logical, segments) = logical_document(document, cwd, width, context);
     let block = TextBlock::new(Text { lines: logical }).wrap(TextWrap::Character);
     let layout = block.layout(
         Constraints::for_width(u64::from(width)),
@@ -148,8 +166,8 @@ pub(super) fn project_with_state(
             segment_cursor += 1;
         }
         let relevant = &segments[segment_cursor..];
-        let anchor = measured_anchor(&document, relevant, &measured.source_range);
-        let mut cells = measured_cells(&document, relevant, &measured, width, revision);
+        let anchor = measured_anchor(document, relevant, &measured.source_range);
+        let mut cells = measured_cells(document, relevant, &measured, width, revision);
         let end = relevant
             .iter()
             .take_while(|segment| segment.display.start < measured.source_range.end)
@@ -179,7 +197,7 @@ pub(super) fn project_with_state(
         if end - frontier <= 256 * 1024 {
             result.selection.push((
                 row,
-                bcode_plugin_sdk::tui::PluginTuiSelectionRow {
+                bcode_plugin_models::tui_selection::PluginTuiSelectionRow {
                     identity: identity.to_owned(),
                     byte_start: frontier,
                     text: command[frontier..end].to_owned(),
@@ -190,7 +208,7 @@ pub(super) fn project_with_state(
         }
         result
             .anchors
-            .push(bcode_plugin_sdk::tui_visual::TuiVisualAnchor {
+            .push(bcode_plugin_models::tui_visual::TuiVisualAnchor {
                 key: format!("shell-command:{row}"),
                 row,
                 source: {
@@ -217,7 +235,7 @@ pub(super) fn project_with_state(
         result.rows.extend(bmux_tui::text::wrap_line_bounded(
             &Line::from_spans(vec![Span::styled(
                 "  embedded presentation limited · original source retained",
-                muted_style(),
+                context.muted_style(),
             )]),
             bmux_tui::text::TextWrapGeometry::uniform(usize::from(width)),
             TextWrap::Character,
@@ -234,14 +252,14 @@ fn admitted_anchor(
     end: usize,
     previous_start: &mut Option<usize>,
     previous_end: &mut usize,
-) -> Option<bcode_plugin_sdk::tui_visual::TuiVisualSourceRange> {
+) -> Option<bcode_plugin_models::tui_visual::TuiVisualSourceRange> {
     if start < *previous_end || *previous_start == Some(start) {
         return None;
     }
     let end = end.max(start);
     *previous_start = Some(start);
     *previous_end = end;
-    Some(bcode_plugin_sdk::tui_visual::TuiVisualSourceRange {
+    Some(bcode_plugin_models::tui_visual::TuiVisualSourceRange {
         identity: identity.to_owned(),
         start,
         end,
@@ -275,7 +293,7 @@ fn logical_document(
     document: &Document,
     cwd: Option<&str>,
     width: u16,
-    context: &bcode_plugin_sdk::tui::PluginTuiVisualRenderContext,
+    context: &crate::shell_portable::CommandContext,
 ) -> (Vec<Line>, Vec<Segment>) {
     let mut logical = Vec::new();
     let mut segments = Vec::new();
@@ -293,7 +311,10 @@ fn logical_document(
                 display: offset..end,
                 provenance: fragment.provenance,
             });
-            spans.push(Span::styled(fragment.text, role_style(fragment.role)));
+            spans.push(Span::styled(
+                fragment.text,
+                role_style(fragment.role, context),
+            ));
             offset = end;
         }
         logical.push(Line::from_spans(spans));
@@ -308,7 +329,7 @@ fn measured_cells(
     measured: &bmux_tui::composition::TextProjectionRow,
     width: u16,
     revision: u64,
-) -> Vec<bcode_plugin_sdk::tui::PluginTuiSelectionCell> {
+) -> Vec<bcode_plugin_models::tui_selection::PluginTuiSelectionCell> {
     let rendered = measured.line.plain_text();
     // BMUX text projection and selection disagree on tab expansion; do not invent geometry.
     if measured.line.width() > usize::from(width) || rendered.contains('\t') {
@@ -342,7 +363,7 @@ fn measured_cells(
                 && let (Some(first), Some(last)) = (ranges.first(), ranges.last())
                 && ranges.windows(2).all(|pair| pair[0].end == pair[1].start)
             {
-                cells.push(bcode_plugin_sdk::tui::PluginTuiSelectionCell {
+                cells.push(bcode_plugin_models::tui_selection::PluginTuiSelectionCell {
                     column: fragment.area.x,
                     width: fragment.area.width,
                     bytes: first.start..last.end,
@@ -384,40 +405,42 @@ fn source_revision(source: &str) -> u64 {
     hash.finish()
 }
 
-fn role_style(role: Role) -> bmux_tui::prelude::Style {
+fn role_style(
+    role: Role,
+    context: &crate::shell_portable::CommandContext,
+) -> bmux_tui::prelude::Style {
     match role {
-        Role::Command | Role::Function => command_style(),
-        Role::Keyword | Role::Flag => flag_style(),
-        Role::Variable | Role::Identifier => super::syntax_style(
-            |syntax| syntax.variable.to_tui(),
-            bmux_tui::prelude::Color::Blue,
-        ),
-        Role::Number => super::syntax_style(
-            |syntax| syntax.number.to_tui(),
-            bmux_tui::prelude::Color::Magenta,
-        ),
-        Role::Operator => operator_style(),
-        Role::String => string_style(),
-        Role::Comment => muted_style(),
-        Role::Literal | Role::Whitespace => argument_style(),
+        Role::Command | Role::Function => context.command_style(),
+        Role::Keyword | Role::Flag => context.flag_style(),
+        Role::Variable | Role::Identifier => {
+            context.syntax_style(|syntax| syntax.variable, bmux_tui::prelude::Color::Blue)
+        }
+        Role::Number => {
+            context.syntax_style(|syntax| syntax.number, bmux_tui::prelude::Color::Magenta)
+        }
+        Role::Operator => context.operator_style(),
+        Role::String => context.string_style(),
+        Role::Comment => context.muted_style(),
+        Role::Literal | Role::Whitespace => context.argument_style(),
     }
 }
 
 fn command_prompt(
     cwd: Option<&str>,
     width: u16,
-    context: &bcode_plugin_sdk::tui::PluginTuiVisualRenderContext,
+    context: &crate::shell_portable::CommandContext,
 ) -> Line {
-    let full_prompt = Line::from_spans(prompt_spans(cwd, context));
+    let full_prompt = Line::from_spans(context.prompt_spans(cwd));
     if full_prompt.width() <= usize::from(width / 2) {
         full_prompt
     } else if width >= 4 {
-        Line::from_spans(vec![Span::styled("❯ ", prompt_style())])
+        Line::from_spans(vec![Span::styled("❯ ", context.prompt_style())])
     } else {
         Line::default()
     }
 }
 
+#[cfg(feature = "static-bundled")]
 pub(super) fn append_metadata(
     target: &mut bcode_plugin_sdk::tui::PluginTuiVisualProjection,
     command: bcode_plugin_sdk::tui::PluginTuiVisualProjection,
@@ -426,7 +449,7 @@ pub(super) fn append_metadata(
     target.selection.extend(command.selection);
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "static-bundled"))]
 pub(super) fn declared_copy(
     projection: &bcode_plugin_sdk::tui::PluginTuiVisualProjection,
 ) -> String {
@@ -437,11 +460,11 @@ pub(super) fn declared_copy(
         .collect()
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "static-bundled"))]
 mod tests {
     use super::*;
 
-    fn context(width: u16) -> bcode_plugin_sdk::tui::PluginTuiVisualRenderContext {
+    const fn context(width: u16) -> bcode_plugin_sdk::tui::PluginTuiVisualRenderContext {
         bcode_plugin_sdk::tui::PluginTuiVisualRenderContext::new(
             width,
             bcode_plugin_sdk::tui::PluginTuiDiffLayout::Auto { breakpoint: 120 },

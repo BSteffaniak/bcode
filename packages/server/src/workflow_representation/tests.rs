@@ -1497,7 +1497,7 @@ async fn assert_delegation_sessions_are_unique(state: &ServerState) {
 }
 
 async fn invoke_delegation_tool(
-    state: &ServerState,
+    state: &std::sync::Arc<ServerState>,
     session: crate::SessionId,
     call: &bcode_model::ToolCall,
 ) -> crate::ToolInvocationResponse {

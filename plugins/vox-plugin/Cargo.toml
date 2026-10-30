@@ -20,9 +20,6 @@ bcode_vox.workspace        = true
 serde                      = { workspace = true, features = ["derive", "std"] }
 serde_json.workspace       = true
 
-[dev-dependencies]
-tempfile.workspace = true
-
 [features]
 default          = []
 fail-on-warnings = []

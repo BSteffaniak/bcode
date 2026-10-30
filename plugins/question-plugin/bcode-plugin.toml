@@ -12,6 +12,11 @@ description  = "Renderer-neutral semantic question interaction controller"
 interface_id = "bcode.interaction-controller/v1"
 name         = "Question Interaction Controller"
 
+[[services]]
+description  = "Opt-in producer-owned question checkpoints and pure completion"
+interface_id = "bcode.interaction-durable/v1"
+name         = "Durable Question Interaction"
+
 [[visual_adapters]]
 artifact_schema    = "bcode.question.outcome"
 id                 = "question-outcome-component"

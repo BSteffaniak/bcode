@@ -52,12 +52,13 @@ impl Transcript {
         let token = self
             .accepted
             .visual_preparation(&TranscriptViewItemId::new(item_id))?;
+        let revision = self.accepted.replacement_visual_revision(&token)?;
         if width == 0 {
             return None;
         }
         Some(PendingImage {
             token,
-            revision: item.revision,
+            revision,
             item_revision: item.revision,
             width,
             rows: 12,
@@ -113,5 +114,118 @@ impl Transcript {
             self.rows = self.accepted.layout.total_rows();
         }
         accepted
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use bcode_session_view_models::SessionViewSnapshot;
+    use bmux_tui::{
+        buffer::Buffer,
+        component::{Component, Constraints, LayoutCx},
+        frame::Frame,
+        paint::PaintCx,
+    };
+
+    fn fixture() -> (Transcript, SessionViewSnapshot) {
+        let mut snapshot = SessionViewSnapshot::empty();
+        snapshot.transcript.revision = 1;
+        snapshot.transcript.items.push(serde_json::from_value(serde_json::json!({
+            "id":"image","revision":1,"sequence":null,"timestamp_ms":null,"streaming":false,
+            "kind":{"type":"tool_invocation","tool":{
+                "tool_call_id":"image-call","producer_plugin_id":"bcode.filesystem","tool_name":"read","arguments_json":"{}","working_directory":null,
+                "status":"finished","result_text":null,"is_error":false,"timing":{},
+                "result":{"type":"artifact","artifact":{
+                    "artifact":{"artifact_id":"image-artifact","producer_plugin_id":"bcode.filesystem","schema":"bcode.filesystem.image","schema_version":1,"metadata":{},"refs":[{"key":"inline-image","content_type":"image/png","byte_len":4}]},
+                    "generic_payload":{}
+                }}
+            }}
+        })).unwrap());
+        let mut transcript = Transcript::new();
+        transcript.prepare_snapshot(&snapshot, 40);
+        (transcript, snapshot)
+    }
+
+    fn card(transcript: &mut Transcript, revision: u64) {
+        assert!(transcript.accepted.accept_visual(
+            TranscriptViewItemId::new("image"),
+            AcceptedVisual {
+                item_revision: 1,
+                width: 40,
+                revision,
+                rows: TranscriptLayoutRows::Rendered(vec![bmux_tui::prelude::Line::raw(
+                    "producer image card"
+                )]),
+            }
+        ));
+    }
+
+    #[test]
+    fn decoded_image_replaces_higher_card_revision_and_paints_in_retained_scene() {
+        let (mut transcript, snapshot) = fixture();
+        card(&mut transcript, 500);
+        let pending = transcript
+            .prepare_image(&snapshot, "image", "inline-image", 40)
+            .unwrap();
+        assert_eq!(pending.revision, 501);
+        let pixels = vec![255, 0, 0, 255];
+        assert!(transcript.accept_image(&pending, pixels.clone(), 1, 1));
+        let area = Rect::new(0, 0, 40, 30);
+        let mut buffer = Buffer::empty(area);
+        let mut frame = Frame::new(&mut buffer);
+        let child = transcript.accepted.child("image-test", 0, "selection");
+        let layout = child.layout(Constraints::tight(area.size()), &mut LayoutCx::new());
+        child.paint(&layout, &mut PaintCx::new(&mut frame));
+        assert_eq!(frame.images().len(), 1);
+        let bmux_tui::image::ImageContribution::Present(image) = &frame.images()[0] else {
+            panic!("decoded image must be composed as a retained placement");
+        };
+        assert_eq!(
+            image.payload,
+            ImagePayload::Pixels {
+                bytes: pixels,
+                width: 1,
+                height: 1,
+                format: ImagePixelFormat::Rgba8
+            }
+        );
+        assert_eq!(image.destination.width, 40);
+        assert_eq!(image.destination.height, 12);
+        assert!(!transcript.accept_image(&pending, vec![255, 0, 0, 255], 1, 1));
+    }
+
+    #[test]
+    fn decoded_image_cannot_replace_newer_output_or_exhausted_revision() {
+        let (mut transcript, snapshot) = fixture();
+        card(&mut transcript, 500);
+        let pending = transcript
+            .prepare_image(&snapshot, "image", "inline-image", 40)
+            .unwrap();
+        card(&mut transcript, 501);
+        assert!(!transcript.accept_image(&pending, vec![255, 0, 0, 255], 1, 1));
+        card(&mut transcript, u64::MAX);
+        assert!(
+            transcript
+                .prepare_image(&snapshot, "image", "inline-image", 40)
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn decoded_image_preserves_geometry_and_item_revision_fences() {
+        let (mut transcript, mut snapshot) = fixture();
+        let pending = transcript
+            .prepare_image(&snapshot, "image", "inline-image", 40)
+            .unwrap();
+        transcript.prepare_snapshot(&snapshot, 39);
+        assert!(!transcript.accept_image(&pending, vec![255, 0, 0, 255], 1, 1));
+        let pending = transcript
+            .prepare_image(&snapshot, "image", "inline-image", 39)
+            .unwrap();
+        snapshot.transcript.revision += 1;
+        snapshot.transcript.items[0].revision += 1;
+        transcript.prepare_snapshot(&snapshot, 39);
+        assert!(!transcript.accept_image(&pending, vec![255, 0, 0, 255], 1, 1));
     }
 }

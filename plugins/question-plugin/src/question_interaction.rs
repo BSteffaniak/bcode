@@ -56,6 +56,9 @@ impl QuestionFocusTarget {
 /// Renderer-neutral question snapshot.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct QuestionSnapshot {
+    /// Whether the producer has already proposed completion; hosts commit resolution.
+    #[serde(default)]
+    pub closed: bool,
     /// Monotonic controller presentation revision.
     pub revision: u64,
     /// Monotonic revision for content that can change logical layout.
@@ -84,6 +87,8 @@ pub struct QuestionInteractionController {
     request: NormalizedQuestionRequest,
     revision: u64,
     layout_revision: u64,
+    #[serde(default)]
+    closed: bool,
     answers: Vec<QuestionAnswerPayload>,
     selected_option_indices: Vec<BTreeSet<usize>>,
     focus: QuestionFocusTarget,
@@ -91,7 +96,94 @@ pub struct QuestionInteractionController {
     validation_error: Option<String>,
 }
 
+/// Invalid producer snapshot. Interaction ownership and freshness are checked by the host.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct QuestionSnapshotError;
+impl std::fmt::Display for QuestionSnapshotError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("invalid question snapshot")
+    }
+}
+impl std::error::Error for QuestionSnapshotError {}
+
 impl QuestionInteractionController {
+    /// Reconstruct a controller from an exact producer checkpoint without replaying inputs.
+    /// The caller must first verify interaction identity, canonical freshness and resolution.
+    /// Reuse the presentation for the same identity to preserve editor history/selection.
+    ///
+    /// # Errors
+    /// Rejects malformed requests, answers, selection identities, focus or revisions.
+    pub fn from_snapshot(snapshot: QuestionSnapshot) -> Result<Self, QuestionSnapshotError> {
+        let request = super::parse_question_request(
+            serde_json::to_value(&snapshot.request).map_err(|_| QuestionSnapshotError)?,
+        )
+        .map_err(|_| QuestionSnapshotError)?;
+        if request != snapshot.request
+            || snapshot.layout_revision > snapshot.revision
+            || snapshot.focused_control_id != snapshot.focus.control_id()
+            || snapshot
+                .invalid_question_index
+                .is_some_and(|index| index >= request.questions.len())
+            || snapshot
+                .validation_error
+                .as_ref()
+                .is_some_and(|error| error.len() > super::MAX_QUESTION_TEXT_BYTES)
+        {
+            return Err(QuestionSnapshotError);
+        }
+        let selected_option_indices: Vec<BTreeSet<usize>> = snapshot
+            .selected_option_indices
+            .iter()
+            .map(|indices| indices.iter().copied().collect())
+            .collect();
+        if selected_option_indices
+            .iter()
+            .zip(&snapshot.selected_option_indices)
+            .any(|(unique, indices)| unique.len() != indices.len())
+        {
+            return Err(QuestionSnapshotError);
+        }
+        let controller = Self {
+            request,
+            revision: snapshot.revision,
+            layout_revision: snapshot.layout_revision,
+            closed: snapshot.closed,
+            answers: snapshot.answers,
+            selected_option_indices,
+            focus: snapshot.focus,
+            invalid_question_index: snapshot.invalid_question_index,
+            validation_error: snapshot.validation_error,
+        };
+        controller
+            .validate_ephemeral_state()
+            .map_err(|()| QuestionSnapshotError)?;
+        for (index, question) in controller.request.questions.iter().enumerate() {
+            let answer = &controller.answers[index];
+            let selected = &controller.selected_option_indices[index];
+            let values: BTreeSet<_> = selected
+                .iter()
+                .map(|option_index| {
+                    let option = &question.options[*option_index];
+                    option.value.as_ref().unwrap_or(&option.label)
+                })
+                .collect();
+            if (question.selection_mode == QuestionSelectionMode::Single && selected.len() > 1)
+                || answer.selected.iter().collect::<BTreeSet<_>>() != values
+                || answer.selected.len() != values.len()
+                || (answer.custom.is_some() && !question.custom && !question.options.is_empty())
+                || (question.custom_mode == QuestionCustomMode::Exclusive
+                    && !selected.is_empty()
+                    && answer
+                        .custom
+                        .as_deref()
+                        .is_some_and(|text| !text.is_empty()))
+            {
+                return Err(QuestionSnapshotError);
+            }
+        }
+        Ok(controller)
+    }
+
     /// Create a question interaction controller.
     #[must_use]
     pub fn new(request: NormalizedQuestionRequest) -> Self {
@@ -111,12 +203,85 @@ impl QuestionInteractionController {
             request,
             revision: 0,
             layout_revision: 0,
+            closed: false,
             answers,
             selected_option_indices,
             focus,
             invalid_question_index: None,
             validation_error: None,
         }
+    }
+
+    /// Export only semantic answers. Focus, validation prose and layout revisions
+    /// deliberately do not belong to the durable producer representation.
+    #[cfg(any(feature = "native", feature = "presentation"))]
+    pub(super) fn durable_answers(
+        &self,
+    ) -> (
+        NormalizedQuestionRequest,
+        Vec<super::question_controller::QuestionCheckpointAnswerV1>,
+    ) {
+        let answers = self
+            .answers
+            .iter()
+            .zip(&self.selected_option_indices)
+            .map(
+                |(answer, indices)| super::question_controller::QuestionCheckpointAnswerV1 {
+                    selected_option_indices: indices.iter().copied().collect(),
+                    selected: answer.selected.clone(),
+                    custom: answer.custom.clone(),
+                },
+            )
+            .collect();
+        (self.request.clone(), answers)
+    }
+
+    /// Restore semantic answers with deterministic first-control focus. The caller
+    /// validates terminal outcome separately; no ephemeral state is deserialized.
+    #[cfg(any(feature = "native", feature = "presentation"))]
+    pub(super) fn restore_durable_answers(
+        request: NormalizedQuestionRequest,
+        answers: &[super::question_controller::QuestionCheckpointAnswerV1],
+    ) -> Result<Self, ()> {
+        if request.questions.len() != answers.len() {
+            return Err(());
+        }
+        let mut controller = Self::new(request);
+        for (index, answer) in answers.iter().enumerate() {
+            let question = &controller.request.questions[index];
+            let indices: BTreeSet<_> = answer.selected_option_indices.iter().copied().collect();
+            if indices.len() != answer.selected_option_indices.len()
+                || indices.iter().any(|i| *i >= question.options.len())
+                || (question.selection_mode == QuestionSelectionMode::Single && indices.len() > 1)
+                || answer.custom.as_ref().is_some_and(|text| {
+                    !question.custom && !question.options.is_empty()
+                        || text.len() > super::MAX_CUSTOM_ANSWER_BYTES
+                })
+                || (question.custom_mode == QuestionCustomMode::Exclusive
+                    && answer.custom.as_ref().is_some_and(|text| !text.is_empty())
+                    && !indices.is_empty())
+            {
+                return Err(());
+            }
+            let expected: BTreeSet<_> = indices
+                .iter()
+                .map(|i| {
+                    let option = &question.options[*i];
+                    option.value.clone().unwrap_or_else(|| option.label.clone())
+                })
+                .collect();
+            let selected: BTreeSet<_> = answer.selected.iter().cloned().collect();
+            if selected != expected || selected.len() != answer.selected.len() {
+                return Err(());
+            }
+            controller.answers[index]
+                .selected
+                .clone_from(&answer.selected);
+            controller.answers[index].custom.clone_from(&answer.custom);
+            controller.selected_option_indices[index] = indices;
+        }
+        controller.validate_ephemeral_state()?;
+        Ok(controller)
     }
 
     /// Validate reconstructed state before applying semantic input. State is ephemeral,
@@ -336,6 +501,7 @@ impl QuestionInteractionController {
     #[must_use]
     pub fn snapshot(&self) -> QuestionSnapshot {
         QuestionSnapshot {
+            closed: self.closed,
             revision: self.revision,
             layout_revision: self.layout_revision,
             request: self.request.clone(),
@@ -352,8 +518,25 @@ impl QuestionInteractionController {
         }
     }
 
+    /// Apply input only when it was translated from the current snapshot.
+    /// Stale input and input after a producer completion proposal are ignored.
+    /// The host still owns committing the authoritative exchange resolution.
+    pub fn handle_input_at_revision(
+        &mut self,
+        revision: u64,
+        input: InteractionInput,
+    ) -> InteractionOutput {
+        if revision != self.revision {
+            return InteractionOutput::None;
+        }
+        self.handle_input(input)
+    }
+
     /// Apply one producer-owned semantic transition.
     pub fn handle_input(&mut self, input: InteractionInput) -> InteractionOutput {
+        if self.closed {
+            return InteractionOutput::None;
+        }
         let layout_may_change = matches!(
             input,
             InteractionInput::Change { .. } | InteractionInput::Submit
@@ -372,10 +555,16 @@ impl QuestionInteractionController {
             InteractionInput::Submit => self.submit(),
             InteractionInput::Cancel => dismissed(),
         };
+        if matches!(
+            output,
+            InteractionOutput::Submitted { .. } | InteractionOutput::Cancelled
+        ) {
+            self.closed = true;
+        }
         if !matches!(output, InteractionOutput::None) {
-            self.revision = self.revision.wrapping_add(1);
+            self.revision = self.revision.saturating_add(1);
             if layout_may_change {
-                self.layout_revision = self.layout_revision.wrapping_add(1);
+                self.layout_revision = self.layout_revision.saturating_add(1);
             }
         }
         output
@@ -682,19 +871,22 @@ mod tests {
 
     #[test]
     fn cancel_submits_plugin_owned_dismissed_response() {
-        let mut controller = QuestionInteractionController::new(request(question(
+        let request = request(question(
             &[("Yes", "yes")],
             QuestionSelectionMode::Single,
             false,
             QuestionCustomMode::Additional,
             false,
-        )));
+        ));
+        let mut controller = QuestionInteractionController::new(request.clone());
         assert_eq!(
             controller.handle_input(InteractionInput::Cancel),
             InteractionOutput::Submitted {
                 payload: json!({"status": "dismissed"}),
             }
         );
+        // Exercise the equivalent control activation on an independently open form.
+        let mut controller = QuestionInteractionController::new(request);
         assert_eq!(
             controller.handle_input(InteractionInput::Activate {
                 control_id: InteractionControlId::new("cancel"),

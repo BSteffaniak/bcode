@@ -10910,6 +10910,28 @@ mod session_progress_tests {
 
 #[cfg(test)]
 mod client_timeout_tests {
+    #[cfg(unix)]
+    fn create_private_socket_fixture(directory: &std::path::Path) {
+        use std::os::unix::fs::{DirBuilderExt as _, PermissionsExt as _};
+        std::fs::DirBuilder::new()
+            .mode(0o700)
+            .create(directory)
+            .unwrap();
+        std::fs::set_permissions(directory, std::fs::Permissions::from_mode(0o700)).unwrap();
+    }
+
+    #[cfg(unix)]
+    async fn remove_closed_fixture_socket(path: &std::path::Path) {
+        let endpoint = bcode_ipc::IpcEndpoint::unix_socket(path);
+        assert!(
+            bcode_ipc::LocalIpcStream::connect(&endpoint).await.is_err(),
+            "fixture listener must be closed before owner cleanup"
+        );
+        // Generic transport drop closes descriptors but deliberately preserves
+        // pathnames. This isolated fixture is the sole binder/remover.
+        std::fs::remove_file(path).unwrap();
+    }
+
     #[test]
     fn pending_exchange_selection_preserves_schema_and_rejects_ambiguity() {
         let exchange = bcode_session_models::PendingToolExchangeSummary {
@@ -11316,7 +11338,7 @@ mod client_timeout_tests {
     #[cfg(unix)]
     async fn interrupted_page_successor(final_page: bool) {
         let dir = std::path::PathBuf::from(format!("/tmp/bcc-{}", SessionOpenOperationId::new()));
-        std::fs::create_dir_all(&dir).unwrap();
+        create_private_socket_fixture(&dir);
         let endpoint = bcode_ipc::IpcEndpoint::unix_socket(dir.join("catalog.sock"));
         let listener = bcode_ipc::LocalIpcListener::bind(&endpoint).unwrap();
         let (dispatched, interrupted) = tokio::sync::oneshot::channel();
@@ -11408,7 +11430,7 @@ mod client_timeout_tests {
         .unwrap();
         assert!(result.is_none());
         server.await.unwrap();
-        assert!(!dir.join("catalog.sock").exists());
+        remove_closed_fixture_socket(&dir.join("catalog.sock")).await;
         std::fs::remove_dir(dir).unwrap();
     }
 
@@ -11416,7 +11438,7 @@ mod client_timeout_tests {
     #[tokio::test]
     async fn interrupted_retained_page_does_not_dispatch_after_cancellation() {
         let dir = std::path::PathBuf::from(format!("/tmp/bcc-{}", SessionOpenOperationId::new()));
-        std::fs::create_dir_all(&dir).unwrap();
+        create_private_socket_fixture(&dir);
         let endpoint = bcode_ipc::IpcEndpoint::unix_socket(dir.join("catalog.sock"));
         let listener = bcode_ipc::LocalIpcListener::bind(&endpoint).unwrap();
         let server = tokio::spawn(async move {
@@ -11467,7 +11489,7 @@ mod client_timeout_tests {
         .unwrap();
         assert!(result.is_none());
         server.await.unwrap();
-        assert!(!dir.join("catalog.sock").exists());
+        remove_closed_fixture_socket(&dir.join("catalog.sock")).await;
         std::fs::remove_dir(dir).unwrap();
     }
 
@@ -11475,7 +11497,7 @@ mod client_timeout_tests {
     #[tokio::test]
     async fn interrupted_catalog_admission_releases_token_without_discovery() {
         let dir = std::path::PathBuf::from(format!("/tmp/bcc-{}", SessionOpenOperationId::new()));
-        std::fs::create_dir_all(&dir).unwrap();
+        create_private_socket_fixture(&dir);
         let endpoint = bcode_ipc::IpcEndpoint::unix_socket(dir.join("catalog.sock"));
         let listener = bcode_ipc::LocalIpcListener::bind(&endpoint).unwrap();
         let server = tokio::spawn(async move {
@@ -11540,7 +11562,7 @@ mod client_timeout_tests {
         .unwrap();
         assert!(result.is_none());
         server.await.unwrap();
-        assert!(!dir.join("catalog.sock").exists());
+        remove_closed_fixture_socket(&dir.join("catalog.sock")).await;
         std::fs::remove_dir(dir).unwrap();
     }
 
@@ -12000,7 +12022,7 @@ mod client_timeout_tests {
     async fn catalog_watcher_delivers_queued_completion_and_closes_on_drop() {
         let socket_dir =
             std::path::PathBuf::from(format!("/tmp/bcw-{}", SessionOpenOperationId::new()));
-        std::fs::create_dir_all(&socket_dir).unwrap();
+        create_private_socket_fixture(&socket_dir);
         let endpoint = bcode_ipc::IpcEndpoint::unix_socket(socket_dir.join("catalog.sock"));
         let listener = bcode_ipc::LocalIpcListener::bind(&endpoint).unwrap();
         let server = tokio::spawn(async move {
@@ -12092,7 +12114,7 @@ mod client_timeout_tests {
             .await
             .unwrap()
             .unwrap();
-        assert!(!socket_dir.join("catalog.sock").exists());
+        remove_closed_fixture_socket(&socket_dir.join("catalog.sock")).await;
         std::fs::remove_dir(socket_dir).unwrap();
     }
 
@@ -12269,7 +12291,7 @@ mod client_timeout_tests {
     #[tokio::test]
     async fn reconnect_rejects_replacement_executable_before_restoring_session() {
         let directory = std::path::PathBuf::from(format!("/tmp/bcp-{}", SessionId::new()));
-        std::fs::create_dir_all(&directory).unwrap();
+        create_private_socket_fixture(&directory);
         let endpoint = bcode_ipc::IpcEndpoint::unix_socket(directory.join("pin.sock"));
         let listener = bcode_ipc::LocalIpcListener::bind(&endpoint).unwrap();
         let server = tokio::spawn(async move {
@@ -12304,6 +12326,7 @@ mod client_timeout_tests {
         ));
         drop(connection);
         server.await.unwrap();
+        remove_closed_fixture_socket(&directory.join("pin.sock")).await;
         std::fs::remove_dir(directory).unwrap();
     }
 
@@ -13361,7 +13384,8 @@ impl bcode_plugin_sdk::application::PluginApplication for BcodeClient {
 /// Renderer-neutral controller consumer retaining one authenticated connection.
 ///
 /// Connection loss is surfaced; operations are never automatically replayed or rebound
-/// to a new caller. Dropping this consumer releases its ephemeral controller ownership.
+/// to a new caller. Dropping releases ephemeral ownership and durable consumer attachment,
+/// never the durable interaction's session-owned execution lifetime.
 pub struct InteractionControllerConsumer {
     connection: tokio::sync::Mutex<ClientConnection>,
 }
@@ -13383,6 +13407,25 @@ impl BcodeClient {
 }
 
 impl InteractionControllerConsumer {
+    /// Discover bounded canonical durable views without inferring producer bindings.
+    ///
+    /// # Errors
+    /// Rejects malformed session identities, invalid bounds, foreign or malformed results,
+    /// stale generations and unavailable transport.
+    pub async fn durable_controllers(
+        &self,
+        session_id: String,
+        query: bcode_plugin_sdk::interaction_application::DurableInteractionQuery,
+    ) -> Result<
+        bcode_plugin_sdk::interaction_application::DurableInteractionPage,
+        bcode_plugin_sdk::interaction_application::InteractionControllerError,
+    > {
+        bcode_plugin_sdk::interaction_application::InteractionApplication::durable_controllers(
+            self, session_id, query,
+        )
+        .await
+    }
+
     /// Open one pending exchange on this retained caller connection.
     /// # Errors
     /// Returns normalized authorization, compatibility, lifecycle or transport failure.
@@ -13422,6 +13465,53 @@ impl InteractionControllerConsumer {
     > {
         use bcode_plugin_sdk::interaction_application::InteractionApplication as _;
         self.controller_input(input).await
+    }
+
+    /// Open a commit-backed durable controller on this verified connection.
+    ///
+    /// # Errors
+    /// Returns explicit unsupported, identity, authorization, bounds or transport failures.
+    pub async fn open_durable(
+        &self,
+        version: u32,
+        binding: bcode_plugin_sdk::interaction_application::DurableInteractionBinding,
+    ) -> Result<
+        bcode_plugin_sdk::interaction_application::DurableInteractionView,
+        bcode_plugin_sdk::interaction_application::InteractionControllerError,
+    > {
+        use bcode_plugin_sdk::interaction_application::InteractionApplication as _;
+        self.open_durable_controller(version, binding).await
+    }
+
+    /// Inspect a committed durable view, without reopening or replaying the tool.
+    ///
+    /// # Errors
+    /// Returns explicit unsupported, identity, authorization, bounds or transport failures.
+    pub async fn durable_view(
+        &self,
+        version: u32,
+        binding: bcode_plugin_sdk::interaction_application::DurableInteractionBinding,
+    ) -> Result<
+        bcode_plugin_sdk::interaction_application::DurableInteractionView,
+        bcode_plugin_sdk::interaction_application::InteractionControllerError,
+    > {
+        use bcode_plugin_sdk::interaction_application::InteractionApplication as _;
+        self.durable_controller_view(version, binding).await
+    }
+
+    /// Send the original stable operation; retries never allocate replacement identities.
+    ///
+    /// # Errors
+    /// Rejects malformed requests, mismatched receipts, conflicts and transport failure.
+    pub async fn durable_input(
+        &self,
+        input: bcode_plugin_sdk::interaction_application::DurableInteractionInput,
+    ) -> Result<
+        bcode_plugin_sdk::interaction_application::DurableInteractionReceipt,
+        bcode_plugin_sdk::interaction_application::InteractionControllerError,
+    > {
+        use bcode_plugin_sdk::interaction_application::InteractionApplication as _;
+        self.durable_controller_input(input).await
     }
 }
 
@@ -13567,6 +13657,95 @@ impl bcode_plugin_sdk::interaction_application::InteractionApplication
                 .await,
         )
     }
+    async fn durable_controllers(
+        &self,
+        session_id: String,
+        query: bcode_plugin_sdk::interaction_application::DurableInteractionQuery,
+    ) -> Result<
+        bcode_plugin_sdk::interaction_application::DurableInteractionPage,
+        bcode_plugin_sdk::interaction_application::InteractionControllerError,
+    > {
+        use bcode_plugin_sdk::interaction_application::InteractionControllerError as Error;
+        query.validate()?;
+        let canonical_session: SessionId =
+            session_id.parse().map_err(|_| Error::InvalidContract)?;
+        if canonical_session.to_string() != session_id {
+            return Err(Error::InvalidContract);
+        }
+        let response = self
+            .connection
+            .lock()
+            .await
+            .send_request(Request::DurableInteractionControllers {
+                session_id: canonical_session,
+                query: query.clone(),
+            })
+            .await;
+        durable_page_response(response, &session_id, &query)
+    }
+
+    async fn open_durable_controller(
+        &self,
+        version: u32,
+        binding: bcode_plugin_sdk::interaction_application::DurableInteractionBinding,
+    ) -> Result<
+        bcode_plugin_sdk::interaction_application::DurableInteractionView,
+        bcode_plugin_sdk::interaction_application::InteractionControllerError,
+    > {
+        validate_durable_open(version, &binding)?;
+        let response = self
+            .connection
+            .lock()
+            .await
+            .send_request(Request::OpenDurableInteractionController {
+                version,
+                binding: binding.clone(),
+            })
+            .await;
+        durable_view_response(response, &binding)
+    }
+
+    async fn durable_controller_view(
+        &self,
+        version: u32,
+        binding: bcode_plugin_sdk::interaction_application::DurableInteractionBinding,
+    ) -> Result<
+        bcode_plugin_sdk::interaction_application::DurableInteractionView,
+        bcode_plugin_sdk::interaction_application::InteractionControllerError,
+    > {
+        validate_durable_open(version, &binding)?;
+        let response = self
+            .connection
+            .lock()
+            .await
+            .send_request(Request::DurableInteractionControllerView {
+                version,
+                binding: binding.clone(),
+            })
+            .await;
+        durable_view_response(response, &binding)
+    }
+
+    async fn durable_controller_input(
+        &self,
+        input: bcode_plugin_sdk::interaction_application::DurableInteractionInput,
+    ) -> Result<
+        bcode_plugin_sdk::interaction_application::DurableInteractionReceipt,
+        bcode_plugin_sdk::interaction_application::InteractionControllerError,
+    > {
+        input.validate()?;
+        let response = self
+            .connection
+            .lock()
+            .await
+            .send_request(Request::DurableInteractionControllerInput {
+                input: input.clone(),
+            })
+            .await
+            .map_err(interaction_application_failure)?;
+        durable_receipt_response(response, &input)
+    }
+
     async fn resolve_exchange(
         &self,
         exchange_id: &str,
@@ -13594,6 +13773,104 @@ impl bcode_plugin_sdk::interaction_application::InteractionApplication
     }
 }
 
+fn durable_receipt_response(
+    response: ResponsePayload,
+    input: &bcode_plugin_sdk::interaction_application::DurableInteractionInput,
+) -> Result<
+    bcode_plugin_sdk::interaction_application::DurableInteractionReceipt,
+    bcode_plugin_sdk::interaction_application::InteractionControllerError,
+> {
+    use bcode_plugin_sdk::interaction_application::{
+        DURABLE_INTERACTION_VERSION, InteractionControllerError as Error,
+    };
+    let ResponsePayload::DurableInteractionControllerReceipt { receipt } = response else {
+        return Err(Error::Unavailable);
+    };
+    receipt.validate()?;
+    if &receipt.input != input {
+        return Err(Error::Conflict);
+    }
+    validate_durable_view(&receipt.view, &input.binding)?;
+    if receipt.version != DURABLE_INTERACTION_VERSION {
+        return Err(Error::InvalidContract);
+    }
+    Ok(receipt)
+}
+
+fn validate_durable_open(
+    version: u32,
+    binding: &bcode_plugin_sdk::interaction_application::DurableInteractionBinding,
+) -> Result<(), bcode_plugin_sdk::interaction_application::InteractionControllerError> {
+    use bcode_plugin_sdk::interaction_application::{
+        DURABLE_INTERACTION_VERSION, InteractionControllerError,
+    };
+    if version != DURABLE_INTERACTION_VERSION {
+        return Err(InteractionControllerError::InvalidContract);
+    }
+    binding.validate()
+}
+
+fn durable_page_response(
+    response: Result<ResponsePayload, ClientError>,
+    session_id: &str,
+    query: &bcode_plugin_sdk::interaction_application::DurableInteractionQuery,
+) -> Result<
+    bcode_plugin_sdk::interaction_application::DurableInteractionPage,
+    bcode_plugin_sdk::interaction_application::InteractionControllerError,
+> {
+    let ResponsePayload::DurableInteractionControllers { page } =
+        response.map_err(interaction_application_failure)?
+    else {
+        return Err(
+            bcode_plugin_sdk::interaction_application::InteractionControllerError::Unavailable,
+        );
+    };
+    page.validate(session_id, query)?;
+    Ok(page)
+}
+
+fn validate_durable_view(
+    view: &bcode_plugin_sdk::interaction_application::DurableInteractionView,
+    binding: &bcode_plugin_sdk::interaction_application::DurableInteractionBinding,
+) -> Result<(), bcode_plugin_sdk::interaction_application::InteractionControllerError> {
+    use bcode_plugin_sdk::interaction_application::{
+        DURABLE_INTERACTION_VERSION, INTERACTION_CONTROLLER_VERSION,
+        InteractionControllerError as Error, validate_durable_size,
+    };
+    validate_durable_size(view)?;
+    view.binding.validate()?;
+    if &view.binding != binding {
+        return Err(Error::Conflict);
+    }
+    if view.version != DURABLE_INTERACTION_VERSION
+        || view.snapshot.version != INTERACTION_CONTROLLER_VERSION
+        || view.snapshot.exchange_id != binding.exchange_id
+        || view.snapshot.route != binding.capability.route
+        || view.snapshot.schema_version != binding.exchange_schema_version
+        || view.revision != view.snapshot.revision
+    {
+        return Err(Error::InvalidContract);
+    }
+    Ok(())
+}
+
+fn durable_view_response(
+    response: Result<ResponsePayload, ClientError>,
+    binding: &bcode_plugin_sdk::interaction_application::DurableInteractionBinding,
+) -> Result<
+    bcode_plugin_sdk::interaction_application::DurableInteractionView,
+    bcode_plugin_sdk::interaction_application::InteractionControllerError,
+> {
+    let ResponsePayload::DurableInteractionControllerView { view } =
+        response.map_err(interaction_application_failure)?
+    else {
+        return Err(
+            bcode_plugin_sdk::interaction_application::InteractionControllerError::Unavailable,
+        );
+    };
+    validate_durable_view(&view, binding)?;
+    Ok(view)
+}
 fn controller_response(
     response: Result<ResponsePayload, ClientError>,
 ) -> Result<
@@ -13628,6 +13905,139 @@ fn interaction_application_failure(
 
 #[cfg(test)]
 mod portable_application_adapter_tests {
+    #[test]
+    fn durable_discovery_responses_validate_scope_contract_and_budget_without_truncation() {
+        use bcode_plugin_sdk::interaction_application::{
+            DurableInteractionPage, DurableInteractionQuery, DurableInteractionView,
+            InteractionControllerError as Error,
+        };
+        let query = DurableInteractionQuery {
+            limit: 1,
+            after_event_sequence: Some(2),
+            expected_generation: Some(7),
+        };
+        let view: DurableInteractionView = serde_json::from_value(serde_json::json!({
+            "version":1,"binding":{"session_id":"session","turn_id":"turn","invocation_id":"call",
+                "request_sequence":1,"exchange_id":"exchange","tool_name":"tool","request_digest":"a".repeat(64),
+                "exchange_schema_version":1,"capability":{"route":{"producer_id":"producer",
+                    "exchange_schema":"request","min_schema_version":1,"max_schema_version":1,"interaction_kind":"kind"},
+                    "checkpoint_schema":"checkpoint","checkpoint_version":1,"continuation_schema":"complete","continuation_version":1}},
+            "revision":2,"snapshot":{"version":1,"exchange_id":"exchange","route":{"producer_id":"producer",
+                "exchange_schema":"request","min_schema_version":1,"max_schema_version":1,"interaction_kind":"kind"},
+                "schema_version":1,"revision":2,"snapshot":{},"output":{"type":"none"}}
+        })).unwrap();
+        let page = DurableInteractionPage {
+            generation: 7,
+            views: vec![view],
+            next_after_event_sequence: Some(3),
+        };
+        let response = |page| Ok(super::ResponsePayload::DurableInteractionControllers { page });
+        assert_eq!(
+            super::durable_page_response(response(page.clone()), "session", &query),
+            Ok(page.clone())
+        );
+        assert_eq!(
+            super::durable_page_response(response(page.clone()), "foreign", &query),
+            Err(Error::Unauthorized)
+        );
+        let mut malformed = page.clone();
+        malformed.views[0].snapshot.exchange_id = "other".into();
+        assert_eq!(
+            super::durable_page_response(response(malformed), "session", &query),
+            Err(Error::InvalidContract)
+        );
+        let mut over_budget = page.clone();
+        over_budget.views.push(over_budget.views[0].clone());
+        assert_eq!(
+            super::durable_page_response(response(over_budget), "session", &query),
+            Err(Error::LimitExceeded)
+        );
+        let mut stale = page;
+        stale.generation += 1;
+        assert_eq!(
+            super::durable_page_response(response(stale), "session", &query),
+            Err(Error::Conflict)
+        );
+        assert_eq!(
+            super::durable_page_response(
+                Ok(super::ResponsePayload::MessageSent),
+                "session",
+                &query
+            ),
+            Err(Error::Unavailable)
+        );
+    }
+
+    #[test]
+    fn durable_receipts_retain_terminal_retry_and_reject_identity_conflicts() {
+        use bcode_plugin_sdk::interaction_application::{
+            DurableInteractionInput, DurableInteractionReceipt, DurableInteractionView,
+            InteractionControllerError,
+        };
+        let input: DurableInteractionInput = serde_json::from_value(serde_json::json!({
+            "version":1,"binding":{"session_id":"session","turn_id":"turn","invocation_id":"call",
+                "request_sequence":1,"exchange_id":"exchange","tool_name":"tool","request_digest":"a".repeat(64),
+                "exchange_schema_version":1,"capability":{"route":{"producer_id":"producer",
+                    "exchange_schema":"request","min_schema_version":1,"max_schema_version":1,"interaction_kind":"kind"},
+                    "checkpoint_schema":"checkpoint","checkpoint_version":1,"continuation_schema":"complete","continuation_version":1}},
+            "operation":{"operation_id":"stable","expected_revision":1},"input":{"type":"submit"}
+        })).unwrap();
+        let view: DurableInteractionView = serde_json::from_value(serde_json::json!({
+            "version":1,"binding":input.binding,"revision":2,"snapshot":{"version":1,
+                "exchange_id":"exchange","route":input.binding.capability.route,"schema_version":1,"revision":2,
+                "snapshot":{},"output":{"type":"submitted","payload":{"status":"answered"}}}
+        })).unwrap();
+        let receipt: DurableInteractionReceipt = serde_json::from_value(serde_json::json!({
+            "version":1,"input":input,"view":view
+        }))
+        .unwrap();
+        let response = super::ResponsePayload::DurableInteractionControllerReceipt {
+            receipt: receipt.clone(),
+        };
+        assert_eq!(
+            super::durable_receipt_response(response.clone(), &input),
+            Ok(receipt.clone())
+        );
+        assert_eq!(
+            super::durable_receipt_response(response, &input),
+            Ok(receipt.clone())
+        );
+        let mut conflicting = input.clone();
+        conflicting.operation.expected_revision += 1;
+        assert_eq!(
+            super::durable_receipt_response(
+                super::ResponsePayload::DurableInteractionControllerReceipt { receipt },
+                &conflicting
+            ),
+            Err(InteractionControllerError::Conflict)
+        );
+        let mut wrong_view = view.clone();
+        wrong_view.snapshot.revision += 1;
+        assert_eq!(
+            super::validate_durable_view(&wrong_view, &input.binding),
+            Err(InteractionControllerError::InvalidContract)
+        );
+        let mut foreign = input.binding.clone();
+        foreign.exchange_id = "other".into();
+        assert_eq!(
+            super::validate_durable_view(&view, &foreign),
+            Err(InteractionControllerError::Conflict)
+        );
+        assert_eq!(
+            super::validate_durable_open(2, &input.binding),
+            Err(InteractionControllerError::InvalidContract)
+        );
+        assert_eq!(
+            super::durable_view_response(
+                Ok(super::ResponsePayload::InteractionControllerSnapshot {
+                    snapshot: view.snapshot
+                }),
+                &input.binding
+            ),
+            Err(InteractionControllerError::Unavailable)
+        );
+    }
+
     #[cfg(unix)]
     #[tokio::test]
     async fn explicit_target_propagates_to_every_connection_and_rechecks_executable() {

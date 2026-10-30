@@ -776,7 +776,7 @@ mod tests {
     }
 
     async fn execute_activated_turn(
-        state: &ServerState,
+        state: &Arc<ServerState>,
         session_id: SessionId,
         number: usize,
     ) -> bcode_session_models::ModelTurnOutcome {
@@ -861,27 +861,29 @@ mod tests {
             .create_session(None, root.path().to_path_buf())
             .await
             .unwrap();
-        let mut state = crate::tests::test_server_state(sessions);
         // Hold canonical ownership through execution and subsequent evidence reads.
-        let evidence_ownership = state
-            .sessions
+        let evidence_ownership = sessions
             .acquire_session_ownership(session.id, bcode_session::SessionOwnershipKind::RuntimeWork)
             .await
             .unwrap();
-        state.plugins = fixture_plugins();
-        state.selected_provider_plugin_id = Some("bcode.fake-provider".into());
-        state.selected_model_id = Some("fake-echo".into());
-        state.startup_config.model.profiles.insert("small".into(), bcode_config::ModelProfileConfig {
+        let mut state = Arc::new({
+            let mut state = crate::tests::test_server_state(sessions);
+            state.plugins = fixture_plugins();
+            state.selected_provider_plugin_id = Some("bcode.fake-provider".into());
+            state.selected_model_id = Some("fake-echo".into());
+            state.startup_config.model.profiles.insert("small".into(), bcode_config::ModelProfileConfig {
             provider_plugin_id: "bcode.fake-provider".into(), model_id: Some("fake-echo".into()),
             settings: BTreeMap::from([("fixture_output".into(), "{\"kind\":\"milestone\",\"header\":\"Behavior implemented\",\"description\":\"Added tested behavior.\"}".into())]),
             ..bcode_config::ModelProfileConfig::default()
         });
-        state.startup_config.milestones = bcode_config::MilestonesConfig {
-            enabled: true,
-            model_profile: Some("small".into()),
-            min_interval_secs: 0,
-            ..bcode_config::MilestonesConfig::default()
-        };
+            state.startup_config.milestones = bcode_config::MilestonesConfig {
+                enabled: true,
+                model_profile: Some("small".into()),
+                min_interval_secs: 0,
+                ..bcode_config::MilestonesConfig::default()
+            };
+            state
+        });
         for number in 0..3 {
             assert_eq!(
                 execute_activated_turn(&state, session.id, number).await,
@@ -905,15 +907,19 @@ mod tests {
             "real completed activation must reach registry policy, inference and canonical publication"
         );
         assert_eq!(page.milestones[0].milestone.header, "Behavior implemented");
-        state.startup_config.milestones.subsequent_turns = 1;
-        state
-            .startup_config
-            .model
-            .profiles
-            .get_mut("small")
-            .unwrap()
-            .settings
-            .insert("fixture_output".into(), "wait_for_cancel".into());
+        {
+            let state = Arc::get_mut(&mut state)
+                .expect("settled turns must release fixture state ownership");
+            state.startup_config.milestones.subsequent_turns = 1;
+            state
+                .startup_config
+                .model
+                .profiles
+                .get_mut("small")
+                .unwrap()
+                .settings
+                .insert("fixture_output".into(), "wait_for_cancel".into());
+        }
         PROVIDER_WAITING.store(false, std::sync::atomic::Ordering::SeqCst);
         PROVIDER_CANCELLED.store(false, std::sync::atomic::Ordering::SeqCst);
         assert_eq!(

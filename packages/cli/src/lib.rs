@@ -808,7 +808,6 @@ async fn route_cli_startup(cli: &Cli) -> Result<bool, CliError> {
 
 async fn handle_cli(cli: Cli) -> Result<(), CliError> {
     let _ = (&cli.profile, cli.request_timeout_secs);
-    let _ = (&cli.state_root, &cli.state_profile);
     let launch_options = cli.launch_options();
     validate_cli_execution_mode(&cli, launch_options)?;
     if let Some(Commands::Run(options)) = &cli.command {
@@ -4168,7 +4167,11 @@ async fn handle_web_command(
             config.presentation.streaming.policy(),
         )
         .with_browser_policy(browser_policy)
+        .map_err(|error| CliError::HyperChadRender(error.to_owned()))?
+        .with_browser_origins(allowed_browser_origins)
         .map_err(|error| CliError::HyperChadRender(error.to_owned()))?;
+    let origin_state = state.clone();
+    let embed_origins = allowed_browser_origins.to_vec();
     let builder = bcode_hyperchad::init(&state).await?;
     let builder = if let Some(assets) = tui_assets {
         assets.with_routes(builder)
@@ -4180,6 +4183,12 @@ async fn handle_web_command(
         .with_actix_bind_address(bind.to_string())
         .with_actix_port(port)
         .with_actix_on_bound(move |address| {
+            let mut browser_origins = embed_origins.clone();
+            browser_origins.push(format!("http://{address}"));
+            if origin_state.clone().with_browser_origins(&browser_origins).is_err() {
+                eprintln!("Could not configure browser origin policy; launch URL withheld");
+                return;
+            }
             let launch_url = if launch_tui {
                 let url = bcode_hyperchad::build_tui_launch_url(address, &launch_token);
                 // The typed UUID cannot introduce fragment parameters. Keep the
@@ -20832,6 +20841,8 @@ const fn session_event_kind_name(kind: &SessionEventKind) -> &'static str {
         SessionEventKind::ToolContribution { .. } => "tool_contribution",
         SessionEventKind::ToolContributionPlaced { .. } => "tool_contribution_placed",
         SessionEventKind::ToolExchangeRequested { .. } => "tool_exchange_requested",
+        SessionEventKind::DurableInteractionCommitted { .. } => "durable_interaction_committed",
+        SessionEventKind::TurnContinuationCommitted { .. } => "turn_continuation_committed",
         SessionEventKind::ToolExchangeResolved { .. } => "tool_exchange_resolved",
         SessionEventKind::WorkingDirectoryChanged { .. } => "working_directory_changed",
         SessionEventKind::SessionImported { .. } => "session_imported",
@@ -22474,6 +22485,20 @@ fn print_non_trace_session_event(event: &SessionEvent) {
             request.schema_version,
             request.response_policy,
             request.payload
+        ),
+        SessionEventKind::DurableInteractionCommitted { operation } => println!(
+            "#{} durable interaction {} invocation={} operation={}",
+            event.sequence,
+            operation.key.interaction_id,
+            operation.key.invocation_id,
+            operation.operation_id
+        ),
+        SessionEventKind::TurnContinuationCommitted { operation } => println!(
+            "#{} turn continuation turn={} continuation={} operation={}",
+            event.sequence,
+            operation.key.turn_id,
+            operation.key.continuation_id,
+            operation.operation_id
         ),
         SessionEventKind::ToolExchangeResolved { event: resolution } => println!(
             "#{} exchange resolved {}:{} {:?}",

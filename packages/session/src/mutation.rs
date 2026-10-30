@@ -7,79 +7,6 @@ use bcode_session_models::{
 };
 use std::sync::atomic::Ordering;
 
-#[cfg(test)]
-mod permission_batch_actor_tests {
-    use super::*;
-
-    #[tokio::test]
-    async fn permission_batch_is_contiguous_with_concurrent_writer_and_survives_restore() {
-        let root = tempfile::tempdir().unwrap();
-        let id;
-        {
-            let manager = SessionManager::persistent(root.path()).unwrap();
-            id = manager
-                .create_session(None, root.path().into())
-                .await
-                .unwrap()
-                .id;
-            let (batch, other) = tokio::join!(
-                manager.append_permission_batch_resolved(
-                    id,
-                    vec!["first".into(), "second".into()],
-                    true
-                ),
-                manager.append_event(
-                    id,
-                    SessionEventKind::AssistantMessage {
-                        text: "concurrent".into()
-                    }
-                ),
-            );
-            let batch = batch.unwrap();
-            let other = other.unwrap();
-            assert_eq!(batch[1].sequence, batch[0].sequence + 1);
-            assert!(other.sequence < batch[0].sequence || other.sequence > batch[1].sequence);
-        }
-        let restored = SessionManager::persistent(root.path()).unwrap();
-        let history = restored.session_history(id).await.unwrap();
-        let approvals = history
-            .iter()
-            .filter(|event| {
-                matches!(
-                    event.kind,
-                    SessionEventKind::PermissionResolved { approved: true, .. }
-                )
-            })
-            .collect::<Vec<_>>();
-        assert_eq!(approvals.len(), 2);
-        assert_eq!(approvals[1].sequence, approvals[0].sequence + 1);
-    }
-
-    #[tokio::test]
-    async fn permission_batch_invalid_membership_does_not_consume_sequence() {
-        let manager = SessionManager::default();
-        let id = manager
-            .create_session(None, std::env::temp_dir())
-            .await
-            .unwrap()
-            .id;
-        let before = manager.session_history(id).await.unwrap();
-        for ids in [
-            vec![],
-            vec!["duplicate".into(), "duplicate".into()],
-            vec![String::new()],
-        ] {
-            assert!(
-                manager
-                    .append_permission_batch_resolved(id, ids, true)
-                    .await
-                    .is_err()
-            );
-        }
-        assert_eq!(manager.session_history(id).await.unwrap(), before);
-    }
-}
-
 impl SessionManager {
     /// Append a user message to a session.
     ///
@@ -843,5 +770,78 @@ impl SessionManager {
                 return next;
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod permission_batch_actor_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn permission_batch_is_contiguous_with_concurrent_writer_and_survives_restore() {
+        let root = tempfile::tempdir().unwrap();
+        let id;
+        {
+            let manager = SessionManager::persistent(root.path()).unwrap();
+            id = manager
+                .create_session(None, root.path().into())
+                .await
+                .unwrap()
+                .id;
+            let (batch, other) = tokio::join!(
+                manager.append_permission_batch_resolved(
+                    id,
+                    vec!["first".into(), "second".into()],
+                    true
+                ),
+                manager.append_event(
+                    id,
+                    SessionEventKind::AssistantMessage {
+                        text: "concurrent".into()
+                    }
+                ),
+            );
+            let batch = batch.unwrap();
+            let other = other.unwrap();
+            assert_eq!(batch[1].sequence, batch[0].sequence + 1);
+            assert!(other.sequence < batch[0].sequence || other.sequence > batch[1].sequence);
+        }
+        let restored = SessionManager::persistent(root.path()).unwrap();
+        let history = restored.session_history(id).await.unwrap();
+        let approvals = history
+            .iter()
+            .filter(|event| {
+                matches!(
+                    event.kind,
+                    SessionEventKind::PermissionResolved { approved: true, .. }
+                )
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(approvals.len(), 2);
+        assert_eq!(approvals[1].sequence, approvals[0].sequence + 1);
+    }
+
+    #[tokio::test]
+    async fn permission_batch_invalid_membership_does_not_consume_sequence() {
+        let manager = SessionManager::default();
+        let id = manager
+            .create_session(None, std::env::temp_dir())
+            .await
+            .unwrap()
+            .id;
+        let before = manager.session_history(id).await.unwrap();
+        for ids in [
+            vec![],
+            vec!["duplicate".into(), "duplicate".into()],
+            vec![String::new()],
+        ] {
+            assert!(
+                manager
+                    .append_permission_batch_resolved(id, ids, true)
+                    .await
+                    .is_err()
+            );
+        }
+        assert_eq!(manager.session_history(id).await.unwrap(), before);
     }
 }

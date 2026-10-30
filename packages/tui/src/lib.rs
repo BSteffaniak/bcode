@@ -359,9 +359,25 @@ async fn run_onboarding_runtime<W: io::Write>(
     input.shutdown().await;
     match result {
         Ok(output) => Ok(output.program.continuation()),
-        Err(bmux_tui_runtime::RuntimeError::Program { error, .. }) => Err(error),
-        Err(bmux_tui_runtime::RuntimeError::Presenter { error, .. }) => Err(error.into()),
+        Err(bmux_tui_runtime::RuntimeError::Program {
+            error,
+            cleanup_error,
+            ..
+        }) => Err(runtime_error_with_cleanup(error, cleanup_error)),
+        Err(bmux_tui_runtime::RuntimeError::Presenter {
+            error,
+            cleanup_error,
+            ..
+        }) => Err(runtime_error_with_cleanup(error, cleanup_error)),
     }
+}
+
+/// Convert independent program/presenter errors without discarding terminal restoration failure.
+fn runtime_error_with_cleanup<E: Into<TuiError>, C: Into<TuiError>>(
+    error: E,
+    cleanup_error: Option<C>,
+) -> TuiError {
+    root_program::runtime_finalization_error(error.into(), cleanup_error.map(Into::into), None)
 }
 
 fn current_time_ms() -> u64 {
@@ -447,6 +463,7 @@ fn bundled_interaction_adapter(
     feature = "static-bundled-code-review-plugin",
     feature = "static-bundled-filesystem-plugin",
     feature = "static-bundled-plugins",
+    feature = "static-bundled-question-plugin",
     feature = "static-bundled-workflow-plugin"
 ))]
 fn bundled_tui_extensions() -> Vec<bcode_plugin_sdk::tui::StaticPluginTuiExtension> {
@@ -457,6 +474,7 @@ fn bundled_tui_extensions() -> Vec<bcode_plugin_sdk::tui::StaticPluginTuiExtensi
     feature = "static-bundled-code-review-plugin",
     feature = "static-bundled-filesystem-plugin",
     feature = "static-bundled-plugins",
+    feature = "static-bundled-question-plugin",
     feature = "static-bundled-workflow-plugin"
 )))]
 const fn bundled_tui_extensions() -> Vec<bcode_plugin_sdk::tui::StaticPluginTuiExtension> {
@@ -795,4 +813,60 @@ pub async fn run_eval_viewer(
     };
     let _writer = guard.leave()?;
     result
+}
+
+#[cfg(test)]
+mod runtime_cleanup_error_tests {
+    use super::{TuiError, runtime_error_with_cleanup};
+
+    #[test]
+    fn program_error_and_distinct_presenter_cleanup_error_both_survive_conversion() {
+        let error = runtime_error_with_cleanup(
+            TuiError::PluginService {
+                code: "test_program".into(),
+                message: "program failed".into(),
+            },
+            Some(std::io::Error::other("restore failed")),
+        );
+        let diagnostic = error.to_string();
+        assert!(diagnostic.contains("plugin service error test_program: program failed"));
+        assert!(diagnostic.contains("terminal cleanup also failed: I/O error: restore failed"));
+        let TuiError::Io(carrier) = error else {
+            panic!("combined diagnostic carrier")
+        };
+        let primary = std::error::Error::source(carrier.get_ref().unwrap()).unwrap();
+        assert!(
+            matches!(primary.downcast_ref::<TuiError>(), Some(TuiError::PluginService { code, .. }) if code == "test_program")
+        );
+    }
+
+    #[test]
+    fn presenter_failure_retains_additional_cleanup_failure() {
+        let diagnostic = runtime_error_with_cleanup(
+            std::io::Error::other("present failed"),
+            Some(std::io::Error::other("restore failed")),
+        )
+        .to_string();
+        assert!(diagnostic.contains("present failed"));
+        assert!(diagnostic.contains("terminal cleanup also failed: I/O error: restore failed"));
+    }
+
+    #[test]
+    fn absent_cleanup_preserves_original_program_and_presenter_error_types() {
+        let program = runtime_error_with_cleanup(
+            TuiError::PluginService {
+                code: "test_program".into(),
+                message: "program failed".into(),
+            },
+            None::<std::io::Error>,
+        );
+        assert!(matches!(program, TuiError::PluginService { code, .. } if code == "test_program"));
+        let presenter = runtime_error_with_cleanup(
+            std::io::Error::new(std::io::ErrorKind::BrokenPipe, "present failed"),
+            None::<std::io::Error>,
+        );
+        assert!(
+            matches!(presenter, TuiError::Io(error) if error.kind() == std::io::ErrorKind::BrokenPipe)
+        );
+    }
 }

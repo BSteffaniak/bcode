@@ -971,6 +971,21 @@ pub enum CoreRuntimeRequest {
 /// Requests owned by the `PermissionInteraction` dispatcher (5 variants).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PermissionInteractionRequest {
+    DurableInteractionControllers {
+        session_id: SessionId,
+        query: bcode_plugin_models::interaction_controller::DurableInteractionQuery,
+    },
+    OpenDurableInteractionController {
+        version: u32,
+        binding: bcode_plugin_models::interaction_controller::DurableInteractionBinding,
+    },
+    DurableInteractionControllerView {
+        version: u32,
+        binding: bcode_plugin_models::interaction_controller::DurableInteractionBinding,
+    },
+    DurableInteractionControllerInput {
+        input: bcode_plugin_models::interaction_controller::DurableInteractionInput,
+    },
     OpenInteractionController {
         version: u32,
         exchange_id: String,
@@ -2302,6 +2317,33 @@ impl RoutedRequest {
             Request::SpawnSession { request } => {
                 Self::SessionLifecycle(Box::new(SessionLifecycleRequest::SpawnSession { request }))
             }
+            Request::DurableInteractionControllers { session_id, query } => {
+                Self::PermissionInteraction(
+                    PermissionInteractionRequest::DurableInteractionControllers {
+                        session_id,
+                        query,
+                    },
+                )
+            }
+            Request::OpenDurableInteractionController { version, binding } => {
+                Self::PermissionInteraction(
+                    PermissionInteractionRequest::OpenDurableInteractionController {
+                        version,
+                        binding,
+                    },
+                )
+            }
+            Request::DurableInteractionControllerView { version, binding } => {
+                Self::PermissionInteraction(
+                    PermissionInteractionRequest::DurableInteractionControllerView {
+                        version,
+                        binding,
+                    },
+                )
+            }
+            Request::DurableInteractionControllerInput { input } => Self::PermissionInteraction(
+                PermissionInteractionRequest::DurableInteractionControllerInput { input },
+            ),
             Request::OpenInteractionController {
                 version,
                 exchange_id,

@@ -138,8 +138,10 @@ const MAX_CHUNK_DATA_SIZE: usize = MAX_FRAME_PAYLOAD_SIZE / 2;
 /// Version 53 adds contextual plugin invocation, cancellation, composer discovery and agent hints.
 /// Version 54 combines those contextual additions with the updated upstream positional layout.
 /// Version 55 adds secret-free queued-submission recovery confirmation and targeted operations.
+/// Version 56 adds separate opt-in durable interaction admission, views and retry receipts.
+/// Version 57 adds bounded canonical durable interaction discovery.
 /// Older positional request/response layouts are rejected rather than misinterpreted.
-pub const CURRENT_PROTOCOL_VERSION: u16 = 55;
+pub const CURRENT_PROTOCOL_VERSION: u16 = 57;
 
 /// Durable session-storage writer epoch expected by this IPC build.
 pub const CURRENT_SESSION_STORAGE_WRITER_EPOCH: u32 =
@@ -1359,6 +1361,25 @@ pub enum Request {
     },
     InteractionControllerInput {
         input: bcode_plugin_models::interaction_controller::InteractionControllerInput,
+    },
+    /// Discover bounded public durable interaction views from canonical session state.
+    DurableInteractionControllers {
+        session_id: SessionId,
+        query: bcode_plugin_models::interaction_controller::DurableInteractionQuery,
+    },
+    /// Explicit durable admission; never aliases ephemeral controller v1.
+    OpenDurableInteractionController {
+        version: u32,
+        binding: bcode_plugin_models::interaction_controller::DurableInteractionBinding,
+    },
+    /// Inspect a canonically committed durable view, including retained terminal state.
+    DurableInteractionControllerView {
+        version: u32,
+        binding: bcode_plugin_models::interaction_controller::DurableInteractionBinding,
+    },
+    /// Stable operation ID and predecessor revision are carried in the typed input.
+    DurableInteractionControllerInput {
+        input: bcode_plugin_models::interaction_controller::DurableInteractionInput,
     },
     ListPendingToolExchanges,
     ResolveToolExchange {
@@ -2847,6 +2868,18 @@ pub enum ResponsePayload {
     },
     InteractionControllerSnapshot {
         snapshot: bcode_plugin_models::interaction_controller::InteractionControllerSnapshot,
+    },
+    /// Canonical durable discovery page; contains no producer checkpoints.
+    DurableInteractionControllers {
+        page: bcode_plugin_models::interaction_controller::DurableInteractionPage,
+    },
+    /// Commit-backed durable view; never evidence supplied by an ephemeral controller.
+    DurableInteractionControllerView {
+        view: bcode_plugin_models::interaction_controller::DurableInteractionView,
+    },
+    /// Original durable operation receipt, retained for exact terminal retries.
+    DurableInteractionControllerReceipt {
+        receipt: bcode_plugin_models::interaction_controller::DurableInteractionReceipt,
     },
     PendingToolExchangeList {
         exchanges: Vec<PendingToolExchangeSummary>,
@@ -4408,6 +4441,90 @@ mod tests {
     };
     use bcode_skill_models::SkillActivationMode;
     use std::collections::BTreeSet;
+
+    #[test]
+    fn durable_input_wire_retains_original_identity_and_exact_retry_operation() {
+        use bcode_plugin_models::interaction_controller::{
+            DURABLE_INTERACTION_VERSION, DurableInteractionBinding, DurableInteractionCapability,
+            DurableInteractionInput, DurableInteractionOperation, InteractionControllerRoute,
+            InteractionInput,
+        };
+        let binding = DurableInteractionBinding {
+            session_id: "session".into(),
+            turn_id: "turn".into(),
+            invocation_id: "call".into(),
+            request_sequence: 7,
+            exchange_id: "exchange".into(),
+            tool_name: "tool".into(),
+            request_digest: "a".repeat(64),
+            exchange_schema_version: 1,
+            capability: DurableInteractionCapability {
+                route: InteractionControllerRoute {
+                    producer_id: "producer".into(),
+                    exchange_schema: "request".into(),
+                    min_schema_version: 1,
+                    max_schema_version: 1,
+                    interaction_kind: "kind".into(),
+                },
+                checkpoint_schema: "checkpoint".into(),
+                checkpoint_version: 1,
+                continuation_schema: "continuation".into(),
+                continuation_version: 1,
+            },
+        };
+        let input = DurableInteractionInput {
+            version: DURABLE_INTERACTION_VERSION,
+            binding: binding.clone(),
+            operation: DurableInteractionOperation {
+                operation_id: "stable-operation".into(),
+                expected_revision: 9,
+            },
+            input: InteractionInput::Submit,
+        };
+        input.validate().unwrap();
+        for request in [
+            Request::DurableInteractionControllers {
+                session_id: SessionId::new(),
+                query: bcode_plugin_models::interaction_controller::DurableInteractionQuery {
+                    limit: 10,
+                    after_event_sequence: Some(3),
+                    expected_generation: Some(7),
+                },
+            },
+            Request::OpenDurableInteractionController {
+                version: DURABLE_INTERACTION_VERSION,
+                binding: binding.clone(),
+            },
+            Request::DurableInteractionControllerView {
+                version: DURABLE_INTERACTION_VERSION,
+                binding,
+            },
+            Request::DurableInteractionControllerInput { input },
+        ] {
+            let encoded = serde_json::to_vec(&request).unwrap();
+            let decoded: Request = serde_json::from_slice(&encoded).unwrap();
+            assert_eq!(decoded, request);
+            assert_eq!(serde_json::to_vec(&decoded).unwrap(), encoded);
+        }
+    }
+    #[test]
+    fn durable_discovery_response_is_typed_and_protocol_56_is_rejected() {
+        use bcode_plugin_models::interaction_controller::DurableInteractionPage;
+        let page = DurableInteractionPage {
+            generation: 9,
+            views: Vec::new(),
+            next_after_event_sequence: Some(12),
+        };
+        let response = ResponsePayload::DurableInteractionControllers { page: page.clone() };
+        let encoded = serde_json::to_vec(&response).unwrap();
+        let decoded: ResponsePayload = serde_json::from_slice(&encoded).unwrap();
+        let ResponsePayload::DurableInteractionControllers { page: actual } = decoded else {
+            panic!("typed discovery response");
+        };
+        assert_eq!(actual, page);
+        assert_eq!(CURRENT_PROTOCOL_VERSION, 57);
+        assert_ne!(ProtocolVersion(56), ProtocolVersion::current());
+    }
 
     #[test]
     fn compression_wire_round_trip() {
@@ -6792,7 +6909,7 @@ mod tests {
     #[tokio::test]
     async fn unsupported_protocol_version_is_rejected() {
         let envelope = Envelope {
-            version: ProtocolVersion(1),
+            version: ProtocolVersion(56),
             request_id: 1,
             kind: EnvelopeKind::Response,
             payload: encode(&Response::Ok(ResponsePayload::MessageSent))
@@ -6815,7 +6932,7 @@ mod tests {
         assert!(matches!(
             error,
             CodecError::UnsupportedVersion {
-                actual: 1,
+                actual: 56,
                 expected: CURRENT_PROTOCOL_VERSION
             }
         ));

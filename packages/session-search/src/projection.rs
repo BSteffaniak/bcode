@@ -218,6 +218,8 @@ pub const fn classify_persisted_event(kind: &SessionEventKind) -> PersistedEvent
         | SessionEventKind::ReasoningChanged { .. }
         | SessionEventKind::ToolExchangeRequested { .. }
         | SessionEventKind::ToolExchangeResolved { .. }
+        | SessionEventKind::DurableInteractionCommitted { .. }
+        | SessionEventKind::TurnContinuationCommitted { .. }
         | SessionEventKind::ProviderContextCompacted { .. }
         | SessionEventKind::RequestContextObserved { .. }
         | SessionEventKind::PluginStatusNote { .. }
@@ -485,6 +487,8 @@ fn project_non_transcript_event(
         | SessionEventKind::ReasoningChanged { .. }
         | SessionEventKind::ToolExchangeRequested { .. }
         | SessionEventKind::ToolExchangeResolved { .. }
+        | SessionEventKind::DurableInteractionCommitted { .. }
+        | SessionEventKind::TurnContinuationCommitted { .. }
         | SessionEventKind::ProviderContextCompacted { .. }
         | SessionEventKind::RequestContextObserved { .. }
         | SessionEventKind::PluginStatusNote { .. }

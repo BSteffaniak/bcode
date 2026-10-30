@@ -9,7 +9,17 @@ fn ownerless_history_reads_use_supported_read_client() {
         return;
     }
     let root = tempfile::tempdir().unwrap();
-    let output = std::process::Command::new(std::env::current_exe().unwrap())
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        std::fs::set_permissions(root.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+    }
+    let mut command = std::process::Command::new(std::env::current_exe().unwrap());
+    #[cfg(unix)]
+    command.env("BCODE_SOCKET", root.path().join("history.sock"));
+    #[cfg(not(unix))]
+    command.env_remove("BCODE_SOCKET");
+    let output = command
         .args([
             "--exact",
             "session_read_cli_tests::ownerless_history_read_child",
@@ -20,7 +30,6 @@ fn ownerless_history_reads_use_supported_read_client() {
         .env("BCODE_SESSION_STORE_DIR", root.path().join("sessions"))
         .env_remove("BCODE_IPC_ENDPOINT")
         .env_remove("BCODE_IPC_ENDPOINT_NAMESPACE")
-        .env_remove("BCODE_SOCKET")
         .env_remove("BCODE_DAEMON_LOG")
         .output()
         .unwrap();

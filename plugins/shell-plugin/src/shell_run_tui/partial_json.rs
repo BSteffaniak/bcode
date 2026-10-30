@@ -1,7 +1,7 @@
 //! Structural decoding of top-level string fields in streamed JSON objects.
 
 /// Decode only complete JSON string units. Incomplete escapes remain invisible until complete.
-pub(super) fn string_field(input: &str, wanted: &str) -> Option<String> {
+pub fn string_field(input: &str, wanted: &str) -> Option<String> {
     let mut rest = input.trim_start().strip_prefix('{')?;
     loop {
         rest = rest.trim_start();
@@ -28,7 +28,7 @@ pub(super) fn string_field(input: &str, wanted: &str) -> Option<String> {
 }
 
 /// Read a completed top-level boolean without requiring the rest of the object.
-pub(super) fn bool_field(input: &str, wanted: &str) -> Option<bool> {
+pub fn bool_field(input: &str, wanted: &str) -> Option<bool> {
     let mut rest = input.trim_start().strip_prefix('{')?;
     loop {
         rest = rest.trim_start();

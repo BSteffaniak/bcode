@@ -5,6 +5,7 @@
 //! `HyperChad` application host for Bcode sessions.
 
 mod browser_api;
+mod browser_origin;
 
 #[cfg(feature = "renderer-html-actix")]
 mod html_actix;
@@ -22,6 +23,11 @@ use std::sync::{Arc, Mutex};
 
 use bcode_client::{
     AttachedSessionHistory, BcodeClient, ClientError, SessionWatchEvent, SessionWatcher,
+};
+use bcode_plugin_sdk::interaction_application::{
+    DURABLE_INTERACTION_VERSION, DurableInteractionInput, DurableInteractionOperation,
+    DurableInteractionPage, DurableInteractionQuery, DurableInteractionReceipt,
+    DurableInteractionView, InteractionControllerError,
 };
 use bcode_session_models::{
     ProjectionWindow, ProjectionWindowAnchor, ProjectionWindowDirection, ProjectionWindowLimits,
@@ -47,7 +53,9 @@ const WATCH_RECONNECT_DELAY: std::time::Duration = std::time::Duration::from_mil
 #[derive(Clone)]
 pub struct HyperChadAppState {
     browser_api: Arc<tokio::sync::Mutex<browser_api::BrowserApiState>>,
+    browser_consumers: Arc<browser_api::browser_consumers::BrowserConsumers>,
     browser_policy: String,
+    browser_origins: Arc<Mutex<browser_origin::BrowserOrigins>>,
     client: BcodeClient,
     access_token: Arc<str>,
     launch_working_directory: Arc<std::path::PathBuf>,
@@ -64,6 +72,9 @@ impl std::fmt::Debug for HyperChadAppState {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter
             .debug_struct("HyperChadAppState")
+            .field("browser_policy", &"[bounded presentation policy]")
+            .field("browser_origins", &"[validated browser origins]")
+            .field("browser_consumers", &"[bounded leased consumers]")
             .field("browser_api", &"[bounded observation cache]")
             .field("client", &self.client)
             .field("access_token", &"[REDACTED]")
@@ -90,6 +101,11 @@ impl std::fmt::Debug for HyperChadAppState {
 
 #[derive(Default)]
 struct LocalInteractionControllers {
+    durable: BTreeMap<String, DurableInteractionView>,
+    legacy_sessions: BTreeSet<SessionId>,
+    durable_queries: BTreeMap<SessionId, DurableInteractionQuery>,
+    durable_sessions: BTreeSet<SessionId>,
+    pending_operations: BTreeMap<String, DurableInteractionInput>,
     entries: BTreeMap<
         String,
         (
@@ -178,7 +194,7 @@ impl std::fmt::Debug for LocalInteractionControllers {
         formatter
             .debug_struct("LocalInteractionControllers")
             .field("interaction_ids", &self.entries.keys().collect::<Vec<_>>())
-            .finish()
+            .finish_non_exhaustive()
     }
 }
 
@@ -482,9 +498,11 @@ impl HyperChadAppState {
                 browser_api::BrowserApiState::default(),
             )),
             browser_policy: String::new(),
+            browser_origins: Arc::new(Mutex::new(browser_origin::BrowserOrigins::default())),
             client,
             access_token: access_token.into(),
             launch_working_directory: Arc::new(launch_working_directory),
+            browser_consumers: Arc::default(),
             watched_sessions: Arc::new(Mutex::new(BTreeSet::new())),
             history_windows: Arc::new(Mutex::new(BTreeMap::new())),
             interaction_controllers: Arc::new(Mutex::new(LocalInteractionControllers::default())),
@@ -501,7 +519,7 @@ impl HyperChadAppState {
     /// # Errors
     /// Returns an error for oversized, malformed or unsupported policy envelopes.
     pub fn with_browser_policy(mut self, policy: String) -> Result<Self, &'static str> {
-        if policy.len() > 64 * 1024 {
+        if policy.len() > 1024 * 1024 {
             return Err("browser presentation policy exceeds bounds");
         }
         let value: serde_json::Value =
@@ -606,6 +624,28 @@ impl HyperChadAppState {
             .query
             .get("token")
             .is_some_and(|token| token == self.access_token())
+            && self
+                .browser_origins
+                .lock()
+                .is_ok_and(|origins| origins.allows(&request.headers))
+    }
+
+    /// Configure exact serialized HTTP(S) origins permitted alongside the launch token.
+    ///
+    /// Clones share this policy so an actual bound listener origin can be installed before
+    /// publishing its launch URL. Missing Origin remains usable by token-authenticated clients.
+    /// Request Host and Forwarded headers never establish origin authority.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for malformed, non-HTTP(S), or non-origin URLs, or poisoned policy state.
+    pub fn with_browser_origins(self, origins: &[String]) -> Result<Self, &'static str> {
+        let policy = browser_origin::BrowserOrigins::new(origins)?;
+        *self
+            .browser_origins
+            .lock()
+            .map_err(|_| "browser origin policy unavailable")? = policy;
+        Ok(self)
     }
 
     /// Return the daemon client used by this `HyperChad` application.
@@ -833,12 +873,621 @@ fn retire_stale_interaction_controllers(
     Ok(())
 }
 
+fn durable_summary(committed: &DurableInteractionView) -> InteractionViewSummary {
+    let binding = &committed.binding;
+    let (resolved, resolution) = match &committed.snapshot.output {
+        bcode_tool::InteractionOutput::Submitted { payload } => (
+            true,
+            Some(bcode_session_models::ToolExchangeResolution::Responded {
+                payload: payload.clone(),
+            }),
+        ),
+        bcode_tool::InteractionOutput::Cancelled => (
+            true,
+            Some(bcode_session_models::ToolExchangeResolution::Cancelled),
+        ),
+        _ => (false, None),
+    };
+    InteractionViewSummary {
+        producer_id: Some(binding.capability.route.producer_id.clone()),
+        exchange_schema: Some(binding.capability.route.exchange_schema.clone()),
+        exchange_schema_version: Some(binding.exchange_schema_version),
+        interaction_id: binding.exchange_id.clone(),
+        kind: binding.capability.route.interaction_kind.clone(),
+        tool_call_id: Some(binding.invocation_id.clone()),
+        title: Some(binding.tool_name.clone()),
+        required: true,
+        snapshot: Some(committed.snapshot.snapshot.clone()),
+        state: if resolved {
+            bcode_session_view_models::InteractionViewState::Resolved
+        } else {
+            bcode_session_view_models::InteractionViewState::Pending
+        },
+        status_detail: None,
+        resolved,
+        resolution,
+    }
+}
+
+fn durable_failure(error: InteractionControllerError) -> ClientError {
+    ClientError::Protocol(error.message().to_owned())
+}
+
+impl LocalInteractionControllers {
+    fn accept_page(
+        &mut self,
+        session_id: SessionId,
+        query: &DurableInteractionQuery,
+        page: DurableInteractionPage,
+    ) -> Result<Vec<InteractionViewSummary>, InteractionControllerError> {
+        page.validate(&session_id.to_string(), query)?;
+        let mut identities = BTreeSet::new();
+        for view in &page.views {
+            if !identities.insert(&view.binding.exchange_id) {
+                return Err(InteractionControllerError::InvalidContract);
+            }
+            if let Some(current) = self.durable.get(&view.binding.exchange_id)
+                && (current.binding != view.binding
+                    || current.revision > view.revision
+                    || (current.revision == view.revision && current != view))
+            {
+                return Err(InteractionControllerError::Conflict);
+            }
+        }
+        drop(identities);
+        let summaries = page.views.iter().map(durable_summary).collect();
+        // One public page only, not an ever-growing controller inventory.
+        self.durable = page
+            .views
+            .into_iter()
+            .map(|view| (view.binding.exchange_id.clone(), view))
+            .collect();
+        self.legacy_sessions.remove(&session_id);
+        self.durable_sessions.clear();
+        self.durable_sessions.insert(session_id);
+        self.durable_queries.clear();
+        self.durable_queries.insert(
+            session_id,
+            DurableInteractionQuery {
+                limit: query.limit,
+                after_event_sequence: page.next_after_event_sequence,
+                expected_generation: page.next_after_event_sequence.map(|_| page.generation),
+            },
+        );
+        Ok(summaries)
+    }
+
+    fn discovery_failure(
+        &mut self,
+        session_id: SessionId,
+        error: InteractionControllerError,
+    ) -> Result<(), InteractionControllerError> {
+        self.legacy_sessions.remove(&session_id);
+        if error != InteractionControllerError::Unsupported {
+            if error == InteractionControllerError::Conflict {
+                self.durable_queries.remove(&session_id);
+            }
+            return Err(error);
+        }
+        // Explicit non-support admits legacy only before durable state was observed.
+        // A disabled deployment cannot erase a known binding or uncertain receipt.
+        let session = session_id.to_string();
+        if self
+            .durable
+            .values()
+            .any(|view| view.binding.session_id == session)
+            || self
+                .pending_operations
+                .values()
+                .any(|input| input.binding.session_id == session)
+        {
+            return Err(InteractionControllerError::Unavailable);
+        }
+        self.legacy_sessions.clear();
+        self.legacy_sessions.insert(session_id);
+        self.durable_sessions.remove(&session_id);
+        self.durable
+            .retain(|_, view| view.binding.session_id != session_id.to_string());
+        Ok(())
+    }
+
+    fn prepare_operation(
+        &mut self,
+        session_id: SessionId,
+        interaction_id: &str,
+        input: bcode_tool::InteractionInput,
+    ) -> Result<Option<DurableInteractionInput>, InteractionControllerError> {
+        if let Some(pending) = self.pending_operations.get(interaction_id) {
+            if pending.binding.session_id != session_id.to_string() || pending.input != input {
+                return Err(InteractionControllerError::Conflict);
+            }
+            return Ok(Some(pending.clone()));
+        }
+        let Some(view) = self.durable.get(interaction_id) else {
+            return if self.legacy_sessions.contains(&session_id) {
+                Ok(None)
+            } else {
+                Err(InteractionControllerError::Unavailable)
+            };
+        };
+        if view.binding.session_id != session_id.to_string() {
+            return Err(InteractionControllerError::Unauthorized);
+        }
+        if !matches!(
+            view.snapshot.output,
+            bcode_tool::InteractionOutput::None | bcode_tool::InteractionOutput::Redraw
+        ) {
+            return Err(InteractionControllerError::NotPending);
+        }
+        if self.pending_operations.len() >= 100 {
+            return Err(InteractionControllerError::LimitExceeded);
+        }
+        let operation = DurableInteractionInput {
+            version: DURABLE_INTERACTION_VERSION,
+            binding: view.binding.clone(),
+            operation: DurableInteractionOperation {
+                operation_id: SessionId::new().to_string(),
+                expected_revision: view.revision,
+            },
+            input,
+        };
+        self.pending_operations
+            .insert(interaction_id.to_owned(), operation.clone());
+        Ok(Some(operation))
+    }
+
+    fn accept_receipt(
+        &mut self,
+        receipt: DurableInteractionReceipt,
+    ) -> Result<(), InteractionControllerError> {
+        receipt.validate()?;
+        let id = &receipt.input.binding.exchange_id;
+        if self.pending_operations.get(id) != Some(&receipt.input) {
+            return Err(InteractionControllerError::Conflict);
+        }
+        if self
+            .durable
+            .get(id)
+            .is_some_and(|current| current.binding != receipt.view.binding)
+        {
+            return Err(InteractionControllerError::Conflict);
+        }
+        // A retained retry receipt is the original successor, not necessarily the
+        // newest committed view already discovered from another consumer.
+        if self
+            .durable
+            .get(id)
+            .is_none_or(|current| current.revision <= receipt.view.revision)
+        {
+            self.durable.insert(id.clone(), receipt.view);
+        }
+        self.pending_operations.remove(id);
+        Ok(())
+    }
+}
+
+impl HyperChadAppState {
+    // None means discovery explicitly selected the legacy Unsupported route.
+    async fn durable_interaction_input(
+        &self,
+        session_id: SessionId,
+        interaction_id: &str,
+        input: bcode_tool::InteractionInput,
+    ) -> Result<bool, ClientError> {
+        // Focus belongs to the attachment, never to durable semantic recovery.
+        if matches!(
+            input,
+            bcode_tool::InteractionInput::Focus { .. } | bcode_tool::InteractionInput::Blur { .. }
+        ) {
+            let controllers = self
+                .interaction_controllers
+                .lock()
+                .map_err(|_| durable_failure(InteractionControllerError::Unavailable))?;
+            return if controllers.durable_sessions.contains(&session_id) {
+                Ok(true)
+            } else if controllers.legacy_sessions.contains(&session_id) {
+                Ok(false)
+            } else {
+                Err(durable_failure(InteractionControllerError::Unavailable))
+            };
+        }
+        let operation = self
+            .interaction_controllers
+            .lock()
+            .map_err(|_| durable_failure(InteractionControllerError::Unavailable))?
+            .prepare_operation(session_id, interaction_id, input)
+            .map_err(durable_failure)?;
+        let Some(operation) = operation else {
+            return Ok(false);
+        };
+        let consumer = self.client.interaction_controller_consumer().await?;
+        // The retained operation survives uncertain delivery, including reconnect.
+        let receipt = consumer
+            .durable_input(operation)
+            .await
+            .map_err(durable_failure)?;
+        self.interaction_controllers
+            .lock()
+            .map_err(|_| durable_failure(InteractionControllerError::Unavailable))?
+            .accept_receipt(receipt)
+            .map_err(durable_failure)?;
+        Ok(true)
+    }
+}
+
+#[cfg(test)]
+mod durable_browser_consumer_tests {
+    use super::*;
+
+    fn committed(session_id: SessionId) -> DurableInteractionView {
+        serde_json::from_value(serde_json::json!({
+            "version":1,"binding":{"session_id":session_id.to_string(),"turn_id":"turn","invocation_id":"call",
+                "request_sequence":1,"exchange_id":"exchange","tool_name":"tool","request_digest":"a".repeat(64),
+                "exchange_schema_version":1,"capability":{"route":{"producer_id":"producer",
+                    "exchange_schema":"request","min_schema_version":1,"max_schema_version":1,"interaction_kind":"kind"},
+                    "checkpoint_schema":"checkpoint","checkpoint_version":1,"continuation_schema":"complete","continuation_version":1}},
+            "revision":2,"snapshot":{"version":1,"exchange_id":"exchange","route":{"producer_id":"producer",
+                "exchange_schema":"request","min_schema_version":1,"max_schema_version":1,"interaction_kind":"kind"},
+                "schema_version":1,"revision":2,"snapshot":{"selected":["committed"]},"output":{"type":"none"}}
+        })).unwrap()
+    }
+
+    fn query() -> DurableInteractionQuery {
+        DurableInteractionQuery {
+            limit: 1,
+            after_event_sequence: None,
+            expected_generation: None,
+        }
+    }
+
+    #[test]
+    fn restart_rehydrates_only_committed_public_selection_and_binding() {
+        let session_id = SessionId::new();
+        let committed = committed(session_id);
+        let mut restarted = LocalInteractionControllers::default();
+        let summaries = restarted
+            .accept_page(
+                session_id,
+                &query(),
+                DurableInteractionPage {
+                    generation: 7,
+                    views: vec![committed.clone()],
+                    next_after_event_sequence: None,
+                },
+            )
+            .unwrap();
+        assert_eq!(
+            summaries[0].snapshot.as_ref(),
+            Some(&committed.snapshot.snapshot)
+        );
+        assert_eq!(summaries[0].producer_id.as_deref(), Some("producer"));
+        let operation = restarted
+            .prepare_operation(session_id, "exchange", bcode_tool::InteractionInput::Submit)
+            .unwrap()
+            .unwrap();
+        assert_eq!(operation.binding, committed.binding);
+        assert_eq!(operation.operation.expected_revision, 2);
+        assert!(restarted.entries.is_empty());
+    }
+
+    #[test]
+    fn uncertain_delivery_reuses_exact_operation_and_conflicting_edit_is_rejected() {
+        let session_id = SessionId::new();
+        let mut cache = LocalInteractionControllers::default();
+        cache
+            .accept_page(
+                session_id,
+                &query(),
+                DurableInteractionPage {
+                    generation: 7,
+                    views: vec![committed(session_id)],
+                    next_after_event_sequence: None,
+                },
+            )
+            .unwrap();
+        let first = cache
+            .prepare_operation(session_id, "exchange", bcode_tool::InteractionInput::Submit)
+            .unwrap()
+            .unwrap();
+        let retry = cache
+            .prepare_operation(session_id, "exchange", bcode_tool::InteractionInput::Submit)
+            .unwrap()
+            .unwrap();
+        assert_eq!(first, retry);
+        assert_eq!(
+            cache.prepare_operation(session_id, "exchange", bcode_tool::InteractionInput::Cancel),
+            Err(InteractionControllerError::Conflict)
+        );
+        let mut terminal = committed(session_id);
+        terminal.revision = 3;
+        terminal.snapshot.revision = 3;
+        terminal.snapshot.output = bcode_tool::InteractionOutput::Submitted {
+            payload: serde_json::json!({"answer":"committed"}),
+        };
+        let mut receipt = DurableInteractionReceipt {
+            version: 1,
+            input: first.clone(),
+            view: terminal.clone(),
+        };
+        receipt.input.operation.operation_id = "wrong-operation".into();
+        assert_eq!(
+            cache.accept_receipt(receipt),
+            Err(InteractionControllerError::Conflict)
+        );
+        assert_eq!(cache.pending_operations["exchange"], first);
+        cache
+            .accept_receipt(DurableInteractionReceipt {
+                version: 1,
+                input: first,
+                view: terminal,
+            })
+            .unwrap();
+        assert!(cache.pending_operations.is_empty());
+        assert!(durable_summary(&cache.durable["exchange"]).resolved);
+        let terminal = cache.durable["exchange"].clone();
+        let mut restarted = LocalInteractionControllers::default();
+        let summaries = restarted
+            .accept_page(
+                session_id,
+                &query(),
+                DurableInteractionPage {
+                    generation: 8,
+                    views: vec![terminal],
+                    next_after_event_sequence: None,
+                },
+            )
+            .unwrap();
+        assert!(summaries[0].resolved);
+        assert_eq!(
+            restarted.prepare_operation(
+                session_id,
+                "exchange",
+                bcode_tool::InteractionInput::Submit
+            ),
+            Err(InteractionControllerError::NotPending)
+        );
+        assert!(cache.entries.is_empty());
+    }
+
+    #[test]
+    fn none_and_redraw_are_acknowledged_only_by_matching_committed_receipts() {
+        for output in [
+            bcode_tool::InteractionOutput::None,
+            bcode_tool::InteractionOutput::Redraw,
+        ] {
+            let session_id = SessionId::new();
+            let mut cache = LocalInteractionControllers::default();
+            cache
+                .accept_page(
+                    session_id,
+                    &query(),
+                    DurableInteractionPage {
+                        generation: 1,
+                        views: vec![committed(session_id)],
+                        next_after_event_sequence: None,
+                    },
+                )
+                .unwrap();
+            let input = cache
+                .prepare_operation(
+                    session_id,
+                    "exchange",
+                    bcode_tool::InteractionInput::Activate {
+                        control_id: bcode_tool::InteractionControlId::new("selection"),
+                    },
+                )
+                .unwrap()
+                .unwrap();
+            assert_eq!(cache.durable["exchange"].revision, 2);
+            let mut successor = committed(session_id);
+            successor.revision = 3;
+            successor.snapshot.revision = 3;
+            successor.snapshot.output = output;
+            successor.snapshot.snapshot = serde_json::json!({"selected":["new-committed"]});
+            cache
+                .accept_receipt(DurableInteractionReceipt {
+                    version: 1,
+                    input,
+                    view: successor.clone(),
+                })
+                .unwrap();
+            assert_eq!(cache.durable["exchange"], successor);
+            assert!(!durable_summary(&successor).resolved);
+            let mut rejoined = LocalInteractionControllers::default();
+            let summaries = rejoined
+                .accept_page(
+                    session_id,
+                    &query(),
+                    DurableInteractionPage {
+                        generation: 2,
+                        views: vec![successor.clone()],
+                        next_after_event_sequence: None,
+                    },
+                )
+                .unwrap();
+            assert_eq!(
+                summaries[0].snapshot.as_ref(),
+                Some(&successor.snapshot.snapshot)
+            );
+        }
+    }
+
+    #[test]
+    fn disabled_discovery_does_not_discard_an_uncertain_operation_after_page_eviction() {
+        let session_id = SessionId::new();
+        let mut cache = LocalInteractionControllers::default();
+        cache
+            .accept_page(
+                session_id,
+                &query(),
+                DurableInteractionPage {
+                    generation: 1,
+                    views: vec![committed(session_id)],
+                    next_after_event_sequence: None,
+                },
+            )
+            .unwrap();
+        let input = cache
+            .prepare_operation(session_id, "exchange", bcode_tool::InteractionInput::Submit)
+            .unwrap()
+            .unwrap();
+        cache
+            .accept_page(
+                session_id,
+                &query(),
+                DurableInteractionPage {
+                    generation: 2,
+                    views: Vec::new(),
+                    next_after_event_sequence: None,
+                },
+            )
+            .unwrap();
+        assert_eq!(
+            cache.discovery_failure(session_id, InteractionControllerError::Unsupported),
+            Err(InteractionControllerError::Unavailable)
+        );
+        assert_eq!(
+            cache.prepare_operation(session_id, "exchange", bcode_tool::InteractionInput::Submit),
+            Ok(Some(input))
+        );
+        assert!(cache.legacy_sessions.is_empty());
+    }
+
+    #[test]
+    fn discovery_preserves_exact_budget_and_generation_and_missing_checkpoint_never_falls_back() {
+        let session_id = SessionId::new();
+        let mut cache = LocalInteractionControllers::default();
+        assert_eq!(
+            cache.prepare_operation(session_id, "missing", bcode_tool::InteractionInput::Submit),
+            Err(InteractionControllerError::Unavailable)
+        );
+        let page = DurableInteractionPage {
+            generation: 7,
+            views: vec![committed(session_id)],
+            next_after_event_sequence: Some(3),
+        };
+        let mut invalid = query();
+        invalid.limit = 0;
+        assert_eq!(
+            cache.accept_page(session_id, &invalid, page.clone()),
+            Err(InteractionControllerError::LimitExceeded)
+        );
+        invalid.limit = 101;
+        assert_eq!(
+            cache.accept_page(session_id, &invalid, page.clone()),
+            Err(InteractionControllerError::LimitExceeded)
+        );
+        cache
+            .accept_page(session_id, &query(), page.clone())
+            .unwrap();
+        let continuation = cache.durable_queries[&session_id].clone();
+        assert_eq!(continuation.limit, 1);
+        assert_eq!(continuation.expected_generation, Some(7));
+        assert_eq!(continuation.after_event_sequence, Some(3));
+        let mut stale = page.clone();
+        stale.generation = 8;
+        stale.next_after_event_sequence = Some(4);
+        assert_eq!(
+            cache.accept_page(session_id, &continuation, stale),
+            Err(InteractionControllerError::Conflict)
+        );
+        let mut oversized = page;
+        oversized.views.push(committed(session_id));
+        assert_eq!(
+            cache.accept_page(session_id, &query(), oversized),
+            Err(InteractionControllerError::LimitExceeded)
+        );
+        assert_eq!(
+            cache.prepare_operation(session_id, "missing", bcode_tool::InteractionInput::Submit),
+            Err(InteractionControllerError::Unavailable)
+        );
+        assert!(cache.entries.is_empty());
+        for failure in [
+            InteractionControllerError::Unavailable,
+            InteractionControllerError::InvalidContract,
+            InteractionControllerError::Conflict,
+        ] {
+            assert_eq!(cache.discovery_failure(session_id, failure), Err(failure));
+            assert_eq!(
+                cache.prepare_operation(
+                    session_id,
+                    "missing",
+                    bcode_tool::InteractionInput::Submit
+                ),
+                Err(InteractionControllerError::Unavailable)
+            );
+        }
+        assert_eq!(
+            cache.discovery_failure(session_id, InteractionControllerError::Unsupported),
+            Err(InteractionControllerError::Unavailable)
+        );
+        let mut disabled = LocalInteractionControllers::default();
+        disabled
+            .discovery_failure(session_id, InteractionControllerError::Unsupported)
+            .unwrap();
+        assert_eq!(
+            disabled.prepare_operation(session_id, "legacy", bcode_tool::InteractionInput::Submit),
+            Ok(None)
+        );
+        // A subsequent missing/corrupt response must revoke legacy admission too.
+        assert_eq!(
+            disabled.discovery_failure(session_id, InteractionControllerError::Unavailable),
+            Err(InteractionControllerError::Unavailable)
+        );
+        assert_eq!(
+            disabled.prepare_operation(session_id, "legacy", bcode_tool::InteractionInput::Submit),
+            Err(InteractionControllerError::Unavailable)
+        );
+    }
+}
+
 async fn hydrate_pending_interactions(
     client: &BcodeClient,
     session_id: SessionId,
     view: &mut SessionView,
     interaction_controllers: &Arc<Mutex<LocalInteractionControllers>>,
 ) -> Result<(), ClientError> {
+    {
+        // Invalidate legacy admission before discovery, including on unavailable transport.
+        let mut controllers = interaction_controllers
+            .lock()
+            .map_err(|_| durable_failure(InteractionControllerError::Unavailable))?;
+        controllers.legacy_sessions.remove(&session_id);
+    }
+    let consumer = client.interaction_controller_consumer().await?;
+    let query = interaction_controllers
+        .lock()
+        .map_err(|_| durable_failure(InteractionControllerError::Unavailable))?
+        .durable_queries
+        .get(&session_id)
+        .cloned()
+        .unwrap_or(DurableInteractionQuery {
+            limit: 100,
+            after_event_sequence: None,
+            expected_generation: None,
+        });
+    match consumer
+        .durable_controllers(session_id.to_string(), query.clone())
+        .await
+    {
+        Ok(page) => {
+            let summaries = interaction_controllers
+                .lock()
+                .map_err(|_| durable_failure(InteractionControllerError::Unavailable))?
+                .accept_page(session_id, &query, page)
+                .map_err(durable_failure)?;
+            for summary in &summaries {
+                view.upsert_interaction(summary.clone());
+            }
+            view.set_pending_interactions(summaries);
+            return Ok(());
+        }
+        Err(error) => interaction_controllers
+            .lock()
+            .map_err(|_| durable_failure(InteractionControllerError::Unavailable))?
+            .discovery_failure(session_id, error)
+            .map_err(durable_failure)?,
+    }
     let exchanges = client.list_pending_tool_exchanges().await?;
     let pending_ids = exchanges
         .iter()
@@ -1613,6 +2262,29 @@ impl HyperChadAppState {
             }
         };
         let interaction_id = form.interaction_id.clone();
+        let Ok(semantic) = interaction_input_from_form(&form) else {
+            return error_page("invalid interaction input");
+        };
+        // A retained network retry must reach its original receipt even after
+        // terminal discovery no longer lists the exchange.
+        let retry = match self.interaction_controllers.lock() {
+            Ok(controllers) => controllers.pending_operations.contains_key(&interaction_id),
+            Err(_) => return error_page("interaction controller state is unavailable"),
+        };
+        if !retry {
+            // Rejoin obtains the binding from canonical discovery before legacy input.
+            if let Err(error) = self.session_snapshot(session_id).await {
+                return error_page(&client_error_message(&error));
+            }
+        }
+        match self
+            .durable_interaction_input(session_id, &interaction_id, semantic)
+            .await
+        {
+            Ok(true) => return self.render_session_or_initial(Some(session_id), "").await,
+            Err(error) => return error_page(&client_error_message(&error)),
+            Ok(false) => {}
+        }
         let exchanges = match self.client.list_pending_tool_exchanges().await {
             Ok(exchanges) => exchanges,
             Err(error) => {
@@ -2258,7 +2930,21 @@ async fn send_connection_update(
         context.reasoning_presentation_policy,
     )
     .await
-    .unwrap_or_else(|_| snapshot_from_view(view, attached));
+    .unwrap_or_else(|error| {
+        let mut snapshot = snapshot_from_view(view, attached);
+        snapshot.interactions.clear();
+        snapshot.transcript.items.retain(|item| {
+            !matches!(
+                item.kind,
+                bcode_session_view_models::TranscriptViewItemKind::Interaction { .. }
+            )
+        });
+        snapshot.notice = Some(bcode_session_view_models::SessionViewNotice {
+            level: bcode_session_view_models::SessionViewNoticeLevel::Error,
+            message: client_error_message(&error),
+        });
+        snapshot
+    });
     snapshot.connection_status = status;
     snapshot.catalog_status = catalog_status;
     sender.publish(scoped_snapshot_update(context, snapshot, sessions));
@@ -3992,6 +4678,19 @@ mod tests {
             assert!(!message.contains("projection index"));
             assert!(!message.contains("provider detail"));
         }
+    }
+
+    #[test]
+    fn browser_policy_launch_accepts_byte_limit_and_rejects_one_more() {
+        let state = HyperChadAppState::new(BcodeClient::default_endpoint(), "secret");
+        let mut encoded = serde_json::json!({
+            "schema_version": 1, "revision": "test", "styles": {}, "bindings": [],
+        })
+        .to_string();
+        encoded.push_str(&" ".repeat(1024 * 1024 - encoded.len()));
+        assert!(state.clone().with_browser_policy(encoded.clone()).is_ok());
+        encoded.push(' ');
+        assert!(state.with_browser_policy(encoded).is_err());
     }
 
     #[test]

@@ -3425,7 +3425,7 @@ mod projection_paging_tests {
         }
     }
 
-    fn queue_test_hello() -> bcode_ipc::ResponsePayload {
+    fn queue_test_hello(executable_digest: &str) -> bcode_ipc::ResponsePayload {
         bcode_ipc::ResponsePayload::Hello {
             protocol_version: bcode_ipc::ProtocolVersion::current(),
             client_id: ClientId::new(),
@@ -3433,11 +3433,7 @@ mod projection_paging_tests {
                 namespace: bcode_ipc::daemon_namespace(),
                 protocol_version: u32::from(bcode_ipc::ProtocolVersion::current().0),
                 artifact_id: Some(bcode_ipc::ArtifactId::current()),
-                executable_digest: Some(
-                    bcode_daemon_lifecycle::current_executable_identity()
-                        .unwrap()
-                        .1,
-                ),
+                executable_digest: Some(executable_digest.to_owned()),
                 build_fingerprint: bcode_ipc::BUILD_FINGERPRINT.to_owned(),
                 storage_writer_epoch: Some(
                     bcode_session_models::CURRENT_SESSION_STORAGE_WRITER_EPOCH,
@@ -3453,6 +3449,7 @@ mod projection_paging_tests {
         session_id: SessionId,
         submission_id: bcode_session_models::SubmissionId,
         confirmation: bcode_session_models::SubmissionResumeConfirmation,
+        executable_digest: String,
     ) {
         let mut prepared = false;
         let mut finished = false;
@@ -3464,7 +3461,7 @@ mod projection_paging_tests {
                 };
                 let request = bcode_ipc::decode_request(&envelope.payload).unwrap();
                 let response = match request {
-                    bcode_ipc::Request::Hello { .. } => queue_test_hello(),
+                    bcode_ipc::Request::Hello { .. } => queue_test_hello(&executable_digest),
                     bcode_ipc::Request::PrepareSubmissionResume {
                         session_id: requested,
                         submission_id: requested_id,
@@ -3532,11 +3529,15 @@ mod projection_paging_tests {
         let endpoint =
             bcode_ipc::IpcEndpoint::unix_socket(socket_dir.path().join("ipc/queue.sock"));
         let listener = bcode_ipc::LocalIpcListener::bind(&endpoint).unwrap();
+        let executable_digest = bcode_daemon_lifecycle::current_executable_identity()
+            .expect("test executable identity")
+            .1;
         let responder = tokio::spawn(respond_to_prepare(
             listener,
             session_id,
             submission_id,
             confirmation,
+            executable_digest,
         ));
         let effect = TuiEffect::QueueRecovery {
             session_id,
@@ -3577,6 +3578,9 @@ mod projection_paging_tests {
         let endpoint =
             bcode_ipc::IpcEndpoint::unix_socket(socket_dir.path().join("ipc/history.sock"));
         let listener = bcode_ipc::LocalIpcListener::bind(&endpoint).expect("IPC listener");
+        let executable_digest = bcode_daemon_lifecycle::current_executable_identity()
+            .expect("test executable identity")
+            .1;
         let responder = tokio::spawn(async move {
             let mut stream = listener.accept().await.expect("history client");
             let mut observed_request = None;
@@ -3596,11 +3600,7 @@ mod projection_paging_tests {
                                     bcode_ipc::ProtocolVersion::current().0,
                                 ),
                                 artifact_id: Some(bcode_ipc::ArtifactId::current()),
-                                executable_digest: Some(
-                                    bcode_daemon_lifecycle::current_executable_identity()
-                                        .expect("test executable identity")
-                                        .1,
-                                ),
+                                executable_digest: Some(executable_digest.clone()),
                                 build_fingerprint: bcode_ipc::BUILD_FINGERPRINT.to_owned(),
                                 storage_writer_epoch: Some(
                                     bcode_ipc::CURRENT_SESSION_STORAGE_WRITER_EPOCH,

@@ -21,6 +21,139 @@ export async function decodeArtifactImage(bytes, contentType, environment = glob
   } finally { bitmap.close(); }
 }
 
+/** Browser-owned platform dialogs, never a competing BMUX layout or input authority. */
+export function createBrowserPlatformPorts({ root, environment = globalThis, signal, onError = () => {} }) {
+  if (!root?.ownerDocument) throw new Error('platform dialog root required');
+  const document = root.ownerDocument;
+  let disposed = false, generation = 0;
+  const fail = () => { if (!disposed) onError('Browser platform operation failed. No control or submission was retried.'); };
+  function clear() {
+    generation++;
+    root.replaceChildren();
+  }
+  function panel(title) {
+    if (disposed) throw new Error('platform ports disposed');
+    clear();
+    const current = generation;
+    const dialog = document.createElement('dialog');
+    const heading = document.createElement('h2');
+    heading.textContent = title;
+    dialog.append(heading);
+    const close = document.createElement('button');
+    close.type = 'button'; close.textContent = 'Close';
+    close.addEventListener('click', clear);
+    dialog.addEventListener('cancel', event => { event.preventDefault(); clear(); });
+    dialog.append(close);
+    root.append(dialog);
+    dialog.showModal();
+    return { dialog, current, live: () => !disposed && current === generation };
+  }
+  function safeURL(value) {
+    const url = new URL(value);
+    if (!['https:', 'http:'].includes(url.protocol) || url.username || url.password || url.href.length > 16384) throw new Error('unsafe navigation');
+    return url.href;
+  }
+  function link(dialog, text, href, download = false) {
+    const anchor = document.createElement('a');
+    anchor.textContent = text; anchor.href = href;
+    anchor.rel = 'noopener noreferrer'; anchor.referrerPolicy = 'no-referrer';
+    if (download) anchor.download = 'artifact';
+    else anchor.target = '_blank';
+    dialog.append(anchor);
+    return anchor;
+  }
+  const ports = {
+    async navigate(value) {
+      const href = safeURL(value);
+      const { dialog } = panel('Open external link');
+      // An explicit native link remains usable after queued WASM work has lost
+      // transient user activation. Never ask window.open to bypass popup policy.
+      link(dialog, href, href);
+    },
+    async writeClipboard(text) {
+      if (disposed || typeof text !== 'string' || new TextEncoder().encode(text).byteLength > 65536) throw new Error('invalid clipboard text');
+      const current = generation;
+      try {
+        if (!environment.navigator?.clipboard?.writeText) throw new Error('clipboard unavailable');
+        await environment.navigator.clipboard.writeText(text);
+      } catch {
+        if (disposed || current !== generation) return;
+        const { dialog, live } = panel('Copy selection');
+        const value = document.createElement('textarea');
+        value.value = text; value.readOnly = true;
+        value.setAttribute('aria-label', 'Selected text to copy');
+        dialog.append(value);
+        value.focus(); value.select();
+        const copy = document.createElement('button');
+        copy.type = 'button'; copy.textContent = 'Copy';
+        copy.addEventListener('click', () => {
+          if (!live()) return;
+          value.focus(); value.select();
+          // A user gesture retry for Clipboard API; manual selection stays
+          // available on insecure origins or browsers without clipboard access.
+          void Promise.resolve().then(() => environment.navigator?.clipboard?.writeText(text)).catch(fail);
+        });
+        dialog.append(copy);
+      }
+    },
+    async consumeArtifact({ bytes, contentType, downloadURL, downloadUnavailable, readNext, presentation = 'view', json }) {
+      if (!(bytes instanceof Uint8Array) || bytes.byteLength > 128 * 1024 || typeof json !== 'string') throw new Error('invalid artifact content');
+      const { dialog, live } = panel('Canonical artifact');
+      if (downloadURL) {
+        const url = new URL(downloadURL);
+        if (url.origin !== environment.location.origin || url.pathname !== '/api/session-view/artifact/download'
+            || url.username || url.password || url.hash) throw new Error('unsafe artifact download');
+        link(dialog, 'Download complete artifact', url.href, true);
+        const caveat = document.createElement('p');
+        caveat.textContent = 'Download is limited to finalized artifacts up to 64 MiB. If the artifact changes or authorization expires, the host returns a JSON error instead of artifact bytes.';
+        dialog.append(caveat);
+      }
+      if (downloadUnavailable) {
+        const warning = document.createElement('p');
+        warning.setAttribute('role', 'status');
+        warning.textContent = downloadUnavailable;
+        dialog.append(warning);
+      }
+      const description = document.createElement('p');
+      const preview = document.createElement('pre');
+      preview.setAttribute('aria-label', 'Artifact range preview');
+      dialog.append(description, preview);
+      function show(range) {
+        if (!live()) return;
+        // textContent only: HTML, SVG and scripts never become active documents.
+        const metadata = JSON.parse(range.json);
+        description.textContent = `Byte range: ${range.bytes.byteLength} bytes. Media type: ${range.contentType ?? 'unknown'}.`;
+        preview.textContent = new TextDecoder().decode(range.bytes);
+        return metadata;
+      }
+      show({ bytes, contentType, json });
+      if (readNext) {
+        const next = document.createElement('button');
+        next.type = 'button'; next.textContent = 'Read next range';
+        next.addEventListener('click', () => {
+          if (!live() || next.disabled) return;
+          next.disabled = true;
+          void readNext().then(range => {
+            if (!live()) return;
+            if (range) { show(range); next.disabled = false; }
+            else next.textContent = 'End of artifact';
+          }).catch(() => { if (live()) { next.disabled = false; fail(); } });
+        });
+        dialog.append(next);
+      }
+      if (presentation === 'download') description.textContent += ' Choose Download complete artifact to save the original bytes.';
+    },
+    dispose() {
+      if (disposed) return;
+      disposed = true; clear();
+      signal?.removeEventListener('abort', ports.dispose);
+    },
+  };
+  signal?.addEventListener('abort', ports.dispose, { once: true });
+  if (signal?.aborted) ports.dispose();
+  return ports;
+}
+
 /** Passive accessibility mirror of committed BMUX regions, never an input authority. */
 export function commitSemanticRegions(root, regions) {
   if (!root || !Array.isArray(regions) || regions.length > 256) throw new Error('invalid semantic mirror');
@@ -113,6 +246,22 @@ export function backendBase(origin, location, allowedOrigins = []) {
   return base;
 }
 
+function artifactPosition(json) {
+  // Preserve canonical u64 lexemes without rounding through JS Number. Matching
+  // complete strings first prevents numeric-looking text from becoming metadata.
+  const exact = JSON.parse(json.replace(/"(?:\\.|[^"\\])*"|(-?\d+(?:\.\d+)?(?:[eE][+-]?\d+)?)/g,
+    (token, number) => number === undefined ? token : `"${number}"`));
+  const original = JSON.parse(json);
+  function integer(key) {
+    if (typeof original[key] !== 'number' || !Number.isInteger(original[key]) || original[key] < 0
+        || typeof exact[key] !== 'string' || !/^\d{1,20}$/.test(exact[key])) throw new Error('invalid artifact position');
+    const value = BigInt(exact[key]);
+    if (value > 18446744073709551615n) throw new Error('invalid artifact position');
+    return value;
+  }
+  return { offset: integer('offset'), total: integer('total_bytes'), revision: exact.reference_revision, artifactId: exact.artifact_id };
+}
+
 /**
  * Mount actual Rust/BMUX UI. recoveryState is caller-owned, in-memory state only;
  * WASM export_recovery/restore_recovery must exclude observations and geometry.
@@ -143,7 +292,62 @@ export async function mountBrowserSession({
   let disposed = false, timer, bridge, rust, disposal, recoveryReady = false;
   let queue = Promise.resolve(), queued = 0;
   let columns = 0, rows = 0, lastSize;
-  let painted = false, paintGeneration = 0, observationGeneration = 0;
+  let painted = false, paintGeneration = 0, observationGeneration = 0, geometryGeneration = 0;
+  let visualWork = null, visualDiscoveryQueued = false, visualBurst = 0;
+  function visualNow() { return BigInt(Math.floor(window.performance.now())); }
+  function releaseVisual(work) {
+    if (!work || work.settled || rust !== work.rust) return;
+    try { rust.fail_visual_artifact(work.claim, visualNow()); }
+    finally { work.settled = true; }
+  }
+  // Rust selects references and continuation ranges. JS retains only one opaque
+  // canonical request/response in flight; producer bytes never enter JS paint.
+  function scheduleVisualArtifact() {
+    if (disposed || visualWork || visualDiscoveryQueued || !painted || visualBurst >= 16
+        || typeof rust.next_visual_artifact !== 'function') return;
+    visualDiscoveryQueued = true;
+    void enqueue(() => {
+      visualDiscoveryQueued = false;
+      if (disposed || visualWork || !painted) return;
+      if (typeof rust.accept_visual_artifact_claim !== 'function' || typeof rust.fail_visual_artifact !== 'function') throw new Error('visual artifact port unavailable');
+      const json = rust.next_visual_artifact(visualNow());
+      if (json == null) return;
+      if (typeof json !== 'string' || new TextEncoder().encode(json).byteLength > 128 * 1024) throw new Error('invalid visual artifact discovery');
+      const lease = JSON.parse(json);
+      if (!lease || typeof lease.claim !== 'string' || lease.claim.length === 0 || lease.claim.length > 128) throw new Error('invalid visual artifact claim');
+      const work = { rust, claim: lease.claim, observation: observationGeneration, geometry: geometryGeneration, settled: false };
+      if (typeof lease.request_json !== 'string' || new TextEncoder().encode(lease.request_json).byteLength > 65536) {
+        releaseVisual(work);
+        throw new Error('invalid visual artifact request');
+      }
+      visualWork = work;
+      visualBurst++;
+      // Network work is outside the native queue so resize and new canonical
+      // observations can invalidate it without waiting for transport completion.
+      void request('/api/session-view/artifact', lease.request_json, 512 * 1024).then(response => enqueue(async () => {
+        if (disposed || rust !== work.rust || work.observation !== observationGeneration
+            || work.geometry !== geometryGeneration) {
+          releaseVisual(work);
+          return;
+        }
+        const accepted = rust.accept_visual_artifact_claim(work.claim, response, visualNow());
+        work.settled = true;
+        if (accepted === true) {
+          visualWork = null;
+          await present(true);
+        }
+      })).catch(async error => {
+        // Native lease mutation also stays on the serialized queue. Remounted
+        // or disposed instances are released before they are freed, never here.
+        if (!disposed) await enqueue(() => releaseVisual(work)).catch(() => {});
+        report(error);
+      }).finally(() => {
+        if (visualWork === work) visualWork = null;
+        // Rust owns expiry, attempt limits and backoff. A subsequent normal
+        // presentation discovers retryable work; failures never spin locally.
+      });
+    }).catch(() => { visualDiscoveryQueued = false; });
+  }
   let controlUncertain = recoveryState.controlUncertain === true;
   function publishState() {
     if (disposed) return;
@@ -154,24 +358,39 @@ export async function mountBrowserSession({
   function clearSemantics() {
     try { onSemantics([]); } catch { /* observer */ }
   }
-  async function present() {
+  async function present(visualContinuation = false) {
+    if (!visualContinuation) visualBurst = 0;
     painted = false;
-    clearSemantics();
-    const committed = await rust.present();
-    if (!disposed && committed === true) {
-      painted = true; paintGeneration++;
+    // Keep the last committed metadata observable while the replacement is
+    // staged. Input remains fenced by `painted` until output commits.
+    try {
+      const committed = await rust.present();
+      if (disposed) return;
+      if (committed !== true) {
+        clearSemantics();
+        return;
+      }
+      paintGeneration++;
+      let regions = [];
       if (bridge && typeof rust.accessibility === 'function') {
         const json = rust.accessibility();
         if (typeof json !== 'string' || new TextEncoder().encode(json).byteLength > 65536) throw new Error('accessibility metadata too large');
         const metadata = JSON.parse(json);
         if (typeof metadata.label !== 'string' || typeof metadata.description !== 'string') throw new Error('invalid accessibility metadata');
-        bridge.setAccessibility({ label: metadata.label, description: metadata.description });
         if (metadata.regions !== undefined) {
           if (!Array.isArray(metadata.regions) || metadata.regions.length > 256) throw new Error('invalid semantic regions');
-          try { onSemantics(metadata.regions); } catch { /* observer */ }
+          regions = metadata.regions;
         }
+        bridge.setAccessibility({ label: metadata.label, description: metadata.description });
       }
+      painted = true;
+      try { onSemantics(regions); } catch { /* observer */ }
       publishState();
+      scheduleVisualArtifact();
+    } catch (error) {
+      painted = false;
+      clearSemantics();
+      throw error;
     }
   }
   let pendingResize = null, resizeQueued = false, pollQueued = false;
@@ -221,12 +440,25 @@ export async function mountBrowserSession({
     queue = work.catch(report).finally(() => { queued--; });
     return work;
   }
+  async function platformWork(operation) {
+    if (disposed) throw new Error('session disposed');
+    let reject;
+    const interrupted = new Promise((_, fail) => { reject = fail; });
+    const abort = () => reject(new Error('browser platform operation interrupted'));
+    controller.signal.addEventListener('abort', abort, { once: true });
+    const deadline = window.setTimeout(abort, requestTimeoutMs);
+    try { return await Promise.race([Promise.resolve().then(operation), interrupted]); }
+    finally {
+      window.clearTimeout(deadline);
+      controller.signal.removeEventListener('abort', abort);
+    }
+  }
   function endpoint(path) {
     const url = new URL(path, base);
     url.searchParams.set('token', token);
     return url;
   }
-  async function request(path, body) {
+  async function request(path, body, responseLimit = 2 * 1024 * 1024) {
     if (disposed) throw new Error('session disposed');
     if (body !== undefined && new TextEncoder().encode(body).byteLength > 65536) throw new Error('request too large');
     const requestController = new AbortController();
@@ -248,7 +480,7 @@ export async function mountBrowserSession({
           void response.body?.cancel().catch(() => {});
           throw new Error('request aborted');
         }
-        const json = await readBounded(response, 2 * 1024 * 1024, requestController.signal);
+        const json = await readBounded(response, responseLimit, requestController.signal);
         // Inspect only error envelopes; pass original observation/receipt bytes to Rust.
         const envelope = JSON.parse(json);
         if (envelope.error !== undefined) throw new Error('backend rejected session request');
@@ -278,6 +510,7 @@ export async function mountBrowserSession({
       // Never silently discard a draft or pending exact retry during backend restart.
       if (typeof rust.export_recovery !== 'function' || typeof rust.restore_recovery !== 'function') throw error;
       saveRecovery();
+      releaseVisual(visualWork);
       rust.cancel_pointer();
       rust.dispose();
       rust.free();
@@ -358,17 +591,59 @@ export async function mountBrowserSession({
         || (range.content_type != null && (typeof range.content_type !== 'string' || range.content_type.length > 256))) throw new Error('invalid artifact response');
     // Metadata stays encoded for exact u64 handling; only bounded bytes enter a
     // caller-injected consumer. No server-supplied URL/path is opened by JS.
+    const position = artifactPosition(json);
+    if (position.offset !== offset || position.offset + BigInt(range.bytes.length) > position.total) throw new Error('invalid artifact range');
     return { json, bytes: Uint8Array.from(range.bytes), contentType: range.content_type };
+  }
+  async function consumeArtifact(intent) {
+    if (typeof capabilities.consumeArtifact !== 'function' || ![undefined, 'view', 'download'].includes(intent.presentation)) throw new Error('artifact consumer unavailable');
+    const fence = rust.prepare_artifact(intent.item_id, intent.reference_key, 0n, 128 * 1024);
+    const current = () => !disposed && fence === rust.prepare_artifact(intent.item_id, intent.reference_key, 0n, 128 * 1024);
+    const itemId = intent.item_id, referenceKey = intent.reference_key;
+    const first = await readArtifact(itemId, referenceKey);
+    if (!current()) return;
+    const identity = artifactPosition(first.json);
+    let offset = BigInt(first.bytes.length);
+    let pending = false;
+    const download = endpoint('/api/session-view/artifact/download');
+    download.searchParams.set('request', rust.prepare_artifact(itemId, referenceKey, 0n, 128 * 1024));
+    const metadata = JSON.parse(first.json);
+    const downloadUnavailable = identity.total > 64n * 1024n * 1024n
+      ? 'Complete download exceeds the 64 MiB browser host budget. Incremental viewing remains available.'
+      : metadata.finalized !== true || metadata.complete === false
+        ? 'Complete download requires a finalized, complete artifact. Incremental viewing remains available.' : undefined;
+    await platformWork(() => capabilities.consumeArtifact({ itemId, referenceKey, ...first, presentation: intent.presentation,
+      downloadURL: downloadUnavailable ? undefined : download.href, downloadUnavailable,
+      readNext: () => {
+        if (!current() || pending) return Promise.reject(new Error('artifact view expired'));
+        if (offset >= identity.total) return Promise.resolve(null);
+        pending = true;
+        return enqueue(async () => {
+          if (!current()) throw new Error('artifact view expired');
+          const range = await readArtifact(itemId, referenceKey, offset);
+          const currentPosition = artifactPosition(range.json);
+          if (!current() || currentPosition.total !== identity.total
+              || currentPosition.artifactId !== identity.artifactId || currentPosition.revision !== identity.revision
+              || range.contentType !== first.contentType || range.bytes.length === 0) throw new Error('artifact changed');
+          offset += BigInt(range.bytes.length);
+          return range;
+        }).finally(() => { pending = false; });
+      },
+    }));
   }
   async function showArtifactImage(itemId, referenceKey) {
     if (typeof rust.prepare_image !== 'function' || typeof rust.accept_image !== 'function'
         || !rust.prepare_image(itemId, referenceKey)) throw new Error('image reference unavailable');
+    const generation = observationGeneration;
+    const geometry = geometryGeneration;
+    const owner = rust;
+    const current = () => !disposed && rust === owner && generation === observationGeneration && geometry === geometryGeneration;
     const range = await readArtifact(itemId, referenceKey);
     const metadata = JSON.parse(range.json);
     if (metadata.offset !== 0 || metadata.total_bytes !== range.bytes.byteLength || metadata.total_bytes > 128 * 1024) throw new Error('incomplete artifact image');
-    if (disposed) return false;
-    const decoded = await decodeArtifactImage(range.bytes, range.contentType);
-    if (disposed) return false;
+    if (!current()) return false;
+    const decoded = await platformWork(() => decodeArtifactImage(range.bytes, range.contentType));
+    if (!current()) return false;
     const accepted = rust.accept_image(decoded.bytes, decoded.width, decoded.height);
     if (accepted) await present();
     return accepted;
@@ -387,6 +662,7 @@ export async function mountBrowserSession({
           try { onError(intent.message); } catch { /* observer */ }
           break;
         case 'history': await loadHistory(intent.direction); break;
+        case 'producer':
         case 'control':
           if (typeof intent.action_json !== 'string') throw new Error('invalid control intent');
           await control(intent.action_json); break;
@@ -394,18 +670,13 @@ export async function mountBrowserSession({
           if (typeof capabilities.navigate !== 'function' || typeof intent.url !== 'string') throw new Error('navigation capability unavailable');
           const url = new URL(intent.url);
           if (!['https:', 'http:'].includes(url.protocol) || url.username || url.password) throw new Error('unsafe navigation');
-          await capabilities.navigate(url.href); break;
+          await platformWork(() => capabilities.navigate(url.href)); break;
         }
         case 'image': await showArtifactImage(intent.item_id, intent.reference_key); break;
-        case 'artifact': {
-          if (typeof capabilities.consumeArtifact !== 'function') throw new Error('artifact consumer unavailable');
-          const range = await readArtifact(intent.item_id, intent.reference_key);
-          if (!disposed) await capabilities.consumeArtifact({ itemId: intent.item_id, referenceKey: intent.reference_key, ...range });
-          break;
-        }
+        case 'artifact': await consumeArtifact(intent); break;
         case 'clipboard':
           if (typeof capabilities.writeClipboard !== 'function' || typeof intent.text !== 'string') throw new Error('clipboard capability unavailable');
-          await capabilities.writeClipboard(intent.text); break;
+          await platformWork(() => capabilities.writeClipboard(intent.text)); break;
         default: throw new Error('unsupported host intent');
       }
     }
@@ -430,14 +701,16 @@ export async function mountBrowserSession({
     disposed = true;
     painted = false;
     clearSemantics();
+    const retiringVisualWork = visualWork;
     controller.abort();
     signal?.removeEventListener('abort', externalAbort);
     window.clearTimeout(timer);
     bridge?.dispose();
+    try { capabilities.dispose?.(); } catch { /* platform cleanup cannot retain Rust */ }
     disposal = (async () => {
       await queue;
       if (rust) {
-        try { if (recoveryReady) saveRecovery(); }
+        try { releaseVisual(retiringVisualWork); if (recoveryReady) saveRecovery(); }
         finally {
           try { rust.cancel_pointer(); rust.dispose(); }
           finally { rust.free(); rust = undefined; }
@@ -459,6 +732,13 @@ export async function mountBrowserSession({
     createRust();
     bridge = mountInteractiveSurface({
       container, canvas,
+      // Bcode's effective keymap includes modified command keys. The generic
+      // bridge defaults to unmodified navigation only; Rust remains the sole
+      // action resolver (including explicit unbinds and unsupported actions).
+      isCapturedKey: event => typeof event.key === 'string' && event.key.length <= 64 &&
+        (event.ctrlKey || event.altKey || event.metaKey ||
+          ['Enter', 'Tab', 'Escape', 'Backspace', 'Delete', 'ArrowLeft', 'ArrowRight',
+            'ArrowUp', 'ArrowDown', 'Home', 'End', 'PageUp', 'PageDown'].includes(event.key)),
       mapPoint: ({ x, y }) => !disposed && painted && x >= 0 && y >= 0 && x < columns * cellWidth && y < rows * cellHeight
         ? { x: x / cellWidth, y: y / cellHeight } : null,
       onInput: event => {
@@ -484,7 +764,7 @@ export async function mountBrowserSession({
           const clipboard = rust.take_clipboard();
           if (clipboard != null) {
             if (typeof capabilities.writeClipboard !== 'function') throw new Error('clipboard capability unavailable');
-            await capabilities.writeClipboard(clipboard);
+            await platformWork(() => capabilities.writeClipboard(clipboard));
           }
           if (!disposed) await dispatchIntents();
           if (!disposed && submitRequested) await submit();
@@ -492,6 +772,7 @@ export async function mountBrowserSession({
       },
       onResize: size => {
         if (disposed) return;
+        geometryGeneration++;
         // The bridge may already have resized the Canvas backing store. Until
         // the queued Rust repaint commits, no old hit region remains visible.
         painted = false;

@@ -1441,6 +1441,27 @@ pub async fn cancel_turn(
     client_id: bcode_session_models::ClientId,
     expected_turn_id: Option<String>,
 ) -> Result<bool, super::ServerError> {
+    let expected_turn_id = if expected_turn_id.is_none() {
+        let owners = state.recovered_interaction_owners.lock().await;
+        let (first, ambiguous) = {
+            let mut matching = owners
+                .range((session_id, String::new())..)
+                .take_while(|((session, _), _)| *session == session_id);
+            let first = matching.next().map(|(_, owner)| owner.turn_id().to_owned());
+            (first, matching.next().is_some())
+        };
+        drop(owners);
+        if ambiguous {
+            return Err(
+                super::ServerError::WorkflowApplicationOperationUnauthorized(
+                    "multiple recovered interactions require targeted cancellation".into(),
+                ),
+            );
+        }
+        first
+    } else {
+        expected_turn_id
+    };
     // A verified live target is actor-owned. Do not run interrupted-work recovery
     // queries before routing its cancellation; those queries cannot settle live work.
     let live_target = if let Some(turn_id) = expected_turn_id.as_deref() {
@@ -1463,6 +1484,9 @@ pub async fn cancel_turn(
     } else {
         false
     };
+    if !live_target && let Some(turn_id) = expected_turn_id.as_deref() {
+        super::finish_recovered_interaction_cancellation(state, session_id, turn_id).await?;
+    }
     if !live_target
         && let Some(turn_id) = expected_turn_id.as_deref()
         && Box::pin(super::submission_recovery::end_interrupted_turn(

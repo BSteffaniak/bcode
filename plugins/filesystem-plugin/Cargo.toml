@@ -14,10 +14,11 @@ version     = { workspace = true }
 crate-type = ["cdylib", "rlib"]
 
 [dependencies]
-bcode_plugin_sdk = { workspace = true, features = ["tui"] }
-bcode_session_models = { workspace = true }
+bcode_plugin_models = { workspace = true, optional = true }
+bcode_plugin_sdk = { workspace = true, features = ["tui"], optional = true }
+bcode_session_models = { workspace = true, optional = true }
 bcode_syntax_render = { workspace = true, optional = true }
-bcode_tool = { workspace = true }
+bcode_tool = { workspace = true, optional = true }
 bcode_tui_components = { workspace = true, features = [
     "diff-viewer",
     "source-preview",
@@ -26,26 +27,47 @@ bcode_tui_components = { workspace = true, features = [
     "tool-card",
 ], optional = true }
 bmux_tui = { workspace = true, optional = true }
+bmux_tui_components = { workspace = true, features = [
+    "action-row",
+], optional = true }
 devicons = { workspace = true, optional = true }
-gix-config = { workspace = true }
-hex = { workspace = true }
-ignore = { workspace = true }
-image = { workspace = true }
-png = { workspace = true }
+gix-config = { workspace = true, optional = true }
+hex = { workspace = true, optional = true }
+ignore = { workspace = true, optional = true }
+image = { workspace = true, optional = true }
+png = { workspace = true, optional = true }
 serde = { workspace = true, features = ["derive", "std"] }
 serde_json = { workspace = true }
-sha1_smol = { workspace = true }
-sha2 = { workspace = true }
+sha1_smol = { workspace = true, optional = true }
+sha2 = { workspace = true, optional = true }
 
 [target.'cfg(unix)'.dependencies]
-libc = { workspace = true }
+libc = { workspace = true, optional = true }
 
 [features]
-default = []
+default = ["native"]
 fail-on-warnings = []
-static-bundled = [
-    "bcode_syntax_render",
-    "bcode_tui_components",
-    "bmux_tui",
-    "devicons",
+native = [
+    "dep:bcode_plugin_sdk",
+    "dep:bcode_session_models",
+    "dep:bcode_tool",
+    "dep:gix-config",
+    "dep:hex",
+    "dep:ignore",
+    "dep:image",
+    "dep:png",
+    "dep:sha1_smol",
+    "dep:sha2",
+    "dep:libc",
 ]
+presentation = [
+    "dep:bcode_plugin_models",
+    "dep:bcode_syntax_render",
+    "dep:bcode_tui_components",
+    "dep:bmux_tui",
+    "dep:bmux_tui_components",
+    "dep:devicons",
+    "bcode_tui_components/transcript-engine",
+    "bcode_tui_components/transcript-markdown",
+]
+static-bundled = ["native", "presentation"]

@@ -853,6 +853,30 @@ impl PluginTuiPresentation {
         Some(registry)
     }
 
+    /// Export user adapter preferences and the backend's actually selected,
+    /// loaded plugin IDs. Extension factories do not establish enablement.
+    /// This does not export or invoke native dylib/service implementations.
+    #[must_use]
+    pub fn portable_visual_policy(
+        &self,
+    ) -> bcode_tui_components::transcript::tool_visual::portable::PortableVisualPolicy {
+        let enabled_plugins = match &self.backend {
+            PresentationPluginBackend::Synchronous(host) => host
+                .loaded_plugins()
+                .iter()
+                .map(|plugin| plugin.manifest().id.clone())
+                .collect(),
+            PresentationPluginBackend::Runtime(runtime) => {
+                runtime.registry().manifests().keys().cloned().collect()
+            }
+        };
+        bcode_tui_components::transcript::tool_visual::portable::PortableVisualPolicy {
+            enabled_plugins,
+            preferred: self.visual_adapter_config.preferred.clone(),
+            disabled: self.visual_adapter_config.disabled.clone(),
+        }
+    }
+
     /// Return compatible routes in configured order whose native implementations are available.
     #[must_use]
     pub fn visual_routes(
@@ -1576,6 +1600,23 @@ pub fn load_default_runtime_with_static_bundled(
     )
 }
 
+/// Open a renderer-only surface using the exact producer and interaction kind from canonical data.
+///
+/// # Errors
+/// Rejects missing producer adapters or incompatible snapshots; never decodes original requests.
+pub async fn open_canonical_interaction_surface(
+    view: &bcode_plugin_sdk::interaction_application::DurableInteractionView,
+) -> Result<bcode_plugin_sdk::tui::BoxedPluginTuiSurface, String> {
+    view.validate().map_err(|error| format!("{error:?}"))?;
+    let route = &view.binding.capability.route;
+    let registry = tui_registry(&route.producer_id)
+        .ok_or_else(|| "canonical terminal producer adapter unavailable".to_owned())?;
+    registry
+        .open_canonical(&route.interaction_kind, view.snapshot.snapshot.clone())
+        .await
+        .map_err(|error| error.to_string())
+}
+
 /// Open a native TUI surface from a platform-owned registry.
 ///
 /// # Errors
@@ -1900,6 +1941,63 @@ library = "libcomposer_fixture.dylib"
         );
         assert!(unsupported.activate_composer(&document).is_none());
         drop(unsupported);
+    }
+
+    #[test]
+    fn portable_policy_uses_loaded_manifests_not_registered_factories() {
+        let bundled = [StaticBundledPlugin::new(
+            COMPOSER_FALLBACK_MANIFEST,
+            bcode_plugin_sdk::static_plugin_vtable!(
+                DynamicVisualTestPlugin,
+                COMPOSER_FALLBACK_MANIFEST
+            ),
+        )];
+        let extensions = [bcode_plugin_sdk::tui::StaticPluginTuiExtension::new(
+            "test.composer-fallback",
+            composer_fallback_registry,
+        )];
+        let host = load_presentation_fallback(
+            &bcode_plugin::PluginSelection::all_enabled(),
+            &bundled,
+            &extensions,
+        )
+        .unwrap();
+        let preferences = bcode_config::TuiVisualAdapterConfig {
+            preferred: vec!["test.composer-fallback/card".into()],
+            disabled: BTreeSet::from(["test.composer-fallback/other".into()]),
+        };
+        let presentation = PluginTuiPresentation::with_runtime_config_and_extensions(
+            host.into(),
+            preferences.clone(),
+            &extensions,
+        );
+        let policy = presentation.portable_visual_policy();
+        assert_eq!(
+            policy.enabled_plugins,
+            BTreeSet::from(["test.composer-fallback".into()])
+        );
+        assert_eq!(policy.preferred, preferences.preferred);
+        assert_eq!(policy.disabled, preferences.disabled);
+        drop(presentation);
+        let empty = PluginHost::load_static_plugins_best_effort(&[]);
+        let presentation = PluginTuiPresentation::with_runtime_config_and_extensions(
+            empty.into(),
+            bcode_config::TuiVisualAdapterConfig::default(),
+            &extensions,
+        );
+        // A registered implementation is not evidence of an enabled plugin.
+        assert!(
+            presentation
+                .registry_factories
+                .contains_key("test.composer-fallback")
+        );
+        assert!(
+            presentation
+                .portable_visual_policy()
+                .enabled_plugins
+                .is_empty()
+        );
+        drop(presentation);
     }
 
     #[test]

@@ -28,7 +28,7 @@ struct BrowserProtocol {
 }
 
 impl BrowserProtocol {
-    fn supported(&self) -> bool {
+    const fn supported(&self) -> bool {
         self.session_view == 1 && self.browser_bridge == 1 && self.canvas == 1
     }
 }

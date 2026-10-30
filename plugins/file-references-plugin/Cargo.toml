@@ -14,7 +14,7 @@ version     = { workspace = true }
 crate-type = ["cdylib", "rlib"]
 
 [dependencies]
-bcode_filesystem_plugin = { workspace = true }
+bcode_filesystem_plugin = { workspace = true, features = ["native"] }
 bcode_plugin_sdk        = { workspace = true }
 bcode_tool              = { workspace = true }
 serde                   = { workspace = true, features = ["derive", "std"] }

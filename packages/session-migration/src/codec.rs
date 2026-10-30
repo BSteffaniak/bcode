@@ -104,6 +104,54 @@ impl HistoricalEnvelope {
         })
     }
 
+    /// Decode schema 52 without inventing checkpoints or reapplying older conversion policy.
+    ///
+    /// Current-equivalent kinds require acceptance by the supplied current decoder. Explicit
+    /// historical conversions remain migration-owned and retain schema-52 recorded values.
+    ///
+    /// # Errors
+    /// Returns an error for an unreleased kind, a current-equivalent payload rejected by the
+    /// current decoder, or an invalid schema-52 payload.
+    pub fn decode_schema_52(
+        &self,
+        current: Result<SessionEvent, String>,
+    ) -> Result<HistoricalDecode, HistoricalSessionEventError> {
+        let (event_kind, _) = source_kind(self)?;
+        if !crate::is_released_event_kind_schema(event_kind, 52) {
+            return Err(HistoricalSessionEventError::UnsupportedEventKind {
+                schema_version: 52,
+                event_kind: event_kind.to_owned(),
+            });
+        }
+        if crate::RELEASED_EVENT_VARIANTS.iter().any(|variant| {
+            variant.kind == event_kind
+                && variant.treatment == crate::ReleasedEventTreatment::RetiredKnown
+        }) {
+            return self.decode_retired_known();
+        }
+        let decoded_kind = if crate::RELEASED_EVENT_VARIANTS.iter().any(|variant| {
+            variant.kind == event_kind
+                && variant.treatment == crate::ReleasedEventTreatment::CurrentEquivalent
+        }) {
+            current.map(|event| event.kind)
+        } else {
+            serde_json::from_value::<SessionEventKind>(self.kind.clone())
+                .map_err(|error| error.to_string())
+        };
+        let kind = decoded_kind.map_err(|reason| HistoricalSessionEventError::InvalidEvent {
+            schema_version: 52,
+            event_kind: event_kind.to_owned(),
+            reason,
+        })?;
+        Ok(HistoricalDecode::Converted {
+            event: self.materialize(kind),
+            metadata: HistoricalEventMetadata {
+                source_schema: 52,
+                source_kind: event_kind.to_owned(),
+            },
+        })
+    }
+
     fn materialize(&self, kind: SessionEventKind) -> SessionEvent {
         SessionEvent {
             schema_version: bcode_session_models::CURRENT_SESSION_EVENT_SCHEMA_VERSION,

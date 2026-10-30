@@ -6,6 +6,7 @@ parent owns the isolated fake provider and verifies canonical history afterward.
 """
 
 import argparse
+import base64
 import hashlib
 import html
 import http.client
@@ -14,6 +15,8 @@ from pathlib import Path
 import os
 import re
 import select
+import signal
+import sys
 import time
 import shutil
 import subprocess
@@ -60,13 +63,13 @@ def backend_address(value):
     return address.hostname, address.port
 
 
-def request(backend, method, path, body=None, headers=None):
+def request(backend, method, path, body=None, headers=None, *, max_bytes=8 * 1024 * 1024):
     connection = http.client.HTTPConnection(*backend, timeout=20)
     try:
         connection.request(method, path, body=body, headers=headers or {})
         response = connection.getresponse()
-        data = response.read(8 * 1024 * 1024 + 1)
-        if len(data) > 8 * 1024 * 1024:
+        data = response.read(max_bytes + 1)
+        if len(data) > max_bytes:
             raise ValueError("unbounded backend response")
         return response.status, {key.lower(): value for key, value in response.getheaders()}, data
     finally:
@@ -84,14 +87,35 @@ def security_checks(backend, args, identity):
     assert status in (200, 401, 403), "unexpected authentication response"
     assert b"unauthorized" in unauthorized, "unauthenticated snapshot disclosed"
     for path in ("/tui/index.html", "/tui/browser-session.js", "/tui/bcode_tui_web_bg.wasm"):
-        status, headers, _ = request(backend, "GET", path)
+        name = path.removeprefix("/tui/")
+        info = json.loads((args.bundle / "manifest.json").read_text())["files"][name]
+        status, headers, asset = request(backend, "GET", path, max_bytes=info["bytes"])
+        assert len(asset) == info["bytes"] and hashlib.sha256(asset).hexdigest() == info["sha256"], \
+            f"served asset differs from verified bundle: {name}"
         assert status == 200, f"asset unavailable: {path}"
         assert headers.get("cache-control") == "no-store", "sensitive cache policy missing"
         assert headers.get("referrer-policy") == "no-referrer", "referrer policy missing"
     path = f"/api/session-view/{args.session}?token={args.token}"
     status, headers, data = request(backend, "GET", path, headers={"Origin": "https://evil.invalid"})
-    assert status == 200, "foreign read did not reach the application CORS policy"
+    assert status == 200 and json.loads(data).get('error') == 'unauthorized', "foreign origin reached authenticated snapshot"
     assert "access-control-allow-origin" not in headers, "foreign CORS granted"
+    for origin in ('null', 'https://evil.invalid', args.backend + '/', 'https://embed.example.invalid.evil.invalid'):
+        status, _, data = request(backend, 'GET', path, headers={'Origin': origin})
+        assert status == 200 and json.loads(data).get('error') == 'unauthorized', 'non-exact origin admitted'
+    for origin in (args.backend, 'https://embed.example.invalid'):
+        status, _, data = request(backend, 'GET', path, headers={'Origin': origin})
+        assert status == 200 and 'snapshot' in json.loads(data), 'configured exact origin rejected'
+    for route, body in (
+        ('/api/session-view/submit-message', {'session_id':args.session,'submission_id':'foreign-origin-e2e','text':'must never be admitted'}),
+        ('/api/session-view/control', {'session_id':args.session,'epoch':args.session,'revision':1,'action':{'type':'permission','permission_id':'foreign','approved':True,'remember':False}}),
+        ('/api/session-view/artifact', {'session_id':args.session,'epoch':args.session,'revision':1,'item_id':'foreign','reference_key':'foreign','offset':0,'length':1}),
+    ):
+        status, _, data = request(backend, 'POST', f'{route}?token={args.token}', json.dumps(body).encode(),
+            {'Origin':'https://evil.invalid','Content-Type':'application/json'})
+        assert status == 200 and json.loads(data).get('error') == 'unauthorized', 'foreign origin mutation/range admitted'
+    status, _, data = request(backend, 'GET', f'/api/session-view/artifact/download?token={args.token}&request=%7B%7D',
+        headers={'Origin':'https://evil.invalid'})
+    assert status == 200 and json.loads(data).get('error') == 'unauthorized', 'foreign download admitted'
     status, headers, _ = request(backend, "OPTIONS", path, headers={
         "Origin": "https://evil.invalid", "Access-Control-Request-Method": "POST",
         "Access-Control-Request-Headers": "content-type",
@@ -115,10 +139,29 @@ def security_checks(backend, args, identity):
     assert (status in (400, 415) or b"invalid_content_type" in data
             or b"invalid_request" in data), "content-type accepted"
     return ["production Actix compatibility", "asset cache/referrer policy",
-            "foreign read has no CORS grant and foreign preflight is rejected", "body and content-type limits"]
+            "foreign read/write/artifact denied and exact listener/embed origins admitted", "body and content-type limits"]
 
 
-def browser_dom(command, url):
+def stop_browser_group(process):
+    """Stop only our new-session Chromium group before removing its profile."""
+    try:
+        os.killpg(process.pid, signal.SIGTERM)
+    except ProcessLookupError:
+        pass
+    try:
+        process.wait(timeout=10)
+    except subprocess.TimeoutExpired:
+        pass
+    # The parent may exit before descendants finish writing the profile. Kill
+    # the entire owned group even when wait() already reaped the parent.
+    try:
+        os.killpg(process.pid, signal.SIGKILL)
+    except ProcessLookupError:
+        pass
+    process.wait(timeout=10)
+
+
+def browser_dom(command, url, evidence_dir=None, on_checkpoint=None):
     """Drive real Chromium over its private CDP pipe using wall-clock deadlines."""
     command_read, command_write = os.pipe()
     response_read, response_write = os.pipe()
@@ -128,13 +171,21 @@ def browser_dom(command, url):
     try:
         with tempfile.TemporaryFile() as errors, subprocess.Popen(
                 launch, pass_fds=(command_read, response_write),
-                stdout=subprocess.DEVNULL, stderr=errors) as process:
+                stdout=subprocess.DEVNULL, stderr=errors,
+                start_new_session=True) as process:
             os.close(command_read)
             os.close(response_write)
             command_read = response_write = None
             pending = bytearray()
             sequence = 0
-            deadline = time.monotonic() + 150
+            deadline = time.monotonic() + 600
+            captured = set()
+            # Bounded transport observations complement canonical backend counts.
+            # Retain no query strings, headers, payloads, or authentication tokens.
+            submission_network = []
+            submission_request_ids = set()
+            if evidence_dir is not None:
+                evidence_dir.mkdir(parents=True, exist_ok=True)
 
             def call(method, params, session=None):
                 nonlocal sequence
@@ -155,6 +206,24 @@ def browser_dom(command, url):
                     raw, _, rest = pending.partition(b"\0")
                     pending[:] = rest
                     reply = json.loads(raw)
+                    method = reply.get('method')
+                    params = reply.get('params', {})
+                    request_id = params.get('requestId')
+                    if method == 'Network.requestWillBeSent':
+                        request = params.get('request', {})
+                        if (urlsplit(request.get('url', '')).path.endswith('/submit-message')
+                                and len(submission_request_ids) < 32):
+                            submission_request_ids.add(request_id)
+                            if len(submission_network) < 128:
+                                submission_network.append({'event': 'request', 'id': request_id,
+                                                           'method': request.get('method')})
+                    elif request_id in submission_request_ids and len(submission_network) < 128:
+                        if method == 'Network.responseReceived':
+                            submission_network.append({'event': 'response', 'id': request_id,
+                                                       'status': params.get('response', {}).get('status')})
+                        elif method == 'Network.loadingFailed':
+                            submission_network.append({'event': 'failed', 'id': request_id,
+                                                       'cancelled': params.get('canceled', False)})
                     if reply.get("id") == sequence:
                         if "error" in reply:
                             raise RuntimeError(reply["error"])
@@ -164,24 +233,70 @@ def browser_dom(command, url):
             try:
                 target = call("Target.createTarget", {"url": "about:blank"})["targetId"]
                 session = call("Target.attachToTarget", {"targetId": target, "flatten": True})["sessionId"]
+                call('Emulation.setDeviceMetricsOverride', {
+                    'width': 1100, 'height': 800, 'deviceScaleFactor': 1, 'mobile': False,
+                }, session)
+                call('Network.enable', {}, session)
                 call("Page.navigate", {"url": url}, session)
                 while time.monotonic() < deadline:
+                    checkpoint_result = call('Runtime.evaluate', {
+                        'expression': 'globalThis.__bcodeAcceptanceCheckpoint',
+                        'returnByValue': True,
+                    }, session)
+                    checkpoint = checkpoint_result.get('result', {}).get('value')
+                    if isinstance(checkpoint, dict) and checkpoint.get('label') not in captured:
+                        label = checkpoint['label']
+                        if evidence_dir is None or not re.fullmatch(r'[a-z0-9-]{1,64}', label):
+                            raise ValueError('checkpoint requires an evidence directory and safe label')
+                        if on_checkpoint is not None:
+                            on_checkpoint(checkpoint)
+                        screenshot = call('Page.captureScreenshot', {'format': 'png'}, session)
+                        png = base64.b64decode(screenshot['data'], validate=True)
+                        if not png.startswith(b'\x89PNG\r\n\x1a\n'):
+                            raise ValueError('Chromium returned invalid screenshot')
+                        (evidence_dir / f'{label}.png').write_bytes(png)
+                        checkpoint['screenshot_sha256'] = hashlib.sha256(png).hexdigest()
+                        (evidence_dir / f'{label}.json').write_text(json.dumps(checkpoint, sort_keys=True))
+                        captured.add(label)
+                        if checkpoint.get('click') is not None:
+                            point = checkpoint['click']
+                            if not all(isinstance(point.get(axis), (int, float)) and 0 <= point[axis] <= 16384 for axis in ('x', 'y')):
+                                raise ValueError('invalid committed input point')
+                            for event in ('mousePressed', 'mouseReleased'):
+                                call('Input.dispatchMouseEvent', {
+                                    'type': event, 'x': point['x'], 'y': point['y'],
+                                    'button': 'left', 'clickCount': 1,
+                                }, session)
+                        call('Runtime.evaluate', {
+                            'expression': f'globalThis.__bcodeAcceptanceAcknowledged = {json.dumps(label)}',
+                        }, session)
                     result = call("Runtime.evaluate", {
                         "expression": "document.querySelector('#result')?.textContent",
                         "returnByValue": True,
                     }, session)
                     value = result.get("result", {}).get("value")
                     if isinstance(value, str) and value != "pending":
+                        if evidence_dir is not None:
+                            screenshot = call('Page.captureScreenshot', {'format':'png'}, session)
+                            (evidence_dir / 'final.png').write_bytes(base64.b64decode(screenshot['data'], validate=True))
+                            (evidence_dir / 'browser-result.txt').write_text(value)
                         return f'<pre id="result">{html.escape(value)}</pre>'
                     time.sleep(0.05)
                 raise TimeoutError("Chromium did not finish behavioral acceptance")
             finally:
-                process.terminate()
+                if evidence_dir is not None:
+                    (evidence_dir / 'submission-network.json').write_text(
+                        json.dumps(submission_network, sort_keys=True))
+                initiating_error = sys.exception()
                 try:
-                    process.wait(timeout=10)
-                except subprocess.TimeoutExpired:
-                    process.kill()
-                    process.wait()
+                    stop_browser_group(process)
+                except Exception as cleanup_error:
+                    if initiating_error is None:
+                        raise
+                    raise ExceptionGroup(
+                        "browser acceptance and owned-process cleanup failed",
+                        [initiating_error, cleanup_error],
+                    ) from None
     finally:
         for descriptor in (command_read, command_write, response_read, response_write):
             if descriptor is not None:
@@ -202,13 +317,65 @@ def run(args):
                    f"--user-data-dir={profile}"]
         if args.no_sandbox:
             command.append("--no-sandbox")
-        dom = browser_dom(command, f"{args.backend}/backend-e2e.html")
+        evidence_dir = args.evidence_dir or Path(tempfile.mkdtemp(prefix='bcode-browser-evidence-'))
+        def verify_pending(checkpoint):
+            kind = checkpoint['label']
+            paths = {
+                'permission-approve-pending': ['approved.txt'],
+                'permission-deny-pending': ['denied.txt'],
+                'batch-approve-pending': ['batch-true-0.txt', 'batch-true-1.txt'],
+                'batch-deny-pending': ['batch-false-0.txt', 'batch-false-1.txt'],
+            }.get(kind, [])
+            if kind == 'cancel-terminal':
+                if args.fixture_root is None:
+                    raise RuntimeError('cancel gate requires isolated fixture root')
+                (args.fixture_root / 'release-cancel-gate').write_bytes(b'release-after-terminal')
+                until = time.monotonic() + 10
+                while not (args.fixture_root / 'cancel-gate-released').exists():
+                    if time.monotonic() > until:
+                        raise TimeoutError('cancel gate release not acknowledged')
+                    time.sleep(0.025)
+            if kind == 'question-option-pending-reconnect':
+                if args.fixture_root is None:
+                    raise RuntimeError('restart requires isolated fixture root')
+                (args.fixture_root / 'backend-restart-request').write_bytes(b'restart-test-owned-backend')
+                until = time.monotonic() + 45
+                while not (args.fixture_root / 'backend-restart-complete').exists():
+                    if time.monotonic() > until:
+                        raise TimeoutError('isolated backend did not restart')
+                    time.sleep(0.025)
+            if paths and args.fixture_root is None:
+                raise RuntimeError('permission acceptance requires explicit test-owned fixture root')
+            for path in paths:
+                if (args.fixture_root / path).exists():
+                    raise RuntimeError('filesystem side effect preceded actual permission approval')
+        dom = browser_dom(command, f"{args.backend}/backend-e2e.html", evidence_dir, verify_pending)
     match = re.search(r'<pre id="result">(.*?)</pre>', dom, re.DOTALL)
     if match is None:
         raise RuntimeError("Chromium did not emit browser acceptance evidence")
     report = json.loads(html.unescape(match[1]))
     if report.get("passed") is not True:
-        raise RuntimeError(report.get("error", "browser did not pass"))
+        raise RuntimeError(f"{report.get('error', 'browser did not pass')}; evidence_dir={evidence_dir}")
+    required_checkpoints = {'initial', 'editor', 'transcript', 'history-resize'}
+    checkpoints = report.get('checkpoints', [])
+    if not required_checkpoints.issubset({checkpoint.get('label') for checkpoint in checkpoints}):
+        raise RuntimeError('incomplete committed Canvas evidence')
+    for checkpoint in checkpoints:
+        recorded = json.loads((evidence_dir / f"{checkpoint['label']}.json").read_text())
+        if recorded['pixel_sha256'] != checkpoint['pixel_sha256']:
+            raise RuntimeError('screenshot checkpoint differs from browser evidence')
+    if report.get('negative_controls') != 7 or report.get('disposed_requests') != 0:
+        raise RuntimeError('missing negative control/disposal evidence')
+    expected_scenarios = {'permission-approve', 'permission-deny', 'batch-approve', 'batch-deny',
+        'question-option', 'question-custom', 'question-cancel', 'image', 'artifact', 'rich', 'cancel', 'config'}
+    scenarios = report.get('scenarios', [])
+    if {scenario.get('kind') for scenario in scenarios} != expected_scenarios or not all(scenario.get('passed') is True for scenario in scenarios):
+        raise RuntimeError('incomplete real production scenarios')
+    for scenario in scenarios:
+        for label in ('terminal', 'reconnect'):
+            if not (evidence_dir / f"{scenario['kind']}-{label}.png").is_file():
+                raise RuntimeError('missing production scenario screenshot')
+    report['evidence_dir'] = str(evidence_dir.resolve())
     report["bundle_sha256"] = identity
     report["chromium_sha256"] = hashlib.sha256(chromium.read_bytes()).hexdigest()
     report["security"] = security
@@ -275,6 +442,8 @@ def main():
     parser.add_argument("--backend", required=True)
     parser.add_argument("--session", required=True)
     parser.add_argument("--token", required=True)
+    parser.add_argument('--fixture-root', type=Path)
+    parser.add_argument('--evidence-dir', type=Path)
     parser.add_argument("--no-sandbox", action="store_true")
     args = parser.parse_args()
     if not re.fullmatch(r"[0-9a-fA-F-]{36}", args.session) or not args.token:

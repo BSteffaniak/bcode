@@ -7,7 +7,7 @@ use bmux_tui::{event::Event, geometry::Rect, paint::PaintCx};
 use bmux_tui_components::text_input::{TextInputControl, TextInputPolicy, TextInputState};
 
 pub use crate::question_interaction::{
-    QuestionFocusTarget, QuestionInteractionController, QuestionSnapshot,
+    QuestionFocusTarget, QuestionInteractionController, QuestionSnapshot, QuestionSnapshotError,
 };
 pub use crate::question_outcome::question_outcome_rows;
 use crate::question_tui::QuestionTerminalRenderer;
@@ -34,6 +34,96 @@ pub trait QuestionInputPort {
     fn keymap_keys(&self, scope: &str, action: &str) -> Vec<String>;
     /// Apply an editor key using BMUX text editing; false means unhandled.
     fn edit_key(&self, state: &mut TextInputState, stroke: KeyStroke) -> bool;
+}
+
+/// Apply an effective question-text binding through the producer's shared BMUX editor.
+///
+/// `None` admits printable literal input only; `Some("")` represents an explicit unbind.
+/// Unknown/unsupported bound actions are consumed without inserting their shortcut text.
+/// Returns whether the key was consumed, not whether text changed. The presentation emits
+/// semantic `Change` only when the editor's text actually changes; selection/history-only
+/// movement remains local. No default binding lookup is performed here.
+pub fn edit_question_key(
+    state: &mut TextInputState,
+    stroke: KeyStroke,
+    resolved_action: Option<&str>,
+) -> bool {
+    use bmux_keyboard::Modifiers;
+    use bmux_tui_components::text_input::{TextInputHistoryAction, TextInputHistoryBindings};
+    let policy = TextInputPolicy::chat_composer();
+    let control =
+        TextInputControl::new(&policy).with_history_bindings(TextInputHistoryBindings::disabled());
+    let Some(action) = resolved_action else {
+        let modifiers = stroke.modifiers;
+        if modifiers.ctrl
+            || modifiers.alt
+            || modifiers.super_key
+            || modifiers.hyper
+            || modifiers.meta
+        {
+            return false;
+        }
+        let character = match stroke.key {
+            KeyCode::Char(character) if !character.is_control() => {
+                if modifiers.shift && character.is_ascii_lowercase() {
+                    character.to_ascii_uppercase()
+                } else {
+                    character
+                }
+            }
+            KeyCode::Space => ' ',
+            _ => return false,
+        };
+        control.handle_key(state, KeyStroke::simple(KeyCode::Char(character)));
+        return true;
+    };
+    let history = match action {
+        "question.text.undo" => Some(TextInputHistoryAction::Undo),
+        "question.text.redo" => Some(TextInputHistoryAction::Redo),
+        _ => None,
+    };
+    if let Some(history) = history {
+        control.handle_key_with_history_action(state, stroke, Some(history));
+        return true;
+    }
+    let (key, ctrl, shift) = match action {
+        "tui.control.up" => (KeyCode::Up, false, false),
+        "tui.control.down" => (KeyCode::Down, false, false),
+        "tui.control.left" => (KeyCode::Left, false, false),
+        "tui.control.right" => (KeyCode::Right, false, false),
+        "tui.control.home" => (KeyCode::Home, false, false),
+        "tui.control.end" => (KeyCode::End, false, false),
+        "tui.control.backspace" => (KeyCode::Backspace, false, false),
+        "tui.control.delete" => (KeyCode::Delete, false, false),
+        "tui.control.word_left" => (KeyCode::Left, true, false),
+        "tui.control.word_right" => (KeyCode::Right, true, false),
+        "tui.control.delete_word_backward" => (KeyCode::Char('w'), true, false),
+        "tui.control.delete_word_forward" => (KeyCode::Delete, true, false),
+        "tui.control.line_start" => (KeyCode::Char('a'), true, false),
+        "tui.control.line_end" => (KeyCode::Char('e'), true, false),
+        "tui.control.delete_to_start" => (KeyCode::Char('u'), true, false),
+        "tui.control.delete_to_end" => (KeyCode::Char('k'), true, false),
+        "tui.control.select_left" => (KeyCode::Left, false, true),
+        "tui.control.select_right" => (KeyCode::Right, false, true),
+        "tui.control.select_up" => (KeyCode::Up, false, true),
+        "tui.control.select_down" => (KeyCode::Down, false, true),
+        "tui.control.select_word_left" => (KeyCode::Left, true, true),
+        "tui.control.select_word_right" => (KeyCode::Right, true, true),
+        "tui.control.newline" => (KeyCode::Enter, false, true),
+        _ => return true,
+    };
+    control.handle_key(
+        state,
+        KeyStroke::with_modifiers(
+            key,
+            Modifiers {
+                ctrl,
+                shift,
+                ..Modifiers::NONE
+            },
+        ),
+    );
+    true
 }
 
 /// Default portable bindings matching native question defaults.
@@ -109,6 +199,7 @@ impl QuestionInputPort for DefaultQuestionInput {
 }
 
 /// Ephemeral form presentation. Controller state must be replaced from canonical producer snapshots.
+#[derive(Clone)]
 pub struct QuestionPresentation {
     renderer: QuestionTerminalRenderer,
 }
@@ -120,6 +211,16 @@ impl Default for QuestionPresentation {
     }
 }
 impl QuestionPresentation {
+    /// Fork the complete retained presentation for a speculative frame transaction.
+    /// This preserves editor undo/redo history, cursor/selection, committed hit geometry,
+    /// layout caches and native focused-field fences without serialization or replay.
+    /// Paint only the fork; publish it in place of the original only after the enclosing
+    /// frame is accepted. A discarded candidate must never route input independently.
+    #[must_use]
+    pub fn fork(&self) -> Self {
+        self.clone()
+    }
+
     /// Apply renderer-owned semantic styles without changing canonical state or geometry.
     pub fn set_theme(&mut self, theme: Option<bmux_tui_components::theme::ComponentTheme>) {
         self.renderer.set_component_theme(theme);
@@ -188,37 +289,128 @@ impl QuestionInputPort for NativeQuestionPort<'_> {
         self.0.keymap_keys(scope, action)
     }
     fn edit_key(&self, state: &mut TextInputState, stroke: KeyStroke) -> bool {
-        use bcode_plugin_sdk::tui::keymap::controls::{ControlAction, ControlInput};
-        use bmux_tui_components::text_input::{TextInputHistoryAction, TextInputHistoryBindings};
-        let policy = TextInputPolicy::chat_composer();
-        let control = TextInputControl::new(&policy)
-            .with_history_bindings(TextInputHistoryBindings::disabled());
-        let history = match self.0.keymap_action("question.text", stroke).as_deref() {
-            Some("question.text.undo") => Some(TextInputHistoryAction::Undo),
-            Some("question.text.redo") => Some(TextInputHistoryAction::Redo),
-            _ => None,
-        };
-        if let Some(history) = history {
-            control.handle_key_with_history_action(state, stroke, Some(history));
-            return true;
+        let action = self.0.keymap_action("question.text", stroke);
+        if action.is_none() && self.0.keymap_is_overridden("question.text", stroke) {
+            return edit_question_key(state, stroke, Some(""));
         }
-        match ControlInput::from_host(
-            self.0,
-            "question.text",
-            stroke,
-            &[ControlAction::TEXT, &[ControlAction::Newline]].concat(),
-            true,
-        ) {
-            ControlInput::Action(action) => {
-                control.handle_key(state, action.native_stroke());
-            }
-            ControlInput::Text(text) => state.buffer_mut().insert_char(text.0),
-            ControlInput::Ignored => return false,
-        }
-        true
+        edit_question_key(state, stroke, action.as_deref())
     }
 }
 
 #[cfg(test)]
 #[path = "presentation_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+mod control_semantics_tests {
+    use super::*;
+    use bcode_tool::InteractionInput;
+    use bmux_tui::{
+        buffer::Buffer,
+        event::{MouseButton, MouseEvent, MouseEventKind},
+        frame::Frame,
+        geometry::Point,
+    };
+
+    #[test]
+    fn painted_option_and_submit_semantics_share_hits_and_producer_mouse_transitions() {
+        for control in ["radio", "checkbox"] {
+            let request = crate::parse_question_request(serde_json::json!({"questions":[{
+                "question":"Choose 界👩‍💻", "options":["First", "Second e\u{301}"],
+                "control":control,"selection_mode":if control == "radio" { "single" } else { "multiple" },
+                "custom":true,"required":true
+            }]})).unwrap();
+            let mut controller = QuestionInteractionController::new(request);
+            let mut form = QuestionPresentation::default();
+            for target in ["question-0.option-1", "question.actions.submit"] {
+                let snapshot = controller.snapshot();
+                let area = Rect::new(3, 4, 50, form.preferred_height(&snapshot, 50));
+                let mut buffer = Buffer::empty(area);
+                let mut frame = Frame::new(&mut buffer);
+                form.render_slice(&snapshot, 0, area, &mut PaintCx::new(&mut frame));
+                let region = frame
+                    .semantics()
+                    .regions()
+                    .iter()
+                    .find(|region| region.id == target)
+                    .expect("individual control semantics");
+                let hit = frame
+                    .hits()
+                    .regions()
+                    .iter()
+                    .find(|hit| hit.id.as_str() == target)
+                    .expect("same measured hit");
+                assert_eq!(region.area, hit.area);
+                let accessibility = region.accessibility.as_ref().unwrap();
+                assert!(
+                    accessibility
+                        .actions
+                        .contains(&bmux_tui::semantic::SemanticAction::Activate)
+                );
+                let event = Event::Mouse(MouseEvent::new(
+                    MouseEventKind::Down(MouseButton::Left),
+                    Point::new(region.area.x, region.area.y),
+                ));
+                let QuestionInputResult::Semantic(input) =
+                    form.input(&event, &snapshot, &DefaultQuestionInput)
+                else {
+                    panic!("producer control input");
+                };
+                let InteractionInput::Activate { control_id } = &input else {
+                    panic!("activation");
+                };
+                assert_eq!(
+                    control_id.as_str(),
+                    if target == "question.actions.submit" {
+                        "submit"
+                    } else {
+                        target
+                    }
+                );
+                let output = controller.handle_input_at_revision(snapshot.revision, input);
+                if target == "question-0.option-1" {
+                    assert_eq!(controller.snapshot().selected_option_indices[0], vec![1]);
+                } else {
+                    assert!(matches!(output, InteractionOutput::Submitted { .. }));
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn clipped_controls_publish_only_the_same_visible_source_geometry() {
+        let request = crate::parse_question_request(serde_json::json!({"questions":[{
+            "question":"Choose", "options":["First", "Second"],"required":true
+        }]}))
+        .unwrap();
+        let snapshot = QuestionInteractionController::new(request).snapshot();
+        let mut form = QuestionPresentation::default();
+        let area = Rect::new(2, 5, 40, 1);
+        let mut buffer = Buffer::empty(area);
+        let mut frame = Frame::new(&mut buffer);
+        form.render_slice(&snapshot, 3, area, &mut PaintCx::new(&mut frame));
+        let options: Vec<_> = frame
+            .semantics()
+            .regions()
+            .iter()
+            .filter(|region| region.id.starts_with("question-0.option-"))
+            .collect();
+        assert_eq!(options.len(), 1);
+        assert_eq!(options[0].id, "question-0.option-1");
+        assert_eq!(options[0].area, area);
+        let hit = frame
+            .hits()
+            .regions()
+            .iter()
+            .find(|hit| hit.id.as_str() == options[0].id)
+            .unwrap();
+        assert_eq!(hit.area, area);
+        assert!(
+            !frame
+                .semantics()
+                .regions()
+                .iter()
+                .any(|region| region.id == "question.actions.submit")
+        );
+    }
+}

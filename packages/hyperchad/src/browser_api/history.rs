@@ -61,6 +61,12 @@ impl HyperChadAppState {
         session_id: bcode_session_models::SessionId,
         request: ProjectionWindowRequest,
     ) -> Result<bcode_session_view_models::SessionViewSnapshot, bcode_client::ClientError> {
+        // Retain a compatible application consumer across poll gaps before the
+        // transient observation connection is opened or dropped. Authentication
+        // and observation serialization remain in the calling route.
+        self.browser_consumers
+            .renew(&self.client, session_id)
+            .await?;
         let mut connection = self.client.connect("bcode-browser-history").await?;
         let attached = crate::attach_hyperchad_projection_window_with_request(
             &mut connection,

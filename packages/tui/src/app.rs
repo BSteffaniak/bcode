@@ -6625,6 +6625,8 @@ const fn event_affects_transcript_rows(event: &SessionEvent) -> bool {
         | SessionEventKind::ToolContributionPlaced { .. }
         | SessionEventKind::ToolExchangeRequested { .. }
         | SessionEventKind::ToolExchangeResolved { .. }
+        | SessionEventKind::DurableInteractionCommitted { .. }
+        | SessionEventKind::TurnContinuationCommitted { .. }
         | SessionEventKind::ToolInvocationLifecycle { .. }
         | SessionEventKind::RalphLifecycle { .. }
         | SessionEventKind::PluginStatusNote { .. }

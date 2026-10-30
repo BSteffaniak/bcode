@@ -12,12 +12,18 @@
     #bcode-canvas { display: block; width: 100%; height: 100%; touch-action: none; }
     #status { margin: 0; font: 14px monospace; }
     #recovery-controls { padding: .25rem; }
+    dialog { max-width: min(90vw, 60rem); max-height: 85vh; overflow: auto; background: #161a20; color: #e0e4ec; }
+    dialog::backdrop { background: #0008; }
+    dialog pre { white-space: pre-wrap; overflow-wrap: anywhere; }
+    dialog a { display: block; color: #9fcaff; overflow-wrap: anywhere; margin: .5rem 0; }
+    dialog textarea { width: min(75vw, 50rem); height: 10rem; }
     #semantics { position: absolute; width: 1px; height: 1px; overflow: hidden; clip-path: inset(50%); }
   </style>
 </head>
 <body>
   <main id="surface"><canvas id="bcode-canvas" aria-label="Bcode session"></canvas></main>
   <section id="semantics" aria-label="Visible session regions"></section>
+  <section id="platform-dialogs" aria-label="Browser platform actions"></section>
   <footer id="recovery-controls" aria-label="Session recovery">
     <p id="status" role="status">Loading browser-local BMUX TUI…</p>
     <button id="refresh-session" type="button" disabled>Refresh canonical state</button>

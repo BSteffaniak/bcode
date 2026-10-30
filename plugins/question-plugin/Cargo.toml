@@ -39,6 +39,7 @@ native = ["dep:bcode_plugin_models", "dep:bcode_plugin_sdk"]
 presentation = [
     "dep:bcode_plugin_models",
     "dep:bcode_tui_components",
+    "bcode_tui_components/transcript-engine",
     "dep:bmux_keyboard",
     "dep:bmux_text_edit",
     "dep:bmux_tui",

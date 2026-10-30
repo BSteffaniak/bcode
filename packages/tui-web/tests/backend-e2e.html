@@ -5,6 +5,9 @@
 <pre id="result">pending</pre>
 <script type="module">
 const output = document.getElementById('result');
+const { committedCheckpoint } = await import('/production-evidence.mjs');
+const checkpoints = [];
+let semanticRegions = [];
 const assert = (value, message) => { if (!value) throw new Error(message); };
 const wait = async (predicate, label) => {
   const until = performance.now() + 15000;
@@ -46,7 +49,9 @@ try {
   let discard = true, dropped;
   const realFetch = globalThis.fetch.bind(globalThis);
   // Fault injection occurs AFTER the real server replies. No response is fabricated.
+  let requests = 0;
   const transport = async (url, options) => {
+    requests++;
     const response = await realFetch(url, options);
     if (new URL(url).pathname.endsWith('/submit-message')) {
       operations.push(JSON.parse(options.body));
@@ -60,13 +65,15 @@ try {
     }
     return response;
   };
-  const mount = () => mountBrowserSession({
+  const cellWidth = 9, cellHeight = 18;
+  const mount = () => mountBrowserSession({cellWidth, cellHeight,
     wasm, mountInteractiveSurface,
     container: document.getElementById('host'), canvas: document.getElementById('canvas'),
     sessionId: configuration.session, token: configuration.token,
     backendOrigin: location.origin, fetch: transport, recoveryState,
     // Manual observations below avoid timing-dependent overlap with mutation admission.
     pollMs: 60000, requestTimeoutMs: 60000,
+    onSemantics: regions => { semanticRegions = regions; },
     onError: error => errors.push(error),
   });
   const api = async (path, body, token = configuration.token) => {
@@ -80,9 +87,10 @@ try {
   const unauthorized = {session_id: configuration.session, submission_id: 'unauthorized-e2e', text: 'must never be accepted'};
   assert((await api('/api/session-view/submit-message', unauthorized, 'wrong-token')).error === 'unauthorized', 'write auth rejection');
   mounted = await mount();
-  mounted.focus();
+  checkpoints.push(await committedCheckpoint('initial', canvas, semanticRegions,
+    {label:'Session composer', cellWidth, cellHeight}));
   const editor = document.querySelector('[data-bmux-input]');
-  assert(editor, 'real BMUX input bridge missing');
+  assert(editor && document.activeElement === editor, 'committed composer geometry did not focus real BMUX input');
   editor.value = text;
   editor.dispatchEvent(new InputEvent('input', {inputType:'insertText', data:text, bubbles:true}));
   await wait(() => {
@@ -91,8 +99,14 @@ try {
   }, 'visible editor text').catch(error => {
     throw new Error(`${error.message}; canvas=${canvas.width}x${canvas.height}; output=${drawn.join('').slice(-4000)}`);
   });
-  editor.dispatchEvent(new KeyboardEvent('keydown', {key:'Enter', code:'Enter', bubbles:true, cancelable:true}));
-  await wait(() => errors.length > 0 && dropped, 'ambiguous post-commit response');
+  checkpoints.push(await committedCheckpoint('editor', canvas, semanticRegions));
+  assert(checkpoints[0].pixel_sha256 !== checkpoints[1].pixel_sha256, 'editor did not change committed pixels');
+  editor.dispatchEvent(new KeyboardEvent('keydown', {key:'Enter', code:'Enter', ctrlKey:true, bubbles:true, cancelable:true}));
+  await wait(() => errors.length > 0 && dropped, 'ambiguous post-commit response').catch(error => {
+    throw new Error(`${error.message}; operations=${operations.length}; errors=${errors.map(String).join('; ')}; dropped=${JSON.stringify(dropped)}`);
+  });
+  assert(dropped.outcome?.type === 'submission_accepted',
+    `first request did not commit: ${JSON.stringify(dropped)}`);
   assert(operations.length === 1, 'unexpected implicit resubmission');
   await mounted.dispose();
   mounted = undefined;
@@ -120,6 +134,32 @@ try {
   await mounted.dispose();
   mounted = await mount();
   await wait(() => drawn.join('').includes(`fake: ${text}`), 'visible real assistant transcript');
+  checkpoints.push(await committedCheckpoint('transcript', canvas, semanticRegions));
+  const guard = {session_id: configuration.session, epoch: snapshot.epoch, revision: snapshot.revision};
+  const missingPermission = {type:'permission', permission_id:'never-issued-e2e', approved:true, remember:false};
+  const staleChecks = [
+    [{...guard, epoch:'00000000-0000-4000-8000-000000000000', action:missingPermission}, 'stale_observation'],
+    [{...guard, revision:0, action:missingPermission}, 'stale_observation'],
+    [{...guard, action:{type:'invoke', service:'filesystem', operation:'read'}}, 'invalid_request'],
+    [{...guard, action:missingPermission, execution:{provider:'not-allowed'}}, 'invalid_request'],
+  ];
+  for (const [operation, expected] of staleChecks) {
+    const response = await api('/api/session-view/control', operation);
+    assert(response.error === expected, `negative control expected ${expected}: ${JSON.stringify(response)}`);
+  }
+  const missing = await api('/api/session-view/control', {...guard, action:missingPermission});
+  assert(missing.error === 'stale_control', `unknown permission identity: ${JSON.stringify(missing)}`);
+  for (const action of [
+    {type:'permission_batch', batch_id:'never-issued-batch-e2e', approved:true},
+    {type:'interaction', interaction_id:'never-issued-interaction-e2e', input:{type:'submit', value:{answer:'must not resolve'}}},
+  ]) {
+    const observed = await api(snapshotPath);
+    const response = await api('/api/session-view/control', {
+      session_id: configuration.session, epoch: observed.epoch, revision: observed.revision, action,
+    });
+    assert(response.error === 'stale_control', `unknown identity accepted: ${JSON.stringify(response)}`);
+  }
+  await mounted.refresh();
   const historyDraft = 'draft retained across canonical history navigation';
   const historyInput = document.querySelector('[data-bmux-input]');
   historyInput.value = historyDraft;
@@ -140,10 +180,26 @@ try {
   const image = document.getElementById('canvas').getContext('2d').getImageData(0, 0, 900, 540).data;
   const background = Array.from(image.slice(0, 4));
   assert(image.some((channel, index) => channel !== background[index % 4]), 'Canvas contains no visible ink');
-  await mounted.dispose();
+  checkpoints.push(await committedCheckpoint('history-resize', canvas, semanticRegions));
+  const disposedEditor = document.querySelector('[data-bmux-input]');
+  const disposed = mounted;
+  await disposed.dispose();
   mounted = undefined;
+  const requestsAtDispose = requests;
+  disposedEditor.value = 'disposed must not submit';
+  disposedEditor.dispatchEvent(new InputEvent('input', {inputType:'insertText', data:disposedEditor.value, bubbles:true}));
+  disposedEditor.dispatchEvent(new KeyboardEvent('keydown', {key:'Enter', code:'Enter', bubbles:true, cancelable:true}));
+  await disposed.refresh();
+  await disposed.retrySubmission();
+  await disposed.dispose();
+  await new Promise(resolve => setTimeout(resolve, 100));
+  assert(requests === requestsAtDispose, 'disposed instance performed network operations');
+  assert(semanticRegions.length === 0, 'dispose retained semantic regions');
   CanvasRenderingContext2D.prototype.fillText = originalFillText;
-  output.textContent = JSON.stringify({passed:true, text, receipt,
+  const { runProductionScenarios } = await import('/production-scenarios.mjs');
+  const scenarios = await runProductionScenarios({configuration, wasm, mountInteractiveSurface, mountBrowserSession});
+  output.textContent = JSON.stringify({passed:true, text, receipt, checkpoints, scenarios,
+    negative_controls: staleChecks.length + 3, disposed_requests: requests - requestsAtDispose,
     evidence:['real WASM Canvas editor input', 'real deterministic provider transcript',
       'post-commit dropped response', 'remount exact retry identical receipt',
       'read/write auth rejection', 'conflicting payload and execution-authority rejection',

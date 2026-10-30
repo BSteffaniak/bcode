@@ -43,15 +43,22 @@ tracing = { workspace = true }
 url = { workspace = true }
 
 [dev-dependencies]
-bcode_agent_runtime        = { workspace = true }
-bcode_config               = { workspace = true }
+bcode_agent_runtime = { workspace = true }
+bcode_config = { workspace = true }
 bcode_fake_provider_plugin = { workspace = true, features = ["static-bundled"] }
-bcode_ipc                  = { workspace = true }
-bcode_model_catalog        = { workspace = true }
-bcode_plugin               = { workspace = true }
-bcode_server               = { workspace = true }
-tempfile                   = { workspace = true }
-tokio                      = { workspace = true, features = ["macros", "rt-multi-thread", "net"] }
+bcode_filesystem_plugin = { workspace = true, features = ["static-bundled"] }
+bcode_ipc = { workspace = true }
+bcode_model_catalog = { workspace = true }
+bcode_plugin = { workspace = true }
+bcode_question_plugin = { workspace = true, features = ["static-bundled"] }
+bcode_server = { workspace = true }
+bcode_shell_plugin = { workspace = true, default-features = false, features = [
+    "static-bundled",
+] }
+bcode_tui = { workspace = true }
+bcode_tui_web = { workspace = true }
+tempfile = { workspace = true }
+tokio = { workspace = true, features = ["macros", "rt-multi-thread", "net"] }
 
 [features]
 default = []
@@ -72,4 +79,5 @@ renderer-html-actix = [
 static-bundled-question-plugin = [
     "dep:bcode_bundled_plugins",
     "bcode_bundled_plugins/static-bundled-question-plugin",
+    "bcode_tui/static-bundled-question-plugin",
 ]

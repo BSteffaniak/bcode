@@ -40,16 +40,25 @@ jobs:
         id: chrome
       - name: Build one immutable matched browser distribution
         run: bash scripts/build-tui-web.sh "$RUNNER_TEMP/bcode-browser-bundle"
+      - name: Archive fresh assets and extract the acceptance input
+        run: |
+          tar -C "$RUNNER_TEMP" -czf "$RUNNER_TEMP/bcode-browser-${GITHUB_SHA}.tar.gz" bcode-browser-bundle
+          cd "$RUNNER_TEMP"
+          sha256sum "bcode-browser-${GITHUB_SHA}.tar.gz" > "bcode-browser-${GITHUB_SHA}.tar.gz.sha256"
+          sha256sum --check "bcode-browser-${GITHUB_SHA}.tar.gz.sha256"
+          mkdir accepted-browser
+          tar --no-same-owner -xzf "bcode-browser-${GITHUB_SHA}.tar.gz" -C accepted-browser
+          diff -r bcode-browser-bundle accepted-browser/bcode-browser-bundle
       - name: Real distribution compatibility and rollback checks
-        run: python3 scripts/test-tui-web-e2e.py --self-test --bundle "$RUNNER_TEMP/bcode-browser-bundle"
+        run: python3 scripts/test-tui-web-e2e.py --self-test --bundle "$RUNNER_TEMP/accepted-browser/bcode-browser-bundle"
       - name: Validate distribution staging and extracted rollback behavior
-        run: BCODE_E2E_BUNDLE="$RUNNER_TEMP/bcode-browser-bundle" nix develop --command cargo test --locked -p xtask browser_distribution_rejects_tamper_and_accepts_exact_rollback -- --ignored --exact tests::browser_distribution_rejects_tamper_and_accepts_exact_rollback
+        run: BCODE_E2E_BUNDLE="$RUNNER_TEMP/accepted-browser/bcode-browser-bundle" nix develop --command cargo test --locked -p xtask browser_distribution_rejects_tamper_and_accepts_exact_rollback -- --ignored --exact tests::browser_distribution_rejects_tamper_and_accepts_exact_rollback
       - name: Validate loader tamper and mixed-protocol rejection
         run: nix develop --command cargo test --locked -p bcode_hyperchad --features renderer-html-actix --lib html_actix::tui_assets::tests
       - name: Production Actix, real WASM, isolated fake provider and durable restart
         env:
           BCODE_E2E_CHROMIUM: ${{ steps.chrome.outputs.chrome-path }}
-          BCODE_E2E_BUNDLE: ${{ runner.temp }}/bcode-browser-bundle
+          BCODE_E2E_BUNDLE: ${{ runner.temp }}/accepted-browser/bcode-browser-bundle
         run: |
           nix develop --command bash -euc '
             export BCODE_E2E_PYTHON="$(command -v python3)"
@@ -57,11 +66,6 @@ jobs:
               --test browser_e2e real_wasm_registered_router_durable_retry_and_restart \
               -- --ignored --exact --nocapture
           '
-      - name: Archive exactly the accepted distribution
-        run: |
-          tar -C "$RUNNER_TEMP" -czf "$RUNNER_TEMP/bcode-browser-${GITHUB_SHA}.tar.gz" bcode-browser-bundle
-          cd "$RUNNER_TEMP"
-          sha256sum "bcode-browser-${GITHUB_SHA}.tar.gz" > "bcode-browser-${GITHUB_SHA}.tar.gz.sha256"
       - uses: actions/upload-artifact@v4
         with:
           name: bcode-browser-${{ github.sha }}

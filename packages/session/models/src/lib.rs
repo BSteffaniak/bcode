@@ -131,6 +131,12 @@ impl SessionSummaryRebuildBudget {
     }
 }
 
+pub mod turn_continuation;
+pub use turn_continuation::*;
+
+pub mod durable_interaction;
+pub use durable_interaction::*;
+
 pub mod application;
 pub use application::*;
 
@@ -1482,7 +1488,7 @@ mod checked_tool_projection_tests {
 }
 
 /// Current persisted session event schema version.
-pub const CURRENT_SESSION_EVENT_SCHEMA_VERSION: u16 = 52;
+pub const CURRENT_SESSION_EVENT_SCHEMA_VERSION: u16 = 53;
 
 /// Stable persisted event kinds emitted by the current session schema.
 ///
@@ -1539,6 +1545,8 @@ pub const CURRENT_PERSISTED_SESSION_EVENT_KINDS: &[&str] = &[
     "milestone_published",
     "milestone_evaluation_completed",
     "automatic_title_updated",
+    "durable_interaction_committed",
+    "turn_continuation_committed",
     "session_renamed",
     "skill_activated",
     "skill_context_loaded",
@@ -1563,6 +1571,8 @@ pub const CURRENT_PERSISTED_SESSION_EVENT_KINDS: &[&str] = &[
 #[must_use]
 pub const fn persisted_session_event_kind_name(kind: &SessionEventKind) -> &'static str {
     match kind {
+        SessionEventKind::TurnContinuationCommitted { .. } => "turn_continuation_committed",
+        SessionEventKind::DurableInteractionCommitted { .. } => "durable_interaction_committed",
         SessionEventKind::SessionCreated { .. } => "session_created",
         SessionEventKind::ClientAttached { .. } => "client_attached",
         SessionEventKind::ClientDetached { .. } => "client_detached",
@@ -5281,6 +5291,14 @@ pub enum SessionEventKind {
     AutomaticTitleUpdated {
         evaluation_id: String,
         title: String,
+    },
+    /// Versioned opt-in domain checkpoint transition; publication requires the new writer contract.
+    DurableInteractionCommitted {
+        operation: DurableInteractionOperation,
+    },
+    /// Original accepted-turn continuation transition; staged and publication-disabled.
+    TurnContinuationCommitted {
+        operation: Box<TurnContinuationOperation>,
     },
 }
 

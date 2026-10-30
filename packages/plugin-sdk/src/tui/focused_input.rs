@@ -68,7 +68,9 @@ pub struct FocusedTextFieldEdit {
 /// Owners call `observe` on ordinary edits, undo/redo, cursor/selection and eligibility
 /// transitions (including focus away and back without painting), and `painted` after
 /// visible presentation. Never mark secrets eligible. Semantic callbacks stay owner-owned.
-#[derive(Debug, PartialEq, Eq)]
+/// Clones are speculative snapshots of the same field lifetime, not independent
+/// simultaneous owners. Commit only one candidate after successful presentation.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FocusedTextFieldAdapter {
     identity: FocusedTextFieldIdentity,
     generation: u64,

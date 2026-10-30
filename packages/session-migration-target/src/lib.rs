@@ -457,6 +457,42 @@ mod tests {
     }
 
     #[test]
+    fn exact_ledger_does_not_bypass_noncurrent_writer_fence() {
+        let mut facts = StorageCompatibilityFacts {
+            current_migration_ids: vec!["base".to_owned()],
+            migration_rows: vec![MigrationLedgerRow {
+                id: "base".to_owned(),
+                status: "completed".to_owned(),
+            }],
+            contract_table_exists: true,
+            contract_schema_version: Some(1),
+            writer_epoch: Some(u64::from(CURRENT_WRITER_EPOCH - 1)),
+            expected_contract_schema_version: 1,
+            legacy_writer_epoch: 1,
+        };
+        let unchanged = facts.clone();
+        assert_eq!(
+            classify_storage_facts(&facts),
+            Ok(StorageCompatibility::MigrationRequired {
+                writer_epoch: u64::from(CURRENT_WRITER_EPOCH - 1),
+            })
+        );
+        assert_eq!(facts, unchanged);
+        facts.writer_epoch = Some(u64::from(CURRENT_WRITER_EPOCH));
+        assert_eq!(
+            classify_storage_facts(&facts),
+            Ok(StorageCompatibility::Current {
+                writer_epoch: u64::from(CURRENT_WRITER_EPOCH),
+            })
+        );
+        facts.writer_epoch = Some(u64::from(CURRENT_WRITER_EPOCH + 1));
+        assert!(matches!(
+            classify_storage_facts(&facts),
+            Err(StorageCompatibilityError::WriterEpoch { .. })
+        ));
+    }
+
+    #[test]
     fn target_api_models_are_policy_free_current_capabilities() {
         let row = CanonicalRow {
             sequence: 7,

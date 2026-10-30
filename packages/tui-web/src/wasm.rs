@@ -1,4 +1,8 @@
 //! WASM entrypoint. The JS owner must serialize calls and await presentation.
+use std::{
+    cell::{RefCell, RefMut},
+    rc::Rc,
+};
 use wasm_bindgen::prelude::*;
 
 use bmux_tui::damage::Damage;
@@ -10,9 +14,15 @@ use crate::SessionSurface;
 /// so reentrant calls fail closed rather than borrowing mutable state over await.
 #[wasm_bindgen]
 pub struct BrowserSession {
-    surface: Option<SessionSurface>,
-    canvas: Option<CanvasRenderer>,
+    surface: Rc<RefCell<Option<SessionSurface>>>,
+    canvas: Rc<RefCell<Option<CanvasRenderer>>>,
     disposed: bool,
+}
+
+#[wasm_bindgen]
+extern "C" {
+    #[wasm_bindgen(js_namespace = console, js_name = error)]
+    fn report_panic(message: &str);
 }
 
 fn error(message: &str) -> JsValue {
@@ -34,9 +44,18 @@ impl BrowserSession {
         cell_width: f64,
         cell_height: f64,
     ) -> Result<Self, JsValue> {
+        std::panic::set_hook(Box::new(|info| {
+            report_panic(&info.to_string());
+        }));
         Ok(Self {
-            surface: Some(SessionSurface::new(session, width, height).map_err(error)?),
-            canvas: Some(CanvasRenderer::new(canvas_id, cell_width, cell_height)?),
+            surface: Rc::new(RefCell::new(Some(
+                SessionSurface::new(session, width, height).map_err(error)?,
+            ))),
+            canvas: Rc::new(RefCell::new(Some(CanvasRenderer::new(
+                canvas_id,
+                cell_width,
+                cell_height,
+            )?))),
             disposed: false,
         })
     }
@@ -47,6 +66,19 @@ impl BrowserSession {
     /// Rejects disposed/busy state or invalid/stale semantic observations.
     pub fn accept_snapshot(&mut self, json: &str) -> Result<bool, JsValue> {
         self.surface()?.accept_snapshot(json).map_err(error)
+    }
+
+    /// Monotonic milliseconds from the platform clock, before the next input.
+    ///
+    /// # Errors
+    /// Rejects disposed/busy state.
+    pub fn set_event_time(&mut self, millis: f64) -> Result<(), JsValue> {
+        if !millis.is_finite() || millis < 0.0 || millis > 9_007_199_254_740_991.0 {
+            return Err(error("invalid monotonic event time"));
+        }
+        #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+        self.surface()?.set_event_time(millis as u64);
+        Ok(())
     }
 
     /// A normalized BMUX bridge event. Pointer coordinates are cell coordinates.
@@ -90,6 +122,7 @@ impl BrowserSession {
             return Err(error("surface disposed"));
         }
         self.canvas
+            .borrow_mut()
             .as_mut()
             .ok_or_else(|| error("presentation in progress"))?
             .set_metrics(cell_width, cell_height, font, baseline)?;
@@ -100,32 +133,43 @@ impl BrowserSession {
     ///
     /// # Errors
     /// Rejects disposed/busy state, presentation limits or Canvas output failure.
-    // Browser DOM futures are single-thread-local by platform definition.
-    #[allow(clippy::future_not_send)]
-    pub async fn present(&mut self) -> Result<bool, JsValue> {
+    pub fn present(&mut self) -> Result<JsValue, JsValue> {
         if self.disposed {
             return Err(error("surface disposed"));
         }
-        let mut surface = self
+        let surface = self
             .surface
+            .borrow_mut()
             .take()
             .ok_or_else(|| error("presentation in progress"))?;
-        let Some(mut canvas) = self.canvas.take() else {
-            self.surface = Some(surface);
+        let Some(canvas) = self.canvas.borrow_mut().take() else {
+            self.surface.borrow_mut().replace(surface);
             return Err(error("presentation in progress"));
         };
-        surface.prepare();
-        let inner = &mut surface.inner;
-        let result = surface
-            .local
-            .present_canvas(&mut canvas, Damage::Full, |cx| inner.paint(cx))
-            .await;
-        if matches!(result, Ok(true)) {
-            surface.commit_output();
-        }
-        self.surface = Some(surface);
-        self.canvas = Some(canvas);
-        result
+        let surface_slot = Rc::clone(&self.surface);
+        let canvas_slot = Rc::clone(&self.canvas);
+        // Return an owned future: no wasm-bindgen exported-object borrow crosses
+        // await. Reentrant calls see empty slots and fail closed until restoration.
+        Ok(wasm_bindgen_futures::future_to_promise(async move {
+            let mut surface = surface;
+            let mut canvas = canvas;
+            let checkpoint = surface.stage_question();
+            surface.prepare();
+            let inner = &mut surface.inner;
+            let result = surface
+                .local
+                .present_canvas(&mut canvas, Damage::Full, |cx| inner.paint(cx))
+                .await;
+            if matches!(result, Ok(true)) {
+                surface.commit_output();
+            } else {
+                surface.restore_question(checkpoint);
+            }
+            surface_slot.borrow_mut().replace(surface);
+            canvas_slot.borrow_mut().replace(canvas);
+            result.map(JsValue::from)
+        })
+        .into())
     }
 
     /// Capture a submission identity generated once by browser crypto.randomUUID.
@@ -134,7 +178,7 @@ impl BrowserSession {
     /// # Errors
     /// Rejects disposed/busy state, invalid identity, empty or oversized drafts.
     pub fn prepare_submission(&mut self, identity: String) -> Result<String, JsValue> {
-        let surface = self.surface()?;
+        let mut surface = self.surface()?;
         let draft = surface.draft().to_owned();
         surface
             .inner
@@ -214,6 +258,62 @@ impl BrowserSession {
         height: u32,
     ) -> Result<bool, JsValue> {
         Ok(self.surface()?.accept_image(bytes, width, height))
+    }
+
+    /// Claim one Rust-selected producer artifact page. JS transports opaque request JSON only.
+    ///
+    /// # Errors
+    /// Rejects invalid clock values and disposed/busy state.
+    pub fn next_visual_artifact(&mut self, now_ms: u64) -> Result<Option<String>, JsValue> {
+        self.surface()?.next_visual_artifact(now_ms).map_err(error)
+    }
+
+    /// Release an exact failed transport claim; bounded retry is scheduled by Rust.
+    ///
+    /// # Errors
+    /// Rejects disposed/busy state.
+    pub fn fail_visual_artifact(&mut self, claim: &str, now_ms: u64) -> Result<(), JsValue> {
+        self.surface()?.fail_visual_artifact(claim, now_ms);
+        Ok(())
+    }
+
+    /// Accept the original response bytes for one live claim; true requests redraw.
+    ///
+    /// # Errors
+    /// Rejects expired/foreign claims, stale geometry and invalid range metadata.
+    pub fn accept_visual_artifact_claim(
+        &mut self,
+        claim: &str,
+        json: &str,
+        now_ms: u64,
+    ) -> Result<bool, JsValue> {
+        self.surface()?
+            .accept_visual_artifact_claim(claim, json, now_ms)
+            .map_err(error)
+    }
+
+    /// Prepare an observation-fenced producer visual range through the narrow artifact port.
+    ///
+    /// # Errors
+    /// Rejects disposed/busy state, stale references and oversized ranges.
+    pub fn prepare_visual_artifact(
+        &mut self,
+        item_id: &str,
+        reference_key: &str,
+        offset: u64,
+        length: u32,
+    ) -> Result<String, JsValue> {
+        self.surface()?
+            .prepare_visual_artifact(item_id, reference_key, offset, length)
+            .map_err(error)
+    }
+
+    /// Accept exact canonical range bytes into the registered producer implementation.
+    ///
+    /// # Errors
+    /// Rejects stale identities, resize/config changes and malformed ranges.
+    pub fn accept_visual_artifact(&mut self, json: &str) -> Result<bool, JsValue> {
+        self.surface()?.accept_visual_artifact(json).map_err(error)
     }
 
     /// Prepare a bounded canonical artifact range from an accepted semantic reference.
@@ -312,20 +412,19 @@ impl BrowserSession {
             return Ok(());
         }
         self.surface()?.cancel_pointer();
-        self.surface = None;
-        self.canvas = None;
+        self.surface.borrow_mut().take();
+        self.canvas.borrow_mut().take();
         self.disposed = true;
         Ok(())
     }
 }
 
 impl BrowserSession {
-    fn surface(&mut self) -> Result<&mut SessionSurface, JsValue> {
+    fn surface(&mut self) -> Result<RefMut<'_, SessionSurface>, JsValue> {
         if self.disposed {
             return Err(error("surface disposed"));
         }
-        self.surface
-            .as_mut()
-            .ok_or_else(|| error("presentation in progress"))
+        RefMut::filter_map(self.surface.borrow_mut(), Option::as_mut)
+            .map_err(|_| error("presentation in progress"))
     }
 }

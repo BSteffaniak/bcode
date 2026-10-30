@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import { readFile } from 'node:fs/promises';
 // Source module has no Node/package dependencies; packaging selects its module URL.
 const source = await readFile(new URL('../src/browser-session.js', import.meta.url), 'utf8');
-const { readBounded, backendBase, mountBrowserSession, commitSemanticRegions, decodeArtifactImage } = await import(`data:text/javascript;base64,${Buffer.from(source).toString('base64')}`);
+const { readBounded, backendBase, mountBrowserSession, commitSemanticRegions, decodeArtifactImage, createBrowserPlatformPorts } = await import(`data:text/javascript;base64,${Buffer.from(source).toString('base64')}`);
 
 function response(chunks, headers = {}) {
   let cancelled = false;
@@ -23,7 +23,7 @@ const ID = '00000000-0000-4000-8000-000000000002';
 
 // Host contract double only: native semantic validation and real Canvas/browser
 // behavior require their owning native tests and packaged browser smoke harness.
-async function fixture({ fetch, recoveryState = {}, timeout = 1000, fault, signal, capabilities = {}, intents = [] } = {}) {
+async function fixture({ fetch, recoveryState = {}, timeout = 1000, fault, signal, capabilities = {}, intents = [], visualReferences, acceptVisual } = {}) {
   const calls = [], errors = [], results = [], accessibility = [], instances = [], bodies = [], states = [], semantics = [];
   let callbacks;
   class BrowserSession {
@@ -37,9 +37,30 @@ async function fixture({ fetch, recoveryState = {}, timeout = 1000, fault, signa
       if (this.epoch !== null && this.epoch !== epoch) throw 'server epoch changed; remount required';
       this.epoch = epoch; calls.push(`accept:${epoch}`);
     }
+    next_visual_artifact(now) {
+      this.check(); assert.equal(typeof now, 'bigint');
+      const reference = visualReferences?.shift();
+      if (!reference) return null;
+      const claim = String(calls.filter(value => value === 'visual-claim').length + 1);
+      calls.push('visual-claim'); this.visualClaim = reference.lease?.claim ?? claim;
+      if (reference.lease) return JSON.stringify({ claim, ...reference.lease });
+      if (reference.length < 1 || reference.length > 65536) throw new Error('native visual range rejected');
+      return JSON.stringify({ claim, request_json: this.prepare_artifact(reference.item_id, reference.reference_key, BigInt(reference.offset), reference.length) });
+    }
+    fail_visual_artifact(claim, now) {
+      this.check(); assert.equal(typeof now, 'bigint'); assert.equal(claim, this.visualClaim);
+      calls.push('visual-fail'); this.visualClaim = null;
+    }
+    accept_visual_artifact_claim(claim, json, now) {
+      this.check(); assert.equal(typeof now, 'bigint'); assert.equal(claim, this.visualClaim);
+      calls.push('visual-accept');
+      const result = acceptVisual ? acceptVisual(json, claim, now) : true;
+      this.visualClaim = null;
+      return result;
+    }
     prepare_image() { this.check(); return true; }
     accept_image(bytes, width, height) { this.check(); calls.push('image'); return bytes.length === width * height * 4; }
-    prepare_artifact(item, reference, offset, length) { this.check(); return `{"session_id":"${SESSION}","item_id":${JSON.stringify(item)},"reference_key":${JSON.stringify(reference)},"offset":${offset},"length":${length}}`; }
+    prepare_artifact(item, reference, offset, length) { this.check(); return `{"session_id":"${SESSION}","epoch":"${ID}","revision":18446744073709551615,"observation":${JSON.stringify(this.epoch)},"item_id":${JSON.stringify(item)},"reference_key":${JSON.stringify(reference)},"offset":${offset},"length":${length}}`; }
     accept_history(json, direction) { this.check(); calls.push(`history:${direction}`); this.accept_snapshot(json); }
     input(json) { this.check(); const event = JSON.parse(json); calls.push(`input:${event.type ?? 'test'}`); if (event.text) this.draft = event.text; return event.submit === true; }
     async present() { this.check(); this.active = true; await tick(); this.active = false; calls.push('present'); return fault !== 'uncommitted'; }
@@ -84,7 +105,7 @@ async function fixture({ fetch, recoveryState = {}, timeout = 1000, fault, signa
     dispose() { this.check(); calls.push('dispose'); }
     free() { this.check(); this.freed = true; calls.push('free'); }
   }
-  const window = { location: { origin: 'https://ui.example' }, crypto: { randomUUID: () => ID }, setTimeout, clearTimeout };
+  const window = { performance: { now: () => 1234.9 }, location: { origin: 'https://ui.example' }, crypto: { randomUUID: () => ID }, setTimeout, clearTimeout };
   const canvas = { id: 'canvas' }, container = { ownerDocument: { defaultView: window } };
   const mounting = mountBrowserSession({
     wasm: { BrowserSession }, container, canvas, sessionId: SESSION, token: 'private-launch', recoveryState,
@@ -101,6 +122,39 @@ async function fixture({ fetch, recoveryState = {}, timeout = 1000, fault, signa
   });
   return { mounting, calls, errors, results, accessibility, instances, bodies, states, semantics, recoveryState, get callbacks() { return callbacks; } };
 }
+
+test('refresh stages semantics without erasing committed targets and fences pending input', async t => {
+  const f = await fixture(); const host = await f.mounting;
+  t.after(() => host.dispose());
+  const session = f.instances[0];
+  const regions = [{ id: 'question-0.option-1', disabled: false,
+    area: { x: 0, y: 0, width: 4, height: 1 } }];
+  session.accessibility = () => JSON.stringify({ label: 'Question', description: '', regions });
+  await host.refresh();
+  const publications = f.semantics.length;
+  let release, entered;
+  const pending = new Promise(resolve => { release = resolve; });
+  const started = new Promise(resolve => { entered = resolve; });
+  session.present = async () => { entered(); await pending; return true; };
+  const refreshing = host.refresh();
+  await started;
+  assert.equal(f.semantics.length, publications);
+  assert.deepEqual(f.semantics.at(-1), regions);
+  assert.equal(f.callbacks.mapPoint({ x: 1, y: 1 }), null);
+  release(); await refreshing;
+  assert.deepEqual(f.semantics.at(-1), regions);
+  assert.notEqual(f.callbacks.mapPoint({ x: 1, y: 1 }), null);
+  session.present = async () => false;
+  await host.refresh();
+  assert.deepEqual(f.semantics.at(-1), []);
+  assert.equal(f.callbacks.mapPoint({ x: 1, y: 1 }), null);
+  session.present = async () => true;
+  await host.refresh();
+  session.present = async () => { throw new Error('output failed'); };
+  await assert.rejects(host.refresh(), /output failed/);
+  assert.deepEqual(f.semantics.at(-1), []);
+  assert.equal(f.callbacks.mapPoint({ x: 1, y: 1 }), null);
+});
 
 test('streamed byte budget and invalid UTF-8 fail closed', async () => {
   const r = response([new Uint8Array(3), new Uint8Array(3)]);
@@ -130,6 +184,19 @@ test('backend origins require explicit consent and secure transport', () => {
   assert.throws(() => backendBase('https://api.example', location));
   assert.equal(backendBase('https://api.example', location, ['https://api.example']).origin, 'https://api.example');
   for (const origin of ['https://user:pass@ui.example', 'https://ui.example/path', 'http://remote.example', 'file:///']) assert.throws(() => backendBase(origin, location));
+});
+
+test('Bcode bridge captures modified commands for the effective Rust keymap', async () => {
+  const f = await fixture();
+  const host = await f.mounting;
+  const capture = f.callbacks.isCapturedKey;
+  assert.equal(capture({key: 'Enter', ctrlKey: true}), true);
+  assert.equal(capture({key: 'x', ctrlKey: true, altKey: true}), true);
+  assert.equal(capture({key: 'k', metaKey: true}), true);
+  assert.equal(capture({key: 'ArrowLeft'}), true);
+  assert.equal(capture({key: 'a'}), false);
+  assert.equal(capture({key: 'x'.repeat(65), ctrlKey: true}), false);
+  await host.dispose();
 });
 
 test('ambiguous retries use exact payload and only matched receipt clears draft', async () => {
@@ -388,6 +455,58 @@ test('unknown control lock survives remount and explicit acknowledgement sends n
   } finally { await host.dispose(); }
 });
 
+test('artifact image admission honors Rust rejection and uses the retained presentation', async t => {
+  const originalBitmap = globalThis.createImageBitmap, originalCanvas = globalThis.OffscreenCanvas;
+  t.after(() => { globalThis.createImageBitmap = originalBitmap; globalThis.OffscreenCanvas = originalCanvas; });
+  let closed = 0;
+  globalThis.createImageBitmap = async () => ({ width: 1, height: 1, close() { closed++; } });
+  globalThis.OffscreenCanvas = class {
+    getContext() { return { drawImage() {}, getImageData() { return { data: new Uint8ClampedArray([255, 0, 0, 255]) }; } }; }
+  };
+  for (const accepted of [true, false]) {
+    const f = await fixture({ fetch: async url => url.pathname.endsWith('/artifact')
+      ? jsonResponse({ reference_key: 'image', content_type: 'image/png', bytes: [137], offset: 0, total_bytes: 1 })
+      : jsonResponse({ epoch: 'first' }) });
+    const host = await f.mounting;
+    try {
+      const before = f.calls.filter(call => call === 'present').length;
+      f.instances[0].accept_image = (bytes, width, height) => {
+        assert.deepEqual(Array.from(bytes), [255, 0, 0, 255]);
+        assert.equal(width, 1); assert.equal(height, 1);
+        return accepted;
+      };
+      assert.equal(await host.showArtifactImage('item', 'image'), accepted);
+      assert.equal(f.calls.filter(call => call === 'present').length, before + Number(accepted));
+    } finally { await host.dispose(); }
+  }
+  assert.equal(closed, 2);
+});
+
+test('resize during image decoding rejects the old geometry before Rust admission', async t => {
+  const originalBitmap = globalThis.createImageBitmap, originalCanvas = globalThis.OffscreenCanvas;
+  t.after(() => { globalThis.createImageBitmap = originalBitmap; globalThis.OffscreenCanvas = originalCanvas; });
+  let finishDecode, decoded;
+  const started = new Promise(resolve => { decoded = resolve; });
+  globalThis.createImageBitmap = () => new Promise(resolve => { finishDecode = resolve; decoded(); });
+  let closed = false;
+  globalThis.OffscreenCanvas = class {
+    getContext() { return { drawImage() {}, getImageData() { return { data: new Uint8ClampedArray([255, 0, 0, 255]) }; } }; }
+  };
+  const f = await fixture({ fetch: async url => url.pathname.endsWith('/artifact')
+    ? jsonResponse({ reference_key: 'image', content_type: 'image/png', bytes: [137], offset: 0, total_bytes: 1 })
+    : jsonResponse({ epoch: 'first' }) });
+  const host = await f.mounting;
+  try {
+    const work = host.showArtifactImage('item', 'image');
+    await started;
+    f.callbacks.onResize({ width: 180, height: 90, device_pixel_ratio: 1 });
+    finishDecode({ width: 1, height: 1, close() { closed = true; } });
+    assert.equal(await work, false);
+    assert.equal(f.calls.includes('image'), false);
+    assert.equal(closed, true);
+  } finally { await host.dispose(); }
+});
+
 test('artifact image decoder accepts bounded raster only and releases resources', async () => {
   let closed = 0;
   const bitmap = { width:2, height:1, close() { closed++; } };
@@ -428,14 +547,14 @@ test('artifact port uses fenced requests, exact offsets, bounded bytes and no pa
   const f = await fixture({ fetch: async (url, options) => {
     if (url.pathname.endsWith('/artifact')) {
       body = options.body;
-      return jsonResponse({ reference_key: 'image', content_type: 'image/png', bytes: [137,80,78,71], total_bytes: '4' });
+      return response([new TextEncoder().encode('{"reference_key":"image","content_type":"image/png","bytes":[137,80,78,71],"offset":18446744073709551611,"total_bytes":18446744073709551615}')]);
     }
     return jsonResponse({ epoch: 'first' });
   } });
   const host = await f.mounting;
   try {
-    const range = await host.readArtifact('item', 'image', 18446744073709551615n, 16);
-    assert.match(body, /"offset":18446744073709551615/);
+    const range = await host.readArtifact('item', 'image', 18446744073709551611n, 16);
+    assert.match(body, /"offset":18446744073709551611/);
     assert.deepEqual([...range.bytes], [137,80,78,71]);
     assert.equal(range.contentType, 'image/png');
     await assert.rejects(host.readArtifact('item', 'image', 1), /invalid/);
@@ -461,4 +580,296 @@ test('committed semantic mirror is atomic, passive, text-only and clears on empt
   assert.throws(() => commitSemanticRegions(root, [{ ...region, area: { ...region.area, width: 0 } }]), /invalid/);
   commitSemanticRegions(root, []);
   assert.deepEqual(root.nodes, []);
+});
+
+function platformFixture(options = {}) {
+  const nodes = [];
+  const document = { createElement(tag) {
+    return { tag, children: [], events: {}, attributes: {},
+      append(...children) { this.children.push(...children); },
+      addEventListener(type, callback) { this.events[type] = callback; },
+      setAttribute(key, value) { this.attributes[key] = value; },
+      showModal() { this.open = true; }, focus() {}, select() {},
+    };
+  } };
+  const root = { ownerDocument: document, nodes, append(node) { this.nodes.push(node); }, replaceChildren() { this.nodes.length = 0; } };
+  const errors = [];
+  const environment = { location: { origin: 'https://ui.example' }, navigator: {}, ...options.environment };
+  const ports = createBrowserPlatformPorts({ root, environment, signal: options.signal, onError: value => errors.push(value) });
+  return { root, ports, errors, children: () => root.nodes[0]?.children ?? [] };
+}
+
+test('packaged platform ports confirm safe navigation and leave no active link after abort', async () => {
+  const controller = new AbortController();
+  const f = platformFixture({ signal: controller.signal });
+  await f.ports.navigate('https://example.com/path');
+  const anchor = f.children().find(node => node.tag === 'a');
+  assert.equal(anchor.href, 'https://example.com/path');
+  assert.equal(anchor.target, '_blank');
+  assert.equal(anchor.rel, 'noopener noreferrer');
+  assert.equal(anchor.referrerPolicy, 'no-referrer');
+  await assert.rejects(f.ports.navigate('javascript:alert(1)'), /unsafe/);
+  await assert.rejects(f.ports.navigate('https://user:password@example.com'), /unsafe/);
+  assert.equal(f.root.nodes.length, 1);
+  controller.abort();
+  assert.equal(f.root.nodes.length, 0);
+  await assert.rejects(f.ports.navigate('https://example.com'), /disposed/);
+});
+
+test('packaged clipboard has explicit gesture/manual fallback and late denial cannot replace a newer dialog', async () => {
+  let reject;
+  const f = platformFixture({ environment: { navigator: { clipboard: { writeText: () => new Promise((_, fail) => { reject = fail; }) } } } });
+  const copy = f.ports.writeClipboard('selected text');
+  await f.ports.navigate('https://example.com');
+  reject(new Error('permission denied'));
+  await copy;
+  assert.equal(f.children().find(node => node.tag === 'a').href, 'https://example.com/');
+  f.ports.dispose();
+  const fallback = platformFixture();
+  await fallback.ports.writeClipboard('<script>literal</script>');
+  const text = fallback.children().find(node => node.tag === 'textarea');
+  assert.equal(text.value, '<script>literal</script>');
+  assert.equal(text.readOnly, true);
+  assert.equal(fallback.children().filter(node => node.tag === 'button').length, 2);
+  fallback.ports.dispose();
+});
+
+test('packaged artifact download uses canonical endpoint and viewer never interprets HTML', async () => {
+  const f = platformFixture();
+  let release;
+  const request = '{"revision":18446744073709551615,"item_id":"item","reference_key":"original","offset":0,"length":131072}';
+  const url = new URL('https://ui.example/api/session-view/artifact/download');
+  url.searchParams.set('token', 'launch'); url.searchParams.set('request', request);
+  await f.ports.consumeArtifact({ bytes: new TextEncoder().encode('<script>bad()</script>'), contentType: 'text/html', json: '{"offset":0,"total_bytes":40}', downloadURL: url.href,
+    readNext: () => new Promise(resolve => { release = resolve; }) });
+  const anchor = f.children().find(node => node.tag === 'a');
+  assert.equal(new URL(anchor.href).pathname, '/api/session-view/artifact/download');
+  assert.equal(new URL(anchor.href).searchParams.get('request'), request);
+  assert.equal(anchor.download, 'artifact');
+  assert.equal(anchor.referrerPolicy, 'no-referrer');
+  assert.equal(anchor.rel, 'noopener noreferrer');
+  const preview = f.children().find(node => node.tag === 'pre');
+  assert.equal(preview.textContent, '<script>bad()</script>');
+  const next = f.children().find(node => node.textContent === 'Read next range');
+  next.events.click();
+  assert.equal(next.disabled, true);
+  f.ports.dispose();
+  release({ bytes: new Uint8Array([65]), json: '{"offset":1,"total_bytes":2}' });
+  await tick();
+  assert.equal(preview.textContent, '<script>bad()</script>');
+  assert.equal(f.root.nodes.length, 0);
+  const hostile = platformFixture();
+  await assert.rejects(hostile.ports.consumeArtifact({ bytes: new Uint8Array([1]), json: '{}', downloadURL: 'https://evil.example/path' }), /unsafe/);
+  hostile.ports.dispose();
+});
+
+test('producer intents use control uncertainty lock with no automatic retry', async () => {
+  const intents = [{ type: 'producer', action_json: '{"type":"interaction","input":{"type":"cancel"}}' }];
+  let attempts = 0;
+  const f = await fixture({ intents, fetch: async url => {
+    if (url.pathname.endsWith('/control')) { attempts++; throw new Error('ambiguous'); }
+    return jsonResponse({ epoch: 'first' });
+  } });
+  const host = await f.mounting;
+  f.callbacks.onInput({ type: 'key' }); await host.refresh();
+  assert.equal(attempts, 1);
+  assert.equal(f.states.at(-1).controlUncertain, true);
+  intents.push({ type: 'producer', action_json: '{"type":"interaction","input":{"type":"cancel"}}' });
+  f.callbacks.onInput({ type: 'key' }); await host.refresh();
+  assert.equal(attempts, 1);
+  await host.dispose();
+});
+
+test('artifact intent constructs exact canonical download request and incremental reads are bounded', async () => {
+  let consumer, ranges = 0;
+  const intents = [{ type: 'artifact', item_id: 'item', reference_key: 'original' }];
+  const f = await fixture({ intents, capabilities: { consumeArtifact(value) { consumer = value; } }, fetch: async (url, options) => {
+    if (url.pathname.endsWith('/artifact')) {
+      ranges++;
+      const offset = JSON.parse(options.body).offset;
+      return jsonResponse({ artifact_id: 'artifact', reference_key: 'original', reference_revision: 1, finalized: true, complete: true, offset, total_bytes: 2, content_type: 'text/plain', bytes: [offset + 65] });
+    }
+    return jsonResponse({ epoch: 'first' });
+  } });
+  const host = await f.mounting;
+  try {
+    f.callbacks.onInput({ type: 'key' }); await host.refresh();
+    assert.ok(consumer);
+    const url = new URL(consumer.downloadURL);
+    assert.equal(url.pathname, '/api/session-view/artifact/download');
+    assert.equal(url.searchParams.get('token'), 'private-launch');
+    assert.match(url.searchParams.get('request'), /"revision":18446744073709551615/);
+    assert.match(url.searchParams.get('request'), /"offset":0/);
+    assert.deepEqual([...consumer.bytes], [65]);
+    const next = consumer.readNext();
+    await assert.rejects(consumer.readNext(), /expired/);
+    assert.deepEqual([...(await next).bytes], [66]);
+    assert.equal(await consumer.readNext(), null);
+    assert.equal(ranges, 2);
+  } finally { await host.dispose(); }
+  await assert.rejects(consumer.readNext(), /expired/);
+});
+
+test('download preflight suppresses unsafe complete downloads and preserves incremental viewer', async () => {
+  for (const metadata of [
+    { finalized: false, complete: true, total_bytes: 1 },
+    { finalized: true, complete: false, total_bytes: 1 },
+    { finalized: true, complete: true, total_bytes: 67108865 },
+  ]) {
+    let consumer;
+    const f = await fixture({ intents: [{ type: 'artifact', item_id: 'i', reference_key: 'r' }], capabilities: { consumeArtifact: value => { consumer = value; } },
+      fetch: async url => url.pathname.endsWith('/artifact')
+        ? jsonResponse({ ...metadata, offset: 0, reference_key: 'r', bytes: [65] }) : jsonResponse({ epoch: 'first' }) });
+    const host = await f.mounting;
+    f.callbacks.onInput({ type: 'key' }); await host.refresh();
+    assert.equal(consumer.downloadURL, undefined);
+    assert.match(consumer.downloadUnavailable, /Incremental viewing remains available/);
+    assert.equal(typeof consumer.readNext, 'function');
+    const platform = platformFixture();
+    await platform.ports.consumeArtifact(consumer);
+    assert.equal(platform.children().some(node => node.tag === 'a'), false);
+    assert.equal(platform.children().find(node => node.attributes.role === 'status').textContent, consumer.downloadUnavailable);
+    platform.ports.dispose();
+    await host.dispose();
+  }
+});
+
+test('stalled platform port cannot retain WASM after disposal', async () => {
+  let started;
+  const entered = new Promise(resolve => { started = resolve; });
+  const f = await fixture({ intents: [{ type: 'clipboard', text: 'copy' }], capabilities: {
+    writeClipboard() { started(); return new Promise(() => {}); },
+  } });
+  const host = await f.mounting;
+  f.callbacks.onInput({ type: 'key' });
+  await entered;
+  await host.dispose();
+  assert.equal(f.instances[0].freed, true);
+  assert.equal(f.calls.filter(value => value === 'free').length, 1);
+});
+
+test('automatic producer visuals forward opaque exact bytes and redraw only on native acceptance', async () => {
+  const original = '{ "opaque": [60,115,99,114,105,112,116], "revision":18446744073709551615 }';
+  const received = [], requests = [];
+  const references = ['source', 'diff', 'shell'].map(reference_key => ({ item_id: 'producer-item', reference_key, offset: '18446744073709551615', length: 65536 }));
+  const f = await fixture({ visualReferences: references, acceptVisual: json => { received.push(json); return true; }, fetch: async (url, options) => {
+    if (url.pathname.endsWith('/artifact')) {
+      requests.push(options.body);
+      return response([new TextEncoder().encode(original)]);
+    }
+    return jsonResponse({ epoch: 'first' });
+  } });
+  const host = await f.mounting;
+  try {
+    for (let i = 0; i < 20 && received.length < 3; i++) await tick();
+    assert.deepEqual(received, [original, original, original]);
+    assert.equal(requests.length, 3);
+    for (const body of requests) {
+      assert.match(body, /"offset":18446744073709551615/);
+      assert.match(body, /"revision":18446744073709551615/);
+      assert.match(body, /"length":65536/);
+    }
+    assert.equal(f.calls.filter(value => value === 'visual-accept').length, 3);
+    assert.ok(f.calls.filter(value => value === 'present').length >= 4);
+  } finally { await host.dispose(); }
+});
+
+test('producer fetch does not block input and resize, revision, disposal reject late responses', async () => {
+  for (const invalidation of ['resize', 'revision', 'dispose']) {
+    let release, started;
+    const entered = new Promise(resolve => { started = resolve; });
+    const f = await fixture({ visualReferences: [{ item_id: 'i', reference_key: 'source', offset: '0', length: 65536 }], fetch: async url => {
+      if (url.pathname.endsWith('/artifact')) {
+        started(); return new Promise(resolve => { release = resolve; });
+      }
+      return jsonResponse({ epoch: 'first' });
+    } });
+    const host = await f.mounting;
+    await entered;
+    f.callbacks.onInput({ type: 'key', text: 'draft while fetching' });
+    for (let i = 0; i < 5 && !f.calls.includes('input:key'); i++) await tick();
+    assert.ok(f.calls.includes('input:key'));
+    if (invalidation === 'resize') f.callbacks.onResize({ width: 180, height: 90, device_pixel_ratio: 1 });
+    if (invalidation === 'dispose') await host.dispose();
+    else await host.refresh();
+    assert.ok(f.calls.some(value => value === 'input:key'));
+    release(jsonResponse({ opaque: 'late' }));
+    for (let i = 0; i < 5; i++) await tick();
+    assert.equal(f.calls.includes('visual-accept'), false, invalidation);
+    assert.equal(f.calls.filter(value => value === 'visual-fail').length, 1, invalidation);
+    await host.dispose();
+    assert.equal(f.instances[0].freed, true);
+  }
+});
+
+test('lease ABI forwards native request verbatim with floored monotonic bigint time', async () => {
+  const request = '{ "revision":18446744073709551615, "offset":18446744073709551615, "length":65536, "reference_key":"opaque" }';
+  const original = '{ "opaque_producer": "not interpreted by browser", "revision":18446744073709551615 }';
+  let body, receipt;
+  const f = await fixture({ visualReferences: [{ lease: { claim: 'opaque-claim', request_json: request } }],
+    acceptVisual: (json, claim, now) => { receipt = { json, claim, now }; return false; },
+    fetch: async (url, options) => {
+      if (url.pathname.endsWith('/artifact')) { body = options.body; return response([new TextEncoder().encode(original)]); }
+      return jsonResponse({ epoch: 'first' });
+    } });
+  const host = await f.mounting;
+  for (let i = 0; i < 10 && !receipt; i++) await tick();
+  assert.equal(body, request);
+  assert.deepEqual(receipt, { json: original, claim: 'opaque-claim', now: 1234n });
+  const paints = f.calls.filter(value => value === 'present').length;
+  for (let i = 0; i < 5; i++) await tick();
+  assert.equal(f.calls.filter(value => value === 'present').length, paints);
+  assert.equal(f.calls.includes('visual-fail'), false);
+  await host.dispose();
+});
+
+test('lease failures release exactly once on transport, rejection, timeout and invalid request', async () => {
+  for (const mode of ['transport', 'reject', 'timeout', 'invalid-request']) {
+    const f = await fixture({ timeout: 10,
+      visualReferences: [mode === 'invalid-request' ? { lease: { request_json: null } } : { item_id: 'i', reference_key: 'r', offset: '0', length: 65536 }],
+      acceptVisual: () => { throw new Error('native rejected expired or invalid lease'); },
+      fetch: async url => {
+        if (url.pathname.endsWith('/artifact')) {
+          if (mode === 'transport') throw new Error('network failed');
+          if (mode === 'timeout') return new Promise(() => {});
+          return jsonResponse({ opaque: true });
+        }
+        return jsonResponse({ epoch: 'first' });
+      } });
+    const host = await f.mounting;
+    for (let i = 0; i < 30 && !f.calls.includes('visual-fail'); i++) await new Promise(resolve => setTimeout(resolve, 2));
+    assert.equal(f.calls.filter(value => value === 'visual-fail').length, 1, mode);
+    assert.ok(f.errors.length, mode);
+    await host.dispose();
+    assert.equal(f.calls.filter(value => value === 'visual-fail').length, 1, mode);
+  }
+});
+
+test('visual discovery rejects oversized ranges before transport and failed producers do not spin', async () => {
+  for (const length of [65537, 0, 65536]) {
+    let requests = 0;
+    const f = await fixture({ visualReferences: [{ item_id: 'i', reference_key: 'r', offset: '0', length }], fetch: async url => {
+      if (url.pathname.endsWith('/artifact')) { requests++; throw new Error('unavailable'); }
+      return jsonResponse({ epoch: 'first' });
+    } });
+    const host = await f.mounting;
+    for (let i = 0; i < 5; i++) await tick();
+    assert.equal(requests, length === 65536 ? 1 : 0);
+    assert.ok(f.errors.length);
+    await host.dispose();
+  }
+});
+
+test('artifact ranges reject wrong offsets, overflow, quoted integer metadata and wrong reference', async () => {
+  for (const range of [
+    { offset: 1, total_bytes: 2, bytes: [1], reference_key: 'r' },
+    { offset: 0, total_bytes: 0, bytes: [1], reference_key: 'r' },
+    { offset: '0', total_bytes: '1', bytes: [1], reference_key: 'r' },
+    { offset: 0, total_bytes: 1, bytes: [1], reference_key: 'other' },
+  ]) {
+    const f = await fixture({ fetch: async url => url.pathname.endsWith('/artifact') ? jsonResponse(range) : jsonResponse({ epoch: 'first' }) });
+    const host = await f.mounting;
+    await assert.rejects(host.readArtifact('i', 'r'), /invalid/);
+    await host.dispose();
+  }
 });

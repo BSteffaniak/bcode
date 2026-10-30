@@ -17,6 +17,8 @@ pub enum Command {
     PageDown,
     Latest,
     Copy,
+    CancelTurn,
+    FocusInteraction,
     PermissionApprove,
     PermissionDeny,
     SelectUp,
@@ -60,6 +62,8 @@ impl Bindings {
                         "transcript.pageDown" => Some(Command::PageDown),
                         "transcript.bottom" => Some(Command::Latest),
                         "tui.transcript.copySelection" => Some(Command::Copy),
+                        "app.interrupt" => Some(Command::CancelTurn),
+                        "tui.interaction.focusActive" => Some(Command::FocusInteraction),
                         _ => Some(Command::Ignore),
                     }
                 }

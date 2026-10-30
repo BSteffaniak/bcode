@@ -985,6 +985,8 @@ async fn authorize_workspace(
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+
     use super::*;
 
     #[test]
@@ -1306,7 +1308,7 @@ library = "libtest_command_context.dylib"
     #[tokio::test]
     async fn typed_command_admission_preserves_declared_route_and_caller_lifetime() {
         let temp = tempfile::tempdir().unwrap();
-        let state = command_state();
+        let state = Arc::new(command_state());
         assert!(declared_route(
             &state,
             "test.command-context",
@@ -1736,7 +1738,7 @@ library = "libtest_composer_dispatch.dylib"
                 bcode_default_agents_plugin::static_plugin(),
             ),
         ];
-        let state = super::super::tests::test_server_state_with_plugins(
+        let state = Arc::new(super::super::tests::test_server_state_with_plugins(
             bcode_session::SessionManager::default(),
             bcode_plugin::PluginRuntimeHost::load_defaults_with_static_bundled(
                 &bcode_plugin::PluginSelection {
@@ -1750,7 +1752,7 @@ library = "libtest_composer_dispatch.dylib"
                 &plugins,
             )
             .unwrap(),
-        );
+        ));
         let root = temp.path().canonicalize().unwrap();
         let client = ClientId::new();
         state
@@ -2327,7 +2329,7 @@ library = "libtest_wait_second.dylib"
     }
 
     async fn search_real_composer(
-        state: &ServerState,
+        state: &Arc<ServerState>,
         root: &Path,
     ) -> Result<PluginServiceOperationResult, PublicPluginError> {
         use bcode_plugin_sdk::composer::{
@@ -2528,35 +2530,49 @@ library = "libtest_wait_second.dylib"
     async fn real_composer_invalid_byte_names_are_partial_without_lossy_edits() {
         use bcode_plugin_sdk::composer::{ComposerSnapshot, ComposerSnapshotState};
         use std::os::unix::ffi::OsStringExt;
+        if isolated_git_fixture(
+            "plugin_context::tests::real_composer_invalid_byte_names_are_partial_without_lossy_edits",
+        ) {
+            return;
+        }
         let temp = tempfile::tempdir().unwrap();
         let root = temp.path().canonicalize().unwrap();
         std::fs::write(root.join("visible.rs"), "content").unwrap();
-        if std::fs::write(
-            root.join(std::ffi::OsString::from_vec(vec![b'x', 255])),
-            "content",
-        )
-        .is_err()
-        {
-            eprintln!("filesystem does not support invalid-byte names; fixture skipped");
-            return;
+        let invalid_path = root.join(std::ffi::OsString::from_vec(vec![b'x', 255]));
+        if let Err(error) = std::fs::write(&invalid_path, "content") {
+            // APFS can reject this fixture before traversal. Do not mistake
+            // unrelated I/O failures for unsupported filename encoding.
+            #[cfg(target_os = "macos")]
+            {
+                assert_eq!(error.raw_os_error(), Some(libc::EILSEQ));
+                assert!(!invalid_path.exists());
+                eprintln!(
+                    "non-UTF-8 traversal not exercised: filesystem rejected fixture with EILSEQ"
+                );
+                return;
+            }
+            #[cfg(not(target_os = "macos"))]
+            panic!("non-UTF-8 fixture creation failed: {error}");
         }
-        let state = real_composer_state(&temp.path().join("sessions"), true);
-        let response = search_real_composer(&state, &root).await.unwrap();
+        let state = Arc::new(real_composer_state(&temp.path().join("sessions"), true));
+        for _ in 0..2 {
+            let response = search_real_composer(&state, &root).await.unwrap();
+            let snapshot: ComposerSnapshot = serde_json::from_slice(&response.payload).unwrap();
+            assert_eq!(snapshot.state, ComposerSnapshotState::Truncated);
+            assert!(
+                snapshot
+                    .candidates
+                    .iter()
+                    .any(|candidate| candidate.label == "visible.rs")
+            );
+            assert!(
+                snapshot
+                    .candidates
+                    .iter()
+                    .all(|candidate| !candidate.edit.replacement.contains('\u{fffd}'))
+            );
+        }
         drop(state);
-        let snapshot: ComposerSnapshot = serde_json::from_slice(&response.payload).unwrap();
-        assert_eq!(snapshot.state, ComposerSnapshotState::Truncated);
-        assert!(
-            snapshot
-                .candidates
-                .iter()
-                .any(|candidate| candidate.label == "visible.rs")
-        );
-        assert!(
-            snapshot
-                .candidates
-                .iter()
-                .all(|candidate| !candidate.edit.replacement.contains('\u{fffd}'))
-        );
     }
 
     async fn real_search_diagnostics(
@@ -2597,7 +2613,7 @@ library = "libtest_wait_second.dylib"
         std::fs::write(root.join("文件 space.rs"), "VISIBLE_CONTENT_MARKER").unwrap();
         stage_fixture_paths(&root, &[".gitignore", "文件 space.rs"]);
         let root = root.canonicalize().unwrap();
-        let state = real_composer_state(&temp.path().join("sessions"), true);
+        let state = Arc::new(real_composer_state(&temp.path().join("sessions"), true));
         let response = search_real_composer(&state, &root).await.unwrap();
         assert!(response.error.is_none(), "{:?}", response.error);
         let snapshot: ComposerSnapshot = serde_json::from_slice(&response.payload).unwrap();
@@ -2634,7 +2650,10 @@ library = "libtest_wait_second.dylib"
         let wire = String::from_utf8(response.payload).unwrap();
         assert!(!wire.contains("VISIBLE_CONTENT_MARKER"));
         assert!(!wire.contains("EXCLUDED_CONTENT_MARKER"));
-        let disabled = real_composer_state(&temp.path().join("disabled-sessions"), false);
+        let disabled = Arc::new(real_composer_state(
+            &temp.path().join("disabled-sessions"),
+            false,
+        ));
         let result = search_real_composer(&disabled, &root).await;
         drop(disabled);
         assert!(result.is_err());
@@ -2863,7 +2882,7 @@ library = "libtest_wait_second.dylib"
     #[tokio::test]
     async fn forged_session_and_launch_roots_are_denied() {
         let temp = tempfile::tempdir().unwrap();
-        let state = bridge_state(&temp.path().join("sessions"));
+        let state = Arc::new(bridge_state(&temp.path().join("sessions")));
         let client = ClientId::new();
         state
             .set_client_runtime_context(

@@ -4,6 +4,7 @@
 
 //! Fake model provider plugin for deterministic tests and smoke flows.
 
+mod artifact_references;
 mod compaction_control;
 mod compaction_fixture;
 mod judgement;
@@ -566,6 +567,13 @@ impl FakeProviderPlugin {
         panel_model.max_image_input_base64_bytes = Some(1024 * 1024);
         vision::support(&mut panel_model.feature_support);
         list.models.push(panel_model);
+        let mut reference_model = list.models[0].clone();
+        artifact_references::MODEL.clone_into(&mut reference_model.model_id);
+        "Fake Tool Artifact References (metadata only)"
+            .clone_into(&mut reference_model.display_name);
+        reference_model.is_default = false;
+        artifact_references::support(&mut reference_model.feature_support);
+        list.models.push(reference_model);
         // The fake provider is catalog-unmapped, so it must honor the selected model itself:
         // the host takes the listing's default as the request target.
         if let Some(selected) = request
@@ -637,6 +645,9 @@ impl FakeProviderPlugin {
         let mut response = capabilities(execution);
         if request.selected_model_id.as_deref() == Some(vision::MODEL) {
             vision::support(&mut response.feature_support);
+        }
+        if request.selected_model_id.as_deref() == Some(artifact_references::MODEL) {
+            artifact_references::support(&mut response.feature_support);
         }
         json_response(&response)
     }
@@ -1081,7 +1092,34 @@ fn fake_event_script(
     {
         return Err("fake event script gates must not be empty".to_owned());
     }
+    if selected.is_some() && script_dispatch_observed(request, &script) {
+        return Ok(None);
+    }
     Ok(Some(script))
+}
+
+fn script_dispatch_observed(request: &ModelTurnRequest, script: &FakeProviderEventScript) -> bool {
+    // Scope acknowledgements to the current user activation, with exact provider
+    // request identities. A matching result alone is not evidence that this
+    // script's call was dispatched. Stateless recognition keeps exact retries
+    // deterministic and never consumes a later user activation's script.
+    let current = || {
+        request
+            .messages
+            .iter()
+            .rev()
+            .take_while(|message| message.role != MessageRole::User)
+    };
+    script.steps.iter().any(|step| {
+        let ProviderTurnEvent::ToolCallFinished { call } = &step.event else { return false; };
+        let dispatched = current().filter(|message| message.role == MessageRole::Assistant)
+            .flat_map(|message| &message.content)
+            .any(|block| matches!(block, ContentBlock::ToolCall { call: actual } if actual == call));
+        let acknowledged = current().filter(|message| message.role == MessageRole::Tool)
+            .flat_map(|message| &message.content)
+            .any(|block| matches!(block, ContentBlock::ToolResult { result } if result.call_id == call.id));
+        dispatched && acknowledged
+    })
 }
 
 fn run_fake_event_script(turn: FakeTurn, script: FakeProviderEventScript) {
@@ -1293,6 +1331,22 @@ fn fake_compaction_response(
         .map(|summary| validate_fake_compaction_summary(summary).map(str::to_owned))
 }
 
+fn fake_media_fixture_response(
+    request: &ModelTurnRequest,
+    user_text: &str,
+) -> Option<Result<String, ProviderError>> {
+    if request.model_id == vision::MODEL {
+        return Some(
+            vision::answer(request, user_text)
+                .map_err(|message| fake_structured_output_error(&message)),
+        );
+    }
+    if request.model_id == artifact_references::MODEL && request.structured_output.is_none() {
+        return artifact_references::acknowledgment(request).map(Ok);
+    }
+    None
+}
+
 fn fake_response_text(
     request: &ModelTurnRequest,
     tool_result: Option<&str>,
@@ -1301,9 +1355,8 @@ fn fake_response_text(
     if let Some(summary) = fake_compaction_response(request, user_text) {
         return summary;
     }
-    if request.model_id == vision::MODEL {
-        return vision::answer(request, user_text)
-            .map_err(|message| fake_structured_output_error(&message));
+    if let Some(response) = fake_media_fixture_response(request, user_text) {
+        return response;
     }
     if let Some(result) = tool_result
         && !(request.structured_output.is_some()
@@ -1979,6 +2032,15 @@ fn validate_fake_request(request: &ModelTurnRequest) -> Option<ProviderError> {
             retry: None,
         });
     }
+    validate_fake_feature_admission(request).or_else(|| {
+        (request.model_id == artifact_references::MODEL)
+            .then(|| artifact_references::validate(request).err())
+            .flatten()
+            .map(|message| unsupported_fake_error("fake_artifact_reference_invalid", message))
+    })
+}
+
+fn validate_fake_feature_admission(request: &ModelTurnRequest) -> Option<ProviderError> {
     let cache_model = prompt_cache::profile_for(&request.model_id);
     let mut feature_support = cache_model
         .as_ref()
@@ -1987,6 +2049,9 @@ fn validate_fake_request(request: &ModelTurnRequest) -> Option<ProviderError> {
         });
     if request.model_id == vision::MODEL {
         vision::support(&mut feature_support);
+    }
+    if request.model_id == artifact_references::MODEL {
+        artifact_references::support(&mut feature_support);
     }
     request
         .explicitly_unsupported_features(&feature_support)
@@ -4240,6 +4305,98 @@ tool-call publish {"$fake_result":{"index":0,"pointer":"/publication_arguments"}
                 } if *actual == status
             )));
         }
+    }
+
+    #[test]
+    fn marker_tool_script_is_consumed_only_by_exact_current_dispatch() {
+        let call = ToolCall {
+            id: "batch-call-0".into(),
+            name: "filesystem.write".into(),
+            arguments: serde_json::json!({"path":"owned","contents":"once"}),
+        };
+        let script = FakeProviderEventScript {
+            steps: vec![FakeProviderEventScriptStep {
+                gate: None,
+                delay_ms: None,
+                event: ProviderTurnEvent::ToolCallFinished { call: call.clone() },
+            }],
+        };
+        let mut request: ModelTurnRequest = serde_json::from_value(serde_json::json!({
+            "session_id":"00000000-0000-0000-0000-000000000000", "turn_id":"activation", "model_id":"fake-echo",
+            "provider_context":{"settings":{"fake_event_scripts_by_prompt_marker": serde_json::json!({"[batch]":script}).to_string()}},
+            "messages":[{"role":"user","content":[{"type":"text","text":"[batch]"}]}]
+        })).unwrap();
+        let assistant = |call: &ToolCall| {
+            serde_json::from_value(serde_json::json!({"role":"assistant","content":[{"type":"tool_call","call":call}]})).unwrap()
+        };
+        let result = |id: &str, denied: bool| {
+            serde_json::from_value(serde_json::json!({"role":"tool","content":[{"type":"tool_result","result":{"call_id":id,"output":"canonical tool result","is_error":denied}}]})).unwrap()
+        };
+        assert_eq!(fake_event_script(&request).unwrap(), Some(script.clone()));
+        // Exact request retries remain deterministic before dispatch evidence.
+        assert_eq!(fake_event_script(&request).unwrap(), Some(script.clone()));
+        request.messages.push(result(&call.id, false));
+        assert_eq!(fake_event_script(&request).unwrap(), Some(script.clone()));
+        let mut foreign = call.clone();
+        foreign.arguments = serde_json::json!({"path":"different","contents":"once"});
+        request.messages.push(assistant(&foreign));
+        assert_eq!(fake_event_script(&request).unwrap(), Some(script.clone()));
+        request.messages.pop();
+        request.messages.pop();
+        request.messages.push(assistant(&call));
+        request.messages.push(result("foreign-call", false));
+        assert_eq!(fake_event_script(&request).unwrap(), Some(script.clone()));
+        request.messages.pop();
+        for denied in [false, true] {
+            request.messages.push(result(&call.id, denied));
+            assert_eq!(fake_event_script(&request).unwrap(), None);
+            assert_eq!(fake_event_script(&request).unwrap(), None);
+            // Exercise actual provider admission, not only selector output.
+            let context: NativeServiceContext = serde_json::from_value(serde_json::json!({
+                "plugin_id":"bcode.fake-provider", "request":{
+                    "interface_id":MODEL_PROVIDER_INTERFACE_ID, "operation":OP_START_TURN,
+                    "payload":serde_json::to_vec(&request).unwrap()
+                }
+            }))
+            .unwrap();
+            let plugin = FakeProviderPlugin::default();
+            let response = plugin.start_turn(&context, false);
+            assert!(response.error.is_none());
+            let started: StartTurnResponse = serde_json::from_slice(&response.payload).unwrap();
+            let events = plugin.state.lock().unwrap().turns[&started.provider_turn_id].drain();
+            assert!(!events.iter().any(|event| matches!(
+                event,
+                ProviderTurnEvent::ToolCallStarted { .. }
+                    | ProviderTurnEvent::ToolCallFinished { .. }
+            )));
+            assert!(events.iter().any(|event| matches!(event, ProviderTurnEvent::TextDelta { text } if text == "fake tool result: canonical tool result")));
+            assert!(events.iter().any(|event| matches!(
+                event,
+                ProviderTurnEvent::TurnFinished {
+                    stop_reason: StopReason::EndTurn
+                }
+            )));
+            request.messages.pop();
+        }
+        request.messages.push(result(&call.id, false));
+        request.messages.push(
+            serde_json::from_value(
+                serde_json::json!({"role":"user","content":[{"type":"text","text":"[batch]"}]}),
+            )
+            .unwrap(),
+        );
+        assert_eq!(fake_event_script(&request).unwrap(), Some(script.clone()));
+        request
+            .provider_context
+            .settings
+            .remove("fake_event_scripts_by_prompt_marker");
+        request.provider_context.settings.insert(
+            FAKE_EVENT_SCRIPT_SETTING.into(),
+            serde_json::to_string(&script).unwrap(),
+        );
+        request.messages.push(assistant(&call));
+        request.messages.push(result(&call.id, false));
+        assert_eq!(fake_event_script(&request).unwrap(), Some(script));
     }
 
     #[test]

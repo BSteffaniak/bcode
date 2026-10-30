@@ -8,15 +8,35 @@ mod javascript;
 mod python;
 mod shell;
 
-use bcode_config::ShellOutputPresentationPolicy;
+use crate::shell_portable::CommandPresentationPolicy as ShellOutputPresentationPolicy;
 use document::{
     AdapterFailure, AdapterInput, Budget, Correspondence, Document, InputPolicy, LanguageAdapter,
     PresentationIssue, Provenance, Role, SourceId,
 };
 
-/// Present the same progressive source policy in every command lifecycle stage.
+/// Present the same progressive source policy in every native lifecycle stage.
+#[cfg(feature = "native")]
 #[must_use]
-pub fn present(source: &str, policy: &ShellOutputPresentationPolicy) -> Document {
+pub fn present(source: &str, policy: &bcode_config::ShellOutputPresentationPolicy) -> Document {
+    present_portable(
+        source,
+        &ShellOutputPresentationPolicy {
+            version: policy.version,
+            enabled: policy.enabled,
+            embedded: policy.embedded,
+            python: policy.python,
+            javascript: policy.javascript,
+            nested_shell: policy.nested_shell,
+            max_source_bytes: policy.max_source_bytes,
+            max_regions: policy.max_regions,
+            max_depth: policy.max_depth,
+        },
+    )
+}
+
+/// Present a command using only producer-owned semantic types.
+#[must_use]
+pub fn present_portable(source: &str, policy: &ShellOutputPresentationPolicy) -> Document {
     let budget = Budget {
         max_source_bytes: policy.max_source_bytes,
         max_fragments: policy.max_source_bytes.saturating_mul(4),
@@ -623,10 +643,10 @@ mod tests {
         ] {
             for end in (0..=source.len()).filter(|end| source.is_char_boundary(*end)) {
                 let prefix = &source[..end];
-                let document = present(prefix, &policy);
+                let document = present_portable(prefix, &policy);
                 assert_eq!(document.display_text(), prefix);
                 assert_eq!(document.execution_text(), prefix);
-                assert_eq!(document, present(prefix, &policy));
+                assert_eq!(document, present_portable(prefix, &policy));
                 assert!(document.fragments.iter().all(|fragment| matches!(
                     fragment.provenance,
                     Provenance::Source {
@@ -644,7 +664,7 @@ mod tests {
         }
         #[cfg(feature = "embedded-python")]
         {
-            let document = present("python3 -c 'value=42'", &policy);
+            let document = present_portable("python3 -c 'value=42'", &policy);
             assert!(
                 document
                     .fragments
@@ -665,8 +685,11 @@ mod tests {
             embedded: false,
             ..policy
         };
-        let document = present(source, &policy);
-        assert_eq!(document.fragments, present(source, &baseline).fragments);
+        let document = present_portable(source, &policy);
+        assert_eq!(
+            document.fragments,
+            present_portable(source, &baseline).fragments
+        );
         assert_eq!(document.sources.len(), 1);
         assert_eq!(document.issues.len(), 1);
         assert_eq!(document.issues[0].source, SourceId(0));
@@ -677,7 +700,7 @@ mod tests {
                 .unwrap()
                 .contains("echo child")
         );
-        assert_eq!(document, present(source, &policy));
+        assert_eq!(document, present_portable(source, &policy));
     }
 
     #[test]
@@ -687,7 +710,7 @@ mod tests {
             max_depth: 2,
             ..Default::default()
         };
-        let document = present(source, &policy);
+        let document = present_portable(source, &policy);
         assert_eq!(document.sources.len(), 2);
         assert_eq!(document.issues.len(), 1);
         let issue = &document.issues[0];
@@ -760,7 +783,7 @@ mod tests {
             "bash -c 'echo yes'",
             "python3 -c \"print($value)\"",
         ] {
-            let document = present(source, &policy);
+            let document = present_portable(source, &policy);
             assert_eq!(document.display_text(), source);
             assert_eq!(document.sources.len(), 1);
         }
@@ -774,11 +797,11 @@ mod tests {
         ] {
             for end in (0..=source.len()).filter(|end| source.is_char_boundary(*end)) {
                 let prefix = &source[..end];
-                let document = present(prefix, &ShellOutputPresentationPolicy::default());
+                let document = present_portable(prefix, &ShellOutputPresentationPolicy::default());
                 assert_eq!(document.execution_text(), prefix);
                 assert_eq!(
                     document,
-                    present(prefix, &ShellOutputPresentationPolicy::default())
+                    present_portable(prefix, &ShellOutputPresentationPolicy::default())
                 );
                 for fragment in &document.fragments {
                     match &fragment.provenance {
@@ -848,7 +871,7 @@ mod tests {
             "node -e 'if(x){foo();bar()}'",
             "bash -c 'if true; then echo yes; fi'",
         ] {
-            let document = present(source, &ShellOutputPresentationPolicy::default());
+            let document = present_portable(source, &ShellOutputPresentationPolicy::default());
             assert_eq!(document.execution_text(), source);
             assert!(
                 document.sources.len() > 1,
@@ -863,7 +886,7 @@ mod tests {
     fn disabled_and_dynamic_embedded_inputs_do_not_claim_decoded_sources() {
         let source = "python3 -c \"print($value)\"";
         assert_eq!(
-            present(source, &ShellOutputPresentationPolicy::default())
+            present_portable(source, &ShellOutputPresentationPolicy::default())
                 .sources
                 .len(),
             1
@@ -872,6 +895,11 @@ mod tests {
             embedded: false,
             ..Default::default()
         };
-        assert_eq!(present("node -e 'foo();bar()'", &policy).sources.len(), 1);
+        assert_eq!(
+            present_portable("node -e 'foo();bar()'", &policy)
+                .sources
+                .len(),
+            1
+        );
     }
 }

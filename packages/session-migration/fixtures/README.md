@@ -107,6 +107,14 @@ inventory plus the shared current event-schema and writer contracts. Both the cu
 implementation and historical migration crate depend on this package. Historical source policy,
 format inventory, and migration orchestration are forbidden from entering it.
 
+Schema 52 / writer epoch 16 is retained in `stores/epoch-16-schema-52-events.jsonl`.
+Its lifecycle matrix covers every supported historical writer epoch. Schema-52 migration
+preserves recorded invocation, exchange, submission, usage and child identities; it does not
+reconstruct producer state from exchange requests or create durable interaction checkpoints.
+`durable_interaction_committed` starts at schema 53 and is rejected in schema-52 input.
+The 16-to-17 writer transition uses the existing exclusive migration, strict validation and
+final writer-contract advancement path; an unchanged SQL ledger does not bypass writer fencing.
+
 A complete migration must normalize all canonical payloads to the current event schema, rebuild
 current projections, produce zero compatibility issues, pass write readiness, and permit a new
 append.

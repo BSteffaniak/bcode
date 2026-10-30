@@ -6,6 +6,9 @@
 use bcode_session_models::ToolArtifact;
 use serde_json::Value;
 
+/// Static producer-owned visual adapters shared by native and browser BMUX hosts.
+pub mod portable;
+
 #[cfg(test)]
 #[path = "tool_visual_tests.rs"]
 mod tests;

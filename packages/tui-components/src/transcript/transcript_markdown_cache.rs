@@ -81,6 +81,7 @@ pub struct TranscriptMarkdownCache {
     entries: RwLock<BTreeMap<u64, CachedMarkdownProjections>>,
     retained_revision: std::sync::atomic::AtomicU64,
     render_count: std::sync::atomic::AtomicUsize,
+    details: RwLock<BTreeMap<(u64, u64), BTreeMap<String, bool>>>,
 }
 
 impl Clone for TranscriptMarkdownCache {
@@ -96,19 +97,62 @@ impl Clone for TranscriptMarkdownCache {
                 self.retained_revision
                     .load(std::sync::atomic::Ordering::Relaxed),
             ),
+            details: RwLock::new(
+                self.details
+                    .read()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .clone(),
+            ),
             render_count: std::sync::atomic::AtomicUsize::new(self.render_count()),
         }
     }
 }
 
 impl TranscriptMarkdownCache {
+    /// Toggle accepted disclosure state at an exact semantic revision.
+    /// Returns false when the bounded local state budget is exhausted.
+    pub fn toggle_details(
+        &self,
+        item_id: u64,
+        revision: u64,
+        contribution: &str,
+        default_open: bool,
+    ) -> bool {
+        let mut details = self
+            .details
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if contribution.len() > 1024
+            || details.len() >= 8192 && !details.contains_key(&(item_id, revision))
+        {
+            return false;
+        }
+        let item = details.entry((item_id, revision)).or_default();
+        if item.len() >= 128 && !item.contains_key(contribution) {
+            return false;
+        }
+        let open = item.entry(contribution.to_owned()).or_insert(default_open);
+        *open = !*open;
+        drop(details);
+        true
+    }
+
     /// Return the current projection, rendering it once when its inputs changed.
     pub fn project(
         &self,
         item: &TranscriptItem,
-        options: MarkdownRenderOptions,
+        mut options: MarkdownRenderOptions,
     ) -> Arc<MarkdownRenderResult> {
         let item_id = item.id().get();
+        let details = self
+            .details
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(&(item_id, item.revision()))
+            .cloned();
+        if let Some(details) = details {
+            options = options.with_details_open(details);
+        }
         let cached = {
             self.entries
                 .read()
@@ -215,6 +259,10 @@ impl TranscriptMarkdownCache {
         let resident_ids = resident_items
             .map(|item| item.id().get())
             .collect::<BTreeSet<_>>();
+        self.details
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .retain(|(item_id, _), _| resident_ids.contains(item_id));
         self.entries
             .write()
             .unwrap_or_else(std::sync::PoisonError::into_inner)

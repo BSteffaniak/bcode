@@ -40,7 +40,7 @@ try {
   const imageCanvas = document.createElement('canvas'); imageCanvas.id='artifact-canvas';
   bridgeRoot.append(imageCanvas); document.body.append(bridgeRoot);
   const { decodeArtifactImage } = await import(new URL('browser-session.js', bundle));
-  const png = Uint8Array.from(atob('iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVQIHWP4z8DwHwAFgAI/ScLbtAAAAABJRU5ErkJggg=='), c => c.charCodeAt(0));
+  const png = Uint8Array.from(atob('iVBORw0KGgoAAAANSUhEUgAAABAAAAAQCAYAAAAf8/9hAAAAGUlEQVR4nGP4IBLwnxLMMGrAqAGjBgwXAwCuWFMfVymrAQAAAABJRU5ErkJggg=='), c => c.charCodeAt(0));
   const raster = await decodeArtifactImage(png, 'image/png');
   if (!raster.bytes.length || raster.width < 1 || raster.height < 1) throw new Error('real image decode failed');
   result.textContent = 'PASS committed real WASM Canvas regions + passive mirror + zero-size clearing + bounded browser raster decode';

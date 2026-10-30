@@ -4,8 +4,8 @@
 //! that may interpret shell artifact schemas and terminal recording references; generic TUI and
 //! transcript code routes opaque plugin visuals without understanding those values.
 
-mod command;
-mod partial_json;
+pub(crate) mod command;
+pub(super) mod partial_json;
 
 pub(super) fn register_keymap(registry: &mut bcode_plugin_sdk::tui::PluginTuiRegistry) {
     for (action, key) in [
@@ -184,7 +184,10 @@ impl bcode_plugin_sdk::tui::PluginTuiVisualAdapter for ShellRunTuiVisualAdapter 
     }
 
     fn supports(&self, kind: &str) -> bool {
-        matches!(kind, SHELL_RUN_SCHEMA | "bcode.tool.request.shell.run")
+        matches!(
+            kind,
+            SHELL_RUN_SCHEMA | "bcode.shell.output" | "bcode.tool.request.shell.run"
+        )
     }
 
     fn render_mode(
@@ -680,6 +683,19 @@ impl bcode_plugin_sdk::tui::PluginTuiVisualAdapter for ShellRunTuiVisualAdapter 
         payload: &serde_json::Value,
         context: &bcode_plugin_sdk::tui::PluginTuiVisualRenderContext,
     ) -> bcode_plugin_sdk::tui::PluginTuiVisualProjection {
+        if (kind == "bcode.shell.output"
+            || payload
+                .get("_artifact_refs")
+                .and_then(serde_json::Value::as_array)
+                .is_some_and(|refs| {
+                    refs.iter()
+                        .any(|r| r["metadata"]["semantic_preview"]["version"] == 1)
+                }))
+            && let Some(projection) =
+                crate::shell_portable::native_projection(kind, payload, context)
+        {
+            return projection;
+        }
         ACTIVE_THEME.with(|theme| theme.set(context.theme()));
         let mut projection = bcode_plugin_sdk::tui::PluginTuiVisualProjection::default();
         let command = self.command_projection(payload, context);
@@ -1487,23 +1503,6 @@ fn shell_command_projection_with_state(
     )
 }
 
-fn prompt_spans(
-    cwd: Option<&str>,
-    context: &bcode_plugin_sdk::tui::PluginTuiVisualRenderContext,
-) -> Vec<Span> {
-    let mut spans = vec![Span::styled("  ", muted_style())];
-    if let Some(cwd) = cwd {
-        spans.push(Span::styled(
-            context.display_path(cwd).to_string(),
-            path_style(),
-        ));
-        spans.push(Span::styled(" ❯ ", prompt_style()));
-    } else {
-        spans.push(Span::styled("❯ ", prompt_style()));
-    }
-    spans
-}
-
 fn theme_style(
     select: impl FnOnce(bcode_plugin_sdk::tui::PluginTuiTheme) -> Style,
     fallback: Style,
@@ -1511,6 +1510,7 @@ fn theme_style(
     ACTIVE_THEME.with(|theme| theme.get().map_or(fallback, select))
 }
 
+#[cfg(test)]
 fn syntax_style(
     select: impl FnOnce(bcode_plugin_sdk::tui::PluginTuiSyntaxTheme) -> Color,
     fallback: Color,
@@ -1525,32 +1525,14 @@ fn muted_style() -> Style {
     theme_style(|theme| theme.muted, Style::new().fg(Color::BrightBlack))
 }
 
-fn path_style() -> Style {
-    theme_style(|theme| theme.focused, Style::new().fg(Color::Blue))
-}
-
-fn prompt_style() -> Style {
-    theme_style(|theme| theme.focused, Style::new().fg(Color::Magenta))
-}
-
+#[cfg(test)]
 fn command_style() -> Style {
     syntax_style(|syntax| syntax.function.to_tui(), Color::Cyan)
 }
 
-fn flag_style() -> Style {
-    syntax_style(|syntax| syntax.keyword.to_tui(), Color::Yellow)
-}
-
+#[cfg(test)]
 fn string_style() -> Style {
     syntax_style(|syntax| syntax.string.to_tui(), Color::Green)
-}
-
-fn operator_style() -> Style {
-    syntax_style(|syntax| syntax.operator.to_tui(), Color::BrightBlack)
-}
-
-fn argument_style() -> Style {
-    theme_style(|theme| theme.text, Style::new())
 }
 
 fn payload_exit_code(payload: &serde_json::Value) -> Option<i32> {

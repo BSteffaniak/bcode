@@ -3079,23 +3079,496 @@ impl SessionDb {
         self.append_event_batch_checked(events, |_| Ok(())).await
     }
 
+    pub(crate) async fn append_interaction_continuation_batch(
+        &self,
+        events: &[(SessionEvent, Option<u64>)],
+        guard: &dyn crate::DurableInteractionCommitGuard,
+    ) -> Result<(), crate::SessionError> {
+        guard.validate()?;
+        crate::durable_interaction::ensure_publication_enabled()?;
+        if events.len() != 4 {
+            return Err(SessionDbError::InvalidData("invalid combined completion".into()).into());
+        }
+        validate_durable_interaction_batch(&events[..3])?;
+        let SessionEventKind::TurnContinuationCommitted { operation } = &events[3].0.kind else {
+            return Err(SessionDbError::InvalidData("missing selected attachment".into()).into());
+        };
+        let bcode_session_models::TurnContinuationTransition::AttachSelectedResult {
+            invocation_id,
+            result_ref,
+        } = &operation.transition
+        else {
+            return Err(SessionDbError::InvalidData("invalid selected attachment".into()).into());
+        };
+        let SessionEventKind::DurableInteractionCommitted {
+            operation: interaction,
+        } = &events[0].0.kind
+        else {
+            unreachable!()
+        };
+        let first_event_session = events[0].0.session_id;
+        if operation.key.session_id != first_event_session
+            || operation.key.turn_id != interaction.key.turn_id
+            || invocation_id != &interaction.key.invocation_id
+            || events[3].0.sequence
+                != events[2]
+                    .0
+                    .sequence
+                    .checked_add(1)
+                    .ok_or_else(|| SessionDbError::InvalidData("sequence overflow".into()))?
+            || *result_ref != crate::turn_continuation::turn_continuation_source_ref(&events[2].0)?
+        {
+            return Err(
+                SessionDbError::InvalidData("conflicting combined attachment".into()).into(),
+            );
+        }
+        self.append_event_batch_checked_inner(events, |_| Ok(()), Some(guard))
+            .await
+            .map_err(Into::into)
+    }
+
+    pub(crate) async fn append_turn_continuation_batch(
+        &self,
+        events: &[(SessionEvent, Option<u64>)],
+        guard: &dyn crate::DurableInteractionCommitGuard,
+    ) -> Result<(), crate::SessionError> {
+        guard.validate()?;
+        crate::durable_interaction::ensure_publication_enabled()?;
+        let Some((first, _)) = events.first() else {
+            return Err(SessionDbError::InvalidData("empty continuation batch".into()).into());
+        };
+        let SessionEventKind::TurnContinuationCommitted { operation } = &first.kind else {
+            return Err(SessionDbError::InvalidData("invalid continuation batch".into()).into());
+        };
+        if matches!(
+            operation.transition,
+            bcode_session_models::TurnContinuationTransition::AttachSelectedResult { .. }
+        ) {
+            return Err(SessionDbError::InvalidData(
+                "selected settlement requires combined completion".into(),
+            )
+            .into());
+        }
+        let expected = crate::turn_continuation::result_event(operation, first)?;
+        if events.len() != 1 + usize::from(expected.is_some())
+            || expected
+                .as_ref()
+                .is_some_and(|expected| events.get(1).is_none_or(|(actual, _)| actual != expected))
+        {
+            return Err(
+                SessionDbError::InvalidData("non-atomic continuation result".into()).into(),
+            );
+        }
+        self.append_event_batch_checked_inner(events, |_| Ok(()), Some(guard))
+            .await
+            .map_err(Into::into)
+    }
+
+    pub(crate) async fn turn_continuation_record(
+        &self,
+        key: &bcode_session_models::TurnContinuationKey,
+    ) -> SessionDbResult<Option<bcode_session_models::TurnContinuationRecord>> {
+        self.validate_write_readiness().await?;
+        let tx = self.db.begin_transaction().await?;
+        let generation = last_sequence(&*tx).await?.unwrap_or(0);
+        crate::turn_continuation::checkpoint(&*tx, generation).await?;
+        let result = crate::turn_continuation::verified_lookup(&*tx, key).await?;
+        tx.commit().await?;
+        Ok(result)
+    }
+    /// Exact bounded continuation read with revision fencing, never history replay.
+    /// # Errors
+    /// Rejects incompatible/stale storage, missing records and stale expected revisions.
+    pub async fn read_turn_continuation(
+        &self,
+        key: &bcode_session_models::TurnContinuationKey,
+        revision: u64,
+    ) -> SessionDbResult<bcode_session_models::TurnContinuationRecord> {
+        let record = self
+            .turn_continuation_record(key)
+            .await?
+            .ok_or_else(|| SessionDbError::InvalidData("missing continuation".into()))?;
+        if record.receipt.revision != revision {
+            return Err(SessionDbError::InvalidData(
+                "stale continuation revision".into(),
+            ));
+        }
+        Ok(record)
+    }
+    pub(crate) async fn turn_continuation_retry(
+        &self,
+        operation: &bcode_session_models::TurnContinuationOperation,
+    ) -> SessionDbResult<Option<bcode_session_models::TurnContinuationReceipt>> {
+        self.validate_write_readiness().await?;
+        let tx = self.db.begin_transaction().await?;
+        let generation = last_sequence(&*tx).await?.unwrap_or(0);
+        crate::turn_continuation::checkpoint(&*tx, generation).await?;
+        let receipt = crate::turn_continuation::retry(&*tx, operation).await?;
+        tx.commit().await?;
+        Ok(receipt)
+    }
+
+    /// Read one exact retained continuation operation/receipt after restart.
+    /// # Errors
+    /// Rejects malformed identity, stale projections or corrupt receipt evidence.
+    pub async fn turn_continuation_operation(
+        &self,
+        key: &bcode_session_models::TurnContinuationKey,
+        operation_id: &str,
+    ) -> SessionDbResult<Option<bcode_session_models::TurnContinuationOperationRecord>> {
+        self.validate_write_readiness().await?;
+        let tx = self.db.begin_transaction().await?;
+        let generation = last_sequence(&*tx).await?.unwrap_or(0);
+        crate::turn_continuation::checkpoint(&*tx, generation).await?;
+        let result = crate::turn_continuation::operation(&*tx, key, operation_id).await?;
+        tx.commit().await?;
+        Ok(result)
+    }
+
+    pub(crate) async fn append_durable_interaction_batch(
+        &self,
+        events: &[(SessionEvent, Option<u64>)],
+        guard: &dyn crate::DurableInteractionCommitGuard,
+    ) -> Result<(), crate::SessionError> {
+        guard.validate()?;
+        crate::durable_interaction::ensure_publication_enabled()?;
+        validate_durable_interaction_batch(events)?;
+        if let Some((
+            SessionEvent {
+                kind: SessionEventKind::DurableInteractionCommitted { operation },
+                ..
+            },
+            _,
+        )) = events.first()
+            && matches!(
+                operation.transition,
+                bcode_session_models::DurableInteractionTransition::Complete { .. }
+            )
+            && self
+                .db
+                .table_exists("turn_continuation_members")
+                .await
+                .map_err(SessionDbError::from)?
+            && self
+                .db
+                .select("turn_continuation_members")
+                .columns(&["continuation_key"])
+                .where_eq("invocation_id", operation.key.invocation_id.clone())
+                .execute_first(&**self.db)
+                .await
+                .map_err(SessionDbError::from)?
+                .is_some()
+        {
+            return Err(SessionDbError::InvalidData(
+                "bound completion requires atomic continuation attachment".into(),
+            )
+            .into());
+        }
+        self.append_event_batch_checked_inner(events, |_| Ok(()), Some(guard))
+            .await
+            .map_err(Into::into)
+    }
+
+    pub(crate) async fn durable_interaction_retry(
+        &self,
+        operation: &bcode_session_models::DurableInteractionOperation,
+    ) -> SessionDbResult<Option<bcode_session_models::DurableInteractionReceipt>> {
+        self.validate_write_readiness().await?;
+        let generation = last_sequence(&**self.db).await?.unwrap_or(0);
+        crate::durable_interaction::validate_checkpoint(&**self.db, generation).await?;
+        crate::durable_interaction::retry(&**self.db, operation).await
+    }
+
+    /// Exact invocation/exchange evidence in one current-compatible read snapshot.
+    /// # Errors
+    /// Rejects missing, mismatched, oversized, incompatible or projection-stale source records.
+    pub async fn durable_interaction_facts(
+        &self,
+        invocation_sequence: u64,
+        exchange_sequence: u64,
+    ) -> SessionDbResult<crate::DurableInteractionFacts> {
+        self.validate_write_readiness().await?;
+        let tx = self.db.begin_transaction().await?;
+        let generation = last_sequence(&*tx)
+            .await?
+            .ok_or_else(|| SessionDbError::InvalidData("missing durable source".into()))?;
+        validate_storage_writer_contract(&*tx).await?;
+        let probe = SessionEvent {
+            schema_version: bcode_session_models::CURRENT_SESSION_EVENT_SCHEMA_VERSION,
+            sequence: generation
+                .checked_add(1)
+                .ok_or_else(|| SessionDbError::InvalidData("generation overflow".into()))?,
+            timestamp_ms: 0,
+            session_id: self.session_id,
+            provenance: None,
+            kind: SessionEventKind::SessionRenamed { name: None },
+        };
+        validate_append_preconditions_without_writer(&*tx, &probe).await?;
+        let result = crate::durable_interaction::facts(
+            &*tx,
+            self.session_id,
+            invocation_sequence,
+            exchange_sequence,
+            generation,
+        )
+        .await?;
+        tx.commit().await?;
+        Ok(result)
+    }
+
+    /// Exact invocation/exchange evidence in one current-compatible read snapshot.
+    /// # Errors
+    /// Rejects missing, mismatched, oversized, incompatible or projection-stale source records.
+    pub async fn durable_interaction_exchange_facts(
+        &self,
+        invocation_sequence: u64,
+        exchange_id: &str,
+    ) -> SessionDbResult<crate::DurableInteractionFacts> {
+        self.validate_write_readiness().await?;
+        let tx = self.db.begin_transaction().await?;
+        let generation = last_sequence(&*tx)
+            .await?
+            .ok_or_else(|| SessionDbError::InvalidData("missing durable source".into()))?;
+        validate_storage_writer_contract(&*tx).await?;
+        let probe = SessionEvent {
+            schema_version: bcode_session_models::CURRENT_SESSION_EVENT_SCHEMA_VERSION,
+            sequence: generation
+                .checked_add(1)
+                .ok_or_else(|| SessionDbError::InvalidData("generation overflow".into()))?,
+            timestamp_ms: 0,
+            session_id: self.session_id,
+            provenance: None,
+            kind: SessionEventKind::SessionRenamed { name: None },
+        };
+        validate_append_preconditions_without_writer(&*tx, &probe).await?;
+        let result = crate::durable_interaction::exchange_facts(
+            &*tx,
+            self.session_id,
+            invocation_sequence,
+            exchange_id,
+            generation,
+        )
+        .await?;
+        tx.commit().await?;
+        Ok(result)
+    }
+
+    /// Exact invocation/exchange evidence in one current-compatible read snapshot.
+    /// # Errors
+    /// Rejects missing, mismatched, oversized, incompatible or projection-stale source records.
+    pub async fn durable_interaction_source(
+        &self,
+        invocation_id: &str,
+        exchange_id: &str,
+    ) -> SessionDbResult<crate::DurableInteractionFacts> {
+        crate::durable_interaction::validate_source_ids(invocation_id, exchange_id)?;
+        self.validate_write_readiness().await?;
+        let tx = self.db.begin_transaction().await?;
+        let generation = last_sequence(&*tx)
+            .await?
+            .ok_or_else(|| SessionDbError::InvalidData("missing durable source".into()))?;
+        validate_storage_writer_contract(&*tx).await?;
+        let probe = SessionEvent {
+            schema_version: bcode_session_models::CURRENT_SESSION_EVENT_SCHEMA_VERSION,
+            sequence: generation
+                .checked_add(1)
+                .ok_or_else(|| SessionDbError::InvalidData("generation overflow".into()))?,
+            timestamp_ms: 0,
+            session_id: self.session_id,
+            provenance: None,
+            kind: SessionEventKind::SessionRenamed { name: None },
+        };
+        validate_append_preconditions_without_writer(&*tx, &probe).await?;
+        let result = crate::durable_interaction::source(
+            &*tx,
+            self.session_id,
+            invocation_id,
+            exchange_id,
+            generation,
+        )
+        .await?;
+        tx.commit().await?;
+        Ok(result)
+    }
+
+    /// Read an exact retained operation and receipt, including the original input digest.
+    /// # Errors
+    /// Rejects stale projections, invalid identities or conflicting canonical/receipt evidence.
+    pub async fn durable_interaction_operation(
+        &self,
+        key: &bcode_session_models::DurableInteractionKey,
+        operation_id: &str,
+    ) -> SessionDbResult<Option<crate::DurableInteractionOperationRecord>> {
+        self.validate_write_readiness().await?;
+        let tx = self.db.begin_transaction().await?;
+        let generation = last_sequence(&*tx)
+            .await?
+            .ok_or_else(|| SessionDbError::InvalidData("missing durable source".into()))?;
+        crate::durable_interaction::validate_checkpoint(&*tx, generation).await?;
+        validate_storage_writer_contract(&*tx).await?;
+        let probe = SessionEvent {
+            schema_version: bcode_session_models::CURRENT_SESSION_EVENT_SCHEMA_VERSION,
+            sequence: generation
+                .checked_add(1)
+                .ok_or_else(|| SessionDbError::InvalidData("generation overflow".into()))?,
+            timestamp_ms: 0,
+            session_id: self.session_id,
+            provenance: None,
+            kind: SessionEventKind::SessionRenamed { name: None },
+        };
+        validate_append_preconditions_without_writer(&*tx, &probe).await?;
+        let result = crate::durable_interaction::retained_operation(
+            &*tx,
+            self.session_id,
+            key,
+            operation_id,
+        )
+        .await?;
+        tx.commit().await?;
+        Ok(result)
+    }
+
+    /// Read one bounded checkpoint without replay or repair.
+    /// # Errors
+    /// Rejects disabled compatibility, stale projections and storage damage.
+    pub async fn durable_interaction(
+        &self,
+        key: &bcode_session_models::DurableInteractionKey,
+    ) -> SessionDbResult<Option<bcode_session_models::DurableInteractionRecord>> {
+        crate::durable_interaction::ensure_publication_enabled()?;
+        self.validate_write_readiness().await?;
+        let tx = self.db.begin_transaction().await?;
+        let generation = last_sequence(&*tx).await?.unwrap_or(0);
+        crate::durable_interaction::validate_checkpoint(&*tx, generation).await?;
+        let record = crate::durable_interaction::lookup(&*tx, key).await?;
+        tx.commit().await?;
+        Ok(record)
+    }
+
+    /// Look up a durable wait by canonical invocation, without scanning history.
+    /// # Errors
+    /// Rejects disabled compatibility, stale projections and ambiguous/corrupt bindings.
+    pub async fn durable_interaction_for_invocation(
+        &self,
+        invocation_id: &str,
+    ) -> SessionDbResult<Option<bcode_session_models::DurableInteractionRecord>> {
+        crate::durable_interaction::ensure_publication_enabled()?;
+        if invocation_id.trim().is_empty()
+            || invocation_id.len() > bcode_session_models::MAX_DURABLE_INTERACTION_ID_BYTES
+        {
+            return Err(SessionDbError::InvalidData(
+                "invalid durable invocation identity".into(),
+            ));
+        }
+        self.validate_write_readiness().await?;
+        let tx = self.db.begin_transaction().await?;
+        let generation = last_sequence(&*tx).await?.unwrap_or(0);
+        crate::durable_interaction::validate_checkpoint(&*tx, generation).await?;
+        let rows = tx
+            .select("durable_interactions")
+            .columns(&["interaction_key"])
+            .where_eq("invocation_id", invocation_id.to_owned())
+            .limit(2)
+            .execute(&*tx)
+            .await?;
+        if rows.len() > 1 {
+            return Err(SessionDbError::InvalidData(
+                "ambiguous durable invocation".into(),
+            ));
+        }
+        let record = if let Some(row) = rows.first() {
+            let text = required_string(row, "interaction_key")?;
+            if text.len() > 4096 {
+                return Err(SessionDbError::InvalidData(
+                    "invalid durable interaction key".into(),
+                ));
+            }
+            let key: bcode_session_models::DurableInteractionKey = serde_json::from_str(&text)?;
+            if key.invocation_id != invocation_id {
+                return Err(SessionDbError::InvalidData(
+                    "inconsistent durable invocation".into(),
+                ));
+            }
+            crate::durable_interaction::lookup(&*tx, &key).await?
+        } else {
+            None
+        };
+        tx.commit().await?;
+        Ok(record)
+    }
+
+    /// Read metadata-only recovery locators pinned to a canonical tail.
+    /// # Errors
+    /// Rejects invalid bounds, stale generations/projections and storage damage.
+    pub async fn durable_interaction_page(
+        &self,
+        query: &bcode_session_models::DurableInteractionQuery,
+    ) -> SessionDbResult<bcode_session_models::DurableInteractionPage> {
+        crate::durable_interaction::ensure_publication_enabled()?;
+        self.validate_write_readiness().await?;
+        let tx = self.db.begin_transaction().await?;
+        let generation = last_sequence(&*tx).await?.unwrap_or(0);
+        let page = crate::durable_interaction::page(&*tx, query, generation).await?;
+        tx.commit().await?;
+        Ok(page)
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn append_guarded_test_batch(
+        &self,
+        events: &[(SessionEvent, Option<u64>)],
+        guard: &dyn crate::DurableInteractionCommitGuard,
+    ) -> SessionDbResult<()> {
+        self.append_event_batch_checked_inner(events, |_| Ok(()), Some(guard))
+            .await
+    }
+
     async fn append_event_batch_checked(
         &self,
         events: &[(SessionEvent, Option<u64>)],
+        check: impl FnMut(usize) -> SessionDbResult<()> + Send,
+    ) -> SessionDbResult<()> {
+        self.append_event_batch_checked_inner(events, check, None)
+            .await
+    }
+
+    async fn append_event_batch_checked_inner(
+        &self,
+        events: &[(SessionEvent, Option<u64>)],
         mut check: impl FnMut(usize) -> SessionDbResult<()> + Send,
+        guard: Option<&dyn crate::DurableInteractionCommitGuard>,
     ) -> SessionDbResult<()> {
         if events.is_empty() {
             return Ok(());
         }
+        validate_interaction_guard(guard)?;
         let tx = self.db.begin_transaction().await?;
+        validate_interaction_guard(guard)?;
         configure_turso_connection(&*tx).await?;
         validate_storage_writer_contract(&*tx).await?;
+        // Validate bound Complete against the entire proposed transaction while the same
+        // write transaction owns the membership read. No independent completion can leave
+        // a committed result without its continuation attachment.
+        crate::turn_continuation::validate_atomic_attachments(&*tx, events).await?;
         for (index, (event, activity_timestamp_ms)) in events.iter().enumerate() {
-            validate_append_preconditions_without_writer(&*tx, event).await?;
+            if matches!(
+                event.kind,
+                SessionEventKind::DurableInteractionCommitted { .. }
+                    | SessionEventKind::TurnContinuationCommitted { .. }
+            ) && guard.is_none()
+            {
+                return Err(SessionDbError::InvalidData(
+                    "durable interaction requires typed atomic append".into(),
+                ));
+            }
+            validate_interaction_guard(guard)?;
+            validate_append_preconditions_inner(&*tx, event).await?;
             append_event_projections(&*tx, event, *activity_timestamp_ms).await?;
             validate_append_postconditions(&*tx, event).await?;
             check(index + 1)?;
+            validate_interaction_guard(guard)?;
         }
+        validate_interaction_guard(guard)?;
         tx.commit().await?;
         Ok(())
     }
@@ -5617,6 +6090,24 @@ impl bcode_session_migration_target::MigrationTarget for SessionMigrationTarget<
         ] {
             self.db.delete(table).execute(self.db).await?;
         }
+        if self
+            .db
+            .table_exists("interaction_exchange_locators")
+            .await?
+        {
+            self.db
+                .delete("interaction_exchange_locators")
+                .execute(self.db)
+                .await?;
+            self.db
+                .insert("projection_checkpoints")
+                .value("projection_name", "interaction_exchange_locators")
+                .value("last_event_seq", -1_i64)
+                .value("projection_version", 1_i64)
+                .value("updated_at_ms", 0_i64)
+                .execute(self.db)
+                .await?;
+        }
         Ok(())
     }
 
@@ -5940,7 +6431,67 @@ async fn configure_turso_connection(db: &dyn Database) -> SessionDbResult<()> {
     Ok(())
 }
 
+fn validate_interaction_guard(
+    guard: Option<&dyn crate::DurableInteractionCommitGuard>,
+) -> SessionDbResult<()> {
+    if let Some(guard) = guard {
+        guard.validate().map_err(|_| {
+            SessionDbError::InvalidData("durable interaction execution authority lost".into())
+        })?;
+    }
+    Ok(())
+}
+
+pub(crate) fn validate_durable_interaction_batch(
+    events: &[(SessionEvent, Option<u64>)],
+) -> SessionDbResult<()> {
+    let invalid = || SessionDbError::InvalidData("invalid durable interaction atomic batch".into());
+    let Some((first, _)) = events.first() else {
+        return Err(invalid());
+    };
+    let SessionEventKind::DurableInteractionCommitted { operation } = &first.kind else {
+        return Err(invalid());
+    };
+    match &operation.transition {
+        bcode_session_models::DurableInteractionTransition::Complete {
+            result,
+            exchange_resolution,
+            ..
+        } => {
+            if events.len() != 3
+                || events[1].0.session_id != first.session_id
+                || first.sequence.checked_add(1) != Some(events[1].0.sequence)
+                || events[2].0.session_id != first.session_id
+                || first.sequence.checked_add(2) != Some(events[2].0.sequence)
+                || !matches!(&events[1].0.kind, SessionEventKind::ToolExchangeResolved { event } if event == exchange_resolution)
+                || !matches!(&events[2].0.kind, SessionEventKind::ToolInvocationResultRecorded { record } if record == result.as_ref())
+            {
+                return Err(invalid());
+            }
+        }
+        _ if events.len() != 1 => return Err(invalid()),
+        _ => {}
+    }
+    Ok(())
+}
+
 async fn validate_append_preconditions_without_writer(
+    db: &dyn Database,
+    event: &SessionEvent,
+) -> SessionDbResult<()> {
+    if matches!(
+        event.kind,
+        SessionEventKind::DurableInteractionCommitted { .. }
+            | SessionEventKind::TurnContinuationCommitted { .. }
+    ) {
+        return Err(SessionDbError::InvalidData(
+            "durable interaction requires typed atomic append".into(),
+        ));
+    }
+    validate_append_preconditions_inner(db, event).await
+}
+
+async fn validate_append_preconditions_inner(
     db: &dyn Database,
     event: &SessionEvent,
 ) -> SessionDbResult<()> {
@@ -5948,6 +6499,9 @@ async fn validate_append_preconditions_without_writer(
         .map_err(SessionDbError::InvalidData)?;
     let canonical_tail = last_sequence(db).await?;
     validate_append_identity(event, canonical_tail)?;
+    Box::pin(crate::turn_continuation::validate_member_result(db, event)).await?;
+    Box::pin(crate::turn_continuation::validate_append(db, event)).await?;
+    crate::durable_interaction::validate_append(db, event).await?;
     crate::submission::validate_activation(db, event).await?;
     validate_model_context_precondition(
         db,
@@ -6238,7 +6792,7 @@ async fn project_context_occupancy_row(
 /// This is the durable append hot path. Each statement is a full Turso round trip, so the base
 /// projections and the occupancy projection share one multi-row checkpoint write instead of
 /// advancing checkpoints one projection at a time.
-async fn append_event_projections(
+pub(crate) async fn append_event_projections(
     db: &dyn Database,
     event: &SessionEvent,
     activity_timestamp_ms: Option<u64>,
@@ -6301,6 +6855,9 @@ async fn project_turn_evidence(db: &dyn Database, event: &SessionEvent) -> Sessi
 }
 
 async fn project_turn_receipt(db: &dyn Database, event: &SessionEvent) -> SessionDbResult<()> {
+    crate::durable_interaction::project_exchange_locator(db, event).await?;
+    crate::turn_continuation::project(db, event).await?;
+    crate::durable_interaction::project(db, event).await?;
     crate::submission::project(db, event).await?;
     project_turn_evidence(db, event).await?;
     let admission = match &event.kind {

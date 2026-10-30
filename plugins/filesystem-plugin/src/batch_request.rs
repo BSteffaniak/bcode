@@ -1109,6 +1109,16 @@ mod tests {
                     .unwrap_err()
                     .contains("permissions")
             );
+            // Ensure the restore is a distinct metadata transition even on filesystems
+            // whose timestamp resolution coalesces immediate chmod operations.
+            let changed_time =
+                snapshot.metadata.modified().unwrap() + std::time::Duration::from_secs(1);
+            std::fs::File::options()
+                .write(true)
+                .open(&path)
+                .unwrap()
+                .set_modified(changed_time)
+                .unwrap();
             std::fs::set_permissions(&path, snapshot.permissions.clone()).unwrap();
             assert!(
                 snapshot

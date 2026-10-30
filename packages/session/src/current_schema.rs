@@ -190,14 +190,22 @@ pub fn session_migrations() -> CurrentMigrationSource {
         drop_index("idx_session_children_pending", "session_children"),
     );
     add_milestone_migrations(&mut source);
+    add_submission_recovery_migrations(&mut source);
+    if crate::durable_interaction::PUBLICATION_ENABLED {
+        add_durable_interaction_migrations(&mut source);
+    }
+    source
+}
+
+fn add_submission_recovery_migrations(source: &mut CurrentMigrationSource) {
     add_migration(
-        &mut source,
+        source,
         "063_submission_queue_visible",
         alter_table("submissions").add_column("queue_visible".into(), DataType::Int, true, None),
         alter_table("submissions").drop_column("queue_visible".into()),
     );
     add_migration(
-        &mut source,
+        source,
         "064_submission_queue_index",
         create_index("idx_submission_queue")
             .if_not_exists(true)
@@ -206,7 +214,7 @@ pub fn session_migrations() -> CurrentMigrationSource {
         drop_index("idx_submission_queue", "submissions"),
     );
     add_migration(
-        &mut source,
+        source,
         "065_submission_recovery_operations",
         create_table("submission_recovery_operations")
             .if_not_exists(true)
@@ -216,7 +224,242 @@ pub fn session_migrations() -> CurrentMigrationSource {
             .column(schema_column("record", DataType::Text, false)),
         drop_table("submission_recovery_operations").if_exists(true),
     );
-    source
+}
+
+/// Staged schema only: coordinator must register after the writer-contract upgrade.
+pub fn add_durable_interaction_migrations(source: &mut CurrentMigrationSource) {
+    add_migration(
+        source,
+        "066_durable_interactions",
+        create_table("durable_interactions")
+            .if_not_exists(true)
+            .column(schema_column("interaction_key", DataType::Text, false))
+            .primary_key("interaction_key")
+            .column(schema_column("invocation_id", DataType::Text, false))
+            .column(schema_column("event_seq", DataType::Int, false))
+            .column(schema_column("locator", DataType::Text, false))
+            .column(schema_column("record", DataType::Text, false)),
+        drop_table("durable_interactions").if_exists(true),
+    );
+    add_migration(
+        source,
+        "067_durable_interaction_event_index",
+        create_index("idx_durable_interaction_event")
+            .if_not_exists(true)
+            .table("durable_interactions")
+            .columns(vec!["event_seq"]),
+        drop_index("idx_durable_interaction_event", "durable_interactions"),
+    );
+    add_migration(
+        source,
+        "068_durable_interaction_operations",
+        create_table("durable_interaction_operations")
+            .if_not_exists(true)
+            .column(schema_column("operation_key", DataType::Text, false))
+            .primary_key("operation_key")
+            .column(schema_column("operation", DataType::Text, false))
+            .column(schema_column("receipt", DataType::Text, false)),
+        drop_table("durable_interaction_operations").if_exists(true),
+    );
+    add_migration(
+        source,
+        "069_durable_interaction_invocation_index",
+        create_index("idx_durable_interaction_invocation")
+            .if_not_exists(true)
+            .table("durable_interactions")
+            .columns(vec!["invocation_id"]),
+        drop_index("idx_durable_interaction_invocation", "durable_interactions"),
+    );
+    add_migration(
+        source,
+        "070_durable_interaction_checkpoint",
+        InitializeDurableInteractions,
+        delete("projection_checkpoints").where_eq("projection_name", "durable_interactions"),
+    );
+    add_turn_continuation_migrations(source);
+    add_exchange_locator_migrations(source);
+}
+
+pub fn add_turn_continuation_migrations(source: &mut CurrentMigrationSource) {
+    for (id, table, primary) in [
+        (
+            "074_turn_continuations",
+            "turn_continuations",
+            "continuation_key",
+        ),
+        (
+            "075_turn_continuation_operations",
+            "turn_continuation_operations",
+            "operation_key",
+        ),
+    ] {
+        let mut create = create_table(table)
+            .if_not_exists(true)
+            .column(schema_column(primary, DataType::Text, false))
+            .primary_key(primary);
+        if table == "turn_continuations" {
+            create = create.column(schema_column("record", DataType::Text, false));
+        } else {
+            create = create
+                .column(schema_column("operation", DataType::Text, false))
+                .column(schema_column("receipt", DataType::Text, false));
+        }
+        add_migration(source, id, create, drop_table(table).if_exists(true));
+    }
+    add_migration(
+        source,
+        "076_turn_continuation_members",
+        create_table("turn_continuation_members")
+            .if_not_exists(true)
+            .column(schema_column("invocation_id", DataType::Text, false))
+            .primary_key("invocation_id")
+            .column(schema_column("continuation_key", DataType::Text, false)),
+        drop_table("turn_continuation_members").if_exists(true),
+    );
+    add_migration(
+        source,
+        "077_turn_continuation_checkpoint",
+        InitializeTurnContinuations,
+        delete("projection_checkpoints").where_eq("projection_name", "turn_continuations"),
+    );
+}
+#[derive(Debug)]
+struct InitializeTurnContinuations;
+#[async_trait::async_trait]
+impl Executable for InitializeTurnContinuations {
+    async fn execute(&self, db: &dyn Database) -> Result<(), DatabaseError> {
+        if db
+            .select("events")
+            .columns(&["event_seq"])
+            .limit(1)
+            .execute_first(db)
+            .await?
+            .is_none()
+            && db
+                .select("projection_checkpoints")
+                .where_eq("projection_name", "turn_continuations")
+                .execute_first(db)
+                .await?
+                .is_none()
+        {
+            db.insert("projection_checkpoints")
+                .value("projection_name", "turn_continuations")
+                .value("projection_version", 1_i64)
+                .value("last_event_seq", -1_i64)
+                .value("updated_at_ms", 0_i64)
+                .execute(db)
+                .await?;
+        }
+        Ok(())
+    }
+}
+
+pub fn add_exchange_locator_migrations(source: &mut CurrentMigrationSource) {
+    add_migration(
+        source,
+        "071_interaction_exchange_locators",
+        create_table("interaction_exchange_locators")
+            .if_not_exists(true)
+            .column(schema_column("exchange_key", DataType::Text, false))
+            .primary_key("exchange_key")
+            .column(schema_column("invocation_id", DataType::Text, false))
+            .column(schema_column("exchange_id", DataType::Text, false))
+            .column(schema_column("request_seq", DataType::Int, false))
+            .column(schema_column("resolution_seq", DataType::Int, true)),
+        drop_table("interaction_exchange_locators").if_exists(true),
+    );
+    add_migration(
+        source,
+        "072_interaction_exchange_identity_index",
+        create_index("idx_interaction_exchange_identity")
+            .if_not_exists(true)
+            .table("interaction_exchange_locators")
+            .columns(vec!["invocation_id", "exchange_id"]),
+        drop_index(
+            "idx_interaction_exchange_identity",
+            "interaction_exchange_locators",
+        ),
+    );
+    add_migration(
+        source,
+        "073_interaction_exchange_checkpoint",
+        InitializeExchangeLocators,
+        delete("projection_checkpoints")
+            .where_eq("projection_name", "interaction_exchange_locators"),
+    );
+}
+
+#[derive(Debug)]
+struct InitializeExchangeLocators;
+
+#[async_trait::async_trait]
+impl Executable for InitializeExchangeLocators {
+    async fn execute(&self, db: &dyn Database) -> Result<(), DatabaseError> {
+        // Fresh current-format storage only. Existing histories require migration-owned
+        // canonical projector ingestion before a trustworthy checkpoint can be published.
+        if db
+            .select("events")
+            .columns(&["event_seq"])
+            .limit(1)
+            .execute_first(db)
+            .await?
+            .is_none()
+            && db
+                .select("projection_checkpoints")
+                .where_eq("projection_name", "interaction_exchange_locators")
+                .execute_first(db)
+                .await?
+                .is_none()
+        {
+            db.insert("projection_checkpoints")
+                .value("projection_name", "interaction_exchange_locators")
+                .value("last_event_seq", -1_i64)
+                .value("projection_version", 1_i64)
+                .value("updated_at_ms", 0_i64)
+                .execute(db)
+                .await?;
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug)]
+struct InitializeDurableInteractions;
+
+#[async_trait::async_trait]
+impl Executable for InitializeDurableInteractions {
+    async fn execute(&self, db: &dyn Database) -> Result<(), DatabaseError> {
+        if db
+            .select("projection_checkpoints")
+            .where_eq("projection_name", "durable_interactions")
+            .execute_first(db)
+            .await?
+            .is_none()
+        {
+            let row = db
+                .select("events")
+                .project_as(
+                    switchy::database::query::max(switchy::database::query::identifier(
+                        "event_seq",
+                    )),
+                    "sequence",
+                )
+                .execute_first(db)
+                .await?;
+            let sequence = row
+                .and_then(|row| row.get("sequence"))
+                .filter(|value| *value != DatabaseValue::Null)
+                .unwrap_or(DatabaseValue::Int64(0));
+            db.insert("projection_checkpoints")
+                .value("projection_name", "durable_interactions")
+                .value("last_event_seq", sequence)
+                .value("projection_version", 1_i64)
+                .value("updated_at_ms", 0_i64)
+                .execute(db)
+                .await?;
+        }
+        Ok(())
+    }
 }
 
 fn add_milestone_migrations(source: &mut CurrentMigrationSource) {

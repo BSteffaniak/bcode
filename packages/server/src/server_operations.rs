@@ -61,7 +61,7 @@ impl UpdateClientContextError {
 
 /// Validate and retain one client's runtime context without transport framing.
 pub async fn update_client_runtime_context(
-    state: &ServerState,
+    state: &std::sync::Arc<ServerState>,
     client_id: bcode_session_models::ClientId,
     runtime_context: Option<bcode_ipc::ClientRuntimeContext>,
 ) -> Result<(), UpdateClientContextError> {

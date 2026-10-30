@@ -435,7 +435,7 @@ fn live_normal_consumer_artifact_pilot() {
 
 #[test]
 fn subprocess_timeout_does_not_claim_cancellation_or_success() {
-    let mut child = Command::new("/bin/sleep")
+    let mut child = Command::new("sleep")
         .arg("1")
         .stdin(Stdio::null())
         .stdout(Stdio::null())

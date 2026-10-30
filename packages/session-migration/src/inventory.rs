@@ -1460,7 +1460,7 @@ pub fn is_released_event_kind_schema(kind: &str, schema: u16) -> bool {
 ///
 /// Event kinds that the current build still persists remain historically decodable through this
 /// schema; the current schema itself is classified by [`classify_event_kind_schema`].
-pub const LATEST_HISTORICAL_EVENT_SCHEMA: u16 = 51;
+pub const LATEST_HISTORICAL_EVENT_SCHEMA: u16 = 52;
 
 fn released_event_schema_range(kind: &str) -> (u16, u16) {
     let live = LATEST_HISTORICAL_EVENT_SCHEMA;
@@ -1470,6 +1470,9 @@ fn released_event_schema_range(kind: &str) -> (u16, u16) {
         | "milestone_evaluation_completed"
         | "milestone_publication_requested"
         | "milestone_published" => (51, CURRENT_EVENT_SCHEMA),
+        "durable_interaction_committed" | "turn_continuation_committed" => {
+            (53, CURRENT_EVENT_SCHEMA)
+        }
         "child_session_created" => (49, CURRENT_EVENT_SCHEMA),
         "session_child_linked" | "session_child_published" | "session_children_reconciled" => {
             (50, CURRENT_EVENT_SCHEMA)
@@ -1600,6 +1603,10 @@ pub const RELEASED_EVENT_VARIANTS: &[ReleasedEventVariantDescriptor] = &[
     ReleasedEventVariantDescriptor {
         kind: "context_usage_observed",
         treatment: ReleasedEventTreatment::ExplicitConversion,
+    },
+    ReleasedEventVariantDescriptor {
+        kind: "durable_interaction_committed",
+        treatment: ReleasedEventTreatment::CurrentEquivalent,
     },
     ReleasedEventVariantDescriptor {
         kind: "execution_session_created",
@@ -1867,6 +1874,10 @@ pub const RELEASED_EVENT_VARIANTS: &[ReleasedEventVariantDescriptor] = &[
     },
     ReleasedEventVariantDescriptor {
         kind: "trace_event",
+        treatment: ReleasedEventTreatment::CurrentEquivalent,
+    },
+    ReleasedEventVariantDescriptor {
+        kind: "turn_continuation_committed",
         treatment: ReleasedEventTreatment::CurrentEquivalent,
     },
     ReleasedEventVariantDescriptor {
@@ -2421,7 +2432,7 @@ pub const RELEASED_HISTORICAL_WRITER_EPOCHS: &[u32] =
 /// emitted by epoch-6 builds and migrate forward without a writer-epoch change.
 pub const RELEASED_HISTORICAL_EVENT_SCHEMAS: &[u16] = &[
     1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26,
-    27, 28, 29, 30, 31, 32, 35, 37, 38, 39, 40, 41, 42, 43, 44, 45, 46, 47, 48, 49, 50, 51,
+    27, 28, 29, 30, 31, 32, 35, 37, 38, 39, 40, 41, 42, 43, 44, 45, 46, 47, 48, 49, 50, 51, 52,
 ];
 
 /// Event schemas between the first released schema and the current schema that no writer emitted.
@@ -2571,6 +2582,8 @@ mod tests {
     fn current_only_event_kinds_fail_closed_outside_their_released_schema_ranges() {
         for (kind, first_schema) in [
             ("child_session_created", 49),
+            ("durable_interaction_committed", 53),
+            ("turn_continuation_committed", 53),
             ("inert_history", 40),
             ("positioned_assistant_reasoning_activity", 42),
             ("positioned_assistant_response_segment", 42),

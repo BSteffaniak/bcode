@@ -1755,6 +1755,37 @@ fn fixture_link_replacement_child(db: &dyn Database) {
 }
 
 #[test]
+fn execution_fence_blocks_transfer_until_external_commit_finishes() {
+    let (_temp, mut store, _, authority, _) = connected_publication_fixture();
+    let fence = store.execution_fence("run-1", &authority).expect("fence");
+    fence.validate().expect("held authority");
+    let next = WorkflowExecutionAuthority {
+        daemon_instance_id: "next-owner".into(),
+        generation: authority.generation + 1,
+        fencing_token: "next-owner-fence".into(),
+        ..authority.clone()
+    };
+    assert!(
+        store
+            .transfer_execution_authority("run-1", &authority, &next, 21)
+            .is_err()
+    );
+    fence
+        .validate()
+        .expect("transfer did not alter held authority");
+    drop(fence);
+    store
+        .transfer_execution_authority("run-1", &authority, &next, 22)
+        .expect("transfer after external commit");
+    assert!(store.execution_fence("run-1", &authority).is_err());
+    store
+        .execution_fence("run-1", &next)
+        .expect("new owner fence")
+        .validate()
+        .expect("new owner");
+}
+
+#[test]
 fn replacement_terminal_owner_can_transfer_only_while_intent_is_pending() {
     let (temp, mut store, _, authority, _) = connected_publication_fixture();
     store

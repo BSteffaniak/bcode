@@ -145,12 +145,53 @@ mod tests {
         settings
     }
 
+    fn read_fixture_headers(reader: &mut impl std::io::Read) -> std::io::Result<bool> {
+        use std::io::{Error, ErrorKind};
+        let deadline = std::time::Instant::now() + Duration::from_millis(500);
+        let mut buffer = [0; 4096];
+        let mut request = Vec::new();
+        while !request.windows(4).any(|window| window == b"\r\n\r\n") {
+            if std::time::Instant::now() >= deadline {
+                return Ok(false);
+            }
+            match reader.read(&mut buffer) {
+                Ok(0) => return Ok(false),
+                Ok(read) => {
+                    request.extend_from_slice(&buffer[..read]);
+                    if request.len() > 16 * 1024 {
+                        return Err(Error::new(
+                            ErrorKind::InvalidData,
+                            "bounded fixture headers",
+                        ));
+                    }
+                }
+                Err(error) if error.kind() == ErrorKind::Interrupted => {}
+                Err(error)
+                    if matches!(error.kind(), ErrorKind::WouldBlock | ErrorKind::TimedOut) =>
+                {
+                    return Ok(false);
+                }
+                Err(error) => return Err(error),
+            }
+        }
+        Ok(true)
+    }
+
     fn fixture(
         status: u16,
         body: &str,
         delay: Duration,
     ) -> (String, std::thread::JoinHandle<usize>) {
-        use std::io::{Read, Write};
+        fixture_with_cancellation(status, body, delay, false)
+    }
+
+    fn fixture_with_cancellation(
+        status: u16,
+        body: &str,
+        delay: Duration,
+        allow_incomplete_headers: bool,
+    ) -> (String, std::thread::JoinHandle<usize>) {
+        use std::io::Write;
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let address = listener.local_addr().unwrap();
         listener.set_nonblocking(true).unwrap();
@@ -164,17 +205,18 @@ mod tests {
                     stream
                         .set_read_timeout(Some(Duration::from_millis(500)))
                         .unwrap();
-                    let mut buffer = [0; 4096];
-                    let mut request = Vec::new();
-                    while !request.windows(4).any(|window| window == b"\r\n\r\n") {
-                        let read = stream.read(&mut buffer).expect("fixture request headers");
-                        assert!(read > 0, "request closed before complete headers");
-                        request.extend_from_slice(&buffer[..read]);
-                        assert!(request.len() <= 16 * 1024, "bounded fixture headers");
+                    // Cancellation may drop a connected client before it sends headers.
+                    // Bound the worker even when no complete request was received.
+                    deadline = deadline
+                        .min(std::time::Instant::now() + LIVE_TIMEOUT + Duration::from_millis(400));
+                    if !read_fixture_headers(&mut stream).expect("fixture request headers") {
+                        assert!(
+                            allow_incomplete_headers,
+                            "request closed or timed out before complete headers"
+                        );
+                        continue;
                     }
                     requests += 1;
-                    deadline =
-                        std::time::Instant::now() + LIVE_TIMEOUT + Duration::from_millis(400);
                     std::thread::sleep(delay);
                     let _ = write!(
                         stream,
@@ -188,6 +230,43 @@ mod tests {
             requests
         });
         (format!("http://{address}"), worker)
+    }
+
+    #[test]
+    fn fixture_headers_distinguish_complete_cancelled_and_invalid_requests() {
+        use std::io::{Cursor, Error, ErrorKind, Read};
+
+        struct ReadError(ErrorKind);
+        impl Read for ReadError {
+            fn read(&mut self, _: &mut [u8]) -> std::io::Result<usize> {
+                Err(Error::from(self.0))
+            }
+        }
+
+        assert!(
+            read_fixture_headers(&mut Cursor::new(
+                b"GET /models HTTP/1.1\r\nHost: localhost\r\n\r\n"
+            ))
+            .unwrap()
+        );
+        assert!(!read_fixture_headers(&mut Cursor::new(b"")).unwrap());
+        assert!(!read_fixture_headers(&mut Cursor::new(b"GET /models HTTP/1.1\r\n")).unwrap());
+        for kind in [ErrorKind::WouldBlock, ErrorKind::TimedOut] {
+            let mut partial = Cursor::new(b"GET /models HTTP/1.1\r\n").chain(ReadError(kind));
+            assert!(!read_fixture_headers(&mut partial).unwrap());
+        }
+        assert_eq!(
+            read_fixture_headers(&mut ReadError(ErrorKind::PermissionDenied))
+                .unwrap_err()
+                .kind(),
+            ErrorKind::PermissionDenied
+        );
+        assert_eq!(
+            read_fixture_headers(&mut Cursor::new(vec![b'x'; 16 * 1024 + 1]))
+                .unwrap_err()
+                .kind(),
+            ErrorKind::InvalidData
+        );
     }
 
     #[test]
@@ -376,7 +455,8 @@ mod tests {
 
     #[tokio::test]
     async fn discovery_future_can_be_cancelled() {
-        let (url, worker) = fixture(200, r#"{"data":[]}"#, Duration::from_millis(200));
+        let (url, worker) =
+            fixture_with_cancellation(200, r#"{"data":[]}"#, Duration::from_millis(200), true);
         let mut settings = xai_settings();
         settings.base_url = url;
         assert!(

@@ -1,6 +1,6 @@
 import init, * as wasm from './bcode_tui_web.js';
 import { mountInteractiveSurface } from './interactive-surface.js';
-import { mountBrowserSession, commitSemanticRegions } from './browser-session.js';
+import { mountBrowserSession, commitSemanticRegions, createBrowserPlatformPorts } from './browser-session.js';
 
 const status = document.getElementById('status');
 const retry = document.getElementById('retry-submission');
@@ -15,10 +15,12 @@ function setControls(state = {}) {
   refresh.disabled = !host;
 }
 function runExplicit(operation) {
+  const current = generation, active = host;
   retry.disabled = refresh.disabled = acknowledge.disabled = true;
-  void operation().then(() => host?.focus()).catch(() => {
+  void operation().then(() => { if (current === generation && host === active) active?.focus(); }).catch(() => {
+    if (current !== generation || host !== active) return;
     status.textContent = 'Operation unresolved. Draft retained. Refresh before another control; retry submission sends its original identity.';
-  }).finally(() => { if (host) setControls(lastState); });
+  }).finally(() => { if (current === generation && host === active && host) setControls(lastState); });
 }
 retry.addEventListener('click', () => { if (host) runExplicit(() => host.retrySubmission()); });
 refresh.addEventListener('click', () => { if (host) runExplicit(() => host.refresh()); });
@@ -47,14 +49,17 @@ const initialized = init({ module_or_path: new URL('./bcode_tui_web_bg.wasm', im
 async function stop() {
   generation++;
   lifetime?.abort();
-  await host?.dispose();
+  const previous = host;
   host = undefined;
   setControls();
   commitSemanticRegions(semantics, []);
+  await previous?.dispose();
 }
 async function start() {
   const current = ++generation;
   const previous = mounting;
+  host = undefined;
+  setControls();
   lifetime?.abort();
   const controller = new AbortController();
   lifetime = controller;
@@ -64,11 +69,15 @@ async function start() {
     await previous?.then(next => next.dispose()).catch(() => {});
     await initialized;
     if (current !== generation || controller.signal.aborted) return;
+    const platform = createBrowserPlatformPorts({
+      root: document.getElementById('platform-dialogs'), signal: controller.signal,
+      onError: message => { if (current === generation) status.textContent = message; },
+    });
     mounting = mountBrowserSession({
       wasm, mountInteractiveSurface,
       container: document.getElementById('surface'), canvas: document.getElementById('bcode-canvas'),
       sessionId, token, backendOrigin, allowedBackendOrigins, recoveryState, signal: controller.signal,
-      capabilities: globalThis.bcodeTuiConfig?.capabilities ?? {},
+      capabilities: { ...platform, ...globalThis.bcodeTuiConfig?.capabilities, dispose: () => platform.dispose() },
       onState: state => {
         if (current !== generation) return;
         lastState = state;
@@ -90,6 +99,7 @@ async function start() {
       host.focus();
     }
   } catch {
+    controller.abort();
     if (current === generation) status.textContent = 'Browser TUI unavailable. Draft recovery may require remount; verify session, launch token and backend access.';
   }
 }

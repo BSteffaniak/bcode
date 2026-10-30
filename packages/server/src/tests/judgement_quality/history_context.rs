@@ -14,29 +14,32 @@ async fn ordinary_history_context_reaches_base_model_off_on_and_fallback() {
         (QualityArm::AutoEligible, true),
     ] {
         REQUESTS.lock().unwrap().clear();
-        let mut state = state(arm, Feature::ContextReranking);
-        configure_normal_turn(&mut state);
-        state.startup_config.model.tool_output.context_chars = 32;
-        state
-            .startup_config
-            .auth
-            .profiles
-            .get_mut("quality-offline")
-            .unwrap()
-            .settings
-            .insert(
-                "env.FAKE_JUDGEMENT_YES_NO_PROBABILITIES".into(),
-                serde_json::json!({"candidate_0":0.1,"candidate_1":0.9}).to_string(),
-            );
-        if absent_model {
+        let state = Arc::new({
+            let mut state = state(arm, Feature::ContextReranking);
+            configure_normal_turn(&mut state);
+            state.startup_config.model.tool_output.context_chars = 32;
             state
                 .startup_config
-                .judgement
-                .selection
-                .as_mut()
+                .auth
+                .profiles
+                .get_mut("quality-offline")
                 .unwrap()
-                .model_id = "absent-offline-judge".into();
-        }
+                .settings
+                .insert(
+                    "env.FAKE_JUDGEMENT_YES_NO_PROBABILITIES".into(),
+                    serde_json::json!({"candidate_0":0.1,"candidate_1":0.9}).to_string(),
+                );
+            if absent_model {
+                state
+                    .startup_config
+                    .judgement
+                    .selection
+                    .as_mut()
+                    .unwrap()
+                    .model_id = "absent-offline-judge".into();
+            }
+            state
+        });
         let session = create_capture_session(&state, root.path()).await;
         let first = state
             .sessions
@@ -352,8 +355,11 @@ async fn unavailable_history_reference_preserves_request_and_unknown_observation
     let _guard = HARNESS_LOCK.lock().await;
     let root = tempfile::tempdir().unwrap();
     REQUESTS.lock().unwrap().clear();
-    let mut state = state(QualityArm::AutoEligible, Feature::ContextReranking);
-    configure_normal_turn(&mut state);
+    let state = Arc::new({
+        let mut state = state(QualityArm::AutoEligible, Feature::ContextReranking);
+        configure_normal_turn(&mut state);
+        state
+    });
     let session = create_capture_session(&state, root.path()).await;
     let completion = run_capture_turn_with_execution(
         &state,

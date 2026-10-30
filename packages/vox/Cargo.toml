@@ -15,7 +15,6 @@ name = "vox"
 path = "src/main.rs"
 
 [dependencies]
-arboard = { workspace = true, optional = true }
 audioadapter-buffers.workspace = true
 clap = { workspace = true, features = [
     "derive",
@@ -63,7 +62,7 @@ x11rb = { workspace = true, features = ["xtest", "xkb"], optional = true }
 tempfile.workspace = true
 
 [features]
-clipboard = ["dep:arboard"]
+clipboard = []
 default = []
 fail-on-warnings = []
 linux-desktop = ["native-audio", "local-inference", "wayland", "x11"]

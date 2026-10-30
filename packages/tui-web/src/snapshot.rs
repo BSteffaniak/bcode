@@ -34,6 +34,9 @@ struct Submission {
 #[derive(Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
 enum BrowserControl {
+    CancelTurn {
+        turn_id: String,
+    },
     Permission {
         permission_id: String,
         approved: bool,
@@ -308,7 +311,7 @@ impl SnapshotState {
         self.browser_request("direction", &direction)
     }
 
-    /// Prepare only a narrow browser permission or producer-owned interaction input.
+    /// Prepare only a narrow browser permission, turn cancellation, or producer-owned interaction input.
     /// This does not retain a retry receipt or authorize arbitrary session actions.
     ///
     /// # Errors
@@ -321,6 +324,11 @@ impl SnapshotState {
             serde_json::from_str(json).map_err(|_| "invalid browser control")?;
         let snapshot = self.snapshot().ok_or("missing observation")?;
         match &action {
+            BrowserControl::CancelTurn { turn_id } => {
+                if turn_id.is_empty() || snapshot.runtime.active_turn_id.as_ref() != Some(turn_id) {
+                    return Err("stale browser control");
+                }
+            }
             BrowserControl::Permission {
                 permission_id,
                 remember,
@@ -390,6 +398,9 @@ impl SnapshotState {
             return Err("unsupported control schema");
         }
         match (action, response.outcome) {
+            (BrowserControl::CancelTurn { .. }, SessionViewActionOutcome::Cancelled { .. }) => {
+                Ok(())
+            }
             (
                 BrowserControl::Permission { .. },
                 SessionViewActionOutcome::PermissionResolved { .. },
@@ -450,6 +461,12 @@ impl SnapshotState {
         }
         self.pending = recovery.pending;
         Ok(())
+    }
+
+    /// Revision of the accepted canonical observation, for committed input fencing.
+    #[must_use]
+    pub fn revision(&self) -> Option<u64> {
+        self.accepted.as_ref().map(|value| value.revision)
     }
 
     /// The unmodified accepted semantic snapshot.
@@ -539,6 +556,36 @@ mod tests {
         let mut snapshot = SessionViewSnapshot::empty();
         snapshot.session_id = Some(SESSION.parse().unwrap());
         serde_json::json!({"schema_version":1,"epoch":EPOCH,"revision":revision,"snapshot":snapshot}).to_string()
+    }
+
+    #[test]
+    fn cancel_control_is_fenced_to_exact_active_turn_and_receipt_kind() {
+        let mut snapshot = SessionViewSnapshot::empty();
+        snapshot.session_id = Some(SESSION.parse().unwrap());
+        snapshot.runtime.active_turn_id = Some("active".into());
+        let mut state = SnapshotState::new(SESSION.into()).unwrap();
+        state.accept(&serde_json::json!({"schema_version":1,"epoch":EPOCH,"revision":u64::MAX,"snapshot":snapshot}).to_string()).unwrap();
+        let action = r#"{"type":"cancel_turn","turn_id":"active"}"#;
+        let request = state.prepare_control(action).unwrap();
+        assert!(request.contains("18446744073709551615"));
+        assert!(
+            state
+                .prepare_control(r#"{"type":"cancel_turn","turn_id":"stale"}"#)
+                .is_err()
+        );
+        assert!(
+            state
+                .accept_control(
+                    action,
+                    r#"{"schema_version":1,"outcome":{"type":"cancelled","cancelled":true}}"#
+                )
+                .is_ok()
+        );
+        assert!(
+            state
+                .accept_control(action, r#"{"schema_version":1,"outcome":{"type":"none"}}"#)
+                .is_err()
+        );
     }
 
     #[test]

@@ -148,6 +148,138 @@ impl<'a> InteractionApplicationHandle<'a> {
         .await)
     }
 
+    /// Discover bounded committed public views for exactly one authorized session.
+    ///
+    /// # Errors
+    /// Rejects unauthorized/incompatible consumers, disabled storage, invalid bounds,
+    /// changed canonical generations and unverifiable source/producer records.
+    pub async fn durable_controllers(
+        &self,
+        session_id: SessionId,
+        query: bcode_plugin_models::interaction_controller::DurableInteractionQuery,
+    ) -> Result<
+        bcode_plugin_models::interaction_controller::DurableInteractionPage,
+        InteractionControllerError,
+    > {
+        self.require_session(session_id).await?;
+        if !interaction_operations::client_supports_controller(self.state, self.client_id).await {
+            return Err(InteractionControllerError::Unauthorized);
+        }
+        crate::durable_interaction::committed_views_page(self.state, session_id, query).await
+    }
+
+    /// Open a session-owned controller through canonical source admission and CAS.
+    ///
+    /// The coordinator supplies the canonical storage adapter; the ephemeral registry
+    /// is intentionally not consulted. Publication remains disabled pending upgrade.
+    ///
+    /// # Errors
+    /// Rejects disabled compatibility, unauthorized consumers and unproved authority.
+    pub(crate) async fn open_durable_controller(
+        &self,
+        store: &impl crate::durable_interaction::DurableInteractionStore,
+        version: u32,
+        binding: &bcode_plugin_models::interaction_controller::DurableInteractionBinding,
+    ) -> Result<
+        bcode_plugin_models::interaction_controller::DurableInteractionView,
+        InteractionControllerError,
+    > {
+        let session_id = self.require_durable_session(version, binding).await?;
+        let cancellation = bcode_plugin_sdk::ServiceCancellation::default();
+        crate::durable_interaction::DurableController {
+            store,
+            plugins: &self.state.plugins,
+            session_id,
+            scope: bcode_plugin::PluginInvocationScope::session(session_id.to_string())
+                .with_client_id(self.client_id.to_string())
+                .with_turn_id(&binding.turn_id),
+            cancellation: &cancellation,
+        }
+        .open(binding)
+        .await
+    }
+
+    /// Read a committed view, including terminal state, without requiring a live wait.
+    ///
+    /// # Errors
+    /// Rejects disabled compatibility, unauthorized consumers and incompatible checkpoints.
+    pub(crate) async fn durable_controller_view(
+        &self,
+        store: &impl crate::durable_interaction::DurableInteractionStore,
+        version: u32,
+        binding: &bcode_plugin_models::interaction_controller::DurableInteractionBinding,
+    ) -> Result<
+        bcode_plugin_models::interaction_controller::DurableInteractionView,
+        InteractionControllerError,
+    > {
+        let session_id = self.require_durable_session(version, binding).await?;
+        let cancellation = bcode_plugin_sdk::ServiceCancellation::default();
+        crate::durable_interaction::DurableController {
+            store,
+            plugins: &self.state.plugins,
+            session_id,
+            scope: bcode_plugin::PluginInvocationScope::session(session_id.to_string())
+                .with_client_id(self.client_id.to_string())
+                .with_turn_id(&binding.turn_id),
+            cancellation: &cancellation,
+        }
+        .view(binding)
+        .await
+    }
+
+    /// Restore, validate and commit semantic input before returning its exact receipt.
+    ///
+    /// # Errors
+    /// Rejects disabled compatibility, conflicting retries, stale revisions and lost ownership.
+    pub(crate) async fn durable_controller_input(
+        &self,
+        store: &impl crate::durable_interaction::DurableInteractionStore,
+        input: &bcode_plugin_models::interaction_controller::DurableInteractionInput,
+    ) -> Result<
+        bcode_plugin_models::interaction_controller::DurableInteractionReceipt,
+        InteractionControllerError,
+    > {
+        let session_id = self
+            .require_durable_session(input.version, &input.binding)
+            .await?;
+        let cancellation = bcode_plugin_sdk::ServiceCancellation::default();
+        crate::durable_interaction::DurableController {
+            store,
+            plugins: &self.state.plugins,
+            session_id,
+            scope: bcode_plugin::PluginInvocationScope::session(session_id.to_string())
+                .with_client_id(self.client_id.to_string())
+                .with_turn_id(&input.binding.turn_id),
+            cancellation: &cancellation,
+        }
+        .input(input)
+        .await
+    }
+
+    async fn require_durable_session(
+        &self,
+        version: u32,
+        binding: &bcode_plugin_models::interaction_controller::DurableInteractionBinding,
+    ) -> Result<SessionId, InteractionControllerError> {
+        use bcode_plugin_models::interaction_controller::DURABLE_INTERACTION_VERSION;
+        if version != DURABLE_INTERACTION_VERSION {
+            return Err(InteractionControllerError::InvalidContract);
+        }
+        binding.validate()?;
+        let session_id = binding
+            .session_id
+            .parse()
+            .map_err(|_| InteractionControllerError::InvalidContract)?;
+        self.require_session(session_id).await?;
+        if !interaction_operations::client_supports_controller(self.state, self.client_id).await {
+            return Err(InteractionControllerError::Unauthorized);
+        }
+        if !crate::durable_interaction::PUBLICATION_ENABLED {
+            return Err(InteractionControllerError::Unavailable);
+        }
+        Ok(session_id)
+    }
+
     /// Open a dynamically discovered plugin-owned semantic controller.
     ///
     /// # Errors
@@ -278,6 +410,55 @@ impl<'a> InteractionApplicationHandle<'a> {
 impl bcode_plugin_sdk::interaction_application::InteractionApplication
     for InteractionApplicationHandle<'_>
 {
+    async fn durable_controllers(
+        &self,
+        session_id: String,
+        query: bcode_plugin_models::interaction_controller::DurableInteractionQuery,
+    ) -> Result<
+        bcode_plugin_models::interaction_controller::DurableInteractionPage,
+        InteractionControllerError,
+    > {
+        let session_id = session_id
+            .parse()
+            .map_err(|_| InteractionControllerError::InvalidContract)?;
+        InteractionApplicationHandle::durable_controllers(self, session_id, query).await
+    }
+
+    async fn open_durable_controller(
+        &self,
+        version: u32,
+        binding: bcode_plugin_models::interaction_controller::DurableInteractionBinding,
+    ) -> Result<
+        bcode_plugin_models::interaction_controller::DurableInteractionView,
+        InteractionControllerError,
+    > {
+        let store = crate::durable_store_for_binding(self.state, &binding).await;
+        InteractionApplicationHandle::open_durable_controller(self, &store, version, &binding).await
+    }
+
+    async fn durable_controller_view(
+        &self,
+        version: u32,
+        binding: bcode_plugin_models::interaction_controller::DurableInteractionBinding,
+    ) -> Result<
+        bcode_plugin_models::interaction_controller::DurableInteractionView,
+        InteractionControllerError,
+    > {
+        let store = crate::durable_store_for_binding(self.state, &binding).await;
+        InteractionApplicationHandle::durable_controller_view(self, &store, version, &binding).await
+    }
+
+    async fn durable_controller_input(
+        &self,
+        input: bcode_plugin_models::interaction_controller::DurableInteractionInput,
+    ) -> Result<
+        bcode_plugin_models::interaction_controller::DurableInteractionReceipt,
+        InteractionControllerError,
+    > {
+        let store = crate::durable_store_for_binding(self.state, &input.binding).await;
+        InteractionApplicationHandle::durable_controller_input(self, &store, &input).await
+    }
+
     async fn pending_exchanges(
         &self,
         session_id: SessionId,

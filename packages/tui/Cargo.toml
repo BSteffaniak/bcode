@@ -124,6 +124,9 @@ static-bundled-filesystem-plugin = [
     "bcode_bundled_plugins/static-bundled-filesystem-plugin",
 ]
 static-bundled-plugins = ["bcode_bundled_plugins/static-bundled-plugins"]
+static-bundled-question-plugin = [
+    "bcode_bundled_plugins/static-bundled-question-plugin",
+]
 static-bundled-shell-plugin = [
     "bcode_bundled_plugins/static-bundled-shell-plugin",
 ]

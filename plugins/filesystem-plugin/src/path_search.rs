@@ -572,7 +572,10 @@ mod unix {
                 &mut |progress| self.resume_workspace(progress, &build_request, grant, rules),
             );
             match inventory {
-                Ok(paths) => {
+                Ok((paths, incomplete)) => {
+                    if let Some(reason) = incomplete {
+                        self.mark(&reason);
+                    }
                     if let Ok(workspace_root) =
                         super::super::confined::open_directory(&grant.workspace_root)
                     {
@@ -654,6 +657,11 @@ mod unix {
                             .pending
                             .push((child.into(), depth + 1, rules.clone()));
                     }
+                }
+                // Successful enumeration may retain valid peers while skipping
+                // non-UTF-8 names. Preserve that status with the cached paths.
+                if progress.incomplete.is_none() {
+                    progress.incomplete = build.response.reason.take();
                 }
                 progress.directories.insert(relative, before);
                 progress.paths.extend(captured);

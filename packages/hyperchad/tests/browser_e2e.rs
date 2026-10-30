@@ -11,6 +11,7 @@
 //! Coordinator invocation after building the actual WASM distribution:
 //! `BCODE_E2E_CHROMIUM=/absolute/chromium BCODE_E2E_BUNDLE=/absolute/dist
 //! BCODE_E2E_PYTHON=/absolute/python3 cargo test --locked -p bcode_hyperchad
+//! --features renderer-html-actix,static-bundled-question-plugin
 //! --test browser_e2e -- --ignored --nocapture`
 //! Run under the locked Nix toolchain; no build or browser fallback is performed.
 
@@ -31,6 +32,22 @@ use serde_json::{Value, json};
 use sha2::{Digest as _, Sha256};
 
 type TestResult<T> = Result<T, Box<dyn std::error::Error + Send + Sync>>;
+
+#[path = "browser_acceptance/backend.rs"]
+mod backend;
+#[path = "browser_acceptance/policy_roundtrip.rs"]
+mod policy_roundtrip;
+#[path = "browser_acceptance/scenarios.rs"]
+mod scenarios;
+
+#[tokio::test]
+#[ignore = "exact-executable isolated backend child"]
+async fn production_backend_child() -> TestResult<()> {
+    let root = PathBuf::from(
+        std::env::var_os("BCODE_BACKEND_FIXTURE_ROOT").ok_or("fixture root required")?,
+    );
+    backend::serve(root).await
+}
 
 fn require(condition: bool, message: &str) -> TestResult<()> {
     if !condition {
@@ -62,11 +79,23 @@ fn production_actix_child() -> TestResult<()> {
         &bcode_config::ConfigEnvironmentSnapshot::new(BTreeMap::new(), root.clone()),
     )?;
     let client = BcodeClient::for_state_location(endpoint, locations.primary());
+    let policy = bcode_tui::browser_presentation::export_with_plugins(
+        &config(),
+        &root,
+        &bcode_plugin::PluginSelection {
+            mode: bcode_plugin::PluginSelectionMode::Explicit,
+            enabled: plugin_ids().into_iter().collect(),
+            disabled: BTreeSet::new(),
+        },
+        &static_plugins(),
+    )?;
     let state = HyperChadAppState::new_in_working_directory(
         client,
         fixture["token"].as_str().ok_or("token")?,
         root,
-    );
+    )
+    .with_browser_policy(policy)?;
+    let origin_state = state.clone();
     let address_file = PathBuf::from(fixture["address_file"].as_str().ok_or("address_file")?);
     let builder = bcode_hyperchad::init_with_snapshot(
         bcode_session_view_models::SessionViewSnapshot::empty(),
@@ -76,6 +105,9 @@ fn production_actix_child() -> TestResult<()> {
     .with_actix_bind_address("127.0.0.1".to_owned())
     .with_actix_port(0)
     .with_actix_on_bound(move |address| {
+        let _state = origin_state.clone().with_browser_origins(&[
+            format!("http://{address}"), "https://embed.example.invalid".into(),
+        ]).expect("install exact fixture listener and embed origins");
         std::fs::write(&address_file, address.to_string()).expect("publish test listener");
     })
     .with_static_asset_route(StaticAssetRoute {
@@ -88,17 +120,37 @@ fn production_actix_child() -> TestResult<()> {
         not_found_behavior: None,
     })
     .with_static_asset_route(StaticAssetRoute {
+        route: "production-evidence.mjs".into(),
+        target: AssetPathTarget::FileContents(
+            include_bytes!("../../tui-web/tests/production-evidence.mjs")
+                .as_slice()
+                .into(),
+        ),
+        not_found_behavior: None,
+    })
+    .with_static_asset_route(StaticAssetRoute {
+        route: "production-scenarios.mjs".into(),
+        target: AssetPathTarget::FileContents(
+            include_bytes!("../../tui-web/tests/production-scenarios.mjs").as_slice().into(),
+        ),
+        not_found_behavior: None,
+    })
+    .with_static_asset_route(StaticAssetRoute {
         route: "fixture.json".into(),
         target: AssetPathTarget::FileContents(
-            serde_json::to_vec(&json!({"session": fixture["session"], "token": fixture["token"]}))?
+            serde_json::to_vec(&json!({"session": fixture["session"], "token": fixture["token"], "scenarios": fixture["scenarios"]}))?
                 .into(),
         ),
         not_found_behavior: None,
     });
     let assets =
         bcode_hyperchad::TuiAssets::load(Path::new(fixture["bundle"].as_str().ok_or("bundle")?))?;
-    let (app, _runtime) = bcode_hyperchad::build_app_with_runtime(assets.with_routes(builder))
+    let (mut app, _runtime) = bcode_hyperchad::build_app_with_runtime(assets.with_routes(builder))
         .map_err(|error| error.to_string())?;
+    bcode_hyperchad::configure_browser_origins(
+        &mut app,
+        &["https://embed.example.invalid".into()],
+    )?;
     app.handle_serve().map_err(|error| error.to_string())?;
     Ok(())
 }
@@ -111,18 +163,50 @@ impl Drop for ActixChild {
     }
 }
 
+fn static_plugins() -> Vec<bcode_plugin::StaticBundledPlugin> {
+    vec![
+        bcode_plugin::StaticBundledPlugin::new(
+            include_str!("../../../plugins/fake-provider-plugin/bcode-plugin.toml"),
+            bcode_fake_provider_plugin::static_plugin(),
+        ),
+        bcode_plugin::StaticBundledPlugin::new(
+            include_str!("../../../plugins/question-plugin/bcode-plugin.toml"),
+            bcode_question_plugin::static_plugin(),
+        ),
+        bcode_plugin::StaticBundledPlugin::new(
+            include_str!("../../../plugins/shell-plugin/bcode-plugin.toml"),
+            bcode_shell_plugin::static_plugin(),
+        ),
+        bcode_plugin::StaticBundledPlugin::new(
+            include_str!("../../../plugins/filesystem-plugin/bcode-plugin.toml"),
+            bcode_filesystem_plugin::static_plugin(),
+        ),
+    ]
+}
+
+fn plugin_ids() -> Vec<String> {
+    vec![
+        "bcode.fake-provider".into(),
+        "bcode.question".into(),
+        "bcode.filesystem".into(),
+        "bcode.shell".into(),
+    ]
+}
+
 fn plugins() -> TestResult<bcode_plugin::PluginRuntimeHost> {
     Ok(
         bcode_plugin::PluginRuntimeHost::load_defaults_with_static_bundled(
             &bcode_plugin::PluginSelection {
                 mode: bcode_plugin::PluginSelectionMode::Explicit,
-                enabled: BTreeSet::from(["bcode.fake-provider".into()]),
+                enabled: BTreeSet::from([
+                    "bcode.fake-provider".into(),
+                    "bcode.question".into(),
+                    "bcode.filesystem".into(),
+                    "bcode.shell".into(),
+                ]),
                 disabled: BTreeSet::new(),
             },
-            &[bcode_plugin::StaticBundledPlugin::new(
-                include_str!("../../../plugins/fake-provider-plugin/bcode-plugin.toml"),
-                bcode_fake_provider_plugin::static_plugin(),
-            )],
+            &static_plugins(),
         )?,
     )
 }
@@ -131,6 +215,57 @@ fn config() -> bcode_config::BcodeConfig {
     let mut config = bcode_config::BcodeConfig::default();
     config.model.provider_plugin_id = Some("bcode.fake-provider".into());
     config.model.model_id = Some("fake-echo".into());
+    config
+        .tui
+        .keybindings
+        .chat
+        .insert("enter".into(), "tui.input.newline".into());
+    config
+        .tui
+        .keybindings
+        .chat
+        .insert("ctrl+enter".into(), "tui.input.submitSteering".into());
+    config
+        .tui
+        .keybindings
+        .chat
+        .insert("ctrl+alt+x".into(), "app.interrupt".into());
+    config
+        .model
+        .settings
+        .insert("fake_prompt_tool_directives".into(), "true".into());
+    config
+        .agent
+        .entry("build".into())
+        .or_default()
+        .permission
+        .write
+        .insert(
+            "*".into(),
+            serde_json::from_value(json!("ask")).expect("ask policy"),
+        );
+    config
+        .agent
+        .entry("build".into())
+        .or_default()
+        .permission
+        .read
+        .insert(
+            "*".into(),
+            serde_json::from_value(json!("allow")).expect("read policy"),
+        );
+    config.tools.shell.env.mode = bcode_config::ShellToolEnvMode::Inherit;
+    config
+        .agent
+        .entry("build".into())
+        .or_default()
+        .permission
+        .command
+        .insert(
+            "cat browser-overbudget.txt".into(),
+            serde_json::from_value(json!("allow")).expect("exact fixture command policy"),
+        );
+    scenarios::configure(&mut config);
     config.skills.enabled = false;
     config.model.prompt_cache.mode = serde_json::from_value(json!("off"))
         .expect("valid isolated fake-provider prompt cache mode");
@@ -225,6 +360,9 @@ fn canonical(events: &[SessionEvent], receipt: &SubmissionReceipt, text: &str) -
     )
 }
 
+// This integration lifecycle keeps fixture startup, browser execution, and
+// canonical verification in one scope so their owned children cannot escape cleanup.
+#[allow(clippy::too_many_lines)]
 async fn exercise(
     client: &BcodeClient,
     root: &Path,
@@ -236,6 +374,7 @@ async fn exercise(
     let session = client
         .create_session_in_working_directory(Some("browser-e2e".into()), root.to_path_buf())
         .await?;
+    let scenarios = scenarios::create(client, root).await?;
     let token = SessionId::new().to_string();
     let address_file = root.join("actix-address");
     let fixture_file = root.join("actix-fixture.json");
@@ -247,6 +386,7 @@ async fn exercise(
             "state_root": root.join("state"),
             "token": token,
             "session": session.id,
+            "scenarios": scenarios,
             "bundle": bundle,
             "address_file": address_file,
         }))?,
@@ -276,6 +416,7 @@ async fn exercise(
     })
     .await??;
     let script = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../scripts/test-tui-web-e2e.py");
+    let fixture_root = root.to_path_buf();
     let output = tokio::task::spawn_blocking(move || {
         std::process::Command::new(python)
             .arg(script)
@@ -287,6 +428,8 @@ async fn exercise(
             .arg(format!("http://{address}"))
             .arg("--session")
             .arg(session.id.to_string())
+            .arg("--fixture-root")
+            .arg(fixture_root)
             .arg("--token")
             .arg(token)
             .output()
@@ -294,6 +437,22 @@ async fn exercise(
     .await;
     drop(http);
     let output = output??;
+    if !output.status.success() {
+        let events = history(client, session.id).await?;
+        let accepted = events
+            .iter()
+            .filter(|event| matches!(event.kind, SessionEventKind::SubmissionAccepted { .. }))
+            .count();
+        let activated = events
+            .iter()
+            .filter(|event| matches!(event.kind, SessionEventKind::SubmissionActivated { .. }))
+            .count();
+        eprintln!(
+            "BROWSER_FAILURE_CANONICAL session={} events={} accepted={accepted} activated={activated}",
+            session.id,
+            events.len()
+        );
+    }
     require(
         output.status.success(),
         &format!(
@@ -304,12 +463,37 @@ async fn exercise(
     )?;
     let report: Value = serde_json::from_slice(&output.stdout)?;
     require(report["passed"] == true, "browser did not pass")?;
+    require(
+        report["negative_controls"] == 7 && report["disposed_requests"] == 0,
+        "browser omitted stale-control or disposal assertions",
+    )?;
+    let checkpoints = report["checkpoints"]
+        .as_array()
+        .ok_or("browser omitted committed Canvas checkpoints")?;
+    require(checkpoints.len() == 4, "incomplete Canvas checkpoints")?;
+    for checkpoint in checkpoints {
+        require(
+            checkpoint["ink"].as_u64().is_some_and(|ink| ink > 0)
+                && checkpoint["pixel_sha256"]
+                    .as_str()
+                    .is_some_and(|digest| digest.len() == 64),
+            "invalid committed Canvas checkpoint",
+        )?;
+    }
     let receipt: SubmissionReceipt = serde_json::from_value(report["receipt"].clone())?;
     let text = report["text"]
         .as_str()
         .ok_or("browser omitted submitted text")?
         .to_owned();
-    canonical(&history(client, session.id).await?, &receipt, &text)?;
+    let canonical_events = history(client, session.id).await?;
+    canonical(&canonical_events, &receipt, &text)?;
+    require(
+        !canonical_events
+            .iter()
+            .any(|event| matches!(event.kind, SessionEventKind::PermissionResolved { .. })),
+        "rejected browser controls must not resolve canonical permissions",
+    )?;
+    scenarios::canonical(client, root, &scenarios, &report["scenarios"]).await?;
     // Read back through a fresh client, not retained HTTP/browser state.
     println!(
         "BROWSER_E2E {}",
@@ -373,6 +557,10 @@ fn explicit_path(name: &str) -> TestResult<PathBuf> {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore = "requires explicit BCODE_E2E_CHROMIUM, BCODE_E2E_BUNDLE and BCODE_E2E_PYTHON; no builds or user runtime"]
 async fn real_wasm_registered_router_durable_retry_and_restart() -> TestResult<()> {
+    require(
+        cfg!(feature = "static-bundled-question-plugin"),
+        "real production acceptance requires static-bundled-question-plugin controller registration",
+    )?;
     let chromium = explicit_path("BCODE_E2E_CHROMIUM")?;
     let bundle = explicit_path("BCODE_E2E_BUNDLE")?;
     let python = explicit_path("BCODE_E2E_PYTHON")?;
@@ -418,48 +606,33 @@ async fn real_wasm_registered_router_durable_retry_and_restart() -> TestResult<(
             && selection.model_id.as_deref() == Some("fake-echo"),
         "ambient model selection conflicts with isolated fake provider; unset model/provider overrides",
     )?;
-    let shutdown = bcode_agent_runtime::CancellationToken::new();
-    let server = bcode_server::run_embedded_with_locations_and_shutdown(
-        endpoint.clone(),
-        test_config,
-        plugins()?,
-        bcode_model_catalog::ModelCatalogResolver::embedded(),
-        vec!["bcode.fake-provider".into()],
-        shutdown.clone(),
-        Some(locations.clone()),
-    );
+    let mut backend = backend::spawn(directory.path())?;
+    ready(&client).await?;
     let work = async {
         let result = exercise(&client, directory.path(), chromium, bundle, python).await;
-        shutdown.cancel();
+        std::fs::write(
+            directory.path().join("browser-exercise-finished"),
+            b"finished",
+        )?;
         result
     };
-    let (server_result, result) = tokio::join!(server, work);
-    server_result?;
+    let restart = backend::restart_on_request(directory.path(), &client, &mut backend);
+    let (result, restart_result) = tokio::join!(work, restart);
     let (session, receipt, text, operation) = result?;
-    let shutdown = bcode_agent_runtime::CancellationToken::new();
-    let server = bcode_server::run_embedded_with_locations_and_shutdown(
-        endpoint,
-        config(),
-        plugins()?,
-        bcode_model_catalog::ModelCatalogResolver::embedded(),
-        vec!["bcode.fake-provider".into()],
-        shutdown.clone(),
-        Some(locations),
-    );
-    let verify = async {
-        let result = retry_after_restart(
-            &client,
-            directory.path(),
-            session,
-            &receipt,
-            &text,
-            &operation,
-        )
-        .await;
-        shutdown.cancel();
-        result
-    };
-    let (server_result, result) = tokio::join!(server, verify);
-    server_result?;
+    restart_result?;
+    backend.0.kill()?;
+    backend.0.wait()?;
+    backend = backend::spawn(directory.path())?;
+    ready(&client).await?;
+    let result = retry_after_restart(
+        &client,
+        directory.path(),
+        session,
+        &receipt,
+        &text,
+        &operation,
+    )
+    .await;
+    drop(backend);
     result
 }

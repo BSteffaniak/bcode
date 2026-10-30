@@ -87,83 +87,6 @@ impl PermissionObservation {
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn checkpoint(session: SessionId, id: &str) -> ScopedPermissionCheckpoint {
-        ScopedPermissionCheckpoint {
-            identity: bcode_session_models::PermissionCheckpointIdentity {
-                permission_id: id.into(),
-                checkpoint_digest: "a".repeat(64),
-            },
-            permission: PermissionSummary {
-                permission_id: id.into(),
-                interaction_route: None,
-                session_id: session,
-                tool_call_id: "call".into(),
-                tool_name: "tool".into(),
-                arguments_json: "{}".into(),
-                batch: None,
-                agent_id: "build".into(),
-                policy_source: None,
-                policy_reason: None,
-                can_remember_policy: false,
-            },
-        }
-    }
-
-    #[test]
-    fn decisions_copy_exact_checkpoint_and_reject_incomplete_or_individual_batch_authority() {
-        let session = SessionId::new();
-        let mut observation = PermissionObservation::default();
-        let mut first = checkpoint(session, "p1");
-        observation.checkpoints.insert("p1".into(), first.clone());
-        let decision = observation
-            .decision(session, Some("p1"), None, true, false)
-            .unwrap();
-        assert_eq!(decision.expected, vec![first.identity.clone()]);
-        assert!(
-            observation
-                .decision(session, Some("p1"), None, true, true)
-                .is_err()
-        );
-        first.permission.batch = Some(bcode_session_models::PermissionBatchCorrelation {
-            batch_id: "batch".into(),
-            call_index: 0,
-            call_count: 2,
-        });
-        let mut second = checkpoint(session, "p2");
-        second.permission.batch = Some(bcode_session_models::PermissionBatchCorrelation {
-            batch_id: "batch".into(),
-            call_index: 1,
-            call_count: 2,
-        });
-        observation.checkpoints.insert("p1".into(), first.clone());
-        observation.checkpoints.insert("p2".into(), second.clone());
-        assert!(
-            observation
-                .decision(session, Some("p1"), None, true, false)
-                .is_err()
-        );
-        assert!(
-            observation
-                .decision(session, None, Some("batch"), true, false)
-                .is_err()
-        );
-        observation.batches.insert("batch".into());
-        let decision = observation
-            .decision(session, None, Some("batch"), true, false)
-            .unwrap();
-        assert_eq!(decision.expected, vec![first.identity, second.identity]);
-        assert!(
-            observation
-                .decision(session, None, Some("batch"), true, true)
-                .is_err()
-        );
-    }
-}
-
 impl crate::HyperChadAppState {
     pub(super) async fn browser_permission_observation(
         &self,
@@ -264,5 +187,82 @@ impl crate::HyperChadAppState {
             .map(|checkpoint| view(&checkpoint.permission))
             .collect();
         Ok(observation)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn checkpoint(session: SessionId, id: &str) -> ScopedPermissionCheckpoint {
+        ScopedPermissionCheckpoint {
+            identity: bcode_session_models::PermissionCheckpointIdentity {
+                permission_id: id.into(),
+                checkpoint_digest: "a".repeat(64),
+            },
+            permission: PermissionSummary {
+                permission_id: id.into(),
+                interaction_route: None,
+                session_id: session,
+                tool_call_id: "call".into(),
+                tool_name: "tool".into(),
+                arguments_json: "{}".into(),
+                batch: None,
+                agent_id: "build".into(),
+                policy_source: None,
+                policy_reason: None,
+                can_remember_policy: false,
+            },
+        }
+    }
+
+    #[test]
+    fn decisions_copy_exact_checkpoint_and_reject_incomplete_or_individual_batch_authority() {
+        let session = SessionId::new();
+        let mut observation = PermissionObservation::default();
+        let mut first = checkpoint(session, "p1");
+        observation.checkpoints.insert("p1".into(), first.clone());
+        let decision = observation
+            .decision(session, Some("p1"), None, true, false)
+            .unwrap();
+        assert_eq!(decision.expected, vec![first.identity.clone()]);
+        assert!(
+            observation
+                .decision(session, Some("p1"), None, true, true)
+                .is_err()
+        );
+        first.permission.batch = Some(bcode_session_models::PermissionBatchCorrelation {
+            batch_id: "batch".into(),
+            call_index: 0,
+            call_count: 2,
+        });
+        let mut second = checkpoint(session, "p2");
+        second.permission.batch = Some(bcode_session_models::PermissionBatchCorrelation {
+            batch_id: "batch".into(),
+            call_index: 1,
+            call_count: 2,
+        });
+        observation.checkpoints.insert("p1".into(), first.clone());
+        observation.checkpoints.insert("p2".into(), second.clone());
+        assert!(
+            observation
+                .decision(session, Some("p1"), None, true, false)
+                .is_err()
+        );
+        assert!(
+            observation
+                .decision(session, None, Some("batch"), true, false)
+                .is_err()
+        );
+        observation.batches.insert("batch".into());
+        let decision = observation
+            .decision(session, None, Some("batch"), true, false)
+            .unwrap();
+        assert_eq!(decision.expected, vec![first.identity, second.identity]);
+        assert!(
+            observation
+                .decision(session, None, Some("batch"), true, true)
+                .is_err()
+        );
     }
 }

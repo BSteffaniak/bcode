@@ -12,17 +12,19 @@ use serde_json::Value;
 use std::collections::BTreeMap;
 
 thread_local! {
-    static ACTIVE_THEME: std::cell::Cell<Option<bcode_plugin_sdk::tui::PluginTuiTheme>> = const {
+    pub(super) static ACTIVE_THEME: std::cell::Cell<Option<crate::filesystem_portable::VisualTheme>> = const {
         std::cell::Cell::new(None)
     };
 }
 
 /// Filesystem request/result TUI visual adapter.
+#[cfg(feature = "static-bundled")]
 #[derive(Default)]
 pub struct FilesystemTuiVisualAdapter {
     selection: std::sync::Mutex<Vec<bcode_plugin_sdk::tui::PluginTuiSelectionRow>>,
 }
 
+#[cfg(feature = "static-bundled")]
 impl bcode_plugin_sdk::tui::PluginTuiVisualAdapter for FilesystemTuiVisualAdapter {
     fn projection(
         &self,
@@ -34,7 +36,8 @@ impl bcode_plugin_sdk::tui::PluginTuiVisualAdapter for FilesystemTuiVisualAdapte
             kind,
             "bcode.filesystem.read" | "bcode.filesystem.artifact.read"
         ) {
-            ACTIVE_THEME.with(|theme| theme.set(context.theme()));
+            ACTIVE_THEME
+                .with(|theme| theme.set(crate::filesystem_portable::VisualContext::theme(context)));
             let (rows, anchors, source_rows) = read_layout(kind, payload, context.width(), context);
             ACTIVE_THEME.with(|theme| theme.set(None));
             let mut source_rows: BTreeMap<_, _> = source_rows
@@ -124,7 +127,8 @@ impl bcode_plugin_sdk::tui::PluginTuiVisualAdapter for FilesystemTuiVisualAdapte
         Vec<Line>,
         Vec<bcode_plugin_sdk::tui_visual::TuiVisualAnchor>,
     ) {
-        ACTIVE_THEME.with(|theme| theme.set(context.theme()));
+        ACTIVE_THEME
+            .with(|theme| theme.set(crate::filesystem_portable::VisualContext::theme(context)));
         let result = match kind {
             "bcode.filesystem.request" => request_layout(payload, context),
             "bcode.filesystem.request-draft.multi-edit" => {
@@ -161,7 +165,8 @@ impl bcode_plugin_sdk::tui::PluginTuiVisualAdapter for FilesystemTuiVisualAdapte
         payload: &Value,
         context: &bcode_plugin_sdk::tui::PluginTuiVisualRenderContext,
     ) -> Vec<Line> {
-        ACTIVE_THEME.with(|theme| theme.set(context.theme()));
+        ACTIVE_THEME
+            .with(|theme| theme.set(crate::filesystem_portable::VisualContext::theme(context)));
         let width = context.width();
         let rows = match kind {
             "bcode.filesystem.request-draft.multi-edit" => {
@@ -229,12 +234,12 @@ fn partial_json_members(input: &str, array: bool) -> Vec<(String, &str)> {
     members
 }
 
-fn multi_edit_draft_layout(
+pub fn multi_edit_draft_layout(
     payload: &Value,
-    context: &bcode_plugin_sdk::tui::PluginTuiVisualRenderContext,
+    context: &impl crate::filesystem_portable::VisualContext,
 ) -> (
     Vec<Line>,
-    Vec<bcode_plugin_sdk::tui_visual::TuiVisualAnchor>,
+    Vec<bcode_plugin_models::tui_visual::TuiVisualAnchor>,
 ) {
     let preview = text(payload, "preview").unwrap_or_default();
     let mut end = preview.len().min(64 * 1024);
@@ -290,22 +295,23 @@ fn multi_edit_draft_layout(
     (rows, anchors)
 }
 
+#[cfg(feature = "static-bundled")]
 fn request_draft_rows(
     kind: &str,
     payload: &Value,
     _width: u16,
-    context: &bcode_plugin_sdk::tui::PluginTuiVisualRenderContext,
+    context: &impl crate::filesystem_portable::VisualContext,
 ) -> Vec<Line> {
     request_draft_layout(kind, payload, context).0
 }
 
-fn request_draft_layout(
+pub fn request_draft_layout(
     kind: &str,
     payload: &Value,
-    context: &bcode_plugin_sdk::tui::PluginTuiVisualRenderContext,
+    context: &impl crate::filesystem_portable::VisualContext,
 ) -> (
     Vec<Line>,
-    Vec<bcode_plugin_sdk::tui_visual::TuiVisualAnchor>,
+    Vec<bcode_plugin_models::tui_visual::TuiVisualAnchor>,
 ) {
     let operation = if kind == "bcode.filesystem.request-draft.edit" {
         "edit"
@@ -519,19 +525,20 @@ fn decode_partial_json_string(encoded: &str) -> Option<String> {
     serde_json::from_str::<String>(&format!("\"{fragment}\"")).ok()
 }
 
+#[cfg(feature = "static-bundled")]
 fn request_rows(
     payload: &Value,
-    context: &bcode_plugin_sdk::tui::PluginTuiVisualRenderContext,
+    context: &impl crate::filesystem_portable::VisualContext,
 ) -> Vec<Line> {
     request_layout(payload, context).0
 }
 
-fn request_layout(
+pub fn request_layout(
     payload: &Value,
-    context: &bcode_plugin_sdk::tui::PluginTuiVisualRenderContext,
+    context: &impl crate::filesystem_portable::VisualContext,
 ) -> (
     Vec<Line>,
-    Vec<bcode_plugin_sdk::tui_visual::TuiVisualAnchor>,
+    Vec<bcode_plugin_models::tui_visual::TuiVisualAnchor>,
 ) {
     let arguments = payload.get("arguments").unwrap_or(payload);
     let operation = text(payload, "operation")
@@ -594,24 +601,25 @@ fn request_layout(
     (rows, Vec::new())
 }
 
+#[cfg(feature = "static-bundled")]
 fn read_rows(
     kind: &str,
     payload: &Value,
     width: u16,
-    context: &bcode_plugin_sdk::tui::PluginTuiVisualRenderContext,
+    context: &impl crate::filesystem_portable::VisualContext,
 ) -> Vec<Line> {
     read_layout(kind, payload, width, context).0
 }
 
-fn read_layout(
+pub fn read_layout(
     kind: &str,
     payload: &Value,
     width: u16,
-    context: &bcode_plugin_sdk::tui::PluginTuiVisualRenderContext,
+    context: &impl crate::filesystem_portable::VisualContext,
 ) -> (
     Vec<Line>,
-    Vec<bcode_plugin_sdk::tui_visual::TuiVisualAnchor>,
-    Vec<bcode_plugin_sdk::tui::PluginTuiSelectionRow>,
+    Vec<bcode_plugin_models::tui_visual::TuiVisualAnchor>,
+    Vec<bcode_plugin_models::tui_selection::PluginTuiSelectionRow>,
 ) {
     use std::hash::{Hash, Hasher};
     let mut anchors = Vec::new();
@@ -658,10 +666,10 @@ fn read_layout(
         for (index, row) in projection.rows.iter().enumerate() {
             let source = Line::from_spans(row.spans.clone()).plain_text();
             let start = row.source_offset;
-            anchors.push(bcode_plugin_sdk::tui_visual::TuiVisualAnchor {
+            anchors.push(bcode_plugin_models::tui_visual::TuiVisualAnchor {
                 key: format!("{identity}:{start}"),
                 row: rows.len() + 1 + index,
-                source: Some(bcode_plugin_sdk::tui_visual::TuiVisualSourceRange {
+                source: Some(bcode_plugin_models::tui_visual::TuiVisualSourceRange {
                     identity: identity.clone(),
                     start,
                     end: start + source.len(),
@@ -682,13 +690,15 @@ fn read_layout(
                 revision,
             )
             .into_iter()
-            .map(|fragment| bcode_plugin_sdk::tui::PluginTuiSelectionCell {
-                column: fragment.area.x,
-                width: fragment.area.width,
-                bytes: fragment.source_range,
-            })
+            .map(
+                |fragment| bcode_plugin_models::tui_selection::PluginTuiSelectionCell {
+                    column: fragment.area.x,
+                    width: fragment.area.width,
+                    bytes: fragment.source_range,
+                },
+            )
             .collect();
-            selection.push(bcode_plugin_sdk::tui::PluginTuiSelectionRow {
+            selection.push(bcode_plugin_models::tui_selection::PluginTuiSelectionRow {
                 identity: identity.clone(),
                 byte_start: start,
                 text: source,
@@ -710,9 +720,9 @@ fn read_layout(
     (rows, anchors, selection)
 }
 
-fn image_rows(
+pub fn image_rows(
     payload: &Value,
-    context: &bcode_plugin_sdk::tui::PluginTuiVisualRenderContext,
+    context: &impl crate::filesystem_portable::VisualContext,
 ) -> Vec<Line> {
     let mut rows = card_header("Image file");
     push_path_kv(&mut rows, "path", text(payload, "path"), context);
@@ -722,9 +732,9 @@ fn image_rows(
     rows
 }
 
-fn exists_rows(
+pub fn exists_rows(
     payload: &Value,
-    context: &bcode_plugin_sdk::tui::PluginTuiVisualRenderContext,
+    context: &impl crate::filesystem_portable::VisualContext,
 ) -> Vec<Line> {
     let exists = payload
         .get("exists")
@@ -744,9 +754,9 @@ fn exists_rows(
     rows
 }
 
-fn list_rows(
+pub fn list_rows(
     payload: &Value,
-    context: &bcode_plugin_sdk::tui::PluginTuiVisualRenderContext,
+    context: &impl crate::filesystem_portable::VisualContext,
 ) -> Vec<Line> {
     let entries = payload
         .get("entries")
@@ -767,7 +777,7 @@ fn list_rows(
             let (icon, icon_style) = path_icon(path, Some(kind));
             rows.push(Line::from_spans(vec![
                 Span::styled(format!("  {icon} "), icon_style),
-                Span::styled(context.display_path(path).to_string(), path_style()),
+                Span::styled(context.display_path(path), path_style()),
                 Span::styled(
                     if kind == "file" {
                         String::new()
@@ -788,9 +798,9 @@ fn list_rows(
     rows
 }
 
-fn find_rows(
+pub fn find_rows(
     payload: &Value,
-    context: &bcode_plugin_sdk::tui::PluginTuiVisualRenderContext,
+    context: &impl crate::filesystem_portable::VisualContext,
 ) -> Vec<Line> {
     let paths = payload
         .get("paths")
@@ -802,7 +812,7 @@ fn find_rows(
         for path in values.iter().filter_map(Value::as_str).take(30) {
             rows.push(Line::from_spans(vec![
                 path_icon_span(path, None, "  "),
-                Span::styled(context.display_path(path).to_string(), path_style()),
+                Span::styled(context.display_path(path), path_style()),
             ]));
         }
         if values.len() > 30 {
@@ -826,10 +836,10 @@ fn find_rows(
     rows
 }
 
-fn grep_rows(
+pub fn grep_rows(
     payload: &Value,
     width: u16,
-    context: &bcode_plugin_sdk::tui::PluginTuiVisualRenderContext,
+    context: &impl crate::filesystem_portable::VisualContext,
 ) -> Vec<Line> {
     let values = payload
         .get("matches")
@@ -855,7 +865,7 @@ fn grep_rows(
             }
             rows.push(Line::from_spans(vec![
                 path_icon_span(path, None, "  "),
-                Span::styled(context.display_path(path).to_string(), path_style()),
+                Span::styled(context.display_path(path), path_style()),
             ]));
             previous_path = Some(path);
         }
@@ -904,10 +914,10 @@ fn grep_rows(
     rows
 }
 
-fn metadata_rows(
+pub fn metadata_rows(
     kind: &str,
     payload: &Value,
-    context: &bcode_plugin_sdk::tui::PluginTuiVisualRenderContext,
+    context: &impl crate::filesystem_portable::VisualContext,
 ) -> Vec<Line> {
     let mut rows = card_header(if kind.contains("artifact") {
         "Artifact metadata"
@@ -947,7 +957,7 @@ fn push_path_kv(
     rows: &mut Vec<Line>,
     key: &str,
     path: Option<&str>,
-    context: &bcode_plugin_sdk::tui::PluginTuiVisualRenderContext,
+    context: &impl crate::filesystem_portable::VisualContext,
 ) {
     push_path_kv_with_kind(rows, key, path, None, context);
 }
@@ -957,13 +967,13 @@ fn push_path_kv_with_kind(
     key: &str,
     path: Option<&str>,
     kind: Option<&str>,
-    context: &bcode_plugin_sdk::tui::PluginTuiVisualRenderContext,
+    context: &impl crate::filesystem_portable::VisualContext,
 ) {
     if let Some(path) = path.filter(|path| !path.is_empty()) {
         rows.push(Line::from_spans(vec![
             Span::styled(format!("  {key}: "), label()),
             path_icon_span(path, kind, ""),
-            Span::styled(context.display_path(path).to_string(), value_style()),
+            Span::styled(context.display_path(path), value_style()),
         ]));
     }
 }
@@ -1051,31 +1061,14 @@ fn dimensions(payload: &Value) -> Option<String> {
     Some(format!("{width}×{height}"))
 }
 
-fn syntax_palette(
-    theme: bcode_plugin_sdk::tui::PluginTuiSyntaxTheme,
+const fn syntax_palette(
+    theme: bcode_syntax_render::SyntaxPalette,
 ) -> bcode_syntax_render::SyntaxPalette {
-    let color = |color: bcode_plugin_sdk::tui::PluginTuiSyntaxColor| {
-        bcode_syntax_render::SyntaxColor::from_tui(color.into())
-    };
-    bcode_syntax_render::SyntaxPalette {
-        text: color(theme.text),
-        comment: color(theme.comment),
-        keyword: color(theme.keyword),
-        function: color(theme.function),
-        variable: color(theme.variable),
-        string: color(theme.string),
-        number: color(theme.number),
-        type_name: color(theme.type_name),
-        operator: color(theme.operator),
-        punctuation: color(theme.punctuation),
-        heading: color(theme.heading),
-        link: color(theme.link),
-        raw: color(theme.raw),
-    }
+    theme
 }
 
 fn theme_style(
-    select: impl FnOnce(bcode_plugin_sdk::tui::PluginTuiTheme) -> Style,
+    select: impl FnOnce(crate::filesystem_portable::VisualTheme) -> Style,
     fallback: Style,
 ) -> Style {
     ACTIVE_THEME.with(|theme| theme.get().map_or(fallback, select))
@@ -1105,7 +1098,7 @@ fn muted() -> Style {
     theme_style(|theme| theme.muted, Style::new().fg(Color::BrightBlack))
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "static-bundled"))]
 mod tests {
     #[test]
     fn draft_layout_emits_source_lines_not_border_guesses() {
@@ -1136,7 +1129,7 @@ mod tests {
     use super::*;
     use std::path::Path;
 
-    fn terminal_native_syntax_theme() -> bcode_plugin_sdk::tui::PluginTuiTheme {
+    const fn terminal_native_syntax_theme() -> bcode_plugin_sdk::tui::PluginTuiTheme {
         use bcode_plugin_sdk::tui::{
             PluginTuiDiffTheme, PluginTuiSourceTheme, PluginTuiSyntaxColor, PluginTuiSyntaxTheme,
             PluginTuiTheme,

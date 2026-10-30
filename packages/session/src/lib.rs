@@ -70,6 +70,12 @@ pub(crate) mod db_row;
 pub(crate) mod db_runtime_work;
 pub(crate) mod db_validation;
 mod derivation;
+mod turn_continuation;
+pub use turn_continuation::{turn_continuation_descriptor_digest, turn_continuation_source_ref};
+mod durable_interaction;
+pub use durable_interaction::{
+    DurableInteractionCommitGuard, DurableInteractionFacts, DurableInteractionOperationRecord,
+};
 pub mod event_compression;
 pub mod history_compression;
 mod invocation_recovery;
@@ -183,6 +189,15 @@ fn ensure_durable_session_event_kind(
     kind: &SessionEventKind,
     metrics: Option<&MetricsRegistry>,
 ) -> Result<(), SessionError> {
+    if matches!(
+        kind,
+        SessionEventKind::DurableInteractionCommitted { .. }
+            | SessionEventKind::TurnContinuationCommitted { .. }
+    ) {
+        return Err(SessionError::EventSerialization(
+            "durable interactions require the typed canonical transaction".into(),
+        ));
+    }
     if matches!(kind, SessionEventKind::InertHistory { .. }) {
         return Err(SessionError::EventSerialization(
             "historical compatibility events cannot be appended".to_owned(),

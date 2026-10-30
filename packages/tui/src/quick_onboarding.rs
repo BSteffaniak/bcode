@@ -480,8 +480,16 @@ pub async fn run_quick_onboarding_in_shell(
     input.shutdown().await;
     match result {
         Ok(output) => Ok(output.program.outcome),
-        Err(bmux_tui_runtime::RuntimeError::Program { error, .. }) => Err(error),
-        Err(bmux_tui_runtime::RuntimeError::Presenter { error, .. }) => Err(error.into()),
+        Err(bmux_tui_runtime::RuntimeError::Program {
+            error,
+            cleanup_error,
+            ..
+        }) => Err(crate::runtime_error_with_cleanup(error, cleanup_error)),
+        Err(bmux_tui_runtime::RuntimeError::Presenter {
+            error,
+            cleanup_error,
+            ..
+        }) => Err(crate::runtime_error_with_cleanup(error, cleanup_error)),
     }
 }
 

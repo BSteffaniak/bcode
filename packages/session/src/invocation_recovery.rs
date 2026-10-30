@@ -470,17 +470,17 @@ mod tests {
 
     #[tokio::test]
     async fn positioned_checkpoint_reopens_exact_turn_request_and_permission() {
-        verify_positioned_checkpoint(false, false).await;
+        Box::pin(verify_positioned_checkpoint(false, false)).await;
     }
 
     #[tokio::test]
     async fn approved_checkpoint_dispatch_is_claimed_once_across_reopen() {
-        verify_positioned_checkpoint(true, false).await;
+        Box::pin(verify_positioned_checkpoint(true, false)).await;
     }
 
     #[tokio::test]
     async fn activated_checkpoint_preserves_acceptance_turn_id_across_reopen() {
-        verify_positioned_checkpoint(true, true).await;
+        Box::pin(verify_positioned_checkpoint(true, true)).await;
     }
 
     async fn checkpoint_turn(

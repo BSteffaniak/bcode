@@ -10,6 +10,22 @@ use bmux_tui::{
     paint::PaintCx,
 };
 
+pub(super) fn markdown_hits(accepted: &AcceptedTranscript) -> Vec<String> {
+    let area = Rect::new(0, 0, 40, 40);
+    let mut buffer = Buffer::empty(area);
+    let mut frame = Frame::new(&mut buffer);
+    let child = accepted.child("transcript", 0, "selection");
+    let layout = child.layout(Constraints::tight(area.size()), &mut LayoutCx::new());
+    child.paint(&layout, &mut PaintCx::new(&mut frame));
+    frame
+        .hits()
+        .regions()
+        .iter()
+        .filter(|hit| hit.id.as_str().starts_with("markdown:"))
+        .map(|hit| hit.id.as_str().to_owned())
+        .collect()
+}
+
 #[test]
 fn producer_actions_are_clipped_and_old_revision_hits_are_inert() {
     let mut source = document(TextFormat::PlainText, "fallback");

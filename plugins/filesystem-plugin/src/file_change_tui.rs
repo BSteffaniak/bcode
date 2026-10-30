@@ -8,10 +8,12 @@ use bmux_tui::prelude::Line;
 /// Filesystem file-change TUI visual adapter.
 #[derive(Default)]
 pub struct FileChangeTuiVisualAdapter {
-    previews: std::sync::Mutex<std::collections::BTreeMap<(String, String), SourcePreview>>,
+    previews: std::sync::Mutex<std::collections::BTreeMap<(String, String, String), SourcePreview>>,
 }
 
 struct SourcePreview {
+    item_revision: Option<u64>,
+    finalized: bool,
     revision: u64,
     total_bytes: u64,
     bytes: Vec<u8>,
@@ -25,6 +27,13 @@ fn source_preview_key(key: &str) -> bool {
     matches!(fields.as_slice(), ["file", index, "old" | "new"] | ["file", index, "old" | "new", "0"] if index.parse::<usize>().is_ok_and(|index| index < 64))
 }
 
+/// Producer-owned byte budget; unsupported references must not be prefetched.
+pub fn source_preview_limit(reference: &str, content_type: Option<&str>) -> Option<u64> {
+    (source_preview_key(reference) && content_type == Some("application/octet-stream"))
+        .then_some(SOURCE_PREVIEW_BYTES as u64)
+}
+
+#[cfg(feature = "static-bundled")]
 impl bcode_plugin_sdk::tui::PluginTuiVisualAdapter for FileChangeTuiVisualAdapter {
     fn supports(&self, kind: &str) -> bool {
         // Keep the old plugin-view schema as a local TUI-only replay shim for pre-artifact logs.
@@ -49,57 +58,22 @@ impl bcode_plugin_sdk::tui::PluginTuiVisualAdapter for FileChangeTuiVisualAdapte
         &self,
         chunk: &bcode_plugin_sdk::tui::PluginTuiArtifactChunk,
     ) -> Result<(), String> {
-        // Batch sources are immutable finalized artifacts, never live streams.
-        if !chunk.finalized
-            || chunk.schema_version != 1
-            || chunk.artifact_id.len() > 4096
-            || chunk.reference_key.len() > 64
-            || chunk.producer_plugin_id != "bcode.filesystem"
-            || !self.accepts_artifact_reference(
-                &chunk.schema,
-                &chunk.reference_key,
-                chunk.content_type.as_deref(),
-            )
-            || chunk.offset.saturating_add(chunk.bytes.len() as u64) > chunk.total_bytes
-        {
-            return Err("invalid filesystem preview chunk".to_owned());
-        }
-        // Retain only the first bounded window; the full source remains in artifact storage.
-        if chunk.offset >= SOURCE_PREVIEW_BYTES as u64 {
-            return Ok(());
-        }
-        let mut previews = self
-            .previews
-            .lock()
-            .map_err(|_| "filesystem preview unavailable")?;
-        let key = (chunk.artifact_id.clone(), chunk.reference_key.clone());
-        // The host advances independently of this disposable preview cache. An
-        // evicted stream may still deliver its tail; do not turn that into a
-        // permanent host fetch error or render the tail as a source prefix.
-        if chunk.offset != 0 && !previews.contains_key(&key) {
-            return Ok(());
-        }
-        if !previews.contains_key(&key) && previews.len() >= SOURCE_PREVIEW_ENTRIES {
-            previews.pop_first();
-        }
-        let preview = previews.entry(key).or_insert_with(|| SourcePreview {
-            revision: chunk.revision,
-            total_bytes: chunk.total_bytes,
-            bytes: Vec::new(),
-        });
-        if preview.revision != chunk.revision || preview.total_bytes != chunk.total_bytes {
-            return Err("conflicting finalized filesystem preview".to_owned());
-        }
-        let bytes = &mut preview.bytes;
-        if chunk.offset == 0 {
-            bytes.clear();
-        }
-        if chunk.offset != bytes.len() as u64 {
-            return Err("noncontiguous filesystem preview chunk".to_owned());
-        }
-        bytes.extend(chunk.bytes.iter().take(SOURCE_PREVIEW_BYTES - bytes.len()));
-        drop(previews);
-        Ok(())
+        self.deliver(
+            &bcode_tui_components::transcript::tool_visual::portable::PortableArtifactChunk {
+                invocation_id: &chunk.tool_call_id,
+                artifact_id: &chunk.artifact_id,
+                reference_key: &chunk.reference_key,
+                producer_plugin_id: &chunk.producer_plugin_id,
+                schema: &chunk.schema,
+                schema_version: chunk.schema_version,
+                content_type: chunk.content_type.as_deref(),
+                offset: chunk.offset,
+                total_bytes: chunk.total_bytes,
+                revision: chunk.revision,
+                finalized: chunk.finalized,
+                bytes: &chunk.bytes,
+            },
+        )
     }
 
     fn render_mode(
@@ -119,15 +93,149 @@ impl bcode_plugin_sdk::tui::PluginTuiVisualAdapter for FileChangeTuiVisualAdapte
         Vec<Line>,
         Vec<bcode_plugin_sdk::tui_visual::TuiVisualAnchor>,
     ) {
+        self.project(kind, payload, context)
+    }
+
+    fn rows(
+        &self,
+        kind: &str,
+        payload: &serde_json::Value,
+        context: &bcode_plugin_sdk::tui::PluginTuiVisualRenderContext,
+    ) -> Vec<Line> {
+        self.layout(kind, payload, context).0
+    }
+}
+
+impl FileChangeTuiVisualAdapter {
+    pub(super) fn deliver(
+        &self,
+        chunk: &bcode_tui_components::transcript::tool_visual::portable::PortableArtifactChunk<'_>,
+    ) -> Result<(), String> {
+        let key = (
+            chunk.invocation_id.to_owned(),
+            chunk.artifact_id.to_owned(),
+            chunk.reference_key.to_owned(),
+        );
+        // Reject conflicting deliveries before the preview cutoff; never leave
+        // an older source window available after detecting a replacement.
+        let mut previews = self
+            .previews
+            .lock()
+            .map_err(|_| "filesystem preview unavailable")?;
+        if previews.get(&key).is_some_and(|preview| {
+            preview.revision != chunk.revision
+                || preview.total_bytes != chunk.total_bytes
+                || preview.finalized != chunk.finalized
+        }) {
+            previews.remove(&key);
+            return Err("conflicting finalized filesystem preview".to_owned());
+        }
+        // Batch sources are immutable finalized artifacts, never live streams.
+        if chunk.invocation_id.is_empty()
+            || chunk.invocation_id.len() > 1024
+            || chunk.artifact_id.is_empty()
+            || chunk.revision == 0
+            || !chunk.finalized
+            || chunk.schema_version != 1
+            || chunk.artifact_id.len() > 4096
+            || chunk.reference_key.len() > 64
+            || chunk.producer_plugin_id != "bcode.filesystem"
+            || chunk.schema != "bcode.filesystem.batch"
+            || !source_preview_key(chunk.reference_key)
+            || chunk.content_type != Some("application/octet-stream")
+            || chunk.offset.saturating_add(chunk.bytes.len() as u64) > chunk.total_bytes
+        {
+            previews.remove(&key);
+            return Err("invalid filesystem preview chunk".to_owned());
+        }
+        // Retain only the first bounded window; the full source remains in artifact storage.
+        if chunk.offset >= SOURCE_PREVIEW_BYTES as u64 {
+            return Ok(());
+        }
+        // The host advances independently of this disposable preview cache. An
+        // evicted stream may still deliver its tail; do not turn that into a
+        // permanent host fetch error or render the tail as a source prefix.
+        if chunk.offset != 0 && !previews.contains_key(&key) {
+            return Ok(());
+        }
+        if !previews.contains_key(&key) && previews.len() >= SOURCE_PREVIEW_ENTRIES {
+            previews.pop_first();
+        }
+        let preview = previews
+            .entry(key.clone())
+            .or_insert_with(|| SourcePreview {
+                item_revision: None,
+                finalized: chunk.finalized,
+                revision: chunk.revision,
+                total_bytes: chunk.total_bytes,
+                bytes: Vec::new(),
+            });
+        let bytes = &mut preview.bytes;
+        if chunk.offset == 0 && !bytes.is_empty() {
+            let retained = chunk.bytes.len().min(SOURCE_PREVIEW_BYTES);
+            if bytes.get(..retained) == chunk.bytes.get(..retained) {
+                return Ok(());
+            }
+            previews.remove(&key);
+            return Err("conflicting duplicate filesystem preview".to_owned());
+        }
+        if chunk.offset != bytes.len() as u64 {
+            previews.remove(&key);
+            return Err("noncontiguous filesystem preview chunk".to_owned());
+        }
+        bytes.extend(chunk.bytes.iter().take(SOURCE_PREVIEW_BYTES - bytes.len()));
+        drop(previews);
+        Ok(())
+    }
+    pub(super) fn project(
+        &self,
+        kind: &str,
+        payload: &serde_json::Value,
+        context: &impl crate::filesystem_portable::VisualContext,
+    ) -> (
+        Vec<Line>,
+        Vec<bcode_plugin_models::tui_visual::TuiVisualAnchor>,
+    ) {
         if kind == "bcode.filesystem.batch" {
             let mut payload = payload.clone();
-            if let (Some(id), Ok(previews)) = (
+            let invocation = payload["_bcode_artifact"]["tool_call_id"]
+                .as_str()
+                .map(str::to_owned);
+            let item_revision = payload["_bcode_presentation_revision"]
+                .as_u64()
+                .unwrap_or_default();
+            let references = payload["_artifact_refs"]
+                .as_array()
+                .cloned()
+                .unwrap_or_default();
+            if let (Some(invocation), Some(id), Ok(mut previews)) = (
+                invocation,
                 payload["_bcode_artifact"]["artifact_id"]
                     .as_str()
                     .map(str::to_owned),
                 self.previews.lock(),
             ) && let Some(files) = payload["files"].as_array_mut()
             {
+                previews.retain(|(call, artifact, reference), preview| {
+                    if call != &invocation {
+                        return true;
+                    }
+                    let current = artifact == &id
+                        && preview.finalized
+                        && preview
+                            .item_revision
+                            .is_none_or(|revision| revision == item_revision)
+                        && references.iter().any(|value| {
+                            value["key"].as_str() == Some(reference)
+                                && value["content_type"].as_str()
+                                    == Some("application/octet-stream")
+                                && value["byte_len"].as_u64() == Some(preview.total_bytes)
+                        });
+                    if current {
+                        preview.item_revision = Some(item_revision);
+                    }
+                    current
+                });
                 for (index, file) in files.iter_mut().enumerate().take(64) {
                     if !file["edit_previews"].is_null() || file["change"]["omitted"] != true {
                         continue;
@@ -137,8 +245,14 @@ impl bcode_plugin_sdk::tui::PluginTuiVisualAdapter for FileChangeTuiVisualAdapte
                         .map(|side| {
                             let key = format!("file-{index}-{side}");
                             let bytes = &previews
-                                .get(&(id.clone(), key.clone()))
-                                .or_else(|| previews.get(&(id.clone(), format!("{key}-0"))))?
+                                .get(&(invocation.clone(), id.clone(), key.clone()))
+                                .or_else(|| {
+                                    previews.get(&(
+                                        invocation.clone(),
+                                        id.clone(),
+                                        format!("{key}-0"),
+                                    ))
+                                })?
                                 .bytes;
                             // A byte window can end inside a UTF-8 scalar. Drop only that suffix.
                             let end = std::str::from_utf8(bytes)
@@ -158,15 +272,6 @@ impl bcode_plugin_sdk::tui::PluginTuiVisualAdapter for FileChangeTuiVisualAdapte
         } else {
             file_change_layout(payload, context)
         }
-    }
-
-    fn rows(
-        &self,
-        kind: &str,
-        payload: &serde_json::Value,
-        context: &bcode_plugin_sdk::tui::PluginTuiVisualRenderContext,
-    ) -> Vec<Line> {
-        self.layout(kind, payload, context).0
     }
 }
 
@@ -296,12 +401,12 @@ fn retained_source_parts(value: &serde_json::Value) -> Option<Vec<(u64, &str)>> 
     (value["byte_len"].as_u64()? == offset).then_some(references)
 }
 
-fn batch_layout(
+pub fn batch_layout(
     payload: &serde_json::Value,
-    context: &bcode_plugin_sdk::tui::PluginTuiVisualRenderContext,
+    context: &impl crate::filesystem_portable::VisualContext,
 ) -> (
     Vec<Line>,
-    Vec<bcode_plugin_sdk::tui_visual::TuiVisualAnchor>,
+    Vec<bcode_plugin_models::tui_visual::TuiVisualAnchor>,
 ) {
     if context.width() == 0 {
         return (Vec::new(), Vec::new());
@@ -387,10 +492,10 @@ fn batch_layout(
 
 pub fn file_change_layout(
     payload: &serde_json::Value,
-    context: &bcode_plugin_sdk::tui::PluginTuiVisualRenderContext,
+    context: &impl crate::filesystem_portable::VisualContext,
 ) -> (
     Vec<Line>,
-    Vec<bcode_plugin_sdk::tui_visual::TuiVisualAnchor>,
+    Vec<bcode_plugin_models::tui_visual::TuiVisualAnchor>,
 ) {
     let width = context.width();
     let path = payload
@@ -455,7 +560,7 @@ pub fn file_change_layout(
     let projection = diff_viewer_layout_with_style(
         DiffViewerInput {
             syntax_palette,
-            label: &context.display_path(path).to_string(),
+            label: &context.display_path(path),
             old_text,
             new_text,
             old_start_line,
@@ -466,11 +571,13 @@ pub fn file_change_layout(
             argument_bytes,
             truncated,
             layout: match context.diff_layout() {
-                bcode_plugin_sdk::tui::PluginTuiDiffLayout::Auto { breakpoint } => {
+                bcode_tui_components::diff_viewer::DiffViewerLayout::Auto { breakpoint } => {
                     DiffViewerLayout::Auto { breakpoint }
                 }
-                bcode_plugin_sdk::tui::PluginTuiDiffLayout::Unified => DiffViewerLayout::Unified,
-                bcode_plugin_sdk::tui::PluginTuiDiffLayout::SideBySide => {
+                bcode_tui_components::diff_viewer::DiffViewerLayout::Unified => {
+                    DiffViewerLayout::Unified
+                }
+                bcode_tui_components::diff_viewer::DiffViewerLayout::SideBySide => {
                     DiffViewerLayout::SideBySide
                 }
             },
@@ -487,7 +594,7 @@ fn source_anchors(
     new_start_line: u32,
 ) -> (
     Vec<Line>,
-    Vec<bcode_plugin_sdk::tui_visual::TuiVisualAnchor>,
+    Vec<bcode_plugin_models::tui_visual::TuiVisualAnchor>,
 ) {
     let mut anchors = Vec::new();
     for mapping in projection.source_lines {
@@ -502,7 +609,7 @@ fn source_anchors(
         } else {
             new_start_line
         };
-        anchors.push(bcode_plugin_sdk::tui_visual::TuiVisualAnchor {
+        anchors.push(bcode_plugin_models::tui_visual::TuiVisualAnchor {
             key: format!("diff:{side}:{}", mapping.line.saturating_sub(start)),
             row: mapping.row,
             source: None,
@@ -511,30 +618,13 @@ fn source_anchors(
     (projection.rows, anchors)
 }
 
-fn syntax_palette(
-    theme: bcode_plugin_sdk::tui::PluginTuiSyntaxTheme,
+const fn syntax_palette(
+    theme: bcode_syntax_render::SyntaxPalette,
 ) -> bcode_syntax_render::SyntaxPalette {
-    let color = |color: bcode_plugin_sdk::tui::PluginTuiSyntaxColor| {
-        bcode_syntax_render::SyntaxColor::from_tui(color.into())
-    };
-    bcode_syntax_render::SyntaxPalette {
-        text: color(theme.text),
-        comment: color(theme.comment),
-        keyword: color(theme.keyword),
-        function: color(theme.function),
-        variable: color(theme.variable),
-        string: color(theme.string),
-        number: color(theme.number),
-        type_name: color(theme.type_name),
-        operator: color(theme.operator),
-        punctuation: color(theme.punctuation),
-        heading: color(theme.heading),
-        link: color(theme.link),
-        raw: color(theme.raw),
-    }
+    theme
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "static-bundled"))]
 mod tests {
     #[test]
     fn retained_diff_is_advertised_without_confusing_missing_or_partial_data() {
@@ -581,7 +671,7 @@ mod tests {
         };
         let (wide_rows, wide) = layout(90);
         let (narrow_rows, narrow) = layout(35);
-        let second = |anchors: &[bcode_plugin_sdk::tui_visual::TuiVisualAnchor]| {
+        let second = |anchors: &[bcode_plugin_models::tui_visual::TuiVisualAnchor]| {
             anchors
                 .iter()
                 .find(|a| a.key == "diff:new:1")
@@ -633,7 +723,7 @@ mod tests {
             &payload,
             &context(bcode_plugin_sdk::tui::PluginTuiDiffLayout::SideBySide),
         );
-        let keys = |anchors: &[bcode_plugin_sdk::tui_visual::TuiVisualAnchor]| {
+        let keys = |anchors: &[bcode_plugin_models::tui_visual::TuiVisualAnchor]| {
             anchors
                 .iter()
                 .map(|a| a.key.clone())
@@ -642,7 +732,7 @@ mod tests {
         assert_eq!(keys(&unified), keys(&split));
         assert_eq!(unified.len(), 4);
         for (rows, anchors) in [(&unified_rows, &unified), (&split_rows, &split)] {
-            bcode_plugin_sdk::tui_visual::validate_visual_anchors(anchors, rows.len())
+            bcode_plugin_models::tui_visual::validate_visual_anchors(anchors, rows.len())
                 .expect("valid source mapping");
             for anchor in anchors {
                 let text = line_text(&rows[anchor.row]);
@@ -686,7 +776,7 @@ mod tests {
             let context =
                 PluginTuiVisualRenderContext::new(width, PluginTuiDiffLayout::Unified, None);
             let (rows, anchors) = batch_layout(&payload, &context);
-            bcode_plugin_sdk::tui_visual::validate_visual_anchors(&anchors, rows.len()).unwrap();
+            bcode_plugin_models::tui_visual::validate_visual_anchors(&anchors, rows.len()).unwrap();
             assert!(
                 rows.iter().all(|row| row.width() <= usize::from(width)),
                 "width {width}: {:?}",
@@ -721,7 +811,7 @@ mod tests {
             let context =
                 PluginTuiVisualRenderContext::new(width, PluginTuiDiffLayout::Unified, None);
             let (rows, anchors) = batch_layout(&payload, &context);
-            bcode_plugin_sdk::tui_visual::validate_visual_anchors(&anchors, rows.len()).unwrap();
+            bcode_plugin_models::tui_visual::validate_visual_anchors(&anchors, rows.len()).unwrap();
             assert!(rows.iter().all(|row| row.width() <= usize::from(width)));
             if width == 100 {
                 let text = rows.iter().map(line_text).collect::<Vec<_>>().join("\n");
@@ -806,7 +896,11 @@ mod tests {
         chunk.offset = 3;
         chunk.bytes = b"def".to_vec();
         adapter.artifact_chunk(&chunk).unwrap();
-        let key = (chunk.artifact_id.clone(), chunk.reference_key.clone());
+        let key = (
+            chunk.tool_call_id.clone(),
+            chunk.artifact_id.clone(),
+            chunk.reference_key.clone(),
+        );
         assert!(!adapter.previews.lock().unwrap().contains_key(&key));
         chunk.offset = 0;
         chunk.bytes = b"abc".to_vec();
@@ -843,7 +937,9 @@ mod tests {
         chunk.bytes = b"after\n".to_vec();
         chunk.total_bytes = 6;
         adapter.artifact_chunk(&chunk).unwrap();
-        let payload = serde_json::json!({"version":1,"_bcode_artifact":{"artifact_id":"batch"},"files":[{
+        let payload = serde_json::json!({"version":1,"_bcode_artifact":{"artifact_id":"batch", "tool_call_id":"call"},
+            "_artifact_refs":[{"key":"file-0-old-0","content_type":"application/octet-stream","byte_len":7},
+                {"key":"file-0-new-0","content_type":"application/octet-stream","byte_len":6}], "files":[{
             "path":"a.rs","status":"committed","change":{"omitted":true}
         }]});
         let context = bcode_plugin_sdk::tui::PluginTuiVisualRenderContext::new(
@@ -861,6 +957,7 @@ mod tests {
         chunk.offset = 1;
         assert!(adapter.artifact_chunk(&chunk).is_err());
         chunk.offset = 0;
+        adapter.artifact_chunk(&chunk).unwrap();
         chunk.revision += 1;
         assert!(adapter.artifact_chunk(&chunk).is_err());
         chunk.revision -= 1;
@@ -915,5 +1012,162 @@ mod tests {
         );
         assert!(rendered.contains("before"), "{rendered}");
         assert!(rendered.contains("after"), "{rendered}");
+    }
+}
+
+#[cfg(test)]
+mod preview_identity_tests {
+    use super::*;
+    use bcode_tui_components::transcript::tool_visual::portable::{
+        PortableArtifactChunk, PortableVisualContext,
+    };
+
+    fn chunk() -> PortableArtifactChunk<'static> {
+        PortableArtifactChunk {
+            invocation_id: "call",
+            artifact_id: "batch",
+            reference_key: "file-0-old",
+            producer_plugin_id: "bcode.filesystem",
+            schema: "bcode.filesystem.batch",
+            schema_version: 1,
+            content_type: Some("application/octet-stream"),
+            offset: 0,
+            total_bytes: 6,
+            revision: 1,
+            finalized: true,
+            bytes: b"before",
+        }
+    }
+
+    #[test]
+    fn preview_budget_is_producer_owned_and_rejects_unrecognized_references() {
+        assert_eq!(
+            source_preview_limit("file-0-old", Some("application/octet-stream")),
+            Some(8192)
+        );
+        assert_eq!(
+            source_preview_limit("file-63-new-0", Some("application/octet-stream")),
+            Some(8192)
+        );
+        for reference in ["file-64-old", "file-0-old-1", "source", "file-0-old-extra"] {
+            assert_eq!(
+                source_preview_limit(reference, Some("application/octet-stream")),
+                None
+            );
+        }
+        assert_eq!(source_preview_limit("file-0-old", Some("text/plain")), None);
+        assert_eq!(source_preview_limit("file-0-old", None), None);
+    }
+
+    #[test]
+    fn malformed_and_conflicting_producer_chunks_evict_old_preview() {
+        for mutation in 0..10 {
+            let adapter = FileChangeTuiVisualAdapter::default();
+            adapter.deliver(&chunk()).unwrap();
+            let mut invalid = chunk();
+            match mutation {
+                0 => invalid.revision = 2,
+                1 => invalid.finalized = false,
+                2 => invalid.content_type = Some("text/plain"),
+                3 => invalid.schema_version = 2,
+                4 => invalid.offset = 1,
+                5 => invalid.bytes = b"change",
+                6 => invalid.revision = 0,
+                7 => invalid.producer_plugin_id = "foreign",
+                8 => invalid.schema = "bcode.filesystem.change",
+                _ => {
+                    invalid.offset = SOURCE_PREVIEW_BYTES as u64;
+                    invalid.total_bytes = invalid.offset + 6;
+                    invalid.revision = 2;
+                }
+            }
+            assert!(adapter.deliver(&invalid).is_err(), "mutation {mutation}");
+            assert!(
+                adapter.previews.lock().unwrap().is_empty(),
+                "mutation {mutation}"
+            );
+        }
+        let adapter = FileChangeTuiVisualAdapter::default();
+        let mut invalid = chunk();
+        invalid.reference_key = "file-64-old";
+        assert!(adapter.deliver(&invalid).is_err());
+        invalid.reference_key = "file-0-old-1";
+        assert!(adapter.deliver(&invalid).is_err());
+        assert!(adapter.previews.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn lookup_requires_current_invocation_reference_and_semantic_revision() {
+        let context = PortableVisualContext {
+            width: 80,
+            theme: None,
+        };
+        for mutation in 0..5 {
+            let adapter = FileChangeTuiVisualAdapter::default();
+            let mut before = chunk();
+            before.bytes = b"cached_old_xyz";
+            before.total_bytes = before.bytes.len() as u64;
+            adapter.deliver(&before).unwrap();
+            let mut after = chunk();
+            after.reference_key = "file-0-new";
+            after.bytes = b"after!";
+            adapter.deliver(&after).unwrap();
+            let mut payload = serde_json::json!({
+                "version":1,
+                "_bcode_artifact":{"artifact_id":"batch","tool_call_id":"call"},
+                "_bcode_presentation_revision":1,
+                "_artifact_refs":[
+                    {"key":"file-0-old","content_type":"application/octet-stream","byte_len":14},
+                    {"key":"file-0-new","content_type":"application/octet-stream","byte_len":6}],
+                "files":[{"path":"a.rs","status":"committed","change":{"omitted":true}}]
+            });
+            let text = |payload: &serde_json::Value| {
+                adapter
+                    .project("bcode.filesystem.batch", payload, &context)
+                    .0
+                    .iter()
+                    .flat_map(|line| line.spans.iter().map(|span| span.content.as_str()))
+                    .collect::<String>()
+            };
+            assert!(text(&payload).contains("cached_old_xyz"));
+            match mutation {
+                0 => payload["_bcode_artifact"]["tool_call_id"] = "other".into(),
+                1 => payload["_bcode_artifact"]["artifact_id"] = "replacement".into(),
+                2 => payload["_bcode_presentation_revision"] = 2.into(),
+                3 => payload["_artifact_refs"][0]["content_type"] = "text/plain".into(),
+                _ => payload["_artifact_refs"][0]["byte_len"] = 7.into(),
+            }
+            assert!(
+                !text(&payload).contains("cached_old_xyz"),
+                "mutation {mutation}"
+            );
+            if mutation != 0 {
+                assert!(
+                    adapter
+                        .previews
+                        .lock()
+                        .unwrap()
+                        .values()
+                        .all(|preview| preview.bytes != b"cached_old_xyz")
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn duplicate_prefix_is_idempotent_and_invocations_are_isolated() {
+        let adapter = FileChangeTuiVisualAdapter::default();
+        adapter.deliver(&chunk()).unwrap();
+        adapter.deliver(&chunk()).unwrap();
+        let mut foreign = chunk();
+        foreign.invocation_id = "other";
+        foreign.bytes = b"change";
+        adapter.deliver(&foreign).unwrap();
+        let previews = adapter.previews.lock().unwrap();
+        assert_eq!(previews.len(), 2);
+        assert_eq!(
+            previews[&("call".into(), "batch".into(), "file-0-old".into())].bytes,
+            b"before"
+        );
     }
 }

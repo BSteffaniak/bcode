@@ -269,6 +269,52 @@ fn non_utf8_names_are_incomplete_when_the_filesystem_supports_them() {
     assert_eq!(paths(&response), ["valid-peer.rs"]);
 }
 
+#[cfg(unix)]
+#[test]
+fn workspace_inventory_preserves_non_utf8_incompleteness_and_valid_peers() {
+    use std::os::unix::ffi::OsStringExt;
+    let root = Fixture::new();
+    root.file("visible.rs");
+    let invalid = root.0.join(std::ffi::OsString::from_vec(vec![b'x', 0xff]));
+    if let Err(error) = fs::write(&invalid, b"unread") {
+        #[cfg(target_os = "macos")]
+        {
+            assert_eq!(error.raw_os_error(), Some(libc::EILSEQ));
+            assert!(!invalid.exists());
+            return;
+        }
+        #[cfg(not(target_os = "macos"))]
+        panic!("non-UTF-8 fixture creation failed: {error}");
+    }
+    let grant = root.grant();
+    let request = request();
+    for _ in 0..2 {
+        // Unlike the uncached walker helper, this exercises production inventory
+        // acquisition and its reusable snapshot with the same exact query.
+        let response = super::search_with_metadata(
+            &request,
+            &grant,
+            &|| false,
+            &|path| {
+                Some(WorkspaceResourceGrant {
+                    workspace_root: grant.workspace_root.clone(),
+                    path: path.into(),
+                })
+            },
+            &|_| None,
+        );
+        assert_eq!(response.state, SearchPathsState::Incomplete);
+        assert_eq!(response.reason.as_deref(), Some("non_utf8_path"));
+        assert_eq!(paths(&response), ["visible.rs"]);
+        assert!(
+            response
+                .entries
+                .iter()
+                .all(|entry| !entry.path.contains('\u{fffd}'))
+        );
+    }
+}
+
 #[test]
 fn ignore_file_presence_is_explicitly_unavailable_without_content_authority() {
     let root = Fixture::new();

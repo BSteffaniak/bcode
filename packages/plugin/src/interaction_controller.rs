@@ -16,6 +16,12 @@ use bcode_plugin_models::interaction_controller::{
 use serde::Serialize;
 use serde_json::Value;
 
+use bcode_plugin_models::interaction_controller::{
+    DURABLE_INTERACTION_SERVICE_ID, DURABLE_INTERACTION_VERSION, DurableInteractionBinding,
+    DurableInteractionCapability, DurableInteractionRequest, DurableInteractionResponse,
+    DurableInvocationCompletion, ProducerInteractionCheckpoint, validate_durable_size,
+};
+
 use crate::{PluginInvocationScope, PluginRuntimeHost};
 
 const CONTROLLER_TIMEOUT: Duration = Duration::from_secs(10);
@@ -120,6 +126,352 @@ fn select_controller_route(
         return Err(InteractionControllerError::InvalidContract);
     }
     Ok(route.clone())
+}
+
+/// Discover the exact producer's durable opt-in route. No persistence or authority
+/// is granted. Only the selected producer is queried, with scoped cancellation.
+///
+/// # Errors
+/// Rejects unavailable services, malformed/ambiguous capabilities and unknown routes.
+pub async fn discover_durable_controller(
+    plugins: &PluginRuntimeHost,
+    producer: &str,
+    schema: &str,
+    schema_version: u32,
+    scope: PluginInvocationScope,
+    cancellation: &bcode_plugin_sdk::ServiceCancellation,
+) -> Result<DurableInteractionCapability, InteractionControllerError> {
+    let response = invoke_durable(
+        plugins,
+        producer,
+        "discover",
+        &DurableInteractionRequest::Discover {
+            version: DURABLE_INTERACTION_VERSION,
+        },
+        scope,
+        cancellation,
+    )
+    .await?;
+    select_durable_capability(&response, producer, schema, schema_version)
+}
+
+fn select_durable_capability(
+    response: &DurableInteractionResponse,
+    producer: &str,
+    schema: &str,
+    version: u32,
+) -> Result<DurableInteractionCapability, InteractionControllerError> {
+    validate_durable_size(response)?;
+    let DurableInteractionResponse::Capabilities(capabilities) = response else {
+        return Err(InteractionControllerError::InvalidContract);
+    };
+    if capabilities.len() > MAX_CONTROLLER_ROUTES {
+        return Err(InteractionControllerError::LimitExceeded);
+    }
+    for capability in capabilities {
+        // Reuse the model's identity and compatibility validation without implying
+        // canonical existence or execution permission for these synthetic facts.
+        let check = DurableInteractionBinding {
+            session_id: "validation".into(),
+            turn_id: "validation".into(),
+            invocation_id: "validation".into(),
+            request_sequence: 1,
+            exchange_id: "validation".into(),
+            tool_name: "validation".into(),
+            request_digest: "0".repeat(64),
+            exchange_schema_version: capability.route.min_schema_version,
+            capability: capability.clone(),
+        };
+        check.validate()?;
+        if !validate_route(&capability.route, producer) {
+            return Err(InteractionControllerError::InvalidContract);
+        }
+    }
+    let mut matching = capabilities
+        .iter()
+        .filter(|capability| capability.route.supports(producer, schema, version));
+    let capability = matching
+        .next()
+        .ok_or(InteractionControllerError::Unsupported)?;
+    if matching.next().is_some() {
+        return Err(InteractionControllerError::InvalidContract);
+    }
+    Ok(capability.clone())
+}
+
+async fn invoke_durable(
+    plugins: &PluginRuntimeHost,
+    producer: &str,
+    operation: &str,
+    request: &DurableInteractionRequest,
+    scope: PluginInvocationScope,
+    cancellation: &bcode_plugin_sdk::ServiceCancellation,
+) -> Result<DurableInteractionResponse, InteractionControllerError> {
+    request.validate()?;
+    if cancellation.is_cancelled() {
+        return Err(InteractionControllerError::Unavailable);
+    }
+    if !plugins
+        .registry()
+        .service_registry()
+        .providers_for(DURABLE_INTERACTION_SERVICE_ID)
+        .is_some_and(|providers| providers.contains(producer))
+    {
+        return Err(InteractionControllerError::Unsupported);
+    }
+    let response = plugins
+        .invoke_service_json_response_scoped_cancellable(
+            producer,
+            DURABLE_INTERACTION_SERVICE_ID,
+            operation,
+            request,
+            scope,
+            CONTROLLER_TIMEOUT,
+            cancellation,
+        )
+        .await
+        .map_err(|_| InteractionControllerError::Unavailable)?;
+    decode_durable_response(&response)
+}
+
+fn decode_durable_response(
+    response: &crate::ServiceResponse,
+) -> Result<DurableInteractionResponse, InteractionControllerError> {
+    if response.payload.len() > MAX_CONTROLLER_BYTES {
+        return Err(InteractionControllerError::LimitExceeded);
+    }
+    if response.error.is_some() {
+        return Err(InteractionControllerError::Unavailable);
+    }
+    let response: DurableInteractionResponse = serde_json::from_slice(&response.payload)
+        .map_err(|_| InteractionControllerError::InvalidContract)?;
+    validate_durable_size(&response)?;
+    Ok(response)
+}
+
+fn validate_durable_scope(
+    binding: &DurableInteractionBinding,
+    scope: &PluginInvocationScope,
+) -> Result<(), InteractionControllerError> {
+    binding.validate()?;
+    if !matches!(scope, PluginInvocationScope::Session { session_id, turn_id: Some(turn_id), .. }
+        if session_id == &binding.session_id && turn_id == &binding.turn_id)
+    {
+        return Err(InteractionControllerError::InvalidContract);
+    }
+    Ok(())
+}
+
+async fn check_durable_capability(
+    plugins: &PluginRuntimeHost,
+    binding: &DurableInteractionBinding,
+    scope: PluginInvocationScope,
+    cancellation: &bcode_plugin_sdk::ServiceCancellation,
+) -> Result<(), InteractionControllerError> {
+    validate_durable_scope(binding, &scope)?;
+    let capability = discover_durable_controller(
+        plugins,
+        &binding.capability.route.producer_id,
+        &binding.capability.route.exchange_schema,
+        binding.exchange_schema_version,
+        scope,
+        cancellation,
+    )
+    .await?;
+    if capability != binding.capability {
+        return Err(InteractionControllerError::Unsupported);
+    }
+    Ok(())
+}
+
+fn validate_export_response(
+    binding: &DurableInteractionBinding,
+    revision: u64,
+    response: DurableInteractionResponse,
+) -> Result<ProducerInteractionCheckpoint, InteractionControllerError> {
+    validate_durable_size(&response)?;
+    let DurableInteractionResponse::Exported(checkpoint) = response else {
+        return Err(InteractionControllerError::InvalidContract);
+    };
+    checkpoint.validate()?;
+    if &checkpoint.binding != binding || checkpoint.revision != revision {
+        return Err(InteractionControllerError::InvalidContract);
+    }
+    Ok(checkpoint)
+}
+
+fn validate_restore_response(
+    binding: &DurableInteractionBinding,
+    response: DurableInteractionResponse,
+) -> Result<InteractionControllerTransition, InteractionControllerError> {
+    validate_durable_size(&response)?;
+    let DurableInteractionResponse::Restored(transition) = response else {
+        return Err(InteractionControllerError::InvalidContract);
+    };
+    validate_transition(&binding.capability.route, &transition)?;
+    Ok(transition)
+}
+
+const fn terminal(output: &InteractionOutput) -> bool {
+    matches!(
+        output,
+        InteractionOutput::Submitted { .. } | InteractionOutput::Cancelled
+    )
+}
+
+fn validate_export_restore_output(
+    original: &InteractionOutput,
+    restored: &InteractionOutput,
+) -> Result<(), InteractionControllerError> {
+    if terminal(original) != terminal(restored) || (terminal(original) && original != restored) {
+        return Err(InteractionControllerError::InvalidContract);
+    }
+    Ok(())
+}
+
+/// Pure producer export followed by restore validation. Callers must commit before
+/// acknowledging the revision. This never installs a registry entry.
+///
+/// # Errors
+/// Rejects scope/capability mismatch, invalid transitions, altered revision/binding,
+/// mismatched terminal output, cancellation, unavailable services and size limits.
+pub async fn export_durable_controller(
+    plugins: &PluginRuntimeHost,
+    binding: &DurableInteractionBinding,
+    revision: u64,
+    transition: &InteractionControllerTransition,
+    scope: PluginInvocationScope,
+    cancellation: &bcode_plugin_sdk::ServiceCancellation,
+) -> Result<ProducerInteractionCheckpoint, InteractionControllerError> {
+    validate_transition(&binding.capability.route, transition)?;
+    check_durable_capability(plugins, binding, scope.clone(), cancellation).await?;
+    let response = invoke_durable(
+        plugins,
+        &binding.capability.route.producer_id,
+        "export",
+        &DurableInteractionRequest::Export {
+            version: DURABLE_INTERACTION_VERSION,
+            binding: binding.clone(),
+            revision,
+            transition: transition.clone(),
+        },
+        scope.clone(),
+        cancellation,
+    )
+    .await?;
+    let checkpoint = validate_export_response(binding, revision, response)?;
+    let restored =
+        restore_durable_unchecked(plugins, binding, &checkpoint, scope, cancellation).await?;
+    validate_export_restore_output(&transition.output, &restored.output)?;
+    Ok(checkpoint)
+}
+
+async fn restore_durable_unchecked(
+    plugins: &PluginRuntimeHost,
+    binding: &DurableInteractionBinding,
+    checkpoint: &ProducerInteractionCheckpoint,
+    scope: PluginInvocationScope,
+    cancellation: &bcode_plugin_sdk::ServiceCancellation,
+) -> Result<InteractionControllerTransition, InteractionControllerError> {
+    let response = invoke_durable(
+        plugins,
+        &binding.capability.route.producer_id,
+        "restore",
+        &DurableInteractionRequest::Restore {
+            version: DURABLE_INTERACTION_VERSION,
+            binding: binding.clone(),
+            checkpoint: checkpoint.clone(),
+        },
+        scope,
+        cancellation,
+    )
+    .await?;
+    validate_restore_response(binding, response)
+}
+
+/// Restore through the exact compatible producer without installing registry state.
+/// The application supplies canonical checkpoint revision and current authority.
+///
+/// # Errors
+/// Rejects scope/binding/capability/response-version mismatches, malformed or oversized
+/// state, unavailable services and cancellation. Producer validates opaque payload.
+pub async fn restore_durable_controller(
+    plugins: &PluginRuntimeHost,
+    binding: &DurableInteractionBinding,
+    checkpoint: &ProducerInteractionCheckpoint,
+    scope: PluginInvocationScope,
+    cancellation: &bcode_plugin_sdk::ServiceCancellation,
+) -> Result<InteractionControllerTransition, InteractionControllerError> {
+    checkpoint.validate()?;
+    if &checkpoint.binding != binding {
+        return Err(InteractionControllerError::InvalidContract);
+    }
+    check_durable_capability(plugins, binding, scope.clone(), cancellation).await?;
+    restore_durable_unchecked(plugins, binding, checkpoint, scope, cancellation).await
+}
+
+fn validate_completion_response(
+    binding: &DurableInteractionBinding,
+    completion_id: &str,
+    response: DurableInteractionResponse,
+) -> Result<DurableInvocationCompletion, InteractionControllerError> {
+    validate_durable_size(&response)?;
+    let DurableInteractionResponse::Completed(completion) = response else {
+        return Err(InteractionControllerError::InvalidContract);
+    };
+    completion.validate()?;
+    if &completion.binding != binding || completion.completion_id != completion_id {
+        return Err(InteractionControllerError::InvalidContract);
+    }
+    let response: bcode_tool::ToolInvocationResponse =
+        serde_json::from_value(completion.response.clone())
+            .map_err(|_| InteractionControllerError::InvalidContract)?;
+    if let Some(bcode_tool::ToolInvocationResult::Artifact { artifact }) = response.result
+        && (artifact.producer_plugin_id != binding.capability.route.producer_id
+            || artifact.tool_call_id.as_deref() != Some(binding.invocation_id.as_str()))
+    {
+        return Err(InteractionControllerError::InvalidContract);
+    }
+    Ok(completion)
+}
+
+/// Pure deterministic producer completion of a terminal checkpoint. No original
+/// tool dispatch, canonical append, registry mutation, or authority acquisition.
+///
+/// # Errors
+/// Rejects nonterminal checkpoints, incompatible producers, malformed responses,
+/// spoofed completion/invocation identities, unavailable services and cancellation.
+pub async fn complete_durable_controller(
+    plugins: &PluginRuntimeHost,
+    binding: &DurableInteractionBinding,
+    checkpoint: &ProducerInteractionCheckpoint,
+    completion_id: &str,
+    scope: PluginInvocationScope,
+    cancellation: &bcode_plugin_sdk::ServiceCancellation,
+) -> Result<DurableInvocationCompletion, InteractionControllerError> {
+    let request = DurableInteractionRequest::Complete {
+        version: DURABLE_INTERACTION_VERSION,
+        binding: binding.clone(),
+        checkpoint: checkpoint.clone(),
+        completion_id: completion_id.into(),
+    };
+    request.validate()?;
+    let restored =
+        restore_durable_controller(plugins, binding, checkpoint, scope.clone(), cancellation)
+            .await?;
+    if !terminal(&restored.output) {
+        return Err(InteractionControllerError::NotPending);
+    }
+    let response = invoke_durable(
+        plugins,
+        &binding.capability.route.producer_id,
+        "complete",
+        &request,
+        scope,
+        cancellation,
+    )
+    .await?;
+    validate_completion_response(binding, completion_id, response)
 }
 
 struct ControllerEntry {
@@ -619,6 +971,438 @@ mod tests {
     use super::*;
     use bcode_plugin_models::interaction_controller::InteractionInput;
     use serde_json::json;
+
+    fn durable_binding() -> DurableInteractionBinding {
+        DurableInteractionBinding {
+            session_id: "session".into(),
+            turn_id: "turn".into(),
+            invocation_id: "call".into(),
+            request_sequence: 1,
+            exchange_id: "exchange".into(),
+            tool_name: "tool".into(),
+            request_digest: "a".repeat(64),
+            exchange_schema_version: 1,
+            capability: DurableInteractionCapability {
+                route: route(),
+                checkpoint_schema: "checkpoint".into(),
+                checkpoint_version: 1,
+                continuation_schema: "complete".into(),
+                continuation_version: 1,
+            },
+        }
+    }
+
+    fn durable_checkpoint() -> ProducerInteractionCheckpoint {
+        ProducerInteractionCheckpoint {
+            binding: durable_binding(),
+            revision: 4,
+            payload: json!({"answer": true}),
+        }
+    }
+
+    fn durable_completion() -> DurableInvocationCompletion {
+        DurableInvocationCompletion {
+            binding: durable_binding(),
+            completion_id: "done".into(),
+            response: serde_json::to_value(bcode_tool::ToolInvocationResponse {
+                output: "done".into(),
+                is_error: false,
+                content: vec![],
+                full_output: None,
+                result: Some(bcode_tool::ToolInvocationResult::Artifact {
+                    artifact: Box::new(bcode_tool::ToolArtifact {
+                        artifact_id: "artifact".into(),
+                        producer_plugin_id: "producer".into(),
+                        schema: "outcome".into(),
+                        schema_version: 1,
+                        tool_call_id: Some("call".into()),
+                        title: None,
+                        metadata: Value::Null,
+                        refs: vec![],
+                    }),
+                }),
+            })
+            .unwrap(),
+        }
+    }
+
+    #[test]
+    fn durable_wire_decode_checks_size_before_parsing_and_rejects_malformed_contract() {
+        let expected = DurableInteractionResponse::Capabilities(vec![]);
+        assert_eq!(
+            decode_durable_response(&crate::ServiceResponse::json(&expected).unwrap()),
+            Ok(expected)
+        );
+        let mut response = crate::ServiceResponse::json(&json!({})).unwrap();
+        assert_eq!(
+            decode_durable_response(&response),
+            Err(InteractionControllerError::InvalidContract)
+        );
+        response.payload = vec![b' '; MAX_CONTROLLER_BYTES + 1];
+        assert_eq!(
+            decode_durable_response(&response),
+            Err(InteractionControllerError::LimitExceeded)
+        );
+        assert_eq!(
+            decode_durable_response(&crate::ServiceResponse::error(
+                "producer_error",
+                "private detail"
+            )),
+            Err(InteractionControllerError::Unavailable)
+        );
+    }
+
+    #[test]
+    fn durable_discovery_rejects_ambiguous_malformed_oversized_or_foreign_capabilities() {
+        let capability = durable_binding().capability;
+        let discover = |capabilities| {
+            select_durable_capability(
+                &DurableInteractionResponse::Capabilities(capabilities),
+                "producer",
+                "schema",
+                1,
+            )
+        };
+        assert_eq!(discover(vec![capability.clone()]), Ok(capability.clone()));
+        assert_eq!(
+            discover(vec![]),
+            Err(InteractionControllerError::Unsupported)
+        );
+        assert_eq!(
+            select_durable_capability(
+                &DurableInteractionResponse::Capabilities(vec![capability.clone()]),
+                "producer",
+                "unknown",
+                1
+            ),
+            Err(InteractionControllerError::Unsupported)
+        );
+        assert!(discover(vec![capability.clone(), capability.clone()]).is_err());
+        let mut foreign = capability.clone();
+        foreign.route.producer_id = "other".into();
+        assert!(discover(vec![foreign]).is_err());
+        let mut malformed = capability.clone();
+        malformed.continuation_version = 0;
+        assert!(discover(vec![malformed]).is_err());
+        assert_eq!(
+            discover(vec![capability.clone(); MAX_CONTROLLER_ROUTES + 1]),
+            Err(InteractionControllerError::LimitExceeded)
+        );
+        let mut oversized = capability;
+        oversized.checkpoint_schema = "x".repeat(MAX_CONTROLLER_BYTES);
+        assert_eq!(
+            discover(vec![oversized]),
+            Err(InteractionControllerError::LimitExceeded)
+        );
+        assert!(
+            select_durable_capability(
+                &DurableInteractionResponse::Exported(durable_checkpoint()),
+                "producer",
+                "request",
+                1
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn durable_export_restore_validate_identity_revision_variant_version_and_bounds() {
+        assert_eq!(
+            validate_export_restore_output(&InteractionOutput::Redraw, &InteractionOutput::None),
+            Ok(())
+        );
+        assert!(
+            validate_export_restore_output(&InteractionOutput::None, &InteractionOutput::Cancelled)
+                .is_err()
+        );
+        assert!(
+            validate_export_restore_output(&InteractionOutput::Cancelled, &InteractionOutput::None)
+                .is_err()
+        );
+        assert!(
+            validate_export_restore_output(
+                &InteractionOutput::Submitted {
+                    payload: json!({"answer":1})
+                },
+                &InteractionOutput::Submitted {
+                    payload: json!({"answer":2})
+                }
+            )
+            .is_err()
+        );
+        let binding = durable_binding();
+        let checkpoint = durable_checkpoint();
+        assert_eq!(
+            validate_export_response(
+                &binding,
+                4,
+                DurableInteractionResponse::Exported(checkpoint.clone())
+            ),
+            Ok(checkpoint.clone())
+        );
+        assert!(
+            validate_export_response(
+                &binding,
+                5,
+                DurableInteractionResponse::Exported(checkpoint.clone())
+            )
+            .is_err()
+        );
+        let mut other = checkpoint.clone();
+        other.binding.invocation_id = "other".into();
+        assert!(
+            validate_export_response(&binding, 4, DurableInteractionResponse::Exported(other))
+                .is_err()
+        );
+        let mut transition = InteractionControllerTransition {
+            version: 1,
+            interaction_kind: "kind".into(),
+            state: json!({}),
+            snapshot: json!({}),
+            output: InteractionOutput::None,
+        };
+        assert_eq!(
+            validate_restore_response(
+                &binding,
+                DurableInteractionResponse::Restored(transition.clone())
+            ),
+            Ok(transition.clone())
+        );
+        transition.version = 2;
+        assert!(
+            validate_restore_response(
+                &binding,
+                DurableInteractionResponse::Restored(transition.clone())
+            )
+            .is_err()
+        );
+        transition.version = 1;
+        transition.interaction_kind = "foreign".into();
+        assert!(
+            validate_restore_response(
+                &binding,
+                DurableInteractionResponse::Restored(transition.clone())
+            )
+            .is_err()
+        );
+        transition.interaction_kind = "kind".into();
+        transition.state = json!("x".repeat(MAX_CONTROLLER_BYTES));
+        assert_eq!(
+            validate_restore_response(&binding, DurableInteractionResponse::Restored(transition)),
+            Err(InteractionControllerError::LimitExceeded)
+        );
+        assert!(
+            validate_restore_response(&binding, DurableInteractionResponse::Exported(checkpoint))
+                .is_err()
+        );
+        assert!(validate_durable_scope(&binding, &PluginInvocationScope::Global).is_err());
+    }
+
+    #[test]
+    fn durable_completion_rejects_spoofed_identity_result_and_wrong_variant() {
+        let binding = durable_binding();
+        let completion = durable_completion();
+        assert_eq!(
+            validate_completion_response(
+                &binding,
+                "done",
+                DurableInteractionResponse::Completed(completion.clone())
+            ),
+            Ok(completion.clone())
+        );
+        assert!(
+            validate_completion_response(
+                &binding,
+                "other",
+                DurableInteractionResponse::Completed(completion.clone())
+            )
+            .is_err()
+        );
+        let mut other = completion.clone();
+        other.binding.invocation_id = "other".into();
+        assert!(
+            validate_completion_response(
+                &binding,
+                "done",
+                DurableInteractionResponse::Completed(other)
+            )
+            .is_err()
+        );
+        let mut malformed = completion.clone();
+        malformed.response = json!({});
+        assert!(
+            validate_completion_response(
+                &binding,
+                "done",
+                DurableInteractionResponse::Completed(malformed)
+            )
+            .is_err()
+        );
+        let mut spoofed = completion;
+        // Mutate the actual tool response contract rather than matching source text.
+        let mut response: bcode_tool::ToolInvocationResponse =
+            serde_json::from_value(spoofed.response).unwrap();
+        let Some(bcode_tool::ToolInvocationResult::Artifact { artifact }) =
+            response.result.as_mut()
+        else {
+            panic!("artifact");
+        };
+        artifact.tool_call_id = Some("other-call".into());
+        spoofed.response = serde_json::to_value(response).unwrap();
+        assert!(
+            validate_completion_response(
+                &binding,
+                "done",
+                DurableInteractionResponse::Completed(spoofed)
+            )
+            .is_err()
+        );
+        assert!(
+            validate_completion_response(
+                &binding,
+                "done",
+                DurableInteractionResponse::Exported(durable_checkpoint())
+            )
+            .is_err()
+        );
+    }
+
+    #[tokio::test]
+    #[allow(clippy::too_many_lines)]
+    async fn durable_question_services_export_restore_complete_with_scoped_cancellation() {
+        let producer = crate::StaticBundledPlugin::new(
+            include_str!("../../../plugins/question-plugin/bcode-plugin.toml"),
+            bcode_question_plugin::static_plugin(),
+        );
+        let plugins = PluginRuntimeHost::load_defaults_with_static_bundled(
+            &crate::PluginSelection {
+                mode: crate::PluginSelectionMode::Explicit,
+                enabled: std::collections::BTreeSet::from(["bcode.question".into()]),
+                disabled: std::collections::BTreeSet::default(),
+            },
+            &[producer],
+        )
+        .unwrap();
+        let scope = PluginInvocationScope::Session {
+            session_id: "session".into(),
+            turn_id: Some("turn".into()),
+            client_id: None,
+            work_id: None,
+        };
+        let cancellation = bcode_plugin_sdk::ServiceCancellation::default();
+        let capability = discover_durable_controller(
+            &plugins,
+            "bcode.question",
+            "bcode.question.request",
+            1,
+            scope.clone(),
+            &cancellation,
+        )
+        .await
+        .unwrap();
+        let mut binding = durable_binding();
+        binding.capability = capability.clone();
+        binding.tool_name = "question".into();
+        let opened = bcode_question_plugin::question_controller::transition(
+            InteractionControllerRequest::Open {
+                version: 1,
+                route: capability.route,
+                schema_version: 1,
+                payload: json!({"questions":[{"question":"Choose", "required":true, "custom":false,
+                "options":[{"label":"Yes", "value":"yes"}]}]}),
+            },
+        )
+        .unwrap();
+        let pending =
+            export_durable_controller(&plugins, &binding, 1, &opened, scope.clone(), &cancellation)
+                .await
+                .unwrap();
+        assert_eq!(
+            complete_durable_controller(
+                &plugins,
+                &binding,
+                &pending,
+                "done",
+                scope.clone(),
+                &cancellation
+            )
+            .await,
+            Err(InteractionControllerError::NotPending)
+        );
+        let restored =
+            restore_durable_controller(&plugins, &binding, &pending, scope.clone(), &cancellation)
+                .await
+                .unwrap();
+        let selected = bcode_question_plugin::question_controller::transition(
+            InteractionControllerRequest::Input {
+                version: 1,
+                route: binding.capability.route.clone(),
+                state: restored.state,
+                input: InteractionInput::Activate {
+                    control_id:
+                        bcode_plugin_models::interaction_controller::InteractionControlId::new(
+                            "question-0.option-0",
+                        ),
+                },
+            },
+        )
+        .unwrap();
+        let submitted = bcode_question_plugin::question_controller::transition(
+            InteractionControllerRequest::Input {
+                version: 1,
+                route: binding.capability.route.clone(),
+                state: selected.state,
+                input: InteractionInput::Submit,
+            },
+        )
+        .unwrap();
+        let checkpoint = export_durable_controller(
+            &plugins,
+            &binding,
+            2,
+            &submitted,
+            scope.clone(),
+            &cancellation,
+        )
+        .await
+        .unwrap();
+        let completion = complete_durable_controller(
+            &plugins,
+            &binding,
+            &checkpoint,
+            "done",
+            scope.clone(),
+            &cancellation,
+        )
+        .await
+        .unwrap();
+        assert_eq!(completion.binding, binding);
+        assert_eq!(completion.completion_id, "done");
+        let mut unknown = binding;
+        unknown.capability.checkpoint_version = 99;
+        let mut future = checkpoint;
+        future.binding = unknown.clone();
+        assert_eq!(
+            restore_durable_controller(&plugins, &unknown, &future, scope.clone(), &cancellation)
+                .await,
+            Err(InteractionControllerError::Unsupported)
+        );
+        cancellation.cancel();
+        let cancelled_discovery = discover_durable_controller(
+            &plugins,
+            "bcode.question",
+            "bcode.question.request",
+            1,
+            scope,
+            &cancellation,
+        )
+        .await;
+        drop(plugins);
+        assert_eq!(
+            cancelled_discovery,
+            Err(InteractionControllerError::Unavailable)
+        );
+    }
 
     fn route() -> InteractionControllerRoute {
         InteractionControllerRoute {

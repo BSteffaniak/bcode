@@ -14,44 +14,44 @@ version     = { workspace = true }
 crate-type = ["cdylib", "rlib"]
 
 [dependencies]
-bcode_agent_profile = { workspace = true }
-bcode_config = { workspace = true }
-bcode_plugin_sdk = { workspace = true, features = ["tui"] }
-bcode_shell_command_analysis = { workspace = true }
-bcode_shell_command_analysis_models = { workspace = true }
-bcode_tool = { workspace = true }
-bcode_tool_runtime = { workspace = true }
-bcode_tui_components = { workspace = true, features = [
-    "terminal-viewer",
-], optional = true }
-bcode_workflow = { workspace = true }
-bmux_keyboard = { workspace = true, optional = true }
-bmux_terminal_grid = { workspace = true, optional = true }
-bmux_tui = { workspace = true, optional = true }
-hex = { workspace = true }
-libc = { workspace = true }
-portable-pty = { workspace = true }
-ruff_formatter = { workspace = true, optional = true }
-ruff_python_formatter = { workspace = true, optional = true }
-serde = { workspace = true, features = ["derive", "std"] }
-serde_json = { workspace = true }
-sha2 = { workspace = true }
-shuck-ast = { workspace = true, optional = true }
-shuck-parser = { workspace = true, optional = true }
-tempfile = { workspace = true }
-tokio = { workspace = true, features = ["rt"] }
-tree-sitter = { workspace = true, optional = true }
-tree-sitter-javascript = { workspace = true, optional = true }
-tree-sitter-python = { workspace = true, optional = true }
-url = { workspace = true }
-vte = { workspace = true }
+bcode_agent_profile                 = { workspace = true, optional = true }
+bcode_config                        = { workspace = true, optional = true }
+bcode_plugin_models                 = { workspace = true, optional = true }
+bcode_plugin_sdk                    = { workspace = true, features = ["tui"], optional = true }
+bcode_shell_command_analysis        = { workspace = true, optional = true }
+bcode_shell_command_analysis_models = { workspace = true, optional = true }
+bcode_tool                          = { workspace = true, optional = true }
+bcode_tool_runtime                  = { workspace = true, optional = true }
+bcode_tui_components                = { workspace = true, optional = true }
+bcode_workflow                      = { workspace = true, optional = true }
+bmux_keyboard                       = { workspace = true, optional = true }
+bmux_terminal_grid                  = { workspace = true, optional = true }
+bmux_tui                            = { workspace = true, optional = true }
+bmux_tui_components                 = { workspace = true, optional = true }
+hex                                 = { workspace = true, optional = true }
+libc                                = { workspace = true, optional = true }
+portable-pty                        = { workspace = true, optional = true }
+ruff_formatter                      = { workspace = true, optional = true }
+ruff_python_formatter               = { workspace = true, optional = true }
+serde                               = { workspace = true, features = ["derive", "std"] }
+serde_json                          = { workspace = true }
+sha2                                = { workspace = true, optional = true }
+shuck-ast                           = { workspace = true, optional = true }
+shuck-parser                        = { workspace = true, optional = true }
+tempfile                            = { workspace = true, optional = true }
+tokio                               = { workspace = true, features = ["rt"], optional = true }
+tree-sitter                         = { workspace = true, optional = true }
+tree-sitter-javascript              = { workspace = true, optional = true }
+tree-sitter-python                  = { workspace = true, optional = true }
+url                                 = { workspace = true, optional = true }
+vte                                 = { workspace = true, optional = true }
 
 [dev-dependencies]
 bcode_session        = { workspace = true }
 bcode_session_models = { workspace = true }
 
 [features]
-default = []
+default = ["native"]
 embedded-javascript = ["dep:tree-sitter", "dep:tree-sitter-javascript"]
 embedded-languages = ["embedded-python", "embedded-javascript"]
 embedded-python = [
@@ -61,12 +61,44 @@ embedded-python = [
     "dep:ruff_python_formatter",
 ]
 fail-on-warnings = []
-static-bundled = [
+native = [
+    "dep:bcode_agent_profile",
+    "dep:bcode_config",
+    "dep:bcode_plugin_sdk",
+    "dep:bcode_shell_command_analysis",
+    "dep:bcode_shell_command_analysis_models",
+    "dep:bcode_tool",
+    "dep:bcode_tool_runtime",
+    "dep:bcode_workflow",
+    "dep:hex",
+    "dep:libc",
+    "dep:portable-pty",
+    "dep:sha2",
+    "dep:tempfile",
+    "dep:tokio",
+    "dep:url",
+    "dep:vte",
+]
+presentation = [
     "embedded-languages",
-    "bcode_tui_components",
-    "bmux_keyboard",
-    "bmux_terminal_grid",
-    "bmux_tui",
-    "shuck-parser",
-    "shuck-ast",
+    "dep:bcode_plugin_models",
+    "dep:bcode_tui_components",
+    "dep:bmux_tui",
+    "dep:bmux_tui_components",
+    "dep:shuck-parser",
+    "dep:shuck-ast",
+    "bcode_tui_components/transcript-engine",
+    "bcode_tui_components/transcript-markdown",
+]
+static-bundled = [
+    "native",
+    "presentation",
+    "bcode_tui_components/terminal-viewer",
+    "embedded-languages",
+    "dep:bcode_tui_components",
+    "dep:bmux_keyboard",
+    "dep:bmux_terminal_grid",
+    "dep:bmux_tui",
+    "dep:shuck-parser",
+    "dep:shuck-ast",
 ]

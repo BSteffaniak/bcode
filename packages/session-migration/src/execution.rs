@@ -312,6 +312,9 @@ fn decode_for_migration(
 ) -> Result<HistoricalDecode, HistoricalSessionEventError> {
     let current = decode_current(payload);
     let envelope = serde_json::from_str::<HistoricalEnvelope>(payload)?;
+    if envelope.schema_version() == 52 {
+        return envelope.decode_schema_52(current);
+    }
     if envelope.schema_version() == crate::CURRENT_EVENT_SCHEMA {
         return match current {
             Ok(event) => Ok(HistoricalDecode::Current(event)),
@@ -468,6 +471,222 @@ mod tests {
     }
 
     #[test]
+    fn schema_52_fixture_migrates_losslessly_without_creating_checkpoints() {
+        let plan = crate::plan_writer_epoch_migration(16).expect("known lossless upgrade");
+        assert_eq!(plan.target_writer_epoch, 17);
+        assert_eq!(plan.steps.len(), 1);
+        assert_eq!(plan.steps[0].id, "session-writer-epoch-16-to-17");
+        let fixture = include_str!("../fixtures/stores/epoch-16-schema-52-events.jsonl");
+        let mut seen = BTreeSet::new();
+        for payload in fixture.lines() {
+            let envelope: serde_json::Value = serde_json::from_str(payload).unwrap();
+            let kind = envelope["kind"].as_object().unwrap().keys().next().unwrap();
+            let row = bcode_session_migration_target::CanonicalRow {
+                sequence: envelope["sequence"].as_u64().unwrap(),
+                event_kind: kind.clone(),
+                schema_version: 52,
+                payload: payload.to_owned(),
+            };
+            let normalized = normalize_canonical_row(&row).expect("released schema-52 fixture");
+            assert_eq!(normalized.event.schema_version, 53);
+            assert_eq!(normalized.event.sequence, row.sequence);
+            assert_eq!(normalized.historical_source, Some(format!("52:{kind}")));
+            assert!(normalized.metric_counter.is_none());
+            let actual = serde_json::to_value(&normalized.event).unwrap();
+            for field in ["sequence", "timestamp_ms", "session_id", "provenance"] {
+                assert_eq!(
+                    actual[field], envelope[field],
+                    "preserve {field} for {kind}"
+                );
+            }
+            if kind == "session_forked" {
+                assert!(normalized.retired_known);
+                assert_eq!(
+                    actual["kind"]["inert_history"]["payload"],
+                    envelope["kind"][kind]
+                );
+            } else {
+                let source: SessionEvent = serde_json::from_str(payload).unwrap();
+                assert_eq!(normalized.event.kind, source.kind, "preserve {kind}");
+                if let SessionEventKind::ChildSessionCreated { spawning, .. } =
+                    &normalized.event.kind
+                {
+                    let spawning = spawning
+                        .as_ref()
+                        .expect("recorded composed spawn is retained");
+                    assert_eq!(spawning.input, "sanitized original child input");
+                }
+                assert!(!normalized.retired_known);
+            }
+            assert!(
+                !actual["kind"]
+                    .as_object()
+                    .unwrap()
+                    .contains_key("durable_interaction_committed")
+            );
+            seen.insert(kind.clone());
+        }
+        for kind in [
+            "model_usage",
+            "execution_session_created",
+            "child_session_created",
+            "submission_recovery_authorized",
+            "submission_pending_cancelled",
+            "tool_exchange_requested",
+            "tool_exchange_resolved",
+            "tool_invocation_result_recorded",
+        ] {
+            assert!(seen.contains(kind), "fixture covers {kind}");
+        }
+    }
+
+    #[test]
+    fn schema_52_valid_current_equivalent_payloads_cannot_bypass_decoder_rejection() {
+        let fixture = include_str!("../fixtures/stores/epoch-16-schema-52-events.jsonl");
+        let mut checked = BTreeSet::new();
+        for payload in fixture.lines() {
+            let envelope: serde_json::Value = serde_json::from_str(payload).unwrap();
+            let kind = envelope["kind"].as_object().unwrap().keys().next().unwrap();
+            if !crate::RELEASED_EVENT_VARIANTS.iter().any(|descriptor| {
+                descriptor.kind == kind
+                    && descriptor.treatment == crate::ReleasedEventTreatment::CurrentEquivalent
+            }) {
+                continue;
+            }
+            serde_json::from_str::<SessionEvent>(payload)
+                .expect("fixture contains a valid current-equivalent representation");
+            let decoded =
+                decode_for_migration(
+                    payload,
+                    |_| Err("current compatibility rejected".to_owned()),
+                );
+            assert!(
+                matches!(
+                    &decoded,
+                    Err(HistoricalSessionEventError::InvalidEvent {
+                        schema_version: 52,
+                        event_kind,
+                        reason,
+                    }) if event_kind == kind && reason == "current compatibility rejected"
+                ),
+                "valid current-equivalent 52:{kind} must retain decoder rejection: {decoded:?}"
+            );
+            checked.insert(kind.clone());
+        }
+        let expected = crate::RELEASED_EVENT_VARIANTS
+            .iter()
+            .filter(|descriptor| {
+                descriptor.treatment == crate::ReleasedEventTreatment::CurrentEquivalent
+                    && descriptor.supports_schema(52)
+            })
+            .map(|descriptor| descriptor.kind.to_owned())
+            .collect::<BTreeSet<_>>();
+        assert_eq!(checked, expected);
+    }
+
+    #[test]
+    fn schema_52_explicit_conversions_preserve_recorded_values_when_current_rejects() {
+        let fixture = include_str!("../fixtures/stores/epoch-16-schema-52-events.jsonl");
+        let mut checked = BTreeSet::new();
+        for payload in fixture.lines() {
+            let envelope: serde_json::Value = serde_json::from_str(payload).unwrap();
+            let kind = envelope["kind"].as_object().unwrap().keys().next().unwrap();
+            if !crate::RELEASED_EVENT_VARIANTS.iter().any(|descriptor| {
+                descriptor.kind == kind
+                    && descriptor.treatment == crate::ReleasedEventTreatment::ExplicitConversion
+            }) {
+                continue;
+            }
+            let source: SessionEvent = serde_json::from_str(payload).unwrap();
+            let normalized = normalize_canonical_event(payload, 53, reject_current)
+                .expect("schema-52 explicit conversions are migration-owned");
+            assert_eq!(normalized.event.kind, source.kind, "preserve 52:{kind}");
+            assert_eq!(normalized.historical.as_ref().unwrap().source_schema, 52);
+            assert!(!normalized.retired_known);
+            checked.insert(kind.clone());
+        }
+        let expected = crate::RELEASED_EVENT_VARIANTS
+            .iter()
+            .filter(|descriptor| {
+                descriptor.treatment == crate::ReleasedEventTreatment::ExplicitConversion
+                    && descriptor.supports_schema(52)
+            })
+            .map(|descriptor| descriptor.kind.to_owned())
+            .collect::<BTreeSet<_>>();
+        assert_eq!(checked, expected);
+    }
+
+    #[test]
+    fn schema_52_pending_exchange_stays_historical_not_recoverable() {
+        let fixture = include_str!("../fixtures/stores/epoch-16-schema-52-events.jsonl");
+        let pending = fixture.lines().filter(|payload| {
+            let envelope: serde_json::Value = serde_json::from_str(payload).unwrap();
+            !envelope["kind"]
+                .as_object()
+                .unwrap()
+                .contains_key("tool_exchange_resolved")
+        });
+        let mut requests = Vec::new();
+        for payload in pending {
+            let source: serde_json::Value = serde_json::from_str(payload).unwrap();
+            let normalized = normalize_canonical_event(payload, 53, |payload| {
+                serde_json::from_str(payload).map_err(|error| error.to_string())
+            })
+            .expect("migration-owned schema-52 decoder");
+            if let SessionEventKind::ToolExchangeRequested { request } = &normalized.event.kind {
+                requests.push(serde_json::to_value(request).unwrap());
+                assert_eq!(
+                    requests.last().unwrap(),
+                    &source["kind"]["tool_exchange_requested"]["request"]
+                );
+            }
+            assert!(!matches!(
+                normalized.event.kind,
+                SessionEventKind::DurableInteractionCommitted { .. }
+            ));
+        }
+        assert_eq!(requests.len(), 1);
+        assert_eq!(requests[0]["invocation_id"], "call");
+        assert_eq!(requests[0]["exchange_id"], "exchange");
+    }
+
+    #[test]
+    fn schema_52_rejects_durable_event_impersonation_even_if_current_decoder_accepts() {
+        let payload = serde_json::json!({
+            "schema_version": 52, "sequence": 7, "timestamp_ms": 13,
+            "session_id": SESSION_ID,
+            "kind": { "durable_interaction_committed": { "operation": {
+                "version": 1,
+                "key": { "turn_id": "original-turn", "invocation_id": "call", "interaction_id": "exchange" },
+                "operation_id": "impersonated", "request_digest": "0".repeat(64),
+                "producer_plugin_id": "fixture.plugin", "request_event_sequence": 5,
+                "exchange_request_event_sequence": 6, "expected_revision": null,
+                "transition": { "checkpoint": { "payload": {
+                    "contract_id": "fixture", "contract_version": 1, "json": "{}"
+                } } }
+            } } }
+        }).to_string();
+        let current: SessionEvent =
+            serde_json::from_str(&payload).expect("new variant is parseable");
+        assert!(matches!(
+            current.kind,
+            SessionEventKind::DurableInteractionCommitted { .. }
+        ));
+        assert!(matches!(
+            normalize_canonical_event(&payload, 53, |_| Ok(current)),
+            Err(HistoricalSessionEventError::UnsupportedEventKind { schema_version: 52, event_kind })
+                if event_kind == "durable_interaction_committed"
+        ));
+        assert!(matches!(
+            normalize_canonical_event(&payload, 53, |_| Err("current-only".to_owned())),
+            Err(HistoricalSessionEventError::UnsupportedEventKind {
+                schema_version: 52,
+                ..
+            })
+        ));
+    }
+
+    #[test]
     fn schema_47_upgrade_preserves_user_admission_and_turn_identity() {
         let payload = format!(
             r#"{{"schema_version":47,"sequence":17,"timestamp_ms":2,"session_id":"{SESSION_ID}","kind":{{"user_message":{{"client_id":"00000000-0000-0000-0000-000000000002","text":"historical pending is not rescheduled","admission":{{}}}}}}}}"#
@@ -566,8 +785,8 @@ mod tests {
         let HistoricalDecode::Converted { event, metadata } = decoded else {
             panic!("historical usage should be migration-owned conversion");
         };
-        assert_eq!(crate::CURRENT_EVENT_SCHEMA, 52);
-        assert_eq!(crate::LATEST_HISTORICAL_EVENT_SCHEMA, 51);
+        assert_eq!(crate::CURRENT_EVENT_SCHEMA, 53);
+        assert_eq!(crate::LATEST_HISTORICAL_EVENT_SCHEMA, 52);
         assert_eq!(metadata.source_schema, 46);
         let SessionEventKind::ModelUsage { usage, .. } = event.kind else {
             panic!("converted event should remain model usage");
@@ -1147,7 +1366,7 @@ mod tests {
     }
 
     #[test]
-    fn epoch_16_replay_preserves_canonical_events_without_conversion() {
+    fn epoch_16_replay_preserves_identity_through_historical_conversion() {
         let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("fixtures");
         let manifest = crate::load_released_fixture_manifest(&root).expect("fixture inventory");
         let source_schema = crate::RELEASED_WRITER_SCHEMA_COMBINATIONS
@@ -1166,20 +1385,40 @@ mod tests {
             let payloads =
                 std::fs::read_to_string(root.join(&fixture.path)).expect("fixture payloads");
             for payload in payloads.lines() {
-                let source: SessionEvent = serde_json::from_str(payload).expect("epoch 16 event");
+                let source: serde_json::Value =
+                    serde_json::from_str(payload).expect("epoch 16 envelope");
+                let kind = source["kind"].as_object().unwrap().keys().next().unwrap();
                 let normalized =
                     normalize_canonical_row(&bcode_session_migration_target::CanonicalRow {
-                        sequence: source.sequence,
-                        event_kind: bcode_session_models::persisted_session_event_kind_name(
-                            &source.kind,
-                        )
-                        .to_owned(),
-                        schema_version: source.schema_version,
+                        sequence: source["sequence"].as_u64().unwrap(),
+                        event_kind: kind.clone(),
+                        schema_version: source_schema,
                         payload: payload.to_owned(),
                     })
                     .expect("lossless projection rebuild input");
-                assert_eq!(normalized.event, source);
-                assert!(normalized.metric_counter.is_none());
+                assert_eq!(normalized.event.schema_version, crate::CURRENT_EVENT_SCHEMA);
+                assert_eq!(
+                    serde_json::to_value(normalized.event.session_id).unwrap(),
+                    source["session_id"]
+                );
+                assert_eq!(normalized.event.sequence, source["sequence"].as_u64().unwrap());
+                assert_eq!(
+                    normalized.event.timestamp_ms,
+                    source["timestamp_ms"].as_u64().unwrap()
+                );
+                assert_eq!(
+                    serde_json::to_value(&normalized.event.provenance).unwrap(),
+                    source["provenance"]
+                );
+                assert_eq!(normalized.historical_source, Some(format!("52:{kind}")));
+                let historical = decode_for_migration(payload, |payload| {
+                    serde_json::from_str::<SessionEvent>(payload).map_err(|error| error.to_string())
+                })
+                .expect("registered historical conversion");
+                assert_eq!(normalized.retired_known, historical.is_retired_known());
+                let mut expected = historical.into_event();
+                expected.schema_version = crate::CURRENT_EVENT_SCHEMA;
+                assert_eq!(normalized.event, expected);
                 replayed += 1;
             }
         }
@@ -1234,6 +1473,7 @@ mod tests {
                     .expect("session fixture"),
             )
             .expect("fixture event");
+            event.schema_version = crate::CURRENT_EVENT_SCHEMA;
             event.kind = checkpoint
                 .clone()
                 .into_event_kind(1)
@@ -1286,6 +1526,7 @@ mod tests {
                     .expect("session fixture"),
             )
             .expect("fixture event");
+            event.schema_version = crate::CURRENT_EVENT_SCHEMA;
             event.kind = kind.clone();
             let SessionEventKind::TraceEvent { trace } = &mut event.kind else {
                 panic!("checkpoint must be a trace event");
@@ -1563,14 +1804,19 @@ mod tests {
                     r#"{{"schema_version":{schema_version},"sequence":1,"session_id":"{SESSION_ID}","kind":{{"{}":{{}}}}}}"#,
                     descriptor.kind
                 );
-                assert!(matches!(
-                    decode_for_migration(&payload, reject_current),
-                    Err(HistoricalSessionEventError::InvalidEvent {
-                        schema_version: actual,
-                        ref event_kind,
-                        ..
-                    }) if actual == schema_version && event_kind == descriptor.kind
-                ));
+                let decoded = decode_for_migration(&payload, reject_current);
+                assert!(
+                    matches!(
+                        &decoded,
+                        Err(HistoricalSessionEventError::InvalidEvent {
+                            schema_version: actual,
+                            event_kind,
+                            ..
+                        }) if *actual == schema_version && event_kind == descriptor.kind
+                    ),
+                    "current-equivalent {schema_version}:{} must retain current decoder rejection: {decoded:?}",
+                    descriptor.kind
+                );
             }
         }
     }

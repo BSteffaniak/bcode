@@ -210,14 +210,301 @@ pub enum InteractiveSurfaceEventOutcome {
     Resolved(ToolExchangeResolution),
 }
 
+use bcode_plugin_sdk::interaction_application::{
+    DURABLE_INTERACTION_VERSION, DurableInteractionInput, DurableInteractionOperation,
+    DurableInteractionQuery, DurableInteractionReceipt, DurableInteractionView,
+    InteractionApplication as _, InteractionControllerError,
+};
+
+/// Canonical evidence lookup. Only explicit Unsupported permits the legacy route.
+async fn discover_native_view(
+    consumer: &bcode_client::InteractionControllerConsumer,
+    session_id: bcode_session_models::SessionId,
+    exchange_id: &str,
+) -> Result<Option<DurableInteractionView>, InteractionControllerError> {
+    let mut query = DurableInteractionQuery {
+        limit: 100,
+        after_event_sequence: None,
+        expected_generation: None,
+    };
+    loop {
+        let page = match consumer
+            .durable_controllers(session_id.to_string(), query.clone())
+            .await
+        {
+            Err(InteractionControllerError::Unsupported) if query.expected_generation.is_none() => {
+                return Ok(None);
+            }
+            result => result?,
+        };
+        page.validate(&session_id.to_string(), &query)?;
+        if let Some(view) = page
+            .views
+            .into_iter()
+            .find(|view| view.binding.exchange_id == exchange_id)
+        {
+            return consumer
+                .open_durable_controller(DURABLE_INTERACTION_VERSION, view.binding)
+                .await
+                .map(Some);
+        }
+        let Some(after) = page.next_after_event_sequence else {
+            return Err(InteractionControllerError::Unavailable);
+        };
+        query.after_event_sequence = Some(after);
+        query.expected_generation = Some(page.generation);
+    }
+}
+
+type NativeInteractionChanged = Arc<dyn Fn(bool, Option<InteractionControllerError>) + Send + Sync>;
+
+#[derive(Debug)]
+struct NativeCommitState {
+    view: DurableInteractionView,
+    pending: Option<DurableInteractionInput>,
+    failure: Option<InteractionControllerError>,
+}
+
+impl NativeCommitState {
+    fn admit(
+        &mut self,
+        input: bcode_tool::InteractionInput,
+    ) -> Result<DurableInteractionInput, InteractionControllerError> {
+        if self.pending.is_some() {
+            return Err(InteractionControllerError::Conflict);
+        }
+        if self.failure.is_some()
+            || matches!(
+                self.view.snapshot.output,
+                bcode_tool::InteractionOutput::Submitted { .. }
+                    | bcode_tool::InteractionOutput::Cancelled
+            )
+        {
+            return Err(InteractionControllerError::NotPending);
+        }
+        let input = DurableInteractionInput {
+            version: DURABLE_INTERACTION_VERSION,
+            binding: self.view.binding.clone(),
+            operation: DurableInteractionOperation {
+                operation_id: format!("native-{}", bcode_session_models::SessionId::new()),
+                expected_revision: self.view.revision,
+            },
+            input,
+        };
+        input.validate()?;
+        self.pending = Some(input.clone());
+        Ok(input)
+    }
+
+    fn acknowledge(
+        &mut self,
+        receipt: DurableInteractionReceipt,
+    ) -> Result<bool, InteractionControllerError> {
+        receipt.validate()?;
+        if self.pending.as_ref() != Some(&receipt.input)
+            || receipt.view.binding != self.view.binding
+        {
+            return Err(InteractionControllerError::Conflict);
+        }
+        self.view = receipt.view;
+        self.pending = None;
+        Ok(matches!(
+            self.view.snapshot.output,
+            bcode_tool::InteractionOutput::Submitted { .. }
+                | bcode_tool::InteractionOutput::Cancelled
+        ))
+    }
+}
+
+/// Attachment-local renderer plus an exact in-flight request; canonical authority stays remote.
+struct NativeDurableSurface {
+    renderer: BoxedPluginTuiSurface,
+    state: Arc<std::sync::Mutex<NativeCommitState>>,
+    sender: mpsc::Sender<DurableInteractionInput>,
+    task: tokio::task::JoinHandle<()>,
+    painted_revision: u64,
+}
+
+impl Drop for NativeDurableSurface {
+    fn drop(&mut self) {
+        self.task.abort();
+    }
+}
+
+impl NativeDurableSurface {
+    fn refresh(&mut self) {
+        let Ok(mut state) = self.state.lock() else {
+            return;
+        };
+        if state.view.revision != self.painted_revision {
+            if self
+                .renderer
+                .apply_canonical_snapshot(state.view.snapshot.snapshot.clone())
+                .is_err()
+            {
+                state.failure = Some(InteractionControllerError::InvalidContract);
+            } else {
+                self.painted_revision = state.view.revision;
+            }
+        }
+    }
+
+    fn start(
+        renderer: BoxedPluginTuiSurface,
+        consumer: bcode_client::InteractionControllerConsumer,
+        view: DurableInteractionView,
+        changed: NativeInteractionChanged,
+    ) -> Self {
+        let painted_revision = view.revision;
+        let state = Arc::new(std::sync::Mutex::new(NativeCommitState {
+            view,
+            pending: None,
+            failure: None,
+        }));
+        let (sender, mut receiver) = mpsc::channel::<DurableInteractionInput>(1);
+        let committed = state.clone();
+        let task = tokio::spawn(async move {
+            while let Some(input) = receiver.recv().await {
+                loop {
+                    match consumer.durable_controller_input(input.clone()).await {
+                        Err(InteractionControllerError::Unavailable) => {
+                            changed(false, Some(InteractionControllerError::Unavailable));
+                            tokio::time::sleep(Duration::from_secs(1)).await;
+                        }
+                        outcome => {
+                            let result = committed.lock().map_or(
+                                Err(InteractionControllerError::Unavailable),
+                                |mut state| match outcome {
+                                    Ok(receipt) => state.acknowledge(receipt),
+                                    Err(error) => Err(error),
+                                },
+                            );
+                            if let Err(error) = result
+                                && let Ok(mut state) = committed.lock()
+                            {
+                                state.failure = Some(error);
+                            }
+                            match result {
+                                Ok(terminal) => changed(terminal, None),
+                                Err(error) => changed(false, Some(error)),
+                            }
+                            break;
+                        }
+                    }
+                }
+            }
+        });
+        Self {
+            renderer,
+            state,
+            sender,
+            task,
+            painted_revision,
+        }
+    }
+}
+
+impl bcode_plugin_sdk::tui::PluginTuiSurface for NativeDurableSurface {
+    fn id(&self) -> &'static str {
+        self.renderer.id()
+    }
+    fn title(&self) -> &'static str {
+        self.renderer.title()
+    }
+    fn prepare_keymap(&mut self, host: &dyn bcode_plugin_sdk::tui::PluginTuiHost) {
+        self.refresh();
+        self.renderer.prepare_keymap(host);
+    }
+    fn preferred_height(&mut self, width: u16) -> u16 {
+        self.refresh();
+        self.renderer.preferred_height(width)
+    }
+    fn focused_row_range(&mut self, width: u16) -> Option<std::ops::Range<u16>> {
+        self.refresh();
+        self.renderer.focused_row_range(width)
+    }
+    fn render(&mut self, area: Rect, frame: &mut PaintCx<'_, '_>) {
+        self.refresh();
+        self.renderer.render(area, frame);
+    }
+    fn render_slice_with_host(
+        &mut self,
+        height: u16,
+        offset: u16,
+        destination: Rect,
+        frame: &mut PaintCx<'_, '_>,
+        host: &dyn bcode_plugin_sdk::tui::PluginTuiHost,
+    ) {
+        self.refresh();
+        self.renderer
+            .render_slice_with_host(height, offset, destination, frame, host);
+    }
+    fn render_with_host(
+        &mut self,
+        area: Rect,
+        frame: &mut PaintCx<'_, '_>,
+        theme: Option<&bcode_plugin_sdk::tui::PluginTuiTheme>,
+        host: &dyn bcode_plugin_sdk::tui::PluginTuiHost,
+    ) {
+        self.refresh();
+        self.renderer.render_with_host(area, frame, theme, host);
+    }
+    fn handle_event_result(
+        &mut self,
+        event: &Event,
+        host: &dyn bcode_plugin_sdk::tui::PluginTuiHost,
+    ) -> bcode_plugin_sdk::tui::PluginTuiEventResult {
+        let action = self.handle_event(event, host);
+        if matches!(action, PluginTuiAction::None) {
+            bcode_plugin_sdk::tui::PluginTuiEventResult::consumed()
+        } else {
+            bcode_plugin_sdk::tui::PluginTuiEventResult::from_legacy(action)
+        }
+    }
+
+    fn handle_event(
+        &mut self,
+        event: &Event,
+        host: &dyn bcode_plugin_sdk::tui::PluginTuiHost,
+    ) -> PluginTuiAction {
+        self.refresh();
+        if self.state.lock().map_or(true, |state| {
+            state.pending.is_some() || state.failure.is_some()
+        }) {
+            return PluginTuiAction::None;
+        }
+        let result =
+            super::plugin_surface_host::compose_surface_input(self.renderer.as_mut(), event, host);
+        if let Some(input) = self.renderer.take_canonical_input()
+            && let Ok(mut state) = self.state.lock()
+        {
+            match state.admit(input) {
+                Ok(request) => {
+                    if self.sender.try_send(request).is_err() {
+                        state.failure = Some(InteractionControllerError::Unavailable);
+                    }
+                }
+                Err(error) => state.failure = Some(error),
+            }
+        }
+        // Canonical terminal publication is delivered by the receipt path, never a local Close.
+        match result.action {
+            PluginTuiAction::Redraw => PluginTuiAction::Redraw,
+            _ => PluginTuiAction::None,
+        }
+    }
+}
+
 /// Runtime state for one client-rendered interactive tool surface.
 pub struct InteractiveSurfaceState {
     interaction_id: String,
     surface: BoxedPluginTuiSurface,
     host: TokioPluginTuiHost,
     pending_resolution: Option<ToolExchangeResolution>,
+    retry_resolution: Option<ToolExchangeResolution>,
     last_width: u16,
     last_preferred_height: u16,
+    canonical: Option<bcode_session_models::SessionId>,
 }
 
 impl InteractiveSurfaceState {
@@ -237,6 +524,8 @@ impl InteractiveSurfaceState {
                 },
             )),
             pending_resolution: None,
+            retry_resolution: None,
+            canonical: None,
             last_width: 0,
             last_preferred_height: 0,
         }
@@ -283,6 +572,8 @@ impl InteractiveSurfaceState {
             surface,
             host,
             pending_resolution: None,
+            retry_resolution: None,
+            canonical: None,
             last_width: 0,
             last_preferred_height: 0,
         })
@@ -308,6 +599,58 @@ impl InteractiveSurfaceState {
         .await
     }
 
+    /// Discover canonical evidence before considering the explicitly unsupported legacy route.
+    ///
+    /// # Errors
+    /// Rejects missing/corrupt durable evidence or missing renderer adapters without fallback.
+    pub async fn open_canonical_request(
+        runtime: &PluginRuntimeHost,
+        request: &InteractiveSurfaceRequest,
+        keymap: &BmuxKeyMap,
+        client: &bcode_client::BcodeClient,
+        session_id: bcode_session_models::SessionId,
+        changed: NativeInteractionChanged,
+    ) -> Result<Self, String> {
+        let consumer = client
+            .interaction_controller_consumer()
+            .await
+            .map_err(|error| error.to_string())?;
+        let Some(view) = discover_native_view(&consumer, session_id, request.interaction_id())
+            .await
+            .map_err(|error| format!("canonical interaction discovery: {error:?}"))?
+        else {
+            return Self::open_request(runtime, request, keymap)
+                .await
+                .map_err(|error| error.to_string());
+        };
+        if matches!(
+            view.snapshot.output,
+            bcode_tool::InteractionOutput::Submitted { .. }
+                | bcode_tool::InteractionOutput::Cancelled
+        ) {
+            return Err("canonical interaction is terminal".to_owned());
+        }
+        let renderer = crate::plugin_tui::open_canonical_interaction_surface(&view).await?;
+        let (redraw_sender, _redraw_receiver) = mpsc::channel(1);
+        let host = TokioPluginTuiHost::current(redraw_sender).with_text_input_resolver(Arc::new(
+            InteractiveTextInputResolver {
+                keymap: keymap.clone(),
+            },
+        ));
+        Ok(Self {
+            interaction_id: request.interaction_id.clone(),
+            surface: Box::new(NativeDurableSurface::start(
+                renderer, consumer, view, changed,
+            )),
+            host,
+            pending_resolution: None,
+            retry_resolution: None,
+            canonical: Some(session_id),
+            last_width: 0,
+            last_preferred_height: 0,
+        })
+    }
+
     /// Update configured composer-like text input intent without reopening the surface.
     pub fn update_keymap(&mut self, keymap: &BmuxKeyMap) {
         self.host
@@ -323,6 +666,17 @@ impl InteractiveSurfaceState {
         stroke: bmux_keyboard::KeyStroke,
     ) -> Option<bmux_text_edit::TextEditCommand> {
         bcode_plugin_sdk::tui::PluginTuiHost::text_edit_command(&self.host, stroke)
+    }
+
+    /// Whether this attachment uses canonical commit-backed semantics.
+    #[must_use]
+    pub const fn is_canonical(&self) -> bool {
+        self.canonical.is_some()
+    }
+
+    /// Original canonical session scope, absent for explicitly unsupported legacy surfaces.
+    pub const fn canonical_session(&self) -> Option<bcode_session_models::SessionId> {
+        self.canonical
     }
 
     /// Return the interaction id associated with this surface.
@@ -467,7 +821,9 @@ impl InteractiveSurfaceState {
 
     /// Clear a pending resolution so the user can retry after host delivery fails.
     pub fn clear_pending_resolution(&mut self) {
-        self.pending_resolution = None;
+        if let Some(resolution) = self.pending_resolution.take() {
+            self.retry_resolution = Some(resolution);
+        }
     }
 
     /// Handle an input event, report consumption, and retain close resolution until confirmation.
@@ -478,7 +834,7 @@ impl InteractiveSurfaceState {
 
     /// Return only the opted-in field from an unresolved owner.
     pub fn focused_text_field(&self) -> Option<bcode_plugin_sdk::tui::FocusedTextFieldSnapshot> {
-        if self.pending_resolution.is_some() {
+        if self.pending_resolution.is_some() || self.retry_resolution.is_some() {
             return None;
         }
         self.surface.focused_text_field()
@@ -492,7 +848,7 @@ impl InteractiveSurfaceState {
         bcode_plugin_sdk::tui::FocusedTextFieldEditResult,
         InteractiveSurfaceEventOutcome,
     ) {
-        if self.pending_resolution.is_some() {
+        if self.pending_resolution.is_some() || self.retry_resolution.is_some() {
             return (
                 bcode_plugin_sdk::tui::FocusedTextFieldEditResult::Rejected(
                     bcode_plugin_sdk::composer::ComposerValidationError::Stale,
@@ -512,6 +868,17 @@ impl InteractiveSurfaceState {
     pub fn handle_event_outcome(&mut self, event: &Event) -> InteractiveSurfaceEventOutcome {
         if let Some(resolution) = &self.pending_resolution {
             return InteractiveSurfaceEventOutcome::Resolved(resolution.clone());
+        }
+        // The producer may already be closed after proposing completion. Retry the
+        // exact retained proposal, never reconstruct an answer or mutate its owner.
+        if let Some(resolution) = &self.retry_resolution {
+            if self.surface.retry_resolution_event(event, &self.host) {
+                let resolution = resolution.clone();
+                self.retry_resolution = None;
+                self.pending_resolution = Some(resolution.clone());
+                return InteractiveSurfaceEventOutcome::Resolved(resolution);
+            }
+            return InteractiveSurfaceEventOutcome::Consumed;
         }
         let result = super::plugin_surface_host::compose_surface_input(
             self.surface.as_mut(),
@@ -645,6 +1012,92 @@ async fn open_surface(
 fn user_dismissed() -> ToolExchangeResolution {
     ToolExchangeResolution::Responded {
         payload: json!({"status": "dismissed"}),
+    }
+}
+
+#[cfg(test)]
+mod native_commit_tests {
+    use super::*;
+
+    fn view() -> DurableInteractionView {
+        serde_json::from_value(json!({
+            "version":1,"binding":{"session_id":"session","turn_id":"turn","invocation_id":"call",
+                "request_sequence":1,"exchange_id":"exchange","tool_name":"generic","request_digest":"a".repeat(64),
+                "exchange_schema_version":1,"capability":{"route":{"producer_id":"producer",
+                "exchange_schema":"schema","min_schema_version":1,"max_schema_version":1,"interaction_kind":"kind"},
+                "checkpoint_schema":"checkpoint","checkpoint_version":1,"continuation_schema":"continue","continuation_version":1}},
+            "revision":4,"snapshot":{"version":1,"exchange_id":"exchange","route":{"producer_id":"producer",
+                "exchange_schema":"schema","min_schema_version":1,"max_schema_version":1,"interaction_kind":"kind"},
+                "schema_version":1,"revision":4,"snapshot":{"selected":["retained"]},"output":{"type":"none"}}
+        })).unwrap()
+    }
+
+    #[test]
+    fn native_durable_restore_preserves_acknowledged_selection_and_exact_retry() {
+        let mut state = NativeCommitState {
+            view: view(),
+            pending: None,
+            failure: None,
+        };
+        assert_eq!(
+            state.view.snapshot.snapshot["selected"],
+            json!(["retained"])
+        );
+        let request = state.admit(bcode_tool::InteractionInput::Submit).unwrap();
+        let retry = state.pending.clone().unwrap();
+        assert_eq!(retry, request);
+        assert_eq!(request.operation.expected_revision, 4);
+        assert_eq!(
+            state.admit(bcode_tool::InteractionInput::Submit),
+            Err(InteractionControllerError::Conflict)
+        );
+        assert_eq!(
+            state.view.snapshot.snapshot["selected"],
+            json!(["retained"])
+        );
+        let mut committed = state.view.clone();
+        committed.revision = 5;
+        committed.snapshot.revision = 5;
+        committed.snapshot.snapshot = json!({"selected":["acknowledged"]});
+        let receipt = DurableInteractionReceipt {
+            version: 1,
+            input: retry,
+            view: committed.clone(),
+        };
+        assert_eq!(state.acknowledge(receipt), Ok(false));
+        assert!(state.pending.is_none());
+        let rejoined = NativeCommitState {
+            view: committed,
+            pending: None,
+            failure: None,
+        };
+        assert_eq!(
+            rejoined.view.snapshot.snapshot["selected"],
+            json!(["acknowledged"])
+        );
+    }
+
+    #[test]
+    fn native_durable_receipt_scope_failure_retains_exact_pending_input() {
+        let mut state = NativeCommitState {
+            view: view(),
+            pending: None,
+            failure: None,
+        };
+        let input = state.admit(bcode_tool::InteractionInput::Submit).unwrap();
+        let mut foreign = state.view.clone();
+        foreign.binding.session_id = "foreign".into();
+        foreign.revision = 5;
+        foreign.snapshot.revision = 5;
+        let receipt = DurableInteractionReceipt {
+            version: 1,
+            input: input.clone(),
+            view: foreign,
+        };
+        assert!(state.acknowledge(receipt).is_err());
+        assert_eq!(state.pending, Some(input));
+        assert_eq!(state.view.binding.session_id, "session");
+        assert_eq!(state.view.revision, 4);
     }
 }
 
@@ -1543,6 +1996,52 @@ mod tests {
             Some(submitted.clone())
         );
         surface.clear_pending_resolution();
+        surface.clear_pending_resolution();
+        assert!(surface.focused_text_field().is_none());
+        assert!(surface.handle_event(&Event::Tick).is_none());
+        assert!(surface.handle_event(&key(KeyCode::Escape)).is_none());
+        let mut remapped_config = bcode_config::TuiConfig::default();
+        remapped_config.keybindings.scopes.insert(
+            "question".into(),
+            std::collections::BTreeMap::from([
+                ("enter".into(), String::new()),
+                ("ctrl+s".into(), "question.submit".into()),
+            ]),
+        );
+        let mut remapped = BmuxKeyMap::from_config(&remapped_config);
+        remapped.integrate_contributors(Ok(bcode_question_plugin::question_tui_registry()
+            .keymap_actions()
+            .to_vec()));
+        surface.update_keymap(&remapped);
+        assert!(surface.handle_event(&key(KeyCode::Enter)).is_none());
+        assert_eq!(
+            surface.handle_event(&Event::Key(
+                bmux_keyboard::parse_key_stroke("ctrl+s").unwrap()
+            )),
+            Some(submitted.clone())
+        );
+        surface.clear_pending_resolution();
+        remapped_config.keybindings.scopes.insert(
+            "question".into(),
+            std::collections::BTreeMap::from([
+                ("enter".into(), String::new()),
+                ("ctrl+s".into(), String::new()),
+            ]),
+        );
+        let mut disabled = BmuxKeyMap::from_config(&remapped_config);
+        disabled.integrate_contributors(Ok(bcode_question_plugin::question_tui_registry()
+            .keymap_actions()
+            .to_vec()));
+        surface.update_keymap(&disabled);
+        assert!(surface.handle_event(&key(KeyCode::Enter)).is_none());
+        assert!(
+            surface
+                .handle_event(&Event::Key(
+                    bmux_keyboard::parse_key_stroke("ctrl+s").unwrap()
+                ))
+                .is_none()
+        );
+        surface.update_keymap(&keymap);
         assert_eq!(surface.handle_event(&key(KeyCode::Enter)), Some(submitted));
     }
 

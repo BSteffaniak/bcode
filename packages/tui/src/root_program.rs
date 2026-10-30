@@ -45,6 +45,13 @@ pub enum BcodeRuntimeMessage {
     EffectCompleted(Box<TuiEffectResult>),
     /// Completed attempt to open the next inline interactive surface.
     InteractiveSurfaceOpened(Result<super::interactive_surface::InteractiveSurfaceState, String>),
+    /// A committed native interaction update, scoped to its original session and exchange.
+    NativeDurableChanged {
+        session_id: bcode_session_models::SessionId,
+        exchange_id: String,
+        terminal: bool,
+        error: Option<bcode_plugin_sdk::interaction_application::InteractionControllerError>,
+    },
     /// Completed inline interactive surface resolution request.
     InteractiveSurfaceResolved(Result<bool, bcode_client::ClientError>),
     /// Due Bcode-owned semantic invalidations.
@@ -87,6 +94,7 @@ impl BcodeRuntimeMessage {
             | Self::EffectCompleted(_)
             | Self::InteractiveSurfaceOpened(_)
             | Self::InteractiveSurfaceResolved(_)
+            | Self::NativeDurableChanged { .. }
             | Self::Invalidations(_)
             | Self::DraftSaveDue
             | Self::InteractionRetryDue => None,
@@ -235,6 +243,7 @@ pub struct BcodeRuntimeModel {
     focused_input_owner: Option<FocusedInputOwner>,
     composer_field: bcode_plugin_sdk::tui::FocusedTextFieldAdapter,
     focused_input_command: Option<bmux_tui_runtime::Command<BcodeRuntimeMessage>>,
+    canonical_interaction: Option<(bcode_session_models::SessionId, String)>,
     focused_visual: Option<String>,
     /// Last successfully committed frame layout used for regional damage projection.
     committed_layout: Option<super::render::FrameLayout>,
@@ -835,6 +844,7 @@ impl BcodeRuntimeModel {
             committed_area: bmux_tui::geometry::Rect::new(0, 0, 0, 0),
             focused_input_owner: None,
             focused_input_command: None,
+            canonical_interaction: None,
             composer_field: bcode_plugin_sdk::tui::FocusedTextFieldAdapter::new("chat", "composer"),
             focused_visual: None,
             committed_layout: None,
@@ -2754,6 +2764,16 @@ impl BcodeRuntimeModel {
         interaction_id: String,
         resolution: bcode_session_models::ToolExchangeResolution,
     ) -> bmux_tui_runtime::Command<BcodeRuntimeMessage> {
+        if self
+            .canonical_interaction
+            .as_ref()
+            .is_some_and(|(_, exchange)| exchange == &interaction_id)
+        {
+            return bmux_tui_runtime::Command::start_if_idle(
+                bmux_tui_runtime::CommandKey::new("bcode.canonical_surface_detach"),
+                async { Some(BcodeRuntimeMessage::InteractiveSurfaceResolved(Ok(true))) },
+            );
+        }
         let client = self.loop_state.foreground_client();
         bmux_tui_runtime::Command::start_if_idle(
             bmux_tui_runtime::CommandKey::new("bcode.interactive_surface_resolution"),
@@ -2778,6 +2798,7 @@ impl BcodeRuntimeModel {
     }
 
     fn handle_session_changed(&mut self) {
+        self.canonical_interaction = None;
         self.composer_field.reset();
         self.clear_transcript_selection();
         self.selection_session = self.chat.app.session_id();
@@ -2802,6 +2823,9 @@ impl BcodeRuntimeModel {
         }
         if let Some(request) = self.loop_state.next_surface_open_request() {
             let keymap = self.settings.keymap().clone();
+            let client = self.loop_state.foreground_client();
+            let session_id = self.chat.attached_session_id();
+            let runtime_handle = handle.clone();
             commands.push(bmux_tui_runtime::Command::start_if_idle(
                 bmux_tui_runtime::CommandKey::new("bcode.interactive_surface_open"),
                 async move {
@@ -2809,11 +2833,23 @@ impl BcodeRuntimeModel {
                         &super::static_bundled_plugins(),
                     ) {
                         Ok(runtime) => {
-                            super::interactive_surface::InteractiveSurfaceState::open_request(
-                                &runtime, &request, &keymap,
-                            )
-                            .await
-                            .map_err(|error| error.to_string())
+                            if let Some(session_id) = session_id {
+                                let exchange_id = request.interaction_id().to_owned();
+                                let changed = std::sync::Arc::new(move |terminal, error| {
+                                    let runtime_handle = runtime_handle.clone();
+                                    let exchange_id = exchange_id.clone();
+                                    drop(tokio::spawn(async move {
+                                        let _ = runtime_handle.send(BcodeRuntimeMessage::NativeDurableChanged {
+                                            session_id, exchange_id, terminal, error,
+                                        }).await;
+                                    }));
+                                });
+                                super::interactive_surface::InteractiveSurfaceState::open_canonical_request(
+                                    &runtime, &request, &keymap, &client, session_id, changed,
+                                ).await
+                            } else {
+                                Err("canonical interaction requires an attached session".to_owned())
+                            }
                         }
                         Err(error) => Err(error.to_string()),
                     };
@@ -4373,20 +4409,66 @@ impl bmux_tui_runtime::Program for BcodeRuntimeModel {
             }
             bmux_tui_runtime::RuntimeEvent::Message(
                 BcodeRuntimeMessage::InteractiveSurfaceOpened(result),
-            ) => match self.loop_state.complete_interactive_surface_open(result) {
-                super::chat_loop::InteractiveSurfaceOpenCompletion::Opened => {
+            ) => {
+                let result = result.and_then(|surface| {
+                    if surface.canonical_session().is_some_and(|session_id| {
+                        self.chat.attached_session_id() != Some(session_id)
+                    }) {
+                        Err("stale canonical interaction session scope".to_owned())
+                    } else {
+                        Ok(surface)
+                    }
+                });
+                let canonical = result
+                    .as_ref()
+                    .ok()
+                    .filter(|surface| surface.is_canonical())
+                    .and_then(|surface| {
+                        self.chat
+                            .attached_session_id()
+                            .map(|session_id| (session_id, surface.interaction_id().to_owned()))
+                    });
+                match self.loop_state.complete_interactive_surface_open(result) {
+                    super::chat_loop::InteractiveSurfaceOpenCompletion::Opened => {
+                        self.canonical_interaction = canonical;
+                        super::invalidation::UiInvalidation::Structural
+                    }
+                    super::chat_loop::InteractiveSurfaceOpenCompletion::Stale => {
+                        super::invalidation::UiInvalidation::None
+                    }
+                    super::chat_loop::InteractiveSurfaceOpenCompletion::Failed => {
+                        self.chat
+                            .app
+                            .set_status("Interactive request unavailable; retrying".to_owned());
+                        super::invalidation::UiInvalidation::Paint
+                    }
+                }
+            }
+            bmux_tui_runtime::RuntimeEvent::Message(
+                BcodeRuntimeMessage::NativeDurableChanged {
+                    session_id,
+                    exchange_id,
+                    terminal,
+                    error,
+                },
+            ) => {
+                if self.chat.attached_session_id() != Some(session_id)
+                    || self.loop_state.active_interactive_surface_id() != Some(exchange_id.as_str())
+                {
+                    super::invalidation::UiInvalidation::None
+                } else {
+                    if terminal {
+                        self.loop_state
+                            .complete_interactive_surface_resolution(true);
+                    }
+                    if let Some(error) = error {
+                        self.chat.app.set_status(format!(
+                            "canonical interaction: {error:?}; input retained"
+                        ));
+                    }
                     super::invalidation::UiInvalidation::Structural
                 }
-                super::chat_loop::InteractiveSurfaceOpenCompletion::Stale => {
-                    super::invalidation::UiInvalidation::None
-                }
-                super::chat_loop::InteractiveSurfaceOpenCompletion::Failed => {
-                    self.chat
-                        .app
-                        .set_status("Interactive request unavailable; retrying".to_owned());
-                    super::invalidation::UiInvalidation::Paint
-                }
-            },
+            }
             bmux_tui_runtime::RuntimeEvent::Message(
                 BcodeRuntimeMessage::InteractiveSurfaceResolved(result),
             ) => match result {
@@ -4534,19 +4616,60 @@ async fn finish_runtime_result<P>(
                 mut output,
             },
         ) => {
-            let error = match cleanup_error {
-                Some(cleanup_error) => TuiError::RuntimeCleanup {
-                    error: Box::new(error),
-                    cleanup_error: Box::new(cleanup_error),
-                },
-                None => error,
-            };
             record_runtime_stats(&mut output.program, &output.stats);
             let settlement = Box::pin(output.program.settle_plugin_operations()).await;
             output.program.shutdown_owned_work();
-            // Preserve terminal failure unless settlement itself could not be verified.
-            settlement.and(Err(error))
+            Err(runtime_finalization_error(
+                error,
+                cleanup_error,
+                settlement.err(),
+            ))
         }
+    }
+}
+
+/// Preserve settlement precedence without losing runtime or terminal restoration failures.
+pub fn runtime_finalization_error(
+    runtime_error: TuiError,
+    cleanup_error: Option<TuiError>,
+    settlement_error: Option<TuiError>,
+) -> TuiError {
+    let (primary, runtime_error) = match settlement_error {
+        Some(error) => (error, Some(runtime_error)),
+        None if cleanup_error.is_none() => return runtime_error,
+        None => (runtime_error, None),
+    };
+    std::io::Error::other(RuntimeFinalizationError {
+        primary,
+        runtime_error,
+        cleanup_error,
+    })
+    .into()
+}
+
+#[derive(Debug)]
+struct RuntimeFinalizationError {
+    primary: TuiError,
+    runtime_error: Option<TuiError>,
+    cleanup_error: Option<TuiError>,
+}
+
+impl std::fmt::Display for RuntimeFinalizationError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(formatter, "{}", self.primary)?;
+        if let Some(error) = &self.runtime_error {
+            write!(formatter, "; runtime also failed: {error}")?;
+        }
+        if let Some(error) = &self.cleanup_error {
+            write!(formatter, "; terminal cleanup also failed: {error}")?;
+        }
+        Ok(())
+    }
+}
+
+impl std::error::Error for RuntimeFinalizationError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(&self.primary)
     }
 }
 
@@ -5957,6 +6080,9 @@ mod tests {
         let socket_dir = tempfile::tempdir().expect("IPC directory");
         let endpoint = bcode_ipc::IpcEndpoint::unix_socket(socket_dir.path().join("ipc/page.sock"));
         let listener = bcode_ipc::LocalIpcListener::bind(&endpoint).expect("listener");
+        let executable_digest = bcode_daemon_lifecycle::current_executable_identity()
+            .expect("test executable identity")
+            .1;
         let responder = tokio::spawn(async move {
             let mut stream = listener.accept().await.expect("client");
             loop {
@@ -5979,11 +6105,7 @@ mod tests {
                                     bcode_ipc::ProtocolVersion::current().0,
                                 ),
                                 artifact_id: Some(bcode_ipc::ArtifactId::current()),
-                                executable_digest: Some(
-                                    bcode_daemon_lifecycle::current_executable_identity()
-                                        .expect("test executable identity")
-                                        .1,
-                                ),
+                                executable_digest: Some(executable_digest.clone()),
                                 build_fingerprint: bcode_ipc::BUILD_FINGERPRINT.to_owned(),
                                 storage_writer_epoch: Some(
                                     bcode_ipc::CURRENT_SESSION_STORAGE_WRITER_EPOCH,
@@ -6152,6 +6274,46 @@ mod tests {
         drop(model);
     }
 
+    // Failure-only diagnostics preserve the real admission error that public IPC intentionally
+    // normalizes. A successful unregistered DB read alone cannot establish server readability.
+    #[cfg(unix)]
+    async fn persisted_history_failure_diagnostic(
+        root: &std::path::Path,
+        session_id: bcode_session_models::SessionId,
+        cursor: bcode_session_models::SessionHistoryCursor,
+    ) -> String {
+        #[cfg(any(target_os = "macos", target_os = "linux"))]
+        let admission = bcode_server::storage_read_admission::RegisteredStorageRead::begin(
+            root.to_path_buf(),
+            session_id,
+        )
+        .await;
+        #[cfg(any(target_os = "macos", target_os = "linux"))]
+        let admission_status = match &admission {
+            Ok(_) => "registered".to_owned(),
+            Err(error) => format!("{error:?}"),
+        };
+        #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+        let admission_status = "not applicable";
+        let diagnostic = bcode_session::SessionManager::persistent_lazy(root.to_path_buf());
+        let history = diagnostic
+            .session_history_page(
+                session_id,
+                bcode_session_models::SessionHistoryQuery {
+                    cursor: Some(cursor),
+                    limit: 512,
+                    direction: bcode_session_models::SessionHistoryDirection::Backward,
+                },
+            )
+            .await
+            .map(|page| page.events.len());
+        // This is a failed-test inspection, not a completed tracked product read. Do not mark
+        // the participant clean without recording access; keep its evidence in the fixture root.
+        #[cfg(any(target_os = "macos", target_os = "linux"))]
+        drop(admission);
+        format!("storage admission: {admission_status}; canonical history: {history:?}")
+    }
+
     #[cfg(unix)]
     #[tokio::test]
     #[allow(clippy::too_many_lines)]
@@ -6178,6 +6340,7 @@ mod tests {
         )
         .expect("resolve isolated state");
         let sessions_root = locations.primary().sessions_root().to_path_buf();
+        let persisted_sessions_root = sessions_root.clone();
         let working_directory = directory.path().to_path_buf();
         let handle = tokio::runtime::Handle::current();
         let fixture_owner = std::sync::Arc::clone(&directory);
@@ -6344,7 +6507,18 @@ mod tests {
                     ..
                 } = &result
                 {
-                    let (page, _) = page.as_ref().expect("canonical older page");
+                    let (page, _) = match page.as_ref() {
+                        Ok(page) => page,
+                        Err(error) => {
+                            let diagnostic = persisted_history_failure_diagnostic(
+                                &persisted_sessions_root,
+                                session.id,
+                                cursor,
+                            )
+                            .await;
+                            panic!("canonical older page: {error:?}; {diagnostic}");
+                        }
+                    };
                     assert!(!page.events.is_empty());
                     assert!(page.events.len() <= 512);
                 } else {
@@ -6623,9 +6797,9 @@ mod tests {
             ),
         )
         .expect("resolve isolated state");
-        let sessions =
-            bcode_session::SessionManager::persistent(locations.primary().sessions_root())
-                .expect("persistent sessions");
+        let persisted_sessions_root = locations.primary().sessions_root().to_path_buf();
+        let sessions = bcode_session::SessionManager::persistent(&persisted_sessions_root)
+            .expect("persistent sessions");
         let session = sessions
             .create_session(None, directory.path().to_path_buf())
             .await
@@ -6659,6 +6833,16 @@ mod tests {
             .await
             .expect("recent bounded history")
             .events;
+        // Dropping a manager does not await actor/database teardown. Complete
+        // the writer's ownership handoff before the server opens persisted history.
+        assert!(matches!(
+            sessions
+                .release_session_ownership(session.id)
+                .await
+                .expect("release persisted fixture ownership"),
+            bcode_session::SessionOwnershipRelease::Released
+                | bcode_session::SessionOwnershipRelease::AlreadyUnowned
+        ));
         drop(sessions);
 
         let mut model = root_test_model_with_history(session.id, &recent);
@@ -6735,7 +6919,60 @@ mod tests {
                 result: page, ..
             } = &result
             {
-                let (page, _) = page.as_ref().expect("persisted first page");
+                let (page, _) = match page.as_ref() {
+                    Ok(page) => page,
+                    Err(error) => {
+                        // The public IPC error is intentionally normalized. On failure only,
+                        // inspect the same canonical store through bounded domain APIs so the
+                        // fixture reports the underlying load/read cause, not a guessed timeout.
+                        let diagnostic = bcode_session::SessionManager::persistent_lazy(
+                            persisted_sessions_root.clone(),
+                        );
+                        let request = bcode_session_models::ProjectionWindowRequest {
+                            projection: bcode_session_models::SessionProjectionKind::Transcript,
+                            anchor: bcode_session_models::ProjectionWindowAnchor::BeforeSequence(
+                                cursor.sequence.saturating_add(1),
+                            ),
+                            direction: bcode_session_models::ProjectionWindowDirection::Backward,
+                            target: bcode_session_models::ProjectionWindowTarget {
+                                min_items: Some(4),
+                                min_estimated_rows: Some(24),
+                                min_bytes: None,
+                                width_columns: Some(80),
+                            },
+                            limits: bcode_session_models::ProjectionWindowLimits {
+                                max_items: 16,
+                                max_events_scanned: 512,
+                                max_bytes: 512 * 1024,
+                            },
+                        };
+                        let projection = diagnostic
+                            .session_projection_history_page(session.id, request)
+                            .await
+                            .map(|page| (page.events.len(), page.window.scanned_events));
+                        let history = diagnostic
+                            .session_history_page(
+                                session.id,
+                                bcode_session_models::SessionHistoryQuery {
+                                    cursor: Some(cursor),
+                                    limit: 512,
+                                    direction:
+                                        bcode_session_models::SessionHistoryDirection::Backward,
+                                },
+                            )
+                            .await
+                            .map(|page| page.events.len());
+                        let admission_diagnostic = persisted_history_failure_diagnostic(
+                            &persisted_sessions_root,
+                            session.id,
+                            cursor,
+                        )
+                        .await;
+                        panic!(
+                            "persisted first page: {error:?}; canonical projection: {projection:?}; canonical history: {history:?}; {admission_diagnostic}"
+                        );
+                    }
+                };
                 assert!(page.events.len() <= 512);
                 assert!(
                     page.events.iter().all(|event| matches!(
@@ -13752,9 +13989,94 @@ mod tests {
         }
     }
 
+    #[test]
+    fn runtime_finalization_retains_all_failures_with_settlement_precedence() {
+        for cleanup in [false, true] {
+            for settlement in [false, true] {
+                let error = super::runtime_finalization_error(
+                    std::io::Error::other("primary runtime failure").into(),
+                    cleanup.then(|| std::io::Error::other("cleanup failure").into()),
+                    settlement.then(|| std::io::Error::other("settlement failure").into()),
+                );
+                let diagnostic = error.to_string();
+                assert!(diagnostic.contains("primary runtime failure"));
+                assert_eq!(diagnostic.contains("cleanup failure"), cleanup);
+                assert_eq!(diagnostic.contains("settlement failure"), settlement);
+                if cleanup || settlement {
+                    let super::TuiError::Io(error) = &error else {
+                        panic!("combined error carrier")
+                    };
+                    let combined = error
+                        .get_ref()
+                        .unwrap()
+                        .downcast_ref::<super::RuntimeFinalizationError>()
+                        .unwrap();
+                    assert!(combined.primary.to_string().contains(if settlement {
+                        "settlement failure"
+                    } else {
+                        "primary runtime failure"
+                    }));
+                    assert_eq!(combined.runtime_error.is_some(), settlement);
+                    assert_eq!(combined.cleanup_error.is_some(), cleanup);
+                    assert!(std::error::Error::source(combined).is_some());
+                } else {
+                    let super::TuiError::Io(error) = error else {
+                        panic!("original I/O error")
+                    };
+                    assert_eq!(error.to_string(), "primary runtime failure");
+                }
+            }
+        }
+    }
+
+    fn assert_root_shutdown_result(
+        exit: &str,
+        result: Result<super::BcodeRuntimeModel, crate::TuiError>,
+    ) {
+        match result {
+            Ok(mut model) => {
+                assert_eq!(exit, "normal");
+                assert_eq!(
+                    model.take_plugin_surface_result(),
+                    Some((
+                        "test".to_string(),
+                        Some(serde_json::json!({"settled": true}))
+                    ))
+                );
+                drop(model);
+            }
+            Err(error) => {
+                assert_ne!(exit, "normal");
+                let diagnostic = error.to_string();
+                if exit == "cleanup" {
+                    assert!(diagnostic.contains("original failure"));
+                    assert!(diagnostic.contains("restoration failure"));
+                } else {
+                    assert!(diagnostic.contains(if exit.starts_with("program") {
+                        "terminal input failed"
+                    } else {
+                        "terminal writer failed"
+                    }));
+                    assert_eq!(
+                        diagnostic.contains("terminal restoration failed"),
+                        exit.ends_with("cleanup")
+                    );
+                }
+                drop(error);
+            }
+        }
+    }
+
     #[tokio::test]
     async fn root_shutdown_waits_for_plugin_results_on_normal_and_fatal_exit() {
-        for exit in ["normal", "program", "presenter", "cleanup"] {
+        for exit in [
+            "normal",
+            "cleanup",
+            "program",
+            "presenter",
+            "program_cleanup",
+            "presenter_cleanup",
+        ] {
             let commits = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
             let (release, receiver) = tokio::sync::oneshot::channel();
             let mut outcome = Some({
@@ -13781,9 +14103,10 @@ mod tests {
                 };
                 drop(retained_model);
                 match exit {
-                    "program" => Err(bmux_tui_runtime::RuntimeError::Program {
+                    "program" | "program_cleanup" => Err(bmux_tui_runtime::RuntimeError::Program {
                         error: std::io::Error::other("terminal input failed").into(),
-                        cleanup_error: None,
+                        cleanup_error: (exit == "program_cleanup")
+                            .then(|| std::io::Error::other("terminal restoration failed").into()),
                         output: Box::new(output),
                     }),
                     "cleanup" => Err(bmux_tui_runtime::RuntimeError::Program {
@@ -13791,11 +14114,15 @@ mod tests {
                         cleanup_error: Some(std::io::Error::other("restoration failure").into()),
                         output: Box::new(output),
                     }),
-                    "presenter" => Err(bmux_tui_runtime::RuntimeError::Presenter {
-                        error: std::io::Error::other("terminal writer failed").into(),
-                        cleanup_error: None,
-                        output: Box::new(output),
-                    }),
+                    "presenter" | "presenter_cleanup" => {
+                        Err(bmux_tui_runtime::RuntimeError::Presenter {
+                            error: std::io::Error::other("terminal writer failed").into(),
+                            cleanup_error: (exit == "presenter_cleanup").then(|| {
+                                std::io::Error::other("terminal restoration failed").into()
+                            }),
+                            output: Box::new(output),
+                        })
+                    }
                     _ => Ok(output),
                 }
             });
@@ -13817,28 +14144,7 @@ mod tests {
             assert_eq!(commits.load(std::sync::atomic::Ordering::SeqCst), 1);
             let result = retained_result.take().expect("outcome transfers once");
             drop(retained_result);
-            match result {
-                Ok(mut model) => {
-                    assert_eq!(exit, "normal");
-                    assert_eq!(
-                        model.take_plugin_surface_result(),
-                        Some((
-                            "test".to_string(),
-                            Some(serde_json::json!({"settled": true}))
-                        ))
-                    );
-                    drop(model);
-                }
-                Err(error) => {
-                    assert_ne!(exit, "normal");
-                    if exit == "cleanup" {
-                        let diagnostic = error.to_string();
-                        assert!(diagnostic.contains("original failure"));
-                        assert!(diagnostic.contains("restoration failure"));
-                    }
-                    drop(error);
-                }
-            }
+            assert_root_shutdown_result(exit, result);
         }
     }
 

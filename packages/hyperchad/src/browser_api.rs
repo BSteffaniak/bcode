@@ -5,6 +5,7 @@
 //! (the `HyperChad` content boundary does not expose HTTP status/header control).
 
 mod artifact;
+pub mod browser_consumers;
 mod controls;
 mod history;
 mod permissions;
@@ -27,7 +28,12 @@ pub fn with_routes(
     let history_state = state.clone();
     let controls_state = state.clone();
     let artifact_state = state.clone();
+    let download_state = state.clone();
     router
+        .with_route("/api/session-view/artifact/download", move |request| {
+            let state = download_state.clone();
+            async move { state.browser_artifact_download(request).await }
+        })
         .with_route("/api/session-view/artifact", move |request| {
             let state = artifact_state.clone();
             async move { state.browser_artifact(request).await }
@@ -337,16 +343,15 @@ impl HyperChadAppState {
         else {
             return error("permission_state_unavailable");
         };
-        let content = match observations.publish_scoped_observation(
+        match observations.publish_scoped_observation(
             session_id,
             snapshot,
             Some(permissions),
             serde_json::from_str(&self.browser_policy).ok(),
         ) {
             Ok(content) => content,
-            Err(code) => return error(code),
-        };
-        content
+            Err(code) => error(code),
+        }
     }
 
     pub(super) async fn browser_submit(&self, request: RouteRequest) -> Content {

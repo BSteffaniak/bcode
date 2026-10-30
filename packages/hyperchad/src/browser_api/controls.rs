@@ -21,6 +21,9 @@ struct ControlRequest {
 #[derive(Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
 enum Control {
+    CancelTurn {
+        turn_id: String,
+    },
     Permission {
         permission_id: String,
         approved: bool,
@@ -38,7 +41,7 @@ enum Control {
 
 // Producer-neutral input, not an arbitrary final exchange resolution. In
 // particular callers cannot send timed_out, failed, closed or host metadata.
-#[derive(Deserialize)]
+#[derive(Clone, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
 enum Input {
     Activate {
@@ -207,6 +210,22 @@ fn batch_action(
     Ok(SessionViewAction::ResolvePermissionBatch { batch_id, approved })
 }
 
+fn validate_cancel_turn(
+    observed: &SessionViewSnapshot,
+    fresh: &SessionViewSnapshot,
+    turn_id: &str,
+) -> Result<(), &'static str> {
+    if !valid_id(turn_id) {
+        return Err("invalid_control_identity");
+    }
+    if observed.runtime.active_turn_id.as_deref() != Some(turn_id)
+        || fresh.runtime.active_turn_id.as_deref() != Some(turn_id)
+    {
+        return Err("stale_control");
+    }
+    Ok(())
+}
+
 impl HyperChadAppState {
     pub(super) async fn browser_control(&self, request: RouteRequest) -> Content {
         if !self.authorizes(&request) {
@@ -242,18 +261,68 @@ impl HyperChadAppState {
         if let Some((revision, _)) = observations.snapshots.get_mut(&query.session_id) {
             *revision = next_revision;
         }
-        // This lock also bounds concurrent browser mutations. Timeout does not prove
-        // rejection: no canonical exactly-once receipt exists for these controls.
-        match tokio::time::timeout(
+        // This lock bounds concurrent browser mutations. A timeout is not rejection;
+        // durable interactions retain their exact operation until a server receipt arrives.
+        match Box::pin(tokio::time::timeout(
             BACKEND_TIMEOUT,
             self.execute_browser_control(query.session_id, &observed, &permissions, query.action),
-        )
+        ))
         .await
         {
             Ok(Ok(content)) => content,
             Ok(Err(code)) => error(code),
             Err(_) => error("control_outcome_unknown"),
         }
+    }
+
+    async fn try_durable_browser_control(
+        &self,
+        session_id: bcode_session_models::SessionId,
+        observed: &SessionViewSnapshot,
+        control: &Control,
+    ) -> Result<bool, &'static str> {
+        let Control::Interaction {
+            interaction_id,
+            input,
+        } = control
+        else {
+            return Ok(false);
+        };
+        {
+            let controllers = self
+                .interaction_controllers
+                .lock()
+                .map_err(|_| "control_state_unavailable")?;
+            let retry = controllers.pending_operations.contains_key(interaction_id);
+            if !controllers.durable_sessions.contains(&session_id) && !retry {
+                return Ok(false);
+            }
+            if !valid_id(interaction_id) {
+                return Err("stale_control");
+            }
+            if !retry {
+                let committed = controllers
+                    .durable
+                    .get(interaction_id)
+                    .map(crate::durable_summary)
+                    .ok_or("control_state_unavailable")?;
+                drop(controllers);
+                let previous = observed
+                    .interactions
+                    .iter()
+                    .find(|item| item.interaction_id == *interaction_id)
+                    .ok_or("stale_control")?;
+                if previous != &committed {
+                    return Err("stale_control");
+                }
+            }
+        }
+        let form = input.clone().form(session_id, interaction_id.clone())?;
+        let semantic =
+            crate::interaction_input_from_form(&form).map_err(|_| "invalid_control_input")?;
+        self.durable_interaction_input(session_id, interaction_id, semantic)
+            .await
+            .map_err(|_| "control_outcome_unknown")
     }
 
     async fn execute_browser_control(
@@ -263,10 +332,23 @@ impl HyperChadAppState {
         permissions: &super::permissions::PermissionObservation,
         control: Control,
     ) -> Result<Content, &'static str> {
+        if self
+            .try_durable_browser_control(session_id, observed, &control)
+            .await?
+        {
+            return Ok(json_content(&BrowserActionResponse {
+                schema_version: 1,
+                outcome: bcode_session_view_models::SessionViewActionOutcome::None,
+            }));
+        }
         let mut fresh = self
             .session_snapshot(session_id)
             .await
             .map_err(|_| "control_state_unavailable")?;
+        if let Control::CancelTurn { turn_id } = &control {
+            validate_cancel_turn(observed, &fresh, turn_id)?;
+            return self.cancel_browser_turn(session_id, turn_id.clone()).await;
+        }
         if !matches!(&control, Control::Interaction { .. }) {
             self.browser_permission_observation(session_id, &mut fresh)
                 .await?;
@@ -303,7 +385,7 @@ impl HyperChadAppState {
                     true,
                 ))
             }
-            Control::Interaction { .. } => None,
+            Control::Interaction { .. } | Control::CancelTurn { .. } => None,
         };
         if let Some((decision, batch)) = decision {
             let result = self
@@ -339,6 +421,22 @@ impl HyperChadAppState {
         self.execute_browser_interaction(session_id, observed, &fresh, interaction_id, input)
             .await
     }
+    async fn cancel_browser_turn(
+        &self,
+        session_id: bcode_session_models::SessionId,
+        turn_id: String,
+    ) -> Result<Content, &'static str> {
+        let cancelled = self
+            .client
+            .cancel_exact_session_turn(session_id, turn_id)
+            .await
+            .map_err(|_| "control_outcome_unknown")?;
+        Ok(json_content(&BrowserActionResponse {
+            schema_version: 1,
+            outcome: bcode_session_view_models::SessionViewActionOutcome::Cancelled { cancelled },
+        }))
+    }
+
     async fn execute_browser_interaction(
         &self,
         session_id: bcode_session_models::SessionId,
@@ -349,6 +447,20 @@ impl HyperChadAppState {
     ) -> Result<Content, &'static str> {
         if !valid_id(&interaction_id) {
             return Err("invalid_control_identity");
+        }
+        let semantic = crate::interaction_input_from_form(
+            &input.clone().form(session_id, interaction_id.clone())?,
+        )
+        .map_err(|_| "invalid_control_input")?;
+        if self
+            .durable_interaction_input(session_id, &interaction_id, semantic)
+            .await
+            .map_err(|_| "control_outcome_unknown")?
+        {
+            return Ok(json_content(&BrowserActionResponse {
+                schema_version: 1,
+                outcome: bcode_session_view_models::SessionViewActionOutcome::None,
+            }));
         }
         let previous = observed
             .interactions
@@ -482,6 +594,67 @@ mod tests {
         );
         observed.permissions[0].batch.as_mut().unwrap().call_count = 2;
         assert!(batch_action(&observed, &observed, "batch".to_owned(), true).is_err());
+    }
+
+    #[tokio::test]
+    async fn untrusted_origin_rejects_control_before_body_or_backend_access() {
+        let state = HyperChadAppState::new(bcode_client::BcodeClient::default_endpoint(), "secret")
+            .with_browser_origins(&["https://embed.example".into()])
+            .unwrap();
+        let mut request = RouteRequest::from_path(
+            "/api/tui/control?token=secret",
+            hyperchad::router::RequestInfo::default(),
+        );
+        request
+            .headers
+            .insert("origin".into(), "https://evil.example".into());
+        let Content::Raw { data, .. } = Box::pin(state.browser_control(request)).await else {
+            panic!("authorization error envelope");
+        };
+        let value: serde_json::Value = serde_json::from_slice(&data).unwrap();
+        assert_eq!(value["error"], "unauthorized");
+    }
+
+    #[test]
+    fn cancellation_requires_exact_observed_and_current_turn() {
+        let mut observed = SessionViewSnapshot::empty();
+        observed.runtime.active_turn_id = Some("turn-first".into());
+        let mut fresh = observed.clone();
+        assert_eq!(
+            validate_cancel_turn(&observed, &fresh, "turn-first"),
+            Ok(())
+        );
+        assert_eq!(
+            validate_cancel_turn(&observed, &fresh, ""),
+            Err("invalid_control_identity")
+        );
+        assert_eq!(
+            validate_cancel_turn(&observed, &fresh, "turn-other"),
+            Err("stale_control")
+        );
+        fresh.runtime.active_turn_id = Some("turn-next".into());
+        assert_eq!(
+            validate_cancel_turn(&observed, &fresh, "turn-first"),
+            Err("stale_control")
+        );
+        assert_eq!(
+            validate_cancel_turn(&observed, &fresh, "turn-next"),
+            Err("stale_control")
+        );
+        fresh.runtime.active_turn_id = None;
+        assert_eq!(
+            validate_cancel_turn(&observed, &fresh, "turn-first"),
+            Err("stale_control")
+        );
+        let control: Control =
+            serde_json::from_str(r#"{"type":"cancel_turn","turn_id":"turn-first"}"#).unwrap();
+        assert!(matches!(control, Control::CancelTurn { turn_id } if turn_id == "turn-first"));
+        assert!(
+            serde_json::from_str::<Control>(
+                r#"{"type":"cancel_turn","turn_id":"turn-first","clear_queue":true}"#
+            )
+            .is_err()
+        );
     }
 
     #[test]

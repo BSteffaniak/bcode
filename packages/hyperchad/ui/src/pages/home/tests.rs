@@ -692,6 +692,30 @@ fn markdown_messages_use_hyperchad_markdown_with_highlighting_and_xss_protection
     assert!(rendered.contains("https://example.com"));
 }
 
+fn assert_no_raw_markup(container: &hyperchad_transformer::Container) {
+    assert!(
+        !matches!(
+            container.element,
+            hyperchad_transformer::Element::Raw { .. }
+        ),
+        "activity details must remain escaped text, never raw HTML"
+    );
+    for child in &container.children {
+        assert_no_raw_markup(child);
+    }
+}
+
+fn literal_occurrences(container: &hyperchad_transformer::Container, expected: &str) -> usize {
+    usize::from(matches!(
+        &container.element,
+        hyperchad_transformer::Element::Text { value } if value == expected
+    )) + container
+        .children
+        .iter()
+        .map(|child| literal_occurrences(child, expected))
+        .sum::<usize>()
+}
+
 #[test]
 fn activity_messages_expose_bounded_details_without_parsing_payload_markup() {
     let mut message = ChatMessageView::plain("Iteration preview");
@@ -722,12 +746,35 @@ fn activity_messages_expose_bounded_details_without_parsing_payload_markup() {
     }
     assert!(text.contains("Activity details"));
     assert!(text.contains("Canonical instructions"));
-    assert!(!text.contains("**exact instructions** <script>not markup</script>"));
+    let exact_instructions = "**exact instructions** <script>not markup</script>";
+    assert!(text.contains(exact_instructions));
+    assert_eq!(
+        containers
+            .iter()
+            .map(|container| literal_occurrences(container, exact_instructions))
+            .sum::<usize>(),
+        1
+    );
+    // The producer's JSON is inspectable escaped data, not the canonical instructions.
+    assert!(text.contains("<script>alert(1)</script>"));
+    let producer_details =
+        serde_json::to_string_pretty(&message.activity.as_ref().unwrap().presentation.payload)
+            .unwrap();
+    let bounded_details: String = producer_details.chars().take(32_000).collect();
+    assert_eq!(
+        containers
+            .iter()
+            .map(|container| literal_occurrences(container, &bounded_details))
+            .sum::<usize>(),
+        1
+    );
     assert!(text.contains("run-a"));
     assert!(text.contains("session event 42"));
     assert!(text.contains("not the exact submitted instructions"));
-    assert!(!text.contains("Structured details truncated for display."));
-    assert!(!format!("{containers:?}").contains("Element::Raw"));
+    assert!(text.contains("Structured details truncated for display."));
+    for container in &containers {
+        assert_no_raw_markup(container);
+    }
     assert!(!text.contains(&"x".repeat(40_000)));
 
     let activity = message.activity.as_mut().unwrap();
@@ -742,7 +789,9 @@ fn activity_messages_expose_bounded_details_without_parsing_payload_markup() {
     assert!(omitted_text.contains("100001 UTF-8 bytes"));
     assert!(omitted_text.contains("session event 42"));
     assert!(!omitted_text.contains("Exact submitted instructions"));
-    assert!(!format!("{omitted:?}").contains("Element::Raw"));
+    for container in &omitted {
+        assert_no_raw_markup(container);
+    }
 
     message.activity.as_mut().unwrap().exact_instructions = Some("Ω".repeat(100_001));
     let mut truncated_text = String::new();

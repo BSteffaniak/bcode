@@ -362,6 +362,20 @@ pub fn decode_session_event(payload: &str) -> Result<SessionEvent, PersistedSess
 ///
 /// Returns an error when the event cannot be serialized as JSON.
 pub fn encode_session_event(event: &SessionEvent) -> Result<String, serde_json::Error> {
+    if let SessionEventKind::DurableInteractionCommitted { operation } = &event.kind {
+        operation.validate().map_err(|_| {
+            <serde_json::Error as serde::ser::Error>::custom(
+                "invalid or unsupported durable interaction envelope",
+            )
+        })?;
+    }
+    if let SessionEventKind::TurnContinuationCommitted { operation } = &event.kind {
+        operation.validate().map_err(|_| {
+            <serde_json::Error as serde::ser::Error>::custom(
+                "invalid original-turn continuation envelope",
+            )
+        })?;
+    }
     serde_json::to_string(&PersistedSessionEvent::from(event))
 }
 
@@ -465,6 +479,9 @@ pub enum PersistedSessionEventError {
     /// Submission execution context has an unsupported or invalid envelope.
     #[error("invalid or unsupported submission execution descriptor")]
     InvalidSubmissionDescriptor,
+    /// Durable interaction envelope is malformed, oversized or unsupported.
+    #[error("invalid or unsupported durable interaction envelope")]
+    InvalidDurableInteraction,
     /// Private original usage is malformed; ordinary reads must not conceal damaged evidence.
     #[error("invalid original billing usage in canonical event")]
     InvalidOriginalUsage,
@@ -516,6 +533,16 @@ impl PersistedSessionEvent {
             });
         }
         let kind = self.kind.into_domain();
+        if let SessionEventKind::DurableInteractionCommitted { operation } = &kind {
+            operation
+                .validate()
+                .map_err(|_| PersistedSessionEventError::InvalidDurableInteraction)?;
+        }
+        if let SessionEventKind::TurnContinuationCommitted { operation } = &kind {
+            operation
+                .validate()
+                .map_err(|_| PersistedSessionEventError::InvalidDurableInteraction)?;
+        }
         let descriptor = match &kind {
             SessionEventKind::SubmissionAccepted { submission } => {
                 submission.execution_descriptor.as_ref()
@@ -902,12 +929,28 @@ enum PersistedSessionEventKind {
     SessionChildrenReconciled {
         verified_children: u64,
     },
+    DurableInteractionCommitted {
+        operation: bcode_session_models::DurableInteractionOperation,
+    },
+    TurnContinuationCommitted {
+        operation: Box<bcode_session_models::TurnContinuationOperation>,
+    },
 }
 
 impl From<&SessionEventKind> for PersistedSessionEventKind {
     #[allow(clippy::too_many_lines)]
     fn from(value: &SessionEventKind) -> Self {
         match value {
+            SessionEventKind::TurnContinuationCommitted { operation } => {
+                Self::TurnContinuationCommitted {
+                    operation: operation.clone(),
+                }
+            }
+            SessionEventKind::DurableInteractionCommitted { operation } => {
+                Self::DurableInteractionCommitted {
+                    operation: operation.clone(),
+                }
+            }
             SessionEventKind::MilestoneEvaluationRequested { request } => {
                 Self::MilestoneEvaluationRequested {
                     request: request.clone(),
@@ -1425,6 +1468,12 @@ impl PersistedSessionEventKind {
     #[allow(clippy::too_many_lines)]
     fn into_domain(self) -> SessionEventKind {
         match self {
+            Self::TurnContinuationCommitted { operation } => {
+                SessionEventKind::TurnContinuationCommitted { operation }
+            }
+            Self::DurableInteractionCommitted { operation } => {
+                SessionEventKind::DurableInteractionCommitted { operation }
+            }
             Self::SessionChildrenReconciled { verified_children } => {
                 SessionEventKind::SessionChildrenReconciled { verified_children }
             }

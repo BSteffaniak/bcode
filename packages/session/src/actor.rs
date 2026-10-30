@@ -186,6 +186,7 @@ mod child_transition_notification_tests {
 }
 
 mod milestone;
+mod turn_continuation;
 
 use super::{
     Arc, ClientId, Instant, PathBuf, ProjectionWindow, ProjectionWindowRequest, SessionAttachment,
@@ -623,6 +624,102 @@ impl SessionHandle {
             reply,
         })
         .await?
+    }
+
+    pub async fn commit_durable_interaction(
+        &self,
+        operation: bcode_session_models::DurableInteractionOperation,
+        activity_timestamp_ms: u64,
+        mutations: broadcast::Sender<crate::SessionMutationCommitted>,
+        guard: Arc<dyn crate::DurableInteractionCommitGuard>,
+    ) -> Result<bcode_session_models::DurableInteractionReceipt, SessionError> {
+        self.send(|reply| SessionCommand::CommitDurableInteraction {
+            operation,
+            activity_timestamp_ms,
+            mutations,
+            guard,
+            reply,
+        })
+        .await?
+    }
+
+    pub async fn durable_interaction(
+        &self,
+        key: bcode_session_models::DurableInteractionKey,
+    ) -> Result<Option<bcode_session_models::DurableInteractionRecord>, SessionError> {
+        self.send(|reply| SessionCommand::DurableInteraction { key, reply })
+            .await?
+    }
+
+    pub async fn durable_interaction_source(
+        &self,
+        invocation_id: String,
+        exchange_id: String,
+    ) -> Result<crate::DurableInteractionFacts, SessionError> {
+        self.send(|reply| SessionCommand::DurableInteractionSource {
+            invocation_id,
+            exchange_id,
+            reply,
+        })
+        .await?
+    }
+
+    pub async fn durable_interaction_exchange_facts(
+        &self,
+        invocation_sequence: u64,
+        exchange_id: String,
+    ) -> Result<crate::DurableInteractionFacts, SessionError> {
+        self.send(|reply| SessionCommand::DurableInteractionExchangeFacts {
+            invocation_sequence,
+            exchange_id,
+            reply,
+        })
+        .await?
+    }
+
+    pub async fn durable_interaction_facts(
+        &self,
+        invocation_sequence: u64,
+        exchange_sequence: u64,
+    ) -> Result<crate::DurableInteractionFacts, SessionError> {
+        self.send(|reply| SessionCommand::DurableInteractionFacts {
+            invocation_sequence,
+            exchange_sequence,
+            reply,
+        })
+        .await?
+    }
+
+    pub async fn durable_interaction_operation(
+        &self,
+        key: bcode_session_models::DurableInteractionKey,
+        operation_id: String,
+    ) -> Result<Option<crate::DurableInteractionOperationRecord>, SessionError> {
+        self.send(|reply| SessionCommand::DurableInteractionOperation {
+            key,
+            operation_id,
+            reply,
+        })
+        .await?
+    }
+
+    pub async fn durable_interaction_for_invocation(
+        &self,
+        invocation_id: String,
+    ) -> Result<Option<bcode_session_models::DurableInteractionRecord>, SessionError> {
+        self.send(|reply| SessionCommand::DurableInteractionForInvocation {
+            invocation_id,
+            reply,
+        })
+        .await?
+    }
+
+    pub async fn durable_interaction_page(
+        &self,
+        query: bcode_session_models::DurableInteractionQuery,
+    ) -> Result<bcode_session_models::DurableInteractionPage, SessionError> {
+        self.send(|reply| SessionCommand::DurableInteractionPage { query, reply })
+            .await?
     }
 
     pub async fn append_event_at_generation(
@@ -1324,6 +1421,80 @@ enum SubmissionMutation {
 }
 
 enum SessionCommand {
+    CompleteInteractionContinuation {
+        interaction: Box<bcode_session_models::DurableInteractionOperation>,
+        settlement: bcode_session_models::TurnContinuationSettlement,
+        guard: Arc<dyn crate::DurableInteractionCommitGuard>,
+        timestamp: u64,
+        mutations: broadcast::Sender<crate::SessionMutationCommitted>,
+        reply: oneshot::Sender<
+            Result<bcode_session_models::InteractionContinuationReceipt, SessionError>,
+        >,
+    },
+    CommitTurnContinuation {
+        operation: Box<bcode_session_models::TurnContinuationOperation>,
+        guard: Arc<dyn crate::DurableInteractionCommitGuard>,
+        timestamp: u64,
+        mutations: broadcast::Sender<crate::SessionMutationCommitted>,
+        reply: oneshot::Sender<Result<bcode_session_models::TurnContinuationReceipt, SessionError>>,
+    },
+    ReadTurnContinuation {
+        key: bcode_session_models::TurnContinuationKey,
+        revision: u64,
+        reply: oneshot::Sender<Result<bcode_session_models::TurnContinuationRecord, SessionError>>,
+    },
+    TurnContinuationOperation {
+        key: bcode_session_models::TurnContinuationKey,
+        operation_id: String,
+        reply: oneshot::Sender<
+            Result<Option<bcode_session_models::TurnContinuationOperationRecord>, SessionError>,
+        >,
+    },
+    DurableInteractionSource {
+        invocation_id: String,
+        exchange_id: String,
+        reply: oneshot::Sender<Result<crate::DurableInteractionFacts, SessionError>>,
+    },
+    DurableInteractionExchangeFacts {
+        invocation_sequence: u64,
+        exchange_id: String,
+        reply: oneshot::Sender<Result<crate::DurableInteractionFacts, SessionError>>,
+    },
+    DurableInteractionFacts {
+        invocation_sequence: u64,
+        exchange_sequence: u64,
+        reply: oneshot::Sender<Result<crate::DurableInteractionFacts, SessionError>>,
+    },
+    DurableInteractionOperation {
+        key: bcode_session_models::DurableInteractionKey,
+        operation_id: String,
+        reply:
+            oneshot::Sender<Result<Option<crate::DurableInteractionOperationRecord>, SessionError>>,
+    },
+    CommitDurableInteraction {
+        operation: bcode_session_models::DurableInteractionOperation,
+        guard: Arc<dyn crate::DurableInteractionCommitGuard>,
+        activity_timestamp_ms: u64,
+        mutations: broadcast::Sender<crate::SessionMutationCommitted>,
+        reply:
+            oneshot::Sender<Result<bcode_session_models::DurableInteractionReceipt, SessionError>>,
+    },
+    DurableInteraction {
+        key: bcode_session_models::DurableInteractionKey,
+        reply: oneshot::Sender<
+            Result<Option<bcode_session_models::DurableInteractionRecord>, SessionError>,
+        >,
+    },
+    DurableInteractionForInvocation {
+        invocation_id: String,
+        reply: oneshot::Sender<
+            Result<Option<bcode_session_models::DurableInteractionRecord>, SessionError>,
+        >,
+    },
+    DurableInteractionPage {
+        query: bcode_session_models::DurableInteractionQuery,
+        reply: oneshot::Sender<Result<bcode_session_models::DurableInteractionPage, SessionError>>,
+    },
     SubmissionQueueStatus {
         reply: oneshot::Sender<Result<bcode_session_models::SubmissionQueueStatus, SessionError>>,
     },
@@ -1750,26 +1921,45 @@ impl SessionActor {
         None
     }
 
+    async fn handle_durable_interaction_command(
+        &mut self,
+        command: SessionCommand,
+    ) -> Option<SessionCommand> {
+        match command {
+            SessionCommand::CommitDurableInteraction {
+                operation,
+                guard,
+                activity_timestamp_ms,
+                mutations,
+                reply,
+            } => {
+                let _ = reply.send(
+                    self.commit_durable_interaction(
+                        operation,
+                        activity_timestamp_ms,
+                        &mutations,
+                        guard.clone(),
+                    )
+                    .await,
+                );
+                drop(guard);
+            }
+            command => return Some(command),
+        }
+        None
+    }
+
     async fn handle_command(&mut self, command: SessionCommand) -> bool {
         let Some(command) = self.handle_usage_command(command).await else {
             return false;
         };
+        let Some(command) = self.handle_durable_interaction_command(command).await else {
+            return false;
+        };
+        let Some(command) = Box::pin(self.handle_turn_continuation_command(command)).await else {
+            return false;
+        };
         match command {
-            SessionCommand::ResolvePermissionBatch {
-                permission_ids,
-                approved,
-                activity_timestamp_ms,
-                reply,
-            } => {
-                let _ = reply.send(
-                    self.append_permission_batch_resolved(
-                        permission_ids,
-                        approved,
-                        activity_timestamp_ms,
-                    )
-                    .await,
-                );
-            }
             SessionCommand::AppendEvent {
                 kind,
                 provenance,
@@ -1854,6 +2044,28 @@ impl SessionActor {
             } => {
                 let _ = reply.send(self.set_composer_draft(&text, updated_at_ms).await);
             }
+            command => return Box::pin(self.handle_permission_command(command)).await,
+        }
+        false
+    }
+
+    async fn handle_permission_command(&mut self, command: SessionCommand) -> bool {
+        match command {
+            SessionCommand::ResolvePermissionBatch {
+                permission_ids,
+                approved,
+                activity_timestamp_ms,
+                reply,
+            } => {
+                let _ = reply.send(
+                    self.append_permission_batch_resolved(
+                        permission_ids,
+                        approved,
+                        activity_timestamp_ms,
+                    )
+                    .await,
+                );
+            }
             command => return Box::pin(self.handle_read_command(command)).await,
         }
         false
@@ -1885,7 +2097,115 @@ impl SessionActor {
         command: SessionCommand,
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = bool> + Send + '_>> {
         match command {
-            SessionCommand::RenormalizeUsage { .. }
+            SessionCommand::DurableInteractionSource {
+                invocation_id,
+                exchange_id,
+                reply,
+            } => Box::pin(async move {
+                let result = match self.existing_session_db().await {
+                    Ok(Some(db)) => db
+                        .durable_interaction_source(&invocation_id, &exchange_id)
+                        .await
+                        .map_err(SessionError::from),
+                    Ok(None) => Err(SessionError::DbUnavailable(self.state.summary.id)),
+                    Err(error) => Err(error),
+                };
+                let _ = reply.send(result);
+                false
+            }),
+            SessionCommand::DurableInteractionExchangeFacts {
+                invocation_sequence,
+                exchange_id,
+                reply,
+            } => Box::pin(async move {
+                let result = match self.existing_session_db().await {
+                    Ok(Some(db)) => db
+                        .durable_interaction_exchange_facts(invocation_sequence, &exchange_id)
+                        .await
+                        .map_err(SessionError::from),
+                    Ok(None) => Err(SessionError::DbUnavailable(self.state.summary.id)),
+                    Err(error) => Err(error),
+                };
+                let _ = reply.send(result);
+                false
+            }),
+            SessionCommand::DurableInteractionFacts {
+                invocation_sequence,
+                exchange_sequence,
+                reply,
+            } => Box::pin(async move {
+                let result = match self.existing_session_db().await {
+                    Ok(Some(db)) => db
+                        .durable_interaction_facts(invocation_sequence, exchange_sequence)
+                        .await
+                        .map_err(SessionError::from),
+                    Ok(None) => Err(SessionError::DbUnavailable(self.state.summary.id)),
+                    Err(error) => Err(error),
+                };
+                let _ = reply.send(result);
+                false
+            }),
+            SessionCommand::DurableInteractionOperation {
+                key,
+                operation_id,
+                reply,
+            } => Box::pin(async move {
+                let result = match self.existing_session_db().await {
+                    Ok(Some(db)) => db
+                        .durable_interaction_operation(&key, &operation_id)
+                        .await
+                        .map_err(SessionError::from),
+                    Ok(None) => Err(SessionError::DbUnavailable(self.state.summary.id)),
+                    Err(error) => Err(error),
+                };
+                let _ = reply.send(result);
+                false
+            }),
+            SessionCommand::DurableInteraction { key, reply } => Box::pin(async move {
+                let result = match self.existing_session_db().await {
+                    Ok(Some(db)) => db
+                        .durable_interaction(&key)
+                        .await
+                        .map_err(SessionError::from),
+                    Ok(None) => Err(SessionError::DbUnavailable(self.state.summary.id)),
+                    Err(error) => Err(error),
+                };
+                let _ = reply.send(result);
+                false
+            }),
+            SessionCommand::DurableInteractionForInvocation {
+                invocation_id,
+                reply,
+            } => Box::pin(async move {
+                let result = match self.existing_session_db().await {
+                    Ok(Some(db)) => db
+                        .durable_interaction_for_invocation(&invocation_id)
+                        .await
+                        .map_err(SessionError::from),
+                    Ok(None) => Err(SessionError::DbUnavailable(self.state.summary.id)),
+                    Err(error) => Err(error),
+                };
+                let _ = reply.send(result);
+                false
+            }),
+            SessionCommand::DurableInteractionPage { query, reply } => Box::pin(async move {
+                let result = match self.existing_session_db().await {
+                    Ok(Some(db)) => db
+                        .durable_interaction_page(&query)
+                        .await
+                        .map_err(SessionError::from),
+                    Ok(None) => Err(SessionError::DbUnavailable(self.state.summary.id)),
+                    Err(error) => Err(error),
+                };
+                let _ = reply.send(result);
+                false
+            }),
+            SessionCommand::CompleteInteractionContinuation { .. }
+            | SessionCommand::CommitTurnContinuation { .. }
+            | SessionCommand::ReadTurnContinuation { .. }
+            | SessionCommand::TurnContinuationOperation { .. }
+            | SessionCommand::RenormalizeUsage { .. }
+            | SessionCommand::CommitDurableInteraction { .. }
             | SessionCommand::RepriceUsage { .. }
             | SessionCommand::AppendUsage { .. }
             | SessionCommand::ResolvePermissionBatch { .. }
@@ -3058,6 +3378,91 @@ impl SessionActor {
         let state = SessionState::from_db_state(db_state, created_at_ms, updated_at_ms);
         self.replace_persisted_state(state);
         Ok(())
+    }
+
+    async fn commit_durable_interaction(
+        &mut self,
+        operation: bcode_session_models::DurableInteractionOperation,
+        activity_timestamp_ms: u64,
+        mutations: &broadcast::Sender<crate::SessionMutationCommitted>,
+        guard: Arc<dyn crate::DurableInteractionCommitGuard>,
+    ) -> Result<bcode_session_models::DurableInteractionReceipt, SessionError> {
+        guard.validate()?;
+        crate::durable_interaction::ensure_publication_enabled()?;
+        operation
+            .validate()
+            .map_err(|field| SessionError::EventSerialization(field.into()))?;
+        self.ensure_ownership()?;
+        let store = self
+            .store
+            .clone()
+            .ok_or(SessionError::DbUnavailable(self.state.summary.id))?;
+        let _write_guard =
+            crate::lease::acquire_session_write_lock(&store.root_path(), self.state.summary.id)?;
+        self.ensure_session_db_for_write().await?;
+        self.refresh_state_from_db_for_write().await?;
+        let db = self
+            .db
+            .as_ref()
+            .ok_or(SessionError::DbUnavailable(self.state.summary.id))?;
+        if let Some(receipt) = db.durable_interaction_retry(&operation).await? {
+            guard.validate()?;
+            return Ok(receipt);
+        }
+        let previous = db.durable_interaction(&operation.key).await?;
+        let record =
+            crate::durable_interaction::advance(previous, &operation, self.state.next_sequence)?;
+        let mut events = vec![(
+            self.state.build_next_event(
+                SessionEventKind::DurableInteractionCommitted {
+                    operation: operation.clone(),
+                },
+                activity_timestamp_ms,
+            ),
+            Some(activity_timestamp_ms),
+        )];
+        if let bcode_session_models::DurableInteractionTransition::Complete {
+            result,
+            exchange_resolution,
+            ..
+        } = operation.transition
+        {
+            let mut resolution = self.state.build_next_event(
+                SessionEventKind::ToolExchangeResolved {
+                    event: exchange_resolution,
+                },
+                activity_timestamp_ms,
+            );
+            resolution.sequence = self.state.next_sequence.checked_add(1).ok_or_else(|| {
+                SessionError::EventSerialization("interaction sequence overflow".into())
+            })?;
+            events.push((resolution, Some(activity_timestamp_ms)));
+            let mut event = self.state.build_next_event(
+                SessionEventKind::ToolInvocationResultRecorded { record: *result },
+                activity_timestamp_ms,
+            );
+            event.sequence = self.state.next_sequence.checked_add(2).ok_or_else(|| {
+                SessionError::EventSerialization("interaction sequence overflow".into())
+            })?;
+            events.push((event, Some(activity_timestamp_ms)));
+        }
+        db.append_durable_interaction_batch(&events, guard.as_ref())
+            .await?;
+        for (event, _) in &events {
+            self.state
+                .apply_persisted_event(event.clone(), activity_timestamp_ms);
+        }
+        self.update_manifest_and_schedule_catalog().await;
+        self.state.load_status = SessionLoadStatusKind::Current;
+        self.refresh_snapshot();
+        for (event, _) in events {
+            let _ = mutations.send(crate::SessionMutationCommitted {
+                session_id: event.session_id,
+                event,
+                summary: self.state.summary(),
+            });
+        }
+        Ok(record.receipt)
     }
 
     async fn append_tool_invocation_result(

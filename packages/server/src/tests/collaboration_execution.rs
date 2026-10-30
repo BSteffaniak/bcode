@@ -84,6 +84,7 @@ async fn published_workers_preserve_user_work(isolated: bool, dependent: bool) {
     if dependent {
         call.arguments["dependencies"] = serde_json::json!({"right":"left"});
     }
+    let mut state = Arc::new(state);
     let staged = invoke_task_with_permission(&state, session, &call, true)
         .await
         .unwrap();
@@ -100,8 +101,10 @@ async fn published_workers_preserve_user_work(isolated: bool, dependent: bool) {
         .await
         .unwrap();
     assert!(!published.is_error, "{}", published.output);
-    state.workflow_driver_sender.take();
-    let state = Arc::new(state);
+    Arc::get_mut(&mut state)
+        .expect("exclusive fixture state after publication")
+        .workflow_driver_sender
+        .take();
     state.start_workflow_driver().await;
     wait_for_contributions(&state).await;
     if isolated {

@@ -6,7 +6,8 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex, TryLockError};
 use std::time::{Duration, Instant};
 pub(super) type ResourceIdentity = (u64, u64, u64, i64, i64);
-type CapturedInventory = (BTreeSet<String>, PolicyDigests);
+type CapturedInventory = (BTreeSet<String>, PolicyDigests, Option<String>);
+type LoadedInventory = (Arc<BTreeSet<String>>, Option<String>);
 pub(super) type PolicyDigests = BTreeMap<String, Option<[u8; 32]>>;
 pub(super) struct Progress {
     pub pending: Vec<(PathBuf, usize, Vec<super::ignore_policy::Rule>)>,
@@ -14,6 +15,8 @@ pub(super) struct Progress {
     pub resources: PolicyDigests,
     pub directories: BTreeMap<PathBuf, ResourceIdentity>,
     pub bytes: usize,
+    // One producer-generated reason, never accumulated per skipped path.
+    pub incomplete: Option<String>,
 }
 impl Progress {
     pub fn new(directory: &str) -> Self {
@@ -23,6 +26,7 @@ impl Progress {
             resources: BTreeMap::new(),
             directories: BTreeMap::new(),
             bytes: 0,
+            incomplete: None,
         }
     }
 }
@@ -49,6 +53,7 @@ struct Snapshot {
     paths: Arc<BTreeSet<String>>,
     tracked: Option<Arc<BTreeSet<String>>>,
     resources: BTreeMap<String, Option<ResourceIdentity>>,
+    incomplete: Option<String>,
 }
 static CACHE: Mutex<Option<Snapshot>> = Mutex::new(None);
 
@@ -60,7 +65,7 @@ pub(super) fn load(
     cancelled: &dyn Fn() -> bool,
     authorize: &dyn Fn(&str) -> Option<WorkspaceResourceGrant>,
     build: &mut dyn FnMut(&mut Progress) -> Result<(), String>,
-) -> Result<Arc<BTreeSet<String>>, String> {
+) -> Result<LoadedInventory, String> {
     let started = Instant::now();
     let tick = || {
         if cancelled() {
@@ -106,10 +111,10 @@ pub(super) fn load(
             }
         }
         if unchanged {
-            return Ok(Arc::clone(&snapshot.paths));
+            return Ok((Arc::clone(&snapshot.paths), snapshot.incomplete.clone()));
         }
     }
-    let (paths, resources) =
+    let (paths, resources, incomplete) =
         resume_capture(request, tracked, &key, grant, authorize, build, &tick)?;
     tick()?;
     let stamps = publication_stamps(resources, grant, authorize, &tick)?;
@@ -120,9 +125,10 @@ pub(super) fn load(
         tracked: tracked.cloned(),
         paths: Arc::clone(&paths),
         resources: stamps,
+        incomplete: incomplete.clone(),
     });
     drop(cache);
-    Ok(paths)
+    Ok((paths, incomplete))
 }
 fn resource_stamp(
     grant: &SearchPathsGrant,
@@ -251,8 +257,7 @@ fn resume_capture(
     }
     let completed = pending.take().expect("pending initialized").progress;
     drop(pending);
-    let (paths, resources) = (completed.paths, completed.resources);
-    Ok((paths, resources))
+    Ok((completed.paths, completed.resources, completed.incomplete))
 }
 
 fn publication_stamps(

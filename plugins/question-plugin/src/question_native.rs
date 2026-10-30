@@ -6,10 +6,9 @@ use bcode_plugin_sdk::{
     ServiceBridgeResponse, ServiceRequest, ServiceResponse, prepare_tool_service_response,
 };
 use bcode_tool::{
-    ListToolsRequest, OP_INVOKE_TOOL, OP_LIST_TOOLS, TOOL_SERVICE_INTERFACE_ID, ToolArtifact,
+    ListToolsRequest, OP_INVOKE_TOOL, OP_LIST_TOOLS, TOOL_SERVICE_INTERFACE_ID,
     ToolCompatibilityAlias, ToolDefinition, ToolExchangeRequest, ToolExchangeResolution,
-    ToolExchangeResponsePolicy, ToolInvocationRequest, ToolInvocationResponse,
-    ToolInvocationResult, ToolList,
+    ToolExchangeResponsePolicy, ToolInvocationRequest, ToolInvocationResponse, ToolList,
 };
 use serde::Serialize;
 use serde_json::{Value, json};
@@ -22,8 +21,8 @@ use super::question_controller;
 use super::question_interaction;
 use super::{
     NormalizedQuestionRequest, QUESTION_EXCHANGE_SCHEMA, QuestionResolutionPayload,
-    QuestionToolOutcome, TOOL_NAME, answered_outcome, dismissed_outcome,
-    format_question_outcome_output, parse_question_request, unanswered_outcome,
+    QuestionToolOutcome, TOOL_NAME, answered_outcome, dismissed_outcome, parse_question_request,
+    unanswered_outcome,
 };
 #[cfg(feature = "static-bundled")]
 use super::{question_outcome_tui, question_tui};
@@ -44,6 +43,7 @@ fn invoke_question_service(context: &NativeServiceContext) -> ServiceResponse {
     match context.request.interface_id.as_str() {
         TOOL_SERVICE_INTERFACE_ID => invoke_tool_service(context),
         "bcode.interaction-controller/v1" => question_controller::invoke(context),
+        "bcode.interaction-durable/v1" => question_controller::invoke_durable(context),
         _ => ServiceResponse::error(
             "unsupported_interface",
             "unsupported question plugin service interface",
@@ -233,30 +233,11 @@ fn question_response(
     interaction_id: &str,
     outcome: &QuestionToolOutcome,
 ) -> ToolInvocationResponse {
-    let output = format_question_outcome_output(outcome);
-    let value = serde_json::to_string(&outcome)
-        .unwrap_or_else(|error| json!({"status":"error","error":error.to_string()}).to_string());
-    ToolInvocationResponse {
-        output,
-        is_error: false,
-        content: Vec::new(),
-        full_output: Some(value.clone()),
-        result: Some(ToolInvocationResult::Artifact {
-            artifact: Box::new(ToolArtifact {
-                artifact_id: format!("question-outcome-{interaction_id}"),
-                producer_plugin_id: "bcode.question".to_string(),
-                schema: "bcode.question.outcome".to_string(),
-                schema_version: 1,
-                tool_call_id: Some(interaction_id.to_string()),
-                title: Some("Question outcome".to_string()),
-                metadata: serde_json::from_str(&value).unwrap_or_else(|_| json!({})),
-                refs: Vec::new(),
-            }),
-        }),
-    }
+    question_controller::durable_question_response(interaction_id, outcome)
+        .unwrap_or_else(|()| tool_error("question outcome could not be encoded".into()))
 }
 
-pub(crate) fn json_response<T: Serialize>(value: &T) -> ServiceResponse {
+pub fn json_response<T: Serialize>(value: &T) -> ServiceResponse {
     match ServiceResponse::json(value) {
         Ok(response) => response,
         Err(error) => ServiceResponse::error("encode_failed", error.to_string()),
@@ -331,8 +312,23 @@ mod tests {
     use crate::{
         MAX_OPTIONS_PER_QUESTION, MAX_QUESTION_TEXT_BYTES, MAX_QUESTIONS, Question,
         QuestionAnswerPayload, QuestionControl, QuestionCustomMode, QuestionOption,
-        QuestionRequestStatus, QuestionSelectionMode, QuestionStatus,
+        QuestionRequestStatus, QuestionSelectionMode, QuestionStatus, SelectedAnswer,
+        format_question_outcome_output,
     };
+
+    #[test]
+    fn durable_completion_uses_the_live_question_result_formatter() {
+        let request = outcome_request();
+        let outcome = dismissed_outcome(&request);
+        let live = question_response("original-invocation", &outcome);
+        let recovered =
+            question_controller::durable_question_response("original-invocation", &outcome)
+                .unwrap();
+        assert_eq!(
+            serde_json::to_value(live).unwrap(),
+            serde_json::to_value(recovered).unwrap()
+        );
+    }
 
     fn outcome_request() -> NormalizedQuestionRequest {
         NormalizedQuestionRequest {

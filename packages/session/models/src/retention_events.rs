@@ -1327,11 +1327,170 @@ fn durable_context(
     Ok(())
 }
 
+fn turn_continuation(
+    i: &mut Inspector,
+    operation: &crate::TurnContinuationOperation,
+) -> Result<(), ObservationRetentionExceeded> {
+    i.nodes(8, 3)?;
+    for text in [
+        &operation.key.turn_id,
+        &operation.key.continuation_id,
+        &operation.operation_id,
+        &operation.request_digest,
+    ] {
+        i.text(text, 4)?;
+    }
+    match &operation.transition {
+        crate::TurnContinuationTransition::Prepare { capture } => {
+            i.nodes(15, 5)?;
+            for text in [
+                &capture.key.turn_id,
+                &capture.key.continuation_id,
+                &capture.submission_id,
+                &capture.model_work_id,
+                &capture.batch_id,
+                &capture.descriptor_digest,
+                &capture.selected_invocation_id,
+                &capture.selected_exchange_id,
+                &capture.host_state.schema,
+                &capture.host_state.json,
+            ] {
+                i.text(text, 6)?;
+            }
+            for source in [
+                &capture.accepted,
+                &capture.activated,
+                &capture.descriptor_source,
+            ] {
+                continuation_ref(i, source, 6)?;
+            }
+            i.collection(capture.members.capacity(), 6)?;
+            for member in &capture.members {
+                i.nodes(2, 7)?;
+                i.text(&member.invocation_id, 8)?;
+                continuation_ref(i, &member.request, 8)?;
+            }
+        }
+        crate::TurnContinuationTransition::StartMember {
+            invocation_id,
+            dispatch_id,
+        } => {
+            i.text(invocation_id, 5)?;
+            i.text(dispatch_id, 5)?;
+        }
+        crate::TurnContinuationTransition::SettleMember {
+            invocation_id,
+            dispatch_id,
+            result,
+        } => {
+            i.text(invocation_id, 5)?;
+            i.text(dispatch_id, 5)?;
+            terminal_result_record_at(i, result, 5)?;
+        }
+        crate::TurnContinuationTransition::SettleWithoutDispatch {
+            invocation_id,
+            result,
+        } => {
+            i.text(invocation_id, 5)?;
+            terminal_result_record_at(i, result, 5)?;
+        }
+        crate::TurnContinuationTransition::AttachSelectedResult {
+            invocation_id,
+            result_ref,
+        } => {
+            i.text(invocation_id, 5)?;
+            continuation_ref(i, result_ref, 5)?;
+        }
+        crate::TurnContinuationTransition::ReadyForModel => {
+            i.nodes(1, 4)?;
+        }
+        crate::TurnContinuationTransition::StartModel { dispatch_id } => {
+            i.text(dispatch_id, 5)?;
+        }
+        crate::TurnContinuationTransition::Retire { successor_ref } => {
+            continuation_ref(i, successor_ref, 5)?;
+        }
+    }
+    Ok(())
+}
+fn continuation_ref(
+    i: &mut Inspector,
+    source: &crate::TurnContinuationSourceRef,
+    depth: usize,
+) -> Result<(), ObservationRetentionExceeded> {
+    i.nodes(3, depth)?;
+    i.text(&source.kind, depth + 1)?;
+    i.text(&source.digest, depth + 1)?;
+    Ok(())
+}
+
+fn durable_interaction(
+    i: &mut Inspector,
+    operation: &crate::DurableInteractionOperation,
+) -> Result<(), ObservationRetentionExceeded> {
+    i.nodes(10, 3)?;
+    i.nodes(3, 4)?;
+    for text in [
+        &operation.key.turn_id,
+        &operation.key.invocation_id,
+        &operation.key.interaction_id,
+    ] {
+        i.text(text, 5)?;
+    }
+    for text in [
+        &operation.operation_id,
+        &operation.request_digest,
+        &operation.producer_plugin_id,
+    ] {
+        i.text(text, 4)?;
+    }
+    i.nodes(1, 4)?;
+    match &operation.transition {
+        crate::DurableInteractionTransition::Checkpoint { payload }
+        | crate::DurableInteractionTransition::Complete {
+            outcome: payload, ..
+        } => {
+            i.nodes(3, 5)?;
+            i.text(&payload.contract_id, 6)?;
+            // Deliberately opaque encoded domain JSON: charge its owned capacity, do not parse it.
+            i.text(&payload.json, 6)?;
+        }
+        crate::DurableInteractionTransition::PublishContinuation { publication_id } => {
+            i.text(publication_id, 5)?;
+        }
+    }
+    if let crate::DurableInteractionTransition::Complete {
+        result,
+        exchange_resolution,
+        ..
+    } = &operation.transition
+    {
+        terminal_result_record_at(i, result, 5)?;
+        i.nodes(3, 5)?;
+        i.text(&exchange_resolution.invocation_id, 6)?;
+        i.text(&exchange_resolution.exchange_id, 6)?;
+        i.nested(
+            inspect_tool_exchange_resolution(
+                &exchange_resolution.resolution,
+                &i.nested_limits(6)?,
+            )?,
+            6,
+        )?;
+    }
+    Ok(())
+}
+
 fn durable_child_and_results(
     i: &mut Inspector,
     kind: &SessionEventKind,
 ) -> Result<(), ObservationRetentionExceeded> {
     match kind {
+        SessionEventKind::TurnContinuationCommitted { operation } => {
+            turn_continuation(i, operation)?;
+        }
+        SessionEventKind::DurableInteractionCommitted { operation } => {
+            durable_interaction(i, operation)?;
+        }
         SessionEventKind::ChildSessionCreated { request, spawning } => {
             child_creation(i, request, 3)?;
             i.nodes(1, 3)?;
@@ -1363,44 +1522,60 @@ fn durable_child_and_results(
             i.text(&completion.evaluation_id, 4)?;
         }
         SessionEventKind::ToolInvocationResultRecorded { record } => {
-            i.nodes(4, 3)?;
-            i.text(&record.invocation_id, 4)?;
-            i.text(&record.model_output, 4)?;
-            i.collection(record.content.capacity(), 4)?;
-            for content in &record.content {
-                i.nodes(1, 5)?;
-                match content {
-                    crate::ToolResultContent::Text { text } => i.text(text, 6)?,
-                    crate::ToolResultContent::Image { image } => {
-                        i.nodes(2, 6)?;
-                        i.text(&image.mime_type, 7)?;
-                        i.text(&image.data_base64, 7)?;
-                        i.nodes(4, 7)?;
-                        i.optional_text(image.metadata.source_path.as_ref(), 8)?;
-                    }
-                    crate::ToolResultContent::ImageRef { image } => {
-                        i.nodes(2, 6)?;
-                        i.text(&image.path, 7)?;
-                        i.text(&image.mime_type, 7)?;
-                        i.optional_text(image.artifact_id.as_ref(), 7)?;
-                        i.optional_text(image.reference_key.as_ref(), 7)?;
-                        i.nodes(4, 7)?;
-                        i.optional_text(image.metadata.source_path.as_ref(), 8)?;
-                    }
-                }
-            }
-            if let Some(presentation) = &record.presentation {
-                i.nested(
-                    inspect_tool_presentation(presentation, &i.nested_limits(5)?)?,
-                    5,
-                )?;
-            }
-            if let Some(result) = &record.result {
-                tool_result(i, result, 5)?;
-            }
+            terminal_result_record(i, record)?;
         }
         SessionEventKind::TraceEvent { trace: value } => trace(i, value, 3)?,
         _ => return Err(ObservationRetentionExceeded),
+    }
+    Ok(())
+}
+
+fn terminal_result_record(
+    i: &mut Inspector,
+    record: &crate::ToolInvocationResultRecord,
+) -> Result<(), ObservationRetentionExceeded> {
+    terminal_result_record_at(i, record, 3)
+}
+
+fn terminal_result_record_at(
+    i: &mut Inspector,
+    record: &crate::ToolInvocationResultRecord,
+    depth: usize,
+) -> Result<(), ObservationRetentionExceeded> {
+    i.nodes(4, depth)?;
+    i.text(&record.invocation_id, depth + 1)?;
+    i.text(&record.model_output, depth + 1)?;
+    i.collection(record.content.capacity(), depth + 1)?;
+    for content in &record.content {
+        i.nodes(1, depth + 2)?;
+        match content {
+            crate::ToolResultContent::Text { text } => i.text(text, depth + 3)?,
+            crate::ToolResultContent::Image { image } => {
+                i.nodes(2, depth + 3)?;
+                i.text(&image.mime_type, depth + 4)?;
+                i.text(&image.data_base64, depth + 4)?;
+                i.nodes(4, depth + 4)?;
+                i.optional_text(image.metadata.source_path.as_ref(), depth + 5)?;
+            }
+            crate::ToolResultContent::ImageRef { image } => {
+                i.nodes(2, depth + 3)?;
+                i.text(&image.path, depth + 4)?;
+                i.text(&image.mime_type, depth + 4)?;
+                i.optional_text(image.artifact_id.as_ref(), depth + 4)?;
+                i.optional_text(image.reference_key.as_ref(), depth + 4)?;
+                i.nodes(4, depth + 4)?;
+                i.optional_text(image.metadata.source_path.as_ref(), depth + 5)?;
+            }
+        }
+    }
+    if let Some(presentation) = &record.presentation {
+        i.nested(
+            inspect_tool_presentation(presentation, &i.nested_limits(depth + 2)?)?,
+            depth + 2,
+        )?;
+    }
+    if let Some(result) = &record.result {
+        tool_result(i, result, depth + 2)?;
     }
     Ok(())
 }

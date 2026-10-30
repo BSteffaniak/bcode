@@ -58,7 +58,9 @@ pub fn bounded_command_policy(
             #[cfg(unix)]
             {
                 let group = format!("-{}", child.id());
-                let status = Command::new("/bin/kill")
+                // Resolve the utility in the evaluator's environment, not the child's
+                // configured environment or working directory (Nix has no /bin/kill).
+                let status = Command::new("kill")
                     .args(["-KILL", "--", &group])
                     .status()?;
                 if !status.success() && child.try_wait()?.is_none() {

@@ -12,6 +12,8 @@ pub mod question_interaction;
 mod question_native;
 #[cfg(feature = "presentation")]
 mod question_outcome;
+#[cfg(feature = "presentation")]
+pub use question_outcome::portable_visual_registrations;
 #[cfg(feature = "static-bundled")]
 mod question_outcome_tui;
 #[cfg(feature = "presentation")]

@@ -2149,12 +2149,14 @@ dependencies = [
 name = "bcode_filesystem_plugin"
 version = "0.0.1-alpha.0"
 dependencies = [
+ "bcode_plugin_models",
  "bcode_plugin_sdk",
  "bcode_session_models",
  "bcode_syntax_render",
  "bcode_tool",
  "bcode_tui_components",
  "bmux_tui",
+ "bmux_tui_components",
  "devicons",
  "gix-config",
  "hex",
@@ -2215,16 +2217,21 @@ dependencies = [
  "bcode_client",
  "bcode_config",
  "bcode_fake_provider_plugin",
+ "bcode_filesystem_plugin",
  "bcode_hyperchad_ui",
  "bcode_ipc",
  "bcode_model_catalog",
  "bcode_plugin",
  "bcode_plugin_sdk",
+ "bcode_question_plugin",
  "bcode_server",
  "bcode_session_models",
  "bcode_session_view",
  "bcode_session_view_models",
+ "bcode_shell_plugin",
  "bcode_tool",
+ "bcode_tui",
+ "bcode_tui_web",
  "hyperchad",
  "serde",
  "serde_json",
@@ -3131,6 +3138,7 @@ version = "0.0.1-alpha.0"
 dependencies = [
  "bcode_agent_profile",
  "bcode_config",
+ "bcode_plugin_models",
  "bcode_plugin_sdk",
  "bcode_session",
  "bcode_session_models",
@@ -3143,6 +3151,7 @@ dependencies = [
  "bmux_keyboard",
  "bmux_terminal_grid",
  "bmux_tui",
+ "bmux_tui_components",
  "hex",
  "libc",
  "portable-pty",
@@ -3382,9 +3391,11 @@ dependencies = [
 name = "bcode_tui_web"
 version = "0.0.1-alpha.0"
 dependencies = [
+ "bcode_filesystem_plugin",
  "bcode_markdown_render",
  "bcode_question_plugin",
  "bcode_session_view_models",
+ "bcode_shell_plugin",
  "bcode_tui_components",
  "bmux_keyboard",
  "bmux_text_edit",
@@ -3466,7 +3477,6 @@ dependencies = [
 name = "bcode_vox"
 version = "0.0.1-alpha.0"
 dependencies = [
- "arboard",
  "audioadapter-buffers",
  "clap",
  "cpal",
@@ -3500,7 +3510,6 @@ dependencies = [
  "bcode_vox",
  "serde",
  "serde_json",
- "tempfile",
 ]
 
 [[package]]

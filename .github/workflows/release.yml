@@ -41,14 +41,25 @@ jobs:
       - uses: DeterminateSystems/nix-installer-action@v21
       - name: Build matched protocol-2 browser distribution
         run: bash scripts/build-tui-web.sh "$RUNNER_TEMP/bcode-browser-bundle"
+      - name: Archive fresh assets and extract the acceptance input
+        run: |
+          tar -C "$RUNNER_TEMP" -czf "$RUNNER_TEMP/browser-bundle.tar.gz" bcode-browser-bundle
+          cd "$RUNNER_TEMP"
+          sha256sum browser-bundle.tar.gz > browser-bundle.tar.gz.sha256
+          sha256sum --check browser-bundle.tar.gz.sha256
+          mkdir accepted-browser
+          tar --no-same-owner -xzf browser-bundle.tar.gz -C accepted-browser
+          diff -r bcode-browser-bundle accepted-browser/bcode-browser-bundle
       - name: Validate immutable inventory and compatibility
-        run: python3 scripts/test-tui-web-e2e.py --self-test --bundle "$RUNNER_TEMP/bcode-browser-bundle"
+        run: python3 scripts/test-tui-web-e2e.py --self-test --bundle "$RUNNER_TEMP/accepted-browser/bcode-browser-bundle"
+      - name: Validate extracted distribution staging, tamper and mixed protocols
+        run: BCODE_E2E_BUNDLE="$RUNNER_TEMP/accepted-browser/bcode-browser-bundle" nix develop --command cargo test --locked -p xtask browser_distribution_rejects_tamper_and_accepts_exact_rollback -- --ignored --exact tests::browser_distribution_rejects_tamper_and_accepts_exact_rollback
       - uses: browser-actions/setup-chrome@v2
         id: chrome
       - name: Production Actix acceptance of the release bundle
         env:
           BCODE_E2E_CHROMIUM: ${{ steps.chrome.outputs.chrome-path }}
-          BCODE_E2E_BUNDLE: ${{ runner.temp }}/bcode-browser-bundle
+          BCODE_E2E_BUNDLE: ${{ runner.temp }}/accepted-browser/bcode-browser-bundle
         run: |
           nix develop --command bash -euc '
             export BCODE_E2E_PYTHON="$(command -v python3)"
@@ -60,7 +71,9 @@ jobs:
         with:
           name: browser-bundle-${{ inputs.commit_sha }}
           if-no-files-found: error
-          path: ${{ runner.temp }}/bcode-browser-bundle/
+          path: |
+            ${{ runner.temp }}/browser-bundle.tar.gz
+            ${{ runner.temp }}/browser-bundle.tar.gz.sha256
 
   build:
     needs: browser-bundle
@@ -272,7 +285,13 @@ jobs:
       - uses: actions/download-artifact@v4
         with:
           name: browser-bundle-${{ inputs.commit_sha }}
-          path: bcode-browser-bundle
+          path: browser-bundle-download
+      - name: Extract the accepted browser assets
+        shell: bash
+        run: |
+          cd browser-bundle-download
+          sha256sum --check browser-bundle.tar.gz.sha256
+          tar --no-same-owner -xzf browser-bundle.tar.gz -C "$GITHUB_WORKSPACE"
 
       - name: Build release artifact
         env:

@@ -24,6 +24,7 @@ pub(crate) mod context_compaction;
 mod context_compaction_request_budget;
 mod context_lineage;
 mod context_recovery;
+mod durable_interaction;
 mod image_input;
 mod import_search_application;
 mod interaction_application;
@@ -540,6 +541,8 @@ pub struct ServerState {
     recovered_permissions: Mutex<BTreeMap<String, bcode_session::InvocationRecoveryCheckpoint>>,
     pending_permission_batches: Arc<StdMutex<BTreeMap<String, Arc<PendingPermissionBatch>>>>,
     pending_tool_exchanges: Mutex<BTreeMap<String, PendingToolExchange>>,
+    recovered_interaction_owners:
+        Mutex<BTreeMap<(SessionId, String), Arc<durable_interaction::RecoveredTurnBinding>>>,
     interaction_controllers: Mutex<bcode_plugin::interaction_controller::InteractionControllerHost>,
     active_plugin_invocations: Arc<StdMutex<BTreeMap<(SessionId, String), ActivePluginInvocation>>>,
     invocation_input_controllers: StdMutex<BTreeMap<(SessionId, String), ClientId>>,
@@ -2695,6 +2698,7 @@ impl ServerState {
             recovered_permissions: Mutex::default(),
             pending_permission_batches: Arc::new(StdMutex::default()),
             pending_tool_exchanges: Mutex::default(),
+            recovered_interaction_owners: Mutex::default(),
             interaction_controllers: Mutex::default(),
             active_plugin_invocations: Arc::default(),
             invocation_input_controllers: StdMutex::default(),
@@ -2748,7 +2752,7 @@ impl ServerState {
         self.clients.lock().await.insert(client_id);
     }
 
-    async fn unregister_client(&self, client_id: ClientId) {
+    async fn unregister_client(self: &Arc<Self>, client_id: ClientId) {
         self.clients.lock().await.remove(&client_id);
         for check in self
             .model_checks
@@ -2923,7 +2927,7 @@ impl ServerState {
         }
     }
 
-    async fn close_client(&self, client_id: ClientId) -> Result<(), ServerError> {
+    async fn close_client(self: &Arc<Self>, client_id: ClientId) -> Result<(), ServerError> {
         self.session_observations.remove_client(client_id);
         self.interaction_controllers
             .lock()
@@ -2942,7 +2946,7 @@ impl ServerState {
     }
 
     async fn set_client_runtime_context(
-        &self,
+        self: &Arc<Self>,
         client_id: ClientId,
         context: Option<ClientRuntimeContext>,
     ) {
@@ -3161,6 +3165,9 @@ impl ServerState {
             return Some(format!(
                 "daemon has {connected_clients} connected clients; refusing idle-only stop"
             ));
+        }
+        if !self.recovered_interaction_owners.lock().await.is_empty() {
+            return Some("daemon has recovered interactive work; refusing idle-only stop".into());
         }
         let active_model_turns = self.active_runtime_turn_count().await;
         if active_model_turns > 0 {
@@ -5965,6 +5972,53 @@ async fn enqueue_recovered_model_turn(
     provider_retry_recovery::preserve_abandoned(state, session_id, work).await
 }
 
+async fn preserve_committed_durable_wait(
+    state: &Arc<ServerState>,
+    session_id: SessionId,
+    invocation_id: &str,
+) -> Result<bool, ServerError> {
+    if !durable_interaction::PUBLICATION_ENABLED {
+        return Ok(false);
+    }
+    let unavailable = |error| {
+        ServerError::WorkflowApplicationOperationUnauthorized(format!(
+            "durable interaction recovery unavailable: {error:?}"
+        ))
+    };
+    let Some(proof) =
+        durable_interaction::committed_wait_for_invocation(state, session_id, invocation_id)
+            .await
+            .map_err(unavailable)?
+    else {
+        return Ok(false);
+    };
+    let restored = durable_interaction::restore_wait(state, &proof)
+        .await
+        .map_err(unavailable)?;
+    let identity = (session_id, proof.key().invocation_id.clone());
+    if restored.view().snapshot.revision != proof.revision()
+        || restored.request().invocation_id != identity.1
+    {
+        return Err(ServerError::WorkflowApplicationOperationUnauthorized(
+            "durable interaction restored identity mismatch".into(),
+        ));
+    }
+    let mut owners = state.recovered_interaction_owners.lock().await;
+    if let std::collections::btree_map::Entry::Vacant(entry) = owners.entry(identity) {
+        let store = durable_interaction::claim_recovered_wait(state, &proof)
+            .await
+            .map_err(unavailable)?;
+        let owner = store.recovered_binding().ok_or_else(|| {
+            ServerError::WorkflowApplicationOperationUnauthorized(
+                "durable interaction ownership missing".into(),
+            )
+        })?;
+        entry.insert(owner);
+    }
+    drop(owners);
+    Ok(true)
+}
+
 async fn recover_abandoned_tool_runs(
     state: &Arc<ServerState>,
     session_id: SessionId,
@@ -5974,6 +6028,10 @@ async fn recover_abandoned_tool_runs(
     let mut continuation_required = false;
     for tool in active_tool_runs {
         if active_runtime_ids.contains(&WorkId::new(format!("tool_{}", tool.tool_call_id))) {
+            continue;
+        }
+        if preserve_committed_durable_wait(state, session_id, &tool.tool_call_id).await? {
+            continuation_required = true;
             continue;
         }
         let observation = state
@@ -6723,6 +6781,10 @@ const fn request_kind(request: &Request) -> &'static str {
         Request::CreateSession { .. } => "create_session",
         Request::CreateChildSession { .. } => "create_child_session",
         Request::SpawnSession { .. } => "spawn_session",
+        Request::DurableInteractionControllers { .. } => "durable_interaction_controllers",
+        Request::OpenDurableInteractionController { .. } => "open_durable_interaction_controller",
+        Request::DurableInteractionControllerView { .. } => "durable_interaction_controller_view",
+        Request::DurableInteractionControllerInput { .. } => "durable_interaction_controller_input",
         Request::OpenInteractionController { .. } => "open_interaction_controller",
         Request::InteractionControllerSnapshot { .. } => "interaction_controller_snapshot",
         Request::InteractionControllerInput { .. } => "interaction_controller_input",
@@ -11166,6 +11228,105 @@ async fn send_controller_response(
     send_response(writer, request_id, response).await
 }
 
+async fn send_durable_view_response(
+    writer: &SharedWriter,
+    request_id: u64,
+    result: Result<
+        bcode_plugin_models::interaction_controller::DurableInteractionView,
+        bcode_plugin_models::interaction_controller::InteractionControllerError,
+    >,
+) -> Result<(), ServerError> {
+    match result {
+        Ok(view) => {
+            send_response(
+                writer,
+                request_id,
+                Response::Ok(ResponsePayload::DurableInteractionControllerView { view }),
+            )
+            .await
+        }
+        Err(error) => send_controller_response(writer, request_id, Err(error)).await,
+    }
+}
+
+async fn durable_store_for_binding(
+    state: &Arc<ServerState>,
+    binding: &bcode_plugin_models::interaction_controller::DurableInteractionBinding,
+) -> durable_interaction::SessionDurableInteractionStore {
+    let owner = if let Ok(session_id) = binding.session_id.parse::<SessionId>() {
+        state
+            .recovered_interaction_owners
+            .lock()
+            .await
+            .get(&(session_id, binding.invocation_id.clone()))
+            .cloned()
+    } else {
+        None
+    };
+    owner.map_or_else(
+        || durable_interaction::SessionDurableInteractionStore::new(state, None),
+        |owner| durable_interaction::SessionDurableInteractionStore::from_recovered(state, &owner),
+    )
+}
+
+async fn handle_durable_interaction_request(
+    request: PermissionInteractionRequest,
+    request_id: u64,
+    client_id: ClientId,
+    state: &Arc<ServerState>,
+    writer: &SharedWriter,
+) -> Result<(), ServerError> {
+    let application = InteractionApplicationHandle::new(state, client_id);
+    match request {
+        PermissionInteractionRequest::DurableInteractionControllers { session_id, query } => {
+            match application.durable_controllers(session_id, query).await {
+                Ok(page) => {
+                    send_response(
+                        writer,
+                        request_id,
+                        Response::Ok(ResponsePayload::DurableInteractionControllers { page }),
+                    )
+                    .await
+                }
+                Err(error) => send_controller_response(writer, request_id, Err(error)).await,
+            }
+        }
+        PermissionInteractionRequest::OpenDurableInteractionController { version, binding } => {
+            let store = durable_store_for_binding(state, &binding).await;
+            let result = application
+                .open_durable_controller(&store, version, &binding)
+                .await;
+            drop(store);
+            send_durable_view_response(writer, request_id, result).await
+        }
+        PermissionInteractionRequest::DurableInteractionControllerView { version, binding } => {
+            let store = durable_store_for_binding(state, &binding).await;
+            let result = application
+                .durable_controller_view(&store, version, &binding)
+                .await;
+            drop(store);
+            send_durable_view_response(writer, request_id, result).await
+        }
+        PermissionInteractionRequest::DurableInteractionControllerInput { input } => {
+            let store = durable_store_for_binding(state, &input.binding).await;
+            match application.durable_controller_input(&store, &input).await {
+                Ok(receipt) => {
+                    send_response(
+                        writer,
+                        request_id,
+                        Response::Ok(ResponsePayload::DurableInteractionControllerReceipt {
+                            receipt,
+                        }),
+                    )
+                    .await
+                }
+                Err(error) => send_controller_response(writer, request_id, Err(error)).await,
+            }
+        }
+        _ => unreachable!("durable dispatcher receives only durable requests"),
+    }
+}
+
 async fn handle_permission_interaction_request(
     request: PermissionInteractionRequest,
     request_id: u64,
@@ -11174,6 +11335,15 @@ async fn handle_permission_interaction_request(
     writer: &SharedWriter,
 ) -> Result<(), ServerError> {
     match request {
+        request @ (PermissionInteractionRequest::DurableInteractionControllers { .. }
+        | PermissionInteractionRequest::OpenDurableInteractionController { .. }
+        | PermissionInteractionRequest::DurableInteractionControllerView { .. }
+        | PermissionInteractionRequest::DurableInteractionControllerInput { .. }) => {
+            Box::pin(handle_durable_interaction_request(
+                request, request_id, client_id, state, writer,
+            ))
+            .await
+        }
         PermissionInteractionRequest::OpenInteractionController {
             version,
             exchange_id,
@@ -11247,18 +11417,10 @@ async fn handle_permission_interaction_request(
             exchange_id,
             resolution_json,
         } => {
-            let resolution =
-                match interaction_operations::decode_tool_exchange_resolution(resolution_json) {
-                    Ok(resolution) => resolution,
-                    Err(error) => {
-                        return send_response(
-                            writer,
-                            request_id,
-                            Response::Err(ErrorResponse::new(error.code(), error.message())),
-                        )
-                        .await;
-                    }
-                };
+            let resolution = match decode_exchange_resolution(resolution_json) {
+                Ok(resolution) => resolution,
+                Err(error) => return send_response(writer, request_id, Response::Err(error)).await,
+            };
             let result = interaction_operations::resolve_tool_exchange(
                 state,
                 client_id,
@@ -11269,6 +11431,13 @@ async fn handle_permission_interaction_request(
             send_response(writer, request_id, tool_exchange_response(result)).await
         }
     }
+}
+
+fn decode_exchange_resolution(
+    resolution_json: serde_json::Value,
+) -> Result<ToolExchangeResolution, ErrorResponse> {
+    interaction_operations::decode_tool_exchange_resolution(resolution_json)
+        .map_err(|error| ErrorResponse::new(error.code(), error.message()))
 }
 
 fn tool_exchange_response(
@@ -11283,7 +11452,7 @@ fn tool_exchange_response(
 async fn handle_update_client_runtime_context(
     request_id: u64,
     client_id: ClientId,
-    state: &ServerState,
+    state: &Arc<ServerState>,
     writer: &SharedWriter,
     runtime_context: Option<ClientRuntimeContext>,
 ) -> Result<(), ServerError> {
@@ -11397,7 +11566,7 @@ fn validate_client_build_fingerprint(build_fingerprint: &str) -> Result<(), Stri
 async fn handle_hello(
     request_id: u64,
     client_id: ClientId,
-    state: &ServerState,
+    state: &Arc<ServerState>,
     writer: &SharedWriter,
     hello: ClientHello,
 ) -> Result<(), ServerError> {
@@ -16574,6 +16743,46 @@ async fn enqueue_cancel_turn_command(
     enqueue_targeted_cancel_turn_command(state, session_id, clear_queue, requested_by, None).await
 }
 
+async fn finish_recovered_interaction_cancellation(
+    state: &Arc<ServerState>,
+    session_id: SessionId,
+    turn_id: &str,
+) -> Result<bool, ServerError> {
+    let completion = Box::pin(durable_interaction::cancel_recovered(
+        state, session_id, turn_id,
+    ))
+    .await
+    .map_err(|error| {
+        ServerError::WorkflowApplicationOperationUnauthorized(format!(
+            "durable interaction cancellation unavailable: {error:?}"
+        ))
+    })?;
+    let Some(completion) = completion else {
+        return Ok(false);
+    };
+    if completion.view.binding.turn_id != turn_id
+        || completion.result.invocation_id != completion.view.binding.invocation_id
+        || completion.receipt.tool_result_event_sequence.is_none()
+    {
+        return Err(ServerError::WorkflowApplicationOperationUnauthorized(
+            "durable interaction cancellation identity mismatch".into(),
+        ));
+    }
+    let identity = (session_id, completion.result.invocation_id);
+    let owner = state
+        .recovered_interaction_owners
+        .lock()
+        .await
+        .remove(&identity);
+    if let Some(owner) = owner.as_ref() {
+        durable_interaction::SessionDurableInteractionStore::from_recovered(state, owner)
+            .revoke_recovered()
+            .await;
+    }
+    drop(owner);
+    Ok(true)
+}
+
 async fn enqueue_targeted_cancel_turn_command(
     state: &Arc<ServerState>,
     session_id: SessionId,
@@ -16581,6 +16790,9 @@ async fn enqueue_targeted_cancel_turn_command(
     requested_by: Option<ClientId>,
     expected_turn_id: Option<String>,
 ) -> Result<bool, ServerError> {
+    if let Some(turn_id) = expected_turn_id.as_deref() {
+        finish_recovered_interaction_cancellation(state, session_id, turn_id).await?;
+    }
     // A registered runtime already establishes the live routing target. Querying the session
     // actor first can queue cancellation behind the durable work it needs to interrupt.
     let live_handle = state
@@ -18199,7 +18411,7 @@ async fn finish_provider_round(context: &RuntimeCommandContext<'_>) -> Option<Mo
 
 #[allow(clippy::too_many_arguments)]
 async fn process_existing_user_event_command(
-    state: &ServerState,
+    state: &Arc<ServerState>,
     permit: &mut SessionTurnPermit,
     phase: Arc<Mutex<SessionRuntimePhase>>,
     followup_commands: &mut mpsc::Receiver<FollowupCommand>,
@@ -18243,7 +18455,7 @@ async fn process_existing_user_event_command(
 
 #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
 async fn process_skill_invocation_command(
-    state: &ServerState,
+    state: &Arc<ServerState>,
     permit: &mut SessionTurnPermit,
     phase: Arc<Mutex<SessionRuntimePhase>>,
     followup_commands: &mut mpsc::Receiver<FollowupCommand>,
@@ -21740,7 +21952,7 @@ impl ModelTurnCompletion {
 
 #[allow(clippy::too_many_arguments)]
 async fn run_model_turn(
-    state: &ServerState,
+    state: &Arc<ServerState>,
     permit: &mut SessionTurnPermit,
     trigger_event: &bcode_session_models::SessionEvent,
     client_id: ClientId,
@@ -21766,7 +21978,7 @@ async fn run_model_turn(
 
 #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
 async fn run_model_turn_lifecycle(
-    state: &ServerState,
+    state: &Arc<ServerState>,
     permit: &mut SessionTurnPermit,
     trigger_event: &bcode_session_models::SessionEvent,
     client_id: ClientId,
@@ -22187,7 +22399,7 @@ struct PreparedModelTurnSetup {
 
 #[allow(clippy::too_many_lines)]
 async fn prepare_model_turn_setup(
-    state: &ServerState,
+    state: &Arc<ServerState>,
     session_id: SessionId,
     trigger_event: &bcode_session_models::SessionEvent,
     runtime_context: Option<ClientRuntimeContext>,
@@ -22494,7 +22706,7 @@ async fn prepare_model_turn_setup(
     clippy::too_many_arguments
 )]
 async fn run_model_turn_inner(
-    state: &ServerState,
+    state: &Arc<ServerState>,
     session_id: SessionId,
     trigger_event: &bcode_session_models::SessionEvent,
     runtime_context: Option<ClientRuntimeContext>,
@@ -22514,7 +22726,7 @@ async fn run_model_turn_inner(
         provider_retry_rules,
         remote_catalog_retry_rules,
         static_context,
-    } = match prepare_model_turn_setup(
+    } = match Box::pin(prepare_model_turn_setup(
         state,
         session_id,
         trigger_event,
@@ -22522,7 +22734,7 @@ async fn run_model_turn_inner(
         &cancel_state,
         command_context,
         recovering,
-    )
+    ))
     .await
     {
         Ok(setup) => setup,
@@ -25362,7 +25574,7 @@ async fn stream_model_turn_events(
     };
     outcome.stream.delivery = ProviderStreamDelivery::Push;
     let output_position_base = *next_output_position;
-    let provider_context = session_model_selection(state, session_id)
+    let provider_context = Box::pin(session_model_selection(state, session_id))
         .await
         .provider_context;
     let mut stream_progress = ModelStreamProgress::with_sensitive_values(
@@ -25759,7 +25971,7 @@ async fn poll_model_turn_events(
     };
     outcome.stream.delivery = ProviderStreamDelivery::Poll;
     let output_position_base = *next_output_position;
-    let provider_context = session_model_selection(state, session_id)
+    let provider_context = Box::pin(session_model_selection(state, session_id))
         .await
         .provider_context;
     let mut stream_progress = ModelStreamProgress::with_sensitive_values(
@@ -32197,7 +32409,7 @@ async fn invocation_service_host_context(
 
 #[derive(Debug)]
 struct ServerToolInvoker<'a> {
-    state: &'a ServerState,
+    state: &'a Arc<ServerState>,
     session_id: SessionId,
     working_directory: &'a Path,
     cancel_state: &'a TurnCancelState,
@@ -32209,7 +32421,7 @@ struct ServerToolInvoker<'a> {
 
 impl<'a> ServerToolInvoker<'a> {
     const fn new(
-        state: &'a ServerState,
+        state: &'a Arc<ServerState>,
         session_id: SessionId,
         working_directory: &'a Path,
         cancel_state: &'a TurnCancelState,
@@ -33698,13 +33910,26 @@ async fn prepare_registered_server_tool(
         ),
         host_context,
     );
-    {
-        let invoker = ServerToolInvoker::new(state, session_id, &working_directory, cancel_state);
-        invoker
-            .prepare_tool(&tool, &request, &scope)
-            .await
-            .map_err(|error| error.to_string())
+    if !scope.accepts_work() || cancel_state.is_cancelled() {
+        return Err(RuntimeError::Cancelled.to_string());
     }
+    let ToolSource::Plugin { plugin_id } = &tool.source else {
+        return Err("server cannot prepare a non-plugin tool".to_owned());
+    };
+    let preparation = state
+        .plugins
+        .invoke_service_json_scoped::<_, ToolPreparationResponse>(
+            plugin_id,
+            TOOL_SERVICE_INTERFACE_ID,
+            OP_PREPARE_TOOL,
+            &request,
+            active_plugin_scope_for_tool_call(state, session_id, &request.invocation.invocation_id)
+                .await,
+        )
+        .await
+        .map_err(|error| error.to_string())?;
+    tool_policy_authorization_metadata(&preparation.authorization, &request.invocation.tool_name)?;
+    Ok(preparation)
 }
 
 #[cfg(test)]
@@ -34176,7 +34401,7 @@ async fn persist_scoped_turn_event(
 
 #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
 fn execute_model_tool_batch<'a>(
-    state: &'a ServerState,
+    state: &'a Arc<ServerState>,
     session_id: SessionId,
     calls: Vec<bcode_model::ToolCall>,
     output_positions: &'a BTreeMap<String, (String, bcode_session_models::TurnOutputPosition)>,
@@ -34216,7 +34441,7 @@ fn execute_model_tool_batch<'a>(
 }
 
 type ModelToolBatchInput<'a, 'context> = (
-    &'a ServerState,
+    &'a Arc<ServerState>,
     SessionId,
     Vec<bcode_model::ToolCall>,
     &'a BTreeMap<String, (String, bcode_session_models::TurnOutputPosition)>,
@@ -34570,7 +34795,7 @@ where
 
 #[cfg(test)]
 async fn execute_model_tool(
-    state: &ServerState,
+    state: &Arc<ServerState>,
     session_id: SessionId,
     call: bcode_model::ToolCall,
     working_directory: std::path::PathBuf,
@@ -35615,7 +35840,7 @@ impl InvocationServiceRouter for ServerServiceRouter<'_> {
 }
 
 struct ServerExchangeBroker<'a> {
-    state: &'a ServerState,
+    state: &'a Arc<ServerState>,
     session_id: SessionId,
     call: &'a bcode_model::ToolCall,
     cancel_state: &'a TurnCancelState,
@@ -35623,7 +35848,7 @@ struct ServerExchangeBroker<'a> {
 
 impl<'a> ServerExchangeBroker<'a> {
     const fn new(
-        state: &'a ServerState,
+        state: &'a Arc<ServerState>,
         session_id: SessionId,
         call: &'a bcode_model::ToolCall,
         cancel_state: &'a TurnCancelState,
@@ -35658,20 +35883,65 @@ impl InvocationExchangeBroker for ServerExchangeBroker<'_> {
                     message: "exchange ID must not be empty".to_owned(),
                 };
             }
-            append_tool_exchange_requested_event(self.state, self.session_id, request.clone())
-                .await;
-            let resolution = resolve_server_exchange(
+            // Disabled durable hosting retains legacy consumer negotiation: an unsupported
+            // exchange has no consumer or recoverable wait to publish. Enabled hosting always
+            // commits canonical source evidence before considering producer admission.
+            if !durable_interaction::PUBLICATION_ENABLED
+                && !interaction_operations::has_exchange_consumer(self.state, &request).await
+            {
+                return ToolExchangeResolution::NoCompatibleConsumer;
+            }
+            let exchange_sequence = match append_tool_exchange_requested_event(
                 self.state,
                 self.session_id,
-                self.call,
                 request.clone(),
-                self.cancel_state,
             )
+            .await
+            {
+                Ok(sequence) => sequence,
+                Err(message) => {
+                    return ToolExchangeResolution::Failed {
+                        code: "exchange_commit_failed".to_owned(),
+                        message,
+                    };
+                }
+            };
+            let resolution = Box::pin(interaction_operations::execute_tool_exchange_committed(
+                self.state,
+                self.session_id,
+                &self.call.id,
+                &request,
+                self.cancel_state,
+                exchange_sequence,
+            ))
             .await
             .unwrap_or_else(|message| ToolExchangeResolution::Failed {
                 code: "server_exchange_failed".to_string(),
                 message,
             });
+            if durable_interaction::PUBLICATION_ENABLED {
+                match durable_interaction::committed_completion_for_invocation(
+                    self.state,
+                    self.session_id,
+                    &request.invocation_id,
+                )
+                .await
+                {
+                    Ok(Some(completion))
+                        if completion.exchange_resolution.exchange_id == request.exchange_id
+                            && completion.exchange_resolution.resolution == resolution =>
+                    {
+                        return resolution;
+                    }
+                    Ok(Some(_)) | Err(_) => {
+                        return ToolExchangeResolution::Failed {
+                            code: "durable_completion_unavailable".to_owned(),
+                            message: "canonical completion could not be verified".to_owned(),
+                        };
+                    }
+                    Ok(None) => {}
+                }
+            }
             append_tool_exchange_resolved_event(
                 self.state,
                 self.session_id,
@@ -35964,7 +36234,7 @@ async fn resolve_workflow_application_request(
 }
 
 async fn resolve_server_plugin_bridge_request(
-    state: &ServerState,
+    state: &Arc<ServerState>,
     session_id: SessionId,
     call: &bcode_model::ToolCall,
     plugin_id: &str,
@@ -36172,23 +36442,6 @@ async fn admit_plugin_process(
     )
 }
 
-async fn resolve_server_exchange(
-    state: &ServerState,
-    session_id: SessionId,
-    call: &bcode_model::ToolCall,
-    request: ToolExchangeRequest,
-    cancel_state: &TurnCancelState,
-) -> Result<ToolExchangeResolution, String> {
-    interaction_operations::execute_tool_exchange(
-        state,
-        session_id,
-        &call.id,
-        &request,
-        cancel_state,
-    )
-    .await
-}
-
 #[derive(Debug)]
 struct ServerPluginInvocationCancellation(bcode_plugin::PluginInvocationCancelHandle);
 
@@ -36218,7 +36471,7 @@ async fn settle_cancelled_plugin_tool(
 
 #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
 async fn invoke_plugin_tool_transport(
-    state: &ServerState,
+    state: &Arc<ServerState>,
     session_id: SessionId,
     call: &bcode_model::ToolCall,
     plugin_id: &str,
@@ -36532,18 +36785,17 @@ async fn append_tool_exchange_requested_event(
     state: &ServerState,
     session_id: SessionId,
     request: bcode_session_models::ToolExchangeRequest,
-) {
-    match state
+) -> Result<u64, String> {
+    let event = state
         .sessions
         .append_event(
             session_id,
             SessionEventKind::ToolExchangeRequested { request },
         )
         .await
-    {
-        Ok(event) => publish_session_event(state, &event).await,
-        Err(error) => tracing::warn!(%error, "failed to append tool exchange request"),
-    }
+        .map_err(|_| "canonical exchange request could not be committed".to_owned())?;
+    publish_session_event(state, &event).await;
+    Ok(event.sequence)
 }
 
 async fn append_tool_exchange_resolved_event(
@@ -40414,8 +40666,8 @@ impl ActivationDispatchOwner for WorkflowActivationOwner<'_> {
                     let admission = async {
                         match request.activation.node.kind {
                             bcode_workflow::NodeKind::Agent => Box::pin(dispatch_workflow_prompt_turn(self.state, request)).await,
-                            bcode_workflow::NodeKind::PluginBlock => dispatch_workflow_plugin_block(self.state, request).await,
-                            bcode_workflow::NodeKind::WorkflowCall => dispatch_workflow_child(self.state, request).await,
+                            bcode_workflow::NodeKind::PluginBlock => Box::pin(dispatch_workflow_plugin_block(self.state, request)).await,
+                            bcode_workflow::NodeKind::WorkflowCall => Box::pin(dispatch_workflow_child(self.state, request)).await,
                             _ => Err(WorkflowStoreError::InvalidData("workflow activation has no production owner".into())),
                         }
                     };
@@ -44342,6 +44594,8 @@ const fn session_event_kind_name(kind: &SessionEventKind) -> &'static str {
         SessionEventKind::SubmissionCancelled { .. } => "submission_cancelled",
         SessionEventKind::SubmissionRecoveryAuthorized { .. } => "submission_recovery_authorized",
         SessionEventKind::SubmissionPendingCancelled { .. } => "submission_pending_cancelled",
+        SessionEventKind::DurableInteractionCommitted { .. } => "durable_interaction_committed",
+        SessionEventKind::TurnContinuationCommitted { .. } => "turn_continuation_committed",
         SessionEventKind::InertHistory { .. } => "inert_history",
     }
 }
@@ -51497,7 +51751,7 @@ event_symbol = "bcode_plugin_handle_event_v1"
     }
 
     async fn settle_advisory_fixture_tool(
-        state: &ServerState,
+        state: &Arc<ServerState>,
         cancel: &TurnCancelState,
         call: bcode_model::ToolCall,
         result: ToolInvocationResponse,
@@ -51826,7 +52080,7 @@ event_symbol = "bcode_plugin_handle_event_v1"
 
     #[tokio::test]
     async fn normal_settled_session_progress_resets_distinct_failure_and_success() {
-        let state = advisory_boundary_fixture_state();
+        let state = Arc::new(advisory_boundary_fixture_state());
         let session = SessionId::new();
         let mut window = judgement::ProgressWindow::default();
         window.set_objective("repair parser".into());
@@ -51888,7 +52142,7 @@ event_symbol = "bcode_plugin_handle_event_v1"
     #[tokio::test]
     async fn postsettlement_advice_preserves_original_tool_result() {
         TRIAGE_FIXTURE_CALLS.store(0, Ordering::SeqCst);
-        let state = advisory_boundary_fixture_state();
+        let state = Arc::new(advisory_boundary_fixture_state());
         let cancel = TurnCancelState::default();
         let (actual, expected) = {
             let output = format!("Authentication failed {}", "界".repeat(4000));
@@ -52263,7 +52517,7 @@ event_symbol = "bcode_plugin_handle_event_v1"
             .create_session(Some("idle blocker".to_owned()), test_working_directory())
             .await
             .expect("session");
-        let state = test_server_state(sessions);
+        let state = Arc::new(test_server_state(sessions));
 
         assert_eq!(state.idle_shutdown_blocker().await, None);
         let control_client = ClientId::new();
@@ -53100,7 +53354,7 @@ library = "test"
             .into_iter()
             .find(|event| matches!(event.kind, SessionEventKind::UserMessage { .. }))
             .expect("user event");
-        let state = test_server_state(sessions.clone());
+        let state = Arc::new(test_server_state(sessions.clone()));
         let (_followup, mut followups) = mpsc::channel(1);
         let (_steering, mut steering) = mpsc::channel(1);
         let (_cancel, mut cancels) = mpsc::channel(1);
@@ -53647,7 +53901,7 @@ library = "test"
 
     #[tokio::test]
     async fn server_exchange_rejects_wrong_invocation_before_registering_interaction() {
-        let state = test_server_state(SessionManager::default());
+        let state = Arc::new(test_server_state(SessionManager::default()));
         let session_id = SessionId::new();
         let call = bcode_model::ToolCall {
             id: "active-call".to_string(),
@@ -53787,7 +54041,7 @@ library = "test"
             )]),
             ..bcode_model::ProviderRequestContext::default()
         };
-        let state = test_server_state_with_fake_provider(sessions);
+        let state = Arc::new(test_server_state_with_fake_provider(sessions));
         state.session_model_selections.lock().await.insert(
             session_id,
             SessionModelSelection {
@@ -53849,8 +54103,11 @@ library = "test"
             )]),
             ..bcode_model::ProviderRequestContext::default()
         };
-        let mut state = test_server_state_with_fake_provider(sessions);
-        state.startup_config.tools.execution.parallel = false;
+        let state = Arc::new({
+            let mut state = test_server_state_with_fake_provider(sessions);
+            state.startup_config.tools.execution.parallel = false;
+            state
+        });
         state.session_model_selections.lock().await.insert(
             session_id,
             SessionModelSelection {
@@ -53984,7 +54241,7 @@ library = "test"
             }),
             ..bcode_model::ProviderRequestContext::default()
         };
-        let state = test_server_state_with_fake_provider(sessions);
+        let state = Arc::new(test_server_state_with_fake_provider(sessions));
         state.session_model_selections.lock().await.insert(
             session_id,
             SessionModelSelection {
@@ -54177,7 +54434,7 @@ library = "test"
 
     #[tokio::test]
     async fn exchange_capabilities_are_client_scoped_and_detach_resolves_pending() {
-        let state = test_server_state(SessionManager::default());
+        let state = Arc::new(test_server_state(SessionManager::default()));
         let compatible_client = ClientId::new();
         let incompatible_client = ClientId::new();
         let adapter = bcode_plugin_sdk::interaction::PluginInteractionAdapterCapability {
@@ -54255,7 +54512,7 @@ library = "test"
 
     #[tokio::test]
     async fn server_exchange_broker_maps_cancellation_and_unknown_schema() {
-        let state = test_server_state(SessionManager::default());
+        let state = Arc::new(test_server_state(SessionManager::default()));
         let session_id = SessionId::new();
         let call = bcode_model::ToolCall {
             id: "active-call".to_string(),
@@ -55325,8 +55582,11 @@ library = "test"
                 .unwrap()
                 .pop()
                 .unwrap();
-            let mut state = test_server_state_with_fake_provider(sessions);
-            state.startup_config.judgement.mode = mode;
+            let state = Arc::new({
+                let mut state = test_server_state_with_fake_provider(sessions);
+                state.startup_config.judgement.mode = mode;
+                state
+            });
             let cancel = Arc::new(TurnCancelState::default());
             let completion = run_test_model_turn_with_cancel_state(
                 &state,
@@ -55434,7 +55694,7 @@ library = "test"
     }
 
     async fn run_test_model_turn(
-        state: &ServerState,
+        state: &Arc<ServerState>,
         session_id: SessionId,
         trigger: &SessionEvent,
         runtime_context: ClientRuntimeContext,
@@ -55466,7 +55726,7 @@ library = "test"
     }
 
     async fn run_test_model_turn_with_cancel_state(
-        state: &ServerState,
+        state: &Arc<ServerState>,
         session_id: SessionId,
         trigger: &SessionEvent,
         runtime_context: ClientRuntimeContext,
@@ -55499,7 +55759,7 @@ library = "test"
     }
 
     async fn run_test_model_turn_with_summary_steering(
-        state: &ServerState,
+        state: &Arc<ServerState>,
         session_id: SessionId,
         trigger: &SessionEvent,
         mut runtime_context: ClientRuntimeContext,
@@ -64144,18 +64404,21 @@ library = "test"
 
     #[tokio::test]
     async fn workflow_invocation_bridge_uses_authenticated_plugin_identity() {
-        let mut state = test_server_state(SessionManager::default());
-        state.set_workflow_run_graph_edit_policy(WorkflowRunGraphEditPolicy {
-            evaluator: Arc::new(|facts| {
-                assert_eq!(facts.actor.actor_id, "authenticated-plugin");
-                assert_eq!(
-                    facts.actor.kind,
-                    bcode_workflow::WorkflowApplicationActorKind::Plugin
-                );
-                WorkflowApplicationAuthorizationDecision::Deny {
-                    reason: "private policy detail".to_owned(),
-                }
-            }),
+        let state = Arc::new({
+            let mut state = test_server_state(SessionManager::default());
+            state.set_workflow_run_graph_edit_policy(WorkflowRunGraphEditPolicy {
+                evaluator: Arc::new(|facts| {
+                    assert_eq!(facts.actor.actor_id, "authenticated-plugin");
+                    assert_eq!(
+                        facts.actor.kind,
+                        bcode_workflow::WorkflowApplicationActorKind::Plugin
+                    );
+                    WorkflowApplicationAuthorizationDecision::Deny {
+                        reason: "private policy detail".to_owned(),
+                    }
+                }),
+            });
+            state
         });
         let call = bcode_model::ToolCall {
             id: "invocation".to_owned(),
@@ -64517,8 +64780,11 @@ library = "test"
     }
 
     async fn assert_registered_execution_context(arguments: serde_json::Value, limit: usize) {
-        let (mut state, child_id, _root) = active_edit_execution_fixture().await;
-        register_workflow_publication_tool(&mut state);
+        let (state, child_id, _root) = {
+            let (mut state, child_id, root) = active_edit_execution_fixture().await;
+            register_workflow_publication_tool(&mut state);
+            (Arc::new(state), child_id, root)
+        };
         let call = bcode_model::ToolCall {
             id: "context-read".to_owned(),
             name: "workflow.execution_context".to_owned(),
@@ -64572,6 +64838,7 @@ library = "test"
                     .expect("allowance")
             )
         );
+        drop(state);
         let mut older = serde_json::to_value(&context).unwrap();
         older.as_object_mut().unwrap().remove("execution_allowance");
         assert!(
@@ -64606,8 +64873,11 @@ library = "test"
     }
 
     async fn assert_registered_task_staging(prompt: bool, allow: bool) {
-        let (mut state, child_id, _root) = active_edit_execution_fixture().await;
-        register_workflow_publication_tool(&mut state);
+        let (state, child_id, _root) = {
+            let (mut state, child_id, root) = active_edit_execution_fixture().await;
+            register_workflow_publication_tool(&mut state);
+            (Arc::new(state), child_id, root)
+        };
         let provenance = state
             .sessions
             .session_summary(child_id)
@@ -64646,6 +64916,7 @@ library = "test"
                     .is_none()
             );
             drop(store);
+            drop(state);
             return;
         }
         let response = response.expect("transport");
@@ -64669,6 +64940,7 @@ library = "test"
             .staged_run_graph_edit("edit-run", &edit.mutation_id, &authority)
             .expect("staged");
         drop(store);
+        drop(state);
         assert_eq!(staged, Some(edit));
     }
 
@@ -64707,6 +64979,7 @@ library = "test"
             .provenance
             .activation_id
             .unwrap();
+        let state = Arc::new(state);
         let (_, call) = task_staging_call(activation, true);
         let (tool, preparation) = prepare_server_tool(&state, session, &call).await.unwrap();
         let metadata =
@@ -64732,10 +65005,11 @@ library = "test"
                 .await
                 .is_empty()
         );
+        drop(state);
     }
 
     async fn invoke_task_with_permission(
-        state: &ServerState,
+        state: &Arc<ServerState>,
         session_id: SessionId,
         call: &bcode_model::ToolCall,
         allow: bool,
@@ -64884,13 +65158,16 @@ library = "test"
 
     #[tokio::test]
     async fn task_group_replay_publishes_through_authenticated_tool_bridge() {
-        let (mut state, session, _root) = active_edit_execution_fixture().await;
-        register_workflow_publication_tool(&mut state);
-        state.set_workflow_run_graph_publication_policy(WorkflowRunGraphPublicationPolicy {
-            evaluator: Arc::new(|_| WorkflowApplicationAuthorizationDecision::Allow),
-        });
-        let (sender, mut receiver) = mpsc::channel(4);
-        state.workflow_driver_sender.set(sender).unwrap();
+        let (mut state, session, _root, mut receiver) = {
+            let (mut state, session, root) = active_edit_execution_fixture().await;
+            register_workflow_publication_tool(&mut state);
+            state.set_workflow_run_graph_publication_policy(WorkflowRunGraphPublicationPolicy {
+                evaluator: Arc::new(|_| WorkflowApplicationAuthorizationDecision::Allow),
+            });
+            let (sender, receiver) = mpsc::channel(4);
+            state.workflow_driver_sender.set(sender).unwrap();
+            (Arc::new(state), session, root, receiver)
+        };
         admit_publication_author(&state, session);
         let activation = state
             .sessions
@@ -64930,20 +65207,24 @@ library = "test"
             arguments: receipt["publication_arguments"].clone(),
         };
         // A matching reference still cannot bypass the separate application grant.
-        state.set_workflow_run_graph_publication_policy(WorkflowRunGraphPublicationPolicy {
-            evaluator: Arc::new(|_| WorkflowApplicationAuthorizationDecision::Deny {
-                reason: "test denial".into(),
-            }),
-        });
+        Arc::get_mut(&mut state)
+            .expect("exclusive state")
+            .set_workflow_run_graph_publication_policy(WorkflowRunGraphPublicationPolicy {
+                evaluator: Arc::new(|_| WorkflowApplicationAuthorizationDecision::Deny {
+                    reason: "test denial".into(),
+                }),
+            });
         assert!(
             invoke_task_with_permission(&state, session, &candidate_call, true)
                 .await
                 .is_err()
         );
         assert!(receiver.try_recv().is_err());
-        state.set_workflow_run_graph_publication_policy(WorkflowRunGraphPublicationPolicy {
-            evaluator: Arc::new(|_| WorkflowApplicationAuthorizationDecision::Allow),
-        });
+        Arc::get_mut(&mut state)
+            .expect("exclusive state")
+            .set_workflow_run_graph_publication_policy(WorkflowRunGraphPublicationPolicy {
+                evaluator: Arc::new(|_| WorkflowApplicationAuthorizationDecision::Allow),
+            });
         let published = invoke_task_with_permission(&state, session, &candidate_call, true)
             .await
             .unwrap();
@@ -64968,6 +65249,7 @@ library = "test"
                 .unwrap(),
             Some(2)
         );
+        drop(state);
     }
 
     #[tokio::test]
@@ -64981,6 +65263,7 @@ library = "test"
         register_workflow_publication_tool(&mut state);
         let (sender, _receiver) = mpsc::channel(4);
         state.workflow_driver_sender.set(sender).expect("queue");
+        let state = Arc::new(state);
         let activation = state
             .sessions
             .session_summary(session)
@@ -65041,6 +65324,7 @@ library = "test"
             1
         );
         drop(store);
+        drop(state);
     }
 
     fn staging_publication_arguments(
@@ -65064,6 +65348,7 @@ library = "test"
         let (sender, mut scheduled) = mpsc::channel(1);
         state.workflow_driver_sender.set(sender).expect("scheduler");
         register_workflow_publication_tool(&mut state);
+        let state = Arc::new(state);
         let provenance = state
             .sessions
             .session_summary(child_id)
@@ -65368,7 +65653,7 @@ library = "test"
     }
 
     async fn stage_group_through_tool(
-        state: &ServerState,
+        state: &Arc<ServerState>,
         session_id: SessionId,
         source: &bcode_workflow::WorkflowRunGraphEditBatch,
         single_worker: bool,
@@ -65626,6 +65911,10 @@ library = "test"
         register_workflow_publication_tool(&mut state);
         let (sender, mut queued) = mpsc::channel(1);
         state.workflow_driver_sender.set(sender).expect("queue");
+        state.set_workflow_run_graph_publication_policy(WorkflowRunGraphPublicationPolicy {
+            evaluator: Arc::new(|_| WorkflowApplicationAuthorizationDecision::Allow),
+        });
+        let mut state = Arc::new(state);
         let source = state
             .workflow_store
             .lock()
@@ -65641,10 +65930,6 @@ library = "test"
             false,
         )
         .await;
-        state.set_workflow_run_graph_publication_policy(WorkflowRunGraphPublicationPolicy {
-            evaluator: Arc::new(|_| WorkflowApplicationAuthorizationDecision::Allow),
-        });
-        let mut state = Arc::new(state);
         publish_and_discard_wakes(&state, edit, &mut queued).await;
         let (path, authority) = {
             let store = state.workflow_store.lock().expect("store");
@@ -65754,6 +66039,16 @@ library = "test"
         let (sender, mut queued) = mpsc::channel(1);
         state.workflow_driver_sender.set(sender).expect("queue");
         register_workflow_publication_tool(&mut state);
+        state.set_workflow_run_graph_publication_policy(WorkflowRunGraphPublicationPolicy {
+            evaluator: Arc::new(|facts| {
+                workflow_operations::authorize_configured_run_graph_publication(
+                    facts,
+                    &BTreeSet::new(),
+                    true,
+                )
+            }),
+        });
+        let mut state = Arc::new(state);
         let provenance = state
             .sessions
             .session_summary(child_id)
@@ -65779,16 +66074,6 @@ library = "test"
                 .expect("stage");
             final_node
         };
-        state.set_workflow_run_graph_publication_policy(WorkflowRunGraphPublicationPolicy {
-            evaluator: Arc::new(|facts| {
-                workflow_operations::authorize_configured_run_graph_publication(
-                    facts,
-                    &BTreeSet::new(),
-                    true,
-                )
-            }),
-        });
-        let mut state = Arc::new(state);
         publish_and_discard_wakes(&state, edit, &mut queued).await;
         if parallel && !owner.has_actual_receipt() {
             settle_group_source(&state).await;
@@ -68298,6 +68583,7 @@ library = "test"
     #[tokio::test]
     async fn workflow_bridge_stages_for_active_execution_and_preserves_revision() {
         let (state, child_id, _root) = active_edit_execution_fixture().await;
+        let state = Arc::new(state);
         let authority = state
             .workflow_store
             .lock()
@@ -69967,7 +70253,7 @@ library = "test"
         let operation_request = request.clone();
         let operation = tokio::spawn(async move {
             interaction_operations::execute_tool_exchange(
-                operation_state.as_ref(),
+                &operation_state,
                 session_id,
                 "call-1",
                 &operation_request,
@@ -69992,7 +70278,7 @@ library = "test"
         assert!(!operation.is_finished());
         assert!(
             interaction_operations::resolve_tool_exchange(
-                state.as_ref(),
+                &state,
                 client_id,
                 &request.exchange_id,
                 ToolExchangeResolution::Responded {
@@ -70016,7 +70302,7 @@ library = "test"
         );
 
         let mismatched = interaction_operations::execute_tool_exchange(
-            state.as_ref(),
+            &state,
             session_id,
             "other-call",
             &request,
@@ -70155,7 +70441,7 @@ library = "test"
         let operation_cancel = Arc::clone(&cancel);
         let operation = tokio::spawn(async move {
             interaction_operations::execute_tool_exchange(
-                operation_state.as_ref(),
+                &operation_state,
                 SessionId::new(),
                 "call-incompatible",
                 &operation_request,
@@ -70178,7 +70464,7 @@ library = "test"
 
         assert_eq!(
             interaction_operations::resolve_tool_exchange(
-                state.as_ref(),
+                &state,
                 incompatible_id,
                 &request.exchange_id,
                 ToolExchangeResolution::Cancelled,
@@ -70241,7 +70527,7 @@ library = "test"
         let operation_request = request.clone();
         let operation = tokio::spawn(async move {
             interaction_operations::execute_tool_exchange(
-                operation_state.as_ref(),
+                &operation_state,
                 SessionId::new(),
                 "call-detach",
                 &operation_request,
@@ -70267,7 +70553,7 @@ library = "test"
             .lock()
             .await
             .remove(&client_id);
-        interaction_operations::resolve_exchanges_without_consumers(state.as_ref()).await;
+        interaction_operations::resolve_exchanges_without_consumers(&state).await;
         assert_eq!(
             operation.await.expect("join").expect("exchange operation"),
             ToolExchangeResolution::ConsumerDetached
@@ -70316,7 +70602,7 @@ library = "test"
         let operation_cancel = Arc::clone(&cancel);
         let first = tokio::spawn(async move {
             interaction_operations::execute_tool_exchange(
-                operation_state.as_ref(),
+                &operation_state,
                 SessionId::new(),
                 "call-duplicate",
                 &operation_request,
@@ -70338,7 +70624,7 @@ library = "test"
         .expect("first exchange should become pending");
 
         let duplicate = interaction_operations::execute_tool_exchange(
-            state.as_ref(),
+            &state,
             SessionId::new(),
             "call-duplicate",
             &request,
@@ -70367,7 +70653,7 @@ library = "test"
 
     #[tokio::test]
     async fn interaction_operation_fails_closed_without_compatible_consumer() {
-        let state = test_server_state(SessionManager::default());
+        let state = Arc::new(test_server_state(SessionManager::default()));
         let request = ToolExchangeRequest {
             invocation_id: "call-no-consumer".to_owned(),
             exchange_id: "exchange-no-consumer".to_owned(),
@@ -70433,7 +70719,7 @@ library = "test"
         let operation_cancel = Arc::clone(&cancel);
         let operation = tokio::spawn(async move {
             interaction_operations::execute_tool_exchange(
-                operation_state.as_ref(),
+                &operation_state,
                 SessionId::new(),
                 "call-cancel",
                 &operation_request,
@@ -70464,7 +70750,7 @@ library = "test"
 
     #[tokio::test]
     async fn interaction_operations_list_and_resolve_without_transport_writing() {
-        let state = test_server_state(SessionManager::default());
+        let state = Arc::new(test_server_state(SessionManager::default()));
         let client_id = ClientId::new();
         state.register_client(client_id).await;
         state
@@ -70636,7 +70922,7 @@ library = "test"
 
     #[tokio::test]
     async fn client_context_errors_are_stable_and_secret_safe() {
-        let state = test_server_state(SessionManager::default());
+        let state = Arc::new(test_server_state(SessionManager::default()));
         let client_id = ClientId::new();
         let context = bcode_ipc::ClientRuntimeContext {
             effective_config_toml: Some(Box::new("secret-invalid-config = [".to_owned())),
@@ -72076,7 +72362,7 @@ event_symbol = "bcode_plugin_handle_event_v1"
             serde_json::to_vec(&session.id).expect("session id"),
         )
         .expect("ready marker");
-        let state = test_server_state_with_shell_plugin(sessions);
+        let state = Arc::new(test_server_state_with_shell_plugin(sessions));
         let (tool, preparation) = prepare_server_tool(&state, session.id, &call)
             .await
             .expect("prepared shell");
@@ -73855,10 +74141,13 @@ event_symbol = "bcode_plugin_handle_event_v1"
             )
             .expect("load web-search and fake-provider plugins"),
         );
-        let mut state = test_server_state(sessions);
-        state.trace_store = TraceStore::new(workspace.path().join("traces"));
-        state.plugins = plugins;
-        state.selected_provider_plugin_id = Some("bcode.fake-provider".to_owned());
+        let state = Arc::new({
+            let mut state = test_server_state(sessions);
+            state.trace_store = TraceStore::new(workspace.path().join("traces"));
+            state.plugins = plugins;
+            state.selected_provider_plugin_id = Some("bcode.fake-provider".to_owned());
+            state
+        });
         state.session_model_selections.lock().await.insert(
             session_id,
             SessionModelSelection {
@@ -74063,7 +74352,7 @@ event_symbol = "bcode_plugin_handle_event_v1"
 
     #[allow(clippy::too_many_arguments)]
     pub async fn invoke_prepared_tool_for_test(
-        state: &ServerState,
+        state: &Arc<ServerState>,
         session_id: SessionId,
         call: &bcode_model::ToolCall,
         tool: RegisteredTool,
@@ -74444,9 +74733,11 @@ event_symbol = "bcode_plugin_handle_event_v1"
     #[tokio::test]
     async fn stale_permission_batch_response_cannot_resolve_another_daemons_batch() {
         let first = test_server_state(SessionManager::default());
-        let mut second = test_server_state(SessionManager::default());
-        second.daemon_status.instance_id = "replacement-daemon".to_owned();
-        let second = Arc::new(second);
+        let second = Arc::new({
+            let mut state = test_server_state(SessionManager::default());
+            state.daemon_status.instance_id = "replacement-daemon".to_owned();
+            state
+        });
         let (first_id, _first_registration) =
             interaction_operations::PendingPermissionBatchRegistration::allocate(
                 &first,
@@ -74488,7 +74779,7 @@ event_symbol = "bcode_plugin_handle_event_v1"
     }
 
     async fn assert_routed_exchange(
-        state: &ServerState,
+        state: &Arc<ServerState>,
         source: SessionId,
         destination: SessionId,
     ) {
@@ -75382,7 +75673,7 @@ event_symbol = "bcode_plugin_handle_event_v1"
     }
 
     async fn execute_server_tool_for_test(
-        state: &ServerState,
+        state: &Arc<ServerState>,
         session_id: SessionId,
         call: bcode_model::ToolCall,
         working_directory: PathBuf,
@@ -75467,8 +75758,11 @@ event_symbol = "bcode_plugin_handle_event_v1"
             .await
             .expect("session")
             .id;
-        let mut state = test_server_state_with_filesystem_plugin(sessions);
-        state.trace_store = TraceStore::new(workspace.path().join("traces"));
+        let state = Arc::new({
+            let mut state = test_server_state_with_filesystem_plugin(sessions);
+            state.trace_store = TraceStore::new(workspace.path().join("traces"));
+            state
+        });
         let call = bcode_model::ToolCall {
             id: "filesystem-image".to_owned(),
             name: "filesystem.read".to_owned(),
@@ -75547,7 +75841,7 @@ event_symbol = "bcode_plugin_handle_event_v1"
             .create_session(None, workspace.path().to_path_buf())
             .await
             .unwrap();
-        let state = test_server_state_with_filesystem_plugin(sessions);
+        let state = Arc::new(test_server_state_with_filesystem_plugin(sessions));
         let target = workspace.path().join("must-not-exist");
         let call = bcode_model::ToolCall {
             id: "dispatch-failure".into(),
@@ -75588,8 +75882,11 @@ event_symbol = "bcode_plugin_handle_event_v1"
             .await
             .expect("filesystem progress session")
             .id;
-        let mut state = test_server_state_with_filesystem_plugin(sessions);
-        state.trace_store = TraceStore::new(workspace.path().join("traces"));
+        let state = Arc::new({
+            let mut state = test_server_state_with_filesystem_plugin(sessions);
+            state.trace_store = TraceStore::new(workspace.path().join("traces"));
+            state
+        });
         let result = execute_server_tool_for_test(
             &state,
             session_id,
@@ -75651,8 +75948,11 @@ event_symbol = "bcode_plugin_handle_event_v1"
             .attach_session(session_id, ClientId::new())
             .await
             .expect("shell contribution session should attach");
-        let mut state = test_server_state_with_shell_plugin(sessions);
-        state.trace_store = TraceStore::new(workspace.path().join("traces"));
+        let state = Arc::new({
+            let mut state = test_server_state_with_shell_plugin(sessions);
+            state.trace_store = TraceStore::new(workspace.path().join("traces"));
+            state
+        });
         let result = execute_server_tool_for_test(
             &state,
             session_id,
@@ -75755,8 +76055,11 @@ event_symbol = "bcode_plugin_handle_event_v1"
             .attach_session(session_id, ClientId::new())
             .await
             .expect("Vim preview session should attach");
-        let mut state = test_server_state_with_vim_edit_plugin(sessions);
-        state.trace_store = TraceStore::new(workspace.path().join("traces"));
+        let state = Arc::new({
+            let mut state = test_server_state_with_vim_edit_plugin(sessions);
+            state.trace_store = TraceStore::new(workspace.path().join("traces"));
+            state
+        });
 
         let result = execute_server_tool_for_test(
             &state,
@@ -75828,8 +76131,11 @@ event_symbol = "bcode_plugin_handle_event_v1"
             .await
             .expect("failed shell session")
             .id;
-        let mut state = test_server_state_with_shell_plugin(sessions);
-        state.trace_store = TraceStore::new(workspace.path().join("traces"));
+        let state = Arc::new({
+            let mut state = test_server_state_with_shell_plugin(sessions);
+            state.trace_store = TraceStore::new(workspace.path().join("traces"));
+            state
+        });
         append_tool_contribution_envelope(
             &state,
             session_id,
@@ -75918,8 +76224,11 @@ event_symbol = "bcode_plugin_handle_event_v1"
             .await
             .expect("cancelled shell session")
             .id;
-        let mut state = test_server_state_with_shell_plugin(sessions);
-        state.trace_store = TraceStore::new(workspace.path().join("traces"));
+        let state = Arc::new({
+            let mut state = test_server_state_with_shell_plugin(sessions);
+            state.trace_store = TraceStore::new(workspace.path().join("traces"));
+            state
+        });
         let call = bcode_model::ToolCall {
             id: "cancelled-shell".to_owned(),
             name: "shell.run".to_owned(),
@@ -75970,6 +76279,11 @@ event_symbol = "bcode_plugin_handle_event_v1"
             .session_history(session_id)
             .await
             .expect("terminal lifecycle history");
+        assert_cancelled_shell_lifecycle(&history, &expected_output);
+        drop(state);
+    }
+
+    fn assert_cancelled_shell_lifecycle(history: &[SessionEvent], expected_output: &str) {
         let recorded = history
             .iter()
             .filter_map(|event| match &event.kind {
@@ -76003,11 +76317,10 @@ event_symbol = "bcode_plugin_handle_event_v1"
             ]
         );
         assert!(
-            bcode_session_view::build_session_view_snapshot(&history)
+            bcode_session_view::build_session_view_snapshot(history)
                 .active_invocations
                 .is_empty()
         );
-        drop(state);
     }
 
     #[cfg(unix)]
@@ -76024,8 +76337,11 @@ event_symbol = "bcode_plugin_handle_event_v1"
             .await
             .expect("scope-cancelled shell session")
             .id;
-        let mut state = test_server_state_with_shell_plugin(sessions);
-        state.trace_store = TraceStore::new(workspace.path().join("traces"));
+        let state = Arc::new({
+            let mut state = test_server_state_with_shell_plugin(sessions);
+            state.trace_store = TraceStore::new(workspace.path().join("traces"));
+            state
+        });
         let call = bcode_model::ToolCall {
             id: "scope-cancelled-shell".to_owned(),
             name: "shell.run".to_owned(),
@@ -76815,7 +77131,9 @@ event_symbol = "bcode_plugin_handle_event_v1"
             )
             .await
             .unwrap();
-        let state = test_server_state_with_fake_provider_and_filesystem(sessions);
+        let state = Arc::new(test_server_state_with_fake_provider_and_filesystem(
+            sessions,
+        ));
         let before = state
             .plugins
             .executor_statuses()
@@ -76856,7 +77174,7 @@ event_symbol = "bcode_plugin_handle_event_v1"
             .await
             .unwrap()
             .id;
-        let state = test_server_state_with_filesystem_plugin(sessions);
+        let state = Arc::new(test_server_state_with_filesystem_plugin(sessions));
         let snapshot = state
             .tool_catalog
             .get(&state.plugins, true, Duration::from_secs(10))
@@ -76935,14 +77253,17 @@ event_symbol = "bcode_plugin_handle_event_v1"
             .await
             .unwrap()
             .id;
-        let mut state = test_server_state_with_filesystem_plugin(sessions);
-        state.trace_store = TraceStore::new(workspace.path().join("traces"));
-        state
-            .startup_config
-            .tools
-            .execution
-            .host_retry_initial_delay_ms = 1;
-        state.startup_config.tools.execution.host_retry_max_delay_ms = 1;
+        let state = Arc::new({
+            let mut state = test_server_state_with_filesystem_plugin(sessions);
+            state.trace_store = TraceStore::new(workspace.path().join("traces"));
+            state
+                .startup_config
+                .tools
+                .execution
+                .host_retry_initial_delay_ms = 1;
+            state.startup_config.tools.execution.host_retry_max_delay_ms = 1;
+            state
+        });
         let (_followup_tx, mut followup_rx) = mpsc::channel(1);
         let (_steering_tx, mut steering_rx) = mpsc::channel(1);
         let (_cancel_tx, mut cancel_rx) = mpsc::channel(1);
@@ -77024,8 +77345,11 @@ event_symbol = "bcode_plugin_handle_event_v1"
             .await
             .expect("registry mixed session")
             .id;
-        let mut state = test_server_state_with_filesystem_plugin(sessions);
-        state.trace_store = TraceStore::new(workspace.path().join("traces"));
+        let state = Arc::new({
+            let mut state = test_server_state_with_filesystem_plugin(sessions);
+            state.trace_store = TraceStore::new(workspace.path().join("traces"));
+            state
+        });
         let (_followup_tx, mut followup_rx) = mpsc::channel(1);
         let (_steering_tx, mut steering_rx) = mpsc::channel(1);
         let (_cancel_tx, mut cancel_rx) = mpsc::channel(1);
@@ -77152,8 +77476,11 @@ event_symbol = "bcode_plugin_handle_event_v1"
             .await
             .unwrap()
             .id;
-        let mut state = test_server_state_with_filesystem_plugin(sessions);
-        state.trace_store = TraceStore::new(workspace.path().join("traces"));
+        let state = Arc::new({
+            let mut state = test_server_state_with_filesystem_plugin(sessions);
+            state.trace_store = TraceStore::new(workspace.path().join("traces"));
+            state
+        });
         let (_followup_tx, mut followup_rx) = mpsc::channel(1);
         let (_steering_tx, mut steering_rx) = mpsc::channel(1);
         let (_cancel_tx, mut cancel_rx) = mpsc::channel(1);
@@ -77353,7 +77680,7 @@ event_symbol = "bcode_plugin_handle_event_v1"
                 current_turn,
             );
             execute_model_tool_batch(
-                task_state.as_ref(),
+                &task_state,
                 session_id,
                 vec![bcode_model::ToolCall {
                     id: "canonical-cancelled-shell".to_owned(),
@@ -77546,7 +77873,7 @@ event_symbol = "bcode_plugin_handle_event_v1"
                 current_turn,
             );
             execute_model_tool_batch(
-                task_state.as_ref(),
+                &task_state,
                 session_id,
                 calls,
                 &BTreeMap::new(),
@@ -80224,7 +80551,7 @@ event_symbol = "bcode_plugin_handle_event_v1"
         let task_call = call.clone();
         let task = tokio::spawn(async move {
             invoke_prepared_tool_for_test(
-                task_state.as_ref(),
+                &task_state,
                 session_id,
                 &task_call,
                 tool,
@@ -80373,7 +80700,7 @@ event_symbol = "bcode_plugin_handle_event_v1"
         let task_cancel = Arc::clone(&cancel_state);
         let task = tokio::spawn(async move {
             invoke_prepared_tool_for_test(
-                task_state.as_ref(),
+                &task_state,
                 session_id,
                 &task_call,
                 tool,
@@ -80532,7 +80859,7 @@ event_symbol = "bcode_plugin_handle_event_v1"
         let task_cancel = Arc::clone(&cancel_state);
         let question_task = tokio::spawn(async move {
             invoke_prepared_tool_for_test(
-                task_state.as_ref(),
+                &task_state,
                 question_session.id,
                 &task_call,
                 tool,
@@ -80678,7 +81005,7 @@ event_symbol = "bcode_plugin_handle_event_v1"
         let task_cancel = Arc::clone(&cancel_state);
         let task = tokio::spawn(async move {
             invoke_prepared_tool_for_test(
-                task_state.as_ref(),
+                &task_state,
                 session_id,
                 &task_call,
                 tool,
@@ -82281,7 +82608,7 @@ event_symbol = "bcode_plugin_handle_event_v1"
             .await
             .expect("session")
             .id;
-        let state = test_server_state(sessions);
+        let state = Arc::new(test_server_state(sessions));
         let client_id = ClientId::new();
         let mut config = bcode_config::BcodeConfig::default();
         config.model.compaction.mode = bcode_config::CompactionMode::ProactiveAndOverflow;
@@ -82937,7 +83264,7 @@ event_symbol = "bcode_plugin_handle_event_v1"
             .await
             .expect("session")
             .id;
-        let state = test_server_state(sessions);
+        let state = Arc::new(test_server_state(sessions));
         state.session_model_selections.lock().await.insert(
             session_id,
             SessionModelSelection {
@@ -83009,7 +83336,7 @@ event_symbol = "bcode_plugin_handle_event_v1"
             .await
             .expect("session")
             .id;
-        let state = test_server_state(sessions);
+        let state = Arc::new(test_server_state(sessions));
         state.session_model_selections.lock().await.insert(
             session_id,
             SessionModelSelection {
@@ -96210,7 +96537,7 @@ event_symbol = "bcode_plugin_handle_event_v1"
             )
             .await
             .expect("trigger");
-        let state = test_server_state_with_fake_provider(sessions);
+        let state = Arc::new(test_server_state_with_fake_provider(sessions));
         state.session_model_selections.lock().await.insert(
             session_id,
             SessionModelSelection {
@@ -96303,7 +96630,7 @@ event_symbol = "bcode_plugin_handle_event_v1"
             settings: BTreeMap::from([("fake_turn_delay_ms".to_owned(), "60000".to_owned())]),
             ..bcode_model::ProviderRequestContext::default()
         };
-        let state = test_server_state_with_fake_provider(sessions);
+        let state = Arc::new(test_server_state_with_fake_provider(sessions));
         state.session_model_selections.lock().await.insert(
             session_id,
             SessionModelSelection {
@@ -96531,8 +96858,11 @@ event_symbol = "bcode_plugin_handle_event_v1"
                 )
                 .await
                 .expect("trigger");
-            let mut state = test_server_state_with_fake_provider(sessions);
-            state.metrics = metrics;
+            let state = Arc::new({
+                let mut state = test_server_state_with_fake_provider(sessions);
+                state.metrics = metrics;
+                state
+            });
             state.session_model_selections.lock().await.insert(
                 session_id,
                 SessionModelSelection {
@@ -98692,10 +99022,13 @@ event_symbol = "bcode_plugin_handle_event_v1"
             )
             .await
             .expect("append trigger event");
-        let mut state = test_server_state_with_fake_provider(sessions);
-        isolate_compaction_request_fixture(&mut state);
-        state.startup_config.system_prompt.mode = bcode_config::SystemPromptMode::Replace;
-        state.startup_config.system_prompt.text = Some("request-only managed canary".into());
+        let state = Arc::new({
+            let mut state = test_server_state_with_fake_provider(sessions);
+            isolate_compaction_request_fixture(&mut state);
+            state.startup_config.system_prompt.mode = bcode_config::SystemPromptMode::Replace;
+            state.startup_config.system_prompt.text = Some("request-only managed canary".into());
+            state
+        });
         let mut provider_context = bcode_model::ProviderRequestContext {
             settings: BTreeMap::from([("fake_managed_compaction".to_string(), "true".to_string())]),
             ..bcode_model::ProviderRequestContext::default()
@@ -98900,12 +99233,15 @@ event_symbol = "bcode_plugin_handle_event_v1"
             )
             .await
             .expect("append trigger event");
-        let mut state = test_server_state_with_fake_provider(sessions);
-        state.startup_config.model.compaction.mode = bcode_config::CompactionMode::Proactive;
-        state.selected_provider_context.settings.insert(
-            "fake_unknown_context_window".to_string(),
-            "true".to_string(),
-        );
+        let state = Arc::new({
+            let mut state = test_server_state_with_fake_provider(sessions);
+            state.startup_config.model.compaction.mode = bcode_config::CompactionMode::Proactive;
+            state.selected_provider_context.settings.insert(
+                "fake_unknown_context_window".to_string(),
+                "true".to_string(),
+            );
+            state
+        });
         state.session_model_selections.lock().await.insert(
             session_id,
             SessionModelSelection {
@@ -99024,13 +99360,16 @@ event_symbol = "bcode_plugin_handle_event_v1"
             )
             .await
             .expect("append trigger event");
-        let mut state = test_server_state_with_fake_provider(sessions);
-        state.startup_config.model.compaction.mode = bcode_config::CompactionMode::OnOverflow;
-        state.startup_config.model.compaction.backend = bcode_config::CompactionBackend::Local;
-        state
-            .selected_provider_context
-            .settings
-            .insert("fake_max_tokens_once".to_owned(), "true".to_owned());
+        let state = Arc::new({
+            let mut state = test_server_state_with_fake_provider(sessions);
+            state.startup_config.model.compaction.mode = bcode_config::CompactionMode::OnOverflow;
+            state.startup_config.model.compaction.backend = bcode_config::CompactionBackend::Local;
+            state
+                .selected_provider_context
+                .settings
+                .insert("fake_max_tokens_once".to_owned(), "true".to_owned());
+            state
+        });
         state.session_model_selections.lock().await.insert(
             session_id,
             SessionModelSelection {
@@ -99193,14 +99532,17 @@ event_symbol = "bcode_plugin_handle_event_v1"
             )
             .await
             .expect("append trigger event");
-        let mut state = test_server_state_with_fake_provider(sessions);
-        state.startup_config.model.compaction.mode = bcode_config::CompactionMode::OnOverflow;
-        state.startup_config.model.compaction.backend = bcode_config::CompactionBackend::Local;
-        state.startup_config.model.compaction.keep_recent_tokens = 1;
-        state
-            .selected_provider_context
-            .settings
-            .insert("fake_context_overflow_once".to_string(), "true".to_string());
+        let state = Arc::new({
+            let mut state = test_server_state_with_fake_provider(sessions);
+            state.startup_config.model.compaction.mode = bcode_config::CompactionMode::OnOverflow;
+            state.startup_config.model.compaction.backend = bcode_config::CompactionBackend::Local;
+            state.startup_config.model.compaction.keep_recent_tokens = 1;
+            state
+                .selected_provider_context
+                .settings
+                .insert("fake_context_overflow_once".to_string(), "true".to_string());
+            state
+        });
         state.session_model_selections.lock().await.insert(
             session_id,
             SessionModelSelection {
@@ -99344,40 +99686,42 @@ event_symbol = "bcode_plugin_handle_event_v1"
             )
             .await
             .expect("append trigger event");
-        let mut state = test_server_state_with_fake_provider(sessions);
-        state.selected_provider_plugin_id = Some("bcode.fake-provider".to_owned());
-        state.selected_model_id = Some("fake-echo".to_owned());
-        state.selected_provider_context.settings.insert(
-            "fake_compaction_summary".to_owned(),
-            "Older context contains fourteen synthetic historical user/assistant pairs, indexed 0 through 13, with repeated x/y padding. No tools, file changes, or validation were recorded in those pairs.".to_owned(),
-        );
-        state
-            .startup_config
-            .system_prompt
-            .sections
-            .repository_context = false;
-        state
-            .startup_config
-            .system_prompt
-            .sections
-            .repository_invariants = false;
-        state
-            .startup_config
-            .system_prompt
-            .sections
-            .dynamic_repository_context = false;
-        // The small fake model tests history compaction, not a machine-dependent skill catalog
-        // retained in the protected current-turn environment snapshot.
-        state.startup_config.system_prompt.sections.skill_catalog = false;
-        state.startup_config.model.compaction.mode = bcode_config::CompactionMode::Proactive;
-        state.startup_config.model.compaction.backend = bcode_config::CompactionBackend::Local;
-        state
-            .startup_config
-            .model
-            .compaction
-            .proactive_threshold_percent = 90;
-        state.startup_config.model.compaction.keep_recent_tokens = 1;
-
+        let state = Arc::new({
+            let mut state = test_server_state_with_fake_provider(sessions);
+            state.selected_provider_plugin_id = Some("bcode.fake-provider".to_owned());
+            state.selected_model_id = Some("fake-echo".to_owned());
+            state.selected_provider_context.settings.insert(
+                "fake_compaction_summary".to_owned(),
+                "Older context contains fourteen synthetic historical user/assistant pairs, indexed 0 through 13, with repeated x/y padding. No tools, file changes, or validation were recorded in those pairs.".to_owned(),
+            );
+            state
+                .startup_config
+                .system_prompt
+                .sections
+                .repository_context = false;
+            state
+                .startup_config
+                .system_prompt
+                .sections
+                .repository_invariants = false;
+            state
+                .startup_config
+                .system_prompt
+                .sections
+                .dynamic_repository_context = false;
+            // The small fake model tests history compaction, not a machine-dependent skill catalog
+            // retained in the protected current-turn environment snapshot.
+            state.startup_config.system_prompt.sections.skill_catalog = false;
+            state.startup_config.model.compaction.mode = bcode_config::CompactionMode::Proactive;
+            state.startup_config.model.compaction.backend = bcode_config::CompactionBackend::Local;
+            state
+                .startup_config
+                .model
+                .compaction
+                .proactive_threshold_percent = 90;
+            state.startup_config.model.compaction.keep_recent_tokens = 1;
+            state
+        });
         let mut permit = SessionTurnPermit::new(session_id);
         let (_followup_tx, mut followup_rx) = mpsc::channel(1);
         let (_steering_tx, mut steering_rx) = mpsc::channel(1);
@@ -99975,9 +100319,12 @@ event_symbol = "bcode_plugin_handle_event_v1"
             )
             .await
             .expect("trigger");
-        let mut state = test_server_state_with_fake_provider(sessions);
-        state.startup_config.model.compaction.mode = bcode_config::CompactionMode::Proactive;
-        state.startup_config.model.compaction.keep_recent_tokens = 1;
+        let state = Arc::new({
+            let mut state = test_server_state_with_fake_provider(sessions);
+            state.startup_config.model.compaction.mode = bcode_config::CompactionMode::Proactive;
+            state.startup_config.model.compaction.keep_recent_tokens = 1;
+            state
+        });
         let provider_context = bcode_model::ProviderRequestContext {
             settings: BTreeMap::from([
                 (
@@ -100901,7 +101248,9 @@ event_symbol = "bcode_plugin_handle_event_v1"
             )
             .await
             .expect("trigger");
-        let state = test_server_state_with_fake_provider_and_filesystem(sessions);
+        let state = Arc::new(test_server_state_with_fake_provider_and_filesystem(
+            sessions,
+        ));
         let provider_context = bcode_model::ProviderRequestContext {
             settings: BTreeMap::from([
                 ("fake_tool_rounds".to_string(), "1".to_string()),
@@ -101017,7 +101366,9 @@ event_symbol = "bcode_plugin_handle_event_v1"
             )
             .await
             .expect("trigger");
-        let state = test_server_state_with_fake_provider_and_filesystem(sessions);
+        let state = Arc::new(test_server_state_with_fake_provider_and_filesystem(
+            sessions,
+        ));
         let provider_context = bcode_model::ProviderRequestContext {
             settings: BTreeMap::from([
                 ("fake_tool_rounds".to_string(), "1".to_string()),
@@ -101174,11 +101525,14 @@ event_symbol = "bcode_plugin_handle_event_v1"
             )
             .await
             .expect("trigger");
-        let mut state = test_server_state_with_fake_provider_and_filesystem(sessions);
-        state.selected_provider_context.settings.insert(
-            "fake_malformed_structured_output".to_string(),
-            "once".to_string(),
-        );
+        let state = Arc::new({
+            let mut state = test_server_state_with_fake_provider_and_filesystem(sessions);
+            state.selected_provider_context.settings.insert(
+                "fake_malformed_structured_output".to_string(),
+                "once".to_string(),
+            );
+            state
+        });
 
         let completion = run_test_model_turn(
             &state,
@@ -101257,7 +101611,9 @@ event_symbol = "bcode_plugin_handle_event_v1"
             )
             .await
             .expect("trigger");
-        let state = test_server_state_with_fake_provider_and_filesystem(sessions);
+        let state = Arc::new(test_server_state_with_fake_provider_and_filesystem(
+            sessions,
+        ));
         let mut provider_context = state.selected_provider_context.clone();
         provider_context.settings.insert(
             "fake_malformed_structured_output".to_string(),
@@ -101454,7 +101810,7 @@ event_symbol = "bcode_plugin_handle_event_v1"
             .await
             .expect("session")
             .id;
-        let state = test_server_state_with_fake_provider(sessions);
+        let state = Arc::new(test_server_state_with_fake_provider(sessions));
         let execution = bcode_session_models::TurnExecutionOptions {
             tools: bcode_session_models::TurnToolPolicy::Disabled,
             permission_mode: bcode_session_models::TurnPermissionMode::Enforce,
@@ -101547,7 +101903,9 @@ event_symbol = "bcode_plugin_handle_event_v1"
             )
             .await
             .expect("trigger");
-        let state = test_server_state_with_fake_provider_and_filesystem(sessions);
+        let state = Arc::new(test_server_state_with_fake_provider_and_filesystem(
+            sessions,
+        ));
         let provider_context = bcode_model::ProviderRequestContext {
             settings: BTreeMap::from([
                 ("fake_tool_rounds".to_string(), "1".to_string()),
@@ -101713,8 +102071,11 @@ event_symbol = "bcode_plugin_handle_event_v1"
             )
             .await
             .expect("trigger");
-        let mut state = test_server_state_with_fake_provider(sessions);
-        isolate_compaction_budget_fixture(&mut state);
+        let state = Arc::new({
+            let mut state = test_server_state_with_fake_provider(sessions);
+            isolate_compaction_budget_fixture(&mut state);
+            state
+        });
         // fake-echo otherwise repeats the entire compaction transcript rather than summarizing
         // it. Pin only the compaction response; ordinary missing-tool rounds remain unscripted.
         let provider_context = repeated_tool_compaction_context();
@@ -103988,7 +104349,7 @@ event_symbol = "bcode_plugin_handle_event_v1"
             )
             .await
             .expect("session");
-        let state = test_server_state_with_shell_plugin(sessions);
+        let state = Arc::new(test_server_state_with_shell_plugin(sessions));
         let call = bcode_model::ToolCall {
             id: "cancelled-bypass".to_owned(),
             name: "shell.run".to_owned(),

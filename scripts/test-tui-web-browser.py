@@ -7,13 +7,14 @@ loopback port. No daemon, provider, credentials, or user session is involved.
 
 import argparse
 import functools
+import html
+import importlib.util
 import hashlib
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import json
 import mimetypes
 from pathlib import Path
 import re
-import subprocess
 import tempfile
 import threading
 from urllib.parse import urlsplit
@@ -78,22 +79,27 @@ def main():
     assets, identity = verified_assets(args.bundle.resolve())
     root = Path(__file__).resolve().parent.parent
     assets["/smoke.html"] = (root / "packages/tui-web/tests/chromium-smoke.html").read_bytes()
+    assets["/semantics.html"] = (root / "packages/tui-web/tests/committed-semantics.html").read_bytes()
+    spec = importlib.util.spec_from_file_location('production_browser_runner', root / 'scripts/test-tui-web-e2e.py')
+    runner = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(runner)
     server = ThreadingHTTPServer(("127.0.0.1", 0), functools.partial(FixtureHandler, assets=assets))
     thread = threading.Thread(target=server.serve_forever, daemon=True)
     thread.start()
     try:
         with tempfile.TemporaryDirectory(prefix="bcode-wasm-chromium-") as profile:
             command = [str(args.chromium), "--headless", "--disable-gpu", "--no-first-run",
-                       f"--user-data-dir={profile}", "--dump-dom", "--timeout=20000",
-                       "--virtual-time-budget=10000"]
+                       f"--user-data-dir={profile}"]
             if args.no_sandbox:
                 command.append("--no-sandbox")
-            command.append(f"http://127.0.0.1:{server.server_port}/smoke.html")
-            result = subprocess.run(command, capture_output=True, text=True, timeout=45, check=True)
-        match = re.search(r'<pre id="result">([^<]*)</pre>', result.stdout)
-        if match is None or not match[1].startswith("PASS "):
-            raise RuntimeError(match[1] if match else "browser did not report a result")
-        print(f"{match[1]}\nartifact sha256:{identity}")
+            for fixture in ('smoke.html', 'semantics.html'):
+                dom = runner.browser_dom(command, f'http://127.0.0.1:{server.server_port}/{fixture}')
+                match = re.search(r'<pre id="result">([^<]*)</pre>', dom)
+                message = html.unescape(match[1]) if match else 'browser did not report a result'
+                if not message.startswith('PASS '):
+                    raise RuntimeError(message)
+                print(message)
+        print(f"artifact sha256:{identity}")
     finally:
         server.shutdown()
         server.server_close()

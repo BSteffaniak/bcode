@@ -38,6 +38,30 @@ impl<W: Write> TerminalCleanWriter<W> {
         Ok(())
     }
 
+    /// Capture a bounded semantic preview without consuming or flushing live state.
+    /// Terminal parsing remains producer-native; consumers receive plain text only.
+    pub fn snapshot(&self) -> TerminalCleanSummary {
+        let mut tail = ByteTail::new(self.performer.tail.max_bytes);
+        tail.push(self.performer.tail.text().as_bytes());
+        let mut bytes = self.performer.bytes_written;
+        let last = self
+            .performer
+            .lines
+            .iter()
+            .rposition(|line| !line.is_empty());
+        for line in self.performer.lines.iter().take(last.map_or(0, |i| i + 1)) {
+            let text = line.text();
+            tail.push(text.as_bytes());
+            tail.push(b"\n");
+            bytes = bytes.saturating_add(text.len() as u64).saturating_add(1);
+        }
+        TerminalCleanSummary {
+            bytes_written: bytes,
+            tail: tail.text(),
+            tail_truncated: self.performer.tail.truncated || tail.truncated,
+        }
+    }
+
     /// Flush all remaining visible terminal state and return the normalized summary.
     pub fn finish(mut self) -> io::Result<TerminalCleanSummary> {
         self.performer.flush_all()?;
@@ -461,6 +485,24 @@ impl ByteTail {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn semantic_snapshot_is_non_consuming_plain_and_bounded() {
+        let mut output = Vec::new();
+        let mut cleaner = super::TerminalCleanWriter::new(&mut output, 80, 24, 128);
+        cleaner
+            .write_chunk(b"loading 1\rloading 2\x1b[31m red\x1b[0m")
+            .unwrap();
+        let first = cleaner.snapshot();
+        assert!(first.tail.contains("loading 2 red"));
+        assert!(!first.tail.contains('\u{1b}'));
+        assert_eq!(first, cleaner.snapshot());
+        cleaner.write_chunk(b"\nfinished\n").unwrap();
+        let final_snapshot = cleaner.snapshot();
+        let final_output = cleaner.finish().unwrap();
+        assert_eq!(final_snapshot, final_output);
+        assert!(final_output.tail.len() <= 128);
+    }
+
     use super::*;
 
     fn clean(chunks: &[&[u8]]) -> TerminalCleanSummary {

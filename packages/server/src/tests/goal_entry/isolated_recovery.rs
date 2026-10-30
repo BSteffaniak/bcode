@@ -1,5 +1,156 @@
 //! Scripted model choices through goal entry, registered worker execution and real Git recovery.
 use super::*;
+use bcode_session_models::SessionEventKind as Kind;
+use futures::FutureExt as _;
+
+// Diagnostics only: neither history nor observations authorize recovery.
+// Keep the bounded event read and stage-pair interpretation together for this diagnostic.
+#[allow(clippy::too_many_lines)]
+async fn log_recovery_progress(
+    state: &ServerState,
+    run_id: &str,
+    parent: SessionId,
+    started: Instant,
+    previous_attempts: &mut Vec<bcode_workflow::AttemptSummary>,
+    sequences: &mut BTreeMap<SessionId, (u64, BTreeMap<String, u64>)>,
+) {
+    let read_started = Instant::now();
+    let (attempts, links) = {
+        let store = state.workflow_store.lock().unwrap();
+        (
+            store.attempt_history(run_id, None, 32).unwrap(),
+            store.execution_session_links_for_run(run_id, 8).unwrap(),
+        )
+    };
+    for attempt in &attempts {
+        if !previous_attempts.contains(attempt) {
+            eprintln!(
+                "isolated recovery +{:?} attempt={attempt:?} prepare_to_admit_ms={:?} admit_to_terminal_ms={:?}",
+                started.elapsed(),
+                attempt
+                    .admitted_at_ms
+                    .map(|end| end.saturating_sub(attempt.prepared_at_ms)),
+                attempt
+                    .terminal_at_ms
+                    .zip(attempt.admitted_at_ms)
+                    .map(|(end, begin)| end.saturating_sub(begin)),
+            );
+        }
+    }
+    *previous_attempts = attempts;
+    eprintln!(
+        "isolated recovery +{:?} attempt/link read took {:?}",
+        started.elapsed(),
+        read_started.elapsed()
+    );
+    let mut sessions = BTreeSet::from([parent]);
+    sessions.extend(
+        links
+            .iter()
+            .map(|link| link.session_id.parse::<SessionId>().unwrap()),
+    );
+    for session_id in sessions {
+        let read_started = Instant::now();
+        eprintln!(
+            "isolated recovery +{:?} history begin session={session_id}",
+            started.elapsed()
+        );
+        let page = state
+            .sessions
+            .session_history_page(
+                session_id,
+                bcode_session_models::SessionHistoryQuery {
+                    cursor: None,
+                    limit: 16,
+                    direction: bcode_session_models::SessionHistoryDirection::Backward,
+                },
+            )
+            .await;
+        eprintln!(
+            "isolated recovery +{:?} history end session={session_id} took {:?}",
+            started.elapsed(),
+            read_started.elapsed()
+        );
+        match page {
+            Ok(page) => {
+                let (previous, stages) = sequences.entry(session_id).or_default();
+                let mut events = page.events;
+                events.sort_by_key(|event| event.sequence);
+                if let Some(first) = events.first()
+                    && first.sequence > previous.saturating_add(1)
+                {
+                    eprintln!(
+                        "isolated recovery session={session_id} bounded tail gap after={} resumes_at={}; missing stage durations are unknown",
+                        *previous, first.sequence
+                    );
+                    stages.clear();
+                }
+                for event in events {
+                    if event.sequence <= *previous {
+                        continue;
+                    }
+                    // No arguments, tool results, model text, or provider errors in diagnostics.
+                    eprintln!(
+                        "isolated recovery +{:?} committed session={session_id} sequence={} timestamp_ms={} kind={}",
+                        started.elapsed(),
+                        event.sequence,
+                        event.timestamp_ms,
+                        bcode_session_models::persisted_session_event_kind_name(&event.kind),
+                    );
+                    let (key, begin) = match &event.kind {
+                        Kind::ModelTurnStarted { turn_id } => {
+                            (Some(format!("model:{turn_id}")), true)
+                        }
+                        Kind::ModelTurnFinished { turn_id, .. } => {
+                            (Some(format!("model:{turn_id}")), false)
+                        }
+                        Kind::RuntimeWorkStarted { work_id, .. } => {
+                            (Some(format!("runtime:{work_id}")), true)
+                        }
+                        Kind::RuntimeWorkFinished { work_id, .. } => {
+                            (Some(format!("runtime:{work_id}")), false)
+                        }
+                        Kind::PermissionRequested { permission_id, .. } => {
+                            (Some(format!("permission:{permission_id}")), true)
+                        }
+                        Kind::PermissionResolved { permission_id, .. } => {
+                            (Some(format!("permission:{permission_id}")), false)
+                        }
+                        Kind::ToolCallRequested { tool_call_id, .. } => {
+                            (Some(format!("tool:{tool_call_id}")), true)
+                        }
+                        Kind::ToolInvocationResultRecorded { record } => {
+                            (Some(format!("tool:{}", record.invocation_id)), false)
+                        }
+                        _ => (None, false),
+                    };
+                    if let Some(key) = key {
+                        if begin {
+                            // Incomplete pairs (including dropped tail events) remain explicit.
+                            if stages.len() < 32 {
+                                stages.insert(key.clone(), event.timestamp_ms);
+                            }
+                            eprintln!(
+                                "isolated recovery stage begin {key} timestamp_ms={}",
+                                event.timestamp_ms
+                            );
+                        } else {
+                            let duration = stages
+                                .remove(&key)
+                                .map(|begin| event.timestamp_ms.saturating_sub(begin));
+                            eprintln!(
+                                "isolated recovery stage end {key} timestamp_ms={} committed_duration_ms={duration:?}",
+                                event.timestamp_ms
+                            );
+                        }
+                    }
+                    *previous = event.sequence;
+                }
+            }
+            Err(_) => eprintln!("isolated recovery history unavailable session={session_id}"),
+        }
+    }
+}
 
 fn git(root: &Path, args: &[&str]) -> String {
     let output = std::process::Command::new("git")
@@ -152,6 +303,8 @@ fn prepare_source(root: &Path) -> String {
 }
 
 #[tokio::test]
+// The real Git scenario and its owned teardown form one sequential acceptance test.
+#[allow(clippy::too_many_lines)]
 async fn goal_workers_recover_real_git_conflict_in_isolated_integration_checkout() {
     let _execution = GOAL_ENTRY_EXECUTION.lock().await;
     let root = tempfile::tempdir().unwrap();
@@ -179,6 +332,9 @@ async fn goal_workers_recover_real_git_conflict_in_isolated_integration_checkout
     ));
     configure_goal_execution(Arc::get_mut(&mut state).unwrap(), root.path());
     state.start_workflow_driver().await;
+
+    let started = Instant::now();
+    let outcome = std::panic::AssertUnwindSafe(Box::pin(async {
     let request = goal_entry_request_with_workspace(
         session.id,
         root.path(),
@@ -188,15 +344,32 @@ async fn goal_workers_recover_real_git_conflict_in_isolated_integration_checkout
     )
     .await;
     let run_id = request.run_id.unwrap();
+    let mut previous_attempts = Vec::new();
+    let mut sequences = BTreeMap::new();
+    let mut last_diagnostic = None;
     tokio::time::timeout(Duration::from_mins(1), async {
         loop {
+            let diagnostic = last_diagnostic.is_none_or(|last: Instant| last.elapsed() >= Duration::from_secs(1));
+            let permission_started = Instant::now();
+            if diagnostic {
+                eprintln!("isolated recovery +{:?} permission poll begin", started.elapsed());
+            }
             approve_goal_permissions(&state, session.id).await;
+            if diagnostic {
+                eprintln!("isolated recovery +{:?} permission poll end took {:?}; validated_outputs begin", started.elapsed(), permission_started.elapsed());
+            }
+            let output_started = Instant::now();
             let outputs = state
                 .workflow_store
                 .lock()
                 .unwrap()
                 .validated_outputs(&run_id, 100)
                 .unwrap();
+            if diagnostic {
+                eprintln!("isolated recovery +{:?} validated_outputs end took {:?}", started.elapsed(), output_started.elapsed());
+                log_recovery_progress(&state, &run_id, session.id, started, &mut previous_attempts, &mut sequences).await;
+                last_diagnostic = Some(Instant::now());
+            }
             if let Some(evaluation) = outputs
                 .iter()
                 .find(|output| output.node_id == "loop.evaluation")
@@ -241,7 +414,26 @@ async fn goal_workers_recover_real_git_conflict_in_isolated_integration_checkout
         }).collect::<Vec<_>>();
         panic!("isolated goal recovery must reach evaluation: {error}; terminal_present: {}; output_facts: {output_facts:?}; failures: {failure_facts:?}; attempts: {attempts:?}", terminal.is_some());
     });
+    }))
+    .catch_unwind()
+    .await;
+    let cleanup_started = Instant::now();
+    eprintln!(
+        "isolated recovery +{:?} owned shutdown begin",
+        started.elapsed()
+    );
+    let cleanup = Box::pin(shutdown_constructed_server(Arc::clone(&state), Ok(()))).await;
+    eprintln!(
+        "isolated recovery +{:?} owned shutdown end took {:?}; success={}",
+        started.elapsed(),
+        cleanup_started.elapsed(),
+        cleanup.is_ok()
+    );
     drop(state);
+    if let Err(panic) = outcome {
+        std::panic::resume_unwind(panic);
+    }
+    cleanup.expect("isolated recovery owned runtime shutdown");
     assert_eq!(git(root.path(), &["rev-parse", "HEAD"]), base);
     assert_eq!(git(root.path(), &status_args), source_status);
     assert_eq!(git(root.path(), &["diff", "--cached"]), source_index);

@@ -17,8 +17,9 @@ mod transcript;
 mod wasm;
 
 pub use policy::{
-    BrowserBinding, BrowserDelete, BrowserEditorCommand, BrowserMotion, BrowserPolicy,
-    BrowserResolvedBinding, BrowserStroke, BrowserStyle,
+    BrowserBinding, BrowserDelete, BrowserEditorCommand, BrowserInteraction, BrowserMotion,
+    BrowserMultiTap, BrowserPolicy, BrowserResolvedBinding, BrowserStroke, BrowserStyle,
+    BrowserVisualPolicy, InteractionPlacement, OffscreenFocus,
 };
 pub use snapshot::{MAX_REQUEST_BYTES, MAX_RESPONSE_BYTES, SnapshotState};
 pub use surface::SessionSurface;
