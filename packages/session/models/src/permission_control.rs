@@ -81,16 +81,15 @@ pub struct ConditionalPermissionDecision {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
 pub enum ConditionalPermissionResult {
-    /// Exact set atomically claimed; normal canonical completion follows.
+    /// Complete set committed before any approval waiter is released.
     Resolved {
         /// Number successfully completed by the permission owner.
         resolved: usize,
     },
-    /// Atomic durable batch approval is unavailable. No checkpoint was claimed
-    /// or decision latched; callers must not fall back to sequential approval.
+    /// Retained for decoding older servers; current servers commit batch approval atomically.
     BatchApprovalUnavailable,
-    /// Exact set was claimed, but canonical completion failed. No batch member
-    /// is released with approval; inspect fresh state before any further action.
+    /// Canonical completion failed or its outcome could not be verified. Inspect
+    /// fresh state before acting again; this result is not a retry receipt.
     CompletionFailed,
     /// Identity, payload, destination, membership or pending state changed. No decision latched.
     Stale,

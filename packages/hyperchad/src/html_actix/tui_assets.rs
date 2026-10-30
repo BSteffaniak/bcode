@@ -19,10 +19,25 @@ pub const TUI_ASSET_FILES: [&str; 7] = [
 const MAX_ASSET_BYTES: u64 = 64 * 1024 * 1024;
 const MAX_DISTRIBUTION_BYTES: usize = 96 * 1024 * 1024;
 
+#[derive(serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct BrowserProtocol {
+    session_view: u16,
+    browser_bridge: u16,
+    canvas: u16,
+}
+
+impl BrowserProtocol {
+    fn supported(&self) -> bool {
+        self.session_view == 1 && self.browser_bridge == 1 && self.canvas == 1
+    }
+}
+
 #[derive(serde::Deserialize)]
 struct AssetManifest {
     schema_version: u16,
     artifact_sha256: String,
+    protocol: BrowserProtocol,
     files: std::collections::BTreeMap<String, AssetDigest>,
 }
 
@@ -46,7 +61,7 @@ fn sha256(bytes: &[u8]) -> String {
         .collect()
 }
 
-fn validate_manifest(files: &[(&str, Vec<u8>)]) -> Result<(), String> {
+fn validate_manifest(files: &[(&str, Vec<u8>)]) -> Result<AssetManifest, String> {
     let manifest_bytes = files
         .iter()
         .find(|(name, _)| *name == "manifest.json")
@@ -57,7 +72,10 @@ fn validate_manifest(files: &[(&str, Vec<u8>)]) -> Result<(), String> {
     }
     let manifest: AssetManifest =
         serde_json::from_slice(manifest_bytes).map_err(|_| "invalid TUI asset manifest")?;
-    if manifest.schema_version != 1 || manifest.files.len() != TUI_ASSET_FILES.len() - 1 {
+    if manifest.schema_version != 2
+        || !manifest.protocol.supported()
+        || manifest.files.len() != TUI_ASSET_FILES.len() - 1
+    {
         return Err("unsupported or incomplete TUI asset manifest".to_owned());
     }
     // Match the builder's canonical sorted, compact JSON bytes (keys bytes, sha256).
@@ -79,13 +97,14 @@ fn validate_manifest(files: &[(&str, Vec<u8>)]) -> Result<(), String> {
     if manifest.artifact_sha256 != sha256(&canonical) {
         return Err("TUI artifact identity mismatch".to_owned());
     }
-    Ok(())
+    Ok(manifest)
 }
 
 /// Fully loaded distribution; files cannot change between validation and serving.
 #[derive(Debug)]
 pub struct TuiAssets {
     files: Vec<(&'static str, Vec<u8>)>,
+    compatibility: Vec<u8>,
 }
 
 impl TuiAssets {
@@ -106,8 +125,15 @@ impl TuiAssets {
         let mut files = Vec::with_capacity(TUI_ASSET_FILES.len());
         let mut total = 0_usize;
         for name in TUI_ASSET_FILES {
-            let path = root
-                .join(name)
+            let source = root.join(name);
+            let source_metadata = std::fs::symlink_metadata(&source)
+                .map_err(|_| format!("missing TUI asset: {name}"))?;
+            if !source_metadata.file_type().is_file() {
+                return Err(format!(
+                    "TUI assets must be regular, unlinked files: {name}"
+                ));
+            }
+            let path = source
                 .canonicalize()
                 .map_err(|_| format!("missing TUI asset: {name}"))?;
             if !path.starts_with(&root) {
@@ -146,13 +172,29 @@ impl TuiAssets {
             }
             files.push((name, bytes));
         }
-        validate_manifest(&files)?;
-        Ok(Self { files })
+        let manifest = validate_manifest(&files)?;
+        let compatibility = serde_json::to_vec(&serde_json::json!({
+            "schema_version": 1,
+            "artifact_sha256": manifest.artifact_sha256,
+            "protocol": manifest.protocol,
+        }))
+        .map_err(|_| "cannot encode TUI compatibility handshake")?;
+        Ok(Self {
+            files,
+            compatibility,
+        })
     }
 
     /// Mount only the validated concrete files, preserving the default HTML renderer.
     #[must_use]
     pub fn with_routes(self, mut builder: AppBuilder) -> AppBuilder {
+        for prefix in ["tui", "tui/v1"] {
+            builder = builder.with_static_asset_route(StaticAssetRoute {
+                route: format!("{prefix}/compatibility.json"),
+                target: AssetPathTarget::FileContents(self.compatibility.clone().into()),
+                not_found_behavior: None,
+            });
+        }
         for (name, bytes) in self.files {
             // The explicit .html entry gives the static renderer a truthful MIME type.
             // Mirror the concrete files here so relative bootstrap/module URLs work.
@@ -203,7 +245,8 @@ mod tests {
             );
         }
         let manifest = serde_json::json!({
-            "schema_version": 1,
+            "schema_version": 2,
+            "protocol": {"session_view": 1, "browser_bridge": 1, "canvas": 1},
             "artifact_sha256": sha256(&serde_json::to_vec(&digests).unwrap()),
             "files": digests,
         });
@@ -238,8 +281,47 @@ mod tests {
         let path = directory.path().join("manifest.json");
         let mut manifest: serde_json::Value =
             serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
-        manifest["schema_version"] = 2.into();
+        manifest["schema_version"] = 3.into();
         std::fs::write(path, serde_json::to_vec(&manifest).unwrap()).unwrap();
+        assert!(TuiAssets::load(directory.path()).is_err());
+    }
+
+    #[test]
+    fn rejects_mixed_protocols_and_missing_handshake() {
+        for field in ["session_view", "browser_bridge", "canvas"] {
+            let directory = distribution();
+            let path = directory.path().join("manifest.json");
+            let mut manifest: serde_json::Value =
+                serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+            manifest["protocol"][field] = 2.into();
+            std::fs::write(path, serde_json::to_vec(&manifest).unwrap()).unwrap();
+            assert!(TuiAssets::load(directory.path()).is_err(), "{field}");
+        }
+        let directory = distribution();
+        let path = directory.path().join("manifest.json");
+        let mut manifest: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        manifest.as_object_mut().unwrap().remove("protocol");
+        std::fs::write(path, serde_json::to_vec(&manifest).unwrap()).unwrap();
+        assert!(TuiAssets::load(directory.path()).is_err());
+    }
+
+    #[test]
+    fn compatibility_is_derived_from_verified_bytes() {
+        let directory = distribution();
+        let loaded = TuiAssets::load(directory.path()).unwrap();
+        let handshake: serde_json::Value = serde_json::from_slice(&loaded.compatibility).unwrap();
+        let manifest: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(directory.path().join("manifest.json")).unwrap())
+                .unwrap();
+        assert_eq!(handshake["artifact_sha256"], manifest["artifact_sha256"]);
+        assert_eq!(handshake["protocol"], manifest["protocol"]);
+        assert_eq!(handshake["schema_version"], 1);
+        std::fs::write(
+            directory.path().join("browser-session.js"),
+            b"mixed release",
+        )
+        .unwrap();
         assert!(TuiAssets::load(directory.path()).is_err());
     }
 
@@ -260,6 +342,16 @@ mod tests {
         let outside = tempfile::NamedTempFile::new().unwrap();
         std::fs::remove_file(directory.path().join("bootstrap.js")).unwrap();
         std::os::unix::fs::symlink(outside.path(), directory.path().join("bootstrap.js")).unwrap();
+        assert!(TuiAssets::load(directory.path()).is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn rejects_links_even_within_distribution() {
+        let directory = distribution();
+        std::fs::remove_file(directory.path().join("bootstrap.js")).unwrap();
+        std::os::unix::fs::symlink("browser-session.js", directory.path().join("bootstrap.js"))
+            .unwrap();
         assert!(TuiAssets::load(directory.path()).is_err());
     }
 

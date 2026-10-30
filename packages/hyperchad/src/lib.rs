@@ -47,6 +47,7 @@ const WATCH_RECONNECT_DELAY: std::time::Duration = std::time::Duration::from_mil
 #[derive(Clone)]
 pub struct HyperChadAppState {
     browser_api: Arc<tokio::sync::Mutex<browser_api::BrowserApiState>>,
+    browser_policy: String,
     client: BcodeClient,
     access_token: Arc<str>,
     launch_working_directory: Arc<std::path::PathBuf>,
@@ -480,6 +481,7 @@ impl HyperChadAppState {
             browser_api: Arc::new(tokio::sync::Mutex::new(
                 browser_api::BrowserApiState::default(),
             )),
+            browser_policy: String::new(),
             client,
             access_token: access_token.into(),
             launch_working_directory: Arc::new(launch_working_directory),
@@ -491,6 +493,37 @@ impl HyperChadAppState {
             streaming_presentation_policy: streaming_presentation_policy.normalized(),
             renderer_tx: Arc::new(Mutex::new(None)),
         }
+    }
+
+    /// Install a bounded presentation policy exported by the native TUI adapter.
+    ///
+    /// An empty policy leaves browser defaults in effect for standalone hosts.
+    /// # Errors
+    /// Returns an error for oversized, malformed or unsupported policy envelopes.
+    pub fn with_browser_policy(mut self, policy: String) -> Result<Self, &'static str> {
+        if policy.len() > 64 * 1024 {
+            return Err("browser presentation policy exceeds bounds");
+        }
+        let value: serde_json::Value =
+            serde_json::from_str(&policy).map_err(|_| "invalid browser presentation policy")?;
+        if value
+            .get("schema_version")
+            .and_then(serde_json::Value::as_u64)
+            != Some(1)
+            || !value
+                .get("styles")
+                .is_some_and(serde_json::Value::is_object)
+            || !value
+                .get("bindings")
+                .is_some_and(serde_json::Value::is_array)
+            || !value
+                .get("revision")
+                .is_some_and(serde_json::Value::is_string)
+        {
+            return Err("unsupported browser presentation policy");
+        }
+        self.browser_policy = policy;
+        Ok(self)
     }
 
     #[cfg(feature = "renderer-html-actix")]

@@ -872,6 +872,7 @@ async fn handle_cli(cli: Cli) -> Result<(), CliError> {
             port,
             allow_non_loopback,
             tui_assets,
+            session,
             allowed_browser_origins,
         } => {
             handle_web_command(
@@ -879,6 +880,7 @@ async fn handle_cli(cli: Cli) -> Result<(), CliError> {
                 port,
                 allow_non_loopback,
                 tui_assets.as_deref(),
+                session,
                 &allowed_browser_origins,
             )
             .await?
@@ -4104,15 +4106,43 @@ fn random_web_access_token() -> Result<String, CliError> {
 }
 
 #[cfg(feature = "web-renderer")]
+fn resolve_web_tui_assets(
+    explicit: Option<&std::path::Path>,
+    executable: &std::path::Path,
+) -> Result<Option<std::path::PathBuf>, CliError> {
+    if let Some(explicit) = explicit {
+        return Ok(Some(explicit.to_owned()));
+    }
+    let Some(parent) = executable.parent() else {
+        return Ok(None);
+    };
+    let bundled = parent.join("bcode-runtimes").join("tui");
+    match std::fs::symlink_metadata(&bundled) {
+        Ok(_) => Ok(Some(bundled)),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(CliError::HyperChadRender(format!(
+            "cannot inspect bundled browser TUI: {error}"
+        ))),
+    }
+}
+
+#[cfg(feature = "web-renderer")]
 async fn handle_web_command(
     bind: std::net::IpAddr,
     requested_port: Option<u16>,
     allow_non_loopback: bool,
     tui_assets: Option<&std::path::Path>,
+    session: Option<bcode_session_models::SessionId>,
     allowed_browser_origins: &[String],
 ) -> Result<(), CliError> {
+    // A packaged browser bundle is selected only beside this exact executable,
+    // never from the working directory or a different installed artifact.
+    let executable =
+        std::env::current_exe().map_err(|error| CliError::HyperChadRender(error.to_string()))?;
+    let tui_assets = resolve_web_tui_assets(tui_assets, &executable)?;
     // Validate the entire concrete distribution before daemon discovery or binding.
     let tui_assets = tui_assets
+        .as_deref()
         .map(bcode_hyperchad::TuiAssets::load)
         .transpose()
         .map_err(CliError::HyperChadRender)?;
@@ -4122,13 +4152,23 @@ async fn handle_web_command(
     let port = requested_port.unwrap_or(0);
     let access_token = random_web_access_token()?;
     let config = bcode_config::load_config()?;
+    let browser_policy = bcode_tui::browser_presentation::export_with_plugins(
+        &config,
+        &bcode_ipc::current_working_directory(),
+        &plugin_selection_for_config(&config),
+        &static_bundled_plugins(),
+    )
+    .map_err(CliError::HyperChadRender)?;
     let state =
-        bcode_hyperchad::HyperChadAppState::with_streaming_presentation_policy_in_working_directory(
+        bcode_hyperchad::HyperChadAppState::with_presentation_policies_in_working_directory(
             BcodeClient::default_endpoint(),
             access_token.clone(),
             bcode_ipc::current_working_directory(),
+            bcode_tui::browser_presentation::reasoning_policy(config.tui.thinking),
             config.presentation.streaming.policy(),
-        );
+        )
+        .with_browser_policy(browser_policy)
+        .map_err(|error| CliError::HyperChadRender(error.to_owned()))?;
     let builder = bcode_hyperchad::init(&state).await?;
     let builder = if let Some(assets) = tui_assets {
         assets.with_routes(builder)
@@ -4141,9 +4181,12 @@ async fn handle_web_command(
         .with_actix_port(port)
         .with_actix_on_bound(move |address| {
             let launch_url = if launch_tui {
-                bcode_hyperchad::build_tui_launch_url(address, &launch_token)
+                let url = bcode_hyperchad::build_tui_launch_url(address, &launch_token);
+                // The typed UUID cannot introduce fragment parameters. Keep the
+                // session beside the capability, never in a server access log.
+                session.map_or(url.clone(), |session| format!("{url}&session={session}"))
             } else {
-                bcode_hyperchad::build_launch_url(address, &launch_token, None)
+                bcode_hyperchad::build_launch_url(address, &launch_token, session)
             };
             if open::that_detached(&launch_url).is_err() {
                 eprintln!("Bcode could not open the HyperChad application in a browser.");
@@ -5051,9 +5094,12 @@ enum Commands {
         /// Explicitly allow binding to a non-loopback address.
         #[arg(long, requires = "bind")]
         allow_non_loopback: bool,
-        /// Serve the browser-local WASM TUI from a complete built distribution.
+        /// Override the browser-local WASM TUI distribution bundled beside this executable.
         #[arg(long, value_name = "DIR")]
         tui_assets: Option<std::path::PathBuf>,
+        /// Open a specific session instead of the session picker.
+        #[arg(long)]
+        session: Option<bcode_session_models::SessionId>,
         /// Explicit cross-origin browser read grants (repeatable exact HTTP(S) origins).
         #[arg(long = "allow-browser-origin")]
         allowed_browser_origins: Vec<String>,
@@ -26700,6 +26746,7 @@ mod web_command_tests {
             port,
             allow_non_loopback,
             tui_assets,
+            session,
             allowed_browser_origins,
         }) = cli.command
         else {
@@ -26710,6 +26757,7 @@ mod web_command_tests {
         assert_eq!(port, None);
         assert!(!allow_non_loopback);
         assert_eq!(tui_assets, None);
+        assert_eq!(session, None);
         assert!(allowed_browser_origins.is_empty());
     }
 
@@ -26725,6 +26773,50 @@ mod web_command_tests {
     }
 
     #[cfg(feature = "web-renderer")]
+    #[test]
+    fn web_bundle_discovery_uses_exact_executable_and_preserves_explicit_override() {
+        let directory = tempfile::tempdir().expect("installation");
+        let executable = directory.path().join("bcode");
+        assert_eq!(resolve_web_tui_assets(None, &executable).unwrap(), None);
+        let bundled = directory.path().join("bcode-runtimes/tui");
+        std::fs::create_dir_all(&bundled).expect("bundle directory");
+        assert_eq!(
+            resolve_web_tui_assets(None, &executable).unwrap(),
+            Some(bundled)
+        );
+        let explicit = directory.path().join("explicit");
+        assert_eq!(
+            resolve_web_tui_assets(Some(&explicit), &executable).unwrap(),
+            Some(explicit)
+        );
+    }
+
+    #[cfg(feature = "web-renderer")]
+    #[test]
+    fn web_bundle_discovery_does_not_hide_broken_distributions() {
+        let directory = tempfile::tempdir().expect("installation");
+        let executable = directory.path().join("bcode");
+        let bundled = directory.path().join("bcode-runtimes/tui");
+        std::fs::create_dir_all(bundled.parent().unwrap()).expect("runtime directory");
+        std::fs::write(&bundled, b"not a directory").expect("damaged distribution");
+        let selected = resolve_web_tui_assets(None, &executable).unwrap().unwrap();
+        assert_eq!(selected, bundled);
+        assert!(bcode_hyperchad::TuiAssets::load(&selected).is_err());
+    }
+
+    #[cfg(feature = "web-renderer")]
+    #[test]
+    fn web_command_accepts_only_typed_session_identity() {
+        let session = bcode_session_models::SessionId::new();
+        let cli = Cli::try_parse_from(["bcode", "web", "--session", &session.to_string()])
+            .expect("session launch should parse");
+        assert!(
+            matches!(cli.command, Some(Commands::Web { session: Some(actual), .. }) if actual == session)
+        );
+        assert!(Cli::try_parse_from(["bcode", "web", "--session", "bad&token=other"]).is_err());
+    }
+
+    #[cfg(feature = "web-renderer")]
     #[tokio::test]
     async fn web_command_rejects_missing_assets_before_daemon_initialization() {
         let directory = tempfile::tempdir().expect("temporary empty distribution");
@@ -26733,6 +26825,7 @@ mod web_command_tests {
             None,
             false,
             Some(directory.path()),
+            None,
             &[],
         )
         .await

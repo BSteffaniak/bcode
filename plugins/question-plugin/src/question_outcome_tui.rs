@@ -1,6 +1,6 @@
 //! Native TUI rendering for question outcome artifacts.
 
-use bcode_tui_components::tool_card::{ToolCardStyle, push_tool_card_detail, tool_card_header};
+use bcode_tui_components::tool_card::{ToolCardStyle, tool_card_header};
 use bmux_tui::prelude::{Line, Span};
 
 /// Native TUI visual adapter for question outcome artifacts.
@@ -29,58 +29,7 @@ impl bcode_plugin_sdk::tui::PluginTuiVisualAdapter for QuestionOutcomeTuiVisualA
             ];
         };
 
-        let mut rows = vec![tool_card_header(
-            Span::styled("◆ ", style.accent),
-            Span::styled("Question outcome", style.title),
-        )];
-        push_tool_card_detail(
-            &mut rows,
-            "status",
-            Some(&format!("{:?}", outcome.status)),
-            style.muted,
-            style.value,
-        );
-        for question in &outcome.questions {
-            rows.push(Line::raw(""));
-            if let Some(header) = &question.header {
-                rows.push(Line::from_spans(vec![Span::styled(
-                    header.clone(),
-                    style.title,
-                )]));
-            }
-            rows.push(Line::from_spans(vec![Span::styled(
-                question.question.clone(),
-                style.value,
-            )]));
-            if question.selected.is_empty() {
-                if let Some(custom) = &question.custom {
-                    push_tool_card_detail(
-                        &mut rows,
-                        "answer",
-                        Some(custom),
-                        style.muted,
-                        style.value,
-                    );
-                }
-            } else {
-                rows.extend(question.selected.iter().map(|answer| {
-                    Line::from_spans(vec![
-                        Span::styled("  ✓ ", style.accent),
-                        Span::styled(answer.label.clone(), style.value),
-                    ])
-                }));
-                if let Some(custom) = &question.custom {
-                    push_tool_card_detail(
-                        &mut rows,
-                        "custom answer",
-                        Some(custom),
-                        style.muted,
-                        style.value,
-                    );
-                }
-            }
-        }
-        rows
+        super::question_outcome::question_outcome_rows(&outcome, style)
     }
 }
 

@@ -311,4 +311,10 @@ pub mod transcript_markdown_cache;
 #[cfg(feature = "transcript-engine")]
 pub mod accepted;
 #[cfg(feature = "transcript-engine")]
+pub mod actions;
+#[cfg(feature = "transcript-engine")]
 pub mod child;
+#[cfg(feature = "transcript-engine")]
+pub mod tool_fallback;
+#[cfg(feature = "transcript-engine")]
+pub mod tool_visual;

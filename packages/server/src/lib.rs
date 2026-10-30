@@ -1656,6 +1656,8 @@ struct PendingPermission {
 pub struct PendingPermissionBatch {
     pub session_id: SessionId,
     pub decision: Mutex<Option<bool>>,
+    /// A scoped decision cannot be inherited by a late batch member.
+    pub scoped_closed: std::sync::atomic::AtomicBool,
 }
 
 #[derive(Clone)]
@@ -74270,7 +74272,7 @@ event_symbol = "bcode_plugin_handle_event_v1"
 
     #[tokio::test]
     async fn interaction_operations_batch_permission_resolution_is_latched_and_batch_scoped() {
-        let state = test_server_state(SessionManager::default());
+        let state = Arc::new(test_server_state(SessionManager::default()));
         let session_id = state
             .sessions
             .create_session(None, test_working_directory())
@@ -74444,6 +74446,7 @@ event_symbol = "bcode_plugin_handle_event_v1"
         let first = test_server_state(SessionManager::default());
         let mut second = test_server_state(SessionManager::default());
         second.daemon_status.instance_id = "replacement-daemon".to_owned();
+        let second = Arc::new(second);
         let (first_id, _first_registration) =
             interaction_operations::PendingPermissionBatchRegistration::allocate(
                 &first,
@@ -77637,7 +77640,7 @@ event_symbol = "bcode_plugin_handle_event_v1"
             .batch_id
             .clone();
         assert_eq!(
-            interaction_operations::resolve_permission_batch(state.as_ref(), &batch_id, true).await,
+            interaction_operations::resolve_permission_batch(&state, &batch_id, true).await,
             1
         );
 
@@ -105892,7 +105895,7 @@ event_symbol = "bcode_plugin_handle_event_v1"
 }
 
 async fn scoped_permission_response(
-    state: &ServerState,
+    state: &Arc<ServerState>,
     request: PermissionInteractionRequest,
 ) -> ResponsePayload {
     match request {

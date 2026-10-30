@@ -101,7 +101,7 @@ impl HyperChadAppState {
             Ok(value) => value,
             Err(code) => return error(code),
         };
-        let Ok(Ok(snapshot)) = tokio::time::timeout(
+        let Ok(Ok(mut snapshot)) = tokio::time::timeout(
             BACKEND_TIMEOUT,
             self.browser_window_snapshot(query.session_id, window.clone()),
         )
@@ -109,7 +109,20 @@ impl HyperChadAppState {
         else {
             return error("history_unavailable");
         };
-        let content = match observations.publish_observation(query.session_id, snapshot) {
+        let Ok(Ok(permissions)) = tokio::time::timeout(
+            BACKEND_TIMEOUT,
+            self.browser_permission_observation(query.session_id, &mut snapshot),
+        )
+        .await
+        else {
+            return error("permission_state_unavailable");
+        };
+        let content = match observations.publish_scoped_observation(
+            query.session_id,
+            snapshot,
+            Some(permissions),
+            serde_json::from_str(&self.browser_policy).ok(),
+        ) {
             Ok(content) => content,
             Err(code) => return error(code),
         };

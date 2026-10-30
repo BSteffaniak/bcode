@@ -27,6 +27,40 @@ impl Transcript {
         self.rows = self.accepted.layout.total_rows();
     }
 
+    /// Run producer-owned portable adapters outside BMUX paint. The same
+    /// canonical visual envelope is used by native plugin dispatch.
+    pub fn prepare_question_visuals(
+        &mut self,
+        theme: Option<bmux_tui_components::theme::ComponentTheme>,
+    ) {
+        use bcode_tui_components::transcript::{
+            tool_visual::CanonicalToolVisual, transcript_layout::TranscriptLayoutRows,
+        };
+        self.accepted.prepare_visuals(|item, _width| {
+            let CanonicalToolVisual::Plugin(visual) = CanonicalToolVisual::for_item(item, None)?;
+            if visual.producer_plugin_id.as_deref() != Some("bcode.question")
+                || visual.schema != "bcode.question.outcome"
+                || visual.schema_version != 1
+            {
+                return None;
+            }
+            let outcome = serde_json::from_value::<bcode_question_plugin::QuestionToolOutcome>(
+                visual.payload,
+            )
+            .ok()?;
+            let rows = bcode_question_plugin::presentation::question_outcome_rows(
+                &outcome,
+                bcode_tui_components::tool_card::ToolCardStyle::from_component_theme(theme),
+            );
+            Some((
+                visual.revision,
+                TranscriptLayoutRows::Rendered(rows),
+                Vec::new(),
+            ))
+        });
+        self.rows = self.accepted.layout.total_rows();
+    }
+
     pub fn anchor(&self, row: usize) -> Option<(String, usize)> {
         let visible = self.accepted.layout.line_at_row(row)?;
         let item = self.accepted.document.get(visible.entry_index)?;
@@ -64,61 +98,7 @@ impl Transcript {
     }
 
     pub fn copy(&self, selection: &bmux_tui::selection::SelectionSnapshot) -> Option<String> {
-        let mut output = String::new();
-        for slice in &selection.slices {
-            if let Some(source) = self.accepted.producer_source(
-                slice.content_id.as_str(),
-                slice.revision,
-                slice.source_range.clone(),
-            ) {
-                output.push_str(&source);
-                continue;
-            }
-            let mut found = false;
-            for item in self.accepted.document.iter() {
-                let id = format!("transcript:{}", item.id().get());
-                if slice
-                    .content_id
-                    .as_str()
-                    .strip_prefix(&id)
-                    .is_some_and(|suffix| suffix.is_empty() || suffix.starts_with('.'))
-                {
-                    if slice.revision != item.revision() {
-                        return None;
-                    }
-                    let suffix = &slice.content_id.as_str()[id.len()..];
-                    let ranges = if let Some(code_id) = suffix.strip_prefix('.') {
-                        let projection = self
-                            .accepted
-                            .layout
-                            .markdown(
-                                self.accepted
-                                    .document
-                                    .iter()
-                                    .position(|candidate| candidate.id() == item.id())?,
-                            )?
-                            .0;
-                        bcode_tui_components::markdown_selection::expand_code_selection_range(
-                            item.text(),
-                            projection.code_block_selections(),
-                            code_id,
-                            slice.source_range.clone(),
-                        )?
-                    } else {
-                        vec![slice.source_range.clone()]
-                    };
-                    for range in ranges {
-                        output.push_str(item.text().get(range)?);
-                    }
-                    found = true;
-                    break;
-                }
-            }
-            if !found {
-                return None;
-            }
-        }
-        Some(output)
+        self.accepted.copy(selection)
     }
 }
 
@@ -129,16 +109,14 @@ pub struct TranscriptComponent<'a> {
     pub top: usize,
 }
 impl TranscriptComponent<'_> {
-    fn child(&self) -> bcode_tui_components::session_ui::TranscriptChild<'_> {
-        bcode_tui_components::session_ui::TranscriptChild {
-            id: "bcode-web/transcript",
-            layout: &self.transcript.accepted.layout,
-            items: self.transcript.accepted.document.items(),
-            top: self.top,
-            selection_scope: "bcode-web/transcript-selection",
-            metadata: true,
-            decorate: None,
-        }
+    const fn child(
+        &self,
+    ) -> bcode_tui_components::transcript::accepted::AcceptedTranscriptChild<'_> {
+        self.transcript.accepted.child(
+            "bcode-web/transcript",
+            self.top,
+            "bcode-web/transcript-selection",
+        )
     }
 }
 impl Component for TranscriptComponent<'_> {

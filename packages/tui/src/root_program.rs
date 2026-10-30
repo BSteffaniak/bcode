@@ -194,9 +194,11 @@ impl OrderedPresentationQueue {
 #[allow(dead_code)]
 pub struct BcodeRuntimeModel {
     /// Canonical application/session owner used by the existing chat path.
-    pub chat: ActiveChat,
+    /// Heap-owned so generic runtime futures do not copy the large retained app
+    /// into every success/error settlement state on a native thread's stack.
+    pub chat: Box<ActiveChat>,
     /// Bcode-specific effect, plugin-surface, projection, artifact, image, and cache state.
-    pub loop_state: ChatLoopState,
+    pub loop_state: Box<ChatLoopState>,
     /// Reloadable keymap, cadence, plugin, and launch settings.
     pub settings: TuiRuntimeSettings,
     /// Draft autosave generation and deadline state.
@@ -812,8 +814,8 @@ impl BcodeRuntimeModel {
                     |_| Err("test clipboard not injected".to_owned());
                 copy
             },
-            chat,
-            loop_state,
+            chat: Box::new(chat),
+            loop_state: Box::new(loop_state),
             settings,
             draft_autosave,
             screen: BcodeRuntimeScreen::Chat,

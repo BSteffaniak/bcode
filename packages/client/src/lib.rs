@@ -8903,8 +8903,9 @@ impl BcodeClient {
     }
 
     /// Resolve only an unchanged exact checkpoint set addressed to the session.
-    /// A batch requires all original members and never remembers policy. Stale
-    /// validation causes zero pending-state mutation. This is not an exactly-once
+    /// A batch requires all original members, never remembers policy, and commits
+    /// all canonical resolution events in one transaction before releasing approvals.
+    /// Stale validation causes zero pending-state mutation. This is not an exactly-once
     /// durable receipt: ambiguous transport requires fresh inspection, not retry.
     ///
     /// # Errors

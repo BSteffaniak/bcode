@@ -2877,29 +2877,7 @@ fn push_transcript_item_rows(
             placement,
             invocation,
         } => {
-            let artifact = bcode_session_models::ToolArtifact {
-                artifact_id: format!(
-                    "{}-{}",
-                    contribution.invocation_id, contribution.contribution_id
-                ),
-                producer_plugin_id: contribution.producer_id.clone(),
-                schema: contribution.schema.clone(),
-                schema_version: contribution.schema_version,
-                tool_call_id: Some(contribution.invocation_id.clone()),
-                title: Some("Tool contribution".to_owned()),
-                metadata: {
-                    let mut payload = contribution.payload.clone();
-                    if let Some(object) = payload.as_object_mut() {
-                        object.insert(
-                            "_bcode_presentation_revision".to_owned(),
-                            serde_json::Value::from(contribution.sequence),
-                        );
-                    }
-                    payload
-                },
-                refs: Vec::new(),
-            };
-            let visual = CanonicalToolVisual::from_artifact(&artifact);
+            let visual = CanonicalToolVisual::from_contribution(contribution);
             let CanonicalToolVisual::Plugin(plugin_visual) = &visual;
             let working_directory = invocation
                 .as_deref()
@@ -4781,29 +4759,7 @@ fn tool_request_draft_visual(
     item: &TranscriptItem,
     draft: &bcode_session_view_models::ToolRequestDraftView,
 ) -> CanonicalToolVisual {
-    CanonicalToolVisual::from_artifact(&bcode_session_models::ToolArtifact {
-        artifact_id: format!("{}-request-draft-{}", draft.tool_call_id, draft.generation),
-        producer_plugin_id: draft
-            .producer_plugin_id
-            .clone()
-            .unwrap_or_else(|| "bcode.unknown".to_owned()),
-        schema: draft.schema.clone(),
-        schema_version: draft.schema_version,
-        tool_call_id: Some(draft.tool_call_id.clone()),
-        title: Some("Tool request draft".to_owned()),
-        metadata: serde_json::json!({
-            "tool_name": draft.tool_name,
-            "argument_bytes": draft.argument_bytes,
-            "preview_start_offset": draft.preview_start_offset,
-            "preview": draft.preview,
-            "truncated": draft.truncated,
-            "streaming": true,
-            "generation": draft.generation,
-            // Shared item revisions advance across draft generation resets; provider revisions do not.
-            "_bcode_presentation_revision": item.source_view_item_revision().unwrap_or_else(|| item.revision()),
-        }),
-        refs: Vec::new(),
-    })
+    CanonicalToolVisual::from_draft(item, draft)
 }
 
 #[test]
@@ -5140,18 +5096,7 @@ fn push_tool_invocation_fallback_rows(
     rows.push(Line::default());
 }
 
-const fn tool_status_label(
-    status: bcode_session_view_models::ToolInvocationViewStatus,
-) -> &'static str {
-    match status {
-        bcode_session_view_models::ToolInvocationViewStatus::Requested => "requested",
-        bcode_session_view_models::ToolInvocationViewStatus::Running => "running",
-        bcode_session_view_models::ToolInvocationViewStatus::Waiting => "waiting",
-        bcode_session_view_models::ToolInvocationViewStatus::Finished => "finished",
-        bcode_session_view_models::ToolInvocationViewStatus::Failed => "failed",
-        bcode_session_view_models::ToolInvocationViewStatus::Cancelled => "cancelled",
-    }
-}
+use bcode_tui_components::transcript::tool_fallback::tool_status_label;
 
 struct ToolResultRenderContext<'a> {
     tool_name: Option<&'a str>,
@@ -5286,32 +5231,7 @@ fn push_tool_result_rows(
     rows.push(Line::default());
 }
 
-fn bounded_tool_argument_fields(arguments: &str) -> Vec<(String, String)> {
-    const MAX_FIELDS: usize = 6;
-    const MAX_VALUE_CHARS: usize = 160;
-    let Ok(serde_json::Value::Object(fields)) = serde_json::from_str(arguments) else {
-        return Vec::new();
-    };
-    fields
-        .into_iter()
-        .take(MAX_FIELDS)
-        .filter_map(|(label, value)| {
-            let value = match value {
-                serde_json::Value::String(value) => value,
-                serde_json::Value::Number(value) => value.to_string(),
-                serde_json::Value::Bool(value) => value.to_string(),
-                serde_json::Value::Null => "none".to_owned(),
-                serde_json::Value::Array(values) => format!("{} values", values.len()),
-                serde_json::Value::Object(values) => format!("{} fields", values.len()),
-            };
-            let mut bounded = value.chars().take(MAX_VALUE_CHARS).collect::<String>();
-            if value.chars().count() > MAX_VALUE_CHARS {
-                bounded.push('…');
-            }
-            (!bounded.is_empty()).then_some((label, bounded))
-        })
-        .collect()
-}
+use bcode_tui_components::transcript::tool_fallback::bounded_tool_argument_fields;
 
 fn push_labeled_text_preview(
     rows: &mut Vec<Line>,

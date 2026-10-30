@@ -2,7 +2,7 @@
 
 use bmux_tui::prelude::Line;
 use std::collections::BTreeSet;
-use std::time::Instant;
+use web_time::Instant;
 
 use super::indexed_transcript_layout::IndexedTranscriptLayout;
 

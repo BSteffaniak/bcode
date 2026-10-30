@@ -27,11 +27,13 @@ pub enum Command {
 }
 
 pub struct Bindings {
+    pub effective: crate::policy::PolicyBindings,
     overrides: BTreeMap<String, Command>,
 }
 impl Bindings {
-    pub const fn new() -> Self {
+    pub fn new() -> Self {
         Self {
+            effective: crate::policy::PolicyBindings::default(),
             overrides: BTreeMap::new(),
         }
     }
@@ -48,6 +50,23 @@ impl Bindings {
         Ok(())
     }
     pub fn command(&self, key: KeyStroke) -> Option<Command> {
+        if self.effective.policy.is_some() {
+            return match self.effective.resolve("chat", key) {
+                Some(crate::policy::BrowserResolvedBinding::Host { action }) => {
+                    match action.as_str() {
+                        "tui.input.submitSteering" => Some(Command::Submit),
+                        "tui.input.newline" => Some(Command::Newline),
+                        "transcript.pageUp" => Some(Command::PageUp),
+                        "transcript.pageDown" => Some(Command::PageDown),
+                        "transcript.bottom" => Some(Command::Latest),
+                        "tui.transcript.copySelection" => Some(Command::Copy),
+                        _ => Some(Command::Ignore),
+                    }
+                }
+                Some(crate::policy::BrowserResolvedBinding::Ignored) => Some(Command::Ignore),
+                _ => None,
+            };
+        }
         let name = key_name(key);
         if let Some(command) = self.overrides.get(&name) {
             return Some(*command);
@@ -72,6 +91,22 @@ impl Bindings {
         key: KeyStroke,
     ) -> bcode_tui_components::permission::decision::PermissionAction {
         use bcode_tui_components::permission::decision::PermissionAction as Action;
+        if self.effective.policy.is_some() {
+            return match self.effective.resolve("permission", key) {
+                Some(crate::policy::BrowserResolvedBinding::Host { action }) => {
+                    match action.as_str() {
+                        "app.permission.approve" => Action::PermissionApprove,
+                        "app.permission.deny" => Action::PermissionDeny,
+                        "tui.select.previous" => Action::SelectUp,
+                        "tui.select.next" => Action::SelectDown,
+                        "tui.select.confirm" => Action::SelectConfirm,
+                        "tui.select.cancel" => Action::SelectCancel,
+                        _ => Action::Other,
+                    }
+                }
+                _ => Action::Other,
+            };
+        }
         match self.overrides.get(&key_name(key)) {
             Some(Command::PermissionApprove) => Action::PermissionApprove,
             Some(Command::PermissionDeny) => Action::PermissionDeny,
@@ -89,6 +124,11 @@ impl Bindings {
                 TextInputControl::new(&composer_policy())
                     .handle_key_with_history_action(state, key, None);
             }
+            SessionKeyBinding::Selection(motion) => {
+                state
+                    .buffer_mut()
+                    .move_cursor_with_selection(motion, bmux_text_edit::SelectionMode::Extend);
+            }
             binding => {
                 apply_editor_binding(state, binding);
             }
@@ -97,6 +137,12 @@ impl Bindings {
 }
 impl SessionKeyBindings for Bindings {
     fn resolve(&self, key: KeyStroke) -> SessionKeyBinding {
+        if self.effective.policy.is_some() {
+            return self
+                .effective
+                .resolve("chat", key)
+                .map_or(SessionKeyBinding::Ignored, |binding| binding.session());
+        }
         if self.command(key).is_some() {
             return SessionKeyBinding::Host;
         }

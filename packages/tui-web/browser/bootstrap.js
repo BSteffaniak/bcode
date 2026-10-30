@@ -1,10 +1,32 @@
 import init, * as wasm from './bcode_tui_web.js';
 import { mountInteractiveSurface } from './interactive-surface.js';
-import { mountBrowserSession } from './browser-session.js';
+import { mountBrowserSession, commitSemanticRegions } from './browser-session.js';
 
 const status = document.getElementById('status');
+const retry = document.getElementById('retry-submission');
+const refresh = document.getElementById('refresh-session');
+const acknowledge = document.getElementById('acknowledge-control');
+const semantics = document.getElementById('semantics');
+function setControls(state = {}) {
+  retry.hidden = !state.unresolvedSubmission;
+  retry.disabled = !host || !state.unresolvedSubmission;
+  acknowledge.hidden = !state.controlUncertain;
+  acknowledge.disabled = !host || !state.controlUncertain;
+  refresh.disabled = !host;
+}
+function runExplicit(operation) {
+  retry.disabled = refresh.disabled = acknowledge.disabled = true;
+  void operation().then(() => host?.focus()).catch(() => {
+    status.textContent = 'Operation unresolved. Draft retained. Refresh before another control; retry submission sends its original identity.';
+  }).finally(() => { if (host) setControls(lastState); });
+}
+retry.addEventListener('click', () => { if (host) runExplicit(() => host.retrySubmission()); });
+refresh.addEventListener('click', () => { if (host) runExplicit(() => host.refresh()); });
+acknowledge.addEventListener('click', () => { if (host) runExplicit(() => host.acknowledgeControl()); });
 let host, mounting, lifetime;
 let generation = 0;
+let lastState = {};
+setControls();
 // Caller-owned and memory-only: never persist launch credentials or snapshots.
 const recoveryState = {};
 // Hash launch capabilities are not sent to the static asset server.
@@ -27,6 +49,8 @@ async function stop() {
   lifetime?.abort();
   await host?.dispose();
   host = undefined;
+  setControls();
+  commitSemanticRegions(semantics, []);
 }
 async function start() {
   const current = ++generation;
@@ -45,6 +69,15 @@ async function start() {
       container: document.getElementById('surface'), canvas: document.getElementById('bcode-canvas'),
       sessionId, token, backendOrigin, allowedBackendOrigins, recoveryState, signal: controller.signal,
       capabilities: globalThis.bcodeTuiConfig?.capabilities ?? {},
+      onState: state => {
+        if (current !== generation) return;
+        lastState = state;
+        setControls(state);
+        if (state.unresolvedSubmission) status.textContent = 'Unresolved submission retained. Retry sends the same identity; no automatic replay.';
+        else if (state.controlUncertain) status.textContent = 'Control outcome unknown. Refresh and explicitly acknowledge before another decision.';
+        else if (host) status.textContent = 'Browser BMUX session connected';
+      },
+      onSemantics: regions => { if (current === generation) commitSemanticRegions(semantics, regions); },
       onError: message => { if (current === generation) status.textContent = message; },
     });
     const next = await mounting;
@@ -52,6 +85,8 @@ async function start() {
     else {
       host = next;
       status.textContent = 'Browser BMUX session connected';
+      setControls(lastState);
+      if (lastState.unresolvedSubmission) status.textContent = 'Unresolved submission retained. Review before exact retry.';
       host.focus();
     }
   } catch {

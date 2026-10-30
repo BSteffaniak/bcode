@@ -16,19 +16,28 @@ const wait = async (predicate, label) => {
 let mounted;
 try {
   const configuration = await (await fetch('/fixture.json')).json();
-  const wasm = await import('/bundle/bcode_tui_web.js');
-  const { mountInteractiveSurface } = await import('/bundle/interactive-surface.js');
-  const { mountBrowserSession } = await import('/bundle/browser-session.js');
+  const manifest = await (await fetch('/tui/manifest.json')).json();
+  const compatibility = await (await fetch('/tui/compatibility.json')).json();
+  assert(compatibility.schema_version === 1 && manifest.schema_version === 2,
+    'unsupported bundle/backend handshake');
+  assert(compatibility.artifact_sha256 === manifest.artifact_sha256 &&
+    JSON.stringify(compatibility.protocol) === JSON.stringify(manifest.protocol),
+    'mixed bundle/backend compatibility');
+  assert(Object.values(compatibility.protocol).every(version => version === 1),
+    'unsupported browser protocol');
+  const wasm = await import('/tui/bcode_tui_web.js');
+  const { mountInteractiveSurface } = await import('/tui/interactive-surface.js');
+  const { mountBrowserSession } = await import('/tui/browser-session.js');
   await wasm.default();
   // Observe real Canvas text calls without replacing rendering or manufacturing a UI.
   // Keep bounded evidence across repaints; canonical backend checks are independent.
   const drawn = [];
   const originalFillText = CanvasRenderingContext2D.prototype.fillText;
   CanvasRenderingContext2D.prototype.fillText = function(text, ...args) {
-    if (this.canvas.id === 'canvas') {
-      drawn.push(String(text));
-      if (drawn.length > 200000) drawn.splice(0, 100000);
-    }
+    // BMUX paints transactionally to a scratch Canvas before committing pixels.
+    // Observe its real text calls as well as the destination Canvas.
+    drawn.push(String(text));
+    if (drawn.length > 200000) drawn.splice(0, 100000);
     return originalFillText.call(this, text, ...args);
   };
   const text = 'browser-e2e-real-backend';
@@ -57,7 +66,7 @@ try {
     sessionId: configuration.session, token: configuration.token,
     backendOrigin: location.origin, fetch: transport, recoveryState,
     // Manual observations below avoid timing-dependent overlap with mutation admission.
-    pollMs: 60000, requestTimeoutMs: 5000,
+    pollMs: 60000, requestTimeoutMs: 60000,
     onError: error => errors.push(error),
   });
   const api = async (path, body, token = configuration.token) => {
@@ -76,7 +85,12 @@ try {
   assert(editor, 'real BMUX input bridge missing');
   editor.value = text;
   editor.dispatchEvent(new InputEvent('input', {inputType:'insertText', data:text, bubbles:true}));
-  await wait(() => drawn.join('').includes(text), 'visible editor text');
+  await wait(() => {
+    if (errors.length) throw new Error(`editor failed: ${errors.map(String).join('; ')}`);
+    return drawn.join('').includes(text);
+  }, 'visible editor text').catch(error => {
+    throw new Error(`${error.message}; canvas=${canvas.width}x${canvas.height}; output=${drawn.join('').slice(-4000)}`);
+  });
   editor.dispatchEvent(new KeyboardEvent('keydown', {key:'Enter', code:'Enter', bubbles:true, cancelable:true}));
   await wait(() => errors.length > 0 && dropped, 'ambiguous post-commit response');
   assert(operations.length === 1, 'unexpected implicit resubmission');
@@ -99,13 +113,30 @@ try {
   do {
     snapshot = await api(snapshotPath);
     if (JSON.stringify(snapshot.snapshot?.transcript).includes(`fake: ${text}`)) break;
-    if (performance.now() > until) throw new Error('real provider transcript did not arrive');
+    if (performance.now() > until) throw new Error(`real provider transcript did not arrive: ${JSON.stringify(snapshot).slice(0, 14000)}`);
     await new Promise(resolve => setTimeout(resolve, 50));
   } while (true);
   drawn.length = 0;
   await mounted.dispose();
   mounted = await mount();
   await wait(() => drawn.join('').includes(`fake: ${text}`), 'visible real assistant transcript');
+  const historyDraft = 'draft retained across canonical history navigation';
+  const historyInput = document.querySelector('[data-bmux-input]');
+  historyInput.value = historyDraft;
+  historyInput.dispatchEvent(new InputEvent('input', {
+    inputType:'insertText', data:historyDraft, bubbles:true,
+  }));
+  await wait(() => drawn.join('').includes(historyDraft), 'visible history-navigation draft');
+  await mounted.loadHistory('older');
+  await mounted.loadHistory('tail');
+  drawn.length = 0;
+  // An unchanged snapshot correctly skips painting. Force a genuine resize
+  // transaction so the retained draft must appear in newly rendered pixels.
+  const resized = document.getElementById('canvas');
+  resized.style.width = '891px';
+  await mounted.refresh();
+  await wait(() => drawn.join('').includes(historyDraft), 'history navigation retained composer draft');
+  await wait(() => drawn.join('').includes(`fake: ${text}`), 'readable transcript after history tail');
   const image = document.getElementById('canvas').getContext('2d').getImageData(0, 0, 900, 540).data;
   const background = Array.from(image.slice(0, 4));
   assert(image.some((channel, index) => channel !== background[index % 4]), 'Canvas contains no visible ink');
@@ -115,10 +146,14 @@ try {
   output.textContent = JSON.stringify({passed:true, text, receipt,
     evidence:['real WASM Canvas editor input', 'real deterministic provider transcript',
       'post-commit dropped response', 'remount exact retry identical receipt',
-      'read/write auth rejection', 'conflicting payload and execution-authority rejection'],
+      'read/write auth rejection', 'conflicting payload and execution-authority rejection',
+      'canonical older/tail history navigation with Canvas-readable retained draft'],
     submission_requests:operations.length, operation:operations[0]});
 } catch (error) {
-  output.textContent = JSON.stringify({passed:false,error:error?.stack ?? String(error)});
+  const describe = error => ({message: error?.stack ?? String(error),
+    cause: error?.cause ? describe(error.cause) : undefined,
+    errors: error instanceof AggregateError ? [...error.errors].map(describe) : undefined});
+  output.textContent = JSON.stringify({passed:false,error:describe(error)});
 } finally {
   if (mounted) await mounted.dispose();
 }

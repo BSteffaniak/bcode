@@ -1,0 +1,71 @@
+name: Browser BMUX acceptance
+
+on:
+  pull_request:
+    paths:
+      - "packages/hyperchad/**"
+      - "packages/tui-web/**"
+      - "packages/tui-components/**"
+      - "packages/cli/**"
+      - "scripts/*tui-web*"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - "flake.*"
+      - ".github/workflows/tui-web-acceptance.yml"
+  push:
+    branches: [master]
+    paths:
+      - "packages/hyperchad/**"
+      - "packages/tui-web/**"
+      - "packages/tui-components/**"
+      - "packages/cli/**"
+      - "scripts/*tui-web*"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - "flake.*"
+      - ".github/workflows/tui-web-acceptance.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  production-actix:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v7
+      - uses: DeterminateSystems/nix-installer-action@v21
+      - uses: browser-actions/setup-chrome@v2
+        id: chrome
+      - name: Build one immutable matched browser distribution
+        run: bash scripts/build-tui-web.sh "$RUNNER_TEMP/bcode-browser-bundle"
+      - name: Real distribution compatibility and rollback checks
+        run: python3 scripts/test-tui-web-e2e.py --self-test --bundle "$RUNNER_TEMP/bcode-browser-bundle"
+      - name: Validate distribution staging and extracted rollback behavior
+        run: BCODE_E2E_BUNDLE="$RUNNER_TEMP/bcode-browser-bundle" nix develop --command cargo test --locked -p xtask browser_distribution_rejects_tamper_and_accepts_exact_rollback -- --ignored --exact tests::browser_distribution_rejects_tamper_and_accepts_exact_rollback
+      - name: Validate loader tamper and mixed-protocol rejection
+        run: nix develop --command cargo test --locked -p bcode_hyperchad --features renderer-html-actix --lib html_actix::tui_assets::tests
+      - name: Production Actix, real WASM, isolated fake provider and durable restart
+        env:
+          BCODE_E2E_CHROMIUM: ${{ steps.chrome.outputs.chrome-path }}
+          BCODE_E2E_BUNDLE: ${{ runner.temp }}/bcode-browser-bundle
+        run: |
+          nix develop --command bash -euc '
+            export BCODE_E2E_PYTHON="$(command -v python3)"
+            cargo test --locked -p bcode_hyperchad --features renderer-html-actix \
+              --test browser_e2e real_wasm_registered_router_durable_retry_and_restart \
+              -- --ignored --exact --nocapture
+          '
+      - name: Archive exactly the accepted distribution
+        run: |
+          tar -C "$RUNNER_TEMP" -czf "$RUNNER_TEMP/bcode-browser-${GITHUB_SHA}.tar.gz" bcode-browser-bundle
+          cd "$RUNNER_TEMP"
+          sha256sum "bcode-browser-${GITHUB_SHA}.tar.gz" > "bcode-browser-${GITHUB_SHA}.tar.gz.sha256"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: bcode-browser-${{ github.sha }}
+          if-no-files-found: error
+          path: |
+            ${{ runner.temp }}/bcode-browser-${{ github.sha }}.tar.gz
+            ${{ runner.temp }}/bcode-browser-${{ github.sha }}.tar.gz.sha256

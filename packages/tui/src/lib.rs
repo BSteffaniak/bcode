@@ -57,6 +57,7 @@ pub use quick_onboarding::{
     QuickConnectionChoice, QuickOnboardingInput, QuickOnboardingOutcome, run_quick_onboarding,
     run_quick_onboarding_in_shell,
 };
+pub mod browser_presentation;
 pub(crate) mod composer_interaction;
 pub(crate) mod composer_interaction_render;
 mod onboarding_program;

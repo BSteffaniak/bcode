@@ -29,6 +29,7 @@ bmux_tui                  = { workspace = true }
 bmux_tui_components       = { workspace = true }
 serde_json                = { workspace = true, optional = true }
 unicode-width             = { workspace = true, optional = true }
+web-time                  = { workspace = true, optional = true }
 
 [dev-dependencies]
 bcode_session_view  = { workspace = true }
@@ -89,5 +90,6 @@ transcript-engine = [
     "dep:bcode_session_view_models",
     "dep:bcode_tool",
     "dep:serde_json",
+    "dep:web-time",
 ]
 transcript-markdown = ["transcript", "dep:bcode_markdown_render"]

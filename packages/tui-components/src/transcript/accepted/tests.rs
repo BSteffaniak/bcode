@@ -12,7 +12,7 @@ use bmux_tui::{
     paint::PaintCx,
 };
 
-fn document(format: TextFormat, text: &str) -> TranscriptViewDocument {
+pub(super) fn document(format: TextFormat, text: &str) -> TranscriptViewDocument {
     let mut snapshot = bcode_session_view_models::SessionViewSnapshot::empty();
     snapshot.transcript.revision = 1;
     snapshot.transcript.items.push(TranscriptViewItem {
@@ -37,6 +37,46 @@ fn document(format: TextFormat, text: &str) -> TranscriptViewDocument {
 }
 
 #[test]
+fn semantic_tool_fixtures_remain_readable_without_an_adapter() {
+    let fixtures: serde_json::Value = serde_json::from_str(include_str!(
+        "../../../../session-view/models/fixtures/renderer-tool-presentations.json"
+    ))
+    .unwrap();
+    for fixture in fixtures.as_array().unwrap() {
+        let mut source = bcode_session_view_models::SessionViewSnapshot::empty().transcript;
+        source.revision = 1;
+        source
+            .items
+            .push(serde_json::from_value(fixture["item"].clone()).unwrap());
+        let mut accepted = AcceptedTranscript::default();
+        accepted.prepare(&source, 80);
+        let mut text = String::new();
+        for row in accepted.layout.visible_lines_from_top(0, u16::MAX) {
+            if let Some(line) = accepted.layout.line(row) {
+                text.push_str(&line.plain_text());
+                text.push('\n');
+            }
+        }
+        for forbidden in fixture["forbidden"].as_array().into_iter().flatten() {
+            let forbidden = forbidden.as_str().unwrap();
+            assert!(
+                !text.contains(forbidden),
+                "{} exposed opaque data {forbidden:?}",
+                fixture["name"]
+            );
+        }
+        for expected in fixture["expected"].as_array().unwrap() {
+            let expected = expected.as_str().unwrap();
+            assert!(
+                text.contains(expected),
+                "{} fallback missing {expected:?}: {text}",
+                fixture["name"]
+            );
+        }
+    }
+}
+
+#[test]
 fn shared_dispatch_and_native_row_bundle_paint_identically_at_tiny_and_unicode_widths() {
     for width in [0, 1, 4, 22, 80] {
         for format in [TextFormat::PlainText, TextFormat::Markdown] {
@@ -48,6 +88,7 @@ fn shared_dispatch_and_native_row_bundle_paint_identically_at_tiny_and_unicode_w
             let item = accepted.document.get(0).expect("accepted semantic item");
             let expected = semantic_rows(item, width, &accepted.markdown);
             let (TranscriptLayoutRows::Rendered(rows)
+            | TranscriptLayoutRows::Selected { rows, .. }
             | TranscriptLayoutRows::Markdown { rows, .. }) = expected
             else {
                 unreachable!()

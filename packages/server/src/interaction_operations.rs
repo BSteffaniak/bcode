@@ -176,8 +176,15 @@ mod scoped_permission_tests {
         }
     }
 
-    async fn fixture() -> (ServerState, SessionId, PendingPermission, PendingPermission) {
-        let state = crate::tests::test_server_state(bcode_session::SessionManager::default());
+    async fn fixture() -> (
+        Arc<ServerState>,
+        SessionId,
+        PendingPermission,
+        PendingPermission,
+    ) {
+        let state = Arc::new(crate::tests::test_server_state(
+            bcode_session::SessionManager::default(),
+        ));
         let session = state
             .sessions
             .create_session(None, std::env::temp_dir())
@@ -188,6 +195,7 @@ mod scoped_permission_tests {
             Arc::new(PendingPermissionBatch {
                 session_id: session.id,
                 decision: Mutex::new(None),
+                scoped_closed: std::sync::atomic::AtomicBool::new(false),
             }),
         );
         let first = checkpoint(session.id, "first", 0, 2);
@@ -229,17 +237,34 @@ mod scoped_permission_tests {
     }
 
     #[tokio::test]
-    async fn conditional_batch_approval_is_unavailable_without_durable_atomic_append() {
+    async fn conditional_batch_approval_commits_before_waiter_release() {
         let (state, session, first, second) = fixture().await;
         let exact = observed(&state, session).await;
         assert_eq!(
             resolve_permissions_conditional(&state, exact).await,
-            ConditionalPermissionResult::BatchApprovalUnavailable
+            ConditionalPermissionResult::Resolved { resolved: 2 }
         );
-        assert_eq!(state.pending_permissions.lock().await.len(), 2);
-        assert_eq!(*first.decision.lock().await, None);
-        assert_eq!(*second.decision.lock().await, None);
-        assert_eq!(permission_batch_decision(&state, "test-batch").await, None);
+        assert_eq!(state.pending_permissions.lock().await.len(), 0);
+        assert_eq!(*first.decision.lock().await, Some(true));
+        assert_eq!(*second.decision.lock().await, Some(true));
+        assert_eq!(
+            permission_batch_decision(&state, "test-batch").await,
+            Some(true)
+        );
+        let history = state.sessions.session_history(session).await.unwrap();
+        assert_eq!(
+            history
+                .iter()
+                .filter(|event| matches!(
+                    event.kind,
+                    bcode_session_models::SessionEventKind::PermissionResolved {
+                        approved: true,
+                        ..
+                    }
+                ))
+                .count(),
+            2
+        );
     }
 
     #[tokio::test]
@@ -354,6 +379,75 @@ mod scoped_permission_tests {
     }
 
     #[tokio::test]
+    async fn legacy_batch_dropped_caller_still_commits_and_releases_waiters() {
+        let (state, session, first, second) = fixture().await;
+        let pending = state.pending_permissions.lock().await;
+        let mut operation = Box::pin(resolve_permission_batch(&state, "test-batch", true));
+        tokio::select! { biased;
+            result = &mut operation => panic!("passed pending fence: {result:?}"),
+            () = tokio::task::yield_now() => {}
+        }
+        drop(operation);
+        drop(pending);
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            loop {
+                if *first.decision.lock().await == Some(true)
+                    && *second.decision.lock().await == Some(true)
+                {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("legacy owned completion");
+        assert_eq!(
+            permission_batch_decision(&state, "test-batch").await,
+            Some(true)
+        );
+        let history = state.sessions.session_history(session).await.unwrap();
+        assert_eq!(
+            history
+                .iter()
+                .filter(|event| matches!(
+                    event.kind,
+                    bcode_session_models::SessionEventKind::PermissionResolved {
+                        approved: true,
+                        ..
+                    }
+                ))
+                .count(),
+            2
+        );
+    }
+
+    #[tokio::test]
+    async fn conditional_batch_committed_membership_never_approves_late_registration() {
+        let (state, session, _, _) = fixture().await;
+        let exact = observed(&state, session).await;
+        assert_eq!(
+            resolve_permissions_conditional(&state, exact).await,
+            ConditionalPermissionResult::Resolved { resolved: 2 }
+        );
+        let late = checkpoint(session, "late", 2, 3);
+        let event = bcode_session_models::SessionEventKind::PermissionRequested {
+            permission_id: "late".into(),
+            tool_call_id: "late-call".into(),
+            producer_plugin_id: None,
+            tool_name: "test.tool".into(),
+            arguments_json: "{}".into(),
+            batch: late.summary.batch.clone(),
+            policy_source: None,
+            policy_reason: None,
+        };
+        assert_eq!(
+            register_pending_permission(&state, &late, event).await,
+            Err(false)
+        );
+        assert!(!state.pending_permissions.lock().await.contains_key("late"));
+    }
+
+    #[tokio::test]
     async fn conditional_batch_stale_replacement_causes_zero_mutation() {
         let (state, session, first, _) = fixture().await;
         let decision = observed(&state, session).await;
@@ -406,11 +500,208 @@ mod scoped_permission_tests {
     }
 
     #[tokio::test]
-    async fn conditional_batch_two_concurrent_resolvers_have_one_winner() {
+    async fn conditional_batch_persistence_failure_preserves_pending_members_and_decisions() {
+        let (state, session, first, second) = fixture().await;
+        let exact = observed(&state, session).await;
+        state.sessions.delete_session(session).await.unwrap();
+        assert_eq!(
+            resolve_permissions_conditional(&state, exact).await,
+            ConditionalPermissionResult::CompletionFailed
+        );
+        assert_eq!(state.pending_permissions.lock().await.len(), 2);
+        assert_eq!(*first.decision.lock().await, None);
+        assert_eq!(*second.decision.lock().await, None);
+        assert_eq!(permission_batch_decision(&state, "test-batch").await, None);
+    }
+
+    #[tokio::test]
+    async fn conditional_batch_caller_cancellation_does_not_abandon_admission() {
+        let (state, session, first, second) = fixture().await;
+        let exact = observed(&state, session).await;
+        let pending = state.pending_permissions.lock().await;
+        let mut operation = Box::pin(resolve_permissions_conditional(&state, exact));
+        tokio::select! { biased;
+            result = &mut operation => panic!("passed membership fence: {result:?}"),
+            () = tokio::task::yield_now() => {}
+        }
+        drop(operation);
+        drop(pending);
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            loop {
+                if *first.decision.lock().await == Some(true)
+                    && *second.decision.lock().await == Some(true)
+                {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("owned completion survives dropped caller");
+        assert_eq!(state.pending_permissions.lock().await.len(), 0);
+    }
+
+    #[tokio::test]
+    async fn conditional_batch_denial_survives_dropped_caller() {
         let (state, session, first, second) = fixture().await;
         let mut exact = observed(&state, session).await;
         exact.approved = false;
-        let deny = exact.clone();
+        let pending = state.pending_permissions.lock().await;
+        let mut operation = Box::pin(resolve_permissions_conditional(&state, exact));
+        tokio::select! { biased;
+            result = &mut operation => panic!("passed membership fence: {result:?}"),
+            () = tokio::task::yield_now() => {}
+        }
+        drop(operation);
+        drop(pending);
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            loop {
+                if *first.decision.lock().await == Some(false)
+                    && *second.decision.lock().await == Some(false)
+                {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("owned denial survives dropped caller");
+        assert_eq!(
+            permission_batch_decision(&state, "test-batch").await,
+            Some(false)
+        );
+        let history = state.sessions.session_history(session).await.unwrap();
+        assert_eq!(
+            history
+                .iter()
+                .filter(|event| matches!(
+                    event.kind,
+                    bcode_session_models::SessionEventKind::PermissionResolved {
+                        approved: false,
+                        ..
+                    }
+                ))
+                .count(),
+            2
+        );
+    }
+
+    #[tokio::test]
+    async fn conditional_batch_cancel_winner_fences_all_approval() {
+        let (state, session, first, second) = fixture().await;
+        let exact = observed(&state, session).await;
+        cancel_pending_permissions_for_session(&state, session).await;
+        assert_eq!(
+            resolve_permissions_conditional(&state, exact).await,
+            ConditionalPermissionResult::Stale
+        );
+        assert_eq!(*first.decision.lock().await, Some(false));
+        assert_eq!(*second.decision.lock().await, Some(false));
+        assert_eq!(
+            permission_batch_decision(&state, "test-batch").await,
+            Some(false)
+        );
+        let history = state.sessions.session_history(session).await.unwrap();
+        assert!(!history.iter().any(|event| matches!(
+            event.kind,
+            bcode_session_models::SessionEventKind::PermissionResolved { approved: true, .. }
+        )));
+    }
+
+    #[tokio::test]
+    async fn conditional_batch_approval_racing_session_cancel_has_one_decision() {
+        let (state, session, first, second) = fixture().await;
+        let exact = observed(&state, session).await;
+        let (result, ()) = tokio::join!(
+            resolve_permissions_conditional(&state, exact),
+            cancel_pending_permissions_for_session(&state, session)
+        );
+        let approved = matches!(
+            result,
+            ConditionalPermissionResult::Resolved { resolved: 2 }
+        );
+        assert!(approved || result == ConditionalPermissionResult::Stale);
+        assert_eq!(*first.decision.lock().await, Some(approved));
+        assert_eq!(*second.decision.lock().await, Some(approved));
+        let history = state.sessions.session_history(session).await.unwrap();
+        let decisions = history
+            .iter()
+            .filter_map(|event| match event.kind {
+                bcode_session_models::SessionEventKind::PermissionResolved { approved, .. } => {
+                    Some(approved)
+                }
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(decisions, vec![approved, approved]);
+    }
+
+    #[tokio::test]
+    async fn conditional_individual_dropped_caller_still_settles_decision() {
+        let (state, session, _, _) = fixture().await;
+        let mut permission = checkpoint(session, "individual", 0, 1);
+        permission.summary.batch = None;
+        state
+            .pending_permissions
+            .lock()
+            .await
+            .insert("individual".into(), permission.clone());
+        let ScopedPermissionLookup::Ready { checkpoints, .. } = scoped_permissions(
+            &state,
+            ScopedPermissionQuery {
+                session_id: session,
+                batch_id: None,
+                after_permission_id: None,
+                limit: MAX_SCOPED_PERMISSION_CHECKPOINTS,
+            },
+        )
+        .await
+        else {
+            panic!("lookup")
+        };
+        let expected = checkpoints
+            .into_iter()
+            .filter(|value| value.identity.permission_id == "individual")
+            .map(|value| value.identity)
+            .collect();
+        let decision = ConditionalPermissionDecision {
+            session_id: session,
+            batch_id: None,
+            expected,
+            approved: false,
+            remember: false,
+        };
+        let pending = state.pending_permissions.lock().await;
+        let mut operation = Box::pin(resolve_permissions_conditional(&state, decision));
+        tokio::select! { biased;
+            result = &mut operation => panic!("passed membership fence: {result:?}"),
+            () = tokio::task::yield_now() => {}
+        }
+        drop(operation);
+        drop(pending);
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            while permission.decision.lock().await.is_none() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("owned individual completion");
+        assert_eq!(*permission.decision.lock().await, Some(false));
+        assert!(
+            !state
+                .pending_permissions
+                .lock()
+                .await
+                .contains_key("individual")
+        );
+    }
+
+    #[tokio::test]
+    async fn conditional_batch_two_concurrent_resolvers_have_one_winner() {
+        let (state, session, first, second) = fixture().await;
+        let exact = observed(&state, session).await;
+        let mut deny = exact.clone();
+        deny.approved = false;
         let (left, right) = tokio::join!(
             resolve_permissions_conditional(&state, exact),
             resolve_permissions_conditional(&state, deny)
@@ -444,10 +735,14 @@ mod scoped_permission_tests {
             result = &mut resolve => panic!("resolver passed held pending lock: {result:?}"),
             () = tokio::task::yield_now() => {}
         }
-        assert!(
-            batch.decision.try_lock().is_err(),
-            "resolver must hold decision latch before final comparison"
-        );
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(2);
+        while batch.decision.try_lock().is_ok() {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "resolver did not reach membership fence"
+            );
+            tokio::task::yield_now().await;
+        }
         pending.remove("second");
         drop(pending);
         assert_eq!(resolve.await, ConditionalPermissionResult::Stale);
@@ -601,6 +896,7 @@ impl PendingPermissionBatch {
         Self {
             session_id,
             decision: Mutex::const_new(None),
+            scoped_closed: std::sync::atomic::AtomicBool::new(false),
         }
     }
 }
@@ -761,7 +1057,16 @@ pub async fn register_pending_permission(
     let batch_decision = if let Some(batch_state) = batch_state.as_ref() {
         let decision = batch_state.decision.lock().await;
         if let Some(decision) = *decision {
-            return Err(decision);
+            return Err(
+                if batch_state
+                    .scoped_closed
+                    .load(std::sync::atomic::Ordering::Acquire)
+                {
+                    false
+                } else {
+                    decision
+                },
+            );
         }
         Some(decision)
     } else {
@@ -1103,6 +1408,17 @@ fn complete_scoped_batch(
 /// Stale validation returns before removing anything or setting the batch latch.
 /// Normal canonical completion occurs only after this claim; failures fail closed.
 pub async fn resolve_permissions_conditional(
+    state: &Arc<ServerState>,
+    request: bcode_session_models::ConditionalPermissionDecision,
+) -> bcode_session_models::ConditionalPermissionResult {
+    let state = Arc::clone(state);
+    // Transport cancellation must not abandon admitted persistence or waiter release.
+    tokio::spawn(async move { resolve_permissions_conditional_owned(&state, request).await })
+        .await
+        .unwrap_or(bcode_session_models::ConditionalPermissionResult::CompletionFailed)
+}
+
+async fn resolve_permissions_conditional_owned(
     state: &ServerState,
     request: bcode_session_models::ConditionalPermissionDecision,
 ) -> bcode_session_models::ConditionalPermissionResult {
@@ -1185,15 +1501,12 @@ pub async fn resolve_permissions_conditional(
             return Result::Invalid;
         }
     }
-    // Approval must be crash-atomic in canonical storage, not merely all-or-none
-    // waiter release. The current session API exposes only single-event appends.
-    // Do not silently fall back to sequential approvals while that API is absent.
-    if request.batch_id.is_some() && request.approved {
-        return Result::BatchApprovalUnavailable;
+    if request.batch_id.is_some() {
+        let batch = batch.as_ref().expect("validated batch");
+        return complete_conditional_batch(state, &request, pending, decision, batch).await;
     }
-    // No awaits between final comparison and removal of the complete set.
-    // Keep the decision latch locked until ALL canonical records are settled;
-    // late registration cannot inherit approval before persistence succeeds.
+    // Individual admission is claimed under the same fence; owned completion survives
+    // caller cancellation. Recovered checkpoints retain their existing recovery owner.
     let permissions = expected
         .keys()
         .map(|id| {
@@ -1206,43 +1519,76 @@ pub async fn resolve_permissions_conditional(
     complete_conditional_permissions(state, &request, permissions, decision).await
 }
 
+async fn complete_conditional_batch(
+    state: &ServerState,
+    request: &bcode_session_models::ConditionalPermissionDecision,
+    mut pending: tokio::sync::MutexGuard<'_, PendingPermissions>,
+    mut decision: Option<tokio::sync::MutexGuard<'_, Option<bool>>>,
+    batch: &PendingPermissionBatch,
+) -> bcode_session_models::ConditionalPermissionResult {
+    use bcode_session_models::ConditionalPermissionResult as Result;
+    // Keep the checkpoint fence through commit so cancellation, replacement and late
+    // registration cannot race the exact set validated by the admission owner.
+    let permissions = request
+        .expected
+        .iter()
+        .map(|identity| pending.entries[&identity.permission_id].clone())
+        .collect::<Vec<_>>();
+    let source = permissions[0].summary.session_id;
+    let ids = permissions
+        .iter()
+        .map(|value| value.summary.permission_id.clone())
+        .collect();
+    let events = match state
+        .sessions
+        .append_permission_batch_resolved(source, ids, request.approved)
+        .await
+    {
+        Ok(events) => events,
+        Err(error) => {
+            tracing::warn!("failed to commit conditional permission batch: {error}");
+            return Result::CompletionFailed;
+        }
+    };
+    for identity in &request.expected {
+        pending
+            .remove(&identity.permission_id)
+            .expect("validated checkpoint under exclusive lock");
+    }
+    batch
+        .scoped_closed
+        .store(true, std::sync::atomic::Ordering::Release);
+    if let Some(decision) = &mut decision {
+        **decision = Some(request.approved);
+    }
+    drop(pending);
+    drop(decision);
+    for permission in &permissions {
+        *permission.decision.lock().await = Some(request.approved);
+    }
+    for permission in &permissions {
+        permission.notify.notify_waiters();
+    }
+    // Plugin publication and routed invalidation must not delay committed waiters.
+    for event in &events {
+        publish_session_event(state, event).await;
+    }
+    for permission in &permissions {
+        notify_interaction_destination(state, &permission.summary).await;
+    }
+    Result::Resolved {
+        resolved: permissions.len(),
+    }
+}
+
 async fn complete_conditional_permissions(
     state: &ServerState,
     request: &bcode_session_models::ConditionalPermissionDecision,
     permissions: Vec<PendingPermission>,
-    mut decision: Option<tokio::sync::MutexGuard<'_, Option<bool>>>,
+    decision: Option<tokio::sync::MutexGuard<'_, Option<bool>>>,
 ) -> bcode_session_models::ConditionalPermissionResult {
     use bcode_session_models::ConditionalPermissionResult as Result;
-    if request.batch_id.is_some() {
-        let mut recorded = true;
-        for permission in &permissions {
-            recorded &= append_permission_resolved_event(
-                state,
-                permission.summary.session_id,
-                permission.summary.permission_id.clone(),
-                request.approved,
-            )
-            .await;
-        }
-        let approved = request.approved && recorded;
-        if let Some(decision) = &mut decision {
-            **decision = Some(approved);
-        }
-        drop(decision);
-        // Never release a prefix of a batch while later canonical writes can fail.
-        for permission in &permissions {
-            *permission.decision.lock().await = Some(approved);
-            permission.notify.notify_waiters();
-            notify_interaction_destination(state, &permission.summary).await;
-        }
-        return if recorded {
-            Result::Resolved {
-                resolved: permissions.len(),
-            }
-        } else {
-            Result::CompletionFailed
-        };
-    }
+    debug_assert!(request.batch_id.is_none());
     drop(decision);
     let permission = permissions
         .into_iter()
@@ -1504,6 +1850,18 @@ pub async fn cancel_pending_permissions_for_session(state: &ServerState, session
 
 /// Resolve one complete pending permission batch without transport framing.
 pub async fn resolve_permission_batch(
+    state: &Arc<ServerState>,
+    batch_id: &str,
+    approved: bool,
+) -> usize {
+    let state = Arc::clone(state);
+    let batch_id = batch_id.to_owned();
+    tokio::spawn(async move { resolve_permission_batch_owned(&state, &batch_id, approved).await })
+        .await
+        .unwrap_or(0)
+}
+
+async fn resolve_permission_batch_owned(
     state: &ServerState,
     batch_id: &str,
     approved: bool,
@@ -1521,40 +1879,57 @@ pub async fn resolve_permission_batch(
     if batch_decision.is_some() {
         return 0;
     }
-    *batch_decision = Some(approved);
-    drop(batch_decision);
-
-    let permissions = {
-        let permission_ids = {
-            let pending = state.pending_permissions.lock().await;
-            pending
-                .iter()
-                .filter(|(_, permission)| {
-                    permission
-                        .summary
-                        .batch
-                        .as_ref()
-                        .is_some_and(|batch| batch.batch_id == batch_id)
-                })
-                .map(|(permission_id, _)| permission_id.clone())
-                .collect::<Vec<_>>()
-        };
-        let mut pending = state.pending_permissions.lock().await;
-        let mut permissions = Vec::with_capacity(permission_ids.len());
-        for permission_id in permission_ids {
-            if let Some(permission) = pending.remove(&permission_id) {
-                permissions.push(permission);
-            }
+    let mut pending = state.pending_permissions.lock().await;
+    let Some(ids) = pending.batches.get(batch_id).cloned() else {
+        // Legacy callers may deny a registered batch before its first checkpoint.
+        // There is no decision event to persist yet and no invocation can be approved.
+        if !approved {
+            *batch_decision = Some(false);
         }
-        permissions
+        return 0;
     };
-    let mut resolved = 0;
-    for permission in permissions {
-        if complete_pending_permission(state, permission, approved, false).await {
-            resolved += 1;
-        }
+    if ids.is_empty()
+        || ids.len() > bcode_session_models::MAX_SCOPED_PERMISSION_CHECKPOINTS
+        || ids
+            .iter()
+            .any(|id| pending.entries[id].summary.session_id != batch.session_id)
+    {
+        return 0;
     }
-    resolved
+    let permissions = ids
+        .iter()
+        .map(|id| pending.entries[id].clone())
+        .collect::<Vec<_>>();
+    let events = match state
+        .sessions
+        .append_permission_batch_resolved(batch.session_id, ids.iter().cloned().collect(), approved)
+        .await
+    {
+        Ok(events) => events,
+        Err(error) => {
+            tracing::warn!("failed to commit permission batch: {error}");
+            return 0;
+        }
+    };
+    for id in &ids {
+        pending.remove(id);
+    }
+    *batch_decision = Some(approved);
+    drop(pending);
+    drop(batch_decision);
+    for permission in &permissions {
+        *permission.decision.lock().await = Some(approved);
+    }
+    for permission in &permissions {
+        permission.notify.notify_waiters();
+    }
+    for event in &events {
+        publish_session_event(state, event).await;
+    }
+    for permission in &permissions {
+        notify_interaction_destination(state, &permission.summary).await;
+    }
+    permissions.len()
 }
 
 /// Validate and execute one complete server-owned tool exchange lifecycle.

@@ -9,6 +9,42 @@ mod child_transition_notification_tests {
     use super::*;
 
     #[tokio::test]
+    async fn permission_batch_actor_dropped_reply_still_commits_complete_set() {
+        let root = tempfile::tempdir().unwrap();
+        let manager = crate::SessionManager::persistent(root.path()).unwrap();
+        let session = manager
+            .create_session(None, root.path().into())
+            .await
+            .unwrap();
+        let handle = manager.session_handle(session.id).await.unwrap();
+        let (reply, receiver) = oneshot::channel();
+        handle
+            .commands
+            .send(SessionCommand::ResolvePermissionBatch {
+                permission_ids: vec!["first".into(), "second".into()],
+                approved: true,
+                activity_timestamp_ms: 10,
+                reply,
+            })
+            .await
+            .unwrap();
+        drop(receiver);
+        // The actor mailbox barrier observes completion even though its reply was abandoned.
+        let history = handle.history().await.unwrap();
+        let decisions = history
+            .iter()
+            .filter(|event| {
+                matches!(
+                    event.kind,
+                    SessionEventKind::PermissionResolved { approved: true, .. }
+                )
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(decisions.len(), 2);
+        assert_eq!(decisions[1].sequence, decisions[0].sequence + 1);
+    }
+
+    #[tokio::test]
     async fn cancelled_child_transition_reply_still_notifies_once() {
         let root = tempfile::tempdir().unwrap();
         let manager = crate::SessionManager::persistent(root.path()).unwrap();
@@ -534,6 +570,21 @@ impl SessionHandle {
             kind,
             cost,
             original,
+            activity_timestamp_ms,
+            reply,
+        })
+        .await?
+    }
+
+    pub async fn append_permission_batch_resolved(
+        &self,
+        permission_ids: Vec<String>,
+        approved: bool,
+        activity_timestamp_ms: u64,
+    ) -> Result<Vec<SessionEvent>, SessionError> {
+        self.send(|reply| SessionCommand::ResolvePermissionBatch {
+            permission_ids,
+            approved,
             activity_timestamp_ms,
             reply,
         })
@@ -1373,6 +1424,12 @@ enum SessionCommand {
         activity_timestamp_ms: u64,
         reply: oneshot::Sender<Result<SessionEvent, SessionError>>,
     },
+    ResolvePermissionBatch {
+        permission_ids: Vec<String>,
+        approved: bool,
+        activity_timestamp_ms: u64,
+        reply: oneshot::Sender<Result<Vec<SessionEvent>, SessionError>>,
+    },
     AppendEvent {
         kind: SessionEventKind,
         provenance: Option<SessionEventProvenance>,
@@ -1698,6 +1755,21 @@ impl SessionActor {
             return false;
         };
         match command {
+            SessionCommand::ResolvePermissionBatch {
+                permission_ids,
+                approved,
+                activity_timestamp_ms,
+                reply,
+            } => {
+                let _ = reply.send(
+                    self.append_permission_batch_resolved(
+                        permission_ids,
+                        approved,
+                        activity_timestamp_ms,
+                    )
+                    .await,
+                );
+            }
             SessionCommand::AppendEvent {
                 kind,
                 provenance,
@@ -1816,6 +1888,7 @@ impl SessionActor {
             SessionCommand::RenormalizeUsage { .. }
             | SessionCommand::RepriceUsage { .. }
             | SessionCommand::AppendUsage { .. }
+            | SessionCommand::ResolvePermissionBatch { .. }
             | SessionCommand::AppendEvent { .. }
             | SessionCommand::RecordChildTransition { .. }
             | SessionCommand::AppendEventAtGeneration { .. }
@@ -3368,6 +3441,77 @@ impl SessionActor {
         self.state.load_status = SessionLoadStatusKind::Current;
         self.refresh_snapshot();
         Ok(marker)
+    }
+
+    async fn append_permission_batch_resolved(
+        &mut self,
+        permission_ids: Vec<String>,
+        approved: bool,
+        activity_timestamp_ms: u64,
+    ) -> Result<Vec<SessionEvent>, SessionError> {
+        self.ensure_ownership()?;
+        let store = self.store.clone();
+        let _write_guard = store
+            .as_ref()
+            .map(|store| {
+                crate::lease::acquire_session_write_lock(&store.root_path(), self.state.summary.id)
+            })
+            .transpose()?;
+        if store.is_some() {
+            self.ensure_session_db_for_write().await?;
+            self.refresh_state_from_db_for_write().await?;
+        }
+        self.state
+            .next_sequence
+            .checked_add(u64::try_from(permission_ids.len()).map_err(|_| {
+                SessionError::EventSerialization("permission batch sequence overflow".into())
+            })?)
+            .ok_or_else(|| {
+                SessionError::EventSerialization("permission batch sequence overflow".into())
+            })?;
+        let events = permission_ids
+            .into_iter()
+            .enumerate()
+            .map(|(index, permission_id)| {
+                let mut event = self.state.build_next_event(
+                    SessionEventKind::PermissionResolved {
+                        permission_id,
+                        approved,
+                    },
+                    activity_timestamp_ms,
+                );
+                event.sequence = event
+                    .sequence
+                    .checked_add(u64::try_from(index).map_err(|_| {
+                        SessionError::EventSerialization(
+                            "permission batch sequence overflow".into(),
+                        )
+                    })?)
+                    .ok_or_else(|| {
+                        SessionError::EventSerialization(
+                            "permission batch sequence overflow".into(),
+                        )
+                    })?;
+                Ok((event, Some(activity_timestamp_ms)))
+            })
+            .collect::<Result<Vec<_>, SessionError>>()?;
+        if store.is_some() {
+            self.db
+                .as_ref()
+                .ok_or(SessionError::DbUnavailable(self.state.summary.id))?
+                .append_event_batch(&events)
+                .await?;
+        }
+        // Permission resolutions have no fallible memory-only projections. Canonical commit
+        // precedes every broker publication, including for the first batch member.
+        for (event, _) in &events {
+            self.state
+                .apply_persisted_event(event.clone(), activity_timestamp_ms);
+        }
+        self.update_manifest_and_schedule_catalog().await;
+        self.state.load_status = SessionLoadStatusKind::Current;
+        self.refresh_snapshot();
+        Ok(events.into_iter().map(|(event, _)| event).collect())
     }
 
     async fn append_event(

@@ -1898,6 +1898,41 @@ mod tests {
     use super::*;
     use bcode_session_models::ToolInvocationResult;
 
+    #[test]
+    fn permission_batch_retains_legacy_canonical_encoding_and_future_rejection() {
+        let session_id = SessionId::new();
+        for approved in [false, true] {
+            // Persistence JSON is the product input/output in this compatibility test.
+            let legacy = serde_json::json!({
+                "schema_version": CURRENT_SESSION_EVENT_SCHEMA_VERSION,
+                "sequence": 7, "timestamp_ms": 13, "session_id": session_id,
+                "kind": {"permission_resolved": {"permission_id": "legacy-checkpoint", "approved": approved}}
+            });
+            let decoded = decode_session_event(&legacy.to_string()).unwrap();
+            assert!(
+                matches!(&decoded.kind, SessionEventKind::PermissionResolved {
+                permission_id, approved: decision,
+            } if permission_id == "legacy-checkpoint" && *decision == approved)
+            );
+            let encoded = encode_session_event(&decoded).unwrap();
+            let encoded: serde_json::Value = serde_json::from_str(&encoded).unwrap();
+            assert_eq!(encoded["kind"], legacy["kind"]);
+            assert_eq!(decode_session_event(&encoded.to_string()).unwrap(), decoded);
+            let mut future = legacy.clone();
+            future["schema_version"] = serde_json::json!(CURRENT_SESSION_EVENT_SCHEMA_VERSION + 1);
+            assert!(matches!(
+                decode_session_event(&future.to_string()),
+                Err(PersistedSessionEventError::UnsupportedSchemaVersion { .. })
+            ));
+            let mut unknown = legacy;
+            unknown["kind"] = serde_json::json!({"FuturePermissionBatch": {"approved": approved}});
+            assert!(matches!(
+                decode_session_event(&unknown.to_string()),
+                Err(PersistedSessionEventError::UnsupportedEventKind { .. })
+            ));
+        }
+    }
+
     fn child_creation_event(spawned: bool) -> SessionEvent {
         let child_id = SessionId::new();
         let request = bcode_session_models::SessionChildCreateRequest {

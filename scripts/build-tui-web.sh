@@ -18,6 +18,7 @@ fi
 # Metadata resolves the selected patch/dependency, not an unrelated worktree.
 METADATA=$(cargo metadata --locked --format-version 1)
 BMUX_MANIFEST=$(printf '%s' "$METADATA" | python3 -c 'import json,sys; p=[p for p in json.load(sys.stdin)["packages"] if p["name"]=="bmux_web_renderer"]; assert len(p)==1,"ambiguous BMUX renderer"; print(p[0]["manifest_path"])')
+BMUX_SOURCE=$(printf '%s' "$METADATA" | python3 -c 'import json,sys; p=[p for p in json.load(sys.stdin)["packages"] if p["name"]=="bmux_web_renderer"]; assert len(p)==1 and p[0].get("source"),"distribution requires a resolved remote BMUX source"; print(p[0]["source"])')
 BRIDGE="$(dirname "$BMUX_MANIFEST")/browser/interactive-surface.js"
 [[ -f "$BRIDGE" ]] || { echo 'resolved BMUX interactive bridge missing' >&2; exit 1; }
 VERSION=$(python3 -c 'import tomllib; p=[p for p in tomllib.load(open("Cargo.lock","rb"))["package"] if p["name"]=="wasm-bindgen"]; assert len(p)==1,"ambiguous wasm-bindgen ABI"; print(p[0]["version"])')
@@ -47,20 +48,27 @@ if [[ ! -f ${WASM_STDLIB[0]} ]]; then
     WASM_BINDGEN="$BINDGEN" bash "$0" "$OUTPUT"
 fi
 cargo build --locked -p bcode_tui_web --target wasm32-unknown-unknown --features wasm --release
-# Build once into a new directory; never overwrite a published artifact.
-mkdir -p "$OUTPUT"
-"$BINDGEN" "$TARGET/wasm32-unknown-unknown/release/bcode_tui_web.wasm" --target web --out-dir "$OUTPUT" --out-name bcode_tui_web --no-typescript
-cp packages/tui-web/browser/index.html packages/tui-web/browser/bootstrap.js "$OUTPUT/"
-cp packages/tui-web/src/browser-session.js "$OUTPUT/"
-cp "$BRIDGE" "$OUTPUT/interactive-surface.js"
-python3 - "$OUTPUT" "$VERSION" "$BMUX_MANIFEST" "$BINDGEN" <<'PY'
+# Generate into a private sibling. A failed bindgen/copy/manifest step must not
+# publish a partial distribution under the caller's final path.
+mkdir -p "$(dirname "$OUTPUT")"
+STAGING=$(mktemp -d "${OUTPUT}.building.XXXXXXXX")
+trap '[[ ! -d "$STAGING" ]] || printf "Unpublished build retained at %s\\n" "$STAGING" >&2' EXIT
+"$BINDGEN" "$TARGET/wasm32-unknown-unknown/release/bcode_tui_web.wasm" --target web --out-dir "$STAGING" --out-name bcode_tui_web --no-typescript
+cp packages/tui-web/browser/index.html packages/tui-web/browser/bootstrap.js "$STAGING/"
+cp packages/tui-web/src/browser-session.js "$STAGING/"
+cp "$BRIDGE" "$STAGING/interactive-surface.js"
+python3 - "$STAGING" "$VERSION" "$BMUX_SOURCE" "$BINDGEN" <<'PY'
 import hashlib,json,pathlib,sys
 root=pathlib.Path(sys.argv[1])
 files={p.name:{"sha256":hashlib.sha256(p.read_bytes()).hexdigest(),"bytes":p.stat().st_size} for p in sorted(root.iterdir()) if p.is_file()}
 required={"index.html","bootstrap.js","browser-session.js","interactive-surface.js","bcode_tui_web.js","bcode_tui_web_bg.wasm"}
 assert files.keys()==required, "unexpected artifact files"
 identity=hashlib.sha256(json.dumps(files,sort_keys=True,separators=(",",":")).encode()).hexdigest()
-manifest={"schema_version":1,"artifact_sha256":identity,"wasm_bindgen_version":sys.argv[2],"bmux_manifest":sys.argv[3],"wasm_bindgen_cli_sha256":hashlib.sha256(pathlib.Path(sys.argv[4]).read_bytes()).hexdigest(),"files":files,"capabilities":["shared_bmux_editor","shared_transcript_viewport","shared_native_markdown_projection","canonical_markdown_selection_copy"],"gaps":["plugin_surfaces","tool_permission_interaction_controls","artifact_images","history_paging","native_theme_and_keymap_transport","action_activation"]}
+manifest={"schema_version":2,"protocol":{"session_view":1,"browser_bridge":1,"canvas":1},"artifact_sha256":identity,"wasm_bindgen_version":sys.argv[2],"bmux_source":sys.argv[3],"wasm_bindgen_cli_sha256":hashlib.sha256(pathlib.Path(sys.argv[4]).read_bytes()).hexdigest(),"files":files,"capabilities":["shared_bmux_editor","shared_transcript_viewport","shared_native_markdown_projection","canonical_markdown_selection_copy"],"gaps":["plugin_surfaces","tool_permission_interaction_controls","artifact_images","history_paging","native_theme_and_keymap_transport","action_activation"]}
 (root/"manifest.json").write_text(json.dumps(manifest,sort_keys=True,indent=2)+"\n")
-print(f"browser artifact sha256:{identity}\n{root}")
+print(f"browser artifact sha256:{identity}")
 PY
+# GNU mv's no-clobber rename preserves a concurrently published output as well.
+mv --no-clobber --no-target-directory "$STAGING" "$OUTPUT"
+[[ ! -d "$STAGING" ]] || { echo 'output appeared during build; refusing to overwrite it' >&2; exit 1; }
+printf '%s\n' "$OUTPUT"

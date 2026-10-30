@@ -2,6 +2,7 @@
 
 use std::collections::BTreeSet;
 
+#[cfg(feature = "native")]
 use bcode_plugin_sdk::interaction::PluginInteraction;
 use bcode_tool::{
     InteractionControlId, InteractionInput, InteractionNavigation, InteractionOutput,
@@ -11,8 +12,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::json;
 
 use super::{
-    NormalizedQuestionRequest, QUESTION_INTERACTION_KIND, QuestionAnswerPayload,
-    QuestionCustomMode, QuestionSelectionMode,
+    NormalizedQuestionRequest, QuestionAnswerPayload, QuestionCustomMode, QuestionSelectionMode,
 };
 
 /// Renderer-neutral question focus target.
@@ -332,7 +332,9 @@ impl QuestionInteractionController {
         }
     }
 
-    fn snapshot(&self) -> QuestionSnapshot {
+    /// Read the current portable presentation snapshot.
+    #[must_use]
+    pub fn snapshot(&self) -> QuestionSnapshot {
         QuestionSnapshot {
             revision: self.revision,
             layout_revision: self.layout_revision,
@@ -350,7 +352,8 @@ impl QuestionInteractionController {
         }
     }
 
-    fn handle_input(&mut self, input: InteractionInput) -> InteractionOutput {
+    /// Apply one producer-owned semantic transition.
+    pub fn handle_input(&mut self, input: InteractionInput) -> InteractionOutput {
         let layout_may_change = matches!(
             input,
             InteractionInput::Change { .. } | InteractionInput::Submit
@@ -483,8 +486,9 @@ fn dismissed() -> InteractionOutput {
     }
 }
 
+#[cfg(feature = "native")]
 impl PluginInteraction for QuestionInteractionController {
-    const KIND: &'static str = QUESTION_INTERACTION_KIND;
+    const KIND: &'static str = super::QUESTION_INTERACTION_KIND;
 
     type Request = NormalizedQuestionRequest;
     type Snapshot = QuestionSnapshot;

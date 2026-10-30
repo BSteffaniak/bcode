@@ -3,12 +3,14 @@
 //! State is returned to the host, not retained in a process-global controller map.
 
 use bcode_plugin_models::interaction_controller::{
-    INTERACTION_CONTROLLER_VERSION, InteractionControllerDiscovery,
-    InteractionControllerDiscoveryRequest, InteractionControllerRequest,
-    InteractionControllerRoute, InteractionControllerTransition, InteractionOutput,
-    MAX_CONTROLLER_BYTES,
+    INTERACTION_CONTROLLER_VERSION, InteractionControllerRequest, InteractionControllerRoute,
+    InteractionControllerTransition, InteractionOutput, MAX_CONTROLLER_BYTES,
 };
-use bcode_plugin_sdk::interaction::PluginInteraction;
+#[cfg(feature = "native")]
+use bcode_plugin_models::interaction_controller::{
+    InteractionControllerDiscovery, InteractionControllerDiscoveryRequest,
+};
+#[cfg(feature = "native")]
 use bcode_plugin_sdk::{NativeServiceContext, ServiceResponse};
 
 use super::{
@@ -16,7 +18,9 @@ use super::{
     question_interaction::QuestionInteractionController,
 };
 
-fn route() -> InteractionControllerRoute {
+/// Return the exact producer route supported by this controller.
+#[must_use]
+pub fn route() -> InteractionControllerRoute {
     InteractionControllerRoute {
         producer_id: "bcode.question".to_owned(),
         exchange_schema: QUESTION_EXCHANGE_SCHEMA.to_owned(),
@@ -28,6 +32,7 @@ fn route() -> InteractionControllerRoute {
 
 /// Route the versioned controller service. All diagnostics deliberately omit payloads.
 #[must_use]
+#[cfg(feature = "native")]
 pub fn invoke(context: &NativeServiceContext) -> ServiceResponse {
     if context.request.payload.len() > MAX_CONTROLLER_BYTES {
         return ServiceResponse::error(
@@ -46,7 +51,7 @@ pub fn invoke(context: &NativeServiceContext) -> ServiceResponse {
             if request.version != INTERACTION_CONTROLLER_VERSION {
                 return invalid();
             }
-            super::json_response(&InteractionControllerDiscovery {
+            super::question_native::json_response(&InteractionControllerDiscovery {
                 version: INTERACTION_CONTROLLER_VERSION,
                 routes: vec![route()],
             })
@@ -59,8 +64,8 @@ pub fn invoke(context: &NativeServiceContext) -> ServiceResponse {
                 return invalid();
             };
             match transition(request) {
-                Ok(response) => super::json_response(&response),
-                Err(()) => invalid(),
+                Ok(response) => super::question_native::json_response(&response),
+                Err(_) => invalid(),
             }
         }
         _ => ServiceResponse::error(
@@ -70,6 +75,7 @@ pub fn invoke(context: &NativeServiceContext) -> ServiceResponse {
     }
 }
 
+#[cfg(feature = "native")]
 fn invalid() -> ServiceResponse {
     ServiceResponse::error(
         "invalid_controller_contract",
@@ -77,7 +83,27 @@ fn invalid() -> ServiceResponse {
     )
 }
 
-fn transition(
+/// Open or advance a bounded serialized producer controller.
+///
+/// # Errors
+/// Rejects unsupported routes/versions, malformed state, and oversized transitions.
+pub fn transition(
+    request: InteractionControllerRequest,
+) -> Result<InteractionControllerTransition, QuestionControllerError> {
+    transition_inner(request).map_err(|()| QuestionControllerError)
+}
+
+/// Invalid, unsupported, or oversized question controller contract. Payloads are never included.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct QuestionControllerError;
+impl std::fmt::Display for QuestionControllerError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("invalid or unsupported question controller contract")
+    }
+}
+impl std::error::Error for QuestionControllerError {}
+
+fn transition_inner(
     request: InteractionControllerRequest,
 ) -> Result<InteractionControllerTransition, ()> {
     let (controller, output) = match request {

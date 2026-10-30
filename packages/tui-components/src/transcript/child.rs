@@ -68,6 +68,28 @@ impl Component for TranscriptChild<'_> {
             let decorated = self.decorate.map(|decorate| decorate(visible, line));
             let line = decorated.as_ref().unwrap_or(line);
             cx.write_line(LocalRect::new(0, i64::from(y), width, 1), line);
+            if self.metadata
+                && visible.source == VisibleTranscriptSource::Transcript
+                && let Some(item) = self.items.get(visible.entry_index)
+            {
+                let mut region = bmux_tui::semantic::SemanticRegion::new(
+                    format!(
+                        "{}:{}:{}",
+                        self.selection_scope,
+                        item.id().get(),
+                        visible.row_in_entry
+                    ),
+                    Rect::new(0, y, width, 1),
+                    "text",
+                );
+                region.accessibility = Some(bmux_tui::semantic::SemanticAccessibility {
+                    text: Some(
+                        bmux_tui::text::line_viewport(line, 0, usize::from(width)).plain_text(),
+                    ),
+                    ..Default::default()
+                });
+                cx.push_semantic(region);
+            }
             if !self.metadata || visible.source != VisibleTranscriptSource::Transcript {
                 continue;
             }
@@ -108,31 +130,7 @@ impl Component for TranscriptChild<'_> {
                         .saturating_add(fragment.order);
                     cx.push_selection_fragment(fragment);
                 }
-                for geometry in &projection.geometry {
-                    if !projection.contributions.iter().any(|contribution| {
-                        contribution.id == geometry.contribution_id
-                            && crate::transcript_markdown::contribution_actionable(
-                                &contribution.kind,
-                            )
-                    }) {
-                        continue;
-                    }
-                    for (index, rect) in geometry.rects.iter().enumerate() {
-                        if document_row < rect.y
-                            || document_row >= rect.y.saturating_add(rect.height)
-                        {
-                            continue;
-                        }
-                        cx.push_hit(
-                            bmux_tui::hit::HitRegion::new(
-                                format!("markdown:{}:{index}", geometry.contribution_id),
-                                Rect::new(rect.x.saturating_add(2), y, rect.width, 1),
-                            )
-                            .role(bmux_tui::hit::HitRole::Action)
-                            .layer(1),
-                        );
-                    }
-                }
+                Self::paint_markdown_actions(item, projection, document_row, y, width, cx);
             }
             self.paint_source_selection(visible, y, width, cx);
         }
@@ -140,6 +138,73 @@ impl Component for TranscriptChild<'_> {
 }
 
 impl TranscriptChild<'_> {
+    fn paint_markdown_actions(
+        item: &super::item::TranscriptItem,
+        projection: &bcode_markdown_render::MarkdownRenderResult,
+        document_row: u16,
+        y: u16,
+        width: u16,
+        cx: &mut PaintCx<'_, '_>,
+    ) {
+        for (block_index, block) in projection.code_block_selections().iter().enumerate() {
+            let Some(geometry) = projection
+                .code_block_geometry
+                .iter()
+                .find(|geometry| geometry.contribution_id == format!("code-header:{block_index}"))
+            else {
+                continue;
+            };
+            for rect in &geometry.rects {
+                if document_row >= rect.y && document_row < rect.y.saturating_add(rect.height) {
+                    cx.push_hit(
+                        bmux_tui::hit::HitRegion::new(
+                            format!(
+                                "transcript-copy:{}:{}:{width}:{}",
+                                item.id().get(),
+                                item.revision(),
+                                block.id
+                            ),
+                            Rect::new(rect.x.saturating_add(2), y, rect.width, 1),
+                        )
+                        .role(bmux_tui::hit::HitRole::Action)
+                        .layer(1),
+                    );
+                }
+            }
+        }
+        for geometry in &projection.geometry {
+            if !projection.contributions.iter().any(|contribution| {
+                contribution.id == geometry.contribution_id
+                    && (crate::transcript_markdown::contribution_actionable(&contribution.kind)
+                        || matches!(
+                            contribution.kind,
+                            bcode_markdown_render::MarkdownContributionKind::Image { .. }
+                        ))
+            }) {
+                continue;
+            }
+            for (index, rect) in geometry.rects.iter().enumerate() {
+                if document_row < rect.y || document_row >= rect.y.saturating_add(rect.height) {
+                    continue;
+                }
+                cx.push_hit(
+                    bmux_tui::hit::HitRegion::new(
+                        format!(
+                            "markdown:{}:{}:{}:{}:{index}",
+                            item.id().get(),
+                            item.revision(),
+                            width,
+                            geometry.contribution_id
+                        ),
+                        Rect::new(rect.x.saturating_add(2), y, rect.width, 1),
+                    )
+                    .role(bmux_tui::hit::HitRole::Action)
+                    .layer(1),
+                );
+            }
+        }
+    }
+
     fn paint_source_selection(
         &self,
         visible: VisibleTranscriptLine,
@@ -157,14 +222,14 @@ impl TranscriptChild<'_> {
             return;
         }
         for (index, cell) in source.cells.iter().enumerate() {
-            if cell.column >= width {
+            if cell.column >= width || cell.width > width - cell.column {
                 continue;
             }
             cx.push_selection_fragment(
                 SelectionFragment::new(
                     self.selection_scope,
                     source.identity.clone(),
-                    Rect::new(cell.column, y, cell.width.min(width - cell.column), 1),
+                    Rect::new(cell.column, y, cell.width, 1),
                     u64::try_from(visible.row_index)
                         .unwrap_or(u64::MAX)
                         .saturating_mul(1_000_000)

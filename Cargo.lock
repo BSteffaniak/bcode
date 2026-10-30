@@ -2210,7 +2210,6 @@ dependencies = [
 name = "bcode_hyperchad"
 version = "0.0.1-alpha.0"
 dependencies = [
- "axum",
  "bcode_agent_runtime",
  "bcode_bundled_plugins",
  "bcode_client",
@@ -3376,12 +3375,15 @@ dependencies = [
  "bmux_tui_components",
  "serde_json",
  "unicode-width 0.2.2",
+ "web-time",
 ]
 
 [[package]]
 name = "bcode_tui_web"
 version = "0.0.1-alpha.0"
 dependencies = [
+ "bcode_markdown_render",
+ "bcode_question_plugin",
  "bcode_session_view_models",
  "bcode_tui_components",
  "bmux_keyboard",

@@ -14,8 +14,8 @@ version     = { workspace = true }
 crate-type = ["cdylib", "rlib"]
 
 [dependencies]
-bcode_plugin_models = { workspace = true }
-bcode_plugin_sdk = { workspace = true }
+bcode_plugin_models = { workspace = true, optional = true }
+bcode_plugin_sdk = { workspace = true, optional = true }
 bcode_tool = { workspace = true }
 bcode_tui_components = { workspace = true, features = [
     "tool-card",
@@ -33,13 +33,20 @@ serde_json = { workspace = true }
 
 [features]
 default = ["dynamic-export"]
-dynamic-export = []
+dynamic-export = ["native"]
 fail-on-warnings = []
+native = ["dep:bcode_plugin_models", "dep:bcode_plugin_sdk"]
+presentation = [
+    "dep:bcode_plugin_models",
+    "dep:bcode_tui_components",
+    "dep:bmux_keyboard",
+    "dep:bmux_text_edit",
+    "dep:bmux_tui",
+    "dep:bmux_tui_components",
+]
 static-bundled = [
+    "native",
+    "presentation",
     "bcode_plugin_sdk/tui",
-    "bcode_tui_components",
-    "bmux_keyboard",
-    "bmux_text_edit",
-    "bmux_tui",
-    "bmux_tui_components",
+    "dep:bcode_tui_components",
 ]

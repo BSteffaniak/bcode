@@ -195,6 +195,55 @@ impl BrowserSession {
             .map_err(error)
     }
 
+    /// Prepare a canonical artifact image, retaining only an async generation token.
+    ///
+    /// # Errors
+    /// Rejects disposed/busy state.
+    pub fn prepare_image(&mut self, item_id: &str, reference: &str) -> Result<bool, JsValue> {
+        Ok(self.surface()?.prepare_image(item_id, reference))
+    }
+
+    /// Admit decoded bounded RGBA pixels through shared generation checks.
+    ///
+    /// # Errors
+    /// Rejects disposed/busy state; stale or invalid pixels return false.
+    pub fn accept_image(
+        &mut self,
+        bytes: Vec<u8>,
+        width: u32,
+        height: u32,
+    ) -> Result<bool, JsValue> {
+        Ok(self.surface()?.accept_image(bytes, width, height))
+    }
+
+    /// Prepare a bounded canonical artifact range from an accepted semantic reference.
+    ///
+    /// # Errors
+    /// Rejects disposed, stale or unsupported artifact references and invalid bounds.
+    pub fn prepare_artifact(
+        &mut self,
+        item_id: &str,
+        reference_key: &str,
+        offset: u64,
+        length: u32,
+    ) -> Result<String, JsValue> {
+        self.surface()?
+            .inner
+            .semantic
+            .prepare_artifact(item_id, reference_key, offset, length)
+            .map_err(error)
+    }
+
+    /// Accept a bounded history response with directional convergence checks.
+    ///
+    /// # Errors
+    /// Rejects stale, malformed or non-progressing history windows.
+    pub fn accept_history(&mut self, json: &str, direction: &str) -> Result<bool, JsValue> {
+        self.surface()?
+            .accept_history(json, direction)
+            .map_err(error)
+    }
+
     /// Validate one explicit pending control against accepted application state.
     ///
     /// # Errors
@@ -205,6 +254,15 @@ impl BrowserSession {
             .semantic
             .prepare_control(json)
             .map_err(error)
+    }
+
+    /// Acknowledge a refreshed unknown control without replaying it.
+    ///
+    /// # Errors
+    /// Rejects disposed or busy presentation state.
+    pub fn acknowledge_control(&mut self) -> Result<(), JsValue> {
+        self.surface()?.acknowledge_control();
+        Ok(())
     }
 
     /// Verify the outcome matches the exact control sent by this host.

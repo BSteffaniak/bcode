@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import { readFile } from 'node:fs/promises';
 // Source module has no Node/package dependencies; packaging selects its module URL.
 const source = await readFile(new URL('../src/browser-session.js', import.meta.url), 'utf8');
-const { readBounded, backendBase, mountBrowserSession } = await import(`data:text/javascript;base64,${Buffer.from(source).toString('base64')}`);
+const { readBounded, backendBase, mountBrowserSession, commitSemanticRegions, decodeArtifactImage } = await import(`data:text/javascript;base64,${Buffer.from(source).toString('base64')}`);
 
 function response(chunks, headers = {}) {
   let cancelled = false;
@@ -24,7 +24,7 @@ const ID = '00000000-0000-4000-8000-000000000002';
 // Host contract double only: native semantic validation and real Canvas/browser
 // behavior require their owning native tests and packaged browser smoke harness.
 async function fixture({ fetch, recoveryState = {}, timeout = 1000, fault, signal, capabilities = {}, intents = [] } = {}) {
-  const calls = [], errors = [], results = [], accessibility = [], instances = [], bodies = [];
+  const calls = [], errors = [], results = [], accessibility = [], instances = [], bodies = [], states = [], semantics = [];
   let callbacks;
   class BrowserSession {
     constructor() { this.draft = ''; this.pending = null; this.epoch = null; this.active = false; this.freed = false; instances.push(this); }
@@ -37,6 +37,10 @@ async function fixture({ fetch, recoveryState = {}, timeout = 1000, fault, signa
       if (this.epoch !== null && this.epoch !== epoch) throw 'server epoch changed; remount required';
       this.epoch = epoch; calls.push(`accept:${epoch}`);
     }
+    prepare_image() { this.check(); return true; }
+    accept_image(bytes, width, height) { this.check(); calls.push('image'); return bytes.length === width * height * 4; }
+    prepare_artifact(item, reference, offset, length) { this.check(); return `{"session_id":"${SESSION}","item_id":${JSON.stringify(item)},"reference_key":${JSON.stringify(reference)},"offset":${offset},"length":${length}}`; }
+    accept_history(json, direction) { this.check(); calls.push(`history:${direction}`); this.accept_snapshot(json); }
     input(json) { this.check(); const event = JSON.parse(json); calls.push(`input:${event.type ?? 'test'}`); if (event.text) this.draft = event.text; return event.submit === true; }
     async present() { this.check(); this.active = true; await tick(); this.active = false; calls.push('present'); return fault !== 'uncommitted'; }
     retry_submission() { this.check(); return this.pending; }
@@ -85,6 +89,7 @@ async function fixture({ fetch, recoveryState = {}, timeout = 1000, fault, signa
   const mounting = mountBrowserSession({
     wasm: { BrowserSession }, container, canvas, sessionId: SESSION, token: 'private-launch', recoveryState,
     requestTimeoutMs: timeout, pollMs: 60000, signal, capabilities, onError: message => errors.push(message), onBackendResult: result => results.push(result),
+    onState: state => states.push(state), onSemantics: regions => semantics.push(regions),
     mountInteractiveSurface(options) { callbacks = options; options.onResize({ width: 90, height: 90, device_pixel_ratio: 1 }); return { setAccessibility(value) { accessibility.push(value); }, dispose() { calls.push('bridge-dispose'); }, focus() {} }; },
     async fetch(url, options) {
       assert.equal(url.origin, 'https://ui.example'); assert.equal(options.cache, 'no-store');
@@ -94,7 +99,7 @@ async function fixture({ fetch, recoveryState = {}, timeout = 1000, fault, signa
       return fetch ? fetch(url, options) : jsonResponse(options.body ? { submission_id: ID } : { epoch: 'first' });
     },
   });
-  return { mounting, calls, errors, results, accessibility, instances, bodies, recoveryState, get callbacks() { return callbacks; } };
+  return { mounting, calls, errors, results, accessibility, instances, bodies, states, semantics, recoveryState, get callbacks() { return callbacks; } };
 }
 
 test('streamed byte budget and invalid UTF-8 fail closed', async () => {
@@ -242,6 +247,7 @@ test('history seam passes original u64 request bytes and accepts semantic replac
   await host.loadHistory('older');
   assert.match(historyBody, /"revision":18446744073709551615/);
   assert.equal(JSON.parse(historyBody).direction, 'older');
+  assert.ok(f.calls.includes('history:older'));
   assert.equal(f.results[0].type, 'history');
   await assert.rejects(host.loadHistory('arbitrary-path'), /unavailable/);
   await host.dispose();
@@ -262,9 +268,12 @@ test('typed controls validate response and refresh without automatic retry', asy
   await assert.rejects(host.control('{"type":"permission","permission_id":"p","approved":true,"remember":false}'), /outcome may be unknown/);
   assert.equal(attempts.length, 1); assert.equal(reads, 2);
   assert.ok(f.errors.some(message => message.includes('no automatic retry')));
+  await assert.rejects(host.control('{"type":"permission","permission_id":"p","approved":false,"remember":false}'), /unresolved/);
+  assert.equal(attempts.length, 1);
+  await host.acknowledgeControl();
   await host.control('{"type":"permission","permission_id":"p","approved":false,"remember":false}');
   assert.match(attempts[1], /"revision":18446744073709551615/);
-  assert.equal(reads, 3); assert.equal(f.results[0].type, 'control');
+  assert.equal(reads, 4); assert.equal(f.results[0].type, 'control');
   await assert.rejects(host.control('{"type":"invoke_skill"}'), /invalid browser control/);
   assert.equal(attempts.length, 2);
   await host.dispose();
@@ -279,6 +288,9 @@ test('unrelated control outcome fails closed and still refreshes', async () => {
   const host = await f.mounting;
   await assert.rejects(host.control('{"type":"interaction","interaction_id":"i","input":{"type":"cancel"}}'), /outcome may be unknown/);
   assert.equal(reads, 2); assert.equal(f.results.length, 0);
+  assert.equal(f.states.at(-1).controlUncertain, true);
+  await assert.rejects(host.control('{"type":"interaction","interaction_id":"i","input":{"type":"cancel"}}'), /Previous control outcome/);
+  assert.equal(reads, 2);
   await host.dispose();
 });
 
@@ -332,4 +344,121 @@ test('initialization failure releases constructed WASM', async () => {
   const f = await fixture({ fault: 'configure' });
   await assert.rejects(f.mounting, /initialization failed/);
   assert.equal(f.instances[0].freed, true);
+});
+
+test('ordinary submit never replays an unresolved operation and recovery exposes explicit retry', async () => {
+  let attempts = 0;
+  const f = await fixture({ fetch: async (url) => {
+    if (url.pathname.endsWith('/submit-message')) { attempts++; throw new Error('ambiguous'); }
+    return jsonResponse({ epoch: 'first' });
+  } });
+  const host = await f.mounting;
+  try {
+    f.callbacks.onInput({ text: 'retained', submit: true });
+    await host.refresh();
+    assert.equal(attempts, 1);
+    assert.equal(f.states.at(-1).unresolvedSubmission, true);
+    f.callbacks.onInput({ submit: true });
+    await host.refresh();
+    assert.equal(attempts, 1);
+    await assert.rejects(host.retrySubmission());
+    assert.equal(attempts, 2);
+  } finally { await host.dispose(); }
+  assert.deepEqual(f.semantics.at(-1), []);
+});
+
+test('unknown control lock survives remount and explicit acknowledgement sends no control', async () => {
+  const recoveryState = {};
+  const f = await fixture({ recoveryState, fetch: async url => {
+    if (url.pathname.endsWith('/control')) throw new Error('unknown');
+    return jsonResponse({ epoch: 'first' });
+  } });
+  const first = await f.mounting;
+  await assert.rejects(first.control('{"type":"permission","permission_id":"p","approved":true,"remember":false}'));
+  await first.dispose();
+  assert.equal(recoveryState.controlUncertain, true);
+  const next = await fixture({ recoveryState });
+  const host = await next.mounting;
+  try {
+    await assert.rejects(host.control('{"type":"permission","permission_id":"p","approved":false,"remember":false}'), /unresolved/);
+    assert.equal(next.bodies.length, 0);
+    await host.acknowledgeControl();
+    assert.equal(next.bodies.length, 0);
+    assert.equal(next.states.at(-1).controlUncertain, false);
+  } finally { await host.dispose(); }
+});
+
+test('artifact image decoder accepts bounded raster only and releases resources', async () => {
+  let closed = 0;
+  const bitmap = { width:2, height:1, close() { closed++; } };
+  const environment = {
+    async createImageBitmap(blob, options) { assert.equal(blob.type,'image/png'); assert.equal(options.resizeWidth,512); return bitmap; },
+    OffscreenCanvas: class { getContext() { return { drawImage() {}, getImageData() { return { data:new Uint8ClampedArray(8) }; } }; } },
+  };
+  const decoded = await decodeArtifactImage(new Uint8Array([1]), 'image/png', environment);
+  assert.equal(decoded.bytes.length,8); assert.equal(closed,1);
+  await assert.rejects(decodeArtifactImage(new Uint8Array([1]), 'image/svg+xml', environment), /unavailable/);
+  bitmap.width=4096;
+  await assert.rejects(decodeArtifactImage(new Uint8Array([1]), 'image/png', environment), /budget/);
+  assert.equal(closed,2);
+});
+
+test('queued keyboard input cannot activate a replacement canonical control', async () => {
+  let release;
+  const gate = new Promise(resolve => { release = resolve; });
+  let reads = 0;
+  const f = await fixture({ fetch: async () => {
+    if (++reads === 2) await gate;
+    return jsonResponse({ epoch: 'first', revision: reads });
+  } });
+  const host = await f.mounting;
+  try {
+    const refresh = host.refresh();
+    await tick();
+    f.callbacks.onInput({ type:'key', key:'Enter', code:'Enter' });
+    release();
+    await refresh;
+    await host.refresh();
+    assert.equal(f.calls.filter(call => call === 'input:key').length, 0);
+  } finally { release(); await host.dispose(); }
+});
+
+test('artifact port uses fenced requests, exact offsets, bounded bytes and no paths', async () => {
+  let body;
+  const f = await fixture({ fetch: async (url, options) => {
+    if (url.pathname.endsWith('/artifact')) {
+      body = options.body;
+      return jsonResponse({ reference_key: 'image', content_type: 'image/png', bytes: [137,80,78,71], total_bytes: '4' });
+    }
+    return jsonResponse({ epoch: 'first' });
+  } });
+  const host = await f.mounting;
+  try {
+    const range = await host.readArtifact('item', 'image', 18446744073709551615n, 16);
+    assert.match(body, /"offset":18446744073709551615/);
+    assert.deepEqual([...range.bytes], [137,80,78,71]);
+    assert.equal(range.contentType, 'image/png');
+    await assert.rejects(host.readArtifact('item', 'image', 1), /invalid/);
+    await assert.rejects(host.readArtifact('item', 'image', 0n, 131073), /invalid/);
+  } finally { await host.dispose(); }
+});
+
+test('committed semantic mirror is atomic, passive, text-only and clears on empty frame', () => {
+  const root = {
+    nodes: [],
+    ownerDocument: { createElement() { return { dataset: {}, attributes: {}, setAttribute(key, value) { this.attributes[key] = value; } }; } },
+    replaceChildren(...nodes) { this.nodes = nodes; },
+  };
+  const region = { id: 'question/one', role: 'button', area: { x: 1, y: 1, width: 2, height: 1 }, label: '<script>', text: 'literal', disabled: true, focused: true };
+  commitSemanticRegions(root, [region]);
+  assert.equal(root.nodes[0].attributes['aria-label'], '<script>');
+  assert.equal(root.nodes[0].textContent, 'literal');
+  assert.equal(root.nodes[0].onclick, undefined);
+  assert.equal(root.nodes[0].attributes['aria-disabled'], 'true');
+  const previous = root.nodes;
+  assert.throws(() => commitSemanticRegions(root, [region, region]), /invalid/);
+  assert.equal(root.nodes, previous);
+  assert.throws(() => commitSemanticRegions(root, [{ ...region, area: { ...region.area, width: 0 } }]), /invalid/);
+  commitSemanticRegions(root, []);
+  assert.deepEqual(root.nodes, []);
 });

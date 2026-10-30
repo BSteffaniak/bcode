@@ -1,6 +1,56 @@
 // Browser platform glue only. Rust/BMUX remains the sole UI/compositor authority.
 class ControlOutcomeError extends Error {}
 
+/** Decode only explicitly admitted canonical image bytes; no URL or host access. */
+export async function decodeArtifactImage(bytes, contentType, environment = globalThis) {
+  if (!(bytes instanceof Uint8Array) || bytes.byteLength === 0 || bytes.byteLength > 128 * 1024
+      || !['image/png', 'image/jpeg', 'image/webp'].includes(contentType)
+      || typeof environment.createImageBitmap !== 'function' || typeof environment.OffscreenCanvas !== 'function') throw new Error('image decode unavailable');
+  // Decode target bounds prevent oversized retained raster allocations. Browser
+  // decoder safety remains the platform's responsibility, not a host resource port.
+  const bitmap = await environment.createImageBitmap(new Blob([bytes], { type: contentType }), { resizeWidth: 512, resizeQuality: 'high' });
+  try {
+    if (!Number.isInteger(bitmap.width) || !Number.isInteger(bitmap.height) || bitmap.width < 1 || bitmap.height < 1
+        || bitmap.width > 2048 || bitmap.height > 2048 || bitmap.width * bitmap.height > 1024 * 1024) throw new Error('image dimensions exceed budget');
+    const canvas = new environment.OffscreenCanvas(bitmap.width, bitmap.height);
+    const context = canvas.getContext('2d', { willReadFrequently: true });
+    if (!context) throw new Error('image raster unavailable');
+    context.drawImage(bitmap, 0, 0);
+    const pixels = context.getImageData(0, 0, bitmap.width, bitmap.height).data;
+    return { width: bitmap.width, height: bitmap.height, bytes: new Uint8Array(pixels.buffer, pixels.byteOffset, pixels.byteLength) };
+  } finally { bitmap.close(); }
+}
+
+/** Passive accessibility mirror of committed BMUX regions, never an input authority. */
+export function commitSemanticRegions(root, regions) {
+  if (!root || !Array.isArray(regions) || regions.length > 256) throw new Error('invalid semantic mirror');
+  const ids = new Set();
+  const nodes = regions.map(region => {
+    if (!region || typeof region.id !== 'string' || region.id.length > 1024 || ids.has(region.id)
+        || typeof region.role !== 'string' || region.role.length > 128
+        || !region.area || !['x', 'y', 'width', 'height'].every(key => Number.isInteger(region.area[key]) && region.area[key] >= 0)
+        || region.area.width === 0 || region.area.height === 0) throw new Error('invalid committed semantic region');
+    ids.add(region.id);
+    for (const key of ['label', 'description', 'text']) {
+      if (region[key] != null && (typeof region[key] !== 'string' || region[key].length > 16384)) throw new Error('invalid semantic text');
+    }
+    const node = root.ownerDocument.createElement('div');
+    node.dataset.regionId = region.id;
+    // No synthetic click handlers or guessed hit coordinates. Keyboard input
+    // continues through the bridge and its committed modal focus policy.
+    node.setAttribute('role', 'group');
+    node.setAttribute('aria-roledescription', region.role);
+    if (region.label) node.setAttribute('aria-label', region.label);
+    if (region.description) node.setAttribute('aria-description', region.description);
+    if (region.disabled) node.setAttribute('aria-disabled', 'true');
+    if (region.focused) node.setAttribute('aria-current', 'true');
+    node.textContent = region.text ?? '';
+    return node;
+  });
+  // Validate every region before replacing the last committed mirror.
+  root.replaceChildren(...nodes);
+}
+
 export async function readBounded(response, limit, signal) {
   if (!response.ok) {
     void response.body?.cancel().catch(() => {});
@@ -73,6 +123,7 @@ export async function mountBrowserSession({
   backendOrigin, allowedBackendOrigins = [], cellWidth = 9, cellHeight = 18,
   fetch: fetchImpl = globalThis.fetch, pollMs = 1000, requestTimeoutMs = 15000,
   bindings = {}, recoveryState = {}, signal, capabilities = {}, onError = () => {}, onBackendResult = () => {},
+  onState = () => {}, onSemantics = () => {},
 }) {
   if (!wasm?.BrowserSession || typeof mountInteractiveSurface !== 'function') {
     throw new Error('initialized WASM and BMUX input bridge required');
@@ -92,19 +143,35 @@ export async function mountBrowserSession({
   let disposed = false, timer, bridge, rust, disposal, recoveryReady = false;
   let queue = Promise.resolve(), queued = 0;
   let columns = 0, rows = 0, lastSize;
-  let painted = false, paintGeneration = 0;
+  let painted = false, paintGeneration = 0, observationGeneration = 0;
+  let controlUncertain = recoveryState.controlUncertain === true;
+  function publishState() {
+    if (disposed) return;
+    try {
+      onState({ unresolvedSubmission: rust.retry_submission() != null, controlUncertain });
+    } catch { /* observers cannot change application or queue state */ }
+  }
+  function clearSemantics() {
+    try { onSemantics([]); } catch { /* observer */ }
+  }
   async function present() {
     painted = false;
+    clearSemantics();
     const committed = await rust.present();
     if (!disposed && committed === true) {
       painted = true; paintGeneration++;
       if (bridge && typeof rust.accessibility === 'function') {
         const json = rust.accessibility();
-        if (typeof json !== 'string' || new TextEncoder().encode(json).byteLength > 16384) throw new Error('accessibility metadata too large');
+        if (typeof json !== 'string' || new TextEncoder().encode(json).byteLength > 65536) throw new Error('accessibility metadata too large');
         const metadata = JSON.parse(json);
         if (typeof metadata.label !== 'string' || typeof metadata.description !== 'string') throw new Error('invalid accessibility metadata');
         bridge.setAccessibility({ label: metadata.label, description: metadata.description });
+        if (metadata.regions !== undefined) {
+          if (!Array.isArray(metadata.regions) || metadata.regions.length > 256) throw new Error('invalid semantic regions');
+          try { onSemantics(metadata.regions); } catch { /* observer */ }
+        }
       }
+      publishState();
     }
   }
   let pendingResize = null, resizeQueued = false, pollQueued = false;
@@ -122,6 +189,7 @@ export async function mountBrowserSession({
       throw new Error('invalid recovery state');
     }
     recoveryState.value = value;
+    publishState();
   }
   function createRust() {
     recoveryReady = false;
@@ -140,8 +208,14 @@ export async function mountBrowserSession({
     queued++;
     const work = queue.then(async () => {
       if (!disposed) {
-        try { return await operation(); }
-        finally { if (!disposed) saveRecovery(); }
+        try {
+          const result = await operation();
+          if (!disposed) saveRecovery();
+          return result;
+        } catch (error) {
+          try { if (!disposed) saveRecovery(); } catch { /* preserve the original failure */ }
+          throw error;
+        }
       }
     });
     queue = work.catch(report).finally(() => { queued--; });
@@ -197,7 +271,7 @@ export async function mountBrowserSession({
   }
   async function acceptObservation(json) {
     if (disposed) return;
-    try { rust.accept_snapshot(json); }
+    try { if (rust.accept_snapshot(json) !== false) observationGeneration++; }
     catch (error) {
       if (String(error) !== 'server epoch changed; remount required'
           && String(error) !== 'Error: server epoch changed; remount required') throw error;
@@ -211,11 +285,13 @@ export async function mountBrowserSession({
       createRust();
       if (lastSize) resize(lastSize);
       rust.accept_snapshot(json);
+      observationGeneration++;
     }
     if (!disposed) await present();
   }
   async function refresh() {
     await acceptObservation(await request(`/api/session-view/${sessionId}`));
+    publishState();
   }
   function notify(type, json) {
     if (!disposed) {
@@ -227,12 +303,15 @@ export async function mountBrowserSession({
     const body = rust.prepare_history(direction);
     const json = await request('/api/session-view/history', body);
     if (disposed) return;
-    await acceptObservation(json);
+    if (typeof rust.accept_history !== 'function') throw new Error('history acceptance unavailable');
+    if (rust.accept_history(json, direction) !== false) observationGeneration++;
+    await present();
     notify('history', json);
   }
   async function control(actionJson) {
     if (typeof actionJson !== 'string' || new TextEncoder().encode(actionJson).byteLength > 65536
         || typeof rust.prepare_control !== 'function' || typeof rust.accept_control !== 'function') throw new Error('control capability unavailable');
+    if (controlUncertain) throw new ControlOutcomeError('Previous control outcome is unresolved; explicitly acknowledge a refreshed state before acting');
     const body = rust.prepare_control(actionJson);
     let failure;
     try {
@@ -241,6 +320,9 @@ export async function mountBrowserSession({
       rust.accept_control(actionJson, json);
       notify('control', json);
     } catch (error) {
+      controlUncertain = true;
+      recoveryState.controlUncertain = true;
+      publishState();
       failure = error;
       if (!disposed) {
         try { onError('Control outcome may be unknown. Refresh pending state before deciding whether to act again; no automatic retry was sent.'); } catch { /* observer */ }
@@ -249,9 +331,47 @@ export async function mountBrowserSession({
     // Controls have no durable retry receipt. Even successful local controller
     // input consumes an observation; get a fresh canonical pending state.
     if (!disposed) {
-      try { await refresh(); } catch (error) { failure ??= error; }
+      try {
+        await refresh();
+        if (!failure && typeof rust.acknowledge_control === 'function') {
+          rust.acknowledge_control();
+          await present();
+        }
+      } catch (error) { failure ??= error; }
     }
-    if (failure) throw new ControlOutcomeError('Control outcome may be unknown; refresh required', { cause: failure });
+    if (failure) {
+      controlUncertain = true;
+      recoveryState.controlUncertain = true;
+      publishState();
+      throw new ControlOutcomeError('Control outcome may be unknown; refresh required', { cause: failure });
+    }
+  }
+  async function readArtifact(itemId, referenceKey, offset = 0n, length = 128 * 1024) {
+    if (typeof rust.prepare_artifact !== 'function' || typeof itemId !== 'string' || typeof referenceKey !== 'string'
+        || typeof offset !== 'bigint' || offset < 0n || offset > 18446744073709551615n
+        || !Number.isInteger(length) || length < 1 || length > 128 * 1024) throw new Error('invalid artifact request');
+    const body = rust.prepare_artifact(itemId, referenceKey, offset, length);
+    const json = await request('/api/session-view/artifact', body);
+    const range = JSON.parse(json);
+    if (range.reference_key !== referenceKey || !Array.isArray(range.bytes) || range.bytes.length > length
+        || !range.bytes.every(byte => Number.isInteger(byte) && byte >= 0 && byte <= 255)
+        || (range.content_type != null && (typeof range.content_type !== 'string' || range.content_type.length > 256))) throw new Error('invalid artifact response');
+    // Metadata stays encoded for exact u64 handling; only bounded bytes enter a
+    // caller-injected consumer. No server-supplied URL/path is opened by JS.
+    return { json, bytes: Uint8Array.from(range.bytes), contentType: range.content_type };
+  }
+  async function showArtifactImage(itemId, referenceKey) {
+    if (typeof rust.prepare_image !== 'function' || typeof rust.accept_image !== 'function'
+        || !rust.prepare_image(itemId, referenceKey)) throw new Error('image reference unavailable');
+    const range = await readArtifact(itemId, referenceKey);
+    const metadata = JSON.parse(range.json);
+    if (metadata.offset !== 0 || metadata.total_bytes !== range.bytes.byteLength || metadata.total_bytes > 128 * 1024) throw new Error('incomplete artifact image');
+    if (disposed) return false;
+    const decoded = await decodeArtifactImage(range.bytes, range.contentType);
+    if (disposed) return false;
+    const accepted = rust.accept_image(decoded.bytes, decoded.width, decoded.height);
+    if (accepted) await present();
+    return accepted;
   }
   async function dispatchIntents() {
     if (typeof rust.take_intents !== 'function') return;
@@ -262,6 +382,10 @@ export async function mountBrowserSession({
     for (const intent of intents) {
       if (disposed) return;
       switch (intent.type) {
+        case 'unavailable':
+          if (typeof intent.message !== 'string' || intent.message.length > 1024) throw new Error('invalid availability message');
+          try { onError(intent.message); } catch { /* observer */ }
+          break;
         case 'history': await loadHistory(intent.direction); break;
         case 'control':
           if (typeof intent.action_json !== 'string') throw new Error('invalid control intent');
@@ -272,6 +396,13 @@ export async function mountBrowserSession({
           if (!['https:', 'http:'].includes(url.protocol) || url.username || url.password) throw new Error('unsafe navigation');
           await capabilities.navigate(url.href); break;
         }
+        case 'image': await showArtifactImage(intent.item_id, intent.reference_key); break;
+        case 'artifact': {
+          if (typeof capabilities.consumeArtifact !== 'function') throw new Error('artifact consumer unavailable');
+          const range = await readArtifact(intent.item_id, intent.reference_key);
+          if (!disposed) await capabilities.consumeArtifact({ itemId: intent.item_id, referenceKey: intent.reference_key, ...range });
+          break;
+        }
         case 'clipboard':
           if (typeof capabilities.writeClipboard !== 'function' || typeof intent.text !== 'string') throw new Error('clipboard capability unavailable');
           await capabilities.writeClipboard(intent.text); break;
@@ -281,6 +412,7 @@ export async function mountBrowserSession({
   }
   async function submit(retryOnly = false) {
     let body = rust.retry_submission();
+    if (body != null && !retryOnly) throw new Error('unresolved submission requires explicit exact retry');
     if (body == null) {
       if (retryOnly) throw new Error('no unresolved submission');
       body = rust.prepare_submission(window.crypto.randomUUID());
@@ -296,6 +428,8 @@ export async function mountBrowserSession({
   async function dispose() {
     if (disposal) return disposal;
     disposed = true;
+    painted = false;
+    clearSemantics();
     controller.abort();
     signal?.removeEventListener('abort', externalAbort);
     window.clearTimeout(timer);
@@ -331,10 +465,15 @@ export async function mountBrowserSession({
         if (disposed) return;
         const json = JSON.stringify(event);
         const inputGeneration = paintGeneration;
+        const inputObservation = observationGeneration;
         const positional = event.type === 'pointer' || event.type === 'wheel';
         if (new TextEncoder().encode(json).byteLength > 65536) { report(); return; }
         void enqueue(async () => {
           // A queued coordinate belongs only to the output it was mapped against.
+          if (inputObservation !== observationGeneration) {
+            rust.cancel_pointer();
+            return;
+          }
           if (positional && (!painted || inputGeneration !== paintGeneration)) {
             rust.cancel_pointer();
             return;
@@ -356,6 +495,7 @@ export async function mountBrowserSession({
         // The bridge may already have resized the Canvas backing store. Until
         // the queued Rust repaint commits, no old hit region remains visible.
         painted = false;
+        clearSemantics();
         pendingResize = size;
         if (resizeQueued) return;
         resizeQueued = true;
@@ -375,12 +515,26 @@ export async function mountBrowserSession({
     if (disposed) throw new Error('session mount aborted');
     schedule();
   } catch (error) {
-    await dispose();
+    try { await dispose(); }
+    catch (cleanupError) {
+      throw new AggregateError([error, cleanupError], 'Browser initialization and cleanup failed');
+    }
     throw new Error('Browser session initialization failed', { cause: error });
   }
   return {
+    showArtifactImage: (itemId, referenceKey) => enqueue(() => showArtifactImage(itemId, referenceKey)),
+    readArtifact: (itemId, referenceKey, offset, length) => enqueue(() => readArtifact(itemId, referenceKey, offset, length)),
     focus: () => { if (!disposed) bridge.focus(); },
     retrySubmission: () => enqueue(() => submit(true)),
+    acknowledgeControl: () => enqueue(async () => {
+      // An explicit user gesture acknowledges ambiguity, never replays it.
+      await refresh();
+      if (typeof rust.acknowledge_control === 'function') rust.acknowledge_control();
+      controlUncertain = false;
+      recoveryState.controlUncertain = false;
+      await present();
+      publishState();
+    }),
     refresh: () => enqueue(refresh),
     loadHistory: direction => enqueue(() => loadHistory(direction)),
     control: actionJson => enqueue(() => control(actionJson)),

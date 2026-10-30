@@ -27,7 +27,8 @@ def verified_assets(bundle):
         "bcode_tui_web.js", "bcode_tui_web_bg.wasm",
     }
     files = manifest["files"]
-    if manifest["schema_version"] != 1 or set(files) != required:
+    if (manifest["schema_version"] != 2 or set(files) != required
+            or manifest.get("protocol") != {"session_view": 1, "browser_bridge": 1, "canvas": 1}):
         raise ValueError("unsupported or incomplete bundle manifest")
     identity = hashlib.sha256(
         json.dumps(files, sort_keys=True, separators=(",", ":")).encode()

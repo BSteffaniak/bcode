@@ -14,6 +14,10 @@ version     = { workspace = true }
 crate-type = ["rlib", "cdylib"]
 
 [dependencies]
+bcode_markdown_render = { workspace = true }
+bcode_question_plugin = { workspace = true, default-features = false, features = [
+    "presentation",
+] }
 bcode_session_view_models = { workspace = true }
 bcode_tui_components = { workspace = true, features = [
     "permission",

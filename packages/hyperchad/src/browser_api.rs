@@ -4,8 +4,10 @@
 //! revision identify observations, not durable stream offsets. Errors are JSON envelopes
 //! (the `HyperChad` content boundary does not expose HTTP status/header control).
 
+mod artifact;
 mod controls;
 mod history;
+mod permissions;
 
 use std::collections::BTreeMap;
 
@@ -24,7 +26,12 @@ pub fn with_routes(
     let submit_state = state.clone();
     let history_state = state.clone();
     let controls_state = state.clone();
+    let artifact_state = state.clone();
     router
+        .with_route("/api/session-view/artifact", move |request| {
+            let state = artifact_state.clone();
+            async move { state.browser_artifact(request).await }
+        })
         .with_route("/api/session-view/history", move |request| {
             let state = history_state.clone();
             async move { state.browser_history(request).await }
@@ -56,6 +63,8 @@ pub struct BrowserApiState {
     revision: u64,
     snapshots: BTreeMap<SessionId, (u64, SessionViewSnapshot)>,
     windows: BTreeMap<SessionId, bcode_session_models::ProjectionWindowRequest>,
+    permissions: BTreeMap<SessionId, permissions::PermissionObservation>,
+    policies: BTreeMap<SessionId, serde_json::Value>,
 }
 
 impl Default for BrowserApiState {
@@ -65,21 +74,30 @@ impl Default for BrowserApiState {
             revision: 0,
             snapshots: BTreeMap::new(),
             windows: BTreeMap::new(),
+            permissions: BTreeMap::new(),
+            policies: BTreeMap::new(),
         }
     }
 }
 
 impl BrowserApiState {
-    /// Serialize the complete envelope before mutating the bounded observation cache.
-    fn publish_observation(
+    fn publish_scoped_observation(
         &mut self,
         session_id: SessionId,
         snapshot: SessionViewSnapshot,
+        permissions: Option<permissions::PermissionObservation>,
+        policy: Option<serde_json::Value>,
     ) -> Result<Content, &'static str> {
+        let policy_changed = self.policies.get(&session_id) != policy.as_ref();
+        let permissions_changed = permissions
+            .as_ref()
+            .is_some_and(|next| self.permissions.get(&session_id) != Some(next));
         let revision = self
             .snapshots
             .get(&session_id)
-            .filter(|(_, previous)| previous == &snapshot)
+            .filter(|(_, previous)| {
+                previous == &snapshot && !permissions_changed && !policy_changed
+            })
             .map(|(revision, _)| *revision)
             .or_else(|| self.revision.checked_add(1))
             .ok_or("revision_exhausted")?;
@@ -87,12 +105,27 @@ impl BrowserApiState {
             schema_version: 1,
             epoch: self.epoch,
             revision,
+            policy,
             snapshot,
         };
         let mut writer = BoundedJson(Vec::new());
         serde_json::to_writer(&mut writer, &envelope).map_err(|_| "response_too_large")?;
         self.observe(session_id, envelope.snapshot)
             .ok_or("revision_exhausted")?;
+        // The opaque checkpoint set participates in the observation fence even
+        // when presentation fields happen to be identical after re-registration.
+        self.revision = self.revision.max(revision);
+        if let Some((observed_revision, _)) = self.snapshots.get_mut(&session_id) {
+            *observed_revision = revision;
+        }
+        if let Some(policy) = envelope.policy {
+            self.policies.insert(session_id, policy);
+        } else {
+            self.policies.remove(&session_id);
+        }
+        if let Some(permissions) = permissions {
+            self.permissions.insert(session_id, permissions);
+        }
         Ok(Content::Raw {
             data: writer.0.into(),
             content_type: "application/json".to_owned(),
@@ -116,6 +149,8 @@ impl BrowserApiState {
             if let Some(oldest) = oldest {
                 self.snapshots.remove(&oldest);
                 self.windows.remove(&oldest);
+                self.permissions.remove(&oldest);
+                self.policies.remove(&oldest);
             }
         }
         self.snapshots.insert(session_id, (self.revision, snapshot));
@@ -133,6 +168,9 @@ pub struct BrowserSessionSnapshot {
     /// Stable within the epoch for an unchanged complete observation.
     pub revision: u64,
     /// Complete replacement, never a patch or durable resume token.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub policy: Option<serde_json::Value>,
+    /// Full semantic state.
     pub snapshot: SessionViewSnapshot,
 }
 
@@ -283,7 +321,7 @@ impl HyperChadAppState {
             .get(&session_id)
             .cloned()
             .unwrap_or_else(crate::hyperchad_projection_window_request);
-        let Ok(Ok(snapshot)) = tokio::time::timeout(
+        let Ok(Ok(mut snapshot)) = tokio::time::timeout(
             BACKEND_TIMEOUT,
             self.browser_window_snapshot(session_id, window),
         )
@@ -291,9 +329,24 @@ impl HyperChadAppState {
         else {
             return error("session_unavailable");
         };
-        observations
-            .publish_observation(session_id, snapshot)
-            .unwrap_or_else(error)
+        let Ok(Ok(permissions)) = tokio::time::timeout(
+            BACKEND_TIMEOUT,
+            self.browser_permission_observation(session_id, &mut snapshot),
+        )
+        .await
+        else {
+            return error("permission_state_unavailable");
+        };
+        let content = match observations.publish_scoped_observation(
+            session_id,
+            snapshot,
+            Some(permissions),
+            serde_json::from_str(&self.browser_policy).ok(),
+        ) {
+            Ok(content) => content,
+            Err(code) => return error(code),
+        };
+        content
     }
 
     pub(super) async fn browser_submit(&self, request: RouteRequest) -> Content {

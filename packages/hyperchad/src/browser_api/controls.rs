@@ -228,6 +228,11 @@ impl HyperChadAppState {
             Ok(value) => value.clone(),
             Err(code) => return error(code),
         };
+        let permissions = observations
+            .permissions
+            .get(&query.session_id)
+            .cloned()
+            .unwrap_or_default();
         // Consume this observation before any controller mutation or admission.
         // A retry must first refresh; this is not an exactly-once receipt.
         let Some(next_revision) = observations.revision.checked_add(1) else {
@@ -241,7 +246,7 @@ impl HyperChadAppState {
         // rejection: no canonical exactly-once receipt exists for these controls.
         match tokio::time::timeout(
             BACKEND_TIMEOUT,
-            self.execute_browser_control(query.session_id, &observed, query.action),
+            self.execute_browser_control(query.session_id, &observed, &permissions, query.action),
         )
         .await
         {
@@ -255,53 +260,84 @@ impl HyperChadAppState {
         &self,
         session_id: bcode_session_models::SessionId,
         observed: &SessionViewSnapshot,
+        permissions: &super::permissions::PermissionObservation,
         control: Control,
     ) -> Result<Content, &'static str> {
-        let fresh = self
+        let mut fresh = self
             .session_snapshot(session_id)
             .await
             .map_err(|_| "control_state_unavailable")?;
-        let action = match control {
+        if !matches!(&control, Control::Interaction { .. }) {
+            self.browser_permission_observation(session_id, &mut fresh)
+                .await?;
+        }
+        let decision = match &control {
             Control::Permission {
                 permission_id,
                 approved,
                 remember,
-            } => permission_action(
-                observed,
-                &fresh,
-                session_id,
-                permission_id,
-                approved,
-                remember,
-            )?,
-            Control::PermissionBatch { batch_id, approved } => {
-                batch_action(observed, &fresh, batch_id, approved)?;
-                // The canonical batch API has no destination/membership CAS.
-                // Observation checks cannot make its global batch mutation safe.
-                return Err("batch_resolution_requires_scoped_membership_cas");
-            }
-            Control::Interaction {
-                interaction_id,
-                input,
             } => {
-                return self
-                    .execute_browser_interaction(
+                permission_action(
+                    observed,
+                    &fresh,
+                    session_id,
+                    permission_id.clone(),
+                    *approved,
+                    *remember,
+                )?;
+                Some((
+                    permissions.decision(
                         session_id,
-                        observed,
-                        &fresh,
-                        interaction_id,
-                        input,
-                    )
-                    .await;
+                        Some(permission_id),
+                        None,
+                        *approved,
+                        *remember,
+                    )?,
+                    false,
+                ))
             }
+            Control::PermissionBatch { batch_id, approved } => {
+                batch_action(observed, &fresh, batch_id.clone(), *approved)?;
+                Some((
+                    permissions.decision(session_id, None, Some(batch_id), *approved, false)?,
+                    true,
+                ))
+            }
+            Control::Interaction { .. } => None,
         };
-        let outcome = bcode_session_view::execute_session_view_action(&self.client, action)
+        if let Some((decision, batch)) = decision {
+            let result = self
+                .client
+                .resolve_permissions_conditional(decision)
+                .await
+                .map_err(|_| "control_outcome_unknown")?;
+            let bcode_session_models::ConditionalPermissionResult::Resolved { resolved } = result
+            else {
+                return Err("conditional_permission_not_resolved");
+            };
+            let outcome = if batch {
+                bcode_session_view_models::SessionViewActionOutcome::PermissionBatchResolved {
+                    resolved_count: resolved,
+                }
+            } else {
+                bcode_session_view_models::SessionViewActionOutcome::PermissionResolved {
+                    resolved: resolved == 1,
+                }
+            };
+            return Ok(json_content(&BrowserActionResponse {
+                schema_version: 1,
+                outcome,
+            }));
+        }
+        let Control::Interaction {
+            interaction_id,
+            input,
+        } = control
+        else {
+            return Err("invalid_control");
+        };
+        self.execute_browser_interaction(session_id, observed, &fresh, interaction_id, input)
             .await
-            .map_err(|_| "control_outcome_unknown")?;
-        Ok(json_content(&BrowserActionResponse {
-            schema_version: 1,
-            outcome,
-        }))
     }
     async fn execute_browser_interaction(
         &self,

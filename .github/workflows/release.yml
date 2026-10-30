@@ -30,7 +30,40 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
+  browser-bundle:
+    name: Build immutable shared browser bundle
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ inputs.commit_sha }}
+      - uses: DeterminateSystems/nix-installer-action@v21
+      - name: Build matched protocol-2 browser distribution
+        run: bash scripts/build-tui-web.sh "$RUNNER_TEMP/bcode-browser-bundle"
+      - name: Validate immutable inventory and compatibility
+        run: python3 scripts/test-tui-web-e2e.py --self-test --bundle "$RUNNER_TEMP/bcode-browser-bundle"
+      - uses: browser-actions/setup-chrome@v2
+        id: chrome
+      - name: Production Actix acceptance of the release bundle
+        env:
+          BCODE_E2E_CHROMIUM: ${{ steps.chrome.outputs.chrome-path }}
+          BCODE_E2E_BUNDLE: ${{ runner.temp }}/bcode-browser-bundle
+        run: |
+          nix develop --command bash -euc '
+            export BCODE_E2E_PYTHON="$(command -v python3)"
+            cargo test --locked -p bcode_hyperchad --features renderer-html-actix \
+              --test browser_e2e real_wasm_registered_router_durable_retry_and_restart \
+              -- --ignored --exact --nocapture
+          '
+      - uses: actions/upload-artifact@v4
+        with:
+          name: browser-bundle-${{ inputs.commit_sha }}
+          if-no-files-found: error
+          path: ${{ runner.temp }}/bcode-browser-bundle/
+
   build:
+    needs: browser-bundle
     name: Build ${{ matrix.target }}
     runs-on: ${{ matrix.os }}
     timeout-minutes: 180
@@ -236,8 +269,14 @@ jobs:
         shell: bash
         run: scripts/check-windows-dependency-portability.sh
 
+      - uses: actions/download-artifact@v4
+        with:
+          name: browser-bundle-${{ inputs.commit_sha }}
+          path: bcode-browser-bundle
+
       - name: Build release artifact
         env:
+          BCODE_TUI_WEB_BUNDLE: ${{ github.workspace }}/bcode-browser-bundle
           APPLE_CODESIGN_IDENTITY: ${{ secrets.APPLE_CODESIGN_IDENTITY }}
           APPLE_ID: ${{ secrets.APPLE_ID }}
           APPLE_APP_SPECIFIC_PASSWORD: ${{ secrets.APPLE_APP_SPECIFIC_PASSWORD }}

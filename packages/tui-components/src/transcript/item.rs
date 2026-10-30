@@ -998,9 +998,7 @@ fn terminal_tool_item_from_shared(tool: &ToolInvocationView) -> TranscriptItem {
         };
         return TranscriptItem::with_kind(
             "Tool presentation",
-            tool.tool_name
-                .clone()
-                .unwrap_or_else(|| "tool presentation".to_owned()),
+            super::tool_fallback::invocation_text(tool),
             matches!(
                 tool.status,
                 ToolInvocationViewStatus::Running | ToolInvocationViewStatus::Waiting

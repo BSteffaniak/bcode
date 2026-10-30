@@ -7,12 +7,19 @@
 //! snapshots and ephemeral editor, navigation and presentation state.
 
 mod bindings;
+mod image;
+mod policy;
+mod question;
 mod snapshot;
 mod surface;
 mod transcript;
 #[cfg(all(feature = "wasm", target_arch = "wasm32"))]
 mod wasm;
 
+pub use policy::{
+    BrowserBinding, BrowserDelete, BrowserEditorCommand, BrowserMotion, BrowserPolicy,
+    BrowserResolvedBinding, BrowserStroke, BrowserStyle,
+};
 pub use snapshot::{MAX_REQUEST_BYTES, MAX_RESPONSE_BYTES, SnapshotState};
 pub use surface::SessionSurface;
 #[cfg(all(feature = "wasm", target_arch = "wasm32"))]

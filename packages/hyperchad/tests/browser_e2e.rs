@@ -1,12 +1,12 @@
+#![cfg(feature = "renderer-html-actix")]
 #![cfg_attr(feature = "fail-on-warnings", deny(warnings))]
 #![warn(clippy::all, clippy::pedantic, clippy::nursery, clippy::cargo)]
 #![allow(clippy::multiple_crate_versions)]
 
 //! Opt-in real browser -> registered router -> IPC -> durable backend acceptance.
 //! No CLI daemon discovery, user configuration, external provider, or shared state.
-//! HTTP is a test-only Axum adapter over production route registration. This tests
-//! same-origin browser requests and route-token authorization, NOT the production
-//! Actix adapter, CORS allowlist, Origin enforcement, or asset middleware.
+//! HTTP is the production HTML/Actix adapter, running in an exact-executable,
+//! test-owned child with immutable validated assets. No proxy rewrites requests.
 //!
 //! Coordinator invocation after building the actual WASM distribution:
 //! `BCODE_E2E_CHROMIUM=/absolute/chromium BCODE_E2E_BUNDLE=/absolute/dist
@@ -19,10 +19,6 @@ use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use axum::body::Bytes;
-use axum::extract::State;
-use axum::http::{Method, StatusCode, Uri};
-use axum::response::IntoResponse as _;
 use bcode_client::BcodeClient;
 use bcode_hyperchad::{HyperChadAppState, router_from_state};
 use bcode_session_models::{
@@ -30,7 +26,7 @@ use bcode_session_models::{
     SubmissionReceipt,
 };
 use hyperchad::renderer::Content;
-use hyperchad::router::{RequestInfo, RouteRequest, Router};
+use hyperchad::router::{RequestInfo, RouteRequest};
 use serde_json::{Value, json};
 use sha2::{Digest as _, Sha256};
 
@@ -43,33 +39,75 @@ fn require(condition: bool, message: &str) -> TestResult<()> {
     Ok(())
 }
 
-// This adapter forwards bytes to production route registration, not mocked API methods.
-async fn route(
-    State(router): State<Router>,
-    method: Method,
-    uri: Uri,
-    body: Bytes,
-) -> axum::response::Response {
-    let mut request = RouteRequest::from_path(
-        uri.path_and_query()
-            .map_or("/", axum::http::uri::PathAndQuery::as_str),
-        RequestInfo::default(),
-    );
-    let Ok(method) = method.as_str().parse() else {
-        return StatusCode::METHOD_NOT_ALLOWED.into_response();
+#[cfg(feature = "renderer-html-actix")]
+#[test]
+#[ignore = "test-owned Actix child; invoked only by browser acceptance parent"]
+fn production_actix_child() -> TestResult<()> {
+    use hyperchad::renderer::assets::{AssetPathTarget, StaticAssetRoute};
+    let Ok(fixture) = std::env::var("BCODE_ACTIX_FIXTURE") else {
+        return Err("Actix fixture path required".into());
     };
-    request.method = method;
-    request
-        .headers
-        .insert("content-type".into(), "application/json".into());
-    request.body = Some(std::sync::Arc::new(body));
-    match router.navigate(request).await {
-        Ok(Some(Content::Raw { data, content_type })) => (
-            [(axum::http::header::CONTENT_TYPE, content_type)],
-            data.to_vec(),
-        )
-            .into_response(),
-        _ => StatusCode::BAD_GATEWAY.into_response(),
+    let fixture: Value = serde_json::from_slice(&std::fs::read(fixture)?)?;
+    let root = PathBuf::from(fixture["root"].as_str().ok_or("root")?);
+    let endpoint = bcode_ipc::IpcEndpoint::unix_socket(PathBuf::from(
+        fixture["socket"].as_str().ok_or("socket")?,
+    ));
+    let state_root = PathBuf::from(fixture["state_root"].as_str().ok_or("state_root")?);
+    let locations = bcode_config::resolve_state_location_set_with_environment(
+        &bcode_config::StateConfig::default(),
+        &bcode_config::StateLocationSelection {
+            root: Some(state_root),
+            profile: None,
+        },
+        &bcode_config::ConfigEnvironmentSnapshot::new(BTreeMap::new(), root.clone()),
+    )?;
+    let client = BcodeClient::for_state_location(endpoint, locations.primary());
+    let state = HyperChadAppState::new_in_working_directory(
+        client,
+        fixture["token"].as_str().ok_or("token")?,
+        root,
+    );
+    let address_file = PathBuf::from(fixture["address_file"].as_str().ok_or("address_file")?);
+    let builder = bcode_hyperchad::init_with_snapshot(
+        bcode_session_view_models::SessionViewSnapshot::empty(),
+        Vec::new(),
+    )
+    .with_router(router_from_state(state))
+    .with_actix_bind_address("127.0.0.1".to_owned())
+    .with_actix_port(0)
+    .with_actix_on_bound(move |address| {
+        std::fs::write(&address_file, address.to_string()).expect("publish test listener");
+    })
+    .with_static_asset_route(StaticAssetRoute {
+        route: "backend-e2e.html".into(),
+        target: AssetPathTarget::FileContents(
+            include_bytes!("../../tui-web/tests/backend-e2e.html")
+                .as_slice()
+                .into(),
+        ),
+        not_found_behavior: None,
+    })
+    .with_static_asset_route(StaticAssetRoute {
+        route: "fixture.json".into(),
+        target: AssetPathTarget::FileContents(
+            serde_json::to_vec(&json!({"session": fixture["session"], "token": fixture["token"]}))?
+                .into(),
+        ),
+        not_found_behavior: None,
+    });
+    let assets =
+        bcode_hyperchad::TuiAssets::load(Path::new(fixture["bundle"].as_str().ok_or("bundle")?))?;
+    let (app, _runtime) = bcode_hyperchad::build_app_with_runtime(assets.with_routes(builder))
+        .map_err(|error| error.to_string())?;
+    app.handle_serve().map_err(|error| error.to_string())?;
+    Ok(())
+}
+
+struct ActixChild(std::process::Child);
+impl Drop for ActixChild {
+    fn drop(&mut self) {
+        let _ = self.0.kill();
+        let _ = self.0.wait();
     }
 }
 
@@ -94,6 +132,8 @@ fn config() -> bcode_config::BcodeConfig {
     config.model.provider_plugin_id = Some("bcode.fake-provider".into());
     config.model.model_id = Some("fake-echo".into());
     config.skills.enabled = false;
+    config.model.prompt_cache.mode = serde_json::from_value(json!("off"))
+        .expect("valid isolated fake-provider prompt cache mode");
     config
 }
 
@@ -172,7 +212,10 @@ fn canonical(events: &[SessionEvent], receipt: &SubmissionReceipt, text: &str) -
             .iter()
             .filter(|event| {
                 matches!(
-                    &event.kind, SessionEventKind::AssistantMessage { text: actual }
+                    &event.kind,
+                    SessionEventKind::AssistantMessage { text: actual }
+                    | SessionEventKind::AssistantResponseSegment { text: actual, .. }
+                    | SessionEventKind::PositionedAssistantResponseSegment { text: actual, .. }
                         if actual == &format!("fake: {text}")
                 )
             })
@@ -194,27 +237,44 @@ async fn exercise(
         .create_session_in_working_directory(Some("browser-e2e".into()), root.to_path_buf())
         .await?;
     let token = SessionId::new().to_string();
-    let router = router_from_state(HyperChadAppState::new_in_working_directory(
-        client.clone(),
-        token.clone(),
-        root.to_path_buf(),
-    ));
-    let listener = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0)).await?;
-    let address = listener.local_addr()?;
-    let (stop_tx, stop_rx) = tokio::sync::oneshot::channel();
-    let http = tokio::spawn(async move {
-        axum::serve(
-            listener,
-            axum::Router::new()
-                .fallback(route)
-                .layer(axum::extract::DefaultBodyLimit::max(65_536))
-                .with_state(router),
-        )
-        .with_graceful_shutdown(async {
-            let _ = stop_rx.await;
-        })
-        .await
-    });
+    let address_file = root.join("actix-address");
+    let fixture_file = root.join("actix-fixture.json");
+    std::fs::write(
+        &fixture_file,
+        serde_json::to_vec(&json!({
+            "root": root,
+            "socket": root.join("ipc/test.sock"),
+            "state_root": root.join("state"),
+            "token": token,
+            "session": session.id,
+            "bundle": bundle,
+            "address_file": address_file,
+        }))?,
+    )?;
+    let mut http = ActixChild(
+        std::process::Command::new(std::env::current_exe()?)
+            .args([
+                "--exact",
+                "production_actix_child",
+                "--ignored",
+                "--nocapture",
+            ])
+            .env("BCODE_ACTIX_FIXTURE", fixture_file)
+            .stdin(std::process::Stdio::null())
+            .spawn()?,
+    );
+    let address = tokio::time::timeout(Duration::from_secs(30), async {
+        loop {
+            if let Ok(address) = std::fs::read_to_string(&address_file) {
+                break Ok::<_, Box<dyn std::error::Error + Send + Sync>>(address);
+            }
+            if let Some(status) = http.0.try_wait()? {
+                break Err(format!("Actix fixture exited: {status}").into());
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    })
+    .await??;
     let script = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../scripts/test-tui-web-e2e.py");
     let output = tokio::task::spawn_blocking(move || {
         std::process::Command::new(python)
@@ -232,8 +292,7 @@ async fn exercise(
             .output()
     })
     .await;
-    let _ = stop_tx.send(());
-    http.await??;
+    drop(http);
     let output = output??;
     require(
         output.status.success(),
@@ -310,6 +369,7 @@ fn explicit_path(name: &str) -> TestResult<PathBuf> {
     Ok(path)
 }
 
+#[cfg(feature = "renderer-html-actix")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore = "requires explicit BCODE_E2E_CHROMIUM, BCODE_E2E_BUNDLE and BCODE_E2E_PYTHON; no builds or user runtime"]
 async fn real_wasm_registered_router_durable_retry_and_restart() -> TestResult<()> {
@@ -342,7 +402,14 @@ async fn real_wasm_registered_router_durable_retry_and_restart() -> TestResult<(
             directory.path().to_path_buf(),
         ),
     )?;
-    let endpoint = bcode_ipc::IpcEndpoint::unix_socket(directory.path().join("ipc/test.sock"));
+    let ipc_directory = directory.path().join("ipc");
+    std::fs::create_dir(&ipc_directory)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        std::fs::set_permissions(&ipc_directory, std::fs::Permissions::from_mode(0o700))?;
+    }
+    let endpoint = bcode_ipc::IpcEndpoint::unix_socket(ipc_directory.join("test.sock"));
     let client = BcodeClient::for_state_location(endpoint.clone(), locations.primary());
     let test_config = config();
     let selection = test_config.resolved_model_selection();

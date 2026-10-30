@@ -16,6 +16,8 @@ struct Observation {
     epoch: String,
     revision: u64,
     snapshot: SessionViewSnapshot,
+    #[serde(default, rename = "policy")]
+    policy: Option<serde_json::Value>,
 }
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -167,7 +169,7 @@ impl SnapshotState {
                 return Err("stale snapshot");
             }
             if next.revision == previous.revision {
-                return if next.snapshot == previous.snapshot {
+                return if next.snapshot == previous.snapshot && next.policy == previous.policy {
                     Ok(false)
                 } else {
                     Err("conflicting snapshot revision")
@@ -176,6 +178,106 @@ impl SnapshotState {
         }
         self.accepted = Some(next);
         Ok(true)
+    }
+
+    /// Prepare an observation-scoped canonical artifact range; callers name a
+    /// semantic item and reference key, never a filesystem path or storage URI.
+    ///
+    /// # Errors
+    /// Rejects foreign references, missing observations and oversized ranges.
+    pub fn prepare_artifact(
+        &self,
+        item_id: &str,
+        reference_key: &str,
+        offset: u64,
+        length: u32,
+    ) -> Result<String, &'static str> {
+        let accepted = self.accepted.as_ref().ok_or("missing observation")?;
+        if length == 0 || length > 128 * 1024 {
+            return Err("invalid artifact range");
+        }
+        let item = accepted
+            .snapshot
+            .transcript
+            .items
+            .iter()
+            .find(|item| item.id.get() == item_id)
+            .ok_or("stale artifact")?;
+        let bcode_session_view_models::TranscriptViewItemKind::ToolInvocation { tool } = &item.kind
+        else {
+            return Err("unsupported artifact");
+        };
+        let Some(bcode_session_view_models::ToolResultView::Artifact { artifact }) = &tool.result
+        else {
+            return Err("unsupported artifact");
+        };
+        let reference = artifact
+            .artifact
+            .refs
+            .iter()
+            .find(|reference| reference.key == reference_key)
+            .ok_or("stale artifact")?;
+        if reference.byte_len.is_some_and(|length| offset > length) {
+            return Err("invalid artifact range");
+        }
+        let json = serde_json::to_string(&serde_json::json!({
+            "session_id": self.session, "epoch": accepted.epoch, "revision": accepted.revision,
+            "item_id": item_id, "reference_key": reference_key, "offset": offset, "length": length,
+        }))
+        .map_err(|_| "invalid artifact request")?;
+        if json.len() > MAX_REQUEST_BYTES {
+            return Err("request too large");
+        }
+        Ok(json)
+    }
+
+    /// Validate directional convergence before replacing a resident window.
+    ///
+    /// # Errors
+    /// Rejects oversized, malformed, non-progressing or boundary-less windows.
+    pub fn validate_history(&self, json: &str, direction: &str) -> Result<(), &'static str> {
+        self.prepare_history(direction)?;
+        if json.len() > MAX_RESPONSE_BYTES {
+            return Err("response too large");
+        }
+        let next: Observation = serde_json::from_str(json).map_err(|_| "invalid snapshot")?;
+        let previous = &self
+            .accepted
+            .as_ref()
+            .ok_or("missing observation")?
+            .snapshot
+            .transcript;
+        let document = &next.snapshot.transcript;
+        let progressing = match direction {
+            "older" => {
+                previous
+                    .source_start_sequence
+                    .zip(document.source_start_sequence)
+                    .is_some_and(|(old, new)| {
+                        new < old || (new == old && !document.has_older_history)
+                    })
+                    || (document.items.is_empty()
+                        && !document.has_older_history
+                        && document.source_start_sequence.is_none())
+            }
+            "newer" => {
+                previous
+                    .source_end_sequence
+                    .zip(document.source_end_sequence)
+                    .is_some_and(|(old, new)| {
+                        new > old || (new == old && !document.has_newer_history)
+                    })
+                    || (document.items.is_empty()
+                        && !document.has_newer_history
+                        && document.source_end_sequence.is_none())
+            }
+            "tail" => !document.has_newer_history,
+            _ => false,
+        };
+        if !progressing {
+            return Err("history window did not progress");
+        }
+        Ok(())
     }
 
     /// Prepare a bounded semantic history replacement from accepted source metadata.
@@ -479,6 +581,58 @@ mod tests {
                 )
                 .is_err()
         );
+    }
+
+    #[test]
+    fn history_windows_require_directional_progress_without_mutating_on_rejection() {
+        let mut snapshot = SessionViewSnapshot::empty();
+        snapshot.session_id = Some(SESSION.parse().unwrap());
+        snapshot.transcript.has_older_history = true;
+        snapshot.transcript.has_newer_history = true;
+        snapshot.transcript.source_start_sequence = Some(100);
+        snapshot.transcript.source_end_sequence = Some(200);
+        let encode = |snapshot: &SessionViewSnapshot, revision| {
+            serde_json::json!({
+                "schema_version":1,"epoch":EPOCH,"revision":revision,"snapshot":snapshot
+            })
+            .to_string()
+        };
+        let mut state = SnapshotState::new(SESSION.into()).unwrap();
+        state.accept(&encode(&snapshot, 1)).unwrap();
+        assert!(
+            state
+                .validate_history(&encode(&snapshot, 2), "older")
+                .is_err()
+        );
+        assert!(
+            state
+                .validate_history(&encode(&snapshot, 2), "newer")
+                .is_err()
+        );
+        snapshot.transcript.source_start_sequence = Some(50);
+        assert!(
+            state
+                .validate_history(&encode(&snapshot, 2), "older")
+                .is_ok()
+        );
+        snapshot.transcript.source_end_sequence = Some(250);
+        assert!(
+            state
+                .validate_history(&encode(&snapshot, 2), "newer")
+                .is_ok()
+        );
+        assert!(
+            state
+                .validate_history(&encode(&snapshot, 2), "tail")
+                .is_err()
+        );
+        snapshot.transcript.has_newer_history = false;
+        assert!(
+            state
+                .validate_history(&encode(&snapshot, 2), "tail")
+                .is_ok()
+        );
+        assert_eq!(state.accepted.as_ref().unwrap().revision, 1);
     }
 
     #[test]

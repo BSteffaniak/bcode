@@ -1371,6 +1371,77 @@ fn build(options: &Options) -> Result<()> {
     build_bcode_release(&options.target, &features, BcodeBuildPurpose::Developer)
 }
 
+const BROWSER_BUNDLE_FILES: [&str; 7] = [
+    "index.html",
+    "bootstrap.js",
+    "browser-session.js",
+    "interactive-surface.js",
+    "bcode_tui_web.js",
+    "bcode_tui_web_bg.wasm",
+    "manifest.json",
+];
+
+/// Verify and snapshot publication bytes before staging; never copy a mutable tree.
+fn verified_browser_bundle(root: &Path) -> Result<BTreeMap<String, Vec<u8>>> {
+    let mut files = BTreeMap::new();
+    let mut total = 0_u64;
+    for name in BROWSER_BUNDLE_FILES {
+        let path = root.join(name);
+        let metadata = fs::symlink_metadata(&path)?;
+        let limit = if name == "manifest.json" {
+            64 * 1024
+        } else {
+            64 * 1024 * 1024
+        };
+        if !metadata.file_type().is_file() || metadata.len() == 0 || metadata.len() > limit {
+            return Err(format_error(format!("invalid browser bundle file: {name}")));
+        }
+        let mut bytes = Vec::new();
+        File::open(path)?.take(limit + 1).read_to_end(&mut bytes)?;
+        total = total.saturating_add(bytes.len() as u64);
+        if bytes.len() as u64 > limit || total > 96 * 1024 * 1024 {
+            return Err(format_error("browser bundle exceeds bounds"));
+        }
+        if name == "bcode_tui_web_bg.wasm" {
+            if !bytes.starts_with(b"\0asm\x01\0\0\0") || bytes.len() <= 8 {
+                return Err(format_error("invalid browser WASM"));
+            }
+        } else {
+            std::str::from_utf8(&bytes).map_err(|_| format_error("non-UTF8 browser asset"))?;
+        }
+        files.insert(name.to_owned(), bytes);
+    }
+    let manifest: serde_json::Value = serde_json::from_slice(&files["manifest.json"])
+        .map_err(|error| format_error(format!("invalid browser manifest: {error}")))?;
+    if manifest["schema_version"] != 2
+        || manifest["protocol"]
+            != serde_json::json!({"session_view":1,"browser_bridge":1,"canvas":1})
+    {
+        return Err(format_error("unsupported browser bundle protocol"));
+    }
+    let mut digests = BTreeMap::new();
+    for (name, bytes) in files
+        .iter()
+        .filter(|(name, _)| name.as_str() != "manifest.json")
+    {
+        digests.insert(
+            name.clone(),
+            serde_json::json!({
+                "bytes": bytes.len(), "sha256": hex::encode(Sha256::digest(bytes)),
+            }),
+        );
+    }
+    let inventory =
+        serde_json::to_value(&digests).map_err(|error| format_error(error.to_string()))?;
+    let canonical =
+        serde_json::to_vec(&digests).map_err(|error| format_error(error.to_string()))?;
+    let identity = hex::encode(Sha256::digest(canonical));
+    if manifest["files"] != inventory || manifest["artifact_sha256"] != identity {
+        return Err(format_error("browser bundle inventory/digest mismatch"));
+    }
+    Ok(files)
+}
+
 fn release(options: &Options) -> Result<()> {
     ensure_windows_release_runs_natively(&options.target, "release")?;
     let features = selected_features(options, true);
@@ -1407,7 +1478,26 @@ fn release(options: &Options) -> Result<()> {
     }
 
     let staging_dir = staging_dir(options);
+    let browser_bundle = if features
+        .iter()
+        .any(|feature| matches!(feature.as_str(), "distribution" | "web-renderer"))
+    {
+        let source = env::var_os("BCODE_TUI_WEB_BUNDLE")
+            .map(PathBuf::from)
+            .ok_or_else(|| format_error("web releases require BCODE_TUI_WEB_BUNDLE pointing to a built immutable distribution"))?;
+        Some(verified_browser_bundle(&source)?)
+    } else {
+        None
+    };
     recreate_dir(&staging_dir)?;
+    if let Some(files) = browser_bundle {
+        let destination = staging_dir.join("bcode-runtimes/tui");
+        fs::create_dir_all(&destination)?;
+        for (name, bytes) in files {
+            fs::write(destination.join(name), bytes)?;
+        }
+        verified_browser_bundle(&destination)?;
+    }
     let staged_binary = staging_dir.join(binary_file_name(target_kind));
     copy_release_binary(&binary, &staged_binary)?;
     if let Some(expected_artifact_id) = artifact_id_before_postprocessing.as_deref() {
@@ -1450,6 +1540,31 @@ fn verify_release(options: &Options) -> Result<()> {
     ensure_file(&checksum_path(&archive))?;
     verify_checksum(&archive)?;
     verify_archive_contents(&archive, target_kind, include_tesseract)?;
+    if features
+        .iter()
+        .any(|feature| matches!(feature.as_str(), "distribution" | "web-renderer"))
+    {
+        let entries: BTreeSet<String> = if target_kind == TargetKind::Linux {
+            command_output(Command::new("tar").arg("-tzf").arg(&archive))?
+                .lines()
+                .map(|entry| entry.trim_start_matches("./").to_owned())
+                .collect()
+        } else {
+            let mut zip = zip::ZipArchive::new(File::open(&archive)?)?;
+            let mut entries = BTreeSet::new();
+            for index in 0..zip.len() {
+                entries.insert(zip.by_index(index)?.name().to_owned());
+            }
+            entries
+        };
+        for name in BROWSER_BUNDLE_FILES {
+            if !entries.contains(&format!("bcode-runtimes/tui/{name}")) {
+                return Err(format_error(format!(
+                    "web release missing browser asset: {name}"
+                )));
+            }
+        }
+    }
 
     if target_kind == TargetKind::Macos {
         let binary = built_binary(&options.target, target_kind);
@@ -2527,6 +2642,13 @@ fn smoke_test_release_archive_in(
         verify_binary_version(&mut version, expected_version)?;
     }
     verify_extracted_artifact_identity(&binary)?;
+    let browser_bundle = extraction.join("bcode-runtimes/tui");
+    if browser_bundle.exists() {
+        verified_browser_bundle(&browser_bundle)?;
+        // Exercise packaged discovery without a daemon or provider: invalid assets
+        // must fail before startup and must not downgrade to the HTML frontend.
+        smoke_test_packaged_browser_rejection(&binary, &browser_bundle, extraction)?;
+    }
     if include_tesseract {
         smoke_test_extracted_tesseract(extraction, target_kind)?;
     }
@@ -2540,6 +2662,87 @@ fn smoke_test_release_archive_in(
         }
     }
     Ok(())
+}
+
+fn smoke_test_packaged_browser_rejection(
+    binary: &Path,
+    bundle: &Path,
+    extraction: &Path,
+) -> Result<()> {
+    let asset = bundle.join("bootstrap.js");
+    let original = fs::read(&asset)?;
+    fs::write(&asset, b"deliberately mismatched release")?;
+    let probe = (|| {
+        let root = extraction.join("browser rejection smoke");
+        fs::create_dir_all(root.join("home"))?;
+        let config = root.join("config.toml");
+        fs::write(&config, "[skills]\nenabled = false\n")?;
+        let output_file = root.join("output.log");
+        let mut command = Command::new(binary);
+        command.env_clear();
+        for name in [
+            "PATH",
+            "SYSTEMROOT",
+            "SystemRoot",
+            "WINDIR",
+            "TEMP",
+            "TMP",
+            "LD_LIBRARY_PATH",
+            "DYLD_LIBRARY_PATH",
+        ] {
+            if let Some(value) = env::var_os(name) {
+                command.env(name, value);
+            }
+        }
+        command
+            .args(["--state-root"])
+            .arg(root.join("state"))
+            .arg("web")
+            .env("BCODE_CONFIG", &config)
+            .env("HOME", root.join("home"))
+            .env("USERPROFILE", root.join("home"))
+            .env("XDG_CONFIG_HOME", root.join("home/config"))
+            .env("XDG_STATE_HOME", root.join("home/state"))
+            .env("APPDATA", root.join("home/config"))
+            .env("LOCALAPPDATA", root.join("home/state"))
+            .stdin(Stdio::null())
+            .stdout(File::create(&output_file)?)
+            .stderr(File::create(root.join("error.log"))?);
+        let mut child = command.spawn()?;
+        let deadline = std::time::Instant::now() + Duration::from_secs(15);
+        loop {
+            if let Some(status) = child.try_wait()? {
+                let diagnostics = fs::read_to_string(root.join("error.log"))?;
+                if status.success() || !diagnostics.contains("TUI asset digest mismatch") {
+                    return Err(format_error(format!(
+                        "packaged web launch did not reject mismatched bundled assets: {status}: {diagnostics}"
+                    )));
+                }
+                if root.join("state").exists() {
+                    let entries = fs::read_dir(root.join("state"))?;
+                    if entries.count() > 0 {
+                        return Err(format_error(
+                            "invalid packaged browser assets initialized daemon state",
+                        ));
+                    }
+                }
+                break;
+            }
+            if std::time::Instant::now() >= deadline {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(format_error(
+                    "packaged invalid-browser launch did not terminate before daemon startup",
+                ));
+            }
+            std::thread::sleep(Duration::from_millis(25));
+        }
+        Ok(())
+    })();
+    // Restore exact verified bytes even when the executable probe fails.
+    fs::write(&asset, original)?;
+    verified_browser_bundle(bundle)?;
+    probe
 }
 
 fn smoke_test_extracted_tesseract(extraction: &Path, target_kind: TargetKind) -> Result<()> {
@@ -3528,6 +3731,16 @@ fn verify_required_archive_entries(
             )));
         }
     }
+    let browser_prefix = "bcode-runtimes/tui/";
+    if entries.iter().any(|name| name.starts_with(browser_prefix)) {
+        for name in BROWSER_BUNDLE_FILES {
+            if !entries.contains(&format!("{browser_prefix}{name}")) {
+                return Err(format_error(format!(
+                    "release archive is missing browser asset: {name}"
+                )));
+            }
+        }
+    }
     if !include_tesseract {
         return Ok(());
     }
@@ -3868,6 +4081,54 @@ mod tests {
     fn windows_shorthand_suggests_the_canonical_target() {
         let error = TargetKind::parse("x86_64-windows").expect_err("shorthand must fail");
         assert!(error.0.contains("x86_64-pc-windows-msvc"));
+    }
+
+    #[test]
+    #[ignore = "requires BCODE_E2E_BUNDLE pointing to an actual built browser distribution"]
+    fn browser_distribution_rejects_tamper_and_accepts_exact_rollback() {
+        let source =
+            PathBuf::from(std::env::var_os("BCODE_E2E_BUNDLE").expect("real bundle required"));
+        let assets = verified_browser_bundle(&source).expect("actual built distribution");
+        let directory = tempfile::tempdir().expect("bundle directory");
+        for (name, bytes) in &assets {
+            fs::write(directory.path().join(name), bytes).expect("copy real asset");
+        }
+        let manifest_path = directory.path().join("manifest.json");
+        let manifest: serde_json::Value =
+            serde_json::from_slice(assets.get("manifest.json").expect("real manifest"))
+                .expect("manifest JSON");
+        assert!(verified_browser_bundle(directory.path()).is_ok());
+        let archive = directory.path().join("roundtrip.zip");
+        let stage = directory.path().join("stage");
+        let staged = stage.join("bcode-runtimes/tui");
+        fs::create_dir_all(&staged).expect("staging directory");
+        for (name, bytes) in verified_browser_bundle(directory.path()).expect("verified bytes") {
+            fs::write(staged.join(name), bytes).expect("staged bytes");
+        }
+        create_zip_archive(&archive, &stage).expect("distribution archive");
+        let extracted = directory.path().join("extracted");
+        fs::create_dir(&extracted).expect("extraction directory");
+        let mut zip =
+            zip::ZipArchive::new(File::open(&archive).expect("archive file")).expect("ZIP");
+        extract_zip_confined(&mut zip, &extracted).expect("confined extraction");
+        assert_eq!(
+            verified_browser_bundle(directory.path()).expect("source"),
+            verified_browser_bundle(&extracted.join("bcode-runtimes/tui")).expect("extracted"),
+        );
+        fs::write(directory.path().join("bootstrap.js"), b"tampered").expect("tamper");
+        assert!(verified_browser_bundle(directory.path()).is_err());
+        fs::write(
+            directory.path().join("bootstrap.js"),
+            assets.get("bootstrap.js").expect("real bootstrap"),
+        )
+        .expect("rollback");
+        assert!(verified_browser_bundle(directory.path()).is_ok());
+        for field in ["session_view", "browser_bridge", "canvas"] {
+            let mut mixed = manifest.clone();
+            mixed["protocol"][field] = 2.into();
+            fs::write(&manifest_path, serde_json::to_vec(&mixed).expect("mixed")).expect("publish");
+            assert!(verified_browser_bundle(directory.path()).is_err());
+        }
     }
 
     #[test]

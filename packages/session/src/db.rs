@@ -3076,16 +3076,25 @@ impl SessionDb {
         &self,
         events: &[(SessionEvent, Option<u64>)],
     ) -> SessionDbResult<()> {
+        self.append_event_batch_checked(events, |_| Ok(())).await
+    }
+
+    async fn append_event_batch_checked(
+        &self,
+        events: &[(SessionEvent, Option<u64>)],
+        mut check: impl FnMut(usize) -> SessionDbResult<()> + Send,
+    ) -> SessionDbResult<()> {
         if events.is_empty() {
             return Ok(());
         }
         let tx = self.db.begin_transaction().await?;
         configure_turso_connection(&*tx).await?;
         validate_storage_writer_contract(&*tx).await?;
-        for (event, activity_timestamp_ms) in events {
+        for (index, (event, activity_timestamp_ms)) in events.iter().enumerate() {
             validate_append_preconditions_without_writer(&*tx, event).await?;
             append_event_projections(&*tx, event, *activity_timestamp_ms).await?;
             validate_append_postconditions(&*tx, event).await?;
+            check(index + 1)?;
         }
         tx.commit().await?;
         Ok(())
@@ -8465,6 +8474,10 @@ mod tests {
             .await
             .expect("raw rows should remain");
         assert_eq!(raw_rows.len(), 3);
+    }
+
+    mod permission_batch_tests {
+        include!("permission_batch_tests.rs");
     }
 
     #[tokio::test]
