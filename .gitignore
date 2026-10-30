@@ -28,3 +28,5 @@ model-live/
 .cursor/
 
 __pycache__/
+
+.recap/
