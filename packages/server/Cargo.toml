@@ -146,6 +146,10 @@ tempfile = { workspace = true }
 tokio = { workspace = true, features = ["test-util"] }
 tracing-subscriber = { workspace = true }
 
+[target.'cfg(target_os = "macos")'.dev-dependencies]
+# APFS filename-encoding regression tests assert the native EILSEQ error.
+libc = { workspace = true }
+
 [target.'cfg(target_os = "linux")'.dependencies]
 libc = { workspace = true }
 sshenv_vault = { workspace = true, features = [
