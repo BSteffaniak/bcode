@@ -638,9 +638,7 @@ async fn run_plugin_surface_in_shell(
             )
             .await?;
         if ready.is_some() && !shell.stop_requested() {
-            shell
-                .run_plugin_surface(surface_kind, repo_path, options)
-                .await?;
+            Box::pin(shell.run_plugin_surface(surface_kind, repo_path, options)).await?;
         }
         Ok::<(), bcode_tui::TuiError>(())
     })

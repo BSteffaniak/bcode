@@ -111,6 +111,7 @@ bcode_server            = { workspace = true }
 bcode_session           = { workspace = true }
 bcode_shell_plugin      = { workspace = true, features = ["static-bundled"] }
 bcode_vim_edit_plugin   = { workspace = true, features = ["static-bundled"] }
+bmux_terminal_protocol  = { workspace = true }
 insta                   = { workspace = true }
 tempfile                = { workspace = true }
 

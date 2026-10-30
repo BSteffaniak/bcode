@@ -345,7 +345,7 @@ async fn run_onboarding_runtime<W: io::Write>(
     let area = terminal.area();
     let theme = theme::resolve_configured_theme(tui_config, std::path::Path::new("."));
     let program = onboarding_program::OnboardingProgram::new(store, shell, &theme, area)?;
-    let presenter = onboarding_program::OnboardingPresenter::new(terminal);
+    let presenter = onboarding_program::onboarding_presenter(terminal);
     let (runtime, handle) = bmux_tui_runtime::Runtime::new(
         program,
         presenter,
@@ -378,6 +378,19 @@ fn runtime_error_with_cleanup<E: Into<TuiError>, C: Into<TuiError>>(
     cleanup_error: Option<C>,
 ) -> TuiError {
     root_program::runtime_finalization_error(error.into(), cleanup_error.map(Into::into), None)
+}
+
+fn terminal_finalization_result<T>(
+    result: Result<T, TuiError>,
+    cleanup: Result<(), TuiError>,
+) -> Result<T, TuiError> {
+    match (result, cleanup) {
+        (Ok(value), Ok(())) => Ok(value),
+        (Err(error), Ok(())) | (Ok(_), Err(error)) => Err(error),
+        (Err(error), Err(cleanup_error)) => {
+            Err(runtime_error_with_cleanup(error, Some(cleanup_error)))
+        }
+    }
 }
 
 fn current_time_ms() -> u64 {
@@ -572,8 +585,7 @@ pub async fn run_ralph_home(repo_path: std::path::PathBuf) -> Result<(), TuiErro
         ))
         .await
     };
-    let _writer = guard.leave()?;
-    result
+    terminal_finalization_result(result, guard.leave().map(|_| ()).map_err(Into::into))
 }
 
 /// Launch-scoped defaults copied into every turn admitted by this TUI.
@@ -683,15 +695,12 @@ pub async fn run_with_static_bundled_and_options(
         })
     };
 
-    match result {
-        Ok(()) => {
-            let _writer = guard.leave().map_err(|error| {
-                io::Error::new(error.kind(), format!("leaving chat terminal: {error}"))
-            })?;
-            Ok(())
-        }
-        Err(error) => Err(error),
-    }
+    terminal_finalization_result(
+        result,
+        guard.leave().map(|_| ()).map_err(|error| {
+            io::Error::new(error.kind(), format!("leaving chat terminal: {error}")).into()
+        }),
+    )
 }
 
 /// Run the full-screen review home/picker.
@@ -702,8 +711,8 @@ pub async fn run_with_static_bundled_and_options(
 #[allow(clippy::future_not_send)]
 pub async fn run_code_review_home(repo_path: std::path::PathBuf) -> Result<(), TuiError> {
     let mut shell = TerminalShell::enter()?;
-    Box::pin(shell.run_review_home(repo_path)).await?;
-    shell.finish()
+    let result = Box::pin(shell.run_review_home(repo_path)).await;
+    shell.finish_with_result(result)
 }
 
 /// Run the full-screen local code review interface for an existing workspace.
@@ -717,8 +726,8 @@ pub async fn run_code_review_workspace(
     build_mode: bool,
 ) -> Result<(), TuiError> {
     let mut shell = TerminalShell::enter()?;
-    Box::pin(shell.run_review_workspace(workspace, build_mode)).await?;
-    shell.finish()
+    let result = Box::pin(shell.run_review_workspace(workspace, build_mode)).await;
+    shell.finish_with_result(result)
 }
 
 /// Run the full-screen local code review interface.
@@ -732,8 +741,8 @@ pub async fn run_code_review(
     target: bcode_code_review_models::ReviewTarget,
 ) -> Result<(), TuiError> {
     let mut shell = TerminalShell::enter()?;
-    shell.run_review(repo_path, target).await?;
-    shell.finish()
+    let result = shell.run_review(repo_path, target).await;
+    shell.finish_with_result(result)
 }
 
 /// Run the eval run picker TUI.
@@ -754,8 +763,7 @@ pub async fn run_eval_viewer_picker(repo_path: std::path::PathBuf) -> Result<(),
         );
         Box::pin(eval_launcher::run_picker(&mut terminal, repo_path)).await
     };
-    let _writer = guard.leave()?;
-    result
+    terminal_finalization_result(result, guard.leave().map(|_| ()).map_err(Into::into))
 }
 
 /// Run the persisted metrics dashboard TUI.
@@ -784,8 +792,7 @@ pub async fn run_metrics_dashboard(
         ))
         .await
     };
-    let _writer = guard.leave()?;
-    result
+    terminal_finalization_result(result, guard.leave().map(|_| ()).map_err(Into::into))
 }
 
 /// Run the eval run viewer TUI for an optional run path.
@@ -811,13 +818,42 @@ pub async fn run_eval_viewer(
         );
         Box::pin(eval_launcher::run_viewer(&mut terminal, repo_path, run)).await
     };
-    let _writer = guard.leave()?;
-    result
+    terminal_finalization_result(result, guard.leave().map(|_| ()).map_err(Into::into))
 }
 
 #[cfg(test)]
 mod runtime_cleanup_error_tests {
-    use super::{TuiError, runtime_error_with_cleanup};
+    use super::{TuiError, runtime_error_with_cleanup, terminal_finalization_result};
+
+    #[test]
+    fn outer_terminal_finalization_preserves_both_failures() {
+        let error = terminal_finalization_result::<()>(
+            Err(TuiError::PluginService {
+                code: "screen".into(),
+                message: "screen failed".into(),
+            }),
+            Err(std::io::Error::other("outer restore failed").into()),
+        )
+        .unwrap_err();
+        let diagnostic = error.to_string();
+        assert!(diagnostic.contains("screen failed"));
+        assert!(diagnostic.contains("outer restore failed"));
+    }
+
+    #[test]
+    fn outer_terminal_finalization_reports_cleanup_after_success() {
+        let result = terminal_finalization_result(
+            Ok(42),
+            Err(std::io::Error::other("outer restore failed").into()),
+        );
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("outer restore failed")
+        );
+        assert_eq!(terminal_finalization_result(Ok(42), Ok(())).unwrap(), 42);
+    }
 
     #[test]
     fn program_error_and_distinct_presenter_cleanup_error_both_survive_conversion() {

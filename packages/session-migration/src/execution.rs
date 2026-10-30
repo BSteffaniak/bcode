@@ -1401,7 +1401,10 @@ mod tests {
                     serde_json::to_value(normalized.event.session_id).unwrap(),
                     source["session_id"]
                 );
-                assert_eq!(normalized.event.sequence, source["sequence"].as_u64().unwrap());
+                assert_eq!(
+                    normalized.event.sequence,
+                    source["sequence"].as_u64().unwrap()
+                );
                 assert_eq!(
                     normalized.event.timestamp_ms,
                     source["timestamp_ms"].as_u64().unwrap()

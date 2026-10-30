@@ -3147,138 +3147,150 @@ impl BcodeRuntimeModel {
 }
 
 /// Synchronous root presenter preserving Bcode frame, hit-map, cursor, and image commit ordering.
+///
+/// The callback is independently higher-ranked over the writer borrow: tying it
+/// to `'b` prevents generalizing the presenter inside Send runtime futures.
 #[allow(dead_code)]
-pub struct BcodeRuntimePresenter<'a, 'b, W> {
+pub type BcodeRuntimePresenter<'a, 'b, W> =
+    bmux_tui_runtime::terminal_presenter::BorrowedTerminalPresenter<
+        'a,
+        &'b mut W,
+        for<'model, 'terminal, 'writer> fn(
+            &'model mut BcodeRuntimeModel,
+            &'terminal mut bmux_tui::terminal::Terminal<&'writer mut W>,
+        )
+            -> Result<bmux_tui_runtime::PresentReport, TuiError>,
+    >;
+
+/// Compose Bcode's synchronous frame policy with BMUX terminal lifecycle.
+#[must_use]
+pub fn bcode_runtime_presenter<'a, 'b, W: std::io::Write>(
     terminal: &'a mut bmux_tui::terminal::Terminal<&'b mut W>,
+) -> BcodeRuntimePresenter<'a, 'b, W> {
+    bmux_tui_runtime::terminal_presenter::BorrowedTerminalPresenter::new(
+        terminal,
+        present_root_frame::<W>,
+    )
 }
 
-impl<'a, 'b, W> BcodeRuntimePresenter<'a, 'b, W> {
-    /// Create a presenter around the caller-owned terminal.
-    #[allow(dead_code)]
-    #[must_use]
-    pub const fn new(terminal: &'a mut bmux_tui::terminal::Terminal<&'b mut W>) -> Self {
-        Self { terminal }
-    }
+fn present_root_frame<W: std::io::Write>(
+    program: &mut BcodeRuntimeModel,
+    terminal: &mut bmux_tui::terminal::Terminal<&mut W>,
+) -> Result<bmux_tui_runtime::PresentReport, TuiError> {
+    // BMUX resolves against the prepared scene's focus scope (or the committed
+    // scope when no frame is prepared); PointerContext.scope is not consulted
+    // by that resolver. Bcode exposes no separate HitId capture owner.
+    terminal.set_pointer_context(bmux_tui::terminal::PointerContext {
+        scope: None,
+        capture: None,
+    });
+    let (frame_interval, damage, fast_temporal_presentation) = program.prepare_root_presentation();
+    let (draw_stats, layout) = super::chat_loop::draw_chat_frame(
+        terminal,
+        &mut program.chat,
+        &mut program.loop_state,
+        Duration::ZERO,
+        frame_interval,
+        damage,
+        fast_temporal_presentation,
+        program.committed_layout,
+        &program.transcript_selection,
+    )?;
+    commit_root_presentation(program, terminal, layout);
+    Ok(bmux_tui_runtime::PresentReport {
+        changed_cells: draw_stats.changed_cells,
+        full_repaint: draw_stats.full_repaint,
+    })
 }
 
-impl<W: std::io::Write> bmux_tui_runtime::Presenter<BcodeRuntimeModel>
-    for BcodeRuntimePresenter<'_, '_, W>
-{
-    type Error = TuiError;
-
-    fn resize(&mut self, size: bmux_tui::geometry::Size) {
-        self.terminal
-            .resize(bmux_tui::geometry::Rect::new(0, 0, size.width, size.height));
-    }
-
-    fn reset(&mut self, _reason: bmux_tui_runtime::ResetReason) {
-        self.terminal.reset();
-    }
-
-    fn present(
-        &mut self,
-        program: &mut BcodeRuntimeModel,
-    ) -> Result<bmux_tui_runtime::PresentReport, Self::Error> {
-        let (frame_interval, damage, fast_temporal_presentation) =
-            program.prepare_root_presentation();
-        let (draw_stats, layout) = super::chat_loop::draw_chat_frame(
-            self.terminal,
-            &mut program.chat,
-            &mut program.loop_state,
-            Duration::ZERO,
-            frame_interval,
-            damage,
-            fast_temporal_presentation,
-            program.committed_layout,
-            &program.transcript_selection,
-        )?;
-        program.synchronize_composer_interaction_with_paint(true);
-        program.committed_hits = self.terminal.hits().clone();
-        program.committed_selection = self.terminal.selection().clone();
-        program.committed_visual_text.clear();
-        program.committed_visual_targets.clear();
-        if let Some(layout) = layout {
-            let body = layout.body();
-            for (offset, line) in program
+/// Publish only the interaction geometry belonging to successfully flushed output.
+fn commit_root_presentation<W: std::io::Write>(
+    program: &mut BcodeRuntimeModel,
+    terminal: &bmux_tui::terminal::Terminal<&mut W>,
+    layout: Option<super::render::FrameLayout>,
+) {
+    program.synchronize_composer_interaction_with_paint(true);
+    program.committed_hits = terminal.hits().clone();
+    program.committed_selection = terminal.selection().clone();
+    program.committed_visual_text.clear();
+    program.committed_visual_targets.clear();
+    if let Some(layout) = layout {
+        let body = layout.body();
+        for (offset, line) in program
+            .chat
+            .app
+            .transcript_layout()
+            .visible_lines_from_top(
+                program.chat.app.transcript_top_row(body.height),
+                body.height,
+            )
+            .into_iter()
+            .enumerate()
+        {
+            if line.source != super::transcript_layout::VisibleTranscriptSource::Transcript {
+                continue;
+            }
+            if let Some((identity, _)) = program
                 .chat
                 .app
                 .transcript_layout()
-                .visible_lines_from_top(
-                    program.chat.app.transcript_top_row(body.height),
-                    body.height,
-                )
-                .into_iter()
-                .enumerate()
+                .content_anchor(line.entry_index, line.row_in_entry)
             {
-                if line.source != super::transcript_layout::VisibleTranscriptSource::Transcript {
-                    continue;
-                }
-                if let Some((identity, _)) = program
-                    .chat
-                    .app
-                    .transcript_layout()
-                    .content_anchor(line.entry_index, line.row_in_entry)
-                {
-                    let area = bmux_tui::geometry::Rect::new(
-                        body.x,
-                        body.y
-                            .saturating_add(u16::try_from(offset).unwrap_or(u16::MAX)),
-                        body.width,
-                        1,
-                    )
-                    .intersection(body);
-                    if !area.is_empty() {
-                        program
-                            .committed_visual_targets
-                            .push((area, identity.to_owned()));
-                    }
-                }
-                if let Some(row) = program
-                    .chat
-                    .app
-                    .transcript_layout()
-                    .selection_row(line.entry_index, line.row_in_entry)
-                {
-                    program.committed_visual_text.push(row.clone());
+                let area = bmux_tui::geometry::Rect::new(
+                    body.x,
+                    body.y
+                        .saturating_add(u16::try_from(offset).unwrap_or(u16::MAX)),
+                    body.width,
+                    1,
+                )
+                .intersection(body);
+                if !area.is_empty() {
+                    program
+                        .committed_visual_targets
+                        .push((area, identity.to_owned()));
                 }
             }
+            if let Some(row) = program
+                .chat
+                .app
+                .transcript_layout()
+                .selection_row(line.entry_index, line.row_in_entry)
+            {
+                program.committed_visual_text.push(row.clone());
+            }
         }
-        if program.focused_visual.as_ref().is_some_and(|focused| {
-            !program
-                .committed_visual_targets
-                .iter()
-                .any(|(_, identity)| identity == focused)
-        }) {
-            program.focused_visual = None;
-        }
-        let reconciliation = program
-            .transcript_selection
-            .reconcile(&program.committed_selection);
-        if reconciliation == bmux_tui::selection::SelectionOutcome::Invalidated {
-            program.clear_transcript_selection();
-            program.presentation_damage = bmux_tui::damage::Damage::Full;
-            program.fast_temporal_presentation = false;
-        } else if program.transcript_selection.phase()
-            != bmux_tui::selection::SelectionGesturePhase::Idle
-        {
-            program.refresh_selected_plain_text();
-        }
-        program.committed_area = self.terminal.area();
-        if matches!(
-            program.focused_input_owner,
-            Some(FocusedInputOwner::Composer)
-        ) {
-            let area = program.chat.app.composer_content_area();
-            program
-                .composer_field
-                .painted(program.chat.app.composer(), area, area);
-        }
-        program.committed_layout = layout;
-        Ok(bmux_tui_runtime::PresentReport {
-            changed_cells: draw_stats.changed_cells,
-            full_repaint: draw_stats.full_repaint,
-        })
     }
+    if program.focused_visual.as_ref().is_some_and(|focused| {
+        !program
+            .committed_visual_targets
+            .iter()
+            .any(|(_, identity)| identity == focused)
+    }) {
+        program.focused_visual = None;
+    }
+    let reconciliation = program
+        .transcript_selection
+        .reconcile(&program.committed_selection);
+    if reconciliation == bmux_tui::selection::SelectionOutcome::Invalidated {
+        program.clear_transcript_selection();
+        program.presentation_damage = bmux_tui::damage::Damage::Full;
+        program.fast_temporal_presentation = false;
+    } else if program.transcript_selection.phase()
+        != bmux_tui::selection::SelectionGesturePhase::Idle
+    {
+        program.refresh_selected_plain_text();
+    }
+    program.committed_area = terminal.area();
+    if matches!(
+        program.focused_input_owner,
+        Some(FocusedInputOwner::Composer)
+    ) {
+        let area = program.chat.app.composer_content_area();
+        program
+            .composer_field
+            .painted(program.chat.app.composer(), area, area);
+    }
+    program.committed_layout = layout;
 }
 
 fn selection_edge_scroll_rows(
@@ -4684,7 +4696,7 @@ pub fn runtime<'a, 'b, W: std::io::Write>(
 ) {
     let config = model.settings.bmux_runtime_config();
     let (runtime, handle) =
-        bmux_tui_runtime::Runtime::new(model, BcodeRuntimePresenter::new(terminal), config);
+        bmux_tui_runtime::Runtime::new(model, bcode_runtime_presenter(terminal), config);
     let bootstrap = BcodeRuntimeMessage::Bootstrap {
         handle: handle.clone(),
     };
@@ -7693,6 +7705,23 @@ mod tests {
         );
     }
 
+    #[test]
+    fn borrowed_stdout_root_runtime_future_is_send() {
+        fn assert_send<T: Send>(_: T) {}
+
+        // Compile the same borrowed-writer runtime shape that crosses the CLI's
+        // boxed Send future boundary, without starting a runtime or terminal I/O.
+        assert_send(async {
+            let mut stdout = std::io::stdout();
+            let mut terminal = bmux_tui::terminal::Terminal::new(
+                &mut stdout,
+                bmux_tui::geometry::Rect::new(0, 0, 80, 24),
+            );
+            let (runtime, handle) = super::runtime(&mut terminal, root_test_model());
+            super::run(runtime, handle).await
+        });
+    }
+
     struct FailingSelectionOutput {
         fail: std::rc::Rc<std::cell::Cell<bool>>,
     }
@@ -7707,6 +7736,261 @@ mod tests {
         }
         fn flush(&mut self) -> std::io::Result<()> {
             Ok(())
+        }
+    }
+
+    struct FlushFailureOutput {
+        fail: std::rc::Rc<std::cell::Cell<bool>>,
+        bytes: Vec<u8>,
+    }
+
+    impl std::io::Write for FlushFailureOutput {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            self.bytes.extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            if self.fail.get() {
+                Err(std::io::Error::other("injected frame flush failure"))
+            } else {
+                Ok(())
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn root_flush_failure_does_not_publish_normal_or_temporal_candidates() {
+        use bmux_tui_runtime::Presenter;
+
+        for temporal in [false, true] {
+            let mut model = root_test_model();
+            let fail = std::rc::Rc::new(std::cell::Cell::new(false));
+            let mut output = FlushFailureOutput {
+                fail: fail.clone(),
+                bytes: Vec::new(),
+            };
+            let mut terminal = bmux_tui::terminal::Terminal::new(
+                &mut output,
+                bmux_tui::geometry::Rect::new(0, 0, 80, 24),
+            );
+            super::bcode_runtime_presenter(&mut terminal)
+                .present(&mut model)
+                .expect("initial committed frame");
+            let committed_area = model.committed_area;
+            let committed_body = model
+                .committed_layout
+                .map(super::super::render::FrameLayout::body);
+            let committed_hits = model.committed_hits.clone();
+            let committed_selection = model.committed_selection.clone();
+            let committed_images = terminal.image_scene().clone();
+            model.focused_visual = Some("retain-until-success".to_owned());
+            model.chat.app.replace_composer_with("not delivered");
+            model.presentation_damage = model.select_presentation_damage(
+                super::super::invalidation::UiInvalidation::Paint,
+                &[super::super::app::TemporalDamage::Composer],
+            );
+            model.fast_temporal_presentation = temporal;
+            fail.set(true);
+            assert!(
+                super::bcode_runtime_presenter(&mut terminal)
+                    .present(&mut model)
+                    .is_err()
+            );
+            assert_eq!(model.committed_area, committed_area);
+            assert_eq!(
+                model
+                    .committed_layout
+                    .map(super::super::render::FrameLayout::body),
+                committed_body
+            );
+            assert_eq!(model.committed_hits, committed_hits);
+            assert_eq!(model.committed_selection, committed_selection);
+            assert_eq!(terminal.image_scene(), &committed_images);
+            assert_eq!(
+                model.focused_visual.as_deref(),
+                Some("retain-until-success")
+            );
+            fail.set(false);
+            model.presentation_damage = bmux_tui::damage::Damage::Full;
+            super::bcode_runtime_presenter(&mut terminal)
+                .present(&mut model)
+                .expect("recovery frame");
+            assert!(model.focused_visual.is_none());
+            drop(model);
+        }
+    }
+
+    #[derive(Default)]
+    struct ImageFailureOutput {
+        bytes: Vec<u8>,
+        fail_upload: bool,
+        fail_flush: bool,
+    }
+
+    impl std::io::Write for ImageFailureOutput {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            // Fail after some upload bytes reached the host, not during cell output.
+            if self.fail_upload && self.bytes.windows(3).any(|part| part == b"a=t") {
+                return Err(std::io::Error::other("injected partial image output"));
+            }
+            self.bytes.extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            if self.fail_flush {
+                Err(std::io::Error::other("injected image frame flush"))
+            } else {
+                Ok(())
+            }
+        }
+    }
+
+    // Keep the failure/recovery matrix and its ordered wire assertions in one scenario.
+    #[allow(clippy::too_many_lines)]
+    #[tokio::test]
+    async fn root_image_normal_and_temporal_failures_repair_before_reupload() {
+        use bmux_tui::geometry::Rect;
+        use bmux_tui::image::{
+            ImageContribution, ImageFit, ImageKey, ImageLifecycle, ImagePayload, ImagePixelFormat,
+            ImagePlacement,
+        };
+        use bmux_tui_runtime::Presenter;
+
+        struct ImageSurface(std::sync::Arc<std::sync::atomic::AtomicU8>);
+        impl bcode_plugin_sdk::tui::PluginTuiSurface for ImageSurface {
+            fn id(&self) -> &'static str {
+                "image-failure-fixture"
+            }
+            fn title(&self) -> &'static str {
+                "Image failure fixture"
+            }
+            fn render(&mut self, area: Rect, frame: &mut bmux_tui::paint::PaintCx<'_, '_>) {
+                frame.push_image(ImageContribution::Present(ImagePlacement {
+                    key: ImageKey::new("root-failure-image"),
+                    payload: ImagePayload::Pixels {
+                        bytes: vec![self.0.load(std::sync::atomic::Ordering::Relaxed), 0, 0, 255],
+                        width: 1,
+                        height: 1,
+                        format: ImagePixelFormat::Rgba8,
+                    },
+                    destination: area,
+                    clip: area,
+                    lifecycle: ImageLifecycle::Frame,
+                    fit: ImageFit::Stretch,
+                    allocation: None,
+                }));
+            }
+            fn handle_event(
+                &mut self,
+                _event: &bmux_tui::event::Event,
+                _host: &dyn bcode_plugin_sdk::tui::PluginTuiHost,
+            ) -> bcode_plugin_sdk::tui::PluginTuiAction {
+                bcode_plugin_sdk::tui::PluginTuiAction::None
+            }
+        }
+
+        for temporal in [false, true] {
+            for partial_output in [false, true] {
+                let mut model = root_test_model();
+                let mut config = model.chat.app.tui_config().clone();
+                config.interactions.placement = bcode_config::TuiInteractionPlacement::Pinned;
+                model.chat.app.apply_tui_config(config);
+                let pixel = std::sync::Arc::new(std::sync::atomic::AtomicU8::new(1));
+                model.loop_state.install_interactive_surface_for_test(
+                    super::super::interactive_surface::InteractiveSurfaceState::from_surface_for_test(
+                        "root-image-fixture",
+                        Box::new(ImageSurface(pixel.clone())),
+                        model.settings.keymap(),
+                    ),
+                );
+                let capabilities = bmux_image::HostImageCapabilities {
+                    kitty_graphics: true,
+                    ..Default::default()
+                };
+                model
+                    .loop_state
+                    .image_presentation_for_test(capabilities.clone());
+                let mut output = ImageFailureOutput::default();
+                let mut terminal =
+                    bmux_tui::terminal::Terminal::new(&mut output, Rect::new(0, 0, 80, 24));
+                super::bcode_runtime_presenter(&mut terminal)
+                    .present(&mut model)
+                    .expect("initial image frame");
+                assert_eq!(terminal.image_scene().placements().len(), 1);
+                assert!(String::from_utf8_lossy(&terminal.writer().bytes).contains("a=t"));
+                let scene = terminal.image_scene().clone();
+                let terminal_hits = terminal.hits().clone();
+                let terminal_selection = terminal.selection().clone();
+                let hits = model.committed_hits.clone();
+                let selection = model.committed_selection.clone();
+                let layout = model
+                    .committed_layout
+                    .map(super::super::render::FrameLayout::body);
+                pixel.store(2, std::sync::atomic::Ordering::Relaxed);
+                terminal.writer_mut().bytes.clear();
+                terminal.writer_mut().fail_upload = partial_output;
+                terminal.writer_mut().fail_flush = !partial_output;
+                model.presentation_damage = bmux_tui::damage::Damage::Full;
+                model.fast_temporal_presentation = temporal;
+                assert!(
+                    super::bcode_runtime_presenter(&mut terminal)
+                        .present(&mut model)
+                        .is_err()
+                );
+                assert!(String::from_utf8_lossy(&terminal.writer().bytes).contains("a=t"));
+                assert_eq!(terminal.image_scene(), &scene);
+                assert_eq!(terminal.hits(), &terminal_hits);
+                assert_eq!(terminal.selection(), &terminal_selection);
+                assert_eq!(model.committed_hits, hits);
+                assert_eq!(model.committed_selection, selection);
+                assert_eq!(
+                    model
+                        .committed_layout
+                        .map(super::super::render::FrameLayout::body),
+                    layout
+                );
+
+                // Probe a clone: repair debt must survive without consuming the real retry.
+                let mut repair = model
+                    .loop_state
+                    .image_presentation_for_test(capabilities.clone())
+                    .clone();
+                let mut cleanup = Vec::new();
+                repair
+                    .cleanup(&mut cleanup, &capabilities)
+                    .expect("repair cleanup probe");
+                // The committed image plus the candidate-only host ID must both
+                // be repaired; deleting only the old resident is insufficient.
+                assert!(String::from_utf8_lossy(&cleanup).matches("d=I").count() >= 2);
+                terminal.writer_mut().fail_upload = false;
+                terminal.writer_mut().fail_flush = false;
+                terminal.writer_mut().bytes.clear();
+                model.presentation_damage = bmux_tui::damage::Damage::Full;
+                model.fast_temporal_presentation = temporal;
+                super::bcode_runtime_presenter(&mut terminal)
+                    .present(&mut model)
+                    .expect("image recovery frame");
+                let retry = String::from_utf8_lossy(&terminal.writer().bytes);
+                assert!(
+                    retry.find("d=I").expect("uncertain IDs removed")
+                        < retry.find("a=t").expect("image reuploaded")
+                );
+                assert!(retry.contains("a=p"));
+                assert_ne!(terminal.image_scene(), &scene);
+                assert_eq!(terminal.image_scene().placements().len(), 1);
+                terminal.writer_mut().bytes.clear();
+                model.presentation_damage = bmux_tui::damage::Damage::Full;
+                model.fast_temporal_presentation = temporal;
+                super::bcode_runtime_presenter(&mut terminal)
+                    .present(&mut model)
+                    .expect("warm recovered frame");
+                let warm = String::from_utf8_lossy(&terminal.writer().bytes);
+                assert!(!warm.contains("a=t"));
+                assert!(!warm.contains("d=I"));
+                drop(model);
+            }
         }
     }
 
@@ -7804,7 +8088,7 @@ mod tests {
         drop(registry);
         let mut bytes = Vec::new();
         let mut terminal = bmux_tui::terminal::Terminal::new(&mut bytes, Rect::new(0, 0, 24, 40));
-        super::BcodeRuntimePresenter::new(&mut terminal)
+        super::bcode_runtime_presenter(&mut terminal)
             .present(&mut model)
             .unwrap();
         let (target, identity) = model
@@ -7833,7 +8117,7 @@ mod tests {
             super::super::invalidation::UiInvalidation::Structural
         );
         model.presentation_damage = bmux_tui::damage::Damage::Full;
-        super::BcodeRuntimePresenter::new(&mut terminal)
+        super::bcode_runtime_presenter(&mut terminal)
             .present(&mut model)
             .unwrap();
         assert_ne!(before, model.committed_visual_text);
@@ -7900,7 +8184,7 @@ mod tests {
             &mut output,
             bmux_tui::geometry::Rect::new(0, 0, 80, 24),
         );
-        super::BcodeRuntimePresenter::new(&mut terminal)
+        super::bcode_runtime_presenter(&mut terminal)
             .present(&mut model)
             .unwrap();
         assert!(!model.committed_visual_text.is_empty());
@@ -7917,7 +8201,7 @@ mod tests {
         terminal.resize(bmux_tui::geometry::Rect::new(0, 0, 30, 12));
         model.presentation_damage = bmux_tui::damage::Damage::Full;
         assert!(
-            super::BcodeRuntimePresenter::new(&mut terminal)
+            super::bcode_runtime_presenter(&mut terminal)
                 .present(&mut model)
                 .is_err()
         );
@@ -7931,7 +8215,7 @@ mod tests {
         assert_eq!(model.focused_visual.as_deref(), Some("removed-target"));
         fail.set(false);
         model.presentation_damage = bmux_tui::damage::Damage::Full;
-        super::BcodeRuntimePresenter::new(&mut terminal)
+        super::bcode_runtime_presenter(&mut terminal)
             .present(&mut model)
             .unwrap();
         assert!(!model.committed_visual_text.is_empty());
@@ -7961,7 +8245,7 @@ mod tests {
         let area = bmux_tui::geometry::Rect::new(0, 0, 40, 12);
         let mut bytes = Vec::new();
         let mut terminal = bmux_tui::terminal::Terminal::new(&mut bytes, area);
-        super::BcodeRuntimePresenter::new(&mut terminal)
+        super::bcode_runtime_presenter(&mut terminal)
             .present(&mut model)
             .expect("startup frame presents");
         let fragment = model
@@ -8038,7 +8322,7 @@ mod tests {
         let area = bmux_tui::geometry::Rect::new(0, 0, 40, 12);
         let mut initial_bytes = Vec::new();
         let mut initial_terminal = bmux_tui::terminal::Terminal::new(&mut initial_bytes, area);
-        super::BcodeRuntimePresenter::new(&mut initial_terminal)
+        super::bcode_runtime_presenter(&mut initial_terminal)
             .present(&mut model)
             .expect("initial frame presents");
         let fragment = model
@@ -8083,7 +8367,7 @@ mod tests {
         model.presentation_damage = bmux_tui::damage::Damage::Full;
         let mut scrolled_bytes = Vec::new();
         let mut scrolled_terminal = bmux_tui::terminal::Terminal::new(&mut scrolled_bytes, area);
-        super::BcodeRuntimePresenter::new(&mut scrolled_terminal)
+        super::bcode_runtime_presenter(&mut scrolled_terminal)
             .present(&mut model)
             .expect("scrolled frame presents");
         let after = model
@@ -8125,7 +8409,7 @@ mod tests {
         let area = bmux_tui::geometry::Rect::new(0, 0, 40, 12);
         let mut initial_bytes = Vec::new();
         let mut initial_terminal = bmux_tui::terminal::Terminal::new(&mut initial_bytes, area);
-        super::BcodeRuntimePresenter::new(&mut initial_terminal)
+        super::bcode_runtime_presenter(&mut initial_terminal)
             .present(&mut model)
             .expect("initial frame presents");
         let fragment = model
@@ -8155,7 +8439,7 @@ mod tests {
 
         let mut selected_bytes = Vec::new();
         let mut selected_terminal = bmux_tui::terminal::Terminal::new(&mut selected_bytes, area);
-        super::BcodeRuntimePresenter::new(&mut selected_terminal)
+        super::bcode_runtime_presenter(&mut selected_terminal)
             .present(&mut model)
             .expect("selected frame presents");
         let selected_cell = selected_terminal
@@ -8224,7 +8508,7 @@ mod tests {
 
         let mut bytes = Vec::new();
         let mut terminal = bmux_tui::terminal::Terminal::new(&mut bytes, area);
-        super::BcodeRuntimePresenter::new(&mut terminal)
+        super::bcode_runtime_presenter(&mut terminal)
             .present(&mut model)
             .expect("replacement frame presents");
 
@@ -8365,7 +8649,7 @@ mod tests {
             assert_eq!(text, "abcdef");
             Ok(())
         };
-        super::BcodeRuntimePresenter::new(terminal)
+        super::bcode_runtime_presenter(terminal)
             .present(&mut model)
             .expect("initial frame");
         let fragment = model
@@ -8426,7 +8710,7 @@ mod tests {
             ));
         }
         assert_eq!(model.selected_plain_text.as_deref(), Some("abcdef"));
-        super::BcodeRuntimePresenter::new(&mut terminal)
+        super::bcode_runtime_presenter(&mut terminal)
             .present(&mut model)
             .expect("selected frame");
         assert_ne!(
@@ -8451,7 +8735,7 @@ mod tests {
         );
         assert!(!model.scheduled_deadlines.contains_key(&timer));
         assert!(model.selected_plain_text.is_none());
-        super::BcodeRuntimePresenter::new(&mut terminal)
+        super::bcode_runtime_presenter(&mut terminal)
             .present(&mut model)
             .expect("cleared frame");
         assert_eq!(
@@ -10474,7 +10758,7 @@ mod tests {
         let area = Rect::new(0, 0, width, 40);
         let mut bytes = Vec::new();
         let mut terminal = bmux_tui::terminal::Terminal::new(&mut bytes, area);
-        super::BcodeRuntimePresenter::new(&mut terminal)
+        super::bcode_runtime_presenter(&mut terminal)
             .present(&mut model)
             .expect("production presentation");
         let fragments = model.committed_selection.fragments();
@@ -10573,7 +10857,7 @@ mod tests {
         let area = Rect::new(0, 0, 70, 40);
         let mut bytes = Vec::new();
         let mut terminal = bmux_tui::terminal::Terminal::new(&mut bytes, area);
-        super::BcodeRuntimePresenter::new(&mut terminal)
+        super::bcode_runtime_presenter(&mut terminal)
             .present(&mut model)
             .expect("accepted streaming frame");
         let old_fragments = model.committed_selection.fragments().to_vec();
@@ -10629,7 +10913,7 @@ mod tests {
             )
             .is_none()
         );
-        super::BcodeRuntimePresenter::new(&mut terminal)
+        super::bcode_runtime_presenter(&mut terminal)
             .present(&mut model)
             .expect("previous compatible frame");
         assert!(
@@ -10666,7 +10950,7 @@ mod tests {
             .push_ephemeral_system_markdown("```\na界b\n```\n".to_owned());
         let mut bytes = Vec::new();
         let mut terminal = bmux_tui::terminal::Terminal::new(&mut bytes, Rect::new(0, 0, 7, 30));
-        super::BcodeRuntimePresenter::new(&mut terminal)
+        super::bcode_runtime_presenter(&mut terminal)
             .present(&mut model)
             .expect("narrow frame");
         let fragments = model.committed_selection.fragments();
@@ -10776,7 +11060,7 @@ mod tests {
             let mut bytes = Vec::new();
             let mut terminal =
                 bmux_tui::terminal::Terminal::new(&mut bytes, Rect::new(0, 0, 70, 40));
-            super::BcodeRuntimePresenter::new(&mut terminal)
+            super::bcode_runtime_presenter(&mut terminal)
                 .present(&mut model)
                 .expect("mixed frame");
             let items = model.chat.app.transcript().iter().collect::<Vec<_>>();
@@ -11151,7 +11435,7 @@ mod tests {
             let mut terminal = bmux_tui::terminal::Terminal::new(&mut bytes, area);
             program.presentation_damage = bmux_tui::damage::Damage::Full;
             let report = bmux_tui_runtime::Presenter::present(
-                &mut super::BcodeRuntimePresenter::new(&mut terminal),
+                &mut super::bcode_runtime_presenter(&mut terminal),
                 program,
             )?;
             let text = terminal
@@ -11200,10 +11484,10 @@ mod tests {
         let mut partial_terminal = bmux_tui::terminal::Terminal::new(&mut partial_bytes, area);
         let mut full_terminal = bmux_tui::terminal::Terminal::new(&mut full_bytes, area);
         {
-            super::BcodeRuntimePresenter::new(&mut partial_terminal)
+            super::bcode_runtime_presenter(&mut partial_terminal)
                 .present(&mut partial_model)
                 .expect("initial partial frame");
-            super::BcodeRuntimePresenter::new(&mut full_terminal)
+            super::bcode_runtime_presenter(&mut full_terminal)
                 .present(&mut full_model)
                 .expect("initial full frame");
         }
@@ -11219,10 +11503,10 @@ mod tests {
         partial_model.fast_temporal_presentation = true;
         full_model.presentation_damage = bmux_tui::damage::Damage::Full;
 
-        super::BcodeRuntimePresenter::new(&mut partial_terminal)
+        super::bcode_runtime_presenter(&mut partial_terminal)
             .present(&mut partial_model)
             .expect("partial status frame");
-        super::BcodeRuntimePresenter::new(&mut full_terminal)
+        super::bcode_runtime_presenter(&mut full_terminal)
             .present(&mut full_model)
             .expect("full status frame");
         // Keep teardown (which can join workers) out of the paired frame captures.
@@ -11236,6 +11520,140 @@ mod tests {
         assert_eq!(partial_terminal.image_scene(), full_terminal.image_scene());
     }
 
+    // Keep stationary modal transitions and their failed-flush authority checks together.
+    #[allow(clippy::too_many_lines)]
+    #[tokio::test]
+    async fn stationary_pointer_tracks_root_modal_open_close_and_failed_flush() {
+        use bmux_tui::event::{Event, MouseEvent, MouseEventKind};
+        use bmux_tui::geometry::{Point, Rect};
+        use bmux_tui::pointer::{PointerIntent, PointerShape, resolve_pointer_intent};
+        use bmux_tui_runtime::{Presenter, Program};
+
+        let mut model = root_test_model();
+        let fail = std::rc::Rc::new(std::cell::Cell::new(false));
+        let mut output = FlushFailureOutput {
+            fail: fail.clone(),
+            bytes: Vec::new(),
+        };
+        let mut terminal = bmux_tui::terminal::Terminal::new(&mut output, Rect::new(0, 0, 80, 24));
+        terminal.set_pointer_capability(
+            bmux_terminal_protocol::pointer_output::PointerShapeCapability::Set,
+        );
+        super::bcode_runtime_presenter(&mut terminal)
+            .present(&mut model)
+            .expect("initial root scene");
+        let composer = terminal
+            .hits()
+            .regions()
+            .iter()
+            .find(|hit| hit.id.as_str() == "composer")
+            .expect("committed composer hit")
+            .area;
+        let point = Point::new(composer.x, composer.bottom().saturating_sub(1));
+        // Observe exactly one motion through the production lifecycle adapter.
+        assert!(
+            super::bcode_runtime_presenter(&mut terminal).observe_terminal_event(&Event::Mouse(
+                MouseEvent::new(MouseEventKind::Move, point)
+            ),)
+        );
+        let intent = |terminal: &bmux_tui::terminal::Terminal<&mut FlushFailureOutput>| {
+            resolve_pointer_intent(
+                terminal.hits(),
+                Some(point),
+                terminal.focus().active_scope(),
+                None,
+            )
+        };
+        assert_eq!(intent(&terminal), PointerIntent::Shape(PointerShape::Text));
+
+        let contains = |bytes: &[u8], expected: &[u8]| {
+            bytes
+                .windows(expected.len())
+                .any(|window| window == expected)
+        };
+        model.presentation_damage = bmux_tui::damage::Damage::None;
+        terminal.writer_mut().bytes.clear();
+        super::bcode_runtime_presenter(&mut terminal)
+            .present(&mut model)
+            .expect("stationary composer pointer");
+        assert!(contains(&terminal.writer().bytes, b"\x1b]22;text\x1b\\"));
+
+        for _ in 0..2 {
+            terminal.writer_mut().bytes.clear();
+            model.loop_state.open_command_palette(&mut model.chat);
+            model.synchronize_screen();
+            model.presentation_damage = bmux_tui::damage::Damage::Full;
+            fail.set(true);
+            assert!(
+                super::bcode_runtime_presenter(&mut terminal)
+                    .present(&mut model)
+                    .is_err()
+            );
+            assert!(terminal.focus().active_scope().is_none());
+            assert_eq!(intent(&terminal), PointerIntent::Shape(PointerShape::Text));
+            fail.set(false);
+            terminal.writer_mut().bytes.clear();
+            model.presentation_damage = bmux_tui::damage::Damage::Full;
+            super::bcode_runtime_presenter(&mut terminal)
+                .present(&mut model)
+                .expect("stationary modal open");
+            assert!(contains(&terminal.writer().bytes, b"\x1b]22;default\x1b\\"));
+            terminal.writer_mut().bytes.clear();
+            assert_eq!(
+                terminal
+                    .focus()
+                    .active_scope()
+                    .map(bmux_tui::hit::HitId::as_str),
+                Some("bcode.foreground")
+            );
+            assert_eq!(
+                intent(&terminal),
+                PointerIntent::Shape(PointerShape::Default)
+            );
+            assert!(
+                terminal
+                    .hits()
+                    .regions()
+                    .iter()
+                    .all(|hit| hit.id.as_str() != "composer")
+            );
+
+            model
+                .update(bmux_tui_runtime::RuntimeEvent::Terminal(Event::Key(
+                    bmux_keyboard::KeyStroke {
+                        key: bmux_keyboard::KeyCode::Escape,
+                        modifiers: bmux_keyboard::Modifiers::NONE,
+                    },
+                )))
+                .expect("close modal input");
+            model.presentation_damage = bmux_tui::damage::Damage::Full;
+            fail.set(true);
+            assert!(
+                super::bcode_runtime_presenter(&mut terminal)
+                    .present(&mut model)
+                    .is_err()
+            );
+            // Failed close cannot expose the background's text pointer authority.
+            assert_eq!(
+                intent(&terminal),
+                PointerIntent::Shape(PointerShape::Default)
+            );
+            assert!(terminal.focus().active_scope().is_some());
+            fail.set(false);
+            terminal.writer_mut().bytes.clear();
+            model.presentation_damage = bmux_tui::damage::Damage::Full;
+            super::bcode_runtime_presenter(&mut terminal)
+                .present(&mut model)
+                .expect("stationary modal close recovery");
+            assert!(contains(&terminal.writer().bytes, b"\x1b]22;text\x1b\\"));
+            assert!(terminal.focus().active_scope().is_none());
+            assert_eq!(intent(&terminal), PointerIntent::Shape(PointerShape::Text));
+        }
+        drop(model);
+    }
+
+    // Keep modal open, temporal reuse, reset, and close assertions in one lifecycle scenario.
+    #[allow(clippy::too_many_lines)]
     #[tokio::test]
     async fn modal_foreground_owns_input_and_metadata_across_frames() {
         use bmux_tui_runtime::{Presenter, Program};
@@ -11248,13 +11666,19 @@ mod tests {
         let area = bmux_tui::geometry::Rect::new(0, 0, 80, 24);
         let mut bytes = Vec::new();
         let mut terminal = bmux_tui::terminal::Terminal::new(&mut bytes, area);
-        super::BcodeRuntimePresenter::new(&mut terminal)
+        super::bcode_runtime_presenter(&mut terminal)
             .present(&mut model)
             .expect("chat");
+        let background_targets: Vec<_> = terminal
+            .hits()
+            .regions()
+            .iter()
+            .map(|hit| hit.id.clone())
+            .collect();
         model.loop_state.open_command_palette(&mut model.chat);
         model.synchronize_screen();
         model.presentation_damage = bmux_tui::damage::Damage::Full;
-        super::BcodeRuntimePresenter::new(&mut terminal)
+        super::bcode_runtime_presenter(&mut terminal)
             .present(&mut model)
             .expect("modal");
         assert!(
@@ -11264,6 +11688,25 @@ mod tests {
                 .iter()
                 .all(|hit| hit.id.as_str() != "composer")
         );
+        assert!(
+            terminal
+                .hits()
+                .regions()
+                .iter()
+                .all(|hit| { !background_targets.contains(&hit.id) })
+        );
+        assert_eq!(
+            terminal
+                .focus()
+                .active_scope()
+                .map(bmux_tui::hit::HitId::as_str),
+            Some("bcode.foreground")
+        );
+        assert!(terminal.hits().regions().iter().all(|hit| {
+            hit.focus_scope
+                .as_ref()
+                .is_none_or(|scope| Some(scope) == terminal.focus().active_scope())
+        }));
         assert!(terminal.selection().fragments().is_empty());
         assert_eq!(terminal.image_scene().placements().len(), 0);
         let snapshot = terminal.retained_buffer().cloned();
@@ -11283,7 +11726,7 @@ mod tests {
                 &[super::super::app::TemporalDamage::Composer],
             );
             model.fast_temporal_presentation = true;
-            super::BcodeRuntimePresenter::new(&mut terminal)
+            super::bcode_runtime_presenter(&mut terminal)
                 .present(&mut model)
                 .expect("modal timer");
             assert_eq!(terminal.retained_buffer(), snapshot.as_ref());
@@ -11298,7 +11741,7 @@ mod tests {
         );
         terminal.reset();
         model.fast_temporal_presentation = true;
-        super::BcodeRuntimePresenter::new(&mut terminal)
+        super::bcode_runtime_presenter(&mut terminal)
             .present(&mut model)
             .expect("reset modal");
         assert_eq!(terminal.retained_buffer(), snapshot.as_ref());
@@ -11312,7 +11755,7 @@ mod tests {
             .expect("close modal");
         assert!(!model.loop_state.has_command_palette());
         assert!(model.loop_state.has_interactive_surface());
-        super::BcodeRuntimePresenter::new(&mut terminal)
+        super::bcode_runtime_presenter(&mut terminal)
             .present(&mut model)
             .expect("restored chat");
         assert!(
@@ -11335,7 +11778,7 @@ mod tests {
             bmux_tui::geometry::Rect::new(0, 0, 80, 24),
         );
         model.loop_state.open_command_palette(&mut model.chat);
-        super::BcodeRuntimePresenter::new(&mut terminal)
+        super::bcode_runtime_presenter(&mut terminal)
             .present(&mut model)
             .expect("palette");
         model.loop_state.open_session_picker(&mut model.chat);
@@ -11347,7 +11790,7 @@ mod tests {
         terminal.resize(bmux_tui::geometry::Rect::new(0, 0, 100, 30));
         model.presentation_damage = bmux_tui::damage::Damage::Full;
         model.fast_temporal_presentation = true;
-        super::BcodeRuntimePresenter::new(&mut terminal)
+        super::bcode_runtime_presenter(&mut terminal)
             .present(&mut model)
             .expect("resized sessions");
         let partial = terminal.retained_buffer().cloned();
@@ -11355,7 +11798,7 @@ mod tests {
         let semantics = terminal.semantics().clone();
         model.presentation_damage = bmux_tui::damage::Damage::Full;
         model.fast_temporal_presentation = false;
-        super::BcodeRuntimePresenter::new(&mut terminal)
+        super::bcode_runtime_presenter(&mut terminal)
             .present(&mut model)
             .expect("reference sessions");
         assert_eq!(terminal.retained_buffer(), partial.as_ref());
@@ -11385,10 +11828,10 @@ mod tests {
         let mut full_bytes = Vec::new();
         let mut partial_terminal = bmux_tui::terminal::Terminal::new(&mut partial_bytes, area);
         let mut full_terminal = bmux_tui::terminal::Terminal::new(&mut full_bytes, area);
-        super::BcodeRuntimePresenter::new(&mut partial_terminal)
+        super::bcode_runtime_presenter(&mut partial_terminal)
             .present(&mut partial)
             .expect("initial picker");
-        super::BcodeRuntimePresenter::new(&mut full_terminal)
+        super::bcode_runtime_presenter(&mut full_terminal)
             .present(&mut full)
             .expect("initial reference picker");
         let picker_cursor = partial_terminal.cursor();
@@ -11411,10 +11854,10 @@ mod tests {
             );
             partial.fast_temporal_presentation = true;
             full.presentation_damage = bmux_tui::damage::Damage::Full;
-            super::BcodeRuntimePresenter::new(&mut partial_terminal)
+            super::bcode_runtime_presenter(&mut partial_terminal)
                 .present(&mut partial)
                 .expect("partial picker");
-            super::BcodeRuntimePresenter::new(&mut full_terminal)
+            super::bcode_runtime_presenter(&mut full_terminal)
                 .present(&mut full)
                 .expect("full picker");
             assert_eq!(
@@ -11442,13 +11885,13 @@ mod tests {
         let mut full_terminal = bmux_tui::terminal::Terminal::new(&mut full_bytes, area);
 
         {
-            let mut presenter = super::BcodeRuntimePresenter::new(&mut partial_terminal);
+            let mut presenter = super::bcode_runtime_presenter(&mut partial_terminal);
             presenter
                 .present(&mut partial_model)
                 .expect("initial partial-side frame presents");
         }
         {
-            let mut presenter = super::BcodeRuntimePresenter::new(&mut full_terminal);
+            let mut presenter = super::bcode_runtime_presenter(&mut full_terminal);
             presenter
                 .present(&mut full_model)
                 .expect("initial full-side frame presents");
@@ -11479,13 +11922,13 @@ mod tests {
         full_model.presentation_damage = bmux_tui::damage::Damage::Full;
 
         {
-            let mut presenter = super::BcodeRuntimePresenter::new(&mut partial_terminal);
+            let mut presenter = super::bcode_runtime_presenter(&mut partial_terminal);
             presenter
                 .present(&mut partial_model)
                 .expect("cursor partial frame presents");
         }
         {
-            let mut presenter = super::BcodeRuntimePresenter::new(&mut full_terminal);
+            let mut presenter = super::bcode_runtime_presenter(&mut full_terminal);
             presenter
                 .present(&mut full_model)
                 .expect("cursor full frame presents");
@@ -11525,7 +11968,7 @@ mod tests {
         let mut bytes = Vec::new();
         let mut terminal = bmux_tui::terminal::Terminal::new(&mut bytes, area);
         {
-            let mut presenter = super::BcodeRuntimePresenter::new(&mut terminal);
+            let mut presenter = super::bcode_runtime_presenter(&mut terminal);
             presenter
                 .present(&mut model)
                 .expect("initial frame presents");
@@ -11664,11 +12107,8 @@ mod tests {
         model: &mut super::BcodeRuntimeModel,
         terminal: &mut bmux_tui::terminal::Terminal<&mut Vec<u8>>,
     ) {
-        bmux_tui_runtime::Presenter::present(
-            &mut super::BcodeRuntimePresenter::new(terminal),
-            model,
-        )
-        .expect("real focused owner presentation");
+        bmux_tui_runtime::Presenter::present(&mut super::bcode_runtime_presenter(terminal), model)
+            .expect("real focused owner presentation");
     }
 
     #[tokio::test]
@@ -12192,7 +12632,7 @@ mod tests {
             let mut bytes = Vec::new();
             let mut terminal = bmux_tui::terminal::Terminal::new(&mut bytes, area);
             bmux_tui_runtime::Presenter::present(
-                &mut super::BcodeRuntimePresenter::new(&mut terminal),
+                &mut super::bcode_runtime_presenter(&mut terminal),
                 &mut model,
             )
             .expect("initial question matrix frame");
@@ -12216,7 +12656,7 @@ mod tests {
                 bmux_tui_runtime::Program::update(&mut model, event(key))
                     .expect("question matrix input");
                 bmux_tui_runtime::Presenter::present(
-                    &mut super::BcodeRuntimePresenter::new(&mut terminal),
+                    &mut super::bcode_runtime_presenter(&mut terminal),
                     &mut model,
                 )
                 .expect("question matrix committed presentation");
@@ -12487,12 +12927,12 @@ mod tests {
         let mut partial_terminal = bmux_tui::terminal::Terminal::new(&mut partial_bytes, area);
         let mut full_terminal = bmux_tui::terminal::Terminal::new(&mut full_bytes, area);
         bmux_tui_runtime::Presenter::present(
-            &mut super::BcodeRuntimePresenter::new(&mut partial_terminal),
+            &mut super::bcode_runtime_presenter(&mut partial_terminal),
             &mut partial,
         )
         .expect("initial partial presentation");
         bmux_tui_runtime::Presenter::present(
-            &mut super::BcodeRuntimePresenter::new(&mut full_terminal),
+            &mut super::bcode_runtime_presenter(&mut full_terminal),
             &mut full,
         )
         .expect("initial full presentation");
@@ -12512,12 +12952,12 @@ mod tests {
         full.fast_temporal_presentation = false;
 
         bmux_tui_runtime::Presenter::present(
-            &mut super::BcodeRuntimePresenter::new(&mut partial_terminal),
+            &mut super::bcode_runtime_presenter(&mut partial_terminal),
             &mut partial,
         )
         .expect("partial redraw");
         bmux_tui_runtime::Presenter::present(
-            &mut super::BcodeRuntimePresenter::new(&mut full_terminal),
+            &mut super::bcode_runtime_presenter(&mut full_terminal),
             &mut full,
         )
         .expect("full redraw");
@@ -12584,12 +13024,12 @@ mod tests {
         let mut short_terminal = bmux_tui::terminal::Terminal::new(&mut short_bytes, area);
         let mut long_terminal = bmux_tui::terminal::Terminal::new(&mut long_bytes, area);
         bmux_tui_runtime::Presenter::present(
-            &mut super::BcodeRuntimePresenter::new(&mut short_terminal),
+            &mut super::bcode_runtime_presenter(&mut short_terminal),
             &mut short,
         )
         .expect("short initial frame");
         bmux_tui_runtime::Presenter::present(
-            &mut super::BcodeRuntimePresenter::new(&mut long_terminal),
+            &mut super::bcode_runtime_presenter(&mut long_terminal),
             &mut long,
         )
         .expect("long initial frame");
@@ -12629,7 +13069,7 @@ mod tests {
         let mut bytes = Vec::new();
         let mut terminal = bmux_tui::terminal::Terminal::new(&mut bytes, area);
         bmux_tui_runtime::Presenter::present(
-            &mut super::BcodeRuntimePresenter::new(&mut terminal),
+            &mut super::bcode_runtime_presenter(&mut terminal),
             &mut model,
         )
         .expect("initial question frame");
@@ -12676,7 +13116,7 @@ mod tests {
             bmux_tui_runtime::Program::update(&mut model, event).expect("question input");
             let draw_started = std::time::Instant::now();
             let report = bmux_tui_runtime::Presenter::present(
-                &mut super::BcodeRuntimePresenter::new(&mut terminal),
+                &mut super::bcode_runtime_presenter(&mut terminal),
                 &mut model,
             )
             .expect("question presentation");
@@ -12801,7 +13241,7 @@ mod tests {
         let mut bytes = Vec::new();
         let mut terminal = bmux_tui::terminal::Terminal::new(&mut bytes, area);
         bmux_tui_runtime::Presenter::present(
-            &mut super::BcodeRuntimePresenter::new(&mut terminal),
+            &mut super::bcode_runtime_presenter(&mut terminal),
             &mut model,
         )
         .expect("initial inline question scroll frame");
@@ -12836,7 +13276,7 @@ mod tests {
             scroll_offsets.push(model.chat.app.scroll_offset());
             let draw_started = std::time::Instant::now();
             let report = bmux_tui_runtime::Presenter::present(
-                &mut super::BcodeRuntimePresenter::new(&mut terminal),
+                &mut super::bcode_runtime_presenter(&mut terminal),
                 &mut model,
             )
             .expect("inline question scroll presentation");
@@ -13006,7 +13446,7 @@ mod tests {
         model.chat.app.replace_composer_with("hello");
         let mut output = Vec::new();
         let mut terminal = bmux_tui::terminal::Terminal::new(&mut output, Rect::new(0, 0, 60, 15));
-        super::BcodeRuntimePresenter::new(&mut terminal)
+        super::bcode_runtime_presenter(&mut terminal)
             .present(&mut model)
             .unwrap();
         let arrow = model
@@ -13027,7 +13467,7 @@ mod tests {
         }
         model.invalidation = super::super::invalidation::UiInvalidation::Structural;
         model.presentation_damage = bmux_tui::damage::Damage::Full;
-        super::BcodeRuntimePresenter::new(&mut terminal)
+        super::bcode_runtime_presenter(&mut terminal)
             .present(&mut model)
             .unwrap();
         let popup = model
@@ -13152,7 +13592,7 @@ mod tests {
         let mut bytes = Vec::new();
         let mut terminal = bmux_tui::terminal::Terminal::new(&mut bytes, Rect::new(0, 0, 100, 24));
         let _invalidation = model.synchronize_screen();
-        super::BcodeRuntimePresenter::new(&mut terminal)
+        super::bcode_runtime_presenter(&mut terminal)
             .present(&mut model)
             .expect("picker");
         let hit = model

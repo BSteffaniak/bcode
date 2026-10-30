@@ -3342,6 +3342,7 @@ dependencies = [
  "bmux_image",
  "bmux_keyboard",
  "bmux_mermaid_render",
+ "bmux_terminal_protocol",
  "bmux_text_edit",
  "bmux_tui",
  "bmux_tui_components",

@@ -32,6 +32,10 @@ pub enum TerminalRecoveryAction {
 pub struct TerminalShell {
     guard: CrosstermTerminalGuard<Stdout>,
     stop_requested: bool,
+    // Retain a failed wait's presentation/cleanup independently from its operation result.
+    // No fresh terminal may replace uncertain output authority.
+    screen_error: Option<TuiError>,
+    handoff_blocked: bool,
 }
 
 impl TerminalShell {
@@ -43,6 +47,8 @@ impl TerminalShell {
         Ok(Self {
             guard: CrosstermTerminalGuard::enter(io::stdout())?,
             stop_requested: false,
+            screen_error: None,
+            handoff_blocked: false,
         })
     }
 
@@ -51,12 +57,18 @@ impl TerminalShell {
     /// # Errors
     /// Returns terminal dimension or writer errors.
     pub fn terminal(&mut self) -> Result<Terminal<&mut Stdout>, TuiError> {
+        admit_screen(self.handoff_blocked, self.screen_error.is_some())?;
         let area = crate::terminal_area()?;
         let writer = self
             .guard
             .writer_mut()
             .ok_or_else(|| io::Error::other("terminal shell writer unavailable"))?;
         Ok(Terminal::new(writer, area))
+    }
+
+    /// Prevent a new screen after a failed runtime whose terminal authority is uncertain.
+    pub(crate) const fn block_handoff(&mut self) {
+        self.handoff_blocked = true;
     }
 
     /// Whether the user requested exit during the most recent initialization wait.
@@ -75,7 +87,8 @@ impl TerminalShell {
         &mut self,
         allow_discovery: bool,
     ) -> Result<bcode_settings::SetupContinuation, TuiError> {
-        crate::run_setup_in_shell(self, allow_discovery).await
+        let result = crate::run_setup_in_shell(self, allow_discovery).await;
+        complete_runtime_screen(&mut self.handoff_blocked, result)
     }
 
     /// Run chat in this terminal lifetime.
@@ -84,6 +97,17 @@ impl TerminalShell {
     /// Returns client, configuration, or terminal errors.
     #[allow(clippy::future_not_send)]
     pub async fn run_chat(
+        &mut self,
+        session_id: Option<bcode_session_models::SessionId>,
+        plugins: &[bcode_plugin::StaticBundledPlugin],
+        options: TuiLaunchOptions,
+    ) -> Result<(), TuiError> {
+        let result = self.run_chat_screen(session_id, plugins, options).await;
+        complete_runtime_screen(&mut self.handoff_blocked, result)
+    }
+
+    #[allow(clippy::future_not_send)]
+    async fn run_chat_screen(
         &mut self,
         session_id: Option<bcode_session_models::SessionId>,
         plugins: &[bcode_plugin::StaticBundledPlugin],
@@ -132,6 +156,19 @@ impl TerminalShell {
     /// Returns unresolved path/options, unsupported surface, launcher, or terminal errors.
     #[allow(clippy::future_not_send)]
     pub async fn run_plugin_surface(
+        &mut self,
+        surface_kind: String,
+        repo_path: Option<std::path::PathBuf>,
+        options: std::collections::BTreeMap<String, String>,
+    ) -> Result<(), TuiError> {
+        let result = self
+            .dispatch_plugin_surface(surface_kind, repo_path, options)
+            .await;
+        complete_runtime_screen(&mut self.handoff_blocked, result)
+    }
+
+    #[allow(clippy::future_not_send)]
+    async fn dispatch_plugin_surface(
         &mut self,
         surface_kind: String,
         repo_path: Option<std::path::PathBuf>,
@@ -204,10 +241,7 @@ impl TerminalShell {
                 {
                     Ok(Some(prepared)) if !self.stop_requested() => prepared,
                     Ok(_) => return Ok(()),
-                    Err(_) => {
-                        self.review_error().await?;
-                        return Ok(());
-                    }
+                    Err(error) => return self.review_preparation_error(error).await,
                 };
                 Box::pin(crate::code_review_launcher::run_prepared_home(
                     &mut self.terminal()?,
@@ -215,21 +249,17 @@ impl TerminalShell {
                 ))
                 .await
             };
-            match result {
-                Ok(crate::code_review_launcher::ReviewHomeOutcome::OpenWorkspace {
+            match complete_runtime_screen(&mut self.handoff_blocked, result)? {
+                crate::code_review_launcher::ReviewHomeOutcome::OpenWorkspace {
                     workspace,
                     build_mode,
-                }) => {
+                } => {
                     Box::pin(self.run_review_workspace(workspace, build_mode)).await?;
                     if self.stop_requested() {
                         return Ok(());
                     }
                 }
-                Ok(crate::code_review_launcher::ReviewHomeOutcome::Exit) => return Ok(()),
-                Err(_) => {
-                    self.review_error().await?;
-                    return Ok(());
-                }
+                crate::code_review_launcher::ReviewHomeOutcome::Exit => return Ok(()),
             }
         }
     }
@@ -237,7 +267,8 @@ impl TerminalShell {
     /// Open a review workspace and its requested chat without terminal teardown.
     ///
     /// # Errors
-    /// Returns terminal or recovery presentation errors. Review failures are acknowledged in-app.
+    /// Returns terminal, runtime, or recovery presentation errors. Preparation failures
+    /// with verified clean screen release are acknowledged in-app.
     #[allow(clippy::future_not_send)]
     pub async fn run_review_workspace(
         &mut self,
@@ -255,7 +286,7 @@ impl TerminalShell {
             {
                 Ok(Some(prepared)) if !self.stop_requested() => prepared,
                 Ok(_) => return Ok(()),
-                Err(_) => return self.review_error().await,
+                Err(error) => return self.review_preparation_error(error).await,
             };
             Box::pin(crate::code_review_launcher::run_prepared_review(
                 &mut self.terminal()?,
@@ -263,16 +294,15 @@ impl TerminalShell {
             ))
             .await
         };
-        match result {
-            Ok(session_id) => self.run_review_chat(session_id).await,
-            Err(_) => self.review_error().await,
-        }
+        let session_id = complete_runtime_screen(&mut self.handoff_blocked, result)?;
+        self.run_review_chat(session_id).await
     }
 
     /// Open a review target and its requested chat without terminal teardown.
     ///
     /// # Errors
-    /// Returns terminal or recovery presentation errors. Review failures are acknowledged in-app.
+    /// Returns terminal, runtime, or recovery presentation errors. Preparation failures
+    /// with verified clean screen release are acknowledged in-app.
     #[allow(clippy::future_not_send)]
     pub async fn run_review(
         &mut self,
@@ -290,7 +320,7 @@ impl TerminalShell {
             {
                 Ok(Some(prepared)) if !self.stop_requested() => prepared,
                 Ok(_) => return Ok(()),
-                Err(_) => return self.review_error().await,
+                Err(error) => return self.review_preparation_error(error).await,
             };
             Box::pin(crate::code_review_launcher::run_prepared_review(
                 &mut self.terminal()?,
@@ -298,10 +328,17 @@ impl TerminalShell {
             ))
             .await
         };
-        match result {
-            Ok(session_id) => self.run_review_chat(session_id).await,
-            Err(_) => self.review_error().await,
+        let session_id = complete_runtime_screen(&mut self.handoff_blocked, result)?;
+        self.run_review_chat(session_id).await
+    }
+
+    async fn review_preparation_error(&mut self, error: TuiError) -> Result<(), TuiError> {
+        // A preparation error is recoverable only when its foreground screen released
+        // authority cleanly. Otherwise return the original operation error for finalization.
+        if self.handoff_blocked || self.screen_error.is_some() {
+            return Err(error);
         }
+        self.review_error().await
     }
 
     async fn review_error(&mut self) -> Result<(), TuiError> {
@@ -325,23 +362,15 @@ impl TerminalShell {
         session_id: Option<bcode_session_models::SessionId>,
     ) -> Result<(), TuiError> {
         if let Some(session_id) = session_id {
-            if self
-                .run_chat(
-                    Some(session_id),
-                    &crate::static_bundled_plugins(),
-                    TuiLaunchOptions::default(),
-                )
-                .await
-                .is_err()
-            {
-                self.review_error().await?;
-            } else {
-                self.stop_requested = true;
-            }
-        } else {
-            // A successful workspace close ends the journey, rather than reopening home.
-            self.stop_requested = true;
+            self.run_chat(
+                Some(session_id),
+                &crate::static_bundled_plugins(),
+                TuiLaunchOptions::default(),
+            )
+            .await?;
         }
+        // Successful chat or workspace close ends the journey instead of reopening home.
+        self.stop_requested = true;
         Ok(())
     }
 
@@ -364,8 +393,12 @@ impl TerminalShell {
         self.stop_requested = false;
         let mut terminal = self.terminal()?;
         let mut input = bmux_tui_runtime::ManagedTerminalInput::start(32);
-        let (result, stop) = wait_operation(&mut terminal, &mut input, label, future).await;
-        self.stop_requested = stop;
+        let (result, stop, presentation_error) =
+            wait_operation(&mut terminal, &mut input, label, future).await;
+        let cleanup = presentation_error.map_or(Ok(()), Err);
+        self.stop_requested = stop || cleanup.is_err();
+        // Preserve committed work for reconciliation even if the screen failed.
+        self.screen_error = cleanup.err();
         result.map(Some)
     }
 
@@ -405,9 +438,15 @@ impl TerminalShell {
             "Esc / B: back   Ctrl-C / Q: close"
         };
         let text = format!("{safe_message}\n\n{instructions}");
-        paint_text(&mut terminal, &text)?;
+        if let Err(error) = paint_text(&mut terminal, &text) {
+            let result = finish_screen(Err(error.into()), &mut terminal);
+            self.handoff_blocked = true;
+            return result;
+        }
         let mut input = bmux_tui_runtime::ManagedTerminalInput::start(32);
-        read_recovery(&mut terminal, &mut input, &text, allow_retry).await
+        let result = read_recovery(&mut terminal, &mut input, &text, allow_retry).await;
+        self.handoff_blocked = result.is_err();
+        result
     }
 
     /// Restore the terminal after the entire journey.
@@ -415,9 +454,54 @@ impl TerminalShell {
     /// # Errors
     /// Returns terminal restoration errors.
     pub fn finish(self) -> Result<(), TuiError> {
-        self.guard.leave()?;
-        Ok(())
+        let result = self.screen_error.map_or(Ok(()), Err);
+        with_cleanup(result, self.guard.leave().map(|_| ()).map_err(Into::into))
     }
+
+    /// Finish the journey without replacing its primary failure with a cleanup failure.
+    ///
+    /// # Errors
+    /// Returns the original error and any independently failed terminal cleanup.
+    pub(crate) fn finish_with_result<T>(self, result: Result<T, TuiError>) -> Result<T, TuiError> {
+        with_cleanup(result, self.finish())
+    }
+}
+
+// A runtime error may include failed pointer restoration. Without typed proof of clean
+// ownership release, fail closed and return the original error to journey finalization.
+const fn complete_runtime_screen<T>(
+    handoff_blocked: &mut bool,
+    result: Result<T, TuiError>,
+) -> Result<T, TuiError> {
+    *handoff_blocked |= result.is_err();
+    result
+}
+
+fn admit_screen(handoff_blocked: bool, pending_screen_error: bool) -> Result<(), TuiError> {
+    if handoff_blocked || pending_screen_error {
+        return Err(
+            io::Error::other("terminal screen failed; finish the shell before reopening").into(),
+        );
+    }
+    Ok(())
+}
+
+fn with_cleanup<T>(
+    result: Result<T, TuiError>,
+    cleanup: Result<(), TuiError>,
+) -> Result<T, TuiError> {
+    match (result, cleanup) {
+        (Ok(value), Ok(())) => Ok(value),
+        (Ok(_), Err(error)) | (Err(error), Ok(())) => Err(error),
+        (Err(error), Err(cleanup)) => Err(crate::runtime_error_with_cleanup(error, Some(cleanup))),
+    }
+}
+
+fn finish_screen<T, W: std::io::Write>(
+    result: Result<T, TuiError>,
+    terminal: &mut Terminal<&mut W>,
+) -> Result<T, TuiError> {
+    with_cleanup(result, terminal.restore_pointer().map_err(Into::into))
 }
 
 // The production and offline-test paths share the exact input/drain loop. No terminal guard
@@ -427,8 +511,9 @@ async fn wait_operation<T, W: std::io::Write>(
     input: &mut bmux_tui_runtime::ManagedTerminalInput,
     label: &str,
     future: impl Future<Output = Result<T, TuiError>>,
-) -> (Result<T, TuiError>, bool) {
-    let initial_paint_failed = paint_text(terminal, label).is_err();
+) -> (Result<T, TuiError>, bool, Option<TuiError>) {
+    let mut presentation_error = paint_text(terminal, label).err().map(TuiError::from);
+    let initial_paint_failed = presentation_error.is_some();
     let mut future = std::pin::pin!(future);
     let mut ticks = tokio::time::interval(std::time::Duration::from_millis(100));
     ticks.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
@@ -444,9 +529,16 @@ async fn wait_operation<T, W: std::io::Write>(
                 for _ in 0..32 {
                     tokio::select! {
                         biased;
-                        event = input.recv(), if input_open => match event {
+                        event = input.recv(), if input_open => match event.inspect(|event| {
+                            if let Ok(Some(event)) = event { terminal.observe_event(event); }
+                        }) {
                             Some(Ok(Some(Event::Key(key)))) if wants_stop(key.key, key.modifiers.ctrl) => stop = true,
-                            Some(Err(_)) | None => { stop = true; input_open = false; }
+                            Some(Err(error)) => {
+                                presentation_error.get_or_insert_with(|| error.into());
+                                stop = true;
+                                input_open = false;
+                            }
+                            None => { stop = true; input_open = false; }
                             _ => {}
                         },
                         () = std::future::ready(()) => break,
@@ -454,22 +546,38 @@ async fn wait_operation<T, W: std::io::Write>(
                 }
                 break result;
             },
-            event = input.recv(), if input_open => match event {
+            event = input.recv(), if input_open => match event.inspect(|event| {
+                if let Ok(Some(event)) = event { terminal.observe_event(event); }
+            }) {
                 Some(Ok(Some(Event::Key(key)))) if wants_stop(key.key, key.modifiers.ctrl) => stop = true,
                 Some(Ok(Some(Event::Resize(size)))) => terminal.resize(Rect::new(0, 0, size.width, size.height)),
-                Some(Err(_)) | None => { stop = true; input_open = false; }
+                Some(Err(error)) => {
+                    presentation_error.get_or_insert_with(|| error.into());
+                    stop = true;
+                    input_open = false;
+                }
+                None => { stop = true; input_open = false; }
                 _ => {}
             },
             _ = ticks.tick(), if paint => {
                 let status = if stop { "Finishing initialization safely before closing…" } else { label };
                 let text = format!("{} {status}\n\nEsc / Ctrl-C to request exit", ["⠋", "⠙", "⠹", "⠸"][phase % 4]);
                 phase = phase.wrapping_add(1);
-                if paint_text(terminal, &text).is_err() { stop = true; paint = false; }
+                if let Err(error) = paint_text(terminal, &text) {
+                    presentation_error.get_or_insert_with(|| error.into());
+                    stop = true;
+                    paint = false;
+                }
             }
         }
     };
     input.shutdown().await;
-    (result, stop)
+    let presentation_error = finish_screen(presentation_error.map_or(Ok(()), Err), terminal).err();
+    (
+        result,
+        stop || presentation_error.is_some(),
+        presentation_error,
+    )
 }
 
 async fn read_recovery<W: std::io::Write>(
@@ -478,31 +586,39 @@ async fn read_recovery<W: std::io::Write>(
     text: &str,
     allow_retry: bool,
 ) -> Result<TerminalRecoveryAction, TuiError> {
-    let result = async {
-        loop {
-            match input.recv().await {
-                Some(Ok(Some(Event::Key(key)))) => {
-                    if let Some(action) = recovery_action(key.key, key.modifiers.ctrl)
-                        .filter(|action| allow_retry || *action != TerminalRecoveryAction::Retry)
-                    {
-                        return Ok(action);
-                    }
-                }
-                Some(Ok(Some(Event::Resize(size)))) => {
-                    terminal.resize(Rect::new(0, 0, size.width, size.height));
-                    paint_text(terminal, text)?;
-                }
-                Some(Err(error)) => return Err(error.into()),
-                None => {
-                    return Err(io::Error::other("terminal input closed during recovery").into());
-                }
-                _ => {}
-            }
+    // Keep the receive loop in this future rather than capturing borrowed screen
+    // state in a nested async block. Every exit still joins input before restoration.
+    let result = loop {
+        let event = input.recv().await;
+        if let Some(Ok(Some(event))) = &event
+            && terminal.observe_event(event)
+            && let Err(error) = paint_text(terminal, text)
+        {
+            break Err(error.into());
         }
-    }
-    .await;
+        match event {
+            Some(Ok(Some(Event::Key(key)))) => {
+                if let Some(action) = recovery_action(key.key, key.modifiers.ctrl)
+                    .filter(|action| allow_retry || *action != TerminalRecoveryAction::Retry)
+                {
+                    break Ok(action);
+                }
+            }
+            Some(Ok(Some(Event::Resize(size)))) => {
+                terminal.resize(Rect::new(0, 0, size.width, size.height));
+                if let Err(error) = paint_text(terminal, text) {
+                    break Err(error.into());
+                }
+            }
+            Some(Err(error)) => break Err(error.into()),
+            None => {
+                break Err(io::Error::other("terminal input closed during recovery").into());
+            }
+            _ => {}
+        }
+    };
     input.shutdown().await;
-    result
+    finish_screen(result, terminal)
 }
 
 fn wants_stop(key: bmux_keyboard::KeyCode, ctrl: bool) -> bool {
@@ -559,6 +675,136 @@ mod tests {
     use super::*;
     use bmux_keyboard::{KeyCode, KeyStroke};
 
+    #[test]
+    fn failed_runtime_refuses_recovery_handoff_and_preserves_all_finalization_errors() {
+        let mut handoff_blocked = false;
+        admit_screen(handoff_blocked, false).unwrap();
+        let runtime_error = crate::runtime_error_with_cleanup(
+            TuiError::PluginService {
+                code: "chat_failed".into(),
+                message: "chat runtime failed".into(),
+            },
+            Some(io::Error::other("pointer restoration failed")),
+        );
+        let result = complete_runtime_screen::<()>(&mut handoff_blocked, Err(runtime_error));
+        assert!(handoff_blocked);
+        assert!(admit_screen(handoff_blocked, false).is_err());
+        let error = with_cleanup(
+            result,
+            Err(io::Error::other("guard restoration failed").into()),
+        )
+        .unwrap_err();
+        let diagnostic = error.to_string();
+        assert!(diagnostic.contains("chat runtime failed"));
+        assert!(diagnostic.contains("pointer restoration failed"));
+        assert!(diagnostic.contains("guard restoration failed"));
+    }
+
+    #[test]
+    fn plugin_runtime_error_blocks_handoff_without_replacing_the_original_error() {
+        // All dispatcher exits pass through this completion boundary, including
+        // validation errors before a terminal is constructed.
+        let mut blocked = false;
+        let error = complete_runtime_screen::<()>(
+            &mut blocked,
+            Err(TuiError::PluginService {
+                code: "surface_failed".into(),
+                message: "surface failed".into(),
+            }),
+        )
+        .unwrap_err();
+        assert!(matches!(error, TuiError::PluginService { code, .. } if code == "surface_failed"));
+        assert!(admit_screen(blocked, false).is_err());
+        complete_runtime_screen(&mut blocked, Ok(())).unwrap();
+        assert!(admit_screen(blocked, false).is_err());
+    }
+
+    #[test]
+    fn successful_runtime_allows_handoff_unless_a_wait_failure_is_pending() {
+        let mut blocked = false;
+        assert_eq!(complete_runtime_screen(&mut blocked, Ok(17)).unwrap(), 17);
+        assert!(admit_screen(blocked, false).is_ok());
+        assert!(admit_screen(blocked, true).is_err());
+    }
+
+    #[test]
+    fn finalization_retains_primary_and_cleanup_failures() {
+        let error = with_cleanup::<()>(
+            Err(io::Error::other("primary operation failed").into()),
+            Err(io::Error::other("terminal restoration failed").into()),
+        )
+        .unwrap_err();
+        let diagnostic = error.to_string();
+        assert!(diagnostic.contains("primary operation failed"));
+        assert!(diagnostic.contains("terminal restoration failed"));
+        assert_eq!(with_cleanup(Ok(17), Ok(())).unwrap(), 17);
+    }
+
+    struct FailedOutput;
+
+    impl std::io::Write for FailedOutput {
+        fn write(&mut self, _bytes: &[u8]) -> io::Result<usize> {
+            Err(io::Error::other("screen output failed"))
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Err(io::Error::other("screen flush failed"))
+        }
+    }
+
+    #[tokio::test]
+    async fn failed_wait_screen_retains_settled_operation_and_diagnostic() {
+        let mut writer = FailedOutput;
+        let mut terminal = Terminal::new(&mut writer, Rect::new(0, 0, 40, 4));
+        let mut input = bmux_tui_runtime::ManagedTerminalInput::from_events([]);
+        let attempts = std::cell::Cell::new(0);
+        let (result, stopped, screen_error) =
+            wait_operation(&mut terminal, &mut input, "Loading…", async {
+                attempts.set(attempts.get() + 1);
+                Ok(17)
+            })
+            .await;
+        assert_eq!(result.unwrap(), 17);
+        assert_eq!(attempts.get(), 1);
+        assert!(stopped);
+        assert!(
+            screen_error
+                .unwrap()
+                .to_string()
+                .contains("screen output failed")
+        );
+        assert!(input.recv().await.is_none());
+    }
+
+    #[tokio::test]
+    async fn failed_recovery_resize_stops_input_and_retains_error() {
+        let mut writer = FailedOutput;
+        let mut terminal = Terminal::new(&mut writer, Rect::new(0, 0, 40, 4));
+        let mut input = bmux_tui_runtime::ManagedTerminalInput::from_events([Ok(Some(
+            Event::Resize(bmux_tui::geometry::Size::new(20, 4)),
+        ))]);
+        let error = read_recovery(&mut terminal, &mut input, "Recovery", false)
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("screen output failed"));
+        assert!(input.recv().await.is_none());
+    }
+
+    #[tokio::test]
+    async fn wait_input_failure_retains_operation_result_without_retry() {
+        let mut bytes = Vec::new();
+        let mut terminal = Terminal::new(&mut bytes, Rect::new(0, 0, 40, 4));
+        let mut input = bmux_tui_runtime::ManagedTerminalInput::from_events([Err(
+            io::Error::other("reader failed"),
+        )]);
+        let (result, stopped, screen_error) =
+            wait_operation(&mut terminal, &mut input, "Loading…", async { Ok(23) }).await;
+        assert_eq!(result.unwrap(), 23);
+        assert!(stopped);
+        assert!(screen_error.unwrap().to_string().contains("reader failed"));
+        assert!(input.recv().await.is_none());
+    }
+
     struct ProgressWriter {
         bytes: Vec<u8>,
         safe_stop: Option<tokio::sync::oneshot::Sender<()>>,
@@ -599,7 +845,7 @@ mod tests {
             let mut input = bmux_tui_runtime::ManagedTerminalInput::from_events([Ok(Some(
                 Event::Key(KeyStroke::simple(KeyCode::Escape)),
             ))]);
-            let (result, stopped) =
+            let (result, stopped, _screen_error) =
                 wait_operation(&mut terminal, &mut input, "Opening review…", async {
                     attempts.set(attempts.get() + 1);
                     // Do not commit until the same foreground terminal has presented the
@@ -664,7 +910,7 @@ mod tests {
         let mut input = bmux_tui_runtime::ManagedTerminalInput::from_events([Ok(Some(
             Event::Key(KeyStroke::simple(KeyCode::Escape)),
         ))]);
-        let (result, stopped) =
+        let (result, stopped, _screen_error) =
             wait_operation(&mut terminal, &mut input, "Loading…", async { Ok(17) }).await;
         assert_eq!(result.unwrap(), 17);
         assert!(stopped);

@@ -7,9 +7,7 @@ use bmux_tui::damage::Damage;
 use bmux_tui::event::Event;
 use bmux_tui::geometry::Rect;
 use bmux_tui::terminal::Terminal;
-use bmux_tui_runtime::{
-    Invalidation, Lifecycle, PresentReport, Presenter, Program, RuntimeEvent, Update,
-};
+use bmux_tui_runtime::{Invalidation, Lifecycle, PresentReport, Program, RuntimeEvent, Update};
 
 use super::{TuiError, current_time_ms, onboarding, onboarding_render};
 
@@ -628,54 +626,49 @@ const fn onboarding_action_for_key(code: KeyCode) -> Option<onboarding::Onboardi
     }
 }
 
-/// Onboarding presenter at the terminal-specific boundary.
-pub struct OnboardingPresenter<'a, 'b, W> {
-    terminal: &'a mut Terminal<&'b mut W>,
+/// Onboarding frame callback, independent of each invocation's borrow lifetimes.
+pub type OnboardingFrame<W> = for<'program, 'terminal> fn(
+    &'program mut OnboardingProgram,
+    &'terminal mut Terminal<W>,
+) -> Result<PresentReport, std::io::Error>;
+
+/// Compose onboarding's frame policy with BMUX's standard terminal lifecycle.
+#[must_use]
+pub fn onboarding_presenter<W: Write>(
+    terminal: &mut Terminal<W>,
+) -> bmux_tui_runtime::terminal_presenter::BorrowedTerminalPresenter<'_, W, OnboardingFrame<W>> {
+    bmux_tui_runtime::terminal_presenter::BorrowedTerminalPresenter::new(
+        terminal,
+        present_onboarding_frame::<W> as OnboardingFrame<W>,
+    )
 }
 
-impl<'a, 'b, W> OnboardingPresenter<'a, 'b, W> {
-    /// Create a presenter around the caller-owned terminal.
-    pub const fn new(terminal: &'a mut Terminal<&'b mut W>) -> Self {
-        Self { terminal }
-    }
-}
-
-impl<W: Write> Presenter<OnboardingProgram> for OnboardingPresenter<'_, '_, W> {
-    type Error = std::io::Error;
-
-    fn resize(&mut self, size: bmux_tui::geometry::Size) {
-        self.terminal
-            .resize(Rect::new(0, 0, size.width, size.height));
-    }
-
-    fn reset(&mut self, _reason: bmux_tui_runtime::ResetReason) {
-        self.terminal.reset();
-    }
-
-    fn present(&mut self, program: &mut OnboardingProgram) -> Result<PresentReport, Self::Error> {
-        let stats = self.terminal.draw_damage(Damage::Full, |frame| {
-            if let Some(form) = &mut program.connection_form {
-                form.render_with_keymap(frame, &program.theme, &program.keymap);
-                return;
-            }
-            if let Some(form) = &mut program.settings_form {
-                form.render_with_keymap(frame, &program.theme, &program.keymap);
-                return;
-            }
-            onboarding_render::render_onboarding_with_keymap(
-                &program.shell,
-                frame,
-                &program.health,
-                program.readiness.clone(),
-                &program.theme,
-                &program.keymap,
-            );
-        })?;
-        Ok(PresentReport {
-            changed_cells: stats.changed_cells,
-            full_repaint: stats.full_repaint,
-        })
-    }
+fn present_onboarding_frame<W: Write>(
+    program: &mut OnboardingProgram,
+    terminal: &mut Terminal<W>,
+) -> Result<PresentReport, std::io::Error> {
+    let stats = terminal.draw_damage(Damage::Full, |frame| {
+        if let Some(form) = &mut program.connection_form {
+            form.render_with_keymap(frame, &program.theme, &program.keymap);
+            return;
+        }
+        if let Some(form) = &mut program.settings_form {
+            form.render_with_keymap(frame, &program.theme, &program.keymap);
+            return;
+        }
+        onboarding_render::render_onboarding_with_keymap(
+            &program.shell,
+            frame,
+            &program.health,
+            program.readiness.clone(),
+            &program.theme,
+            &program.keymap,
+        );
+    })?;
+    Ok(PresentReport {
+        changed_cells: stats.changed_cells,
+        full_repaint: stats.full_repaint,
+    })
 }
 
 #[cfg(test)]
@@ -683,6 +676,57 @@ mod tests {
     use super::onboarding_action_for_key;
     use bmux_keyboard::KeyCode;
     use bmux_tui_runtime::Program as _;
+
+    fn assert_send<T: Send>(_: &T) {}
+
+    #[tokio::test]
+    async fn borrowed_presenter_preserves_onboarding_frame_and_restores_before_reuse() {
+        let temp = tempfile::tempdir().unwrap();
+        let theme = crate::theme::resolve_configured_theme(
+            &bcode_config::TuiConfig::default(),
+            temp.path(),
+        );
+        let make_program = || {
+            super::OnboardingProgram::new(
+                bcode_settings::SettingsStore::from_settings_db_path(
+                    temp.path().join("settings.db"),
+                ),
+                crate::onboarding::OnboardingShell::from_reconciliation(
+                    &[],
+                    &bcode_settings::SetupConfigSummary::default().reconciliation_input(),
+                ),
+                &theme,
+                bmux_tui::geometry::Rect::new(0, 0, 40, 8),
+            )
+            .unwrap()
+        };
+        let mut expected = Vec::new();
+        let mut expected_terminal = bmux_tui::terminal::Terminal::new(
+            &mut expected,
+            bmux_tui::geometry::Rect::new(0, 0, 40, 8),
+        );
+        let expected_report =
+            super::present_onboarding_frame(&mut make_program(), &mut expected_terminal).unwrap();
+        expected_terminal.restore_pointer().unwrap();
+
+        let mut actual = Vec::new();
+        let mut terminal = bmux_tui::terminal::Terminal::new(
+            &mut actual,
+            bmux_tui::geometry::Rect::new(0, 0, 1, 1),
+        );
+        {
+            use bmux_tui_runtime::Presenter as _;
+            let mut presenter = super::onboarding_presenter(&mut terminal);
+            presenter.resize(bmux_tui::geometry::Size::new(40, 8));
+            let report = presenter.present(&mut make_program()).unwrap();
+            assert_eq!(report.changed_cells, expected_report.changed_cells);
+            assert_eq!(report.full_repaint, expected_report.full_repaint);
+            let restoration = presenter.restore();
+            assert_send(&restoration);
+            restoration.await.unwrap();
+        }
+        assert_eq!(actual, expected);
+    }
 
     #[test]
     fn incomplete_launch_stays_inside_setup_and_can_be_retried() {

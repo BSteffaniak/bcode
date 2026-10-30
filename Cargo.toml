@@ -324,6 +324,7 @@ bmux_plugin_schema = { default-features = false, version = "0.0.1-alpha.4" }
 bmux_plugin_sdk = { default-features = false, version = "0.0.1-alpha.4" }
 bmux_syntax_render = { default-features = false, version = "0.0.1-alpha.4" }
 bmux_terminal_grid = { default-features = false, version = "0.0.1-alpha.4" }
+bmux_terminal_protocol = { default-features = false, version = "0.0.1-alpha.4" }
 bmux_text_edit = { default-features = false, version = "0.0.1-alpha.4" }
 bmux_tui = { default-features = false, version = "0.0.1-alpha.4" }
 # BMUX text-input currently imports scroll_view without enabling its feature. Keep
@@ -591,11 +592,9 @@ opt-level = "z"
 inherits  = "dev"
 opt-level = 0
 
-# Keep each framework dependency closure on one source so public primitive types
-# stay identical without requiring sibling development checkouts.
+# Keep framework contracts and their dependency closure on upstream master.
+# Cargo.lock pins the verified revision without requiring a sibling checkout.
 [patch.crates-io]
-# Track framework contracts and their dependency closure on upstream master.
-# Keep each upstream on one source; crates.io versions have not yet been bumped.
 bmux_attach_image_protocol         = { git = "https://github.com/BSteffaniak/bmux", branch = "master" }
 bmux_codec                         = { git = "https://github.com/BSteffaniak/bmux", branch = "master" }
 bmux_config_composition            = { git = "https://github.com/BSteffaniak/bmux", branch = "master" }
@@ -612,6 +611,7 @@ bmux_plugin_schema                 = { git = "https://github.com/BSteffaniak/bmu
 bmux_plugin_sdk                    = { git = "https://github.com/BSteffaniak/bmux", branch = "master" }
 bmux_syntax_render                 = { git = "https://github.com/BSteffaniak/bmux", branch = "master" }
 bmux_terminal_grid                 = { git = "https://github.com/BSteffaniak/bmux", branch = "master" }
+bmux_terminal_protocol             = { git = "https://github.com/BSteffaniak/bmux", branch = "master" }
 bmux_text_edit                     = { git = "https://github.com/BSteffaniak/bmux", branch = "master" }
 bmux_tui                           = { git = "https://github.com/BSteffaniak/bmux", branch = "master" }
 bmux_tui_components                = { git = "https://github.com/BSteffaniak/bmux", branch = "master" }

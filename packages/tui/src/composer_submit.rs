@@ -356,13 +356,17 @@ pub fn paint_menu(
             u16::try_from(rect.height).unwrap_or(u16::MAX),
         ));
     }
+    frame.push_hit(
+        HitRegion::new(MENU_BOUNDS, menu_area)
+            .role(bmux_tui::hit::HitRole::Background)
+            .pointer_events(false),
+    );
     frame.with_child(
         i32::from(available.x),
         i64::from(available.y),
         LocalRect::new(0, 0, available.width, available.height),
         |cx| component.paint(&layout, cx),
     );
-    frame.push_hit(HitRegion::new(MENU_BOUNDS, menu_area).pointer_events(false));
 }
 
 #[cfg(test)]
@@ -444,6 +448,76 @@ mod tests {
             MouseEvent::new(MouseEventKind::Up(MouseButton::Left), point),
             enabled,
         )
+    }
+
+    #[test]
+    fn composer_pointer_intent_tracks_enabled_controls() {
+        use bmux_tui::pointer::{PointerIntent, PointerShape, resolve_pointer_intent};
+
+        let mut submit = ComposerSubmit::default();
+        let area = Rect::new(3, 2, 60, 15);
+        for (text, shape) in [
+            ("hello", PointerShape::Pointer),
+            ("", PointerShape::Default),
+        ] {
+            let hits = draw(&mut submit, area, text);
+            for id in [SEND, MORE] {
+                assert_eq!(
+                    resolve_pointer_intent(&hits, Some(point(&hits, id)), None, None),
+                    PointerIntent::Shape(shape),
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn menu_pointer_intent_preserves_items_and_occludes_background() {
+        use bmux_tui::hit::HitRole;
+        use bmux_tui::pointer::{PointerIntent, PointerShape, resolve_pointer_intent};
+
+        let mut submit = ComposerSubmit::default();
+        let area = Rect::new(3, 2, 60, 15);
+        let hits = draw(&mut submit, area, "hello");
+        click(&mut submit, &hits, MORE, true);
+        assert!(submit.is_open());
+        let mut buffer = Buffer::empty(area);
+        let mut frame = Frame::new(&mut buffer);
+        PaintCx::new(&mut frame)
+            .push_hit(HitRegion::new("background-editor", area).role(HitRole::TextInput));
+        paint_menu(
+            &mut submit,
+            area,
+            true,
+            &mut PaintCx::new(&mut frame),
+            TuiTheme::for_theme_id("terminal-native"),
+        );
+        let hits = frame.hits();
+        assert_eq!(
+            resolve_pointer_intent(hits, Some(Point::new(area.x, area.y)), None, None),
+            PointerIntent::Shape(PointerShape::Text),
+        );
+        let item = point(hits, "composer.send.menu.send");
+        assert_eq!(
+            resolve_pointer_intent(hits, Some(item), None, None),
+            PointerIntent::Shape(PointerShape::Pointer),
+        );
+        let bounds = hits
+            .regions()
+            .iter()
+            .find(|hit| hit.id.as_str() == MENU_BOUNDS)
+            .expect("menu bounds");
+        let border = Point::new(bounds.area.x - 1, bounds.area.y);
+        assert_eq!(
+            resolve_pointer_intent(hits, Some(border), None, None),
+            PointerIntent::Shape(PointerShape::Default),
+        );
+        let outcome = submit.mouse(
+            hits,
+            MouseEvent::new(MouseEventKind::Down(MouseButton::Left), border),
+            true,
+        );
+        assert!(outcome.handled);
+        assert!(outcome.placement.is_none());
     }
 
     #[test]

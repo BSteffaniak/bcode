@@ -2792,6 +2792,16 @@ impl ChatLoopState {
         self.interactive_surface = Some(surface);
     }
 
+    /// Configure an explicit test host and inspect cloned compositor repair state.
+    #[cfg(test)]
+    pub(super) const fn image_presentation_for_test(
+        &mut self,
+        capabilities: bmux_image::HostImageCapabilities,
+    ) -> &mut bmux_image::tui::TuiImageCompositor {
+        self.markdown_image_capabilities = capabilities;
+        &mut self.markdown_image_compositor
+    }
+
     #[cfg(test)]
     pub const fn set_interactive_surface_geometry_for_test(
         &mut self,
@@ -5825,11 +5835,13 @@ pub fn draw_chat_frame<W: Write>(
         }
     });
     let foreground_owns_canvas = loop_state.foreground_owns_canvas();
-    let mut compositor = std::mem::take(&mut loop_state.markdown_image_compositor);
+    // Output may fail after emitting image protocol bytes, including at flush.
+    // Keep committed residency separate from the candidate and preserve repair debt.
+    let compositor = std::cell::RefCell::new(loop_state.markdown_image_compositor.clone());
     let capabilities = loop_state.markdown_image_capabilities.clone();
     let config = loop_state.markdown_image_config.clone();
     let terminal_area = terminal.area();
-    let draw_result = terminal.draw_damage_with_overlay(
+    let draw_result = terminal.draw_damage_with_output_hooks(
         damage,
         |frame| {
             let modal = loop_state.modal_foreground();
@@ -5916,7 +5928,9 @@ pub fn draw_chat_frame<W: Write>(
             }
             paint_foreground(chat, loop_state, geometry, frame);
         },
+        |writer| compositor.borrow_mut().prepare_output(writer),
         |writer, scene, delta| {
+            let mut compositor = compositor.borrow_mut();
             compositor.apply_delta(delta);
             compositor
                 .render(
@@ -5934,8 +5948,19 @@ pub fn draw_chat_frame<W: Write>(
                 .map_err(std::io::Error::other)
         },
     );
-    loop_state.markdown_image_compositor = compositor;
-    let draw_stats = draw_result?;
+    let compositor = compositor.into_inner();
+    let draw_stats = match draw_result {
+        Ok(stats) => {
+            loop_state.markdown_image_compositor = compositor;
+            stats
+        }
+        Err(error) => {
+            loop_state
+                .markdown_image_compositor
+                .invalidate_after_failed_output(&compositor);
+            return Err(error.into());
+        }
+    };
     loop_state.interactive_surface_geometry = geometry;
     loop_state.telemetry.record_histogram(
         "tui.frame.changed_cells",
@@ -6238,11 +6263,13 @@ fn draw_temporal_frame<W: Write>(
                 .any(|region| !area.intersection(*region).is_empty())
     };
     let draw_started = Instant::now();
-    let mut compositor = std::mem::take(&mut loop_state.markdown_image_compositor);
+    // Output may fail after emitting image protocol bytes, including at flush.
+    // Keep committed residency separate from the candidate and preserve repair debt.
+    let compositor = std::cell::RefCell::new(loop_state.markdown_image_compositor.clone());
     let capabilities = loop_state.markdown_image_capabilities.clone();
     let config = loop_state.markdown_image_config.clone();
     let terminal_area = terminal.area();
-    let draw_result = terminal.draw_damage_with_overlay(
+    let draw_result = terminal.draw_damage_with_output_hooks(
         damage,
         |frame| {
             if loop_state.modal_foreground() {
@@ -6264,7 +6291,9 @@ fn draw_temporal_frame<W: Write>(
                 frame,
             );
         },
+        |writer| compositor.borrow_mut().prepare_output(writer),
         |writer, scene, delta| {
+            let mut compositor = compositor.borrow_mut();
             compositor.apply_delta(delta);
             compositor
                 .render(
@@ -6282,8 +6311,19 @@ fn draw_temporal_frame<W: Write>(
                 .map_err(std::io::Error::other)
         },
     );
-    loop_state.markdown_image_compositor = compositor;
-    let draw_stats = draw_result?;
+    let compositor = compositor.into_inner();
+    let draw_stats = match draw_result {
+        Ok(stats) => {
+            loop_state.markdown_image_compositor = compositor;
+            stats
+        }
+        Err(error) => {
+            loop_state
+                .markdown_image_compositor
+                .invalidate_after_failed_output(&compositor);
+            return Err(error.into());
+        }
+    };
     record_frame_telemetry(
         loop_state,
         &draw_stats,

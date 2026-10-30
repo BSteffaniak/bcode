@@ -16,9 +16,7 @@ use bmux_tui_components::selectable_list::{
     SelectableList, SelectableListHighlightPolicy, SelectableListItem, SelectableListPolicy,
     SelectableListState, SelectableListStyles,
 };
-use bmux_tui_runtime::{
-    Invalidation, Lifecycle, PresentReport, Presenter, Program, RuntimeEvent, Update,
-};
+use bmux_tui_runtime::{Invalidation, Lifecycle, PresentReport, Program, RuntimeEvent, Update};
 
 use crate::{TuiError, setup_connection_form::ConnectionForm, theme::PresentedTheme};
 
@@ -415,28 +413,15 @@ impl Program for QuickProgram {
     }
 }
 
-struct QuickPresenter<'a, 'b, W> {
-    terminal: &'a mut Terminal<&'b mut W>,
-}
-
-impl<W: Write> Presenter<QuickProgram> for QuickPresenter<'_, '_, W> {
-    type Error = io::Error;
-    fn resize(&mut self, size: bmux_tui::geometry::Size) {
-        self.terminal
-            .resize(Rect::new(0, 0, size.width, size.height));
-    }
-    fn reset(&mut self, _reason: bmux_tui_runtime::ResetReason) {
-        self.terminal.reset();
-    }
-    fn present(&mut self, program: &mut QuickProgram) -> Result<PresentReport, Self::Error> {
-        let stats = self
-            .terminal
-            .draw_damage(Damage::Full, |frame| program.render(frame))?;
-        Ok(PresentReport {
-            changed_cells: stats.changed_cells,
-            full_repaint: stats.full_repaint,
-        })
-    }
+fn present_quick_frame<W: Write>(
+    program: &mut QuickProgram,
+    terminal: &mut Terminal<W>,
+) -> Result<PresentReport, io::Error> {
+    let stats = terminal.draw_damage(Damage::Full, |frame| program.render(frame))?;
+    Ok(PresentReport {
+        changed_cells: stats.changed_cells,
+        full_repaint: stats.full_repaint,
+    })
 }
 
 /// Present a quick startup choice or enroll through the existing secure provider lifecycle.
@@ -449,8 +434,7 @@ pub async fn run_quick_onboarding(
 ) -> Result<QuickOnboardingOutcome, TuiError> {
     let mut shell = crate::TerminalShell::enter()?;
     let result = run_quick_onboarding_in_shell(&mut shell, input).await;
-    shell.finish()?;
-    result
+    shell.finish_with_result(result)
 }
 
 /// Present startup choices while retaining the caller's terminal ownership.
@@ -469,16 +453,17 @@ pub async fn run_quick_onboarding_in_shell(
     let mut terminal = shell.terminal()?;
     let (runtime, handle) = bmux_tui_runtime::Runtime::new(
         program,
-        QuickPresenter {
-            terminal: &mut terminal,
-        },
+        bmux_tui_runtime::terminal_presenter::BorrowedTerminalPresenter::new(
+            &mut terminal,
+            present_quick_frame,
+        ),
         bmux_tui_runtime::RuntimeConfig::default(),
     );
     let mut input =
         bmux_tui_runtime::TerminalInput::start::<QuickProgram>(handle, QuickMessage::InputFailed);
     let result = Box::pin(runtime.run()).await;
     input.shutdown().await;
-    match result {
+    let result = match result {
         Ok(output) => Ok(output.program.outcome),
         Err(bmux_tui_runtime::RuntimeError::Program {
             error,
@@ -490,12 +475,51 @@ pub async fn run_quick_onboarding_in_shell(
             cleanup_error,
             ..
         }) => Err(crate::runtime_error_with_cleanup(error, cleanup_error)),
+    };
+    if result.is_err() {
+        shell.block_handoff();
     }
+    result
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use bmux_tui_runtime::Presenter as _;
+
+    #[tokio::test]
+    async fn borrowed_presenter_preserves_frame_and_terminal_lifecycle() {
+        let mut expected = Vec::new();
+        let mut expected_terminal = Terminal::new(&mut expected, Rect::new(0, 0, 40, 8));
+        let expected_report = present_quick_frame(&mut program(), &mut expected_terminal).unwrap();
+        expected_terminal.restore_pointer().unwrap();
+
+        let mut actual = Vec::new();
+        let mut terminal = Terminal::new(&mut actual, Rect::new(0, 0, 1, 1));
+        {
+            let mut presenter =
+                bmux_tui_runtime::terminal_presenter::BorrowedTerminalPresenter::new(
+                    &mut terminal,
+                    present_quick_frame,
+                );
+            presenter.resize(bmux_tui::geometry::Size::new(40, 8));
+            let mouse = Event::Mouse(bmux_tui::event::MouseEvent::new(
+                bmux_tui::event::MouseEventKind::Move,
+                bmux_tui::geometry::Point::new(0, 0),
+            ));
+            assert!(presenter.observe_terminal_event(&mouse));
+            assert!(!presenter.observe_terminal_event(&mouse));
+            assert!(
+                presenter.observe_terminal_event(&Event::Focus(bmux_tui::event::FocusEvent::Lost,))
+            );
+            let report = presenter.present(&mut program()).unwrap();
+            assert_eq!(report.changed_cells, expected_report.changed_cells);
+            assert_eq!(report.full_repaint, expected_report.full_repaint);
+            presenter.restore().await.unwrap();
+        }
+        assert_eq!(actual, expected);
+    }
+
     fn program() -> QuickProgram {
         QuickProgram::new(
             QuickOnboardingInput {
