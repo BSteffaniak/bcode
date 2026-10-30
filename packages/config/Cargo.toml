@@ -19,6 +19,7 @@ bcode_provider_auth_models   = { workspace = true }
 bcode_session_view_models    = { workspace = true }
 bcode_skill_models           = { workspace = true }
 bcode_tool                   = { workspace = true }
+bmux_config_composition      = { workspace = true }
 hex                          = { workspace = true }
 hyperchad_docs_config        = { workspace = true }
 hyperchad_docs_config_derive = { workspace = true }

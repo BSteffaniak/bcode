@@ -316,7 +316,10 @@ fn consolidate(
     policies: &mut BTreeMap<String, toml::Value>,
 ) -> Result<(), ConfigError> {
     if let Some(reference) = doc.get("auth_pool_config")
-        && reference.as_str() != destination.to_str()
+        && !reference.as_str().is_some_and(|reference| {
+            let path = Path::new(reference);
+            path == destination || path.canonicalize().ok().as_deref() == Some(destination)
+        })
     {
         return Err(invalid(
             "Preset already references another shared pool file",

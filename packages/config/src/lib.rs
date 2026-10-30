@@ -1210,19 +1210,15 @@ pub fn merge_config_values(base: &mut toml::Value, overlay: toml::Value) {
     merge_toml_value(base, overlay);
 }
 
+/// Merge TOML documents using the shared format-neutral composition engine.
 fn merge_toml_value(base: &mut toml::Value, overlay: toml::Value) {
-    match (base, overlay) {
-        (toml::Value::Table(base_table), toml::Value::Table(overlay_table)) => {
-            for (key, value) in overlay_table {
-                if let Some(existing) = base_table.get_mut(&key) {
-                    merge_toml_value(existing, value);
-                } else {
-                    base_table.insert(key, value);
-                }
-            }
-        }
-        (base_slot, overlay_value) => *base_slot = overlay_value,
-    }
+    use bmux_config_composition::TomlCodec;
+    let mut value =
+        TomlCodec::from_toml(base.clone()).expect("configuration values are valid TOML");
+    value.overlay_replace(
+        TomlCodec::from_toml(overlay).expect("configuration overlay is valid TOML"),
+    );
+    *base = TomlCodec::to_toml(&value).expect("composed configuration is valid TOML");
 }
 
 fn parse_composition_config(root: &toml::Table) -> Result<CompositionConfig, ConfigError> {
@@ -1241,55 +1237,40 @@ fn resolve_profile_patch(
     requested_profile_id: &str,
     profiles: &BTreeMap<String, CompositionProfile>,
 ) -> Result<toml::Table, ConfigError> {
-    fn resolve_inner(
-        requested_profile_id: &str,
-        profiles: &BTreeMap<String, CompositionProfile>,
-        stack: &mut Vec<String>,
-        cache: &mut BTreeMap<String, toml::Table>,
-    ) -> Result<toml::Table, ConfigError> {
-        let canonical_id = canonical_profile_id(requested_profile_id);
-        if let Some(resolved) = cache.get(&canonical_id) {
-            return Ok(resolved.clone());
-        }
-        if stack.contains(&canonical_id) {
-            let mut cycle = stack.clone();
-            cycle.push(canonical_id.clone());
-            return Err(ConfigError::Composition {
-                message: format!("profile inheritance cycle detected: {}", cycle.join(" -> ")),
-            });
-        }
-        let Some(profile) = profiles.get(&canonical_id) else {
-            return Err(ConfigError::Composition {
-                message: format!(
-                    "profile '{requested_profile_id}' is not defined (known profiles: {})",
-                    profiles.keys().cloned().collect::<Vec<_>>().join(", ")
-                ),
-            });
-        };
-
-        stack.push(canonical_id.clone());
-        let mut resolved = toml::Table::new();
-        for parent_id in &profile.extends {
-            let parent_patch = resolve_inner(parent_id, profiles, stack, cache)?;
-            let mut merged = toml::Value::Table(resolved);
-            merge_toml_value(&mut merged, toml::Value::Table(parent_patch));
-            resolved = merged.as_table().cloned().unwrap_or_default();
-        }
-        let mut merged = toml::Value::Table(resolved);
-        merge_toml_value(&mut merged, toml::Value::Table(profile.patch.clone()));
-        let resolved = merged.as_table().cloned().unwrap_or_default();
-        stack.pop();
-
-        cache.insert(canonical_id, resolved.clone());
-        Ok(resolved)
-    }
-
-    resolve_inner(
-        requested_profile_id,
-        profiles,
-        &mut Vec::new(),
-        &mut BTreeMap::new(),
+    use bmux_config_composition::{Profile, ProfileLimits, resolve_profile_cached};
+    let profiles = profiles
+        .iter()
+        .map(|(name, profile)| {
+            (
+                name.clone(),
+                Profile {
+                    parents: profile
+                        .extends
+                        .iter()
+                        .map(|parent| canonical_profile_id(parent))
+                        .collect(),
+                    value: profile.patch.clone(),
+                },
+            )
+        })
+        .collect();
+    resolve_profile_cached(
+        &canonical_profile_id(requested_profile_id),
+        &profiles,
+        ProfileLimits {
+            max_depth: 128,
+            max_expansions: 65_536,
+        },
+        |base, overlay| {
+            let mut value = toml::Value::Table(std::mem::take(base));
+            merge_toml_value(&mut value, toml::Value::Table(overlay));
+            *base = value.as_table().cloned().unwrap_or_default();
+            Ok(())
+        },
     )
+    .map_err(|error| ConfigError::Composition {
+        message: format!("profile inheritance: {error}"),
+    })
 }
 
 fn resolve_composed_config_value(
@@ -9515,101 +9496,113 @@ fn merged_raw_config_value_with_overrides(
     paths: &[PathBuf],
     overrides: &ConfigLoadOverrides,
 ) -> Result<toml::Value, ConfigError> {
-    if let Some(path) = &overrides.exclusive_config_path {
-        let metadata = std::fs::metadata(path).map_err(|source| ConfigError::Io {
-            path: path.clone(),
-            source,
-        })?;
-        if !metadata.is_file() {
-            return Err(ConfigError::Composition {
-                message: "exclusive configuration must be a regular file".to_owned(),
-            });
+    use bmux_config_composition::{DuplicatePolicy, LoadContext, Loader, Requirement, TomlCodec};
+    let builder = Loader::builder().duplicates(DuplicatePolicy::Allow);
+    let builder = if let Some(path) = &overrides.exclusive_config_path {
+        builder.file("exclusive", Some(path), Requirement::Required)
+    } else {
+        builder
+            .file(
+                "base",
+                overrides.base_config_path.as_deref(),
+                Requirement::Optional,
+            )
+            .files("discovered", paths.iter().cloned(), Requirement::Optional)
+            .file(
+                "environment-file",
+                overrides.env_config_path.as_deref(),
+                Requirement::Required,
+            )
+            .text("environment-inline", overrides.env_config_toml.as_deref())
+            .file(
+                "cli-file",
+                overrides.cli_config_path.as_deref(),
+                Requirement::Required,
+            )
+    }
+    .text("cli-inline", overrides.cli_config_toml.as_deref());
+    let cwd = configuration_anchor(paths, overrides)?;
+    let context = LoadContext::new(cwd, BTreeMap::new()).map_err(composition_error)?;
+    let captured = builder
+        .build()
+        .and_then(|loader| loader.capture(&context))
+        .map_err(composition_error)?;
+    // File-relative references remain a product policy. Transform individual
+    // captured documents, then compose the transformed layers in their exact order.
+    let mapped = captured.try_map_documents(&TomlCodec, |source, value| {
+        let mut value = TomlCodec::to_toml(&value).map_err(composition_error)?;
+        if let Some(path) = &source.path {
+            shared_pools::expand(&mut value, path)?;
         }
-        let mut merged = load_toml_file(path)?;
-        if let Some(raw) = overrides.cli_config_toml.as_deref() {
-            merge_toml_value(&mut merged, parse_raw_toml_config(raw, "cli")?);
-        }
-        return Ok(merged);
-    }
-    let mut merged = toml::Value::Table(toml::Table::new());
-
-    if let Some(path) = overrides.base_config_path.as_ref()
-        && path.exists()
-    {
-        merge_toml_value(&mut merged, load_toml_file(path)?);
-    }
-
-    for path in paths {
-        if path.exists() {
-            merge_toml_value(&mut merged, load_toml_file(path)?);
-        }
-    }
-
-    if let Some(path) = overrides.env_config_path.as_ref() {
-        let path = resolve_config_override_path(path);
-        if !path.exists() {
-            return Err(ConfigError::Io {
-                path,
-                source: std::io::Error::new(
-                    std::io::ErrorKind::NotFound,
-                    "environment config path not found",
-                ),
-            });
-        }
-        merge_toml_value(&mut merged, load_toml_file(&path)?);
-    }
-
-    if let Some(raw) = overrides.env_config_toml.as_deref() {
-        merge_toml_value(&mut merged, parse_raw_toml_config(raw, "env")?);
-    }
-
-    if let Some(path) = overrides.cli_config_path.as_ref() {
-        let path = resolve_config_override_path(path);
-        if !path.exists() {
-            return Err(ConfigError::Io {
-                path,
-                source: std::io::Error::new(
-                    std::io::ErrorKind::NotFound,
-                    "CLI config path not found",
-                ),
-            });
-        }
-        merge_toml_value(&mut merged, load_toml_file(&path)?);
-    }
-
-    if let Some(raw) = overrides.cli_config_toml.as_deref() {
-        merge_toml_value(&mut merged, parse_raw_toml_config(raw, "cli")?);
-    }
-
-    Ok(merged)
+        TomlCodec::from_toml(value).map_err(composition_error)
+    })?;
+    mapped
+        .resolve(&TomlCodec)
+        .and_then(|resolved| resolved.decode())
+        .map_err(composition_error)
 }
 
-fn resolve_config_override_path(path: &Path) -> PathBuf {
-    if path.is_absolute() {
-        return path.to_path_buf();
+fn configuration_anchor(
+    paths: &[PathBuf],
+    overrides: &ConfigLoadOverrides,
+) -> Result<PathBuf, ConfigError> {
+    env::current_dir()
+        .or_else(|error| {
+            let relative = paths
+                .iter()
+                .chain(
+                    [
+                        overrides.exclusive_config_path.as_ref(),
+                        overrides.base_config_path.as_ref(),
+                        overrides.env_config_path.as_ref(),
+                        overrides.cli_config_path.as_ref(),
+                    ]
+                    .into_iter()
+                    .flatten(),
+                )
+                .any(|path| path.is_relative());
+            if relative {
+                Err(error)
+            } else {
+                // Absolute-file and memory-only plans do not consult this anchor.
+                Ok(env::temp_dir())
+            }
+        })
+        .map_err(|source| ConfigError::Io {
+            path: PathBuf::from("."),
+            source,
+        })
+}
+
+impl From<bmux_config_composition::Error> for ConfigError {
+    fn from(error: bmux_config_composition::Error) -> Self {
+        composition_error(error)
     }
-    env::current_dir().map_or_else(|_| path.to_path_buf(), |cwd| cwd.join(path))
+}
+
+fn composition_error(error: bmux_config_composition::Error) -> ConfigError {
+    ConfigError::Composition {
+        message: error.to_string(),
+    }
 }
 
 fn parse_raw_toml_config(raw: &str, source_name: &str) -> Result<toml::Value, ConfigError> {
-    toml::from_str(raw).map_err(|source| ConfigError::Composition {
-        message: format!("failed to parse {source_name} raw config TOML: {source}"),
-    })
+    use bmux_config_composition::TomlCodec;
+    TomlCodec::parse(raw)
+        .and_then(|value| TomlCodec::to_toml(&value))
+        .map_err(|error| ConfigError::Composition {
+            message: format!("invalid {source_name} TOML: {error}"),
+        })
 }
 
 fn load_toml_file(path: &Path) -> Result<toml::Value, ConfigError> {
-    let contents = std::fs::read_to_string(path).map_err(|source| ConfigError::Io {
-        path: path.to_path_buf(),
-        source,
-    })?;
-    let mut raw = toml::from_str(&contents).map_err(|source| ConfigError::Composition {
-        message: format!(
-            "failed to parse config {}: {source}",
-            display_from_current_dir(path)
-        ),
-    })?;
-    shared_pools::expand(&mut raw, path)?;
-    Ok(raw)
+    merged_raw_config_value_with_overrides(
+        &[],
+        &ConfigLoadOverrides {
+            exclusive_config_path: Some(path.to_owned()),
+            ..ConfigLoadOverrides::default()
+        },
+    )
 }
 
 fn read_config(path: &Path) -> Result<BcodeConfig, ConfigError> {

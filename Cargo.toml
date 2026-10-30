@@ -313,6 +313,7 @@ bmux_codec = { default-features = false, features = [
     "compression-lz4",
     "compression-zstd",
 ], version = "0.0.1-alpha.4" }
+bmux_config_composition = { version = "0.0.1-alpha.4", default-features = false }
 bmux_image = { default-features = false, version = "0.0.1-alpha.4" }
 bmux_ipc = { default-features = false, version = "0.0.1-alpha.4" }
 bmux_keyboard = { default-features = false, version = "0.0.1-alpha.4" }
@@ -597,6 +598,7 @@ opt-level = 0
 # Keep each upstream on one source; crates.io versions have not yet been bumped.
 bmux_attach_image_protocol         = { git = "https://github.com/BSteffaniak/bmux", branch = "master" }
 bmux_codec                         = { git = "https://github.com/BSteffaniak/bmux", branch = "master" }
+bmux_config_composition            = { git = "https://github.com/BSteffaniak/bmux", branch = "master" }
 bmux_fonts                         = { git = "https://github.com/BSteffaniak/bmux", branch = "master" }
 bmux_image                         = { git = "https://github.com/BSteffaniak/bmux", branch = "master" }
 bmux_ipc                           = { git = "https://github.com/BSteffaniak/bmux", branch = "master" }
