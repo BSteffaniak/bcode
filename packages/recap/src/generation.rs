@@ -277,7 +277,7 @@ impl Journal {
             "configuration.json",
         )?
         .ok_or(Error::Invalid("missing generation configuration"))?;
-        if digest(&format!("recap-engine-v1:{options:?}"))? != status.preparation {
+        if digest(&format!("recap-engine-v2:{options:?}"))? != status.preparation {
             return Err(Error::Invalid("configuration checksum mismatch"));
         }
         Ok(options)
@@ -373,6 +373,7 @@ impl ModelExecutor for Executor<'_> {
                 .begin::<ModelResponse>(&key)
                 .map_err(|_| ModelError::RecoveryRequired)?
             {
+                cancel.activity(crate::activity::Activity::Reused);
                 return Ok(response);
             }
             let response = self.inner.execute(request, cancel).await?;
@@ -397,6 +398,7 @@ impl ModelExecutor for Executor<'_> {
                 .begin::<AnalysisResponse>(&key)
                 .map_err(|_| ModelError::RecoveryRequired)?
             {
+                cancel.activity(crate::activity::Activity::Reused);
                 return Ok(response);
             }
             let response = self.inner.execute_analysis(request, cancel).await?;

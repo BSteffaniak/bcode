@@ -12,6 +12,7 @@ use super::{
     ownership::{Findings, Ownership},
 };
 use crate::analysis_contracts::{ChapterComposition, Outline};
+use crate::contracts::BlockContent;
 use serde_json::json;
 use std::collections::BTreeMap;
 
@@ -387,7 +388,10 @@ pub(super) fn finish(
                             }
                         }
                     }
-                    crate::contracts::BlockContent::Text { .. } => {}
+                    crate::contracts::BlockContent::Text { .. }
+                    | BlockContent::Heading { .. }
+                    | BlockContent::List { .. }
+                    | BlockContent::Diagram { .. } => {}
                 }
             }
             chapter.section

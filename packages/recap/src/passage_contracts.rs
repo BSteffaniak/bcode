@@ -25,6 +25,9 @@ pub struct PassageSource {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct SourceUnit {
+    /// Shared source-attested context, never primary evidence for individual turns.
+    #[serde(default)]
+    pub source_context: crate::source_context::SourceContext,
     /// Host-assigned unit identity.
     pub id: String,
     /// Exact material this unit must render.

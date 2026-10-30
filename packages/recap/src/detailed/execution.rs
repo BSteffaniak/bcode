@@ -217,6 +217,10 @@ impl Operation<'_> {
                     let response = result.expect("all wave futures settled")?;
                     check(response.stage() == stage, "analysis stage mismatch")?;
                     let size = match &response {
+                        AnalysisResponse::EditionPlan(value) => serde_json::to_vec(value)?,
+                        AnalysisResponse::VisualPlan(value) => serde_json::to_vec(value)?,
+                        AnalysisResponse::VisualReview(value) => serde_json::to_vec(value)?,
+                        AnalysisResponse::Participants(value) => serde_json::to_vec(value)?,
                         AnalysisResponse::ExtractionInventory(value) => serde_json::to_vec(value)?,
                         AnalysisResponse::Outline(value) => serde_json::to_vec(value)?,
                         AnalysisResponse::ChapterComposition(value) => serde_json::to_vec(value)?,
@@ -254,7 +258,11 @@ impl Operation<'_> {
 const fn progress(stage: AnalysisStage) -> (crate::diagnostics::Phase, usize) {
     use crate::diagnostics::Phase;
     match stage {
-        AnalysisStage::ExtractionInventory
+        AnalysisStage::EditionPlan
+        | AnalysisStage::VisualPlan
+        | AnalysisStage::VisualReview
+        | AnalysisStage::Participants
+        | AnalysisStage::ExtractionInventory
         | AnalysisStage::VisualInspection
         | AnalysisStage::Outline => (Phase::Analysis, 0),
         AnalysisStage::ChapterComposition | AnalysisStage::PassageComposition => {

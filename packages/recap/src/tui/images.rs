@@ -34,7 +34,11 @@ pub(super) fn load_preview(
         .find_map(|block| match &block.content {
             BlockContent::Image { asset_id, .. } => Some(asset_id.as_str()),
             BlockContent::Comparison { items } => items.first().map(|item| item.asset_id.as_str()),
-            BlockContent::Text { .. } | BlockContent::Clip { .. } => None,
+            BlockContent::Text { .. }
+            | BlockContent::Clip { .. }
+            | BlockContent::Heading { .. }
+            | BlockContent::List { .. }
+            | BlockContent::Diagram { .. } => None,
         });
     let Some(asset_id) = asset_id else {
         return Ok(None);

@@ -469,6 +469,7 @@ pub(crate) fn passage_units(
             assets: serde_json::from_value(payload["assets"].clone())?,
         };
         let unit = SourceUnit {
+            source_context: document.source.context.for_composition(),
             id: window.id,
             primary,
             context: PassageSource {
@@ -634,6 +635,7 @@ mod tests {
             revision: 1,
             title: "Source".into(),
             source: Source {
+                context: crate::source_context::SourceContext::default(),
                 id: "video".into(),
                 title: "Video".into(),
                 url: None,
@@ -825,6 +827,7 @@ mod tests {
         };
         let mut document = detailed_source(vec![], 10_000);
         document.assets.push(Asset {
+            illustration: None,
             id: "large-metadata".repeat(300),
             path: AssetPath::new("frame.jpg").unwrap(),
             mime_type: "image/jpeg".into(),
@@ -947,6 +950,7 @@ mod tests {
             transcript_segment_ids: vec![],
         });
         document.assets.push(Asset {
+            illustration: None,
             id: "frame".into(),
             path: AssetPath::new("frame.jpg").unwrap(),
             mime_type: "image/jpeg".into(),

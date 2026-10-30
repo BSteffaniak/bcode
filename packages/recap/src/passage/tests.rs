@@ -37,6 +37,7 @@ fn fixture() -> (RecapDocument, SourceUnit, Passage) {
         assets: vec![],
     };
     let unit = SourceUnit {
+        source_context: crate::source_context::SourceContext::default(),
         id: "unit-0".into(),
         primary: source,
         context: PassageSource {

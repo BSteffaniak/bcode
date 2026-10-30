@@ -278,6 +278,8 @@ struct State {
 }
 /// Observer implemented by callers; events contain no raw process/provider content.
 pub trait Observer: Send + Sync + std::fmt::Debug {
+    /// Optional private activity channel; diagnostic collectors intentionally discard it.
+    fn activity(&self, _activity: crate::activity::Activity) {}
     /// Observe a semantic event; callers must keep this bounded and nonblocking.
     fn observe(&self, event: Event);
     /// Optional count-only extension. Existing event observers remain compatible.

@@ -65,6 +65,14 @@ struct Active {
     task: tokio::task::JoinHandle<()>,
 }
 
+#[derive(Debug)]
+struct ActivityObserver(bcode_recap::activity::Timeline);
+impl bcode_recap::diagnostics::Observer for ActivityObserver {
+    fn observe(&self, _event: bcode_recap::diagnostics::Event) {}
+    fn activity(&self, activity: bcode_recap::activity::Activity) {
+        bcode_recap::activity::ActivitySink::emit(&self.0, activity);
+    }
+}
 enum Message {
     Discovered(
         u64,
@@ -78,7 +86,18 @@ enum Message {
     InputFailed(String),
 }
 
+#[derive(Default)]
+struct ActivityPresentation {
+    expanded: bool,
+    history: std::collections::VecDeque<bmux_tui::text::Line>,
+    lines: Vec<bmux_tui::text::Line>,
+    scroll: Cell<ScrollViewState>,
+}
+
 struct App {
+    activity: bcode_recap::activity::Timeline,
+    stage_history: std::collections::VecDeque<String>,
+    live_detail: ActivityPresentation,
     preview: Option<images::PreviewImage>,
     preview_generation: u64,
     image_capabilities: bmux_image::host_caps::HostImageCapabilities,
@@ -136,6 +155,9 @@ impl App {
         ];
         let resume_id = bcode_recap::generation::Journal::latest(&options.store).ok();
         Self {
+            activity: bcode_recap::activity::Timeline::default(),
+            stage_history: std::collections::VecDeque::new(),
+            live_detail: ActivityPresentation::default(),
             preview: None,
             preview_generation: 0,
             image_capabilities: bmux_image::host_caps::HostImageCapabilities::default(),
@@ -182,6 +204,35 @@ impl App {
             size: Cell::new((80, 24)),
         }
     }
+    fn refresh_activity(&mut self) {
+        self.live_detail.lines = self.live_detail.history.iter().cloned().collect();
+        for (millis, event) in self.activity.recent(256) {
+            let text = match event {
+                bcode_recap::activity::Activity::Started { id, label } => {
+                    format!("{millis}ms · #{id} Started {label}")
+                }
+                bcode_recap::activity::Activity::Finished { id, succeeded } => format!(
+                    "{millis}ms · #{id} {}",
+                    if succeeded {
+                        "Completed"
+                    } else {
+                        "Failed or interrupted"
+                    }
+                ),
+                bcode_recap::activity::Activity::Text { id, text } => {
+                    format!("#{id} · Provisional output · not yet validated\n{text}")
+                }
+                bcode_recap::activity::Activity::Reused => {
+                    format!("{millis}ms · Reused completed work")
+                }
+            };
+            for line in text.lines() {
+                self.live_detail
+                    .lines
+                    .push(bmux_tui::text::Line::from(line.to_owned()));
+            }
+        }
+    }
     fn text(&self, index: usize) -> String {
         self.fields[index]
             .borrow()
@@ -221,7 +272,11 @@ impl App {
         }
         self.sequence = self.sequence.saturating_add(1);
         let id = self.sequence;
-        let cancel = Cancellation::default();
+        self.activity = bcode_recap::activity::Timeline::default();
+        self.stage_history.clear();
+        self.live_detail = ActivityPresentation::default();
+        let cancel = Cancellation::default()
+            .observed(std::sync::Arc::new(ActivityObserver(self.activity.clone())));
         let self_cancel = cancel.clone();
         let options = self.options.clone();
         let (tx, mut rx) = tokio::sync::mpsc::channel(8);
@@ -263,22 +318,32 @@ impl App {
                 "Cancellation requested · waiting for the operation to settle safely".into();
         }
     }
-    fn action(&mut self, action: &str) -> Update<Message> {
+    fn active_action(&mut self, action: &str) -> Option<Update<Message>> {
         if action == "quit" {
             self.quitting = true;
             self.cancel();
-            return if self.active.is_none() {
+            return Some(if self.active.is_none() {
                 Update::exit()
             } else {
                 Update::redraw()
-            };
+            });
         }
         if action == "cancel" {
             self.cancel();
-            return Update::redraw();
+            return Some(Update::redraw());
         }
         if self.active.is_some() {
-            return Update::none();
+            return Some(if action == "live-detail" {
+                self.effect_action(action)
+            } else {
+                Update::none()
+            });
+        }
+        None
+    }
+    fn action(&mut self, action: &str) -> Update<Message> {
+        if let Some(update) = self.active_action(action) {
+            return update;
         }
         if let Some(update) = self.settings_action(action) {
             return update;
@@ -336,7 +401,7 @@ impl App {
                 }
             }
             "generate" | "apply" | "export" | "open" | "approve-duration" | "decline-duration"
-            | "resume" | "retry-uncertain" => {
+            | "resume" | "retry-uncertain" | "live-detail" => {
                 return self.effect_action(action);
             }
             "more" => {
@@ -366,6 +431,11 @@ impl App {
     }
     fn effect_action(&mut self, action: &str) -> Update<Message> {
         match action {
+            "live-detail" => {
+                self.live_detail.expanded = !self.live_detail.expanded;
+                self.refresh_activity();
+            }
+
             "resume" | "retry-uncertain" => {
                 let id = self
                     .text(0)
@@ -549,6 +619,7 @@ impl App {
                     Some("generate")
                 }
                 KeyCode::F(2) if !self.settings_state.open => Some("generate"),
+                KeyCode::F(3) if self.active.is_some() => Some("live-detail"),
                 KeyCode::F(3) => Some("chapters"),
                 KeyCode::F(4) => Some("refine"),
                 KeyCode::F(5) => Some("export"),
@@ -795,6 +866,9 @@ impl Program for App {
                 return Ok(update);
             }
             RuntimeEvent::Message(Message::Tick) => {
+                if self.active.is_some() {
+                    self.refresh_activity();
+                }
                 return Ok(if self.active.is_some() {
                     Update::redraw()
                 } else {
@@ -807,6 +881,21 @@ impl Program for App {
                 self.cancel();
             }
             RuntimeEvent::Message(Message::Progress(id, stage)) => {
+                if self.active.as_ref().is_some_and(|active| active.id == id) {
+                    let label = format!("{stage:?}");
+                    if self.stage_history.back() != Some(&label) {
+                        self.live_detail
+                            .history
+                            .push_back(bmux_tui::text::Line::from(format!("Stage · {label}")));
+                        while self.live_detail.history.len() > 128 {
+                            self.live_detail.history.pop_front();
+                        }
+                        self.stage_history.push_back(label);
+                    }
+                    while self.stage_history.len() > 64 {
+                        self.stage_history.pop_front();
+                    }
+                }
                 if let Some(active) = &mut self.active
                     && active.id == id
                 {

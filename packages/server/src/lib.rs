@@ -36314,7 +36314,8 @@ async fn resolve_server_plugin_bridge_request(
             })
         }
         ServiceBridgeRequest::InvokeService(request)
-            if request.interface_id == bcode_tool::PROCESS_ADMISSION_INTERFACE_ID =>
+            if request.interface_id == bcode_tool::PROCESS_ADMISSION_INTERFACE_ID
+                || request.interface_id == bcode_tool::WEB_ADMISSION_INTERFACE_ID =>
         {
             let resolution =
                 admit_plugin_process(state, session_id, call, plugin_id, request, cancel_state)
@@ -36396,6 +36397,30 @@ impl Drop for ProcessAgentGuard<'_> {
     }
 }
 
+fn decode_external_admission(
+    request: &ToolInvocationServiceRequest,
+) -> Result<bcode_agent_profile::ToolPolicyOperation, String> {
+    use bcode_agent_profile::ToolPolicyOperation;
+    let operation: ToolPolicyOperation = serde_json::from_value(request.payload.clone())
+        .map_err(|_| "invalid operation".to_owned())?;
+    match (&operation, request.interface_id.as_str()) {
+        (ToolPolicyOperation::Process { .. }, bcode_tool::PROCESS_ADMISSION_INTERFACE_ID) => {
+            Ok(operation)
+        }
+        (ToolPolicyOperation::Web { url: Some(url) }, bcode_tool::WEB_ADMISSION_INTERFACE_ID)
+            if url::Url::parse(url).is_ok_and(|url| {
+                url.scheme() == "https"
+                    && url.username().is_empty()
+                    && url.password().is_none()
+                    && url.host_str().is_some()
+            }) =>
+        {
+            Ok(operation)
+        }
+        _ => Err("unsupported external admission".into()),
+    }
+}
+
 async fn admit_plugin_process(
     state: &ServerState,
     session_id: SessionId,
@@ -36411,11 +36436,7 @@ async fn admit_plugin_process(
             || cancel_state.is_cancelled()
         {
             ToolInvocationServiceResolution::Cancelled
-        } else if let Ok(operation @ bcode_agent_profile::ToolPolicyOperation::Process { .. }) =
-            serde_json::from_value::<bcode_agent_profile::ToolPolicyOperation>(
-                request.payload.clone(),
-            )
-        {
+        } else if let Ok(operation) = decode_external_admission(&request) {
             let agent = cancel_state
                 .process_admission_agents
                 .lock()
@@ -36450,7 +36471,10 @@ async fn admit_plugin_process(
                 });
             }
             let must_ask = matches!(skill, SkillToolPolicyOutcome::Ask { .. });
-            let process_name = process_policy_name(&metadata.operation)?;
+            let process_name = match &metadata.operation {
+                bcode_agent_profile::ToolPolicyOperation::Web { .. } => "web.fetch".to_owned(),
+                _ => process_policy_name(&metadata.operation)?,
+            };
             let mut prompt = call.clone();
             prompt.name.clone_from(&process_name);
             prompt.arguments = request.payload;
@@ -106325,5 +106349,54 @@ async fn scoped_permission_response(
             }
         }
         _ => unreachable!("scoped permission dispatcher"),
+    }
+}
+
+#[cfg(test)]
+mod external_admission_contract_tests {
+    use super::*;
+    #[test]
+    fn web_admission_does_not_accept_process_facts_or_unsafe_urls() {
+        let request = |payload| ToolInvocationServiceRequest {
+            invocation_id: "caller".into(),
+            request_id: "one".into(),
+            route_id: None,
+            interface_id: bcode_tool::WEB_ADMISSION_INTERFACE_ID.into(),
+            operation: bcode_tool::OP_AUTHORIZE_WEB.into(),
+            payload,
+        };
+        assert!(
+            decode_external_admission(&request(
+                serde_json::to_value(bcode_agent_profile::ToolPolicyOperation::Web {
+                    url: Some("https://commons.wikimedia.org/w/api.php".into())
+                })
+                .unwrap()
+            ))
+            .is_ok()
+        );
+        for url in [
+            "http://example.com",
+            "https://secret@example.com",
+            "file:///tmp/x",
+        ] {
+            assert!(
+                decode_external_admission(&request(
+                    serde_json::to_value(bcode_agent_profile::ToolPolicyOperation::Web {
+                        url: Some(url.into())
+                    })
+                    .unwrap()
+                ))
+                .is_err()
+            );
+        }
+        assert!(
+            decode_external_admission(&request(
+                serde_json::to_value(bcode_agent_profile::ToolPolicyOperation::Read {
+                    paths: vec!["/tmp/x".into()]
+                })
+                .unwrap()
+            ))
+            .is_err()
+        );
     }
 }

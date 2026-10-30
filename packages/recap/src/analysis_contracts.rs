@@ -15,6 +15,14 @@ use crate::{
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum AnalysisStage {
+    /// Organize accepted source passages without rewriting their content.
+    EditionPlan,
+    /// Plan source-grounded supporting illustrations.
+    VisualPlan,
+    /// Inspect an external candidate for relevance and truthful captioning.
+    VisualReview,
+    /// Resolve participants from explicit source attestations.
+    Participants,
     /// Identify substantive source information within one bounded window.
     ExtractionInventory,
     /// Organize inventory and explicitly account for every item.
@@ -434,6 +442,14 @@ impl CoverageReport {
 /// by the request stage; adapters must never guess the stage from returned content.
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum AnalysisResponse {
+    /// Validated contiguous editorial grouping.
+    EditionPlan(crate::editorial::EditionPlan),
+    /// Supporting illustration opportunities.
+    VisualPlan(crate::visual_context::VisualPlan),
+    /// Multimodal candidate assessment.
+    VisualReview(crate::visual_context::VisualReview),
+    /// Source-attested participant candidates.
+    Participants(crate::source_context::Participants),
     /// Window information inventory.
     ExtractionInventory(ExtractionInventory),
     /// Item-accounted chapter plan.
@@ -470,6 +486,10 @@ impl AnalysisResponse {
             return Err(ModelError::InvalidResponse);
         }
         match stage {
+            AnalysisStage::EditionPlan => serde_json::from_slice(bytes).map(Self::EditionPlan),
+            AnalysisStage::VisualPlan => serde_json::from_slice(bytes).map(Self::VisualPlan),
+            AnalysisStage::VisualReview => serde_json::from_slice(bytes).map(Self::VisualReview),
+            AnalysisStage::Participants => serde_json::from_slice(bytes).map(Self::Participants),
             AnalysisStage::ExtractionInventory => {
                 serde_json::from_slice(bytes).map(Self::ExtractionInventory)
             }
@@ -495,6 +515,10 @@ impl AnalysisResponse {
     #[must_use]
     pub const fn stage(&self) -> AnalysisStage {
         match self {
+            Self::EditionPlan(_) => AnalysisStage::EditionPlan,
+            Self::VisualPlan(_) => AnalysisStage::VisualPlan,
+            Self::VisualReview(_) => AnalysisStage::VisualReview,
+            Self::Participants(_) => AnalysisStage::Participants,
             Self::ExtractionInventory(_) => AnalysisStage::ExtractionInventory,
             Self::Outline(_) => AnalysisStage::Outline,
             Self::ChapterComposition(_) => AnalysisStage::ChapterComposition,
@@ -532,6 +556,16 @@ pub fn analysis_response_schema(stage: AnalysisStage) -> serde_json::Value {
         "item_ids":strings,"chapter_ids":strings,"description":text
     }));
     match stage {
+        AnalysisStage::EditionPlan => {
+            object(json!({"chapters":array(object(json!({"title":text,"section_ids":strings})))}))
+        }
+        AnalysisStage::VisualPlan => object(
+            json!({"opportunities":array(object(json!({"section_id":text,"subject":text,"purpose":text})))}),
+        ),
+        AnalysisStage::VisualReview => object(json!({"useful":{"type":"boolean"},"caption":text})),
+        AnalysisStage::Participants => object(
+            json!({"participants":array(object(json!({"name":text,"role":text,"evidence":text})))}),
+        ),
         AnalysisStage::PassageComposition => crate::passage_contracts::composition_schema(),
         AnalysisStage::PassageReview => crate::passage_contracts::review_schema(),
         AnalysisStage::PassagePatch => crate::passage_contracts::patch_schema(),

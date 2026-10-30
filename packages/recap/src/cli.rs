@@ -31,6 +31,9 @@ struct Cli {
     /// Maximum bytes in one stored recap document.
     #[arg(long, global = true, default_value = "8388608", value_parser = positive_u64)]
     max_document_bytes: u64,
+    /// Stream private provisional model output to stderr; never included in diagnostic reports.
+    #[arg(long, global = true)]
+    live_output: bool,
     #[command(subcommand)]
     command: Option<Command>,
 }
@@ -389,7 +392,7 @@ pub async fn main() -> ExitCode {
             options.diagnostic_report = arguments.diagnostic_report;
             options.store = arguments.store;
             options.max_document_bytes = arguments.max_document_bytes;
-            return match crate::tui::run(options).await {
+            return match Box::pin(crate::tui::run(options)).await {
                 Ok(()) => ExitCode::SUCCESS,
                 Err(error) => {
                     eprintln!("recap: {error}");
@@ -405,7 +408,11 @@ pub async fn main() -> ExitCode {
             Err(_) => ExitCode::FAILURE,
         };
     }
-    let cancellation = Cancellation::default();
+    let cancellation = if arguments.live_output {
+        Cancellation::default().observed(std::sync::Arc::new(CliActivity))
+    } else {
+        Cancellation::default()
+    };
     let signal_cancel = cancellation.clone();
     let signal_task = tokio::spawn(async move {
         if tokio::signal::ctrl_c().await.is_ok() {
@@ -425,6 +432,34 @@ pub async fn main() -> ExitCode {
                 ExitCode::from(130)
             } else {
                 ExitCode::FAILURE
+            }
+        }
+    }
+}
+
+#[derive(Debug)]
+struct CliActivity;
+impl bcode_recap::diagnostics::Observer for CliActivity {
+    fn observe(&self, _event: bcode_recap::diagnostics::Event) {}
+    fn activity(&self, event: bcode_recap::activity::Activity) {
+        use bcode_recap::activity::Activity;
+        match event {
+            Activity::Started { id, label } => eprintln!("\n[{id}] {label}"),
+            Activity::Finished { id, succeeded } => eprintln!(
+                "\n[{id}] {}",
+                if succeeded {
+                    "completed"
+                } else {
+                    "interrupted or failed"
+                }
+            ),
+            Activity::Reused => eprintln!("[recovery] reused completed work"),
+            Activity::Text { id, text } => {
+                let safe: String = text
+                    .chars()
+                    .filter(|c| !c.is_control() || *c == '\n' || *c == '\t')
+                    .collect();
+                eprint!("[{id} provisional] {safe}");
             }
         }
     }

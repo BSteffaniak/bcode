@@ -17,6 +17,8 @@ use std::{
     time::{Duration, Instant},
 };
 
+static NEXT_CALL: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+
 /// Resolve through Bcode's configured selection and provider authentication.
 #[derive(Clone, Debug)]
 pub struct BcodeOptions {
@@ -347,6 +349,17 @@ impl BcodeExecutor {
             return Err(ModelError::Cancelled);
         }
         let max_bytes = request.max_response_bytes;
+        let input: serde_json::Value =
+            serde_json::from_str(&request.input_text).unwrap_or(serde_json::Value::Null);
+        let unit = input["source_unit"]["id"]
+            .as_str()
+            .filter(|id| {
+                id.len() <= 128
+                    && id
+                        .bytes()
+                        .all(|b| b.is_ascii_alphanumeric() || b"-_".contains(&b))
+            })
+            .unwrap_or("");
         let mut content = vec![ContentBlock::Text {
             text: request.input_text,
         }];
@@ -362,6 +375,16 @@ impl BcodeExecutor {
                 },
             });
         }
+        let call_id = NEXT_CALL.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let live = Arc::new(LiveCall {
+            id: call_id,
+            cancel: cancellation.clone(),
+            succeeded: std::sync::atomic::AtomicBool::new(false),
+        });
+        cancellation.activity(bcode_recap::activity::Activity::Started {
+            id: call_id,
+            label: format!("{:?} {unit}", timing.stage),
+        });
         let agent = self
             .sdk
             .agent()
@@ -376,6 +399,7 @@ impl BcodeExecutor {
                     .with_jitter_millis(250)
                     .normalized_only(),
             )
+            .invocation_event_sink(live.clone())
             .system(request.instructions)
             .parameters(self.parameters.clone())
             .timeout(self.timeout)
@@ -414,14 +438,54 @@ impl BcodeExecutor {
         if encoded.len() > max_bytes {
             return Err(ModelError::InvalidResponse);
         }
+        live.succeeded
+            .store(true, std::sync::atomic::Ordering::Relaxed);
         Ok(encoded)
+    }
+}
+#[derive(Debug)]
+struct LiveCall {
+    id: u64,
+    cancel: Cancellation,
+    succeeded: std::sync::atomic::AtomicBool,
+}
+impl bcode::TurnEventSink for LiveCall {
+    fn emit(&self, event: bcode::ScopedTurnEvent) -> bool {
+        let text = match event {
+            bcode::ScopedTurnEvent::Runtime(
+                bcode::AgentEvent::TextDelta(text)
+                | bcode::AgentEvent::Output {
+                    event: bcode_model::ProviderOutputEvent::TextDelta { text },
+                    ..
+                },
+            ) => Some(text),
+            _ => None,
+        };
+        if let Some(text) = text {
+            self.cancel
+                .activity(bcode_recap::activity::Activity::Text { id: self.id, text });
+        }
+        true
+    }
+}
+impl Drop for LiveCall {
+    fn drop(&mut self) {
+        self.cancel
+            .activity(bcode_recap::activity::Activity::Finished {
+                id: self.id,
+                succeeded: self.succeeded.load(std::sync::atomic::Ordering::Relaxed),
+            });
     }
 }
 
 const fn request_stage(stage: bcode_recap::model::AnalysisStage) -> RequestStage {
     use bcode_recap::model::AnalysisStage;
     match stage {
-        AnalysisStage::ExtractionInventory => RequestStage::Inventory,
+        AnalysisStage::EditionPlan
+        | AnalysisStage::VisualPlan
+        | AnalysisStage::VisualReview
+        | AnalysisStage::Participants
+        | AnalysisStage::ExtractionInventory => RequestStage::Inventory,
         AnalysisStage::Outline => RequestStage::Outline,
         AnalysisStage::ChapterComposition | AnalysisStage::PassageComposition => {
             RequestStage::Chapter

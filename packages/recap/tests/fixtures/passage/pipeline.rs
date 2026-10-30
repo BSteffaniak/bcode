@@ -295,6 +295,7 @@ fn source(case: &passage::Case, with_image: bool) -> RecapDocument {
         revision: 1,
         title: case.id.clone(),
         source: Source {
+            context: bcode_recap::source_context::SourceContext::default(),
             id: case.id.clone(),
             title: case.id.clone(),
             url: None,
@@ -315,6 +316,7 @@ fn source(case: &passage::Case, with_image: bool) -> RecapDocument {
         transcript,
         assets: if with_image {
             vec![Asset {
+                illustration: None,
                 id: "source-frame".into(),
                 path: AssetPath::new("source-frame.png").unwrap(),
                 mime_type: "image/png".into(),

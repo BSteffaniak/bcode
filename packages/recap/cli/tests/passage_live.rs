@@ -182,6 +182,7 @@ fn grounded_excerpt() -> RecapDocument {
         revision: 1,
         title: "Procedure and limitations".into(),
         source: Source {
+            context: bcode_recap::source_context::SourceContext::default(),
             id: "excerpt".into(),
             title: "Procedure and limitations".into(),
             url: None,

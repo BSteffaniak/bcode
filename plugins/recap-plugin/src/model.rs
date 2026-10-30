@@ -17,6 +17,7 @@ use bcode_recap::{
 use bcode_tool::{ToolInvocationServiceRequest, ToolInvocationServiceResolution};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+static NEXT_CALL: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
 pub struct HostExecutor {
     pub bridge: ServiceBridge,
     pub invocation_id: String,
@@ -140,6 +141,11 @@ impl HostExecutor {
             scope_id: scope_id.clone(),
             turn_id: started.turn_id.clone(),
         };
+        let call_id = NEXT_CALL.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        cancel.activity(bcode_recap::activity::Activity::Started {
+            id: call_id,
+            label: "Structured recap model request".into(),
+        });
         let mut cursor = 0;
         let mut text = String::new();
         let deadline = tokio::time::Instant::now() + Duration::from_secs(120);
@@ -169,7 +175,13 @@ impl HostExecutor {
                     | ProviderTurnEvent::Output {
                         event: bcode_model::ProviderOutputEvent::TextDelta { text: delta },
                         ..
-                    } => text.push_str(&delta),
+                    } => {
+                        cancel.activity(bcode_recap::activity::Activity::Text {
+                            id: call_id,
+                            text: delta.clone(),
+                        });
+                        text.push_str(&delta);
+                    }
                     ProviderTurnEvent::Error { .. } | ProviderTurnEvent::Cancelled => {
                         failed = true;
                     }
@@ -188,6 +200,10 @@ impl HostExecutor {
         // Finish is explicit and never triggers retry of an uncertain model operation.
         let _: Result<bcode_model::AckResponse, _> = self.call(wire::OP_CANCEL, &turn);
         let _: Result<bcode_model::AckResponse, _> = self.call(wire::OP_FINISH, &turn);
+        cancel.activity(bcode_recap::activity::Activity::Finished {
+            id: call_id,
+            succeeded: result.is_ok(),
+        });
         result
     }
 }

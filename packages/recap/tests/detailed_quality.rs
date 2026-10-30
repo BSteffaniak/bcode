@@ -336,7 +336,8 @@ fn numeric_and_logical_mutations_fail_across_source_categories() {
             .unwrap();
         let mut document = case.expected_document(Depth::Detailed);
         let text = match &mut document.sections[index].blocks[0].content {
-            BlockContent::Text { text } => text,
+            BlockContent::Text { text } | BlockContent::Heading { text } => text,
+            BlockContent::List { .. } | BlockContent::Diagram { .. } => continue,
             BlockContent::Image { caption, .. } => caption,
             _ => panic!("expected text or image"),
         };
@@ -359,11 +360,13 @@ fn cosmetic_case_whitespace_and_section_titles_do_not_change_coverage() {
             section.title = "Editorial heading".into();
             for block in &mut section.blocks {
                 let text = match &mut block.content {
-                    BlockContent::Text { text } => text,
+                    BlockContent::Text { text } | BlockContent::Heading { text } => text,
                     BlockContent::Image { caption, .. } | BlockContent::Clip { caption, .. } => {
                         caption
                     }
-                    BlockContent::Comparison { .. } => continue,
+                    BlockContent::Comparison { .. }
+                    | BlockContent::List { .. }
+                    | BlockContent::Diagram { .. } => continue,
                 };
                 *text = text.to_uppercase().replace(' ', "  \n ");
             }

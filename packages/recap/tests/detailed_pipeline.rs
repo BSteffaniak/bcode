@@ -101,6 +101,10 @@ impl ModelExecutor for Typed {
                 cancel.cancel();
             }
             let mut response = match request.stage {
+                AnalysisStage::EditionPlan
+                | AnalysisStage::VisualPlan
+                | AnalysisStage::VisualReview
+                | AnalysisStage::Participants => panic!("fixture has no participant metadata"),
                 AnalysisStage::ExtractionInventory => self.stage_inventory(&request),
                 AnalysisStage::VisualInspection => Self::stage_visual(&request),
                 AnalysisStage::Outline => Self::stage_outline(&request),
@@ -125,6 +129,10 @@ impl ModelExecutor for Typed {
             }
             if self.corrupt_stage == Some(request.stage) {
                 match &mut response {
+                    AnalysisResponse::EditionPlan(_)
+                    | AnalysisResponse::VisualPlan(_)
+                    | AnalysisResponse::VisualReview(_)
+                    | AnalysisResponse::Participants(_) => panic!("fixture has no participants"),
                     AnalysisResponse::ExtractionInventory(value) => {
                         // Visual-only windows legitimately have no text items.
                         // Corrupt the echoed host identity in every window rather
@@ -525,6 +533,7 @@ fn source() -> (RecapDocument, Vec<ImageAsset>, DetailedPolicy) {
         revision: 1,
         title: "Grounded".into(),
         source: Source {
+            context: bcode_recap::source_context::SourceContext::default(),
             id: "video".into(),
             title: "Video".into(),
             url: None,
@@ -550,12 +559,14 @@ fn source() -> (RecapDocument, Vec<ImageAsset>, DetailedPolicy) {
         ],
         assets: vec![
             Asset {
+                illustration: None,
                 id: "frame".into(),
                 path: AssetPath::new("frame.png").unwrap(),
                 mime_type: "image/png".into(),
                 range: early,
             },
             Asset {
+                illustration: None,
                 id: "late-frame".into(),
                 path: AssetPath::new("late.png").unwrap(),
                 mime_type: "image/png".into(),
@@ -1104,6 +1115,10 @@ async fn every_stage_rejects_fabricated_or_incomplete_identity_sets() {
             "corruption fixture did not reach {stage:?}"
         );
         match stage {
+            AnalysisStage::EditionPlan
+            | AnalysisStage::VisualPlan
+            | AnalysisStage::VisualReview
+            | AnalysisStage::Participants => panic!("fixture has no participant metadata"),
             AnalysisStage::ExtractionInventory | AnalysisStage::VisualInspection => {
                 assert!(calls.iter().all(|call| matches!(
                     call,

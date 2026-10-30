@@ -405,7 +405,10 @@ async fn unreferenced_inspection_evidence_is_retained_but_not_read_by_export() {
         .iter()
         .flat_map(|section| &section.blocks)
         .flat_map(|block| match &block.content {
-            BlockContent::Text { .. } => vec![],
+            BlockContent::Text { .. }
+            | BlockContent::Heading { .. }
+            | BlockContent::List { .. }
+            | BlockContent::Diagram { .. } => vec![],
             BlockContent::Image { asset_id, .. } | BlockContent::Clip { asset_id, .. } => {
                 vec![asset_id.as_str()]
             }

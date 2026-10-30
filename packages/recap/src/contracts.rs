@@ -8,7 +8,7 @@ use std::collections::BTreeSet;
 use serde::{Deserialize, Serialize};
 
 /// The only supported document representation. Unknown versions are never downgraded.
-pub const DOCUMENT_SCHEMA_VERSION: u32 = 1;
+pub const DOCUMENT_SCHEMA_VERSION: u32 = 2;
 
 /// A recap operation result.
 pub type Result<T> = std::result::Result<T, Error>;
@@ -61,6 +61,9 @@ pub enum Error {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Source {
+    /// Source-attested context; absent in version-one documents created before enrichment.
+    #[serde(default)]
+    pub context: crate::source_context::SourceContext,
     /// Stable source identity.
     pub id: String,
     /// Human-readable title.
@@ -181,6 +184,9 @@ impl From<AssetPath> for String {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Asset {
+    /// Present only for supporting imagery retrieved outside the source video.
+    #[serde(default)]
+    pub illustration: Option<crate::visual_context::IllustrationOrigin>,
     /// Stable asset identity.
     pub id: String,
     /// Relative to this document's owned assets directory.
@@ -244,6 +250,25 @@ pub struct Block {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
 pub enum BlockContent {
+    /// A subsection heading, distinct from source processing boundaries.
+    Heading {
+        /// Plain heading text.
+        text: String,
+    },
+    /// A source-grounded ordered or unordered list.
+    List {
+        /// Whether order carries meaning.
+        ordered: bool,
+        /// Plain text items.
+        items: Vec<String>,
+    },
+    /// A simple explanatory sequence, not a quantitative chart.
+    Diagram {
+        /// What this source-grounded illustration explains.
+        caption: String,
+        /// Ordered labeled steps. No invented measurements or arbitrary markup.
+        steps: Vec<String>,
+    },
     /// A paragraph.
     Text {
         /// Plain text.
@@ -354,6 +379,7 @@ impl RecapDocument {
         }
         nonempty(&self.title)?;
         nonempty(&self.source.title)?;
+        validate_context(&self.source.context)?;
         if let Some(focus) = &self.intent.focus {
             nonempty(focus)?;
         }
@@ -386,6 +412,7 @@ impl RecapDocument {
             }
         }
         for asset in &self.assets {
+            validate_illustration(asset, self.schema_version)?;
             asset.range.validate(self.source.duration_ms)?;
             if !paths.insert(&asset.path) {
                 return invalid("duplicate asset path");
@@ -401,8 +428,22 @@ impl RecapDocument {
             nonempty(&section.title)?;
             for block in &section.blocks {
                 references(&block.evidence_ids, &evidence_ids)?;
+                if self.schema_version == 1
+                    && matches!(
+                        &block.content,
+                        BlockContent::Heading { .. }
+                            | BlockContent::List { .. }
+                            | BlockContent::Diagram { .. }
+                    )
+                {
+                    return invalid("rich content requires document version two");
+                }
                 match &block.content {
-                    BlockContent::Text { text } => nonempty(text)?,
+                    BlockContent::Text { text } | BlockContent::Heading { text } => nonempty(text)?,
+                    BlockContent::List { items, .. }
+                    | BlockContent::Diagram { steps: items, .. } => {
+                        validate_items(items, &block.content)?;
+                    }
                     BlockContent::Image { asset_id, caption } => {
                         self.validate_media(asset_id, "image/")?;
                         nonempty(caption)?;
@@ -439,8 +480,62 @@ impl RecapDocument {
     }
 }
 
+fn validate_context(context: &crate::source_context::SourceContext) -> Result<()> {
+    if context.description.len() > 32 * 1024
+        || context
+            .creator
+            .as_ref()
+            .is_some_and(|text| text.len() > 4096)
+        || context.chapters.len() > 512
+        || context.chapters.iter().any(|text| text.len() > 1024)
+        || context.participants.len() > 32
+        || context.participants.iter().any(|person| {
+            person.name.trim().is_empty()
+                || person.name.len() > 256
+                || person.role.len() > 256
+                || person.evidence.is_empty()
+                || person.evidence.len() > 1024
+        })
+    {
+        return invalid("invalid source context bounds");
+    }
+    Ok(())
+}
+
+fn validate_items(items: &[String], content: &BlockContent) -> Result<()> {
+    if items.is_empty() || items.len() > 64 {
+        return invalid("empty or oversized semantic list");
+    }
+    for item in items {
+        nonempty(item)?;
+    }
+    if let BlockContent::Diagram { caption, .. } = content {
+        nonempty(caption)?;
+    }
+    Ok(())
+}
+
+fn validate_illustration(asset: &Asset, version: u32) -> Result<()> {
+    let Some(origin) = &asset.illustration else {
+        return Ok(());
+    };
+    if version < 2
+        || origin.purpose.trim().is_empty()
+        || ![&origin.page_url, &origin.image_url, &origin.license_url]
+            .iter()
+            .all(|value| {
+                url::Url::parse(value).is_ok_and(|url| {
+                    url.scheme() == "https" && url.username().is_empty() && url.password().is_none()
+                })
+            })
+    {
+        return invalid("invalid supporting illustration provenance");
+    }
+    Ok(())
+}
+
 const fn check_version(version: u32) -> Result<()> {
-    if version != DOCUMENT_SCHEMA_VERSION {
+    if version != 1 && version != DOCUMENT_SCHEMA_VERSION {
         return Err(Error::UnsupportedVersion(version));
     }
     Ok(())
@@ -512,6 +607,7 @@ pub(crate) mod tests {
             revision: 1,
             title: "A visual recap".into(),
             source: Source {
+                context: crate::source_context::SourceContext::default(),
                 id: "video-1".into(),
                 title: "Original".into(),
                 url: None,
@@ -535,6 +631,7 @@ pub(crate) mod tests {
                 transcript_segment_ids: vec!["words".into()],
             }],
             assets: vec![Asset {
+                illustration: None,
                 id: "frame".into(),
                 path: AssetPath::new("frames/first.png").unwrap(),
                 mime_type: "image/png".into(),
@@ -569,8 +666,8 @@ pub(crate) mod tests {
     #[test]
     fn future_version_is_rejected_before_payload_interpretation() {
         assert!(matches!(
-            RecapDocument::from_json_slice(br#"{"schema_version":2,"future_payload":true}"#),
-            Err(Error::UnsupportedVersion(2))
+            RecapDocument::from_json_slice(br#"{"schema_version":3,"future_payload":true}"#),
+            Err(Error::UnsupportedVersion(3))
         ));
         let mut value = document();
         value.schema_version = 0;
@@ -645,5 +742,30 @@ pub(crate) mod tests {
         value = document();
         value.assets[0].mime_type = "image/svg+xml".into();
         assert!(value.validate().is_err());
+    }
+}
+
+#[cfg(test)]
+mod edition_compatibility_tests {
+    use super::*;
+    #[test]
+    fn version_one_remains_readable_but_new_semantics_require_version_two() {
+        let mut document = super::tests::document();
+        document.schema_version = 1;
+        let mut legacy = serde_json::to_value(&document).unwrap();
+        legacy["source"].as_object_mut().unwrap().remove("context");
+        for asset in legacy["assets"].as_array_mut().unwrap() {
+            asset.as_object_mut().unwrap().remove("illustration");
+        }
+        let decoded =
+            RecapDocument::from_json_slice(&serde_json::to_vec(&legacy).unwrap()).unwrap();
+        assert!(decoded.source.context.participants.is_empty());
+        document.sections[0].blocks[0].content = BlockContent::List {
+            ordered: false,
+            items: vec!["Substantive point".into()],
+        };
+        assert!(document.validate().is_err());
+        document.schema_version = DOCUMENT_SCHEMA_VERSION;
+        document.validate().unwrap();
     }
 }

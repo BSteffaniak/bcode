@@ -288,6 +288,10 @@ impl<'a> AnnotatedExecutor<'a> {
         assert!(!request.instructions.trim().is_empty());
         assert!(request.max_response_bytes > 0);
         match request.stage {
+            AnalysisStage::EditionPlan
+            | AnalysisStage::VisualPlan
+            | AnalysisStage::VisualReview
+            | AnalysisStage::Participants => panic!("fixture has no participant metadata"),
             AnalysisStage::ExtractionInventory | AnalysisStage::VisualInspection => {
                 self.extract(request)
             }

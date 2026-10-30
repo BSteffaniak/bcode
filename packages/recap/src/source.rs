@@ -42,6 +42,8 @@ pub struct AcquisitionOptions {
 /// Source media and optional real timestamped captions.
 #[derive(Debug)]
 pub struct AcquiredSource {
+    /// Source metadata, untrusted and separate from speaker attribution.
+    pub context: crate::source_context::SourceContext,
     /// Canonical local media path.
     pub video: PathBuf,
     /// Captions, possibly empty; absence is not a transcript.
@@ -450,6 +452,7 @@ pub async fn acquire(
     }
     if let SourceInput::Local(path) = input {
         return Ok(AcquiredSource {
+            context: crate::source_context::SourceContext::default(),
             video: local_video(path, options.max_video_bytes)?,
             captions: vec![],
             title: None,
@@ -525,6 +528,7 @@ pub async fn acquire(
     request.args.insert(0, "--no-progress".into());
     download_process(&request, cancel, AcquisitionStage::Download).await?;
     let mut acquired = collect_download(workspace, options, cancel)?;
+    acquired.context = crate::source_context::SourceContext::from_metadata(&metadata);
     acquired.title = metadata
         .get("title")
         .and_then(serde_json::Value::as_str)
@@ -563,6 +567,7 @@ fn collect_download(
         }
     }
     Ok(AcquiredSource {
+        context: crate::source_context::SourceContext::default(),
         video: video.ok_or(SourceError::Invalid(
             "downloader produced no video within budget",
         ))?,

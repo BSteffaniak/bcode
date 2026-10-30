@@ -221,7 +221,9 @@ impl App {
             .child(self.button("home", "Home", 0))
             .child(self.button("settings-nav", "Settings", 66))
             .child(self.button("theme", "◐", 1));
-        let body = if self.active.is_some() {
+        let body = if self.active.is_some() && self.live_detail.expanded {
+            self.activity_view()
+        } else if self.active.is_some() {
             self.working()
         } else if self.settings_state.open {
             self.settings_view()
@@ -399,6 +401,30 @@ impl App {
                 .padding(LogicalInsets::all(1)),
         )
     }
+    fn activity_view(&self) -> Element<'_> {
+        let p = self.palette;
+        Element::new(
+            Column::new()
+                .child(Self::label(
+                    "RECENT ACTIVITY · provisional output, not the accepted edition",
+                    p.title(),
+                ))
+                .child(self.button("live-detail", "← Back to progress · F3", 77))
+                .flex(Flex::new(
+                    1,
+                    TextViewComponent::new(
+                        "activity-history",
+                        &self.live_detail.lines,
+                        &self.live_detail.scroll,
+                    )
+                    .styles(TextViewStyles {
+                        text: p.text(),
+                        background: Style::new().bg(p.panel),
+                        ..TextViewStyles::default()
+                    }),
+                )),
+        )
+    }
     fn working(&self) -> Element<'_> {
         let p = self.palette;
         let active = self
@@ -419,20 +445,6 @@ impl App {
             ),
             stage => (stage, None),
         };
-        let steps = [
-            (Stage::ModelReadiness, "00  Model readiness"),
-            (Stage::Acquisition, "01  Source & captions"),
-            (Stage::Media, "02  Source visuals"),
-            (Stage::Composition, "03  Compose perspective"),
-            (
-                Stage::Analysis,
-                "Analysis · source inventory & chapter plan",
-            ),
-            (Stage::Writing, "Writing · source-grounded chapters"),
-            (Stage::Audit, "Audit · source coverage"),
-            (Stage::Repair, "Repair · identified coverage gaps"),
-            (Stage::Storage, "Validate & save"),
-        ];
         let mut body = Column::new()
             .gap(1)
             .child(Self::label(
@@ -463,9 +475,21 @@ impl App {
                 ),
                 p.quiet(),
             ));
+        for label in self.activity_labels() {
+            body = body.child(Self::label(label, p.quiet()));
+        }
+        body = body.child(self.button(
+            "live-detail",
+            if self.live_detail.expanded {
+                "Hide live output · F3"
+            } else {
+                "Show live output · F3"
+            },
+            77,
+        ));
         // Only the active stage is asserted: inactive stages may be skipped, repeated,
         // or revisited during repair. Keep cancellation visible on short terminals.
-        for (current, label) in steps {
+        for (current, label) in Self::working_steps() {
             if stage == Some(current) {
                 body = body.child(Self::label(
                     format!("◉  {label}"),
@@ -496,6 +520,61 @@ impl App {
                 .content_style(p.text().bg(p.panel))
                 .padding(LogicalInsets::all(2)),
         )
+    }
+    const fn working_steps() -> [(Stage, &'static str); 9] {
+        [
+            (Stage::ModelReadiness, "00  Model readiness"),
+            (Stage::Acquisition, "01  Source & captions"),
+            (Stage::Media, "02  Source visuals"),
+            (Stage::Composition, "03  Compose perspective"),
+            (
+                Stage::Analysis,
+                "Analysis · source inventory & chapter plan",
+            ),
+            (Stage::Writing, "Writing · source-grounded chapters"),
+            (Stage::Audit, "Audit · source coverage"),
+            (Stage::Repair, "Repair · identified coverage gaps"),
+            (Stage::Storage, "Validate & save"),
+        ]
+    }
+    fn activity_labels(&self) -> Vec<String> {
+        let mut labels = Vec::new();
+        for previous in self
+            .stage_history
+            .iter()
+            .rev()
+            .take(4)
+            .collect::<Vec<_>>()
+            .into_iter()
+            .rev()
+        {
+            labels.push(format!("· {previous}"));
+        }
+        for (millis, event) in self.activity.recent(4) {
+            let label = match event {
+                bcode_recap::activity::Activity::Started { id, label } => {
+                    format!("{millis}ms · #{id} {label}")
+                }
+                bcode_recap::activity::Activity::Finished { id, succeeded } => format!(
+                    "#{id} {}",
+                    if succeeded {
+                        "completed"
+                    } else {
+                        "interrupted or failed"
+                    }
+                ),
+                bcode_recap::activity::Activity::Reused => "✓ Reused completed work".into(),
+                bcode_recap::activity::Activity::Text { id, text } => {
+                    if self.live_detail.expanded {
+                        format!("#{id} · Provisional output (not yet validated)\n{text}")
+                    } else {
+                        format!("#{id} · Receiving provisional output")
+                    }
+                }
+            };
+            labels.push(label);
+        }
+        labels
     }
     fn reader_content(&self) -> Element<'_> {
         let p = self.palette;
@@ -666,6 +745,36 @@ impl App {
     }
 }
 
+fn is_illustration(document: &RecapDocument, id: &str) -> bool {
+    document
+        .assets
+        .iter()
+        .find(|asset| asset.id == id)
+        .is_some_and(|asset| asset.illustration.is_some())
+}
+fn semantic_lines(content: &BlockContent, p: &Palette, push: &mut impl FnMut(String, Style)) {
+    match content {
+        BlockContent::List { ordered, items } => {
+            for (index, item) in items.iter().enumerate() {
+                push(
+                    if *ordered {
+                        format!("{}. {item}", index + 1)
+                    } else {
+                        format!("• {item}")
+                    },
+                    p.text(),
+                );
+            }
+        }
+        BlockContent::Diagram { caption, steps } => {
+            push(caption.clone(), p.title());
+            for (index, item) in steps.iter().enumerate() {
+                push(format!("{} → {item}", index + 1), p.text());
+            }
+        }
+        _ => {}
+    }
+}
 pub(super) fn reader_lines(
     document: Option<&RecapDocument>,
     chapter: usize,
@@ -688,21 +797,41 @@ pub(super) fn reader_lines(
         push(String::new(), p.text());
         for block in &section.blocks {
             match &block.content {
+                BlockContent::Heading { text } => push(text.clone(), p.title()),
+                BlockContent::List { .. } | BlockContent::Diagram { .. } => {
+                    semantic_lines(&block.content, p, &mut push);
+                }
                 BlockContent::Text { text } => push(text.clone(), p.text()),
                 BlockContent::Image { asset_id, caption } => {
-                    push("▧  SOURCE STILL".into(), Style::new().fg(p.accent));
+                    let external = is_illustration(document, asset_id);
+                    push(
+                        if external {
+                            "▧ SUPPORTING ILLUSTRATION"
+                        } else {
+                            "▧ SOURCE STILL"
+                        }
+                        .into(),
+                        Style::new().fg(p.accent),
+                    );
                     push(caption.clone(), p.text());
                     if let Some(asset) = document.assets.iter().find(|asset| asset.id == *asset_id)
                     {
-                        push(
-                            format!(
-                                "{}–{} · {}",
-                                timestamp(asset.range.start_ms),
-                                timestamp(asset.range.end_ms),
-                                asset.path.as_str()
-                            ),
-                            p.quiet(),
-                        );
+                        if external {
+                            push(
+                                "Supporting illustration · attribution in HTML".into(),
+                                p.quiet(),
+                            );
+                        } else {
+                            push(
+                                format!(
+                                    "{}–{} · {}",
+                                    timestamp(asset.range.start_ms),
+                                    timestamp(asset.range.end_ms),
+                                    asset.path.as_str()
+                                ),
+                                p.quiet(),
+                            );
+                        }
                     }
                     push("Image available in exported HTML · terminal preview uses detected image capabilities".into(),p.quiet());
                 }
@@ -781,6 +910,7 @@ mod tests {
             revision: 1,
             title: "Long source".into(),
             source: Source {
+                context: bcode_recap::source_context::SourceContext::default(),
                 id: "source".into(),
                 title: "Source".into(),
                 url: None,

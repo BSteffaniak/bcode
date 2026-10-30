@@ -76,7 +76,9 @@ pub(super) fn admit(
             document
                 .assets
                 .iter()
-                .filter(|asset| asset.mime_type.starts_with("image/"))
+                .filter(|asset| {
+                    asset.illustration.is_none() && asset.mime_type.starts_with("image/")
+                })
                 .all(|asset| supplied.contains(asset.id.as_str())),
             "passage source image bytes missing",
         )?;

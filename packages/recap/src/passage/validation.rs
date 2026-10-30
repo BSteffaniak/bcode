@@ -49,7 +49,10 @@ pub(super) fn passage(document: &RecapDocument, unit: &SourceUnit, value: &Passa
         let media = |id: &str| unit.primary.assets.iter().any(|asset| asset.id == id);
         check(
             match &block.content {
-                BlockContent::Text { .. } => true,
+                BlockContent::Text { .. }
+                | BlockContent::Heading { .. }
+                | BlockContent::List { .. }
+                | BlockContent::Diagram { .. } => true,
                 BlockContent::Image { asset_id, .. } | BlockContent::Clip { asset_id, .. } => {
                     media(asset_id)
                 }

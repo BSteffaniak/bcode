@@ -381,12 +381,36 @@ fn validate_store_root(store_root: &Path) -> Result<(), String> {
     Ok(())
 }
 
+#[derive(Debug)]
+struct PluginActivity {
+    timeline: bcode_recap::activity::Timeline,
+    publisher: std::sync::Mutex<bcode_plugin_sdk::TransientProgressPublisher>,
+}
+impl bcode_recap::diagnostics::Observer for PluginActivity {
+    fn observe(&self, _event: bcode_recap::diagnostics::Event) {}
+    fn activity(&self, event: bcode_recap::activity::Activity) {
+        bcode_recap::activity::ActivitySink::emit(&self.timeline, event);
+        if let Ok(mut publisher) = self.publisher.try_lock() {
+            let _=publisher.upsert_if_ready(&serde_json::json!({"version":1,"provisional":true,"recent":self.timeline.recent(16)}));
+        }
+    }
+}
+
 fn operation_cancellation(
     context: &NativeServiceContext,
     invocation: &str,
     root: &Path,
 ) -> Cancellation {
-    let cancel = Cancellation::default();
+    let activity = PluginActivity {
+        timeline: bcode_recap::activity::Timeline::default(),
+        publisher: std::sync::Mutex::new(context.transient_progress(
+            invocation,
+            "recap-activity",
+            "bcode.recap.activity",
+            1,
+        )),
+    };
+    let cancel = Cancellation::default().observed(std::sync::Arc::new(activity));
     if context.request.interface_id == bcode_tool::TOOL_SERVICE_INTERFACE_ID {
         cancel.set_process_admission(std::sync::Arc::new(
             super::process_admission::HostProcessAdmission {

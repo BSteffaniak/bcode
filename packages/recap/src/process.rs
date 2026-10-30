@@ -22,6 +22,13 @@ pub struct Cancellation(
 
 /// Caller-injected authorization for each fully constructed literal process request.
 pub trait ProcessAdmission: Send + Sync + std::fmt::Debug {
+    /// Authorize a normalized HTTPS retrieval separately from executable permission.
+    /// Existing process-only hosts fail closed until they implement this capability.
+    /// # Errors
+    /// Returns admission denial without making a network request.
+    fn authorize_web(&self, _url: &str) -> Result<(), ProcessError> {
+        Err(ProcessError::AdmissionDenied)
+    }
     /// Called before spawn. A failure must not start the process.
     /// # Errors
     /// Returns a secret-safe denial when operation policy or ownership cannot be verified.
@@ -40,6 +47,12 @@ impl Cancellation {
             observer.observe(event);
         }
     }
+    /// Publish private provisional activity separately from diagnostic events.
+    pub fn activity(&self, activity: crate::activity::Activity) {
+        if let Some(observer) = &self.2 {
+            observer.activity(activity);
+        }
+    }
     /// Emit operation-local count-only telemetry without persisting source data.
     pub fn measure(&self, measurement: crate::diagnostics::Measurement) {
         if let Some(observer) = &self.2 {
@@ -52,6 +65,25 @@ impl Cancellation {
         self.2.clone()
     }
     /// Install a process admission capability before starting the pipeline.
+    /// Admit network work before making any request. Standalone callers own their
+    /// operation; embedded hosts with admission installed must explicitly allow it.
+    /// # Errors
+    /// Returns denial if host policy cannot establish authorization.
+    pub fn authorize_web(&self, url: &str) -> Result<(), ProcessError> {
+        if self.is_cancelled() {
+            return Err(ProcessError::Cancelled);
+        }
+        let admission = self
+            .1
+            .lock()
+            .map_err(|_| ProcessError::AdmissionDenied)?
+            .clone();
+        if let Some(admission) = admission {
+            admission.authorize_web(url)?;
+        }
+        Ok(())
+    }
+    /// Install per-operation admission before executing external effects.
     pub fn set_process_admission(&self, admission: Arc<dyn ProcessAdmission>) {
         *self
             .1

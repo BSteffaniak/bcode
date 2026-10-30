@@ -2,11 +2,13 @@
 #![warn(clippy::all, clippy::pedantic, clippy::nursery, clippy::cargo)]
 #![allow(clippy::multiple_crate_versions)]
 //! Independent video understanding, visual recap composition, and portable export.
+pub mod activity;
 pub mod analysis_contracts;
 pub mod composition;
 pub mod contracts;
 pub mod detailed;
 pub mod diagnostics;
+pub mod editorial;
 pub mod engine;
 pub mod export;
 pub mod generation;
@@ -17,4 +19,8 @@ pub mod passage_contracts;
 pub mod process;
 pub mod source;
 pub mod source_analysis;
+pub mod source_context;
 pub mod storage;
+
+pub mod illustrations;
+pub mod visual_context;

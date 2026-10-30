@@ -204,6 +204,7 @@ impl Case {
             revision: 1,
             title: self.title.clone(),
             source: Source {
+                context: bcode_recap::source_context::SourceContext::default(),
                 id: format!("source_{}", self.id),
                 title: self.title.clone(),
                 url: None,
@@ -245,6 +246,7 @@ impl Case {
                 .iter()
                 .filter_map(|observation| {
                     observation.visual.as_ref().map(|visual| Asset {
+                        illustration: None,
                         id: visual.asset_id.clone(),
                         path: AssetPath::new(format!("{}.png", visual.asset_id)).unwrap(),
                         mime_type: "image/png".into(),
@@ -402,7 +404,9 @@ fn normalized(text: &str) -> String {
 
 fn block_text(content: &BlockContent) -> String {
     match content {
-        BlockContent::Text { text } => text.clone(),
+        BlockContent::Text { text } | BlockContent::Heading { text } => text.clone(),
+        BlockContent::List { items, .. } => items.join("\n"),
+        BlockContent::Diagram { caption, steps } => format!("{caption}\n{}", steps.join("\n")),
         BlockContent::Image { caption, .. } | BlockContent::Clip { caption, .. } => caption.clone(),
         BlockContent::Comparison { items } => items
             .iter()
@@ -414,7 +418,10 @@ fn block_text(content: &BlockContent) -> String {
 
 fn uses_asset(content: &BlockContent, id: &str) -> bool {
     match content {
-        BlockContent::Text { .. } => false,
+        BlockContent::Text { .. }
+        | BlockContent::Heading { .. }
+        | BlockContent::List { .. }
+        | BlockContent::Diagram { .. } => false,
         BlockContent::Image { asset_id, .. } | BlockContent::Clip { asset_id, .. } => {
             asset_id == id
         }

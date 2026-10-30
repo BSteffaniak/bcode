@@ -116,6 +116,7 @@ fn long_reader() -> App {
         revision: 1,
         title: "Long reader".into(),
         source: Source {
+            context: bcode_recap::source_context::SourceContext::default(),
             id: "source".into(),
             title: "Source".into(),
             url: None,
@@ -490,6 +491,7 @@ fn reader_title_stays_visible_after_narrow_resize() {
         revision: 1,
         title: "Unicode field notes".into(),
         source: Source {
+            context: bcode_recap::source_context::SourceContext::default(),
             id: "video".into(),
             title: "Video".into(),
             url: None,
@@ -788,4 +790,50 @@ async fn keyboard_duration_approval_starts_only_the_explicitly_accepted_request(
     let active = app.active.take().unwrap();
     active.cancel.cancel();
     active.task.await.unwrap();
+}
+
+#[tokio::test]
+async fn live_output_is_opt_in_scrollable_and_diagnostics_remain_content_free() {
+    use bcode_recap::{
+        activity::{Activity, ActivitySink},
+        diagnostics::Observer,
+    };
+    let mut app = App::new(TuiOptions::default());
+    app.active = Some(Active {
+        id: 42,
+        cancel: Cancellation::default(),
+        started: Instant::now(),
+        stage: Some(Stage::Writing),
+        cancelling: false,
+        task: tokio::spawn(async {}),
+    });
+    app.activity.emit(Activity::Started {
+        id: 7,
+        label: "Chapter writing".into(),
+    });
+    app.activity.emit(Activity::Text {
+        id: 7,
+        text: "Private provisional source-bearing text".into(),
+    });
+    let visible = |app: &mut App| {
+        let (buffer, _) = paint(app, 100, 32);
+        buffer
+            .cells()
+            .iter()
+            .map(|cell| cell.symbol.as_str())
+            .collect::<String>()
+    };
+    assert!(!visible(&mut app).contains("Private provisional"));
+    app.action("live-detail");
+    assert!(visible(&mut app).contains("Private provisional"));
+    let report = bcode_recap::diagnostics::Operation::new("test".into());
+    report.activity(Activity::Text {
+        id: 7,
+        text: "Private provisional source-bearing text".into(),
+    });
+    assert!(
+        !serde_json::to_string(&report.report())
+            .unwrap()
+            .contains("Private provisional")
+    );
 }

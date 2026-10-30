@@ -350,6 +350,12 @@ pub(super) fn validate_repaired_chapter(
             )?;
         }
         let assets: Vec<&str> = match &block.content {
+            BlockContent::Heading { .. }
+            | BlockContent::List { .. }
+            | BlockContent::Diagram { .. } => {
+                text = true;
+                vec![]
+            }
             BlockContent::Text { text: content } => {
                 text |= !content.trim().is_empty();
                 vec![]

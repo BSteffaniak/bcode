@@ -127,6 +127,10 @@ pub struct PreparedToolInvocation {
 pub const PROCESS_ADMISSION_INTERFACE_ID: &str = "bcode.process-admission/v1";
 /// Authorize one fully constructed process operation before spawn.
 pub const OP_AUTHORIZE_PROCESS: &str = "authorize";
+/// Normalized per-request web admission; unknown hosts reject without network effects.
+pub const WEB_ADMISSION_INTERFACE_ID: &str = "bcode.web-admission/v1";
+/// Admit one normalized URL before opening a connection.
+pub const OP_AUTHORIZE_WEB: &str = "authorize";
 
 /// Opaque nested service request issued by an active invocation.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

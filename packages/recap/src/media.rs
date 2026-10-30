@@ -335,6 +335,7 @@ pub async fn extract_visuals(
             }
         }
         assets.push(Asset {
+            illustration: None,
             id: format!("visual-{index:04}"),
             path: AssetPath::new(name)?,
             mime_type: if is_clip { "video/mp4" } else { "image/jpeg" }.into(),

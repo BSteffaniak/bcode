@@ -181,11 +181,23 @@ fn render_document(mut renderer: Renderer<'_>) -> HtmlExport {
     escape(&mut html, &document.title);
     html.push_str(" — Recap</title><style>");
     html.push_str(CSS);
+
     html.push_str("</style></head><body><a class=\"skip\" href=\"#main\">Skip to recap</a><div class=\"shell\"><header class=\"masthead\"><span class=\"brand\">Recap / Visual field notes</span><span>One video. The essential ideas.</span></header><div class=\"hero\"><div class=\"eyebrow\">A visual video recap</div><h1>");
     escape(&mut html, &document.title);
     html.push_str("</h1><p class=\"lede\">");
     escape(&mut html, &document.source.title);
-    html.push_str("</p><div class=\"source-meta\"><span>");
+    html.push_str("</p>");
+    for person in &document.source.context.participants {
+        html.push_str("<p class=\"participant\"><strong>");
+        escape(&mut html, &person.name);
+        html.push_str("</strong>");
+        if !person.role.is_empty() {
+            html.push_str(" · ");
+            escape(&mut html, &person.role);
+        }
+        html.push_str("</p>");
+    }
+    html.push_str("<div class=\"source-meta\"><span>");
     escape(
         &mut html,
         &format!(
@@ -272,6 +284,37 @@ struct Renderer<'a> {
 impl Renderer<'_> {
     fn block(&mut self, html: &mut String, block: &Block) {
         match &block.content {
+            BlockContent::Heading { text } => {
+                html.push_str("<h3>");
+                escape(html, text);
+                html.push_str("</h3>");
+            }
+            BlockContent::List { ordered, items } => {
+                html.push_str(if *ordered {
+                    "<ol class=\"reading-list\">"
+                } else {
+                    "<ul class=\"reading-list\">"
+                });
+                for item in items {
+                    html.push_str("<li>");
+                    escape(html, item);
+                    html.push_str("</li>");
+                }
+                html.push_str(if *ordered { "</ol>" } else { "</ul>" });
+            }
+            BlockContent::Diagram { caption, steps } => {
+                html.push_str("<figure class=\"explanation-diagram\"><figcaption>");
+                escape(html, caption);
+                html.push_str("</figcaption><ol>");
+                for item in steps {
+                    html.push_str("<li><span>");
+                    escape(html, item);
+                    html.push_str("</span></li>");
+                }
+                html.push_str(
+                    "</ol><small>Illustration of the source explanation</small></figure>",
+                );
+            }
             BlockContent::Text { text } => {
                 html.push_str("<div class=\"prose\"><p>");
                 escape(html, text);
@@ -357,7 +400,25 @@ impl Renderer<'_> {
         if clip {
             html.push_str("<span>Silent excerpt · </span>");
         }
-        self.source_time(html, asset.range);
+        if let Some(origin) = &asset.illustration {
+            html.push_str("<p class=\"illustration-credit\">Supporting illustration · ");
+            escape(html, &origin.purpose);
+            for (label, value) in [
+                ("Original publisher", origin.page_url.as_str()),
+                (origin.license.as_str(), origin.license_url.as_str()),
+            ] {
+                html.push_str(" · <a rel=\"noreferrer noopener\" href=\"");
+                escape(html, value);
+                html.push_str("\">");
+                escape(html, label);
+                html.push_str("</a>");
+            }
+            html.push_str(" · ");
+            escape(html, &origin.attribution);
+            html.push_str("</p>");
+        } else {
+            self.source_time(html, asset.range);
+        }
         html.push_str("</figcaption>");
         if clip {
             let segments: Vec<_> = self
@@ -740,6 +801,7 @@ mod tests {
             revision: 1,
             title: "The essential idea".into(),
             source: Source {
+                context: crate::source_context::SourceContext::default(),
                 id: "source".into(),
                 title: "Original video".into(),
                 url: Some("https://example.org/watch?v=123&lang=en".into()),
@@ -749,6 +811,7 @@ mod tests {
             transcript: vec![],
             evidence: vec![],
             assets: vec![Asset {
+                illustration: None,
                 id: "frame".into(),
                 path: AssetPath::new("frame.png").unwrap(),
                 mime_type: "image/png".into(),
@@ -1269,5 +1332,69 @@ mod tests {
             export_html(&document, root.path(), ExportBudget::default()),
             Err(ExportError::InvalidDocument(_))
         ));
+    }
+}
+
+#[cfg(test)]
+mod rich_edition_tests {
+    use super::*;
+    #[test]
+    fn semantic_content_is_offline_escaped_and_external_images_are_not_video_evidence() {
+        let root = tempfile::tempdir().unwrap();
+        let mut document = crate::contracts::tests::document();
+        document.source.context.participants = vec![crate::source_context::Participant {
+            name: "Ada".into(),
+            role: "Host".into(),
+            evidence: "Host Ada".into(),
+        }];
+        document.assets[0].illustration = Some(crate::visual_context::IllustrationOrigin {
+            page_url: "https://commons.wikimedia.org/wiki/File:Example".into(),
+            image_url: "https://upload.wikimedia.org/example.jpg".into(),
+            license: "CC BY 4.0".into(),
+            license_url: "https://creativecommons.org/licenses/by/4.0/".into(),
+            attribution: "Artist <script>bad</script>".into(),
+            purpose: "Illustrate the example".into(),
+        });
+        for (id, content) in [
+            (
+                "heading",
+                BlockContent::Heading {
+                    text: "A clearer structure".into(),
+                },
+            ),
+            (
+                "list",
+                BlockContent::List {
+                    ordered: false,
+                    items: vec!["A < B".into(), "Second useful point".into()],
+                },
+            ),
+            (
+                "diagram",
+                BlockContent::Diagram {
+                    caption: "How it works".into(),
+                    steps: vec!["Input".into(), "Learning".into(), "Output".into()],
+                },
+            ),
+        ] {
+            document.sections[0].blocks.push(Block {
+                id: id.into(),
+                evidence_ids: vec![document.evidence[0].id.clone()],
+                content,
+            });
+        }
+        let export = export_html(&document, root.path(), ExportBudget::default()).unwrap();
+        for expected in [
+            "<h3>A clearer structure</h3>",
+            "A &lt; B",
+            "How it works",
+            "Supporting illustration",
+            "CC BY 4.0",
+            "Artist &lt;script&gt;bad&lt;/script&gt;",
+            "Ada",
+        ] {
+            assert!(export.html.contains(expected), "missing {expected}");
+        }
+        assert!(!export.html.contains("<script>bad</script>"));
     }
 }

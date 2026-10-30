@@ -120,8 +120,20 @@ pub fn response_schema() -> serde_json::Value {
         json!({"type":{"type":"string","enum":["comparison"]},"items":{"type":"array","items":item}}),
         &["type", "items"],
     );
+    let heading = schema_object(
+        json!({"type":{"const":"heading","type":"string"},"text":string}),
+        &["type", "text"],
+    );
+    let list = schema_object(
+        json!({"type":{"const":"list","type":"string"},"ordered":{"type":"boolean"},"items":{"type":"array","items":string}}),
+        &["type", "ordered", "items"],
+    );
+    let diagram = schema_object(
+        json!({"type":{"const":"diagram","type":"string"},"caption":string,"steps":{"type":"array","items":string}}),
+        &["type", "caption", "steps"],
+    );
     let block = schema_object(
-        json!({"id":string,"evidence_ids":{"type":"array","items":string},"content":{"anyOf":[text,image,clip,comparison]}}),
+        json!({"id":string,"evidence_ids":{"type":"array","items":string},"content":{"anyOf":[text,image,clip,comparison,heading,list,diagram]}}),
         &["id", "evidence_ids", "content"],
     );
     let section = schema_object(

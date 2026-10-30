@@ -17,6 +17,33 @@ pub struct HostProcessAdmission {
     pub sequence: AtomicU64,
 }
 impl ProcessAdmission for HostProcessAdmission {
+    fn authorize_web(&self, url: &str) -> Result<(), ProcessError> {
+        let response = self
+            .bridge
+            .request(&ServiceBridgeRequest::InvokeService(
+                ToolInvocationServiceRequest {
+                    invocation_id: self.invocation.clone(),
+                    request_id: format!("web-{}", self.sequence.fetch_add(1, Ordering::Relaxed)),
+                    route_id: None,
+                    interface_id: bcode_tool::WEB_ADMISSION_INTERFACE_ID.into(),
+                    operation: bcode_tool::OP_AUTHORIZE_WEB.into(),
+                    payload: serde_json::to_value(ToolPolicyOperation::Web {
+                        url: Some(url.into()),
+                    })
+                    .map_err(|_| ProcessError::AdmissionDenied)?,
+                },
+            ))
+            .map_err(|_| ProcessError::AdmissionDenied)?;
+        if matches!(
+            response,
+            ServiceBridgeResponse::Service(ToolInvocationServiceResolution::Responded { .. })
+        ) {
+            Ok(())
+        } else {
+            Err(ProcessError::AdmissionDenied)
+        }
+    }
+
     fn authorize(&self, request: &ProcessRequest) -> Result<(), ProcessError> {
         let text = |path: &Path| {
             path.to_str()

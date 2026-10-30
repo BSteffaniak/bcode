@@ -331,6 +331,9 @@ impl std::fmt::Debug for ProgressObserver {
     }
 }
 impl bcode_recap::diagnostics::Observer for ProgressObserver {
+    fn activity(&self, activity: bcode_recap::activity::Activity) {
+        self.parent.activity(activity);
+    }
     fn measure(&self, measurement: bcode_recap::diagnostics::Measurement) {
         self.parent.measure(measurement);
         bcode_recap::diagnostics::Observer::measure(&self.operation, measurement);
@@ -1416,7 +1419,11 @@ impl<F: FnMut(Stage) + Send> ModelExecutor for ProgressExecutor<'_, F> {
             model::AnalysisStage,
         };
         let phase = match request.stage {
-            AnalysisStage::ExtractionInventory
+            AnalysisStage::EditionPlan
+            | AnalysisStage::VisualPlan
+            | AnalysisStage::VisualReview
+            | AnalysisStage::Participants
+            | AnalysisStage::ExtractionInventory
             | AnalysisStage::Outline
             | AnalysisStage::VisualInspection => Phase::Analysis,
             AnalysisStage::ChapterComposition | AnalysisStage::PassageComposition => Phase::Writing,
@@ -1693,6 +1700,7 @@ mod tests {
             revision: 1,
             title: "Saved recap".into(),
             source: Source {
+                context: bcode_recap::source_context::SourceContext::default(),
                 id: "video".into(),
                 title: "Video".into(),
                 url: None,
