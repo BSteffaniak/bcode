@@ -376,7 +376,9 @@ async fn production_pipeline_rejects_stale_patch_without_changing_source() {
         .unwrap_err();
     assert!(matches!(
         error,
-        CompositionError::Invalid("stale passage patch revision")
+        CompositionError::Invalid(
+            "passage patch correction attempts exhausted; unresolved findings remain"
+        )
     ));
     assert_eq!(source, before);
     let requests = model.requests.lock().unwrap();
@@ -385,7 +387,7 @@ async fn production_pipeline_rejects_stale_patch_without_changing_source() {
             .iter()
             .filter(|r| r.stage == AnalysisStage::PassagePatch)
             .count(),
-        1
+        policy(180_000).allowances.max_repair_rounds + 1
     );
     assert_eq!(
         requests

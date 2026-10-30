@@ -74,7 +74,8 @@ pub struct AnalysisAllowances {
     pub max_image_bytes: usize,
     /// Optional maximum source windows (zero disables the ceiling) accepted by this operation.
     pub max_source_windows: usize,
-    /// Maximum explicit audit/repair iterations.
+    /// Maximum explicit audit/repair iterations, and additional correction attempts
+    /// per semantically invalid completed passage patch. Does not retry provider errors.
     pub max_repair_rounds: usize,
 }
 

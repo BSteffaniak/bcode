@@ -72,7 +72,16 @@ labeled preceding context. Initial writers receive original source directly and 
 through the shared reservation/cancellation executor. Host-assigned passage/block
 identities and revisions support local two-way reviews and atomic targeted patches.
 The host rejects stale revisions, foreign/gapped provenance, illegal/conflicting
-operations, unchanged or repeated candidates, and unresolved review findings. Patch
+operations, unchanged or repeated candidates, and unresolved review findings. Completed
+patches rejected by semantic validation receive host-owned rejection feedback and a
+distinct correction request against the unchanged base and findings. Additional
+correction attempts per patch are bounded by `max_repair_rounds` and use the normal
+call, byte, and cancellation admission. Exhaustion fails closed; corrections still
+require ordinary re-review and final source/boundary review. Provider errors and
+uncertain calls are not retried by this mechanism. The original patch request stays
+unchanged for checkpoint compatibility: saved invalid responses remain preserved,
+and deterministic correction requests reuse their own completed checkpoints on
+resume without replaying prior calls. Patch
 application retains untouched blocks exactly. Provenance validates references, not
 whether a model's allegation is true.
 

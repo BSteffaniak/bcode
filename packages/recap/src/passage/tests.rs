@@ -15,6 +15,8 @@ use crate::{
 
 use super::{compose_passages, validation};
 
+mod correction;
+
 fn block(id: &str, text: &str) -> Block {
     Block {
         id: id.into(),
