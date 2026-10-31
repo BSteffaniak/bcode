@@ -118,7 +118,7 @@ impl Selection {
         }
     }
 
-    fn options(&self) -> bcode::ConfiguredModelOptions {
+    pub(crate) fn options(&self) -> bcode::ConfiguredModelOptions {
         let mut settings = std::collections::BTreeMap::new();
         if let Some(endpoint) = &self.endpoint {
             settings.insert("openai.base_url".into(), endpoint.clone());

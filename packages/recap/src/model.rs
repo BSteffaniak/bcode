@@ -219,6 +219,11 @@ pub trait ModelExecutor: Send + Sync {
         None
     }
 
+    /// Secret-free standalone settings for exact resume; embedded adapters may omit them.
+    fn resume_configuration(&self) -> Option<crate::model_configuration::ResumeModelConfiguration> {
+        None
+    }
+
     /// Execute one normalized text-plus-images request.
     fn execute<'a>(
         &'a self,

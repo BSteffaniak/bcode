@@ -14,6 +14,7 @@ pub mod export;
 pub mod generation;
 pub mod media;
 pub mod model;
+pub mod model_configuration;
 pub mod passage;
 pub mod passage_contracts;
 pub mod process;

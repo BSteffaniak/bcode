@@ -451,7 +451,7 @@ impl App {
                     return self.admit(Request::Resume(Box::new(crate::cli::Resume {
                         id,
                         retry_uncertain: action == "retry-uncertain",
-                        model: value.model,
+                        model: crate::cli::ResumeModelOptions::default(),
                         output,
                     })));
                 }

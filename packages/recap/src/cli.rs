@@ -1,4 +1,5 @@
 //! Command-line policy for the standalone visual recap application.
+mod resume;
 use crate::application::Stage;
 use crate::application::{self, Error as CliError};
 use crate::application::{check_tool, configured_model, preflight_model};
@@ -6,6 +7,7 @@ use crate::application::{check_tool, configured_model, preflight_model};
 use crate::application::{create_options, model_options, read_transcript, write_output};
 use bcode_recap::{process::Cancellation, storage::DocumentStore};
 use clap::{Args, CommandFactory as _, Parser, Subcommand};
+pub use resume::ResumeModelOptions;
 #[cfg(feature = "tui")]
 use std::io::IsTerminal as _;
 #[cfg(test)]
@@ -65,7 +67,7 @@ pub struct Resume {
     #[arg(long)]
     pub retry_uncertain: bool,
     #[command(flatten)]
-    pub model: ModelOptions,
+    pub model: ResumeModelOptions,
     #[command(flatten)]
     pub output: OutputOptions,
 }
@@ -108,6 +110,17 @@ pub struct ModelOptions {
     /// Maximum combined bytes of actual model-visible source images.
     #[arg(long, default_value = "33554432", value_parser = positive_u64)]
     pub max_model_image_bytes: u64,
+}
+
+impl ModelOptions {
+    pub(crate) fn defaults_for_resume() -> Self {
+        let parsed = Cli::try_parse_from(["recap", "create", "--source", "video.mp4"])
+            .expect("built-in model defaults");
+        match parsed.command {
+            Some(Command::Create(value)) => value.model,
+            _ => unreachable!(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Args)]

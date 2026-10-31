@@ -440,6 +440,7 @@ impl Engine<'_> {
                 "published document differs from generation candidate",
             ));
         }
+        journal.save_model_configuration(self.executor.resume_configuration())?;
         journal.write("configuration.json", &self.options)?;
         let executor = crate::generation::Executor {
             inner: self.executor,
@@ -561,6 +562,7 @@ impl Engine<'_> {
             retry_uncertain,
             crate::generation::Kind::Refine,
         )?;
+        journal.save_model_configuration(self.executor.resume_configuration())?;
         journal.write("configuration.json", &self.options)?;
         let previous = if let Some(previous) = journal.read::<RecapDocument>("previous.json")? {
             previous

@@ -60,6 +60,30 @@ Explicit diagnostic export uses report version 2 with a versioned count-only mea
 
 Exhausted allowances and unsupported analysis execution fail explicitly rather than silently falling back to Standard. Intermediate analysis is operation-local; no implicit durable prompt/checkpoint cache is introduced. The existing versioned document shape and unknown-version rejection remain authoritative. Prior revisions remain unchanged until a validated successor commits.
 
+## Resume model settings
+
+Standalone create/refine operations retain a versioned, checksum-protected `model.json`
+under the generation lease before inference. It stores effective Recap selection
+references, token limit and deadline—not configuration file contents, credentials,
+or provider metadata. Config paths are made absolute. CLI and TUI resume restore
+these references without merging today's Recap preferences. The SDK supplies a
+fingerprint of effective configuration and normalized selection so changed or
+missing configuration fails closed rather than silently choosing another setup.
+Authentication remains provider-owned and must still be available.
+
+Resume model flags are explicit-only overrides: omitted fields inherit saved values,
+including when an explicit value equals a normal create default. Overrides affect
+unfinished work; completed exact calls remain reusable and uncertain calls still
+require separate approval. The original generation identity remains the checkpoint
+binding, while the next lease owner saves the updated unfinished-work settings.
+An explicit `--model-config` also acknowledges a replacement configuration. No
+config files or global preferences are rewritten.
+
+Older generations may contain only an executor hash. Resume adopts settings only
+when current or explicitly supplied original options reproduce that hash exactly;
+otherwise it reports that the original settings are needed once. Missing history
+is not reconstructed by guessing, and existing checkpoints are preserved.
+
 ## Source-aligned Detailed passages
 
 Detailed normally uses source-aligned passages across the standalone CLI, TUI and

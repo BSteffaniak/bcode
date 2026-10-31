@@ -309,6 +309,43 @@ impl Journal {
         }
         Ok(status)
     }
+    /// Read saved model references without resolving providers or acquiring execution ownership.
+    /// # Errors
+    /// Rejects unsupported, damaged, unsafe or differently bound settings.
+    pub fn model_configuration(
+        store: &Path,
+        id: &str,
+    ) -> Result<Option<crate::model_configuration::ResumeModelConfiguration>> {
+        let status = Self::inspect(store, id)?;
+        let directory = directory(&store.join("generations").join(id))?;
+        let saved: Option<crate::model_configuration::ResumeModelConfiguration> =
+            record(&directory, "model.json")?;
+        if let Some(saved) = &saved {
+            Self::validate_model_configuration(&status, saved)?;
+        }
+        Ok(saved)
+    }
+    fn validate_model_configuration(
+        status: &Status,
+        saved: &crate::model_configuration::ResumeModelConfiguration,
+    ) -> Result<()> {
+        if saved.version != 1 || status.executor.as_ref() != Some(&saved.identity) {
+            return Err(Error::Invalid(
+                "unsupported or conflicting saved model configuration",
+            ));
+        }
+        Ok(())
+    }
+    pub(crate) fn save_model_configuration(
+        &self,
+        saved: Option<crate::model_configuration::ResumeModelConfiguration>,
+    ) -> Result<()> {
+        if let Some(saved) = saved {
+            Self::validate_model_configuration(&self.status, &saved)?;
+            self.write("model.json", &saved)?;
+        }
+        Ok(())
+    }
     pub(crate) fn read<T: DeserializeOwned>(&self, name: &str) -> Result<Option<T>> {
         record(&self.root, name)
     }
@@ -361,6 +398,9 @@ pub(crate) struct Executor<'a> {
 impl ModelExecutor for Executor<'_> {
     fn recovery_identity(&self) -> Option<String> {
         self.inner.recovery_identity()
+    }
+    fn resume_configuration(&self) -> Option<crate::model_configuration::ResumeModelConfiguration> {
+        self.inner.resume_configuration()
     }
     fn execute<'a>(&'a self, request: ModelRequest, cancel: &'a Cancellation) -> ModelFuture<'a> {
         Box::pin(async move {
@@ -429,6 +469,51 @@ mod tests {
             intent: crate::contracts::GenerationIntent::default(),
         }
     }
+    #[test]
+    fn resume_model_configuration_is_optional_versioned_and_bound_to_original_identity() {
+        use crate::model_configuration::{ModelConfiguration, ResumeModelConfiguration};
+        let root = tempfile::tempdir().unwrap();
+        let journal = open(root.path(), false);
+        assert!(
+            Journal::model_configuration(root.path(), "recovery-test")
+                .unwrap()
+                .is_none()
+        );
+        let saved = ResumeModelConfiguration {
+            version: 1,
+            identity: "offline-model-v1".into(),
+            selection_fingerprint: "selection".into(),
+            config_fingerprint: Some("fingerprint".into()),
+            options: ModelConfiguration {
+                config_path: "/private/config.toml".into(),
+                profile: Some("original".into()),
+                context: None,
+                model: Some("model".into()),
+                provider: Some("provider".into()),
+                endpoint: None,
+                auth_profile: Some("account-reference".into()),
+                max_output_tokens: 10000,
+                timeout: std::time::Duration::from_secs(300),
+            },
+        };
+        journal
+            .save_model_configuration(Some(saved.clone()))
+            .unwrap();
+        drop(journal);
+        assert_eq!(
+            Journal::model_configuration(root.path(), "recovery-test").unwrap(),
+            Some(saved.clone())
+        );
+        let journal = open(root.path(), false);
+        let mut invalid = saved.clone();
+        invalid.identity = "other".into();
+        assert!(journal.save_model_configuration(Some(invalid)).is_err());
+        let mut future = saved;
+        future.version = 2;
+        journal.write("model.json", &future).unwrap();
+        assert!(Journal::model_configuration(root.path(), "recovery-test").is_err());
+    }
+
     fn open(root: &Path, approve: bool) -> Journal {
         Journal::open(
             root,

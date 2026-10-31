@@ -288,6 +288,25 @@ impl ConfiguredModelOptions {
         Ok(config)
     }
 
+    /// Fingerprint effective configuration and normalized selection without exposing
+    /// configuration contents, credentials, or provider-private data. This is a
+    /// compatibility guard, not a durable configuration snapshot or authorization.
+    /// # Errors
+    /// Returns a configuration error if loading, selection or serialization fails.
+    pub fn configuration_fingerprint(&self) -> Result<String> {
+        let config = self.load()?;
+        let resolved = self.selection(&config);
+        let mut hasher = Sha256::new();
+        hasher.update(serde_json::to_vec(&config).map_err(|_| {
+            BcodeError::ProviderConfiguration("configuration fingerprint unavailable".into())
+        })?);
+        hasher.update(format!("{resolved:?}"));
+        hasher.update(serde_json::to_vec(&self.settings).map_err(|_| {
+            BcodeError::ProviderConfiguration("configuration fingerprint unavailable".into())
+        })?);
+        Ok(hex::encode(hasher.finalize()))
+    }
+
     fn validate_auth_selection(
         &self,
         config: &bcode_config::BcodeConfig,
@@ -11274,6 +11293,32 @@ fn generation_steps(runtime: &AgentTurnResponse) -> Vec<GenerationStep> {
 #[cfg(all(test, feature = "config"))]
 mod configured_model_options_tests {
     use super::*;
+
+    #[test]
+    fn configuration_fingerprint_detects_effective_changes_without_exposing_contents() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("config.toml");
+        let original = "[model]\nprovider_plugin_id = 'bcode.openai-compatible'\nmodel_id = 'test-model'\n[auth.profiles.account]\nbackend = 'env'\nprovider_id = 'openai'\nowner_plugin_id = 'bcode.openai-compatible'\nscheme = 'api_key'\n";
+        std::fs::write(&path, original).unwrap();
+        let mut options = ConfiguredModelOptions {
+            config_path: Some(path.clone()),
+            ..Default::default()
+        };
+        let fingerprint = options.configuration_fingerprint().unwrap();
+        assert_eq!(fingerprint.len(), 64);
+        assert_eq!(fingerprint, options.configuration_fingerprint().unwrap());
+        options.model = Some("another-model".into());
+        assert_ne!(fingerprint, options.configuration_fingerprint().unwrap());
+        options.model = None;
+        options.auth_profile = Some("account".into());
+        options
+            .settings
+            .insert("openai.base_url".into(), "https://example.com".into());
+        assert_ne!(fingerprint, options.configuration_fingerprint().unwrap());
+        options.settings.clear();
+        std::fs::write(&path, original.replace("test-model", "changed-model")).unwrap();
+        assert_ne!(fingerprint, options.configuration_fingerprint().unwrap());
+    }
 
     #[test]
     fn explicit_file_uses_central_profiles_aliases_and_normalized_metadata() {

@@ -20,23 +20,51 @@ use std::{
 static NEXT_CALL: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
 
 /// Resolve through Bcode's configured selection and provider authentication.
-#[derive(Clone, Debug)]
-pub struct BcodeOptions {
-    /// Empty means Bcode's normal layered configuration.
-    pub config_path: std::path::PathBuf,
-    pub profile: Option<String>,
-    pub context: Option<String>,
-    pub model: Option<String>,
-    pub provider: Option<String>,
-    /// Request-only provider-owned base URL override.
-    pub endpoint: Option<String>,
-    /// Configured authentication profile reference.
-    pub auth_profile: Option<String>,
-    /// Normalized provider output-token ceiling.
-    pub max_output_tokens: u32,
-    /// Deadline for one model composition operation.
-    pub timeout: Duration,
+pub use bcode_recap::model_configuration::ModelConfiguration as BcodeOptions;
+
+fn configuration_fingerprint(options: &BcodeOptions) -> Result<Option<String>, ModelFailure> {
+    crate::connections::Selection {
+        config_path: (!options.config_path.as_os_str().is_empty())
+            .then(|| options.config_path.clone()),
+        profile: options.profile.clone(),
+        context: options.context.clone(),
+        model: options.model.clone(),
+        provider: options.provider.clone(),
+        endpoint: options.endpoint.clone(),
+        auth_profile: options.auth_profile.clone(),
+    }
+    .options()
+    .configuration_fingerprint()
+    .map(Some)
+    .map_err(|_| ModelFailure::Configuration)
 }
+
+fn retained_options(
+    selected: &crate::connections::Selection,
+    max_output_tokens: u32,
+    timeout: Duration,
+) -> Result<BcodeOptions, ModelFailure> {
+    let mut resume_options = BcodeOptions {
+        config_path: selected.config_path.clone().unwrap_or_default(),
+        profile: selected.profile.clone(),
+        context: selected.context.clone(),
+        model: selected.model.clone(),
+        provider: selected.provider.clone(),
+        endpoint: selected.endpoint.clone(),
+        auth_profile: selected.auth_profile.clone(),
+        max_output_tokens,
+        timeout,
+    };
+    if !resume_options.config_path.as_os_str().is_empty() {
+        resume_options.config_path = std::fs::canonicalize(&resume_options.config_path)
+            .map_err(|_| ModelFailure::Configuration)?;
+    }
+    Ok(resume_options)
+}
+
+#[cfg(test)]
+#[path = "bcode_adapter/resume_tests.rs"]
+mod resume_tests;
 
 /// Standalone inference using centrally configured selection and provider authentication.
 pub struct BcodeExecutor {
@@ -47,6 +75,7 @@ pub struct BcodeExecutor {
     selection: (String, String, Option<String>),
     observer: Option<Arc<dyn Observer>>,
     recovery: Option<String>,
+    resume: Option<bcode_recap::model_configuration::ResumeModelConfiguration>,
 }
 /// Allowlisted SDK failure category; never contains provider text or response content.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -186,6 +215,91 @@ impl BcodeExecutor {
     /// # Errors
     /// Returns a secret-safe unavailable error when configuration/discovery fails.
     pub async fn configured(options: BcodeOptions) -> Result<Self, ModelFailure> {
+        Self::configured_inner(options, true).await
+    }
+
+    /// Resolve saved settings without consulting current Recap preferences.
+    /// # Errors
+    /// Rejects unsupported settings, changed referenced files, and unavailable selections.
+    pub async fn configured_resume(
+        saved: bcode_recap::model_configuration::ResumeModelConfiguration,
+        options: BcodeOptions,
+        explicit_override: bool,
+    ) -> Result<Self, ModelFailure> {
+        if saved.version != 1 {
+            return Err(ModelFailure::Configuration);
+        }
+        if !explicit_override
+            && configuration_fingerprint(&saved.options)? != saved.config_fingerprint
+        {
+            return Err(ModelFailure::Configuration);
+        }
+        let expected_selection = options.model == saved.options.model
+            && options.provider == saved.options.provider
+            && options.profile == saved.options.profile
+            && options.context == saved.options.context
+            && options.config_path == saved.options.config_path;
+        let mut executor = Self::configured_inner(options, false).await?;
+        if !explicit_override
+            && expected_selection
+            && bcode_recap::generation::identity(&format!("{:?}", executor.selection))
+                != saved.selection_fingerprint
+        {
+            return Err(ModelFailure::Configuration);
+        }
+        executor.recovery = Some(saved.identity.clone());
+        if let Some(configuration) = &mut executor.resume {
+            configuration.identity = saved.identity;
+        }
+        Ok(executor)
+    }
+
+    /// Recover legacy settings only when current preferences or explicit options
+    /// reproduce the recorded identity exactly. Never guesses a historical model.
+    /// # Errors
+    /// Fails before inference when the old settings cannot be verified.
+    pub async fn configured_legacy(
+        options: BcodeOptions,
+        expected: &str,
+    ) -> Result<Self, ModelFailure> {
+        let mut executor = Self::configured(options.clone()).await?;
+        if executor.recovery.as_deref() != Some(expected) {
+            let effective = executor
+                .resume
+                .as_ref()
+                .ok_or(ModelFailure::Configuration)?
+                .options
+                .clone();
+            let bytes_identity = if effective.config_path.as_os_str().is_empty() {
+                "discovered".to_owned()
+            } else {
+                let bytes = std::fs::read(&effective.config_path)
+                    .map_err(|_| ModelFailure::Configuration)?;
+                bcode_recap::generation::identity(&String::from_utf8_lossy(&bytes))
+            };
+            let original =
+                format!("{effective:?}").replacen("ModelConfiguration {", "BcodeOptions {", 1);
+            let key = bcode_recap::generation::identity(&format!(
+                "recap-bcode-v1:{original}:{bytes_identity}"
+            ));
+            let key = bcode_recap::generation::identity(&format!("{key}:{:?}", executor.selection));
+            if key != expected {
+                return Err(ModelFailure::Configuration);
+            }
+            executor.recovery = Some(key.clone());
+            executor
+                .resume
+                .as_mut()
+                .ok_or(ModelFailure::Configuration)?
+                .identity = key;
+        }
+        Ok(executor)
+    }
+
+    async fn configured_inner(
+        options: BcodeOptions,
+        preferences: bool,
+    ) -> Result<Self, ModelFailure> {
         if options.max_output_tokens == 0 || options.timeout.is_zero() {
             return Err(ModelFailure::Configuration);
         }
@@ -197,14 +311,17 @@ impl BcodeExecutor {
                 std::fs::read(&options.config_path).map_err(|_| ModelFailure::Configuration)?;
             bcode_recap::generation::identity(&String::from_utf8_lossy(&bytes))
         };
+        // Preserve the legacy request identity despite extracting its portable type.
+        let legacy_options =
+            format!("{options:?}").replacen("ModelConfiguration {", "BcodeOptions {", 1);
         let recovery = Some(bcode_recap::generation::identity(&format!(
-            "recap-bcode-v1:{options:?}:{config_identity}"
+            "recap-bcode-v1:{legacy_options}:{config_identity}"
         )));
         let parameters = bcode_model::ModelParameters {
             max_output_tokens: Some(options.max_output_tokens),
             ..bcode_model::ModelParameters::default()
         };
-        let selected = crate::connections::effective_selection(&crate::connections::Selection {
+        let selection_options = crate::connections::Selection {
             config_path: (!options.config_path.as_os_str().is_empty())
                 .then_some(options.config_path),
             profile: options.profile,
@@ -213,8 +330,15 @@ impl BcodeExecutor {
             provider: options.provider,
             endpoint: options.endpoint,
             auth_profile: options.auth_profile,
-        })
-        .map_err(|_| ModelFailure::Configuration)?;
+        };
+        let selected = if preferences {
+            crate::connections::effective_selection(&selection_options)
+                .map_err(|_| ModelFailure::Configuration)?
+        } else {
+            selection_options
+        };
+        let resume_options =
+            retained_options(&selected, options.max_output_tokens, options.timeout)?;
         let effective_profile = selected.profile.clone();
         let sdk = crate::connections::resolve(&selected)
             .await
@@ -243,6 +367,22 @@ impl BcodeExecutor {
         .await
         .map_err(|_| ModelFailure::Timeout)?
         .map_err(|error| ModelFailure::classify(&error))?;
+        let recovery =
+            recovery.map(|key| bcode_recap::generation::identity(&format!("{key}:{selection:?}")));
+        let resume = recovery
+            .as_ref()
+            .map(|identity| {
+                Ok(bcode_recap::model_configuration::ResumeModelConfiguration {
+                    version: 1,
+                    identity: identity.clone(),
+                    selection_fingerprint: bcode_recap::generation::identity(&format!(
+                        "{selection:?}"
+                    )),
+                    config_fingerprint: configuration_fingerprint(&resume_options)?,
+                    options: resume_options,
+                })
+            })
+            .transpose()?;
         Ok(Self {
             sdk,
             parameters,
@@ -250,14 +390,19 @@ impl BcodeExecutor {
             failure: Mutex::new(None),
             selection: selection.clone(),
             observer: None,
-            recovery: recovery
-                .map(|key| bcode_recap::generation::identity(&format!("{key}:{selection:?}"))),
+            recovery,
+            resume,
         })
     }
 }
 impl ModelExecutor for BcodeExecutor {
     fn recovery_identity(&self) -> Option<String> {
         self.recovery.clone()
+    }
+    fn resume_configuration(
+        &self,
+    ) -> Option<bcode_recap::model_configuration::ResumeModelConfiguration> {
+        self.resume.clone()
     }
 
     fn execute<'a>(
@@ -693,6 +838,7 @@ mod tests {
             selection: ("test".into(), "test".into(), None),
             observer: None,
             recovery: Some("test".into()),
+            resume: None,
         });
         let cancellation = Cancellation::default();
         let mut calls = tokio::task::JoinSet::new();

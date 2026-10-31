@@ -679,7 +679,29 @@ async fn resume_job(
     let configuration = bcode_recap::generation::Journal::configuration(root, &value.id)
         .map_err(|error| Error::Action(error.to_string()))?;
     progress(Stage::ModelReadiness);
-    let executor = observed_model(&value.model, cancel).await?;
+    let saved = bcode_recap::generation::Journal::model_configuration(root, &value.id)
+        .map_err(|error| Error::Action(error.to_string()))?;
+    let executor = if let Some(saved) = saved {
+        let mut options = saved.options.clone();
+        value.model.apply(&mut options);
+        crate::bcode_adapter::BcodeExecutor::configured_resume(saved, options, value.model.model_config.is_some())
+            .await.map_err(|_| Error::Action("Saved model configuration is unavailable or changed. Restore its configuration/authentication references, or explicitly override --model-config. No model request was made.".into()))?
+    } else {
+        let mut options = model_options(&ModelOptions::defaults_for_resume());
+        value.model.apply(&mut options);
+        let status = bcode_recap::generation::Journal::inspect(root, &value.id)
+            .map_err(|error| Error::Action(error.to_string()))?;
+        let identity = status.executor.as_deref().ok_or_else(|| {
+            Error::Action("Legacy generation has no verifiable model identity".into())
+        })?;
+        crate::bcode_adapter::BcodeExecutor::configured_legacy(options, identity)
+            .await.map_err(|_| Error::Action("This older generation saved only a model identity hash, not its settings. Current settings do not match. Supply the original model options once to adopt verified resume settings; no checkpoints were changed or model requests made.".into()))?
+    };
+    let executor = if let Some(observer) = cancel.observer() {
+        executor.with_observer(observer)
+    } else {
+        executor
+    };
     executor.observe_selection(cancel);
     let engine = Engine {
         executor: &executor,
@@ -1399,6 +1421,11 @@ struct ProgressExecutor<'a, F> {
 impl<F: FnMut(Stage) + Send> ModelExecutor for ProgressExecutor<'_, F> {
     fn recovery_identity(&self) -> Option<String> {
         self.executor.recovery_identity()
+    }
+    fn resume_configuration(
+        &self,
+    ) -> Option<bcode_recap::model_configuration::ResumeModelConfiguration> {
+        self.executor.resume_configuration()
     }
 
     fn execute<'a>(

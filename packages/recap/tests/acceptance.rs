@@ -38,6 +38,29 @@ impl ModelExecutor for DeterministicModel {
         Some("offline-deterministic-v1".into())
     }
 
+    fn resume_configuration(
+        &self,
+    ) -> Option<bcode_recap::model_configuration::ResumeModelConfiguration> {
+        use bcode_recap::model_configuration::{ModelConfiguration, ResumeModelConfiguration};
+        Some(ResumeModelConfiguration {
+            version: 1,
+            identity: self.recovery_identity().unwrap(),
+            options: ModelConfiguration {
+                config_path: std::path::PathBuf::new(),
+                profile: Some("offline-original".into()),
+                context: None,
+                model: Some("fixture".into()),
+                provider: Some("fixture".into()),
+                endpoint: None,
+                auth_profile: None,
+                max_output_tokens: 10000,
+                timeout: std::time::Duration::from_secs(300),
+            },
+            selection_fingerprint: "offline-selection".into(),
+            config_fingerprint: Some("offline-config".into()),
+        })
+    }
+
     fn execute<'a>(
         &'a self,
         request: ModelRequest,
@@ -846,6 +869,11 @@ async fn crash_restart_reuses_completed_work_without_original_source() {
     let model = DeterministicModel::default();
     let store = DocumentStore::new(root.path().join("store"), 8 * 1024 * 1024);
     assert!(store.load(&request.id).is_err());
+    let saved_model =
+        bcode_recap::generation::Journal::model_configuration(store.generation_root(), &request.id)
+            .unwrap()
+            .unwrap();
+    assert_eq!(Some(saved_model.clone()), model.resume_configuration());
     let engine = Engine {
         executor: &model,
         store: store.clone(),
