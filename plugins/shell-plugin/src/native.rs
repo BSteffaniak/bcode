@@ -27,6 +27,7 @@ use sha2::{Digest, Sha256};
 use std::fs::File;
 use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
+#[cfg(test)]
 use std::process::Command;
 use std::sync::{Arc, Mutex as StdMutex};
 use std::time::{Duration, Instant};
@@ -1238,25 +1239,15 @@ fn direnv_file_for(cwd: &Path) -> Option<PathBuf> {
     }
 }
 
-fn direnv_available() -> bool {
-    Command::new("direnv")
-        .arg("version")
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .status()
-        .is_ok_and(|status| status.success())
-}
+#[path = "native/direnv_probe.rs"]
+mod direnv_probe;
 
 fn should_use_direnv(cwd: Option<&Path>, config: ShellToolEnvConfig) -> Result<bool, String> {
     match config.mode {
         ShellToolEnvMode::Inherit => Ok(false),
-        ShellToolEnvMode::Direnv => {
-            if direnv_available() {
-                Ok(true)
-            } else {
-                Err("shell env mode is direnv, but `direnv` is not available on PATH".to_owned())
-            }
-        }
+        ShellToolEnvMode::Direnv => direnv_probe::check(cwd)
+            .map(|()| true)
+            .map_err(|error| format!("shell env mode is direnv: {error}")),
         ShellToolEnvMode::Auto => {
             let Some(cwd) = cwd else {
                 return Ok(false);
@@ -1264,15 +1255,13 @@ fn should_use_direnv(cwd: Option<&Path>, config: ShellToolEnvConfig) -> Result<b
             let Some(envrc) = direnv_file_for(cwd) else {
                 return Ok(false);
             };
-            if direnv_available() {
-                Ok(true)
-            } else if config.auto_fallback == ShellToolEnvAutoFallback::Inherit {
-                Ok(false)
-            } else {
-                Err(format!(
-                    "found {}, but `direnv` is not available on PATH; install direnv or set `[tools.shell.env] auto_fallback = \"inherit\"`",
+            match direnv_probe::check(Some(cwd)) {
+                Ok(()) => Ok(true),
+                Err(_) if config.auto_fallback == ShellToolEnvAutoFallback::Inherit => Ok(false),
+                Err(error) => Err(format!(
+                    "found {}; {error}; repair the reported probe failure or explicitly set `[tools.shell.env] auto_fallback = \"inherit\"`",
                     display(&envrc, cwd)
-                ))
+                )),
             }
         }
     }
