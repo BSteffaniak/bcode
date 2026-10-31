@@ -1700,6 +1700,9 @@ impl TuiEffect {
         handle: bmux_tui_runtime::RuntimeHandle<super::root_program::BcodeRuntimeMessage>,
     ) -> bmux_tui_runtime::Command<super::root_program::BcodeRuntimeMessage> {
         let key = self.command_key();
+        if matches!(schedule, EffectSchedule::Cancel) {
+            return bmux_tui_runtime::Command::cancel(key);
+        }
         let client = match self.daemon_intent() {
             EffectDaemonIntent::Background => passive_client.clone(),
             EffectDaemonIntent::Foreground => foreground_client.clone(),
@@ -3244,6 +3247,107 @@ mod projection_paging_tests {
     }
 
     use super::*;
+
+    struct CancellationProbe {
+        handle: Option<
+            bmux_tui_runtime::RuntimeHandle<super::super::root_program::BcodeRuntimeMessage>,
+        >,
+        phase: u8,
+        cancelled: std::sync::Arc<tokio::sync::Notify>,
+    }
+
+    impl bmux_tui_runtime::Program for CancellationProbe {
+        type Message = super::super::root_program::BcodeRuntimeMessage;
+        type Error = std::convert::Infallible;
+
+        fn update(
+            &mut self,
+            event: bmux_tui_runtime::RuntimeEvent<Self::Message>,
+        ) -> Result<bmux_tui_runtime::Update<Self::Message>, Self::Error> {
+            use bmux_tui_runtime::{Command, Update};
+            let effect = TuiEffect::LoadSessionPicker {
+                generation: 1,
+                scope: bcode_session_models::SessionDiscoveryScope::AllWorkingDirectories,
+                query: bcode_session_models::SessionCatalogQuery::default(),
+                cursor: None,
+            };
+            let update = match self.phase {
+                0 => {
+                    let bmux_tui_runtime::RuntimeEvent::Message(Self::Message::Bootstrap {
+                        handle,
+                    }) = event
+                    else {
+                        panic!("expected bootstrap");
+                    };
+                    self.handle = Some(handle.clone());
+                    let cancelled = std::sync::Arc::clone(&self.cancelled);
+                    Update::none().with_command(Command::start_if_idle(
+                        effect.command_key(),
+                        async move {
+                            struct NotifyOnDrop(std::sync::Arc<tokio::sync::Notify>);
+                            impl Drop for NotifyOnDrop {
+                                fn drop(&mut self) {
+                                    self.0.notify_one();
+                                }
+                            }
+                            let _guard = NotifyOnDrop(cancelled);
+                            handle
+                                .send(Self::Message::PluginSurfaceInvalidated)
+                                .await
+                                .unwrap();
+                            std::future::pending().await
+                        },
+                    ))
+                }
+                1 => {
+                    let client = BcodeClient::default_endpoint();
+                    let handle = self.handle.as_ref().unwrap().clone();
+                    let cancelled = std::sync::Arc::clone(&self.cancelled);
+                    Update::none()
+                        .with_command(effect.command(
+                            EffectSchedule::Cancel,
+                            &client,
+                            &client,
+                            handle,
+                        ))
+                        .with_command(Command::concurrent(async move {
+                            cancelled.notified().await;
+                            Some(Self::Message::PluginSurfaceInvalidated)
+                        }))
+                }
+                _ => Update::exit(),
+            };
+            self.phase += 1;
+            Ok(update)
+        }
+    }
+
+    #[tokio::test]
+    async fn cancellation_command_stops_active_session_picker_work() {
+        let (runtime, handle) = bmux_tui_runtime::Runtime::new(
+            CancellationProbe {
+                handle: None,
+                phase: 0,
+                cancelled: std::sync::Arc::new(tokio::sync::Notify::new()),
+            },
+            bmux_tui_runtime::HeadlessPresenter::default(),
+            bmux_tui_runtime::RuntimeConfig::default(),
+        );
+        assert!(
+            handle
+                .try_send(super::super::root_program::BcodeRuntimeMessage::Bootstrap {
+                    handle: handle.clone(),
+                })
+                .is_ok()
+        );
+        let outcome = tokio::time::timeout(std::time::Duration::from_secs(2), runtime.run())
+            .await
+            .expect("cancellation must drop active picker work");
+        let output = outcome.unwrap_or_else(|_| panic!("probe runtime failed"));
+        assert_eq!(output.program.phase, 3);
+        assert_eq!(output.stats.commands_started, 2);
+        assert_eq!(output.stats.commands_cancelled, 1);
+    }
 
     struct CommandOwner {
         outcome: bcode_command::application::CommandInvocationOutcome,
