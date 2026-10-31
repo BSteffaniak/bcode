@@ -1243,9 +1243,17 @@ fn direnv_file_for(cwd: &Path) -> Option<PathBuf> {
 mod direnv_probe;
 
 fn should_use_direnv(cwd: Option<&Path>, config: ShellToolEnvConfig) -> Result<bool, String> {
+    select_direnv(cwd, config, direnv_probe::check)
+}
+
+fn select_direnv(
+    cwd: Option<&Path>,
+    config: ShellToolEnvConfig,
+    probe: impl FnOnce(Option<&Path>) -> Result<(), String>,
+) -> Result<bool, String> {
     match config.mode {
         ShellToolEnvMode::Inherit => Ok(false),
-        ShellToolEnvMode::Direnv => direnv_probe::check(cwd)
+        ShellToolEnvMode::Direnv => probe(cwd)
             .map(|()| true)
             .map_err(|error| format!("shell env mode is direnv: {error}")),
         ShellToolEnvMode::Auto => {
@@ -1255,7 +1263,7 @@ fn should_use_direnv(cwd: Option<&Path>, config: ShellToolEnvConfig) -> Result<b
             let Some(envrc) = direnv_file_for(cwd) else {
                 return Ok(false);
             };
-            match direnv_probe::check(Some(cwd)) {
+            match probe(Some(cwd)) {
                 Ok(()) => Ok(true),
                 Err(_) if config.auto_fallback == ShellToolEnvAutoFallback::Inherit => Ok(false),
                 Err(error) => Err(format!(
@@ -6555,6 +6563,41 @@ mod tests {
         assert_eq!(plan.program, "direnv");
         assert!(plan.args.iter().any(|arg| arg.contains(&marker)));
         assert!(plan.args.iter().any(|arg| arg.contains("echo hello")));
+    }
+
+    #[test]
+    fn direnv_auto_fallback_is_configurable_and_defaults_open() {
+        fn fail(_: Option<&Path>) -> Result<(), String> {
+            Err("injected spawn failure".to_owned())
+        }
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join(".envrc"), "").unwrap();
+        assert!(!select_direnv(Some(dir.path()), ShellToolEnvConfig::default(), fail).unwrap());
+        let closed = ShellToolEnvConfig {
+            auto_fallback: ShellToolEnvAutoFallback::Error,
+            ..ShellToolEnvConfig::default()
+        };
+        assert!(
+            select_direnv(Some(dir.path()), closed, fail)
+                .unwrap_err()
+                .contains("injected spawn failure")
+        );
+        assert!(select_direnv(Some(dir.path()), closed, |_| Ok(())).unwrap());
+        let required = ShellToolEnvConfig {
+            mode: ShellToolEnvMode::Direnv,
+            ..ShellToolEnvConfig::default()
+        };
+        assert!(select_direnv(Some(dir.path()), required, fail).is_err());
+        let inherited = ShellToolEnvConfig {
+            mode: ShellToolEnvMode::Inherit,
+            ..closed
+        };
+        assert!(
+            !select_direnv(Some(dir.path()), inherited, |_| panic!(
+                "inherit must not probe"
+            ))
+            .unwrap()
+        );
     }
 
     #[test]

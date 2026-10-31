@@ -53,7 +53,7 @@ fn run(command: &mut Command, timeout: Duration) -> Result<(), Failure> {
             Ok(Some(status)) if status.success() => return Ok(()),
             Ok(Some(status)) => return Err(Failure::Exit(status)),
             Ok(None) if started.elapsed() < timeout => {
-                std::thread::sleep(Duration::from_millis(10))
+                std::thread::sleep(Duration::from_millis(10));
             }
             Ok(None) => {
                 let _ = child.kill();

@@ -201,7 +201,8 @@ fn tools_config_examples() -> String {
 \n\
          [tools.shell.env]\n\
          mode = \"auto\"\n\
-         auto_fallback = \"error\"\n\
+         # Fail open on preflight failure; use \"error\" to fail closed.\n\
+         auto_fallback = \"inherit\"\n\
          ```\n",
     )
 }

@@ -3325,7 +3325,7 @@ impl Default for ShellToolEnvConfig {
     fn default() -> Self {
         Self {
             mode: ShellToolEnvMode::Auto,
-            auto_fallback: ShellToolEnvAutoFallback::Error,
+            auto_fallback: ShellToolEnvAutoFallback::Inherit,
             hide_direnv_prelude: default_hide_direnv_prelude(),
         }
     }
@@ -3447,10 +3447,11 @@ pub enum ShellToolEnvMode {
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, ConfigDocEnum)]
 #[serde(rename_all = "snake_case")]
 pub enum ShellToolEnvAutoFallback {
-    /// Return an actionable error when auto-detected environment setup cannot run.
-    #[default]
+    /// Fail closed when the auto-detected direnv preflight cannot run successfully.
     Error,
-    /// Fall back to the daemon process environment.
+    /// Fail open to the daemon process environment on direnv preflight failure (default).
+    /// This does not retry commands or bypass direnv environment-loading failures.
+    #[default]
     Inherit,
 }
 
@@ -9614,6 +9615,28 @@ fn read_config(path: &Path) -> Result<BcodeConfig, ConfigError> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn shell_env_fallback_defaults_and_explicit_policy_round_trip() {
+        use super::{ShellToolEnvAutoFallback, ShellToolEnvConfig};
+        assert_eq!(
+            ShellToolEnvConfig::default().auto_fallback,
+            ShellToolEnvAutoFallback::Inherit
+        );
+        let omitted: ShellToolEnvConfig = toml::from_str("").unwrap();
+        assert_eq!(omitted.auto_fallback, ShellToolEnvAutoFallback::Inherit);
+        for (value, expected) in [
+            ("inherit", ShellToolEnvAutoFallback::Inherit),
+            ("error", ShellToolEnvAutoFallback::Error),
+        ] {
+            let config: ShellToolEnvConfig =
+                toml::from_str(&format!("auto_fallback = {value:?}")).unwrap();
+            assert_eq!(config.auto_fallback, expected);
+            let decoded: ShellToolEnvConfig =
+                toml::from_str(&toml::to_string(&config).unwrap()).unwrap();
+            assert_eq!(decoded, config);
+        }
+        assert!(toml::from_str::<ShellToolEnvConfig>("auto_fallback = 'unknown'").is_err());
+    }
     #[test]
     fn ordered_policy_settings_roundtrip_and_identity_preserve_order() {
         let raw = r#"
