@@ -34,6 +34,12 @@ impl DocumentStore {
         }
     }
 
+    /// Return this store's explicit durable generation namespace.
+    #[must_use]
+    pub fn generation_root(&self) -> &Path {
+        &self.root
+    }
+
     /// Return the owned media directory for an ID. This does not create it or
     /// authorize access; media producers must preserve the private-root boundary.
     ///

@@ -65,6 +65,30 @@ recap export lesson --output lesson.html
 
 The default document store is `.recap`; use global `--store /absolute/path` to choose another location. Refine creates a revision with optimistic concurrency checks. An export is a snapshot, not a live agent connection. Existing output files are not overwritten unless explicitly allowed by the CLI.
 
+## Generation recovery
+
+Creation and refinement retain private, versioned checkpoints under the selected
+store's `generations/` directory. These contain source material, media, requests,
+and completed model responses: treat the store as sensitive local data, not a
+public diagnostic report. Do not delete it while recovery is needed.
+
+Resume with `recap --store /path/to/store resume GENERATION_ID`, the TUI Resume
+control (or `resume:GENERATION_ID` in the source field), or `recap.resume` in Bcode.
+Use the same explicit model/profile configuration. Refinement generation IDs are
+`DOCUMENT_ID-rNEXT_REVISION`. Recovery rejects incompatible model identities,
+changed requests/policies, damaged checkpoints and concurrent owners. Completed
+exact requests are reused; unfinished requests are not assumed to have failed.
+`--retry-uncertain` explicitly permits repeating such requests and may incur
+additional provider usage. The TUI exposes a separate approval action.
+
+Acquired sources, completed media preparation and accepted model responses survive
+restart. A crash during an unfinished media stage can repeat that stage. Composition
+reconstructs intermediate domain state from exact completed-response replay; it is
+not an independently durable checkpoint for every accepted passage patch. Output
+publication retains optimistic revision checks and no-clobber asset behavior.
+Provider retries use Bcode's normalized retry categories and bounded delays, not
+blanket retries of configuration failures or ambiguous execution.
+
 ## HTML
 
 CSS, JavaScript, images, and selected silent clips are embedded. Reading works offline and core content remains present without JavaScript. Following source links requires network access. Media budgets can cause explicit degradation notices; no media silently becomes a remote dependency.
@@ -105,8 +129,9 @@ No raw source, prompts or credentials are included in these measurements.
 Adaptive scene/transcript sampling improves visual evidence, but sampled frames do not
 prove complete visual coverage or motion understanding. Reading notes preserve inspection
 limitations. Audits and evidence references are safeguards, not a guarantee of factual or
-semantic completeness. Intermediate analysis remains operation-local; no implicit durable
-checkpoint cache is created. Existing documents remain readable without conversion.
+semantic completeness. Intermediate analysis is retained in explicit private generation
+checkpoints for recovery; it is never included implicitly in public diagnostics.
+Existing documents remain readable without conversion.
 
 ## Validation
 

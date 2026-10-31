@@ -280,7 +280,8 @@ async fn retry_policy_uses_typed_retryability_and_provider_delay_hint() {
         .retry_policy(
             RetryPolicy::new(1, Duration::ZERO)
                 .with_max_delay(Duration::from_millis(10))
-                .with_jitter_millis(2),
+                .with_jitter_millis(2)
+                .normalized_only(),
         )
         .run(&mut provider)
         .await

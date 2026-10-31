@@ -10,7 +10,7 @@ use crate::{
 };
 
 /// Explicit composition budgets. Limits reject inputs rather than silently dropping evidence.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, serde::Serialize, serde::Deserialize)]
 pub struct CompositionLimits {
     /// Maximum total encoded image bytes.
     pub image_bytes: usize,

@@ -219,13 +219,17 @@ impl ModelHostOperations {
         }
         if matches!(
             request.operation.as_str(),
-            wire::OP_ADMISSION | wire::OP_START | wire::OP_START_STRUCTURED
+            wire::OP_ADMISSION
+                | wire::OP_RECOVERY_IDENTITY
+                | wire::OP_START
+                | wire::OP_START_STRUCTURED
         ) && !self.admits(caller)
         {
             return failed("model_host_not_admitted");
         }
         match request.operation.as_str() {
             wire::OP_ADMISSION => responded(&bcode_model::AckResponse::default()),
+            wire::OP_RECOVERY_IDENTITY => self.recovery_identity(),
             wire::OP_START => {
                 let Ok(input) = serde_json::from_value::<wire::StartRequest>(request.payload)
                 else {
@@ -288,6 +292,29 @@ impl ModelHostOperations {
             }
             _ => ToolInvocationServiceResolution::Unsupported,
         }
+    }
+
+    fn recovery_identity(&self) -> ToolInvocationServiceResolution {
+        use sha2::{Digest as _, Sha256};
+        let Ok(configured) = serde_json::to_vec(&self.config) else {
+            return failed("model_host_identity_unavailable");
+        };
+        let mut hash = Sha256::new();
+        hash.update(b"model-host-recovery-v1");
+        hash.update(configured);
+        hash.update(self.admission.model_profile.as_bytes());
+        let identity = hash
+            .finalize()
+            .iter()
+            .fold(String::new(), |mut text, byte| {
+                use std::fmt::Write as _;
+                write!(&mut text, "{byte:02x}").expect("String write");
+                text
+            });
+        responded(&wire::RecoveryIdentity {
+            version: 1,
+            identity,
+        })
     }
 
     async fn start(
@@ -675,22 +702,58 @@ impl ModelHostOperations {
             return Ok(());
         }
         let scope = PluginInvocationScope::Global;
-        let started = tokio::time::timeout(
-            Duration::from_mins(1),
-            invoke_model_provider_start_turn_with_custody(
-                state,
-                Some(route.clone()),
-                &request,
-                scope.clone(),
-                &self.config,
-                credential_custody,
-            ),
-        )
-        .await
-        .map_err(|_| "start_failed_no_retry")?
-        .map_err(|_| "start_failed_no_retry")?;
-        drop(request);
-        poll_provider_turn(state, turn, route, started, scope).await
+        let mut attempt = 0_u32;
+        loop {
+            if turn.cancel.load(Ordering::Acquire) || turn.expires_at <= now() {
+                return Ok(());
+            }
+            let started = tokio::time::timeout(
+                Duration::from_mins(1),
+                invoke_model_provider_start_turn_with_custody(
+                    state,
+                    Some(route.clone()),
+                    &request,
+                    scope.clone(),
+                    &self.config,
+                    credential_custody.clone(),
+                ),
+            )
+            .await
+            .map_err(|_| "start_failed_no_retry")?
+            .map_err(|_| "start_failed_no_retry")?;
+            let Some(error) =
+                poll_provider_turn(state, turn, route.clone(), started, scope.clone()).await?
+            else {
+                return Ok(());
+            };
+            attempt = attempt.saturating_add(1);
+            let delay = bcode_model_provider_runtime::normalized_retry_delay(
+                &error,
+                attempt,
+                3,
+                Duration::from_secs(1),
+                Duration::from_secs(30),
+                SystemTime::now(),
+            );
+            let Some(delay) = delay else {
+                retain_event(
+                    &mut *turn.inner.lock().await,
+                    bcode_model::ProviderTurnEvent::Error { error },
+                );
+                return Ok(());
+            };
+            let until = tokio::time::Instant::now() + delay;
+            while tokio::time::Instant::now() < until {
+                if turn.cancel.load(Ordering::Acquire) || turn.expires_at <= now() {
+                    retain_event(
+                        &mut *turn.inner.lock().await,
+                        bcode_model::ProviderTurnEvent::Cancelled,
+                    );
+                    return Ok(());
+                }
+                tokio::time::sleep(Duration::from_millis(25)).await;
+            }
+        }
     }
 
     /// Signal cleanup when an owning service invocation ends. Invoke even on disconnect/failure.
@@ -840,9 +903,11 @@ async fn poll_provider_turn(
     route: String,
     started: StartTurnResponse,
     scope: PluginInvocationScope,
-) -> Result<(), &'static str> {
+) -> Result<Option<bcode_model::ProviderError>, &'static str> {
     let mut cancelled = false;
     let mut polling_failed = false;
+    let mut retry_failure = None;
+    let mut output_seen = false;
     loop {
         if turn.cancel.load(Ordering::Acquire) || turn.expires_at <= now() {
             cancelled = true;
@@ -864,6 +929,26 @@ async fn poll_provider_turn(
         };
         let mut inner = turn.inner.lock().await;
         for event in batch.events {
+            if let bcode_model::ProviderTurnEvent::Error { error } = &event
+                && !output_seen
+                && bcode_model_provider_runtime::normalized_retry_delay(
+                    error,
+                    1,
+                    3,
+                    Duration::from_secs(1),
+                    Duration::from_secs(30),
+                    SystemTime::now(),
+                )
+                .is_some()
+            {
+                retry_failure = Some(error.clone());
+                continue;
+            }
+            output_seen |= !matches!(event, bcode_model::ProviderTurnEvent::Usage { .. });
+            if output_seen && let Some(error) = retry_failure.take() {
+                inner.terminal = true;
+                retain_event(&mut inner, bcode_model::ProviderTurnEvent::Error { error });
+            }
             if matches!(
                 event,
                 bcode_model::ProviderTurnEvent::TurnFinished { .. }
@@ -878,7 +963,7 @@ async fn poll_provider_turn(
         }
         let terminal = inner.terminal;
         drop(inner);
-        if terminal {
+        if terminal || retry_failure.is_some() {
             break;
         }
         tokio::time::sleep(Duration::from_millis(100)).await;
@@ -918,7 +1003,7 @@ async fn poll_provider_turn(
         let mut inner = turn.inner.lock().await;
         retain_event(&mut inner, bcode_model::ProviderTurnEvent::Cancelled);
     }
-    Ok(())
+    Ok(retry_failure)
 }
 
 fn acknowledge_cleanup(

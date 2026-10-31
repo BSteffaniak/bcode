@@ -8,6 +8,17 @@ use serde::{Deserialize, Serialize};
 pub const INTERFACE_ID: &str = "bcode.model-host/v1";
 /// Check fixed-profile admission without reserving work or invoking a provider.
 pub const OP_ADMISSION: &str = "admission";
+/// Read the admitted replay namespace without starting inference. Unsupported old hosts reject it.
+pub const OP_RECOVERY_IDENTITY: &str = "recovery_identity.v1";
+/// Normalized model/config identity for durable integration checkpoints; never credentials.
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RecoveryIdentity {
+    /// Compatibility boundary.
+    pub version: u32,
+    /// Opaque host-owned identity. A changed value invalidates replay.
+    pub identity: String,
+}
 /// Start operation.
 pub const OP_START: &str = "start_turn";
 /// Poll operation.

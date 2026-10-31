@@ -23,7 +23,7 @@ use std::collections::{BTreeMap, BTreeSet};
 /// Plugin identity.
 pub const PLUGIN_ID: &str = "bcode.recap";
 /// Direct library-backed recap operations.
-const OPERATIONS: [&str; 4] = ["create", "refine", "export", "inspect"];
+const OPERATIONS: [&str; 5] = ["create", "refine", "export", "inspect", "resume"];
 
 /// User commands remain available when model-callable recap tools are disabled.
 #[must_use]
@@ -41,6 +41,7 @@ pub fn commands() -> Vec<CommandContribution> {
             for name in match operation {
                 "create" => vec!["source", "focus", "transcript"],
                 "refine" => vec!["focus"],
+                "resume" => vec!["retry_uncertain"],
                 _ => vec![],
             } {
                 arguments.push(CommandArgumentContribution {
@@ -83,6 +84,7 @@ fn definitions() -> Vec<ToolDefinition> {
         if operation == "create" { properties["source"] = json!({"type":"string","description":"Local video within the canonical workspace, or a YouTube URL"}); properties["transcript"] = json!({"type":"string","description":"Optional workspace-confined VTT/SRT file"}); required.push("source"); }
         if matches!(operation, "create" | "refine") { properties["focus"] = json!({"type":"string"}); }
         if operation == "refine" { required.push("focus"); }
+        if operation == "resume" { properties["retry_uncertain"]=json!({"type":"string","enum":["true","false"],"description":"Explicit approval to repeat unresolved provider calls"}); }
         ToolDefinition { name: format!("recap.{operation}"), description: format!("{operation} a grounded visual recap using direct Rust library execution. Create/refine require explicitly admitted model-host inference. Local files stay within the canonical workspace; recap data lives in .recap."), input_schema: json!({"type":"object","properties":properties,"required":required,"additionalProperties":false}) }
     }).collect()
 }
@@ -219,10 +221,10 @@ mod tests {
     #[test]
     fn commands_and_tools_are_portable_and_namespaced() {
         let commands = super::commands();
-        assert_eq!(commands.len(), 4);
+        assert_eq!(commands.len(), 5);
         assert!(commands.iter().all(|command| command.slash.is_some()));
         let tools = super::definitions();
-        assert_eq!(tools.len(), 4);
+        assert_eq!(tools.len(), 5);
         assert!(
             tools
                 .iter()

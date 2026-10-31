@@ -357,18 +357,87 @@ async fn review(
     images: &[ImageAsset],
     policy: &DetailedPolicy,
 ) -> Result<PassageReview> {
-    let response = execute(
-        execution,
-        AnalysisStage::PassageReview,
-        json!({"source_unit":unit,"passage":passage,"neighboring_passages_context_only":neighbors,
-            "neighboring_source_units_context_only":neighboring_sources}),
-        source::frames(unit, images, policy.inspect_visuals),
-        REVIEW,
-        policy,
-    )
-    .await?;
-    let AnalysisResponse::PassageReview(review) = response else {
-        return Err(CompositionError::Invalid("passage review stage mismatch"));
+    let input = json!({"source_unit":unit,"passage":passage,"neighboring_passages_context_only":neighbors,
+        "neighboring_source_units_context_only":neighboring_sources});
+    let overhead = PASSAGE_POLICY
+        .len()
+        .saturating_add(REVIEW.len())
+        .saturating_add(1);
+    let limit = policy.allowances.max_input_bytes.saturating_sub(overhead);
+    let mut pending = vec![input];
+    let mut combined = PassageReview {
+        findings: Vec::new(),
+        limitations: Vec::new(),
     };
-    Ok(review)
+    while let Some(input) = pending.pop() {
+        let size = serde_json::to_vec(&input)?.len();
+        if size > limit {
+            if let Some((left, right)) = split_review(&input) {
+                pending.push(right);
+                pending.push(left);
+                continue;
+            }
+            return Err(CompositionError::Limit {
+                resource: "indivisible source review bytes",
+                actual: size.saturating_add(overhead),
+                limit: policy.allowances.max_input_bytes,
+            });
+        }
+        let response = execute(
+            execution,
+            AnalysisStage::PassageReview,
+            input,
+            source::frames(unit, images, policy.inspect_visuals),
+            REVIEW,
+            policy,
+        )
+        .await?;
+        let AnalysisResponse::PassageReview(review) = response else {
+            return Err(CompositionError::Invalid("passage review stage mismatch"));
+        };
+        for finding in review.findings {
+            if !combined.findings.contains(&finding) {
+                combined.findings.push(finding);
+            }
+        }
+        for limitation in review.limitations {
+            if !combined.limitations.contains(&limitation) {
+                combined.limitations.push(limitation);
+            }
+        }
+    }
+    Ok(combined)
+}
+
+// Split review prose, never source evidence or block text. Every target block is
+// checked against every context partition; findings still validate against the full passage.
+fn split_review(input: &serde_json::Value) -> Option<(serde_json::Value, serde_json::Value)> {
+    let targets = input.pointer("/passage/blocks")?.as_array()?;
+    if targets.len() > 1 {
+        let mut left = input.clone();
+        let mut right = input.clone();
+        let middle = targets.len() / 2;
+        left["passage"]["blocks"] = json!(&targets[..middle]);
+        right["passage"]["blocks"] = json!(&targets[middle..]);
+        return Some((left, right));
+    }
+    let neighbors = input["neighboring_passages_context_only"].as_array()?;
+    if neighbors.len() > 1 {
+        let mut left = input.clone();
+        let mut right = input.clone();
+        let middle = neighbors.len() / 2;
+        left["neighboring_passages_context_only"] = json!(&neighbors[..middle]);
+        right["neighboring_passages_context_only"] = json!(&neighbors[middle..]);
+        return Some((left, right));
+    }
+    let blocks = neighbors.first()?.get("blocks")?.as_array()?;
+    if blocks.len() < 2 {
+        return None;
+    }
+    let middle = blocks.len() / 2;
+    let mut left = input.clone();
+    let mut right = input.clone();
+    left["neighboring_passages_context_only"][0]["blocks"] = json!(&blocks[..middle]);
+    right["neighboring_passages_context_only"][0]["blocks"] = json!(&blocks[middle..]);
+    Some((left, right))
 }

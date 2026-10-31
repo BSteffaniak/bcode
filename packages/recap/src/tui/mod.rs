@@ -104,6 +104,7 @@ struct App {
     status: String,
     failure_lines: Vec<bmux_tui::text::Line>,
     duration_approval: Option<application::DurationApproval>,
+    resume_id: Option<String>,
     export: Option<PathBuf>,
     quitting: bool,
     refine: bool,
@@ -133,6 +134,7 @@ impl App {
             String::new(),
             String::new(),
         ];
+        let resume_id = bcode_recap::generation::Journal::latest(&options.store).ok();
         Self {
             preview: None,
             preview_generation: 0,
@@ -163,6 +165,7 @@ impl App {
                 .into(),
             failure_lines: Vec::new(),
             duration_approval: None,
+            resume_id,
             export: None,
             quitting: false,
             refine: false,
@@ -187,9 +190,34 @@ impl App {
             .trim()
             .to_owned()
     }
-    fn admit(&mut self, request: Request) -> Update<Message> {
+    fn admit(&mut self, mut request: Request) -> Update<Message> {
         if self.active.is_some() {
             return Update::none();
+        }
+        if let Request::RefineAndExport(value) = &request
+            && let Some(document) = &self.document
+        {
+            self.resume_id = Some(format!(
+                "{}-r{}",
+                value.id,
+                document.revision.saturating_add(1)
+            ));
+        }
+        if let Request::CreateAndExport(value) = &mut request {
+            if value.id.is_none() {
+                match application::new_generation_id() {
+                    Ok(id) => value.id = Some(id),
+                    Err(error) => {
+                        self.status = error.to_string();
+                        return Update::redraw();
+                    }
+                }
+            }
+            self.status = format!(
+                "Generation {} · work is saved for resume",
+                value.id.as_deref().unwrap_or_default()
+            );
+            self.resume_id.clone_from(&value.id);
         }
         self.sequence = self.sequence.saturating_add(1);
         let id = self.sequence;
@@ -307,7 +335,8 @@ impl App {
                     Depth::Detailed => Depth::Brief,
                 }
             }
-            "generate" | "apply" | "export" | "open" | "approve-duration" | "decline-duration" => {
+            "generate" | "apply" | "export" | "open" | "approve-duration" | "decline-duration"
+            | "resume" | "retry-uncertain" => {
                 return self.effect_action(action);
             }
             "more" => {
@@ -337,6 +366,28 @@ impl App {
     }
     fn effect_action(&mut self, action: &str) -> Update<Message> {
         match action {
+            "resume" | "retry-uncertain" => {
+                let id = self
+                    .text(0)
+                    .strip_prefix("resume:")
+                    .map(str::to_owned)
+                    .or_else(|| self.resume_id.clone());
+                if let Some(id) = id {
+                    let value = self
+                        .options
+                        .create_request(String::new(), None, None, self.depth);
+                    let output = value.output;
+                    self.resume_id = Some(id.clone());
+                    return self.admit(Request::Resume(Box::new(crate::cli::Resume {
+                        id,
+                        retry_uncertain: action == "retry-uncertain",
+                        model: value.model,
+                        output,
+                    })));
+                }
+                self.status =
+                    "Enter resume:GENERATION-ID in the source field, then choose Resume.".into();
+            }
             "approve-duration" => {
                 if self.active.is_some() {
                     return Update::none();
@@ -789,6 +840,7 @@ fn operation_error(error: &application::Error) -> String {
             ModelError::ExecutionFailed=>"Model request failed · check the selected profile's access, provider availability and request timeout. Rate limits or transport failures are possible, not confirmed. No automatic retry; review the operation before retrying explicitly.".into(),
             ModelError::Unavailable=>"Model unavailable · check the explicit config, profile and multimodal model selection, then Generate again.".into(),
             ModelError::InvalidResponse=>"Model returned an invalid structured recap · no fabricated fallback was saved. Review model compatibility before retrying explicitly.".into(),
+            ModelError::RecoveryRequired | ModelError::Checkpoint=>"Generation paused · saved work is intact. Resume with explicit approval before repeating unresolved model calls.".into(),
             ModelError::Cancelled=>"Model operation cancelled · no successful recap is implied.".into(),
         };
     }

@@ -6,6 +6,7 @@ use bcode_recap::{
 
 pub fn engine(error: EngineError) -> String {
     match error {
+        EngineError::Generation(error) => format!("recap_generation_paused: {error}"),
         EngineError::Source(error @ SourceError::Acquisition { .. }) => format!("recap_acquisition_failed: {error}"),
         EngineError::Source(SourceError::Process(error)) | EngineError::Media(MediaError::Process(error)) => process(&error),
         EngineError::Source(SourceError::Invalid(reason)) => format!("recap_source_invalid: {reason}; check video URL and transcript format"),

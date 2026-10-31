@@ -33,7 +33,7 @@ pub enum Stage {
 }
 
 /// Inputs for noninteractive default generation or optional technical focus.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub struct GenerateRequest {
     /// Stable caller-selected document identity.
     pub id: String,
@@ -50,7 +50,7 @@ pub struct GenerateRequest {
 }
 
 /// Explicit tools and budgets; no automatic installation, credentials, or provider selection.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub struct EngineOptions {
     /// Acquisition workspace, downloader and budgets.
     pub acquisition: AcquisitionOptions,
@@ -82,6 +82,9 @@ pub struct PreparedRecap {
 /// Domain-local errors; a failed model never masquerades as a generated recap.
 #[derive(Debug, thiserror::Error)]
 pub enum EngineError {
+    /// Durable generation recovery failure.
+    #[error(transparent)]
+    Generation(#[from] crate::generation::Error),
     /// Acquisition failed.
     #[error(transparent)]
     Source(#[from] source::SourceError),
@@ -129,13 +132,32 @@ impl Engine<'_> {
         cancel: &Cancellation,
         progress: &mut (dyn FnMut(Stage) + Send),
     ) -> Result<PreparedRecap, EngineError> {
+        self.prepare_checkpointed(request, cancel, progress, None)
+            .await
+    }
+    async fn prepare_checkpointed(
+        &self,
+        request: &GenerateRequest,
+        cancel: &Cancellation,
+        progress: &mut (dyn FnMut(Stage) + Send),
+        journal: Option<&crate::generation::Journal>,
+    ) -> Result<PreparedRecap, EngineError> {
+        if let Some(journal) = journal
+            && let Some(grounded) = journal.read::<RecapDocument>("grounded.json")?
+        {
+            let visuals = restore_visuals(journal, &grounded, &self.options)?;
+            return self
+                .compose_prepared(request, grounded, visuals, cancel, progress, journal)
+                .await;
+        }
         crate::contracts::validate_id(&request.id)?;
         crate::contracts::validate_id(&request.source_id)?;
         if request.source_title.trim().is_empty() {
             return Err(EngineError::Invalid("empty source title"));
         }
         stage(cancel, progress, Stage::Acquisition)?;
-        let acquired = source::acquire(&request.input, &self.options.acquisition, cancel).await?;
+        let acquired =
+            acquire_checkpointed(request, &self.options.acquisition, cancel, journal).await?;
         stage(cancel, progress, Stage::Media)?;
         cancel.emit(crate::diagnostics::Event::Phase {
             phase: crate::diagnostics::Phase::Probe,
@@ -191,6 +213,43 @@ impl Engine<'_> {
             assets: visuals.assets.clone(),
             sections: vec![],
         };
+        if let Some(journal) = journal {
+            persist_visuals(journal, &grounded, &visuals, &self.options)?;
+            journal.write("grounded.json", &grounded)?;
+            self.compose_prepared(request, grounded, visuals, cancel, progress, journal)
+                .await
+        } else {
+            self.compose_without_checkpoint(request, grounded, visuals, cancel, progress)
+                .await
+        }
+    }
+    async fn compose_prepared(
+        &self,
+        request: &GenerateRequest,
+        grounded: RecapDocument,
+        visuals: VisualAssets,
+        cancel: &Cancellation,
+        progress: &mut (dyn FnMut(Stage) + Send),
+        journal: &crate::generation::Journal,
+    ) -> Result<PreparedRecap, EngineError> {
+        if let Some(document) = journal.read::<RecapDocument>("candidate.json")? {
+            document.validate()?;
+            return Ok(PreparedRecap { document, visuals });
+        }
+        let result = self
+            .compose_without_checkpoint(request, grounded, visuals, cancel, progress)
+            .await?;
+        journal.write("candidate.json", &result.document)?;
+        Ok(result)
+    }
+    async fn compose_without_checkpoint(
+        &self,
+        request: &GenerateRequest,
+        grounded: RecapDocument,
+        visuals: VisualAssets,
+        cancel: &Cancellation,
+        progress: &mut (dyn FnMut(Stage) + Send),
+    ) -> Result<PreparedRecap, EngineError> {
         let images = read_images(
             &grounded,
             |asset, limit| {
@@ -317,7 +376,57 @@ impl Engine<'_> {
         cancel: &Cancellation,
         progress: &mut (dyn FnMut(Stage) + Send),
     ) -> Result<RecapDocument, EngineError> {
-        let prepared = self.prepare(request, cancel, progress).await?;
+        self.generate_recoverable(request, cancel, progress, false)
+            .await
+    }
+    /// Continue an exact durable generation. Explicit approval is required to repeat unresolved calls.
+    /// # Errors
+    /// Rejects concurrent ownership, incompatible checkpoints, changed requests and unresolved effects.
+    pub async fn generate_recoverable(
+        &self,
+        request: &GenerateRequest,
+        cancel: &Cancellation,
+        progress: &mut (dyn FnMut(Stage) + Send),
+        retry_uncertain: bool,
+    ) -> Result<RecapDocument, EngineError> {
+        check_cancelled(cancel)?;
+        let preparation =
+            crate::generation::digest(&format!("recap-engine-v1:{:?}", self.options))?;
+        let journal = crate::generation::Journal::open(
+            self.store.generation_root(),
+            request,
+            self.executor.recovery_identity(),
+            preparation,
+            retry_uncertain,
+        )?;
+        if self
+            .store
+            .generation_root()
+            .join(format!("{}.json", request.id))
+            .exists()
+        {
+            let document = self.store.load(&request.id)?;
+            if journal.read::<RecapDocument>("candidate.json")?.as_ref() == Some(&document) {
+                journal.published(document.revision)?;
+                return Ok(document);
+            }
+            return Err(EngineError::Invalid(
+                "published document differs from generation candidate",
+            ));
+        }
+        journal.write("configuration.json", &self.options)?;
+        let executor = crate::generation::Executor {
+            inner: self.executor,
+            journal: &journal,
+        };
+        let engine = Engine {
+            executor: &executor,
+            store: self.store.clone(),
+            options: self.options.clone(),
+        };
+        let prepared = engine
+            .prepare_checkpointed(request, cancel, progress, Some(&journal))
+            .await?;
         stage(cancel, progress, Stage::Export)?;
         let _export = export::export_html(
             &prepared.document,
@@ -334,7 +443,12 @@ impl Engine<'_> {
             return Err(EngineError::Invalid("symlink store root"));
         }
         // create_dir, not create_dir_all: never reuse or overwrite another operation's assets.
-        fs::create_dir(&destination)?;
+        if !destination.exists() {
+            fs::create_dir(&destination)?;
+        }
+        if destination.symlink_metadata()?.file_type().is_symlink() {
+            return Err(EngineError::Invalid("unsafe asset destination"));
+        }
         for asset in &prepared.document.assets {
             check_cancelled(cancel)?;
             let from = source::owned_file(
@@ -343,18 +457,14 @@ impl Engine<'_> {
                 self.options.media.max_asset_bytes,
             )?;
             let target = destination.join(asset.path.as_str());
-            let mut input = fs::File::open(from)?;
-            let mut output = fs::OpenOptions::new()
-                .write(true)
-                .create_new(true)
-                .open(target)?;
-            std::io::copy(&mut input, &mut output)?;
-            output.sync_all()?;
+            copy_verified(&from, &target)?;
         }
         fs::File::open(&destination)?.sync_all()?;
         check_cancelled(cancel)?;
         self.store.save(&prepared.document, None)?;
         cancel.emit(crate::diagnostics::Event::Committed);
+        // Canonical publication remains successful even if the advisory marker fails.
+        let _ = journal.published(prepared.document.revision);
         progress(Stage::Complete);
         Ok(prepared.document)
     }
@@ -376,37 +486,121 @@ impl Engine<'_> {
     ) -> Result<RecapDocument, EngineError> {
         check_cancelled(cancel)?;
         let previous = self.store.load(id)?;
+        let request = GenerateRequest {
+            id: format!("{id}-r{}", previous.revision.saturating_add(1)),
+            source_id: id.into(),
+            source_title: "Recap refinement".into(),
+            input: SourceInput::Local(PathBuf::new()),
+            transcript: None,
+            intent,
+        };
+        self.refine_checkpointed(&request, previous, cancel, progress, false)
+            .await
+    }
+    /// Resume a creation or refinement from its saved immutable request.
+    /// # Errors
+    /// Rejects changed identities, corrupt state, revision conflicts and uncertain calls.
+    pub async fn resume_generation(
+        &self,
+        id: &str,
+        cancel: &Cancellation,
+        progress: &mut (dyn FnMut(Stage) + Send),
+        retry_uncertain: bool,
+    ) -> Result<RecapDocument, EngineError> {
+        let status = crate::generation::Journal::inspect(self.store.generation_root(), id)?;
+        if status.kind == crate::generation::Kind::Refine {
+            let previous = self.store.load(&status.request.source_id)?;
+            self.refine_checkpointed(&status.request, previous, cancel, progress, retry_uncertain)
+                .await
+        } else {
+            self.generate_recoverable(&status.request, cancel, progress, retry_uncertain)
+                .await
+        }
+    }
+    async fn refine_checkpointed(
+        &self,
+        request: &GenerateRequest,
+        current: RecapDocument,
+        cancel: &Cancellation,
+        progress: &mut (dyn FnMut(Stage) + Send),
+        retry_uncertain: bool,
+    ) -> Result<RecapDocument, EngineError> {
+        let preparation =
+            crate::generation::digest(&format!("recap-engine-v1:{:?}", self.options))?;
+        let journal = crate::generation::Journal::open_kind(
+            self.store.generation_root(),
+            request,
+            self.executor.recovery_identity(),
+            preparation,
+            retry_uncertain,
+            crate::generation::Kind::Refine,
+        )?;
+        journal.write("configuration.json", &self.options)?;
+        let previous = if let Some(previous) = journal.read::<RecapDocument>("previous.json")? {
+            previous
+        } else {
+            journal.write("previous.json", &current)?;
+            current.clone()
+        };
+        if let Some(candidate) = journal.read::<RecapDocument>("candidate.json")? {
+            if current == candidate {
+                return Ok(current);
+            }
+            if current != previous {
+                return Err(EngineError::Invalid("refinement base revision changed"));
+            }
+            return self.commit_refinement(candidate, &previous, cancel, progress, &journal);
+        }
+        if current != previous {
+            return Err(EngineError::Invalid("refinement base revision changed"));
+        }
         let images = read_images(
             &previous,
-            |asset, limit| Ok(self.store.read_asset(id, asset, limit)?),
+            |asset, limit| Ok(self.store.read_asset(&previous.id, asset, limit)?),
             self.options.composition.image_bytes,
         )?;
         stage(cancel, progress, Stage::Composition)?;
-        let mut composition_source = previous.clone();
-        composition_source.remove_generation_notes();
+        let mut grounded = previous.clone();
+        grounded.remove_generation_notes();
+        let executor = crate::generation::Executor {
+            inner: self.executor,
+            journal: &journal,
+        };
         let candidate = Composer {
-            executor: self.executor,
+            executor: &executor,
             limits: self.options.composition,
         }
         .compose_with_policy(
-            &composition_source,
+            &grounded,
             images,
-            intent,
-            Some(&composition_source),
+            request.intent.clone(),
+            Some(&grounded),
             &self.options.detailed,
             cancel,
         )
         .await?;
+        journal.write("candidate.json", &candidate)?;
+        self.commit_refinement(candidate, &previous, cancel, progress, &journal)
+    }
+    fn commit_refinement(
+        &self,
+        candidate: RecapDocument,
+        previous: &RecapDocument,
+        cancel: &Cancellation,
+        progress: &mut (dyn FnMut(Stage) + Send),
+        journal: &crate::generation::Journal,
+    ) -> Result<RecapDocument, EngineError> {
         candidate.validate()?;
         stage(cancel, progress, Stage::Export)?;
         let _export = export::export_html(
             &candidate,
-            &self.store.asset_directory(id)?,
+            &self.store.asset_directory(&previous.id)?,
             self.options.export,
         )?;
         stage(cancel, progress, Stage::Storage)?;
         self.store.save(&candidate, Some(previous.revision))?;
         cancel.emit(crate::diagnostics::Event::Committed);
+        let _ = journal.published(candidate.revision);
         progress(Stage::Complete);
         Ok(candidate)
     }
@@ -436,6 +630,146 @@ impl Engine<'_> {
 }
 
 /// Derive an explicit inspection envelope without broadening publication limits.
+#[derive(serde::Serialize, serde::Deserialize)]
+struct AcquiredCheckpoint {
+    captions: Vec<source::SubtitleCue>,
+    title: Option<String>,
+    checksum: String,
+}
+async fn acquire_checkpointed(
+    request: &GenerateRequest,
+    options: &AcquisitionOptions,
+    cancel: &Cancellation,
+    journal: Option<&crate::generation::Journal>,
+) -> Result<source::AcquiredSource, EngineError> {
+    let Some(journal) = journal else {
+        return Ok(source::acquire(&request.input, options, cancel).await?);
+    };
+    let video = journal.root().join("source-video");
+    if let Some(saved) = journal.read::<AcquiredCheckpoint>("acquired.json")? {
+        let video = source::owned_file(journal.root(), &video, options.max_video_bytes)?;
+        if checksum(&video)? != saved.checksum {
+            return Err(EngineError::Invalid("source checksum mismatch"));
+        }
+        return Ok(source::AcquiredSource {
+            video,
+            captions: saved.captions,
+            title: saved.title,
+            workspace: None,
+        });
+    }
+    let acquired = source::acquire(&request.input, options, cancel).await?;
+    copy_verified(&acquired.video, &video)?;
+    journal.write(
+        "acquired.json",
+        &AcquiredCheckpoint {
+            captions: acquired.captions.clone(),
+            title: acquired.title.clone(),
+            checksum: checksum(&video)?,
+        },
+    )?;
+    Ok(acquired)
+}
+fn checksum(path: &std::path::Path) -> Result<String, EngineError> {
+    use sha2::{Digest as _, Sha256};
+    let mut hash = Sha256::new();
+    let mut file = fs::File::open(path)?;
+    let mut buffer = vec![0_u8; 65536];
+    loop {
+        let count = file.read(&mut buffer)?;
+        if count == 0 {
+            break;
+        }
+        hash.update(&buffer[..count]);
+    }
+    Ok(hash
+        .finalize()
+        .iter()
+        .fold(String::new(), |mut text, byte| {
+            use std::fmt::Write as _;
+            write!(&mut text, "{byte:02x}").expect("writing to String");
+            text
+        }))
+}
+fn copy_verified(source: &std::path::Path, target: &std::path::Path) -> Result<(), EngineError> {
+    if target.symlink_metadata().is_ok() {
+        if target.symlink_metadata()?.file_type().is_symlink()
+            || checksum(source)? != checksum(target)?
+        {
+            return Err(EngineError::Invalid("conflicting generation asset"));
+        }
+        return Ok(());
+    }
+    let parent = target
+        .parent()
+        .ok_or(EngineError::Invalid("asset parent"))?;
+    fs::create_dir_all(parent)?;
+    if parent.symlink_metadata()?.file_type().is_symlink() {
+        return Err(EngineError::Invalid("symlink checkpoint asset parent"));
+    }
+    let mut staging = tempfile::NamedTempFile::new_in(parent)?;
+    std::io::copy(&mut fs::File::open(source)?, &mut staging)?;
+    staging.as_file().sync_all()?;
+    staging
+        .persist_noclobber(target)
+        .map_err(|error| error.error)?;
+    fs::File::open(parent)?.sync_all()?;
+    Ok(())
+}
+#[derive(serde::Serialize, serde::Deserialize)]
+struct AssetChecksums(std::collections::BTreeMap<String, String>);
+fn persist_visuals(
+    journal: &crate::generation::Journal,
+    document: &RecapDocument,
+    visuals: &VisualAssets,
+    options: &EngineOptions,
+) -> Result<(), EngineError> {
+    let mut hashes = std::collections::BTreeMap::new();
+    for asset in &document.assets {
+        let path = source::owned_file(
+            visuals.directory.path(),
+            &visuals.directory.path().join(asset.path.as_str()),
+            options.media.max_asset_bytes,
+        )?;
+        copy_verified(
+            &path,
+            &journal.root().join("assets").join(asset.path.as_str()),
+        )?;
+        hashes.insert(asset.id.clone(), checksum(&path)?);
+    }
+    journal.write("assets.json", &AssetChecksums(hashes))?;
+    Ok(())
+}
+fn restore_visuals(
+    journal: &crate::generation::Journal,
+    document: &RecapDocument,
+    options: &EngineOptions,
+) -> Result<VisualAssets, EngineError> {
+    document.validate()?;
+    let hashes: AssetChecksums = journal
+        .read("assets.json")?
+        .ok_or(EngineError::Invalid("missing asset checksums"))?;
+    let directory = tempfile::Builder::new()
+        .prefix("recap-resume-")
+        .tempdir_in(&options.acquisition.workspace)?;
+    let root = journal.root().join("assets");
+    for asset in &document.assets {
+        let path = source::owned_file(
+            &root,
+            &root.join(asset.path.as_str()),
+            options.media.max_asset_bytes,
+        )?;
+        if hashes.0.get(&asset.id) != Some(&checksum(&path)?) {
+            return Err(EngineError::Invalid("asset checksum mismatch"));
+        }
+        copy_verified(&path, &directory.path().join(asset.path.as_str()))?;
+    }
+    Ok(VisualAssets {
+        assets: document.assets.clone(),
+        directory,
+    })
+}
+
 fn inspection_limits(
     options: &EngineOptions,
 ) -> Result<(media::InspectionBudget, MediaBudget, bool), EngineError> {

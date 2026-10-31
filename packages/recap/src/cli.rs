@@ -42,6 +42,8 @@ enum Command {
     Tui(application::TuiOptions),
     /// Analyze a local video or `YouTube` URL, persist a recap, and export HTML.
     Create(Box<Create>),
+    /// Resume a saved generation without repeating completed calls.
+    Resume(Box<Resume>),
     /// Refine an existing recap without replacing it unless inference succeeds.
     Refine(Box<Refine>),
     /// Export a stored recap as one self-contained HTML file; no model needed.
@@ -50,6 +52,19 @@ enum Command {
     Inspect(Inspect),
     /// Check required media tools and optional configured model selection.
     Doctor(Doctor),
+}
+
+#[derive(Debug, Clone, Args)]
+pub struct Resume {
+    #[arg(value_parser=document_id)]
+    pub id: String,
+    /// Approve repeating unresolved calls; provider work or billing may have occurred.
+    #[arg(long)]
+    pub retry_uncertain: bool,
+    #[command(flatten)]
+    pub model: ModelOptions,
+    #[command(flatten)]
+    pub output: OutputOptions,
 }
 
 #[derive(Debug, Clone, Args)]
@@ -452,6 +467,17 @@ async fn run(arguments: Cli, cancel: &Cancellation) -> Result<(), CliError> {
                 report_export(&result);
             }
             Ok(())
+        }
+        Some(Command::Resume(value)) => {
+            let output = value.output.clone();
+            let outcome = application::execute(
+                &options,
+                application::Request::Resume(value),
+                cancel,
+                &mut progress,
+            )
+            .await?;
+            finish_generation(&store, outcome, &output)
         }
         Some(Command::Create(value)) => {
             if let Some(id) = &value.id {

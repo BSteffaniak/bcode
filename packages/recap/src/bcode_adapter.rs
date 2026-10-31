@@ -44,6 +44,7 @@ pub struct BcodeExecutor {
     failure: Mutex<Option<ModelFailure>>,
     selection: (String, String, Option<String>),
     observer: Option<Arc<dyn Observer>>,
+    recovery: Option<String>,
 }
 /// Allowlisted SDK failure category; never contains provider text or response content.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -186,6 +187,17 @@ impl BcodeExecutor {
         if options.max_output_tokens == 0 || options.timeout.is_zero() {
             return Err(ModelFailure::Configuration);
         }
+        let config_identity = if options.config_path.as_os_str().is_empty() {
+            // Discovery selection is verified below; no ambient credentials are persisted.
+            "discovered".into()
+        } else {
+            let bytes =
+                std::fs::read(&options.config_path).map_err(|_| ModelFailure::Configuration)?;
+            bcode_recap::generation::identity(&String::from_utf8_lossy(&bytes))
+        };
+        let recovery = Some(bcode_recap::generation::identity(&format!(
+            "recap-bcode-v1:{options:?}:{config_identity}"
+        )));
         let parameters = bcode_model::ModelParameters {
             max_output_tokens: Some(options.max_output_tokens),
             ..bcode_model::ModelParameters::default()
@@ -234,12 +246,18 @@ impl BcodeExecutor {
             parameters,
             timeout: options.timeout,
             failure: Mutex::new(None),
-            selection,
+            selection: selection.clone(),
             observer: None,
+            recovery: recovery
+                .map(|key| bcode_recap::generation::identity(&format!("{key}:{selection:?}"))),
         })
     }
 }
 impl ModelExecutor for BcodeExecutor {
+    fn recovery_identity(&self) -> Option<String> {
+        self.recovery.clone()
+    }
+
     fn execute<'a>(
         &'a self,
         request: ModelRequest,
@@ -352,6 +370,12 @@ impl BcodeExecutor {
             // The configured Recap SDK uses default runtime settings. Auth/selection,
             // agent permission policy and request cancellation remain on this builder.
             .runtime(bcode::AgentRuntime::default())
+            .retry_policy(
+                bcode::RetryPolicy::new(3, Duration::from_secs(1))
+                    .with_max_delay(Duration::from_secs(30))
+                    .with_jitter_millis(250)
+                    .normalized_only(),
+            )
             .system(request.instructions)
             .parameters(self.parameters.clone())
             .timeout(self.timeout)
@@ -604,6 +628,7 @@ mod tests {
             failure: Mutex::new(None),
             selection: ("test".into(), "test".into(), None),
             observer: None,
+            recovery: Some("test".into()),
         });
         let cancellation = Cancellation::default();
         let mut calls = tokio::task::JoinSet::new();

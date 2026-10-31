@@ -9,6 +9,7 @@ pub mod detailed;
 pub mod diagnostics;
 pub mod engine;
 pub mod export;
+pub mod generation;
 pub mod media;
 pub mod model;
 pub mod passage;

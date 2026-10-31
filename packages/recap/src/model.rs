@@ -11,7 +11,7 @@ use crate::{contracts::Section, process::Cancellation};
 pub use crate::analysis_contracts::{AnalysisRequest, AnalysisResponse, AnalysisStage};
 
 /// An in-memory source image, with identity matching the document asset registry.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct ImageAsset {
     /// Registered asset identity.
     pub asset_id: String,
@@ -23,7 +23,7 @@ pub struct ImageAsset {
 
 /// Normalized multimodal request. The adapter must preserve the separation between
 /// trusted instructions and untrusted source text/images.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub struct ModelRequest {
     /// Trusted composition policy, not source content.
     pub instructions: String,
@@ -178,6 +178,14 @@ pub enum ModelError {
     /// Response is malformed, oversized, or unsupported.
     #[error("invalid structured recap model response")]
     InvalidResponse,
+    /// Durable call state is unresolved; caller must explicitly approve another invocation.
+    #[error(
+        "generation paused: unresolved model call; resume with explicit uncertain-call approval"
+    )]
+    RecoveryRequired,
+    /// A checkpoint could not be committed; provider effects may have occurred.
+    #[error("generation checkpoint failed; completed provider work may need reconciliation")]
+    Checkpoint,
 }
 
 /// Object-safe execution future used without an async-trait dependency.
@@ -193,6 +201,12 @@ pub type AnalysisFuture<'a> =
 /// Implementations must honor cancellation while awaiting the model, bound response
 /// bytes before decoding, and return actual structured model output or an error.
 pub trait ModelExecutor: Send + Sync {
+    /// Stable replay namespace, including normalized model selection and adapter semantics.
+    /// None refuses durable reuse across executions; credentials must never be included.
+    fn recovery_identity(&self) -> Option<String> {
+        None
+    }
+
     /// Execute one normalized text-plus-images request.
     fn execute<'a>(
         &'a self,

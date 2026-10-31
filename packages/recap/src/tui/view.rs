@@ -313,6 +313,12 @@ impl App {
                 ))
                 .child(self.button("settings", "Settings", 67)),
         );
+        form = form.child(self.button("resume", "Resume saved generation", 70));
+        if let Some(id) = &self.resume_id {
+            form = form.child(Self::label(format!("Saved generation · {id}"), p.quiet()));
+            form = form.child(Self::label("Unresolved calls require explicit retry approval; they may have incurred AI usage.",p.text()))
+                .child(self.button("retry-uncertain", "Approve retry of unresolved calls", 71));
+        }
         form = form.child(self.button(
             "depth",
             match self.depth {

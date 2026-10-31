@@ -77,6 +77,13 @@ impl HostExecutor {
     }
 }
 impl ModelExecutor for HostExecutor {
+    fn recovery_identity(&self) -> Option<String> {
+        let identity: wire::RecoveryIdentity = self
+            .call(wire::OP_RECOVERY_IDENTITY, serde_json::json!({}))
+            .ok()?;
+        (identity.version == 1 && !identity.identity.is_empty()).then_some(identity.identity)
+    }
+
     fn execute<'a>(&'a self, request: ModelRequest, cancel: &'a Cancellation) -> ModelFuture<'a> {
         Box::pin(async move {
             let max_bytes = request.max_response_bytes;

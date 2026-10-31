@@ -190,6 +190,7 @@ impl TuiOptions {
 /// A single operation, run directly against the same embedded engine as the CLI.
 #[derive(Debug)]
 pub enum Request {
+    Resume(Box<crate::cli::Resume>),
     CheckSource {
         source: String,
         tools: crate::cli::Tools,
@@ -302,7 +303,8 @@ pub struct CatalogEntry {
 
 const fn reportable(request: &Request) -> bool {
     match request {
-        Request::Create(_)
+        Request::Resume(_)
+        | Request::Create(_)
         | Request::Refine(_)
         | Request::Export { .. }
         | Request::CheckSource { .. } => true,
@@ -496,6 +498,10 @@ async fn execute_inner(
             let output = value.output.clone();
             (Request::Refine(value), Some(output))
         }
+        Request::Resume(value) => {
+            let output = value.output.clone();
+            (Request::Resume(value), Some(output))
+        }
         Request::Create(value) => {
             let output = value.output.clone();
             (Request::Create(value), Some(output))
@@ -578,6 +584,7 @@ async fn execute_job(
         Request::CreateAndExport(_) | Request::RefineAndExport(_) | Request::ExportCopy { .. } => {
             unreachable!("export jobs normalized")
         }
+        Request::Resume(value) => resume_job(*value, store, cancel, progress).await,
         Request::Create(value) => create_job(*value, store, cancel, progress).await,
         Request::Refine(value) => {
             crate::cli::document_id(&value.id).map_err(Error::Action)?;
@@ -659,6 +666,35 @@ async fn execute_job(
         }
     }
 }
+async fn resume_job(
+    value: crate::cli::Resume,
+    store: &DocumentStore,
+    cancel: &Cancellation,
+    progress: &mut (impl FnMut(Stage) + Send),
+) -> Result<Outcome, Error> {
+    let root = store.generation_root();
+    let configuration = bcode_recap::generation::Journal::configuration(root, &value.id)
+        .map_err(|error| Error::Action(error.to_string()))?;
+    progress(Stage::ModelReadiness);
+    let executor = observed_model(&value.model, cancel).await?;
+    executor.observe_selection(cancel);
+    let engine = Engine {
+        executor: &executor,
+        store: store.clone(),
+        options: configuration,
+    };
+    let document = engine
+        .resume_generation(
+            &value.id,
+            cancel,
+            &mut |stage| progress(stage.into()),
+            value.retry_uncertain,
+        )
+        .await?;
+    drop(executor);
+    Ok(Outcome::Document(Box::new(document)))
+}
+
 async fn create_job(
     value: Create,
     store: &DocumentStore,
@@ -833,7 +869,7 @@ pub enum Error {
         report: Box<bcode_recap::diagnostics::Report>,
         source: Option<Box<Self>>,
     },
-    #[error("model operation failed ({code}); no automatic retry was performed", code = .0.code())]
+    #[error("model operation failed ({code}); generation progress is retained", code = .0.code())]
     ModelExecution(crate::bcode_adapter::ModelFailure),
     #[error("output {} already exists; choose another export destination or use --output FILE / --force in the CLI", .0.display())]
     OutputExists(PathBuf),
@@ -1358,6 +1394,10 @@ struct ProgressExecutor<'a, F> {
 }
 
 impl<F: FnMut(Stage) + Send> ModelExecutor for ProgressExecutor<'_, F> {
+    fn recovery_identity(&self) -> Option<String> {
+        self.executor.recovery_identity()
+    }
+
     fn execute<'a>(
         &'a self,
         request: bcode_recap::model::ModelRequest,
@@ -1391,6 +1431,16 @@ impl<F: FnMut(Stage) + Send> ModelExecutor for ProgressExecutor<'_, F> {
         }
         self.executor.execute_analysis(request, cancellation)
     }
+}
+
+pub fn new_generation_id() -> Result<String, Error> {
+    let directory = tempfile::Builder::new().prefix("recap-").tempdir()?;
+    Ok(directory
+        .path()
+        .file_name()
+        .ok_or_else(|| Error::Action("generation identity unavailable".into()))?
+        .to_string_lossy()
+        .into_owned())
 }
 
 pub async fn create(
@@ -1435,7 +1485,7 @@ pub async fn create(
     };
     let engine = Engine {
         executor: &executor,
-        store,
+        store: store.clone(),
         options: configuration,
     };
     let title = match &input {
@@ -1457,6 +1507,10 @@ pub async fn create(
             depth: options.depth,
         },
     };
+    eprintln!(
+        "Generation {} · resume with: recap resume {}",
+        request.id, request.id
+    );
     let document = engine
         .generate(&request, cancel, &mut |stage| {
             progress
@@ -1484,7 +1538,7 @@ pub async fn refine(
     };
     let engine = Engine {
         executor: &executor,
-        store,
+        store: store.clone(),
         options: configuration,
     };
     let mut intent = previous.intent;

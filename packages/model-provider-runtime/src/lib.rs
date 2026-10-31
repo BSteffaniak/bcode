@@ -7,6 +7,58 @@
 pub mod diagnostics;
 pub use diagnostics::ProviderDiagnostics;
 
+/// Shared recovery decision for a normalized provider failure before output commitment.
+/// Caller must prove no partial output/tool effects and relinquished provider ownership.
+#[must_use]
+pub fn normalized_retry_delay(
+    error: &bcode_model::ProviderError,
+    attempt: u32,
+    max_retries: u32,
+    base: std::time::Duration,
+    max_delay: std::time::Duration,
+    now: std::time::SystemTime,
+) -> Option<std::time::Duration> {
+    use bcode_model::ProviderErrorCategory as Category;
+    if attempt == 0
+        || attempt > max_retries
+        || !error.retryable
+        || !matches!(
+            error.category,
+            Category::RateLimit
+                | Category::Network
+                | Category::Timeout
+                | Category::ProviderInternal
+                | Category::Overloaded
+        )
+    {
+        return None;
+    }
+    let backoff = base
+        .checked_mul(1_u32 << attempt.saturating_sub(1).min(31))
+        .unwrap_or(max_delay)
+        .min(max_delay);
+    let hinted = error
+        .retry
+        .as_deref()
+        .map_or(std::time::Duration::ZERO, |hint| {
+            let relative = hint.retry_after_ms.map(std::time::Duration::from_millis);
+            let absolute = hint.retry_at_unix.map(|time| {
+                std::time::UNIX_EPOCH
+                    .checked_add(std::time::Duration::from_secs(time))
+                    .and_then(|instant| instant.duration_since(now).ok())
+                    .unwrap_or(std::time::Duration::ZERO)
+            });
+            relative
+                .into_iter()
+                .chain(absolute)
+                .max()
+                .unwrap_or(std::time::Duration::ZERO)
+        });
+    // Never retry earlier than a provider's hint, or sleep beyond admitted policy.
+    let delay = backoff.max(hinted);
+    (delay <= max_delay).then_some(delay)
+}
+
 mod usage_receiver;
 pub use usage_receiver::receive_original_usage;
 
@@ -2364,5 +2416,51 @@ mod output_position_tests {
             next.positioned_output().map(|(position, _)| position.get()),
             Some(8)
         );
+    }
+}
+
+#[cfg(test)]
+mod recovery_policy_tests {
+    use super::*;
+    use std::time::{Duration, SystemTime};
+    #[test]
+    fn normalized_recovery_is_bounded_and_respects_retry_hints_and_terminal_categories() {
+        let mut error = bcode_model::ProviderError {
+            code: "offline".into(),
+            category: bcode_model::ProviderErrorCategory::RateLimit,
+            message: "test".into(),
+            retryable: true,
+            provider_message: None,
+            failure: None,
+            request_id: None,
+            diagnostic_context: Box::default(),
+            retry: None,
+            sources: Box::default(),
+        };
+        let delay = |error: &bcode_model::ProviderError, attempt| {
+            normalized_retry_delay(
+                error,
+                attempt,
+                3,
+                Duration::from_secs(1),
+                Duration::from_secs(30),
+                SystemTime::UNIX_EPOCH,
+            )
+        };
+        assert_eq!(delay(&error, 1), Some(Duration::from_secs(1)));
+        assert_eq!(delay(&error, 3), Some(Duration::from_secs(4)));
+        assert_eq!(delay(&error, 4), None);
+        error.retry = Some(Box::new(bcode_model::ProviderRetryHint {
+            retry_after_ms: Some(60_000),
+            retry_at_unix: None,
+            ..Default::default()
+        }));
+        assert_eq!(delay(&error, 1), None);
+        error.retry = None;
+        error.retryable = false;
+        assert_eq!(delay(&error, 1), None);
+        error.retryable = true;
+        error.category = bcode_model::ProviderErrorCategory::Auth;
+        assert_eq!(delay(&error, 1), None);
     }
 }

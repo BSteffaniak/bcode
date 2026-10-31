@@ -34,6 +34,10 @@ struct DeterministicModel {
 }
 
 impl ModelExecutor for DeterministicModel {
+    fn recovery_identity(&self) -> Option<String> {
+        Some("offline-deterministic-v1".into())
+    }
+
     fn execute<'a>(
         &'a self,
         request: ModelRequest,
@@ -684,23 +688,177 @@ async fn cancelled_and_stale_refinement_preserve_authoritative_revision() {
     };
     let mut stages = Vec::new();
     let result = racing_engine
-        .refine(
-            &initial.id,
-            GenerationIntent::default(),
+        .resume_generation(
+            "acceptance-r2",
             &Cancellation::default(),
-            &mut |stage| stages.push(stage),
+            &mut |stage| {
+                stages.push(stage);
+                if stage == Stage::Storage {
+                    let mut winner = initial.clone();
+                    winner.revision += 1;
+                    winner.title = "Concurrent winner".into();
+                    store.save(&winner, Some(initial.revision)).unwrap();
+                }
+            },
+            true,
         )
         .await;
-    assert!(matches!(
-        result,
-        Err(EngineError::Contract(Error::RevisionConflict {
-            expected: Some(1),
-            actual: Some(2)
-        }))
-    ));
+    assert!(
+        matches!(
+            result,
+            Err(EngineError::Contract(Error::RevisionConflict {
+                expected: Some(1),
+                actual: Some(2)
+            }))
+        ),
+        "{result:?}"
+    );
     assert!(!stages.contains(&Stage::Complete));
     let winner = store.load(&initial.id).unwrap();
     assert_eq!(winner.revision, 2);
     assert_eq!(winner.title, "Concurrent winner");
     assert_eq!(winner.assets, initial.assets);
+}
+
+#[tokio::test]
+async fn generation_survives_process_reopen_without_source_or_repeated_completed_calls() {
+    let root = tempfile::tempdir().unwrap();
+    let path = video(root.path()).await;
+    let request = request(path.clone());
+    let model = DeterministicModel::default();
+    let store = DocumentStore::new(root.path().join("store"), 8 * 1024 * 1024);
+    let engine = Engine {
+        executor: &model,
+        store: store.clone(),
+        options: options(root.path()),
+    };
+    let cancel = Cancellation::default();
+    let first = engine
+        .generate(&request, &cancel, &mut |stage| {
+            if stage == Stage::Storage {
+                cancel.cancel();
+            }
+        })
+        .await;
+    assert!(matches!(first, Err(EngineError::Cancelled)));
+    assert!(store.load(&request.id).is_err());
+    assert_eq!(model.calls.load(Ordering::SeqCst), 1);
+    drop(engine);
+    fs::remove_file(&path).unwrap();
+    let mut configuration = options(root.path());
+    // Same immutable policy, recreated in a fresh engine; media executables would
+    // fail if invoked with the now-missing source. Grounded assets are restored.
+    configuration.acquisition.workspace = root.path().into();
+    let engine = Engine {
+        executor: &model,
+        store: store.clone(),
+        options: configuration,
+    };
+    let result = engine
+        .generate(&request, &Cancellation::default(), &mut |_| {})
+        .await
+        .unwrap();
+    assert_eq!(model.calls.load(Ordering::SeqCst), 1);
+    assert_eq!(store.load(&request.id).unwrap(), result);
+    let again = engine
+        .generate(&request, &Cancellation::default(), &mut |_| {})
+        .await
+        .unwrap();
+    assert_eq!(again, result);
+    assert_eq!(model.calls.load(Ordering::SeqCst), 1);
+    assert!(
+        !engine
+            .export(&request.id, &Cancellation::default(), &mut |_| {})
+            .unwrap()
+            .html
+            .is_empty()
+    );
+}
+
+// The subprocess is deliberately stopped without running destructors. The parent
+// owns the temporary directory and always reaps the child before asserting.
+#[tokio::test]
+async fn crash_restart_reuses_completed_work_without_original_source() {
+    const CHILD_ROOT: &str = "RECAP_CRASH_ACCEPTANCE_ROOT";
+    if let Some(root) = std::env::var_os(CHILD_ROOT) {
+        let root = std::path::PathBuf::from(root);
+        let request = request(video(&root).await);
+        fs::write(
+            root.join("request.json"),
+            serde_json::to_vec(&request).unwrap(),
+        )
+        .unwrap();
+        let model = DeterministicModel::default();
+        let engine = Engine {
+            executor: &model,
+            store: DocumentStore::new(root.join("store"), 8 * 1024 * 1024),
+            options: options(&root),
+        };
+        engine
+            .generate(&request, &Cancellation::default(), &mut |stage| {
+                if stage == Stage::Storage {
+                    assert_eq!(model.calls.load(Ordering::SeqCst), 1);
+                    fs::write(root.join("ready"), b"completed model and media").unwrap();
+                    loop {
+                        std::thread::park();
+                    }
+                }
+            })
+            .await
+            .unwrap();
+        panic!("child must be killed before publication");
+    }
+    let root = tempfile::tempdir().unwrap();
+    let mut child = std::process::Command::new(std::env::current_exe().unwrap())
+        .args([
+            "--exact",
+            "crash_restart_reuses_completed_work_without_original_source",
+            "--nocapture",
+        ])
+        .env(CHILD_ROOT, root.path())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .unwrap();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+    while !root.path().join("ready").exists() && std::time::Instant::now() < deadline {
+        if child.try_wait().unwrap().is_some() {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+    let ready = root.path().join("ready").exists();
+    let _ = child.kill();
+    child.wait().unwrap();
+    assert!(
+        ready,
+        "child did not reach durable pre-publication boundary"
+    );
+    let request: GenerateRequest =
+        serde_json::from_slice(&fs::read(root.path().join("request.json")).unwrap()).unwrap();
+    let SourceInput::Local(source) = &request.input else {
+        panic!("expected local fixture")
+    };
+    fs::remove_file(source).unwrap();
+    let model = DeterministicModel::default();
+    let store = DocumentStore::new(root.path().join("store"), 8 * 1024 * 1024);
+    assert!(store.load(&request.id).is_err());
+    let engine = Engine {
+        executor: &model,
+        store: store.clone(),
+        options: options(root.path()),
+    };
+    let result = engine
+        .resume_generation(&request.id, &Cancellation::default(), &mut |_| {}, false)
+        .await
+        .unwrap();
+    assert_eq!(model.calls.load(Ordering::SeqCst), 0);
+    assert_eq!(store.load(&request.id).unwrap(), result);
+    assert!(
+        !engine
+            .export(&request.id, &Cancellation::default(), &mut |_| {})
+            .unwrap()
+            .html
+            .is_empty()
+    );
 }

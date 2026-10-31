@@ -78,14 +78,22 @@ pub fn validate(
     if !valid_id(args.get("id").ok_or("id is required")?) {
         return Err("invalid recap identity".into());
     }
-    if args
-        .keys()
-        .any(|key| !matches!(key.as_str(), "id" | "source" | "focus" | "transcript"))
-    {
+    if args.keys().any(|key| {
+        !matches!(
+            key.as_str(),
+            "id" | "source" | "focus" | "transcript" | "retry_uncertain"
+        )
+    }) {
         return Err("unknown recap argument".into());
     }
     if operation == "recap.create" {
         let _ = source(args, root)?;
+    }
+    if args
+        .get("retry_uncertain")
+        .is_some_and(|value| value != "true" && value != "false")
+    {
+        return Err("invalid uncertain-call approval".into());
     }
     if operation == "recap.refine"
         && args
@@ -143,6 +151,16 @@ pub fn policy_operations(
         ],
     }];
     match operation {
+        "recap.resume" => {
+            facts.push(Operation::Read {
+                paths: vec![store.join("generations").join(id).display().to_string()],
+            });
+            facts.push(Operation::Write {
+                paths: vec![store.display().to_string()],
+                category: "write".into(),
+            });
+            facts.push(Operation::Mutating);
+        }
         "recap.refine" => {
             facts.push(Operation::Write {
                 paths: vec![
@@ -188,7 +206,7 @@ pub fn run(
         invocation_id: invocation.into(),
         cancellation: context.cancellation.clone(),
     };
-    if matches!(operation, "recap.create" | "recap.refine") {
+    if matches!(operation, "recap.create" | "recap.refine" | "recap.resume") {
         executor.check_admission().map_err(
             |_| "recap model-host admission required; no media or store writes performed",
         )?;
@@ -297,6 +315,27 @@ fn run_engine(
                     };
                     let document = engine
                         .generate(&request, cancel, &mut progress)
+                        .await
+                        .map_err(super::diagnostics::engine)?;
+                    serde_json::to_string(&document).map_err(|_| "recap encoding failed".into())
+                }
+                "recap.resume" => {
+                    let options =
+                        bcode_recap::generation::Journal::configuration(Path::new(store_root), id)
+                            .map_err(|error| error.to_string())?;
+                    let resumed = Engine {
+                        executor: engine.executor,
+                        store: engine.store.clone(),
+                        options,
+                    };
+                    let document = resumed
+                        .resume_generation(
+                            id,
+                            cancel,
+                            &mut progress,
+                            args.get("retry_uncertain")
+                                .is_some_and(|value| value == "true"),
+                        )
                         .await
                         .map_err(super::diagnostics::engine)?;
                     serde_json::to_string(&document).map_err(|_| "recap encoding failed".into())

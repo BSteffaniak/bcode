@@ -6,7 +6,7 @@ use std::{
 };
 
 /// Input accepted by the source adapter.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub enum SourceInput {
     /// Existing local video.
     Local(PathBuf),
@@ -14,7 +14,7 @@ pub enum SourceInput {
     Youtube(String),
 }
 /// A timestamped transcript segment in seconds.
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct SubtitleCue {
     /// Inclusive source start.
     pub start_seconds: f64,
@@ -24,7 +24,7 @@ pub struct SubtitleCue {
     pub text: String,
 }
 /// Explicit acquisition budgets and downloader selection.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub struct AcquisitionOptions {
     /// Executable supplied by caller; never installed automatically.
     pub yt_dlp: PathBuf,
@@ -675,7 +675,7 @@ pub fn deduplicate_rolling_captions(
 
 /// Explicit argument-vector transcription command. The canonical input video path is
 /// appended to `args`; the command must emit timestamped VTT/SRT on standard output.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub struct TranscriptionCommand {
     /// Caller-approved executable; never installed or resolved through a shell.
     pub program: PathBuf,

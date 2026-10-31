@@ -10,7 +10,7 @@ use std::{
 };
 
 /// Local media executables, selected explicitly by the application.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub struct MediaTools {
     /// ffmpeg executable.
     pub ffmpeg: PathBuf,
@@ -38,7 +38,7 @@ pub struct VideoMetadata {
     pub has_audio: bool,
 }
 /// Practical extraction limits, independent of source length.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub struct MediaBudget {
     /// Maximum requested still frames.
     pub max_frames: usize,
@@ -380,7 +380,7 @@ pub struct VisualCandidate {
     pub reason: CandidateReason,
 }
 /// Explicit Detailed inspection budgets; Standard media defaults are unchanged.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub struct InspectionBudget {
     /// Maximum merged candidates, no more than 128.
     pub max_candidates: usize,

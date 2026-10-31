@@ -515,6 +515,7 @@ pub struct RetryPolicy {
     base_delay: Duration,
     max_delay: Duration,
     jitter_millis: u64,
+    normalized_only: bool,
 }
 
 impl RetryPolicy {
@@ -526,7 +527,15 @@ impl RetryPolicy {
             base_delay: delay,
             max_delay: delay,
             jitter_millis: 0,
+            normalized_only: false,
         }
+    }
+
+    /// Require a normalized retryable provider failure; opaque invocation failures stay terminal.
+    #[must_use]
+    pub const fn normalized_only(mut self) -> Self {
+        self.normalized_only = true;
+        self
     }
 
     /// Configure exponential backoff capped at `max_delay`.
@@ -646,6 +655,29 @@ impl ProviderRoundPlanner for RetryPolicy {
                     request: context.proposed_request.clone(),
                 });
             };
+            if self.normalized_only {
+                let delay = match failure {
+                    RuntimeError::Provider { error, .. } => {
+                        bcode_model_provider_runtime::normalized_retry_delay(
+                            error,
+                            context.attempt,
+                            self.max_retries,
+                            self.base_delay,
+                            self.max_delay,
+                            std::time::SystemTime::now(),
+                        )
+                    }
+                    _ => None,
+                };
+                return Ok(
+                    delay.map_or(ProviderRoundPlan::Fail { error: None }, |delay| {
+                        ProviderRoundPlan::RetryAfter {
+                            request: context.proposed_request.clone(),
+                            delay,
+                        }
+                    }),
+                );
+            }
             let retryable = retryable_provider_failure(failure);
             Ok(if retryable && context.attempt <= self.max_retries {
                 ProviderRoundPlan::RetryAfter {

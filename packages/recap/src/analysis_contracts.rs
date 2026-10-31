@@ -37,7 +37,7 @@ pub enum AnalysisStage {
 
 /// Provider-neutral stage request. Adapters must put instructions in a trusted
 /// instruction channel and input/images in a separate untrusted source channel.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub struct AnalysisRequest {
     /// Selects exactly one result schema.
     pub stage: AnalysisStage,
@@ -432,7 +432,7 @@ impl CoverageReport {
 
 /// Stage-specific typed result. Wire responses are the inner object only, selected
 /// by the request stage; adapters must never guess the stage from returned content.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum AnalysisResponse {
     /// Window information inventory.
     ExtractionInventory(ExtractionInventory),

@@ -19,7 +19,7 @@ const CSS: &str = include_str!("export_assets/recap.css");
 const JS: &str = include_str!("export_assets/recap.js");
 
 /// Explicit limits for reads and the resulting embedded media (including base64 overhead).
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, serde::Serialize, serde::Deserialize)]
 pub struct ExportBudget {
     /// Maximum raw bytes read from any one asset.
     pub max_asset_bytes: u64,

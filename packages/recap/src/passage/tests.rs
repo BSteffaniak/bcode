@@ -652,3 +652,50 @@ async fn long_source_completes_all_audits_past_old_call_and_window_ceilings() {
     );
     result.validate().unwrap();
 }
+
+#[test]
+fn oversized_review_partition_preserves_every_source_and_target_without_splitting_blocks() {
+    let (_, unit, passage) = fixture();
+    let input = serde_json::json!({"source_unit":unit,"passage":passage,"neighboring_passages_context_only":[passage.clone(),passage],"neighboring_source_units_context_only":[unit.clone(),unit]});
+    let mut pending = vec![input.clone()];
+    let mut leaves = vec![];
+    while let Some(value) = pending.pop() {
+        if let Some((a, b)) = super::split_review(&value) {
+            pending.push(a);
+            pending.push(b);
+        } else {
+            leaves.push(value);
+        }
+    }
+    assert_eq!(leaves.len(), 8);
+    for value in &leaves {
+        assert_eq!(value["source_unit"], input["source_unit"]);
+        assert_eq!(
+            value["neighboring_source_units_context_only"],
+            input["neighboring_source_units_context_only"]
+        );
+        assert_eq!(value["passage"]["blocks"].as_array().unwrap().len(), 1);
+        assert_eq!(
+            value["neighboring_passages_context_only"][0]["blocks"]
+                .as_array()
+                .unwrap()
+                .len(),
+            1
+        );
+    }
+    for target in input["passage"]["blocks"].as_array().unwrap() {
+        for neighbor in input["neighboring_passages_context_only"]
+            .as_array()
+            .unwrap()
+        {
+            for block in neighbor["blocks"].as_array().unwrap() {
+                assert!(
+                    leaves
+                        .iter()
+                        .any(|leaf| leaf["passage"]["blocks"][0] == *target
+                            && leaf["neighboring_passages_context_only"][0]["blocks"][0] == *block)
+                );
+            }
+        }
+    }
+}
