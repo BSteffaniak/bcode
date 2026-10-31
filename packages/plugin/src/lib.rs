@@ -3,6 +3,7 @@
 #![allow(clippy::multiple_crate_versions)]
 #![deny(unsafe_op_in_unsafe_fn)]
 
+#[cfg(feature = "bmux-host")]
 mod bmux_host_adapter;
 mod diagnostics;
 pub mod interaction_controller;
@@ -135,6 +136,7 @@ fn validate_auth_plugin_id(plugin_id: &str) -> Result<(), AuthProviderRegistryEr
         Ok(())
     }
 }
+#[cfg(feature = "bmux-host")]
 pub use bmux_host_adapter::{
     BcodeHostCapabilityMap, BcodePluginRuntimeMode, BmuxHostPluginAdapter,
 };

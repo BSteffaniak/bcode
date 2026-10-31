@@ -7,7 +7,7 @@ use bcode_recap::{
     model::{ModelError, ModelExecutor, ModelFuture, ModelRequest, ModelResponse},
     process::Cancellation,
 };
-use std::time::Duration;
+use std::{sync::Mutex, time::Duration};
 
 /// Explicit standalone configuration; no ambient selection substitution.
 #[derive(Clone, Debug)]
@@ -28,8 +28,130 @@ pub struct BcodeExecutor {
     sdk: Bcode,
     parameters: bcode_model::ModelParameters,
     timeout: Duration,
+    failure: Mutex<Option<ModelFailure>>,
+}
+/// Allowlisted SDK failure category; never contains provider text or response content.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ModelFailure {
+    Timeout,
+    Cancelled,
+    ProviderInvocation,
+    ProviderAuth,
+    ProviderNetwork,
+    ProviderInvalidRequest,
+    ProviderContextLength,
+    ProviderModelNotFound,
+    ProviderUnsupported,
+    ProviderInternal,
+    ProviderOverloaded,
+    ProviderExecutionUnverified,
+    ProviderAfterOutput,
+    RateLimited,
+    Configuration,
+    StructuredJson,
+    StructuredSchema,
+    StructuredDecode,
+    StructuredRepair,
+    Runtime,
+    Sdk,
+}
+impl ModelFailure {
+    /// Stable public diagnostic code, independent of raw SDK display/debug output.
+    #[must_use]
+    pub const fn code(self) -> &'static str {
+        match self {
+            Self::Timeout => "model_timeout",
+            Self::Cancelled => "model_cancelled",
+            Self::ProviderInvocation => "provider_invocation",
+            Self::ProviderAuth => "provider_auth",
+            Self::ProviderNetwork => "provider_network",
+            Self::ProviderInvalidRequest => "provider_invalid_request",
+            Self::ProviderContextLength => "provider_context_length",
+            Self::ProviderModelNotFound => "provider_model_not_found",
+            Self::ProviderUnsupported => "provider_unsupported_feature",
+            Self::ProviderInternal => "provider_internal",
+            Self::ProviderOverloaded => "provider_overloaded",
+            Self::ProviderExecutionUnverified => "provider_execution_unverified",
+            Self::ProviderAfterOutput => "provider_after_output",
+            Self::RateLimited => "rate_limited",
+            Self::Configuration => "model_configuration",
+            Self::StructuredJson => "structured_json",
+            Self::StructuredSchema => "structured_schema",
+            Self::StructuredDecode => "structured_decode",
+            Self::StructuredRepair => "structured_repair_exhausted",
+            Self::Runtime => "model_runtime",
+            Self::Sdk => "model_sdk",
+        }
+    }
+    const fn classify(error: &bcode::BcodeError) -> Self {
+        use bcode::{BcodeError, RuntimeError};
+        match error {
+            BcodeError::Runtime(error) => match error {
+                RuntimeError::Timeout { .. } => Self::Timeout,
+                RuntimeError::Cancelled => Self::Cancelled,
+                RuntimeError::ProviderInvocation(_) => Self::ProviderInvocation,
+                RuntimeError::Provider { error, .. } => {
+                    use bcode_model::ProviderErrorCategory;
+                    match error.category {
+                        ProviderErrorCategory::Config => Self::Configuration,
+                        ProviderErrorCategory::Auth => Self::ProviderAuth,
+                        ProviderErrorCategory::RateLimit => Self::RateLimited,
+                        ProviderErrorCategory::Network => Self::ProviderNetwork,
+                        ProviderErrorCategory::Timeout => Self::Timeout,
+                        ProviderErrorCategory::ModelNotFound => Self::ProviderModelNotFound,
+                        ProviderErrorCategory::ContextLength => Self::ProviderContextLength,
+                        ProviderErrorCategory::InvalidRequest => Self::ProviderInvalidRequest,
+                        ProviderErrorCategory::UnsupportedFeature => Self::ProviderUnsupported,
+                        ProviderErrorCategory::ProviderInternal => Self::ProviderInternal,
+                        ProviderErrorCategory::Overloaded => Self::ProviderOverloaded,
+                        ProviderErrorCategory::Cancelled => Self::Cancelled,
+                    }
+                }
+                RuntimeError::ProviderExecutionUnverified(_) => Self::ProviderExecutionUnverified,
+                RuntimeError::ProviderAfterOutput(_) => Self::ProviderAfterOutput,
+                _ => Self::Runtime,
+            },
+            BcodeError::MissingProvider
+            | BcodeError::MissingPluginRuntime
+            | BcodeError::ProviderConfiguration(_)
+            | BcodeError::Config(_)
+            | BcodeError::Plugin(_) => Self::Configuration,
+            BcodeError::RateLimited { .. } => Self::RateLimited,
+            BcodeError::StructuredInvalidJson(_) => Self::StructuredJson,
+            BcodeError::StructuredInvalidSchema(_) | BcodeError::StructuredSchemaValidation(_) => {
+                Self::StructuredSchema
+            }
+            BcodeError::StructuredDecode(_) => Self::StructuredDecode,
+            BcodeError::StructuredRepairExhausted(_) => Self::StructuredRepair,
+            _ => Self::Sdk,
+        }
+    }
 }
 impl BcodeExecutor {
+    /// Last failed invocation's bounded diagnostic category, without raw SDK data.
+    #[must_use]
+    pub fn failure(&self) -> Option<ModelFailure> {
+        *self
+            .failure
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+    fn execution_error(&self, error: &bcode::BcodeError) -> ModelError {
+        let failure = ModelFailure::classify(error);
+        *self
+            .failure
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(failure);
+        match failure {
+            ModelFailure::Cancelled => ModelError::Cancelled,
+            ModelFailure::Configuration => ModelError::Unavailable,
+            ModelFailure::StructuredJson
+            | ModelFailure::StructuredSchema
+            | ModelFailure::StructuredDecode => ModelError::InvalidResponse,
+            _ => ModelError::ExecutionFailed,
+        }
+    }
+
     /// Load enabled provider plugins and resolve the configured selection, without a daemon.
     /// # Errors
     /// Returns a secret-safe unavailable error when configuration/discovery fails.
@@ -59,6 +181,7 @@ impl BcodeExecutor {
             sdk,
             parameters,
             timeout: options.timeout,
+            failure: Mutex::new(None),
         })
     }
 }
@@ -69,6 +192,10 @@ impl ModelExecutor for BcodeExecutor {
         cancellation: &'a Cancellation,
     ) -> ModelFuture<'a> {
         Box::pin(async move {
+            *self
+                .failure
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
             if cancellation.is_cancelled() {
                 return Err(ModelError::Cancelled);
             }
@@ -111,7 +238,7 @@ impl ModelExecutor for BcodeExecutor {
                 tokio::pin!(operation);
                 loop {
                     tokio::select! {
-                        result = &mut operation => break result.map_err(|_| ModelError::ExecutionFailed)?,
+                        result = &mut operation => break result.map_err(|error| self.execution_error(&error))?,
                         () = tokio::time::sleep(Duration::from_millis(25)) => {
                             if cancellation.is_cancelled() {
                                 token.cancel();
@@ -132,6 +259,37 @@ impl ModelExecutor for BcodeExecutor {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn sdk_diagnostics_discard_untrusted_error_payloads() {
+        use bcode::{BcodeError, RuntimeError};
+        let secret = "credential-do-not-display";
+        for (error, expected) in [
+            (
+                BcodeError::Runtime(RuntimeError::ProviderInvocation(secret.into())),
+                ModelFailure::ProviderInvocation,
+            ),
+            (
+                BcodeError::StructuredInvalidJson(secret.into()),
+                ModelFailure::StructuredJson,
+            ),
+            (
+                BcodeError::StructuredRepairExhausted(secret.into()),
+                ModelFailure::StructuredRepair,
+            ),
+            (
+                BcodeError::Runtime(RuntimeError::Timeout {
+                    timeout: Duration::from_secs(1),
+                }),
+                ModelFailure::Timeout,
+            ),
+        ] {
+            let category = ModelFailure::classify(&error);
+            assert_eq!(category, expected);
+            assert!(!category.code().contains(secret));
+            assert!(!format!("{category:?}").contains(secret));
+        }
+    }
 
     #[tokio::test]
     async fn invalid_budgets_fail_before_configuration_or_provider_access() {

@@ -1,24 +1,16 @@
 //! Command-line policy for the standalone visual recap application.
-use std::{
-    io::{Read as _, Write},
-    path::{Path, PathBuf},
-    process::ExitCode,
-    time::Duration,
-};
-
-use bcode_recap::{
-    composition::CompositionLimits,
-    contracts::GenerationIntent,
-    contracts::RecapDocument,
-    engine::{Engine, EngineOptions, GenerateRequest, Stage},
-    export::{ExportBudget, export_html},
-    media::{MediaBudget, MediaTools},
-    model::ModelExecutor,
-    process::{self, Cancellation, ProcessRequest},
-    source::{self, AcquisitionOptions, SourceInput},
-    storage::DocumentStore,
-};
-use clap::{Args, Parser, Subcommand};
+use crate::application::Stage;
+use crate::application::{self, Error as CliError};
+use crate::application::{check_tool, configured_model, preflight_model};
+#[cfg(test)]
+use crate::application::{create_options, model_options, read_transcript, write_output};
+use bcode_recap::{process::Cancellation, storage::DocumentStore};
+use clap::{Args, CommandFactory as _, Parser, Subcommand};
+#[cfg(feature = "tui")]
+use std::io::IsTerminal as _;
+#[cfg(test)]
+use std::time::Duration;
+use std::{io::Write, path::PathBuf, process::ExitCode};
 
 #[derive(Debug, Parser)]
 #[command(
@@ -37,11 +29,14 @@ struct Cli {
     #[arg(long, global = true, default_value = "8388608", value_parser = positive_u64)]
     max_document_bytes: u64,
     #[command(subcommand)]
-    command: Command,
+    command: Option<Command>,
 }
 
 #[derive(Debug, Subcommand)]
 enum Command {
+    /// Browse and create recaps in the interactive terminal application.
+    #[cfg(feature = "tui")]
+    Tui(application::TuiOptions),
     /// Analyze a local video or `YouTube` URL, persist a recap, and export HTML.
     Create(Box<Create>),
     /// Refine an existing recap without replacing it unless inference succeeds.
@@ -54,149 +49,152 @@ enum Command {
     Doctor(Doctor),
 }
 
-#[derive(Debug, Args)]
-struct ModelOptions {
+#[derive(Debug, Clone, Args)]
+pub struct ModelOptions {
     /// Explicit Bcode provider configuration file for embedded inference.
     #[arg(long, required = true)]
-    model_config: PathBuf,
+    pub model_config: PathBuf,
     /// Configured model profile (not an authentication credential).
     #[arg(long)]
-    profile: Option<String>,
+    pub profile: Option<String>,
     /// Configured model name or alias, resolved by the model catalog.
     #[arg(long)]
-    model: Option<String>,
+    pub model: Option<String>,
     /// Configured provider override, resolved by the model catalog.
     #[arg(long)]
-    provider: Option<String>,
+    pub provider: Option<String>,
     /// Configuration context to select from the explicit file.
     #[arg(long)]
-    context: Option<String>,
+    pub context: Option<String>,
     /// Maximum output tokens for each inference request.
     #[arg(long, default_value = "8192", value_parser = clap::value_parser!(u32).range(1..))]
-    max_output_tokens: u32,
+    pub max_output_tokens: u32,
     /// Wall-clock deadline for model inference, in seconds.
     #[arg(long, default_value = "180", value_parser = positive_u64)]
-    model_timeout_seconds: u64,
+    pub model_timeout_seconds: u64,
     /// Maximum JSON prompt bytes (over-budget evidence is rejected, not silently dropped).
     #[arg(long, default_value = "2097152", value_parser = positive_u64)]
-    max_prompt_bytes: u64,
+    pub max_prompt_bytes: u64,
     /// Maximum JSON response bytes accepted from the model.
     #[arg(long, default_value = "1048576", value_parser = positive_u64)]
-    max_response_bytes: u64,
+    pub max_response_bytes: u64,
     /// Maximum combined bytes of actual model-visible source images.
     #[arg(long, default_value = "33554432", value_parser = positive_u64)]
-    max_model_image_bytes: u64,
+    pub max_model_image_bytes: u64,
 }
 
-#[derive(Debug, Args)]
-struct Tools {
+#[derive(Debug, Clone, Args)]
+pub struct Tools {
     /// yt-dlp executable; required only for `YouTube` acquisition.
     #[arg(long, default_value = "yt-dlp")]
-    yt_dlp: PathBuf,
+    pub yt_dlp: PathBuf,
     /// ffmpeg executable for frames and short clips.
     #[arg(long, default_value = "ffmpeg")]
-    ffmpeg: PathBuf,
+    pub ffmpeg: PathBuf,
     /// ffprobe executable for source metadata.
     #[arg(long, default_value = "ffprobe")]
-    ffprobe: PathBuf,
+    pub ffprobe: PathBuf,
 }
 
-#[derive(Debug, Args)]
-struct Create {
+#[derive(Debug, Clone, Args)]
+pub struct Create {
+    /// Renderer-selected semantic detail; headless default remains Standard.
+    #[arg(skip)]
+    pub depth: bcode_recap::contracts::Depth,
     /// Existing video path or supported `YouTube` URL.
     #[arg(long)]
-    source: String,
+    pub source: String,
     /// Stable document ID. Defaults to a new unique recap ID.
     #[arg(long, value_parser = document_id)]
-    id: Option<String>,
+    pub id: Option<String>,
     /// Editorial focus. Omit for a general visual recap, not a conversation.
     #[arg(long, value_parser = nonempty)]
-    focus: Option<String>,
+    pub focus: Option<String>,
     /// Explicit timestamped VTT or SRT transcript; otherwise use available captions.
     #[arg(long)]
-    transcript: Option<PathBuf>,
+    pub transcript: Option<PathBuf>,
     /// Explicit speech-to-text executable used only when captions/transcript are absent.
     /// It receives the video path after the literal arguments and must emit VTT/SRT.
     #[arg(long, conflicts_with = "transcript")]
-    transcriber: Option<PathBuf>,
+    pub transcriber: Option<PathBuf>,
     /// Literal argument to --transcriber; repeat as needed (no shell expansion).
     #[arg(long, requires = "transcriber")]
-    transcriber_arg: Vec<std::ffi::OsString>,
+    pub transcriber_arg: Vec<std::ffi::OsString>,
     /// Preferred `YouTube` caption language.
     #[arg(long, default_value = "en")]
-    caption_language: String,
+    pub caption_language: String,
     /// Parent directory for bounded temporary downloads and extraction.
     #[arg(long)]
-    workspace: Option<PathBuf>,
+    pub workspace: Option<PathBuf>,
     #[command(flatten)]
-    model: ModelOptions,
+    pub model: ModelOptions,
     #[command(flatten)]
-    tools: Tools,
+    pub tools: Tools,
     #[command(flatten)]
-    budget: CreateBudget,
+    pub budget: CreateBudget,
     #[command(flatten)]
-    output: OutputOptions,
+    pub output: OutputOptions,
 }
 
-#[derive(Debug, Args)]
-struct CreateBudget {
+#[derive(Debug, Clone, Args)]
+pub struct CreateBudget {
     /// Maximum source bytes (also enforced for local files).
     #[arg(long, default_value = "268435456", value_parser = positive_u64)]
-    max_video_bytes: u64,
+    pub max_video_bytes: u64,
     /// Maximum source duration in seconds.
     #[arg(long, default_value = "7200", value_parser = positive_u64)]
-    max_duration_seconds: u64,
+    pub max_duration_seconds: u64,
     /// Maximum sampled source frames.
     #[arg(long, default_value = "12", value_parser = clap::value_parser!(u32).range(1..))]
-    max_frames: u32,
+    pub max_frames: u32,
     /// Maximum silent short clips (zero disables clips).
     #[arg(long, default_value = "3")]
-    max_clips: u32,
+    pub max_clips: u32,
     /// Maximum combined duration of extracted silent clips, in milliseconds.
     #[arg(long, default_value = "24000", value_parser = positive_u64)]
-    max_clip_duration_ms: u64,
+    pub max_clip_duration_ms: u64,
     /// Maximum width of extracted source media, preserving aspect ratio.
     #[arg(long, default_value = "960", value_parser = clap::value_parser!(u32).range(1..))]
-    max_width: u32,
+    pub max_width: u32,
     /// Maximum total extracted media bytes.
     #[arg(long, default_value = "25165824", value_parser = positive_u64)]
-    max_media_bytes: u64,
+    pub max_media_bytes: u64,
     /// Deadline for each acquisition/media subprocess, in seconds.
     #[arg(long, default_value = "120", value_parser = positive_u64)]
-    operation_timeout_seconds: u64,
+    pub operation_timeout_seconds: u64,
 }
 
-#[derive(Debug, Args)]
-struct Refine {
+#[derive(Debug, Clone, Args)]
+pub struct Refine {
     /// Stored document ID, not a JSON input file.
     #[arg(value_parser = document_id)]
-    id: String,
+    pub id: String,
     /// Required editorial instruction for the next revision.
     #[arg(long, value_parser = nonempty)]
-    focus: String,
+    pub focus: String,
     #[command(flatten)]
-    model: ModelOptions,
+    pub model: ModelOptions,
     #[command(flatten)]
-    output: OutputOptions,
+    pub output: OutputOptions,
 }
 
-#[derive(Debug, Args)]
-struct OutputOptions {
+#[derive(Debug, Clone, Args)]
+pub struct OutputOptions {
     /// Destination HTML file (default: <id>.html in the current directory).
     #[arg(short, long)]
-    output: Option<PathBuf>,
+    pub output: Option<PathBuf>,
     /// Explicitly permit replacing an existing output file.
     #[arg(long)]
-    force: bool,
+    pub force: bool,
     /// Maximum raw bytes embedded from any single asset.
     #[arg(long, default_value = "12582912", value_parser = positive_u64)]
-    max_export_asset_bytes: u64,
+    pub max_export_asset_bytes: u64,
     /// Maximum total embedded media bytes, including base64 overhead.
     #[arg(long, default_value = "50331648", value_parser = positive_u64)]
-    max_export_media_bytes: u64,
+    pub max_export_media_bytes: u64,
 }
 
-#[derive(Debug, Args)]
+#[derive(Debug, Clone, Args)]
 struct Export {
     #[arg(value_parser = document_id)]
     id: String,
@@ -204,7 +202,7 @@ struct Export {
     output: OutputOptions,
 }
 
-#[derive(Debug, Args)]
+#[derive(Debug, Clone, Args)]
 struct Inspect {
     #[arg(value_parser = document_id)]
     id: String,
@@ -213,7 +211,7 @@ struct Inspect {
     json: bool,
 }
 
-#[derive(Debug, Args)]
+#[derive(Debug, Clone, Args)]
 struct Doctor {
     #[command(flatten)]
     tools: Tools,
@@ -238,7 +236,7 @@ fn positive_u64(value: &str) -> Result<u64, String> {
         .ok_or_else(|| "must be a positive integer".into())
 }
 
-fn nonempty(value: &str) -> Result<String, String> {
+pub fn nonempty(value: &str) -> Result<String, String> {
     if value.trim().is_empty() {
         Err("must not be blank".into())
     } else {
@@ -246,7 +244,7 @@ fn nonempty(value: &str) -> Result<String, String> {
     }
 }
 
-fn document_id(value: &str) -> Result<String, String> {
+pub fn document_id(value: &str) -> Result<String, String> {
     // Cheap argument validation; the store remains the authoritative contract validator.
     let reserved = matches!(
         value.to_ascii_uppercase().as_str(),
@@ -287,24 +285,6 @@ fn document_id(value: &str) -> Result<String, String> {
     Ok(value.to_owned())
 }
 
-#[derive(Debug, thiserror::Error)]
-enum CliError {
-    #[error("{0}")]
-    Action(String),
-    #[error(transparent)]
-    Document(#[from] bcode_recap::contracts::Error),
-    #[error("file operation failed: {0}")]
-    Io(#[from] std::io::Error),
-    #[error("document serialization failed: {0}")]
-    Json(#[from] serde_json::Error),
-    #[error(transparent)]
-    Engine(#[from] bcode_recap::engine::EngineError),
-    #[error(transparent)]
-    Source(#[from] bcode_recap::source::SourceError),
-    #[error(transparent)]
-    Export(#[from] bcode_recap::export::ExportError),
-}
-
 fn inspect(store: &DocumentStore, options: &Inspect) -> Result<(), CliError> {
     let document = store.load(&options.id)?;
     let mut output = std::io::stdout().lock();
@@ -326,114 +306,49 @@ fn inspect(store: &DocumentStore, options: &Inspect) -> Result<(), CliError> {
     Ok(())
 }
 
-fn export_document(
-    store: &DocumentStore,
-    document: &RecapDocument,
-    options: &OutputOptions,
-) -> Result<(), CliError> {
-    let root = store.asset_directory(&document.id)?;
-    let result = export_html(
-        document,
-        &root,
-        ExportBudget {
-            max_asset_bytes: options.max_export_asset_bytes,
-            max_total_media_bytes: options.max_export_media_bytes,
-            ..ExportBudget::default()
-        },
-    )?;
-    let destination = output_path(&document.id, options);
-    write_output(&destination, result.html.as_bytes(), options.force)?;
-    for degradation in &result.report.degradations {
-        eprintln!("warning: media export degraded: {:?}", degradation.reason);
-    }
-    eprintln!(
-        "Exported {} ({} embedded media bytes; {} omissions)",
-        destination.display(),
-        result.report.embedded_media_bytes,
-        result.report.degradations.len()
-    );
-    Ok(())
-}
-
-fn export_committed(
-    store: &DocumentStore,
-    document: &RecapDocument,
-    options: &OutputOptions,
-) -> Result<(), CliError> {
-    export_document(store, document, options).map_err(|error| CliError::Action(format!(
-        "recap {} revision {} was committed, but HTML export failed: {error}. The saved revision is intact; retry recap export {} --output FILE",
-        document.id, document.revision, document.id
-    )))
-}
-
-fn output_path(id: &str, options: &OutputOptions) -> PathBuf {
-    options
-        .output
-        .clone()
-        .unwrap_or_else(|| PathBuf::from(format!("{id}.html")))
-}
-
-// Stage output beside its destination so failures never truncate an existing HTML file.
-fn write_output(path: &Path, bytes: &[u8], force: bool) -> Result<(), CliError> {
-    let parent = path
-        .parent()
-        .filter(|path| !path.as_os_str().is_empty())
-        .unwrap_or_else(|| Path::new("."));
-    let mut staged = tempfile::NamedTempFile::new_in(parent)?;
-    staged.write_all(bytes)?;
-    staged.as_file().sync_all()?;
-    if force {
-        staged
-            .persist(path)
-            .map_err(|error| CliError::Io(error.error))?;
-    } else {
-        staged.persist_noclobber(path).map_err(|error| {
-            if error.error.kind() == std::io::ErrorKind::AlreadyExists {
-                CliError::Action(format!(
-                    "output {} already exists; choose --output or pass --force",
-                    path.display()
-                ))
-            } else {
-                CliError::Io(error.error)
-            }
-        })?;
-    }
-    Ok(())
-}
-
-async fn check_tool(
-    program: &Path,
-    name: &str,
-    cancellation: &Cancellation,
-) -> Result<(), CliError> {
-    let request = ProcessRequest {
-        program: program.to_owned(),
-        args: vec![
-            if name == "yt-dlp" {
-                "--version"
-            } else {
-                "-version"
-            }
-            .into(),
-        ],
-        cwd: None,
-        timeout: Duration::from_secs(10),
-        max_output_bytes: 64 * 1024,
-        file_budget: None,
-    };
-    if cancellation.is_cancelled() {
-        return Err(CliError::Action("operation cancelled".into()));
-    }
-    process::run(&request, cancellation).await.map_err(|_| CliError::Action(format!(
-        "{name} unavailable or failed its version check; install {name} or select its executable with --{name}"
-    )))?;
-    eprintln!("ok: {name}");
-    Ok(())
-}
-
 /// Parse arguments and run the standalone application, reporting actionable failures.
 pub async fn main() -> ExitCode {
     let arguments = Cli::parse();
+    #[cfg(feature = "tui")]
+    {
+        let interactive = std::io::stdin().is_terminal()
+            && std::io::stdout().is_terminal()
+            && std::io::stderr().is_terminal();
+        if arguments.command.is_none() || matches!(arguments.command, Some(Command::Tui(_))) {
+            if arguments.command.is_none() && !interactive {
+                return match Cli::command().print_help() {
+                    Ok(()) => ExitCode::SUCCESS,
+                    Err(_) => ExitCode::FAILURE,
+                };
+            }
+            if !interactive {
+                eprintln!(
+                    "recap: tui requires interactive stdin, stdout, and stderr terminals; use create, refine, export, inspect, or doctor for headless operation"
+                );
+                return ExitCode::FAILURE;
+            }
+            let mut options = match arguments.command {
+                Some(Command::Tui(options)) => options,
+                _ => application::TuiOptions::default(),
+            };
+            options.store = arguments.store;
+            options.max_document_bytes = arguments.max_document_bytes;
+            return match crate::tui::run(options).await {
+                Ok(()) => ExitCode::SUCCESS,
+                Err(error) => {
+                    eprintln!("recap: {error}");
+                    ExitCode::FAILURE
+                }
+            };
+        }
+    }
+    #[cfg(not(feature = "tui"))]
+    if arguments.command.is_none() {
+        return match Cli::command().print_help() {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(_) => ExitCode::FAILURE,
+        };
+    }
     let cancellation = Cancellation::default();
     let signal_cancel = cancellation.clone();
     let signal_task = tokio::spawn(async move {
@@ -459,75 +374,94 @@ pub async fn main() -> ExitCode {
     }
 }
 
-fn model_options(options: &ModelOptions) -> crate::bcode_adapter::BcodeOptions {
-    crate::bcode_adapter::BcodeOptions {
-        config_path: options.model_config.clone(),
-        profile: options.profile.clone(),
-        context: options.context.clone(),
-        model: options.model.clone(),
-        provider: options.provider.clone(),
-        max_output_tokens: options.max_output_tokens,
-        timeout: Duration::from_secs(options.model_timeout_seconds),
+fn report_export(result: &application::ExportResult) {
+    for degradation in &result.report.degradations {
+        eprintln!("warning: media export degraded: {:?}", degradation.reason);
     }
-}
-
-async fn configured_model(
-    options: &ModelOptions,
-) -> Result<crate::bcode_adapter::BcodeExecutor, CliError> {
-    preflight_model(options)?;
-    eprintln!("Resolving explicit embedded model configuration (no daemon)…");
-    crate::bcode_adapter::BcodeExecutor::configured(model_options(options)).await.map_err(|_| CliError::Action(
-        "embedded model configuration failed; check --model-config, --profile/--context, provider authentication and multimodal model support; no fallback model was used".into()
-    ))
-}
-
-fn preflight_model(options: &ModelOptions) -> Result<(), CliError> {
-    if !std::fs::metadata(&options.model_config)
-        .map_err(|_| {
-            CliError::Action(format!(
-                "cannot read model configuration {}; supply an existing --model-config FILE",
-                options.model_config.display()
-            ))
-        })?
-        .is_file()
-    {
-        return Err(CliError::Action(
-            "--model-config must name a regular configuration file".into(),
-        ));
-    }
-    for (name, value) in [
-        ("profile", &options.profile),
-        ("model", &options.model),
-        ("provider", &options.provider),
-        ("context", &options.context),
-    ] {
-        if value.as_ref().is_some_and(|value| value.trim().is_empty()) {
-            return Err(CliError::Action(format!("--{name} must not be blank")));
-        }
-    }
-    Ok(())
+    eprintln!(
+        "Exported {} ({} embedded media bytes; {} omissions)",
+        result.path.display(),
+        result.report.embedded_media_bytes,
+        result.report.degradations.len()
+    );
 }
 
 async fn run(arguments: Cli, cancel: &Cancellation) -> Result<(), CliError> {
-    let store = DocumentStore::new(arguments.store, arguments.max_document_bytes);
+    let options = application::TuiOptions {
+        store: arguments.store,
+        max_document_bytes: arguments.max_document_bytes,
+        ..application::TuiOptions::default()
+    };
+    let store = DocumentStore::new(&options.store, options.max_document_bytes);
     match arguments.command {
-        Command::Inspect(options) => inspect(&store, &options),
-        Command::Export(options) => {
-            let document = store.load(&options.id)?;
-            export_document(&store, &document, &options.output)
+        Some(Command::Inspect(value)) => inspect(&store, &value),
+        Some(Command::Export(value)) => {
+            let outcome = application::execute(
+                &options,
+                application::Request::Export {
+                    id: value.id,
+                    options: value.output,
+                },
+                cancel,
+                &mut progress,
+            )
+            .await?;
+            if let application::Outcome::Exported(result) = outcome {
+                report_export(&result);
+            }
+            Ok(())
         }
-        Command::Create(options) => {
-            preflight_model(&options.model)?;
-            let executor = configured_model(&options.model).await?;
-            create(store, &options, &executor, cancel).await
+        Some(Command::Create(value)) => {
+            if let Some(id) = &value.id {
+                application::check_output_destination(id, &value.output)?;
+            }
+            let output = value.output.clone();
+            let outcome = application::execute(
+                &options,
+                application::Request::Create(value),
+                cancel,
+                &mut progress,
+            )
+            .await?;
+            finish_generation(&store, outcome, &output)
         }
-        Command::Refine(options) => {
-            preflight_model(&options.model)?;
-            let executor = configured_model(&options.model).await?;
-            refine(store, &options, &executor, cancel).await
+        Some(Command::Refine(value)) => {
+            application::check_output_destination(&value.id, &value.output)?;
+            let output = value.output.clone();
+            let outcome = application::execute(
+                &options,
+                application::Request::Refine(value),
+                cancel,
+                &mut progress,
+            )
+            .await?;
+            finish_generation(&store, outcome, &output)
         }
-        Command::Doctor(options) => doctor(&options, cancel).await,
+        Some(Command::Doctor(value)) => doctor(&value, cancel).await,
+        #[cfg(feature = "tui")]
+        Some(Command::Tui(_)) => Err(CliError::Action(
+            "interactive routing was not initialized".into(),
+        )),
+        None => Err(CliError::Action(
+            "interactive routing was not initialized".into(),
+        )),
     }
+}
+
+fn finish_generation(
+    store: &DocumentStore,
+    outcome: application::Outcome,
+    output: &OutputOptions,
+) -> Result<(), CliError> {
+    if let application::Outcome::Document(document) = outcome {
+        eprintln!(
+            "Saved {} revision {}. Re-export anytime with: recap export {}",
+            document.id, document.revision, document.id
+        );
+        let result = application::export_committed(store, &document, output)?;
+        report_export(&result);
+    }
+    Ok(())
 }
 
 async fn doctor(options: &Doctor, cancel: &Cancellation) -> Result<(), CliError> {
@@ -540,6 +474,8 @@ async fn doctor(options: &Doctor, cancel: &Cancellation) -> Result<(), CliError>
         if let Err(error) = check_tool(program, name, cancel).await {
             eprintln!("error: {error}");
             failures += 1;
+        } else {
+            eprintln!("ok: {name}");
         }
     }
     if let Some(config) = &options.model_config {
@@ -591,6 +527,7 @@ fn progress(stage: Stage) {
     eprintln!(
         "{}",
         match stage {
+            Stage::ModelReadiness => "Resolving explicit embedded model configuration (no daemon)…",
             Stage::Acquisition => "Acquiring source and available captions…",
             Stage::Media => "Probing source and extracting real visual evidence…",
             Stage::Composition => "Composing grounded visual recap with configured model…",
@@ -601,217 +538,146 @@ fn progress(stage: Stage) {
     );
 }
 
-fn check_output_destination(id: &str, options: &OutputOptions) -> Result<(), CliError> {
-    let path = output_path(id, options);
-    if !options.force && path.try_exists()? {
-        return Err(CliError::Action(format!(
-            "output {} already exists; choose --output or pass --force",
-            path.display()
-        )));
-    }
-    Ok(())
-}
-
-fn engine_options(workspace: PathBuf) -> EngineOptions {
-    EngineOptions {
-        acquisition: AcquisitionOptions {
-            yt_dlp: "yt-dlp".into(),
-            workspace,
-            max_video_bytes: 256 * 1024 * 1024,
-            max_duration_seconds: 7200.0,
-            caption_language: "en".into(),
-            timeout: Duration::from_secs(120),
-        },
-        transcription: None,
-        tools: MediaTools::default(),
-        media: MediaBudget::default(),
-        composition: CompositionLimits::default(),
-        export: ExportBudget::default(),
+impl Default for OutputOptions {
+    fn default() -> Self {
+        let parsed =
+            Cli::try_parse_from(["recap", "export", "default"]).expect("built-in export defaults");
+        match parsed.command {
+            Some(Command::Export(value)) => value.output,
+            _ => unreachable!(),
+        }
     }
 }
-
-fn read_transcript(path: &Path) -> Result<String, CliError> {
-    const LIMIT: u64 = 2 * 1024 * 1024;
-    if !std::fs::metadata(path)?.is_file() {
-        return Err(CliError::Action(
-            "--transcript must name a regular VTT/SRT file".into(),
-        ));
+#[cfg(feature = "tui")]
+impl Create {
+    /// Canonical clap defaults, without requiring a complete interactive form.
+    pub fn defaults_for_form() -> Self {
+        let parsed = Cli::try_parse_from([
+            "recap",
+            "create",
+            "--source",
+            "video.mp4",
+            "--model-config",
+            "provider.toml",
+        ])
+        .expect("built-in create defaults");
+        match parsed.command {
+            Some(Command::Create(value)) => *value,
+            _ => unreachable!(),
+        }
     }
-    let file = std::fs::File::open(path)?;
-    let mut bytes = Vec::new();
-    file.take(LIMIT + 1).read_to_end(&mut bytes)?;
-    if u64::try_from(bytes.len()).unwrap_or(u64::MAX) > LIMIT {
-        return Err(CliError::Action(
-            "transcript exceeds the 2 MiB limit; supply a bounded VTT/SRT transcript".into(),
-        ));
+}
+#[cfg(feature = "tui")]
+impl Refine {
+    /// Canonical clap defaults, without requiring a complete interactive form.
+    pub fn defaults_for_form() -> Self {
+        let parsed = Cli::try_parse_from([
+            "recap",
+            "refine",
+            "recap",
+            "--focus",
+            "Details",
+            "--model-config",
+            "provider.toml",
+        ])
+        .expect("built-in refine defaults");
+        match parsed.command {
+            Some(Command::Refine(value)) => *value,
+            _ => unreachable!(),
+        }
     }
-    let text = String::from_utf8(bytes)
-        .map_err(|_| CliError::Action("transcript must be UTF-8 VTT/SRT".into()))?;
-    source::parse_subtitles(&text)?;
-    Ok(text)
-}
-
-fn apply_composition_limits(
-    options: &mut EngineOptions,
-    model: &ModelOptions,
-) -> Result<(), CliError> {
-    let convert = |value| {
-        usize::try_from(value)
-            .map_err(|_| CliError::Action("model byte budget exceeds platform limits".into()))
-    };
-    options.composition.input_bytes = convert(model.max_prompt_bytes)?;
-    options.composition.response_bytes = convert(model.max_response_bytes)?;
-    options.composition.image_bytes = convert(model.max_model_image_bytes)?;
-    Ok(())
-}
-
-fn create_options(options: &Create) -> Result<EngineOptions, CliError> {
-    let mut configuration =
-        engine_options(options.workspace.clone().unwrap_or_else(std::env::temp_dir));
-    configuration
-        .acquisition
-        .yt_dlp
-        .clone_from(&options.tools.yt_dlp);
-    configuration.acquisition.max_video_bytes = options.budget.max_video_bytes;
-    configuration.acquisition.max_duration_seconds =
-        Duration::from_secs(options.budget.max_duration_seconds).as_secs_f64();
-    configuration
-        .acquisition
-        .caption_language
-        .clone_from(&options.caption_language);
-    configuration.acquisition.timeout =
-        Duration::from_secs(options.budget.operation_timeout_seconds);
-    configuration.transcription =
-        options
-            .transcriber
-            .as_ref()
-            .map(|program| source::TranscriptionCommand {
-                program: program.clone(),
-                args: options.transcriber_arg.clone(),
-                timeout: configuration.acquisition.timeout,
-            });
-    configuration.tools = MediaTools {
-        ffmpeg: options.tools.ffmpeg.clone(),
-        ffprobe: options.tools.ffprobe.clone(),
-    };
-    configuration.media.max_frames = usize::try_from(options.budget.max_frames)
-        .map_err(|_| CliError::Action("frame budget exceeds platform limits".into()))?;
-    configuration.media.max_clips = usize::try_from(options.budget.max_clips)
-        .map_err(|_| CliError::Action("clip budget exceeds platform limits".into()))?;
-    configuration.media.max_clip_duration_ms = options.budget.max_clip_duration_ms;
-    configuration.media.max_width = options.budget.max_width;
-    configuration.media.max_asset_bytes = options.budget.max_media_bytes;
-    configuration.media.operation_timeout = configuration.acquisition.timeout;
-    apply_composition_limits(&mut configuration, &options.model)?;
-    configuration.composition.images = configuration.media.max_frames;
-    Ok(configuration)
-}
-
-async fn create(
-    store: DocumentStore,
-    options: &Create,
-    executor: &dyn ModelExecutor,
-    cancel: &Cancellation,
-) -> Result<(), CliError> {
-    let id = if let Some(id) = &options.id {
-        id.clone()
-    } else {
-        let directory = tempfile::Builder::new().prefix("recap-").tempdir()?;
-        directory
-            .path()
-            .file_name()
-            .ok_or_else(|| CliError::Action("cannot allocate recap identity; supply --id".into()))?
-            .to_string_lossy()
-            .into_owned()
-    };
-    check_output_destination(&id, &options.output)?;
-    let input = if options.source.contains("://") {
-        SourceInput::Youtube(source::youtube_url(&options.source)?)
-    } else {
-        SourceInput::Local(PathBuf::from(&options.source))
-    };
-    check_tool(&options.tools.ffmpeg, "ffmpeg", cancel).await?;
-    check_tool(&options.tools.ffprobe, "ffprobe", cancel).await?;
-    if matches!(&input, SourceInput::Youtube(_)) {
-        check_tool(&options.tools.yt_dlp, "yt-dlp", cancel).await?;
-    }
-    // Validate user inputs before potentially paid inference; downloading/probing still happens in the engine.
-    let supplied_transcript = options
-        .transcript
-        .as_deref()
-        .map(read_transcript)
-        .transpose()?;
-    let configuration = create_options(options)?;
-    let engine = Engine {
-        executor,
-        store,
-        options: configuration,
-    };
-    let title = match &input {
-        SourceInput::Local(path) => path
-            .file_stem()
-            .unwrap_or_default()
-            .to_string_lossy()
-            .into_owned(),
-        SourceInput::Youtube(_) => "YouTube video".into(),
-    };
-    let request = GenerateRequest {
-        id: id.clone(),
-        source_id: id,
-        source_title: title,
-        input,
-        transcript: supplied_transcript,
-        intent: GenerationIntent {
-            focus: options.focus.clone(),
-            ..GenerationIntent::default()
-        },
-    };
-    let document = engine.generate(&request, cancel, &mut progress).await?;
-    eprintln!("Rendering self-contained HTML…");
-    eprintln!(
-        "Saved {} revision {}. Re-export anytime with: recap --store {} export {}",
-        document.id,
-        document.revision,
-        engine
-            .store
-            .asset_directory(&document.id)?
-            .parent()
-            .unwrap_or_else(|| Path::new("."))
-            .display(),
-        document.id
-    );
-    export_committed(&engine.store, &document, &options.output)
-}
-
-async fn refine(
-    store: DocumentStore,
-    options: &Refine,
-    executor: &dyn ModelExecutor,
-    cancel: &Cancellation,
-) -> Result<(), CliError> {
-    let previous = store.load(&options.id)?;
-    check_output_destination(&options.id, &options.output)?;
-    let mut configuration = engine_options(std::env::temp_dir());
-    apply_composition_limits(&mut configuration, &options.model)?;
-    let engine = Engine {
-        executor,
-        store,
-        options: configuration,
-    };
-    let mut intent = previous.intent;
-    intent.focus = Some(options.focus.clone());
-    let document = engine
-        .refine(&options.id, intent, cancel, &mut progress)
-        .await?;
-    eprintln!("Rendering self-contained HTML…");
-    eprintln!("Saved {} revision {}", document.id, document.revision);
-    export_committed(&engine.store, &document, &options.output)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use clap::CommandFactory as _;
+
+    #[cfg(feature = "tui")]
+    #[test]
+    fn interactive_entry_can_browse_without_model_configuration() {
+        assert!(Cli::try_parse_from(["recap"]).unwrap().command.is_none());
+        let parsed =
+            Cli::try_parse_from(["recap", "tui", "--store", "notes", "--id", "lesson"]).unwrap();
+        assert_eq!(parsed.store, PathBuf::from("notes"));
+        let Some(Command::Tui(options)) = parsed.command else {
+            panic!("expected tui")
+        };
+        assert!(options.model_config.is_none());
+        assert_eq!(options.id.as_deref(), Some("lesson"));
+    }
+
+    #[cfg(feature = "tui")]
+    #[test]
+    fn tui_selection_is_optional_and_reaches_shared_job_options() {
+        let parsed = Cli::try_parse_from([
+            "recap",
+            "tui",
+            "--source",
+            "lesson.mp4",
+            "--model-config",
+            "provider.toml",
+            "--profile",
+            "sol",
+            "--context",
+            "work",
+            "--model",
+            "selected",
+            "--provider",
+            "custom",
+            "--id",
+            "lesson",
+        ])
+        .unwrap();
+        let Some(Command::Tui(options)) = parsed.command else {
+            panic!("expected tui")
+        };
+        let transcript = Some(PathBuf::from("captions.vtt"));
+        let create = options.create_request(
+            options.source.clone().unwrap(),
+            transcript.clone(),
+            Some("Details".into()),
+            bcode_recap::contracts::Depth::Detailed,
+        );
+        assert_eq!(create.model.profile.as_deref(), Some("sol"));
+        assert_eq!(create.model.context.as_deref(), Some("work"));
+        assert_eq!(create.model.model.as_deref(), Some("selected"));
+        assert_eq!(create.model.provider.as_deref(), Some("custom"));
+        assert_eq!(create.model.model_config, PathBuf::from("provider.toml"));
+        assert_eq!(create.id.as_deref(), Some("lesson"));
+        assert_eq!(create.transcript, transcript);
+        assert_eq!(create.depth, bcode_recap::contracts::Depth::Detailed);
+        let defaults = Create::defaults_for_form();
+        let actual_engine = create_options(&create).unwrap();
+        let default_engine = create_options(&defaults).unwrap();
+        assert_eq!(
+            actual_engine.media.max_frames,
+            default_engine.media.max_frames
+        );
+        assert_eq!(
+            actual_engine.media.max_asset_bytes,
+            default_engine.media.max_asset_bytes
+        );
+        assert_eq!(
+            actual_engine.composition.input_bytes,
+            default_engine.composition.input_bytes
+        );
+        assert_eq!(
+            actual_engine.composition.response_bytes,
+            default_engine.composition.response_bytes
+        );
+        let refine = options.refine_request("lesson".into(), "Compare".into());
+        assert_eq!(refine.focus, "Compare");
+        assert_eq!(
+            refine.model.max_output_tokens,
+            create.model.max_output_tokens
+        );
+        assert_eq!(refine.model.max_prompt_bytes, create.model.max_prompt_bytes);
+        assert!(!options.output_options().force);
+        assert_eq!(
+            options.output_options().max_export_media_bytes,
+            defaults.output.max_export_media_bytes
+        );
+    }
 
     #[test]
     fn model_and_media_budgets_reach_execution_options() {
@@ -842,7 +708,7 @@ mod tests {
             "9",
         ])
         .unwrap();
-        let Command::Create(options) = parsed.command else {
+        let Some(Command::Create(options)) = parsed.command else {
             panic!("expected create")
         };
         let model = model_options(&options.model);
@@ -895,7 +761,7 @@ mod tests {
             "provider.toml",
         ])
         .unwrap();
-        let Command::Create(options) = parsed.command else {
+        let Some(Command::Create(options)) = parsed.command else {
             panic!("expected create")
         };
         assert!(options.focus.is_none());
@@ -993,7 +859,7 @@ mod tests {
             "vtt",
         ])
         .unwrap();
-        let Command::Create(options) = parsed.command else {
+        let Some(Command::Create(options)) = parsed.command else {
             panic!("expected create")
         };
         assert_eq!(options.transcriber.unwrap(), PathBuf::from("speech-tool"));

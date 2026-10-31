@@ -12,6 +12,28 @@ The executable is `target/debug/recap`. The reusable `bcode_recap` library is in
 
 Install `ffmpeg` and `ffprobe` for media processing. YouTube input additionally requires `yt-dlp`. Dependencies are checked, never installed implicitly. Sources must be accessible and lawful to process; access restrictions fail explicitly.
 
+## Terminal application
+
+The default build is headless-only and excludes terminal rendering/input dependencies. Enable the optional TUI explicitly:
+
+```sh
+cargo build -p bcode_recap_cli --features tui
+# Or install with terminal support:
+cargo install --path packages/recap/cli --features tui
+```
+
+Without `tui`, bare `recap` prints help even in a terminal, and the `tui` subcommand is not present. All one-shot commands are available in either build.
+
+```sh
+recap
+recap tui --model-config /absolute/path/provider.toml --profile my-profile
+recap --store /absolute/path/recaps tui --id existing-recap
+```
+
+Bare `recap` opens the BMUX terminal application only with terminal stdin/stdout/stderr; otherwise it prints help. Explicit `recap tui` requires a terminal. Existing one-shot subcommands remain headless even in a terminal: no alternate screen, prompts or implicit browser opening.
+
+The TUI has source/model fields, source/transcript options, a bounded local library, stage/elapsed-time progress, a chapter reader, optional focus refinement, HTML export and explicit browser opening. `F2` generates, `F3` toggles chapters/library, `F4` opens focus/source options, `F5` exports, `F6` opens exported HTML, `F8` cycles themes, and `F10` quits. Tab and mouse navigate controls. Escape requests cancellation while working. Themes are currently per-launch presentation choices; `NO_COLOR` starts monochrome. Native still previews depend on the terminal's advertised BMUX image capabilities; HTML remains the video-playback surface. A theme change does not rewrite model configuration.
+
 ## Generate
 
 ```sh

@@ -242,8 +242,44 @@ pub fn check(target: &str) -> Result<()> {
             failures.push(format!("portable presentation: {}", path.join(" -> ")));
         }
     }
+    check_feature_profiles(target, &mut failures)?;
+    if !failures.is_empty() {
+        return Err(format_error(failures.join("\n")));
+    }
+    println!("Dependency boundaries passed for {target}");
+    Ok(())
+}
+
+fn check_feature_profiles(target: &str, failures: &mut Vec<String>) -> Result<()> {
     // Separate consumer workspaces prevent unrelated workspace members from unifying features.
     for (package, directory, features, required, denied) in [
+        (
+            "bcode_recap_cli",
+            "packages/recap/cli",
+            "",
+            &[][..],
+            &[
+                "bmux_tui",
+                "bmux_tui_components",
+                "bmux_tui_runtime",
+                "bmux_keyboard",
+                "bmux_text_edit",
+                "bmux_image",
+                "crossterm",
+            ][..],
+        ),
+        (
+            "bcode_recap_cli",
+            "packages/recap/cli",
+            "tui",
+            &[
+                "bmux_tui",
+                "bmux_tui_components",
+                "bmux_tui_runtime",
+                "bmux_image",
+            ][..],
+            &[][..],
+        ),
         (
             "bcode",
             "packages/bcode",
@@ -289,19 +325,9 @@ pub fn check(target: &str) -> Result<()> {
         ),
     ] {
         check_profile(
-            target,
-            package,
-            directory,
-            features,
-            required,
-            denied,
-            &mut failures,
+            target, package, directory, features, required, denied, failures,
         )?;
     }
-    if !failures.is_empty() {
-        return Err(format_error(failures.join("\n")));
-    }
-    println!("Dependency boundaries passed for {target}");
     Ok(())
 }
 
@@ -361,6 +387,50 @@ fn check_profile(
     Ok(())
 }
 
+// Binary-only subjects cannot be a dependency of the usual consumer probe. Resolve their
+// real dependency/feature tables in a fresh workspace with a synthetic local target instead.
+fn configure_binary_probe(
+    probe: &mut toml_edit::DocumentMut,
+    workspace: &toml_edit::DocumentMut,
+    directory: &std::path::Path,
+) -> Result<()> {
+    let subject = std::fs::read_to_string(directory.join("Cargo.toml"))?
+        .parse::<toml_edit::DocumentMut>()
+        .map_err(|error| format_error(format!("invalid binary subject manifest: {error}")))?;
+    let selected = probe["dependencies"]["subject"]["features"].clone();
+    probe["package"] = subject["package"].clone();
+    probe["package"]["autobins"] = toml_edit::value(false);
+    probe["dependencies"] = subject["dependencies"].clone();
+    probe["features"] = subject["features"].clone();
+    probe["features"]["default"] = selected;
+    probe["workspace"] = workspace["workspace"].clone();
+    probe["workspace"]
+        .as_table_mut()
+        .expect("workspace table")
+        .remove("members");
+    probe["workspace"]
+        .as_table_mut()
+        .expect("workspace table")
+        .remove("default-members");
+    if let Some(dependencies) = probe["workspace"]["dependencies"].as_table_mut() {
+        for (_, dependency) in dependencies.iter_mut() {
+            if let Some(path) = dependency.get_mut("path")
+                && let Some(relative) = path.as_str()
+            {
+                *path =
+                    toml_edit::value(workspace_root().join(relative).to_string_lossy().as_ref());
+            }
+        }
+    }
+    probe["workspace"]["package"]["readme"] = toml_edit::value(
+        workspace_root()
+            .join("README.md")
+            .to_string_lossy()
+            .as_ref(),
+    );
+    Ok(())
+}
+
 fn profile_graph(target: &str, package: &str, directory: &str, features: &str) -> Result<Graph> {
     let temp = tempfile::tempdir()?;
     let path = workspace_root().join(directory);
@@ -380,6 +450,9 @@ fn profile_graph(target: &str, package: &str, directory: &str, features: &str) -
     let mut probe_manifest = manifest
         .parse::<toml_edit::DocumentMut>()
         .map_err(|error| format_error(format!("invalid probe manifest: {error}")))?;
+    if package == "bcode_recap_cli" {
+        configure_binary_probe(&mut probe_manifest, &workspace_manifest, &path)?;
+    }
     if let Some(patches) = workspace_manifest.get("patch") {
         let mut patches = patches.clone();
         if let Some(sources) = patches.as_table_mut() {
