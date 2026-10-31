@@ -573,7 +573,7 @@ pub struct MetricsSpan {
     metrics: MetricsRegistry,
     name: String,
     labels: MetricLabels,
-    started_at: Instant,
+    started_at: Option<Instant>,
     finished: bool,
 }
 
@@ -878,7 +878,9 @@ impl MetricsRegistry {
     where
         F: Future<Output = T>,
     {
-        let _ = self;
+        if !self.is_enabled() {
+            return future.await;
+        }
         scope_metrics_context(context, future).await
     }
 
@@ -891,6 +893,9 @@ impl MetricsRegistry {
     where
         F: Future<Output = T>,
     {
+        if !self.is_enabled() {
+            return future.await;
+        }
         self.in_context(
             MetricsContext::new().with_database_operation(&operation),
             future,
@@ -904,11 +909,20 @@ impl MetricsRegistry {
     /// dropping without finishing records `unfinished`, not success or inferred cancellation.
     #[must_use]
     pub fn span(&self, name: impl Into<String>) -> MetricsSpan {
+        if !self.is_enabled() {
+            return MetricsSpan {
+                metrics: self.clone(),
+                name: String::new(),
+                labels: MetricLabels::new(),
+                started_at: None,
+                finished: true,
+            };
+        }
         MetricsSpan {
             metrics: self.clone(),
             name: name.into(),
             labels: current_metrics_context().labels,
-            started_at: Instant::now(),
+            started_at: Some(Instant::now()),
             finished: false,
         }
     }
@@ -1413,14 +1427,18 @@ impl MetricsSpan {
     /// Add a string-like label to this span.
     #[must_use]
     pub fn label(mut self, key: impl Into<String>, value: &impl ToString) -> Self {
-        self.labels.insert(key.into(), value.to_string());
+        if self.started_at.is_some() {
+            self.labels.insert(key.into(), value.to_string());
+        }
         self
     }
 
     /// Add many labels to this span.
     #[must_use]
     pub fn labels(mut self, labels: MetricLabels) -> Self {
-        self.labels.extend(labels);
+        if self.started_at.is_some() {
+            self.labels.extend(labels);
+        }
         self
     }
 
@@ -1463,7 +1481,11 @@ impl MetricsSpan {
         );
         self.metrics.record_histogram_with_exact_labels(
             format!("{}.duration_ms", self.name),
-            u64::try_from(self.started_at.elapsed().as_millis()).unwrap_or(u64::MAX),
+            u64::try_from(
+                self.started_at
+                    .map_or(0, |started| started.elapsed().as_millis()),
+            )
+            .unwrap_or(u64::MAX),
             labels,
         );
     }
@@ -2643,6 +2665,31 @@ mod tests {
             .find(|event| event.name == "outside.total")
             .expect("outside event");
         assert!(!outside.labels.contains_key("database_operation"));
+    }
+
+    #[test]
+    fn disabled_span_does_not_materialize_names_or_labels() {
+        struct Unused;
+        struct Name(std::cell::Cell<bool>);
+        impl From<&Name> for String {
+            fn from(name: &Name) -> Self {
+                name.0.set(true);
+                "unexpected conversion".to_owned()
+            }
+        }
+        impl std::fmt::Display for Unused {
+            fn fmt(&self, _: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                panic!("disabled metrics must not format labels")
+            }
+        }
+        let metrics = MetricsRegistry::disabled();
+        let name = Name(std::cell::Cell::new(false));
+        metrics
+            .span(&name)
+            .label(&name, &Unused)
+            .finish_with_outcome(&Unused);
+        drop(metrics.span(&name).label(&name, &Unused));
+        assert!(!name.0.get());
     }
 
     #[test]

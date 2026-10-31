@@ -571,7 +571,7 @@ mod tests {
         let (followup_commands, mut receiver) = mpsc::channel(2);
         let (steering_commands, _steering_receiver) = mpsc::channel(1);
         let (cancel_commands, _cancel_receiver) = mpsc::channel(1);
-        let queued = Arc::new(AtomicUsize::new(0));
+        let queued = Arc::new(crate::activity_changes::ActivityCounter::new(0));
         state.session_runtimes.lock().await.insert(
             id,
             SessionRuntimeHandle {
@@ -579,8 +579,10 @@ mod tests {
                 steering_commands,
                 cancel_commands,
                 queued_followups: Arc::clone(&queued),
-                queued_steering: Arc::new(AtomicUsize::new(0)),
-                phase: Arc::new(Mutex::new(SessionRuntimePhase::Idle)),
+                queued_steering: Arc::new(crate::activity_changes::ActivityCounter::new(0)),
+                phase: Arc::new(crate::activity_changes::ActivityMutex::new(
+                    SessionRuntimePhase::Idle,
+                )),
                 current_turn: Arc::new(Mutex::new(None)),
             },
         );
@@ -755,7 +757,7 @@ mod tests {
         let (followup_commands, mut receiver) = mpsc::channel(4);
         let (steering_commands, _steering_receiver) = mpsc::channel(1);
         let (cancel_commands, _cancel_receiver) = mpsc::channel(1);
-        let queued = Arc::new(AtomicUsize::new(0));
+        let queued = Arc::new(crate::activity_changes::ActivityCounter::new(0));
         state.session_runtimes.lock().await.insert(
             id,
             SessionRuntimeHandle {
@@ -763,8 +765,10 @@ mod tests {
                 steering_commands,
                 cancel_commands,
                 queued_followups: Arc::clone(&queued),
-                queued_steering: Arc::new(AtomicUsize::new(0)),
-                phase: Arc::new(Mutex::new(SessionRuntimePhase::Idle)),
+                queued_steering: Arc::new(crate::activity_changes::ActivityCounter::new(0)),
+                phase: Arc::new(crate::activity_changes::ActivityMutex::new(
+                    SessionRuntimePhase::Idle,
+                )),
                 current_turn: Arc::new(Mutex::new(None)),
             },
         );
@@ -1058,7 +1062,7 @@ mod tests {
             let (_followup_tx, mut followup_rx) = mpsc::channel(1);
             let (_steering_tx, mut steering_rx) = mpsc::channel(1);
             let (_cancel_tx, mut cancel_rx) = mpsc::channel(1);
-            let queued = AtomicUsize::new(0);
+            let queued = crate::activity_changes::ActivityCounter::new(0);
             let mut commands = RuntimeCommandContext::new(
                 &mut followup_rx,
                 &mut steering_rx,
@@ -1114,7 +1118,7 @@ mod tests {
         let (_followup_tx, mut followup_rx) = mpsc::channel(1);
         let (_steering_tx, mut steering_rx) = mpsc::channel(1);
         let (_cancel_tx, mut cancel_rx) = mpsc::channel(1);
-        let queued = AtomicUsize::new(0);
+        let queued = crate::activity_changes::ActivityCounter::new(0);
         let mut commands = RuntimeCommandContext::new(
             &mut followup_rx,
             &mut steering_rx,

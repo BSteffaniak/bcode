@@ -83,7 +83,7 @@ async fn alternating_timeouts_retry_until_success_without_replaying_tools() {
     let (_followup_tx, mut followup_rx) = mpsc::channel(1);
     let (_steering_tx, mut steering_rx) = mpsc::channel(1);
     let (_cancel_tx, mut cancel_rx) = mpsc::channel(1);
-    let queued = AtomicUsize::new(0);
+    let queued = crate::activity_changes::ActivityCounter::new(0);
     let mut commands = RuntimeCommandContext::new(
         &mut followup_rx,
         &mut steering_rx,
@@ -92,7 +92,9 @@ async fn alternating_timeouts_retry_until_success_without_replaying_tools() {
         Arc::new(Mutex::new(None)),
     );
     let cancel = TurnCancelState::default();
-    let phase = Arc::new(Mutex::new(SessionRuntimePhase::ProviderActive));
+    let phase = Arc::new(crate::activity_changes::ActivityMutex::new(
+        SessionRuntimePhase::ProviderActive,
+    ));
     let selection = SessionModelSelection::default();
     let config = bcode_config::ModelRetryConfig::default();
     let mut recovery = ModelTurnRecoveryState::default();
@@ -163,7 +165,7 @@ async fn maximum_backoff_is_cancellable_even_when_control_channel_is_closed() {
     let (_steering_tx, mut steering_rx) = mpsc::channel(1);
     let (cancel_tx, mut cancel_rx) = mpsc::channel(1);
     drop(cancel_tx);
-    let queued = AtomicUsize::new(0);
+    let queued = crate::activity_changes::ActivityCounter::new(0);
     let mut commands = RuntimeCommandContext::new(
         &mut followup_rx,
         &mut steering_rx,

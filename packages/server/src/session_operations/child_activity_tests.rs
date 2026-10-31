@@ -71,7 +71,7 @@ async fn observed_failure_does_not_conceal_nonresident_unknown() {
 #[tokio::test]
 async fn complete_empty_evidence_requires_resident_idle_scheduler() {
     use crate::{SessionRuntimeHandle, SessionRuntimePhase};
-    use std::sync::{Arc, atomic::AtomicUsize};
+    use std::sync::Arc;
     use tokio::sync::{Mutex, mpsc};
     let state = crate::tests::test_server_state(bcode_session::SessionManager::default());
     let summary = state
@@ -88,9 +88,11 @@ async fn complete_empty_evidence_requires_resident_idle_scheduler() {
             followup_commands,
             steering_commands,
             cancel_commands,
-            queued_followups: Arc::new(AtomicUsize::new(0)),
-            queued_steering: Arc::new(AtomicUsize::new(0)),
-            phase: Arc::new(Mutex::new(SessionRuntimePhase::Idle)),
+            queued_followups: Arc::new(crate::activity_changes::ActivityCounter::new(0)),
+            queued_steering: Arc::new(crate::activity_changes::ActivityCounter::new(0)),
+            phase: Arc::new(crate::activity_changes::ActivityMutex::new(
+                SessionRuntimePhase::Idle,
+            )),
             current_turn: Arc::new(Mutex::new(None)),
         },
     );
@@ -109,7 +111,7 @@ async fn owned_terminal_fixture(
     bcode_session::SessionOwnershipGuard,
 ) {
     use crate::{SessionRuntimeHandle, SessionRuntimePhase};
-    use std::sync::{Arc, atomic::AtomicUsize};
+    use std::sync::Arc;
     use tokio::sync::{Mutex, mpsc};
     let sessions = bcode_session::SessionManager::persistent(root).unwrap();
     let state = crate::tests::test_server_state(sessions);
@@ -129,9 +131,11 @@ async fn owned_terminal_fixture(
         followup_commands: mpsc::channel(1).0,
         steering_commands: mpsc::channel(1).0,
         cancel_commands: mpsc::channel(1).0,
-        queued_followups: Arc::new(AtomicUsize::new(0)),
-        queued_steering: Arc::new(AtomicUsize::new(0)),
-        phase: Arc::new(Mutex::new(SessionRuntimePhase::Idle)),
+        queued_followups: Arc::new(crate::activity_changes::ActivityCounter::new(0)),
+        queued_steering: Arc::new(crate::activity_changes::ActivityCounter::new(0)),
+        phase: Arc::new(crate::activity_changes::ActivityMutex::new(
+            SessionRuntimePhase::Idle,
+        )),
         current_turn: Arc::new(Mutex::new(None)),
     };
     state.session_runtimes.lock().await.insert(id, runtime);

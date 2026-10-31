@@ -39,6 +39,8 @@ mod model_evidence;
 mod model_ignores;
 mod model_request_target;
 pub use command_application::CommandApplicationHandle;
+mod activity_changes;
+mod activity_watch;
 mod plugin_context;
 mod plugin_operations;
 mod provider_retry_recovery;
@@ -49,6 +51,9 @@ pub mod runtime_work_operations;
 mod server_operations;
 mod services_application;
 mod session_activity;
+use activity_changes::{ActivityChanges, ActivityCounter, ActivityMutex};
+#[cfg(test)]
+use std::sync::atomic::AtomicUsize;
 mod session_application;
 mod session_spawning;
 pub use import_search_application::ImportSearchApplicationHandle;
@@ -238,10 +243,7 @@ use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::process::{Command, Stdio};
 use std::str::FromStr;
-use std::sync::{
-    Arc, Mutex as StdMutex,
-    atomic::{AtomicUsize, Ordering},
-};
+use std::sync::{Arc, Mutex as StdMutex, atomic::Ordering};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use thiserror::Error;
 use tokio::io::{WriteHalf, split};
@@ -493,11 +495,13 @@ pub struct ServerState {
     skill_prompt_options: SkillPromptCatalogOptions,
     active_skills: Mutex<BTreeMap<SessionId, BTreeSet<SkillId>>>,
     turn_skills: Mutex<BTreeMap<(SessionId, u64), SkillTurnInvocation>>,
-    session_runtimes: Mutex<BTreeMap<SessionId, SessionRuntimeHandle>>,
+    session_runtimes: ActivityMutex<BTreeMap<SessionId, SessionRuntimeHandle>>,
     // Disposable bounded observations of successfully committed terminal work.
     workflow_activity_scans: workflow_representation::workflow_activity::WorkflowActivityScans,
     progress_observations: StdMutex<workflow_representation::activity::SessionProgressRegistry>,
     activity_observations: Mutex<session_activity::ActivityObservations>,
+    activity_changes: ActivityChanges,
+    activity_watches: activity_watch::ActivityWatchRegistry,
     turn_admission_locks: Mutex<BTreeMap<SessionId, Arc<Mutex<()>>>>,
     workflow_prompt_admissions: StdMutex<BTreeMap<String, std::sync::Weak<Mutex<()>>>>,
     workflow_store: Arc<StdMutex<bcode_workflow_store::WorkflowStore>>,
@@ -725,9 +729,9 @@ struct SessionRuntimeHandle {
     followup_commands: mpsc::Sender<FollowupCommand>,
     steering_commands: mpsc::Sender<SteeringCommand>,
     cancel_commands: mpsc::Sender<CancelCommand>,
-    queued_followups: Arc<AtomicUsize>,
-    queued_steering: Arc<AtomicUsize>,
-    phase: Arc<Mutex<SessionRuntimePhase>>,
+    queued_followups: Arc<ActivityCounter>,
+    queued_steering: Arc<ActivityCounter>,
+    phase: Arc<ActivityMutex<SessionRuntimePhase>>,
     current_turn: Arc<Mutex<Option<RuntimeCurrentTurn>>>,
 }
 
@@ -737,7 +741,7 @@ async fn remove_session_runtime_if_current(
     session_id: SessionId,
     current_turn: &Arc<Mutex<Option<RuntimeCurrentTurn>>>,
 ) -> bool {
-    let mut runtimes = state.session_runtimes.lock().await;
+    let mut runtimes = state.session_runtimes.lock_for(session_id).await;
     if runtimes
         .get(&session_id)
         .is_some_and(|handle| Arc::ptr_eq(&handle.current_turn, current_turn))
@@ -823,7 +827,7 @@ struct RuntimeCommandContext<'a> {
     followup_commands: &'a mut mpsc::Receiver<FollowupCommand>,
     steering_commands: &'a mut mpsc::Receiver<SteeringCommand>,
     cancel_commands: &'a mut mpsc::Receiver<CancelCommand>,
-    queued_followups: &'a AtomicUsize,
+    queued_followups: &'a ActivityCounter,
     current_turn: Arc<Mutex<Option<RuntimeCurrentTurn>>>,
 }
 
@@ -832,7 +836,7 @@ impl<'a> RuntimeCommandContext<'a> {
         followup_commands: &'a mut mpsc::Receiver<FollowupCommand>,
         steering_commands: &'a mut mpsc::Receiver<SteeringCommand>,
         cancel_commands: &'a mut mpsc::Receiver<CancelCommand>,
-        queued_followups: &'a AtomicUsize,
+        queued_followups: &'a ActivityCounter,
         current_turn: Arc<Mutex<Option<RuntimeCurrentTurn>>>,
     ) -> Self {
         Self {
@@ -856,7 +860,7 @@ enum FollowupCommand {
         client_id: ClientId,
         runtime_context: Option<ClientRuntimeContext>,
         user_event: Box<bcode_session_models::SessionEvent>,
-        queued_steering: Option<Arc<AtomicUsize>>,
+        queued_steering: Option<Arc<ActivityCounter>>,
         cancel_state: Option<Arc<TurnCancelState>>,
         completion: Option<oneshot::Sender<ModelTurnCompletion>>,
         recovering: bool,
@@ -2550,8 +2554,10 @@ impl ServerState {
         state_root: PathBuf,
     ) -> Self {
         let (shutdown, _) = broadcast::channel(1);
+        let activity_changes = ActivityChanges::default();
         let activity_observations =
-            session_activity::ActivityObservations::new(sessions.subscribe_mutations());
+            session_activity::ActivityObservations::new(sessions.subscribe_mutations())
+                .with_changes(activity_changes.clone());
         let session_migrations = bcode_session_migration::SessionMigrationService::default();
         let (workflow_store, workflow_store_unavailable) = init.workflow_store.map_or_else(
             || {
@@ -2642,7 +2648,7 @@ impl ServerState {
             skill_prompt_options: init.skill_prompt_options,
             active_skills: Mutex::default(),
             turn_skills: Mutex::default(),
-            session_runtimes: Mutex::default(),
+            session_runtimes: ActivityMutex::observed(BTreeMap::new(), activity_changes.clone()),
             workflow_activity_scans:
                 workflow_representation::workflow_activity::WorkflowActivityScans::new(
                     std::num::NonZeroUsize::new(16).expect("positive scan budget"),
@@ -2655,6 +2661,8 @@ impl ServerState {
                 ),
             ),
             activity_observations: Mutex::new(activity_observations),
+            activity_watches: activity_watch::ActivityWatchRegistry::default(),
+            activity_changes: activity_changes.clone(),
             turn_admission_locks: Mutex::default(),
             workflow_prompt_admissions: StdMutex::default(),
             workflow_store: StdMutex::new(workflow_store).into(),
@@ -2695,7 +2703,10 @@ impl ServerState {
             workflow_page_barrier: Mutex::new(None),
             workflow_discovery_scans: Arc::new(StdMutex::new(BTreeMap::new())),
             workflow_computations: StdMutex::new(BTreeMap::new()),
-            runtime_work: RuntimeWorkManager::with_metrics(init.metrics.clone()),
+            runtime_work: RuntimeWorkManager::with_metrics_observed(
+                init.metrics.clone(),
+                activity_changes,
+            ),
             ralph_store: init.ralph_store,
             active_ralph_runs: Mutex::default(),
             model_checks: Mutex::default(),
@@ -2766,6 +2777,7 @@ impl ServerState {
 
     async fn unregister_client(self: &Arc<Self>, client_id: ClientId) {
         self.clients.lock().await.remove(&client_id);
+        self.activity_watches.remove_client(client_id);
         for check in self
             .model_checks
             .lock()
@@ -2941,6 +2953,7 @@ impl ServerState {
 
     async fn close_client(self: &Arc<Self>, client_id: ClientId) -> Result<(), ServerError> {
         self.session_observations.remove_client(client_id);
+        self.activity_watches.remove_client(client_id);
         self.interaction_controllers
             .lock()
             .await
@@ -6909,6 +6922,9 @@ const fn request_kind(request: &Request) -> &'static str {
         Request::DeriveSession { .. } => "derive_session",
         Request::SessionDerivationStatus { .. } => "session_derivation_status",
         Request::CancelSessionDerivation { .. } => "cancel_session_derivation",
+        Request::OpenSessionActivityWatch { .. } => "open_session_activity_watch",
+        Request::PullSessionActivityWatch { .. } => "pull_session_activity_watch",
+        Request::CloseSessionActivityWatch { .. } => "close_session_activity_watch",
         Request::OpenSessionObservation { .. } => "open_session_observation",
         Request::PullSessionObservation { .. } => "pull_session_observation",
         Request::CloseSessionObservation { .. } => "close_session_observation",
@@ -7205,6 +7221,51 @@ fn handle_request_inner<'a>(
     writer: &'a SharedWriter,
 ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), ServerError>> + Send + 'a>> {
     match request {
+        SessionLifecycleRequest::OpenSessionActivityWatch { scope } => Box::pin(async move {
+            let result = SessionApplicationHandle::new(state, client_id)
+                .open_activity_watch(scope)
+                .await;
+            let response = result.map_or_else(
+                |error| Response::Err(ErrorResponse::new(error.code, error.message)),
+                |handle| Response::Ok(ResponsePayload::SessionActivityWatchOpened { handle }),
+            );
+            send_response(writer, request_id, response).await
+        }),
+        SessionLifecycleRequest::PullSessionActivityWatch { handle } => Box::pin(async move {
+            let _reply = match state.activity_watches.reserve_reply() {
+                Ok(permit) => permit,
+                Err(error) => {
+                    return send_response(
+                        writer,
+                        request_id,
+                        Response::Err(ErrorResponse::new(error.code, error.message)),
+                    )
+                    .await;
+                }
+            };
+            let result = SessionApplicationHandle::new(state, client_id)
+                .pull_activity_watch(handle)
+                .await;
+            let response = result.map_or_else(
+                |error| Response::Err(ErrorResponse::new(error.code, error.message)),
+                |delivery| {
+                    Response::Ok(ResponsePayload::SessionActivityWatchUpdated {
+                        delivery: Box::new(delivery),
+                    })
+                },
+            );
+            send_response(writer, request_id, response).await
+        }),
+        SessionLifecycleRequest::CloseSessionActivityWatch { handle } => Box::pin(async move {
+            let result = SessionApplicationHandle::new(state, client_id)
+                .close_activity_watch(handle)
+                .await;
+            let response = result.map_or_else(
+                |error| Response::Err(ErrorResponse::new(error.code, error.message)),
+                |closed| Response::Ok(ResponsePayload::SessionActivityWatchClosed { closed }),
+            );
+            send_response(writer, request_id, response).await
+        }),
         SessionLifecycleRequest::OpenSessionObservation { request } => Box::pin(async move {
             let result = async {
                 use bcode_session_models::SessionObservationError as E;
@@ -11816,10 +11877,12 @@ async fn explicit_session_ownership_release_outcome_inner(
         match state.sessions.release_session_ownership(session_id).await? {
             bcode_session::SessionOwnershipRelease::Released => {
                 state.activity_observations.lock().await.release(session_id);
+                state.activity_changes.for_session(session_id).notify();
                 SessionOwnershipReleaseOutcome::Released
             }
             bcode_session::SessionOwnershipRelease::AlreadyUnowned => {
                 state.activity_observations.lock().await.release(session_id);
+                state.activity_changes.for_session(session_id).notify();
                 SessionOwnershipReleaseOutcome::AlreadyUnowned
             }
             bcode_session::SessionOwnershipRelease::Blocked(snapshot) => {
@@ -16534,6 +16597,7 @@ async fn activate_pending_steering_inner(
 ) -> Result<bool, bcode_session::SessionError> {
     let lock = turn_admission_lock(state, session_id).await;
     let _guard = lock.lock().await;
+    let _activity_change = context.queued_followups.change_guard();
     let mut current = context.current_turn.lock().await;
     let Some(turn) = current.as_mut() else {
         return Ok(false);
@@ -17002,7 +17066,7 @@ async fn session_runtime_handle(
     state: &Arc<ServerState>,
     session_id: SessionId,
 ) -> SessionRuntimeHandle {
-    let mut runtimes = state.session_runtimes.lock().await;
+    let mut runtimes = state.session_runtimes.lock_for(session_id).await;
     if let Some(handle) = runtimes.get(&session_id) {
         return handle.clone();
     }
@@ -17010,12 +17074,21 @@ async fn session_runtime_handle(
     let (followup_commands, followup_receiver) = mpsc::channel(128);
     let (steering_commands, steering_receiver) = mpsc::channel(128);
     let (cancel_commands, cancel_receiver) = mpsc::channel(32);
-    let queued_followups = Arc::new(AtomicUsize::new(0));
-    let queued_steering = Arc::new(AtomicUsize::new(0));
+    let queued_followups = Arc::new(ActivityCounter::observed(
+        0,
+        state.activity_changes.for_session(session_id),
+    ));
+    let queued_steering = Arc::new(ActivityCounter::observed(
+        0,
+        state.activity_changes.for_session(session_id),
+    ));
     let followup_receiver = Arc::new(Mutex::new(Some(followup_receiver)));
     let steering_receiver = Arc::new(Mutex::new(Some(steering_receiver)));
     let cancel_receiver = Arc::new(Mutex::new(Some(cancel_receiver)));
-    let phase = Arc::new(Mutex::new(SessionRuntimePhase::Idle));
+    let phase = Arc::new(ActivityMutex::observed(
+        SessionRuntimePhase::Idle,
+        state.activity_changes.for_session(session_id),
+    ));
     let current_turn = Arc::new(Mutex::new(None));
     let handle = SessionRuntimeHandle {
         followup_commands,
@@ -17570,8 +17643,8 @@ async fn run_session_runtime(
     followup_commands: Arc<Mutex<Option<mpsc::Receiver<FollowupCommand>>>>,
     steering_commands: Arc<Mutex<Option<mpsc::Receiver<SteeringCommand>>>>,
     cancel_commands: Arc<Mutex<Option<mpsc::Receiver<CancelCommand>>>>,
-    queued_followups: Arc<AtomicUsize>,
-    phase: Arc<Mutex<SessionRuntimePhase>>,
+    queued_followups: Arc<ActivityCounter>,
+    phase: Arc<ActivityMutex<SessionRuntimePhase>>,
     current_turn: Arc<Mutex<Option<RuntimeCurrentTurn>>>,
 ) {
     Box::pin(run_session_runtime_inner(
@@ -17594,8 +17667,8 @@ async fn run_session_runtime_inner(
     followup_commands: Arc<Mutex<Option<mpsc::Receiver<FollowupCommand>>>>,
     steering_commands: Arc<Mutex<Option<mpsc::Receiver<SteeringCommand>>>>,
     cancel_commands: Arc<Mutex<Option<mpsc::Receiver<CancelCommand>>>>,
-    queued_followups: Arc<AtomicUsize>,
-    phase: Arc<Mutex<SessionRuntimePhase>>,
+    queued_followups: Arc<ActivityCounter>,
+    phase: Arc<ActivityMutex<SessionRuntimePhase>>,
     current_turn: Arc<Mutex<Option<RuntimeCurrentTurn>>>,
 ) {
     let mut permit = SessionTurnPermit::new(session_id);
@@ -17972,7 +18045,7 @@ enum RuntimeQueueCommand {
     Followup(Box<FollowupCommand>),
 }
 
-fn queued_steering_counter(command: &FollowupCommand) -> Option<&AtomicUsize> {
+fn queued_steering_counter(command: &FollowupCommand) -> Option<&ActivityCounter> {
     match command {
         FollowupCommand::ExecuteTurn {
             queued_steering: Some(queued_steering),
@@ -17986,7 +18059,7 @@ fn queued_steering_counter(command: &FollowupCommand) -> Option<&AtomicUsize> {
 async fn next_runtime_queue_command(
     cancel_commands: &mut mpsc::Receiver<CancelCommand>,
     followup_commands: &mut mpsc::Receiver<FollowupCommand>,
-    queued_followups: &AtomicUsize,
+    queued_followups: &ActivityCounter,
 ) -> Option<RuntimeQueueCommand> {
     tokio::select! {
         biased;
@@ -18017,7 +18090,7 @@ async fn service_cancel_commands(
     session_id: SessionId,
     cancel_commands: &mut mpsc::Receiver<CancelCommand>,
     followup_commands: &mut mpsc::Receiver<FollowupCommand>,
-    queued_followups: &AtomicUsize,
+    queued_followups: &ActivityCounter,
 ) {
     while let Ok(command) = cancel_commands.try_recv() {
         process_cancel_turn_command(
@@ -18063,7 +18136,7 @@ async fn process_cancel_turn_command(
     state: &ServerState,
     session_id: SessionId,
     followup_commands: &mut mpsc::Receiver<FollowupCommand>,
-    queued_followups: &AtomicUsize,
+    queued_followups: &ActivityCounter,
     command: CancelCommand,
 ) {
     Box::pin(process_cancel_turn_command_inner(
@@ -18080,7 +18153,7 @@ async fn process_cancel_turn_command_inner(
     state: &ServerState,
     session_id: SessionId,
     followup_commands: &mut mpsc::Receiver<FollowupCommand>,
-    queued_followups: &AtomicUsize,
+    queued_followups: &ActivityCounter,
     command: CancelCommand,
 ) {
     let lock = turn_admission_lock(state, session_id).await;
@@ -18356,10 +18429,13 @@ async fn service_runtime_priority_commands(
 }
 
 async fn set_runtime_phase(
-    phase: &Arc<Mutex<SessionRuntimePhase>>,
+    phase: &Arc<ActivityMutex<SessionRuntimePhase>>,
     next_phase: SessionRuntimePhase,
 ) {
-    *phase.lock().await = next_phase;
+    let mut current = phase.lock().await;
+    if *current != next_phase {
+        *current = next_phase;
+    }
 }
 
 async fn begin_current_turn(
@@ -18369,6 +18445,7 @@ async fn begin_current_turn(
     cancel_state: Arc<TurnCancelState>,
     execution: TurnExecutionOptions,
 ) {
+    let _activity_change = context.queued_followups.change_guard();
     let mut current_turn = context.current_turn.lock().await;
     debug_assert!(
         current_turn.is_none(),
@@ -18388,6 +18465,7 @@ async fn begin_current_turn(
 }
 
 async fn finish_current_turn(context: &RuntimeCommandContext<'_>) {
+    let _activity_change = context.queued_followups.change_guard();
     let mut current_turn = context.current_turn.lock().await;
     debug_assert!(
         current_turn.is_some(),
@@ -18400,6 +18478,7 @@ async fn begin_provider_round(
     context: &RuntimeCommandContext<'_>,
     model_turn: ModelRequestAttempt,
 ) {
+    let _activity_change = context.queued_followups.change_guard();
     let mut current_turn_guard = context.current_turn.lock().await;
     let Some(current_turn) = current_turn_guard.as_mut() else {
         debug_assert!(
@@ -18420,6 +18499,7 @@ async fn take_managed_compaction_attempt(
     context: &RuntimeCommandContext<'_>,
     provider_turn_id: &str,
 ) -> Option<ModelRequestAttempt> {
+    let _activity_change = context.queued_followups.change_guard();
     let mut current_turn = context.current_turn.lock().await;
     let attempt = current_turn.as_mut()?.model.as_mut()?;
     if attempt.provider_turn_id != provider_turn_id || attempt.managed_compaction_persisted {
@@ -18432,6 +18512,7 @@ async fn take_managed_compaction_attempt(
 }
 
 async fn finish_provider_round(context: &RuntimeCommandContext<'_>) -> Option<ModelRequestAttempt> {
+    let _activity_change = context.queued_followups.change_guard();
     let mut current_turn_guard = context.current_turn.lock().await;
     let Some(current_turn) = current_turn_guard.as_mut() else {
         debug_assert!(
@@ -18453,11 +18534,11 @@ async fn finish_provider_round(context: &RuntimeCommandContext<'_>) -> Option<Mo
 async fn process_existing_user_event_command(
     state: &Arc<ServerState>,
     permit: &mut SessionTurnPermit,
-    phase: Arc<Mutex<SessionRuntimePhase>>,
+    phase: Arc<ActivityMutex<SessionRuntimePhase>>,
     followup_commands: &mut mpsc::Receiver<FollowupCommand>,
     steering_commands: &mut mpsc::Receiver<SteeringCommand>,
     cancel_commands: &mut mpsc::Receiver<CancelCommand>,
-    queued_followups: &AtomicUsize,
+    queued_followups: &ActivityCounter,
     current_turn: Arc<Mutex<Option<RuntimeCurrentTurn>>>,
     client_id: ClientId,
     runtime_context: Option<ClientRuntimeContext>,
@@ -18497,11 +18578,11 @@ async fn process_existing_user_event_command(
 async fn process_skill_invocation_command(
     state: &Arc<ServerState>,
     permit: &mut SessionTurnPermit,
-    phase: Arc<Mutex<SessionRuntimePhase>>,
+    phase: Arc<ActivityMutex<SessionRuntimePhase>>,
     followup_commands: &mut mpsc::Receiver<FollowupCommand>,
     steering_commands: &mut mpsc::Receiver<SteeringCommand>,
     cancel_commands: &mut mpsc::Receiver<CancelCommand>,
-    queued_followups: &AtomicUsize,
+    queued_followups: &ActivityCounter,
     current_turn: Arc<Mutex<Option<RuntimeCurrentTurn>>>,
     client_id: ClientId,
     runtime_context: Option<ClientRuntimeContext>,
@@ -18654,11 +18735,11 @@ async fn process_skill_invocation_command(
 async fn process_restart_session_compaction_command(
     state: &ServerState,
     session_id: SessionId,
-    phase: Arc<Mutex<SessionRuntimePhase>>,
+    phase: Arc<ActivityMutex<SessionRuntimePhase>>,
     followup_commands: &mut mpsc::Receiver<FollowupCommand>,
     steering_commands: &mut mpsc::Receiver<SteeringCommand>,
     cancel_commands: &mut mpsc::Receiver<CancelCommand>,
-    queued_followups: &AtomicUsize,
+    queued_followups: &ActivityCounter,
     current_turn: Arc<Mutex<Option<RuntimeCurrentTurn>>>,
     client_id: ClientId,
     selection: SessionModelSelection,
@@ -18676,6 +18757,7 @@ async fn process_restart_session_compaction_command(
         cancel_state: Arc::clone(&cancel_state),
         model: None,
     });
+    state.activity_changes.for_session(session_id).notify();
     set_runtime_phase(&phase, SessionRuntimePhase::Compacting).await;
     let mut command_context = RuntimeCommandContext::new(
         followup_commands,
@@ -18693,6 +18775,7 @@ async fn process_restart_session_compaction_command(
     ))
     .await;
     *current_turn.lock().await = None;
+    state.activity_changes.for_session(session_id).notify();
     set_runtime_phase(&phase, SessionRuntimePhase::Idle).await;
     result.map(|completion| completion.message)
 }
@@ -18701,11 +18784,11 @@ async fn process_restart_session_compaction_command(
 async fn process_compact_session_command(
     state: &ServerState,
     session_id: SessionId,
-    phase: Arc<Mutex<SessionRuntimePhase>>,
+    phase: Arc<ActivityMutex<SessionRuntimePhase>>,
     followup_commands: &mut mpsc::Receiver<FollowupCommand>,
     steering_commands: &mut mpsc::Receiver<SteeringCommand>,
     cancel_commands: &mut mpsc::Receiver<CancelCommand>,
-    queued_followups: &AtomicUsize,
+    queued_followups: &ActivityCounter,
     current_turn: Arc<Mutex<Option<RuntimeCurrentTurn>>>,
     client_id: ClientId,
     selection: SessionModelSelection,
@@ -18722,6 +18805,7 @@ async fn process_compact_session_command(
         cancel_state: Arc::clone(&cancel_state),
         model: None,
     });
+    state.activity_changes.for_session(session_id).notify();
     set_runtime_phase(&phase, SessionRuntimePhase::Compacting).await;
     let mut command_context = RuntimeCommandContext::new(
         followup_commands,
@@ -18741,6 +18825,7 @@ async fn process_compact_session_command(
     ))
     .await;
     *current_turn.lock().await = None;
+    state.activity_changes.for_session(session_id).notify();
     set_runtime_phase(&phase, SessionRuntimePhase::Idle).await;
     result.map(|completion| completion.message)
 }
@@ -21114,16 +21199,17 @@ async fn handle_rebuild_session_summary(
 #[allow(clippy::too_many_arguments)]
 async fn process_rebuild_summary_command(
     state: &ServerState,
-    phase: Arc<Mutex<SessionRuntimePhase>>,
+    phase: Arc<ActivityMutex<SessionRuntimePhase>>,
     followup_commands: &mut mpsc::Receiver<FollowupCommand>,
     steering_commands: &mut mpsc::Receiver<SteeringCommand>,
     cancel_commands: &mut mpsc::Receiver<CancelCommand>,
-    queued_followups: &AtomicUsize,
+    queued_followups: &ActivityCounter,
     current_turn: Arc<Mutex<Option<RuntimeCurrentTurn>>>,
     client_id: ClientId,
     selection: SessionModelSelection,
     request: bcode_session_models::SessionSummaryRebuildRequest,
 ) -> Result<String, CompactionError> {
+    let session_id = request.session_id;
     let cancel_state = Arc::new(TurnCancelState::default());
     *current_turn.lock().await = Some(RuntimeCurrentTurn {
         interaction_route: None,
@@ -21140,6 +21226,7 @@ async fn process_rebuild_summary_command(
         cancel_state: Arc::clone(&cancel_state),
         model: None,
     });
+    state.activity_changes.for_session(session_id).notify();
     set_runtime_phase(&phase, SessionRuntimePhase::Compacting).await;
     let mut context = RuntimeCommandContext::new(
         followup_commands,
@@ -21157,6 +21244,7 @@ async fn process_rebuild_summary_command(
     ))
     .await;
     *current_turn.lock().await = None;
+    state.activity_changes.for_session(session_id).notify();
     set_runtime_phase(&phase, SessionRuntimePhase::Idle).await;
     result
 }
@@ -21930,7 +22018,7 @@ struct ProviderErrorRetryContext<'a> {
     remote_catalog_retry_rules: &'a [bcode_model::ProviderRetryRule],
     retry_config: &'a bcode_config::ModelRetryConfig,
     cancel_state: &'a TurnCancelState,
-    phase: &'a Arc<Mutex<SessionRuntimePhase>>,
+    phase: &'a Arc<ActivityMutex<SessionRuntimePhase>>,
     provider_round: u32,
     completed_tool_rounds: u32,
     segment_order: u32,
@@ -21998,7 +22086,7 @@ async fn run_model_turn(
     client_id: ClientId,
     runtime_context: Option<ClientRuntimeContext>,
     command_context: &mut RuntimeCommandContext<'_>,
-    phase: &Arc<Mutex<SessionRuntimePhase>>,
+    phase: &Arc<ActivityMutex<SessionRuntimePhase>>,
     supplied_cancel_state: Option<Arc<TurnCancelState>>,
     recovering: bool,
 ) -> ModelTurnCompletion {
@@ -22033,7 +22121,7 @@ async fn run_model_turn_lifecycle(
     client_id: ClientId,
     runtime_context: Option<ClientRuntimeContext>,
     command_context: &mut RuntimeCommandContext<'_>,
-    phase: &Arc<Mutex<SessionRuntimePhase>>,
+    phase: &Arc<ActivityMutex<SessionRuntimePhase>>,
     supplied_cancel_state: Option<Arc<TurnCancelState>>,
     recovering: bool,
 ) -> ModelTurnCompletion {
@@ -22104,7 +22192,7 @@ async fn prepare_turn_lifecycle(
     client_id: ClientId,
     runtime_context: Option<&ClientRuntimeContext>,
     command_context: &mut RuntimeCommandContext<'_>,
-    phase: &Arc<Mutex<SessionRuntimePhase>>,
+    phase: &Arc<ActivityMutex<SessionRuntimePhase>>,
     supplied_cancel_state: Option<Arc<TurnCancelState>>,
     recovering: bool,
 ) -> PreparedTurnLifecycle {
@@ -22212,7 +22300,7 @@ async fn settle_turn_lifecycle(
     session_id: SessionId,
     trigger_event: &bcode_session_models::SessionEvent,
     command_context: &mut RuntimeCommandContext<'_>,
-    phase: &Arc<Mutex<SessionRuntimePhase>>,
+    phase: &Arc<ActivityMutex<SessionRuntimePhase>>,
     recovering: bool,
     prepared: PreparedTurnLifecycle,
     completion: ModelTurnCompletion,
@@ -22241,6 +22329,7 @@ async fn settle_turn_lifecycle(
     .await;
     Box::pin(interaction_operations::cancel_pending_permissions_for_session(state, session_id))
         .await;
+    let _activity_change = command_context.queued_followups.change_guard();
     if let Some(turn) = command_context.current_turn.lock().await.as_mut() {
         turn.execution = None;
     }
@@ -22474,6 +22563,7 @@ async fn prepare_model_turn_setup(
             "accepted execution context is unavailable or changed",
         ));
     };
+    let _activity_change = command_context.queued_followups.change_guard();
     if let Some(turn) = command_context.current_turn.lock().await.as_mut() {
         turn.selection = Some(selection.clone());
     }
@@ -22511,6 +22601,7 @@ async fn prepare_model_turn_setup(
             }
         };
         selection.native_default = false;
+        let _activity_change = command_context.queued_followups.change_guard();
         if let Some(turn) = command_context.current_turn.lock().await.as_mut() {
             turn.selection = Some(selection.clone());
         }
@@ -22521,6 +22612,7 @@ async fn prepare_model_turn_setup(
             error,
         ));
     }
+    let _activity_change = command_context.queued_followups.change_guard();
     if let Some(turn) = command_context.current_turn.lock().await.as_mut() {
         turn.selection = Some(selection.clone());
     }
@@ -22761,7 +22853,7 @@ async fn run_model_turn_inner(
     runtime_context: Option<ClientRuntimeContext>,
     cancel_state: Arc<TurnCancelState>,
     command_context: &mut RuntimeCommandContext<'_>,
-    phase: &Arc<Mutex<SessionRuntimePhase>>,
+    phase: &Arc<ActivityMutex<SessionRuntimePhase>>,
     recovering: bool,
 ) -> ModelTurnCompletion {
     let PreparedModelTurnSetup {
@@ -53139,7 +53231,7 @@ library = "test"
         let (followup_commands, mut followups) = mpsc::channel(1);
         let (steering_commands, mut steering) = mpsc::channel(1);
         let (cancel_commands, mut cancels) = mpsc::channel(1);
-        let queued = Arc::new(AtomicUsize::new(0));
+        let queued = Arc::new(ActivityCounter::new(0));
         state.session_runtimes.lock().await.insert(
             session_id,
             SessionRuntimeHandle {
@@ -53147,8 +53239,8 @@ library = "test"
                 steering_commands,
                 cancel_commands,
                 queued_followups: Arc::clone(&queued),
-                queued_steering: Arc::new(AtomicUsize::new(0)),
-                phase: Arc::new(Mutex::new(SessionRuntimePhase::ProviderActive)),
+                queued_steering: Arc::new(ActivityCounter::new(0)),
+                phase: Arc::new(ActivityMutex::new(SessionRuntimePhase::ProviderActive)),
                 current_turn: Arc::clone(&current_turn),
             },
         );
@@ -53239,9 +53331,9 @@ library = "test"
             followup_commands,
             steering_commands,
             cancel_commands,
-            queued_followups: Arc::new(AtomicUsize::new(1)),
-            queued_steering: Arc::new(AtomicUsize::new(0)),
-            phase: Arc::new(Mutex::new(SessionRuntimePhase::ProviderActive)),
+            queued_followups: Arc::new(ActivityCounter::new(1)),
+            queued_steering: Arc::new(ActivityCounter::new(0)),
+            phase: Arc::new(ActivityMutex::new(SessionRuntimePhase::ProviderActive)),
             current_turn: Arc::new(Mutex::new(Some(RuntimeCurrentTurn {
                 interaction_route: None,
                 kind: RuntimeOperationKind::ModelTurn,
@@ -53326,7 +53418,7 @@ library = "test"
         let state = test_server_state_with_fake_provider(SessionManager::default());
         let session_id = SessionId::new();
         let (_sender, mut followups) = mpsc::channel(1);
-        let queued_followups = AtomicUsize::new(1);
+        let queued_followups = ActivityCounter::new(1);
         for expected_turn_id in [Some("finished".to_owned()), None] {
             let (response, completion) = oneshot::channel();
             process_cancel_turn_command(
@@ -53370,9 +53462,9 @@ library = "test"
                 followup_commands,
                 steering_commands,
                 cancel_commands,
-                queued_followups: Arc::new(AtomicUsize::new(0)),
-                queued_steering: Arc::new(AtomicUsize::new(0)),
-                phase: Arc::new(Mutex::new(SessionRuntimePhase::Compacting)),
+                queued_followups: Arc::new(ActivityCounter::new(0)),
+                queued_steering: Arc::new(ActivityCounter::new(0)),
+                phase: Arc::new(ActivityMutex::new(SessionRuntimePhase::Compacting)),
                 current_turn: Arc::new(Mutex::new(Some(RuntimeCurrentTurn {
                     interaction_route: None,
                     kind: RuntimeOperationKind::ModelTurn,
@@ -53435,7 +53527,7 @@ library = "test"
         let (_followup, mut followups) = mpsc::channel(1);
         let (_steering, mut steering) = mpsc::channel(1);
         let (_cancel, mut cancels) = mpsc::channel(1);
-        let queued = AtomicUsize::new(0);
+        let queued = ActivityCounter::new(0);
         let current = Arc::new(Mutex::new(None));
         let mut commands = RuntimeCommandContext::new(
             &mut followups,
@@ -53444,7 +53536,7 @@ library = "test"
             &queued,
             Arc::clone(&current),
         );
-        let phase = Arc::new(Mutex::new(SessionRuntimePhase::Idle));
+        let phase = Arc::new(ActivityMutex::new(SessionRuntimePhase::Idle));
         let mut permit = SessionTurnPermit::new(session.id);
         let completion = run_model_turn(
             &state,
@@ -53502,7 +53594,7 @@ library = "test"
         let (_followup, mut followups) = mpsc::channel(1);
         let (_steering, mut steering) = mpsc::channel(1);
         let (_cancel, mut cancels) = mpsc::channel(1);
-        let queued = AtomicUsize::new(0);
+        let queued = ActivityCounter::new(0);
         let current = Arc::new(Mutex::new(None));
         let mut commands = RuntimeCommandContext::new(
             &mut followups,
@@ -53511,7 +53603,7 @@ library = "test"
             &queued,
             Arc::clone(&current),
         );
-        let phase = Arc::new(Mutex::new(SessionRuntimePhase::Idle));
+        let phase = Arc::new(ActivityMutex::new(SessionRuntimePhase::Idle));
         let turn = run_model_turn_inner(
             &state,
             session_id,
@@ -53530,7 +53622,7 @@ library = "test"
             Arc::new(Mutex::new(None)),
             Arc::new(Mutex::new(None)),
             Arc::new(Mutex::new(None)),
-            Arc::new(AtomicUsize::new(0)),
+            Arc::new(ActivityCounter::new(0)),
             phase,
             current,
         );
@@ -55780,7 +55872,7 @@ library = "test"
         let (_followup_tx, mut followup_rx) = mpsc::channel(1);
         let (_steering_tx, mut steering_rx) = mpsc::channel(1);
         let (_cancel_tx, mut cancel_rx) = mpsc::channel(1);
-        let queued_followups = AtomicUsize::new(0);
+        let queued_followups = ActivityCounter::new(0);
         let mut command_context = RuntimeCommandContext::new(
             &mut followup_rx,
             &mut steering_rx,
@@ -55795,7 +55887,7 @@ library = "test"
             ClientId::new(),
             Some(runtime_context),
             &mut command_context,
-            &Arc::new(Mutex::new(SessionRuntimePhase::Idle)),
+            &Arc::new(ActivityMutex::new(SessionRuntimePhase::Idle)),
             None,
             false,
         )
@@ -55813,7 +55905,7 @@ library = "test"
         let (_followup_tx, mut followup_rx) = mpsc::channel(1);
         let (_steering_tx, mut steering_rx) = mpsc::channel(1);
         let (_cancel_tx, mut cancel_rx) = mpsc::channel(1);
-        let queued_followups = AtomicUsize::new(0);
+        let queued_followups = ActivityCounter::new(0);
         let mut command_context = RuntimeCommandContext::new(
             &mut followup_rx,
             &mut steering_rx,
@@ -55828,7 +55920,7 @@ library = "test"
             ClientId::new(),
             Some(runtime_context),
             &mut command_context,
-            &Arc::new(Mutex::new(SessionRuntimePhase::Idle)),
+            &Arc::new(ActivityMutex::new(SessionRuntimePhase::Idle)),
             cancel_state,
             false,
         )
@@ -55862,7 +55954,7 @@ library = "test"
         let (_followup_tx, mut followup_rx) = mpsc::channel(1);
         let (steering_tx, mut steering_rx) = mpsc::channel(1);
         let (_cancel_tx, mut cancel_rx) = mpsc::channel(1);
-        let queued_followups = AtomicUsize::new(0);
+        let queued_followups = ActivityCounter::new(0);
         let mut command_context = RuntimeCommandContext::new(
             &mut followup_rx,
             &mut steering_rx,
@@ -55870,7 +55962,7 @@ library = "test"
             &queued_followups,
             Arc::new(Mutex::new(None)),
         );
-        let phase = Arc::new(Mutex::new(SessionRuntimePhase::Idle));
+        let phase = Arc::new(ActivityMutex::new(SessionRuntimePhase::Idle));
         bcode_fake_provider_plugin::reset_fake_compaction_summary_signal(&signal);
         let turn = run_model_turn(
             state,
@@ -57174,7 +57266,7 @@ library = "test"
         let (_followup_tx, mut followup_rx) = mpsc::channel(1);
         let (_steering_tx, mut steering_rx) = mpsc::channel(1);
         let (_cancel_tx, mut cancel_rx) = mpsc::channel(1);
-        let queued = AtomicUsize::new(0);
+        let queued = ActivityCounter::new(0);
         let mut context = RuntimeCommandContext::new(
             &mut followup_rx,
             &mut steering_rx,
@@ -60732,9 +60824,9 @@ library = "test"
         let (_followup_tx, mut followup_rx) = mpsc::channel(1);
         let (_steering_tx, mut steering_rx) = mpsc::channel(1);
         let (_cancel_tx, mut cancel_rx) = mpsc::channel(1);
-        let queued_followups = AtomicUsize::new(0);
+        let queued_followups = ActivityCounter::new(0);
         let current_turn = Arc::new(Mutex::new(None));
-        let phase = Arc::new(Mutex::new(SessionRuntimePhase::Idle));
+        let phase = Arc::new(ActivityMutex::new(SessionRuntimePhase::Idle));
 
         Box::pin(process_compact_session_command(
             &state,
@@ -62037,7 +62129,7 @@ library = "test"
         let (_followup_tx, mut followup_rx) = mpsc::channel(1);
         let (_steering_tx, mut steering_rx) = mpsc::channel(1);
         let (_cancel_tx, mut cancel_rx) = mpsc::channel(1);
-        let queued_followups = AtomicUsize::new(0);
+        let queued_followups = ActivityCounter::new(0);
         let current_turn = Arc::new(Mutex::new(None));
         let mut command_context = RuntimeCommandContext::new(
             &mut followup_rx,
@@ -62117,7 +62209,7 @@ library = "test"
         let (_followup_tx, mut followup_rx) = mpsc::channel(1);
         let (_steering_tx, mut steering_rx) = mpsc::channel(1);
         let (_cancel_tx, mut cancel_rx) = mpsc::channel(1);
-        let queued_followups = AtomicUsize::new(0);
+        let queued_followups = ActivityCounter::new(0);
         let current_turn = Arc::new(Mutex::new(None));
         let mut command_context = RuntimeCommandContext::new(
             &mut followup_rx,
@@ -67593,9 +67685,9 @@ library = "test"
                 followup_commands,
                 steering_commands,
                 cancel_commands,
-                queued_followups: Arc::new(AtomicUsize::new(0)),
-                queued_steering: Arc::new(AtomicUsize::new(0)),
-                phase: Arc::new(Mutex::new(SessionRuntimePhase::ProviderActive)),
+                queued_followups: Arc::new(ActivityCounter::new(0)),
+                queued_steering: Arc::new(ActivityCounter::new(0)),
+                phase: Arc::new(ActivityMutex::new(SessionRuntimePhase::ProviderActive)),
                 current_turn: Arc::new(Mutex::new(Some(RuntimeCurrentTurn {
                     interaction_route: None,
                     kind: RuntimeOperationKind::ModelTurn,
@@ -71599,9 +71691,9 @@ event_symbol = "bcode_plugin_handle_event_v1"
                 followup_commands,
                 steering_commands,
                 cancel_commands,
-                queued_followups: Arc::new(AtomicUsize::new(1)),
-                queued_steering: Arc::new(AtomicUsize::new(0)),
-                phase: Arc::new(Mutex::new(SessionRuntimePhase::ProviderActive)),
+                queued_followups: Arc::new(ActivityCounter::new(1)),
+                queued_steering: Arc::new(ActivityCounter::new(0)),
+                phase: Arc::new(ActivityMutex::new(SessionRuntimePhase::ProviderActive)),
                 current_turn: Arc::new(Mutex::new(None)),
             },
         );
@@ -72615,9 +72707,9 @@ event_symbol = "bcode_plugin_handle_event_v1"
             followup_commands,
             steering_commands,
             cancel_commands,
-            queued_followups: Arc::new(AtomicUsize::new(0)),
-            queued_steering: Arc::new(AtomicUsize::new(0)),
-            phase: Arc::new(Mutex::new(SessionRuntimePhase::Idle)),
+            queued_followups: Arc::new(ActivityCounter::new(0)),
+            queued_steering: Arc::new(ActivityCounter::new(0)),
+            phase: Arc::new(ActivityMutex::new(SessionRuntimePhase::Idle)),
             current_turn: Arc::new(Mutex::new(None)),
         };
         state
@@ -72709,8 +72801,8 @@ event_symbol = "bcode_plugin_handle_event_v1"
             Arc::new(Mutex::new(Some(followup_receiver))),
             Arc::new(Mutex::new(Some(steering_receiver))),
             Arc::new(Mutex::new(Some(cancel_receiver))),
-            Arc::new(AtomicUsize::new(1)),
-            Arc::new(Mutex::new(SessionRuntimePhase::Idle)),
+            Arc::new(ActivityCounter::new(1)),
+            Arc::new(ActivityMutex::new(SessionRuntimePhase::Idle)),
             Arc::new(Mutex::new(None)),
         )
         .await;
@@ -72746,9 +72838,9 @@ event_symbol = "bcode_plugin_handle_event_v1"
                 followup_commands,
                 steering_commands,
                 cancel_commands,
-                queued_followups: Arc::new(AtomicUsize::new(0)),
-                queued_steering: Arc::new(AtomicUsize::new(0)),
-                phase: Arc::new(Mutex::new(SessionRuntimePhase::Idle)),
+                queued_followups: Arc::new(ActivityCounter::new(0)),
+                queued_steering: Arc::new(ActivityCounter::new(0)),
+                phase: Arc::new(ActivityMutex::new(SessionRuntimePhase::Idle)),
                 current_turn: Arc::new(Mutex::new(None)),
             },
         );
@@ -72839,9 +72931,9 @@ event_symbol = "bcode_plugin_handle_event_v1"
             followup_commands,
             steering_commands,
             cancel_commands,
-            queued_followups: Arc::new(AtomicUsize::new(0)),
-            queued_steering: Arc::new(AtomicUsize::new(0)),
-            phase: Arc::new(Mutex::new(SessionRuntimePhase::Idle)),
+            queued_followups: Arc::new(ActivityCounter::new(0)),
+            queued_steering: Arc::new(ActivityCounter::new(0)),
+            phase: Arc::new(ActivityMutex::new(SessionRuntimePhase::Idle)),
             current_turn: Arc::new(Mutex::new(None)),
         };
         state
@@ -73008,9 +73100,9 @@ event_symbol = "bcode_plugin_handle_event_v1"
                 followup_commands,
                 steering_commands,
                 cancel_commands,
-                queued_followups: Arc::new(AtomicUsize::new(0)),
-                queued_steering: Arc::new(AtomicUsize::new(0)),
-                phase: Arc::new(Mutex::new(SessionRuntimePhase::Idle)),
+                queued_followups: Arc::new(ActivityCounter::new(0)),
+                queued_steering: Arc::new(ActivityCounter::new(0)),
+                phase: Arc::new(ActivityMutex::new(SessionRuntimePhase::Idle)),
                 current_turn: Arc::clone(&replacement_turn),
             },
         );
@@ -73128,14 +73220,14 @@ event_symbol = "bcode_plugin_handle_event_v1"
         let (steering_commands, mut steering) = mpsc::channel(8);
         let (cancel_commands, mut cancels) = mpsc::channel(8);
         let current = Arc::new(Mutex::new(None));
-        let queued = Arc::new(AtomicUsize::new(0));
+        let queued = Arc::new(ActivityCounter::new(0));
         let handle = SessionRuntimeHandle {
             followup_commands,
             steering_commands,
             cancel_commands,
             queued_followups: Arc::clone(&queued),
-            queued_steering: Arc::new(AtomicUsize::new(0)),
-            phase: Arc::new(Mutex::new(SessionRuntimePhase::ProviderActive)),
+            queued_steering: Arc::new(ActivityCounter::new(0)),
+            phase: Arc::new(ActivityMutex::new(SessionRuntimePhase::ProviderActive)),
             current_turn: Arc::clone(&current),
         };
         state
@@ -73197,7 +73289,7 @@ event_symbol = "bcode_plugin_handle_event_v1"
         let (followup_commands, mut followups) = mpsc::channel(1);
         let (steering_commands, _steering) = mpsc::channel(1);
         let (cancel_commands, _cancels) = mpsc::channel(1);
-        let queued = Arc::new(AtomicUsize::new(0));
+        let queued = Arc::new(ActivityCounter::new(0));
         state.session_runtimes.lock().await.insert(
             session.id,
             SessionRuntimeHandle {
@@ -73205,8 +73297,8 @@ event_symbol = "bcode_plugin_handle_event_v1"
                 steering_commands,
                 cancel_commands,
                 queued_followups: Arc::clone(&queued),
-                queued_steering: Arc::new(AtomicUsize::new(0)),
-                phase: Arc::new(Mutex::new(SessionRuntimePhase::Idle)),
+                queued_steering: Arc::new(ActivityCounter::new(0)),
+                phase: Arc::new(ActivityMutex::new(SessionRuntimePhase::Idle)),
                 current_turn: Arc::new(Mutex::new(None)),
             },
         );
@@ -73291,7 +73383,7 @@ event_symbol = "bcode_plugin_handle_event_v1"
         let (_followup_tx, mut followups) = mpsc::channel(1);
         let (_steering_tx, mut steering) = mpsc::channel(1);
         let (_cancel_tx, mut cancels) = mpsc::channel(1);
-        let queued = AtomicUsize::new(0);
+        let queued = ActivityCounter::new(0);
         let current = Arc::new(Mutex::new(None));
         let context = RuntimeCommandContext::new(
             &mut followups,
@@ -74116,7 +74208,7 @@ event_symbol = "bcode_plugin_handle_event_v1"
         let (followup_commands, mut followups) = mpsc::channel(1);
         let (steering_commands, _steering) = mpsc::channel(1);
         let (cancel_commands, _cancels) = mpsc::channel(1);
-        let queued = Arc::new(AtomicUsize::new(0));
+        let queued = Arc::new(ActivityCounter::new(0));
         state.session_runtimes.lock().await.insert(
             session.id,
             SessionRuntimeHandle {
@@ -74124,8 +74216,8 @@ event_symbol = "bcode_plugin_handle_event_v1"
                 steering_commands,
                 cancel_commands,
                 queued_followups: Arc::clone(&queued),
-                queued_steering: Arc::new(AtomicUsize::new(0)),
-                phase: Arc::new(Mutex::new(SessionRuntimePhase::Idle)),
+                queued_steering: Arc::new(ActivityCounter::new(0)),
+                phase: Arc::new(ActivityMutex::new(SessionRuntimePhase::Idle)),
                 current_turn: Arc::new(Mutex::new(None)),
             },
         );
@@ -74928,9 +75020,9 @@ event_symbol = "bcode_plugin_handle_event_v1"
                 followup_commands,
                 steering_commands,
                 cancel_commands,
-                queued_followups: Arc::new(AtomicUsize::new(0)),
-                queued_steering: Arc::new(AtomicUsize::new(0)),
-                phase: Arc::new(Mutex::new(SessionRuntimePhase::ProviderActive)),
+                queued_followups: Arc::new(ActivityCounter::new(0)),
+                queued_steering: Arc::new(ActivityCounter::new(0)),
+                phase: Arc::new(ActivityMutex::new(SessionRuntimePhase::ProviderActive)),
                 current_turn: Arc::new(Mutex::new(Some(RuntimeCurrentTurn {
                     interaction_route: Some(route.clone()),
                     kind: RuntimeOperationKind::ModelTurn,
@@ -76484,7 +76576,7 @@ event_symbol = "bcode_plugin_handle_event_v1"
         let (_followup_tx, mut followup_rx) = mpsc::channel(1);
         let (_steering_tx, mut steering_rx) = mpsc::channel(1);
         let (_cancel_tx, mut cancel_rx) = mpsc::channel(1);
-        let queued = AtomicUsize::new(0);
+        let queued = ActivityCounter::new(0);
         let mut context = RuntimeCommandContext::new(
             &mut followup_rx,
             &mut steering_rx,
@@ -77274,7 +77366,7 @@ event_symbol = "bcode_plugin_handle_event_v1"
         let (_followup_tx, mut followup_rx) = mpsc::channel(1);
         let (_steering_tx, mut steering_rx) = mpsc::channel(1);
         let (_cancel_tx, mut cancel_rx) = mpsc::channel(1);
-        let queued = AtomicUsize::new(0);
+        let queued = ActivityCounter::new(0);
         let mut context = RuntimeCommandContext::new(
             &mut followup_rx,
             &mut steering_rx,
@@ -77344,7 +77436,7 @@ event_symbol = "bcode_plugin_handle_event_v1"
         let (_followup_tx, mut followup_rx) = mpsc::channel(1);
         let (_steering_tx, mut steering_rx) = mpsc::channel(1);
         let (_cancel_tx, mut cancel_rx) = mpsc::channel(1);
-        let queued_followups = AtomicUsize::new(0);
+        let queued_followups = ActivityCounter::new(0);
         let mut context = RuntimeCommandContext::new(
             &mut followup_rx,
             &mut steering_rx,
@@ -77430,7 +77522,7 @@ event_symbol = "bcode_plugin_handle_event_v1"
         let (_followup_tx, mut followup_rx) = mpsc::channel(1);
         let (_steering_tx, mut steering_rx) = mpsc::channel(1);
         let (_cancel_tx, mut cancel_rx) = mpsc::channel(1);
-        let queued_followups = AtomicUsize::new(0);
+        let queued_followups = ActivityCounter::new(0);
         let current_turn = Arc::new(Mutex::new(None));
         let mut command_context = RuntimeCommandContext::new(
             &mut followup_rx,
@@ -77561,7 +77653,7 @@ event_symbol = "bcode_plugin_handle_event_v1"
         let (_followup_tx, mut followup_rx) = mpsc::channel(1);
         let (_steering_tx, mut steering_rx) = mpsc::channel(1);
         let (_cancel_tx, mut cancel_rx) = mpsc::channel(1);
-        let queued = AtomicUsize::new(0);
+        let queued = ActivityCounter::new(0);
         let mut context = RuntimeCommandContext::new(
             &mut followup_rx,
             &mut steering_rx,
@@ -77747,7 +77839,7 @@ event_symbol = "bcode_plugin_handle_event_v1"
             let (_followup_tx, mut followup_rx) = mpsc::channel(1);
             let (_steering_tx, mut steering_rx) = mpsc::channel(1);
             let (_cancel_tx, mut cancel_rx) = mpsc::channel(1);
-            let queued_followups = AtomicUsize::new(0);
+            let queued_followups = ActivityCounter::new(0);
             let current_turn = Arc::new(Mutex::new(None));
             let mut command_context = RuntimeCommandContext::new(
                 &mut followup_rx,
@@ -77940,7 +78032,7 @@ event_symbol = "bcode_plugin_handle_event_v1"
             let (_followup_tx, mut followup_rx) = mpsc::channel(1);
             let (_steering_tx, mut steering_rx) = mpsc::channel(1);
             let (_cancel_tx, mut cancel_rx) = mpsc::channel(1);
-            let queued_followups = AtomicUsize::new(0);
+            let queued_followups = ActivityCounter::new(0);
             let current_turn = Arc::new(Mutex::new(None));
             let mut command_context = RuntimeCommandContext::new(
                 &mut followup_rx,
@@ -86101,7 +86193,7 @@ event_symbol = "bcode_plugin_handle_event_v1"
             .expect("session");
         let session_id = session.id;
         let (sender, mut receiver) = mpsc::channel(4);
-        let queued_followups = AtomicUsize::new(0);
+        let queued_followups = ActivityCounter::new(0);
         let event = |sequence, text: &str, priority| bcode_session_models::SessionEvent {
             schema_version: bcode_session_models::CURRENT_SESSION_EVENT_SCHEMA_VERSION,
             session_id,
@@ -99136,7 +99228,7 @@ event_symbol = "bcode_plugin_handle_event_v1"
         let (_followup_tx, mut followup_rx) = mpsc::channel(1);
         let (_steering_tx, mut steering_rx) = mpsc::channel(1);
         let (_cancel_tx, mut cancel_rx) = mpsc::channel(1);
-        let queued_followups = AtomicUsize::new(0);
+        let queued_followups = ActivityCounter::new(0);
         let current_turn = Arc::new(Mutex::new(None));
         let mut command_context = RuntimeCommandContext::new(
             &mut followup_rx,
@@ -99145,7 +99237,7 @@ event_symbol = "bcode_plugin_handle_event_v1"
             &queued_followups,
             current_turn,
         );
-        let phase = Arc::new(Mutex::new(SessionRuntimePhase::Idle));
+        let phase = Arc::new(ActivityMutex::new(SessionRuntimePhase::Idle));
 
         let effective_selection = session_model_selection_with_runtime_context(
             &state,
@@ -99333,7 +99425,7 @@ event_symbol = "bcode_plugin_handle_event_v1"
         let (_followup_tx, mut followup_rx) = mpsc::channel(1);
         let (_steering_tx, mut steering_rx) = mpsc::channel(1);
         let (_cancel_tx, mut cancel_rx) = mpsc::channel(1);
-        let queued_followups = AtomicUsize::new(0);
+        let queued_followups = ActivityCounter::new(0);
         let current_turn = Arc::new(Mutex::new(None));
         let mut command_context = RuntimeCommandContext::new(
             &mut followup_rx,
@@ -99342,7 +99434,7 @@ event_symbol = "bcode_plugin_handle_event_v1"
             &queued_followups,
             current_turn,
         );
-        let phase = Arc::new(Mutex::new(SessionRuntimePhase::Idle));
+        let phase = Arc::new(ActivityMutex::new(SessionRuntimePhase::Idle));
 
         let completion = run_model_turn(
             &state,
@@ -99460,7 +99552,7 @@ event_symbol = "bcode_plugin_handle_event_v1"
         let (_followup_tx, mut followup_rx) = mpsc::channel(1);
         let (_steering_tx, mut steering_rx) = mpsc::channel(1);
         let (_cancel_tx, mut cancel_rx) = mpsc::channel(1);
-        let queued_followups = AtomicUsize::new(0);
+        let queued_followups = ActivityCounter::new(0);
         let mut command_context = RuntimeCommandContext::new(
             &mut followup_rx,
             &mut steering_rx,
@@ -99468,7 +99560,7 @@ event_symbol = "bcode_plugin_handle_event_v1"
             &queued_followups,
             Arc::new(Mutex::new(None)),
         );
-        let phase = Arc::new(Mutex::new(SessionRuntimePhase::Idle));
+        let phase = Arc::new(ActivityMutex::new(SessionRuntimePhase::Idle));
 
         let completion = run_model_turn(
             &state,
@@ -99634,7 +99726,7 @@ event_symbol = "bcode_plugin_handle_event_v1"
         let (_followup_tx, mut followup_rx) = mpsc::channel(1);
         let (_steering_tx, mut steering_rx) = mpsc::channel(1);
         let (_cancel_tx, mut cancel_rx) = mpsc::channel(1);
-        let queued_followups = AtomicUsize::new(0);
+        let queued_followups = ActivityCounter::new(0);
         let current_turn = Arc::new(Mutex::new(None));
         let mut command_context = RuntimeCommandContext::new(
             &mut followup_rx,
@@ -99643,7 +99735,7 @@ event_symbol = "bcode_plugin_handle_event_v1"
             &queued_followups,
             current_turn,
         );
-        let phase = Arc::new(Mutex::new(SessionRuntimePhase::Idle));
+        let phase = Arc::new(ActivityMutex::new(SessionRuntimePhase::Idle));
         let completion = run_model_turn(
             &state,
             &mut permit,
@@ -99803,7 +99895,7 @@ event_symbol = "bcode_plugin_handle_event_v1"
         let (_followup_tx, mut followup_rx) = mpsc::channel(1);
         let (_steering_tx, mut steering_rx) = mpsc::channel(1);
         let (_cancel_tx, mut cancel_rx) = mpsc::channel(1);
-        let queued_followups = AtomicUsize::new(0);
+        let queued_followups = ActivityCounter::new(0);
         let current_turn = Arc::new(Mutex::new(None));
         let mut command_context = RuntimeCommandContext::new(
             &mut followup_rx,
@@ -99812,7 +99904,7 @@ event_symbol = "bcode_plugin_handle_event_v1"
             &queued_followups,
             current_turn,
         );
-        let phase = Arc::new(Mutex::new(SessionRuntimePhase::Idle));
+        let phase = Arc::new(ActivityMutex::new(SessionRuntimePhase::Idle));
 
         let completion = run_model_turn(
             &state,
@@ -100312,7 +100404,7 @@ event_symbol = "bcode_plugin_handle_event_v1"
         let (_followup_tx, mut followup_rx) = mpsc::channel(1);
         let (_steering_tx, mut steering_rx) = mpsc::channel(1);
         let (_cancel_tx, mut cancel_rx) = mpsc::channel(1);
-        let queued_followups = AtomicUsize::new(0);
+        let queued_followups = ActivityCounter::new(0);
         let mut command_context = RuntimeCommandContext::new(
             &mut followup_rx,
             &mut steering_rx,
@@ -100527,7 +100619,7 @@ event_symbol = "bcode_plugin_handle_event_v1"
         let (_followup_tx, mut followup_rx) = mpsc::channel(1);
         let (_steering_tx, mut steering_rx) = mpsc::channel(1);
         let (_cancel_tx, mut cancel_rx) = mpsc::channel(1);
-        let queued_followups = AtomicUsize::new(0);
+        let queued_followups = ActivityCounter::new(0);
         let mut command_context = RuntimeCommandContext::new(
             &mut followup_rx,
             &mut steering_rx,

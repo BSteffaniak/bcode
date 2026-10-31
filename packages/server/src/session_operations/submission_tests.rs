@@ -107,9 +107,11 @@ async fn submission_runtime_fixture(
         followup_commands,
         steering_commands,
         cancel_commands,
-        queued_followups: Arc::new(AtomicUsize::new(0)),
-        queued_steering: Arc::new(AtomicUsize::new(0)),
-        phase: Arc::new(Mutex::new(SessionRuntimePhase::ProviderActive)),
+        queued_followups: Arc::new(crate::activity_changes::ActivityCounter::new(0)),
+        queued_steering: Arc::new(crate::activity_changes::ActivityCounter::new(0)),
+        phase: Arc::new(crate::activity_changes::ActivityMutex::new(
+            SessionRuntimePhase::ProviderActive,
+        )),
         current_turn: Arc::new(Mutex::new(None)),
     };
     state

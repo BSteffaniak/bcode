@@ -23,6 +23,292 @@ use super::{
     slash_palette,
 };
 
+/// One non-resumable observation lifetime owned by a BMUX command. A pull stays
+/// alive across UI updates; cancellation discards its dedicated client connection.
+static ACTIVITY_WATCH_LIFETIMES: std::sync::LazyLock<std::sync::Arc<tokio::sync::Semaphore>> =
+    std::sync::LazyLock::new(|| std::sync::Arc::new(tokio::sync::Semaphore::new(16)));
+
+struct ActivityWatch {
+    lifetime: Option<tokio::sync::OwnedSemaphorePermit>,
+    client: BcodeClient,
+    handle: bcode_session_models::SessionActivityWatchHandle,
+}
+
+impl ActivityWatch {
+    async fn open(
+        client: BcodeClient,
+        scope: bcode_session_models::SessionActivityWatchScope,
+    ) -> Result<Self, String> {
+        Self::open_with_lifetimes(client, scope, ACTIVITY_WATCH_LIFETIMES.clone()).await
+    }
+
+    async fn open_with_lifetimes(
+        client: BcodeClient,
+        scope: bcode_session_models::SessionActivityWatchScope,
+        lifetimes: std::sync::Arc<tokio::sync::Semaphore>,
+    ) -> Result<Self, String> {
+        use bcode_session_models::application::SessionApplication;
+        let lifetime = lifetimes
+            .acquire_owned()
+            .await
+            .map_err(|error| error.to_string())?;
+        let handle = client
+            .open_activity_watch(scope)
+            .await
+            .map_err(|error| error.message)?;
+        Ok(Self {
+            client,
+            handle,
+            lifetime: Some(lifetime),
+        })
+    }
+
+    async fn next_delivery(
+        &self,
+    ) -> Result<bcode_session_models::SessionActivityWatchDelivery, String> {
+        use bcode_session_models::application::SessionApplication;
+        self.client
+            .pull_activity_watch(self.handle)
+            .await
+            .map_err(|error| error.message)
+    }
+}
+
+impl Drop for ActivityWatch {
+    fn drop(&mut self) {
+        use bcode_session_models::application::SessionApplication;
+        let client = self.client.clone();
+        let handle = self.handle;
+        let lifetime = self.lifetime.take();
+        // The client invalidates an uncertain pull on drop. Explicit close also
+        // releases a settled/idle handle; cleanup never waits on the UI thread.
+        if let Ok(runtime) = tokio::runtime::Handle::try_current() {
+            drop(runtime.spawn(async move {
+                let _closed = tokio::time::timeout(
+                    std::time::Duration::from_secs(2),
+                    client.close_activity_watch(handle),
+                )
+                .await;
+                drop(lifetime);
+            }));
+        }
+    }
+}
+
+/// Split combined frontend demand without changing query windows or starving later
+/// windows. Every returned watch obeys the portable host's actual candidate budget.
+#[must_use]
+pub fn activity_watch_batches(
+    scope: &bcode_session_models::SessionActivityWatchScope,
+) -> Vec<bcode_session_models::SessionActivityWatchScope> {
+    use bcode_session_models::SessionActivityWatchScope;
+    let mut batches = Vec::new();
+    let mut batch = SessionActivityWatchScope {
+        activity: Vec::new(),
+        children: Vec::new(),
+    };
+    let mut budget = 0;
+    for target in &scope.activity {
+        let cost = target.query.limit + 1;
+        if budget + cost > 512 || batch.activity.len() == 16 {
+            batches.push(batch);
+            batch = SessionActivityWatchScope {
+                activity: Vec::new(),
+                children: Vec::new(),
+            };
+            budget = 0;
+        }
+        batch.activity.push(target.clone());
+        budget += cost;
+    }
+    for query in &scope.children {
+        if budget + query.limit > 512 || batch.children.len() == 8 {
+            batches.push(batch);
+            batch = SessionActivityWatchScope {
+                activity: Vec::new(),
+                children: Vec::new(),
+            };
+            budget = 0;
+        }
+        batch.children.push(query.clone());
+        budget += query.limit;
+    }
+    if !batch.activity.is_empty() || !batch.children.is_empty() {
+        batches.push(batch);
+    }
+    batches
+}
+
+/// Own all admitted streams and their bounded aggregation in one cancellable command.
+pub async fn run_activity_watches(
+    client: BcodeClient,
+    scope: bcode_session_models::SessionActivityWatchScope,
+    generation: u64,
+    handle: bmux_tui_runtime::RuntimeHandle<super::root_program::BcodeRuntimeMessage>,
+) -> Option<super::root_program::BcodeRuntimeMessage> {
+    use super::root_program::BcodeRuntimeMessage;
+    use bcode_session_models::{
+        SessionActivityWatchSnapshot, application::SessionApplicationFailure,
+    };
+    let batches = activity_watch_batches(&scope);
+    if batches.is_empty() {
+        return None;
+    }
+    let (sender, mut receiver) = mpsc::channel(batches.len());
+    // JoinSet aborts every opening/pulling worker when BMUX drops this command.
+    let mut workers = tokio::task::JoinSet::new();
+    for (index, batch) in batches.iter().cloned().enumerate() {
+        let client = client.clone();
+        let sender = sender.clone();
+        workers.spawn(async move {
+            loop {
+                let result = async {
+                    let watch = ActivityWatch::open(client.clone(), batch.clone()).await?;
+                    let result = loop {
+                        let delivery = match watch.next_delivery().await {
+                            Ok(delivery) => delivery,
+                            Err(error) => break Err(error),
+                        };
+                        if sender.send((index, Ok(delivery.snapshot))).await.is_err() {
+                            break Ok::<(), String>(());
+                        }
+                    };
+                    drop(watch);
+                    result
+                }
+                .await;
+                match result {
+                    Ok(()) => return,
+                    Err(error) => {
+                        if sender.send((index, Err(error))).await.is_err() {
+                            return;
+                        }
+                        tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+                    }
+                }
+            }
+        });
+    }
+    drop(sender);
+    let unknown = || SessionApplicationFailure {
+        code: "activity_watch_pending".into(),
+        message: "Activity watch pending or disconnected".into(),
+    };
+    let mut latest: Vec<_> = batches
+        .iter()
+        .map(|batch| SessionActivityWatchSnapshot {
+            activity: batch.activity.iter().map(|_| Err(unknown())).collect(),
+            children: batch.children.iter().map(|_| Err(unknown())).collect(),
+        })
+        .collect();
+    while let Some((index, result)) = receiver.recv().await {
+        latest[index] = result.unwrap_or_else(|error| SessionActivityWatchSnapshot {
+            activity: batches[index]
+                .activity
+                .iter()
+                .map(|_| {
+                    Err(SessionApplicationFailure {
+                        code: "activity_watch_disconnected".into(),
+                        message: error.clone(),
+                    })
+                })
+                .collect(),
+            children: batches[index]
+                .children
+                .iter()
+                .map(|_| {
+                    Err(SessionApplicationFailure {
+                        code: "activity_watch_disconnected".into(),
+                        message: error.clone(),
+                    })
+                })
+                .collect(),
+        });
+        let mut snapshot = SessionActivityWatchSnapshot {
+            activity: Vec::new(),
+            children: Vec::new(),
+        };
+        for value in &latest {
+            snapshot.activity.extend(value.activity.clone());
+            snapshot.children.extend(value.children.clone());
+        }
+        if handle
+            .send(BcodeRuntimeMessage::ChildWatchProjection {
+                generation,
+                result: Ok(snapshot),
+            })
+            .await
+            .is_err()
+        {
+            break;
+        }
+    }
+    None
+}
+
+#[cfg(test)]
+mod activity_watch_lifetime_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn close_tasks_retain_admission_and_cancelled_open_releases_its_waiter() {
+        let lifetimes = std::sync::Arc::new(tokio::sync::Semaphore::new(2));
+        let first = lifetimes.clone().acquire_owned().await.unwrap();
+        let second = lifetimes.clone().acquire_owned().await.unwrap();
+        let pending_gate = lifetimes.clone();
+        let mut pending = tokio::spawn(async move {
+            ActivityWatch::open_with_lifetimes(
+                BcodeClient::default_endpoint(),
+                bcode_session_models::SessionActivityWatchScope {
+                    activity: Vec::new(),
+                    children: Vec::new(),
+                },
+                pending_gate,
+            )
+            .await
+        });
+        tokio::task::yield_now().await;
+        assert!(
+            !pending.is_finished(),
+            "opening waits for bounded live+cleanup admission"
+        );
+        pending.abort();
+        assert!(matches!((&mut pending).await, Err(error) if error.is_cancelled()));
+        drop(pending);
+        let watch = |permit| ActivityWatch {
+            client: BcodeClient::default_endpoint(),
+            handle: bcode_session_models::SessionActivityWatchHandle {
+                watch_id: SessionId::new(),
+                epoch: SessionId::new(),
+            },
+            lifetime: Some(permit),
+        };
+        drop(watch(first));
+        drop(watch(second));
+        assert_eq!(
+            lifetimes.available_permits(),
+            0,
+            "cleanup owns permits until it settles"
+        );
+        let one = tokio::time::timeout(
+            std::time::Duration::from_secs(3),
+            lifetimes.clone().acquire_owned(),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        let two = tokio::time::timeout(
+            std::time::Duration::from_secs(3),
+            lifetimes.clone().acquire_owned(),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        drop((one, two));
+        assert_eq!(lifetimes.available_permits(), 2);
+    }
+}
+
 const TRANSCRIPT_PAGE_TARGET_ITEMS: usize = 4;
 const TRANSCRIPT_PAGE_MAX_ITEMS: usize = 16;
 const TRANSCRIPT_PAGE_TARGET_ROWS: usize = 24;

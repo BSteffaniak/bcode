@@ -137,6 +137,10 @@ pub use turn_continuation::*;
 pub mod durable_interaction;
 pub use durable_interaction::*;
 
+/// Bounded non-owning activity and child-window watches.
+pub mod activity_watch;
+pub use activity_watch::*;
+
 pub mod application;
 pub use application::*;
 

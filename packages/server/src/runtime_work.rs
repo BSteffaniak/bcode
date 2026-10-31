@@ -6,7 +6,6 @@ use bcode_session_models::{RuntimeWorkKind, RuntimeWorkStatus, SessionId, WorkId
 use bcode_session_models::{RuntimeWorkObservation, RuntimeWorkSnapshot};
 use std::collections::BTreeMap;
 use std::sync::Arc;
-use tokio::sync::Mutex;
 
 use crate::TurnCancelState;
 
@@ -236,7 +235,8 @@ pub struct CancelledRuntimeWork {
 /// Central server registry and cancellation router for active runtime work.
 #[derive(Debug, Default)]
 pub struct RuntimeWorkManager {
-    active: Mutex<BTreeMap<(SessionId, WorkId), ActiveRuntimeWork>>,
+    active:
+        super::activity_changes::ActivityMutex<BTreeMap<(SessionId, WorkId), ActiveRuntimeWork>>,
     metrics: MetricsRegistry,
     #[cfg(test)]
     pub(super) progress: tokio::sync::watch::Sender<()>,
@@ -268,7 +268,7 @@ impl RuntimeWorkManager {
         token: &WorkObservationToken,
         stage: ObservedWorkStage,
     ) -> Option<WorkObservationToken> {
-        let mut active = self.active.lock().await;
+        let mut active = self.active.lock_for(token.session_id).await;
         let work = active.get_mut(&(token.session_id, token.work_id.clone()))?;
         if !Arc::ptr_eq(&token.owner, &work.observation_owner)
             || !Arc::ptr_eq(&token.revision, &work.observation_revision)
@@ -332,10 +332,21 @@ impl RuntimeWorkManager {
     #[must_use]
     pub fn with_metrics(metrics: MetricsRegistry) -> Self {
         Self {
-            active: Mutex::default(),
+            active: super::activity_changes::ActivityMutex::default(),
             metrics,
             #[cfg(test)]
             progress: tokio::sync::watch::channel(()).0,
+        }
+    }
+
+    #[must_use]
+    pub(super) fn with_metrics_observed(
+        metrics: MetricsRegistry,
+        changes: super::activity_changes::ActivityChanges,
+    ) -> Self {
+        Self {
+            active: super::activity_changes::ActivityMutex::observed(BTreeMap::new(), changes),
+            ..Self::with_metrics(metrics)
         }
     }
 
@@ -345,7 +356,7 @@ impl RuntimeWorkManager {
     /// identity replaces its cancellation handle without creating another durable start event.
     pub async fn start(&self, session_id: SessionId, spec: RuntimeWorkSpec) -> (bool, bool) {
         let cancellable = spec.cancellation.is_cancellable();
-        let mut active = self.active.lock().await;
+        let mut active = self.active.lock_for(session_id).await;
         let inherited_cancellation = spec.parent_work_id.as_ref().is_some_and(|parent| {
             active
                 .get(&(session_id, parent.clone()))
@@ -390,7 +401,7 @@ impl RuntimeWorkManager {
         if permit.session_id() != session_id {
             return false;
         }
-        let mut active = self.active.lock().await;
+        let mut active = self.active.lock_for(session_id).await;
         let Some(work) = active.get_mut(&(session_id, work_id.clone())) else {
             return false;
         };
@@ -452,7 +463,7 @@ impl RuntimeWorkManager {
         work_id: &WorkId,
         cancellation: CancellationHandle,
     ) -> bool {
-        let mut active = self.active.lock().await;
+        let mut active = self.active.lock_for(session_id).await;
         let replaced = if let Some(work) = active.get_mut(&(session_id, work_id.clone())) {
             work.spec.cancellation = cancellation;
             true
@@ -494,7 +505,7 @@ impl RuntimeWorkManager {
         session_id: SessionId,
         work_id: &WorkId,
     ) -> Vec<WorkId> {
-        let mut active = self.active.lock().await;
+        let mut active = self.active.lock_for(session_id).await;
         if !active.contains_key(&(session_id, work_id.clone())) {
             return Vec::new();
         }
@@ -593,7 +604,7 @@ impl RuntimeWorkManager {
         &self,
         token: &WorkObservationToken,
     ) -> Option<RuntimeWorkSpec> {
-        let mut active = self.active.lock().await;
+        let mut active = self.active.lock_for(token.session_id).await;
         let key = (token.session_id, token.work_id.clone());
         let matches_owner = active
             .get(&key)
@@ -611,7 +622,7 @@ impl RuntimeWorkManager {
     pub async fn take(&self, session_id: SessionId, work_id: &WorkId) -> Option<RuntimeWorkSpec> {
         let removed = self
             .active
-            .lock()
+            .lock_for(session_id)
             .await
             .remove(&(session_id, work_id.clone()));
         #[cfg(test)]

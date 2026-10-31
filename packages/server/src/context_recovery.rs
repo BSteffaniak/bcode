@@ -308,12 +308,14 @@ mod tests {
             model_id: Some("fake-model".into()),
             ..SessionModelSelection::default()
         };
-        let phase = Arc::new(Mutex::new(SessionRuntimePhase::Idle));
+        let phase = Arc::new(crate::activity_changes::ActivityMutex::new(
+            SessionRuntimePhase::Idle,
+        ));
         let current = Arc::new(Mutex::new(None));
         let (_followup_tx, mut followup_rx) = mpsc::channel(4);
         let (_steering_tx, mut steering_rx) = mpsc::channel(4);
         let (_cancel_tx, mut cancel_rx) = mpsc::channel(4);
-        let queued = AtomicUsize::new(0);
+        let queued = crate::activity_changes::ActivityCounter::new(0);
         let result = process_rebuild_summary_command(
             &state,
             Arc::clone(&phase),

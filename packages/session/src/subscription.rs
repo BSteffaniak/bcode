@@ -5,6 +5,13 @@ use bcode_session_models::{SessionEvent, SessionId, SessionSummary};
 use tokio::sync::broadcast;
 
 impl SessionManager {
+    /// Observe resident ownership and metadata changes without loading sessions or acquiring authority.
+    /// Notifications are bounded invalidations, not durable event offsets. Lag requires resnapshot.
+    #[must_use]
+    pub fn subscribe_activity_changes(&self) -> tokio::sync::broadcast::Receiver<SessionId> {
+        self.activity_tx.subscribe()
+    }
+
     /// Subscribe to admission-bounded observation updates without attaching a client.
     ///
     /// Queue/structural exhaustion terminates this observer only, not persistence

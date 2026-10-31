@@ -393,11 +393,31 @@ struct SavedSessionReadingPosition {
     content: Option<(String, usize)>,
 }
 
+#[derive(Debug, Clone)]
+struct ChildWatchPresentation {
+    windows: Vec<bcode_session_models::SessionChildQuery>,
+    activity: Vec<bcode_session_models::SessionActivityTarget>,
+    navigation: SessionId,
+    relationships: BTreeMap<(SessionId, Option<SessionId>), Vec<SessionId>>,
+}
+
+impl Default for ChildWatchPresentation {
+    fn default() -> Self {
+        Self {
+            windows: Vec::new(),
+            activity: Vec::new(),
+            navigation: SessionId::new(),
+            relationships: BTreeMap::new(),
+        }
+    }
+}
+
 /// State owned by the terminal user interface.
 #[derive(Debug, Clone)]
 pub struct BmuxApp {
     pending_session_link: Option<SessionId>,
     child_request_fence: crate::child_request_fence::ChildRequestFence,
+    child_watch: ChildWatchPresentation,
     child_activity: Option<bcode_session_models::SessionActivityPage>,
     child_activity_error: Option<String>,
     child_panel: ChildPanelPresentation,
@@ -637,6 +657,7 @@ impl BmuxApp {
         Self {
             pending_session_link: None,
             child_request_fence: crate::child_request_fence::ChildRequestFence::default(),
+            child_watch: ChildWatchPresentation::default(),
             child_activity: None,
             child_activity_error: None,
             child_panel: ChildPanelPresentation::Hidden,
@@ -1484,8 +1505,10 @@ impl BmuxApp {
             super::effects::TuiEffect::LoadSessionChildren {
                 parent_id,
                 generation,
+                after,
                 ..
             } => {
+                self.retain_child_watch_window(*parent_id, *after);
                 *generation = self.child_request_fence.begin(false, *parent_id);
                 true
             }
@@ -1495,11 +1518,27 @@ impl BmuxApp {
                 generation,
             } => {
                 *after = self.monitor_activity_cursor(*session_id);
+                let target = bcode_session_models::SessionActivityTarget {
+                    session_id: *session_id,
+                    query: bcode_session_models::SessionActivityQuery {
+                        scope: bcode_session_models::SessionActivityScope::DirectChildren,
+                        after: *after,
+                        limit: 64,
+                    },
+                };
+                if !self.child_watch.activity.contains(&target) {
+                    self.child_watch.activity.insert(0, target);
+                    self.child_watch.activity.truncate(8);
+                }
                 *generation = self.child_request_fence.begin(true, *session_id);
                 true
             }
             _ => false,
         }
+    }
+
+    pub(crate) fn invalidate_child_requests(&mut self) {
+        self.child_request_fence = crate::child_request_fence::ChildRequestFence::default();
     }
 
     pub(crate) fn accepts_child_result(
@@ -1544,6 +1583,219 @@ impl BmuxApp {
                 self.child_activity_error = Some(format!("children: stale/degraded · {error}"));
             }
         }
+    }
+
+    /// Retain only bounded loaded windows; explicit paging displaces the oldest window.
+    fn retain_child_watch_window(&mut self, parent_id: SessionId, after: Option<SessionId>) {
+        if self.session_id != Some(parent_id)
+            && !self
+                .child_summaries
+                .iter()
+                .any(|summary| summary.id == parent_id)
+        {
+            return;
+        }
+        let query = bcode_session_models::SessionChildQuery {
+            parent_id,
+            after,
+            limit: 64,
+        };
+        if !self.child_watch.windows.contains(&query) {
+            self.child_watch.windows.insert(0, query);
+            self.child_watch.windows.truncate(4);
+        }
+    }
+
+    fn retain_child_activity_continuation(
+        &mut self,
+        target: &bcode_session_models::SessionActivityTarget,
+        after: SessionId,
+    ) {
+        let continuation = bcode_session_models::SessionActivityTarget {
+            session_id: target.session_id,
+            query: bcode_session_models::SessionActivityQuery {
+                after: Some(after),
+                ..target.query.clone()
+            },
+        };
+        if self.child_watch.activity.len() < 8 && !self.child_watch.activity.contains(&continuation)
+        {
+            self.child_watch.activity.push(continuation);
+        }
+    }
+
+    /// Apply a full replacement from the current activity watch, including reset.
+    pub(crate) fn apply_child_watch_snapshot(
+        &mut self,
+        scope: &bcode_session_models::SessionActivityWatchScope,
+        snapshot: bcode_session_models::SessionActivityWatchSnapshot,
+    ) {
+        if snapshot.activity.len() != scope.activity.len()
+            || snapshot.children.len() != scope.children.len()
+        {
+            self.child_activity_error =
+                Some("children: stale/degraded · invalid watch snapshot bounds".to_owned());
+            return;
+        }
+        let mut pages: BTreeMap<SessionId, Vec<bcode_session_models::SessionActivityPage>> =
+            BTreeMap::new();
+        let mut errors = Vec::new();
+        for (target, result) in scope.activity.iter().zip(snapshot.activity) {
+            self.child_request_fence.begin(true, target.session_id);
+            if self.session_id != Some(target.session_id)
+                && !self
+                    .child_summaries
+                    .iter()
+                    .any(|summary| summary.id == target.session_id)
+            {
+                continue;
+            }
+            match result {
+                Ok(mut page) => {
+                    if target.query.after.is_some()
+                        && page.coverage == bcode_session_models::SessionActivityCoverage::Complete
+                    {
+                        page.coverage = bcode_session_models::SessionActivityCoverage::Partial;
+                    }
+                    if let Some(after) = page.next_after {
+                        self.retain_child_activity_continuation(target, after);
+                    }
+                    pages.entry(target.session_id).or_default().push(page);
+                }
+                Err(error) => errors.push(error.message),
+            }
+        }
+        // Complete replacements must not leave an old active/waiting fact behind.
+        self.child_pages.clear();
+        self.child_activity = None;
+        self.session_view.invalidate_child_card_activity();
+        for (id, windows) in pages {
+            if let Some(page) =
+                bcode_session_view::child_activity::combine_activity_windows(windows)
+            {
+                if Some(id) == self.session_id {
+                    self.apply_child_activity(Ok(page));
+                } else {
+                    self.apply_monitor_activity(id, page);
+                }
+            }
+        }
+        self.child_watch.relationships.retain(|(parent, after), _| {
+            scope
+                .children
+                .iter()
+                .any(|query| query.parent_id == *parent && query.after == *after)
+        });
+        for (query, result) in scope.children.iter().zip(snapshot.children) {
+            self.child_request_fence.begin(false, query.parent_id);
+            match result {
+                Ok(page) => {
+                    let ids: Vec<_> = page.children.iter().map(|child| child.id).collect();
+                    if page.complete
+                        && page.issues.is_empty()
+                        && let Some(previous) = self
+                            .child_watch
+                            .relationships
+                            .insert((query.parent_id, query.after), ids.clone())
+                    {
+                        let removed: Vec<_> = previous
+                            .into_iter()
+                            .filter(|id| {
+                                !ids.contains(id)
+                                    && !self
+                                        .child_watch
+                                        .relationships
+                                        .values()
+                                        .any(|window| window.contains(id))
+                            })
+                            .collect();
+                        self.child_summaries
+                            .retain(|summary| !removed.contains(&summary.id));
+                    }
+                    if self.child_watch.windows.len() < 4
+                        && let Some(after) = page.next_after
+                    {
+                        self.retain_child_watch_window(query.parent_id, Some(after));
+                    }
+                    self.apply_monitor_children(query.parent_id, &page);
+                }
+                Err(error) => errors.push(error.message),
+            }
+        }
+        self.apply_session_view_terminal_adapter();
+        if !errors.is_empty() {
+            self.child_activity_error =
+                Some(format!("children: stale/degraded · {}", errors.join("; ")));
+        }
+    }
+
+    /// Loaded windows and a bounded discovery frontier, independent of observation timestamps.
+    pub(crate) fn child_watch_scope(
+        &self,
+    ) -> Option<bcode_session_models::SessionActivityWatchScope> {
+        use bcode_session_models::{
+            SessionActivityQuery, SessionActivityScope, SessionActivityTarget,
+            SessionActivityWatchScope, SessionChildQuery,
+        };
+        let root = self.session_id?;
+        let mut children = vec![SessionChildQuery {
+            parent_id: root,
+            after: None,
+            limit: 64,
+        }];
+        let mut add = |query: SessionChildQuery| {
+            if children.len() < 8 && !children.contains(&query) {
+                children.push(query);
+            }
+        };
+        for query in &self.child_watch.windows {
+            add(query.clone());
+        }
+        for parent_id in self.expanded_monitor_sessions() {
+            add(SessionChildQuery {
+                parent_id,
+                after: None,
+                limit: 64,
+            });
+        }
+        for parent_id in self.monitor_discovery_frontier() {
+            add(SessionChildQuery {
+                parent_id,
+                after: None,
+                limit: 64,
+            });
+        }
+        let mut activity: Vec<_> = children
+            .iter()
+            .map(|query| SessionActivityTarget {
+                session_id: query.parent_id,
+                query: SessionActivityQuery {
+                    scope: SessionActivityScope::DirectChildren,
+                    after: query.after,
+                    limit: query.limit,
+                },
+            })
+            .collect();
+        for target in &self.child_watch.activity {
+            if self.session_id != Some(target.session_id)
+                && !self
+                    .child_summaries
+                    .iter()
+                    .any(|summary| summary.id == target.session_id)
+            {
+                continue;
+            }
+            if activity.len() < 16 && !activity.contains(target) {
+                activity.push(target.clone());
+            }
+        }
+        Some(SessionActivityWatchScope { activity, children })
+    }
+
+    /// Navigation identity fences A -> B -> A, including otherwise identical scopes.
+    #[must_use]
+    pub(crate) const fn child_watch_navigation(&self) -> SessionId {
+        self.child_watch.navigation
     }
 
     /// Persistent known-active count, never an inferred subtree total.
@@ -1762,6 +2014,8 @@ impl BmuxApp {
 
     /// Surface failed coordinator observations without replacing accepted evidence with idle.
     pub fn monitor_observation_failed(&mut self, session_id: SessionId, error: &str) {
+        self.session_view.invalidate_child_card_activity();
+        self.apply_session_view_terminal_adapter();
         self.child_activity_error = Some(format!("child {session_id}: stale/degraded · {error}"));
     }
 
@@ -2130,6 +2384,11 @@ impl BmuxApp {
             self.child_summaries.clear();
             self.child_pages.clear();
             self.child_cursors.clear();
+            self.child_watch.windows.clear();
+            self.child_watch.activity.clear();
+            self.child_watch.navigation = SessionId::new();
+            self.child_watch.relationships.clear();
+            self.child_request_fence = crate::child_request_fence::ChildRequestFence::default();
             self.child_expanded.clear();
             self.child_panel_selected = 0;
         }

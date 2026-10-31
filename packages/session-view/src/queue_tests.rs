@@ -208,101 +208,137 @@ async fn respond_to_recovery_scenario(
     pending: SubmissionRecord,
     confirmation: SubmissionResumeConfirmation,
 ) {
-    let mut stage = 0;
-    while stage < 6 {
-        let mut stream = listener.accept().await.unwrap();
-        loop {
-            let Ok(envelope) = bcode_ipc::recv_envelope(&mut stream).await else {
-                break;
-            };
-            let request = bcode_ipc::decode_request(&envelope.payload).unwrap();
-            let payload = match request {
-                Request::Hello { .. } => recovery_test_hello(),
-                Request::SubmissionQueueStatus {
-                    session_id: requested,
-                } => {
-                    assert_eq!(requested, session_id);
-                    assert!(stage == 0 || stage == 4);
-                    stage += 1;
-                    queue_response(stage, &pending)
-                }
-                Request::PrepareSubmissionResume {
-                    session_id: requested,
-                    submission_id,
-                    expected_accepted_sequence,
-                } => {
-                    assert_eq!(stage, 1);
-                    assert_eq!(requested, session_id);
-                    assert_eq!(submission_id, pending.receipt.submission_id);
-                    assert_eq!(expected_accepted_sequence, 7);
-                    stage += 1;
-                    ResponsePayload::SubmissionResumePrepared {
-                        confirmation: confirmation.clone(),
-                    }
-                }
-                Request::ResumeSubmission {
-                    session_id: requested,
-                    confirmation: received,
-                    operation_id,
-                } => {
-                    assert_eq!(stage, 2);
-                    assert_eq!(requested, session_id);
-                    assert_eq!(received, confirmation);
-                    assert_eq!(operation_id, "resume-operation");
-                    stage += 1;
-                    ResponsePayload::SubmissionRecovered {
-                        result: SubmissionRecoveryResult {
-                            record: pending.clone(),
-                            duplicate: false,
-                        },
-                    }
-                }
-                Request::CancelPendingSubmission {
-                    session_id: requested,
-                    submission_id,
-                    expected_accepted_sequence,
-                    operation_id,
-                } => {
-                    assert_eq!(stage, 3);
-                    assert_eq!(requested, session_id);
-                    assert_eq!(submission_id, pending.receipt.submission_id);
-                    assert_eq!(expected_accepted_sequence, 7);
-                    assert_eq!(operation_id, "cancel-operation");
-                    stage += 1;
-                    let mut cancelled = pending.clone();
-                    cancelled.status = SubmissionStatus::Cancelled { event_sequence: 10 };
-                    ResponsePayload::SubmissionRecovered {
-                        result: SubmissionRecoveryResult {
-                            record: cancelled,
-                            duplicate: true,
-                        },
-                    }
-                }
-                Request::CancelSessionTurn {
-                    session_id: requested,
-                    expected_turn_id,
-                    clear_queue,
-                } => {
-                    interrupted_cancel_response(
-                        stage,
-                        requested,
+    let stage = std::sync::Arc::new(std::sync::Mutex::new(0));
+    let mut connections = tokio::task::JoinSet::new();
+    loop {
+        let mut stream = tokio::select! {
+            stream = listener.accept() => stream.unwrap(),
+            completed = connections.join_next(), if !connections.is_empty() => {
+                if completed.unwrap().unwrap() { return; }
+                continue;
+            }
+        };
+        let stage = stage.clone();
+        let pending = pending.clone();
+        let confirmation = confirmation.clone();
+        connections.spawn(async move {
+            loop {
+                let Ok(envelope) = bcode_ipc::recv_envelope(&mut stream).await else {
+                    break;
+                };
+                let request = bcode_ipc::decode_request(&envelope.payload).unwrap();
+                let (payload, complete) = {
+                    let mut stage_guard = stage.lock().unwrap();
+                    let result = recovery_scenario_response(
+                        request,
                         session_id,
-                        expected_turn_id.as_deref(),
-                        clear_queue,
+                        &pending,
+                        &confirmation,
+                        &mut stage_guard,
                     );
-                    stage += 1;
-                    ResponsePayload::TurnCancellationRequested { cancelled: true }
+                    drop(stage_guard);
+                    result
+                };
+                let reply =
+                    bcode_ipc::response_envelope(envelope.request_id, &Response::Ok(payload))
+                        .unwrap();
+                bcode_ipc::send_envelope(&mut stream, &reply).await.unwrap();
+                if complete {
+                    return true;
                 }
-                other => panic!(
-                    "recovery must not scan history, change settings, or grant permissions: {other:?}"
-                ),
-            };
-            let reply =
-                bcode_ipc::response_envelope(envelope.request_id, &Response::Ok(payload)).unwrap();
-            bcode_ipc::send_envelope(&mut stream, &reply).await.unwrap();
-            if stage == 6 {
-                break;
+            }
+            false
+        });
+    }
+}
+
+fn recovery_scenario_response(
+    request: Request,
+    session_id: SessionId,
+    pending: &SubmissionRecord,
+    confirmation: &SubmissionResumeConfirmation,
+    stage: &mut usize,
+) -> (ResponsePayload, bool) {
+    let payload = match request {
+        Request::Hello { .. } => recovery_test_hello(),
+        Request::SubmissionQueueStatus {
+            session_id: requested,
+        } => {
+            assert_eq!(requested, session_id);
+            assert!(*stage == 0 || *stage == 4);
+            *stage += 1;
+            queue_response(*stage, pending)
+        }
+        Request::PrepareSubmissionResume {
+            session_id: requested,
+            submission_id,
+            expected_accepted_sequence,
+        } => {
+            assert_eq!(*stage, 1);
+            assert_eq!(requested, session_id);
+            assert_eq!(submission_id, pending.receipt.submission_id);
+            assert_eq!(expected_accepted_sequence, 7);
+            *stage += 1;
+            ResponsePayload::SubmissionResumePrepared {
+                confirmation: confirmation.clone(),
             }
         }
-    }
+        Request::ResumeSubmission {
+            session_id: requested,
+            confirmation: received,
+            operation_id,
+        } => {
+            assert_eq!(*stage, 2);
+            assert_eq!(requested, session_id);
+            assert_eq!(&received, confirmation);
+            assert_eq!(operation_id, "resume-operation");
+            *stage += 1;
+            ResponsePayload::SubmissionRecovered {
+                result: SubmissionRecoveryResult {
+                    record: pending.clone(),
+                    duplicate: false,
+                },
+            }
+        }
+        Request::CancelPendingSubmission {
+            session_id: requested,
+            submission_id,
+            expected_accepted_sequence,
+            operation_id,
+        } => {
+            assert_eq!(*stage, 3);
+            assert_eq!(requested, session_id);
+            assert_eq!(submission_id, pending.receipt.submission_id);
+            assert_eq!(expected_accepted_sequence, 7);
+            assert_eq!(operation_id, "cancel-operation");
+            *stage += 1;
+            let mut cancelled = pending.clone();
+            cancelled.status = SubmissionStatus::Cancelled { event_sequence: 10 };
+            ResponsePayload::SubmissionRecovered {
+                result: SubmissionRecoveryResult {
+                    record: cancelled,
+                    duplicate: true,
+                },
+            }
+        }
+        Request::CancelSessionTurn {
+            session_id: requested,
+            expected_turn_id,
+            clear_queue,
+        } => {
+            interrupted_cancel_response(
+                *stage,
+                requested,
+                session_id,
+                expected_turn_id.as_deref(),
+                clear_queue,
+            );
+            *stage += 1;
+            ResponsePayload::TurnCancellationRequested { cancelled: true }
+        }
+        other => panic!(
+            "recovery must not scan history, change settings, or grant permissions: {other:?}"
+        ),
+    };
+    (payload, *stage == 6)
 }

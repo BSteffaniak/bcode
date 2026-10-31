@@ -807,7 +807,7 @@ mod tests {
         let (_followup, mut followups) = tokio::sync::mpsc::channel(1);
         let (_steering, mut steering) = tokio::sync::mpsc::channel(1);
         let (cancel, mut cancels) = tokio::sync::mpsc::channel(1);
-        let queued = std::sync::atomic::AtomicUsize::new(0);
+        let queued = crate::activity_changes::ActivityCounter::new(0);
         let mut commands = crate::RuntimeCommandContext::new(
             &mut followups,
             &mut steering,
@@ -815,7 +815,9 @@ mod tests {
             &queued,
             Arc::new(tokio::sync::Mutex::new(None)),
         );
-        let phase = Arc::new(tokio::sync::Mutex::new(crate::SessionRuntimePhase::Idle));
+        let phase = Arc::new(crate::activity_changes::ActivityMutex::new(
+            crate::SessionRuntimePhase::Idle,
+        ));
         let execution = Box::pin(crate::run_model_turn(
             state,
             &mut permit,

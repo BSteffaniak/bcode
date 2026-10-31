@@ -726,6 +726,56 @@ impl ChatLoopState {
         self.runtime_stats.record(&mut self.telemetry, stats);
     }
 
+    pub(crate) fn child_picker_watch_generation(&self) -> Option<u64> {
+        self.session_picker
+            .as_ref()
+            .map(|_| self.session_picker_generation)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn install_child_watch_picker_for_test(
+        &mut self,
+        picker: super::session_picker::SessionPickerApp,
+    ) {
+        self.session_picker = Some(picker);
+    }
+
+    #[must_use]
+    pub(crate) fn child_picker_watch_windows(
+        &self,
+    ) -> Vec<bcode_session_models::SessionChildQuery> {
+        self.session_picker.as_ref().map_or_else(
+            Vec::new,
+            super::session_picker::SessionPickerApp::child_watch_windows,
+        )
+    }
+
+    pub(crate) fn child_watch_failed(&mut self, error: &str) {
+        if let Some(picker) = self.session_picker.as_mut() {
+            picker.set_status(format!("Children unavailable/degraded: {error}"));
+        }
+    }
+
+    pub(crate) fn apply_child_watch_to_picker(
+        &mut self,
+        scope: &bcode_session_models::SessionActivityWatchScope,
+        snapshot: &bcode_session_models::SessionActivityWatchSnapshot,
+    ) {
+        if let Some(picker) = self.session_picker.as_mut() {
+            let loaded = picker.child_watch_windows();
+            for (query, result) in scope.children.iter().zip(&snapshot.children) {
+                if !loaded.contains(query) {
+                    continue;
+                }
+                match result {
+                    Ok(page) => picker.apply_watched_children(query, page.clone()),
+                    Err(error) => picker
+                        .set_status(format!("Children unavailable/degraded: {}", error.message)),
+                }
+            }
+        }
+    }
+
     pub fn foreground_client(&self) -> BcodeClient {
         self.foreground_client.clone()
     }
@@ -734,7 +784,7 @@ impl ChatLoopState {
         self.telemetry.flush_if_due(now);
     }
 
-    pub fn next_telemetry_flush_at(&self) -> Option<Instant> {
+    pub const fn next_telemetry_flush_at(&self) -> Option<Instant> {
         self.telemetry.next_flush_at()
     }
 
@@ -2192,6 +2242,7 @@ impl ChatLoopState {
     }
 
     fn restart_session_picker_subscription(&mut self, chat: &mut ActiveChat) {
+        chat.app.invalidate_child_requests();
         self.session_picker_generation = self
             .session_picker_generation
             .checked_add(1)
@@ -2421,6 +2472,7 @@ impl ChatLoopState {
                         && !picker.all_directories()
                     {
                         if let Some((parent_id, after)) = picker.next_child_page() {
+                            picker.retain_child_watch_window(parent_id, Some(after));
                             chat.replace_effect(TuiEffect::LoadSessionChildren {
                                 parent_id,
                                 after: Some(after),
@@ -2433,6 +2485,7 @@ impl ChatLoopState {
                         && !picker.all_directories()
                     {
                         if let Some(parent_id) = picker.toggle_selected_branch() {
+                            picker.retain_child_watch_window(parent_id, None);
                             chat.replace_effect(TuiEffect::LoadSessionChildren {
                                 parent_id,
                                 after: None,
@@ -3057,7 +3110,7 @@ impl TuiRuntimeSettings {
             selection: tui_config.selection,
             completion_settings: bcode_config::CompletionConfig::default(),
             frame_interval: tui_config.render.frame_interval(),
-            runtime_config: super::runtime_adapter::config(&tui_config),
+            runtime_config: super::runtime_adapter::config(&tui_config, false),
             metrics_enabled: false,
             static_plugins: static_plugins.to_vec(),
             tui_extensions: super::bundled_tui_extensions(),
@@ -3099,7 +3152,7 @@ impl TuiRuntimeSettings {
         self.selection_autoscroll = tui_config.mouse.selection_autoscroll;
         self.selection = tui_config.selection;
         self.frame_interval = tui_config.render.frame_interval();
-        self.runtime_config = super::runtime_adapter::config(tui_config);
+        self.runtime_config = super::runtime_adapter::config(tui_config, self.metrics_enabled);
     }
 
     /// Build the domain-neutral BMUX runtime configuration for current TUI settings.
@@ -3110,6 +3163,7 @@ impl TuiRuntimeSettings {
 
     pub const fn set_metrics_enabled(&mut self, enabled: bool) {
         self.metrics_enabled = enabled;
+        self.runtime_config.collect_detailed_telemetry = enabled;
     }
 
     pub const fn metrics_enabled(&self) -> bool {
@@ -5608,7 +5662,7 @@ pub fn draw_chat_frame<W: Write>(
     } else {
         damage
     };
-    let frame_started = Instant::now();
+    let frame_started = loop_state.telemetry.is_enabled().then(Instant::now);
     let prepare_started = frame_started;
     if fast_temporal_presentation
         && terminal.retained_buffer().is_some()
@@ -5740,6 +5794,9 @@ pub fn draw_chat_frame<W: Write>(
         )
     };
     for stats in chat.app.transcript_layout_mut().drain_sync_stats() {
+        if !loop_state.telemetry.is_enabled() {
+            continue;
+        }
         let mut labels = bcode_metrics::MetricLabels::new();
         labels.insert(
             "invalidation".to_owned(),
@@ -5778,6 +5835,9 @@ pub fn draw_chat_frame<W: Write>(
     }
     if let Some(presentation) = chat.app.plugin_presentation() {
         for diagnostic in presentation.drain_diagnostics() {
+            if !loop_state.telemetry.is_enabled() {
+                continue;
+            }
             let mut labels = bcode_metrics::MetricLabels::new();
             labels.insert("plugin_id".to_owned(), diagnostic.plugin_id);
             labels.insert("diagnostic".to_owned(), diagnostic.name);
@@ -5788,6 +5848,9 @@ pub fn draw_chat_frame<W: Write>(
             );
         }
         for timing in presentation.drain_timings() {
+            if !loop_state.telemetry.is_enabled() {
+                continue;
+            }
             let mut labels = bcode_metrics::MetricLabels::new();
             labels.insert("operation".to_owned(), timing.operation.to_owned());
             labels.insert("plugin_id".to_owned(), timing.plugin_id);
@@ -5799,9 +5862,9 @@ pub fn draw_chat_frame<W: Write>(
             );
         }
     }
-    let prepare_ms = elapsed_millis(prepare_started);
+    let prepare_ms = prepare_started.map_or(0, elapsed_millis);
     let theme = render::TuiTheme::for_app(&chat.app);
-    let draw_started = Instant::now();
+    let draw_started = loop_state.telemetry.is_enabled().then(Instant::now);
     let regions = damage.retained_regions().to_vec();
     let full_damage = damage.is_full();
     let intersects = |area: bmux_tui::geometry::Rect| {
@@ -5962,43 +6025,15 @@ pub fn draw_chat_frame<W: Write>(
         }
     };
     loop_state.interactive_surface_geometry = geometry;
-    loop_state.telemetry.record_histogram(
-        "tui.frame.changed_cells",
-        u64::try_from(draw_stats.changed_cells).unwrap_or(u64::MAX),
+    record_frame_telemetry(
+        loop_state,
+        &draw_stats,
+        schedule_delay,
+        frame_interval,
+        frame_started,
+        draw_started,
+        prepare_ms,
     );
-    if draw_stats.full_repaint {
-        loop_state
-            .telemetry
-            .add_counter("tui.frame.full_repaint_total", 1);
-    }
-    let draw_ms = elapsed_millis(draw_started);
-    let total_ms = elapsed_millis(frame_started);
-    loop_state.telemetry.add_counter("tui.frame.total", 1);
-    let frame_budget_ms = frame_interval.map_or(u64::MAX, |interval| {
-        u64::try_from(interval.as_millis()).unwrap_or(u64::MAX)
-    });
-    if total_ms >= frame_budget_ms {
-        loop_state
-            .telemetry
-            .add_counter("tui.frame.over_budget_total", 1);
-    }
-    let frame_index = loop_state.frame_index;
-    loop_state.frame_index = loop_state.frame_index.wrapping_add(1);
-    if frame_index.is_multiple_of(16) || total_ms >= frame_budget_ms {
-        loop_state
-            .telemetry
-            .record_histogram("tui.frame.prepare_ms", prepare_ms);
-        loop_state
-            .telemetry
-            .record_histogram("tui.frame.draw_ms", draw_ms);
-        loop_state
-            .telemetry
-            .record_histogram("tui.frame.total_ms", total_ms);
-        loop_state.telemetry.record_histogram(
-            "tui.frame.schedule_delay_ms",
-            u64::try_from(schedule_delay.as_millis()).unwrap_or(u64::MAX),
-        );
-    }
     Ok((draw_stats, layout))
 }
 
@@ -6251,7 +6286,7 @@ fn draw_temporal_frame<W: Write>(
     loop_state: &mut ChatLoopState,
     damage: bmux_tui::damage::Damage,
     frame_interval: Option<Duration>,
-    frame_started: Instant,
+    frame_started: Option<Instant>,
     layout: render::FrameLayout,
 ) -> Result<(bmux_tui::terminal::DrawStats, Option<render::FrameLayout>), TuiError> {
     let full_damage = damage.is_full();
@@ -6262,7 +6297,7 @@ fn draw_temporal_frame<W: Write>(
                 .iter()
                 .any(|region| !area.intersection(*region).is_empty())
     };
-    let draw_started = Instant::now();
+    let draw_started = loop_state.telemetry.is_enabled().then(Instant::now);
     // Output may fail after emitting image protocol bytes, including at flush.
     // Keep committed residency separate from the candidate and preserve repair debt.
     let compositor = std::cell::RefCell::new(loop_state.markdown_image_compositor.clone());
@@ -6341,10 +6376,13 @@ fn record_frame_telemetry(
     draw_stats: &bmux_tui::terminal::DrawStats,
     schedule_delay: Duration,
     frame_interval: Option<Duration>,
-    frame_started: Instant,
-    draw_started: Instant,
+    frame_started: Option<Instant>,
+    draw_started: Option<Instant>,
     prepare_ms: u64,
 ) {
+    if !loop_state.telemetry.is_enabled() {
+        return;
+    }
     loop_state.telemetry.record_histogram(
         "tui.frame.changed_cells",
         u64::try_from(draw_stats.changed_cells).unwrap_or(u64::MAX),
@@ -6354,8 +6392,8 @@ fn record_frame_telemetry(
             .telemetry
             .add_counter("tui.frame.full_repaint_total", 1);
     }
-    let draw_ms = elapsed_millis(draw_started);
-    let total_ms = elapsed_millis(frame_started);
+    let draw_ms = draw_started.map_or(0, elapsed_millis);
+    let total_ms = frame_started.map_or(0, elapsed_millis);
     loop_state.telemetry.add_counter("tui.frame.total", 1);
     let frame_budget_ms = frame_interval.map_or(u64::MAX, |interval| {
         u64::try_from(interval.as_millis()).unwrap_or(u64::MAX)

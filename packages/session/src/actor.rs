@@ -300,6 +300,7 @@ fn record_append_rejection_metrics(
 pub struct SessionHandle {
     commands: mpsc::Sender<SessionCommand>,
     snapshot: Arc<RwLock<SessionSnapshot>>,
+    activity_notifications: Arc<RwLock<Option<tokio::sync::broadcast::Sender<SessionId>>>>,
 }
 
 /// Categories of server work that can keep a persistent session owned after clients detach.
@@ -426,7 +427,9 @@ impl SessionHandle {
         )));
         let (commands, receiver) = mpsc::channel(256);
         let (ownership_releases, ownership_release_receiver) = mpsc::unbounded_channel();
+        let activity_notifications = Arc::new(RwLock::new(None));
         let actor = SessionActor {
+            activity_notifications: Arc::clone(&activity_notifications),
             state,
             store,
             lease: lease.map(Arc::new),
@@ -453,7 +456,23 @@ impl SessionHandle {
             snapshot: Arc::clone(&snapshot),
         };
         tokio::spawn(actor.run());
-        Self { commands, snapshot }
+        Self {
+            commands,
+            snapshot,
+            activity_notifications,
+        }
+    }
+
+    #[must_use]
+    pub(crate) fn with_activity_notifications(
+        self,
+        sender: tokio::sync::broadcast::Sender<SessionId>,
+    ) -> Self {
+        *self
+            .activity_notifications
+            .write()
+            .expect("activity notification lock") = Some(sender);
+        self
     }
 
     pub fn snapshot(&self) -> SessionSnapshot {
@@ -1828,6 +1847,7 @@ struct SessionActor {
     ownership_releases: mpsc::UnboundedSender<OwnershipRelease>,
     ownership_release_receiver: mpsc::UnboundedReceiver<OwnershipRelease>,
     snapshot: Arc<RwLock<SessionSnapshot>>,
+    activity_notifications: Arc<RwLock<Option<tokio::sync::broadcast::Sender<SessionId>>>>,
 }
 
 impl SessionActor {
@@ -2938,11 +2958,27 @@ impl SessionActor {
     }
 
     fn refresh_snapshot(&self) {
-        *self
+        let next = SessionSnapshot::from_state(&self.state, self.lease.is_some());
+        let mut previous = self
             .snapshot
             .write()
-            .expect("session snapshot lock poisoned") =
-            SessionSnapshot::from_state(&self.state, self.lease.is_some());
+            .expect("session snapshot lock poisoned");
+        let mut previous_semantic = previous.clone();
+        let mut next_semantic = next.clone();
+        previous_semantic.summary.updated_at_ms = 0;
+        next_semantic.summary.updated_at_ms = 0;
+        let changed = previous_semantic != next_semantic;
+        *previous = next;
+        drop(previous);
+        if changed
+            && let Some(sender) = self
+                .activity_notifications
+                .read()
+                .expect("activity notification lock")
+                .as_ref()
+        {
+            let _ = sender.send(self.state.summary.id);
+        }
     }
 
     async fn release_idle_resources(&mut self) -> bool {

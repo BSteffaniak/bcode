@@ -11269,6 +11269,29 @@ impl SessionView {
         }
     }
 
+    /// Invalidate ephemeral card evidence after a watch reset, scope change, or disconnect.
+    /// Publication remains canonical; missing observation is never inferred idle.
+    pub fn invalidate_child_card_activity(&mut self) {
+        let mut changed = false;
+        for item in &mut self.snapshot.transcript.items {
+            if item.id.get().starts_with("child-session:")
+                && let TranscriptViewItemKind::SystemMessage { message } = &mut item.kind
+            {
+                let title = message.text.split("\n\n").nth(1).unwrap_or("Child session");
+                let text = format!(
+                    "### Child session\n\n{title}\n\nPublished · activity unknown · assignment acceptance unavailable"
+                );
+                if message.text != text {
+                    message.text = text;
+                    changed = true;
+                }
+            }
+        }
+        if changed {
+            self.bump_revision();
+        }
+    }
+
     /// Update ephemeral evidence on canonical child cards without appending transcript noise.
     pub fn observe_child_card_activity(
         &mut self,

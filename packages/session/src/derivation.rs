@@ -760,7 +760,8 @@ impl SessionManager {
                 &db::SessionDb::open_existing_turso_in_root(summary.id, &store.root_path()).await?,
             )
             .await?;
-        let handle = crate::actor::SessionHandle::new(state, Some(store.clone()), None);
+        let handle = crate::actor::SessionHandle::new(state, Some(store.clone()), None)
+            .with_activity_notifications(self.activity_tx.clone());
         self.inner.lock().await.sessions.insert(summary.id, handle);
         Ok(())
     }

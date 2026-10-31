@@ -116,6 +116,7 @@ pub struct ActivityObservations {
     receiver: Option<tokio::sync::broadcast::Receiver<bcode_session::SessionMutationCommitted>>,
     buffered: BTreeMap<SessionId, BTreeMap<u64, SessionEvent>>,
     pending: bool,
+    changes: Option<super::activity_changes::ActivityChanges>,
 }
 
 impl ActivityObservations {
@@ -131,10 +132,26 @@ impl ActivityObservations {
         }
     }
 
+    #[must_use]
+    pub(super) fn with_changes(
+        mut self,
+        changes: super::activity_changes::ActivityChanges,
+    ) -> Self {
+        self.changes = Some(changes);
+        self
+    }
+
     fn degrade_all(&mut self) {
+        let changed = self
+            .sessions
+            .values()
+            .any(|facts| facts.complete || !facts.poisoned);
         for facts in self.sessions.values_mut() {
             facts.complete = false;
             facts.poisoned = true;
+        }
+        if changed && let Some(changes) = &self.changes {
+            changes.notify();
         }
     }
 
@@ -178,12 +195,25 @@ impl ActivityObservations {
                 }
             }
         }
+        if self
+            .receiver
+            .as_ref()
+            .is_some_and(tokio::sync::broadcast::Receiver::is_empty)
+        {
+            self.pending = false;
+        } else if let Some(changes) = &self.changes {
+            // Continue bounded catch-up on a change wake, never wait for an unrelated query.
+            changes.notify();
+        }
     }
 
     /// Release disposable evidence when runtime observation ownership ends.
     pub fn release(&mut self, id: SessionId) {
-        self.sessions.remove(&id);
+        let removed = self.sessions.remove(&id).is_some();
         self.buffered.remove(&id);
+        if removed && let Some(changes) = &self.changes {
+            changes.for_session(id).notify();
+        }
     }
 
     /// Legacy synthetic observer; manual frontend publication is ignored when subscribed.
@@ -199,6 +229,9 @@ impl ActivityObservations {
             && let Some((id, _)) = self.sessions.pop_first()
         {
             self.buffered.remove(&id);
+            if let Some(changes) = &self.changes {
+                changes.for_session(id).notify();
+            }
         }
         let facts = self.sessions.entry(event.session_id).or_default();
         if facts

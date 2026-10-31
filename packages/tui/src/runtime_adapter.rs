@@ -6,8 +6,9 @@ use super::telemetry::TuiTelemetry;
 
 /// Build generic runtime scheduling configuration from Bcode-owned TUI settings.
 #[must_use]
-pub fn config(tui: &TuiConfig) -> bmux_tui_runtime::RuntimeConfig {
+pub fn config(tui: &TuiConfig, metrics_enabled: bool) -> bmux_tui_runtime::RuntimeConfig {
     bmux_tui_runtime::RuntimeConfig {
+        collect_detailed_telemetry: metrics_enabled,
         frame_interval: tui.render.frame_interval(),
         ..bmux_tui_runtime::RuntimeConfig::default()
     }
@@ -22,6 +23,11 @@ pub struct RuntimeStatsRecorder {
 impl RuntimeStatsRecorder {
     /// Record one runtime snapshot without double-counting cumulative counters.
     pub fn record(&mut self, telemetry: &mut TuiTelemetry, stats: &bmux_tui_runtime::RuntimeStats) {
+        if !telemetry.is_enabled() {
+            // Track the baseline without allocating labels or timing metric work.
+            self.previous = *stats;
+            return;
+        }
         record_queue_gauges(telemetry, stats);
         record_admission_deltas(telemetry, stats, &self.previous);
         record_lifecycle_deltas(telemetry, stats, &self.previous);
@@ -238,16 +244,24 @@ mod tests {
 
     #[test]
     fn config_maps_frame_interval_without_product_types_crossing_boundary() {
-        let enabled = config(&TuiConfig {
-            render: TuiRenderConfig { max_fps: 20 },
-            ..TuiConfig::default()
-        });
+        let enabled = config(
+            &TuiConfig {
+                render: TuiRenderConfig { max_fps: 20 },
+                ..TuiConfig::default()
+            },
+            true,
+        );
+        assert!(enabled.collect_detailed_telemetry);
         assert_eq!(enabled.frame_interval, Some(Duration::from_millis(50)));
 
-        let unlimited = config(&TuiConfig {
-            render: TuiRenderConfig { max_fps: 0 },
-            ..TuiConfig::default()
-        });
+        let unlimited = config(
+            &TuiConfig {
+                render: TuiRenderConfig { max_fps: 0 },
+                ..TuiConfig::default()
+            },
+            false,
+        );
+        assert!(!unlimited.collect_detailed_telemetry);
         assert_eq!(unlimited.frame_interval, None);
     }
 }

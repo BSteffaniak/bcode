@@ -341,6 +341,52 @@ impl bcode_session_models::SessionCompactionRestartApplication for SessionApplic
 impl SessionApplication for SessionApplicationHandle<'_> {
     type CompactionOperation = ServerSessionCompactionOperation;
 
+    async fn open_activity_watch(
+        &self,
+        scope: bcode_session_models::SessionActivityWatchScope,
+    ) -> Result<bcode_session_models::SessionActivityWatchHandle, SessionApplicationFailure> {
+        self.require_running()?;
+        super::activity_watch::validate(&scope)?;
+        for target in &scope.activity {
+            self.selected_location(target.session_id).await?;
+        }
+        for query in &scope.children {
+            self.selected_location(query.parent_id).await?;
+        }
+        let clients = self.state.clients.lock().await;
+        if !clients.contains(&self.client_id) {
+            return Err(failure(
+                "activity_watch_unauthorized",
+                "Activity watch requires a connected caller.",
+            ));
+        }
+        let result = self
+            .state
+            .activity_watches
+            .open(self.state, self.client_id, scope);
+        drop(clients);
+        result
+    }
+    async fn pull_activity_watch(
+        &self,
+        handle: bcode_session_models::SessionActivityWatchHandle,
+    ) -> Result<bcode_session_models::SessionActivityWatchDelivery, SessionApplicationFailure> {
+        self.require_running()?;
+        self.state
+            .activity_watches
+            .pull(self.client_id, handle)
+            .await
+    }
+    fn close_activity_watch(
+        &self,
+        handle: bcode_session_models::SessionActivityWatchHandle,
+    ) -> impl std::future::Future<Output = Result<bool, SessionApplicationFailure>> {
+        std::future::ready(
+            self.require_running()
+                .map(|()| self.state.activity_watches.close(self.client_id, handle)),
+        )
+    }
+
     async fn begin_session_compaction(
         &self,
         session_id: SessionId,

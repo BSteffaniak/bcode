@@ -655,6 +655,32 @@ pub trait SessionApplication: Sync {
         operation_id: crate::SessionDerivationOperationId,
     ) -> impl Future<Output = Result<bool, SessionApplicationFailure>> + Send;
 
+    /// Open a non-owning bounded activity watch. No execution authority is acquired.
+    /// # Errors
+    /// Rejects invalid scope, unavailable locations, or exhausted watch admission.
+    fn open_activity_watch(
+        &self,
+        scope: crate::SessionActivityWatchScope,
+    ) -> impl Future<Output = Result<crate::SessionActivityWatchHandle, SessionApplicationFailure>> + Send;
+
+    /// Wait for the initial snapshot or the next semantic replacement.
+    /// Only one pull may be outstanding per handle. Cancellation closes that watch.
+    /// # Errors
+    /// Rejects foreign/closed handles, concurrent pulls, and oversized projections.
+    fn pull_activity_watch(
+        &self,
+        handle: crate::SessionActivityWatchHandle,
+    ) -> impl Future<Output = Result<crate::SessionActivityWatchDelivery, SessionApplicationFailure>>
+    + Send;
+
+    /// Release observation resources only; this never cancels execution.
+    /// # Errors
+    /// Rejects stopped applications. Unknown or foreign handles return false.
+    fn close_activity_watch(
+        &self,
+        handle: crate::SessionActivityWatchHandle,
+    ) -> impl Future<Output = Result<bool, SessionApplicationFailure>> + Send;
+
     /// Read bounded activity for a canonical session and its direct children.
     /// # Errors
     /// Rejects invalid budgets or unavailable canonical metadata.

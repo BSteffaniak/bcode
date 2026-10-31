@@ -36,6 +36,51 @@ pub fn child_activity_label(page: &SessionActivityPage) -> String {
     format!("children: {active} known active · {coverage}")
 }
 
+/// Combine a watch's loaded windows without retaining observations from an older
+/// delivery. Continuations never claim whole-scope completeness on their own.
+#[must_use]
+pub fn combine_activity_windows(
+    mut pages: Vec<SessionActivityPage>,
+) -> Option<SessionActivityPage> {
+    if pages.is_empty() {
+        return None;
+    }
+    let mut page = pages.remove(0);
+    let partial = page.next_after.is_some()
+        || pages.iter().any(|window| {
+            window.coverage != SessionActivityCoverage::Complete || window.next_after.is_some()
+        });
+    let mut observations = std::collections::BTreeMap::new();
+    for window in std::iter::once(&page).chain(pages.iter()) {
+        for activity in &window.descendants {
+            let entry = observations
+                .entry(activity.session_id)
+                .or_insert_with(|| (window.observed_at_ms, activity.clone()));
+            if window.observed_at_ms >= entry.0 {
+                *entry = (window.observed_at_ms, activity.clone());
+            }
+        }
+    }
+    for window in pages {
+        if window.observed_at_ms >= page.observed_at_ms {
+            page.own = window.own;
+            page.observed_at_ms = window.observed_at_ms;
+        }
+        page.issues.extend(window.issues);
+        if window.coverage == SessionActivityCoverage::Degraded {
+            page.coverage = SessionActivityCoverage::Degraded;
+        }
+    }
+    page.descendants = observations
+        .into_values()
+        .map(|(_, activity)| activity)
+        .collect();
+    if partial && page.coverage == SessionActivityCoverage::Complete {
+        page.coverage = SessionActivityCoverage::Partial;
+    }
+    Some(page)
+}
+
 /// Independent runtime evidence; no assignment acceptance or completion is invented.
 #[must_use]
 pub fn activity_evidence_label(activity: &SessionActivity) -> String {

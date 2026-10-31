@@ -974,7 +974,8 @@ impl SessionManager {
             SessionState::from_catalog_summary(summary.clone()),
             self.store.clone(),
             None,
-        );
+        )
+        .with_activity_notifications(self.activity_tx.clone());
         self.inner
             .lock()
             .await

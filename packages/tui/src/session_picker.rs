@@ -53,6 +53,9 @@ pub struct SessionPickerApp {
     catalog_cursor: Option<bcode_session_models::SessionCatalogCursor>,
     catalog_next_cursor: Option<bcode_session_models::SessionCatalogCursor>,
     child_loaded: Vec<SessionNavigationKey>,
+    child_watch_windows: Vec<bcode_session_models::SessionChildQuery>,
+    child_watch_relationships:
+        std::collections::BTreeMap<(SessionId, Option<SessionId>), Vec<SessionId>>,
     expanded: BTreeSet<SessionNavigationKey>,
     tree_rows: Vec<SessionTreeRow>,
     child_cursors: std::collections::BTreeMap<SessionId, Option<SessionId>>,
@@ -109,6 +112,8 @@ impl SessionPickerApp {
             bulk_migration_operation_id: None,
             search_backfill_operation_id: None,
             child_loaded: Vec::new(),
+            child_watch_windows: Vec::new(),
+            child_watch_relationships: std::collections::BTreeMap::new(),
             expanded: BTreeSet::new(),
             tree_rows: Vec::new(),
             child_cursors: std::collections::BTreeMap::new(),
@@ -149,6 +154,8 @@ impl SessionPickerApp {
         self.restart_catalog();
         self.sessions.clear();
         self.child_loaded.clear();
+        self.child_watch_windows.clear();
+        self.child_watch_relationships.clear();
         self.expanded.clear();
         self.tree_rows.clear();
         self.child_cursors.clear();
@@ -710,6 +717,67 @@ impl SessionPickerApp {
         }
     }
 
+    /// Remember the explicit loaded query, never a delivery's moving continuation.
+    pub(crate) fn retain_child_watch_window(
+        &mut self,
+        parent_id: SessionId,
+        after: Option<SessionId>,
+    ) {
+        let query = bcode_session_models::SessionChildQuery {
+            parent_id,
+            after,
+            limit: 64,
+        };
+        if !self.child_watch_windows.contains(&query) {
+            self.child_watch_windows.insert(0, query);
+            self.child_watch_windows.truncate(4);
+            self.child_watch_relationships.retain(|(parent, after), _| {
+                self.child_watch_windows
+                    .iter()
+                    .any(|query| query.parent_id == *parent && query.after == *after)
+            });
+        }
+    }
+
+    /// Bounded local loaded windows; aggregate catalogs do not invent relationship scope.
+    #[must_use]
+    pub(crate) fn child_watch_windows(&self) -> Vec<bcode_session_models::SessionChildQuery> {
+        if self.all_directories() {
+            Vec::new()
+        } else {
+            self.child_watch_windows.clone()
+        }
+    }
+
+    /// Full replacement of one loaded query, not a new page request.
+    pub(crate) fn apply_watched_children(
+        &mut self,
+        query: &bcode_session_models::SessionChildQuery,
+        page: bcode_session_models::SessionChildPage,
+    ) {
+        let key = (query.parent_id, query.after);
+        if page.complete && page.issues.is_empty() {
+            let ids: Vec<_> = page.children.iter().map(|child| child.id).collect();
+            if let Some(previous) = self.child_watch_relationships.insert(key, ids.clone()) {
+                let removed: Vec<_> = previous
+                    .into_iter()
+                    .filter(|id| {
+                        !ids.contains(id)
+                            && !self
+                                .child_watch_relationships
+                                .values()
+                                .any(|window| window.contains(id))
+                    })
+                    .collect();
+                self.sessions
+                    .retain(|summary| !removed.contains(&summary.id));
+                self.child_loaded
+                    .retain(|loaded| !removed.contains(&loaded.session_id));
+            }
+        }
+        self.apply_children(query.parent_id, page);
+    }
+
     /// Merge one explicitly requested child page without changing the selected identity.
     pub fn apply_children(
         &mut self,
@@ -950,6 +1018,43 @@ fn empty_item(message: &str, muted: Style) -> ListItem {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn pushed_picker_window_replaces_loaded_children_and_scope_toggle_discards_watch() {
+        let mut parent = summary("parent", "/tmp");
+        parent.parent_id = None;
+        let mut child = summary("child", "/tmp");
+        child.parent_id = Some(parent.id);
+        let mut picker = super::SessionPickerApp::new(vec![parent.clone()]);
+        let query = bcode_session_models::SessionChildQuery {
+            parent_id: parent.id,
+            after: None,
+            limit: 64,
+        };
+        picker.retain_child_watch_window(parent.id, None);
+        picker.apply_watched_children(
+            &query,
+            bcode_session_models::SessionChildPage {
+                children: vec![child.clone()],
+                next_after: None,
+                complete: true,
+                issues: vec![],
+            },
+        );
+        assert!(picker.sessions.iter().any(|summary| summary.id == child.id));
+        picker.apply_watched_children(
+            &query,
+            bcode_session_models::SessionChildPage {
+                children: vec![],
+                next_after: None,
+                complete: true,
+                issues: vec![],
+            },
+        );
+        assert!(!picker.sessions.iter().any(|summary| summary.id == child.id));
+        assert_eq!(picker.child_watch_windows(), [query]);
+        assert!(picker.set_all_directories(true));
+        assert!(picker.child_watch_windows().is_empty());
+    }
     use super::*;
 
     fn summary(title: &str, working_directory: &str) -> SessionSummary {

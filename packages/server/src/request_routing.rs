@@ -47,6 +47,15 @@ use std::path::PathBuf;
 /// Requests owned by the `SessionLifecycle` dispatcher (41 variants).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SessionLifecycleRequest {
+    OpenSessionActivityWatch {
+        scope: bcode_session_models::SessionActivityWatchScope,
+    },
+    PullSessionActivityWatch {
+        handle: bcode_session_models::SessionActivityWatchHandle,
+    },
+    CloseSessionActivityWatch {
+        handle: bcode_session_models::SessionActivityWatchHandle,
+    },
     OpenSessionObservation {
         request: bcode_session_models::observation::SessionObservationRequest,
     },
@@ -2306,6 +2315,15 @@ impl RoutedRequest {
             Request::ComposerDraft { scope } => {
                 Self::SessionLifecycle(Box::new(SessionLifecycleRequest::ComposerDraft { scope }))
             }
+            Request::OpenSessionActivityWatch { scope } => Self::SessionLifecycle(Box::new(
+                SessionLifecycleRequest::OpenSessionActivityWatch { scope },
+            )),
+            Request::PullSessionActivityWatch { handle } => Self::SessionLifecycle(Box::new(
+                SessionLifecycleRequest::PullSessionActivityWatch { handle },
+            )),
+            Request::CloseSessionActivityWatch { handle } => Self::SessionLifecycle(Box::new(
+                SessionLifecycleRequest::CloseSessionActivityWatch { handle },
+            )),
             Request::OpenSessionObservation { request } => {
                 Self::SessionLifecycle(Box::new(SessionLifecycleRequest::OpenSessionObservation {
                     request,

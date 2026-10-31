@@ -55,11 +55,13 @@ async fn run_capture_turn_with_execution(
     let (followup_tx, mut followup) = mpsc::channel(1);
     let (steering_tx, mut steering) = mpsc::channel(1);
     let (cancel_tx, mut cancel) = mpsc::channel(1);
-    let queued = Arc::new(AtomicUsize::new(0));
+    let queued = Arc::new(crate::activity_changes::ActivityCounter::new(0));
     let cancel_state = Arc::new(TurnCancelState::default());
     // The registered actor starts idle; lifecycle alone owns begin/end_current_turn.
     let current = Arc::new(Mutex::new(None));
-    let phase = Arc::new(Mutex::new(SessionRuntimePhase::Idle));
+    let phase = Arc::new(crate::activity_changes::ActivityMutex::new(
+        SessionRuntimePhase::Idle,
+    ));
     state.session_runtimes.lock().await.insert(
         session,
         SessionRuntimeHandle {
@@ -67,7 +69,7 @@ async fn run_capture_turn_with_execution(
             steering_commands: steering_tx,
             cancel_commands: cancel_tx,
             queued_followups: Arc::clone(&queued),
-            queued_steering: Arc::new(AtomicUsize::new(0)),
+            queued_steering: Arc::new(crate::activity_changes::ActivityCounter::new(0)),
             phase: Arc::clone(&phase),
             current_turn: Arc::clone(&current),
         },

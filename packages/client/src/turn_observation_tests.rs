@@ -5,7 +5,7 @@ use bcode_session_models::{ModelTurnOutcome, SessionEventKind};
 
 async fn watcher() -> (SessionWatcher, LocalIpcStream, std::path::PathBuf) {
     let directory = std::path::PathBuf::from(format!("/tmp/bcw-{}", SessionId::new()));
-    std::fs::create_dir_all(&directory).expect("socket directory");
+    crate::client_timeout_tests::create_private_socket_fixture(&directory);
     let endpoint = bcode_ipc::IpcEndpoint::unix_socket(directory.join("client.sock"));
     let listener = bcode_ipc::LocalIpcListener::bind(&endpoint).expect("listener");
     let stream = LocalIpcStream::connect(&endpoint).await.expect("connect");
@@ -14,6 +14,7 @@ async fn watcher() -> (SessionWatcher, LocalIpcStream, std::path::PathBuf) {
         stream,
         next_request_id: 1,
         client_id: None,
+        verified_daemon: None,
         pending_events: VecDeque::new(),
         request_timeout: Duration::from_secs(1),
         reconnect_client: None,

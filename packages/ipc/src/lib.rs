@@ -141,8 +141,9 @@ const MAX_CHUNK_DATA_SIZE: usize = MAX_FRAME_PAYLOAD_SIZE / 2;
 /// Version 56 adds separate opt-in durable interaction admission, views and retry receipts.
 /// Version 57 adds bounded canonical durable interaction discovery.
 /// Version 58 adds explicit session-scoped local X-ray endpoint bootstrap and revocation.
+/// Version 59 adds non-owning bounded activity and child-window watch delivery.
 /// Older positional request/response layouts are rejected rather than misinterpreted.
-pub const CURRENT_PROTOCOL_VERSION: u16 = 58;
+pub const CURRENT_PROTOCOL_VERSION: u16 = 59;
 
 /// Durable session-storage writer epoch expected by this IPC build.
 pub const CURRENT_SESSION_STORAGE_WRITER_EPOCH: u32 =
@@ -1361,6 +1362,18 @@ pub enum Request {
         scope: ComposerDraftScope,
     },
     /// Open a connection-owned bounded semantic session observation.
+    /// Open a bounded non-owning activity and child-window watch.
+    OpenSessionActivityWatch {
+        scope: bcode_session_models::SessionActivityWatchScope,
+    },
+    /// Long-pull the initial or next semantic replacement. One outstanding pull per watch.
+    PullSessionActivityWatch {
+        handle: bcode_session_models::SessionActivityWatchHandle,
+    },
+    /// Release only observation resources, never execution authority.
+    CloseSessionActivityWatch {
+        handle: bcode_session_models::SessionActivityWatchHandle,
+    },
     OpenSessionObservation {
         request: bcode_session_models::observation::SessionObservationRequest,
     },
@@ -2886,6 +2899,15 @@ pub enum ResponsePayload {
     ComposerDraftSet,
     PluginContributions {
         contributions: PluginContributions,
+    },
+    SessionActivityWatchOpened {
+        handle: bcode_session_models::SessionActivityWatchHandle,
+    },
+    SessionActivityWatchUpdated {
+        delivery: Box<bcode_session_models::SessionActivityWatchDelivery>,
+    },
+    SessionActivityWatchClosed {
+        closed: bool,
     },
     SessionObservationOpened {
         handle: bcode_session_models::observation::SessionObservationHandle,
@@ -4560,7 +4582,7 @@ mod tests {
             panic!("typed discovery response");
         };
         assert_eq!(actual, page);
-        assert_eq!(CURRENT_PROTOCOL_VERSION, 58);
+        assert_eq!(CURRENT_PROTOCOL_VERSION, 59);
         assert_ne!(ProtocolVersion(56), ProtocolVersion::current());
     }
 

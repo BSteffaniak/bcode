@@ -43,7 +43,7 @@ async fn resumed_synthesis_failure_retains_normalized_overflow_without_private_m
     let (_followup_tx, mut followup_rx) = mpsc::channel(1);
     let (_steering_tx, mut steering_rx) = mpsc::channel(1);
     let (_cancel_tx, mut cancel_rx) = mpsc::channel(1);
-    let queued = AtomicUsize::new(0);
+    let queued = crate::activity_changes::ActivityCounter::new(0);
     let mut commands = RuntimeCommandContext::new(
         &mut followup_rx,
         &mut steering_rx,

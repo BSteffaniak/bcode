@@ -47,6 +47,27 @@ Running, queued, permission wait, input wait, idle, failed, interrupted, and unk
 
 Own-session evidence counts do not claim subtree totals. Nonresident sessions, event gaps, evicted evidence, and unobserved descendants remain unknown, partial, or degraded. Activity pages are timestamped observations, not durable subscriptions or reconnect checkpoints. Monitoring installs no scheduler and acquires no execution authority. Existing workflow ownership and cancellation fencing remain unchanged.
 
+## Activity watches
+
+Portable clients can open a non-owning activity watch through `SessionApplication`.
+A scope selects bounded activity queries and loaded direct-child windows; it does
+not recursively subscribe to an entire descendant tree. Existing one-shot CLI
+queries remain available.
+
+The first delivery is a bounded snapshot. Later deliveries replace that scope's
+state after semantic changes. Every delivery carries its watch identity, fresh
+epoch, and contiguous subscription-local sequence. These are not canonical event
+sequences or durable resume tokens. A reset explicitly invalidates the previous
+view after observation gaps or skipped revisions. Query failures remain explicit;
+unavailable activity is never inferred to be idle.
+
+Healthy idle watches do not periodically query storage. Identical scopes share a
+server projection. Scope changes close the old watch and open a new one; transport
+loss requires a fresh watch and snapshot, not replay of mutations. Closing a watch
+or disconnecting releases observation resources without cancelling execution.
+Admission, candidate counts, replacement bytes, and pending delivery are bounded.
+Large trees remain accessible through incremental windows.
+
 ## Persistence and compatibility
 
 The child's canonical `ChildSessionCreated` request records immutable parentage. Parent `SessionChildLinked` intent and `SessionChildPublished` acknowledgment fence publication; `SessionChildrenReconciled` records explicit maintenance coverage. The parent-local relationship projection advances atomically with canonical event checkpoints. Session summaries and catalogs remain derived.

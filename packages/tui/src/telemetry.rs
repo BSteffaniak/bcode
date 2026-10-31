@@ -5,10 +5,12 @@ use bcode_metrics::{
     ClientMetricBatch, ClientMetricObservation, MAX_CLIENT_METRIC_OBSERVATIONS, MetricLabels,
 };
 use std::collections::BTreeMap;
-use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::future::{Future, poll_fn};
+use std::pin::Pin;
+use std::sync::{Arc, Mutex};
+use std::task::Poll;
 use std::time::{Duration, Instant};
-use tokio::sync::{mpsc, watch};
+use tokio::sync::{Notify, mpsc};
 use tokio::task::JoinHandle;
 
 const TELEMETRY_FLUSH_INTERVAL: Duration = Duration::from_secs(1);
@@ -21,70 +23,165 @@ struct DeliveryOutcome {
     succeeded: bool,
 }
 
-/// TUI-local telemetry aggregation with one in-flight and one replaceable pending batch.
-pub struct TuiTelemetry {
+type Upload = Pin<Box<dyn Future<Output = bool> + Send>>;
+
+#[derive(Default)]
+struct DeliveryState {
     enabled: bool,
-    counters: BTreeMap<MetricKey, u64>,
-    gauges: BTreeMap<MetricKey, i64>,
-    histograms: Vec<(MetricKey, u64)>,
-    next_flush_at: Instant,
-    batch_tx: watch::Sender<Option<ClientMetricBatch>>,
-    outcome_rx: mpsc::Receiver<DeliveryOutcome>,
-    in_flight: Arc<AtomicBool>,
-    pending: Arc<AtomicBool>,
+    pending: Option<ClientMetricBatch>,
+    upload: Option<Upload>,
+    observations: usize,
+}
+
+struct Delivery {
+    state: Arc<Mutex<DeliveryState>>,
+    wake: Arc<Notify>,
+    outcomes: mpsc::Receiver<DeliveryOutcome>,
     worker: JoinHandle<()>,
 }
 
-impl TuiTelemetry {
-    /// Start a bounded sender using an independent daemon connection.
-    pub(crate) fn new(client: BcodeClient, enabled: bool) -> Self {
-        let (batch_tx, mut batch_rx) = watch::channel(None::<ClientMetricBatch>);
-        let (outcome_tx, outcome_rx) = mpsc::channel(1);
-        let in_flight = Arc::new(AtomicBool::new(false));
-        let pending = Arc::new(AtomicBool::new(false));
-        let worker_in_flight = Arc::clone(&in_flight);
-        let worker_pending = Arc::clone(&pending);
+impl Delivery {
+    fn new<F, U>(mut upload: F) -> Self
+    where
+        F: FnMut(ClientMetricBatch) -> U + Send + 'static,
+        U: Future<Output = bool> + Send + 'static,
+    {
+        let state = Arc::new(Mutex::new(DeliveryState {
+            enabled: true,
+            ..DeliveryState::default()
+        }));
+        let wake = Arc::new(Notify::new());
+        let (outcome_tx, outcomes) = mpsc::channel(1);
+        let worker_state = Arc::clone(&state);
+        let worker_wake = Arc::clone(&wake);
         let worker = tokio::spawn(async move {
             loop {
-                if batch_rx.changed().await.is_err() {
-                    break;
-                }
-                let Some(batch) = batch_rx.borrow_and_update().clone() else {
-                    continue;
-                };
-                worker_in_flight.store(true, Ordering::Release);
-                worker_pending.store(false, Ordering::Release);
-                let observations = batch.observations.len();
-                let succeeded = client.ingest_client_metrics(batch).await.is_ok();
-                worker_in_flight.store(false, Ordering::Release);
-                let _ = outcome_tx
-                    .send(DeliveryOutcome {
-                        observations,
-                        succeeded,
+                worker_wake.notified().await;
+                // Optional metrics yield to ready interactive work before dispatch.
+                tokio::task::yield_now().await;
+                loop {
+                    let outcome = poll_fn(|cx| {
+                        let mut state = worker_state.lock().expect("telemetry delivery lock");
+                        if !state.enabled {
+                            return Poll::Ready(None);
+                        }
+                        if state.upload.is_none() {
+                            let Some(batch) = state.pending.take() else {
+                                return Poll::Ready(None);
+                            };
+                            let observations = batch.observations.len();
+                            let request = upload(batch);
+                            state.upload = Some(Box::pin(request));
+                            // The count belongs to this request, not the replaceable slot.
+                            state.observations = observations;
+                        }
+                        // Poll and disable share a short, non-async lock. Once disable
+                        // returns no old future can be polled or queued batch dispatched.
+                        let succeeded = std::task::ready!(
+                            state
+                                .upload
+                                .as_mut()
+                                .expect("active upload")
+                                .as_mut()
+                                .poll(cx)
+                        );
+                        state.upload = None;
+                        Poll::Ready(Some(DeliveryOutcome {
+                            observations: state.observations,
+                            succeeded,
+                        }))
                     })
                     .await;
+                    let Some(outcome) = outcome else { break };
+                    // Delivery diagnostics must never stall uploads or interactive work.
+                    let _ = outcome_tx.try_send(outcome);
+                    tokio::task::yield_now().await;
+                }
             }
         });
         Self {
-            enabled,
-            counters: BTreeMap::new(),
-            gauges: BTreeMap::new(),
-            histograms: Vec::new(),
-            next_flush_at: Instant::now() + TELEMETRY_FLUSH_INTERVAL,
-            batch_tx,
-            outcome_rx,
-            in_flight,
-            pending,
+            state,
+            wake,
+            outcomes,
             worker,
         }
     }
 
+    fn replace(&self, batch: ClientMetricBatch) -> bool {
+        let mut state = self.state.lock().expect("telemetry delivery lock");
+        if !state.enabled {
+            return false;
+        }
+        let replaced = state.pending.replace(batch).is_some();
+        drop(state);
+        self.wake.notify_one();
+        replaced
+    }
+}
+
+impl Drop for Delivery {
+    fn drop(&mut self) {
+        let mut state = self.state.lock().expect("telemetry delivery lock");
+        state.enabled = false;
+        state.pending = None;
+        // Cancel only this metrics request. Transport framing/reuse is client-owned.
+        state.upload = None;
+        drop(state);
+        self.worker.abort();
+    }
+}
+
+/// TUI-local telemetry aggregation with one in-flight and one replaceable pending batch.
+pub struct TuiTelemetry {
+    enabled: bool,
+    client: BcodeClient,
+    counters: BTreeMap<MetricKey, u64>,
+    gauges: BTreeMap<MetricKey, i64>,
+    histograms: Vec<(MetricKey, u64)>,
+    next_flush_at: Option<Instant>,
+    delivery: Option<Delivery>,
+}
+
+impl TuiTelemetry {
+    /// Construct dormant telemetry; only explicit enable starts a delivery worker.
+    pub(crate) fn new(client: BcodeClient, enabled: bool) -> Self {
+        let mut telemetry = Self {
+            enabled: false,
+            client,
+            counters: BTreeMap::new(),
+            gauges: BTreeMap::new(),
+            histograms: Vec::new(),
+            next_flush_at: None,
+            delivery: None,
+        };
+        telemetry.set_enabled(enabled);
+        telemetry
+    }
+
+    /// Whether callers should prepare metric-only clocks, labels, and snapshots.
+    #[must_use]
+    pub(crate) const fn is_enabled(&self) -> bool {
+        self.enabled
+    }
+
     pub(crate) fn set_enabled(&mut self, enabled: bool) {
+        if self.enabled == enabled {
+            return;
+        }
         self.enabled = enabled;
-        if !enabled {
-            self.counters.clear();
-            self.gauges.clear();
-            self.histograms.clear();
+        if enabled {
+            let client = self.client.clone();
+            self.delivery = Some(Delivery::new(move |batch| {
+                let client = client.clone();
+                async move { client.ingest_client_metrics(batch).await.is_ok() }
+            }));
+            self.next_flush_at = Some(Instant::now() + TELEMETRY_FLUSH_INTERVAL);
+        } else {
+            self.delivery = None;
+            self.next_flush_at = None;
+            self.counters = BTreeMap::new();
+            self.gauges = BTreeMap::new();
+            self.histograms = Vec::new();
         }
     }
 
@@ -127,16 +224,18 @@ impl TuiTelemetry {
         self.flush_if_due(Instant::now());
     }
 
-    pub(crate) fn next_flush_at(&self) -> Option<Instant> {
-        self.enabled.then_some(self.next_flush_at)
+    pub(crate) const fn next_flush_at(&self) -> Option<Instant> {
+        self.next_flush_at
     }
 
     pub(crate) fn flush_if_due(&mut self, now: Instant) {
-        self.drain_outcomes();
         if !self.enabled {
             return;
         }
-        if now >= self.next_flush_at || self.observation_count() >= MAX_CLIENT_METRIC_OBSERVATIONS {
+        self.drain_outcomes();
+        if self.next_flush_at.is_some_and(|deadline| now >= deadline)
+            || self.observation_count() >= MAX_CLIENT_METRIC_OBSERVATIONS
+        {
             self.flush(now);
         }
     }
@@ -149,7 +248,11 @@ impl TuiTelemetry {
     }
 
     fn drain_outcomes(&mut self) {
-        while let Ok(outcome) = self.outcome_rx.try_recv() {
+        while let Some(outcome) = self
+            .delivery
+            .as_mut()
+            .and_then(|delivery| delivery.outcomes.try_recv().ok())
+        {
             if outcome.succeeded {
                 self.add_counter_without_flush(
                     "tui.telemetry.delivered_observations",
@@ -178,7 +281,7 @@ impl TuiTelemetry {
 
     fn flush(&mut self, now: Instant) {
         if self.observation_count() == 0 {
-            self.next_flush_at = now + TELEMETRY_FLUSH_INTERVAL;
+            self.next_flush_at = Some(now + TELEMETRY_FLUSH_INTERVAL);
             return;
         }
         let batch_observations = self.observation_count();
@@ -231,25 +334,236 @@ impl TuiTelemetry {
             );
         }
 
-        let has_in_flight = self.in_flight.load(Ordering::Acquire);
-        let replaced = self.pending.swap(true, Ordering::AcqRel);
-        if has_in_flight && replaced {
+        if self
+            .delivery
+            .as_ref()
+            .is_some_and(|delivery| delivery.replace(batch))
+        {
             self.add_counter_without_flush("tui.telemetry.dropped_total", 1);
         }
-        self.batch_tx.send_replace(Some(batch));
-        self.next_flush_at = now + TELEMETRY_FLUSH_INTERVAL;
-    }
-}
-
-impl Drop for TuiTelemetry {
-    fn drop(&mut self) {
-        self.worker.abort();
+        self.next_flush_at = Some(now + TELEMETRY_FLUSH_INTERVAL);
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    fn batch(value: u64) -> ClientMetricBatch {
+        ClientMetricBatch {
+            observations: vec![ClientMetricObservation::CounterDelta {
+                name: "test.delivery".to_owned(),
+                value,
+                labels: MetricLabels::new(),
+            }],
+        }
+    }
+
+    #[test]
+    fn disabled_startup_needs_no_runtime_or_delivery_state() {
+        let mut telemetry = TuiTelemetry::new(BcodeClient::default_endpoint(), false);
+        telemetry.add_counter("test.counter", 1);
+        telemetry.record_histogram("test.histogram", 1);
+        telemetry.set_gauge("test.gauge", 1);
+        telemetry.flush_if_due(Instant::now());
+        telemetry.set_enabled(false);
+        assert!(!telemetry.is_enabled());
+        assert!(telemetry.delivery.is_none());
+        assert!(telemetry.next_flush_at().is_none());
+        assert_eq!(telemetry.observation_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn disable_discards_pending_before_dispatch_and_reenable_starts_fresh() {
+        let mut telemetry = TuiTelemetry::new(BcodeClient::default_endpoint(), true);
+        let calls = Arc::new(AtomicUsize::new(0));
+        let uploads = Arc::clone(&calls);
+        telemetry.delivery = Some(Delivery::new(move |_| {
+            uploads.fetch_add(1, Ordering::SeqCst);
+            async { true }
+        }));
+        telemetry.add_counter_without_flush("test.old", 1);
+        telemetry.flush(Instant::now());
+        telemetry.set_enabled(false);
+        tokio::task::yield_now().await;
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+        assert!(telemetry.delivery.is_none());
+        assert!(telemetry.next_flush_at().is_none());
+        assert_eq!(telemetry.observation_count(), 0);
+
+        telemetry.set_enabled(true);
+        assert!(telemetry.delivery.is_some());
+        assert!(telemetry.next_flush_at().is_some());
+        assert_eq!(telemetry.observation_count(), 0);
+        telemetry.add_counter("test.new", 1);
+        assert_eq!(telemetry.observation_count(), 1);
+        telemetry.set_enabled(true);
+        assert_eq!(telemetry.observation_count(), 1);
+    }
+
+    struct CancelProbe(Arc<AtomicUsize>);
+
+    impl Drop for CancelProbe {
+        fn drop(&mut self) {
+            self.0.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
+    #[tokio::test]
+    async fn disable_cancels_inflight_and_never_dispatches_pending() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let cancelled = Arc::new(AtomicUsize::new(0));
+        let (started_tx, mut started_rx) = mpsc::channel(1);
+        let uploads = Arc::clone(&calls);
+        let drops = Arc::clone(&cancelled);
+        let mut telemetry = TuiTelemetry::new(BcodeClient::default_endpoint(), true);
+        telemetry.delivery = Some(Delivery::new(move |_| {
+            uploads.fetch_add(1, Ordering::SeqCst);
+            let probe = CancelProbe(Arc::clone(&drops));
+            let _ = started_tx.try_send(());
+            async move {
+                let _probe = probe;
+                std::future::pending::<bool>().await
+            }
+        }));
+        telemetry.delivery.as_ref().unwrap().replace(batch(1));
+        started_rx.recv().await.unwrap();
+        telemetry.delivery.as_ref().unwrap().replace(batch(2));
+        telemetry.add_counter("test.aggregated", 1);
+        telemetry.set_enabled(false);
+        // Cancellation drops the request synchronously, not at the next task poll.
+        assert_eq!(cancelled.load(Ordering::SeqCst), 1);
+        assert_eq!(telemetry.observation_count(), 0);
+        tokio::task::yield_now().await;
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn slow_delivery_keeps_only_latest_pending_and_reports_outcomes() {
+        let (started_tx, mut started_rx) = mpsc::channel(4);
+        let permits = Arc::new(tokio::sync::Semaphore::new(0));
+        let release = Arc::clone(&permits);
+        let mut delivery = Delivery::new(move |batch| {
+            let _ = started_tx.try_send(batch);
+            let permits = Arc::clone(&permits);
+            async move {
+                permits.acquire().await.unwrap().forget();
+                true
+            }
+        });
+        assert!(!delivery.replace(batch(1)));
+        assert_eq!(started_rx.recv().await.unwrap(), batch(1));
+        assert!(!delivery.replace(batch(2)));
+        for value in 3..1_000 {
+            assert!(delivery.replace(batch(value)));
+        }
+        assert!(started_rx.try_recv().is_err());
+        release.add_permits(1);
+        assert_eq!(started_rx.recv().await.unwrap(), batch(999));
+        let outcome = delivery.outcomes.recv().await.unwrap();
+        assert!(outcome.succeeded);
+        assert_eq!(outcome.observations, 1);
+        release.add_permits(1);
+        assert!(delivery.outcomes.recv().await.unwrap().succeeded);
+        assert!(started_rx.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn disabled_runtime_snapshots_advance_baseline_without_collecting_metrics() {
+        let mut telemetry = TuiTelemetry::new(BcodeClient::default_endpoint(), false);
+        let mut recorder = super::super::runtime_adapter::RuntimeStatsRecorder::default();
+        recorder.record(
+            &mut telemetry,
+            &bmux_tui_runtime::RuntimeStats {
+                frames_presented: 100,
+                ..bmux_tui_runtime::RuntimeStats::default()
+            },
+        );
+        assert_eq!(telemetry.observation_count(), 0);
+        assert!(telemetry.delivery.is_none());
+        telemetry.set_enabled(true);
+        recorder.record(
+            &mut telemetry,
+            &bmux_tui_runtime::RuntimeStats {
+                frames_presented: 103,
+                ..bmux_tui_runtime::RuntimeStats::default()
+            },
+        );
+        assert_eq!(
+            telemetry.counters.get(&(
+                "tui.runtime.frames_presented_total".to_owned(),
+                MetricLabels::new()
+            )),
+            Some(&3)
+        );
+    }
+
+    #[tokio::test]
+    async fn reenabled_delivery_sends_new_observations_without_old_queue() {
+        let mut telemetry = TuiTelemetry::new(BcodeClient::default_endpoint(), true);
+        telemetry.add_counter_without_flush("test.old", 1);
+        telemetry.flush(Instant::now());
+        telemetry.set_enabled(false);
+        telemetry.set_enabled(true);
+        let (tx, mut rx) = mpsc::channel(1);
+        telemetry.delivery = Some(Delivery::new(move |batch| {
+            let _ = tx.try_send(batch);
+            async { true }
+        }));
+        telemetry.add_counter_without_flush("test.new", 1);
+        telemetry.flush(Instant::now());
+        let delivered = rx.recv().await.unwrap();
+        let names: Vec<_> = delivered
+            .observations
+            .iter()
+            .map(|observation| match observation {
+                ClientMetricObservation::CounterDelta { name, .. }
+                | ClientMetricObservation::Gauge { name, .. }
+                | ClientMetricObservation::Histogram { name, .. } => name.as_str(),
+            })
+            .collect();
+        assert!(names.contains(&"test.new"));
+        assert!(!names.contains(&"test.old"));
+    }
+
+    #[tokio::test]
+    async fn failed_upload_is_reported_without_blocking_next_delivery() {
+        let (tx, mut rx) = mpsc::channel(2);
+        let mut delivery = Delivery::new(move |batch| {
+            let _ = tx.try_send(batch);
+            async { false }
+        });
+        delivery.replace(batch(1));
+        assert_eq!(rx.recv().await.unwrap(), batch(1));
+        assert!(!delivery.outcomes.recv().await.unwrap().succeeded);
+        delivery.replace(batch(2));
+        assert_eq!(rx.recv().await.unwrap(), batch(2));
+        assert!(!delivery.outcomes.recv().await.unwrap().succeeded);
+    }
+
+    #[tokio::test]
+    async fn enabled_aggregation_and_delivery_batches_are_bounded() {
+        let mut telemetry = TuiTelemetry::new(BcodeClient::default_endpoint(), true);
+        telemetry.delivery = Some(Delivery::new(|_| std::future::pending::<bool>()));
+        for value in 0..10_000 {
+            telemetry.record_histogram("test.backlog", value);
+            assert!(telemetry.observation_count() <= MAX_CLIENT_METRIC_OBSERVATIONS);
+        }
+        let pending_count = telemetry
+            .delivery
+            .as_ref()
+            .unwrap()
+            .state
+            .lock()
+            .unwrap()
+            .pending
+            .as_ref()
+            .unwrap()
+            .observations
+            .len();
+        assert!(pending_count <= MAX_CLIENT_METRIC_OBSERVATIONS);
+    }
 
     #[tokio::test]
     #[ignore = "manual deterministic performance baseline"]
@@ -499,8 +813,8 @@ mod tests {
     async fn replaced_pending_batches_are_counted_as_dropped() {
         let client = BcodeClient::default_endpoint();
         let mut telemetry = TuiTelemetry::new(client, true);
-        telemetry.in_flight.store(true, Ordering::Release);
-        telemetry.pending.store(true, Ordering::Release);
+        telemetry.add_counter_without_flush("test.pending", 1);
+        telemetry.flush(Instant::now());
         telemetry.add_counter_without_flush("test.observation", 1);
 
         telemetry.flush(Instant::now());

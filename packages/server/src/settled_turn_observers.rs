@@ -353,7 +353,7 @@ mod tests {
         let (_followup, mut followups) = tokio::sync::mpsc::channel(1);
         let (_steering, mut steering) = tokio::sync::mpsc::channel(1);
         let (_cancel, mut cancels) = tokio::sync::mpsc::channel(1);
-        let queued = AtomicUsize::new(0);
+        let queued = crate::activity_changes::ActivityCounter::new(0);
         let current = std::sync::Arc::new(tokio::sync::Mutex::new(None));
         let mut commands = crate::RuntimeCommandContext::new(
             &mut followups,
@@ -471,7 +471,7 @@ mod tests {
         let (_followup, mut followups) = tokio::sync::mpsc::channel(1);
         let (_steering, mut steering) = tokio::sync::mpsc::channel(1);
         let (_cancel, mut cancels) = tokio::sync::mpsc::channel(1);
-        let queued = std::sync::atomic::AtomicUsize::new(0);
+        let queued = crate::activity_changes::ActivityCounter::new(0);
         let current = std::sync::Arc::new(tokio::sync::Mutex::new(None));
         let mut commands = crate::RuntimeCommandContext::new(
             &mut followups,

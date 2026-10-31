@@ -726,6 +726,7 @@ pub struct SessionManager {
     catalog_status_tx: watch::Sender<CatalogLoadStatus>,
     catalog_status_rx: watch::Receiver<CatalogLoadStatus>,
     mutation_tx: broadcast::Sender<SessionMutationCommitted>,
+    activity_tx: broadcast::Sender<SessionId>,
     pending_child_counts: Arc<Mutex<BTreeMap<SessionId, usize>>>,
     child_receipts: Arc<Mutex<BTreeMap<(SessionId, SessionId), bool>>>,
     shared_execution_locks: Arc<Mutex<BTreeMap<SessionId, Arc<Mutex<()>>>>>,
@@ -792,6 +793,7 @@ impl Default for SessionManager {
             catalog_status_tx,
             catalog_status_rx,
             mutation_tx: broadcast::channel(1024).0,
+            activity_tx: broadcast::channel(1024).0,
             pending_child_counts: Arc::new(Mutex::new(BTreeMap::new())),
             child_receipts: Arc::new(Mutex::new(BTreeMap::new())),
             shared_execution_locks: Arc::new(Mutex::new(BTreeMap::new())),
@@ -887,6 +889,7 @@ impl SessionManager {
         };
         let (catalog_status_tx, catalog_status_rx) = watch::channel(catalog_status);
         let (mutation_tx, _) = broadcast::channel(1024);
+        let activity_tx = broadcast::channel(1024).0;
         Self {
             inner: Arc::new(Mutex::new(SessionManagerInner {
                 sessions: sessions
@@ -894,7 +897,8 @@ impl SessionManager {
                     .map(|(session_id, state)| {
                         (
                             session_id,
-                            SessionHandle::new(state, Some(executor.clone()), None),
+                            SessionHandle::new(state, Some(executor.clone()), None)
+                                .with_activity_notifications(activity_tx.clone()),
                         )
                     })
                     .collect(),
@@ -905,6 +909,7 @@ impl SessionManager {
             catalog_status_tx,
             catalog_status_rx,
             mutation_tx,
+            activity_tx,
             pending_child_counts: Arc::new(Mutex::new(BTreeMap::new())),
             child_receipts: Arc::new(Mutex::new(BTreeMap::new())),
             shared_execution_locks: Arc::new(Mutex::new(BTreeMap::new())),
@@ -1135,7 +1140,8 @@ impl SessionManager {
         let result = store.load_catalog_session(session_id).await;
         phase.finish_result(&result);
         let state = result?.ok_or(SessionError::NotFound(session_id))?;
-        let handle = SessionHandle::new(state, Some(store.clone()), None);
+        let handle = SessionHandle::new(state, Some(store.clone()), None)
+            .with_activity_notifications(self.activity_tx.clone());
         self.inner
             .lock()
             .await
@@ -1342,12 +1348,14 @@ impl SessionManager {
         // append does not reopen the file.
         inner.sessions.insert(
             session_id,
-            SessionHandle::new_with_db(state, Some(store.clone()), Some(lease), Some(db)),
+            SessionHandle::new_with_db(state, Some(store.clone()), Some(lease), Some(db))
+                .with_activity_notifications(self.activity_tx.clone()),
         );
         self.metrics.record_histogram(
             "session.manager.ensure_loaded.insert_handle_duration_ms",
             insert_timer.elapsed_ms(),
         );
+        let _ = self.activity_tx.send(session_id);
         record_ensure_loaded_duration(&self.metrics, "db_loaded", total_timer.elapsed_ms());
         Ok(())
     }
@@ -1383,6 +1391,7 @@ impl SessionManager {
         let _ = self.catalog_status_tx.send(CatalogLoadStatus::Loading);
         let registry = Arc::clone(&self.inner);
         let status = self.catalog_status_tx.clone();
+        let activity_tx = self.activity_tx.clone();
         tokio::spawn(async move {
             let sessions = match store.load_catalog().await {
                 Ok(sessions) => sessions,
@@ -1394,10 +1403,10 @@ impl SessionManager {
             };
             let mut inner = registry.lock().await;
             for (session_id, state) in sessions {
-                inner
-                    .sessions
-                    .entry(session_id)
-                    .or_insert_with(|| SessionHandle::new(state, Some(store.clone()), None));
+                inner.sessions.entry(session_id).or_insert_with(|| {
+                    SessionHandle::new(state, Some(store.clone()), None)
+                        .with_activity_notifications(activity_tx.clone())
+                });
             }
             drop(inner);
             let _ = status.send(CatalogLoadStatus::Loaded);
@@ -1450,6 +1459,7 @@ impl SessionManager {
                     Some(store.clone()),
                     None,
                 )
+                .with_activity_notifications(self.activity_tx.clone())
             });
         }
         Ok(summaries)
@@ -1687,7 +1697,8 @@ impl SessionManager {
             .as_ref()
             .map(|store| lease::acquire_session_lease(&store.root_path(), id, store.lease_owner()))
             .transpose()?;
-        let handle = SessionHandle::new(state, self.store.clone(), lease);
+        let handle = SessionHandle::new(state, self.store.clone(), lease)
+            .with_activity_notifications(self.activity_tx.clone());
         let event = handle
             .append_event(
                 SessionEventKind::SessionCreated {
@@ -2411,6 +2422,10 @@ impl SessionManager {
                     Err(error) => return Err(SessionStoreError::Io(error).into()),
                 }
             }
+        }
+        let _ = self.activity_tx.send(session_id);
+        if let Some(parent) = session.parent_id {
+            let _ = self.activity_tx.send(parent);
         }
         Ok(session)
     }

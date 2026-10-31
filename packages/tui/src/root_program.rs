@@ -33,6 +33,16 @@ pub enum BcodeRuntimeMessage {
     Terminal(Event),
     /// Ordered canonical/session-view stream update.
     SessionStream(Box<history_flow::SessionStreamUpdate>),
+    /// Full bounded activity replacement, fenced to a local scope generation.
+    ChildWatch {
+        generation: u64,
+        result: Result<bcode_session_models::SessionActivityWatchDelivery, String>,
+    },
+    /// Combined replacement from all admitted watch batches.
+    ChildWatchProjection {
+        generation: u64,
+        result: Result<bcode_session_models::SessionActivityWatchSnapshot, String>,
+    },
     /// Completed revision-bound plugin composer search.
     ComposerSearchCompleted(super::composer_interaction::ComposerCompletion),
     /// Completed artifact fetch for the active presentation generation.
@@ -88,6 +98,8 @@ impl BcodeRuntimeMessage {
             | Self::TerminalInputFailed(_)
             | Self::Terminal(_)
             | Self::SessionStream(_)
+            | Self::ChildWatch { .. }
+            | Self::ChildWatchProjection { .. }
             | Self::ArtifactFetchCompleted(_)
             | Self::ComposerSearchCompleted(_)
             | Self::PluginSurfaceInvalidated
@@ -258,8 +270,10 @@ pub struct BcodeRuntimeModel {
     pub(crate) resurrection: Option<super::resurrection::Publisher>,
     theme_input_signature: u64,
     theme_reload_at: Instant,
-    child_activity_at: Instant,
-    child_refresh_cursor: Option<bcode_session_models::SessionId>,
+    child_watch_scope: Option<bcode_session_models::SessionActivityWatchScope>,
+    child_watch_navigation: Option<bcode_session_models::SessionId>,
+    child_watch_generation: u64,
+    child_watch_picker_generation: Option<u64>,
     scheduled_deadlines: BTreeMap<bmux_tui_runtime::TimerId, Instant>,
     temporal_registry: TemporalRegistry,
     selection_clear_at: Option<Instant>,
@@ -281,7 +295,6 @@ enum RootTimer {
     InteractiveSurfaceRetry,
     TelemetryFlush,
     ThemeReload,
-    ChildActivity,
     SelectionClear(u64),
 }
 
@@ -299,7 +312,6 @@ impl RootTimer {
             Self::InteractiveSurfaceRetry => "bcode.interactive_surface_retry",
             Self::TelemetryFlush => "bcode.telemetry_flush",
             Self::ThemeReload => "bcode.theme_reload",
-            Self::ChildActivity => "bcode.child_activity",
             Self::SelectionClear(_) => unreachable!("selection timer handled above"),
         })
     }
@@ -855,8 +867,10 @@ impl BcodeRuntimeModel {
             resurrection: None,
             theme_input_signature,
             theme_reload_at,
-            child_activity_at: Instant::now() + Duration::from_secs(2),
-            child_refresh_cursor: None,
+            child_watch_scope: None,
+            child_watch_navigation: None,
+            child_watch_generation: 0,
+            child_watch_picker_generation: None,
             scheduled_deadlines: BTreeMap::new(),
             temporal_registry: TemporalRegistry::default(),
             pending_timeline_jump: None,
@@ -2814,6 +2828,9 @@ impl BcodeRuntimeModel {
         handle: &bmux_tui_runtime::RuntimeHandle<BcodeRuntimeMessage>,
     ) -> Vec<bmux_tui_runtime::Command<BcodeRuntimeMessage>> {
         let (mut commands, notes) = self.loop_state.take_pending_effects(&mut self.chat, handle);
+        if let Some(command) = self.collect_child_watch_work(handle) {
+            commands.push(command);
+        }
         if let Some(command) = self.focused_input_command.take() {
             commands.push(command);
         }
@@ -2932,7 +2949,6 @@ impl BcodeRuntimeModel {
                 self.loop_state.next_telemetry_flush_at(),
             ),
             (RootTimer::ThemeReload, Some(self.theme_reload_at)),
-            (RootTimer::ChildActivity, Some(self.child_activity_at)),
         ];
         for (timer, deadline) in deadlines {
             let id = timer.id();
@@ -2990,57 +3006,71 @@ impl BcodeRuntimeModel {
         bmux_tui::damage::Damage::Full
     }
 
-    fn refresh_child_monitor(&mut self, now: Instant) {
-        self.child_activity_at = now + Duration::from_secs(2);
-        if let Some(session_id) = self.chat.attached_session_id() {
-            self.chat
-                .start_effect(super::effects::TuiEffect::LoadChildActivity {
-                    session_id,
-                    after: None,
-                    generation: 0,
-                });
-            let pending = self.chat.app.monitor_pending_activity_sessions();
-            let expanded = if pending.is_empty() {
-                self.chat.app.monitor_discovery_frontier()
-            } else {
-                pending.clone()
-            };
-            let next = expanded
-                .iter()
-                .copied()
-                .find(|id| self.child_refresh_cursor.is_none_or(|last| *id > last));
-            // Advance the root window only after servicing the loaded frontier once.
-            if pending.is_empty() && (next.is_none() || self.child_refresh_cursor.is_none()) {
-                self.chat
-                    .start_effect(super::effects::TuiEffect::LoadSessionChildren {
-                        parent_id: session_id,
-                        after: self.chat.app.monitor_frontier_cursor(session_id),
-                        generation: 0,
-                    });
+    fn desired_child_watch_scope(&self) -> Option<bcode_session_models::SessionActivityWatchScope> {
+        use bcode_session_models::{
+            SessionActivityQuery, SessionActivityScope, SessionActivityTarget,
+            SessionActivityWatchScope,
+        };
+        let picker = self.loop_state.child_picker_watch_windows();
+        let mut scope = self
+            .chat
+            .attached_session_id()
+            .and_then(|_| self.chat.app.child_watch_scope())
+            .unwrap_or(SessionActivityWatchScope {
+                activity: Vec::new(),
+                children: Vec::new(),
+            });
+        // Keep every selected loaded window. Admission partitions the combined demand;
+        // a picker never silently evicts a monitor window.
+        for query in picker {
+            if !scope.children.contains(&query) {
+                scope.children.push(query.clone());
             }
-            if !expanded.is_empty() {
-                let child_id = if pending.is_empty() {
-                    next.unwrap_or(expanded[0])
-                } else {
-                    pending[0]
-                };
-                if pending.is_empty() {
-                    self.child_refresh_cursor = Some(child_id);
-                }
-                self.chat
-                    .start_effect(super::effects::TuiEffect::LoadSessionChildren {
-                        parent_id: child_id,
-                        after: self.chat.app.monitor_frontier_cursor(child_id),
-                        generation: 0,
-                    });
-                self.chat
-                    .start_effect(super::effects::TuiEffect::LoadChildActivity {
-                        session_id: child_id,
-                        after: None,
-                        generation: 0,
-                    });
+            let target = SessionActivityTarget {
+                session_id: query.parent_id,
+                query: SessionActivityQuery {
+                    scope: SessionActivityScope::DirectChildren,
+                    after: query.after,
+                    limit: query.limit,
+                },
+            };
+            if !scope.activity.contains(&target) {
+                scope.activity.push(target);
             }
         }
+        (!scope.children.is_empty()).then_some(scope)
+    }
+
+    fn collect_child_watch_work(
+        &mut self,
+        handle: &bmux_tui_runtime::RuntimeHandle<BcodeRuntimeMessage>,
+    ) -> Option<bmux_tui_runtime::Command<BcodeRuntimeMessage>> {
+        let scope = self.desired_child_watch_scope();
+        let navigation = scope
+            .as_ref()
+            .map(|_| self.chat.app.child_watch_navigation());
+        let picker_generation = self.loop_state.child_picker_watch_generation();
+        if scope == self.child_watch_scope
+            && navigation == self.child_watch_navigation
+            && picker_generation == self.child_watch_picker_generation
+        {
+            return None;
+        }
+        self.child_watch_scope.clone_from(&scope);
+        self.child_watch_picker_generation = picker_generation;
+        self.child_watch_navigation = navigation;
+        self.child_watch_generation = self.child_watch_generation.wrapping_add(1);
+        let generation = self.child_watch_generation;
+        let key = bmux_tui_runtime::CommandKey::new("bcode.child_activity_watch");
+        let Some(scope) = scope else {
+            return Some(bmux_tui_runtime::Command::cancel(key));
+        };
+        let client = self.loop_state.foreground_client();
+        let handle = handle.clone();
+        Some(bmux_tui_runtime::Command::replace(
+            key,
+            super::effects::run_activity_watches(client, scope, generation, handle),
+        ))
     }
 
     fn handle_timer(
@@ -3095,10 +3125,6 @@ impl BcodeRuntimeModel {
                     self.loop_state.record_runtime_stats(&handle.stats());
                 }
                 self.loop_state.flush_telemetry_if_due(now);
-                super::invalidation::UiInvalidation::None
-            }
-            "bcode.child_activity" => {
-                self.refresh_child_monitor(now);
                 super::invalidation::UiInvalidation::None
             }
             "bcode.theme_reload" => {
@@ -3907,6 +3933,18 @@ impl bmux_tui_runtime::Program for BcodeRuntimeModel {
         &mut self,
         event: bmux_tui_runtime::RuntimeEvent<Self::Message>,
     ) -> Result<bmux_tui_runtime::Update<Self::Message>, Self::Error> {
+        let event = match event {
+            bmux_tui_runtime::RuntimeEvent::Message(BcodeRuntimeMessage::ChildWatch {
+                generation,
+                result,
+            }) => {
+                bmux_tui_runtime::RuntimeEvent::Message(BcodeRuntimeMessage::ChildWatchProjection {
+                    generation,
+                    result: result.map(|delivery| delivery.snapshot),
+                })
+            }
+            event => event,
+        };
         self.chat
             .app
             .composer_submit
@@ -4180,6 +4218,42 @@ impl bmux_tui_runtime::Program for BcodeRuntimeModel {
             ) => {
                 if self.chat.app.advance_streaming_presentation(Instant::now()) {
                     super::invalidation::UiInvalidation::Paint
+                } else {
+                    super::invalidation::UiInvalidation::None
+                }
+            }
+            bmux_tui_runtime::RuntimeEvent::Message(BcodeRuntimeMessage::ChildWatch { .. }) => {
+                unreachable!("legacy delivery normalized before dispatch")
+            }
+            bmux_tui_runtime::RuntimeEvent::Message(
+                BcodeRuntimeMessage::ChildWatchProjection { generation, result },
+            ) => {
+                if generation != self.child_watch_generation
+                    || self.child_watch_picker_generation
+                        != self.loop_state.child_picker_watch_generation()
+                    || self.child_watch_navigation
+                        != self
+                            .desired_child_watch_scope()
+                            .as_ref()
+                            .map(|_| self.chat.app.child_watch_navigation())
+                    || self.child_watch_scope != self.desired_child_watch_scope()
+                {
+                    super::invalidation::UiInvalidation::None
+                } else if let Some(scope) = self.child_watch_scope.clone() {
+                    match result {
+                        Ok(snapshot) => {
+                            self.loop_state
+                                .apply_child_watch_to_picker(&scope, &snapshot);
+                            self.chat.app.apply_child_watch_snapshot(&scope, snapshot);
+                        }
+                        Err(error) => {
+                            self.loop_state.child_watch_failed(&error);
+                            if let Some(session_id) = self.chat.attached_session_id() {
+                                self.chat.app.monitor_observation_failed(session_id, &error);
+                            }
+                        }
+                    }
+                    super::invalidation::UiInvalidation::Structural
                 } else {
                     super::invalidation::UiInvalidation::None
                 }
@@ -4571,7 +4645,9 @@ impl bmux_tui_runtime::Program for BcodeRuntimeModel {
 /// Record one live root-runtime statistics snapshot into Bcode telemetry.
 pub fn record_runtime_stats(model: &mut BcodeRuntimeModel, stats: &bmux_tui_runtime::RuntimeStats) {
     model.loop_state.record_runtime_stats(stats);
-    model.loop_state.flush_telemetry_if_due(Instant::now());
+    if model.loop_state.next_telemetry_flush_at().is_some() {
+        model.loop_state.flush_telemetry_if_due(Instant::now());
+    }
 }
 
 /// Consume a successful root-runtime output after recording its final neutral statistics.
