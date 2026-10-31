@@ -1,4 +1,5 @@
 use super::*;
+
 use bcode_recap::model_configuration::ResumeModelConfiguration;
 
 fn model_options(path: std::path::PathBuf) -> BcodeOptions {

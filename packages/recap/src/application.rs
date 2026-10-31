@@ -973,10 +973,10 @@ fn safe_error(error: &Error) -> String {
             use crate::bcode_adapter::ModelFailure;
             let guidance = match failure {
                 ModelFailure::ProviderAuth => {
-                    "Check the selected provider authentication/profile; no account fallback was attempted"
+                    "Check the selected provider authentication/profile and configured auth pool; account failover is provider-managed"
                 }
                 ModelFailure::Configuration => {
-                    "Check model config, profile/context and saved Settings selection; no model fallback was attempted"
+                    "Check model config, profile/context, relative config references and saved Settings selection; initialization did not complete"
                 }
                 ModelFailure::Timeout => {
                     "Model operation exceeded its deadline; inspect before explicitly retrying"

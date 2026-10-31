@@ -56,11 +56,17 @@ fn retained_options(
         timeout,
     };
     if !resume_options.config_path.as_os_str().is_empty() {
-        resume_options.config_path = std::fs::canonicalize(&resume_options.config_path)
+        // Config-owned relative references resolve beside the supplied path, not
+        // beside a symlink target (e.g. a Home Manager file in /nix/store).
+        resume_options.config_path = std::path::absolute(&resume_options.config_path)
             .map_err(|_| ModelFailure::Configuration)?;
     }
     Ok(resume_options)
 }
+
+#[cfg(test)]
+#[path = "bcode_adapter/path_tests.rs"]
+mod path_tests;
 
 #[cfg(test)]
 #[path = "bcode_adapter/resume_tests.rs"]
