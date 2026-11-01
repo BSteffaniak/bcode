@@ -46,12 +46,39 @@ struct GoalCli {
     #[arg(long, requires = "judge_provider", value_enum)]
     judge_failure: Option<JudgeFailure>,
 
+    #[command(flatten)]
+    output: GoalOutput,
     /// Opt in to a living progress document and its planning phase.
     #[arg(long, conflicts_with = "no_progress_document")]
     progress_document: bool,
     /// Keep progress-document planning disabled (the default).
     #[arg(long)]
     no_progress_document: bool,
+}
+
+/// Definition preparation and machine-readable output are independent of goal
+/// execution policy and document planning.
+#[derive(Debug, clap::Args)]
+struct GoalOutput {
+    /// Prepare and register the exact goal definition without provider generation,
+    /// run admission or dispatch. Requires an authored stop condition and prohibits
+    /// progress-document writes.
+    #[arg(long, requires_all = ["json", "stop_condition"], conflicts_with = "progress_document")]
+    prepare: bool,
+    /// Emit the prepared typed workflow start request as JSON.
+    #[arg(long)]
+    json: bool,
+    /// Preselect the exact fresh run identity for a separately configured
+    /// diagnostic grant. Preparation does not admit this run or grant capture.
+    #[arg(long, requires = "prepare", value_parser = parse_prepared_run_id)]
+    run_id: Option<String>,
+}
+
+fn parse_prepared_run_id(value: &str) -> Result<String, String> {
+    if value.is_empty() || value.len() > 256 || value.chars().any(char::is_control) {
+        return Err("Prepared run identity must be nonempty, at most 256 bytes, and contain no control characters".into());
+    }
+    Ok(value.to_owned())
 }
 
 #[derive(Debug, Clone, Copy, clap::ValueEnum)]
@@ -123,6 +150,15 @@ async fn check_delegation(client: &BcodeClient) -> Result<(), String> {
 }
 
 fn validate_args(args: &GoalCli) -> Result<(), String> {
+    if args.output.prepare && (!args.output.json || args.progress_document) {
+        return Err("Goal preparation requires --json and forbids progress-document writes".into());
+    }
+    if args.output.run_id.is_some() && !args.output.prepare {
+        return Err("A preselected run identity requires --prepare".into());
+    }
+    if args.output.prepare && args.stop_condition.is_none() {
+        return Err("Goal preparation requires an authored --stop-condition; provider generation is not preparation".into());
+    }
     LoopWorkflowInput::new(
         args.objective.clone(),
         "validation".into(),
@@ -140,15 +176,42 @@ fn validate_args(args: &GoalCli) -> Result<(), String> {
 async fn run(args: GoalCli) -> Result<(), String> {
     validate_args(&args)?;
     let client = BcodeClient::default_endpoint();
+    let mut request = build_goal_request(&client, &args).await?;
+    if let Some(run_id) = &args.output.run_id {
+        request.run_id = Some(parse_prepared_run_id(run_id)?);
+    }
+    if args.output.prepare {
+        let prepared = prepare(&client, request).await?;
+        println!(
+            "{}",
+            serde_json::to_string(&prepared).map_err(|error| error.to_string())?
+        );
+        return Ok(());
+    }
+    let started = admit(&client, request).await?;
+    println!(
+        "{}",
+        serde_json::json!({"session_id": args.session, "run_id": started.run.run_id, "runtime_work_id": started.runtime_work_id, "status": "admitted (not completed)"})
+    );
+    Ok(())
+}
+
+/// Build the exact goal definition and input with ordinary preflight checks and
+/// explicitly requested document setup. The caller validates preparation before
+/// entering here, preventing generation and document mutation in that mode.
+async fn build_goal_request(
+    client: &BcodeClient,
+    args: &GoalCli,
+) -> Result<bcode_plugin_sdk::tui::PluginWorkflowStartRequest, String> {
     let judgement = args.judgement()?;
-    check_judgement(&client, judgement.as_ref()).await?;
+    check_judgement(client, judgement.as_ref()).await?;
     let collaboration = args.swarm.mode().collaboration();
     let guidance = super::swarm::guidance(&args.guidance, &args.swarm.swarm_instructions);
     if guidance.len() > MAX_PROMPT_BYTES {
         return Err("combined guidance is too large".into());
     }
     if collaboration == crate::CollaborationMode::Requested {
-        check_delegation(&client).await?;
+        check_delegation(client).await?;
     }
     let progress = args.progress_document;
     let (mut input, source) = if let Some(condition) = &args.stop_condition {
@@ -208,12 +271,12 @@ async fn run(args: GoalCli) -> Result<(), String> {
         request.limits.concurrency_cap = Some(concurrency.get());
     }
     if collaboration == crate::CollaborationMode::Requested {
-        check_delegation(&client).await?;
+        check_delegation(client).await?;
     }
-    check_judgement(&client, input.judgement_evaluation.as_ref()).await?;
+    check_judgement(client, input.judgement_evaluation.as_ref()).await?;
     if progress {
         let setup = goal::ProgressDocumentSetup::headless(
-            args.objective,
+            args.objective.clone(),
             guidance,
             source.ok_or("Missing generation source")?,
         );
@@ -227,12 +290,7 @@ async fn run(args: GoalCli) -> Result<(), String> {
         let document = document.ok_or("Progress document preparation returned no document")?;
         goal::attach_document(&mut request, &document)?;
     }
-    let started = admit(&client, request).await?;
-    println!(
-        "{}",
-        serde_json::json!({"session_id": args.session, "run_id": started.run.run_id, "runtime_work_id": started.runtime_work_id, "status": "admitted (not completed)"})
-    );
-    Ok(())
+    Ok(request)
 }
 
 async fn check_judgement(
@@ -262,45 +320,314 @@ async fn admit(
     client: &BcodeClient,
     request: bcode_plugin_sdk::tui::PluginWorkflowStartRequest,
 ) -> Result<bcode_workflow::WorkflowRunStartResponse, String> {
-    let limits = &request.limits;
     client
-        .start_workflow(bcode_workflow::WorkflowStartRequest {
-            identity: request.identity,
-            definition: request.definition,
-            run_id: request.run_id,
-            workspace_snapshot: None,
-            parent_session_id: request.parent_session_id,
-            input: request.input,
-            binding: bcode_workflow_store::WorkflowRunBinding {
-                owner_plugin_id: request.binding.owner_plugin_id,
-                workflow_kind: request.binding.workflow_kind,
-                scope_key: request.binding.scope_key,
-                display_label: request.binding.display_label,
-                single_active: request.binding.single_active,
-            },
-            limits: bcode_workflow_store::WorkflowRunLimits {
-                deadline_at_ms: limits.maximum_duration_ms.map(|duration| {
-                    std::time::SystemTime::now()
-                        .duration_since(std::time::UNIX_EPOCH)
-                        .map(|now| u64::try_from(now.as_millis()).unwrap_or(u64::MAX))
-                        .unwrap_or_default()
-                        .saturating_add(duration)
-                }),
-                node_execution_cap: limits.node_execution_cap,
-                concurrency_cap: limits.concurrency_cap,
-                cycle_cap: limits.cycle_cap,
-                retry_cap: limits.retry_cap,
-                recursion_depth_cap: limits.recursion_depth_cap,
-                descendant_cap: limits.descendant_cap,
-            },
-        })
+        .start_workflow(start_request(request))
         .await
         .map_err(|error| error.to_string())
+}
+
+/// Exact conversion shared by normal admission and preparation. Empty workspace
+/// means the server derives the canonical parent-session workspace at admission,
+/// identically to normal goal start; the caller must not guess from process cwd.
+fn start_request(
+    request: bcode_plugin_sdk::tui::PluginWorkflowStartRequest,
+) -> bcode_workflow::WorkflowStartRequest {
+    let limits = &request.limits;
+    bcode_workflow::WorkflowStartRequest {
+        identity: request.identity,
+        definition: request.definition,
+        run_id: request.run_id,
+        workspace_snapshot: None,
+        parent_session_id: request.parent_session_id,
+        input: request.input,
+        binding: bcode_workflow_store::WorkflowRunBinding {
+            owner_plugin_id: request.binding.owner_plugin_id,
+            workflow_kind: request.binding.workflow_kind,
+            scope_key: request.binding.scope_key,
+            display_label: request.binding.display_label,
+            single_active: request.binding.single_active,
+        },
+        limits: bcode_workflow_store::WorkflowRunLimits {
+            deadline_at_ms: limits.maximum_duration_ms.map(|duration| {
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|now| u64::try_from(now.as_millis()).unwrap_or(u64::MAX))
+                    .unwrap_or_default()
+                    .saturating_add(duration)
+            }),
+            node_execution_cap: limits.node_execution_cap,
+            concurrency_cap: limits.concurrency_cap,
+            cycle_cap: limits.cycle_cap,
+            retry_cap: limits.retry_cap,
+            recursion_depth_cap: limits.recursion_depth_cap,
+            descendant_cap: limits.descendant_cap,
+        },
+    }
+}
+
+/// Preparation persists only an exact validated compiled definition through the
+/// existing idempotent registration API. It creates no workflow run, session work,
+/// dispatch, document, diagnostic grant or execution authority. Ordinary start
+/// authorization and session/workspace checks still run when this request is used.
+async fn prepare(
+    client: &BcodeClient,
+    request: bcode_plugin_sdk::tui::PluginWorkflowStartRequest,
+) -> Result<bcode_workflow::WorkflowRunStartRequest, String> {
+    prepare_registered(request, |registration| async {
+        client
+            .register_workflow_definition(registration)
+            .await
+            .map(|_| ())
+            .map_err(|error| error.to_string())
+    })
+    .await
+}
+
+/// The preparation executor has only definition-registration capability: no
+/// admission, document, tool or diagnostic-authority operation is accepted here.
+async fn prepare_registered<F, Fut>(
+    request: bcode_plugin_sdk::tui::PluginWorkflowStartRequest,
+    register: F,
+) -> Result<bcode_workflow::WorkflowRunStartRequest, String>
+where
+    F: FnOnce(bcode_workflow::WorkflowDefinitionRegistrationRequest) -> Fut,
+    Fut: std::future::Future<Output = Result<(), String>>,
+{
+    let request = start_request(request);
+    let prepared = prepared_run(&request)?;
+    register(bcode_workflow::WorkflowDefinitionRegistrationRequest {
+        definition_id: request.identity.definition_id,
+        version: request.identity.definition_version,
+        definition: request.definition,
+    })
+    .await?;
+    Ok(prepared)
+}
+
+fn prepared_run(
+    request: &bcode_workflow::WorkflowStartRequest,
+) -> Result<bcode_workflow::WorkflowRunStartRequest, String> {
+    if request.run_id.as_ref().is_none_or(String::is_empty) {
+        return Err("Goal preparation requires a stable run identity".into());
+    }
+    Ok(bcode_workflow::WorkflowRunStartRequest {
+        definition_id: request.identity.definition_id.clone(),
+        definition_version: request.identity.definition_version,
+        run_id: request.run_id.clone(),
+        workspace_snapshot: request.workspace_snapshot.clone().unwrap_or_default(),
+        parent_session_id: request.parent_session_id,
+        parent_session_generation: None,
+        binding: Some(request.binding.clone()),
+        input: Some(request.input.clone()),
+        limits: request.limits.clone(),
+    })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn prepare_executes_only_exact_definition_registration_and_returns_unadmitted_run() {
+        let input = LoopWorkflowInput::new("Implement".into(), "Verify".into(), 2).unwrap();
+        let request = build_start_request(
+            &input,
+            SessionId::new(),
+            SetupKind::Goal,
+            crate::CollaborationMode::Disabled,
+            false,
+            None,
+        )
+        .unwrap();
+        let expected_run = request.run_id.clone();
+        let expected_definition = request.definition.clone();
+        let expected_identity = request.identity.clone();
+        let expected_input = request.input.clone();
+        let registrations = std::cell::Cell::new(0);
+        let prepared = prepare_registered(request, |registration| {
+            registrations.set(registrations.get() + 1);
+            assert_eq!(registration.definition, expected_definition);
+            assert_eq!(registration.definition_id, expected_identity.definition_id);
+            assert_eq!(registration.version, expected_identity.definition_version);
+            std::future::ready(Ok(()))
+        })
+        .await
+        .unwrap();
+        assert_eq!(registrations.get(), 1);
+        assert_eq!(prepared.run_id, expected_run);
+        assert_eq!(prepared.definition_id, expected_identity.definition_id);
+        assert_eq!(prepared.input, Some(expected_input));
+    }
+
+    #[tokio::test]
+    async fn prepare_rejects_missing_identity_before_registration_and_propagates_denial() {
+        let input = LoopWorkflowInput::new("Implement".into(), "Verify".into(), 2).unwrap();
+        let mut request = build_start_request(
+            &input,
+            SessionId::new(),
+            SetupKind::Goal,
+            crate::CollaborationMode::Disabled,
+            false,
+            None,
+        )
+        .unwrap();
+        request.run_id = None;
+        let called = std::cell::Cell::new(false);
+        let result = prepare_registered(request, |_| {
+            called.set(true);
+            std::future::ready(Ok(()))
+        })
+        .await;
+        assert!(result.is_err());
+        assert!(!called.get());
+        let request = build_start_request(
+            &input,
+            SessionId::new(),
+            SetupKind::Goal,
+            crate::CollaborationMode::Disabled,
+            false,
+            None,
+        )
+        .unwrap();
+        assert_eq!(
+            prepare_registered(request, |_| std::future::ready(Err(
+                "registration denied".into()
+            )))
+            .await
+            .unwrap_err(),
+            "registration denied"
+        );
+    }
+
+    #[test]
+    fn prepare_requires_json_and_rejects_document_mutation_before_execution() {
+        let id = SessionId::new().to_string();
+        let base = [
+            "goal",
+            "--session",
+            &id,
+            "--objective",
+            "Implement",
+            "--worker-attempts",
+            "1",
+        ];
+        assert!(GoalCli::try_parse_from(base.into_iter().chain(["--prepare"])).is_err());
+        assert!(GoalCli::try_parse_from(base.into_iter().chain(["--prepare", "--json"])).is_err());
+        assert!(
+            GoalCli::try_parse_from(base.into_iter().chain([
+                "--prepare",
+                "--json",
+                "--progress-document",
+            ]))
+            .is_err()
+        );
+        let args = GoalCli::try_parse_from(base.into_iter().chain([
+            "--prepare",
+            "--json",
+            "--stop-condition",
+            "Tests pass",
+        ]))
+        .unwrap();
+        assert!(validate_args(&args).is_ok());
+        assert!(args.output.prepare);
+        let mut missing_condition = args;
+        missing_condition.stop_condition = None;
+        assert!(validate_args(&missing_condition).is_err());
+        let normal = GoalCli::try_parse_from(base).unwrap();
+        assert!(!normal.output.prepare);
+        assert!(!normal.output.json);
+    }
+
+    #[test]
+    fn preselected_preparation_identity_is_explicit_and_bounded() {
+        let session = SessionId::new().to_string();
+        let base = ["goal", "--session", &session, "--objective", "Implement"];
+        assert!(
+            GoalCli::try_parse_from(base.into_iter().chain(["--run-id", "exact-root",])).is_err()
+        );
+        let prepared = GoalCli::try_parse_from(base.into_iter().chain([
+            "--prepare",
+            "--json",
+            "--stop-condition",
+            "Verify",
+            "--run-id",
+            "exact-root",
+        ]))
+        .unwrap();
+        assert_eq!(prepared.output.run_id.as_deref(), Some("exact-root"));
+        assert!(validate_args(&prepared).is_ok());
+        assert!(parse_prepared_run_id("").is_err());
+        assert!(parse_prepared_run_id("run\nforeign").is_err());
+        assert!(parse_prepared_run_id(&"x".repeat(257)).is_err());
+        assert!(parse_prepared_run_id(&"x".repeat(256)).is_ok());
+    }
+
+    #[test]
+    fn flattened_output_options_preserve_normal_goal_and_preparation_modes() {
+        let session = SessionId::new().to_string();
+        let base = ["goal", "--session", &session, "--objective", "Implement"];
+        let normal =
+            GoalCli::try_parse_from(base.into_iter().chain(["--json", "--no-progress-document"]))
+                .unwrap();
+        assert!(normal.output.json);
+        assert!(!normal.output.prepare);
+        assert!(normal.no_progress_document);
+        assert!(!normal.progress_document);
+        assert!(validate_args(&normal).is_ok());
+        let prepared = GoalCli::try_parse_from(base.into_iter().chain([
+            "--prepare",
+            "--json",
+            "--stop-condition",
+            "Verify",
+        ]))
+        .unwrap();
+        assert!(prepared.output.prepare && prepared.output.json);
+        assert!(validate_args(&prepared).is_ok());
+        assert!(
+            GoalCli::try_parse_from(base.into_iter().chain([
+                "--prepare",
+                "--json",
+                "--stop-condition",
+                "Verify",
+                "--progress-document",
+            ]))
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn prepared_run_preserves_exact_normal_goal_input_binding_identity_and_limits() {
+        let input =
+            LoopWorkflowInput::new("Implement exactly".into(), "Verify exactly".into(), 3).unwrap();
+        let request = build_start_request(
+            &input,
+            SessionId::new(),
+            SetupKind::Goal,
+            crate::CollaborationMode::Disabled,
+            false,
+            None,
+        )
+        .unwrap();
+        let normal = start_request(request);
+        let prepared = prepared_run(&normal).unwrap();
+        assert_eq!(prepared.definition_id, normal.identity.definition_id);
+        assert_eq!(
+            prepared.definition_version,
+            normal.identity.definition_version
+        );
+        assert_eq!(prepared.parent_session_id, normal.parent_session_id);
+        assert_eq!(prepared.run_id, normal.run_id);
+        assert_eq!(prepared.input, Some(normal.input.clone()));
+        assert_eq!(prepared.binding, Some(normal.binding.clone()));
+        assert_eq!(prepared.limits, normal.limits);
+        assert!(prepared.workspace_snapshot.is_empty()); // same canonical-session derivation
+        let roundtrip: bcode_workflow::WorkflowRunStartRequest =
+            serde_json::from_str(&serde_json::to_string(&prepared).unwrap()).unwrap();
+        assert_eq!(roundtrip, prepared);
+        let mut missing_identity = normal;
+        missing_identity.run_id = None;
+        assert!(prepared_run(&missing_identity).is_err());
+    }
 
     #[test]
     fn judgement_arguments_are_explicit_and_compile_into_the_goal() {

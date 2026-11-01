@@ -2837,9 +2837,29 @@ pub enum WorkflowApplicationOperation {
     StartActiveRevision,
     StartPreset,
     PublishAndStart,
+    /// Admit explicitly scoped live diagnostics, never execution itself.
+    ObserveExecution,
+    /// Read retained live diagnostics under renewed authorization.
+    ReadExecutionObservation,
+    /// Cut off diagnostics while retaining bytes for export.
+    FinalizeExecutionObservation,
+    /// Export separately authorized sensitive diagnostic bytes.
+    ExportExecutionObservation,
 }
 
 impl WorkflowApplicationOperation {
+    /// Whether independent explicit diagnostic scope approval is required.
+    #[must_use]
+    pub const fn is_execution_observation(self) -> bool {
+        matches!(
+            self,
+            Self::ObserveExecution
+                | Self::ReadExecutionObservation
+                | Self::FinalizeExecutionObservation
+                | Self::ExportExecutionObservation
+        )
+    }
+
     const fn requires_draft(self) -> bool {
         matches!(
             self,
@@ -2892,6 +2912,22 @@ impl WorkflowApplicationOperation {
 /// Facts are normalized by the application boundary and do not contain renderer, transport,
 /// persistence, provider-private, or tool-call types. Producer provenance remains diagnostic and
 /// cannot replace the authenticated actor.
+/// Canonical diagnostic authorization facts, independent of session access/discovery.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WorkflowExecutionObservationFacts {
+    /// Exact root run of the diagnostic grant.
+    pub root_run_id: String,
+    /// Explicit recursive descendant opt-in.
+    pub recursive: bool,
+    /// Separate sensitive capture/export decision.
+    pub deep_capture: bool,
+    /// Verified owning state location selected by the authenticated connection.
+    pub state_location_id: String,
+    /// Verified namespace selected by the authenticated connection.
+    pub namespace: String,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct WorkflowApplicationOperationFacts {
@@ -2899,6 +2935,9 @@ pub struct WorkflowApplicationOperationFacts {
     pub version: u32,
     /// Exact requested operation.
     pub operation: WorkflowApplicationOperation,
+    /// Exact independent diagnostic scope, present only for diagnostic operations.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub execution_observation: Option<WorkflowExecutionObservationFacts>,
     /// Authenticated actor assigned by the application boundary.
     pub actor: WorkflowApplicationActor,
     /// Exact registration target; absent for authored-workflow operations.
@@ -2931,6 +2970,43 @@ pub struct WorkflowApplicationOperationFacts {
 }
 
 impl WorkflowApplicationOperationFacts {
+    fn validate_execution_observation(&self) -> Result<(), WorkflowError> {
+        let scope = self.execution_observation.as_ref().ok_or_else(|| {
+            authoring_error(
+                "application_operation.execution_observation",
+                "explicit diagnostic scope is required",
+            )
+        })?;
+        for (field, value) in [
+            ("root_run_id", scope.root_run_id.as_str()),
+            ("state_location_id", scope.state_location_id.as_str()),
+            ("namespace", scope.namespace.as_str()),
+        ] {
+            if value.is_empty() || value.len() > 256 || value.chars().any(char::is_control) {
+                return Err(authoring_error(field, "invalid diagnostic scope identity"));
+            }
+        }
+        if self.definition_registration.is_some()
+            || !self.workflow_id.is_empty()
+            || self.draft_id.is_some()
+            || self.revision.is_some()
+            || self.preset_id.is_some()
+            || self.producer.is_some()
+            || self.activates
+            || self.executes
+            || self.requirements != WorkflowRequirementSummary::default()
+            || self.effects != WorkflowEffectSummary::default()
+            || (self.operation == WorkflowApplicationOperation::ExportExecutionObservation
+                && !scope.deep_capture)
+        {
+            return Err(authoring_error(
+                "application_operation.execution_observation",
+                "diagnostics cannot activate, execute or use unrelated authored targets/effects",
+            ));
+        }
+        Ok(())
+    }
+
     /// Validate canonical authored-workflow application-operation facts.
     ///
     /// # Errors
@@ -2949,6 +3025,15 @@ impl WorkflowApplicationOperationFacts {
             ));
         }
         self.actor.validate()?;
+        if self.operation.is_execution_observation() {
+            return self.validate_execution_observation();
+        }
+        if self.execution_observation.is_some() {
+            return Err(authoring_error(
+                "application_operation.execution_observation",
+                "unrelated diagnostic scope",
+            ));
+        }
         if self.operation == WorkflowApplicationOperation::RegisterDefinition {
             let registration = self.definition_registration.as_ref().ok_or_else(|| {
                 authoring_error(
@@ -4804,6 +4889,25 @@ pub struct WorkflowRunGraphPublicationFacts {
     pub actor: WorkflowApplicationActor,
     /// Exact edit whose execution effects are being authorized.
     pub request: WorkflowRunGraphEditBatch,
+}
+
+/// Plugin service compatibility boundary for exact execution diagnostic policy.
+pub const WORKFLOW_EXECUTION_OBSERVATION_POLICY_INTERFACE_ID: &str =
+    "bcode.workflow-execution-observation-policy/v1";
+/// Evaluate normalized application facts under explicitly configured diagnostic grants.
+pub const OP_AUTHORIZE_EXECUTION_OBSERVATION: &str = "authorize";
+
+/// Plugin-owned diagnostic decision; never authorizes execution or mutation.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "decision", rename_all = "snake_case", deny_unknown_fields)]
+pub enum WorkflowExecutionObservationPolicyDecision {
+    /// Permit only the exact diagnostic operation until the configured absolute expiry.
+    Allow {
+        /// Exclusive Unix-millisecond authorization cutoff; missing expiry is invalid.
+        expires_at_unix_ms: u64,
+    },
+    /// Deny diagnostics without affecting observed execution.
+    Deny,
 }
 
 /// Plugin service compatibility boundary for run publication policy.
@@ -22268,6 +22372,7 @@ steps:
         let facts = WorkflowApplicationOperationFacts {
             version: WORKFLOW_APPLICATION_OPERATION_FACTS_VERSION,
             operation: WorkflowApplicationOperation::PublishDraft,
+            execution_observation: None,
             actor: WorkflowApplicationActor {
                 kind: WorkflowApplicationActorKind::LocalClient,
                 actor_id: "local-client/1".to_string(),

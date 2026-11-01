@@ -1645,9 +1645,46 @@ pub enum WorkflowApplicationAuthorizationDecision {
     Deny { reason: String },
 }
 
+/// Evaluate an exact host-approved diagnostic operation scope.
+///
+/// Grants are normalized canonical facts, never discovered runs, session access or
+/// provider provenance. The host owns grant lifetime and must revoke active captures
+/// on withdrawal.
+#[must_use]
+pub fn authorize_execution_observation_grants(
+    facts: &bcode_workflow::WorkflowApplicationOperationFacts,
+    approved: &[(
+        bcode_workflow::WorkflowApplicationActor,
+        bcode_workflow::WorkflowApplicationOperation,
+        bcode_workflow::WorkflowExecutionObservationFacts,
+    )],
+) -> WorkflowApplicationAuthorizationDecision {
+    if facts.validate().is_ok()
+        && facts.operation.is_execution_observation()
+        && facts.execution_observation.as_ref().is_some_and(|scope| {
+            approved.iter().any(|(actor, operation, grant)| {
+                actor == &facts.actor && *operation == facts.operation && grant == scope
+            })
+        })
+    {
+        WorkflowApplicationAuthorizationDecision::Allow
+    } else {
+        WorkflowApplicationAuthorizationDecision::Deny {
+            reason: "no explicit matching execution diagnostic grant".to_owned(),
+        }
+    }
+}
+
 pub fn authorize_local_workflow_application_operation(
     facts: &bcode_workflow::WorkflowApplicationOperationFacts,
 ) -> WorkflowApplicationAuthorizationDecision {
+    if facts.validate().is_err() || facts.operation.is_execution_observation() {
+        return WorkflowApplicationAuthorizationDecision::Deny {
+            reason:
+                "execution diagnostics require an explicit run, recursive and sensitive scope grant"
+                    .to_owned(),
+        };
+    }
     match facts.actor.kind {
         bcode_workflow::WorkflowApplicationActorKind::LocalClient => {
             WorkflowApplicationAuthorizationDecision::Allow
@@ -11102,6 +11139,7 @@ pub async fn register_definition(
         &bcode_workflow::WorkflowApplicationOperationFacts {
             version: bcode_workflow::WORKFLOW_APPLICATION_OPERATION_FACTS_VERSION,
             operation: bcode_workflow::WorkflowApplicationOperation::RegisterDefinition,
+            execution_observation: None,
             actor: bcode_workflow::WorkflowApplicationActor {
                 kind: bcode_workflow::WorkflowApplicationActorKind::LocalClient,
                 actor_id: client_id.to_string(),

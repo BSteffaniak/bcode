@@ -15,6 +15,20 @@ use bcode_client::xray::XrayClient;
 use bcode_xray_models::{XRAY_SCHEMA_VERSION, XrayFinalization, XrayObserveRequest};
 use serde::Serialize;
 
+mod budget;
+mod execution_consumer;
+mod segmented;
+mod workflow_watch;
+pub use execution_consumer::ExecutionCapture;
+pub use workflow_watch::WorkflowWatch;
+mod controller_consumer;
+mod session_capture;
+pub use segmented::{
+    CaptureLimits, EvalXrayAggregate, EvalXrayAggregation, EvalXraySegment,
+    EvalXraySessionEvidence, ExecutionReadinessReceipt,
+};
+pub use session_capture::SessionCapture;
+
 thread_local! {
     static CONFIG: RefCell<Option<EvalXrayCapture>> = const { RefCell::new(None) };
 }
@@ -75,6 +89,9 @@ pub struct EvalXrayEvidence {
     pub status: &'static str,
     /// Number of retained envelopes (including control events).
     pub envelopes: u64,
+    /// Whether observation-owned retained payloads were explicitly released.
+    /// False is not a claim of server retention expiry or successful revocation.
+    pub observation_released: bool,
     /// Engine cutoff is evidence only, not a task-completion receipt.
     pub finalization: Option<XrayFinalization>,
 }
@@ -92,6 +109,7 @@ impl EvalXrayEvidence {
             workflow_children_complete: false,
             status: "attach_unavailable",
             envelopes: 0,
+            observation_released: false,
             finalization: None,
         }
     }
@@ -151,6 +169,12 @@ impl Capture {
                 return evidence;
             };
             runtime.block_on(async {
+                if config.client.is_none() {
+                    return controller_consumer::consume(
+                        &application, &session, &path, config.deep_capture,
+                        &worker_stop, &ready_tx,
+                    ).await;
+                }
                 let mut endpoint_lease = None;
                 let client = if let Some(client) = config.client {
                     client
@@ -174,7 +198,8 @@ impl Capture {
                     endpoint_lease = Some(endpoint);
                     client
                 };
-                let outcome = async {
+                let mut observation_id = None;
+                let mut outcome = async {
                 let attached = tokio::time::timeout(Duration::from_secs(20), client.observe(XrayObserveRequest {
                     schema_version: XRAY_SCHEMA_VERSION, session_id: session,
                     deep_capture: config.deep_capture,
@@ -183,13 +208,14 @@ impl Capture {
                     let _ = ready_tx.send(());
                     return evidence;
                 };
+                observation_id = Some(stream.observation_id().to_owned());
                 let Ok(mut sink) = JsonlBundleRecorder::create(&path, stream.observation_id(), &evidence.session_id, RecordingOptions::default()) else {
                     evidence.status = "recording_unavailable";
                     let _ = ready_tx.send(());
                     return evidence;
                 };
-                let first = stream.recv().await;
-                if !matches!(first, Ok(Some(ref envelope)) if sink.append(envelope).is_ok()) {
+                let first = tokio::time::timeout(Duration::from_secs(5), stream.recv()).await;
+                if !matches!(first, Ok(Ok(Some(ref envelope))) if sink.append(envelope).is_ok()) {
                     evidence.status = "recording_unavailable";
                     let _ = ready_tx.send(());
                     return evidence;
@@ -236,17 +262,33 @@ impl Capture {
                 let manifest = finalization.as_ref().filter(|_| drained && payloads_ok && !semantic_omission)
                     .and_then(|boundary| sink.finalize(boundary).ok());
                 if manifest.is_none() { let _ = sink.interrupt(); }
-                if stream.finalization().is_some() {
-                    let _ = client.release(stream.observation_id()).await;
-                }
                 evidence.settle(finalization, manifest.is_some());
                 evidence.payloads_complete = payloads_ok && !semantic_omission
                     && manifest.is_some_and(|manifest| manifest.evidence_complete);
                 evidence.evidence_complete = evidence.delivery_complete
                     && evidence.payloads_complete && evidence.continuity_complete;
-                if !evidence.evidence_complete { evidence.status = "evidence_incomplete"; }
+                if !evidence.evidence_complete {
+                    evidence.status = if !payloads_ok {
+                        "payload_export_incomplete"
+                    } else if semantic_omission {
+                        "semantic_capture_omitted"
+                    } else {
+                        "evidence_incomplete"
+                    };
+                }
                 evidence
                 }.await;
+                if let Some(observation_id) = observation_id {
+                    // Release requires accepted cutoff even on failed recording,
+                    // payload export or drain paths. Neither operation stops work.
+                    if outcome.finalization.is_none() {
+                        let _ = tokio::time::timeout(Duration::from_secs(5), client.finalize(&observation_id)).await;
+                    }
+                    outcome.observation_released = matches!(
+                        tokio::time::timeout(Duration::from_secs(5), client.release(&observation_id)).await,
+                        Ok(Ok(()))
+                    );
+                }
                 if let Some(endpoint) = endpoint_lease {
                     let _ = tokio::time::timeout(Duration::from_secs(5), endpoint.close()).await;
                 }
@@ -300,7 +342,7 @@ impl Capture {
         evidence.continuity_complete = false;
         evidence.evidence_complete = false;
         evidence.status = "daemon_restart_gap";
-        std::fs::write(&self.receipt, serde_json::to_vec_pretty(&evidence).ok()?).ok()?;
+        self.write_receipt(&mut evidence);
         Some(evidence)
     }
 
@@ -310,10 +352,19 @@ impl Capture {
 
     fn finish_inner(&mut self) -> Option<EvalXrayEvidence> {
         self.stop.store(true, Ordering::Release);
-        let evidence = self.worker.take()?.join().ok()?;
-        let bytes = serde_json::to_vec_pretty(&evidence).ok()?;
-        std::fs::write(&self.receipt, bytes).ok()?;
+        let mut evidence = self.worker.take()?.join().ok()?;
+        self.write_receipt(&mut evidence);
         Some(evidence)
+    }
+
+    fn write_receipt(&self, evidence: &mut EvalXrayEvidence) {
+        let written = serde_json::to_vec_pretty(evidence)
+            .is_ok_and(|bytes| std::fs::write(&self.receipt, bytes).is_ok());
+        if !written {
+            evidence.delivery_complete = false;
+            evidence.evidence_complete = false;
+            evidence.status = "evidence_receipt_write_failed";
+        }
     }
 }
 
@@ -457,6 +508,7 @@ mod tests {
                 correlation: correlation.clone(),
                 data: serde_json::json!({}),
                 sensitive: false,
+                capture: None,
             },
         };
         sink.append(&ready).unwrap();
@@ -468,7 +520,7 @@ mod tests {
         assert_eq!(envelope.event.correlation, correlation);
     }
 
-    fn capture_fixture(workflow: bool, restart_gap: bool) -> EvalXrayEvidence {
+    pub(super) fn capture_fixture(workflow: bool, restart_gap: bool) -> EvalXrayEvidence {
         use bcode_xray_models::{XrayCapabilities, XrayCorrelation, XrayEnvelope, XrayEvent};
         use std::io::{Read as _, Write as _};
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
@@ -491,6 +543,7 @@ mod tests {
                     name: name.into(),
                     data,
                     sensitive: false,
+                    capture: None,
                     correlation: XrayCorrelation {
                         session_id: "session".into(),
                         ..Default::default()

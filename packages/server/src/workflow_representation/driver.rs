@@ -317,6 +317,20 @@ async fn dispatch_and_record_inner(
 ) -> Result<(), ServerError> {
     // Admission time denotes the handoff, not the later receipt persistence time.
     // Synchronous plugin owners may already return a terminal result from dispatch.
+    // Existing-child recovery bypasses session creation. Reattach retained capture
+    // before entering the owner, using only a verified canonical execution link.
+    if state.xray_execution_watches.active()
+        && let Ok(Some(link)) = super::owner::execution_session_link(
+            state,
+            &dispatch.activation.run_id,
+            &dispatch.activation.node_id,
+            &dispatch.activation.activation_id,
+            dispatch.attempt,
+        )
+        .await
+    {
+        super::owner::observe_execution_session(state, authority, &link, true).await;
+    }
     let admitted_at_ms = crate::current_unix_millis();
     let boundary = crate::xray_workflow::Boundary::new(
         bcode_xray::CaptureContext::current(),
@@ -538,7 +552,7 @@ fn drive_page<'a>(
                 None,
             );
             if let Some(context) = context.as_ref().filter(|context| context.capture_active()) {
-                context.emit(
+                context.emit_with_capture(
                     "workflow",
                     "node.admission",
                     serde_json::json!({
@@ -546,6 +560,7 @@ fn drive_page<'a>(
                         "revision": revision,
                     }),
                     false,
+                    Some(bcode_xray::XrayCaptureAttachments::new(Vec::new())),
                 );
             }
             let boundary = crate::xray_workflow::Boundary::new(context.clone(), "activation.drive");

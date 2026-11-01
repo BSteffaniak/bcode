@@ -66,6 +66,10 @@ mod session_observation;
 pub mod xray_application;
 pub mod xray_bootstrap;
 mod xray_context;
+#[cfg(test)]
+mod xray_execution_acceptance_tests;
+mod xray_execution_application;
+mod xray_execution_watch;
 pub mod xray_http;
 mod xray_projection;
 mod xray_tools;
@@ -96,7 +100,7 @@ mod workflow_representation;
 mod workflow_test_support;
 pub use workflow_operations::{
     WorkflowApplicationAuthorizationDecision, WorkflowRunGraphEditPolicy,
-    WorkflowRunGraphPublicationPolicy,
+    WorkflowRunGraphPublicationPolicy, authorize_execution_observation_grants,
 };
 mod worktree_creation;
 mod worktree_operations;
@@ -519,6 +523,7 @@ pub struct ServerState {
         Option<workflow_operations::WorkflowRunGraphPublicationPolicy>,
     workflow_attempt_repair_policy: Option<workflow_operations::WorkflowAttemptRepairPolicy>,
     workflow_application_authorization: workflow_operations::WorkflowApplicationAuthorizationPolicy,
+    workflow_execution_plugin_policy: bool,
     workflow_discovery_capacity: Arc<tokio::sync::Semaphore>,
     #[cfg(test)]
     workflow_detail_barrier: Mutex<
@@ -545,6 +550,7 @@ pub struct ServerState {
     session_observations: session_observation::SessionObservationRegistry,
     /// Transient diagnostics; never canonical session history or execution authority.
     pub xray: Arc<bcode_xray::XrayHub>,
+    xray_execution_watches: xray_execution_watch::ExecutionWatchRegistry,
     xray_endpoints: xray_bootstrap::XrayEndpointRegistry,
     generation_contexts: Mutex<BTreeMap<String, context_generation::CapturedContext>>,
     session_model_selections: Mutex<BTreeMap<SessionId, SessionModelSelection>>,
@@ -2431,6 +2437,7 @@ impl ServerState {
                 actor_id: client_id.to_string(),
             },
             definition_registration: None,
+            execution_observation: None,
             workflow_id: request.workflow_id,
             draft_id: request.draft_id,
             revision: request.revision,
@@ -2689,6 +2696,7 @@ impl ServerState {
                 }),
             }),
             workflow_attempt_repair_policy: None,
+            workflow_execution_plugin_policy: init.workflow_application_authorization.is_none(),
             workflow_application_authorization: init.workflow_application_authorization.unwrap_or(
                 workflow_operations::WorkflowApplicationAuthorizationPolicy {
                     evaluator: Arc::new(
@@ -2713,6 +2721,7 @@ impl ServerState {
             session_observations: session_observation::SessionObservationRegistry::default(),
             xray_endpoints: xray_bootstrap::XrayEndpointRegistry::default(),
             xray: Arc::new(bcode_xray::XrayHub::default()),
+            xray_execution_watches: xray_execution_watch::ExecutionWatchRegistry::default(),
             generation_contexts: Mutex::default(),
             session_model_selections: Mutex::default(),
             session_model_selection_origins: Mutex::default(),
@@ -2954,6 +2963,9 @@ impl ServerState {
     async fn close_client(self: &Arc<Self>, client_id: ClientId) -> Result<(), ServerError> {
         self.session_observations.remove_client(client_id);
         self.activity_watches.remove_client(client_id);
+        let _ = self
+            .xray_execution_watches
+            .revoke_principal(&client_id.to_string());
         self.interaction_controllers
             .lock()
             .await
@@ -6840,6 +6852,12 @@ const fn request_kind(request: &Request) -> &'static str {
         Request::ListWorkflowDiagnosticArtifacts { .. } => "list_workflow_diagnostic_artifacts",
         Request::ReadWorkflowDiagnosticArtifact { .. } => "read_workflow_diagnostic_artifact",
         Request::OpenXrayEndpoint { .. } => "open_xray_endpoint",
+        Request::StartWorkflowRunObserved { .. } => "start_workflow_run_observed",
+        Request::OpenXrayExecutionWatch { .. } => "open_xray_execution_watch",
+        Request::ReadXrayExecutionWatch { .. } => "read_xray_execution_watch",
+        Request::FinalizeXrayExecutionWatch { .. } => "finalize_xray_execution_watch",
+        Request::ExportXrayExecutionWatch { .. } => "export_xray_execution_watch",
+        Request::RevokeXrayExecutionWatch { .. } => "revoke_xray_execution_watch",
         Request::CloseXrayEndpoint { .. } => "close_xray_endpoint",
         Request::ReadSessionTraceBlob { .. } => "read_session_trace_blob",
         Request::ReadSessionArtifact { .. } => "read_session_artifact",
@@ -7875,14 +7893,124 @@ fn handle_request_inner<'a>(
         SessionLifecycleRequest::OpenXrayEndpoint {
             session_id,
             deep_capture,
+            origin_grant,
         } => Box::pin(async move {
-            let result = state
-                .open_xray_endpoint(client_id, session_id, deep_capture)
-                .await;
+            let result = match origin_grant
+                .map(|grant| {
+                    xray_bootstrap::XrayOriginGrant::new(&grant.origin, grant.lifetime_seconds)
+                })
+                .transpose()
+            {
+                Ok(grant) => {
+                    state
+                        .open_xray_endpoint_with_origin(client_id, session_id, deep_capture, grant)
+                        .await
+                }
+                Err(error) => Err(error),
+            };
             let response = result.map_or_else(
                 |error| Response::Err(ErrorResponse::new(error.code(), error.to_string())),
                 |endpoint| Response::Ok(ResponsePayload::XrayEndpointOpened { endpoint }),
             );
+            send_response(writer, request_id, response).await
+        }),
+        SessionLifecycleRequest::StartWorkflowRunObserved { start, observation } => {
+            Box::pin(async move {
+                let response = state
+                    .start_workflow_run_observed(client_id, start, observation)
+                    .await
+                    .map_or_else(
+                        |error| {
+                            Response::Err(ErrorResponse::new(
+                                "xray_observed_start_failed",
+                                format!("{error:?}"),
+                            ))
+                        },
+                        |(started, ready)| {
+                            Response::Ok(ResponsePayload::WorkflowRunStartedObserved {
+                                started,
+                                ready,
+                            })
+                        },
+                    );
+                send_response(writer, request_id, response).await
+            })
+        }
+        SessionLifecycleRequest::OpenXrayExecutionWatch(request) => Box::pin(async move {
+            let response = state
+                .open_execution_watch(client_id, request)
+                .await
+                .map_or_else(
+                    |error| {
+                        Response::Err(ErrorResponse::new(
+                            "xray_execution_watch_failed",
+                            format!("{error:?}"),
+                        ))
+                    },
+                    |opened| Response::Ok(ResponsePayload::OpenXrayExecutionWatch { opened }),
+                );
+            send_response(writer, request_id, response).await
+        }),
+        SessionLifecycleRequest::ReadXrayExecutionWatch(request) => Box::pin(async move {
+            let response = state
+                .read_execution_watch(client_id, request)
+                .await
+                .map_or_else(
+                    |error| {
+                        Response::Err(ErrorResponse::new(
+                            "xray_execution_watch_failed",
+                            format!("{error:?}"),
+                        ))
+                    },
+                    |page| Response::Ok(ResponsePayload::ReadXrayExecutionWatch { page }),
+                );
+            send_response(writer, request_id, response).await
+        }),
+        SessionLifecycleRequest::FinalizeXrayExecutionWatch(request) => Box::pin(async move {
+            let response = state
+                .finalize_execution_watch(client_id, request)
+                .await
+                .map_or_else(
+                    |error| {
+                        Response::Err(ErrorResponse::new(
+                            "xray_execution_watch_failed",
+                            format!("{error:?}"),
+                        ))
+                    },
+                    |evidence| {
+                        Response::Ok(ResponsePayload::FinalizeXrayExecutionWatch { evidence })
+                    },
+                );
+            send_response(writer, request_id, response).await
+        }),
+        SessionLifecycleRequest::ExportXrayExecutionWatch(request) => Box::pin(async move {
+            let response = state
+                .export_execution_watch_payload(client_id, request)
+                .await
+                .map_or_else(
+                    |error| {
+                        Response::Err(ErrorResponse::new(
+                            "xray_execution_watch_failed",
+                            format!("{error:?}"),
+                        ))
+                    },
+                    |chunk| Response::Ok(ResponsePayload::ExportXrayExecutionWatch { chunk }),
+                );
+            send_response(writer, request_id, response).await
+        }),
+        SessionLifecycleRequest::RevokeXrayExecutionWatch(request) => Box::pin(async move {
+            let response = state
+                .revoke_execution_watch(client_id, request)
+                .await
+                .map_or_else(
+                    |error| {
+                        Response::Err(ErrorResponse::new(
+                            "xray_execution_watch_failed",
+                            format!("{error:?}"),
+                        ))
+                    },
+                    |revoked| Response::Ok(ResponsePayload::RevokeXrayExecutionWatch { revoked }),
+                );
             send_response(writer, request_id, response).await
         }),
         SessionLifecycleRequest::CloseXrayEndpoint { endpoint_id } => Box::pin(async move {
@@ -22090,12 +22218,7 @@ async fn run_model_turn(
     supplied_cancel_state: Option<Arc<TurnCancelState>>,
     recovering: bool,
 ) -> ModelTurnCompletion {
-    let correlation = bcode_xray_models::XrayCorrelation {
-        session_id: trigger_event.session_id.to_string(),
-        turn_id: Some(execution_turn_id(trigger_event)),
-        ..Default::default()
-    };
-    let capture = state.xray.context(correlation);
+    let capture = xray_workflow::turn_context(state, trigger_event).await;
     capture
         .scope(context_compaction_request_budget::scope(Box::pin(
             run_model_turn_lifecycle(
@@ -42431,6 +42554,21 @@ where
                         ));
                     }
                 }
+                workflow_representation::owner::observe_execution_session(
+                    state,
+                    &dispatch_authority,
+                    &bcode_workflow_store::WorkflowExecutionSessionLink::new(
+                        request.activation.run_id.clone(),
+                        request.activation.node_id.clone(),
+                        request.activation.activation_id.clone(),
+                        request.attempt,
+                        existing.id.to_string(),
+                        run.workspace_snapshot.clone(),
+                        current_unix_millis(),
+                    ),
+                    true,
+                )
+                .await;
                 existing
             } else {
                 let child = prepare_workflow_execution_child(
@@ -69061,6 +69199,7 @@ library = "test"
                 actor_id: ClientId::new().to_string(),
             },
             definition_registration: None,
+            execution_observation: None,
             workflow_id: workflow_id.clone(),
             draft_id: None,
             revision: None,

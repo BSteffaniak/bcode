@@ -1,5 +1,151 @@
 //! Behavioral adapter tests. Deliberately do not inspect source text or implementation names.
 
+#[tokio::test(start_paused = true)]
+async fn deadline_rejects_ready_work_and_cancels_waiting_work() {
+    let deadline = Instant::now() + Duration::from_secs(1);
+    let touched = std::sync::atomic::AtomicBool::new(false);
+    tokio::time::advance(Duration::from_secs(1)).await;
+    assert!(
+        before_expiry(Some(deadline), async {
+            touched.store(true, std::sync::atomic::Ordering::SeqCst);
+        })
+        .await
+        .is_none()
+    );
+    assert!(!touched.load(std::sync::atomic::Ordering::SeqCst));
+    assert!(
+        before_expiry(
+            Some(Instant::now() + Duration::from_secs(1)),
+            std::future::pending::<()>()
+        )
+        .await
+        .is_none()
+    );
+    assert_eq!(before_expiry(None, async { 42 }).await, Some(42));
+}
+
+#[tokio::test(start_paused = true)]
+async fn slow_json_body_and_ready_expired_body_cannot_cross_authorization_deadline() {
+    for body in [
+        Body::from_stream(futures::stream::pending::<Result<String, Infallible>>()),
+        Body::from(r#"{"schema_version":1,"observation_id":"one"}"#),
+    ] {
+        let mut input = request("/v1/xray/finalize");
+        *input.body_mut() = body;
+        input
+            .extensions_mut()
+            .insert(CapabilityDeadline(Some(Instant::now())));
+        let result = request_json::<control::FinalizeRequest>(input).await;
+        assert_eq!(result.err().unwrap().status(), StatusCode::FORBIDDEN);
+    }
+    let mut input = request("/v1/xray/finalize");
+    *input.body_mut() = Body::from_stream(futures::stream::pending::<Result<String, Infallible>>());
+    input.extensions_mut().insert(CapabilityDeadline(Some(
+        Instant::now() + Duration::from_secs(1),
+    )));
+    assert_eq!(
+        request_json::<serde_json::Value>(input)
+            .await
+            .unwrap_err()
+            .status(),
+        StatusCode::FORBIDDEN
+    );
+}
+
+#[tokio::test]
+async fn exact_preflight_and_expiry_apply_to_every_read_only_route() {
+    let state = Arc::new(crate::tests::test_server_state(
+        bcode_session::SessionManager::default(),
+    ));
+    let mut config = XrayHttpConfig::default();
+    config
+        .allowed_origins
+        .insert("http://localhost:5173".into());
+    for expired in [false, true] {
+        let access = if expired {
+            access().with_expiry(Instant::now())
+        } else {
+            access()
+        };
+        let (_shutdown, stopped) = watch::channel(false);
+        let http_state = Arc::new(HttpState {
+            application: XrayApplication::new(Arc::clone(&state), Arc::clone(&state.xray)),
+            observations: Arc::clone(&access.observations),
+            access,
+            config: config.clone(),
+            authority: AUTHORITY.into(),
+            shutdown: stopped,
+            calls: Arc::new(Semaphore::new(1)),
+            control_calls: Arc::new(Semaphore::new(1)),
+        });
+        let app = Router::new()
+            .fallback(|| async { StatusCode::NO_CONTENT })
+            .layer(middleware::from_fn_with_state(
+                Arc::clone(&http_state),
+                guard,
+            ));
+        drop(http_state);
+        for route in ["observe", "payload", "finalize", "release"] {
+            for origin in [
+                "http://localhost:5173",
+                "http://localhost:5174",
+                "null",
+                "*",
+            ] {
+                for method in ["POST", "DELETE"] {
+                    let input = Request::builder()
+                        .method("OPTIONS")
+                        .uri(format!("/v1/xray/{route}"))
+                        .header(header::HOST, AUTHORITY)
+                        .header(header::ORIGIN, origin)
+                        .header("access-control-request-method", method)
+                        .header(
+                            "access-control-request-headers",
+                            "authorization, content-type",
+                        )
+                        .body(Body::empty())
+                        .unwrap();
+                    let response = tower::ServiceExt::oneshot(app.clone(), input)
+                        .await
+                        .unwrap();
+                    let allowed = !expired && origin == "http://localhost:5173" && method == "POST";
+                    assert_eq!(
+                        response.status(),
+                        if allowed {
+                            StatusCode::NO_CONTENT
+                        } else {
+                            StatusCode::FORBIDDEN
+                        }
+                    );
+                    assert!(
+                        !response
+                            .headers()
+                            .contains_key(header::ACCESS_CONTROL_ALLOW_CREDENTIALS)
+                    );
+                    if allowed {
+                        assert_eq!(
+                            response.headers()[header::ACCESS_CONTROL_ALLOW_ORIGIN],
+                            origin
+                        );
+                    }
+                }
+            }
+            let response =
+                tower::ServiceExt::oneshot(app.clone(), request(&format!("/v1/xray/{route}")))
+                    .await
+                    .unwrap();
+            assert_eq!(
+                response.status(),
+                if expired {
+                    StatusCode::FORBIDDEN
+                } else {
+                    StatusCode::NO_CONTENT
+                }
+            );
+        }
+    }
+}
+
 use super::*;
 use axum::body::Body;
 use bcode_session_models::SessionId;

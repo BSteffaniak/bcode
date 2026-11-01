@@ -191,7 +191,19 @@ pub enum SessionLifecycleRequest {
     OpenXrayEndpoint {
         session_id: SessionId,
         deep_capture: bool,
+        origin_grant: Option<bcode_ipc::XrayOriginGrantRequest>,
     },
+    StartWorkflowRunObserved {
+        start: bcode_workflow::WorkflowRunStartRequest,
+        observation: bcode_xray_models::execution_watch::ExecutionWatchStartOptions,
+    },
+    OpenXrayExecutionWatch(bcode_xray_models::execution_watch::OpenExecutionWatchRequest),
+    ReadXrayExecutionWatch(bcode_xray_models::execution_watch::ReadExecutionWatchRequest),
+    FinalizeXrayExecutionWatch(bcode_xray_models::execution_watch::FinalizeExecutionWatchRequest),
+    ExportXrayExecutionWatch(
+        bcode_xray_models::execution_watch::ExportExecutionWatchPayloadRequest,
+    ),
+    RevokeXrayExecutionWatch(bcode_xray_models::execution_watch::RevokeExecutionWatchRequest),
     CloseXrayEndpoint {
         endpoint_id: String,
     },
@@ -2415,10 +2427,30 @@ impl RoutedRequest {
             Request::OpenXrayEndpoint {
                 session_id,
                 deep_capture,
+                origin_grant,
             } => Self::SessionLifecycle(Box::new(SessionLifecycleRequest::OpenXrayEndpoint {
                 session_id,
                 deep_capture,
+                origin_grant,
             })),
+            Request::StartWorkflowRunObserved { start, observation } => Self::SessionLifecycle(
+                Box::new(SessionLifecycleRequest::StartWorkflowRunObserved { start, observation }),
+            ),
+            Request::OpenXrayExecutionWatch { request } => Self::SessionLifecycle(Box::new(
+                SessionLifecycleRequest::OpenXrayExecutionWatch(request),
+            )),
+            Request::ReadXrayExecutionWatch { request } => Self::SessionLifecycle(Box::new(
+                SessionLifecycleRequest::ReadXrayExecutionWatch(request),
+            )),
+            Request::FinalizeXrayExecutionWatch { request } => Self::SessionLifecycle(Box::new(
+                SessionLifecycleRequest::FinalizeXrayExecutionWatch(request),
+            )),
+            Request::ExportXrayExecutionWatch { request } => Self::SessionLifecycle(Box::new(
+                SessionLifecycleRequest::ExportXrayExecutionWatch(request),
+            )),
+            Request::RevokeXrayExecutionWatch { request } => Self::SessionLifecycle(Box::new(
+                SessionLifecycleRequest::RevokeXrayExecutionWatch(request),
+            )),
             Request::CloseXrayEndpoint { endpoint_id } => {
                 Self::SessionLifecycle(Box::new(SessionLifecycleRequest::CloseXrayEndpoint {
                     endpoint_id,

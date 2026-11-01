@@ -258,9 +258,10 @@ extern "C" fn service_bridge_callback(
         .filter(|_| diagnostics::negotiated(user_data as usize))
     {
         return std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            // Check fixed control response capacity before Acquire can retain a lease.
-            // All version-1 status replies fit 256 bytes; SDK always provides this capacity.
-            if output_ptr.is_null() || output_capacity < 256 {
+            // Preflight before Acquire/Release or payload retention can change ownership.
+            // Legacy lease replies retain 256 bytes; payload replies require 4096.
+            let required_capacity = diagnostics::control_response_capacity(bytes);
+            if output_ptr.is_null() || output_capacity < required_capacity {
                 diagnostics::record_loss(user_data as usize, "control_response_unavailable");
                 return SERVICE_BRIDGE_STATUS_RESPONSE_TOO_LARGE;
             }

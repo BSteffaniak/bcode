@@ -1,6 +1,8 @@
 //! Generic bounded diagnostic callback leases, independent of invocation stack callbacks.
 //! Plugin data never chooses authorization, session, or originating correlation.
 
+mod payload;
+
 #[cfg(test)]
 mod tests;
 
@@ -19,7 +21,20 @@ struct Entry {
     key: usize,
     capture: CaptureContext,
     owners: AtomicUsize,
+    payloads: Mutex<payload::Transfers>,
 }
+impl Drop for Entry {
+    fn drop(&mut self) {
+        let pending = self
+            .payloads
+            .get_mut()
+            .map_or(1, |state| state.pending_count());
+        if pending != 0 {
+            let _ = self.capture.report_external_loss(pending as u64);
+        }
+    }
+}
+
 struct Slot {
     entry: Mutex<Option<Arc<Entry>>>,
     key: AtomicUsize,
@@ -69,6 +84,7 @@ impl DiagnosticRegistration {
         }
         let slot = slot(key);
         let Ok(mut value) = slot.entry.try_lock() else {
+            let _ = capture.report_external_loss(1);
             capture.emit(
                 "plugin",
                 "diagnostic_channel_unavailable",
@@ -79,6 +95,7 @@ impl DiagnosticRegistration {
         };
         if value.is_some() {
             drop(value);
+            let _ = capture.report_external_loss(1);
             capture.emit(
                 "plugin",
                 "diagnostic_channel_unavailable",
@@ -91,6 +108,7 @@ impl DiagnosticRegistration {
             key,
             capture,
             owners: AtomicUsize::new(1),
+            payloads: Mutex::new(payload::Transfers::default()),
         });
         slot.origin.store(
             Arc::into_raw(Arc::clone(&entry)).cast_mut(),
@@ -160,6 +178,7 @@ fn origin(key: usize) -> Option<Arc<Entry>> {
 
 pub fn record_loss(key: usize, reason: &'static str) {
     if let Some(entry) = origin(key) {
+        let _ = entry.capture.report_external_loss(1);
         entry.capture.emit(
             "plugin",
             "diagnostic_bridge_gap",
@@ -210,9 +229,24 @@ fn release(key: usize) {
     drop(removed);
 }
 
+/// Minimum reply capacity required before a control may perform any side effect.
+/// Legacy event-only clients retain their 256-byte control response contract.
+#[must_use]
+pub fn control_response_capacity(bytes: &[u8]) -> usize {
+    if bytes.len() <= MAX_NATIVE_DIAGNOSTIC_BYTES
+        && serde_json::from_slice::<DiagnosticControl>(bytes).is_ok_and(|request| {
+            matches!(request.operation, DiagnosticControlOperation::Payload(_))
+        })
+    {
+        4096
+    } else {
+        256
+    }
+}
+
 /// Reserved controls are intercepted before normal bridge/cancellation dispatch.
 pub fn control(key: usize, bytes: &[u8]) -> Option<DiagnosticStatus> {
-    if bytes.len() > 256 {
+    if bytes.len() > MAX_NATIVE_DIAGNOSTIC_BYTES {
         record_loss(key, "oversized_control");
         return None;
     }
@@ -223,6 +257,25 @@ pub fn control(key: usize, bytes: &[u8]) -> Option<DiagnosticStatus> {
     if request.version != NATIVE_DIAGNOSTICS_VERSION {
         record_loss(key, "unsupported_control_version");
         return None;
+    }
+    if let DiagnosticControlOperation::Loss { count } = request.operation {
+        let entry = lookup(key)?;
+        let accepted = count > 0 && entry.capture.report_external_loss(count);
+        return Some(DiagnosticStatus {
+            version: NATIVE_DIAGNOSTICS_VERSION,
+            payload: accepted
+                .then_some(bcode_plugin_sdk::diagnostics::payload::PayloadReply::Progress),
+            ..Default::default()
+        });
+    }
+    if let DiagnosticControlOperation::Payload(operation) = request.operation {
+        let entry = lookup(key)?;
+        return Some(DiagnosticStatus {
+            version: NATIVE_DIAGNOSTICS_VERSION,
+            active: entry.capture.deep_capture_active(),
+            deep_active: entry.capture.deep_capture_active(),
+            payload: Some(payload::control(&entry, operation)),
+        });
     }
     if matches!(request.operation, DiagnosticControlOperation::Release) {
         release(key);
@@ -259,6 +312,7 @@ pub fn control(key: usize, bytes: &[u8]) -> Option<DiagnosticStatus> {
         version: NATIVE_DIAGNOSTICS_VERSION,
         active: deep_active,
         deep_active,
+        payload: None,
     })
 }
 
@@ -269,6 +323,7 @@ pub fn event(key: usize, bytes: &[u8]) {
         return;
     }
     if bytes.len() > MAX_NATIVE_DIAGNOSTIC_BYTES {
+        let _ = entry.capture.report_external_loss(1);
         entry.capture.emit(
             "plugin",
             "diagnostic_payload_omitted",
@@ -280,6 +335,7 @@ pub fn event(key: usize, bytes: &[u8]) {
         return;
     }
     let Ok(envelope) = serde_json::from_slice::<NativeDiagnosticEvent>(bytes) else {
+        let _ = entry.capture.report_external_loss(1);
         entry.capture.emit(
             "plugin",
             "diagnostic_payload_omitted",
@@ -291,6 +347,7 @@ pub fn event(key: usize, bytes: &[u8]) {
         return;
     };
     if envelope.version != NATIVE_DIAGNOSTICS_VERSION {
+        let _ = entry.capture.report_external_loss(1);
         entry.capture.emit(
             "plugin",
             "diagnostic_payload_omitted",
@@ -301,10 +358,15 @@ pub fn event(key: usize, bytes: &[u8]) {
         );
         return;
     }
-    let event = envelope.event;
+    let mut event = envelope.event;
+    // Plugin-authored metadata may describe locations but cannot select reference scope.
+    event.correlation = entry.capture.correlation().clone();
+    if event.payload_references().is_err() {
+        record_loss(key, "invalid_payload_attachment");
+        return;
+    }
     // NEVER use plugin correlation or sensitivity as authority. Every plugin-authored body
     // is protected; only the originating host context supplies scope and authorization.
-    entry
-        .capture
-        .emit(&event.domain, &event.name, event.data, true);
+    event.sensitive = true;
+    entry.capture.emit_event(event);
 }

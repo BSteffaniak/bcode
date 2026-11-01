@@ -6,10 +6,21 @@
 
 use crate::ServerState;
 use bcode_session_models::SessionId;
+use bcode_xray::XrayCaptureAttachments;
 
-/// Emit payload-free diagnostics for the validated session owner.
-pub fn emit(state: &ServerState, session_id: SessionId, name: &str, data: serde_json::Value) {
-    context(state, session_id).emit("interaction", name, data, false);
+/// Observe cleanup using only the count of removed exchanges, never exchange contents.
+pub fn exchanges_cleaned(state: &ServerState, session_id: SessionId, removed: usize) {
+    capture_exchanges_cleaned(&context(state, session_id), removed);
+}
+
+fn capture_exchanges_cleaned(capture: &bcode_xray::CaptureContext, removed: usize) {
+    capture.emit_with_capture(
+        "interaction",
+        "exchanges_cleaned",
+        serde_json::json!({"removed": removed}),
+        false,
+        Some(XrayCaptureAttachments::new(vec![])),
+    );
 }
 
 /// Bind diagnostics to the validated invocation without inventing turn ancestry.
@@ -96,31 +107,24 @@ impl InteractionObservation {
         tool_call_id: &str,
         operation: &'static str,
     ) -> Self {
-        let capture = tool_context(state, session_id, tool_call_id);
-        capture.emit(
-            "interaction",
-            "operation_started",
-            serde_json::json!({"operation": operation}),
-            false,
-        );
-        Self {
-            capture,
-            operation,
-            started: std::time::Instant::now(),
-            finished: false,
-        }
+        Self::start_capture(tool_context(state, session_id, tool_call_id), operation)
     }
+
     pub(crate) fn start(
         state: &ServerState,
         session_id: SessionId,
         operation: &'static str,
     ) -> Self {
-        let capture = context(state, session_id);
-        capture.emit(
+        Self::start_capture(context(state, session_id), operation)
+    }
+
+    fn start_capture(capture: bcode_xray::CaptureContext, operation: &'static str) -> Self {
+        capture.emit_with_capture(
             "interaction",
             "operation_started",
             serde_json::json!({"operation": operation}),
             false,
+            Some(XrayCaptureAttachments::new(vec![])),
         );
         Self {
             capture,
@@ -135,11 +139,11 @@ impl InteractionObservation {
             return;
         }
         self.finished = true;
-        self.capture.emit("interaction", "operation_finished", serde_json::json!({
+        self.capture.emit_with_capture("interaction", "operation_finished", serde_json::json!({
             "operation": self.operation,
             "outcome": outcome,
             "duration_ms": u64::try_from(self.started.elapsed().as_millis()).unwrap_or(u64::MAX),
-        }), false);
+        }), false, Some(XrayCaptureAttachments::new(vec![])));
     }
 }
 
@@ -236,6 +240,69 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn normalized_cleanup_lifecycle_declares_only_inline_scalar_data() {
+        for deep_capture in [false, true] {
+            let hub = bcode_xray::XrayHub::default();
+            let mut observation = hub
+                .observe(bcode_xray::XrayObserveRequest {
+                    schema_version: bcode_xray::XRAY_SCHEMA_VERSION,
+                    session_id: "owner".into(),
+                    deep_capture,
+                })
+                .expect("observe");
+            observation.recv().await.expect("ready");
+            let capture = owner_context(&hub, "owner".into());
+            let mut guard =
+                InteractionObservation::start_capture(capture.clone(), "exchange_cleanup");
+            capture_exchanges_cleaned(&capture, 3);
+            guard.finish("completed");
+            guard.finish("failed"); // Settled completion cannot be overwritten.
+            drop(guard);
+            observation.finalize().expect("cutoff");
+            for name in [
+                "operation_started",
+                "exchanges_cleaned",
+                "operation_finished",
+            ] {
+                let event = observation.recv().await.expect("diagnostic").event;
+                assert_eq!(event.domain, "interaction");
+                assert_eq!(event.name, name);
+                assert_eq!(event.correlation.session_id, "owner");
+                assert!(!event.sensitive);
+                assert_eq!(event.capture, Some(XrayCaptureAttachments::new(vec![])));
+                assert!(
+                    event
+                        .payload_references()
+                        .expect("typed references")
+                        .is_empty()
+                );
+                match name {
+                    "operation_started" => assert_eq!(
+                        event.data,
+                        serde_json::json!({"operation":"exchange_cleanup"})
+                    ),
+                    "exchanges_cleaned" => assert_eq!(event.data, serde_json::json!({"removed":3})),
+                    _ => {
+                        assert_eq!(event.data["operation"], "exchange_cleanup");
+                        assert_eq!(event.data["outcome"], "completed");
+                        assert!(event.data["duration_ms"].is_u64());
+                        assert_eq!(event.data.as_object().expect("scalars").len(), 3);
+                    }
+                }
+            }
+            assert_eq!(
+                observation
+                    .recv()
+                    .await
+                    .expect("no duplicate finish")
+                    .event
+                    .name,
+                "finalized"
+            );
+        }
+    }
+
+    #[tokio::test]
     async fn interaction_guard_drop_reports_unfinished_not_cancelled() {
         let hub = bcode_xray::XrayHub::default();
         let mut observation = hub
@@ -256,5 +323,16 @@ mod tests {
         let event = observation.recv().await.expect("unfinished");
         assert_eq!(event.event.name, "operation_finished");
         assert_eq!(event.event.data["outcome"], "unfinished");
+        assert_eq!(
+            event.event.capture,
+            Some(XrayCaptureAttachments::new(vec![]))
+        );
+        assert!(
+            event
+                .event
+                .payload_references()
+                .expect("typed references")
+                .is_empty()
+        );
     }
 }

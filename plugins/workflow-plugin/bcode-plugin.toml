@@ -11,6 +11,13 @@ interface_id = "bcode.workflow-publication-policy/v1"
 name         = "Workflow Publication Policy"
 
 [[services]]
+class                 = "service"
+description           = "Explicit exact expiring execution diagnostic grants"
+interface_id          = "bcode.workflow-execution-observation-policy/v1"
+invocation_operations = ["authorize"]
+name                  = "Workflow Execution Observation Policy"
+
+[[services]]
 class        = "tool_execution"
 description  = "Execution-scoped workflow graph staging"
 interface_id = "bcode.tool/v1"

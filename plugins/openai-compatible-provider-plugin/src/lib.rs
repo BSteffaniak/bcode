@@ -278,6 +278,7 @@ struct OpenAiAuthTokenResponse {
 
 impl TurnState {
     fn push(&self, event: ProviderTurnEvent) {
+        diagnostics::event(&event);
         if matches!(
             &event,
             ProviderTurnEvent::TextDelta { .. }

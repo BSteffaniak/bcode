@@ -7,7 +7,7 @@
 
 use std::collections::BTreeMap;
 use std::fs::File;
-use std::io::{self, Write};
+use std::io::{self, BufRead as _, Read as _, Write};
 use std::path::Path;
 
 use bcode_xray_models::{
@@ -17,7 +17,21 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 /// Independently evolving on-disk bundle contract. Unknown versions must be rejected.
-pub const RECORDING_SCHEMA_VERSION: u16 = 1;
+pub const RECORDING_SCHEMA_VERSION: u16 = 2;
+
+/// A restarted live capture cannot certify continuity with its predecessor.
+#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+pub enum CaptureSegmentBoundary {
+    /// No preceding capture is asserted.
+    #[default]
+    Initial,
+    /// A new observation after a lost connection, with an explicit unrecoverable gap.
+    RestartAfterGap {
+        /// Prior live observation identity, not a replay cursor or storage path.
+        previous_observation_id: String,
+    },
+}
 
 /// Consumer-side recording interface, replaceable by non-filesystem implementations.
 /// Payload references must be registered explicitly, not discovered by guessing JSON.
@@ -91,6 +105,7 @@ pub enum RecordingState {
 
 /// Only recorder-generated relative names are written; payload IDs are not paths.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct RecordedPayload {
     pub reference: XrayPayloadRef,
     /// None means explicitly expected but not successfully retained locally.
@@ -99,6 +114,7 @@ pub struct RecordedPayload {
 
 /// Integrity coordinates for the exact JSONL bytes (including newlines).
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct RecordedEvents {
     pub relative_path: String,
     pub byte_len: u64,
@@ -112,6 +128,9 @@ pub struct RecordedEvents {
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct RecordingManifest {
+    /// V2 adds explicit capture segment boundaries. V1 has only initial captures.
+    #[serde(default)]
+    pub segment: CaptureSegmentBoundary,
     pub schema_version: u16,
     pub envelope_schema_version: u16,
     pub observation_id: String,
@@ -210,6 +229,7 @@ impl JsonlBundleRecorder {
             events,
             options,
             manifest: RecordingManifest {
+                segment: CaptureSegmentBoundary::Initial,
                 schema_version: RECORDING_SCHEMA_VERSION,
                 envelope_schema_version: XRAY_SCHEMA_VERSION,
                 observation_id: observation_id.to_owned(),
@@ -243,6 +263,32 @@ impl JsonlBundleRecorder {
     #[must_use]
     pub const fn manifest(&self) -> &RecordingManifest {
         &self.manifest
+    }
+
+    /// Begin a new gapful segment after a lost observation. Does not reattach,
+    /// reopen, repair or append to its predecessor; authorization is caller-owned.
+    ///
+    /// # Errors
+    /// Rejects invalid predecessor identity and all errors from `create`.
+    pub fn create_segment(
+        destination: &Path,
+        observation_id: &str,
+        session_id: &str,
+        previous_observation_id: &str,
+        options: RecordingOptions,
+    ) -> Result<Self, RecordingError> {
+        if previous_observation_id.is_empty()
+            || previous_observation_id.len() > 4096
+            || previous_observation_id == observation_id
+        {
+            return Err(RecordingError::InvalidInput);
+        }
+        let mut recorder = Self::create(destination, observation_id, session_id, options)?;
+        recorder.manifest.segment = CaptureSegmentBoundary::RestartAfterGap {
+            previous_observation_id: previous_observation_id.to_owned(),
+        };
+        recorder.publish_manifest()?;
+        Ok(recorder)
     }
 
     fn active(&self) -> Result<(), RecordingError> {
@@ -476,7 +522,8 @@ impl RecordingSink for JsonlBundleRecorder {
         }
         self.manifest.finalization = Some(boundary.clone());
         self.manifest.state = RecordingState::Finalized;
-        self.manifest.evidence_complete = self.manifest.missing_sequences == 0
+        self.manifest.evidence_complete = self.manifest.segment == CaptureSegmentBoundary::Initial
+            && self.manifest.missing_sequences == 0
             && self.manifest.omitted_events == 0
             && boundary.dropped_events == 0
             && boundary.hub_contention_drops == 0
@@ -499,6 +546,7 @@ impl RecordingSink for JsonlBundleRecorder {
         }
         self.manifest.state = RecordingState::Interrupted;
         self.manifest.evidence_complete = false;
+        self.manifest.failure_code = Some("capture_interrupted_start_new_gapful_segment".into());
         if let Err(error) = self.publish_manifest() {
             return Err(self.fail(error));
         }
@@ -512,6 +560,266 @@ impl Drop for JsonlBundleRecorder {
             let _ = self.interrupt();
         }
     }
+}
+
+/// Read and verify a bounded offline bundle without repairing or rewriting it.
+///
+/// Returns the recorded lifecycle unchanged: an interrupted/recording bundle is
+/// never promoted to finalized. Digests establish integrity, not authenticity.
+/// Unknown envelope domains are retained; unknown contract versions fail closed.
+/// Memory is bounded by one manifest, one event and one payload read buffer.
+///
+/// # Errors
+/// Rejects unsupported versions, unsafe paths/symlinks/nonregular files, stale or
+/// inconsistent manifests, length/digest/order mismatches, bounds and IO failures.
+pub fn inspect_bundle(
+    destination: &Path,
+    options: &RecordingOptions,
+) -> Result<RecordingManifest, RecordingError> {
+    let directory = confined::open_bundle(destination)?;
+    let mut bytes = Vec::new();
+    confined::read(&directory, "manifest.json")?
+        .take(
+            u64::try_from(options.max_manifest_bytes)
+                .map_err(|_| RecordingError::Limit)?
+                .saturating_add(1),
+        )
+        .read_to_end(&mut bytes)?;
+    if bytes.len() > options.max_manifest_bytes {
+        return Err(RecordingError::Limit);
+    }
+    let value: serde_json::Value =
+        serde_json::from_slice(&bytes).map_err(|_| RecordingError::InvalidInput)?;
+    let version = value
+        .get("schema_version")
+        .and_then(serde_json::Value::as_u64);
+    if !matches!(version, Some(1 | 2))
+        || (version == Some(2) && value.get("segment").is_none())
+        || (version == Some(1) && value.get("segment").is_some())
+    {
+        return Err(RecordingError::InvalidInput);
+    }
+    let manifest: RecordingManifest =
+        serde_json::from_value(value).map_err(|_| RecordingError::InvalidInput)?;
+    if !matches!(manifest.schema_version, 1 | RECORDING_SCHEMA_VERSION)
+        || manifest.envelope_schema_version != XRAY_SCHEMA_VERSION
+    {
+        return Err(RecordingError::InvalidInput);
+    }
+    if manifest.schema_version == 1 && manifest.segment != CaptureSegmentBoundary::Initial {
+        return Err(RecordingError::InvalidInput);
+    }
+    if let CaptureSegmentBoundary::RestartAfterGap {
+        previous_observation_id,
+    } = &manifest.segment
+        && (previous_observation_id.is_empty()
+            || previous_observation_id.len() > 4096
+            || previous_observation_id == &manifest.observation_id)
+    {
+        return Err(RecordingError::InvalidInput);
+    }
+    if manifest.events.relative_path != "events.jsonl"
+        || manifest.observation_id.is_empty()
+        || manifest.session_id.is_empty()
+        || manifest.observation_id.len() > 4096
+        || manifest.session_id.len() > 4096
+        || manifest.payloads.len() > options.max_payloads
+        || manifest.events.byte_len > options.max_bundle_bytes
+    {
+        return Err(RecordingError::InvalidInput);
+    }
+    let terminal = verify_bundle_events(&directory, &manifest, options)?;
+    verify_bundle_payloads(&directory, &manifest, options)?;
+    verify_bundle_lifecycle(&manifest, terminal.as_ref())?;
+    Ok(manifest)
+}
+
+fn verify_bundle_events(
+    directory: &File,
+    manifest: &RecordingManifest,
+    options: &RecordingOptions,
+) -> Result<Option<XrayFinalization>, RecordingError> {
+    let mut events = io::BufReader::new(confined::read(directory, "events.jsonl")?);
+    let mut hash = Sha256::new();
+    let mut length = 0_u64;
+    let mut count = 0_u64;
+    let mut last = 0;
+    let mut next = 1;
+    let mut missing = 0_u64;
+    let mut omitted = 0_u64;
+    let mut terminal = None;
+    loop {
+        let mut line = Vec::new();
+        events
+            .by_ref()
+            .take((options.max_event_bytes as u64).saturating_add(2))
+            .read_until(b'\n', &mut line)?;
+        if line.is_empty() {
+            break;
+        }
+        if line.len() > options.max_event_bytes.saturating_add(1) || line.last() != Some(&b'\n') {
+            return Err(RecordingError::Limit);
+        }
+        length = length
+            .checked_add(line.len() as u64)
+            .ok_or(RecordingError::Limit)?;
+        if length > manifest.events.byte_len {
+            return Err(RecordingError::Integrity);
+        }
+        hash.update(&line);
+        let envelope: XrayEnvelope =
+            serde_json::from_slice(&line).map_err(|_| RecordingError::InvalidInput)?;
+        if envelope.schema_version != XRAY_SCHEMA_VERSION
+            || envelope.observation_id != manifest.observation_id
+            || envelope.event.correlation.session_id != manifest.session_id
+            || envelope.sequence < next
+            || envelope.sequence == u64::MAX
+            || terminal.is_some()
+        {
+            return Err(RecordingError::InvalidOrder);
+        }
+        for reference in envelope
+            .payload_references()
+            .map_err(|_| RecordingError::InvalidInput)?
+        {
+            if !manifest
+                .payloads
+                .get(&reference.payload_id)
+                .is_some_and(|payload| payload.reference == reference)
+            {
+                return Err(RecordingError::Integrity);
+            }
+        }
+        let control = envelope.event.domain == "xray";
+        if count == 0 && (envelope.sequence != 1 || !control || envelope.event.name != "ready") {
+            return Err(RecordingError::InvalidOrder);
+        }
+        missing = missing.saturating_add(envelope.sequence - next);
+        next = envelope.sequence + 1;
+        if control && envelope.event.name == "gap" {
+            let gap: XrayGap = serde_json::from_value(envelope.event.data.clone())
+                .map_err(|_| RecordingError::InvalidInput)?;
+            let first_missing = gap.first_sequence;
+            if first_missing != envelope.sequence
+                || gap.last_sequence < first_missing
+                || gap.last_sequence == u64::MAX
+            {
+                return Err(RecordingError::InvalidOrder);
+            }
+            missing = missing.saturating_add(gap.last_sequence - gap.first_sequence + 1);
+            next = gap.last_sequence + 1;
+        } else if control && envelope.event.name == "finalized" {
+            let boundary: XrayFinalization = serde_json::from_value(envelope.event.data.clone())
+                .map_err(|_| RecordingError::InvalidInput)?;
+            if !finalization_matches_envelope(&boundary, &envelope) {
+                return Err(RecordingError::Integrity);
+            }
+            terminal = Some(boundary);
+        }
+        if envelope.event.name.ends_with("_omitted") {
+            omitted = omitted.saturating_add(1);
+        }
+        count += 1;
+        last = envelope.sequence;
+    }
+    if length != manifest.events.byte_len
+        || hex::encode(hash.finalize()) != manifest.events.sha256
+        || count != manifest.events.envelope_count
+        || last != manifest.events.last_sequence
+        || missing != manifest.missing_sequences
+        || omitted != manifest.omitted_events
+    {
+        return Err(RecordingError::Integrity);
+    }
+    Ok(terminal)
+}
+
+fn verify_bundle_payloads(
+    directory: &File,
+    manifest: &RecordingManifest,
+    options: &RecordingOptions,
+) -> Result<(), RecordingError> {
+    let payload_directory = confined::open_directory(directory, "payloads")?;
+    let mut total = manifest.events.byte_len;
+    for (id, payload) in &manifest.payloads {
+        let reference = &payload.reference;
+        if id != &reference.payload_id
+            || reference.schema_version != XRAY_SCHEMA_VERSION
+            || reference.session_id != manifest.session_id
+            || reference.byte_len > options.max_payload_bytes as u64
+            || reference.sha256.len() != 64
+            || !reference
+                .sha256
+                .bytes()
+                .all(|byte| byte.is_ascii_hexdigit())
+        {
+            return Err(RecordingError::InvalidInput);
+        }
+        if let Some(path) = &payload.relative_path {
+            let name = format!("{}-{}.bin", digest(id.as_bytes()), reference.sha256);
+            if path != &format!("payloads/{name}") {
+                return Err(RecordingError::InvalidInput);
+            }
+            total = total
+                .checked_add(reference.byte_len)
+                .ok_or(RecordingError::Limit)?;
+            if total > options.max_bundle_bytes {
+                return Err(RecordingError::Limit);
+            }
+            let mut file = confined::read(&payload_directory, &name)?;
+            let mut hash = Sha256::new();
+            let mut length = 0_u64;
+            let mut buffer = [0; 16 * 1024];
+            loop {
+                let read = file.read(&mut buffer)?;
+                if read == 0 {
+                    break;
+                }
+                length = length
+                    .checked_add(read as u64)
+                    .ok_or(RecordingError::Limit)?;
+                if length > reference.byte_len {
+                    return Err(RecordingError::Integrity);
+                }
+                hash.update(&buffer[..read]);
+            }
+            if length != reference.byte_len || hex::encode(hash.finalize()) != reference.sha256 {
+                return Err(RecordingError::Integrity);
+            }
+        }
+    }
+    Ok(())
+}
+
+fn verify_bundle_lifecycle(
+    manifest: &RecordingManifest,
+    terminal: Option<&XrayFinalization>,
+) -> Result<(), RecordingError> {
+    if manifest.state == RecordingState::Finalized {
+        let boundary = manifest
+            .finalization
+            .as_ref()
+            .ok_or(RecordingError::Integrity)?;
+        if terminal != Some(boundary) {
+            return Err(RecordingError::Integrity);
+        }
+        let complete = manifest.segment == CaptureSegmentBoundary::Initial
+            && manifest.missing_sequences == 0
+            && manifest.omitted_events == 0
+            && boundary.dropped_events == 0
+            && boundary.hub_contention_drops == 0
+            && boundary.evicted_payloads == 0
+            && manifest
+                .payloads
+                .values()
+                .all(|payload| payload.relative_path.is_some());
+        if manifest.evidence_complete != complete {
+            return Err(RecordingError::Integrity);
+        }
+    } else if manifest.evidence_complete || manifest.finalization.is_some() {
+        return Err(RecordingError::Integrity);
+    }
+    Ok(())
 }
 
 fn finalization_matches_envelope(boundary: &XrayFinalization, envelope: &XrayEnvelope) -> bool {
@@ -570,6 +878,41 @@ mod confined {
 
     fn map(error: rustix::io::Errno) -> RecordingError {
         RecordingError::Io(std::io::Error::from(error).kind())
+    }
+
+    pub(super) fn open_bundle(path: &Path) -> Result<File, RecordingError> {
+        if !path.is_absolute() {
+            return Err(RecordingError::InvalidOptions);
+        }
+        let flags = OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC;
+        let mut directory = File::from(open("/", flags, Mode::empty()).map_err(map)?);
+        for component in path.components() {
+            match component {
+                Component::RootDir => {}
+                Component::Normal(name) => {
+                    directory =
+                        File::from(openat(&directory, name, flags, Mode::empty()).map_err(map)?);
+                }
+                _ => return Err(RecordingError::InvalidOptions),
+            }
+        }
+        Ok(directory)
+    }
+
+    pub(super) fn open_directory(parent: &File, name: &str) -> Result<File, RecordingError> {
+        let flags = OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC;
+        Ok(File::from(
+            openat(parent, name, flags, Mode::empty()).map_err(map)?,
+        ))
+    }
+
+    pub(super) fn read(parent: &File, name: &str) -> Result<File, RecordingError> {
+        let flags = OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::NONBLOCK | OFlags::CLOEXEC;
+        let file = File::from(openat(parent, name, flags, Mode::empty()).map_err(map)?);
+        if !file.metadata()?.is_file() {
+            return Err(RecordingError::InvalidInput);
+        }
+        Ok(file)
     }
 
     pub(super) fn create_bundle(path: &Path) -> Result<File, RecordingError> {
@@ -632,6 +975,141 @@ mod tests {
     use std::os::unix::fs::{PermissionsExt, symlink};
     use tempfile::TempDir;
 
+    #[test]
+    fn offline_reader_verifies_content_and_preserves_interruption() {
+        let (_temporary, path, mut recorder) = setup();
+        ready(&mut recorder);
+        let bytes = b"captured diagnostic";
+        recorder.store_payload(&reference(bytes), bytes).unwrap();
+        recorder.interrupt().unwrap();
+        let manifest = inspect_bundle(&path, &RecordingOptions::default()).unwrap();
+        assert_eq!(manifest.state, RecordingState::Interrupted);
+        assert!(!manifest.evidence_complete);
+        assert!(manifest.failure_code.is_some());
+        let payload = manifest
+            .payloads
+            .values()
+            .next()
+            .unwrap()
+            .relative_path
+            .as_ref()
+            .unwrap();
+        std::fs::write(path.join(payload), b"corrupt").unwrap();
+        assert!(inspect_bundle(&path, &RecordingOptions::default()).is_err());
+    }
+
+    #[test]
+    fn offline_reader_accepts_v1_but_rejects_future_or_incomplete_v2_contracts() {
+        let (_temporary, path, mut recorder) = setup();
+        ready(&mut recorder);
+        finish(&mut recorder, &boundary(2));
+        assert!(
+            inspect_bundle(&path, &RecordingOptions::default())
+                .unwrap()
+                .evidence_complete
+        );
+        let manifest_path = path.join("manifest.json");
+        let original: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&manifest_path).unwrap()).unwrap();
+        for version in [1, 2, 99] {
+            let mut value = original.clone();
+            value["schema_version"] = serde_json::json!(version);
+            value.as_object_mut().unwrap().remove("segment");
+            std::fs::write(&manifest_path, serde_json::to_vec(&value).unwrap()).unwrap();
+            let result = inspect_bundle(&path, &RecordingOptions::default());
+            assert_eq!(result.is_ok(), version == 1);
+        }
+    }
+
+    #[test]
+    fn offline_reader_rejects_segment_downgrade_and_forged_continuity() {
+        let temporary = tempfile::tempdir().unwrap();
+        let path = temporary.path().canonicalize().unwrap().join("gapful");
+        let mut recorder = JsonlBundleRecorder::create_segment(
+            &path,
+            "observer",
+            "session",
+            "previous",
+            RecordingOptions::default(),
+        )
+        .unwrap();
+        ready(&mut recorder);
+        finish(&mut recorder, &boundary(2));
+        let manifest_path = path.join("manifest.json");
+        let original: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&manifest_path).unwrap()).unwrap();
+        assert!(
+            !inspect_bundle(&path, &RecordingOptions::default())
+                .unwrap()
+                .evidence_complete
+        );
+        let mut downgrade = original.clone();
+        downgrade["schema_version"] = serde_json::json!(1);
+        let mut forged = original.clone();
+        forged["evidence_complete"] = serde_json::json!(true);
+        let mut self_reference = original;
+        self_reference["segment"]["previous_observation_id"] = serde_json::json!("observer");
+        for invalid in [downgrade, forged, self_reference] {
+            std::fs::write(&manifest_path, serde_json::to_vec(&invalid).unwrap()).unwrap();
+            assert!(inspect_bundle(&path, &RecordingOptions::default()).is_err());
+        }
+    }
+
+    #[test]
+    fn offline_reader_rejects_symlink_traversal_truncation_and_bounds() {
+        let (_temporary, path, mut recorder) = setup();
+        ready(&mut recorder);
+        finish(&mut recorder, &boundary(2));
+        let options = RecordingOptions {
+            max_event_bytes: 1,
+            ..RecordingOptions::default()
+        };
+        assert!(inspect_bundle(&path, &options).is_err());
+        let events = std::fs::read(path.join("events.jsonl")).unwrap();
+        std::fs::write(path.join("events.jsonl"), &events[..events.len() - 1]).unwrap();
+        assert!(inspect_bundle(&path, &RecordingOptions::default()).is_err());
+        let manifest_path = path.join("manifest.json");
+        let mut value: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&manifest_path).unwrap()).unwrap();
+        value["events"]["relative_path"] = serde_json::json!("../events.jsonl");
+        std::fs::write(&manifest_path, serde_json::to_vec(&value).unwrap()).unwrap();
+        assert!(inspect_bundle(&path, &RecordingOptions::default()).is_err());
+        std::fs::rename(&manifest_path, path.join("original.json")).unwrap();
+        symlink("original.json", &manifest_path).unwrap();
+        assert!(inspect_bundle(&path, &RecordingOptions::default()).is_err());
+    }
+
+    #[test]
+    fn restarted_segment_is_explicitly_gapful_even_after_clean_finalization() {
+        let temporary = tempfile::tempdir().unwrap();
+        let path = temporary.path().canonicalize().unwrap().join("new-segment");
+        let mut recorder = JsonlBundleRecorder::create_segment(
+            &path,
+            "observer",
+            "session",
+            "previous-observer",
+            RecordingOptions::default(),
+        )
+        .unwrap();
+        ready(&mut recorder);
+        let manifest = finish(&mut recorder, &boundary(2));
+        assert!(!manifest.evidence_complete);
+        assert_eq!(
+            inspect_bundle(&path, &RecordingOptions::default()).unwrap(),
+            manifest
+        );
+        assert!(
+            JsonlBundleRecorder::create_segment(
+                &path,
+                "observer",
+                "session",
+                "previous-observer",
+                RecordingOptions::default(),
+            )
+            .is_err()
+        );
+    }
+
     fn setup() -> (TempDir, std::path::PathBuf, JsonlBundleRecorder) {
         let temporary = tempfile::tempdir().unwrap();
         // macOS temp roots can have a symlink ancestor; canonicalize trusted test input.
@@ -653,6 +1131,7 @@ mod tests {
                 name: name.into(),
                 data,
                 sensitive: false,
+                capture: None,
                 correlation: XrayCorrelation {
                     session_id: "session".into(),
                     ..XrayCorrelation::default()
@@ -1024,6 +1503,15 @@ mod tests {
 #[cfg(not(unix))]
 mod confined {
     use super::{File, Path, RecordingError};
+    pub(super) fn open_bundle(_: &Path) -> Result<File, RecordingError> {
+        Err(RecordingError::UnsupportedPlatform)
+    }
+    pub(super) fn open_directory(_: &File, _: &str) -> Result<File, RecordingError> {
+        Err(RecordingError::UnsupportedPlatform)
+    }
+    pub(super) fn read(_: &File, _: &str) -> Result<File, RecordingError> {
+        Err(RecordingError::UnsupportedPlatform)
+    }
     pub(super) fn create_bundle(_: &Path) -> Result<File, RecordingError> {
         Err(RecordingError::UnsupportedPlatform)
     }

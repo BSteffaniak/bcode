@@ -31,9 +31,11 @@ bmux_tui_components = { workspace = true, features = [
     "text-input",
 ], optional = true }
 clap = { workspace = true, features = ["std"] }
+hex = { workspace = true }
 schemars = { workspace = true }
 serde = { workspace = true, features = ["derive", "std"] }
 serde_json = { workspace = true }
+sha2 = { workspace = true }
 tokio = { workspace = true, features = ["rt", "sync"], optional = true }
 
 [dev-dependencies]

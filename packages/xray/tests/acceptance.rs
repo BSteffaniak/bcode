@@ -26,13 +26,13 @@ fn correlation(session: &str, turn: Option<&str>) -> XrayCorrelation {
 }
 
 fn event(session: &str, turn: Option<&str>, name: &str) -> XrayEvent {
-    XrayEvent {
-        domain: "acceptance".to_owned(),
-        name: name.to_owned(),
-        correlation: correlation(session, turn),
-        data: json!({"fixture": true}),
-        sensitive: false,
-    }
+    XrayEvent::new(
+        "acceptance",
+        name,
+        correlation(session, turn),
+        json!({"fixture": true}),
+        false,
+    )
 }
 
 async fn receive(observer: &mut bcode_xray::XrayObservation) -> XrayEnvelope {
@@ -309,6 +309,95 @@ async fn sensitive_payload_access_is_bounded_and_bound_to_live_owning_observatio
     assert!(!hub.deep_capture_active("payload"));
 }
 
+#[tokio::test]
+async fn explicit_capture_locations_survive_delivery_without_discovering_ordinary_json() {
+    use bcode_xray_models::{XrayCaptureAttachment, XrayCaptureAttachments};
+
+    let hub = XrayHub::default();
+    let context = hub.context(correlation("attachments", Some("turn")));
+    let mut deep = hub.observe(request("attachments", true)).expect("deep");
+    let mut shallow = hub.observe(request("attachments", false)).expect("shallow");
+    receive(&mut deep).await;
+    receive(&mut shallow).await;
+    let reference = context
+        .capture_payload("text/plain", b"retained")
+        .unwrap()
+        .unwrap();
+    let ordinary = json!({
+        "malformed": {"payload_id": "ordinary", "sha256": "not-a-digest", "byte_len": 42},
+        "valid_looking": reference,
+        "future_looking": {"schema_version": 999, "payload_id": "also-ordinary"},
+    });
+    context.emit("acceptance", "ordinary", ordinary.clone(), false);
+    for observation in [&mut deep, &mut shallow] {
+        let delivered = receive(observation).await;
+        assert_eq!(delivered.event.data, ordinary);
+        assert!(delivered.event.capture.is_none());
+        assert!(delivered.payload_references().unwrap().is_empty());
+    }
+    let mut captured = XrayEvent::new(
+        "acceptance",
+        "retained",
+        context.correlation().clone(),
+        json!({"payload": reference, "ordinary": ordinary}),
+        true,
+    );
+    captured.capture = Some(XrayCaptureAttachments::new(vec![
+        XrayCaptureAttachment::PayloadRef {
+            pointer: "/payload".into(),
+        },
+    ]));
+    context.emit_event(captured);
+    let delivered = receive(&mut deep).await;
+    assert_eq!(delivered.payload_references().unwrap(), vec![reference]);
+    shallow.finalize().unwrap();
+    assert_eq!(
+        receive(&mut shallow).await.event.name,
+        "finalized",
+        "sensitive attachment was not delivered to shallow observation"
+    );
+    deep.finalize().unwrap();
+    assert_eq!(receive(&mut deep).await.event.name, "finalized");
+}
+
+#[cfg(unix)]
+fn emit_recording_payload_fixture(hub: &XrayHub) -> bcode_xray_models::XrayPayloadRef {
+    use bcode_xray_models::{XrayCaptureAttachment, XrayCaptureAttachments};
+
+    let context = hub.context(correlation("record", Some("turn")));
+    let payload = context
+        .capture_payload("text/plain", b"retained fixture")
+        .expect("capture")
+        .expect("active deep observation");
+    context.emit_with_capture(
+        "acceptance",
+        "payload_captured",
+        json!({
+            "payload": payload,
+            "ordinary": {"payload_id": "not-a-reference", "sha256": "ordinary", "byte_len": 17},
+        }),
+        true,
+        Some(XrayCaptureAttachments::new(vec![
+            XrayCaptureAttachment::PayloadRef {
+                pointer: "/payload".into(),
+            },
+        ])),
+    );
+    payload
+}
+
+#[cfg(unix)]
+fn register_declared_payloads(
+    recorder: &mut impl bcode_xray::recording::RecordingSink,
+    references: &[bcode_xray_models::XrayPayloadRef],
+) {
+    for reference in references {
+        recorder
+            .expect_payload(reference)
+            .expect("register declared reference");
+    }
+}
+
 #[cfg(unix)]
 #[tokio::test]
 async fn recorder_consumes_actual_engine_payloads_and_only_certifies_local_boundary() {
@@ -333,17 +422,14 @@ async fn recorder_consumes_actual_engine_payloads_and_only_certifies_local_bound
     .expect("explicit bundle");
     let ready = receive(&mut observer).await;
     recorder.append(&ready).expect("record ready");
-    let payload = hub
-        .capture_payload(
-            &correlation("record", Some("turn")),
-            "text/plain",
-            b"retained fixture",
-        )
-        .expect("capture")
-        .expect("active deep observation");
+    let payload = emit_recording_payload_fixture(&hub);
+    let captured = receive(&mut observer).await;
+    let references = captured.payload_references().expect("explicit locations");
+    assert_eq!(references, vec![payload.clone()]);
     recorder
-        .expect_payload(&payload)
-        .expect("register exact reference");
+        .append(&captured)
+        .expect("record typed payload event");
+    register_declared_payloads(&mut recorder, &references);
     let range = hub
         .read_payload(&XrayReadPayloadRequest {
             schema_version: 1,
@@ -375,8 +461,9 @@ async fn recorder_consumes_actual_engine_payloads_and_only_certifies_local_bound
     .expect("new explicit sink");
     recorder.append(&ready).expect("retained real engine ready");
     recorder
-        .expect_payload(&payload)
-        .expect("payload reference");
+        .append(&captured)
+        .expect("retained typed payload envelope");
+    register_declared_payloads(&mut recorder, &references);
     recorder
         .store_payload(&payload, &range.bytes)
         .expect("payload");

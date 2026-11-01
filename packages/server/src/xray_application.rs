@@ -159,7 +159,28 @@ impl XrayApplication {
         grant: &XrayAccessGrant,
         request: XrayObserveRequest,
     ) -> Result<XrayObservation, XrayApplicationError> {
+        self.observe_with_deadline(grant, request, None).await
+    }
+
+    /// Authorize and admit observation with an absolute capture-authorization deadline.
+    ///
+    /// The deadline is passed into the engine after the same scope, health and storage
+    /// checks as [`Self::observe`]. It fences producers independently of async teardown;
+    /// it neither extends authority nor implies successful observation finalization.
+    /// `None` preserves the ordinary unlimited observation policy.
+    ///
+    /// # Errors
+    /// Returns ordinary admission failures, including expired engine authorization.
+    pub async fn observe_with_deadline(
+        &self,
+        grant: &XrayAccessGrant,
+        request: XrayObserveRequest,
+        expires_at: Option<std::time::Instant>,
+    ) -> Result<XrayObservation, XrayApplicationError> {
         let session_id = grant.authorize(&request)?;
+        if expires_at.is_some_and(|deadline| std::time::Instant::now() >= deadline) {
+            return Err(XrayApplicationError::NotAdmitted);
+        }
         #[cfg(any(target_os = "macos", target_os = "linux"))]
         let mut admission = crate::storage_read_admission::RegisteredStorageRead::for_session(
             &self.state,
@@ -183,9 +204,19 @@ impl XrayApplication {
         if !available {
             return Err(XrayApplicationError::Unavailable);
         }
-        self.hub
-            .observe(request)
-            .map_err(|_| XrayApplicationError::NotAdmitted)
+        if expires_at.is_some_and(|deadline| std::time::Instant::now() >= deadline) {
+            return Err(XrayApplicationError::NotAdmitted);
+        }
+        let observation = self
+            .hub
+            .observe_with_deadline(request, expires_at)
+            .map_err(|_| XrayApplicationError::NotAdmitted)?;
+        // The engine can return an inert observation for an expired deadline. That
+        // is safe for retention but is not successful application admission/readiness.
+        if expires_at.is_some_and(|deadline| std::time::Instant::now() >= deadline) {
+            return Err(XrayApplicationError::NotAdmitted);
+        }
+        Ok(observation)
     }
 }
 

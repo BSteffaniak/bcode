@@ -9704,6 +9704,111 @@ pub struct ClientConnection {
 }
 
 impl ClientConnection {
+    /// Admit a fresh workflow with explicitly authorized capture before scheduling.
+    ///
+    /// # Errors
+    /// Rejects denied execution/observation scope and unavailable admission. Transport
+    /// failure is ambiguous: do not blindly retry an effectful admission.
+    pub async fn start_workflow_run_observed(
+        &mut self,
+        start: bcode_workflow::WorkflowRunStartRequest,
+        observation: bcode_xray_models::execution_watch::ExecutionWatchStartOptions,
+    ) -> Result<
+        (
+            bcode_workflow::WorkflowRunStartResponse,
+            bcode_xray_models::execution_watch::ExecutionWatchReady,
+        ),
+        ClientError,
+    > {
+        match self
+            .send_request(Request::StartWorkflowRunObserved { start, observation })
+            .await?
+        {
+            ResponsePayload::WorkflowRunStartedObserved { started, ready } => Ok((started, ready)),
+            _ => Err(ClientError::UnexpectedResponse),
+        }
+    }
+
+    /// Open explicitly authorized workflow execution diagnostics.
+    /// # Errors
+    /// Rejects denied scope, unavailable capture, and inconsistent responses.
+    pub async fn open_execution_watch(
+        &mut self,
+        request: bcode_xray_models::execution_watch::OpenExecutionWatchRequest,
+    ) -> Result<bcode_xray_models::execution_watch::ExecutionWatchReady, ClientError> {
+        match self
+            .send_request(Request::OpenXrayExecutionWatch { request })
+            .await?
+        {
+            ResponsePayload::OpenXrayExecutionWatch { opened } => Ok(opened),
+            _ => Err(ClientError::UnexpectedResponse),
+        }
+    }
+
+    /// Consume a bounded live diagnostic page, not a replay cursor.
+    /// # Errors
+    /// Rejects denied scope, stale cursors, and unavailable capture.
+    pub async fn read_execution_watch(
+        &mut self,
+        request: bcode_xray_models::execution_watch::ReadExecutionWatchRequest,
+    ) -> Result<bcode_xray_models::execution_watch::ExecutionWatchPage, ClientError> {
+        match self
+            .send_request(Request::ReadXrayExecutionWatch { request })
+            .await?
+        {
+            ResponsePayload::ReadXrayExecutionWatch { page } => Ok(page),
+            _ => Err(ClientError::UnexpectedResponse),
+        }
+    }
+
+    /// Establish diagnostic cutoffs without changing execution.
+    /// # Errors
+    /// Rejects denied scope, invalid bounds, and unavailable capture.
+    pub async fn finalize_execution_watch(
+        &mut self,
+        request: bcode_xray_models::execution_watch::FinalizeExecutionWatchRequest,
+    ) -> Result<bcode_xray_models::execution_watch::ExecutionWatchFinalEvidence, ClientError> {
+        match self
+            .send_request(Request::FinalizeXrayExecutionWatch { request })
+            .await?
+        {
+            ResponsePayload::FinalizeXrayExecutionWatch { evidence } => Ok(evidence),
+            _ => Err(ClientError::UnexpectedResponse),
+        }
+    }
+
+    /// Export an authorized retained diagnostic payload range.
+    /// # Errors
+    /// Rejects denied scope, invalid references, and unavailable bytes.
+    pub async fn export_execution_watch_payload(
+        &mut self,
+        request: bcode_xray_models::execution_watch::ExportExecutionWatchPayloadRequest,
+    ) -> Result<bcode_xray_models::XrayPayloadRange, ClientError> {
+        match self
+            .send_request(Request::ExportXrayExecutionWatch { request })
+            .await?
+        {
+            ResponsePayload::ExportXrayExecutionWatch { chunk } => Ok(chunk),
+            _ => Err(ClientError::UnexpectedResponse),
+        }
+    }
+
+    /// Revoke diagnostics and release retention without cancelling execution.
+    /// # Errors
+    /// Rejects unknown or foreign watches and unavailable capture.
+    pub async fn revoke_execution_watch(
+        &mut self,
+        request: bcode_xray_models::execution_watch::RevokeExecutionWatchRequest,
+    ) -> Result<bcode_xray_models::execution_watch::ExecutionWatchRevoked, ClientError> {
+        match self
+            .send_request(Request::RevokeXrayExecutionWatch { request })
+            .await?
+        {
+            ResponsePayload::RevokeXrayExecutionWatch { revoked } => Ok(revoked),
+            _ => Err(ClientError::UnexpectedResponse),
+        }
+    }
+
     /// Open a session-scoped local diagnostic capability on this authenticated connection.
     /// Retain this connection for revocation; a fresh connection has a different client identity.
     ///
@@ -9714,10 +9819,25 @@ impl ClientConnection {
         session_id: SessionId,
         deep_capture: bool,
     ) -> Result<bcode_ipc::XrayEndpointInfo, ClientError> {
+        self.open_xray_endpoint_with_origin(session_id, deep_capture, None)
+            .await
+    }
+
+    /// Open a capability with an explicit, expiring browser Origin grant.
+    ///
+    /// # Errors
+    /// Rejects invalid grants, authorization failures, and inconsistent responses.
+    pub async fn open_xray_endpoint_with_origin(
+        &mut self,
+        session_id: SessionId,
+        deep_capture: bool,
+        origin_grant: Option<bcode_ipc::XrayOriginGrantRequest>,
+    ) -> Result<bcode_ipc::XrayEndpointInfo, ClientError> {
         match self
             .send_request(Request::OpenXrayEndpoint {
                 session_id,
                 deep_capture,
+                origin_grant,
             })
             .await?
         {

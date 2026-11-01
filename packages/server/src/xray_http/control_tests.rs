@@ -2,6 +2,89 @@ use super::*;
 use axum::body::Body;
 use bcode_session_models::SessionId;
 
+#[tokio::test(start_paused = true)]
+async fn capability_expiry_drops_deep_capture_and_payloads_even_during_finalized_retention() {
+    use futures::StreamExt;
+    for finalize_first in [false, true] {
+        let hub = bcode_xray::XrayHub::default();
+        let session = SessionId::new();
+        let grant = XrayAccessGrant::authorized(BTreeSet::from([session]), true).unwrap();
+        let observation = hub
+            .observe(XrayObserveRequest {
+                schema_version: 1,
+                session_id: session.to_string(),
+                deep_capture: true,
+            })
+            .unwrap();
+        let id = observation.id().to_owned();
+        let reference = hub
+            .capture_payload(
+                &bcode_xray_models::XrayCorrelation {
+                    session_id: session.to_string(),
+                    ..Default::default()
+                },
+                "text/plain",
+                b"sensitive fixture",
+            )
+            .unwrap()
+            .unwrap();
+        let registry = Arc::new(control::Registry::default());
+        let registration = registry.register(&id, session.to_string(), 1).unwrap();
+        let (_shutdown, stopped) = watch::channel(false);
+        let deadline = Instant::now() + Duration::from_secs(2);
+        let response = registered_observation_response(
+            observation,
+            Arc::new(Semaphore::new(1)).try_acquire_owned().unwrap(),
+            stopped,
+            None,
+            Some(deadline),
+            registration,
+        );
+        let mut body = response.into_body().into_data_stream();
+        let ready = body.next().await.unwrap().unwrap();
+        assert!(String::from_utf8_lossy(&ready).contains("\"name\":\"ready\""));
+        let read = XrayReadPayloadRequest {
+            schema_version: 1,
+            observation_id: id.clone(),
+            session_id: session.to_string(),
+            payload_id: reference.payload_id,
+            offset: 0,
+            length: 1024,
+        };
+        assert!(hub.read_payload(&read).is_ok());
+        if finalize_first {
+            assert_eq!(
+                control::finalize_control(registry.authorized(&id, &grant).unwrap())
+                    .await
+                    .status(),
+                StatusCode::OK
+            );
+            while let Some(bytes) = body.next().await {
+                assert!(bytes.is_ok());
+            }
+            assert_eq!(registry.active_count(), 1);
+            assert!(hub.read_payload(&read).is_ok());
+        } else {
+            assert!(hub.deep_capture_active(&session.to_string()));
+        }
+        tokio::time::advance(Duration::from_secs(2)).await;
+        timeout(Duration::from_secs(1), async {
+            while registry.active_count() != 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        assert!(!hub.deep_capture_active(&session.to_string()));
+        assert!(!hub.capture_active(&session.to_string()));
+        assert!(hub.read_payload(&read).is_err());
+        assert!(registry.authorized(&id, &grant).is_err());
+        if !finalize_first {
+            assert!(body.next().await.is_none());
+        }
+    }
+}
+
 #[tokio::test]
 async fn concurrent_finalize_is_one_cutoff_and_payloads_survive_until_stream_drain() {
     let hub = bcode_xray::XrayHub::default();
@@ -34,6 +117,7 @@ async fn concurrent_finalize_is_one_cutoff_and_payloads_survive_until_stream_dra
         observation,
         calls.try_acquire_owned().unwrap(),
         stopped,
+        None,
         None,
         registration,
     );
@@ -117,6 +201,7 @@ async fn default_subscription_stays_hot_idle_beyond_previous_lifetime_and_across
         Arc::new(Semaphore::new(1)).try_acquire_owned().unwrap(),
         stopped,
         XrayHttpConfig::default().max_observation_duration,
+        None,
         registration,
     );
     let mut body = response.into_body().into_data_stream();
@@ -138,6 +223,7 @@ async fn default_subscription_stays_hot_idle_beyond_previous_lifetime_and_across
             },
             data: serde_json::json!({}),
             sensitive: false,
+            capture: None,
         });
         timeout(Duration::from_secs(1), async {
             loop {

@@ -1,0 +1,31 @@
+[plugins]
+default = "none"
+enabled = [
+    "bcode.fake-provider",
+    "bcode.filesystem",
+    "bcode.default-agents",
+    "bcode.loop",
+    "bcode.workflow",
+    "bcode.eval",
+]
+[model]
+model_id           = "fake-echo"
+provider_plugin_id = "bcode.fake-provider"
+[model.settings]
+fake_structured_output_json = "loop_until:1"
+[model.prompt_cache]
+mode = "off"
+[observability]
+persist_model_requests = false
+persist_tool_io        = false
+[skills]
+include_user_skills = false
+[auth.profiles.judgement-fixture]
+backend         = "aws"
+owner_plugin_id = "bcode.fake-provider"
+provider_id     = "fake"
+scheme          = "api_key"
+[auth.profiles.judgement-fixture.map.api_key]
+env = "FAKE_JUDGEMENT_KEY"
+[auth.profiles.judgement-fixture.settings]
+"env.FAKE_JUDGEMENT_KEY" = "test-only"

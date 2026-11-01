@@ -173,9 +173,11 @@ impl ProviderDiagnostics {
         if !capture.deep_capture_active() {
             return;
         }
-        match build() {
-            Ok(data) => capture.emit("provider", name, data, true),
-            Err(()) => capture.emit(
+        if let Ok(data) = build() {
+            capture.emit("provider", name, data, true);
+        } else {
+            let _ = capture.report_external_loss(1);
+            capture.emit(
                 "provider",
                 "payload_omitted",
                 json!({
@@ -185,7 +187,7 @@ impl ProviderDiagnostics {
                     "complete": false,
                 }),
                 false,
-            ),
+            );
         }
     }
 }
@@ -226,6 +228,72 @@ mod budget_tests {
         const FORMAT: &'static str = "test.body";
         const SCHEMA_VERSION: u16 = 1;
         const STAGE: ProviderDiagnosticStage = ProviderDiagnosticStage::RequestAdapted;
+    }
+
+    #[test]
+    fn sensitive_provider_json_reference_lookalikes_remain_opaque() {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(async {
+                let hub = bcode_xray::XrayHub::default();
+                let capture = hub.context(bcode_xray_models::XrayCorrelation {
+                    session_id: "session".into(),
+                    ..Default::default()
+                });
+                let mut observation = hub
+                    .observe(bcode_xray_models::XrayObserveRequest {
+                        schema_version: 1,
+                        session_id: "session".into(),
+                        deep_capture: true,
+                    })
+                    .unwrap();
+                observation.recv().await.unwrap();
+                let ordinary = json!({
+                    "payload_id": "provider-owned-content", "byte_len": 1, "sha256": "ordinary",
+                    "nested": {"schema_version": 999, "payload_id": "not-a-capture"},
+                });
+                ProviderDiagnostics::new(Some(capture))
+                    .sensitive("fixture", || Ok(ordinary.clone()));
+                let envelope = observation.recv().await.unwrap();
+                assert_eq!(envelope.event.data, ordinary);
+                assert!(envelope.event.capture.is_none());
+                assert!(envelope.payload_references().unwrap().is_empty());
+            });
+    }
+
+    #[tokio::test]
+    async fn encoding_omission_reaches_terminal_loss_without_sensitive_content() {
+        let hub = bcode_xray::XrayHub::default();
+        let mut observation = hub
+            .observe(bcode_xray::XrayObserveRequest {
+                schema_version: bcode_xray::XRAY_SCHEMA_VERSION,
+                session_id: "omission".into(),
+                deep_capture: true,
+            })
+            .unwrap();
+        let diagnostics =
+            ProviderDiagnostics::new(Some(hub.context(bcode_xray::XrayCorrelation {
+                session_id: "omission".into(),
+                ..Default::default()
+            })));
+        diagnostics.sensitive("fixture", || Err(()));
+        observation.finalize().unwrap();
+        let mut omitted = false;
+        let mut loss = None;
+        while let Some(envelope) = observation.recv().await {
+            if envelope.event.name == "payload_omitted" {
+                assert!(!envelope.event.sensitive);
+                assert_eq!(envelope.event.data["complete"], false);
+                omitted = true;
+            }
+            if envelope.event.name == "finalized" {
+                loss = envelope.event.data["hub_contention_drops"].as_u64();
+            }
+        }
+        assert!(omitted);
+        assert_eq!(loss, Some(1));
     }
 
     #[test]

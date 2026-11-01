@@ -30,6 +30,24 @@ impl Write for BoundedJson {
 fn redact(value: &mut Value) {
     match value {
         Value::Object(fields) => {
+            // Error/warning/retry strings can contain transport credentials. Lifecycle
+            // facts are emitted separately; never retain their unrestricted JSON bodies.
+            if matches!(
+                fields.get("type").and_then(Value::as_str),
+                Some("error" | "warning" | "retry_scheduled")
+            ) {
+                fields.retain(|key, _| key == "type");
+                return;
+            }
+            // Normalized provider extensions and metadata carry replay/optimization
+            // state, not diagnostic content. Preserve the discriminator, not the value.
+            if matches!(
+                fields.get("type").and_then(Value::as_str),
+                Some("provider_extension" | "provider_metadata")
+            ) && let Some(value) = fields.get_mut("value")
+            {
+                *value = Value::String("[REDACTED]".into());
+            }
             for (key, value) in fields {
                 let key = key.to_ascii_lowercase().replace(['-', '_'], "");
                 if matches!(
@@ -61,6 +79,16 @@ fn redact(value: &mut Value) {
                         | "privatekey"
                         | "xapikey"
                         | "xauthtoken"
+                        | "signature"
+                        | "thoughtsignature"
+                        | "encryptedcontent"
+                        | "redactedcontent"
+                        | "providerprivatedata"
+                        | "provideropaque"
+                        | "providermetadata"
+                        | "diagnosticcontext"
+                        | "error"
+                        | "providermessage"
                 ) {
                     *value = Value::String("[REDACTED]".into());
                 } else {
@@ -73,6 +101,25 @@ fn redact(value: &mut Value) {
     }
 }
 
+/// Observe the judgement result without exposing provider errors or configuration.
+pub fn outcome<T>(result: &Result<T, &'static str>) {
+    let Some(context) = CaptureContext::current() else {
+        return;
+    };
+    let outcome = match result {
+        Ok(_) => "completed",
+        Err("judgement invocation cancelled") => "cancelled",
+        Err(_) => "failed",
+    };
+    context.emit_with_capture(
+        "provider.jev",
+        "invocation_outcome",
+        json!({"outcome":outcome}),
+        false,
+        Some(bcode_xray::XrayCaptureAttachments::new(Vec::new())),
+    );
+}
+
 /// Capture a bounded JSON projection only while deep observation is active.
 pub fn record(name: &str, payload: &impl Serialize) {
     let Some(context) = CaptureContext::current().filter(CaptureContext::deep_capture_active)
@@ -81,7 +128,9 @@ pub fn record(name: &str, payload: &impl Serialize) {
     };
     let mut writer = BoundedJson(Vec::new());
     if serde_json::to_writer(&mut writer, payload).is_err() {
-        context.emit("provider.jev", "payload_omitted", json!({"capture_format": CAPTURE_FORMAT, "capture_version": CAPTURE_VERSION, "record": name, "reason": "serialization_or_size_limit", "limit_bytes": MAX_PAYLOAD_BYTES}), false);
+        let _ = context.report_external_loss(1);
+        context.emit_with_capture("provider.jev", "payload_omitted", json!({"capture_format": CAPTURE_FORMAT, "capture_version": CAPTURE_VERSION, "record": name, "reason": "serialization_or_size_limit", "limit_bytes": MAX_PAYLOAD_BYTES}), false,
+Some(bcode_xray::XrayCaptureAttachments::new(Vec::new())));
         return;
     }
     emit_json(&context, name, &writer.0);
@@ -89,40 +138,50 @@ pub fn record(name: &str, payload: &impl Serialize) {
 
 fn emit_json(context: &CaptureContext, name: &str, bytes: &[u8]) {
     let Ok(mut value) = serde_json::from_slice::<Value>(bytes) else {
-        context.emit("provider.jev", "payload_omitted", json!({"capture_format": CAPTURE_FORMAT, "capture_version": CAPTURE_VERSION, "record": name, "reason": "invalid_or_excessively_nested_json"}), false);
+        let _ = context.report_external_loss(1);
+        context.emit_with_capture("provider.jev", "payload_omitted", json!({"capture_format": CAPTURE_FORMAT, "capture_version": CAPTURE_VERSION, "record": name, "reason": "invalid_or_excessively_nested_json"}), false,
+Some(bcode_xray::XrayCaptureAttachments::new(Vec::new())));
         return;
     };
     redact(&mut value);
     // Serialize again only after redaction. Never retain unsanitized input bytes.
     let mut sanitized = BoundedJson(Vec::new());
     if serde_json::to_writer(&mut sanitized, &value).is_err() {
-        context.emit("provider.jev", "payload_omitted", json!({"capture_format": CAPTURE_FORMAT, "capture_version": CAPTURE_VERSION, "record": name, "reason": "sanitized_size_limit", "limit_bytes": MAX_PAYLOAD_BYTES}), false);
+        let _ = context.report_external_loss(1);
+        context.emit_with_capture("provider.jev", "payload_omitted", json!({"capture_format": CAPTURE_FORMAT, "capture_version": CAPTURE_VERSION, "record": name, "reason": "sanitized_size_limit", "limit_bytes": MAX_PAYLOAD_BYTES}), false,
+Some(bcode_xray::XrayCaptureAttachments::new(Vec::new())));
         return;
     }
     if sanitized.0.len() <= INLINE_BYTES {
-        context.emit(
+        context.emit_with_capture(
             "provider.jev",
             name,
             json!({
                 "capture_format": CAPTURE_FORMAT, "capture_version": CAPTURE_VERSION,
-                "representation": "redacted_json", "redaction": "structural_credentials_v1",
+                "representation": "redacted_json", "redaction": "structural_credentials_and_protected_metadata_v2", "wire_equivalent": false,
                 "value": value
             }),
             true,
-        );
+Some(bcode_xray::XrayCaptureAttachments::new(Vec::new())));
         return;
     }
     match context.capture_payload("application/json", &sanitized.0) {
-        Ok(Some(reference)) => context.emit("provider.jev", name, json!({
+        Ok(Some(reference)) => context.emit_with_capture("provider.jev", name, json!({
             "capture_format": CAPTURE_FORMAT, "capture_version": CAPTURE_VERSION,
             "representation": "redacted_json_payload_ref", "payload_ref": reference,
-            "redaction": "structural_credentials_v1"
-        }), true),
-        Ok(None) => {}, // Observation ended during capture; never retain after detach.
-        Err(_) => context.emit("provider.jev", "payload_omitted", json!({
+            "redaction": "structural_credentials_and_protected_metadata_v2", "wire_equivalent": false
+        }), true, Some(bcode_xray::XrayCaptureAttachments::new(vec![
+            bcode_xray::XrayCaptureAttachment::PayloadRef { pointer: "/payload_ref".into() },
+        ]))),
+        Ok(None) if !context.deep_capture_active() => {},
+        Ok(None) | Err(_) => {
+            let _ = context.report_external_loss(1);
+            context.emit_with_capture("provider.jev", "payload_omitted", json!({
             "capture_format": CAPTURE_FORMAT, "capture_version": CAPTURE_VERSION,
             "record": name, "reason": "payload_retention_unavailable", "byte_len": sanitized.0.len()
-        }), false),
+        }), false,
+Some(bcode_xray::XrayCaptureAttachments::new(Vec::new())));
+        }
     }
 }
 
@@ -133,7 +192,9 @@ pub fn bytes(name: &str, bytes: &[u8]) {
         return;
     };
     if bytes.len() > MAX_PAYLOAD_BYTES {
-        context.emit("provider.jev", "payload_omitted", json!({"capture_format": CAPTURE_FORMAT, "capture_version": CAPTURE_VERSION, "record": name, "reason": "size_limit", "byte_len": bytes.len(), "limit_bytes": MAX_PAYLOAD_BYTES}), false);
+        let _ = context.report_external_loss(1);
+        context.emit_with_capture("provider.jev", "payload_omitted", json!({"capture_format": CAPTURE_FORMAT, "capture_version": CAPTURE_VERSION, "record": name, "reason": "size_limit", "byte_len": bytes.len(), "limit_bytes": MAX_PAYLOAD_BYTES}), false,
+Some(bcode_xray::XrayCaptureAttachments::new(Vec::new())));
         return;
     }
     emit_json(&context, name, bytes);
@@ -157,7 +218,201 @@ mod tests {
     use super::*;
 
     #[test]
+    fn capture_declarations_distinguish_inline_control_and_retained_payloads() {
+        use std::future::Future as _;
+        use std::task::{Context, Waker};
+
+        // All observation reads are ready after finalization; no runtime dependency.
+        let mut fixture = std::pin::pin!(assert_capture_declarations());
+        assert!(
+            fixture
+                .as_mut()
+                .poll(&mut Context::from_waker(Waker::noop()))
+                .is_ready()
+        );
+    }
+
+    async fn assert_capture_declarations() {
+        use bcode_xray::{XRAY_SCHEMA_VERSION, XrayCorrelation, XrayHub, XrayObserveRequest};
+        let hub = XrayHub::default();
+        let mut observation = hub
+            .observe(XrayObserveRequest {
+                schema_version: XRAY_SCHEMA_VERSION,
+                session_id: "typed-fixture".into(),
+                deep_capture: true,
+            })
+            .unwrap();
+        let capture = hub.context(XrayCorrelation {
+            session_id: "typed-fixture".into(),
+            ..Default::default()
+        });
+        capture.scope_sync(|| {
+            record("fixture_inline", &json!({"payload_id":"ordinary-user-data", "byte_len":7, "sha256":"not-a-reference"}));
+            record("fixture_large", &json!({"text":"界🙂".repeat(8192), "api_key":"private-fixture-key"}));
+            outcome::<()>(&Err("judgement invocation cancelled"));
+            emit_json(&capture, "fixture_invalid", b"{");
+        });
+        observation.finalize().unwrap();
+        let mut names = Vec::new();
+        while let Some(envelope) = observation.recv().await {
+            if !envelope.event.domain.starts_with("provider.") {
+                continue;
+            }
+            let declaration = envelope
+                .event
+                .capture
+                .as_ref()
+                .expect("producer must declare capture semantics");
+            assert_eq!(
+                declaration.schema_version,
+                bcode_xray::XRAY_CAPTURE_SCHEMA_VERSION
+            );
+            let references = envelope.payload_references().unwrap();
+            assert!(
+                !envelope
+                    .event
+                    .data
+                    .to_string()
+                    .contains("private-fixture-key")
+            );
+            if envelope.event.name == "fixture_large" {
+                assert!(envelope.event.sensitive);
+                assert_eq!(references.len(), 1);
+                let reference = &references[0];
+                assert_eq!(reference.session_id, "typed-fixture");
+                assert_eq!(reference.content_type, "application/json");
+                assert!(reference.byte_len > INLINE_BYTES as u64);
+                let range = hub
+                    .read_payload(&bcode_xray::XrayReadPayloadRequest {
+                        schema_version: XRAY_SCHEMA_VERSION,
+                        observation_id: observation.id().to_owned(),
+                        session_id: "typed-fixture".into(),
+                        payload_id: reference.payload_id.clone(),
+                        offset: 0,
+                        length: 4096,
+                    })
+                    .unwrap();
+                assert_eq!(range.bytes.len(), 4096);
+            } else {
+                assert!(declaration.attachments.is_empty());
+                assert!(references.is_empty());
+                if envelope.event.name == "fixture_inline" {
+                    assert!(envelope.event.sensitive);
+                    assert_eq!(
+                        envelope.event.data["value"]["payload_id"],
+                        "ordinary-user-data"
+                    );
+                } else {
+                    assert!(!envelope.event.sensitive);
+                }
+            }
+            names.push(envelope.event.name);
+        }
+        assert_eq!(
+            names,
+            [
+                "fixture_inline",
+                "fixture_large",
+                "invocation_outcome",
+                "payload_omitted"
+            ]
+        );
+    }
+
+    #[test]
+    fn judgement_body_and_answer_usage_are_captured_without_protected_fields() {
+        use bcode_xray::{XRAY_SCHEMA_VERSION, XrayCorrelation, XrayHub, XrayObserveRequest};
+        tokio::runtime::Builder::new_current_thread().build().unwrap().block_on(async {
+            let hub = XrayHub::default();
+            let mut observation = hub.observe(XrayObserveRequest {
+                schema_version: XRAY_SCHEMA_VERSION,
+                session_id: "fixture".into(),
+                deep_capture: true,
+            }).unwrap();
+            let capture = hub.context(XrayCorrelation {
+                session_id: "fixture".into(),
+                request_id: Some("judgement-request".into()),
+                ..Default::default()
+            });
+            capture.scope(async {
+                record("adapted_request", &json!({
+                    "state":"fixture state", "model":"fixture model",
+                    "questions":{"q":{"type":"noul","instructions":"fixture question"}}
+                }));
+                bytes("received_record", br#"{"model":"fixture model","answers":{"q":{"type":"noul","noul":0.5}},"usage":{"input_tokens":7,"output_tokens":3},"access_token":"protected-fixture"}"#);
+                bytes("received_record", b"malformed protected-fixture");
+            }).await;
+            observation.finalize().unwrap();
+            assert_eq!(observation.recv().await.unwrap().event.name, "ready");
+            let request = observation.recv().await.unwrap();
+            assert_eq!(request.event.name, "adapted_request");
+            assert_eq!(request.event.data["value"]["state"], "fixture state");
+            let response = observation.recv().await.unwrap();
+            assert_eq!(response.event.correlation.request_id.as_deref(), Some("judgement-request"));
+            assert_eq!(response.event.data["value"]["answers"]["q"]["noul"], 0.5);
+            assert_eq!(response.event.data["value"]["usage"]["output_tokens"], 3);
+            assert!(!response.event.data.to_string().contains("protected-fixture"));
+            let omission = observation.recv().await.unwrap();
+            assert_eq!(omission.event.name, "payload_omitted");
+            assert!(!omission.event.data.to_string().contains("protected-fixture"));
+            assert_eq!(observation.recv().await.unwrap().event.name, "finalized");
+            assert!(observation.recv().await.is_none());
+        });
+    }
+
+    #[test]
+    fn invocation_outcomes_are_secret_safe_and_available_without_deep_capture() {
+        use bcode_xray::{XRAY_SCHEMA_VERSION, XrayCorrelation, XrayHub, XrayObserveRequest};
+        use std::future::Future as _;
+        use std::task::{Context, Waker};
+        let mut future = std::pin::pin!(async {
+            let hub = XrayHub::default();
+            let mut observation = hub
+                .observe(XrayObserveRequest {
+                    schema_version: XRAY_SCHEMA_VERSION,
+                    session_id: "fixture".into(),
+                    deep_capture: false,
+                })
+                .unwrap();
+            let capture = hub.context(XrayCorrelation {
+                session_id: "fixture".into(),
+                ..Default::default()
+            });
+            capture
+                .scope(async {
+                    outcome(&Ok::<_, &'static str>(()));
+                    outcome::<()>(&Err("judgement invocation cancelled"));
+                    outcome::<()>(&Err("private-error"));
+                })
+                .await;
+            observation.finalize().unwrap();
+            assert_eq!(observation.recv().await.unwrap().event.name, "ready");
+            for expected in ["completed", "cancelled", "failed"] {
+                let envelope = observation.recv().await.unwrap();
+                assert_eq!(envelope.event.data["outcome"], expected);
+                assert!(!envelope.event.sensitive);
+                assert!(
+                    !serde_json::to_string(&envelope)
+                        .unwrap()
+                        .contains("private-error")
+                );
+            }
+            assert_eq!(observation.recv().await.unwrap().event.name, "finalized");
+            assert!(observation.recv().await.is_none());
+        });
+        assert!(
+            future
+                .as_mut()
+                .poll(&mut Context::from_waker(Waker::noop()))
+                .is_ready()
+        );
+    }
+
+    #[test]
     fn no_observation_does_not_even_serialize_payload() {
+        use bcode_xray::{XRAY_SCHEMA_VERSION, XrayCorrelation, XrayHub, XrayObserveRequest};
+        use std::future::Future as _;
+        use std::task::{Context, Waker};
         struct MustNotSerialize;
         impl Serialize for MustNotSerialize {
             fn serialize<S: serde::Serializer>(&self, _: S) -> Result<S::Ok, S::Error> {
@@ -165,6 +420,36 @@ mod tests {
             }
         }
         record("disabled_fixture", &MustNotSerialize);
+        let hub = XrayHub::default();
+        let _shallow = hub
+            .observe(XrayObserveRequest {
+                schema_version: XRAY_SCHEMA_VERSION,
+                session_id: "fixture".into(),
+                deep_capture: false,
+            })
+            .unwrap();
+        let deep = hub
+            .observe(XrayObserveRequest {
+                schema_version: XRAY_SCHEMA_VERSION,
+                session_id: "foreign".into(),
+                deep_capture: true,
+            })
+            .unwrap();
+        let capture = hub.context(XrayCorrelation {
+            session_id: "fixture".into(),
+            ..Default::default()
+        });
+        let mut future = std::pin::pin!(capture.scope(async {
+            record("shallow_fixture", &MustNotSerialize);
+            drop(deep);
+            record("detached_fixture", &MustNotSerialize);
+        }));
+        assert!(
+            future
+                .as_mut()
+                .poll(&mut Context::from_waker(Waker::noop()))
+                .is_ready()
+        );
     }
 
     #[test]
@@ -176,6 +461,42 @@ mod tests {
         assert_eq!(value["nested"][0]["refresh-token"], "[REDACTED]");
         assert_eq!(value["nested"][0]["text"], "sensitive user content");
         assert_eq!(value["usage"]["input_tokens"], 7);
+    }
+
+    #[test]
+    fn protected_state_is_redacted_but_semantic_content_survives() {
+        let mut value = json!({
+            "items": [
+                {"type":"reasoning", "text":"reason", "signature":"private", "encrypted_content":"private"},
+                {"type":"provider_metadata", "key":"optimization", "value":"private"},
+                {"type":"provider_extension", "value":{"arbitrary":"private"}},
+                {"type":"tool_call", "value":{"answer":42}},
+                {"redactedContent":"private", "thought_signature":"private"}
+            ],
+            "usage":{"input_tokens":7}, "provider_metadata":{"arbitrary":"private"}
+        });
+        redact(&mut value);
+        assert!(!value.to_string().contains("private"));
+        assert_eq!(value["items"][0]["text"], "reason");
+        assert_eq!(value["items"][1]["type"], "provider_metadata");
+        assert_eq!(value["items"][3]["value"]["answer"], 42);
+        assert_eq!(value["usage"]["input_tokens"], 7);
+    }
+
+    #[test]
+    fn transport_error_bodies_are_not_diagnostic_content() {
+        let mut value = json!([
+            {"type":"error", "error":{"message":"private bearer", "category":"network"}},
+            {"type":"warning", "message":"private endpoint"},
+            {"type":"retry_scheduled", "reason":"private token"},
+            {"error":{"message":"private raw transport"}, "text":"user semantic text"},
+            {"type":"text_delta", "text":"user semantic text"}
+        ]);
+        redact(&mut value);
+        assert!(!value.to_string().contains("private"));
+        assert_eq!(value[0], json!({"type":"error"}));
+        assert_eq!(value[3]["text"], "user semantic text");
+        assert_eq!(value[4]["text"], "user semantic text");
     }
 
     #[test]

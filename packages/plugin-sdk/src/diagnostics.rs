@@ -4,6 +4,8 @@
 //! ABI. Old SDKs ignore negotiation and continue ordinary stream semantics. Unknown modes or
 //! versions disable diagnostics. Neither payload correlation nor activity hints authorize access.
 
+pub mod payload;
+
 #[cfg(test)]
 mod tests;
 
@@ -55,12 +57,18 @@ pub enum NativeDiagnosticMode {
 }
 
 /// Typed lease/control operations over the existing bridge callback ABI.
-#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum DiagnosticControlOperation {
     Acquire,
     State,
     Release,
+    /// Independently negotiated bounded payload extension.
+    Payload(payload::PayloadControl),
+    /// Newly lost bridge callbacks, not an execution outcome.
+    Loss {
+        count: u64,
+    },
 }
 
 /// A bounded control request. It cannot name a session, payload path, or another lease.
@@ -78,6 +86,9 @@ pub struct DiagnosticStatus {
     pub version: u16,
     pub active: bool,
     pub deep_active: bool,
+    /// Absent for old hosts and ordinary lease operations.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub payload: Option<payload::PayloadReply>,
 }
 
 /// One protected side-channel event. Never a `ServiceResponse` or ordinary service event.
@@ -93,6 +104,7 @@ struct CallbackSink {
     callback: ServiceBridgeCallback,
     user_data: usize,
     max_bytes: usize,
+    session_id: String,
     acquired: bool,
 }
 
@@ -104,7 +116,7 @@ impl CallbackSink {
         };
         let mut bytes = DIAGNOSTIC_CONTROL_PREFIX.to_vec();
         serde_json::to_writer(&mut bytes, &request).ok()?;
-        let mut output = [0_u8; 256];
+        let mut output = [0_u8; 4096];
         let mut length = 0;
         let status = (self.callback)(
             bytes.as_ptr(),
@@ -131,6 +143,17 @@ impl Drop for CallbackSink {
 }
 
 impl XrayCaptureSink for CallbackSink {
+    fn capture_payload(
+        &self,
+        media_type: &str,
+        bytes: &[u8],
+    ) -> Result<Option<bcode_xray::XrayPayloadRef>, bcode_xray::XrayError> {
+        payload::capture(self, media_type, bytes)
+    }
+    fn report_external_loss(&self, count: u64) -> bool {
+        self.control(DiagnosticControlOperation::Loss { count })
+            .is_some_and(|status| matches!(status.payload, Some(payload::PayloadReply::Progress)))
+    }
     fn capture_active(&self) -> bool {
         self.control(DiagnosticControlOperation::State)
             .is_some_and(|s| s.active)
@@ -155,6 +178,7 @@ impl XrayCaptureSink for CallbackSink {
             remaining: self.max_bytes,
         };
         if serde_json::to_writer(&mut encoded, &envelope).is_err() {
+            let _ = self.report_external_loss(1);
             // Do not emit partial JSON. Fixed omission is safe even when the original is sensitive.
             let omission = NativeDiagnosticEvent {
                 version: NATIVE_DIAGNOSTICS_VERSION,
@@ -164,6 +188,7 @@ impl XrayCaptureSink for CallbackSink {
                     correlation: envelope.event.correlation,
                     data: serde_json::json!({"reason":"encoding_failed_or_budget_exceeded","complete":false}),
                     sensitive: false,
+                    capture: None,
                 },
             };
             encoded = BudgetWriter {
@@ -242,6 +267,7 @@ pub(super) fn capture_context(
         callback: callback?,
         user_data: user_data as usize,
         max_bytes: negotiation.max_event_bytes,
+        session_id: negotiation.correlation.session_id.clone(),
         acquired: false,
     };
     sink.control(DiagnosticControlOperation::Acquire)?;

@@ -14,6 +14,28 @@ use std::time::Duration;
 mod workflow_capture;
 pub use workflow_capture::ModelCoverageFailure;
 
+/// A preselected capture root is request data, never authorization. It cannot
+/// silently change ordinary execution when capture was not explicitly requested.
+fn preselected_xray_root(
+    value: Option<&serde_json::Value>,
+    capture_requested: bool,
+) -> Result<Option<&str>, EvalError> {
+    let Some(value) = value else {
+        return Ok(None);
+    };
+    let Some(root) = value.as_str().filter(|root| {
+        !root.is_empty() && root.len() <= 256 && !root.chars().any(char::is_control)
+    }) else {
+        return Err(EvalError::Validation("xray_root_run_id must be a nonempty run identity of at most 256 bytes without control characters".into()));
+    };
+    if !capture_requested {
+        return Err(EvalError::Validation(
+            "xray_root_run_id requires explicit X-ray capture".into(),
+        ));
+    }
+    Ok(Some(root))
+}
+
 /// Optional evidence cannot invalidate an independently settled execution result.
 fn retain_attempt_evidence(
     output: &mut ExecutionOutput,
@@ -1163,6 +1185,15 @@ pub fn execute(
     rep_dir: &Path,
     workspace: &Path,
 ) -> Result<ExecutionOutput, EvalError> {
+    let preselected_root = preselected_xray_root(
+        variant.metadata.get("xray_root_run_id"),
+        super::xray_capture::WorkflowWatch::requested(),
+    )?;
+    if preselected_root.is_some() && (suite.run.repetitions != 1 || suite.cases.len() != 1) {
+        return Err(EvalError::Validation(
+            "an exact xray_root_run_id requires a single-case, single-repetition variant; configure a distinct exact root for each execution".into(),
+        ));
+    }
     let mut config: WorkflowEvalConfig =
         serde_json::from_value(variant.metadata.get("workflow").cloned().ok_or_else(|| {
             EvalError::Validation("workflow executor requires metadata.workflow".into())
@@ -1439,7 +1470,7 @@ pub fn execute(
     }
     // Observe the root session before admission. This is not subtree coverage:
     // children require their own pre-dispatch attachment contract.
-    let _xray = super::xray_capture::Capture::start_workflow(
+    let xray = super::xray_capture::SessionCapture::start_workflow(
         session_id,
         rep_dir,
         &config.binary,
@@ -1450,7 +1481,38 @@ pub fn execute(
             .map(|(key, value)| (key.clone(), value.clone())),
     );
     let start = Instant::now();
-    let admitted = invoke(&args, "admission", remaining()).inspect_err(|_| {
+    let admission = if super::xray_capture::WorkflowWatch::requested() {
+        // Goal owns prompt generation and compiled definition construction. Its
+        // prepare surface registers the exact definition without exposing a run
+        // to scheduling. Eval must not duplicate that plugin's authoring policy.
+        let mut prepare_args = args.clone();
+        prepare_args.extend(["--prepare".into(), "--json".into()]);
+        if let Some(root) = preselected_root {
+            prepare_args.extend(["--run-id".into(), root.into()]);
+        }
+        let prepared = invoke(&prepare_args, "admission-prepare", remaining())?;
+        let request: bcode_workflow::WorkflowRunStartRequest = serde_json::from_value(prepared)?;
+        if preselected_root.is_some_and(|root| request.run_id.as_deref() != Some(root)) {
+            return Err(EvalError::Validation(
+                "prepared run identity differs from explicit capture root".into(),
+            ));
+        }
+        super::xray_capture::WorkflowWatch::admit(
+            request,
+            rep_dir,
+            &config.binary,
+            variant
+                .env
+                .iter()
+                .chain(&case.env)
+                .map(|(key, value)| (key.clone(), value.clone())),
+        )
+        .map(|(admitted, watch)| (admitted, Some(watch)))
+        .map_err(|category| EvalError::Validation(category.into()))
+    } else {
+        invoke(&args, "admission", remaining()).map(|admitted| (admitted, None))
+    };
+    let (admitted, execution_xray) = admission.inspect_err(|_| {
         // The single admission request may have committed before its transport deadline.
         // Never replay it or guess a run identity to cancel.
         let _ = write_json(rep_dir.join("admission-unresolved.json"), &serde_json::json!({
@@ -1807,7 +1869,58 @@ pub fn execute(
         }
     };
     write_json(rep_dir.join("session-history.json"), &history)?;
+    let descendant_xray_evidence =
+        execution_xray.and_then(super::xray_capture::WorkflowWatch::finish);
+    let xray_evidence = xray.and_then(super::xray_capture::SessionCapture::finish);
     let mut measurements = EvalMeasurementSet::new();
+    if super::xray_capture::WorkflowWatch::requested()
+        || xray_evidence.is_some()
+        || descendant_xray_evidence.is_some()
+    {
+        measurements.insert(
+            "eval.xray.evidence_complete".into(),
+            f64::from(
+                xray_evidence
+                    .as_ref()
+                    .is_some_and(|evidence| evidence.evidence_complete)
+                    && descendant_xray_evidence
+                        .as_ref()
+                        .is_some_and(|evidence| evidence.evidence_complete),
+            ),
+        );
+        measurements.insert(
+            "eval.xray.workflow_children_complete".into(),
+            f64::from(
+                descendant_xray_evidence
+                    .as_ref()
+                    .is_some_and(|evidence| evidence.evidence_complete),
+            ),
+        );
+    }
+    if let Some(evidence) = xray_evidence {
+        measurements.insert(
+            "eval.xray.root_evidence_complete".into(),
+            f64::from(evidence.evidence_complete),
+        );
+        measurements.insert(
+            "eval.xray.ready_before_submission".into(),
+            f64::from(evidence.ready_before_submission),
+        );
+    }
+    if let Some(evidence) = descendant_xray_evidence {
+        measurements.insert(
+            "eval.xray.descendant_evidence_complete".into(),
+            f64::from(evidence.evidence_complete),
+        );
+        measurements.insert(
+            "eval.xray.expected_sessions".into(),
+            evidence.expected_sessions as f64,
+        );
+        measurements.insert(
+            "eval.xray.observed_sessions".into(),
+            evidence.observed_sessions as f64,
+        );
+    }
     measurements.insert(
         "workflow.wall_time_ms".into(),
         execution_elapsed.as_millis() as f64,
@@ -2330,6 +2443,26 @@ pub fn terminal_status(value: &serde_json::Value) -> bool {
 mod observation_tests {
     use super::*;
     use std::cell::Cell;
+
+    #[test]
+    fn preselected_root_requires_explicit_capture_and_bounded_identity() {
+        assert_eq!(preselected_xray_root(None, false).unwrap(), None);
+        let root = serde_json::json!("exact-root");
+        assert_eq!(
+            preselected_xray_root(Some(&root), true).unwrap(),
+            Some("exact-root")
+        );
+        assert!(preselected_xray_root(Some(&root), false).is_err());
+        for invalid in [
+            serde_json::json!(null),
+            serde_json::json!(7),
+            serde_json::json!(""),
+            serde_json::json!("a\nb"),
+            serde_json::json!("x".repeat(257)),
+        ] {
+            assert!(preselected_xray_root(Some(&invalid), true).is_err());
+        }
+    }
 
     fn marker_readiness_page(reason: Option<&str>, issue: Option<&str>) -> serde_json::Value {
         let session = "00000000-0000-0000-0000-000000000001";

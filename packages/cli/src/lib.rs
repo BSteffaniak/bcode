@@ -9012,7 +9012,7 @@ fn dispatch_non_ranking_session_command(
     command: Box<SessionCommand>,
 ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), CliError>> + Send>> {
     match *command {
-        SessionCommand::Xray(args) => Box::pin(async move { xray::run(&args).await }),
+        SessionCommand::Xray(args) => Box::pin(async move { Box::pin(xray::run(&args)).await }),
         SessionCommand::RankCategories { .. } => unreachable!("ranking is dispatched above"),
         SessionCommand::Categorization { session_id, json } => Box::pin(async move {
             Box::pin(print_session_categorization(session_id, json)).await?;

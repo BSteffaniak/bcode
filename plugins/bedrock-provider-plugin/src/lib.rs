@@ -416,16 +416,20 @@ impl BedrockProviderPlugin {
 }
 
 fn push_runtime_error(turn: &TurnState, error: &str) {
-    turn.push(ProviderTurnEvent::Error {
+    let event = ProviderTurnEvent::Error {
         error: provider_error(
             "runtime_unavailable",
             ProviderErrorCategory::ProviderInternal,
             error.to_string(),
         ),
-    });
-    turn.push(ProviderTurnEvent::TurnFinished {
+    };
+    diagnostics::event(&event);
+    turn.push(event);
+    let event = ProviderTurnEvent::TurnFinished {
         stop_reason: StopReason::Error,
-    });
+    };
+    diagnostics::event(&event);
+    turn.push(event);
 }
 
 /// Interval used only to observe locally-buffered turn production inside this plugin.
@@ -481,6 +485,9 @@ fn forward_turn_events(
 
 /// Emit one provider turn event as an incremental service event.
 fn emit_provider_turn_event(context: &NativeServiceContext, event: &ProviderTurnEvent) {
+    if matches!(event, ProviderTurnEvent::Usage { .. }) {
+        diagnostics::event(event);
+    }
     if let Ok(payload) = serde_json::to_vec(event) {
         context.events.emit(&payload);
     }
@@ -491,28 +498,32 @@ async fn stream_bedrock_turn(
     turn: &TurnState,
     discovery: Arc<Mutex<DiscoveryCache>>,
 ) {
+    let push = |event| {
+        diagnostics::event(&event);
+        turn.push(event);
+    };
     match stream_bedrock_turn_inner(request, turn, discovery).await {
-        Ok(StreamOutcome::Finished) => turn.push(ProviderTurnEvent::TurnFinished {
+        Ok(StreamOutcome::Finished) => push(ProviderTurnEvent::TurnFinished {
             stop_reason: StopReason::EndTurn,
         }),
-        Ok(StreamOutcome::ToolCall) => turn.push(ProviderTurnEvent::TurnFinished {
+        Ok(StreamOutcome::ToolCall) => push(ProviderTurnEvent::TurnFinished {
             stop_reason: StopReason::ToolCall,
         }),
-        Ok(StreamOutcome::MaxTokens) => turn.push(ProviderTurnEvent::TurnFinished {
+        Ok(StreamOutcome::MaxTokens) => push(ProviderTurnEvent::TurnFinished {
             stop_reason: StopReason::MaxTokens,
         }),
-        Ok(StreamOutcome::Refusal) => turn.push(ProviderTurnEvent::TurnFinished {
+        Ok(StreamOutcome::Refusal) => push(ProviderTurnEvent::TurnFinished {
             stop_reason: StopReason::Refusal,
         }),
         Ok(StreamOutcome::Cancelled) => {
-            turn.push(ProviderTurnEvent::Cancelled);
-            turn.push(ProviderTurnEvent::TurnFinished {
+            push(ProviderTurnEvent::Cancelled);
+            push(ProviderTurnEvent::TurnFinished {
                 stop_reason: StopReason::Cancelled,
             });
         }
         Err(error) => {
-            turn.push(ProviderTurnEvent::Error { error });
-            turn.push(ProviderTurnEvent::TurnFinished {
+            push(ProviderTurnEvent::Error { error });
+            push(ProviderTurnEvent::TurnFinished {
                 stop_reason: StopReason::Error,
             });
         }

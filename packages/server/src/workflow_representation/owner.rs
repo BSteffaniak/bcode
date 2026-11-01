@@ -151,8 +151,34 @@ pub async fn execution_session_link(
     }
 }
 
+#[path = "owner_execution_watch/mod.rs"]
+mod execution_watch;
+
 /// Persist the execution-session identity under the same representation and authority.
+/// Watch capture is installed only after verified persistence, before dispatch returns.
 pub async fn link_execution_session(
+    state: &ServerState,
+    authority: &WorkflowExecutionAuthority,
+    link: &WorkflowExecutionSessionLink,
+) -> Result<(), WorkflowStoreError> {
+    persist_execution_session(state, authority, link).await?;
+    execution_watch::before_dispatch(state, authority, link, true).await;
+    Ok(())
+}
+
+/// Re-admit live capture for an already materialized execution session before dispatch.
+/// Call only after canonical linkage/authority verification. No execution is dispatched.
+/// This also supports the existing-child recovery branch owned by the server facade.
+pub async fn observe_execution_session(
+    state: &ServerState,
+    authority: &WorkflowExecutionAuthority,
+    link: &WorkflowExecutionSessionLink,
+    dedicated_session: bool,
+) {
+    execution_watch::before_dispatch(state, authority, link, dedicated_session).await;
+}
+
+async fn persist_execution_session(
     state: &ServerState,
     authority: &WorkflowExecutionAuthority,
     link: &WorkflowExecutionSessionLink,
@@ -196,9 +222,14 @@ pub async fn link_shared_execution_session(
     {
         RunLookup::Legacy => {
             retained.verify_execution_authority(&link.run_id, authority)?;
+            execution_watch::before_dispatch(state, authority, link, false).await;
             Ok(())
         }
-        RunLookup::Available(_) => link_execution_session(state, authority, link).await,
+        RunLookup::Available(_) => {
+            persist_execution_session(state, authority, link).await?;
+            execution_watch::before_dispatch(state, authority, link, false).await;
+            Ok(())
+        }
         _ => Err(store_error("unsupported shared execution storage")),
     }
 }

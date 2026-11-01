@@ -1,10 +1,11 @@
 # X-ray v1 protocol
 
-This describes the implemented source contracts in this checkout. Offline
-engine, protocol and whole-app acceptance tests have passed, including readiness,
-idle multi-turn observation, recording, provider errors and exact cancellation.
-This is not a live-provider or complete-coverage certification. See
-[Session X-ray](xray.md) for validation scope, usage, architecture and remaining limits.
+This describes implemented source contracts, not a release certification. Isolated
+provider diagnostics and real fake-provider dylib byte/hash tests passed; final
+coordinator integration acceptance remains pending. The latest whole-app run had
+18 passes/two failures. Workflow authorization-negative cases passed, but positive
+completeness failed; subsequent opaque-producer fixes still need rebuilt-artifact
+validation. See [Session X-ray](xray.md) for scope and validation requirements.
 
 X-ray is live, session-scoped, read-only diagnostics. Dropping/finalizing an
 observer closes capture, never cancels or mutates the observed execution. It is
@@ -22,7 +23,9 @@ must be checked at their own boundaries, not inferred from the envelope version.
 An envelope contains:
 
 * `schema_version`, `observation_id`, `sequence`, `timestamp_unix_ms`.
-* `event`: `domain`, `name`, `correlation`, `data`, `sensitive`.
+* `event`: `domain`, `name`, `correlation`, `data`, `sensitive`, and optional
+  versioned `capture` metadata declaring retained-reference locations (or explicitly
+  none). Missing metadata remains legacy opaque data.
 * Correlation contains exact `session_id` and optional `turn_id`, `request_id`,
   `tool_call_id`, `run_id`, `activation_id`, `attempt_id`.
 
@@ -149,19 +152,47 @@ be an empty successful range at declared length; it does not upgrade completenes
 The current full-export consumer caps payloads at one MiB and ranges at 64 KiB,
 validates version/identity/offset/progress/EOF on every response, assembles bounded
 bytes, and verifies full length/SHA-256 in both the client and sink. Reference
-discovery traverses bounded event data and treats objects with `payload_id` or
-`sha256` plus `byte_len` as typed references; malformed/future/conflicting candidates
-fail closed. This has a known collision risk: arbitrary nested provider/tool/user
-content can contain those fields without being a reference. An explicit typed
-reference location/discriminator is needed to remove that ambiguity; domain authors
-cannot guarantee arbitrary content avoids it. Expected references are registered
-before fetching so failed export remains missing in the manifest.
+locations are declared by versioned `event.capture` attachments: each `payload_ref`
+attachment supplies a JSON pointer relative to `event.data`. Unsupported versions,
+missing/duplicate locations, malformed/foreign/conflicting references fail closed.
+An explicit empty attachment list declares inline/control content without references;
+absence means legacy opaque data, not an invitation to scan arbitrary JSON or claim
+payload completeness. Objects with reference-shaped keys outside declared locations
+remain ordinary content. Expected references are registered before fetching so failed
+export remains missing in the manifest.
 
 Fetch promptly while consuming events. HTTP keeps final retention only for bounded
 body-drain/disconnect grace; do not defer all exports until after closing SSE.
-Larger native-plugin payloads cannot be retained across the current callback ABI:
-they report omission. Never substitute canonical session trace files, reconstruct
-content from history or reinterpret unavailable payloads as empty complete data.
+Native payload transfer negotiates independently from event callbacks. An event-only
+host can keep event compatibility while declining payload retention. Supported hosts
+bound Begin/ordered Chunk/Finish operations, verify full length/digest, recheck deep
+scope and return host-origin references; Abort, expiry and lease release clean up
+unfinished transfers. The extension permits up to one MiB per transfer, four pending
+transfers per lease and bounded global reservation. Unavailable/oversized captures
+produce explicit loss/omission, not truncated success. Never substitute canonical
+session trace files, reconstruct content from history or reinterpret unavailable
+payloads as empty complete data.
+
+## Recursive execution admission and transport recovery
+
+Session observation alone never grants access to workflow descendants. Execution
+watches/start-observed admission use the ordinary application boundary, not HTTP
+steering routes. Trusted plugin configuration supplies versioned expiring grants
+matching actor, root run, namespace, state location, operation and explicit recursive/
+deep scope. Missing, malformed, expired or mismatched grants fail closed. Execution
+permission is separate. Dispatch rechecks observation authorization; bounded watch
+pages and child readiness reserve capture before dispatch rather than claiming
+later parent events prove child coverage. Grant expiry/revocation and lost watch
+continuity remain explicit incomplete evidence, not implicit broader access.
+
+The CLI decouples SSE intake from stdout, payload fetches and recording with a
+bounded consumer queue (default 256; `--consumer-queue-capacity` range 1–4096).
+Overflow interrupts the recording and reports incomplete evidence; it never stalls
+observed execution indefinitely. Optional `--reconnect transport` uses bounded fresh
+bootstrap/admission attempts, new readiness/observation IDs and distinct recording
+segments. It preserves transport/restart gaps rather than filling them from history.
+Recovery does not replay events, reuse sequences as durable cursors, promise gapless
+continuity, or upgrade a missing finalization/payload to successful completion.
 
 ## Minimal browser authenticated fetch example
 

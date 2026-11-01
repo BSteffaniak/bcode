@@ -17,8 +17,8 @@ use std::collections::{BTreeMap, VecDeque};
 use std::future::Future;
 use std::io::{self, Write};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, MutexGuard};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::sync::{Arc, Mutex, MutexGuard, RwLock};
+use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 pub use bcode_xray_models::*;
 use serde_json::json;
@@ -115,7 +115,9 @@ struct StoredPayload {
 
 struct Observer {
     session_id: String,
+    run_id: Option<String>,
     deep_capture: bool,
+    deadline: Option<Instant>,
     queue: VecDeque<XrayEnvelope>,
     next_sequence: u64,
     dropped: u64,
@@ -129,6 +131,21 @@ struct Observer {
 }
 
 impl Observer {
+    fn accepts_capture(&self) -> bool {
+        self.finalization.is_none()
+            && self
+                .deadline
+                .is_none_or(|deadline| Instant::now() < deadline)
+    }
+
+    fn matches(&self, correlation: &XrayCorrelation) -> bool {
+        self.session_id == correlation.session_id
+            && self
+                .run_id
+                .as_ref()
+                .is_none_or(|run| correlation.run_id.as_ref() == Some(run))
+    }
+
     /// Evict oldest payloads before retaining one already validated bounded capture.
     fn retain_payload(&mut self, stored: &StoredPayload, config: &XrayConfig) {
         while self.payloads.len() >= config.max_retained_payloads
@@ -158,10 +175,50 @@ struct State {
     observers: BTreeMap<String, Observer>,
 }
 
+#[derive(Clone)]
+struct ActivityHint {
+    correlation: XrayCorrelation,
+    deep_capture: bool,
+    deadline: Option<Instant>,
+}
+
+#[derive(Clone, Copy)]
+enum LossCause {
+    EmitState,
+    PayloadPreflight,
+    PayloadCommit,
+    ActivityHint,
+    External,
+}
+
+#[derive(Default)]
+struct LossCounters {
+    emit_state: AtomicU64,
+    payload_preflight: AtomicU64,
+    payload_commit: AtomicU64,
+    activity_hint: AtomicU64,
+    external: AtomicU64,
+}
+
+impl LossCounters {
+    const fn counter(&self, cause: LossCause) -> &AtomicU64 {
+        match cause {
+            LossCause::EmitState => &self.emit_state,
+            LossCause::PayloadPreflight => &self.payload_preflight,
+            LossCause::PayloadCommit => &self.payload_commit,
+            LossCause::ActivityHint => &self.activity_hint,
+            LossCause::External => &self.external,
+        }
+    }
+}
+
 struct Inner {
     config: XrayConfig,
     state: Mutex<State>,
+    // Lifecycle-only writes; delivery/retention never acquire this lock.
+    activity: RwLock<BTreeMap<String, ActivityHint>>,
     contention: AtomicU64,
+    loss_causes: LossCounters,
 }
 
 /// A cloneable application-owned hub; there is intentionally no process-global registry.
@@ -172,7 +229,33 @@ pub struct XrayHub {
 
 impl std::fmt::Debug for XrayHub {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        formatter.debug_struct("XrayHub").finish_non_exhaustive()
+        // Numeric, hub-lifetime diagnostic snapshots only. Independent relaxed
+        // loads are not a coherent cutoff receipt or a source of authorization.
+        let causes = &self.inner.loss_causes;
+        formatter
+            .debug_struct("XrayHub")
+            .field("loss_total", &self.inner.contention.load(Ordering::Relaxed))
+            .field(
+                "emit_state_busy",
+                &causes.emit_state.load(Ordering::Relaxed),
+            )
+            .field(
+                "payload_preflight_busy",
+                &causes.payload_preflight.load(Ordering::Relaxed),
+            )
+            .field(
+                "payload_commit_busy",
+                &causes.payload_commit.load(Ordering::Relaxed),
+            )
+            .field(
+                "activity_hint_unavailable",
+                &causes.activity_hint.load(Ordering::Relaxed),
+            )
+            .field(
+                "external_reported_loss",
+                &causes.external.load(Ordering::Relaxed),
+            )
+            .finish_non_exhaustive()
     }
 }
 
@@ -190,7 +273,9 @@ impl XrayHub {
             inner: Arc::new(Inner {
                 config,
                 state: Mutex::new(State::default()),
+                activity: RwLock::new(BTreeMap::new()),
                 contention: AtomicU64::new(0),
+                loss_causes: LossCounters::default(),
             }),
         }
     }
@@ -199,13 +284,18 @@ impl XrayHub {
         self.inner.state.lock().map_err(|_| XrayError::Unavailable)
     }
 
-    fn producer_state(&self) -> Result<MutexGuard<'_, State>, XrayError> {
+    fn try_state(&self) -> Result<MutexGuard<'_, State>, XrayError> {
         self.inner.state.try_lock().map_err(|error| match error {
-            std::sync::TryLockError::WouldBlock => {
-                self.inner.contention.fetch_add(1, Ordering::Relaxed);
-                XrayError::Busy
-            }
+            std::sync::TryLockError::WouldBlock => XrayError::Busy,
             std::sync::TryLockError::Poisoned(_) => XrayError::Unavailable,
+        })
+    }
+
+    fn producer_state(&self, cause: LossCause) -> Result<MutexGuard<'_, State>, XrayError> {
+        self.try_state().inspect_err(|error| {
+            if matches!(error, XrayError::Busy) {
+                self.record_loss(cause, 1);
+            }
         })
     }
 
@@ -216,6 +306,64 @@ impl XrayHub {
     /// # Errors
     /// Rejects unsupported versions, invalid identities/configuration, capacity and poisoned state.
     pub fn observe(&self, request: XrayObserveRequest) -> Result<XrayObservation, XrayError> {
+        self.observe_with_deadline(request, None)
+    }
+
+    /// Attach with an optional hard capture cutoff, independent of scheduler wakeups.
+    ///
+    /// At or after the deadline no new events or payloads are retained. Existing
+    /// evidence remains drainable until normal finalization/drop. None is unbounded.
+    /// This does not schedule shutdown, cancel execution or grant authorization.
+    ///
+    /// # Errors
+    /// Returns the same admission errors as [`Self::observe`].
+    pub fn observe_with_deadline(
+        &self,
+        request: XrayObserveRequest,
+        deadline: Option<Instant>,
+    ) -> Result<XrayObservation, XrayError> {
+        self.observe_filtered(request, None, deadline)
+    }
+
+    /// Observe only an exact run correlation within the authorized session.
+    ///
+    /// This filters instrumentation metadata; it does not discover descendants or
+    /// grant workflow authority. Missing or different run metadata never matches.
+    ///
+    /// # Errors
+    /// Returns attach errors or invalid identity for an empty/invalid run identity.
+    pub fn observe_run(
+        &self,
+        request: XrayObserveRequest,
+        run_id: String,
+    ) -> Result<XrayObservation, XrayError> {
+        self.observe_run_with_deadline(request, run_id, None)
+    }
+
+    /// Attach an exact-run observation with an optional hard capture deadline.
+    ///
+    /// Cutoff and drain semantics match [`Self::observe_with_deadline`].
+    ///
+    /// # Errors
+    /// Returns the same admission errors as [`Self::observe_run`].
+    pub fn observe_run_with_deadline(
+        &self,
+        request: XrayObserveRequest,
+        run_id: String,
+        deadline: Option<Instant>,
+    ) -> Result<XrayObservation, XrayError> {
+        if !valid_identity(&run_id) {
+            return Err(XrayError::InvalidIdentity);
+        }
+        self.observe_filtered(request, Some(run_id), deadline)
+    }
+
+    fn observe_filtered(
+        &self,
+        request: XrayObserveRequest,
+        run_id: Option<String>,
+        deadline: Option<Instant>,
+    ) -> Result<XrayObservation, XrayError> {
         check_version(request.schema_version)?;
         if !valid_identity(&request.session_id) {
             return Err(XrayError::InvalidIdentity);
@@ -241,7 +389,9 @@ impl XrayHub {
             id.clone(),
             Observer {
                 session_id: request.session_id.clone(),
+                run_id: run_id.clone(),
                 deep_capture: request.deep_capture,
+                deadline,
                 queue: VecDeque::new(),
                 next_sequence: 2,
                 dropped: 0,
@@ -254,12 +404,14 @@ impl XrayHub {
                 evicted_payloads: 0,
             },
         );
+        self.refresh_activity(&state);
         drop(state);
         let capabilities = self.capabilities(request.deep_capture);
         Ok(XrayObservation {
             hub: self.clone(),
             id,
             session_id: request.session_id,
+            run_id,
             notify,
             ready: Some(capabilities),
             expected_sequence: 2,
@@ -290,7 +442,7 @@ impl XrayHub {
     /// # Errors
     /// Returns busy or unavailable when the observation registry cannot be inspected.
     pub fn observation_active(&self) -> Result<bool, XrayError> {
-        let state = self.producer_state()?;
+        let state = self.try_state()?;
         Ok(!state.observers.is_empty())
     }
 
@@ -302,7 +454,7 @@ impl XrayHub {
         if !valid_identity(session_id) {
             return Err(XrayError::InvalidIdentity);
         }
-        let state = self.producer_state()?;
+        let state = self.try_state()?;
         Ok(state
             .observers
             .values()
@@ -318,24 +470,102 @@ impl XrayHub {
         self.active(session_id, false)
     }
 
-    /// Gate expensive sensitive serialization; false on unavailable/contended state.
+    /// Gate expensive sensitive serialization; false on unavailable/contended hint state.
     ///
-    /// Contention is counted as uncertainty even if the caller never calls `emit`.
+    /// Delivery and payload IO do not contend with these lifecycle-only hints.
+    /// Lifecycle contention is counted as uncertainty even without a later `emit`.
     #[must_use]
     pub fn deep_capture_active(&self, session_id: &str) -> bool {
         self.active(session_id, true)
     }
 
+    fn refresh_activity(&self, state: &State) {
+        // A derived hint, rebuilt from authoritative state under the lifecycle lock.
+        let mut activity = self
+            .inner
+            .activity
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        activity.clear();
+        for (id, observer) in &state.observers {
+            if observer.finalization.is_none() {
+                activity.insert(
+                    id.clone(),
+                    ActivityHint {
+                        correlation: XrayCorrelation {
+                            session_id: observer.session_id.clone(),
+                            run_id: observer.run_id.clone(),
+                            ..XrayCorrelation::default()
+                        },
+                        deep_capture: observer.deep_capture,
+                        deadline: observer.deadline,
+                    },
+                );
+            }
+        }
+    }
+
+    /// Report callbacks lost before engine sequence allocation.
+    ///
+    /// Counts are conservative hub-wide uncertainty in `hub_contention_drops`, not
+    /// exact selected-session gaps. Report only newly lost callbacks, before cutoff;
+    /// repeated reports add counts and finalized receipts are never rewritten.
+    pub fn report_external_loss(&self, count: u64) {
+        self.record_loss(LossCause::External, count);
+    }
+
+    fn record_loss(&self, cause: LossCause, count: u64) {
+        // Preserve the authoritative aggregate update and cutoff rules. Cause
+        // counters are independent attribution, not a replacement receipt.
+        let _ = self
+            .inner
+            .contention
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |value| {
+                Some(value.saturating_add(count))
+            });
+        let _ = self.inner.loss_causes.counter(cause).fetch_update(
+            Ordering::Relaxed,
+            Ordering::Relaxed,
+            |value| Some(value.saturating_add(count)),
+        );
+    }
+
     fn active(&self, session_id: &str, deep: bool) -> bool {
-        // A false hint can suppress producer work before emit is called. Count lock
-        // contention here as uncertainty too, so gating cannot hide evidence loss.
-        self.producer_state().is_ok_and(|state| {
-            state.observers.values().any(|observer| {
-                observer.session_id == session_id
-                    && observer.finalization.is_none()
-                    && (!deep || observer.deep_capture)
-            })
-        })
+        self.correlation_active(
+            &XrayCorrelation {
+                session_id: session_id.to_owned(),
+                ..XrayCorrelation::default()
+            },
+            deep,
+        )
+    }
+
+    /// Exact-correlated activity hint, including optional run filtering.
+    /// Session-wide observers accept any run; scoped observers require the exact run.
+    #[must_use]
+    pub fn correlation_active(&self, correlation: &XrayCorrelation, deep: bool) -> bool {
+        // Do not contend with delivery, payload reads, or queue draining just to
+        // decide whether expensive diagnostic serialization is worth doing.
+        self.inner.activity.try_read().map_or_else(
+            |_| {
+                self.record_loss(LossCause::ActivityHint, 1);
+                false
+            },
+            |activity| {
+                activity.values().any(|hint| {
+                    hint.correlation.session_id == correlation.session_id
+                        && hint
+                            .correlation
+                            .run_id
+                            .as_ref()
+                            .is_none_or(|run| correlation.run_id.as_ref() == Some(run))
+                        && (!deep || hint.deep_capture)
+                        && hint
+                            .deadline
+                            .is_none_or(|deadline| Instant::now() < deadline)
+                })
+            },
+        )
     }
 
     /// Bind explicit origin metadata to this hub without enabling capture.
@@ -355,14 +585,9 @@ impl XrayHub {
     /// readiness, gaps or terminal delivery. This API is trusted instrumentation, not
     /// an authorization boundary for accepting arbitrary client-supplied events.
     pub fn emit(&self, mut event: XrayEvent) {
-        let Ok(mut state) = self.producer_state() else {
-            return;
-        };
-        if !state.observers.values().any(|observer| {
-            observer.session_id == event.correlation.session_id
-                && observer.finalization.is_none()
-                && (!event.sensitive || observer.deep_capture)
-        }) {
+        // Validation is bounded but can serialize a full event. Keep it outside the
+        // delivery lock so unrelated producers and receivers can make progress.
+        if !self.correlation_active(&event.correlation, event.sensitive) {
             return;
         }
         let mut value_budget = self.inner.config.max_event_bytes;
@@ -373,6 +598,8 @@ impl XrayHub {
                 .is_err()
         {
             Some("event_too_large")
+        } else if event.payload_references().is_err() {
+            Some("invalid_capture_metadata")
         } else {
             None
         };
@@ -382,15 +609,21 @@ impl XrayHub {
                 name: "event_omitted".into(),
                 correlation: XrayCorrelation {
                     session_id: event.correlation.session_id,
+                    run_id: event.correlation.run_id.filter(|run| valid_identity(run)),
                     ..XrayCorrelation::default()
                 },
                 data: json!({"reason": reason}),
                 sensitive: event.sensitive,
+                capture: None,
             };
         }
+        let Ok(mut state) = self.producer_state(LossCause::EmitState) else {
+            return;
+        };
+        let mut notifications = Vec::with_capacity(state.observers.len());
         for (id, observer) in &mut state.observers {
-            if observer.session_id != event.correlation.session_id
-                || observer.finalization.is_some()
+            if !observer.matches(&event.correlation)
+                || !observer.accepts_capture()
                 || (event.sensitive && !observer.deep_capture)
             {
                 continue;
@@ -411,7 +644,11 @@ impl XrayHub {
                     event: event.clone(),
                 });
             }
-            observer.notify.notify_one();
+            notifications.push(Arc::clone(&observer.notify));
+        }
+        drop(state);
+        for notify in notifications {
+            notify.notify_one();
         }
     }
 
@@ -440,14 +677,21 @@ impl XrayHub {
         if bytes.len() > self.inner.config.max_payload_bytes {
             return Err(XrayError::PayloadTooLarge);
         }
-        let mut state = self.producer_state()?;
-        if !state.observers.values().any(|observer| {
-            observer.session_id == correlation.session_id
-                && observer.deep_capture
-                && observer.finalization.is_none()
-        }) {
+        if !self.correlation_active(correlation, true) {
             return Ok(None);
         }
+        // Verify authoritative scope/deadline before preparing sensitive retention,
+        // not only after hashing. Hints alone never authorize capture.
+        {
+            let state = self.producer_state(LossCause::PayloadPreflight)?;
+            if !state.observers.values().any(|observer| {
+                observer.matches(correlation) && observer.deep_capture && observer.accepts_capture()
+            }) {
+                return Ok(None);
+            }
+        }
+        // Hash and copy bounded bytes without holding the delivery/retention lock.
+        // Authorization and deadline are rechecked under that lock before retention.
         let reference = XrayPayloadRef {
             schema_version: XRAY_SCHEMA_VERSION,
             payload_id: Uuid::new_v4().to_string(),
@@ -460,17 +704,20 @@ impl XrayHub {
             reference: reference.clone(),
             bytes: Arc::from(bytes),
         };
+        let mut state = self.producer_state(LossCause::PayloadCommit)?;
+        let mut retained = false;
         for observer in state.observers.values_mut() {
-            if observer.session_id != correlation.session_id
+            if !observer.matches(correlation)
                 || !observer.deep_capture
-                || observer.finalization.is_some()
+                || !observer.accepts_capture()
             {
                 continue;
             }
             observer.retain_payload(&stored, &self.inner.config);
+            retained = true;
         }
         drop(state);
-        Ok(Some(reference))
+        Ok(retained.then_some(reference))
     }
 
     /// Read an authorized retained byte range without filesystem or canonical-history access.
@@ -506,7 +753,10 @@ impl XrayHub {
         let payload = observer
             .payloads
             .get(&request.payload_id)
-            .ok_or(XrayError::PayloadUnavailable)?;
+            .ok_or(XrayError::PayloadUnavailable)?
+            .clone();
+        // Pin authorized bytes, then release retention state before copying a range.
+        drop(state);
         let start = usize::try_from(request.offset).map_err(|_| XrayError::InvalidRange)?;
         if start > payload.bytes.len() {
             return Err(XrayError::InvalidRange);
@@ -520,7 +770,6 @@ impl XrayHub {
             bytes: payload.bytes[start..end].to_vec(),
             eof: end == payload.bytes.len(),
         };
-        drop(state);
         Ok(range)
     }
 }
@@ -533,10 +782,21 @@ pub struct XrayObservation {
     hub: XrayHub,
     id: String,
     session_id: String,
+    run_id: Option<String>,
     notify: Arc<Notify>,
     ready: Option<XrayCapabilities>,
     expected_sequence: u64,
     terminal: bool,
+}
+
+impl std::fmt::Debug for XrayObservation {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // Never include session/run identity, payloads, event contents or grants.
+        formatter
+            .debug_struct("XrayObservation")
+            .field("hub_loss_attribution", &self.hub)
+            .finish_non_exhaustive()
+    }
 }
 
 impl XrayObservation {
@@ -578,8 +838,10 @@ impl XrayObservation {
             evicted_payloads: observer.evicted_payloads,
         };
         observer.finalization = Some(finalization.clone());
-        observer.notify.notify_one();
+        let notify = Arc::clone(&observer.notify);
+        self.hub.refresh_activity(&state);
         drop(state);
+        notify.notify_one();
         Ok(finalization)
     }
 
@@ -611,20 +873,24 @@ impl XrayObservation {
                     .front()
                     .map_or(observer.next_sequence, |event| event.sequence);
                 if self.expected_sequence < next_available {
+                    let first_sequence = self.expected_sequence;
+                    self.expected_sequence = next_available;
+                    drop(state);
                     let gap = XrayGap {
-                        first_sequence: self.expected_sequence,
+                        first_sequence,
                         last_sequence: next_available - 1,
                         reason: "observer_queue_full".into(),
                     };
-                    self.expected_sequence = next_available;
-                    return Some(self.control(gap.first_sequence, "gap", json!(gap)));
+                    return Some(self.control(first_sequence, "gap", json!(gap)));
                 }
                 if let Some(event) = observer.queue.pop_front() {
                     self.expected_sequence = event.sequence + 1;
+                    drop(state);
                     return Some(event);
                 }
-                if let Some(finalization) = &observer.finalization {
+                if let Some(finalization) = observer.finalization.clone() {
                     self.terminal = true;
+                    drop(state);
                     return Some(self.control(
                         finalization.final_sequence,
                         "finalized",
@@ -647,8 +913,10 @@ impl XrayObservation {
                 name: name.to_owned(),
                 data,
                 sensitive: false,
+                capture: None,
                 correlation: XrayCorrelation {
                     session_id: self.session_id.clone(),
+                    run_id: self.run_id.clone(),
                     ..XrayCorrelation::default()
                 },
             },
@@ -660,6 +928,7 @@ impl Drop for XrayObservation {
     fn drop(&mut self) {
         if let Ok(mut state) = self.hub.state() {
             state.observers.remove(&self.id);
+            self.hub.refresh_activity(&state);
         }
     }
 }
@@ -684,12 +953,43 @@ pub trait XrayCaptureSink: Send + Sync {
     ///
     /// The implementation rechecks activity, sensitive authorization and origin scope.
     fn emit(&self, event: XrayEvent);
+
+    /// Retain sanitized sensitive bytes under the host-owned originating scope.
+    ///
+    /// Implementations must recheck authorization and activity and enforce bounded,
+    /// all-or-nothing retention without blocking. Returned references must describe
+    /// real host retention; incoming diagnostic metadata is never authority.
+    ///
+    /// # Errors
+    /// Returns unsupported by default; adapters may return host capture errors.
+    fn capture_payload(
+        &self,
+        _media_type: &str,
+        _bytes: &[u8],
+    ) -> Result<Option<XrayPayloadRef>, XrayError> {
+        Err(XrayError::PayloadCaptureUnsupported)
+    }
+
+    /// Account for newly lost external callbacks before engine cutoff.
+    ///
+    /// Return true only when loss was retained by the host. Legacy event-only
+    /// adapters return false; callers must not claim complete evidence in that case.
+    fn report_external_loss(&self, _count: u64) -> bool {
+        false
+    }
 }
+
+type ExternalPayloadCapture = dyn Fn(&XrayCorrelation, &str, &[u8]) -> Result<Option<XrayPayloadRef>, XrayError>
+    + Send
+    + Sync;
 
 #[derive(Clone)]
 enum CaptureTarget {
     Hub(XrayHub),
-    Sink(Arc<dyn XrayCaptureSink>),
+    Sink(
+        Arc<dyn XrayCaptureSink>,
+        Option<Arc<ExternalPayloadCapture>>,
+    ),
 }
 
 std::thread_local! {
@@ -730,8 +1030,49 @@ impl CaptureContext {
     #[must_use]
     pub const fn from_sink(correlation: XrayCorrelation, sink: Arc<dyn XrayCaptureSink>) -> Self {
         Self {
-            target: CaptureTarget::Sink(sink),
+            target: CaptureTarget::Sink(sink, None),
             correlation,
+        }
+    }
+
+    /// Construct a payload-capable external adapter without changing event-only sinks.
+    ///
+    /// The callback is host-owned and must recheck current deep authorization, bind
+    /// origin correlation, enforce negotiated all-or-nothing byte bounds, and return
+    /// only real retained references. It must be bounded, nonblocking, panic-free and
+    /// secret-safe. The caller supplies sanitized bytes, never capture credentials.
+    /// Neither this constructor nor activity hints grant capture authorization.
+    #[must_use]
+    pub fn with_external_sink(
+        correlation: XrayCorrelation,
+        sink: Arc<dyn XrayCaptureSink>,
+        capture_payload: impl Fn(
+            &XrayCorrelation,
+            &str,
+            &[u8],
+        ) -> Result<Option<XrayPayloadRef>, XrayError>
+        + Send
+        + Sync
+        + 'static,
+    ) -> Self {
+        Self {
+            target: CaptureTarget::Sink(sink, Some(Arc::new(capture_payload))),
+            correlation,
+        }
+    }
+
+    /// Report newly lost callbacks without emitting an event or allocating sequence.
+    ///
+    /// True means the host accepted accounting, not that the callbacks were captured.
+    /// Report before finalization; late reports never rewrite a terminal receipt.
+    #[must_use]
+    pub fn report_external_loss(&self, count: u64) -> bool {
+        match &self.target {
+            CaptureTarget::Hub(hub) => {
+                hub.report_external_loss(count);
+                true
+            }
+            CaptureTarget::Sink(sink, _) => sink.report_external_loss(count),
         }
     }
 
@@ -776,8 +1117,8 @@ impl CaptureContext {
     #[must_use]
     pub fn deep_capture_active(&self) -> bool {
         match &self.target {
-            CaptureTarget::Hub(hub) => hub.deep_capture_active(&self.correlation.session_id),
-            CaptureTarget::Sink(sink) => sink.deep_capture_active(),
+            CaptureTarget::Hub(hub) => hub.correlation_active(&self.correlation, true),
+            CaptureTarget::Sink(sink, _) => sink.deep_capture_active(),
         }
     }
 
@@ -785,8 +1126,8 @@ impl CaptureContext {
     #[must_use]
     pub fn capture_active(&self) -> bool {
         match &self.target {
-            CaptureTarget::Hub(hub) => hub.capture_active(&self.correlation.session_id),
-            CaptureTarget::Sink(sink) => sink.capture_active(),
+            CaptureTarget::Hub(hub) => hub.correlation_active(&self.correlation, false),
+            CaptureTarget::Sink(sink, _) => sink.capture_active(),
         }
     }
 
@@ -796,17 +1137,42 @@ impl CaptureContext {
     /// levels before crossing the adapter; the host must impose its own negotiated
     /// bounds as well. Invalid/oversized data produces an explicit omission instead.
     pub fn emit(&self, domain: &str, name: &str, data: serde_json::Value, sensitive: bool) {
-        let mut event = XrayEvent {
+        self.emit_with_capture(domain, name, data, sensitive, None);
+    }
+
+    /// Emit domain data with explicit typed capture locations.
+    ///
+    /// Reference locations are relative to `data`; arbitrary JSON is never scanned.
+    /// The same bounded delivery, sensitive gates and host-owned origin rules as
+    /// [`Self::emit`] apply. External adapters must preserve the complete event.
+    pub fn emit_with_capture(
+        &self,
+        domain: &str,
+        name: &str,
+        data: serde_json::Value,
+        sensitive: bool,
+        capture: Option<XrayCaptureAttachments>,
+    ) {
+        self.emit_event(XrayEvent {
             domain: domain.to_owned(),
             name: name.to_owned(),
             data,
             sensitive,
             correlation: self.correlation.clone(),
-        };
+            capture,
+        });
+    }
+
+    /// Emit a typed domain event, preserving explicit capture attachments.
+    ///
+    /// The context replaces caller-supplied correlation with its originating metadata.
+    /// External adapters must still enforce host-owned authority and negotiated bounds.
+    pub fn emit_event(&self, mut event: XrayEvent) {
+        event.correlation = self.correlation.clone();
         match &self.target {
             CaptureTarget::Hub(hub) => hub.emit(event),
-            CaptureTarget::Sink(sink) => {
-                if !sink.capture_active() || (sensitive && !sink.deep_capture_active()) {
+            CaptureTarget::Sink(sink, _) => {
+                if !sink.capture_active() || (event.sensitive && !sink.deep_capture_active()) {
                     return;
                 }
                 let mut budget = 64 * 1024;
@@ -821,6 +1187,7 @@ impl CaptureContext {
                     event.domain = "capture".into();
                     event.name = "event_omitted".into();
                     event.data = json!({"reason": "external_sink_event_limit_or_identity"});
+                    event.capture = None;
                 }
                 sink.emit(event);
             }
@@ -833,8 +1200,10 @@ impl CaptureContext {
     /// `capture.payload_omitted`, and the caller receives an explicit unsupported error.
     ///
     /// # Errors
-    /// Hub errors are described in [`XrayHub::capture_payload`]. External sinks return
-    /// [`XrayError::PayloadCaptureUnsupported`] when deep capture is active, otherwise None.
+    /// Hub errors are described in [`XrayHub::capture_payload`]. Payload-capable external
+    /// sinks propagate host callback errors after validating identity and content type.
+    /// Event-only sinks return [`XrayError::PayloadCaptureUnsupported`] when deep capture
+    /// is active, otherwise None.
     pub fn capture_payload(
         &self,
         content_type: &str,
@@ -842,9 +1211,25 @@ impl CaptureContext {
     ) -> Result<Option<XrayPayloadRef>, XrayError> {
         match &self.target {
             CaptureTarget::Hub(hub) => hub.capture_payload(&self.correlation, content_type, bytes),
-            CaptureTarget::Sink(_) => {
+            CaptureTarget::Sink(sink, capture_payload) => {
                 if !self.capture_active() || !self.deep_capture_active() {
                     return Ok(None);
+                }
+                if !valid_correlation(&self.correlation) {
+                    return Err(XrayError::InvalidIdentity);
+                }
+                if content_type.is_empty()
+                    || content_type.len() > 256
+                    || content_type.chars().any(char::is_control)
+                {
+                    return Err(XrayError::InvalidContentType);
+                }
+                let result = capture_payload.as_ref().map_or_else(
+                    || sink.capture_payload(content_type, bytes),
+                    |capture_payload| capture_payload(&self.correlation, content_type, bytes),
+                );
+                if result != Err(XrayError::PayloadCaptureUnsupported) {
+                    return result;
                 }
                 self.emit(
                     "capture",

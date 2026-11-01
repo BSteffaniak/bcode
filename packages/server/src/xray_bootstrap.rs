@@ -22,9 +22,73 @@ use crate::xray_http::{self, XrayHttpAccess, XrayHttpConfig};
 const MAX_ENDPOINTS: usize = 16;
 const UNUSED_TIMEOUT: Duration = Duration::from_secs(60);
 
+/// Explicit bootstrap options. Defaults never authorize browser access.
+#[derive(Debug, Default)]
+pub struct XrayEndpointOptions {
+    /// Untrusted exact-Origin request; validated after matching-client admission.
+    pub origin_grant: Option<bcode_ipc::XrayOriginGrantRequest>,
+}
+
+/// An explicit, exact browser Origin grant for one endpoint capability.
+///
+/// Construct immediately before bootstrap. Expiry is absolute and is never
+/// extended by active observations, reconnects, or cloning request data. Revoking
+/// the containing endpoint revokes both its bearer and this browser grant.
+#[derive(Debug)]
+pub struct XrayOriginGrant {
+    origin: String,
+    expires_at: Instant,
+}
+
+impl XrayOriginGrant {
+    /// Validate a canonical HTTP loopback Origin and a nonzero lifetime in seconds.
+    ///
+    /// No normalization is performed: callers must supply the exact browser Origin,
+    /// with no path, trailing slash, credentials, query, fragment or default port.
+    ///
+    /// # Errors
+    /// Returns a fixed error for invalid origins, zero or unrepresentable lifetimes.
+    pub fn new(origin: &str, lifetime_seconds: u64) -> Result<Self, XrayBootstrapError> {
+        if !valid_bootstrap_origin(origin) || lifetime_seconds == 0 {
+            return Err(XrayBootstrapError::InvalidOriginGrant);
+        }
+        let expires_at = Instant::now()
+            .checked_add(Duration::from_secs(lifetime_seconds))
+            .ok_or(XrayBootstrapError::InvalidOriginGrant)?;
+        Ok(Self {
+            origin: origin.to_owned(),
+            expires_at,
+        })
+    }
+}
+
+fn valid_bootstrap_origin(origin: &str) -> bool {
+    if origin.len() > 256 {
+        return false;
+    }
+    let Ok(url) = url::Url::parse(origin) else {
+        return false;
+    };
+    url.scheme() == "http"
+        && url.username().is_empty()
+        && url.password().is_none()
+        && url.query().is_none()
+        && url.fragment().is_none()
+        && url.origin().ascii_serialization() == origin
+        && url.host_str().is_some_and(|host| {
+            host == "localhost"
+                || host == "[::1]"
+                || host
+                    .parse::<std::net::IpAddr>()
+                    .is_ok_and(|ip| ip.is_loopback())
+        })
+}
+
 /// Secret-safe bootstrap failures; no paths, credentials or operating-system errors.
 #[derive(Debug, thiserror::Error)]
 pub enum XrayBootstrapError {
+    #[error("X-ray Origin grant is invalid or expired")]
+    InvalidOriginGrant,
     #[error("X-ray bootstrap is not authorized")]
     Forbidden,
     #[error("X-ray bootstrap is unavailable")]
@@ -38,6 +102,7 @@ impl XrayBootstrapError {
     #[must_use]
     pub const fn code(&self) -> &'static str {
         match self {
+            Self::InvalidOriginGrant => "xray_origin_grant_invalid",
             Self::Forbidden => "xray_bootstrap_forbidden",
             Self::Unavailable => "xray_bootstrap_unavailable",
             Self::Capacity => "xray_bootstrap_capacity",
@@ -113,7 +178,58 @@ impl ServerState {
         session_id: SessionId,
         deep_capture: bool,
     ) -> Result<XrayEndpointInfo, XrayBootstrapError> {
+        self.open_xray_endpoint_with_options(
+            client_id,
+            session_id,
+            deep_capture,
+            XrayEndpointOptions::default(),
+        )
+        .await
+    }
+
+    /// Open a capability using explicit application bootstrap options.
+    ///
+    /// Origin validation and monotonic expiry binding belong to bootstrap, not IPC
+    /// routing. Omitted Origin requests retain the browser-denying default.
+    ///
+    /// # Errors
+    /// Returns fixed authorization, Origin-validation or endpoint-admission errors.
+    pub async fn open_xray_endpoint_with_options(
+        self: &Arc<Self>,
+        client_id: ClientId,
+        session_id: SessionId,
+        deep_capture: bool,
+        options: XrayEndpointOptions,
+    ) -> Result<XrayEndpointInfo, XrayBootstrapError> {
         self.require_xray_bootstrap_client(client_id).await?;
+        let origin_grant = options
+            .origin_grant
+            .map(|request| XrayOriginGrant::new(&request.origin, request.lifetime_seconds))
+            .transpose()?;
+        self.open_xray_endpoint_with_origin(client_id, session_id, deep_capture, origin_grant)
+            .await
+    }
+
+    /// Open a one-session capability with an optional explicit browser Origin grant.
+    ///
+    /// `None` denies all Origin-bearing requests. A grant permits exactly one Origin
+    /// and expires the entire endpoint at its absolute deadline, even while active.
+    /// It does not authorize deep capture or replace bearer authentication. Use
+    /// [`Self::close_xray_endpoint`] to revoke it; changing an Origin requires a new
+    /// endpoint and independent credential rather than mutating live authorization.
+    ///
+    /// # Errors
+    /// Fails closed for expired grants and all ordinary endpoint admission failures.
+    pub async fn open_xray_endpoint_with_origin(
+        self: &Arc<Self>,
+        client_id: ClientId,
+        session_id: SessionId,
+        deep_capture: bool,
+        origin_grant: Option<XrayOriginGrant>,
+    ) -> Result<XrayEndpointInfo, XrayBootstrapError> {
+        self.require_xray_bootstrap_client(client_id).await?;
+        let expires_at = origin_grant.as_ref().map(|grant| grant.expires_at);
+        require_unexpired_origin(expires_at)?;
         crate::session_operations::require_selected_location(self, session_id)
             .await
             .map_err(|_| XrayBootstrapError::Unavailable)?;
@@ -129,14 +245,16 @@ impl ServerState {
         let application = XrayApplication::new(Arc::clone(self), Arc::clone(&self.xray));
         // Reuse the application's bounded canonical health/read-admission policy. Drop
         // the probe immediately; it is not returned as a successful external observation.
+        require_unexpired_origin(expires_at)?;
         let probe = application
-            .observe(
+            .observe_with_deadline(
                 &grant,
                 bcode_xray_models::XrayObserveRequest {
                     schema_version: bcode_xray_models::XRAY_SCHEMA_VERSION,
                     session_id: session_id.to_string(),
                     deep_capture,
                 },
+                expires_at.map(Instant::into_std),
             )
             .await
             .map_err(|_| XrayBootstrapError::Unavailable)?;
@@ -151,20 +269,31 @@ impl ServerState {
         if self.shutdown_requested.load(Ordering::SeqCst) {
             return Err(XrayBootstrapError::Unavailable);
         }
+        require_unexpired_origin(expires_at)?;
         let endpoint_id = uuid::Uuid::new_v4().to_string();
         // Three UUID-v4 values contain 366 independent random bits (not just 244).
         let token = new_token();
         let credential = CredentialFile::create(&self.state_root, &endpoint_id, &token)?;
         let access =
             XrayHttpAccess::new(&token, grant).map_err(|_| XrayBootstrapError::Unavailable)?;
+        let access = match expires_at {
+            Some(deadline) => access.with_expiry(deadline),
+            None => access,
+        };
         drop(token);
-        let config = XrayHttpConfig::default();
+        let config = XrayHttpConfig {
+            allowed_origins: origin_grant
+                .map(|grant| BTreeSet::from([grant.origin]))
+                .unwrap_or_default(),
+            ..XrayHttpConfig::default()
+        };
         let listener = xray_http::bind(&config)
             .await
             .map_err(|_| XrayBootstrapError::Unavailable)?;
         let address = listener
             .local_addr()
             .map_err(|_| XrayBootstrapError::Unavailable)?;
+        require_unexpired_origin(expires_at)?;
         let info = XrayEndpointInfo {
             endpoint_id: endpoint_id.clone(),
             session_id,
@@ -181,7 +310,7 @@ impl ServerState {
         let task = tokio::spawn(async move {
             // Guard cleanup runs on normal completion, serve error, panic or abort.
             let _credential = credential;
-            let inactivity = endpoint_shutdown(weak, activity, stopped, shutdown);
+            let inactivity = endpoint_shutdown(weak, activity, stopped, shutdown, expires_at);
             if xray_http::serve(listener, application, access, config, inactivity)
                 .await
                 .is_err()
@@ -256,16 +385,34 @@ impl ServerState {
     }
 }
 
+fn require_unexpired_origin(expires_at: Option<Instant>) -> Result<(), XrayBootstrapError> {
+    if expires_at.is_some_and(|deadline| Instant::now() >= deadline) {
+        Err(XrayBootstrapError::InvalidOriginGrant)
+    } else {
+        Ok(())
+    }
+}
+
+async fn origin_expired(expires_at: Option<Instant>) {
+    match expires_at {
+        Some(deadline) => tokio::time::sleep_until(deadline).await,
+        None => std::future::pending::<()>().await,
+    }
+}
+
 async fn endpoint_shutdown(
     state: Weak<ServerState>,
     activity: XrayHttpAccess,
     mut stopped: oneshot::Receiver<()>,
     mut shutdown: tokio::sync::broadcast::Receiver<()>,
+    expires_at: Option<Instant>,
 ) {
     let mut last_active = Instant::now();
     let mut tick = interval(Duration::from_secs(1));
     loop {
         tokio::select! {
+            // Explicit authorization expiry is independent of idle reclamation.
+            () = origin_expired(expires_at) => return,
             _ = &mut stopped => return,
             _ = shutdown.recv() => return,
             _ = tick.tick() => {

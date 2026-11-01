@@ -899,6 +899,9 @@ impl FakeProviderPlugin {
             .turns
             .get(&request.provider_turn_id)
             .map_or_else(Vec::new, FakeTurn::drain);
+        for event in &events {
+            diagnostics::event(event);
+        }
         diagnostics::record("stream_records", &events);
         json_response(&PollTurnEventsResponse { events })
     }
@@ -3142,6 +3145,7 @@ fn stream_fake_turn_events(turn: &FakeTurn, context: &NativeServiceContext) -> S
 
 /// Emit one provider turn event as an incremental service event.
 fn emit_provider_turn_event(context: &NativeServiceContext, event: &ProviderTurnEvent) {
+    diagnostics::event(event);
     diagnostics::record("stream_record", event);
     if let Ok(payload) = serde_json::to_vec(event) {
         context.events.emit(&payload);

@@ -111,6 +111,9 @@ pub async fn takeover(
     })
     .await
     .map_err(|_| unsupported())?;
+    // Diagnostic continuity cannot cross a verified owner replacement. This does not
+    // grant/revoke execution authority and diagnostic failure cannot block takeover.
+    let _ = state.xray_execution_watches.ownership_changed(run_id);
     owner_boundary::verify(&db, run_id, &replacement)
         .await
         .map_err(|_| unavailable())?;

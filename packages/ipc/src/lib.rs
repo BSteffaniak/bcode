@@ -331,6 +331,16 @@ impl Envelope {
     }
 }
 
+/// Explicit exact browser Origin grant for one endpoint capability.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct XrayOriginGrantRequest {
+    /// Exact HTTP(S) Origin, never a wildcard or URL path.
+    pub origin: String,
+    /// Bounded lifetime measured from authorized endpoint creation.
+    pub lifetime_seconds: u64,
+}
+
 /// A session-scoped local diagnostic capability. No bearer bytes cross IPC.
 /// The private credential file is delivered only to an authorized matching client.
 #[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -1446,6 +1456,33 @@ pub enum Request {
     OpenXrayEndpoint {
         session_id: SessionId,
         deep_capture: bool,
+        #[serde(default)]
+        origin_grant: Option<XrayOriginGrantRequest>,
+    },
+    /// Atomically admit a fresh run with authorized capture installed before scheduling.
+    StartWorkflowRunObserved {
+        start: bcode_workflow::WorkflowRunStartRequest,
+        observation: bcode_xray_models::execution_watch::ExecutionWatchStartOptions,
+    },
+    /// Explicitly authorize observing an exact workflow run and optional descendants.
+    OpenXrayExecutionWatch {
+        request: bcode_xray_models::execution_watch::OpenExecutionWatchRequest,
+    },
+    /// Consume a bounded live execution observation page.
+    ReadXrayExecutionWatch {
+        request: bcode_xray_models::execution_watch::ReadExecutionWatchRequest,
+    },
+    /// Establish diagnostic cutoffs, never execution cancellation.
+    FinalizeXrayExecutionWatch {
+        request: bcode_xray_models::execution_watch::FinalizeExecutionWatchRequest,
+    },
+    /// Export an authorized retained diagnostic payload range.
+    ExportXrayExecutionWatch {
+        request: bcode_xray_models::execution_watch::ExportExecutionWatchPayloadRequest,
+    },
+    /// Revoke capture and release its retained resources.
+    RevokeXrayExecutionWatch {
+        request: bcode_xray_models::execution_watch::RevokeExecutionWatchRequest,
     },
     /// Revoke a local diagnostic capability without affecting session execution.
     CloseXrayEndpoint {
@@ -2354,6 +2391,25 @@ pub enum ResponsePayload {
         endpoint: XrayEndpointInfo,
     },
     XrayEndpointClosed,
+    WorkflowRunStartedObserved {
+        started: bcode_workflow::WorkflowRunStartResponse,
+        ready: bcode_xray_models::execution_watch::ExecutionWatchReady,
+    },
+    OpenXrayExecutionWatch {
+        opened: bcode_xray_models::execution_watch::ExecutionWatchReady,
+    },
+    ReadXrayExecutionWatch {
+        page: bcode_xray_models::execution_watch::ExecutionWatchPage,
+    },
+    FinalizeXrayExecutionWatch {
+        evidence: bcode_xray_models::execution_watch::ExecutionWatchFinalEvidence,
+    },
+    ExportXrayExecutionWatch {
+        chunk: bcode_xray_models::XrayPayloadRange,
+    },
+    RevokeXrayExecutionWatch {
+        revoked: bcode_xray_models::execution_watch::ExecutionWatchRevoked,
+    },
     Hello {
         protocol_version: ProtocolVersion,
         client_id: ClientId,

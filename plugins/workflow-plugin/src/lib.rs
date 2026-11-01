@@ -8,6 +8,7 @@ mod authoring_tui;
 #[cfg(feature = "static-bundled")]
 mod cli;
 mod keybindings;
+mod observation_policy;
 mod prose;
 mod prose_editor;
 mod tools;
@@ -62,6 +63,28 @@ impl RustPlugin for WorkflowPlugin {
                     );
                 };
                 json_response(&publication_policy(&facts))
+            }
+            (
+                bcode_workflow::WORKFLOW_EXECUTION_OBSERVATION_POLICY_INTERFACE_ID,
+                bcode_workflow::OP_AUTHORIZE_EXECUTION_OBSERVATION,
+            ) => {
+                let Ok(facts) = context
+                    .request
+                    .payload_json::<bcode_workflow::WorkflowApplicationOperationFacts>()
+                else {
+                    return json_response(
+                        &bcode_workflow::WorkflowExecutionObservationPolicyDecision::Deny,
+                    );
+                };
+                let now = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .ok()
+                    .and_then(|duration| u64::try_from(duration.as_millis()).ok());
+                let decision = now.map_or(
+                    bcode_workflow::WorkflowExecutionObservationPolicyDecision::Deny,
+                    |now| observation_policy::evaluate(&context.config.config, &facts, now),
+                );
+                json_response(&decision)
             }
             (COMMAND_INTERFACE_ID, OP_INVOKE_COMMAND) => invoke_command(&context.request),
             (SESSION_STATUS_INTERFACE_ID, OP_SESSION_STATUS) => session_status(&context.request),

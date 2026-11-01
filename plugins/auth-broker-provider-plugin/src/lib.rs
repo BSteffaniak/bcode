@@ -402,7 +402,9 @@ fn failed(code: Failure) -> ServiceResponse {
 }
 impl AuthBrokerProviderPlugin {
     fn invoke(&self, context: &NativeServiceContext) -> ServiceResponse {
-        match self.handle(context) {
+        let result = self.handle(context);
+        diagnostics::operation(&context.request.operation, &result);
+        match result {
             Ok(response) => response,
             Err(code) => failed(code),
         }

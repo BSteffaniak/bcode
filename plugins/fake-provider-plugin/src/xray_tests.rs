@@ -77,11 +77,147 @@ async fn real_fake_adapter_and_push_stream_are_captured_without_changing_respons
         stream_seen |= envelope.event.name == "stream_record";
     }
     assert!(request_seen && stream_seen);
-    for observation in [&mut shallow, &mut foreign] {
-        while let Some(envelope) = observation.recv().await {
-            assert_ne!(envelope.event.domain, "provider.fake");
+    while let Some(envelope) = shallow.recv().await {
+        if envelope.event.domain == "provider.fake" {
+            assert_eq!(envelope.event.name, "normalized_outcome");
+            assert!(!envelope.event.sensitive);
         }
     }
+    while let Some(envelope) = foreign.recv().await {
+        assert_ne!(envelope.event.domain, "provider.fake");
+    }
+}
+
+#[tokio::test]
+async fn typed_payload_locations_ignore_reference_shaped_user_content() {
+    let hub = XrayHub::default();
+    let mut observation = observe(&hub, "fixture", true);
+    let capture = hub.context(XrayCorrelation {
+        session_id: "fixture".into(),
+        ..Default::default()
+    });
+    capture
+        .scope(async {
+            diagnostics::record(
+                "inline_fixture",
+                &serde_json::json!({
+                    "payload_ref":{"payload_id":"user-text", "sha256":"not-a-digest", "byte_len":7}
+                }),
+            );
+            diagnostics::record(
+                "retained_fixture",
+                &serde_json::json!({
+                    "text":"fixture".repeat(8192),
+                    "payload_ref":{"payload_id":"user-text", "sha256":"not-a-digest", "byte_len":7}
+                }),
+            );
+        })
+        .await;
+    observation.finalize().unwrap();
+    assert_eq!(observation.recv().await.unwrap().event.name, "ready");
+    let inline = observation.recv().await.unwrap();
+    assert!(inline.payload_references().unwrap().is_empty());
+    assert_eq!(
+        inline.event.data["value"]["payload_ref"]["payload_id"],
+        "user-text"
+    );
+    let retained = observation.recv().await.unwrap();
+    let references = retained.payload_references().unwrap();
+    assert_eq!(references.len(), 1);
+    assert_eq!(
+        serde_json::to_value(&references[0]).unwrap(),
+        retained.event.data["payload_ref"]
+    );
+    assert_eq!(observation.recv().await.unwrap().event.name, "finalized");
+    assert!(observation.recv().await.is_none());
+}
+
+#[tokio::test]
+async fn shallow_outcomes_exclude_arbitrary_error_and_protected_metadata() {
+    let hub = XrayHub::default();
+    let mut observation = observe(&hub, "fixture", false);
+    let capture = hub.context(XrayCorrelation {
+        session_id: "fixture".into(),
+        ..Default::default()
+    });
+    capture
+        .scope(async {
+            let mut error = fake_persist_error("private-message");
+            error.category = ProviderErrorCategory::Network;
+            error.provider_message = Some("private-provider-message".into());
+            error.diagnostic_context = Box::new(BTreeMap::from([(
+                "private-key".into(),
+                "private-value".into(),
+            )]));
+            diagnostics::event(&ProviderTurnEvent::Error { error });
+            diagnostics::event(&ProviderTurnEvent::Cancelled);
+            diagnostics::event(&ProviderTurnEvent::Usage {
+                usage: TokenUsage::default(),
+            });
+        })
+        .await;
+    observation.finalize().unwrap();
+    assert_eq!(observation.recv().await.unwrap().event.name, "ready");
+    let error = observation.recv().await.unwrap();
+    assert_eq!(error.event.data["category"], "network");
+    assert!(!serde_json::to_string(&error).unwrap().contains("private"));
+    assert!(!error.event.sensitive);
+    assert_eq!(
+        observation.recv().await.unwrap().event.data["outcome"],
+        "cancelled"
+    );
+    assert_eq!(observation.recv().await.unwrap().event.name, "finalized");
+    assert!(observation.recv().await.is_none());
+}
+
+#[tokio::test]
+async fn oversized_capture_is_explicit_loss_without_private_json_and_finish_is_normalized() {
+    let hub = XrayHub::default();
+    let mut observation = observe(&hub, "fixture", true);
+    let capture = hub.context(XrayCorrelation {
+        session_id: "fixture".into(),
+        ..Default::default()
+    });
+    capture.scope_sync(|| {
+        diagnostics::record(
+            "oversized_fixture",
+            &serde_json::json!({
+                "text": "界🙂".repeat(160_000),
+                "api_key": "private-oversized-secret"
+            }),
+        );
+        diagnostics::event(&ProviderTurnEvent::TurnFinished {
+            stop_reason: StopReason::EndTurn,
+        });
+    });
+    observation.finalize().unwrap();
+    let mut omitted = false;
+    let mut finished = false;
+    let mut loss = None;
+    while let Some(envelope) = observation.recv().await {
+        assert!(
+            !serde_json::to_string(&envelope)
+                .unwrap()
+                .contains("private-oversized-secret")
+        );
+        assert!(envelope.payload_references().unwrap().is_empty());
+        if envelope.event.name == "payload_omitted" {
+            assert_eq!(envelope.event.data["reason"], "serialization_or_size_limit");
+            assert!(!envelope.event.sensitive);
+            omitted = true;
+        }
+        if envelope.event.name == "normalized_outcome" {
+            assert_eq!(envelope.event.data["outcome"], "finished");
+            assert_eq!(envelope.event.data["stop_reason"], "end_turn");
+            finished = true;
+        }
+        if envelope.event.name == "finalized" {
+            loss = envelope.event.data["hub_contention_drops"].as_u64();
+        }
+    }
+    assert!(omitted);
+    assert!(finished);
+    assert_eq!(loss, Some(1));
 }
 
 #[tokio::test]
@@ -149,6 +285,7 @@ async fn large_redacted_payload_is_retrievable_by_transient_reference_after_fina
         envelope.event.data["representation"],
         "redacted_json_payload_ref"
     );
+    assert_eq!(envelope.payload_references().unwrap().len(), 1);
     let reference: XrayPayloadRef =
         serde_json::from_value(envelope.event.data["payload_ref"].clone()).unwrap();
     let mut bytes = Vec::new();

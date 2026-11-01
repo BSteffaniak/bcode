@@ -2797,12 +2797,7 @@ pub async fn cancel_session_tool_exchanges(state: &ServerState, session_id: Sess
         pending.notify.notify_waiters();
         notify_route_destination(state, pending.summary.interaction_route.as_ref()).await;
     }
-    crate::xray_tools::emit(
-        state,
-        session_id,
-        "exchanges_cleaned",
-        serde_json::json!({"removed": removed_count}),
-    );
+    crate::xray_tools::exchanges_cleaned(state, session_id, removed_count);
     observation.finish("completed");
 }
 

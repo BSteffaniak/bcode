@@ -1,7 +1,7 @@
 //! Session-scoped X-ray over the public local HTTP/SSE protocol.
 //!
-//! This client deliberately does not discover private daemon sockets or start a daemon.
-//! Callers supply a trusted endpoint and a bearer token obtained through local discovery.
+//! Matching application clients bootstrap authorized endpoints through their ordinary API.
+//! Explicit endpoint overrides remain supported; no private daemon socket discovery occurs.
 //! Streams are transient: EOF without `xray.finalized` is an error, never a resume cursor.
 
 use bcode_xray_models::{
@@ -12,6 +12,15 @@ use reqwest::header::{ACCEPT, AUTHORIZATION, HeaderValue};
 use sha2::{Digest as _, Sha256};
 use std::collections::VecDeque;
 use std::time::Duration;
+
+#[cfg(test)]
+mod behavior_tests;
+mod controller;
+#[cfg(test)]
+mod controller_tests;
+pub use controller::{
+    XrayObservationController, XraySegmentEnd, XraySegmentIdentity, XraySegmentResult,
+};
 
 const MAX_SSE_FRAME_BYTES: usize = 2 * 1024 * 1024;
 const HTTP_OPERATION_TIMEOUT: Duration = Duration::from_secs(15);
@@ -36,14 +45,21 @@ impl XrayEndpointLease {
     /// # Errors
     /// Reports rejected or ambiguous revocation. Never deletes the credential path locally.
     pub async fn close(mut self) -> Result<(), crate::ClientError> {
-        self.connection
-            .close_xray_endpoint(&self.info.endpoint_id)
-            .await
+        tokio::time::timeout(
+            HTTP_OPERATION_TIMEOUT,
+            self.connection.close_xray_endpoint(&self.info.endpoint_id),
+        )
+        .await
+        .map_err(|_| {
+            crate::ClientError::Protocol(
+                "X-ray endpoint revocation timed out; acknowledgement unavailable".into(),
+            )
+        })?
     }
 }
 
 /// Secret-safe transport or protocol failure. Server bodies and request details are excluded.
-#[derive(Debug, thiserror::Error)]
+#[derive(Clone, Debug, thiserror::Error)]
 pub enum XrayClientError {
     /// Endpoint was not an explicit loopback HTTP origin.
     #[error(
@@ -53,6 +69,9 @@ pub enum XrayClientError {
     /// Authentication material was malformed.
     #[error("invalid X-ray bearer credential")]
     InvalidCredential,
+    /// Application admission was rejected; no response text or secrets are exposed.
+    #[error("X-ray application admission rejected; explicit authorization is required")]
+    AdmissionRejected,
     /// No server response can be trusted as a successful operation.
     #[error("X-ray HTTP transport failed; observation may be incomplete")]
     Transport,
@@ -67,12 +86,28 @@ pub enum XrayClientError {
     Incomplete,
 }
 
+impl XrayClientError {
+    /// Whether an explicit bounded caller recovery policy may rebootstrap after loss.
+    /// Authorization, schema, configuration and unknown HTTP failures are never transient.
+    /// This is not an automatic retry instruction or permission to broaden authorization.
+    #[must_use]
+    pub const fn permits_rebootstrap_retry(&self) -> bool {
+        matches!(
+            self,
+            Self::Transport | Self::Incomplete | Self::Http(502..=504)
+        )
+    }
+}
+
 /// Authenticated public HTTP client. Debug output intentionally omits configuration.
 #[derive(Clone)]
 pub struct XrayClient {
     http: reqwest::Client,
     origin: reqwest::Url,
     authorization: HeaderValue,
+    revoked: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    capture_closed: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    drain_expiry: std::sync::Arc<std::sync::Mutex<Option<tokio::time::Instant>>>,
 }
 
 impl std::fmt::Debug for XrayClient {
@@ -82,6 +117,93 @@ impl std::fmt::Debug for XrayClient {
 }
 
 impl XrayClient {
+    /// Load a bounded private regular credential file without following its final symlink.
+    /// Credential bytes and filesystem errors never enter diagnostics or recording output.
+    /// The file is read afresh; this method does not cache or renew an old capability.
+    ///
+    /// # Errors
+    /// Rejects unavailable, replaced, oversized, non-private or malformed credentials,
+    /// unsupported platforms and invalid endpoint origins.
+    pub fn from_credential_file(
+        endpoint: &str,
+        path: &std::path::Path,
+    ) -> Result<Self, XrayClientError> {
+        use std::io::Read as _;
+        validate_origin(endpoint)?;
+        #[cfg(not(unix))]
+        {
+            let _ = path;
+            Err(XrayClientError::InvalidCredential)
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::{MetadataExt as _, OpenOptionsExt as _};
+            let invalid = |_| XrayClientError::InvalidCredential;
+            let before = std::fs::symlink_metadata(path).map_err(invalid)?;
+            if !before.is_file() || before.file_type().is_symlink() {
+                return Err(XrayClientError::InvalidCredential);
+            }
+            let file = std::fs::OpenOptions::new()
+                .read(true)
+                .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+                .open(path)
+                .map_err(invalid)?;
+            let metadata = file.metadata().map_err(invalid)?;
+            if !metadata.is_file()
+                || metadata.mode() & 0o077 != 0
+                || metadata.dev() != before.dev()
+                || metadata.ino() != before.ino()
+                || metadata.len() > 4096
+            {
+                return Err(XrayClientError::InvalidCredential);
+            }
+            let mut bytes = Vec::new();
+            file.take(4097).read_to_end(&mut bytes).map_err(invalid)?;
+            if bytes.len() > 4096 {
+                return Err(XrayClientError::InvalidCredential);
+            }
+            let token = String::from_utf8(bytes).map_err(|_| XrayClientError::InvalidCredential)?;
+            Self::new(endpoint, &token)
+        }
+    }
+
+    fn invalidate(&self) {
+        self.revoked
+            .store(true, std::sync::atomic::Ordering::Release);
+    }
+
+    fn close_capture_for_drain(&self, deadline: tokio::time::Instant) {
+        self.capture_closed
+            .store(true, std::sync::atomic::Ordering::Release);
+        if let Ok(mut expiry) = self.drain_expiry.lock() {
+            *expiry = Some(expiry.map_or(deadline, |previous| previous.min(deadline)));
+        } else {
+            self.invalidate();
+        }
+    }
+
+    /// Disable new observations on all clones while queued payloads drain for at most
+    /// 30 seconds. Repeated calls cannot extend the original deadline. This does not
+    /// close an existing stream: its owner must drop it before joining the consumer.
+    /// Endpoint revocation and payload release remain explicit, after that join.
+    pub fn begin_payload_drain(&self) {
+        self.close_capture_for_drain(tokio::time::Instant::now() + Duration::from_secs(30));
+    }
+
+    fn ensure_active(&self) -> Result<(), XrayClientError> {
+        let expired = self.drain_expiry.lock().map_or(true, |expiry| {
+            expiry.is_some_and(|deadline| tokio::time::Instant::now() >= deadline)
+        });
+        if expired {
+            self.invalidate();
+        }
+        if self.revoked.load(std::sync::atomic::Ordering::Acquire) {
+            Err(XrayClientError::InvalidCredential)
+        } else {
+            Ok(())
+        }
+    }
+
     /// Construct a client from explicitly trusted local configuration.
     ///
     /// Redirects and ambient proxies are disabled. Tokens are sent only as sensitive
@@ -107,6 +229,9 @@ impl XrayClient {
             http,
             origin,
             authorization,
+            revoked: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            capture_closed: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            drain_expiry: std::sync::Arc::new(std::sync::Mutex::new(None)),
         })
     }
 
@@ -119,6 +244,12 @@ impl XrayClient {
         &self,
         request: XrayObserveRequest,
     ) -> Result<XrayStream, XrayClientError> {
+        if self
+            .capture_closed
+            .load(std::sync::atomic::Ordering::Acquire)
+        {
+            return Err(XrayClientError::InvalidCredential);
+        }
         if request.schema_version != XRAY_SCHEMA_VERSION || request.session_id.is_empty() {
             return Err(XrayClientError::Protocol);
         }
@@ -152,6 +283,7 @@ impl XrayClient {
             last_sequence: 0,
             finalized: false,
             finalization: None,
+            revoked: self.revoked.clone(),
         };
         let ready = tokio::time::timeout(Duration::from_secs(15), stream.read_next())
             .await
@@ -197,10 +329,23 @@ impl XrayClient {
     }
 
     fn bounded_post(&self, path: &str) -> Result<reqwest::RequestBuilder, XrayClientError> {
+        let url = self.url(path)?;
+        let timeout = self
+            .drain_expiry
+            .lock()
+            .map_err(|_| XrayClientError::InvalidCredential)?
+            .map_or(HTTP_OPERATION_TIMEOUT, |deadline| {
+                HTTP_OPERATION_TIMEOUT
+                    .min(deadline.saturating_duration_since(tokio::time::Instant::now()))
+            });
+        if timeout.is_zero() {
+            self.invalidate();
+            return Err(XrayClientError::InvalidCredential);
+        }
         Ok(self
             .http
-            .post(self.url(path)?)
-            .timeout(HTTP_OPERATION_TIMEOUT)
+            .post(url)
+            .timeout(timeout)
             .header(AUTHORIZATION, self.authorization.clone()))
     }
 
@@ -298,9 +443,9 @@ impl XrayClient {
     /// Copy generic typed payload references carried in event data into a recording sink.
     /// Call while observation retention is live, including after the final frame but before
     /// `release`. Successful HTTP payload reads renew the server's bounded retention lease.
-    /// Candidate objects containing `payload_id` or digest/length coordinates must be
-    /// exactly a complete v1 `XrayPayloadRef`; malformed/future references fail closed.
-    /// Traversal, reference
+    /// Only explicitly declared typed capture attachments are resolved. Undeclared
+    /// reference-shaped user/tool/provider JSON remains opaque. Malformed or future
+    /// declared attachments fail closed. Reference
     /// count, payload size, ranges and per-payload fetch time are bounded. The client
     /// checks full SHA-256 and length; sink `store_payload` checks them again before
     /// claiming local retention.
@@ -331,7 +476,10 @@ impl XrayClient {
         sink: &mut dyn bcode_xray::recording::RecordingSink,
         range_bytes: u32,
     ) -> Result<(), XrayClientError> {
-        let references = payload_references(&envelope.event.data)?;
+        self.ensure_active()?;
+        let references = envelope
+            .payload_references()
+            .map_err(|_| XrayClientError::Protocol)?;
         for reference in &references {
             if reference.schema_version != XRAY_SCHEMA_VERSION
                 || reference.session_id != envelope.event.correlation.session_id
@@ -388,6 +536,7 @@ impl XrayClient {
     }
 
     fn url(&self, path: &str) -> Result<reqwest::Url, XrayClientError> {
+        self.ensure_active()?;
         self.origin
             .join(path)
             .map_err(|_| XrayClientError::InvalidEndpoint)
@@ -404,98 +553,6 @@ fn validate_payload_bytes(
         return Err(XrayClientError::Protocol);
     }
     Ok(())
-}
-
-fn payload_references(
-    data: &serde_json::Value,
-) -> Result<Vec<bcode_xray_models::XrayPayloadRef>, XrayClientError> {
-    let mut pending = vec![(data, 0_u8, false)];
-    let mut visited = 0_usize;
-    let mut references = std::collections::BTreeMap::new();
-    while let Some((value, depth, expected_reference)) = pending.pop() {
-        visited += 1;
-        if expected_reference
-            && !value.is_null()
-            && !value.is_array()
-            && !value
-                .as_object()
-                .is_some_and(|object| object.contains_key("payload_id"))
-        {
-            return Err(XrayClientError::Protocol);
-        }
-        if visited > 4096 || depth > 32 {
-            return Err(XrayClientError::Protocol);
-        }
-        match value {
-            serde_json::Value::Object(object)
-                if object.contains_key("payload_id")
-                    || (object.contains_key("sha256") && object.contains_key("byte_len")) =>
-            {
-                let fields = [
-                    "schema_version",
-                    "payload_id",
-                    "session_id",
-                    "content_type",
-                    "byte_len",
-                    "sha256",
-                ];
-                if object.len() != fields.len()
-                    || object.keys().any(|key| !fields.contains(&key.as_str()))
-                {
-                    return Err(XrayClientError::Protocol);
-                }
-                let reference: bcode_xray_models::XrayPayloadRef =
-                    serde_json::from_value(value.clone()).map_err(|_| XrayClientError::Protocol)?;
-                if reference.schema_version != XRAY_SCHEMA_VERSION
-                    || reference.payload_id.is_empty()
-                    || reference.sha256.len() != 64
-                    || !reference
-                        .sha256
-                        .bytes()
-                        .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
-                {
-                    return Err(XrayClientError::Protocol);
-                }
-                if references
-                    .get(&reference.payload_id)
-                    .is_some_and(|existing| existing != &reference)
-                {
-                    return Err(XrayClientError::Protocol);
-                }
-                references.insert(reference.payload_id.clone(), reference);
-                if references.len() > 64 {
-                    return Err(XrayClientError::Protocol);
-                }
-            }
-            serde_json::Value::Object(object) => {
-                if pending.len().saturating_add(object.len()) > 4096 {
-                    return Err(XrayClientError::Protocol);
-                }
-                pending.extend(object.iter().map(|(key, value)| {
-                    (
-                        value,
-                        depth + 1,
-                        matches!(
-                            key.as_str(),
-                            "payload" | "payloads" | "payload_ref" | "payload_refs"
-                        ),
-                    )
-                }));
-            }
-            serde_json::Value::Array(array) => {
-                if pending.len().saturating_add(array.len()) > 4096 {
-                    return Err(XrayClientError::Protocol);
-                }
-                pending.extend(
-                    array
-                        .iter()
-                        .map(|value| (value, depth + 1, expected_reference)),
-                );
-            }
-            _ => {}
-        }
-    }
-    Ok(references.into_values().collect())
 }
 
 fn check_status(response: &reqwest::Response) -> Result<(), XrayClientError> {
@@ -540,6 +597,7 @@ pub struct XrayStream {
     last_sequence: u64,
     finalized: bool,
     finalization: Option<XrayFinalization>,
+    revoked: std::sync::Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl XrayStream {
@@ -560,6 +618,9 @@ impl XrayStream {
     /// # Errors
     /// Rejects unknown versions, identity changes, unexplained sequence loss and abrupt EOF.
     pub async fn recv(&mut self) -> Result<Option<XrayEnvelope>, XrayClientError> {
+        if self.revoked.load(std::sync::atomic::Ordering::Acquire) {
+            return Err(XrayClientError::InvalidCredential);
+        }
         if let Some(envelope) = self.pending.pop_front() {
             return Ok(Some(envelope));
         }
@@ -571,6 +632,9 @@ impl XrayStream {
 
     async fn read_next(&mut self) -> Result<XrayEnvelope, XrayClientError> {
         loop {
+            if self.revoked.load(std::sync::atomic::Ordering::Acquire) {
+                return Err(XrayClientError::InvalidCredential);
+            }
             if let Some(data) = self.decoder.next_data()? {
                 let envelope: XrayEnvelope =
                     serde_json::from_str(&data).map_err(|_| XrayClientError::Protocol)?;
@@ -590,6 +654,7 @@ impl XrayStream {
     fn accept(&mut self, envelope: &XrayEnvelope) -> Result<(), XrayClientError> {
         if envelope.schema_version != XRAY_SCHEMA_VERSION
             || envelope.observation_id.is_empty()
+            || envelope.observation_id.len() > 128
             || envelope.event.correlation.session_id != self.session_id
             || self
                 .observation_id
@@ -598,6 +663,9 @@ impl XrayStream {
         {
             return Err(XrayClientError::Protocol);
         }
+        let _ = envelope
+            .payload_references()
+            .map_err(|_| XrayClientError::Protocol)?;
         let delivered_through = validate_sequence(envelope, self.last_sequence)?;
         if envelope.event.domain == "xray" && envelope.event.name == "finalized" {
             let finalization: XrayFinalization =
@@ -715,47 +783,6 @@ mod tests {
     }
 
     #[test]
-    fn payload_references_are_typed_bounded_and_conflict_checked() {
-        let reference = bcode_xray_models::XrayPayloadRef {
-            schema_version: XRAY_SCHEMA_VERSION,
-            payload_id: "payload-1".into(),
-            session_id: "session".into(),
-            content_type: "text/plain".into(),
-            byte_len: 3,
-            sha256: hex::encode(Sha256::digest(b"abc")),
-        };
-        let data = serde_json::json!({"nested": [{"payload": reference}, reference]});
-        assert_eq!(payload_references(&data).unwrap(), vec![reference.clone()]);
-        assert!(validate_payload_bytes(&reference, b"abc").is_ok());
-        assert!(validate_payload_bytes(&reference, b"abd").is_err());
-        assert!(validate_payload_bytes(&reference, b"ab").is_err());
-        let mut future = reference.clone();
-        future.schema_version += 1;
-        assert!(payload_references(&serde_json::json!({"payload": future})).is_err());
-        let mut unknown = serde_json::to_value(&reference).unwrap();
-        unknown
-            .as_object_mut()
-            .unwrap()
-            .insert("future".into(), serde_json::json!(true));
-        assert!(payload_references(&unknown).is_err());
-        assert!(
-            payload_references(
-                &serde_json::json!({"payload": {"future_encoding": "missing reference"}})
-            )
-            .is_err()
-        );
-        assert!(payload_references(&serde_json::json!({"payload_id": "incomplete"})).is_err());
-        let mut conflicting = reference.clone();
-        conflicting.byte_len += 1;
-        assert!(payload_references(&serde_json::json!([reference, conflicting])).is_err());
-        let mut deep = serde_json::json!(null);
-        for _ in 0..34 {
-            deep = serde_json::json!([deep]);
-        }
-        assert!(payload_references(&deep).is_err());
-    }
-
-    #[test]
     fn origins_reject_remote_credential_and_ambient_discovery() {
         for origin in [
             "https://127.0.0.1:1234",
@@ -795,6 +822,7 @@ mod tests {
                 name: "gap".into(),
                 correlation: bcode_xray_models::XrayCorrelation::default(),
                 sensitive: false,
+                capture: None,
                 data: serde_json::json!({"first_sequence": 2, "last_sequence": 5, "reason": "queue_full"}),
             },
         };

@@ -154,10 +154,11 @@ fn invoke(request: &ServiceRequest, cancellation: &ServiceCancellation) -> Servi
             let Ok(envelope) = request.payload_json::<ProviderRequest>() else {
                 return ServiceResponse::error("invalid_request", "invalid judgement request");
             };
-            match runtime.block_on(diagnostics::scope(cancel_on_signal(
-                judge(&envelope),
-                cancellation,
-            ))) {
+            match runtime.block_on(diagnostics::scope(async {
+                let result = cancel_on_signal(judge(&envelope), cancellation).await;
+                diagnostics::outcome(&result);
+                result
+            })) {
                 Ok(result) => encode(&result),
                 Err(error) => ServiceResponse::error(error, error),
             }

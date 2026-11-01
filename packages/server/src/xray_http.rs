@@ -122,6 +122,7 @@ pub struct XrayHttpAccess {
     digest: [u8; 32],
     grant: XrayAccessGrant,
     observations: Arc<control::Registry>,
+    expires_at: Option<Instant>,
 }
 
 impl XrayHttpAccess {
@@ -143,7 +144,22 @@ impl XrayHttpAccess {
             digest: Sha256::digest(token.as_bytes()).into(),
             grant,
             observations: Arc::new(control::Registry::default()),
+            expires_at: None,
         })
+    }
+
+    /// Bind an absolute authorization deadline shared by all routes and observers.
+    /// Unlike observation cutoff, expiry revokes retained payload access as well.
+    /// The constructor remains unlimited unless a provisioner explicitly calls this.
+    #[must_use]
+    pub const fn with_expiry(mut self, expires_at: Instant) -> Self {
+        self.expires_at = Some(expires_at);
+        self
+    }
+
+    fn expired(&self) -> bool {
+        self.expires_at
+            .is_some_and(|deadline| Instant::now() >= deadline)
     }
 
     /// Live observers, including finalized streams still draining retained payloads.
@@ -243,6 +259,7 @@ pub async fn serve(
     {
         return Err(XrayHttpStartError::InvalidConfiguration);
     }
+    let expires_at = access.expires_at;
     let (stop, stopped) = watch::channel(false);
     let mut graceful_stop = stopped.clone();
     let observations = Arc::clone(&access.observations);
@@ -277,6 +294,12 @@ pub async fn serve(
             let _ = graceful_stop.changed().await;
         })
         .into_future();
+    let shutdown = async move {
+        tokio::select! {
+            () = shutdown => {},
+            () = optional_deadline(expires_at) => {},
+        }
+    };
     tokio::pin!(server);
     tokio::pin!(shutdown);
     tokio::select! {
@@ -447,6 +470,9 @@ fn request_guard(
     authority: &str,
     request: &Request,
 ) -> Result<Option<String>, HttpFailure> {
+    if access.expired() {
+        return Err(failure(StatusCode::FORBIDDEN, "xray_capability_expired"));
+    }
     let headers = request.headers();
     if request.uri().to_string().len() > 512
         || headers.len() > 64
@@ -490,7 +516,7 @@ fn request_guard(
     Ok(origin)
 }
 
-async fn guard(State(state): State<Arc<HttpState>>, request: Request, next: Next) -> Response {
+async fn guard(State(state): State<Arc<HttpState>>, mut request: Request, next: Next) -> Response {
     let origin = match request_guard(&state.access, &state.config, &state.authority, &request) {
         Ok(origin) => origin,
         Err(response) => return secure_headers(response.into_response(), None),
@@ -529,8 +555,33 @@ async fn guard(State(state): State<Arc<HttpState>>, request: Request, next: Next
             public_error(StatusCode::FORBIDDEN, "xray_preflight_forbidden")
         }
     } else {
-        next.run(request).await
+        request
+            .extensions_mut()
+            .insert(CapabilityDeadline(state.access.expires_at));
+        before_expiry(state.access.expires_at, next.run(request))
+            .await
+            .unwrap_or_else(|| public_error(StatusCode::FORBIDDEN, "xray_capability_expired"))
     };
+    // A synchronous handler may finish on the same poll that crosses the deadline.
+    if state.access.expired() {
+        return secure_headers(
+            public_error(StatusCode::FORBIDDEN, "xray_capability_expired"),
+            None,
+        );
+    }
+    let response = response.map(|body| {
+        let expires_at = state.access.expires_at;
+        axum::body::Body::from_stream(stream::unfold(
+            body.into_data_stream(),
+            move |mut body| async move {
+                use futures::StreamExt;
+                before_expiry(expires_at, body.next())
+                    .await
+                    .flatten()
+                    .map(|chunk| (chunk, body))
+            },
+        ))
+    });
     secure_headers(response, origin.as_deref())
 }
 
@@ -553,7 +604,32 @@ fn secure_headers(mut response: Response, origin: Option<&str>) -> Response {
     response
 }
 
+/// Poll no work after its authorization deadline, including a simultaneously ready body.
+async fn before_expiry<T>(expires_at: Option<Instant>, work: impl Future<Output = T>) -> Option<T> {
+    if expires_at.is_some_and(|deadline| Instant::now() >= deadline) {
+        return None;
+    }
+    tokio::select! {
+        biased;
+        () = optional_deadline(expires_at) => None,
+        value = work => {
+            if expires_at.is_some_and(|deadline| Instant::now() >= deadline) {
+                None
+            } else {
+                Some(value)
+            }
+        },
+    }
+}
+
+#[derive(Clone, Copy)]
+struct CapabilityDeadline(Option<Instant>);
+
 async fn request_json<T: serde::de::DeserializeOwned>(request: Request) -> Result<T, HttpFailure> {
+    let expires_at = request
+        .extensions()
+        .get::<CapabilityDeadline>()
+        .and_then(|deadline| deadline.0);
     if single_header(request.headers(), "content-type") != Some("application/json")
         || request.headers().contains_key(header::CONTENT_ENCODING)
     {
@@ -562,11 +638,15 @@ async fn request_json<T: serde::de::DeserializeOwned>(request: Request) -> Resul
             "xray_json_required",
         ));
     }
-    let bytes = timeout(
-        REQUEST_TIMEOUT,
-        to_bytes(request.into_body(), MAX_REQUEST_BYTES),
+    let bytes = before_expiry(
+        expires_at,
+        timeout(
+            REQUEST_TIMEOUT,
+            to_bytes(request.into_body(), MAX_REQUEST_BYTES),
+        ),
     )
     .await
+    .ok_or_else(|| failure(StatusCode::FORBIDDEN, "xray_capability_expired"))?
     .map_err(|_| failure(StatusCode::REQUEST_TIMEOUT, "xray_request_timeout"))?
     .map_err(|_| failure(StatusCode::PAYLOAD_TOO_LARGE, "xray_request_too_large"))?;
     serde_json::from_slice(&bytes)
@@ -584,16 +664,29 @@ async fn observe(State(state): State<Arc<HttpState>>, request: Request) -> Respo
         Ok(input) => input,
         Err(response) => return response.into_response(),
     };
+    if state.access.expired() {
+        return public_error(StatusCode::FORBIDDEN, "xray_capability_expired");
+    }
     let session_id = input.session_id.clone();
-    let observation = match timeout(
-        REQUEST_TIMEOUT,
-        state.application.observe(&state.access.grant, input),
+    let observation = match before_expiry(
+        state.access.expires_at,
+        timeout(
+            REQUEST_TIMEOUT,
+            state.application.observe_with_deadline(
+                &state.access.grant,
+                input,
+                state.access.expires_at.map(Instant::into_std),
+            ),
+        ),
     )
     .await
     {
-        Ok(Ok(observation)) => observation,
-        Ok(Err(error)) => return application_error(error),
-        Err(_) => return public_error(StatusCode::SERVICE_UNAVAILABLE, "xray_admission_timeout"),
+        Some(Ok(Ok(observation))) => observation,
+        Some(Ok(Err(error))) => return application_error(error),
+        Some(Err(_)) => {
+            return public_error(StatusCode::SERVICE_UNAVAILABLE, "xray_admission_timeout");
+        }
+        None => return public_error(StatusCode::FORBIDDEN, "xray_capability_expired"),
     };
     let registration = match state.observations.register(
         observation.id(),
@@ -608,6 +701,7 @@ async fn observe(State(state): State<Arc<HttpState>>, request: Request) -> Respo
         permit,
         state.shutdown.clone(),
         state.config.max_observation_duration,
+        state.access.expires_at,
         registration,
     )
 }
@@ -623,7 +717,14 @@ fn observation_response(
     let registration = registry
         .register(observation.id(), String::new(), 1)
         .unwrap();
-    registered_observation_response(observation, permit, shutdown, Some(duration), registration)
+    registered_observation_response(
+        observation,
+        permit,
+        shutdown,
+        Some(duration),
+        None,
+        registration,
+    )
 }
 
 fn registered_observation_response(
@@ -631,6 +732,7 @@ fn registered_observation_response(
     permit: tokio::sync::OwnedSemaphorePermit,
     shutdown: watch::Receiver<bool>,
     duration: Option<Duration>,
+    expires_at: Option<Instant>,
     registration: (
         control::Registration,
         watch::Receiver<bool>,
@@ -653,42 +755,50 @@ fn registered_observation_response(
     // frame plus a five-second send budget makes stalled readers release observation state.
     let (sender, receiver) = mpsc::channel(1);
     let pump = tokio::spawn(async move {
-        let mut state = stream_state;
-        loop {
-            let next = tokio::select! {
-                biased;
-                () = sender.closed() => break,
-                next = next_event(&mut state) => next,
-            };
-            let Some(event) = next else { break };
-            let terminal = matches!(&event, Ok((_, true)));
-            if !state.send_event(&sender, event).await {
-                break;
+        // Hard revocation drops the observation, registration and retained payloads,
+        // even if a reader stalls or a finalization receipt has already been sent.
+        let _ = before_expiry(expires_at, async move {
+            let mut state = stream_state;
+            loop {
+                let next = tokio::select! {
+                    biased;
+                    () = sender.closed() => break,
+                    next = next_event(&mut state) => next,
+                };
+                let Some(event) = next else { break };
+                let terminal = matches!(&event, Ok((_, true)));
+                if !state.send_event(&sender, event).await {
+                    break;
+                }
+                if terminal {
+                    break;
+                }
             }
-            if terminal {
-                break;
+            let finalized = matches!(*state.cutoff.borrow(), Some(Ok(_)));
+            if finalized {
+                state
+                    .registration
+                    .retain_payloads(&mut state.shutdown)
+                    .await;
             }
-        }
-        let finalized = matches!(*state.cutoff.borrow(), Some(Ok(_)));
-        if finalized {
-            state
-                .registration
-                .retain_payloads(&mut state.shutdown)
-                .await;
-        }
+        })
+        .await;
     });
     // Dropping a JoinHandle detaches rather than aborts. Active disconnect is noticed by
     // sender.closed(); finalized disconnect retains only the bounded payload lease.
     let output = stream::unfold(
         (receiver, pump, false),
-        |(mut receiver, pump, terminal)| async move {
+        move |(mut receiver, pump, terminal)| async move {
             if terminal {
                 return None;
             }
-            receiver.recv().await.map(|event| {
-                let terminal = matches!(&event, Ok((_, true)));
-                (event.map(|(event, _)| event), (receiver, pump, terminal))
-            })
+            before_expiry(expires_at, receiver.recv())
+                .await
+                .flatten()
+                .map(|event| {
+                    let terminal = matches!(&event, Ok((_, true)));
+                    (event.map(|(event, _)| event), (receiver, pump, terminal))
+                })
         },
     );
     Sse::new(output)
@@ -811,6 +921,7 @@ impl ObservationStream {
             return result.as_ref().map(|_| ()).map_err(|error| *error);
         }
         let result = self.observation.finalize().map_err(|_| ());
+        tracing::info!(loss_attribution = ?self.observation, "X-ray observation cutoff established");
         let success = result.is_ok();
         self.cutoff.send_replace(Some(result));
         if success { Ok(()) } else { Err(()) }
@@ -834,6 +945,9 @@ async fn payload(State(state): State<Arc<HttpState>>, request: Request) -> Respo
         Ok(input) => input,
         Err(response) => return response.into_response(),
     };
+    if state.access.expired() {
+        return public_error(StatusCode::FORBIDDEN, "xray_capability_expired");
+    }
     let control = match state
         .observations
         .authorized(&input.observation_id, &state.access.grant)

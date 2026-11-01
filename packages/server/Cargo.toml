@@ -148,6 +148,7 @@ png = { workspace = true }
 switchy = { workspace = true, features = ["database", "database-schema"] }
 tempfile = { workspace = true }
 tokio = { workspace = true, features = ["test-util"] }
+tower = { workspace = true, features = ["util"] }
 tracing-subscriber = { workspace = true }
 
 [target.'cfg(target_os = "macos")'.dev-dependencies]

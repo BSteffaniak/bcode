@@ -1,0 +1,38 @@
+id             = "xray-offline-workflow"
+name           = "Actual eval CLI with production scoped diagnostic policy"
+schema_version = 1
+[run]
+fail_fast            = false
+isolation            = "temp_copy"
+randomize_case_order = false
+repetitions          = 1
+timeout_ms           = 120000
+[[variants]]
+executor = "workflow"
+id       = "single"
+[variants.metadata]
+daemon_isolation = "shared"
+xray_root_run_id = "@ROOT_RUN_ID@"
+[variants.metadata.workflow]
+binary            = "@IDENTIFIED_BINARY@"
+concurrency       = 1
+expected_contains = ["@EXPECTED_REPORT@"]
+max_iterations    = 1
+preserve_files    = ["value.txt"]
+stop_condition    = "Scripted evaluator completes at iteration 1."
+strategy          = "no-delegation"
+worker_attempts   = 1
+[variants.metadata.workflow.judge]
+account   = "judgement-fixture"
+model     = "fake-judgement"
+provider  = "bcode.fake-provider"
+threshold = 70
+[[cases]]
+fixture = "workspace"
+id      = "scripted-loop"
+prompt  = "Return a scripted contribution and evaluate completion."
+[[cases.judges]]
+metric   = "workflow.oracle_passed"
+min      = 1
+required = true
+type     = "metric_threshold"

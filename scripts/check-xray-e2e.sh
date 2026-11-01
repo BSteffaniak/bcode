@@ -4,8 +4,8 @@
 # Supply deliberately selected, matching test artifacts.
 set -euo pipefail
 
-if [[ $# != 6 ]]; then
-    echo "usage: bash $0 /absolute/bcode sha256 /absolute/xray-acceptance-test sha256 /absolute/server-xray-test sha256" >&2
+if [[ $# != 8 && $# != 10 ]]; then
+    echo "usage: bash $0 /absolute/bcode sha256 /absolute/xray-acceptance-test sha256 /absolute/server-xray-test sha256 /absolute/fake-provider-library sha256 [/absolute/server-lib-test sha256]" >&2
     exit 2
 fi
 
@@ -24,11 +24,14 @@ import tempfile
 
 args = sys.argv[1:]
 artifacts = []
-for name, offset in (("bcode", 0), ("acceptance", 2), ("server", 4)):
+selections = [("bcode", 0), ("acceptance", 2), ("server", 4), ("provider_library", 6)]
+if len(args) == 10:
+    selections.append(("recursive_server", 8))
+for name, offset in selections:
     path = Path(args[offset])
     expected = args[offset + 1]
-    if not path.is_absolute() or not path.is_file() or not os.access(path, os.X_OK):
-        raise SystemExit(f"{name}: absolute existing executable required")
+    if not path.is_absolute() or not path.is_file() or (name != "provider_library" and not os.access(path, os.X_OK)):
+        raise SystemExit(f"{name}: absolute existing artifact required (executable for test/client)")
     if not re.fullmatch(r"[0-9a-f]{64}", expected):
         raise SystemExit(f"{name}: explicit lowercase SHA-256 required")
     digest = hashlib.sha256()
@@ -56,20 +59,39 @@ env = {
     "BCODE_CONFIG": str(config),
     "BCODE_STATE_DIR": str(work / "state"),
     "BCODE_XRAY_TEST_BINARY": artifacts[0]["path"],
+    "BCODE_XRAY_TEST_PROVIDER_LIBRARY": artifacts[3]["path"],
     # Child fixtures retain their private roots on either outcome and print only
     # locators to this log; do not inline stderr (it may contain captured content).
     "RUST_BACKTRACE": "1",
 }
 results = []
-for artifact in artifacts[1:]:
-    command = [artifact["path"], "--include-ignored", "--test-threads=1", "--nocapture"]
+suites = artifacts[1:3] + artifacts[4:]
+for artifact in suites:
+    command = [artifact["path"]]
+    if artifact["name"] == "recursive_server":
+        command.append("xray_execution_acceptance_tests::")
+    command += ["--include-ignored", "--test-threads=1", "--nocapture"]
     try:
+        # Recheck before each suite: mutable local artifact paths must not silently
+        # become a different client or provider after the initial selection.
+        for selected in artifacts:
+            digest = hashlib.sha256()
+            with Path(selected["path"]).open("rb") as source:
+                for chunk in iter(lambda: source.read(1024 * 1024), b""):
+                    digest.update(chunk)
+            if digest.hexdigest() != selected["sha256"]:
+                raise SystemExit("selected artifact changed; no further suite invoked")
         with (work / f'{artifact["name"]}.log').open("wb") as log:
             process = subprocess.Popen(command, cwd=work / "work", env=env,
                                        stdin=subprocess.DEVNULL, stdout=log,
                                        stderr=subprocess.STDOUT, start_new_session=True)
             try:
-                code = process.wait(timeout=360)
+                # The serial server suite includes six whole-app cases and a
+                # deliberate observer crash with up to 75s for verified reclamation.
+                # The 360s aggregate expired during its last production case despite
+                # preceding cases passing; keep per-operation/test bounds unchanged.
+                suite_timeout = 600 if artifact["name"] == "server" else 360
+                code = process.wait(timeout=suite_timeout)
                 results.append({"name": artifact["name"], "exit_code": code})
             except subprocess.TimeoutExpired:
                 results.append({"name": artifact["name"], "timeout": True})
@@ -84,9 +106,15 @@ for artifact in artifacts[1:]:
                 process.wait()
     except OSError:
         results.append({"name": artifact["name"], "launch_failed": True})
-    (work / "results.json").write_text(json.dumps(results, indent=2) + "\n")
+    if results[-1].get("exit_code") == 0:
+        log_bytes = (work / f'{artifact["name"]}.log').read_bytes()
+        summaries = re.findall(rb"test result: ok\. ([0-9]+) passed; ([0-9]+) failed; ([0-9]+) ignored;", log_bytes)
+        if not summaries or any(int(failed) or int(ignored) for _, failed, ignored in summaries) or not sum(int(passed) for passed, _, _ in summaries):
+            results[-1]["acceptance_error"] = "missing_nonempty_unignored_libtest_success"
+            results[-1]["exit_code"] = 1
+    (work / "results.json").write_text(json.dumps({"artifacts": artifacts, "results": results}, indent=2) + "\n")
     if results[-1].get("exit_code") != 0:
         print(f'{artifact["name"]} failed or timed out; see private log', file=sys.stderr)
         raise SystemExit(1)
-print("Offline engine/protocol/whole-app fixtures passed; fake-provider mechanics do not certify live provider quality or complete v1 coverage.")
+print("Selected offline fixture suites passed; inspect results.json for scope. Fake-provider mechanics do not certify live provider quality or complete v1 coverage.")
 PY

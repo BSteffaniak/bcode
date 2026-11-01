@@ -33,11 +33,20 @@ struct Peer {
 
 impl Peer {
     fn serve(responses: Vec<Vec<u8>>) -> Self {
+        let responses = responses
+            .into_iter()
+            .enumerate()
+            .map(|(index, bytes)| (if index == 0 { "observe" } else { "release" }, bytes))
+            .collect();
+        Self::serve_paths(responses)
+    }
+
+    fn serve_paths(responses: Vec<(&'static str, Vec<u8>)>) -> Self {
         let listener = TcpListener::bind("127.0.0.1:0").expect("isolated loopback listener");
         let address = listener.local_addr().expect("bound address");
         listener.set_nonblocking(true).expect("bounded accept");
         let worker = std::thread::spawn(move || {
-            for (index, response) in responses.into_iter().enumerate() {
+            for (index, (expected_path, response)) in responses.into_iter().enumerate() {
                 // The second connection follows CLI startup, stream drain, and local
                 // recording flush; allow that work without weakening request checks.
                 let admission_budget = if index == 0 { 10 } else { 30 };
@@ -67,9 +76,27 @@ impl Peer {
                 stream
                     .set_write_timeout(Some(Duration::from_secs(5)))
                     .expect("write bound");
-                let target = consume_request(&mut stream);
-                let expected_path = if index == 0 { "observe" } else { "release" };
-                assert_eq!(target, format!("POST /v1/xray/{expected_path} HTTP/1.1"));
+                let (target, body) = consume_request(&mut stream);
+                let wire_path = if expected_path == "payload_checked" {
+                    "payload"
+                } else {
+                    expected_path
+                };
+                assert_eq!(target, format!("POST /v1/xray/{wire_path} HTTP/1.1"));
+                if expected_path == "payload_checked" {
+                    let outgoing = response
+                        .windows(4)
+                        .position(|part| part == b"\r\n\r\n")
+                        .expect("response headers")
+                        + 4;
+                    let range: serde_json::Value =
+                        serde_json::from_slice(&response[outgoing..]).expect("range JSON");
+                    assert_eq!(
+                        body["offset"], range["offset"],
+                        "client must progress its requested offset"
+                    );
+                    assert_eq!(body["payload_id"], range["payload"]["payload_id"]);
+                }
                 // Fragment arbitrary UTF-8 and SSE boundaries, not just whole frames.
                 for fragment in response.chunks(13) {
                     stream.write_all(fragment).expect("fixture response");
@@ -95,7 +122,7 @@ impl Peer {
     }
 }
 
-fn consume_request(stream: &mut TcpStream) -> String {
+fn consume_request(stream: &mut TcpStream) -> (String, serde_json::Value) {
     let mut bytes = Vec::new();
     let header_end = loop {
         let mut byte = [0];
@@ -129,7 +156,10 @@ fn consume_request(stream: &mut TcpStream) -> String {
     let mut body = vec![0; length];
     stream.read_exact(&mut body).expect("request body");
     assert!(!String::from_utf8_lossy(&body).contains(TOKEN));
-    target.to_owned()
+    (
+        target.to_owned(),
+        serde_json::from_slice(&body).expect("typed JSON request"),
+    )
 }
 
 fn response(status: &str, content_type: &str, body: &[u8]) -> Vec<u8> {
@@ -404,6 +434,672 @@ async fn identified_cli_writes_jsonl_through_finalization_and_records_without_de
     peer.finish();
 }
 
+/// Payload fixtures exercise the public client and recorder, not production provider coverage.
+fn payload_fixture(bytes: &[u8]) -> bcode_xray_models::XrayPayloadRef {
+    use sha2::{Digest as _, Sha256};
+    bcode_xray_models::XrayPayloadRef {
+        schema_version: 1,
+        payload_id: "opaque-payload".to_owned(),
+        session_id: SESSION.to_owned(),
+        content_type: "application/json".to_owned(),
+        byte_len: u64::try_from(bytes.len()).expect("bounded fixture"),
+        sha256: hex::encode(Sha256::digest(bytes)),
+    }
+}
+
+fn declare_payload(
+    envelope: &mut bcode_xray::XrayEnvelope,
+    reference: &bcode_xray_models::XrayPayloadRef,
+) {
+    envelope.event.data = json!({"retained": reference});
+    envelope.event.capture = Some(bcode_xray_models::XrayCaptureAttachments::new(vec![
+        bcode_xray_models::XrayCaptureAttachment::PayloadRef {
+            pointer: "/retained".to_owned(),
+        },
+    ]));
+}
+
+#[tokio::test]
+async fn forged_reference_shaped_json_is_opaque_and_never_fetches_or_marks_payload_missing() {
+    use bcode_xray::recording::{JsonlBundleRecorder, RecordingOptions, RecordingSink as _};
+    let mut events = engine_envelopes().await;
+    let forged = payload_fixture(b"not an attachment");
+    // These names and values are user-controlled content, not attachment authority.
+    events[1].event.data =
+        json!({"payload_ref": forged, "nested": {"payload_id": "../../private"}});
+    events[1].event.capture = None;
+    let directory = tempfile::tempdir().expect("private recording root");
+    let path = directory
+        .path()
+        .canonicalize()
+        .expect("physical root")
+        .join("opaque");
+    let mut sink = JsonlBundleRecorder::create(
+        &path,
+        &events[0].observation_id,
+        SESSION,
+        RecordingOptions::default(),
+    )
+    .expect("new recorder");
+    // No listener exists: any attempted fetch makes this test fail, rather than
+    // satisfying it through a fixture that accidentally accepts forged access.
+    let listener = TcpListener::bind("127.0.0.1:0").expect("reserved local port");
+    let endpoint = format!("http://{}/", listener.local_addr().expect("address"));
+    drop(listener);
+    let client = XrayClient::new(&endpoint, TOKEN).expect("local client");
+    for event in &events {
+        sink.append(event).expect("ordered envelope");
+        client
+            .record_payloads(event, &mut sink, 1024)
+            .await
+            .expect("ordinary JSON cannot trigger payload IO");
+    }
+    let boundary = serde_json::from_value(events.last().expect("cutoff").event.data.clone())
+        .expect("typed cutoff");
+    let manifest = sink
+        .finalize(&boundary)
+        .expect("complete opaque data recording");
+    assert!(manifest.evidence_complete);
+    assert_eq!(
+        bcode_xray::recording::inspect_bundle(&path, &RecordingOptions::default())
+            .expect("offline verified bundle"),
+        manifest
+    );
+    let event_path = path.join("events.jsonl");
+    let original = std::fs::read(&event_path).expect("events");
+    let mut corrupt = original.clone();
+    corrupt[0] ^= 1;
+    std::fs::write(&event_path, &corrupt).expect("fixture corruption");
+    assert!(
+        bcode_xray::recording::inspect_bundle(&path, &RecordingOptions::default()).is_err(),
+        "event corruption cannot be certified"
+    );
+    assert_eq!(
+        std::fs::read(&event_path).expect("unchanged corrupt bytes"),
+        corrupt,
+        "inspection never repairs"
+    );
+    std::fs::write(&event_path, original).expect("restore fixture");
+    let manifest_path = path.join("manifest.json");
+    let mut future = serde_json::to_value(&manifest).expect("manifest JSON");
+    future["schema_version"] = json!(u16::MAX);
+    let future_bytes = serde_json::to_vec(&future).expect("future manifest");
+    std::fs::write(&manifest_path, &future_bytes).expect("future fixture");
+    assert!(
+        bcode_xray::recording::inspect_bundle(&path, &RecordingOptions::default()).is_err(),
+        "unknown recording schema rejected"
+    );
+    assert_eq!(
+        std::fs::read(manifest_path).expect("preserved future manifest"),
+        future_bytes
+    );
+    assert!(manifest.payloads.is_empty());
+    let retained = std::fs::read_to_string(path.join("events.jsonl")).expect("retained data");
+    assert!(
+        retained.contains("../../private"),
+        "ordinary data is preserved, not reinterpreted"
+    );
+}
+
+#[tokio::test]
+async fn payload_wire_corruption_future_schema_and_foreign_identity_never_complete_recording() {
+    use bcode_xray::recording::{
+        JsonlBundleRecorder, RecordingOptions, RecordingSink as _, RecordingState,
+    };
+    let bytes = b"complete sensitive fixture";
+    let reference = payload_fixture(bytes);
+    for fault in [
+        "digest",
+        "future_range",
+        "future_reference",
+        "foreign_observation",
+        "foreign_session",
+        "wrong_offset",
+        "false_eof",
+        "empty_progress",
+    ] {
+        let mut events = engine_envelopes().await;
+        declare_payload(&mut events[1], &reference);
+        let mut range = json!({
+            "schema_version": 1, "observation_id": events[0].observation_id,
+            "payload": reference, "offset": 0, "bytes": bytes, "eof": true,
+        });
+        match fault {
+            "digest" => range["bytes"][0] = json!(0),
+            "future_range" => range["schema_version"] = json!(2),
+            "future_reference" => range["payload"]["schema_version"] = json!(2),
+            "foreign_observation" => range["observation_id"] = json!("other-observer"),
+            "foreign_session" => range["payload"]["session_id"] = json!("other-session"),
+            "wrong_offset" => range["offset"] = json!(1),
+            "false_eof" => range["eof"] = json!(false),
+            "empty_progress" => {
+                range["bytes"] = json!([]);
+                range["eof"] = json!(false);
+            }
+            _ => unreachable!(),
+        }
+        let peer = Peer::serve_paths(vec![(
+            "payload",
+            response(
+                "200 OK",
+                "application/json",
+                &serde_json::to_vec(&range).expect("range fixture"),
+            ),
+        )]);
+        let client = XrayClient::new(&peer.endpoint(), TOKEN).expect("client");
+        let directory = tempfile::tempdir().expect("private root");
+        let path = directory
+            .path()
+            .canonicalize()
+            .expect("physical root")
+            .join("corrupt");
+        let mut sink = JsonlBundleRecorder::create(
+            &path,
+            &events[0].observation_id,
+            SESSION,
+            RecordingOptions::default(),
+        )
+        .expect("recorder");
+        sink.append(&events[0]).expect("ready");
+        sink.append(&events[1]).expect("declared capture");
+        assert!(
+            client
+                .record_payloads(&events[1], &mut sink, 1024)
+                .await
+                .is_err(),
+            "fault must fail closed: {fault}"
+        );
+        assert!(!sink.manifest().evidence_complete, "fault: {fault}");
+        assert_ne!(
+            sink.manifest().state,
+            RecordingState::Finalized,
+            "fault: {fault}"
+        );
+        assert!(
+            sink.manifest()
+                .payloads
+                .values()
+                .all(|payload| payload.relative_path.is_none()),
+            "corrupt bytes cannot become retained evidence: {fault}"
+        );
+        peer.finish();
+    }
+}
+
+#[tokio::test]
+async fn multi_range_payload_transfer_records_exact_bytes_and_digest() {
+    use bcode_xray::recording::{JsonlBundleRecorder, RecordingOptions, RecordingSink as _};
+    let bytes = "dynamic-sized 中文 👩‍💻 e\u{301}\n".repeat(5000).into_bytes();
+    assert!(bytes.len() > 128 * 1024);
+    let reference = payload_fixture(&bytes);
+    let mut events = engine_envelopes().await;
+    declare_payload(&mut events[1], &reference);
+    let responses = bytes
+        .chunks(16 * 1024)
+        .enumerate()
+        .map(|(index, part)| {
+            let offset = index * 16 * 1024;
+            let range = json!({"schema_version": 1, "observation_id": events[0].observation_id,
+            "payload": reference, "offset": offset, "bytes": part,
+            "eof": offset + part.len() == bytes.len()});
+            (
+                "payload_checked",
+                response(
+                    "200 OK",
+                    "application/json",
+                    &serde_json::to_vec(&range).expect("range"),
+                ),
+            )
+        })
+        .collect();
+    let peer = Peer::serve_paths(responses);
+    let client = XrayClient::new(&peer.endpoint(), TOKEN).expect("client");
+    let directory = tempfile::tempdir().expect("root");
+    let path = directory
+        .path()
+        .canonicalize()
+        .expect("physical root")
+        .join("ranges");
+    let mut sink = JsonlBundleRecorder::create(
+        &path,
+        &events[0].observation_id,
+        SESSION,
+        RecordingOptions::default(),
+    )
+    .expect("recorder");
+    for event in &events {
+        sink.append(event).expect("ordered event");
+        client
+            .record_payloads(event, &mut sink, 16 * 1024)
+            .await
+            .expect("verified range export");
+    }
+    let cutoff = serde_json::from_value(events.last().expect("cutoff").event.data.clone())
+        .expect("boundary");
+    let manifest = sink.finalize(&cutoff).expect("finalized");
+    assert!(manifest.evidence_complete);
+    assert_eq!(manifest.payloads.len(), 1);
+    let retained = manifest
+        .payloads
+        .get(&reference.payload_id)
+        .expect("retained reference");
+    assert_eq!(retained.reference, reference);
+    let payload_path = path.join(retained.relative_path.as_ref().expect("retained bytes"));
+    assert_eq!(std::fs::read(&payload_path).expect("payload"), bytes);
+    bcode_xray::recording::inspect_bundle(&path, &RecordingOptions::default())
+        .expect("independently verified complete bundle");
+    let mut damaged = bytes.clone();
+    let middle = damaged.len() / 2;
+    damaged[middle] ^= 1;
+    std::fs::write(&payload_path, &damaged).expect("same-length payload corruption");
+    assert!(
+        bcode_xray::recording::inspect_bundle(&path, &RecordingOptions::default()).is_err(),
+        "same-length corruption must fail full digest verification"
+    );
+    assert_eq!(
+        std::fs::read(payload_path).expect("unchanged corruption"),
+        damaged,
+        "reader must not repair payload"
+    );
+    peer.finish();
+}
+
+struct HostSink {
+    hub: XrayHub,
+    origin: bcode_xray::XrayCorrelation,
+}
+impl bcode_xray::XrayCaptureSink for HostSink {
+    fn capture_active(&self) -> bool {
+        self.hub.capture_active(&self.origin.session_id)
+    }
+    fn deep_capture_active(&self) -> bool {
+        self.hub.deep_capture_active(&self.origin.session_id)
+    }
+    fn emit(&self, mut event: bcode_xray::XrayEvent) {
+        event.correlation = self.origin.clone();
+        self.hub.emit(event);
+    }
+    fn report_external_loss(&self, count: u64) -> bool {
+        self.hub
+            .context(self.origin.clone())
+            .report_external_loss(count)
+    }
+}
+fn load_dynamic_capture_provider() -> bcode_plugin::LoadedPlugin {
+    let library = std::path::PathBuf::from(
+        std::env::var_os("BCODE_XRAY_TEST_PROVIDER_LIBRARY")
+            .expect("identified fake-provider dynamic library"),
+    );
+    assert!(library.is_absolute());
+    let mut manifest: bcode_plugin::PluginManifest = toml::from_str(include_str!(
+        "../../../plugins/fake-provider-plugin/bcode-plugin.toml"
+    ))
+    .expect("real fake-provider manifest");
+    let bcode_plugin::PluginRuntime::Native(runtime) = &mut manifest.runtime;
+    runtime.library.clone_from(&library);
+    let plugin = bcode_plugin::load_registered_plugin(&bcode_plugin::RegisteredPlugin {
+        manifest,
+        manifest_path: library.with_file_name("fixture-manifest.toml"),
+    })
+    .expect("real native plugin load");
+    plugin.activate().expect("activate");
+    plugin
+}
+fn invoke_dynamic_capture(plugin: &bcode_plugin::LoadedPlugin, hub: &XrayHub, large: &str) {
+    let origin = bcode_xray::XrayCorrelation {
+        session_id: SESSION.to_owned(),
+        run_id: Some("large-native-fixture-run".to_owned()),
+        activation_id: Some("large-native-fixture-activation".to_owned()),
+        attempt_id: Some("real-dynamic-large".to_owned()),
+        ..Default::default()
+    };
+    let external_hub = hub.clone();
+    let authorized_origin = origin.clone();
+    let capture = bcode_xray::CaptureContext::with_external_sink(
+        origin.clone(),
+        std::sync::Arc::new(HostSink {
+            hub: hub.clone(),
+            origin,
+        }),
+        move |_untrusted_origin, media_type, bytes| {
+            external_hub.capture_payload(&authorized_origin, media_type, bytes)
+        },
+    );
+    assert!(large.len() > 128 * 1024);
+    let payload = serde_json::to_vec(&json!({
+        "session_id": SESSION, "turn_id": "dynamic-large-turn", "model_id": "fake-echo",
+        "system_prompt": large,
+        "messages": [{"role": "user", "content": [{"type": "text", "text": "tiny reply"}]}],
+        "provider_context": {"settings": {"api_key": "synthetic-never-export-canary"}}
+    }))
+    .expect("provider request");
+    let mut ordinary = Vec::new();
+    let result = capture
+        .scope_sync(|| {
+            plugin.invoke_service_with_events(
+                "bcode.model-provider/v3",
+                "run_turn",
+                payload,
+                |event| ordinary.push(event),
+            )
+        })
+        .expect("dynamic invocation");
+    assert!(result.error.is_none());
+    plugin.deactivate().expect("deactivate");
+    assert!(
+        !ordinary.is_empty(),
+        "ordinary execution still produces provider output"
+    );
+    assert!(
+        ordinary
+            .iter()
+            .all(|event| !String::from_utf8_lossy(event).contains("synthetic-never-export-canary")),
+        "capture credentials never enter ordinary provider output"
+    );
+    drop(capture);
+}
+fn dynamic_payload_ranges(
+    hub: &XrayHub,
+    event: &bcode_xray_models::XrayEnvelope,
+    reference: &bcode_xray_models::XrayPayloadRef,
+    response_ranges: &mut Vec<(&'static str, Vec<u8>)>,
+) -> Vec<u8> {
+    let mut bytes = Vec::new();
+    loop {
+        let range = hub
+            .read_payload(&bcode_xray_models::XrayReadPayloadRequest {
+                schema_version: 1,
+                observation_id: event.observation_id.clone(),
+                session_id: SESSION.to_owned(),
+                payload_id: reference.payload_id.clone(),
+                offset: u64::try_from(bytes.len()).expect("offset"),
+                length: 16 * 1024,
+            })
+            .expect("real retained SDK payload");
+        bytes.extend_from_slice(&range.bytes);
+        response_ranges.push((
+            "payload_checked",
+            response(
+                "200 OK",
+                "application/json",
+                &serde_json::to_vec(&range).expect("range JSON"),
+            ),
+        ));
+        if range.eof {
+            break;
+        }
+    }
+    bytes
+}
+fn verify_dynamic_capture(
+    hub: &XrayHub,
+    events: &[bcode_xray_models::XrayEnvelope],
+    large: &str,
+) -> Vec<(&'static str, Vec<u8>)> {
+    let mut response_ranges = Vec::new();
+    let mut large_requests = 0;
+    assert_eq!(
+        events
+            .iter()
+            .filter(|event| event.event.domain == "provider.fake"
+                && event.event.name == "adapted_request")
+            .count(),
+        1,
+        "first and only real native request must be evidenced"
+    );
+    assert!(
+        !events
+            .iter()
+            .any(|event| event.event.name.ends_with("_omitted")),
+        "large native transfer must not substitute an omission notice"
+    );
+    for event in events {
+        assert!(
+            !serde_json::to_string(event)
+                .expect("JSON")
+                .contains("synthetic-never-export-canary")
+        );
+        for reference in event
+            .payload_references()
+            .expect("explicit SDK attachments")
+        {
+            assert_eq!(
+                event.event.correlation.run_id.as_deref(),
+                Some("large-native-fixture-run")
+            );
+            assert_eq!(
+                event.event.correlation.activation_id.as_deref(),
+                Some("large-native-fixture-activation")
+            );
+            assert_eq!(
+                event.event.correlation.attempt_id.as_deref(),
+                Some("real-dynamic-large")
+            );
+            let bytes = dynamic_payload_ranges(hub, event, &reference, &mut response_ranges);
+            assert!(!String::from_utf8_lossy(&bytes).contains("synthetic-never-export-canary"));
+            if bytes.len() > 128 * 1024 {
+                let retained: serde_json::Value =
+                    serde_json::from_slice(&bytes).expect("provider projection");
+                assert_eq!(
+                    retained["system_prompt"].as_str(),
+                    Some(large),
+                    "complete real request, not synthetic replacement or truncation"
+                );
+                large_requests += 1;
+            }
+        }
+    }
+    assert_eq!(
+        large_requests, 1,
+        "real dynamic adapted request must retain full payload through SDK callback"
+    );
+    response_ranges
+}
+async fn record_dynamic_capture(
+    events: &[bcode_xray_models::XrayEnvelope],
+    response_ranges: Vec<(&'static str, Vec<u8>)>,
+) {
+    use bcode_xray::recording::{JsonlBundleRecorder, RecordingOptions, RecordingSink as _};
+    let peer = Peer::serve_paths(response_ranges);
+    let client = XrayClient::new(&peer.endpoint(), TOKEN).expect("client");
+    let directory = tempfile::tempdir().expect("private root");
+    let path = directory
+        .path()
+        .canonicalize()
+        .expect("physical root")
+        .join("dynamic");
+    let mut sink = JsonlBundleRecorder::create(
+        &path,
+        &events[0].observation_id,
+        SESSION,
+        RecordingOptions::default(),
+    )
+    .expect("recorder");
+    for event in events {
+        sink.append(event).expect("record ordered real event");
+        client
+            .record_payloads(event, &mut sink, 16 * 1024)
+            .await
+            .expect("real dynamic bytes exported through client");
+    }
+    let cutoff = serde_json::from_value(events.last().expect("cutoff").event.data.clone())
+        .expect("boundary");
+    assert!(
+        sink.finalize(&cutoff)
+            .expect("recording cutoff")
+            .evidence_complete
+    );
+    peer.finish();
+}
+#[tokio::test]
+#[ignore = "requires explicitly identified BCODE_XRAY_TEST_PROVIDER_LIBRARY; no compilation or provider network calls"]
+async fn real_dynamic_large_request_crosses_sdk_capture_and_verified_range_export() {
+    let plugin = load_dynamic_capture_provider();
+    let hub = XrayHub::default();
+    let mut observe_request = request();
+    observe_request.deep_capture = true;
+    let mut observation = hub.observe(observe_request).expect("deep readiness");
+    let large = "large-real-dynamic 中文 👩‍💻 e\u{301}\n".repeat(5000);
+    invoke_dynamic_capture(&plugin, &hub, &large);
+    drop(plugin);
+    observation.finalize().expect("cutoff");
+    let mut events = Vec::new();
+    while let Some(event) = observation.recv().await {
+        events.push(event);
+    }
+    let response_ranges = verify_dynamic_capture(&hub, &events, &large);
+    record_dynamic_capture(&events, response_ranges).await;
+}
+
+#[tokio::test]
+async fn stalled_observer_never_blocks_producer_and_loss_cannot_be_recorded_as_complete() {
+    use bcode_xray::recording::{JsonlBundleRecorder, RecordingOptions, RecordingSink as _};
+    let hub = XrayHub::new(bcode_xray::XrayConfig {
+        queue_capacity: 4,
+        ..Default::default()
+    });
+    let mut observation = hub.observe(request()).expect("slow observer");
+    let producer_hub = hub.clone();
+    let (done, completed) = std::sync::mpsc::channel();
+    let producer = std::thread::spawn(move || {
+        let context = producer_hub.context(bcode_xray::XrayCorrelation {
+            session_id: SESSION.to_owned(),
+            ..Default::default()
+        });
+        for index in 0..20_000 {
+            context.emit("fixture", "burst", json!({"index": index}), false);
+        }
+        done.send(()).expect("producer completion");
+    });
+    // The receiver deliberately consumes nothing until producer completion. This
+    // catches backpressure/deadlock without imposing a throughput microbenchmark.
+    completed
+        .recv_timeout(Duration::from_secs(10))
+        .expect("stalled consumer must not hold execution hostage");
+    producer.join().expect("producer");
+    let cutoff = observation
+        .finalize()
+        .expect("cutoff independent of consumer");
+    assert!(
+        cutoff.dropped_events > 0,
+        "bounded queue must report actual loss"
+    );
+    let directory = tempfile::tempdir().expect("root");
+    let path = directory
+        .path()
+        .canonicalize()
+        .expect("physical root")
+        .join("slow");
+    let mut sink = None;
+    let mut gaps = 0;
+    while let Some(event) = observation.recv().await {
+        let recorder = sink.get_or_insert_with(|| {
+            JsonlBundleRecorder::create(
+                &path,
+                &event.observation_id,
+                SESSION,
+                RecordingOptions::default(),
+            )
+            .expect("recorder")
+        });
+        if event.event.domain == "xray" && event.event.name == "gap" {
+            gaps += 1;
+        }
+        recorder
+            .append(&event)
+            .expect("loss is valid diagnostic evidence");
+    }
+    assert!(gaps > 0);
+    let manifest = sink
+        .expect("ready cannot be crowded out")
+        .finalize(&cutoff)
+        .expect("local finalized evidence");
+    assert!(!manifest.evidence_complete);
+    assert!(manifest.missing_sequences > 0);
+    bcode_xray::recording::inspect_bundle(&path, &RecordingOptions::default())
+        .expect("loss-bearing recording remains verifiable");
+}
+
+#[tokio::test]
+async fn dropping_one_observation_revokes_its_payloads_without_revoking_another_or_foreign_session()
+{
+    let hub = XrayHub::default();
+    let mut deep = request();
+    deep.deep_capture = true;
+    let mut first = hub.observe(deep.clone()).expect("first deep grant");
+    let mut second = hub.observe(deep).expect("independent deep grant");
+    let mut foreign_request = request();
+    foreign_request.session_id = "foreign-session".to_owned();
+    foreign_request.deep_capture = true;
+    let mut foreign = hub.observe(foreign_request).expect("foreign observation");
+    let first_id = first.recv().await.expect("first ready").observation_id;
+    let second_id = second.recv().await.expect("second ready").observation_id;
+    let foreign_id = foreign.recv().await.expect("foreign ready").observation_id;
+    let correlation = bcode_xray::XrayCorrelation {
+        session_id: SESSION.to_owned(),
+        ..Default::default()
+    };
+    let reference = hub
+        .capture_payload(&correlation, "text/plain", b"observation-owned")
+        .expect("capture")
+        .expect("authorized active deep observer");
+    let read =
+        |observation_id: String, session_id: &str| bcode_xray_models::XrayReadPayloadRequest {
+            schema_version: 1,
+            observation_id,
+            session_id: session_id.to_owned(),
+            payload_id: reference.payload_id.clone(),
+            offset: 0,
+            length: 64,
+        };
+    assert!(hub.read_payload(&read(first_id.clone(), SESSION)).is_ok());
+    assert!(
+        hub.read_payload(&read(foreign_id.clone(), SESSION))
+            .is_err()
+    );
+    assert!(
+        hub.read_payload(&read(foreign_id, "foreign-session"))
+            .is_err()
+    );
+    drop(first);
+    assert!(
+        hub.read_payload(&read(first_id, SESSION)).is_err(),
+        "dropped scope no longer owns retained bytes"
+    );
+    assert_eq!(
+        hub.read_payload(&read(second_id, SESSION))
+            .expect("other observation unaffected")
+            .bytes,
+        b"observation-owned"
+    );
+    hub.context(correlation)
+        .emit("fixture", "execution_continues", json!({}), false);
+    let event = second.recv().await.expect("remaining live observation");
+    assert_eq!(event.event.name, "execution_continues");
+}
+
+#[tokio::test]
+async fn independently_future_capture_metadata_is_rejected_before_export() {
+    let events = engine_envelopes().await;
+    let mut wire = serde_json::to_value(&events[1]).expect("event JSON");
+    wire["event"]["capture"] = json!({"schema_version": 2, "attachments": []});
+    let mut body = format!(
+        "event: xray\ndata: {}\n\n",
+        serde_json::to_string(&events[0]).expect("ready")
+    )
+    .into_bytes();
+    body.extend_from_slice(format!("event: xray\ndata: {wire}\n\n").as_bytes());
+    let peer = Peer::serve(vec![response("200 OK", "text/event-stream", &body)]);
+    let client = XrayClient::new(&peer.endpoint(), TOKEN).expect("client");
+    let mut stream = client.observe(request()).await.expect("ready");
+    stream.recv().await.expect("ready read");
+    assert!(
+        stream.recv().await.is_err(),
+        "capture schema evolves independently of envelope version"
+    );
+    peer.finish();
+}
+
 /// Executable-owned fixture: the daemon artifact and every CLI client are the same
 /// identified file. No client from this test binary is used to cross artifact versions.
 #[cfg(unix)]
@@ -412,6 +1108,7 @@ mod production {
     use std::collections::{BTreeMap, BTreeSet};
     use std::path::PathBuf;
     use std::process::{Child, Command, Stdio};
+    use std::time::Instant;
     use wait_timeout::ChildExt as _;
 
     struct OwnedChild(Child);
@@ -428,7 +1125,7 @@ mod production {
 
     struct App {
         _directory: PathBuf,
-        _socket_directory: tempfile::TempDir,
+        socket_directory: tempfile::TempDir,
         root: PathBuf,
         binary: PathBuf,
         environment: BTreeMap<String, String>,
@@ -508,20 +1205,26 @@ persist_tool_io = false
             ]);
             let mut app = Self {
                 _directory: directory,
-                _socket_directory: socket_directory,
+                socket_directory,
                 root,
                 binary,
                 environment,
                 server: None,
                 invocation: 0,
             };
-            let child = app.spawn(&["server", "run"], "server");
-            app.server = Some(child);
+            app.start_server();
+            app
+        }
+
+        fn start_server(&mut self) {
+            let socket = self.socket_directory.path().join("s");
+            let child = self.spawn(&["server", "run"], "server");
+            self.server = Some(child);
             // A successful application command is readiness, not socket existence.
             let deadline = std::time::Instant::now() + Duration::from_secs(45);
             loop {
                 assert!(
-                    app.server
+                    self.server
                         .as_mut()
                         .expect("owned server")
                         .0
@@ -529,7 +1232,7 @@ persist_tool_io = false
                         .expect("server status")
                         .is_none(),
                     "foreground server exited during startup; private logs: {}",
-                    app.root.display()
+                    self.root.display()
                 );
                 let socket_bound = std::fs::symlink_metadata(&socket).is_ok_and(|metadata| {
                     use std::os::unix::fs::FileTypeExt as _;
@@ -540,7 +1243,7 @@ persist_tool_io = false
                 // coordinator against the same artifact root. Wait for bind first,
                 // then require an actual application handshake (bind alone is not ready).
                 if socket_bound {
-                    let result = app.run(&["server", "status"]);
+                    let result = self.run(&["server", "status"]);
                     if result.0 {
                         break;
                     }
@@ -551,7 +1254,6 @@ persist_tool_io = false
                 );
                 std::thread::sleep(Duration::from_millis(50));
             }
-            app
         }
 
         fn command(&self) -> Command {
@@ -628,9 +1330,49 @@ persist_tool_io = false
             }
         }
 
-        fn stop(mut self) {
-            let (success, _) = self.run(&["server", "stop-if-idle", "--wait"]);
-            assert!(success, "only isolated idle server may be stopped");
+        fn stop(self) {
+            self.stop_when_idle(false);
+        }
+
+        fn stop_after_observer_crash(self) {
+            self.stop_when_idle(true);
+        }
+
+        fn stop_when_idle(mut self, await_reclamation: bool) {
+            // A SIGKILL cannot close its capability. The server reclaims unused
+            // endpoints after 60 seconds; allow bounded scheduling/CLI overhead.
+            let deadline =
+                Instant::now() + Duration::from_secs(if await_reclamation { 75 } else { 45 });
+            loop {
+                self.invocation += 1;
+                let label = format!("command-{}", self.invocation);
+                let mut child = self.spawn(&["server", "stop-if-idle", "--wait"], &label);
+                let status = child
+                    .0
+                    .wait_timeout(deadline.saturating_duration_since(Instant::now()))
+                    .expect("bounded idle shutdown wait")
+                    .expect("idle shutdown command deadline");
+                if status.success() {
+                    break;
+                }
+                let error = std::fs::read_to_string(self.root.join(format!("{label}.err")))
+                    .expect("idle shutdown diagnostic");
+                assert!(
+                    await_reclamation
+                        && error
+                            .trim()
+                            .starts_with("error: client error: server returned error daemon_busy:"),
+                    "only isolated idle server may be stopped: {error}"
+                );
+                assert!(
+                    Instant::now() < deadline,
+                    "crashed observer capability was not reclaimed: {error}"
+                );
+                std::thread::sleep(
+                    Duration::from_millis(250)
+                        .min(deadline.saturating_duration_since(Instant::now())),
+                );
+            }
             let status = self
                 .server
                 .as_mut()
@@ -644,6 +1386,469 @@ persist_tool_io = false
 
     fn model(envelope: &bcode_xray::XrayEnvelope, name: &str) -> bool {
         envelope.event.domain == "model" && envelope.event.name == name
+    }
+
+    fn browser_request(
+        endpoint: &str,
+        token: &str,
+        method: &str,
+        route: &str,
+        origin: &str,
+        body: &serde_json::Value,
+    ) -> std::io::Result<(u16, String)> {
+        let address = endpoint
+            .strip_prefix("http://")
+            .expect("local endpoint")
+            .trim_end_matches('/');
+        let mut stream = TcpStream::connect_timeout(
+            &address.parse().expect("loopback address"),
+            Duration::from_secs(3),
+        )?;
+        stream.set_read_timeout(Some(Duration::from_secs(3)))?;
+        stream.set_write_timeout(Some(Duration::from_secs(3)))?;
+        let body = serde_json::to_vec(body).expect("request JSON");
+        let preflight = if method == "OPTIONS" {
+            "Access-Control-Request-Method: POST\r\nAccess-Control-Request-Headers: authorization,content-type\r\n"
+        } else {
+            ""
+        };
+        let request = format!(
+            "{method} /v1/xray/{route} HTTP/1.1\r\nHost: {address}\r\nOrigin: {origin}\r\nAuthorization: Bearer {token}\r\nContent-Type: application/json\r\n{preflight}Content-Length: {}\r\nConnection: close\r\n\r\n",
+            body.len()
+        );
+        stream.write_all(request.as_bytes())?;
+        stream.write_all(&body)?;
+        let mut headers = Vec::new();
+        while !headers.ends_with(b"\r\n\r\n") {
+            let mut byte = [0];
+            stream.read_exact(&mut byte)?;
+            headers.push(byte[0]);
+            assert!(headers.len() <= 16 * 1024, "bounded HTTP response headers");
+        }
+        let headers = String::from_utf8(headers).expect("HTTP header UTF-8");
+        let status = headers
+            .lines()
+            .next()
+            .expect("status line")
+            .split_whitespace()
+            .nth(1)
+            .expect("status code")
+            .parse()
+            .expect("numeric status");
+        assert!(
+            !headers.contains(token),
+            "bearer bytes cannot enter response headers"
+        );
+        Ok((status, headers))
+    }
+
+    fn browser_handoff(app: &App) -> serde_json::Value {
+        let deadline = std::time::Instant::now() + Duration::from_secs(30);
+        let handoff = loop {
+            let bytes =
+                std::fs::read(app.root.join("browser.err")).expect("private CLI diagnostics");
+            if let Some(value) = bytes
+                .split(|byte| *byte == b'\n')
+                .filter_map(|line| serde_json::from_slice::<serde_json::Value>(line).ok())
+                .find(|value| value["kind"] == "xray_browser_handoff")
+            {
+                break value;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "browser handoff deadline"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        };
+        app.wait_event("browser", |event| {
+            event.event.domain == "xray" && event.event.name == "ready"
+        });
+        handoff
+    }
+    fn verify_browser_grant(
+        app: &mut App,
+        endpoint: &str,
+        token: &str,
+        origin: &str,
+        session: &str,
+    ) {
+        let foreign_session = app.create();
+        for route in ["observe", "payload", "finalize", "release"] {
+            let (status, headers) =
+                browser_request(endpoint, token, "OPTIONS", route, origin, &json!({}))
+                    .expect("real preflight");
+            assert_eq!(status, 204, "exact Origin preflight: {route}");
+            let lower = headers.to_ascii_lowercase();
+            assert!(lower.contains("access-control-allow-origin: http://localhost:5173\r\n"));
+            assert!(!lower.contains("access-control-allow-credentials:"));
+            for denied_origin in [
+                "http://localhost:5174",
+                "http://127.0.0.1:5173",
+                "null",
+                "*",
+            ] {
+                assert_eq!(
+                    browser_request(endpoint, token, "OPTIONS", route, denied_origin, &json!({}))
+                        .expect("denied preflight")
+                        .0,
+                    403
+                );
+                assert_eq!(
+                    browser_request(endpoint, token, "POST", route, denied_origin, &json!({}))
+                        .expect("denied actual request")
+                        .0,
+                    403,
+                    "actual CORS enforcement: {route}"
+                );
+            }
+        }
+        assert_eq!(
+            browser_request(
+                endpoint,
+                token,
+                "POST",
+                "observe",
+                origin,
+                &json!({"schema_version": 1, "session_id": foreign_session, "deep_capture": true})
+            )
+            .expect("foreign session denied")
+            .0,
+            403
+        );
+        // The granted Origin cannot turn diagnostic access into steering routes.
+        assert_eq!(
+            browser_request(
+                endpoint,
+                token,
+                "POST",
+                "cancel",
+                origin,
+                &json!({"session_id": session})
+            )
+            .expect("no execution control route")
+            .0,
+            404
+        );
+    }
+    fn verify_browser_expiry(
+        observer: &mut OwnedChild,
+        endpoint: &str,
+        token: &str,
+        origin: &str,
+        credential: &std::path::Path,
+        observation_id: &str,
+    ) {
+        // Expiry must terminate existing deep capture, not only new preflights.
+        let expired = observer
+            .0
+            .wait_timeout(Duration::from_secs(25))
+            .expect("bounded expiry")
+            .expect("expiry closes active observation");
+        assert!(
+            !expired.success(),
+            "capability expiry is evidence interruption, not a successful requested cutoff"
+        );
+        assert!(
+            !credential.exists(),
+            "expired capability file must be revoked by owner"
+        );
+        for route in ["observe", "payload", "finalize", "release"] {
+            match browser_request(
+                endpoint,
+                token,
+                "POST",
+                route,
+                origin,
+                &json!({"schema_version": 1, "observation_id": observation_id}),
+            ) {
+                Ok((status, _)) => {
+                    assert_eq!(status, 403, "expired capabilities cannot invoke {route}");
+                }
+                Err(error) => assert!(
+                    matches!(
+                        error.kind(),
+                        std::io::ErrorKind::ConnectionRefused
+                            | std::io::ErrorKind::ConnectionReset
+                            | std::io::ErrorKind::UnexpectedEof
+                            | std::io::ErrorKind::BrokenPipe
+                    ),
+                    "expiry must close transport or explicitly forbid, not hang: {error}"
+                ),
+            }
+        }
+    }
+    #[test]
+    #[ignore = "whole-app fixture requires identified bcode with static fake provider and browser Origin bootstrap"]
+    fn production_browser_origin_is_exact_expiring_and_does_not_steer_execution() {
+        let mut app = App::start();
+        let session = app.create();
+        let origin = "http://localhost:5173";
+        let mut observer = app.spawn(
+            &[
+                "session",
+                "xray",
+                &session,
+                "--deep",
+                "--allow-origin",
+                origin,
+                "--origin-lifetime-seconds",
+                "12",
+                "--browser-handoff",
+            ],
+            "browser",
+        );
+        let handoff = browser_handoff(&app);
+        let endpoint = handoff["endpoint"].as_str().expect("endpoint locator");
+        let credential = PathBuf::from(
+            handoff["credential_file"]
+                .as_str()
+                .expect("credential locator"),
+        );
+        assert!(
+            credential.starts_with(app.root.join("state")),
+            "daemon-owned private capability"
+        );
+        let token = std::fs::read_to_string(&credential)
+            .expect("explicit out-of-band credential provisioning");
+        let token = token.trim();
+        assert!(
+            !serde_json::to_string(&handoff)
+                .expect("handoff JSON")
+                .contains(token)
+        );
+        let observation_id = app.events("browser")[0].observation_id.clone();
+        verify_browser_grant(&mut app, endpoint, token, origin, &session);
+        verify_browser_expiry(
+            &mut observer,
+            endpoint,
+            token,
+            origin,
+            &credential,
+            &observation_id,
+        );
+        let (success, bytes) = app.run(&[
+            "send",
+            &session,
+            "ordinary work after browser expiry",
+            "--wait",
+            "--json",
+            "--timeout-secs",
+            "20",
+        ]);
+        assert!(success, "expiry never cancels session execution");
+        let result: serde_json::Value = serde_json::from_slice(&bytes).expect("terminal receipt");
+        assert_eq!(result["outcome"], "completed");
+        assert!(
+            !std::fs::read_to_string(app.root.join("browser.out"))
+                .expect("JSONL")
+                .contains(token)
+        );
+        app.stop();
+    }
+
+    #[test]
+    #[ignore = "whole-app fixture requires identified bcode with static fake provider"]
+    fn production_observer_disconnection_is_isolated_and_never_cancels_session_work() {
+        let mut app = App::start();
+        let session = app.create();
+        let foreign_session = app.create();
+        let mut first = app.spawn(&["session", "xray", &session], "isolation-first");
+        // This case tests disconnection isolation, not simultaneous bootstrap
+        // admission against one session's bounded read/ownership gate.
+        app.wait_event("isolation-first", |event| {
+            event.event.domain == "xray" && event.event.name == "ready"
+        });
+        let mut second = app.spawn(
+            &["session", "xray", &session, "--duration-seconds", "15"],
+            "isolation-second",
+        );
+        app.wait_event("isolation-second", |event| {
+            event.event.domain == "xray" && event.event.name == "ready"
+        });
+        let first_id = app.events("isolation-first")[0].observation_id.clone();
+        let second_id = app.events("isolation-second")[0].observation_id.clone();
+        assert_ne!(first_id, second_id);
+        let (success, _) = app.run(&[
+            "send",
+            &foreign_session,
+            "FOREIGN_SESSION_ISOLATION_CANARY",
+            "--wait",
+            "--json",
+            "--timeout-secs",
+            "20",
+        ]);
+        assert!(success);
+        // Disconnect just one directly owned client, without any cancel command.
+        first.0.kill().expect("disconnect owned observer");
+        first.0.wait().expect("reap disconnected observer");
+        let (success, bytes) = app.run(&[
+            "send",
+            &session,
+            "work after observer disconnection",
+            "--wait",
+            "--json",
+            "--timeout-secs",
+            "20",
+        ]);
+        assert!(
+            success,
+            "observer disconnection must never cancel or block ordinary execution"
+        );
+        let receipt: serde_json::Value =
+            serde_json::from_slice(&bytes).expect("terminal task receipt");
+        assert_eq!(receipt["outcome"], "completed");
+        let turn = receipt["receipt"]["turn_id"]
+            .as_str()
+            .expect("turn identity");
+        app.wait_event("isolation-second", |event| {
+            model(event, "turn_finished")
+                && event.event.correlation.turn_id.as_deref() == Some(turn)
+        });
+        assert!(
+            second
+                .0
+                .wait_timeout(Duration::from_secs(30))
+                .expect("bounded drain")
+                .expect("cutoff")
+                .success()
+        );
+        let events = app.events("isolation-second");
+        assert!(events.iter().all(|event| event.observation_id == second_id
+            && event.event.correlation.session_id == session));
+        assert!(
+            !serde_json::to_string(&events)
+                .expect("event JSON")
+                .contains("FOREIGN_SESSION_ISOLATION_CANARY")
+        );
+        assert!(
+            events
+                .iter()
+                .any(|event| event.event.domain == "xray" && event.event.name == "finalized")
+        );
+        app.stop_after_observer_crash();
+    }
+
+    fn interrupt_restart_segment(app: &mut App, session: &str) -> (PathBuf, String, Vec<u8>) {
+        use bcode_xray::recording::{RecordingOptions, RecordingState};
+        let first_bundle = app.root.join("before-restart");
+        let mut old_observer = app.spawn(
+            &[
+                "session",
+                "xray",
+                session,
+                "--record",
+                first_bundle.to_str().expect("bundle"),
+            ],
+            "restart-old",
+        );
+        app.wait_event("restart-old", |event| {
+            event.event.domain == "xray" && event.event.name == "ready"
+        });
+        let previous = app.events("restart-old")[0].observation_id.clone();
+        // Only this fixture's directly owned foreground child is killed. This is
+        // deliberate transport loss, not a supported observer cancellation API.
+        let mut server = app.server.take().expect("owned foreground child");
+        server.0.kill().expect("crash fixture daemon");
+        server.0.wait().expect("reap fixture daemon");
+        let status = old_observer
+            .0
+            .wait_timeout(Duration::from_secs(25))
+            .expect("bounded observer exit")
+            .expect("EOF must end old observer");
+        assert!(
+            !status.success(),
+            "daemon death cannot become successful finalization"
+        );
+        let before =
+            bcode_xray::recording::inspect_bundle(&first_bundle, &RecordingOptions::default())
+                .expect("interrupted recording remains inspectable");
+        assert_eq!(before.state, RecordingState::Interrupted);
+        assert!(!before.evidence_complete);
+        assert!(
+            before.finalization.is_none(),
+            "no synthesized terminal evidence after daemon death"
+        );
+        let immutable = std::fs::read(first_bundle.join("events.jsonl")).expect("first segment");
+        (first_bundle, previous, immutable)
+    }
+    #[test]
+    #[ignore = "whole-app fixture requires identified bcode with static fake provider"]
+    fn production_daemon_restart_interrupts_old_bundle_and_new_segment_is_explicitly_gapful() {
+        use bcode_xray::recording::{
+            CaptureSegmentBoundary, JsonlBundleRecorder, RecordingOptions, RecordingSink as _,
+            RecordingState,
+        };
+        let mut app = App::start();
+        let session = app.create();
+        let (first_bundle, previous, immutable) = interrupt_restart_segment(&mut app, &session);
+        app.start_server();
+        let mut new_observer = app.spawn(
+            &["session", "xray", &session, "--duration-seconds", "10"],
+            "restart-new",
+        );
+        app.wait_event("restart-new", |event| {
+            event.event.domain == "xray" && event.event.name == "ready"
+        });
+        let fresh = app.events("restart-new")[0].observation_id.clone();
+        assert_ne!(
+            fresh, previous,
+            "restart creates a new live observation, not a resume cursor"
+        );
+        let (success, _) = app.run(&[
+            "send",
+            &session,
+            "after real daemon restart",
+            "--wait",
+            "--json",
+            "--timeout-secs",
+            "20",
+        ]);
+        assert!(success, "ordinary session work survives daemon replacement");
+        assert!(
+            new_observer
+                .0
+                .wait_timeout(Duration::from_secs(30))
+                .expect("drain")
+                .expect("new cutoff")
+                .success()
+        );
+        let events = app.events("restart-new");
+        assert_eq!(events[0].sequence, 1);
+        assert!(events.iter().all(|event| event.observation_id == fresh));
+        let destination = app.root.join("after-restart");
+        let mut sink = JsonlBundleRecorder::create_segment(
+            &destination,
+            &fresh,
+            &session,
+            &previous,
+            RecordingOptions::default(),
+        )
+        .expect("explicit new gapful segment");
+        for event in &events {
+            sink.append(event).expect("new segment event");
+        }
+        let cutoff =
+            serde_json::from_value(events.last().expect("cutoff event").event.data.clone())
+                .expect("boundary");
+        let after = sink.finalize(&cutoff).expect("new segment finalized");
+        assert_eq!(after.state, RecordingState::Finalized);
+        assert_eq!(
+            after.segment,
+            CaptureSegmentBoundary::RestartAfterGap {
+                previous_observation_id: previous
+            }
+        );
+        assert!(
+            !after.evidence_complete,
+            "locally finalized restart segment cannot erase the interruption"
+        );
+        bcode_xray::recording::inspect_bundle(&destination, &RecordingOptions::default())
+            .expect("verified gapful bundle");
+        assert_eq!(
+            std::fs::read(first_bundle.join("events.jsonl")).expect("old segment unchanged"),
+            immutable
+        );
+        app.stop();
     }
 
     #[test]

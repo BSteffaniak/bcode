@@ -15,7 +15,11 @@ mod agent_cleanup;
 mod agent_progress;
 mod capture;
 mod xray_capture;
-pub use xray_capture::{EvalXrayCapture, EvalXrayEvidence, with_xray_capture};
+pub use xray_capture::{
+    CaptureLimits, EvalXrayAggregate, EvalXrayAggregation, EvalXrayCapture, EvalXrayEvidence,
+    EvalXraySegment, EvalXraySessionEvidence, ExecutionCapture, ExecutionReadinessReceipt,
+    with_xray_capture,
+};
 mod semantic_capture;
 
 /// Capture supported public workflow history collections from verified inspection capabilities.
@@ -550,6 +554,12 @@ fn with_execution_budget<T>(
     execute()
 }
 
+fn suite_parent(path: &Path) -> &Path {
+    path.parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."))
+}
+
 /// Execute an already-loaded suite without an additional caller execution budget.
 /// Relative resources resolve against the explicit suite locator; configured suite limits remain.
 ///
@@ -560,11 +570,7 @@ pub fn run_loaded_suite(
     mut suite: EvalSuite,
 ) -> Result<EvalRunResult, EvalError> {
     validate_suite(&suite)?;
-    let suite_dir = options
-        .suite_path
-        .parent()
-        .map_or_else(|| PathBuf::from("."), Path::to_path_buf)
-        .canonicalize()?;
+    let suite_dir = suite_parent(&options.suite_path).canonicalize()?;
     suite.metadata.insert(
         "suite_dir".into(),
         serde_json::Value::String(suite_dir.display().to_string()),
@@ -575,6 +581,9 @@ pub fn run_loaded_suite(
         .unwrap_or_else(|| default_run_id(&suite.id));
     let output_dir = options.output_root.join(&run_id);
     fs::create_dir_all(&output_dir)?;
+    // Subprocesses execute in workspaces, not the CLI's cwd. Absolute artifact
+    // locators must survive that boundary (including prepared admission output).
+    let output_dir = output_dir.canonicalize()?;
     let manifest = EvalRunManifest {
         run_id,
         suite_id: suite.id.clone(),
@@ -1712,8 +1721,8 @@ async fn execute_agent_variant_async(
                 }),
             },
         )?;
-        let mut xray = xray_capture::Capture::start(&session.id.to_string(), rep_dir, &client);
-        let mut pre_restart_evidence = None;
+        let mut xray =
+            xray_capture::SessionCapture::start(&session.id.to_string(), rep_dir, &client);
         let start = Instant::now();
         progress(format!(
             "agent turn: variant={} case={} rep={} session={} sending prompt",
@@ -1777,10 +1786,10 @@ async fn execute_agent_variant_async(
         if let Some(follow_up) = &variant.follow_up
             && !telemetry.timed_out
         {
-            if follow_up.restart_daemon {
-                pre_restart_evidence = xray
-                    .take()
-                    .and_then(xray_capture::Capture::finish_with_restart_gap);
+            if follow_up.restart_daemon
+                && let Some(capture) = xray.as_mut()
+            {
+                capture.before_restart();
             }
             let outcome = run_agent_follow_up(AgentFollowUpInput {
                 client: &client,
@@ -1791,6 +1800,7 @@ async fn execute_agent_variant_async(
                 session_id: session.id,
                 follow_up,
                 timeout,
+                xray: xray.as_mut(),
                 timeout_policy: suite.run.resolved_timeout(case),
             })
             .await?;
@@ -1815,8 +1825,7 @@ async fn execute_agent_variant_async(
                 }),
             },
         )?;
-        let xray_evidence =
-            pre_restart_evidence.or_else(|| xray.and_then(xray_capture::Capture::finish));
+        let xray_evidence = xray.and_then(xray_capture::SessionCapture::finish);
         if let Some(evidence) = xray_evidence {
             measurements.insert(
                 "eval.xray.evidence_complete".into(),
@@ -1892,6 +1901,7 @@ struct AgentFollowUpInput<'a> {
     session_id: bcode_session_models::SessionId,
     follow_up: &'a bcode_eval_models::EvalFollowUpConfig,
     timeout: std::time::Duration,
+    xray: Option<&'a mut xray_capture::SessionCapture>,
     timeout_policy: bcode_eval_models::EvalResolvedTimeout,
 }
 
@@ -1916,6 +1926,7 @@ async fn run_agent_follow_up(
         follow_up,
         timeout,
         timeout_policy,
+        mut xray,
     } = input;
     let mut diagnostics = Vec::new();
     if follow_up.restart_daemon {
@@ -1933,6 +1944,9 @@ async fn run_agent_follow_up(
         client.ensure_daemon_available().await.map_err(|error| {
             EvalError::Client(format!("daemon restart before follow-up: {error}"))
         })?;
+        if let Some(capture) = xray.as_mut() {
+            capture.after_restart(client);
+        }
         append_observation(
             rep_dir,
             &EvalObservation {
@@ -1942,15 +1956,6 @@ async fn run_agent_follow_up(
             },
         )?;
     }
-    let follow_up_xray = if follow_up.restart_daemon {
-        let directory = rep_dir.join("follow-up-xray");
-        // Optional evidence failure must not alter execution or canonical telemetry.
-        fs::create_dir_all(&directory).ok().and_then(|()| {
-            xray_capture::Capture::start(&session_id.to_string(), &directory, client)
-        })
-    } else {
-        None
-    };
     let start_sequence = latest_session_sequence(client, session_id).await?;
     let start = Instant::now();
     progress(format!(
@@ -2005,9 +2010,6 @@ async fn run_agent_follow_up(
             severity: EvalDiagnosticSeverity::Error,
             message: "follow-up turn timed out before ModelTurnFinished".into(),
         });
-    }
-    if let Some(capture) = follow_up_xray {
-        let _ = capture.finish_with_restart_gap();
     }
     Ok(AgentFollowUpOutcome {
         measurements,
@@ -4891,6 +4893,19 @@ mod orchestration_tests;
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn bare_suite_filename_uses_current_directory_not_empty_parent() {
+        let parent = super::suite_parent(std::path::Path::new("suite.toml"));
+        assert_eq!(parent, std::path::Path::new("."));
+        assert_eq!(
+            parent.canonicalize().unwrap(),
+            std::env::current_dir().unwrap().canonicalize().unwrap()
+        );
+        assert_eq!(
+            super::suite_parent(std::path::Path::new("fixtures/suite.toml")),
+            std::path::Path::new("fixtures")
+        );
+    }
     #[test]
     fn history_capture_precedes_exports_without_inventing_receipts() {
         let directory = std::env::temp_dir().join(format!(

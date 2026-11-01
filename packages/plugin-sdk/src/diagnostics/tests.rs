@@ -8,6 +8,9 @@ struct Fixture {
     acquired: AtomicUsize,
     released: AtomicUsize,
     events: Mutex<Vec<Vec<u8>>>,
+    payload_mode: AtomicUsize,
+    aborted: AtomicUsize,
+    payload_bytes: Mutex<Vec<u8>>,
 }
 extern "C" fn control(
     request: *const u8,
@@ -21,6 +24,10 @@ extern "C" fn control(
     let bytes = unsafe { std::slice::from_raw_parts(request, length) };
     let request: DiagnosticControl =
         serde_json::from_slice(bytes.strip_prefix(DIAGNOSTIC_CONTROL_PREFIX).unwrap()).unwrap();
+    let payload = match &request.operation {
+        DiagnosticControlOperation::Payload(operation) => fixture_payload(fixture, operation),
+        _ => None,
+    };
     match request.operation {
         DiagnosticControlOperation::Acquire => {
             fixture.acquired.fetch_add(1, Ordering::SeqCst);
@@ -28,12 +35,15 @@ extern "C" fn control(
         DiagnosticControlOperation::Release => {
             fixture.released.fetch_add(1, Ordering::SeqCst);
         }
-        DiagnosticControlOperation::State => {}
+        DiagnosticControlOperation::State
+        | DiagnosticControlOperation::Payload(_)
+        | DiagnosticControlOperation::Loss { .. } => {}
     }
     let bytes = serde_json::to_vec(&DiagnosticStatus {
         version: 1,
         active: true,
         deep_active: true,
+        payload,
     })
     .unwrap();
     assert!(bytes.len() <= capacity);
@@ -43,6 +53,107 @@ extern "C" fn control(
     }
     SERVICE_BRIDGE_STATUS_OK
 }
+fn fixture_payload(
+    fixture: &Fixture,
+    operation: &payload::PayloadControl,
+) -> Option<payload::PayloadReply> {
+    use payload::{PayloadControl, PayloadReply};
+    use sha2::{Digest, Sha256};
+    let mode = fixture.payload_mode.load(Ordering::SeqCst);
+    if mode == 0 {
+        return None; // Legacy event-only host.
+    }
+    Some(match operation {
+        PayloadControl::Negotiate { .. } => PayloadReply::Supported {
+            version: payload::PAYLOAD_VERSION,
+            max_bytes: payload::MAX_PAYLOAD_BYTES,
+            chunk_bytes: payload::MAX_CHUNK_BYTES,
+        },
+        PayloadControl::Begin { .. } => {
+            fixture.payload_bytes.lock().unwrap().clear();
+            PayloadReply::Accepted { transfer: 7 }
+        }
+        PayloadControl::Chunk { offset, bytes, .. } => {
+            if mode == 2 {
+                return None; // Lost/malformed acknowledgement after Begin.
+            }
+            let mut received = fixture.payload_bytes.lock().unwrap();
+            assert_eq!(*offset, received.len());
+            received.extend_from_slice(bytes);
+            PayloadReply::Progress
+        }
+        PayloadControl::Finish { .. } => {
+            let bytes = fixture.payload_bytes.lock().unwrap();
+            PayloadReply::Retained {
+                reference: bcode_xray::XrayPayloadRef {
+                    schema_version: if mode == 3 {
+                        99
+                    } else {
+                        bcode_xray::XRAY_SCHEMA_VERSION
+                    },
+                    payload_id: if mode == 8 {
+                        String::new()
+                    } else {
+                        "opaque-reference".into()
+                    },
+                    session_id: if mode == 4 { "foreign" } else { "host" }.into(),
+                    content_type: if mode == 5 {
+                        "text/plain"
+                    } else {
+                        "application/json"
+                    }
+                    .into(),
+                    byte_len: bytes.len() as u64 + u64::from(mode == 7),
+                    sha256: if mode == 6 {
+                        "0".repeat(64)
+                    } else {
+                        hex::encode(Sha256::digest(&*bytes))
+                    },
+                },
+            }
+        }
+        PayloadControl::Abort { .. } => {
+            fixture.aborted.fetch_add(1, Ordering::SeqCst);
+            fixture.payload_bytes.lock().unwrap().clear();
+            PayloadReply::Progress
+        }
+    })
+}
+
+#[test]
+fn retained_payload_acknowledgements_validate_metadata_and_abort_every_failed_transfer() {
+    let bytes =
+        serde_json::to_vec(&serde_json::json!({"text": "界🙂e\u{301}".repeat(10_000)})).unwrap();
+    for mode in 1..=8 {
+        let mut fixture = Fixture::default();
+        fixture.payload_mode.store(mode, Ordering::SeqCst);
+        let data = std::ptr::from_mut(&mut fixture).cast();
+        let capture = capture_context(
+            Some(&negotiation()),
+            ServiceEventEmitter::new(Some(event), data),
+            Some(control),
+            data,
+        )
+        .unwrap();
+        let result = capture.capture_payload("application/json", &bytes);
+        if mode == 1 {
+            let reference = result.unwrap().expect("explicit retained acknowledgement");
+            assert_eq!(reference.byte_len, bytes.len() as u64);
+            assert_eq!(*fixture.payload_bytes.lock().unwrap(), bytes);
+            assert_eq!(fixture.aborted.load(Ordering::SeqCst), 0);
+        } else {
+            assert!(
+                result.is_err(),
+                "mode {mode} cannot masquerade as detached/empty success"
+            );
+            assert_eq!(fixture.aborted.load(Ordering::SeqCst), 1);
+            assert!(fixture.payload_bytes.lock().unwrap().is_empty());
+        }
+        drop(capture);
+        assert_eq!(fixture.released.load(Ordering::SeqCst), 1);
+    }
+}
+
 extern "C" fn event(payload: *const u8, length: usize, data: *mut c_void) {
     let fixture = unsafe { &*data.cast::<Fixture>() };
     let bytes = unsafe { std::slice::from_raw_parts(payload, length) };
@@ -116,6 +227,41 @@ fn unsupported_or_absent_negotiation_never_acquires_callback() {
     assert!(capture_context(Some(&unknown), emitter, Some(control), data).is_none());
     assert_eq!(fixture.acquired.load(Ordering::SeqCst), 0);
     assert!(fixture.events.lock().unwrap().is_empty());
+}
+
+#[test]
+fn old_event_only_host_keeps_events_and_rejects_payload_extension_without_empty_success() {
+    let mut fixture = Fixture::default();
+    let data = std::ptr::from_mut(&mut fixture).cast();
+    let capture = capture_context(
+        Some(&negotiation()),
+        ServiceEventEmitter::new(Some(event), data),
+        Some(control),
+        data,
+    )
+    .unwrap();
+    assert!(matches!(
+        capture.capture_payload("text/plain", b"payload"),
+        Err(bcode_xray::XrayError::PayloadCaptureUnsupported)
+    ));
+    assert!(!capture.report_external_loss(1));
+    capture.emit("fixture", "still_available", serde_json::json!({}), true);
+    assert!(fixture.events.lock().unwrap().iter().any(|bytes| {
+        let event: NativeDiagnosticEvent =
+            serde_json::from_slice(bytes.strip_prefix(DIAGNOSTIC_EVENT_PREFIX).unwrap()).unwrap();
+        event.event.name == "still_available"
+    }));
+    drop(capture);
+    assert_eq!(fixture.released.load(Ordering::SeqCst), 1);
+}
+
+#[test]
+fn legacy_status_remains_decodable_without_payload_extension() {
+    let status: DiagnosticStatus =
+        serde_json::from_str(r#"{"version":1,"active":true,"deep_active":true}"#).unwrap();
+    assert!(status.payload.is_none());
+    let wire = serde_json::to_value(status).unwrap();
+    assert!(wire.get("payload").is_none());
 }
 
 #[test]

@@ -7,7 +7,7 @@
 //! explicit lossy-projection marker. Domain-private objects require owner projections.
 use bcode_model::{ProviderOutputEvent, ProviderTurnEvent};
 use bcode_session_models::{SessionEvent, SessionEventKind, SessionId};
-use bcode_xray::CaptureContext;
+use bcode_xray::{CaptureContext, XrayCaptureAttachment, XrayCaptureAttachments, XrayEvent};
 use bcode_xray_models::XrayCorrelation;
 use serde_json::{Value, json};
 
@@ -80,15 +80,24 @@ fn protected_text_at(
         return;
     };
     match context.capture_payload("application/vnd.bcode.xray.diagnostic-text+json", &bytes) {
-        Ok(Some(reference)) => context.emit(
-            "session",
-            "content_projected",
-            json!({
-                "field": field, "canonical_sequence": canonical_sequence,
-                "payload": reference, "complete_original": false,
-            }),
-            true,
-        ),
+        Ok(Some(reference)) => {
+            let mut event = XrayEvent::new(
+                "session",
+                "content_projected",
+                context.correlation().clone(),
+                json!({
+                    "field": field, "canonical_sequence": canonical_sequence,
+                    "payload": reference, "complete_original": false,
+                }),
+                true,
+            );
+            event.capture = Some(XrayCaptureAttachments::new(vec![
+                XrayCaptureAttachment::PayloadRef {
+                    pointer: "/payload".into(),
+                },
+            ]));
+            context.emit_event(event);
+        }
         Ok(None) => {} // Observer detached between gating and payload admission.
         Err(_) => context.emit(
             "session",
@@ -124,11 +133,12 @@ fn canonical_projection(context: &CaptureContext, event: &SessionEvent) {
     }
     let text = canonical_content(event, &mut correlation, &mut data);
     let context = context.with_correlation(correlation);
-    context.emit(
+    context.emit_with_capture(
         "session",
         super::session_event_kind_name(&event.kind),
         data,
         false,
+        Some(XrayCaptureAttachments::new(vec![])),
     );
     if let Some((field, value)) = text {
         protected_text_at(&context, field, value, Some(event.sequence));
@@ -459,7 +469,13 @@ fn provider_projection(context: &CaptureContext, event: &ProviderTurnEvent) {
         // serialize it, even when a deep observer exists. Provider adapters own it.
         _ => json!({"detail": "requires_domain_owned_projection"}),
     };
-    context.emit("model", super::provider_turn_event_kind(event), data, false);
+    context.emit_with_capture(
+        "model",
+        super::provider_turn_event_kind(event),
+        data,
+        false,
+        Some(XrayCaptureAttachments::new(vec![])),
+    );
 }
 
 pub fn provider_event(
@@ -524,6 +540,61 @@ mod tests {
             json!(bcode_session_models::ModelTurnOutcome::Error)
         );
         assert!(!emitted.data.to_string().contains("must-not-appear"));
+        assert_eq!(emitted.capture, Some(XrayCaptureAttachments::new(vec![])));
+        assert!(emitted.payload_references().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn shallow_canonical_runtime_work_declares_no_external_payloads() {
+        let hub = XrayHub::default();
+        let started = event(SessionEventKind::RuntimeWorkStarted {
+            work_id: bcode_session_models::WorkId::new("work"),
+            kind: bcode_session_models::RuntimeWorkKind::Tool,
+            label: "private label".into(),
+            tool_call_id: Some("call".into()),
+            plugin_id: None,
+            service_interface: None,
+            operation: None,
+            parent_work_id: None,
+            started_at_ms: None,
+            cancellable: false,
+        });
+        let finished = SessionEvent {
+            sequence: started.sequence + 1,
+            kind: SessionEventKind::RuntimeWorkFinished {
+                work_id: bcode_session_models::WorkId::new("work"),
+                status: bcode_session_models::RuntimeWorkStatus::Completed,
+                finished_at_ms: None,
+                message: Some("private message".into()),
+            },
+            ..started.clone()
+        };
+        let mut observation = hub
+            .observe(XrayObserveRequest {
+                schema_version: 1,
+                session_id: started.session_id.to_string(),
+                deep_capture: false,
+            })
+            .unwrap();
+        observation.recv().await.unwrap();
+        let context = hub.context(XrayCorrelation {
+            session_id: started.session_id.to_string(),
+            ..Default::default()
+        });
+        for (source, name) in [
+            (&started, "runtime_work_started"),
+            (&finished, "runtime_work_finished"),
+        ] {
+            canonical_projection(&context, source);
+            let emitted = observation.recv().await.unwrap().event;
+            assert_eq!(emitted.name, name);
+            assert_eq!(emitted.data["work_id"], "work");
+            assert_eq!(emitted.data["canonical_sequence"], source.sequence);
+            assert!(!emitted.sensitive);
+            assert!(!emitted.data.to_string().contains("private"));
+            assert_eq!(emitted.capture, Some(XrayCaptureAttachments::new(vec![])));
+            assert!(emitted.payload_references().unwrap().is_empty());
+        }
     }
 
     #[tokio::test]
@@ -559,11 +630,15 @@ mod tests {
         );
         let text = observation.recv().await.expect("text metadata").event;
         assert_eq!(text.data["text_bytes"], 14);
+        assert_eq!(text.capture, Some(XrayCaptureAttachments::new(vec![])));
+        assert!(text.payload_references().unwrap().is_empty());
         assert!(!text.data.to_string().contains("private prompt"));
         let call = observation.recv().await.expect("call metadata").event;
         assert_eq!(call.correlation.tool_call_id.as_deref(), Some("call"));
         assert!(!call.data.to_string().contains("never-emit"));
         assert!(!call.sensitive);
+        assert_eq!(call.capture, Some(XrayCaptureAttachments::new(vec![])));
+        assert!(call.payload_references().unwrap().is_empty());
     }
 
     #[tokio::test]
@@ -682,6 +757,42 @@ mod tests {
         assert_eq!(emitted.data["is_error"], true);
         assert_eq!(emitted.correlation.turn_id.as_deref(), Some("turn"));
         assert!(!emitted.data.to_string().contains("private result"));
+    }
+
+    #[tokio::test]
+    async fn projected_text_declares_only_its_retained_payload_location() {
+        let hub = XrayHub::default();
+        let context = hub.context(XrayCorrelation {
+            session_id: "session".into(),
+            ..Default::default()
+        });
+        let mut observation = hub
+            .observe(XrayObserveRequest {
+                schema_version: 1,
+                session_id: "session".into(),
+                deep_capture: true,
+            })
+            .unwrap();
+        observation.recv().await.unwrap();
+        protected_text(
+            &context,
+            "body",
+            r#"{"payload_id":"ordinary-text","sha256":"not-a-reference","byte_len":12}"#,
+        );
+        let captured = observation.recv().await.unwrap();
+        assert_eq!(captured.event.name, "content_projected");
+        let references = captured.payload_references().unwrap();
+        assert_eq!(references.len(), 1);
+        assert_eq!(
+            serde_json::to_value(&references[0]).unwrap(),
+            captured.event.data["payload"]
+        );
+        assert_eq!(
+            captured.event.capture.unwrap().attachments,
+            vec![XrayCaptureAttachment::PayloadRef {
+                pointer: "/payload".into()
+            },]
+        );
     }
 
     #[tokio::test]

@@ -5,7 +5,7 @@
 use std::io::{self, Write};
 
 use bcode_model::{ContentBlock, ModelMessage, ModelTurnRequest};
-use bcode_xray::CaptureContext;
+use bcode_xray::{CaptureContext, XrayCaptureAttachment, XrayCaptureAttachments, XrayEvent};
 use serde::ser::{Serialize, SerializeSeq, SerializeStruct, Serializer};
 use serde_json::json;
 
@@ -30,7 +30,7 @@ pub fn assembled_request(request: &ModelTurnRequest, boundary: &'static str) {
     let mut correlation = context.correlation().clone();
     correlation.request_id = Some(request.turn_id.clone());
     let context = context.with_correlation(correlation);
-    context.emit(
+    context.emit_with_capture(
         "context",
         boundary,
         json!({
@@ -47,6 +47,7 @@ pub fn assembled_request(request: &ModelTurnRequest, boundary: &'static str) {
             "engine_limits": "see_xray_ready_capabilities",
         }),
         false,
+        Some(XrayCaptureAttachments::new(vec![])),
     );
     sensitive(
         &context,
@@ -72,14 +73,14 @@ pub fn final_messages(messages: &[ModelMessage]) {
     let Some(context) = CaptureContext::current().filter(CaptureContext::capture_active) else {
         return;
     };
-    context.emit("context", "messages_assembled", json!({
+    context.emit_with_capture("context", "messages_assembled", json!({
         "messages": messages.len(),
         "capture_completeness": "normalized_view_with_explicit_exclusions",
         "excluded_fields": ["provider_extensions", "image_source_paths", "unresolved_image_reference_bytes"],
         "inline_limit_bytes": INLINE_CAPTURE_BYTES,
         "producer_limit_bytes": MAX_CAPTURE_BYTES,
         "engine_limits": "see_xray_ready_capabilities",
-    }), false);
+    }), false, Some(XrayCaptureAttachments::new(vec![])));
     sensitive(&context, "assembled_messages", &Messages(messages));
 }
 
@@ -102,7 +103,7 @@ pub fn sensitive<T: Serialize + ?Sized>(context: &CaptureContext, name: &'static
     let byte_len = bytes.len();
     if byte_len <= INLINE_CAPTURE_BYTES {
         match serde_json::from_slice::<serde_json::Value>(&bytes) {
-            Ok(value) => context.emit(
+            Ok(value) => context.emit_with_capture(
                 "context",
                 name,
                 json!({
@@ -112,24 +113,34 @@ pub fn sensitive<T: Serialize + ?Sized>(context: &CaptureContext, name: &'static
                     "producer_limit_bytes": MAX_CAPTURE_BYTES,
                 }),
                 true,
+                Some(XrayCaptureAttachments::new(vec![])),
             ),
             Err(_) => omitted(context, name, "encoding_failed", Some(byte_len)),
         }
         return;
     }
     match context.capture_payload("application/json", &bytes) {
-        Ok(Some(payload)) => context.emit(
-            "context",
-            name,
-            json!({
-                "storage": "payload", "payload": payload, "byte_len": byte_len,
-                "completeness": "complete_normalized_view",
-                "inline_limit_bytes": INLINE_CAPTURE_BYTES,
-                "producer_limit_bytes": MAX_CAPTURE_BYTES,
-                "retention": "transient_observation_scoped_subject_to_eviction",
-            }),
-            true,
-        ),
+        Ok(Some(payload)) => {
+            let mut event = XrayEvent::new(
+                "context",
+                name,
+                context.correlation().clone(),
+                json!({
+                    "storage": "payload", "payload": payload, "byte_len": byte_len,
+                    "completeness": "complete_normalized_view",
+                    "inline_limit_bytes": INLINE_CAPTURE_BYTES,
+                    "producer_limit_bytes": MAX_CAPTURE_BYTES,
+                    "retention": "transient_observation_scoped_subject_to_eviction",
+                }),
+                true,
+            );
+            event.capture = Some(XrayCaptureAttachments::new(vec![
+                XrayCaptureAttachment::PayloadRef {
+                    pointer: "/payload".into(),
+                },
+            ]));
+            context.emit_event(event);
+        }
         Ok(None) => omitted(context, name, "capture_no_longer_active", Some(byte_len)),
         Err(error) => {
             let reason = match error {
@@ -408,6 +419,42 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn shallow_assembled_request_declares_no_external_payloads() {
+        let hub = bcode_xray::XrayHub::default();
+        let session = bcode_session_models::SessionId::new();
+        let mut observer = hub
+            .observe(bcode_xray::XrayObserveRequest {
+                schema_version: 1,
+                session_id: session.to_string(),
+                deep_capture: false,
+            })
+            .unwrap();
+        observer.recv().await.unwrap();
+        let context = hub.context(bcode_xray::XrayCorrelation {
+            session_id: session.to_string(),
+            ..Default::default()
+        });
+        let request: ModelTurnRequest = serde_json::from_value(json!({
+            "session_id": session, "turn_id":"turn", "model_id":"fixture",
+            "system_prompt":"private", "messages":[], "tools":[],
+        }))
+        .unwrap();
+        context
+            .scope(async {
+                assembled_request(&request, "request_assembled");
+            })
+            .await;
+        let emitted = observer.recv().await.unwrap().event;
+        assert_eq!(emitted.name, "request_assembled");
+        assert!(!emitted.sensitive);
+        assert_eq!(emitted.capture, Some(XrayCaptureAttachments::new(vec![])));
+        assert!(emitted.payload_references().unwrap().is_empty());
+        assert!(!emitted.data.to_string().contains("private"));
+        observer.finalize().unwrap();
+        assert_eq!(observer.recv().await.unwrap().event.domain, "xray");
+    }
+
+    #[tokio::test]
     async fn deep_capture_reports_oversize_without_partial_content() {
         let hub = bcode_xray::XrayHub::default();
         let context = hub.context(bcode_xray::XrayCorrelation {
@@ -426,6 +473,8 @@ mod tests {
         let event = observer.recv().await.unwrap().event;
         assert_eq!(event.name, "capture_omitted");
         assert_eq!(event.data["reason"], "byte_limit");
+        // An omission is not upgraded to a complete no-reference declaration.
+        assert!(event.capture.is_none());
         assert!(!event.sensitive);
         drop(observer);
         assert!(!context.deep_capture_active());
@@ -468,8 +517,9 @@ mod tests {
             captured.correlation.request_id.as_deref(),
             Some("request-1")
         );
-        let reference: bcode_xray::XrayPayloadRef =
-            serde_json::from_value(captured.data["payload"].clone()).unwrap();
+        let references = captured.payload_references().unwrap();
+        assert_eq!(references.len(), 1);
+        let reference = &references[0];
         let mut bytes = Vec::new();
         while u64::try_from(bytes.len()).unwrap() < reference.byte_len {
             let range = hub
@@ -525,8 +575,37 @@ mod tests {
         let captured = observer.recv().await.unwrap().event;
         assert_eq!(captured.name, "assembled_messages");
         assert_eq!(captured.data["storage"], "payload");
+        assert_eq!(captured.payload_references().unwrap().len(), 1);
         assert!(captured.data["payload"]["byte_len"].as_u64().unwrap() > 32 * 1024);
         assert_eq!(captured.data["completeness"], "complete_normalized_view");
+    }
+
+    #[tokio::test]
+    async fn inline_context_reference_lookalikes_are_opaque_content() {
+        let hub = bcode_xray::XrayHub::default();
+        let context = hub.context(bcode_xray::XrayCorrelation {
+            session_id: "session".into(),
+            ..Default::default()
+        });
+        let mut observer = hub
+            .observe(bcode_xray::XrayObserveRequest {
+                schema_version: 1,
+                session_id: "session".into(),
+                deep_capture: true,
+            })
+            .unwrap();
+        observer.recv().await.unwrap();
+        let ordinary = json!({
+            "payload_id": "ordinary-content", "sha256": "not-a-digest", "byte_len": 42,
+            "nested": {"schema_version": 999, "payload_id": "also-ordinary"},
+        });
+        sensitive(&context, "inline_collision", &ordinary);
+        let captured = observer.recv().await.unwrap().event;
+        assert_eq!(captured.data["storage"], "inline");
+        assert_eq!(captured.data["content"], ordinary);
+        assert!(captured.sensitive);
+        assert_eq!(captured.capture, Some(XrayCaptureAttachments::new(vec![])));
+        assert!(captured.payload_references().unwrap().is_empty());
     }
 
     #[tokio::test]

@@ -7,6 +7,142 @@ use std::time::Instant;
 
 use bcode_xray::CaptureContext;
 
+/// Construct model-turn diagnostics from immutable admitted turn metadata and exact
+/// canonical workflow linkage. Node IDs and attempt numbers are never relabelled as
+/// activation/dispatch IDs. Missing or unsupported linkage disables only enrichment.
+/// Shared-parent turns use their admission identity, not session-level provenance.
+pub async fn turn_context(
+    state: &crate::ServerState,
+    trigger_event: &bcode_session_models::SessionEvent,
+) -> CaptureContext {
+    let execution = crate::turn_execution_options(trigger_event);
+    let mut correlation = bcode_xray_models::XrayCorrelation {
+        session_id: trigger_event.session_id.to_string(),
+        turn_id: Some(crate::execution_turn_id(trigger_event)),
+        ..Default::default()
+    };
+    if let Some(turn) = execution.correlation.as_ref() {
+        // The execution correlation is immutable host-admitted metadata; it confers
+        // no diagnostic authorization. The hub still evaluates the exact run grant.
+        if valid_turn_identity(&turn.execution_id) {
+            correlation.run_id = Some(turn.execution_id.clone());
+            if let Some((activation, dispatch)) =
+                verified_turn_attempt(state, trigger_event, turn).await
+            {
+                correlation.activation_id = Some(activation);
+                correlation.attempt_id = Some(dispatch);
+            }
+        }
+    }
+    state.xray.context(correlation)
+}
+
+fn valid_turn_identity(value: &str) -> bool {
+    !value.is_empty() && value.len() <= 256 && !value.chars().any(char::is_control)
+}
+
+fn workflow_turn_dispatch(trigger: &bcode_session_models::SessionEvent) -> Option<&str> {
+    use bcode_session_models::SessionEventKind;
+    let admission = match &trigger.kind {
+        SessionEventKind::UserMessage { admission, .. }
+        | SessionEventKind::SubmissionActivated { admission, .. } => admission,
+        SessionEventKind::SubmissionAccepted { submission } => &submission.admission,
+        _ => return None,
+    };
+    let origin = admission.origin.as_ref()?;
+    let identity = origin.correlation_id.as_deref()?;
+    (origin.producer == "bcode.workflow"
+        && admission.idempotency_key.as_deref() == Some(identity)
+        && valid_turn_identity(identity))
+    .then_some(identity)
+}
+
+async fn verified_turn_attempt(
+    state: &crate::ServerState,
+    trigger: &bcode_session_models::SessionEvent,
+    turn: &bcode_session_models::TurnExecutionCorrelation,
+) -> Option<(String, String)> {
+    use bcode_workflow_store::representation::{attempts::owner_boundary, graph, runs};
+    use switchy_database_connection::{SqliteAccess, SqliteOpenOptions, open_sqlite_rusqlite};
+
+    let identity = workflow_turn_dispatch(trigger)?;
+    if !valid_turn_identity(&turn.unit_id) || turn.attempt == 0 {
+        return None;
+    }
+    // Retain the existing canonical maintenance fence; never install, upgrade,
+    // acquire execution ownership or substitute a different workflow location.
+    let retained = {
+        let store = state.workflow_store.try_lock().ok()?;
+        if !store.path().is_file() {
+            return None;
+        }
+        store.retained_handle().ok()?
+    };
+    let db = open_sqlite_rusqlite(
+        retained.path(),
+        &SqliteOpenOptions {
+            access: SqliteAccess::ReadOnly,
+            allow_uri: false,
+            busy_timeout: std::time::Duration::ZERO,
+            foreign_keys: true,
+            connections: std::num::NonZeroUsize::MIN,
+        },
+    )
+    .ok()?;
+    if !matches!(
+        runs::lookup(&db, &turn.execution_id).await.ok()?,
+        runs::RunLookup::Available(_)
+    ) {
+        return None;
+    }
+    let prepared = owner_boundary::prepared(&db, &turn.execution_id, identity)
+        .await
+        .ok()??;
+    if prepared.run_id != turn.execution_id
+        || prepared.node_id != turn.unit_id
+        || prepared.attempt != turn.attempt
+        || prepared.dispatch_identity() != identity
+    {
+        return None;
+    }
+    if graph::activation_id(&db, &turn.execution_id, &turn.unit_id)
+        .await
+        .ok()?
+        .as_deref()
+        != Some(prepared.activation_id.as_str())
+    {
+        return None;
+    }
+    let link = owner_boundary::execution_session_link(
+        &db,
+        &turn.execution_id,
+        &turn.unit_id,
+        &prepared.activation_id,
+        turn.attempt,
+    )
+    .await
+    .ok()??;
+    if link.run_id != turn.execution_id
+        || link.node_id != turn.unit_id
+        || link.activation_id != prepared.activation_id
+        || link.attempt != turn.attempt
+        || link.session_id != trigger.session_id.to_string()
+    {
+        return None;
+    }
+    // Do not attach a new generation's identities to an earlier queued turn if the
+    // graph advanced while reading its link. No fallbacks or bounded-list guessing.
+    if graph::activation_id(&db, &turn.execution_id, &turn.unit_id)
+        .await
+        .ok()?
+        .as_deref()
+        != Some(prepared.activation_id.as_str())
+    {
+        return None;
+    }
+    Some((prepared.activation_id, identity.to_owned()))
+}
+
 /// Resolve the actual current canonical association, never a guessed ambient session.
 /// Failure disables diagnostics only; it does not change dispatch/ownership outcomes.
 /// Call this at background-driver entry before spawning descendants.
@@ -127,7 +263,9 @@ impl Boundary {
             .as_ref()
             .filter(|context| context.capture_active())
         {
-            context.emit(
+            // This producer owns the complete content-free record: generated UUID,
+            // static phase/outcome labels and elapsed time, with no payload locations.
+            context.emit_with_capture(
                 "workflow",
                 self.operation,
                 serde_json::json!({
@@ -138,6 +276,7 @@ impl Boundary {
                         .unwrap_or(u64::MAX),
                 }),
                 false,
+                Some(bcode_xray_models::XrayCaptureAttachments::new(Vec::new())),
             );
         }
     }
@@ -154,11 +293,13 @@ impl Drop for Boundary {
 /// Emit only a normalized domain fact, never receipt content or arbitrary errors.
 pub fn fact(context: Option<&CaptureContext>, name: &str, outcome: &'static str) {
     if let Some(context) = context.filter(|context| context.capture_active()) {
-        context.emit(
+        // Only a normalized static outcome is data; no receipt/error body is copied.
+        context.emit_with_capture(
             "workflow",
             name,
             serde_json::json!({ "outcome": outcome }),
             false,
+            Some(bcode_xray_models::XrayCaptureAttachments::new(Vec::new())),
         );
     }
 }
@@ -168,6 +309,44 @@ mod tests {
     use super::*;
     use bcode_xray::XrayHub;
     use bcode_xray_models::{XrayCorrelation, XrayObserveRequest};
+
+    #[test]
+    fn workflow_dispatch_requires_exact_admitted_origin_and_idempotency_identity() {
+        use bcode_session_models::{
+            SessionEvent, SessionEventKind, TurnAdmissionMetadata, TurnOrigin,
+        };
+        let mut admission = TurnAdmissionMetadata {
+            origin: Some(TurnOrigin {
+                producer: "bcode.workflow".into(),
+                correlation_id: Some("canonical-dispatch".into()),
+                display_label: None,
+            }),
+            idempotency_key: Some("canonical-dispatch".into()),
+            ..Default::default()
+        };
+        let event = |admission| SessionEvent {
+            schema_version: 1,
+            sequence: 1,
+            timestamp_ms: 0,
+            session_id: bcode_session_models::SessionId::new(),
+            provenance: None,
+            kind: SessionEventKind::UserMessage {
+                client_id: bcode_session_models::ClientId::new(),
+                text: String::new(),
+                admission,
+            },
+        };
+        let matching = event(admission.clone());
+        assert_eq!(
+            workflow_turn_dispatch(&matching),
+            Some("canonical-dispatch")
+        );
+        admission.idempotency_key = Some("different-dispatch".into());
+        assert!(workflow_turn_dispatch(&event(admission.clone())).is_none());
+        admission.idempotency_key = Some("canonical-dispatch".into());
+        admission.origin.as_mut().unwrap().producer = "other-owner".into();
+        assert!(workflow_turn_dispatch(&event(admission)).is_none());
+    }
 
     fn origin(hub: &XrayHub, session: &str) -> CaptureContext {
         hub.context(XrayCorrelation {
@@ -304,6 +483,43 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn normalized_fact_declares_inline_data_without_changing_opaque_default() {
+        let hub = XrayHub::default();
+        let mut observation = hub
+            .observe(XrayObserveRequest {
+                schema_version: 1,
+                session_id: "session".into(),
+                deep_capture: false,
+            })
+            .expect("observe");
+        let _ready = observation.recv().await.expect("ready");
+        let context = origin(&hub, "session");
+        fact(Some(&context), "receipt.status", "ok");
+        context.emit(
+            "workflow",
+            "opaque.untrusted",
+            serde_json::json!({
+                "payload_id":"not-a-declared-reference", "byte_len":12
+            }),
+            false,
+        );
+        let inline = observation.recv().await.expect("inline fact").event;
+        assert_eq!(inline.data, serde_json::json!({"outcome":"ok"}));
+        assert_eq!(
+            inline.capture,
+            Some(bcode_xray_models::XrayCaptureAttachments::new(Vec::new()))
+        );
+        assert!(
+            inline
+                .payload_references()
+                .expect("inline metadata")
+                .is_empty()
+        );
+        let opaque = observation.recv().await.expect("opaque event").event;
+        assert!(opaque.capture.is_none());
+    }
+
+    #[tokio::test]
     async fn dropped_boundary_is_unfinished_and_explicit_completion_is_not_reopened() {
         let hub = XrayHub::default();
         let mut observation = hub
@@ -328,5 +544,17 @@ mod tests {
         assert_eq!(events[0].data["boundary_id"], events[1].data["boundary_id"]);
         assert_ne!(events[0].data["boundary_id"], events[2].data["boundary_id"]);
         assert!(events.iter().all(|event| !event.sensitive));
+        for event in events {
+            assert_eq!(
+                event.capture,
+                Some(bcode_xray_models::XrayCaptureAttachments::new(Vec::new()))
+            );
+            assert!(
+                event
+                    .payload_references()
+                    .expect("valid inline declaration")
+                    .is_empty()
+            );
+        }
     }
 }

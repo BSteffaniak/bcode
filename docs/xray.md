@@ -6,16 +6,20 @@ API, and keep observing across turns and idle periods. Stopping observation does
 not cancel session work. X-ray is neither canonical history nor a durable replay,
 repair, steering, cross-session aggregation, or web-inspector facility.
 
-**Implementation status:** the current checkout contains the engine, application
-admission, matching-client endpoint bootstrap, local HTTP/SSE transport, CLI,
-recording sink, native plugin bridge and eval consumer. Integration validation
-passed workspace checking, strict all-target Clippy, architecture boundaries,
-foundation and focused X-ray tests, and isolated offline engine/protocol/whole-app
-acceptance (8 engine and 10 server tests). A real fake-provider dynamic-library
-capture test and the offline prompt-cache eval regression suite also passed.
-These checks do not certify live-provider quality, complete provider coverage,
-workflow descendant capture, or whole-app eval X-ray evidence completeness.
-The coverage table below describes implemented source, not a tested release claim.
+**Implementation status:** this checkout contains live capture, typed reference export,
+independently negotiated native payload transfer, bounded CLI consumption/recovery,
+and explicitly authorized recursive workflow observation. This is not a release or
+complete-provider-quality claim. Current coordinator-reported validation includes
+isolated diagnostic tests for all five providers and the real fake-provider dylib
+Unicode/complete-byte hash regression passing. The identified offline whole-app
+suite passed all 20 cases, and its engine acceptance suite passed nine cases.
+Four workflow authorization-negative cases passed. Positive workflow evaluation
+remains blocked by intermittent genuine producer-lock contention: the latest
+attributed run lost one emit despite complete exported payloads and no opaque
+producer events. Completeness correctly remains false for that run. Bounded
+nonblocking ingest decoupled from observer-state locking requires further design
+and acceptance; passing individual runs do not establish reliable closure. Final
+coordinator acceptance remains pending; see [validation](#validation-requirements).
 
 See [protocol and browser example](xray-protocol.md),
 [frontend contracts](frontend-contracts.md),
@@ -88,21 +92,33 @@ The optional native diagnostic channel is version-negotiated on the plugin callb
 boundary, separate from ordinary service events. The host pins origin correlation
 before dispatch and replaces incoming plugin correlation. Older/unsupported
 negotiation disables diagnostics without requiring unrelated plugin functionality
-to fail. Native callbacks support bounded inline events; they do **not** support
-hub payload retention across the ABI. Larger native captures therefore report
-omission rather than exporting an invented storage reference.
+to fail. The optional payload extension negotiates independently of event callbacks:
+legacy event-only hosts still accept events but cannot acknowledge payload retention.
+Supported hosts assemble ordered bounded chunks, verify complete length/SHA-256 and
+return host-origin transient references. Transfers have per-lease/global quotas,
+expiry, idempotent abort and lease-release cleanup; retention rechecks deep scope.
+Unsupported, rejected or unavailable capture is explicit loss/omission, not empty
+success, invented references or permission to read private storage.
 
 The recording interface is a consumer-side sink, independent of daemon persistence;
 it can be replaced without changing producers or the public stream. Its current
 filesystem implementation is described in the [protocol](xray-protocol.md#recording-bundles).
-Synchronous file IO must stay on the consumer/blocking side, never instrumentation
-producer paths. Current CLI capture serializes consumption with sink IO and payload
-fetches; a slow disk/export can cause observation queue gaps, not execution waits.
+Synchronous file IO stays on the consumer/blocking side, never instrumentation
+producer paths. CLI SSE intake feeds a separate stdout/recording/payload consumer
+through a bounded queue: default 256 envelopes, configurable with
+`--consumer-queue-capacity` from 1 through 4096. Slow export cannot block execution;
+sustained consumer overflow interrupts capture and preserves incomplete evidence.
+
+`--reconnect transport` opts into bounded fresh admission after transport loss
+(automatic-bootstrap mode only). Each segment gets new readiness and an observation
+identity; recording preserves interrupted segments and explicit gaps. Retry count
+and delay are bounded options. This is gapful recovery, not replay, a durable resume
+cursor, or a guarantee that missing events/payloads can be recovered.
 
 ## Source coverage and unsupported scope
 
 This matrix describes contract boundaries rather than a second symbol inventory.
-All implemented rows remain unverified in this phase.
+Rows describe implemented contracts, not a claim that every path passed final acceptance.
 
 | Area | Implemented source behavior | Limits / unsupported claims |
 | --- | --- | --- |
@@ -111,13 +127,13 @@ All implemented rows remain unverified in this phase.
 | Session/runtime | Live projected session and provider lifecycle/output, submission and turn correlation | Not a lossless event-log/frontend reducer; deep text projections may be lossy |
 | Context/compaction | Final normalized assembly/content, selection/lineage and compaction observations; bounded inline/payload capture | Explicit exclusions include provider extensions and image source paths; not proof of raw provider delivery or quality |
 | Providers | Provider-owned request/body/stream projections in bundled OpenAI-compatible, Bedrock, JEV, auth-broker and fake integrations; normalized runtime lifecycle/usage | Provider-specific limits/redaction apply; no headers/auth/config export, byte-exact HTTP transcript or complete adapter parity claim |
-| Native plugins | Negotiated, bounded diagnostic callback channel with host-owned origin and retained callback leases | No large-payload retention across ABI; old/unsupported plugins have no diagnostic coverage |
+| Native plugins | Independently negotiated event/payload extensions, host-origin chunk retention, typed references and retained callback leases | Old event-only hosts cannot retain payloads; quota, contention, expiry and unsupported negotiation remain explicit loss |
 | Tools/interactions | Dispatch, authorization/exchange waits, outcomes, cancellation and unfinished boundary observations | Cancellation request does not prove rollback or absence of effects; content remains explicitly deep |
-| Workflows | Run/activation/attempt, writer waits, dispatch, receipt publication, settlement/retirement observations with origin scope | Parent observation does not automatically observe independent child sessions; no whole-tree coverage claim |
+| Workflows | Run/activation/attempt observations plus bounded recursive execution watches and pre-dispatch child readiness under exact trusted grants | Parent attachment alone does not authorize descendants; root, recursive and deep scope require explicit expiring authorization; no whole-tree completeness claim |
 | Payloads | Observation-owned bounded references, authorized ranged export, consumer full-length/digest verification | Eviction/unavailable bytes remain missing; no private storage path fallback; export promptly before retention ends |
 | Recording | Replaceable sink; JSONL + payload bundle; private files, integrity coordinates, atomic lifecycle manifest | Unix only; no database sink, automatic repair/resume or offline reader in this implementation |
-| Eval | Readiness before submission, capture around task/workflow consumption, bundle and separate evidence receipt | Task score/exit outcome is independent; workflow child capture explicitly incomplete; external executable/environment selection cannot silently use consumer defaults |
-| Validation | Behavioral tests and an offline end-to-end harness authored | None executed in this phase; source presence is not test evidence |
+| Eval | Readiness before submission, segmented task/workflow capture and separate evidence receipts | Task outcome is independent; recursive coverage and payload completeness fail closed on missing, opaque or interrupted evidence; final positive acceptance pending |
+| Validation | Isolated provider/native regressions passed; partial whole-app and workflow authorization evidence reported above | Required checks and final rebuilt-artifact acceptance are not interchangeable; no release certification |
 
 ## Eval use
 
@@ -132,16 +148,20 @@ Each captured execution session gets an `xray` bundle and an
 `xray-evidence.json` receipt under its eval output directory. Receipts distinguish
 readiness, delivery, payload retention, continuity and aggregate evidence status
 from the ordinary task outcome. An attach/export/flush failure must not become a
-passing evidence result, nor overwrite the task's score/exit status. Workflow-child
-coverage is a separate explicit incomplete field; observing run boundaries in the
-parent is not observing every child model request.
+passing evidence result, nor overwrite the task's score/exit status. Root session,
+recursive descendant and deep capture are distinct authorization scopes. The bundled
+workflow plugin accepts versioned `execution_observation_policy` grants only from
+trusted configuration, matching actor, exact root run, namespace, state location,
+recursive/deep flags and operation. Grants expire and are rechecked at dispatch;
+missing, malformed, expired or mismatched grants deny capture. Diagnostic approval
+is not permission to execute work. Bounded watch pages and exact child readiness
+support recursive observation without treating a parent attachment as tree access.
 
-An offline `--xray-deep` cache eval exercised real attachment and recording across
-an isolated daemon restart. Its task passed, while the evidence receipt correctly
-reported `daemon_restart_gap`, incomplete continuity, and incomplete aggregate
-evidence. Native captures larger than the callback budget were explicitly omitted
-because payload retention across the native ABI is not implemented. This run
-therefore validates degraded-evidence reporting, not complete eval capture.
+An earlier offline cache eval reported `daemon_restart_gap` while its task passed;
+that is degraded-evidence reporting, not successful complete capture. Native payload
+retention is now implemented, but a previous omission or opaque event is not repaired
+retroactively. The current positive workflow completeness run remains unsuccessful
+pending final rebuilt-artifact validation.
 
 Workflow evals can select another executable and environment. Without an explicitly
 supplied subject endpoint, the implementation guards against bootstrapping a
@@ -149,20 +169,35 @@ mismatched consumer binary/environment. An explicit endpoint remains the caller'
 responsibility to bind to the intended subject; bearer access is not proof of model
 selection, exact provider delivery, task success or whole-run coverage.
 
+## Validation requirements
+
+Required validation is not a list of completed checks. For a final source revision,
+run workspace check, strict all-target Clippy, architecture validation and relevant
+engine, client/controller, CLI, provider, native-bridge, server and eval tests under
+[AGENTS.md](../AGENTS.md). Rebuild the fake-provider dylib and matching host artifacts;
+run the ignored native regression with an explicit absolute
+`BCODE_XRAY_TEST_PROVIDER_LIBRARY` and record artifact hashes. Run the offline
+`scripts/check-xray-e2e.sh` with deliberately selected matching executable/test/library
+artifacts, plus the workflow eval positive-completeness and authorization-negative
+fixtures. The runner alone does not execute every native/unit regression. Changes
+to host cache planning or eval cache paths also require
+`scripts/check-prompt-cache-eval.sh`. Retain failures and distinguish source, artifact
+identity, command success, task outcome and evidence completeness. No live-provider
+quality or complete coverage follows from offline fake-provider success.
+
 ## Known integration/security limits
 
 * Browser access requires a host-provisioned exact Origin grant. Automatic bootstrap
   uses an empty Origin allowlist; there is no documented runtime setting to change it.
 * Finalization certifies an engine delivery cutoff, not transport delivery, disk flush,
   provider cleanup, canonical settlement or task success. Close all consumer layers.
-* Native bridge contention/negotiation failures can disable or drop diagnostic
-  callbacks before engine sequence allocation; engine gap counters alone cannot
-  certify complete plugin coverage. That loss needs bridge-owned accounting before
-  an absence-of-loss claim can cover native diagnostics.
-* Client reference discovery recursively recognizes reference-shaped event JSON.
-  Ordinary nested tool/provider/user data with `payload_id` or `sha256` plus
-  `byte_len` can collide with this heuristic and fail export. A typed/discriminated
-  reference location is needed; this cannot safely be fixed by trusting private paths.
+* Native bridge failures report bounded explicit loss, including failures before
+  engine sequence allocation. Conservative loss counters are not unique-callback
+  inventories, and absence of engine sequence gaps cannot certify plugin coverage.
+* Capture declarations identify reference locations explicitly. Empty declarations
+  mean inline/control data with no references; missing declarations remain legacy
+  opaque data and cannot establish payload completeness. Arbitrary nested objects
+  are not scanned or trusted merely because they look like references.
 * Payload export and disk writes consume observer time. Fetch references while the
   observation retains them; final HTTP retention is bounded and not a later export API.
 * Bundle digests are corruption coordinates, not signatures. No offline reader is

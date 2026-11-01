@@ -8,6 +8,13 @@
 
 use serde::{Deserialize, Serialize};
 
+mod capture;
+pub mod execution_watch;
+
+pub use capture::{
+    XRAY_CAPTURE_SCHEMA_VERSION, XrayCaptureAttachment, XrayCaptureAttachments, XrayCaptureError,
+};
+
 /// Independently evolving observation and payload-access protocol version.
 pub const XRAY_SCHEMA_VERSION: u16 = 1;
 
@@ -45,6 +52,32 @@ pub struct XrayEvent {
     pub data: serde_json::Value,
     /// Restricts delivery to observations explicitly authorized for deep capture.
     pub sensitive: bool,
+    /// Explicit independently versioned capture locations. Absent legacy metadata
+    /// leaves all data opaque; consumers must never guess references from JSON shape.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub capture: Option<XrayCaptureAttachments>,
+}
+
+impl XrayEvent {
+    /// Constructs an event with opaque data and no declared payload references.
+    /// Producers retaining payloads must explicitly populate `capture`.
+    #[must_use]
+    pub fn new(
+        domain: impl Into<String>,
+        name: impl Into<String>,
+        correlation: XrayCorrelation,
+        data: serde_json::Value,
+        sensitive: bool,
+    ) -> Self {
+        Self {
+            domain: domain.into(),
+            name: name.into(),
+            correlation,
+            data,
+            sensitive,
+            capture: None,
+        }
+    }
 }
 
 /// Ordered delivery within one observation. Sequence numbers start at one (`xray.ready`).
@@ -150,6 +183,7 @@ pub struct XrayFinalization {
 ///
 /// Content is unredacted diagnostic data; a digest does not imply secret safety.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct XrayPayloadRef {
     /// Payload-access protocol version.
     pub schema_version: u16,
@@ -228,6 +262,7 @@ mod tests {
                 name: "future-event".into(),
                 correlation: XrayCorrelation::default(),
                 sensitive: false,
+                capture: None,
                 data: serde_json::json!({"future": [1, 2]}),
             },
         };

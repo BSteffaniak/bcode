@@ -1871,7 +1871,9 @@ pub async fn append_context_compaction_trace(
             CompactionTraceKind::Started => "compaction_started",
             CompactionTraceKind::Finished => "compaction_finished",
         };
-        context.emit(
+        // This exact producer-owned scalar projection contains no payload references.
+        // Provider-derived reason/message remain excluded from X-ray data.
+        context.emit_with_capture(
             "context",
             event_name,
             serde_json::json!({
@@ -1879,6 +1881,7 @@ pub async fn append_context_compaction_trace(
                 "compacted": compacted,
             }),
             false,
+            Some(bcode_xray_models::XrayCaptureAttachments::new(Vec::new())),
         );
         // reason/message can contain provider text. Do not put them in scalar diagnostics.
     }
@@ -1902,6 +1905,69 @@ pub async fn append_context_compaction_trace(
         },
     )
     .await;
+}
+
+#[cfg(test)]
+#[tokio::test]
+async fn compaction_trace_declares_only_its_scalar_projection() {
+    let sessions = bcode_session::SessionManager::default();
+    let session = sessions
+        .create_session(None, std::env::temp_dir())
+        .await
+        .expect("session");
+    let state = crate::tests::test_server_state(sessions);
+    let mut observation = state
+        .xray
+        .observe(bcode_xray_models::XrayObserveRequest {
+            schema_version: 1,
+            session_id: session.id.to_string(),
+            deep_capture: false,
+        })
+        .expect("observe");
+    let _ready = observation.recv().await.expect("ready");
+    let context = state.xray.context(bcode_xray_models::XrayCorrelation {
+        session_id: session.id.to_string(),
+        ..bcode_xray_models::XrayCorrelation::default()
+    });
+    for (kind, name) in [
+        (CompactionTraceKind::Diagnostic, "compaction_diagnostic"),
+        (CompactionTraceKind::Skipped, "compaction_skipped"),
+        (CompactionTraceKind::Started, "compaction_started"),
+        (CompactionTraceKind::Finished, "compaction_finished"),
+    ] {
+        context
+            .scope(append_context_compaction_trace(
+                &state,
+                session.id,
+                kind,
+                "private-provider-reason",
+                123,
+                true,
+                Some("private-provider-message".into()),
+            ))
+            .await;
+        let event = observation.recv().await.expect("compaction event").event;
+        assert_eq!(event.domain, "context");
+        assert_eq!(event.name, name);
+        assert_eq!(
+            event.data,
+            serde_json::json!({
+                "projected_context_chars":123, "compacted":true,
+            })
+        );
+        assert!(!event.sensitive);
+        assert_eq!(
+            event.capture,
+            Some(bcode_xray_models::XrayCaptureAttachments::new(Vec::new()))
+        );
+        assert!(
+            event
+                .payload_references()
+                .expect("valid no-ref declaration")
+                .is_empty()
+        );
+    }
+    drop(state);
 }
 
 pub async fn validate_summary_publication(

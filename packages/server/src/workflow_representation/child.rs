@@ -133,6 +133,35 @@ pub async fn dispatch(
     ))
 }
 
+/// Read verified root and direct parent for diagnostic scope admission only.
+/// The canonical root permits arbitrary recursive depth without a full ancestor replay.
+pub(super) async fn diagnostic_parent_context(
+    state: &ServerState,
+    run_id: &str,
+    authority: &bcode_workflow_store::WorkflowExecutionAuthority,
+) -> Result<(String, Option<String>), ServerError> {
+    let retained = retained_store(state).await?;
+    if !recovery::is_represented(state, run_id).await? {
+        retained
+            .verify_execution_authority(run_id, authority)
+            .map_err(|_| unavailable())?;
+        return Ok(retained.parent_run_link(run_id)?.map_or_else(
+            || (run_id.to_owned(), None),
+            |link| (link.root_run_id, Some(link.parent_run_id)),
+        ));
+    }
+    let db = open(retained.path(), false)?;
+    let context = super::backpressure::retry(|| {
+        representation::hierarchy::parent_context(&db, authority, run_id)
+    })
+    .await
+    .map_err(|_| unavailable())?;
+    Ok((
+        context.root_run_id,
+        context.parent_link.map(|link| link.parent_run_id),
+    ))
+}
+
 /// Read the canonical parent only; discovery grants no execution authority.
 pub async fn parent_run(state: &ServerState, run_id: &str) -> Result<Option<String>, ServerError> {
     let retained = retained_store(state).await?;
