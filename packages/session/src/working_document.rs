@@ -1,8 +1,11 @@
 //! Mutable working notes, separate from finalized artifact compression and event authority.
+use bcode_confined_fs::{Creation, Dir, OpenOptions};
 use bcode_session_models::{
     MAX_WORKING_DOCUMENT_BYTES, SessionWorkingDocument, SessionWorkingDocumentRequest,
 };
-use std::{io, path::Path};
+use std::ffi::OsStr;
+use std::io::{self, Read as _};
+use std::path::Path;
 
 /// Prepare or read one bounded working document under the owning session root.
 /// Caller must hold session ownership and authorize explicit creation before calling.
@@ -36,122 +39,80 @@ pub fn access(
         .join(request.session_id.to_string())
         .join("working-documents")
         .join(&request.scope_id);
-    #[cfg(unix)]
-    {
-        use crate::artifact_storage::confined;
-        use std::{ffi::CString, fs::File, io::Read as _, os::fd::AsRawFd as _};
-        let root = root.canonicalize()?;
-        let mut parent = File::open(&root)?;
-        for component in relative.components() {
-            let name =
-                CString::new(component.as_os_str().as_encoded_bytes()).map_err(|_| invalid())?;
-            if request.initial_text.is_some() {
-                // SAFETY: parent is a live directory descriptor and name is NUL terminated.
-                let result = unsafe { libc::mkdirat(parent.as_raw_fd(), name.as_ptr(), 0o700) };
-                if result != 0 && io::Error::last_os_error().kind() != io::ErrorKind::AlreadyExists
-                {
-                    return Err(io::Error::last_os_error());
-                }
-            }
-            match confined::open_child(&parent, &name, true) {
-                Ok(next) => parent = next,
-                Err(error)
-                    if error.kind() == io::ErrorKind::NotFound
-                        && request.initial_text.is_none() =>
-                {
-                    return Ok(None);
-                }
+    let root = root.canonicalize()?;
+    let mut parent = Dir::open_following_links(&root)?;
+    for component in relative.components() {
+        let name = component.as_os_str();
+        if request.initial_text.is_some() {
+            match parent.create_dir(name) {
+                Ok(()) => {}
+                Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {}
                 Err(error) => return Err(error),
             }
         }
-        if let Some(text) = &request.initial_text {
-            publish_initial(&parent, text)?;
-        }
-        let file = match confined::open_child(&parent, c"progress.md", false) {
-            Ok(file) => file,
+        match parent.open_dir(name) {
+            Ok(next) => parent = next,
             Err(error)
                 if error.kind() == io::ErrorKind::NotFound && request.initial_text.is_none() =>
             {
                 return Ok(None);
             }
             Err(error) => return Err(error),
-        };
-        if !file.metadata()?.is_file() {
-            return Err(invalid());
         }
-        let mut bytes = Vec::new();
-        file.take((MAX_WORKING_DOCUMENT_BYTES + 1) as u64)
-            .read_to_end(&mut bytes)?;
-        if bytes.len() > MAX_WORKING_DOCUMENT_BYTES {
-            return Err(invalid());
+    }
+    if let Some(text) = &request.initial_text {
+        publish_initial(&parent, text)?;
+    }
+    let file = match parent.open_file(OsStr::new(DOCUMENT), OpenOptions::new().read(true)) {
+        Ok(file) => file,
+        Err(error) if error.kind() == io::ErrorKind::NotFound && request.initial_text.is_none() => {
+            return Ok(None);
         }
-        let text = String::from_utf8(bytes).map_err(|_| invalid())?;
-        Ok(Some(SessionWorkingDocument {
-            session_id: request.session_id,
-            scope_id: request.scope_id.clone(),
-            path: root
-                .join(relative)
-                .join("progress.md")
-                .to_string_lossy()
-                .into_owned(),
-            text,
-        }))
+        Err(error) => return Err(error),
+    };
+    let mut bytes = Vec::new();
+    file.take((MAX_WORKING_DOCUMENT_BYTES + 1) as u64)
+        .read_to_end(&mut bytes)?;
+    if bytes.len() > MAX_WORKING_DOCUMENT_BYTES {
+        return Err(invalid());
     }
-    #[cfg(not(unix))]
-    {
-        let _ = (root, relative);
-        Err(io::Error::new(
-            io::ErrorKind::Unsupported,
-            "confined working documents unavailable on this platform",
-        ))
-    }
+    let text = String::from_utf8(bytes).map_err(|_| invalid())?;
+    Ok(Some(SessionWorkingDocument {
+        session_id: request.session_id,
+        scope_id: request.scope_id.clone(),
+        path: root
+            .join(relative)
+            .join(DOCUMENT)
+            .to_string_lossy()
+            .into_owned(),
+        text,
+    }))
 }
 
-#[cfg(unix)]
-fn publish_initial(parent: &std::fs::File, text: &str) -> io::Result<()> {
-    use std::{
-        ffi::CString,
-        fs::File,
-        io::Write as _,
-        os::fd::{AsRawFd as _, FromRawFd as _},
-    };
-    let temporary =
-        CString::new(format!(".prepare-{}", uuid::Uuid::new_v4())).expect("UUID contains no NUL");
-    // SAFETY: parent and NUL-terminated name remain live throughout the syscall.
-    let fd = unsafe {
-        libc::openat(
-            parent.as_raw_fd(),
-            temporary.as_ptr(),
-            libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL | libc::O_NOFOLLOW | libc::O_CLOEXEC,
-            0o600,
-        )
-    };
-    if fd < 0 {
-        return Err(io::Error::last_os_error());
-    }
-    // SAFETY: transfer freshly created descriptor exactly once.
-    let mut file = unsafe { File::from_raw_fd(fd) };
+const DOCUMENT: &str = "progress.md";
+
+fn publish_initial(parent: &Dir, text: &str) -> io::Result<()> {
+    use std::io::Write as _;
+    let temporary = format!(".prepare-{}", uuid::Uuid::new_v4());
+    let temporary = OsStr::new(&temporary);
+    let mut file = parent.open_file(
+        temporary,
+        OpenOptions::new().write(true).creation(Creation::New),
+    )?;
     let result = (|| {
         file.write_all(text.as_bytes())?;
         file.sync_all()?;
-        // SAFETY: both names and the parent descriptor are live. linkat never replaces a destination.
-        if unsafe {
-            libc::linkat(
-                parent.as_raw_fd(),
-                temporary.as_ptr(),
-                parent.as_raw_fd(),
-                c"progress.md".as_ptr(),
-                0,
-            )
-        } != 0
-            && io::Error::last_os_error().kind() != io::ErrorKind::AlreadyExists
-        {
-            return Err(io::Error::last_os_error());
+        // A hard link never replaces an existing document.
+        match parent.hard_link(temporary, parent, OsStr::new(DOCUMENT)) {
+            Ok(()) => {}
+            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {}
+            Err(error) => return Err(error),
         }
-        parent.sync_all()
+        parent.sync()
     })();
-    // SAFETY: remove only the uniquely created staging name, never the document.
-    unsafe { libc::unlinkat(parent.as_raw_fd(), temporary.as_ptr(), 0) };
+    drop(file);
+    // Remove only the uniquely created staging name, never the document.
+    let _ = parent.remove_file(temporary);
     result
 }
 

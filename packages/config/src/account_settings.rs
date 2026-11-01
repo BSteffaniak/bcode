@@ -151,11 +151,8 @@ pub fn update<T>(
     let mut temporary = tempfile::NamedTempFile::new_in(parent).map_err(|_| invalid())?;
     temporary.write_all(&bytes).map_err(|_| invalid())?;
     temporary.as_file().sync_all().map_err(|_| invalid())?;
-    temporary.persist(&path).map_err(|_| invalid())?;
-    #[cfg(unix)]
-    std::fs::File::open(parent)
-        .and_then(|file| file.sync_all())
-        .map_err(|_| invalid())?;
+    bcode_confined_fs::persist(temporary, &path).map_err(|_| invalid())?;
+    bcode_confined_fs::sync_directory_path(parent).map_err(|_| invalid())?;
     Ok(result)
 }
 

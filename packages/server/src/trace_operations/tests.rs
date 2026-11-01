@@ -1,9 +1,9 @@
 //! Behavioral coverage for confined retained trace reads.
 
 use super::*;
-use bcode_session_models::{
-    SessionId, SessionTraceEvent, SessionTracePhase, TraceBlobCompleteness, TraceRedaction,
-};
+use bcode_session_models::{SessionId, SessionTraceEvent, SessionTracePhase};
+#[cfg(unix)]
+use bcode_session_models::{TraceBlobCompleteness, TraceRedaction};
 
 fn request(session_id: SessionId) -> ReadSessionTraceBlobRequest {
     ReadSessionTraceBlobRequest {

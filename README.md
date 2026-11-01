@@ -97,6 +97,7 @@ Start with the [plugin guide](docs/plugins.md) and the [dynamic plugin example](
 * [Skills](docs/skills.md)
 * [Session imports](docs/session-import-plugins.md)
 * [Reasoning presentation](docs/reasoning-presentation.md)
+* [Windows support](docs/windows-support.md)
 
 ### Build on Bcode
 

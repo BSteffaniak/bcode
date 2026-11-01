@@ -62,8 +62,8 @@ pub(crate) fn atomic_replace(path: &Path, contents: &[u8]) -> std::io::Result<()
     let mut temporary = tempfile::NamedTempFile::new_in(parent)?;
     temporary.write_all(contents)?;
     temporary.as_file().sync_all()?;
-    temporary.persist(path).map_err(|error| error.error)?;
-    std::fs::File::open(parent)?.sync_all()?;
+    bcode_confined_fs::persist(temporary, path)?;
+    bcode_confined_fs::sync_directory_path(parent)?;
     Ok(())
 }
 

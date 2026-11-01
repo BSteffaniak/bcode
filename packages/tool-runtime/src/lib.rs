@@ -514,7 +514,8 @@ fn process_command(request: &ProcessExecutionRequest) -> Command {
         command.env_remove(name);
     }
     if let Some(cwd) = &request.cwd {
-        command.current_dir(cwd);
+        // cmd.exe rejects verbatim (`\\?\`) current directories produced by canonicalization.
+        command.current_dir(dunce::simplified(cwd));
     }
     configure_command_for_timeout(&mut command);
     command

@@ -12,9 +12,9 @@ mod filesystem_tui;
 pub use filesystem_portable::portable_visual_registrations;
 #[cfg(feature = "native")]
 mod batch_request;
-#[cfg(all(feature = "native", unix))]
+#[cfg(feature = "native")]
 mod confined;
-#[cfg(all(feature = "native", unix))]
+#[cfg(feature = "native")]
 mod coordination;
 #[cfg(feature = "native")]
 pub mod path_search;

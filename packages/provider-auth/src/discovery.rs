@@ -5,9 +5,7 @@
 
 use bcode_provider_auth_models::{AuthCredentialSource, AuthSecretField};
 use std::io::Read as _;
-#[cfg(unix)]
-use std::path::Component;
-use std::path::Path;
+use std::path::{Component, Path};
 use zeroize::Zeroizing;
 
 const MAX_SOURCE_BYTES: u64 = 1024 * 1024;
@@ -132,55 +130,44 @@ fn read_json_source(
     Ok(value)
 }
 
-#[cfg(unix)]
 fn open_confined(
     home: &Path,
     relative: &str,
 ) -> Result<Option<std::fs::File>, CredentialSourceStatus> {
-    use std::os::fd::{AsRawFd as _, FromRawFd as _};
-    use std::os::unix::ffi::OsStrExt as _;
     let parts = Path::new(relative).components().collect::<Vec<_>>();
-    if parts.is_empty()
-        || parts
-            .iter()
-            .any(|part| !matches!(part, Component::Normal(_)))
+    let Some((last, ancestors)) = parts.split_last() else {
+        return Err(CredentialSourceStatus::Unavailable);
+    };
+    if parts
+        .iter()
+        .any(|part| !matches!(part, Component::Normal(_)))
     {
         return Err(CredentialSourceStatus::Unavailable);
     }
-    let mut directory =
-        std::fs::File::open(home).map_err(|_| CredentialSourceStatus::Unavailable)?;
-    for (index, part) in parts.iter().enumerate() {
-        let name = std::ffi::CString::new(part.as_os_str().as_bytes())
-            .map_err(|_| CredentialSourceStatus::Unavailable)?;
-        let mut flags = libc::O_RDONLY | libc::O_CLOEXEC | libc::O_NOFOLLOW | libc::O_NONBLOCK;
-        if index + 1 < parts.len() {
-            flags |= libc::O_DIRECTORY;
+    let missing_or_unavailable = |error: std::io::Error| {
+        if error.kind() == std::io::ErrorKind::NotFound {
+            Ok(None)
+        } else {
+            Err(CredentialSourceStatus::Unavailable)
         }
-        // SAFETY: the directory descriptor and NUL-terminated name live for the
-        // call. Each component is opened relative to the held directory, never
-        // following symlinks, so path replacement cannot escape the root.
-        let fd = unsafe { libc::openat(directory.as_raw_fd(), name.as_ptr(), flags) };
-        if fd < 0 {
-            return if std::io::Error::last_os_error().kind() == std::io::ErrorKind::NotFound {
-                Ok(None)
-            } else {
-                Err(CredentialSourceStatus::Unavailable)
-            };
-        }
-        // SAFETY: openat returned a new owned descriptor, transferred exactly once.
-        directory = unsafe { std::fs::File::from_raw_fd(fd) };
+    };
+    // Each component is opened relative to the held directory without following links,
+    // so path replacement cannot escape the root.
+    let mut directory = bcode_confined_fs::Dir::open_following_links(home)
+        .map_err(|_| CredentialSourceStatus::Unavailable)?;
+    for part in ancestors {
+        directory = match directory.open_dir(part.as_os_str()) {
+            Ok(directory) => directory,
+            Err(error) => return missing_or_unavailable(error),
+        };
     }
-    Ok(Some(directory))
-}
-
-#[cfg(not(unix))]
-const fn open_confined(
-    _home: &Path,
-    _relative: &str,
-) -> Result<Option<std::fs::File>, CredentialSourceStatus> {
-    // Until handle-relative confinement is available on this platform, preserve
-    // credentials and offer manual enrollment instead of a racy path fallback.
-    Err(CredentialSourceStatus::Unavailable)
+    match directory.open_file(
+        last.as_os_str(),
+        bcode_confined_fs::OpenOptions::new().read(true),
+    ) {
+        Ok(file) => Ok(Some(file)),
+        Err(error) => missing_or_unavailable(error),
+    }
 }
 
 fn clear_json_strings(value: &mut serde_json::Value) {
@@ -220,22 +207,6 @@ mod tests {
     }
 
     #[test]
-    #[cfg(not(unix))]
-    fn unsupported_confinement_preserves_source_and_refuses_discovery() {
-        let home = tempfile::tempdir().unwrap();
-        let path = home.path().join("auth.json");
-        let contents = r#"{"provider":{"type":"api","key":"test-value"}}"#;
-        std::fs::write(&path, contents).unwrap();
-        assert_eq!(
-            discover(true, home.path(), &field()),
-            vec![(0, CredentialSourceStatus::Unavailable)]
-        );
-        assert!(read_selected(home.path(), &field(), 0).is_err());
-        assert_eq!(std::fs::read_to_string(path).unwrap(), contents);
-    }
-
-    #[test]
-    #[cfg(unix)]
     fn reads_only_compatible_static_keys_and_preserves_source() {
         let home = tempfile::tempdir().unwrap();
         let path = home.path().join("auth.json");

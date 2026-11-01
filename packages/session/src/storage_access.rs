@@ -76,7 +76,7 @@ pub fn record_session_access(
     let root = root.canonicalize()?;
     let (mut file, directory_handle) = open_session_access_file(&root, session_id, true)?;
     let result = record_access(&mut file, kind, conservative_access_time(now_ms))?;
-    directory_handle.sync_all()?;
+    directory_handle.sync()?;
     Ok(result)
 }
 
@@ -121,83 +121,50 @@ pub(crate) fn initialize_session_access(
     };
     file.unlock()?;
     result?;
-    directory.sync_all()
+    directory.sync()
 }
 
-#[cfg(unix)]
 fn open_session_access_file(
     root: &Path,
     session_id: SessionId,
     create: bool,
-) -> io::Result<(File, File)> {
-    use std::ffi::CString;
-    use std::os::fd::{AsRawFd as _, FromRawFd as _};
-    use std::os::unix::fs::MetadataExt as _;
-    fn child(parent: &File, name: &std::ffi::CStr, flags: i32) -> io::Result<File> {
-        // SAFETY: parent is an owned valid descriptor, name is NUL-terminated, and the returned
-        // descriptor is transferred exactly once into File. All traversal is relative to handles.
-        let fd = unsafe {
-            libc::openat(
-                parent.as_raw_fd(),
-                name.as_ptr(),
-                flags | libc::O_CLOEXEC | libc::O_NOFOLLOW | libc::O_NONBLOCK,
-                0o600,
-            )
-        };
-        if fd < 0 {
-            return Err(io::Error::last_os_error());
+) -> io::Result<(File, bcode_confined_fs::Dir)> {
+    use bcode_confined_fs::{Creation, Dir, EntryKind, OpenOptions};
+    use std::ffi::OsStr;
+    // All traversal below the trusted root is relative to retained handles and never
+    // follows links.
+    let root = Dir::open_following_links(root)?;
+    let directory = root.open_dir(OsStr::new(&session_id.to_string()))?;
+    match directory.metadata_at(OsStr::new("session.db"))?.kind() {
+        EntryKind::Directory => {
+            let canonical = directory.open_dir(OsStr::new("session.db"))?;
+            let marker =
+                canonical.open_file(OsStr::new("format"), OpenOptions::new().read(true))?;
+            let mut bytes = Vec::new();
+            std::io::Read::take(marker, 20).read_to_end(&mut bytes)?;
+            if bytes != b"BCODE_SESSION_DB 1\n" {
+                return Err(invalid());
+            }
+            if canonical.metadata_at(OsStr::new("data.db"))?.kind() != EntryKind::File {
+                return Err(invalid());
+            }
         }
-        // SAFETY: openat returned a fresh descriptor owned by this function.
-        Ok(unsafe { File::from_raw_fd(fd) })
+        EntryKind::File => {}
+        EntryKind::Symlink | EntryKind::Other => return Err(invalid()),
     }
-    let root = File::open(root)?;
-    let name = CString::new(session_id.to_string()).map_err(|_| invalid())?;
-    let directory = child(&root, &name, libc::O_RDONLY | libc::O_DIRECTORY)?;
-    let canonical = child(&directory, c"session.db", libc::O_RDONLY)?;
-    if canonical.metadata()?.is_dir() {
-        let marker = child(&canonical, c"format", libc::O_RDONLY)?;
-        if !marker.metadata()?.is_file() {
-            return Err(invalid());
-        }
-        let mut bytes = Vec::new();
-        std::io::Read::take(marker, 20).read_to_end(&mut bytes)?;
-        if bytes != b"BCODE_SESSION_DB 1\n" {
-            return Err(invalid());
-        }
-        if !child(&canonical, c"data.db", libc::O_RDONLY)?
-            .metadata()?
-            .is_file()
-        {
-            return Err(invalid());
-        }
-    } else if !canonical.metadata()?.is_file() {
-        return Err(invalid());
-    }
-    let file = child(
-        &directory,
-        c"storage-access.bin",
-        if create {
-            libc::O_RDWR | libc::O_CREAT
-        } else {
-            libc::O_RDONLY
-        },
-    )?;
-    if !file.metadata()?.is_file() || file.metadata()?.nlink() != 1 {
+    let options = if create {
+        OpenOptions::new()
+            .read(true)
+            .write(true)
+            .creation(Creation::IfMissing)
+    } else {
+        OpenOptions::new().read(true)
+    };
+    let file = directory.open_file(OsStr::new("storage-access.bin"), options)?;
+    if bcode_confined_fs::file_metadata(&file)?.link_count() != 1 {
         return Err(invalid());
     }
     Ok((file, directory))
-}
-
-#[cfg(not(unix))]
-fn open_session_access_file(
-    _root: &Path,
-    _session_id: SessionId,
-    _create: bool,
-) -> io::Result<(File, File)> {
-    Err(io::Error::new(
-        io::ErrorKind::Unsupported,
-        "confined storage access tracking is unavailable on this platform",
-    ))
 }
 
 fn invalid() -> io::Error {

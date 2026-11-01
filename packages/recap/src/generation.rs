@@ -158,8 +158,8 @@ fn atomic(root: &Path, name: &str, value: &impl Serialize) -> Result<()> {
     let mut file = tempfile::NamedTempFile::new_in(root)?;
     file.write_all(&bytes)?;
     file.as_file().sync_all()?;
-    file.persist(root.join(name)).map_err(|error| error.error)?;
-    File::open(root)?.sync_all()?;
+    bcode_confined_fs::persist(file, &root.join(name))?;
+    bcode_confined_fs::sync_directory_path(root)?;
     Ok(())
 }
 impl Journal {

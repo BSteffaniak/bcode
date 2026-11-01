@@ -299,7 +299,6 @@ struct StatResponse {
 
 fn invoke_filesystem_service(context: &NativeServiceContext) -> ServiceResponse {
     let request = &context.request;
-    #[cfg(unix)]
     let _mutation_guard = if matches!(request.operation.as_str(), "write" | "edit") {
         match coordination::acquire(&|| context.cancellation.is_cancelled()) {
             Ok(guard) => Some(guard),
@@ -844,7 +843,6 @@ fn invoke_tool(context: &NativeServiceContext) -> ServiceResponse {
             result: None,
         });
     }
-    #[cfg(unix)]
     let _mutation_guard = if matches!(
         request.name.as_str(),
         "filesystem.write" | "filesystem.edit" | "filesystem.multi_edit"

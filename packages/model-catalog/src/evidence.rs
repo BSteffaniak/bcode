@@ -157,7 +157,7 @@ impl EvidenceStore {
             file.write_all(&bytes)?;
             file.sync_all()?;
             fs::rename(&temporary, self.directory.join("evidence-v1.json"))?;
-            fs::File::open(&self.directory)?.sync_all()
+            bcode_confined_fs::sync_directory_path(&self.directory)
         })();
         if result.is_err() {
             let _ = fs::remove_file(&temporary);

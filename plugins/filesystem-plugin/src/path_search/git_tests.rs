@@ -105,6 +105,7 @@ fn nonrepo_requires_workspace_and_worktree_gitfile_fails_explicitly() {
     );
 }
 
+#[cfg(unix)]
 #[test]
 fn workspace_explicit_refresh_and_symlink_cache_validation() {
     let root = Fixture::new();

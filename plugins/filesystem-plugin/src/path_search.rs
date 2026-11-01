@@ -9,23 +9,16 @@
 //! Only separately authorized, bounded ignore/Git metadata reads are performed.
 //! No content is returned or attached. Unsupported ignore syntax fails closed.
 
-#[cfg(any(target_os = "macos", target_os = "linux", target_os = "android"))]
 mod git_config;
-#[cfg(any(target_os = "macos", target_os = "linux", target_os = "android"))]
 mod git_policy;
 mod ignore_policy;
-#[cfg(any(target_os = "macos", target_os = "linux", target_os = "android"))]
 mod inventory;
 mod matcher;
-#[cfg(any(target_os = "macos", target_os = "linux", target_os = "android"))]
 mod prepared;
-#[cfg(any(target_os = "macos", target_os = "linux", target_os = "android"))]
 mod workspace_inventory;
 
-#[cfg(any(target_os = "macos", target_os = "linux", target_os = "android"))]
 use std::path::PathBuf;
 use std::path::{Component, Path};
-#[cfg(any(target_os = "macos", target_os = "linux", target_os = "android"))]
 use std::time::{Duration, Instant};
 
 use bcode_plugin_sdk::prelude::*;
@@ -300,6 +293,29 @@ fn valid_request(request: &SearchPathsRequest) -> bool {
         && Path::new(&request.directory).components().count() <= 64
 }
 
+/// Join a `/`-separated workspace-relative path onto an absolute root, one component at a
+/// time. Windows verbatim (`\\?\`) roots do not treat `/` as a separator, so a plain
+/// `join` would form a single invalid component.
+fn under(root: &Path, relative: impl AsRef<Path>) -> std::path::PathBuf {
+    let mut path = root.to_path_buf();
+    for part in relative.as_ref().components() {
+        path.push(part);
+    }
+    path
+}
+
+/// Extend a workspace-relative path with one name using `/`, the wire separator on every
+/// platform, so results match Git-index paths and host resource grants.
+fn child(relative: &Path, name: impl AsRef<std::ffi::OsStr>) -> std::path::PathBuf {
+    if relative.as_os_str().is_empty() {
+        return name.as_ref().into();
+    }
+    let mut path = relative.as_os_str().to_owned();
+    path.push("/");
+    path.push(name);
+    path.into()
+}
+
 fn excluded(path: &Path, grant: &SearchPathsGrant, hidden: bool) -> bool {
     path.components().any(|part| {
         let Component::Normal(name) = part else {
@@ -312,18 +328,6 @@ fn excluded(path: &Path, grant: &SearchPathsGrant, hidden: bool) -> bool {
         .any(|prefix| path.starts_with(prefix))
 }
 
-#[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "android")))]
-fn search_with_metadata(
-    _: &SearchPathsRequest,
-    _: &SearchPathsGrant,
-    _: &dyn Fn() -> bool,
-    _: &dyn Fn(&str) -> Option<WorkspaceResourceGrant>,
-    _: &dyn Fn(&Path) -> Option<WorkspaceResourceGrant>,
-) -> SearchPathsResponse {
-    SearchPathsResponse::terminal(SearchPathsState::Unavailable, "platform_unavailable")
-}
-
-#[cfg(any(target_os = "macos", target_os = "linux", target_os = "android"))]
 fn search_with_metadata(
     request: &SearchPathsRequest,
     grant: &SearchPathsGrant,
@@ -331,7 +335,7 @@ fn search_with_metadata(
     authorize_resource: &dyn Fn(&str) -> Option<WorkspaceResourceGrant>,
     authorize_external: &dyn Fn(&Path) -> Option<WorkspaceResourceGrant>,
 ) -> SearchPathsResponse {
-    unix::search_with_metadata(
+    walk::search_with_metadata(
         request,
         grant,
         cancelled,
@@ -341,76 +345,41 @@ fn search_with_metadata(
     )
 }
 
-#[cfg(any(target_os = "macos", target_os = "linux", target_os = "android"))]
-mod unix {
+/// Confined traversal: every directory is opened relative to its pinned parent handle
+/// without following links, and bindings are revalidated by identity.
+mod walk {
     use super::{
         Component, Duration, Instant, Path, PathBuf, SearchPathEntry, SearchPathKind,
         SearchPathsGrant, SearchPathsRequest, SearchPathsResponse, SearchPathsState,
-        WorkspaceResourceGrant, excluded, git_policy, ignore_policy, inventory, matcher, prepared,
-        valid_relative, valid_request, workspace_inventory,
+        WorkspaceResourceGrant, child, excluded, git_policy, ignore_policy, inventory, matcher,
+        prepared, under, valid_relative, valid_request, workspace_inventory,
     };
-    use std::ffi::CString;
-    use std::fs::File;
+    use bcode_confined_fs::{Dir, EntryKind, FileIdentity, Metadata};
     use std::io::Read as _;
-    use std::os::fd::{AsRawFd, FromRawFd};
-    use std::os::unix::ffi::OsStrExt;
-    use std::os::unix::fs::MetadataExt as _;
 
-    struct Directory(*mut libc::DIR);
-    impl Drop for Directory {
-        fn drop(&mut self) {
-            // SAFETY: fdopendir transferred ownership to this unique RAII wrapper.
-            unsafe {
-                libc::closedir(self.0);
-            }
-        }
-    }
-
-    fn open_child(parent: &File, name: &Path) -> std::io::Result<File> {
-        let name = CString::new(name.as_os_str().as_bytes())?;
-        // SAFETY: parent and NUL-terminated name are live; no creation flags.
-        let fd = unsafe {
-            libc::openat(
-                parent.as_raw_fd(),
-                name.as_ptr(),
-                libc::O_RDONLY
-                    | libc::O_DIRECTORY
-                    | libc::O_NOFOLLOW
-                    | libc::O_CLOEXEC
-                    | libc::O_NONBLOCK,
-            )
-        };
-        if fd < 0 {
-            return Err(std::io::Error::last_os_error());
-        }
-        // SAFETY: successful openat returned a unique owned descriptor.
-        Ok(unsafe { File::from_raw_fd(fd) })
+    fn open_child(parent: &Dir, name: &Path) -> std::io::Result<Dir> {
+        parent.open_dir(name.as_os_str())
     }
 
     fn read_policy(
         resource: &WorkspaceResourceGrant,
-        stat: &libc::stat,
+        expected: &Metadata,
         max_bytes: usize,
         tick: &mut dyn FnMut() -> Result<(), &'static str>,
     ) -> Result<Vec<u8>, &'static str> {
         // Re-traverse the grant's exact absolute target with existing no-follow machinery.
         let Ok((_, input)) =
-            super::super::confined::open_target(&resource.workspace_root.join(&resource.path))
+            super::super::confined::open_target(&under(&resource.workspace_root, &resource.path))
         else {
             return Err("ignore_policy_unavailable");
         };
-        let Ok(metadata) = input.metadata() else {
+        let Ok(metadata) = bcode_confined_fs::file_metadata(&input) else {
             return Err("ignore_policy_unavailable");
         };
-        #[cfg(target_os = "macos")]
-        let device = u64::try_from(stat.st_dev).ok();
-        #[cfg(not(target_os = "macos"))]
-        let device = Some(stat.st_dev);
-        if !metadata.is_file()
+        if metadata.kind() != EntryKind::File
             || metadata.len() > 16_384
-            || metadata.nlink() != 1
-            || Some(metadata.dev()) != device
-            || metadata.ino() != stat.st_ino
+            || metadata.link_count() != 1
+            || metadata.identity() != expected.identity()
         {
             return Err("ignore_policy_unavailable");
         }
@@ -439,14 +408,12 @@ mod unix {
             }
             bytes.extend_from_slice(&chunk[..count]);
         }
-        let Ok(after) = input.metadata() else {
+        let Ok(after) = bcode_confined_fs::file_metadata(&input) else {
             return Err("ignore_policy_unavailable");
         };
         if metadata.len() != after.len()
-            || metadata.mtime() != after.mtime()
-            || metadata.mtime_nsec() != after.mtime_nsec()
-            || metadata.ctime() != after.ctime()
-            || metadata.ctime_nsec() != after.ctime_nsec()
+            || metadata.modified() != after.modified()
+            || metadata.changed() != after.changed()
         {
             return Err("ignore_policy_changed");
         }
@@ -459,8 +426,8 @@ mod unix {
         authorize_resource: &'a dyn Fn(&str) -> Option<WorkspaceResourceGrant>,
         started: Instant,
         bytes: usize,
-        root_identity: Option<(u64, u64)>,
-        bindings: Vec<(PathBuf, u64, u64)>,
+        root_identity: Option<FileIdentity>,
+        bindings: Vec<(PathBuf, FileIdentity)>,
         tracked_paths: Option<std::sync::Arc<std::collections::BTreeSet<String>>>,
         capture: Option<std::collections::BTreeSet<String>>,
         resources: std::collections::BTreeMap<String, Option<[u8; 32]>>,
@@ -497,10 +464,10 @@ mod unix {
     impl Budget<'_> {
         fn descend(
             &mut self,
-            mut root: File,
+            mut root: Dir,
             relative: &Path,
             grant: &SearchPathsGrant,
-        ) -> Option<(File, Vec<ignore_policy::Rule>)> {
+        ) -> Option<(Dir, Vec<ignore_policy::Rule>)> {
             let mut rules = Vec::new();
             let mut ancestor = PathBuf::new();
             for part in relative.components() {
@@ -513,7 +480,7 @@ mod unix {
                 let Component::Normal(name) = part else {
                     unreachable!();
                 };
-                ancestor.push(name);
+                ancestor = child(&ancestor, name);
                 let ignored = self.ignored(&ancestor, true, &rules)?;
                 if ignored {
                     self.response = SearchPathsResponse::terminal(
@@ -536,7 +503,7 @@ mod unix {
         }
         fn workspace(
             &mut self,
-            root: &File,
+            root: &Dir,
             relative: &Path,
             grant: &SearchPathsGrant,
             rules: &[ignore_policy::Rule],
@@ -605,9 +572,11 @@ mod unix {
             inherited: &[ignore_policy::Rule],
         ) -> Result<(), String> {
             while let Some((relative, depth, rules)) = progress.pending.last().cloned() {
-                let directory =
-                    super::super::confined::open_directory(&grant.workspace_root.join(&relative))
-                        .map_err(|_| "directory_changed")?;
+                let directory = super::super::confined::open_directory(&under(
+                    &grant.workspace_root,
+                    &relative,
+                ))
+                .map_err(|_| "directory_changed")?;
                 let before = workspace_inventory::directory_identity(&directory)?;
                 let mut build = Budget::new(request, self.cancelled, self.authorize_resource);
                 build.started = self.started;
@@ -728,7 +697,7 @@ mod unix {
                 Err("byte_limit")
             }
         }
-        fn bound(&mut self, file: &File, relative: &Path, grant: &SearchPathsGrant) -> bool {
+        fn bound(&mut self, file: &Dir, relative: &Path, grant: &SearchPathsGrant) -> bool {
             if self.stop() {
                 return false;
             }
@@ -738,15 +707,15 @@ mod unix {
                 }
                 let root = super::super::confined::open_directory(&grant.workspace_root).ok()?;
                 let root = root.metadata().ok()?;
-                if self.root_identity != Some((root.dev(), root.ino())) {
+                if self.root_identity != Some(root.identity()) {
                     return None;
                 }
                 let current =
-                    super::super::confined::open_directory(&grant.workspace_root.join(relative))
+                    super::super::confined::open_directory(&under(&grant.workspace_root, relative))
                         .ok()?;
                 let current = current.metadata().ok()?;
                 let pinned = file.metadata().ok()?;
-                (current.dev() == pinned.dev() && current.ino() == pinned.ino()).then_some(())
+                (current.identity() == pinned.identity()).then_some(())
             })()
             .is_some();
             if !valid {
@@ -791,7 +760,7 @@ mod unix {
                 }
             }
         }
-        fn remember(&mut self, file: &File, relative: &Path, grant: &SearchPathsGrant) -> bool {
+        fn remember(&mut self, file: &Dir, relative: &Path, grant: &SearchPathsGrant) -> bool {
             if !self.bound(file, relative, grant) {
                 return false;
             }
@@ -802,8 +771,7 @@ mod unix {
                 self.mark("directory_changed");
                 return false;
             };
-            self.bindings
-                .push((relative.into(), metadata.dev(), metadata.ino()));
+            self.bindings.push((relative.into(), metadata.identity()));
             true
         }
         fn validate_results(&mut self, grant: &SearchPathsGrant) {
@@ -812,13 +780,11 @@ mod unix {
                     self.response.entries.clear();
                     return;
                 }
-                let (relative, device, inode) = &self.bindings[index];
+                let (relative, identity) = &self.bindings[index];
                 let matches =
-                    super::super::confined::open_directory(&grant.workspace_root.join(relative))
-                        .and_then(|file| file.metadata())
-                        .is_ok_and(|metadata| {
-                            metadata.dev() == *device && metadata.ino() == *inode
-                        });
+                    super::super::confined::open_directory(&under(&grant.workspace_root, relative))
+                        .and_then(|directory| directory.metadata())
+                        .is_ok_and(|metadata| metadata.identity() == *identity);
                 if !matches {
                     self.mark("directory_changed");
                     self.response.entries.clear();
@@ -828,62 +794,37 @@ mod unix {
         }
         fn names(
             &mut self,
-            file: &File,
+            file: &Dir,
             relative: &Path,
             grant: &SearchPathsGrant,
         ) -> Option<Vec<String>> {
             if !self.remember(file, relative, grant) {
                 return None;
             }
-            // SAFETY: dup creates an independently owned descriptor.
-            let fd = unsafe { libc::dup(file.as_raw_fd()) };
-            if fd < 0 {
+            let Ok(entries) = file.entries() else {
                 self.mark("entry_unavailable");
                 return None;
-            }
-            // SAFETY: fd is an owned directory descriptor. fdopendir takes ownership on success.
-            let dir = unsafe { libc::fdopendir(fd) };
-            if dir.is_null() {
-                // SAFETY: fdopendir failed and did not consume fd.
-                unsafe {
-                    libc::close(fd);
-                }
-                self.mark("entry_unavailable");
-                return None;
-            }
-            let dir = Directory(dir);
+            };
             let mut names = Vec::new();
-            loop {
+            for entry in entries {
                 if (self.capture.is_none() || names.len() % 128 == 0)
                     && !self.bound(file, relative, grant)
                 {
                     return None;
                 }
-                // Clear thread-local errno so EOF and enumeration failure remain distinguishable.
-                set_errno(0);
-                // SAFETY: directory is live and exclusively enumerated; entry read before next call.
-                let entry = unsafe { libc::readdir(dir.0) };
-                if entry.is_null() {
-                    if errno() != 0 {
-                        self.mark("entry_unavailable");
-                        return None;
-                    }
-                    break;
-                }
-                // SAFETY: readdir returns a NUL-terminated d_name valid until next readdir.
-                let name = unsafe { std::ffi::CStr::from_ptr((*entry).d_name.as_ptr()) };
-                if matches!(name.to_bytes(), b"." | b"..") {
-                    continue;
-                }
+                let Ok(entry) = entry else {
+                    self.mark("entry_unavailable");
+                    return None;
+                };
                 if self.response.visited_entries >= self.request.max_entries.clamp(1, 250_000) {
                     self.mark("entry_limit");
                     return None;
                 }
                 self.response.visited_entries += 1;
-                if !self.charge(name.to_bytes().len().saturating_add(64)) {
+                if !self.charge(entry.name().len().saturating_add(64)) {
                     return None;
                 }
-                let Ok(name) = name.to_str() else {
+                let Some(name) = entry.name().to_str() else {
                     self.mark("non_utf8_path");
                     continue;
                 };
@@ -897,7 +838,7 @@ mod unix {
         }
         fn ignore_rules(
             &mut self,
-            file: &File,
+            file: &Dir,
             relative: &Path,
             grant: &SearchPathsGrant,
             rules: &mut Vec<ignore_policy::Rule>,
@@ -905,7 +846,7 @@ mod unix {
             if !self.bound(file, relative, grant) {
                 return false;
             }
-            let path = relative.join(".gitignore");
+            let path = child(relative, ".gitignore");
             if excluded(&path, grant, true) {
                 self.mark("ignore_policy_denied");
                 return false;
@@ -915,26 +856,15 @@ mod unix {
             }
             self.resources
                 .insert(path.to_string_lossy().into_owned(), None);
-            let mut stat = std::mem::MaybeUninit::<libc::stat>::uninit();
-            // SAFETY: live descriptor/name, writable stat, no symlink following.
-            if unsafe {
-                libc::fstatat(
-                    file.as_raw_fd(),
-                    c".gitignore".as_ptr(),
-                    stat.as_mut_ptr(),
-                    libc::AT_SYMLINK_NOFOLLOW,
-                )
-            } != 0
-            {
-                if std::io::Error::last_os_error().kind() == std::io::ErrorKind::NotFound {
-                    return true;
+            let stat = match file.metadata_at(std::ffi::OsStr::new(".gitignore")) {
+                Ok(stat) => stat,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => return true,
+                Err(_) => {
+                    self.mark("ignore_policy_unavailable");
+                    return false;
                 }
-                self.mark("ignore_policy_unavailable");
-                return false;
-            }
-            // SAFETY: successful fstatat initialized output.
-            let stat = unsafe { stat.assume_init() };
-            if stat.st_mode & libc::S_IFMT != libc::S_IFREG || stat.st_size > 16_384 {
+            };
+            if stat.kind() != EntryKind::File || stat.len() > 16_384 {
                 self.mark("ignore_policy_unavailable");
                 return false;
             }
@@ -942,7 +872,7 @@ mod unix {
                 self.mark("ignore_policy_unavailable");
                 return false;
             };
-            let Ok(length) = usize::try_from(stat.st_size) else {
+            let Ok(length) = usize::try_from(stat.len()) else {
                 self.mark("ignore_policy_unavailable");
                 return false;
             };
@@ -1110,7 +1040,7 @@ mod unix {
         }
         fn tracked(
             &mut self,
-            root: &File,
+            root: &Dir,
             paths: &std::sync::Arc<std::collections::BTreeSet<String>>,
             grant: &SearchPathsGrant,
         ) {
@@ -1145,7 +1075,7 @@ mod unix {
                     continue;
                 };
                 let Ok(directory) =
-                    super::super::confined::open_directory(&grant.workspace_root.join(parent))
+                    super::super::confined::open_directory(&under(&grant.workspace_root, parent))
                 else {
                     continue;
                 };
@@ -1155,26 +1085,12 @@ mod unix {
                 let Some(name) = path_ref.file_name() else {
                     continue;
                 };
-                let Ok(name) = CString::new(name.as_bytes()) else {
+                // Never follow links: the entry itself must still have the indexed kind.
+                let Ok(stat) = directory.metadata_at(name) else {
                     continue;
                 };
-                let mut stat = std::mem::MaybeUninit::<libc::stat>::uninit();
-                // SAFETY: live descriptor/basename/output; never follow symlinks.
-                if unsafe {
-                    libc::fstatat(
-                        directory.as_raw_fd(),
-                        name.as_ptr(),
-                        stat.as_mut_ptr(),
-                        libc::AT_SYMLINK_NOFOLLOW,
-                    )
-                } != 0
-                {
-                    continue;
-                }
-                // SAFETY: successful fstatat initialized output.
-                let mode = unsafe { stat.assume_init() }.st_mode & libc::S_IFMT;
-                if (kind == SearchPathKind::File && mode != libc::S_IFREG)
-                    || (kind == SearchPathKind::Directory && mode != libc::S_IFDIR)
+                if (kind == SearchPathKind::File && stat.kind() != EntryKind::File)
+                    || (kind == SearchPathKind::Directory && stat.kind() != EntryKind::Directory)
                 {
                     continue;
                 }
@@ -1186,7 +1102,7 @@ mod unix {
         }
         fn walk(
             &mut self,
-            file: &File,
+            file: &Dir,
             relative: &Path,
             depth: usize,
             grant: &SearchPathsGrant,
@@ -1203,7 +1119,7 @@ mod unix {
         }
         fn walk_entries(
             &mut self,
-            file: &File,
+            file: &Dir,
             relative: &Path,
             depth: usize,
             grant: &SearchPathsGrant,
@@ -1218,34 +1134,19 @@ mod unix {
                 {
                     return false;
                 }
-                let path = relative.join(&name);
+                let path = child(relative, &name);
                 if excluded(&path, grant, self.request.include_hidden) {
                     continue;
                 }
-                let Ok(cname) = CString::new(name.as_bytes()) else {
-                    self.mark("non_utf8_path");
-                    continue;
-                };
-                let mut stat = std::mem::MaybeUninit::<libc::stat>::uninit();
-                // SAFETY: output is writable; file/name remain live. Never follows symlinks.
-                if unsafe {
-                    libc::fstatat(
-                        file.as_raw_fd(),
-                        cname.as_ptr(),
-                        stat.as_mut_ptr(),
-                        libc::AT_SYMLINK_NOFOLLOW,
-                    )
-                } != 0
-                {
+                // Never follows links; links and special files are not candidates.
+                let Ok(stat) = file.metadata_at(std::ffi::OsStr::new(&name)) else {
                     self.mark("entry_unavailable");
                     continue;
-                }
-                // SAFETY: successful fstatat initialized the structure.
-                let mode = unsafe { stat.assume_init() }.st_mode & libc::S_IFMT;
-                let kind = match mode {
-                    libc::S_IFREG => SearchPathKind::File,
-                    libc::S_IFDIR => SearchPathKind::Directory,
-                    _ => continue,
+                };
+                let kind = match stat.kind() {
+                    EntryKind::File => SearchPathKind::File,
+                    EntryKind::Directory => SearchPathKind::Directory,
+                    EntryKind::Symlink | EntryKind::Other => continue,
                 };
                 match self.ignored(&path, kind == SearchPathKind::Directory, rules) {
                     Some(true) => continue,
@@ -1278,30 +1179,14 @@ mod unix {
         }
     }
 
-    // libc exposes the platform's thread-local errno through different accessors.
-    #[cfg(target_os = "macos")]
-    fn errno_pointer() -> *mut libc::c_int {
-        unsafe { libc::__error() }
-    }
-    #[cfg(not(target_os = "macos"))]
-    fn errno_pointer() -> *mut libc::c_int {
-        unsafe { libc::__errno_location() }
-    }
-    fn set_errno(value: libc::c_int) {
-        unsafe {
-            *errno_pointer() = value;
-        }
-    }
-    fn errno() -> libc::c_int {
-        unsafe { *errno_pointer() }
-    }
-
     fn valid_grant(grant: &SearchPathsGrant) -> bool {
         grant.workspace_root.is_absolute()
-            && grant
-                .workspace_root
-                .components()
-                .all(|part| matches!(part, Component::RootDir | Component::Normal(_)))
+            && grant.workspace_root.components().all(|part| {
+                matches!(
+                    part,
+                    Component::Prefix(_) | Component::RootDir | Component::Normal(_)
+                )
+            })
             && grant.workspace_root.as_os_str().len() <= 4096
             && grant.workspace_root.components().count() <= 64
             && grant.excluded_prefixes.len() <= 4096
@@ -1339,7 +1224,7 @@ mod unix {
                 "directory_denied",
             );
         }
-        // Reuse canonical no-follow descriptor traversal; never canonicalize untrusted
+        // Reuse canonical no-follow handle traversal; never canonicalize untrusted
         // paths via symlink-following filesystem operations. No regular file is opened.
         let Ok(root) = super::super::confined::open_directory(&grant.workspace_root) else {
             return SearchPathsResponse::terminal(
@@ -1353,13 +1238,13 @@ mod unix {
                 "root_unavailable",
             );
         };
-        if !metadata.is_dir() {
+        if metadata.kind() != EntryKind::Directory {
             return SearchPathsResponse::terminal(
                 SearchPathsState::Unavailable,
                 "root_unavailable",
             );
         }
-        budget.root_identity = Some((metadata.dev(), metadata.ino()));
+        budget.root_identity = Some(metadata.identity());
         let tracked = if use_inventory {
             match inventory::load(
                 request,
@@ -1415,10 +1300,7 @@ mod unix {
     }
 }
 
-#[cfg(all(
-    test,
-    any(target_os = "macos", target_os = "linux", target_os = "android")
-))]
+#[cfg(test)]
 mod tests;
 
 #[cfg(test)]
@@ -1428,7 +1310,7 @@ fn search(
     cancelled: &dyn Fn() -> bool,
     authorize_resource: &dyn Fn(&str) -> Option<WorkspaceResourceGrant>,
 ) -> SearchPathsResponse {
-    unix::search_with_metadata(
+    walk::search_with_metadata(
         request,
         grant,
         cancelled,

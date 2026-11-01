@@ -725,7 +725,9 @@ impl TesseractEngine {
             (Backend::Dynamic(runtime), None) => runtime.tessdata_dir.clone(),
             (Backend::Linked, None) => resolve_tessdata_dir(),
         };
-        let datapath_string = datapath.to_string_lossy().into_owned();
+        // Tesseract appends `/<language>.traineddata`, which Win32 does not normalize
+        // inside verbatim (`\\?\`) paths produced by canonicalization.
+        let datapath_string = dunce::simplified(&datapath).to_string_lossy().into_owned();
         let datapath_c = CString::new(datapath_string.clone())?;
         let language_c = CString::new(options.language.clone())?;
         let engine_mode = options.engine_mode.unwrap_or(EngineMode::Default) as i32;

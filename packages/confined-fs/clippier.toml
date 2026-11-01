@@ -1,0 +1,5 @@
+# Exercise openat-family and NtCreateFile-relative backends on their native kernels.
+[[config]]
+os = "ubuntu"
+[[config]]
+os = "windows"

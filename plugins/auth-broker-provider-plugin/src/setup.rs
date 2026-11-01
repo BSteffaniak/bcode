@@ -261,31 +261,10 @@ pub async fn prepare(input: &PrepareRequest) -> Result<PrepareResponse, &'static
     })
 }
 
-#[cfg(unix)]
 mod private;
-#[cfg(not(unix))]
-mod private {
-    pub(super) struct Directory;
-    impl Directory {
-        pub(super) fn open(_: &std::path::Path) -> Result<Self, crate::Failure> {
-            Err("private_files_require_unix")
-        }
-        pub(super) fn publish(&self, _: &str, _: u64, _: &str) -> Result<(), crate::Failure> {
-            Err("private_files_require_unix")
-        }
-    }
-}
 
 pub(crate) fn read_lease(lease: &str, expiry: &str) -> Result<(String, u64), Failure> {
-    #[cfg(unix)]
-    {
-        private::read_lease(lease, expiry)
-    }
-    #[cfg(not(unix))]
-    {
-        let _ = (lease, expiry);
-        Err("private_files_require_unix")
-    }
+    private::read_lease(lease, expiry)
 }
 
 #[cfg(test)]

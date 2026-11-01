@@ -420,8 +420,7 @@ pub fn save_preferences(
     file.as_file()
         .sync_all()
         .map_err(|_| ConnectionError::Preferences)?;
-    file.persist(path)
-        .map_err(|_| ConnectionError::Preferences)?;
+    bcode_confined_fs::persist(file, path).map_err(|_| ConnectionError::Preferences)?;
     Ok(())
 }
 

@@ -1,3 +1,4 @@
+#[cfg(unix)]
 use super::*;
 
 /// Nix/Home Manager commonly link config files into a store while keeping

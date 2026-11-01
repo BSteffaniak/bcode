@@ -1,0 +1,35 @@
+[package]
+authors     = { workspace = true }
+categories  = ["filesystem"]
+description = "Handle-relative, no-follow filesystem access for confining untrusted names"
+edition     = { workspace = true }
+keywords    = ["bcode", "filesystem", "openat", "security"]
+license     = { workspace = true }
+name        = "bcode_confined_fs"
+readme      = { workspace = true }
+repository  = { workspace = true }
+version     = { workspace = true }
+
+[dependencies]
+tempfile = { workspace = true }
+
+[target.'cfg(unix)'.dependencies]
+libc = { workspace = true }
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { workspace = true, features = [
+    "Wdk_Foundation",
+    "Wdk_Storage_FileSystem",
+    "Wdk_System_SystemServices",
+    "Win32_Foundation",
+    "Win32_Security",
+    "Win32_Security_Authorization",
+    "Win32_Storage_FileSystem",
+    "Win32_System_IO",
+    "Win32_System_SystemServices",
+    "Win32_System_Threading",
+] }
+
+[features]
+default          = []
+fail-on-warnings = []

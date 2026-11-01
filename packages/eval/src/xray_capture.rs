@@ -374,8 +374,16 @@ impl Drop for Capture {
     }
 }
 
+/// Credential privacy is verified through Unix ownership modes; other platforms fail closed.
+#[cfg(not(unix))]
+const fn read_bootstrap_client(_endpoint: &bcode_ipc::XrayEndpointInfo) -> Result<XrayClient, ()> {
+    Err(())
+}
+
+#[cfg(unix)]
 fn read_bootstrap_client(endpoint: &bcode_ipc::XrayEndpointInfo) -> Result<XrayClient, ()> {
     use std::io::Read as _;
+    use std::os::unix::fs::MetadataExt as _;
     let path = &endpoint.credential_file;
     let before = std::fs::symlink_metadata(path).map_err(|_| ())?;
     if !before.is_file() || before.file_type().is_symlink() {
@@ -383,17 +391,9 @@ fn read_bootstrap_client(endpoint: &bcode_ipc::XrayEndpointInfo) -> Result<XrayC
     }
     let file = std::fs::File::open(path).map_err(|_| ())?;
     let metadata = file.metadata().map_err(|_| ())?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::MetadataExt as _;
-        if metadata.mode() & 0o077 != 0
-            || before.dev() != metadata.dev()
-            || before.ino() != metadata.ino()
-        {
-            return Err(());
-        }
-    }
-    #[cfg(not(unix))]
+    if metadata.mode() & 0o077 != 0
+        || before.dev() != metadata.dev()
+        || before.ino() != metadata.ino()
     {
         return Err(());
     }

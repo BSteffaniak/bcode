@@ -1140,9 +1140,7 @@ pub fn write_output(path: &Path, bytes: &[u8], force: bool) -> Result<(), Error>
     staged.write_all(bytes)?;
     staged.as_file().sync_all()?;
     if force {
-        staged
-            .persist(path)
-            .map_err(|error| Error::Io(error.error))?;
+        bcode_confined_fs::persist(staged, path).map_err(Error::Io)?;
     } else {
         staged.persist_noclobber(path).map_err(|error| {
             if error.error.kind() == std::io::ErrorKind::AlreadyExists {

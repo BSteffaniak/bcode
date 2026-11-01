@@ -1,9 +1,9 @@
 //! Bounded Git-index path inventory; content reads require fresh resource grants.
 //! Single-slot cache coalesces refreshes and never caches authorization.
 use super::{SearchPathsGrant, SearchPathsRequest, WorkspaceResourceGrant, valid_relative};
+use bcode_confined_fs::{EntryKind, FileIdentity, Metadata, Timestamp, file_metadata};
 use std::collections::BTreeSet;
 use std::io::Read as _;
-use std::os::unix::fs::MetadataExt as _;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex, TryLockError};
 use std::time::{Duration, Instant};
@@ -11,21 +11,18 @@ use std::time::{Duration, Instant};
 const MAX_INDEX_BYTES: usize = 32 * 1024 * 1024;
 const MAX_PATH_BYTES: usize = 16 * 1024 * 1024;
 const MAX_PATHS: usize = 250_000;
-type Identity = (u64, u64, u64, i64, i64, i64, i64);
-fn identity(metadata: &std::fs::Metadata) -> Identity {
+type Identity = (FileIdentity, u64, Timestamp, Timestamp);
+const fn identity(metadata: &Metadata) -> Identity {
     (
-        metadata.dev(),
-        metadata.ino(),
+        metadata.identity(),
         metadata.len(),
-        metadata.mtime(),
-        metadata.mtime_nsec(),
-        metadata.ctime(),
-        metadata.ctime_nsec(),
+        metadata.modified(),
+        metadata.changed(),
     )
 }
 struct Cached {
     root: PathBuf,
-    root_identity: (u64, u64),
+    root_identity: FileIdentity,
     index: Identity,
     index_path: PathBuf,
     pointer: Option<(PathBuf, Identity)>,
@@ -57,22 +54,24 @@ pub(super) fn load(
     else {
         return Ok(Some(Arc::new(BTreeSet::new())));
     };
-    let index_path = resource.workspace_root.join(&resource.path);
+    let index_path = super::under(&resource.workspace_root, &resource.path);
     tick()?;
-    let (_, mut index) =
-        match super::super::confined::open_target(&resource.workspace_root.join(&resource.path)) {
-            Ok(file) => file,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                return Ok(Some(Arc::new(BTreeSet::new())));
-            }
-            Err(_) => return Err("git_index_unavailable"),
-        };
-    let metadata = index.metadata().map_err(|_| "git_index_unavailable")?;
-    if !metadata.is_file() || metadata.len() > MAX_INDEX_BYTES as u64 {
+    let (_, mut index) = match super::super::confined::open_target(&super::under(
+        &resource.workspace_root,
+        &resource.path,
+    )) {
+        Ok(file) => file,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(Some(Arc::new(BTreeSet::new())));
+        }
+        Err(_) => return Err("git_index_unavailable"),
+    };
+    let metadata = file_metadata(&index).map_err(|_| "git_index_unavailable")?;
+    if metadata.kind() != EntryKind::File || metadata.len() > MAX_INDEX_BYTES as u64 {
         return Err("git_index_limit");
     }
     let stamp = identity(&metadata);
-    let root_stamp = (root_meta.dev(), root_meta.ino());
+    let root_stamp = root_meta.identity();
     let mut cache = loop {
         tick()?;
         match CACHE.try_lock() {
@@ -109,21 +108,23 @@ pub(super) fn load(
     }
     let paths = confine_paths(&bytes, grant, &repository_root, tick)?;
     tick()?;
-    let (_, current) =
-        super::super::confined::open_target(&resource.workspace_root.join(&resource.path))
-            .map_err(|_| "git_index_changed")?;
+    let (_, current) = super::super::confined::open_target(&super::under(
+        &resource.workspace_root,
+        &resource.path,
+    ))
+    .map_err(|_| "git_index_changed")?;
     let current_root = super::super::confined::open_directory(&grant.workspace_root)
         .map_err(|_| "root_changed")?;
     let current_root = current_root.metadata().map_err(|_| "root_changed")?;
-    if identity(&current.metadata().map_err(|_| "git_index_changed")?) != stamp
-        || (current_root.dev(), current_root.ino()) != root_stamp
+    if identity(&file_metadata(&current).map_err(|_| "git_index_changed")?) != stamp
+        || current_root.identity() != root_stamp
     {
         return Err("git_index_changed");
     }
     if let Some((path, stamp)) = &pointer {
         let (_, current) =
             super::super::confined::open_target(path).map_err(|_| "git_pointer_changed")?;
-        if identity(&current.metadata().map_err(|_| "git_pointer_changed")?) != *stamp {
+        if identity(&file_metadata(&current).map_err(|_| "git_pointer_changed")?) != *stamp {
             return Err("git_pointer_changed");
         }
     }
@@ -248,27 +249,42 @@ fn parse(
     Ok(paths)
 }
 
+/// Lexically resolve `target` (absolute, or relative to the canonical `root`).
+///
+/// The base and target are normalized as separate component streams: joining a relative
+/// target onto a Windows verbatim (`\\?\`) root would otherwise keep `/` and `..`
+/// literally inside one component. Only the base may carry a drive or UNC prefix.
 pub(super) fn normalize_absolute(
     root: &std::path::Path,
     target: &str,
 ) -> Result<PathBuf, &'static str> {
+    use std::path::Component;
     let target = std::path::Path::new(target);
-    let absolute = if target.is_absolute() {
-        target.to_owned()
+    let (base, relative) = if target.is_absolute() {
+        (target, std::path::Path::new(""))
     } else {
-        root.join(target)
+        (root, target)
     };
-    let mut normalized = PathBuf::from("/");
-    for part in absolute.components() {
+    let mut components = base.components().peekable();
+    let mut normalized = match components.peek() {
+        Some(Component::Prefix(prefix)) => {
+            let mut normalized = PathBuf::from(prefix.as_os_str());
+            components.next();
+            normalized.push(Component::RootDir);
+            normalized
+        }
+        _ => PathBuf::from("/"),
+    };
+    for part in components.chain(relative.components()) {
         match part {
-            std::path::Component::Normal(name) => normalized.push(name),
-            std::path::Component::RootDir | std::path::Component::CurDir => (),
-            std::path::Component::ParentDir => {
+            Component::Normal(name) => normalized.push(name),
+            Component::RootDir | Component::CurDir => (),
+            Component::ParentDir => {
                 if !normalized.pop() {
                     return Err("git_pointer_invalid");
                 }
             }
-            std::path::Component::Prefix(_) => return Err("git_pointer_invalid"),
+            Component::Prefix(_) => return Err("git_pointer_invalid"),
         }
     }
     if !normalized.is_absolute() || normalized.components().count() > 64 {
@@ -286,26 +302,16 @@ pub(super) fn discover_repository(
         tick()?;
         let directory = super::super::confined::open_directory(ancestor)
             .map_err(|_| "git_ancestor_unavailable")?;
-        let mut stat = std::mem::MaybeUninit::<libc::stat>::uninit();
-        // SAFETY: owned directory, static basename, writable stat; never follows symlinks.
-        if unsafe {
-            libc::fstatat(
-                std::os::fd::AsRawFd::as_raw_fd(&directory),
-                c".git".as_ptr(),
-                stat.as_mut_ptr(),
-                libc::AT_SYMLINK_NOFOLLOW,
-            )
-        } == 0
-        {
-            // SAFETY: successful fstatat initialized output.
-            let mode = unsafe { stat.assume_init() }.st_mode & libc::S_IFMT;
-            if mode != libc::S_IFREG && mode != libc::S_IFDIR {
-                return Err("git_metadata_unavailable");
+        // Never follows links: a linked `.git` is reported, not resolved.
+        match directory.metadata_at(std::ffi::OsStr::new(".git")) {
+            Ok(stat) => {
+                if !matches!(stat.kind(), EntryKind::File | EntryKind::Directory) {
+                    return Err("git_metadata_unavailable");
+                }
+                return Ok(Some(ancestor.to_owned()));
             }
-            return Ok(Some(ancestor.to_owned()));
-        }
-        if std::io::Error::last_os_error().kind() != std::io::ErrorKind::NotFound {
-            return Err("git_ancestor_unavailable");
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(_) => return Err("git_ancestor_unavailable"),
         }
     }
     Ok(None)
@@ -324,21 +330,10 @@ fn resolve_index(
     let nested = repository_root != grant.workspace_root;
     let resolved = match super::super::confined::open_directory(&git) {
         Ok(git_directory) => {
-            let mut stat = std::mem::MaybeUninit::<libc::stat>::uninit();
-            // SAFETY: live directory descriptor/static basename/writable stat.
-            if unsafe {
-                libc::fstatat(
-                    std::os::fd::AsRawFd::as_raw_fd(&git_directory),
-                    c"index".as_ptr(),
-                    stat.as_mut_ptr(),
-                    libc::AT_SYMLINK_NOFOLLOW,
-                )
-            } != 0
-            {
-                if std::io::Error::last_os_error().kind() == std::io::ErrorKind::NotFound {
-                    return Ok(None);
-                }
-                return Err("git_index_unavailable");
+            match git_directory.metadata_at(std::ffi::OsStr::new("index")) {
+                Ok(_) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+                Err(_) => return Err("git_index_unavailable"),
             }
             let resource = if nested {
                 external(&git.join("index"))
@@ -362,13 +357,15 @@ fn resolve_index(
             } else {
                 authorize(".git")
             }
-            .filter(|resource| resource.workspace_root.join(&resource.path) == git)
+            .filter(|resource| super::under(&resource.workspace_root, &resource.path) == git)
             .ok_or("git_pointer_denied")?;
-            let (_, mut pointer) =
-                super::super::confined::open_target(&resource.workspace_root.join(&resource.path))
-                    .map_err(|_| "git_pointer_unavailable")?;
-            let before = pointer.metadata().map_err(|_| "git_pointer_unavailable")?;
-            if !before.is_file() || before.len() > 4096 {
+            let (_, mut pointer) = super::super::confined::open_target(&super::under(
+                &resource.workspace_root,
+                &resource.path,
+            ))
+            .map_err(|_| "git_pointer_unavailable")?;
+            let before = file_metadata(&pointer).map_err(|_| "git_pointer_unavailable")?;
+            if before.kind() != EntryKind::File || before.len() > 4096 {
                 return Err("git_pointer_invalid");
             }
             let mut bytes = Vec::new();
@@ -379,7 +376,7 @@ fn resolve_index(
                 .map_err(|_| "git_pointer_unavailable")?;
             tick()?;
             if bytes.len() > 4096
-                || identity(&pointer.metadata().map_err(|_| "git_pointer_changed")?)
+                || identity(&file_metadata(&pointer).map_err(|_| "git_pointer_changed")?)
                     != identity(&before)
             {
                 return Err("git_pointer_changed");
@@ -396,7 +393,7 @@ fn resolve_index(
             let index_path = target.join("index");
             let resource = external(&index_path)
                 .filter(|resource| {
-                    resource.workspace_root.join(&resource.path) == index_path
+                    super::under(&resource.workspace_root, &resource.path) == index_path
                         && resource.path == "index"
                         && resource.workspace_root == target
                 })

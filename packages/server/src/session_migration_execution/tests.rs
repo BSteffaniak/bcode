@@ -1,6 +1,7 @@
 use super::*;
 use bcode_session::artifact_storage::ArtifactMaintenanceCancellation;
 
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 #[tokio::test]
 async fn released_historical_upgrade_reports_actual_execution_failure() {
     let (root, state, id, _, _) =
@@ -32,6 +33,7 @@ async fn released_historical_upgrade_reports_actual_execution_failure() {
     );
 }
 
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 #[tokio::test]
 async fn busy_reader_failure_allows_immediate_fresh_admission_after_release() {
     let root = tempfile::tempdir().expect("root");

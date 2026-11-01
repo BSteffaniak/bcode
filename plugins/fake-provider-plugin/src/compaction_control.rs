@@ -175,7 +175,7 @@ impl Control {
             .map_err(|_| "cannot create compaction evidence")?;
         file.write_all(bytes)
             .map_err(|_| "cannot write compaction evidence")?;
-        file.persist(self.directory.join(name))
+        bcode_confined_fs::persist(file, &self.directory.join(name))
             .map_err(|_| "cannot publish compaction evidence")?;
         Ok(())
     }

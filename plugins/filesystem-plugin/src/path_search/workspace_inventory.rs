@@ -1,11 +1,16 @@
 //! Reusable authorized workspace traversal snapshots, independent of query/output bounds.
 use super::{SearchPathsGrant, SearchPathsRequest, WorkspaceResourceGrant};
+use bcode_confined_fs::{FileIdentity, Metadata, Timestamp};
 use std::collections::{BTreeMap, BTreeSet};
-use std::os::unix::fs::MetadataExt as _;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex, TryLockError};
 use std::time::{Duration, Instant};
-pub(super) type ResourceIdentity = (u64, u64, u64, i64, i64);
+pub(super) type ResourceIdentity = (FileIdentity, u64, Timestamp);
+
+/// Identity plus size and last-write time, which also change when a directory's entries do.
+const fn resource_identity(metadata: &Metadata) -> ResourceIdentity {
+    (metadata.identity(), metadata.len(), metadata.modified())
+}
 type CapturedInventory = (BTreeSet<String>, PolicyDigests, Option<String>);
 type LoadedInventory = (Arc<BTreeSet<String>>, Option<String>);
 pub(super) type PolicyDigests = BTreeMap<String, Option<[u8; 32]>>;
@@ -40,7 +45,7 @@ static PENDING: Mutex<Option<Pending>> = Mutex::new(None);
 #[derive(Clone, PartialEq, Eq)]
 struct SnapshotKey {
     root: PathBuf,
-    root_identity: (u64, u64),
+    root_identity: FileIdentity,
     exclusions: Vec<PathBuf>,
     directory: String,
     hidden: bool,
@@ -82,7 +87,7 @@ pub(super) fn load(
     let metadata = root.metadata().map_err(|_| "root_unavailable")?;
     let key = SnapshotKey {
         root: grant.workspace_root.clone(),
-        root_identity: (metadata.dev(), metadata.ino()),
+        root_identity: metadata.identity(),
         exclusions: grant.excluded_prefixes.clone(),
         directory: request.directory.clone(),
         hidden: request.include_hidden,
@@ -135,31 +140,19 @@ fn resource_stamp(
     path: &str,
     authorize: &dyn Fn(&str) -> Option<WorkspaceResourceGrant>,
 ) -> Result<Option<ResourceIdentity>, &'static str> {
-    let target = grant.workspace_root.join(path);
+    let target = super::under(&grant.workspace_root, path);
     let parent = target.parent().ok_or("inventory_resource_changed")?;
     let directory =
         super::super::confined::open_directory(parent).map_err(|_| "inventory_resource_changed")?;
-    let name = std::ffi::CString::new(
-        path.rsplit('/')
-            .next()
-            .ok_or("inventory_resource_changed")?,
-    )
-    .map_err(|_| "inventory_resource_changed")?;
-    let mut stat = std::mem::MaybeUninit::<libc::stat>::uninit();
-    // SAFETY: owned descriptor, live basename, writable stat, no symlink following.
-    if unsafe {
-        libc::fstatat(
-            std::os::fd::AsRawFd::as_raw_fd(&directory),
-            name.as_ptr(),
-            stat.as_mut_ptr(),
-            libc::AT_SYMLINK_NOFOLLOW,
-        )
-    } != 0
-    {
-        if std::io::Error::last_os_error().kind() == std::io::ErrorKind::NotFound {
-            return Ok(None);
-        }
-        return Err("inventory_resource_changed");
+    let name = path
+        .rsplit('/')
+        .next()
+        .ok_or("inventory_resource_changed")?;
+    // No link following: the named entry must be observed without resolving it.
+    match directory.metadata_at(std::ffi::OsStr::new(name)) {
+        Ok(_) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(_) => return Err("inventory_resource_changed"),
     }
     let resource = authorize(path)
         .filter(|resource| resource.workspace_root == grant.workspace_root && resource.path == path)
@@ -167,14 +160,9 @@ fn resource_stamp(
     let (_, file) =
         super::super::confined::open_target(&PathBuf::from(&resource.workspace_root).join(path))
             .map_err(|_| "inventory_resource_changed")?;
-    let metadata = file.metadata().map_err(|_| "inventory_resource_changed")?;
-    Ok(Some((
-        metadata.dev(),
-        metadata.ino(),
-        metadata.len(),
-        metadata.mtime(),
-        metadata.mtime_nsec(),
-    )))
+    let metadata =
+        bcode_confined_fs::file_metadata(&file).map_err(|_| "inventory_resource_changed")?;
+    Ok(Some(resource_identity(&metadata)))
 }
 
 fn validate_progress(
@@ -185,8 +173,9 @@ fn validate_progress(
 ) -> Result<(), String> {
     for (path, expected) in &progress.directories {
         tick()?;
-        let directory = super::super::confined::open_directory(&grant.workspace_root.join(path))
-            .map_err(|_| "directory_changed")?;
+        let directory =
+            super::super::confined::open_directory(&super::under(&grant.workspace_root, path))
+                .map_err(|_| "directory_changed")?;
         if directory_identity(&directory)? != *expected {
             return Err("directory_changed".into());
         }
@@ -198,8 +187,9 @@ fn validate_progress(
             return Err("inventory_resource_changed".into());
         }
         if let Some(expected) = digest {
-            let (_, file) = super::super::confined::open_target(&grant.workspace_root.join(path))
-                .map_err(|_| "inventory_resource_changed")?;
+            let (_, file) =
+                super::super::confined::open_target(&super::under(&grant.workspace_root, path))
+                    .map_err(|_| "inventory_resource_changed")?;
             let mut bytes = Vec::new();
             std::io::Read::read_to_end(&mut std::io::Read::take(file, 16_385), &mut bytes)
                 .map_err(|_| "inventory_resource_changed")?;
@@ -211,15 +201,11 @@ fn validate_progress(
     }
     Ok(())
 }
-pub(super) fn directory_identity(file: &std::fs::File) -> Result<ResourceIdentity, &'static str> {
-    let metadata = file.metadata().map_err(|_| "directory_changed")?;
-    Ok((
-        metadata.dev(),
-        metadata.ino(),
-        metadata.len(),
-        metadata.mtime(),
-        metadata.mtime_nsec(),
-    ))
+pub(super) fn directory_identity(
+    directory: &bcode_confined_fs::Dir,
+) -> Result<ResourceIdentity, &'static str> {
+    let metadata = directory.metadata().map_err(|_| "directory_changed")?;
+    Ok(resource_identity(&metadata))
 }
 
 fn resume_capture(
@@ -274,8 +260,9 @@ fn publication_stamps(
             return Err("inventory_resource_changed".into());
         }
         if let Some(expected) = expected {
-            let (_, file) = super::super::confined::open_target(&grant.workspace_root.join(&path))
-                .map_err(|_| "inventory_resource_changed")?;
+            let (_, file) =
+                super::super::confined::open_target(&super::under(&grant.workspace_root, &path))
+                    .map_err(|_| "inventory_resource_changed")?;
             let mut bytes = Vec::new();
             std::io::Read::read_to_end(&mut std::io::Read::take(file, 16_385), &mut bytes)
                 .map_err(|_| "inventory_resource_changed")?;
@@ -310,7 +297,7 @@ mod tests {
             .unwrap();
         let key = SnapshotKey {
             root: grant.workspace_root.clone(),
-            root_identity: (metadata.dev(), metadata.ino()),
+            root_identity: metadata.identity(),
             exclusions: Vec::new(),
             directory: String::new(),
             hidden: false,

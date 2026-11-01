@@ -15,6 +15,7 @@ version.workspace    = true
 
 [dependencies]
 base64.workspace = true
+bcode_confined_fs = { workspace = true }
 clap = { workspace = true, features = [
     "derive",
     "std",

@@ -11230,6 +11230,7 @@ mod client_timeout_tests {
     use std::path::Path;
     use std::time::Duration;
 
+    #[cfg(unix)]
     #[tokio::test]
     async fn typed_definition_inspection_rejects_untrusted_responses() {
         use bcode_workflow::WorkflowAuthoringApplication as _;
@@ -14558,6 +14559,7 @@ mod portable_application_adapter_tests {
         }
     }
 
+    #[cfg(unix)]
     #[tokio::test]
     async fn semantic_consumer_retains_one_connection_and_surfaces_failure_without_reconnect() {
         use bcode_plugin_sdk::interaction_application::InteractionControllerError as Error;

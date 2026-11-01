@@ -575,6 +575,7 @@ mod tests {
                 Err(ConfigRecoveryError::InvalidSource)
             );
         }
+        #[cfg_attr(not(unix), allow(unused_mut))]
         let mut source = sources(dir.path(), &["../outside.toml"]);
         assert_eq!(
             replay(&source, &roots),

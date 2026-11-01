@@ -27,7 +27,7 @@ use sha2::{Digest, Sha256};
 use std::fs::File;
 use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
-#[cfg(test)]
+#[cfg(all(test, unix))]
 use std::process::Command;
 use std::sync::{Arc, Mutex as StdMutex};
 use std::time::{Duration, Instant};
@@ -1195,11 +1195,13 @@ struct TerminalStreamOutput {
     prelude_suppressed: bool,
 }
 
+/// Canonical verbatim (`\\?\`) prefixes are removed when representable: cmd.exe rejects
+/// them as current directories and falls back to the Windows directory.
 fn resolve_effective_cwd(
     arguments: &ShellRunArguments,
     session_cwd: Option<&Path>,
 ) -> Option<PathBuf> {
-    arguments.cwd.as_deref().map_or_else(
+    let cwd = arguments.cwd.as_deref().map_or_else(
         || session_cwd.map(Path::to_path_buf),
         |cwd| {
             if cwd.is_absolute() {
@@ -1210,7 +1212,8 @@ fn resolve_effective_cwd(
                     .or_else(|| Some(cwd.to_path_buf()))
             }
         },
-    )
+    );
+    cwd.map(|cwd| dunce::simplified(&cwd).to_path_buf())
 }
 
 fn shell_config_with_environment(
@@ -1239,6 +1242,9 @@ fn direnv_file_for(cwd: &Path) -> Option<PathBuf> {
     }
 }
 
+#[cfg(any(windows, test))]
+#[path = "native/conpty_bootstrap.rs"]
+mod conpty_bootstrap;
 #[path = "native/direnv_probe.rs"]
 mod direnv_probe;
 
@@ -1377,7 +1383,7 @@ struct TerminalRunPaths<'a> {
     primary_presentation: Option<Arc<StdMutex<PrimaryPresentationPublisher>>>,
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 fn run_terminal_shell_command(
     events: ServiceEventEmitter,
     cancellation: &bcode_plugin_sdk::ServiceCancellation,
@@ -1820,10 +1826,18 @@ fn run_terminal_shell_command_inner(
         .spawn_command(command)
         .map_err(|error| error.to_string())?;
     drop(pair.slave);
+    #[cfg_attr(windows, allow(unused_mut))]
     let mut reader = pair
         .master
         .try_clone_reader()
         .map_err(|error| error.to_string())?;
+    #[cfg(windows)]
+    let mut reader = conpty_bootstrap::CursorQueryResponder::new(
+        reader,
+        pair.master
+            .take_writer()
+            .map_err(|error| error.to_string())?,
+    );
     #[cfg(unix)]
     let reader_fd = pair
         .master

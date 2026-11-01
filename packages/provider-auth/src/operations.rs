@@ -1,13 +1,10 @@
 //! Host-owned provider-auth application operations.
 
 use crate::{AuthProfileResolutionError, ResolvedAuthProfile, lifecycle::AuthVaultLifecycle};
-#[cfg(unix)]
 mod enrollment;
-#[cfg(unix)]
 pub use enrollment::{
     CustodyEnrollment, CustodyEnrollmentMode, CustodyEnrollmentReadiness, read_custody_identity,
 };
-#[cfg(unix)]
 pub(crate) mod refresh;
 use bcode_provider_auth_models::{
     AUTH_CREDENTIAL_UPDATE_SCHEMA_VERSION, AUTH_SECURITY_INSPECTION_SCHEMA_VERSION,
@@ -15,7 +12,6 @@ use bcode_provider_auth_models::{
     AuthDiagnosticSeverity, AuthMethodContribution, AuthSecurityInspectionRequest,
     AuthSecurityInspectionResponse,
 };
-#[cfg(unix)]
 pub use refresh::resolve_refresh_service_request_with_custody;
 
 /// Authorization context bound by the host from an active plugin/provider invocation.
@@ -116,7 +112,6 @@ pub struct AuthProvisioningIntent {
     pub profile_binding: String,
 }
 
-#[cfg(unix)]
 pub(crate) fn provisioning_binding(
     profile: &ResolvedAuthProfile,
 ) -> Result<String, crate::lifecycle::AuthVaultLifecycleError> {
@@ -226,7 +221,6 @@ pub trait AuthCustodyKeySource: Send + Sync {
 /// Pools are intentionally unsupported by this single-profile service. Identities are zeroized
 /// on release; directory ownership is released with storage. Device factors fail closed and
 /// remote-factor limitations remain those of the lifecycle custody reader.
-#[cfg(unix)]
 pub struct RetainedAuthRequestCustody {
     storage: std::sync::Mutex<Box<dyn crate::custody_storage::AuthCustodyStorage>>,
     resolved: ResolvedAuthProfile,
@@ -239,7 +233,6 @@ pub struct RetainedAuthRequestCustody {
     active_enrollment: std::sync::Mutex<Option<String>>,
 }
 
-#[cfg(unix)]
 impl RetainedAuthRequestCustody {
     /// Resolve a fenced provisioning attempt after caller authorization for maintenance.
     /// Does not replay credential changes or delete external factors.
@@ -351,7 +344,6 @@ impl RetainedAuthRequestCustody {
     }
 }
 
-#[cfg(unix)]
 impl AuthRequestCustody for RetainedAuthRequestCustody {
     fn materialize(
         &self,
@@ -394,7 +386,6 @@ impl AuthRequestCustody for RetainedAuthRequestCustody {
     }
 }
 
-#[cfg(unix)]
 impl AuthCredentialCustody for RetainedAuthRequestCustody {
     fn begin_refresh(
         &self,
@@ -592,7 +583,6 @@ pub fn resolve_credential_update_service_request_with_custody<'registry>(
     use bcode_provider_auth_models::{AUTH_HOST_INTERFACE_ID, OP_UPDATE_CREDENTIALS};
     use bcode_tool::ToolInvocationServiceResolution as Resolution;
 
-    #[cfg(unix)]
     if request.interface_id == AUTH_HOST_INTERFACE_ID
         && matches!(
             request.operation.as_str(),
@@ -608,19 +598,6 @@ pub fn resolve_credential_update_service_request_with_custody<'registry>(
             request,
             custody,
         );
-    }
-    #[cfg(not(unix))]
-    if request.interface_id == AUTH_HOST_INTERFACE_ID
-        && matches!(
-            request.operation.as_str(),
-            bcode_provider_auth_models::OP_BEGIN_REFRESH
-                | bcode_provider_auth_models::OP_COMMIT_REFRESH
-        )
-    {
-        return Resolution::Failed {
-            code: "auth_refresh_unavailable".into(),
-            message: "durable refresh coordination is unavailable on this host".into(),
-        };
     }
     if request.interface_id != AUTH_HOST_INTERFACE_ID || request.operation != OP_UPDATE_CREDENTIALS
     {

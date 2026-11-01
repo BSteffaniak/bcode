@@ -9040,31 +9040,7 @@ fn dispatch_non_ranking_session_command(
                     "explicit --apply is required".to_owned(),
                 ));
             }
-            #[cfg(not(any(target_os = "macos", target_os = "linux")))]
-            {
-                let _ = entry_budget;
-                return Err(CliError::InvalidArguments(
-                    "legacy admission compaction is unsupported on this platform".to_owned(),
-                ));
-            }
-            #[cfg(any(target_os = "macos", target_os = "linux"))]
-            {
-                let root = bcode_config::default_session_store_dir();
-                let retired =
-                bcode_session::storage_admission::StorageAdmissionRegistry::compact_legacy_readers(
-                    &root,
-                    entry_budget as usize,
-                )
-                .map_err(|error| {
-                    CliError::InvalidArguments(format!(
-                        "legacy admission compaction refused: {error}"
-                    ))
-                })?;
-                print_json(
-                    &serde_json::json!({ "retired": retired, "maintenance_blocker_retained": true }),
-                )?;
-            }
-            Ok(())
+            compact_legacy_admission(entry_budget)
         }),
         SessionCommand::StorageAdmission { session_id, apply } => Box::pin(async move {
             ensure_server_running().await?;
@@ -9744,6 +9720,27 @@ fn dispatch_non_ranking_session_command(
             Ok(())
         }),
     }
+}
+
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+fn compact_legacy_admission(entry_budget: u32) -> Result<(), CliError> {
+    let root = bcode_config::default_session_store_dir();
+    let retired =
+        bcode_session::storage_admission::StorageAdmissionRegistry::compact_legacy_readers(
+            &root,
+            entry_budget as usize,
+        )
+        .map_err(|error| {
+            CliError::InvalidArguments(format!("legacy admission compaction refused: {error}"))
+        })?;
+    print_json(&serde_json::json!({ "retired": retired, "maintenance_blocker_retained": true }))
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "linux")))]
+fn compact_legacy_admission(_entry_budget: u32) -> Result<(), CliError> {
+    Err(CliError::InvalidArguments(
+        "legacy admission compaction is unsupported on this platform".to_owned(),
+    ))
 }
 
 async fn reprice_session_command(

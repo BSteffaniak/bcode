@@ -14,6 +14,7 @@ version     = { workspace = true }
 crate-type = ["cdylib", "rlib"]
 
 [dependencies]
+bcode_confined_fs = { workspace = true, optional = true }
 bcode_plugin_models = { workspace = true, optional = true }
 bcode_plugin_sdk = { workspace = true, features = ["tui"], optional = true }
 bcode_session_models = { workspace = true, optional = true }
@@ -48,6 +49,7 @@ libc = { workspace = true, optional = true }
 default = ["native"]
 fail-on-warnings = []
 native = [
+    "dep:bcode_confined_fs",
     "dep:bcode_plugin_sdk",
     "dep:bcode_session_models",
     "dep:bcode_tool",

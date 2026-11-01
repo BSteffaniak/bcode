@@ -3,6 +3,8 @@
 use std::io::{Read as _, Write as _};
 use std::path::Path;
 
+use bcode_confined_fs::{Creation, Dir, OpenOptions, RenameMode};
+
 #[cfg(feature = "simulation")]
 pub mod simulation;
 
@@ -147,20 +149,28 @@ impl AuthRefreshIntent {
     }
 }
 
-/// An exclusively owned Unix custody directory containing only encrypted vault data.
+/// An exclusively owned private custody directory containing only encrypted vault data.
 ///
 /// Callers must control the directory's ancestors and exclude hostile same-user filesystem
 /// mutation. The retained directory and lock confine operations after acquisition. This is
 /// not an import API: ordinary sshenv files are rejected, never converted or overwritten.
-#[cfg(unix)]
 #[derive(Debug)]
 pub struct CredentialCustodyStorage {
-    directory: std::fs::File,
+    directory: Dir,
     _lock: std::fs::File,
     refresh_poisoned: std::cell::Cell<bool>,
 }
 
-#[cfg(unix)]
+const OWNER_LOCK: &str = "owner.lock";
+const PENDING: &str = "pending";
+const CUSTODY: &str = "custody";
+const PROVISIONING: &str = "provisioning-v1";
+const REFRESH: &str = "refresh-v1";
+
+fn entry(name: &str) -> &std::ffi::OsStr {
+    std::ffi::OsStr::new(name)
+}
+
 impl CredentialCustodyStorage {
     /// Acquire an existing private custody directory without repair or initialization.
     ///
@@ -178,22 +188,16 @@ impl CredentialCustodyStorage {
     /// Rejects existing/relative paths or invalid vault bytes. Failed initialization is
     /// preserved for explicit maintenance, not silently retried.
     pub fn create(path: &Path, ciphertext: &[u8]) -> Result<Self, CustodyStorageError> {
-        use std::os::unix::fs::DirBuilderExt as _;
         validate(ciphertext)?;
         if !path.is_absolute() {
             return Err(CustodyStorageError::Ownership);
         }
-        std::fs::DirBuilder::new()
-            .mode(0o700)
-            .create(path)
-            .map_err(CustodyStorageError::Io)?;
+        bcode_confined_fs::create_private_dir(path).map_err(CustodyStorageError::Io)?;
         let store = Self::acquire(path, true)?;
         store.publish(ciphertext)?;
         // The directory entry itself must survive a crash before remote enrollment is admitted.
         let parent = path.parent().ok_or(CustodyStorageError::Ownership)?;
-        std::fs::File::open(parent)
-            .and_then(|directory| directory.sync_all())
-            .map_err(CustodyStorageError::Io)?;
+        bcode_confined_fs::sync_directory_path(parent).map_err(CustodyStorageError::Io)?;
         Ok(store)
     }
 
@@ -203,7 +207,6 @@ impl CredentialCustodyStorage {
     /// No vault conversion or credential materialization is performed by this coordinator.
     /// Errors preserve existing state for explicit maintenance.
     pub(crate) fn native_coordinator(vault: &Path) -> Result<Self, CustodyStorageError> {
-        use std::os::unix::fs::DirBuilderExt as _;
         if !vault.is_absolute()
             || std::fs::symlink_metadata(vault)
                 .map_err(CustodyStorageError::Io)?
@@ -215,16 +218,14 @@ impl CredentialCustodyStorage {
         let mut name = vault.as_os_str().to_os_string();
         name.push(".refresh");
         let path = std::path::PathBuf::from(name);
-        match std::fs::DirBuilder::new().mode(0o700).create(&path) {
+        match bcode_confined_fs::create_private_dir(&path) {
             Ok(()) => {
                 let store = Self::acquire(&path, true)?;
-                store
-                    .directory
-                    .sync_all()
-                    .map_err(CustodyStorageError::Io)?;
-                std::fs::File::open(path.parent().ok_or(CustodyStorageError::Ownership)?)
-                    .and_then(|parent| parent.sync_all())
-                    .map_err(CustodyStorageError::Io)?;
+                store.directory.sync().map_err(CustodyStorageError::Io)?;
+                bcode_confined_fs::sync_directory_path(
+                    path.parent().ok_or(CustodyStorageError::Ownership)?,
+                )
+                .map_err(CustodyStorageError::Io)?;
                 Ok(store)
             }
             Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
@@ -235,43 +236,62 @@ impl CredentialCustodyStorage {
     }
 
     fn acquire(path: &Path, create: bool) -> Result<Self, CustodyStorageError> {
-        use std::os::unix::fs::{MetadataExt as _, OpenOptionsExt as _};
         if !path.is_absolute() {
             return Err(CustodyStorageError::Ownership);
         }
-        let directory = std::fs::OpenOptions::new()
-            .read(true)
-            .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC)
-            .open(path)
-            .map_err(CustodyStorageError::Io)?;
-        let metadata = directory.metadata().map_err(CustodyStorageError::Io)?;
-        // SAFETY: geteuid has no preconditions.
-        if metadata.uid() != unsafe { libc::geteuid() } || metadata.mode() & 0o077 != 0 {
+        let directory = Dir::open(path).map_err(CustodyStorageError::Io)?;
+        if !directory.is_private().map_err(CustodyStorageError::Io)? {
             return Err(CustodyStorageError::Ownership);
         }
-        let lock = crate::store::open_owned_entry(
-            &directory,
-            c"owner.lock",
-            libc::O_RDWR
-                | if create {
-                    libc::O_CREAT | libc::O_EXCL
-                } else {
-                    0
-                },
-        )
-        .map_err(CustodyStorageError::Io)?;
+        let lock = directory
+            .open_file(
+                entry(OWNER_LOCK),
+                OpenOptions::new()
+                    .read(true)
+                    .write(true)
+                    .private(true)
+                    .creation(if create {
+                        Creation::New
+                    } else {
+                        Creation::Existing
+                    }),
+            )
+            .map_err(CustodyStorageError::Io)?;
         lock.try_lock()
             .map_err(|_| CustodyStorageError::Ownership)?;
-        // A pending publication cannot be guessed to have succeeded or failed.
-        match crate::store::open_owned_entry(&directory, c"pending", libc::O_RDONLY) {
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-            _ => return Err(CustodyStorageError::MaintenanceRequired),
-        }
-        Ok(Self {
+        let store = Self {
             directory,
             _lock: lock,
             refresh_poisoned: std::cell::Cell::new(false),
-        })
+        };
+        // A pending publication cannot be guessed to have succeeded or failed.
+        store.ensure_absent(PENDING)?;
+        Ok(store)
+    }
+
+    fn open_entry(&self, name: &str) -> std::io::Result<std::fs::File> {
+        self.directory
+            .open_file(entry(name), OpenOptions::new().read(true))
+    }
+
+    fn create_entry(&self, name: &str) -> Result<std::fs::File, CustodyStorageError> {
+        self.directory
+            .open_file(
+                entry(name),
+                OpenOptions::new()
+                    .write(true)
+                    .private(true)
+                    .creation(Creation::New),
+            )
+            .map_err(CustodyStorageError::Io)
+    }
+
+    /// Only a definitively missing marker is absent; any other observation is ambiguous.
+    fn ensure_absent(&self, name: &str) -> Result<(), CustodyStorageError> {
+        match self.open_entry(name) {
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            _ => Err(CustodyStorageError::MaintenanceRequired),
+        }
     }
 
     /// Read bounded encrypted vault bytes; never unlock, repair, or select another location.
@@ -282,12 +302,8 @@ impl CredentialCustodyStorage {
         if self.refresh_poisoned.get() {
             return Err(CustodyStorageError::MaintenanceRequired);
         }
-        match crate::store::open_owned_entry(&self.directory, c"pending", libc::O_RDONLY) {
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-            _ => return Err(CustodyStorageError::MaintenanceRequired),
-        }
-        let file = crate::store::open_owned_entry(&self.directory, c"custody", libc::O_RDONLY)
-            .map_err(CustodyStorageError::Io)?;
+        self.ensure_absent(PENDING)?;
+        let file = self.open_entry(CUSTODY).map_err(CustodyStorageError::Io)?;
         let mut bytes = Vec::new();
         file.take((MAX_BYTES + MAGIC.len() + 1) as u64)
             .read_to_end(&mut bytes)
@@ -318,10 +334,7 @@ impl CredentialCustodyStorage {
 
     /// Reject unresolved external provisioning before any further credential mutation.
     pub(crate) fn ensure_no_provisioning(&self) -> Result<(), CustodyStorageError> {
-        match crate::store::open_owned_entry(&self.directory, c"provisioning-v1", libc::O_RDONLY) {
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
-            _ => Err(CustodyStorageError::MaintenanceRequired),
-        }
+        self.ensure_absent(PROVISIONING)
     }
 
     /// Durably fence external provisioning before dispatch. Any failure preserves the fence.
@@ -339,26 +352,21 @@ impl CredentialCustodyStorage {
         {
             return Err(CustodyStorageError::MaintenanceRequired);
         }
-        let mut intent = crate::store::open_owned_entry(
-            &self.directory,
-            c"provisioning-v1",
-            libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL,
-        )
-        .map_err(CustodyStorageError::Io)?;
+        let mut intent = self.create_entry(PROVISIONING)?;
         intent
             .write_all(&bytes)
             .and_then(|()| intent.sync_all())
             .map_err(CustodyStorageError::Io)?;
-        self.directory.sync_all().map_err(CustodyStorageError::Io)
+        self.directory.sync().map_err(CustodyStorageError::Io)
     }
 
     /// Read a bounded current-format intent; legacy markers are never guessed.
     pub(crate) fn provisioning_intent(
         &self,
     ) -> Result<crate::operations::AuthProvisioningIntent, CustodyStorageError> {
-        let file =
-            crate::store::open_owned_entry(&self.directory, c"provisioning-v1", libc::O_RDONLY)
-                .map_err(CustodyStorageError::Io)?;
+        let file = self
+            .open_entry(PROVISIONING)
+            .map_err(CustodyStorageError::Io)?;
         let mut bytes = Vec::new();
         file.take(65537)
             .read_to_end(&mut bytes)
@@ -376,46 +384,33 @@ impl CredentialCustodyStorage {
 
     /// Clear the fence only after verified factor binding and durable custody publication.
     pub(crate) fn finish_provisioning(&self) -> Result<(), CustodyStorageError> {
-        use std::os::fd::AsRawFd as _;
-        // SAFETY: the static relative name and retained directory descriptor are valid.
-        if unsafe { libc::unlinkat(self.directory.as_raw_fd(), c"provisioning-v1".as_ptr(), 0) }
-            != 0
-        {
-            return Err(CustodyStorageError::Io(std::io::Error::last_os_error()));
-        }
-        self.directory.sync_all().map_err(CustodyStorageError::Io)
+        self.directory
+            .remove_file(entry(PROVISIONING))
+            .map_err(CustodyStorageError::Io)?;
+        self.directory.sync().map_err(CustodyStorageError::Io)
     }
 
     fn publish(&self, ciphertext: &[u8]) -> Result<(), CustodyStorageError> {
-        use std::os::fd::AsRawFd as _;
-        let mut pending = crate::store::open_owned_entry(
-            &self.directory,
-            c"pending",
-            libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL,
-        )
-        .map_err(CustodyStorageError::Io)?;
+        let mut pending = self.create_entry(PENDING)?;
         pending
             .write_all(MAGIC)
             .and_then(|()| pending.write_all(ciphertext))
             .and_then(|()| pending.sync_all())
             .map_err(CustodyStorageError::Io)?;
-        // SAFETY: both static C names are relative to the live retained directory descriptor.
-        if unsafe {
-            libc::renameat(
-                self.directory.as_raw_fd(),
-                c"pending".as_ptr(),
-                self.directory.as_raw_fd(),
-                c"custody".as_ptr(),
+        // Windows cannot rename over a file that is still open without delete sharing.
+        drop(pending);
+        self.directory
+            .rename(
+                entry(PENDING),
+                &self.directory,
+                entry(CUSTODY),
+                RenameMode::Replace,
             )
-        } != 0
-        {
-            return Err(CustodyStorageError::Io(std::io::Error::last_os_error()));
-        }
-        self.directory.sync_all().map_err(CustodyStorageError::Io)
+            .map_err(CustodyStorageError::Io)?;
+        self.directory.sync().map_err(CustodyStorageError::Io)
     }
 }
 
-#[cfg(unix)]
 impl AuthCustodyStorage for CredentialCustodyStorage {
     fn read(&self) -> Result<Vec<u8>, CustodyStorageError> {
         Self::read(self)
@@ -450,10 +445,7 @@ impl AuthCustodyStorage for CredentialCustodyStorage {
         if self.refresh_poisoned.get() {
             return Err(CustodyStorageError::MaintenanceRequired);
         }
-        match crate::store::open_owned_entry(&self.directory, c"refresh-v1", libc::O_RDONLY) {
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
-            _ => Err(CustodyStorageError::MaintenanceRequired),
-        }
+        self.ensure_absent(REFRESH)
     }
 
     fn begin_refresh(&self, intent: &AuthRefreshIntent) -> Result<(), CustodyStorageError> {
@@ -462,23 +454,17 @@ impl AuthCustodyStorage for CredentialCustodyStorage {
         self.ensure_no_provisioning()?;
         let bytes =
             serde_json::to_vec(intent).map_err(|_| CustodyStorageError::MaintenanceRequired)?;
-        let mut file = crate::store::open_owned_entry(
-            &self.directory,
-            c"refresh-v1",
-            libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL,
-        )
-        .map_err(CustodyStorageError::Io)?;
+        let mut file = self.create_entry(REFRESH)?;
         file.write_all(&bytes).map_err(CustodyStorageError::Io)?;
         file.sync_all().map_err(CustodyStorageError::Io)?;
-        self.directory.sync_all().map_err(CustodyStorageError::Io)
+        self.directory.sync().map_err(CustodyStorageError::Io)
     }
 
     fn refresh_intent(&self) -> Result<AuthRefreshIntent, CustodyStorageError> {
         if self.refresh_poisoned.get() {
             return Err(CustodyStorageError::MaintenanceRequired);
         }
-        let file = crate::store::open_owned_entry(&self.directory, c"refresh-v1", libc::O_RDONLY)
-            .map_err(CustodyStorageError::Io)?;
+        let file = self.open_entry(REFRESH).map_err(CustodyStorageError::Io)?;
         let mut bytes = Vec::new();
         file.take(1025)
             .read_to_end(&mut bytes)
@@ -493,15 +479,13 @@ impl AuthCustodyStorage for CredentialCustodyStorage {
     }
 
     fn finish_refresh(&self, intent: &AuthRefreshIntent) -> Result<(), CustodyStorageError> {
-        use std::os::fd::AsRawFd as _;
         if self.refresh_intent()? != *intent {
             return Err(CustodyStorageError::Conflict);
         }
-        // SAFETY: the static relative name and retained directory descriptor are valid.
-        if unsafe { libc::unlinkat(self.directory.as_raw_fd(), c"refresh-v1".as_ptr(), 0) } != 0 {
-            return Err(CustodyStorageError::Io(std::io::Error::last_os_error()));
-        }
-        if let Err(error) = self.directory.sync_all() {
+        self.directory
+            .remove_file(entry(REFRESH))
+            .map_err(CustodyStorageError::Io)?;
+        if let Err(error) = self.directory.sync() {
             self.refresh_poisoned.set(true);
             return Err(CustodyStorageError::Io(error));
         }

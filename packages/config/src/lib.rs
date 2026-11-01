@@ -6239,13 +6239,8 @@ fn write_runtime_auth_subscriptions(
     let mut temporary = tempfile::NamedTempFile::new_in(parent).map_err(io_error)?;
     temporary.write_all(contents.as_bytes()).map_err(io_error)?;
     temporary.as_file().sync_all().map_err(io_error)?;
-    temporary
-        .persist(path)
-        .map_err(|error| io_error(error.error))?;
-    #[cfg(unix)]
-    fs::File::open(parent)
-        .and_then(|directory| directory.sync_all())
-        .map_err(io_error)?;
+    bcode_confined_fs::persist(temporary, path).map_err(io_error)?;
+    bcode_confined_fs::sync_directory_path(parent).map_err(io_error)?;
     Ok(())
 }
 

@@ -3922,7 +3922,7 @@ fn unix_socket_has_listener(path: &Path) -> bool {
     std::os::unix::net::UnixStream::connect(path).is_ok()
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 fn run_isolated_fork_fixture(test_name: &str) -> bool {
     const ENV: &str = "BCODE_ISOLATED_FORK_FIXTURE";
     if std::env::var(ENV).as_deref() == Ok(test_name) {

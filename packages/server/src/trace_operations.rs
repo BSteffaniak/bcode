@@ -28,6 +28,7 @@ pub enum ReadTraceBlobError {
     Unavailable,
     /// Referenced content no longer exists.
     #[error("retained trace content is missing")]
+    #[cfg_attr(not(unix), allow(dead_code))]
     Missing,
     /// Reference identity, confinement, byte count, hash or storage is damaged.
     #[error("retained trace content failed verification")]

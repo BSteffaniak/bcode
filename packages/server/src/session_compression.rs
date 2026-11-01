@@ -1,5 +1,5 @@
 //! Explicit page-based compression; shared session primitives retain execution authority.
-#[cfg(test)]
+#[cfg(all(test, any(target_os = "macos", target_os = "linux")))]
 mod tests;
 use super::ServerState;
 use bcode_session::artifact_storage::{

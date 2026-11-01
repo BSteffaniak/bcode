@@ -569,44 +569,19 @@ impl SessionStore {
     }
 }
 
-#[cfg(unix)]
 fn read_confined_manifest(root: &Path, session_id: SessionId) -> std::io::Result<Vec<u8>> {
+    use bcode_confined_fs::{Dir, EntryKind, OpenOptions};
+    use std::ffi::OsStr;
     use std::io::Read as _;
-    use std::os::fd::{AsRawFd as _, FromRawFd as _};
-    use std::os::unix::fs::MetadataExt as _;
-    fn child(
-        parent: &fs::File,
-        name: &std::ffi::CStr,
-        directory: bool,
-    ) -> std::io::Result<fs::File> {
-        // SAFETY: parent remains open and name is NUL-terminated; returned descriptor is owned.
-        let fd = unsafe {
-            libc::openat(
-                parent.as_raw_fd(),
-                name.as_ptr(),
-                libc::O_RDONLY
-                    | libc::O_NOFOLLOW
-                    | libc::O_NONBLOCK
-                    | libc::O_CLOEXEC
-                    | if directory { libc::O_DIRECTORY } else { 0 },
-            )
-        };
-        if fd < 0 {
-            return Err(std::io::Error::last_os_error());
-        }
-        // SAFETY: successful openat returned an owned descriptor.
-        Ok(unsafe { fs::File::from_raw_fd(fd) })
-    }
-    let root = fs::File::open(root)?;
-    let id = std::ffi::CString::new(session_id.to_string()).map_err(std::io::Error::other)?;
-    let directory = child(&root, &id, true)?;
-    let canonical = child(&directory, c"session.db", false)?;
-    if !canonical.metadata()?.is_file() && !canonical.metadata()?.is_dir() {
+    let root = Dir::open_following_links(root)?;
+    let directory = root.open_dir(OsStr::new(&session_id.to_string()))?;
+    let canonical = directory.metadata_at(OsStr::new("session.db"))?;
+    if !matches!(canonical.kind(), EntryKind::File | EntryKind::Directory) {
         return Err(std::io::Error::other("invalid canonical session path"));
     }
-    let manifest = child(&directory, c"manifest.json", false)?;
-    let metadata = manifest.metadata()?;
-    if !metadata.is_file() || metadata.nlink() != 1 {
+    let manifest =
+        directory.open_file(OsStr::new("manifest.json"), OpenOptions::new().read(true))?;
+    if bcode_confined_fs::file_metadata(&manifest)?.link_count() != 1 {
         return Err(std::io::Error::other("invalid catalog manifest file"));
     }
     let mut bytes = Vec::new();
@@ -617,14 +592,6 @@ fn read_confined_manifest(root: &Path, session_id: SessionId) -> std::io::Result
         ));
     }
     Ok(bytes)
-}
-
-#[cfg(not(unix))]
-fn read_confined_manifest(_root: &Path, _session_id: SessionId) -> std::io::Result<Vec<u8>> {
-    Err(std::io::Error::new(
-        std::io::ErrorKind::Unsupported,
-        "confined catalog manifest reads unavailable",
-    ))
 }
 
 #[cfg(test)]

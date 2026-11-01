@@ -182,8 +182,7 @@ impl PoolMigration {
             }
             // Sync each backup directory before publishing any replacement.
             if let Some(parent) = edit.path.parent() {
-                std::fs::File::open(parent)
-                    .and_then(|file| file.sync_all())
+                bcode_confined_fs::sync_directory_path(parent)
                     .map_err(|source| io(parent, source))?;
             }
         }

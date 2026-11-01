@@ -66,7 +66,7 @@ mod session_observation;
 pub mod xray_application;
 pub mod xray_bootstrap;
 mod xray_context;
-#[cfg(test)]
+#[cfg(all(test, unix))]
 mod xray_execution_acceptance_tests;
 mod xray_execution_application;
 mod xray_execution_watch;
@@ -31699,7 +31699,10 @@ fn bounded_dynamic_value(value: &str) -> String {
 }
 
 fn format_execution_environment() -> String {
-    let shell = std::env::var("SHELL")
+    // Windows command execution uses the system interpreter even when launched from a
+    // POSIX-like shell whose inherited SHELL would misdescribe it.
+    let shell_variable = if cfg!(windows) { "COMSPEC" } else { "SHELL" };
+    let shell = std::env::var(shell_variable)
         .ok()
         .and_then(|path| Path::new(&path).file_name()?.to_str().map(str::to_owned))
         .map_or_else(
@@ -77952,6 +77955,7 @@ event_symbol = "bcode_plugin_handle_event_v1"
         )));
     }
 
+    #[cfg(unix)]
     #[tokio::test]
     async fn canonical_server_batch_cancellation_persists_terminal_result() {
         let workspace = tempfile::tempdir().expect("canonical cancellation workspace");

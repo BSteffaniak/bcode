@@ -404,9 +404,8 @@ impl AuthStorage for NativeAuthStorage {
                 tempfile::NamedTempFile::new_in(&self.directory).map_err(AuthStoreError::Io)?;
             temporary.write_all(bytes).map_err(AuthStoreError::Io)?;
             temporary.as_file().sync_all().map_err(AuthStoreError::Io)?;
-            temporary
-                .persist(self.directory.join("state.json"))
-                .map_err(|error| AuthStoreError::Io(error.error))?;
+            bcode_confined_fs::persist(temporary, &self.directory.join("state.json"))
+                .map_err(AuthStoreError::Io)?;
             Ok(())
         }
     }

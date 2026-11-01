@@ -96,7 +96,10 @@ impl Fixture {
             #[cfg(unix)]
             std::os::unix::fs::symlink(plugins, root.join("xdg/bcode/plugins")).unwrap();
             #[cfg(not(unix))]
-            panic!("dynamic native plugin fixture requires Unix");
+            panic!(
+                "dynamic native plugin fixture requires Unix: {}",
+                plugins.display()
+            );
         }
         fs::write(root.join("config.toml"), CONFIG).unwrap();
         let state_id = bcode_config::runtime_scope_id(&root.join("state"), &root.join("xdg/bcode"));

@@ -24,7 +24,7 @@ use regex::Regex;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest as _, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
-use std::fs::{self, File, OpenOptions};
+use std::fs::{self, OpenOptions};
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, RwLock};
@@ -1427,9 +1427,7 @@ fn atomic_write(path: &Path, bytes: &[u8]) -> Result<(), ProviderError> {
         return Err(ProviderError::io(&error));
     }
     fs::rename(&temporary, path).map_err(|error| ProviderError::io(&error))?;
-    File::open(parent)
-        .and_then(|directory| directory.sync_all())
-        .map_err(|error| ProviderError::io(&error))
+    bcode_confined_fs::sync_directory_path(parent).map_err(|error| ProviderError::io(&error))
 }
 
 fn validate_root(root: &Path) -> Result<(), ProviderError> {

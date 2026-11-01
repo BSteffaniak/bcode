@@ -6,7 +6,6 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use zeroize::{Zeroize as _, Zeroizing};
 
-#[cfg(unix)]
 fn zeroize_vault_values(vault: &mut sshenv_vault::Vault) {
     for values in vault.profiles.profiles.values_mut() {
         for value in values.values_mut() {
@@ -15,7 +14,6 @@ fn zeroize_vault_values(vault: &mut sshenv_vault::Vault) {
     }
 }
 
-#[cfg(unix)]
 fn generate_custody_key(
     source: Option<&dyn crate::operations::AuthCustodyKeySource>,
 ) -> Result<sshenv_vault::DataKey, AuthVaultLifecycleError> {
@@ -254,7 +252,6 @@ impl<'a> AuthVaultLifecycle<'a> {
     /// Returns an error when the vault/profile cannot be read or declared ownership is invalid.
     /// Damaged state never causes reset, mutation, or fallback.
     pub fn read(&self) -> Result<BTreeMap<String, String>, AuthVaultLifecycleError> {
-        #[cfg(unix)]
         let _guard = crate::operations::refresh::native::read_guard(&self.vault_path())?;
         self.read_uncoordinated()
     }
@@ -319,7 +316,6 @@ impl<'a> AuthVaultLifecycle<'a> {
     ///
     /// # Errors
     /// Returns ownership mapping, custody storage, or unlock errors without changing storage.
-    #[cfg(unix)]
     pub fn read_from_custody(
         &self,
         custody: &dyn crate::custody_storage::AuthCustodyStorage,
@@ -329,7 +325,6 @@ impl<'a> AuthVaultLifecycle<'a> {
         self.read_from_custody_with_device(custody, identities, passphrase, None)
     }
 
-    #[cfg(unix)]
     pub(crate) fn read_from_custody_with_device(
         &self,
         custody: &dyn crate::custody_storage::AuthCustodyStorage,
@@ -423,7 +418,6 @@ impl<'a> AuthVaultLifecycle<'a> {
     ///
     /// # Errors
     /// Returns custody, credential mapping, or unlock failures without native fallback.
-    #[cfg(unix)]
     pub fn materialize_from_custody(
         &self,
         custody: &dyn crate::custody_storage::AuthCustodyStorage,
@@ -433,7 +427,6 @@ impl<'a> AuthVaultLifecycle<'a> {
         self.materialize_from_custody_with_device(custody, identities, passphrase, None)
     }
 
-    #[cfg(unix)]
     pub(crate) fn materialize_from_custody_with_device(
         &self,
         custody: &dyn crate::custody_storage::AuthCustodyStorage,
@@ -467,7 +460,6 @@ impl<'a> AuthVaultLifecycle<'a> {
     /// # Errors
     /// Rejects unsupported policy, invalid storage keys, unlock failure, or conflicting writes.
     /// A publication durability failure is uncertain and must not be blindly retried.
-    #[cfg(unix)]
     pub(crate) fn persist_to_custody(
         &self,
         custody: &mut dyn crate::custody_storage::AuthCustodyStorage,
@@ -570,7 +562,6 @@ impl<'a> AuthVaultLifecycle<'a> {
         Ok(diagnostics)
     }
 
-    #[cfg(unix)]
     fn begin_custody_provisioning(
         &self,
         custody: &dyn crate::custody_storage::AuthCustodyStorage,
@@ -621,7 +612,6 @@ impl<'a> AuthVaultLifecycle<'a> {
         Ok(None)
     }
 
-    #[cfg(unix)]
     fn apply_custody_changes(
         &self,
         vault: &mut sshenv_vault::Vault,
@@ -649,7 +639,6 @@ impl<'a> AuthVaultLifecycle<'a> {
 
     /// Validate the supported age-only enrollment policy before any remote effect.
     /// Existing factors are rejected, never removed or invoked.
-    #[cfg(unix)]
     pub(crate) fn validate_enrollment_custody(
         &self,
         custody: &dyn crate::custody_storage::AuthCustodyStorage,
@@ -705,7 +694,6 @@ impl<'a> AuthVaultLifecycle<'a> {
         Ok(())
     }
 
-    #[cfg(unix)]
     fn enforce_custody_policy(
         &self,
         vault: &mut sshenv_vault::Vault,
@@ -727,7 +715,6 @@ impl<'a> AuthVaultLifecycle<'a> {
         result
     }
 
-    #[cfg(unix)]
     fn validate_custody_changes(
         &self,
         changes: &BTreeMap<String, Option<String>>,
@@ -886,7 +873,6 @@ impl<'a> AuthVaultLifecycle<'a> {
         &self,
         changes: BTreeMap<String, Option<String>>,
     ) -> Result<Vec<crate::security::AuthSecurityDiagnostic>, AuthVaultLifecycleError> {
-        #[cfg(unix)]
         let _guard = {
             if !self.vault_path().exists() {
                 self.open_or_initialize_store()?;
@@ -1018,7 +1004,6 @@ impl<'a> AuthVaultLifecycle<'a> {
     /// Returns an error when the vault/profile cannot be read or the resulting profile cannot be
     /// written.
     pub fn delete(&self) -> Result<(), AuthVaultLifecycleError> {
-        #[cfg(unix)]
         let _guard = crate::operations::refresh::native::read_guard(&self.vault_path())?;
         let vault = self.vault_path();
         if !vault.exists() {
@@ -1224,7 +1209,6 @@ mod tests {
         }
     }
 
-    #[cfg(unix)]
     #[cfg(not(feature = "custody-simulation"))]
     struct RefreshFixture {
         root: tempfile::TempDir,
@@ -1235,7 +1219,6 @@ mod tests {
         retained: crate::operations::RetainedAuthRequestCustody,
     }
 
-    #[cfg(unix)]
     #[cfg(not(feature = "custody-simulation"))]
     fn refresh_fixture() -> RefreshFixture {
         use crate::operations::RetainedAuthRequestCustody;
@@ -1295,7 +1278,6 @@ mod tests {
     }
 
     #[test]
-    #[cfg(unix)]
     #[cfg(not(feature = "custody-simulation"))]
     fn native_refresh_fences_reads_and_writes_and_preserves_complete_rotation() {
         use crate::operations::refresh::{RefreshOperation, native};
@@ -1395,7 +1377,6 @@ mod tests {
     }
 
     #[test]
-    #[cfg(unix)]
     #[cfg(not(feature = "custody-simulation"))]
     fn refresh_serializes_and_commits_complete_records() {
         use crate::operations::{AuthCredentialCustody as _, AuthRequestCustody as _};
@@ -1468,7 +1449,6 @@ mod tests {
     }
 
     #[test]
-    #[cfg(unix)]
     #[cfg(not(feature = "custody-simulation"))]
     fn unresolved_refresh_requires_owned_reenrollment() {
         use crate::operations::{
@@ -1910,7 +1890,6 @@ mod tests {
     }
 
     #[test]
-    #[cfg(unix)]
     #[cfg(not(feature = "custody-simulation"))]
     fn retained_policy_rejects_unprovisioned_required_and_preferred() {
         let root = tempfile::tempdir().unwrap();
@@ -2022,7 +2001,6 @@ mod tests {
     }
 
     #[test]
-    #[cfg(unix)]
     #[cfg(not(feature = "custody-simulation"))]
     fn provisioned_factor_must_be_retrievable_before_policy_changes() {
         struct MismatchedDevice;
@@ -2088,10 +2066,9 @@ mod tests {
         }
     }
 
-    #[cfg(unix)]
     #[cfg(not(feature = "custody-simulation"))]
     struct UnavailableDevice(std::sync::atomic::AtomicUsize);
-    #[cfg(unix)]
+
     #[cfg(not(feature = "custody-simulation"))]
     impl crate::operations::AuthDeviceFactorSource for UnavailableDevice {
         fn provisioning_identity(
@@ -2142,7 +2119,6 @@ mod tests {
     }
 
     #[test]
-    #[cfg(unix)]
     #[cfg(not(feature = "custody-simulation"))]
     fn selected_key_source_failure_preserves_ciphertext_and_retry_uses_source() {
         use crate::operations::{AuthCredentialCustody as _, AuthRequestCustody as _};
@@ -2240,7 +2216,6 @@ mod tests {
         );
     }
 
-    #[cfg(unix)]
     #[cfg(not(feature = "custody-simulation"))]
     fn selected_test_storage(
         custody: crate::custody_storage::CredentialCustodyStorage,
@@ -2261,7 +2236,6 @@ mod tests {
     }
 
     #[test]
-    #[cfg(unix)]
     #[cfg(not(feature = "custody-simulation"))]
     fn retained_custody_reads_canonical_credentials_without_native_fallback() {
         use crate::operations::{AuthCredentialCustody as _, AuthRequestCustody as _};

@@ -113,12 +113,8 @@ impl DocumentStore {
         let mut temporary = tempfile::NamedTempFile::new_in(&root)?;
         temporary.write_all(&bytes)?;
         temporary.as_file().sync_all()?;
-        temporary
-            .persist(destination)
-            .map_err(|error| Error::Io(error.error))?;
-        File::open(&root)
-            .and_then(|directory| directory.sync_all())
-            .map_err(Error::DurabilityUncertain)?;
+        bcode_confined_fs::persist(temporary, &destination).map_err(Error::Io)?;
+        bcode_confined_fs::sync_directory_path(&root).map_err(Error::DurabilityUncertain)?;
         Ok(())
     }
 

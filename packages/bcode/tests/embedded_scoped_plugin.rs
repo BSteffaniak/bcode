@@ -168,6 +168,7 @@ impl ToolAuthorizationCoordinator for AllowAuthorization {
     }
 }
 
+#[cfg(unix)]
 fn shell_definition() -> ToolDefinition {
     ToolDefinition {
         name: "shell.run".to_string(),
@@ -176,6 +177,7 @@ fn shell_definition() -> ToolDefinition {
     }
 }
 
+#[cfg(unix)]
 fn static_shell_runtime() -> bcode_plugin::PluginRuntimeHost {
     let bundled = [bcode_plugin::StaticBundledPlugin::new(
         include_str!("../../../plugins/shell-plugin/bcode-plugin.toml"),
@@ -192,6 +194,7 @@ fn static_shell_runtime() -> bcode_plugin::PluginRuntimeHost {
     )
 }
 
+#[cfg(unix)]
 fn dynamic_shell_runtime() -> bcode_plugin::PluginRuntimeHost {
     dynamic_plugin_runtime("shell", "bcode.shell")
 }
@@ -592,6 +595,7 @@ async fn embedded_filesystem_active_cancellation_preserves_committed_outcome() {
     assert_eq!(std::fs::read_dir(directory.path()).unwrap().count(), 2);
 }
 
+#[cfg(unix)]
 async fn assert_direct_batch_overlaps() {
     let barrier = Arc::new(tokio::sync::Barrier::new(2));
     let handler_barrier = Arc::clone(&barrier);
@@ -635,6 +639,7 @@ async fn assert_direct_batch_overlaps() {
     assert!(output.results.iter().all(Result::is_ok));
 }
 
+#[cfg(unix)]
 #[derive(Debug)]
 struct FutureRemoteInvoker {
     admission: Option<Arc<tokio::sync::Semaphore>>,
@@ -642,6 +647,7 @@ struct FutureRemoteInvoker {
     maximum: AtomicUsize,
 }
 
+#[cfg(unix)]
 impl FutureRemoteInvoker {
     fn concurrent() -> Arc<Self> {
         Arc::new(Self {
@@ -664,6 +670,7 @@ impl FutureRemoteInvoker {
     }
 }
 
+#[cfg(unix)]
 impl ToolInvoker for FutureRemoteInvoker {
     fn prepare_tool<'a>(
         &'a self,
@@ -705,6 +712,7 @@ impl ToolInvoker for FutureRemoteInvoker {
     }
 }
 
+#[cfg(unix)]
 async fn assert_future_remote_batch_semantics(invoker: Arc<FutureRemoteInvoker>, maximum: usize) {
     let calls = [
         ToolCall {
@@ -745,6 +753,7 @@ async fn assert_future_remote_batch_semantics(invoker: Arc<FutureRemoteInvoker>,
     );
 }
 
+#[cfg(unix)]
 async fn assert_reentrant_shell_batch_overlaps(plugins: bcode_plugin::PluginRuntimeHost) {
     let workspace = tempfile::tempdir().expect("shell overlap workspace");
     let calls = (0..2)

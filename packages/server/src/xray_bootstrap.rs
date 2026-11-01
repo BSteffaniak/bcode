@@ -2,6 +2,7 @@
 //! Bearer bytes exist only in a private credential file and the HTTP access constructor.
 
 use std::collections::{BTreeMap, BTreeSet};
+#[cfg(unix)]
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::Ordering;

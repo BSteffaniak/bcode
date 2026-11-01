@@ -57,9 +57,7 @@ fn deserialize_targets<'de, D: serde::Deserializer<'de>>(
                 {
                     return Err(serde::de::Error::custom("invalid prepared target path"));
                 }
-                if !paths.insert(target.path.clone())
-                    || !identities.insert((target.device, target.inode))
-                {
+                if !paths.insert(target.path.clone()) || !identities.insert(target.identity()) {
                     return Err(serde::de::Error::custom("duplicate prepared target"));
                 }
                 targets.push(target);
@@ -86,14 +84,65 @@ fn deserialize_version<'de, D: serde::Deserializer<'de>>(deserializer: D) -> Res
 }
 
 /// Canonical target identity captured from a no-follow open during preparation.
+///
+/// File IDs are split into 64-bit halves. High halves are nonzero only for 128-bit IDs
+/// (such as Windows `ReFS`) and are omitted otherwise, preserving the established encoding.
 #[derive(Debug, serde::Serialize, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct PreparedTarget {
     pub path: PathBuf,
     pub device: u64,
     pub inode: u64,
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub inode_high: u64,
     pub parent_device: u64,
     pub parent_inode: u64,
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub parent_inode_high: u64,
+}
+
+#[allow(
+    clippy::trivially_copy_pass_by_ref,
+    reason = "serde skip predicates receive field references"
+)]
+const fn is_zero(value: &u64) -> bool {
+    *value == 0
+}
+
+/// Volume and 128-bit file ID of one object.
+type Identity = (u64, u64, u64);
+
+#[allow(
+    clippy::cast_possible_truncation,
+    reason = "splits a 128-bit file ID exactly into its 64-bit halves"
+)]
+const fn identity_of(metadata: &bcode_confined_fs::Metadata) -> Identity {
+    let identity = metadata.identity();
+    let file = identity.file();
+    (identity.volume(), file as u64, (file >> 64) as u64)
+}
+
+impl PreparedTarget {
+    const fn identity(&self) -> Identity {
+        (self.device, self.inode, self.inode_high)
+    }
+
+    const fn parent_identity(&self) -> Identity {
+        (
+            self.parent_device,
+            self.parent_inode,
+            self.parent_inode_high,
+        )
+    }
+
+    /// Whether `file` and `parent` are exactly the prepared objects.
+    fn matches(
+        &self,
+        file: &bcode_confined_fs::Metadata,
+        parent: &bcode_confined_fs::Metadata,
+    ) -> bool {
+        identity_of(file) == self.identity() && identity_of(parent) == self.parent_identity()
+    }
 }
 
 /// Validate the already-decoded request before resolving any target paths.
@@ -129,7 +178,7 @@ pub fn prepare(arguments: &Value, root: Option<&Path>) -> Result<PreparedBatch, 
         }
         let target =
             validate_target(&canonical).map_err(|error| format!("file {}: {error}", index + 1))?;
-        if !identities.insert((target.device, target.inode)) {
+        if !identities.insert(target.identity()) {
             return Err(format!("file {}: duplicate file identity", index + 1));
         }
         paths.push(target);
@@ -165,13 +214,13 @@ fn request_digest(arguments: &Value) -> [u8; 32] {
 
 /// Verify request binding and reopen prepared identities without mutating files.
 /// Publication must still recheck identities and snapshots under coordination.
-#[cfg(all(test, unix))]
+#[cfg(test)]
 pub fn verify(arguments: &Value, descriptor: &PreparedBatch) -> Result<(), String> {
     verify_cancellable(arguments, descriptor, &|| false)
 }
 
 /// Screen a batch while observing cancellation between bounded read chunks.
-#[cfg(all(test, unix))]
+#[cfg(test)]
 pub fn verify_cancellable(
     arguments: &Value,
     descriptor: &PreparedBatch,
@@ -202,10 +251,8 @@ fn collect_snapshots(
     for (index, target) in descriptor.targets.iter().enumerate() {
         let current = validate_target(&target.path)
             .map_err(|error| format!("file {}: {error}", index + 1))?;
-        if current.device != target.device
-            || current.inode != target.inode
-            || current.parent_device != target.parent_device
-            || current.parent_inode != target.parent_inode
+        if current.identity() != target.identity()
+            || current.parent_identity() != target.parent_identity()
         {
             return Err(format!(
                 "file {}: prepared target identity changed",
@@ -233,7 +280,7 @@ fn collect_snapshots(
 
 /// Execute an authorized batch while the caller holds mutation coordination.
 /// Validation failures publish nothing; later failures never undo prior commits.
-#[cfg(all(test, unix))]
+#[cfg(test)]
 pub fn execute(
     arguments: &Value,
     descriptor: &PreparedBatch,
@@ -250,11 +297,11 @@ pub fn execute_with_changes(
     cancelled: &impl Fn() -> bool,
     retain: &mut impl FnMut(usize, &str, &str) -> Value,
 ) -> Result<Value, String> {
-    let snapshots = collect_snapshots(arguments, descriptor, cancelled)?;
+    let mut snapshots = collect_snapshots(arguments, descriptor, cancelled)?;
     let mut stopped = false;
     let mut outcomes = Vec::with_capacity(snapshots.len());
     let mut change_bytes_remaining = 64 * 1024;
-    for (index, (snapshot, target)) in snapshots.iter().zip(&descriptor.targets).enumerate() {
+    for (index, (snapshot, target)) in snapshots.iter_mut().zip(&descriptor.targets).enumerate() {
         let (status, error) = if stopped {
             ("not_attempted", None)
         } else if cancelled() {
@@ -262,10 +309,8 @@ pub fn execute_with_changes(
             ("cancelled", None)
         } else {
             match snapshot.publish(target, cancelled) {
-                #[cfg(unix)]
                 Ok(PublicationOutcome::Committed) => ("committed", None),
                 Ok(PublicationOutcome::Unchanged) => ("unchanged", None),
-                #[cfg(unix)]
                 Ok(PublicationOutcome::Unknown(error)) => {
                     stopped = true;
                     ("unknown", Some(error))
@@ -417,43 +462,54 @@ fn check_cancelled(cancelled: &impl Fn() -> bool) -> Result<(), String> {
 struct Snapshot {
     source: String,
     output: String,
-    #[cfg(unix)]
-    parent: std::fs::File,
-    #[cfg(unix)]
-    file: std::fs::File,
-    #[cfg(unix)]
+    parent: bcode_confined_fs::Dir,
+    /// Released immediately before publication; see `Snapshot::publish`.
+    file: Option<std::fs::File>,
     permissions: std::fs::Permissions,
-    #[cfg(unix)]
     metadata: std::fs::Metadata,
 }
 
-#[cfg(unix)]
+/// Whether file metadata observed through one handle is unchanged. Identity and link
+/// counts are compared separately through confined metadata.
 fn metadata_unchanged(before: &std::fs::Metadata, after: &std::fs::Metadata) -> bool {
-    use std::os::unix::fs::MetadataExt as _;
-    before.dev() == after.dev()
-        && before.ino() == after.ino()
-        && before.size() == after.size()
-        && before.mode() == after.mode()
-        && before.uid() == after.uid()
-        && before.gid() == after.gid()
-        && before.nlink() == after.nlink()
-        && before.mtime() == after.mtime()
-        && before.mtime_nsec() == after.mtime_nsec()
-        && before.ctime() == after.ctime()
-        && before.ctime_nsec() == after.ctime_nsec()
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt as _;
+        before.dev() == after.dev()
+            && before.ino() == after.ino()
+            && before.size() == after.size()
+            && before.mode() == after.mode()
+            && before.uid() == after.uid()
+            && before.gid() == after.gid()
+            && before.nlink() == after.nlink()
+            && before.mtime() == after.mtime()
+            && before.mtime_nsec() == after.mtime_nsec()
+            && before.ctime() == after.ctime()
+            && before.ctime_nsec() == after.ctime_nsec()
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::MetadataExt as _;
+        before.file_size() == after.file_size()
+            && before.file_attributes() == after.file_attributes()
+            && before.creation_time() == after.creation_time()
+            && before.last_write_time() == after.last_write_time()
+    }
+}
+
+fn confined_metadata(file: &std::fs::File) -> Result<bcode_confined_fs::Metadata, String> {
+    bcode_confined_fs::file_metadata(file).map_err(|error| error.to_string())
 }
 
 enum PublicationOutcome {
     Unchanged,
-    #[cfg(unix)]
     Committed,
-    #[cfg(unix)]
     Unknown(String),
 }
 
 impl Snapshot {
     fn publish(
-        &self,
+        &mut self,
         target: &PreparedTarget,
         cancelled: &impl Fn() -> bool,
     ) -> Result<PublicationOutcome, String> {
@@ -461,32 +517,31 @@ impl Snapshot {
         if self.source == self.output {
             return Ok(PublicationOutcome::Unchanged);
         }
-        #[cfg(unix)]
-        {
-            let staged = super::confined::StagedFile::create(
-                &self.parent,
+        let staged = super::confined::StagedFile::create(
+            &self.parent,
+            self.output.as_bytes(),
+            self.permissions.clone(),
+            cancelled,
+        )
+        .map_err(|error| error.to_string())?;
+        self.recheck(target, cancelled)?;
+        // Windows cannot replace a file this process holds open unless the volume supports
+        // POSIX rename semantics, which FAT, exFAT, and many network shares do not. The
+        // identity was verified immediately above and the rename replaces the name anyway.
+        self.file = None;
+        let publication = staged
+            .publish(
+                target.path.file_name().ok_or("missing target name")?,
                 self.output.as_bytes(),
-                self.permissions.clone(),
                 cancelled,
             )
             .map_err(|error| error.to_string())?;
-            self.recheck(target, cancelled)?;
-            let publication = staged
-                .publish(
-                    target.path.file_name().ok_or("missing target name")?,
-                    self.output.as_bytes(),
-                    cancelled,
-                )
-                .map_err(|error| error.to_string())?;
-            Ok(match publication {
-                super::confined::Publication::Committed => PublicationOutcome::Committed,
-                super::confined::Publication::Unknown(error) => PublicationOutcome::Unknown(
-                    format!("publication outcome unknown; inspect target before retrying: {error}"),
-                ),
-            })
-        }
-        #[cfg(not(unix))]
-        Err("multi-edit publication unsupported on this platform".to_owned())
+        Ok(match publication {
+            super::confined::Publication::Committed => PublicationOutcome::Committed,
+            super::confined::Publication::Unknown(error) => PublicationOutcome::Unknown(format!(
+                "publication outcome unknown; inspect target before retrying: {error}"
+            )),
+        })
     }
 
     fn recheck(
@@ -494,75 +549,66 @@ impl Snapshot {
         target: &PreparedTarget,
         cancelled: &impl Fn() -> bool,
     ) -> Result<(), String> {
+        use std::io::Read as _;
         check_cancelled(cancelled)?;
-        #[cfg(unix)]
+        let current = validate_target(&target.path)?;
+        let parent = self.parent.metadata().map_err(|error| error.to_string())?;
+        let snapshot_file = self.file.as_ref().ok_or("snapshot was already published")?;
+        let file = confined_metadata(snapshot_file)?;
+        if !current.matches(&file, &parent) || file.link_count() != 1 {
+            return Err("snapshot identity changed".to_owned());
+        }
+        let file_permissions = snapshot_file
+            .metadata()
+            .map_err(|error| error.to_string())?
+            .permissions();
+        if file_permissions != self.permissions {
+            return Err("snapshot permissions changed".to_owned());
+        }
+        let (reopened_parent, reopened) =
+            super::confined::open_target(&target.path).map_err(|error| error.to_string())?;
+        let reopened_parent = reopened_parent
+            .metadata()
+            .map_err(|error| error.to_string())?;
+        let metadata = confined_metadata(&reopened)?;
+        if metadata.identity() != file.identity()
+            || reopened_parent.identity() != parent.identity()
+            || metadata.link_count() != 1
         {
-            use std::io::Read as _;
-            use std::os::unix::fs::MetadataExt as _;
-            let current = validate_target(&target.path)?;
-            let parent = self.parent.metadata().map_err(|error| error.to_string())?;
-            let file = self.file.metadata().map_err(|error| error.to_string())?;
-            if current.device != file.dev()
-                || current.inode != file.ino()
-                || current.parent_device != parent.dev()
-                || current.parent_inode != parent.ino()
-                || file.nlink() != 1
-            {
-                return Err("snapshot identity changed".to_owned());
+            return Err("snapshot identity changed".to_owned());
+        }
+        let mut reader = reopened.take(self.source.len() as u64 + 1);
+        let mut chunk = [0u8; 8192];
+        let mut offset = 0;
+        loop {
+            check_cancelled(cancelled)?;
+            let count = reader.read(&mut chunk).map_err(|error| error.to_string())?;
+            if count == 0 {
+                break;
             }
-            if file.permissions() != self.permissions {
-                return Err("snapshot permissions changed".to_owned());
-            }
-            let (reopened_parent, reopened) =
-                super::confined::open_target(&target.path).map_err(|error| error.to_string())?;
-            let reopened_parent = reopened_parent
-                .metadata()
-                .map_err(|error| error.to_string())?;
-            let metadata = reopened.metadata().map_err(|error| error.to_string())?;
-            if metadata.dev() != file.dev()
-                || metadata.ino() != file.ino()
-                || reopened_parent.dev() != parent.dev()
-                || reopened_parent.ino() != parent.ino()
-                || metadata.nlink() != 1
-            {
-                return Err("snapshot identity changed".to_owned());
-            }
-            let mut reader = reopened.take(self.source.len() as u64 + 1);
-            let mut chunk = [0u8; 8192];
-            let mut offset = 0;
-            loop {
-                check_cancelled(cancelled)?;
-                let count = reader.read(&mut chunk).map_err(|error| error.to_string())?;
-                if count == 0 {
-                    break;
-                }
-                if self.source.as_bytes().get(offset..offset + count) != Some(&chunk[..count]) {
-                    return Err("snapshot content changed".to_owned());
-                }
-                offset += count;
-            }
-            if offset != self.source.len() {
+            if self.source.as_bytes().get(offset..offset + count) != Some(&chunk[..count]) {
                 return Err("snapshot content changed".to_owned());
             }
-            let after = reader
-                .get_ref()
-                .metadata()
-                .map_err(|error| error.to_string())?;
-            if after.permissions() != self.permissions || after.nlink() != 1 {
-                return Err("snapshot permissions or links changed".to_owned());
-            }
-            if !metadata_unchanged(&self.metadata, &after) {
-                return Err("snapshot metadata changed".to_owned());
-            }
-            // Retain replacement output alongside the source through the full recheck.
-            debug_assert!(self.output.len() <= 4 * 1024 * 1024);
-            Ok(())
+            offset += count;
         }
-        #[cfg(not(unix))]
+        if offset != self.source.len() {
+            return Err("snapshot content changed".to_owned());
+        }
+        let after = reader
+            .get_ref()
+            .metadata()
+            .map_err(|error| error.to_string())?;
+        if after.permissions() != self.permissions
+            || confined_metadata(reader.get_ref())?.link_count() != 1
         {
-            let _ = (self, target);
-            Err("snapshot recheck unsupported".to_owned())
+            return Err("snapshot permissions or links changed".to_owned());
         }
+        if !metadata_unchanged(&self.metadata, &after) {
+            return Err("snapshot metadata changed".to_owned());
+        }
+        // Retain replacement output alongside the source through the full recheck.
+        debug_assert!(self.output.len() <= 4 * 1024 * 1024);
+        Ok(())
     }
 }
 
@@ -573,128 +619,112 @@ fn validate_snapshot(
     remaining: &mut usize,
     cancelled: &impl Fn() -> bool,
 ) -> Result<Snapshot, String> {
-    #[cfg(unix)]
+    use std::io::Read as _;
+    const MAX_FILE_BYTES: usize = 4 * 1024 * 1024;
+    let (parent, handle) =
+        super::confined::open_target(&target.path).map_err(|error| error.to_string())?;
+    let metadata = handle.metadata().map_err(|error| error.to_string())?;
+    let confined = confined_metadata(&handle)?;
+    let parent_metadata = parent.metadata().map_err(|error| error.to_string())?;
+    if !metadata.is_file()
+        || confined.link_count() != 1
+        || !target.matches(&confined, &parent_metadata)
     {
-        use std::io::Read as _;
-        use std::os::unix::fs::MetadataExt as _;
-        const MAX_FILE_BYTES: usize = 4 * 1024 * 1024;
-        let (parent, handle) =
-            super::confined::open_target(&target.path).map_err(|error| error.to_string())?;
-        let metadata = handle.metadata().map_err(|error| error.to_string())?;
-        let parent_metadata = parent.metadata().map_err(|error| error.to_string())?;
-        if !metadata.is_file()
-            || metadata.nlink() != 1
-            || metadata.dev() != target.device
-            || metadata.ino() != target.inode
-            || parent_metadata.dev() != target.parent_device
-            || parent_metadata.ino() != target.parent_inode
-        {
-            return Err("prepared target identity changed".to_owned());
-        }
-        let limit = MAX_FILE_BYTES.min(*remaining);
-        let mut source = Vec::new();
-        let mut reader = handle.take(limit as u64 + 1);
-        let mut chunk = [0u8; 8 * 1024];
-        loop {
-            check_cancelled(cancelled)?;
-            let read = reader.read(&mut chunk).map_err(|error| error.to_string())?;
-            if read == 0 {
-                break;
-            }
-            let required = source.len() + read;
-            if required > source.capacity() {
-                source
-                    .try_reserve_exact(required - source.len())
-                    .map_err(|_| "cannot allocate bounded snapshot".to_owned())?;
-            }
-            if source.capacity() > limit + 1 {
-                return Err("snapshot allocation exceeds byte budget".to_owned());
-            }
-            source.extend_from_slice(&chunk[..read]);
-        }
-        let after = reader
-            .get_ref()
-            .metadata()
-            .map_err(|error| error.to_string())?;
-        if !metadata_unchanged(&metadata, &after) {
-            return Err("snapshot metadata changed during read".to_owned());
-        }
-        let source = String::from_utf8(source)
-            .map_err(|error| format!("cannot read UTF-8 snapshot: {error}"))?;
-        if source.len() > limit {
-            return Err("snapshot exceeds file or aggregate byte budget".to_owned());
-        }
-        *remaining = remaining
-            .checked_sub(source.capacity())
-            .ok_or("snapshot allocation exceeds aggregate byte budget")?;
-        let edits = file["edits"]
-            .as_array()
-            .expect("validated edits")
-            .iter()
-            .map(|edit| {
-                (
-                    edit["old_text"].as_str().expect("validated search"),
-                    edit["new_text"].as_str().expect("validated replacement"),
-                )
-            })
-            .collect::<Vec<_>>();
-        let (output, _) = super::replacement::replace_snapshot_cancellable(
-            &source,
-            &edits,
-            MAX_FILE_BYTES.min(*remaining),
-            false,
-            cancelled,
-        )?;
+        return Err("prepared target identity changed".to_owned());
+    }
+    let limit = MAX_FILE_BYTES.min(*remaining);
+    let mut source = Vec::new();
+    let mut reader = handle.take(limit as u64 + 1);
+    let mut chunk = [0u8; 8 * 1024];
+    loop {
         check_cancelled(cancelled)?;
-        *remaining = remaining
-            .checked_sub(output.capacity())
-            .ok_or("replacement allocation exceeds aggregate byte budget")?;
-        Ok(Snapshot {
-            source,
-            output,
-            parent,
-            file: reader.into_inner(),
-            permissions: metadata.permissions(),
-            metadata,
+        let read = reader.read(&mut chunk).map_err(|error| error.to_string())?;
+        if read == 0 {
+            break;
+        }
+        let required = source.len() + read;
+        if required > source.capacity() {
+            source
+                .try_reserve_exact(required - source.len())
+                .map_err(|_| "cannot allocate bounded snapshot".to_owned())?;
+        }
+        if source.capacity() > limit + 1 {
+            return Err("snapshot allocation exceeds byte budget".to_owned());
+        }
+        source.extend_from_slice(&chunk[..read]);
+    }
+    let after = reader
+        .get_ref()
+        .metadata()
+        .map_err(|error| error.to_string())?;
+    if !metadata_unchanged(&metadata, &after) {
+        return Err("snapshot metadata changed during read".to_owned());
+    }
+    let source = String::from_utf8(source)
+        .map_err(|error| format!("cannot read UTF-8 snapshot: {error}"))?;
+    if source.len() > limit {
+        return Err("snapshot exceeds file or aggregate byte budget".to_owned());
+    }
+    *remaining = remaining
+        .checked_sub(source.capacity())
+        .ok_or("snapshot allocation exceeds aggregate byte budget")?;
+    let edits = file["edits"]
+        .as_array()
+        .expect("validated edits")
+        .iter()
+        .map(|edit| {
+            (
+                edit["old_text"].as_str().expect("validated search"),
+                edit["new_text"].as_str().expect("validated replacement"),
+            )
         })
-    }
-    #[cfg(not(unix))]
-    {
-        let _ = (file, target, remaining, cancelled);
-        Err("multi-edit snapshots are unsupported on this platform".to_owned())
-    }
+        .collect::<Vec<_>>();
+    let (output, _) = super::replacement::replace_snapshot_cancellable(
+        &source,
+        &edits,
+        MAX_FILE_BYTES.min(*remaining),
+        false,
+        cancelled,
+    )?;
+    check_cancelled(cancelled)?;
+    *remaining = remaining
+        .checked_sub(output.capacity())
+        .ok_or("replacement allocation exceeds aggregate byte budget")?;
+    Ok(Snapshot {
+        source,
+        output,
+        parent,
+        file: Some(reader.into_inner()),
+        permissions: metadata.permissions(),
+        metadata,
+    })
 }
 
 // Preparation screens metadata through a no-follow handle. Execution must
 // independently reopen and compare authorized identities before publication.
 fn validate_target(path: &Path) -> Result<PreparedTarget, String> {
-    #[cfg(unix)]
     let (parent_metadata, metadata) = super::confined::open_target(path)
-        .and_then(|(parent, file)| Ok((parent.metadata()?, file.metadata()?)))
+        .and_then(|(parent, file)| {
+            Ok((parent.metadata()?, bcode_confined_fs::file_metadata(&file)?))
+        })
         .map_err(|error| error.to_string())?;
-    #[cfg(not(unix))]
-    let metadata = std::fs::symlink_metadata(path).map_err(|error| error.to_string())?;
-    if !metadata.is_file() {
+    if metadata.kind() != bcode_confined_fs::EntryKind::File {
         return Err("multi-edit requires a regular file".to_owned());
     }
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::MetadataExt;
-        if metadata.nlink() != 1 {
-            return Err("multi-edit does not support hard-linked targets".to_owned());
-        }
-        Ok(PreparedTarget {
-            path: path.to_path_buf(),
-            device: metadata.dev(),
-            inode: metadata.ino(),
-            parent_device: parent_metadata.dev(),
-            parent_inode: parent_metadata.ino(),
-        })
+    if metadata.link_count() != 1 {
+        return Err("multi-edit does not support hard-linked targets".to_owned());
     }
-    #[cfg(not(unix))]
-    {
-        Err("multi-edit target identity checks are unsupported on this platform".to_owned())
-    }
+    let (device, inode, inode_high) = identity_of(&metadata);
+    let (parent_device, parent_inode, parent_inode_high) = identity_of(&parent_metadata);
+    Ok(PreparedTarget {
+        path: path.to_path_buf(),
+        device,
+        inode,
+        inode_high,
+        parent_device,
+        parent_inode,
+        parent_inode_high,
+    })
 }
 
 fn validate(arguments: &Value) -> Result<(), String> {
@@ -835,7 +865,6 @@ mod tests {
     }
 
     #[test]
-    #[cfg(unix)]
     fn omitted_committed_changes_retain_exact_sources_without_changing_outcome() {
         let root = crate::tests::temp_dir("batch-retained-change");
         let path = root.join("large");
@@ -866,7 +895,6 @@ mod tests {
         );
     }
 
-    #[cfg(unix)]
     #[test]
     fn execution_validates_whole_batch_and_accounts_for_commits_and_cancellation() {
         let root = crate::tests::temp_dir("batch-execution");
@@ -913,7 +941,6 @@ mod tests {
         std::fs::remove_dir(root).unwrap();
     }
 
-    #[cfg(unix)]
     #[test]
     fn stale_later_target_stops_batch_without_undoing_committed_files() {
         let root = crate::tests::temp_dir("batch-partial-stale");
@@ -981,7 +1008,6 @@ mod tests {
         })
     }
 
-    #[cfg(unix)]
     #[test]
     fn preparation_detects_parent_replacement_even_when_file_inode_is_preserved() {
         let root = crate::tests::temp_dir("batch-parent-identity");
@@ -1008,7 +1034,6 @@ mod tests {
         std::fs::remove_dir(root).unwrap();
     }
 
-    #[cfg(unix)]
     #[test]
     fn snapshot_rejects_mutation_during_initial_read() {
         let root = crate::tests::temp_dir("batch-read-race");
@@ -1049,7 +1074,6 @@ mod tests {
         std::fs::remove_dir(root).unwrap();
     }
 
-    #[cfg(unix)]
     #[test]
     fn snapshot_budget_accounts_for_retained_allocations() {
         let root = crate::tests::temp_dir("batch-allocation-budget");
@@ -1077,6 +1101,7 @@ mod tests {
             .is_err()
         );
         assert_eq!(std::fs::read_to_string(&path).unwrap(), "original");
+        drop(snapshot);
         std::fs::remove_file(path).unwrap();
         std::fs::remove_dir(root).unwrap();
     }
@@ -1138,7 +1163,6 @@ mod tests {
         std::fs::remove_dir(root).unwrap();
     }
 
-    #[cfg(unix)]
     #[test]
     fn snapshot_validation_rejects_later_invalid_edit_without_writes() {
         let root = crate::tests::temp_dir("batch-snapshots");
@@ -1182,18 +1206,6 @@ mod tests {
         std::fs::remove_file(first).unwrap();
         std::fs::remove_file(second).unwrap();
         std::fs::remove_dir(root).unwrap();
-    }
-
-    #[test]
-    #[cfg(not(unix))]
-    fn multi_edit_refuses_unsupported_identity_checks_without_mutation() {
-        let home = crate::tests::temp_dir("unsupported-batch");
-        let path = home.join("source.txt");
-        std::fs::write(&path, "original").unwrap();
-        let request =
-            json!({"files":[{"path":path,"edits":[{"old_text":"original","new_text":"changed"}]}]});
-        assert!(prepare(&request, None).unwrap_err().contains("unsupported"));
-        assert_eq!(std::fs::read_to_string(path).unwrap(), "original");
     }
 
     #[test]
@@ -1314,7 +1326,6 @@ mod tests {
         std::fs::remove_dir(root).unwrap();
     }
 
-    #[cfg(unix)]
     #[test]
     fn descriptor_retains_identity_and_distinguishes_replacement() {
         let root = crate::tests::temp_dir("batch-identity");

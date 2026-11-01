@@ -485,7 +485,6 @@ pub(crate) fn read_auth_vault_profile(
     vault_path: &Path,
     profile: &str,
 ) -> Result<Option<BTreeMap<String, String>>, String> {
-    #[cfg(unix)]
     let _guard = crate::operations::refresh::native::read_guard(vault_path)
         .map_err(|error| error.to_string())?;
     read_auth_vault_profile_uncoordinated(vault_path, profile)
@@ -897,7 +896,6 @@ pub(crate) fn prepare_auth_vault_security(
 }
 
 /// Prepare current-format retained policy without native factor effects or format conversion.
-#[cfg(unix)]
 pub(crate) fn prepare_retained_device_policy(
     vault: &mut sshenv_vault::Vault,
     resolved: &crate::ResolvedAuthProfile,
@@ -985,7 +983,6 @@ pub(crate) fn prepare_retained_device_policy(
 
 /// Verify that retained custody can preserve an already-satisfied device policy.
 /// No migration, factor creation, or native discovery occurs here.
-#[cfg(unix)]
 pub(crate) fn validate_retained_device_policy(
     vault: &sshenv_vault::Vault,
     profile: &str,

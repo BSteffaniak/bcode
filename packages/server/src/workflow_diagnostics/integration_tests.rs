@@ -280,4 +280,6 @@ async fn persisted_capture_lists_reads_and_fails_closed_on_damaged_bytes() {
         std::os::unix::fs::symlink(&outside, &path).unwrap();
         assert_eq!(read(&state, &request).await, Err(Error::Unavailable));
     }
+    #[cfg(not(unix))]
+    let _ = &root;
 }

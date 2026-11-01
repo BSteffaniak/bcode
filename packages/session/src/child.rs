@@ -655,7 +655,7 @@ impl SessionManager {
             .await?;
         let stage_timer = timer(request.child_id, Stage::RenameAndSync);
         fs::rename(db::session_dir_path(&staging, request.child_id), &canonical)?;
-        File::open(&root)?.sync_all()?;
+        bcode_confined_fs::sync_directory_path(&root)?;
         drop(stage_timer);
         drop(ownership);
         let stage_timer = timer(request.child_id, Stage::Publication);

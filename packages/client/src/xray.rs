@@ -128,7 +128,6 @@ impl XrayClient {
         endpoint: &str,
         path: &std::path::Path,
     ) -> Result<Self, XrayClientError> {
-        use std::io::Read as _;
         validate_origin(endpoint)?;
         #[cfg(not(unix))]
         {
@@ -137,6 +136,7 @@ impl XrayClient {
         }
         #[cfg(unix)]
         {
+            use std::io::Read as _;
             use std::os::unix::fs::{MetadataExt as _, OpenOptionsExt as _};
             let invalid = |_| XrayClientError::InvalidCredential;
             let before = std::fs::symlink_metadata(path).map_err(invalid)?;

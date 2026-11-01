@@ -1,0 +1,5 @@
+# Exercise atomic publication and private-file semantics on native Windows.
+[[config]]
+os = "ubuntu"
+[[config]]
+os = "windows"

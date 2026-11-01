@@ -1,7 +1,6 @@
 //! Exact-grant, no-follow repository-local exclusion resources.
 use super::{SearchPathsGrant, WorkspaceResourceGrant, ignore_policy, inventory};
 use std::io::Read as _;
-use std::os::unix::fs::MetadataExt as _;
 use std::path::{Path, PathBuf};
 
 pub(super) struct Policy {
@@ -182,7 +181,7 @@ fn load_sources(
                 &mut |path| reader.read(path),
             )?;
         }
-        Some(common.join("info/exclude"))
+        Some(super::under(&common, "info/exclude"))
     } else {
         None
     };
@@ -195,8 +194,12 @@ fn load_sources(
         )?),
         None => sources
             .xdg
-            .map(|path| path.join("git/ignore"))
-            .or_else(|| sources.home.map(|path| path.join(".config/git/ignore"))),
+            .map(|path| super::under(&path, "git/ignore"))
+            .or_else(|| {
+                sources
+                    .home
+                    .map(|path| super::under(&path, ".config/git/ignore"))
+            }),
     };
     let mut rules = Vec::new();
     let mut cost = 0_usize;
@@ -279,17 +282,19 @@ fn read(
         external(path)
     }
     .filter(|resource| {
-        resource.workspace_root.join(&resource.path) == path
+        super::under(&resource.workspace_root, &resource.path) == path
             && PathBuf::from(&resource.path)
                 .components()
                 .all(|part| matches!(part, std::path::Component::Normal(_)))
     })
     .ok_or("git_ignore_resource_denied")?;
     tick()?;
-    let (_, file) =
-        super::super::confined::open_target(&resource.workspace_root.join(&resource.path))
-            .map_err(|_| "git_metadata_unavailable")?;
-    let before = file.metadata().map_err(|_| "git_metadata_unavailable")?;
+    let (_, file) = super::super::confined::open_target(&super::under(
+        &resource.workspace_root,
+        &resource.path,
+    ))
+    .map_err(|_| "git_metadata_unavailable")?;
+    let before = bcode_confined_fs::file_metadata(&file).map_err(|_| "git_metadata_unavailable")?;
     let mut bytes = Vec::new();
     file.take(16_385)
         .read_to_end(&mut bytes)
@@ -297,15 +302,12 @@ fn read(
     tick()?;
     let (_, current) =
         super::super::confined::open_target(path).map_err(|_| "git_metadata_changed")?;
-    let after = current.metadata().map_err(|_| "git_metadata_changed")?;
+    let after = bcode_confined_fs::file_metadata(&current).map_err(|_| "git_metadata_changed")?;
     if bytes.len() > 16_384
-        || before.dev() != after.dev()
-        || before.ino() != after.ino()
+        || before.identity() != after.identity()
         || before.len() != after.len()
-        || before.mtime() != after.mtime()
-        || before.mtime_nsec() != after.mtime_nsec()
-        || before.ctime() != after.ctime()
-        || before.ctime_nsec() != after.ctime_nsec()
+        || before.modified() != after.modified()
+        || before.changed() != after.changed()
     {
         return Err("git_metadata_changed");
     }
@@ -416,6 +418,7 @@ mod tests {
         assert_ne!(changed.fingerprint, before);
         assert!(ignored(&changed, "changed.tmp"));
     }
+    #[cfg(unix)]
     #[test]
     fn metadata_reads_require_canonical_no_follow_sources() {
         let fixture = Fixture::new();

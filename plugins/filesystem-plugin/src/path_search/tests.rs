@@ -139,6 +139,7 @@ fn hidden_and_policy_exclusions_are_pruned_even_when_navigating() {
     );
 }
 
+#[cfg(unix)]
 #[test]
 fn symlinks_and_parent_components_cannot_escape() {
     let root = Fixture::new();
@@ -243,6 +244,7 @@ fn depth_bound_is_explicitly_incomplete() {
     assert_eq!(paths(&response), ["one"]);
 }
 
+#[cfg(unix)]
 #[test]
 fn non_utf8_names_are_incomplete_when_the_filesystem_supports_them() {
     use std::os::unix::ffi::OsStringExt;
@@ -404,6 +406,7 @@ fn authorized_empty_comment_and_complex_ignore_policies_have_truthful_states() {
     }
 }
 
+#[cfg(unix)]
 #[test]
 fn oversized_symlink_and_excluded_ignore_files_fail_closed() {
     let root = Fixture::new();
@@ -460,6 +463,7 @@ fn mismatched_resource_grant_and_descriptor_replacement_are_rejected() {
     assert!(response.entries.is_empty());
 }
 
+#[cfg(unix)]
 #[test]
 fn ignore_parent_symlink_race_cannot_redirect_an_authorized_read() {
     let root = Fixture::new();

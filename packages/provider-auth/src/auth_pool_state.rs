@@ -469,7 +469,7 @@ pub(crate) fn preserve_pool_observations(
     serde_json::to_writer_pretty(&mut temporary, &state).map_err(|_| invalid())?;
     temporary.flush().map_err(|_| invalid())?;
     temporary.as_file().sync_all().map_err(|_| invalid())?;
-    temporary.persist(&path).map_err(|_| invalid())?;
+    bcode_confined_fs::persist(temporary, &path).map_err(|_| invalid())?;
     Ok(ownership)
 }
 
@@ -519,7 +519,7 @@ fn save_state(state: &AuthPoolState) {
         && serde_json::to_writer_pretty(&mut temporary, state).is_ok()
         && temporary.as_file().sync_all().is_ok()
     {
-        let _ = temporary.persist(path);
+        let _ = bcode_confined_fs::persist(temporary, &path);
     }
 }
 

@@ -1,79 +1,45 @@
-//! No-follow descriptor traversal for canonical multi-edit targets.
+//! No-follow handle traversal for canonical multi-edit targets.
 
-use std::ffi::CString;
+use std::ffi::{OsStr, OsString};
 use std::fs::File;
 use std::io;
-use std::os::fd::{AsRawFd as _, FromRawFd as _};
-use std::os::unix::ffi::OsStrExt as _;
 use std::path::{Component, Path};
+
+use bcode_confined_fs::{Creation, Dir, OpenOptions, RenameMode};
 
 /// Open a canonical absolute file without following any symlink components.
 ///
 /// This pins the opened object, not the directory's continuing namespace location.
 /// Callers must still bind and recheck authorized identities before publication.
-pub fn open_target(path: &Path) -> io::Result<(File, File)> {
-    open_absolute(path, false)
-}
-
-/// Open a canonical directory with no-follow traversal, including the final component.
-/// Does not open regular files. Like `open_target`, pins the object, not its namespace.
-pub fn open_directory(path: &Path) -> io::Result<File> {
-    if path == Path::new("/") {
-        return File::open("/");
-    }
-    open_absolute(path, true).map(|(_, directory)| directory)
-}
-
-fn open_absolute(path: &Path, directory: bool) -> io::Result<(File, File)> {
-    let mut components = path.components().peekable();
-    if components.next() != Some(Component::RootDir) || components.peek().is_none() {
+pub fn open_target(path: &Path) -> io::Result<(Dir, File)> {
+    let (Some(parent), Some(name)) = (path.parent(), path.file_name()) else {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
             "expected absolute file path",
         ));
+    };
+    if !matches!(path.components().next_back(), Some(Component::Normal(_))) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "invalid target component",
+        ));
     }
-    let mut handle = File::open("/")?;
-    while let Some(component) = components.next() {
-        let Component::Normal(name) = component else {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "invalid target component",
-            ));
-        };
-        let name = CString::new(name.as_bytes())?;
-        let flags = libc::O_RDONLY
-            | libc::O_CLOEXEC
-            | libc::O_NOFOLLOW
-            | libc::O_NONBLOCK
-            | if directory || components.peek().is_some() {
-                libc::O_DIRECTORY
-            } else {
-                0
-            };
-        // SAFETY: handle owns the directory descriptor throughout the call and
-        // name is a valid NUL-terminated string. No creation flags are supplied.
-        let descriptor = unsafe { libc::openat(handle.as_raw_fd(), name.as_ptr(), flags) };
-        if descriptor < 0 {
-            return Err(io::Error::last_os_error());
-        }
-        // SAFETY: openat returned a fresh owned descriptor, transferred once.
-        let child = unsafe { File::from_raw_fd(descriptor) };
-        if components.peek().is_none() {
-            return Ok((handle, child));
-        }
-        handle = child;
-    }
-    Err(io::Error::new(
-        io::ErrorKind::InvalidInput,
-        "missing target component",
-    ))
+    let parent = Dir::open_strict(parent)?;
+    let file = parent.open_file(name, OpenOptions::new().read(true))?;
+    Ok((parent, file))
+}
+
+/// Open a canonical directory with no-follow traversal, including the final component.
+/// Does not open regular files. Like `open_target`, pins the object, not its namespace.
+pub fn open_directory(path: &Path) -> io::Result<Dir> {
+    Dir::open_strict(path)
 }
 
 /// Same-directory staging owned by a pinned directory handle.
 /// Drop removes only the private staging name, never the published target.
 pub struct StagedFile<'a> {
-    parent: &'a File,
-    name: CString,
+    parent: &'a Dir,
+    name: OsString,
     file: File,
     permissions: std::fs::Permissions,
     published: bool,
@@ -86,9 +52,56 @@ pub enum Publication {
     Unknown(io::Error),
 }
 
+/// Read exactly `buffer.len()` bytes at `offset` without moving a shared cursor.
+fn read_exact_at(file: &File, buffer: &mut [u8], offset: u64) -> io::Result<()> {
+    #[cfg(unix)]
+    {
+        std::os::unix::fs::FileExt::read_exact_at(file, buffer, offset)
+    }
+    #[cfg(windows)]
+    {
+        let mut filled = 0;
+        while filled < buffer.len() {
+            let read = std::os::windows::fs::FileExt::seek_read(
+                file,
+                &mut buffer[filled..],
+                offset + filled as u64,
+            )?;
+            if read == 0 {
+                return Err(io::Error::from(io::ErrorKind::UnexpectedEof));
+            }
+            filled += read;
+        }
+        Ok(())
+    }
+}
+
+/// Whether staged metadata changed between verification reads. Unix compares mode and
+/// change time; Windows compares the attributes and last-write time it exposes.
+fn staged_metadata_changed(before: &std::fs::Metadata, after: &std::fs::Metadata) -> bool {
+    if after.len() != before.len() || after.permissions() != before.permissions() {
+        return true;
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt as _;
+        after.mode() != before.mode()
+            || after.mtime() != before.mtime()
+            || after.mtime_nsec() != before.mtime_nsec()
+            || after.ctime() != before.ctime()
+            || after.ctime_nsec() != before.ctime_nsec()
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::MetadataExt as _;
+        after.file_attributes() != before.file_attributes()
+            || after.last_write_time() != before.last_write_time()
+    }
+}
+
 impl<'a> StagedFile<'a> {
     pub fn create(
-        parent: &'a File,
+        parent: &'a Dir,
         bytes: &[u8],
         permissions: std::fs::Permissions,
         cancelled: &impl Fn() -> bool,
@@ -103,29 +116,19 @@ impl<'a> StagedFile<'a> {
                 ));
             }
             let id = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            let name = CString::new(format!(".bcode-edit-{}-{id}", std::process::id()))?;
-            // SAFETY: parent and name remain valid; exclusive creation never follows a link.
-            let fd = unsafe {
-                libc::openat(
-                    parent.as_raw_fd(),
-                    name.as_ptr(),
-                    libc::O_RDWR
-                        | libc::O_CREAT
-                        | libc::O_EXCL
-                        | libc::O_NOFOLLOW
-                        | libc::O_CLOEXEC,
-                    0o600,
-                )
+            let name = OsString::from(format!(".bcode-edit-{}-{id}", std::process::id()));
+            // Exclusive creation never follows a link.
+            let file = match parent.open_file(
+                &name,
+                OpenOptions::new()
+                    .read(true)
+                    .write(true)
+                    .creation(Creation::New),
+            ) {
+                Ok(file) => file,
+                Err(error) if error.kind() == io::ErrorKind::AlreadyExists => continue,
+                Err(error) => return Err(error),
             };
-            if fd < 0 {
-                let error = io::Error::last_os_error();
-                if error.kind() == io::ErrorKind::AlreadyExists {
-                    continue;
-                }
-                return Err(error);
-            }
-            // SAFETY: fresh owned descriptor from openat.
-            let file = unsafe { File::from_raw_fd(fd) };
             let mut staged = Self {
                 parent,
                 name,
@@ -152,41 +155,26 @@ impl<'a> StagedFile<'a> {
         ))
     }
 
-    // A pathname is not ownership. Keep the descriptor alive so inode reuse cannot
+    // A pathname is not ownership. Keep the handle alive so identity reuse cannot
     // make an unrelated replacement appear to be our staging file.
     fn owns_name(&self) -> io::Result<bool> {
-        use std::os::unix::fs::MetadataExt as _;
-        let owned = self.file.metadata()?;
-        let mut named = std::mem::MaybeUninit::<libc::stat>::uninit();
-        // SAFETY: parent/name are live and named points to writable stat storage.
-        if unsafe {
-            libc::fstatat(
-                self.parent.as_raw_fd(),
-                self.name.as_ptr(),
-                named.as_mut_ptr(),
-                libc::AT_SYMLINK_NOFOLLOW,
-            )
-        } != 0
-        {
-            return Err(io::Error::last_os_error());
-        }
-        // SAFETY: successful fstatat initialized the stat value.
-        let named = unsafe { named.assume_init() };
-        Ok(i128::from(named.st_dev) == i128::from(owned.dev()) && named.st_ino == owned.ino())
+        let owned = bcode_confined_fs::file_metadata(&self.file)?;
+        let named = self.parent.metadata_at(&self.name)?;
+        Ok(named.identity() == owned.identity())
     }
 
     pub fn publish(
         mut self,
-        name: &std::ffi::OsStr,
+        name: &OsStr,
         expected: &[u8],
         cancelled: &impl Fn() -> bool,
     ) -> io::Result<Publication> {
-        use std::os::unix::fs::{FileExt as _, MetadataExt as _, PermissionsExt as _};
         let metadata = self.file.metadata()?;
-        if metadata.mode() & 0o7777 != self.permissions.mode() & 0o7777 {
+        if !same_permissions(&metadata.permissions(), &self.permissions) {
             return Err(io::Error::other("staging permissions changed"));
         }
-        if metadata.len() != expected.len() as u64 || metadata.nlink() != 1 {
+        let links = bcode_confined_fs::file_metadata(&self.file)?.link_count();
+        if metadata.len() != expected.len() as u64 || links != 1 {
             return Err(io::Error::other("staging size or links changed"));
         }
         let mut chunk = [0u8; 8192];
@@ -198,19 +186,14 @@ impl<'a> StagedFile<'a> {
                 ));
             }
             let buffer = &mut chunk[..expected_chunk.len()];
-            self.file.read_exact_at(buffer, (index * 8192) as u64)?;
+            read_exact_at(&self.file, buffer, (index * 8192) as u64)?;
             if buffer != expected_chunk {
                 return Err(io::Error::other("staging content changed"));
             }
         }
         let after = self.file.metadata()?;
-        if after.len() != metadata.len()
-            || after.nlink() != 1
-            || after.mode() != metadata.mode()
-            || after.mtime() != metadata.mtime()
-            || after.mtime_nsec() != metadata.mtime_nsec()
-            || after.ctime() != metadata.ctime()
-            || after.ctime_nsec() != metadata.ctime_nsec()
+        if staged_metadata_changed(&metadata, &after)
+            || bcode_confined_fs::file_metadata(&self.file)?.link_count() != 1
         {
             return Err(io::Error::other(
                 "staging metadata changed during verification",
@@ -236,32 +219,36 @@ impl<'a> StagedFile<'a> {
                 "invalid publication leaf",
             ));
         }
-        let name = CString::new(name.as_bytes())?;
-        // SAFETY: both names and the directory descriptor remain live through renameat.
-        if unsafe {
-            libc::renameat(
-                self.parent.as_raw_fd(),
-                self.name.as_ptr(),
-                self.parent.as_raw_fd(),
-                name.as_ptr(),
-            )
-        } != 0
+        if let Err(error) = self
+            .parent
+            .rename(&self.name, self.parent, name, RenameMode::Replace)
         {
-            return Ok(Publication::Unknown(io::Error::last_os_error()));
+            return Ok(Publication::Unknown(error));
         }
         self.published = true;
         Ok(Publication::Committed)
     }
 }
 
+/// Compare the permission bits each platform preserves on publication.
+fn same_permissions(left: &std::fs::Permissions, right: &std::fs::Permissions) -> bool {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        left.mode() & 0o7777 == right.mode() & 0o7777
+    }
+    #[cfg(not(unix))]
+    {
+        left.readonly() == right.readonly()
+    }
+}
+
 impl Drop for StagedFile<'_> {
     fn drop(&mut self) {
         if !self.published && self.owns_name().unwrap_or(false) {
-            // SAFETY: parent and name remain live. Identity was checked above;
-            // external namespace writers can still race this best-effort cleanup.
-            unsafe {
-                libc::unlinkat(self.parent.as_raw_fd(), self.name.as_ptr(), 0);
-            }
+            // Identity was checked above; external namespace writers can still race this
+            // best-effort cleanup.
+            let _ = self.parent.remove_file(&self.name);
         }
     }
 }
@@ -270,6 +257,41 @@ impl Drop for StagedFile<'_> {
 mod tests {
     use super::*;
 
+    #[test]
+    fn portable_staging_publishes_verified_bytes_and_cleans_abandoned_stages() {
+        let root = crate::tests::temp_dir("portable-staging")
+            .canonicalize()
+            .unwrap();
+        let target = root.join("target");
+        std::fs::write(&target, b"original").unwrap();
+        let permissions = std::fs::metadata(&target).unwrap().permissions();
+        let (parent, _) = open_target(&target).unwrap();
+        let tampered =
+            StagedFile::create(&parent, b"expected", permissions.clone(), &|| false).unwrap();
+        std::fs::write(root.join(&tampered.name), b"tampered").unwrap();
+        assert!(
+            tampered
+                .publish(OsStr::new("target"), b"expected", &|| false)
+                .is_err()
+        );
+        assert_eq!(std::fs::read(&target).unwrap(), b"original");
+        let staged =
+            StagedFile::create(&parent, b"new\r\ncontents", permissions, &|| false).unwrap();
+        assert!(matches!(
+            staged
+                .publish(OsStr::new("target"), b"new\r\ncontents", &|| false)
+                .unwrap(),
+            Publication::Committed
+        ));
+        assert_eq!(std::fs::read(&target).unwrap(), b"new\r\ncontents");
+        assert_eq!(std::fs::read_dir(&root).unwrap().count(), 1);
+        assert!(open_target(Path::new("relative")).is_err());
+        assert!(open_directory(&root).unwrap().metadata().is_ok());
+        std::fs::remove_file(target).unwrap();
+        std::fs::remove_dir(root).unwrap();
+    }
+
+    #[cfg(unix)]
     #[test]
     fn staged_publication_preserves_bytes_and_permissions_and_cleans_abandoned_stage() {
         use std::os::unix::fs::PermissionsExt as _;
@@ -310,6 +332,7 @@ mod tests {
         std::fs::remove_dir(root).unwrap();
     }
 
+    #[cfg(unix)]
     #[test]
     fn staging_content_tampering_and_cancellation_leave_target_unchanged() {
         use std::os::unix::fs::PermissionsExt as _;
@@ -328,7 +351,7 @@ mod tests {
             )
             .unwrap();
             if !cancel {
-                let path = root.join(std::ffi::OsStr::from_bytes(staged.name.as_bytes()));
+                let path = root.join(&staged.name);
                 std::fs::write(path, b"tampered").unwrap();
             }
             assert!(
@@ -343,6 +366,7 @@ mod tests {
         std::fs::remove_dir(root).unwrap();
     }
 
+    #[cfg(unix)]
     #[test]
     fn staging_permission_tampering_is_rejected_before_publication() {
         use std::os::unix::fs::PermissionsExt as _;
@@ -378,6 +402,7 @@ mod tests {
         std::fs::remove_dir(root).unwrap();
     }
 
+    #[cfg(unix)]
     #[test]
     fn rename_error_reports_uncertainty_and_cleans_stage() {
         use std::os::unix::fs::PermissionsExt as _;
@@ -409,6 +434,7 @@ mod tests {
         std::fs::remove_dir(root).unwrap();
     }
 
+    #[cfg(unix)]
     #[test]
     fn replaced_staging_name_is_neither_published_nor_cleaned_up() {
         use std::os::unix::fs::PermissionsExt as _;
@@ -425,7 +451,7 @@ mod tests {
             &|| false,
         )
         .unwrap();
-        let staging_path = root.join(std::ffi::OsStr::from_bytes(staged.name.as_bytes()));
+        let staging_path = root.join(&staged.name);
         std::fs::remove_file(&staging_path).unwrap();
         std::fs::write(&staging_path, b"foreign").unwrap();
         assert!(
@@ -440,6 +466,7 @@ mod tests {
         std::fs::remove_dir(root).unwrap();
     }
 
+    #[cfg(unix)]
     #[test]
     fn rejects_symlinks_in_parent_and_leaf_without_following_them() {
         let root = crate::tests::temp_dir("batch-confined")
@@ -451,7 +478,7 @@ mod tests {
         std::fs::write(&target, "original").unwrap();
         let (parent, file) = open_target(&target).unwrap();
         assert!(file.metadata().unwrap().is_file());
-        assert!(parent.metadata().unwrap().is_dir());
+        assert!(parent.as_file().metadata().unwrap().is_dir());
         let parent_alias = root.join("parent-alias");
         let leaf_alias = root.join("leaf-alias");
         std::os::unix::fs::symlink(&directory, &parent_alias).unwrap();

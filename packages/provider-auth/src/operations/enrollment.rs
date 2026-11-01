@@ -303,25 +303,16 @@ impl RetainedAuthRequestCustody {
 /// # Errors
 /// Returns a secret-safe failure for unsupported permissions, unavailable files, or invalid input.
 pub fn read_custody_identity(path: &Path) -> Result<Zeroizing<String>, AuthVaultLifecycleError> {
-    use std::{
-        io::Read as _,
-        os::unix::fs::{MetadataExt as _, OpenOptionsExt as _},
-    };
+    use std::io::Read as _;
     if !path.is_absolute() {
         return Err(AuthVaultLifecycleError::InvalidCredential);
     }
-    let mut file = std::fs::OpenOptions::new()
-        .read(true)
-        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_NONBLOCK)
-        .open(path)
-        .map_err(|_| unavailable())?;
+    let mut file =
+        bcode_confined_fs::open_file_path(path, bcode_confined_fs::OpenOptions::new().read(true))
+            .map_err(|_| unavailable())?;
     let metadata = file.metadata().map_err(|_| unavailable())?;
-    // SAFETY: geteuid has no preconditions.
-    if !metadata.is_file()
-        || metadata.uid() != unsafe { libc::geteuid() }
-        || metadata.mode() & 0o077 != 0
-        || metadata.len() > 4096
-    {
+    let private = bcode_confined_fs::is_private(&file).map_err(|_| unavailable())?;
+    if !metadata.is_file() || !private || metadata.len() > 4096 {
         return Err(AuthVaultLifecycleError::InvalidCredential);
     }
     let mut identity = Zeroizing::new(String::new());
@@ -410,6 +401,7 @@ mod tests {
         (resolved, method)
     }
 
+    #[cfg(unix)]
     #[test]
     fn service_identity_reader_enforces_ownership_bounds_and_redaction() {
         use std::os::unix::fs::{PermissionsExt as _, symlink};

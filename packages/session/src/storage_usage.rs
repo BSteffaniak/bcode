@@ -157,7 +157,7 @@ pub fn measure_session_storage_with_backups(
 /// destination filesystem, avoiding a path re-resolution between admission and the check.
 ///
 /// # Errors
-/// Rejects non-directory handles, unsupported platforms, failed filesystem queries, unrepresentable
+/// Rejects non-directory handles, failed filesystem queries, unrepresentable
 /// measurements, or insufficient space available to the current user.
 pub fn ensure_storage_headroom(destination: &fs::File, additional_bytes: u64) -> io::Result<()> {
     if !destination.metadata()?.is_dir() {
@@ -166,36 +166,10 @@ pub fn ensure_storage_headroom(destination: &fs::File, additional_bytes: u64) ->
             "storage destination is not a directory",
         ));
     }
-    #[cfg(unix)]
-    {
-        use std::os::fd::AsRawFd as _;
-        let mut statistics = std::mem::MaybeUninit::<libc::statvfs>::uninit();
-        // SAFETY: destination remains open and statistics points to writable, correctly sized memory.
-        if unsafe { libc::fstatvfs(destination.as_raw_fd(), statistics.as_mut_ptr()) } != 0 {
-            return Err(io::Error::last_os_error());
-        }
-        // SAFETY: successful fstatvfs initialized the entire result.
-        let statistics = unsafe { statistics.assume_init() };
-        if statistics.f_frsize == 0 {
-            return Err(io::Error::other("unknown filesystem allocation unit"));
-        }
-        let available = u128::from(statistics.f_bavail)
-            .checked_mul(u128::from(statistics.f_frsize))
-            .and_then(|bytes| u64::try_from(bytes).ok())
-            .ok_or_else(|| io::Error::other("invalid available storage measurement"))?;
-        check_available_storage(available, additional_bytes)
-    }
-    #[cfg(not(unix))]
-    {
-        let _ = additional_bytes;
-        Err(io::Error::new(
-            io::ErrorKind::Unsupported,
-            "storage headroom query unavailable",
-        ))
-    }
+    let available = bcode_confined_fs::available_bytes(destination)?;
+    check_available_storage(available, additional_bytes)
 }
 
-#[cfg(any(unix, test))]
 fn check_available_storage(available: u64, required: u64) -> io::Result<()> {
     if available < required {
         Err(io::Error::new(
@@ -441,11 +415,12 @@ mod tests {
         );
     }
 
-    #[cfg(unix)]
     #[test]
     fn headroom_query_uses_directory_handle_and_does_not_mutate_storage() {
         let directory = tempfile::tempdir().expect("directory");
-        let handle = fs::File::open(directory.path()).expect("handle");
+        let handle = bcode_confined_fs::Dir::open(directory.path())
+            .expect("handle")
+            .into_file();
         ensure_storage_headroom(&handle, 0).expect("query");
         assert_eq!(fs::read_dir(directory.path()).expect("entries").count(), 0);
         let file = directory.path().join("file");

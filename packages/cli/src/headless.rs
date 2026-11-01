@@ -59,6 +59,7 @@ fn claim_fresh_state_with_environment(
                     .to_owned(),
             )
         })?;
+        #[cfg_attr(not(unix), allow(unused_mut))]
         let mut builder = std::fs::DirBuilder::new();
         #[cfg(unix)]
         {

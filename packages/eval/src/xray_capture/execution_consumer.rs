@@ -90,6 +90,7 @@ impl ExecutionCapture {
         let mut aggregate = EvalXrayAggregation::new(limits);
         aggregate.execution_watch_ready(&ready);
         let directory = recording_directory(directory)?;
+        #[cfg_attr(not(unix), allow(unused_mut))]
         let mut builder = std::fs::DirBuilder::new();
         #[cfg(unix)]
         {

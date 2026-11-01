@@ -346,7 +346,7 @@ impl CacheStore {
         let bytes = serde_json::to_vec(&simulator).map_err(|_| state_error())?;
         let mut temporary = tempfile::NamedTempFile::new_in(&root).map_err(|_| state_error())?;
         std::io::Write::write_all(&mut temporary, &bytes).map_err(|_| state_error())?;
-        temporary.persist(&path).map_err(|_| state_error())?;
+        bcode_confined_fs::persist(temporary, &path).map_err(|_| state_error())?;
         drop(lock);
         Ok(round)
     }

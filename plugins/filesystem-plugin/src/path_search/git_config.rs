@@ -105,9 +105,9 @@ pub(super) fn expand(
 pub(super) fn user_sources(home: Option<&Path>, xdg: Option<&Path>) -> Vec<PathBuf> {
     let mut paths = Vec::new();
     if let Some(xdg) = xdg {
-        paths.push(xdg.join("git/config"));
+        paths.push(super::under(xdg, "git/config"));
     } else if let Some(home) = home {
-        paths.push(home.join(".config/git/config"));
+        paths.push(super::under(home, ".config/git/config"));
     }
     if let Some(home) = home {
         paths.push(home.join(".gitconfig"));
@@ -121,21 +121,23 @@ mod tests {
     use std::collections::BTreeMap;
     #[test]
     fn include_precedence_denial_and_conditional_are_explicit() {
+        // Any absolute directory works; only lexical paths are compared, never opened.
+        let cfg = std::env::temp_dir().join("cfg");
         let files = BTreeMap::from([
-            (PathBuf::from("/cfg/main"), b"[core]\n excludesFile=first\n[include]\n path=child\n[core]\n excludesFile=last\n".to_vec()),
-            (PathBuf::from("/cfg/child"), b"[core]\n excludesFile=included\n".to_vec()),
+            (cfg.join("main"), b"[core]\n excludesFile=first\n[include]\n path=child\n[core]\n excludesFile=last\n".to_vec()),
+            (cfg.join("child"), b"[core]\n excludesFile=included\n".to_vec()),
         ]);
         let mut settings = Settings::new();
         settings
-            .load(Path::new("/cfg/main"), None, &mut |path| {
+            .load(&cfg.join("main"), None, &mut |path| {
                 Ok(files.get(path).cloned())
             })
             .unwrap();
         assert_eq!(settings.excludes, Some("last".into()));
         let mut settings = Settings::new();
         assert_eq!(
-            settings.load(Path::new("/cfg/main"), None, &mut |path| {
-                if path == Path::new("/cfg/child") {
+            settings.load(&cfg.join("main"), None, &mut |path| {
+                if path == cfg.join("child") {
                     Err("git_ignore_resource_denied")
                 } else {
                     Ok(files.get(path).cloned())
@@ -145,7 +147,7 @@ mod tests {
         );
         let mut settings = Settings::new();
         settings
-            .load(Path::new("/cfg/conditional"), None, &mut |_| {
+            .load(&cfg.join("conditional"), None, &mut |_| {
                 Ok(Some(b"[includeIf \"gitdir:x\"]\n path=secret\n".to_vec()))
             })
             .unwrap();

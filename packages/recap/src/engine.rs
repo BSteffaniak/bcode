@@ -794,7 +794,7 @@ fn copy_verified(source: &std::path::Path, target: &std::path::Path) -> Result<(
     staging
         .persist_noclobber(target)
         .map_err(|error| error.error)?;
-    fs::File::open(parent)?.sync_all()?;
+    bcode_confined_fs::sync_directory_path(parent)?;
     Ok(())
 }
 #[derive(serde::Serialize, serde::Deserialize)]

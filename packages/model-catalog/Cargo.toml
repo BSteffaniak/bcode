@@ -17,6 +17,7 @@ path = "src/main.rs"
 test = false
 
 [dependencies]
+bcode_confined_fs          = { workspace = true }
 bcode_model                = { workspace = true }
 bcode_model_catalog_models = { workspace = true }
 bcode_plugin_sdk           = { workspace = true }

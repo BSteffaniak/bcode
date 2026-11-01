@@ -333,7 +333,7 @@ impl SessionManager {
             return Err(SessionError::DerivationPublicationConflict(destination_id));
         }
         fs::rename(&staged_dir, &canonical_dir)?;
-        File::open(&root)?.sync_all()?;
+        bcode_confined_fs::sync_directory_path(&root)?;
         let _cleanup = fs::remove_dir_all(&staging_root);
         self.adopt_derived_session(summary.clone()).await?;
         Ok(summary)
@@ -780,7 +780,7 @@ fn sync_staged_session(paths: &[PathBuf]) -> Result<(), SessionError> {
         File::open(path)?.sync_all()?;
     }
     if let Some(directory) = paths.first().and_then(|path| path.parent()) {
-        File::open(directory)?.sync_all()?;
+        bcode_confined_fs::sync_directory_path(directory)?;
     }
     Ok(())
 }
@@ -806,7 +806,7 @@ fn write_derivation_receipt(
     file.write_all(&bytes)?;
     file.sync_all()?;
     fs::rename(&temp, path)?;
-    File::open(parent)?.sync_all()?;
+    bcode_confined_fs::sync_directory_path(parent)?;
     Ok(())
 }
 
