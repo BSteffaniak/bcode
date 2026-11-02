@@ -3250,7 +3250,10 @@ mod tests {
             let validation: ValidateConfigResponse =
                 serde_json::from_slice(&response.payload).unwrap();
             assert!(validation.valid);
-            assert!(validation.failures.is_empty());
+            assert_eq!(
+                validation.failures,
+                [] as [bcode_model::ProviderFailureContext; 0]
+            );
             assert_eq!(validation.metadata, request.provider_context.settings);
         }
     }
@@ -3409,7 +3412,7 @@ mod tests {
             }
         ));
         turn.cancel();
-        assert!(turn.drain().is_empty());
+        assert_eq!(turn.drain(), [] as [bcode_model::ProviderTurnEvent; 0]);
     }
 
     fn drain_script_until(

@@ -176,7 +176,7 @@ fn silence_skips_recognizer_construction_and_text_processing() {
         || panic!("silence must not construct a recognizer"),
     )
     .unwrap();
-    assert!(transcript.text.is_empty());
+    assert_eq!(transcript.text, "");
 }
 
 #[test]

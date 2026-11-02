@@ -102,11 +102,9 @@ async fn assert_pending_preparation(db: &dyn Database, identity: &str) {
     let rows = pending(db, "ledger", None, 1).await.unwrap();
     assert_eq!(rows.len(), 1);
     assert!(rows[0].receipt.is_none());
-    assert!(
-        pending(db, "ledger", Some(identity), 1)
-            .await
-            .unwrap()
-            .is_empty()
+    assert_eq!(
+        pending(db, "ledger", Some(identity), 1).await.unwrap(),
+        [] as [crate::representation::attempts::PendingAttempt; 0]
     );
 }
 
@@ -142,7 +140,10 @@ async fn assert_terminal_retry(
             .as_ref(),
         Some(prepared)
     );
-    assert!(pending(db, "ledger", None, 10).await.unwrap().is_empty());
+    assert_eq!(
+        pending(db, "ledger", None, 10).await.unwrap(),
+        [] as [crate::representation::attempts::PendingAttempt; 0]
+    );
     assert_eq!(
         owner_boundary::dispatch_intent(db, "ledger", identity)
             .await
@@ -336,11 +337,11 @@ async fn assert_owner_links(
             .unwrap(),
         vec![link.clone()]
     );
-    assert!(
+    assert_eq!(
         super::super::inspection_sessions::links(db, "another-run", None, 100)
             .await
-            .unwrap()
-            .is_empty()
+            .unwrap(),
+        [] as [crate::WorkflowExecutionSessionLink; 0]
     );
     let conflicting = crate::WorkflowExecutionSessionLink {
         session_id: "different".into(),

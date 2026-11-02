@@ -8330,10 +8330,9 @@ mod tests {
             Kind::EditDraft,
             Kind::ForkDefinition,
         ] {
-            assert!(
-                !registry
-                    .keys_for_action(keybindings::RUNS, workflow_action_id(kind))
-                    .is_empty()
+            assert_ne!(
+                registry.keys_for_action(keybindings::RUNS, workflow_action_id(kind)),
+                [] as [&str; 0]
             );
         }
 
@@ -8500,7 +8499,7 @@ mod tests {
             let keys = TestHost
                 .keymap_keys(keybindings::RUNS, &format!("workflow.{action}"))
                 .join("/");
-            assert!(!keys.is_empty());
+            assert_ne!(keys, "");
             assert!(rendered.contains(&format!("{keys} {label}")));
         }
         let host = FooterKeymapHost(
@@ -8841,7 +8840,7 @@ mod tests {
             let keys = TestHost
                 .keymap_keys(keybindings::RUNS, &format!("workflow.{action}"))
                 .join("/");
-            assert!(!keys.is_empty());
+            assert_ne!(keys, "");
             assert!(rendered.contains(&format!("{keys} {label}")));
         }
         let narrow = render_workspace_text(&mut surface, 24, 28);

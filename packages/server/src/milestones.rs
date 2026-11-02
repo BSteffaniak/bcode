@@ -577,7 +577,7 @@ mod tests {
                 context.bridge.is_available(),
                 "auxiliary inference requires the provider custody bridge"
             );
-            assert!(request.tools.is_empty());
+            assert_eq!(request.tools, [] as [bcode_model::ToolDefinition; 0]);
             assert!(
                 request
                     .system_prompt

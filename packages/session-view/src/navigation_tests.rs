@@ -151,7 +151,7 @@ fn collapse_search_and_zero_budget_are_bounded() {
     assert!(searched.rows[0].ancestor_context);
     assert!(!searched.rows[2].ancestor_context);
     let empty = project_session_tree(&summaries, &BTreeSet::new(), None, 0);
-    assert!(empty.rows.is_empty());
+    assert_eq!(empty.rows, [] as [crate::navigation::SessionTreeRow; 0]);
     assert!(empty.truncated);
 }
 

@@ -139,7 +139,10 @@ async fn historical_cold_upgrade_then_artifact_and_history_compression_preserves
     assert_eq!(std::fs::read(&access).expect("unchanged age"), before);
     let backups = bcode_session_migration::retained_migration_backups(root.path(), id, 256)
         .expect("retained backups");
-    assert!(!backups.backups.is_empty());
+    assert_ne!(
+        backups.backups,
+        [] as [bcode_session_migration::RetainedMigrationBackupDiagnosis; 0]
+    );
     let db = bcode_session::db::SessionDb::open_existing_turso_in_root(id, root.path())
         .await
         .expect("current db");

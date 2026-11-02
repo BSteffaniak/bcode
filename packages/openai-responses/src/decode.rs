@@ -741,18 +741,21 @@ mod tests {
             drain_complete_stream_lines(&mut buffer),
             vec!["data: a".to_string(), "data: b".to_string()]
         );
-        assert!(buffer.is_empty());
+        assert_eq!(buffer, "");
 
         // A partial trailing line stays buffered until its terminator arrives.
         let mut buffer = String::from("data: {\"ty");
-        assert!(drain_complete_stream_lines(&mut buffer).is_empty());
+        assert_eq!(
+            drain_complete_stream_lines(&mut buffer),
+            [] as [std::string::String; 0]
+        );
         assert_eq!(buffer, "data: {\"ty");
         buffer.push_str("pe\":\"x\"}\n");
         assert_eq!(
             drain_complete_stream_lines(&mut buffer),
             vec!["data: {\"type\":\"x\"}".to_string()]
         );
-        assert!(buffer.is_empty());
+        assert_eq!(buffer, "");
     }
 
     #[test]

@@ -494,8 +494,14 @@ mod tests {
             .persist_definition(&run.definition_id, run.definition_version, &definition)
             .unwrap();
         let inspection = super::inspect(&state, "new", 100).await.unwrap().unwrap();
-        assert!(inspection.child_run_links.is_empty());
-        assert!(inspection.descendant_runs.is_empty());
+        assert_eq!(
+            inspection.child_run_links,
+            [] as [bcode_workflow::WorkflowRunLink; 0]
+        );
+        assert_eq!(
+            inspection.descendant_runs,
+            [] as [bcode_workflow::WorkflowDescendantRunSummary; 0]
+        );
         assert!(
             !inspection
                 .unavailable_collections
@@ -517,7 +523,10 @@ mod tests {
         let (_root, state) = super::super::tests::fixture_with_store(true);
         super::super::tests::admit_extension_with_observations(&state, true).await;
         let inspection = super::inspect(&state, "new", 100).await.unwrap().unwrap();
-        assert!(inspection.repeat_outcomes.is_empty());
+        assert_eq!(
+            inspection.repeat_outcomes,
+            [] as [bcode_workflow::WorkflowRepeatOutcomeSummary; 0]
+        );
         assert!(
             !inspection
                 .unavailable_collections

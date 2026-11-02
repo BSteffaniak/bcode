@@ -590,7 +590,10 @@ async fn monitor_mouse_row_selects_and_chevron_expands_without_opening_session()
     )));
     assert_eq!(model.chat.app.selected_monitor_session(), Some(child));
     assert!(model.chat.app.child_panel_focused());
-    assert!(model.chat.app.expanded_monitor_sessions().is_empty());
+    assert_eq!(
+        model.chat.app.expanded_monitor_sessions(),
+        [] as [bcode_session_models::SessionId; 0]
+    );
     assert_eq!(model.chat.opening_session_id(), None);
     model.route_terminal_event(Event::Mouse(bmux_tui::event::MouseEvent::new(
         bmux_tui::event::MouseEventKind::Down(bmux_tui::event::MouseButton::Left),

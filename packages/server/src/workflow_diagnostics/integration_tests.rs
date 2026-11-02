@@ -224,7 +224,10 @@ async fn successful_101st_write_is_preserved_and_discovery_reports_overflow() {
     };
     let discovered = summaries(&receipt, "overflow-run", dispatch).unwrap();
     assert_eq!(discovered.artifacts.len(), 100);
-    assert!(discovered.unavailable.is_empty());
+    assert_eq!(
+        discovered.unavailable,
+        [] as [bcode_workflow::WorkflowDiagnosticUnavailableArtifact; 0]
+    );
     assert_eq!(discovered.omitted_artifacts, Some(1));
     drop(retained);
     drop(state);

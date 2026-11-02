@@ -80,7 +80,10 @@ fn live_image_without_registry_survives_and_exit_or_crash_releases_it() {
         assert_eq!(cleanup_stale_daemon_images(root.path()).unwrap(), 1);
         assert!(active.exists());
         assert!(!unused.exists());
-        assert!(read_records(root.path()).is_empty());
+        assert_eq!(
+            read_records(root.path()),
+            [] as [(std::path::PathBuf, DaemonRecord); 0]
+        );
         if crash {
             child.0.kill().unwrap();
         } else {

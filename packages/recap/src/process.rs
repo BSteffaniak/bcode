@@ -346,11 +346,9 @@ mod tests {
             read_bounded(data.as_slice(), 128, true).await,
             Err(ProcessError::OutputLimit)
         ));
-        assert!(
-            read_bounded(data.as_slice(), 0, false)
-                .await
-                .unwrap()
-                .is_empty()
+        assert_eq!(
+            read_bounded(data.as_slice(), 0, false).await.unwrap(),
+            [] as [u8; 0]
         );
     }
 

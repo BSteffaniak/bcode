@@ -752,7 +752,7 @@ mod tests {
             contribution("new", BTreeSet::from([CommandSurface::Slash])),
         ]);
 
-        assert!(items.is_empty());
+        assert_eq!(items, [] as [crate::slash_palette::SlashItem; 0]);
     }
 
     #[test]

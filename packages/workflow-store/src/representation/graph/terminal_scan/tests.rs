@@ -302,13 +302,13 @@ async fn terminal_scan_reopens_and_new_revision_invalidates_prior_proof() {
     };
     graph_revision::publish(&*db, &owner, &batch).await.unwrap();
     assert!(!pending(&*db, "scan").await.unwrap());
-    assert!(
+    assert_eq!(
         db.select(TABLE)
             .where_eq("run_id", "scan")
             .execute(&*db)
             .await
-            .unwrap()
-            .is_empty()
+            .unwrap(),
+        [] as [switchy_database::Row; 0]
     );
     assert_eq!(runs::terminalize(&*db, &owner, "scan").await.unwrap(), None);
     assert!(pending(&*db, "scan").await.unwrap());
@@ -335,12 +335,12 @@ async fn terminal_scan_reopens_and_new_revision_invalidates_prior_proof() {
         .await
         .unwrap();
     tx.commit().await.unwrap();
-    assert!(
+    assert_eq!(
         db.select(TABLE)
             .where_eq("run_id", "scan")
             .execute(&*db)
             .await
-            .unwrap()
-            .is_empty()
+            .unwrap(),
+        [] as [switchy_database::Row; 0]
     );
 }

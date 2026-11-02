@@ -13,7 +13,7 @@ const QUERY: &[u8] = b"\x1b[6n";
 const REPLY: &[u8] = b"\x1b[1;1R";
 
 /// Reader that answers the leading `ConPTY` cursor query through `writer`.
-pub(super) struct CursorQueryResponder<R, W> {
+pub struct CursorQueryResponder<R, W> {
     reader: R,
     /// Retained for the reader's lifetime so the pseudoconsole input stays open.
     writer: W,
@@ -23,7 +23,7 @@ pub(super) struct CursorQueryResponder<R, W> {
 }
 
 impl<R, W> CursorQueryResponder<R, W> {
-    pub(super) const fn new(reader: R, writer: W) -> Self {
+    pub const fn new(reader: R, writer: W) -> Self {
         Self {
             reader,
             writer,
@@ -146,21 +146,21 @@ mod tests {
     fn other_leading_output_passes_through_unanswered() {
         let (output, reply) = run(&[b"\x1b[", b"2Jtext\x1b[6n"], 64);
         assert_eq!(output, b"\x1b[2Jtext\x1b[6n");
-        assert!(reply.is_empty());
+        assert_eq!(reply, [] as [u8; 0]);
     }
 
     #[test]
     fn partial_query_at_eof_is_released() {
         let (output, reply) = run(&[b"\x1b[6"], 64);
         assert_eq!(output, b"\x1b[6");
-        assert!(reply.is_empty());
+        assert_eq!(reply, [] as [u8; 0]);
     }
 
     #[test]
     fn released_bytes_respect_small_buffers() {
         let (output, reply) = run(&[b"\x1b[6", b"xyz"], 2);
         assert_eq!(output, b"\x1b[6xyz");
-        assert!(reply.is_empty());
+        assert_eq!(reply, [] as [u8; 0]);
         let (output, reply) = run(&[b"\x1b[6nabcdef"], 2);
         assert_eq!(output, b"abcdef");
         assert_eq!(reply, b"\x1b[1;1R");
@@ -169,7 +169,7 @@ mod tests {
     #[test]
     fn empty_stream_reports_eof() {
         let (output, reply) = run(&[], 8);
-        assert!(output.is_empty());
-        assert!(reply.is_empty());
+        assert_eq!(output, [] as [u8; 0]);
+        assert_eq!(reply, [] as [u8; 0]);
     }
 }

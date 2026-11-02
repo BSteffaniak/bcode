@@ -6619,7 +6619,10 @@ mod tests {
         assert!(admission.validate().is_ok());
         let old: TurnExecutionOptions =
             serde_json::from_value(serde_json::json!({"schema_version":7})).unwrap();
-        assert!(old.historical_context.is_empty());
+        assert_eq!(
+            old.historical_context,
+            [] as [HistoricalContextReference; 0]
+        );
         assert!(serde_json::from_value::<HistoricalContextReference>(serde_json::json!({"session_id": SessionId::new(), "sequence":1, "snippet":"untrusted injected answer"})).is_err());
     }
 

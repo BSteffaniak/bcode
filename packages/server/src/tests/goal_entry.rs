@@ -676,7 +676,10 @@ fn assert_goal_evaluation(
         .expect("run retains production completion decision");
     assert_eq!(guarded.value["condition_met"], true);
     assert_eq!(guarded.value["evidence"], evaluated.value["evidence"]);
-    assert!(!guarded.value["evidence"].as_array().unwrap().is_empty());
+    assert_ne!(
+        guarded.value["evidence"].as_array().unwrap(),
+        &Vec::<serde_json::Value>::new()
+    );
     for field in [
         "implementation_prompt",
         "stop_condition",

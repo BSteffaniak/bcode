@@ -69,7 +69,10 @@ async fn exact_limit_lookahead_distinguishes_complete_and_truncated() {
 async fn absent_and_future_optional_state_are_unavailable_not_empty_complete() {
     let absent = switchy_database_connection::init_sqlite_rusqlite(None).unwrap();
     let (values, complete) = inspect(&*absent, "run", 10).await;
-    assert!(values.is_empty());
+    assert_eq!(
+        values,
+        [] as [bcode_workflow::WorkflowAdmissionObservation; 0]
+    );
     assert_eq!(complete, None);
     let db = database().await;
     db.update("workflow_admission_observation_contract")
@@ -79,7 +82,10 @@ async fn absent_and_future_optional_state_are_unavailable_not_empty_complete() {
         .await
         .unwrap();
     let (values, complete) = inspect(&*db, "run", 10).await;
-    assert!(values.is_empty());
+    assert_eq!(
+        values,
+        [] as [bcode_workflow::WorkflowAdmissionObservation; 0]
+    );
     assert_eq!(complete, None);
 }
 
@@ -95,6 +101,9 @@ async fn corrupt_lookahead_does_not_certify_a_valid_prefix() {
         .await
         .unwrap();
     let (values, complete) = inspect(&*db, "run", 1).await;
-    assert!(values.is_empty());
+    assert_eq!(
+        values,
+        [] as [bcode_workflow::WorkflowAdmissionObservation; 0]
+    );
     assert_eq!(complete, None);
 }

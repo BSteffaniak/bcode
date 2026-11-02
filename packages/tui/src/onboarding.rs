@@ -1164,7 +1164,10 @@ mod tests {
         assert!(audit.safe);
         assert!(render.snapshot_text().contains("Welcome"));
         assert!(setup_section_story(SetupSectionId::Welcome).contains("Optional settings"));
-        assert!(!render.focused_detail.actions.is_empty());
+        assert_ne!(
+            render.focused_detail.actions,
+            [] as [std::string::String; 0]
+        );
     }
 
     #[test]

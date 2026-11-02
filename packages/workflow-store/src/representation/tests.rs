@@ -248,12 +248,9 @@ async fn admission_is_idempotent_uncapped_and_never_executable() {
         identity(&*db, "admitted").await.unwrap(),
         Some(RunRepresentation::Version2)
     );
-    assert!(
-        db.select("workflow_runs")
-            .execute(&*db)
-            .await
-            .unwrap()
-            .is_empty()
+    assert_eq!(
+        db.select("workflow_runs").execute(&*db).await.unwrap(),
+        [] as [switchy_database::Row; 0]
     );
     let rows = db.select(RUNS).execute(&*db).await.unwrap();
     let Some(DatabaseValue::String(json)) = rows[0].get("admission_json") else {

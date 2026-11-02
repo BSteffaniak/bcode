@@ -36,7 +36,7 @@ fn terminal_turn_rejects_late_events_even_after_drain() {
     late_worker.push(ProviderTurnEvent::TurnFinished {
         stop_reason: StopReason::Error,
     });
-    assert!(store.drain(&id).is_empty());
+    assert_eq!(store.drain(&id), [] as [bcode_model::ProviderTurnEvent; 0]);
 }
 
 struct Released(mpsc::Sender<()>);
@@ -324,12 +324,21 @@ fn finishing_all_turns_cancels_handles_without_reusing_identity() {
     let (second_id, second) = store.insert_started("provider");
     store.cancel_all();
     assert!(first.is_cancelled());
-    assert!(!store.drain(&first_id).is_empty());
+    assert_ne!(
+        store.drain(&first_id),
+        [] as [bcode_model::ProviderTurnEvent; 0]
+    );
     store.finish_all();
     assert!(first.is_cancelled());
     assert!(second.is_cancelled());
-    assert!(store.drain(&first_id).is_empty());
-    assert!(store.drain(&second_id).is_empty());
+    assert_eq!(
+        store.drain(&first_id),
+        [] as [bcode_model::ProviderTurnEvent; 0]
+    );
+    assert_eq!(
+        store.drain(&second_id),
+        [] as [bcode_model::ProviderTurnEvent; 0]
+    );
     store.finish_all();
     let (next_id, next) = store.insert_started("provider");
     assert_ne!(first_id, next_id);

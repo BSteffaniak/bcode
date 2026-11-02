@@ -359,6 +359,6 @@ mod tests {
             )
             .is_err()
         );
-        assert!(destination.into_inner().is_empty());
+        assert_eq!(destination.into_inner(), [] as [u8; 0]);
     }
 }

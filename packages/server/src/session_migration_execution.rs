@@ -287,7 +287,7 @@ fn check_maintenance_cancelled(control: &MaintenanceMigrationControl) -> Result<
 
 use bcode_session_migration::SessionMigrationProgressReporter as MigrationExecutionProgress;
 
-#[cfg(test)]
+#[cfg(all(test, any(target_os = "macos", target_os = "linux")))]
 mod tests;
 
 async fn migration_source_evidence(

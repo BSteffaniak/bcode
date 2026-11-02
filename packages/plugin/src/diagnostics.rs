@@ -293,7 +293,7 @@ pub fn control(key: usize, bytes: &[u8]) -> Option<DiagnosticStatus> {
         let entry = value.as_ref().filter(|entry| entry.key == key)?.clone();
         if entry
             .owners
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |n| {
+            .try_update(Ordering::AcqRel, Ordering::Acquire, |n| {
                 (n < MAX_LEASES).then_some(n + 1)
             })
             .is_err()

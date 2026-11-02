@@ -103,7 +103,7 @@ mod tests {
     fn switchy_backend_internals_are_allowed() {
         let mut failures = Vec::new();
         graph("switchy_database", None, "schema").check_sql(true, "test", &mut failures);
-        assert!(failures.is_empty());
+        assert_eq!(failures, [] as [std::string::String; 0]);
     }
 
     #[test]

@@ -1391,7 +1391,7 @@ mod tests {
         let _ = controller.advance(first_due + Duration::from_secs(5));
         assert_eq!(controller.raw_text(), raw);
         controller.restart(first_due + Duration::from_secs(6));
-        assert!(controller.raw_text().is_empty());
+        assert_eq!(controller.raw_text(), "");
         assert_eq!(controller.delivered_chunks(), 0);
     }
 
@@ -1417,7 +1417,7 @@ mod tests {
 
         controller.restart(next_due);
         assert_eq!(controller.source_policy(), sparse);
-        assert!(controller.raw_text().is_empty());
+        assert_eq!(controller.raw_text(), "");
         assert_eq!(controller.accepted_bytes(), 0);
     }
 

@@ -1341,7 +1341,7 @@ mod tests {
         loop {
             let batch = scan.advance_sources(16).unwrap();
             assert!(batch.sources.len() <= 16);
-            assert!(scan.result.sources.is_empty());
+            assert_eq!(scan.result.sources, [] as [DiscoveredWorkflowSource; 0]);
             assert!(scan.result.diagnostics.len() <= 1);
             delivered += batch.sources.len();
             if batch.complete {
@@ -1450,7 +1450,7 @@ mod tests {
         let mut completed = false;
         for _ in 0..100 {
             if let Some(result) = scan.advance(1).unwrap() {
-                assert!(result.sources.is_empty());
+                assert_eq!(result.sources, [] as [DiscoveredWorkflowSource; 0]);
                 completed = true;
                 break;
             }
@@ -1478,7 +1478,7 @@ mod tests {
         loop {
             let batch = scan.advance_sources(1).unwrap();
             assert!(batch.sources.len() <= 1);
-            assert!(scan.result.sources.is_empty());
+            assert_eq!(scan.result.sources, [] as [DiscoveredWorkflowSource; 0]);
             delivered.extend(batch.sources);
             if batch.complete {
                 break;
@@ -1765,8 +1765,11 @@ members:
             if error.kind() == std::io::ErrorKind::Interrupted)
         );
         assert!(!temporary.exists());
-        assert!(scan.result.sources.is_empty());
-        assert!(scan.result.diagnostics.is_empty());
+        assert_eq!(scan.result.sources, [] as [DiscoveredWorkflowSource; 0]);
+        assert_eq!(
+            scan.result.diagnostics,
+            [] as [WorkflowDiscoveryDiagnostic; 0]
+        );
         assert!(scan.advance_sources(1).is_err());
     }
 
@@ -1803,8 +1806,8 @@ members:
             loop {
                 let batch = scan.advance_sources(16).unwrap();
                 assert!(batch.sources.len() <= 16);
-                assert!(scan.result.sources.is_empty());
-                assert!(batch.diagnostics.is_empty());
+                assert_eq!(scan.result.sources, [] as [DiscoveredWorkflowSource; 0]);
+                assert_eq!(batch.diagnostics, [] as [WorkflowDiscoveryDiagnostic; 0]);
                 for source in batch.sources {
                     assert!(matches!(
                         source,
@@ -1858,7 +1861,7 @@ members:
             20,
         )
         .expect("discovery");
-        assert!(result.sources.is_empty());
+        assert_eq!(result.sources, [] as [DiscoveredWorkflowSource; 0]);
         assert!(
             result
                 .diagnostics
@@ -1888,7 +1891,7 @@ members:
             20,
         )
         .expect("discovery");
-        assert!(result.sources.is_empty());
+        assert_eq!(result.sources, [] as [DiscoveredWorkflowSource; 0]);
         assert_eq!(result.diagnostics[0].code, "invalid_package");
     }
 

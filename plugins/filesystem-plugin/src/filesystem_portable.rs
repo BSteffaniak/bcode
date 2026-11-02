@@ -497,7 +497,10 @@ mod tests {
                 .render(&input, &context)
                 .unwrap();
             if width == 0 {
-                assert!(output.actions.is_empty());
+                assert_eq!(
+                    output.actions,
+                    [] as [bcode_tui_components::transcript::actions::TranscriptActionRegion; 0]
+                );
                 continue;
             }
             assert_eq!(output.actions.len(), 1);
@@ -530,11 +533,14 @@ mod tests {
                     },
                 )
                 .unwrap();
-            assert!(output.actions.is_empty());
+            assert_eq!(
+                output.actions,
+                [] as [bcode_tui_components::transcript::actions::TranscriptActionRegion; 0]
+            );
         }
         let mut streaming = input;
         streaming.streaming = true;
-        assert!(
+        assert_eq!(
             FilesystemVisual::default()
                 .render(
                     &streaming,
@@ -544,8 +550,8 @@ mod tests {
                     }
                 )
                 .unwrap()
-                .actions
-                .is_empty()
+                .actions,
+            [] as [bcode_tui_components::transcript::actions::TranscriptActionRegion; 0]
         );
         let deleted = visual(
             "bcode.filesystem.change",

@@ -187,7 +187,7 @@ mod tests {
             bmux_tui::ansi::write_ansi_frame(&mut full, &frame, None).unwrap();
             let mut redraw = Vec::new();
             bmux_tui::ansi::write_ansi_frame_diff(&mut redraw, &frame, &blank, None).unwrap();
-            assert!(!redraw.is_empty());
+            assert_ne!(redraw, [] as [u8; 0]);
             let mut restored = Vec::new();
             bmux_tui::ansi::write_ansi_frame(&mut restored, &frame, None).unwrap();
             assert_eq!(full, restored);

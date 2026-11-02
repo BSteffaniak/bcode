@@ -116,7 +116,10 @@ async fn typed_payload_locations_ignore_reference_shaped_user_content() {
     observation.finalize().unwrap();
     assert_eq!(observation.recv().await.unwrap().event.name, "ready");
     let inline = observation.recv().await.unwrap();
-    assert!(inline.payload_references().unwrap().is_empty());
+    assert_eq!(
+        inline.payload_references().unwrap(),
+        [] as [bcode_xray::XrayPayloadRef; 0]
+    );
     assert_eq!(
         inline.event.data["value"]["payload_ref"]["payload_id"],
         "user-text"
@@ -200,7 +203,10 @@ async fn oversized_capture_is_explicit_loss_without_private_json_and_finish_is_n
                 .unwrap()
                 .contains("private-oversized-secret")
         );
-        assert!(envelope.payload_references().unwrap().is_empty());
+        assert_eq!(
+            envelope.payload_references().unwrap(),
+            [] as [bcode_xray::XrayPayloadRef; 0]
+        );
         if envelope.event.name == "payload_omitted" {
             assert_eq!(envelope.event.data["reason"], "serialization_or_size_limit");
             assert!(!envelope.event.sensitive);

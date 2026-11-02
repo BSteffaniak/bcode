@@ -294,8 +294,11 @@ mod tests {
                     .unwrap();
                 assert_eq!(range.bytes.len(), 4096);
             } else {
-                assert!(declaration.attachments.is_empty());
-                assert!(references.is_empty());
+                assert_eq!(
+                    declaration.attachments,
+                    [] as [bcode_xray::XrayCaptureAttachment; 0]
+                );
+                assert_eq!(references, [] as [bcode_xray::XrayPayloadRef; 0]);
                 if envelope.event.name == "fixture_inline" {
                     assert!(envelope.event.sensitive);
                     assert_eq!(

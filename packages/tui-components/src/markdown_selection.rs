@@ -280,7 +280,7 @@ mod tests {
             None,
         );
 
-        assert!(!fragments.is_empty());
+        assert_ne!(fragments, [] as [bmux_tui::selection::SelectionFragment; 0]);
         assert!(fragments.iter().all(|fragment| fragment.area.x >= 4));
         assert!(fragments.iter().all(|fragment| fragment.area.y >= 7));
         assert!(fragments.iter().any(|fragment| fragment.area.width == 2));

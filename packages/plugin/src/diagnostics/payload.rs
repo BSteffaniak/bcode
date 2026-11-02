@@ -182,7 +182,7 @@ fn begin(
         return reject(entry, "payload_id_exhausted");
     };
     if RESERVED
-        .fetch_update(Ordering::AcqRel, Ordering::Acquire, |used| {
+        .try_update(Ordering::AcqRel, Ordering::Acquire, |used| {
             used.checked_add(byte_len)
                 .filter(|total| *total <= GLOBAL_BYTES)
         })

@@ -241,7 +241,7 @@ fn malformed_explicit_override_is_secret_safe_and_never_creates_a_store() {
     ] {
         let output = run_at(&arguments, root.path());
         assert_eq!(output.status.code(), Some(1), "{arguments:?}");
-        assert!(!output.stderr.is_empty());
+        assert_ne!(output.stderr, [] as [u8; 0]);
         for stream in [&output.stdout, &output.stderr] {
             assert!(!String::from_utf8_lossy(stream).contains(sentinel));
         }

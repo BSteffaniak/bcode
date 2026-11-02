@@ -13686,7 +13686,10 @@ pub(crate) mod tests {
         app.resolved_review_threads.insert(thread_key.clone());
 
         app.thread_filter = ReviewThreadFilter::Open;
-        assert!(app.visible_thread_summaries().is_empty());
+        assert_eq!(
+            app.visible_thread_summaries(),
+            [] as [crate::code_review_tui::ReviewThreadSummary; 0]
+        );
         app.thread_filter = ReviewThreadFilter::Resolved;
         assert_eq!(app.visible_thread_summaries().len(), 1);
 
@@ -16659,7 +16662,7 @@ pub(crate) mod tests {
         first.runtime.active_turn_id = Some("turn-1".to_string());
         let mut state = ReviewAgentSessionViewState::from_snapshot(first);
         assert_eq!(state.phase, ReviewAgentThreadPhase::Running);
-        assert!(state.display_answer().is_empty());
+        assert_eq!(state.display_answer(), "");
         assert_eq!(
             state.session_items().last().map(|item| item.text.as_str()),
             Some("Hello wor")

@@ -509,11 +509,9 @@ mod tests {
             inline.capture,
             Some(bcode_xray_models::XrayCaptureAttachments::new(Vec::new()))
         );
-        assert!(
-            inline
-                .payload_references()
-                .expect("inline metadata")
-                .is_empty()
+        assert_eq!(
+            inline.payload_references().expect("inline metadata"),
+            [] as [bcode_xray::XrayPayloadRef; 0]
         );
         let opaque = observation.recv().await.expect("opaque event").event;
         assert!(opaque.capture.is_none());
@@ -549,11 +547,11 @@ mod tests {
                 event.capture,
                 Some(bcode_xray_models::XrayCaptureAttachments::new(Vec::new()))
             );
-            assert!(
+            assert_eq!(
                 event
                     .payload_references()
-                    .expect("valid inline declaration")
-                    .is_empty()
+                    .expect("valid inline declaration"),
+                [] as [bcode_xray::XrayPayloadRef; 0]
             );
         }
     }

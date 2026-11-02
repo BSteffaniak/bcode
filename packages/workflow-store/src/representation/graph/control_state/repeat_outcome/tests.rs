@@ -105,12 +105,9 @@ async fn actual_repeat_records_are_fenced_idempotent_bounded_and_atomic() {
     assert!(page_in(&*tx, "outcomes", None, 2).await.is_err());
     tx.rollback().await.unwrap();
     let tx = db.begin_transaction().await.unwrap();
-    assert!(
-        page_in(&*tx, "outcomes", None, 2)
-            .await
-            .unwrap()
-            .0
-            .is_empty()
+    assert_eq!(
+        page_in(&*tx, "outcomes", None, 2).await.unwrap().0,
+        [] as [bcode_workflow::WorkflowRepeatOutcomeSummary; 0]
     );
     tx.commit().await.unwrap();
 }

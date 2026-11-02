@@ -541,7 +541,10 @@ mod tests {
         );
         assert!(!emitted.data.to_string().contains("must-not-appear"));
         assert_eq!(emitted.capture, Some(XrayCaptureAttachments::new(vec![])));
-        assert!(emitted.payload_references().unwrap().is_empty());
+        assert_eq!(
+            emitted.payload_references().unwrap(),
+            [] as [bcode_xray::XrayPayloadRef; 0]
+        );
     }
 
     #[tokio::test]
@@ -593,7 +596,10 @@ mod tests {
             assert!(!emitted.sensitive);
             assert!(!emitted.data.to_string().contains("private"));
             assert_eq!(emitted.capture, Some(XrayCaptureAttachments::new(vec![])));
-            assert!(emitted.payload_references().unwrap().is_empty());
+            assert_eq!(
+                emitted.payload_references().unwrap(),
+                [] as [bcode_xray::XrayPayloadRef; 0]
+            );
         }
     }
 
@@ -631,14 +637,20 @@ mod tests {
         let text = observation.recv().await.expect("text metadata").event;
         assert_eq!(text.data["text_bytes"], 14);
         assert_eq!(text.capture, Some(XrayCaptureAttachments::new(vec![])));
-        assert!(text.payload_references().unwrap().is_empty());
+        assert_eq!(
+            text.payload_references().unwrap(),
+            [] as [bcode_xray::XrayPayloadRef; 0]
+        );
         assert!(!text.data.to_string().contains("private prompt"));
         let call = observation.recv().await.expect("call metadata").event;
         assert_eq!(call.correlation.tool_call_id.as_deref(), Some("call"));
         assert!(!call.data.to_string().contains("never-emit"));
         assert!(!call.sensitive);
         assert_eq!(call.capture, Some(XrayCaptureAttachments::new(vec![])));
-        assert!(call.payload_references().unwrap().is_empty());
+        assert_eq!(
+            call.payload_references().unwrap(),
+            [] as [bcode_xray::XrayPayloadRef; 0]
+        );
     }
 
     #[tokio::test]

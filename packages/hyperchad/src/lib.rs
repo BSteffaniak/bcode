@@ -3403,7 +3403,10 @@ mod tests {
 
         let snapshot = view.snapshot();
         assert_eq!(snapshot.transcript.items.len(), tools.len());
-        assert!(snapshot.runtime_work.is_empty());
+        assert_eq!(
+            snapshot.runtime_work,
+            [] as [bcode_session_view_models::RuntimeWorkView; 0]
+        );
         assert!(snapshot.transcript.items.iter().all(|item| matches!(
             item.kind,
             bcode_session_view_models::TranscriptViewItemKind::ToolInvocation { .. }
@@ -3466,7 +3469,10 @@ mod tests {
             "removed",
         ));
         let removed = view.snapshot().clone();
-        assert!(removed.transcript.items.is_empty());
+        assert_eq!(
+            removed.transcript.items,
+            [] as [bcode_session_view_models::TranscriptViewItem; 0]
+        );
         let removal = scoped_snapshot_patch(&mut previous, &removed).expect("removal patch");
         assert!(removal.reset.is_none());
         assert!(matches!(
@@ -4177,7 +4183,10 @@ mod tests {
             },
         ));
 
-        assert!(view.snapshot().permissions.is_empty());
+        assert_eq!(
+            view.snapshot().permissions,
+            [] as [bcode_session_view_models::PermissionView; 0]
+        );
         assert!(view.snapshot().transcript.items.iter().any(|item| {
             matches!(
                 &item.kind,

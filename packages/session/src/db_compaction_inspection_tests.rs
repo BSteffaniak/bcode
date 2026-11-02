@@ -287,7 +287,10 @@ async fn unrelated_traces_are_incomplete_not_missing_and_empty_history_is_distin
         limit: 1,
     };
     let empty = db.compaction_inspection_page(query).await.unwrap();
-    assert!(empty.entries.is_empty());
+    assert_eq!(
+        empty.entries,
+        [] as [bcode_session_models::SessionCompactionInspectionEntry; 0]
+    );
     assert!(!empty.has_more);
     assert!(!empty.degraded);
     for sequence in 0..3 {
@@ -304,7 +307,10 @@ async fn unrelated_traces_are_incomplete_not_missing_and_empty_history_is_distin
         .unwrap();
     }
     let incomplete = db.compaction_inspection_page(query).await.unwrap();
-    assert!(incomplete.entries.is_empty());
+    assert_eq!(
+        incomplete.entries,
+        [] as [bcode_session_models::SessionCompactionInspectionEntry; 0]
+    );
     assert!(incomplete.has_more);
     assert_eq!(incomplete.scanned_events, 1);
     db.append_event(&trace(

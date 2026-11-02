@@ -104,7 +104,7 @@ async fn assert_history_receipt(
     absent_model: bool,
 ) {
     let requests = REQUESTS.lock().unwrap().clone();
-    assert!(!requests.is_empty());
+    assert_ne!(requests, [] as [bcode_model::ModelTurnRequest; 0]);
     let request = &requests[0];
     let text = serde_json::to_string(&request.messages).unwrap();
     assert!(text.contains("Protected compacted summary"));
@@ -299,7 +299,10 @@ async fn assert_history_tool_scope_controls(
     .unwrap();
     assert_eq!(snapshot.operations.len(), 1);
     assert!(snapshot.operations[0].selection.is_none());
-    assert!(snapshot.operations[0].inference.is_empty());
+    assert_eq!(
+        snapshot.operations[0].inference,
+        [] as [bcode_model::judgement::OptionalOperationObservation; 0]
+    );
     state.optional_context.lock().unwrap().insert(
         session,
         vec![(

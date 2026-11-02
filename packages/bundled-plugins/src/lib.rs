@@ -977,7 +977,10 @@ mod tests {
             .iter()
             .find_map(|(manifest, _)| (manifest.id == "bcode.loop").then_some(manifest))
             .expect("loop plugin is included in the static bundle");
-        assert!(!loop_manifest.services.is_empty());
+        assert_ne!(
+            loop_manifest.services,
+            [] as [bcode_plugin::PluginService; 0]
+        );
         let host = bcode_plugin::PluginRuntimeHost::load_defaults_with_static_bundled(
             &bcode_plugin::PluginSelection::all_enabled(),
             &static_plugins,

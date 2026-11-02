@@ -955,11 +955,11 @@ async fn typed_agent_test_harness_uses_real_prompt_owner_and_fake_provider() {
         }
         progress.changed().await;
     }
-    assert!(
+    assert_eq!(
         representation::attempts::pending(&db, "new", None, 10)
             .await
-            .expect("pending")
-            .is_empty()
+            .expect("pending"),
+        [] as [bcode_workflow_store::representation::attempts::PendingAttempt; 0]
     );
     assert_eq!(
         crate::WorkflowActivationOwner { state: &state }
@@ -1155,11 +1155,11 @@ async fn authentic_loop_start_executes_plugin_judgement_and_two_provider_rounds(
     })
     .await;
     let db = open(&crate::workflow_store_path(&state), false).expect("db");
-    assert!(
+    assert_eq!(
         representation::attempts::pending(&db, &run_id, None, 100)
             .await
-            .expect("settled")
-            .is_empty()
+            .expect("settled"),
+        [] as [bcode_workflow_store::representation::attempts::PendingAttempt; 0]
     );
     assert!(
         state
@@ -1209,11 +1209,11 @@ async fn failed_receipt_is_terminal_not_repeated_scheduler_progress() {
             .status,
         bcode_workflow::RunStatus::Failed
     );
-    assert!(
+    assert_eq!(
         representation::attempts::pending(&db, "new", None, 10)
             .await
-            .expect("pending")
-            .is_empty()
+            .expect("pending"),
+        [] as [bcode_workflow_store::representation::attempts::PendingAttempt; 0]
     );
     assert_eq!(
         representation::attempts::owner_boundary::terminal_outcome(
@@ -1655,11 +1655,11 @@ async fn public_cancellation_settles_real_gated_provider_without_late_reopen() {
         .expect("terminal"),
         Some(representation::attempts::TerminalOutcome::Cancelled)
     );
-    assert!(
+    assert_eq!(
         representation::attempts::pending(&db, "new", None, 10)
             .await
-            .expect("no live attempts")
-            .is_empty()
+            .expect("no live attempts"),
+        [] as [bcode_workflow_store::representation::attempts::PendingAttempt; 0]
     );
 }
 
@@ -2007,7 +2007,13 @@ async fn fixture_supervisor_joins_and_reclaims_only_its_owned_tasks() {
         .await
         .expect("real driver exited before guard disarm");
     assert!(state.workflow_driver_task.lock().await.is_none());
-    assert!(state.runtime_work.active_all().await.is_empty());
+    assert_eq!(
+        state.runtime_work.active_all().await,
+        [] as [(
+            bcode_session_models::SessionId,
+            bcode_session_models::RuntimeWorkSnapshot
+        ); 0]
+    );
     assert!(cleanup.completed);
     drop(cleanup);
     drop(state);
@@ -3060,11 +3066,11 @@ async fn normal_pause_blocks_new_dispatch_and_resume_wakes_same_typed_run() {
         .await
         .expect("paused drive");
     let db = open(&crate::workflow_store_path(&state), false).expect("db");
-    assert!(
+    assert_eq!(
         representation::attempts::pending(&db, "new", None, 10)
             .await
-            .expect("no attempts")
-            .is_empty()
+            .expect("no attempts"),
+        [] as [bcode_workflow_store::representation::attempts::PendingAttempt; 0]
     );
     assert!(
         crate::workflow_operations::resume_run(&state, "new")

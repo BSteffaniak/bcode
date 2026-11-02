@@ -299,7 +299,7 @@ impl ModelExecutor for DetailedInspectionProbe {
                     )
                 }
                 AnalysisStage::VisualInspection => {
-                    assert!(!request.images.is_empty());
+                    assert_ne!(request.images, [] as [bcode_recap::model::ImageAsset; 0]);
                     assert!(
                         request.images.len() <= 4,
                         "composition image cap must constrain inspection extraction"
@@ -330,7 +330,7 @@ impl ModelExecutor for DetailedInspectionProbe {
                     Err(bcode_recap::model::ModelError::Unavailable)
                 }
                 AnalysisStage::PassageComposition => {
-                    assert!(!request.images.is_empty());
+                    assert_ne!(request.images, [] as [bcode_recap::model::ImageAsset; 0]);
                     assert!(request.images.len() <= 4);
                     let unit: bcode_recap::passage_contracts::SourceUnit =
                         serde_json::from_value(request.input["source_unit"].clone()).unwrap();
@@ -510,7 +510,10 @@ async fn real_video_generate_export_refine_and_missing_offline_asset() {
     let html = engine
         .export(&initial.id, &Cancellation::default(), &mut |_| {})
         .unwrap();
-    assert!(html.report.degradations.is_empty());
+    assert_eq!(
+        html.report.degradations,
+        [] as [bcode_recap::export::Degradation; 0]
+    );
     assert!(html.html.contains("data:image/jpeg;base64,"));
     assert!(html.html.contains("data:video/mp4;base64,"));
     assert!(html.html.contains("data:text/vtt;base64,"));
@@ -792,12 +795,12 @@ async fn generation_survives_process_reopen_without_source_or_repeated_completed
         .unwrap();
     assert_eq!(again, result);
     assert_eq!(model.calls.load(Ordering::SeqCst), 1);
-    assert!(
-        !engine
+    assert_ne!(
+        engine
             .export(&request.id, &Cancellation::default(), &mut |_| {})
             .unwrap()
-            .html
-            .is_empty()
+            .html,
+        ""
     );
 }
 
@@ -885,11 +888,11 @@ async fn crash_restart_reuses_completed_work_without_original_source() {
         .unwrap();
     assert_eq!(model.calls.load(Ordering::SeqCst), 0);
     assert_eq!(store.load(&request.id).unwrap(), result);
-    assert!(
-        !engine
+    assert_ne!(
+        engine
             .export(&request.id, &Cancellation::default(), &mut |_| {})
             .unwrap()
-            .html
-            .is_empty()
+            .html,
+        ""
     );
 }

@@ -923,7 +923,7 @@ mod tests {
                         || !fixture.lifecycle_matrix.source_writer_epochs.is_empty()
                 );
             } else {
-                assert!(fixture.source_writer_epochs.is_empty());
+                assert_eq!(fixture.source_writer_epochs, [] as [u32; 0]);
             }
             assert!(!fixture.historical_payloads || fixture.migratable_store);
             let contents =

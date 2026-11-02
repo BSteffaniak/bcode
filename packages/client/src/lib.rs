@@ -444,7 +444,7 @@ mod runtime_work_history_tests {
             let spans = runtime_work_spans(vec![event(kind.clone())]);
             assert_eq!(spans.len(), 1);
             assert_eq!(spans[0].work_id, work_id);
-            assert!(spans[0].label.is_empty());
+            assert_eq!(spans[0].label, "");
             assert_eq!(spans[0].parent_work_id, None);
             assert_eq!(spans[0].started_at_ms, None);
             assert_eq!(spans[0].duration_ms(), None);
@@ -2695,7 +2695,10 @@ mod runtime_context_auth_tests {
         );
         assert_eq!(context.auth_profile.as_deref(), Some("custom-account"));
         assert!(context.auth_pool.is_none());
-        assert!(context.auth_candidates.is_empty());
+        assert_eq!(
+            context.auth_candidates,
+            [] as [bcode_model::ProviderAuthCandidate; 0]
+        );
     }
 
     #[tokio::test]
@@ -11224,9 +11227,6 @@ mod client_timeout_tests {
         SessionId, SessionMigrationProgress, SessionMigrationStage, SessionOpenOperationId,
         SessionOpenOperationSnapshot, SessionOpenTerminalOutcome,
     };
-    use bcode_session_search::{
-        SessionSearchBackfillOperationState, SessionSearchBackfillOperationStatus,
-    };
     use std::path::Path;
     use std::time::Duration;
 
@@ -12996,6 +12996,9 @@ mod client_timeout_tests {
     #[cfg(unix)]
     #[tokio::test]
     async fn backfill_wait_longer_than_default_request_timeout_receives_quiet_response() {
+        use bcode_session_search::{
+            SessionSearchBackfillOperationState, SessionSearchBackfillOperationStatus,
+        };
         let socket_dir =
             std::path::PathBuf::from(format!("/tmp/bcl-{}", SessionOpenOperationId::new()));
         create_private_socket_fixture(&socket_dir);
@@ -14539,7 +14542,10 @@ mod portable_application_adapter_tests {
             context.interaction_controller_versions,
             std::collections::BTreeSet::from([1, 99])
         );
-        assert!(context.interaction_adapters.is_empty());
+        assert_eq!(
+            context.interaction_adapters,
+            [] as [bcode_plugin_sdk::interaction::PluginInteractionAdapterCapability; 0]
+        );
     }
     #[cfg(unix)]
     fn semantic_consumer_fixture_daemon() -> bcode_ipc::DaemonStatus {
@@ -14586,7 +14592,10 @@ mod portable_application_adapter_tests {
                 context.interaction_controller_versions,
                 std::collections::BTreeSet::from([1])
             );
-            assert!(context.interaction_adapters.is_empty());
+            assert_eq!(
+                context.interaction_adapters,
+                [] as [bcode_plugin_sdk::interaction::PluginInteractionAdapterCapability; 0]
+            );
             let response = bcode_ipc::Response::Ok(bcode_ipc::ResponsePayload::Hello {
                 protocol_version: bcode_ipc::ProtocolVersion::current(),
                 client_id: bcode_session_models::ClientId::new(),

@@ -281,7 +281,8 @@ pub struct ExportResult {
 #[derive(Debug)]
 pub struct CatalogCursor {
     root: PathBuf,
-    entries: std::fs::ReadDir,
+    /// Boxed because Windows embeds a directory-search record in `ReadDir`.
+    entries: Box<std::fs::ReadDir>,
 }
 #[cfg(feature = "tui")]
 #[derive(Debug)]
@@ -839,7 +840,7 @@ fn list(
         }
         CatalogCursor {
             root: options.store.clone(),
-            entries: std::fs::read_dir(&options.store)?,
+            entries: Box::new(std::fs::read_dir(&options.store)?),
         }
     };
     let store = DocumentStore::new(&options.store, options.max_document_bytes);
@@ -1662,37 +1663,39 @@ mod progress_tests {
     #[tokio::test]
     async fn typed_analysis_reports_real_stages_without_downgrading_unsupported_execution() {
         let mut stages = Vec::new();
-        let progress = std::sync::Mutex::new(|stage| stages.push(stage));
-        let executor = ProgressExecutor {
-            executor: &UnsupportedExecutor,
-            progress: &progress,
-        };
-        let cancel = Cancellation::default();
-        for stage in [
-            AnalysisStage::ExtractionInventory,
-            AnalysisStage::Outline,
-            AnalysisStage::VisualInspection,
-            AnalysisStage::ChapterComposition,
-            AnalysisStage::SourceAudit,
-            AnalysisStage::SourceRepair,
-        ] {
-            assert_eq!(
-                executor
-                    .execute_analysis(
-                        AnalysisRequest {
-                            stage,
-                            instructions: "trusted policy".into(),
-                            input: serde_json::json!({}),
-                            images: vec![],
-                            max_response_bytes: 1024,
-                        },
-                        &cancel
-                    )
-                    .await,
-                Err(ModelError::Unavailable)
-            );
+        // The progress closure borrows `stages` until this scope ends.
+        {
+            let progress = std::sync::Mutex::new(|stage| stages.push(stage));
+            let executor = ProgressExecutor {
+                executor: &UnsupportedExecutor,
+                progress: &progress,
+            };
+            let cancel = Cancellation::default();
+            for stage in [
+                AnalysisStage::ExtractionInventory,
+                AnalysisStage::Outline,
+                AnalysisStage::VisualInspection,
+                AnalysisStage::ChapterComposition,
+                AnalysisStage::SourceAudit,
+                AnalysisStage::SourceRepair,
+            ] {
+                assert_eq!(
+                    executor
+                        .execute_analysis(
+                            AnalysisRequest {
+                                stage,
+                                instructions: "trusted policy".into(),
+                                input: serde_json::json!({}),
+                                images: vec![],
+                                max_response_bytes: 1024,
+                            },
+                            &cancel
+                        )
+                        .await,
+                    Err(ModelError::Unavailable)
+                );
+            }
         }
-        drop(progress);
         assert_eq!(
             stages,
             [
@@ -1849,7 +1852,7 @@ mod tests {
         assert!(
             matches!(error, Error::Operation { source, .. } if matches!(*source, Error::Action(_)))
         );
-        assert!(stages.is_empty());
+        assert_eq!(stages, [] as [crate::application::Stage; 0]);
         assert!(!options.store.exists());
     }
 
@@ -1948,7 +1951,7 @@ mod tests {
         assert!(
             matches!(outcome, Err(Error::Operation { source, .. }) if matches!(*source, Error::Cancelled))
         );
-        assert!(stages.is_empty());
+        assert_eq!(stages, [] as [crate::application::Stage; 0]);
         assert!(!options.store.exists());
     }
 

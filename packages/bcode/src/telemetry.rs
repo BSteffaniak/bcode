@@ -272,7 +272,7 @@ mod metrics {
             if metrics.active_stream {
                 let active = self
                     .active_streams
-                    .fetch_update(Ordering::AcqRel, Ordering::Acquire, |active| {
+                    .try_update(Ordering::AcqRel, Ordering::Acquire, |active| {
                         Some(active.saturating_sub(1))
                     })
                     .unwrap_or_default()

@@ -1023,7 +1023,10 @@ mod tests {
             control_id: custom_control_id(0),
             value: InteractionValue::String("something else".to_owned()),
         });
-        assert!(controller.snapshot().answers[0].selected.is_empty());
+        assert_eq!(
+            controller.snapshot().answers[0].selected,
+            [] as [std::string::String; 0]
+        );
         controller.handle_input(InteractionInput::Activate {
             control_id: option_control_id(0, 0),
         });
@@ -1168,6 +1171,9 @@ mod tests {
                 InteractionOutput::None
             );
         }
-        assert!(controller.snapshot().answers[0].selected.is_empty());
+        assert_eq!(
+            controller.snapshot().answers[0].selected,
+            [] as [std::string::String; 0]
+        );
     }
 }

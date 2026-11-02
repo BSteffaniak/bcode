@@ -259,7 +259,10 @@ mod budget_tests {
                 let envelope = observation.recv().await.unwrap();
                 assert_eq!(envelope.event.data, ordinary);
                 assert!(envelope.event.capture.is_none());
-                assert!(envelope.payload_references().unwrap().is_empty());
+                assert_eq!(
+                    envelope.payload_references().unwrap(),
+                    [] as [bcode_xray::XrayPayloadRef; 0]
+                );
             });
     }
 

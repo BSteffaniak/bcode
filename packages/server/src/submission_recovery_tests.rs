@@ -800,21 +800,17 @@ async fn interrupted_turn_can_be_explicitly_ended_without_replaying_tools_or_los
         status(&state, session.id).await.unwrap().oldest,
         Some(later.clone())
     );
-    assert!(
-        state
-            .sessions
-            .active_tool_runs(session.id)
-            .await
-            .unwrap()
-            .is_empty()
+    assert_eq!(
+        state.sessions.active_tool_runs(session.id).await.unwrap(),
+        [] as [bcode_session::db::ToolRun; 0]
     );
-    assert!(
+    assert_eq!(
         state
             .sessions
             .active_runtime_work(session.id)
             .await
-            .unwrap()
-            .is_empty()
+            .unwrap(),
+        [] as [bcode_session::db::RuntimeWorkProjection; 0]
     );
     let history = state.sessions.session_history(session.id).await.unwrap();
     assert_eq!(

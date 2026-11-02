@@ -1,7 +1,6 @@
 use super::*;
 use bcode_session::artifact_storage::ArtifactMaintenanceCancellation;
 
-#[cfg(any(target_os = "macos", target_os = "linux"))]
 #[tokio::test]
 async fn released_historical_upgrade_reports_actual_execution_failure() {
     let (root, state, id, _, _) =
@@ -33,7 +32,6 @@ async fn released_historical_upgrade_reports_actual_execution_failure() {
     );
 }
 
-#[cfg(any(target_os = "macos", target_os = "linux"))]
 #[tokio::test]
 async fn busy_reader_failure_allows_immediate_fresh_admission_after_release() {
     let root = tempfile::tempdir().expect("root");
@@ -153,11 +151,11 @@ async fn maintenance_closes_current_storage_without_runtime_handoff() {
     reopened.database().close().await.expect("close probe");
     drop(write);
     drop(guard);
-    assert!(
+    assert_eq!(
         bcode_session_migration::retained_migration_backups(root.path(), id, 1024)
             .expect("backup inventory")
-            .backups
-            .is_empty()
+            .backups,
+        [] as [bcode_session_migration::RetainedMigrationBackupDiagnosis; 0]
     );
 }
 

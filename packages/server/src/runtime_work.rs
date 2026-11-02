@@ -979,7 +979,10 @@ mod tests {
         let retired = manager.take_observed(&original).await.unwrap();
         assert_eq!(retired.work_id, id);
         assert!(manager.take_observed(&current).await.is_none());
-        assert!(manager.active_for_session(session).await.is_empty());
+        assert_eq!(
+            manager.active_for_session(session).await,
+            [] as [bcode_session_models::RuntimeWorkSnapshot; 0]
+        );
     }
 
     #[tokio::test]
@@ -1071,7 +1074,7 @@ mod tests {
             .active_page(SessionId::new(), None, 2, 4096)
             .await
             .unwrap();
-        assert!(empty.is_empty());
+        assert_eq!(empty, [] as [bcode_session_models::RuntimeWorkSnapshot; 0]);
         assert!(cursor.is_none());
         // Page cursors remain valid when the preceding registration disappears.
         manager.finish(session, &WorkId::new("a")).await;
@@ -1360,11 +1363,9 @@ mod tests {
             (true, true)
         );
         assert_eq!(manager.active_for_session(session_id).await.len(), 1);
-        assert!(
-            !manager
-                .cancel_with_children(session_id, &work_id)
-                .await
-                .is_empty()
+        assert_ne!(
+            manager.cancel_with_children(session_id, &work_id).await,
+            [] as [bcode_session_models::WorkId; 0]
         );
         wait_for_count(&count, 1).await;
         assert_eq!(
@@ -1372,7 +1373,10 @@ mod tests {
             RuntimeWorkStatus::Cancelling
         );
         manager.finish(session_id, &work_id).await;
-        assert!(manager.active_for_session(session_id).await.is_empty());
+        assert_eq!(
+            manager.active_for_session(session_id).await,
+            [] as [bcode_session_models::RuntimeWorkSnapshot; 0]
+        );
     }
 
     #[tokio::test]
@@ -1385,17 +1389,13 @@ mod tests {
         manager
             .start(session_id, test_spec("work", Arc::clone(&count)))
             .await;
-        assert!(
-            !manager
-                .cancel_with_children(session_id, &work_id)
-                .await
-                .is_empty()
+        assert_ne!(
+            manager.cancel_with_children(session_id, &work_id).await,
+            [] as [bcode_session_models::WorkId; 0]
         );
-        assert!(
-            manager
-                .cancel_with_children(session_id, &work_id)
-                .await
-                .is_empty()
+        assert_eq!(
+            manager.cancel_with_children(session_id, &work_id).await,
+            [] as [bcode_session_models::WorkId; 0]
         );
         wait_for_count(&count, 1).await;
     }
@@ -1420,11 +1420,9 @@ mod tests {
                 )
                 .await
         );
-        assert!(
-            !manager
-                .cancel_with_children(session_id, &work_id)
-                .await
-                .is_empty()
+        assert_ne!(
+            manager.cancel_with_children(session_id, &work_id).await,
+            [] as [bcode_session_models::WorkId; 0]
         );
         assert_eq!(first.load(Ordering::SeqCst), 0);
         wait_for_count(&second, 1).await;
@@ -1449,11 +1447,9 @@ mod tests {
             )
             .await;
 
-        assert!(
-            !manager
-                .cancel_with_children(session_id, &parent_id)
-                .await
-                .is_empty()
+        assert_ne!(
+            manager.cancel_with_children(session_id, &parent_id).await,
+            [] as [bcode_session_models::WorkId; 0]
         );
         wait_for_count(&parent_count, 1).await;
         wait_for_count(&child_count, 1).await;

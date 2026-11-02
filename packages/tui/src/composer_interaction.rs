@@ -791,7 +791,10 @@ pub mod tests {
         field.identity.lifetime += 1;
         state.observe_focused_field(scope(), field);
         assert!(!state.visible());
-        assert!(state.items.is_empty());
+        assert_eq!(
+            state.items,
+            [] as [bmux_tui_components::selectable_list::SelectableListItem; 0]
+        );
         assert!(state.focused_edit().is_none());
     }
 

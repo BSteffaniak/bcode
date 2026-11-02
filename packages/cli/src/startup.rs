@@ -962,7 +962,7 @@ mod tests {
             recovery: None,
         };
         super::recover_launch_input(&mut input);
-        assert!(input.choices.is_empty());
+        assert_eq!(input.choices, [] as [bcode_tui::QuickConnectionChoice; 0]);
         let recovery = input.recovery.unwrap();
         assert!(recovery.contains("a session may already exist"));
         assert!(recovery.contains("inspect Sessions"));

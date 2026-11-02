@@ -76,7 +76,10 @@ fn unavailable_and_bad_config_return_valid_error_snapshots() {
                 code: expected.into()
             }
         );
-        assert!(snapshot.candidates.is_empty());
+        assert_eq!(
+            snapshot.candidates,
+            [] as [bcode_plugin_sdk::composer::ComposerCandidate; 0]
+        );
         snapshot.validate_for(&request).unwrap();
     }
 }
@@ -157,6 +160,9 @@ fn cancellation_before_search_and_in_nested_reply_are_truthful() {
                 code: "cancelled".into()
             }
         );
-        assert!(snapshot.candidates.is_empty());
+        assert_eq!(
+            snapshot.candidates,
+            [] as [bcode_plugin_sdk::composer::ComposerCandidate; 0]
+        );
     }
 }

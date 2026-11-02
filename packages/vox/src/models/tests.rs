@@ -51,8 +51,8 @@ fn catalog_is_pinned_unique_and_has_attribution() {
             Some(std::ffi::OsStr::new("gguf"))
         );
         assert_eq!(Path::new(model.filename).components().count(), 1);
-        assert!(!model.license.is_empty());
-        assert!(!model.attribution.is_empty());
+        assert_ne!(model.license, "");
+        assert_ne!(model.attribution, "");
     }
 }
 
@@ -307,7 +307,7 @@ fn cancellation_during_read_prevents_the_next_write() {
         copy_exact_bounded(&mut CancelRead(cancel.clone()), &mut target, 8, &cancel),
         Err(Error::Cancelled)
     ));
-    assert!(target.is_empty());
+    assert_eq!(target, [] as [u8; 0]);
 }
 
 #[test]

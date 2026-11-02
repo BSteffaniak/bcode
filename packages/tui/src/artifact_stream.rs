@@ -1134,7 +1134,10 @@ mod tests {
         assert!(!coordinator.artifact_fetches[&key].fetching);
         assert_eq!(coordinator.stats.terminal_failures, 1);
         coordinator.reset_session(session_id);
-        assert!(coordinator.failed_invocations().is_empty());
+        assert_eq!(
+            coordinator.failed_invocations(),
+            [] as [std::string::String; 0]
+        );
         assert_eq!(coordinator.artifact_fetches[&key].consecutive_failures, 0);
         assert_eq!(coordinator.artifact_fetches[&key].next_offset, 4);
         assert!(coordinator.next_retry_at().is_some());
@@ -1446,7 +1449,10 @@ mod tests {
                     ..ActiveArtifactFetchState::default()
                 },
             );
-            assert!(coordinator.recovered_invocations().is_empty());
+            assert_eq!(
+                coordinator.recovered_invocations(),
+                [] as [std::string::String; 0]
+            );
         }
     }
 

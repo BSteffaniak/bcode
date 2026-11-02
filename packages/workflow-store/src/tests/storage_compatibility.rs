@@ -354,12 +354,12 @@ fn retirement_preserves_history_and_current_page_continuations_after_upgrade() {
     assert_eq!(page.nodes.len(), 1);
     assert_eq!(page.nodes[0].node.id, "after");
     assert!(page.nodes_complete && page.edges_complete);
-    assert!(page.edges.is_empty());
-    assert!(
+    assert_eq!(page.edges, [] as [crate::run_graph::RunGraphEdge; 0]);
+    assert_eq!(
         store
             .current_run_graph_nodes("run-1", 2, Some("after"), 1)
-            .expect("continuation")
-            .is_empty()
+            .expect("continuation"),
+        [] as [crate::run_graph::RunGraphNode; 0]
     );
     assert_eq!(before, fixture_changes(&store.connection));
     block_on(
@@ -421,11 +421,11 @@ fn schema_37_upgrade_preserves_discovery_and_adds_replacement_intents() {
     .expect("old schema");
     drop(store);
     let mut store = WorkflowStore::initialize_in_state_dir(temp.path(), 1001).expect("upgrade");
-    assert!(
+    assert_eq!(
         store
             .advance_continuation_discovery("artifact", 1)
-            .expect("retained cursor")
-            .is_empty()
+            .expect("retained cursor"),
+        [] as [std::string::String; 0]
     );
     recovery::verify(&store.connection).expect("current schema");
     block_on(drop_table("workflow_replacement_intents").execute(&store.connection))
@@ -1649,11 +1649,9 @@ fn run_creation_validates_each_entry_schema_and_rolls_back_atomically() {
             .expect("summary")
             .is_none()
     );
-    assert!(
-        store
-            .pending_activations(10)
-            .expect("activations")
-            .is_empty()
+    assert_eq!(
+        store.pending_activations(10).expect("activations"),
+        [] as [PendingActivation; 0]
     );
     for table in [
         "workflow_run_graphs",
@@ -2125,7 +2123,7 @@ fn explicit_authored_repair_requires_confined_backup_and_repairs_only_safe_state
         .expect("repair");
     assert!(report.active_pointer_cleared);
     assert_eq!(report.indexes_recreated, 5);
-    assert!(report.remaining_issues.is_empty());
+    assert_eq!(report.remaining_issues, [] as [WorkflowAuthoringIssue; 0]);
     assert!(backup.is_file());
     assert_eq!(
         store

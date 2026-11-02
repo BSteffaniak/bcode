@@ -18913,11 +18913,7 @@ mod tests {
         );
         for package in &plan.packages[1..] {
             assert_eq!(package.plan.lock.imports.len(), 1);
-            assert!(
-                !package.plan.lock.imports[0]
-                    .package_lock_digest_sha256
-                    .is_empty()
-            );
+            assert_ne!(package.plan.lock.imports[0].package_lock_digest_sha256, "");
             let call: WorkflowCallConfiguration = serde_json::from_value(
                 package.plan.members[0].lowering.document.definition.nodes["value"]
                     .configuration
@@ -22704,7 +22700,7 @@ steps:
         assert!(valid.is_valid());
         assert!(valid.source_digest_sha256.is_some());
         assert!(valid.executable_source_digest_sha256.is_some());
-        assert!(valid.diagnostics.is_empty());
+        assert_eq!(valid.diagnostics, [] as [WorkflowValidationDiagnostic; 0]);
         round_trip(&valid);
 
         let mut invalid = authored_document();
@@ -22724,7 +22720,7 @@ steps:
             report.diagnostics[0].document_path,
             "bindings.target.node_id"
         );
-        assert!(!report.diagnostics[0].remediation.is_empty());
+        assert_ne!(report.diagnostics[0].remediation, "");
         round_trip(&report);
     }
 
@@ -25788,7 +25784,7 @@ steps:
     async fn cloned_step_resource_configuration_is_value_semantic() {
         let base = Step::map("worker", |input: Input| Ok(input));
         let writer = base.clone().resources([ResourceClaim::write("repository")]);
-        assert!(base.fragment.nodes[0].resources.is_empty());
+        assert_eq!(base.fragment.nodes[0].resources, [] as [ResourceClaim; 0]);
         assert_eq!(writer.fragment.nodes[0].resources.len(), 1);
     }
 

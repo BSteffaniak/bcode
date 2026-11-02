@@ -170,7 +170,10 @@ fn unsafe_billing_is_not_retained_but_valid_normalized_fields_can_survive() {
     else {
         panic!("capture and normalization are independent")
     };
-    assert!(original.reports.is_empty());
+    assert_eq!(
+        original.reports,
+        [] as [bcode_session_models::OriginalUsageReport; 0]
+    );
     assert_eq!(
         original.capture_issue,
         Some(UsageCaptureIssue::UnsafeOrMalformed)

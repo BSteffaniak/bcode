@@ -1741,17 +1741,17 @@ fn stale_preparation_authority_creates_no_attempt_or_resources() {
             )
             .is_err()
     );
-    assert!(
+    assert_eq!(
         store
             .attempt_history(&run.run_id, None, 10)
-            .expect("attempts")
-            .is_empty()
+            .expect("attempts"),
+        [] as [bcode_workflow::AttemptSummary; 0]
     );
-    assert!(
+    assert_eq!(
         store
             .resource_leases_for_run(&run.run_id, 10)
-            .expect("leases")
-            .is_empty()
+            .expect("leases"),
+        [] as [bcode_workflow::WorkflowResourceLease; 0]
     );
     assert_eq!(
         store
@@ -2526,11 +2526,11 @@ fn authored_workflow_draft_revision_and_preset_lifecycle_survives_restart() {
     reopened
         .delete_workflow_preset(&workflow.workflow_id, "default", 2)
         .expect("delete preset");
-    assert!(
+    assert_eq!(
         reopened
             .list_workflow_presets(&workflow.workflow_id, 10)
-            .expect("presets")
-            .is_empty()
+            .expect("presets"),
+        [] as [WorkflowPreset; 0]
     );
 }
 #[test]

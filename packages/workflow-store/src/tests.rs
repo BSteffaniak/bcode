@@ -887,11 +887,11 @@ fn prepared_mutation_approval_facts_are_persisted_and_survive_restart() {
         );
     }
     let store = WorkflowStore::open_in_state_dir(temp.path()).expect("restart");
-    assert!(
+    assert_eq!(
         store
             .pending_mutation_approvals("mutation-run", 10)
-            .expect("approvals")
-            .is_empty()
+            .expect("approvals"),
+        [] as [bcode_workflow::WorkflowMutationApproval; 0]
     );
     let restored: bcode_workflow::WorkflowMutationGrantScope = serde_json::from_value(
         store
@@ -962,11 +962,9 @@ fn replacement_retains_artifact_after_terminal_cancellation_until_withdrawal() {
     store
         .withdraw_replacement_owned("run-1", "successor", &authority, 21)
         .expect("withdraw");
-    assert!(
-        store
-            .active_target_artifact_ids(10)
-            .expect("released")
-            .is_empty()
+    assert_eq!(
+        store.active_target_artifact_ids(10).expect("released"),
+        [] as [std::string::String; 0]
     );
 }
 
@@ -1026,11 +1024,9 @@ fn active_target_artifact_ids_reports_artifacts_owning_resumable_runs() {
             .status,
         RunStatus::Cancelled
     );
-    assert!(
-        store
-            .active_target_artifact_ids(100)
-            .expect("artifacts")
-            .is_empty()
+    assert_eq!(
+        store.active_target_artifact_ids(100).expect("artifacts"),
+        [] as [std::string::String; 0]
     );
 }
 
@@ -1072,23 +1068,21 @@ fn mutation_approval_cancellation_settles_wait_without_grant_or_attempt() {
             .request_cancellation("mutation-run", 30)
             .expect("cancel")
     );
-    assert!(
+    assert_eq!(
         store
             .pending_mutation_approvals("mutation-run", 10)
-            .expect("approvals")
-            .is_empty()
+            .expect("approvals"),
+        [] as [bcode_workflow::WorkflowMutationApproval; 0]
     );
-    assert!(
-        store
-            .grants_for_run("mutation-run", 10)
-            .expect("grants")
-            .is_empty()
+    assert_eq!(
+        store.grants_for_run("mutation-run", 10).expect("grants"),
+        [] as [bcode_workflow::WorkflowGrant; 0]
     );
-    assert!(
+    assert_eq!(
         store
             .attempt_history("mutation-run", None, 10)
-            .expect("attempts")
-            .is_empty()
+            .expect("attempts"),
+        [] as [bcode_workflow::AttemptSummary; 0]
     );
     assert_eq!(
         store
@@ -1220,11 +1214,11 @@ async fn mutation_approval_approve_persists_grant_before_restart_dispatchability
     }
     let mut store = WorkflowStore::open_in_state_dir(temp.path()).expect("reopen");
     assert_eq!(store.pending_activations(10).expect("pending").len(), 1);
-    assert!(
+    assert_eq!(
         store
             .attempt_history("mutation-run", None, 10)
-            .expect("attempts")
-            .is_empty()
+            .expect("attempts"),
+        [] as [bcode_workflow::AttemptSummary; 0]
     );
     let owner = MutationDispatchOwner(std::sync::atomic::AtomicUsize::new(0));
     let first = store
@@ -1234,13 +1228,13 @@ async fn mutation_approval_approve_persists_grant_before_restart_dispatchability
     assert_eq!(first.admitted.len(), 1);
     let dispatch_identity = first.admitted[0].clone();
     assert_eq!(owner.0.load(std::sync::atomic::Ordering::SeqCst), 1);
-    assert!(
+    assert_eq!(
         store
             .dispatch_pending_activations(&owner, 10, 41)
             .await
             .expect("second scan")
-            .admitted
-            .is_empty()
+            .admitted,
+        [] as [std::string::String; 0]
     );
     assert_eq!(owner.0.load(std::sync::atomic::Ordering::SeqCst), 1);
     let attempts = store
@@ -1366,12 +1360,15 @@ fn mutation_approval_deny_and_expiry_never_dispatch() {
             .expect("resolution");
         assert_eq!(resolved.status, expected);
         assert!(resolved.grant_id.is_none());
-        assert!(store.pending_activations(10).expect("pending").is_empty());
-        assert!(
+        assert_eq!(
+            store.pending_activations(10).expect("pending"),
+            [] as [PendingActivation; 0]
+        );
+        assert_eq!(
             store
                 .attempt_history("mutation-run", None, 10)
-                .expect("attempts")
-                .is_empty()
+                .expect("attempts"),
+            [] as [bcode_workflow::AttemptSummary; 0]
         );
         assert_eq!(
             store
@@ -1423,18 +1420,21 @@ fn mutation_approval_wait_is_exact_persisted_and_restart_safe() {
         store
             .request_mutation_approval(&approval)
             .expect("idempotent request");
-        assert!(store.pending_activations(10).expect("pending").is_empty());
+        assert_eq!(
+            store.pending_activations(10).expect("pending"),
+            [] as [PendingActivation; 0]
+        );
         assert_eq!(
             store
                 .pending_mutation_approvals("mutation-run", 10)
                 .expect("approvals"),
             vec![approval]
         );
-        assert!(
+        assert_eq!(
             store
                 .attempt_history("mutation-run", None, 10)
-                .expect("attempts")
-                .is_empty()
+                .expect("attempts"),
+            [] as [bcode_workflow::AttemptSummary; 0]
         );
     }
     let store = WorkflowStore::open_in_state_dir(temp.path()).expect("reopen");
@@ -1445,7 +1445,10 @@ fn mutation_approval_wait_is_exact_persisted_and_restart_safe() {
             .len(),
         1
     );
-    assert!(store.pending_activations(10).expect("pending").is_empty());
+    assert_eq!(
+        store.pending_activations(10).expect("pending"),
+        [] as [PendingActivation; 0]
+    );
 }
 
 #[test]
@@ -1498,11 +1501,11 @@ fn mutation_approval_rejects_stale_or_wrong_identity_without_waiting() {
     wrong_activation.scope.activation_id = "other-activation".to_string();
     assert!(store.request_mutation_approval(&wrong_activation).is_err());
     assert_eq!(store.pending_activations(10).expect("pending").len(), 1);
-    assert!(
+    assert_eq!(
         store
             .pending_mutation_approvals("mutation-run", 10)
-            .expect("approvals")
-            .is_empty()
+            .expect("approvals"),
+        [] as [bcode_workflow::WorkflowMutationApproval; 0]
     );
 }
 
@@ -2388,11 +2391,11 @@ fn replacement_discovery_pages_terminal_owners_without_mutation() {
             .expect("last"),
         ["c"]
     );
-    assert!(
+    assert_eq!(
         store
             .pending_replacement_run_ids_after("c", 1)
-            .expect("end")
-            .is_empty()
+            .expect("end"),
+        [] as [std::string::String; 0]
     );
     assert!(store.pending_replacement_run_ids_after("", 0).is_err());
     assert!(
@@ -2619,11 +2622,11 @@ fn replacement_process_loss_preserves_atomic_handoff() {
                 .count(),
             1
         );
-        assert!(
+        assert_eq!(
             store
                 .attempt_history("successor", None, 10)
-                .expect("no implicit dispatch")
-                .is_empty()
+                .expect("no implicit dispatch"),
+            [] as [bcode_workflow::AttemptSummary; 0]
         );
         assert_eq!(
             store.run_summary("old").expect("old").expect("run").status,
@@ -3975,11 +3978,11 @@ async fn run_scoped_dispatch_ignores_unrelated_pending_activation() {
             .len(),
         1
     );
-    assert!(
+    assert_eq!(
         store
             .pending_activations_for_run("run-2", 10)
-            .expect("second pending")
-            .is_empty()
+            .expect("second pending"),
+        [] as [PendingActivation; 0]
     );
 }
 
@@ -4052,7 +4055,7 @@ async fn owner_dispatch_persists_intent_before_call_and_receipt_after_acceptance
         .await
         .expect("dispatch");
     assert_eq!(summary.admitted.len(), 1);
-    assert!(summary.unsupported.is_empty());
+    assert_eq!(summary.unsupported, [] as [std::string::String; 0]);
     assert_eq!(
         owner.observed_status.lock().expect("status").as_deref(),
         Some("prepared")
@@ -4113,14 +4116,17 @@ async fn dispatch_failure_stays_prepared_and_is_not_redispatched() {
             .is_err()
     );
     assert_eq!(owner.0.load(Ordering::SeqCst), 1);
-    assert!(store.pending_activations(10).expect("pending").is_empty());
-    assert!(
+    assert_eq!(
+        store.pending_activations(10).expect("pending"),
+        [] as [PendingActivation; 0]
+    );
+    assert_eq!(
         store
             .dispatch_pending_activations(&owner, 10, 21)
             .await
             .expect("retry scan")
-            .admitted
-            .is_empty()
+            .admitted,
+        [] as [std::string::String; 0]
     );
     assert_eq!(owner.0.load(Ordering::SeqCst), 1);
     let attempt = store
@@ -4275,11 +4281,9 @@ fn pending_activation_admission_is_atomic_and_single_winner() {
             .expect("second admission")
             .is_none()
     );
-    assert!(
-        first_store
-            .pending_activations(10)
-            .expect("pending")
-            .is_empty()
+    assert_eq!(
+        first_store.pending_activations(10).expect("pending"),
+        [] as [PendingActivation; 0]
     );
     let attempts = first_store
         .attempt_history("run-1", None, 10)
@@ -4301,7 +4305,10 @@ fn pending_activation_admission_is_atomic_and_single_winner() {
 #[test]
 fn terminal_runs_returns_only_bounded_parent_owned_terminal_runs() {
     let (_temp, store) = initialized_store();
-    assert!(store.terminal_runs(10).expect("terminal runs").is_empty());
+    assert_eq!(
+        store.terminal_runs(10).expect("terminal runs"),
+        [] as [bcode_workflow::WorkflowRunSummary; 0]
+    );
     block_on(
         update("workflow_runs")
             .value("status", "failed")
@@ -4358,11 +4365,9 @@ fn pending_activation_admission_rolls_back_when_intent_is_oversized() {
         .expect_err("oversized intent");
     assert!(error.to_string().contains("exceeds"));
     assert_eq!(store.pending_activations(10).expect("pending").len(), 1);
-    assert!(
-        store
-            .attempt_history("run-1", None, 10)
-            .expect("attempts")
-            .is_empty()
+    assert_eq!(
+        store.attempt_history("run-1", None, 10).expect("attempts"),
+        [] as [bcode_workflow::AttemptSummary; 0]
     );
 }
 
@@ -4394,10 +4399,10 @@ fn prepared_recovery_rejects_malformed_json_without_writes() {
         )
         .expect("malformed JSON fixture");
         let before = fixture_changes(&store.connection);
-        assert!(
+        assert_eq!(
             prepared_read_only_dispatches_for_run(&store.connection, "unrelated-run", 10)
-                .expect("unrelated scope must not decode damaged rows")
-                .is_empty()
+                .expect("unrelated scope must not decode damaged rows"),
+            [] as [PreparedActivationDispatch; 0]
         );
         assert!(prepared_read_only_dispatches(&store.connection, 10).is_err());
         assert!(prepared_read_only_dispatches_for_run(&store.connection, "run-1", 10).is_err());
@@ -4536,10 +4541,10 @@ fn cancellation_admission_recovery_never_enables_redispatch() {
             prepared_dispatches_scoped(&store.connection, Some("run-1"), 10, false, None)
                 .expect("evidence");
         assert_eq!(evidence.len(), 1);
-        assert!(
+        assert_eq!(
             prepared_read_only_dispatches_for_run(&store.connection, "run-1", 10)
-                .expect("redispatch")
-                .is_empty()
+                .expect("redispatch"),
+            [] as [PreparedActivationDispatch; 0]
         );
         assert_eq!(fixture_changes(&store.connection), before);
     }
@@ -4598,10 +4603,10 @@ fn prepared_recovery_filters_identities_before_limit() {
             .expect("selected recovery");
     assert_eq!(recovered.len(), 1);
     assert_eq!(recovered[0].dispatch_identity, "later-identity");
-    assert!(
+    assert_eq!(
         prepared_dispatches_scoped(&store.connection, Some("run-1"), 1, true, Some(&[]))
-            .expect("empty selection")
-            .is_empty()
+            .expect("empty selection"),
+        [] as [PreparedActivationDispatch; 0]
     );
 }
 
@@ -4756,15 +4761,14 @@ fn prepared_recovery_requires_running_activations() {
         )
         .expect("non-running activation");
         let before = fixture_changes(&store.connection);
-        assert!(
-            prepared_read_only_dispatches(&store.connection, 10)
-                .expect("global recovery")
-                .is_empty()
+        assert_eq!(
+            prepared_read_only_dispatches(&store.connection, 10).expect("global recovery"),
+            [] as [PreparedActivationDispatch; 0]
         );
-        assert!(
+        assert_eq!(
             prepared_read_only_dispatches_for_run(&store.connection, "run-1", 10)
-                .expect("run recovery")
-                .is_empty()
+                .expect("run recovery"),
+            [] as [PreparedActivationDispatch; 0]
         );
         assert_eq!(fixture_changes(&store.connection), before);
     }
@@ -4913,7 +4917,7 @@ fn restart_reconciliation_never_retries_ambiguous_mutation() {
         .expect("reconcile");
 
     assert_eq!(summary.repair_required, [identity]);
-    assert!(summary.safe_prepared.is_empty());
+    assert_eq!(summary.safe_prepared, [] as [std::string::String; 0]);
     let run_status: String = fixture_scalar_text(
         &store.connection,
         &select("workflow_runs")
@@ -5138,7 +5142,7 @@ fn durable_repeat_control_settlement_advances_generation_then_fails_at_bound() {
     let settled = store
         .settle_pending_control_nodes("repeat-run", 10, 5)
         .expect("complete");
-    assert!(settled.activated.is_empty());
+    assert_eq!(settled.activated, [] as [bcode_workflow::NewActivation; 0]);
     assert_eq!(
         store
             .run_summary("repeat-run")
@@ -5217,7 +5221,7 @@ fn repeat_restart_cannot_duplicate_or_skip_generation() {
     let second = reopened
         .settle_pending_control_nodes("repeat-restart-run", 10, 4)
         .expect("idempotent settle");
-    assert!(second.activated.is_empty());
+    assert_eq!(second.activated, [] as [bcode_workflow::NewActivation; 0]);
     drop(reopened);
 
     let reopened = WorkflowStore::open_in_state_dir(temp.path()).expect("second reopen");
@@ -5859,7 +5863,7 @@ fn assert_source_local_context(
     let (last, _, _) = store
         .execution_context_graph_page(link, authority, &continuation)
         .expect("source continuation");
-    assert!(last.edges.is_empty());
+    assert_eq!(last.edges, [] as [crate::run_graph::RunGraphEdge; 0]);
     assert!(last.edges_complete);
     let stale = bcode_workflow::WorkflowExecutionContextRequest {
         expected_revision: Some(999),
@@ -6154,7 +6158,10 @@ fn cancelled_ambiguous_attempt_cannot_be_abandoned_for_retry() {
     let after = store.attempt_history("run-1", None, 10).expect("after");
     assert_eq!(after[0].status, before[0].status);
     assert_eq!(after[0].attempt, before[0].attempt);
-    assert!(store.pending_activations(10).expect("pending").is_empty());
+    assert_eq!(
+        store.pending_activations(10).expect("pending"),
+        [] as [PendingActivation; 0]
+    );
 }
 
 #[test]
@@ -6336,7 +6343,7 @@ async fn receipt_page_advances_past_deferred_work() {
         .reconcile_owned_receipt_page(&Observer, "run-1", &authority, &identity, 1, 21)
         .await
         .expect("next");
-    assert!(summary.deferred.is_empty());
+    assert_eq!(summary.deferred, [] as [std::string::String; 0]);
     assert!(cursor.is_none());
     let first = store
         .advance_receipt_recovery(&Observer, "run-1", &authority, 1, 22)
@@ -6349,7 +6356,7 @@ async fn receipt_page_advances_past_deferred_work() {
         .advance_receipt_recovery(&Observer, "run-1", &authority, 1, 23)
         .await
         .expect("durable next");
-    assert!(next.deferred.is_empty());
+    assert_eq!(next.deferred, [] as [std::string::String; 0]);
     let revisited = store
         .advance_receipt_recovery(&Observer, "run-1", &authority, 1, 24)
         .await
@@ -6571,7 +6578,7 @@ async fn receipt_pages_advance_past_unresolved_attempts() {
         .await
         .expect("next page");
     assert!(next.is_none());
-    assert!(summary.succeeded.is_empty());
+    assert_eq!(summary.succeeded, [] as [std::string::String; 0]);
     assert_eq!(
         reopened
             .attempt_history("run-1", None, 10)
@@ -6736,7 +6743,7 @@ async fn run_scoped_async_reconciliation_ignores_unrelated_owner_failure() {
         .await
         .expect("unrelated failure must not fail run-scoped reconciliation");
 
-    assert!(summary.succeeded.is_empty());
+    assert_eq!(summary.succeeded, [] as [std::string::String; 0]);
     assert_eq!(
         store
             .attempt_history("run-1", None, 10)
@@ -6795,7 +6802,7 @@ async fn unknown_cancellation_outcome_requires_repair_not_success() {
         .reconcile_receipt_backed_attempts_async(&Observer, 10, 22)
         .await
         .expect("observe");
-    assert!(summary.cancelled.is_empty());
+    assert_eq!(summary.cancelled, [] as [std::string::String; 0]);
     assert_eq!(summary.repair_required, vec![identity]);
     assert_eq!(
         store.attempt_history("run-1", None, 10).expect("history")[0].status,
@@ -6843,7 +6850,7 @@ async fn cancellation_recovery_requires_terminal_owner_evidence_after_restart() 
             .reconcile_receipt_backed_attempts_async(&Observer(observation), 10, 22)
             .await
             .expect("observe cancellation progress");
-        assert!(summary.cancelled.is_empty());
+        assert_eq!(summary.cancelled, [] as [std::string::String; 0]);
         assert_ne!(
             store
                 .run_summary("run-1")
@@ -6940,11 +6947,11 @@ fn receipt_backed_restart_reconciliation_persists_terminal_success() {
 #[test]
 fn pending_work_rejects_inconsistent_executable_binding_without_writes() {
     let (_temp, store) = initialized_store();
-    assert!(
-        !store
+    assert_ne!(
+        store
             .pending_activations_for_run("run-1", 10)
-            .expect("pending work")
-            .is_empty()
+            .expect("pending work"),
+        [] as [PendingActivation; 0]
     );
     block_on(
         update("workflow_activations")
@@ -7357,11 +7364,11 @@ fn verify_fan_out_terminal_result(store: &WorkflowStore, failed: bool) {
             .count(),
         3 - usize::from(failed)
     );
-    assert!(
+    assert_eq!(
         store
             .pending_activations_for_run("run-1", 10)
-            .expect("pending")
-            .is_empty()
+            .expect("pending"),
+        [] as [PendingActivation; 0]
     );
 }
 
@@ -7977,12 +7984,12 @@ fn assert_retired_fan_out_after_reopen(path: &std::path::Path, run_id: &str) {
             .iter()
             .all(|activation| activation.node_id == "replacement")
     );
-    assert!(
+    assert_eq!(
         store
             .settle_pending_control_nodes(run_id, 10, 23)
             .expect("settle")
-            .activated
-            .is_empty()
+            .activated,
+        [] as [bcode_workflow::NewActivation; 0]
     );
     let count: u64 = fixture_scalar_unsigned(
         &store.connection,
@@ -8449,11 +8456,9 @@ fn retry_boundaries_survive_restart_without_automatic_scheduling() {
     drop(reopened);
 
     let reopened = WorkflowStore::open_in_state_dir(temp.path()).expect("terminal restart");
-    assert!(
-        reopened
-            .pending_activations(10)
-            .expect("pending")
-            .is_empty()
+    assert_eq!(
+        reopened.pending_activations(10).expect("pending"),
+        [] as [PendingActivation; 0]
     );
     assert_eq!(
         reopened
@@ -8508,7 +8513,7 @@ fn cancelled_receipt_backed_mutation_is_terminal_not_repair_required() {
         .reconcile_receipt_backed_attempts(&Observer, 10, 20)
         .expect("reconcile");
     assert_eq!(summary.cancelled, [identity]);
-    assert!(summary.repair_required.is_empty());
+    assert_eq!(summary.repair_required, [] as [std::string::String; 0]);
     assert_eq!(
         store
             .run_summary("run-1")
@@ -8682,14 +8687,14 @@ fn missing_recovery_barrier_is_not_recreated_on_open() {
     assert!(WorkflowStore::open_in_state_dir(temp.path()).is_err());
     assert!(WorkflowStore::initialize_in_state_dir(temp.path(), 994).is_err());
     let connection = fixture_open(&workflow_database_path(temp.path()), true);
-    assert!(
+    assert_eq!(
         fixture_rows(
             &connection,
             &select("sqlite_schema")
                 .columns(&["name"])
                 .where_eq("name", "recovery_blocks_handoff")
-        )
-        .is_empty()
+        ),
+        [] as [switchy_database::Row; 0]
     );
 }
 
@@ -9317,7 +9322,7 @@ fn verify_edge_removal_publication(retain_active: bool) {
         .expect("authority")
         .expect("owner");
     let edges = store.run_graph_edges("run-1", None, 100).expect("edges");
-    assert!(!edges.is_empty());
+    assert_ne!(edges, [] as [crate::run_graph::RunGraphEdge; 0]);
     assert_incident_edges(&store, &edges);
     let request = bcode_workflow::WorkflowRunGraphEditBatch {
         version: bcode_workflow::WORKFLOW_RUN_GRAPH_EDIT_VERSION,
@@ -9371,11 +9376,11 @@ fn verify_edge_removal_publication(retain_active: bool) {
     )
     .expect("live edges");
     assert_eq!(live, 0);
-    assert!(
+    assert_eq!(
         store
             .current_run_graph_incident_edges("run-1", 2, "first", true, None, 1)
-            .expect("retired outgoing")
-            .is_empty()
+            .expect("retired outgoing"),
+        [] as [crate::run_graph::RunGraphEdge; 0]
     );
     assert!(
         store
@@ -9465,11 +9470,9 @@ fn assert_revised_settlement_rollback(
             .to_string()
             .contains("injected revised settlement failure")
     );
-    assert!(
-        store
-            .output_summaries(&output.run_id, 10)
-            .expect("outputs")
-            .is_empty()
+    assert_eq!(
+        store.output_summaries(&output.run_id, 10).expect("outputs"),
+        [] as [bcode_workflow::WorkflowOutputSummary; 0]
     );
     let status = fixture_scalar_text(
         &store.connection,
@@ -9526,7 +9529,7 @@ fn settle_disconnected_source(
     let outcome = store
         .persist_validated_output_at_graph_revision(&output, 2, authority)
         .expect("retired edge does not block settlement");
-    assert!(outcome.activated.is_empty());
+    assert_eq!(outcome.activated, [] as [bcode_workflow::NewActivation; 0]);
 }
 
 fn assert_published_leaf_admission(store: &WorkflowStore) {
@@ -10406,11 +10409,11 @@ fn exact_node_revision_preserves_historical_executable_after_reopen() {
         .current_run_graph_nodes("run-1", 2, None, 1)
         .expect("current page");
     assert_eq!(page, vec![current.clone()]);
-    assert!(
+    assert_eq!(
         store
             .current_run_graph_nodes("run-1", 2, Some("review"), 1)
-            .expect("end")
-            .is_empty()
+            .expect("end"),
+        [] as [crate::run_graph::RunGraphNode; 0]
     );
     assert!(store.current_run_graph_nodes("run-1", 1, None, 1).is_err());
     assert!(store.current_run_graph_nodes("run-1", 2, None, 0).is_err());
@@ -10622,11 +10625,11 @@ fn exact_edge_revision_preserves_history_after_reopen() {
         .expect("page");
     assert_eq!(page.len(), 1);
     assert_eq!(page[0].edge, edge);
-    assert!(
+    assert_eq!(
         store
             .current_run_graph_edges("run-1", 2, Some(0), 1)
-            .expect("end")
-            .is_empty()
+            .expect("end"),
+        [] as [crate::run_graph::RunGraphEdge; 0]
     );
     assert!(store.current_run_graph_edges("run-1", 1, None, 1).is_err());
     assert_eq!(
@@ -10909,11 +10912,11 @@ fn endpoint_reads_reject_missing_indexes_without_repair() {
             .run_graph_incoming_edges("run-1", "review", None, 1)
             .is_err()
     );
-    assert!(
+    assert_eq!(
         store
             .run_graph_edges("run-1", None, 1)
-            .expect("unfiltered read remains available")
-            .is_empty()
+            .expect("unfiltered read remains available"),
+        [] as [crate::run_graph::RunGraphEdge; 0]
     );
     assert_eq!(fixture_changes(&store.connection), before);
     let count = fixture_scalar_unsigned(
@@ -11589,7 +11592,7 @@ fn assert_single_node_graph_page_in(db: &dyn Database, node: &super::RunGraphNod
         assert_eq!(page.revision, node.revision);
         assert_eq!(page.nodes, vec![node.clone()]);
         assert!(page.nodes_complete && page.edges_complete);
-        assert!(page.edges.is_empty());
+        assert_eq!(page.edges, [] as [crate::run_graph::RunGraphEdge; 0]);
     }
 }
 
@@ -11610,7 +11613,7 @@ fn assert_single_node_graph_page(store: &WorkflowStore, node: &super::RunGraphNo
         assert_eq!(page.revision, node.revision);
         assert_eq!(page.nodes, vec![node.clone()]);
         assert!(page.nodes_complete && page.edges_complete);
-        assert!(page.edges.is_empty());
+        assert_eq!(page.edges, [] as [crate::run_graph::RunGraphEdge; 0]);
     }
 }
 
@@ -12326,11 +12329,9 @@ fn exit_output_rejects_unknown_activation_state_atomically() {
         store.event_history("run-1", None, 100).expect("events"),
         events
     );
-    assert!(
-        store
-            .output_summaries("run-1", 100)
-            .expect("outputs")
-            .is_empty()
+    assert_eq!(
+        store.output_summaries("run-1", 100).expect("outputs"),
+        [] as [bcode_workflow::WorkflowOutputSummary; 0]
     );
     let status: String = fixture_scalar_text(
         &store.connection,
@@ -12942,7 +12943,7 @@ fn deferred_receipt_backed_mutation_remains_running() {
         .reconcile_receipt_backed_attempts(&Observer, 10, 20)
         .expect("reconcile");
     assert_eq!(summary.deferred, [identity]);
-    assert!(summary.repair_required.is_empty());
+    assert_eq!(summary.repair_required, [] as [std::string::String; 0]);
     assert_eq!(
         store
             .run_summary("run-1")
@@ -13071,8 +13072,8 @@ async fn assert_root_exhaustion_defers_child_dispatch(path: &Path, child_run_id:
         .await
         .unwrap();
     assert_eq!(summary.exhausted.len(), 1);
-    assert!(summary.admitted.is_empty());
-    assert!(summary.raced.is_empty());
+    assert_eq!(summary.admitted, [] as [std::string::String; 0]);
+    assert_eq!(summary.raced, [] as [std::string::String; 0]);
     assert_eq!(owner.0.load(std::sync::atomic::Ordering::SeqCst), 0);
     assert!(fixture_changes(&reopened.connection) > before);
     let event = fixture_scalar_text(
@@ -13112,7 +13113,7 @@ async fn assert_root_exhaustion_defers_child_dispatch(path: &Path, child_run_id:
         .await
         .unwrap();
     assert_eq!(after_restart.exhausted, summary.exhausted);
-    assert!(after_restart.admitted.is_empty());
+    assert_eq!(after_restart.admitted, [] as [std::string::String; 0]);
     assert_eq!(
         fixture_changes(&reopened.connection),
         before_restart_dispatch
@@ -13124,11 +13125,9 @@ async fn assert_root_exhaustion_defers_child_dispatch(path: &Path, child_run_id:
             .unwrap(),
         pending_before_restart
     );
-    assert!(
-        reopened
-            .attempt_history(child_run_id, None, 10)
-            .unwrap()
-            .is_empty()
+    assert_eq!(
+        reopened.attempt_history(child_run_id, None, 10).unwrap(),
+        [] as [bcode_workflow::AttemptSummary; 0]
     );
     assert_eq!(
         reopened
@@ -13986,11 +13985,9 @@ fn child_run_failure_rolls_back_child_and_link() {
     };
     assert!(store.create_child_run_idempotent(&request).is_err());
     assert!(store.run_summary(&child_id).expect("child").is_none());
-    assert!(
-        store
-            .child_run_links("rollback-parent", 10)
-            .expect("links")
-            .is_empty()
+    assert_eq!(
+        store.child_run_links("rollback-parent", 10).expect("links"),
+        [] as [bcode_workflow::WorkflowRunLink; 0]
     );
     request.run.workspace_snapshot = "snapshot".to_string();
     request.run.limits.node_execution_cap += 1;
@@ -14453,7 +14450,7 @@ fn assert_pending_publication_finalization(
         .accepted_run_graph_publication_page(&run.run_id, authority, None, 1)
         .expect("discover accepted publication");
     assert_eq!(page, std::slice::from_ref(&request.mutation_id));
-    assert!(
+    assert_eq!(
         store
             .accepted_run_graph_publication_page(
                 &run.run_id,
@@ -14461,8 +14458,8 @@ fn assert_pending_publication_finalization(
                 Some(&request.mutation_id),
                 1
             )
-            .expect("end of page")
-            .is_empty()
+            .expect("end of page"),
+        [] as [std::string::String; 0]
     );
     let mut stale = authority.clone();
     stale.generation += 1;
@@ -14622,11 +14619,11 @@ fn assert_publication_cancellation_settlement(
             .has_publication_cancellation_intent(run_id, "unrelated-dispatch")
             .expect("unrelated attempt")
     );
-    assert!(
+    assert_eq!(
         store
             .pending_publication_cancellations_after(run_id, authority, Some(&identity), 1)
-            .expect("end of cancellation sweep")
-            .is_empty()
+            .expect("end of cancellation sweep"),
+        [] as [ActiveAttemptCancellation; 0]
     );
     assert!(
         store
@@ -14646,7 +14643,7 @@ fn assert_publication_cancellation_settlement(
     let running = store
         .apply_attempt_observation(&identity, AttemptObservation::Running, 31)
         .expect("still running");
-    assert!(running.cancelled.is_empty());
+    assert_eq!(running.cancelled, [] as [std::string::String; 0]);
     assert_eq!(
         store
             .pending_publication_cancellations(run_id, authority, 10)
@@ -14658,11 +14655,11 @@ fn assert_publication_cancellation_settlement(
         .apply_attempt_observation(&identity, AttemptObservation::Cancelled, 32)
         .expect("owner stopped");
     assert_eq!(settled.cancelled, [identity]);
-    assert!(
+    assert_eq!(
         store
             .pending_publication_cancellations(run_id, authority, 10)
-            .expect("settled")
-            .is_empty()
+            .expect("settled"),
+        [] as [ActiveAttemptCancellation; 0]
     );
     assert!(
         !cancellation_requested_for_run(&store.connection, run_id).expect("not run cancellation")
@@ -14714,7 +14711,7 @@ fn cancellation_requires_terminal_owner_evidence() {
         let summary = store
             .apply_attempt_observation(&identity, observation, 21)
             .expect("nonterminal owner");
-        assert!(summary.cancelled.is_empty());
+        assert_eq!(summary.cancelled, [] as [std::string::String; 0]);
         if unknown {
             assert_eq!(summary.repair_required, [identity]);
             assert_eq!(
@@ -14782,11 +14779,9 @@ fn cancellation_intent_wins_over_late_success_observation() {
         .expect("cancelled late success");
 
     assert_eq!(summary.cancelled, [identity]);
-    assert!(
-        store
-            .output_summaries("run-1", 10)
-            .expect("outputs")
-            .is_empty()
+    assert_eq!(
+        store.output_summaries("run-1", 10).expect("outputs"),
+        [] as [bcode_workflow::WorkflowOutputSummary; 0]
     );
     assert_eq!(
         store
@@ -14995,7 +14990,7 @@ async fn cancellation_propagates_to_receipt_backed_owner_after_durable_intent() 
         .propagate_cancellation("run-1", &owner, 10, 22)
         .await
         .expect("already signalled");
-    assert!(repeated.signalled.is_empty());
+    assert_eq!(repeated.signalled, [] as [std::string::String; 0]);
     assert_eq!(owner.requests.lock().expect("requests").len(), 1);
     assert_eq!(
         store.attempt_history("run-1", None, 10).expect("attempts")[0].status,
@@ -15778,12 +15773,9 @@ fn explicit_repair_requires_proof_and_never_dispatches() {
             .status,
         RunStatus::Paused
     );
-    assert!(
-        store
-            .doctor_run("run-1", 10)
-            .expect("doctor")
-            .issues
-            .is_empty()
+    assert_eq!(
+        store.doctor_run("run-1", 10).expect("doctor").issues,
+        [] as [bcode_workflow::WorkflowDoctorIssue; 0]
     );
 }
 
@@ -15873,11 +15865,11 @@ fn explicit_abandonment_is_required_before_retrying_ambiguous_mutation() {
         prepared_at_ms: older[0].prepared_at_ms,
         dispatch_identity: older[0].dispatch_identity.clone(),
     };
-    assert!(
+    assert_eq!(
         store
             .attempt_history("run-1", Some(&end_cursor), 1)
-            .expect("end of attempt history")
-            .is_empty()
+            .expect("end of attempt history"),
+        [] as [bcode_workflow::AttemptSummary; 0]
     );
     assert_eq!(fixture_changes(&store.connection), before);
     assert_attempt_coordinate_corruption_is_non_mutating(&store, &newest[0].dispatch_identity);
@@ -16046,11 +16038,9 @@ fn durable_input_gate_waits_validates_and_activates_successor() {
         .expect("next");
     assert_eq!(next.node_id, "next");
     assert_eq!(next.input, Some(serde_json::json!(7)));
-    assert!(
-        store
-            .waiting_activations("input-run", 10)
-            .expect("waits")
-            .is_empty()
+    assert_eq!(
+        store.waiting_activations("input-run", 10).expect("waits"),
+        [] as [bcode_workflow::WaitingActivation; 0]
     );
 }
 
@@ -16304,7 +16294,10 @@ fn durable_approval_denial_is_terminal_and_never_activates_downstream() {
         .expect("deny");
     assert_eq!(result.outcome, "denied");
     assert_eq!(result.run_status, RunStatus::Failed);
-    assert!(store.pending_activations(10).expect("pending").is_empty());
+    assert_eq!(
+        store.pending_activations(10).expect("pending"),
+        [] as [PendingActivation; 0]
+    );
     assert_eq!(
         store
             .run_summary("approval-run")
@@ -16578,12 +16571,12 @@ async fn prepared_read_only_redispatch_reuses_identity_and_persists_receipt() {
         .expect("row");
     assert_eq!(attempt.status, "admitted");
     assert!(attempt.has_receipt);
-    assert!(
+    assert_eq!(
         reopened
             .redispatch_prepared_read_only(&owner, 10, 21)
             .await
-            .expect("idempotent scan")
-            .is_empty()
+            .expect("idempotent scan"),
+        [] as [std::string::String; 0]
     );
 }
 
@@ -16854,7 +16847,7 @@ async fn dispatch_admission_enforces_declared_resources_and_run_concurrency() {
         .dispatch_pending_activations(&Owner, 10, 4)
         .await
         .expect("capacity defers");
-    assert!(summary.admitted.is_empty());
+    assert_eq!(summary.admitted, [] as [std::string::String; 0]);
     assert_eq!(summary.raced.len(), 1);
     assert_eq!(store.pending_activations(10).unwrap().len(), 1);
     let attempts = store
@@ -16864,7 +16857,7 @@ async fn dispatch_admission_enforces_declared_resources_and_run_concurrency() {
     let leases = store
         .resource_leases_for_run("parallel-resource-run", 10)
         .unwrap();
-    assert!(leases.is_empty());
+    assert_eq!(leases, [] as [bcode_workflow::WorkflowResourceLease; 0]);
     let first_dispatch = &attempts[0].dispatch_identity;
     assert_deferred_worker_resumes(&mut store, &Owner, temp.path(), first_dispatch).await;
 }
@@ -16906,7 +16899,7 @@ async fn assert_deferred_worker_resumes(
         .await
         .unwrap();
     assert_eq!(exhausted.exhausted.len(), 1);
-    assert!(exhausted.admitted.is_empty());
+    assert_eq!(exhausted.admitted, [] as [std::string::String; 0]);
     store
         .apply_attempt_observation(first_dispatch, AttemptObservation::Cancelled, 5)
         .unwrap();
@@ -16916,7 +16909,7 @@ async fn assert_deferred_worker_resumes(
         .await
         .unwrap();
     assert_eq!(exhausted.exhausted.len(), 1);
-    assert!(exhausted.admitted.is_empty());
+    assert_eq!(exhausted.admitted, [] as [std::string::String; 0]);
     let authority = reopened
         .execution_authority("parallel-resource-run")
         .unwrap()
@@ -16934,7 +16927,7 @@ async fn assert_deferred_worker_resumes(
         .await
         .unwrap();
     assert_eq!(summary.admitted.len(), 1);
-    assert!(summary.raced.is_empty());
+    assert_eq!(summary.raced, [] as [std::string::String; 0]);
     let attempts = reopened
         .attempt_history("parallel-resource-run", None, 10)
         .unwrap();
@@ -16946,7 +16939,10 @@ async fn assert_deferred_worker_resumes(
             .count(),
         1
     );
-    assert!(reopened.pending_activations(10).unwrap().is_empty());
+    assert_eq!(
+        reopened.pending_activations(10).unwrap(),
+        [] as [PendingActivation; 0]
+    );
 }
 
 #[test]
@@ -17116,15 +17112,15 @@ fn decisions_grants_leases_and_checkpoints_are_durable_and_fail_closed() {
             .expect("restored checkpoint"),
         Some(checkpoint)
     );
-    assert!(
-        !fixture_rows(
+    assert_ne!(
+        fixture_rows(
             &reopened.connection,
             &select("workflow_resource_leases")
                 .columns(&["lease_id"])
                 .where_eq("lease_id", "lease-write")
                 .where_eq("released_at_ms", DatabaseValue::Null)
-        )
-        .is_empty()
+        ),
+        [] as [switchy_database::Row; 0]
     );
 }
 
@@ -17761,7 +17757,7 @@ fn repeat_completion_does_not_terminalize_unfinished_work() {
     let result = store
         .settle_pending_control_nodes(&run.run_id, 10, 4)
         .expect("settle repeat");
-    assert!(result.activated.is_empty());
+    assert_eq!(result.activated, [] as [bcode_workflow::NewActivation; 0]);
     assert_eq!(
         store
             .run_summary(&run.run_id)
@@ -18077,7 +18073,10 @@ fn attempt_history_rejects_unrepresentable_cursor_timestamp() {
         };
         let result = store.attempt_history("run-1", Some(&cursor), 1);
         if i64::try_from(prepared_at_ms).is_ok() {
-            assert!(result.expect("representable cursor").is_empty());
+            assert_eq!(
+                result.expect("representable cursor"),
+                [] as [bcode_workflow::AttemptSummary; 0]
+            );
         } else {
             assert!(matches!(result, Err(WorkflowStoreError::InvalidData(_))));
         }
@@ -18625,7 +18624,7 @@ fn conflicting_start_preserves_admitted_run_across_reopen() {
     let admitted_nodes = store
         .run_graph_nodes(&rejected.run_id, None, 100)
         .expect("admitted graph");
-    assert!(!admitted_nodes.is_empty());
+    assert_ne!(admitted_nodes, [] as [crate::run_graph::RunGraphNode; 0]);
     let admitted_summary = store.run_summary(&rejected.run_id).expect("admitted run");
     rejected.input = Some(serde_json::json!("conflicting duplicate"));
     assert!(store.create_run(&rejected).is_err());
@@ -18685,11 +18684,9 @@ fn invalid_successor_input_rolls_back_output_and_activation_atomically() {
             .collect::<Vec<_>>(),
         ["first"]
     );
-    assert!(
-        store
-            .output_summaries(&run.run_id, 10)
-            .expect("outputs")
-            .is_empty()
+    assert_eq!(
+        store.output_summaries(&run.run_id, 10).expect("outputs"),
+        [] as [bcode_workflow::WorkflowOutputSummary; 0]
     );
 }
 
@@ -19241,7 +19238,7 @@ fn successor_preserves_existing_generation_with_distinct_identity() {
                 created_at_ms: 20,
             })
             .expect("source completion");
-        assert!(result.activated.is_empty());
+        assert_eq!(result.activated, [] as [bcode_workflow::NewActivation; 0]);
         let rows = fixture_rows(
             &store.connection,
             &select("workflow_activations")
@@ -19430,11 +19427,9 @@ fn oversized_transform_context_rolls_back_output_and_successor() {
             })
             .expect_err("oversized context");
         assert!(error.to_string().contains("invalid or oversized"));
-        assert!(
-            store
-                .output_summaries("run-1", 100)
-                .expect("outputs")
-                .is_empty()
+        assert_eq!(
+            store.output_summaries("run-1", 100).expect("outputs"),
+            [] as [bcode_workflow::WorkflowOutputSummary; 0]
         );
         assert_eq!(
             store.event_history("run-1", None, 100).expect("events"),
@@ -19614,11 +19609,9 @@ fn transform_non_dependency_reference_rolls_back_output() {
         })
         .expect_err("non-dependency reference");
     assert!(error.to_string().contains("non-dependency node"));
-    assert!(
-        store
-            .output_summaries("run-1", 100)
-            .expect("outputs")
-            .is_empty()
+    assert_eq!(
+        store.output_summaries("run-1", 100).expect("outputs"),
+        [] as [bcode_workflow::WorkflowOutputSummary; 0]
     );
     assert_eq!(
         store.event_history("run-1", None, 100).expect("events"),
@@ -19715,12 +19708,10 @@ fn check_skipped_dependency_materialization(reference_skipped: bool) {
         return;
     }
     let error = result.expect_err("skipped dependency has no value");
-    assert!(!error.to_string().is_empty());
-    assert!(
-        store
-            .output_summaries(&run.run_id, 10)
-            .expect("outputs")
-            .is_empty()
+    assert_ne!(error.to_string(), "");
+    assert_eq!(
+        store.output_summaries(&run.run_id, 10).expect("outputs"),
+        [] as [bcode_workflow::WorkflowOutputSummary; 0]
     );
     assert_eq!(
         store
@@ -19807,7 +19798,7 @@ fn revised_leaf_output_requires_current_admission_and_completes() {
         .persist_validated_output_at_graph_revision(&output, 2, &authority)
         .expect("revised leaf settlement");
     assert_eq!(outcome.run_status, RunStatus::Completed);
-    assert!(outcome.activated.is_empty());
+    assert_eq!(outcome.activated, [] as [bcode_workflow::NewActivation; 0]);
     drop(store);
     let mut store = WorkflowStore::open_in_state_dir(temp.path()).expect("reopen");
     assert!(store.persist_validated_output(&output).is_err());
@@ -19947,11 +19938,11 @@ fn assert_retained_successor_deadline(store: &mut WorkflowStore, output: &Valida
         .persist_validated_output(output)
         .expect_err("expired successor admission");
     assert!(error.to_string().contains("deadline"));
-    assert!(
+    assert_eq!(
         store
             .validated_outputs("sequential-run", 10)
-            .expect("no expired output")
-            .is_empty()
+            .expect("no expired output"),
+        [] as [bcode_workflow::ValidatedOutput; 0]
     );
     block_on(
         update("workflow_runs")
@@ -20989,17 +20980,17 @@ fn preparation_failure_rolls_back_resource_leases_and_events() {
             )
             .is_err()
     );
-    assert!(
+    assert_eq!(
         store
             .resource_leases_for_run(&run.run_id, 10)
-            .expect("leases")
-            .is_empty()
+            .expect("leases"),
+        [] as [bcode_workflow::WorkflowResourceLease; 0]
     );
-    assert!(
+    assert_eq!(
         store
             .attempt_history(&run.run_id, None, 10)
-            .expect("attempts")
-            .is_empty()
+            .expect("attempts"),
+        [] as [bcode_workflow::AttemptSummary; 0]
     );
     let after: u64 = fixture_scalar_unsigned(
         &store.connection,
@@ -21072,11 +21063,11 @@ async fn dispatch_receipt_is_fenced_when_authority_transfers_after_owner_accepta
         .reconcile_owned_prepared_attempts_for_run(&run.run_id, &replacement, 10, 27)
         .expect("replacement recovery");
     assert_eq!(recovered.repair_required.len(), 1);
-    assert!(
+    assert_eq!(
         store
             .pending_activations_for_run(&run.run_id, 10)
-            .expect("pending")
-            .is_empty()
+            .expect("pending"),
+        [] as [PendingActivation; 0]
     );
 }
 
@@ -21325,11 +21316,9 @@ fn execution_allowance_increase_is_fenced_and_compare_and_set() {
         store.pending_activations_for_run(&run.run_id, 10).unwrap(),
         pending
     );
-    assert!(
-        store
-            .attempt_history(&run.run_id, None, 10)
-            .unwrap()
-            .is_empty()
+    assert_eq!(
+        store.attempt_history(&run.run_id, None, 10).unwrap(),
+        [] as [bcode_workflow::AttemptSummary; 0]
     );
     for status in ["completed", "failed", "cancelled", "repair_required"] {
         block_on(
@@ -21547,11 +21536,11 @@ fn unresolved_repair_retains_owning_artifact_until_terminal_resolution() {
             &authority,
         )
         .expect("resolution");
-    assert!(
+    assert_eq!(
         store
             .active_target_artifact_ids(10)
-            .expect("terminal artifacts")
-            .is_empty()
+            .expect("terminal artifacts"),
+        [] as [std::string::String; 0]
     );
 }
 
@@ -21717,17 +21706,15 @@ fn recovery_takeover_settles_cancellation_from_owner_evidence_after_restart() {
             .status,
         RunStatus::Cancelled
     );
-    assert!(
+    assert_eq!(
         store
             .active_attempt_cancellations(&run.run_id, 10)
-            .expect("settled cancellations")
-            .is_empty()
+            .expect("settled cancellations"),
+        [] as [ActiveAttemptCancellation; 0]
     );
-    assert!(
-        store
-            .active_target_artifact_ids(10)
-            .expect("retention")
-            .is_empty()
+    assert_eq!(
+        store.active_target_artifact_ids(10).expect("retention"),
+        [] as [std::string::String; 0]
     );
 }
 
@@ -21931,11 +21918,9 @@ fn recovery_discovery_includes_fenced_repair_runs() {
         )
         .expect("prepare");
     store.reconcile_prepared_attempts(10, 11).expect("repair");
-    assert!(
-        store
-            .recovery_candidate_run_ids(10)
-            .expect("before")
-            .is_empty()
+    assert_eq!(
+        store.recovery_candidate_run_ids(10).expect("before"),
+        [] as [std::string::String; 0]
     );
     store
         .enter_recovery_only(&run.run_id, &authority, 12)
@@ -22546,11 +22531,9 @@ fn assert_graph_gate_cancellation(kind: bcode_workflow::NodeKind, answer_first: 
     );
     drop(store);
     let mut store = WorkflowStore::open_in_state_dir(temp.path()).expect("reopen");
-    assert!(
-        store
-            .waiting_activations(&run.run_id, 10)
-            .expect("waiting")
-            .is_empty()
+    assert_eq!(
+        store.waiting_activations(&run.run_id, 10).expect("waiting"),
+        [] as [bcode_workflow::WaitingActivation; 0]
     );
     assert!(
         store
@@ -22568,13 +22551,14 @@ fn assert_graph_gate_cancellation(kind: bcode_workflow::NodeKind, answer_first: 
             .resolve_approval(&run.run_id, "first", &activation_id, true, 22)
             .is_err()
     );
-    assert!(
-        store
-            .validated_outputs(&run.run_id, 10)
-            .expect("outputs")
-            .is_empty()
+    assert_eq!(
+        store.validated_outputs(&run.run_id, 10).expect("outputs"),
+        [] as [bcode_workflow::ValidatedOutput; 0]
     );
-    assert!(store.pending_activations(10).expect("pending").is_empty());
+    assert_eq!(
+        store.pending_activations(10).expect("pending"),
+        [] as [PendingActivation; 0]
+    );
 }
 
 fn assert_answer_wins_graph_cancellation(
@@ -22657,11 +22641,11 @@ fn retained_connected_successor_requires_binding_and_commits_current_revision() 
         created_at_ms: 20,
     };
     assert!(store.persist_validated_output(&output).is_err());
-    assert!(
+    assert_eq!(
         store
             .validated_outputs("sequential-run", 10)
-            .expect("outputs")
-            .is_empty()
+            .expect("outputs"),
+        [] as [bcode_workflow::ValidatedOutput; 0]
     );
     assert_eq!(
         store
@@ -22687,11 +22671,11 @@ fn retained_connected_successor_requires_binding_and_commits_current_revision() 
             .persist_validated_output_with_fault(&output, &FailRetainedSuccessors)
             .is_err()
     );
-    assert!(
+    assert_eq!(
         store
             .validated_outputs("sequential-run", 10)
-            .expect("rolled back outputs")
-            .is_empty()
+            .expect("rolled back outputs"),
+        [] as [bcode_workflow::ValidatedOutput; 0]
     );
     assert_eq!(
         store
@@ -22850,7 +22834,7 @@ fn validated_output_atomically_activates_direct_successor_and_completes_run() {
         })
         .expect("second output");
     assert_eq!(second.run_status, RunStatus::Completed);
-    assert!(second.activated.is_empty());
+    assert_eq!(second.activated, [] as [bcode_workflow::NewActivation; 0]);
     assert_eq!(
         store
             .run_summary("sequential-run")
@@ -22887,7 +22871,10 @@ fn paused_completion_materializes_successor_without_admitting_execution() {
         .unwrap();
     assert_eq!(result.run_status, RunStatus::Paused);
     assert_eq!(result.activated.len(), 1);
-    assert!(store.pending_activations(10).unwrap().is_empty());
+    assert_eq!(
+        store.pending_activations(10).unwrap(),
+        [] as [PendingActivation; 0]
+    );
     drop(store);
     let mut store = WorkflowStore::open_in_state_dir(temp.path()).unwrap();
     assert_eq!(
@@ -22948,7 +22935,7 @@ fn join_activates_once_only_after_all_direct_dependencies_complete() {
             })
             .expect("branch output");
         if node_id == "left" {
-            assert!(result.activated.is_empty());
+            assert_eq!(result.activated, [] as [bcode_workflow::NewActivation; 0]);
         } else {
             assert_eq!(result.activated.len(), 1);
             assert_eq!(result.activated[0].node_id, "join");
@@ -23361,7 +23348,7 @@ fn parallel_missing_result_preserves_successful_sibling_and_failure_after_reopen
             })
             .expect("retain successful sibling despite missing result");
         assert_eq!(result.run_status, RunStatus::Failed);
-        assert!(result.activated.is_empty());
+        assert_eq!(result.activated, [] as [bcode_workflow::NewActivation; 0]);
         drop(store);
         let reopened = WorkflowStore::open_in_state_dir(temp.path()).expect("reopen");
         assert_eq!(
@@ -23523,11 +23510,11 @@ fn fail_fast_parallel_failure_persists_sibling_cancellation_before_signalling() 
             .mark_sibling_cancellation_signalled(&right_identity, 7)
             .expect("mark signalled")
     );
-    assert!(
+    assert_eq!(
         reopened
             .pending_sibling_cancellations(10)
-            .expect("settled pending siblings")
-            .is_empty()
+            .expect("settled pending siblings"),
+        [] as [ActiveAttemptCancellation; 0]
     );
     assert_eq!(
         reopened
@@ -24612,7 +24599,7 @@ fn unmatched_conditional_edges_complete_with_the_source_terminal_output() {
             created_at_ms: 20,
         })
         .expect("output");
-    assert!(result.activated.is_empty());
+    assert_eq!(result.activated, [] as [bcode_workflow::NewActivation; 0]);
     assert_eq!(result.run_status, RunStatus::Completed);
     assert_eq!(
         store
@@ -24733,11 +24720,9 @@ fn resumable_pending_runs_exclude_paused_cancelled_repair_and_active_work() {
     );
 
     store.pause_run("run-1", 20).expect("pause");
-    assert!(
-        store
-            .resumable_pending_run_ids(10)
-            .expect("paused")
-            .is_empty()
+    assert_eq!(
+        store.resumable_pending_run_ids(10).expect("paused"),
+        [] as [std::string::String; 0]
     );
     store.resume_run("run-1", 21).expect("resume");
     let prepared = store
@@ -24751,21 +24736,17 @@ fn resumable_pending_runs_exclude_paused_cancelled_repair_and_active_work() {
             prepared_at_ms: 22,
         })
         .expect("prepare");
-    assert!(
-        store
-            .resumable_pending_run_ids(10)
-            .expect("active attempt")
-            .is_empty()
+    assert_eq!(
+        store.resumable_pending_run_ids(10).expect("active attempt"),
+        [] as [std::string::String; 0]
     );
     store.request_cancellation("run-1", 23).expect("cancel");
     store
         .settle_orphaned_attempt_cancellation(&prepared, 24)
         .expect("settle");
-    assert!(
-        store
-            .resumable_pending_run_ids(10)
-            .expect("cancelled")
-            .is_empty()
+    assert_eq!(
+        store.resumable_pending_run_ids(10).expect("cancelled"),
+        [] as [std::string::String; 0]
     );
 
     let mut repair = initialized_store_at(temp.path().join("repair").as_path());
@@ -24774,11 +24755,9 @@ fn resumable_pending_runs_exclude_paused_cancelled_repair_and_active_work() {
     repair
         .settle_orphaned_attempt_cancellation(&identity, 21)
         .expect("repair required");
-    assert!(
-        repair
-            .resumable_pending_run_ids(10)
-            .expect("repair")
-            .is_empty()
+    assert_eq!(
+        repair.resumable_pending_run_ids(10).expect("repair"),
+        [] as [std::string::String; 0]
     );
 }
 
@@ -24791,11 +24770,17 @@ fn pending_activation_reads_are_bounded_and_definition_backed() {
     assert_eq!(pending[0].input, Some(serde_json::json!(1)));
     assert_eq!(pending[0].node.kind, bcode_workflow::NodeKind::Task);
     store.pause_run("run-1", 20).expect("pause");
-    assert!(store.pending_activations(10).expect("paused").is_empty());
+    assert_eq!(
+        store.pending_activations(10).expect("paused"),
+        [] as [PendingActivation; 0]
+    );
     store.resume_run("run-1", 21).expect("resume");
     assert_eq!(store.pending_activations(10).expect("resumed").len(), 1);
     store.request_cancellation("run-1", 22).expect("cancel");
-    assert!(store.pending_activations(10).expect("cancelled").is_empty());
+    assert_eq!(
+        store.pending_activations(10).expect("cancelled"),
+        [] as [PendingActivation; 0]
+    );
 }
 
 #[test]
@@ -24887,11 +24872,11 @@ fn idle_discovery_preserves_publication_read_fence() {
     let mut store = WorkflowStore::open_in_state_dir(temp.path()).expect("store");
     let fence = store.publication_read_fence().expect("fence");
     for _ in 0..3 {
-        assert!(
+        assert_eq!(
             store
                 .advance_continuation_discovery("artifact-a", 1)
-                .unwrap()
-                .is_empty()
+                .unwrap(),
+            [] as [std::string::String; 0]
         );
         store
             .validate_publication_read_fence(&fence)
@@ -24941,11 +24926,11 @@ fn durable_discovery_survives_restart_and_isolates_artifacts() {
             .expect("third"),
         ["c"]
     );
-    assert!(
+    assert_eq!(
         store
             .advance_continuation_discovery("artifact-a", 1)
-            .expect("end")
-            .is_empty()
+            .expect("end"),
+        [] as [std::string::String; 0]
     );
     assert_eq!(
         store
@@ -25007,11 +24992,9 @@ fn running_discovery_pages_past_unchanged_runs() {
         store.continuation_run_ids_after("b", 1).expect("last"),
         ["c"]
     );
-    assert!(
-        store
-            .continuation_run_ids_after("c", 1)
-            .expect("end")
-            .is_empty()
+    assert_eq!(
+        store.continuation_run_ids_after("c", 1).expect("end"),
+        [] as [std::string::String; 0]
     );
     assert!(store.continuation_run_ids_after("", 0).is_err());
 }
@@ -25235,11 +25218,11 @@ fn bounded_run_inspection_queries_exclude_inline_output_values() {
         .output_summaries_after("run-1", None, 1)
         .expect("page");
     assert_eq!(page[0].output_id, "output-1");
-    assert!(
+    assert_eq!(
         store
             .output_summaries_after("run-1", Some("output-1"), 1)
-            .expect("end")
-            .is_empty()
+            .expect("end"),
+        [] as [bcode_workflow::WorkflowOutputSummary; 0]
     );
     let exact = store
         .inspect_exact_output("run-1", "output-1")
@@ -25272,17 +25255,13 @@ fn bounded_run_inspection_queries_exclude_inline_output_values() {
     )
     .expect("damage fixture");
     assert!(store.inspect_exact_output("run-1", "output-1").is_err());
-    assert!(
-        store
-            .grants_for_run("run-1", 10)
-            .expect("grants")
-            .is_empty()
+    assert_eq!(
+        store.grants_for_run("run-1", 10).expect("grants"),
+        [] as [bcode_workflow::WorkflowGrant; 0]
     );
-    assert!(
-        store
-            .resource_leases_for_run("run-1", 10)
-            .expect("leases")
-            .is_empty()
+    assert_eq!(
+        store.resource_leases_for_run("run-1", 10).expect("leases"),
+        [] as [bcode_workflow::WorkflowResourceLease; 0]
     );
 }
 
@@ -25570,7 +25549,10 @@ fn definition_registration_rejects_deserialized_invalid_structure() {
         .persist_definition("example", 1, &definition)
         .expect_err("invalid definition");
     assert!(error.to_string().contains("unknown step 'missing'"));
-    assert!(store.list_definitions(10).expect("list").is_empty());
+    assert_eq!(
+        store.list_definitions(10).expect("list"),
+        [] as [bcode_workflow::StoredWorkflowDefinition; 0]
+    );
 }
 
 #[test]

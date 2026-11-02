@@ -158,11 +158,11 @@ fn discovery_returns_only_recorded_public_metadata_and_validates_every_reference
 fn empty_recorded_discovery_is_not_a_missing_receipt() {
     let (request, mut receipt, _) = fixture();
     receipt.receipt["diagnostics"]["artifacts"] = serde_json::json!([]);
-    assert!(
+    assert_eq!(
         summaries(&receipt, &request.run_id, &request.dispatch_identity)
             .unwrap()
-            .artifacts
-            .is_empty()
+            .artifacts,
+        [] as [bcode_workflow::WorkflowDiagnosticArtifactSummary; 0]
     );
     receipt.receipt = serde_json::json!({});
     assert!(matches!(

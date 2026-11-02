@@ -555,7 +555,7 @@ impl WorkflowTemplateContribution {
         ) {
             (Some(definition), None, None) => definition,
             (None, Some(source), Some(document)) => {
-                source.validate().map_err(&invalid)?;
+                source.validate().map_err(invalid)?;
                 document.validate()?;
                 &document.definition
             }
@@ -1885,7 +1885,7 @@ pub enum PluginLoadError {
     #[error("failed to parse manifest {path}: {source}")]
     ManifestParse {
         path: PathBuf,
-        source: toml::de::Error,
+        source: Box<toml::de::Error>,
     },
     #[error("plugin '{plugin_id}' uses unsupported ABI version {actual}; expected {expected}")]
     UnsupportedAbi {
@@ -1931,7 +1931,7 @@ pub enum PluginLoadError {
     #[error("plugin manifest export from {library} did not parse: {source}")]
     ExportedManifestParse {
         library: PathBuf,
-        source: toml::de::Error,
+        source: Box<toml::de::Error>,
     },
     #[error("manifest ID mismatch: file declared '{file_id}', library exported '{library_id}'")]
     ManifestIdMismatch { file_id: String, library_id: String },
@@ -2123,7 +2123,7 @@ fn parse_static_bundled_manifest(
     let mut manifest: PluginManifest = toml::from_str(plugin.manifest_toml).map_err(|source| {
         PluginLoadError::ExportedManifestParse {
             library: PathBuf::from("<static>"),
-            source,
+            source: Box::new(source),
         }
     })?;
     if let Some(package_root) = plugin.package_root {
@@ -6349,7 +6349,7 @@ fn read_manifest(path: &Path) -> Result<PluginManifest, PluginLoadError> {
     let contents = std::fs::read_to_string(path)?;
     toml::from_str(&contents).map_err(|source| PluginLoadError::ManifestParse {
         path: path.to_path_buf(),
-        source,
+        source: Box::new(source),
     })
 }
 
@@ -6386,7 +6386,7 @@ fn load_exported_manifest(
     })?;
     toml::from_str(manifest_toml).map_err(|source| PluginLoadError::ExportedManifestParse {
         library: library_path.to_path_buf(),
-        source,
+        source: Box::new(source),
     })
 }
 
@@ -6406,7 +6406,7 @@ fn load_static_exported_manifest(
     })?;
     toml::from_str(manifest_toml).map_err(|source| PluginLoadError::ExportedManifestParse {
         library: PathBuf::from("<static>"),
-        source,
+        source: Box::new(source),
     })
 }
 
@@ -6604,7 +6604,10 @@ library = "libexample.dylib"
         );
         assert_eq!(config.categories, vec!["tool", "example"]);
         assert_eq!(config.aliases[0].reason.as_deref(), Some("legacy"));
-        assert!(config.validation_errors().is_empty());
+        assert_eq!(
+            config.validation_errors(),
+            [] as [PluginConfigMetadataError; 0]
+        );
     }
 
     #[test]
@@ -12639,7 +12642,10 @@ library = "libexample_plugin.dylib"
             .unwrap()
             .remove("composer_contributions");
         let legacy: PluginManifest = serde_json::from_value(legacy_json).unwrap();
-        assert!(legacy.composer_contributions.is_empty());
+        assert_eq!(
+            legacy.composer_contributions,
+            [] as [bcode_plugin_sdk::composer::ComposerContribution; 0]
+        );
         manifest.services[0].interface_id = COMPOSER_INTERFACE_ID.into();
         manifest.composer_contributions.push(ComposerContribution {
             id: "topics".into(),
@@ -12659,14 +12665,26 @@ library = "libexample_plugin.dylib"
         manifest
             .composer_contributions
             .push(manifest.composer_contributions[0].clone());
-        assert!(owned_composer_contributions(&manifest).is_empty());
+        assert_eq!(
+            owned_composer_contributions(&manifest),
+            [] as [bcode_plugin_sdk::composer::PluginOwnedComposerContribution; 0]
+        );
         manifest.composer_contributions.pop();
         manifest.composer_contributions[0].service_interface_id = "bcode.composer/v2".into();
-        assert!(owned_composer_contributions(&manifest).is_empty());
+        assert_eq!(
+            owned_composer_contributions(&manifest),
+            [] as [bcode_plugin_sdk::composer::PluginOwnedComposerContribution; 0]
+        );
         manifest.composer_contributions[0].service_interface_id = COMPOSER_INTERFACE_ID.into();
         manifest.services.clear();
-        assert!(owned_composer_contributions(&manifest).is_empty());
-        assert!(plugin_composer_contributions(&[]).is_empty());
+        assert_eq!(
+            owned_composer_contributions(&manifest),
+            [] as [bcode_plugin_sdk::composer::PluginOwnedComposerContribution; 0]
+        );
+        assert_eq!(
+            plugin_composer_contributions(&[]),
+            [] as [bcode_plugin_sdk::composer::PluginOwnedComposerContribution; 0]
+        );
     }
 
     pub fn test_manifest(id: &str) -> PluginManifest {

@@ -238,10 +238,9 @@ mod tests {
     #[test]
     fn opaque_plugin_payloads_are_not_call_dependencies() {
         let source = r#"{"workflow_source_version":3,"steps":[{"id":"plugin","uses":"plugin/action@1","with":{"workflow_call":{"target":"not-a-call"}}}]}"#;
-        assert!(
-            workflow_source_dependency_targets(source, WorkflowSourceFormat::Json)
-                .unwrap()
-                .is_empty()
+        assert_eq!(
+            workflow_source_dependency_targets(source, WorkflowSourceFormat::Json).unwrap(),
+            [] as [WorkflowCallTarget; 0]
         );
     }
 

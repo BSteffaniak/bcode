@@ -64,7 +64,7 @@ fn rich_images_follow_item_revision_width_removal_and_viewport_clipping() {
             assert_eq!(image.destination.intersection(area), image.destination);
             assert_eq!(image.allocation.unwrap().height, 4);
         } else {
-            assert!(frame.images().is_empty());
+            assert_eq!(frame.images(), []);
         }
     }
     source.revision += 1;

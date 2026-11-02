@@ -1005,7 +1005,7 @@ mod tests {
             report.cases[0].context,
             ImageVerificationOutcome::Unsupported
         );
-        assert!(provider.requests.is_empty());
+        assert_eq!(provider.requests, [] as [bcode_model::ModelTurnRequest; 0]);
         options.model.feature_support.media_input.insert(
             MediaInputFeature::ToolResultImage,
             bcode_model::CapabilitySupport::supported(
@@ -1039,7 +1039,7 @@ mod tests {
         else {
             panic!("control result")
         };
-        assert!(result.content.is_empty());
+        assert_eq!(result.content, [] as [bcode_model::ToolResultContent; 0]);
         assert!(
             provider
                 .requests
@@ -1078,7 +1078,7 @@ mod tests {
         options.images[0].data_base64 = "A".repeat(MAX_IMAGE_BASE64_BYTES);
         let mut provider = ProbeProvider::default();
         assert!(run_image_verification(&mut provider, &options).is_err());
-        assert!(provider.requests.is_empty());
+        assert_eq!(provider.requests, [] as [bcode_model::ModelTurnRequest; 0]);
     }
 
     #[test]

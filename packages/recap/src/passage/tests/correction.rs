@@ -118,11 +118,11 @@ async fn invalid_completed_patch_gets_distinct_bounded_feedback_and_full_rerevie
         }
         assert!(patches[0].input.get("patch_correction").is_none());
         assert_eq!(patches[1].input["patch_correction"]["attempt"], 1);
-        assert!(
-            !patches[1].input["patch_correction"]["rejection"]
+        assert_ne!(
+            patches[1].input["patch_correction"]["rejection"]
                 .as_str()
-                .unwrap()
-                .is_empty()
+                .unwrap(),
+            ""
         );
         assert_eq!(
             requests

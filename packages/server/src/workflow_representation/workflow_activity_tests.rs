@@ -71,7 +71,7 @@ fn shared_failure_boundary_preserves_closed_codes_and_operations() {
         };
         assert_eq!(operation, "session_link");
         assert_eq!(code, expected_code);
-        assert!(!message.is_empty());
+        assert_ne!(message, "");
         let response =
             bcode_ipc::ErrorResponse::new(code, format!("{message}; operation={operation}"));
         let encoded = serde_json::to_value(response).expect("portable error response");
@@ -520,7 +520,10 @@ async fn retained_database_handle_keeps_snapshot_pages_readable_until_close() {
         .expect("retained snapshot page must not deadlock")
         .unwrap();
     drop(state);
-    assert!(second.children.is_empty());
+    assert_eq!(
+        second.children,
+        [] as [bcode_workflow_view_models::WorkflowActivityChild; 0]
+    );
     assert!(second.inventory_exhausted);
     assert!(second.subtree_coverage_complete);
     tokio::time::timeout(Duration::from_millis(250), scans.close(&first.scan_id))

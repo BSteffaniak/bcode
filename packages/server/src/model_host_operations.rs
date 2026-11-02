@@ -1705,7 +1705,7 @@ mod tests {
         let config = bcode_config::BcodeConfig::default();
         let host = ModelHostOperations::from_config(&config);
         assert!(!host.admits("bcode.auth-broker"));
-        assert!(host.admission.model_profile.is_empty());
+        assert_eq!(host.admission.model_profile, "");
         drop(host);
         let mut config = config;
         config.plugins.config.insert("bcode.auth-broker".into(), toml::from_str(

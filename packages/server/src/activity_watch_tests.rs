@@ -493,12 +493,12 @@ async fn loaded_child_window_tracks_relationship_and_metadata_without_recursive_
         }],
     };
     let handle = state.activity_watches.open(&state, owner, scope).unwrap();
-    assert!(
+    assert_eq!(
         pull(&state, owner, handle).await.snapshot.children[0]
             .as_ref()
             .unwrap()
-            .children
-            .is_empty()
+            .children,
+        [] as [bcode_session_models::SessionSummary; 0]
     );
     let child = Box::pin(state.sessions.create_child_session(
         bcode_session_models::SessionChildCreateRequest {

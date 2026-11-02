@@ -6198,7 +6198,7 @@ mod tests {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         assert_eq!(requests.len(), 1);
-        assert!(requests[0].tools.is_empty());
+        assert_eq!(requests[0].tools, [] as [bcode_model::ToolDefinition; 0]);
         assert!(requests[0].structured_output.is_some());
         drop(requests);
     }
@@ -6281,7 +6281,7 @@ mod tests {
         assert!(requests[1].structured_output.is_none());
         assert_eq!(requests[1].tools.len(), 1);
         assert!(requests[2].structured_output.is_some());
-        assert!(requests[2].tools.is_empty());
+        assert_eq!(requests[2].tools, [] as [bcode_model::ToolDefinition; 0]);
         assert!(response.events.iter().any(|event| matches!(
             event,
             AgentRuntimeEvent::StructuredOutputFinalizationStarted
@@ -6362,7 +6362,7 @@ mod tests {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         assert_eq!(requests.len(), 2);
-        assert!(requests[1].tools.is_empty());
+        assert_eq!(requests[1].tools, [] as [bcode_model::ToolDefinition; 0]);
         assert!(requests[1].structured_output.is_some());
         drop(requests);
     }
@@ -6728,7 +6728,7 @@ mod tests {
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         assert_eq!(requests.len(), 3);
         for request in &requests[1..] {
-            assert!(request.tools.is_empty());
+            assert_eq!(request.tools, [] as [bcode_model::ToolDefinition; 0]);
             assert!(request.structured_output.is_some());
             assert_eq!(
                 request.tool_call_policy.choice,

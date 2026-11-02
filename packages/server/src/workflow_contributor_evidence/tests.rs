@@ -91,7 +91,10 @@ fn unavailable_contract_does_not_return_partial_evidence() {
         ContributorEvidenceStatus::ProvenanceUnavailable
     );
     assert!(result.scope.is_none());
-    assert!(result.events.is_empty());
+    assert_eq!(
+        result.events,
+        [] as [bcode_workflow::contributor_evidence::ContributorEventReference; 0]
+    );
     assert!(result.evidence.is_none());
 }
 
@@ -349,8 +352,14 @@ async fn missing_or_corrupt_introducing_publication_never_releases_history() {
             );
             assert!(response.scope.is_none());
             assert!(response.evidence.is_none());
-            assert!(response.contributors.is_empty());
-            assert!(response.events.is_empty());
+            assert_eq!(
+                response.contributors,
+                [] as [bcode_workflow::contributor_evidence::ContributorEvidenceScope; 0]
+            );
+            assert_eq!(
+                response.events,
+                [] as [bcode_workflow::contributor_evidence::ContributorEventReference; 0]
+            );
         } else {
             assert!(
                 corrupt,
@@ -481,7 +490,10 @@ async fn entry_context_generated_listing_excludes_equal_output_sibling() {
     assert!(response.generated_provenance.is_some());
     assert!(response.scope.is_none());
     assert!(response.evidence.is_none());
-    assert!(response.events.is_empty());
+    assert_eq!(
+        response.events,
+        [] as [bcode_workflow::contributor_evidence::ContributorEventReference; 0]
+    );
     assert_eq!(
         response
             .contributors
@@ -513,8 +525,14 @@ async fn entry_context_damaged_publication_never_releases_contributors() {
         ContributorEvidenceStatus::ProvenanceUnavailable
     );
     assert!(response.scope.is_none());
-    assert!(response.contributors.is_empty());
-    assert!(response.events.is_empty());
+    assert_eq!(
+        response.contributors,
+        [] as [bcode_workflow::contributor_evidence::ContributorEvidenceScope; 0]
+    );
+    assert_eq!(
+        response.events,
+        [] as [bcode_workflow::contributor_evidence::ContributorEventReference; 0]
+    );
     assert!(response.evidence.is_none());
 }
 

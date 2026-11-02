@@ -203,12 +203,12 @@ async fn transaction_compatible_reads_leave_caller_snapshot_active() {
         .is_err()
     );
     assert!(!tx.sqlite_is_autocommit().await.unwrap());
-    assert!(
+    assert_eq!(
         page_in(&*tx, &run.run_id, None, Section::Children, None, 1)
             .await
             .unwrap()
-            .children
-            .is_empty()
+            .children,
+        [] as [bcode_workflow::WorkflowRunLink; 0]
     );
     tx.rollback().await.unwrap();
     assert!(
@@ -290,7 +290,7 @@ async fn attempts_without_sessions_still_advance_inventory_cursor() {
     .unwrap();
     assert_eq!(pinned_second.attempts.len(), 1);
     // The helper did not consume or commit the caller's transaction.
-    assert!(
+    assert_eq!(
         page_in(
             &*snapshot,
             &run.run_id,
@@ -301,8 +301,8 @@ async fn attempts_without_sessions_still_advance_inventory_cursor() {
         )
         .await
         .unwrap()
-        .children
-        .is_empty()
+        .children,
+        [] as [bcode_workflow::WorkflowRunLink; 0]
     );
     snapshot.rollback().await.unwrap();
     let children = page(
@@ -315,6 +315,9 @@ async fn attempts_without_sessions_still_advance_inventory_cursor() {
     )
     .await
     .unwrap();
-    assert!(children.children.is_empty());
+    assert_eq!(
+        children.children,
+        [] as [bcode_workflow::WorkflowRunLink; 0]
+    );
     assert!(children.next_after.is_none());
 }

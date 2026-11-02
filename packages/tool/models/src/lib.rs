@@ -228,7 +228,6 @@ impl ToolPresentationUpdateScope {
     ///
     /// Includes fences for presentations no longer retained by a consumer. Iteration
     /// does not change scope state, generation, or duplicate acceptance semantics.
-    #[must_use]
     pub fn iter_retained_revisions(
         &self,
     ) -> impl ExactSizeIterator<Item = (&ToolPresentationIdentity, u64)> {

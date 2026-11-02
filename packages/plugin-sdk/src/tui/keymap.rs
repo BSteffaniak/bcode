@@ -340,10 +340,9 @@ mod tests {
             assert_eq!(registry.action_for_key("viewer", stroke), None);
             assert!(registry.is_overridden_key("viewer", stroke));
         }
-        assert!(
-            registry
-                .keys_for_action("viewer", "plugin.upper")
-                .is_empty()
+        assert_eq!(
+            registry.keys_for_action("viewer", "plugin.upper"),
+            [] as [&str; 0]
         );
     }
 
@@ -464,7 +463,10 @@ mod tests {
                 BTreeMap::from([("enter".into(), String::new()), ("o".into(), String::new())]),
             )]))
             .unwrap();
-        assert!(registry.keys_for_action("viewer", "plugin.open").is_empty());
+        assert_eq!(
+            registry.keys_for_action("viewer", "plugin.open"),
+            [] as [&str; 0]
+        );
     }
 
     #[test]
@@ -481,7 +483,7 @@ mod tests {
         registry
             .register(action("plugin.open", "viewer", &["enter"]))
             .unwrap();
-        assert!(registry.unresolved_actions().is_empty());
+        assert_eq!(registry.unresolved_actions(), [] as [(&str, &str); 0]);
         assert_eq!(registry.keys_for_action("viewer", "plugin.open"), ["x"]);
     }
 

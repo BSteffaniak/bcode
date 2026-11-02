@@ -123,7 +123,7 @@ fn assert_monitor_resize_preserves_selection(app: &mut BmuxApp, selected: Sessio
             );
         }
         if width == 0 || height == 0 {
-            assert!(frame.hits().regions().is_empty());
+            assert_eq!(frame.hits().regions(), []);
         }
     }
 }
@@ -374,7 +374,10 @@ fn canonical_parent_intent_is_not_a_card_and_publication_retry_is_one_card() {
         },
     );
     let mut app = BmuxApp::new_with_history(Some(parent), &[intent], &[], false);
-    assert!(app.session_view_snapshot().transcript.items.is_empty());
+    assert_eq!(
+        app.session_view_snapshot().transcript.items,
+        [] as [bcode_session_view_models::TranscriptViewItem; 0]
+    );
     app.absorb_session_event(&published);
     let mut retry = published.clone();
     retry.sequence = 3;
@@ -413,11 +416,11 @@ fn canonical_parent_intent_is_not_a_card_and_publication_retry_is_one_card() {
 #[test]
 fn unrelated_session_has_no_child_strip_until_monitor_requested() {
     let mut app = BmuxApp::new_with_history(Some(SessionId::new()), &[], &[], false);
-    assert!(app.child_activity_text().is_empty());
+    assert_eq!(app.child_activity_text(), "");
     app.toggle_child_panel();
     assert!(app.child_activity_text().contains("unknown"));
     app.toggle_child_panel();
-    assert!(app.child_activity_text().is_empty());
+    assert_eq!(app.child_activity_text(), "");
     drop(app);
 }
 
@@ -565,7 +568,10 @@ fn monitor_refresh_updates_attention_without_retargeting_selection() {
     app.release_child_panel_focus();
     app.open_child_panel();
     assert_eq!(app.selected_monitor_session(), Some(selected));
-    assert!(app.session_view_snapshot().transcript.items.is_empty());
+    assert_eq!(
+        app.session_view_snapshot().transcript.items,
+        [] as [bcode_session_view_models::TranscriptViewItem; 0]
+    );
     drop(app);
 }
 
@@ -729,7 +735,7 @@ fn monitor_painted_panel_preserves_status_color_and_visible_chevron_geometry() {
                 assert_ne!(styles.raised.bg, app.presented_theme().canvas.bg);
             }
             if area.is_empty() {
-                assert!(hits.is_empty());
+                assert_eq!(hits, [] as [crate::monitor_presentation::MonitorHit; 0]);
             }
         }
     }

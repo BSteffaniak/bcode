@@ -55,11 +55,11 @@ async fn large_restart_reopens_and_admits_only_after_all_retirements() {
         .await
         .unwrap();
     assert!(pending(&*db, "graph").await.unwrap());
-    assert!(
+    assert_eq!(
         super::super::ready(&*db, "graph", 1, None, 100)
             .await
-            .unwrap()
-            .is_empty()
+            .unwrap(),
+        [] as [crate::representation::graph::Activation; 0]
     );
     for _ in 0..5 {
         assert!(
@@ -73,11 +73,11 @@ async fn large_restart_reopens_and_admits_only_after_all_retirements() {
     let db = switchy_database_connection::init_sqlite_rusqlite(Some(&path)).unwrap();
     let mut count = 0;
     while pending(&*db, "graph").await.unwrap() {
-        assert!(
+        assert_eq!(
             super::super::ready(&*db, "graph", 1, None, 100)
                 .await
-                .unwrap()
-                .is_empty()
+                .unwrap(),
+            [] as [crate::representation::graph::Activation; 0]
         );
         assert!(
             super::super::frontier::advance(&*db, &owner, "graph", 7)
@@ -178,13 +178,13 @@ async fn restart_validation_blocks_unsettled_body_before_any_retirement() {
             .unwrap(),
         original
     );
-    assert!(
+    assert_eq!(
         db.select(VISITS)
             .where_eq("phase", "done")
             .limit(1)
             .execute(&*db)
             .await
-            .unwrap()
-            .is_empty()
+            .unwrap(),
+        [] as [switchy_database::Row; 0]
     );
 }

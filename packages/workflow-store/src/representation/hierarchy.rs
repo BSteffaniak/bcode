@@ -811,12 +811,12 @@ mod tests {
         assert_eq!(page.children.len(), 1);
         assert_eq!(page.children[0].child_run_id, child_id);
         assert!(page.next_child_run_id.is_none());
-        assert!(
+        assert_eq!(
             children(db, "parent", Some(child_id), 1)
                 .await
                 .unwrap()
-                .children
-                .is_empty()
+                .children,
+            [] as [bcode_workflow::WorkflowRunLink; 0]
         );
         assert!(children(db, "parent", None, 0).await.is_err());
         let context = parent_context(db, owner, "parent").await.unwrap();

@@ -2289,7 +2289,7 @@ fn local_artifact_paths_and_storage_uris_never_become_unguarded_resources() {
     assert!(text.contains("/tmp/private-image.png"));
     assert!(!text.contains("file:///tmp/private-image.png"));
     assert!(text.contains("Image preview is protected."));
-    assert!(urls.is_empty());
+    assert_eq!(urls, [] as [std::string::String; 0]);
 }
 
 #[test]
@@ -2327,7 +2327,7 @@ fn filesystem_image_adapter_never_uses_untrusted_storage_uris_directly() {
     for container in &protected {
         collect_resource_urls(container, &mut protected_urls);
     }
-    assert!(protected_urls.is_empty());
+    assert_eq!(protected_urls, [] as [std::string::String; 0]);
     assert!(protected_text.contains("Image preview is protected."));
     assert!(protected_text.contains("guarded artifact: inline-image"));
     assert!(protected_text.contains("dimensions: 320x200"));
@@ -2415,7 +2415,7 @@ fn registered_adapters_reject_missing_required_fields_and_unsupported_versions()
             bcode_session_models::ToolContributionPlacement::Request,
         );
         let rendered = container_text_all(&rendered);
-        assert!(!rendered.is_empty());
+        assert_ne!(rendered, "");
         assert!(rendered.len() < 32_000);
         let unsupported = bcode_session_models::ToolContributionEvent {
             schema_version: schema_version.saturating_add(1),
@@ -2445,7 +2445,7 @@ fn registered_adapters_reject_missing_required_fields_and_unsupported_versions()
                 artifact: missing.clone()
             })
         );
-        assert!(!rendered_missing.is_empty());
+        assert_ne!(rendered_missing, "");
         assert!(rendered_missing.len() < 64_000);
         let unsupported = ToolArtifactView::from(ToolArtifact {
             schema_version: schema_version.saturating_add(1),
@@ -2780,7 +2780,7 @@ fn every_registered_visual_adapter_has_a_fixture() {
             panic!("visual adapter fixture did not render {schema}@{schema_version}")
         });
         let rendered = format!("{rich:?}");
-        assert!(!rendered.is_empty());
+        assert_ne!(rendered, "");
         assert!(!rendered.contains("tool request"));
     }
 }
@@ -3177,7 +3177,10 @@ fn runtime_work_is_presented_from_runtime_state_outside_transcript() {
 
     let runtime_work = unrepresented_runtime_work(&snapshot);
     assert_eq!(runtime_work, snapshot.runtime_work);
-    assert!(snapshot.transcript.items.is_empty());
+    assert_eq!(
+        snapshot.transcript.items,
+        [] as [bcode_session_view_models::TranscriptViewItem; 0]
+    );
 }
 
 #[test]

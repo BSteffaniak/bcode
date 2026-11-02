@@ -166,13 +166,13 @@ async fn ownerless_history_read_child() {
         return;
     }
     let session_id = SessionId::new();
-    assert!(
+    assert_eq!(
         bcode_session::lease::active_session_owners(
             &bcode_config::default_session_store_dir(),
             session_id,
         )
-        .unwrap()
-        .is_empty()
+        .unwrap(),
+        [] as [bcode_session::lease::SessionLeaseOwner; 0]
     );
     let endpoint = bcode_ipc::default_endpoint();
     let listener = bcode_ipc::LocalIpcListener::bind(&endpoint).unwrap();
@@ -225,12 +225,12 @@ async fn ownerless_history_read_child() {
     tokio::time::timeout(std::time::Duration::from_secs(15), operations)
         .await
         .expect("bounded IPC history tests timed out");
-    assert!(
+    assert_eq!(
         bcode_session::lease::active_session_owners(
             &bcode_config::default_session_store_dir(),
             session_id,
         )
-        .unwrap()
-        .is_empty()
+        .unwrap(),
+        [] as [bcode_session::lease::SessionLeaseOwner; 0]
     );
 }

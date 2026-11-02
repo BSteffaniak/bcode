@@ -47,7 +47,7 @@ async fn snapshot_waits_retain_input_and_missing_tables_remain_unavailable() {
     let missing = open(store.path(), false).unwrap();
     let tx = missing.begin_transaction().await.unwrap();
     let (waits, complete) = inspect(&*tx, "gates", 1, 100).await;
-    assert!(waits.is_empty());
+    assert_eq!(waits, [] as [bcode_workflow::WaitingActivation; 0]);
     assert_eq!(complete, None);
     tx.commit().await.unwrap();
 }

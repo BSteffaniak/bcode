@@ -4390,7 +4390,7 @@ impl PendingDiscovery {
         }
     }
 
-    #[cfg(test)]
+    #[cfg(all(test, unix))]
     pub(super) fn retained_preview_count(&self) -> usize {
         self.scan
             .as_ref()

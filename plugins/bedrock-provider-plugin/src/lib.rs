@@ -7487,7 +7487,7 @@ mod tests {
                 Some(queued.unwrap_or(StopReason::Cancelled))
             );
             assert!(turn.is_cancelled());
-            assert!(turn.drain().is_empty());
+            assert_eq!(turn.drain(), [] as [bcode_model::ProviderTurnEvent; 0]);
         }
     }
 
@@ -7526,7 +7526,7 @@ mod tests {
             stream_bedrock_turn_inner(&request, &turn, discovery).await,
             Ok(StreamOutcome::Cancelled)
         ));
-        assert!(turn.drain().is_empty());
+        assert_eq!(turn.drain(), [] as [bcode_model::ProviderTurnEvent; 0]);
     }
 
     #[test]
@@ -7540,7 +7540,10 @@ mod tests {
             transferred: true,
         });
         assert!(!turn.is_cancelled());
-        assert!(!store.lock().unwrap().drain(&id).is_empty());
+        assert_ne!(
+            store.lock().unwrap().drain(&id),
+            [] as [bcode_model::ProviderTurnEvent; 0]
+        );
         store.lock().unwrap().finish(&id);
         assert!(turn.is_cancelled());
     }
@@ -7560,7 +7563,10 @@ mod tests {
         }));
         assert!(outcome.is_err());
         assert!(turn.is_cancelled());
-        assert!(store.lock().unwrap().drain(&id).is_empty());
+        assert_eq!(
+            store.lock().unwrap().drain(&id),
+            [] as [bcode_model::ProviderTurnEvent; 0]
+        );
     }
 
     #[test]
@@ -7589,7 +7595,10 @@ mod tests {
         let (turn_id, turn) = plugin.turns.lock().unwrap().insert_started("test");
         plugin.deactivate_concurrent().expect("shutdown");
         assert!(turn.is_cancelled());
-        assert!(plugin.turns.lock().unwrap().drain(&turn_id).is_empty());
+        assert_eq!(
+            plugin.turns.lock().unwrap().drain(&turn_id),
+            [] as [bcode_model::ProviderTurnEvent; 0]
+        );
         assert!(task.is_finished());
         assert!(runtime.block_on(async {}).is_err());
         plugin.deactivate().expect("idempotent shutdown");
@@ -9000,11 +9009,11 @@ mod tests {
     #[test]
     fn mantle_sse_decoder_handles_fragmented_multiline_events() {
         let mut decoder = MantleSseDecoder::default();
-        assert!(
+        assert_eq!(
             decoder
                 .push(b"event: message_start\r\ndata: {\"type\":")
-                .unwrap()
-                .is_empty()
+                .unwrap(),
+            [] as [serde_json::Value; 0]
         );
         let events = decoder
             .push(b"\"message_start\",\r\ndata: \"message\":{}}\r\n\r\n")
@@ -11847,7 +11856,7 @@ mod tests {
             let started = Instant::now();
             let list = plugin.models(&request);
             models_us.push(started.elapsed().as_micros());
-            assert!(!list.models.is_empty());
+            assert_ne!(list.models, [] as [bcode_model::ModelInfo; 0]);
         }
         settings_us.sort_unstable();
         key_us.sort_unstable();

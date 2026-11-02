@@ -967,10 +967,9 @@ mod tests {
         let owner_path = guard.owner_path.clone();
         drop(guard);
         assert!(!owner_path.exists());
-        assert!(
-            active_session_owners(temp_dir.path(), session_id)
-                .expect("owners")
-                .is_empty()
+        assert_eq!(
+            active_session_owners(temp_dir.path(), session_id).expect("owners"),
+            [] as [crate::lease::SessionLeaseOwner; 0]
         );
     }
 
@@ -1074,10 +1073,9 @@ mod tests {
         let abandoned = access_dir.join("abandoned.json.tmp-pre-publish");
         fs::write(&abandoned, b"partial metadata").expect("abandoned temp file");
 
-        assert!(
-            active_session_owners(temp_dir.path(), session_id)
-                .expect("owner scan")
-                .is_empty()
+        assert_eq!(
+            active_session_owners(temp_dir.path(), session_id).expect("owner scan"),
+            [] as [crate::lease::SessionLeaseOwner; 0]
         );
         let owner = acquire_session_lease(temp_dir.path(), session_id, &context("current", 5))
             .expect("pre-publish temp file must not block acquisition");
@@ -1442,10 +1440,9 @@ mod tests {
         let next = acquire_session_maintenance_guard(temp_dir.path(), session_id)
             .expect("failed transition must release maintenance coordinator");
         drop(next);
-        assert!(
-            active_session_owners(temp_dir.path(), session_id)
-                .expect("owner scan")
-                .is_empty()
+        assert_eq!(
+            active_session_owners(temp_dir.path(), session_id).expect("owner scan"),
+            [] as [crate::lease::SessionLeaseOwner; 0]
         );
     }
 

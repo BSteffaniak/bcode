@@ -295,7 +295,7 @@ async fn sensitive_payload_access_is_bounded_and_bound_to_live_owning_observatio
         })
         .expect("EOF");
     assert!(eof.eof);
-    assert!(eof.bytes.is_empty());
+    assert_eq!(eof.bytes, [] as [u8; 0]);
     deep.finalize().expect("cutoff");
     assert!(
         hub.read_payload(&read).is_ok(),
@@ -333,7 +333,10 @@ async fn explicit_capture_locations_survive_delivery_without_discovering_ordinar
         let delivered = receive(observation).await;
         assert_eq!(delivered.event.data, ordinary);
         assert!(delivered.event.capture.is_none());
-        assert!(delivered.payload_references().unwrap().is_empty());
+        assert_eq!(
+            delivered.payload_references().unwrap(),
+            [] as [bcode_xray::XrayPayloadRef; 0]
+        );
     }
     let mut captured = XrayEvent::new(
         "acceptance",

@@ -148,6 +148,7 @@ fn assert_diagnostics(report: &bcode_recap::diagnostics::Report) {
     }
 }
 
+#[allow(clippy::too_many_lines)]
 #[tokio::test]
 async fn engine_fixture_generate_refine_export_and_cancel() {
     let temporary = tempfile::tempdir().unwrap();
@@ -213,7 +214,10 @@ async fn engine_fixture_generate_refine_export_and_cancel() {
     let html = engine
         .export(&initial.id, &Cancellation::default(), &mut |_| {})
         .unwrap();
-    assert!(html.report.degradations.is_empty());
+    assert_eq!(
+        html.report.degradations,
+        [] as [bcode_recap::export::Degradation; 0]
+    );
     assert!(html.html.contains("data:image/jpeg;base64,"));
     std::fs::write(root.join("recap.html"), html.html).unwrap();
     let cancel = Cancellation::default();

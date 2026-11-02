@@ -5069,7 +5069,10 @@ mod tests {
             },
         ]);
         assert_eq!(stale[0].observation, stale[1].observation);
-        assert!(!stale[0].observation.semantic_items.is_empty());
+        assert_ne!(
+            stale[0].observation.semantic_items,
+            [] as [(bcode_session_view_models::TranscriptViewItemId, u64); 0]
+        );
         let stale_items = stale[0].observation.semantic_items.clone();
         bmux_tui_runtime::Program::update(
             &mut model,
@@ -6607,7 +6610,7 @@ mod tests {
                             panic!("canonical older page: {error:?}; {diagnostic}");
                         }
                     };
-                    assert!(!page.events.is_empty());
+                    assert_ne!(page.events, [] as [bcode_session_models::SessionEvent; 0]);
                     assert!(page.events.len() <= 512);
                 } else {
                     panic!("expected older page");
@@ -6769,7 +6772,7 @@ mod tests {
                 } = &result
                 {
                     let (page, _) = page.as_ref().expect("canonical newer page");
-                    assert!(!page.events.is_empty());
+                    assert_ne!(page.events, [] as [bcode_session_models::SessionEvent; 0]);
                     assert!(page.events.len() <= 512);
                 } else {
                     panic!("expected newer page");
@@ -8097,6 +8100,7 @@ mod tests {
         assert!(checked > 0);
     }
 
+    #[allow(clippy::too_many_lines)]
     #[tokio::test]
     async fn shell_navigation_uses_committed_clipped_targets() {
         use bmux_tui::event::{Event, MouseButton, MouseEvent, MouseEventKind};
@@ -8174,7 +8178,10 @@ mod tests {
             .cloned()
             .expect("visible shell terminal target");
         assert!(target.height == 1 && target.width <= 24);
-        assert!(!model.committed_visual_text.is_empty());
+        assert_ne!(
+            model.committed_visual_text,
+            [] as [bcode_plugin_sdk::tui::PluginTuiSelectionRow; 0]
+        );
         let event = Event::Mouse(MouseEvent::new(
             MouseEventKind::Down(MouseButton::Right),
             Point::new(target.x, target.y),
@@ -8200,6 +8207,7 @@ mod tests {
         drop(model);
     }
 
+    #[allow(clippy::too_many_lines)]
     #[tokio::test]
     async fn visual_selection_text_commits_on_first_frame_and_survives_failed_resize() {
         use bmux_tui_runtime::Presenter;
@@ -8263,10 +8271,16 @@ mod tests {
         super::bcode_runtime_presenter(&mut terminal)
             .present(&mut model)
             .unwrap();
-        assert!(!model.committed_visual_text.is_empty());
+        assert_ne!(
+            model.committed_visual_text,
+            [] as [bcode_plugin_sdk::tui::PluginTuiSelectionRow; 0]
+        );
         assert_visual_selection_matches_container(&model.chat.app);
         let targets = model.committed_visual_targets.clone();
-        assert!(!targets.is_empty());
+        assert_ne!(
+            targets,
+            [] as [(bmux_tui::geometry::Rect, std::string::String); 0]
+        );
         model.focused_visual = Some("removed-target".to_owned());
         let before: Vec<_> = model
             .committed_visual_text
@@ -8294,7 +8308,10 @@ mod tests {
         super::bcode_runtime_presenter(&mut terminal)
             .present(&mut model)
             .unwrap();
-        assert!(!model.committed_visual_text.is_empty());
+        assert_ne!(
+            model.committed_visual_text,
+            [] as [bcode_plugin_sdk::tui::PluginTuiSelectionRow; 0]
+        );
         assert!(model.focused_visual.is_none());
         assert_ne!(targets, model.committed_visual_targets);
         drop(model);
@@ -9023,7 +9040,7 @@ mod tests {
         assert!(!model.scheduled_deadlines.contains_key(&timer));
         assert!(model.selection_clear_at.is_none());
         assert!(model.selected_plain_text.is_none());
-        assert!(model.committed_selection.scopes().is_empty());
+        assert_eq!(model.committed_selection.scopes(), []);
         assert!(
             model
                 .chat
@@ -9412,7 +9429,7 @@ mod tests {
         assert_eq!(field.lock().unwrap().document.text, "主题 👩‍💻");
         drop(field);
         assert_eq!(submits.load(std::sync::atomic::Ordering::SeqCst), 0);
-        assert!(model.chat.app.take_pending_submission().is_empty());
+        assert_eq!(model.chat.app.take_pending_submission(), "");
         assert!(!model.loop_state.composer_interaction.visible());
         composer_root_key(&mut model, "enter");
         drop(model);
@@ -9445,7 +9462,7 @@ mod tests {
                 fixture.submits.load(std::sync::atomic::Ordering::SeqCst),
                 usize::from(outcome == EventOutcome::Ignored)
             );
-            assert!(fixture.model.chat.app.take_pending_submission().is_empty());
+            assert_eq!(fixture.model.chat.app.take_pending_submission(), "");
             drop(fixture);
         }
     }
@@ -9601,7 +9618,7 @@ mod tests {
         if let Some(hint) = hint {
             assert!(model.loop_state.composer_interaction.hint().contains(hint));
         } else {
-            assert!(model.loop_state.composer_interaction.hint().is_empty());
+            assert_eq!(model.loop_state.composer_interaction.hint(), "");
         }
         if active_key != Some("ctrl+r") {
             assert_eq!(
@@ -9678,7 +9695,7 @@ mod tests {
             ),
             history
         );
-        assert!(model.chat.app.take_pending_submission().is_empty());
+        assert_eq!(model.chat.app.take_pending_submission(), "");
         drop(model);
     }
 
@@ -9688,7 +9705,7 @@ mod tests {
             let mut model = composer_root_fixture(&bcode_config::TuiConfig::default());
             composer_root_key(&mut model, key);
             assert_eq!(model.chat.app.composer().text(), "主题 👩‍💻");
-            assert!(model.chat.app.take_pending_submission().is_empty());
+            assert_eq!(model.chat.app.take_pending_submission(), "");
             assert!(!model.loop_state.composer_interaction.visible());
             drop(model);
         }
@@ -9708,7 +9725,7 @@ mod tests {
         composer_root_key(&mut model, "escape");
         assert!(!model.loop_state.composer_interaction.visible());
         assert_eq!(model.chat.app.composer().text(), "#topic");
-        assert!(model.chat.app.take_pending_submission().is_empty());
+        assert_eq!(model.chat.app.take_pending_submission(), "");
         drop(model);
     }
 
@@ -9731,7 +9748,7 @@ mod tests {
         );
         composer_root_key(&mut model, "ctrl+y");
         assert_eq!(model.chat.app.composer().text(), "主题 👩‍💻");
-        assert!(model.chat.app.take_pending_submission().is_empty());
+        assert_eq!(model.chat.app.take_pending_submission(), "");
         drop(model);
         let mut model = composer_root_fixture(&config);
         composer_root_key(&mut model, "ctrl+x");
@@ -9740,7 +9757,7 @@ mod tests {
         let mut model = composer_root_fixture(&config);
         composer_root_key(&mut model, "x");
         assert_eq!(model.chat.app.composer().text(), "#topicx");
-        assert!(model.chat.app.take_pending_submission().is_empty());
+        assert_eq!(model.chat.app.take_pending_submission(), "");
         drop(model);
     }
 
@@ -9765,7 +9782,7 @@ mod tests {
             composer_root_key(&mut model, redo);
             assert_eq!(model.chat.app.composer().edit_state(), after);
             assert!(!model.chat.app.composer().can_redo());
-            assert!(model.chat.app.take_pending_submission().is_empty());
+            assert_eq!(model.chat.app.take_pending_submission(), "");
         }
     }
 
@@ -9850,7 +9867,7 @@ mod tests {
             assert_eq!(model.chat.app.composer().edit_state(), before);
             assert!(!model.chat.app.composer().can_undo());
             assert!(!model.chat.app.composer().can_redo());
-            assert!(model.chat.app.take_pending_submission().is_empty());
+            assert_eq!(model.chat.app.take_pending_submission(), "");
         }
     }
 
@@ -9888,7 +9905,7 @@ mod tests {
         composer_root_key(&mut model, "enter");
         assert_eq!(model.chat.app.composer().edit_state(), before);
         assert!(!model.loop_state.composer_interaction.visible());
-        assert!(model.chat.app.take_pending_submission().is_empty());
+        assert_eq!(model.chat.app.take_pending_submission(), "");
         assert!(!model.chat.app.composer().can_undo());
         assert!(model.chat.app.composer().can_redo());
         composer_root_key(&mut model, "ctrl+y");
@@ -9920,7 +9937,7 @@ mod tests {
             assert!(model.chat.app.composer().can_redo());
             assert!(model.chat.app.composer_mut().redo());
             assert_eq!(model.chat.app.composer().edit_state(), changed);
-            assert!(model.chat.app.take_pending_submission().is_empty());
+            assert_eq!(model.chat.app.take_pending_submission(), "");
             assert!(model.chat.app.status().contains("draft unchanged"));
             assert!(!model.loop_state.composer_interaction.visible());
             drop(model);
@@ -9957,7 +9974,7 @@ mod tests {
             )));
         }
         assert_eq!(model.chat.app.composer().text(), "#topic");
-        assert!(model.chat.app.take_pending_submission().is_empty());
+        assert_eq!(model.chat.app.take_pending_submission(), "");
         drop(model);
     }
 
@@ -9979,7 +9996,7 @@ mod tests {
             model.compose_focused_input_event(&Event::Mouse(MouseEvent::new(kind, point)));
         }
         assert_eq!(model.chat.app.composer().text(), "主题 👩‍💻");
-        assert!(model.chat.app.take_pending_submission().is_empty());
+        assert_eq!(model.chat.app.take_pending_submission(), "");
         drop(model);
     }
 
@@ -10007,7 +10024,7 @@ mod tests {
             point,
         )));
         assert_eq!(model.chat.app.composer().text(), "主题 👩‍💻");
-        assert!(model.chat.app.take_pending_submission().is_empty());
+        assert_eq!(model.chat.app.take_pending_submission(), "");
         drop(model);
     }
 
@@ -10136,7 +10153,7 @@ mod tests {
             bmux_tui::event::EventOutcome::Ignored,
         );
         assert_eq!(model.chat.app.composer().text(), "#topic");
-        assert!(model.chat.app.take_pending_submission().is_empty());
+        assert_eq!(model.chat.app.take_pending_submission(), "");
         drop(model);
     }
 
@@ -11457,8 +11474,8 @@ mod tests {
     async fn root_model_starts_with_empty_committed_selection_state() {
         let model = root_test_model();
 
-        assert!(model.committed_selection.scopes().is_empty());
-        assert!(model.committed_selection.fragments().is_empty());
+        assert_eq!(model.committed_selection.scopes(), []);
+        assert_eq!(model.committed_selection.fragments(), []);
         assert_eq!(
             model.transcript_selection.phase(),
             bmux_tui::selection::SelectionGesturePhase::Idle
@@ -11783,7 +11800,7 @@ mod tests {
                 .as_ref()
                 .is_none_or(|scope| Some(scope) == terminal.focus().active_scope())
         }));
-        assert!(terminal.selection().fragments().is_empty());
+        assert_eq!(terminal.selection().fragments(), []);
         assert_eq!(terminal.image_scene().placements().len(), 0);
         let snapshot = terminal.retained_buffer().cloned();
         let cursor = terminal.cursor();
@@ -11807,7 +11824,7 @@ mod tests {
                 .expect("modal timer");
             assert_eq!(terminal.retained_buffer(), snapshot.as_ref());
             assert_eq!(terminal.cursor(), cursor);
-            assert!(terminal.selection().fragments().is_empty());
+            assert_eq!(terminal.selection().fragments(), []);
         }
         assert_eq!(
             model
@@ -12262,7 +12279,7 @@ mod tests {
             )),
             bmux_tui::event::EventOutcome::Ignored,
         );
-        assert!(model.chat.app.take_pending_submission().is_empty());
+        assert_eq!(model.chat.app.take_pending_submission(), "");
         assert!(
             model
                 .loop_state
@@ -14297,7 +14314,7 @@ mod tests {
             .request_draft
             .as_ref()
             .expect("first draft awaits presentation");
-        assert!(first.preview.is_empty());
+        assert_eq!(first.preview, "");
         assert_eq!(
             bmux_tui_runtime::Program::presentation_committed(
                 &mut model,

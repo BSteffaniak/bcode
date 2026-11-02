@@ -891,7 +891,10 @@ mod tests {
         assert_eq!(plan.relocatable.len(), 1);
         assert_eq!(plan.relocatable[0].session_id, session_id);
         assert_eq!(plan.relocatable[0].canonical_bytes, 16);
-        assert!(plan.blocked.is_empty());
+        assert_eq!(
+            plan.blocked,
+            [] as [crate::relocation::SessionRelocationEntry; 0]
+        );
         assert!(
             source.path().join(session_id.to_string()).exists(),
             "planning must not move the source"
@@ -929,7 +932,10 @@ mod tests {
         )
         .expect("plan");
 
-        assert!(plan.relocatable.is_empty());
+        assert_eq!(
+            plan.relocatable,
+            [] as [crate::relocation::SessionRelocationEntry; 0]
+        );
         let blocked = plan
             .blocked
             .iter()
@@ -1045,7 +1051,7 @@ mod tests {
         )
         .expect("relocate");
 
-        assert!(report.relocated.is_empty());
+        assert_eq!(report.relocated, [] as [bcode_session_models::SessionId; 0]);
         assert_eq!(
             report
                 .blocked
@@ -1205,7 +1211,7 @@ mod tests {
         assert_eq!(report.live.len(), 1);
         assert_eq!(report.live[0].session_id, session_id);
         assert!(report.live[0].live);
-        assert!(report.pruned.is_empty());
+        assert_eq!(report.pruned, [] as [bcode_session_models::SessionId; 0]);
         assert!(
             staging.exists(),
             "pruning must never delete a running relocation's staging directory"
@@ -1452,7 +1458,10 @@ mod tests {
                         Some(SessionRelocationBlock::DestinationConflict),
                         "a duplicated canonical root must surface as a conflict"
                     );
-                    assert!(plan.relocatable.is_empty());
+                    assert_eq!(
+                        plan.relocatable,
+                        [] as [crate::relocation::SessionRelocationEntry; 0]
+                    );
                 }
                 other => panic!("unhandled phase {other}"),
             }

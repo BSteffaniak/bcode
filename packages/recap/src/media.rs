@@ -998,7 +998,7 @@ mod tests {
     fn sampling_is_bounded_and_inside_source() {
         assert_eq!(sample_frame_times(1000, 3), vec![250, 500, 750]);
         assert_eq!(sample_frame_times(1, 20), vec![0]);
-        assert!(sample_frame_times(0, 3).is_empty());
+        assert_eq!(sample_frame_times(0, 3), [] as [u64; 0]);
         assert_eq!(sample_frame_times(1000, usize::MAX).len(), 100);
     }
 }

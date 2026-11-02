@@ -1307,7 +1307,10 @@ mod tests {
             Some(activated.clone())
         );
         assert_eq!(db.submission_queue_head().await.unwrap(), Some(activated));
-        assert!(db.pending_submissions(None, 1).await.unwrap().is_empty());
+        assert_eq!(
+            db.pending_submissions(None, 1).await.unwrap(),
+            [] as [bcode_session_models::SubmissionRecord; 0]
+        );
         assert_eq!(
             db.model_context_events()
                 .await
@@ -1433,12 +1436,12 @@ mod tests {
                     .unwrap(),
             );
         }
-        assert!(
+        assert_eq!(
             manager
                 .pending_submissions_for_turn(session.id, target.clone(), None, 0)
                 .await
-                .unwrap()
-                .is_empty()
+                .unwrap(),
+            [] as [bcode_session_models::SubmissionRecord; 0]
         );
         assert_eq!(
             manager
@@ -1501,12 +1504,9 @@ mod tests {
                 .unwrap(),
             vec![observed]
         );
-        assert!(
-            manager
-                .model_context_events(session_id)
-                .await
-                .unwrap()
-                .is_empty()
+        assert_eq!(
+            manager.model_context_events(session_id).await.unwrap(),
+            [] as [bcode_session_models::SessionEvent; 0]
         );
         manager
             .cancel_submission(session_id, id.clone())
@@ -1632,12 +1632,9 @@ mod tests {
         );
         let id = SubmissionId::for_queued_turn(&receipt.turn_id);
         assert_eq!(submission.id, id);
-        assert!(
-            manager
-                .model_context_events(session.id)
-                .await
-                .unwrap()
-                .is_empty()
+        assert_eq!(
+            manager.model_context_events(session.id).await.unwrap(),
+            [] as [bcode_session_models::SessionEvent; 0]
         );
         let (duplicate, duplicate_events) = manager
             .admit_queued_turn_with_events(
@@ -1649,7 +1646,10 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(duplicate, TurnAdmission::Existing(receipt.clone()));
-        assert!(duplicate_events.is_empty());
+        assert_eq!(
+            duplicate_events,
+            [] as [bcode_session_models::SessionEvent; 0]
+        );
         assert!(
             manager
                 .admit_queued_turn_with_events(
@@ -1915,12 +1915,12 @@ mod tests {
                 .await
                 .is_err()
         );
-        assert!(
+        assert_eq!(
             manager
                 .pending_submissions(session_id, None, 256)
                 .await
-                .unwrap()
-                .is_empty()
+                .unwrap(),
+            [] as [bcode_session_models::SubmissionRecord; 0]
         );
         assert_eq!(
             manager.model_context_events(session_id).await.unwrap(),

@@ -2925,6 +2925,7 @@ dependencies = [
  "bcode_command",
  "bcode_compressed_session_search_plugin",
  "bcode_config",
+ "bcode_confined_fs",
  "bcode_daemon_lifecycle",
  "bcode_default_agents_plugin",
  "bcode_eval",
@@ -3755,9 +3756,9 @@ dependencies = [
 name = "bcode_xray"
 version = "0.0.1-alpha.0"
 dependencies = [
+ "bcode_confined_fs",
  "bcode_xray_models",
  "hex",
- "rustix 1.1.5",
  "serde",
  "serde_json",
  "sha2 0.11.1",

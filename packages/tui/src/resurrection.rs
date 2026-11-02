@@ -5,131 +5,15 @@
 
 use bcode_config::{SessionResurrectionConfig, SessionResurrectionMode};
 use bcode_session_models::SessionId;
-use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
-const PROTOCOL: &str = "application-resurrection/1";
-const MAX_FRAME: usize = 16_384;
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct Descriptor {
-    application: String,
-    version: u32,
-    session_store: PathBuf,
-    session_id: SessionId,
-}
-
-impl Descriptor {
-    fn session(&self, authority: &std::path::Path) -> std::io::Result<SessionId> {
-        if self.application != "bcode" || self.version != 1 || self.session_store != authority {
-            return Err(std::io::Error::other(
-                "unsupported resurrection descriptor or session authority mismatch",
-            ));
-        }
-        Ok(self.session_id)
-    }
-}
-
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-struct Welcome {
-    protocol: String,
-    restore: Option<Descriptor>,
-}
-
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-struct Rejected {
-    protocol: String,
-    error: HostRejection,
-}
-
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-struct HostRejection {
-    code: String,
-}
-
-#[derive(Deserialize)]
-#[serde(untagged)]
-enum HandshakeResponse {
-    Welcome(Welcome),
-    Rejected(Rejected),
-}
-
-fn read_welcome(reader: &mut impl std::io::BufRead) -> std::io::Result<Welcome> {
-    let response: HandshakeResponse = read_frame(reader)?;
-    let protocol = match &response {
-        HandshakeResponse::Welcome(value) => &value.protocol,
-        HandshakeResponse::Rejected(value) => &value.protocol,
-    };
-    if protocol != PROTOCOL {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::InvalidData,
-            "unsupported resurrection host protocol",
-        ));
-    }
-    match response {
-        HandshakeResponse::Welcome(welcome) => Ok(welcome),
-        HandshakeResponse::Rejected(rejected) => {
-            // Host data is untrusted: render known reasons, never arbitrary host text.
-            let (kind, reason) = match rejected.error.code.as_str() {
-                "ownership_verification_unavailable" => (
-                    std::io::ErrorKind::Other,
-                    "the host could not verify foreground process ownership",
-                ),
-                "ownership_rejected" => (
-                    std::io::ErrorKind::PermissionDenied,
-                    "the connecting process does not own the current execution",
-                ),
-                "invalid_handshake" => (
-                    std::io::ErrorKind::InvalidData,
-                    "the host rejected the handshake or peer identity",
-                ),
-                "launch_unavailable" => (
-                    std::io::ErrorKind::ConnectionAborted,
-                    "the launch is no longer available for restoration",
-                ),
-                _ => (
-                    std::io::ErrorKind::InvalidData,
-                    "the host rejected the connection with an unknown error code",
-                ),
-            };
-            Err(std::io::Error::new(kind, reason))
-        }
-    }
-}
-
-fn handshake_error(error: &std::io::Error) -> std::io::Error {
-    std::io::Error::new(
-        error.kind(),
-        format!(
-            "Session restoration failed during the host handshake: {error}. To launch without restoration, set BCODE_NO_SESSION_RESURRECTION=1."
-        ),
-    )
-}
-
-#[derive(Serialize)]
-struct Hello {
-    protocol: &'static str,
-    application: &'static str,
-    pid: u32,
-    accept_restore: bool,
-}
-
-#[derive(Serialize)]
-struct Selection {
-    operation: &'static str,
-    revision: u64,
-    descriptor: Option<Descriptor>,
-}
-
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-struct Acknowledgement {
-    revision: u64,
-}
+#[cfg(unix)]
+mod wire;
+#[cfg(unix)]
+use wire::{
+    Acknowledgement, Descriptor, Hello, PROTOCOL, Selection, handshake_error, read_frame,
+    read_welcome, write_frame,
+};
 
 fn endpoint(
     config: &SessionResurrectionConfig,
@@ -182,6 +66,13 @@ impl Publisher {
     }
 }
 
+#[cfg_attr(
+    not(unix),
+    expect(
+        clippy::unused_async,
+        reason = "callers share the asynchronous signature of the Unix transport"
+    )
+)]
 pub async fn connect(
     config: &SessionResurrectionConfig,
     explicit_session: Option<SessionId>,
@@ -191,27 +82,38 @@ pub async fn connect(
     let Some(path) = endpoint(config, advertised.as_deref(), disabled)? else {
         return Ok((explicit_session, None, None));
     };
-    connect_endpoint(
-        path,
-        explicit_session,
-        bcode_config::default_session_store_dir(),
-        config.mode,
-    )
-    .await
+    #[cfg(unix)]
+    {
+        connect_endpoint(
+            path,
+            explicit_session,
+            bcode_config::default_session_store_dir(),
+            config.mode,
+        )
+        .await
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = path;
+        Err(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "local resurrection transport is unavailable on this platform",
+        ))
+    }
 }
 
+#[cfg(unix)]
 async fn connect_endpoint(
     path: PathBuf,
     explicit_session: Option<SessionId>,
     authority: PathBuf,
     mode: SessionResurrectionMode,
 ) -> std::io::Result<(Option<SessionId>, Option<Publisher>, Option<String>)> {
-    #[cfg(unix)]
-    {
-        // Only transport discovery failures are optional. Never downgrade handshake
-        // or authority validation failures to a successful ordinary launch.
-        let connected = tokio::task::spawn_blocking(move || {
-            match std::os::unix::net::UnixStream::connect(path) {
+    // Only transport discovery failures are optional. Never downgrade handshake
+    // or authority validation failures to a successful ordinary launch.
+    let connected =
+        tokio::task::spawn_blocking(
+            move || match std::os::unix::net::UnixStream::connect(path) {
                 Ok(stream) => Ok(Some(stream)),
                 Err(error)
                     if mode == SessionResurrectionMode::Auto
@@ -226,70 +128,59 @@ async fn connect_endpoint(
                     error.kind(),
                     format!("connecting to session resurrection host: {error}"),
                 )),
-            }
-        })
+            },
+        )
         .await
         .map_err(std::io::Error::other)??;
-        let Some(stream) = connected else {
-            return Ok((
-                explicit_session,
-                None,
-                Some(
-                    "Session resurrection host unavailable; continuing without restoration.".into(),
-                ),
-            ));
-        };
-        let (stream, restored, authority) = tokio::task::spawn_blocking(move || {
-            stream.set_read_timeout(Some(std::time::Duration::from_secs(2)))?;
-            stream.set_write_timeout(Some(std::time::Duration::from_secs(2)))?;
-            let mut stream = std::io::BufReader::new(stream);
-            write_frame(
-                stream.get_mut(),
-                &Hello {
-                    protocol: PROTOCOL,
-                    application: "bcode",
-                    pid: std::process::id(),
-                    accept_restore: explicit_session.is_none(),
-                },
-            )?;
-            let welcome = read_welcome(&mut stream)?;
-            let restored = if explicit_session.is_none() {
-                welcome
-                    .restore
-                    .as_ref()
-                    .map(|value| {
-                        let canonical = authority.canonicalize().map_err(|error| {
-                            std::io::Error::new(
-                                error.kind(),
-                                format!("validating resurrection session store: {error}"),
-                            )
-                        })?;
-                        value.session(&canonical)
-                    })
-                    .transpose()?
-            } else {
-                None
-            };
-            Ok((stream, restored, authority))
-        })
-        .await
-        .map_err(std::io::Error::other)
-        .and_then(std::convert::identity)
-        .map_err(|error| handshake_error(&error))?;
-        Ok((
-            explicit_session.or(restored),
-            Some(start_publisher(stream, authority)),
+    let Some(stream) = connected else {
+        return Ok((
+            explicit_session,
             None,
-        ))
-    }
-    #[cfg(not(unix))]
-    {
-        let _ = path;
-        Err(std::io::Error::new(
-            std::io::ErrorKind::Unsupported,
-            "local resurrection transport is unavailable on this platform",
-        ))
-    }
+            Some("Session resurrection host unavailable; continuing without restoration.".into()),
+        ));
+    };
+    let (stream, restored, authority) = tokio::task::spawn_blocking(move || {
+        stream.set_read_timeout(Some(std::time::Duration::from_secs(2)))?;
+        stream.set_write_timeout(Some(std::time::Duration::from_secs(2)))?;
+        let mut stream = std::io::BufReader::new(stream);
+        write_frame(
+            stream.get_mut(),
+            &Hello {
+                protocol: PROTOCOL,
+                application: "bcode",
+                pid: std::process::id(),
+                accept_restore: explicit_session.is_none(),
+            },
+        )?;
+        let welcome = read_welcome(&mut stream)?;
+        let restored = if explicit_session.is_none() {
+            welcome
+                .restore
+                .as_ref()
+                .map(|value| {
+                    let canonical = authority.canonicalize().map_err(|error| {
+                        std::io::Error::new(
+                            error.kind(),
+                            format!("validating resurrection session store: {error}"),
+                        )
+                    })?;
+                    value.session(&canonical)
+                })
+                .transpose()?
+        } else {
+            None
+        };
+        Ok((stream, restored, authority))
+    })
+    .await
+    .map_err(std::io::Error::other)
+    .and_then(std::convert::identity)
+    .map_err(|error| handshake_error(&error))?;
+    Ok((
+        explicit_session.or(restored),
+        Some(start_publisher(stream, authority)),
+        None,
+    ))
 }
 
 #[cfg(unix)]
@@ -357,45 +248,10 @@ fn start_publisher(
     }
 }
 
-fn write_frame(writer: &mut impl std::io::Write, value: &impl Serialize) -> std::io::Result<()> {
-    let bytes = serde_json::to_vec(value)?;
-    if bytes.len() + 1 >= MAX_FRAME {
-        return Err(std::io::Error::other("resurrection frame exceeds limit"));
-    }
-    writer.write_all(&bytes)?;
-    writer.write_all(b"\n")?;
-    writer.flush()
-}
-
-fn read_frame<T: serde::de::DeserializeOwned>(
-    reader: &mut impl std::io::BufRead,
-) -> std::io::Result<T> {
-    use std::io::BufRead;
-    let mut bytes = Vec::new();
-    std::io::Read::take(reader, MAX_FRAME as u64).read_until(b'\n', &mut bytes)?;
-    if bytes.len() >= MAX_FRAME {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::InvalidData,
-            "resurrection response exceeds protocol limit",
-        ));
-    }
-    if bytes.is_empty() {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::UnexpectedEof,
-            "resurrection host closed the connection before replying",
-        ));
-    }
-    if bytes.last() != Some(&b'\n') {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::UnexpectedEof,
-            "truncated resurrection response",
-        ));
-    }
-    Ok(serde_json::from_slice(&bytes)?)
-}
-
 #[cfg(test)]
 mod tests {
+    #[cfg(unix)]
+    use super::wire::*;
     use super::*;
 
     #[test]
@@ -413,15 +269,14 @@ mod tests {
             None
         );
         config.mode = SessionResurrectionMode::Enabled;
-        config.endpoint = Some("/configured/host".into());
-        assert_eq!(
-            endpoint(&config, None, false).unwrap(),
-            Some(PathBuf::from("/configured/host"))
-        );
+        let configured = std::env::temp_dir().join("configured-host");
+        config.endpoint = Some(configured.to_string_lossy().into_owned());
+        assert_eq!(endpoint(&config, None, false).unwrap(), Some(configured));
         config.endpoint = Some("relative".into());
         assert!(endpoint(&config, None, false).is_err());
     }
 
+    #[cfg(unix)]
     #[test]
     fn frames_reject_truncation_size_and_unknown_fields() {
         assert!(read_frame::<Welcome>(&mut &b"{}"[..]).is_err());
@@ -434,6 +289,7 @@ mod tests {
         assert_eq!(ack.revision, 2);
     }
 
+    #[cfg(unix)]
     #[test]
     fn frames_distinguish_closed_truncated_oversized_and_malformed_responses() {
         for (bytes, kind, message) in [
@@ -709,6 +565,7 @@ mod tests {
         }
     }
 
+    #[cfg(unix)]
     #[test]
     fn descriptors_cannot_redirect_authority() {
         let descriptor = Descriptor {

@@ -204,7 +204,7 @@ fn cancellation_before_press_has_no_key_events() {
         key_pair(&mut keys, 42, &cancel),
         Err(Error::Cancelled)
     ));
-    assert!(keys.events.is_empty());
+    assert_eq!(keys.events, [] as [(u32, bool); 0]);
 }
 
 #[test]

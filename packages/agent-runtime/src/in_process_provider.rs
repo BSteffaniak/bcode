@@ -259,7 +259,7 @@ where
     fn turn_id(&self) -> Result<String, crate::RuntimeError> {
         let sequence = self
             .next_turn
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |value| {
+            .try_update(Ordering::Relaxed, Ordering::Relaxed, |value| {
                 value.checked_add(1)
             })
             .map_err(|_| {
@@ -1479,7 +1479,7 @@ mod tests {
         )
         .await;
         assert!(matches!(result, Err(RuntimeError::Cancelled)));
-        assert!(events.is_empty());
+        assert_eq!(events, [] as [crate::AgentRuntimeEvent; 0]);
         assert!(adapter.turns.lock().expect("registry").is_empty());
         tokio::time::timeout(Duration::from_secs(2), async {
             while !released.load(Ordering::Acquire) {
@@ -1628,7 +1628,7 @@ mod tests {
             if error.code == "in_process_worker_stopped" && !error.retryable)
         );
         drop(InProcessWorkerGuard(state.clone()));
-        assert!(state.drain().is_empty());
+        assert_eq!(state.drain(), [] as [bcode_model::ProviderTurnEvent; 0]);
     }
 
     #[derive(Debug)]
@@ -2024,13 +2024,13 @@ mod tests {
             .await
             .expect("poll");
         assert_eq!(response.events, vec![ProviderTurnEvent::TurnStarted]);
-        assert!(
+        assert_eq!(
             adapter
                 .poll_turn_events(None, &request)
                 .await
                 .expect("second poll")
-                .events
-                .is_empty()
+                .events,
+            [] as [bcode_model::ProviderTurnEvent; 0]
         );
     }
 

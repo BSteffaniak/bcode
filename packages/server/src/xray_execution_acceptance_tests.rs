@@ -1531,7 +1531,7 @@ impl AcceptanceFixture {
         assert_eq!(children.children[0].root_run_id, RUN);
         assert_eq!(children.children[0].parent_run_id, RUN);
         assert_eq!(children.children[0].parent_attempt, 1);
-        assert!(!children.children[0].parent_activation_id.is_empty());
+        assert_ne!(children.children[0].parent_activation_id, "");
         let child_run = &children.children[0].child_run_id;
         let grandchildren = representation::hierarchy::children(&self.db, child_run, None, 8)
             .await
@@ -1540,14 +1540,14 @@ impl AcceptanceFixture {
         assert_eq!(grandchildren.children[0].root_run_id, RUN);
         assert_eq!(&grandchildren.children[0].parent_run_id, child_run);
         assert_eq!(grandchildren.children[0].parent_attempt, 1);
-        assert!(!grandchildren.children[0].parent_activation_id.is_empty());
+        assert_ne!(grandchildren.children[0].parent_activation_id, "");
         let grandchild_run = &grandchildren.children[0].child_run_id;
-        assert!(
+        assert_eq!(
             representation::hierarchy::children(&self.db, grandchild_run, None, 8)
                 .await
                 .expect("finite recursive leaf")
-                .children
-                .is_empty()
+                .children,
+            [] as [bcode_workflow::WorkflowRunLink; 0]
         );
         assert_eq!(
             crate::workflow_representation::child::parent_run(&self.fixture.0, child_run)

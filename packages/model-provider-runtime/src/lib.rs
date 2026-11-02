@@ -628,7 +628,7 @@ mod attempt_timing_transport_tests {
             },
         };
         state.push(event.clone());
-        assert!(state.drain().is_empty());
+        assert_eq!(state.drain(), [] as [bcode_model::ProviderTurnEvent; 0]);
         state.enable_attempt_timing();
         state.push(event.clone());
         assert_eq!(state.drain(), vec![event]);
@@ -658,7 +658,7 @@ mod attempt_timing_transport_tests {
                 outcome: bcode_model::ProviderAttemptOutcome::Cancelled,
             },
         });
-        assert!(state.drain().is_empty());
+        assert_eq!(state.drain(), [] as [bcode_model::ProviderTurnEvent; 0]);
     }
 }
 

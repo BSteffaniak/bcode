@@ -1042,12 +1042,12 @@ mod tests {
             .collect::<Vec<_>>();
         assert!(rows.iter().filter(|row| !row.trim().is_empty()).count() > 1);
         assert!(rows.join(" ").contains("retry."));
-        assert!(
+        assert_eq!(
             buffer
                 .row_symbols(area.bottom() - 2)
                 .expect("footer")
-                .trim()
-                .is_empty()
+                .trim(),
+            ""
         );
     }
 

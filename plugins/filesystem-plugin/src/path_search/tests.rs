@@ -208,7 +208,10 @@ fn bounds_truthfully_distinguish_empty_truncated_and_cancelled() {
     let response = search(&query, &root.grant(), &|| false);
     assert_eq!(response.state, SearchPathsState::Incomplete);
     assert_eq!(response.visited_entries, 3);
-    assert!(response.entries.is_empty()); // no arbitrary readdir-order subset
+    assert_eq!(
+        response.entries,
+        [] as [crate::path_search::SearchPathEntry; 0]
+    ); // no arbitrary readdir-order subset
     let query = SearchPathsRequest {
         max_bytes: 1024,
         ..request()
@@ -228,7 +231,10 @@ fn bounds_truthfully_distinguish_empty_truncated_and_cancelled() {
     };
     let response = search(&query, &root.grant(), &|| false);
     assert_eq!(response.state, SearchPathsState::Complete);
-    assert!(response.entries.is_empty());
+    assert_eq!(
+        response.entries,
+        [] as [crate::path_search::SearchPathEntry; 0]
+    );
 }
 
 #[test]
@@ -326,7 +332,10 @@ fn ignore_file_presence_is_explicitly_unavailable_without_content_authority() {
         let response = search(&request(), &root.grant(), &|| false);
         assert_eq!(response.state, SearchPathsState::Incomplete);
         assert_eq!(response.reason.as_deref(), Some("ignore_policy_denied"));
-        assert!(response.entries.is_empty());
+        assert_eq!(
+            response.entries,
+            [] as [crate::path_search::SearchPathEntry; 0]
+        );
     }
 }
 
@@ -460,7 +469,10 @@ fn mismatched_resource_grant_and_descriptor_replacement_are_rejected() {
         response.reason.as_deref(),
         Some("ignore_policy_unavailable")
     );
-    assert!(response.entries.is_empty());
+    assert_eq!(
+        response.entries,
+        [] as [crate::path_search::SearchPathEntry; 0]
+    );
 }
 
 #[cfg(unix)]
@@ -485,7 +497,10 @@ fn ignore_parent_symlink_race_cannot_redirect_an_authorized_read() {
         })
     });
     assert_eq!(response.reason.as_deref(), Some("directory_changed"));
-    assert!(response.entries.is_empty());
+    assert_eq!(
+        response.entries,
+        [] as [crate::path_search::SearchPathEntry; 0]
+    );
     assert!(
         !serde_json::to_string(&response)
             .unwrap()
@@ -516,7 +531,10 @@ fn relocated_directory_cannot_publish_denied_namespace_peers() {
     });
     assert_eq!(response.state, SearchPathsState::Incomplete);
     assert_eq!(response.reason.as_deref(), Some("directory_changed"));
-    assert!(response.entries.is_empty());
+    assert_eq!(
+        response.entries,
+        [] as [crate::path_search::SearchPathEntry; 0]
+    );
 }
 
 #[test]
@@ -535,7 +553,10 @@ fn exhausted_ignore_budget_stops_before_resource_admission() {
     });
     assert_eq!(response.reason.as_deref(), Some("byte_limit"));
     assert!(!called.get());
-    assert!(response.entries.is_empty());
+    assert_eq!(
+        response.entries,
+        [] as [crate::path_search::SearchPathEntry; 0]
+    );
 }
 
 #[test]
@@ -552,7 +573,10 @@ fn resource_admission_cancellation_prevents_policy_read() {
         })
     });
     assert_eq!(response.state, SearchPathsState::Cancelled);
-    assert!(response.entries.is_empty());
+    assert_eq!(
+        response.entries,
+        [] as [crate::path_search::SearchPathEntry; 0]
+    );
 }
 
 #[test]
@@ -572,7 +596,10 @@ fn relocation_after_child_discovery_discards_stale_results() {
     });
     assert_eq!(response.state, SearchPathsState::Incomplete);
     assert_eq!(response.reason.as_deref(), Some("directory_changed"));
-    assert!(response.entries.is_empty());
+    assert_eq!(
+        response.entries,
+        [] as [crate::path_search::SearchPathEntry; 0]
+    );
 }
 
 #[test]
@@ -587,7 +614,10 @@ fn cumulative_ignore_rules_stop_before_exhausted_parser_allocation() {
     };
     let response = authorized_search(&query, &root.grant());
     assert_eq!(response.reason.as_deref(), Some("byte_limit"));
-    assert!(response.entries.is_empty());
+    assert_eq!(
+        response.entries,
+        [] as [crate::path_search::SearchPathEntry; 0]
+    );
 }
 
 extern "C" fn grant_bridge(
@@ -608,7 +638,7 @@ extern "C" fn grant_bridge(
         panic!("unexpected bridge family");
     };
     assert_eq!(request.interface_id, PATH_SEARCH_AUTHORIZATION_INTERFACE);
-    assert!(request.invocation_id.is_empty());
+    assert_eq!(request.invocation_id, "");
     let payload = if request.operation == OP_WORKSPACE_ACCESS_AUTHORIZE {
         assert_eq!(
             request.payload,

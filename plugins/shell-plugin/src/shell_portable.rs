@@ -627,7 +627,7 @@ mod tests {
         for width in [1, 2, 8, 40] {
             let mut projection = CommandProjection::default();
             append_output(&mut projection, output, width);
-            assert!(!projection.rows.is_empty());
+            assert_ne!(projection.rows, [] as [bmux_tui::text::Line; 0]);
             assert!(
                 projection
                     .rows

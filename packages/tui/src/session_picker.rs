@@ -1053,7 +1053,10 @@ mod tests {
         assert!(!picker.sessions.iter().any(|summary| summary.id == child.id));
         assert_eq!(picker.child_watch_windows(), [query]);
         assert!(picker.set_all_directories(true));
-        assert!(picker.child_watch_windows().is_empty());
+        assert_eq!(
+            picker.child_watch_windows(),
+            [] as [bcode_session_models::SessionChildQuery; 0]
+        );
     }
     use super::*;
 
@@ -1101,7 +1104,10 @@ mod tests {
         let initial = app.all_directories();
         assert!(app.set_all_directories(!initial));
         assert_eq!(app.filter().buffer().text(), "東京 query");
-        assert!(app.sessions.is_empty());
+        assert_eq!(
+            app.sessions,
+            [] as [bcode_session_models::SessionSummary; 0]
+        );
         assert_eq!(
             SessionPickerApp::remembered(Vec::new()).all_directories(),
             !initial
@@ -1227,7 +1233,7 @@ mod tests {
             assert_eq!(app.mode(), SessionPickerMode::Filter);
             assert_eq!(app.selected_session_id(), Some(survivor.id));
             assert!(app.status().contains("action canceled"));
-            assert!(app.rename().buffer().text().is_empty());
+            assert_eq!(app.rename().buffer().text(), "");
         }
     }
 
@@ -1533,7 +1539,7 @@ mod tests {
         app.set_search_results(&response, vec![hit]);
         assert!(app.status().contains("searchable coverage complete"));
         assert!(!app.status().contains("query_complete="));
-        assert!(!app.search_preview().is_empty());
+        assert_ne!(app.search_preview(), "");
     }
 
     #[test]

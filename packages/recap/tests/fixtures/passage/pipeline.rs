@@ -65,7 +65,10 @@ impl Scripted {
     }
 
     fn inspect_source(&self, unit: &SourceUnit) {
-        assert!(!unit.primary.transcript.is_empty());
+        assert_ne!(
+            unit.primary.transcript,
+            [] as [bcode_recap::contracts::TranscriptSegment; 0]
+        );
         for cue in &unit.primary.transcript {
             let expected = self
                 .expected_source

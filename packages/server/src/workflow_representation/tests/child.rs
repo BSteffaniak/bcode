@@ -367,12 +367,12 @@ async fn assert_recursive_completion(
         .unwrap();
     assert_eq!(second.children.len(), 1);
     assert_eq!(second.children[0].depth, 3);
-    assert!(
+    assert_eq!(
         representation::hierarchy::children(db, &second.children[0].child_run_id, None, 10)
             .await
             .unwrap()
-            .children
-            .is_empty()
+            .children,
+        [] as [bcode_workflow::WorkflowRunLink; 0]
     );
     for id in [
         &root.run_id,

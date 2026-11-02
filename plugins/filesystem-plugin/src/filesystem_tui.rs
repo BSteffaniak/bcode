@@ -1474,7 +1474,13 @@ mod tests {
             &payload,
             &PluginTuiVisualRenderContext::new(60, PluginTuiDiffLayout::Unified, None),
         );
-        assert!(!narrow.selection.is_empty());
+        assert_ne!(
+            narrow.selection,
+            [] as [(
+                usize,
+                bcode_plugin_models::tui_selection::PluginTuiSelectionRow
+            ); 0]
+        );
         assert_ne!(narrow.selection, wide.selection);
         assert!(adapter.selection.lock().unwrap().is_empty());
         for projection in [narrow, wide] {
@@ -1502,7 +1508,10 @@ mod tests {
             None,
         );
         let (paint, anchors) = adapter.layout("bcode.filesystem.read", &payload, &context);
-        assert!(!anchors.is_empty());
+        assert_ne!(
+            anchors,
+            [] as [bcode_plugin_models::tui_visual::TuiVisualAnchor; 0]
+        );
         for anchor in &anchors {
             let range = anchor.source.as_ref().unwrap();
             let row = adapter.selection_row(&range.identity, range.start).unwrap();

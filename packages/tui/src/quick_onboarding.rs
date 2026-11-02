@@ -780,7 +780,10 @@ mod tests {
         for word in ["账户", "🦀", "e\u{301}", "styled", "words"] {
             assert!(text.contains(word));
         }
-        assert!(wrapped_rows("🦀", 0, style).is_empty());
+        assert_eq!(
+            wrapped_rows("🦀", 0, style),
+            [] as [bmux_tui::text::Line; 0]
+        );
     }
 
     #[test]
@@ -798,10 +801,10 @@ mod tests {
                 &mut buffer,
             )));
             if program.choice_area.height == 0 {
-                assert!(
+                assert_eq!(
                     choice_list(&program.items())
-                        .visible_semantic_regions(program.choice_area, &program.list)
-                        .is_empty()
+                        .visible_semantic_regions(program.choice_area, &program.list),
+                    [] as [bmux_tui_components::hit_test::HitRegion<&str>; 0]
                 );
                 continue;
             }
@@ -814,7 +817,10 @@ mod tests {
             let items = program.items();
             let list = choice_list(&items);
             let hits = list.visible_semantic_regions(program.choice_area, &program.list);
-            assert!(!hits.is_empty());
+            assert_ne!(
+                hits,
+                [] as [bmux_tui_components::hit_test::HitRegion<&str>; 0]
+            );
             assert!(
                 hits.iter()
                     .any(|hit| hit.key == program.selected.to_string())
@@ -830,7 +836,7 @@ mod tests {
                     ),
                     Some(hit.key)
                 );
-                assert!(!buffer.row_symbols(hit.rect.y).unwrap().trim().is_empty());
+                assert_ne!(buffer.row_symbols(hit.rect.y).unwrap().trim(), "");
             }
         }
         assert_eq!(program.key(KeyCode::Enter), Lifecycle::Exit);

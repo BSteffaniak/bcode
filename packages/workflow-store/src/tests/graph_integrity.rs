@@ -27,11 +27,9 @@ fn preparation_rejects_inconsistent_admission_graph_binding() {
         .expect_err("inconsistent admission");
     assert!(error.to_string().contains("admission binding"));
     assert_eq!(fixture_changes(&store.connection), before);
-    assert!(
-        store
-            .attempt_history("run-1", None, 10)
-            .expect("history")
-            .is_empty()
+    assert_eq!(
+        store.attempt_history("run-1", None, 10).expect("history"),
+        [] as [bcode_workflow::AttemptSummary; 0]
     );
     block_on(store.connection.exec_delete_count(
         &delete("workflow_activation_graph_bindings").where_eq("run_id", "run-1"),
@@ -367,10 +365,10 @@ fn fan_out_failure_requires_run_graph_and_releases_wait_all_capacity() {
     block_on(transaction.rollback()).expect("restore fixture");
     let transaction =
         database::begin(&store.connection, TransactionMode::Deferred).expect("transaction");
-    assert!(
+    assert_eq!(
         settle_fan_out_member_failure(transaction.as_ref(), &request, "failure", 40)
-            .expect("settle failure")
-            .is_empty()
+            .expect("settle failure"),
+        [] as [ActiveAttemptCancellation; 0]
     );
     let after_settlement = fixture_changes(transaction.as_ref());
     assert!(
@@ -522,7 +520,7 @@ fn graph_migration_preserves_ambiguous_prepared_mutations() {
         .reconcile_prepared_attempts_for_run("run-1", 10, 50)
         .expect("reconcile");
     assert_eq!(summary.repair_required, [identity]);
-    assert!(summary.safe_prepared.is_empty());
+    assert_eq!(summary.safe_prepared, [] as [std::string::String; 0]);
     let attempts = store.attempt_history("run-1", None, 10).expect("attempts");
     assert_eq!(attempts.len(), 1);
     assert_eq!(attempts[0].status, "repair_required");
@@ -691,11 +689,11 @@ fn graph_migration_preserves_completed_execution_state() {
         store.run_graph_revision("run-1").expect("revision"),
         Some(1)
     );
-    assert!(
+    assert_eq!(
         store
             .pending_activations_for_run("run-1", 10)
-            .expect("pending")
-            .is_empty()
+            .expect("pending"),
+        [] as [PendingActivation; 0]
     );
 }
 #[test]
@@ -1259,7 +1257,7 @@ fn combined_graph_page_failure_releases_snapshot_without_writes() {
         .current_run_graph_page("run-1", Some(1), None, Some(0), 1)
         .expect("page beyond damage");
     assert_eq!(page.nodes.len(), 1);
-    assert!(page.edges.is_empty());
+    assert_eq!(page.edges, [] as [crate::run_graph::RunGraphEdge; 0]);
     assert!(page.nodes_complete && page.edges_complete);
     assert!(block_on(store.connection.sqlite_is_autocommit()).expect("autocommit state"));
     assert_eq!(fixture_changes(&store.connection), before);
@@ -1316,11 +1314,11 @@ fn edge_pages_seek_past_revision_history() {
         .expect("next");
     assert_eq!(next.len(), 1);
     assert_eq!(next[0].edge_id, 1);
-    assert!(
+    assert_eq!(
         store
             .current_run_graph_edges("run-1", 200, Some(1), 1)
-            .expect("end")
-            .is_empty()
+            .expect("end"),
+        [] as [crate::run_graph::RunGraphEdge; 0]
     );
 }
 #[test]
@@ -1795,11 +1793,9 @@ fn initial_node_pages_resume_without_duplicates_or_mutation() {
         assert!(ids.binary_search(&format!("page-{index:03}")).is_ok());
     }
     assert!(store.run_graph_nodes("missing", Some(""), 10).is_err());
-    assert!(
-        store
-            .run_graph_nodes("missing", None, 10)
-            .expect("missing")
-            .is_empty()
+    assert_eq!(
+        store.run_graph_nodes("missing", None, 10).expect("missing"),
+        [] as [crate::run_graph::RunGraphNode; 0]
     );
     assert_eq!(fixture_changes(&store.connection), before);
 }
@@ -1896,11 +1892,11 @@ fn schema_16_index_migration_rolls_back_on_orphaned_graph() {
     let reopened = WorkflowStore::open_in_state_dir(temp.path()).expect("reopen migrated store");
     let nodes = reopened.run_graph_nodes("run-1", None, 100).expect("nodes");
     assert_eq!(nodes, original_nodes);
-    assert!(
+    assert_eq!(
         reopened
             .run_graph_outgoing_edges("run-1", &original_nodes[0].node.id, None, 1)
-            .expect("source index available")
-            .is_empty()
+            .expect("source index available"),
+        [] as [crate::run_graph::RunGraphEdge; 0]
     );
 }
 #[test]
@@ -2147,17 +2143,17 @@ fn schema_16_migration_adds_source_index_without_rebuilding_graph() {
             .expect("incoming"),
         edges
     );
-    assert!(
+    assert_eq!(
         store
             .run_graph_outgoing_edges("run-1", &target.id, None, 100)
-            .expect("target outgoing")
-            .is_empty()
+            .expect("target outgoing"),
+        [] as [crate::run_graph::RunGraphEdge; 0]
     );
-    assert!(
+    assert_eq!(
         store
             .run_graph_incoming_edges("run-1", node_id, None, 100)
-            .expect("source incoming")
-            .is_empty()
+            .expect("source incoming"),
+        [] as [crate::run_graph::RunGraphEdge; 0]
     );
     assert_eq!(
         store
@@ -2269,11 +2265,11 @@ fn outgoing_edge_pages_filter_sources_and_preserve_storage() {
             .run_graph_outgoing_edges("missing", &node.id, Some(u64::MAX), 1)
             .is_err()
     );
-    assert!(
+    assert_eq!(
         store
             .run_graph_outgoing_edges("missing", &node.id, None, 1)
-            .expect("missing run")
-            .is_empty()
+            .expect("missing run"),
+        [] as [crate::run_graph::RunGraphEdge; 0]
     );
     assert_eq!(fixture_changes(&store.connection), before);
 }
@@ -2288,15 +2284,14 @@ fn edge_pages_validate_inputs_even_for_missing_runs() {
         for run_id in ["run-1", "missing"] {
             assert!(query(&store, run_id, "", None, 10).is_err());
             assert!(query(&store, run_id, "review", Some(u64::MAX), 10).is_err());
-            assert!(
-                query(&store, run_id, "missing", None, usize::MAX)
-                    .expect("absent endpoint")
-                    .is_empty()
+            assert_eq!(
+                query(&store, run_id, "missing", None, usize::MAX).expect("absent endpoint"),
+                [] as [crate::run_graph::RunGraphEdge; 0]
             );
-            assert!(
+            assert_eq!(
                 query(&store, run_id, "review", Some(i64::MAX as u64), 10)
-                    .expect("valid final cursor")
-                    .is_empty()
+                    .expect("valid final cursor"),
+                [] as [crate::run_graph::RunGraphEdge; 0]
             );
         }
         assert!(query(&store, "", "review", None, 10).is_err());
@@ -2615,7 +2610,7 @@ fn initial_graph_reads_preserve_caller_revision_transaction() {
         .expect("baseline record");
     let transaction =
         database::begin(&store.connection, TransactionMode::Deferred).expect("caller transaction");
-    assert!(
+    assert_eq!(
         WorkflowStore::run_graph_incoming_edges_in(
             transaction.as_ref(),
             "run-1",
@@ -2623,8 +2618,8 @@ fn initial_graph_reads_preserve_caller_revision_transaction() {
             None,
             10
         )
-        .expect("initial edges")
-        .is_empty()
+        .expect("initial edges"),
+        [] as [crate::run_graph::RunGraphEdge; 0]
     );
     assert_eq!(
         WorkflowStore::run_graph_nodes_in(transaction.as_ref(), "run-1", None, 10)
@@ -2682,11 +2677,11 @@ fn initial_graph_reads_preserve_caller_revision_transaction() {
             .expect("restored revision"),
         Some(1)
     );
-    assert!(
+    assert_eq!(
         store
             .run_graph_incoming_edges("run-1", "review", None, 10)
-            .expect("restored edges")
-            .is_empty()
+            .expect("restored edges"),
+        [] as [crate::run_graph::RunGraphEdge; 0]
     );
     assert_eq!(
         store
@@ -3243,7 +3238,7 @@ fn graph_pages_include_maximum_edge_identity_and_finish_without_overflow() {
     let exhausted = store
         .current_run_graph_page("run-1", Some(1), None, Some(maximum), 1)
         .expect("exhausted page");
-    assert!(exhausted.edges.is_empty());
+    assert_eq!(exhausted.edges, [] as [crate::run_graph::RunGraphEdge; 0]);
     assert!(exhausted.edges_complete);
     assert_eq!(
         store
@@ -3265,23 +3260,23 @@ fn graph_pages_include_maximum_edge_identity_and_finish_without_overflow() {
             .expect("initial last"),
         last.edges
     );
-    assert!(
+    assert_eq!(
         store
             .run_graph_edges("run-1", Some(maximum), 1)
-            .expect("initial exhausted")
-            .is_empty()
+            .expect("initial exhausted"),
+        [] as [crate::run_graph::RunGraphEdge; 0]
     );
-    assert!(
+    assert_eq!(
         store
             .run_graph_incoming_edges("run-1", "review", Some(maximum), 1)
-            .expect("incoming exhausted")
-            .is_empty()
+            .expect("incoming exhausted"),
+        [] as [crate::run_graph::RunGraphEdge; 0]
     );
-    assert!(
+    assert_eq!(
         store
             .run_graph_outgoing_edges("run-1", "review", Some(maximum), 1)
-            .expect("outgoing exhausted")
-            .is_empty()
+            .expect("outgoing exhausted"),
+        [] as [crate::run_graph::RunGraphEdge; 0]
     );
     assert_eq!(fixture_changes(&store.connection), before);
 }
@@ -3340,7 +3335,7 @@ fn graph_edge_allocation_observation_includes_retired_edges_outside_page() {
     let exhausted = store
         .current_run_graph_page("run-1", Some(2), None, Some(2), 1)
         .expect("empty page");
-    assert!(exhausted.edges.is_empty());
+    assert_eq!(exhausted.edges, [] as [crate::run_graph::RunGraphEdge; 0]);
     assert_eq!(exhausted.next_edge_id, Some(901));
     assert!(
         store
@@ -4422,11 +4417,11 @@ fn initial_edge_pages_preserve_duplicate_edges_and_detect_damage() {
     // Exercise storage independently of scheduler cycle admission.
     replace_duplicate_edge_graph(&store.connection, &plan);
     assert!(store.run_graph_edges("run-1", Some(u64::MAX), 2).is_err());
-    assert!(
+    assert_eq!(
         store
             .run_graph_edges("run-1", Some(i64::MAX as u64), 2)
-            .expect("last representable cursor")
-            .is_empty()
+            .expect("last representable cursor"),
+        [] as [crate::run_graph::RunGraphEdge; 0]
     );
     let first = store.run_graph_edges("run-1", None, 2).expect("first page");
     assert_eq!(first.len(), 2);
@@ -4447,11 +4442,11 @@ fn initial_edge_pages_preserve_duplicate_edges_and_detect_damage() {
             .expect("incoming"),
         first
     );
-    assert!(
+    assert_eq!(
         store
             .run_graph_incoming_edges("run-1", "absent", None, 2)
-            .expect("other target")
-            .is_empty()
+            .expect("other target"),
+        [] as [crate::run_graph::RunGraphEdge; 0]
     );
     let incoming = store
         .run_graph_incoming_edges("run-1", &edge.to, Some(1), 2)
@@ -4463,11 +4458,9 @@ fn initial_edge_pages_preserve_duplicate_edges_and_detect_damage() {
         .expect("second page");
     assert_eq!(second.len(), 1);
     assert_eq!(second[0].edge_id, 2);
-    assert!(
-        store
-            .run_graph_edges("run-1", Some(2), 2)
-            .expect("end")
-            .is_empty()
+    assert_eq!(
+        store.run_graph_edges("run-1", Some(2), 2).expect("end"),
+        [] as [crate::run_graph::RunGraphEdge; 0]
     );
     block_on(
         store.connection.exec_update_count(
@@ -4730,12 +4723,12 @@ fn repeat_back_edges_use_admitted_graph_after_reopen() {
         settled.activated[0].input,
         Some(serde_json::json!({"condition_met": false, "iteration": 2}))
     );
-    assert!(
+    assert_eq!(
         store
             .settle_pending_control_nodes(&run.run_id, 10, 4)
             .expect("settled already")
-            .activated
-            .is_empty()
+            .activated,
+        [] as [bcode_workflow::NewActivation; 0]
     );
 }
 #[test]
@@ -4789,11 +4782,11 @@ fn rejected_run_preserves_existing_run_and_graph_across_reopen() {
             .expect("rejected run")
             .is_none()
     );
-    assert!(
+    assert_eq!(
         store
             .run_graph_nodes(&rejected.run_id, None, 100)
-            .expect("rejected graph")
-            .is_empty()
+            .expect("rejected graph"),
+        [] as [crate::run_graph::RunGraphNode; 0]
     );
     rejected.input = Some(serde_json::json!("valid"));
     store.create_run(&rejected).expect("retry after reopen");
@@ -5126,7 +5119,7 @@ fn successor_reuse_requires_current_graph_reconciliation() {
             .execute(transaction.as_ref()),
     )
     .expect("explicit retention");
-    assert!(
+    assert_eq!(
         materialize_selected_successors(
             transaction.as_ref(),
             &output,
@@ -5135,8 +5128,8 @@ fn successor_reuse_requires_current_graph_reconciliation() {
             vec!["second".into()],
             &BTreeMap::new(),
         )
-        .expect("reconciled reuse")
-        .is_empty()
+        .expect("reconciled reuse"),
+        [] as [bcode_workflow::NewActivation; 0]
     );
     let admitted: u64 = fixture_scalar_unsigned(
         transaction.as_ref(),

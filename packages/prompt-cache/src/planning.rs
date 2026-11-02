@@ -293,7 +293,7 @@ mod tests {
         assert!(hints.cache_system_prompt);
         assert!(hints.cache_tools);
         assert_eq!(hints.key.as_deref(), Some("bcode:test"));
-        assert!(messages.is_empty());
+        assert_eq!(messages, [] as [bcode_model::ModelMessage; 0]);
     }
 
     #[test]

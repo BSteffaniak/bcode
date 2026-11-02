@@ -653,7 +653,7 @@ mod tests {
         )
         .unwrap();
         let (page, next, degraded) = store.discovery_page(None, 1).await.unwrap();
-        assert!(page.is_empty());
+        assert_eq!(page, [] as [bcode_session_models::SessionSummary; 0]);
         assert!(next.is_some());
         assert!(degraded);
         let other = root.path().join("outside.json");
@@ -906,7 +906,7 @@ mod tests {
             .discover_readable_session_summaries()
             .expect("a missing root is reported as empty, not as an error");
 
-        assert!(summaries.is_empty());
+        assert_eq!(summaries, [] as [bcode_session_models::SessionSummary; 0]);
         assert!(
             !absent.exists(),
             "read-only discovery must not create the root it inspects"

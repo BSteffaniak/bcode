@@ -219,7 +219,7 @@ fn failure_details_remain_painted_after_home_and_resize() {
     assert_eq!(app.screen, Screen::Home);
     app.action("diagnostics");
     assert_eq!(app.screen, Screen::Diagnostics);
-    assert!(!app.failure_lines.is_empty());
+    assert_ne!(app.failure_lines, [] as [bmux_tui::text::Line; 0]);
 }
 
 #[test]

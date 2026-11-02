@@ -55,7 +55,10 @@ async fn waits_are_exact_stable_and_resolution_feedback_is_idempotent() {
     assert_eq!(first.activated.len(), 1);
     let duplicate = resolve_gate(&*db, &owner, &request).await.unwrap();
     assert!(duplicate.duplicate);
-    assert!(duplicate.activated.is_empty());
+    assert_eq!(
+        duplicate.activated,
+        [] as [crate::representation::graph::Activation; 0]
+    );
     request.decision = GateDecision::Input(serde_json::json!(10));
     assert!(resolve_gate(&*db, &owner, &request).await.is_err());
     let current = page(&*db, "waits", 10).await.unwrap();
@@ -67,7 +70,10 @@ async fn waits_are_exact_stable_and_resolution_feedback_is_idempotent() {
     request.activation_id = current.gates[0].activation_id.clone();
     request.decision = GateDecision::Approve;
     resolve_gate(&*db, &owner, &request).await.unwrap();
-    assert!(page(&*db, "waits", 10).await.unwrap().gates.is_empty());
+    assert_eq!(
+        page(&*db, "waits", 10).await.unwrap().gates,
+        [] as [crate::representation::graph::gate_waits::GateWait; 0]
+    );
 }
 #[tokio::test]
 async fn cancellation_and_unknown_contract_do_not_expose_actions() {
@@ -81,7 +87,10 @@ async fn cancellation_and_unknown_contract_do_not_expose_actions() {
     rep::safety::request_cancellation(&*db, "waits", &owner, 5)
         .await
         .unwrap();
-    assert!(page(&*db, "waits", 10).await.unwrap().gates.is_empty());
+    assert_eq!(
+        page(&*db, "waits", 10).await.unwrap().gates,
+        [] as [crate::representation::graph::gate_waits::GateWait; 0]
+    );
     db.update("workflow_representation_contract")
         .value("version", i64::MAX)
         .where_eq("representation", 2_i64)

@@ -160,7 +160,7 @@ mod tests {
             registry.action_for_key(scope, parse_key_stroke("r").unwrap()),
             None
         );
-        assert!(registry.keys_for_action(scope, action).is_empty());
+        assert_eq!(registry.keys_for_action(scope, action), [] as [&str; 0]);
         let host = Host(registry);
         assert_eq!(
             event(&Event::Key(parse_key_stroke("r").unwrap()), &host, scope),

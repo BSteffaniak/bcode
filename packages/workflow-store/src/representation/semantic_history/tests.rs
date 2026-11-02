@@ -91,12 +91,12 @@ async fn exact_attempt_events_duplicates_and_pinned_pages() {
     ));
     let mut pinned = first.cursor;
     pinned.after_sequence = 1;
-    assert!(
+    assert_eq!(
         page(&*db, "history", Some(&pinned), 100)
             .await
             .unwrap()
-            .events
-            .is_empty()
+            .events,
+        [] as [bcode_workflow::WorkflowSemanticHistoryEvent; 0]
     );
 }
 #[tokio::test]
@@ -295,14 +295,14 @@ async fn rolled_back_event_write_and_missing_origin_are_explicit() {
         .await
         .unwrap();
     tx.rollback().await.unwrap();
-    assert!(
+    assert_eq!(
         db.select(EVENTS)
             .where_eq("run_id", "never-committed")
             .limit(1)
             .execute(&*db)
             .await
-            .unwrap()
-            .is_empty()
+            .unwrap(),
+        [] as [switchy_database::Row; 0]
     );
     // No origin is manufactured by inspection for an older or absent run.
     assert_eq!(

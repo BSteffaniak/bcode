@@ -1321,7 +1321,7 @@ mod tests {
             &[],
         );
 
-        assert!(response.warnings.is_empty());
+        assert_eq!(response.warnings, [] as [std::string::String; 0]);
         let thread = response.threads.first().expect("imported thread");
         assert_eq!(thread.state, ExternalReviewThreadState::Open);
         assert_eq!(thread.mapping.status, ExternalAnchorMappingStatus::Exact);
@@ -1581,7 +1581,7 @@ mod tests {
 
         let draft = github_review_draft(&bundle, &options);
 
-        assert!(draft.comments.is_empty());
+        assert_eq!(draft.comments, [] as [GitHubReviewComment; 0]);
         assert!(
             draft
                 .warnings

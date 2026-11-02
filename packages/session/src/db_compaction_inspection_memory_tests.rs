@@ -33,7 +33,10 @@ async fn memory_compaction_inspection_is_bounded_safe_and_non_mutating() {
         .await
         .unwrap();
     assert_eq!(page.scanned_events, 200);
-    assert!(page.entries.is_empty());
+    assert_eq!(
+        page.entries,
+        [] as [bcode_session_models::SessionCompactionInspectionEntry; 0]
+    );
     assert!(page.has_more);
     assert!(!page.degraded);
     let page = manager

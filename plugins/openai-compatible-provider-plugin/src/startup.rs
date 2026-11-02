@@ -269,7 +269,10 @@ mod tests {
                 decoded.choices.first(),
                 recommendation.recommendation.as_ref()
             );
-            assert!(!decoded.choices.is_empty());
+            assert_ne!(
+                decoded.choices,
+                [] as [bcode_model::StartupRecommendation; 0]
+            );
             let catalog = offline_catalog().unwrap();
             for choice in decoded.choices {
                 assert_eq!(
@@ -291,7 +294,10 @@ mod tests {
         };
         let decoded: bcode_model::StartupModelChoicesResponse =
             serde_json::from_slice(&choices_response(&unsupported).payload).unwrap();
-        assert!(decoded.choices.is_empty());
+        assert_eq!(
+            decoded.choices,
+            [] as [bcode_model::StartupRecommendation; 0]
+        );
         assert!(
             choices_response(&ServiceRequest {
                 payload: b"{}".to_vec(),

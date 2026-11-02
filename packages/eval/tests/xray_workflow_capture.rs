@@ -436,7 +436,7 @@ fn assert_recorded(fixture: &Fixture, task_passed: bool) {
     assert!(!run_sessions.is_empty());
     for session in run_sessions.values() {
         let segments = session["segments"].as_array().unwrap();
-        assert!(!segments.is_empty());
+        assert_ne!(segments.as_slice(), [] as [serde_json::Value; 0]);
         assert!(
             segments
                 .iter()

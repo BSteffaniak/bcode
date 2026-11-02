@@ -2232,7 +2232,10 @@ mod reasoning_effort_order_tests {
 
     #[test]
     fn empty_advertisement_stays_empty() {
-        assert!(ordered_reasoning_effort_values(&[]).is_empty());
+        assert_eq!(
+            ordered_reasoning_effort_values(&[]),
+            [] as [std::string::String; 0]
+        );
     }
 }
 

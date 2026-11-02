@@ -1502,7 +1502,7 @@ mod tests {
         };
         let mut runtime = MarkdownPresentationRuntime::new().unwrap();
         let (removed, tasks) = runtime.reconcile_and_start(&input, policy);
-        assert!(removed.is_empty());
+        assert_eq!(removed, [] as [std::string::String; 0]);
         let [task] = tasks.try_into().expect("one image task");
 
         assert!(runtime.complete(task.await.unwrap()));
@@ -1917,7 +1917,7 @@ mod tests {
         store.reconcile(&[input("owner:image:1", "a.png")], policy);
         assert_eq!(store.len(), 1);
         let unchanged = store.reconcile(&[input("owner:image:1", "a.png")], policy);
-        assert!(unchanged.is_empty());
+        assert_eq!(unchanged, [] as [std::string::String; 0]);
         assert!(
             store
                 .state_mut("owner:image:1")
@@ -1974,12 +1974,18 @@ mod tests {
             .expect("image state")
             .ready(image(2, 2));
 
-        assert!(store.reconcile(&input, unsupported).is_empty());
+        assert_eq!(
+            store.reconcile(&input, unsupported),
+            [] as [std::string::String; 0]
+        );
         assert_eq!(
             store.state("image"),
             Some(&MarkdownImagePresentationState::TerminalUnsupported)
         );
-        assert!(store.reconcile(&input, enabled).is_empty());
+        assert_eq!(
+            store.reconcile(&input, enabled),
+            [] as [std::string::String; 0]
+        );
         assert_eq!(
             store.state("image"),
             Some(&MarkdownImagePresentationState::Idle)

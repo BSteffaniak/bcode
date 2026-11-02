@@ -726,7 +726,10 @@ mod tests {
                 )
                 .is_err()
             );
-            assert!(rejected.optional_operations.is_empty());
+            assert_eq!(
+                rejected.optional_operations,
+                [] as [bcode_model::judgement::OptionalOperationObservation; 0]
+            );
             assert!(!rejected.optional_operations_complete);
             assert_eq!(rejected.inference_calls, None);
         }

@@ -2392,8 +2392,9 @@ mod tests {
         assert!(values.get("emulate_frames").is_some_and(|value| *value > 0));
         assert!(values.get("retained_bytes").is_some_and(|value| *value > 0));
         assert!(values.get("emitted_rows").is_some_and(|value| *value > 0));
-        assert!(
-            bcode_plugin_sdk::tui::PluginTuiVisualAdapter::drain_diagnostics(&adapter).is_empty()
+        assert_eq!(
+            bcode_plugin_sdk::tui::PluginTuiVisualAdapter::drain_diagnostics(&adapter),
+            [] as [bcode_plugin_sdk::tui::PluginTuiDiagnostic; 0]
         );
     }
 
@@ -3346,7 +3347,13 @@ mod tests {
                 &PluginTuiVisualRenderContext::new(40, PluginTuiDiffLayout::Unified, None),
             );
             adapter.live_replays.lock().unwrap().clear();
-            assert!(!narrow.selection.is_empty());
+            assert_ne!(
+                narrow.selection,
+                [] as [(
+                    usize,
+                    bcode_plugin_models::tui_selection::PluginTuiSelectionRow
+                ); 0]
+            );
             assert_ne!(narrow.selection, wide.selection);
             for projection in [narrow, wide] {
                 for (index, row) in projection.selection {
@@ -3979,7 +3986,7 @@ mod tests {
             );
             let projection = adapter.command_projection(&payload, &context);
             if width == 0 {
-                assert!(projection.rows.is_empty());
+                assert_eq!(projection.rows, [] as [bmux_tui::text::Line; 0]);
                 continue;
             }
             assert_eq!(command::declared_copy(&projection), source);

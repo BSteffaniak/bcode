@@ -1757,7 +1757,7 @@ mod tests {
         assert!(queue.remove("first"));
         assert_eq!(queue.interaction_ids(), ["second"]);
         queue.retain(&std::collections::BTreeSet::new());
-        assert!(queue.interaction_ids().is_empty());
+        assert_eq!(queue.interaction_ids(), [] as [&str; 0]);
     }
 
     #[test]

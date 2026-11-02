@@ -121,7 +121,10 @@ async fn sequence_settles_exact_output_and_validates_terminal_schema() {
             .graph_output,
         Some(serde_json::json!(4))
     );
-    assert!(ready(&*db, "graph", 1, None, 10).await.unwrap().is_empty());
+    assert_eq!(
+        ready(&*db, "graph", 1, None, 10).await.unwrap(),
+        [] as [crate::representation::graph::Activation; 0]
+    );
 }
 #[tokio::test]
 async fn parallel_fan_in_waits_and_preserves_left_right_order() {
@@ -264,7 +267,10 @@ async fn loop_body_evaluation_repeat_uses_new_generation_and_retains_output() {
         .await
         .unwrap();
     assert_eq!(rows.len(), 2);
-    assert!(ready(&*db, "graph", 1, None, 10).await.unwrap().is_empty());
+    assert_eq!(
+        ready(&*db, "graph", 1, None, 10).await.unwrap(),
+        [] as [crate::representation::graph::Activation; 0]
+    );
 }
 
 #[tokio::test]
@@ -288,7 +294,10 @@ async fn conditional_edge_uses_shared_predicate_and_does_not_activate_unselected
     settle_output(&*db, &owner, "graph", "first", 1, &serde_json::json!(1))
         .await
         .unwrap();
-    assert!(ready(&*db, "graph", 1, None, 10).await.unwrap().is_empty());
+    assert_eq!(
+        ready(&*db, "graph", 1, None, 10).await.unwrap(),
+        [] as [crate::representation::graph::Activation; 0]
+    );
     assert!(output(&*db, "graph", "last").await.unwrap().is_none());
 }
 
@@ -453,7 +462,10 @@ async fn blocked_branch_resumes_repeat_and_unselected_gates_do_not_block_complet
             .await
             .unwrap();
     }
-    assert!(ready(&*db, "graph", 1, None, 100).await.unwrap().is_empty());
+    assert_eq!(
+        ready(&*db, "graph", 1, None, 100).await.unwrap(),
+        [] as [crate::representation::graph::Activation; 0]
+    );
 }
 
 #[tokio::test]

@@ -21,7 +21,7 @@ fn retained_projection_keeps_original_fence_source_and_identity_across_resize() 
             42,
             None,
         );
-        assert!(!fragments.is_empty());
+        assert_ne!(fragments, [] as [bmux_tui::selection::SelectionFragment; 0]);
         assert!(
             accepted
                 .projection()
@@ -100,7 +100,7 @@ fn scrolled_body_clips_selection_and_hits_through_the_same_bmux_context() {
     let mut buffer = Buffer::empty(area);
     let mut frame = Frame::new(&mut buffer);
     body.paint(&layout, &mut PaintCx::new(&mut frame));
-    assert!(!frame.hits().regions().is_empty());
+    assert_ne!(frame.hits().regions(), []);
     for fragment in frame.selection().fragments() {
         assert_eq!(fragment.area.intersection(area), fragment.area);
         assert_eq!(fragment.revision, 12);

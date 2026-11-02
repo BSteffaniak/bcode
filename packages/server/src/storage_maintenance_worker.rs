@@ -80,7 +80,7 @@ impl StorageMaintenanceWorker {
         }
     }
 
-    #[cfg(test)]
+    #[cfg(all(test, any(target_os = "macos", target_os = "linux")))]
     pub(super) fn terminal(
         &self,
         id: SessionId,

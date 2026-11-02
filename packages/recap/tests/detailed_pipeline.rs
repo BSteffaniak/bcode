@@ -1245,11 +1245,12 @@ async fn missing_source_point_without_inventory_identity_is_repaired() {
         .find(|request| request.stage == AnalysisStage::SourceRepair)
         .unwrap();
     assert_eq!(repair.input["issues"][0]["item_ids"], serde_json::json!([]));
-    assert!(
-        !repair.input["untrusted_sources"]
+    assert_ne!(
+        repair.input["untrusted_sources"]
             .as_array()
             .unwrap()
-            .is_empty()
+            .as_slice(),
+        [] as [serde_json::Value; 0]
     );
 }
 
@@ -2189,12 +2190,16 @@ async fn final_source_audit_requires_empty_checked_list_for_empty_inventory() {
                     && request.input["required_checked_item_ids"] == serde_json::json!([])
             })
             .unwrap();
-        assert!(!empty_final.input["chapters"].as_array().unwrap().is_empty());
-        assert!(
-            !empty_final.input["untrusted_sources"]
+        assert_ne!(
+            empty_final.input["chapters"].as_array().unwrap().as_slice(),
+            [] as [serde_json::Value; 0]
+        );
+        assert_ne!(
+            empty_final.input["untrusted_sources"]
                 .as_array()
                 .unwrap()
-                .is_empty()
+                .as_slice(),
+            [] as [serde_json::Value; 0]
         );
     }
 }

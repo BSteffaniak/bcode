@@ -1245,7 +1245,10 @@ mod tests {
                 .unwrap();
         let sources: bcode_session_import::ListImportSourcesResponse =
             serde_json::from_slice(&response.payload).unwrap();
-        assert!(sources.sources.is_empty());
+        assert_eq!(
+            sources.sources,
+            [] as [bcode_session_import::ImportSourceInfo; 0]
+        );
         let response = super::call_import_service(
             &state,
             bcode_session_import::OP_DISCOVER_IMPORTABLE_SESSIONS,
@@ -1255,7 +1258,10 @@ mod tests {
         .unwrap();
         let discovery: bcode_session_import::DiscoverImportableSessionsResponse =
             serde_json::from_slice(&response.payload).unwrap();
-        assert!(discovery.sessions.is_empty());
+        assert_eq!(
+            discovery.sessions,
+            [] as [bcode_session_import::ImportableSessionSummary; 0]
+        );
         for (operation, payload) in [
             (
                 bcode_session_import::OP_DISCOVER_IMPORTABLE_SESSIONS,

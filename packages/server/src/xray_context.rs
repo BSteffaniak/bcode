@@ -448,7 +448,10 @@ mod tests {
         assert_eq!(emitted.name, "request_assembled");
         assert!(!emitted.sensitive);
         assert_eq!(emitted.capture, Some(XrayCaptureAttachments::new(vec![])));
-        assert!(emitted.payload_references().unwrap().is_empty());
+        assert_eq!(
+            emitted.payload_references().unwrap(),
+            [] as [bcode_xray::XrayPayloadRef; 0]
+        );
         assert!(!emitted.data.to_string().contains("private"));
         observer.finalize().unwrap();
         assert_eq!(observer.recv().await.unwrap().event.domain, "xray");
@@ -532,7 +535,7 @@ mod tests {
                     length: 16 * 1024,
                 })
                 .unwrap();
-            assert!(!range.bytes.is_empty());
+            assert_ne!(range.bytes, [] as [u8; 0]);
             bytes.extend_from_slice(&range.bytes);
         }
         let decoded: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
@@ -605,7 +608,10 @@ mod tests {
         assert_eq!(captured.data["content"], ordinary);
         assert!(captured.sensitive);
         assert_eq!(captured.capture, Some(XrayCaptureAttachments::new(vec![])));
-        assert!(captured.payload_references().unwrap().is_empty());
+        assert_eq!(
+            captured.payload_references().unwrap(),
+            [] as [bcode_xray::XrayPayloadRef; 0]
+        );
     }
 
     #[tokio::test]

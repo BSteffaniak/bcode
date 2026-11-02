@@ -16845,7 +16845,6 @@ impl SessionView {
                 self.snapshot.transcript.revision =
                     self.snapshot.transcript.revision.saturating_add(1);
                 self.bump_revision();
-                true
             }
             PendingTextDestination::ReasoningPart {
                 turn_id,
@@ -16868,9 +16867,9 @@ impl SessionView {
                         text: text.to_owned(),
                     },
                 );
-                true
             }
         }
+        true
     }
 
     fn flush_turn_text_presentations(&mut self, turn_id: &str) -> bool {
@@ -19275,7 +19274,10 @@ mod tests {
         });
         view.clear_history_window();
         assert!(view.snapshot().runtime.queue_recovery().is_some());
-        assert!(view.snapshot().transcript.items.is_empty());
+        assert_eq!(
+            view.snapshot().transcript.items,
+            [] as [bcode_session_view_models::TranscriptViewItem; 0]
+        );
         view.apply_event(&event(
             session_id,
             2,
@@ -20140,7 +20142,10 @@ mod tests {
         let projected = &view.snapshot().contributions["call:surface"];
         assert_eq!(projected.sequence, 2);
         assert_eq!(projected.payload, serde_json::json!({"opaque": [1, 2]}));
-        assert!(view.snapshot().transcript.items.is_empty());
+        assert_eq!(
+            view.snapshot().transcript.items,
+            [] as [bcode_session_view_models::TranscriptViewItem; 0]
+        );
 
         view.apply_event(&contribution(
             3,
@@ -20292,7 +20297,10 @@ mod tests {
         direct.apply_live_event(&cancel);
         attached.apply_live_event(&cancel);
         assert_eq!(direct.snapshot(), attached.snapshot());
-        assert!(direct.snapshot().transcript.items.is_empty());
+        assert_eq!(
+            direct.snapshot().transcript.items,
+            [] as [bcode_session_view_models::TranscriptViewItem; 0]
+        );
 
         let request = event(
             session_id,
@@ -22214,7 +22222,10 @@ mod tests {
         view.apply_live_event(&contribution(2));
         assert!(view.snapshot().active_invocations.is_empty());
         assert!(view.snapshot().contributions.is_empty());
-        assert!(view.snapshot().transcript.items.is_empty());
+        assert_eq!(
+            view.snapshot().transcript.items,
+            [] as [bcode_session_view_models::TranscriptViewItem; 0]
+        );
     }
 
     #[test]
@@ -24254,8 +24265,14 @@ mod tests {
         assert_eq!(view.snapshot().interactions.len(), 1);
 
         view.set_pending_interactions(Vec::new());
-        assert!(view.snapshot().interactions.is_empty());
-        assert!(view.snapshot().transcript.items.is_empty());
+        assert_eq!(
+            view.snapshot().interactions,
+            [] as [bcode_session_view_models::InteractionViewSummary; 0]
+        );
+        assert_eq!(
+            view.snapshot().transcript.items,
+            [] as [bcode_session_view_models::TranscriptViewItem; 0]
+        );
     }
 
     #[test]
@@ -24280,7 +24297,10 @@ mod tests {
         assert_eq!(view.snapshot().permissions.len(), 1);
 
         view.set_pending_permissions(Vec::new());
-        assert!(view.snapshot().permissions.is_empty());
+        assert_eq!(
+            view.snapshot().permissions,
+            [] as [bcode_session_view_models::PermissionView; 0]
+        );
     }
 
     #[test]
@@ -24310,7 +24330,10 @@ mod tests {
             },
         ));
 
-        assert!(view.snapshot().permissions.is_empty());
+        assert_eq!(
+            view.snapshot().permissions,
+            [] as [bcode_session_view_models::PermissionView; 0]
+        );
         assert!(matches!(
             &view.snapshot().transcript.items[0].kind,
             TranscriptViewItemKind::Permission { permission }
@@ -26448,7 +26471,10 @@ mod tests {
             cancellable: true,
             observation: None,
         }]);
-        assert!(view.snapshot().runtime_work.is_empty());
+        assert_eq!(
+            view.snapshot().runtime_work,
+            [] as [bcode_session_view_models::RuntimeWorkView; 0]
+        );
         view.set_runtime_work_snapshots(&[]);
 
         view.apply_event(&event(
@@ -26467,7 +26493,10 @@ mod tests {
                 cancellable: true,
             },
         ));
-        assert!(view.snapshot().runtime_work.is_empty());
+        assert_eq!(
+            view.snapshot().runtime_work,
+            [] as [bcode_session_view_models::RuntimeWorkView; 0]
+        );
     }
 
     #[test]
@@ -26565,8 +26594,14 @@ mod tests {
             },
         ));
 
-        assert!(view.snapshot().runtime_work.is_empty());
-        assert!(view.snapshot().transcript.items.is_empty());
+        assert_eq!(
+            view.snapshot().runtime_work,
+            [] as [bcode_session_view_models::RuntimeWorkView; 0]
+        );
+        assert_eq!(
+            view.snapshot().transcript.items,
+            [] as [bcode_session_view_models::TranscriptViewItem; 0]
+        );
     }
 
     #[test]
@@ -26604,7 +26639,10 @@ mod tests {
         ]);
 
         assert_eq!(snapshot.runtime_work[0].message.as_deref(), Some("halfway"));
-        assert!(snapshot.transcript.items.is_empty());
+        assert_eq!(
+            snapshot.transcript.items,
+            [] as [bcode_session_view_models::TranscriptViewItem; 0]
+        );
     }
 
     #[test]
@@ -26683,7 +26721,10 @@ mod tests {
             },
         ));
         assert_eq!(view.snapshot().transcript, transcript_before);
-        assert!(view.snapshot().runtime_work.is_empty());
+        assert_eq!(
+            view.snapshot().runtime_work,
+            [] as [bcode_session_view_models::RuntimeWorkView; 0]
+        );
     }
 
     #[test]
@@ -26755,7 +26796,10 @@ mod tests {
             view.snapshot().transcript.items,
             std::slice::from_ref(&initial_item)
         );
-        assert!(view.snapshot().runtime_work.is_empty());
+        assert_eq!(
+            view.snapshot().runtime_work,
+            [] as [bcode_session_view_models::RuntimeWorkView; 0]
+        );
 
         view.apply_event(&event(
             session_id,

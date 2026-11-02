@@ -861,7 +861,14 @@ fn transcript_selection_scene_reflows_without_changing_logical_source_ranges() {
         })
         .collect::<Vec<_>>();
 
-    assert!(!wide_ranges.is_empty());
+    assert_ne!(
+        wide_ranges,
+        [] as [(
+            bmux_tui::selection::SelectionContentId,
+            std::ops::Range<usize>,
+            u64
+        ); 0]
+    );
     assert_eq!(narrow_ranges, wide_ranges);
     assert!(wide.validate().is_ok());
     assert!(narrow.validate().is_ok());
@@ -899,7 +906,13 @@ fn ephemeral_markdown_selection_scene_reflows_without_changing_source_ranges() {
         .map(|fragment| (fragment.content_id.clone(), fragment.source_range.clone()))
         .collect::<Vec<_>>();
 
-    assert!(!wide_ranges.is_empty());
+    assert_ne!(
+        wide_ranges,
+        [] as [(
+            bmux_tui::selection::SelectionContentId,
+            std::ops::Range<usize>
+        ); 0]
+    );
     assert_eq!(narrow_ranges, wide_ranges);
     assert!(wide.validate().is_ok());
     assert!(narrow.validate().is_ok());
@@ -1075,7 +1088,10 @@ fn local_plain_markdown_and_json_system_notes_keep_distinct_formats() {
     app.push_ephemeral_system_json(r#"{"value":1}"#.to_owned());
 
     assert_eq!(app.transcript().len(), 3);
-    assert!(app.session_view_snapshot().transcript.items.is_empty());
+    assert_eq!(
+        app.session_view_snapshot().transcript.items,
+        [] as [bcode_session_view_models::TranscriptViewItem; 0]
+    );
     assert_eq!(
         app.transcript()[0].text_format(),
         bcode_session_view_models::TextFormat::PlainText
@@ -2384,7 +2400,7 @@ fn markdown_hit_regions_follow_scroll_resize_and_replacement() {
     let scrolled = markdown_hit_regions_for_item(&original, 10, 11, area);
     let resized = markdown_hit_regions_for_item(&original, 10, 10, Rect::new(3, 4, 30, 3));
 
-    assert!(!visible.is_empty());
+    assert_ne!(visible, [] as [bmux_tui::hit::HitRegion; 0]);
     assert!(scrolled.iter().all(|region| region.area.y >= area.y));
     assert_ne!(
         visible.iter().map(|region| region.area).collect::<Vec<_>>(),
@@ -2438,7 +2454,10 @@ fn markdown_hit_regions_follow_scroll_resize_and_replacement() {
         "plain replacement".to_owned(),
         TextFormat::Markdown,
     );
-    assert!(markdown_hit_regions_for_item(&replacement, 10, 10, area).is_empty());
+    assert_eq!(
+        markdown_hit_regions_for_item(&replacement, 10, 10, area),
+        [] as [bmux_tui::hit::HitRegion; 0]
+    );
 
     let details = TranscriptItem::with_format(
         "System",
@@ -3871,7 +3890,7 @@ fn rich_content_matrix_is_bounded_and_semantic_across_themes() {
                     .with_streaming(true)
                     .with_document_id(format!("rich-{theme_id}-{width}")),
             );
-            assert!(!rendered.lines.is_empty());
+            assert_ne!(rendered.lines, [] as [bmux_tui::text::Line; 0]);
             assert!(
                 rendered
                     .lines

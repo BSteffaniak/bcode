@@ -7311,7 +7311,10 @@ mod tests {
             oldest: Some(record.clone()),
             blocker: Some(SubmissionQueueBlocker::MissingContext),
         });
-        assert!(app.session_view_snapshot().transcript.items.is_empty());
+        assert_eq!(
+            app.session_view_snapshot().transcript.items,
+            [] as [bcode_session_view_models::TranscriptViewItem; 0]
+        );
         app.prepare_queue_confirmation(confirmation.clone());
         assert_eq!(app.queue_recovery.confirmation, Some(confirmation.clone()));
         assert!(!app.queue_recovery.settings_visible);
@@ -8158,7 +8161,7 @@ mod tests {
         let catalog = crate::theme::catalog_view(&mut app);
         drop(app);
 
-        assert!(!catalog.entries.is_empty());
+        assert_ne!(catalog.entries, [] as [crate::theme::ThemeCatalogEntry; 0]);
         assert_eq!(catalog.diagnostics.len(), 1);
         assert!(catalog.diagnostics[0].contains("broken.toml"));
     }
@@ -9613,8 +9616,14 @@ mod tests {
             },
         });
 
-        assert!(app.session_view_snapshot().runtime_work.is_empty());
-        assert!(app.session_view_snapshot().transcript.items.is_empty());
+        assert_eq!(
+            app.session_view_snapshot().runtime_work,
+            [] as [bcode_session_view_models::RuntimeWorkView; 0]
+        );
+        assert_eq!(
+            app.session_view_snapshot().transcript.items,
+            [] as [bcode_session_view_models::TranscriptViewItem; 0]
+        );
         let transcript_is_empty = app.transcript().is_empty();
         drop(app);
         assert!(transcript_is_empty);
@@ -10766,7 +10775,7 @@ mod tests {
             },
         ));
 
-        assert!(app.pending_submissions().is_empty());
+        assert_eq!(app.pending_submissions(), []);
         assert_eq!(
             app.shared_terminal_text_for_sequence(1, "You").as_deref(),
             Some("shared user")

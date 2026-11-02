@@ -487,10 +487,9 @@ mod tests {
             )
             .is_err()
         );
-        assert!(
-            pack(PackingGate::Experimental, &[], &template(), 128_000, None)
-                .unwrap()
-                .is_empty()
+        assert_eq!(
+            pack(PackingGate::Experimental, &[], &template(), 128_000, None).unwrap(),
+            [] as [std::string::String; 0]
         );
     }
 }

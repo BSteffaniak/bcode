@@ -457,7 +457,7 @@ mod tests {
         .expect_err("cancelled");
         assert_eq!(error.kind(), io::ErrorKind::Interrupted);
         assert_eq!(original.into_inner(), bytes);
-        assert!(candidate.into_inner().is_empty());
+        assert_eq!(candidate.into_inner(), [] as [u8; 0]);
     }
 
     #[test]

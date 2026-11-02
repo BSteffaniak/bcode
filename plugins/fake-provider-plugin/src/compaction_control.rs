@@ -755,7 +755,7 @@ mod tests {
         let request = request(scratch.path());
         let turn = FakeTurn::default();
         dispatch(&request, turn.clone(), Ok("kept".into()), 10);
-        assert!(turn.drain().is_empty());
+        assert_eq!(turn.drain(), [] as [bcode_model::ProviderTurnEvent; 0]);
         turn.cancel();
         for _ in 0..1000 {
             let attempt = std::fs::read_dir(scratch.path())
@@ -790,7 +790,7 @@ mod tests {
             .unwrap()
             .path();
         assert!(attempt.join("ready.json").exists());
-        assert!(turn.drain().is_empty());
+        assert_eq!(turn.drain(), [] as [bcode_model::ProviderTurnEvent; 0]);
         std::fs::write(attempt.join("release"), []).unwrap();
         let mut text = String::new();
         for _ in 0..1000 {

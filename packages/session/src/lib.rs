@@ -3732,7 +3732,10 @@ mod tests {
                         panic!("observation category: {}", error.observation_category())
                     });
                 assert!(page.complete);
-                assert!(page.children.is_empty());
+                assert_eq!(
+                    page.children,
+                    [] as [bcode_session_models::SessionSummary; 0]
+                );
                 tokio::task::yield_now().await;
             }
         };
@@ -3760,12 +3763,12 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(second.len(), 2);
-        assert!(
+        assert_eq!(
             manager
                 .usage_catalog_page(second.last().copied())
                 .await
-                .unwrap()
-                .is_empty()
+                .unwrap(),
+            [] as [bcode_session_models::SessionId; 0]
         );
         let actual: std::collections::BTreeSet<_> = first.into_iter().chain(second).collect();
         assert_eq!(actual, expected);
@@ -4514,11 +4517,9 @@ mod tests {
             .await
             .expect("session deletes");
         restarted.flush_catalog_updates().await;
-        assert!(
-            restarted
-                .list_sessions(&changed_working_directory)
-                .await
-                .is_empty()
+        assert_eq!(
+            restarted.list_sessions(&changed_working_directory).await,
+            [] as [bcode_session_models::SessionSummary; 0]
         );
         restarted.shutdown_catalog_updates().await;
         std::fs::remove_dir_all(root).expect("temp dir should clean up");
@@ -5584,6 +5585,7 @@ mod tests {
         );
     }
 
+    #[allow(clippy::too_many_lines)]
     #[tokio::test]
     async fn ordered_live_text_operations_never_enter_history_and_restart_drops_state() {
         let root = unique_temp_dir();
@@ -5680,7 +5682,10 @@ mod tests {
             .attach_session(session_id, ClientId::new())
             .await
             .expect("restarted session should attach");
-        assert!(attachment.live_checkpoints.is_empty());
+        assert_eq!(
+            attachment.live_checkpoints,
+            [] as [bcode_session_models::SessionLiveEvent; 0]
+        );
         assert!(!attachment.history.iter().any(|event| matches!(
             event.kind,
             SessionEventKind::AssistantDelta { .. }
@@ -5947,7 +5952,10 @@ mod tests {
             .attach_session(session.id, ClientId::new())
             .await
             .expect("session should reattach");
-        assert!(attachment.live_checkpoints.is_empty());
+        assert_eq!(
+            attachment.live_checkpoints,
+            [] as [bcode_session_models::SessionLiveEvent; 0]
+        );
 
         let _ = manager
             .publish_live_event(session.id, publish(3, 11, "late"))
@@ -5956,7 +5964,10 @@ mod tests {
             .attach_session(session.id, ClientId::new())
             .await
             .expect("late update should not revive checkpoint");
-        assert!(attachment.live_checkpoints.is_empty());
+        assert_eq!(
+            attachment.live_checkpoints,
+            [] as [bcode_session_models::SessionLiveEvent; 0]
+        );
 
         manager
             .append_model_turn_finished(
@@ -7481,10 +7492,9 @@ mod tests {
             .expect("adopt migration lease");
 
         assert!(!manager.session_is_owned(session.id).await);
-        assert!(
-            crate::lease::active_session_owners(&root, session.id)
-                .expect("owner scan")
-                .is_empty()
+        assert_eq!(
+            crate::lease::active_session_owners(&root, session.id).expect("owner scan"),
+            [] as [crate::lease::SessionLeaseOwner; 0]
         );
         std::fs::remove_dir_all(root).expect("temp dir should clean up");
     }
@@ -7563,10 +7573,9 @@ mod tests {
             0
         );
         assert!(!manager.session_is_owned(session.id).await);
-        assert!(
-            crate::lease::active_session_owners(&root, session.id)
-                .expect("owner scan")
-                .is_empty()
+        assert_eq!(
+            crate::lease::active_session_owners(&root, session.id).expect("owner scan"),
+            [] as [crate::lease::SessionLeaseOwner; 0]
         );
         std::fs::remove_dir_all(root).expect("temp dir should clean up");
     }
@@ -7594,10 +7603,9 @@ mod tests {
             SessionError::NotFound(id) if id == session.id
         ));
         assert!(!manager.session_is_owned(session.id).await);
-        assert!(
-            crate::lease::active_session_owners(&root, session.id)
-                .expect("owner scan")
-                .is_empty()
+        assert_eq!(
+            crate::lease::active_session_owners(&root, session.id).expect("owner scan"),
+            [] as [crate::lease::SessionLeaseOwner; 0]
         );
         std::fs::remove_dir_all(root).expect("temp dir should clean up");
     }
@@ -7693,10 +7701,9 @@ mod tests {
                 .expect("session should detach")
         );
         assert!(!manager.session_is_owned(session.id).await);
-        assert!(
-            crate::lease::active_session_owners(&root, session.id)
-                .expect("owner scan")
-                .is_empty()
+        assert_eq!(
+            crate::lease::active_session_owners(&root, session.id).expect("owner scan"),
+            [] as [crate::lease::SessionLeaseOwner; 0]
         );
 
         let next = SessionManager::persistent_with_metrics_and_lease_owner(
@@ -8467,7 +8474,7 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec![1, 2]
         );
-        assert!(empty.is_empty());
+        assert_eq!(empty, [] as [bcode_session_models::SessionEvent; 0]);
 
         std::fs::remove_dir_all(root).expect("temp dir should clean up");
     }
@@ -9850,18 +9857,14 @@ mod tests {
             .await
             .expect("session should delete");
 
-        assert!(
-            manager
-                .list_sessions(&test_working_directory())
-                .await
-                .is_empty()
+        assert_eq!(
+            manager.list_sessions(&test_working_directory()).await,
+            [] as [bcode_session_models::SessionSummary; 0]
         );
         let restored = SessionManager::persistent(&root).expect("manager should restore");
-        assert!(
-            restored
-                .list_sessions(&test_working_directory())
-                .await
-                .is_empty()
+        assert_eq!(
+            restored.list_sessions(&test_working_directory()).await,
+            [] as [bcode_session_models::SessionSummary; 0]
         );
 
         std::fs::remove_dir_all(root).expect("temp dir should clean up");
@@ -10117,11 +10120,9 @@ mod tests {
 
         let restored = SessionManager::persistent_lazy(&root);
         assert!(!restored.catalog_loaded());
-        assert!(
-            restored
-                .cached_sessions(&test_working_directory())
-                .await
-                .is_empty()
+        assert_eq!(
+            restored.cached_sessions(&test_working_directory()).await,
+            [] as [bcode_session_models::SessionSummary; 0]
         );
 
         let summary = restored

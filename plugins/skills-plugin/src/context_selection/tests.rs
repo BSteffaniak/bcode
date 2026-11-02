@@ -262,7 +262,10 @@ fn invalid_duplicate_unprovenanced_or_oversized_sources_are_not_ranked() {
             _ => input.candidates[2].snippet = "x".repeat(2049),
         }
         assert!(prepare(&input).judgement.is_none());
-        assert!(apply(&advised(input)).included_ids.is_empty());
+        assert_eq!(
+            apply(&advised(input)).included_ids,
+            [] as [std::string::String; 0]
+        );
     }
 }
 

@@ -3309,7 +3309,10 @@ mod observation_tests {
             );
             assert_eq!(output.exit_code, Some(0));
             assert_eq!(output.measurements, measurements);
-            assert!(output.artifacts.is_empty());
+            assert_eq!(
+                output.artifacts,
+                [] as [bcode_eval_models::EvalArtifactRef; 0]
+            );
             assert_eq!(output.diagnostics.len(), 1);
             assert_eq!(serde_json::to_vec(&oracle).unwrap(), oracle_before);
         }
@@ -3744,7 +3747,10 @@ metric = "wall_time_ms"
             .unwrap();
             assert_eq!(calls.get(), 1);
             assert!(!operation.inference_complete);
-            assert!(operation.inference.is_empty());
+            assert_eq!(
+                operation.inference,
+                [] as [bcode_model::judgement::OptionalOperationObservation; 0]
+            );
             let bytes = std::fs::read(
                 directory
                     .path()

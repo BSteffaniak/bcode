@@ -112,7 +112,7 @@ fn polling_is_redacted_and_does_not_consume_mutation_capacity() {
         );
     }
     assert!(server.clients.is_empty());
-    assert!(server.handler.actions.is_empty());
+    assert_eq!(server.handler.actions, [] as [crate::contracts::Action; 0]);
 }
 
 #[test]
@@ -135,7 +135,7 @@ fn foreign_service_and_bad_mutation_ids_fail_closed() {
         }));
         assert_eq!(response.result, Err(Failure::Identity));
     }
-    assert!(server.handler.actions.is_empty());
+    assert_eq!(server.handler.actions, [] as [crate::contracts::Action; 0]);
     assert!(server.clients.is_empty());
 }
 
@@ -145,7 +145,7 @@ fn unknown_version_cannot_mutate() {
     let mut unknown = action_request(1, Action::Toggle);
     unknown.version = VERSION + 1;
     assert_eq!(server.dispatch(&unknown).result, Err(Failure::Version));
-    assert!(server.handler.actions.is_empty());
+    assert_eq!(server.handler.actions, [] as [crate::contracts::Action; 0]);
 }
 
 #[test]

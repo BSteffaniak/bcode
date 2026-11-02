@@ -39,8 +39,9 @@ Windows semantics:
   reopened through the same object so their filter can interpret them.
 * **Names.** Components containing `\`, `:` (alternate data streams), or a trailing dot or space
   are rejected; Win32 path normalization would make such names unreachable.
-* **Privacy.** "Private" means owned by the current user with a DACL granting access only to
-  that user, SYSTEM, and Administrators. Private directories carry a protected inheritable DACL,
+* **Privacy.** "Private" means a DACL granting access only to the current user, SYSTEM, and
+  Administrators, and an owner from that same set. Elevated administrators own new objects
+  through the Administrators group by default, so files inherit that owner. Private directories carry a protected inheritable DACL,
   so files created inside inherit it; explicitly private files receive their own descriptor.
   Other created files inherit their directory's access control, preserving user ACLs.
 * **Replacement and deletion.** Renames and deletions request POSIX semantics, so a file

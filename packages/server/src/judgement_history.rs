@@ -278,14 +278,20 @@ mod tests {
         shifted.insert(0, messages[0].clone());
         let final_lineage =
             super::super::context_lineage::final_lineage(&shifted, &lineage).unwrap();
-        assert!(final_lineage.entries.is_empty());
+        assert_eq!(
+            final_lineage.entries,
+            [] as [bcode_model::lineage::ContextLineageEntry; 0]
+        );
         assert_eq!(final_lineage.omitted, 1);
         messages[0].content = vec![ContentBlock::Text {
             text: "rewritten".to_owned(),
         }];
         let final_lineage =
             super::super::context_lineage::final_lineage(&messages, &lineage).unwrap();
-        assert!(final_lineage.entries.is_empty());
+        assert_eq!(
+            final_lineage.entries,
+            [] as [bcode_model::lineage::ContextLineageEntry; 0]
+        );
         assert_eq!(final_lineage.omitted, 1);
     }
 

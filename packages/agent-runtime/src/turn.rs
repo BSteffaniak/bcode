@@ -146,7 +146,7 @@ impl TurnScopeOwner {
                 .unwrap_or_default();
             let generation = self
                 .next_generation
-                .fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| {
+                .try_update(Ordering::AcqRel, Ordering::Acquire, |current| {
                     current.checked_add(1)
                 })
                 .expect("turn generation exhausted");

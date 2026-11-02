@@ -50,7 +50,10 @@ fn legacy_collision_shapes_remain_opaque_and_round_trip_without_metadata() {
     assert!(encoded.get("capture").is_none());
     let decoded: XrayEvent = serde_json::from_value(encoded).unwrap();
     assert_eq!(decoded, source);
-    assert!(decoded.payload_references().unwrap().is_empty());
+    assert_eq!(
+        decoded.payload_references().unwrap(),
+        [] as [XrayPayloadRef; 0]
+    );
 }
 
 #[test]
@@ -71,11 +74,11 @@ fn declarations_ignore_arbitrary_collisions_and_resolve_escaped_keys_and_arrays(
 
 #[test]
 fn empty_attachment_list_does_not_walk_even_valid_reference_shapes() {
-    assert!(
+    assert_eq!(
         event(serde_json::json!([reference()]), &[])
             .payload_references()
-            .unwrap()
-            .is_empty()
+            .unwrap(),
+        [] as [XrayPayloadRef; 0]
     );
 }
 

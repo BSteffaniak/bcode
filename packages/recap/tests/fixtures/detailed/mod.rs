@@ -141,17 +141,17 @@ impl Case {
                 observation.visual.is_some()
             );
             if let Some(text) = &observation.transcript {
-                assert!(!text.trim().is_empty());
+                assert_ne!(text.trim(), "");
             }
             if let Some(visual) = &observation.visual {
                 assert!(assets.insert(visual.asset_id.as_str()));
-                assert!(!visual.description.trim().is_empty());
+                assert_ne!(visual.description.trim(), "");
             }
         }
         let mut items = BTreeSet::new();
         for item in &self.items {
             assert!(items.insert(item.id.as_str()));
-            assert!(!item.required_fragments.is_empty());
+            assert_ne!(item.required_fragments, [] as [std::string::String; 0]);
             assert!(item.required_fragments.iter().all(|fragment| {
                 !fragment.trim().is_empty()
                     && item
@@ -159,7 +159,7 @@ impl Case {
                         .to_lowercase()
                         .contains(&fragment.to_lowercase())
             }));
-            assert!(!item.evidence_ids.is_empty());
+            assert_ne!(item.evidence_ids, [] as [std::string::String; 0]);
             assert!(
                 item.evidence_ids
                     .iter()

@@ -1693,7 +1693,7 @@ mod tests {
         let config: bcode_workflow::WorkflowPromptConfiguration =
             serde_json::from_value(task.node.configuration).unwrap();
         assert!(config.timeout_ms > 0);
-        assert!(config.tool_allowlist.is_empty());
+        assert_eq!(config.tool_allowlist, [] as [std::string::String; 0]);
     }
 
     #[test]
@@ -1848,12 +1848,9 @@ mod tests {
         arguments["resources"][0]["access"] = json!("future");
         assert!(parse_tool_edit(PROMPT_TASK_NAME, &arguments).is_err());
         arguments.as_object_mut().unwrap().remove("resources");
-        assert!(
-            parse_prompt_task(&arguments)
-                .unwrap()
-                .node
-                .resources
-                .is_empty()
+        assert_eq!(
+            parse_prompt_task(&arguments).unwrap().node.resources,
+            [] as [bcode_workflow::ResourceClaim; 0]
         );
     }
 

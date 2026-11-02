@@ -131,7 +131,7 @@ async fn receipt_updates_and_session_links_pin_examined_attempts() {
     let first = page(&*db, "run", Source::SessionLinks, None, 1)
         .await
         .unwrap();
-    assert!(first.identities.is_empty());
+    assert_eq!(first.identities, [] as [std::string::String; 0]);
     let cursor = first.next.unwrap();
     assert_eq!(cursor.after.as_deref(), Some("a"));
     db.insert("workflow_execution_sessions_v2")

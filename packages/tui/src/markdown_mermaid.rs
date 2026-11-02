@@ -676,7 +676,7 @@ mod tests {
             renderer: bmux_mermaid_render::WasmMermaidRenderer::new_with_fuel(1).expect("renderer"),
         };
         let (removed, tasks) = runtime.reconcile_and_start(&inputs, true);
-        assert!(removed.is_empty());
+        assert_eq!(removed, [] as [std::string::String; 0]);
         let [task] = tasks.try_into().expect("one worker task");
 
         assert!(runtime.complete(task.await.unwrap()));
@@ -821,7 +821,7 @@ mod tests {
         let mut cache = MermaidRenderCache::default();
         assert!(store.complete("v1", Ok(rendered("v1")), &mut cache));
         let unchanged = store.reconcile(&initial, true);
-        assert!(unchanged.is_empty());
+        assert_eq!(unchanged, [] as [std::string::String; 0]);
 
         let first = store
             .ready_placement("diagram", Rect::new(2, 3, 20, 8), Rect::new(4, 4, 10, 4))
@@ -856,7 +856,10 @@ mod tests {
             store.state("diagram"),
             Some(&MarkdownMermaidPresentationState::TerminalUnsupported)
         );
-        assert!(store.reconcile(&replacement, true).is_empty());
+        assert_eq!(
+            store.reconcile(&replacement, true),
+            [] as [std::string::String; 0]
+        );
         assert_eq!(
             store.state("diagram"),
             Some(&MarkdownMermaidPresentationState::Idle)

@@ -3044,7 +3044,10 @@ mod controller_consumer_tests {
         cancel_session_tool_exchanges(&state, session).await;
         assert!(other_resolution.lock().await.is_none());
         cancel_session_tool_exchanges(&state, sibling).await;
-        assert!(list_pending_tool_exchanges(&state).await.is_empty());
+        assert_eq!(
+            list_pending_tool_exchanges(&state).await,
+            [] as [bcode_session_models::PendingToolExchangeSummary; 0]
+        );
         drop(state);
     }
 
@@ -3131,7 +3134,10 @@ mod controller_consumer_tests {
                     .await
                     .is_err()
             );
-            assert!(list_pending_tool_exchanges(&state).await.is_empty());
+            assert_eq!(
+                list_pending_tool_exchanges(&state).await,
+                [] as [bcode_session_models::PendingToolExchangeSummary; 0]
+            );
             commit.send(Ok(true)).unwrap();
             let (_, _, durable) = registration.await.unwrap();
             assert!(durable);
@@ -3161,7 +3167,10 @@ mod controller_consumer_tests {
             result,
             Err(ExchangeRegistrationError::Durability(_))
         ));
-        assert!(list_pending_tool_exchanges(&state).await.is_empty());
+        assert_eq!(
+            list_pending_tool_exchanges(&state).await,
+            [] as [bcode_session_models::PendingToolExchangeSummary; 0]
+        );
         drop(state);
     }
 
@@ -3310,7 +3319,10 @@ mod controller_consumer_tests {
             *resolution.lock().await,
             Some(ToolExchangeResolution::Cancelled)
         );
-        assert!(list_pending_tool_exchanges(&state).await.is_empty());
+        assert_eq!(
+            list_pending_tool_exchanges(&state).await,
+            [] as [bcode_session_models::PendingToolExchangeSummary; 0]
+        );
     }
 
     #[tokio::test]

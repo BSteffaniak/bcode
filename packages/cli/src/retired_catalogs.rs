@@ -430,11 +430,11 @@ mod tests {
         assert_eq!(reports[0].action, RetiredCatalogAction::Removed);
         assert_eq!(reports[0].migrated_drafts, 1);
         assert!(!namespace_dir.exists());
-        assert!(
+        assert_eq!(
             retired_catalog_reports(state.path(), &session_root, true)
                 .await
-                .expect("second cleanup")
-                .is_empty()
+                .expect("second cleanup"),
+            [] as [crate::retired_catalogs::RetiredCatalogReport; 0]
         );
         let active = bcode_session::db::GlobalSessionDb::open_existing_turso_in_root(&session_root)
             .await

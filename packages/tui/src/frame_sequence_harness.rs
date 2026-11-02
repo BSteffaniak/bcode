@@ -1974,7 +1974,13 @@ mod tests {
         assert!(frames[1].text.contains("hello"), "{}", frames[1].text);
         assert_eq!(frames[1].observation.semantic_items.len(), 1);
         assert_eq!(frames[1].observation.terminal_items.len(), 1);
-        assert!(!frames[1].observation.terminal_rows.is_empty());
+        assert_ne!(
+            frames[1].observation.terminal_rows,
+            [] as [(
+                std::option::Option<bcode_session_view_models::TranscriptViewItemId>,
+                usize
+            ); 0]
+        );
         assert!(matches!(
             frames[1].observation.damage,
             super::super::transcript_document::TranscriptDocumentDamage::Structural
@@ -2557,7 +2563,14 @@ mod tests {
             frames[1].text
         );
         assert_eq!(frames[1].observation.semantic_items.len(), 1);
-        assert!(frames[1].observation.terminal_items.is_empty());
+        assert_eq!(
+            frames[1].observation.terminal_items,
+            [] as [(
+                bcode_tui_components::transcript::item::TranscriptItemId,
+                std::option::Option<bcode_session_view_models::TranscriptViewItemId>,
+                std::option::Option<u64>
+            ); 0]
+        );
         assert!(frames[2].text.contains("Raw chain of thought"));
         assert_eq!(
             frames[0].observation.semantic_items[0].0,

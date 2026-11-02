@@ -2220,7 +2220,10 @@ mod tests {
             response.error.as_ref().map(|error| error.code.as_str()),
             Some("stale_generation")
         );
-        assert!(restarted.status(&config).coverage.is_empty());
+        assert_eq!(
+            restarted.status(&config).coverage,
+            [] as [bcode_session_search::SessionSearchCoverage; 0]
+        );
     }
 
     #[test]
@@ -2741,14 +2744,20 @@ mod tests {
         let status = plugin.status(&provider_config);
         assert_eq!(status.state, SearchProviderState::Ready);
         assert_eq!(status.document_count, 0);
-        assert!(status.coverage.is_empty());
+        assert_eq!(
+            status.coverage,
+            [] as [bcode_session_search::SessionSearchCoverage; 0]
+        );
         let search = plugin.search(
             &provider_config,
             &request("rebuild"),
             &ServiceCancellation::default(),
         );
         let search: SessionSearchResponse = search.payload_json().expect("search");
-        assert!(search.hits.is_empty());
+        assert_eq!(
+            search.hits,
+            [] as [bcode_session_search::SessionSearchHit; 0]
+        );
     }
 
     #[test]

@@ -205,7 +205,7 @@ fn discovery_ignores_non_tool_events_but_advances_over_them() {
     history.has_more = true;
     history.next_cursor = Some(SessionHistoryCursor { sequence: 1 });
     let discovery = discover(id, &history, 0, 1).expect("non-tool page");
-    assert!(discovery.events.is_empty());
+    assert_eq!(discovery.events, [] as [super::EventReference; 0]);
     assert_eq!(discovery.scanned_events, 1);
     assert_eq!(discovery.next_sequence, Some(1));
 }

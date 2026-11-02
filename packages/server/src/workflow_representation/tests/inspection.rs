@@ -145,11 +145,9 @@ async fn inspection_routes_both_families_and_marks_unavailable_evidence() {
     assert!(rows.iter().any(|run| run.run_id == "legacy"));
     assert!(rows.iter().any(|run| run.run_id == "new"));
     assert!(discovery::events(&state, "new", None, 100).await.is_err());
-    assert!(
-        discovery::attempts(&state, "new", None, 100)
-            .await
-            .unwrap()
-            .is_empty()
+    assert_eq!(
+        discovery::attempts(&state, "new", None, 100).await.unwrap(),
+        [] as [bcode_workflow::AttemptSummary; 0]
     );
 }
 

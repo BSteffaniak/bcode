@@ -1923,10 +1923,16 @@ mod judgement_context_producer_tests {
     #[test]
     fn oversize_and_blank_lines_are_declined_not_truncated_and_candidate_scan_is_bounded() {
         let long = "界".repeat(683);
-        assert!(grep_context_candidates(&response(&[&long, " "]), "call-a").is_empty());
+        assert_eq!(
+            grep_context_candidates(&response(&[&long, " "]), "call-a"),
+            [] as [bcode_session_models::JudgementContextCandidate; 0]
+        );
         let many = response(&["original"; 40]);
         assert_eq!(grep_context_candidates(&many, "call-a").len(), 32);
-        assert!(grep_context_candidates(&many, &"x".repeat(128)).is_empty());
+        assert_eq!(
+            grep_context_candidates(&many, &"x".repeat(128)),
+            [] as [bcode_session_models::JudgementContextCandidate; 0]
+        );
     }
 
     #[test]

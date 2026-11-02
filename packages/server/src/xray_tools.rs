@@ -270,11 +270,9 @@ mod tests {
                 assert_eq!(event.correlation.session_id, "owner");
                 assert!(!event.sensitive);
                 assert_eq!(event.capture, Some(XrayCaptureAttachments::new(vec![])));
-                assert!(
-                    event
-                        .payload_references()
-                        .expect("typed references")
-                        .is_empty()
+                assert_eq!(
+                    event.payload_references().expect("typed references"),
+                    [] as [bcode_xray::XrayPayloadRef; 0]
                 );
                 match name {
                     "operation_started" => assert_eq!(
@@ -327,12 +325,9 @@ mod tests {
             event.event.capture,
             Some(XrayCaptureAttachments::new(vec![]))
         );
-        assert!(
-            event
-                .event
-                .payload_references()
-                .expect("typed references")
-                .is_empty()
+        assert_eq!(
+            event.event.payload_references().expect("typed references"),
+            [] as [bcode_xray::XrayPayloadRef; 0]
         );
     }
 }

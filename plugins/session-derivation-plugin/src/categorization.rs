@@ -500,7 +500,10 @@ mod tests {
             request.task = task;
             let response = rank(&request).unwrap();
             assert_eq!(response.ordered_session_ids, baseline);
-            assert!(response.matched_session_ids.is_empty());
+            assert_eq!(
+                response.matched_session_ids,
+                [] as [bcode_session_models::SessionId; 0]
+            );
             assert!(!response.applied);
         }
         request.candidates[1]
@@ -509,7 +512,10 @@ mod tests {
             .unwrap()
             .source_sequence = 9;
         request.task = Some("other".into());
-        assert!(rank(&request).unwrap().matched_session_ids.is_empty());
+        assert_eq!(
+            rank(&request).unwrap().matched_session_ids,
+            [] as [bcode_session_models::SessionId; 0]
+        );
         request.candidates.push(request.candidates[0].clone());
         assert!(rank(&request).is_err());
         request.candidates.pop();

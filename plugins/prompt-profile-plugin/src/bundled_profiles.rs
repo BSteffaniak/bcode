@@ -91,7 +91,7 @@ mod tests {
         let mut config = PromptProfileConfig::default();
         let mut diagnostics = Vec::new();
         install(&mut config, &mut diagnostics);
-        assert!(diagnostics.is_empty());
+        assert_eq!(diagnostics, [] as [std::string::String; 0]);
         let layer = config
             .family
             .get("claude")

@@ -732,7 +732,10 @@ mod tests {
             observation.operation.trigger,
             TriggerDisposition::NotApplicable
         );
-        assert!(observation.operation.inference.is_empty());
+        assert_eq!(
+            observation.operation.inference,
+            [] as [bcode_model::judgement::OptionalOperationObservation; 0]
+        );
         let mut invalid = observation.clone();
         invalid.complete = false;
         assert!(attempt_observable(&invalid, Arm::Off).is_err());

@@ -146,7 +146,7 @@ mod tests {
                 for y in 0..10 {
                     let row = buffer.row_symbols(y).unwrap();
                     if y < 2 || y >= 2 + height {
-                        assert!(row.trim().is_empty());
+                        assert_eq!(row.trim(), "");
                     }
                 }
             }
@@ -191,6 +191,9 @@ mod tests {
             points(&report, &model, "USD", 1000),
             vec![ChartPoint::new(0.0, 1.5)]
         );
-        assert!(points(&report, &model, "EUR", 1000).is_empty());
+        assert_eq!(
+            points(&report, &model, "EUR", 1000),
+            [] as [bmux_tui_components::chart::ChartPoint; 0]
+        );
     }
 }

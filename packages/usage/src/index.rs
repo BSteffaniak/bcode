@@ -823,14 +823,14 @@ mod tests {
             .build()
             .await
             .unwrap();
-        assert!(
+        assert_eq!(
             db.select("sqlite_master")
                 .where_eq("name", "usage_meta")
                 .limit(1)
                 .execute(&*db)
                 .await
-                .unwrap()
-                .is_empty()
+                .unwrap(),
+            [] as [switchy::database::Row; 0]
         );
         assert_eq!(
             db.select("sqlite_master")

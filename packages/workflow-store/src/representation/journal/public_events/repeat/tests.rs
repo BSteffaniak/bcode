@@ -154,7 +154,7 @@ async fn pinned_pages_exclude_later_commits_and_never_expand_v1_scopes() {
     tx.commit().await.unwrap();
     let first = page(&*db, 1, "covered", 0, None, 100).await.unwrap();
     let emissions = repeat_events(&first);
-    assert!(!emissions.is_empty());
+    assert_ne!(emissions, [] as [&bcode_workflow::WorkflowHistoryEvent; 0]);
     assert_eq!(first.events.events.len(), 100);
     assert_eq!(first.events.scopes.len(), 3);
     let pin = first.events.through_sequence;

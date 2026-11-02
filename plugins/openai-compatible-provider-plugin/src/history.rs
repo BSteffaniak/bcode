@@ -482,7 +482,10 @@ mod tests {
         assert_eq!(decoded.selected_node, snapshot.selected_node);
         assert_eq!(decoded.revision_id, revision);
         assert_eq!(decoded.warnings, snapshot.import_warnings());
-        assert!(!decoded.warnings.is_empty());
+        assert_ne!(
+            decoded.warnings,
+            [] as [bcode_session_import::ImportWarning; 0]
+        );
         assert_eq!(decoded.events, snapshot.import_events());
     }
     use super::*;
@@ -574,7 +577,7 @@ mod tests {
         let codes: BTreeSet<_> = warnings.iter().map(|warning| &warning.code).collect();
         assert_eq!(codes.len(), warnings.len());
         for warning in &warnings {
-            assert!(!warning.message.is_empty());
+            assert_ne!(warning.message, "");
             assert!(!warning.message.contains("private title"));
             assert_eq!(warning.count, None);
         }
@@ -583,7 +586,10 @@ mod tests {
             serde_json::from_slice(&serialized).unwrap();
         assert_eq!(decoded, warnings);
         snapshot.warnings.clear();
-        assert!(snapshot.import_warnings().is_empty());
+        assert_eq!(
+            snapshot.import_warnings(),
+            [] as [bcode_session_import::ImportWarning; 0]
+        );
     }
 
     #[test]

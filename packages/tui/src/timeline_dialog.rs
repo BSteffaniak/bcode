@@ -405,7 +405,7 @@ mod tests {
             milestones: Vec::new(),
             next_after_sequence: Some(200),
         });
-        assert!(dialog.entries().is_empty());
+        assert_eq!(dialog.entries(), []);
         assert_eq!(dialog.next_after_sequence(), Some(200));
         dialog.replace_milestone_page(&bcode_session_models::SessionMilestonePage {
             milestones: Vec::new(),
@@ -422,7 +422,7 @@ mod tests {
         let mut requests = super::MilestonePageRequests::default();
         let mut dialog = state();
         let first = requests.begin(session, None, &mut dialog).unwrap();
-        assert!(dialog.entries().is_empty());
+        assert_eq!(dialog.entries(), []);
         assert!(dialog.is_loading());
         assert_eq!(
             dialog.handle_key(KeyStroke::simple(KeyCode::Enter)),

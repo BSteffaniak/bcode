@@ -35954,7 +35954,7 @@ where
         ));
     }
     let _ = std::fs::remove_file(&temporary);
-    if let Err(error) = sync_artifact_directory(&canonical_directory) {
+    if let Err(error) = bcode_confined_fs::sync_directory_path(&canonical_directory) {
         let _ = std::fs::remove_file(&destination);
         return Err(("artifact_sync_failed".to_string(), error.to_string()));
     }
@@ -35965,18 +35965,6 @@ where
         "content_type": request.content_type,
         "metadata": request.metadata,
     }))
-}
-
-fn sync_artifact_directory(directory: &Path) -> std::io::Result<()> {
-    #[cfg(unix)]
-    {
-        std::fs::File::open(directory)?.sync_all()
-    }
-    #[cfg(not(unix))]
-    {
-        let _ = directory;
-        Ok(())
-    }
 }
 
 struct ServerServiceRouter<'a> {
@@ -46312,18 +46300,21 @@ mod tests {
         assert_eq!(catalog.runs[0].run_id, "edit-run");
         assert_eq!(catalog.runs[0].attention.pending_tool_permissions, 1);
         state.pending_permissions.lock().await.clear();
-        assert!(
+        assert_eq!(
             workflow_operations::catalog_view(&state, &query)
                 .await
                 .unwrap()
-                .runs
-                .is_empty()
+                .runs,
+            [] as [bcode_workflow_view_models::WorkflowRunListItem; 0]
         );
         let view = workflow_operations::run_view(&state, "edit-run", 10)
             .await
             .unwrap();
         assert_eq!(view.run.attention.pending_tool_permissions, 0);
-        assert!(view.tool_permissions.is_empty());
+        assert_eq!(
+            view.tool_permissions,
+            [] as [bcode_workflow_view_models::WorkflowToolPermissionView; 0]
+        );
     }
 
     #[tokio::test]
@@ -46804,7 +46795,9 @@ mod tests {
     use crate::context_compaction::*;
     use bcode_session_models::{CURRENT_SESSION_EVENT_SCHEMA_VERSION, SessionEvent};
     use std::sync::Mutex as TestMutex;
-    use switchy::database::{DatabaseValue, query::FilterableQuery};
+    use switchy::database::DatabaseValue;
+    #[cfg(unix)]
+    use switchy::database::query::FilterableQuery;
     use tracing_subscriber::fmt::MakeWriter;
 
     #[allow(clippy::too_many_lines)]
@@ -47772,7 +47765,10 @@ mod tests {
                 .iter()
                 .any(|provider| provider.provider_id == "test.fast-session-search")
         );
-        assert!(hydrated.is_empty());
+        assert_eq!(
+            hydrated,
+            [] as [bcode_session_search::HydratedSessionSearchHit; 0]
+        );
 
         server.abort();
         drop(state);
@@ -47822,10 +47818,10 @@ mod tests {
             .expect("server task");
         assert!(state.attached_client_sessions.lock().await.is_empty());
         assert!(!sessions.session_is_owned(session.id).await);
-        assert!(
+        assert_eq!(
             bcode_session::lease::active_session_owners(session_root.path(), session.id)
-                .expect("owner scan")
-                .is_empty()
+                .expect("owner scan"),
+            [] as [bcode_session::lease::SessionLeaseOwner; 0]
         );
 
         let next = SessionManager::persistent_with_metrics_and_lease_owner(
@@ -48244,6 +48240,7 @@ mod tests {
         thread.join().expect("package export lifecycle");
     }
 
+    #[cfg(unix)]
     fn package_replacement_test_document() -> bcode_workflow::WorkflowAuthoringDocument {
         let mut document = test_workflow_authoring_document();
         let node = document.definition.nodes.get_mut("agent").expect("node");
@@ -48252,6 +48249,7 @@ mod tests {
         document
     }
 
+    #[cfg(unix)]
     async fn verify_package_export_replacement_selection(
         client: &bcode_client::BcodeClient,
         state: &Arc<ServerState>,
@@ -48349,6 +48347,7 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
     #[allow(clippy::too_many_lines)]
     async fn published_package_export_lifecycle() {
         let sessions = SessionManager::default();
@@ -48862,7 +48861,10 @@ mod tests {
         assert_eq!(inspection.workflow.active_revision, Some(1));
         assert_eq!(inspection.revisions.len(), 1);
         assert_eq!(inspection.presets.len(), 1);
-        assert!(inspection.issues.is_empty());
+        assert_eq!(
+            inspection.issues,
+            [] as [bcode_workflow::WorkflowAuthoringIssueSnapshot; 0]
+        );
         let bundle = client
             .export_workflow_revision(bcode_workflow::ExportWorkflowRevisionRequest {
                 workflow_id: workflow_id.clone(),
@@ -49047,14 +49049,14 @@ mod tests {
             send(&mut stream, 4, Request::Ping).await,
             Response::Ok(ResponsePayload::Pong)
         ));
-        assert!(
+        assert_eq!(
             state
                 .workflow_store
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
                 .list_authored_workflows(10)
-                .expect("authored workflows")
-                .is_empty()
+                .expect("authored workflows"),
+            [] as [bcode_workflow_store::AuthoredWorkflow; 0]
         );
         drop(stream);
         server.await.expect("server task");
@@ -49417,6 +49419,7 @@ mod tests {
         drop(state);
     }
 
+    #[allow(clippy::too_many_lines)]
     #[cfg(unix)]
     #[tokio::test]
     async fn large_package_catalog_streams_all_retained_pages() {
@@ -49455,9 +49458,15 @@ mod tests {
                 .await
                 .unwrap();
             assert!(page.items.len() <= request.limit);
-            assert!(page.diagnostics.is_empty());
+            assert_eq!(
+                page.diagnostics,
+                [] as [bcode_workflow::WorkflowLaunchDiagnostic; 0]
+            );
             if let Some(token) = page.discovery_token {
-                assert!(page.items.is_empty());
+                assert_eq!(
+                    page.items,
+                    [] as [bcode_workflow::WorkflowLaunchCatalogItem; 0]
+                );
                 request.discovery_token = Some(token);
                 continue;
             }
@@ -49744,7 +49753,10 @@ mod tests {
             let page = workflow_operations::launch_catalog(&state, &request)
                 .await
                 .unwrap();
-            assert!(!page.items.is_empty());
+            assert_ne!(
+                page.items,
+                [] as [bcode_workflow::WorkflowLaunchCatalogItem; 0]
+            );
             assert!(page.items.len() < request.limit);
             for item in &page.items {
                 assert_eq!(item.description.as_ref().unwrap().len(), 4096);
@@ -49830,6 +49842,7 @@ mod tests {
         drop(state);
     }
 
+    #[cfg(unix)]
     fn discovery_fence_mutation() -> bcode_workflow_store::AuthoredWorkflow {
         bcode_workflow_store::AuthoredWorkflow {
             workflow_id: "mutation".into(),
@@ -49842,6 +49855,7 @@ mod tests {
         }
     }
 
+    #[cfg(unix)]
     fn release_discovery_scans(state: &ServerState) {
         state.workflow_discovery_scans.lock().unwrap().clear();
     }
@@ -50154,7 +50168,10 @@ mod tests {
                 .await
                 .unwrap();
             if let Some(token) = page.discovery_token {
-                assert!(page.items.is_empty());
+                assert_eq!(
+                    page.items,
+                    [] as [bcode_workflow::WorkflowLaunchCatalogItem; 0]
+                );
                 pending += 1;
                 request.discovery_token = Some(token);
                 continue;
@@ -50208,7 +50225,7 @@ mod tests {
         let tail = isolated_test_output_tail(source.as_slice()).await;
         assert_eq!(tail.len(), 8192);
         assert_eq!(tail, source[source.len() - tail.len()..]);
-        assert!(isolated_test_output_tail(&b""[..]).await.is_empty());
+        assert_eq!(isolated_test_output_tail(&b""[..]).await, [] as [u8; 0]);
     }
 
     /// Runs an exact test in a fresh process, returning true in the parent process.
@@ -50633,14 +50650,14 @@ mod tests {
         assert_eq!(detail.item, *item);
         assert_eq!(detail.document.workflow_id, "example/concise-run");
         assert_eq!(detail.document.definition.nodes.len(), 2);
-        assert!(
+        assert_eq!(
             state
                 .workflow_store
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
                 .list_runs(10)
-                .expect("runs")
-                .is_empty()
+                .expect("runs"),
+            [] as [bcode_workflow::WorkflowRunSummary; 0]
         );
         drop(state);
     }
@@ -51495,14 +51512,14 @@ mod tests {
             .expect("revision")
             .expect("revision");
         assert_eq!(before, after);
-        assert!(
+        assert_eq!(
             state
                 .workflow_store
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
                 .list_runs(10)
-                .expect("runs")
-                .is_empty()
+                .expect("runs"),
+            [] as [bcode_workflow::WorkflowRunSummary; 0]
         );
 
         let request = bcode_workflow::StartAuthoredWorkflowRequest {
@@ -51522,14 +51539,14 @@ mod tests {
                 .await
                 .is_err()
         );
-        assert!(
+        assert_eq!(
             state
                 .workflow_store
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
                 .list_runs(10)
-                .expect("runs")
-                .is_empty()
+                .expect("runs"),
+            [] as [bcode_workflow::WorkflowRunSummary; 0]
         );
         drop(state);
     }
@@ -51727,7 +51744,10 @@ mod tests {
                 .active_revision,
             Some(1)
         );
-        assert!(store.list_runs(10).expect("runs").is_empty());
+        assert_eq!(
+            store.list_runs(10).expect("runs"),
+            [] as [bcode_workflow::WorkflowRunSummary; 0]
+        );
         drop(store);
         drop(state);
     }
@@ -52191,7 +52211,10 @@ event_symbol = "bcode_plugin_handle_event_v1"
             operation.application,
             Some(bcode_model::judgement::ApplicationDisposition::BaselineRetained)
         );
-        assert!(operation.inference.is_empty());
+        assert_eq!(
+            operation.inference,
+            [] as [bcode_model::judgement::OptionalOperationObservation; 0]
+        );
         assert_eq!(operation.selection.as_ref().unwrap().admitted, vec![0]);
     }
 
@@ -52212,21 +52235,21 @@ event_symbol = "bcode_plugin_handle_event_v1"
             }],
         }];
         let unchanged = absent.clone();
-        assert!(
+        assert_eq!(
             incorporate_optional_context(
                 &mut absent,
                 &captured,
                 std::slice::from_ref(&candidate.id)
-            )
-            .is_empty()
+            ),
+            [] as [std::string::String; 0]
         );
         let (included, lineage) = incorporate_optional_context_tracked(
             &mut absent,
             &captured,
             std::slice::from_ref(&candidate.id),
         );
-        assert!(included.is_empty());
-        assert!(lineage.calls.is_empty());
+        assert_eq!(included, [] as [std::string::String; 0]);
+        assert_eq!(lineage.calls, [] as [u64; 0]);
         assert_eq!(lineage.omitted, 1);
         let mut retained = vec![original.clone()];
         let (_, lineage) = incorporate_optional_context_tracked(
@@ -52377,7 +52400,10 @@ event_symbol = "bcode_plugin_handle_event_v1"
         let operation = &snapshot.operations[0];
         assert_eq!(operation.trigger, TriggerDisposition::NotApplicable);
         assert!(operation.inference_complete);
-        assert!(operation.inference.is_empty());
+        assert_eq!(
+            operation.inference,
+            [] as [bcode_model::judgement::OptionalOperationObservation; 0]
+        );
         assert_eq!(
             operation.application,
             Some(ApplicationDisposition::BaselineRetained)
@@ -55329,10 +55355,10 @@ library = "test"
             1
         );
         remove_finalized_active_artifact(&state, session_id, "artifact-active", "recording");
-        assert!(
+        assert_eq!(
             active_artifact_snapshot_events(&state, session_id)
-                .expect("snapshots after finalized transition")
-                .is_empty()
+                .expect("snapshots after finalized transition"),
+            [] as [bcode_session_models::SessionLiveEvent; 0]
         );
         remove_session_artifact_dir(&artifact_dir).expect("artifact cleanup");
         drop(state);
@@ -55584,7 +55610,7 @@ library = "test"
         let (_, tail) = read_artifact_file_range(&path, &root, 8, 100).expect("tail");
         assert_eq!(tail, b"89");
         let (_, eof) = read_artifact_file_range(&path, &root, 10, 1).expect("EOF");
-        assert!(eof.is_empty());
+        assert_eq!(eof, [] as [u8; 0]);
         let error = read_artifact_file_range(&path, &root, 11, 1)
             .expect_err("offset beyond EOF must be rejected");
         assert!(error.contains("exceeds artifact length"));
@@ -57550,7 +57576,7 @@ library = "test"
             StructuredOutputPhase::Finalization,
         );
         assert_eq!(work.structured_output, Some(structured_output));
-        assert!(work.tools.is_empty());
+        assert_eq!(work.tools, [] as [bcode_model::ToolDefinition; 0]);
         assert_eq!(work.tool_call_policy.choice, bcode_model::ToolChoice::None);
         assert_eq!(
             work.metadata.get("bcode_structured_output_phase"),
@@ -58175,7 +58201,10 @@ library = "test"
             durable_before
         );
         let restarted_state = test_server_state(restarted);
-        assert!(active_tool_request_draft_snapshot_events(&restarted_state, session.id).is_empty());
+        assert_eq!(
+            active_tool_request_draft_snapshot_events(&restarted_state, session.id),
+            [] as [bcode_session_models::SessionLiveEvent; 0]
+        );
     }
 
     #[tokio::test]
@@ -58582,7 +58611,10 @@ library = "test"
         );
         assert_eq!(streamed_history, non_streamed_history);
         assert_eq!(streamed_history.len(), 3);
-        assert!(active_tool_request_draft_snapshot_events(&state, streamed.id).is_empty());
+        assert_eq!(
+            active_tool_request_draft_snapshot_events(&state, streamed.id),
+            [] as [bcode_session_models::SessionLiveEvent; 0]
+        );
         drop(state);
     }
 
@@ -58765,11 +58797,13 @@ library = "test"
             )
             .await;
 
-            assert!(active_tool_request_draft_snapshot_events(&state, session_id).is_empty());
-            assert!(
-                progress
-                    .tool_request_draft_checkpoints("turn-terminal")
-                    .is_empty()
+            assert_eq!(
+                active_tool_request_draft_snapshot_events(&state, session_id),
+                [] as [bcode_session_models::SessionLiveEvent; 0]
+            );
+            assert_eq!(
+                progress.tool_request_draft_checkpoints("turn-terminal"),
+                [] as [bcode_session_models::ToolRequestDraftEvent; 0]
             );
             let registry = state
                 .active_tool_request_drafts
@@ -58827,8 +58861,14 @@ library = "test"
         )
         .await;
 
-        assert!(active_tool_request_draft_snapshot_events(&state, session_id).is_empty());
-        assert!(progress.tool_request_draft_checkpoints("turn-1").is_empty());
+        assert_eq!(
+            active_tool_request_draft_snapshot_events(&state, session_id),
+            [] as [bcode_session_models::SessionLiveEvent; 0]
+        );
+        assert_eq!(
+            progress.tool_request_draft_checkpoints("turn-1"),
+            [] as [bcode_session_models::ToolRequestDraftEvent; 0]
+        );
         let first = attachment.live_events.recv().await.expect("draft event");
         assert!(matches!(
             first.kind,
@@ -58897,7 +58937,10 @@ library = "test"
         .await;
         drop(guard);
 
-        assert!(active_tool_request_draft_snapshot_events(&state, session.id).is_empty());
+        assert_eq!(
+            active_tool_request_draft_snapshot_events(&state, session.id),
+            [] as [bcode_session_models::SessionLiveEvent; 0]
+        );
         let history = state
             .sessions
             .session_history(session.id)
@@ -59501,7 +59544,7 @@ library = "test"
         assert!(checkpoint.truncated);
         assert!(std::str::from_utf8(text.as_bytes()).is_ok());
         let active = &progress.active_tool_calls["call-write"];
-        assert!(active.pending_text.is_empty());
+        assert_eq!(active.pending_text, "");
         assert!(!active.pending_checkpoint);
     }
 
@@ -59626,7 +59669,10 @@ library = "test"
         for call_id in ["call-write", "call-edit"] {
             progress.finish_tool_call(call_id);
         }
-        assert!(progress.tool_request_draft_checkpoints("turn-1").is_empty());
+        assert_eq!(
+            progress.tool_request_draft_checkpoints("turn-1"),
+            [] as [bcode_session_models::ToolRequestDraftEvent; 0]
+        );
         progress.start_tool_call(
             "call-write".to_owned(),
             "filesystem.write".to_owned(),
@@ -59706,7 +59752,7 @@ library = "test"
             Arc::new(TurnCancelState::default()),
         );
 
-        assert!(stream.assistant_text.is_empty());
+        assert_eq!(stream.assistant_text, "");
         assert!(!stream.should_flush());
     }
 
@@ -59919,7 +59965,10 @@ library = "test"
 
         let activity = activity.finish(bcode_session_models::ReasoningActivityStatus::Completed);
         assert!(activity.opaque);
-        assert!(activity.parts.is_empty());
+        assert_eq!(
+            activity.parts,
+            [] as [bcode_session_models::ReasoningPart; 0]
+        );
         assert_eq!(
             activity.status,
             bcode_session_models::ReasoningActivityStatus::Completed
@@ -60680,7 +60729,10 @@ library = "test"
         )
         .expect("overflow recovery must compact one historical unit");
         assert_eq!(plan.compacted_through_sequence, 2);
-        assert!(plan.retained_tail.is_empty());
+        assert_eq!(
+            plan.retained_tail,
+            [] as [bcode_session_models::SessionEvent; 0]
+        );
     }
 
     #[test]
@@ -62385,11 +62437,13 @@ library = "test"
         )
         .await;
 
-        assert!(active_tool_request_draft_snapshot_events(&state, session_id).is_empty());
-        assert!(
-            progress
-                .tool_request_draft_checkpoints("turn-timeout")
-                .is_empty()
+        assert_eq!(
+            active_tool_request_draft_snapshot_events(&state, session_id),
+            [] as [bcode_session_models::SessionLiveEvent; 0]
+        );
+        assert_eq!(
+            progress.tool_request_draft_checkpoints("turn-timeout"),
+            [] as [bcode_session_models::ToolRequestDraftEvent; 0]
         );
         assert!(matches!(
             attachment.live_events.recv().await.expect("checkpoint").kind,
@@ -63631,8 +63685,9 @@ library = "test"
         sections.runtime_mode = false;
         sections.worktree_context = false;
         sections.config_profile = false;
-        assert!(
-            build_dynamic_system_context(&cwd, None, &sections, "build", None, None).is_empty()
+        assert_eq!(
+            build_dynamic_system_context(&cwd, None, &sections, "build", None, None),
+            ""
         );
     }
 
@@ -63904,7 +63959,7 @@ library = "test"
         assert!(stable.starts_with("custom base"));
         assert!(stable.contains("Repository invariants:"));
         assert!(!stable.contains("Stable repository context:"));
-        assert!(dynamic.is_empty());
+        assert_eq!(dynamic, "");
     }
 
     #[test]
@@ -64205,7 +64260,10 @@ library = "test"
         assert_eq!(usage.cache_write_input_tokens, Some(4));
         assert_eq!(usage.reasoning_tokens, Some(2));
         assert_eq!(usage.pricing_context.request_input_tokens, None);
-        assert!(usage.pricing_usage_details.is_empty());
+        assert_eq!(
+            usage.pricing_usage_details,
+            [] as [bcode_session_models::SessionPricingUsageDetail; 0]
+        );
         assert!(
             usage.cost.is_none(),
             "canonical usage must not embed calculated cost"
@@ -64537,7 +64595,10 @@ library = "test"
             1
         );
         close_tool_presentation_update_scope(&state, second_session, "call-2");
-        assert!(active_presentation_snapshot_events(&state, second_session).is_empty());
+        assert_eq!(
+            active_presentation_snapshot_events(&state, second_session),
+            [] as [bcode_session_models::SessionLiveEvent; 0]
+        );
         drop(state);
     }
 
@@ -65310,10 +65371,9 @@ library = "test"
         .expect("preauthorized staging must not wait for permission")
         .unwrap();
         assert!(!response.is_error, "{}", response.output);
-        assert!(
-            interaction_operations::list_permissions(&state)
-                .await
-                .is_empty()
+        assert_eq!(
+            interaction_operations::list_permissions(&state).await,
+            [] as [bcode_session_models::PermissionSummary; 0]
         );
         drop(state);
     }
@@ -66275,11 +66335,9 @@ library = "test"
             "dependent work must not dispatch: {attempts:?}"
         );
         assert_eq!(attempts[0].status, expected_status);
-        assert!(
-            store
-                .validated_outputs("edit-run", 10)
-                .expect("outputs")
-                .is_empty()
+        assert_eq!(
+            store.validated_outputs("edit-run", 10).expect("outputs"),
+            [] as [bcode_workflow::ValidatedOutput; 0]
         );
         drop(store);
         drop(state);
@@ -67848,7 +67906,7 @@ library = "test"
                 .expect("deferred page");
         assert!(page.deferred);
         assert_eq!(page.last_scanned.as_deref(), Some(identity));
-        assert!(page.classifiable.is_empty());
+        assert_eq!(page.classifiable, [] as [std::string::String; 0]);
         assert!(
             state
                 .workflow_store
@@ -67961,11 +68019,11 @@ library = "test"
                 .status,
             expected
         );
-        assert!(
+        assert_eq!(
             reopened
                 .prepared_admission_recovery_after("edit-run", &authority, "", 10)
-                .expect("remaining preparations")
-                .is_empty()
+                .expect("remaining preparations"),
+            [] as [bcode_workflow_store::PreparedActivationDispatch; 0]
         );
         drop(reopened);
         drop(state);
@@ -69115,7 +69173,7 @@ library = "test"
                         vec![bcode_workflow::ResourceClaim::read("registration-resource")]
                     );
                     assert!(!facts.requirements.agents.is_empty());
-                    assert!(facts.workflow_id.is_empty());
+                    assert_eq!(facts.workflow_id, "");
                     assert!(!facts.executes);
                     if policy_denied.load(std::sync::atomic::Ordering::SeqCst) {
                         workflow_operations::WorkflowApplicationAuthorizationDecision::Deny {
@@ -69740,7 +69798,10 @@ library = "test"
         )
         .await
         .expect("history page");
-        assert!(!history_page.events.is_empty());
+        assert_ne!(
+            history_page.events,
+            [] as [bcode_session_models::SessionEvent; 0]
+        );
         let around = session_operations::history_around(
             &state,
             operation_client_id,
@@ -69914,15 +69975,17 @@ library = "test"
         );
 
         let inactive_skill = bcode_skill_models::SkillId::new("not-active");
-        assert!(session_operations::list_skills(&state).skills.is_empty());
+        assert_eq!(
+            session_operations::list_skills(&state).skills,
+            [] as [bcode_skill_models::SkillSummary; 0]
+        );
         assert!(matches!(
             session_operations::describe_skill(&state, &inactive_skill),
             Err(session_operations::DescribeSkillError::Disabled)
         ));
-        assert!(
-            session_operations::active_skills(&state, session.id)
-                .await
-                .is_empty()
+        assert_eq!(
+            session_operations::active_skills(&state, session.id).await,
+            [] as [bcode_skill_models::SkillContextResponse; 0]
         );
         assert!(matches!(
             session_operations::activate_skill(&state, session.id, inactive_skill.clone()).await,
@@ -70064,7 +70127,7 @@ library = "test"
         earlier: &[SessionCatalogSourceStatus],
         later: &[SessionCatalogSourceStatus],
     ) {
-        assert!(!earlier.is_empty());
+        assert_ne!(earlier, []);
         assert_eq!(earlier, later);
         assert!(earlier.iter().all(|source| source.updated_at_ms > 0));
     }
@@ -70606,10 +70669,9 @@ library = "test"
             }
         );
         assert!(state.pending_tool_exchanges.lock().await.is_empty());
-        assert!(
-            interaction_operations::list_pending_tool_exchanges(&state)
-                .await
-                .is_empty()
+        assert_eq!(
+            interaction_operations::list_pending_tool_exchanges(&state).await,
+            [] as [bcode_session_models::PendingToolExchangeSummary; 0]
         );
 
         let mismatched = interaction_operations::execute_tool_exchange(
@@ -71367,7 +71429,10 @@ library = "test"
     #[tokio::test]
     async fn model_catalog_diagnostics_match_real_ipc_without_plugins() {
         let state = Arc::new(test_server_state(SessionManager::default()));
-        assert!(plugin_operations::list_services(&state).is_empty());
+        assert_eq!(
+            plugin_operations::list_services(&state),
+            [] as [bcode_ipc::PluginServiceSummary; 0]
+        );
         let direct: bcode_model_catalog_models::ModelCatalogDiagnostics =
             server_operations::model_catalog_diagnostics(&state).await;
         let socket_dir = tempfile::tempdir().expect("diagnostics socket directory");
@@ -72123,10 +72188,9 @@ event_symbol = "bcode_plugin_handle_event_v1"
                 .await
             );
         }
-        assert!(
-            interaction_operations::list_permissions(&state)
-                .await
-                .is_empty()
+        assert_eq!(
+            interaction_operations::list_permissions(&state).await,
+            [] as [bcode_session_models::PermissionSummary; 0]
         );
         assert_eq!(
             state
@@ -72259,10 +72323,9 @@ event_symbol = "bcode_plugin_handle_event_v1"
             !interaction_operations::resolve_permission(state, "pending-permission", false, false)
                 .await
         );
-        assert!(
-            interaction_operations::list_permissions(state)
-                .await
-                .is_empty()
+        assert_eq!(
+            interaction_operations::list_permissions(state).await,
+            [] as [bcode_session_models::PermissionSummary; 0]
         );
         assert!(
             recover_abandoned_session_runtime_work(state, session_id)
@@ -72348,7 +72411,10 @@ event_symbol = "bcode_plugin_handle_event_v1"
             .await
             .unwrap();
         drop(state);
-        assert!(remaining.is_empty());
+        assert_eq!(
+            remaining,
+            [] as [bcode_session::db::RuntimeWorkProjection; 0]
+        );
     }
 
     #[tokio::test]
@@ -72600,13 +72666,13 @@ event_symbol = "bcode_plugin_handle_event_v1"
         );
         let history_json = serde_json::to_string(&history).expect("history JSON");
         assert!(!history_json.contains("partial secret"));
-        assert!(
+        assert_eq!(
             sessions
                 .attach_session(session.id, ClientId::new())
                 .await
                 .expect("attach after recovery")
-                .live_checkpoints
-                .is_empty()
+                .live_checkpoints,
+            [] as [bcode_session_models::SessionLiveEvent; 0]
         );
     }
 
@@ -73585,7 +73651,7 @@ event_symbol = "bcode_plugin_handle_event_v1"
                 .await
                 .unwrap()
         );
-        assert!(
+        assert_eq!(
             state
                 .sessions
                 .pending_submissions_for_turn(
@@ -73595,8 +73661,8 @@ event_symbol = "bcode_plugin_handle_event_v1"
                     32
                 )
                 .await
-                .unwrap()
-                .is_empty()
+                .unwrap(),
+            [] as [bcode_session_models::SubmissionRecord; 0]
         );
         drop(state);
     }
@@ -74642,6 +74708,7 @@ event_symbol = "bcode_plugin_handle_event_v1"
         state
     }
 
+    #[cfg(unix)]
     fn test_server_state_with_vim_edit_plugin(sessions: SessionManager) -> ServerState {
         let plugin = bcode_plugin::StaticBundledPlugin::new(
             include_str!("../../../plugins/vim-edit-plugin/bcode-plugin.toml"),
@@ -74715,6 +74782,7 @@ event_symbol = "bcode_plugin_handle_event_v1"
         .await
     }
 
+    #[cfg(unix)]
     async fn approve_pending_permission_for_test(
         state: &ServerState,
         permission: &PendingPermission,
@@ -74823,10 +74891,9 @@ event_symbol = "bcode_plugin_handle_event_v1"
             )
             .await
         );
-        assert!(
-            interaction_operations::list_permissions(&state)
-                .await
-                .is_empty()
+        assert_eq!(
+            interaction_operations::list_permissions(&state).await,
+            [] as [bcode_session_models::PermissionSummary; 0]
         );
         assert!(
             !interaction_operations::resolve_permission(
@@ -74862,10 +74929,9 @@ event_symbol = "bcode_plugin_handle_event_v1"
         )
         .await;
         assert_eq!(result, Err(false));
-        assert!(
-            interaction_operations::list_permissions(&state)
-                .await
-                .is_empty()
+        assert_eq!(
+            interaction_operations::list_permissions(&state).await,
+            [] as [bcode_session_models::PermissionSummary; 0]
         );
         drop(state);
     }
@@ -75089,6 +75155,7 @@ event_symbol = "bcode_plugin_handle_event_v1"
         );
     }
 
+    #[cfg(unix)]
     async fn assert_routed_exchange(
         state: &Arc<ServerState>,
         source: SessionId,
@@ -75249,10 +75316,9 @@ event_symbol = "bcode_plugin_handle_event_v1"
         );
         assert_eq!(*cancelled.decision.lock().await, Some(false));
         assert_eq!(invalidations.try_recv().unwrap(), destination);
-        assert!(
-            interaction_operations::list_permissions(&state)
-                .await
-                .is_empty()
+        assert_eq!(
+            interaction_operations::list_permissions(&state).await,
+            [] as [bcode_session_models::PermissionSummary; 0]
         );
         let source_history = state.sessions.session_history(source).await.unwrap();
         assert!(source_history.iter().any(|event| matches!(
@@ -75983,6 +76049,7 @@ event_symbol = "bcode_plugin_handle_event_v1"
         .expect("all permissions should resolve before invocation starts")
     }
 
+    #[cfg(unix)]
     async fn execute_server_tool_for_test(
         state: &Arc<ServerState>,
         session_id: SessionId,
@@ -76010,6 +76077,7 @@ event_symbol = "bcode_plugin_handle_event_v1"
         .await
     }
 
+    #[cfg(unix)]
     async fn assert_persisted_tool_results_in_order(
         state: &ServerState,
         session_id: SessionId,
@@ -76490,10 +76558,10 @@ event_symbol = "bcode_plugin_handle_event_v1"
         .await
         .expect("failed shell should produce a tool result");
         assert!(result.is_error);
-        assert!(
+        assert_eq!(
             active_contribution_snapshot_events(&state, session_id)
-                .expect("cleared failure progress snapshot")
-                .is_empty()
+                .expect("cleared failure progress snapshot"),
+            [] as [bcode_session_models::SessionLiveEvent; 0]
         );
 
         let stages = state
@@ -76594,6 +76662,7 @@ event_symbol = "bcode_plugin_handle_event_v1"
         drop(state);
     }
 
+    #[cfg(unix)]
     fn assert_cancelled_shell_lifecycle(history: &[SessionEvent], expected_output: &str) {
         let recorded = history
             .iter()
@@ -78044,6 +78113,7 @@ event_symbol = "bcode_plugin_handle_event_v1"
         drop(state);
     }
 
+    #[cfg(unix)]
     fn settled_shell_report(history: &[bcode_session_models::SessionEvent]) -> &str {
         let report = history
             .iter()
@@ -78068,6 +78138,7 @@ event_symbol = "bcode_plugin_handle_event_v1"
         report
     }
 
+    #[cfg(unix)]
     async fn assert_cancelled_client_report(
         connection: &mut bcode_client::ClientConnection,
         report: &str,
@@ -78088,6 +78159,7 @@ event_symbol = "bcode_plugin_handle_event_v1"
         assert_eq!(delivered.as_deref(), Some(report));
     }
 
+    #[cfg(unix)]
     async fn cancellation_test_client(
         state: &Arc<ServerState>,
         session_id: SessionId,
@@ -78115,6 +78187,7 @@ event_symbol = "bcode_plugin_handle_event_v1"
         (connection, server)
     }
 
+    #[cfg(unix)]
     fn assert_cancelled_shell_stages(history: &[bcode_session_models::SessionEvent]) {
         let stages = history
             .iter()
@@ -78360,6 +78433,7 @@ event_symbol = "bcode_plugin_handle_event_v1"
         drop(state);
     }
 
+    #[cfg(unix)]
     async fn assert_current_session_writer_epoch(session_root: &Path, session_id: SessionId) {
         let db =
             bcode_session::db::SessionDb::open_existing_turso_in_root(session_id, session_root)
@@ -78371,6 +78445,7 @@ event_symbol = "bcode_plugin_handle_event_v1"
         );
     }
 
+    #[cfg(unix)]
     async fn wait_for_user_message(state: &ServerState, session_id: SessionId, expected: &str) {
         tokio::time::timeout(Duration::from_secs(5), async {
             loop {
@@ -78392,6 +78467,7 @@ event_symbol = "bcode_plugin_handle_event_v1"
         .expect("message should persist");
     }
 
+    #[cfg(unix)]
     async fn create_current_session(sessions: &SessionManager, workspace: &Path) -> SessionId {
         sessions
             .create_session(Some("current IPC".to_owned()), workspace.to_path_buf())
@@ -78400,6 +78476,7 @@ event_symbol = "bcode_plugin_handle_event_v1"
             .id
     }
 
+    #[cfg(unix)]
     async fn assert_current_session_prepares_and_attaches_without_migration(
         connection: &mut bcode_client::ClientConnection,
         state: &ServerState,
@@ -78420,6 +78497,7 @@ event_symbol = "bcode_plugin_handle_event_v1"
             .expect("current bounded attach");
     }
 
+    #[cfg(unix)]
     async fn prepare_legacy_session_with_two_clients_and_disconnect(
         client: &bcode_client::BcodeClient,
         mut initiator: bcode_client::ClientConnection,
@@ -78497,6 +78575,7 @@ event_symbol = "bcode_plugin_handle_event_v1"
         (snapshot, true)
     }
 
+    #[cfg(unix)]
     async fn create_current_and_legacy_ipc_sessions(
         session_root: &Path,
         workspace: &Path,
@@ -78528,6 +78607,7 @@ event_symbol = "bcode_plugin_handle_event_v1"
         (session.id, current_session_id)
     }
 
+    #[cfg(unix)]
     async fn create_current_writer_with_legacy_schema_ipc_sessions(
         session_root: &Path,
         workspace: &Path,
@@ -78535,6 +78615,7 @@ event_symbol = "bcode_plugin_handle_event_v1"
         create_current_writer_with_event_schema_ipc_sessions(session_root, workspace, 40).await
     }
 
+    #[cfg(unix)]
     async fn create_current_writer_with_event_schema_ipc_sessions(
         session_root: &Path,
         workspace: &Path,
@@ -78713,6 +78794,7 @@ event_symbol = "bcode_plugin_handle_event_v1"
         server.abort();
     }
 
+    #[cfg(unix)]
     async fn prepare_session_until_terminal(
         connection: &mut bcode_client::ClientConnection,
         session_id: SessionId,
@@ -79289,7 +79371,10 @@ event_symbol = "bcode_plugin_handle_event_v1"
                 .await
                 .expect("permission history"),
         );
-        assert!(permission_snapshot.permissions.is_empty());
+        assert_eq!(
+            permission_snapshot.permissions,
+            [] as [bcode_session_view_models::PermissionView; 0]
+        );
         assert!(
             permission_snapshot
                 .transcript
@@ -80711,12 +80796,9 @@ event_symbol = "bcode_plugin_handle_event_v1"
                 .await
                 .expect("resolve permission")
         );
-        assert!(
-            client
-                .list_permissions()
-                .await
-                .expect("list resolved")
-                .is_empty()
+        assert_eq!(
+            client.list_permissions().await.expect("list resolved"),
+            [] as [bcode_session_models::PermissionSummary; 0]
         );
         assert_eq!(*decision.lock().await, Some(true));
         assert!(
@@ -80726,10 +80808,9 @@ event_symbol = "bcode_plugin_handle_event_v1"
                 .expect("stale resolution")
         );
         assert_eq!(*decision.lock().await, Some(true));
-        assert!(
-            interaction_operations::list_permissions(&state)
-                .await
-                .is_empty()
+        assert_eq!(
+            interaction_operations::list_permissions(&state).await,
+            [] as [bcode_session_models::PermissionSummary; 0]
         );
         let history = state
             .sessions
@@ -80760,7 +80841,10 @@ event_symbol = "bcode_plugin_handle_event_v1"
             "inspection and invalid rule updates must not duplicate the request"
         );
         let snapshot = bcode_session_view::build_session_view_snapshot(&history);
-        assert!(snapshot.permissions.is_empty());
+        assert_eq!(
+            snapshot.permissions,
+            [] as [bcode_session_view_models::PermissionView; 0]
+        );
         assert!(snapshot.transcript.items.iter().any(|item| matches!(
             &item.kind,
             bcode_session_view_models::TranscriptViewItemKind::Permission { permission }
@@ -82343,7 +82427,10 @@ event_symbol = "bcode_plugin_handle_event_v1"
     #[tokio::test]
     async fn judgement_setup_lists_disabled_and_unconfigured_providers_safely() {
         let empty = judgement::setup_catalog(&test_server_state(SessionManager::default())).await;
-        assert!(empty.providers.is_empty());
+        assert_eq!(
+            empty.providers,
+            [] as [bcode_model::judgement::SetupProvider; 0]
+        );
         let state = test_server_state_with_fake_provider(SessionManager::default());
         let catalog = judgement::setup_catalog(&state).await;
         let fake = catalog
@@ -82352,7 +82439,7 @@ event_symbol = "bcode_plugin_handle_event_v1"
             .find(|entry| entry.plugin_id == "bcode.fake-provider")
             .expect("fake provider");
         assert_eq!(fake.auth_provider_id, "fake");
-        assert!(fake.profiles.is_empty());
+        assert_eq!(fake.profiles, [] as [std::string::String; 0]);
         assert!(!fake.environment_available);
         assert!(fake.unavailable_reason.is_some());
         assert!(serde_json::to_string(&catalog).unwrap().len() <= 262_144);
@@ -82393,7 +82480,7 @@ event_symbol = "bcode_plugin_handle_event_v1"
                 .iter()
                 .any(|model| model.model_id == "jev-1.13.0")
         );
-        assert!(jev.profiles.is_empty());
+        assert_eq!(jev.profiles, [] as [std::string::String; 0]);
         assert!(!jev.environment_available);
         assert!(
             jev.unavailable_reason
@@ -84190,7 +84277,7 @@ event_symbol = "bcode_plugin_handle_event_v1"
         let absent =
             resolve_prompt_profile(&state, SessionId::new(), "build", &config, &target, &tools)
                 .await;
-        assert!(absent.applied_layers.is_empty());
+        assert_eq!(absent.applied_layers, [] as [std::string::String; 0]);
         assert!(absent.tool_description_overrides.is_empty());
         assert_eq!(
             apply_system_prompt_profile("base".to_string(), &absent),
@@ -85623,7 +85710,10 @@ event_symbol = "bcode_plugin_handle_event_v1"
             bcode_workflow_store::RunStatus::Completed
         );
         let parent_work = state.runtime_work.active_for_session(parent.id).await;
-        assert!(parent_work.is_empty());
+        assert_eq!(
+            parent_work,
+            [] as [bcode_session_models::RuntimeWorkSnapshot; 0]
+        );
         restore_workflow_run_batch_with_receipt_limit(&state, vec!["restore-run".to_string()], 1)
             .await;
         let store = state
@@ -86721,8 +86811,8 @@ event_symbol = "bcode_plugin_handle_event_v1"
             .expect("reconcile");
         if !correlated {
             assert_eq!(summary.deferred.len(), 1);
-            assert!(summary.repair_required.is_empty());
-            assert!(summary.failed.is_empty());
+            assert_eq!(summary.repair_required, [] as [std::string::String; 0]);
+            assert_eq!(summary.failed, [] as [std::string::String; 0]);
             assert_eq!(
                 store
                     .run_summary("observe-run")
@@ -87667,7 +87757,7 @@ event_symbol = "bcode_plugin_handle_event_v1"
             .dispatch_pending_activations(&owner, 10, 4)
             .await
             .expect("dispatch repair-required run");
-        assert!(redispatch.admitted.is_empty());
+        assert_eq!(redispatch.admitted, [] as [std::string::String; 0]);
         let events = state
             .sessions
             .session_history(parent.id)
@@ -89408,7 +89498,10 @@ event_symbol = "bcode_plugin_handle_event_v1"
             .expect("initialization") = Some(receiver);
         let status = state.status(None).await;
         drop(state);
-        assert!(status.sessions.is_empty());
+        assert_eq!(
+            status.sessions,
+            [] as [bcode_session_models::SessionSummary; 0]
+        );
         assert!(
             status
                 .workflow_unavailable_reason
@@ -90452,7 +90545,7 @@ event_symbol = "bcode_plugin_handle_event_v1"
             .await
             .expect("orphaned cancellation settles");
 
-        assert!(signalled.is_empty());
+        assert_eq!(signalled, [] as [std::string::String; 0]);
         assert_eq!(
             state
                 .workflow_store
@@ -91184,12 +91277,9 @@ event_symbol = "bcode_plugin_handle_event_v1"
             .await
             .expect("finish root work");
 
-        assert!(
-            state
-                .runtime_work
-                .active_for_session(session.id)
-                .await
-                .is_empty()
+        assert_eq!(
+            state.runtime_work.active_for_session(session.id).await,
+            [] as [bcode_session_models::RuntimeWorkSnapshot; 0]
         );
         assert!(
             state
@@ -91995,11 +92085,11 @@ event_symbol = "bcode_plugin_handle_event_v1"
         assert_eq!(samples, 1);
         assert_eq!(result.status, "expired");
         assert!(result.grant_id.is_none());
-        assert!(
+        assert_eq!(
             store
                 .pending_mutation_approvals("expiration", 10)
-                .expect("pending")
-                .is_empty()
+                .expect("pending"),
+            [] as [bcode_workflow::WorkflowMutationApproval; 0]
         );
     }
 
@@ -92120,7 +92210,10 @@ event_symbol = "bcode_plugin_handle_event_v1"
         server.await.expect("server task");
         drop(state);
         assert_eq!(inspection.grants.len(), 1);
-        assert!(inspection.mutation_approvals.is_empty());
+        assert_eq!(
+            inspection.mutation_approvals,
+            [] as [bcode_workflow::WorkflowMutationApprovalInspection; 0]
+        );
     }
 
     #[tokio::test]
@@ -92167,8 +92260,14 @@ event_symbol = "bcode_plugin_handle_event_v1"
                 .await
                 .expect("inspection");
             assert_eq!(before.grants.len(), 1);
-            assert!(!before.decisions.is_empty());
-            assert!(before.mutation_approvals.is_empty());
+            assert_ne!(
+                before.decisions,
+                [] as [bcode_workflow::WorkflowDecisionInspection; 0]
+            );
+            assert_eq!(
+                before.mutation_approvals,
+                [] as [bcode_workflow::WorkflowMutationApprovalInspection; 0]
+            );
             assert!(
                 workflow_operations::resolve_mutation_approval_with_continuation(
                     &state,
@@ -92232,9 +92331,15 @@ event_symbol = "bcode_plugin_handle_event_v1"
             .await
             .expect("inspection");
         assert_eq!(before.run.status, bcode_workflow::RunStatus::Failed);
-        assert!(before.grants.is_empty());
-        assert!(before.attempts.is_empty());
-        assert!(before.mutation_approvals.is_empty());
+        assert_eq!(
+            before.grants,
+            [] as [bcode_workflow::WorkflowGrantInspection; 0]
+        );
+        assert_eq!(before.attempts, [] as [bcode_workflow::AttemptSummary; 0]);
+        assert_eq!(
+            before.mutation_approvals,
+            [] as [bcode_workflow::WorkflowMutationApprovalInspection; 0]
+        );
         assert!(
             bcode_workflow::WorkflowRunApplication::resolve_workflow_mutation_approval(
                 &application(),
@@ -92559,7 +92664,7 @@ event_symbol = "bcode_plugin_handle_event_v1"
             Some(bcode_workflow::WorkflowWaitKind::Input)
         );
         assert_eq!(waiting.node_id, "wait");
-        assert!(!observation.node_id.is_empty());
+        assert_ne!(observation.node_id, "");
         assert!(activation_event.payload.get("input").is_none());
         let completion_event = inspection
             .events
@@ -92594,7 +92699,10 @@ event_symbol = "bcode_plugin_handle_event_v1"
         );
         let graph = inspection.graph.as_ref().expect("run-owned graph");
         assert_eq!(graph.revision, 1);
-        assert!(!graph.edges.is_empty());
+        assert_ne!(
+            graph.edges,
+            [] as [bcode_workflow::WorkflowRunGraphEdgeInspection; 0]
+        );
         assert!(graph.edges.iter().all(|edge| edge.revision == 1));
         assert!(graph.nodes_complete);
         assert!(graph.edges_complete);
@@ -93750,13 +93858,13 @@ event_symbol = "bcode_plugin_handle_event_v1"
         assert!(events.iter().any(|event| matches!(&event.kind,
             SessionEventKind::ModelTurnFinished { turn_id, outcome: ModelTurnOutcome::Cancelled, .. }
                 if turn_id == "old-turn")));
-        assert!(
+        assert_eq!(
             state
                 .sessions
                 .session_turn_evidence(session.id, "missing")
                 .await
-                .expect("absent lookup")
-                .is_empty()
+                .expect("absent lookup"),
+            [] as [bcode_session_models::SessionEvent; 0]
         );
         drop(state);
     }
@@ -93845,7 +93953,10 @@ event_symbol = "bcode_plugin_handle_event_v1"
                 .len(),
             1
         );
-        assert!(store.pending_activations(10).expect("pending").is_empty());
+        assert_eq!(
+            store.pending_activations(10).expect("pending"),
+            [] as [bcode_workflow_store::PendingActivation; 0]
+        );
         drop(store);
     }
 
@@ -94630,14 +94741,14 @@ event_symbol = "bcode_plugin_handle_event_v1"
         assert!(
             matches!(error, bcode_client::ClientError::Server { code, message } if code == failure.code() && message == failure.to_string())
         );
-        assert!(
+        assert_eq!(
             state
                 .workflow_store
                 .lock()
                 .expect("store")
                 .list_authored_workflows(1)
-                .expect("workflows")
-                .is_empty()
+                .expect("workflows"),
+            [] as [bcode_workflow_store::AuthoredWorkflow; 0]
         );
         shutdown.send(()).expect("shutdown");
         server.await.expect("server");
@@ -94677,7 +94788,10 @@ event_symbol = "bcode_plugin_handle_event_v1"
             .workflow_store
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        assert!(store.list_definitions(1).expect("definitions").is_empty());
+        assert_eq!(
+            store.list_definitions(1).expect("definitions"),
+            [] as [bcode_workflow::StoredWorkflowDefinition; 0]
+        );
         let (workflow, draft) = unavailable_workflow_sentinel();
         assert_eq!(
             store
@@ -94691,7 +94805,10 @@ event_symbol = "bcode_plugin_handle_event_v1"
                 .expect("sentinel draft"),
             Some(draft)
         );
-        assert!(store.list_runs(1).expect("runs").is_empty());
+        assert_eq!(
+            store.list_runs(1).expect("runs"),
+            [] as [bcode_workflow::WorkflowRunSummary; 0]
+        );
         drop(store);
     }
 
@@ -95236,7 +95353,10 @@ event_symbol = "bcode_plugin_handle_event_v1"
                 .expect("persisted draft");
             assert_eq!(persisted.document, draft.document);
             assert_eq!(persisted.generation, draft.generation);
-            assert!(store.list_runs(1).expect("runs").is_empty());
+            assert_eq!(
+                store.list_runs(1).expect("runs"),
+                [] as [bcode_workflow::WorkflowRunSummary; 0]
+            );
             drop(store);
         }
         drop(state);
@@ -95658,7 +95778,10 @@ event_symbol = "bcode_plugin_handle_event_v1"
         let bounded_history = runtime_work_operations::history(&state, session.id, 2)
             .await
             .expect("runtime work history");
-        assert!(!bounded_history.is_empty());
+        assert_ne!(
+            bounded_history,
+            [] as [bcode_session_models::SessionEvent; 0]
+        );
         assert!(bounded_history.len() <= 2);
 
         let history = state
@@ -95869,10 +95992,9 @@ event_symbol = "bcode_plugin_handle_event_v1"
             None,
         )
         .await;
-        assert!(
-            runtime_work_operations::list(&state, session.id)
-                .await
-                .is_empty()
+        assert_eq!(
+            runtime_work_operations::list(&state, session.id).await,
+            [] as [bcode_session_models::RuntimeWorkSnapshot; 0]
         );
         let history = runtime_work_operations::history(&state, session.id, 10)
             .await
@@ -95922,17 +96044,16 @@ event_symbol = "bcode_plugin_handle_event_v1"
         );
         // The execution owner has released work, but terminal persistence was lost.
         state.runtime_work.finish(session.id, &work_id).await;
-        assert!(
-            runtime_work_operations::list(&state, session.id)
-                .await
-                .is_empty()
+        assert_eq!(
+            runtime_work_operations::list(&state, session.id).await,
+            [] as [bcode_session_models::RuntimeWorkSnapshot; 0]
         );
-        assert!(
+        assert_eq!(
             runtime_work_operations::subscribe(&state, session.id)
                 .await
                 .expect("unowned subscription")
-                .initial_events
-                .is_empty()
+                .initial_events,
+            [] as [bcode_session_models::SessionEvent; 0]
         );
         // A live read neither repairs canonical history nor invents a terminal outcome.
         let history = runtime_work_operations::history(&state, session.id, 10)
@@ -96289,12 +96410,12 @@ event_symbol = "bcode_plugin_handle_event_v1"
         assert!(matches!(event.kind,
             SessionEventKind::RuntimeWorkFinished { work_id: id, status: RuntimeWorkStatus::Cancelled, .. }
                 if id == work_id));
-        assert!(
+        assert_eq!(
             client
                 .list_runtime_work(session_id)
                 .await
-                .expect("terminal active list")
-                .is_empty()
+                .expect("terminal active list"),
+            [] as [bcode_session_models::RuntimeWorkSnapshot; 0]
         );
         assert!(
             !client
@@ -96359,12 +96480,12 @@ event_symbol = "bcode_plugin_handle_event_v1"
                 .expect("direct stable terminal history"),
             terminal_history
         );
-        assert!(
+        assert_eq!(
             client
                 .list_runtime_work(session_id)
                 .await
-                .expect("stable terminal list")
-                .is_empty()
+                .expect("stable terminal list"),
+            [] as [bcode_session_models::RuntimeWorkSnapshot; 0]
         );
     }
 
@@ -96397,7 +96518,7 @@ event_symbol = "bcode_plugin_handle_event_v1"
             .expect("bounded IPC spans");
         assert_eq!(spans.len(), 1);
         assert_eq!(&spans[0].work_id, work_id);
-        assert!(spans[0].label.is_empty());
+        assert_eq!(spans[0].label, "");
         assert_eq!(spans[0].started_at_ms, None);
         assert_eq!(spans[0].finished_at_ms, None);
         assert_eq!(spans[0].status, None);
@@ -97069,7 +97190,10 @@ event_symbol = "bcode_plugin_handle_event_v1"
             },
         );
         assert!(std::mem::size_of_val(&observed) < payload.len());
-        assert!(state.metrics.report().events.is_empty());
+        assert_eq!(
+            state.metrics.report().events,
+            [] as [bcode_metrics::MetricEvent; 0]
+        );
         assert_eq!(observed.await, Ok(7 * payload.len()));
         let report = state.metrics.report();
         drop(state);
@@ -98437,10 +98561,9 @@ event_symbol = "bcode_plugin_handle_event_v1"
         .await;
         assert!(attachment.live_events.try_recv().is_err());
         clear_active_contributions(&state, session_id, "call-1").await;
-        assert!(
-            active_contribution_snapshot_events(&state, session_id)
-                .expect("cleared snapshots")
-                .is_empty()
+        assert_eq!(
+            active_contribution_snapshot_events(&state, session_id).expect("cleared snapshots"),
+            [] as [bcode_session_models::SessionLiveEvent; 0]
         );
         assert!(matches!(
             attachment.live_events.recv().await.expect("terminal removal").kind,
@@ -98550,10 +98673,10 @@ event_symbol = "bcode_plugin_handle_event_v1"
         )
         .await;
         assert!(attachment.live_events.try_recv().is_err());
-        assert!(
+        assert_eq!(
             active_contribution_snapshot_events(&state, session_id)
-                .expect("post-terminal snapshot")
-                .is_empty()
+                .expect("post-terminal snapshot"),
+            [] as [bcode_session_models::SessionLiveEvent; 0]
         );
 
         let mut next_generation = envelope;
@@ -98694,10 +98817,10 @@ event_symbol = "bcode_plugin_handle_event_v1"
             )
             .await;
 
-            assert!(
+            assert_eq!(
                 active_contribution_snapshot_events(&state, session_id)
-                    .expect("active contribution snapshot")
-                    .is_empty()
+                    .expect("active contribution snapshot"),
+                [] as [bcode_session_models::SessionLiveEvent; 0]
             );
             assert!(
                 state
@@ -98854,16 +98977,18 @@ event_symbol = "bcode_plugin_handle_event_v1"
             .await
             .expect("detach and unload");
 
-        assert!(active_tool_request_draft_snapshot_events(&state, session.id).is_empty());
-        assert!(
-            active_contribution_snapshot_events(&state, session.id)
-                .expect("cleared progress snapshot")
-                .is_empty()
+        assert_eq!(
+            active_tool_request_draft_snapshot_events(&state, session.id),
+            [] as [bcode_session_models::SessionLiveEvent; 0]
         );
-        assert!(
-            active_artifact_snapshot_events(&state, session.id)
-                .expect("cleared artifact snapshot")
-                .is_empty()
+        assert_eq!(
+            active_contribution_snapshot_events(&state, session.id)
+                .expect("cleared progress snapshot"),
+            [] as [bcode_session_models::SessionLiveEvent; 0]
+        );
+        assert_eq!(
+            active_artifact_snapshot_events(&state, session.id).expect("cleared artifact snapshot"),
+            [] as [bcode_session_models::SessionLiveEvent; 0]
         );
         let drafts = state
             .active_tool_request_drafts
@@ -98998,27 +99123,33 @@ event_symbol = "bcode_plugin_handle_event_v1"
                 },
             );
 
-        assert!(!active_tool_request_draft_snapshot_events(&state, first).is_empty());
-        assert!(
-            !active_contribution_snapshot_events(&state, second)
-                .expect("second snapshot")
-                .is_empty()
+        assert_ne!(
+            active_tool_request_draft_snapshot_events(&state, first),
+            [] as [bcode_session_models::SessionLiveEvent; 0]
+        );
+        assert_ne!(
+            active_contribution_snapshot_events(&state, second).expect("second snapshot"),
+            [] as [bcode_session_models::SessionLiveEvent; 0]
         );
         assert!(!state.active_artifacts.lock().expect("artifacts").is_empty());
 
         state.request_shutdown();
 
-        assert!(active_tool_request_draft_snapshot_events(&state, first).is_empty());
-        assert!(active_tool_request_draft_snapshot_events(&state, second).is_empty());
-        assert!(
-            active_contribution_snapshot_events(&state, first)
-                .expect("first cleared snapshot")
-                .is_empty()
+        assert_eq!(
+            active_tool_request_draft_snapshot_events(&state, first),
+            [] as [bcode_session_models::SessionLiveEvent; 0]
         );
-        assert!(
-            active_contribution_snapshot_events(&state, second)
-                .expect("second cleared snapshot")
-                .is_empty()
+        assert_eq!(
+            active_tool_request_draft_snapshot_events(&state, second),
+            [] as [bcode_session_models::SessionLiveEvent; 0]
+        );
+        assert_eq!(
+            active_contribution_snapshot_events(&state, first).expect("first cleared snapshot"),
+            [] as [bcode_session_models::SessionLiveEvent; 0]
+        );
+        assert_eq!(
+            active_contribution_snapshot_events(&state, second).expect("second cleared snapshot"),
+            [] as [bcode_session_models::SessionLiveEvent; 0]
         );
         assert!(state.active_artifacts.lock().expect("artifacts").is_empty());
         let metrics = state.metrics.snapshot();
@@ -99194,7 +99325,10 @@ event_symbol = "bcode_plugin_handle_event_v1"
 
         drop(registration);
         state.release_session_resources_if_idle(session.id).await;
-        assert!(active_tool_request_draft_snapshot_events(&state, session.id).is_empty());
+        assert_eq!(
+            active_tool_request_draft_snapshot_events(&state, session.id),
+            [] as [bcode_session_models::SessionLiveEvent; 0]
+        );
         drop(state);
     }
 
@@ -99448,13 +99582,13 @@ event_symbol = "bcode_plugin_handle_event_v1"
         );
         assert!(snapshots[0].request_id.is_some());
         assert!(snapshots[0].request_fingerprint.is_some());
-        assert!(!snapshots[0].portable_summary.is_empty());
+        assert_ne!(snapshots[0].portable_summary, "");
         assert!(
             !snapshots[0]
                 .portable_summary
                 .contains("request-only managed canary")
         );
-        assert!(!snapshots[0].compatibility_key.is_empty());
+        assert_ne!(snapshots[0].compatibility_key, "");
         assert!(
             snapshots[0]
                 .portable_summary
@@ -99471,7 +99605,7 @@ event_symbol = "bcode_plugin_handle_event_v1"
             Some(snapshots[0].format_version),
             Some(&snapshots[0].compatibility_key),
         );
-        assert!(!stored.is_empty());
+        assert_ne!(stored, [] as [bcode_model::ModelMessage; 0]);
         assert!(compatible.starts_with(&stored));
         let restarted_history: Vec<bcode_session_models::SessionEvent> =
             serde_json::from_str(&serde_json::to_string(&history).expect("serialize history"))
@@ -99632,7 +99766,7 @@ event_symbol = "bcode_plugin_handle_event_v1"
         assert_eq!(segments.len(), 1, "history: {history:#?}");
         assert_eq!(segments[0].0, "segment-0");
         assert_eq!(segments[0].1, 0);
-        assert!(!segments[0].2.is_empty());
+        assert_ne!(segments[0].2, "");
         assert!(!history.iter().any(|event| {
             event.sequence > trigger_event.sequence
                 && matches!(event.kind, SessionEventKind::AssistantMessage { .. })
@@ -101169,8 +101303,8 @@ event_symbol = "bcode_plugin_handle_event_v1"
         assert_eq!(snapshot.auth_profile.as_deref(), Some("profile-a"));
         assert_eq!(snapshot.format_version, 1);
         assert_eq!(snapshot.compatibility_key, "bcode.fake-provider/context-v1");
-        assert!(!snapshot.messages_json.is_empty());
-        assert!(!snapshot.portable_summary.is_empty());
+        assert_ne!(snapshot.messages_json, "");
+        assert_ne!(snapshot.portable_summary, "");
 
         let incompatible_messages = session_events_to_model_messages_for_target(
             &history,
@@ -102053,7 +102187,7 @@ event_symbol = "bcode_plugin_handle_event_v1"
         .await
         .expect("static turn context");
 
-        assert!(prepared.tools.is_empty());
+        assert_eq!(prepared.tools, [] as [bcode_model::ToolDefinition; 0]);
         assert!(prepared.prefix_context.as_ref().is_some_and(|message| message.content.iter().any(
             |block| matches!(block, ContentBlock::Text { text } if text.contains("/client-specific/sol.toml"))
         )));
@@ -103573,7 +103707,7 @@ event_symbol = "bcode_plugin_handle_event_v1"
         let state = test_server_state(sessions);
         let captured = canonical_portable_context(&state, session.id, marker.sequence).await;
         drop(state);
-        assert!(captured.is_empty());
+        assert_eq!(captured, "");
     }
 
     #[tokio::test]
@@ -103728,7 +103862,10 @@ event_symbol = "bcode_plugin_handle_event_v1"
         .await
         .expect("canonical result");
 
-        assert!(active_tool_request_draft_snapshot_events(&state, session_id).is_empty());
+        assert_eq!(
+            active_tool_request_draft_snapshot_events(&state, session_id),
+            [] as [bcode_session_models::SessionLiveEvent; 0]
+        );
         let registry = state
             .active_tool_request_drafts
             .lock()
@@ -104742,7 +104879,7 @@ event_symbol = "bcode_plugin_handle_event_v1"
         )
         .await;
 
-        assert!(tools.is_empty());
+        assert_eq!(tools, [] as [bcode_model::ToolDefinition; 0]);
         drop(state);
     }
 
@@ -104854,15 +104991,13 @@ event_symbol = "bcode_plugin_handle_event_v1"
             .unwrap();
         let state = test_server_state_with_question_plugin(sessions);
         for policy in [TurnToolPolicy::Enabled, TurnToolPolicy::ReadOnly] {
-            assert!(
-                collect_model_tools(&state, session.id, None, policy, false)
-                    .await
-                    .is_empty()
+            assert_eq!(
+                collect_model_tools(&state, session.id, None, policy, false).await,
+                [] as [bcode_model::ToolDefinition; 0]
             );
-            assert!(
-                !collect_model_tools(&state, session.id, None, policy, true)
-                    .await
-                    .is_empty()
+            assert_ne!(
+                collect_model_tools(&state, session.id, None, policy, true).await,
+                [] as [bcode_model::ToolDefinition; 0]
             );
         }
         let call = bcode_model::ToolCall {

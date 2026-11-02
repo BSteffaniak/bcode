@@ -950,14 +950,14 @@ mod tests {
                 Provenance::Source { id, range } => {
                     assert_eq!(*id, SourceId(0));
                     assert!(range.start >= previous);
-                    assert!(source[previous..range.start].trim().is_empty());
+                    assert_eq!(source[previous..range.start].trim(), "");
                     assert_eq!(fragment.text, source[range.clone()]);
                     previous = range.end;
                 }
-                Provenance::Generated => assert!(fragment.text.trim().is_empty()),
+                Provenance::Generated => assert_eq!(fragment.text.trim(), ""),
             }
         }
-        assert!(source[previous..].trim().is_empty());
+        assert_eq!(source[previous..].trim(), "");
     }
 
     #[test]

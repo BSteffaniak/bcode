@@ -36,6 +36,10 @@ pub async fn admission_report(
 }
 
 #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+#[expect(
+    clippy::unused_async,
+    reason = "callers share the asynchronous signature of the supported implementation"
+)]
 pub async fn admission_report(
     _state: &ServerState,
     _id: bcode_session_models::SessionId,

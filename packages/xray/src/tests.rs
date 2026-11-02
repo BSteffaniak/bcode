@@ -312,7 +312,7 @@ fn payload_capture_is_opt_in_bounded_and_never_reconstructed() {
     assert_eq!(range.bytes, b"abc");
     assert!(!range.eof);
     read.offset = 6;
-    assert!(hub.read_payload(&read).unwrap().bytes.is_empty());
+    assert_eq!(hub.read_payload(&read).unwrap().bytes, [] as [u8; 0]);
     assert!(hub.read_payload(&read).unwrap().eof);
     read.offset = 7;
     assert_eq!(hub.read_payload(&read), Err(XrayError::InvalidRange));
@@ -1146,7 +1146,10 @@ async fn emit_with_capture_preserves_explicit_references_while_emit_keeps_data_o
     );
     let opaque = observation.recv().await.unwrap();
     assert!(opaque.event.capture.is_none());
-    assert!(opaque.event.payload_references().unwrap().is_empty());
+    assert_eq!(
+        opaque.event.payload_references().unwrap(),
+        [] as [bcode_xray_models::XrayPayloadRef; 0]
+    );
 }
 
 #[tokio::test]

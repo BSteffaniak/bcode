@@ -4737,7 +4737,10 @@ mod tests {
             domain.config_extensions[0].sections(),
             ["example", "legacy"]
         );
-        assert!(domain.composer_contributions.is_empty());
+        assert_eq!(
+            domain.composer_contributions,
+            [] as [bcode_plugin_sdk::composer::PluginOwnedComposerContribution; 0]
+        );
         let mut legacy = json.clone();
         legacy
             .as_object_mut()
@@ -4747,10 +4750,22 @@ mod tests {
         assert_eq!(legacy, domain);
         assert_eq!(serde_json::to_value(domain).unwrap(), json);
         let empty: PluginContributions = serde_json::from_str("{}").unwrap();
-        assert!(empty.commands.is_empty());
-        assert!(empty.command_contributions.is_empty());
-        assert!(empty.config_extensions.is_empty());
-        assert!(empty.composer_contributions.is_empty());
+        assert_eq!(
+            empty.commands,
+            [] as [bcode_plugin_models::PluginOwnedCommandContribution; 0]
+        );
+        assert_eq!(
+            empty.command_contributions,
+            [] as [bcode_command::CommandContribution; 0]
+        );
+        assert_eq!(
+            empty.config_extensions,
+            [] as [bcode_plugin_models::PluginConfigExtension; 0]
+        );
+        assert_eq!(
+            empty.composer_contributions,
+            [] as [bcode_plugin_sdk::composer::PluginOwnedComposerContribution; 0]
+        );
     }
 
     #[test]

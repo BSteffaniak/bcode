@@ -42,7 +42,7 @@ mod tests {
             serde_json::from_value(serde_json::json!({})).unwrap();
         assert_eq!(response.loop_summary, None);
         assert_eq!(response.active_run, None);
-        assert!(response.interrupted_runs.is_empty());
+        assert_eq!(response.interrupted_runs, [] as [RalphRunSummary; 0]);
         assert_eq!(
             serde_json::to_value(response).unwrap(),
             serde_json::json!({

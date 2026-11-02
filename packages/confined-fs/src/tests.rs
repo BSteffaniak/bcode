@@ -342,6 +342,24 @@ fn private_directories_and_their_files_are_private() {
 }
 
 #[test]
+fn private_child_directories_and_their_files_are_private() {
+    let (_temp, dir) = root();
+    dir.create_private_dir(name("private")).unwrap();
+    let private = dir.open_dir(name("private")).unwrap();
+    assert!(private.is_private().unwrap());
+    write_new(&private, "secret", b"value");
+    let file = private
+        .open_file(name("secret"), OpenOptions::new().read(true))
+        .unwrap();
+    assert!(crate::is_private(&file).unwrap());
+    assert_eq!(
+        dir.create_private_dir(name("private")).unwrap_err().kind(),
+        std::io::ErrorKind::AlreadyExists
+    );
+    assert!(dir.create_private_dir(name("..")).is_err());
+}
+
+#[test]
 fn explicitly_private_files_do_not_depend_on_inheritance() {
     let (temp, dir) = root();
     let file = dir

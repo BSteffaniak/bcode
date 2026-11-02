@@ -262,7 +262,7 @@ mod tests {
             let error = response.error.unwrap();
             assert_eq!(error.code, "history_profile_required");
             assert!(!error.message.contains("secret"));
-            assert!(response.payload.is_empty());
+            assert_eq!(response.payload, [] as [u8; 0]);
         }
     }
 
@@ -311,7 +311,7 @@ mod tests {
             let response = access_error(failure);
             let error = response.error.unwrap();
             assert_eq!(error.code, code);
-            assert!(!error.message.is_empty());
+            assert_ne!(error.message, "");
             if let HistoryAccessError::RateLimited {
                 retry_after_seconds,
             } = failure
@@ -321,7 +321,7 @@ mod tests {
                 assert_eq!(details.schema_version, 1);
                 assert_eq!(details.retry_after_seconds, retry_after_seconds);
             } else {
-                assert!(response.payload.is_empty());
+                assert_eq!(response.payload, [] as [u8; 0]);
             }
         }
     }

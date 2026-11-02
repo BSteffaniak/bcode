@@ -142,7 +142,7 @@ async fn alternating_timeouts_retry_until_success_without_replaying_tools() {
         assert!(matches!(result, ModelTurnRetry::Continue));
         assert_eq!(start.elapsed(), Duration::from_secs(2 << index));
         assert_eq!(outcome.incomplete_tool_calls, ["never-executable"]);
-        assert!(outcome.pending_tool_calls.is_empty());
+        assert_eq!(outcome.pending_tool_calls, [] as [bcode_model::ToolCall; 0]);
     }
     assert_eq!(recovery.consecutive_retry_attempts, 4);
     assert_eq!(recovery.retry_attempts["builtin.no_progress_timeout"], 2);

@@ -2145,9 +2145,9 @@ mod tests {
         assert_eq!(event.step_index, 0);
         assert_eq!(event.before_cursor.line, 1);
         assert_eq!(event.after_cursor.line, 1);
-        assert!(!event.nvim_mode.is_empty());
+        assert_ne!(event.nvim_mode, "");
         assert_eq!(event.context.start_line, 1);
-        assert!(!event.context.lines.is_empty());
+        assert_ne!(event.context.lines, [] as [std::string::String; 0]);
         assert!(event.changed);
         assert_eq!(
             event.message.as_deref(),
@@ -2333,8 +2333,8 @@ mod tests {
         })
         .expect("run vim edit");
         assert!(result.changed);
-        assert!(!result.diff.is_empty());
-        assert!(!result.events.is_empty());
+        assert_ne!(result.diff, "");
+        assert_ne!(result.events, [] as [VimEditEvent; 0]);
         assert_eq!(
             fs::read_to_string(file.path()).expect("read original"),
             "foo"

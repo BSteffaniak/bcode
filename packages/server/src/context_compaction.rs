@@ -1960,11 +1960,11 @@ async fn compaction_trace_declares_only_its_scalar_projection() {
             event.capture,
             Some(bcode_xray_models::XrayCaptureAttachments::new(Vec::new()))
         );
-        assert!(
+        assert_eq!(
             event
                 .payload_references()
-                .expect("valid no-ref declaration")
-                .is_empty()
+                .expect("valid no-ref declaration"),
+            [] as [bcode_xray::XrayPayloadRef; 0]
         );
     }
     drop(state);
@@ -4547,7 +4547,10 @@ mod generic_result_tests {
         };
         let first = structural_compaction_plan_with_policy(&events, 1_000, policy).unwrap();
         assert!(first.compacted_through_sequence > 2);
-        assert!(!first.retained_tail.is_empty());
+        assert_ne!(
+            first.retained_tail,
+            [] as [bcode_session_models::SessionEvent; 0]
+        );
         assert!(first.estimated_tail_tokens >= 2_000);
         let first_boundary = first.compacted_through_sequence;
         let mut retained = vec![event(
@@ -5318,7 +5321,7 @@ mod coverage_tests {
             &"x".repeat(COMPACTION_MAX_RESPONSE_BYTES)
         ));
         assert_eq!(wire, "complete prefix");
-        assert!(bounded_compaction_body(&["too large".into()], 2).is_empty());
+        assert_eq!(bounded_compaction_body(&["too large".into()], 2), "");
     }
 
     #[test]

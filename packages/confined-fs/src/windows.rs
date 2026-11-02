@@ -542,6 +542,19 @@ pub fn create_dir_at(directory: &File, name: &OsStr) -> io::Result<()> {
     .map(drop)
 }
 
+pub fn create_private_dir_at(directory: &File, name: &OsStr) -> io::Result<()> {
+    let descriptor = private_descriptor(true)?;
+    nt_create(
+        handle(directory),
+        &wide(name),
+        FILE_LIST_DIRECTORY,
+        FILE_CREATE,
+        FILE_DIRECTORY_FILE,
+        descriptor.0,
+    )
+    .map(drop)
+}
+
 /// Applies one `NtSetInformationFile` request.
 fn set_information(
     file: &File,
@@ -964,8 +977,15 @@ pub fn is_private(file: &File) -> io::Result<bool> {
     }
     let _descriptor = LocalAllocation(descriptor);
     let user = CurrentUser::query()?;
-    // SAFETY: owner and the user SID are valid SIDs for the duration of the call.
-    if owner.is_null() || unsafe { EqualSid(owner, user.sid()) } == 0 {
+    // SAFETY: a SID is valid for the duration of each comparison.
+    let trusted = |sid: PSID| unsafe {
+        EqualSid(sid, user.sid()) != 0
+            || IsWellKnownSid(sid, WinLocalSystemSid) != 0
+            || IsWellKnownSid(sid, WinBuiltinAdministratorsSid) != 0
+    };
+    // Elevated administrators own new objects through the Administrators group by
+    // default. Ownership only confers rights those principals already hold.
+    if owner.is_null() || !trusted(owner) {
         return Ok(false);
     }
     // A NULL DACL grants everyone full access.
@@ -991,13 +1011,7 @@ pub fn is_private(file: &File) -> io::Result<bool> {
                 // SAFETY: an ACCESS_ALLOWED_ACE stores its SID after the header and mask.
                 let sid: PSID =
                     unsafe { ace.cast::<u8>().add(size_of::<ACE_HEADER>() + 4) }.cast::<c_void>();
-                // SAFETY: sid and the user SID are valid for these comparisons.
-                let trusted = unsafe {
-                    EqualSid(sid, user.sid()) != 0
-                        || IsWellKnownSid(sid, WinLocalSystemSid) != 0
-                        || IsWellKnownSid(sid, WinBuiltinAdministratorsSid) != 0
-                };
-                if !trusted {
+                if !trusted(sid) {
                     return Ok(false);
                 }
             }

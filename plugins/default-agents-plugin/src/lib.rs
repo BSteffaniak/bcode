@@ -947,7 +947,7 @@ read = { "**" = "deny" }
     fn manifest_agent_defaults_are_valid() {
         let defaults = manifest_defaults().expect("plugin manifest defaults should parse");
 
-        assert!(!defaults.build_tools.is_empty());
+        assert_ne!(defaults.build_tools, [] as [std::string::String; 0]);
         for disabled_tool in &defaults.plan_disabled_tools {
             assert!(
                 defaults.build_tools.contains(disabled_tool),

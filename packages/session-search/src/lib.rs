@@ -2910,7 +2910,7 @@ mod tests {
             &SessionSearchPlanPolicy::default(),
             &[],
         );
-        assert!(ordinary.providers.is_empty());
+        assert_eq!(ordinary.providers, [] as [SessionSearchProviderInfo; 0]);
         assert_eq!(ordinary.failures.len(), 1);
         assert_eq!(ordinary.failures[0].plugin_id, "policy");
         assert_eq!(
@@ -2931,7 +2931,7 @@ mod tests {
             },
             &[],
         );
-        assert!(deep.failures.is_empty());
+        assert_eq!(deep.failures, [] as [SessionSearchProviderFailure; 0]);
     }
 
     #[test]
@@ -3054,7 +3054,7 @@ mod tests {
             ..deep
         };
         let plan = plan_session_search_with_policy_and_routes(&request, discovery, &remote, &[]);
-        assert!(plan.failures.is_empty());
+        assert_eq!(plan.failures, [] as [SessionSearchProviderFailure; 0]);
     }
 
     #[test]
@@ -3177,7 +3177,7 @@ mod tests {
         );
         assert_eq!(plan.providers.len(), 1);
         assert_eq!(plan.providers[0].plugin_id, "second");
-        assert!(plan.failures.is_empty());
+        assert_eq!(plan.failures, [] as [SessionSearchProviderFailure; 0]);
     }
 
     #[test]

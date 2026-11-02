@@ -10149,7 +10149,7 @@ mod tests {
                     if line == "\r\n" {
                         break;
                     }
-                    assert!(!line.is_empty());
+                    assert_ne!(line, "");
                     headers.push_str(&line);
                 }
                 let length = headers
@@ -10526,7 +10526,7 @@ mod tests {
         )
         .await
         .unwrap();
-        assert!(turn.drain().is_empty());
+        assert_eq!(turn.drain(), [] as [bcode_model::ProviderTurnEvent; 0]);
     }
 
     #[tokio::test]
@@ -10542,7 +10542,7 @@ mod tests {
             stream_chat_completion_with_failover(&request, &turn).await,
             Ok(StreamOutcome::Cancelled)
         ));
-        assert!(turn.drain().is_empty());
+        assert_eq!(turn.drain(), [] as [bcode_model::ProviderTurnEvent; 0]);
     }
 
     #[tokio::test]
@@ -10564,7 +10564,7 @@ mod tests {
             result,
             Ok(CandidateTryOutcome::Finished(StreamOutcome::Cancelled))
         ));
-        assert!(turn.drain().is_empty());
+        assert_eq!(turn.drain(), [] as [bcode_model::ProviderTurnEvent; 0]);
     }
 
     #[tokio::test]
@@ -13159,7 +13159,7 @@ mod tests {
                 loop {
                     let mut line = String::new();
                     std::io::BufRead::read_line(&mut reader, &mut line).expect("header");
-                    assert!(!line.is_empty());
+                    assert_ne!(line, "");
                     if line == "\r\n" {
                         break;
                     }
@@ -13258,7 +13258,7 @@ mod tests {
                     if line == "\r\n" {
                         break;
                     }
-                    assert!(!line.is_empty());
+                    assert_ne!(line, "");
                     headers.push_str(&line);
                 }
                 assert_eq!(

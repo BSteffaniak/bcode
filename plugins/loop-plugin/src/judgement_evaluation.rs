@@ -823,7 +823,7 @@ mod tests {
             transient_progress_limits: TransientProgressLimits::default(),
         };
         let off = invoke(&context);
-        assert!(boundaries.is_empty());
+        assert_eq!(boundaries, [] as [std::string::String; 0]);
         context.config.config = serde_json::json!({"persist_judgement_diagnostics":true});
         let on = invoke(&context);
         assert_eq!(on.payload, off.payload);

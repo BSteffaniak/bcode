@@ -759,7 +759,10 @@ mod edition_compatibility_tests {
         }
         let decoded =
             RecapDocument::from_json_slice(&serde_json::to_vec(&legacy).unwrap()).unwrap();
-        assert!(decoded.source.context.participants.is_empty());
+        assert_eq!(
+            decoded.source.context.participants,
+            [] as [crate::source_context::Participant; 0]
+        );
         document.sections[0].blocks[0].content = BlockContent::List {
             ordered: false,
             items: vec!["Substantive point".into()],

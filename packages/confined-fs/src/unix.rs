@@ -244,6 +244,11 @@ pub fn create_dir_at(directory: &File, name: &OsStr) -> io::Result<()> {
     check(unsafe { libc::mkdirat(directory.as_raw_fd(), name.as_ptr(), 0o700) }).map(drop)
 }
 
+/// Unix directories created here are already owner-only.
+pub fn create_private_dir_at(directory: &File, name: &OsStr) -> io::Result<()> {
+    create_dir_at(directory, name)
+}
+
 fn unlinkat(directory: &File, name: &OsStr, flags: libc::c_int) -> io::Result<()> {
     let name = c_name(name)?;
     // SAFETY: name is NUL-terminated and relative to the live directory descriptor.

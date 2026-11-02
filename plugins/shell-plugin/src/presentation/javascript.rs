@@ -641,7 +641,10 @@ mod tests {
                 &AdapterInput { depth: 4, ..input },
                 &budget
             ));
-            assert!(rejected.fragments.is_empty());
+            assert_eq!(
+                rejected.fragments,
+                [] as [crate::presentation::document::Fragment; 0]
+            );
         }
     }
 
@@ -663,7 +666,10 @@ mod tests {
             },
             &budget
         ));
-        assert!(document.fragments.is_empty());
+        assert_eq!(
+            document.fragments,
+            [] as [crate::presentation::document::Fragment; 0]
+        );
     }
 
     #[test]

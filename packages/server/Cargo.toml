@@ -18,6 +18,7 @@ bcode_agent_runtime = { workspace = true }
 bcode_bundled_plugins = { workspace = true, optional = true }
 bcode_command = { workspace = true }
 bcode_config = { workspace = true }
+bcode_confined_fs = { workspace = true }
 bcode_daemon_lifecycle = { workspace = true }
 bcode_ipc = { workspace = true }
 bcode_metrics = { workspace = true }

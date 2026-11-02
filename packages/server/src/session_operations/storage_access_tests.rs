@@ -436,7 +436,7 @@ async fn explicit_history_tracks_but_background_history_does_not() {
     )
     .await
     .expect("page");
-    assert!(!page.events.is_empty());
+    assert_ne!(page.events, [] as [bcode_session_models::SessionEvent; 0]);
     let mut file = std::fs::File::open(&path).expect("tracking");
     assert!(matches!(
         observe_access(&mut file).expect("record"),

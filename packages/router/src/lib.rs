@@ -1015,7 +1015,10 @@ mod tests {
             .expect("router should choose a model");
 
         assert_eq!(decision.selected_model, ModelId::new("openai_max_strong"));
-        assert!(decision.features.matched_rules.is_empty());
+        assert_eq!(
+            decision.features.matched_rules,
+            [] as [std::string::String; 0]
+        );
     }
 
     #[test]
@@ -1047,7 +1050,10 @@ mod tests {
             .expect("router should choose a model");
 
         assert_eq!(decision.selected_model, ModelId::new("openai_max_strong"));
-        assert!(decision.features.matched_rules.is_empty());
+        assert_eq!(
+            decision.features.matched_rules,
+            [] as [std::string::String; 0]
+        );
     }
 
     #[test]

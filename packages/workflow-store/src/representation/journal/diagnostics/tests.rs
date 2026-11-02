@@ -105,7 +105,10 @@ async fn unknown_version_future_pin_and_missing_origin_are_not_complete() {
     let (_temp, db) = admitted(false).await;
     let missing = page(&*db, 1, "run", 0, None, 100).await.unwrap();
     assert_eq!(missing.origin, CoverageOrigin::NotEnabled);
-    assert!(missing.records.is_empty());
+    assert_eq!(
+        missing.records,
+        [] as [crate::representation::journal::diagnostics::DiagnosticRecord; 0]
+    );
     assert!(page(&*db, 2, "run", 0, None, 100).await.is_err());
     assert!(page(&*db, 1, "run", 0, Some(100), 100).await.is_err());
     assert!(page(&*db, 1, "run", 1, Some(0), 100).await.is_err());

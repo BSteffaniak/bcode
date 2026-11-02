@@ -87,7 +87,7 @@ static NEXT_FIELD_LIFETIME: std::sync::atomic::AtomicU64 = std::sync::atomic::At
 
 fn next_lifetime() -> Option<u64> {
     NEXT_FIELD_LIFETIME
-        .fetch_update(
+        .try_update(
             std::sync::atomic::Ordering::Relaxed,
             std::sync::atomic::Ordering::Relaxed,
             |value| value.checked_add(1),

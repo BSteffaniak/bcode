@@ -461,9 +461,9 @@ fn assert_retained_checkouts(root: &Path, trees: &Path, base: &str) {
         std::fs::read_to_string(integration.join("verification.txt")).unwrap(),
         "verified"
     );
-    assert!(git(&integration, &["ls-files", "-u"]).is_empty());
+    assert_eq!(git(&integration, &["ls-files", "-u"]), "");
     for id in ["left", "right"] {
         assert_ne!(git(&trees.join(id), &["rev-parse", "HEAD"]), base);
-        assert!(git(&trees.join(id), &["status", "--porcelain"]).is_empty());
+        assert_eq!(git(&trees.join(id), &["status", "--porcelain"]), "");
     }
 }

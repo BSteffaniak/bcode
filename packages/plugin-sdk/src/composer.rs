@@ -317,7 +317,7 @@ mod tests {
         legacy.as_object_mut().unwrap().remove("interaction_state");
         legacy.as_object_mut().unwrap().remove("action_id");
         let legacy: ComposerSearchRequest = serde_json::from_value(legacy).unwrap();
-        assert!(legacy.contribution_id.is_empty());
+        assert_eq!(legacy.contribution_id, "");
         legacy.validate().unwrap();
         let declarations: Vec<_> = ["example.topic", "example.symbol"]
             .into_iter()
@@ -404,6 +404,9 @@ mod tests {
             ComposerContinuation::Finish
         );
         let discovery: crate::PluginContributions = serde_json::from_str("{}").unwrap();
-        assert!(discovery.composer_contributions.is_empty());
+        assert_eq!(
+            discovery.composer_contributions,
+            [] as [bcode_plugin_models::composer::PluginOwnedComposerContribution; 0]
+        );
     }
 }

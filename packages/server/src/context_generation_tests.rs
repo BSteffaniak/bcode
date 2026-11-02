@@ -295,5 +295,5 @@ async fn assert_generation_request(
     assert!(actual.contains("Preserve streaming"));
     assert!(actual.contains("formulate the goal"));
     assert!(!actual.contains("later message"));
-    assert!(request.tools.is_empty());
+    assert_eq!(request.tools, [] as [bcode_model::ToolDefinition; 0]);
 }

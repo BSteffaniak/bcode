@@ -21,10 +21,9 @@ fn canonical_detailed_covers_all_items_while_standard_is_selective() {
         assert!(coverage(&case, &detailed, Depth::Detailed).is_complete());
         assert!(coverage(&case, &standard, Depth::Standard).is_complete());
         assert!(standard.sections.len() < detailed.sections.len());
-        assert!(
-            !coverage(&case, &standard, Depth::Detailed)
-                .missing
-                .is_empty()
+        assert_ne!(
+            coverage(&case, &standard, Depth::Detailed).missing,
+            [] as [std::string::String; 0]
         );
         let encoded = serde_json::to_vec(&detailed).unwrap();
         assert_eq!(RecapDocument::from_json_slice(&encoded).unwrap(), detailed);
@@ -121,7 +120,7 @@ fn tutorial_cannot_swap_before_verification_even_if_all_facts_survive() {
     document.sections.swap(3, 4);
     document.validate().unwrap();
     let report = coverage(case, &document, Depth::Detailed);
-    assert!(report.missing.is_empty());
+    assert_eq!(report.missing, [] as [std::string::String; 0]);
     assert_eq!(report.out_of_order, ["atomic_swap"]);
 }
 
@@ -163,7 +162,10 @@ fn visual_only_observations_never_become_fabricated_speech() {
     let corpus = corpus();
     let case = case(&corpus, "visual_only");
     let mut document = case.expected_document(Depth::Detailed);
-    assert!(document.transcript.is_empty());
+    assert_eq!(
+        document.transcript,
+        [] as [bcode_recap::contracts::TranscriptSegment; 0]
+    );
     assert!(
         document
             .evidence
@@ -234,7 +236,7 @@ fn complete_item_words_do_not_excuse_known_false_additions() {
                 });
             document.validate().unwrap();
             let report = coverage(&case, &document, Depth::Detailed);
-            assert!(report.missing.is_empty());
+            assert_eq!(report.missing, [] as [std::string::String; 0]);
             assert_eq!(report.distorted.as_slice(), std::slice::from_ref(claim));
             assert!(!report.is_complete(), "{}: {claim}", case.id);
         }

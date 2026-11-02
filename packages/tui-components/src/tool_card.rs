@@ -107,7 +107,7 @@ mod tests {
     fn detail_omits_missing_values() {
         let mut rows = Vec::new();
         push_tool_card_detail(&mut rows, "path", None, Style::new(), Style::new());
-        assert!(rows.is_empty());
+        assert_eq!(rows, [] as [bmux_tui::text::Line; 0]);
         push_tool_card_detail(
             &mut rows,
             "path",

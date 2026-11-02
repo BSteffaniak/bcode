@@ -198,7 +198,10 @@ mod tests {
             .await
             .unwrap();
         assert!(!before.explanations[0].incomplete);
-        assert!(before.explanations[0].blockers.is_empty());
+        assert_eq!(
+            before.explanations[0].blockers,
+            [] as [crate::representation::diagnostics::Blocker; 0]
+        );
         let tx = db
             .begin_transaction_with_mode(switchy_database::TransactionMode::Immediate)
             .await
@@ -233,7 +236,10 @@ mod tests {
             .unwrap();
         tx.commit().await.unwrap();
         let clear = snapshot(&*db, "diagnostics", None, None, 1).await.unwrap();
-        assert!(clear.explanations[0].blockers.is_empty());
+        assert_eq!(
+            clear.explanations[0].blockers,
+            [] as [crate::representation::diagnostics::Blocker; 0]
+        );
         assert!(!clear.explanations[0].incomplete);
         assert_eq!(clear.scheduling.occupied, before.scheduling.occupied);
     }
@@ -281,6 +287,9 @@ mod tests {
         };
         assert!(explanation.incomplete);
         // There is deliberately no Ready/eligible result in this explanatory contract.
-        assert!(explanation.blockers.is_empty());
+        assert_eq!(
+            explanation.blockers,
+            [] as [crate::representation::diagnostics::Blocker; 0]
+        );
     }
 }

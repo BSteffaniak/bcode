@@ -21,7 +21,7 @@ fn service_failure_codes_survive_without_untrusted_messages() {
         });
         let decoded = serde_json::from_slice(&serde_json::to_vec(&wire).unwrap()).unwrap();
         let response = invocation_response(decoded, &request());
-        assert!(response.payload.is_empty());
+        assert_eq!(response.payload, [] as [u8; 0]);
         let error = response.error.unwrap();
         let expected = if matches!(
             code,
@@ -78,7 +78,10 @@ fn additive_generated_listing_and_old_response_compatibility() {
     };
     let old = serde_json::to_value(response()).unwrap();
     let decoded: ExecutionContributorEvidenceResponse = serde_json::from_value(old).unwrap();
-    assert!(decoded.contributors.is_empty());
+    assert_eq!(
+        decoded.contributors,
+        [] as [bcode_workflow::contributor_evidence::ContributorEvidenceScope; 0]
+    );
     let query = parse(json!({"expected_revision":2,"action":{"kind":"contributors","after_node_id":null,"limit":1}})).unwrap();
     let mut listing = response();
     let mut scope = listing.scope.take().unwrap();

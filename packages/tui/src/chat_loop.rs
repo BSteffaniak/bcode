@@ -7103,7 +7103,7 @@ mod scheduler_tests {
     fn failed_command_preserves_diagnostic_and_suppresses_native_effects() {
         let (message, effects) = plugin_command_presentation(command_response(false));
         assert_eq!(message.as_deref(), Some("command diagnostic"));
-        assert!(effects.is_empty());
+        assert_eq!(effects, [] as [bcode_command::CommandEffect; 0]);
     }
 
     #[test]
@@ -7121,7 +7121,7 @@ mod scheduler_tests {
         response.message = None;
         let (message, effects) = plugin_command_presentation(response);
         assert_eq!(message.as_deref(), Some("Plugin command failed"));
-        assert!(effects.is_empty());
+        assert_eq!(effects, [] as [bcode_command::CommandEffect; 0]);
     }
 
     #[test]
@@ -7856,7 +7856,10 @@ mod scheduler_tests {
         );
 
         observe_interactive_surface_event(&mut state, &resolved_event("queued"));
-        assert!(state.interactive_surface_queue.interaction_ids().is_empty());
+        assert_eq!(
+            state.interactive_surface_queue.interaction_ids(),
+            [] as [&str; 0]
+        );
     }
 
     #[tokio::test]

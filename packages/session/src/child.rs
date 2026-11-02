@@ -1630,9 +1630,12 @@ mod tests {
                     page.complete,
                     "fresh canonical parent must not need reconciliation"
                 );
-                assert!(page.children.is_empty());
+                assert_eq!(
+                    page.children,
+                    [] as [bcode_session_models::SessionSummary; 0]
+                );
                 assert!(page.next_after.is_none());
-                assert!(page.issues.is_empty());
+                assert_eq!(page.issues, [] as [std::string::String; 0]);
                 tokio::task::yield_now().await;
             }
         };
@@ -1666,7 +1669,7 @@ mod tests {
             .unwrap();
         let pending = manager.query_child_sessions(query.clone()).await.unwrap();
         assert!(!pending.complete);
-        assert!(!pending.issues.is_empty());
+        assert_ne!(pending.issues, [] as [std::string::String; 0]);
         let child = manager.create_child_session(request.clone()).await.unwrap();
         assert!(
             manager
@@ -1818,7 +1821,7 @@ mod tests {
         database.close().await.unwrap();
         let before = manager.query_child_sessions(query.clone()).await.unwrap();
         assert!(!before.complete);
-        assert!(!before.issues.is_empty());
+        assert_ne!(before.issues, [] as [std::string::String; 0]);
         manager.release_session_ownership(parent.id).await.unwrap();
         let maintenance = SessionManager::persistent(root.path()).unwrap();
         assert_eq!(
@@ -1831,7 +1834,10 @@ mod tests {
         );
         let after = maintenance.query_child_sessions(query).await.unwrap();
         assert!(after.complete);
-        assert!(after.children.is_empty());
+        assert_eq!(
+            after.children,
+            [] as [bcode_session_models::SessionSummary; 0]
+        );
     }
 
     #[tokio::test]

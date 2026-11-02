@@ -822,7 +822,7 @@ mod tests {
                                 );
                             }
                         }
-                        Provenance::Generated => assert!(fragment.text.trim().is_empty()),
+                        Provenance::Generated => assert_eq!(fragment.text.trim(), ""),
                     }
                 }
                 if end >= source.find("42").unwrap() + 2 {

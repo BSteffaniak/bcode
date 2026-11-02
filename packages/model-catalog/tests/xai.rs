@@ -168,11 +168,13 @@ fn xai_support_routes_separate_multi_agent_from_chat_completions() {
     let multi_agent = catalog.model("xai", "grok-4.20-multi-agent-0309").unwrap();
     assert_eq!(multi_agent.bcode_support, BcodeSupportStatus::Unsupported);
     assert!(!multi_agent.capabilities.tool_use);
-    assert!(multi_agent.deployments.is_empty());
-    assert!(
-        catalog
-            .provider_models_for_support_target("xai", &target("chatgpt_codex"), false)
-            .is_empty()
+    assert_eq!(
+        multi_agent.deployments,
+        [] as [bcode_model_catalog_models::ModelDeployment; 0]
+    );
+    assert_eq!(
+        catalog.provider_models_for_support_target("xai", &target("chatgpt_codex"), false),
+        [] as [bcode_model::ModelInfo; 0]
     );
 }
 

@@ -620,7 +620,7 @@ mod tests {
         assert_eq!(prepared.input, Some(normal.input.clone()));
         assert_eq!(prepared.binding, Some(normal.binding.clone()));
         assert_eq!(prepared.limits, normal.limits);
-        assert!(prepared.workspace_snapshot.is_empty()); // same canonical-session derivation
+        assert_eq!(prepared.workspace_snapshot, ""); // same canonical-session derivation
         let roundtrip: bcode_workflow::WorkflowRunStartRequest =
             serde_json::from_str(&serde_json::to_string(&prepared).unwrap()).unwrap();
         assert_eq!(roundtrip, prepared);

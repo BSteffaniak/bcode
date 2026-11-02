@@ -157,8 +157,6 @@ pub struct RecordingManifest {
 pub enum RecordingError {
     #[error("recording filesystem operation failed ({0:?})")]
     Io(io::ErrorKind),
-    #[error("unsupported recording platform")]
-    UnsupportedPlatform,
     #[error("invalid recording destination or options")]
     InvalidOptions,
     #[error("incompatible or foreign recording input")]
@@ -185,8 +183,8 @@ impl From<io::Error> for RecordingError {
 /// Unix descriptor-relative no-follow operations pin the bundle against path swaps.
 /// Other platforms fail closed. Never automatically resumes or repairs a bundle.
 pub struct JsonlBundleRecorder {
-    directory: File,
-    payload_directory: File,
+    directory: bcode_confined_fs::Dir,
+    payload_directory: bcode_confined_fs::Dir,
     events: File,
     options: RecordingOptions,
     manifest: RecordingManifest,
@@ -306,7 +304,7 @@ impl JsonlBundleRecorder {
         temporary.write_all(&bytes)?;
         temporary.sync_all()?;
         confined::replace(&self.directory, "manifest.pending", "manifest.json")?;
-        self.directory.sync_all()?;
+        self.directory.sync()?;
         Ok(())
     }
 
@@ -488,7 +486,7 @@ impl RecordingSink for JsonlBundleRecorder {
             let mut file = confined::create(&self.payload_directory, &name)?;
             file.write_all(bytes)?;
             file.sync_all()?;
-            self.payload_directory.sync_all()?;
+            self.payload_directory.sync()?;
             Ok(())
         })();
         if let Err(error) = result {
@@ -635,7 +633,7 @@ pub fn inspect_bundle(
 }
 
 fn verify_bundle_events(
-    directory: &File,
+    directory: &bcode_confined_fs::Dir,
     manifest: &RecordingManifest,
     options: &RecordingOptions,
 ) -> Result<Option<XrayFinalization>, RecordingError> {
@@ -735,7 +733,7 @@ fn verify_bundle_events(
 }
 
 fn verify_bundle_payloads(
-    directory: &File,
+    directory: &bcode_confined_fs::Dir,
     manifest: &RecordingManifest,
     options: &RecordingOptions,
 ) -> Result<(), RecordingError> {
@@ -870,108 +868,92 @@ fn bounded_json(value: &impl Serialize, limit: usize) -> Result<Vec<u8>, Recordi
     Ok(writer.bytes)
 }
 
-#[cfg(unix)]
 mod confined {
     use super::{File, Path, RecordingError};
-    use rustix::fs::{Mode, OFlags, mkdirat, open, openat, renameat};
+    use bcode_confined_fs::{Creation, Dir, OpenOptions, RenameMode};
     use std::path::Component;
 
-    fn map(error: rustix::io::Errno) -> RecordingError {
-        RecordingError::Io(std::io::Error::from(error).kind())
-    }
-
-    pub(super) fn open_bundle(path: &Path) -> Result<File, RecordingError> {
+    /// Splits an absolute path into its root and normal components, refusing `.` and `..`.
+    fn components(
+        path: &Path,
+    ) -> Result<(std::path::PathBuf, Vec<&std::ffi::OsStr>), RecordingError> {
         if !path.is_absolute() {
             return Err(RecordingError::InvalidOptions);
         }
-        let flags = OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC;
-        let mut directory = File::from(open("/", flags, Mode::empty()).map_err(map)?);
-        for component in path.components() {
-            match component {
-                Component::RootDir => {}
-                Component::Normal(name) => {
-                    directory =
-                        File::from(openat(&directory, name, flags, Mode::empty()).map_err(map)?);
-                }
-                _ => return Err(RecordingError::InvalidOptions),
-            }
-        }
-        Ok(directory)
-    }
-
-    pub(super) fn open_directory(parent: &File, name: &str) -> Result<File, RecordingError> {
-        let flags = OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC;
-        Ok(File::from(
-            openat(parent, name, flags, Mode::empty()).map_err(map)?,
-        ))
-    }
-
-    pub(super) fn read(parent: &File, name: &str) -> Result<File, RecordingError> {
-        let flags = OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::NONBLOCK | OFlags::CLOEXEC;
-        let file = File::from(openat(parent, name, flags, Mode::empty()).map_err(map)?);
-        if !file.metadata()?.is_file() {
-            return Err(RecordingError::InvalidInput);
-        }
-        Ok(file)
-    }
-
-    pub(super) fn create_bundle(path: &Path) -> Result<File, RecordingError> {
-        if !path.is_absolute() {
-            return Err(RecordingError::InvalidOptions);
-        }
+        let mut root = std::path::PathBuf::new();
         let mut names = Vec::new();
         for component in path.components() {
             match component {
-                Component::RootDir => {}
+                Component::Prefix(_) | Component::RootDir if names.is_empty() => {
+                    root.push(component);
+                }
                 Component::Normal(name) => names.push(name),
                 _ => return Err(RecordingError::InvalidOptions),
             }
         }
-        let (name, ancestors) = names.split_last().ok_or(RecordingError::InvalidOptions)?;
-        let flags = OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC;
-        let mut parent = File::from(open("/", flags, Mode::empty()).map_err(map)?);
-        for ancestor in ancestors {
-            parent = File::from(openat(&parent, *ancestor, flags, Mode::empty()).map_err(map)?);
+        Ok((root, names))
+    }
+
+    /// Opens the root and then each name without following links.
+    fn open_strict(root: &Path, names: &[&std::ffi::OsStr]) -> Result<Dir, RecordingError> {
+        let mut directory = Dir::open(root)?;
+        for name in names {
+            directory = directory.open_dir(name)?;
         }
-        mkdirat(&parent, *name, Mode::RUSR | Mode::WUSR | Mode::XUSR).map_err(map)?;
-        let directory = File::from(openat(&parent, *name, flags, Mode::empty()).map_err(map)?);
-        parent.sync_all()?;
         Ok(directory)
     }
 
-    pub(super) fn mkdir(parent: &File, name: &str) -> Result<File, RecordingError> {
-        mkdirat(parent, name, Mode::RUSR | Mode::WUSR | Mode::XUSR).map_err(map)?;
-        let directory = openat(
-            parent,
-            name,
-            OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
-            Mode::empty(),
-        )
-        .map_err(map)?;
-        parent.sync_all()?;
-        Ok(File::from(directory))
+    pub(super) fn open_bundle(path: &Path) -> Result<Dir, RecordingError> {
+        let (root, names) = components(path)?;
+        open_strict(&root, &names)
     }
 
-    pub(super) fn create(parent: &File, name: &str) -> Result<File, RecordingError> {
-        let fd = openat(
-            parent,
-            name,
-            OFlags::WRONLY | OFlags::CREATE | OFlags::EXCL | OFlags::NOFOLLOW | OFlags::CLOEXEC,
-            Mode::RUSR | Mode::WUSR,
-        )
-        .map_err(map)?;
-        Ok(File::from(fd))
+    pub(super) fn open_directory(parent: &Dir, name: &str) -> Result<Dir, RecordingError> {
+        Ok(parent.open_dir(name.as_ref())?)
     }
 
-    pub(super) fn replace(parent: &File, from: &str, to: &str) -> Result<(), RecordingError> {
-        renameat(parent, from, parent, to).map_err(map)
+    pub(super) fn read(parent: &Dir, name: &str) -> Result<File, RecordingError> {
+        // Links and non-regular entries, including substituted FIFOs, are refused.
+        Ok(parent.open_file(name.as_ref(), OpenOptions::new().read(true))?)
+    }
+
+    pub(super) fn create_bundle(path: &Path) -> Result<Dir, RecordingError> {
+        let (root, names) = components(path)?;
+        let (name, ancestors) = names.split_last().ok_or(RecordingError::InvalidOptions)?;
+        let parent = open_strict(&root, ancestors)?;
+        parent.create_private_dir(name)?;
+        let directory = parent.open_dir(name)?;
+        parent.sync()?;
+        Ok(directory)
+    }
+
+    pub(super) fn mkdir(parent: &Dir, name: &str) -> Result<Dir, RecordingError> {
+        parent.create_private_dir(name.as_ref())?;
+        let directory = parent.open_dir(name.as_ref())?;
+        parent.sync()?;
+        Ok(directory)
+    }
+
+    pub(super) fn create(parent: &Dir, name: &str) -> Result<File, RecordingError> {
+        Ok(parent.open_file(
+            name.as_ref(),
+            OpenOptions::new()
+                .write(true)
+                .creation(Creation::New)
+                .private(true),
+        )?)
+    }
+
+    pub(super) fn replace(parent: &Dir, from: &str, to: &str) -> Result<(), RecordingError> {
+        Ok(parent.rename(from.as_ref(), parent, to.as_ref(), RenameMode::Replace)?)
     }
 }
 
-#[cfg(all(test, unix))]
+#[cfg(test)]
 mod tests {
     use super::*;
     use bcode_xray_models::{XrayCorrelation, XrayEvent};
+    #[cfg(unix)]
     use std::os::unix::fs::{PermissionsExt, symlink};
     use tempfile::TempDir;
 
@@ -1055,6 +1037,7 @@ mod tests {
         }
     }
 
+    #[cfg(unix)]
     #[test]
     fn offline_reader_rejects_symlink_traversal_truncation_and_bounds() {
         let (_temporary, path, mut recorder) = setup();
@@ -1079,6 +1062,7 @@ mod tests {
         assert!(inspect_bundle(&path, &RecordingOptions::default()).is_err());
     }
 
+    #[cfg(unix)]
     #[test]
     fn restarted_segment_is_explicitly_gapful_even_after_clean_finalization() {
         let temporary = tempfile::tempdir().unwrap();
@@ -1415,6 +1399,7 @@ mod tests {
         ));
     }
 
+    #[cfg(unix)]
     #[test]
     fn private_modes_no_overwrite_and_symlink_ancestors_fail_closed() {
         let (temporary, path, mut recorder) = setup();
@@ -1478,6 +1463,7 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
     #[test]
     fn replaced_payload_directory_symlink_cannot_redirect_pinned_writer() {
         let (temporary, path, mut recorder) = setup();
@@ -1497,31 +1483,5 @@ mod tests {
         // No external content was touched. Reader must still reject the substituted
         // symlink rather than trusting a manifest-relative path when opening a bundle.
         recorder.interrupt().unwrap();
-    }
-}
-
-#[cfg(not(unix))]
-mod confined {
-    use super::{File, Path, RecordingError};
-    pub(super) fn open_bundle(_: &Path) -> Result<File, RecordingError> {
-        Err(RecordingError::UnsupportedPlatform)
-    }
-    pub(super) fn open_directory(_: &File, _: &str) -> Result<File, RecordingError> {
-        Err(RecordingError::UnsupportedPlatform)
-    }
-    pub(super) fn read(_: &File, _: &str) -> Result<File, RecordingError> {
-        Err(RecordingError::UnsupportedPlatform)
-    }
-    pub(super) fn create_bundle(_: &Path) -> Result<File, RecordingError> {
-        Err(RecordingError::UnsupportedPlatform)
-    }
-    pub(super) fn mkdir(_: &File, _: &str) -> Result<File, RecordingError> {
-        Err(RecordingError::UnsupportedPlatform)
-    }
-    pub(super) fn create(_: &File, _: &str) -> Result<File, RecordingError> {
-        Err(RecordingError::UnsupportedPlatform)
-    }
-    pub(super) fn replace(_: &File, _: &str, _: &str) -> Result<(), RecordingError> {
-        Err(RecordingError::UnsupportedPlatform)
     }
 }

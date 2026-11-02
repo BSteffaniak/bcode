@@ -3958,8 +3958,8 @@ mod tests {
             .iter()
             .map(|span| span.content.as_str())
             .collect::<String>();
-        assert!(!narrow.spans.is_empty());
-        assert!(!wide.spans.is_empty());
+        assert_ne!(narrow.spans, [] as [bmux_tui::text::Span; 0]);
+        assert_ne!(wide.spans, [] as [bmux_tui::text::Span; 0]);
         assert!(display_width(&narrow_text) <= 24);
         assert!(display_width(&wide_text) <= 100);
     }

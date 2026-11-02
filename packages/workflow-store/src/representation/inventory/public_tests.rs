@@ -234,7 +234,10 @@ async fn public_unmapped_capture_is_unavailable_not_empty_complete() {
     let result = page(&*db, &query).await.unwrap();
     query.validate_page(&result).unwrap();
     assert!(matches!(result.coverage, Coverage::Unavailable { .. }));
-    assert!(result.entries.is_empty());
+    assert_eq!(
+        result.entries,
+        [] as [bcode_workflow::WorkflowInventoryEntry; 0]
+    );
     assert!(result.next_cursor.is_none());
 }
 
@@ -299,7 +302,10 @@ async fn registered_admission_installs_current_inventory_without_history_backfil
         let current = page(&*db, &query).await.unwrap();
         query.validate_page(&current).unwrap();
         assert_eq!(current.coverage, Coverage::CurrentInventoryComplete);
-        assert!(current.entries.is_empty());
+        assert_eq!(
+            current.entries,
+            [] as [bcode_workflow::WorkflowInventoryEntry; 0]
+        );
         assert!(current.next_cursor.is_none());
     }
     assert_eq!(
@@ -423,7 +429,10 @@ async fn registered_admission_preserves_existing_unattributed_inventory_gap() {
             .await
             .unwrap();
         assert!(matches!(current.coverage, Coverage::Unavailable { .. }));
-        assert!(current.entries.is_empty());
+        assert_eq!(
+            current.entries,
+            [] as [bcode_workflow::WorkflowInventoryEntry; 0]
+        );
         assert!(
             Box::pin(crate::representation::admit_registered(
                 &*db,

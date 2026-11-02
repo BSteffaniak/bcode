@@ -284,7 +284,7 @@ async fn ordinary_assembled_request_excludes_canonical_compaction_checkpoint() {
         .unwrap();
     assert_eq!(acknowledgement, bcode_model::AckResponse::default());
     assert_checkpoint_private(&events);
-    assert!(!events.events.is_empty());
+    assert_ne!(events.events, [] as [bcode_model::ProviderTurnEvent; 0]);
 }
 
 #[tokio::test]

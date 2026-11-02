@@ -327,7 +327,7 @@ fn partial_ranges_verify_entire_blob_and_preserve_capture_status() {
     assert!(range.eof);
     request.offset = 7;
     let range = read_verified(root.path(), &request, &reference).expect("EOF");
-    assert!(range.bytes.is_empty());
+    assert_eq!(range.bytes, [] as [u8; 0]);
     assert!(range.eof);
     // Corrupt bytes outside the requested range still invalidate the response.
     request.offset = 0;
@@ -383,7 +383,7 @@ fn symlinks_at_each_untrusted_component_are_rejected() {
 fn zero_byte_capture_and_disabled_store_are_explicit() {
     let (root, request, reference) = fixture(b"");
     let range = read_verified(root.path(), &request, &reference).expect("empty retained capture");
-    assert!(range.bytes.is_empty());
+    assert_eq!(range.bytes, [] as [u8; 0]);
     assert!(range.eof);
     assert_eq!(range.byte_len, 0);
     assert_eq!(

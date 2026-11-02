@@ -1682,7 +1682,10 @@ library = "libtest_command_context.dylib"
                     .as_deref(),
                 Some("authoritative prompt")
             );
-            assert!(prompts.candidates.is_empty());
+            assert_eq!(
+                prompts.candidates,
+                [] as [bcode_session_models::SessionDerivationPromptCandidate; 0]
+            );
         } else {
             assert!(
                 prompts

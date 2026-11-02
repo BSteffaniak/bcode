@@ -8007,12 +8007,9 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(migrated.turn_receipt("test", "old").await.unwrap(), receipt);
-        assert!(
-            migrated
-                .pending_submissions(None, 256)
-                .await
-                .unwrap()
-                .is_empty()
+        assert_eq!(
+            migrated.pending_submissions(None, 256).await.unwrap(),
+            [] as [bcode_session_models::SubmissionRecord; 0]
         );
         assert_eq!(migrated.model_context_events().await.unwrap(), vec![prompt]);
         assert_eq!(
@@ -8049,12 +8046,9 @@ mod tests {
                 .await
                 .unwrap();
         }
-        assert!(
-            catalog
-                .list_sessions_page(None, 0)
-                .await
-                .unwrap()
-                .is_empty()
+        assert_eq!(
+            catalog.list_sessions_page(None, 0).await.unwrap(),
+            [] as [bcode_session_models::SessionSummary; 0]
         );
         let first = catalog.list_sessions_page(None, usize::MAX).await.unwrap();
         assert_eq!(first.len(), 256);
@@ -9252,11 +9246,9 @@ mod tests {
         .await
         .expect("append tool finish");
 
-        assert!(
-            db.active_tool_runs()
-                .await
-                .expect("active after finish")
-                .is_empty()
+        assert_eq!(
+            db.active_tool_runs().await.expect("active after finish"),
+            [] as [crate::db::ToolRun; 0]
         );
         let completed = db
             .tool_runs_by_status("complete")
@@ -9304,11 +9296,9 @@ mod tests {
         .await
         .expect("append generic tool result");
 
-        assert!(
-            db.active_tool_runs()
-                .await
-                .expect("active tool runs")
-                .is_empty()
+        assert_eq!(
+            db.active_tool_runs().await.expect("active tool runs"),
+            [] as [crate::db::ToolRun; 0]
         );
         let completed = db
             .tool_runs_by_status("complete")
@@ -9660,12 +9650,12 @@ mod tests {
             migrated.storage_writer_epoch().await.expect("writer epoch"),
             u64::from(CURRENT_SESSION_STORAGE_WRITER_EPOCH)
         );
-        assert!(
+        assert_eq!(
             migrated
                 .tool_runs_by_status("running")
                 .await
-                .expect("running tools")
-                .is_empty()
+                .expect("running tools"),
+            [] as [crate::db::ToolRun; 0]
         );
         let complete = migrated
             .tool_runs_by_status("complete")
@@ -9716,11 +9706,9 @@ mod tests {
         .await
         .expect("append terminal lifecycle");
 
-        assert!(
-            db.tool_runs_by_status("running")
-                .await
-                .expect("running")
-                .is_empty()
+        assert_eq!(
+            db.tool_runs_by_status("running").await.expect("running"),
+            [] as [crate::db::ToolRun; 0]
         );
         let complete = db
             .tool_runs_by_status("complete")
@@ -9789,7 +9777,10 @@ mod tests {
         ))
         .await
         .expect("suspend");
-        assert!(db.active_runtime_work().await.expect("inactive").is_empty());
+        assert_eq!(
+            db.active_runtime_work().await.expect("inactive"),
+            [] as [crate::db::RuntimeWorkProjection; 0]
+        );
         db.append_event(&event(session_id, 2, start))
             .await
             .expect("resume");
@@ -10159,7 +10150,10 @@ mod tests {
                 .is_err()
         );
         assert!(db.runtime_work_by_ids(&[], 0).await.is_err());
-        assert!(db.runtime_work_by_ids(&[], 4096).await.unwrap().is_empty());
+        assert_eq!(
+            db.runtime_work_by_ids(&[], 4096).await.unwrap(),
+            [] as [crate::db::RuntimeWorkProjection; 0]
+        );
         // Corrupt only the disposable projection with the existing structured query API.
         db.db
             .update("runtime_work")
@@ -10226,11 +10220,9 @@ mod tests {
         .await
         .expect("append runtime work finish");
 
-        assert!(
-            db.active_runtime_work()
-                .await
-                .expect("active after finish")
-                .is_empty()
+        assert_eq!(
+            db.active_runtime_work().await.expect("active after finish"),
+            [] as [crate::db::RuntimeWorkProjection; 0]
         );
     }
 
@@ -11944,7 +11936,10 @@ mod tests {
             generation: None,
         };
         let first = db.usage_page(&query).await.unwrap();
-        assert!(first.entries.is_empty());
+        assert_eq!(
+            first.entries,
+            [] as [bcode_session_models::SessionUsageEntry; 0]
+        );
         assert_eq!(first.scanned, 1);
         assert_eq!(first.next_after.as_deref(), Some("r1"));
         query.after = first.next_after;
@@ -11960,7 +11955,10 @@ mod tests {
         ));
         query.after = second.next_after;
         let third = db.usage_page(&query).await.unwrap();
-        assert!(third.entries.is_empty());
+        assert_eq!(
+            third.entries,
+            [] as [bcode_session_models::SessionUsageEntry; 0]
+        );
         query.after = third.next_after;
         let end = db.usage_page(&query).await.unwrap();
         assert_eq!(end.scanned, 0);
@@ -12971,7 +12969,10 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec![0, 1]
         );
-        assert!(db.turn_evidence("absent").await.expect("absent").is_empty());
+        assert_eq!(
+            db.turn_evidence("absent").await.expect("absent"),
+            [] as [bcode_session_models::SessionEvent; 0]
+        );
         switchy::database::schema::drop_index("idx_turn_evidence_sequence", "turn_evidence")
             .execute(db.database())
             .await
@@ -14407,11 +14408,11 @@ mod tests {
             .await
             .expect("captured sweep");
         assert_eq!(first, vec![("artifact-0".into(), "recording".into())]);
-        assert!(
+        assert_eq!(
             db.artifact_maintenance_page_through(Some(("artifact-0", "recording")), 0)
                 .await
-                .expect("sweep done")
-                .is_empty()
+                .expect("sweep done"),
+            [] as [(std::string::String, std::string::String); 0]
         );
         assert_eq!(
             db.artifact_maintenance_page_through(None, 1)
@@ -15124,17 +15125,15 @@ mod tests {
             .await
             .expect("tail");
         assert_eq!(page.len(), 1);
-        assert!(
+        assert_eq!(
             db.canonical_rows_page(i64::MAX as u64 + 1, 3)
                 .await
-                .expect("past tail")
-                .is_empty()
+                .expect("past tail"),
+            [] as [bcode_session_migration_target::CanonicalRow; 0]
         );
-        assert!(
-            db.canonical_rows_page(0, 0)
-                .await
-                .expect("zero page")
-                .is_empty()
+        assert_eq!(
+            db.canonical_rows_page(0, 0).await.expect("zero page"),
+            [] as [bcode_session_migration_target::CanonicalRow; 0]
         );
     }
 
@@ -15171,7 +15170,10 @@ mod tests {
         assert_eq!(second.len(), 1);
         assert_eq!(second[0].sequence, 2);
         assert_eq!(second[0].payload, logical);
-        assert!(db.canonical_rows_page(3, 3).await.expect("end").is_empty());
+        assert_eq!(
+            db.canonical_rows_page(3, 3).await.expect("end"),
+            [] as [bcode_session_migration_target::CanonicalRow; 0]
+        );
     }
 
     #[tokio::test]

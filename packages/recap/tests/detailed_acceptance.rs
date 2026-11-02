@@ -167,7 +167,7 @@ impl<'a> AnnotatedExecutor<'a> {
     fn verify_sources(&self, request: &AnalysisRequest, stage: &str) {
         let mut assets = BTreeSet::new();
         let sources = request.input["untrusted_sources"].as_array().unwrap();
-        assert!(!sources.is_empty());
+        assert_ne!(sources.as_slice(), [] as [serde_json::Value; 0]);
         for entry in sources {
             assets.extend(self.verify_source(&entry["source"], stage));
         }
@@ -285,7 +285,7 @@ impl<'a> AnnotatedExecutor<'a> {
     fn respond(&self, request: &AnalysisRequest) -> AnalysisResponse {
         // Source text is product input here, never repository source-code inspection.
         assert!(!request.instructions.contains("UNTRUSTED_FIXTURE_DIRECTIVE"));
-        assert!(!request.instructions.trim().is_empty());
+        assert_ne!(request.instructions.trim(), "");
         assert!(request.max_response_bytes > 0);
         match request.stage {
             AnalysisStage::EditionPlan
@@ -351,7 +351,7 @@ impl<'a> AnnotatedExecutor<'a> {
 
     fn outline(&self, request: &AnalysisRequest) -> AnalysisResponse {
         assert_eq!(request.input["intent"]["depth"], "detailed");
-        assert!(request.images.is_empty());
+        assert_eq!(request.images, [] as [bcode_recap::model::ImageAsset; 0]);
         let items: Vec<InformationItem> = decode(&request.input["items"]);
         for item in &items {
             self.annotation(item);
@@ -458,7 +458,10 @@ impl<'a> AnnotatedExecutor<'a> {
         let plans: Vec<ChapterPlan> = decode(&request.input["chapter_plans"]);
         let items: Vec<InformationItem> = decode(&request.input["items"]);
         let current: Vec<ChapterComposition> = decode(&request.input["chapters"]);
-        assert!(!issues.is_empty());
+        assert_ne!(
+            issues,
+            [] as [bcode_recap::analysis_contracts::CoverageIssue; 0]
+        );
         assert_eq!(plans.len(), 1, "repair must be narrowly targeted");
         assert_eq!(current.len(), 1);
         assert!(
@@ -632,7 +635,10 @@ async fn corpus_survives_actual_staged_composition_and_targeted_repair() {
             for stage in ["visual", "chapter", "audit"] {
                 assert_eq!(trace.images_seen.get(stage), Some(&all_images));
             }
-            assert!(output.transcript.is_empty());
+            assert_eq!(
+                output.transcript,
+                [] as [bcode_recap::contracts::TranscriptSegment; 0]
+            );
         }
     }
 }

@@ -1573,7 +1573,10 @@ mod tests {
                 assert!(page.has_newer);
                 break;
             }
-            assert!(page.transcript_items.is_empty());
+            assert_eq!(
+                page.transcript_items,
+                [] as [bcode_session_models::TranscriptProjectionItem; 0]
+            );
             assert!(page.has_newer);
         }
         assert!(scanned > 3);
@@ -1641,7 +1644,10 @@ mod tests {
                 assert_eq!(page.transcript_items.len(), 1);
                 break;
             }
-            assert!(page.transcript_items.is_empty());
+            assert_eq!(
+                page.transcript_items,
+                [] as [bcode_session_models::TranscriptProjectionItem; 0]
+            );
             assert!(page.has_older);
         }
         assert!(scanned > 3);
@@ -1678,7 +1684,10 @@ mod tests {
             },
         )
         .expect("bounded latest projection");
-        assert!(window.transcript_items.is_empty());
+        assert_eq!(
+            window.transcript_items,
+            [] as [bcode_session_models::TranscriptProjectionItem; 0]
+        );
         assert_eq!(window.scanned_events, 2);
         assert_eq!(
             window.source_range,
@@ -1809,7 +1818,10 @@ mod tests {
                 &request(anchor, direction),
             )
             .expect("supported projection");
-            assert!(window.transcript_items.is_empty());
+            assert_eq!(
+                window.transcript_items,
+                [] as [bcode_session_models::TranscriptProjectionItem; 0]
+            );
             assert_eq!(
                 window.source_range,
                 Some(ProjectionSourceRange {

@@ -72,7 +72,7 @@ fn valid_backup_is_verified_without_mutation_and_handle_is_read_only() {
             .limit(1),
     )
     .unwrap();
-    assert!(rows.is_empty());
+    assert_eq!(rows, [] as [switchy_database::Row; 0]);
     super::database::commit(transaction).unwrap();
     drop(reader);
     assert_eq!(std::fs::read(&path).unwrap(), before);
@@ -114,7 +114,7 @@ fn structured_baseline_initialization_preserves_both_compatibility_contracts() {
             version == 43
         );
         let violations = futures::executor::block_on(db.sqlite_foreign_key_check()).unwrap();
-        assert!(violations.is_empty());
+        assert_eq!(violations, [] as [switchy_database::Row; 0]);
     }
 }
 

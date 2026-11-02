@@ -563,7 +563,10 @@ mod tests {
         );
         effect.generation = 2;
         let accepted = effect.accept(disabled).expect("latest disabled result");
-        assert!(accepted.response.providers.is_empty());
+        assert_eq!(
+            accepted.response.providers,
+            [] as [bcode_session_search::FederatedProviderReport; 0]
+        );
         assert!(!accepted.response.query_complete);
     }
 

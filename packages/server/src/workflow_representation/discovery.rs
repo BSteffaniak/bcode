@@ -490,7 +490,10 @@ mod semantic_history_tests {
             page.cursor.coverage,
             WorkflowSemanticHistoryCoverage::Unsupported
         );
-        assert!(page.events.is_empty());
+        assert_eq!(
+            page.events,
+            [] as [bcode_workflow::WorkflowSemanticHistoryEvent; 0]
+        );
         query.cursor = Some(page.cursor);
         query.cursor.as_mut().unwrap().coverage =
             WorkflowSemanticHistoryCoverage::CompleteFromAdmission;

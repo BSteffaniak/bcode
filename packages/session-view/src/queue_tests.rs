@@ -84,7 +84,10 @@ async fn queue_hydration_and_targeted_actions_use_only_bounded_application_opera
         hydrate_submission_queue(&client, session_id, &mut view)
             .await
             .unwrap();
-        assert!(view.snapshot().transcript.items.is_empty());
+        assert_eq!(
+            view.snapshot().transcript.items,
+            [] as [bcode_session_view_models::TranscriptViewItem; 0]
+        );
         assert!(view.snapshot().runtime.queue_recovery().unwrap().can_resume);
         let prepared = execute_session_view_action(
             &client,

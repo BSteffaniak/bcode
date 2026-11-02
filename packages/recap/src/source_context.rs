@@ -101,7 +101,10 @@ mod tests {
         let context = SourceContext::from_metadata(
             &serde_json::json!({"channel":"Podcast Network","description":"Host Ada interviews guest Lin."}),
         );
-        assert!(context.participants.is_empty());
+        assert_eq!(
+            context.participants,
+            [] as [crate::source_context::Participant; 0]
+        );
         assert!(context.supports(
             &Participant {
                 name: "Ada".into(),

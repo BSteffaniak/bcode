@@ -65,11 +65,11 @@ async fn concurrent_page_preserves_resource_exclusion_and_active_cancellation() 
         })
         .await;
         stop_fixture_driver(&state).await;
-        assert!(
+        assert_eq!(
             representation::attempts::pending(&db, "resource-page", None, 10)
                 .await
-                .expect("settled")
-                .is_empty()
+                .expect("settled"),
+            [] as [bcode_workflow_store::representation::attempts::PendingAttempt; 0]
         );
     }
 }

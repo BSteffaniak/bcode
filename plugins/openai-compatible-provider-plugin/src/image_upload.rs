@@ -388,7 +388,7 @@ mod tests {
                 loop {
                     let mut line = String::new();
                     reader.read_line(&mut line).expect("header");
-                    assert!(!line.is_empty());
+                    assert_ne!(line, "");
                     if line == "\r\n" {
                         break;
                     }

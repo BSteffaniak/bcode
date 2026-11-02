@@ -922,7 +922,7 @@ async fn metrics(
         .telemetry
         .events()
         .await
-        .map_err(&|e| telemetry_error_response(&e))?;
+        .map_err(|e| telemetry_error_response(&e))?;
     let summary = summarize_usage(&events);
     Ok(format!(
         "# TYPE brouter_requests_total counter\nbrouter_requests_total {}\n# TYPE brouter_request_success_total counter\nbrouter_request_success_total {}\n# TYPE brouter_estimated_cost_total counter\nbrouter_estimated_cost_total {}\n# TYPE brouter_latency_ms_sum counter\nbrouter_latency_ms_sum {}\n",
@@ -1805,7 +1805,7 @@ async fn route_request(
     }
     let mut decision = invoke_llm_judge(state, &decision)
         .await
-        .map_err(&|e| router_error_response(&e))?
+        .map_err(|e| router_error_response(&e))?
         .unwrap_or(decision);
     apply_selected_request_controls(state, request, &mut decision);
     record_route_decision_event(state, headers, request, &decision, request_id, preference)

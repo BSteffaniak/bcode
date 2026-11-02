@@ -516,7 +516,7 @@ impl CredentialFile {
     }
 
     #[cfg(not(unix))]
-    fn create(_: &Path, _: &str, _: &str) -> Result<Self, XrayBootstrapError> {
+    const fn create(_: &Path, _: &str, _: &str) -> Result<Self, XrayBootstrapError> {
         Err(XrayBootstrapError::Unavailable)
     }
 }

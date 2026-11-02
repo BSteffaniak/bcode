@@ -60,11 +60,11 @@ async fn worker_loop_upgrades_released_history_then_compresses_both_tiers() {
     assert!(usage.maintenance.is_some());
     // Inspecting maintenance and backup diagnostics must not make the session recently used.
     assert_eq!(std::fs::read(&access).expect("unchanged age"), before);
-    assert!(
-        !bcode_session_migration::retained_migration_backups(root.path(), id, 256)
+    assert_ne!(
+        bcode_session_migration::retained_migration_backups(root.path(), id, 256)
             .expect("backups")
-            .backups
-            .is_empty()
+            .backups,
+        [] as [bcode_session_migration::RetainedMigrationBackupDiagnosis; 0]
     );
     let db = bcode_session::db::SessionDb::open_existing_turso_in_root(id, root.path())
         .await

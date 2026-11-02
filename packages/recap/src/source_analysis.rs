@@ -909,8 +909,8 @@ mod tests {
                 serde_json::to_value(&unit.context.transcript).unwrap(),
                 payload["preceding_context"]["transcript"]
             );
-            assert!(unit.context.evidence.is_empty());
-            assert!(unit.context.assets.is_empty());
+            assert_eq!(unit.context.evidence, [] as [crate::contracts::Evidence; 0]);
+            assert_eq!(unit.context.assets, [] as [crate::contracts::Asset; 0]);
             for cue in &unit.context.transcript {
                 assert!(
                     !unit

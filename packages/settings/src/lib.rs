@@ -3025,8 +3025,8 @@ mod tests {
     #[test]
     fn disabled_discovery_returns_no_sources_or_recommendations() {
         let snapshot = super::detect_setup_environment_with_policy(false, 42);
-        assert!(snapshot.entries.is_empty());
-        assert!(snapshot.recommendations.is_empty());
+        assert_eq!(snapshot.entries, [] as [DetectionCacheEntry; 0]);
+        assert_eq!(snapshot.recommendations, [] as [SetupRecommendation; 0]);
     }
 
     use super::*;
@@ -3091,7 +3091,7 @@ mod tests {
 
         assert!(safe.safe);
         assert!(!unsafe_report.safe);
-        assert!(!unsafe_report.findings.is_empty());
+        assert_ne!(unsafe_report.findings, [] as [std::string::String; 0]);
     }
 
     #[test]

@@ -748,7 +748,7 @@ mod tests {
                         .map(String::as_str),
                     Some("retained")
                 );
-                assert!(request.tools.is_empty());
+                assert_eq!(request.tools, [] as [bcode_model::ToolDefinition; 0]);
                 let index = self.next.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                 assert!(index < 3, "unexpected retry or additional invocation");
                 self.started.wait().await;

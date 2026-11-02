@@ -654,7 +654,7 @@ fn read_dynamic_provider_payload(
                 length: 4096,
             })
             .unwrap();
-        assert!(!range.bytes.is_empty());
+        assert_ne!(range.bytes, [] as [u8; 0]);
         bytes.extend_from_slice(&range.bytes);
     }
     assert_eq!(bytes.len() as u64, reference.byte_len);

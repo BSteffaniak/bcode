@@ -87,7 +87,6 @@ impl TelemetryStore {
                     .unwrap_or_else(std::sync::PoisonError::into_inner)
                     .usage_events
                     .push(event.clone());
-                Ok(())
             }
             TelemetryBackend::Database(database) => {
                 database
@@ -135,9 +134,9 @@ impl TelemetryStore {
                     )
                     .execute(&***database)
                     .await?;
-                Ok(())
             }
         }
+        Ok(())
     }
 
     /// Records a structured routing event.
@@ -154,7 +153,6 @@ impl TelemetryStore {
                     .unwrap_or_else(std::sync::PoisonError::into_inner)
                     .routing_events
                     .push(event.clone());
-                Ok(())
             }
             TelemetryBackend::Database(database) => {
                 database
@@ -178,9 +176,9 @@ impl TelemetryStore {
                     )
                     .execute(&***database)
                     .await?;
-                Ok(())
             }
         }
+        Ok(())
     }
 
     /// Returns all recorded usage events.

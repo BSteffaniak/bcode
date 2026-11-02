@@ -891,7 +891,10 @@ mod tests {
     fn embeds_image_and_retains_all_content_without_script() {
         let (root, document) = fixture();
         let export = export_html(&document, root.path(), ExportBudget::default()).unwrap();
-        assert!(export.report.degradations.is_empty());
+        assert_eq!(
+            export.report.degradations,
+            [] as [crate::export::Degradation; 0]
+        );
         let uri = format!("data:image/png;base64,{PNG}");
         assert!(export.html.contains(&uri));
         assert_eq!(export.report.embedded_media_bytes, uri.len() as u64);
@@ -965,7 +968,10 @@ mod tests {
         assert_eq!(semantic.matches("0:12.500–0:14.750").count(), 80);
         assert!(semantic.contains("#t=12"));
         assert_eq!(export.report.embedded_media_bytes, 0);
-        assert!(export.report.degradations.is_empty());
+        assert_eq!(
+            export.report.degradations,
+            [] as [crate::export::Degradation; 0]
+        );
 
         document.source.url = None;
         let local = export_html(&document, root.path(), ExportBudget::default()).unwrap();
@@ -1036,12 +1042,12 @@ mod tests {
             max_total_media_bytes: size,
             ..ExportBudget::default()
         };
-        assert!(
+        assert_eq!(
             export_html(&document, root.path(), budget)
                 .unwrap()
                 .report
-                .degradations
-                .is_empty()
+                .degradations,
+            [] as [crate::export::Degradation; 0]
         );
         let budget = ExportBudget {
             max_total_media_bytes: size - 1,
@@ -1221,7 +1227,10 @@ mod tests {
         });
         fs::write(root.path().join("clip.mp4"), mp4(false)).unwrap();
         let export = export_html(&document, root.path(), ExportBudget::default()).unwrap();
-        assert!(export.report.degradations.is_empty());
+        assert_eq!(
+            export.report.degradations,
+            [] as [crate::export::Degradation; 0]
+        );
         assert!(export.html.contains("data:video/mp4;base64,"));
         assert!(export.html.contains("<video controls muted playsinline"));
         assert!(export.html.contains("<track kind=\"captions\""));

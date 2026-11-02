@@ -863,7 +863,10 @@ mod tests {
                 .collect::<Vec<_>>(),
             [(1, 18), (1, 19), (2, 0)]
         );
-        assert!(cache.visible_lines_from_top(22, 4).is_empty());
+        assert_eq!(
+            cache.visible_lines_from_top(22, 4),
+            [] as [crate::transcript::transcript_layout::VisibleTranscriptLine; 0]
+        );
     }
 
     #[test]
@@ -875,6 +878,9 @@ mod tests {
             cache.drain_sync_stats(),
             vec![TranscriptLayoutSyncStats::cache_hit(7)]
         );
-        assert!(cache.drain_sync_stats().is_empty());
+        assert_eq!(
+            cache.drain_sync_stats(),
+            [] as [crate::transcript::transcript_layout::TranscriptLayoutSyncStats; 0]
+        );
     }
 }

@@ -335,16 +335,13 @@ where
 
     truncate_file(&wal_repair.path, wal_repair.truncate_len)?;
     match validate().await {
-        Ok(()) => {
-            report.status = RepairStatus::Repaired;
-            Ok(())
-        }
+        Ok(()) => report.status = RepairStatus::Repaired,
         Err(error) => {
             report.status = RepairStatus::ManualRequired;
             report.final_error = Some(error.to_string());
-            Ok(())
         }
     }
+    Ok(())
 }
 
 async fn model_context_projection_note(
@@ -618,7 +615,7 @@ mod tests {
                 .await
                 .unwrap();
             assert_eq!(report.status, RepairStatus::ManualRequired);
-            assert!(report.actions.is_empty());
+            assert_eq!(report.actions, [] as [crate::repair::RepairAction; 0]);
             assert!(report.backup_path.is_none());
             assert_eq!(
                 std::fs::read(directory.join("format")).unwrap(),
@@ -712,7 +709,7 @@ mod tests {
         .expect("dry run");
         assert_eq!(dry_report.status, RepairStatus::WouldRepair);
         assert_eq!(dry_report.backup_path, None);
-        assert!(!dry_report.actions.is_empty());
+        assert_ne!(dry_report.actions, [] as [crate::repair::RepairAction; 0]);
         assert_eq!(std::fs::read(&db_path).expect("database bytes"), before[0]);
         assert_eq!(std::fs::read(&shm_path).expect("shm bytes"), before[1]);
         assert_eq!(std::fs::read(&tshm_path).expect("tshm bytes"), before[2]);
@@ -791,7 +788,7 @@ mod tests {
                 && error.contains("checkpoint #0")
                 && error.contains("ends at #1")
         }));
-        assert!(report.actions.is_empty());
+        assert_eq!(report.actions, [] as [crate::repair::RepairAction; 0]);
     }
 
     #[tokio::test]
@@ -895,7 +892,7 @@ mod tests {
             "unexpected initial error: {initial_error}"
         );
         assert_eq!(report.backup_path, None);
-        assert!(report.actions.is_empty());
+        assert_eq!(report.actions, [] as [crate::repair::RepairAction; 0]);
         assert_eq!(session_storage_files(temp_dir.path(), session_id), before);
 
         let repair_report = repair_session(
@@ -907,7 +904,10 @@ mod tests {
         .expect("unsupported event repair should report");
         assert_eq!(repair_report.status, RepairStatus::ManualRequired);
         assert_eq!(repair_report.backup_path, None);
-        assert!(repair_report.actions.is_empty());
+        assert_eq!(
+            repair_report.actions,
+            [] as [crate::repair::RepairAction; 0]
+        );
         assert!(
             repair_report
                 .final_error

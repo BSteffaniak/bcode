@@ -267,7 +267,10 @@ async fn cancellation_is_fenced_idempotent_and_retains_run_state() {
         request_cancellation(&*db, "safety", &stale, 10).await,
         Err(Error::AuthorityConflict)
     ));
-    assert!(db.select(CANCEL).execute(&*db).await.unwrap().is_empty());
+    assert_eq!(
+        db.select(CANCEL).execute(&*db).await.unwrap(),
+        [] as [switchy_database::Row; 0]
+    );
     let before = db
         .select(RUNS)
         .where_eq("run_id", "safety")
@@ -440,13 +443,13 @@ async fn shared_reads_block_writes_and_failed_claim_sets_leave_no_partial_reserv
         .await
         .is_err()
     );
-    assert!(
+    assert_eq!(
         tx.select(LEASES)
             .where_eq("dispatch_identity", "writer")
             .execute(&*tx)
             .await
-            .unwrap()
-            .is_empty()
+            .unwrap(),
+        [] as [switchy_database::Row; 0]
     );
     release(&*tx, "run", "read-a").await.unwrap();
     assert!(
@@ -515,14 +518,14 @@ async fn large_claim_sets_page_duplicates_and_preserve_atomic_reservation() {
             .await
             .is_err()
     );
-    assert!(
+    assert_eq!(
         tx.select(LEASES)
             .where_eq("dispatch_identity", "blocked")
             .limit(1)
             .execute(&*tx)
             .await
-            .unwrap()
-            .is_empty()
+            .unwrap(),
+        [] as [switchy_database::Row; 0]
     );
     release(&*tx, "large", "holder").await.unwrap();
     reserve(&*tx, "large", "replacement", &claims)
@@ -534,14 +537,14 @@ async fn large_claim_sets_page_duplicates_and_preserve_atomic_reservation() {
         .await
         .unwrap();
     reserve(&*tx, "large", "holder", &claims).await.unwrap();
-    assert!(
+    assert_eq!(
         tx.select(LEASES)
             .where_eq("dispatch_identity", "replacement")
             .limit(1)
             .execute(&*tx)
             .await
-            .unwrap()
-            .is_empty()
+            .unwrap(),
+        [] as [switchy_database::Row; 0]
     );
     tx.commit().await.unwrap();
 }

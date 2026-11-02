@@ -59,7 +59,7 @@ fn explicit_method_never_consumes_input_or_falls_back() {
     );
     assert!(prompt.method(&provider, Some("unknown")).is_err());
     assert_eq!(prompt.reader.position(), 0);
-    assert!(prompt.writer.is_empty());
+    assert_eq!(prompt.writer, [] as [u8; 0]);
 }
 
 #[test]
@@ -81,7 +81,7 @@ fn noninteractive_choices_fail_without_consuming_input() {
             .contains("--method")
     );
     assert_eq!(prompt.reader.position(), 0);
-    assert!(prompt.writer.is_empty());
+    assert_eq!(prompt.writer, [] as [u8; 0]);
 }
 
 #[test]

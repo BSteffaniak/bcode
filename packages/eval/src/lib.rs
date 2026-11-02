@@ -4692,8 +4692,11 @@ fn report_repetition_cost(metrics: &EvalMeasurementSet, price: ModelPricing) -> 
     } else {
         cached * price.cached_input?
     };
-    let cost =
-        ((input - cached).mul_add(price.input, cached_cost) + output * price.output) / 1_000_000.0;
+    let cost = f64::mul_add(
+        output,
+        price.output,
+        (input - cached).mul_add(price.input, cached_cost),
+    ) / 1_000_000.0;
     cost.is_finite().then_some(cost)
 }
 
@@ -4815,7 +4818,7 @@ fn metric_efficiency_score(suite: &EvalSuite, measurements: &EvalMeasurementSet)
             EvalMetricDirection::LowerIsBetter => inverse_score(value, target),
             EvalMetricDirection::HigherIsBetter => (value / target).clamp(0.0, 1.0),
         };
-        weighted += score * f64::from(rule.weight);
+        weighted = f64::mul_add(score, f64::from(rule.weight), weighted);
         total_weight = total_weight.saturating_add(rule.weight);
     }
     (total_weight > 0).then_some(weighted / f64::from(total_weight))

@@ -3100,7 +3100,7 @@ fn pending_rich_markdown_finalizes_without_layout_drift_or_duplicate_content() {
         },
     ));
 
-    assert!(app.pending_submissions().is_empty());
+    assert_eq!(app.pending_submissions(), []);
     let user_items = app
         .transcript()
         .iter()
@@ -3178,7 +3178,7 @@ fn slash_palette_renders_above_composer() {
 
     assert!(output.contains("Commands"));
     assert!(output.contains("/plan"));
-    assert!(buffer.row_symbols(0).unwrap().trim().is_empty());
+    assert_eq!(buffer.row_symbols(0).unwrap().trim(), "");
     assert!(buffer.row_symbols(13).unwrap().contains("Commands"));
 }
 
@@ -9102,11 +9102,11 @@ fn thinking_dialog_does_not_cycle_when_reasoning_is_unsupported() {
     dialog.focus_next();
     dialog.cycle_focused();
     assert_eq!(dialog.effort(), None);
-    assert!(dialog.effort_values().is_empty());
+    assert_eq!(dialog.effort_values(), [] as [String; 0]);
     dialog.focus_next();
     dialog.cycle_focused();
     assert_eq!(dialog.summary(), None);
-    assert!(dialog.summary_values().is_empty());
+    assert_eq!(dialog.summary_values(), [] as [String; 0]);
 }
 
 #[test]

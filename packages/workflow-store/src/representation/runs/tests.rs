@@ -48,34 +48,34 @@ async fn canonical_summary_and_outputs_share_one_sqlite_snapshot() {
             .unwrap();
         assert_eq!(nodes.len(), 1);
         assert_eq!(nodes[0].id, node);
-        assert!(
+        assert_eq!(
             super::super::graph_edges::page(&*tx, "run", revision, None, None, 100)
                 .await
-                .unwrap()
-                .is_empty()
+                .unwrap(),
+            [] as [crate::representation::graph_edges::Edge; 0]
         );
         let snapshot =
             super::super::scheduling::snapshot_in(&*tx, "run", Some(revision), None, 100)
                 .await
                 .unwrap();
         assert_eq!(snapshot.activations.len(), 1);
-        assert!(
+        assert_eq!(
             super::super::inspection_attempts::page_in(&*tx, "run", None, 100)
                 .await
-                .unwrap()
-                .is_empty()
+                .unwrap(),
+            [] as [bcode_workflow::AttemptSummary; 0]
         );
-        assert!(
+        assert_eq!(
             super::super::inspection_sessions::links(&*tx, "run", None, 100)
                 .await
-                .unwrap()
-                .is_empty()
+                .unwrap(),
+            [] as [crate::WorkflowExecutionSessionLink; 0]
         );
-        assert!(
+        assert_eq!(
             super::super::admission_observation::inspect(&*tx, "run", None, 100)
                 .await
-                .unwrap()
-                .is_empty()
+                .unwrap(),
+            [] as [crate::representation::admission_observation::Observation; 0]
         );
         let activation = graph::activation_id(&*tx, "run", &node)
             .await
@@ -88,24 +88,24 @@ async fn canonical_summary_and_outputs_share_one_sqlite_snapshot() {
                 .is_none()
         );
         assert!(summary_in(&*tx, "missing").await.unwrap().is_none());
-        assert!(
+        assert_eq!(
             super::super::inspection_attempts::page_in(&*tx, "run", None, 10)
                 .await
-                .unwrap()
-                .is_empty()
+                .unwrap(),
+            [] as [bcode_workflow::AttemptSummary; 0]
         );
-        assert!(
+        assert_eq!(
             super::super::hierarchy::children_in(&*tx, "run", None, 10)
                 .await
                 .unwrap()
-                .children
-                .is_empty()
+                .children,
+            [] as [bcode_workflow::WorkflowRunLink; 0]
         );
-        assert!(
+        assert_eq!(
             graph::completion::outputs_in(&*tx, "run", None, 1)
                 .await
-                .unwrap()
-                .is_empty()
+                .unwrap(),
+            [] as [bcode_workflow::ValidatedOutput; 0]
         );
         tx.commit().await.unwrap();
 
@@ -233,12 +233,9 @@ async fn detachment_changes_only_association_and_needs_no_owner() {
         })
     ));
     assert_eq!(catalog(&*db, None, 1).await.unwrap().entries.len(), 1);
-    assert!(
-        catalog(&*db, Some("run"), 1)
-            .await
-            .unwrap()
-            .entries
-            .is_empty()
+    assert_eq!(
+        catalog(&*db, Some("run"), 1).await.unwrap().entries,
+        [] as [(std::string::String, crate::representation::runs::RunLookup); 0]
     );
     db.update(super::super::CONTRACT)
         .value("version", 999_i64)

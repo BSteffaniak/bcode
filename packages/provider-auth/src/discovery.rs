@@ -203,7 +203,10 @@ mod tests {
 
     #[test]
     fn disabled_discovery_does_not_access_missing_root() {
-        assert!(discover(false, Path::new("/nonexistent/bcode-test"), &field()).is_empty());
+        assert_eq!(
+            discover(false, Path::new("/nonexistent/bcode-test"), &field()),
+            [] as [(usize, crate::discovery::CredentialSourceStatus); 0]
+        );
     }
 
     #[test]

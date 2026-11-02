@@ -1660,7 +1660,7 @@ mod tests {
         );
         let mut pending = activity(Vec::new(), true, false);
         pending.finished = false;
-        assert!(reasoning_activity_body(&pending).is_empty());
+        assert_eq!(reasoning_activity_body(&pending), "");
 
         // Nothing has arrived yet: no chrome to explain, and no misleading claim.
         assert!(

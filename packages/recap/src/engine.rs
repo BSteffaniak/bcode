@@ -1133,9 +1133,9 @@ mod tests {
             ..MediaBudget::default()
         };
         let (frames, clips) = select_moments(90_000, &[], &GenerationIntent::default(), &budget);
-        assert!(!frames.is_empty());
+        assert_ne!(frames, [] as [u64; 0]);
         assert!(frames.len() <= budget.max_frames);
-        assert!(!clips.is_empty());
+        assert_ne!(clips, [] as [crate::contracts::TimeRange; 0]);
         assert!(clips.len() <= budget.max_clips);
         assert!(
             clips
@@ -1207,6 +1207,9 @@ mod context_tests {
                 .await
                 .is_err()
         );
-        assert!(document.source.context.participants.is_empty());
+        assert_eq!(
+            document.source.context.participants,
+            [] as [crate::source_context::Participant; 0]
+        );
     }
 }

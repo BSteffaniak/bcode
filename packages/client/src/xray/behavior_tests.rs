@@ -56,7 +56,10 @@ fn declare(envelope: &mut XrayEnvelope, pointer: &str) {
 fn only_declared_attachments_are_resolved_and_verified() {
     let mut event =
         envelope(&serde_json::json!({"tool": {"payload_id": "ordinary"}, "blob": reference()}));
-    assert!(event.payload_references().unwrap().is_empty());
+    assert_eq!(
+        event.payload_references().unwrap(),
+        [] as [bcode_xray::XrayPayloadRef; 0]
+    );
     declare(&mut event, "/blob");
     let refs = event.payload_references().unwrap();
     assert_eq!(refs.len(), 1);

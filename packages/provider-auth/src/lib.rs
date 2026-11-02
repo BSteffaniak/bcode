@@ -2083,7 +2083,10 @@ mod tests {
         assert_eq!(auth.profile.as_deref(), Some("legacy-openai"));
         assert_eq!(auth.scheme.as_deref(), Some("chatgpt"));
         assert!(auth.credentials.is_empty());
-        assert!(!auth.diagnostics.is_empty());
+        assert_ne!(
+            auth.diagnostics,
+            [] as [bcode_model::ProviderAuthDiagnostic; 0]
+        );
 
         let explicit = resolve_provider_request_context(ProviderRequestContextResolution {
             config: &config,
@@ -2582,7 +2585,10 @@ profiles = ["account"]
             &bcode_config::RuntimeAuthSubscriptions::default(),
             |_, _| panic!("empty pool must not acquire profile credentials"),
         );
-        assert!(empty.auth_candidates.is_empty());
+        assert_eq!(
+            empty.auth_candidates,
+            [] as [bcode_model::ProviderAuthCandidate; 0]
+        );
         assert!(empty.auth.is_none());
     }
 
@@ -2597,7 +2603,10 @@ profiles = ["account"]
         });
         assert_eq!(context.auth_profile.as_deref(), Some("missing"));
         assert!(context.auth.is_none());
-        assert!(context.auth_candidates.is_empty());
+        assert_eq!(
+            context.auth_candidates,
+            [] as [bcode_model::ProviderAuthCandidate; 0]
+        );
         assert!(context.env.is_empty());
     }
 

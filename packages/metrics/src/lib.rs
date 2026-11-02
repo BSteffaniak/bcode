@@ -2405,7 +2405,7 @@ mod tests {
             frame.description.as_deref(),
             Some("Total TUI frame duration.")
         );
-        assert!(frame.label_keys.is_empty());
+        assert_eq!(frame.label_keys, [] as [std::string::String; 0]);
         let plugin_work = &descriptors["tui.plugin_visual.work"];
         assert_eq!(plugin_work.unit, None);
         assert_eq!(
@@ -2700,7 +2700,7 @@ mod tests {
 
         assert!(!metrics.is_enabled());
         assert_eq!(metrics.snapshot(), MetricsSnapshot::default());
-        assert!(metrics.report().events.is_empty());
+        assert_eq!(metrics.report().events, [] as [MetricEvent; 0]);
     }
 
     #[test]

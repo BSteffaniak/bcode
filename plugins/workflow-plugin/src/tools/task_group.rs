@@ -2212,7 +2212,10 @@ mod tests {
             .as_object_mut()
             .unwrap()
             .remove("bind_source_activation");
-        assert!(parse(&request).unwrap().reconciliation.is_empty());
+        assert_eq!(
+            parse(&request).unwrap().reconciliation,
+            [] as [bcode_workflow::WorkflowRunGraphReconciliation; 0]
+        );
     }
 
     #[test]
@@ -2737,7 +2740,7 @@ mod tests {
                     bcode_workflow::WorkflowToolCapability::ReadOnly
                 );
             } else {
-                assert!(node.resources.is_empty());
+                assert_eq!(node.resources, [] as [bcode_workflow::ResourceClaim; 0]);
             }
         }
         request["tasks"][0]["resources"][0]["access"] = json!("future");
@@ -2761,7 +2764,7 @@ mod tests {
                 continue;
             };
             if node.kind != NodeKind::Agent {
-                assert!(node.resources.is_empty());
+                assert_eq!(node.resources, [] as [bcode_workflow::ResourceClaim; 0]);
                 continue;
             }
             agents += 1;
@@ -2838,7 +2841,7 @@ mod tests {
                 assert_eq!(config.tool_allowlist, ["filesystem.read"]);
             } else {
                 assert_eq!(config.timeout_ms, 300_000);
-                assert!(config.tool_allowlist.is_empty());
+                assert_eq!(config.tool_allowlist, [] as [std::string::String; 0]);
             }
         }
         request["tasks"][0]["timeout_ms"] = json!(0);

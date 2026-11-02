@@ -4814,7 +4814,10 @@ mod tests {
             })
             .expect("empty diff is a successful materialization");
 
-        assert!(response.materialization.surfaces.is_empty());
+        assert_eq!(
+            response.materialization.surfaces,
+            [] as [bcode_code_review_models::ReviewSurface; 0]
+        );
         assert!(
             response
                 .materialization
@@ -4953,7 +4956,10 @@ mod tests {
                 target,
             })
             .expect("materialize target");
-            assert!(!summary.files.is_empty());
+            assert_ne!(
+                summary.files,
+                [] as [bcode_code_review_models::ReviewFile; 0]
+            );
         }
     }
 
@@ -5093,7 +5099,10 @@ mod tests {
         .expect("list imports");
 
         assert_eq!(listed.records, vec![replacement.record]);
-        assert!(listed.records[0].threads.is_empty());
+        assert_eq!(
+            listed.records[0].threads,
+            [] as [bcode_code_review_models::ExternalReviewThread; 0]
+        );
         assert_eq!(listed.records[0].warnings, vec!["replacement"]);
     }
 
@@ -5230,7 +5239,10 @@ mod tests {
         )
         .expect("bundle");
 
-        assert!(bundle.threads.is_empty());
+        assert_eq!(
+            bundle.threads,
+            [] as [bcode_code_review_models::ReviewBundleThread; 0]
+        );
     }
 
     #[test]
@@ -5438,7 +5450,10 @@ mod tests {
             &config,
         )
         .expect("bundle");
-        assert!(bundle.threads.is_empty());
+        assert_eq!(
+            bundle.threads,
+            [] as [bcode_code_review_models::ReviewBundleThread; 0]
+        );
     }
 
     #[test]

@@ -2958,6 +2958,10 @@ pub(crate) mod tests {
         CorruptApply,
         StaleApply,
         IncompatiblePolicy,
+        #[cfg_attr(
+            not(unix),
+            expect(dead_code, reason = "only Unix-socket IPC readiness tests gate status")
+        )]
         GatedStatus,
     }
 
@@ -3877,8 +3881,14 @@ pub(crate) mod tests {
         state.session_search_enabled = false;
 
         let inventory = list_providers(&state).await;
-        assert!(inventory.providers.is_empty());
-        assert!(inventory.failures.is_empty());
+        assert_eq!(
+            inventory.providers,
+            [] as [bcode_session_search::SessionSearchProviderInfo; 0]
+        );
+        assert_eq!(
+            inventory.failures,
+            [] as [bcode_session_search::SessionSearchProviderFailure; 0]
+        );
 
         let error = search_provider(&state, FAST_PROVIDER_ID, &request())
             .await
@@ -4158,7 +4168,10 @@ pub(crate) mod tests {
         process_dirty_sessions(&state).await;
 
         assert_eq!(APPLY_BATCH_CALLS.load(Ordering::SeqCst), 1);
-        assert!(state.session_search_dirty.snapshot().await.0.is_empty());
+        assert_eq!(
+            state.session_search_dirty.snapshot().await.0,
+            [] as [bcode_session_models::SessionId; 0]
+        );
         drop(state);
     }
 
@@ -5753,7 +5766,7 @@ pub(crate) mod tests {
         let elapsed = started.elapsed();
         let pending = state.session_search_dirty.snapshot().await.0;
         drop(state);
-        assert!(pending.is_empty());
+        assert_eq!(pending, [] as [bcode_session_models::SessionId; 0]);
         let calls = APPLY_BATCH_CALLS.load(Ordering::SeqCst);
         assert!(calls >= sessions);
         println!(
@@ -5792,7 +5805,7 @@ pub(crate) mod tests {
         let pending = state.session_search_dirty.snapshot().await.0;
         drop(state);
         assert_eq!(APPLY_BATCH_CALLS.load(Ordering::SeqCst), 2);
-        assert!(pending.is_empty());
+        assert_eq!(pending, [] as [bcode_session_models::SessionId; 0]);
     }
 
     #[tokio::test]
@@ -5818,7 +5831,7 @@ pub(crate) mod tests {
     async fn dirty_session_queue_stays_empty_without_committed_mutations() {
         let queue = SessionSearchDirtyQueue::default();
         let (sessions, rescan_required) = queue.snapshot().await;
-        assert!(sessions.is_empty());
+        assert_eq!(sessions, [] as [bcode_session_models::SessionId; 0]);
         assert!(!rescan_required);
     }
 
@@ -5862,7 +5875,10 @@ pub(crate) mod tests {
         queue.mark_committed(session_id).await;
         assert_eq!(queue.retry_attempts(session_id).await, 0);
         assert_eq!(queue.take().await, vec![session_id]);
-        assert!(queue.snapshot().await.0.is_empty());
+        assert_eq!(
+            queue.snapshot().await.0,
+            [] as [bcode_session_models::SessionId; 0]
+        );
     }
 
     #[tokio::test]
@@ -5873,7 +5889,10 @@ pub(crate) mod tests {
             queue.mark_retry(session_id).await,
             Some(INCREMENTAL_RETRY_DELAY)
         );
-        assert!(queue.take().await.is_empty());
+        assert_eq!(
+            queue.take().await,
+            [] as [bcode_session_models::SessionId; 0]
+        );
         // The retry schedules a wakeup once the backoff elapses; wait for it instead of sleeping.
         tokio::time::timeout(INCREMENTAL_RETRY_DELAY * 20, queue.notified())
             .await
@@ -5884,6 +5903,7 @@ pub(crate) mod tests {
         assert_eq!(queue.retry_attempts(session_id).await, 0);
     }
 
+    #[allow(clippy::too_many_lines)]
     #[tokio::test]
     async fn all_search_disabled_preserves_complete_session_investigation_boundary() {
         let _guard = SEARCH_TEST_LOCK.lock().await;
@@ -5897,8 +5917,14 @@ pub(crate) mod tests {
         std::fs::create_dir(&working_directory).expect("working directory");
 
         let inventory = list_providers(&state).await;
-        assert!(inventory.providers.is_empty());
-        assert!(inventory.failures.is_empty());
+        assert_eq!(
+            inventory.providers,
+            [] as [bcode_session_search::SessionSearchProviderInfo; 0]
+        );
+        assert_eq!(
+            inventory.failures,
+            [] as [bcode_session_search::SessionSearchProviderFailure; 0]
+        );
 
         let session = state
             .sessions
@@ -6103,7 +6129,10 @@ pub(crate) mod tests {
             serde_json::to_vec(&response).expect("terminal response re-encodes"),
             terminal
         );
-        assert!(response.hits.is_empty());
+        assert_eq!(
+            response.hits,
+            [] as [bcode_session_search::SessionSearchHit; 0]
+        );
         assert_eq!(response.providers.len(), 0);
         assert_eq!(response.failures.len(), 1);
         assert_eq!(

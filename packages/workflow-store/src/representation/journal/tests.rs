@@ -320,12 +320,12 @@ async fn rollback_opt_in_filter_and_keyset_pages_are_truthful() {
         CoverageOrigin::NotEnabled
     );
     graph(&*db, "independent").await;
-    assert!(
+    assert_eq!(
         page(&*db, "independent", 0, None, 1)
             .await
             .unwrap()
-            .observations
-            .is_empty()
+            .observations,
+        [] as [crate::representation::journal::TransitionObservation; 0]
     );
     let tx = db
         .begin_transaction_with_mode(TransactionMode::Immediate)
@@ -468,6 +468,7 @@ async fn independent_writer_connection_emits_without_journal_api() {
     assert_eq!(observed.observations[0].operation, "insert");
 }
 
+#[allow(clippy::too_many_lines)]
 #[tokio::test]
 async fn admission_opt_in_is_atomic_and_idempotent_without_backfill() {
     let (_temp, db) = fixture().await;
@@ -502,7 +503,10 @@ async fn admission_opt_in_is_atomic_and_idempotent_without_backfill() {
         .await
         .unwrap();
     assert_eq!(default_page.origin, CoverageOrigin::NotEnabled);
-    assert!(default_page.observations.is_empty());
+    assert_eq!(
+        default_page.observations,
+        [] as [crate::representation::journal::TransitionObservation; 0]
+    );
     assert!(
         super::super::admit_registered_observed(&*db, &default_request, &definition, true)
             .await

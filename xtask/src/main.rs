@@ -2352,15 +2352,15 @@ fn create_zip_archive(archive: &Path, staging_dir: &Path) -> Result<()> {
 }
 
 fn archive_file_mode(path: &Path) -> Result<u32> {
+    let permissions = path.metadata()?.permissions();
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt as _;
-        Ok(path.metadata()?.permissions().mode() & 0o777)
+        Ok(permissions.mode() & 0o777)
     }
     #[cfg(not(unix))]
     {
-        let _ = path;
-        Ok(0o644)
+        Ok(if permissions.readonly() { 0o444 } else { 0o644 })
     }
 }
 

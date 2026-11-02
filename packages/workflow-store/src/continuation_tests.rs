@@ -280,7 +280,10 @@ fn continuation_stops_early_and_rejects_success() {
             RunStatus::Completed
         );
         assert!(store.continuation_source(&run.run_id).is_err());
-        assert!(store.pending_activations(100).unwrap().is_empty());
+        assert_eq!(
+            store.pending_activations(100).unwrap(),
+            [] as [crate::PendingActivation; 0]
+        );
     }
 }
 
@@ -335,7 +338,10 @@ fn continuation_failed_admission_rolls_back_and_duplicate_ignores_later_state() 
             .unwrap()
     );
     assert_eq!(store.run_summary(&run.run_id).unwrap(), before);
-    assert!(store.pending_activations(100).unwrap().is_empty());
+    assert_eq!(
+        store.pending_activations(100).unwrap(),
+        [] as [crate::PendingActivation; 0]
+    );
 }
 
 #[test]

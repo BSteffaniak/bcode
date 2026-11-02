@@ -67,7 +67,10 @@ async fn acquisition_facts_are_atomic_idempotent_and_missing_time_fails_closed()
     assert!(!page_in(&*tx, "leases", 1).await.unwrap().complete);
     tx.rollback().await.unwrap();
     let tx = db.begin_transaction().await.unwrap();
-    assert!(page_in(&*tx, "leases", 2).await.unwrap().leases.is_empty());
+    assert_eq!(
+        page_in(&*tx, "leases", 2).await.unwrap().leases,
+        [] as [bcode_workflow::WorkflowResourceLease; 0]
+    );
     tx.commit().await.unwrap();
     let tx = db
         .begin_transaction_with_mode(TransactionMode::Immediate)
@@ -85,6 +88,9 @@ async fn acquisition_facts_are_atomic_idempotent_and_missing_time_fails_closed()
     super::super::release(&*tx, "leases", &dispatch)
         .await
         .unwrap();
-    assert!(page_in(&*tx, "leases", 2).await.unwrap().leases.is_empty());
+    assert_eq!(
+        page_in(&*tx, "leases", 2).await.unwrap().leases,
+        [] as [bcode_workflow::WorkflowResourceLease; 0]
+    );
     tx.rollback().await.unwrap();
 }

@@ -165,7 +165,7 @@ mod tests {
         {
             let config: bcode_workflow::WorkflowPromptConfiguration =
                 serde_json::from_value(node.configuration.clone()).unwrap();
-            assert!(!config.tool_allowlist.is_empty());
+            assert_ne!(config.tool_allowlist, [] as [std::string::String; 0]);
             assert!(
                 !config
                     .tool_allowlist
@@ -375,7 +375,7 @@ mod tests {
                     {
                         let config: bcode_workflow::WorkflowPromptConfiguration =
                             serde_json::from_value(node.configuration.clone()).unwrap();
-                        assert!(!config.tool_allowlist.is_empty());
+                        assert_ne!(config.tool_allowlist, [] as [std::string::String; 0]);
                         assert!(
                             !config
                                 .tool_allowlist

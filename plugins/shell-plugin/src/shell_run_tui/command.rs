@@ -524,7 +524,13 @@ mod tests {
                             .all(|line| line.width() <= usize::from(width))
                     );
                     if width == 0 {
-                        assert!(projected.selection.is_empty());
+                        assert_eq!(
+                            projected.selection,
+                            [] as [(
+                                usize,
+                                bcode_plugin_models::tui_selection::PluginTuiSelectionRow
+                            ); 0]
+                        );
                         continue;
                     }
                     assert_eq!(declared_copy(&projected), source);

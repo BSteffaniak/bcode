@@ -209,8 +209,11 @@ mod tests {
         );
         assert_eq!(rows[0].spans[0].style.fg, Some(Color::Magenta));
         assert_eq!(rows[0].spans[1].style.fg, Some(Color::Green));
-        assert!(output.actions.is_empty());
-        assert!(output.images.is_empty());
+        assert_eq!(
+            output.actions,
+            [] as [bcode_tui_components::transcript::actions::TranscriptActionRegion; 0]
+        );
+        assert_eq!(output.images, [] as [bmux_tui::image::ImagePlacement; 0]);
     }
 
     #[test]

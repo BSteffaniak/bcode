@@ -324,7 +324,7 @@ mod tests {
                     .map(|record| record.table)
                     .collect::<Vec<_>>()
             );
-            assert!(!row.migration_step_ids.is_empty());
+            assert_ne!(row.migration_step_ids, [] as [&str; 0]);
             let plan = plan_writer_epoch_migration(row.source_writer_epoch).expect("writer plan");
             assert_eq!(plan.target_writer_epoch, CURRENT_WRITER_EPOCH);
             assert_eq!(
@@ -431,7 +431,10 @@ mod tests {
     #[test]
     fn current_writer_has_an_empty_plan() {
         let plan = plan_writer_epoch_migration(CURRENT_WRITER_EPOCH).expect("current plan");
-        assert!(plan.steps.is_empty());
+        assert_eq!(
+            plan.steps,
+            [] as [crate::inventory::MigrationStepDescriptor; 0]
+        );
     }
 
     #[test]

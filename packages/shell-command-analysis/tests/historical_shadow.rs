@@ -215,11 +215,17 @@ async fn structured_history_reader_filters_without_mutating_storage() {
 async fn historical_reader_preserves_missing_and_invalid_files() {
     let directory = tempfile::tempdir().unwrap();
     let missing = directory.path().join("missing.db");
-    assert!(shell_sources(&missing).await.is_empty());
+    assert_eq!(
+        shell_sources(&missing).await,
+        [] as [std::string::String; 0]
+    );
     assert!(!missing.exists());
     let invalid = directory.path().join("invalid.db");
     std::fs::write(&invalid, b"not a database").unwrap();
-    assert!(shell_sources(&invalid).await.is_empty());
+    assert_eq!(
+        shell_sources(&invalid).await,
+        [] as [std::string::String; 0]
+    );
     assert_eq!(std::fs::read(&invalid).unwrap(), b"not a database");
 }
 

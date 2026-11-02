@@ -371,7 +371,7 @@ mod tests {
             include_str!("../../../../../docs/tui-keybindings.md"),
             include_str!("../../../../../docs/plugins.md"),
         ] {
-            assert!(!markdown.trim().is_empty());
+            assert_ne!(markdown.trim(), "");
         }
     }
 }

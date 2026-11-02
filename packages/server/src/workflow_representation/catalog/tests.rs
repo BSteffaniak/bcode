@@ -20,7 +20,10 @@ async fn ordinary_catalog_returns_explicit_basic_page_when_extension_installed()
     let result = basic_view(&state, &request).await;
     drop(state);
     let page = result.unwrap().unwrap();
-    assert!(page.runs.is_empty());
+    assert_eq!(
+        page.runs,
+        [] as [bcode_workflow_view_models::WorkflowRunListItem; 0]
+    );
     assert!(!page.has_more);
     let availability = page.basic_discovery.unwrap();
     assert!(!availability.requested_query_applied);

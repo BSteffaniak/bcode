@@ -443,7 +443,10 @@ mod tests {
         .unwrap();
         assert!(verify_columns(db, "workflow_recovery_barriers", &["absent_column"]).is_err());
         assert!(verify_columns(db, "absent_table", &["run_id"]).is_err());
-        assert!(store.list_runs(10).unwrap().is_empty());
+        assert_eq!(
+            store.list_runs(10).unwrap(),
+            [] as [bcode_workflow::WorkflowRunSummary; 0]
+        );
     }
 
     #[test]

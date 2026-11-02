@@ -43,7 +43,7 @@ fn queue_recovery_is_session_level_secret_safe_and_preserves_unavailable_actions
     ] {
         let mut snapshot = SessionViewSnapshot::empty();
         snapshot.runtime.submission_queue = Some(blocked_queue(blocker));
-        assert!(snapshot.transcript.items.is_empty());
+        assert_eq!(snapshot.transcript.items, [] as [TranscriptViewItem; 0]);
         let recovery = snapshot
             .runtime
             .queue_recovery()
@@ -1285,7 +1285,7 @@ fn runtime_state_changes_patch_without_transcript_operations_or_reset() {
 
     let patch = SessionViewPatch::between_snapshots(&base, &next);
     assert!(patch.reset.is_none());
-    assert!(patch.transcript.is_empty());
+    assert_eq!(patch.transcript, [] as [TranscriptViewPatchOp; 0]);
     assert_eq!(next.transcript.revision, patch.revision);
     assert_eq!(patch.latest_sequence, Some(2));
     assert_eq!(patch.runtime.as_ref(), Some(&next.runtime));
@@ -1489,7 +1489,7 @@ fn snapshot_patch_resets_when_non_transcript_state_changes() {
 
     let patch = SessionViewPatch::between_snapshots(&base, &next);
     assert_eq!(patch.reset.as_deref(), Some(&next));
-    assert!(patch.transcript.is_empty());
+    assert_eq!(patch.transcript, [] as [TranscriptViewPatchOp; 0]);
 
     base.apply_patch(&patch).expect("reset patch applies");
     assert_eq!(base, next);

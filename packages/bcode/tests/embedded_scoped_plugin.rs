@@ -595,7 +595,6 @@ async fn embedded_filesystem_active_cancellation_preserves_committed_outcome() {
     assert_eq!(std::fs::read_dir(directory.path()).unwrap().count(), 2);
 }
 
-#[cfg(unix)]
 async fn assert_direct_batch_overlaps() {
     let barrier = Arc::new(tokio::sync::Barrier::new(2));
     let handler_barrier = Arc::clone(&barrier);
@@ -639,7 +638,6 @@ async fn assert_direct_batch_overlaps() {
     assert!(output.results.iter().all(Result::is_ok));
 }
 
-#[cfg(unix)]
 #[derive(Debug)]
 struct FutureRemoteInvoker {
     admission: Option<Arc<tokio::sync::Semaphore>>,
@@ -647,7 +645,6 @@ struct FutureRemoteInvoker {
     maximum: AtomicUsize,
 }
 
-#[cfg(unix)]
 impl FutureRemoteInvoker {
     fn concurrent() -> Arc<Self> {
         Arc::new(Self {
@@ -670,7 +667,6 @@ impl FutureRemoteInvoker {
     }
 }
 
-#[cfg(unix)]
 impl ToolInvoker for FutureRemoteInvoker {
     fn prepare_tool<'a>(
         &'a self,
@@ -712,7 +708,6 @@ impl ToolInvoker for FutureRemoteInvoker {
     }
 }
 
-#[cfg(unix)]
 async fn assert_future_remote_batch_semantics(invoker: Arc<FutureRemoteInvoker>, maximum: usize) {
     let calls = [
         ToolCall {
@@ -909,12 +904,17 @@ async fn explicit_artifact_root_enables_shell_recording_updates() {
     }
 }
 
-#[cfg(unix)]
 #[tokio::test]
-async fn direct_static_dynamic_and_future_remote_adapters_share_scheduler_semantics() {
+async fn direct_and_future_remote_adapters_share_scheduler_semantics() {
     assert_direct_batch_overlaps().await;
-    assert_reentrant_shell_batch_overlaps(static_shell_runtime()).await;
-    assert_reentrant_shell_batch_overlaps(dynamic_shell_runtime()).await;
     assert_future_remote_batch_semantics(FutureRemoteInvoker::concurrent(), 2).await;
     assert_future_remote_batch_semantics(FutureRemoteInvoker::non_reentrant(), 1).await;
+}
+
+/// The overlap probe is a POSIX shell script.
+#[cfg(unix)]
+#[tokio::test]
+async fn static_and_dynamic_shell_adapters_share_scheduler_semantics() {
+    assert_reentrant_shell_batch_overlaps(static_shell_runtime()).await;
+    assert_reentrant_shell_batch_overlaps(dynamic_shell_runtime()).await;
 }

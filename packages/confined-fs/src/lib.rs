@@ -375,6 +375,20 @@ impl Dir {
         sys::create_dir_at(&self.file, name)
     }
 
+    /// Creates a child directory accessible only to the current user and the
+    /// platform's administrators. Files created inside it inherit that restriction
+    /// on Windows.
+    ///
+    /// # Errors
+    ///
+    /// * The name is not a single valid component.
+    /// * The entry already exists, or the directory or its access control cannot be
+    ///   created.
+    pub fn create_private_dir(&self, name: &OsStr) -> io::Result<()> {
+        validate_name(name)?;
+        sys::create_private_dir_at(&self.file, name)
+    }
+
     /// Removes a child file or link without following it.
     ///
     /// # Errors

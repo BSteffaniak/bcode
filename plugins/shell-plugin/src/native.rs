@@ -4172,7 +4172,7 @@ mod tests {
             }],
         ));
 
-        assert!(response.payload.is_empty());
+        assert_eq!(response.payload, [] as [u8; 0]);
         let error = response.error.expect("invalid preparation error");
         assert_eq!(error.code, "invalid_preparation");
         assert!(error.message.contains("must be absolute"));
@@ -5084,7 +5084,10 @@ mod tests {
                 )
             })
             .collect::<Vec<_>>();
-        assert!(!artifact_updates.is_empty());
+        assert_ne!(
+            artifact_updates,
+            [] as [(u64, u64, bool, std::string::String); 0]
+        );
         assert!(
             artifact_updates
                 .windows(2)
@@ -5425,17 +5428,17 @@ mod tests {
     fn prelude_gate_suppresses_until_marker() {
         let mut filter = PreludeGate::new(vec!["__MARK__".to_string()]);
 
-        assert!(filter.write(b"direnv: loading\n").is_empty());
+        assert_eq!(filter.write(b"direnv: loading\n"), [] as [u8; 0]);
         assert_eq!(filter.write(b"__MARK__\nhello\n"), b"hello\n");
         assert_eq!(filter.write(b"world\n"), b"world\n");
-        assert!(filter.finish().is_empty());
+        assert_eq!(filter.finish(), [] as [u8; 0]);
     }
 
     #[test]
     fn prelude_gate_handles_split_marker() {
         let mut filter = PreludeGate::new(vec!["__MARK__".to_string()]);
 
-        assert!(filter.write(b"noise\n__MA").is_empty());
+        assert_eq!(filter.write(b"noise\n__MA"), [] as [u8; 0]);
         assert_eq!(filter.write(b"RK__\r\noutput"), b"output");
     }
 
@@ -5443,7 +5446,7 @@ mod tests {
     fn prelude_gate_preserves_output_without_marker() {
         let mut filter = PreludeGate::new(vec!["__MARK__".to_string()]);
 
-        assert!(filter.write(b"direnv error\n").is_empty());
+        assert_eq!(filter.write(b"direnv error\n"), [] as [u8; 0]);
         assert_eq!(filter.finish(), b"direnv error\n");
     }
 
@@ -5452,7 +5455,7 @@ mod tests {
         let mut filter = PreludeGate::new(Vec::new());
 
         assert_eq!(filter.write(b"hello"), b"hello");
-        assert!(filter.finish().is_empty());
+        assert_eq!(filter.finish(), [] as [u8; 0]);
     }
 
     #[test]

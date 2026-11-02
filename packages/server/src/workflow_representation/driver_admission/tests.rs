@@ -107,7 +107,10 @@ async fn stale_authority_cannot_record_failure_or_change_preparation() {
     )
     .await
     .unwrap();
-    assert!(observations.is_empty());
+    assert_eq!(
+        observations,
+        [] as [bcode_workflow_store::representation::admission_observation::Observation; 0]
+    );
     let after = bcode_workflow_store::representation::attempts::owner_boundary::prepared(
         &db,
         &request.activation.run_id,

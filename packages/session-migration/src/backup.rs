@@ -1157,7 +1157,7 @@ mod tests {
         assert_eq!(diagnosis.manifest.source_writer_epoch, 2);
         assert_eq!(diagnosis.manifest.target_writer_epoch, 4);
         assert_eq!(diagnosis.manifest.created_at_ms, 7);
-        assert!(diagnosis.manifest.operation_id.is_empty());
+        assert_eq!(diagnosis.manifest.operation_id, "");
     }
 
     #[test]
@@ -1300,10 +1300,9 @@ mod tests {
             u64::try_from(large.len() + 5).expect("bytes")
         );
         assert_eq!(fs::read(destination.join("large")).expect("large"), large);
-        assert!(
-            fs::read(destination.join("empty"))
-                .expect("empty")
-                .is_empty()
+        assert_eq!(
+            fs::read(destination.join("empty")).expect("empty"),
+            [] as [u8; 0]
         );
     }
 

@@ -64,7 +64,7 @@ async fn observed_failure_does_not_conceal_nonresident_unknown() {
         observed.states,
         vec![SessionActivityState::Failed, SessionActivityState::Unknown]
     );
-    assert!(!issues.is_empty());
+    assert_ne!(issues, [] as [std::string::String; 0]);
     assert!(no_scheduler);
 }
 
@@ -100,7 +100,7 @@ async fn complete_empty_evidence_requires_resident_idle_scheduler() {
     let observed = observe_activity(&state, &summary, &mut issues).await;
     drop(state);
     assert_eq!(observed.states, vec![SessionActivityState::Idle]);
-    assert!(issues.is_empty());
+    assert_eq!(issues, [] as [std::string::String; 0]);
 }
 
 async fn owned_terminal_fixture(

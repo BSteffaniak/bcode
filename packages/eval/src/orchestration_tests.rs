@@ -47,7 +47,7 @@ fn orchestration_fixtures_calibrate_real_judges_with_positive_and_negative_artif
         "interactive-acceptance.toml",
     ] {
         let suite = load_suite(suite_dir.join(manifest)).unwrap();
-        assert!(!suite.cases.is_empty());
+        assert_ne!(suite.cases, [] as [bcode_eval_models::EvalCase; 0]);
         for case in &suite.cases {
             let temp = tempfile::tempdir().unwrap();
             let workspace = prepare_workspace(&suite, &suite_dir, temp.path(), case).unwrap();

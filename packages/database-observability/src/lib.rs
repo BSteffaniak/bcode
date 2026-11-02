@@ -1034,12 +1034,12 @@ mod tests {
             .expect("temporary storage");
         let integrity = database.sqlite_integrity_check().await.expect("integrity");
         assert_eq!(integrity.len(), 1);
-        assert!(
+        assert_eq!(
             database
                 .sqlite_foreign_key_check()
                 .await
-                .expect("foreign keys")
-                .is_empty()
+                .expect("foreign keys"),
+            [] as [switchy_database::Row; 0]
         );
         assert_eq!(
             database
@@ -1322,12 +1322,9 @@ mod tests {
                 .await
                 .expect("column exists")
         );
-        assert!(
-            !database
-                .list_tables()
-                .await
-                .expect("list tables")
-                .is_empty()
+        assert_ne!(
+            database.list_tables().await.expect("list tables"),
+            [] as [std::string::String; 0]
         );
         assert!(
             database
@@ -1336,12 +1333,12 @@ mod tests {
                 .expect("table info")
                 .is_some()
         );
-        assert!(
-            !database
+        assert_ne!(
+            database
                 .get_table_columns("items")
                 .await
-                .expect("table columns")
-                .is_empty()
+                .expect("table columns"),
+            [] as [switchy_database::schema::ColumnInfo; 0]
         );
         assert_eq!(
             database
@@ -1438,7 +1435,7 @@ mod tests {
             .iter()
             .filter(|event| event.name == "database.operation.timeline")
             .collect::<Vec<_>>();
-        assert!(!timeline_events.is_empty());
+        assert_ne!(timeline_events, [] as [&bcode_metrics::MetricEvent; 0]);
         for event in &timeline_events {
             assert_eq!(
                 event.labels.get("database_role").map(String::as_str),

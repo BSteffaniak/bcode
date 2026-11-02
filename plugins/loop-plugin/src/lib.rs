@@ -4222,7 +4222,7 @@ mod tests {
                 configuration.tool_capability,
                 bcode_workflow::WorkflowToolCapability::Mutating
             );
-            assert!(configuration.tool_allowlist.is_empty());
+            assert_eq!(configuration.tool_allowlist, [] as [std::string::String; 0]);
         }
     }
 
@@ -4725,7 +4725,7 @@ mod tests {
     #[test]
     fn commands_cover_the_loop_lifecycle() {
         let commands = commands();
-        assert!(!commands.is_empty());
+        assert_ne!(commands, [] as [bcode_command::CommandContribution; 0]);
         assert!(commands.iter().all(|command| {
             command.execution == bcode_command::CommandExecution::Immediate
                 && command.surfaces.contains(&CommandSurface::Slash)
@@ -4889,13 +4889,9 @@ mod tests {
         if let SetupDiscovery::Ready(catalog) = &mut surface.judgement_catalog {
             catalog.providers[0].environment_available = true;
         }
-        assert!(
-            surface
-                .selected_judgement()
-                .unwrap()
-                .unwrap()
-                .auth_profile
-                .is_empty()
+        assert_eq!(
+            surface.selected_judgement().unwrap().unwrap().auth_profile,
+            ""
         );
         surface.judgement_enabled = EvaluationMode::Standard;
         assert!(surface.selected_judgement().unwrap().is_none());
@@ -5289,7 +5285,7 @@ mod tests {
 
     fn verify_goal_second_round_workers(store: &mut bcode_workflow_store::WorkflowStore) {
         let workers = store.pending_activations(10).unwrap();
-        assert!(!workers.is_empty());
+        assert_ne!(workers, [] as [bcode_workflow_store::PendingActivation; 0]);
         assert!(
             workers
                 .iter()
@@ -5500,7 +5496,7 @@ mod tests {
                 assert_eq!(pending.len(), 1);
                 assert_eq!(pending[0].node_id, "loop.implementation");
             } else {
-                assert!(pending.is_empty());
+                assert_eq!(pending, [] as [bcode_workflow_store::PendingActivation; 0]);
                 assert_blocker_resolution_researches(&mut store, &input);
             }
         }
@@ -5656,7 +5652,10 @@ mod tests {
             store
                 .settle_pending_control_nodes("blocked-loop", 20, now)
                 .expect("idle");
-            assert!(store.pending_activations(10).unwrap().is_empty());
+            assert_eq!(
+                store.pending_activations(10).unwrap(),
+                [] as [bcode_workflow_store::PendingActivation; 0]
+            );
             let waiting = store.waiting_activations("blocked-loop", 10).unwrap();
             assert_eq!(waiting.len(), 1);
             assert_eq!(
@@ -5747,7 +5746,10 @@ mod tests {
             resolution.run_status,
             bcode_workflow_store::RunStatus::Failed
         );
-        assert!(store.pending_activations(10).unwrap().is_empty());
+        assert_eq!(
+            store.pending_activations(10).unwrap(),
+            [] as [bcode_workflow_store::PendingActivation; 0]
+        );
         assert!(
             store
                 .resolve_approval(
@@ -5759,7 +5761,10 @@ mod tests {
                 )
                 .is_err()
         );
-        assert!(store.pending_activations(10).unwrap().is_empty());
+        assert_eq!(
+            store.pending_activations(10).unwrap(),
+            [] as [bcode_workflow_store::PendingActivation; 0]
+        );
     }
 
     fn verify_blocked_loop_resolution(
@@ -6133,7 +6138,7 @@ mod tests {
         assert_eq!(implementation.iteration, 3);
         assert_eq!(implementation.external_blocker, LoopExternalBlocker::None);
         assert!(!implementation.condition_met);
-        assert!(implementation.evidence.is_empty());
+        assert_eq!(implementation.evidence, [] as [std::string::String; 0]);
 
         let input = LoopWorkflowInput {
             implementation_prompt: "continue implementation".to_string(),
@@ -6220,7 +6225,7 @@ mod tests {
             PluginTuiAction::Redraw
         );
         assert_eq!(surface.judgement_threshold, 95);
-        assert!(surface.evaluation.buffer().text().is_empty());
+        assert_eq!(surface.evaluation.buffer().text(), "");
     }
 
     #[test]

@@ -544,7 +544,10 @@ fn keyboard_validation_radio_custom_checkbox_and_submission() {
         &mut controller,
         &DefaultQuestionInput,
     );
-    assert!(controller.snapshot().selected_option_indices[0].is_empty());
+    assert_eq!(
+        controller.snapshot().selected_option_indices[0],
+        [] as [usize; 0]
+    );
     form.handle_event(&key(KeyCode::Tab), &mut controller, &DefaultQuestionInput);
     form.handle_event(&key(KeyCode::Space), &mut controller, &DefaultQuestionInput);
     form.handle_event(&key(KeyCode::Tab), &mut controller, &DefaultQuestionInput);

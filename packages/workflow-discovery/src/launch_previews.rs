@@ -468,12 +468,12 @@ mod tests {
             .unwrap();
         assert_eq!(next.items, vec![preview]);
         assert!(!next.has_more);
-        assert!(
+        assert_eq!(
             spool
                 .bounded_page(Some(("same", "b")), 1, MAX_PREVIEW_PAGE_BYTES, &|| false)
                 .unwrap()
-                .items
-                .is_empty()
+                .items,
+            [] as [bcode_workflow::WorkflowLaunchCatalogItem; 0]
         );
     }
 
@@ -482,7 +482,10 @@ mod tests {
         let spool = LaunchPreviewSpool::new().unwrap();
         let path = spool.directory.path().to_path_buf();
         assert!(path.join("previews.sqlite").is_file());
-        assert!(spool.first(1).unwrap().is_empty());
+        assert_eq!(
+            spool.first(1).unwrap(),
+            [] as [bcode_workflow::WorkflowLaunchCatalogItem; 0]
+        );
         assert!(spool.first(0).is_err());
         assert!(spool.first(crate::MAX_DISCOVERY_RESULTS + 1).is_err());
         drop(spool);

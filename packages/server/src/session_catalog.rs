@@ -1667,7 +1667,10 @@ mod tests {
             .page_with_scope(&state, scope.clone(), query.clone(), None, 1)
             .await
             .unwrap();
-        assert!(page.sessions.is_empty());
+        assert_eq!(
+            page.sessions,
+            [] as [bcode_session_models::SessionSummary; 0]
+        );
         let cursor = page.next_cursor.unwrap();
         assert!(
             state
@@ -1700,7 +1703,10 @@ mod tests {
             .page_with_scope(&state, scope.clone(), query, Some(cursor), 1)
             .await
             .unwrap();
-        assert!(next.sessions.is_empty());
+        assert_eq!(
+            next.sessions,
+            [] as [bcode_session_models::SessionSummary; 0]
+        );
         let one = state
             .session_catalog
             .page_with_scope(
@@ -1845,12 +1851,9 @@ mod tests {
             page.catalog_status,
             bcode_session_models::SessionCatalogStatus::Degraded(_)
         ));
-        assert!(
-            state
-                .session_catalog
-                .ambiguous_location_ids(id)
-                .await
-                .is_empty()
+        assert_eq!(
+            state.session_catalog.ambiguous_location_ids(id).await,
+            [] as [std::string::String; 0]
         );
         assert_eq!(super::exact_location_claims(&state, id).unwrap().len(), 2);
         assert!(
@@ -2011,7 +2014,7 @@ mod tests {
         let source = inner.sources[&super::native_source_key()].clone();
         drop(inner);
         assert_eq!(source.generation, 3);
-        assert!(source.sessions().is_empty());
+        assert_eq!(source.sessions(), []);
         assert!(matches!(
             source.state,
             super::SourceCacheState::Failed { .. }
@@ -2028,11 +2031,7 @@ mod tests {
             )
             .await;
         let inner = catalog.inner.lock().await;
-        assert!(
-            inner.sources[&super::native_source_key()]
-                .sessions()
-                .is_empty()
-        );
+        assert_eq!(inner.sources[&super::native_source_key()].sessions(), []);
         drop(inner);
     }
 
@@ -2330,11 +2329,7 @@ mod tests {
                 inner.sources[&super::native_source_key()].state,
                 super::SourceCacheState::Empty
             ));
-            assert!(
-                inner.sources[&super::native_source_key()]
-                    .sessions()
-                    .is_empty()
-            );
+            assert_eq!(inner.sources[&super::native_source_key()].sessions(), []);
             drop(inner);
             let mut revisions = catalog.subscribe();
             catalog
@@ -2358,11 +2353,7 @@ mod tests {
             .await
             .expect("invalidated discovery must complete a fresh load");
             let inner = catalog.inner.lock().await;
-            assert!(
-                inner.sources[&super::native_source_key()]
-                    .sessions()
-                    .is_empty()
-            );
+            assert_eq!(inner.sources[&super::native_source_key()].sessions(), []);
             drop(inner);
             drop(state);
         }
@@ -2413,10 +2404,9 @@ mod tests {
                 Some(generation),
             )
             .await;
-        assert!(
-            catalog.inner.lock().await.sources[&super::native_source_key()]
-                .sessions()
-                .is_empty()
+        assert_eq!(
+            catalog.inner.lock().await.sources[&super::native_source_key()].sessions(),
+            []
         );
     }
     #[tokio::test]
@@ -2504,11 +2494,11 @@ mod tests {
     #[tokio::test]
     async fn import_enumeration_retries_errors_and_cancelled_initialization() {
         let catalog = SessionCatalog::default();
-        assert!(
+        assert_eq!(
             catalog
                 .import_source_ids("provider", async { Err("offline".to_owned()) })
-                .await
-                .is_empty()
+                .await,
+            [] as [std::string::String; 0]
         );
         {
             let pending = catalog.import_source_ids("provider", std::future::pending());
@@ -2709,7 +2699,10 @@ mod tests {
         .expect("cold catalog listing must complete")
         .unwrap();
         let first_useful = started.elapsed();
-        assert!(!snapshot.sessions.is_empty());
+        assert_ne!(
+            snapshot.sessions,
+            [] as [bcode_session_models::SessionSummary; 0]
+        );
         assert!(snapshot.sessions.len() <= expected.len());
         for session in &snapshot.sessions {
             assert_eq!(expected.get(&session.id), Some(&session.name));
@@ -2900,10 +2893,9 @@ mod tests {
         std::fs::remove_file(&alias).unwrap();
         std::os::unix::fs::symlink(&second, &alias).unwrap();
         let inner = catalog.inner.lock().await;
-        assert!(
-            super::snapshot_locked(&inner, &first.canonicalize().unwrap(), true)
-                .sessions
-                .is_empty()
+        assert_eq!(
+            super::snapshot_locked(&inner, &first.canonicalize().unwrap(), true).sessions,
+            [] as [bcode_session_models::SessionSummary; 0]
         );
         assert_eq!(
             super::snapshot_locked(&inner, &second.canonicalize().unwrap(), true)
@@ -2928,7 +2920,10 @@ mod tests {
         assert_eq!(primary.sessions_root, root.path());
         assert_eq!(primary.location_id, "retained-location");
         state.daemon_status.state_location_id = None;
-        assert!(super::native_locations(&state).is_empty());
+        assert_eq!(
+            super::native_locations(&state),
+            [] as [super::NativeLocation; 0]
+        );
         drop(state);
     }
     use super::{
@@ -3004,7 +2999,10 @@ mod tests {
         let snapshot = super::snapshot_locked(&inner, &session.working_directory, true);
         drop(inner);
         assert_eq!(snapshot.revision, 4);
-        assert!(snapshot.sessions.is_empty());
+        assert_eq!(
+            snapshot.sessions,
+            [] as [bcode_session_models::SessionSummary; 0]
+        );
     }
 
     #[tokio::test]

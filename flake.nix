@@ -18,7 +18,7 @@
         pkgs = import nixpkgs { inherit system; };
         # Keep the native formatter crates and development tools on a compatible toolchain.
         rustc =
-          assert pkgs.lib.versionAtLeast pkgs.rustc.version "1.97";
+          assert pkgs.lib.versionAtLeast pkgs.rustc.version "1.99";
           pkgs.rustc;
       in
       {
@@ -37,7 +37,7 @@
             openssl
             fish
           ])
-          ++ pkgs.lib.optionals pkgs.stdenv.isLinux (
+          ++ pkgs.lib.optionals pkgs.stdenv.hostPlatform.isLinux (
             with pkgs;
             [
               alsa-lib

@@ -120,12 +120,12 @@ impl WorkflowWatch {
                 let _ = admission_tx.send(Ok(admitted));
                 let capture = until(
                     tokio::time::Instant::now() + Duration::from_secs(5),
-                    ExecutionCapture::from_ready(
+                    Box::pin(ExecutionCapture::from_ready(
                         connection,
                         ready,
                         &directory,
                         CaptureLimits::default(),
-                    ),
+                    )),
                 )
                 .await;
                 let Ok(Ok(mut capture)) = capture else {

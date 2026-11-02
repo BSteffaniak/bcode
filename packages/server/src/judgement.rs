@@ -1174,7 +1174,10 @@ mod observation_tests {
             judgement::TriggerDisposition::NotApplicable
         );
         assert!(snapshot.operations[0].inference_complete);
-        assert!(snapshot.operations[0].inference.is_empty());
+        assert_eq!(
+            snapshot.operations[0].inference,
+            [] as [bcode_model::judgement::OptionalOperationObservation; 0]
+        );
         let pending = turn.begin_operation(
             judgement::Feature::ToolResultTriage,
             judgement::TriggerDisposition::Triggered,
@@ -1321,7 +1324,10 @@ mod observation_tests {
         turn.close(Terminal::Completed, &ALL);
         let snapshot: judgement::TurnJudgementObservation =
             serde_json::from_str(&store.snapshot_json(session, "details").unwrap()).unwrap();
-        assert!(snapshot.passive_aggregates.is_empty());
+        assert_eq!(
+            snapshot.passive_aggregates,
+            [] as [bcode_model::judgement::PassiveOperationAggregate; 0]
+        );
         assert_eq!(snapshot.omitted, 1);
         assert_eq!(snapshot.accounting.unwrap().omitted_operations, 1);
         assert!(!snapshot.complete);
@@ -1336,7 +1342,10 @@ mod observation_tests {
         let snapshot: judgement::TurnJudgementObservation =
             serde_json::from_str(&store.snapshot_json(session, "pending-passive").unwrap())
                 .unwrap();
-        assert!(snapshot.passive_aggregates.is_empty());
+        assert_eq!(
+            snapshot.passive_aggregates,
+            [] as [bcode_model::judgement::PassiveOperationAggregate; 0]
+        );
         assert_eq!(snapshot.omitted, 1);
         assert!(!snapshot.complete);
         let turn = store.begin(session, "late").unwrap();
@@ -1448,7 +1457,10 @@ mod observation_tests {
         let snapshot: judgement::TurnJudgementObservation =
             serde_json::from_str(&store.snapshot_json(session, "cancelled").unwrap()).unwrap();
         assert!(!snapshot.complete);
-        assert!(snapshot.operations[0].inference.is_empty());
+        assert_eq!(
+            snapshot.operations[0].inference,
+            [] as [bcode_model::judgement::OptionalOperationObservation; 0]
+        );
         let turn = store.begin(session, "overflow").unwrap();
         for _ in 0..65 {
             turn.begin_operation(Feature::ToolResultTriage, Trigger::Triggered)

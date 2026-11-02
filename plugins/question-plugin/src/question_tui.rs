@@ -2322,7 +2322,10 @@ mod tests {
             apply_event(&mut renderer, &mut checkbox, &key(KeyCode::Space)),
             InteractionOutput::Redraw
         );
-        assert!(checkbox.snapshot().answers[0].selected.is_empty());
+        assert_eq!(
+            checkbox.snapshot().answers[0].selected,
+            [] as [std::string::String; 0]
+        );
         apply_event(&mut renderer, &mut checkbox, &key(KeyCode::Tab));
         apply_event(&mut renderer, &mut checkbox, &key(KeyCode::Space));
         assert_eq!(checkbox.snapshot().answers[0].selected, ["Two"]);

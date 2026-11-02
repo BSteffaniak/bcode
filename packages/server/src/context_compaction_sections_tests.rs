@@ -131,12 +131,12 @@ fn replacement_sections_remove_obsolete_narrative_but_preserve_independent_instr
         prior.current_scope[0].statement
     );
     let sections = Sections::from_prior(&accepted.continuation).unwrap();
-    assert!(sections.background.is_empty());
+    assert_eq!(sections.background, "");
     assert_eq!(
         sections.decisions,
         "Implemented typed API; verification passed"
     );
-    assert!(sections.active_work_blockers.is_empty());
+    assert_eq!(sections.active_work_blockers, "");
 }
 
 #[test]

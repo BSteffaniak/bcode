@@ -22157,7 +22157,7 @@ mod submission_failure_output_tests {
             )
             .is_err()
         );
-        assert!(output.is_empty());
+        assert_eq!(output, [] as [u8; 0]);
     }
 
     #[test]
@@ -23538,7 +23538,10 @@ mod auth_cli_tests {
         let isolated = auth_profile_summaries_from(&config, &registry);
         assert_eq!(isolated, vec![summaries[0].clone()]);
         config.auth.profiles.clear();
-        assert!(auth_profile_summaries_from(&config, &registry).is_empty());
+        assert_eq!(
+            auth_profile_summaries_from(&config, &registry),
+            [] as [AuthProfileSummary; 0]
+        );
     }
 
     #[test]
@@ -24342,7 +24345,7 @@ auth_profile = "openai"
             response.schema_version += 1;
             output.clear();
             assert!(prepare_auth_flow_response(&mut output, &response).is_err());
-            assert!(output.is_empty());
+            assert_eq!(output, [] as [u8; 0]);
         }
     }
 
@@ -25012,7 +25015,7 @@ mod theme_command_tests {
         };
         assert!(matches!(copy(&mut output), Err(CliError::Json(_))));
         assert!(!parent.exists());
-        assert!(output.is_empty());
+        assert_eq!(output, [] as [u8; 0]);
 
         // Linux filesystems permit existing non-UTF-8 names; macOS may reject
         // creating them even though the preflight check above is portable Unix.
@@ -25022,7 +25025,7 @@ mod theme_command_tests {
             std::fs::write(&path, "original content").unwrap();
             assert!(matches!(copy(&mut output), Err(CliError::Json(_))));
             assert_eq!(std::fs::read(&path).unwrap(), b"original content");
-            assert!(output.is_empty());
+            assert_eq!(output, [] as [u8; 0]);
         }
     }
 
@@ -25068,7 +25071,7 @@ mod theme_command_tests {
             )
             .is_err()
         );
-        assert!(output.is_empty());
+        assert_eq!(output, [] as [u8; 0]);
     }
 
     #[test]
@@ -25103,7 +25106,7 @@ mod theme_command_tests {
             ] {
                 let mut writer = FlushFailure::default();
                 assert!(write_theme_command(command, &mut writer).is_err());
-                assert!(!writer.bytes.is_empty());
+                assert_ne!(writer.bytes, [] as [u8; 0]);
             }
         }
         let copied = root.path().join("copy.toml");
@@ -25183,7 +25186,7 @@ mod theme_command_tests {
         assert_eq!(value["schema_version"], 1);
         let rows = value["themes"].as_array().unwrap();
         assert_eq!(rows.len(), catalog.definitions().count());
-        assert!(!rows.is_empty());
+        assert_ne!(rows.as_slice(), [] as [serde_json::Value; 0]);
         for (row, definition) in rows.iter().zip(catalog.definitions()) {
             assert_eq!(row["id"], definition.id());
             assert_eq!(row["display_name"], definition.display_name());
@@ -26730,7 +26733,10 @@ mod web_command_tests {
         assert!(diagnosis.lock_error.contains("locked by another process"));
         // No lease records exist for this fixture, which is exactly the dead-end case.
         assert_eq!(diagnosis.lease_named_owners, 0);
-        assert!(diagnosis.owner_observations.is_empty());
+        assert_eq!(
+            diagnosis.owner_observations,
+            [] as [bcode_session::lease::SessionOwnerObservation; 0]
+        );
         // Guidance must name a non-destructive next step and must not advise stopping a daemon for
         // being old, because concurrent build-specific daemons are intended.
         assert!(diagnosis.recovery_guidance.contains("release-owner"));
@@ -27768,7 +27774,7 @@ mod workflow_source_tests {
             serde_json::from_value(definition.nodes["assess"].configuration.clone())
                 .expect("assessment prompt");
         assert!(assessment.read_only);
-        assert!(assessment.tool_allowlist.is_empty());
+        assert_eq!(assessment.tool_allowlist, [] as [std::string::String; 0]);
         assert!(
             !entry.plan.members[0]
                 .lowering
@@ -30566,7 +30572,7 @@ mod json_stream_output_tests {
             .await;
             if outcome != 0 {
                 assert!(result.is_err());
-                assert!(output.bytes.is_empty());
+                assert_eq!(output.bytes, [] as [u8; 0]);
                 assert_eq!(output.flushes, 0);
             } else {
                 result.unwrap();
@@ -30625,7 +30631,7 @@ mod json_stream_output_tests {
         range.offset = range.total_bytes;
         let mut output = Output::default();
         super::write_artifact_range(&mut output, &range, true).unwrap();
-        assert!(output.bytes.is_empty());
+        assert_eq!(output.bytes, [] as [u8; 0]);
         assert_eq!(output.flushes, 1);
     }
 
@@ -30749,7 +30755,7 @@ mod json_stream_output_tests {
                 super::write_model_validation(&mut output, response, json),
                 Err(CliError::PluginService { .. })
             ));
-            assert!(output.bytes.is_empty());
+            assert_eq!(output.bytes, [] as [u8; 0]);
         }
     }
 
@@ -30798,13 +30804,13 @@ mod json_stream_output_tests {
                 super::write_model_capabilities(&mut output, failed, json),
                 Err(CliError::PluginService { .. })
             ));
-            assert!(output.bytes.is_empty());
+            assert_eq!(output.bytes, [] as [u8; 0]);
             let malformed = bcode_ipc::PluginServiceResponse {
                 payload: b"not json".to_vec(),
                 error: None,
             };
             assert!(super::write_model_capabilities(&mut output, malformed, json).is_err());
-            assert!(output.bytes.is_empty());
+            assert_eq!(output.bytes, [] as [u8; 0]);
         }
     }
 
@@ -30967,7 +30973,7 @@ mod json_stream_output_tests {
                     Err(CliError::Signal(error)) if error.kind() == std::io::ErrorKind::BrokenPipe
                 ));
                 if !fail_diagnostics {
-                    assert!(diagnostics.bytes.is_empty());
+                    assert_eq!(diagnostics.bytes, [] as [u8; 0]);
                 }
             }
         }
@@ -30998,7 +31004,7 @@ mod json_stream_output_tests {
         assert_eq!(output.flushes, 1);
         let mut empty = Output::default();
         super::write_worktree_list(&mut empty, &[]).unwrap();
-        assert!(empty.bytes.is_empty());
+        assert_eq!(empty.bytes, [] as [u8; 0]);
         assert_eq!(empty.flushes, 1);
         for fail_write in [true, false] {
             let mut output = Output {
@@ -31449,7 +31455,10 @@ mod json_stream_output_tests {
             &mut unrelated_view,
             Some(bcode_session_models::SessionId::new()),
         );
-        assert!(unrelated_view.is_empty());
+        assert_eq!(
+            unrelated_view,
+            [] as [bcode_session_models::PermissionSummary; 0]
+        );
         super::filter_permission_list(&mut routed, Some(destination));
         assert_eq!(routed.len(), 1);
         assert_eq!(routed[0].permission_id, "second");
@@ -31775,12 +31784,12 @@ mod json_stream_output_tests {
         let mut output = Output::default();
         let error = write_json_stream_record(&mut output, &Invalid).expect_err("invalid value");
         assert!(matches!(error, CliError::Json(_)));
-        assert!(output.bytes.is_empty());
+        assert_eq!(output.bytes, [] as [u8; 0]);
         assert_eq!(output.flushes, 0);
         let error =
             super::write_json_result(&mut output, &Invalid).expect_err("invalid finite value");
         assert!(matches!(error, CliError::Json(_)));
-        assert!(output.bytes.is_empty());
+        assert_eq!(output.bytes, [] as [u8; 0]);
         assert_eq!(output.flushes, 0);
     }
 }
@@ -31965,7 +31974,10 @@ mod interaction_cli_tests {
         super::filter_session_exchanges(&mut exchanges, Some(selected));
         assert_eq!(exchanges, vec![original[0].clone(), original[2].clone()]);
         super::filter_session_exchanges(&mut exchanges, Some(other));
-        assert!(exchanges.is_empty());
+        assert_eq!(
+            exchanges,
+            [] as [bcode_session_models::PendingToolExchangeSummary; 0]
+        );
     }
 
     #[test]

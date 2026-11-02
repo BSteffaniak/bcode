@@ -44,7 +44,7 @@ async fn producer_and_execution_correlated_turns_do_not_pollute_milestones() {
     }
     let empty = db.milestone_context(8192, 10).await.unwrap();
     assert!(empty.source.is_none());
-    assert!(empty.text.is_empty());
+    assert_eq!(empty.text, "");
     assert_eq!(empty.new_turns, 0);
     assert_eq!(empty.new_tokens, 0);
 
@@ -643,15 +643,15 @@ async fn assert_publication_projections(
     assert_eq!(page.milestones.len(), 1);
     assert_eq!(page.milestones[0].timestamp_ms, 1000 + published_sequence);
     assert_eq!(page.milestones[0].event_sequence, published_sequence);
-    assert!(
+    assert_eq!(
         db.milestones(SessionMilestoneQuery {
             after_sequence: Some(published_sequence),
             limit: 1
         })
         .await
         .unwrap()
-        .milestones
-        .is_empty()
+        .milestones,
+        [] as [bcode_session_models::SessionMilestoneEntry; 0]
     );
     assert!(
         db.model_context_events()

@@ -1890,7 +1890,7 @@ mod tests {
                 .active_skills(session.id)
                 .await
                 .unwrap();
-            assert!(active.is_empty());
+            assert_eq!(active, [] as [bcode_skill_models::SkillContextResponse; 0]);
         }
         drop(state);
     }

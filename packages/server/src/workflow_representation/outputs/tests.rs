@@ -115,7 +115,10 @@ async fn assert_basic_inspection(state: &ServerState) {
         inspected.nodes[0].status,
         bcode_workflow_view_models::WorkflowNodeStatus::Unknown(_)
     ));
-    assert!(inspected.actions.is_empty());
+    assert_eq!(
+        inspected.actions,
+        [] as [bcode_workflow_view_models::WorkflowActionAffordance; 0]
+    );
     let scheduling = inspected.scheduling.as_ref().unwrap();
     assert_eq!(scheduling.activations.len(), 1);
     assert_eq!(scheduling.policy.as_ref().unwrap().max_running, None);
@@ -199,7 +202,7 @@ async fn absent_legacy_outputs_remain_empty_without_installing_extension() {
     state.workflow_store = std::sync::Arc::new(std::sync::Mutex::new(store));
     let outputs = run_outputs(&state, "absent", 10).await.unwrap();
     drop(state);
-    assert!(outputs.is_empty());
+    assert_eq!(outputs, [] as [bcode_workflow::WorkflowOutputInspection; 0]);
     let db = open(&path, false).unwrap();
     assert!(
         !switchy_database::Database::table_exists(&db, "workflow_representation_contract")

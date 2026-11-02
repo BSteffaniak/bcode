@@ -714,7 +714,7 @@ scheme = "api_key"
         .unwrap();
         let catalog = bcode_model_catalog::ModelCatalog::load_bundled().unwrap();
         let expected = catalog.provider_models_as_model_info("openai");
-        assert!(!expected.is_empty());
+        assert_ne!(expected, [] as [bcode::ModelInfo; 0]);
         for model in expected {
             let discovered = snapshot
                 .models

@@ -520,10 +520,10 @@ impl XrayHub {
         let _ = self
             .inner
             .contention
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |value| {
+            .try_update(Ordering::Relaxed, Ordering::Relaxed, |value| {
                 Some(value.saturating_add(count))
             });
-        let _ = self.inner.loss_causes.counter(cause).fetch_update(
+        let _ = self.inner.loss_causes.counter(cause).try_update(
             Ordering::Relaxed,
             Ordering::Relaxed,
             |value| Some(value.saturating_add(count)),

@@ -11354,7 +11354,7 @@ scheme = "api_key"
         let expected = bcode_model_catalog::ModelCatalog::load_bundled()
             .unwrap()
             .provider_models_as_model_info("openai");
-        assert!(!expected.is_empty());
+        assert_ne!(expected, [] as [bcode_model::ModelInfo; 0]);
         for model in expected {
             assert!(
                 discovery

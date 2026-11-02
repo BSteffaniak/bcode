@@ -28,23 +28,23 @@ fn annotations_have_ordered_source_and_independent_meaning_obligations() {
             assert!(sources.insert(&unit.id));
             assert!(unit.start_ms >= previous_end);
             assert!(unit.end_ms > unit.start_ms);
-            assert!(!unit.text.trim().is_empty());
+            assert_ne!(unit.text.trim(), "");
             previous_end = unit.end_ms;
         }
         let mut obligations = BTreeSet::new();
         assert!(!case.obligations.is_empty());
         for obligation in &case.obligations {
             assert!(obligations.insert(&obligation.id));
-            assert!(!obligation.meaning.trim().is_empty());
-            assert!(!obligation.phrases.is_empty());
+            assert_ne!(obligation.meaning.trim(), "");
+            assert_ne!(obligation.phrases, [] as [std::string::String; 0]);
             assert!(obligation.phrases.iter().all(|p| !p.trim().is_empty()));
-            assert!(!obligation.source_ids.is_empty());
+            assert_ne!(obligation.source_ids, [] as [std::string::String; 0]);
             assert!(obligation.source_ids.iter().all(|id| sources.contains(id)));
         }
         let mut controls = BTreeSet::new();
         for control in &case.controls {
             assert!(controls.insert(&control.id));
-            assert!(!control.source_ids.is_empty());
+            assert_ne!(control.source_ids, [] as [std::string::String; 0]);
             assert!(control.source_ids.iter().all(|id| sources.contains(id)));
             assert!(control.missing.iter().all(|id| obligations.contains(id)));
             assert!(
@@ -105,15 +105,15 @@ fn phrase_oracle_deliberately_cannot_certify_semantics() {
         // report must never be presented as a semantic acceptance decision.
         let negated = format!("The following account is false: {}", case.acceptable);
         let report = phrase_controls(&case, &negated);
-        assert!(report.missing.is_empty());
-        assert!(report.unsupported.is_empty());
+        assert_eq!(report.missing, [] as [&str; 0]);
+        assert_eq!(report.unsupported, [] as [&str; 0]);
     }
     let corpus = corpus();
     let causal = &corpus.cases[0];
     let paraphrase = "Buffering lets senders proceed while the receiver briefly stops. Two hundred items each second over three seconds require six hundred slots. This arithmetic does not measure speed. If arrivals keep exceeding service, capacity postpones rather than cures saturation.";
     // A human can judge this against the independent rubric. The exact-phrase
     // oracle misses a faithful paraphrase and cannot be used as a quality score.
-    assert!(!phrase_controls(causal, paraphrase).missing.is_empty());
+    assert_ne!(phrase_controls(causal, paraphrase).missing, [] as [&str; 0]);
 }
 
 #[test]
@@ -146,11 +146,11 @@ fn patch_fixture_supplies_stale_revision_and_untouched_content_sentinels() {
     let corpus = corpus();
     let patch = corpus.patch_scenario;
     assert!(patch.expected_revision < patch.current_revision);
-    assert!(!patch.target_block.is_empty());
-    assert!(!patch.replacement_text.is_empty());
-    assert!(!patch.untouched_text.is_empty());
-    assert!(!patch.untouched_image.asset_id.is_empty());
-    assert!(!patch.untouched_image.caption.is_empty());
+    assert_ne!(patch.target_block, "");
+    assert_ne!(patch.replacement_text, "");
+    assert_ne!(patch.untouched_text, "");
+    assert_ne!(patch.untouched_image.asset_id, "");
+    assert_ne!(patch.untouched_image.caption, "");
     assert_eq!(
         patch.untouched_image.evidence_ids,
         ["boundary_left", "boundary_right"]

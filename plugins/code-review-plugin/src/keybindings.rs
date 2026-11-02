@@ -242,7 +242,7 @@ mod tests {
             registry.action_for_key(scope, parse_key_stroke("b").unwrap()),
             None
         );
-        assert!(registry.keys_for_action(scope, action).is_empty());
+        assert_eq!(registry.keys_for_action(scope, action), [] as [&str; 0]);
         assert_eq!(
             from_registry(&registry, scope, parse_key_stroke("b").unwrap(), false),
             None

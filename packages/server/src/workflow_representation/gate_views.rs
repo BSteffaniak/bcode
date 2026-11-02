@@ -148,10 +148,19 @@ mod tests {
         attach(&mut view, vec![approval.clone()]);
         assert_eq!(view.actions.len(), 2);
         attach(&mut view, vec![]);
-        assert!(view.actions.is_empty());
-        assert!(view.waits.is_empty());
+        assert_eq!(
+            view.actions,
+            [] as [bcode_workflow_view_models::WorkflowActionAffordance; 0]
+        );
+        assert_eq!(
+            view.waits,
+            [] as [bcode_workflow_view_models::WorkflowWaitView; 0]
+        );
         view.terminal = Some(bcode_workflow_view_models::WorkflowTerminalView::Cancelled);
         attach(&mut view, vec![approval]);
-        assert!(view.actions.is_empty());
+        assert_eq!(
+            view.actions,
+            [] as [bcode_workflow_view_models::WorkflowActionAffordance; 0]
+        );
     }
 }

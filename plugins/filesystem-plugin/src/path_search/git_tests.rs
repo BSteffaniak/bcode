@@ -78,7 +78,10 @@ fn git_index_staged_tracked_ignored_untracked_deleted_and_cache_permissions() {
             path: path.into(),
         })
     });
-    assert!(response.entries.is_empty());
+    assert_eq!(
+        response.entries,
+        [] as [crate::path_search::SearchPathEntry; 0]
+    );
     assert_ne!(response.state, SearchPathsState::Complete);
 }
 
@@ -318,7 +321,10 @@ fn corrupt_index_checksum_is_rejected_before_cache_admission() {
         response.reason.as_deref(),
         Some("git_index_checksum_or_object_format_unsupported")
     );
-    assert!(response.entries.is_empty());
+    assert_eq!(
+        response.entries,
+        [] as [crate::path_search::SearchPathEntry; 0]
+    );
 }
 
 #[test]
@@ -345,7 +351,10 @@ fn nested_workspace_tracks_only_its_repo_relative_subtree_with_fresh_grants() {
     let denied =
         super::search_with_metadata(&tracked_request(), &grant, &|| false, &|_| None, &|_| None);
     assert_eq!(denied.reason.as_deref(), Some("git_index_denied"));
-    assert!(denied.entries.is_empty());
+    assert_eq!(
+        denied.entries,
+        [] as [crate::path_search::SearchPathEntry; 0]
+    );
     repository.file("nested/added");
     git(&repository, &["add", "nested/added"]);
     assert!(paths(&run()).contains(&"added"));
@@ -407,7 +416,10 @@ fn info_exclude_is_authorized_refreshed_and_never_suppresses_tracked() {
             path: path.into(),
         })
     });
-    assert!(denied.entries.is_empty());
+    assert_eq!(
+        denied.entries,
+        [] as [crate::path_search::SearchPathEntry; 0]
+    );
     assert_eq!(denied.reason.as_deref(), Some("git_ignore_resource_denied"));
 }
 

@@ -287,7 +287,7 @@ mod tests {
         }
         let completion = wait_latest(&mut coordinator).await;
         assert_eq!(completion.generation.item_revision, 32);
-        assert!(!rendered(&completion).lines.is_empty());
+        assert_ne!(rendered(&completion).lines, [] as [bmux_tui::text::Line; 0]);
     }
 
     #[tokio::test]
@@ -309,7 +309,7 @@ mod tests {
 
         let completion = wait_latest(&mut coordinator).await;
         assert_eq!(completion.generation.options.width, 18);
-        assert!(!rendered(&completion).lines.is_empty());
+        assert_ne!(rendered(&completion).lines, [] as [bmux_tui::text::Line; 0]);
     }
 
     #[tokio::test]
@@ -334,7 +334,7 @@ mod tests {
         coordinator.request(request(2, "recovers"));
         let recovered = wait_latest(&mut coordinator).await;
         assert_eq!(recovered.generation.item_revision, 2);
-        assert!(!rendered(&recovered).lines.is_empty());
+        assert_ne!(rendered(&recovered).lines, [] as [bmux_tui::text::Line; 0]);
     }
 
     #[tokio::test]

@@ -1882,10 +1882,9 @@ mod tests {
         assert!(read_records_strict(root.path(), 16).is_err());
         let directory = registry_dir(root.path());
         fs::create_dir(&directory).expect("registry");
-        assert!(
-            read_records_strict(root.path(), 16)
-                .expect("empty")
-                .is_empty()
+        assert_eq!(
+            read_records_strict(root.path(), 16).expect("empty"),
+            [] as [DaemonRecord; 0]
         );
         let record = record_with_writer_epoch(Some(10));
         fs::write(

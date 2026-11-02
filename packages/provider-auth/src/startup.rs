@@ -384,11 +384,11 @@ mod tests {
 
     #[test]
     fn disabled_discovery_never_reads_environment() {
-        assert!(
+        assert_eq!(
             discover_candidates([&provider()], false, Path::new("/missing"), |_| panic!(
                 "must not read"
-            ))
-            .is_empty()
+            )),
+            [] as [bcode_provider_auth_models::startup::StartupAuthCandidate; 0]
         );
     }
 
@@ -472,7 +472,10 @@ mod tests {
         })
         .unwrap();
         assert!(context.env.is_empty());
-        assert!(context.auth_candidates.is_empty());
+        assert_eq!(
+            context.auth_candidates,
+            [] as [bcode_model::ProviderAuthCandidate; 0]
+        );
         assert_eq!(
             context.auth.unwrap().credentials["api_key"].value,
             "synthetic-selected"
@@ -605,11 +608,11 @@ mod tests {
     fn invalid_contributions_are_not_discovered() {
         let mut provider = provider();
         provider.schema_version += 1;
-        assert!(
+        assert_eq!(
             discover_candidates([&provider], true, Path::new("/missing"), |_| panic!(
                 "must not read"
-            ))
-            .is_empty()
+            )),
+            [] as [bcode_provider_auth_models::startup::StartupAuthCandidate; 0]
         );
     }
 
