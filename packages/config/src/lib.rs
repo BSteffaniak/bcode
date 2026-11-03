@@ -5612,6 +5612,10 @@ pub fn runtime_auth_subscriptions_path() -> PathBuf {
 
 /// Acquire exclusive registry ownership before reading state for mutation.
 fn lock_auth_subscriptions(path: &Path) -> Result<fs::File, ConfigError> {
+    lock_auth_subscriptions_with_wait(path, false)
+}
+
+fn lock_auth_subscriptions_with_wait(path: &Path, wait: bool) -> Result<fs::File, ConfigError> {
     let parent = path.parent().ok_or_else(|| ConfigError::Composition {
         message: "auth registry requires a parent directory".to_owned(),
     })?;
@@ -5630,9 +5634,26 @@ fn lock_auth_subscriptions(path: &Path) -> Result<fs::File, ConfigError> {
             path: lock_path.clone(),
             source,
         })?;
-    file.try_lock().map_err(|error| ConfigError::Composition {
-        message: format!("auth registry is busy or cannot be locked: {error}"),
-    })?;
+    if wait {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            match file.try_lock() {
+                Ok(()) => break,
+                Err(std::fs::TryLockError::WouldBlock) if std::time::Instant::now() < deadline => {
+                    std::thread::sleep(std::time::Duration::from_millis(5));
+                }
+                Err(error) => {
+                    return Err(ConfigError::Composition {
+                        message: format!("auth registry cannot be locked: {error}"),
+                    });
+                }
+            }
+        }
+    } else {
+        file.try_lock().map_err(|error| ConfigError::Composition {
+            message: format!("auth registry is busy or cannot be locked: {error}"),
+        })?;
+    }
     Ok(file)
 }
 

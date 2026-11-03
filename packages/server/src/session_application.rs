@@ -1838,9 +1838,13 @@ mod tests {
     #[tokio::test]
     async fn typed_drafts_reasoning_and_skills_keep_canonical_ownership() {
         let root = tempfile::tempdir().unwrap();
-        let state = Arc::new(crate::tests::test_server_state(
-            bcode_session::SessionManager::persistent(root.path()).unwrap(),
-        ));
+        let sessions = bcode_session::SessionManager::persistent(root.path()).unwrap();
+        let mut state = Arc::new(crate::tests::test_server_state(sessions));
+        Arc::get_mut(&mut state)
+            .unwrap()
+            .startup_config
+            .skills
+            .enabled = false;
         {
             let caller = ClientId::new();
             let session = application_for(&state, caller)

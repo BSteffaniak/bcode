@@ -80,29 +80,35 @@ fn open(
 async fn retained_store(
     state: &ServerState,
 ) -> Result<bcode_workflow_store::WorkflowStore, ServerError> {
-    state.poll_workflow_initialization(false)?;
-    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+    let mut retries = 0_u32;
     loop {
-        // A synchronous lock wait here can occupy every runtime worker while the
-        // owner is awaiting database work on that same runtime. Yield contenders
-        // instead; retaining a handle still uses the canonical maintenance fence.
-        {
-            let store = match state.workflow_store.try_lock() {
-                Ok(store) => Some(store),
-                Err(std::sync::TryLockError::Poisoned(error)) => Some(error.into_inner()),
-                Err(std::sync::TryLockError::WouldBlock) => None,
-            };
-            if let Some(store) = store {
-                if !store.path().is_file() {
-                    return Err(unavailable());
+        match state.poll_workflow_initialization(false) {
+            Err(ServerError::WorkflowStorageBusy) if retries < 8 => {}
+            Err(error) => return Err(error),
+            Ok(()) => {
+                let store = std::sync::Arc::clone(&state.workflow_store);
+                // Retaining opens/verifies a connection. Never block workers needed to finish
+                // transactions. Retry only this side-effect-free acquisition, never dispatch.
+                let retained = tokio::task::spawn_blocking(move || {
+                    let store = store
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner);
+                    if !store.path().is_file() {
+                        return Err(unavailable());
+                    }
+                    store.retained_handle().map_err(ServerError::from)
+                })
+                .await
+                .map_err(|_| unavailable())?;
+                match retained {
+                    Err(ServerError::WorkflowStore(ref error))
+                        if error.is_transient_initialization_failure() && retries < 8 => {}
+                    result => return result,
                 }
-                return Ok(store.retained_handle()?);
             }
         }
-        if tokio::time::Instant::now() >= deadline {
-            return Err(unavailable());
-        }
-        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        retries += 1;
+        tokio::time::sleep(std::time::Duration::from_millis(10 * u64::from(retries))).await;
     }
 }
 
@@ -132,7 +138,9 @@ fn read_failure_normalization_preserves_only_typed_busy() {
 
 async fn lookup_at(path: &Path, run_id: &str) -> Result<RunLookup, ServerError> {
     let db = open(path, false)?;
-    backpressure::queued(path, || representation::runs::lookup(&db, run_id))
+    // Classification is a bounded read. Waiting for the writer queue here makes diagnostic
+    // reads reenter a queue already held by receipt publication/cancellation callers.
+    backpressure::retry(|| representation::runs::lookup(&db, run_id))
         .await
         .map_err(backpressure::normalize)
 }

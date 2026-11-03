@@ -1946,7 +1946,14 @@ async fn compaction_trace_declares_only_its_scalar_projection() {
                 Some("private-provider-message".into()),
             ))
             .await;
-        let event = observation.recv().await.expect("compaction event").event;
+        // Other session diagnostics can be interleaved with the producer-owned projection.
+        // Observe the semantic event, rather than assuming transport delivery is single-domain.
+        let event = loop {
+            let event = observation.recv().await.expect("compaction event").event;
+            if event.domain == "context" && event.name == name {
+                break event;
+            }
+        };
         assert_eq!(event.domain, "context");
         assert_eq!(event.name, name);
         assert_eq!(

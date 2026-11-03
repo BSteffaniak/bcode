@@ -48,7 +48,17 @@ async fn fanout_real_provider_members_overlap_at_32_and_100() {
 }
 
 async fn fanout_overlap(count: u32) {
-    let (_root, _sessions, state, _) = typed_provider_fixture_with_delegation(true).await;
+    let (_root, _sessions, mut state, _) = typed_provider_fixture_with_delegation(true).await;
+    // This fixture proves simultaneous provider overlap, not queued admission. Explicitly
+    // provision enough work slots for every held member plus its setup service calls.
+    std::sync::Arc::get_mut(&mut state)
+        .expect("unshared fixture state")
+        .plugins
+        .configure_invocation_limits(
+            std::num::NonZeroUsize::new(count as usize + 16).unwrap(),
+            std::num::NonZeroUsize::new(4).unwrap(),
+        )
+        .expect("fixture invocation capacity");
     let mut cleanup = FixtureCleanup::new(&state);
     let _release =
         ReleaseGate(state.selected_provider_context.settings["delegation_fixture_gate"].clone());
@@ -65,11 +75,15 @@ async fn fanout_overlap(count: u32) {
         pending.iter().all(|attempt| attempt.receipt.is_some()),
         "all provider owners admitted before releasing any"
     );
-    bcode_fake_provider_plugin::wait_for_fake_event_script_gate_members(
-        &state.selected_provider_context.settings["delegation_fixture_gate"],
-        count as usize,
+    let ready = tokio::time::timeout(
+        std::time::Duration::from_secs(15),
+        bcode_fake_provider_plugin::wait_for_fake_event_script_gate_members(
+            &state.selected_provider_context.settings["delegation_fixture_gate"],
+            count as usize,
+        ),
     )
     .await;
+    ready.expect("all admitted members must reach provider gate");
     bcode_fake_provider_plugin::release_fake_event_script_gate(
         &state.selected_provider_context.settings["delegation_fixture_gate"],
     );

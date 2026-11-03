@@ -4350,6 +4350,22 @@ impl PluginRuntimeHost {
             .collect()
     }
 
+    /// Configure bounded work admission before sharing this runtime or starting invocations.
+    /// Query/control admission remains independent, and plugin-declared limits still apply.
+    ///
+    /// # Errors
+    /// Returns an error if another host or an admitted invocation retains the current limiter.
+    pub fn configure_invocation_limits(
+        &mut self,
+        global: std::num::NonZeroUsize,
+        per_session: std::num::NonZeroUsize,
+    ) -> Result<(), &'static str> {
+        let limiter = Arc::get_mut(&mut self.resources)
+            .ok_or("plugin invocation limits require an unshared, quiescent runtime")?;
+        *limiter = PluginResourceLimiter::new(global.get(), per_session.get());
+        Ok(())
+    }
+
     /// Return a clone of this runtime host that emits runtime metrics to `metrics`.
     #[must_use]
     pub fn with_metrics(mut self, metrics: bcode_metrics::MetricsRegistry) -> Self {
@@ -7233,6 +7249,41 @@ library = "libauth_test.dylib"
             diagnostics[0].error,
             PluginConfigMetadataError::EmptySection
         );
+    }
+
+    #[test]
+    fn invocation_limits_require_exclusive_quiescent_runtime() {
+        let mut host: PluginRuntimeHost = PluginHost::default().into();
+        host.configure_invocation_limits(
+            std::num::NonZeroUsize::new(128).unwrap(),
+            std::num::NonZeroUsize::new(8).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(host.resources.max_global, 128);
+        assert_eq!(host.resources.max_per_session, 8);
+        let shared = host.clone();
+        assert!(
+            host.configure_invocation_limits(
+                std::num::NonZeroUsize::MIN,
+                std::num::NonZeroUsize::MIN
+            )
+            .is_err()
+        );
+        drop(shared);
+        let retained = Arc::clone(&host.resources);
+        assert!(
+            host.configure_invocation_limits(
+                std::num::NonZeroUsize::MIN,
+                std::num::NonZeroUsize::MIN
+            )
+            .is_err()
+        );
+        drop(retained);
+        host.configure_invocation_limits(std::num::NonZeroUsize::MIN, std::num::NonZeroUsize::MIN)
+            .unwrap();
+        assert_eq!(host.resources.max_global, 1);
+        assert_eq!(host.resources.max_per_session, 1);
+        drop(host);
     }
 
     #[test]

@@ -146,6 +146,26 @@ pub fn update<T>(
     Ok(result)
 }
 
+/// Update settings after waiting up to five seconds for verified cross-process ownership.
+///
+/// Call from a blocking worker, never an asynchronous runtime worker. The closure runs once,
+/// after reading the current state under the lock; a failed publication is never retried.
+///
+/// # Errors
+/// Returns locking, validation, closure, or persistence errors without permissive fallback.
+pub fn update_waiting<T>(
+    root: &Path,
+    key: &str,
+    change: impl FnOnce(&mut AccountSettings) -> Result<T, super::ConfigError>,
+) -> Result<T, super::ConfigError> {
+    let path = path(root, key)?;
+    let _lock = super::lock_auth_subscriptions_with_wait(&path, true)?;
+    let mut state = read(&path)?;
+    let result = change(&mut state)?;
+    write(&path, &state)?;
+    Ok(result)
+}
+
 fn write(path: &Path, state: &AccountSettings) -> Result<(), super::ConfigError> {
     use std::io::Write as _;
     let bytes = serde_json::to_vec(state).map_err(|_| invalid())?;
@@ -211,6 +231,46 @@ impl AccountSettingsTransaction {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn waiting_updates_serialize_concurrent_session_initialization() {
+        let root = tempfile::tempdir().unwrap();
+        let key = "d".repeat(64);
+        let barrier = std::sync::Barrier::new(16);
+        std::thread::scope(|scope| {
+            for index in 0..16 {
+                let root = root.path();
+                let key = &key;
+                let barrier = &barrier;
+                scope.spawn(move || {
+                    barrier.wait();
+                    update_waiting(root, key, |settings| {
+                        settings.sessions.insert(
+                            index.to_string(),
+                            AccountRoute::Only {
+                                account: AccountId {
+                                    provider_id: "fixture".into(),
+                                    profile: index.to_string(),
+                                },
+                            },
+                        );
+                        Ok(())
+                    })
+                    .unwrap();
+                });
+            }
+        });
+        assert_eq!(load(root.path(), &key).unwrap().sessions.len(), 16);
+        let before = load(root.path(), &key).unwrap();
+        assert!(
+            update_waiting(root.path(), &key, |settings| {
+                settings.sessions.clear();
+                Err::<(), _>(invalid())
+            })
+            .is_err()
+        );
+        assert_eq!(load(root.path(), &key).unwrap(), before);
+    }
 
     #[test]
     fn retained_transaction_excludes_writers_and_preserves_rejected_snapshot() {

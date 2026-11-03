@@ -72,6 +72,16 @@ fn observe_owner_stage<'a, T: 'a>(
     }
 }
 
+fn server_store_error(error: ServerError) -> WorkflowStoreError {
+    match error {
+        ServerError::WorkflowStorageBusy => {
+            WorkflowStoreError::StructuredDatabase(switchy_database::DatabaseError::Busy)
+        }
+        ServerError::WorkflowStore(error) => error,
+        _ => store_error("workflow owner unavailable"),
+    }
+}
+
 fn store_error(_: impl std::fmt::Display) -> WorkflowStoreError {
     WorkflowStoreError::InvalidData("workflow owner storage is unavailable or inconsistent".into())
 }
@@ -96,10 +106,10 @@ async fn check_owner_admission_inner(
     request: &PreparedActivationDispatch,
     authority: &WorkflowExecutionAuthority,
 ) -> Result<Option<serde_json::Value>, WorkflowStoreError> {
-    let retained = retained_store(state).await.map_err(store_error)?;
+    let retained = retained_store(state).await.map_err(server_store_error)?;
     match lookup_at(retained.path(), &request.activation.run_id)
         .await
-        .map_err(store_error)?
+        .map_err(server_store_error)?
     {
         RunLookup::Legacy => retained.check_owner_admission(request, authority),
         RunLookup::Available(_) => {
@@ -130,10 +140,10 @@ pub async fn execution_session_link(
     activation_id: &str,
     attempt: u32,
 ) -> Result<Option<WorkflowExecutionSessionLink>, WorkflowStoreError> {
-    let retained = retained_store(state).await.map_err(store_error)?;
+    let retained = retained_store(state).await.map_err(server_store_error)?;
     match lookup_at(retained.path(), run_id)
         .await
-        .map_err(store_error)?
+        .map_err(server_store_error)?
     {
         RunLookup::Missing => Ok(None),
         RunLookup::Legacy => {
@@ -183,7 +193,7 @@ async fn persist_execution_session(
     authority: &WorkflowExecutionAuthority,
     link: &WorkflowExecutionSessionLink,
 ) -> Result<(), WorkflowStoreError> {
-    let mut retained = retained_store(state).await.map_err(store_error)?;
+    let mut retained = retained_store(state).await.map_err(server_store_error)?;
     match lookup_at(retained.path(), &link.run_id)
         .await
         .map_err(store_error)?
@@ -215,7 +225,7 @@ pub async fn link_shared_execution_session(
     authority: &WorkflowExecutionAuthority,
     link: &WorkflowExecutionSessionLink,
 ) -> Result<(), WorkflowStoreError> {
-    let retained = retained_store(state).await.map_err(store_error)?;
+    let retained = retained_store(state).await.map_err(server_store_error)?;
     match lookup_at(retained.path(), &link.run_id)
         .await
         .map_err(store_error)?
@@ -330,7 +340,7 @@ async fn persist_receipt_inner(
     receipt: &bcode_workflow_store::DispatchReceipt,
     authority: &WorkflowExecutionAuthority,
 ) -> Result<(), WorkflowStoreError> {
-    let retained = retained_store(state).await.map_err(store_error)?;
+    let retained = retained_store(state).await.map_err(server_store_error)?;
     let queue = super::backpressure::write_queue(retained.path()).map_err(store_error)?;
     #[cfg(not(test))]
     let publication_lock = queue.lock();
@@ -610,10 +620,10 @@ async fn settle_observation_inner(
 ) -> Result<bcode_workflow_store::ReceiptReconciliationSummary, WorkflowStoreError> {
     use bcode_workflow_store::AttemptObservation as Observation;
     use representation::attempts::TerminalOutcome;
-    let retained = retained_store(state).await.map_err(store_error)?;
+    let retained = retained_store(state).await.map_err(server_store_error)?;
     match lookup_at(retained.path(), &request.activation.run_id)
         .await
-        .map_err(store_error)?
+        .map_err(server_store_error)?
     {
         RunLookup::Legacy => {
             return crate::persist_workflow_prompt_completion(
@@ -1050,10 +1060,10 @@ pub async fn dispatch_intent(
     run_id: &str,
     dispatch_identity: &str,
 ) -> Result<serde_json::Value, WorkflowStoreError> {
-    let retained = retained_store(state).await.map_err(store_error)?;
+    let retained = retained_store(state).await.map_err(server_store_error)?;
     match lookup_at(retained.path(), run_id)
         .await
-        .map_err(store_error)?
+        .map_err(server_store_error)?
     {
         RunLookup::Legacy => retained.dispatch_intent(dispatch_identity),
         RunLookup::Available(_) => {
@@ -1074,10 +1084,10 @@ pub async fn cancellation_intended(
     run_id: &str,
     dispatch_identity: &str,
 ) -> Result<bool, WorkflowStoreError> {
-    let retained = retained_store(state).await.map_err(store_error)?;
+    let retained = retained_store(state).await.map_err(server_store_error)?;
     match lookup_at(retained.path(), run_id)
         .await
-        .map_err(store_error)?
+        .map_err(server_store_error)?
     {
         RunLookup::Legacy => {
             let run = retained
@@ -1090,7 +1100,7 @@ pub async fn cancellation_intended(
             let db = open(retained.path(), false).map_err(store_error)?;
             let guard = local_authority(state, run_id)
                 .await
-                .map_err(store_error)?
+                .map_err(server_store_error)?
                 .ok_or_else(|| store_error("missing owner"))?;
             super::backpressure::queued(retained.path(), || {
                 owner_boundary::cancellation_intended(

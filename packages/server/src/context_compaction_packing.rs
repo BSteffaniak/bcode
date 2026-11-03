@@ -13,7 +13,7 @@ use super::budget::ResolvedSummaryPolicy;
 use super::compaction_capacity_tokens;
 
 /// Persisted packing identity. Changing request-fit semantics requires explicit supersession.
-pub(super) const ALGORITHM_ID: &str = "adaptive-complete-request-v2";
+pub(super) const ALGORITHM_ID: &str = "adaptive-complete-request-v3";
 
 #[derive(Clone, Copy)]
 pub(super) enum PackingGate {
@@ -132,6 +132,15 @@ fn packing_carry_reserve(
     "x".repeat(low)
 }
 
+fn source_records(gate: PackingGate, chunk: &str) -> Vec<&str> {
+    // Byte-budget batches contain independently framed records, not indivisible protocol units.
+    if matches!(gate, PackingGate::Capacity) {
+        chunk.split_inclusive('\n').collect()
+    } else {
+        vec![chunk]
+    }
+}
+
 fn pack_bounded(
     gate: PackingGate,
     source: &[String],
@@ -224,7 +233,7 @@ fn pack_bounded(
     };
     let mut packed = Vec::new();
     let mut pending = String::new();
-    for chunk in source {
+    for chunk in source.iter().flat_map(|chunk| source_records(gate, chunk)) {
         let mut candidate = pending.clone();
         candidate.push_str(chunk);
         if fits(&candidate) {
@@ -236,7 +245,7 @@ fn pack_bounded(
             if !fits(chunk) {
                 return Err(CompactionError::Provider("indivisible evidence chunk exceeds experimental request capacity; coverage unchanged".into()));
             }
-            pending.clone_from(chunk);
+            pending.push_str(chunk);
         }
     }
     if !pending.is_empty() {
@@ -405,6 +414,36 @@ mod tests {
             pack_with_policy(PackingGate::Disabled, &source, &request, &policy).unwrap(),
             source
         );
+    }
+
+    #[test]
+    fn capacity_packing_rebatches_records_without_changing_source_bytes() {
+        let request = template();
+        let policy = policy_for_window(&request, 8192, 5000);
+        let records = (0..14)
+            .map(|sequence| {
+                serde_json::json!({
+                    "sequence":sequence, "provenance":"user", "byte_offset":0,
+                    "final_fragment":true, "text":"x".repeat(1000),
+                })
+                .to_string()
+                    + "\n"
+            })
+            .collect::<String>();
+        let packed = pack_with_policy(
+            PackingGate::Capacity,
+            std::slice::from_ref(&records),
+            &request,
+            &policy,
+        )
+        .expect("independently framed records fit separately");
+        assert!(packed.len() > 1);
+        assert_eq!(packed.concat(), records);
+        assert!(packed.iter().all(|chunk| {
+            chunk
+                .lines()
+                .all(|line| serde_json::from_str::<serde_json::Value>(line).is_ok())
+        }));
     }
 
     #[test]

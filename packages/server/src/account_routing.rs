@@ -278,20 +278,26 @@ pub async fn freeze(
     if selection.provider_context.account_routing_frozen {
         return Ok(());
     }
-    let settings = account_settings::load(&state.state_root, &context.key)
-        .map_err(|_| "account settings unavailable")?;
-    let route = route(&settings, session, &context);
-    // Capture inherited defaults once. Subsequent default changes cannot affect this session.
-    if !settings.sessions.contains_key(&session.to_string()) {
-        account_settings::update(&state.state_root, &context.key, |settings| {
+    let root = state.state_root.clone();
+    let (context, settings, route) = tokio::task::spawn_blocking(move || {
+        account_settings::update_waiting(&root, &context.key, |settings| {
+            // Resolve inherited defaults from the locked snapshot, not an observation made
+            // before another session/account writer won admission.
+            let route = route(settings, session, &context);
             settings
                 .sessions
                 .entry(session.to_string())
-                .or_insert_with(|| route.clone());
-            Ok(())
+                .or_insert(route);
+            Ok((
+                settings.clone(),
+                settings.sessions[&session.to_string()].clone(),
+            ))
         })
-        .map_err(|_| "could not freeze session routing")?;
-    }
+        .map(|(settings, route)| (context, settings, route))
+    })
+    .await
+    .map_err(|_| "session routing worker failed")?
+    .map_err(|_| "could not freeze session routing")?;
     bcode_provider_auth::account_routing::freeze(
         &context.config,
         &context.registry,

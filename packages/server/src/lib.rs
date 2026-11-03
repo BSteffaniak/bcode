@@ -435,6 +435,8 @@ mod context_generation;
 
 #[derive(Debug)]
 pub struct ServerState {
+    #[cfg(test)]
+    test_state_root: Option<Arc<tempfile::TempDir>>,
     usage_index: Mutex<bcode_usage::index::UsageIndex>,
     locations: Option<bcode_config::StateLocationSet>,
     state_root: PathBuf,
@@ -1133,6 +1135,11 @@ impl RuntimeCurrentTurn {
                 normalized_selection
                     .requested_model_id
                     .clone_from(&active_selection.requested_model_id);
+                // Freezing records that the active request's account route has been resolved;
+                // it does not itself select a different provider/account. Compare actual routing
+                // facts unchanged, ignoring only this resolved-state bookkeeping bit.
+                normalized_selection.provider_context.account_routing_frozen =
+                    active_selection.provider_context.account_routing_frozen;
                 active_selection == &normalized_selection
             })
             && self.execution.as_ref().is_some_and(|active| {
@@ -2553,7 +2560,10 @@ impl ServerState {
         plugins: bcode_plugin::PluginRuntimeHost,
         init: ServerStateInit,
     ) -> Self {
-        Self::new_in_state_root(sessions, plugins, init, bcode_config::default_state_dir())
+        let root = Arc::new(tempfile::tempdir().expect("isolated server state"));
+        let mut state = Self::new_in_state_root(sessions, plugins, init, root.path().to_path_buf());
+        state.test_state_root = Some(root);
+        state
     }
 
     #[allow(clippy::too_many_lines)]
@@ -2593,6 +2603,8 @@ impl ServerState {
         let run_edit_plugins = init.startup_config.workflows.run_edit_plugins.clone();
         let bcode_runtime_context = init.bcode_runtime_context;
         Self {
+            #[cfg(test)]
+            test_state_root: None,
             usage_index: Mutex::new(bcode_usage::index::UsageIndex::in_state_root(&state_root)),
             locations: None,
             state_root,
@@ -73300,6 +73312,15 @@ event_symbol = "bcode_plugin_handle_event_v1"
         };
         let selection = SessionModelSelection::default();
         assert!(turn.accepts_steering(&execution, &selection));
+        turn.selection
+            .as_mut()
+            .unwrap()
+            .provider_context
+            .account_routing_frozen = true;
+        assert!(turn.accepts_steering(&execution, &selection));
+        let mut different_account = selection.clone();
+        different_account.provider_context.auth_profile = Some("different-account".into());
+        assert!(!turn.accepts_steering(&execution, &different_account));
         let variants = [
             TurnExecutionOptions {
                 permission_mode: bcode_session_models::TurnPermissionMode::Bypass,
@@ -84402,6 +84423,16 @@ event_symbol = "bcode_plugin_handle_event_v1"
         let mut startup_config = bcode_config::BcodeConfig::default();
         startup_config.model.prompt_cache.mode = bcode_model::PromptCacheMode::Off;
         startup_config.model.tool_output.context_chars = 1_000;
+        // Fake-provider tests use an 8k context window. Repository guidance and the user's
+        // installed skill catalog are external inputs, not fixtures; their growth must not
+        // consume the test model's entire retained request budget before history is considered.
+        startup_config.system_prompt.sections.repository_context = false;
+        startup_config.system_prompt.sections.repository_invariants = false;
+        startup_config
+            .system_prompt
+            .sections
+            .dynamic_repository_context = false;
+        startup_config.system_prompt.sections.skill_catalog = false;
         // Tests assert on the diagnostic provider-event and compaction traces, which the daemon
         // persists only at debug observability. Production defaults keep those gated.
         let observability = bcode_config::ObservabilityConfig {
@@ -100812,6 +100843,18 @@ event_symbol = "bcode_plugin_handle_event_v1"
         drop(state);
     }
 
+    fn rebuilt_compaction_requests(history: &[SessionEvent]) -> usize {
+        history
+            .iter()
+            .filter(|event| {
+                matches!(&event.kind,
+            SessionEventKind::TraceEvent { trace }
+                if matches!(&trace.payload, SessionTracePayload::ContextCompaction { reason, .. }
+                    if reason == "request_rebuilt_after_compaction"))
+            })
+            .count()
+    }
+
     #[tokio::test]
     async fn rebuilt_proactive_request_that_remains_unfit_is_terminal() {
         let temp_dir = tempfile::tempdir().expect("temp dir");
@@ -100882,22 +100925,22 @@ event_symbol = "bcode_plugin_handle_event_v1"
             .session_history(session_id)
             .await
             .expect("history");
+        let committed = history
+            .iter()
+            .filter(|event| {
+                matches!(
+                    event.kind,
+                    SessionEventKind::ContextCompacted { .. }
+                        | SessionEventKind::ProviderContextCompacted { .. }
+                )
+            })
+            .count();
         assert_eq!(
-            history
-                .iter()
-                .filter(|event| matches!(
-                    &event.kind,
-                    SessionEventKind::TraceEvent { trace }
-                        if matches!(
-                            &trace.payload,
-                            SessionTracePayload::ContextCompaction { reason, .. }
-                                if reason == "request_rebuilt_after_compaction"
-                        )
-                ))
-                .count(),
-            usize::from(summary_started),
-            "completion: {completion:?}"
+            rebuilt_compaction_requests(&history),
+            committed,
+            "only committed compaction can rebuild: {completion:?}"
         );
+        assert!(summary_started, "steering must arrive during synthesis");
         assert!(history.iter().any(|event| matches!(
             &event.kind,
             SessionEventKind::TraceEvent { trace }

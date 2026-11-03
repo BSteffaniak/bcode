@@ -19,6 +19,12 @@ process ownership and database file identity before and after opening a connecti
 It does not replace per-operation execution-authority checks or share connection-local
 publication read fences. Missing or replaced files fail closed, without initialization.
 
+The asynchronous server retains verified handles on blocking workers, including database opening
+and mutex acquisition, so connection contention cannot stall workers driving current transactions.
+Only side-effect-free handle acquisition retries transient admission contention; external dispatch
+is never replayed by that retry. Bounded representation classification reads do not join the writer
+queue, preventing diagnostic origin resolution from reentering a queue held by receipt publication.
+
 A server regression admits independent agent workflows through production `start_run`
 using two distinct daemon instance identities and store handles, then runs both existing
 drivers to completion. It uses the fake provider and one process; it is not yet a
