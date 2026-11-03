@@ -1155,6 +1155,18 @@ equal the canonical event tail. Missing/stale projection state surfaces `Project
 state surfaces repair-required. Relative and supported legacy absolute/file references are accepted
 only after canonical path confinement beneath the session artifact root.
 
+Artifact-bearing presentation updates and contribution events are admitted by the server while
+holding the producer's invocation registration, before forwarding best-effort presentation work to
+a scoped queue. Queue saturation or delayed presentation consumption cannot discard artifact
+finalization. Normal registration release marks only genuinely unfinished references abandoned;
+a committed canonical result retires matching live references regardless of their prior live status.
+Canonical commitment also closes presentation admission, so delayed updates cannot reopen it.
+
+Range reads resolve the bounded canonical reference first. Before a canonical reference exists,
+a registered live prefix remains available. Abandoned live state never overrides a committed
+reference or conceals durable compatibility/projection failures. Ownership and storage-read admission
+remain held through content access; no read repairs projections or replays history.
+
 Live artifact revisions and persisted finalizing event sequences are separate domains. A live
 reference may already be finalized before its canonical event is observed. Clients identify a
 persisted range by `finalized_event_seq`, never by numeric revision ordering or `finalized` alone.

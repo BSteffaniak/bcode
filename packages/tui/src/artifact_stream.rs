@@ -1014,6 +1014,84 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn canonical_recovery_delivers_only_missing_suffix_and_clears_failure() {
+        let session_id = SessionId::new();
+        let key = (
+            session_id,
+            "call".into(),
+            "artifact".into(),
+            "recording".into(),
+        );
+        let mut coordinator = ArtifactStreamCoordinator::new(BcodeClient::default_endpoint());
+        coordinator.artifact_fetches.insert(
+            key.clone(),
+            ActiveArtifactFetchState {
+                next_offset: 4,
+                target: Some(target(4, 6145, false)),
+                terminal_error: Some("producer incorrectly reported incomplete".into()),
+                delivered_successfully: true,
+                ..ActiveArtifactFetchState::default()
+            },
+        );
+        let event = SessionEventKind::ToolInvocationResultRecorded {
+            record: bcode_session_models::ToolInvocationResultRecord {
+                invocation_id: "call".into(),
+                model_output: String::new(),
+                is_error: false,
+                presentation: None,
+                content: vec![],
+                result: Some(bcode_session_models::ToolInvocationResult::Artifact {
+                    artifact: Box::new(bcode_session_models::ToolArtifact {
+                        artifact_id: "artifact".into(),
+                        producer_plugin_id: "producer".into(),
+                        schema: "visual".into(),
+                        schema_version: 1,
+                        tool_call_id: Some("call".into()),
+                        title: None,
+                        metadata: serde_json::Value::Null,
+                        refs: vec![bcode_session_models::ToolArtifactRef {
+                            key: "recording".into(),
+                            content_type: None,
+                            storage_uri: None,
+                            byte_len: Some(8),
+                            metadata: None,
+                        }],
+                    }),
+                }),
+            },
+        };
+        assert_eq!(coordinator.failed_invocations(), ["call"]);
+        coordinator.observe_finalized_artifact(session_id, 7, &event, |_, _, _, _, _| true);
+        assert_eq!(coordinator.failed_invocations(), Vec::<String>::new());
+        assert_eq!(coordinator.recovered_invocations(), Vec::<String>::new());
+        let mut response = range(4, 8, 7, b"tail");
+        response.finalized = true;
+        response.finalized_event_seq = Some(7);
+        let mut delivered = Vec::new();
+        assert!(coordinator.handle_completion(
+            Some(session_id),
+            ActiveArtifactFetchCompletion {
+                session_id,
+                key: key.clone(),
+                requested_offset: 4,
+                requested_end: 8,
+                target_revision: ArtifactRevision::Persisted(7),
+                result: Ok(response),
+            },
+            |chunk| {
+                assert_eq!(chunk.offset, 4);
+                delivered.extend_from_slice(&chunk.bytes);
+                Ok(true)
+            }
+        ));
+        assert_eq!(delivered, b"tail");
+        assert_eq!(coordinator.recovered_invocations(), ["call"]);
+        coordinator.observe_artifact_target(session_id, &key, target(20, 9000, false), true);
+        assert_eq!(coordinator.recovered_invocations(), ["call"]);
+        assert_eq!(coordinator.artifact_fetches[&key].next_offset, 8);
+    }
+
     #[test]
     fn artifact_fetch_ranges_are_chunk_bounded_and_advance_from_committed_offset() {
         let committed_bytes = u64::from(ACTIVE_ARTIFACT_FETCH_BYTES) * 3;

@@ -14961,19 +14961,8 @@ async fn read_session_artifact_range_untracked(
         ));
     }
     let active = active_artifact_reference(state, session_id, artifact_id, reference_key)?;
-    if let Some(active) = active.as_ref().filter(|reference| !reference.finalized) {
-        return read_active_artifact_range(
-            session_artifact_dir(state, session_id)?,
-            artifact_id,
-            reference_key,
-            offset,
-            length,
-            active.clone(),
-            ownership,
-        )
-        .await;
-    }
-
+    // Canonical finalization supersedes every live entry, including a stale active prefix.
+    // The bounded projection lookup below falls back to live data only before finalization.
     // A finalized live registration remains readable until its transactional durable projection
     // is visible. Once the projection is visible, reads switch to it and retire the live entry
     // only after a successful canonical read. This closes the producer-finish/projection race
@@ -14988,7 +14977,7 @@ async fn read_session_artifact_range_untracked(
             error @ (bcode_session::SessionError::ProjectionStale { .. }
             | bcode_session::SessionError::DbUnavailable(_)),
         ) => {
-            if let Some(active) = active {
+            if let Some(active) = active.filter(|reference| !reference.abandoned) {
                 return read_active_artifact_range(
                     session_artifact_dir(state, session_id)?,
                     artifact_id,
@@ -36990,7 +36979,10 @@ async fn invoke_plugin_tool_transport(
                             {
                                 if route_canonical_events_to_scope {
                                     if let Some(scope) = invocation_scope {
-                                        let _accepted = scope.emit_presentation_update(update);
+                                        route_scoped_plugin_presentation_update(
+                                            state, session_id, &call.id, plugin_id, scope, update,
+                                        )
+                                        .await;
                                     }
                                 } else {
                                     publish_plugin_tool_presentation_update(
@@ -37018,7 +37010,7 @@ async fn invoke_plugin_tool_transport(
                                 bcode_session_models::ToolContributionEvent,
                             >(&payload)
                             {
-                                if route_canonical_events_to_scope {
+                                if route_canonical_events_to_scope && contribution.artifact.is_none() {
                                     if let Some(scope) = invocation_scope {
                                         let _accepted = scope.emit_contribution(contribution);
                                     }
@@ -37063,7 +37055,10 @@ async fn invoke_plugin_tool_transport(
         {
             if route_canonical_events_to_scope {
                 if let Some(scope) = invocation_scope {
-                    let _accepted = scope.emit_presentation_update(update);
+                    route_scoped_plugin_presentation_update(
+                        state, session_id, &call.id, plugin_id, scope, update,
+                    )
+                    .await;
                 }
             } else {
                 publish_plugin_tool_presentation_update(
@@ -37079,7 +37074,7 @@ async fn invoke_plugin_tool_transport(
         } else if let Ok(contribution) =
             serde_json::from_slice::<bcode_session_models::ToolContributionEvent>(&payload)
         {
-            if route_canonical_events_to_scope {
+            if route_canonical_events_to_scope && contribution.artifact.is_none() {
                 if let Some(scope) = invocation_scope {
                     let _accepted = scope.emit_contribution(contribution);
                 }
@@ -37483,6 +37478,40 @@ async fn clear_active_contributions(
         refresh_active_live_state_metrics(state);
     }
 }
+// Artifact-bearing updates are lifecycle messages, not lossy presentation hints. Admit and
+// publish them while the producer registration still exists, before returning its response.
+// Ordinary presentation remains bounded and best-effort through the scoped sink.
+async fn route_scoped_plugin_presentation_update(
+    state: &ServerState,
+    session_id: SessionId,
+    invocation_id: &str,
+    producer_id: &str,
+    scope: &InvocationScope,
+    update: bcode_tool::ToolPresentationUpdate,
+) {
+    if !scope.accepts_work() {
+        return;
+    }
+    if update.artifact.is_some() {
+        if publish_plugin_tool_presentation_update(
+            state,
+            session_id,
+            invocation_id,
+            producer_id,
+            update,
+        )
+        .await
+        .is_err()
+        {
+            // A rejected visual must not replace a physically settled tool outcome or permit
+            // replay of its effects. Keep diagnostics free of artifact paths and payloads.
+            tracing::warn!(%session_id, invocation_id, "artifact presentation admission rejected");
+        }
+    } else {
+        let _accepted = scope.emit_presentation_update(update);
+    }
+}
+
 async fn publish_plugin_tool_presentation_update(
     state: &ServerState,
     session_id: SessionId,
@@ -37490,6 +37519,9 @@ async fn publish_plugin_tool_presentation_update(
     producer_id: &str,
     update: bcode_tool::ToolPresentationUpdate,
 ) -> Result<(), String> {
+    // Reject unauthorized, stale, and closed presentation updates before touching artifacts.
+    accept_tool_presentation_update(state, session_id, invocation_id, producer_id, &update)
+        .map_err(|error| format!("presentation update rejected: {error:?}"))?;
     if update.artifact.is_some() {
         let artifact_envelope = bcode_session_models::ToolContributionEnvelope::new(
             bcode_session_models::ToolContributionPlacement::Hidden,
@@ -37517,13 +37549,10 @@ async fn publish_plugin_tool_presentation_update(
             Ok(()) => {}
             Err(error)
                 if error == "active artifact revision and committed length must increase"
-                    || error == "active artifact is already finalized"
-                    || error == "active artifact invocation is not registered" => {}
+                    || error == "active artifact is already finalized" => {}
             Err(error) => return Err(error),
         }
     }
-    accept_tool_presentation_update(state, session_id, invocation_id, producer_id, &update)
-        .map_err(|error| format!("presentation update rejected: {error:?}"))?;
     if let Ok(mut updates) = state.active_presentation_updates.lock() {
         updates.insert(
             (
@@ -39354,11 +39383,12 @@ fn transition_finalized_active_artifacts(
         .map(|reference| reference.key.as_str())
         .collect::<BTreeSet<_>>();
     if let Ok(mut active) = state.active_artifacts.lock() {
-        active.retain(|key, reference| {
+        // A committed result supersedes live evidence regardless of whether delivery of the
+        // producer's final live revision succeeded. Do not retain abandoned prefixes here.
+        active.retain(|key, _reference| {
             key.session_id != session_id
                 || key.artifact_id != artifact.artifact_id
                 || !reference_keys.contains(key.reference_key.as_str())
-                || !reference.finalized
         });
     }
 }
@@ -39433,6 +39463,7 @@ async fn append_tool_finished_event_inner(
         )
         .await;
     if let Ok(event) = &generic_event {
+        close_tool_presentation_update_scope(state, session_id, &tool_call_id);
         transition_finalized_active_artifacts(state, session_id, semantic_result.as_ref());
         publish_session_event(state, event).await;
         retire_tool_request_draft_after_result(state, session_id, &tool_call_id).await;
@@ -46282,6 +46313,7 @@ fn default_session_artifact_dir(session_id: SessionId) -> PathBuf {
 
 #[cfg(test)]
 mod tests {
+    include!("artifact_lifecycle_tests.rs");
     include!("session_operations/submission_tests.rs");
     mod collaboration_execution;
     mod goal_entry;

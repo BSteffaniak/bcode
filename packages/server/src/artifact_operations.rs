@@ -71,6 +71,7 @@ pub fn classify_internal_error(error: &str) -> ReadArtifactError {
     } else if error.contains("artifact reference has no storage URI")
         || error.contains("artifact reference is unavailable")
         || error.contains("artifact reference is incomplete")
+        || error.contains("active artifact is incomplete because its producer stopped")
         || error.contains("artifact file is unavailable")
         || error.contains("No such file or directory")
     {
