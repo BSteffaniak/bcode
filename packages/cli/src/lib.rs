@@ -13017,7 +13017,7 @@ fn auth_pool_compatibility_response(
             Ok(Some(compatibility))
         }
         Err(bcode_plugin::PluginServiceCallError::Service { code, .. })
-            if matches!(code.as_str(), "unsupported_operation" | "unsupported_provider") => Ok(None),
+            if matches!(code.as_str(), "unsupported_interface" | "unsupported_operation" | "unsupported_provider") => Ok(None),
         Err(bcode_plugin::PluginServiceCallError::Invoke(
             bcode_plugin::PluginLoadError::ServiceNotRegistered(_),
         )) => Ok(None),
@@ -23356,7 +23356,11 @@ mod auth_cli_tests {
             auth_pool_management_label(Some("subscription")),
             "automatic (subscription)"
         );
-        for code in ["unsupported_operation", "unsupported_provider"] {
+        for code in [
+            "unsupported_interface",
+            "unsupported_operation",
+            "unsupported_provider",
+        ] {
             assert!(
                 auth_pool_compatibility_response(Err(
                     bcode_plugin::PluginServiceCallError::Service {

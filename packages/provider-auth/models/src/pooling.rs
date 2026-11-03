@@ -3,6 +3,10 @@
 use serde::{Deserialize, Serialize};
 
 /// Optional authentication service operation. Unsupported means automatic pooling is unavailable.
+///
+/// Owners without the authentication service may return `unsupported_interface`; owners without
+/// this operation or provider may return `unsupported_operation` or `unsupported_provider`.
+/// Other failures and malformed responses must not be interpreted as missing capability.
 pub const OP_AUTH_POOL_COMPATIBILITY: &str = "pool_compatibility";
 
 /// Request to the enabled authentication owner, not an arbitrary provider plugin.

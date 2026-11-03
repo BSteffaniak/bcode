@@ -15,7 +15,7 @@ pub fn pool_compatibility(
     host: &bcode_plugin::PluginHost,
     provider: &bcode_plugin::RegisteredAuthProvider,
 ) -> Result<Option<bcode_provider_auth_models::AuthPoolCompatibility>, &'static str> {
-    match host.invoke_service_json(
+    pool_compatibility_response(host.invoke_service_json(
         &provider.plugin_id,
         bcode_provider_auth_models::AUTH_INTERFACE_ID,
         bcode_provider_auth_models::OP_AUTH_POOL_COMPATIBILITY,
@@ -23,7 +23,16 @@ pub fn pool_compatibility(
             schema_version: 1,
             provider_id: provider.contribution.provider_id.clone(),
         },
-    ) {
+    ))
+}
+
+fn pool_compatibility_response(
+    response: Result<
+        bcode_provider_auth_models::AuthPoolCompatibility,
+        bcode_plugin::PluginServiceCallError,
+    >,
+) -> Result<Option<bcode_provider_auth_models::AuthPoolCompatibility>, &'static str> {
+    match response {
         Ok(compatibility) => {
             let compatibility: bcode_provider_auth_models::AuthPoolCompatibility = compatibility;
             compatibility.validate().map_err(
@@ -34,7 +43,7 @@ pub fn pool_compatibility(
         Err(bcode_plugin::PluginServiceCallError::Service { code, .. })
             if matches!(
                 code.as_str(),
-                "unsupported_operation" | "unsupported_provider"
+                "unsupported_interface" | "unsupported_operation" | "unsupported_provider"
             ) =>
         {
             Ok(None)
@@ -549,6 +558,56 @@ fn adapt_effects(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn optional_pool_capability_accepts_only_explicitly_unsupported_services() {
+        for code in [
+            "unsupported_interface",
+            "unsupported_operation",
+            "unsupported_provider",
+        ] {
+            assert!(
+                pool_compatibility_response(Err(bcode_plugin::PluginServiceCallError::Service {
+                    code: code.to_owned(),
+                    message: "unsupported".to_owned(),
+                },))
+                .unwrap()
+                .is_none()
+            );
+        }
+        assert!(
+            pool_compatibility_response(Err(bcode_plugin::PluginServiceCallError::Invoke(
+                bcode_plugin::PluginLoadError::ServiceNotRegistered("bcode.auth/v1".to_owned()),
+            ),))
+            .unwrap()
+            .is_none()
+        );
+        assert_eq!(
+            pool_compatibility_response(Err(bcode_plugin::PluginServiceCallError::Service {
+                code: "internal_error".to_owned(),
+                message: "private plugin diagnostic".to_owned(),
+            },))
+            .unwrap_err(),
+            "Authentication pool compatibility could not be validated; credentials were not changed."
+        );
+        let valid = bcode_provider_auth_models::AuthPoolCompatibility {
+            schema_version: 1,
+            provider_id: "example".to_owned(),
+            group: "subscription".to_owned(),
+            methods: vec!["device".to_owned()],
+        };
+        assert_eq!(
+            pool_compatibility_response(Ok(valid.clone())).unwrap(),
+            Some(valid.clone())
+        );
+        assert!(
+            pool_compatibility_response(Ok(bcode_provider_auth_models::AuthPoolCompatibility {
+                schema_version: 99,
+                ..valid
+            }))
+            .is_err()
+        );
+    }
 
     #[test]
     fn completion_reports_pool_policy_and_survives_success_update() {
