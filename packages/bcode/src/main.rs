@@ -56,6 +56,9 @@ fn build_info() -> bcode_build_info::BuildInfo {
 }
 
 fn main() {
+    if let Some(code) = bcode_cli::xray_export_process_entry(&build_info()) {
+        std::process::exit(code);
+    }
     bcode_cli::record_process_entry();
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()

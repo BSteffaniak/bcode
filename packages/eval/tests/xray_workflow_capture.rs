@@ -132,7 +132,10 @@ impl Fixture {
             .env("HOME", self.root.join("home"))
             .env("XDG_CONFIG_HOME", self.root.join("xdg"))
             .env("BCODE_CONFIG", self.root.join("config.toml"))
-            .env("BCODE_LOG", "bcode_server::xray_http=info")
+            .env("BCODE_STARTUP_TRACE", "1")
+            // BCODE_LOG overrides the startup-trace default. Keep these fixed,
+            // secret-safe targets identical for every case; never enable payload logs.
+            .env("BCODE_LOG", "off,bcode_client::startup=debug,bcode_server::startup=debug,bcode_plugin::startup=debug,bcode_daemon_lifecycle::startup=debug,bcode_server::xray_http=info")
             .env("BCODE_STATE_DIR", self.root.join("state"));
         command
     }
@@ -155,11 +158,23 @@ impl Fixture {
                 .unwrap();
                 return status;
             }
-            assert!(
-                Instant::now() < deadline,
-                "{label} timed out; private evidence: {}",
-                self.root.display()
-            );
+            if Instant::now() >= deadline {
+                fs::write(
+                    self.root.join(format!("{label}.outcome.json")),
+                    serde_json::to_vec_pretty(&json!({
+                        "success": false, "timed_out": true,
+                        "effects_reconciled": false, "replayed": false,
+                        "stdout": format!("{label}.stdout"),
+                        "stderr": format!("{label}.stderr"),
+                    }))
+                    .unwrap(),
+                )
+                .unwrap();
+                panic!(
+                    "{label} timed out; private evidence: {}",
+                    self.root.display()
+                );
+            }
             std::thread::sleep(Duration::from_millis(25));
         }
     }
@@ -247,10 +262,10 @@ impl Fixture {
             .join("runs/capture/cases/scripted-loop/variants/single/repetitions/0001")
     }
 
-    fn stop(&self) {
+    fn stop(&self, label: &str) {
         assert!(
             self.invoke(
-                "stop",
+                label,
                 &["server", "stop-if-idle", "--wait"],
                 Duration::from_secs(30)
             )
@@ -291,8 +306,13 @@ fn spawn_logged(mut command: Command, root: &Path, label: &str) -> OwnedChild {
 fn read_json(path: &Path) -> Value {
     let metadata = fs::metadata(path).unwrap_or_else(|error| panic!("required artifact {} unavailable: {error}; inspect fixture eval.stderr/eval.stdout and execution-failure.json", path.display()));
     assert!(metadata.len() <= 4 * 1024 * 1024, "bounded fixture JSON");
-    let bytes = fs::read(path)
-        .unwrap_or_else(|error| panic!("read required artifact {}: {error}", path.display()));
+    let mut bytes = Vec::new();
+    File::open(path)
+        .unwrap()
+        .take(4 * 1024 * 1024 + 1)
+        .read_to_end(&mut bytes)
+        .unwrap();
+    assert!(bytes.len() <= 4 * 1024 * 1024, "bounded fixture JSON read");
     serde_json::from_slice(&bytes)
         .unwrap_or_else(|error| panic!("decode required artifact {}: {error}", path.display()))
 }
@@ -303,7 +323,11 @@ fn read_json(path: &Path) -> Value {
 fn assert_first_request_recorded(rep: &Path, root_run_id: &str) {
     use std::io::{BufRead as _, BufReader};
     let mut found = false;
-    for entry in fs::read_dir(rep.join("xray-execution")).unwrap().take(1025) {
+    for (index, entry) in fs::read_dir(rep.join("xray-execution"))
+        .unwrap()
+        .enumerate()
+    {
+        assert!(index < 1024, "execution bundle inspection bound exceeded");
         let entry = entry.unwrap();
         let name = entry.file_name();
         let name = name.to_str().unwrap();
@@ -320,6 +344,7 @@ fn assert_first_request_recorded(rep: &Path, root_run_id: &str) {
         let mut first = true;
         let mut first_turn = None;
         let mut first_request_checked = false;
+        let mut inspected_bytes = 0;
         loop {
             let mut line = Vec::new();
             let length = reader
@@ -331,6 +356,11 @@ fn assert_first_request_recorded(rep: &Path, root_run_id: &str) {
                 break;
             }
             assert!(length <= 1024 * 1024);
+            inspected_bytes += length;
+            assert!(
+                inspected_bytes <= 16 * 1024 * 1024,
+                "event inspection bound exceeded"
+            );
             let envelope: Value = serde_json::from_slice(&line).unwrap();
             if first {
                 assert_eq!(envelope["sequence"], 1);
@@ -450,62 +480,167 @@ fn assert_recorded(fixture: &Fixture, task_passed: bool) {
     assert!(fixture.root.join("runs/capture/summary.json").is_file());
 }
 
-#[test]
-#[ignore = "coordinator selects matching offline client/plugin artifacts and private evidence root"]
-fn actual_eval_cli_uses_production_policy_and_separates_task_from_evidence() {
-    let subject = Subject::selected();
-    for (label, expected, passed) in [
-        ("pass", "evaluated", true),
-        ("task-fails", "independent-oracle-must-not-match", false),
-    ] {
-        let fixture = Fixture::new(&subject, label);
-        fixture.configure(Grant::Exact, true, expected);
-        let status = fixture.eval(true);
-        fixture.stop();
-        assert_eq!(
-            status.success(),
-            passed,
-            "actual eval task result: {}",
-            fixture.root.display()
-        );
-        assert_recorded(&fixture, passed);
-    }
+fn panic_message(result: &std::thread::Result<()>) -> Option<&str> {
+    result.as_ref().err().map(|panic| {
+        panic
+            .downcast_ref::<String>()
+            .map(String::as_str)
+            .or_else(|| panic.downcast_ref::<&str>().copied())
+            .unwrap_or("non-string test failure")
+    })
 }
 
-#[test]
-#[ignore = "coordinator selects matching offline client/plugin artifacts and private evidence root"]
-fn actual_eval_cli_denies_absent_expired_foreign_and_ungranted_deep_scope() {
+/// Each test owns one attempt and one private scope. Never replay admission after
+/// a missing response. Catch assertions only to preserve cleanup AND primary evidence.
+fn run_case(label: &str, grant: Grant, deep: bool, expected: Option<bool>) {
     let subject = Subject::selected();
-    for (label, grant, grant_deep) in [
-        ("absent", Grant::Absent, true),
-        ("expired", Grant::Expired, true),
-        ("foreign", Grant::ForeignRoot, true),
-        ("namespace", Grant::ForeignNamespace, true),
-        ("state", Grant::ForeignState, true),
-        ("nonrecursive", Grant::NonRecursive, true),
-        ("shallow", Grant::Exact, false),
-    ] {
-        let fixture = Fixture::new(&subject, label);
-        fixture.configure(grant, grant_deep, "evaluated");
+    let fixture = Fixture::new(&subject, label);
+    let primary = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        fixture.configure(
+            grant,
+            deep,
+            if expected == Some(false) {
+                "independent-oracle-must-not-match"
+            } else {
+                "evaluated"
+            },
+        );
+        let fingerprints = ["config.toml", "suite.toml"].map(|name| {
+            let bytes = fs::read(fixture.root.join(name)).unwrap();
+            (name, hex::encode(Sha256::digest(bytes)))
+        });
+        fs::write(
+            fixture.root.join("inputs.json"),
+            serde_json::to_vec_pretty(&json!({"sha256": fingerprints})).unwrap(),
+        )
+        .unwrap();
         let status = fixture.eval(true);
-        fixture.stop();
-        assert!(!status.success());
-        let rep = fixture.repetition();
-        assert!(
-            !rep.join("admission.json").exists(),
-            "denial must precede admission"
-        );
-        let prepared = read_json(&rep.join("admission-prepare.stdout"));
-        assert_eq!(
-            prepared["run_id"], fixture.root_run_id,
-            "ordinary definition registration must succeed despite diagnostic denial"
-        );
-        assert!(prepared.get("runtime_work_id").is_none());
-        let failure = read_json(&rep.join("execution-failure.json"));
-        assert!(
-            failure.to_string().contains("observed_admission"),
-            "must fail at observed admission, not unrelated startup/config failure"
-        );
-        assert!(!rep.join("xray-execution/evidence.json").exists());
-    }
+        if let Some(passed) = expected {
+            assert_eq!(status.success(), passed, "task outcome differs from oracle");
+            assert_recorded(&fixture, passed);
+        } else {
+            assert_nonadmission(&fixture, status);
+        }
+    }));
+    let cleanup = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        fixture.stop("stop");
+    }));
+    fs::write(
+        fixture.root.join("case-outcome.json"),
+        serde_json::to_vec_pretty(&json!({
+            "schema_version": 1, "case": label, "attempts": 1,
+            "root_run_id": fixture.root_run_id,
+            "primary_passed": primary.is_ok(), "primary_failure": panic_message(&primary),
+            "cleanup_passed": cleanup.is_ok(), "cleanup_failure": panic_message(&cleanup),
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    assert!(
+        primary.is_ok() && cleanup.is_ok(),
+        "case {label}: primary={:?}, cleanup={:?}; evidence: {}",
+        panic_message(&primary),
+        panic_message(&cleanup),
+        fixture.root.display()
+    );
 }
+
+fn assert_nonadmission(fixture: &Fixture, status: ExitStatus) {
+    assert!(!status.success());
+    let rep = fixture.repetition();
+    let prepared = read_json(&rep.join("admission-prepare.stdout"));
+    assert_eq!(prepared["run_id"], fixture.root_run_id);
+    assert!(prepared.get("runtime_work_id").is_none());
+    let failure = read_json(&rep.join("execution-failure.json"));
+    assert!(
+        failure["error"]
+            .as_str()
+            .is_some_and(|error| error.contains("observed_admission")),
+        "must reach observed admission, not fail at unrelated startup/configuration"
+    );
+    // The current eval error deliberately preserves transport ambiguity. A missing
+    // local receipt cannot prove denial. Fence late commits by verified release of
+    // this fixture's exact daemon before one bounded public durable status lookup.
+    // This may start a replacement matching daemon in this PRIVATE scope only.
+    // Never cancel, resubmit, repair, inspect databases, or infer absence on error.
+    fixture.stop("nonadmission-release");
+    let reconciled = fixture.invoke(
+        "nonadmission-status",
+        &["workflow", "run-status", "--run-id", &fixture.root_run_id],
+        Duration::from_secs(30),
+    );
+    let absence = reconciled.success()
+        && read_json(&fixture.root.join("nonadmission-status.stdout")).is_null();
+    fs::write(
+        fixture.root.join("nonadmission-proof.json"),
+        serde_json::to_vec_pretty(&json!({
+            "schema_version": 1, "run_id": fixture.root_run_id,
+            "admission_response": "unresolved_no_retry",
+            "prior_owner_released": true,
+            "durable_absence_after_release": absence,
+            "admission_replayed": false,
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    assert!(
+        absence,
+        "non-admission unresolved or run exists; no retry permitted"
+    );
+    assert!(!rep.join("admission.json").exists());
+    assert!(!rep.join("xray-execution/evidence.json").exists());
+}
+
+macro_rules! acceptance_case {
+    ($name:ident, $label:literal, $grant:expr, $deep:expr, $expected:expr) => {
+        #[test]
+        #[ignore = "coordinator runs the frozen matrix once, serially, with explicit artifact hashes"]
+        fn $name() {
+            run_case($label, $grant, $deep, $expected);
+        }
+    };
+}
+
+// Fixed campaign: three positive samples, one task-failure independence case,
+// and the full negative matrix once. Rust test failures do not skip later cases.
+acceptance_case!(positive_1, "positive-1", Grant::Exact, true, Some(true));
+acceptance_case!(positive_2, "positive-2", Grant::Exact, true, Some(true));
+acceptance_case!(positive_3, "positive-3", Grant::Exact, true, Some(true));
+acceptance_case!(
+    task_failure,
+    "task-failure",
+    Grant::Exact,
+    true,
+    Some(false)
+);
+acceptance_case!(negative_absent, "absent", Grant::Absent, true, None);
+acceptance_case!(negative_expired, "expired", Grant::Expired, true, None);
+acceptance_case!(
+    negative_root,
+    "foreign-root",
+    Grant::ForeignRoot,
+    true,
+    None
+);
+acceptance_case!(
+    negative_namespace,
+    "foreign-namespace",
+    Grant::ForeignNamespace,
+    true,
+    None
+);
+acceptance_case!(
+    negative_state,
+    "foreign-state",
+    Grant::ForeignState,
+    true,
+    None
+);
+acceptance_case!(
+    negative_nonrecursive,
+    "nonrecursive",
+    Grant::NonRecursive,
+    true,
+    None
+);
+acceptance_case!(negative_shallow, "shallow", Grant::Exact, false, None);

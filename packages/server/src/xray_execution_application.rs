@@ -263,6 +263,8 @@ impl ServerState {
     ///
     /// # Errors
     /// Rejects foreign/unregistered callers, denied policy and malformed evidence pages.
+    /// Returns unavailable if completion and authorization recheck exceed five seconds
+    /// (or the earlier authorization expiry). The cutoff remains resumable.
     pub async fn finalize_execution_watch(
         &self,
         client_id: ClientId,
@@ -272,14 +274,42 @@ impl ServerState {
         let scope = self
             .xray_execution_watches
             .scope_for_principal(&client_id.to_string(), &request.watch_id)?;
-        self.authorize_execution_observation(
-            client_id,
-            WorkflowApplicationOperation::FinalizeExecutionObservation,
-            &scope,
-        )
-        .await?;
-        self.xray_execution_watches
-            .finalize_authorized(&client_id.to_string(), request)
+        let (_, authorization_deadline) = self
+            .authorize_execution_observation(
+                client_id,
+                WorkflowApplicationOperation::FinalizeExecutionObservation,
+                &scope,
+            )
+            .await?;
+        let mut deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+        if let Some(expiry) = authorization_deadline {
+            deadline = deadline.min(tokio::time::Instant::from_std(expiry));
+        }
+        tokio::time::timeout_at(deadline, async {
+            let evidence = self
+                .xray_execution_watches
+                .finalize_authorized_complete(&client_id.to_string(), request.clone())
+                .await?;
+            // Recheck after waiting, before exporting any completed evidence.
+            let (_, expiry) = self
+                .authorize_execution_observation(
+                    client_id,
+                    WorkflowApplicationOperation::FinalizeExecutionObservation,
+                    &scope,
+                )
+                .await?;
+            if expiry.is_some_and(|expiry| std::time::Instant::now() >= expiry) {
+                return Err(dto::ExecutionWatchError::Forbidden);
+            }
+            self.xray_execution_watches
+                .scope_for_principal(&client_id.to_string(), &request.watch_id)?;
+            if tokio::time::Instant::now() >= deadline {
+                return Err(dto::ExecutionWatchError::Unavailable);
+            }
+            Ok(evidence)
+        })
+        .await
+        .map_err(|_| dto::ExecutionWatchError::Unavailable)?
     }
 
     /// Export a bounded retained byte range after separate sensitive-export authorization.
@@ -292,21 +322,64 @@ impl ServerState {
         client_id: ClientId,
         request: dto::ExportExecutionWatchPayloadRequest,
     ) -> Result<bcode_xray_models::XrayPayloadRange, dto::ExecutionWatchError> {
-        version(request.schema_version)?;
-        let scope = self
-            .xray_execution_watches
-            .scope_for_principal(&client_id.to_string(), &request.watch_id)?;
-        if !scope.deep_capture {
-            return Err(dto::ExecutionWatchError::Forbidden);
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+        // One budget includes both policy checks; a read timeout never revokes
+        // the watch, poisons retention, or claims a missing payload is empty.
+        let mut shutdown = self.shutdown.subscribe();
+        let work = Box::pin(tokio::time::timeout_at(deadline, async {
+            version(request.schema_version)?;
+            let principal = client_id.to_string();
+            let selected = self.execution_observation_caller(client_id).await?;
+            let scope = self
+                .xray_execution_watches
+                .scope_for_principal(&principal, &request.watch_id)?;
+            if !scope.deep_capture {
+                return Err(dto::ExecutionWatchError::Forbidden);
+            }
+            let (root_session, expiry) = self
+                .authorize_execution_observation(
+                    client_id,
+                    WorkflowApplicationOperation::ExportExecutionObservation,
+                    &scope,
+                )
+                .await?;
+            let result = self
+                .xray_execution_watches
+                .export_authorized_complete(&self.xray, &principal, &request, expiry)
+                .await;
+            // Reauthorize even an engine error: withdrawal/expiry takes precedence.
+            let (current_root, current_expiry) = self
+                .authorize_execution_observation(
+                    client_id,
+                    WorkflowApplicationOperation::ExportExecutionObservation,
+                    &scope,
+                )
+                .await?;
+            if current_root != root_session
+                || self.execution_observation_caller(client_id).await? != selected
+                || expiry.is_some_and(|expiry| std::time::Instant::now() >= expiry)
+                || current_expiry.is_some_and(|expiry| std::time::Instant::now() >= expiry)
+                || self
+                    .xray_execution_watches
+                    .scope_for_principal(&principal, &request.watch_id)?
+                    != scope
+            {
+                return Err(dto::ExecutionWatchError::Forbidden);
+            }
+            // Policy awaits can race child removal/revocation: recheck the exact
+            // retained link synchronously immediately before releasing bytes.
+            self.xray_execution_watches
+                .validate_payload_export(&principal, &request)?;
+            if tokio::time::Instant::now() >= deadline {
+                return Err(dto::ExecutionWatchError::Unavailable);
+            }
+            result
+        }));
+        tokio::select! {
+            biased;
+            _ = shutdown.recv() => Err(dto::ExecutionWatchError::Unavailable),
+            result = work => result.map_err(|_| dto::ExecutionWatchError::Unavailable)?,
         }
-        self.authorize_execution_observation(
-            client_id,
-            WorkflowApplicationOperation::ExportExecutionObservation,
-            &scope,
-        )
-        .await?;
-        self.xray_execution_watches
-            .export_authorized(&self.xray, &client_id.to_string(), request)
     }
 
     /// Release diagnostic captures under the registered opening caller. Revocation does

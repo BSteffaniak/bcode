@@ -1,11 +1,10 @@
 # X-ray v1 protocol
 
-This describes implemented source contracts, not a release certification. Isolated
-provider diagnostics and real fake-provider dylib byte/hash tests passed; final
-coordinator integration acceptance remains pending. The latest whole-app run had
-18 passes/two failures. Workflow authorization-negative cases passed, but positive
-completeness failed; subsequent opaque-producer fixes still need rebuilt-artifact
-validation. See [Session X-ray](xray.md) for scope and validation requirements.
+This describes source contracts, not a release certification. Ordinary-event
+ingestion and pending-cutoff caller integration have changed; fresh integrated
+acceptance remains pending. Historical provider tests do not establish broad model,
+stream, or provider coverage. See [Session X-ray](xray.md) for current scope and
+validation requirements.
 
 X-ray is live, session-scoped, read-only diagnostics. Dropping/finalizing an
 observer closes capture, never cancels or mutates the observed execution. It is
@@ -30,7 +29,11 @@ An envelope contains:
   `tool_call_id`, `run_id`, `activation_id`, `attempt_id`.
 
 Sequences belong to one observation, start at one, and are not canonical session
-positions or durable cursors. Correlation is supplied by owning domains; absence
+positions or durable cursors. Ordinary-event sequences are assigned while consuming
+bounded global ingress, in processing order. Admission captures exact observation
+generations; a later attach cannot receive an earlier queued command. Admission
+before expiry permits later delivery, but does not permit new admission after expiry.
+Correlation is supplied by owning domains; absence
 means unknown, not permission to infer identity from text. Wall timestamps support
 joins, not cross-process elapsed-duration arithmetic. Domain elapsed intervals use
 monotonic clocks. Neither event content nor diagnostic correlation grants access.
@@ -124,12 +127,22 @@ The response reports the accepted engine cutoff with `observation_id`,
 Concurrent/retried cutoff requests coalesce while the observation is registered.
 A pending/unavailable response is not permission to assume finalization succeeded.
 Continue consuming SSE until the matching `xray.finalized` envelope with the same
-identity and final sequence. Drain queued events and tail gaps first. EOF before
+identity and final sequence. Internally, engine cutoff can remain `FinalizePending`
+while admitted publishers, ingress commands, or global loss reporters settle.
+Asynchronous completion resumes that same cutoff; applications bound waiting and
+must not cache pending as a terminal failure or report provisional success. This
+Rust API/configuration change does not change public models or the wire version.
+Drain queued events and tail gaps first. EOF before
 that envelope is incomplete. Retry support does not promise later replay after
 registration/retention ends.
 
-`hub_contention_drops` is conservative hub-wide loss during the observation, not an
-exact selected-session drop count. Finalization stops further capture for this
+`hub_contention_drops` is the legacy wire name for conservative presequence
+uncertainty, including global ingress count/byte exhaustion, publication-operation
+limits, lifecycle contention, and reported external loss. It is not an exact
+selected-session drop count and does not imply a corresponding sequence gap.
+Registered global loss reporters fence receipt completion; unrelated hub reporting
+can delay cutoff. Reports beginning after that uncertainty boundary need not enter
+the frozen receipt. Finalization stops further capture for this
 observer, not all observers or session execution. It proves neither provider
 termination, receipt publication, canonical settlement, transport delivery nor
 successful local recording. Those require their own outcomes.
@@ -143,7 +156,20 @@ successful local recording. Those require their own outcomes.
 Only authorized deep observations can export their retained bytes. A typed
 reference contains `schema_version`, `payload_id`, `session_id`, `content_type`,
 `byte_len`, `sha256`. It is not a filesystem locator. Capture is all-or-nothing,
-observation-owned and eviction-bounded. A range response contains `schema_version`,
+observation-owned and eviction-bounded. Payload producers reserve a separate bounded
+pending count/byte budget and channel permit before copying/hashing, then revalidate
+original deep-authorized generations and expiry before publication. The default
+global pending limits are 64 captures and 8 MiB; retained-cache limits remain separate.
+No reference returns without successful publication to at least one eligible original
+target. Consumer-state locking cannot reject capture; transient lifecycle contention
+and capacity/progress exhaustion still fail explicitly.
+
+Reads resolve a fixed prior-publication prefix. Unresolved ingress is transient
+engine `Busy`, not absent/empty success; asynchronous application reads wait within
+their operational deadline and recheck scope, expiry, revocation, and lease membership
+before releasing bytes. Cutoff settles payload commands as well as ordinary events.
+Pending budgets and engine APIs do not change public wire models or version 1.
+A range response contains `schema_version`,
 `observation_id`, the complete `payload` reference, `offset`, `bytes` (JSON byte
 array), and `eof`. Zero requested length, overflow, oversized ranges, foreign/
 shallow/missing observations and unavailable/evicted content fail closed. EOF can
@@ -185,8 +211,19 @@ pages and child readiness reserve capture before dispatch rather than claiming
 later parent events prove child coverage. Grant expiry/revocation and lost watch
 continuity remain explicit incomplete evidence, not implicit broader access.
 
-The CLI decouples SSE intake from stdout, payload fetches and recording with a
-bounded consumer queue (default 256; `--consumer-queue-capacity` range 1–4096).
+The CLI decouples SSE intake from stdout, payload fetches and recording with an
+owned exporter child and bounded consumer queue (default 256;
+`--consumer-queue-capacity` range 1–4096). Private framed IPC carries initialization
+and envelopes; a version, embedded loaded-build digest, and executable metadata
+handshake precedes bearer transfer. The bearer never enters argv or environment.
+Internal child `Ready` acknowledges initialization/recorder creation, not delivery
+of the session's `xray.ready` envelope or successful stdout/recording completion.
+Status frames contain typed outcomes, not arbitrary child error text.
+The child has an independent client; parent-local invalidation is not propagated
+through shared memory. Server authorization/expiry/revocation still governs payload
+requests, and the parent retains endpoint ownership through export shutdown.
+A nonrenewing drain deadline bounds stalled output/IPC; owned-child kill/reap has
+separate bounded waits. Unconfirmed reap remains unresolved failure with no recovery.
 Overflow interrupts the recording and reports incomplete evidence; it never stalls
 observed execution indefinitely. Optional `--reconnect transport` uses bounded fresh
 bootstrap/admission attempts, new readiness/observation IDs and distinct recording

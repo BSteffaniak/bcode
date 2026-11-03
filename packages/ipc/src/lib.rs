@@ -219,13 +219,35 @@ impl ArtifactId {
     ///
     /// Returns an I/O error if raw executable bytes cannot be read.
     pub fn for_executable(reader: &mut impl std::io::Read) -> std::io::Result<Self> {
-        if env!("BCODE_ARTIFACT_ID_EXPLICIT") == "true" {
-            return Ok(Self(ARTIFACT_ID.to_owned()));
-        }
-        Self::from_executable(reader)
+        Self::for_executable_with_digest(reader).map(|(identity, _)| identity)
     }
 
+    /// Resolve identity and return the digest computed from these supplied bytes.
+    ///
+    /// Raw Cargo builds consume the reader from its current position and return
+    /// `Some` lowercase hexadecimal SHA-256. Explicit producer identities return
+    /// `None` without reading: no byte digest was computed in that mode. The digest
+    /// is not independent authorization; callers must still verify expected identity.
+    ///
+    /// # Errors
+    /// Returns an I/O error if raw executable bytes cannot be read.
+    pub fn for_executable_with_digest(
+        reader: &mut impl std::io::Read,
+    ) -> std::io::Result<(Self, Option<String>)> {
+        if env!("BCODE_ARTIFACT_ID_EXPLICIT") == "true" {
+            return Ok((Self(ARTIFACT_ID.to_owned()), None));
+        }
+        Self::from_executable_with_digest(reader).map(|(identity, digest)| (identity, Some(digest)))
+    }
+
+    #[cfg(test)]
     fn from_executable(reader: &mut impl std::io::Read) -> std::io::Result<Self> {
+        Self::from_executable_with_digest(reader).map(|(identity, _)| identity)
+    }
+
+    fn from_executable_with_digest(
+        reader: &mut impl std::io::Read,
+    ) -> std::io::Result<(Self, String)> {
         let mut digest = Sha256::new();
         let mut buffer = vec![0_u8; 65536].into_boxed_slice();
         loop {
@@ -235,10 +257,8 @@ impl ArtifactId {
             }
             digest.update(&buffer[..read]);
         }
-        Ok(Self(format!(
-            "cargo-sha256-{}",
-            hex::encode(digest.finalize())
-        )))
+        let digest = hex::encode(digest.finalize());
+        Ok((Self(format!("cargo-sha256-{digest}")), digest))
     }
 
     /// Return the artifact identity as text.
@@ -4877,6 +4897,32 @@ mod tests {
     }
 
     #[test]
+    fn executable_digest_api_preserves_identity_and_computation_semantics() {
+        let bytes = b"abc";
+        let mut reader = std::io::Cursor::new(bytes);
+        let (identity, digest) = ArtifactId::for_executable_with_digest(&mut reader).unwrap();
+        assert_eq!(
+            identity,
+            ArtifactId::for_executable(&mut bytes.as_slice()).unwrap()
+        );
+        if env!("BCODE_ARTIFACT_ID_EXPLICIT") == "true" {
+            assert!(digest.is_none());
+            assert_eq!(reader.position(), 0);
+        } else {
+            assert_eq!(
+                digest.as_deref(),
+                Some("ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad")
+            );
+            assert_eq!(reader.position(), 3);
+        }
+        let (_, computed) = ArtifactId::from_executable_with_digest(&mut bytes.as_slice()).unwrap();
+        assert_eq!(
+            computed,
+            "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
+        );
+    }
+
+    #[test]
     fn raw_artifact_identity_tracks_final_bytes_and_survives_copy() {
         let first = b"final target a with cached dependency label";
         let second = b"final target b with cached dependency label";
@@ -4901,6 +4947,13 @@ mod tests {
             }
         }
         assert!(ArtifactId::from_executable(&mut Unreadable).is_err());
+        assert!(ArtifactId::from_executable_with_digest(&mut Unreadable).is_err());
+        let public_result = ArtifactId::for_executable_with_digest(&mut Unreadable);
+        if env!("BCODE_ARTIFACT_ID_EXPLICIT") == "true" {
+            assert!(public_result.unwrap().1.is_none());
+        } else {
+            assert!(public_result.is_err());
+        }
     }
 
     #[test]

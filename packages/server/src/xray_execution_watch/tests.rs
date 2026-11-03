@@ -457,6 +457,70 @@ fn deep_payload_ranges_are_bound_to_exact_grant_run_and_observation() {
     ));
 }
 
+#[tokio::test]
+async fn complete_payload_read_keeps_exact_link_and_expiry_fences() {
+    let hub = XrayHub::default();
+    let registry = ExecutionWatchRegistry::default();
+    let grant =
+        ExecutionWatchGrant::authorized("test-client".into(), "root".into(), true, true).unwrap();
+    let id = registry.open(1, &grant).unwrap();
+    let session = SessionId::new();
+    admit(&registry, &hub, session, "root", &[]);
+    let ready = registry.page(&grant, &id, 0, 8).unwrap();
+    let reference = hub
+        .capture_payload(
+            &XrayCorrelation {
+                session_id: session.to_string(),
+                run_id: Some("root".into()),
+                ..Default::default()
+            },
+            "text/plain",
+            b"bounded bytes",
+        )
+        .unwrap()
+        .unwrap();
+    let request = bcode_xray_models::XrayReadPayloadRequest {
+        schema_version: 1,
+        observation_id: ready.events[0].envelope.observation_id.clone(),
+        session_id: session.to_string(),
+        payload_id: reference.payload_id,
+        offset: 0,
+        length: 7,
+    };
+    let request = bcode_xray_models::execution_watch::ExportExecutionWatchPayloadRequest {
+        schema_version: 1,
+        watch_id: id,
+        run_id: "root".into(),
+        payload: request,
+    };
+    assert!(matches!(
+        registry
+            .read_payload_complete(&hub, &grant, &request, Some(std::time::Instant::now()),)
+            .await,
+        Err(ExecutionWatchError::Forbidden)
+    ));
+    let mut foreign = request.clone();
+    foreign.run_id = "child".into();
+    assert!(matches!(
+        registry
+            .read_payload_complete(&hub, &grant, &foreign, None,)
+            .await,
+        Err(ExecutionWatchError::Forbidden)
+    ));
+    let range = registry
+        .read_payload_complete(&hub, &grant, &request, None)
+        .await
+        .unwrap();
+    assert_eq!(range.bytes, b"bounded");
+    registry.revoke(&grant).unwrap();
+    assert!(matches!(
+        registry
+            .read_payload_complete(&hub, &grant, &request, None,)
+            .await,
+        Err(ExecutionWatchError::Forbidden)
+    ));
+}
+
 #[test]
 fn validates_versions_policy_and_page_bounds_before_capture() {
     let registry = ExecutionWatchRegistry::default();

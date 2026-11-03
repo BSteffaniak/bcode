@@ -101,11 +101,11 @@ fn live_image_without_registry_survives_and_exit_or_crash_releases_it() {
 fn pinned_executable_child() {
     let pinned = pinned_bcode_executable().unwrap();
     let root = PathBuf::from(std::env::var_os("BCODE_IMAGE_LEASE_TEST_ROOT").unwrap());
-    fs::write(
-        root.join("pinned"),
-        pinned.path().as_os_str().as_encoded_bytes(),
-    )
-    .unwrap();
+    let pending = root.join("pinned.pending");
+    fs::write(&pending, pinned.path().as_os_str().as_encoded_bytes()).unwrap();
+    // Existence is the parent's readiness signal: publish only the complete path,
+    // never an empty/partial marker observed between create and write.
+    fs::rename(pending, root.join("pinned")).unwrap();
     loop {
         std::thread::sleep(Duration::from_millis(10));
         std::hint::black_box(pinned);

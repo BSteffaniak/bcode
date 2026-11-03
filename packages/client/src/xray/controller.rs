@@ -223,6 +223,23 @@ impl XrayObservationController {
         self.active.as_ref().map(|active| &active.client)
     }
 
+    /// Transfer this live observation's transport capability to an owned exporter.
+    ///
+    /// The returned bearer is sensitive: send it only over private IPC, never in
+    /// arguments, environment variables, diagnostics, or persisted recordings.
+    /// This does not grant execution authority or extend endpoint authorization.
+    ///
+    /// # Errors
+    /// Returns an error if no active observation exists, its capability was revoked,
+    /// or its authorization header cannot be represented as a bearer string.
+    pub fn export_process_transport(&self) -> Result<(String, String), XrayClientError> {
+        self.active
+            .as_ref()
+            .ok_or(XrayClientError::InvalidCredential)?
+            .client
+            .export_process_transport()
+    }
+
     /// Revoke/drop the previous capability, authorize a new endpoint and await readiness.
     /// Failed attempts are never retried with cached credentials. Even failed admissions
     /// consume an ordinal so a later success cannot conceal an intervening capture gap.

@@ -639,19 +639,30 @@ async fn acceptance(immediate: bool, public: bool, shared_parent: bool, test_nam
     if isolated_acceptance(test_name).await {
         return;
     }
+    eprintln!("xray acceptance phase: setup begin");
     let mut fixture = Box::pin(AcceptanceFixture::setup(immediate, public, shared_parent)).await;
+    eprintln!("xray acceptance phase: setup complete; register begin");
     let (start, lock, digest) = fixture.register().await;
+    eprintln!("xray acceptance phase: register complete; admission begin");
     let ready = Box::pin(fixture.admit(start, &lock, &digest)).await;
+    eprintln!("xray acceptance phase: admission complete; verify admission begin");
     fixture.verify_admission(&ready).await;
+    eprintln!("xray acceptance phase: verify admission complete; drive begin");
     let driven = Box::pin(fixture.drive(&ready)).await;
+    eprintln!("xray acceptance phase: drive complete; foreign drive begin");
     fixture.drive_foreign().await;
+    eprintln!("xray acceptance phase: foreign drive complete; finalize begin");
     let runs = driven.runs.clone();
     let (events, cutoff, cursor) = fixture.finalize(&ready, driven).await;
+    eprintln!("xray acceptance phase: finalize complete; verify evidence begin");
     fixture
         .verify_evidence(&ready, &events, &cutoff, &runs)
         .await;
+    eprintln!("xray acceptance phase: verify evidence complete; late/revoke begin");
     fixture.verify_late_and_revoke(ready, cursor).await;
+    eprintln!("xray acceptance phase: late/revoke complete; finish begin");
     fixture.finish().await;
+    eprintln!("xray acceptance phase: finish complete");
     drop(fixture);
     drop(guard);
 }
@@ -674,22 +685,29 @@ impl AcceptanceFixture {
             session_root.display()
         );
         let sessions = crate::SessionManager::persistent_lazy(&session_root);
+        eprintln!("xray acceptance phase: setup parent session begin");
         let parent = sessions
             .create_session(Some("xray-recursive-owner".into()), root.clone())
             .await
             .expect("parent session");
+        eprintln!("xray acceptance phase: setup parent session complete; workflow store begin");
         let store = bcode_workflow_store::WorkflowStore::create_coexistence_baseline(&root)
             .expect("typed workflow store");
+        eprintln!("xray acceptance phase: setup workflow store complete");
         let scope = dto::ExecutionWatchScope {
             root_run_id: RUN.into(),
             recursive: true,
             deep_capture: true,
         };
+        eprintln!("xray acceptance phase: setup configuration begin");
         let (state, approved) = configure_state(sessions, store, public, &scope);
+        eprintln!("xray acceptance phase: setup configuration complete; connection begin");
         let fixture = Fixture(Arc::new(state));
         let transport = connect_fixture(&fixture.0, public, &approved).await;
+        eprintln!("xray acceptance phase: setup connection complete");
         drop(approved);
         // Typed structured schema/query APIs only; no SQL text or driver escape hatches.
+        eprintln!("xray acceptance phase: setup typed database connection begin");
         let db = switchy_database_connection::open_sqlite_rusqlite(
             &crate::workflow_store_path(&fixture.0),
             &switchy_database_connection::SqliteOpenOptions {
@@ -701,6 +719,7 @@ impl AcceptanceFixture {
             },
         )
         .expect("typed database connection");
+        eprintln!("xray acceptance phase: setup typed database connection complete");
         Self {
             fixture,
             root,
@@ -726,6 +745,7 @@ impl AcceptanceFixture {
         let lock = package_lock(&identity);
         lock.validate().expect("recursive package lock");
         let digest = lock.digest_sha256().expect("lock digest");
+        eprintln!("xray acceptance phase: register definition begin");
         self.fixture
             .0
             .workflow_store
@@ -737,7 +757,9 @@ impl AcceptanceFixture {
                 &definition,
             )
             .expect("registered executable definition");
+        eprintln!("xray acceptance phase: register definition complete");
         if !self.immediate {
+            eprintln!("xray acceptance phase: package publication begin");
             self.db
                 .insert("workflow_package_publications")
                 .value("package_id", lock.package_id.as_str())
@@ -751,6 +773,7 @@ impl AcceptanceFixture {
                 .execute(&self.db)
                 .await
                 .expect("publish immutable recursive fixture");
+            eprintln!("xray acceptance phase: package publication complete");
         }
         let limits = workflow::WorkflowRunLimits {
             recursion_depth_cap: 8,
@@ -864,6 +887,7 @@ impl AcceptanceFixture {
         lock: &workflow::WorkflowPackageLock,
         digest: &str,
     ) -> dto::ExecutionWatchReady {
+        eprintln!("xray acceptance phase: gated run admission begin");
         crate::workflow_operations::start_run_with_package(
             &self.fixture.0,
             start,
@@ -872,9 +896,11 @@ impl AcceptanceFixture {
         )
         .await
         .expect("real gated recursive run admission");
+        eprintln!("xray acceptance phase: gated run admission complete; initial gate query begin");
         let waits = representation::graph::gate_waits::page(&self.db, RUN, 8)
             .await
             .expect("canonical initial gate");
+        eprintln!("xray acceptance phase: initial gate query complete");
         assert_eq!(
             waits.gates.len(),
             1,
@@ -981,7 +1007,9 @@ impl AcceptanceFixture {
                 if self.immediate { assert!(gates.is_empty(), "observed start must capture immediate provider calls without an authored barrier"); }
                 for gate in gates {
                     if resolved.insert((run.clone(), gate.activation_id.clone())) {
+                        eprintln!("xray acceptance phase: gate resolution begin");
                         let result = crate::workflow_operations::provide_input(&self.fixture.0, &run, &gate.node_id, &gate.activation_id, gate.input).await.expect("ordinary execution activation after watch ready");
+                        eprintln!("xray acceptance phase: gate resolution complete");
                         assert_eq!(result.outcome, "accepted");
                     }
                 }
@@ -996,7 +1024,9 @@ impl AcceptanceFixture {
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
     }).await;
+        eprintln!("xray acceptance phase: drive loop ended; retain diagnostics begin");
         retain_diagnostics(&self.fixture.0, &self.root, &runs, &events).await;
+        eprintln!("xray acceptance phase: retain diagnostics complete");
         completion.expect("finite real recursive execution must complete; retained acceptance-diagnostics.json records canonical progress");
         assert_eq!(
             runs.len(),

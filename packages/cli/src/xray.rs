@@ -11,7 +11,9 @@ use clap::Args;
 use crate::CliError;
 use bcode_xray::recording::{JsonlBundleRecorder, RecordingOptions, RecordingSink};
 
+mod export_process;
 mod reconnect;
+pub use export_process::xray_export_process_entry;
 
 #[cfg(test)]
 mod tests;
@@ -72,7 +74,7 @@ pub struct XrayArgs {
     #[arg(long, value_parser = clap::value_parser!(u64).range(1..))]
     pub duration_seconds: Option<u64>,
     /// Maximum time to drain the network after requesting a delivery cutoff.
-    /// Accepted local IO is joined before payload release, not detached on timeout.
+    /// Exporter shutdown has a separate nonrenewable 30-second deadline and bounded reap.
     #[arg(long, default_value_t = 15, value_parser = clap::value_parser!(u64).range(1..=300))]
     pub finalize_timeout_seconds: u64,
 }
@@ -245,27 +247,30 @@ async fn run_endpoint(args: &XrayArgs, endpoint: &str, token_file: &Path) -> Res
         serde_json::from_value(ready.event.data.clone())?;
     let range_bytes = u32::try_from(capabilities.max_payload_range_bytes.min(64 * 1024))
         .map_err(|_| invalid("invalid X-ray payload range capability"))?;
-    let (sender, receiver) = tokio::sync::mpsc::channel(usize::from(args.consumer_queue_capacity));
-    let worker_client = client.clone();
-    let destination = args.record.clone();
-    let observation_id = stream.observation_id().to_owned();
-    let session_id = args.session_id.to_string();
-    let runtime = tokio::runtime::Handle::current();
-    let (consumer_finished, consumer_done) = tokio::sync::oneshot::channel();
-    let consumer = tokio::task::spawn_blocking(move || {
-        let result = consume_segment(
-            receiver,
-            &worker_client,
-            destination.as_deref(),
-            &observation_id,
-            &session_id,
-            range_bytes,
-            &runtime,
-        );
-        let _ = consumer_finished.send(());
-        result
-    });
-    let result = receive_endpoint(args, &client, &mut stream, &sender, consumer_done, ready).await;
+    let init = export_process::Init::new(
+        &client,
+        args.record.clone(),
+        stream.observation_id().to_owned(),
+        args.session_id.to_string(),
+        None,
+        range_bytes,
+    )
+    .map_err(ConsumerFailure::into_cli)?;
+    let (sender, consumer_done, consumer) =
+        export_process::spawn(init, usize::from(args.consumer_queue_capacity))
+            .await
+            .map_err(ConsumerFailure::into_cli)?;
+    let result = receive_endpoint(
+        args,
+        &client,
+        &mut stream,
+        &sender,
+        consumer_done,
+        ready,
+        &consumer,
+    )
+    .await;
+    consumer.begin_shutdown();
     // Finish is sent only after an authenticated terminal frame. FIFO ordering makes
     // the consumer verify/store all preceding payloads before it flushes the bundle.
     let boundary = stream.finalization().cloned();
@@ -288,11 +293,9 @@ async fn run_endpoint(args: &XrayArgs, endpoint: &str, token_file: &Path) -> Res
         let _ = sender.send(ConsumerMessage::Finish(boundary)).await;
     }
     drop(sender);
-    // Never detach the blocking task on timeout: it may still hold payload references
-    // or bundle descriptors. Failed intake drains accepted work then marks interrupted.
-    let export_result = consumer
-        .await
-        .map_err(|_| invalid("X-ray consumer failed; inspect the unfinished bundle manifest"))?;
+    // The supervised child owns all blocking IO. Join includes bounded kill/reap
+    // on timeout, with cleanup explicitly unconfirmed if the OS cannot reap it.
+    let export_result = consumer.join().await.map_err(ConsumerFailure::into_cli);
     if result.is_ok()
         && export_result.is_ok()
         && terminal_received
@@ -302,8 +305,20 @@ async fn run_endpoint(args: &XrayArgs, endpoint: &str, token_file: &Path) -> Res
             "X-ray retained-payload release is unconfirmed; session work is unaffected",
         ));
     }
-    result?;
-    export_result
+    finish_delivery(result, export_result)
+}
+
+fn finish_delivery(
+    intake: Result<(), CliError>,
+    export: Result<(), CliError>,
+) -> Result<(), CliError> {
+    match (intake, export) {
+        (Err(primary), Err(drain)) => Err(invalid(&format!(
+            "{primary}; X-ray accepted-message drain also failed: {drain}",
+        ))),
+        (Err(primary), Ok(())) => Err(primary),
+        (Ok(()), result) => result,
+    }
 }
 
 async fn receive_endpoint(
@@ -313,6 +328,7 @@ async fn receive_endpoint(
     sender: &tokio::sync::mpsc::Sender<ConsumerMessage>,
     mut consumer_done: tokio::sync::oneshot::Receiver<()>,
     ready: bcode_xray_models::XrayEnvelope,
+    consumer: &export_process::ExportProcess,
 ) -> Result<(), CliError> {
     enqueue(sender, ready)?;
     let stop = async {
@@ -330,7 +346,7 @@ async fn receive_endpoint(
         tokio::select! {
             _ = &mut consumer_done => return Err(invalid(
                 "X-ray consumer stopped; recording is unfinished; inspect disk/stdout and manifest.json")),
-            result = &mut stop => { result?; break; }
+            result = &mut stop => { consumer.begin_shutdown(); result?; break; }
             envelope = stream.recv() => {
                 match envelope.map_err(|error| transport_error(&error))? {
                     Some(envelope) => enqueue(sender, envelope)?,
@@ -353,9 +369,14 @@ async fn receive_endpoint(
         }
         Ok::<(), CliError>(())
     };
-    tokio::time::timeout(Duration::from_secs(args.finalize_timeout_seconds), drain)
-        .await
-        .map_err(|_| invalid("X-ray finalization timed out; bundle is unfinished"))?
+    tokio::time::timeout_at(
+        consumer
+            .shutdown_deadline()
+            .min(tokio::time::Instant::now() + Duration::from_secs(args.finalize_timeout_seconds)),
+        drain,
+    )
+    .await
+    .map_err(|_| invalid("X-ray finalization timed out; bundle is unfinished"))?
 }
 
 #[cfg(test)]
@@ -401,6 +422,7 @@ impl From<CliError> for ConsumerFailure {
     }
 }
 
+#[cfg(test)]
 fn consume_segment(
     receiver: tokio::sync::mpsc::Receiver<ConsumerMessage>,
     client: &XrayClient,
@@ -433,6 +455,7 @@ struct ConsumerRecording<'a> {
     previous: Option<&'a str>,
 }
 
+#[cfg(test)]
 fn consume_segment_after_gap(
     mut receiver: tokio::sync::mpsc::Receiver<ConsumerMessage>,
     client: &XrayClient,
@@ -440,25 +463,7 @@ fn consume_segment_after_gap(
     range_bytes: u32,
     runtime: &tokio::runtime::Handle,
 ) -> Result<(), ConsumerFailure> {
-    let ConsumerRecording {
-        destination,
-        observation_id,
-        session_id,
-        previous,
-    } = recording;
-    let mut recorder = match (destination, previous) {
-        (Some(path), Some(previous)) => Some(Box::new(
-            JsonlBundleRecorder::create_segment(
-                path,
-                observation_id,
-                session_id,
-                previous,
-                RecordingOptions::default(),
-            )
-            .map_err(|_| invalid("could not create fresh gapful recording segment"))?,
-        ) as Box<dyn RecordingSink>),
-        _ => open_recording(destination, observation_id, session_id)?,
-    };
+    let mut recorder = open_segment_recording(recording)?;
     let mut stdout = std::io::stdout();
     while let Some(message) = receiver.blocking_recv() {
         match message {
@@ -493,6 +498,29 @@ fn consume_segment_after_gap(
         let _ = recorder.interrupt();
     }
     Err(invalid("X-ray segment interrupted: inspect manifest.json; retain the bundle and start a new segment, never append or repair automatically").into())
+}
+
+fn open_segment_recording(
+    recording: ConsumerRecording<'_>,
+) -> Result<Option<Box<dyn RecordingSink>>, CliError> {
+    let ConsumerRecording {
+        destination,
+        observation_id,
+        session_id,
+        previous,
+    } = recording;
+    match (destination, previous) {
+        (Some(path), Some(previous)) => JsonlBundleRecorder::create_segment(
+            path,
+            observation_id,
+            session_id,
+            previous,
+            RecordingOptions::default(),
+        )
+        .map(|recorder| Some(Box::new(recorder) as Box<dyn RecordingSink>))
+        .map_err(|_| invalid("could not create fresh gapful recording segment")),
+        _ => open_recording(destination, observation_id, session_id),
+    }
 }
 
 async fn record_envelope(

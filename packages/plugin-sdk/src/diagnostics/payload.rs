@@ -68,18 +68,22 @@ pub(super) fn capture(
         return Err(XrayError::PayloadTooLarge);
     }
     let request = |operation| {
-        sink.control(super::DiagnosticControlOperation::Payload(operation))?
-            .payload
+        sink.control(super::DiagnosticControlOperation::Payload(operation))
+            .map(|status| status.payload)
+            .ok_or(XrayError::Unavailable)
     };
-    let Some(PayloadReply::Supported {
+    let (max_bytes, chunk_bytes) = match request(PayloadControl::Negotiate {
         version: PAYLOAD_VERSION,
-        max_bytes,
-        chunk_bytes,
-    }) = request(PayloadControl::Negotiate {
-        version: PAYLOAD_VERSION,
-    })
-    else {
-        return Err(XrayError::PayloadCaptureUnsupported);
+    })? {
+        Some(PayloadReply::Supported {
+            version: PAYLOAD_VERSION,
+            max_bytes,
+            chunk_bytes,
+        }) => (max_bytes, chunk_bytes),
+        // A valid legacy control response without the optional extension is the
+        // only evidence that the host does not implement payload capture.
+        None => return Err(XrayError::PayloadCaptureUnsupported),
+        Some(_) => return Err(XrayError::Unavailable),
     };
     if bytes.len() > max_bytes || chunk_bytes == 0 || chunk_bytes > MAX_CHUNK_BYTES {
         return Err(XrayError::PayloadTooLarge);
@@ -89,8 +93,9 @@ pub(super) fn capture(
         byte_len: bytes.len(),
         sha256: digest.clone(),
         media_type: media_type.into(),
-    }) else {
-        return Err(XrayError::PayloadCaptureUnsupported);
+    })?
+    else {
+        return Err(XrayError::Unavailable);
     };
     // Every exit after Begin must release the host reservation, including an unwinding
     // caller. Finish consumes it on success; Abort is deliberately idempotent.
@@ -104,13 +109,13 @@ pub(super) fn capture(
                 transfer,
                 offset: index * chunk_bytes,
                 bytes: chunk.to_vec(),
-            }),
+            })?,
             Some(PayloadReply::Progress)
         ) {
-            return Err(XrayError::PayloadCaptureUnsupported);
+            return Err(XrayError::Unavailable);
         }
     }
-    let result = request(PayloadControl::Finish { transfer });
+    let result = request(PayloadControl::Finish { transfer })?;
     match result {
         Some(PayloadReply::Retained { reference })
             if reference.schema_version == bcode_xray::XRAY_SCHEMA_VERSION
@@ -123,7 +128,7 @@ pub(super) fn capture(
             pending.transfer = None;
             Ok(Some(reference))
         }
-        _ => Err(XrayError::PayloadCaptureUnsupported),
+        _ => Err(XrayError::Unavailable),
     }
 }
 

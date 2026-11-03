@@ -8,18 +8,70 @@ repair, steering, cross-session aggregation, or web-inspector facility.
 
 **Implementation status:** this checkout contains live capture, typed reference export,
 independently negotiated native payload transfer, bounded CLI consumption/recovery,
-and explicitly authorized recursive workflow observation. This is not a release or
-complete-provider-quality claim. Current coordinator-reported validation includes
-isolated diagnostic tests for all five providers and the real fake-provider dylib
-Unicode/complete-byte hash regression passing. The identified offline whole-app
-suite passed all 20 cases, and its engine acceptance suite passed nine cases.
-Four workflow authorization-negative cases passed. Positive workflow evaluation
-remains blocked by intermittent genuine producer-lock contention: the latest
-attributed run lost one emit despite complete exported payloads and no opaque
-producer events. Completeness correctly remains false for that run. Bounded
-nonblocking ingest decoupled from observer-state locking requires further design
-and acceptance; passing individual runs do not establish reliable closure. Final
-coordinator acceptance remains pending; see [validation](#validation-requirements).
+and explicitly authorized recursive workflow observation. Ordinary events and
+sensitive payload captures now use separate bounded global channels rather than
+acquiring observer consumer state on producer paths. Source changes and
+coordinator-reported package tests are prior-phase validation, not release
+certification: fresh integrated workflow, exporter lifecycle, and evidence acceptance
+remain pending. Transient lifecycle contention and capacity exhaustion can still
+lose diagnostics; passing individual runs does not establish lossless capture or
+complete provider coverage. See [validation](#validation-requirements).
+
+### Ordinary-event ingestion and cutoff
+
+Producers capture exact observation-generation targets at admission and publish
+without waiting for consumer state or channel capacity. Consumers assign sequences
+in publication-processing order, not wall-clock or admission order. Later attaches
+do not receive earlier queued commands. Events admitted before expiry remain
+eligible for delivery after expiry; new event admission and sensitive-payload
+commit enforce their respective scope/deadline checks.
+
+Global ingress rejection occurs before sequence allocation. It contributes
+conservative uncertainty to the legacy `hub_contention_drops` field, not an invented
+sequence gap. Per-observation delivery-queue overflow remains sequenced and produces
+exact gaps. Lifecycle-only registry access can still reject producers, including
+payload commit, with truthful uncertainty accounting. Ordinary consumer reads do
+not acquire producer admission locks. This is neither a durable channel nor a
+guarantee of delivery under arbitrary load.
+
+Engine Rust configuration adds global `ingress_capacity` (default 256),
+`max_ingress_bytes` (default 16 MiB serialized content), and
+`max_inflight_operations` (default 256). Public models and wire versions are unchanged.
+Memory ownership includes ingress plus existing per-observation delivery queues,
+bounded admitted-publisher inputs/target metadata, and retained payloads. Serialized
+byte limits are not exact heap measurements.
+
+### Bounded payload publication
+
+Payload preparation reserves global pending count, byte credits, and channel capacity
+before copying/hashing. Defaults are `max_pending_payloads = 64` (valid 2 through
+1,048,576) and `max_pending_payload_bytes = 8 MiB` (at least `max_payload_bytes`).
+Zero-byte captures still consume count. Checked payload ownership includes global
+pending bytes plus each observation's retained-cache limit; concurrent authorized
+range/export copies and metadata are separate bounded ownership.
+
+Commit revalidates only the original observation generations, exact session/run,
+deep scope, CLOSED state, and expiry after preparation. No reference is returned if
+no original target remains eligible or publication fails. A successful reference
+means bytes are owned by bounded host ingress or cache, not a promise to reconstruct
+them later. Pending credits remain charged until cache transfer or rejection.
+Payloads admitted before expiry can drain afterward; later attachments do not inherit
+them. Lifetime progress exhaustion fails explicitly before successful publication.
+
+Immediate payload reads pump a finite prior-publication prefix. If that prefix is
+unresolved, the engine returns transient `Busy` rather than pretending bytes are
+missing or empty. Asynchronous reads preserve their prefix across notifications;
+applications impose bounded waiting and recheck authorization/expiry after awaits.
+Both event and payload ingress participate in cutoff settlement. These are Rust
+configuration/API changes, not public model or wire-version changes.
+
+Cutoff closes admission once, then completes only after admitted publications,
+queued commands, and registered global uncertainty reporters settle. The Rust engine
+can return `FinalizePending`; asynchronous completion resumes the same irreversible
+cutoff without holding consumer locks across awaits. Unrelated hub reporters can
+delay completion. Applications must enforce bounded waiting and preserve pending
+rather than fabricate a receipt or cache pending as permanent failure. Finalized
+receipts remain frozen; stopping observation never cancels execution.
 
 See [protocol and browser example](xray-protocol.md),
 [frontend contracts](frontend-contracts.md),
@@ -103,11 +155,31 @@ success, invented references or permission to read private storage.
 The recording interface is a consumer-side sink, independent of daemon persistence;
 it can be replaced without changing producers or the public stream. Its current
 filesystem implementation is described in the [protocol](xray-protocol.md#recording-bundles).
-Synchronous file IO stays on the consumer/blocking side, never instrumentation
-producer paths. CLI SSE intake feeds a separate stdout/recording/payload consumer
-through a bounded queue: default 256 envelopes, configurable with
-`--consumer-queue-capacity` from 1 through 4096. Slow export cannot block execution;
+Synchronous file IO stays on the consumer side, never instrumentation producer
+paths. The CLI exporter runs in a directly owned child of the current executable;
+its private entry is handled before ordinary runtime/configuration/plugin startup.
+The parent owns SSE intake, cutoff, and the endpoint lease; the child owns stdout,
+recording, and bounded payload export. Initialization duplicates the endpoint bearer
+over framed private stdin IPC after a version, embedded build-digest, and file-identity
+handshake, never through argv or environment. The root private entry receives its
+embedded build information before runtime construction; the parent checks the
+child's loaded build digest before transferring the bearer. The child environment
+is cleared. Its client does not share the parent's in-memory revocation flags:
+server scope/expiry/revocation and owned-child termination remain the enforcement
+boundaries. Internal exporter `Ready` means initialization and recorder creation
+succeeded; it is not the session's `xray.ready` envelope, flushed stdout, or evidence
+completion.
+
+The consumer queue defaults to 256 envelopes, configurable with
+`--consumer-queue-capacity` from 1 through 4096. IPC has bounded frames and typed,
+secret-free status messages. Slow output cannot block observed execution;
 sustained consumer overflow interrupts capture and preserves incomplete evidence.
+Exporter shutdown starts a nonrenewing 30-second drain deadline, followed by bounded
+owned-child termination/reaping (up to two five-second wait windows). Startup has
+a separate 30-second bound. Final recording success requires matching terminal
+input, successful child processing, and successful process exit—not merely delivery
+to IPC. Unconfirmed reap is an unresolved local failure and forbids recovery.
+Whole-application exporter lifecycle acceptance remains pending.
 
 `--reconnect transport` opts into bounded fresh admission after transport loss
 (automatic-bootstrap mode only). Each segment gets new readiness and an observation
@@ -119,6 +191,10 @@ cursor, or a guarantee that missing events/payloads can be recovered.
 
 This matrix describes contract boundaries rather than a second symbol inventory.
 Rows describe implemented contracts, not a claim that every path passed final acceptance.
+First-call request/stream evidence is limited to the exercised model, provider,
+transport, and fixture. Only explicitly declared typed references establish expected
+payload exports; neither reference-shaped opaque JSON nor successful event counts
+prove complete bytes, all stream variants, subsequent calls, or future providers.
 
 | Area | Implemented source behavior | Limits / unsupported claims |
 | --- | --- | --- |
@@ -133,7 +209,7 @@ Rows describe implemented contracts, not a claim that every path passed final ac
 | Payloads | Observation-owned bounded references, authorized ranged export, consumer full-length/digest verification | Eviction/unavailable bytes remain missing; no private storage path fallback; export promptly before retention ends |
 | Recording | Replaceable sink; JSONL + payload bundle; private files, integrity coordinates, atomic lifecycle manifest | Unix only; no database sink, automatic repair/resume or offline reader in this implementation |
 | Eval | Readiness before submission, segmented task/workflow capture and separate evidence receipts | Task outcome is independent; recursive coverage and payload completeness fail closed on missing, opaque or interrupted evidence; final positive acceptance pending |
-| Validation | Isolated provider/native regressions passed; partial whole-app and workflow authorization evidence reported above | Required checks and final rebuilt-artifact acceptance are not interchangeable; no release certification |
+| Validation | Engine tests reported by the coordinator; fresh integrated acceptance remains pending | Required checks and final rebuilt-artifact acceptance are not interchangeable; no release certification |
 
 ## Eval use
 

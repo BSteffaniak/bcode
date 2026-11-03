@@ -86,6 +86,90 @@ async fn capability_expiry_drops_deep_capture_and_payloads_even_during_finalized
 }
 
 #[tokio::test]
+async fn payload_handler_exports_exact_bytes_and_rejects_revoked_scope() {
+    let state = Arc::new(crate::tests::test_server_state(
+        bcode_session::SessionManager::default(),
+    ));
+    let session = SessionId::new();
+    let grant = XrayAccessGrant::authorized(BTreeSet::from([session]), true).unwrap();
+    let access = XrayHttpAccess::new(&"a".repeat(43), grant).unwrap();
+    let observation = state
+        .xray
+        .observe(XrayObserveRequest {
+            schema_version: 1,
+            session_id: session.to_string(),
+            deep_capture: true,
+        })
+        .unwrap();
+    let id = observation.id().to_owned();
+    let registration = access
+        .observations
+        .register(&id, session.to_string(), 1)
+        .unwrap();
+    let reference = state
+        .xray
+        .capture_payload(
+            &bcode_xray_models::XrayCorrelation {
+                session_id: session.to_string(),
+                ..Default::default()
+            },
+            "text/plain",
+            b"retained bytes",
+        )
+        .unwrap()
+        .unwrap();
+    let input = XrayReadPayloadRequest {
+        schema_version: 1,
+        observation_id: id,
+        session_id: session.to_string(),
+        payload_id: reference.payload_id,
+        offset: 0,
+        length: 8,
+    };
+    let (_shutdown, stopped) = watch::channel(false);
+    let http_state = Arc::new(HttpState {
+        application: XrayApplication::new(Arc::clone(&state), Arc::clone(&state.xray)),
+        observations: Arc::clone(&access.observations),
+        access,
+        config: XrayHttpConfig::default(),
+        authority: "localhost".into(),
+        shutdown: stopped,
+        calls: Arc::new(Semaphore::new(1)),
+        control_calls: Arc::new(Semaphore::new(1)),
+    });
+    drop(state);
+    let make_request = || {
+        Request::builder()
+            .method("POST")
+            .uri("/v1/xray/payload")
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(serde_json::to_vec(&input).unwrap()))
+            .unwrap()
+    };
+    let response = payload(State(Arc::clone(&http_state)), make_request()).await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let bytes = to_bytes(response.into_body(), 4096).await.unwrap();
+    let range: bcode_xray_models::XrayPayloadRange = serde_json::from_slice(&bytes).unwrap();
+    assert_eq!(range.bytes, b"retained");
+    assert_eq!(range.payload.session_id, session.to_string());
+    // Release must prevent access even while the engine still retains bytes.
+    http_state
+        .observations
+        .authorized(&input.observation_id, &http_state.access.grant)
+        .unwrap()
+        .release
+        .send_replace(true);
+    let revoked_state = State(Arc::clone(&http_state));
+    drop(http_state);
+    assert_eq!(
+        payload(revoked_state, make_request()).await.status(),
+        StatusCode::NOT_FOUND
+    );
+    drop(registration);
+    drop(observation);
+}
+
+#[tokio::test]
 async fn concurrent_finalize_is_one_cutoff_and_payloads_survive_until_stream_drain() {
     let hub = bcode_xray::XrayHub::default();
     let session = SessionId::new();
@@ -316,6 +400,37 @@ fn registry_is_bounded_scoped_and_cleans_up_without_replay_tombstones() {
     drop(registration);
     assert_eq!(registry.active_count(), 0);
     assert!(registry.authorized("one", &grant).is_err());
+}
+
+#[tokio::test(start_paused = true)]
+async fn timed_out_finalize_request_can_resume_the_same_cutoff() {
+    let hub = bcode_xray::XrayHub::default();
+    let session = SessionId::new();
+    let mut observation = hub
+        .observe(XrayObserveRequest {
+            schema_version: 1,
+            session_id: session.to_string(),
+            deep_capture: false,
+        })
+        .unwrap();
+    let registry = Arc::new(control::Registry::default());
+    let (_registration, mut requested, receipt) = registry
+        .register(observation.id(), session.to_string(), 1)
+        .unwrap();
+    let grant = XrayAccessGrant::authorized(BTreeSet::from([session]), false).unwrap();
+    let control = registry.authorized(observation.id(), &grant).unwrap();
+    let response = control::finalize_control(control.clone()).await;
+    assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+    assert!(*requested.borrow_and_update());
+    assert!(control.receipt.borrow().is_none());
+    assert!(!*control.release.borrow());
+    let frozen = observation.finalize_complete().await.unwrap();
+    receipt.send_replace(Some(Ok(frozen.clone())));
+    assert_eq!(
+        control::finalize_control(control.clone()).await.status(),
+        StatusCode::OK
+    );
+    assert_eq!(*control.receipt.borrow(), Some(Ok(frozen)));
 }
 
 #[tokio::test]

@@ -7,8 +7,14 @@
 //! storage, steers execution, or retains data after the last owning observation drops.
 //! Producer operations never wait for queue capacity or acquire a blocking lock.
 
+mod ingress;
+mod payload;
 pub mod recording;
 
+#[cfg(test)]
+mod ingress_tests;
+#[cfg(test)]
+mod payload_tests;
 #[cfg(test)]
 mod tests;
 
@@ -23,8 +29,9 @@ use std::time::{Instant, SystemTime, UNIX_EPOCH};
 pub use bcode_xray_models::*;
 use serde_json::json;
 use sha2::{Digest, Sha256};
+use std::task::{Context, Poll};
 use thiserror::Error;
-use tokio::sync::Notify;
+use tokio::sync::{Notify, mpsc};
 use uuid::Uuid;
 
 /// Hard per-observation retention bounds. Invalid configuration fails at attach.
@@ -34,11 +41,32 @@ pub struct XrayConfig {
     pub max_observations: usize,
     /// Buffered ordinary events per observation; ready/gap/final records cannot be crowded out.
     pub queue_capacity: usize,
+    /// Global ordinary-event ingress slots; default 256, valid from 1 through
+    /// Tokio's maximum permit count. Independent of observation delivery queues.
+    pub ingress_capacity: usize,
+    /// Global serialized content retained in ingress (default 16 MiB); at least
+    /// `max_event_bytes`. Owned event trees are bounded by node/depth validation, not
+    /// exactly measured heap bytes. In-flight caller-owned event inputs are separate.
+    /// Total buffered content adds each delivery queue's event-byte bound.
+    /// Admitted unpublished trees additionally number at most `max_inflight_operations`;
+    /// target vectors contain at most `max_observations` entries per operation/command.
+    pub max_ingress_bytes: usize,
+    /// Maximum simultaneous publication operations; default 256, valid from two
+    /// through Tokio's maximum permit count. Exhaustion is
+    /// presequence uncertainty, not exclusive-writer contention.
+    pub max_inflight_operations: usize,
     /// Maximum serialized producer event bytes; at least 1024.
     pub max_event_bytes: usize,
     /// Maximum bytes in one all-or-nothing payload capture.
     pub max_payload_bytes: usize,
-    /// Maximum payload bytes owned by an observation; at least `max_payload_bytes`.
+    /// Maximum pending payload operations, including preparation and zero-byte
+    /// captures. Default 64; valid `2..=1_048_576`.
+    pub max_pending_payloads: usize,
+    /// Global preparation/queued/handoff bytes, default 8 MiB; at least
+    /// `max_payload_bytes`. Cache plus pending ownership is bounded separately
+    /// from read-pinned bytes and caller-owned range/export copies.
+    pub max_pending_payload_bytes: usize,
+    /// Maximum retained-cache payload bytes per observation; at least `max_payload_bytes`.
     pub max_retained_payload_bytes: usize,
     /// Maximum retained payload count, including zero-length payloads.
     pub max_retained_payloads: usize,
@@ -51,8 +79,13 @@ impl Default for XrayConfig {
         Self {
             max_observations: 32,
             queue_capacity: 256,
+            ingress_capacity: 256,
+            max_ingress_bytes: 256 * 64 * 1024,
+            max_inflight_operations: 256,
             max_event_bytes: 64 * 1024,
             max_payload_bytes: 1024 * 1024,
+            max_pending_payloads: 64,
+            max_pending_payload_bytes: 8 * 1024 * 1024,
             max_retained_payload_bytes: 8 * 1024 * 1024,
             max_retained_payloads: 64,
             max_payload_range_bytes: 64 * 1024,
@@ -81,6 +114,9 @@ pub enum XrayError {
     /// A nonblocking registry operation encountered contention.
     #[error("X-ray producer busy; no capture retained")]
     Busy,
+    /// Cutoff is established but admitted publishers or ingress remain unresolved.
+    #[error("X-ray finalization pending")]
+    FinalizePending,
     /// The exact transient observation no longer exists.
     #[error("X-ray observation is no longer available")]
     ObservationUnavailable,
@@ -99,6 +135,9 @@ pub enum XrayError {
     /// The exact payload was not captured or has been evicted.
     #[error("X-ray payload is unavailable or evicted")]
     PayloadUnavailable,
+    /// The transient payload ingress generation exhausted its progress coordinates.
+    #[error("X-ray payload progress exhausted")]
+    PayloadProgressExhausted,
     /// The byte range is empty, oversized, overflowing or beyond retained EOF.
     #[error("invalid X-ray payload range")]
     InvalidRange,
@@ -122,8 +161,9 @@ struct Observer {
     next_sequence: u64,
     dropped: u64,
     contention_start: u64,
+    contention_cutoff: Option<u64>,
+    admission: Arc<ingress::Admission>,
     finalization: Option<XrayFinalization>,
-    notify: Arc<Notify>,
     payloads: BTreeMap<String, StoredPayload>,
     payload_order: VecDeque<String>,
     payload_bytes: usize,
@@ -131,13 +171,6 @@ struct Observer {
 }
 
 impl Observer {
-    fn accepts_capture(&self) -> bool {
-        self.finalization.is_none()
-            && self
-                .deadline
-                .is_none_or(|deadline| Instant::now() < deadline)
-    }
-
     fn matches(&self, correlation: &XrayCorrelation) -> bool {
         self.session_id == correlation.session_id
             && self
@@ -170,9 +203,11 @@ impl Observer {
     }
 }
 
-#[derive(Default)]
 struct State {
     observers: BTreeMap<String, Observer>,
+    ingress: mpsc::Receiver<ingress::Command>,
+    payload_ingress: mpsc::Receiver<payload::Command>,
+    payload_consumed: u64,
 }
 
 #[derive(Clone)]
@@ -180,11 +215,11 @@ struct ActivityHint {
     correlation: XrayCorrelation,
     deep_capture: bool,
     deadline: Option<Instant>,
+    admission: Arc<ingress::Admission>,
 }
 
 #[derive(Clone, Copy)]
 enum LossCause {
-    EmitState,
     PayloadPreflight,
     PayloadCommit,
     ActivityHint,
@@ -198,12 +233,13 @@ struct LossCounters {
     payload_commit: AtomicU64,
     activity_hint: AtomicU64,
     external: AtomicU64,
+    ingress_full: AtomicU64,
+    inflight_full: AtomicU64,
 }
 
 impl LossCounters {
     const fn counter(&self, cause: LossCause) -> &AtomicU64 {
         match cause {
-            LossCause::EmitState => &self.emit_state,
             LossCause::PayloadPreflight => &self.payload_preflight,
             LossCause::PayloadCommit => &self.payload_commit,
             LossCause::ActivityHint => &self.activity_hint,
@@ -215,6 +251,11 @@ impl LossCounters {
 struct Inner {
     config: XrayConfig,
     state: Mutex<State>,
+    ingress: RwLock<mpsc::Sender<ingress::Command>>,
+    ingress_budget: Arc<ingress::Budget>,
+    payload_sender: RwLock<mpsc::Sender<payload::Command>>,
+    payload_budget: Arc<ingress::Budget>,
+    payload_issued: RwLock<Arc<AtomicU64>>,
     // Lifecycle-only writes; delivery/retention never acquire this lock.
     activity: RwLock<BTreeMap<String, ActivityHint>>,
     contention: AtomicU64,
@@ -255,6 +296,11 @@ impl std::fmt::Debug for XrayHub {
                 "external_reported_loss",
                 &causes.external.load(Ordering::Relaxed),
             )
+            .field("ingress_full", &causes.ingress_full.load(Ordering::Relaxed))
+            .field(
+                "inflight_full",
+                &causes.inflight_full.load(Ordering::Relaxed),
+            )
             .finish_non_exhaustive()
     }
 }
@@ -269,10 +315,35 @@ impl XrayHub {
     /// Construct an application-owned hub with explicit retention bounds.
     #[must_use]
     pub fn new(config: XrayConfig) -> Self {
+        // Invalid configurations construct but fail at observation admission.
+        let capacity = if valid_ingress_config(&config) {
+            config.ingress_capacity
+        } else {
+            1
+        };
+        let (sender, receiver) = mpsc::channel(capacity);
+        let payload_capacity = if valid_pending_config(&config) {
+            config.max_pending_payloads
+        } else {
+            2
+        };
+        let (payload_sender, payload_receiver) = mpsc::channel(payload_capacity);
+        let ingress_budget = ingress::Budget::new();
+        let payload_budget = ingress::Budget::with_notify(Arc::clone(&ingress_budget.notify));
         Self {
             inner: Arc::new(Inner {
                 config,
-                state: Mutex::new(State::default()),
+                state: Mutex::new(State {
+                    observers: BTreeMap::new(),
+                    ingress: receiver,
+                    payload_ingress: payload_receiver,
+                    payload_consumed: 0,
+                }),
+                ingress: RwLock::new(sender),
+                ingress_budget,
+                payload_sender: RwLock::new(payload_sender),
+                payload_budget,
+                payload_issued: RwLock::new(Arc::new(AtomicU64::new(0))),
                 activity: RwLock::new(BTreeMap::new()),
                 contention: AtomicU64::new(0),
                 loss_causes: LossCounters::default(),
@@ -288,14 +359,6 @@ impl XrayHub {
         self.inner.state.try_lock().map_err(|error| match error {
             std::sync::TryLockError::WouldBlock => XrayError::Busy,
             std::sync::TryLockError::Poisoned(_) => XrayError::Unavailable,
-        })
-    }
-
-    fn producer_state(&self, cause: LossCause) -> Result<MutexGuard<'_, State>, XrayError> {
-        self.try_state().inspect_err(|error| {
-            if matches!(error, XrayError::Busy) {
-                self.record_loss(cause, 1);
-            }
         })
     }
 
@@ -369,7 +432,9 @@ impl XrayHub {
             return Err(XrayError::InvalidIdentity);
         }
         let config = &self.inner.config;
-        if config.max_observations == 0
+        if !valid_ingress_config(config)
+            || !valid_pending_config(config)
+            || config.max_observations == 0
             || config.queue_capacity == 0
             || config.max_event_bytes < 1024
             || config.max_payload_bytes == 0
@@ -384,7 +449,7 @@ impl XrayHub {
             return Err(XrayError::Capacity);
         }
         let id = Uuid::new_v4().to_string();
-        let notify = Arc::new(Notify::new());
+        let notify = Arc::clone(&self.inner.ingress_budget.notify);
         state.observers.insert(
             id.clone(),
             Observer {
@@ -396,8 +461,9 @@ impl XrayHub {
                 next_sequence: 2,
                 dropped: 0,
                 contention_start: self.inner.contention.load(Ordering::Relaxed),
+                contention_cutoff: None,
+                admission: Arc::new(ingress::Admission::default()),
                 finalization: None,
-                notify: Arc::clone(&notify),
                 payloads: BTreeMap::new(),
                 payload_order: VecDeque::new(),
                 payload_bytes: 0,
@@ -416,6 +482,7 @@ impl XrayHub {
             ready: Some(capabilities),
             expected_sequence: 2,
             terminal: false,
+            finalize_more: false,
         })
     }
 
@@ -488,7 +555,8 @@ impl XrayHub {
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         activity.clear();
         for (id, observer) in &state.observers {
-            if observer.finalization.is_none() {
+            if !observer.admission.closed.load(Ordering::Acquire) && observer.finalization.is_none()
+            {
                 activity.insert(
                     id.clone(),
                     ActivityHint {
@@ -499,6 +567,7 @@ impl XrayHub {
                         },
                         deep_capture: observer.deep_capture,
                         deadline: observer.deadline,
+                        admission: Arc::clone(&observer.admission),
                     },
                 );
             }
@@ -511,6 +580,10 @@ impl XrayHub {
     /// exact selected-session gaps. Report only newly lost callbacks, before cutoff;
     /// repeated reports add counts and finalized receipts are never rewritten.
     pub fn report_external_loss(&self, count: u64) {
+        let _reporter = self.inner.ingress_budget.reporter();
+        // Fence successful reports against lifecycle cutoff. Contended reports
+        // retain legacy hub-wide uncertainty rather than invent exact gaps.
+        let _activity = self.inner.activity.try_read();
         self.record_loss(LossCause::External, count);
     }
 
@@ -520,7 +593,7 @@ impl XrayHub {
         let _ = self
             .inner
             .contention
-            .try_update(Ordering::Relaxed, Ordering::Relaxed, |value| {
+            .try_update(Ordering::SeqCst, Ordering::SeqCst, |value| {
                 Some(value.saturating_add(count))
             });
         let _ = self.inner.loss_causes.counter(cause).try_update(
@@ -544,6 +617,7 @@ impl XrayHub {
     /// Session-wide observers accept any run; scoped observers require the exact run.
     #[must_use]
     pub fn correlation_active(&self, correlation: &XrayCorrelation, deep: bool) -> bool {
+        let _reporter = self.inner.ingress_budget.reporter();
         // Do not contend with delivery, payload reads, or queue draining just to
         // decide whether expensive diagnostic serialization is worth doing.
         self.inner.activity.try_read().map_or_else(
@@ -617,39 +691,143 @@ impl XrayHub {
                 capture: None,
             };
         }
-        let Ok(mut state) = self.producer_state(LossCause::EmitState) else {
+        let Some(mut publication) = self.admit_event(&event) else {
             return;
         };
-        let mut notifications = Vec::with_capacity(state.observers.len());
-        for (id, observer) in &mut state.observers {
-            if !observer.matches(&event.correlation)
-                || !observer.accepts_capture()
-                || (event.sensitive && !observer.deep_capture)
-            {
-                continue;
+        self.publish_event(&mut publication, event);
+    }
+
+    fn admit_event(&self, event: &XrayEvent) -> Option<ingress::Publication> {
+        let _reporter = self.inner.ingress_budget.reporter();
+        let activity = self.inner.activity.try_read().ok().or_else(|| {
+            self.record_loss(LossCause::ActivityHint, 1);
+            None
+        })?;
+        // Capture all active handles for conservative hub-wide uncertainty, but
+        // retain delivery eligibility separately. Closed generations never reappear.
+        let admitted_at = Instant::now();
+        let targets = activity
+            .iter()
+            .filter(|(_, hint)| {
+                hint.deadline.is_none_or(|deadline| admitted_at < deadline)
+                    && !hint.admission.closed.load(Ordering::Acquire)
+            })
+            .map(|(id, hint)| ingress::Target {
+                id: id.clone(),
+                admitted_at,
+                admission: Arc::clone(&hint.admission),
+                deliver: hint.correlation.session_id == event.correlation.session_id
+                    && hint
+                        .correlation
+                        .run_id
+                        .as_ref()
+                        .is_none_or(|run| event.correlation.run_id.as_ref() == Some(run))
+                    && (!event.sensitive || hint.deep_capture),
+            })
+            .collect::<Vec<_>>();
+        if !targets.iter().any(|target| target.deliver) {
+            return None;
+        }
+        let Some(operation) = self
+            .inner
+            .ingress_budget
+            .operation(self.inner.config.max_inflight_operations)
+        else {
+            for target in targets {
+                target.admission.lose();
             }
-            let sequence = observer.next_sequence;
-            let Some(next) = sequence.checked_add(1) else {
-                continue;
+            self.inner
+                .loss_causes
+                .inflight_full
+                .fetch_add(1, Ordering::Relaxed);
+            return None;
+        };
+        let sender = self.inner.ingress.try_read().ok()?.clone();
+        let publication =
+            ingress::Publication::new(targets, &self.inner.ingress_budget, operation, sender);
+        // Registration must finish under the lifecycle read lock: early release
+        // would allow cutoff to freeze before these targets become active.
+        drop(activity);
+        Some(publication)
+    }
+
+    fn publish_event(&self, publication: &mut ingress::Publication, event: XrayEvent) {
+        let mut writer = LimitedWriter(self.inner.config.max_event_bytes);
+        if serde_json::to_writer(&mut writer, &event).is_err() {
+            return;
+        }
+        let size = self.inner.config.max_event_bytes - writer.0;
+        let Some(bytes) = self
+            .inner
+            .ingress_budget
+            .bytes(size, self.inner.config.max_ingress_bytes)
+        else {
+            self.inner
+                .loss_causes
+                .ingress_full
+                .fetch_add(1, Ordering::Relaxed);
+            return;
+        };
+        let sender = publication.sender();
+        let Ok(permit) = sender.try_reserve() else {
+            self.inner
+                .loss_causes
+                .ingress_full
+                .fetch_add(1, Ordering::Relaxed);
+            return;
+        };
+        permit.send(publication.command(event, bytes));
+        publication.published();
+        self.inner.ingress_budget.notify.notify_waiters();
+    }
+
+    /// Process one finite global ingress pass. `true` requests another pass without
+    /// waiting for a new notification. Never use Tokio's potentially parking `try_recv`.
+    fn pump(&self, state: &mut State) -> Result<bool, XrayError> {
+        let payload_boundary = Self::payload_boundary(state)?;
+        let payload_more = self.pump_payloads(state, payload_boundary)?;
+        let mut context = Context::from_waker(&self.inner.ingress_budget.waker);
+        for _ in 0..self.inner.config.ingress_capacity {
+            let Poll::Ready(Some(command)) = state.ingress.poll_recv(&mut context) else {
+                return Ok(payload_more);
             };
-            observer.next_sequence = next;
-            if observer.queue.len() >= self.inner.config.queue_capacity {
-                observer.dropped = observer.dropped.saturating_add(1);
-            } else {
-                observer.queue.push_back(XrayEnvelope {
-                    schema_version: XRAY_SCHEMA_VERSION,
-                    observation_id: id.clone(),
-                    sequence,
-                    timestamp_unix_ms: timestamp(),
-                    event: event.clone(),
-                });
+            for target in &command.targets {
+                if !target.deliver {
+                    continue;
+                }
+                let Some(observer) = state.observers.get_mut(&target.id) else {
+                    continue;
+                };
+                if !Arc::ptr_eq(&observer.admission, &target.admission)
+                    || observer.finalization.is_some()
+                    || !observer.matches(&command.event.correlation)
+                    || (command.event.sensitive && !observer.deep_capture)
+                    || observer
+                        .deadline
+                        .is_some_and(|deadline| target.admitted_at >= deadline)
+                {
+                    continue;
+                }
+                let sequence = observer.next_sequence;
+                let Some(next) = sequence.checked_add(1) else {
+                    continue;
+                };
+                observer.next_sequence = next;
+                if observer.queue.len() >= self.inner.config.queue_capacity {
+                    observer.dropped = observer.dropped.saturating_add(1);
+                } else {
+                    observer.queue.push_back(XrayEnvelope {
+                        schema_version: XRAY_SCHEMA_VERSION,
+                        observation_id: target.id.clone(),
+                        sequence,
+                        timestamp_unix_ms: timestamp(),
+                        event: command.event.clone(),
+                    });
+                }
             }
-            notifications.push(Arc::clone(&observer.notify));
+            drop(command);
         }
-        drop(state);
-        for notify in notifications {
-            notify.notify_one();
-        }
+        Ok(true)
     }
 
     /// Retain sensitive bytes only in currently active deep observations for this session.
@@ -658,7 +836,8 @@ impl XrayHub {
     /// calling; this does not claim automatic redaction. Returns None when unobserved.
     ///
     /// # Errors
-    /// Returns invalid identity/content type, oversized input, busy or unavailable state.
+    /// Returns invalid identity/content type, oversized input, busy or unavailable state,
+    /// or `PayloadProgressExhausted` before publication when the generation is full.
     pub fn capture_payload(
         &self,
         correlation: &XrayCorrelation,
@@ -677,47 +856,10 @@ impl XrayHub {
         if bytes.len() > self.inner.config.max_payload_bytes {
             return Err(XrayError::PayloadTooLarge);
         }
-        if !self.correlation_active(correlation, true) {
-            return Ok(None);
-        }
-        // Verify authoritative scope/deadline before preparing sensitive retention,
-        // not only after hashing. Hints alone never authorize capture.
-        {
-            let state = self.producer_state(LossCause::PayloadPreflight)?;
-            if !state.observers.values().any(|observer| {
-                observer.matches(correlation) && observer.deep_capture && observer.accepts_capture()
-            }) {
-                return Ok(None);
-            }
-        }
-        // Hash and copy bounded bytes without holding the delivery/retention lock.
-        // Authorization and deadline are rechecked under that lock before retention.
-        let reference = XrayPayloadRef {
-            schema_version: XRAY_SCHEMA_VERSION,
-            payload_id: Uuid::new_v4().to_string(),
-            session_id: correlation.session_id.clone(),
-            content_type: content_type.to_owned(),
-            byte_len: u64::try_from(bytes.len()).map_err(|_| XrayError::PayloadTooLarge)?,
-            sha256: hex::encode(Sha256::digest(bytes)),
-        };
-        let stored = StoredPayload {
-            reference: reference.clone(),
-            bytes: Arc::from(bytes),
-        };
-        let mut state = self.producer_state(LossCause::PayloadCommit)?;
-        let mut retained = false;
-        for observer in state.observers.values_mut() {
-            if !observer.matches(correlation)
-                || !observer.deep_capture
-                || !observer.accepts_capture()
-            {
-                continue;
-            }
-            observer.retain_payload(&stored, &self.inner.config);
-            retained = true;
-        }
-        drop(state);
-        Ok(retained.then_some(reference))
+        self.prepare_payload(correlation, content_type, bytes)?
+            .map_or(Ok(None), |preparation| {
+                self.commit_payload(preparation, correlation)
+            })
     }
 
     /// Read an authorized retained byte range without filesystem or canonical-history access.
@@ -727,9 +869,20 @@ impl XrayHub {
     /// # Errors
     /// Rejects unsupported versions, unavailable/foreign/shallow observations, missing or
     /// evicted payloads, zero/oversized lengths, overflow and offsets beyond EOF.
+    /// Returns `PayloadProgressExhausted` on inconsistent/exhausted progress arithmetic.
+    /// Returns `Busy` rather than unavailable if a prior FIFO publication is unresolved.
     pub fn read_payload(
         &self,
         request: &XrayReadPayloadRequest,
+    ) -> Result<XrayPayloadRange, XrayError> {
+        let mut boundary = None;
+        self.read_payload_at(request, &mut boundary)
+    }
+
+    fn read_payload_at(
+        &self,
+        request: &XrayReadPayloadRequest,
+        boundary: &mut Option<u64>,
     ) -> Result<XrayPayloadRange, XrayError> {
         check_version(request.schema_version)?;
         let length = usize::try_from(request.length).map_err(|_| XrayError::InvalidRange)?;
@@ -742,7 +895,7 @@ impl XrayHub {
         {
             return Err(XrayError::InvalidRange);
         }
-        let state = self.state()?;
+        let mut state = self.state()?;
         let observer = state
             .observers
             .get(&request.observation_id)
@@ -750,11 +903,23 @@ impl XrayHub {
         if observer.session_id != request.session_id || !observer.deep_capture {
             return Err(XrayError::CaptureInactive);
         }
-        let payload = observer
-            .payloads
-            .get(&request.payload_id)
-            .ok_or(XrayError::PayloadUnavailable)?
-            .clone();
+        let prior = if let Some(prior) = *boundary {
+            prior
+        } else {
+            let prior = Self::payload_boundary(&state)?;
+            *boundary = Some(prior);
+            prior
+        };
+        self.pump_payloads(&mut state, prior)?;
+        let observer = state
+            .observers
+            .get(&request.observation_id)
+            .ok_or(XrayError::ObservationUnavailable)?;
+        let payload = match observer.payloads.get(&request.payload_id) {
+            Some(payload) => payload.clone(),
+            None if state.payload_consumed < prior => return Err(XrayError::Busy),
+            None => return Err(XrayError::PayloadUnavailable),
+        };
         // Pin authorized bytes, then release retention state before copying a range.
         drop(state);
         let start = usize::try_from(request.offset).map_err(|_| XrayError::InvalidRange)?;
@@ -772,6 +937,30 @@ impl XrayHub {
         };
         Ok(range)
     }
+
+    /// Read through a finite prior-publication boundary, awaiting an in-flight
+    /// publication without holding locks. Cancellation only abandons this read.
+    /// Callers must impose their own request timeout. Range copies and pinned
+    /// payload Arcs are owned by each concurrent reader, separately from cache limits.
+    ///
+    /// # Errors
+    /// Returns the same version, scope, range and unavailable errors as
+    /// [`Self::read_payload`]; unresolved publication is awaited instead of `Busy`.
+    pub async fn read_payload_complete(
+        &self,
+        request: &XrayReadPayloadRequest,
+    ) -> Result<XrayPayloadRange, XrayError> {
+        let mut boundary = None;
+        loop {
+            let notified = self.inner.ingress_budget.notify.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+            match self.read_payload_at(request, &mut boundary) {
+                Err(XrayError::Busy) => notified.await,
+                result => return result,
+            }
+        }
+    }
 }
 
 /// A single live observation.
@@ -787,6 +976,7 @@ pub struct XrayObservation {
     ready: Option<XrayCapabilities>,
     expected_sequence: u64,
     terminal: bool,
+    finalize_more: bool,
 }
 
 impl std::fmt::Debug for XrayObservation {
@@ -812,37 +1002,93 @@ impl XrayObservation {
     /// transport or finishing a recording. This never waits for execution or persistence.
     ///
     /// # Errors
-    /// Returns unavailable state/observation or exhausted sequence space.
+    /// Returns unavailable state/observation, exhausted sequence space, or
+    /// `FinalizePending` when pre-cutoff publication or a global uncertainty
+    /// reporter remains unresolved, or `PayloadProgressExhausted` for invalid payload
+    /// progress arithmetic. Reports are conservatively hub-wide: activity
+    /// in another observation may delay completion, but cannot hide lost work.
     pub fn finalize(&mut self) -> Result<XrayFinalization, XrayError> {
+        // Lock order is always consumer state -> lifecycle registry. Producers only
+        // take the latter's shared lock, never the consumer state lock.
         let mut state = self.hub.state()?;
         let observer = state
             .observers
-            .get_mut(&self.id)
+            .get(&self.id)
             .ok_or(XrayError::ObservationUnavailable)?;
         if let Some(finalization) = &observer.finalization {
             return Ok(finalization.clone());
         }
+        if !observer.admission.closed.load(Ordering::Acquire) {
+            // Close/remove once. Completion retries must not acquire this write
+            // lock and cause fresh lifecycle-hint rejections in other sessions.
+            let mut activity = self
+                .hub
+                .inner
+                .activity
+                .write()
+                .map_err(|_| XrayError::Unavailable)?;
+            observer.admission.closed.store(true, Ordering::Release);
+            activity.remove(&self.id);
+        }
+        let more = self.hub.pump(&mut state)?;
+        self.finalize_more = more;
+        let observer = state
+            .observers
+            .get_mut(&self.id)
+            .ok_or(XrayError::ObservationUnavailable)?;
+        if !observer.admission.settled() || !self.hub.inner.ingress_budget.reporters_settled() {
+            drop(state);
+            return Err(XrayError::FinalizePending);
+        }
         if observer.next_sequence == u64::MAX {
             return Err(XrayError::SequenceExhausted);
         }
+        // A zero reporter count is the global uncertainty boundary. Every reporter
+        // already registered has completed its update; later reporters may be
+        // conservatively included by the following total load but cannot be missed
+        // from a successful receipt for work begun before this boundary.
+        observer.contention_cutoff = Some(self.hub.inner.contention.load(Ordering::SeqCst));
         let finalization = XrayFinalization {
             observation_id: self.id.clone(),
             final_sequence: observer.next_sequence,
             dropped_events: observer.dropped,
-            hub_contention_drops: self
-                .hub
-                .inner
-                .contention
-                .load(Ordering::Relaxed)
-                .saturating_sub(observer.contention_start),
+            hub_contention_drops: observer
+                .contention_cutoff
+                .unwrap_or(observer.contention_start)
+                .saturating_sub(observer.contention_start)
+                .saturating_add(observer.admission.loss.load(Ordering::Acquire)),
             evicted_payloads: observer.evicted_payloads,
         };
         observer.finalization = Some(finalization.clone());
-        let notify = Arc::clone(&observer.notify);
-        self.hub.refresh_activity(&state);
         drop(state);
-        notify.notify_one();
+        self.notify.notify_waiters();
         Ok(finalization)
+    }
+
+    /// Complete the same irreversible cutoff, asynchronously awaiting publishers.
+    /// Cancellation leaves admission closed; a subsequent call resumes completion.
+    /// No consumer lock is held across await. Callers should enforce their own deadline.
+    ///
+    /// # Errors
+    /// Returns unavailable state/observation or exhausted sequence space. Pending
+    /// admission is awaited rather than returned as an error.
+    pub async fn finalize_complete(&mut self) -> Result<XrayFinalization, XrayError> {
+        loop {
+            let notify = Arc::clone(&self.notify);
+            let notified = notify.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+            match self.finalize() {
+                Err(XrayError::FinalizePending) => {
+                    if self.finalize_more {
+                        tokio::task::yield_now().await;
+                    } else {
+                        notified.await;
+                    }
+                }
+                result => return result,
+            }
+        }
     }
 
     /// Receive ready, ordered events/gaps, then finalization and EOF.
@@ -859,8 +1105,17 @@ impl XrayObservation {
         loop {
             let notify = Arc::clone(&self.notify);
             let notified = notify.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+            let more;
             {
                 let Ok(mut state) = self.hub.state() else {
+                    self.terminal = true;
+                    return None;
+                };
+                more = if let Ok(more) = self.hub.pump(&mut state) {
+                    more
+                } else {
                     self.terminal = true;
                     return None;
                 };
@@ -898,7 +1153,11 @@ impl XrayObservation {
                     ));
                 }
             }
-            notified.await;
+            if more {
+                tokio::task::yield_now().await;
+            } else {
+                notified.await;
+            }
         }
     }
 
@@ -927,8 +1186,50 @@ impl XrayObservation {
 impl Drop for XrayObservation {
     fn drop(&mut self) {
         if let Ok(mut state) = self.hub.state() {
-            state.observers.remove(&self.id);
+            {
+                let _activity = self
+                    .hub
+                    .inner
+                    .activity
+                    .write()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                if let Some(observer) = state.observers.remove(&self.id) {
+                    observer.admission.closed.store(true, Ordering::Release);
+                }
+                if state.observers.is_empty() {
+                    // Retire the entire channel generation. Late admitted publishers
+                    // own the old sender, whose receiver is dropped here; their bytes
+                    // are released on return rather than retained by an idle hub.
+                    let (sender, receiver) =
+                        mpsc::channel(self.hub.inner.config.ingress_capacity.max(1));
+                    let (payload_sender, payload_receiver) =
+                        mpsc::channel(self.hub.inner.config.max_pending_payloads.max(2));
+                    state.payload_ingress = payload_receiver;
+                    state.payload_consumed = 0;
+                    *self
+                        .hub
+                        .inner
+                        .payload_issued
+                        .write()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner) =
+                        Arc::new(AtomicU64::new(0));
+                    *self
+                        .hub
+                        .inner
+                        .payload_sender
+                        .write()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner) = payload_sender;
+                    state.ingress = receiver;
+                    *self
+                        .hub
+                        .inner
+                        .ingress
+                        .write()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner) = sender;
+                }
+            }
             self.hub.refresh_activity(&state);
+            let _ = self.hub.pump(&mut state);
         }
     }
 }
@@ -1256,6 +1557,34 @@ impl CaptureContext {
             std::future::poll_fn(|cx| with_sync_capture(None, || future.as_mut().poll(cx)));
         CAPTURE_CONTEXT.scope(self.clone(), polling).await
     }
+}
+
+fn valid_pending_config(config: &XrayConfig) -> bool {
+    (2..=1_048_576).contains(&config.max_pending_payloads)
+        && config.max_pending_payload_bytes >= config.max_payload_bytes
+        && config
+            .max_retained_payload_bytes
+            .checked_mul(config.max_observations)
+            .and_then(|bytes| bytes.checked_add(config.max_pending_payload_bytes))
+            .is_some()
+}
+
+fn valid_ingress_config(config: &XrayConfig) -> bool {
+    config.ingress_capacity > 0
+        && config.ingress_capacity <= tokio::sync::Semaphore::MAX_PERMITS
+        && config.max_inflight_operations >= 2
+        && config.max_inflight_operations <= tokio::sync::Semaphore::MAX_PERMITS
+        && config.max_ingress_bytes >= config.max_event_bytes
+        && config
+            .ingress_capacity
+            .checked_add(config.max_inflight_operations)
+            .is_some()
+        && config
+            .queue_capacity
+            .checked_mul(config.max_event_bytes)
+            .and_then(|bytes| bytes.checked_mul(config.max_observations))
+            .and_then(|bytes| bytes.checked_add(config.max_ingress_bytes))
+            .is_some()
 }
 
 const fn check_version(version: u16) -> Result<(), XrayError> {

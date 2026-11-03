@@ -6,6 +6,11 @@ use super::{
 };
 use bcode_xray_models::execution_watch as dto;
 
+enum FinalizationAttempt {
+    Complete(dto::ExecutionWatchFinalEvidence),
+    Pending,
+}
+
 impl ExecutionWatchRegistry {
     /// Admit an already-authorized exact run/recursive/deep scope for an authenticated
     /// principal. Caller MUST authorize this request's scope before calling, validate
@@ -147,11 +152,43 @@ impl ExecutionWatchRegistry {
     ///
     /// # Errors
     /// Rejects unsupported versions, foreign/revoked watches and invalid page bounds.
+    /// Returns unavailable while any cutoff is pending; retry resumes the same cutoff
+    /// and preserves completed entry receipts rather than caching absent evidence.
+    #[cfg(test)]
     pub(crate) fn finalize_authorized(
         &self,
         principal: &str,
         request: dto::FinalizeExecutionWatchRequest,
     ) -> Result<dto::ExecutionWatchFinalEvidence, dto::ExecutionWatchError> {
+        match self.finalize_attempt(principal, request)? {
+            FinalizationAttempt::Complete(evidence) => Ok(evidence),
+            FinalizationAttempt::Pending => Err(dto::ExecutionWatchError::Unavailable),
+        }
+    }
+
+    /// Await retained engine completion futures without holding registry state.
+    /// Cancellation preserves those futures and the irreversible cutoff for resumption.
+    pub(crate) async fn finalize_authorized_complete(
+        &self,
+        principal: &str,
+        request: dto::FinalizeExecutionWatchRequest,
+    ) -> Result<dto::ExecutionWatchFinalEvidence, dto::ExecutionWatchError> {
+        loop {
+            let notified = self.finalization_progress.0.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+            match self.finalize_attempt(principal, request.clone())? {
+                FinalizationAttempt::Complete(evidence) => return Ok(evidence),
+                FinalizationAttempt::Pending => notified.await,
+            }
+        }
+    }
+
+    fn finalize_attempt(
+        &self,
+        principal: &str,
+        request: dto::FinalizeExecutionWatchRequest,
+    ) -> Result<FinalizationAttempt, dto::ExecutionWatchError> {
         version(request.schema_version)?;
         let limit =
             usize::try_from(request.limit).map_err(|_| dto::ExecutionWatchError::InvalidRequest)?;
@@ -173,16 +210,51 @@ impl ExecutionWatchRegistry {
             if watch.status == ExecutionWatchStatus::Ready {
                 watch.status = ExecutionWatchStatus::Finalized;
             }
-            // Work is bounded by configurable concurrent subscriptions, not lifetime
-            // descendants. Capture producers never call this consumer-side operation.
+            // Close every entry even if an earlier one is pending. Each successful
+            // cutoff is retained, while transient pending entries resume on retry.
+            // This is one bounded synchronous pass: never await under `watches`.
+            let mut pending = false;
+            let waker = futures::task::waker(std::sync::Arc::clone(&self.finalization_progress));
+            let mut context = std::task::Context::from_waker(&waker);
+            for entry in watch.sessions.values_mut() {
+                if entry.finalization.is_some() {
+                    continue;
+                }
+                if entry.finalizing.is_none() {
+                    let mut observation = entry
+                        .observation
+                        .take()
+                        .ok_or(dto::ExecutionWatchError::Unavailable)?;
+                    entry.finalizing = Some(Box::pin(async move {
+                        let result = observation.finalize_complete().await;
+                        (observation, result)
+                    }));
+                }
+                let completion = entry.finalizing.as_mut().expect("completion installed");
+                match completion.as_mut().poll(&mut context) {
+                    std::task::Poll::Pending => pending = true,
+                    std::task::Poll::Ready((observation, result)) => {
+                        entry.finalizing = None;
+                        entry.observation = Some(observation);
+                        pending |= !entry.settle_finalization(result);
+                    }
+                }
+            }
+            if pending {
+                return Ok(FinalizationAttempt::Pending);
+            }
             watch.cutoffs = Some(
                 watch
                     .sessions
-                    .iter_mut()
+                    .iter()
                     .map(|((session, run), entry)| dto::ExecutionWatchCutoff {
                         run_id: run.clone(),
                         session_id: session.to_string(),
-                        finalization: entry.observation.finalize().ok(),
+                        finalization: entry
+                            .finalization
+                            .as_ref()
+                            .and_then(|result| result.as_ref().ok())
+                            .cloned(),
                     })
                     .collect(),
             );
@@ -210,7 +282,8 @@ impl ExecutionWatchRegistry {
             cutoffs: cutoffs[offset..end].to_vec(),
         };
         drop(watches);
-        Ok(evidence)
+        self.finalization_progress.0.notify_waiters();
+        Ok(FinalizationAttempt::Complete(evidence))
     }
 
     /// Export retained bytes only under the authenticated opening principal's separate
@@ -218,6 +291,7 @@ impl ExecutionWatchRegistry {
     ///
     /// # Errors
     /// Rejects unsupported versions, foreign/shallow scopes, identities and invalid ranges.
+    #[cfg(test)]
     pub(crate) fn export_authorized(
         &self,
         hub: &XrayHub,
@@ -237,6 +311,87 @@ impl ExecutionWatchRegistry {
             .map_err(error);
         drop(payload);
         result
+    }
+
+    /// Validate the exact retained link without reading bytes or retaining a lock.
+    /// Used again after asynchronous application policy reauthorization.
+    pub(crate) fn validate_payload_export(
+        &self,
+        principal: &str,
+        request: &dto::ExportExecutionWatchPayloadRequest,
+    ) -> Result<ExecutionWatchGrant, dto::ExecutionWatchError> {
+        version(request.schema_version)?;
+        let grant = self.principal_grant(principal, &request.watch_id)?;
+        let session = request
+            .payload
+            .session_id
+            .parse::<bcode_session_models::SessionId>()
+            .map_err(|_| dto::ExecutionWatchError::InvalidRequest)?;
+        if session.to_string() != request.payload.session_id {
+            return Err(dto::ExecutionWatchError::InvalidRequest);
+        }
+        if grant
+            .deadline
+            .is_some_and(|deadline| std::time::Instant::now() >= deadline)
+        {
+            return Err(dto::ExecutionWatchError::Forbidden);
+        }
+        let mut watches = self
+            .watches
+            .lock()
+            .map_err(|_| dto::ExecutionWatchError::Unavailable)?;
+        let watch = authorized_watch(&mut watches, &grant, &request.watch_id).map_err(error)?;
+        let entry = watch
+            .sessions
+            .get(&(session, request.run_id.clone()))
+            .ok_or(dto::ExecutionWatchError::Forbidden)?;
+        if !grant.scope().deep_capture || entry.observation_id != request.payload.observation_id {
+            return Err(dto::ExecutionWatchError::Forbidden);
+        }
+        drop(watches);
+        Ok(grant)
+    }
+
+    /// Complete one finite prior-publication read on the opening principal.
+    /// Dropping this future abandons only the read, never the watch or execution.
+    /// The caller owns its finite operational budget and policy reauthorization.
+    pub(crate) async fn export_authorized_complete(
+        &self,
+        hub: &XrayHub,
+        principal: &str,
+        request: &dto::ExportExecutionWatchPayloadRequest,
+        expires_at: Option<std::time::Instant>,
+    ) -> Result<bcode_xray_models::XrayPayloadRange, dto::ExecutionWatchError> {
+        let grant = self.validate_payload_export(principal, request)?;
+        let expiry = match (expires_at, grant.deadline) {
+            (Some(a), Some(b)) => Some(a.min(b)),
+            (a, b) => a.or(b),
+        };
+        let read = self.read_payload_complete(hub, &grant, request, expiry);
+        tokio::pin!(read);
+        loop {
+            let changed = self.finalization_progress.0.notified();
+            tokio::pin!(changed);
+            changed.as_mut().enable();
+            self.validate_payload_export(principal, request)?;
+            if expiry.is_some_and(|deadline| std::time::Instant::now() >= deadline) {
+                return Err(dto::ExecutionWatchError::Forbidden);
+            }
+            tokio::select! {
+                biased;
+                () = async {
+                    match expiry {
+                        Some(deadline) => tokio::time::sleep_until(deadline.into()).await,
+                        None => std::future::pending::<()>().await,
+                    }
+                } => return Err(dto::ExecutionWatchError::Forbidden),
+                () = &mut changed => {},
+                result = &mut read => {
+                    self.validate_payload_export(principal, request)?;
+                    return result.map_err(error);
+                }
+            }
+        }
     }
 
     /// Delete this principal's observation/captures, never its execution. The application
@@ -277,6 +432,7 @@ impl ExecutionWatchRegistry {
             }
         });
         drop(watches);
+        self.finalization_progress.0.notify_waiters();
         Ok(())
     }
 

@@ -240,9 +240,275 @@ fn typed_finalization_retains_payloads_after_event_eof_and_prevents_new_attachme
         b"retained"
     );
     assert!(matches!(
-        registry.export_authorized(&hub, "bob", export),
+        registry.export_authorized(&hub, "bob", export.clone()),
         Err(dto::ExecutionWatchError::Forbidden)
     ));
+    verify_revoked_payload_is_unavailable(&registry, &hub, export);
+}
+
+fn verify_revoked_payload_is_unavailable(
+    registry: &ExecutionWatchRegistry,
+    hub: &XrayHub,
+    export: dto::ExportExecutionWatchPayloadRequest,
+) {
+    let retained = export.payload.clone();
+    registry
+        .revoke_authorized(
+            "alice",
+            dto::RevokeExecutionWatchRequest {
+                schema_version: 1,
+                watch_id: export.watch_id.clone(),
+            },
+        )
+        .unwrap();
+    assert!(hub.read_payload(&retained).is_err());
+    assert!(matches!(
+        registry.export_authorized(hub, "alice", export),
+        Err(dto::ExecutionWatchError::Forbidden)
+    ));
+}
+
+#[tokio::test]
+async fn async_payload_export_preserves_exact_principal_link_expiry_and_revocation() {
+    let registry = ExecutionWatchRegistry::default();
+    let hub = XrayHub::default();
+    let ready = registry.reserve_admission("alice", request()).unwrap();
+    let session = SessionId::new();
+    let authority = WorkflowExecutionAuthority {
+        target_artifact_id: "artifact".into(),
+        daemon_instance_id: "daemon".into(),
+        generation: 1,
+        fencing_token: "private".into(),
+    };
+    registry.before_dispatch(&hub, "root", session, &authority, &[], true);
+    let page = registry
+        .read_authorized(
+            "alice",
+            dto::ReadExecutionWatchRequest {
+                schema_version: 1,
+                watch_id: ready.watch_id.clone(),
+                cursor: 0,
+                limit: 8,
+            },
+        )
+        .unwrap();
+    let reference = hub
+        .capture_payload(
+            &bcode_xray_models::XrayCorrelation {
+                session_id: session.to_string(),
+                run_id: Some("root".into()),
+                ..Default::default()
+            },
+            "text/plain",
+            b"retained bytes",
+        )
+        .unwrap()
+        .unwrap();
+    let export = dto::ExportExecutionWatchPayloadRequest {
+        schema_version: 1,
+        watch_id: ready.watch_id.clone(),
+        run_id: "root".into(),
+        payload: bcode_xray_models::XrayReadPayloadRequest {
+            schema_version: 1,
+            observation_id: page.events[0].envelope.observation_id.clone(),
+            session_id: session.to_string(),
+            payload_id: reference.payload_id,
+            offset: 0,
+            length: 8,
+        },
+    };
+    assert!(matches!(
+        registry
+            .export_authorized_complete(&hub, "bob", &export, None)
+            .await,
+        Err(dto::ExecutionWatchError::Forbidden)
+    ));
+    assert!(matches!(
+        registry
+            .export_authorized_complete(&hub, "alice", &export, Some(std::time::Instant::now()),)
+            .await,
+        Err(dto::ExecutionWatchError::Forbidden)
+    ));
+    let mut foreign = export.clone();
+    foreign.run_id = "child".into();
+    assert!(matches!(
+        registry
+            .export_authorized_complete(&hub, "alice", &foreign, None)
+            .await,
+        Err(dto::ExecutionWatchError::Forbidden)
+    ));
+    let range = registry
+        .export_authorized_complete(&hub, "alice", &export, None)
+        .await
+        .unwrap();
+    assert_eq!(range.bytes, b"retained");
+    assert_eq!(range.observation_id, export.payload.observation_id);
+    assert_eq!(range.payload.session_id, export.payload.session_id);
+    verify_async_export_link_removed(&registry, &hub, session, export).await;
+}
+
+async fn verify_async_export_link_removed(
+    registry: &ExecutionWatchRegistry,
+    hub: &XrayHub,
+    session: SessionId,
+    export: dto::ExportExecutionWatchPayloadRequest,
+) {
+    let mut wrong_observation = export.clone();
+    wrong_observation.payload.observation_id = "foreign".into();
+    assert!(matches!(
+        registry
+            .export_authorized_complete(hub, "alice", &wrong_observation, None,)
+            .await,
+        Err(dto::ExecutionWatchError::Forbidden)
+    ));
+    // A successful read must not make a later exact-link check sticky.
+    registry
+        .release_session(
+            &registry.validate_payload_export("alice", &export).unwrap(),
+            &export.watch_id,
+            session,
+            "root",
+        )
+        .unwrap();
+    assert!(matches!(
+        registry.validate_payload_export("alice", &export),
+        Err(dto::ExecutionWatchError::Forbidden)
+    ));
+    registry.revoke_principal("alice").unwrap();
+    assert!(matches!(
+        registry
+            .export_authorized_complete(hub, "alice", &export, None)
+            .await,
+        Err(dto::ExecutionWatchError::Forbidden)
+    ));
+}
+
+#[test]
+fn pending_entry_is_resumed_without_caching_absent_final_evidence() {
+    let registry = ExecutionWatchRegistry::default();
+    let hub = XrayHub::default();
+    let ready = registry.open_authorized("alice", request()).unwrap();
+    let session = SessionId::new();
+    let authority = WorkflowExecutionAuthority {
+        target_artifact_id: "artifact".into(),
+        daemon_instance_id: "daemon".into(),
+        generation: 1,
+        fencing_token: "private".into(),
+    };
+    registry.before_dispatch(&hub, "root", session, &authority, &[], true);
+    {
+        let mut watches = registry.watches.lock().unwrap();
+        let watch = watches.get_mut(&ready.watch_id).unwrap();
+        let entry = watch.sessions.get_mut(&(session, "root".into())).unwrap();
+        assert!(!entry.settle_finalization(Err(bcode_xray::XrayError::FinalizePending)));
+        assert!(entry.finalization.is_none());
+        assert!(watch.cutoffs.is_none());
+        drop(watches);
+    }
+    let finalize = dto::FinalizeExecutionWatchRequest {
+        schema_version: 1,
+        watch_id: ready.watch_id.clone(),
+        offset: 0,
+        limit: 1,
+    };
+    let evidence = registry
+        .finalize_authorized("alice", finalize.clone())
+        .unwrap();
+    assert!(evidence.cutoffs[0].finalization.is_some());
+    assert_eq!(
+        registry
+            .finalize_authorized("alice", finalize)
+            .unwrap()
+            .cutoffs,
+        evidence.cutoffs
+    );
+    registry
+        .revoke_authorized(
+            "alice",
+            dto::RevokeExecutionWatchRequest {
+                schema_version: 1,
+                watch_id: ready.watch_id.clone(),
+            },
+        )
+        .unwrap();
+    assert!(!hub.capture_active(&session.to_string()));
+    assert!(matches!(
+        registry.read_authorized(
+            "alice",
+            dto::ReadExecutionWatchRequest {
+                schema_version: 1,
+                watch_id: ready.watch_id,
+                cursor: 0,
+                limit: 1,
+            }
+        ),
+        Err(dto::ExecutionWatchError::Forbidden)
+    ));
+}
+
+#[tokio::test]
+async fn async_application_finalization_waits_for_pending_entry_receipt() {
+    use futures::FutureExt;
+    let registry = ExecutionWatchRegistry::default();
+    let hub = XrayHub::default();
+    let ready = registry.open_authorized("alice", request()).unwrap();
+    let session = SessionId::new();
+    let authority = WorkflowExecutionAuthority {
+        target_artifact_id: "artifact".into(),
+        daemon_instance_id: "daemon".into(),
+        generation: 1,
+        fencing_token: "private".into(),
+    };
+    registry.before_dispatch(&hub, "root", session, &authority, &[], true);
+    let (release, admitted) = tokio::sync::oneshot::channel();
+    {
+        let mut watches = registry.watches.lock().unwrap();
+        let entry = watches
+            .get_mut(&ready.watch_id)
+            .unwrap()
+            .sessions
+            .get_mut(&(session, "root".into()))
+            .unwrap();
+        let mut observation = entry.observation.take().unwrap();
+        entry.finalizing = Some(Box::pin(async move {
+            admitted.await.unwrap();
+            let receipt = observation.finalize_complete().await;
+            (observation, receipt)
+        }));
+        drop(watches);
+    }
+    let request = dto::FinalizeExecutionWatchRequest {
+        schema_version: 1,
+        watch_id: ready.watch_id.clone(),
+        offset: 0,
+        limit: 1,
+    };
+    {
+        let completion = registry.finalize_authorized_complete("alice", request.clone());
+        tokio::pin!(completion);
+        assert!(completion.as_mut().now_or_never().is_none());
+        let watches = registry.watches.try_lock().unwrap();
+        assert!(watches.get(&ready.watch_id).unwrap().cutoffs.is_none());
+        drop(watches);
+        // Cancel the application waiter, not the retained engine completion.
+    }
+    let resumed = registry.finalize_authorized_complete("alice", request.clone());
+    tokio::pin!(resumed);
+    assert!(resumed.as_mut().now_or_never().is_none());
+    release.send(()).unwrap();
+    let evidence = tokio::time::timeout(std::time::Duration::from_secs(1), resumed)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(evidence.cutoffs[0].finalization.is_some());
+    assert_eq!(
+        registry
+            .finalize_authorized_complete("alice", request)
+            .await
+            .unwrap()
+            .cutoffs,
+        evidence.cutoffs
+    );
 }
 
 #[test]

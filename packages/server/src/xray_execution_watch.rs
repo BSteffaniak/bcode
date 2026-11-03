@@ -164,11 +164,43 @@ pub struct ExecutionWatchPage {
     pub events: Vec<ExecutionWatchEvent>,
 }
 
+type CutoffResult = Result<bcode_xray_models::XrayFinalization, bcode_xray::XrayError>;
+type CutoffFuture =
+    std::pin::Pin<Box<dyn std::future::Future<Output = (XrayObservation, CutoffResult)> + Send>>;
+
+#[derive(Default)]
+struct FinalizationProgress(tokio::sync::Notify);
+
+impl futures::task::ArcWake for FinalizationProgress {
+    fn wake_by_ref(arc_self: &Arc<Self>) {
+        arc_self.0.notify_waiters();
+    }
+}
+
 struct Subscription {
     run_id: String,
     authority: WorkflowExecutionAuthority,
-    observation: XrayObservation,
+    observation: Option<XrayObservation>,
+    observation_id: String,
+    finalizing: Option<CutoffFuture>,
     ended: bool,
+    // None is resumable pending/not requested, never successful absent evidence.
+    finalization: Option<Result<bcode_xray_models::XrayFinalization, ()>>,
+}
+
+impl Subscription {
+    /// Settle terminal evidence only; a pending barrier remains resumable.
+    fn settle_finalization(
+        &mut self,
+        result: Result<bcode_xray_models::XrayFinalization, bcode_xray::XrayError>,
+    ) -> bool {
+        match result {
+            Ok(receipt) => self.finalization = Some(Ok(receipt)),
+            Err(bcode_xray::XrayError::FinalizePending) => return false,
+            Err(_) => self.finalization = Some(Err(())),
+        }
+        true
+    }
 }
 
 struct Watch {
@@ -188,6 +220,7 @@ struct Watch {
 pub struct ExecutionWatchRegistry {
     policy: ExecutionWatchPolicy,
     watches: Mutex<BTreeMap<String, Watch>>,
+    finalization_progress: Arc<FinalizationProgress>,
     contention: AtomicU64,
 }
 
@@ -211,7 +244,7 @@ impl ExecutionWatchRegistry {
     ///
     /// # Errors
     /// Rejects zero bounds and pages too small for meaningful envelopes.
-    pub const fn new(policy: ExecutionWatchPolicy) -> Result<Self, ExecutionWatchError> {
+    pub fn new(policy: ExecutionWatchPolicy) -> Result<Self, ExecutionWatchError> {
         if policy.concurrent_watches == 0
             || policy.max_sessions_per_watch == 0
             || policy.max_page_events == 0
@@ -223,6 +256,7 @@ impl ExecutionWatchRegistry {
         Ok(Self {
             policy,
             watches: Mutex::new(BTreeMap::new()),
+            finalization_progress: Arc::default(),
             contention: AtomicU64::new(0),
         })
     }
@@ -359,8 +393,11 @@ impl ExecutionWatchRegistry {
                         Subscription {
                             run_id: run_id.to_owned(),
                             authority: authority.clone(),
-                            observation,
+                            observation_id: observation.id().to_owned(),
+                            observation: Some(observation),
+                            finalizing: None,
                             ended: false,
+                            finalization: None,
                         },
                     );
                 }
@@ -413,7 +450,10 @@ impl ExecutionWatchRegistry {
             if subscription.ended {
                 continue;
             }
-            match subscription.observation.recv().now_or_never() {
+            let Some(observation) = subscription.observation.as_mut() else {
+                continue;
+            };
+            match observation.recv().now_or_never() {
                 Some(Some(envelope)) => {
                     let control = envelope.event.domain == "xray";
                     if !control
@@ -468,6 +508,7 @@ impl ExecutionWatchRegistry {
     /// # Errors
     /// Rejects foreign grants, shallow captures, foreign observation/session identities,
     /// missing payloads and invalid ranges with fixed secret-safe errors.
+    #[cfg(test)]
     pub fn read_payload(
         &self,
         hub: &XrayHub,
@@ -492,7 +533,7 @@ impl ExecutionWatchRegistry {
             .sessions
             .get(&(session_id, run_id.to_owned()))
             .ok_or(ExecutionWatchError::Forbidden)?;
-        if !grant.deep_capture || subscription.observation.id() != request.observation_id {
+        if !grant.deep_capture || subscription.observation_id != request.observation_id {
             return Err(ExecutionWatchError::Forbidden);
         }
         let result = hub
@@ -500,6 +541,58 @@ impl ExecutionWatchRegistry {
             .map_err(|_| ExecutionWatchError::Unavailable);
         drop(watches);
         result
+    }
+
+    /// Await only the engine's finite prior-publication boundary, checking exact
+    /// grant/run/session/observation membership before and after suspension.
+    /// Callers must bound the request and supply their authorized grant expiry.
+    /// No registry lock or execution authority is retained across the await.
+    ///
+    /// # Errors
+    /// Rejects expiry/revocation, foreign scopes, invalid requests and missing bytes.
+    pub async fn read_payload_complete(
+        &self,
+        hub: &XrayHub,
+        grant: &ExecutionWatchGrant,
+        request: &bcode_xray_models::execution_watch::ExportExecutionWatchPayloadRequest,
+        expires_at: Option<std::time::Instant>,
+    ) -> Result<bcode_xray_models::XrayPayloadRange, ExecutionWatchError> {
+        if request.schema_version != 1 {
+            return Err(ExecutionWatchError::InvalidRequest);
+        }
+        let watch_id = &request.watch_id;
+        let run_id = &request.run_id;
+        let request = &request.payload;
+        let session_id = request
+            .session_id
+            .parse::<SessionId>()
+            .map_err(|_| ExecutionWatchError::InvalidRequest)?;
+        if session_id.to_string() != request.session_id {
+            return Err(ExecutionWatchError::InvalidRequest);
+        }
+        let authorize = || {
+            if expires_at.is_some_and(|deadline| std::time::Instant::now() >= deadline) {
+                return Err(ExecutionWatchError::Forbidden);
+            }
+            let mut watches = self
+                .watches
+                .lock()
+                .map_err(|_| ExecutionWatchError::Unavailable)?;
+            let watch = authorized_watch(&mut watches, grant, watch_id)?;
+            let subscription = watch
+                .sessions
+                .get(&(session_id, run_id.to_owned()))
+                .ok_or(ExecutionWatchError::Forbidden)?;
+            if !grant.deep_capture || subscription.observation_id != request.observation_id {
+                return Err(ExecutionWatchError::Forbidden);
+            }
+            drop(watches);
+            Ok(())
+        };
+        authorize()?;
+        let result = hub.read_payload_complete(request).await;
+        authorize()?;
+        result.map_err(|_| ExecutionWatchError::Unavailable)
     }
 
     /// Revoke a grant and immediately discard its pending captures, including clones.
@@ -514,6 +607,7 @@ impl ExecutionWatchRegistry {
             .map_err(|_| ExecutionWatchError::Unavailable)?;
         watches.retain(|_, watch| !Arc::ptr_eq(&watch.grant.revoked, &grant.revoked));
         drop(watches);
+        self.finalization_progress.0.notify_waiters();
         Ok(())
     }
 
@@ -566,6 +660,8 @@ impl ExecutionWatchRegistry {
             .get_mut(&(session_id, run_id.to_owned()))
             .ok_or(ExecutionWatchError::Forbidden)?
             .observation
+            .as_mut()
+            .ok_or(ExecutionWatchError::Unavailable)?
             .finalize()
             .map_err(|_| ExecutionWatchError::Unavailable);
         drop(watches);

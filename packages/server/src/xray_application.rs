@@ -146,6 +146,48 @@ impl XrayApplication {
             .map_err(|_| XrayApplicationError::Unavailable)
     }
 
+    /// Read a finite prior-publication boundary without holding application locks.
+    /// Cancellation abandons only this read; it does not revoke capture or execution.
+    /// Callers must impose a finite operational timeout and monitor revocation.
+    ///
+    /// # Errors
+    /// Rejects invalid ranges, foreign/shallow scope, expiry before or after the
+    /// await, and unavailable retained bytes. Pending publication is awaited.
+    pub async fn read_payload_complete(
+        &self,
+        grant: &XrayAccessGrant,
+        request: &bcode_xray_models::XrayReadPayloadRequest,
+        expires_at: Option<std::time::Instant>,
+    ) -> Result<bcode_xray_models::XrayPayloadRange, XrayApplicationError> {
+        let authorize = || {
+            grant.authorize(&XrayObserveRequest {
+                schema_version: request.schema_version,
+                session_id: request.session_id.clone(),
+                deep_capture: true,
+            })?;
+            if expires_at.is_some_and(|deadline| std::time::Instant::now() >= deadline) {
+                return Err(XrayApplicationError::Forbidden);
+            }
+            if request.observation_id.len() > 128
+                || request.payload_id.len() > 128
+                || request.length == 0
+                || request.length > 1024 * 1024
+                || request
+                    .offset
+                    .checked_add(u64::from(request.length))
+                    .is_none()
+            {
+                return Err(XrayApplicationError::InvalidRequest);
+            }
+            Ok(())
+        };
+        authorize()?;
+        let result = self.hub.read_payload_complete(request).await;
+        // Authorization outranks even an engine failure after a suspended read.
+        authorize()?;
+        result.map_err(|_| XrayApplicationError::Unavailable)
+    }
+
     /// Authorize scope, check bounded current session health, then attach while idle or active.
     ///
     /// The engine's first envelope is the readiness boundary. HTTP headers alone do not
@@ -274,6 +316,60 @@ mod tests {
             .map(|_| SessionId::new())
             .collect();
         assert!(XrayAccessGrant::authorized(sessions, false).is_err());
+    }
+
+    #[tokio::test]
+    async fn complete_payload_read_preserves_bytes_scope_and_expiry() {
+        let hub = Arc::new(XrayHub::default());
+        let application = XrayApplication::new(
+            Arc::new(crate::tests::test_server_state(
+                bcode_session::SessionManager::default(),
+            )),
+            Arc::clone(&hub),
+        );
+        let session = SessionId::new();
+        let grant = XrayAccessGrant::authorized(BTreeSet::from([session]), true).unwrap();
+        let shallow = XrayAccessGrant::authorized(BTreeSet::from([session]), false).unwrap();
+        let observation = hub.observe(request(session, true)).unwrap();
+        let reference = hub
+            .capture_payload(
+                &bcode_xray_models::XrayCorrelation {
+                    session_id: session.to_string(),
+                    ..Default::default()
+                },
+                "text/plain",
+                b"exact retained bytes",
+            )
+            .unwrap()
+            .unwrap();
+        let input = bcode_xray_models::XrayReadPayloadRequest {
+            schema_version: 1,
+            observation_id: observation.id().into(),
+            session_id: session.to_string(),
+            payload_id: reference.payload_id,
+            offset: 6,
+            length: 8,
+        };
+        assert!(matches!(
+            application
+                .read_payload_complete(&shallow, &input, None)
+                .await,
+            Err(XrayApplicationError::Forbidden)
+        ));
+        assert!(matches!(
+            application
+                .read_payload_complete(&grant, &input, Some(std::time::Instant::now()),)
+                .await,
+            Err(XrayApplicationError::Forbidden)
+        ));
+        let range = application
+            .read_payload_complete(&grant, &input, None)
+            .await
+            .unwrap();
+        assert_eq!(range.bytes, b"retained");
+        assert_eq!(range.offset, 6);
+        assert!(!range.eof);
+        assert_eq!(application.read_payload(&grant, &input).unwrap(), range);
     }
 
     #[test]

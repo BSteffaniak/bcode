@@ -46,10 +46,12 @@ impl Peer {
         let address = listener.local_addr().expect("bound address");
         listener.set_nonblocking(true).expect("bounded accept");
         let worker = std::thread::spawn(move || {
-            for (index, (expected_path, response)) in responses.into_iter().enumerate() {
-                // The second connection follows CLI startup, stream drain, and local
-                // recording flush; allow that work without weakening request checks.
-                let admission_budget = if index == 0 { 10 } else { 30 };
+            for (expected_path, response) in responses {
+                // Admission starts before the identified CLI is launched. Cover
+                // its existing 15-second whole-process budget as well as direct
+                // clients; a 10-second peer expiry can close the listener before
+                // the CLI reaches its HTTP request. Socket I/O stays bounded.
+                let admission_budget = 30;
                 let deadline = std::time::Instant::now() + Duration::from_secs(admission_budget);
                 let mut stream = loop {
                     match listener.accept() {
@@ -273,6 +275,105 @@ async fn ready_then_transport_eof_is_incomplete_not_success() {
         Err(XrayClientError::Incomplete)
     ));
     assert!(stream.finalization().is_none());
+    peer.finish();
+}
+
+#[tokio::test]
+async fn data_then_transport_eof_cannot_substitute_for_the_missing_cutoff() {
+    let expected = engine_envelopes().await;
+    let prefix = &expected[..expected.len() - 1];
+    let peer = Peer::serve(vec![sse(prefix)]);
+    let client = XrayClient::new(&peer.endpoint(), TOKEN).expect("client");
+    let mut stream = client.observe(request()).await.expect("ready");
+    for envelope in prefix {
+        assert_eq!(
+            stream.recv().await.expect("valid prefix"),
+            Some(envelope.clone())
+        );
+    }
+    assert!(matches!(
+        stream.recv().await,
+        Err(XrayClientError::Incomplete)
+    ));
+    assert!(stream.finalization().is_none());
+    peer.finish();
+}
+
+#[tokio::test]
+async fn presequence_ingress_loss_crosses_http_but_cannot_certify_recording_completeness() {
+    use bcode_xray::recording::{JsonlBundleRecorder, RecordingOptions, RecordingSink as _};
+
+    let hub = XrayHub::new(bcode_xray::XrayConfig {
+        ingress_capacity: 2,
+        queue_capacity: 16,
+        ..bcode_xray::XrayConfig::default()
+    });
+    let mut observer = hub.observe(request()).expect("observe");
+    let context = hub.context(bcode_xray::XrayCorrelation {
+        session_id: SESSION.to_owned(),
+        ..Default::default()
+    });
+    for index in 0..7 {
+        context.emit("fixture", "item", json!({"index": index}), false);
+    }
+    let cutoff = tokio::time::timeout(Duration::from_secs(5), observer.finalize_complete())
+        .await
+        .expect("bounded cutoff")
+        .expect("settled cutoff");
+    assert_eq!(cutoff.dropped_events, 0);
+    assert_eq!(cutoff.hub_contention_drops, 5);
+    assert_eq!(cutoff.final_sequence, 4);
+    let mut expected = Vec::new();
+    while let Some(envelope) = observer.recv().await {
+        expected.push(envelope);
+    }
+    assert_eq!(expected.len(), 4, "ready, two retained events, terminal");
+    assert_eq!(expected[1].event.data["index"], 0);
+    assert_eq!(expected[2].event.data["index"], 1);
+    assert!(expected.iter().all(|envelope| envelope.event.name != "gap"));
+    let peer = Peer::serve(vec![sse(&expected)]);
+    let client = XrayClient::new(&peer.endpoint(), TOKEN).expect("client");
+    let mut stream = client.observe(request()).await.expect("ready");
+    let directory = tempfile::tempdir().expect("private bundle root");
+    let path = directory
+        .path()
+        .canonicalize()
+        .expect("physical root")
+        .join("ingress-loss");
+    let mut recorder = JsonlBundleRecorder::create(
+        &path,
+        stream.observation_id(),
+        SESSION,
+        RecordingOptions::default(),
+    )
+    .expect("recorder");
+    for envelope in expected {
+        let delivered = stream
+            .recv()
+            .await
+            .expect("valid diagnostic stream")
+            .expect("event");
+        assert_eq!(delivered, envelope);
+        recorder
+            .append(&delivered)
+            .expect("preserve loss-bearing evidence");
+    }
+    assert!(stream.recv().await.expect("terminal EOF").is_none());
+    assert_eq!(stream.finalization(), Some(&cutoff));
+    let manifest = recorder
+        .finalize(&cutoff)
+        .expect("local recording finalized");
+    assert!(
+        !manifest.evidence_complete,
+        "contiguous delivery is not losslessness"
+    );
+    assert_eq!(
+        manifest.missing_sequences, 0,
+        "no invented ingress sequence gaps"
+    );
+    assert_eq!(manifest.finalization.as_ref(), Some(&cutoff));
+    bcode_xray::recording::inspect_bundle(&path, &RecordingOptions::default())
+        .expect("truthful incomplete bundle remains verifiable");
     peer.finish();
 }
 
@@ -556,6 +657,8 @@ async fn payload_wire_corruption_future_schema_and_foreign_identity_never_comple
         "foreign_session",
         "wrong_offset",
         "false_eof",
+        "premature_eof",
+        "past_declared_length",
         "empty_progress",
     ] {
         let mut events = engine_envelopes().await;
@@ -572,6 +675,12 @@ async fn payload_wire_corruption_future_schema_and_foreign_identity_never_comple
             "foreign_session" => range["payload"]["session_id"] = json!("other-session"),
             "wrong_offset" => range["offset"] = json!(1),
             "false_eof" => range["eof"] = json!(false),
+            "premature_eof" => range["bytes"] = json!(&bytes[..bytes.len() - 1]),
+            "past_declared_length" => {
+                let mut oversized = bytes.to_vec();
+                oversized.push(0);
+                range["bytes"] = json!(oversized);
+            }
             "empty_progress" => {
                 range["bytes"] = json!([]);
                 range["eof"] = json!(false);
@@ -956,6 +1065,7 @@ async fn stalled_observer_never_blocks_producer_and_loss_cannot_be_recorded_as_c
     use bcode_xray::recording::{JsonlBundleRecorder, RecordingOptions, RecordingSink as _};
     let hub = XrayHub::new(bcode_xray::XrayConfig {
         queue_capacity: 4,
+        ingress_capacity: 8,
         ..Default::default()
     });
     let mut observation = hub.observe(request()).expect("slow observer");
@@ -977,12 +1087,18 @@ async fn stalled_observer_never_blocks_producer_and_loss_cannot_be_recorded_as_c
         .recv_timeout(Duration::from_secs(10))
         .expect("stalled consumer must not hold execution hostage");
     producer.join().expect("producer");
-    let cutoff = observation
-        .finalize()
+    let cutoff = tokio::time::timeout(Duration::from_secs(5), observation.finalize_complete())
+        .await
+        .expect("bounded cutoff completion")
         .expect("cutoff independent of consumer");
-    assert!(
-        cutoff.dropped_events > 0,
-        "bounded queue must report actual loss"
+    // Eight commands fit ingress; four fit delivery. All other attempts are
+    // presequence uncertainty, not fabricated delivery coordinates.
+    assert_eq!(cutoff.dropped_events, 4);
+    assert_eq!(cutoff.hub_contention_drops, 19_992);
+    assert_eq!(cutoff.final_sequence, 10);
+    assert_eq!(
+        observation.finalize().expect("idempotent settled cutoff"),
+        cutoff
     );
     let directory = tempfile::tempdir().expect("root");
     let path = directory
@@ -992,6 +1108,8 @@ async fn stalled_observer_never_blocks_producer_and_loss_cannot_be_recorded_as_c
         .join("slow");
     let mut sink = None;
     let mut gaps = 0;
+    let mut retained = 0_u64;
+    let mut terminal = None;
     while let Some(event) = observation.recv().await {
         let recorder = sink.get_or_insert_with(|| {
             JsonlBundleRecorder::create(
@@ -1002,20 +1120,44 @@ async fn stalled_observer_never_blocks_producer_and_loss_cannot_be_recorded_as_c
             )
             .expect("recorder")
         });
-        if event.event.domain == "xray" && event.event.name == "gap" {
-            gaps += 1;
+        match (event.event.domain.as_str(), event.event.name.as_str()) {
+            ("fixture", "burst") => {
+                assert_eq!(event.sequence, retained + 2);
+                assert_eq!(event.event.data["index"], retained);
+                retained += 1;
+            }
+            ("xray", "gap") => {
+                gaps += 1;
+                let gap: bcode_xray_models::XrayGap =
+                    serde_json::from_value(event.event.data.clone()).expect("typed delivery gap");
+                assert_eq!((gap.first_sequence, gap.last_sequence), (6, 9));
+            }
+            ("xray", "finalized") => {
+                terminal = Some(
+                    serde_json::from_value::<bcode_xray_models::XrayFinalization>(
+                        event.event.data.clone(),
+                    )
+                    .expect("terminal cutoff"),
+                );
+            }
+            ("xray", "ready") => {}
+            _ => panic!("unexpected stalled-observer event"),
         }
         recorder
             .append(&event)
             .expect("loss is valid diagnostic evidence");
     }
-    assert!(gaps > 0);
+    assert_eq!(retained, 4);
+    assert_eq!(gaps, 1);
+    assert_eq!(terminal.as_ref(), Some(&cutoff));
+    assert!(observation.recv().await.is_none());
     let manifest = sink
         .expect("ready cannot be crowded out")
         .finalize(&cutoff)
         .expect("local finalized evidence");
     assert!(!manifest.evidence_complete);
-    assert!(manifest.missing_sequences > 0);
+    assert_eq!(manifest.missing_sequences, 4);
+    assert_eq!(manifest.finalization.as_ref(), Some(&cutoff));
     bcode_xray::recording::inspect_bundle(&path, &RecordingOptions::default())
         .expect("loss-bearing recording remains verifiable");
 }
@@ -1658,8 +1800,11 @@ persist_tool_io = false
         app.wait_event("isolation-first", |event| {
             event.event.domain == "xray" && event.event.name == "ready"
         });
+        // Both sequential submissions have 20-second execution budgets, plus
+        // startup/control overhead. Keep observation live through both; this is
+        // disconnection isolation, not a race against a 15-second cutoff.
         let mut second = app.spawn(
-            &["session", "xray", &session, "--duration-seconds", "15"],
+            &["session", "xray", &session, "--duration-seconds", "60"],
             "isolation-second",
         );
         app.wait_event("isolation-second", |event| {
@@ -1707,7 +1852,7 @@ persist_tool_io = false
         assert!(
             second
                 .0
-                .wait_timeout(Duration::from_secs(30))
+                .wait_timeout(Duration::from_secs(75))
                 .expect("bounded drain")
                 .expect("cutoff")
                 .success()

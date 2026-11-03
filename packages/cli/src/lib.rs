@@ -14,6 +14,8 @@ pub use clierror::CliDiagnosticError;
 mod plugin_cli;
 pub mod retired_catalogs;
 mod session_migration_adapter;
+pub use xray::xray_export_process_entry;
+
 mod xray;
 
 use base64::Engine as _;

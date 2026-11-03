@@ -823,7 +823,10 @@ pub fn initialize_artifact_bootstrap() -> Result<&'static ArtifactBootstrap, Dae
         path: PathBuf::from("<current_exe>"),
         source,
     })?;
+    let identity_started = std::time::Instant::now();
+    tracing::debug!(target: "bcode_daemon_lifecycle::startup", phase = "bootstrap.current_identity", "artifact bootstrap phase started");
     let artifact_id = bcode_ipc::ArtifactId::current();
+    tracing::debug!(target: "bcode_daemon_lifecycle::startup", phase = "bootstrap.current_identity", elapsed_us = identity_started.elapsed().as_micros(), "artifact bootstrap phase completed");
     let bootstrap = ArtifactBootstrap::open_verified(source_path, artifact_id)?;
     let _ = ARTIFACT_BOOTSTRAP.set(bootstrap);
     Ok(ARTIFACT_BOOTSTRAP
@@ -844,17 +847,25 @@ impl ArtifactBootstrap {
                 path: bootstrap.source_path.clone(),
                 source: std::io::Error::other("artifact bootstrap lock poisoned"),
             })?;
-        let observed = bcode_ipc::ArtifactId::for_executable(&mut *source).map_err(|source| {
-            DaemonLifecycleError::Io {
+        let verification_started = std::time::Instant::now();
+        tracing::debug!(target: "bcode_daemon_lifecycle::startup", phase = "bootstrap.retained_identity", "artifact bootstrap phase started");
+        let verification = bcode_ipc::ArtifactId::for_executable_with_digest(&mut *source);
+        tracing::debug!(target: "bcode_daemon_lifecycle::startup", phase = "bootstrap.retained_identity", elapsed_us = verification_started.elapsed().as_micros(), success = verification.is_ok(), "artifact bootstrap phase completed");
+        let (observed, computed_digest) =
+            verification.map_err(|source| DaemonLifecycleError::Io {
                 path: bootstrap.source_path.clone(),
                 source,
-            }
-        })?;
+            })?;
         if observed != bootstrap.artifact_id {
             return Err(DaemonLifecycleError::Io {
                 path: bootstrap.source_path.clone(),
                 source: std::io::Error::other("executable changed during artifact bootstrap"),
             });
+        }
+        // Reuse only the hash computed from this independently verified retained
+        // handle, and only after the expected identity comparison succeeded.
+        if let Some(digest) = computed_digest {
+            let _ = bootstrap.executable_digest.set(digest);
         }
         drop(source);
         Ok(bootstrap)
@@ -922,7 +933,11 @@ impl ArtifactBootstrap {
         if let Some(digest) = self.executable_digest.get() {
             return Ok(digest.clone());
         }
-        let digest = sha256_reader(&mut *source, &self.source_path)?;
+        let digest_started = std::time::Instant::now();
+        tracing::debug!(target: "bcode_daemon_lifecycle::startup", phase = "bootstrap.executable_digest", "artifact bootstrap phase started");
+        let computed = sha256_reader(&mut *source, &self.source_path);
+        tracing::debug!(target: "bcode_daemon_lifecycle::startup", phase = "bootstrap.executable_digest", elapsed_us = digest_started.elapsed().as_micros(), success = computed.is_ok(), "artifact bootstrap phase completed");
+        let digest = computed?;
         // Publish before releasing the file lock so queued callers do not hash again.
         let _ = self.executable_digest.set(digest.clone());
         drop(source);
@@ -2500,6 +2515,30 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn bootstrap_verification_rejects_replacement_between_identity_and_open() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("bcode");
+        fs::write(&path, b"first executable bytes").unwrap();
+        let identity =
+            bcode_ipc::ArtifactId::for_executable(&mut fs::File::open(&path).unwrap()).unwrap();
+        let replacement = root.path().join("replacement");
+        fs::write(&replacement, b"second executable bytes").unwrap();
+        let replacement_identity =
+            bcode_ipc::ArtifactId::for_executable(&mut fs::File::open(&replacement).unwrap())
+                .unwrap();
+        if identity == replacement_identity {
+            // Explicit producer identities do not claim byte-derived identity;
+            // their independent executable digest remains computed on demand.
+            let bootstrap = ArtifactBootstrap::open_verified(path, identity).unwrap();
+            assert!(bootstrap.executable_digest.get().is_none());
+            return;
+        }
+        fs::rename(replacement, &path).unwrap();
+        assert!(ArtifactBootstrap::open_verified(path, identity).is_err());
+    }
+
     #[test]
     fn concurrent_bootstrap_digest_callers_share_verified_identity() {
         let root = tempfile::tempdir().unwrap();
@@ -2509,6 +2548,10 @@ mod tests {
         let identity = bcode_ipc::ArtifactId::for_executable(&mut bytes.as_slice()).unwrap();
         let bootstrap = ArtifactBootstrap::open_verified(path.clone(), identity).unwrap();
         let expected = executable_sha256(&path).unwrap();
+        let mut supplied = bytes.as_slice();
+        let (_, computed) =
+            bcode_ipc::ArtifactId::for_executable_with_digest(&mut supplied).unwrap();
+        assert_eq!(bootstrap.executable_digest.get(), computed.as_ref());
         let barrier = std::sync::Barrier::new(16);
         std::thread::scope(|scope| {
             let handles = (0..16)

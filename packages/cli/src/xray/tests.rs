@@ -71,7 +71,7 @@ fn consumer_queue_is_bounded_nonblocking_and_preserves_accepted_order() {
     );
 }
 
-fn pipeline_envelope(
+pub(super) fn pipeline_envelope(
     sequence: u64,
     name: &str,
     data: serde_json::Value,

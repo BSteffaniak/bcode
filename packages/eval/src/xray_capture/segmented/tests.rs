@@ -223,6 +223,65 @@ fn local_export_failure_is_not_hidden_by_successful_watch_drain() {
 }
 
 #[test]
+fn incomplete_capture_does_not_change_the_independent_task_judge() {
+    let mut reducer = ready_aggregate();
+    reducer.readiness(&root());
+    export_root(&mut reducer);
+    // Deterministic capture-only fault, not scheduler contention or a retried run.
+    reducer.gap();
+    reducer.watch_drained("watch");
+    let evidence = reducer.finish();
+    assert!(!evidence.evidence_complete);
+    assert!(evidence.watch_drained);
+    let judge = crate::EvalJudgeConfig::MetricThreshold {
+        metric: "workflow.oracle_passed".into(),
+        min: Some(1.0),
+        max: None,
+        required: true,
+        variants: Vec::new(),
+    };
+    let directory = tempfile::tempdir().unwrap();
+    for task_passed in [true, false] {
+        let mut measurements = crate::EvalMeasurementSet::new();
+        measurements.insert(
+            "workflow.oracle_passed".into(),
+            f64::from(u8::from(task_passed)),
+        );
+        let before = crate::run_judge(
+            &judge,
+            directory.path(),
+            directory.path(),
+            directory.path(),
+            "",
+            &measurements,
+            "single",
+        )
+        .unwrap();
+        measurements.insert(
+            "eval.xray.evidence_complete".into(),
+            f64::from(u8::from(evidence.evidence_complete)),
+        );
+        let after = crate::run_judge(
+            &judge,
+            directory.path(),
+            directory.path(),
+            directory.path(),
+            "",
+            &measurements,
+            "single",
+        )
+        .unwrap();
+        assert_eq!(before.passed, task_passed);
+        assert_eq!(after.passed, before.passed);
+        assert_eq!(after.required, before.required);
+        assert_eq!(
+            after.score.map(f64::to_bits),
+            before.score.map(f64::to_bits)
+        );
+    }
+}
+
+#[test]
 fn restart_gap_and_missing_drain_barrier_cannot_pass() {
     let mut reducer = ready_aggregate();
     let mut receipt = root();

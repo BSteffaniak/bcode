@@ -828,7 +828,7 @@ async fn next_event(state: &mut ObservationStream) -> Option<Result<(Event, bool
             }
         }
         state.closing = true;
-        if state.establish_cutoff().is_err() {
+        if state.establish_cutoff().await.is_err() {
             state.finished = true;
             return Some(Ok((transport_failure(), true)));
         }
@@ -892,7 +892,7 @@ impl ObservationStream {
             }
             if !self.closing && requested {
                 self.closing = true;
-                if self.establish_cutoff().is_err() {
+                if !self.cutoff_while_connected(sender, deadline).await {
                     return false;
                 }
             }
@@ -900,28 +900,61 @@ impl ObservationStream {
                 _ = self.registration.release.changed() => return false,
                 result = &mut send => return result.is_ok(),
                 () = sleep_until(deadline) => return false,
-                _ = self.finalize_requested.changed(), if !self.closing => {
-                    self.closing = true;
-                    if self.establish_cutoff().is_err() { return false; }
-                }
-                _ = self.shutdown.changed(), if !self.closing => {
-                    self.closing = true;
-                    if self.establish_cutoff().is_err() { return false; }
-                }
+                _ = self.finalize_requested.changed(), if !self.closing => {},
+                _ = self.shutdown.changed(), if !self.closing => {},
                 () = optional_deadline(self.deadline), if !self.closing => {
                     self.closing = true;
-                    if self.establish_cutoff().is_err() { return false; }
+                    if !self.cutoff_while_connected(sender, deadline).await { return false; }
                 }
             }
         }
     }
 
-    fn establish_cutoff(&mut self) -> Result<(), ()> {
+    async fn cutoff_while_connected(
+        &mut self,
+        sender: &mpsc::Sender<Result<(Event, bool), Infallible>>,
+        deadline: Instant,
+    ) -> bool {
+        // A control-request timeout does not cancel the pump. A stalled transport's
+        // existing send deadline still retires it without claiming a successful cutoff.
+        tokio::select! {
+            biased;
+            () = sender.closed() => false,
+            () = sleep_until(deadline) => false,
+            result = self.establish_cutoff() => result.is_ok(),
+        }
+    }
+
+    async fn establish_cutoff(&mut self) -> Result<(), ()> {
         if let Some(result) = self.cutoff.borrow().as_ref() {
             return result.as_ref().map(|_| ()).map_err(|error| *error);
         }
-        let result = self.observation.finalize().map_err(|_| ());
+        // A control-request timeout does not cancel this pump or cache a provisional
+        // failure. Engine completion resumes the same irreversible cutoff.
+        let result = {
+            let completion = self.observation.finalize_complete();
+            tokio::pin!(completion);
+            let shutting_down = *self.shutdown.borrow();
+            if shutting_down {
+                timeout(REQUEST_TIMEOUT, &mut completion)
+                    .await
+                    .map_err(|_| ())?
+            } else {
+                tokio::select! {
+                    result = &mut completion => result,
+                    _ = self.shutdown.changed() => {
+                        timeout(REQUEST_TIMEOUT, &mut completion).await.map_err(|_| ())?
+                    }
+                }
+            }
+        };
+        // Pending is transient even if an engine implementation returns it from the
+        // asynchronous path. Never publish it as a permanent failed receipt.
+        if matches!(result, Err(bcode_xray::XrayError::FinalizePending)) {
+            return Err(());
+        }
         tracing::info!(loss_attribution = ?self.observation, "X-ray observation cutoff established");
+        let result = result.map_err(|_| ());
         let success = result.is_ok();
         self.cutoff.send_replace(Some(result));
         if success { Ok(()) } else { Err(()) }
@@ -958,7 +991,54 @@ async fn payload(State(state): State<Arc<HttpState>>, request: Request) -> Respo
     if control.session_id != input.session_id {
         return public_error(StatusCode::FORBIDDEN, "xray_forbidden");
     }
-    match state.application.read_payload(&state.access.grant, &input) {
+    let mut shutdown = state.shutdown.clone();
+    let mut released = control.release.subscribe();
+    if *shutdown.borrow() {
+        return public_error(StatusCode::SERVICE_UNAVAILABLE, "xray_http_stopping");
+    }
+    if *released.borrow() {
+        return public_error(StatusCode::NOT_FOUND, "xray_observation_unavailable");
+    }
+    let read = state.application.read_payload_complete(
+        &state.access.grant,
+        &input,
+        state.access.expires_at.map(Instant::into_std),
+    );
+    let result = tokio::select! {
+        biased;
+        () = optional_deadline(state.access.expires_at) => {
+            return public_error(StatusCode::FORBIDDEN, "xray_capability_expired");
+        }
+        _ = shutdown.changed() => {
+            return public_error(StatusCode::SERVICE_UNAVAILABLE, "xray_http_stopping");
+        }
+        _ = released.changed() => {
+            return public_error(StatusCode::NOT_FOUND, "xray_observation_unavailable");
+        }
+        result = timeout(REQUEST_TIMEOUT, read) => match result {
+            Ok(result) => result,
+            // No engine/cache mutation: publication can finish for a later read.
+            Err(_) => return public_error(StatusCode::SERVICE_UNAVAILABLE, "xray_payload_pending"),
+        },
+    };
+    if state.access.expired() {
+        return public_error(StatusCode::FORBIDDEN, "xray_capability_expired");
+    }
+    if *shutdown.borrow() {
+        return public_error(StatusCode::SERVICE_UNAVAILABLE, "xray_http_stopping");
+    }
+    if *released.borrow() {
+        return public_error(StatusCode::NOT_FOUND, "xray_observation_unavailable");
+    }
+    // Recheck endpoint-local membership after suspension, without holding its
+    // registry mutex while awaiting the engine's finite publication boundary.
+    if let Err(response) = state
+        .observations
+        .authorized(&input.observation_id, &state.access.grant)
+    {
+        return response.into_response();
+    }
+    match result {
         Ok(range) => {
             control.activity.send_replace(Instant::now());
             match bounded_json_limit(&range, 8 * 1024 * 1024) {

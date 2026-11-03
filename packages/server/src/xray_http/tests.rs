@@ -380,7 +380,7 @@ async fn engine_ready_and_finalization_remain_explicit_diagnostic_boundaries() {
     let encoded = bounded_json(&ready).unwrap();
     let decoded: bcode_xray_models::XrayEnvelope = serde_json::from_str(&encoded).unwrap();
     assert_eq!(decoded, ready);
-    observation.finalize().unwrap();
+    observation.finalize_complete().await.unwrap();
     let finalized = observation.recv().await.unwrap();
     assert_eq!(finalized.event.name, "finalized");
     assert!(observation.recv().await.is_none());

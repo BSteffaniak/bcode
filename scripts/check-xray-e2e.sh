@@ -4,14 +4,32 @@
 # Supply deliberately selected, matching test artifacts.
 set -euo pipefail
 
+selection=all
+if [[ ${1:-} == --suite ]]; then
+    if [[ $# -lt 2 ]]; then
+        echo "--suite requires all, acceptance, server, or recursive_server" >&2
+        exit 2
+    fi
+    selection=$2
+    shift 2
+fi
+case "$selection" in
+    all|acceptance|server|recursive_server) ;;
+    *) echo "unknown suite selection: $selection" >&2; exit 2 ;;
+esac
+
 if [[ $# != 8 && $# != 10 ]]; then
-    echo "usage: bash $0 /absolute/bcode sha256 /absolute/xray-acceptance-test sha256 /absolute/server-xray-test sha256 /absolute/fake-provider-library sha256 [/absolute/server-lib-test sha256]" >&2
+    echo "usage: bash $0 [--suite all|acceptance|server|recursive_server] /absolute/bcode sha256 /absolute/xray-acceptance-test sha256 /absolute/server-xray-test sha256 /absolute/fake-provider-library sha256 [/absolute/server-lib-test sha256]" >&2
+    exit 2
+fi
+if [[ $selection == recursive_server && $# != 10 ]]; then
+    echo "recursive_server requires the explicit server-lib-test artifact and hash" >&2
     exit 2
 fi
 
 # Python owns the entire isolated subprocess environment and bounded execution.
 # No caller credentials, BCODE_* overrides, proxy settings, or config are inherited.
-exec python3 - "$@" <<'PY'
+exec python3 - "$selection" "$@" <<'PY'
 import hashlib
 import json
 import os
@@ -22,7 +40,8 @@ import subprocess
 import sys
 import tempfile
 
-args = sys.argv[1:]
+selection = sys.argv[1]
+args = sys.argv[2:]
 artifacts = []
 selections = [("bcode", 0), ("acceptance", 2), ("server", 4), ("provider_library", 6)]
 if len(args) == 10:
@@ -66,10 +85,20 @@ env = {
 }
 results = []
 suites = artifacts[1:3] + artifacts[4:]
+if selection != "all":
+    suites = [artifact for artifact in suites if artifact["name"] == selection]
+scope = {
+    "selection": selection,
+    "selected_suites": [artifact["name"] for artifact in suites],
+    "all_supplied_suites_selected": selection == "all",
+    "recursive_server_supplied": len(artifacts) == 5,
+}
+(work / "scope.json").write_text(json.dumps(scope, indent=2) + "\n")
 for artifact in suites:
     command = [artifact["path"]]
     if artifact["name"] == "recursive_server":
         command.append("xray_execution_acceptance_tests::")
+    list_command = command + ["--list"]
     command += ["--include-ignored", "--test-threads=1", "--nocapture"]
     try:
         # Recheck before each suite: mutable local artifact paths must not silently
@@ -81,6 +110,15 @@ for artifact in suites:
                     digest.update(chunk)
             if digest.hexdigest() != selected["sha256"]:
                 raise SystemExit("selected artifact changed; no further suite invoked")
+        list_path = work / f'{artifact["name"]}.list'
+        with list_path.open("wb") as listing:
+            inventory = subprocess.run(
+                list_command, cwd=work / "work", env=env, stdin=subprocess.DEVNULL,
+                stdout=listing, stderr=subprocess.STDOUT, timeout=30, check=False,
+            )
+        listed_tests = len(re.findall(rb"^.+: test\r?$", list_path.read_bytes(), re.MULTILINE))
+        if inventory.returncode != 0 or listed_tests == 0:
+            raise SystemExit(f'{artifact["name"]}: missing nonempty test inventory; suite not run')
         with (work / f'{artifact["name"]}.log').open("wb") as log:
             process = subprocess.Popen(command, cwd=work / "work", env=env,
                                        stdin=subprocess.DEVNULL, stdout=log,
@@ -104,17 +142,22 @@ for artifact in suites:
                 except ProcessLookupError:
                     pass
                 process.wait()
+    except subprocess.TimeoutExpired:
+        results.append({"name": artifact["name"], "inventory_timeout": True})
     except OSError:
         results.append({"name": artifact["name"], "launch_failed": True})
     if results[-1].get("exit_code") == 0:
         log_bytes = (work / f'{artifact["name"]}.log').read_bytes()
         summaries = re.findall(rb"test result: ok\. ([0-9]+) passed; ([0-9]+) failed; ([0-9]+) ignored;", log_bytes)
-        if not summaries or any(int(failed) or int(ignored) for _, failed, ignored in summaries) or not sum(int(passed) for passed, _, _ in summaries):
-            results[-1]["acceptance_error"] = "missing_nonempty_unignored_libtest_success"
+        results[-1]["listed_tests"] = listed_tests
+        passed_tests = sum(int(passed) for passed, _, _ in summaries)
+        results[-1]["passed_tests"] = passed_tests
+        if not summaries or any(int(failed) or int(ignored) for _, failed, ignored in summaries) or passed_tests != listed_tests:
+            results[-1]["acceptance_error"] = "not_all_listed_tests_passed_unignored"
             results[-1]["exit_code"] = 1
-    (work / "results.json").write_text(json.dumps({"artifacts": artifacts, "results": results}, indent=2) + "\n")
+    (work / "results.json").write_text(json.dumps({"scope": scope, "artifacts": artifacts, "results": results}, indent=2) + "\n")
     if results[-1].get("exit_code") != 0:
         print(f'{artifact["name"]} failed or timed out; see private log', file=sys.stderr)
         raise SystemExit(1)
-print("Selected offline fixture suites passed; inspect results.json for scope. Fake-provider mechanics do not certify live provider quality or complete v1 coverage.")
+print(f"Selected offline fixture suites passed: {', '.join(scope['selected_suites'])}. No suite was retried. Inspect results.json for scope; subset runs are not full-matrix acceptance. Fake-provider mechanics do not certify live provider quality or complete v1 coverage.")
 PY

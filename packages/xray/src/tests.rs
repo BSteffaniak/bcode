@@ -1,7 +1,7 @@
 //! Engine-owned behavioral coverage. Intentionally not executed during interface convergence.
 use super::*;
 
-fn request(session_id: &str, deep_capture: bool) -> XrayObserveRequest {
+pub fn request(session_id: &str, deep_capture: bool) -> XrayObserveRequest {
     XrayObserveRequest {
         schema_version: XRAY_SCHEMA_VERSION,
         session_id: session_id.into(),
@@ -9,14 +9,14 @@ fn request(session_id: &str, deep_capture: bool) -> XrayObserveRequest {
     }
 }
 
-fn correlation(session_id: &str) -> XrayCorrelation {
+pub fn correlation(session_id: &str) -> XrayCorrelation {
     XrayCorrelation {
         session_id: session_id.into(),
         ..XrayCorrelation::default()
     }
 }
 
-fn event(session_id: &str, name: &str, sensitive: bool) -> XrayEvent {
+pub fn event(session_id: &str, name: &str, sensitive: bool) -> XrayEvent {
     XrayEvent {
         domain: "test".into(),
         name: name.into(),
@@ -137,35 +137,39 @@ async fn reserved_controls_and_deeply_nested_payloads_cannot_forge_delivery() {
 }
 
 #[test]
-fn loss_attribution_preserves_aggregate_and_distinguishes_all_five_causes() {
+fn loss_attribution_distinguishes_payload_hint_and_external_causes() {
     let hub = XrayHub::default();
     let mut observation = hub.observe(request("s", true)).unwrap();
     let guard = hub.inner.state.lock().unwrap();
     assert_eq!(hub.observation_active(), Err(XrayError::Busy));
     assert_eq!(hub.session_observation_active("s"), Err(XrayError::Busy));
     hub.emit(event("s", "blocked", false));
+    assert!(
+        hub.capture_payload(&correlation("s"), "text/plain", b"test")
+            .unwrap()
+            .is_some()
+    );
+    drop(guard);
+    let prepared = hub
+        .prepare_payload(&correlation("s"), "text/plain", b"test")
+        .unwrap()
+        .unwrap();
+    let activity = hub.inner.activity.write().unwrap();
     assert_eq!(
-        hub.capture_payload(&correlation("s"), "text/plain", b"test"),
+        hub.commit_payload(prepared, &correlation("s")),
         Err(XrayError::Busy)
     );
-    // Deterministically pause just the commit phase rather than race the hasher.
-    assert!(matches!(
-        hub.producer_state(LossCause::PayloadCommit),
-        Err(XrayError::Busy)
-    ));
-    drop(guard);
-    let activity = hub.inner.activity.write().unwrap();
     assert!(!hub.correlation_active(&correlation("s"), true));
     drop(activity);
     hub.report_external_loss(3);
     let causes = &hub.inner.loss_causes;
-    assert_eq!(causes.emit_state.load(Ordering::Relaxed), 1);
-    assert_eq!(causes.payload_preflight.load(Ordering::Relaxed), 1);
+    assert_eq!(causes.emit_state.load(Ordering::Relaxed), 0);
+    assert_eq!(causes.payload_preflight.load(Ordering::Relaxed), 0);
     assert_eq!(causes.payload_commit.load(Ordering::Relaxed), 1);
     assert_eq!(causes.activity_hint.load(Ordering::Relaxed), 1);
     assert_eq!(causes.external.load(Ordering::Relaxed), 3);
     let cutoff = observation.finalize().unwrap();
-    assert_eq!(cutoff.hub_contention_drops, 7);
+    assert_eq!(cutoff.hub_contention_drops, 5);
     assert_eq!(cutoff.dropped_events, 0);
     hub.report_external_loss(1);
     assert_eq!(observation.finalize().unwrap(), cutoff);
@@ -180,16 +184,17 @@ fn busy_lifecycle_queries_do_not_report_lost_producer_work() {
     assert_eq!(hub.observation_active(), Err(XrayError::Busy));
     assert_eq!(hub.session_observation_active("s"), Err(XrayError::Busy));
     assert_eq!(hub.inner.contention.load(Ordering::Relaxed), 0);
-    // The same paused registry still rejects and counts actual producer work.
+    // Consumer-state contention rejects neither event nor payload publication.
     hub.emit(event("s", "contended", false));
-    assert_eq!(
-        hub.capture_payload(&correlation("s"), "text/plain", b"test"),
-        Err(XrayError::Busy)
+    assert!(
+        hub.capture_payload(&correlation("s"), "text/plain", b"test")
+            .unwrap()
+            .is_some()
     );
     drop(guard);
     assert!(hub.observation_active().unwrap());
     assert!(hub.session_observation_active("s").unwrap());
-    assert_eq!(observation.finalize().unwrap().hub_contention_drops, 2);
+    assert_eq!(observation.finalize().unwrap().hub_contention_drops, 0);
 }
 
 struct RegistryWakeProbe {
@@ -261,18 +266,20 @@ async fn producer_contention_is_nonblocking_and_visible_at_finalization() {
     let mut observation = hub.observe(request("s", true)).unwrap();
     let guard = hub.inner.state.lock().unwrap();
     hub.emit(event("s", "contended", false));
-    assert_eq!(
-        hub.capture_payload(&correlation("s"), "text/plain", b"test"),
-        Err(XrayError::Busy)
+    assert!(
+        hub.capture_payload(&correlation("s"), "text/plain", b"test")
+            .unwrap()
+            .is_some()
     );
     drop(guard);
     let cutoff = observation.finalize().unwrap();
-    assert_eq!(cutoff.hub_contention_drops, 2);
+    assert_eq!(cutoff.hub_contention_drops, 0);
     assert_eq!(observation.recv().await.unwrap().event.name, "ready");
+    assert_eq!(observation.recv().await.unwrap().event.name, "contended");
     assert_eq!(observation.recv().await.unwrap().event.name, "finalized");
 }
 
-fn payload_request(
+pub fn payload_request(
     observer: &XrayObservation,
     reference: &XrayPayloadRef,
 ) -> XrayReadPayloadRequest {
@@ -988,19 +995,24 @@ async fn past_deadlines_disable_capture_without_waiting_for_observer_shutdown() 
 }
 
 #[test]
-fn deadline_is_rechecked_under_retention_lock_despite_a_stale_positive_hint() {
+fn deadline_is_rechecked_at_payload_commit_after_positive_preparation() {
     let hub = XrayHub::default();
     let mut observation = hub.observe_with_deadline(request("s", true), None).unwrap();
     let context = hub.context(correlation("s"));
-    // Simulate crossing expiry after a positive hint without sleeps or scheduling.
-    // Deliberately leave the derived hint unchanged to exercise authoritative checks.
-    hub.state()
-        .unwrap()
-        .observers
-        .get_mut(observation.id())
-        .unwrap()
-        .deadline = Some(Instant::now());
     assert!(context.deep_capture_active());
+    let preparation = hub
+        .prepare_payload(&correlation("s"), "text/plain", b"too late")
+        .unwrap()
+        .unwrap();
+    // Deterministically expire the authoritative lifecycle generation after hash/
+    // copy, before commit. Public deadlines are immutable; this is a clock hook.
+    {
+        let mut state = hub.state().unwrap();
+        state.observers.get_mut(observation.id()).unwrap().deadline = Some(Instant::now());
+        hub.refresh_activity(&state);
+        drop(state);
+    }
+    assert_eq!(hub.commit_payload(preparation, &correlation("s")), Ok(None));
     context.emit("domain", "too_late", json!({}), false);
     assert_eq!(context.capture_payload("text/plain", b"too late"), Ok(None));
     let state = hub.state().unwrap();
@@ -1269,16 +1281,19 @@ fn external_payload_callback_propagates_host_rejection_without_inventing_a_refer
         Err(XrayError::PayloadTooLarge)
     );
     let guard = hub.inner.state.lock().unwrap();
-    assert_eq!(
-        adapter.capture_payload("text/plain", b"ok"),
-        Err(XrayError::Busy)
+    assert!(
+        adapter
+            .capture_payload("text/plain", b"ok")
+            .unwrap()
+            .is_some()
     );
     drop(guard);
-    assert_eq!(observation.finalize().unwrap().hub_contention_drops, 1);
-    assert!(
+    assert_eq!(observation.finalize().unwrap().hub_contention_drops, 0);
+    assert_eq!(
         hub.state().unwrap().observers[observation.id()]
             .payloads
-            .is_empty()
+            .len(),
+        1
     );
 }
 

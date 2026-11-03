@@ -24,6 +24,26 @@ extern "C" fn control(
     let bytes = unsafe { std::slice::from_raw_parts(request, length) };
     let request: DiagnosticControl =
         serde_json::from_slice(bytes.strip_prefix(DIAGNOSTIC_CONTROL_PREFIX).unwrap()).unwrap();
+    if matches!(request.operation, DiagnosticControlOperation::Payload(_)) {
+        match fixture.payload_mode.load(Ordering::SeqCst) {
+            13 => return crate::SERVICE_BRIDGE_STATUS_FAILED,
+            14 | 15 => {
+                let future = b"{\"version\":99,\"active\":true,\"deep_active\":true}";
+                let bytes: &[u8] = if fixture.payload_mode.load(Ordering::SeqCst) == 14 {
+                    future
+                } else {
+                    b"{malformed"
+                };
+                assert!(bytes.len() <= capacity);
+                unsafe {
+                    std::ptr::copy_nonoverlapping(bytes.as_ptr(), output, bytes.len());
+                    *output_length = bytes.len();
+                }
+                return SERVICE_BRIDGE_STATUS_OK;
+            }
+            _ => {}
+        }
+    }
     let payload = match &request.operation {
         DiagnosticControlOperation::Payload(operation) => fixture_payload(fixture, operation),
         _ => None,
@@ -62,6 +82,25 @@ fn fixture_payload(
     let mode = fixture.payload_mode.load(Ordering::SeqCst);
     if mode == 0 {
         return None; // Legacy event-only host.
+    }
+    if matches!(operation, PayloadControl::Negotiate { .. }) {
+        match mode {
+            9 => return Some(PayloadReply::Unavailable),
+            10 => {
+                return Some(PayloadReply::Supported {
+                    version: 99,
+                    max_bytes: 1024,
+                    chunk_bytes: 1024,
+                });
+            }
+            _ => {}
+        }
+    }
+    if mode == 11 && matches!(operation, PayloadControl::Begin { .. }) {
+        return Some(PayloadReply::Unavailable);
+    }
+    if mode == 12 && matches!(operation, PayloadControl::Finish { .. }) {
+        return Some(PayloadReply::Unavailable);
     }
     Some(match operation {
         PayloadControl::Negotiate { .. } => PayloadReply::Supported {
@@ -124,7 +163,7 @@ fn fixture_payload(
 fn retained_payload_acknowledgements_validate_metadata_and_abort_every_failed_transfer() {
     let bytes =
         serde_json::to_vec(&serde_json::json!({"text": "界🙂e\u{301}".repeat(10_000)})).unwrap();
-    for mode in 1..=8 {
+    for mode in 1..=15 {
         let mut fixture = Fixture::default();
         fixture.payload_mode.store(mode, Ordering::SeqCst);
         let data = std::ptr::from_mut(&mut fixture).cast();
@@ -143,11 +182,20 @@ fn retained_payload_acknowledgements_validate_metadata_and_abort_every_failed_tr
             assert_eq!(fixture.aborted.load(Ordering::SeqCst), 0);
         } else {
             assert!(
-                result.is_err(),
-                "mode {mode} cannot masquerade as detached/empty success"
+                matches!(result, Err(bcode_xray::XrayError::Unavailable)),
+                "mode {mode} must fail unavailable, never unsupported or empty success"
             );
-            assert_eq!(fixture.aborted.load(Ordering::SeqCst), 1);
+            assert_eq!(
+                fixture.aborted.load(Ordering::SeqCst),
+                usize::from(matches!(mode, 2..=8 | 12))
+            );
             assert!(fixture.payload_bytes.lock().unwrap().is_empty());
+            assert!(fixture.events.lock().unwrap().iter().all(|bytes| {
+                let event: NativeDiagnosticEvent =
+                    serde_json::from_slice(bytes.strip_prefix(DIAGNOSTIC_EVENT_PREFIX).unwrap())
+                        .unwrap();
+                event.event.data["reason"] != "external_sink_payload_unsupported"
+            }));
         }
         drop(capture);
         assert_eq!(fixture.released.load(Ordering::SeqCst), 1);
@@ -244,6 +292,13 @@ fn old_event_only_host_keeps_events_and_rejects_payload_extension_without_empty_
         capture.capture_payload("text/plain", b"payload"),
         Err(bcode_xray::XrayError::PayloadCaptureUnsupported)
     ));
+    assert!(fixture.events.lock().unwrap().iter().any(|bytes| {
+        let event: NativeDiagnosticEvent =
+            serde_json::from_slice(bytes.strip_prefix(DIAGNOSTIC_EVENT_PREFIX).unwrap()).unwrap();
+        event.event.domain == "capture"
+            && event.event.name == "payload_omitted"
+            && event.event.data["reason"] == "external_sink_payload_unsupported"
+    }));
     assert!(!capture.report_external_loss(1));
     capture.emit("fixture", "still_available", serde_json::json!({}), true);
     assert!(fixture.events.lock().unwrap().iter().any(|bytes| {

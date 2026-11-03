@@ -118,7 +118,7 @@ impl WorkflowWatch {
                 // local recorder failure must not hide the run from evaluation
                 // or prevent its ordinary timeout/cancellation reconciliation.
                 let _ = admission_tx.send(Ok(admitted));
-                let capture = until(
+                let capture = Box::pin(until(
                     tokio::time::Instant::now() + Duration::from_secs(5),
                     Box::pin(ExecutionCapture::from_ready(
                         connection,
@@ -126,7 +126,7 @@ impl WorkflowWatch {
                         &directory,
                         CaptureLimits::default(),
                     )),
-                )
+                ))
                 .await;
                 let Ok(Ok(mut capture)) = capture else {
                     return None;

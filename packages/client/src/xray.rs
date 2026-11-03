@@ -167,6 +167,25 @@ impl XrayClient {
         }
     }
 
+    /// Transfer this live transport capability to an owned exporter over private IPC.
+    ///
+    /// The returned bearer is sensitive and must never enter arguments, environment
+    /// variables, diagnostics or recordings. This does not extend server authorization.
+    ///
+    /// # Errors
+    /// Returns invalid credentials if revoked, the drain deadline elapsed, or the
+    /// authorization header cannot be represented as a bearer string.
+    pub fn export_process_transport(&self) -> Result<(String, String), XrayClientError> {
+        self.ensure_active()?;
+        let bearer = self
+            .authorization
+            .to_str()
+            .ok()
+            .and_then(|value| value.strip_prefix("Bearer "))
+            .ok_or(XrayClientError::InvalidCredential)?;
+        Ok((self.origin.as_str().to_owned(), bearer.to_owned()))
+    }
+
     fn invalidate(&self) {
         self.revoked
             .store(true, std::sync::atomic::Ordering::Release);
