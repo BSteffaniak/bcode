@@ -21,6 +21,8 @@ mod checkpoint;
 mod packing;
 #[path = "context_compaction_response.rs"]
 mod response;
+#[path = "context_compaction_retry.rs"]
+mod retry;
 #[path = "context_compaction_synthesis.rs"]
 mod synthesis;
 
@@ -166,11 +168,15 @@ async fn restart_session_context_with_policy(
         }
         let policy = resolve_summary_budget(state, session_id, selection, &history, plan.compacted_through_sequence,
             progress_requirement.map_or(1, |requirement| requirement.minimum_reclaimable_tokens).max(1), cancel).await?;
+        let frozen: Option<budget::ResolvedSummaryPolicy> = if request.version == 2 && old.request_state.is_some() && !old.needs_upgrade()
+            && plan.compacted_through_sequence == old.boundary { Some(old.resolved_policy()?) } else { None };
+        let policy = frozen.filter(|old| old.same_dispatch_capacity(&policy)).unwrap_or(policy);
         let seed = if old.needs_upgrade() && plan.compacted_through_sequence == old.boundary { Some(old.migration_seed(&transcript)?) } else { None };
         let (chunks, packing) = synthesis_chunks(state, session_id, selection, &transcript, cancel, Some(&policy), seed.as_ref()).await?;
         let mut replacement = checkpoint::LocalCheckpoint::create_with_policy(&plan, &transcript, &chunks, synthesis_limits(&policy))?;
         replacement.packing_policy = budget_packing_identity(&packing, &policy)?;
         replacement.bind_capacity_policy(&policy)?;
+        if request.version == 2 && old.request_state.is_some() { replacement.retain_accepted_prefix(&old); }
         if let Some(seed) = seed { replacement.apply_migration_seed(seed); }
         let restart = checkpoint::prepare_restart_domain(state, request, &old, &proof, &replacement, (&plan, &transcript, &chunks)).await?;
         let replacement_key = restart.replacement_key.clone();
@@ -365,6 +371,12 @@ pub enum CompactionError {
     RecoveryRequired(CompactionRecoveryReason),
     #[error("provider error: {0}")]
     Provider(String),
+    /// Normalized provider failure; never classify retries from display text.
+    #[error("compaction provider failure: {code}: {message}", code = .0.code, message = .0.message)]
+    ProviderFailure(Box<bcode_model::ProviderError>),
+    /// Retained reservations require explicit bounded recovery, not another automatic dispatch.
+    #[error("compaction operation blocked; explicit recovery required; boundary unchanged")]
+    OperationBlocked,
 }
 
 pub struct CompactionCompletion {
@@ -883,6 +895,9 @@ async fn compact_session_context_with_policy_inner(
         checkpoint
             .admit_contract_continuation(state, session_id, &checkpoint_key)
             .await?;
+        if checkpoint.admission_blocked() {
+            return Err(CompactionError::OperationBlocked);
+        }
         checkpoint
             .observe(
                 state,
@@ -1745,6 +1760,29 @@ pub async fn maybe_auto_compact_session_context(
         .activated_conversation_snapshot(session_id)
         .await?
         .events;
+    let policy = CompactionPlanningPolicy::Proactive {
+        keep_recent_tokens: effective_compaction_config(&config, selection).keep_recent_tokens
+            as usize,
+    };
+    let key = format!(
+        "{}:{:?}",
+        checkpoint::operation_key(
+            &history,
+            selection,
+            config.model.tool_output.context_chars,
+            policy
+        )?,
+        effective_compaction_config(&config, selection).backend
+    );
+    let (_, retained) = checkpoint::load_resolved(state, session_id, &key).await?;
+    if retained
+        .as_ref()
+        .is_some_and(checkpoint::LocalCheckpoint::admission_blocked)
+    {
+        // The owning failure remains canonical. Do not emit another Started/Finished pair or
+        // spend another request for an unchanged blocked operation on each tool round.
+        return Err(CompactionError::OperationBlocked);
+    }
     let projected_context_chars =
         projected_model_context_chars(&history, config.model.tool_output.context_chars);
     let projected_context_tokens = evaluation.candidate_input_tokens;
@@ -2171,7 +2209,7 @@ async fn consolidate_carry(
     if cancel.is_cancelled() {
         return Err(CompactionError::Cancelled);
     }
-    let response = collect_compaction_summary_once_with_policy(
+    let response = retry::collect(
         state,
         session_id,
         selection,
@@ -2181,6 +2219,7 @@ async fn consolidate_carry(
         command_context,
         cancel,
         policy,
+        checkpoint,
     )
     .await?;
     if let Some((checkpoint, key)) = checkpoint {
@@ -2636,7 +2675,7 @@ async fn repair_synthesis_chunk(
             )?
         };
         // Bound the nested synthesis future; cancellation shares this worker stack.
-        let response = Box::pin(collect_compaction_summary_once_with_policy(
+        let response = Box::pin(retry::collect(
             state,
             session_id,
             selection,
@@ -2646,6 +2685,7 @@ async fn repair_synthesis_chunk(
             command_context.as_deref_mut(),
             cancel_state,
             summary_budget,
+            checkpoint,
         ))
         .await;
         let summary = match response {
@@ -2689,6 +2729,10 @@ async fn repair_synthesis_chunk(
                 break;
             }
             Err(reason) => {
+                append_context_compaction_trace(state, session_id, CompactionTraceKind::Diagnostic,
+                    "synthesis_response_semantic_diagnostic", 0, false,
+                    Some(format!("chunk={}/{} reason={} response_bytes={} response_sha256={}; body not retained in public diagnostics",
+                        index + 1, total_chunks, reason.guidance(), summary.len(), hex::encode(sha2::Sha256::digest(summary.as_bytes()))))).await;
                 rejection = Some(reason);
                 rejected_output = Some(summary);
             }
@@ -3185,56 +3229,6 @@ fn compaction_request_attempt(
     }
 }
 
-#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
-fn collect_compaction_summary_once_with_policy<'a>(
-    state: &'a ServerState,
-    session_id: SessionId,
-    selection: &'a SessionModelSelection,
-    transcript: &'a CompactionTranscript,
-    prompt_text: &'a str,
-    contract: response::ResponseContract,
-    command_context: Option<&'a mut RuntimeCommandContext<'_>>,
-    cancel_state: &'a TurnCancelState,
-    policy: &'a budget::ResolvedSummaryPolicy,
-) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<String, CompactionError>> + Send + 'a>>
-{
-    Box::pin(async move {
-        let (request, mut attempt) = Box::pin(prepare_synthesis_request(
-            state,
-            session_id,
-            selection,
-            transcript,
-            prompt_text,
-            contract,
-            cancel_state,
-            policy,
-        ))
-        .await?;
-        let response = Box::pin(dispatch_synthesis_request(
-            state,
-            session_id,
-            selection,
-            request,
-            &mut attempt,
-            command_context,
-            cancel_state,
-        ))
-        .await;
-        let validation = response.as_ref().ok().map(|text| contract.validate(text));
-        if let Some(Err(reason)) = validation {
-            append_context_compaction_trace(state, session_id, CompactionTraceKind::Diagnostic,
-                "synthesis_response_contract_diagnostic", 0, false,
-                Some(format!("request_id={} contract={} response_bytes={} response_sha256={} {}; body not retained in public diagnostics",
-                    attempt.identity.request_id,
-                    contract.request().name,
-                    response.as_ref().map_or(0, String::len),
-                    hex::encode(sha2::Sha256::digest(response.as_ref().expect("validated response").as_bytes())),
-                    reason.guidance()))).await;
-        }
-        response
-    })
-}
-
 /// Resolve and validate a single reserved request before entering provider transport.
 #[allow(clippy::too_many_arguments)]
 async fn prepare_synthesis_request(
@@ -3688,6 +3682,8 @@ async fn stream_compaction_summary(
     result
 }
 
+// Cancellation, actor steering, and provider stream consumption share one ordered select loop.
+#[allow(clippy::too_many_lines)]
 async fn stream_compaction_summary_inner(
     state: &ServerState,
     session_id: SessionId,
@@ -3697,6 +3693,7 @@ async fn stream_compaction_summary_inner(
     cancel_state: &TurnCancelState,
 ) -> Result<String, CompactionError> {
     let mut summary = String::new();
+    let mut output_started = false;
     let timeout = Duration::from_secs(state.model_streaming.no_progress_timeout_secs);
     let mut last_progress_at = Instant::now();
 
@@ -3768,20 +3765,25 @@ async fn stream_compaction_summary_inner(
                 let Ok(event) = serde_json::from_slice::<ProviderTurnEvent>(&payload) else {
                     continue;
                 };
-                if compaction_event_is_progress(&event) {
-                    last_progress_at = Instant::now();
+                if let Some(progress) = compaction_progress_at(&event) {
+                    last_progress_at = progress;
                 }
                 match handle_compaction_events(
                     state,
                     session_id,
                     attempt,
                     &mut summary,
+                    &mut output_started,
                     vec![event],
                 )
                 .await
                 {
                     CompactionPollStatus::Continue => {}
                     CompactionPollStatus::Finished => return Ok(summary),
+                    CompactionPollStatus::ProviderFailure(error) => {
+                        return Err(CompactionError::ProviderFailure(error));
+                    }
+                    CompactionPollStatus::Cancelled => return Err(CompactionError::Cancelled),
                     CompactionPollStatus::Failed(error) => {
                         invocation.cancel.cancel();
                         return Err(CompactionError::Provider(error));
@@ -3807,6 +3809,7 @@ pub async fn poll_compaction_summary_actor_aware(
     cancel_state: &TurnCancelState,
 ) -> Result<String, CompactionError> {
     let mut summary = String::new();
+    let mut output_started = false;
     let mut idle_for = Duration::ZERO;
     loop {
         let poll = PollTurnEventsRequest {
@@ -3841,8 +3844,15 @@ pub async fn poll_compaction_summary_actor_aware(
             continue;
         }
         let saw_progress = compaction_events_include_progress(&response.events);
-        match handle_compaction_events(state, session_id, attempt, &mut summary, response.events)
-            .await
+        match handle_compaction_events(
+            state,
+            session_id,
+            attempt,
+            &mut summary,
+            &mut output_started,
+            response.events,
+        )
+        .await
         {
             CompactionPollStatus::Continue => {
                 if saw_progress {
@@ -3859,6 +3869,10 @@ pub async fn poll_compaction_summary_actor_aware(
                 }
             }
             CompactionPollStatus::Finished => return Ok(summary),
+            CompactionPollStatus::ProviderFailure(error) => {
+                return Err(CompactionError::ProviderFailure(error));
+            }
+            CompactionPollStatus::Cancelled => return Err(CompactionError::Cancelled),
             CompactionPollStatus::Failed(error) => return Err(CompactionError::Provider(error)),
         }
     }
@@ -3921,6 +3935,7 @@ pub async fn poll_compaction_summary(
     cancel_state: &TurnCancelState,
 ) -> Result<String, CompactionError> {
     let mut summary = String::new();
+    let mut output_started = false;
     let mut idle_for = Duration::ZERO;
     loop {
         let poll = PollTurnEventsRequest {
@@ -3941,8 +3956,15 @@ pub async fn poll_compaction_summary(
             continue;
         }
         let saw_progress = compaction_events_include_progress(&response.events);
-        match handle_compaction_events(state, session_id, attempt, &mut summary, response.events)
-            .await
+        match handle_compaction_events(
+            state,
+            session_id,
+            attempt,
+            &mut summary,
+            &mut output_started,
+            response.events,
+        )
+        .await
         {
             CompactionPollStatus::Continue => {
                 if saw_progress {
@@ -3957,13 +3979,34 @@ pub async fn poll_compaction_summary(
                 }
             }
             CompactionPollStatus::Finished => return Ok(summary),
+            CompactionPollStatus::ProviderFailure(error) => {
+                return Err(CompactionError::ProviderFailure(error));
+            }
+            CompactionPollStatus::Cancelled => return Err(CompactionError::Cancelled),
             CompactionPollStatus::Failed(error) => return Err(CompactionError::Provider(error)),
         }
     }
 }
 
+fn compaction_progress_at(event: &ProviderTurnEvent) -> Option<Instant> {
+    compaction_event_is_progress(event).then(Instant::now)
+}
+
 pub fn compaction_events_include_progress(events: &[ProviderTurnEvent]) -> bool {
     events.iter().any(compaction_event_is_progress)
+}
+
+pub const fn compaction_event_is_output(event: &ProviderTurnEvent) -> bool {
+    matches!(
+        event,
+        ProviderTurnEvent::Output { .. }
+            | ProviderTurnEvent::TextDelta { .. }
+            | ProviderTurnEvent::ReasoningDelta { .. }
+            | ProviderTurnEvent::ReasoningActivity { .. }
+            | ProviderTurnEvent::ToolCallStarted { .. }
+            | ProviderTurnEvent::ToolCallDelta { .. }
+            | ProviderTurnEvent::ToolCallFinished { .. }
+    )
 }
 
 pub const fn compaction_event_is_progress(event: &ProviderTurnEvent) -> bool {
@@ -3998,6 +4041,8 @@ pub enum CompactionPollStatus {
     Continue,
     Finished,
     Failed(String),
+    ProviderFailure(Box<bcode_model::ProviderError>),
+    Cancelled,
 }
 
 // The final encoded envelope has a stricter limit. This larger wire bound allows one bounded
@@ -4010,14 +4055,18 @@ fn append_compaction_delta(summary: &mut String, text: &str) -> bool {
     true
 }
 
+// One ordered consumer must preserve usage, output-before-error, and cancellation semantics.
+#[allow(clippy::too_many_lines)]
 pub async fn handle_compaction_events(
     state: &ServerState,
     session_id: SessionId,
     attempt: &mut ModelRequestAttempt,
     summary: &mut String,
+    output_started: &mut bool,
     events: Vec<ProviderTurnEvent>,
 ) -> CompactionPollStatus {
     for event in events {
+        *output_started |= compaction_event_is_output(&event);
         match event {
             ProviderTurnEvent::ModelAvailability { observation } => {
                 super::model_evidence::persist(state, &observation);
@@ -4074,20 +4123,24 @@ pub async fn handle_compaction_events(
                 append_system_event(state, session_id, format!("model warning: {message}")).await;
             }
             ProviderTurnEvent::Error { error } => {
-                return CompactionPollStatus::Failed(format!(
-                    "model error {}: {}",
-                    error.code, error.message
-                ));
+                return if *output_started {
+                    CompactionPollStatus::Failed(
+                        "provider failed after compaction output; explicit recovery required"
+                            .into(),
+                    )
+                } else {
+                    CompactionPollStatus::ProviderFailure(Box::new(error))
+                };
             }
             ProviderTurnEvent::Cancelled => {
-                return CompactionPollStatus::Failed("model turn cancelled".to_string());
+                return CompactionPollStatus::Cancelled;
             }
             ProviderTurnEvent::TurnFinished { stop_reason } => match stop_reason {
                 bcode_model::StopReason::Error => {
                     return CompactionPollStatus::Failed("model turn ended with error".to_string());
                 }
                 bcode_model::StopReason::Cancelled => {
-                    return CompactionPollStatus::Failed("model turn cancelled".to_string());
+                    return CompactionPollStatus::Cancelled;
                 }
                 bcode_model::StopReason::Refusal => {
                     return CompactionPollStatus::Failed("model declined compaction".to_string());

@@ -8249,6 +8249,26 @@ impl AgentSession {
         Ok(response)
     }
 
+    /// Send a user message through the agent's configured provider and append the
+    /// user/assistant exchange to this chat session.
+    ///
+    /// Like [`Agent::generate_text`], this uses the agent's provider factory, otherwise its
+    /// embedded plugin provider. Attach an invocation event sink to the agent to observe the
+    /// turn's events while it runs.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when no provider is configured, or when context retrieval, provider
+    /// invocation, cancellation, or persistence fails.
+    pub async fn generate_text(
+        &mut self,
+        prompt: impl Into<String>,
+    ) -> Result<GenerateTextResponse> {
+        let mut provider = self.agent.configured_provider()?;
+        self.generate_text_with_provider(&mut provider, prompt)
+            .await
+    }
+
     /// Send a user message and append the user/assistant exchange to this chat session.
     ///
     /// This is the frontend-oriented alias for [`Self::generate_text_with_provider`].
@@ -8667,42 +8687,41 @@ impl Agent {
         AgentBuilder::default()
     }
 
-    /// Generate text using the agent's configured embedded provider.
+    /// Generate text using the agent's configured provider (its provider factory, otherwise the
+    /// embedded plugin provider).
     ///
     /// # Errors
     ///
-    /// Returns an error when no embedded provider is configured, provider invocation fails, the
-    /// runtime is cancelled, or the provider reports an error.
-    #[cfg(feature = "embedded-plugins")]
+    /// Returns an error when no provider is configured, provider invocation fails, the runtime is
+    /// cancelled, or the provider reports an error.
     pub async fn generate_text(&self, prompt: impl Into<String>) -> Result<GenerateTextResponse> {
-        let mut provider: Box<dyn ModelProviderInvoker> =
-            self.provider_factory.as_ref().map_or_else(
-                || {
-                    self.provider
-                        .clone()
-                        .map(|provider| Box::new(provider) as Box<dyn ModelProviderInvoker>)
-                        .ok_or(BcodeError::MissingProvider)
-                },
-                |factory| Ok(factory()),
-            )?;
+        let mut provider = self.configured_provider()?;
         self.generate_text_with_provider(&mut provider, prompt)
             .await
     }
 
-    /// Generate text using the configured provider factory.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error when no provider factory is configured or provider invocation fails.
+    /// Acquire the provider this agent uses when the caller supplies none: the provider factory
+    /// when configured, otherwise the embedded plugin provider.
+    #[cfg(feature = "embedded-plugins")]
+    fn configured_provider(&self) -> Result<Box<dyn ModelProviderInvoker>> {
+        self.provider_factory.as_ref().map_or_else(
+            || {
+                self.provider
+                    .clone()
+                    .map(|provider| Box::new(provider) as Box<dyn ModelProviderInvoker>)
+                    .ok_or(BcodeError::MissingProvider)
+            },
+            |factory| Ok(factory()),
+        )
+    }
+
+    /// Acquire the provider this agent uses when the caller supplies none: the provider factory.
     #[cfg(not(feature = "embedded-plugins"))]
-    pub async fn generate_text(&self, prompt: impl Into<String>) -> Result<GenerateTextResponse> {
-        let mut provider = self
-            .provider_factory
+    fn configured_provider(&self) -> Result<Box<dyn ModelProviderInvoker>> {
+        self.provider_factory
             .as_ref()
             .map(|factory| factory())
-            .ok_or(BcodeError::MissingProvider)?;
-        self.generate_text_with_provider(&mut provider, prompt)
-            .await
+            .ok_or(BcodeError::MissingProvider)
     }
 
     /// Run one complete provider/tool turn with a caller-supplied provider.

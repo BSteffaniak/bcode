@@ -426,6 +426,44 @@ missing pages, unsupported events and exhausted bounds fail closed. Ordinary mod
 is not counted as settlement of compaction requests. The current tail remains independently
 identity-fenced; intervening conversation never becomes permission to replay an uncertain call.
 
+## Bounded local provider retries
+
+Current capacity-aware local checkpoints include an optional version-1 `request_state` host
+extension. Older hosts reject that unknown field rather than executing it as an older checkpoint;
+old checkpoints remain unchanged and do not implicitly receive retry allowances. Every provider
+dispatch remains reserved before execution. Normalized pre-output provider failures retain typed
+retry classification/hints and exact request identity; transport loss, cancellation, output-before-
+error and process loss remain unresolved and cannot authorize automatic replay. Terminal failure
+identities are execution evidence, not fabricated terminal billing usage.
+
+Transport retries do not consume a summary-validation repair slot. They share the normal provider
+retry classifier, configured opt-outs/finite limits, provider/catalog rules and delay calculation,
+with an independent cumulative ceiling of eight extra requests and a five-minute dispatch window
+for the frozen operation. These limits cannot renew on another submission or daemon replacement.
+Successful responses reset consecutive backoff/policy counters, not cumulative charges. Push and
+poll consumers use the same output-before-error and cancellation rules. Consolidation uses the
+same bounded retry path.
+
+Blocked proactive operations are reported once per activation and are not dispatched on every
+subsequent tool round. Ordinary generation may continue only while the normal input-capacity
+check permits it; capacity exhaustion reports explicit recovery-required failure. Semantic
+rejection diagnostics record safe reason, response size and digest before repair; response bodies
+are excluded. Aggregate request totals are not a promise that the current chunk is dispatchable.
+Use `session compaction-status` for lifecycle/blocker observations; generic `session inspect
+... compactions` selects committed compaction markers.
+
+Explicit restart now recognizes provider failures and exhausted operations while preserving
+settlement requirements. `--prepare-restart --abandon-unresolved` authorizes new bounded work
+without claiming the missing old response was effect-free. It can retain an accepted prefix only
+when source manifest, packing, policy and carry bookkeeping are exact. Inherited prefix charges
+remain counted but are not misidentified as requests dispatched by the replacement operation.
+Source or capacity changes use the existing conservative reconstruction path. Original canonical
+checkpoints and request charges are never reset or overwritten.
+
+The offline gate includes rejected-summary/overload recovery, retry opt-out and finite/cumulative
+limits, daemon replacement without allowance renewal, explicit settled restart, and explicit
+abandonment after cancellation/restart/crash while verifying accepted-prefix reuse.
+
 ## Reconstructing an already stale summary
 
 Ordinary compaction cannot recover evidence omitted by an earlier summary. Explicitly use

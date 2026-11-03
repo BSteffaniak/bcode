@@ -59,8 +59,11 @@ run_case recovery run_recovery.py
 run_case policy-mismatch run_recovery.py --policy-mismatch
 run_case consolidation-interrupted run_consolidation.py
 run_case consolidation-reclaim run_consolidation.py --finish-consolidation
-for outcome in repair oversize-repair omit-scope-repair paraphrase-scope-repair near-limit; do
+for outcome in repair oversize-repair omit-scope-repair paraphrase-scope-repair near-limit repair-overload overload-once; do
     run_case "${outcome}" run.py --outcome "${outcome}"
+done
+for retry_case in disabled finite bounded; do
+    run_case "retry-${retry_case}" run_retry.py --case "${retry_case}"
 done
 for interruption in cancel restart crash; do
     run_case "automatic-${interruption}" run_automatic.py --interruption "${interruption}"

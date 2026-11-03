@@ -186,6 +186,9 @@ pub(super) struct LocalCheckpoint {
     restart_allowance: Option<RestartAllowance>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     contract_continuation: Option<ContractContinuation>,
+    // Optional compatibility boundary: old readers reject this field instead of ignoring retries.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(super) request_state: Option<super::retry::RequestState>,
     #[serde(default)]
     synthesis_phase: SynthesisPhase,
     #[serde(default)]
@@ -219,6 +222,7 @@ impl LocalCheckpoint {
             resolved_policy: None,
             restart_allowance: None,
             contract_continuation: None,
+            request_state: None,
             synthesis_phase: SynthesisPhase::Accumulating,
             consolidation_requests: Vec::new(),
             boundary: plan.compacted_through_sequence,
@@ -250,6 +254,7 @@ impl LocalCheckpoint {
             resolved_policy: None,
             restart_allowance: None,
             contract_continuation: None,
+            request_state: Some(super::retry::RequestState::new()),
             synthesis_phase: SynthesisPhase::Accumulating,
             consolidation_requests: vec![0; chunks.len()],
             boundary: plan.compacted_through_sequence,
@@ -263,6 +268,41 @@ impl LocalCheckpoint {
         };
         Self::decode(&checkpoint.encode()?)?;
         Ok(checkpoint)
+    }
+
+    pub(super) fn retain_accepted_prefix(&mut self, old: &Self) {
+        // Only exact current-format source/packing/policy identity permits carry transfer.
+        // The old unresolved slot and every old charge remain in its canonical operation.
+        if old.next_chunk == 0
+            || old.next_chunk >= old.manifest.len()
+            || old.upgrade.is_some()
+            || old.contract_continuation.is_some()
+            || old.source_digest != self.source_digest
+            || old.boundary != self.boundary
+            || old.manifest != self.manifest
+            || old.packing_policy != self.packing_policy
+            || old.consolidation_requests.len() != self.consolidation_requests.len()
+            || old.resolved_policy != self.resolved_policy
+            || old.synthesis_policy != self.synthesis_policy
+        {
+            return;
+        }
+        self.next_chunk = old.next_chunk;
+        self.evidence.clone_from(&old.evidence);
+        self.unfinished.clone_from(&old.unfinished);
+        self.user_sequences.clone_from(&old.user_sequences);
+        self.requests[..old.next_chunk].clone_from_slice(&old.requests[..old.next_chunk]);
+        self.consolidation_requests[..old.next_chunk]
+            .clone_from_slice(&old.consolidation_requests[..old.next_chunk]);
+        let inherited = self
+            .requests
+            .iter()
+            .chain(&self.consolidation_requests)
+            .map(|count| u32::from(*count))
+            .sum();
+        if let Some(lifecycle) = &mut self.request_state {
+            lifecycle.inherited_requests = inherited;
+        }
     }
 
     /// Call before restoration or dispatch; absence is explicit incompatibility, not a reset.
@@ -368,6 +408,18 @@ impl LocalCheckpoint {
         Ok(())
     }
 
+    fn inherited_requests(&self) -> usize {
+        self.request_state
+            .as_ref()
+            .map_or(0, |state| state.inherited_requests as usize)
+    }
+
+    fn extra_requests(&self) -> usize {
+        self.request_state
+            .as_ref()
+            .map_or(0, |state| state.extra_requests as usize)
+    }
+
     /// Total reserved requests, including corrective work; no old counter is ever reset.
     fn consumed_requests(&self) -> u32 {
         self.upgrade.as_ref().map_or(0, |seed| seed.spent_requests)
@@ -377,6 +429,10 @@ impl LocalCheckpoint {
                 .chain(&self.consolidation_requests)
                 .map(|count| u32::from(*count))
                 .sum::<u32>()
+            + self
+                .request_state
+                .as_ref()
+                .map_or(0, |state| state.extra_requests)
             + self
                 .contract_continuation
                 .as_ref()
@@ -424,12 +480,31 @@ impl LocalCheckpoint {
         Ok(())
     }
 
+    // Validate the entire opaque compatibility envelope before exposing any executable state.
+    #[allow(clippy::too_many_lines)]
     pub(super) fn decode(payload: &str) -> Result<Self, CompactionError> {
         if payload.len() > MAX_PAYLOAD {
             return Err(invalid_checkpoint());
         }
         let checkpoint: Self = serde_json::from_str(payload).map_err(|_| invalid_checkpoint())?;
         checkpoint.verify_upgrade()?;
+        if checkpoint
+            .request_state
+            .as_ref()
+            .is_some_and(|state| !state.valid())
+        {
+            return Err(invalid_checkpoint());
+        }
+        if checkpoint.inherited_requests()
+            > checkpoint
+                .requests
+                .iter()
+                .chain(&checkpoint.consolidation_requests)
+                .map(|count| usize::from(*count))
+                .sum::<usize>()
+        {
+            return Err(invalid_checkpoint());
+        }
         checkpoint.verify_contract_continuation()?;
         if checkpoint
             .restart_allowance
@@ -633,13 +708,19 @@ impl LocalCheckpoint {
                                 || {
                                     self.restart_allowance.as_ref().map_or_else(
                                         || {
-                                            total.saturating_mul(
-                                                if self.synthesis_policy.is_some() {
-                                                    4
+                                            total
+                                                .saturating_mul(
+                                                    if self.synthesis_policy.is_some() {
+                                                        4
+                                                    } else {
+                                                        2
+                                                    },
+                                                )
+                                                .saturating_add(if self.request_state.is_some() {
+                                                    8
                                                 } else {
-                                                    2
-                                                },
-                                            )
+                                                    0
+                                                })
                                         },
                                         |allowance| u64::from(allowance.max_requests),
                                     )
@@ -653,7 +734,8 @@ impl LocalCheckpoint {
                 source_events: None,
                 decoded_bytes: None,
             }),
-            blocker: None,
+            blocker: (phase == bcode_session_models::CompactionInspectionPhase::Blocked)
+                .then_some(bcode_session_models::CompactionInspectionBlocker::BudgetExhausted),
         };
         let Ok(detail) = observation.encode() else {
             return;
@@ -708,6 +790,13 @@ impl LocalCheckpoint {
         key: &str,
     ) -> Result<bool, CompactionError> {
         use bcode_session_models::{SessionHistoryDirection, SessionHistoryQuery};
+        if self
+            .request_state
+            .as_ref()
+            .is_some_and(super::retry::RequestState::blocked)
+        {
+            return Ok(false);
+        }
         if self.contract_continuation.is_some()
             || self.requests.get(self.next_chunk) != Some(&2)
             || self.synthesis_phase != SynthesisPhase::Accumulating
@@ -813,6 +902,48 @@ impl LocalCheckpoint {
         Ok(())
     }
 
+    pub(super) fn admission_blocked(&self) -> bool {
+        let exhausted_chunk = self
+            .requests
+            .get(self.next_chunk)
+            .is_some_and(|count| *count >= if self.request_state.is_some() { 2 } else { 1 })
+            && self
+                .contract_continuation
+                .as_ref()
+                .is_none_or(|grant| grant.chunk == self.next_chunk && grant.requests >= 2);
+        self.request_state
+            .as_ref()
+            .is_some_and(super::retry::RequestState::blocked)
+            || exhausted_chunk
+            || self.synthesis_phase != SynthesisPhase::Accumulating
+            || (self.next_chunk < self.manifest.len() && self.verify_restart_allowance().is_err())
+    }
+
+    pub(super) async fn reserve_provider_retry(
+        &mut self,
+        state: &ServerState,
+        session_id: SessionId,
+        key: &str,
+    ) -> Result<(), CompactionError> {
+        self.verify_restart_allowance()?;
+        if self
+            .contract_continuation
+            .as_ref()
+            .is_some_and(|grant| grant.reserved >= 64)
+        {
+            return Err(CompactionError::OperationBlocked);
+        }
+        self.request_state
+            .as_mut()
+            .ok_or_else(invalid_checkpoint)?
+            .reserve_extra()?;
+        // Extra attempts remain charged to corrective work as well as their own bound.
+        if let Some(grant) = &mut self.contract_continuation {
+            grant.reserved += 1;
+        }
+        self.save(state, session_id, key).await
+    }
+
     pub(super) async fn reserve(
         &mut self,
         state: &ServerState,
@@ -821,6 +952,9 @@ impl LocalCheckpoint {
         index: usize,
     ) -> Result<u8, CompactionError> {
         let attempt = self.reserve_slot(index)?;
+        if let Some(lifecycle) = &mut self.request_state {
+            lifecycle.reserve_pending();
+        }
         self.save(state, session_id, key).await?;
         self.observe(
             state,
@@ -912,12 +1046,7 @@ impl LocalCheckpoint {
             ));
         }
         if let Some(allowance) = &self.restart_allowance {
-            let consumed: u32 = self
-                .requests
-                .iter()
-                .chain(&self.consolidation_requests)
-                .map(|count| u32::from(*count))
-                .sum();
+            let consumed = self.consumed_requests();
             if consumed >= allowance.max_requests || current_unix_millis() >= allowance.deadline_ms
             {
                 return Err(CompactionError::Provider(
@@ -1008,6 +1137,9 @@ impl LocalCheckpoint {
         key: &str,
     ) -> Result<u8, CompactionError> {
         let attempt = self.reserve_consolidation_slot()?;
+        if let Some(lifecycle) = &mut self.request_state {
+            lifecycle.reserve_pending();
+        }
         self.save(state, session_id, key).await?;
         compaction_recovery::transition(
             state,
@@ -1422,6 +1554,11 @@ fn validate_restart_tail(
         .trim();
     for event in events.iter().skip(1) {
         match &event.kind {
+            SessionEventKind::TraceEvent { trace }
+                if trace.turn_id.as_deref() == owner
+                    && matches!(&trace.payload, SessionTracePayload::ProviderEvent { event_type, detail: None }
+                        if event_type == bcode_session_models::PROVIDER_RETRY_CHECKPOINT_EVENT) => {
+            }
             SessionEventKind::ModelTurnFinished {
                 turn_id, outcome, ..
             } if !terminal_seen
@@ -1486,7 +1623,7 @@ fn restart_failure_blocker(
             continue;
         }
         let window = &events[index..=terminal];
-        if validate_settled_attempts(window).is_err() {
+        if validate_settled_attempts(window, request.version == 2).is_err() {
             continue;
         }
         if let Ok((checkpoint, usages)) =
@@ -1502,7 +1639,9 @@ fn restart_failure_blocker(
                     .contract_continuation
                     .as_ref()
                     .map_or(0, |grant| usize::from(grant.requests));
-            if usages.len() < reserved {
+            if usages.len()
+                < reserved + checkpoint.extra_requests() - checkpoint.inherited_requests()
+            {
                 return Blocker::UnsettledRequests;
             }
         }
@@ -1581,7 +1720,7 @@ fn validate_restart_failure_proof(
     if reason != "compaction_finished" {
         return Err(invalid_checkpoint());
     }
-    validate_settled_attempts(events)?;
+    validate_settled_attempts(events, request.version == 2)?;
     let (checkpoint, usages) = restart_attempt_evidence(request, &events[1..events.len() - 1])?;
     validate_restart_rejection(request, &checkpoint, &usages, message)?;
     let abandoned_responses = if request.version == 2 {
@@ -1621,10 +1760,25 @@ fn validate_restart_failure_proof(
 /// Every intervening attempt must finish unpublished before the next one starts.
 fn validate_settled_attempts(
     events: &[bcode_session_models::SessionEvent],
+    abandon: bool,
 ) -> Result<(), CompactionError> {
     let mut active = false;
     let mut owner = None;
     for event in events {
+        if abandon
+            && active
+            && matches!(&event.kind,
+            SessionEventKind::ModelTurnFinished { turn_id, outcome, .. }
+                if owner.as_ref().is_some_and(|owner: &Option<String>| owner.as_deref() == Some(turn_id.as_str()))
+                    && matches!(outcome, bcode_session_models::ModelTurnOutcome::Error
+                        | bcode_session_models::ModelTurnOutcome::Cancelled
+                        | bcode_session_models::ModelTurnOutcome::IdleTimeout
+                        | bcode_session_models::ModelTurnOutcome::ProviderUnavailable))
+        {
+            // This closes activation ownership only. It does NOT settle its provider response;
+            // the version-2 request separately records explicit abandonment of that response.
+            active = false;
+        }
         let SessionEventKind::TraceEvent { trace } = &event.kind else {
             continue;
         };
@@ -1724,6 +1878,16 @@ fn restart_attempt_evidence(
         }
     }
     let checkpoint = checkpoint.ok_or_else(invalid_checkpoint)?;
+    if let Some(lifecycle) = &checkpoint.request_state {
+        for request_id in lifecycle.failures() {
+            let identity = observed
+                .iter()
+                .find(|(_, id)| id == request_id)
+                .ok_or_else(invalid_checkpoint)?;
+            // A normalized terminal failure is execution evidence, not synthesized billing usage.
+            usages.insert(identity.clone());
+        }
+    }
     if request.version == 2 {
         let reserved = checkpoint
             .requests
@@ -1735,7 +1899,8 @@ fn restart_attempt_evidence(
                 .contract_continuation
                 .as_ref()
                 .map_or(0, |grant| usize::from(grant.requests));
-        if observed.len() != reserved
+        if observed.len()
+            != reserved + checkpoint.extra_requests() - checkpoint.inherited_requests()
             || observed
                 .iter()
                 .map(|(_, id)| id)
@@ -1767,9 +1932,9 @@ fn validate_restart_rejection(
             .as_ref()
             .map_or(0, |grant| usize::from(grant.requests));
     if (if request.version == 2 {
-        usages.len() > reserved
+        usages.len() > reserved + checkpoint.extra_requests() - checkpoint.inherited_requests()
     } else {
-        usages.len() != reserved
+        usages.len() != reserved + checkpoint.extra_requests() - checkpoint.inherited_requests()
     }) || usages
         .iter()
         .map(|(_, request_id)| request_id)
@@ -1804,9 +1969,22 @@ fn validate_restart_rejection(
             || message
                 .contains("explicit compaction restart deadline exhausted; boundary unchanged")
             || message.contains("compaction corrective deadline exhausted; boundary unchanged"));
+    // Failure selection does not establish settlement. Version 1 still requires unique terminal
+    // evidence for every reserved request; version 2 explicitly abandons observed unresolved calls.
+    let provider_failure = message
+        .starts_with("context compaction failed: compaction provider failure:")
+        || message
+            == "context compaction failed: compaction operation blocked; explicit recovery required; boundary unchanged"
+        || message
+            == "context compaction failed: provider error: compaction request/repair budget exhausted; boundary unchanged"
+        || message.starts_with("context compaction failed: provider error: model error ");
     let cancelled_consolidation = checkpoint.synthesis_phase == SynthesisPhase::ConsolidatingV1
         && message == "context compaction failed: compaction cancelled";
+    let cancelled_operation =
+        request.version == 2 && message == "context compaction failed: compaction cancelled";
     if !cancelled_consolidation
+        && !cancelled_operation
+        && !provider_failure
         && (!message.starts_with("context compaction failed:")
             || !message.ends_with("; boundary unchanged")
             || !(bounded_repair || incompatible || consolidation || migration))
@@ -1969,6 +2147,8 @@ fn validates_legacy_expansion(
         )? == old.source_digest)
 }
 
+// Keep source identity, allowance, and replacement validation in one pre-publication proof.
+#[allow(clippy::too_many_lines)]
 pub(super) fn prepare_restart(
     request: &bcode_session_models::SessionCompactionRestartRequest,
     old: &LocalCheckpoint,
@@ -1980,6 +2160,20 @@ pub(super) fn prepare_restart(
 ) -> Result<PreparedRestart, CompactionError> {
     request.validate().map_err(|_| invalid_checkpoint())?;
     let expanded_legacy_source = validates_legacy_expansion(old, replacement, plan)?;
+    let retained_prefix = request.version == 2
+        && old.request_state.is_some()
+        && replacement.next_chunk == old.next_chunk
+        && replacement.next_chunk > 0
+        && old.manifest == replacement.manifest
+        && old.packing_policy == replacement.packing_policy
+        && old.resolved_policy == replacement.resolved_policy
+        && old.synthesis_policy == replacement.synthesis_policy
+        && old.consolidation_requests[..old.next_chunk]
+            == replacement.consolidation_requests[..old.next_chunk]
+        && digest(&old.evidence)? == digest(&replacement.evidence)?
+        && old.user_sequences == replacement.user_sequences
+        && old.unfinished == replacement.unfinished
+        && old.requests[..old.next_chunk] == replacement.requests[..replacement.next_chunk];
     if failure.operation_key != request.expected_operation_key
         || failure
             .events
@@ -1999,14 +2193,28 @@ pub(super) fn prepare_restart(
             && (old.boundary != replacement.boundary
                 || old.source_digest != replacement.source_digest))
         || (replacement.next_chunk != 0
+            && !retained_prefix
             && !replacement.upgrade.as_ref().is_some_and(|seed| {
                 seed.source_complete && replacement.next_chunk == replacement.manifest.len()
             }))
         || (replacement.upgrade.is_some() && !old.needs_upgrade())
-        || replacement.requests.iter().any(|count| *count != 0)
+        || replacement
+            .requests
+            .iter()
+            .skip(if retained_prefix {
+                replacement.next_chunk
+            } else {
+                0
+            })
+            .any(|count| *count != 0)
         || replacement
             .consolidation_requests
             .iter()
+            .skip(if retained_prefix {
+                replacement.next_chunk
+            } else {
+                0
+            })
             .any(|count| *count != 0)
         || replacement.synthesis_policy.is_none()
         || replacement.resolved_policy.is_none()
@@ -2038,6 +2246,12 @@ pub(super) fn prepare_restart(
             .upgrade
             .as_ref()
             .map_or(0, |seed| seed.spent_requests)
+            .checked_add(if retained_prefix {
+                replacement.consumed_requests()
+            } else {
+                0
+            })
+            .ok_or_else(invalid_checkpoint)?
             .checked_add(request.budget.max_provider_requests)
             .ok_or_else(invalid_checkpoint)?,
         deadline_ms: current_unix_millis()
@@ -3132,6 +3346,38 @@ mod tests {
         assert_eq!(restored.requests[0], 1);
         restored.restart_allowance.as_mut().unwrap().deadline_ms = 1;
         assert!(restored.verify_restart_allowance().is_err());
+    }
+
+    #[test]
+    fn provider_failure_recovery_still_requires_settlement_or_explicit_abandonment() {
+        let (_, plan, transcript, chunks) = fixture("Preserve restrictions.");
+        let mut old = LocalCheckpoint::create(&plan, &transcript, &chunks).unwrap();
+        old.requests[0] = 2;
+        let mut request = consolidation_restart_request(SessionId::new());
+        let usage = |index| {
+            (
+                format!("{}-compact-{}-{index}", request.session_id, old.boundary),
+                format!("r{index}"),
+            )
+        };
+        let settled = BTreeSet::from([usage(1), usage(2)]);
+        let partial = BTreeSet::from([usage(1)]);
+        for message in [
+            "context compaction failed: provider error: model error server_is_overloaded: busy",
+            "context compaction failed: provider error: compaction request/repair budget exhausted; boundary unchanged",
+            "context compaction failed: compaction operation blocked; explicit recovery required; boundary unchanged",
+        ] {
+            assert!(validate_restart_rejection(&request, &old, &partial, message).is_err());
+            validate_restart_rejection(&request, &old, &settled, message).unwrap();
+        }
+        request.version = 2;
+        validate_restart_rejection(
+            &request,
+            &old,
+            &partial,
+            "context compaction failed: provider error: model error server_is_overloaded: busy",
+        )
+        .unwrap();
     }
 
     async fn append_recovery_history_gap(state: &ServerState, session_id: SessionId) {
@@ -4559,6 +4805,43 @@ mod tests {
         assert_eq!(legacy.unfinished, durable.unfinished);
         assert_eq!(legacy.next_chunk, durable.next_chunk);
         drop(state);
+    }
+
+    #[test]
+    fn provider_retry_reservations_are_cumulative_and_block_replay_after_reload() {
+        let (_, plan, transcript, chunks) = fixture("Keep scope.");
+        let mut checkpoint =
+            LocalCheckpoint::create_with_policy(&plan, &transcript, &chunks, capacity_policy())
+                .unwrap();
+        assert!(!checkpoint.admission_blocked());
+        checkpoint.reserve_slot(0).unwrap();
+        checkpoint.request_state.as_mut().unwrap().reserve_pending();
+        assert!(
+            LocalCheckpoint::decode(&checkpoint.encode().unwrap())
+                .unwrap()
+                .admission_blocked()
+        );
+        for _ in 0..8 {
+            checkpoint
+                .request_state
+                .as_mut()
+                .unwrap()
+                .reserve_extra()
+                .unwrap();
+        }
+        assert_eq!(checkpoint.consumed_requests(), 9);
+        assert!(
+            checkpoint
+                .request_state
+                .as_mut()
+                .unwrap()
+                .reserve_extra()
+                .is_err()
+        );
+        let restored = LocalCheckpoint::decode(&checkpoint.encode().unwrap()).unwrap();
+        assert_eq!(restored.consumed_requests(), 9);
+        assert!(restored.admission_blocked());
+        assert_eq!(restored.requests, vec![1; chunks.len()]);
     }
 
     #[test]

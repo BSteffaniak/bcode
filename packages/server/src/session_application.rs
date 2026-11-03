@@ -262,6 +262,14 @@ fn compaction_failure(error: session_operations::CompactError) -> SessionApplica
                 };
                 failure("compaction_recovery_required", detail)
             }
+            CompactionError::ProviderFailure(error) => compaction_provider_failure(&format!(
+                "model error {}: {}",
+                error.code, error.message
+            )),
+            CompactionError::OperationBlocked => failure(
+                "compaction_recovery_required",
+                "retained compaction requests are blocked; prepare explicit bounded recovery; accepted work is retained and the context boundary is unchanged",
+            ),
             CompactionError::Provider(message) => compaction_provider_failure(&message),
             CompactionError::PlanUnavailable(_) | CompactionError::InsufficientProgress { .. } => {
                 failure(

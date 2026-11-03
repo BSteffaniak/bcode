@@ -8,7 +8,12 @@ def verify_injections(control, outcome):
     for path in Path(control).glob("attempt-*"):
         ready = json.loads((path / "ready.json").read_text())
         finished = json.loads((path / "finished.json").read_text())
-        if ready["outcome"] != outcome or not finished.get("response_ok"):
+        if ready["outcome"] != outcome:
+            raise ValueError("injection did not select the requested outcome")
+        if not finished.get("response_ok"):
+            if outcome in ("repair-overload", "overload-once"):
+                attempts.append((ready, None, None))
+                continue
             raise ValueError("injection did not finish with the selected response")
         text = (path / "response.json").read_text()
         prior = None
@@ -24,6 +29,16 @@ def verify_injections(control, outcome):
         attempts.append((ready, text, prior))
     if not attempts:
         raise ValueError("no actual controlled synthesis attempts")
+    if outcome in ("repair-overload", "overload-once"):
+        failures = [(ready, text) for ready, text, _ in attempts if text is None]
+        if len(failures) != 1:
+            raise ValueError("expected exactly one injected provider overload")
+        if outcome == "repair-overload" and not any(text == "{not-json" for _, text, _ in attempts):
+            raise ValueError("expected rejected synthesis before overload")
+        if not any(text and text != "{not-json" for _, text, _ in attempts):
+            raise ValueError("no accepted replacement after overload")
+        return {"outcome": outcome, "attempts": len(attempts), "provider_failures": 1,
+                "fault_delivery_only": True}
     if outcome == "near-limit":
         for _, text, _ in attempts:
             if len(text) != 5924:

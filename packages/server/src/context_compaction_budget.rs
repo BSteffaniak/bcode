@@ -63,6 +63,16 @@ fn invalid(message: &str) -> CompactionError {
 }
 
 impl ResolvedSummaryPolicy {
+    pub(super) fn same_dispatch_capacity(&self, other: &Self) -> bool {
+        self.provider_id == other.provider_id
+            && self.model_id == other.model_id
+            && self.context_window == other.context_window
+            && self.requested_max_output_tokens == other.requested_max_output_tokens
+            && self.provider_max_output_tokens == other.provider_max_output_tokens
+            && self.maximum_summary_bytes == other.maximum_summary_bytes
+            && self.maximum_response_bytes == other.maximum_response_bytes
+    }
+
     /// Resolve from the same model capacity and complete-request estimates used by the parent.
     ///
     /// # Errors

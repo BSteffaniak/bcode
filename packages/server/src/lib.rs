@@ -23103,6 +23103,7 @@ async fn run_model_turn_inner(
     let mut last_proactive_compaction_boundary = None;
     let mut last_proactive_attempt_boundary = None;
     let mut capacity_compaction_passes = 0_u8;
+    let mut proactive_blocker_reported = false;
     append_context_compaction_trace(
         state,
         session_id,
@@ -23363,6 +23364,12 @@ async fn run_model_turn_inner(
             }) => {
                 last_proactive_attempt_boundary = Some(compacted_through_sequence);
             }
+            Err(CompactionError::OperationBlocked) => {
+                if !proactive_blocker_reported {
+                    proactive_blocker_reported = true;
+                    append_system_event(state, session_id, "auto compaction blocked; accepted work retained; prepare explicit bounded recovery".into()).await;
+                }
+            }
             Err(error) => {
                 append_system_event(
                     state,
@@ -23382,6 +23389,12 @@ async fn run_model_turn_inner(
             )
             .await
         {
+            if proactive_blocker_reported {
+                return ModelTurnCompletion::with_message(
+                    ModelTurnOutcome::Error,
+                    "model input capacity exhausted while compaction is blocked; accepted work retained; prepare explicit bounded compaction recovery",
+                );
+            }
             if compacted_this_pass && capacity_compaction_passes < 3 {
                 capacity_compaction_passes += 1;
                 append_context_compaction_trace(
@@ -57027,6 +57040,90 @@ library = "test"
     }
 
     #[tokio::test]
+    async fn compaction_provider_errors_preserve_retry_facts_but_never_retry_after_output() {
+        use crate::context_compaction::{CompactionPollStatus, handle_compaction_events};
+        let state = test_server_state(SessionManager::default());
+        let id = SessionId::new();
+        let error = bcode_model::ProviderError {
+            code: "server_is_overloaded".into(),
+            category: bcode_model::ProviderErrorCategory::Overloaded,
+            message: "busy".into(),
+            retryable: true,
+            provider_message: None,
+            failure: None,
+            request_id: None,
+            diagnostic_context: Box::default(),
+            sources: Box::default(),
+            retry: Some(Box::new(bcode_model::ProviderRetryHint {
+                retry_after_ms: Some(2345),
+                ..Default::default()
+            })),
+        };
+        for output in [
+            None,
+            Some(ProviderTurnEvent::TextDelta {
+                text: "partial".into(),
+            }),
+            Some(ProviderTurnEvent::ReasoningDelta {
+                text: "private reasoning".into(),
+            }),
+        ] {
+            let mut attempt = test_cost_attempt();
+            let mut text = String::new();
+            let mut started = false;
+            if let Some(output) = output {
+                assert!(matches!(
+                    handle_compaction_events(
+                        &state,
+                        id,
+                        &mut attempt,
+                        &mut text,
+                        &mut started,
+                        vec![output]
+                    )
+                    .await,
+                    CompactionPollStatus::Continue
+                ));
+            }
+            let status = handle_compaction_events(
+                &state,
+                id,
+                &mut attempt,
+                &mut text,
+                &mut started,
+                vec![ProviderTurnEvent::Error {
+                    error: error.clone(),
+                }],
+            )
+            .await;
+            if started {
+                assert!(matches!(status, CompactionPollStatus::Failed(_)));
+            } else {
+                let CompactionPollStatus::ProviderFailure(actual) = status else {
+                    panic!("typed failure required")
+                };
+                assert_eq!(actual.category, error.category);
+                assert!(actual.retryable);
+                assert_eq!(actual.retry.unwrap().retry_after_ms, Some(2345));
+            }
+        }
+        let mut attempt = test_cost_attempt();
+        assert!(matches!(
+            handle_compaction_events(
+                &state,
+                id,
+                &mut attempt,
+                &mut String::new(),
+                &mut false,
+                vec![ProviderTurnEvent::Cancelled]
+            )
+            .await,
+            CompactionPollStatus::Cancelled
+        ));
+        drop(state);
+    }
+
+    #[tokio::test]
     async fn request_cost_lifecycle_captures_rates_and_preserves_interrupted_coverage() {
         let sessions = SessionManager::default();
         let session = sessions
@@ -57106,6 +57203,7 @@ library = "test"
             session.id,
             &mut attempt,
             &mut String::new(),
+            &mut false,
             vec![ProviderTurnEvent::Usage { usage: warm }],
         )
         .await;

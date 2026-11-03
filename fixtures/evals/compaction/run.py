@@ -21,7 +21,7 @@ parser.add_argument("--binary", required=True, type=pathlib.Path)
 parser.add_argument("--case", choices=("explicit", "automatic-cancel", "automatic-restart", "automatic-crash"),
                     default="explicit")
 parser.add_argument("--outcome", choices=("success", "repair", "oversize-repair", "omit-scope-repair",
-                                               "paraphrase-scope-repair", "near-limit"), default="success",
+                                               "paraphrase-scope-repair", "near-limit", "repair-overload", "overload-once"), default="success",
                     help="Opt-in deterministic synthesis fault/near-limit carry (explicit case only)")
 args = parser.parse_args()
 if args.case != "explicit" and args.outcome != "success":

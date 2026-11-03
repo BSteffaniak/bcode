@@ -87,6 +87,9 @@ impl Control {
                 | "paraphrase-scope"
                 | "paraphrase-scope-repair"
                 | "near-limit"
+                | "repair-overload"
+                | "overload"
+                | "overload-once"
         ) {
             return Err("unsupported fake compaction outcome".into());
         }
@@ -210,6 +213,29 @@ impl Control {
 
     fn response(&self, text: Result<String, ProviderError>) -> Result<String, ProviderError> {
         match self.outcome.as_str() {
+            "overload" => Err(compaction_overload()),
+            "overload-once" | "repair-overload" => {
+                let root = self.directory.parent().expect("scratch attempt parent");
+                // Scratch-only deterministic scenario state, confined by Control::prepare.
+                let attempts = std::fs::read_dir(root)
+                    .map_err(|error| fake_structured_output_error(&error))?
+                    .filter_map(Result::ok)
+                    .filter(|entry| entry.file_name().to_string_lossy().starts_with("attempt-"))
+                    .count();
+                if self.outcome == "repair-overload" && attempts == 1 {
+                    Ok("{not-json".into())
+                } else if attempts
+                    == if self.outcome == "repair-overload" {
+                        2
+                    } else {
+                        1
+                    }
+                {
+                    Err(compaction_overload())
+                } else {
+                    text
+                }
+            }
             "fail" => Err(fake_structured_output_error(
                 &"injected fake compaction failure",
             )),
@@ -239,6 +265,14 @@ impl Control {
             _ => text,
         }
     }
+}
+
+fn compaction_overload() -> ProviderError {
+    let mut error = fake_structured_output_error(&"deterministic compaction overload");
+    error.code = "server_is_overloaded".into();
+    error.category = bcode_model::ProviderErrorCategory::Overloaded;
+    error.retryable = true;
+    error
 }
 
 // Deliberately adversarial output, never a replacement source of canonical evidence.

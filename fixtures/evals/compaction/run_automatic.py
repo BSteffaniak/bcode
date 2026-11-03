@@ -336,19 +336,58 @@ enabled = false
                     raise ValueError("restart error did not explicitly preserve unresolved provider outcome")
                 self.save("original-activation-settlement.json", json.dumps(evidence, indent=2))
         self.export("interrupted.jsonl")
+        if self.interruption != "cancel":
+            # Surface retained blocked work through an ordinary manual operation. This records
+            # an exact completed-failure selection after the interrupted activation terminalizes;
+            # it neither settles nor replays the missing provider response.
+            result = self.run("session", "compact", self.session, "--json", check=False)
+            self.save("blocked-manual-compaction.json", result.stdout)
+            if result.returncode == 0:
+                raise ValueError("unresolved request unexpectedly resumed without authorization")
+        # Unresolved provider requests are not replayed by ordinary turn admission. Explicitly
+        # authorize abandoning the held response, then admit bounded recovery through the CLI.
+        import uuid
+        prepared = json.loads(self.run("session", "compact", self.session, "--prepare-restart",
+            "--abandon-unresolved", "--restart-operation-id", str(uuid.uuid4()),
+            "--restart-max-provider-requests", "128", "--restart-timeout-ms", "300000", "--json").stdout)
+        self.save("explicit-recovery-preparation.json", json.dumps(prepared, indent=2))
+        if prepared.get("blocker") or not prepared.get("restart"):
+            raise ValueError(f"explicit interrupted recovery blocked: {prepared.get('blocker')}")
+        request = self.save("explicit-recovery-request.json", json.dumps(prepared["restart"]))
+        recovery_stdout = (self.work / "explicit-recovery-admission.json").open("w")
+        recovery_stderr = (self.work / "explicit-recovery-admission.stderr").open("w")
+        self.logs.extend([recovery_stdout, recovery_stderr])
+        recovery_process = subprocess.Popen(self.base + ["session", "compact", self.session,
+            "--restart-request", str(request), "--json"], cwd=self.repo, env=self.env,
+            stdout=recovery_stdout, stderr=recovery_stderr)
+        resumed = self.gate(seen)
+        seen.add(str(resumed))
+        self.save("resumed-attempt.json", json.dumps({"attempt": resumed.name}))
+        from verify_automatic import coverage_keys, check_no_replay
+        check_no_replay(coverage_keys(first), coverage_keys(resumed))
+        (resumed / "release").touch()
+        deadline = time.monotonic() + self.timeout
+        while time.monotonic() < deadline:
+            for attempt in attempts(self.control):
+                if str(attempt) not in seen:
+                    seen.add(str(attempt))
+                    (attempt / "release").touch()
+            events = load_events([self.export("recovery.jsonl")])
+            if markers(events):
+                break
+            time.sleep(.1)
+        else:
+            raise ValueError("explicit recovery did not publish a marker")
+        recovery_process.wait(timeout=self.timeout)
+        if recovery_process.returncode:
+            raise ValueError("explicit recovery command failed")
         # Ordinary new turn admission exercises the real same-session automatic path.
         followup = self.run("send", self.session,
                             "Continue the requested work without changing the corrected scope.", "--json").stdout
         self.save("followup-admission.jsonl", followup)
         target_turn = admitted_turn(json.loads(followup))
         self.identity["continuation_turn_id"] = target_turn
-        resumed = self.gate(seen)
-        seen.add(str(resumed))
-        self.save("resumed-attempt.json", json.dumps({"attempt": resumed.name}))
-        # Fail early if accepted prefix is requested again; never release a known replay as success.
-        from verify_automatic import coverage_keys, check_no_replay
-        check_no_replay(coverage_keys(first), coverage_keys(resumed))
-        (resumed / "release").touch()
+        # Explicit recovery already completed all retained source synthesis.
         deadline = time.monotonic() + self.timeout
         while time.monotonic() < deadline:
             for attempt in attempts(self.control):
