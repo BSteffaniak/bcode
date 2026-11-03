@@ -6361,7 +6361,12 @@ impl Bcode {
             .await
     }
 
-    /// Return models advertised by an embedded provider plugin.
+    /// Return models advertised by an embedded provider plugin, enriched with the embedded model
+    /// catalog (context windows, reasoning controls, pricing).
+    ///
+    /// The SDK's provider request context (configured settings and credentials) is sent only to
+    /// the provider it was resolved for, the default selection's provider; other providers
+    /// receive an empty context, so credentials never cross providers.
     ///
     /// # Errors
     ///
@@ -6369,20 +6374,39 @@ impl Bcode {
     /// cannot be invoked or decoded.
     #[cfg(feature = "embedded-plugins")]
     pub async fn provider_models(&self, provider_plugin_id: impl AsRef<str>) -> Result<ModelList> {
-        let plugins = self
+        let provider_plugin_id = provider_plugin_id.as_ref();
+        let selector = self
+            .default_model_selector()
+            .filter(|selector| selector.provider_plugin_id() == Some(provider_plugin_id));
+        let selected_model_id = selector.map(|selector| selector.model_id().to_owned());
+        let request = bcode_model::ModelListRequest {
+            provider_context: if selector.is_some() {
+                self.provider_context.clone()
+            } else {
+                ProviderRequestContext::default()
+            },
+            selected_model_id: selected_model_id.clone(),
+        };
+        let models = self
             .plugins
             .as_ref()
-            .ok_or(BcodeError::MissingPluginRuntime)?;
-        plugins
+            .ok_or(BcodeError::MissingPluginRuntime)?
             .invoke_service_json_scoped(
-                provider_plugin_id.as_ref(),
+                provider_plugin_id,
                 MODEL_PROVIDER_INTERFACE_ID,
                 OP_MODELS,
-                &bcode_model::ModelListRequest::default(),
+                &request,
                 bcode_plugin::PluginInvocationScope::Global,
             )
             .await
-            .map_err(|error| BcodeError::ProviderConfiguration(error.to_string()))
+            .map_err(|error| BcodeError::ProviderConfiguration(error.to_string()))?;
+        Ok(bcode_model_catalog::ModelCatalogResolver::embedded()
+            .resolve_selection(
+                models,
+                selected_model_id.as_deref(),
+                selected_model_id.as_deref(),
+            )
+            .await)
     }
 }
 
