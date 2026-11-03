@@ -1,4 +1,6 @@
 #[cfg(test)]
+mod effective_mapping;
+#[cfg(test)]
 mod fixes;
 
 use super::*;

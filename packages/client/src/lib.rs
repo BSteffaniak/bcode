@@ -640,6 +640,57 @@ impl bcode_provider_auth_models::application::AuthPoolApplication for BcodeClien
     }
 }
 
+impl bcode_provider_auth_models::application::AccountLifecycleApplication for BcodeClient {
+    async fn account_lifecycle_catalog(
+        &self,
+    ) -> Result<
+        bcode_provider_auth_models::application::AccountLifecycleCatalog,
+        bcode_provider_auth_models::application::AuthPoolApplicationFailure,
+    > {
+        Self::account_lifecycle_catalog(self)
+            .await
+            .map_err(account_lifecycle_client_failure)
+    }
+
+    async fn preview_account_lifecycle(
+        &self,
+        request: bcode_provider_auth_models::account_lifecycle::AccountLifecycleRequest,
+        revoke: bool,
+    ) -> Result<
+        bcode_provider_auth_models::application::AccountLifecyclePlan,
+        bcode_provider_auth_models::application::AuthPoolApplicationFailure,
+    > {
+        Self::preview_account_lifecycle(self, request, revoke)
+            .await
+            .map_err(account_lifecycle_client_failure)
+    }
+
+    async fn execute_account_lifecycle(
+        &self,
+        plan_id: String,
+    ) -> Result<
+        bcode_provider_auth_models::application::AccountLifecycleExecution,
+        bcode_provider_auth_models::application::AuthPoolApplicationFailure,
+    > {
+        Self::execute_account_lifecycle(self, plan_id)
+            .await
+            .map_err(account_lifecycle_client_failure)
+    }
+}
+
+fn account_lifecycle_client_failure(
+    error: ClientError,
+) -> bcode_provider_auth_models::application::AuthPoolApplicationFailure {
+    let (code, message) = match error {
+        ClientError::Server { code, message } => (code, message),
+        _ => (
+            "account_lifecycle_transport_failed".into(),
+            "account lifecycle response unavailable".into(),
+        ),
+    };
+    bcode_provider_auth_models::application::AuthPoolApplicationFailure { code, message }
+}
+
 impl bcode_provider_auth_models::application::AccountRoutingApplication for BcodeClient {
     async fn account_routing(
         &self,
@@ -5860,6 +5911,52 @@ impl BcodeClient {
             profile,
         })
         .await
+    }
+
+    /// Read registered providers and owned declared/runtime accounts without credentials.
+    /// # Errors
+    /// Fails on transport, caller configuration, or authoritative registry errors.
+    pub async fn account_lifecycle_catalog(
+        &self,
+    ) -> Result<bcode_provider_auth_models::application::AccountLifecycleCatalog, ClientError> {
+        match self.send_request(Request::AccountLifecycleCatalog).await? {
+            ResponsePayload::AccountLifecycleCatalog { catalog } => Ok(catalog),
+            _ => Err(ClientError::UnexpectedResponse),
+        }
+    }
+
+    /// Review explicit logout/removal effects; this does not mutate account state.
+    /// # Errors
+    /// Fails for invalid ownership, unsupported revocation, or unavailable state.
+    pub async fn preview_account_lifecycle(
+        &self,
+        request: bcode_provider_auth_models::account_lifecycle::AccountLifecycleRequest,
+        revoke: bool,
+    ) -> Result<bcode_provider_auth_models::application::AccountLifecyclePlan, ClientError> {
+        match self
+            .send_request(Request::PreviewAccountLifecycle { request, revoke })
+            .await?
+        {
+            ResponsePayload::AccountLifecyclePreview { plan } => Ok(plan),
+            _ => Err(ClientError::UnexpectedResponse),
+        }
+    }
+
+    /// Execute a caller-bound reviewed plan after the caller has confirmed its effects.
+    /// # Errors
+    /// Fails for unavailable, expired, foreign, or stale plans, or transport errors.
+    pub async fn execute_account_lifecycle(
+        &self,
+        plan_id: String,
+    ) -> Result<bcode_provider_auth_models::application::AccountLifecycleExecution, ClientError>
+    {
+        match self
+            .send_request(Request::ExecuteAccountLifecycle { plan_id })
+            .await?
+        {
+            ResponsePayload::AccountLifecycleExecuted { result } => Ok(result),
+            _ => Err(ClientError::UnexpectedResponse),
+        }
     }
 
     /// Apply a portable auth-pool preference request through the daemon boundary.

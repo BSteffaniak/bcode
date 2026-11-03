@@ -752,6 +752,57 @@ impl bcode_daemon_lifecycle::application::RuntimeApplication for ServicesApplica
     }
 }
 
+impl bcode_provider_auth_models::application::AccountLifecycleApplication
+    for ServicesApplicationHandle<'_>
+{
+    async fn account_lifecycle_catalog(
+        &self,
+    ) -> Result<
+        bcode_provider_auth_models::application::AccountLifecycleCatalog,
+        bcode_provider_auth_models::application::AuthPoolApplicationFailure,
+    > {
+        self.require_running().map_err(account_lifecycle_stopped)?;
+        crate::account_lifecycle::catalog(self.state, self.client_id).await
+    }
+
+    async fn preview_account_lifecycle(
+        &self,
+        request: bcode_provider_auth_models::account_lifecycle::AccountLifecycleRequest,
+        revoke: bool,
+    ) -> Result<
+        bcode_provider_auth_models::application::AccountLifecyclePlan,
+        bcode_provider_auth_models::application::AuthPoolApplicationFailure,
+    > {
+        self.require_running().map_err(account_lifecycle_stopped)?;
+        crate::account_lifecycle::preview(self.state, self.client_id, request, revoke).await
+    }
+
+    async fn execute_account_lifecycle(
+        &self,
+        plan_id: String,
+    ) -> Result<
+        bcode_provider_auth_models::application::AccountLifecycleExecution,
+        bcode_provider_auth_models::application::AuthPoolApplicationFailure,
+    > {
+        self.require_running().map_err(account_lifecycle_stopped)?;
+        Box::pin(crate::account_lifecycle::execute(
+            self.state,
+            self.client_id,
+            &plan_id,
+        ))
+        .await
+    }
+}
+
+fn account_lifecycle_stopped(
+    (code, message): (&str, &str),
+) -> bcode_provider_auth_models::application::AuthPoolApplicationFailure {
+    bcode_provider_auth_models::application::AuthPoolApplicationFailure {
+        code: code.into(),
+        message: message.into(),
+    }
+}
+
 impl bcode_provider_auth_models::application::AccountRoutingApplication
     for ServicesApplicationHandle<'_>
 {
@@ -904,6 +955,43 @@ mod tests {
         Arc::new(crate::tests::test_server_state(
             bcode_session::SessionManager::default(),
         ))
+    }
+
+    #[tokio::test]
+    async fn account_lifecycle_rejects_stopped_access_and_unknown_plans() {
+        use bcode_provider_auth_models::application::AccountLifecycleApplication as _;
+        let state = state();
+        let handle = ServicesApplicationHandle::new(&state, ClientId::new());
+        let error = handle
+            .execute_account_lifecycle("unreviewed".into())
+            .await
+            .unwrap_err();
+        assert_eq!(error.code, "account_lifecycle_plan_unavailable");
+        assert!(state.account_lifecycle_plans.lock().await.is_empty());
+        state
+            .shutdown_requested
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        assert_eq!(
+            handle.account_lifecycle_catalog().await.unwrap_err().code,
+            "services_application_stopped"
+        );
+        assert_eq!(handle.preview_account_lifecycle(
+            bcode_provider_auth_models::account_lifecycle::AccountLifecycleRequest {
+                schema_version: 1,
+                provider_id: "provider".into(),
+                profile: "account".into(),
+                action: bcode_provider_auth_models::account_lifecycle::AccountLifecycleAction::Remove,
+            }, false,
+        ).await.unwrap_err().code, "services_application_stopped");
+        assert_eq!(
+            handle
+                .execute_account_lifecycle("unreviewed".into())
+                .await
+                .unwrap_err()
+                .code,
+            "services_application_stopped"
+        );
+        drop(state);
     }
 
     #[tokio::test]

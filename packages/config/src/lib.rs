@@ -5906,6 +5906,8 @@ pub struct RuntimeAuthProfileRemoval {
     pub removed_bindings: Vec<String>,
     /// Pools the profile was removed from as a member.
     pub removed_from_pools: Vec<String>,
+    /// Owned runtime pools whose preference referenced the forgotten profile.
+    pub cleared_preferences: Vec<String>,
 }
 
 impl RuntimeAuthProfileRemoval {
@@ -5915,6 +5917,7 @@ impl RuntimeAuthProfileRemoval {
         self.removed_profile
             || !self.removed_bindings.is_empty()
             || !self.removed_from_pools.is_empty()
+            || !self.cleared_preferences.is_empty()
     }
 }
 
@@ -5945,7 +5948,10 @@ pub fn remove_runtime_auth_profile(
     Ok(removal)
 }
 
-fn remove_runtime_auth_profile_from(
+/// Remove owned runtime references from a caller-owned snapshot without I/O.
+///
+/// Declarative configuration and entries owned by other plugins are untouched.
+pub fn remove_runtime_auth_profile_from(
     registry: &mut RuntimeAuthSubscriptions,
     profile_name: &str,
     owner_plugin_id: &str,
@@ -5984,11 +5990,19 @@ fn remove_runtime_auth_profile_from(
         let before = pool.profiles.len();
         pool.profiles
             .retain(|member| member.auth_profile != profile_name || !owned(member));
-        if pool.profiles.len() != before {
+        let removed_member = pool.profiles.len() != before;
+        let owned_pool = pool
+            .owner_plugin_id
+            .as_deref()
+            .or(pool.provider_plugin_id.as_deref())
+            == Some(owner_plugin_id);
+        if (removed_member || owned_pool) && pool.preferred_profile.as_deref() == Some(profile_name)
+        {
+            pool.preferred_profile = None;
+            removal.cleared_preferences.push(pool_name.clone());
+        }
+        if removed_member {
             removal.removed_from_pools.push(pool_name.clone());
-            if pool.preferred_profile.as_deref() == Some(profile_name) {
-                pool.preferred_profile = None;
-            }
             if pool.profiles.is_empty() {
                 emptied_pools.push(pool_name.clone());
             }
@@ -6242,6 +6256,65 @@ fn write_runtime_auth_subscriptions(
     bcode_confined_fs::persist(temporary, path).map_err(io_error)?;
     bcode_confined_fs::sync_directory_path(parent).map_err(io_error)?;
     Ok(())
+}
+
+/// Retained ownership of the native runtime auth registry.
+///
+/// Multi-domain account mutations acquire this first, then account settings, then
+/// observation ownership. All file locks are nonblocking. Dropping releases ownership.
+pub struct RuntimeAuthTransaction {
+    path: PathBuf,
+    _lock: fs::File,
+}
+
+impl RuntimeAuthTransaction {
+    /// Acquire the selected runtime registry without repairing or initializing its contents.
+    ///
+    /// # Errors
+    /// Fails on unavailable ownership or unsupported existing state.
+    pub fn acquire() -> Result<Self, ConfigError> {
+        Self::acquire_at(runtime_auth_subscriptions_path())
+    }
+
+    /// Acquire an explicit registry path using the same lock discipline as normal writers.
+    ///
+    /// # Errors
+    /// Fails on unavailable ownership or unsupported existing state.
+    pub fn acquire_at(path: PathBuf) -> Result<Self, ConfigError> {
+        let lock = lock_auth_subscriptions(&path)?;
+        let transaction = Self { path, _lock: lock };
+        transaction.snapshot()?;
+        Ok(transaction)
+    }
+
+    /// Read bounded, losslessly supported state under retained ownership.
+    ///
+    /// # Errors
+    /// Fails closed on damaged, unsupported or unreadable state.
+    pub fn snapshot(&self) -> Result<RuntimeAuthSubscriptions, ConfigError> {
+        read_auth_subscriptions_for_update(&self.path)
+    }
+
+    /// Compare and publish a replacement while retaining ownership.
+    ///
+    /// # Errors
+    /// A mismatch is rejected before writing. I/O errors during publication can have an
+    /// uncertain outcome, including a successful rename followed by failed directory sync.
+    pub fn commit(
+        &mut self,
+        expected: &RuntimeAuthSubscriptions,
+        replacement: &RuntimeAuthSubscriptions,
+    ) -> Result<(), ConfigError> {
+        if self.snapshot()? != *expected {
+            return Err(ConfigError::Composition {
+                message: "runtime auth state changed; existing state preserved".into(),
+            });
+        }
+        if expected != replacement {
+            write_runtime_auth_subscriptions(&self.path, replacement)?;
+        }
+        Ok(())
+    }
 }
 
 /// Return an explicitly selected state root, without opting into default persistence.

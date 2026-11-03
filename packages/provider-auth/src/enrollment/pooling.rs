@@ -123,7 +123,7 @@ pub fn plan(
         method_id,
         destination,
     )?;
-    let metadata = metadata(&prepared.resolved);
+    let mut metadata = metadata(&prepared.resolved);
     let mut result = EnrollmentResult {
         profile: prepared.resolved.profile_name.clone(),
         pool: None,
@@ -164,7 +164,7 @@ pub fn plan(
     if runtime
         .profiles
         .get(&result.profile)
-        .is_some_and(|old| old != &metadata)
+        .is_some_and(|old| !super::effective_mapping::profiles_match(old, &metadata, provider))
         || runtime
             .bindings
             .get(&provider.provider_id)
@@ -176,6 +176,11 @@ pub fn plan(
             Source::Combined,
             Reason::MemberMetadata,
         ));
+    }
+    // Preserve the accepted durable representation: publication deliberately uses
+    // strict registry equality and must not rewrite equivalent mapping syntax.
+    if let Some(existing) = runtime.profiles.get(&result.profile) {
+        metadata.map.clone_from(&existing.map);
     }
     let original = prepared.resolved.clone();
     Ok(EnrollmentPlan {
@@ -425,7 +430,11 @@ impl PoolPlanner<'_> {
                     .iter()
                     .find(|member| member.auth_profile == primary.profile_name)
                 {
-                    if existing != &primary_metadata {
+                    if !super::effective_mapping::members_match(
+                        existing,
+                        &primary_metadata,
+                        provider,
+                    ) {
                         return Err(conflict(
                             None,
                             Some(&primary.profile_name),
@@ -482,7 +491,7 @@ impl PoolPlanner<'_> {
             .iter()
             .find(|existing| existing.auth_profile == result.profile)
         {
-            if existing != &member {
+            if !super::effective_mapping::members_match(existing, &member, self.provider) {
                 return Err(conflict(
                     Some(name),
                     Some(&result.profile),

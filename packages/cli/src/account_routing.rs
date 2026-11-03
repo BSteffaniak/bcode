@@ -1,10 +1,9 @@
 //! Account-first CLI adapters for the shared application routing operations.
 
+mod guided;
+
 use bcode_client::BcodeClient;
-use bcode_provider_auth_models::{
-    AccountId, AccountPause, AccountRoute, AccountRoutingScope, RenameAccountRequest,
-    SetAccountPauseRequest, SetAccountRoutingRequest,
-};
+use bcode_provider_auth_models::{AccountId, AccountRoute, AccountRoutingScope};
 use bcode_session_models::SessionId;
 use clap::{Subcommand, ValueEnum};
 
@@ -36,58 +35,74 @@ pub enum PauseDuration {
 
 #[derive(Debug, Subcommand)]
 pub enum AccountCommand {
+    /// Open the guided account-routing menu.
+    Manage,
+    /// Remove a saved account through the reviewed account lifecycle flow.
+    Remove {
+        #[arg(long)]
+        provider: Option<String>,
+        profile: Option<String>,
+        #[arg(long, conflicts_with = "profile")]
+        all: bool,
+        #[arg(long)]
+        yes: bool,
+        #[arg(long)]
+        revoke: bool,
+    },
     /// Inspect accounts and this session's next-turn and new-session routing as JSON.
     Status {
         #[arg(long)]
-        session: SessionId,
+        session: Option<SessionId>,
     },
-    /// Select an account without changing the model. Only this account is used unless fallback is explicit.
+    /// Select an account without changing the model. Fallback is always explicit.
     Use {
-        profile: String,
+        profile: Option<String>,
         #[arg(long)]
-        session: SessionId,
+        session: Option<SessionId>,
         /// Owning provider plugin ID, not a pool name.
         #[arg(long)]
-        provider: String,
-        #[arg(long, value_enum, default_value = "session")]
-        scope: Scope,
-        /// Explicit fallback profiles in attempt order. Omit for account-only routing.
+        provider: Option<String>,
+        /// Defaults to session for fully specified commands.
+        #[arg(long, value_enum)]
+        scope: Option<Scope>,
         #[arg(long, value_delimiter = ',')]
         fallback: Vec<String>,
     },
     /// Clear the override and follow configuration again.
     FollowConfiguration {
         #[arg(long)]
-        session: SessionId,
-        #[arg(long, value_enum, default_value = "session")]
-        scope: Scope,
+        session: Option<SessionId>,
+        /// Defaults to session for fully specified commands.
+        #[arg(long, value_enum)]
+        scope: Option<Scope>,
     },
     /// Exclude this account across pools and account-only routing in this configuration.
     Pause {
-        profile: String,
+        profile: Option<String>,
         #[arg(long)]
-        session: SessionId,
+        session: Option<SessionId>,
         #[arg(long)]
-        provider: String,
-        #[arg(long, value_enum, default_value = "manual")]
-        duration: PauseDuration,
+        provider: Option<String>,
+        /// Defaults to manual for fully specified commands.
+        #[arg(long, value_enum)]
+        duration: Option<PauseDuration>,
     },
     /// Resume a paused account; does not change routing or select it.
     Resume {
-        profile: String,
+        profile: Option<String>,
         #[arg(long)]
-        session: SessionId,
+        session: Option<SessionId>,
         #[arg(long)]
-        provider: String,
+        provider: Option<String>,
     },
-    /// Change a friendly label only. Omit the label to restore the profile name.
+    /// Change a friendly label only. Omit the label in an explicit command to restore the profile name.
     Rename {
-        profile: String,
+        profile: Option<String>,
         label: Option<String>,
         #[arg(long)]
-        session: SessionId,
+        session: Option<SessionId>,
         #[arg(long)]
-        provider: String,
+        provider: Option<String>,
     },
 }
 
@@ -113,90 +128,50 @@ fn route(provider: &str, profile: String, fallback: Vec<String>) -> AccountRoute
     }
 }
 
+/// Open the guided account-routing menu.
+///
+/// # Errors
+/// Returns application, terminal, or missing-interactive-input errors.
+pub async fn manage() -> Result<(), CliError> {
+    handle(AccountCommand::Manage).await
+}
+
 pub async fn handle(command: AccountCommand) -> Result<(), CliError> {
+    if let AccountCommand::Remove {
+        provider,
+        profile,
+        all,
+        yes,
+        revoke,
+    } = command
+    {
+        return super::auth_management::lifecycle(super::auth_management::LifecycleOptions {
+            provider,
+            profile,
+            all,
+            yes,
+            revoke,
+            action: bcode_provider_auth_models::account_lifecycle::AccountLifecycleAction::Remove,
+        })
+        .await;
+    }
     let client = BcodeClient::default_endpoint();
-    match command {
-        AccountCommand::Status { session } => {
+    let Some(prepared) = guided::complete(&client, command).await? else {
+        return Ok(());
+    };
+    match prepared {
+        guided::Prepared::Status(session) => {
             crate::print_json(&client.account_routing(session).await?)
         }
-        AccountCommand::Use {
-            profile,
-            session,
-            provider,
-            scope,
-            fallback,
-        } => {
-            let request = SetAccountRoutingRequest {
-                scope: scope.into(),
-                route: route(&provider, profile, fallback),
-            };
+        guided::Prepared::Routing(session, request) => {
             crate::print_json(&client.set_account_routing(session, request).await?)
         }
-        AccountCommand::FollowConfiguration { session, scope } => crate::print_json(
-            &client
-                .set_account_routing(
-                    session,
-                    SetAccountRoutingRequest {
-                        scope: scope.into(),
-                        route: AccountRoute::FollowConfiguration,
-                    },
-                )
-                .await?,
-        ),
-        AccountCommand::Pause {
-            profile,
-            session,
-            provider,
-            duration,
-        } => {
-            let pause = match duration {
-                PauseDuration::Manual => AccountPause::Manual,
-                PauseDuration::OneHour => AccountPause::OneHour,
-                PauseDuration::FourHours => AccountPause::FourHours,
-            };
-            crate::print_json(
-                &client
-                    .set_account_pause(
-                        session,
-                        SetAccountPauseRequest {
-                            account: account(provider, profile),
-                            pause,
-                        },
-                    )
-                    .await?,
-            )
+        guided::Prepared::Pause(session, request) => {
+            crate::print_json(&client.set_account_pause(session, request).await?)
         }
-        AccountCommand::Resume {
-            profile,
-            session,
-            provider,
-        } => crate::print_json(
-            &client
-                .set_account_pause(
-                    session,
-                    SetAccountPauseRequest {
-                        account: account(provider, profile),
-                        pause: AccountPause::Resume,
-                    },
-                )
-                .await?,
-        ),
-        AccountCommand::Rename {
-            profile,
-            label,
-            session,
-            provider,
-        } => crate::print_json(
-            &client
-                .rename_account(
-                    session,
-                    RenameAccountRequest {
-                        account: account(provider, profile),
-                        label,
-                    },
-                )
-                .await?,
-        ),
+        guided::Prepared::Rename(session, request) => {
+            crate::print_json(&client.rename_account(session, request).await?)
+        }
     }
 }
 

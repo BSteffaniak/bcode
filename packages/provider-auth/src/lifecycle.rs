@@ -1004,11 +1004,17 @@ impl<'a> AuthVaultLifecycle<'a> {
     /// Returns an error when the vault/profile cannot be read or the resulting profile cannot be
     /// written.
     pub fn delete(&self) -> Result<(), AuthVaultLifecycleError> {
-        let _guard = crate::operations::refresh::native::read_guard(&self.vault_path())?;
         let vault = self.vault_path();
-        if !vault.exists() {
+        if !vault.try_exists().map_err(|_| {
+            AuthVaultLifecycleError::ProfileUnavailable("credential storage unavailable".into())
+        })? {
+            // A missing vault does not authorize bypassing an existing ambiguous refresh fence.
+            let _guard = crate::operations::refresh::native::read_guard(&vault)?;
             return Ok(());
         }
+        // Unlike read_guard, establish coordination even for a vault that has never refreshed.
+        // Hold it through publication so a concurrent begin/commit cannot restore deleted tokens.
+        let _guard = crate::operations::refresh::native::guard(&vault)?;
         let store = auth_store(&vault);
         let Some(mut values) = store
             .get_profile(self.storage_profile())
@@ -1017,7 +1023,9 @@ impl<'a> AuthVaultLifecycle<'a> {
             return Ok(());
         };
         for key in self.credential_storage_keys()?.into_values() {
-            values.remove(&key);
+            if let Some(mut value) = values.remove(&key) {
+                value.zeroize();
+            }
         }
         store
             .replace_profile(self.storage_profile(), values)
@@ -1743,7 +1751,10 @@ mod tests {
             *sshenv_vault::device::retrieve_operation_factor(&slot).unwrap(),
             *factor_key
         );
-        assert!(retained.persist(&profile, changes).unwrap().is_empty());
+        assert_eq!(
+            retained.persist(&profile, changes).unwrap(),
+            Vec::<crate::security::AuthSecurityDiagnostic>::new()
+        );
         drop(retained);
         let retained =
             open(crate::custody_storage::CredentialCustodyStorage::open(&directory).unwrap());
@@ -1843,6 +1854,34 @@ mod tests {
             supports_verification: false,
             supports_revocation: false,
         }
+    }
+
+    #[test]
+    #[cfg(not(feature = "custody-simulation"))]
+    fn deletion_establishes_refresh_coordination_and_preserves_unrelated_credentials() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("vault");
+        let profile = resolved(&path);
+        let registration = method();
+        let lifecycle =
+            AuthVaultLifecycle::new(&profile, "exa", "bcode.web-search", &registration).unwrap();
+        lifecycle
+            .upsert(BTreeMap::from([("api_key".into(), "owned".into())]))
+            .unwrap();
+        let store = auth_store(&path);
+        let mut values = store.get_profile("exa").unwrap().unwrap();
+        values.insert("UNRELATED".into(), "preserved".to_owned().into());
+        store.replace_profile("exa", values).unwrap();
+        lifecycle.delete().unwrap();
+        let values = auth_store(&path).get_profile("exa").unwrap().unwrap();
+        assert!(!values.contains_key("TEST_PROVIDER_API_KEY"));
+        assert_eq!(values["UNRELATED"].as_str(), "preserved");
+        assert!(root.path().join("vault.refresh").is_dir());
+        lifecycle.delete().unwrap();
+        assert_eq!(
+            auth_store(&path).get_profile("exa").unwrap().unwrap(),
+            values
+        );
     }
 
     #[test]

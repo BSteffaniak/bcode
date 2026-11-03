@@ -21,6 +21,16 @@ pub struct State {
     active: bool,
 }
 
+/// Discard retained credential material for one lifecycle-invalidated account.
+/// Keep the minted receipt and active state: invalidation is not permission to mint a new route.
+pub async fn invalidate_account(state: &ServerState, profile: &str) {
+    let mut cache = state.managed_default_routing.lock().await;
+    cache.candidates.remove(profile);
+    cache.live.remove(profile);
+    // Do not seed missing material from the daemon's pre-lifecycle startup context.
+    cache.active = true;
+}
+
 const fn unavailable() -> ModelRequestTargetError {
     ModelRequestTargetError::ManagedAuthentication
 }

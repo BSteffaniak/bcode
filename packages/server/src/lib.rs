@@ -9,6 +9,7 @@
 //! Every provider usage or managed-compaction event must be applied to the exact request boundary
 //! captured before that request was sent rather than inferred from later session history.
 
+mod account_lifecycle;
 pub(crate) mod account_routing;
 pub(crate) mod artifact_operations;
 mod auxiliary_generation;
@@ -475,6 +476,8 @@ pub struct ServerState {
     selected_model_id: Option<String>,
     selected_provider_context: bcode_model::ProviderRequestContext,
     managed_default_routing: Mutex<managed_default_routing::State>,
+    account_lifecycle_invalidations: Mutex<BTreeMap<bcode_provider_auth_models::AccountId, String>>,
+    account_lifecycle_plans: Mutex<BTreeMap<String, account_lifecycle::RetainedPlan>>,
     startup_config: bcode_config::BcodeConfig,
     history_auth_gate: Arc<tokio::sync::Semaphore>,
     session_configs: Mutex<BTreeMap<SessionId, bcode_config::BcodeConfig>>,
@@ -2630,6 +2633,8 @@ impl ServerState {
             selected_model_id: init.selected_model_id,
             selected_provider_context: init.selected_provider_context,
             managed_default_routing: Mutex::new(managed_default_routing::State::default()),
+            account_lifecycle_invalidations: Mutex::default(),
+            account_lifecycle_plans: Mutex::default(),
             startup_config: init.startup_config,
             history_auth_gate: Arc::new(tokio::sync::Semaphore::new(2)),
             contextual_plugin_invocations: StdMutex::default(),
@@ -2796,6 +2801,10 @@ impl ServerState {
         {
             check.cancellation.cancel();
         }
+        self.account_lifecycle_plans
+            .lock()
+            .await
+            .retain(|_, plan| plan.client_id != client_id);
         self.client_runtime_contexts.lock().await.remove(&client_id);
         interaction_operations::resolve_exchanges_without_consumers(self).await;
         self.client_session_namespaces
@@ -7070,6 +7079,9 @@ const fn request_kind(request: &Request) -> &'static str {
         Request::SetAccountRouting { .. } => "set_account_routing",
         Request::SetAccountPause { .. } => "set_account_pause",
         Request::RenameAccount { .. } => "rename_account",
+        Request::AccountLifecycleCatalog => "account_lifecycle_catalog",
+        Request::PreviewAccountLifecycle { .. } => "preview_account_lifecycle",
+        Request::ExecuteAccountLifecycle { .. } => "execute_account_lifecycle",
         Request::AuthPoolList => "auth_pool_list",
         Request::SetAuthPoolPreference { .. } => "set_auth_pool_preference",
         Request::AppendPresentationNote { .. } => "append_presentation_note",
@@ -11049,6 +11061,30 @@ async fn handle_core_runtime_request(
                 Ok(routing) => Response::Ok(ResponsePayload::AccountRouting { routing }),
                 Err(error) => Response::Err(ErrorResponse::new(error.code, error.message)),
             };
+            send_response(writer, request_id, response).await
+        }
+        CoreRuntimeRequest::AccountLifecycleCatalog => {
+            let result = bcode_provider_auth_models::application::AccountLifecycleApplication::account_lifecycle_catalog(&ServicesApplicationHandle::new(state, client_id)).await;
+            let response = result.map_or_else(
+                |error| Response::Err(ErrorResponse::new(error.code, error.message)),
+                |catalog| Response::Ok(ResponsePayload::AccountLifecycleCatalog { catalog }),
+            );
+            send_response(writer, request_id, response).await
+        }
+        CoreRuntimeRequest::PreviewAccountLifecycle { request, revoke } => {
+            let result = bcode_provider_auth_models::application::AccountLifecycleApplication::preview_account_lifecycle(&ServicesApplicationHandle::new(state, client_id), request, revoke).await;
+            let response = result.map_or_else(
+                |error| Response::Err(ErrorResponse::new(error.code, error.message)),
+                |plan| Response::Ok(ResponsePayload::AccountLifecyclePreview { plan }),
+            );
+            send_response(writer, request_id, response).await
+        }
+        CoreRuntimeRequest::ExecuteAccountLifecycle { plan_id } => {
+            let result = Box::pin(bcode_provider_auth_models::application::AccountLifecycleApplication::execute_account_lifecycle(&ServicesApplicationHandle::new(state, client_id), plan_id)).await;
+            let response = result.map_or_else(
+                |error| Response::Err(ErrorResponse::new(error.code, error.message)),
+                |result| Response::Ok(ResponsePayload::AccountLifecycleExecuted { result }),
+            );
             send_response(writer, request_id, response).await
         }
         CoreRuntimeRequest::AuthPoolList => {

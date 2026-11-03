@@ -273,6 +273,8 @@ pub async fn freeze(
     selection: &mut SessionModelSelection,
 ) -> Result<(), String> {
     let context = context(state, session).await?;
+    crate::account_lifecycle::refresh_invalidated_context(state, &context.config, selection)
+        .await?;
     if selection.provider_context.account_routing_frozen {
         return Ok(());
     }

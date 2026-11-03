@@ -1,6 +1,8 @@
 //! Host-owned provider-auth application operations.
 
 use crate::{AuthProfileResolutionError, ResolvedAuthProfile, lifecycle::AuthVaultLifecycle};
+/// Shared typed local logout and account-removal operations.
+pub mod account_lifecycle;
 mod enrollment;
 pub use enrollment::{
     CustodyEnrollment, CustodyEnrollmentMode, CustodyEnrollmentReadiness, read_custody_identity,

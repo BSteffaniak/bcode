@@ -18,7 +18,9 @@ use bmux_tui_components::{
         SelectableListComponent, SelectableListItem, SelectableListState, SelectableListStyles,
     },
 };
+mod many;
 mod status;
+pub use many::{AuthMultiChoiceOutcome, choose_many};
 pub use status::AuthStatus;
 
 use std::{
@@ -54,6 +56,28 @@ pub fn choose(
     labels: &[String],
     config: &bcode_config::TuiConfig,
 ) -> io::Result<AuthChoiceOutcome> {
+    let outcome = run(
+        title,
+        labels,
+        config,
+        Choice::new(labels),
+        Choice::update,
+        AuthChoiceOutcome::Cancelled,
+    )?;
+    if let AuthChoiceOutcome::Selected(index) = outcome {
+        writeln!(io::stderr(), "{title}: {}", labels[index])?;
+    }
+    Ok(outcome)
+}
+
+fn run<T>(
+    title: &str,
+    labels: &[String],
+    config: &bcode_config::TuiConfig,
+    mut choice: Choice,
+    mut update: impl FnMut(&mut Choice, &Event, &[String]) -> Option<T>,
+    cancelled: T,
+) -> io::Result<T> {
     if labels.is_empty() {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
@@ -72,7 +96,6 @@ pub fn choose(
         theme.accent = bmux_tui::style::Color::Default;
     }
     let mut terminal = InlineTerminal::enter(io::stderr())?;
-    let mut choice = Choice::new(labels);
     let mut previous_size = None;
     loop {
         let size = bmux_tui::crossterm::terminal_size()?;
@@ -90,13 +113,11 @@ pub fn choose(
             ))?;
         }
         let Some(event) = bmux_tui::crossterm::read_event()? else {
-            return Ok(AuthChoiceOutcome::Cancelled);
-        };
-        if let Some(outcome) = choice.update(&event, labels) {
             terminal.finish()?;
-            if let AuthChoiceOutcome::Selected(index) = outcome {
-                writeln!(io::stderr(), "{title}: {}", labels[index])?;
-            }
+            return Ok(cancelled);
+        };
+        if let Some(outcome) = update(&mut choice, &event, labels) {
+            terminal.finish()?;
             return Ok(outcome);
         }
     }
@@ -106,6 +127,7 @@ struct Choice {
     filter: String,
     indices: Vec<usize>,
     selected: usize,
+    checked: Option<std::collections::BTreeSet<usize>>,
 }
 impl Choice {
     fn new(labels: &[String]) -> Self {
@@ -113,6 +135,7 @@ impl Choice {
             filter: String::new(),
             indices: (0..labels.len()).collect(),
             selected: 0,
+            checked: None,
         }
     }
     fn update(&mut self, event: &Event, labels: &[String]) -> Option<AuthChoiceOutcome> {
@@ -161,6 +184,10 @@ impl Choice {
         None
     }
     fn refilter(&mut self, labels: &[String]) {
+        let focused = self
+            .checked
+            .as_ref()
+            .and_then(|_| self.indices.get(self.selected).copied());
         let query = self.filter.to_lowercase();
         self.indices = labels
             .iter()
@@ -168,7 +195,13 @@ impl Choice {
             .filter(|(_, label)| label.to_lowercase().contains(&query))
             .map(|(index, _)| index)
             .collect();
-        self.selected = 0;
+        self.selected = focused
+            .and_then(|index| {
+                self.indices
+                    .iter()
+                    .position(|&candidate| candidate == index)
+            })
+            .unwrap_or(0);
     }
 }
 
@@ -193,7 +226,16 @@ fn render(
     let rows = choice
         .indices
         .iter()
-        .map(|&index| SelectableListItem::new(index.to_string(), labels[index].clone()))
+        .map(|&index| {
+            let label = choice.checked.as_ref().map_or_else(
+                || labels[index].clone(),
+                |checked| {
+                    let marker = if checked.contains(&index) { "x" } else { " " };
+                    format!("[{marker}] {}", labels[index])
+                },
+            );
+            SelectableListItem::new(index.to_string(), label)
+        })
         .collect::<Vec<_>>();
     let state = SelectableListState::new((!rows.is_empty()).then_some(choice.selected));
     // BMUX owns scroll/reveal mechanics and all cell measurement.
@@ -208,12 +250,31 @@ fn render(
         ..Default::default()
     };
     let state = Cell::new(state);
-    let hints = [
+    let mut hints = vec![
         KeyHint::new("↑↓", "Move"),
         KeyHint::new("Enter", "Continue"),
         KeyHint::new("Esc", "Back"),
         KeyHint::new("Ctrl-C", "Cancel"),
     ];
+    if choice.checked.is_some() {
+        hints.insert(1, KeyHint::new("Space", "Toggle"));
+        hints.insert(2, KeyHint::new("Ctrl-A", "Select all choices"));
+    }
+    let filter = choice.checked.as_ref().map_or_else(
+        || format!("Filter: {}", choice.filter),
+        |checked| {
+            let guidance = if checked.is_empty() {
+                " — select at least one to continue"
+            } else {
+                ""
+            };
+            format!(
+                "Filter: {} | {} selected{guidance}",
+                choice.filter,
+                checked.len()
+            )
+        },
+    );
     let list = SelectableListComponent::new("auth.choices", &rows, &state).styles(styles);
     let root = Column::new()
         .child(TextBlock::new(Text::from_lines(vec![Line::from_spans(
@@ -222,7 +283,7 @@ fn render(
                 bmux_tui::style::Style::new().fg(theme.accent),
             )],
         )])))
-        .child(TextBlock::new(format!("Filter: {}", choice.filter)))
+        .child(TextBlock::new(filter))
         .flex(Flex::new(1, RevealedList(list)))
         .child(KeyHintBarComponent::new("auth.keys", &hints));
     let layout = root.layout(Constraints::tight(size), &mut LayoutCx::new());

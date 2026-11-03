@@ -1,4 +1,5 @@
 use super::*;
+use crate::read_auth_input_line;
 use std::io::Cursor;
 
 fn prompter(input: &str, interactive: bool) -> Prompter<Cursor<Vec<u8>>, Vec<u8>> {

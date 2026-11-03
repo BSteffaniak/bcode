@@ -169,6 +169,37 @@ Missing plugins/providers, duplicate registrations, ownership mismatches, damage
 
 Bundled API-key integrations declare their conventional environment names in provider-owned auth registrations. The generic ordered lookup helper accepts a scoped reader, so chat invocation can honor client-supplied transient environment values before process environment, while web-search invocation retains daemon-process and explicit-reference precedence. Jev's explicit empty-profile path additionally requires matching keys to agree; that stricter policy is not retroactively applied to chat or web-search, where first-populated-key behavior is part of existing UX. OpenAI/OpenRouter/xAI declare their API-key methods; the OpenAI-compatible plugin uses the ordered declaration for its OpenAI and xAI conventional key fallbacks while continuing to resolve OAuth, saved credentials, configured custom environment names, and xAI-vs-OpenAI precedence itself. Web search registers Brave, Tavily, Exa, Perplexity, Gemini, Serper, and SerpAPI API-key methods and uses their declared ordered names for conventional fallback; configured secret references and host-owned, provider-scoped credentials retain precedence, and stored credentials participate in search/fetch auto selection and status. Existing non-Exa status metadata stays unchanged for explicit references or ambient-only credentials; integrated profiles report an `integrated_auth` source and plugin owner. Bedrock continues to use the AWS SDK credential chain rather than a generic API-key declaration. Provider registration does not change chat model identity or tool availability; newly enrolled web-search keys make their provider eligible for existing auto-selection. Neither model-native search nor no-key DuckDuckGo requires an API-key method.
 
+## Guided account management
+
+On an interactive terminal, `bcode auth` opens the account-management menu. Direct
+`auth login`, `auth logout`, and `auth account remove` commands guide missing
+provider/account selections using the same inline terminal choices. Explicit
+arguments skip selection steps; destructive operations still present a review.
+Back revisits earlier choices and Cancel before execution makes no changes.
+Simple terminals use numbered prompts; noninteractive commands never prompt.
+
+* **Sign out** deletes only the selected method's owned local credentials. Profile
+  declarations, runtime enrollment, and pool membership remain for reauthentication.
+* **Remove account** additionally forgets owned runtime enrollment and account state.
+  Declarative profiles remain visible as configuration-defined slots: generated/Nix
+  configuration is never rewritten. Remove declarations in their source configuration
+  if those slots are no longer wanted.
+* **Remote revocation** is an optional provider capability, not a synonym for local
+  deletion. The review warns that remote effects can extend to other computers.
+  Remote and local results are reported separately.
+
+Account removal supports explicit multi-account selection. No account is selected
+by default, including when only one exists. For noninteractive logout/removal,
+select a provider and `--profile <name>` or `--all`, and pass `--yes` explicitly.
+Each account's effects are reported independently; partial or uncertain outcomes
+must be inspected rather than blindly replayed. Damaged credential stores are
+never reset to make removal appear successful.
+
+The account menu also exposes session-bound routing, labels, pauses and pool
+preferences. Account-only routing never silently changes to another account after
+sign-out/removal. Credential presence, remote authentication validity and routing
+cooldown are separate facts; absence of cooldown is not proof of usable credentials.
+
 ## Compatibility
 
 Legacy environment-backed profiles and conventional provider environment variables remain supported where the owning integration documents them. Deprecated top-level provider login commands may translate arguments into canonical registered methods during migration, but they are not extension points and must not retain independent credential/OAuth implementations.

@@ -970,6 +970,14 @@ pub enum CoreRuntimeRequest {
     CancelApplicationCommand {
         invocation_id: String,
     },
+    AccountLifecycleCatalog,
+    PreviewAccountLifecycle {
+        request: bcode_provider_auth_models::account_lifecycle::AccountLifecycleRequest,
+        revoke: bool,
+    },
+    ExecuteAccountLifecycle {
+        plan_id: String,
+    },
     AuthPoolList,
     /// Read account-first next-turn routing in the session configuration.
     AccountRouting {
@@ -2528,6 +2536,20 @@ impl RoutedRequest {
                 session_id,
                 request,
             })),
+            Request::AccountLifecycleCatalog => {
+                Self::CoreRuntime(Box::new(CoreRuntimeRequest::AccountLifecycleCatalog))
+            }
+            Request::PreviewAccountLifecycle { request, revoke } => {
+                Self::CoreRuntime(Box::new(CoreRuntimeRequest::PreviewAccountLifecycle {
+                    request,
+                    revoke,
+                }))
+            }
+            Request::ExecuteAccountLifecycle { plan_id } => {
+                Self::CoreRuntime(Box::new(CoreRuntimeRequest::ExecuteAccountLifecycle {
+                    plan_id,
+                }))
+            }
             Request::AuthPoolList => Self::CoreRuntime(Box::new(CoreRuntimeRequest::AuthPoolList)),
             Request::SetAuthPoolPreference { pool, profile } => {
                 Self::CoreRuntime(Box::new(CoreRuntimeRequest::SetAuthPoolPreference {

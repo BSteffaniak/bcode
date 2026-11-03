@@ -1,16 +1,12 @@
 //! Terminal-only presentation of provider-registered login choices.
 
-use super::{CliError, read_auth_input_line, selected_auth_method};
+use super::{CliError, selected_auth_method};
 use bcode_config::{BcodeConfig, RuntimeAuthSubscriptions};
 use bcode_plugin::RegisteredAuthProvider;
 use bcode_provider_auth::enrollment::{EnrollmentDestination, EnrollmentPlan, PoolEnrollment};
 use bcode_provider_auth_models::{AuthMethodContribution, AuthPoolCompatibility};
 use std::collections::BTreeSet;
-use std::io::{IsTerminal as _, Write};
-
-fn interactive() -> bool {
-    std::io::stdin().is_terminal() && std::io::stderr().is_terminal()
-}
+use std::io::Write;
 
 pub fn resolve_provider(explicit_profile: Option<&str>) -> Result<Option<String>, CliError> {
     let config = bcode_config::load_config()?;
@@ -35,80 +31,9 @@ pub fn resolve_provider(explicit_profile: Option<&str>) -> Result<Option<String>
     result.and_then(|provider| cleanup.map(|()| Some(provider)))
 }
 
-pub struct Prompter<R, W> {
-    pub reader: R,
-    pub writer: W,
-    pub interactive: bool,
-    pub rich: bool,
-    pub back_requested: bool,
-}
-
-pub fn terminal() -> Prompter<std::io::Stdin, std::io::Stderr> {
-    Prompter {
-        reader: std::io::stdin(),
-        writer: std::io::stderr(),
-        interactive: interactive(),
-        rich: bcode_tui::auth_inline::supported(),
-        back_requested: false,
-    }
-}
+pub use super::auth_prompts::{Prompter, terminal};
 
 impl<R: std::io::Read, W: Write> Prompter<R, W> {
-    pub fn choose(
-        &mut self,
-        title: &str,
-        labels: &[String],
-        hint: &str,
-    ) -> Result<usize, CliError> {
-        if !self.interactive {
-            return Err(CliError::LoginProfile(format!("{title}. {hint}")));
-        }
-        if labels.is_empty() {
-            return Err(CliError::LoginProfile(format!(
-                "{title}: no available choices. {hint}"
-            )));
-        }
-        if self.rich {
-            let config = bcode_config::load_config()?;
-            return match bcode_tui::auth_inline::choose(title, labels, &config.tui)? {
-                bcode_tui::auth_inline::AuthChoiceOutcome::Selected(index) => Ok(index),
-                bcode_tui::auth_inline::AuthChoiceOutcome::Back => {
-                    self.back_requested = true;
-                    Err(CliError::LoginProfile(
-                        "Return to previous authentication step.".to_owned(),
-                    ))
-                }
-                bcode_tui::auth_inline::AuthChoiceOutcome::Cancelled => {
-                    Err(CliError::LoginProfile(
-                        "Authentication cancelled before provider side effects.".to_owned(),
-                    ))
-                }
-            };
-        }
-        writeln!(self.writer, "{title}")?;
-        for (index, label) in labels.iter().enumerate() {
-            writeln!(self.writer, "  {}) {label}", index + 1)?;
-        }
-        loop {
-            write!(self.writer, "Select 1-{} (q to cancel): ", labels.len())?;
-            self.writer.flush()?;
-            // Avoid reading ahead into a subsequent password or provider-owned prompt.
-            let answer =
-                read_auth_input_line(std::io::BufReader::with_capacity(1, &mut self.reader))?;
-            if answer.trim().eq_ignore_ascii_case("q") {
-                return Err(CliError::LoginProfile(
-                    "Authentication cancelled; credentials were not changed.".to_owned(),
-                ));
-            }
-            if let Ok(number) = answer.trim().parse::<usize>()
-                && let Some(index) = number.checked_sub(1).filter(|index| *index < labels.len())
-            {
-                return Ok(index);
-            }
-            writeln!(self.writer, "Enter a listed number, or q to cancel.")?;
-        }
-    }
-
     pub fn provider(&mut self, providers: &[&RegisteredAuthProvider]) -> Result<String, CliError> {
         let labels = providers
             .iter()

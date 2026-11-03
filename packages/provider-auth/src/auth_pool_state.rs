@@ -413,6 +413,152 @@ fn legacy_state_path() -> PathBuf {
         .join("openai-compatible-auth-pool-state.json")
 }
 
+/// Retained native observation ownership for local account lifecycle operations.
+///
+/// Acquire after runtime registry and account-settings transactions. Never calls the
+/// permissive `load_state` fallback: damaged or unsupported state fails closed.
+pub struct AuthPoolStateTransaction {
+    _ownership: ObservationOwnership,
+    path: PathBuf,
+    legacy: PathBuf,
+}
+
+impl AuthPoolStateTransaction {
+    /// Acquire the selected native observation store.
+    ///
+    /// # Errors
+    /// Fails if ownership or a trustworthy bounded snapshot is unavailable.
+    pub fn acquire() -> Result<Self, bcode_config::ConfigError> {
+        Self::acquire_at(state_path(), legacy_state_path())
+    }
+
+    /// Acquire explicit observation paths, sharing native writers' lock discipline.
+    ///
+    /// # Errors
+    /// Fails on lock contention, unsupported state or I/O errors.
+    pub fn acquire_at(path: PathBuf, legacy: PathBuf) -> Result<Self, bcode_config::ConfigError> {
+        let invalid = observation_error;
+        let guard = STATE_LOCK.try_lock().map_err(|_| invalid())?;
+        let parent = path.parent().ok_or_else(invalid)?;
+        fs::create_dir_all(parent).map_err(|_| invalid())?;
+        let file = fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(path.with_extension("lock"))
+            .map_err(|_| invalid())?;
+        file.try_lock().map_err(|_| invalid())?;
+        let transaction = Self {
+            _ownership: ObservationOwnership {
+                _guard: guard,
+                _file: file,
+            },
+            path,
+            legacy,
+        };
+        transaction.snapshot()?;
+        Ok(transaction)
+    }
+
+    /// Read bounded observations without repair or lossy deserialization.
+    ///
+    /// # Errors
+    /// Fails on corrupt, oversized, unreadable or unsupported observations.
+    pub fn snapshot(&self) -> Result<AuthPoolState, bcode_config::ConfigError> {
+        use std::io::Read as _;
+        let invalid = observation_error;
+        let file = match fs::File::open(&self.path) {
+            Ok(file) => file,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                match fs::File::open(&self.legacy) {
+                    Ok(file) => file,
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                        return Ok(AuthPoolState::default());
+                    }
+                    Err(_) => return Err(invalid()),
+                }
+            }
+            Err(_) => return Err(invalid()),
+        };
+        let mut bytes = Vec::new();
+        file.take(8 * 1024 * 1024 + 1)
+            .read_to_end(&mut bytes)
+            .map_err(|_| invalid())?;
+        if bytes.len() > 8 * 1024 * 1024 {
+            return Err(invalid());
+        }
+        let original: serde_json::Value = serde_json::from_slice(&bytes).map_err(|_| invalid())?;
+        let state: AuthPoolState =
+            serde_json::from_value(original.clone()).map_err(|_| invalid())?;
+        let supported = serde_json::to_value(&state).map_err(|_| invalid())?;
+        if !observation_fields_preserved(&original, &supported) {
+            return Err(invalid());
+        }
+        Ok(state)
+    }
+
+    /// Compare and publish observations atomically while retaining ownership.
+    ///
+    /// # Errors
+    /// Rejects changed state; publication I/O errors may have an uncertain durable outcome.
+    pub fn commit(
+        &mut self,
+        expected: &AuthPoolState,
+        replacement: &AuthPoolState,
+    ) -> Result<(), bcode_config::ConfigError> {
+        use std::io::Write as _;
+        let invalid = observation_error;
+        if self.snapshot()? != *expected {
+            return Err(invalid());
+        }
+        if expected == replacement {
+            return Ok(());
+        }
+        let bytes = serde_json::to_vec_pretty(replacement).map_err(|_| invalid())?;
+        if bytes.len() > 8 * 1024 * 1024 {
+            return Err(invalid());
+        }
+        let parent = self.path.parent().ok_or_else(invalid)?;
+        let mut temporary = tempfile::NamedTempFile::new_in(parent).map_err(|_| invalid())?;
+        temporary.write_all(&bytes).map_err(|_| invalid())?;
+        temporary.as_file().sync_all().map_err(|_| invalid())?;
+        bcode_confined_fs::persist(temporary, &self.path).map_err(|_| invalid())?;
+        bcode_confined_fs::sync_directory_path(parent).map_err(|_| invalid())?;
+        Ok(())
+    }
+}
+
+fn observation_error() -> bcode_config::ConfigError {
+    bcode_config::ConfigError::Composition {
+        message: "auth observations unavailable or unsupported; explicit maintenance required"
+            .into(),
+    }
+}
+
+fn observation_fields_preserved(
+    original: &serde_json::Value,
+    supported: &serde_json::Value,
+) -> bool {
+    match (original, supported) {
+        (serde_json::Value::Object(original), serde_json::Value::Object(supported)) => {
+            original.iter().all(|(key, value)| {
+                supported
+                    .get(key)
+                    .is_some_and(|next| observation_fields_preserved(value, next))
+            })
+        }
+        (serde_json::Value::Array(original), serde_json::Value::Array(supported)) => {
+            original.len() == supported.len()
+                && original
+                    .iter()
+                    .zip(supported)
+                    .all(|(value, next)| observation_fields_preserved(value, next))
+        }
+        _ => original == supported,
+    }
+}
+
 pub(crate) struct ObservationOwnership {
     _guard: std::sync::MutexGuard<'static, ()>,
     _file: fs::File,

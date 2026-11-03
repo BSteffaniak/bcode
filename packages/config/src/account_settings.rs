@@ -138,12 +138,17 @@ pub fn update<T>(
     key: &str,
     change: impl FnOnce(&mut AccountSettings) -> Result<T, super::ConfigError>,
 ) -> Result<T, super::ConfigError> {
-    use std::io::Write;
     let path = path(root, key)?;
     let _lock = super::lock_auth_subscriptions(&path)?;
     let mut state = read(&path)?;
     let result = change(&mut state)?;
-    let bytes = serde_json::to_vec(&state).map_err(|_| invalid())?;
+    write(&path, &state)?;
+    Ok(result)
+}
+
+fn write(path: &Path, state: &AccountSettings) -> Result<(), super::ConfigError> {
+    use std::io::Write as _;
+    let bytes = serde_json::to_vec(state).map_err(|_| invalid())?;
     if bytes.len() > 1_048_576 {
         return Err(invalid());
     }
@@ -151,14 +156,90 @@ pub fn update<T>(
     let mut temporary = tempfile::NamedTempFile::new_in(parent).map_err(|_| invalid())?;
     temporary.write_all(&bytes).map_err(|_| invalid())?;
     temporary.as_file().sync_all().map_err(|_| invalid())?;
-    bcode_confined_fs::persist(temporary, &path).map_err(|_| invalid())?;
+    bcode_confined_fs::persist(temporary, path).map_err(|_| invalid())?;
     bcode_confined_fs::sync_directory_path(parent).map_err(|_| invalid())?;
-    Ok(result)
+    Ok(())
+}
+
+/// Retained configuration-scoped settings ownership, shared with ordinary account writers.
+/// Acquire after runtime registry ownership and before routing observation ownership.
+pub struct AccountSettingsTransaction {
+    path: std::path::PathBuf,
+    _lock: std::fs::File,
+}
+
+impl AccountSettingsTransaction {
+    /// Acquire settings without repairing or replacing damaged state.
+    ///
+    /// # Errors
+    /// Fails for an invalid configuration key, unavailable lock or unreadable settings.
+    pub fn acquire(root: &Path, key: &str) -> Result<Self, super::ConfigError> {
+        let path = path(root, key)?;
+        let lock = super::lock_auth_subscriptions(&path)?;
+        let transaction = Self { path, _lock: lock };
+        transaction.snapshot()?;
+        Ok(transaction)
+    }
+
+    /// Read current settings under retained ownership.
+    ///
+    /// # Errors
+    /// Fails closed for unreadable or unsupported settings.
+    pub fn snapshot(&self) -> Result<AccountSettings, super::ConfigError> {
+        read(&self.path)
+    }
+
+    /// Compare and atomically publish settings, retaining the lock until dropped.
+    ///
+    /// # Errors
+    /// Rejects changed state; publication I/O errors may have an uncertain durable outcome.
+    pub fn commit(
+        &mut self,
+        expected: &AccountSettings,
+        replacement: &AccountSettings,
+    ) -> Result<(), super::ConfigError> {
+        if self.snapshot()? != *expected {
+            return Err(invalid());
+        }
+        if expected != replacement {
+            write(&self.path, replacement)?;
+        }
+        Ok(())
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn retained_transaction_excludes_writers_and_preserves_rejected_snapshot() {
+        let root = tempfile::tempdir().unwrap();
+        let key = "c".repeat(64);
+        {
+            let mut transaction = AccountSettingsTransaction::acquire(root.path(), &key).unwrap();
+            assert!(AccountSettingsTransaction::acquire(root.path(), &key).is_err());
+            let before = transaction.snapshot().unwrap();
+            let mut next = before.clone();
+            next.defaults.insert(
+                "preset".into(),
+                AccountRoute::Only {
+                    account: AccountId {
+                        provider_id: "test".into(),
+                        profile: "first".into(),
+                    },
+                },
+            );
+            transaction.commit(&before, &next).unwrap();
+            assert!(
+                transaction
+                    .commit(&before, &AccountSettings::default())
+                    .is_err()
+            );
+            assert_eq!(transaction.snapshot().unwrap(), next);
+        }
+        assert!(AccountSettingsTransaction::acquire(root.path(), &key).is_ok());
+    }
 
     #[test]
     fn identity_is_source_and_context_not_model_or_contents() {

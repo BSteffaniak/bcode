@@ -1537,6 +1537,18 @@ pub enum Request {
         batch: bcode_metrics::ClientMetricBatch,
     },
     /// List portable auth-pool status.
+    /// Registered providers and explicitly owned lifecycle accounts.
+    AccountLifecycleCatalog,
+    /// Review local effects before any mutation or optional remote revocation.
+    PreviewAccountLifecycle {
+        request: bcode_provider_auth_models::account_lifecycle::AccountLifecycleRequest,
+        #[serde(default)]
+        revoke: bool,
+    },
+    /// Execute one immutable caller-bound reviewed plan.
+    ExecuteAccountLifecycle {
+        plan_id: String,
+    },
     AuthPoolList,
     /// Persist or clear an interactive preferred auth-pool profile.
     /// Read account-first next-turn routing in the session configuration.
@@ -3056,6 +3068,18 @@ pub enum ResponsePayload {
     ClientMetricsIngested {
         /// Number of observations merged into the daemon registry.
         accepted: usize,
+    },
+    /// Registered providers and owned declared/runtime profiles.
+    AccountLifecycleCatalog {
+        catalog: bcode_provider_auth_models::application::AccountLifecycleCatalog,
+    },
+    /// Caller-bound immutable reviewed lifecycle plan.
+    AccountLifecyclePreview {
+        plan: bcode_provider_auth_models::application::AccountLifecyclePlan,
+    },
+    /// Independent local and remote effect evidence.
+    AccountLifecycleExecuted {
+        result: bcode_provider_auth_models::application::AccountLifecycleExecution,
     },
     /// Portable auth-pool status list.
     AuthPoolList {

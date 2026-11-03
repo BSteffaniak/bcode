@@ -890,11 +890,7 @@ async fn handle_cli(cli: Cli) -> Result<(), CliError> {
         Commands::Judgement { command } => Box::pin(handle_judgement_command(command)).await?,
         Commands::Model { command } => handle_model_command(command).await?,
         Commands::Auth { command } => {
-            if cli.no_credential_discovery && matches!(command, AuthCommand::Discover) {
-                println!("Automatic credential discovery is disabled.");
-            } else {
-                handle_auth_command(command).await?;
-            }
+            handle_auth_entry(command, cli.no_credential_discovery).await?;
         }
         Commands::Login { command } => handle_login_command(command).await?,
         Commands::Permission { command } => handle_permission_command(command).await?,
@@ -5128,7 +5124,7 @@ enum Commands {
     },
     Auth {
         #[command(subcommand)]
-        command: AuthCommand,
+        command: Option<AuthCommand>,
     },
     /// Deprecated compatibility login commands. Use `bcode auth login <provider>`.
     Login {
@@ -7514,10 +7510,24 @@ struct VerifyCacheArgs {
 
 #[derive(Debug, Subcommand)]
 enum AuthCommand {
+    /// Manage authentication accounts interactively.
+    Manage,
     /// Manage account selection, next-turn routing, saved defaults, labels, and pause state.
     Account {
         #[command(subcommand)]
-        command: account_routing::AccountCommand,
+        command: Option<account_routing::AccountCommand>,
+    },
+    /// Delete credentials and remove runtime enrollment without editing configuration.
+    Remove {
+        provider: Option<String>,
+        #[arg(long)]
+        profile: Option<String>,
+        #[arg(long, conflicts_with = "profile")]
+        all: bool,
+        #[arg(long)]
+        yes: bool,
+        #[arg(long)]
+        revoke: bool,
     },
     /// Initialize, reconnect, or inspect retained broker credential custody.
     BrokerSetup {
@@ -7627,9 +7637,15 @@ enum AuthCommand {
     },
     /// Delete locally stored credentials for one dynamically registered provider.
     Logout {
-        provider: String,
+        provider: Option<String>,
         #[arg(long)]
         profile: Option<String>,
+        /// Select all owned accounts for this provider explicitly.
+        #[arg(long, conflicts_with = "profile")]
+        all: bool,
+        /// Confirm the reviewed local operation without an interactive prompt.
+        #[arg(long)]
+        yes: bool,
         /// Explicitly ask a supporting provider to revoke credentials remotely first.
         #[arg(long)]
         revoke: bool,
@@ -7668,6 +7684,8 @@ enum AuthPoolCommand {
         #[arg(long)]
         apply: bool,
     },
+    /// Open guided pool preference management.
+    Manage,
     List,
     /// Read normalized, secret-free auth-pool status from the daemon as JSON.
     /// Unlike local list/status, this reports the running host's effective pools.
@@ -10429,12 +10447,60 @@ async fn handle_model_command(command: ModelCommand) -> Result<(), CliError> {
     Ok(())
 }
 
+async fn handle_auth_entry(
+    command: Option<AuthCommand>,
+    no_discovery: bool,
+) -> Result<(), CliError> {
+    if no_discovery && matches!(command, Some(AuthCommand::Discover)) {
+        println!("Automatic credential discovery is disabled.");
+        Ok(())
+    } else if let Some(command) = command {
+        handle_auth_command(command).await
+    } else {
+        auth_management::manage().await
+    }
+}
+
 async fn handle_auth_command(command: AuthCommand) -> Result<(), CliError> {
+    use bcode_provider_auth_models::account_lifecycle::AccountLifecycleAction;
+    let action = if matches!(&command, AuthCommand::Remove { .. }) {
+        AccountLifecycleAction::Remove
+    } else {
+        AccountLifecycleAction::Logout
+    };
     match command {
         AuthCommand::Discover | AuthCommand::Import { .. } => {
             credential_setup::handle_command(command)
         }
-        AuthCommand::Account { command } => account_routing::handle(command).await,
+        AuthCommand::Manage => auth_management::manage().await,
+        AuthCommand::Remove {
+            provider,
+            profile,
+            all,
+            yes,
+            revoke,
+        }
+        | AuthCommand::Logout {
+            provider,
+            profile,
+            all,
+            yes,
+            revoke,
+        } => {
+            auth_management::lifecycle(auth_management::LifecycleOptions {
+                provider,
+                profile,
+                all,
+                yes,
+                revoke,
+                action,
+            })
+            .await
+        }
+        AuthCommand::Account { command } => match command {
+            Some(command) => account_routing::handle(command).await,
+            None => account_routing::manage().await,
+        },
         AuthCommand::Providers => auth_providers(),
         AuthCommand::Status { provider, profile } => provider
             .map_or_else(auth_status, |provider| {
@@ -10445,6 +10511,12 @@ async fn handle_auth_command(command: AuthCommand) -> Result<(), CliError> {
             AuthProfileCommand::Show { profile } => auth_profile_show(&profile),
         },
         AuthCommand::Pool { command } => handle_auth_pool_command(command).await,
+        command => handle_auth_login_command(command).await,
+    }
+}
+
+async fn handle_auth_login_command(command: AuthCommand) -> Result<(), CliError> {
+    match command {
         AuthCommand::BrokerSetup {
             operation,
             provider,
@@ -10490,35 +10562,69 @@ async fn handle_auth_command(command: AuthCommand) -> Result<(), CliError> {
             method,
             verify,
         } => {
-            let provider = match provider {
-                Some(provider) => Some(provider),
-                None => auth_login::resolve_provider(profile.as_deref())?,
-            };
-            if let Some(provider) = provider {
-                auth_provider_login(
-                    &provider,
-                    AuthProviderLoginOptions {
-                        explicit_profile: profile.as_deref(),
-                        explicit_vault: vault,
-                        recipient_key: recipient_key.as_deref(),
-                        no_device_seal,
-                        pool: pool.as_deref(),
-                        standalone,
-                        requested_method: method.as_deref(),
-                        verify,
-                        prompting: AuthLoginPrompting::Interactive,
-                    },
-                )
-                .await
-            } else {
-                auth_login(profile, vault, recipient_key)
-            }
+            handle_auth_login_selection(AuthLoginSelection {
+                provider,
+                profile,
+                vault,
+                recipient_key,
+                no_device_seal,
+                pool,
+                standalone,
+                method,
+                verify,
+            })
+            .await
         }
-        AuthCommand::Logout {
-            provider,
-            profile,
-            revoke,
-        } => auth_provider_logout(&provider, profile.as_deref(), revoke).await,
+        command => credential_setup::handle_command(command),
+    }
+}
+
+struct AuthLoginSelection {
+    provider: Option<String>,
+    profile: Option<String>,
+    vault: Option<PathBuf>,
+    recipient_key: Option<String>,
+    no_device_seal: bool,
+    pool: Option<String>,
+    standalone: bool,
+    method: Option<String>,
+    verify: bool,
+}
+
+async fn handle_auth_login_selection(selection: AuthLoginSelection) -> Result<(), CliError> {
+    let AuthLoginSelection {
+        provider,
+        profile,
+        vault,
+        recipient_key,
+        no_device_seal,
+        pool,
+        standalone,
+        method,
+        verify,
+    } = selection;
+    let provider = match provider {
+        Some(provider) => Some(provider),
+        None => auth_login::resolve_provider(profile.as_deref())?,
+    };
+    if let Some(provider) = provider {
+        auth_provider_login(
+            &provider,
+            AuthProviderLoginOptions {
+                explicit_profile: profile.as_deref(),
+                explicit_vault: vault,
+                recipient_key: recipient_key.as_deref(),
+                no_device_seal,
+                pool: pool.as_deref(),
+                standalone,
+                requested_method: method.as_deref(),
+                verify,
+                prompting: AuthLoginPrompting::Interactive,
+            },
+        )
+        .await
+    } else {
+        auth_login(profile, vault, recipient_key)
     }
 }
 
@@ -10599,6 +10705,7 @@ async fn handle_auth_pool_command(command: AuthPoolCommand) -> Result<(), CliErr
             destination,
             apply,
         } => reconcile_auth_pool(&source, &destination, apply),
+        AuthPoolCommand::Manage => auth_management::pool_preferences().await,
         AuthPoolCommand::List => auth_pool_list(),
         AuthPoolCommand::DaemonStatus => {
             let pools = Box::pin(BcodeClient::default_endpoint().auth_pool_list()).await?;
@@ -12574,7 +12681,7 @@ fn print_auth_pool_profile_status(
         return;
     }
     println!(
-        "  {profile}: {source}, {config_status}, storage {storage}, vault {vault}, available, {last_success}, {priming}",
+        "  {profile}: {source}, {config_status}, storage {storage}, vault {vault}, no cooldown (credential status not checked), {last_success}, {priming}",
         storage = auth_pool_profile_storage(config, profile).unwrap_or_else(|| "-".to_string()),
         vault = auth_pool_profile_vault(config, profile).unwrap_or_else(|| "-".to_string()),
     );
@@ -12597,6 +12704,8 @@ fn auth_pool_profile_vault(config: &bcode_config::BcodeConfig, profile: &str) ->
 
 mod account_routing;
 mod auth_login;
+mod auth_management;
+mod auth_prompts;
 mod credential_setup;
 mod headless;
 mod startup;
@@ -12755,6 +12864,7 @@ fn lookup_registered_auth_profile_from(
     .map_err(|error| CliError::LoginProfile(error.to_string()))
 }
 
+#[cfg(test)]
 fn resolve_registered_auth_profile_from(
     config: &bcode_config::BcodeConfig,
     runtime: &bcode_config::RuntimeAuthSubscriptions,
@@ -12770,15 +12880,6 @@ fn resolve_registered_auth_profile_from(
         runtime,
     )
     .map_err(|error| CliError::LoginProfile(error.to_string()))
-}
-
-fn resolve_registered_auth_profile(
-    provider: &bcode_plugin::RegisteredAuthProvider,
-    explicit_profile: Option<&str>,
-) -> Result<bcode_provider_auth::ResolvedAuthProfile, CliError> {
-    let config = bcode_config::load_config()?;
-    let runtime = bcode_config::load_runtime_auth_subscriptions();
-    resolve_registered_auth_profile_from(&config, &runtime, provider, explicit_profile)
 }
 
 #[cfg(test)]
@@ -13060,77 +13161,6 @@ fn print_auth_enrollment_result(result: &bcode_provider_auth::enrollment::Enroll
     } else {
         println!("No auth pool enrollment (standalone).");
     }
-}
-
-async fn auth_provider_logout(
-    provider_id: &str,
-    explicit_profile: Option<&str>,
-    revoke: bool,
-) -> Result<(), CliError> {
-    let mut host = load_cli_plugin_host()?;
-    let result = logout_auth_provider(&host, provider_id, explicit_profile, revoke).await;
-    let cleanup = host.deactivate_all().map_err(CliError::from);
-    result.and(cleanup)
-}
-
-async fn logout_auth_provider(
-    host: &bcode_plugin::PluginHost,
-    provider_id: &str,
-    explicit_profile: Option<&str>,
-    revoke: bool,
-) -> Result<(), CliError> {
-    let provider = registered_auth_provider(host, provider_id)?;
-    let resolved = resolve_registered_auth_profile(&provider, explicit_profile)?;
-    let method = resolved_auth_method(&provider, &resolved)?;
-    if revoke {
-        let supports = match method {
-            bcode_provider_auth_models::AuthMethodContribution::SecretFields {
-                supports_revocation,
-                ..
-            }
-            | bcode_provider_auth_models::AuthMethodContribution::Interactive {
-                supports_revocation,
-                ..
-            } => *supports_revocation,
-        };
-        if !supports {
-            return Err(CliError::LoginProfile(format!(
-                "Provider '{provider_id}' does not support remote revocation."
-            )));
-        }
-        run_auth_interactive_flow(host, &provider, method, &resolved, false, true).await?;
-    }
-    bcode_provider_auth::lifecycle::AuthVaultLifecycle::new(
-        &resolved,
-        provider_id,
-        &provider.plugin_id,
-        method,
-    )
-    .map_err(|error| CliError::LoginProfile(error.to_string()))?
-    .delete()
-    .map_err(|error| CliError::LoginProfile(error.to_string()))?;
-    // Runtime-registered profiles also carry non-secret routing metadata (pool membership,
-    // bindings). Leaving it behind would keep routing turns at a profile with no credentials.
-    let removal = if resolved.source == bcode_provider_auth::AuthProfileSource::Runtime {
-        bcode_config::remove_runtime_auth_profile(&resolved.profile_name, &provider.plugin_id)?
-    } else {
-        bcode_config::RuntimeAuthProfileRemoval::default()
-    };
-    let mut writer = std::io::stdout().lock();
-    writeln!(
-        writer,
-        "Local authentication removed for provider '{provider_id}'."
-    )?;
-    if !removal.removed_from_pools.is_empty() {
-        writeln!(
-            writer,
-            "Removed profile '{}' from auth pool(s): {}.",
-            resolved.profile_name,
-            removal.removed_from_pools.join(", ")
-        )?;
-    }
-    writer.flush()?;
-    Ok(())
 }
 
 fn unconfigured_auth_provider_status_lines(
@@ -23177,7 +23207,7 @@ mod auth_cli_tests {
         let Some(Commands::Auth { command }) = cli.command else {
             panic!("expected auth command");
         };
-        command
+        command.expect("auth subcommand")
     }
 
     #[test]
@@ -23437,11 +23467,11 @@ mod auth_cli_tests {
         assert!(matches!(
             cli.command,
             Some(Commands::Auth {
-                command: AuthCommand::Login {
+                command: Some(AuthCommand::Login {
                     standalone: true,
                     pool: None,
                     ..
-                },
+                }),
             })
         ));
         assert!(
@@ -24124,7 +24154,7 @@ auth_profile = "openai"
         assert!(matches!(
             cli.command,
             Some(Commands::Auth {
-                command: AuthCommand::Login { provider: Some(provider), .. }
+                command: Some(AuthCommand::Login { provider: Some(provider), .. })
             }) if provider == "jev"
         ));
     }
@@ -24147,11 +24177,11 @@ auth_profile = "openai"
         assert!(matches!(
             cli.command,
             Some(Commands::Auth {
-                command: AuthCommand::Login {
+                command: Some(AuthCommand::Login {
                     provider: Some(provider),
                     no_device_seal: true,
                     ..
-                }
+                })
             }) if provider == "openai"
         ));
     }
@@ -24177,13 +24207,13 @@ auth_profile = "openai"
         assert!(matches!(
             cli.command,
             Some(Commands::Auth {
-                command: AuthCommand::Login {
+                command: Some(AuthCommand::Login {
                     provider: Some(provider),
                     profile: Some(profile),
                     pool: Some(pool),
                     method: Some(method),
                     ..
-                }
+                })
             }) if provider == "openai"
                 && profile == "openai-2"
                 && pool == "openai"
@@ -24201,11 +24231,11 @@ auth_profile = "openai"
         assert!(matches!(
             cli.command,
             Some(Commands::Auth {
-                command: AuthCommand::Login {
+                command: Some(AuthCommand::Login {
                     provider: None,
                     profile: Some(profile),
                     ..
-                }
+                })
             }) if profile == "legacy"
         ));
 
@@ -24216,10 +24246,10 @@ auth_profile = "openai"
         assert!(matches!(
             cli.command,
             Some(Commands::Auth {
-                command: AuthCommand::Status {
+                command: Some(AuthCommand::Status {
                     provider: Some(provider),
                     profile: Some(profile),
-                }
+                })
             }) if provider == "test" && profile == "work"
         ));
     }

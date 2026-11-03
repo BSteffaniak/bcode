@@ -4,6 +4,7 @@
 //! are separate operations; callers publish metadata only after successful enrollment.
 
 mod diagnostics;
+mod effective_mapping;
 mod intent;
 mod journey;
 pub use diagnostics::{EnrollmentConflict, EnrollmentConflictReason, EnrollmentConflictSource};
