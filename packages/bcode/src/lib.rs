@@ -6361,6 +6361,48 @@ impl Bcode {
             .await
     }
 
+    /// Return the provider's subscription or account usage (quota meters and windows) for the
+    /// SDK's configured authentication.
+    ///
+    /// Like [`Self::provider_models`], the configured provider request context is sent only to
+    /// the provider it was resolved for; other providers receive an empty context. Providers
+    /// without usage discovery answer with `supported: false`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when no embedded plugin runtime is configured or the provider service
+    /// cannot be invoked or decoded.
+    #[cfg(feature = "embedded-plugins")]
+    pub async fn provider_auth_usage(
+        &self,
+        provider_plugin_id: impl AsRef<str>,
+    ) -> Result<bcode_model::AuthUsageResponse> {
+        let provider_plugin_id = provider_plugin_id.as_ref();
+        let owns_context = self
+            .default_model_selector()
+            .is_some_and(|selector| selector.provider_plugin_id() == Some(provider_plugin_id));
+        let request = bcode_model::AuthUsageRequest {
+            provider_context: if owns_context {
+                self.provider_context.clone()
+            } else {
+                ProviderRequestContext::default()
+            },
+            meter_ids: Vec::new(),
+        };
+        self.plugins
+            .as_ref()
+            .ok_or(BcodeError::MissingPluginRuntime)?
+            .invoke_service_json_scoped(
+                provider_plugin_id,
+                MODEL_PROVIDER_INTERFACE_ID,
+                bcode_model::OP_AUTH_USAGE,
+                &request,
+                bcode_plugin::PluginInvocationScope::Global,
+            )
+            .await
+            .map_err(|error| BcodeError::ProviderConfiguration(error.to_string()))
+    }
+
     /// Return models advertised by an embedded provider plugin, enriched with the embedded model
     /// catalog (context windows, reasoning controls, pricing).
     ///
