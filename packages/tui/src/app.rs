@@ -412,6 +412,13 @@ impl Default for ChildWatchPresentation {
     }
 }
 
+/// Captured native input and explicit placement retained by the composer.
+#[derive(Debug, Clone, Default)]
+pub struct ManagedComposerState {
+    pub requests: std::collections::BTreeMap<String, bcode_session_models::ExternalHarnessRequest>,
+    pub placement: Option<bcode_harness_models::HarnessPlacement>,
+}
+
 /// State owned by the terminal user interface.
 #[derive(Debug, Clone)]
 pub struct BmuxApp {
@@ -451,6 +458,7 @@ pub struct BmuxApp {
     token_usage: TokenUsageMeter,
     session_ui: bcode_tui_components::session_ui::SessionUi,
     pub(crate) composer_submit: super::composer_submit::ComposerSubmit,
+    pub(crate) managed_composer: ManagedComposerState,
     input_history: InputHistory,
     transcript: TranscriptDocument,
     transcript_projection_revision: u64,
@@ -647,6 +655,10 @@ impl BmuxApp {
         )
     }
 
+    #[expect(
+        clippy::too_many_lines,
+        reason = "exhaustive application-state initialization keeps all initial field values together"
+    )]
     fn initial_session_state_with_presentation(
         session_id: Option<SessionId>,
         input_history: &[SessionInputHistoryEntry],
@@ -691,6 +703,7 @@ impl BmuxApp {
             token_usage: TokenUsageMeter::default(),
             session_ui: bcode_tui_components::session_ui::SessionUi::new(),
             composer_submit: super::composer_submit::ComposerSubmit::default(),
+            managed_composer: ManagedComposerState::default(),
             input_history: InputHistory::from_entries(input_history),
             transcript: TranscriptDocument::default(),
             transcript_projection_revision: 0,
@@ -767,6 +780,14 @@ impl BmuxApp {
 
     /// Move app-level presentation/runtime state from another app after recreating session state.
     pub(crate) fn take_cross_session_state_from(&mut self, source: &Self) {
+        self.managed_composer
+            .requests
+            .clone_from(&source.managed_composer.requests);
+        if self.session_id == source.session_id {
+            self.managed_composer
+                .placement
+                .clone_from(&source.managed_composer.placement);
+        }
         self.session_reading_positions
             .clone_from(&source.session_reading_positions);
         if source.scroll_offset() > 0
@@ -5228,6 +5249,18 @@ impl BmuxApp {
             self.downgrade_sticky_entry_anchor();
         }
         match &event.kind {
+            SessionEventKind::ExternalHarnessOperation { .. }
+            | SessionEventKind::ExternalBackendBound { .. }
+            | SessionEventKind::ExternalSubmissionAccepted { .. }
+            | SessionEventKind::ExternalDeliveryObserved { .. }
+            | SessionEventKind::ExternalObservationRecorded { .. } => {
+                // Native history identifies the backend, not execution authority. Default Send
+                // explicitly queues a follow-up; steering requires a user-selected native turn.
+                if self.managed_composer.placement.is_none() {
+                    self.managed_composer.placement =
+                        Some(bcode_harness_models::HarnessPlacement::NextTurn);
+                }
+            }
             SessionEventKind::SubmissionAccepted { submission } => {
                 self.pending_submissions.remove_id(&submission.id);
                 self.set_status(match submission.requested_placement {
@@ -5760,6 +5793,11 @@ impl BmuxApp {
     }
 
     /// Apply bounded authoritative submission lifecycle hydration.
+    /// Remove only the optimistic item covered by a managed delivery receipt.
+    pub fn acknowledge_managed_composer(&mut self, id: &bcode_session_models::SubmissionId) {
+        self.pending_submissions.remove_id(id);
+    }
+
     pub fn apply_submission_records(&mut self, records: &[bcode_session_models::SubmissionRecord]) {
         for record in records {
             self.pending_submissions.remove_id(&record.submission.id);

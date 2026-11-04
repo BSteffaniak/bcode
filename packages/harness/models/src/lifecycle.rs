@@ -534,6 +534,15 @@ impl HarnessResponse {
     }
 }
 
+/// Authoritative native turn outcome, distinct from background-work settlement.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum HarnessTerminalDisposition {
+    Completed,
+    Interrupted,
+    Failed,
+}
+
 /// Normalized observations only. Tool/subagent activity is never dispatched as Bcode work.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
@@ -549,6 +558,22 @@ pub enum HarnessObservationKind {
         submission_id: String,
         attempt_id: String,
         native_turn_id: String,
+    },
+    /// Main-thread native reply explicitly consumed the retained submission attempt.
+    /// This proves neither native turn identity, settlement nor replay safety.
+    SubmissionConsumed {
+        submission_id: String,
+        attempt_id: String,
+        native_frame_id: String,
+    },
+    /// Native result explicitly attributes its response to the retained attempt.
+    /// Queued user sends exclude native automatic/background work: zero is not settlement.
+    SubmissionResultObserved {
+        submission_id: String,
+        attempt_id: String,
+        native_frame_id: String,
+        is_error: bool,
+        queued_user_sends: Option<u32>,
     },
     /// Native-proven identity; requested IDs and initialize transport readiness are insufficient.
     BindingConfirmed {
@@ -579,6 +604,11 @@ pub enum HarnessObservationKind {
     Diagnostic {
         code: String,
         message: String,
+    },
+    /// Native-proven terminal disposition, not proof of background-work settlement.
+    NativeTurnTerminal {
+        native_turn_id: String,
+        disposition: HarnessTerminalDisposition,
     },
     /// Only this explicit authoritative evidence can claim native settlement.
     Settlement {
@@ -626,6 +656,21 @@ impl HarnessObservation {
                 id(attempt_id)?;
                 id(native_turn_id)
             }
+            HarnessObservationKind::SubmissionConsumed {
+                submission_id,
+                attempt_id,
+                native_frame_id,
+            }
+            | HarnessObservationKind::SubmissionResultObserved {
+                submission_id,
+                attempt_id,
+                native_frame_id,
+                ..
+            } => {
+                id(submission_id)?;
+                id(attempt_id)?;
+                id(native_frame_id)
+            }
             HarnessObservationKind::BindingConfirmed { open_id, binding } => {
                 id(open_id)?;
                 binding.validate_owner(&self.session_id, self.generation)
@@ -662,7 +707,10 @@ impl HarnessObservation {
                 id(code)?;
                 text(message)
             }
-            HarnessObservationKind::Settlement { native_turn_id } => id(native_turn_id),
+            HarnessObservationKind::Settlement { native_turn_id }
+            | HarnessObservationKind::NativeTurnTerminal { native_turn_id, .. } => {
+                id(native_turn_id)
+            }
             HarnessObservationKind::Vendor { namespace, detail } => {
                 id(namespace)?;
                 wire(detail, MAX_HARNESS_VENDOR_BYTES)

@@ -1,7 +1,7 @@
 # Claude Code managed harness
 
 `ClaudeCodePlugin` is a native Rust plugin (`cdylib` and statically usable `rlib`).
-Its manifest declares `bcode.harness/v1`; it never registers a model provider or
+Its manifest declares `bcode.harness/v2`; it never registers a model provider or
 executes an observed native tool through Bcode's tool dispatcher.
 
 ## Integration
@@ -130,25 +130,30 @@ currently satisfied with an immediate bounded poll.
   performs actual executable version verification. It is not a remote auth or
   executable digest verification.
 
-## Submission acceptance limitation
+## Submission attribution and remaining completion limits
 
-The shared `SubmissionAccepted { submission_id, attempt_id, native_turn_id }`
-observation requires native protocol proof of that exact association, with owner
-and generation taken from its enclosing observation. The currently integrated
-Claude SDK `submit` reports only frame write completion and carries no verified
-native acceptance event or stable turn mapping. Consequently this plugin emits
-no `SubmissionAccepted`: successful writes remain `DeliveryAttempted`, failed
-writes uncertain, and `native_request_id` stays absent. Raw assistant `turn_id`,
-message IDs/UUIDs, user echoes, result IDs/text, binding confirmation and idle
-cannot fill the missing association. Verified transport settlement may still be
-reported as status, but cannot complete a workflow assignment without accepted
-turn correlation. No automatic resend is authorized by missing acceptance.
+The Rust transport retains a caller UUID for each exact submission attempt.
+Verified native reply and result attribution produce `SubmissionConsumed` and
+`SubmissionResultObserved` under the current session and ownership generation.
+Merged native frames can name multiple retained attempts. These observations
+prove attribution, not a native turn ID, settlement or replay safety. They do
+not populate `SubmissionAccepted.native_turn_id`.
 
-Production workflow acceptance remains blocked pending a behaviorally verified
-native/SDK contract that carries submission correlation and stable native turn
-identity. This needs protocol-owner evidence and a typed SDK event before a
-producer can safely emit the shared observation; configuration/version strings
-alone cannot assert it. Plugin tests cover rejection of raw identity lookalikes.
+An authorized native Claude Code 2.1.308 test exercised the production Rust
+library over two submissions on one live subscription-backed connection. Exact
+UUID attribution, expected replies and native state observations were verified.
+This is library acceptance, not full Bcode workflow or interactive acceptance.
+
+A separate native background-shell probe observed result and idle before shell
+completion and an automatic follow-up. The library therefore fences unsupported
+background activity rather than completing from idle or queue zero. General
+workflow completion still requires independently verified assignment-correlated
+terminal and background-settlement evidence. No artificial identity prompt,
+UUID-as-turn-ID substitution or automatic resend fills that gap.
+
+The service boundary is `bcode.harness/v2`; old v1 plugins are not admitted as
+compatible v2 producers. See the session persistence architecture for durable
+schema/writer migration.
 
 ## Native login evidence and client-terminal integration
 

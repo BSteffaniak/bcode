@@ -276,7 +276,21 @@ pub fn external_transcript_item(
     {
         return Err(HarnessContractError::WrongOwner);
     }
-    let (category, text) = match &observation.kind {
+    let (category, text) = external_observation_content(&observation.kind);
+    Ok(ExternalTranscriptItemView {
+        observation_id: observation.observation_id.clone(),
+        sequence,
+        provenance: provenance.clone(),
+        category,
+        text,
+        incomplete: observation.completeness != HarnessCompleteness::Complete,
+    })
+}
+
+fn external_observation_content(
+    kind: &HarnessObservationKind,
+) -> (ExternalTranscriptCategory, String) {
+    match kind {
         HarnessObservationKind::SubmissionAccepted {
             submission_id,
             attempt_id,
@@ -285,6 +299,37 @@ pub fn external_transcript_item(
             ExternalTranscriptCategory::Status,
             format!(
                 "Native submission accepted: {submission_id} · attempt {attempt_id} · native turn {native_turn_id} (not settlement, assignment completion, or replay authority)"
+            ),
+        ),
+        HarnessObservationKind::NativeTurnTerminal {
+            native_turn_id,
+            disposition,
+        } => (
+            ExternalTranscriptCategory::Status,
+            format!(
+                "Native turn {native_turn_id} ended: {disposition:?} (not background settlement)"
+            ),
+        ),
+        HarnessObservationKind::SubmissionConsumed {
+            submission_id,
+            attempt_id,
+            native_frame_id,
+        } => (
+            ExternalTranscriptCategory::Status,
+            format!(
+                "Native reply consumed submission {submission_id} · attempt {attempt_id} · frame {native_frame_id} (not turn identity or settlement)"
+            ),
+        ),
+        HarnessObservationKind::SubmissionResultObserved {
+            submission_id,
+            attempt_id,
+            native_frame_id,
+            is_error,
+            queued_user_sends,
+        } => (
+            ExternalTranscriptCategory::Status,
+            format!(
+                "Native result attributed to submission {submission_id} · attempt {attempt_id} · frame {native_frame_id} · error {is_error} · queued user sends {queued_user_sends:?} (not settlement)"
             ),
         ),
         HarnessObservationKind::BindingConfirmed { open_id, binding } => (
@@ -327,20 +372,7 @@ pub fn external_transcript_item(
                 interaction.request_id, interaction.prompt, interaction.scope
             ),
         ),
-        HarnessObservationKind::Status { status } => {
-            let view = external_activity(status);
-            (
-                ExternalTranscriptCategory::Status,
-                format!(
-                    "{} · {} · {} · {} · {}",
-                    view.connectivity,
-                    view.execution,
-                    view.attention,
-                    view.continuation,
-                    view.completeness
-                ),
-            )
-        }
+        HarnessObservationKind::Status { status } => external_status_content(status),
         HarnessObservationKind::Diagnostic { code, message } => (
             ExternalTranscriptCategory::Status,
             format!("{code}: {message}"),
@@ -353,15 +385,20 @@ pub fn external_transcript_item(
             ExternalTranscriptCategory::Status,
             format!("Native extension observation: {namespace} (detail omitted)"),
         ),
-    };
-    Ok(ExternalTranscriptItemView {
-        observation_id: observation.observation_id.clone(),
-        sequence,
-        provenance: provenance.clone(),
-        category,
-        text,
-        incomplete: observation.completeness != HarnessCompleteness::Complete,
-    })
+    }
+}
+
+fn external_status_content(
+    status: &HarnessExecutionStatus,
+) -> (ExternalTranscriptCategory, String) {
+    let view = external_activity(status);
+    (
+        ExternalTranscriptCategory::Status,
+        format!(
+            "{} · {} · {} · {} · {}",
+            view.connectivity, view.execution, view.attention, view.continuation, view.completeness
+        ),
+    )
 }
 
 fn history_bindings(

@@ -156,10 +156,27 @@ async fn check_foreign_retained_submit(completed: bool) {
 
 #[tokio::test]
 async fn typed_submission_acceptance_is_exact_indexed_and_offline_readable() {
-    Box::pin(check_typed_submission_acceptance()).await;
+    Box::pin(check_typed_submission_acceptance(
+        false,
+        HarnessTerminalDisposition::Completed,
+    ))
+    .await;
+    Box::pin(check_typed_submission_acceptance(
+        false,
+        HarnessTerminalDisposition::Interrupted,
+    ))
+    .await;
+    Box::pin(check_typed_submission_acceptance(
+        true,
+        HarnessTerminalDisposition::Failed,
+    ))
+    .await;
 }
 
-async fn check_typed_submission_acceptance() {
+async fn check_typed_submission_acceptance(
+    with_gap: bool,
+    terminal_disposition: HarnessTerminalDisposition,
+) {
     let root = tempfile::tempdir().unwrap();
     let sessions = manager(root.path());
     let session = sessions
@@ -265,12 +282,270 @@ async fn check_typed_submission_acceptance() {
             .await
             .is_err()
     );
+    let mut frames = page(&owner);
+    frames.next_after = Some("native-frames".into());
+    let mut consumed = frames.observations[0].clone();
+    consumed.observation_id = "consumed".into();
+    consumed.native_correlations.clear();
+    consumed.kind = HarnessObservationKind::SubmissionConsumed {
+        submission_id: "accepted-input".into(),
+        attempt_id: "accepted-attempt".into(),
+        native_frame_id: "consumed-frame".into(),
+    };
+    let mut observed = consumed.clone();
+    observed.observation_id = "result-observed".into();
+    observed.kind = HarnessObservationKind::SubmissionResultObserved {
+        submission_id: "accepted-input".into(),
+        attempt_id: "accepted-attempt".into(),
+        native_frame_id: "result-frame".into(),
+        is_error: false,
+        queued_user_sends: Some(0),
+    };
+    frames.observations = vec![consumed, observed];
+    for index in 0..2 {
+        let mut wrong = frames.clone();
+        wrong.observations = vec![wrong.observations[index].clone()];
+        match &mut wrong.observations[0].kind {
+            HarnessObservationKind::SubmissionConsumed { attempt_id, .. }
+            | HarnessObservationKind::SubmissionResultObserved { attempt_id, .. } => {
+                *attempt_id = "foreign-attempt".into()
+            }
+            _ => unreachable!(),
+        }
+        assert!(
+            sessions
+                .commit_external_harness_page(&owner, None, &wrong)
+                .await
+                .is_err()
+        );
+    }
+    let mut foreign_generation = frames.clone();
+    foreign_generation.observations[0].generation += 1;
+    assert!(
+        sessions
+            .commit_external_harness_page(&owner, None, &foreign_generation)
+            .await
+            .is_err()
+    );
+    let mut duplicate = frames.clone();
+    duplicate.observations[1] = duplicate.observations[0].clone();
+    duplicate.observations[1].observation_id = "renamed-duplicate".into();
+    assert!(
+        sessions
+            .commit_external_harness_page(&owner, None, &duplicate)
+            .await
+            .is_err()
+    );
     sessions
-        .commit_external_harness_page(&owner, None, &accepted)
+        .commit_external_harness_page(&owner, None, &frames)
         .await
         .unwrap();
     sessions
-        .commit_external_harness_page(&owner, None, &accepted)
+        .commit_external_harness_page(&owner, None, &frames)
+        .await
+        .unwrap();
+    for index in 0..2 {
+        let mut duplicate = frames.clone();
+        duplicate.next_after = Some(format!("duplicate-{index}"));
+        duplicate.observations = vec![duplicate.observations[index].clone()];
+        duplicate.observations[0].observation_id = format!("renamed-frame-{index}");
+        assert!(
+            sessions
+                .commit_external_harness_page(&owner, Some("native-frames"), &duplicate)
+                .await
+                .is_err()
+        );
+    }
+    let mut conflicting_frame = frames.clone();
+    conflicting_frame.next_after = Some("conflicting-frame".into());
+    conflicting_frame.observations = vec![conflicting_frame.observations[1].clone()];
+    conflicting_frame.observations[0].observation_id = "changed-result-observed".into();
+    if let HarnessObservationKind::SubmissionResultObserved {
+        is_error,
+        queued_user_sends,
+        ..
+    } = &mut conflicting_frame.observations[0].kind
+    {
+        *is_error = true;
+        *queued_user_sends = Some(2);
+    }
+    assert!(
+        sessions
+            .commit_external_harness_page(&owner, Some("native-frames"), &conflicting_frame)
+            .await
+            .is_err()
+    );
+    let mut cross_kind = frames.clone();
+    cross_kind.next_after = Some("cross-kind-frame".into());
+    cross_kind.observations = vec![cross_kind.observations[1].clone()];
+    cross_kind.observations[0].observation_id = "cross-kind-frame".into();
+    if let HarnessObservationKind::SubmissionResultObserved {
+        native_frame_id, ..
+    } = &mut cross_kind.observations[0].kind
+    {
+        *native_frame_id = "consumed-frame".into();
+    }
+    sessions
+        .commit_external_harness_page(&owner, Some("native-frames"), &cross_kind)
+        .await
+        .unwrap();
+    // The prepared target permits only its first submit. Further native sends must use
+    // the native-confirmed binding, just like the production multi-attempt path.
+    let binding = HarnessSessionBinding {
+        schema_version: HARNESS_SCHEMA_VERSION,
+        session_id: session.id.to_string(),
+        instance_id: "fixture".into(),
+        native_session_id: "native-confirmed".into(),
+        native_version: "fixture-v1".into(),
+        generation: owner.generation,
+    };
+    let mut confirmation = page(&owner);
+    confirmation.next_after = Some("merged-binding-confirmed".into());
+    confirmation.observations[0].observation_id = "merged-binding-confirmed".into();
+    confirmation.observations[0].native_correlations.clear();
+    confirmation.observations[0].kind = HarnessObservationKind::BindingConfirmed {
+        open_id: "open".into(),
+        binding: binding.clone(),
+    };
+    sessions
+        .commit_external_harness_page(&owner, Some("cross-kind-frame"), &confirmation)
+        .await
+        .unwrap();
+    // A merged native frame may attribute a second exact retained attempt, even in
+    // the same stage. Claim it canonically before publishing that attribution.
+    let mut merged_submit: HarnessRequest =
+        serde_json::from_value(serde_json::to_value(&submit).unwrap()).unwrap();
+    merged_submit.request_id = "merged-submit".into();
+    if let HarnessRequestKind::Submit { target, submission } = &mut merged_submit.kind {
+        *target = HarnessSessionTarget::Confirmed(binding);
+        submission.submission_id = "merged-input".into();
+        submission.attempt_id = "merged-attempt".into();
+    }
+    sessions
+        .claim_external_harness_request(&owner, &merged_submit)
+        .await
+        .unwrap();
+    let mut merged = frames.clone();
+    merged.next_after = Some("merged-native-frame".into());
+    for (index, observation) in merged.observations.iter_mut().enumerate() {
+        observation.observation_id = format!("merged-frame-{index}");
+        match &mut observation.kind {
+            HarnessObservationKind::SubmissionConsumed {
+                submission_id,
+                attempt_id,
+                ..
+            }
+            | HarnessObservationKind::SubmissionResultObserved {
+                submission_id,
+                attempt_id,
+                ..
+            } => {
+                *submission_id = "merged-input".into();
+                *attempt_id = "merged-attempt".into();
+            }
+            _ => unreachable!(),
+        }
+    }
+    let mut another_submit: HarnessRequest =
+        serde_json::from_value(serde_json::to_value(&merged_submit).unwrap()).unwrap();
+    another_submit.request_id = "another-merged-submit".into();
+    if let HarnessRequestKind::Submit { submission, .. } = &mut another_submit.kind {
+        submission.submission_id = "another-merged-input".into();
+        submission.attempt_id = "another-merged-attempt".into();
+    }
+    sessions
+        .claim_external_harness_request(&owner, &another_submit)
+        .await
+        .unwrap();
+    let mut another_attribution = merged.observations.clone();
+    for (index, observation) in another_attribution.iter_mut().enumerate() {
+        observation.observation_id = format!("another-merged-frame-{index}");
+        match &mut observation.kind {
+            HarnessObservationKind::SubmissionConsumed {
+                submission_id,
+                attempt_id,
+                ..
+            }
+            | HarnessObservationKind::SubmissionResultObserved {
+                submission_id,
+                attempt_id,
+                ..
+            } => {
+                *submission_id = "another-merged-input".into();
+                *attempt_id = "another-merged-attempt".into();
+            }
+            _ => unreachable!(),
+        }
+    }
+    merged.observations.extend(another_attribution);
+    sessions
+        .commit_external_harness_page(&owner, Some("merged-binding-confirmed"), &merged)
+        .await
+        .unwrap();
+    sessions
+        .commit_external_harness_page(&owner, Some("merged-binding-confirmed"), &merged)
+        .await
+        .unwrap();
+    let mut merged_duplicate = merged.clone();
+    merged_duplicate.next_after = Some("merged-duplicate".into());
+    merged_duplicate.observations[0].observation_id = "renamed-merged".into();
+    assert!(
+        sessions
+            .commit_external_harness_page(&owner, Some("merged-native-frame"), &merged_duplicate)
+            .await
+            .is_err()
+    );
+    let frame_only = sessions
+        .session_external_harness_submission_evidence(
+            session.id,
+            "accepted-input",
+            "accepted-attempt",
+        )
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(frame_only.1.completeness, HarnessCompleteness::Partial);
+    assert!(frame_only.1.observations.is_empty());
+    assert!(
+        sessions
+            .session_external_harness_submission_acceptance(
+                session.id,
+                "accepted-input",
+                "accepted-attempt",
+            )
+            .await
+            .unwrap()
+            .is_none()
+    );
+    // Acceptance is beyond the old first-1024-observation scan window.
+    let mut prefix_cursor = merged.next_after;
+    for batch in 0..9 {
+        let mut prefix = page(&owner);
+        prefix.next_after = Some(format!("prefix-{batch}"));
+        prefix.observations = (0..128)
+            .map(|offset| {
+                let mut observation = prefix.observations[0].clone();
+                observation.observation_id = format!("prefix-{batch}-{offset}");
+                observation.native_correlations.clear();
+                observation
+            })
+            .collect();
+        // Loss before acceptance is not evidence loss for this submission.
+        if batch == 0 {
+            prefix.completeness = HarnessCompleteness::Gap;
+        }
+        sessions
+            .commit_external_harness_page(&owner, prefix_cursor.as_deref(), &prefix)
+            .await
+            .unwrap();
+        prefix_cursor = prefix.next_after;
+    }
+    sessions
+        .commit_external_harness_page(&owner, prefix_cursor.as_deref(), &accepted)
+        .await
+        .unwrap();
+    sessions
+        .commit_external_harness_page(&owner, prefix_cursor.as_deref(), &accepted)
         .await
         .unwrap();
     assert_eq!(
@@ -309,6 +584,165 @@ async fn check_typed_submission_acceptance() {
             .await
             .is_err()
     );
+    let missing = sessions
+        .session_external_harness_submission_evidence(
+            session.id,
+            "accepted-input",
+            "accepted-attempt",
+        )
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(missing.0, owner);
+    assert_eq!(missing.1.completeness, HarnessCompleteness::Partial);
+    assert_eq!(missing.1.observations, accepted.observations);
+    assert!(missing.1.next_after.as_deref().unwrap().starts_with("h1:"));
+    let mut terminal = page(&owner);
+    terminal.next_after = Some("terminal".into());
+    let mut result = terminal.observations[0].clone();
+    result.observation_id = "result".into();
+    result.native_correlations = vec!["actual-native-turn".into()];
+    result.kind = HarnessObservationKind::Result {
+        text: "late result".into(),
+    };
+    let mut settlement = result.clone();
+    settlement.observation_id = "settlement".into();
+    settlement.kind = HarnessObservationKind::Settlement {
+        native_turn_id: "actual-native-turn".into(),
+    };
+    terminal.observations = vec![result, settlement];
+    let mut result_page = terminal.clone();
+    result_page.next_after = Some("result-only".into());
+    result_page.observations.truncate(1);
+    sessions
+        .commit_external_harness_page(&owner, Some("native-cursor"), &result_page)
+        .await
+        .unwrap();
+    let mut conflicting = result_page.clone();
+    conflicting.next_after = Some("conflict-result".into());
+    conflicting.observations[0].observation_id = "conflict-result".into();
+    conflicting.observations[0].kind = HarnessObservationKind::Result {
+        text: "different complete result".into(),
+    };
+    assert!(
+        sessions
+            .commit_external_harness_page(&owner, Some("result-only"), &conflicting)
+            .await
+            .is_err()
+    );
+    let mut native_terminal = terminal.observations[0].clone();
+    native_terminal.observation_id = "native-terminal".into();
+    native_terminal.kind = HarnessObservationKind::NativeTurnTerminal {
+        native_turn_id: "actual-native-turn".into(),
+        disposition: terminal_disposition,
+    };
+    let mut native_terminal_page = terminal.clone();
+    native_terminal_page.next_after = Some("native-terminal".into());
+    native_terminal_page.observations = vec![native_terminal.clone()];
+    let mut wrong_terminal = native_terminal_page.clone();
+    wrong_terminal.observations[0].kind = HarnessObservationKind::NativeTurnTerminal {
+        native_turn_id: "not-accepted".into(),
+        disposition: HarnessTerminalDisposition::Completed,
+    };
+    assert!(
+        sessions
+            .commit_external_harness_page(&owner, Some("result-only"), &wrong_terminal)
+            .await
+            .is_err()
+    );
+    sessions
+        .commit_external_harness_page(&owner, Some("result-only"), &native_terminal_page)
+        .await
+        .unwrap();
+    sessions
+        .commit_external_harness_page(&owner, Some("result-only"), &native_terminal_page)
+        .await
+        .unwrap();
+    for disposition in [
+        HarnessTerminalDisposition::Completed,
+        HarnessTerminalDisposition::Interrupted,
+        HarnessTerminalDisposition::Failed,
+    ] {
+        let mut conflicting = native_terminal_page.clone();
+        conflicting.next_after = Some("conflicting-native-terminal".into());
+        conflicting.observations[0].observation_id = "renamed-native-terminal".into();
+        conflicting.observations[0].kind = HarnessObservationKind::NativeTurnTerminal {
+            native_turn_id: "actual-native-turn".into(),
+            disposition,
+        };
+        assert!(
+            sessions
+                .commit_external_harness_page(&owner, Some("native-terminal"), &conflicting)
+                .await
+                .is_err()
+        );
+    }
+    let terminal_without_settlement = sessions
+        .session_external_harness_submission_evidence(
+            session.id,
+            "accepted-input",
+            "accepted-attempt",
+        )
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        terminal_without_settlement.1.completeness,
+        HarnessCompleteness::Partial
+    );
+    assert_eq!(terminal_without_settlement.1.observations.len(), 3);
+    terminal.observations.insert(1, native_terminal);
+    let mut settlement_page = terminal.clone();
+    settlement_page.observations.drain(..2);
+    sessions
+        .commit_external_harness_page(&owner, Some("native-terminal"), &settlement_page)
+        .await
+        .unwrap();
+    let complete = sessions
+        .session_external_harness_submission_evidence(
+            session.id,
+            "accepted-input",
+            "accepted-attempt",
+        )
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(complete.0, owner);
+    assert_eq!(complete.1.completeness, HarnessCompleteness::Complete);
+    assert_eq!(complete.1.observations.len(), 4);
+    assert_eq!(
+        &complete.1.observations[1..],
+        terminal.observations.as_slice()
+    );
+    // An uncorrelated gap after acceptance (even after settlement) remains a fence.
+    let mut gap = page(&owner);
+    gap.next_after = Some("gap".into());
+    gap.observations[0].observation_id = "gap".into();
+    gap.observations[0].native_correlations.clear();
+    gap.status.completeness = HarnessCompleteness::Gap;
+    if with_gap {
+        sessions
+            .commit_external_harness_page(&owner, Some("terminal"), &gap)
+            .await
+            .unwrap();
+    }
+    let fenced = sessions
+        .session_external_harness_submission_evidence(
+            session.id,
+            "accepted-input",
+            "accepted-attempt",
+        )
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        fenced.1.completeness,
+        if with_gap {
+            HarnessCompleteness::Gap
+        } else {
+            HarnessCompleteness::Complete
+        }
+    );
     sessions
         .release_idle_session_resources(session.id)
         .await
@@ -334,6 +768,78 @@ async fn check_typed_submission_acceptance() {
             .unwrap(),
         Some(accepted.observations[0].clone())
     );
+    let reopened_frames = observer
+        .external_harness_history(session.id, None, 128)
+        .await
+        .unwrap();
+    assert_eq!(reopened_frames.observations.len(), 2);
+    assert!(matches!(&reopened_frames.observations[0].kind,
+        HarnessObservationKind::SubmissionConsumed { submission_id, attempt_id, native_frame_id }
+            if submission_id == "accepted-input" && attempt_id == "accepted-attempt"
+                && native_frame_id == "consumed-frame"));
+    assert!(matches!(&reopened_frames.observations[1].kind,
+        HarnessObservationKind::SubmissionResultObserved {
+            submission_id, attempt_id, native_frame_id, is_error: false, queued_user_sends: Some(0),
+        } if submission_id == "accepted-input" && attempt_id == "accepted-attempt"
+            && native_frame_id == "result-frame"));
+    assert_eq!(
+        observer
+            .session_external_harness_submission_evidence(
+                session.id,
+                "accepted-input",
+                "accepted-attempt",
+            )
+            .await
+            .unwrap(),
+        Some(fenced.clone()),
+    );
+    let maintenance =
+        bcode_session::lease::acquire_session_maintenance_guard(root.path(), session.id).unwrap();
+    let write = bcode_session::lease::acquire_maintenance_session_write_lock(
+        &maintenance,
+        root.path(),
+        session.id,
+    )
+    .unwrap();
+    let db = bcode_session::db::SessionDb::open_existing_turso_in_root(session.id, root.path())
+        .await
+        .unwrap();
+    let before_reindex = db.last_event_sequence().await.unwrap();
+    use switchy::database::query::FilterableQuery as _;
+    db.database()
+        .delete("turn_evidence")
+        .where_eq("evidence_kind", "harness_operation_v1")
+        .where_eq(
+            "turn_id",
+            bcode_session_models::external_backend::external_backend_key(
+                "terminal_coverage_v2",
+                "current",
+            ),
+        )
+        .execute(db.database())
+        .await
+        .unwrap();
+    let error = db
+        .external_harness_submission_evidence("accepted-input", "accepted-attempt")
+        .await
+        .unwrap_err();
+    assert!(error.to_string().contains("maintenance"));
+    assert!(
+        db.reindex_external_harness_evidence(&maintenance, &write)
+            .await
+            .unwrap()
+            > 0
+    );
+    assert_eq!(db.last_event_sequence().await.unwrap(), before_reindex);
+    assert_eq!(
+        db.external_harness_submission_evidence("accepted-input", "accepted-attempt")
+            .await
+            .unwrap(),
+        Some(fenced)
+    );
+    drop(db);
+    drop(write);
+    drop(maintenance);
     assert!(
         bcode_session::lease::active_session_owners(root.path(), session.id)
             .unwrap()
@@ -1065,6 +1571,11 @@ async fn offline_snapshot_rejects_missing_exact_index_without_repair_or_history_
         .await
         .unwrap();
     assert!(db.external_harness_snapshot().await.is_err());
+    assert!(
+        db.external_harness_submission_evidence("submission", "attempt")
+            .await
+            .is_err()
+    );
     assert_eq!(db.last_event_sequence().await.unwrap(), tail);
     drop(db);
     assert!(

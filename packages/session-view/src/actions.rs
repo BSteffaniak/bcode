@@ -49,6 +49,33 @@ pub async fn execute_session_view_action(
     action: SessionViewAction,
 ) -> Result<SessionViewActionOutcome, ClientError> {
     match action {
+        SessionViewAction::PrepareComposerSubmission {
+            session_id,
+            submission_id,
+            attempt_id,
+            text,
+            placement,
+            expected_native_turn_id,
+        } => {
+            let managed = client
+                .prepare_managed_composer_submission(
+                    session_id,
+                    (submission_id, attempt_id),
+                    text,
+                    placement == PromptPlacementView::Steering,
+                    expected_native_turn_id,
+                )
+                .await?;
+            Ok(SessionViewActionOutcome::SubmissionPrepared {
+                managed: managed.map(Box::new),
+            })
+        }
+        SessionViewAction::SubmitManagedMessage { request } => {
+            let response = client.submit_managed_composer_request(*request).await?;
+            Ok(SessionViewActionOutcome::ManagedSubmissionRecorded {
+                response: Box::new(response),
+            })
+        }
         SessionViewAction::SubmitMessage {
             submission_id,
             session_id,

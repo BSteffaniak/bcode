@@ -33,6 +33,17 @@ while IFS= read -r frame; do
           ;;
       esac
       case "$FAKE_CASE" in
+        attribution)
+          case "$frame" in
+            *'"uuid":"00000000-0000-4000-8000-000000000001"'*) ;;
+            *) exit 4 ;;
+          esac
+          printf '%s\n' '{"type":"command_lifecycle","state":"started","command_uuid":"00000000-0000-4000-8000-000000000001","session_id":"native-auto"}'
+          printf '%s\n' '{"type":"assistant","uuid":"00000000-0000-4000-8000-000000000002","user_message_uuid":"00000000-0000-4000-8000-000000000001","session_id":"native-auto","message":{"content":[]}}'
+          printf '%s\n' '{"type":"rate_limit_event","session_id":"native-auto"}'
+          printf '%s\n' '{"type":"result","uuid":"00000000-0000-4000-8000-000000000003","user_message_uuid":"00000000-0000-4000-8000-000000000001","session_id":"native-auto","is_error":false,"queued_turn_count":0}'
+          printf '%s\n' '{"type":"system","subtype":"session_state_changed","state":"idle","session_id":"native-auto","sdk_host_only":true}'
+          ;;
         callbacks)
           printf '%s\n' '{"type":"control_request","request_id":"a","request":{"subtype":"can_use_tool","tool_name":"AskUserQuestion","input":{"questions":[]}}}'
           printf '%s\n' '{"type":"control_request","request_id":"b","request":{"subtype":"hook_callback","callback_id":"hook_0","input":{}}}'

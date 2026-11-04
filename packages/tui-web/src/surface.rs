@@ -518,7 +518,7 @@ impl SessionSurface {
                     OLDER => Some("Load older history"),
                     NEWER => Some("Load newer history"),
                     LATEST => Some("New messages below; return to latest"),
-                    EDITOR => Some("Session composer"),
+                    EDITOR => Some("Session composer. Ordinary native input queues a follow-up. For exact native steering type /native steer followed by the expected native turn and message. Unresolved submissions retain their exact target and attempt for retry"),
                     id if id.starts_with("bcode-web/permission/") => self.inner.committed_permission
                         .as_ref()
                         .and_then(|permission| {

@@ -79,7 +79,7 @@ pub trait SessionCompactionRecoveryDiscoveryApplication: Sync {
 }
 
 /// Durable session-storage writer epoch shared by runtime and daemon compatibility handshakes.
-pub const CURRENT_SESSION_STORAGE_WRITER_EPOCH: u32 = 18;
+pub const CURRENT_SESSION_STORAGE_WRITER_EPOCH: u32 = 19;
 
 /// Identifies retained turn observations in the existing system-message text contract.
 ///
@@ -1503,7 +1503,7 @@ mod checked_tool_projection_tests {
 }
 
 /// Current persisted session event schema version.
-pub const CURRENT_SESSION_EVENT_SCHEMA_VERSION: u16 = 53;
+pub const CURRENT_SESSION_EVENT_SCHEMA_VERSION: u16 = 54;
 
 /// Stable persisted event kinds emitted by the current session schema.
 ///

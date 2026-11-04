@@ -792,25 +792,31 @@ fn validate_cli_execution_mode(
     Ok(())
 }
 
-/// Handle the exact bare artifact identity probe before runtime or plugin bootstrap.
+/// Handle a parsed artifact identity probe before runtime or plugin bootstrap.
 ///
-/// Returns `false` for every other argument shape so ordinary parsing remains authoritative.
-/// Raw builds still derive identity from final executable bytes; no advertised or cached
-/// replacement identity is accepted.
+/// Uses the canonical root parser, including global options, without resolving configuration,
+/// opening state, or discovering plugins. Other commands, invalid syntax, and flags requesting
+/// execution or onboarding retain ordinary startup handling. Raw builds still derive identity
+/// from final executable bytes; no advertised or cached replacement identity is accepted.
 ///
 /// # Errors
 /// Returns an error if writing or flushing the identity fails.
 pub fn try_run_artifact_id_probe() -> Result<bool, CliError> {
-    if !is_bare_artifact_id_probe(std::env::args_os().skip(1)) {
+    if !is_artifact_id_probe(std::env::args_os()) {
         return Ok(false);
     }
     write_artifact_id()?;
     Ok(true)
 }
 
-fn is_bare_artifact_id_probe(mut arguments: impl Iterator<Item = std::ffi::OsString>) -> bool {
-    arguments.next().as_deref() == Some(std::ffi::OsStr::new("artifact-id"))
-        && arguments.next().is_none()
+fn is_artifact_id_probe(arguments: impl IntoIterator<Item = std::ffi::OsString>) -> bool {
+    let Ok(cli) = Cli::try_parse_from(arguments) else {
+        return false;
+    };
+    matches!(cli.command, Some(Commands::ArtifactId))
+        && !cli.new
+        && !cli.onboard
+        && cli.launch_options() == bcode_tui::TuiLaunchOptions::default()
 }
 
 fn write_artifact_id() -> Result<(), CliError> {
@@ -839,7 +845,6 @@ async fn route_cli_startup(cli: &Cli) -> Result<bool, CliError> {
 }
 
 async fn handle_cli(cli: Cli) -> Result<(), CliError> {
-    let _ = (&cli.profile, cli.request_timeout_secs);
     let launch_options = cli.launch_options();
     validate_cli_execution_mode(&cli, launch_options)?;
     if let Some(Commands::Run(options)) = &cli.command {
@@ -4915,17 +4920,49 @@ mod build_version_tests {
     use super::*;
 
     #[test]
-    fn early_artifact_probe_only_accepts_exact_bare_command() {
+    fn early_artifact_probe_uses_canonical_parser_without_bootstrap() {
         for (arguments, expected) in [
             (vec!["artifact-id"], true),
             (vec![], false),
             (vec!["artifact-id", "--help"], false),
-            (vec!["--state-root", "/tmp/example", "artifact-id"], false),
-            (vec!["--json-errors", "artifact-id"], false),
+            (vec!["--state-root", "/tmp/example", "artifact-id"], true),
+            (vec!["artifact-id", "--state-root=/tmp/example"], true),
+            (vec!["--json-errors", "artifact-id"], true),
+            (
+                vec![
+                    "--config-only",
+                    "/not/read.toml",
+                    "--context",
+                    "isolated",
+                    "artifact-id",
+                ],
+                true,
+            ),
+            (
+                vec![
+                    "--state-root",
+                    "/tmp/example",
+                    "--state-profile",
+                    "other",
+                    "artifact-id",
+                ],
+                false,
+            ),
+            (vec!["--request-timeout-secs", "0", "artifact-id"], false),
+            (
+                vec!["--state-root", "/tmp/example", "artifact-id", "extra"],
+                false,
+            ),
+            (vec!["--onboard", "artifact-id"], false),
+            (vec!["--new", "artifact-id"], false),
+            (vec!["--no-tools", "artifact-id"], false),
             (vec!["version"], false),
         ] {
             assert_eq!(
-                is_bare_artifact_id_probe(arguments.into_iter().map(std::ffi::OsString::from)),
+                is_artifact_id_probe(
+                    std::iter::once(std::ffi::OsString::from("bcode"))
+                        .chain(arguments.into_iter().map(std::ffi::OsString::from))
+                ),
                 expected,
             );
         }

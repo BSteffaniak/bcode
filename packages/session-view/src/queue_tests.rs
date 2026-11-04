@@ -154,6 +154,239 @@ async fn queue_hydration_and_targeted_actions_use_only_bounded_application_opera
         .unwrap();
 }
 
+fn managed_composer_target(
+    session_id: SessionId,
+) -> bcode_ipc::harness::ManagedSessionTargetSnapshot {
+    use bcode_harness_models::{
+        HarnessAuthBinding, HarnessAuthCustody, HarnessInstance, HarnessPreparedSession,
+        HarnessSessionTarget,
+    };
+    use bcode_ipc::harness::ManagedSessionTargetSnapshot;
+    ManagedSessionTargetSnapshot {
+        session_id,
+        instance: HarnessInstance {
+            instance_id: "native".into(),
+            plugin_id: "native.plugin".into(),
+            executable: "/native".into(),
+            config_namespace: "isolated".into(),
+            auth: HarnessAuthBinding {
+                provider_id: "native".into(),
+                profile: "work".into(),
+                credential_namespace: "isolated".into(),
+                custody: HarnessAuthCustody::NativeManaged,
+            },
+        },
+        target: HarnessSessionTarget::Prepared(HarnessPreparedSession {
+            open_id: "open".into(),
+            session_id: session_id.to_string(),
+            instance_id: "native".into(),
+            generation: 3,
+            native_version: "1".into(),
+            requested_native_session_id: None,
+        }),
+    }
+}
+
+fn managed_composer_delivery_response(
+    request: &bcode_ipc::harness::ManagedSessionRequest,
+    expected: &bcode_ipc::harness::ManagedSessionTargetSnapshot,
+    exact: &mut Option<String>,
+    wrong_generation: bool,
+) -> String {
+    use bcode_harness_models::{
+        HarnessDeliveryState, HarnessReceipt, HarnessRequestKind, HarnessServiceResponse,
+        HarnessServiceResponseKind,
+    };
+    use bcode_ipc::harness::ManagedSessionOperation;
+    let session_id = expected.session_id;
+    assert_eq!(request.operation, ManagedSessionOperation::Followup);
+    let call = request.decode_call().unwrap();
+    assert_eq!(call.session_id, Some(session_id));
+    assert!(call.parent_session_id.is_none());
+    let HarnessRequestKind::Submit { target, submission } = &call.harness.kind else {
+        panic!("submit only");
+    };
+    assert_eq!(target, &expected.target);
+    assert_eq!(submission.submission_id, "composer-submit");
+    assert_eq!(submission.attempt_id, "composer-attempt");
+    assert_eq!(submission.generation, 3);
+    assert_eq!(submission.text, "ordinary native input");
+    assert_eq!(
+        submission.placement,
+        bcode_harness_models::HarnessPlacement::NextTurn
+    );
+    if let Some(exact) = exact.as_ref() {
+        assert_eq!(&request.request_json, exact);
+    } else {
+        *exact = Some(request.request_json.clone());
+    }
+    serde_json::to_string(&HarnessServiceResponse {
+        schema_version: 1,
+        request_id: call.harness.request_id.clone(),
+        operation: bcode_harness_models::HarnessOperation::Submit,
+        kind: HarnessServiceResponseKind::Receipt(HarnessReceipt {
+            submission_id: submission.submission_id.clone(),
+            attempt_id: submission.attempt_id.clone(),
+            session_id: submission.session_id.clone(),
+            generation: if wrong_generation { 4 } else { 3 },
+            state: HarnessDeliveryState::Uncertain,
+            native_request_id: None,
+        }),
+    })
+    .unwrap()
+}
+
+async fn serve_managed_composer_scenario(
+    listener: bcode_ipc::LocalIpcListener,
+    expected: bcode_ipc::harness::ManagedSessionTargetSnapshot,
+) {
+    use bcode_ipc::harness::{ManagedSessionOperation, ManagedSessionResponse};
+    let session_id = expected.session_id;
+    let mut stage = 0;
+    let mut exact = None;
+    while stage < 6 {
+        let mut stream = listener.accept().await.unwrap();
+        loop {
+            let Ok(envelope) = bcode_ipc::recv_envelope(&mut stream).await else {
+                break;
+            };
+            let payload = match bcode_ipc::decode_request(&envelope.payload).unwrap() {
+                Request::Hello { .. } => recovery_test_hello(),
+                Request::ManagedSession { request } => {
+                    let response_json = match stage {
+                        0..=2 => {
+                            assert_eq!(request.operation, ManagedSessionOperation::Binding);
+                            let query: serde_json::Value =
+                                serde_json::from_str(&request.request_json).unwrap();
+                            assert_eq!(query["session_id"], session_id.to_string());
+                            serde_json::to_string(&Some(&expected)).unwrap()
+                        }
+                        3..=5 => managed_composer_delivery_response(
+                            &request,
+                            &expected,
+                            &mut exact,
+                            stage == 5,
+                        ),
+                        _ => unreachable!(),
+                    };
+                    stage += 1;
+                    ResponsePayload::ManagedSession {
+                        response: ManagedSessionResponse {
+                            schema_version: 1,
+                            response_json,
+                        },
+                    }
+                }
+                other => panic!(
+                    "managed composer must not change model selections or dispatch model work: {other:?}"
+                ),
+            };
+            bcode_ipc::send_envelope(
+                &mut stream,
+                &bcode_ipc::response_envelope(envelope.request_id, &Response::Ok(payload)).unwrap(),
+            )
+            .await
+            .unwrap();
+            if stage == 6 {
+                break;
+            }
+        }
+    }
+}
+
+#[tokio::test]
+async fn managed_composer_shared_actions_capture_then_dispatch_exact_uncertain_attempt() {
+    use bcode_harness_models::HarnessDeliveryState;
+    let (_socket, endpoint, listener) = private_queue_ipc_fixture();
+    let session_id = SessionId::new();
+    let backend = tokio::spawn(serve_managed_composer_scenario(
+        listener,
+        managed_composer_target(session_id),
+    ));
+    let client = BcodeClient::new(endpoint);
+    // Older callers without a captured native envelope fail closed instead of invoking a model.
+    assert!(
+        execute_session_view_action(
+            &client,
+            SessionViewAction::SubmitMessage {
+                submission_id: SubmissionId("legacy".into()),
+                session_id: Some(session_id),
+                launch_working_directory: None,
+                text: "must not execute".into(),
+                placement: PromptPlacement::FollowUp,
+                execution: Box::default(),
+            }
+        )
+        .await
+        .is_err()
+    );
+    assert!(
+        execute_session_view_action(
+            &client,
+            SessionViewAction::PrepareComposerSubmission {
+                session_id,
+                submission_id: "missing-turn".into(),
+                attempt_id: "missing-turn-attempt".into(),
+                text: "must not steer".into(),
+                placement: PromptPlacement::Steering,
+                expected_native_turn_id: None,
+            }
+        )
+        .await
+        .is_err()
+    );
+    let prepared = execute_session_view_action(
+        &client,
+        SessionViewAction::PrepareComposerSubmission {
+            session_id,
+            submission_id: "composer-submit".into(),
+            attempt_id: "composer-attempt".into(),
+            text: "ordinary native input".into(),
+            placement: PromptPlacement::FollowUp,
+            expected_native_turn_id: None,
+        },
+    )
+    .await
+    .unwrap();
+    let SessionViewActionOutcome::SubmissionPrepared {
+        managed: Some(retained),
+    } = prepared
+    else {
+        panic!("captured target required");
+    };
+    for _ in 0..2 {
+        let outcome = execute_session_view_action(
+            &client,
+            SessionViewAction::SubmitManagedMessage {
+                request: retained.clone(),
+            },
+        )
+        .await
+        .unwrap();
+        let SessionViewActionOutcome::ManagedSubmissionRecorded { response } = outcome else {
+            panic!("native receipt, not model acceptance");
+        };
+        let ExternalHarnessResponseKind::Receipt(receipt) = response.kind else {
+            panic!("receipt required");
+        };
+        assert_eq!(receipt.state, HarnessDeliveryState::Uncertain);
+        assert_eq!(receipt.attempt_id, "composer-attempt");
+    }
+    assert!(
+        execute_session_view_action(
+            &client,
+            SessionViewAction::SubmitManagedMessage { request: retained }
+        )
+        .await
+        .is_err(),
+        "foreign-generation receipt must fail, never become model acceptance"
+    );
+    tokio::time::timeout(std::time::Duration::from_secs(10), backend)
+        .await
+        .unwrap()
+        .unwrap();
+}
+
 fn recovery_test_hello() -> ResponsePayload {
     ResponsePayload::Hello {
         protocol_version: bcode_ipc::ProtocolVersion::current(),

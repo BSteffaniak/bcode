@@ -1460,7 +1460,7 @@ pub fn is_released_event_kind_schema(kind: &str, schema: u16) -> bool {
 ///
 /// Event kinds that the current build still persists remain historically decodable through this
 /// schema; the current schema itself is classified by [`classify_event_kind_schema`].
-pub const LATEST_HISTORICAL_EVENT_SCHEMA: u16 = 52;
+pub const LATEST_HISTORICAL_EVENT_SCHEMA: u16 = 53;
 
 fn released_event_schema_range(kind: &str) -> (u16, u16) {
     let live = LATEST_HISTORICAL_EVENT_SCHEMA;
@@ -1476,8 +1476,9 @@ fn released_event_schema_range(kind: &str) -> (u16, u16) {
         | "milestone_evaluation_completed"
         | "milestone_publication_requested"
         | "milestone_published" => (51, CURRENT_EVENT_SCHEMA),
+        // These families remain publication-gated and have no released historical writer.
         "durable_interaction_committed" | "turn_continuation_committed" => {
-            (53, CURRENT_EVENT_SCHEMA)
+            (CURRENT_EVENT_SCHEMA, CURRENT_EVENT_SCHEMA)
         }
         "child_session_created" => (49, CURRENT_EVENT_SCHEMA),
         "session_child_linked" | "session_child_published" | "session_children_reconciled" => {
@@ -1527,7 +1528,7 @@ fn released_event_schema_range(kind: &str) -> (u16, u16) {
         }
         "runtime_work_progress" => (18, live),
         "session_derived" => (46, CURRENT_EVENT_SCHEMA),
-        "session_forked" => (22, live),
+        "session_forked" => (22, 52),
         "session_imported" => (16, live),
         "session_renamed" | "trace_event" => (7, live),
         "tool_contribution"
@@ -2283,7 +2284,12 @@ pub struct MigrationStepDescriptor {
     pub target_writer_epoch: u32,
 }
 
-pub const MIGRATION_STEPS: [MigrationStepDescriptor; 17] = [
+pub const MIGRATION_STEPS: [MigrationStepDescriptor; 18] = [
+    MigrationStepDescriptor {
+        id: "session-writer-epoch-18-to-19",
+        source_writer_epoch: 18,
+        target_writer_epoch: 19,
+    },
     MigrationStepDescriptor {
         id: "session-writer-epoch-17-to-18",
         source_writer_epoch: 17,
@@ -2458,11 +2464,16 @@ pub const RELEASED_WRITER_SCHEMA_COMBINATIONS: &[ReleasedWriterSchemaDescriptor]
         writer_epoch: 17,
         event_schema: 52,
     },
+    ReleasedWriterSchemaDescriptor {
+        writer_epoch: 18,
+        event_schema: 53,
+    },
 ];
 
 /// Released historical writer epochs that must migrate to [`CURRENT_WRITER_EPOCH`].
-pub const RELEASED_HISTORICAL_WRITER_EPOCHS: &[u32] =
-    &[1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17];
+pub const RELEASED_HISTORICAL_WRITER_EPOCHS: &[u32] = &[
+    1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18,
+];
 
 /// Released historical event schemas currently evidenced by Git history.
 ///
@@ -2471,7 +2482,7 @@ pub const RELEASED_HISTORICAL_WRITER_EPOCHS: &[u32] =
 /// emitted by epoch-6 builds and migrate forward without a writer-epoch change.
 pub const RELEASED_HISTORICAL_EVENT_SCHEMAS: &[u16] = &[
     1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26,
-    27, 28, 29, 30, 31, 32, 35, 37, 38, 39, 40, 41, 42, 43, 44, 45, 46, 47, 48, 49, 50, 51, 52,
+    27, 28, 29, 30, 31, 32, 35, 37, 38, 39, 40, 41, 42, 43, 44, 45, 46, 47, 48, 49, 50, 51, 52, 53,
 ];
 
 /// Event schemas between the first released schema and the current schema that no writer emitted.
@@ -2626,8 +2637,8 @@ mod tests {
             ("external_observation_recorded", 53),
             ("external_interaction_responded", 53),
             ("child_session_created", 49),
-            ("durable_interaction_committed", 53),
-            ("turn_continuation_committed", 53),
+            ("durable_interaction_committed", CURRENT_EVENT_SCHEMA),
+            ("turn_continuation_committed", CURRENT_EVENT_SCHEMA),
             ("inert_history", 40),
             ("positioned_assistant_reasoning_activity", 42),
             ("positioned_assistant_response_segment", 42),
@@ -3068,6 +3079,10 @@ mod tests {
                 ReleasedWriterSchemaDescriptor {
                     writer_epoch: 17,
                     event_schema: 52
+                },
+                ReleasedWriterSchemaDescriptor {
+                    writer_epoch: 18,
+                    event_schema: 53
                 },
             ]
         );

@@ -54,6 +54,16 @@ pub fn stage_session_message(
         return false;
     }
     let session_id = chat.attached_session_id();
+    if let Some(session_id) = session_id {
+        let unresolved = chat.app.managed_composer.requests.values().any(|request| {
+            let (owner, _) = request.target();
+            owner == session_id.to_string()
+        });
+        if unresolved {
+            chat.app.set_status("Native input remains unresolved. Use /native retry <submission-id> for the retained attempt; no new input was sent".into());
+            return false;
+        }
+    }
     let message = chat.app.take_pending_submission();
     if message.trim().is_empty() {
         chat.app.clear_pending_submission(&message);
@@ -78,8 +88,27 @@ pub fn stage_session_message(
         .is_none()
         .then(|| chat.app.selected_model_id().map(ToOwned::to_owned))
         .flatten();
+    let expected_native_turn_id = match &chat.app.managed_composer.placement {
+        Some(bcode_harness_models::HarnessPlacement::Steer {
+            expected_native_turn_id,
+        }) => Some(expected_native_turn_id.clone()),
+        _ => None,
+    };
+    let placement = match &chat.app.managed_composer.placement {
+        Some(bcode_harness_models::HarnessPlacement::NextTurn) => {
+            bcode_ipc::PromptPlacement::FollowUp
+        }
+        Some(bcode_harness_models::HarnessPlacement::Steer { .. }) => {
+            bcode_ipc::PromptPlacement::Steering
+        }
+        None => placement,
+    };
     chat.start_effect(TuiEffect::SubmitMessage {
         request: Box::new(SubmitMessageRequest {
+            managed: None,
+            managed_only: chat.app.managed_composer.placement.is_some(),
+            attempt_id: bcode_session_models::SessionId::new().to_string(),
+            expected_native_turn_id,
             submission_id: chat
                 .app
                 .pending_submissions()
@@ -108,6 +137,63 @@ pub fn stage_session_message(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn native_composer_stages_explicit_placement_and_attempt_without_model_dispatch() {
+        use super::super::session_flow::{ActiveChat, AgentCatalog, ChatSessionAttachment};
+        let session_id = bcode_session_models::SessionId::new();
+        let (event_sender, event_receiver) = crate::history_flow::session_stream_channel();
+        let mut chat = ActiveChat {
+            app: super::super::app::BmuxApp::new_with_history(Some(session_id), &[], &[], false),
+            agents: AgentCatalog::default(),
+            attachment: ChatSessionAttachment::Attached { session_id },
+            event_sender,
+            event_receiver,
+            event_task: None,
+            opening_session_progress: None,
+            pending_effects: super::super::effects::TuiEffectQueue::default(),
+        };
+        for expected in [None, Some("turn-7".to_owned())] {
+            chat.app.managed_composer.placement = Some(expected.clone().map_or(
+                bcode_harness_models::HarnessPlacement::NextTurn,
+                |expected_native_turn_id| bcode_harness_models::HarnessPlacement::Steer {
+                    expected_native_turn_id,
+                },
+            ));
+            chat.app.replace_composer_with("native input");
+            chat.app.stage_submission();
+            assert!(stage_session_message(
+                std::path::Path::new("."),
+                crate::TuiLaunchOptions::default(),
+                &mut chat,
+                bcode_ipc::PromptPlacement::Steering
+            ));
+            let (effects, _) = chat.pending_effects.drain_runtime();
+            let request = effects
+                .into_iter()
+                .find_map(|(_, effect)| match effect {
+                    TuiEffect::SubmitMessage { request } => Some(request),
+                    _ => None,
+                })
+                .unwrap();
+            assert!(request.managed_only);
+            assert!(
+                request.managed.is_none(),
+                "staging must not invent a target"
+            );
+            assert_ne!(request.attempt_id, request.submission_id.0);
+            assert_eq!(request.expected_native_turn_id, expected);
+            assert_eq!(
+                request.placement,
+                if expected.is_some() {
+                    bcode_ipc::PromptPlacement::Steering
+                } else {
+                    bcode_ipc::PromptPlacement::FollowUp
+                }
+            );
+        }
+        drop(chat);
+    }
 
     #[test]
     fn submission_preserves_observed_connection_for_new_and_existing_sessions() {

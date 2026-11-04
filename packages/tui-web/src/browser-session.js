@@ -688,6 +688,13 @@ export async function mountBrowserSession({
       if (retryOnly) throw new Error('no unresolved submission');
       body = rust.prepare_submission(window.crypto.randomUUID());
     }
+    // Preparation is read-only. Persist its exact target/attempt before native delivery.
+    if (rust.submission_needs_preparation()) {
+      const prepared = await request('/api/session-view/prepare-submission', body);
+      rust.accept_submission_preparation(prepared);
+      saveRecovery();
+      body = rust.retry_submission();
+    }
     // Retain the exact operation before transport begins, even on an ambiguous failure.
     saveRecovery();
     const json = await request('/api/session-view/submit-message', body);

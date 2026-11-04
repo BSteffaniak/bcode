@@ -2,7 +2,7 @@
 use bcode_harness_models::{HarnessRequest, HarnessRequestKind, MAX_HARNESS_WIRE_BYTES};
 use serde::{Deserialize, Serialize};
 
-/// Host application interface. Native plugins use `bcode.harness/v1` instead.
+/// Host application interface. Native plugins use `bcode.harness/v2` instead.
 pub const MANAGED_SESSION_INTERFACE_ID: &str = "bcode.managed-session/v1";
 /// Application envelope version.
 pub const MANAGED_SESSION_VERSION: u16 = 1;

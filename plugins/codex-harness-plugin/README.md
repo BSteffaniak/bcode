@@ -1,6 +1,6 @@
 # Codex managed harness plugin
 
-Native `codex app-server --listen stdio://` backend for shared `bcode.harness/v1`,
+Native `codex app-server --listen stdio://` backend for shared `bcode.harness/v2`,
 not a model provider. Protocol source is explicitly pinned to Codex
 `8553558345de65dddf41ca4f6200e5b7b84d9cf9`; the sibling checkout HEAD is different.
 
@@ -58,8 +58,11 @@ Pinned notifications are interpreted as actually defined:
   a sanitized `native_turn_failed` diagnostic, not native error text. Interrupted
   and failed turns never produce successful settlement. Delayed duplicate completion
   cannot reopen a terminal turn.
-* Successful exact active-turn completion may produce native `Settlement`, never
-  assignment acceptance. Native multi-agent operation is disabled and effective
+* Complete exact accepted-turn completion produces `NativeTurnTerminal`, not
+  background-work settlement. Completed final agent items produce bounded,
+  correlated `Result` observations. Native background processes can survive a
+  completed turn, so this producer does not fabricate `Settlement`. Native
+  multi-agent operation is disabled and effective
   `features.multi_agent=false` verified before opening. Observed collab activity,
   pending controls, error evidence or any observation gap prevents settlement.
   Background continuation remains unsupported. One-entry deferred settlement makes
@@ -98,7 +101,9 @@ immediate per-invocation cancellation plumbing is not yet integrated.
 Approvals/questions use exact native request IDs and generation. File approval needs
 a retained bounded diff and no root grant; absent/evicted diff is declined. Additional
 permissions/network grants are declined. Secret generic questions are not exposed.
-Multi-question answering remains unsupported. Unknown callbacks are rejected; wrong
+Multi-question batches are exposed sequentially with exact per-question response
+identities and one final native answer map; cancellation discards partial answers.
+Unknown callbacks are rejected; wrong
 thread callbacks cannot acquire authority. Arbitrary dynamic tools are refused,
 never dispatched into Bcode. `bcode_parent_assistance` is registered/interpreted only
 with an explicit validated host assistance grant; host must reauthorize responses.

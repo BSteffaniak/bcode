@@ -306,6 +306,76 @@ pub fn resolve_explicit_profile_context(
     Ok(context)
 }
 
+/// Resolve one explicit profile's provider identity without materializing credentials.
+///
+/// Declarative profiles take precedence over runtime registrations. Context-scoped selections
+/// never consult global runtime metadata, and conflicting legacy pool members fail closed.
+///
+/// # Errors
+/// Returns a secret-safe error for missing, ambiguous, foreign, or unverifiable metadata.
+pub fn resolve_owned_profile_metadata(
+    config: &bcode_config::BcodeConfig,
+    owner_plugin_id: &str,
+    profile: &str,
+) -> Result<ResolvedAuthProfile, &'static str> {
+    if owner_plugin_id.trim().is_empty() || profile.trim().is_empty() {
+        return Err("an explicit provider and auth profile are required");
+    }
+    let name = context_profile_name(config, "", Some(profile))
+        .map_err(|_| "selected auth profile ownership cannot be verified")?;
+    let name = name.as_deref().unwrap_or(profile);
+    let runtime = if config.auth.profiles.contains_key(name) || config.active_context.is_some() {
+        bcode_config::RuntimeAuthSubscriptions::default()
+    } else {
+        bcode_config::try_load_runtime_auth_subscriptions()
+            .map_err(|_| "selected auth profile configuration is unavailable")?
+    };
+    resolve_owned_profile_metadata_with(config, &runtime, owner_plugin_id, name)
+}
+
+fn resolve_owned_profile_metadata_with(
+    config: &bcode_config::BcodeConfig,
+    runtime: &bcode_config::RuntimeAuthSubscriptions,
+    owner_plugin_id: &str,
+    profile: &str,
+) -> Result<ResolvedAuthProfile, &'static str> {
+    if owner_plugin_id.trim().is_empty() || profile.trim().is_empty() {
+        return Err("an explicit provider and auth profile are required");
+    }
+    let provider_id = config
+        .auth
+        .profiles
+        .get(profile)
+        .map_or_else(
+            || {
+                if config.active_context.is_some() {
+                    None
+                } else {
+                    runtime.profiles.get(profile).map_or_else(
+                        || {
+                            runtime
+                                .pools
+                                .values()
+                                .flat_map(|pool| &pool.profiles)
+                                .find(|member| member.auth_profile == profile)
+                                .map(|member| member.provider.as_str())
+                        },
+                        |registered| Some(registered.provider_id.as_str()),
+                    )
+                }
+            },
+            |declared| declared.provider_id.as_deref(),
+        )
+        .ok_or("selected auth profile ownership cannot be verified")?;
+    let resolved =
+        resolve_auth_provider_profile(config, provider_id, owner_plugin_id, Some(profile), runtime)
+            .map_err(|_| "selected auth profile ownership cannot be verified")?;
+    if resolved.profile_name != profile {
+        return Err("selected auth profile could not be resolved");
+    }
+    Ok(resolved)
+}
+
 /// Resolve exactly one named, registered-provider-owned profile for a non-generation operation.
 ///
 /// Provider identity and plugin ownership are checked before any credential materialization;
@@ -2699,6 +2769,151 @@ profiles = ["account"]
                 }) if actual == missing
             ));
         }
+    }
+
+    #[test]
+    fn owned_profile_metadata_resolves_pool_member_without_materializing_credentials() {
+        let config = bcode_config::BcodeConfig::default();
+        let runtime = pool_member_runtime(None, Some("bcode.openai-compatible"));
+        let resolved = super::resolve_owned_profile_metadata_with(
+            &config,
+            &runtime,
+            "bcode.openai-compatible",
+            "openai-2",
+        )
+        .unwrap();
+        assert_eq!(resolved.provider_id, "openai");
+        assert_eq!(resolved.owner_plugin_id, "bcode.openai-compatible");
+        assert_eq!(resolved.profile_name, "openai-2");
+        // The fixture's vault is not opened by metadata resolution.
+        assert_eq!(resolved.source, super::AuthProfileSource::Runtime);
+    }
+
+    #[test]
+    fn owned_profile_metadata_rejects_ambiguous_foreign_and_missing_profiles() {
+        let config = bcode_config::BcodeConfig::default();
+        let runtime = pool_member_runtime(None, Some("bcode.openai-compatible"));
+        for (owner, profile) in [
+            ("bcode.foreign", "openai-2"),
+            ("bcode.openai-compatible", "missing"),
+        ] {
+            assert!(
+                super::resolve_owned_profile_metadata_with(&config, &runtime, owner, profile)
+                    .is_err()
+            );
+        }
+        for field in ["provider", "owner", "destination"] {
+            let mut runtime = runtime.clone();
+            let mut conflicting = runtime.pools["openai"].clone();
+            let member = &mut conflicting.profiles[0];
+            match field {
+                "provider" => member.provider = "openrouter".into(),
+                "owner" => member.owner_plugin_id = Some("bcode.foreign".into()),
+                _ => member.storage_profile = "different-account".into(),
+            }
+            runtime.pools.insert("conflicting".into(), conflicting);
+            assert!(
+                super::resolve_owned_profile_metadata_with(
+                    &config,
+                    &runtime,
+                    "bcode.openai-compatible",
+                    "openai-2",
+                )
+                .is_err()
+            );
+        }
+    }
+
+    #[test]
+    fn owned_profile_metadata_never_falls_back_from_invalid_declaration() {
+        let runtime = pool_member_runtime(None, Some("bcode.openai-compatible"));
+        let mut config = bcode_config::BcodeConfig::default();
+        config.auth.profiles.insert(
+            "openai-2".into(),
+            bcode_config::AuthProfileConfig {
+                backend: "not-a-credential-backend".into(),
+                provider_id: Some("openai".into()),
+                owner_plugin_id: Some("bcode.foreign".into()),
+                ..Default::default()
+            },
+        );
+        assert!(
+            super::resolve_owned_profile_metadata_with(
+                &config,
+                &runtime,
+                "bcode.openai-compatible",
+                "openai-2",
+            )
+            .is_err()
+        );
+        config
+            .auth
+            .profiles
+            .get_mut("openai-2")
+            .unwrap()
+            .owner_plugin_id = Some("bcode.openai-compatible".into());
+        // An unsupported credential backend is harmless during metadata-only inspection.
+        assert!(
+            super::resolve_owned_profile_metadata_with(
+                &config,
+                &runtime,
+                "bcode.openai-compatible",
+                "openai-2",
+            )
+            .is_ok()
+        );
+    }
+
+    #[test]
+    fn owned_profile_metadata_checks_runtime_registration_and_context_isolation() {
+        let mut config = bcode_config::BcodeConfig::default();
+        let mut runtime = pool_member_runtime(None, Some("bcode.openai-compatible"));
+        runtime.profiles.insert(
+            "openai-2".into(),
+            bcode_config::RuntimeAuthProfile {
+                provider_id: "openrouter".into(),
+                owner_plugin_id: "bcode.foreign".into(),
+                backend: "sshenv".into(),
+                scheme: "api_key".into(),
+                storage_profile: "foreign-account".into(),
+                vault: PathBuf::from("/fixture/not-opened"),
+                map: BTreeMap::new(),
+                device_seal: None,
+            },
+        );
+        // An invalid top-level registration must not fall through to a valid pool member.
+        assert!(
+            super::resolve_owned_profile_metadata_with(
+                &config,
+                &runtime,
+                "bcode.openai-compatible",
+                "openai-2",
+            )
+            .is_err()
+        );
+        runtime
+            .profiles
+            .get_mut("openai-2")
+            .unwrap()
+            .owner_plugin_id = "bcode.openai-compatible".into();
+        let resolved = super::resolve_owned_profile_metadata_with(
+            &config,
+            &runtime,
+            "bcode.openai-compatible",
+            "openai-2",
+        )
+        .unwrap();
+        assert_eq!(resolved.provider_id, "openrouter");
+        config.active_context = Some("isolated".into());
+        assert!(
+            super::resolve_owned_profile_metadata_with(
+                &config,
+                &runtime,
+                "bcode.openai-compatible",
+                "openai-2",
+            )
+            .is_err()
+        );
     }
 
     fn pool_member_runtime(

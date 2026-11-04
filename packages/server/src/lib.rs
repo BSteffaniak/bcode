@@ -67841,12 +67841,12 @@ library = "test"
 
     #[tokio::test]
     async fn completed_source_turn_recovers_missing_workflow_receipt() {
-        assert_completed_source_receipt_recovery(false).await;
+        Box::pin(assert_completed_source_receipt_recovery(false)).await;
     }
 
     #[tokio::test]
     async fn replacement_owner_recovers_completed_source_receipt() {
-        assert_completed_source_receipt_recovery(true).await;
+        Box::pin(assert_completed_source_receipt_recovery(true)).await;
     }
 
     async fn assert_completed_source_receipt_recovery(replace_owner: bool) {
@@ -100090,6 +100090,7 @@ event_symbol = "bcode_plugin_handle_event_v1"
             .expect("append trigger event");
         let state = Arc::new({
             let mut state = test_server_state_with_fake_provider(sessions);
+            isolate_compaction_request_fixture(&mut state);
             state.startup_config.model.compaction.mode = bcode_config::CompactionMode::OnOverflow;
             state.startup_config.model.compaction.backend = bcode_config::CompactionBackend::Local;
             state
@@ -100262,6 +100263,7 @@ event_symbol = "bcode_plugin_handle_event_v1"
             .expect("append trigger event");
         let state = Arc::new({
             let mut state = test_server_state_with_fake_provider(sessions);
+            isolate_compaction_request_fixture(&mut state);
             state.startup_config.model.compaction.mode = bcode_config::CompactionMode::OnOverflow;
             state.startup_config.model.compaction.backend = bcode_config::CompactionBackend::Local;
             state.startup_config.model.compaction.keep_recent_tokens = 1;
@@ -100416,6 +100418,7 @@ event_symbol = "bcode_plugin_handle_event_v1"
             .expect("append trigger event");
         let state = Arc::new({
             let mut state = test_server_state_with_fake_provider(sessions);
+            isolate_compaction_request_fixture(&mut state);
             state.selected_provider_plugin_id = Some("bcode.fake-provider".to_owned());
             state.selected_model_id = Some("fake-echo".to_owned());
             state.selected_provider_context.settings.insert(
@@ -100797,6 +100800,7 @@ event_symbol = "bcode_plugin_handle_event_v1"
         state.startup_config.model.compaction.keep_recent_tokens = 1;
         state.startup_config.model.compaction.backend =
             bcode_config::CompactionBackend::ProviderNative;
+        isolate_compaction_request_fixture(&mut state);
         let selection = SessionModelSelection {
             provider_plugin_id: Some("bcode.fake-provider".to_string()),
             requested_model_id: None,
@@ -100879,6 +100883,7 @@ event_symbol = "bcode_plugin_handle_event_v1"
         state.startup_config.model.compaction.keep_recent_tokens = 1;
         state.startup_config.model.compaction.backend =
             bcode_config::CompactionBackend::ProviderNative;
+        isolate_compaction_request_fixture(&mut state);
         let selection = SessionModelSelection {
             provider_plugin_id: Some("bcode.fake-provider".to_string()),
             model_id: Some("fake-model".to_string()),
@@ -102762,12 +102767,15 @@ event_symbol = "bcode_plugin_handle_event_v1"
     }
 
     // Structural compaction tests exercise their own canonical instructions/history, not
-    // the checkout's AGENTS.md, diff, or the developer's installed skill catalog.
-    // Keep the fake model's real capacity and all production admission checks intact.
+    // the checkout's AGENTS.md, diff, or the developer's installed skill catalog. These
+    // request-only inputs survive history compaction and can exhaust an 8k fake model
+    // before synthesis/cancellation is reached. Retain base/agent instructions and the
+    // fake model's real capacity; isolate only external discovery through configuration.
     fn isolate_compaction_request_fixture(state: &mut ServerState) {
         state.startup_config.invariants.enabled = false;
         state.startup_config.skills.enabled = false;
         let sections = &mut state.startup_config.system_prompt.sections;
+        sections.skill_catalog = false;
         sections.repository_context = false;
         sections.repository_invariants = false;
         sections.dynamic_repository_context = false;
@@ -102909,6 +102917,7 @@ event_symbol = "bcode_plugin_handle_event_v1"
             .await;
         }
         let mut state = test_server_state_with_fake_provider(sessions);
+        isolate_compaction_request_fixture(&mut state);
         state.startup_config.model.compaction.keep_recent_tokens = 1;
         let selection = SessionModelSelection {
             provider_plugin_id: Some("bcode.fake-provider".to_owned()),

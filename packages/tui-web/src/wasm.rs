@@ -211,6 +211,24 @@ impl BrowserSession {
         Ok(self.surface()?.take_clipboard())
     }
 
+    /// Whether this retained input requires non-mutating backend preparation.
+    /// # Errors
+    /// Rejects disposed or busy state.
+    pub fn submission_needs_preparation(&mut self) -> Result<bool, JsValue> {
+        Ok(self.surface()?.inner.semantic.needs_preparation())
+    }
+
+    /// Capture the managed target before any send and preserve it for exact retries.
+    /// # Errors
+    /// Rejects mismatched or malformed preparation.
+    pub fn accept_submission_preparation(&mut self, json: &str) -> Result<(), JsValue> {
+        self.surface()?
+            .inner
+            .semantic
+            .accept_preparation(json)
+            .map_err(error)
+    }
+
     /// Exact retry payload, never a regenerated identity.
     ///
     /// # Errors

@@ -6,7 +6,7 @@
 use crate::ServerState;
 use bcode_harness_models::{
     HarnessCompleteness, HarnessObservationKind, HarnessRequestKind, HarnessServiceResponse,
-    HarnessServiceResponseKind, HarnessSessionTarget,
+    HarnessServiceResponseKind, HarnessSessionTarget, HarnessTerminalDisposition,
 };
 use bcode_ipc::harness::ManagedSessionCall;
 use bcode_session_models::SessionId;
@@ -637,7 +637,7 @@ async fn execute(
     })
 }
 
-/// Observe a bounded indexed canonical evidence window, then drain one bounded native page.
+/// Observe a bounded indexed canonical submission snapshot, then drain one bounded native page.
 /// Native/plugin unavailability is deferred; daemon loss never becomes a terminal result.
 pub(crate) async fn observe_receipt(
     state: &ServerState,
@@ -718,61 +718,44 @@ async fn canonical_outcome(
             message: "managed submission rejected".into(),
         });
     }
-    let acceptance = state
+    let evidence = state
         .sessions
-        .session_external_harness_submission_acceptance(
+        .session_external_harness_submission_evidence(
             receipt.session_id,
             &submission.submission_id,
             &submission.attempt_id,
         )
         .await
-        .map_err(|_| invalid("managed submission acceptance evidence unavailable"))?;
-    let Some(acceptance) = acceptance else {
+        .map_err(|_| invalid("managed submission evidence unavailable"))?;
+    let Some((evidence_owner, page)) = evidence else {
+        return Ok(deferred("managed submission evidence unavailable"));
+    };
+    if evidence_owner != owner {
+        return Ok(deferred("managed submission evidence owner changed"));
+    }
+    if page.completeness == HarnessCompleteness::Gap
+        || page.status.completeness == HarnessCompleteness::Gap
+    {
+        return Ok(deferred("managed evidence gap"));
+    }
+    let mut acceptances = page.observations.iter().filter(|observation| {
+        matches!(
+            &observation.kind,
+            HarnessObservationKind::SubmissionAccepted { .. }
+        )
+    });
+    let Some(acceptance) = acceptances.next() else {
         return Ok(deferred(
             "managed submission has no authoritative native turn correlation",
         ));
     };
-    let native_id = accepted_turn(&acceptance, receipt)?;
-    // Actor-owned history contains the canonical operation-page observations. Legacy
-    // external_backend indexes do not materialize these pages; never infer absence from
-    // querying the wrong projection or equate native request and execution-turn IDs.
-    let mut after = None;
-    let mut observations = Vec::new();
-    for _ in 0..8 {
-        let page = state
-            .sessions
-            .external_harness_history(receipt.session_id, after.clone(), 128)
-            .await
-            .map_err(|_| invalid("managed turn evidence unavailable"))?;
-        if page.observations.is_empty() && (page.next_after.is_none() || page.next_after == after) {
-            return outcome(&observations, receipt, &native_id);
-        }
-        for observation in page.observations {
-            if observation.generation == receipt.generation
-                && (observation
-                    .native_correlations
-                    .iter()
-                    .any(|id| id == &native_id)
-                    || matches!(&observation.kind, HarnessObservationKind::Settlement { native_turn_id } if native_turn_id == &native_id))
-            {
-                observations.push(observation);
-            }
-        }
-        let result = outcome(&observations, receipt, &native_id)?;
-        if !matches!(result, AttemptObservation::Deferred { .. }) {
-            return Ok(result);
-        }
-        let Some(next) = page.next_after else {
-            return Ok(result);
-        };
-        if after.as_ref() == Some(&next) {
-            return Err(invalid("managed history cursor did not advance"));
-        }
-        after = Some(next);
+    if acceptances.next().is_some() {
+        return Err(invalid("conflicting managed submission acceptance"));
     }
-    Ok(deferred(
-        "managed turn evidence exceeds bounded observation window",
-    ))
+    let native_id = accepted_turn(acceptance, receipt)?;
+    // The canonical indexed snapshot includes exact acceptance, terminal evidence and
+    // applicable loss fences. Never restart a bounded scan at the history prefix.
+    outcome(&page.observations, receipt, &native_id)
 }
 
 // Acceptance establishes only the submission/attempt-to-turn association, never settlement.
@@ -815,6 +798,7 @@ fn outcome(
     native_id: &str,
 ) -> Result<AttemptObservation, WorkflowStoreError> {
     let mut settled = false;
+    let mut terminal = None;
     let mut result = None;
     for observation in observations {
         observation
@@ -823,17 +807,46 @@ fn outcome(
         if observation.session_id != receipt.session_id.to_string()
             || observation.generation != receipt.generation
         {
-            return Err(invalid("foreign managed observation"));
+            return Ok(deferred("foreign or stale managed observation"));
         }
+        // Partial progress is not incomplete terminal evidence. Explicit loss remains a
+        // fence even when a producer also supplies a complete result and settlement.
+        if observation.completeness == HarnessCompleteness::Gap
+            || matches!(&observation.kind, HarnessObservationKind::Status { status }
+                if status.completeness == HarnessCompleteness::Gap)
+        {
+            return Ok(deferred("managed evidence gap"));
+        }
+    }
+    for observation in observations {
         if observation.completeness != HarnessCompleteness::Complete {
+            if observation.completeness == HarnessCompleteness::Partial
+                && matches!(
+                    &observation.kind,
+                    HarnessObservationKind::Text { .. }
+                        | HarnessObservationKind::Tool { .. }
+                        | HarnessObservationKind::Subagent { .. }
+                        | HarnessObservationKind::Status { .. }
+                )
+            {
+                continue;
+            }
             return Ok(deferred("managed evidence incomplete"));
         }
         match &observation.kind {
+            HarnessObservationKind::NativeTurnTerminal {
+                native_turn_id,
+                disposition,
+            } if native_turn_id == native_id => {
+                if terminal.is_some_and(|previous| previous != *disposition) {
+                    return Ok(deferred("conflicting managed native terminal evidence"));
+                }
+                terminal = Some(*disposition);
+            }
             HarnessObservationKind::Settlement { native_turn_id }
                 if native_turn_id == native_id =>
             {
                 settled = true;
-                break;
             }
             HarnessObservationKind::Result { text }
                 if observation
@@ -851,11 +864,34 @@ fn outcome(
             "awaiting authoritative assignment-correlated native settlement",
         ));
     }
+    let Some(terminal) = terminal else {
+        return Ok(deferred(
+            "awaiting authoritative native terminal disposition",
+        ));
+    };
+    match terminal {
+        HarnessTerminalDisposition::Interrupted => return Ok(AttemptObservation::Cancelled),
+        HarnessTerminalDisposition::Failed => {
+            return Ok(AttemptObservation::Failed {
+                message: "managed native turn failed".into(),
+            });
+        }
+        HarnessTerminalDisposition::Completed => {}
+    }
     let Some(result) = result else {
         return Ok(deferred(
             "settled native turn has no bounded assignment result",
         ));
     };
+    complete_assignment_output(receipt, native_id, &result)
+}
+
+// Terminal evidence is checked by outcome before entering ordinary workflow dataflow.
+fn complete_assignment_output(
+    receipt: &HarnessWorkflowReceipt,
+    native_id: &str,
+    result: &str,
+) -> Result<AttemptObservation, WorkflowStoreError> {
     let HarnessRequestKind::Submit { submission, .. } = &receipt.call.harness.kind else {
         return Err(invalid("missing managed submission"));
     };
@@ -1022,6 +1058,19 @@ mod tests {
         }
     }
 
+    fn terminal(
+        receipt: &HarnessWorkflowReceipt,
+        disposition: HarnessTerminalDisposition,
+    ) -> bcode_harness_models::HarnessObservation {
+        observation(
+            receipt,
+            HarnessObservationKind::NativeTurnTerminal {
+                native_turn_id: "turn".into(),
+                disposition,
+            },
+        )
+    }
+
     #[test]
     fn typed_acceptance_requires_exact_attempt_generation_and_complete_evidence() {
         let receipt = receipt();
@@ -1087,6 +1136,7 @@ mod tests {
                     text: "verified result".into(),
                 },
             ),
+            terminal(&receipt, HarnessTerminalDisposition::Completed),
             observation(
                 &receipt,
                 HarnessObservationKind::Settlement {
@@ -1106,6 +1156,308 @@ mod tests {
     }
 
     #[test]
+    fn partial_progress_does_not_poison_complete_result_and_settlement() {
+        let receipt = receipt();
+        let progress = [
+            HarnessObservationKind::Text {
+                text: "streaming".into(),
+            },
+            HarnessObservationKind::Tool {
+                native_tool_id: "tool".into(),
+                name: "read".into(),
+                status: "running".into(),
+            },
+            HarnessObservationKind::Status {
+                status: bcode_harness_models::HarnessExecutionStatus {
+                    connectivity: bcode_harness_models::HarnessConnectivity::Connected,
+                    activity: bcode_harness_models::HarnessActivity::Running,
+                    attention: bcode_harness_models::HarnessAttention::None,
+                    continuation: bcode_harness_models::HarnessContinuation::Unknown,
+                    completeness: HarnessCompleteness::Partial,
+                },
+            },
+        ];
+        let mut events = progress
+            .into_iter()
+            .map(|kind| {
+                let mut event = observation(&receipt, kind);
+                event.completeness = HarnessCompleteness::Partial;
+                event
+            })
+            .collect::<Vec<_>>();
+        events.push(observation(
+            &receipt,
+            HarnessObservationKind::Result {
+                text: "complete answer".into(),
+            },
+        ));
+        events.push(terminal(&receipt, HarnessTerminalDisposition::Completed));
+        events.push(observation(
+            &receipt,
+            HarnessObservationKind::Settlement {
+                native_turn_id: "turn".into(),
+            },
+        ));
+        let AttemptObservation::Succeeded { output } = outcome(&events, &receipt, "turn").unwrap()
+        else {
+            panic!("partial progress must not invalidate complete terminal evidence");
+        };
+        assert_eq!(output.value["result"], "complete answer");
+    }
+
+    #[test]
+    fn incomplete_terminal_evidence_and_unknown_progress_remain_deferred() {
+        let receipt = receipt();
+        for completeness in [HarnessCompleteness::Partial, HarnessCompleteness::Unknown] {
+            for incomplete_index in 0..3 {
+                let mut events = [
+                    terminal(&receipt, HarnessTerminalDisposition::Completed),
+                    observation(
+                        &receipt,
+                        HarnessObservationKind::Result {
+                            text: "answer".into(),
+                        },
+                    ),
+                    observation(
+                        &receipt,
+                        HarnessObservationKind::Settlement {
+                            native_turn_id: "turn".into(),
+                        },
+                    ),
+                ];
+                events[incomplete_index].completeness = completeness;
+                assert!(matches!(
+                    outcome(&events, &receipt, "turn").unwrap(),
+                    AttemptObservation::Deferred { .. }
+                ));
+            }
+        }
+        let mut progress = observation(
+            &receipt,
+            HarnessObservationKind::Text {
+                text: "unknown coverage".into(),
+            },
+        );
+        progress.completeness = HarnessCompleteness::Unknown;
+        let events = [
+            progress,
+            terminal(&receipt, HarnessTerminalDisposition::Completed),
+            observation(
+                &receipt,
+                HarnessObservationKind::Result {
+                    text: "answer".into(),
+                },
+            ),
+            observation(
+                &receipt,
+                HarnessObservationKind::Settlement {
+                    native_turn_id: "turn".into(),
+                },
+            ),
+        ];
+        assert!(matches!(
+            outcome(&events, &receipt, "turn").unwrap(),
+            AttemptObservation::Deferred { .. }
+        ));
+    }
+
+    #[test]
+    fn explicit_progress_gaps_fence_complete_terminal_evidence() {
+        let receipt = receipt();
+        let mut gap = observation(
+            &receipt,
+            HarnessObservationKind::Text {
+                text: "lost progress".into(),
+            },
+        );
+        gap.completeness = HarnessCompleteness::Gap;
+        let status_gap = observation(
+            &receipt,
+            HarnessObservationKind::Status {
+                status: bcode_harness_models::HarnessExecutionStatus {
+                    connectivity: bcode_harness_models::HarnessConnectivity::Connected,
+                    activity: bcode_harness_models::HarnessActivity::Running,
+                    attention: bcode_harness_models::HarnessAttention::None,
+                    continuation: bcode_harness_models::HarnessContinuation::Unknown,
+                    completeness: HarnessCompleteness::Gap,
+                },
+            },
+        );
+        for mut progress in [gap, status_gap] {
+            // Generation-wide loss cannot be hidden by an absent turn correlation.
+            progress.native_correlations.clear();
+            for gap_position in 0..=3 {
+                let mut events = vec![
+                    terminal(&receipt, HarnessTerminalDisposition::Completed),
+                    observation(
+                        &receipt,
+                        HarnessObservationKind::Result {
+                            text: "answer".into(),
+                        },
+                    ),
+                    observation(
+                        &receipt,
+                        HarnessObservationKind::Settlement {
+                            native_turn_id: "turn".into(),
+                        },
+                    ),
+                ];
+                events.insert(gap_position, progress.clone());
+                assert!(matches!(
+                    outcome(&events, &receipt, "turn").unwrap(),
+                    AttemptObservation::Deferred { .. }
+                ));
+            }
+        }
+    }
+
+    #[test]
+    fn interrupted_and_failed_turns_require_settlement_but_not_result() {
+        let receipt = receipt();
+        for disposition in [
+            HarnessTerminalDisposition::Interrupted,
+            HarnessTerminalDisposition::Failed,
+        ] {
+            let terminal = terminal(&receipt, disposition);
+            assert!(matches!(
+                outcome(std::slice::from_ref(&terminal), &receipt, "turn").unwrap(),
+                AttemptObservation::Deferred { .. }
+            ));
+            let events = [
+                terminal,
+                observation(
+                    &receipt,
+                    HarnessObservationKind::Settlement {
+                        native_turn_id: "turn".into(),
+                    },
+                ),
+            ];
+            let mut gap_events = events.clone();
+            gap_events[1].completeness = HarnessCompleteness::Gap;
+            assert!(matches!(
+                outcome(&gap_events, &receipt, "turn").unwrap(),
+                AttemptObservation::Deferred { .. }
+            ));
+            match outcome(&events, &receipt, "turn").unwrap() {
+                AttemptObservation::Cancelled => {
+                    assert_eq!(disposition, HarnessTerminalDisposition::Interrupted);
+                }
+                AttemptObservation::Failed { message } => {
+                    assert_eq!(disposition, HarnessTerminalDisposition::Failed);
+                    assert_eq!(message, "managed native turn failed");
+                }
+                other => panic!("expected settled terminal disposition, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn result_attribution_does_not_replace_native_terminal_disposition() {
+        let receipt = receipt();
+        let events = [
+            observation(
+                &receipt,
+                HarnessObservationKind::SubmissionConsumed {
+                    submission_id: "submission".into(),
+                    attempt_id: "attempt".into(),
+                    native_frame_id: "reply".into(),
+                },
+            ),
+            observation(
+                &receipt,
+                HarnessObservationKind::SubmissionResultObserved {
+                    submission_id: "submission".into(),
+                    attempt_id: "attempt".into(),
+                    native_frame_id: "result".into(),
+                    is_error: false,
+                    queued_user_sends: Some(0),
+                },
+            ),
+            observation(
+                &receipt,
+                HarnessObservationKind::Result {
+                    text: "attributed answer".into(),
+                },
+            ),
+            observation(
+                &receipt,
+                HarnessObservationKind::Settlement {
+                    native_turn_id: "turn".into(),
+                },
+            ),
+        ];
+        assert!(matches!(
+            outcome(&events, &receipt, "turn").unwrap(),
+            AttemptObservation::Deferred { .. }
+        ));
+        assert!(accepted_turn(&events[0], &receipt).is_err());
+        assert!(accepted_turn(&events[1], &receipt).is_err());
+    }
+
+    #[test]
+    fn missing_foreign_incomplete_and_conflicting_terminal_evidence_defers() {
+        let receipt = receipt();
+        let base = vec![
+            observation(
+                &receipt,
+                HarnessObservationKind::Result {
+                    text: "answer is not terminal proof".into(),
+                },
+            ),
+            observation(
+                &receipt,
+                HarnessObservationKind::Settlement {
+                    native_turn_id: "turn".into(),
+                },
+            ),
+        ];
+        assert!(matches!(
+            outcome(&base, &receipt, "turn").unwrap(),
+            AttemptObservation::Deferred { .. }
+        ));
+        let mut foreign = terminal(&receipt, HarnessTerminalDisposition::Completed);
+        foreign.kind = HarnessObservationKind::NativeTurnTerminal {
+            native_turn_id: "foreign-turn".into(),
+            disposition: HarnessTerminalDisposition::Completed,
+        };
+        let mut partial = terminal(&receipt, HarnessTerminalDisposition::Completed);
+        partial.completeness = HarnessCompleteness::Partial;
+        for terminal in [foreign, partial] {
+            let mut events = base.clone();
+            events.push(terminal);
+            assert!(matches!(
+                outcome(&events, &receipt, "turn").unwrap(),
+                AttemptObservation::Deferred { .. }
+            ));
+        }
+        for dispositions in [
+            [
+                HarnessTerminalDisposition::Completed,
+                HarnessTerminalDisposition::Failed,
+            ],
+            [
+                HarnessTerminalDisposition::Interrupted,
+                HarnessTerminalDisposition::Completed,
+            ],
+        ] {
+            let mut events = base.clone();
+            events.extend(dispositions.map(|disposition| terminal(&receipt, disposition)));
+            assert!(matches!(
+                outcome(&events, &receipt, "turn").unwrap(),
+                AttemptObservation::Deferred { .. }
+            ));
+        }
+        let mut stale = terminal(&receipt, HarnessTerminalDisposition::Interrupted);
+        stale.generation += 1;
+        let mut events = base;
+        events.push(stale);
+        assert!(matches!(
+            outcome(&events, &receipt, "turn").unwrap(),
+            AttemptObservation::Deferred { .. }
+        ));
+    }
+
+    #[test]
     fn stale_partial_and_foreign_turn_evidence_never_settles() {
         let receipt = receipt();
         let result = observation(
@@ -1121,7 +1473,10 @@ mod tests {
             },
         );
         settled.generation = 1;
-        assert!(outcome(&[result.clone(), settled.clone()], &receipt, "turn").is_err());
+        assert!(matches!(
+            outcome(&[result.clone(), settled.clone()], &receipt, "turn").unwrap(),
+            AttemptObservation::Deferred { .. }
+        ));
         settled.generation = 2;
         settled.completeness = HarnessCompleteness::Gap;
         assert!(matches!(
@@ -1208,6 +1563,7 @@ mod tests {
                     text: "native result".into(),
                 },
             ),
+            terminal(&receipt, HarnessTerminalDisposition::Completed),
             observation(
                 &receipt,
                 HarnessObservationKind::Settlement {

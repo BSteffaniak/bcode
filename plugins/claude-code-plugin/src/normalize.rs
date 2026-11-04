@@ -5,8 +5,8 @@ use bcode_harness_models::{
     HarnessChoice, HarnessCompleteness, HarnessConnectivity, HarnessContinuation,
     HarnessContractError, HarnessExecutionStatus, HarnessInteraction, HarnessInteractionKind,
     HarnessObservation, HarnessObservationKind, HarnessResponse, HarnessResponseValue,
-    HarnessSessionBinding, HarnessSessionTarget, MAX_HARNESS_ID_BYTES, MAX_HARNESS_ITEMS,
-    MAX_HARNESS_TEXT_BYTES,
+    HarnessSessionBinding, HarnessSessionTarget, HarnessSubmission, MAX_HARNESS_ID_BYTES,
+    MAX_HARNESS_ITEMS, MAX_HARNESS_TEXT_BYTES,
 };
 use serde_json::{Value, json};
 use std::collections::BTreeMap;
@@ -24,6 +24,7 @@ pub struct Normalizer {
     /// Native protocol input never writes this field.
     pub assistance_grant: Option<HarnessAssistanceGrant>,
     pending_grants: BTreeMap<String, HarnessAssistanceGrant>,
+    attribution: crate::attribution::Producer,
 }
 impl Normalizer {
     #[cfg(test)]
@@ -43,6 +44,7 @@ impl Normalizer {
             submitted: false,
             assistance_grant: None,
             pending_grants: BTreeMap::new(),
+            attribution: crate::attribution::Producer::new(),
         }
     }
     pub fn confirmation(
@@ -87,9 +89,32 @@ impl Normalizer {
         };
         observation.validate().ok().map(|()| observation)
     }
+    #[must_use]
+    pub fn retained_attribution(&self) -> &[crate::RetainedAttribution] {
+        self.attribution.evidence()
+    }
+    pub fn retain_submission(
+        &mut self,
+        submission: &HarnessSubmission,
+    ) -> Result<bcode_claude_code::SubmissionUuid, HarnessContractError> {
+        if submission.session_id != self.target.session_id()
+            || submission.generation != self.target.generation()
+        {
+            return Err(HarnessContractError::WrongOwner);
+        }
+        self.attribution.retain(submission)
+    }
     pub fn event(&mut self, event: Event) -> Vec<HarnessObservation> {
         let mut kinds = Vec::new();
         match event {
+            Event::Attribution(evidence) => {
+                // Only typed native correlation plus an exact retained pair can
+                // publish these events. Neither establishes a native turn identity.
+                match self.attribution.record(&evidence) {
+                    Ok(observations) => kinds.extend(observations),
+                    Err(_) => return self.gap(),
+                }
+            }
             Event::Message(NativeMessage::Assistant(value)) => {
                 let Some(normalized) = Self::assistant(&value) else {
                     return self.gap();
@@ -158,7 +183,9 @@ impl Normalizer {
                     status: status(&state),
                 });
             }
-            Event::Message(NativeMessage::User(_) | NativeMessage::Stream(_)) => {}
+            Event::Message(
+                NativeMessage::User(_) | NativeMessage::Stream(_) | NativeMessage::Notice(_),
+            ) => {}
         }
         let expected = kinds.len();
         let observations: Vec<_> = kinds

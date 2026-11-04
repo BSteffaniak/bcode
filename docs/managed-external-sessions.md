@@ -115,10 +115,16 @@ BMUX remains the terminal layout authority.
 
 ## Compatibility and verification
 
-The independently evolving service interface is `bcode.harness/v1`. Operation
+The independently evolving service interface is `bcode.harness/v2`; v1 plugins
+are not admitted through the v2 registry. The envelope shape remains schema one.
+V2 distinguishes native-turn acceptance, consumed-prompt attribution, result
+attribution, terminal disposition and background-work settlement. None substitutes
+for another. Operation
 requests and responses validate correlation, operation family, instance, generation
 and bounded payloads. Durable session-event changes follow the existing migration
-and writer-epoch mechanisms rather than a parallel event database.
+and writer-epoch mechanisms rather than a parallel event database. Event schema
+54 / writer epoch 19 fences the new closed observation variants and indexes;
+existing epoch-18 data requires the explicit registered migration.
 
 Deterministic protocol fixtures and isolated application tests supplement, but do
 not replace, exact-version native acceptance. Native login behavior, background

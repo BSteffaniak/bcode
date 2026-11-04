@@ -405,6 +405,117 @@ impl BcodeClient {
         .await
     }
 
+    /// Capture a managed composer envelope without sending input. A missing/unavailable target
+    /// never permits fallback after managed dispatch; binding discovery must distinguish absent
+    /// managed state from managed state whose transport has not been prepared.
+    /// # Errors
+    /// Rejects unavailable targets, unsupported steering, missing expected turns and invalid IDs.
+    pub async fn prepare_managed_composer_submission(
+        &self,
+        session_id: SessionId,
+        identities: (String, String),
+        text: String,
+        steering: bool,
+        expected_native_turn_id: Option<String>,
+    ) -> Result<Option<bcode_session_models::ExternalHarnessRequest>, ClientError> {
+        let (submission_id, attempt_id) = identities;
+        let expected_native_turn_id =
+            expected_native_turn_id.filter(|value| !value.trim().is_empty());
+        let Some(snapshot) = self.managed_session_binding(session_id).await? else {
+            return Ok(None);
+        };
+        if steering && expected_native_turn_id.is_none() {
+            // A plain Send is explicit next-turn input only when the harness is known managed.
+            // Do not guess an active native turn or silently steer a later turn.
+            return Err(ClientError::Protocol("Native steering requires /native composer steer <native-turn>; choose Queue as follow-up or /native composer next for ordinary input".into()));
+        }
+        let placement = if steering {
+            let expected_native_turn_id = expected_native_turn_id
+                .filter(|value| !value.is_empty())
+                .ok_or_else(|| ClientError::Protocol(
+                    "Native steering requires an explicitly selected native turn; use Queue as follow-up for ordinary input".into(),
+                ))?;
+            let inspected = self
+                .managed_session_call(
+                    ManagedSessionOperation::Inspect,
+                    ManagedSessionCall {
+                        session_id: Some(session_id),
+                        harness: HarnessRequest {
+                            schema_version: HARNESS_SCHEMA_VERSION,
+                            request_id: submission_id.clone(),
+                            instance: snapshot.instance.clone(),
+                            kind: HarnessRequestKind::Inspect,
+                        },
+                        parent_session_id: None,
+                        assistance_destination_session_id: None,
+                    },
+                )
+                .await?;
+            if !matches!(inspected.kind, HarnessServiceResponseKind::Inspection(ref inspection)
+                if inspection.capabilities.steering.support == HarnessSupportLevel::Supported)
+            {
+                return Err(ClientError::Protocol(
+                    "Exact native steering is not supported by this harness".into(),
+                ));
+            }
+            bcode_harness_models::HarnessPlacement::Steer {
+                expected_native_turn_id,
+            }
+        } else {
+            if expected_native_turn_id.is_some() {
+                return Err(ClientError::Protocol(
+                    "Next-turn input cannot carry a steering expectation".into(),
+                ));
+            }
+            bcode_harness_models::HarnessPlacement::NextTurn
+        };
+        let call = submission_call(
+            snapshot.instance,
+            snapshot.target.clone(),
+            bcode_harness_models::HarnessSubmission {
+                submission_id,
+                attempt_id,
+                session_id: session_id.to_string(),
+                generation: snapshot.target.generation(),
+                text,
+                placement,
+            },
+        )?;
+        bcode_session_models::ExternalHarnessRequest::from_request(&call.harness)
+            .map(Some)
+            .map_err(|_| ClientError::Protocol("Invalid managed composer preparation".into()))
+    }
+
+    /// Dispatch only a retained composer submission. Never resolves a replacement target or
+    /// substitutes a model operation after a native failure.
+    /// # Errors
+    /// Rejects non-submit requests, invalid ownership/correlation and application failures.
+    pub async fn submit_managed_composer_request(
+        &self,
+        retained: bcode_session_models::ExternalHarnessRequest,
+    ) -> Result<bcode_session_models::ExternalHarnessResponse, ClientError> {
+        let request = retained.request();
+        request
+            .validate()
+            .map_err(|_| ClientError::Protocol("Invalid retained managed submission".into()))?;
+        let HarnessRequestKind::Submit { target, submission } = &request.kind else {
+            return Err(ClientError::Protocol(
+                "Expected a managed composer submission".into(),
+            ));
+        };
+        let call = submission_call(request.instance.clone(), target.clone(), submission.clone())?;
+        if request.request_id != submission.submission_id {
+            return Err(ClientError::Protocol(
+                "Managed composer request identity changed".into(),
+            ));
+        }
+        let response = self
+            .managed_session_call(ManagedSessionOperation::Followup, call)
+            .await?;
+        bcode_session_models::ExternalHarnessResponse::from_response(&request, &response)
+            .map_err(|_| ClientError::Protocol("Invalid managed composer receipt".into()))
+    }
+
     /// Submit or steer through the managed application, retaining exact caller-selected identities.
     /// # Errors
     /// Rejects stale binding generations, invalid native-turn expectations, or daemon admission.
@@ -928,6 +1039,33 @@ mod tests {
             expected_native_turn_id: "unconfirmed-turn".into(),
         };
         assert!(submission_call(snapshot.instance, snapshot.target, steer).is_err());
+    }
+
+    #[tokio::test]
+    async fn captured_composer_request_rejects_changed_correlation_before_transport() {
+        use bcode_harness_models::{HarnessPlacement, HarnessSubmission};
+        let snapshot = prepared_snapshot();
+        let call = submission_call(
+            snapshot.instance,
+            snapshot.target,
+            HarnessSubmission {
+                submission_id: "submission".into(),
+                attempt_id: "attempt".into(),
+                session_id: snapshot.session_id.to_string(),
+                generation: 3,
+                text: "hello".into(),
+                placement: HarnessPlacement::NextTurn,
+            },
+        )
+        .unwrap();
+        let mut retained =
+            bcode_session_models::ExternalHarnessRequest::from_request(&call.harness).unwrap();
+        retained.request_id = "different-submission".into();
+        let client = BcodeClient::default_endpoint();
+        assert!(matches!(
+            client.submit_managed_composer_request(retained).await,
+            Err(ClientError::Protocol(_))
+        ));
     }
 
     #[tokio::test]

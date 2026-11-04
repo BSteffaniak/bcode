@@ -114,11 +114,15 @@ pub enum NativeMessage {
     User(Value),
     Result(Value),
     Stream(Value),
+    /// Native lifecycle/rate-limit metadata; neither a turn nor settlement proof.
+    Notice(Value),
 }
 /// A bounded stream item; callback IDs are valid only in this process generation.
 #[derive(Clone, Debug)]
 pub enum Event {
     Message(NativeMessage),
+    /// Native consumed-prompt evidence; never a native turn ID or settlement proof.
+    Attribution(crate::SubmissionAttribution),
     Callback {
         request_id: String,
         request: CallbackRequest,
@@ -135,8 +139,10 @@ pub struct Lifecycle {
     result: bool,
     submitted: bool,
     tasks: BTreeSet<String>,
+    background_snapshot: BTreeSet<String>,
     max_tasks: usize,
     uncertain: bool,
+    queued_user_sends: Option<u64>,
 }
 impl Lifecycle {
     pub(crate) const fn new(support: SettlementSupport, max_tasks: usize) -> Self {
@@ -146,8 +152,10 @@ impl Lifecycle {
             result: false,
             submitted: false,
             tasks: BTreeSet::new(),
+            background_snapshot: BTreeSet::new(),
             max_tasks,
             uncertain: false,
+            queued_user_sends: None,
         }
     }
     pub(crate) fn can_submit(&self) -> bool {
@@ -173,9 +181,72 @@ impl Lifecycle {
         }
         match self.state {
             Some(SessionState::RequiresAction) => Settlement::RequiresAction,
-            Some(SessionState::Idle) if self.result && self.tasks.is_empty() => Settlement::Settled,
+            Some(SessionState::Idle)
+                if self.result
+                    && self.tasks.is_empty()
+                    && self.background_snapshot.is_empty()
+                    && self.queued_user_sends.is_none_or(|count| count == 0) =>
+            {
+                Settlement::Settled
+            }
             _ => Settlement::Running,
         }
+    }
+    fn observe_background_tool_intent(&mut self, value: &Value, kind: &str) -> Result<(), Error> {
+        if kind == "assistant"
+            && value.get("parent_tool_use_id").is_none_or(Value::is_null)
+            && let Some(blocks) = value.pointer("/message/content").and_then(Value::as_array)
+        {
+            for block in blocks {
+                if block.get("type").and_then(Value::as_str) == Some("tool_use")
+                    && block.get("name").and_then(Value::as_str) == Some("Bash")
+                    && let Some(background) = block.pointer("/input/run_in_background")
+                    && background.as_bool().ok_or(Error::Protocol)?
+                {
+                    // Native 2.1.308 can report result + idle before this shell
+                    // finishes, followed by an uncorrelated notification turn.
+                    // Fence before task_started (which may itself be missing).
+                    self.support = SettlementSupport::Unknown;
+                }
+            }
+        }
+        Ok(())
+    }
+    fn observe_background_snapshot(&mut self, value: &Value) -> Result<(), Error> {
+        let entries = value
+            .get("tasks")
+            .and_then(Value::as_array)
+            .ok_or(Error::Protocol)?;
+        if entries.len() > self.max_tasks {
+            return Err(Error::Capacity);
+        }
+        let mut snapshot = BTreeSet::new();
+        let mut unknown = false;
+        for entry in entries {
+            let id = entry
+                .get("task_id")
+                .and_then(Value::as_str)
+                .ok_or(Error::Protocol)?;
+            crate::launch::validate_id(id)?;
+            if !snapshot.insert(id.to_owned()) {
+                return Err(Error::Protocol);
+            }
+            let task_type = entry
+                .get("task_type")
+                .and_then(Value::as_str)
+                .ok_or(Error::Protocol)?;
+            unknown |= !matches!(task_type, "local_agent" | "local_workflow");
+        }
+        if unknown {
+            self.support = SettlementSupport::Unknown;
+        }
+        // Replace only the background snapshot, never independently observed tasks.
+        // Completion/removal can owe a follow-up: require a fresh authoritative idle.
+        if snapshot != self.background_snapshot {
+            self.state = Some(SessionState::Running);
+        }
+        self.background_snapshot = snapshot;
+        Ok(())
     }
     pub(crate) fn observe(&mut self, value: &Value) -> Result<(), Error> {
         let kind = value
@@ -187,9 +258,25 @@ impl Lifecycle {
         {
             self.submit();
         }
+        self.observe_background_tool_intent(value, kind)?;
+        if kind == "user"
+            && value.get("parent_tool_use_id").is_none_or(Value::is_null)
+            && let Some(id) = value
+                .pointer("/tool_use_result/backgroundTaskId")
+                .or_else(|| value.pointer("/tool_use_result/background_task_id"))
+        {
+            crate::launch::validate_id(id.as_str().ok_or(Error::Protocol)?)?;
+            // Corroborates a background shell even if stream/tool-start evidence
+            // was unavailable. It does not prove notification-turn settlement.
+            self.support = SettlementSupport::Unknown;
+        }
         if kind == "result" {
             // Preserve current-activity idle: supported hosts can emit it just before result.
             self.result = true;
+            self.queued_user_sends = value
+                .get("queued_turn_count")
+                .map(|count| count.as_u64().ok_or(Error::Protocol))
+                .transpose()?;
         }
         if kind != "system" {
             return Ok(());
@@ -199,6 +286,7 @@ impl Lifecycle {
                 let state = value.get("state").ok_or(Error::Protocol)?.clone();
                 self.state = Some(serde_json::from_value(state).map_err(|_| Error::Protocol)?);
             }
+            Some("background_tasks_changed") => self.observe_background_snapshot(value)?,
             Some("task_started") => {
                 if !matches!(
                     value.get("task_type").and_then(Value::as_str),
@@ -247,6 +335,124 @@ impl Lifecycle {
 mod tests {
     use super::{Lifecycle, Settlement, SettlementSupport};
     use serde_json::json;
+
+    #[test]
+    fn snapshots_block_idle_and_replacement_requires_fresh_idle() {
+        let mut lifecycle = Lifecycle::new(SettlementSupport::VerifiedSessionState, 2);
+        lifecycle.submit();
+        lifecycle
+            .observe(
+                &json!({"type":"system","subtype":"background_tasks_changed",
+            "tasks":[{"task_id":"agent-1","task_type":"local_agent"}]}),
+            )
+            .unwrap();
+        lifecycle.observe(&json!({"type":"result"})).unwrap();
+        lifecycle
+            .observe(&json!({"type":"system","subtype":"session_state_changed","state":"idle"}))
+            .unwrap();
+        assert_ne!(lifecycle.snapshot(), Settlement::Settled);
+        lifecycle
+            .observe(&json!({"type":"system","subtype":"background_tasks_changed","tasks":[]}))
+            .unwrap();
+        assert_ne!(lifecycle.snapshot(), Settlement::Settled);
+        lifecycle
+            .observe(&json!({"type":"system","subtype":"session_state_changed","state":"idle"}))
+            .unwrap();
+        assert_eq!(lifecycle.snapshot(), Settlement::Settled);
+    }
+
+    #[test]
+    fn malformed_snapshots_and_background_shell_result_fail_closed() {
+        let mut lifecycle = Lifecycle::new(SettlementSupport::VerifiedSessionState, 1);
+        for tasks in [
+            json!(null),
+            json!([{}]),
+            json!([{"task_id":"x"}]),
+            json!([{"task_id":"x","task_type":"local_agent"},{"task_id":"y","task_type":"local_agent"}]),
+        ] {
+            assert!(
+                lifecycle
+                    .observe(
+                        &json!({"type":"system","subtype":"background_tasks_changed","tasks":tasks})
+                    )
+                    .is_err()
+            );
+        }
+        let mut duplicates = Lifecycle::new(SettlementSupport::VerifiedSessionState, 2);
+        assert!(duplicates.observe(&json!({"type":"system","subtype":"background_tasks_changed",
+            "tasks":[{"task_id":"x","task_type":"local_agent"},{"task_id":"x","task_type":"local_agent"}]})).is_err());
+        lifecycle
+            .observe(&json!({"type":"user","tool_use_result":{"backgroundTaskId":"shell-1"}}))
+            .unwrap();
+        lifecycle.observe(&json!({"type":"result"})).unwrap();
+        lifecycle
+            .observe(&json!({"type":"system","subtype":"session_state_changed","state":"idle"}))
+            .unwrap();
+        assert_eq!(lifecycle.snapshot(), Settlement::Unsupported);
+    }
+
+    #[test]
+    fn empty_snapshot_never_erases_an_independently_started_task() {
+        let mut lifecycle = Lifecycle::new(SettlementSupport::VerifiedSessionState, 2);
+        lifecycle.submit();
+        lifecycle.observe(&json!({"type":"system","subtype":"task_started","task_id":"foreground","task_type":"local_agent"})).unwrap();
+        lifecycle
+            .observe(&json!({"type":"system","subtype":"background_tasks_changed","tasks":[]}))
+            .unwrap();
+        lifecycle.observe(&json!({"type":"result"})).unwrap();
+        lifecycle
+            .observe(&json!({"type":"system","subtype":"session_state_changed","state":"idle"}))
+            .unwrap();
+        assert_ne!(lifecycle.snapshot(), Settlement::Settled);
+    }
+
+    #[test]
+    fn background_tool_intent_fences_idle_even_without_task_started() {
+        let mut lifecycle = Lifecycle::new(SettlementSupport::VerifiedSessionState, 2);
+        lifecycle.submit();
+        lifecycle
+            .observe(&json!({"type":"assistant","message":{"content":[{
+                "type":"tool_use","id":"tool-1","name":"Bash",
+                "input":{"command":"sleep 3","run_in_background":true}
+            }]}}))
+            .unwrap();
+        lifecycle
+            .observe(&json!({"type":"result","queued_turn_count":0}))
+            .unwrap();
+        lifecycle
+            .observe(&json!({"type":"system","subtype":"session_state_changed","state":"idle"}))
+            .unwrap();
+        assert_eq!(lifecycle.snapshot(), Settlement::Unsupported);
+    }
+
+    #[test]
+    fn queued_sends_block_settlement_and_background_bash_idle_is_not_completion() {
+        let mut lifecycle = Lifecycle::new(SettlementSupport::VerifiedSessionState, 2);
+        lifecycle.submit();
+        lifecycle
+            .observe(&json!({"type":"result","queued_turn_count":1}))
+            .unwrap();
+        lifecycle
+            .observe(&json!({"type":"system","subtype":"session_state_changed","state":"idle"}))
+            .unwrap();
+        assert_ne!(lifecycle.snapshot(), Settlement::Settled);
+        assert!(
+            lifecycle
+                .observe(&json!({"type":"result","queued_turn_count":-1}))
+                .is_err()
+        );
+
+        let mut background = Lifecycle::new(SettlementSupport::VerifiedSessionState, 2);
+        background.submit();
+        background.observe(&json!({"type":"system","subtype":"task_started","task_id":"bash-1","task_type":"local_bash"})).unwrap();
+        background
+            .observe(&json!({"type":"result","queued_turn_count":0}))
+            .unwrap();
+        background
+            .observe(&json!({"type":"system","subtype":"session_state_changed","state":"idle"}))
+            .unwrap();
+        assert_eq!(background.snapshot(), Settlement::Unsupported);
+    }
 
     #[test]
     fn idle_and_result_in_either_order_settle_only_current_activity() {

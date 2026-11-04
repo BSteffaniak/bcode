@@ -83,6 +83,7 @@ mod tests {
         calls: Vec<&'static str>,
         interrupt_projectors: bool,
         stale_evidence: bool,
+        harness_coverage: Option<ProjectionValidation>,
     }
 
     #[async_trait]
@@ -131,18 +132,20 @@ mod tests {
 
         async fn validate_strict_current(&mut self) -> Result<StrictValidation, Self::Error> {
             self.calls.push("validate");
+            let mut projections = vec![ProjectionValidation {
+                projection: "turn_evidence".to_owned(),
+                actual_schema_version: Some(1),
+                expected_schema_version: 1,
+                checkpoint: if self.stale_evidence {
+                    Some(6)
+                } else {
+                    Some(7)
+                },
+            }];
+            projections.extend(self.harness_coverage.clone());
             Ok(StrictValidation {
                 canonical_tail: Some(7),
-                projections: vec![ProjectionValidation {
-                    projection: "turn_evidence".to_owned(),
-                    actual_schema_version: Some(1),
-                    expected_schema_version: 1,
-                    checkpoint: if self.stale_evidence {
-                        Some(6)
-                    } else {
-                        Some(7)
-                    },
-                }],
+                projections,
                 model_context_schema_version: Some(2),
                 expected_model_context_schema_version: 2,
                 model_context_checkpoint: Some(7),
@@ -194,6 +197,46 @@ mod tests {
             ))
         ));
         assert_eq!(target.calls, ["finalize_projectors", "validate"]);
+    }
+
+    #[tokio::test]
+    async fn harness_v2_coverage_must_be_exact_before_writer_advances() {
+        for (actual_schema_version, checkpoint) in [
+            (None, None),
+            (Some(1), Some(7)),
+            (Some(3), Some(7)),
+            (Some(2), Some(6)),
+            (Some(2), Some(8)),
+        ] {
+            let mut target = RecordingTarget {
+                harness_coverage: Some(ProjectionValidation {
+                    projection: "managed_harness_terminal_evidence".to_owned(),
+                    actual_schema_version,
+                    expected_schema_version: 2,
+                    checkpoint,
+                }),
+                ..RecordingTarget::default()
+            };
+            assert!(
+                finalize_validated_target(&mut target, Some(7))
+                    .await
+                    .is_err()
+            );
+            assert_eq!(target.calls, ["finalize_projectors", "validate"]);
+        }
+        let mut target = RecordingTarget {
+            harness_coverage: Some(ProjectionValidation {
+                projection: "managed_harness_terminal_evidence".to_owned(),
+                actual_schema_version: Some(2),
+                expected_schema_version: 2,
+                checkpoint: Some(7),
+            }),
+            ..RecordingTarget::default()
+        };
+        finalize_validated_target(&mut target, Some(7))
+            .await
+            .unwrap();
+        assert_eq!(target.calls, ["finalize_projectors", "validate", "writer"]);
     }
 
     #[tokio::test]

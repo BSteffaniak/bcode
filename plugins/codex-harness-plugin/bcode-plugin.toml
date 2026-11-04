@@ -5,7 +5,7 @@ version = "0.0.1"
 [[services]]
 class        = "service"
 description  = "Native Codex app-server managed session backend"
-interface_id = "bcode.harness/v1"
+interface_id = "bcode.harness/v2"
 name         = "Codex managed sessions"
 
 [concurrency]

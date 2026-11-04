@@ -66,6 +66,14 @@ async function fixture({ fetch, recoveryState = {}, timeout = 1000, fault, signa
     async present() { this.check(); this.active = true; await tick(); this.active = false; calls.push('present'); return fault !== 'uncommitted'; }
     retry_submission() { this.check(); return this.pending; }
     prepare_submission(identity) { this.check(); this.pending = JSON.stringify({ session_id: SESSION, submission_id: identity, text: this.draft, placement: 'steering' }); return this.pending; }
+    submission_needs_preparation() { this.check(); return capabilities.managedPreparation === true && !JSON.parse(this.pending).prepared; }
+    accept_submission_preparation(json) {
+      this.check(); const response = JSON.parse(json);
+      if (response.outcome?.type !== 'submission_prepared') throw new Error('invalid preparation');
+      const pending = JSON.parse(this.pending);
+      pending.managed = response.outcome.managed; pending.prepared = true;
+      this.pending = JSON.stringify(pending); calls.push('native-prepared');
+    }
     settle_submission(json) {
       this.check(); const receipt = JSON.parse(json);
       if (receipt.submission_id !== JSON.parse(this.pending).submission_id) throw new Error('unmatched receipt');
@@ -236,6 +244,30 @@ test('epoch remount preserves draft and unresolved submission with a fresh obser
   const remounted = await next.mounting;
   assert.equal(next.instances[0].draft, 'newer draft'); assert.equal(next.instances[0].pending, exact);
   await remounted.dispose();
+});
+
+test('managed preparation is retained before dispatch and ambiguous retry never prepares a new target', async () => {
+  let prepares = 0, sends = 0;
+  const nativeBodies = [];
+  const f = await fixture({ capabilities: { managedPreparation: true }, fetch: async (url, options) => {
+    if (!options.body) return jsonResponse({ epoch: 'first' });
+    if (url.pathname.endsWith('/prepare-submission')) {
+      prepares++;
+      return jsonResponse({ schema_version: 1, outcome: { type: 'submission_prepared', managed: { captured: 'generation-3-attempt-1' } } });
+    }
+    sends++; nativeBodies.push(options.body);
+    return jsonResponse({ schema_version: 1, error: 'submission_outcome_unknown' });
+  } });
+  const host = await f.mounting;
+  f.callbacks.onInput({ text: 'native input', submit: true });
+  await host.refresh();
+  assert.equal(prepares, 1); assert.equal(sends, 1);
+  assert.equal(JSON.parse(f.instances[0].pending).managed.captured, 'generation-3-attempt-1');
+  assert.ok(f.recoveryState.value.includes('generation-3-attempt-1'));
+  await host.retrySubmission().catch(() => {});
+  assert.equal(prepares, 1); assert.equal(sends, 2);
+  assert.equal(nativeBodies[0], nativeBodies[1]);
+  await host.dispose();
 });
 
 test('deadlines release stalled fetches and visible errors retain pending submission', async () => {

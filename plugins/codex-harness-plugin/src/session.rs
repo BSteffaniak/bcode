@@ -5,16 +5,20 @@ use bcode_harness_models::{
     HarnessConnectivity, HarnessContinuation, HarnessDeliveryState, HarnessExecutionStatus,
     HarnessInteraction, HarnessInteractionKind, HarnessObservation, HarnessObservationKind,
     HarnessPlacement, HarnessReceipt, HarnessResponse, HarnessResponseValue, HarnessSessionBinding,
-    HarnessSubmission, MAX_HARNESS_ID_BYTES, MAX_HARNESS_OBSERVATIONS, MAX_HARNESS_TEXT_BYTES,
+    HarnessSubmission, HarnessTerminalDisposition, MAX_HARNESS_ID_BYTES, MAX_HARNESS_OBSERVATIONS,
+    MAX_HARNESS_TEXT_BYTES,
 };
 use serde_json::{Value, json};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
 struct Callback {
     native_id: Value,
     interaction: HarnessInteraction,
     method: String,
     question_ids: Vec<String>,
+    remaining_questions: VecDeque<Value>,
+    answers: BTreeMap<String, Value>,
+    pending_question: bool,
     turn_id: String,
 }
 
@@ -27,12 +31,13 @@ pub struct CodexSession {
     observation_epoch: uuid::Uuid,
     uncertain_submission: bool,
     active_turn: Option<String>,
+    accepted_turn: Option<String>,
     last_submission: Option<(HarnessSubmission, HarnessReceipt)>,
     file_changes: BTreeMap<String, String>,
     observation_gap: bool,
     status: HarnessExecutionStatus,
     assistance_grant: Option<HarnessAssistanceGrant>,
-    pending_settlement: Option<HarnessObservation>,
+    pending_terminal: Option<HarnessObservation>,
     pending_acceptance: Option<HarnessObservation>,
     last_terminal_turn: Option<String>,
     fresh_first_input: bool,
@@ -81,10 +86,42 @@ impl CodexSession {
     /// Rejects grants not correlated with this exact session and generation.
     pub fn open_admitted(
         launch: &Launch,
+        binding: HarnessSessionBinding,
+        resume: bool,
+        key: Option<&str>,
+        assistance_grant: Option<&HarnessAssistanceGrant>,
+    ) -> Result<Self, CodexError> {
+        Self::open_configured(launch, binding, resume, key, assistance_grant, false)
+    }
+
+    /// Open a fresh, ephemeral ChatGPT-subscription thread with restricted native execution.
+    ///
+    /// Uses the existing credential namespace without login or account mutation. The thread
+    /// has a read-only sandbox, no environments, dynamic tools or selected capability roots,
+    /// and no approval escalation. Shell, web, hooks, plugins and delegation are disabled.
+    /// Native model-catalog utility tools are not a general-purpose tool allowlist.
+    /// Callers must isolate process state (including `CODEX_SQLITE_HOME`) before launch.
+    ///
+    /// # Errors
+    /// Rejects non-ChatGPT readiness, custom providers, configured MCP servers, unsupported
+    /// native restrictions, malformed binding or transport failure. Never falls back to keys.
+    pub fn open_ephemeral(
+        launch: &Launch,
+        binding: HarnessSessionBinding,
+    ) -> Result<Self, CodexError> {
+        if launch.ephemeral_credentials {
+            return Err(CodexError::Configuration);
+        }
+        Self::open_configured(launch, binding, false, None, None, true)
+    }
+
+    fn open_configured(
+        launch: &Launch,
         mut binding: HarnessSessionBinding,
         resume: bool,
         key: Option<&str>,
         assistance_grant: Option<&HarnessAssistanceGrant>,
+        ephemeral: bool,
     ) -> Result<Self, CodexError> {
         if let Some(grant) = assistance_grant {
             grant.validate().map_err(|_| CodexError::Stale)?;
@@ -115,6 +152,8 @@ impl CodexSession {
                 "thread/resume",
                 json!({"threadId":binding.native_session_id,"excludeTurns":true}),
             )?
+        } else if ephemeral {
+            Self::start_ephemeral(&mut server, launch)?
         } else {
             server.call("thread/start", json!({"cwd":launch.working_directory,"approvalPolicy":"untrusted","daybreakEnabled":false,
                 "dynamicTools":if assistance_grant.is_some() { json!([{"type":"function","name":"bcode_parent_assistance",
@@ -123,7 +162,7 @@ impl CodexSession {
         };
         if !resume
             && (result["thread"]["status"]["type"].as_str() != Some("idle")
-                || result["thread"]["daybreakEnabled"].as_bool() != Some(false)
+                || (!ephemeral && result["thread"]["daybreakEnabled"].as_bool() != Some(false))
                 || !result["thread"]["turns"]
                     .as_array()
                     .is_some_and(Vec::is_empty))
@@ -131,6 +170,34 @@ impl CodexSession {
             server.fence();
             return Err(CodexError::Protocol);
         }
+        Self::confirm_native_binding(&server, &mut binding, &result, resume)?;
+        Ok(Self {
+            server,
+            binding,
+            callbacks: BTreeMap::new(),
+            sequence: 0,
+            observation_epoch: uuid::Uuid::new_v4(),
+            uncertain_submission: false,
+            active_turn: None,
+            accepted_turn: None,
+            last_submission: None,
+            file_changes: BTreeMap::new(),
+            observation_gap: false,
+            status: unknown_status(),
+            assistance_grant: assistance_grant.cloned(),
+            pending_terminal: None,
+            pending_acceptance: None,
+            last_terminal_turn: None,
+            fresh_first_input: !resume,
+        })
+    }
+
+    fn confirm_native_binding(
+        server: &AppServer,
+        binding: &mut HarnessSessionBinding,
+        result: &Value,
+        resume: bool,
+    ) -> Result<(), CodexError> {
         let (gap, closed) = server.health()?;
         if gap || closed {
             return Err(CodexError::Uncertain);
@@ -145,25 +212,7 @@ impl CodexSession {
         if !resume {
             server.arm_first_input(&binding.native_session_id)?;
         }
-        binding.validate().map_err(|_| CodexError::Protocol)?;
-        Ok(Self {
-            server,
-            binding,
-            callbacks: BTreeMap::new(),
-            sequence: 0,
-            observation_epoch: uuid::Uuid::new_v4(),
-            uncertain_submission: false,
-            active_turn: None,
-            last_submission: None,
-            file_changes: BTreeMap::new(),
-            observation_gap: false,
-            status: unknown_status(),
-            assistance_grant: assistance_grant.cloned(),
-            pending_settlement: None,
-            pending_acceptance: None,
-            last_terminal_turn: None,
-            fresh_first_input: !resume,
-        })
+        binding.validate().map_err(|_| CodexError::Protocol)
     }
 
     fn deliver_vault_key(
@@ -190,6 +239,81 @@ impl CodexSession {
                 return Err(CodexError::Configuration);
             }
             server.call("account/login/start", json!({"type":"apiKey","apiKey":key}))?;
+        }
+        Ok(())
+    }
+
+    fn start_ephemeral(server: &mut AppServer, launch: &Launch) -> Result<Value, CodexError> {
+        Self::verify_subscription(server, launch)?;
+        let result = server.call(
+            "thread/start",
+            json!({
+                "cwd":launch.working_directory,
+                "modelProvider":"openai",
+                "approvalPolicy":"never",
+                "sandbox":"read-only",
+                "ephemeral":true,
+                "environments":[],
+                "dynamicTools":[],
+                "selectedCapabilityRoots":[],
+                "config":{
+                    "features.multi_agent":false,
+                    "features.shell_tool":false,
+                    "features.hooks":false,
+                    "features.codex_hooks":false,
+                    "features.plugin_hooks":false,
+                    "features.plugins":false,
+                    "features.enable_mcp_apps":false,
+                    "features.skill_mcp_dependency_install":false,
+                    "features.request_permissions_tool":false,
+                    "features.tool_suggest":false,
+                    "web_search":"disabled",
+                    "tools.update_plan.enabled":false,
+                    "tools.experimental_request_user_input.enabled":false,
+                    "log_dir":launch.working_directory,
+                    "sqlite_home":launch.working_directory
+                }
+            }),
+        )?;
+        if result["thread"]["ephemeral"].as_bool() != Some(true)
+            || result["modelProvider"].as_str() != Some("openai")
+            || result["approvalPolicy"].as_str() != Some("never")
+            || result["sandbox"]["type"].as_str() != Some("readOnly")
+        {
+            server.fence();
+            return Err(CodexError::Unsupported);
+        }
+        Ok(result)
+    }
+
+    fn verify_subscription(server: &mut AppServer, launch: &Launch) -> Result<(), CodexError> {
+        let mut account = server.call("account/read", json!({"refreshToken":false}))?;
+        let chatgpt = account["account"]["type"].as_str() == Some("chatgpt");
+        crate::transport::wipe_value(&mut account);
+        if !chatgpt {
+            return Err(CodexError::Configuration);
+        }
+        let mut config = server.call(
+            "config/read",
+            json!({"includeLayers":false,"cwd":launch.working_directory}),
+        )?;
+        let provider = config["config"]["model_provider"]
+            .as_str()
+            .or_else(|| config["config"]["modelProvider"].as_str());
+        let builtin = provider.is_none_or(|provider| provider == "openai")
+            && config["config"]["model_providers"]["openai"].is_null()
+            && config["config"]["modelProviders"]["openai"].is_null()
+            && config["config"]["openai_base_url"].is_null()
+            && config["config"]["chatgpt_base_url"]
+                .as_str()
+                .is_none_or(|url| url == "https://chatgpt.com/backend-api/");
+        let no_mcp = ["mcp_servers", "mcpServers"].iter().all(|key| {
+            let value = &config["config"][*key];
+            value.is_null() || value.as_object().is_some_and(serde_json::Map::is_empty)
+        });
+        crate::transport::wipe_value(&mut config);
+        if !builtin || !no_mcp {
+            return Err(CodexError::Configuration);
         }
         Ok(())
     }
@@ -349,6 +473,7 @@ impl CodexSession {
                 self.server.fence();
                 return Err(CodexError::Protocol);
             }
+            self.accepted_turn = Some(turn_id.clone());
             self.active_turn = Some(turn_id);
             self.pending_acceptance = Some(acceptance);
         }
@@ -362,7 +487,9 @@ impl CodexSession {
         })
     }
 
-    /// Interrupt exactly the named native turn; acknowledgment is not settlement.
+    /// Request interruption of the retained named native turn; acknowledgment is not settlement.
+    /// Native checks precede a generic interrupt operation, so this is not an atomic
+    /// expected-turn fence across a concurrent native turn transition.
     ///
     /// # Errors
     /// Rejects stale generations, empty turns, or native/transport failure.
@@ -372,6 +499,13 @@ impl CodexSession {
             .map_err(|_| CodexError::Stale)?;
         if turn_id.is_empty() || turn_id.len() > MAX_HARNESS_ID_BYTES {
             return Err(CodexError::Bounds);
+        }
+        if self.active_turn.as_deref() != Some(turn_id) {
+            return Err(CodexError::Stale);
+        }
+        let (gap, closed) = self.server.health()?;
+        if self.observation_gap || gap || closed {
+            return Err(CodexError::Uncertain);
         }
         self.server.call(
             "turn/interrupt",
@@ -411,7 +545,7 @@ impl CodexSession {
         Ok(self.status.clone())
     }
 
-    /// Bounded native turn evidence. Native settlement never claims assignment acceptance.
+    /// Bounded native turn evidence. Terminal outcome does not prove background quiescence.
     ///
     /// # Errors
     /// Returns malformed protocol, callback overflow, or invalid normalized observations.
@@ -427,13 +561,13 @@ impl CodexSession {
             // subsequently lost. Deliver it before any started/completed/settlement event.
             return Ok((vec![acceptance], HarnessCompleteness::Partial));
         }
-        if self.pending_settlement.is_some() {
+        if self.pending_terminal.is_some() {
             let (gap, closed) = self.server.health()?;
             if gap || closed {
-                self.pending_settlement = None;
+                self.pending_terminal = None;
                 self.observation_gap = true;
-            } else if let Some(settlement) = self.pending_settlement.take() {
-                return Ok((vec![settlement], HarnessCompleteness::Partial));
+            } else if let Some(terminal) = self.pending_terminal.take() {
+                return Ok((vec![terminal], HarnessCompleteness::Partial));
             }
         }
         let (events, gap, closed) = self.server.events((limit / 2).max(1))?;
@@ -447,21 +581,14 @@ impl CodexSession {
         }
         let mut observations = Vec::new();
         for event in events {
-            let settle_turn = if !self.observation_gap
+            let terminal_turn = if !self.observation_gap
+                && !self.uncertain_submission
                 && event["method"] == "turn/completed"
-                && event["params"]["turn"]["status"] == "completed"
-                && event["params"]["turn"]["error"].is_null()
-                && !event["params"]["turn"]["items"]
-                    .as_array()
-                    .is_some_and(|items| {
-                        items
-                            .iter()
-                            .any(|item| item["type"] == "collabAgentToolCall")
-                    })
                 && event["params"]["threadId"].as_str()
                     == Some(self.binding.native_session_id.as_str())
+                && self.active_turn.is_some()
                 && event["params"]["turn"]["id"].as_str() == self.active_turn.as_deref()
-                && self.callbacks.is_empty()
+                && event["params"]["turn"]["id"].as_str() == self.accepted_turn.as_deref()
             {
                 event["params"]["turn"]["id"].as_str().map(str::to_owned)
             } else {
@@ -477,28 +604,42 @@ impl CodexSession {
                     return Err(error);
                 }
             }
-            if let Some(turn_id) = settle_turn {
-                self.sequence = self.sequence.checked_add(1).ok_or(CodexError::Bounds)?;
-                let settlement = HarnessObservation {
-                    observation_id: format!(
-                        "codex:{}:{}:{}",
-                        self.binding.generation, self.observation_epoch, self.sequence
-                    ),
-                    session_id: self.binding.session_id.clone(),
-                    generation: self.binding.generation,
-                    native_correlations: vec![turn_id.clone()],
-                    completeness: HarnessCompleteness::Complete,
-                    kind: HarnessObservationKind::Settlement {
-                        native_turn_id: turn_id,
-                    },
-                };
-                settlement.validate().map_err(|_| CodexError::Protocol)?;
+            if let Some(turn_id) = terminal_turn {
+                let terminal = self.terminal_observation(&event, turn_id)?;
                 if observations.len() < limit {
-                    observations.push(settlement);
+                    observations.push(terminal);
                 } else {
-                    self.pending_settlement = Some(settlement);
+                    self.pending_terminal = Some(terminal);
                 }
+                // Native task completion records live background-terminal counts;
+                // it does not close those processes. Neither completed, interrupted
+                // nor failed proves quiescence. Do not synthesize Settlement here.
             }
+        }
+        if observations.is_empty()
+            && !self.observation_gap
+            && let Some(callback) = self
+                .callbacks
+                .values_mut()
+                .find(|callback| callback.pending_question)
+        {
+            callback.pending_question = false;
+            self.sequence = self.sequence.checked_add(1).ok_or(CodexError::Bounds)?;
+            let observation = HarnessObservation {
+                observation_id: format!(
+                    "codex:{}:{}:{}",
+                    self.binding.generation, self.observation_epoch, self.sequence
+                ),
+                session_id: self.binding.session_id.clone(),
+                generation: self.binding.generation,
+                native_correlations: vec![callback.turn_id.clone()],
+                completeness: HarnessCompleteness::Complete,
+                kind: HarnessObservationKind::Interaction {
+                    interaction: callback.interaction.clone(),
+                },
+            };
+            observation.validate().map_err(|_| CodexError::Protocol)?;
+            observations.push(observation);
         }
         let completeness = if gap || self.observation_gap {
             HarnessCompleteness::Gap
@@ -509,6 +650,38 @@ impl CodexSession {
         };
         self.status.completeness = completeness;
         Ok((observations, completeness))
+    }
+
+    fn terminal_observation(
+        &mut self,
+        event: &Value,
+        turn_id: String,
+    ) -> Result<HarnessObservation, CodexError> {
+        let disposition = match event["params"]["turn"]["status"].as_str() {
+            Some("completed") if event["params"]["turn"]["error"].is_null() => {
+                HarnessTerminalDisposition::Completed
+            }
+            Some("interrupted") => HarnessTerminalDisposition::Interrupted,
+            Some("failed") => HarnessTerminalDisposition::Failed,
+            _ => return Err(CodexError::Protocol),
+        };
+        self.sequence = self.sequence.checked_add(1).ok_or(CodexError::Bounds)?;
+        let terminal = HarnessObservation {
+            observation_id: format!(
+                "codex:{}:{}:{}",
+                self.binding.generation, self.observation_epoch, self.sequence
+            ),
+            session_id: self.binding.session_id.clone(),
+            generation: self.binding.generation,
+            native_correlations: vec![turn_id.clone()],
+            completeness: HarnessCompleteness::Complete,
+            kind: HarnessObservationKind::NativeTurnTerminal {
+                native_turn_id: turn_id,
+                disposition,
+            },
+        };
+        terminal.validate().map_err(|_| CodexError::Protocol)?;
+        Ok(terminal)
     }
 
     /// Last normalized native execution evidence; not proof of assignment completion.
@@ -534,6 +707,26 @@ impl CodexSession {
         {
             return Ok(None);
         }
+        if method == "serverRequest/resolved" {
+            if params["threadId"].as_str() != Some(self.binding.native_session_id.as_str()) {
+                return Ok(None);
+            }
+            let native_id = params.get("requestId").ok_or(CodexError::Protocol)?;
+            if !native_id.is_string() && !native_id.is_i64() {
+                return Err(CodexError::Protocol);
+            }
+            self.callbacks
+                .retain(|_, callback| callback.native_id != *native_id);
+            if self.callbacks.is_empty() {
+                self.status.attention = HarnessAttention::None;
+            }
+            return Ok(None);
+        }
+        if matches!(method, "turn/started" | "turn/completed")
+            && params["threadId"].as_str() != Some(self.binding.native_session_id.as_str())
+        {
+            return Ok(None);
+        }
         self.retain_file_change_diff(method, params)?;
         if method == "thread/started" {
             if params["thread"]["id"].as_str() != Some(self.binding.native_session_id.as_str()) {
@@ -541,31 +734,8 @@ impl CodexSession {
             }
             self.status.connectivity = HarnessConnectivity::Connected;
         }
-        if method == "turn/started" {
-            if self.fresh_first_input {
-                self.fresh_first_input = false;
-                self.uncertain_submission = true;
-                self.server.fence();
-                return Err(CodexError::Uncertain);
-            }
-            let turn_id = params["turn"]["id"].as_str().ok_or(CodexError::Protocol)?;
-            if self.last_terminal_turn.as_deref() == Some(turn_id) {
-                return Ok(None);
-            }
-            if turn_id.is_empty() || turn_id.len() > MAX_HARNESS_ID_BYTES {
-                return Err(CodexError::Protocol);
-            }
-            self.active_turn = Some(turn_id.to_owned());
-        } else if method == "turn/completed" {
-            if params["turn"]["id"].as_str() != self.active_turn.as_deref() {
-                return Ok(None);
-            }
-            self.last_terminal_turn = self.active_turn.take();
-            if let Some(turn_id) = params["turn"]["id"].as_str() {
-                self.callbacks
-                    .retain(|_, callback| callback.turn_id != turn_id);
-                self.file_changes.clear();
-            }
+        if !self.update_native_turn(method, params)? {
+            return Ok(None);
         }
         if !params["threadId"].is_string() && method != "thread/started" {
             return Ok(None);
@@ -592,7 +762,9 @@ impl CodexSession {
             params["turnId"]
                 .as_str()
                 .or_else(|| params["turn"]["id"].as_str()),
-            params["itemId"].as_str(),
+            params["itemId"]
+                .as_str()
+                .or_else(|| params["item"]["id"].as_str()),
             params["callId"].as_str(),
         ]
         .into_iter()
@@ -600,16 +772,52 @@ impl CodexSession {
         {
             native_correlations.push(value.to_owned());
         }
+        let completeness = if matches!(kind, HarnessObservationKind::Result { .. }) {
+            HarnessCompleteness::Complete
+        } else {
+            HarnessCompleteness::Partial
+        };
         let observation = HarnessObservation {
             observation_id,
             session_id: self.binding.session_id.clone(),
             generation: self.binding.generation,
             native_correlations,
             kind,
-            completeness: HarnessCompleteness::Partial,
+            completeness,
         };
         observation.validate().map_err(|_| CodexError::Bounds)?;
         Ok(Some(observation))
+    }
+
+    // False skips stale turn evidence; errors retain the same pre-normalization fence.
+    fn update_native_turn(&mut self, method: &str, params: &Value) -> Result<bool, CodexError> {
+        if method == "turn/started" {
+            if self.fresh_first_input {
+                self.fresh_first_input = false;
+                self.uncertain_submission = true;
+                self.server.fence();
+                return Err(CodexError::Uncertain);
+            }
+            let turn_id = params["turn"]["id"].as_str().ok_or(CodexError::Protocol)?;
+            if self.last_terminal_turn.as_deref() == Some(turn_id) {
+                return Ok(false);
+            }
+            if turn_id.is_empty() || turn_id.len() > MAX_HARNESS_ID_BYTES {
+                return Err(CodexError::Protocol);
+            }
+            self.active_turn = Some(turn_id.to_owned());
+        } else if method == "turn/completed" {
+            if params["turn"]["id"].as_str() != self.active_turn.as_deref() {
+                return Ok(false);
+            }
+            self.last_terminal_turn = self.active_turn.take();
+            if let Some(turn_id) = params["turn"]["id"].as_str() {
+                self.callbacks
+                    .retain(|_, callback| callback.turn_id != turn_id);
+                self.file_changes.clear();
+            }
+        }
+        Ok(true)
     }
 
     /// Retain only bounded native diffs for later exact-item approval; absence never grants approval.
@@ -645,12 +853,41 @@ impl CodexSession {
         if self.callbacks.len() >= 32 {
             return Err(CodexError::Bounds);
         }
+        if params["turnId"].as_str() != self.active_turn.as_deref() || self.active_turn.is_none() {
+            self.server.send(json!({"id":native_id,"error":{"code":-32600,"message":"Callback does not match active turn"}}))?;
+            return Ok(None);
+        }
         let request_id = observation_id.to_owned();
         let Some((kind, prompt)) = self.callback_admission(method, params, native_id)? else {
             return Ok(None);
         };
+        let mut interaction_params = params.clone();
+        let mut remaining_questions = VecDeque::new();
+        if kind == HarnessInteractionKind::Question {
+            let questions = params["questions"].as_array().ok_or(CodexError::Protocol)?;
+            if questions.is_empty() || questions.len() > 32 {
+                return Err(CodexError::Bounds);
+            }
+            let mut ids = BTreeSet::new();
+            for question in questions {
+                let id = question["id"].as_str().ok_or(CodexError::Protocol)?;
+                if id.is_empty()
+                    || id.len() > MAX_HARNESS_ID_BYTES
+                    || id.trim() != id
+                    || id.chars().any(char::is_control)
+                    || !ids.insert(id)
+                {
+                    return Err(CodexError::Protocol);
+                }
+                // Validate every question before exposing any part of the native batch.
+                let single = json!({"questions":[question]});
+                self.callback_interaction(method, &single, &request_id, kind, prompt)?;
+            }
+            remaining_questions.extend(questions.iter().skip(1).cloned());
+            interaction_params["questions"] = json!([questions[0]]);
+        }
         let (interaction, question_ids) =
-            self.callback_interaction(method, params, &request_id, kind, prompt)?;
+            self.callback_interaction(method, &interaction_params, &request_id, kind, prompt)?;
         self.callbacks.insert(
             request_id,
             Callback {
@@ -658,6 +895,9 @@ impl CodexSession {
                 interaction: interaction.clone(),
                 method: method.to_owned(),
                 question_ids,
+                remaining_questions,
+                answers: BTreeMap::new(),
+                pending_question: false,
                 turn_id: params["turnId"]
                     .as_str()
                     .ok_or(CodexError::Protocol)?
@@ -824,6 +1064,48 @@ impl CodexSession {
         Ok((interaction, question_ids))
     }
 
+    fn completed_agent_message(
+        &self,
+        params: &Value,
+    ) -> Result<Option<HarnessObservationKind>, CodexError> {
+        let turn_id = params["turnId"].as_str();
+        if self.observation_gap
+            || self.uncertain_submission
+            || self.active_turn.is_none()
+            || turn_id != self.active_turn.as_deref()
+            || turn_id != self.accepted_turn.as_deref()
+        {
+            // A completed item cannot adopt an unaccepted turn or revive a terminal
+            // turn. Wrong/missing correlation never supplies workflow output.
+            return Ok(None);
+        }
+        let item = &params["item"];
+        let item_id = item["id"].as_str().ok_or(CodexError::Protocol)?;
+        if item_id.is_empty()
+            || item_id.len() > MAX_HARNESS_ID_BYTES
+            || item_id.trim() != item_id
+            || item_id.chars().any(char::is_control)
+        {
+            return Err(CodexError::Protocol);
+        }
+        let text = item["text"].as_str().ok_or(CodexError::Protocol)?;
+        if text.len() > MAX_HARNESS_TEXT_BYTES {
+            // Never truncate an authoritative result into a different answer.
+            return Err(CodexError::Bounds);
+        }
+        if item["phase"].as_str() == Some("final_answer") {
+            Ok(Some(HarnessObservationKind::Result {
+                text: text.to_owned(),
+            }))
+        } else {
+            // Item completion is not turn completion. Commentary, partial answers
+            // and legacy/unknown phases remain display content, never final output.
+            Ok(Some(HarnessObservationKind::Text {
+                text: text.to_owned(),
+            }))
+        }
+    }
+
     fn normalize_notification(
         &mut self,
         method: &str,
@@ -839,6 +1121,9 @@ impl CodexSession {
             "item/started" | "item/completed" => {
                 let item = &params["item"];
                 match item["type"].as_str() {
+                    Some("agentMessage") if method == "item/completed" => {
+                        return self.completed_agent_message(params);
+                    }
                     Some("commandExecution" | "fileChange" | "mcpToolCall" | "dynamicToolCall") => {
                         HarnessObservationKind::Tool {
                             native_tool_id: item["id"]
@@ -904,13 +1189,16 @@ impl CodexSession {
         &mut self,
         params: &Value,
     ) -> Result<HarnessObservationKind, CodexError> {
+        if params["turn"]["status"] == "completed" && !params["turn"]["error"].is_null() {
+            return Err(CodexError::Protocol);
+        }
         let kind = {
             self.status.connectivity = HarnessConnectivity::Connected;
             self.status.attention = HarnessAttention::None;
+            self.status.continuation = HarnessContinuation::Unknown;
             self.status.activity = match params["turn"]["status"].as_str() {
-                Some("completed") => HarnessActivity::Settled,
+                Some("completed" | "failed") => HarnessActivity::Unknown,
                 Some("interrupted") => HarnessActivity::Interrupted,
-                Some("failed") => HarnessActivity::Unknown,
                 _ => return Err(CodexError::Protocol),
             };
             if params["turn"]["status"] == "failed" {
@@ -926,6 +1214,34 @@ impl CodexSession {
             }
         };
         Ok(kind)
+    }
+
+    fn answer_question(&mut self, request_id: &str, answer: &str) -> Result<(), CodexError> {
+        let mut callback = self.callbacks.remove(request_id).ok_or(CodexError::Stale)?;
+        callback.answers.insert(
+            callback.question_ids[0].clone(),
+            json!({"answers":[answer]}),
+        );
+        if let Some(question) = callback.remaining_questions.pop_front() {
+            let request_id = format!("codex-question:{}", uuid::Uuid::new_v4());
+            let (interaction, question_ids) = self.callback_interaction(
+                &callback.method,
+                &json!({"questions":[question]}),
+                &request_id,
+                HarnessInteractionKind::Question,
+                "Codex requests user input",
+            )?;
+            callback.interaction = interaction;
+            callback.question_ids = question_ids;
+            callback.pending_question = true;
+            self.callbacks.insert(request_id, callback);
+            return Ok(());
+        }
+        if self.callbacks.is_empty() {
+            self.status.attention = HarnessAttention::None;
+        }
+        self.server
+            .send(json!({"id":callback.native_id,"result":{"answers":callback.answers}}))
     }
 
     /// Respond to one exact generation-fenced native callback. Responses are consumed before send.
@@ -944,6 +1260,11 @@ impl CodexSession {
         response
             .validate_for(&callback.interaction)
             .map_err(|_| CodexError::Stale)?;
+        if self.active_turn.as_deref() != Some(callback.turn_id.as_str())
+            || callback.pending_question
+        {
+            return Err(CodexError::Stale);
+        }
         let result = match &response.value {
             HarnessResponseValue::Approval { approved } => {
                 json!({"decision":if *approved {"accept"} else {"decline"}})
@@ -970,12 +1291,8 @@ impl CodexSession {
                 } else {
                     text.as_str()
                 };
-                let mut answers = serde_json::Map::new();
-                answers.insert(
-                    callback.question_ids[0].clone(),
-                    json!({"answers":[answer]}),
-                );
-                json!({"answers":answers})
+                let answer = answer.to_owned();
+                return self.answer_question(&response.request_id, &answer);
             }
             HarnessResponseValue::Assistance { text } => {
                 json!({"contentItems":[{"type":"inputText","text":text}],"success":true})

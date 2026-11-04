@@ -6197,6 +6197,7 @@ impl bcode_session_migration_target::MigrationTarget for SessionMigrationTarget<
         &mut self,
     ) -> Result<bcode_session_migration_target::StrictValidation, Self::Error> {
         let canonical_tail = last_sequence(self.db).await?;
+        harness_operation::validate_migration_keys(self.db).await?;
         let facts = migration_target_validation_facts(self.db, canonical_tail).await?;
         Ok(facts)
     }
@@ -6205,6 +6206,7 @@ impl bcode_session_migration_target::MigrationTarget for SessionMigrationTarget<
         &mut self,
         receipt: &bcode_session_migration_target::MigrationReceipt,
     ) -> Result<(), Self::Error> {
+        harness_operation::validate_migration_keys(self.db).await?;
         self.db
             .insert("session_migration_receipts")
             .value("operation_id", receipt.operation_id.clone())
@@ -6225,6 +6227,7 @@ impl bcode_session_migration_target::MigrationTarget for SessionMigrationTarget<
     }
 
     async fn finalize_writer_contract(&mut self) -> Result<(), Self::Error> {
+        harness_operation::validate_migration_keys(self.db).await?;
         // Cross-session completeness is not established by a per-session historical replay.
         self.db
             .update("session_children_checkpoint")
@@ -12729,7 +12732,13 @@ mod tests {
             },
         );
         let events = request.events(&template).unwrap();
-        assert_compaction_restart_fences(&db, &request, &template, &checkpoint).await;
+        Box::pin(assert_compaction_restart_fences(
+            &db,
+            &request,
+            &template,
+            &checkpoint,
+        ))
+        .await;
         let terminal = event(
             id,
             3,

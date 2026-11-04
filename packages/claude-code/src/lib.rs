@@ -3,11 +3,13 @@
 #![warn(clippy::all, clippy::pedantic, clippy::nursery, clippy::cargo)]
 #![allow(clippy::multiple_crate_versions)]
 
+mod attribution;
 mod auth;
 mod launch;
 mod protocol;
 mod transport;
 
+pub use attribution::{AttributionStage, SubmissionAttribution, SubmissionUuid};
 pub use auth::{
     AuthMethod, AuthStatus, NativeAuthSupport, NativeLoginHandoff, auth_status, login_handoff,
 };

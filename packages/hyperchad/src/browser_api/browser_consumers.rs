@@ -176,7 +176,10 @@ mod tests {
     #[cfg(unix)]
     #[tokio::test]
     async fn real_server_poll_gap_without_html_retains_consumer_until_expiry_and_drop() {
+        use std::os::unix::fs::PermissionsExt as _;
+
         let directory = tempfile::tempdir().unwrap();
+        std::fs::set_permissions(directory.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
         let locations = bcode_config::resolve_state_location_set_with_environment(
             &bcode_config::StateConfig::default(),
             &bcode_config::StateLocationSelection {
@@ -191,6 +194,7 @@ mod tests {
         .unwrap();
         let endpoint = bcode_ipc::IpcEndpoint::unix_socket(directory.path().join("consumer.sock"));
         let client = BcodeClient::for_state_location(endpoint.clone(), locations.primary());
+        let observer = BcodeClient::for_state_location(endpoint.clone(), locations.primary());
         let shutdown = bcode_agent_runtime::CancellationToken::new();
         let server = async {
             bcode_server::run_embedded_with_locations_and_shutdown(
@@ -213,13 +217,14 @@ mod tests {
             .await
             .expect("embedded consumer fixture server must start and shut down cleanly");
         };
-        let exercise = exercise_browser_consumer(&client, &directory, &shutdown);
+        let exercise = exercise_browser_consumer(client, &observer, &directory, &shutdown);
         tokio::join!(server, exercise);
     }
 
     #[cfg(unix)]
     async fn exercise_browser_consumer(
-        client: &BcodeClient,
+        client: BcodeClient,
+        observer: &BcodeClient,
         directory: &tempfile::TempDir,
         shutdown: &bcode_agent_runtime::CancellationToken,
     ) {
@@ -247,6 +252,12 @@ mod tests {
             directory.path().to_path_buf(),
         );
         assert!(app.renderer_tx.lock().unwrap().is_none());
+        // Check the dedicated consumer before snapshot requests populate reusable lanes.
+        app.browser_consumers
+            .renew(&app.client, session)
+            .await
+            .unwrap();
+        wait_attached_count(observer, directory.path(), session, 1).await;
         let request = crate::hyperchad_projection_window_request();
         app.browser_window_snapshot(session, request.clone())
             .await
@@ -267,9 +278,6 @@ mod tests {
             assert!(first.same_channel(&entries.get(&session).unwrap().ready));
             drop(entries);
         }
-        // The isolated server retains exactly one consumer socket after the
-        // transient observation sockets drain; no HTML renderer was installed.
-        wait_attached_count(client, directory.path(), session, 1).await;
         app.browser_consumers
             .entries
             .lock()
@@ -298,12 +306,14 @@ mod tests {
             .ready
             .clone();
         drop(app);
+        // Release snapshot request lanes as well as the leased consumer.
+        drop(client);
         tokio::time::timeout(Duration::from_secs(5), async {
             while closed.changed().await.is_ok() {}
         })
         .await
         .unwrap();
-        wait_attached_count(client, directory.path(), session, 0).await;
+        wait_attached_count(observer, directory.path(), session, 0).await;
         shutdown.cancel();
     }
 
@@ -317,10 +327,13 @@ mod tests {
         let mut last_observed = None;
         let result = tokio::time::timeout(Duration::from_secs(5), async {
             loop {
-                let sessions = client
+                // A dedicated catalog probe must not add a retained request-lane socket.
+                let mut catalog = client.connect("browser-consumer-catalog-probe").await.unwrap();
+                let sessions = catalog
                     .list_sessions_in_working_directory(working_directory.to_path_buf())
                     .await
                     .unwrap();
+                drop(catalog);
                 assert!(sessions.sessions.iter().any(|value| value.id == session), "exact fixture session must remain discoverable");
                 // Catalog summaries cache durable metadata, not runtime client
                 // membership. This isolated server has exactly this one leased

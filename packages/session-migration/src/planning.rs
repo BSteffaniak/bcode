@@ -422,6 +422,11 @@ mod tests {
                     id: "session-writer-epoch-17-to-18",
                     source_writer_epoch: 17,
                     target_writer_epoch: 18,
+                },
+                MigrationStepDescriptor {
+                    id: "session-writer-epoch-18-to-19",
+                    source_writer_epoch: 18,
+                    target_writer_epoch: 19,
                 }
             ]
         );
@@ -438,20 +443,48 @@ mod tests {
     #[test]
     fn external_backend_epoch_has_a_lossless_forward_only_projection_upgrade() {
         let plan = plan_writer_epoch_migration(17).expect("external locator projection upgrade");
-        assert_eq!(plan.target_writer_epoch, 18);
+        assert_eq!(plan.target_writer_epoch, 19);
         assert_eq!(
             plan.steps,
-            [MigrationStepDescriptor {
-                id: "session-writer-epoch-17-to-18",
-                source_writer_epoch: 17,
-                target_writer_epoch: 18,
-            }]
+            [
+                MigrationStepDescriptor {
+                    id: "session-writer-epoch-17-to-18",
+                    source_writer_epoch: 17,
+                    target_writer_epoch: 18,
+                },
+                MigrationStepDescriptor {
+                    id: "session-writer-epoch-18-to-19",
+                    source_writer_epoch: 18,
+                    target_writer_epoch: 19,
+                },
+            ]
         );
         assert!(matches!(
             plan_writer_epoch_migration_with_registry(18, 17, &MIGRATION_STEPS),
             Err(MigrationPlanError::FutureWriter {
                 source_writer_epoch: 18,
                 current_writer_epoch: 17
+            })
+        ));
+    }
+
+    #[test]
+    fn terminal_evidence_epoch_has_an_explicit_forward_only_step() {
+        let plan = plan_writer_epoch_migration(18).expect("terminal evidence upgrade");
+        assert_eq!(plan.target_writer_epoch, 19);
+        assert_eq!(
+            plan.steps,
+            [MigrationStepDescriptor {
+                id: "session-writer-epoch-18-to-19",
+                source_writer_epoch: 18,
+                target_writer_epoch: 19,
+            }]
+        );
+        assert!(matches!(
+            plan_writer_epoch_migration_with_registry(19, 18, &MIGRATION_STEPS),
+            Err(MigrationPlanError::FutureWriter {
+                source_writer_epoch: 19,
+                current_writer_epoch: 18,
             })
         ));
     }

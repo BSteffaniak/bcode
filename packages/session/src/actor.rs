@@ -612,6 +612,25 @@ impl SessionHandle {
         .await?
     }
 
+    pub(crate) async fn harness_submission_evidence(
+        &self,
+        submission_id: String,
+        attempt_id: String,
+    ) -> Result<
+        Option<(
+            bcode_session_models::ExternalHarnessOwner,
+            bcode_harness_models::HarnessObservationPage,
+        )>,
+        SessionError,
+    > {
+        self.send(|reply| SessionCommand::HarnessSubmissionEvidence {
+            submission_id,
+            attempt_id,
+            reply,
+        })
+        .await?
+    }
+
     pub(crate) async fn harness_submission_acceptance(
         &self,
         submission_id: String,
@@ -1797,6 +1816,19 @@ enum SessionCommand {
         timestamp_ms: u64,
         reply: oneshot::Sender<Result<SessionEvent, SessionError>>,
     },
+    HarnessSubmissionEvidence {
+        submission_id: String,
+        attempt_id: String,
+        reply: oneshot::Sender<
+            Result<
+                Option<(
+                    bcode_session_models::ExternalHarnessOwner,
+                    bcode_harness_models::HarnessObservationPage,
+                )>,
+                SessionError,
+            >,
+        >,
+    },
     HarnessSubmissionAcceptance {
         submission_id: String,
         attempt_id: String,
@@ -2810,6 +2842,36 @@ impl SessionActor {
             } => Box::pin(async move {
                 let result =
                     Box::pin(self.restart_compaction_checkpoint(request, timestamp_ms)).await;
+                let _ = reply.send(result);
+                false
+            }),
+            SessionCommand::HarnessSubmissionEvidence {
+                submission_id,
+                attempt_id,
+                reply,
+            } => Box::pin(async move {
+                let result = if let Some(db) = self.db.as_ref() {
+                    db.external_harness_submission_evidence(&submission_id, &attempt_id)
+                        .await
+                        .map_err(Into::into)
+                } else if let Some(store) = self.store.as_ref() {
+                    let root = store.root_path();
+                    if crate::db::session_db_path(&root, self.state.summary.id).exists() {
+                        match SessionDb::open_existing_turso_in_root(self.state.summary.id, &root)
+                            .await
+                        {
+                            Ok(db) => db
+                                .external_harness_submission_evidence(&submission_id, &attempt_id)
+                                .await
+                                .map_err(Into::into),
+                            Err(error) => Err(error.into()),
+                        }
+                    } else {
+                        Ok(None)
+                    }
+                } else {
+                    Ok(None)
+                };
                 let _ = reply.send(result);
                 false
             }),

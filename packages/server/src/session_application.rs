@@ -1853,8 +1853,10 @@ mod tests {
         let root = tempfile::tempdir().unwrap();
         let sessions = bcode_session::SessionManager::persistent(root.path()).unwrap();
         let mut state = Arc::new(crate::tests::test_server_state(sessions));
+        // Session creation discovers skills from configuration, independently of the
+        // constructor's absent registry. Exercise the disabled configuration explicitly.
         Arc::get_mut(&mut state)
-            .unwrap()
+            .expect("fixture state is not shared during configuration")
             .startup_config
             .skills
             .enabled = false;

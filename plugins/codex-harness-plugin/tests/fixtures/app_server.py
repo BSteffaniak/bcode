@@ -34,6 +34,8 @@ for line in sys.stdin:
     with open("methods.jsonl", "a", encoding="utf-8") as log:
         log.write(json.dumps({"method": method, "expectedTurnId": params.get("expectedTurnId"),
                               "callback": request.get("id") if method is None else None,
+                              "turnId": params.get("turnId"),
+                              "result": request.get("result"),
                               "success": request.get("result", {}).get("success")}) + "\n")
     if method == "initialize":
         result(request, {"codexHome": "/wrong-home" if os.path.exists("wrong-home") else os.environ["CODEX_HOME"],
@@ -111,23 +113,103 @@ for line in sys.stdin:
             for index in range(300):
                 emit({"id": 100 + index, "method": "item/tool/requestUserInput", "params": {
                     "threadId": "native-thread", "turnId": "turn-1", "questions": []}})
-        if text in ("approval", "question", "assistance", "dynamic", "foreign"):
+        if text.startswith("terminal-"):
+            status = text.removeprefix("terminal-")
+            native_turn = turn(status if status in ("completed", "failed", "interrupted") else "completed")
+            native_turn.update({"itemsView": "summary", "rootTurnId": "turn-1",
+                                "startedAt": 1700000000, "completedAt": 1700000001, "durationMs": 1000})
+            thread_id = "native-thread"
+            if status == "wrong-turn":
+                native_turn["id"] = "other-turn"
+            if status == "foreign":
+                thread_id = "foreign-thread"
+            if status == "invalid":
+                native_turn["status"] = "future-status"
+            if status == "contradictory":
+                native_turn["error"] = {"message": "sensitive native error", "codexErrorInfo": "other"}
+            if status == "background":
+                native_turn["items"] = [{"type": "commandExecution", "id": "command-1", "command": "sleep 60",
+                                         "cwd": os.getcwd(), "processId": "123", "status": "inProgress",
+                                         "commandActions": [], "aggregatedOutput": None, "exitCode": None, "durationMs": None}]
+            if status == "lost":
+                sys.exit(0)
+            emit({"method": "turn/completed", "params": {"threadId": thread_id, "turn": native_turn}})
+            if status == "duplicate":
+                emit({"method": "turn/completed", "params": {"threadId": thread_id, "turn": native_turn}})
+            emit({"method": "item/agentMessage/delta", "params": {
+                "threadId": "native-thread", "turnId": "turn-1", "itemId": "marker", "delta": "result-fixture-end"}})
+            continue
+        if text.startswith("result-"):
+            emit({"method": "item/agentMessage/delta", "params": {
+                "threadId": "native-thread", "turnId": "turn-1", "itemId": "message-1",
+                "delta": "partial streamed text"}})
+            item = {"type": "agentMessage", "id": "message-1", "text": "Complete answer: 界 👋",
+                    "phase": "final_answer", "memoryCitation": None, "delivery": None, "questions": None}
+            item_params = {"threadId": "native-thread", "turnId": "turn-1",
+                           "item": item, "completedAtMs": 1700000000000}
+            item_method = "item/completed"
+            if text == "result-commentary":
+                item["phase"] = "commentary"
+            if text == "result-partial":
+                item["phase"] = "partial_answer"
+            if text == "result-unphased":
+                item["phase"] = None
+            if text == "result-unknown-phase":
+                item["phase"] = "future_phase"
+            if text == "result-started":
+                item_method = "item/started"
+            if text == "result-unaccepted-turn":
+                unaccepted = turn("inProgress")
+                unaccepted["id"] = "other-turn"
+                emit({"method": "turn/started", "params": {"threadId": "native-thread", "turn": unaccepted}})
+                item_params["turnId"] = "other-turn"
+            if text == "result-wrong-turn":
+                item_params["turnId"] = "other-turn"
+            if text == "result-missing-turn":
+                del item_params["turnId"]
+            if text == "result-foreign-thread":
+                item_params["threadId"] = "unrelated-thread"
+            if text == "result-oversized":
+                item["text"] = "x" * 65537
+            if text == "result-malformed":
+                del item["text"]
+            if text == "result-late":
+                completed()
+            if text != "result-delta-only":
+                emit({"method": item_method, "params": item_params})
+            if text not in ("result-held", "result-late", "result-oversized", "result-malformed"):
+                completed("interrupted" if text == "result-interrupted" else "failed" if text == "result-failed" else "completed")
+            emit({"method": "item/agentMessage/delta", "params": {
+                "threadId": "native-thread", "turnId": "turn-1", "itemId": "marker",
+                "delta": "result-fixture-end"}})
+            continue
+        if text in ("approval", "question", "multi-question", "duplicate-question", "secret-question", "resolved-question", "foreign-resolved-question", "assistance", "dynamic", "foreign"):
             callback_method = "item/commandExecution/requestApproval"
             callback_params = {"threadId": "native-thread", "turnId": "turn-1", "itemId": "item-1", "command": "echo fixture"}
             if text == "foreign":
                 callback_params["threadId"] = "unrelated-thread"
-            if text == "question":
+            if text in ("question", "multi-question", "duplicate-question", "secret-question", "resolved-question", "foreign-resolved-question"):
                 callback_method = "item/tool/requestUserInput"
-                callback_params["questions"] = [{"id": "q1", "question": "Choose one", "isSecret": False}]
+                callback_params["questions"] = [{"id": "q1", "question": "Choose one", "isSecret": False,
+                                                  "options": [{"label": "First", "description": "First choice"}]}]
+                if text in ("multi-question", "duplicate-question", "secret-question"):
+                    callback_params["questions"].append({"id": "q1" if text == "duplicate-question" else "q2",
+                                                        "question": "Explain why", "isSecret": text == "secret-question"})
             if text in ("assistance", "dynamic"):
                 callback_method = "item/tool/call"
                 callback_params.update({"tool": "bcode_parent_assistance" if text == "assistance" else "shell.run",
                                         "arguments": {"question": "Need context"}, "callId": "native-call"})
             emit({"id": 91, "method": callback_method, "params": callback_params})
+            if text in ("resolved-question", "foreign-resolved-question"):
+                emit({"method": "serverRequest/resolved", "params": {
+                    "threadId": "unrelated-thread" if text == "foreign-resolved-question" else "native-thread",
+                    "requestId": 91}})
         emit({"method": "item/agentMessage/delta", "params": {"threadId": "native-thread", "turnId": "turn-1", "delta": "fixture text"}})
-        if text not in ("approval", "question", "assistance", "dynamic"):
+        if text not in ("approval", "question", "multi-question", "duplicate-question", "secret-question", "resolved-question", "foreign-resolved-question", "assistance", "dynamic"):
             completed(text if text in ("failed", "interrupted") else "completed")
     elif method == "turn/interrupt":
+        if os.path.exists("lost-interrupt-ack"):
+            sys.exit(0)
         result(request, {})
         completed("interrupted")
     elif method is None:

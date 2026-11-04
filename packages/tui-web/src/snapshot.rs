@@ -25,10 +25,23 @@ struct Observation {
 struct Submission {
     #[serde(rename = "submission_id")]
     identity: String,
+    #[serde(default)]
+    attempt_id: Option<String>,
+    /// Unmodified editor text, retained when native command syntax is normalized.
+    #[serde(default)]
+    draft_text: Option<String>,
     #[serde(rename = "session_id")]
     session: String,
     text: String,
     placement: String,
+    #[serde(default)]
+    native_only: bool,
+    #[serde(default = "legacy_prepared")]
+    prepared: bool,
+    #[serde(default)]
+    managed: Option<bcode_session_view_models::ManagedComposerRequest>,
+    #[serde(default)]
+    expected_native_turn_id: Option<String>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -451,13 +464,41 @@ impl SnapshotState {
             && (pending.session != self.session
                 || !uuid(&pending.identity)
                 || pending.text.trim().is_empty()
-                || pending.placement != "steering"
+                || !matches!(pending.placement.as_str(), "steering" | "follow_up")
                 || serde_json::to_vec(pending)
                     .map_err(|_| "invalid recovery submission")?
                     .len()
                     > MAX_REQUEST_BYTES)
         {
             return Err("invalid recovery submission");
+        }
+        if let Some(pending) = &recovery.pending
+            && let Some(request) = &pending.managed
+        {
+            request
+                .request()
+                .validate()
+                .map_err(|_| "invalid recovered native request")?;
+            let bcode_session_view_models::ManagedComposerRequestKind::Submit {
+                submission, ..
+            } = &request.kind
+            else {
+                return Err("invalid recovered native operation");
+            };
+            if !pending.prepared
+                || submission.submission_id != pending.identity
+                || submission.attempt_id
+                    != pending.attempt_id.as_deref().unwrap_or(&pending.identity)
+                || submission.session_id != pending.session
+                || submission.text != pending.text
+                || !composer_placement_matches(
+                    request,
+                    &pending.placement,
+                    pending.expected_native_turn_id.as_deref(),
+                )
+            {
+                return Err("recovered native input mismatch");
+            }
         }
         self.pending = recovery.pending;
         Ok(())
@@ -490,11 +531,40 @@ impl SnapshotState {
         if !uuid(&identity) || text.trim().is_empty() || self.accepted.is_none() {
             return Err("invalid submission");
         }
+        let native_only = text.starts_with("/native steer ") || text.starts_with("/native next ");
+        let draft_text = text.clone();
+        let (placement, expected_native_turn_id, text) =
+            if let Some(rest) = text.strip_prefix("/native steer ") {
+                let (expected, text) = rest
+                    .split_once(char::is_whitespace)
+                    .ok_or("usage: /native steer <expected-native-turn> <text>")?;
+                if expected.is_empty() || text.trim().is_empty() {
+                    return Err("empty native steering input");
+                }
+                (
+                    "steering".to_owned(),
+                    Some(expected.to_owned()),
+                    text.trim_start().to_owned(),
+                )
+            } else if let Some(text) = text.strip_prefix("/native next ") {
+                if text.trim().is_empty() {
+                    return Err("empty native input");
+                }
+                ("follow_up".to_owned(), None, text.trim_start().to_owned())
+            } else {
+                ("follow_up".to_owned(), None, text)
+            };
         let next = Submission {
+            attempt_id: Some(format!("attempt-{identity}")),
             identity,
+            draft_text: Some(draft_text),
             session: self.session.clone(),
             text,
-            placement: "steering".to_owned(),
+            placement,
+            prepared: false,
+            managed: None,
+            expected_native_turn_id,
+            native_only,
         };
         let body = serde_json::to_string(&next).map_err(|_| "invalid submission")?;
         if body.len() > MAX_REQUEST_BYTES {
@@ -510,6 +580,83 @@ impl SnapshotState {
         self.pending
             .as_ref()
             .and_then(|pending| serde_json::to_string(pending).ok())
+    }
+
+    /// Whether the exact pending operation still needs non-mutating backend preparation.
+    #[must_use]
+    pub fn needs_preparation(&self) -> bool {
+        self.pending
+            .as_ref()
+            .is_some_and(|pending| !pending.prepared)
+    }
+
+    /// Retain preparation before native dispatch; an existing captured envelope is immutable.
+    /// # Errors
+    /// Rejects malformed, mismatched or non-preparation responses.
+    pub fn accept_preparation(&mut self, json: &str) -> Result<(), &'static str> {
+        if json.len() > MAX_RESPONSE_BYTES {
+            return Err("preparation too large");
+        }
+        let response: ActionResponse =
+            serde_json::from_str(json).map_err(|_| "invalid preparation")?;
+        let pending = self.pending.as_mut().ok_or("no pending submission")?;
+        if pending.prepared || response.schema_version != 1 {
+            return Err("unexpected preparation");
+        }
+        let SessionViewActionOutcome::SubmissionPrepared { managed } = response.outcome else {
+            return Err("invalid preparation outcome");
+        };
+        if pending.native_only && managed.is_none() {
+            return Err("native backend unavailable; no model fallback");
+        }
+        if let Some(request) = &managed {
+            if !pending.prepared && request.request_id != pending.identity {
+                return Err("preparation request mismatch");
+            }
+            let bcode_session_view_models::ManagedComposerRequestKind::Submit {
+                submission, ..
+            } = &request.kind
+            else {
+                return Err("invalid preparation operation");
+            };
+            request
+                .request()
+                .validate()
+                .map_err(|_| "invalid preparation")?;
+            if submission.submission_id != pending.identity
+                || submission.attempt_id
+                    != pending.attempt_id.as_deref().unwrap_or(&pending.identity)
+                || submission.session_id != pending.session
+                || submission.text != pending.text
+                || !composer_placement_matches(
+                    request,
+                    &pending.placement,
+                    pending.expected_native_turn_id.as_deref(),
+                )
+            {
+                return Err("preparation owner mismatch");
+            }
+        }
+        let Some(pending) = self.pending.as_ref() else {
+            return Ok(());
+        };
+        let mut candidate = pending.clone();
+        if managed.is_none() && !pending.native_only {
+            // Preserve the pre-existing browser model-composer steering policy. The initial
+            // next-turn placement is the explicit managed default, not a model policy change.
+            "steering".clone_into(&mut candidate.placement);
+        }
+        candidate.managed = managed.map(|request| *request);
+        candidate.prepared = true;
+        if serde_json::to_vec(&candidate)
+            .map_err(|_| "invalid prepared input")?
+            .len()
+            > MAX_REQUEST_BYTES
+        {
+            return Err("prepared input exceeds request budget");
+        }
+        self.pending = Some(candidate);
+        Ok(())
     }
 
     /// Validate a durable receipt before releasing the retained retry identity.
@@ -529,16 +676,72 @@ impl SnapshotState {
             return Err("unsupported action schema");
         }
         match response.outcome {
+            SessionViewActionOutcome::ManagedSubmissionRecorded { response } => {
+                let retained = pending
+                    .managed
+                    .as_ref()
+                    .ok_or("unexpected native receipt")?;
+                response
+                    .response()
+                    .validate_for(&retained.request())
+                    .map_err(|_| "native receipt mismatch")?;
+                let bcode_session_view_models::ManagedComposerResponseKind::Receipt(receipt) =
+                    response.kind
+                else {
+                    return Err("native delivery unresolved; exact input retained");
+                };
+                let state =
+                    serde_json::to_value(receipt.state).map_err(|_| "invalid delivery state")?;
+                if state == "uncertain" || state == "delivery_attempted" {
+                    return Err("native delivery unresolved; exact input retained");
+                }
+            }
             SessionViewActionOutcome::SubmissionAccepted {
                 session_id,
                 receipt,
-            } if session_id.to_string() == pending.session
+            } if pending.managed.is_none()
+                && session_id.to_string() == pending.session
                 && receipt.submission_id.0 == pending.identity => {}
             _ => return Err("unmatched submission receipt"),
         }
-        let text = pending.text.clone();
+        let text = pending
+            .draft_text
+            .clone()
+            .unwrap_or_else(|| pending.text.clone());
         self.pending = None;
         Ok(text)
+    }
+}
+
+const fn legacy_prepared() -> bool {
+    // Legacy recovery may already have sent a model submission. Never reprepare it as native.
+    true
+}
+
+fn composer_placement_matches(
+    request: &bcode_session_view_models::ManagedComposerRequest,
+    placement: &str,
+    expected: Option<&str>,
+) -> bool {
+    let bcode_session_view_models::ManagedComposerRequestKind::Submit { submission, .. } =
+        &request.kind
+    else {
+        return false;
+    };
+    if submission.submission_id != request.request_id {
+        return false;
+    }
+    let Ok(value) = serde_json::to_value(&submission.placement) else {
+        return false;
+    };
+    match placement {
+        "follow_up" => value["kind"] == "next_turn" && expected.is_none(),
+        "steering" => {
+            value["kind"] == "steer"
+                && value["expected_native_turn_id"].as_str() == expected
+                && expected.is_some()
+        }
+        _ => false,
     }
 }
 
@@ -680,6 +883,121 @@ mod tests {
                 .is_ok()
         );
         assert_eq!(state.accepted.as_ref().unwrap().revision, 1);
+    }
+
+    #[test]
+    fn managed_preparation_recovery_keeps_exact_attempt_and_rejects_foreign_receipts() {
+        let mut state = SnapshotState::new(SESSION.into()).unwrap();
+        state.accept(&observation(1)).unwrap();
+        state
+            .prepare_submission(EPOCH.into(), "native input".into())
+            .unwrap();
+        let retained = serde_json::json!({
+            "schema_version":1,"request_id":EPOCH,
+            "instance":{"instance_id":"native","plugin_id":"native.plugin","executable":"/native","config_namespace":"isolated",
+                "auth":{"provider_id":"native","profile":"work","credential_namespace":"isolated","custody":"native_managed"}},
+            "kind":{"operation":"submit","request":{
+                "target":{"state":"prepared","session":{"open_id":"open","session_id":SESSION,"instance_id":"native","generation":3,"native_version":"1","requested_native_session_id":null}},
+                "submission":{"submission_id":EPOCH,"attempt_id":format!("attempt-{EPOCH}"),"session_id":SESSION,"generation":3,"text":"native input","placement":{"kind":"next_turn"}}
+            }}
+        });
+        let typed: Result<bcode_session_view_models::ManagedComposerRequest, _> =
+            serde_json::from_value(retained);
+        let retained = typed.expect("fixture must match the real portable contract");
+        let preparation = serde_json::json!({"schema_version":1,"outcome":{"type":"submission_prepared","managed":retained}});
+        let original = state.retry_submission().unwrap();
+        let mut foreign = preparation.clone();
+        foreign["outcome"]["managed"]["kind"]["request"]["submission"]["attempt_id"] =
+            "foreign-attempt".into();
+        assert!(state.accept_preparation(&foreign.to_string()).is_err());
+        assert_eq!(state.retry_submission().as_deref(), Some(original.as_str()));
+        assert!(state.needs_preparation());
+        state.accept_preparation(&preparation.to_string()).unwrap();
+        assert!(
+            state.accept_preparation(&preparation.to_string()).is_err(),
+            "captured target is immutable"
+        );
+        let exact = state.retry_submission().unwrap();
+        let mut recovered = SnapshotState::new(SESSION.into()).unwrap();
+        recovered
+            .restore_recovery(&state.export_recovery().unwrap())
+            .unwrap();
+        assert_eq!(
+            recovered.retry_submission().as_deref(),
+            Some(exact.as_str())
+        );
+        assert!(!recovered.needs_preparation());
+        let receipt = serde_json::json!({"schema_version":1,"outcome":{"type":"managed_submission_recorded","response":{
+            "schema_version":1,"request_id":EPOCH,"operation":"submit","kind":{"kind":"receipt","response":{
+                "submission_id":EPOCH,"attempt_id":format!("attempt-{EPOCH}"),"session_id":SESSION,"generation":3,"state":"uncertain","native_request_id":null
+            }}
+        }}});
+        assert!(recovered.settle_submission(&receipt.to_string()).is_err());
+        assert_eq!(
+            recovered.retry_submission().as_deref(),
+            Some(exact.as_str())
+        );
+        let mut attempted = receipt.clone();
+        attempted["outcome"]["response"]["kind"]["response"]["state"] = "delivery_attempted".into();
+        assert!(recovered.settle_submission(&attempted.to_string()).is_err());
+        assert_eq!(
+            recovered.retry_submission().as_deref(),
+            Some(exact.as_str())
+        );
+        let mut wrong = receipt.clone();
+        wrong["outcome"]["response"]["kind"]["response"]["generation"] = 4.into();
+        wrong["outcome"]["response"]["kind"]["response"]["state"] = "accepted".into();
+        assert!(recovered.settle_submission(&wrong.to_string()).is_err());
+        let mut accepted = receipt;
+        accepted["outcome"]["response"]["kind"]["response"]["state"] = "accepted".into();
+        assert_eq!(
+            recovered.settle_submission(&accepted.to_string()).unwrap(),
+            "native input"
+        );
+        assert!(recovered.retry_submission().is_none());
+    }
+
+    #[test]
+    fn pending_capture_budget_rejects_oversize_without_losing_existing_retry() {
+        let mut state = SnapshotState::new(SESSION.into()).unwrap();
+        state.accept(&observation(1)).unwrap();
+        assert!(
+            state
+                .prepare_submission(EPOCH.into(), "x".repeat(MAX_REQUEST_BYTES))
+                .is_err()
+        );
+        assert!(state.retry_submission().is_none());
+        let exact = state
+            .prepare_submission(EPOCH.into(), "bounded input".into())
+            .unwrap();
+        assert_eq!(
+            state
+                .prepare_submission(SESSION.into(), "x".repeat(MAX_REQUEST_BYTES))
+                .unwrap(),
+            exact
+        );
+        assert_eq!(state.retry_submission().as_deref(), Some(exact.as_str()));
+        let mut oversized =
+            serde_json::from_str::<serde_json::Value>(&state.export_recovery().unwrap()).unwrap();
+        oversized["pending"]["text"] = "x".repeat(MAX_REQUEST_BYTES).into();
+        let mut fresh = SnapshotState::new(SESSION.into()).unwrap();
+        assert!(fresh.restore_recovery(&oversized.to_string()).is_err());
+        assert!(fresh.retry_submission().is_none());
+    }
+
+    #[test]
+    fn explicit_native_steering_is_retained_and_rejects_missing_turn() {
+        let mut state = SnapshotState::new(SESSION.into()).unwrap();
+        state.accept(&observation(1)).unwrap();
+        let body = state
+            .prepare_submission(EPOCH.into(), "/native steer turn-7 hello".into())
+            .unwrap();
+        let value: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(value["placement"], "steering");
+        assert_eq!(value["expected_native_turn_id"], "turn-7");
+        assert_eq!(value["text"], "hello");
+        assert_eq!(value["draft_text"], "/native steer turn-7 hello");
+        assert_eq!(state.retry_submission().as_deref(), Some(body.as_str()));
     }
 
     #[test]

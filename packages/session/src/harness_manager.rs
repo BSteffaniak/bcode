@@ -15,6 +15,46 @@ fn mismatch() -> SessionError {
     SessionError::EventSerialization("invalid canonical harness result".into())
 }
 impl SessionManager {
+    /// Read bounded indexed acceptance/result/native-terminal/settlement evidence under one
+    /// canonical snapshot. The tuple includes current owner; observations retain canonical
+    /// sequence/page-offset order (at most four), and `next_after` is the acceptance h1 cursor.
+    /// Complete requires all four complete observations; Partial may still include an explicit
+    /// failed/interrupted terminal. Gap fences loss since acceptance. No ownership acquisition
+    /// or history scan occurs; attribution frames alone never establish a native terminal.
+    /// # Errors
+    /// Rejects stale/missing indexes, foreign/conflicting evidence and concurrent changes.
+    pub async fn session_external_harness_submission_evidence(
+        &self,
+        session_id: bcode_session_models::SessionId,
+        submission_id: &str,
+        attempt_id: &str,
+    ) -> Result<Option<(ExternalHarnessOwner, HarnessObservationPage)>, SessionError> {
+        if [submission_id, attempt_id].iter().any(|id| {
+            id.is_empty() || id.len() > MAX_HARNESS_ID_BYTES || id.chars().any(char::is_control)
+        }) {
+            return Err(mismatch());
+        }
+        let gate = self.session_load_gate(session_id).await;
+        let _guard = gate.lock().await;
+        let cached = self.inner.lock().await.sessions.get(&session_id).cloned();
+        if let Some(handle) = cached {
+            return handle
+                .harness_submission_evidence(submission_id.into(), attempt_id.into())
+                .await;
+        }
+        let Some(store) = self.store.as_ref() else {
+            return Ok(None);
+        };
+        let root = store.root_path();
+        if !crate::db::session_db_path(&root, session_id).exists() {
+            return Ok(None);
+        }
+        let db = crate::db::SessionDb::open_existing_turso_in_root(session_id, &root).await?;
+        Ok(db
+            .external_harness_submission_evidence(submission_id, attempt_id)
+            .await?)
+    }
+
     /// Read exact typed native acceptance evidence without acquiring execution ownership.
     /// Current caller access authorization is required at the application boundary.
     /// # Errors

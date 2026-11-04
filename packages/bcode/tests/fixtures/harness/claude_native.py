@@ -10,6 +10,7 @@ from pathlib import Path
 import select
 import sys
 import time
+import uuid
 
 VERSION = "bcode-offline-claude-fixture 1.0.0"
 LIMIT = 65536
@@ -122,6 +123,7 @@ def main():
         idle_seconds = int(timeout_file.read_text(encoding="ascii"))
         if not 15 <= idle_seconds <= 120:
             raise ValueError()
+    submission_uuid = None
     for _ in range(32):
         frame = receive(idle_seconds)
         if frame.get("type") == "user":
@@ -129,6 +131,7 @@ def main():
             if frame.get("message", {}).get("content") != "fixture-only":
                 (root / "unexpected-user.rejected").touch()
                 raise ValueError()
+            submission_uuid = str(uuid.UUID(frame["uuid"]))
             mark(root, "first-user-received")
             effect(root, "submit")
             if scenario == "lost_before_confirmation":
@@ -139,10 +142,16 @@ def main():
                 raise SystemExit(81)
             emit({"type":"system", "subtype":"session_state_changed",
                   "session_id":session, "state":"running"})
+            emit({"type":"assistant", "session_id":session,
+                  "uuid":"66666666-6666-4666-8666-666666666666",
+                  "user_message_uuid":submission_uuid,
+                  "message":{"role":"assistant", "content":[]}})
             if scenario == "sensitive_error":
                 # Deliberately unsafe native diagnostic: host must sanitize.
                 emit({"type":"result", "subtype":"error_during_execution",
                       "is_error":True, "session_id":session,
+                      "uuid":"77777777-7777-4777-8777-777777777777",
+                      "user_message_uuid":submission_uuid, "queued_turn_count":0,
                       "errors":["fixture-secret-DO-NOT-PERSIST"]})
                 raise SystemExit(82)
             if scenario == "question":
@@ -166,7 +175,9 @@ def main():
                       "session_id":session, "state":"running"})
                 continue
             emit({"type":"result", "subtype":"success", "session_id":session,
-                  "is_error":False, "result":"fixture complete"})
+                  "is_error":False, "result":"fixture complete",
+                  "uuid":"88888888-8888-4888-8888-888888888888",
+                  "user_message_uuid":submission_uuid, "queued_turn_count":0})
             emit({"type":"system", "subtype":"session_state_changed",
                   "session_id":session, "state":"idle"})
         elif frame.get("request", {}).get("subtype") == "interrupt":
@@ -175,7 +186,9 @@ def main():
                   "request_id":frame["request_id"], "response":{}}})
             if (root / "hold-after-answer").exists():
                 emit({"type":"result", "subtype":"success", "session_id":session,
-                      "is_error":False, "result":"fixture interrupted"})
+                      "is_error":False, "result":"fixture interrupted",
+                      "uuid":"99999999-9999-4999-8999-999999999999",
+                      "user_message_uuid":submission_uuid, "queued_turn_count":0})
                 emit({"type":"system", "subtype":"session_state_changed",
                       "session_id":session, "state":"idle"})
         else:

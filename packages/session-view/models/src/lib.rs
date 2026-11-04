@@ -2053,6 +2053,16 @@ pub enum ComposerDraftViewScope {
 /// Compatibility name for the session-owned message acceptance disposition.
 pub use bcode_session_models::MessageAcceptanceDisposition as MessageAcceptanceDispositionView;
 
+/// Captured managed composer request; contains an exact instance, target and mutation identities.
+/// This portable session-owned contract contains no IPC or renderer types.
+pub use bcode_session_models::ExternalHarnessRequest as ManagedComposerRequest;
+/// Submission request family used to verify retained portable composer envelopes.
+pub use bcode_session_models::ExternalHarnessRequestKind as ManagedComposerRequestKind;
+/// Canonical managed delivery evidence, never a model submission receipt.
+pub use bcode_session_models::ExternalHarnessResponse as ManagedComposerResponse;
+/// Delivery response family used by portable composer recovery.
+pub use bcode_session_models::ExternalHarnessResponseKind as ManagedComposerResponseKind;
+
 /// Result of executing a renderer-neutral session action.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
@@ -2065,6 +2075,16 @@ pub enum SessionViewActionOutcome {
         session_id: SessionId,
         /// Exact durable receipt.
         receipt: bcode_session_models::SubmissionReceipt,
+    },
+    /// Non-mutating composer preparation. Retain this result before dispatch.
+    SubmissionPrepared {
+        /// Exact managed envelope, or no managed backend for a model session.
+        managed: Option<Box<ManagedComposerRequest>>,
+    },
+    /// Canonical managed delivery result; not model acceptance or native settlement.
+    ManagedSubmissionRecorded {
+        /// Exact validated response to the retained request.
+        response: Box<ManagedComposerResponse>,
     },
     /// A prompt was accepted and may have created a session.
     MessageAccepted {
@@ -2111,6 +2131,26 @@ pub enum SessionViewActionOutcome {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum SessionViewAction {
+    /// Capture the current managed target and explicit placement without sending input.
+    PrepareComposerSubmission {
+        /// Existing session.
+        session_id: SessionId,
+        /// Retained client submission identity.
+        submission_id: String,
+        /// Retained client attempt identity.
+        attempt_id: String,
+        /// Exact input text.
+        text: String,
+        /// Follow-up or explicit steering, never an inferred placement.
+        placement: PromptPlacementView,
+        /// Required for managed steering; never inferred from the latest reply.
+        expected_native_turn_id: Option<String>,
+    },
+    /// Dispatch the exact previously prepared managed envelope, including on retry.
+    SubmitManagedMessage {
+        /// Retained target, generation, text, placement and mutation identities.
+        request: Box<ManagedComposerRequest>,
+    },
     /// Submit a prompt for the active or specified session.
     SubmitMessage {
         /// Caller-retained identity for retry-safe acceptance.

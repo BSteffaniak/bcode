@@ -25,6 +25,7 @@ pub fn with_routes(
     state: HyperChadAppState,
 ) -> hyperchad::router::Router {
     let submit_state = state.clone();
+    let prepare_state = state.clone();
     let history_state = state.clone();
     let controls_state = state.clone();
     let artifact_state = state.clone();
@@ -37,6 +38,10 @@ pub fn with_routes(
         .with_route("/api/session-view/artifact", move |request| {
             let state = artifact_state.clone();
             async move { state.browser_artifact(request).await }
+        })
+        .with_route("/api/session-view/prepare-submission", move |request| {
+            let state = prepare_state.clone();
+            async move { state.browser_prepare_submission(request).await }
         })
         .with_route("/api/session-view/history", move |request| {
             let state = history_state.clone();
@@ -186,6 +191,12 @@ pub struct BrowserSessionSnapshot {
 pub struct BrowserSubmitMessage {
     /// Retain this identity and the exact request on ambiguous failures.
     pub submission_id: String,
+    /// Retained native attempt; legacy model clients may omit it.
+    #[serde(default)]
+    pub attempt_id: Option<String>,
+    /// Editor-only recovery value; never dispatched as execution text.
+    #[serde(default)]
+    pub draft_text: Option<String>,
     /// Existing target session; session creation is deliberately excluded.
     pub session_id: SessionId,
     /// Nonblank prompt, within the total request byte limit.
@@ -193,6 +204,18 @@ pub struct BrowserSubmitMessage {
     /// Shared queue placement policy.
     #[serde(default)]
     pub placement: PromptPlacementView,
+    /// Exact prepared native envelope, retained before dispatch and on retry.
+    #[serde(default)]
+    pub managed: Option<bcode_session_models::ExternalHarnessRequest>,
+    /// Browser-local preparation marker; never grants dispatch authority.
+    #[serde(default)]
+    pub prepared: bool,
+    /// Explicit native-only composer input rejects a model backend.
+    #[serde(default)]
+    pub native_only: bool,
+    /// Explicit turn expectation for native steering preparation.
+    #[serde(default)]
+    pub expected_native_turn_id: Option<String>,
 }
 
 /// Successful application action response; acceptance is not execution.
@@ -354,6 +377,55 @@ impl HyperChadAppState {
         }
     }
 
+    pub(super) async fn browser_prepare_submission(&self, request: RouteRequest) -> Content {
+        if !self.authorizes(&request) {
+            return error("unauthorized");
+        }
+        let message: BrowserSubmitMessage = match parse_body(&request) {
+            Ok(message) => message,
+            Err(code) => return error(code),
+        };
+        if message.submission_id.is_empty()
+            || message.submission_id.len() > 128
+            || message.submission_id.chars().any(char::is_control)
+            || message.text.trim().is_empty()
+        {
+            return error("invalid_request");
+        }
+        let Ok(_operation) = self.browser_api.try_lock() else {
+            return error("browser_busy");
+        };
+        if message.managed.is_some() {
+            return error("already_prepared");
+        }
+        let action = SessionViewAction::PrepareComposerSubmission {
+            session_id: message.session_id,
+            submission_id: message.submission_id.clone(),
+            attempt_id: message
+                .attempt_id
+                .unwrap_or_else(|| message.submission_id.clone()),
+            text: message.text,
+            placement: message.placement,
+            expected_native_turn_id: message.expected_native_turn_id,
+        };
+        let native_only = message.native_only;
+        match tokio::time::timeout(
+            BACKEND_TIMEOUT,
+            bcode_session_view::execute_session_view_action(&self.client, action),
+        )
+        .await
+        {
+            Ok(Ok(bcode_session_view_models::SessionViewActionOutcome::SubmissionPrepared {
+                managed: None,
+            })) if native_only => error("native_backend_unavailable"),
+            Ok(Ok(outcome)) => json_content(&BrowserActionResponse {
+                schema_version: 1,
+                outcome,
+            }),
+            Ok(Err(_)) | Err(_) => error("preparation_unavailable"),
+        }
+    }
+
     pub(super) async fn browser_submit(&self, request: RouteRequest) -> Content {
         if !self.authorizes(&request) {
             return error("unauthorized");
@@ -375,13 +447,50 @@ impl HyperChadAppState {
         };
         // No session creation: ambiguous retry must not create another session. Canonical
         // submission admission owns identity, exact-payload conflict checks and durable receipts.
-        let action = SessionViewAction::SubmitMessage {
-            submission_id: bcode_session_models::SubmissionId(message.submission_id),
-            session_id: Some(message.session_id),
-            launch_working_directory: None,
-            text: message.text,
-            placement: message.placement,
-            execution: Box::default(),
+        if message.native_only && message.managed.is_none() {
+            return error("native_backend_unavailable");
+        }
+        let action = if let Some(retained) = message.managed {
+            let bcode_session_models::ExternalHarnessRequestKind::Submit { submission, .. } =
+                &retained.kind
+            else {
+                return error("invalid_managed_submission");
+            };
+            if submission.session_id != message.session_id.to_string()
+                || submission.submission_id != message.submission_id
+                || submission.text != message.text
+                || message
+                    .attempt_id
+                    .as_ref()
+                    .is_some_and(|attempt| *attempt != submission.attempt_id)
+                || match &submission.placement {
+                    bcode_harness_models::HarnessPlacement::NextTurn => {
+                        message.placement != PromptPlacementView::FollowUp
+                            || message.expected_native_turn_id.is_some()
+                    }
+                    bcode_harness_models::HarnessPlacement::Steer {
+                        expected_native_turn_id,
+                    } => {
+                        message.placement != PromptPlacementView::Steering
+                            || message.expected_native_turn_id.as_ref()
+                                != Some(expected_native_turn_id)
+                    }
+                }
+            {
+                return error("invalid_managed_submission");
+            }
+            SessionViewAction::SubmitManagedMessage {
+                request: Box::new(retained),
+            }
+        } else {
+            SessionViewAction::SubmitMessage {
+                submission_id: bcode_session_models::SubmissionId(message.submission_id),
+                session_id: Some(message.session_id),
+                launch_working_directory: None,
+                text: message.text,
+                placement: message.placement,
+                execution: Box::default(),
+            }
         };
         // Bound concurrent browser backend work without an unbounded waiter queue.
         // A busy response is pre-admission; clients still retain the exact operation.

@@ -330,6 +330,7 @@ fn decode_for_migration(
             schema_version: envelope.schema_version(),
         });
     }
+    envelope.validate_observation_compatibility()?;
     let source_kind = envelope.source_kind_name()?;
     if source_kind == "child_session_created"
         && envelope.schema_version() < 52
@@ -337,13 +338,17 @@ fn decode_for_migration(
     {
         return envelope.decode_child_session_created();
     }
-    // Schemas 51 and 52 are losslessly representation-compatible except for child creation above.
+    // Schemas 51 through 53 are representation-compatible except for child creation above.
+    // Schema 53 external observations retain their original evidence class: replay must never
+    // promote a result, acceptance or settlement into a newly introduced terminal disposition.
     // Preserve recorded usage and all admission identities rather than applying older policy.
-    if matches!(envelope.schema_version(), 51 | 52)
+    if matches!(envelope.schema_version(), 51..=53)
         && crate::is_released_event_kind_schema(source_kind, envelope.schema_version())
         && crate::RELEASED_EVENT_VARIANTS.iter().any(|variant| {
             variant.kind == source_kind
-                && variant.treatment == crate::ReleasedEventTreatment::CurrentEquivalent
+                && (variant.treatment == crate::ReleasedEventTreatment::CurrentEquivalent
+                    || (envelope.schema_version() == 53
+                        && variant.treatment == crate::ReleasedEventTreatment::ExplicitConversion))
         })
     {
         return current
@@ -475,9 +480,10 @@ mod tests {
     fn schema_52_fixture_migrates_losslessly_without_creating_checkpoints() {
         let plan = crate::plan_writer_epoch_migration(16).expect("known lossless upgrade");
         assert_eq!(plan.target_writer_epoch, crate::CURRENT_WRITER_EPOCH);
-        assert_eq!(plan.steps.len(), 2);
+        assert_eq!(plan.steps.len(), 3);
         assert_eq!(plan.steps[0].id, "session-writer-epoch-16-to-17");
         assert_eq!(plan.steps[1].id, "session-writer-epoch-17-to-18");
+        assert_eq!(plan.steps[2].id, "session-writer-epoch-18-to-19");
         let fixture = include_str!("../fixtures/stores/epoch-16-schema-52-events.jsonl");
         let mut seen = BTreeSet::new();
         for payload in fixture.lines() {
@@ -490,7 +496,7 @@ mod tests {
                 payload: payload.to_owned(),
             };
             let normalized = normalize_canonical_row(&row).expect("released schema-52 fixture");
-            assert_eq!(normalized.event.schema_version, 53);
+            assert_eq!(normalized.event.schema_version, 54);
             assert_eq!(normalized.event.sequence, row.sequence);
             assert_eq!(normalized.historical_source, Some(format!("52:{kind}")));
             assert!(normalized.metric_counter.is_none());
@@ -787,8 +793,8 @@ mod tests {
         let HistoricalDecode::Converted { event, metadata } = decoded else {
             panic!("historical usage should be migration-owned conversion");
         };
-        assert_eq!(crate::CURRENT_EVENT_SCHEMA, 53);
-        assert_eq!(crate::LATEST_HISTORICAL_EVENT_SCHEMA, 52);
+        assert_eq!(crate::CURRENT_EVENT_SCHEMA, 54);
+        assert_eq!(crate::LATEST_HISTORICAL_EVENT_SCHEMA, 53);
         // Classification preserves the source envelope; canonical normalization alone
         // advances its schema after historical semantics have been interpreted.
         assert_eq!(event.schema_version, metadata.source_schema);
@@ -1225,6 +1231,7 @@ mod tests {
             ("plugin_automation_turn_finished", 29),
             ("plugin_automation_turn_started", 29),
             ("session_forked", 45),
+            ("session_forked", 52),
             ("tool_invocation_presentation", 21),
         ] {
             let payload = format!(
@@ -1240,6 +1247,23 @@ mod tests {
                 event.kind,
                 SessionEventKind::InertHistory { ref event_type, ref payload }
                     if event_type == event_kind && payload["preserved"] == true
+            ));
+        }
+    }
+
+    #[test]
+    fn schema_53_rejects_unpublished_and_already_retired_families() {
+        for event_kind in [
+            "durable_interaction_committed",
+            "turn_continuation_committed",
+            "session_forked",
+        ] {
+            let payload = format!(
+                r#"{{"schema_version":53,"sequence":1,"session_id":"{SESSION_ID}","kind":{{"{event_kind}":{{}}}}}}"#
+            );
+            assert!(matches!(
+                decode_for_migration(&payload, reject_current),
+                Err(HistoricalSessionEventError::UnsupportedEventKind { .. })
             ));
         }
     }
@@ -1374,6 +1398,311 @@ mod tests {
     }
 
     #[test]
+    fn epoch_18_fixtures_preserve_exact_typed_events_and_harness_evidence() {
+        use bcode_session_models::external_backend::ExternalBackendEnvelope;
+        use bcode_session_models::external_harness::ExternalHarnessOperationRecord;
+
+        for (fixture, count) in [
+            (
+                include_str!("../fixtures/stores/epoch-18-schema-53-events.jsonl"),
+                75,
+            ),
+            (
+                include_str!("../fixtures/stores/epoch-18-schema-53-harness.jsonl"),
+                9,
+            ),
+        ] {
+            assert_eq!(fixture.lines().count(), count);
+            for (sequence, payload) in fixture.lines().enumerate() {
+                let source: SessionEvent = serde_json::from_str(payload).unwrap();
+                assert_eq!(source.schema_version, 53);
+                assert_eq!(source.sequence, u64::try_from(sequence).unwrap());
+                let value: serde_json::Value = serde_json::from_str(payload).unwrap();
+                let event_kind = value["kind"]
+                    .as_object()
+                    .unwrap()
+                    .keys()
+                    .next()
+                    .unwrap()
+                    .clone();
+                let normalized =
+                    normalize_canonical_row(&bcode_session_migration_target::CanonicalRow {
+                        sequence: source.sequence,
+                        event_kind: event_kind.clone(),
+                        schema_version: 53,
+                        payload: payload.to_owned(),
+                    })
+                    .unwrap();
+                assert_eq!(
+                    normalized.historical_source,
+                    Some(format!("53:{event_kind}"))
+                );
+                assert!(!normalized.retired_known);
+                assert_eq!(normalized.metric_counter, None);
+                let mut expected = source;
+                expected.schema_version = crate::CURRENT_EVENT_SCHEMA;
+                assert_eq!(normalized.event, expected);
+                let mut future = value;
+                future["schema_version"] = serde_json::json!(crate::CURRENT_EVENT_SCHEMA + 1);
+                assert!(matches!(
+                    normalize_canonical_row(&bcode_session_migration_target::CanonicalRow {
+                        sequence: expected.sequence,
+                        event_kind: event_kind.clone(),
+                        schema_version: crate::CURRENT_EVENT_SCHEMA + 1,
+                        payload: future.to_string(),
+                    }),
+                    Err(HistoricalSessionEventError::UnsupportedSchema { .. })
+                ));
+                if let SessionEventKind::ExternalHarnessOperation { operation } = &expected.kind {
+                    operation.validate().unwrap();
+                    if let ExternalHarnessOperationRecord::ObservationPage { page, .. } =
+                        &operation.record
+                    {
+                        // Schema-53 replay retains only the recorded evidence. A settlement or
+                        // zero queued work is never promoted into a new native terminal outcome.
+                        assert!(page.observations.iter().all(|observation| {
+                            let kind = serde_json::to_value(&observation.kind).unwrap();
+                            !matches!(
+                                kind["kind"].as_str(),
+                                Some(
+                                    "native_turn_terminal"
+                                        | "submission_consumed"
+                                        | "submission_result_observed"
+                                )
+                            )
+                        }));
+                    }
+                } else {
+                    let _ = ExternalBackendEnvelope::from_event(&expected).unwrap();
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn epoch_18_harness_replay_preserves_exact_page_cursors_and_loss() {
+        use bcode_session_models::external_harness::ExternalHarnessOperationRecord;
+        let pages = include_str!("../fixtures/stores/epoch-18-schema-53-harness.jsonl")
+            .lines()
+            .filter_map(|payload| {
+                let event: SessionEvent = serde_json::from_str(payload).unwrap();
+                let SessionEventKind::ExternalHarnessOperation { operation } = event.kind else {
+                    return None;
+                };
+                let ExternalHarnessOperationRecord::ObservationPage { after, page, .. } =
+                    operation.record
+                else {
+                    return None;
+                };
+                let kinds = page
+                    .observations
+                    .iter()
+                    .map(|observation| {
+                        serde_json::to_value(&observation.kind).unwrap()["kind"]
+                            .as_str()
+                            .unwrap()
+                            .to_owned()
+                    })
+                    .collect::<Vec<_>>();
+                Some((
+                    event.sequence,
+                    after,
+                    page.next_after,
+                    kinds,
+                    serde_json::to_value(page.completeness).unwrap(),
+                ))
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            pages,
+            vec![
+                (
+                    5,
+                    None,
+                    Some("accepted".into()),
+                    vec!["submission_accepted".into()],
+                    serde_json::json!("complete"),
+                ),
+                (
+                    6,
+                    Some("accepted".into()),
+                    Some("result".into()),
+                    vec!["result".into()],
+                    serde_json::json!("complete"),
+                ),
+                (
+                    7,
+                    Some("result".into()),
+                    Some("settled".into()),
+                    vec!["settlement".into()],
+                    serde_json::json!("complete"),
+                ),
+                (
+                    8,
+                    Some("settled".into()),
+                    Some("gap".into()),
+                    vec![],
+                    serde_json::json!("gap"),
+                ),
+            ]
+        );
+    }
+
+    #[test]
+    fn schema_53_harness_pages_reject_new_nested_evidence() {
+        for kind in [
+            "submission_consumed",
+            "submission_result_observed",
+            "native_turn_terminal",
+        ] {
+            let payload = serde_json::json!({
+                "schema_version": 53,
+                "sequence": 0,
+                "timestamp_ms": 1,
+                "session_id": "00000000-0000-0000-0000-000000000001",
+                "kind": {
+                    "external_harness_operation": {
+                        "operation": {
+                            "record": {
+                                "kind": "observation_page",
+                                "page": { "observations": [{ "kind": { "kind": kind } }] }
+                            }
+                        }
+                    }
+                }
+            });
+            let envelope: HistoricalEnvelope = serde_json::from_value(payload).unwrap();
+            assert!(matches!(
+                envelope.validate_observation_compatibility(),
+                Err(HistoricalSessionEventError::InvalidEvent {
+                    schema_version: 53,
+                    ..
+                })
+            ));
+        }
+    }
+
+    #[test]
+    fn schema_53_observations_preserve_evidence_class_without_inventing_terminals() {
+        let base: serde_json::Value = serde_json::from_str(
+            include_str!("../fixtures/stores/epoch-16-schema-52-events.jsonl")
+                .lines()
+                .next()
+                .unwrap(),
+        )
+        .unwrap();
+        let session_id = base["session_id"].as_str().unwrap();
+        for kind in [
+            serde_json::json!({"kind": "text", "text": "historical progress"}),
+            serde_json::json!({"kind": "result", "text": "historical result"}),
+            serde_json::json!({
+                "kind": "submission_accepted", "submission_id": "submission",
+                "attempt_id": "attempt", "native_turn_id": "turn"
+            }),
+            serde_json::json!({"kind": "settlement", "native_turn_id": "turn"}),
+        ] {
+            let mut source = base.clone();
+            source["schema_version"] = serde_json::json!(53);
+            source["kind"] = serde_json::json!({
+                "external_observation_recorded": {
+                    "version": 1,
+                    "observation": {
+                        "observation_id": "old-observation", "session_id": session_id,
+                        "generation": 1, "native_correlations": ["turn"],
+                        "completeness": "complete", "kind": kind
+                    }
+                }
+            });
+            let normalized =
+                normalize_canonical_row(&bcode_session_migration_target::CanonicalRow {
+                    sequence: source["sequence"].as_u64().unwrap(),
+                    event_kind: "external_observation_recorded".into(),
+                    schema_version: 53,
+                    payload: source.to_string(),
+                })
+                .unwrap();
+            assert_eq!(normalized.event.schema_version, crate::CURRENT_EVENT_SCHEMA);
+            assert_eq!(
+                normalized.historical_source.as_deref(),
+                Some("53:external_observation_recorded")
+            );
+            assert!(!normalized.retired_known);
+            let converted = serde_json::to_value(normalized.event).unwrap();
+            assert_eq!(converted["kind"], source["kind"]);
+            assert_eq!(converted["sequence"], source["sequence"]);
+            assert_eq!(converted["timestamp_ms"], source["timestamp_ms"]);
+            assert_eq!(converted["session_id"], source["session_id"]);
+            assert_eq!(converted["provenance"], source["provenance"]);
+
+            source["schema_version"] = serde_json::json!(crate::CURRENT_EVENT_SCHEMA + 1);
+            assert!(matches!(
+                normalize_canonical_row(&bcode_session_migration_target::CanonicalRow {
+                    sequence: source["sequence"].as_u64().unwrap(),
+                    event_kind: "external_observation_recorded".into(),
+                    schema_version: crate::CURRENT_EVENT_SCHEMA + 1,
+                    payload: source.to_string(),
+                }),
+                Err(HistoricalSessionEventError::UnsupportedSchema { .. })
+            ));
+        }
+    }
+
+    #[test]
+    fn schema_53_rejects_new_closed_observation_variants() {
+        let mut source: serde_json::Value = serde_json::from_str(
+            include_str!("../fixtures/stores/epoch-16-schema-52-events.jsonl")
+                .lines()
+                .next()
+                .unwrap(),
+        )
+        .unwrap();
+        for kind in [
+            serde_json::json!({
+                "kind": "submission_consumed", "submission_id": "submission",
+                "attempt_id": "attempt", "native_frame_id": "frame"
+            }),
+            serde_json::json!({
+                "kind": "submission_result_observed", "submission_id": "submission",
+                "attempt_id": "attempt", "native_frame_id": "frame",
+                "is_error": false, "queued_user_sends": 0
+            }),
+            serde_json::json!({
+                "kind": "native_turn_terminal", "native_turn_id": "turn",
+                "disposition": "completed"
+            }),
+        ] {
+            source["schema_version"] = serde_json::json!(53);
+            source["kind"] = serde_json::json!({
+                "external_observation_recorded": {
+                    "version": 1,
+                    "observation": {
+                        "observation_id": "new-observation", "session_id": source["session_id"],
+                        "generation": 1, "native_correlations": ["turn"],
+                        "completeness": "complete", "kind": kind
+                    }
+                }
+            });
+            let mut row = bcode_session_migration_target::CanonicalRow {
+                sequence: source["sequence"].as_u64().unwrap(),
+                event_kind: "external_observation_recorded".into(),
+                schema_version: 53,
+                payload: source.to_string(),
+            };
+            assert!(matches!(
+                normalize_canonical_row(&row),
+                Err(HistoricalSessionEventError::InvalidEvent {
+                    schema_version: 53,
+                    ..
+                })
+            ));
+            source["schema_version"] = serde_json::json!(crate::CURRENT_EVENT_SCHEMA);
+            row.schema_version = crate::CURRENT_EVENT_SCHEMA;
+            row.payload = source.to_string();
+            assert!(normalize_canonical_row(&row).is_ok());
+        }
+    }
+
+    #[test]
     fn epoch_17_replay_preserves_normalized_external_evidence_without_vendor_runtime() {
         use bcode_session_models::external_backend::ExternalBackendEnvelope;
         let mut event = serde_json::from_str::<SessionEvent>(
@@ -1427,7 +1756,7 @@ mod tests {
         assert!(normalized.metric_counter.is_none());
         let plan = crate::plan_writer_epoch_migration(17).unwrap();
         assert_eq!(plan.target_writer_epoch, crate::CURRENT_WRITER_EPOCH);
-        assert_eq!(plan.steps.len(), 1);
+        assert_eq!(plan.steps.len(), 2);
     }
 
     #[test]

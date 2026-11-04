@@ -176,6 +176,8 @@ impl LaunchOptions {
         let mut command = self.command();
         command
             .args([
+                "--print",
+                "--include-partial-messages",
                 "--output-format",
                 "stream-json",
                 "--verbose",

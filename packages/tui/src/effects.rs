@@ -462,9 +462,18 @@ fn projection_page_as_history_page(
 }
 
 /// Submit-message effect request payload.
+#[derive(Debug)]
 pub struct SubmitMessageRequest {
     /// Stable identity allocated with the optimistic composer item.
     pub submission_id: bcode_session_models::SubmissionId,
+    /// Captured native intent; populated by the preparation round trip before dispatch.
+    pub managed: Option<bcode_session_models::ExternalHarnessRequest>,
+    /// Native attempt identity retained before preparation.
+    pub attempt_id: String,
+    /// Explicit native composer mode must never create model work.
+    pub managed_only: bool,
+    /// Explicit native turn selected by the user, never inferred from assistant text.
+    pub expected_native_turn_id: Option<String>,
     /// Existing session, if already attached.
     pub session_id: Option<SessionId>,
     /// Working directory to use when creating a draft session.
@@ -1492,6 +1501,12 @@ pub struct SessionStatusHydration {
 }
 
 #[derive(Debug)]
+pub enum ComposerReceipt {
+    Model(bcode_session_models::SubmissionReceipt),
+    Managed(Box<bcode_session_models::ExternalHarnessResponse>),
+}
+
+#[derive(Debug)]
 pub struct SubmitMessageResult {
     /// Session that received the message.
     pub session_id: SessionId,
@@ -1500,7 +1515,9 @@ pub struct SubmitMessageResult {
     /// Bounded lifecycle read following acceptance, when available.
     pub submission: Result<Option<bcode_session_models::SubmissionRecord>, ClientError>,
     /// Server acceptance for the submitted message.
-    pub receipt: bcode_session_models::SubmissionReceipt,
+    pub receipt: Option<ComposerReceipt>,
+    /// Prepared exact native envelope. Its debug representation is not printed.
+    pub prepared_request: Option<Box<SubmitMessageRequest>>,
     /// Agent committed during submission.
     pub committed_agent_id: Option<String>,
     /// Pending reasoning effort generation committed during submission.
@@ -1509,6 +1526,22 @@ pub struct SubmitMessageResult {
     pub event_task: Option<JoinHandle<()>>,
     /// Releases a newly-created session stream after the TUI installs the session id.
     pub event_stream_release: Option<oneshot::Sender<()>>,
+}
+
+impl SubmitMessageResult {
+    const fn empty(session_id: SessionId) -> Self {
+        Self {
+            session_id,
+            created_session: None,
+            submission: Ok(None),
+            receipt: None,
+            prepared_request: None,
+            committed_agent_id: None,
+            committed_reasoning_effort_generation: None,
+            event_task: None,
+            event_stream_release: None,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
@@ -1961,9 +1994,14 @@ const TUI_EFFECT_STREAM_CAPACITY: usize = 64;
 
 impl TuiEffect {
     #[cfg(test)]
-    pub(super) async fn run_for_test(self, client: BcodeClient) -> TuiEffectResult {
-        let (streaming_sender, _streaming_receiver) = mpsc::channel(1);
-        self.run(client, streaming_sender).await
+    pub(super) fn run_for_test(
+        self,
+        client: BcodeClient,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = TuiEffectResult> + Send>> {
+        Box::pin(async move {
+            let (streaming_sender, _streaming_receiver) = mpsc::channel(1);
+            Box::pin(self.run(client, streaming_sender)).await
+        })
     }
 
     pub(super) fn command_key(&self) -> bmux_tui_runtime::CommandKey {
@@ -2703,7 +2741,9 @@ impl TuiEffect {
                 .await;
                 TuiEffectResult::PluginCommandInvoked { plugin_id, result }
             }
-            Self::SubmitMessage { request } => run_submit_message(&client, *request).await,
+            Self::SubmitMessage { request } => {
+                Box::pin(run_submit_message(&client, *request)).await
+            }
             Self::SkillAction { request } => run_skill_action(&client, *request).await,
             Self::SetSessionModel {
                 session_id,
@@ -3059,7 +3099,7 @@ async fn run_submit_message(
     TuiEffectResult::SubmitMessage {
         submission_id: request.submission_id.clone(),
         message,
-        result: Box::new(submit_message(client, request).await),
+        result: Box::new(Box::pin(submit_message(client, request)).await),
     }
 }
 
@@ -3202,108 +3242,165 @@ async fn require_model_submission_target(
     Ok(())
 }
 
+fn validate_managed_composer_request(request: &SubmitMessageRequest) -> Result<(), ClientError> {
+    if let Some(retained) = request.managed.as_ref() {
+        let bcode_session_models::ExternalHarnessRequestKind::Submit { submission, .. } =
+            &retained.kind
+        else {
+            return Err(ClientError::Protocol(
+                "Invalid managed composer request".into(),
+            ));
+        };
+        if Some(
+            submission
+                .session_id
+                .parse::<SessionId>()
+                .map_err(|_| ClientError::Protocol("Invalid managed session".into()))?,
+        ) != request.session_id
+            || submission.submission_id != request.submission_id.0
+            || submission.attempt_id != request.attempt_id
+            || submission.text != request.message
+        {
+            return Err(ClientError::Protocol(
+                "Managed composer request changed before dispatch".into(),
+            ));
+        }
+    }
+    Ok(())
+}
+
+async fn prepare_composer_session(
+    client: &BcodeClient,
+    request: &mut SubmitMessageRequest,
+) -> Result<SubmitMessageResult, ClientError> {
+    if let Some(session_id) = request.session_id {
+        return Ok(SubmitMessageResult::empty(session_id));
+    }
+    if request.managed_only {
+        return Err(ClientError::Protocol(
+            "Create and attach a managed session before native input; no model session was created"
+                .into(),
+        ));
+    }
+    let session = client
+        .create_session_in_working_directory(None, request.launch_working_directory.clone())
+        .await
+        .map_err(|error| submission_stage_error("creating the session", error))?;
+    let _ = execute_session_view_action(
+        client,
+        SessionViewAction::UpdateDraft {
+            scope: bcode_session_view_models::ComposerDraftViewScope::DraftSession {
+                launch_working_directory: request.launch_working_directory.clone(),
+            },
+            text: String::new(),
+        },
+    )
+    .await;
+    let (attached, task, release) = history_flow::attach_paused_session_event_stream(
+        client,
+        session.id,
+        request.event_sender.clone(),
+    )
+    .await
+    .map_err(submission_attach_error)?;
+    let session_id = session.id;
+    request.message = clipboard_image::promote_draft_clipboard_images(
+        &request.message,
+        &request.launch_working_directory,
+        session_id,
+    )
+    .map_err(|error| ClientError::Server {
+        code: "tui_clipboard_image_promotion_failed".to_owned(),
+        message: error.to_string(),
+    })?;
+    request.session_id = Some(session_id);
+    let mut result = SubmitMessageResult::empty(session_id);
+    result.created_session = Some(attached.session);
+    result.event_task = Some(task);
+    result.event_stream_release = Some(release);
+    Ok(result)
+}
+
 async fn submit_message(
     client: &BcodeClient,
-    request: SubmitMessageRequest,
+    mut request: SubmitMessageRequest,
 ) -> Result<SubmitMessageResult, ClientError> {
-    let SubmitMessageRequest {
-        submission_id,
-        session_id,
-        launch_working_directory,
-        message,
-        placement,
-        provider_plugin_id,
-        model_id,
-        agent_id,
-        reasoning_effort,
-        reasoning_summary,
-        reasoning_effort_generation,
-        mut execution,
-        event_sender,
-    } = request;
-    execution.reasoning = Some(Box::new(bcode_session_models::TurnReasoningOptions {
-        effort: reasoning_effort.clone(),
-        summary: reasoning_summary.clone(),
-    }));
-    execution.agent_profile.clone_from(&agent_id);
-    let mut message = message;
-    let mut created_session = None;
-    let mut event_task = None;
-    let mut event_stream_release = None;
-    let session_id = if let Some(session_id) = session_id {
-        session_id
-    } else {
-        let session = client
-            .create_session_in_working_directory(None, launch_working_directory.clone())
-            .await
-            .map_err(|error| submission_stage_error("creating the session", error))?;
-        let _ = execute_session_view_action(
-            client,
-            SessionViewAction::UpdateDraft {
-                scope: bcode_session_view_models::ComposerDraftViewScope::DraftSession {
-                    launch_working_directory: launch_working_directory.clone(),
-                },
-                text: String::new(),
-            },
+    validate_managed_composer_request(&request)?;
+    let mut result = Box::pin(prepare_composer_session(client, &mut request)).await?;
+    if let Some(retained) = request.managed.take() {
+        let response = client.submit_managed_composer_request(retained).await?;
+        result.receipt = Some(ComposerReceipt::Managed(Box::new(response)));
+        return Ok(result);
+    }
+    let prepared = client
+        .prepare_managed_composer_submission(
+            result.session_id,
+            (request.submission_id.0.clone(), request.attempt_id.clone()),
+            request.message.clone(),
+            request.placement == PromptPlacement::Steering,
+            request.expected_native_turn_id.clone(),
         )
-        .await;
-        let (attached, task, release) =
-            history_flow::attach_paused_session_event_stream(client, session.id, event_sender)
-                .await
-                .map_err(submission_attach_error)?;
-        let session_id = session.id;
-        message = clipboard_image::promote_draft_clipboard_images(
-            &message,
-            &launch_working_directory,
-            session_id,
-        )
-        .map_err(|error| ClientError::Server {
-            code: "tui_clipboard_image_promotion_failed".to_owned(),
-            message: error.to_string(),
-        })?;
-        created_session = Some(attached.session);
-        event_task = Some(task);
-        event_stream_release = Some(release);
-        session_id
-    };
-    require_model_submission_target(client, session_id).await?;
+        .await?;
+    if let Some(managed) = prepared {
+        request.managed = Some(managed);
+        request.managed_only = true;
+        result.prepared_request = Some(Box::new(request));
+        return Ok(result);
+    }
+    if request.managed_only {
+        return Err(ClientError::Protocol(
+            "Managed native target unavailable; no model fallback".into(),
+        ));
+    }
+    Box::pin(submit_model_composer(client, request, result)).await
+}
+
+async fn submit_model_composer(
+    client: &BcodeClient,
+    mut request: SubmitMessageRequest,
+    mut result: SubmitMessageResult,
+) -> Result<SubmitMessageResult, ClientError> {
+    require_model_submission_target(client, result.session_id).await?;
     apply_submit_runtime_selections(
         client,
-        session_id,
-        provider_plugin_id,
-        model_id,
+        result.session_id,
+        request.provider_plugin_id,
+        request.model_id,
         None,
-        reasoning_effort.clone(),
-        reasoning_summary.clone(),
+        request.reasoning_effort.clone(),
+        request.reasoning_summary.clone(),
     )
     .await
     .map_err(|error| submission_stage_error("applying model/agent/reasoning selections", error))?;
+    request.execution.reasoning = Some(Box::new(bcode_session_models::TurnReasoningOptions {
+        effort: request.reasoning_effort,
+        summary: request.reasoning_summary,
+    }));
+    request
+        .execution
+        .agent_profile
+        .clone_from(&request.agent_id);
     let outcome = execute_session_view_action(
         client,
         SessionViewAction::SubmitMessage {
-            submission_id,
-            session_id: Some(session_id),
+            submission_id: request.submission_id,
+            session_id: Some(result.session_id),
             launch_working_directory: None,
-            text: message,
-            placement,
-            execution: Box::new(execution),
+            text: request.message,
+            placement: request.placement,
+            execution: Box::new(request.execution),
         },
     )
     .await
     .map_err(|error| submission_stage_error("waiting for message acceptance", error))?;
     let receipt = submission_receipt_from_action(outcome)?;
-    Ok(SubmitMessageResult {
-        session_id,
-        created_session,
-        submission: client
-            .get_submission(session_id, receipt.submission_id.clone())
-            .await,
-        receipt,
-        committed_agent_id: agent_id,
-        committed_reasoning_effort_generation: reasoning_effort_generation,
-        event_task,
-        event_stream_release,
-    })
+    result.submission = client
+        .get_submission(result.session_id, receipt.submission_id.clone())
+        .await;
+    result.receipt = Some(ComposerReceipt::Model(receipt));
+    result.committed_agent_id = request.agent_id;
+    result.committed_reasoning_effort_generation = request.reasoning_effort_generation;
+    Ok(result)
 }
 
 fn submission_receipt_from_action(

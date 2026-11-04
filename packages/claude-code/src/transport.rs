@@ -23,6 +23,8 @@ struct State {
     callbacks: BTreeMap<String, CallbackRequest>,
     responding: BTreeSet<String>,
     lifecycle: Lifecycle,
+    attribution: crate::attribution::AttributionLedger,
+    attributed_mode: Option<bool>,
     fault: Option<Fault>,
     expected_session_id: Option<String>,
     confirmed_session_id: Option<String>,
@@ -218,7 +220,7 @@ impl ClaudeSession {
     /// # Errors
     /// Invalid selection, version mismatch, process creation failure or invalid limits.
     pub async fn spawn(options: LaunchOptions) -> Result<Self, Error> {
-        Self::spawn_selected(options, Vec::new(), None).await
+        Self::spawn_selected(options, Vec::new(), None, false).await
     }
     /// Create a new native session with an explicit UUID using `--session-id`.
     /// The requested UUID is selection only: call `initialize`, submit the actual task,
@@ -232,7 +234,13 @@ impl ClaudeSession {
                 "create and resume are mutually exclusive",
             ));
         }
-        Self::spawn_selected(options, Vec::new(), Some(native_session_id.to_owned())).await
+        Self::spawn_selected(
+            options,
+            Vec::new(),
+            Some(native_session_id.to_owned()),
+            false,
+        )
+        .await
     }
     /// Launch with bounded in-process SDK MCP server names. `McpMessage` callbacks
     /// are routed to the caller; this library never executes tools itself.
@@ -242,7 +250,7 @@ impl ClaudeSession {
         options: LaunchOptions,
         servers: Vec<String>,
     ) -> Result<Self, Error> {
-        Self::spawn_selected(options, servers, None).await
+        Self::spawn_selected(options, servers, None, false).await
     }
     /// Explicit new-session identity together with SDK MCP registrations.
     /// # Errors
@@ -258,26 +266,38 @@ impl ClaudeSession {
                 "create and resume are mutually exclusive",
             ));
         }
-        Self::spawn_selected(options, servers, Some(native_session_id.to_owned())).await
+        Self::spawn_selected(options, servers, Some(native_session_id.to_owned()), false).await
+    }
+    /// Create a fresh session with native tools and MCP disabled at launch.
+    /// This is not a general no-effects sandbox or a settlement capability claim:
+    /// managed hooks/configuration still require independent trust and observation.
+    /// # Errors
+    /// Same as `spawn_new`; resume and SDK server registration are not allowed.
+    pub async fn spawn_new_without_tools(
+        options: LaunchOptions,
+        native_session_id: &str,
+    ) -> Result<Self, Error> {
+        crate::validate_session_uuid(native_session_id)?;
+        if options.resume_session_id.is_some() {
+            return Err(Error::InvalidConfiguration(
+                "create and resume are mutually exclusive",
+            ));
+        }
+        Self::spawn_selected(
+            options,
+            Vec::new(),
+            Some(native_session_id.to_owned()),
+            true,
+        )
+        .await
     }
     async fn spawn_selected(
         options: LaunchOptions,
         servers: Vec<String>,
         create_id: Option<String>,
+        without_tools: bool,
     ) -> Result<Self, Error> {
-        if servers.len() > 32 {
-            return Err(Error::Capacity);
-        }
-        let mut native_servers = BTreeMap::new();
-        for name in servers {
-            crate::launch::validate_id(&name)?;
-            if native_servers
-                .insert(name.clone(), json!({"type":"sdk","name":name}))
-                .is_some()
-            {
-                return Err(Error::InvalidConfiguration("duplicate SDK MCP server"));
-            }
-        }
+        let native_servers = sdk_server_configuration(servers)?;
         let auth = crate::auth_status(&options).await?;
         if !auth.logged_in {
             return Err(Error::InvalidConfiguration(
@@ -288,6 +308,9 @@ impl ClaudeSession {
             .clone()
             .or_else(|| options.resume_session_id.clone());
         let mut command = options.stream_command();
+        if without_tools {
+            configure_without_tools(&mut command);
+        }
         if let Some(id) = create_id {
             command.arg(format!("--session-id={id}"));
         }
@@ -310,6 +333,8 @@ impl ClaudeSession {
                 callbacks: BTreeMap::new(),
                 responding: BTreeSet::new(),
                 lifecycle: Lifecycle::new(options.settlement_support, options.limits.active_tasks),
+                attribution: crate::attribution::AttributionLedger::new(),
+                attributed_mode: None,
                 fault: None,
                 expected_session_id,
                 confirmed_session_id: None,
@@ -568,6 +593,28 @@ impl ClaudeClient {
         text: &str,
         native_session_id: Option<&str>,
     ) -> Result<DeliveryReceipt, Error> {
+        self.submit_inner(text, native_session_id, None).await
+    }
+    /// Submit one exact client-selected attempt UUID, retained before enqueueing.
+    /// The UUID is a correlation key, never a native turn ID. A failed/uncertain
+    /// write does not release it or authorize retry. At most 256 UUIDs are retained
+    /// for this process lifetime; callers must not mix attributed and legacy sends.
+    /// # Errors
+    /// Same as `submit`, plus reused UUID or exhausted retained-attempt capacity.
+    pub async fn submit_with_uuid(
+        &self,
+        text: &str,
+        native_session_id: Option<&str>,
+        uuid: crate::SubmissionUuid,
+    ) -> Result<DeliveryReceipt, Error> {
+        self.submit_inner(text, native_session_id, Some(uuid)).await
+    }
+    async fn submit_inner(
+        &self,
+        text: &str,
+        native_session_id: Option<&str>,
+        uuid: Option<crate::SubmissionUuid>,
+    ) -> Result<DeliveryReceipt, Error> {
         if self.shared.initialized.load(Ordering::Acquire) != 2 {
             return Err(Error::InvalidConfiguration("not initialized"));
         }
@@ -586,8 +633,11 @@ impl ClaudeClient {
                 return Err(Error::SessionIdentity);
             }
         }
-        let frame = json!({"type":"user","session_id":native_session_id.unwrap_or(""),
+        let mut frame = json!({"type":"user","session_id":native_session_id.unwrap_or(""),
             "message":{"role":"user","content":text},"parent_tool_use_id":null});
+        if let Some(uuid) = &uuid {
+            frame["uuid"] = json!(uuid.as_str());
+        }
         let ack = {
             let mut state = self.shared.lock();
             if let Some(fault) = state.fault {
@@ -597,6 +647,18 @@ impl ClaudeClient {
                 return Err(Error::InvalidConfiguration(
                     "active turn steering is unsupported; wait for authoritative settlement",
                 ));
+            }
+            if state
+                .attributed_mode
+                .is_some_and(|mode| mode != uuid.is_some())
+            {
+                return Err(Error::InvalidConfiguration(
+                    "mixed attributed and legacy submissions",
+                ));
+            }
+            state.attributed_mode = Some(uuid.is_some());
+            if let Some(uuid) = uuid {
+                state.attribution.retain(uuid)?;
             }
             let ack = self.shared.enqueue(&frame, None)?;
             state.lifecycle.submit();
@@ -717,7 +779,7 @@ async fn read_stdout(
                 if frame.is_empty() {
                     continue;
                 }
-                let result = serde_json::from_slice::<Value>(&frame)
+                let result = crate::attribution::decode_frame(&frame)
                     .map_err(|_| Error::Protocol)
                     .and_then(|value| route(value, &shared, &events));
                 frame.clear();
@@ -743,6 +805,33 @@ async fn read_stdout(
     } else {
         Fault::Protocol
     });
+}
+fn configure_without_tools(command: &mut tokio::process::Command) {
+    command.args([
+        "--tools",
+        "",
+        "--strict-mcp-config",
+        "--mcp-config",
+        "{\"mcpServers\":{}}",
+        "--disable-slash-commands",
+        "--no-session-persistence",
+    ]);
+}
+fn sdk_server_configuration(servers: Vec<String>) -> Result<BTreeMap<String, Value>, Error> {
+    if servers.len() > 32 {
+        return Err(Error::Capacity);
+    }
+    let mut native_servers = BTreeMap::new();
+    for name in servers {
+        crate::launch::validate_id(&name)?;
+        if native_servers
+            .insert(name.clone(), json!({"type":"sdk","name":name}))
+            .is_some()
+        {
+            return Err(Error::InvalidConfiguration("duplicate SDK MCP server"));
+        }
+    }
+    Ok(native_servers)
 }
 fn send_event(events: &mpsc::Sender<Event>, event: Event) -> Result<(), Error> {
     events.try_send(event).map_err(|_| Error::Capacity)
@@ -786,6 +875,36 @@ fn handle_control_response(value: &Value, shared: &Shared, state: &mut State) ->
     }
     Ok(())
 }
+fn handle_control_request(
+    value: &Value,
+    shared: &Shared,
+    state: &mut State,
+    events: &mpsc::Sender<Event>,
+) -> Result<(), Error> {
+    let id = value
+        .get("request_id")
+        .and_then(Value::as_str)
+        .ok_or(Error::Protocol)?;
+    crate::launch::validate_id(id)?;
+    if state.callbacks.contains_key(id) {
+        return Err(Error::Protocol);
+    }
+    if state.callbacks.len() >= shared.limits.active_callbacks {
+        return Err(Error::Capacity);
+    }
+    let request: CallbackRequest =
+        serde_json::from_value(value.get("request").cloned().ok_or(Error::Protocol)?)
+            .map_err(|_| Error::Protocol)?;
+    state.lifecycle.attention();
+    state.callbacks.insert(id.to_owned(), request.clone());
+    send_event(
+        events,
+        Event::Callback {
+            request_id: id.to_owned(),
+            request,
+        },
+    )
+}
 fn route(value: Value, shared: &Shared, events: &mpsc::Sender<Event>) -> Result<(), Error> {
     let kind = value
         .get("type")
@@ -800,29 +919,7 @@ fn route(value: Value, shared: &Shared, events: &mpsc::Sender<Event>) -> Result<
             handle_control_response(&value, shared, &mut state)?;
         }
         "control_request" => {
-            let id = value
-                .get("request_id")
-                .and_then(Value::as_str)
-                .ok_or(Error::Protocol)?;
-            crate::launch::validate_id(id)?;
-            if state.callbacks.contains_key(id) {
-                return Err(Error::Protocol);
-            }
-            if state.callbacks.len() >= shared.limits.active_callbacks {
-                return Err(Error::Capacity);
-            }
-            let request: CallbackRequest =
-                serde_json::from_value(value.get("request").cloned().ok_or(Error::Protocol)?)
-                    .map_err(|_| Error::Protocol)?;
-            state.lifecycle.attention();
-            state.callbacks.insert(id.to_owned(), request.clone());
-            send_event(
-                events,
-                Event::Callback {
-                    request_id: id.to_owned(),
-                    request,
-                },
-            )?;
+            handle_control_request(&value, shared, &mut state, events)?;
         }
         "control_cancel_request" => {
             let id = value
@@ -839,7 +936,8 @@ fn route(value: Value, shared: &Shared, events: &mpsc::Sender<Event>) -> Result<
                 )?;
             }
         }
-        "system" | "assistant" | "user" | "result" | "stream_event" => {
+        "system" | "assistant" | "user" | "result" | "stream_event" | "command_lifecycle"
+        | "rate_limit_event" => {
             if kind == "system" && value.get("subtype").and_then(Value::as_str) == Some("init") {
                 let id = value
                     .get("session_id")
@@ -863,8 +961,23 @@ fn route(value: Value, shared: &Shared, events: &mpsc::Sender<Event>) -> Result<
                     return Err(Error::SessionIdentity);
                 }
             }
+            let attribution = state.attribution.observe(&value)?;
+            if attribution.is_some() {
+                let id = value
+                    .get("session_id")
+                    .and_then(Value::as_str)
+                    .ok_or(Error::SessionIdentity)?;
+                confirm_identity(&mut state, id)?;
+                shared.identity_changed.notify_waiters();
+            }
             let previous = state.settlement();
-            state.lifecycle.observe(&value)?;
+            // A session-scoped/startup/stale result cannot settle an attributed attempt.
+            if kind != "result"
+                || state.attributed_mode != Some(true)
+                || state.attribution.answers_current(attribution.as_ref())
+            {
+                state.lifecycle.observe(&value)?;
+            }
             let next = state.settlement();
             drop(state);
             let message = match kind {
@@ -872,8 +985,12 @@ fn route(value: Value, shared: &Shared, events: &mpsc::Sender<Event>) -> Result<
                 "assistant" => NativeMessage::Assistant(value),
                 "user" => NativeMessage::User(value),
                 "result" => NativeMessage::Result(value),
-                _ => NativeMessage::Stream(value),
+                "stream_event" => NativeMessage::Stream(value),
+                _ => NativeMessage::Notice(value),
             };
+            if let Some(attribution) = attribution {
+                send_event(events, Event::Attribution(attribution))?;
+            }
             send_event(events, Event::Message(message))?;
             if next != previous {
                 send_event(events, Event::Settlement(next))?;

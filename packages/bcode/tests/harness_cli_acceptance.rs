@@ -20,6 +20,7 @@ const CHILD: &str = "22222222-2222-4222-8222-222222222222";
 const PROBE_SESSION: &str = "33333333-3333-4333-8333-333333333333";
 #[cfg(all(unix, feature = "daemon-client"))]
 const PROBE_CHILD: &str = "44444444-4444-4444-8444-444444444444";
+const ATTEMPT: &str = "55555555-5555-4555-8555-555555555555";
 const SECRET: &str = "fixture-secret-DO-NOT-PERSIST";
 const BUDGET: u64 = 1_048_576;
 
@@ -34,6 +35,106 @@ struct Reply {
     ok: bool,
     value: Value,
     output: String,
+}
+
+fn response_failure_label(value: &Value) -> &'static str {
+    if value["kind"]["kind"].as_str() != Some("failure") {
+        return "not_failure";
+    }
+    match value["kind"]["response"].as_str() {
+        Some("unsupported") => "unsupported",
+        Some("invalid_request") => "invalid_request",
+        Some("unavailable") => "unavailable",
+        Some("stale_generation") => "stale_generation",
+        Some("conflict") => "conflict",
+        Some("authentication") => "authentication",
+        Some("policy") => "policy",
+        Some("uncertain") => "uncertain",
+        _ => "unrecognized_failure",
+    }
+}
+
+fn operation_label(args: &[&str]) -> &'static str {
+    match args {
+        ["artifact-id", ..] => "artifact_identity",
+        ["server", "start", ..] => "server_start",
+        ["server", "stop", ..] => "server_stop",
+        ["harness", "start", ..] => "harness_start",
+        ["harness", ..] => "harness_operation",
+        ["session", ..] => "session_operation",
+        _ => "other_operation",
+    }
+}
+
+fn bounded_failure_code(stderr: &mut std::fs::File) -> &'static str {
+    if stderr.rewind().is_err() {
+        return "diagnostic_read_failed";
+    }
+    let mut prefix = Vec::new();
+    if stderr.take(8192).read_to_end(&mut prefix).is_err() {
+        return "diagnostic_read_failed";
+    }
+    // Never echo native/provider output, paths, arguments, transcripts, or arbitrary error codes.
+    // Only a fixed classification of the first recognized public/runtime failure is emitted.
+    let categories: &[(&[u8], &str)] = &[
+        (b"daemon_start_timeout", "daemon_start_timeout"),
+        (b"daemon_start_exited", "daemon_start_exited"),
+        (b"daemon_start_health_check", "daemon_start_health_check"),
+        (
+            b"daemon_start_endpoint_occupied",
+            "daemon_start_endpoint_occupied",
+        ),
+        (b"daemon_start_incompatible", "daemon_start_incompatible"),
+        (b"daemon_start_connection", "daemon_start_connection"),
+        (b"panicked at", "runtime_panic"),
+        (b"stack overflow", "runtime_stack_overflow"),
+        (b"unrecognized subcommand", "cli_subcommand_rejected"),
+        (b"unexpected argument", "cli_argument_rejected"),
+        (b"Permission denied", "permission_denied"),
+        (b"No such file or directory", "missing_file"),
+        (b"Address already in use", "endpoint_in_use"),
+        (b"Connection refused", "connection_refused"),
+        (b"error", "unclassified_error"),
+    ];
+    categories
+        .iter()
+        .filter_map(|(needle, code)| {
+            prefix
+                .windows(needle.len())
+                .position(|window| window == *needle)
+                .map(|position| (position, *code))
+        })
+        .min_by_key(|(position, _)| *position)
+        .map_or("no_recognized_error_in_prefix", |(_, code)| code)
+}
+
+#[test]
+fn budget_failure_diagnostics_are_fixed_and_do_not_echo_output() {
+    use std::io::Write as _;
+    let mut stderr = tempfile::tempfile().unwrap();
+    writeln!(
+        stderr,
+        "{SECRET}\nthread 'private-name' panicked at /private/path"
+    )
+    .unwrap();
+    assert_eq!(bounded_failure_code(&mut stderr), "runtime_panic");
+    assert_eq!(operation_label(&["server", "start"]), "server_start");
+    assert_eq!(operation_label(&[SECRET]), "other_operation");
+    assert_eq!(
+        response_failure_label(&json!({"kind":{"kind":"failure","response":"conflict"}})),
+        "conflict"
+    );
+    assert_eq!(
+        response_failure_label(&json!({"kind":{"kind":"failure","response":SECRET}})),
+        "unrecognized_failure"
+    );
+    let mut bounded = tempfile::tempfile().unwrap();
+    bounded.write_all(&vec![b'x'; 8192]).unwrap();
+    bounded.write_all(b"panicked at secret tail").unwrap();
+    assert_eq!(
+        bounded_failure_code(&mut bounded),
+        "no_recognized_error_in_prefix"
+    );
 }
 
 impl Cli {
@@ -164,13 +265,20 @@ impl Cli {
                     self.native_timings()
                 );
             }
-            if Instant::now() >= deadline
-                || out.metadata().unwrap().len() > BUDGET
-                || err.metadata().unwrap().len() > BUDGET
-            {
+            let deadline_exceeded = Instant::now() >= deadline;
+            let stdout_bytes = out.metadata().unwrap().len();
+            let stderr_bytes = err.metadata().unwrap().len();
+            let stdout_cap_exceeded = stdout_bytes > BUDGET;
+            let stderr_cap_exceeded = stderr_bytes > BUDGET;
+            if deadline_exceeded || stdout_cap_exceeded || stderr_cap_exceeded {
                 let _ = child.kill();
                 let _ = child.wait();
-                panic!("bounded isolated CLI operation exceeded its budget");
+                let code = bounded_failure_code(&mut err);
+                panic!(
+                    "bounded isolated CLI failure: operation={} deadline_exceeded={deadline_exceeded} stdout_cap_exceeded={stdout_cap_exceeded} stderr_cap_exceeded={stderr_cap_exceeded} stdout_bytes={stdout_bytes} stderr_bytes={stderr_bytes} elapsed={:?} diagnostic_code={code}",
+                    operation_label(args),
+                    started.elapsed(),
+                );
             }
             std::thread::sleep(Duration::from_millis(10));
         };
@@ -321,7 +429,7 @@ impl Cli {
 
     fn send(&self, target: &Value, text: &str) -> Reply {
         self.call("send", json!({"operation":"submit","request":{"target":target,
-            "submission":{"submission_id":"retained-submit","attempt_id":"retained-attempt",
+            "submission":{"submission_id":"retained-submit","attempt_id":ATTEMPT,
                 "session_id":target["session"]["session_id"],"generation":target["session"]["generation"],
                 "text":text,"placement":{"kind":"next_turn"}}}}),
             target["session"]["session_id"].as_str().unwrap(), None)
@@ -440,7 +548,7 @@ impl Cli {
         };
         self.call("reconcile", json!({"operation":"reconcile","request":{
             "session_id":target["session"]["session_id"],"generation":target["session"]["generation"],
-            "open_id":target["session"].get("open_id"),"submission_id":"retained-submit","attempt_id":"retained-attempt",
+            "open_id":target["session"].get("open_id"),"submission_id":"retained-submit","attempt_id":ATTEMPT,
             "binding":binding}}),target["session"]["session_id"].as_str().unwrap(),None)
     }
 }
@@ -509,7 +617,12 @@ fn managed_start_respond_stale_cancel_and_offline_bounded_history() {
     );
     let first = cli.send(&binding, "fixture-only");
     assert!(first.ok);
-    assert_eq!(first.value["kind"]["kind"], "receipt");
+    assert_eq!(
+        first.value["kind"]["kind"],
+        "receipt",
+        "first send response: failure={}",
+        response_failure_label(&first.value)
+    );
     let retry = cli.send(&binding, "fixture-only");
     assert!(retry.ok);
     assert_eq!(first.value, retry.value);

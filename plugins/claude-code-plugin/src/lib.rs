@@ -2,11 +2,13 @@
 #![warn(clippy::all, clippy::pedantic, clippy::nursery, clippy::cargo)]
 #![allow(clippy::multiple_crate_versions)]
 //! Claude Code execution backend. The host owns admission and canonical persistence.
+mod attribution;
 mod auth;
 mod capabilities;
 mod config;
 mod normalize;
 mod parent_bridge;
+pub use attribution::RetainedAttribution;
 pub use auth::{
     NATIVE_HANDOFF_INTERFACE_ID, NATIVE_HANDOFF_OPERATION, NativeLoginExecution,
     NativeLoginHandoffData, NativeLoginHandoffRequest, NativeLoginHandoffResponse,
@@ -59,7 +61,7 @@ impl StreamState {
             self.gap = true;
         }
         self.observations.extend(observations);
-        true
+        !self.gap
     }
 }
 impl StreamState {
@@ -235,6 +237,25 @@ impl RustPlugin for ClaudeCodePlugin {
     }
 }
 impl ClaudeCodePlugin {
+    /// Inspect bounded, sanitized producer evidence on an exact retained target.
+    /// This is not canonical publication, native turn acceptance, settlement, or
+    /// authority to execute/replay. Portable consumed/result observations are also
+    /// emitted through normal observation delivery. Raw native payloads and
+    /// prompt/result text are never returned by this inspection method.
+    /// # Errors
+    /// Unknown transport, instance mismatch, stale generation, or poisoned state.
+    pub fn retained_attribution(
+        &mut self,
+        instance: &HarnessInstance,
+        target: &HarnessSessionTarget,
+    ) -> Result<Vec<RetainedAttribution>, HarnessFailure> {
+        let process = self.retained_process(instance, target)?;
+        let stream = process
+            .stream
+            .lock()
+            .map_err(|_| HarnessFailure::Unavailable)?;
+        Ok(stream.normalizer.retained_attribution().to_vec())
+    }
     async fn invoke(
         &mut self,
         request: &HarnessRequest,
@@ -334,14 +355,8 @@ impl ClaudeCodePlugin {
             return Err(HarnessFailure::Unavailable);
         }
         if process.submissions.len() >= MAX_RETAINED_MUTATIONS {
-            if process.client.settlement() != Settlement::Settled {
-                return Err(HarnessFailure::Unavailable);
-            }
-            // Canonical host admission owns replay fencing over the entire lifetime.
-            // These caches are only recent evidence; eviction never establishes NotApplied.
-            process.submissions.clear();
-            process.responses.clear();
-            process.controls.clear();
+            // Never evict exact UUID/attempt ownership while this process can emit frames.
+            return Err(HarnessFailure::Unavailable);
         }
         if matches!(target, HarnessSessionTarget::Prepared(_))
             && process
@@ -374,18 +389,23 @@ impl ClaudeCodePlugin {
             state: HarnessDeliveryState::DeliveryAttempted,
             native_request_id: None,
         };
-        process.submissions.insert(
-            submission.submission_id.clone(),
-            (submission.clone(), receipt.clone()),
-        );
-        {
+        let native_uuid = {
             let mut stream = process
                 .stream
                 .lock()
                 .map_err(|_| HarnessFailure::Unavailable)?;
+            let uuid = stream
+                .normalizer
+                .retain_submission(submission)
+                .map_err(|_| HarnessFailure::Conflict)?;
             stream.normalizer.submitted = true;
             stream.normalizer.turn_id = None;
-        }
+            uuid
+        };
+        process.submissions.insert(
+            submission.submission_id.clone(),
+            (submission.clone(), receipt.clone()),
+        );
         // A completed write is not a native acceptance acknowledgement.
         let native_selection = match target {
             HarnessSessionTarget::Prepared(value) => value.requested_native_session_id.as_deref(),
@@ -393,7 +413,7 @@ impl ClaudeCodePlugin {
         };
         receipt.state = if process
             .client
-            .submit(&submission.text, native_selection)
+            .submit_with_uuid(&submission.text, native_selection, native_uuid)
             .await
             .is_ok()
         {

@@ -5,6 +5,29 @@ See [Child sessions](child-sessions.md) for immutable recursive session relation
 See [Session storage tiering](session-storage-tiering.md) for the implemented bounded storage
 measurement command and the remaining transparent-compression design.
 
+## Native harness terminal-evidence upgrade
+
+Writer epoch 19 and event schema 54 introduce the closed observation variants
+`SubmissionConsumed`, `SubmissionResultObserved`, and `NativeTurnTerminal`. The
+`session-writer-epoch-18-to-19` migration is owned by session migration and runs through
+exclusive upgrade/maintenance coordination, with the existing backup, interruption recovery,
+receipt and strict-target validation sequence. Epoch-18 writers cannot write an epoch-19 store;
+unknown future epochs or event schemas are rejected without mutation.
+
+Schema-53 events remain recognized historical input. Conversion changes the event envelope to
+schema 54 while preserving sequence, timestamp, session, provenance and original event semantics.
+Historical acceptance, result and settlement observations are not converted into terminal outcomes
+or replay authority. The newly introduced closed variants are rejected if presented as schema 53.
+
+The migration replays normalized canonical events through the existing typed migration-target
+projector hooks. Harness-operation projection owns `terminal_coverage_v2`, exact native-frame
+attribution, result/terminal/settlement and gap keys in `turn_evidence`; migration does not maintain
+a second key inventory or reconstruct native evidence. Historical pages receive coverage for
+what they actually contain, never synthesized terminal dispositions. Projector finalization and
+strict validation precede advancing the writer contract. Missing or incompatible coverage in
+normal reads or appends remains maintenance-required: those paths do not replay history or
+silently rebuild the projection.
+
 ## Compaction synthesis recovery
 
 Writer epoch 17 adds indexed operational compaction-synthesis checkpoints without changing event

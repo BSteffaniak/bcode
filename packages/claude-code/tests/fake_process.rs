@@ -72,6 +72,55 @@ async fn settled(session: &mut ClaudeSession) {
 }
 
 #[tokio::test(flavor = "current_thread")]
+async fn uuid_wire_submission_emits_reply_and_result_evidence_before_raw_frames() {
+    use bcode_claude_code::{AttributionStage, NativeMessage, SubmissionUuid};
+    let fake = Fake::new("attribution");
+    let mut session = fake.start().await;
+    let client = session.client();
+    let uuid = SubmissionUuid::new("00000000-0000-4000-8000-000000000001".into()).unwrap();
+    client
+        .submit_with_uuid("hello", None, uuid.clone())
+        .await
+        .unwrap();
+    let mut stages = Vec::new();
+    let mut saw_notice = false;
+    let mut saw_settlement = false;
+    for _ in 0..16 {
+        match receive(&mut session).await.unwrap() {
+            Event::Attribution(evidence) => {
+                assert_eq!(evidence.primary, uuid);
+                assert_eq!(evidence.consumed, vec![uuid.clone()]);
+                stages.push(evidence.stage);
+            }
+            Event::Message(NativeMessage::Assistant(_)) => {
+                assert_eq!(stages, [AttributionStage::Reply]);
+            }
+            Event::Message(NativeMessage::Result(_)) => assert_eq!(stages.len(), 2),
+            Event::Message(NativeMessage::Notice(_)) => saw_notice = true,
+            Event::Settlement(Settlement::Settled) => {
+                saw_settlement = true;
+                break;
+            }
+            _ => {}
+        }
+    }
+    assert!(saw_settlement && saw_notice);
+    assert_eq!(
+        stages,
+        [
+            AttributionStage::Reply,
+            AttributionStage::Result {
+                is_error: false,
+                queued_turn_count: Some(0)
+            }
+        ]
+    );
+    assert!(client.submit_with_uuid("hello", None, uuid).await.is_err());
+    assert!(client.submit("legacy", None).await.is_err());
+    session.close().await;
+}
+
+#[tokio::test(flavor = "current_thread")]
 async fn result_then_idle_settles_but_interrupt_ack_is_not_settlement() {
     let fake = Fake::new("normal");
     let mut session = fake.start().await;

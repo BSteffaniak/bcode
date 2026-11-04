@@ -29,6 +29,11 @@ pub enum SlashCommandOutcome {
         session: bcode_command::CommandSessionRequirement,
         arguments: String,
     },
+    /// Configure native composer placement or retry an exact retained request.
+    ManagedComposer {
+        expected_native_turn_id: Option<String>,
+        retry_submission_id: Option<String>,
+    },
     /// Open timeline message browser.
     OpenTimeline,
     /// Refresh pending permissions and open the existing review dialog.
@@ -824,6 +829,24 @@ async fn execute_builtin(
 
     match command {
         BuiltinCommandId::Native => {
+            if parts == ["/native", "composer", "next"] {
+                return Ok(SlashCommandOutcome::ManagedComposer {
+                    expected_native_turn_id: None,
+                    retry_submission_id: None,
+                });
+            }
+            if let ["/native", "composer", "steer", expected] = parts {
+                return Ok(SlashCommandOutcome::ManagedComposer {
+                    expected_native_turn_id: Some((*expected).into()),
+                    retry_submission_id: None,
+                });
+            }
+            if let ["/native", "retry", identity] = parts {
+                return Ok(SlashCommandOutcome::ManagedComposer {
+                    expected_native_turn_id: None,
+                    retry_submission_id: Some((*identity).into()),
+                });
+            }
             let Some(session_id) = session_id else {
                 return Ok(SlashCommandOutcome::SystemPlain(
                     "Open a managed external session first".into(),

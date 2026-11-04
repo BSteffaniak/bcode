@@ -21,6 +21,23 @@ fn failed(stage: SessionSpawnStage, code: &str, message: &str) -> SessionSpawnRe
     }
 }
 
+fn resolve_registered_profile_metadata(
+    registry: &bcode_plugin::AuthProviderRegistry,
+    config: &bcode_config::BcodeConfig,
+    provider_plugin_id: &str,
+    profile: &str,
+) -> Result<bcode_provider_auth::ResolvedAuthProfile, &'static str> {
+    let metadata =
+        bcode_provider_auth::resolve_owned_profile_metadata(config, provider_plugin_id, profile)?;
+    if registry
+        .get(&metadata.provider_id)
+        .is_none_or(|registered| registered.plugin_id != metadata.owner_plugin_id)
+    {
+        return Err("provider authentication ownership cannot be verified");
+    }
+    Ok(metadata)
+}
+
 fn resolve_provider_context(
     state: &ServerState,
     config: &bcode_config::BcodeConfig,
@@ -47,40 +64,28 @@ fn resolve_provider_context(
     if profile.trim().is_empty() || profile.len() > 256 {
         return Err("invalid auth profile reference");
     }
-    let matching: Vec<_> = state
-        .plugins
-        .auth_provider_registry()
-        .providers()
-        .into_iter()
-        .filter(|contribution| contribution.plugin_id == provider)
-        .collect();
-    if matching.len() != 1 {
-        return Err("provider authentication ownership cannot be verified");
-    }
-    // Ownership is verified by the provider-auth domain before credential materialization.
-    let owned = bcode_provider_auth::resolve_owned_profile_context(
+    let metadata = resolve_registered_profile_metadata(
+        state.plugins.auth_provider_registry(),
         config,
-        &matching[0].contribution.provider_id,
         provider,
         profile,
+    )?;
+    // Exact profile metadata and registry ownership are verified before materialization.
+    let owned = bcode_provider_auth::resolve_owned_profile_context(
+        config,
+        &metadata.provider_id,
+        provider,
+        &metadata.profile_name,
     )
     .map_err(|_| "requested auth profile ownership or credentials cannot be verified")?;
-    selection.auth_profile = Some(profile.into());
+    selection.auth_profile = Some(metadata.profile_name);
     selection.auth_pool = None;
-    let mut resolved = bcode_provider_auth::try_resolve_provider_request_context(
-        bcode_provider_auth::ProviderRequestContextResolution {
-            config,
-            selection: selection.clone(),
-        },
-    )
-    .map_err(|_| "requested auth profile configuration cannot be resolved")?;
-    resolved.auth = owned.auth;
-    resolved.auth_profile = owned.auth_profile;
-    resolved.auth_pool = None;
-    resolved.auth_candidates.clear();
-    resolved.auth_pool_routing = bcode_model::ProviderAuthPoolRouting::default();
-    resolved.auth_pool_selection_reason = None;
-    Ok(resolved)
+    Ok(bcode_model::ProviderRequestContext {
+        model_profile: selection.model_profile.clone(),
+        settings: selection.settings.clone(),
+        request: selection.request.clone(),
+        ..owned
+    })
 }
 
 /// Prepare caller-bound spawning selection before creating a child or admitting work.
@@ -477,6 +482,122 @@ async fn admit_spawned_session(
 mod tests {
     use super::*;
     use bcode_session_models::{SessionChildCreateRequest, SessionId, TurnAdmissionMetadata};
+
+    fn spawn_auth_config() -> bcode_config::BcodeConfig {
+        let mut config = bcode_config::BcodeConfig::default();
+        config.auth.profiles.insert(
+            "selected".into(),
+            bcode_config::AuthProfileConfig {
+                backend: "aws".into(),
+                provider_id: Some("openai".into()),
+                owner_plugin_id: Some("bcode.openai-compatible".into()),
+                scheme: Some("api_key".into()),
+                map: std::collections::BTreeMap::from([(
+                    "api_key".into(),
+                    bcode_config::AuthCredentialMapping {
+                        env: Some("BCODE_SPAWN_TEST_KEY".into()),
+                        key: None,
+                    },
+                )]),
+                settings: std::collections::BTreeMap::from([(
+                    "env.BCODE_SPAWN_TEST_KEY".into(),
+                    "test-only".into(),
+                )]),
+            },
+        );
+        config
+    }
+
+    fn spawn_auth_registry(owner: &str) -> bcode_plugin::AuthProviderRegistry {
+        let mut registry = bcode_plugin::AuthProviderRegistry::new();
+        for provider in ["openai", "openrouter", "xai"] {
+            registry
+                .register(
+                    owner,
+                    bcode_plugin::AuthProviderContribution {
+                        schema_version:
+                            bcode_provider_auth_models::AUTH_PROVIDER_CONTRIBUTION_SCHEMA_VERSION,
+                        provider_id: provider.into(),
+                        display_name: provider.into(),
+                        methods: vec![bcode_plugin::AuthMethodContribution::Interactive {
+                            method_id: "login".into(),
+                            display_name: "Login".into(),
+                            operation: "login".into(),
+                            credentials: Vec::new(),
+                            supports_revocation: false,
+                        }],
+                    },
+                )
+                .unwrap();
+        }
+        registry
+    }
+
+    #[test]
+    fn explicit_profile_selects_exact_provider_from_multi_provider_plugin() {
+        let config = spawn_auth_config();
+        let registry = spawn_auth_registry("bcode.openai-compatible");
+        let metadata = resolve_registered_profile_metadata(
+            &registry,
+            &config,
+            "bcode.openai-compatible",
+            "selected",
+        )
+        .unwrap();
+        assert_eq!(metadata.provider_id, "openai");
+        let context = bcode_provider_auth::resolve_owned_profile_context(
+            &config,
+            &metadata.provider_id,
+            &metadata.owner_plugin_id,
+            &metadata.profile_name,
+        )
+        .unwrap();
+        assert_eq!(context.auth_profile.as_deref(), Some("selected"));
+        assert_eq!(
+            context.auth.unwrap().credentials["api_key"].value,
+            "test-only"
+        );
+        assert_eq!(context.auth_candidates, Vec::new());
+        assert!(context.auth_pool.is_none());
+    }
+
+    #[test]
+    fn explicit_profile_rejects_foreign_missing_and_unverifiable_registry_ownership() {
+        let config = spawn_auth_config();
+        for registry in [
+            spawn_auth_registry("bcode.foreign"),
+            bcode_plugin::AuthProviderRegistry::new(),
+        ] {
+            assert!(
+                resolve_registered_profile_metadata(
+                    &registry,
+                    &config,
+                    "bcode.openai-compatible",
+                    "selected",
+                )
+                .is_err()
+            );
+        }
+        let registry = spawn_auth_registry("bcode.openai-compatible");
+        for owner in [None, Some("bcode.foreign"), Some("")] {
+            let mut config = config.clone();
+            config
+                .auth
+                .profiles
+                .get_mut("selected")
+                .unwrap()
+                .owner_plugin_id = owner.map(str::to_owned);
+            assert!(
+                resolve_registered_profile_metadata(
+                    &registry,
+                    &config,
+                    "bcode.openai-compatible",
+                    "selected",
+                )
+                .is_err()
+            );
+        }
+    }
 
     async fn fixture() -> (tempfile::TempDir, Arc<ServerState>, SessionSpawnRequest) {
         let root = tempfile::tempdir().unwrap();

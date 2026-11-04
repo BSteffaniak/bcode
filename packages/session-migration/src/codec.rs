@@ -152,6 +152,45 @@ impl HistoricalEnvelope {
         })
     }
 
+    /// Reject observation variants that were not part of the schema-53 closed contract.
+    /// This is historical decoding policy, not native protocol interpretation.
+    ///
+    /// # Errors
+    /// Returns an error if the historical kind envelope is malformed or contains an
+    /// observation variant introduced after its declared schema.
+    pub fn validate_observation_compatibility(&self) -> Result<(), HistoricalSessionEventError> {
+        if self.schema_version >= 54 {
+            return Ok(());
+        }
+        let (event_kind, payload) = source_kind(self)?;
+        let observations: Vec<&serde_json::Value> = match event_kind {
+            "external_observation_recorded" => {
+                payload.pointer("/observation").into_iter().collect()
+            }
+            "external_harness_operation" => payload
+                .pointer("/operation/record/page/observations")
+                .and_then(serde_json::Value::as_array)
+                .map(|values| values.iter().collect())
+                .unwrap_or_default(),
+            _ => Vec::new(),
+        };
+        if observations.iter().any(|observation| {
+            matches!(
+                observation
+                    .pointer("/kind/kind")
+                    .and_then(serde_json::Value::as_str),
+                Some("submission_consumed" | "submission_result_observed" | "native_turn_terminal")
+            )
+        }) {
+            return Err(HistoricalSessionEventError::InvalidEvent {
+                schema_version: self.schema_version,
+                event_kind: event_kind.to_owned(),
+                reason: "observation variant requires event schema 54".to_owned(),
+            });
+        }
+        Ok(())
+    }
+
     fn materialize(&self, kind: SessionEventKind) -> SessionEvent {
         SessionEvent {
             schema_version: bcode_session_models::CURRENT_SESSION_EVENT_SCHEMA_VERSION,

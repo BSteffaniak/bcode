@@ -95,7 +95,9 @@ holds that guard through the runtime call; no general cross-session invocation a
 is granted. All workflow managed operations use the installed `managed_sessions` application
 backend rather than vendor service dispatch.
 
-No formatting/build/test/check commands have run during the initial implementation wave.
-Tests are written for exact preparation, typed creation/assistance/steering/control bounds,
-receipt compatibility and authoritative correlated workflow output. Live mixed-graph,
-restart, cancellation races and central caller routing require later integrated validation.
+The integration wave has passed canonical host harness tests and isolated offline CLI
+acceptance, including restart, cancellation, retained parentage and terminal handoff.
+Production workflow-boundary tests prove correlated completion with a controlled
+native fixture. These are not live mixed-harness acceptance: general native
+background settlement, interruption and resumed-turn support remain subject to
+adapter evidence and must fail closed when unsupported.

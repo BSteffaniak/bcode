@@ -129,6 +129,22 @@ pub(super) fn observation(
                 i.text(text, 6)?;
             }
         }
+        HarnessObservationKind::SubmissionConsumed {
+            submission_id,
+            attempt_id,
+            native_frame_id,
+        }
+        | HarnessObservationKind::SubmissionResultObserved {
+            submission_id,
+            attempt_id,
+            native_frame_id,
+            ..
+        } => {
+            for text in [submission_id, attempt_id, native_frame_id] {
+                i.text(text, 6)?;
+            }
+            i.nodes(2, 6)?;
+        }
         HarnessObservationKind::BindingConfirmed { open_id, binding } => {
             i.text(open_id, 6)?;
             i.nodes(2, 6)?;
@@ -166,7 +182,11 @@ pub(super) fn observation(
             i.text(code, 6)?;
             i.text(message, 6)?;
         }
-        HarnessObservationKind::Settlement { native_turn_id } => i.text(native_turn_id, 6)?,
+        HarnessObservationKind::Settlement { native_turn_id }
+        | HarnessObservationKind::NativeTurnTerminal { native_turn_id, .. } => {
+            i.text(native_turn_id, 6)?;
+            i.nodes(1, 6)?;
+        }
         HarnessObservationKind::Vendor { namespace, detail } => {
             i.text(namespace, 6)?;
             i.json(detail, 6)?;

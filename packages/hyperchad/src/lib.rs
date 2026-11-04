@@ -64,6 +64,9 @@ pub struct HyperChadAppState {
     history_windows: Arc<Mutex<BTreeMap<SessionId, ProjectionWindowRequest>>>,
     interaction_controllers: Arc<Mutex<LocalInteractionControllers>>,
     interaction_submissions: Arc<Mutex<BTreeSet<String>>>,
+    /// Bounded exact HTML confirmations, retained across live updates.
+    managed_composer_pending:
+        Arc<Mutex<BTreeMap<SessionId, bcode_session_models::ExternalHarnessRequest>>>,
     reasoning_presentation_policy: ReasoningPresentationPolicy,
     streaming_presentation_policy: StreamingPresentationPolicy,
     renderer_tx: Arc<Mutex<Option<Arc<LatestSnapshotUpdates>>>>,
@@ -84,6 +87,10 @@ impl std::fmt::Debug for HyperChadAppState {
             .field("history_windows", &self.history_windows)
             .field("interaction_controllers", &self.interaction_controllers)
             .field("interaction_submissions", &self.interaction_submissions)
+            .field(
+                "managed_composer_pending",
+                &"[bounded retained native input]",
+            )
             .field(
                 "reasoning_presentation_policy",
                 &self.reasoning_presentation_policy,
@@ -271,6 +278,12 @@ struct PromptForm {
     text: String,
     #[serde(default)]
     placement: PromptPlacementView,
+    #[serde(default)]
+    managed_request: Option<String>,
+    #[serde(default)]
+    native_only: bool,
+    #[serde(default)]
+    expected_native_turn_id: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -508,6 +521,7 @@ impl HyperChadAppState {
             history_windows: Arc::new(Mutex::new(BTreeMap::new())),
             interaction_controllers: Arc::new(Mutex::new(LocalInteractionControllers::default())),
             interaction_submissions: Arc::new(Mutex::new(BTreeSet::new())),
+            managed_composer_pending: Arc::new(Mutex::new(BTreeMap::new())),
             reasoning_presentation_policy,
             streaming_presentation_policy: streaming_presentation_policy.normalized(),
             renderer_tx: Arc::new(Mutex::new(None)),
@@ -687,28 +701,35 @@ impl HyperChadAppState {
     /// # Errors
     ///
     /// Returns an error when the daemon cannot be reached or rejects the attach request.
-    pub async fn session_snapshot(
+    pub fn session_snapshot(
         &self,
         session_id: bcode_session_models::SessionId,
-    ) -> Result<SessionViewSnapshot, ClientError> {
-        let request = self
-            .history_windows
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .get(&session_id)
-            .cloned()
-            .unwrap_or_else(hyperchad_projection_window_request);
-        let mut connection = self.client.connect("bcode-hyperchad").await?;
-        let attached =
-            attach_hyperchad_projection_window_with_request(&mut connection, session_id, request)
-                .await?;
-        session_view_from_attached_history(
-            &self.client,
-            attached,
-            &self.interaction_controllers,
-            self.reasoning_presentation_policy,
-        )
-        .await
+    ) -> std::pin::Pin<
+        Box<dyn std::future::Future<Output = Result<SessionViewSnapshot, ClientError>> + Send + '_>,
+    > {
+        Box::pin(async move {
+            let request = self
+                .history_windows
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .get(&session_id)
+                .cloned()
+                .unwrap_or_else(hyperchad_projection_window_request);
+            let mut connection = self.client.connect("bcode-hyperchad").await?;
+            let attached = attach_hyperchad_projection_window_with_request(
+                &mut connection,
+                session_id,
+                request,
+            )
+            .await?;
+            session_view_from_attached_history(
+                &self.client,
+                attached,
+                &self.interaction_controllers,
+                self.reasoning_presentation_policy,
+            )
+            .await
+        })
     }
 }
 
@@ -1898,8 +1919,17 @@ impl HyperChadAppState {
                 "The submitted form could not be read. Review the fields and try again.",
             );
         };
+        if form
+            .managed_request
+            .as_ref()
+            .is_some_and(|value| value.len() > bcode_harness_models::MAX_HARNESS_WIRE_BYTES)
+            || form.text.len() > bcode_harness_models::MAX_HARNESS_TEXT_BYTES
+        {
+            return error_page("Native submission exceeds the bounded request budget");
+        }
         let session_id = form.session_id.as_deref().and_then(parse_session_id);
-        if form.text.split_whitespace().next() == Some("/native") {
+        if form.managed_request.is_none() && form.text.split_whitespace().next() == Some("/native")
+        {
             let Some(session_id) = session_id else {
                 return error_page("Open a managed external session before using /native");
             };
@@ -1923,6 +1953,45 @@ impl HyperChadAppState {
                 .render_session_or_initial(session_id, "prompt cannot be empty")
                 .await;
         }
+        if form.managed_request.is_none()
+            && let Some(session_id) = session_id
+        {
+            let retained = self
+                .managed_composer_pending
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .get(&session_id)
+                .cloned();
+            if let Some(retained) = retained {
+                return self.managed_composer_confirmation(&retained,
+                        "Native input is already prepared or unresolved. Retry only this exact captured attempt.");
+            }
+        }
+        if let Some(encoded) = form.managed_request.as_deref() {
+            return self
+                .submit_retained_html_composer(&form, session_id, encoded)
+                .await;
+        }
+        if let Some(session_id) = session_id {
+            match self.client.prepare_managed_composer_submission(
+                session_id, (form.submission_id.clone(), form.submission_id.clone()), form.text.clone(),
+                form.placement == PromptPlacementView::Steering, form.expected_native_turn_id.clone(),
+            ).await {
+                Ok(Some(retained)) => return self.managed_composer_confirmation(&retained,
+                    "Confirm native input. The exact target and attempt are retained; Send does not imply settlement."),
+                Ok(None) if form.native_only => return error_page("Native target unavailable; no model fallback"),
+                Ok(None) => {}
+                Err(error) => return self.render_session_or_initial(Some(session_id), &client_error_message(&error)).await,
+            }
+        }
+        self.submit_model_html_composer(form, session_id).await
+    }
+
+    async fn submit_model_html_composer(
+        &self,
+        form: PromptForm,
+        session_id: Option<SessionId>,
+    ) -> hyperchad::template::Containers {
         let launch_working_directory = session_id
             .is_none()
             .then(|| self.launch_working_directory.as_ref().clone());
@@ -1962,6 +2031,136 @@ impl HyperChadAppState {
             Err(error) => {
                 self.render_session_or_initial(session_id, &client_error_message(&error))
                     .await
+            }
+        }
+    }
+
+    async fn submit_retained_html_composer(
+        &self,
+        form: &PromptForm,
+        session_id: Option<SessionId>,
+        encoded: &str,
+    ) -> hyperchad::template::Containers {
+        let Ok(retained) =
+            serde_json::from_str::<bcode_session_models::ExternalHarnessRequest>(encoded)
+        else {
+            return error_page("Invalid retained native submission");
+        };
+        let bcode_session_models::ExternalHarnessRequestKind::Submit { submission, .. } =
+            &retained.kind
+        else {
+            return error_page("Expected a retained native submission");
+        };
+        if Some(submission.session_id.as_str()) != form.session_id.as_deref()
+            || submission.submission_id != form.submission_id
+            || submission.text != form.text
+        {
+            return error_page("Retained native submission does not match the form");
+        }
+        if let Err(reason) = self.retain_managed_composer(&retained) {
+            return error_page(reason);
+        }
+        let response = self
+            .client
+            .submit_managed_composer_request(retained.clone())
+            .await;
+        let status = match response {
+            Ok(response) => match response.kind {
+                bcode_session_models::ExternalHarnessResponseKind::Receipt(receipt)
+                    if receipt.state != bcode_harness_models::HarnessDeliveryState::Uncertain
+                        && receipt.state
+                            != bcode_harness_models::HarnessDeliveryState::DeliveryAttempted =>
+                {
+                    if let Some(session_id) = session_id {
+                        self.managed_composer_pending
+                            .lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner)
+                            .remove(&session_id);
+                    }
+                    return self.render_session_or_initial(session_id,
+                            &format!("Native delivery {:?}; not native settlement or assignment completion", receipt.state)).await;
+                }
+                _ => "Native delivery unresolved. Only the exact retained input may be retried."
+                    .to_owned(),
+            },
+            Err(_) => "Native delivery unresolved. Only the exact retained input may be retried."
+                .to_owned(),
+        };
+        self.managed_composer_confirmation(&retained, &status)
+    }
+
+    fn retain_managed_composer(
+        &self,
+        retained: &bcode_session_models::ExternalHarnessRequest,
+    ) -> Result<(), &'static str> {
+        retained
+            .request()
+            .validate()
+            .map_err(|_| "Invalid native composer envelope")?;
+        let bcode_session_models::ExternalHarnessRequestKind::Submit { submission, .. } =
+            &retained.kind
+        else {
+            return Err("Expected native composer submission");
+        };
+        let session_id = submission
+            .session_id
+            .parse::<SessionId>()
+            .map_err(|_| "Invalid native session")?;
+        let mut pending = self
+            .managed_composer_pending
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(previous) = pending.get(&session_id) {
+            if previous != retained {
+                return Err(
+                    "Another native attempt is unresolved; inspect the retained confirmation before sending",
+                );
+            }
+        } else {
+            if pending.len() >= 128 {
+                return Err("Native confirmation limit reached; unresolved input was not replaced");
+            }
+            pending.insert(session_id, retained.clone());
+        }
+        drop(pending);
+        Ok(())
+    }
+
+    fn managed_composer_confirmation(
+        &self,
+        retained: &bcode_session_models::ExternalHarnessRequest,
+        status: &str,
+    ) -> hyperchad::template::Containers {
+        use bcode_hyperchad_ui::context::PresentationContext as _;
+        let bcode_session_models::ExternalHarnessRequestKind::Submit { submission, .. } =
+            &retained.kind
+        else {
+            return error_page("Invalid native submission confirmation");
+        };
+        if let Err(reason) = self.retain_managed_composer(retained) {
+            return error_page(reason);
+        }
+        let Ok(encoded) = serde_json::to_string(retained) else {
+            return error_page("Native confirmation unavailable");
+        };
+        #[cfg(feature = "renderer-html-actix")]
+        let context = html_actix::HtmlActixPresentationContext::new(Arc::clone(&self.access_token));
+        #[cfg(not(feature = "renderer-html-actix"))]
+        let context = bcode_hyperchad_ui::context::StaticPresentationContext;
+        hyperchad::template::container! {
+            div #bcode-web-shell {
+                h2 { "Managed native input" }
+                div { (status) }
+                div { (format!("Generation {} · submission {} · attempt {} · {:?}", submission.generation, submission.submission_id, submission.attempt_id, submission.placement)) }
+                div white-space="preserve-wrap" { (&submission.text) }
+                form hx-post=(context.action_target(bcode_hyperchad_ui::context::PresentationAction::SubmitMessage)) hx-target="#bcode-web-shell" hx-swap=this {
+                    input type=hidden name="session_id" value=(&submission.session_id);
+                    input type=hidden name="submission_id" value=(&submission.submission_id);
+                    input type=hidden name="text" value=(&submission.text);
+                    input type=hidden name="managed_request" value=(encoded);
+                    button type=submit { "Send exact retained native input" }
+                }
+                div { "After an ambiguous response, retry this same form; do not create another attempt." }
             }
         }
     }
@@ -2551,23 +2750,111 @@ impl HyperChadAppState {
         rendered
     }
 
-    async fn render_session_with_status(
-        &self,
+    fn render_session_with_status<'a>(
+        &'a self,
         session_id: SessionId,
-        sessions: &[SessionSummary],
+        sessions: &'a [SessionSummary],
         catalog_status: bcode_session_view_models::SessionCatalogViewStatus,
-        status: &str,
-    ) -> hyperchad::template::Containers {
-        match self.session_snapshot(session_id).await {
-            Ok(mut snapshot) => {
-                snapshot.catalog_status = catalog_status;
-                let (level, message) = semantic_notice(status);
-                snapshot.notice =
-                    Some(bcode_session_view_models::SessionViewNotice { level, message });
-                self.render_home(&snapshot, sessions)
+        status: &'a str,
+    ) -> std::pin::Pin<
+        Box<dyn std::future::Future<Output = hyperchad::template::Containers> + Send + 'a>,
+    > {
+        Box::pin(async move {
+            match self.session_snapshot(session_id).await {
+                Ok(mut snapshot) => {
+                    snapshot.catalog_status = catalog_status;
+                    let (level, message) = semantic_notice(status);
+                    snapshot.notice =
+                        Some(bcode_session_view_models::SessionViewNotice { level, message });
+                    let page = self.render_home(&snapshot, sessions);
+                    if self
+                        .client
+                        .managed_session_binding(session_id)
+                        .await
+                        .ok()
+                        .flatten()
+                        .is_some()
+                    {
+                        return self.managed_composer_page(page, session_id);
+                    }
+                    page
+                }
+                Err(error) => error_page(&client_error_message(&error)),
             }
-            Err(error) => error_page(&client_error_message(&error)),
+        })
+    }
+
+    fn managed_composer_page(
+        &self,
+        page: hyperchad::template::Containers,
+        session_id: SessionId,
+    ) -> hyperchad::template::Containers {
+        use hyperchad::renderer::transformer::{Container, Element, Input};
+        let retained = self
+            .managed_composer_pending
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(&session_id)
+            .cloned();
+        if let Some(retained) = retained {
+            return self.managed_composer_confirmation(&retained,
+                "Native input is prepared or unresolved. Live updates never replace its captured target or retry identity.");
         }
+        #[cfg(feature = "renderer-html-actix")]
+        let context = html_actix::HtmlActixPresentationContext::new(Arc::clone(&self.access_token));
+        #[cfg(not(feature = "renderer-html-actix"))]
+        let context = bcode_hyperchad_ui::context::StaticPresentationContext;
+        let action = bcode_hyperchad_ui::context::PresentationContext::action_target(
+            &context,
+            bcode_hyperchad_ui::context::PresentationAction::SubmitMessage,
+        );
+        let fields = [
+            ("session_id", session_id.to_string()),
+            ("submission_id", SessionId::new().to_string()),
+            ("native_only", "true".to_owned()),
+        ]
+        .into_iter()
+        .map(|(name, value)| Container {
+            element: Element::Input {
+                input: Input::Hidden { value: Some(value) },
+                name: Some(name.to_owned()),
+                autofocus: None,
+            },
+            ..Container::default()
+        })
+        .collect::<Vec<_>>();
+        let expected_turn = Container {
+            element: Element::Input {
+                input: Input::Text {
+                    value: None,
+                    placeholder: Some("Expected native turn (steering only)".to_owned()),
+                },
+                name: Some("expected_native_turn_id".to_owned()),
+                autofocus: None,
+            },
+            ..Container::default()
+        };
+        let mut page = page;
+        let controls = hyperchad::template::container! {
+            div {
+                h2 { "Native session composer" }
+                div { "Send queues a native follow-up. Steering requires the exact native turn displayed by native history; unsupported placement fails closed. Model settings are not applied." }
+                form hx-post=(action) hx-target="#bcode-web-shell" hx-swap=this {
+                    (fields)
+                    textarea name="text" placeholder="Message the managed native session" { }
+                    select name="placement" selected="follow_up" {
+                        option value="follow_up" { "Queue native follow-up" }
+                        option value="steering" { "Steer exact native turn" }
+                    }
+                    (expected_turn)
+                    button type=submit { "Prepare native input" }
+                }
+            }
+        };
+        if let Some(shell) = page.first_mut() {
+            shell.children.splice(0..0, controls);
+        }
+        page
     }
 }
 
@@ -3203,6 +3490,7 @@ where
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(Arc::clone(&updates));
     let renderer = renderer.clone();
+    let application = state.clone();
     let access_token = Arc::clone(&state.access_token);
     tokio::spawn(async move {
         loop {
@@ -3217,11 +3505,24 @@ where
                 );
             }
             let context = html_actix::HtmlActixPresentationContext::new(Arc::clone(&access_token));
-            let Some(fragment) = live_update_fragment(&update.snapshot, &update.sessions, &context)
+            let Some(mut fragment) =
+                live_update_fragment(&update.snapshot, &update.sessions, &context)
             else {
                 tracing::error!("HyperChad live update produced no application fragment");
                 continue;
             };
+            if let Some(session_id) = update.snapshot.session_id
+                && application
+                    .client
+                    .managed_session_binding(session_id)
+                    .await
+                    .ok()
+                    .flatten()
+                    .is_some()
+            {
+                let mut page = application.managed_composer_page(vec![fragment], session_id);
+                fragment = page.remove(0);
+            }
             let view = hyperchad::renderer::View::builder()
                 .with_fragment(fragment)
                 .build();
@@ -3235,6 +3536,107 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn has_retained_field(containers: &[hyperchad::renderer::transformer::Container]) -> bool {
+        containers.iter().any(|container| matches!(&container.element,
+            hyperchad::renderer::transformer::Element::Input { name: Some(name), .. } if name == "managed_request")
+            || has_retained_field(&container.children))
+    }
+
+    #[test]
+    fn managed_html_confirmation_survives_live_render_and_rejects_replacement() {
+        use bcode_harness_models::{
+            HarnessAuthBinding, HarnessAuthCustody, HarnessInstance, HarnessPlacement,
+            HarnessPreparedSession, HarnessRequest, HarnessRequestKind, HarnessSessionTarget,
+            HarnessSubmission,
+        };
+        let session_id = SessionId::new();
+        let retained =
+            bcode_session_models::ExternalHarnessRequest::from_request(&HarnessRequest {
+                schema_version: 1,
+                request_id: "original".into(),
+                instance: HarnessInstance {
+                    instance_id: "native".into(),
+                    plugin_id: "native.plugin".into(),
+                    executable: "/native".into(),
+                    config_namespace: "isolated".into(),
+                    auth: HarnessAuthBinding {
+                        provider_id: "native".into(),
+                        profile: "work".into(),
+                        credential_namespace: "isolated".into(),
+                        custody: HarnessAuthCustody::NativeManaged,
+                    },
+                },
+                kind: HarnessRequestKind::Submit {
+                    target: HarnessSessionTarget::Prepared(HarnessPreparedSession {
+                        open_id: "open".into(),
+                        session_id: session_id.to_string(),
+                        instance_id: "native".into(),
+                        generation: 3,
+                        native_version: "1".into(),
+                        requested_native_session_id: None,
+                    }),
+                    submission: HarnessSubmission {
+                        submission_id: "original".into(),
+                        attempt_id: "attempt-original".into(),
+                        session_id: session_id.to_string(),
+                        generation: 3,
+                        text: "native input".into(),
+                        placement: HarnessPlacement::NextTurn,
+                    },
+                },
+            })
+            .unwrap();
+        let app = HyperChadAppState::new(BcodeClient::default_endpoint(), "test-token");
+        app.retain_managed_composer(&retained).unwrap();
+        let page = app.managed_composer_page(Vec::new(), session_id);
+
+        assert!(
+            has_retained_field(&page),
+            "live rendering must preserve the exact confirmation form"
+        );
+        let mut changed = retained.clone();
+        changed.request_id = "replacement".into();
+        if let bcode_session_models::ExternalHarnessRequestKind::Submit { submission, .. } =
+            &mut changed.kind
+        {
+            submission.submission_id = "replacement".into();
+            submission.attempt_id = "replacement-attempt".into();
+        }
+        assert!(app.retain_managed_composer(&changed).is_err());
+        assert_eq!(
+            app.managed_composer_pending
+                .lock()
+                .unwrap()
+                .get(&session_id),
+            Some(&retained)
+        );
+        for _ in 1..128 {
+            let mut next = retained.clone();
+            let session_id = SessionId::new();
+            if let bcode_session_models::ExternalHarnessRequestKind::Submit { target, submission } =
+                &mut next.kind
+            {
+                submission.session_id = session_id.to_string();
+                if let HarnessSessionTarget::Prepared(prepared) = target {
+                    prepared.session_id = session_id.to_string();
+                }
+            }
+            app.retain_managed_composer(&next).unwrap();
+        }
+        let mut overflow = retained;
+        let overflow_session = SessionId::new();
+        if let bcode_session_models::ExternalHarnessRequestKind::Submit { target, submission } =
+            &mut overflow.kind
+        {
+            submission.session_id = overflow_session.to_string();
+            if let HarnessSessionTarget::Prepared(prepared) = target {
+                prepared.session_id = overflow_session.to_string();
+            }
+        }
+        assert!(app.retain_managed_composer(&overflow).is_err());
+        assert_eq!(app.managed_composer_pending.lock().unwrap().len(), 128);
+    }
 
     #[test]
     fn hyperchad_streaming_policies_preserve_multibyte_text_for_every_mode() {

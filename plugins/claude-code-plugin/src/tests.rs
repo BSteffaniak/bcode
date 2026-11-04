@@ -7,6 +7,194 @@ use bcode_harness_models::{
 use serde_json::json;
 
 #[test]
+fn attributed_attempts_are_retained_without_claiming_turn_acceptance() {
+    use bcode_claude_code::{AttributionStage, SubmissionAttribution};
+    let mut normalizer = normalizer();
+    let submission = HarnessSubmission {
+        submission_id: "submission-1".into(),
+        attempt_id: "00000000-0000-4000-8000-000000000001".into(),
+        session_id: "session".into(),
+        generation: 7,
+        text: "not part of retained evidence".into(),
+        placement: HarnessPlacement::NextTurn,
+    };
+    let uuid = normalizer.retain_submission(&submission).unwrap();
+    assert!(normalizer.retain_submission(&submission).is_err());
+    let evidence = SubmissionAttribution {
+        native_frame_uuid: "00000000-0000-4000-8000-000000000002".into(),
+        primary: uuid.clone(),
+        consumed: vec![uuid],
+        resumed: false,
+        stage: AttributionStage::Reply,
+    };
+    let observations = normalizer.event(Event::Attribution(evidence.clone()));
+    assert_eq!(observations.len(), 1);
+    assert_eq!(
+        observations[0].kind,
+        HarnessObservationKind::SubmissionConsumed {
+            submission_id: submission.submission_id.clone(),
+            attempt_id: submission.attempt_id.clone(),
+            native_frame_id: evidence.native_frame_uuid.clone(),
+        }
+    );
+    assert_eq!(observations[0].session_id, submission.session_id);
+    assert_eq!(observations[0].generation, submission.generation);
+    assert_eq!(
+        normalizer.event(Event::Attribution(evidence.clone())),
+        Vec::new()
+    );
+    assert_eq!(normalizer.retained_attribution().len(), 1);
+    let retained = &normalizer.retained_attribution()[0];
+    assert_eq!(retained.submission_id, submission.submission_id);
+    assert_eq!(retained.attempt_id, submission.attempt_id);
+    assert!(normalizer.turn_id.is_none());
+    let mut conflicting = evidence;
+    conflicting.stage = AttributionStage::Result {
+        is_error: false,
+        queued_turn_count: Some(0),
+    };
+    assert!(
+        normalizer
+            .event(Event::Attribution(conflicting))
+            .iter()
+            .any(|observation| observation.completeness == HarnessCompleteness::Gap)
+    );
+}
+
+#[test]
+fn merged_result_attribution_emits_exact_pairs_and_rejects_queue_overflow_atomically() {
+    use bcode_claude_code::{AttributionStage, SubmissionAttribution};
+    let mut normalizer = normalizer();
+    let mut attempts = Vec::new();
+    for index in 1..=2 {
+        let submission = HarnessSubmission {
+            submission_id: format!("submission-{index}"),
+            attempt_id: format!("00000000-0000-4000-8000-{index:012x}"),
+            session_id: "session".into(),
+            generation: 7,
+            text: "hello".into(),
+            placement: HarnessPlacement::NextTurn,
+        };
+        attempts.push((
+            normalizer.retain_submission(&submission).unwrap(),
+            submission,
+        ));
+    }
+    let mut evidence = SubmissionAttribution {
+        native_frame_uuid: "00000000-0000-4000-8000-000000000003".into(),
+        primary: attempts[1].0.clone(),
+        consumed: attempts.iter().map(|(uuid, _)| uuid.clone()).collect(),
+        resumed: false,
+        stage: AttributionStage::Result {
+            is_error: true,
+            queued_turn_count: Some(u64::from(u32::MAX) + 1),
+        },
+    };
+    let overflow = normalizer.event(Event::Attribution(evidence.clone()));
+    assert!(
+        overflow
+            .iter()
+            .any(|observation| observation.completeness == HarnessCompleteness::Gap)
+    );
+    assert_eq!(normalizer.retained_attribution(), []);
+    evidence.stage = AttributionStage::Result {
+        is_error: true,
+        queued_turn_count: Some(2),
+    };
+    let observations = normalizer.event(Event::Attribution(evidence.clone()));
+    assert_eq!(observations.len(), 2);
+    for (observation, (_, submission)) in observations.iter().zip(&attempts) {
+        assert_eq!(
+            observation.kind,
+            HarnessObservationKind::SubmissionResultObserved {
+                submission_id: submission.submission_id.clone(),
+                attempt_id: submission.attempt_id.clone(),
+                native_frame_id: evidence.native_frame_uuid.clone(),
+                is_error: true,
+                queued_user_sends: Some(2),
+            }
+        );
+    }
+    assert_eq!(
+        normalizer.event(Event::Attribution(evidence.clone())),
+        Vec::new()
+    );
+    assert_eq!(normalizer.retained_attribution().len(), 2);
+    assert!(normalizer.turn_id.is_none());
+    evidence.native_frame_uuid = "00000000-0000-4000-8000-000000000004".into();
+    evidence.stage = AttributionStage::Result {
+        is_error: false,
+        queued_turn_count: None,
+    };
+    let observations = normalizer.event(Event::Attribution(evidence));
+    assert!(observations.iter().all(|observation| matches!(
+        observation.kind,
+        HarnessObservationKind::SubmissionResultObserved {
+            queued_user_sends: None,
+            ..
+        }
+    )));
+}
+
+#[test]
+fn attributed_attempts_reject_wrong_owner_resume_and_nonuuid_attempts() {
+    let mut normalizer = normalizer();
+    let mut submission = HarnessSubmission {
+        submission_id: "submission-1".into(),
+        attempt_id: "00000000-0000-4000-8000-000000000001".into(),
+        session_id: "session".into(),
+        generation: 8,
+        text: "hello".into(),
+        placement: HarnessPlacement::NextTurn,
+    };
+    assert!(normalizer.retain_submission(&submission).is_err());
+    submission.generation = 7;
+    submission.attempt_id = "not-a-canonical-uuid".into();
+    assert!(normalizer.retain_submission(&submission).is_err());
+    submission.attempt_id = "00000000-0000-4000-8000-000000000001".into();
+    let uuid = normalizer.retain_submission(&submission).unwrap();
+    let resumed = bcode_claude_code::SubmissionAttribution {
+        native_frame_uuid: "00000000-0000-4000-8000-000000000002".into(),
+        primary: uuid.clone(),
+        consumed: vec![uuid],
+        resumed: true,
+        stage: bcode_claude_code::AttributionStage::Reply,
+    };
+    assert!(
+        normalizer
+            .event(Event::Attribution(resumed))
+            .iter()
+            .any(|observation| observation.completeness == HarnessCompleteness::Gap)
+    );
+    assert_eq!(normalizer.retained_attribution(), []);
+}
+
+#[test]
+fn attribution_retention_is_bounded_and_never_recycles_attempts() {
+    let mut normalizer = normalizer();
+    for index in 0..256 {
+        let submission = HarnessSubmission {
+            submission_id: format!("submission-{index}"),
+            attempt_id: format!("00000000-0000-4000-8000-{index:012x}"),
+            session_id: "session".into(),
+            generation: 7,
+            text: "hello".into(),
+            placement: HarnessPlacement::NextTurn,
+        };
+        normalizer.retain_submission(&submission).unwrap();
+    }
+    let overflow = HarnessSubmission {
+        submission_id: "overflow".into(),
+        attempt_id: "00000000-0000-4000-8000-ffffffffffff".into(),
+        session_id: "session".into(),
+        generation: 7,
+        text: "hello".into(),
+        placement: HarnessPlacement::NextTurn,
+    };
+    assert!(normalizer.retain_submission(&overflow).is_err());
+}
+
+#[test]
 fn eof_after_confirmation_and_interaction_keeps_retained_evidence_readable() {
     let prepared = HarnessPreparedSession {
         open_id: "open-eof".into(),
@@ -567,10 +755,10 @@ fn oversized_or_malformed_requests_do_not_start_a_runtime() {
             },
             config: bcode_plugin_sdk::PluginConfigContext::default(),
             events: bcode_plugin_sdk::ServiceEventEmitter::default(),
+            diagnostics: None,
             cancellation: bcode_plugin_sdk::ServiceCancellation::default(),
             bridge: bcode_plugin_sdk::ServiceBridge::default(),
             transient_progress_limits: bcode_plugin_sdk::TransientProgressLimits::default(),
-            diagnostics: None,
         };
         assert!(plugin.invoke_service(context).error.is_some());
         assert!(plugin.runtime.is_none());

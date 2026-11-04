@@ -1,0 +1,66 @@
+{
+  "schema": "bcode.claude-code.native-correlation-evidence.v1",
+  "observed_date": "2026-10-29",
+  "native_version": "2.1.308 (Claude Code)",
+  "executable": "/nix/store/yzhsl1i8v8gypvdx2bigpysj58la5i8w-claude-code-2.1.308/bin/claude",
+  "executable_sha256": "49ca742c79d844aea24b25190c765994bbcb7d63ddf4726e4c048e89946494b0",
+  "wrapped_artifact_sha256": "0696f3eba9cc930f29dab7e6d4102b79b72d58c163c14415cfe72460575e355b",
+  "route": {
+    "auth_status_exit": 0,
+    "logged_in": true,
+    "auth_method": "claude.ai",
+    "api_provider": "firstParty",
+    "init_api_key_source": "none",
+    "ambient_api_provider_credentials": "excluded by environment allowlist",
+    "account_changes": false
+  },
+  "isolation": {
+    "workspace": "temporary empty directory outside repository",
+    "optional_settings_sources": [],
+    "mcp_servers": [],
+    "session_persistence": false,
+    "model_selection": "haiku",
+    "raw_transcripts_retained": false
+  },
+  "single_reply_with_sdk_state_flag": {
+    "flag": "CLAUDE_CODE_SDK_READS_SESSION_STATE=1",
+    "events": [
+      {"sequence": 2, "kind": "state", "state": "running", "sdk_host_only": true},
+      {"sequence": 3, "kind": "command", "state": "queued", "exact_submission_matches": true},
+      {"sequence": 4, "kind": "command", "state": "started", "exact_submission_matches": true},
+      {"sequence": 8, "kind": "first_stream_reply", "primary_matches": true, "consumed_is_single_exact_submission": true},
+      {"sequence": 12, "kind": "first_assistant_reply", "primary_matches": true, "consumed_is_single_exact_submission": true},
+      {"sequence": 17, "kind": "result", "primary_matches": true, "consumed_is_single_exact_submission": true, "is_error": false, "queued_turn_count": 0, "expected_text": true},
+      {"sequence": 18, "kind": "command", "state": "completed", "exact_submission_matches": true},
+      {"sequence": 19, "kind": "state", "state": "idle", "sdk_host_only": true}
+    ],
+    "correlated_frame_uuids_distinct_and_canonical": true,
+    "resumed": false,
+    "exit_after_closing_input": 0
+  },
+  "background_sleep_three_seconds": {
+    "observed_tool_calls": 1,
+    "events": [
+      {"sequence": 23, "kind": "task_started", "task_type": "local_bash", "is_backgrounded": true},
+      {"sequence": 33, "kind": "result", "primary_matches": true, "consumed_is_single_exact_submission": true, "is_error": false, "queued_turn_count": 0},
+      {"sequence": 34, "kind": "command", "state": "completed", "exact_submission_matches": true},
+      {"sequence": 35, "kind": "state", "state": "idle"},
+      {"sequence": 36, "kind": "task_updated", "patch_status": "completed"},
+      {"sequence": 37, "kind": "task_notification", "status": "completed"},
+      {"sequence": 38, "kind": "background_tasks_changed", "tasks": []},
+      {"sequence": 39, "kind": "state", "state": "running"},
+      {"sequence": 51, "kind": "assistant", "correlation_present": false},
+      {"sequence": 55, "kind": "result", "correlation_present": false, "is_error": false, "queued_turn_count": 0},
+      {"sequence": 56, "kind": "state", "state": "idle"}
+    ],
+    "exit_after_closing_input": 0,
+    "conclusion": "Result, command completed, queue zero, and native idle can all precede local_bash completion and an uncorrelated native follow-up. local_bash settlement remains unsupported."
+  },
+  "limits": [
+    "Native subprocess probes, not execution of the modified Rust implementation.",
+    "Merged, conflicting, duplicate and missing-field cases are authored offline tests, not live native proof.",
+    "No native turn identifier was established.",
+    "Account entitlement scope, process-loss recovery and interruption behavior were not established.",
+    "The SDK state flag was necessary to observe idle in the single-reply probe."
+  ]
+}

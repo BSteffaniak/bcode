@@ -14,7 +14,10 @@ pub use service::*;
 use serde::{Deserialize, Serialize};
 
 /// Independently versioned plugin service boundary.
-pub const HARNESS_INTERFACE_ID: &str = "bcode.harness/v1";
+///
+/// Version two adds explicit consumed-prompt attribution and terminal disposition.
+/// V1 plugins are not admitted through this interface; the envelope shape remains schema one.
+pub const HARNESS_INTERFACE_ID: &str = "bcode.harness/v2";
 /// Current envelope schema; other versions are rejected, not coerced.
 pub const HARNESS_SCHEMA_VERSION: u16 = 1;
 /// Maximum encoded request or response, checked before decoding.

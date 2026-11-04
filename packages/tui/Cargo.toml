@@ -19,6 +19,7 @@ bcode_client = { workspace = true }
 bcode_code_review_models = { workspace = true }
 bcode_command = { workspace = true }
 bcode_config = { workspace = true }
+bcode_harness_models = { workspace = true }
 bcode_ipc = { workspace = true }
 bcode_markdown_render = { workspace = true }
 bcode_metrics = { workspace = true }
@@ -105,7 +106,6 @@ bcode_agent_runtime     = { workspace = true }
 bcode_daemon_lifecycle  = { workspace = true }
 bcode_filesystem_plugin = { workspace = true, features = ["static-bundled"] }
 bcode_git_plugin        = { workspace = true, features = ["static-bundled"] }
-bcode_harness_models    = { workspace = true }
 bcode_hello_plugin      = { workspace = true }
 bcode_model_catalog     = { workspace = true }
 bcode_question_plugin   = { workspace = true, features = ["static-bundled"] }

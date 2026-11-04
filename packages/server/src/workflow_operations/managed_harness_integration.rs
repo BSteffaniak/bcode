@@ -14,6 +14,9 @@ use std::{collections::BTreeSet, sync::Arc};
 
 const PLUGIN: &str = "test.workflow-managed-boundary";
 const RUN: &str = "managed-production-boundary";
+// static_plugin_vtable! retains one plugin instance per macro callsite, not per host.
+// These scenarios must own its entire lifetime, including state reset and host drop.
+static FIXTURE_LIFETIME: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 const MANIFEST: &str = r#"
 id = "test.workflow-managed-boundary"
 name = "Offline workflow integration"
@@ -21,7 +24,7 @@ version = "0.0.1"
 [[services]]
 interface_id = "bcode.agent-profile/v1"
 [[services]]
-interface_id = "bcode.harness/v1"
+interface_id = "bcode.harness/v2"
 [[services]]
 interface_id = "test.workflow-control/v1"
 [[services]]
@@ -54,13 +57,22 @@ library = "unused-test-library"
 event_symbol = "bcode_plugin_handle_event_v1"
 "#;
 
+#[derive(Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord)]
+enum EvidencePhase {
+    #[default]
+    Progress,
+    Terminal,
+    Quiescent,
+}
+
 #[derive(Default)]
 struct OfflineHarness {
     submissions: usize,
-    release: bool,
+    released: EvidencePhase,
+    emitted: EvidencePhase,
     polls: usize,
     accepted_submission: Option<(String, String)>,
-    settled: bool,
+    disposition: Option<HarnessTerminalDisposition>,
 }
 
 fn response(value: &impl serde::Serialize) -> ServiceResponse {
@@ -73,8 +85,13 @@ impl RustPlugin for OfflineHarness {
             "bcode.agent-profile/v1" => policy(&context),
             "bcode.workflow-block/v1" => preparation(&context),
             "test.workflow-control/v1" => {
-                if context.request.operation == "release" {
-                    self.release = true;
+                match context.request.operation.as_str() {
+                    "reset" => *self = Self::default(),
+                    "release" => self.released = EvidencePhase::Quiescent,
+                    "terminal" => self.released = self.released.max(EvidencePhase::Terminal),
+                    "fail" => self.disposition = Some(HarnessTerminalDisposition::Failed),
+                    "interrupt" => self.disposition = Some(HarnessTerminalDisposition::Interrupted),
+                    _ => {}
                 }
                 if context.request.operation == "polls" {
                     response(&self.polls)
@@ -182,6 +199,10 @@ impl OfflineHarness {
             }
             HarnessRequestKind::Submit { target, submission } => {
                 assert!(matches!(target, HarnessSessionTarget::Prepared(_)));
+                assert_eq!(
+                    self.submissions, 0,
+                    "one fixture scenario must never redeliver its native submission"
+                );
                 self.submissions += 1;
                 self.accepted_submission = Some((
                     submission.submission_id.clone(),
@@ -232,15 +253,33 @@ impl OfflineHarness {
                     native_turn_id: "native-turn".into(),
                 },
             ));
+            if self
+                .disposition
+                .unwrap_or(HarnessTerminalDisposition::Completed)
+                == HarnessTerminalDisposition::Completed
+            {
+                events.push((
+                    "result",
+                    HarnessObservationKind::Result {
+                        text: "verified native result".into(),
+                    },
+                ));
+            }
+        }
+        if self.released >= EvidencePhase::Terminal && self.emitted < EvidencePhase::Terminal {
+            self.emitted = EvidencePhase::Terminal;
             events.push((
-                "result",
-                HarnessObservationKind::Result {
-                    text: "verified native result".into(),
+                "terminal",
+                HarnessObservationKind::NativeTurnTerminal {
+                    native_turn_id: "native-turn".into(),
+                    disposition: self
+                        .disposition
+                        .unwrap_or(HarnessTerminalDisposition::Completed),
                 },
             ));
         }
-        if self.release && !self.settled {
-            self.settled = true;
+        if self.released == EvidencePhase::Quiescent && self.emitted < EvidencePhase::Quiescent {
+            self.emitted = EvidencePhase::Quiescent;
             events.push((
                 "settled",
                 HarnessObservationKind::Settlement {
@@ -520,12 +559,42 @@ async fn control(state: &ServerState, operation: &str) -> usize {
 
 #[tokio::test]
 async fn managed_workflow_production_dispatch_preserves_state_until_authoritative_settlement() {
-    Box::pin(check_production_dispatch()).await;
+    Box::pin(check_production_dispatch(
+        HarnessTerminalDisposition::Completed,
+    ))
+    .await;
 }
 
-async fn check_production_dispatch() {
+#[tokio::test]
+async fn managed_workflow_production_failed_turn_settles_without_result() {
+    Box::pin(check_production_dispatch(
+        HarnessTerminalDisposition::Failed,
+    ))
+    .await;
+}
+
+#[tokio::test]
+async fn managed_workflow_production_interrupted_turn_settles_without_result() {
+    Box::pin(check_production_dispatch(
+        HarnessTerminalDisposition::Interrupted,
+    ))
+    .await;
+}
+
+async fn check_production_dispatch(disposition: HarnessTerminalDisposition) {
+    let _fixture_lifetime = FIXTURE_LIFETIME.lock().await;
     let root = tempfile::tempdir().unwrap();
     let state = fixture(root.path());
+    assert_eq!(control(&state, "reset").await, 0);
+    match disposition {
+        HarnessTerminalDisposition::Completed => {}
+        HarnessTerminalDisposition::Failed => {
+            assert_eq!(control(&state, "fail").await, 0);
+        }
+        HarnessTerminalDisposition::Interrupted => {
+            assert_eq!(control(&state, "interrupt").await, 0);
+        }
+    }
     let parent = state
         .sessions
         .create_session(None, root.path().into())
@@ -567,7 +636,7 @@ async fn check_production_dispatch() {
         0,
         "policy preparation cannot deliver native input"
     );
-    approve_and_observe_execution(Arc::clone(&state), &graph, child).await;
+    approve_and_observe_execution(Arc::clone(&state), &graph, child, disposition).await;
     // Retain the daemon, its canonical session writers, and workflow authority through
     // the final awaited application call; release only after all assertions finish.
     drop(state);
@@ -577,6 +646,7 @@ async fn approve_and_observe_execution(
     state: Arc<ServerState>,
     graph: &bcode_workflow::WorkflowDefinition,
     child: SessionId,
+    disposition: HarnessTerminalDisposition,
 ) {
     let approvals = state
         .workflow_store
@@ -629,7 +699,12 @@ async fn approve_and_observe_execution(
         "retry observation must not resubmit"
     );
     assert_no_external_output(&state);
+    assert_terminal_without_quiescence(&state, child, disposition).await;
     assert_eq!(control(&state, "release").await, 1);
+    if disposition != HarnessTerminalDisposition::Completed {
+        assert_non_success_terminal(&state, child, disposition).await;
+        return;
+    }
     let output = wait_for_external_output(&state, graph, child).await;
     assert_eq!(output.value["state"]["normal_predecessor"], "retained");
     assert_eq!(output.value["value"]["result"], "verified native result");
@@ -645,6 +720,116 @@ async fn approve_and_observe_execution(
     assert_eq!(run.status, bcode_workflow::RunStatus::Completed);
     assert_eq!(control(&state, "count").await, 1);
     drop(state);
+}
+
+async fn assert_terminal_without_quiescence(
+    state: &Arc<ServerState>,
+    child: SessionId,
+    disposition: HarnessTerminalDisposition,
+) {
+    assert_eq!(control(state, "terminal").await, 1);
+    for _ in 0..8 {
+        assert!(matches!(
+            production_receipt_observation(state).await.unwrap(),
+            bcode_workflow_store::AttemptObservation::Deferred { .. }
+        ));
+        let (_, evidence) = state
+            .sessions
+            .session_external_harness_submission_evidence(child, "submission", "attempt")
+            .await
+            .unwrap()
+            .unwrap();
+        if evidence.observations.iter().any(|event| {
+            matches!(
+                &event.kind,
+                HarnessObservationKind::NativeTurnTerminal { disposition: actual, .. }
+                    if *actual == disposition
+            )
+        }) {
+            assert!(
+                !evidence
+                    .observations
+                    .iter()
+                    .any(|event| matches!(&event.kind, HarnessObservationKind::Settlement { .. }))
+            );
+            assert_no_external_output(state);
+            return;
+        }
+        tokio::task::yield_now().await;
+    }
+    panic!("native terminal evidence was not retained");
+}
+
+async fn assert_non_success_terminal(
+    state: &Arc<ServerState>,
+    child: SessionId,
+    disposition: HarnessTerminalDisposition,
+) {
+    let mut observed = None;
+    for _ in 0..8 {
+        let observation = production_receipt_observation(state).await.unwrap();
+        if !matches!(
+            observation,
+            bcode_workflow_store::AttemptObservation::Deferred { .. }
+        ) {
+            observed = Some(observation);
+            break;
+        }
+        tokio::task::yield_now().await;
+    }
+    let expected_status = match (disposition, observed) {
+        (
+            HarnessTerminalDisposition::Interrupted,
+            Some(bcode_workflow_store::AttemptObservation::Cancelled),
+        ) => "cancelled",
+        (
+            HarnessTerminalDisposition::Failed,
+            Some(bcode_workflow_store::AttemptObservation::Failed { message }),
+        ) => {
+            assert_eq!(message, "managed native turn failed");
+            "failed"
+        }
+        other => panic!("expected authoritative non-success observation: {other:?}"),
+    };
+    let (_, evidence) = state
+        .sessions
+        .session_external_harness_submission_evidence(child, "submission", "attempt")
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(evidence.observations.iter().any(|event| matches!(
+        &event.kind,
+        HarnessObservationKind::NativeTurnTerminal { native_turn_id, disposition: actual }
+            if native_turn_id == "native-turn" && *actual == disposition
+    )));
+    assert!(evidence.observations.iter().any(|event| matches!(
+        &event.kind,
+        HarnessObservationKind::Settlement { native_turn_id } if native_turn_id == "native-turn"
+    )));
+    assert!(
+        !evidence
+            .observations
+            .iter()
+            .any(|event| matches!(&event.kind, HarnessObservationKind::Result { .. }))
+    );
+    for _ in 0..8 {
+        crate::drive_workflow_run(state, RUN).await.unwrap();
+        let terminal = state
+            .workflow_store
+            .lock()
+            .unwrap()
+            .attempt_history(RUN, None, 8)
+            .unwrap()
+            .into_iter()
+            .any(|attempt| attempt.has_receipt && attempt.status == expected_status);
+        if terminal {
+            assert_no_external_output(state);
+            assert_eq!(control(state, "count").await, 1);
+            return;
+        }
+        tokio::task::yield_now().await;
+    }
+    panic!("native non-success did not reach persisted workflow terminal outcome");
 }
 
 async fn assert_typed_acceptance(state: &ServerState, child: SessionId) {
@@ -676,6 +861,20 @@ async fn assert_typed_acceptance(state: &ServerState, child: SessionId) {
         matches!(&acceptance.kind, HarnessObservationKind::SubmissionAccepted { submission_id, attempt_id, native_turn_id }
         if submission_id == "submission" && attempt_id == "attempt" && native_turn_id == "native-turn")
     );
+    let (evidence_owner, evidence) = state
+        .sessions
+        .session_external_harness_submission_evidence(child, "submission", "attempt")
+        .await
+        .unwrap()
+        .expect("canonical indexed submission evidence");
+    assert_eq!(evidence_owner, canonical.owner);
+    assert_eq!(evidence.completeness, HarnessCompleteness::Partial);
+    assert!(evidence.observations.contains(&acceptance));
+    assert!(!evidence.observations.iter().any(|event| matches!(
+        &event.kind,
+        HarnessObservationKind::NativeTurnTerminal { .. }
+            | HarnessObservationKind::Settlement { .. }
+    )));
 }
 
 async fn wait_for_external_output(
@@ -725,6 +924,7 @@ async fn wait_for_external_output(
                 &event.native_correlations,
                 event.completeness,
                 match &event.kind {
+                    HarnessObservationKind::NativeTurnTerminal { .. } => "terminal",
                     HarnessObservationKind::Settlement { .. } => "settlement",
                     HarnessObservationKind::Result { .. } => "result",
                     HarnessObservationKind::BindingConfirmed { .. } => "confirmation",

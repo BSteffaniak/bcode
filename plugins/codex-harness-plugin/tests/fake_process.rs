@@ -9,7 +9,7 @@ use bcode_harness_models::{
     HARNESS_SCHEMA_VERSION, HarnessActivity, HarnessAssistanceGrant, HarnessAuthBinding,
     HarnessCompleteness, HarnessDeliveryState, HarnessObservation, HarnessObservationKind,
     HarnessPlacement, HarnessReceipt, HarnessResponse, HarnessResponseValue, HarnessSessionBinding,
-    HarnessSubmission,
+    HarnessSubmission, HarnessTerminalDisposition,
 };
 use bcode_provider_auth_models::managed::{AuthCustodyMode, AuthReadiness};
 use std::os::unix::fs::PermissionsExt as _;
@@ -75,9 +75,16 @@ fn observations(session: &mut CodexSession, want_interaction: bool) -> Vec<Harne
         {
             break;
         }
-        if !want_interaction && all.iter().any(|observation| matches!(&observation.kind,
-            HarnessObservationKind::Status { status } if matches!(status.activity, HarnessActivity::Settled | HarnessActivity::Interrupted))
-            || matches!(&observation.kind, HarnessObservationKind::Diagnostic { code, .. } if code == "native_turn_failed")) { break; }
+        if !want_interaction
+            && all.iter().any(|observation| {
+                matches!(
+                    &observation.kind,
+                    HarnessObservationKind::NativeTurnTerminal { .. }
+                )
+            })
+        {
+            break;
+        }
         std::thread::sleep(Duration::from_millis(5));
     }
     all
@@ -187,7 +194,12 @@ fn continuously_drains_stderr_and_normalizes_correlated_turn_completion() {
             .iter()
             .any(|event| matches!(event.kind, HarnessObservationKind::Text { .. }))
     );
-    assert!(events.iter().any(|event| matches!(&event.kind, HarnessObservationKind::Settlement { native_turn_id } if native_turn_id == "turn-1")));
+    assert!(events.iter().any(|event| matches!(&event.kind, HarnessObservationKind::NativeTurnTerminal { native_turn_id, disposition: HarnessTerminalDisposition::Completed } if native_turn_id == "turn-1")));
+    assert!(
+        !events
+            .iter()
+            .any(|event| matches!(event.kind, HarnessObservationKind::Settlement { .. }))
+    );
     assert!(
         events
             .iter()
@@ -253,6 +265,517 @@ fn approvals_questions_and_assistance_are_generation_fenced_one_shot_callbacks()
         response.generation = 7;
         session.respond(&response).unwrap();
         assert_eq!(session.respond(&response), Err(CodexError::Stale));
+    }
+}
+
+fn result_fixture_events(session: &mut CodexSession, limit: usize) -> Vec<HarnessObservation> {
+    let deadline = Instant::now() + Duration::from_secs(2);
+    let mut events = Vec::new();
+    while Instant::now() < deadline {
+        let (page, _) = session.observe(limit).unwrap();
+        assert!(page.len() <= limit);
+        let ended = page.iter().any(|event| {
+            matches!(&event.kind,
+            HarnessObservationKind::Text { text } if text == "result-fixture-end")
+        });
+        events.extend(page);
+        if ended {
+            return events;
+        }
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    panic!("fixture must reach the ordered end marker");
+}
+
+#[test]
+fn completed_final_agent_item_is_complete_correlated_output_before_separate_terminal() {
+    for limit in [1, 16] {
+        let (_temp, launch) = fixture();
+        let mut session = CodexSession::open(&launch, binding(), false).unwrap();
+        session.submit(&submission("result-final")).unwrap();
+        let events = result_fixture_events(&mut session, limit);
+        let results = events
+            .iter()
+            .enumerate()
+            .filter(|(_, event)| matches!(event.kind, HarnessObservationKind::Result { .. }))
+            .collect::<Vec<_>>();
+        assert_eq!(results.len(), 1);
+        let (result_index, result) = results[0];
+        assert_eq!(result.completeness, HarnessCompleteness::Complete);
+        assert_eq!(result.native_correlations, ["turn-1", "message-1"]);
+        assert_eq!(
+            result.kind,
+            HarnessObservationKind::Result {
+                text: "Complete answer: 界 👋".into(),
+            }
+        );
+        assert!(
+            events[..result_index]
+                .iter()
+                .any(|event| matches!(&event.kind,
+            HarnessObservationKind::Text { text } if text == "partial streamed text"))
+        );
+        let terminal_index = events.iter().position(|event| matches!(&event.kind,
+            HarnessObservationKind::NativeTurnTerminal { native_turn_id, disposition: HarnessTerminalDisposition::Completed } if native_turn_id == "turn-1")).unwrap();
+        assert!(result_index < terminal_index);
+        assert!(
+            !events
+                .iter()
+                .any(|event| matches!(event.kind, HarnessObservationKind::Settlement { .. }))
+        );
+        assert!(events[..result_index].iter().any(|event| matches!(&event.kind,
+            HarnessObservationKind::SubmissionAccepted { native_turn_id, .. } if native_turn_id == "turn-1")));
+    }
+}
+
+#[test]
+fn delta_started_partial_unphased_and_stale_items_never_become_authoritative_results() {
+    for text in [
+        "result-delta-only",
+        "result-started",
+        "result-commentary",
+        "result-partial",
+        "result-unphased",
+        "result-unknown-phase",
+        "result-wrong-turn",
+        "result-missing-turn",
+        "result-foreign-thread",
+        "result-late",
+    ] {
+        let (_temp, launch) = fixture();
+        let mut session = CodexSession::open(&launch, binding(), false).unwrap();
+        session.submit(&submission(text)).unwrap();
+        let events = result_fixture_events(&mut session, 1);
+        assert!(
+            !events
+                .iter()
+                .any(|event| matches!(event.kind, HarnessObservationKind::Result { .. })),
+            "{text}"
+        );
+        // Terminal disposition without a final item is lifecycle evidence, not output.
+        assert!(
+            events.iter().any(|event| matches!(
+                event.kind,
+                HarnessObservationKind::NativeTurnTerminal { .. }
+            )),
+            "{text}"
+        );
+    }
+}
+
+#[test]
+fn observed_but_unaccepted_turn_cannot_supply_an_assignment_result() {
+    let (_temp, launch) = fixture();
+    let mut session = CodexSession::open(&launch, binding(), false).unwrap();
+    session
+        .submit(&submission("result-unaccepted-turn"))
+        .unwrap();
+    let events = result_fixture_events(&mut session, 1);
+    assert!(!events.iter().any(|event| matches!(
+        event.kind,
+        HarnessObservationKind::Result { .. } | HarnessObservationKind::Settlement { .. }
+    )));
+}
+
+#[test]
+fn final_item_does_not_independently_prove_successful_terminal_lifecycle() {
+    for text in ["result-held", "result-interrupted", "result-failed"] {
+        let (_temp, launch) = fixture();
+        let mut session = CodexSession::open(&launch, binding(), false).unwrap();
+        session.submit(&submission(text)).unwrap();
+        let events = result_fixture_events(&mut session, 16);
+        assert!(
+            events
+                .iter()
+                .any(|event| matches!(event.kind, HarnessObservationKind::Result { .. }))
+        );
+        assert!(
+            !events
+                .iter()
+                .any(|event| matches!(event.kind, HarnessObservationKind::Settlement { .. }))
+        );
+        if text == "result-held" {
+            assert_eq!(session.status().activity, HarnessActivity::Running);
+        }
+    }
+}
+
+#[test]
+fn oversized_or_malformed_final_item_fences_instead_of_truncating_output() {
+    for (text, expected) in [
+        ("result-oversized", CodexError::Bounds),
+        ("result-malformed", CodexError::Protocol),
+    ] {
+        let (_temp, launch) = fixture();
+        let mut session = CodexSession::open(&launch, binding(), false).unwrap();
+        session.submit(&submission(text)).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(2);
+        let error = loop {
+            match session.observe(1) {
+                Ok((page, _)) => assert!(
+                    !page
+                        .iter()
+                        .any(|event| matches!(event.kind, HarnessObservationKind::Result { .. }))
+                ),
+                Err(error) => break error,
+            }
+            assert!(Instant::now() < deadline);
+            std::thread::sleep(Duration::from_millis(5));
+        };
+        assert_eq!(error, expected);
+        assert_eq!(session.observe(1).unwrap().1, HarnessCompleteness::Gap);
+    }
+}
+
+#[test]
+fn native_terminal_dispositions_are_complete_exact_and_never_assert_background_quiescence() {
+    for (text, expected) in [
+        ("terminal-completed", HarnessTerminalDisposition::Completed),
+        ("terminal-failed", HarnessTerminalDisposition::Failed),
+        (
+            "terminal-interrupted",
+            HarnessTerminalDisposition::Interrupted,
+        ),
+        ("terminal-background", HarnessTerminalDisposition::Completed),
+        ("terminal-duplicate", HarnessTerminalDisposition::Completed),
+    ] {
+        for limit in [1, 16] {
+            let (_temp, launch) = fixture();
+            let mut session = CodexSession::open(&launch, binding(), false).unwrap();
+            session.submit(&submission(text)).unwrap();
+            let events = result_fixture_events(&mut session, limit);
+            let terminals = events
+                .iter()
+                .filter(|event| {
+                    matches!(
+                        event.kind,
+                        HarnessObservationKind::NativeTurnTerminal { .. }
+                    )
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(terminals.len(), 1, "{text}");
+            assert_eq!(terminals[0].completeness, HarnessCompleteness::Complete);
+            assert_eq!(terminals[0].native_correlations, ["turn-1"]);
+            assert_ne!(session.status().activity, HarnessActivity::Settled);
+            assert_eq!(
+                terminals[0].kind,
+                HarnessObservationKind::NativeTurnTerminal {
+                    native_turn_id: "turn-1".into(),
+                    disposition: expected,
+                }
+            );
+            assert!(!events.iter().any(|event| matches!(
+                event.kind,
+                HarnessObservationKind::Settlement { .. } | HarnessObservationKind::Result { .. }
+            )));
+            assert!(
+                !serde_json::to_string(&events)
+                    .unwrap()
+                    .contains("sensitive native error")
+            );
+        }
+    }
+}
+
+#[test]
+fn foreign_and_stale_terminal_events_cannot_terminalize_the_accepted_turn() {
+    for text in ["terminal-wrong-turn", "terminal-foreign"] {
+        let (_temp, launch) = fixture();
+        let mut session = CodexSession::open(&launch, binding(), false).unwrap();
+        session.submit(&submission(text)).unwrap();
+        let events = result_fixture_events(&mut session, 1);
+        assert!(!events.iter().any(|event| matches!(
+            event.kind,
+            HarnessObservationKind::NativeTurnTerminal { .. }
+                | HarnessObservationKind::Settlement { .. }
+        )));
+    }
+}
+
+#[test]
+fn invalid_terminal_or_process_loss_never_supplies_terminal_or_settlement_proof() {
+    for text in [
+        "terminal-invalid",
+        "terminal-contradictory",
+        "terminal-lost",
+    ] {
+        let (_temp, launch) = fixture();
+        let mut session = CodexSession::open(&launch, binding(), false).unwrap();
+        session.submit(&submission(text)).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(2);
+        loop {
+            match session.observe(1) {
+                Ok((events, completeness)) => {
+                    assert!(!events.iter().any(|event| matches!(
+                        event.kind,
+                        HarnessObservationKind::NativeTurnTerminal { .. }
+                            | HarnessObservationKind::Settlement { .. }
+                    )));
+                    if completeness == HarnessCompleteness::Gap {
+                        break;
+                    }
+                }
+                Err(error) => {
+                    assert_eq!(error, CodexError::Protocol);
+                    break;
+                }
+            }
+            assert!(Instant::now() < deadline);
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    }
+}
+
+#[test]
+fn native_question_batch_is_answered_once_after_each_exact_question() {
+    let (temp, launch) = fixture();
+    let mut session = CodexSession::open(&launch, binding(), false).unwrap();
+    session.submit(&submission("multi-question")).unwrap();
+    let first = observations(&mut session, true)
+        .into_iter()
+        .find_map(|event| match event.kind {
+            HarnessObservationKind::Interaction { interaction } => Some(interaction),
+            _ => None,
+        })
+        .unwrap();
+    assert_eq!(first.prompt, "Choose one");
+    assert_eq!(first.choices[0].label, "First");
+    let first_response = HarnessResponse {
+        response_id: "answer-first".into(),
+        request_id: first.request_id,
+        session_id: "bcode-session".into(),
+        generation: 7,
+        value: HarnessResponseValue::Answer {
+            choice_id: Some("option-0".into()),
+            text: String::new(),
+        },
+    };
+    session.respond(&first_response).unwrap();
+    assert_eq!(session.respond(&first_response), Err(CodexError::Stale));
+    assert!(!calls(&temp).iter().any(|call| call["callback"] == 91));
+    let second = observations(&mut session, true)
+        .into_iter()
+        .find_map(|event| match event.kind {
+            HarnessObservationKind::Interaction { interaction } => Some(interaction),
+            _ => None,
+        })
+        .unwrap();
+    assert_eq!(second.prompt, "Explain why");
+    assert!(second.choices.is_empty());
+    assert_ne!(second.request_id, first_response.request_id);
+    let mut second_response = HarnessResponse {
+        response_id: "answer-second".into(),
+        request_id: second.request_id,
+        session_id: "bcode-session".into(),
+        generation: 6,
+        value: HarnessResponseValue::Answer {
+            choice_id: None,
+            text: "Because".into(),
+        },
+    };
+    assert_eq!(session.respond(&second_response), Err(CodexError::Stale));
+    second_response.generation = 7;
+    session.respond(&second_response).unwrap();
+    assert_eq!(session.respond(&second_response), Err(CodexError::Stale));
+    observations(&mut session, false);
+    let replies = calls(&temp)
+        .into_iter()
+        .filter(|call| call["callback"] == 91)
+        .collect::<Vec<_>>();
+    assert_eq!(replies.len(), 1);
+    assert_eq!(
+        replies[0]["result"],
+        serde_json::json!({"answers": {
+            "q1": {"answers": ["First"]}, "q2": {"answers": ["Because"]}
+        }})
+    );
+}
+
+#[test]
+fn cancelling_question_batch_discards_partial_answers() {
+    let (temp, launch) = fixture();
+    let mut session = CodexSession::open(&launch, binding(), false).unwrap();
+    session.submit(&submission("multi-question")).unwrap();
+    for (index, value) in [
+        HarnessResponseValue::Answer {
+            choice_id: None,
+            text: "partial".into(),
+        },
+        HarnessResponseValue::Cancel,
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let interaction = observations(&mut session, true)
+            .into_iter()
+            .find_map(|event| match event.kind {
+                HarnessObservationKind::Interaction { interaction } => Some(interaction),
+                _ => None,
+            })
+            .unwrap();
+        session
+            .respond(&HarnessResponse {
+                response_id: format!("response-{index}"),
+                request_id: interaction.request_id,
+                session_id: "bcode-session".into(),
+                generation: 7,
+                value,
+            })
+            .unwrap();
+    }
+    observations(&mut session, false);
+    let replies = calls(&temp)
+        .into_iter()
+        .filter(|call| call["callback"] == 91)
+        .collect::<Vec<_>>();
+    assert_eq!(replies.len(), 1);
+    assert_eq!(replies[0]["result"], serde_json::json!({"answers": {}}));
+}
+
+#[test]
+fn native_resolution_revokes_only_the_matching_owned_callback() {
+    for (text, revoked) in [
+        ("resolved-question", true),
+        ("foreign-resolved-question", false),
+    ] {
+        let (_temp, launch) = fixture();
+        let mut session = CodexSession::open(&launch, binding(), false).unwrap();
+        session.submit(&submission(text)).unwrap();
+        let mut interaction = None;
+        // The fixture sends resolution before this text marker, so draining through
+        // the marker proves the notification was consumed without a timing guess.
+        let deadline = Instant::now() + Duration::from_secs(2);
+        let mut marker = false;
+        while !marker && Instant::now() < deadline {
+            for event in session.observe(16).unwrap().0 {
+                match event.kind {
+                    HarnessObservationKind::Interaction { interaction: value } => {
+                        interaction = Some(value)
+                    }
+                    HarnessObservationKind::Text { .. } => marker = true,
+                    _ => {}
+                }
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert!(marker);
+        let response = HarnessResponse {
+            response_id: "resolved-answer".into(),
+            request_id: interaction.unwrap().request_id,
+            session_id: "bcode-session".into(),
+            generation: 7,
+            value: HarnessResponseValue::Cancel,
+        };
+        assert_eq!(
+            session.respond(&response),
+            if revoked {
+                Err(CodexError::Stale)
+            } else {
+                Ok(())
+            }
+        );
+    }
+}
+
+#[test]
+fn interrupt_requires_exact_retained_turn_and_observed_terminal_evidence() {
+    let (temp, launch) = fixture();
+    let mut session = CodexSession::open(&launch, binding(), false).unwrap();
+    assert_eq!(session.interrupt_active(7), Err(CodexError::Uncertain));
+    assert_eq!(session.interrupt(7, "turn-1"), Err(CodexError::Stale));
+    session.submit(&submission("approval")).unwrap();
+    let interaction = observations(&mut session, true)
+        .into_iter()
+        .find_map(|event| match event.kind {
+            HarnessObservationKind::Interaction { interaction } => Some(interaction),
+            _ => None,
+        })
+        .unwrap();
+    assert_eq!(session.interrupt(6, "turn-1"), Err(CodexError::Stale));
+    assert_eq!(session.interrupt(7, "wrong-turn"), Err(CodexError::Stale));
+    session.interrupt_active(7).unwrap();
+    // RPC acknowledgment alone must not mutate the observed lifecycle status.
+    assert_ne!(session.status().activity, HarnessActivity::Interrupted);
+    let events = observations(&mut session, false);
+    assert!(events.iter().any(|event| matches!(&event.kind,
+        HarnessObservationKind::Status { status } if status.activity == HarnessActivity::Interrupted)));
+    assert!(
+        !events
+            .iter()
+            .any(|event| matches!(event.kind, HarnessObservationKind::Settlement { .. }))
+    );
+    assert_eq!(
+        session.respond(&HarnessResponse {
+            response_id: "after-interrupt".into(),
+            request_id: interaction.request_id,
+            session_id: "bcode-session".into(),
+            generation: 7,
+            value: HarnessResponseValue::Approval { approved: true },
+        }),
+        Err(CodexError::Stale)
+    );
+    assert_eq!(session.interrupt_active(7), Err(CodexError::Uncertain));
+    let interrupts = calls(&temp)
+        .into_iter()
+        .filter(|call| call["method"] == "turn/interrupt")
+        .collect::<Vec<_>>();
+    assert_eq!(interrupts.len(), 1);
+    assert_eq!(interrupts[0]["turnId"], "turn-1");
+}
+
+#[test]
+fn lost_interrupt_ack_remains_uncertain_without_successful_settlement() {
+    let (temp, launch) = fixture();
+    let mut session = CodexSession::open(&launch, binding(), false).unwrap();
+    session.submit(&submission("approval")).unwrap();
+    observations(&mut session, true);
+    std::fs::write(temp.path().join("lost-interrupt-ack"), "").unwrap();
+    assert_eq!(session.interrupt_active(7), Err(CodexError::Uncertain));
+    let (events, completeness) = session.observe(16).unwrap();
+    assert_eq!(completeness, HarnessCompleteness::Gap);
+    assert!(events.is_empty());
+    assert_ne!(session.status().activity, HarnessActivity::Interrupted);
+    assert_eq!(session.interrupt_active(7), Err(CodexError::Uncertain));
+    assert_eq!(
+        calls(&temp)
+            .iter()
+            .filter(|call| call["method"] == "turn/interrupt")
+            .count(),
+        1
+    );
+}
+
+#[test]
+fn malformed_or_secret_question_batches_never_expose_a_partial_question() {
+    for text in ["duplicate-question", "secret-question"] {
+        let (_temp, launch) = fixture();
+        let mut session = CodexSession::open(&launch, binding(), false).unwrap();
+        session.submit(&submission(text)).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(2);
+        let mut finished = false;
+        while !finished && Instant::now() < deadline {
+            match session.observe(16) {
+                Ok((events, _)) => {
+                    assert!(!events.iter().any(|event| matches!(
+                        event.kind,
+                        HarnessObservationKind::Interaction { .. }
+                    )));
+                    finished = events.iter().any(|event| {
+                        matches!(
+                            &event.kind,
+                            HarnessObservationKind::NativeTurnTerminal { .. }
+                        )
+                    });
+                }
+                Err(error) => {
+                    assert_eq!(text, "duplicate-question");
+                    assert_eq!(error, CodexError::Protocol);
+                    finished = true;
+                }
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert!(finished);
     }
 }
 

@@ -197,17 +197,15 @@ comparison against the advertised artifact, never raw output. Its result cannot
 construct a target, retry admission or replace the original verification failure.
 The probe watchdog allows this extra diagnostic time; the canonical verifier's
 five-second identity deadline and all claim/replay assertions remain unchanged.
-Coordinator diagnostics have observed `exceeded_verifier_5s` together with
-`valid_matches_advertisement`: the exact executable returns a valid matching
-identity, but too late for normal verification. This is an explicit-target startup
-deadline blocker, not missing artifact metadata. `DaemonTarget` has no public
-retained-target constructor that can avoid the required executable probe. The
-fixture must not synthesize one, accept the diagnostic result as authority, use
-a shim executable, or retry until a convenient timing passes. Resolution belongs
-to the lifecycle owner: optimize the real identity startup path or provide an
-explicit bounded identity-probe timeout selection while retaining hash, identity,
-namespace, storage/protocol and live-handshake checks. Until that lands and the
-whole test passes, the same-socket acceptance remains blocked.
+Earlier runs observed `exceeded_verifier_5s` with a matching diagnostic identity.
+The production CLI now handles exact bare `artifact-id` before Tokio and plugin
+bootstrap. The fast path also uses the canonical parser for global-option identity
+invocations without reading configuration or opening state. Subsequent serial
+coordinator acceptance passed normal target verification
+without a shim, alternate target, diagnostic authority or relaxed deadline.
+Those bounded passes do not prove every cold start meets five seconds. The
+fixture must continue to preserve executable hash, artifact/namespace,
+storage/protocol and live-handshake checks and report real verification failures.
 Two real IPC connections share one
 namespace reservation before claim. After daemon restart, old sessions are used
 only for readonly status/history checks; distinct new sessions must complete real
@@ -219,8 +217,9 @@ connection are rejected. This probe claims but deliberately does not execute a
 second plan: it must not fabricate a reap to clear ambiguous delivery. The
 isolated daemon/state is cleaned up afterward. The first successfully reaped
 flow's fence is independently shown released by restart and fresh preparation.
-New terminal acceptance has not been run in this lane; coordinator validation
-is required.
+The integrated offline suite passes serially with the static Claude plugin and
+real verified test client; this is fixture acceptance, not native account login
+or full live harness workflow acceptance.
 
 ## Daemon auth acceptance and fresh-begin boundary
 
@@ -263,5 +262,6 @@ unsupported by this fixture. No test/build was run here.
 * Native tools remaining inert, canonical trace/telemetry secret scanning and
   damaged-history completeness/repair behavior need additional application
   instrumentation; CLI/history assertions cover only their observable boundary.
-* New terminal acceptance remains uncompiled and unexecuted by this lane;
-  prior daemon-readonly acceptance validation is coordinator-owned.
+* Integrated serial acceptance covers the real verified client, dedicated terminal
+  handoff and daemon read-only boundaries. It does not establish real native
+  account login, SSH handoff or general native background settlement.

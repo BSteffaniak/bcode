@@ -1,6 +1,6 @@
 //! Typed harness service adapter for native plugins.
 //!
-//! Plugins declare `bcode.harness/v1` in their ordinary manifest `services` list.
+//! Plugins declare `bcode.harness/v2` in their ordinary manifest `services` list.
 //! Registration uses that existing manifest boundary, not a new native ABI callback.
 //! The host remains responsible for admission, credential delivery and ownership fencing.
 
@@ -108,10 +108,10 @@ mod tests {
             },
             config: crate::PluginConfigContext::default(),
             events: crate::ServiceEventEmitter::default(),
+            diagnostics: None,
             cancellation: crate::ServiceCancellation::default(),
             bridge: crate::ServiceBridge::default(),
             transient_progress_limits: crate::TransientProgressLimits::default(),
-            diagnostics: None,
         }
     }
     #[test]

@@ -4602,6 +4602,65 @@ fn apply_root_slash_command_outcome(
 ) {
     use super::slash_commands::SlashCommandOutcome;
     match outcome {
+        SlashCommandOutcome::ManagedComposer {
+            expected_native_turn_id,
+            retry_submission_id,
+        } => {
+            if let Some(identity) = retry_submission_id {
+                let Some(request) = chat.app.managed_composer.requests.get(&identity).cloned()
+                else {
+                    chat.app
+                        .set_status("No retained native request for that submission".into());
+                    return;
+                };
+                let bcode_session_models::ExternalHarnessRequestKind::Submit { submission, .. } =
+                    &request.kind
+                else {
+                    return;
+                };
+                let Ok(session_id) = submission.session_id.parse() else {
+                    return;
+                };
+                if chat.attached_session_id() != Some(session_id) {
+                    chat.app
+                        .set_status("Attach the original native session before retrying".into());
+                    return;
+                }
+                chat.start_effect(TuiEffect::SubmitMessage {
+                    request: Box::new(super::effects::SubmitMessageRequest {
+                        submission_id: bcode_session_models::SubmissionId(
+                            submission.submission_id.clone(),
+                        ),
+                        session_id: Some(session_id),
+                        message: submission.text.clone(),
+                        managed: Some(request.clone()),
+                        attempt_id: submission.attempt_id.clone(),
+                        managed_only: true,
+                        expected_native_turn_id: None,
+                        placement: bcode_ipc::PromptPlacement::FollowUp,
+                        launch_working_directory: settings.launch_working_directory().to_path_buf(),
+                        provider_plugin_id: None,
+                        model_id: None,
+                        agent_id: None,
+                        reasoning_effort: None,
+                        reasoning_summary: None,
+                        reasoning_effort_generation: None,
+                        execution: bcode_session_models::TurnExecutionOptions::default(),
+                        event_sender: chat.event_sender.clone(),
+                    }),
+                });
+                chat.app
+                    .set_status("Retrying exact retained native request; no new attempt".into());
+            } else {
+                chat.app.managed_composer.placement = Some(expected_native_turn_id.map_or(
+                    bcode_harness_models::HarnessPlacement::NextTurn,
+                    |expected_native_turn_id| bcode_harness_models::HarnessPlacement::Steer {
+                        expected_native_turn_id,
+                    },
+                ));
+                chat.app.set_status("Native composer placement selected; ordinary Send uses it. /native composer next or /native composer steer <native-turn>".into());
+            }
+        }
         SlashCommandOutcome::Handled(status) => chat.app.set_status(status),
         SlashCommandOutcome::SystemMarkdown(text) => chat.append_durable_presentation_note(
             "bcode.host",
@@ -4957,6 +5016,102 @@ fn start_root_ralph_action(
     chat.app.set_status("running Ralph action…".to_owned());
 }
 
+fn dispatch_prepared_managed_composer(
+    chat: &mut ActiveChat,
+    request: Box<super::effects::SubmitMessageRequest>,
+) {
+    let Some(retained) = request.managed.clone() else {
+        return;
+    };
+    if chat
+        .app
+        .managed_composer
+        .requests
+        .get(&request.submission_id.0)
+        .is_some_and(|previous| previous != &retained)
+    {
+        chat.app.set_status(
+            "Conflicting native preparation rejected; original attempt retained".into(),
+        );
+        return;
+    }
+    if !chat
+        .app
+        .managed_composer
+        .requests
+        .contains_key(&request.submission_id.0)
+        && chat.app.managed_composer.requests.len() >= 128
+    {
+        chat.app.set_status(
+            "Native pending request limit reached; inspect unresolved requests before sending"
+                .into(),
+        );
+        return;
+    }
+    chat.app
+        .managed_composer
+        .requests
+        .insert(request.submission_id.0.clone(), retained);
+    if chat.attached_session_id() != request.session_id {
+        chat.app.set_status(format!("Native input prepared but not sent after session switch. Attach its original session, then /native retry {}", request.submission_id.0));
+        return;
+    }
+    if let Some(expected) = chat.app.managed_composer.placement.as_mut() {
+        *expected = bcode_harness_models::HarnessPlacement::NextTurn;
+    }
+    chat.start_effect(TuiEffect::SubmitMessage { request });
+    chat.app
+        .set_status("Sending retained native input; delivery is not settlement".into());
+}
+
+fn apply_managed_composer_receipt(
+    chat: &mut ActiveChat,
+    submission_id: &bcode_session_models::SubmissionId,
+    response: &bcode_session_models::ExternalHarnessResponse,
+) {
+    use bcode_session_models::ExternalHarnessResponseKind;
+    let status = match &response.kind {
+        ExternalHarnessResponseKind::Receipt(receipt) => {
+            let recorded = chat
+                .app
+                .managed_composer
+                .requests
+                .get(&receipt.submission_id);
+            let exact = recorded.is_some_and(|request| matches!(&request.kind,
+                bcode_session_models::ExternalHarnessRequestKind::Submit { submission, .. }
+                if submission.submission_id == receipt.submission_id && submission.attempt_id == receipt.attempt_id
+                    && submission.generation == receipt.generation && submission.session_id == receipt.session_id));
+            if !exact {
+                chat.app
+                    .set_status("Native receipt mismatch; retained unresolved input".into());
+                return;
+            }
+            if !matches!(
+                receipt.state,
+                bcode_harness_models::HarnessDeliveryState::Uncertain
+                    | bcode_harness_models::HarnessDeliveryState::DeliveryAttempted
+            ) {
+                chat.app.acknowledge_managed_composer(submission_id);
+                chat.app
+                    .managed_composer
+                    .requests
+                    .remove(&receipt.submission_id);
+            }
+            format!(
+                "Native delivery {:?}; not assignment completion. Uncertain input: /native retry {} (same attempt)",
+                receipt.state, receipt.submission_id
+            )
+        }
+        ExternalHarnessResponseKind::Failure(failure) => format!(
+            "Native delivery {failure:?}; request retained. /native retry {}",
+            submission_id.0
+        ),
+        _ => "Unexpected native response; retained unresolved input".into(),
+    };
+    chat.app.set_status(status);
+    ensure_session_stream_after_foreground_wake(chat);
+}
+
 fn apply_submit_message_result(
     chat: &mut ActiveChat,
     submission_id: &bcode_session_models::SubmissionId,
@@ -4964,7 +5119,22 @@ fn apply_submit_message_result(
     result: Result<super::effects::SubmitMessageResult, ClientError>,
 ) {
     match result {
-        Ok(result) => {
+        Ok(mut result) => {
+            if let Some(request) = result.prepared_request.take() {
+                dispatch_prepared_managed_composer(chat, request);
+                return;
+            }
+            if let Some(super::effects::ComposerReceipt::Managed(response)) = &result.receipt {
+                apply_managed_composer_receipt(chat, submission_id, response);
+                return;
+            }
+            if let Some(super::effects::ComposerReceipt::Model(receipt)) = &result.receipt
+                && receipt.submission_id != *submission_id
+            {
+                chat.app
+                    .set_status("Model receipt mismatch; retained unresolved input".into());
+                return;
+            }
             chat.mark_attached(result.session_id);
             chat.app
                 .set_daemon_connection(super::app::DaemonConnectionState::Connected);
@@ -4989,10 +5159,8 @@ fn apply_submit_message_result(
                 Ok(Some(record)) => {
                     chat.app
                         .apply_submission_records(std::slice::from_ref(&record));
-                    chat.app.set_status(format!(
-                        "Submission {} accepted",
-                        result.receipt.submission_id.0
-                    ));
+                    chat.app
+                        .set_status(format!("Submission {} accepted", submission_id.0));
                 }
                 Ok(None) => chat
                     .app
@@ -5007,6 +5175,15 @@ fn apply_submit_message_result(
         }
         Err(error) => {
             // An error can follow durable acceptance: retain identity and do not stage a duplicate.
+            if chat
+                .app
+                .managed_composer
+                .requests
+                .contains_key(&submission_id.0)
+            {
+                chat.app.set_status(format!("Native delivery unresolved; exact request retained. /native retry {}. Do not send the draft as a new attempt.", submission_id.0));
+                return;
+            }
             daemon_issue::report_client_issue(
                 &mut chat.app,
                 &format!(
@@ -7064,6 +7241,240 @@ pub fn cycle_session_agent(chat: &mut ActiveChat) {
 #[cfg(test)]
 mod scheduler_tests {
     use super::*;
+
+    fn managed_test_chat() -> ActiveChat {
+        let session_id = bcode_session_models::SessionId::new();
+        let (event_sender, event_receiver) = super::super::history_flow::session_stream_channel();
+        ActiveChat {
+            app: super::super::app::BmuxApp::new_with_history(Some(session_id), &[], &[], false),
+            agents: super::super::session_flow::AgentCatalog::default(),
+            attachment: super::super::session_flow::ChatSessionAttachment::Attached { session_id },
+            event_sender,
+            event_receiver,
+            event_task: None,
+            opening_session_progress: None,
+            pending_effects: super::super::effects::TuiEffectQueue::default(),
+        }
+    }
+
+    fn managed_test_request(
+        chat: &ActiveChat,
+        identity: &str,
+    ) -> super::super::effects::SubmitMessageRequest {
+        use bcode_harness_models::{
+            HarnessAuthBinding, HarnessAuthCustody, HarnessInstance, HarnessPlacement,
+            HarnessPreparedSession, HarnessRequest, HarnessRequestKind, HarnessSessionTarget,
+            HarnessSubmission,
+        };
+        let session_id = chat.attached_session_id().unwrap();
+        let retained =
+            bcode_session_models::ExternalHarnessRequest::from_request(&HarnessRequest {
+                schema_version: 1,
+                request_id: identity.into(),
+                instance: HarnessInstance {
+                    instance_id: "native".into(),
+                    plugin_id: "native.plugin".into(),
+                    executable: "/native".into(),
+                    config_namespace: "isolated".into(),
+                    auth: HarnessAuthBinding {
+                        provider_id: "native".into(),
+                        profile: "work".into(),
+                        credential_namespace: "isolated".into(),
+                        custody: HarnessAuthCustody::NativeManaged,
+                    },
+                },
+                kind: HarnessRequestKind::Submit {
+                    target: HarnessSessionTarget::Prepared(HarnessPreparedSession {
+                        open_id: "open".into(),
+                        session_id: session_id.to_string(),
+                        instance_id: "native".into(),
+                        generation: 3,
+                        native_version: "1".into(),
+                        requested_native_session_id: None,
+                    }),
+                    submission: HarnessSubmission {
+                        submission_id: identity.into(),
+                        attempt_id: format!("attempt-{identity}"),
+                        session_id: session_id.to_string(),
+                        generation: 3,
+                        text: "native input".into(),
+                        placement: HarnessPlacement::NextTurn,
+                    },
+                },
+            })
+            .unwrap();
+        super::super::effects::SubmitMessageRequest {
+            submission_id: bcode_session_models::SubmissionId(identity.into()),
+            managed: Some(retained),
+            attempt_id: format!("attempt-{identity}"),
+            managed_only: true,
+            expected_native_turn_id: None,
+            session_id: Some(session_id),
+            launch_working_directory: std::path::PathBuf::from("."),
+            message: "native input".into(),
+            placement: bcode_ipc::PromptPlacement::FollowUp,
+            provider_plugin_id: None,
+            model_id: None,
+            agent_id: None,
+            reasoning_effort: None,
+            reasoning_summary: None,
+            reasoning_effort_generation: None,
+            execution: bcode_session_models::TurnExecutionOptions::default(),
+            event_sender: chat.event_sender.clone(),
+        }
+    }
+
+    fn assert_managed_capture_rejects_conflicts_and_overflow(
+        chat: &mut ActiveChat,
+        identity: &bcode_session_models::SubmissionId,
+        retained: &bcode_session_models::ExternalHarnessRequest,
+    ) {
+        use super::super::effects::SubmitMessageResult;
+        let session_id = chat.attached_session_id().unwrap();
+        let mut conflict = managed_test_request(chat, &identity.0);
+        if let Some(retained) = &mut conflict.managed
+            && let bcode_session_models::ExternalHarnessRequestKind::Submit { submission, .. } =
+                &mut retained.kind
+        {
+            submission.attempt_id = "replacement-attempt".into();
+        }
+        apply_submit_message_result(
+            chat,
+            identity,
+            "native input",
+            Ok(SubmitMessageResult {
+                session_id,
+                created_session: None,
+                submission: Ok(None),
+                receipt: None,
+                prepared_request: Some(Box::new(conflict)),
+                committed_agent_id: None,
+                committed_reasoning_effort_generation: None,
+                event_task: None,
+                event_stream_release: None,
+            }),
+        );
+        assert_eq!(
+            chat.app.managed_composer.requests.get(&identity.0),
+            Some(retained)
+        );
+        assert_eq!(
+            chat.pending_effects.queued_effect_count(),
+            0,
+            "conflicting attempt never replaces or dispatches"
+        );
+        for index in 1..128 {
+            let request = managed_test_request(chat, &format!("retained-{index}"));
+            chat.app
+                .managed_composer
+                .requests
+                .insert(request.submission_id.0.clone(), request.managed.unwrap());
+        }
+        let overflow = managed_test_request(chat, "overflow");
+        apply_submit_message_result(
+            chat,
+            &bcode_session_models::SubmissionId("overflow".into()),
+            "native input",
+            Ok(SubmitMessageResult {
+                session_id,
+                created_session: None,
+                submission: Ok(None),
+                receipt: None,
+                prepared_request: Some(Box::new(overflow)),
+                committed_agent_id: None,
+                committed_reasoning_effort_generation: None,
+                event_task: None,
+                event_stream_release: None,
+            }),
+        );
+        assert_eq!(chat.app.managed_composer.requests.len(), 128);
+        assert!(!chat.app.managed_composer.requests.contains_key("overflow"));
+        assert_eq!(chat.pending_effects.queued_effect_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn managed_composer_capture_is_bounded_and_uncertain_receipt_retains_exact_attempt() {
+        use super::super::effects::{ComposerReceipt, SubmitMessageResult};
+        let mut chat = managed_test_chat();
+        chat.event_task = Some(tokio::spawn(std::future::pending()));
+        chat.app.replace_composer_with("native input");
+        chat.app.stage_submission();
+        let identity = chat.app.pending_submissions().last().unwrap().id().clone();
+        let request = managed_test_request(&chat, &identity.0);
+        let retained = request.managed.clone().unwrap();
+        let prepared = SubmitMessageResult {
+            session_id: chat.attached_session_id().unwrap(),
+            created_session: None,
+            submission: Ok(None),
+            receipt: None,
+            prepared_request: Some(Box::new(request)),
+            committed_agent_id: None,
+            committed_reasoning_effort_generation: None,
+            event_task: None,
+            event_stream_release: None,
+        };
+        apply_submit_message_result(&mut chat, &identity, "native input", Ok(prepared));
+        assert_eq!(
+            chat.app.managed_composer.requests.get(&identity.0),
+            Some(&retained)
+        );
+        assert_eq!(chat.pending_effects.queued_effect_count(), 1);
+        let _ = chat.pending_effects.drain_runtime();
+        let session_id = chat.attached_session_id().unwrap();
+        let response = bcode_session_models::ExternalHarnessResponse::from_response(
+            &retained.request(),
+            &bcode_harness_models::HarnessServiceResponse {
+                schema_version: 1,
+                request_id: identity.0.clone(),
+                operation: bcode_harness_models::HarnessOperation::Submit,
+                kind: bcode_harness_models::HarnessServiceResponseKind::Receipt(
+                    bcode_harness_models::HarnessReceipt {
+                        submission_id: identity.0.clone(),
+                        attempt_id: format!("attempt-{}", identity.0),
+                        session_id: session_id.to_string(),
+                        generation: 3,
+                        state: bcode_harness_models::HarnessDeliveryState::Uncertain,
+                        native_request_id: None,
+                    },
+                ),
+            },
+        )
+        .unwrap();
+        apply_submit_message_result(
+            &mut chat,
+            &identity,
+            "native input",
+            Ok(SubmitMessageResult {
+                session_id,
+                created_session: None,
+                submission: Ok(None),
+                receipt: Some(ComposerReceipt::Managed(Box::new(response))),
+                prepared_request: None,
+                committed_agent_id: None,
+                committed_reasoning_effort_generation: None,
+                event_task: None,
+                event_stream_release: None,
+            }),
+        );
+        assert_eq!(
+            chat.app.managed_composer.requests.get(&identity.0),
+            Some(&retained)
+        );
+        assert!(
+            chat.app
+                .pending_submissions()
+                .iter()
+                .any(|pending| pending.id() == &identity)
+        );
+        assert!(chat.app.status().contains("Uncertain"));
+        assert_eq!(
+            chat.pending_effects.queued_effect_count(),
+            0,
+            "uncertainty never auto-resends"
+        );
+        assert_managed_capture_rejects_conflicts_and_overflow(&mut chat, &identity, &retained);
+        chat.event_task.take().unwrap().abort();
+    }
 
     fn command_response(success: bool) -> bcode_command::InvokeCommandResponse {
         bcode_command::InvokeCommandResponse {

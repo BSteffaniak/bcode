@@ -255,12 +255,15 @@ const fn classify_external_observation(
         HarnessObservationKind::Result { .. } => PersistedEventClassification::Searchable,
         HarnessObservationKind::Text { .. } => PersistedEventClassification::NonFinal,
         HarnessObservationKind::SubmissionAccepted { .. }
+        | HarnessObservationKind::SubmissionConsumed { .. }
+        | HarnessObservationKind::SubmissionResultObserved { .. }
         | HarnessObservationKind::BindingConfirmed { .. }
         | HarnessObservationKind::Tool { .. }
         | HarnessObservationKind::Subagent { .. }
         | HarnessObservationKind::Interaction { .. }
         | HarnessObservationKind::Status { .. }
         | HarnessObservationKind::Diagnostic { .. }
+        | HarnessObservationKind::NativeTurnTerminal { .. }
         | HarnessObservationKind::Settlement { .. }
         | HarnessObservationKind::Vendor { .. } => PersistedEventClassification::Excluded,
     }
@@ -1036,12 +1039,15 @@ fn project_external_transcript_event(
                     ));
                 }
                 HarnessObservationKind::SubmissionAccepted { .. }
+                | HarnessObservationKind::SubmissionConsumed { .. }
+                | HarnessObservationKind::SubmissionResultObserved { .. }
                 | HarnessObservationKind::BindingConfirmed { .. }
                 | HarnessObservationKind::Tool { .. }
                 | HarnessObservationKind::Subagent { .. }
                 | HarnessObservationKind::Interaction { .. }
                 | HarnessObservationKind::Status { .. }
                 | HarnessObservationKind::Diagnostic { .. }
+                | HarnessObservationKind::NativeTurnTerminal { .. }
                 | HarnessObservationKind::Settlement { .. }
                 | HarnessObservationKind::Vendor { .. } => {
                     return Some(EventProjection::Excluded(

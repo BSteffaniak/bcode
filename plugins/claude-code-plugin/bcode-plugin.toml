@@ -5,7 +5,7 @@ version = "0.0.1"
 [[services]]
 class        = "service"
 description  = "Typed native Claude Code lifecycle; not a model provider or Bcode tool executor"
-interface_id = "bcode.harness/v1"
+interface_id = "bcode.harness/v2"
 name         = "Claude Code managed sessions"
 
 [[services]]
