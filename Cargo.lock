@@ -1528,6 +1528,7 @@ dependencies = [
  "bcode_model_provider_runtime",
  "bcode_openai_compatible_provider_plugin",
  "bcode_plugin",
+ "bcode_plugin_config",
  "bcode_plugin_sdk",
  "bcode_provider_auth",
  "bcode_provider_auth_models",
@@ -2651,6 +2652,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "bcode_plugin_config"
+version = "0.0.1-alpha.0"
+dependencies = [
+ "bcode_config",
+ "bcode_plugin",
+ "bcode_provider_auth",
+ "serde_json",
+ "sshenv_vault",
+ "toml 1.1.8+spec-1.1.0",
+]
+
+[[package]]
 name = "bcode_plugin_models"
 version = "0.0.1-alpha.0"
 dependencies = [
@@ -2944,6 +2957,7 @@ dependencies = [
  "bcode_model_provider_runtime",
  "bcode_pi_session_import_plugin",
  "bcode_plugin",
+ "bcode_plugin_config",
  "bcode_plugin_models",
  "bcode_plugin_sdk",
  "bcode_project_instructions",

@@ -5701,10 +5701,7 @@ impl Bcode {
             })??;
         let defaults = bcode_plugin::static_bundled_default_plugin_ids(static_plugins)?;
         let selection = bcode_config::plugin_selection_with_default_plugin_ids(&config, &defaults);
-        let plugins = bcode_plugin::PluginRuntimeHost::load_defaults_with_static_bundled(
-            &selection,
-            static_plugins,
-        )?;
+        let plugins = load_configured_plugins(&config, &selection, static_plugins)?;
         let resolved = options.selection(&config);
         if resolved.model_id.is_none() || resolved.provider_plugin_id.is_none() {
             return Err(BcodeError::ProviderConfiguration(
@@ -5763,10 +5760,7 @@ impl Bcode {
         let default_plugin_ids = bcode_plugin::static_bundled_default_plugin_ids(static_plugins)?;
         let plugin_selection =
             bcode_config::plugin_selection_with_default_plugin_ids(&config, &default_plugin_ids);
-        let plugins = bcode_plugin::PluginRuntimeHost::load_defaults_with_static_bundled(
-            &plugin_selection,
-            static_plugins,
-        )?;
+        let plugins = load_configured_plugins(&config, &plugin_selection, static_plugins)?;
         Ok(Self::builder()
             .plugin_runtime(plugins)
             .provider_defaults_from_config(&config)
@@ -5827,10 +5821,7 @@ impl Bcode {
             })?;
         let defaults = bcode_plugin::static_bundled_default_plugin_ids(static_plugins)?;
         let selection = bcode_config::plugin_selection_with_default_plugin_ids(&config, &defaults);
-        let plugins = bcode_plugin::PluginRuntimeHost::load_defaults_with_static_bundled(
-            &selection,
-            static_plugins,
-        )?;
+        let plugins = load_configured_plugins(&config, &selection, static_plugins)?;
         let environment =
             bcode_config::ConfigEnvironmentSnapshot::new(BTreeMap::new(), PathBuf::from("."));
         let resolved = config.resolved_model_selection_with_environment(&environment);
@@ -6450,6 +6441,30 @@ impl Bcode {
             )
             .await)
     }
+}
+
+/// Load plugins the way the daemon does: each with its `bcode.toml` section,
+/// a state directory, and invocation-time credentials (see
+/// [`bcode_plugin_config`]). Embedded hosts keep plugin state apart from any
+/// daemon's.
+#[cfg(all(feature = "config", feature = "embedded-plugins"))]
+fn load_configured_plugins(
+    config: &bcode_config::BcodeConfig,
+    selection: &bcode_plugin::PluginSelection,
+    static_plugins: &[bcode_plugin::StaticBundledPlugin],
+) -> Result<bcode_plugin::PluginRuntimeHost> {
+    let state_base = bcode_config::default_state_dir()
+        .join("derived")
+        .join("plugins")
+        .join("embedded");
+    let configs = bcode_plugin_config::resolve_plugin_configs(config, static_plugins, &state_base);
+    Ok(
+        bcode_plugin::PluginRuntimeHost::load_defaults_with_static_bundled_and_config(
+            selection,
+            static_plugins,
+            configs,
+        )?,
+    )
 }
 
 /// Builder for [`Bcode`].

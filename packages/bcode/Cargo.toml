@@ -54,6 +54,7 @@ bcode_model_catalog = { workspace = true }
 bcode_model_provider_runtime = { workspace = true }
 bcode_openai_compatible_provider_plugin = { workspace = true, optional = true }
 bcode_plugin = { workspace = true, optional = true }
+bcode_plugin_config = { workspace = true, optional = true }
 bcode_plugin_sdk = { workspace = true }
 bcode_provider_auth = { workspace = true, optional = true }
 bcode_provider_auth_models = { workspace = true }
@@ -147,7 +148,11 @@ bundled-ocr-tesseract-v5-5-2 = [
 ]
 bundled-plugins = ["dep:bcode_bundled_plugins"]
 cli = ["dep:bcode_cli"]
-config = ["dep:bcode_config", "dep:bcode_provider_auth"]
+config = [
+    "dep:bcode_config",
+    "dep:bcode_plugin_config",
+    "dep:bcode_provider_auth",
+]
 daemon-client = ["dep:bcode_client", "dep:bcode_session_search"]
 default = []
 distribution = [
