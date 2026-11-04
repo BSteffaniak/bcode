@@ -74,7 +74,7 @@ Invalid files are diagnosed and are never partially applied. Theme files are dat
 * `bcode-dark` and `bcode-light` provide first-party opaque palettes.
 * `monochrome` emphasizes glyphs and modifiers rather than color distinctions.
 * `high-contrast` provides strong focus, selection, warning, error, and success distinctions.
-* `nord` adapts the Nord palette under its MIT license; source, copyright, and license text are recorded in `packages/tui/themes/attribution/nord.md`.
+* `nord` adapts the Nord palette under its MIT license; source, copyright, and license text are recorded in `packages/tui-theme/themes/attribution/nord.md`.
 
 ## Authoring format
 
@@ -288,6 +288,22 @@ Bcode does not currently ship a separate JSON/TOML schema artifact. The version-
 Bcode owns coding-agent roles such as transcript speakers, tool states, Markdown, syntax, source cards, and diffs. BMUX owns generic terminal component styling. Native plugin TUI adapters receive renderer-owned semantic presentation with a fingerprint, while plugin behavior and domain state remain plugin-owned.
 
 A definition may omit roles. Resolution inherits from parent themes and then uses Bcode's readable semantic defaults. Rich plugin presentation must retain a generic structured fallback.
+
+## Git client roles
+
+`bcode git` uses the standard roles (`canvas`, `text.*`, `border.*`, `selection.active`,
+`state.*`, `surface.*`, `diff.*`, `syntax.*`, `source.gutter`) and these optional roles, each with a
+colorful fallback derived from the theme's state colors and `accent`/`violet` palette entries:
+
+* `git.title`, `git.title.focused`, `git.key`
+* `git.cursor`, `git.cursor.inactive`, `git.range`
+* `git.status.staged`, `git.status.unstaged`, `git.status.untracked`, `git.status.conflict`
+* `git.directory`
+* `git.branch.head`, `git.branch.local`, `git.branch.remote`, `git.tag`
+* `git.commit.sha`, `git.commit.author`, `git.commit.date`
+
+Graph lanes, authors and branch names cycle through a palette built from the theme's accent, state
+and violet colors so each keeps a stable color.
 
 ## Reload and errors
 

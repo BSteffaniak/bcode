@@ -159,6 +159,7 @@ distribution = [
     "app",
     "bundled-ocr-tesseract",
     "config",
+    "git-ui",
     "static-bundled-plugins",
     "web-renderer",
 ]
@@ -227,6 +228,8 @@ static-bundled-git-plugin = [
     "bundled-plugins",
     "bcode_bundled_plugins/static-bundled-git-plugin",
 ]
+# Interactive `bcode git` client; part of `distribution`, omit it to opt out.
+git-ui = ["static-bundled-git-plugin", "bcode_bundled_plugins/git-ui"]
 static-bundled-github-review-publisher-plugin = [
     "bundled-plugins",
     "bcode_bundled_plugins/static-bundled-github-review-publisher-plugin",

@@ -283,35 +283,35 @@ impl ThemeCatalog {
         let mut catalog = Self::new();
         catalog.insert(parse_theme_definition(
             "builtin:terminal-native",
-            include_str!("../../themes/terminal-native.toml"),
+            include_str!("../themes/terminal-native.toml"),
         )?);
         catalog.insert(parse_theme_definition(
             "builtin:terminal-native-structured",
-            include_str!("../../themes/terminal-native-structured.toml"),
+            include_str!("../themes/terminal-native-structured.toml"),
         )?);
         catalog.insert(parse_theme_definition(
             "builtin:bcode-dark",
-            include_str!("../../themes/bcode-dark.toml"),
+            include_str!("../themes/bcode-dark.toml"),
         )?);
         catalog.insert(parse_theme_definition(
             "builtin:bcode",
-            include_str!("../../themes/bcode.toml"),
+            include_str!("../themes/bcode.toml"),
         )?);
         catalog.insert(parse_theme_definition(
             "builtin:bcode-light",
-            include_str!("../../themes/bcode-light.toml"),
+            include_str!("../themes/bcode-light.toml"),
         )?);
         catalog.insert(parse_theme_definition(
             "builtin:monochrome",
-            include_str!("../../themes/monochrome.toml"),
+            include_str!("../themes/monochrome.toml"),
         )?);
         catalog.insert(parse_theme_definition(
             "builtin:high-contrast",
-            include_str!("../../themes/high-contrast.toml"),
+            include_str!("../themes/high-contrast.toml"),
         )?);
         catalog.insert(parse_theme_definition(
             "builtin:nord",
-            include_str!("../../themes/nord.toml"),
+            include_str!("../themes/nord.toml"),
         )?);
         Ok(catalog)
     }
@@ -331,16 +331,16 @@ impl ThemeCatalog {
     #[must_use]
     pub fn bundled_source(id: &str) -> Option<&'static str> {
         match id {
-            "terminal-native" => Some(include_str!("../../themes/terminal-native.toml")),
+            "terminal-native" => Some(include_str!("../themes/terminal-native.toml")),
             "terminal-native-structured" => {
-                Some(include_str!("../../themes/terminal-native-structured.toml"))
+                Some(include_str!("../themes/terminal-native-structured.toml"))
             }
-            "bcode" => Some(include_str!("../../themes/bcode.toml")),
-            "bcode-dark" => Some(include_str!("../../themes/bcode-dark.toml")),
-            "bcode-light" => Some(include_str!("../../themes/bcode-light.toml")),
-            "monochrome" => Some(include_str!("../../themes/monochrome.toml")),
-            "high-contrast" => Some(include_str!("../../themes/high-contrast.toml")),
-            "nord" => Some(include_str!("../../themes/nord.toml")),
+            "bcode" => Some(include_str!("../themes/bcode.toml")),
+            "bcode-dark" => Some(include_str!("../themes/bcode-dark.toml")),
+            "bcode-light" => Some(include_str!("../themes/bcode-light.toml")),
+            "monochrome" => Some(include_str!("../themes/monochrome.toml")),
+            "high-contrast" => Some(include_str!("../themes/high-contrast.toml")),
+            "nord" => Some(include_str!("../themes/nord.toml")),
             _ => None,
         }
     }
@@ -526,45 +526,6 @@ pub enum ContainerBorder {
     Left,
     /// Single-line border on all sides.
     All,
-}
-
-impl From<ContainerRecipe> for bcode_tui_components::transcript::TranscriptContainerRecipe {
-    fn from(recipe: ContainerRecipe) -> Self {
-        Self {
-            layout: match recipe.layout {
-                ContainerLayout::Plain => {
-                    bcode_tui_components::transcript::TranscriptContainerLayout::Plain
-                }
-                ContainerLayout::LeftBar => {
-                    bcode_tui_components::transcript::TranscriptContainerLayout::LeftBar
-                }
-                ContainerLayout::Panel => {
-                    bcode_tui_components::transcript::TranscriptContainerLayout::Panel
-                }
-            },
-            width: match recipe.width {
-                ContainerWidth::Content => {
-                    bcode_tui_components::transcript::TranscriptContainerWidth::Content
-                }
-                ContainerWidth::Full => {
-                    bcode_tui_components::transcript::TranscriptContainerWidth::Full
-                }
-            },
-            border: match recipe.border {
-                ContainerBorder::None => {
-                    bcode_tui_components::transcript::TranscriptContainerBorder::None
-                }
-                ContainerBorder::Left => {
-                    bcode_tui_components::transcript::TranscriptContainerBorder::Left
-                }
-                ContainerBorder::All => {
-                    bcode_tui_components::transcript::TranscriptContainerBorder::All
-                }
-            },
-            padding_x: recipe.padding_x,
-            padding_y: recipe.padding_y,
-        }
-    }
 }
 
 #[derive(Debug, Clone, PartialEq, Deserialize)]

@@ -37,6 +37,10 @@ cargo xtask dev-release --features web-renderer
 cargo xtask release --features static-bundled-plugins,bundled-ocr-tesseract
 ```
 
+`distribution` includes the interactive git client through the `git-ui` feature. List features
+explicitly without `git-ui` to build bcode without it; the standalone client builds separately
+with `cargo build --release -p bcode_git_ui_cli` (binary `bcode-git`).
+
 Canonical distribution commands:
 
 ```sh

@@ -53,6 +53,7 @@ bcode_tui_components = { workspace = true, features = [
     "transcript-engine",
     "transcript-markdown",
 ] }
+bcode_tui_theme = { workspace = true }
 bcode_usage_models = { workspace = true }
 bcode_workflow = { workspace = true }
 bcode_workflow_store = { workspace = true }

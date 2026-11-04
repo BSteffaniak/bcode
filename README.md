@@ -94,6 +94,7 @@ Start with the [plugin guide](docs/plugins.md) and the [dynamic plugin example](
 
 * [Permissions](docs/permissions.md)
 * [Worktrees](docs/worktrees.md)
+* [Git client (`bcode git`)](docs/git-ui.md)
 * [Skills](docs/skills.md)
 * [Session imports](docs/session-import-plugins.md)
 * [Reasoning presentation](docs/reasoning-presentation.md)

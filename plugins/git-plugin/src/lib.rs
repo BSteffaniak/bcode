@@ -2,6 +2,8 @@
 #![warn(clippy::all, clippy::pedantic, clippy::nursery, clippy::cargo)]
 #![allow(clippy::multiple_crate_versions)]
 
+#[cfg(feature = "git-ui")]
+mod cli;
 #[cfg(feature = "static-bundled")]
 mod git_tui;
 
@@ -632,7 +634,14 @@ const fn tool_error(output: String) -> ToolInvocationResponse {
 #[cfg(feature = "static-bundled")]
 #[must_use]
 pub fn static_plugin() -> bcode_plugin_sdk::StaticPluginVtable {
-    bcode_plugin_sdk::static_plugin_vtable!(GitPlugin, include_str!("../bcode-plugin.toml"))
+    #[cfg_attr(not(feature = "git-ui"), allow(unused_mut))]
+    let mut vtable =
+        bcode_plugin_sdk::static_plugin_vtable!(GitPlugin, include_str!("../bcode-plugin.toml"));
+    #[cfg(feature = "git-ui")]
+    {
+        vtable.cli_registration = Some(cli::registration);
+    }
+    vtable
 }
 
 #[cfg(feature = "static-bundled")]

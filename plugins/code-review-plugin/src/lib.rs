@@ -4541,187 +4541,56 @@ fn git_output(repo_root: &Path, args: &[&str]) -> Result<String, ReviewError> {
 }
 
 fn parse_unified_diff(diff: &str) -> Result<Vec<ReviewFile>, ReviewError> {
-    let mut files = Vec::new();
-    let mut current_file: Option<ReviewFile> = None;
-    let mut current_hunk: Option<ReviewHunk> = None;
-    let mut old_line = 0u32;
-    let mut new_line = 0u32;
-
-    for line in diff.lines() {
-        if line.starts_with("diff --git ") {
-            push_hunk(&mut current_file, current_hunk.take());
-            push_file(&mut files, current_file.take());
-            current_file = Some(file_from_diff_git_line(line));
-            continue;
-        }
-
-        let Some(file) = current_file.as_mut() else {
-            continue;
-        };
-
-        if line.starts_with("new file mode ") {
-            file.status = ReviewFileStatus::Added;
-            continue;
-        }
-        if line.starts_with("deleted file mode ") {
-            file.status = ReviewFileStatus::Deleted;
-            continue;
-        }
-        if line.starts_with("similarity index ") {
-            file.status = ReviewFileStatus::Renamed;
-            continue;
-        }
-        if let Some(path) = line.strip_prefix("rename from ") {
-            file.old_path = Some(path.to_string());
-            file.status = ReviewFileStatus::Renamed;
-            continue;
-        }
-        if let Some(path) = line.strip_prefix("rename to ") {
-            file.new_path = Some(path.to_string());
-            file.status = ReviewFileStatus::Renamed;
-            continue;
-        }
-        if line.starts_with("Binary files ") {
-            file.is_binary = true;
-            continue;
-        }
-        if let Some(path) = line.strip_prefix("--- ") {
-            if path != "/dev/null" {
-                file.old_path = Some(strip_diff_path_prefix(path).to_string());
-            }
-            continue;
-        }
-        if let Some(path) = line.strip_prefix("+++ ") {
-            if path != "/dev/null" {
-                file.new_path = Some(strip_diff_path_prefix(path).to_string());
-            }
-            continue;
-        }
-        if line.starts_with("@@ ") {
-            push_hunk(&mut current_file, current_hunk.take());
-            let hunk = parse_hunk_header(line)?;
-            old_line = hunk.old_start;
-            new_line = hunk.new_start;
-            current_hunk = Some(hunk);
-            continue;
-        }
-
-        let Some(hunk) = current_hunk.as_mut() else {
-            continue;
-        };
-
-        if let Some(content) = line.strip_prefix('+') {
-            hunk.lines.push(ReviewLine {
-                kind: ReviewLineKind::Added,
-                old_line: None,
-                new_line: Some(new_line),
-                content: content.to_string(),
-            });
-            file.additions = file.additions.saturating_add(1);
-            new_line = new_line.saturating_add(1);
-        } else if let Some(content) = line.strip_prefix('-') {
-            hunk.lines.push(ReviewLine {
-                kind: ReviewLineKind::Removed,
-                old_line: Some(old_line),
-                new_line: None,
-                content: content.to_string(),
-            });
-            file.deletions = file.deletions.saturating_add(1);
-            old_line = old_line.saturating_add(1);
-        } else if let Some(content) = line.strip_prefix(' ') {
-            hunk.lines.push(ReviewLine {
-                kind: ReviewLineKind::Context,
-                old_line: Some(old_line),
-                new_line: Some(new_line),
-                content: content.to_string(),
-            });
-            old_line = old_line.saturating_add(1);
-            new_line = new_line.saturating_add(1);
-        }
-    }
-
-    push_hunk(&mut current_file, current_hunk.take());
-    push_file(&mut files, current_file.take());
-    Ok(files)
+    let files = bcode_git::diff::parse_unified_diff(diff)
+        .map_err(|error| ReviewError::Parse(error.to_string()))?;
+    Ok(files.into_iter().map(review_file).collect())
 }
 
-fn file_from_diff_git_line(line: &str) -> ReviewFile {
-    let rest = line.strip_prefix("diff --git ").unwrap_or_default();
-    let mut parts = rest.split_whitespace();
-    let old_path = parts.next().map(strip_diff_path_prefix).map(str::to_string);
-    let new_path = parts.next().map(strip_diff_path_prefix).map(str::to_string);
-
+fn review_file(file: bcode_git::models::DiffFile) -> ReviewFile {
+    use bcode_git::models::{DiffFileStatus, DiffLineKind};
     ReviewFile {
-        old_path,
-        new_path,
-        status: ReviewFileStatus::Modified,
-        additions: 0,
-        deletions: 0,
-        hunks: Vec::new(),
-        is_binary: false,
+        old_path: file.old_path,
+        new_path: file.new_path,
+        status: match file.status {
+            DiffFileStatus::Modified => ReviewFileStatus::Modified,
+            DiffFileStatus::Added => ReviewFileStatus::Added,
+            DiffFileStatus::Deleted => ReviewFileStatus::Deleted,
+            DiffFileStatus::Renamed => ReviewFileStatus::Renamed,
+            DiffFileStatus::Copied => ReviewFileStatus::Copied,
+        },
+        additions: file.additions,
+        deletions: file.deletions,
+        is_binary: file.is_binary,
+        hunks: file
+            .hunks
+            .into_iter()
+            .map(|hunk| ReviewHunk {
+                old_start: hunk.old_start,
+                old_count: hunk.old_count,
+                new_start: hunk.new_start,
+                new_count: hunk.new_count,
+                heading: hunk.heading,
+                lines: hunk
+                    .lines
+                    .into_iter()
+                    .map(|line| ReviewLine {
+                        kind: match line.kind {
+                            DiffLineKind::Context => ReviewLineKind::Context,
+                            DiffLineKind::Added => ReviewLineKind::Added,
+                            DiffLineKind::Removed => ReviewLineKind::Removed,
+                        },
+                        old_line: line.old_line,
+                        new_line: line.new_line,
+                        // Review presentation is line-oriented; drop CRLF carriage returns.
+                        content: line
+                            .content
+                            .strip_suffix('\r')
+                            .map_or_else(|| line.content.clone(), str::to_owned),
+                    })
+                    .collect(),
+            })
+            .collect(),
     }
-}
-
-fn parse_hunk_header(line: &str) -> Result<ReviewHunk, ReviewError> {
-    let Some(rest) = line.strip_prefix("@@ ") else {
-        return Err(ReviewError::Parse(format!("invalid hunk header: {line}")));
-    };
-    let Some((ranges, heading)) = rest.split_once(" @@") else {
-        return Err(ReviewError::Parse(format!("invalid hunk header: {line}")));
-    };
-    let mut ranges = ranges.split_whitespace();
-    let old_range = ranges
-        .next()
-        .ok_or_else(|| ReviewError::Parse(format!("missing old range: {line}")))?;
-    let new_range = ranges
-        .next()
-        .ok_or_else(|| ReviewError::Parse(format!("missing new range: {line}")))?;
-    let (old_start, old_count) = parse_hunk_range(old_range, '-')?;
-    let (new_start, new_count) = parse_hunk_range(new_range, '+')?;
-    let heading = heading.trim();
-
-    Ok(ReviewHunk {
-        old_start,
-        old_count,
-        new_start,
-        new_count,
-        heading: (!heading.is_empty()).then(|| heading.to_string()),
-        lines: Vec::new(),
-    })
-}
-
-fn parse_hunk_range(range: &str, prefix: char) -> Result<(u32, u32), ReviewError> {
-    let Some(range) = range.strip_prefix(prefix) else {
-        return Err(ReviewError::Parse(format!(
-            "hunk range missing '{prefix}' prefix: {range}"
-        )));
-    };
-    let (start, count) = range.split_once(',').unwrap_or((range, "1"));
-    let start = start
-        .parse::<u32>()
-        .map_err(|error| ReviewError::Parse(format!("invalid hunk start '{start}': {error}")))?;
-    let count = count
-        .parse::<u32>()
-        .map_err(|error| ReviewError::Parse(format!("invalid hunk count '{count}': {error}")))?;
-    Ok((start, count))
-}
-
-fn push_hunk(file: &mut Option<ReviewFile>, hunk: Option<ReviewHunk>) {
-    if let (Some(file), Some(hunk)) = (file, hunk) {
-        file.hunks.push(hunk);
-    }
-}
-
-fn push_file(files: &mut Vec<ReviewFile>, file: Option<ReviewFile>) {
-    if let Some(file) = file {
-        files.push(file);
-    }
-}
-
-fn strip_diff_path_prefix(path: &str) -> &str {
-    path.strip_prefix("a/")
-        .or_else(|| path.strip_prefix("b/"))
-        .unwrap_or(path)
 }
 
 fn json_response<T: Serialize>(value: &T) -> ServiceResponse {
@@ -5662,17 +5531,6 @@ mod tests {
         assert_eq!(files[0].status, ReviewFileStatus::Renamed);
         assert_eq!(files[0].additions, 1);
         assert_eq!(files[0].deletions, 1);
-    }
-
-    #[test]
-    fn parses_single_line_hunk_range() {
-        let hunk = parse_hunk_header("@@ -4 +4,2 @@ fn main()").expect("parse hunk");
-
-        assert_eq!(hunk.old_start, 4);
-        assert_eq!(hunk.old_count, 1);
-        assert_eq!(hunk.new_start, 4);
-        assert_eq!(hunk.new_count, 2);
-        assert_eq!(hunk.heading.as_deref(), Some("fn main()"));
     }
 
     #[test]

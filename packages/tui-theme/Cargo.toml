@@ -1,0 +1,24 @@
+[package]
+authors     = { workspace = true }
+categories  = ["command-line-interface", "config"]
+description = "Terminal theme definitions, discovery and bundled themes for bcode"
+edition     = { workspace = true }
+keywords    = ["bcode", "theme", "tui"]
+license     = { workspace = true }
+name        = "bcode_tui_theme"
+readme      = { workspace = true }
+repository  = { workspace = true }
+version     = { workspace = true }
+
+[dependencies]
+bmux_tui  = { workspace = true }
+serde     = { workspace = true, features = ["derive", "std"] }
+thiserror = { workspace = true }
+toml      = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }
+
+[features]
+default          = []
+fail-on-warnings = []

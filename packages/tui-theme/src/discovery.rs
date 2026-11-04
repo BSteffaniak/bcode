@@ -349,7 +349,7 @@ mod tests {
     use tempfile::tempdir;
 
     use super::{ThemeDiscoveryRoot, ThemeSourceKind, default_theme_roots, discover_themes};
-    use crate::theme::definition::ThemeSelection;
+    use crate::definition::ThemeSelection;
 
     fn theme(id: &str, accent: &str) -> String {
         format!("schema_version = 1\nid = \"{id}\"\n[palette]\naccent = \"{accent}\"\n")

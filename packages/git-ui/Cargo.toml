@@ -1,0 +1,45 @@
+[package]
+authors     = { workspace = true }
+categories  = ["command-line-interface", "development-tools"]
+description = "Interactive terminal git client for bcode"
+edition     = { workspace = true }
+keywords    = ["bcode", "git", "tui"]
+license     = { workspace = true }
+name        = "bcode_git_ui"
+readme      = { workspace = true }
+repository  = { workspace = true }
+version     = { workspace = true }
+
+[dependencies]
+bcode_git = { workspace = true }
+bcode_keymap = { workspace = true }
+bcode_syntax_render = { workspace = true }
+bcode_tui_theme = { workspace = true }
+bmux_keyboard = { workspace = true, features = ["crossterm"] }
+bmux_text_edit = { workspace = true }
+bmux_tui = { workspace = true, features = ["crossterm"] }
+bmux_tui_components = { workspace = true, features = [
+    "modal-frame",
+    "pane",
+    "scroll-view",
+    "selectable-list",
+    "text-input",
+    "text-input-box",
+] }
+bmux_tui_runtime = { workspace = true, features = ["crossterm"] }
+notify = { workspace = true, features = ["macos_fsevent"] }
+serde = { workspace = true, features = ["derive", "std"] }
+tokio = { workspace = true, features = [
+    "macros",
+    "rt-multi-thread",
+    "sync",
+    "time",
+] }
+toml = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }
+
+[features]
+default          = []
+fail-on-warnings = []

@@ -5,8 +5,26 @@
 
 use bmux_keyboard::{KeyCode, KeyStroke, Modifiers};
 
-use super::{KeymapAction, KeymapError, KeymapRegistry};
-use crate::tui::PluginTuiHost;
+use crate::{KeymapAction, KeymapError, KeymapRegistry};
+
+/// Effective keymap lookups provided by a frontend host that owns the registry.
+pub trait KeymapResolver {
+    /// Action bound to `stroke` in `scope`, if any.
+    fn keymap_action(&self, scope: &str, stroke: KeyStroke) -> Option<String>;
+
+    /// Whether configuration explicitly owns `stroke` in `scope`.
+    fn keymap_is_overridden(&self, scope: &str, stroke: KeyStroke) -> bool;
+}
+
+impl KeymapResolver for KeymapRegistry {
+    fn keymap_action(&self, scope: &str, stroke: KeyStroke) -> Option<String> {
+        self.action_for_key(scope, stroke).map(str::to_owned)
+    }
+
+    fn keymap_is_overridden(&self, scope: &str, stroke: KeyStroke) -> bool {
+        self.is_overridden_key(scope, stroke)
+    }
+}
 
 /// Shared semantic operations understood by BMUX terminal controls.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -289,10 +307,10 @@ pub enum ControlInput {
 }
 
 impl ControlInput {
-    /// Resolve using a plugin host. An action belonging to another handler never becomes text.
+    /// Resolve using a frontend host. An action belonging to another handler never becomes text.
     #[must_use]
-    pub fn from_host(
-        host: &dyn PluginTuiHost,
+    pub fn from_host<H: KeymapResolver + ?Sized>(
+        host: &H,
         scope: &str,
         stroke: KeyStroke,
         supported: &[ControlAction],

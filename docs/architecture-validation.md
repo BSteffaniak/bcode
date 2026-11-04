@@ -20,6 +20,10 @@ dev-only edges, includes build edges, and reports a dependency path for each vio
 * Minimal app and CLI profiles exclude heavyweight optional implementations; distribution and
   web-enabled profiles include their intended implementations.
 * The bundled-plugin registry without features excludes search backends.
+* The `app` profile excludes the git client (`bcode_git_ui`); `distribution` includes it.
+* The standalone `bcode-git` binary excludes plugin hosting, configuration, the main TUI, client,
+  server, session, agent runtime, model and HTTP crates.
+* The `bcode_git` repository layer cannot reach terminal renderers.
 * Production/build graphs exclude nonportable `sha2-asm`.
 
 Workspace-default resolution checks model/router boundaries. Portable frontend and feature profiles

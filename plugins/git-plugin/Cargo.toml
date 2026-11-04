@@ -15,12 +15,14 @@ crate-type = ["cdylib", "rlib"]
 
 [dependencies]
 bcode_config = { workspace = true }
+bcode_git_ui = { workspace = true, optional = true }
 bcode_plugin_sdk = { workspace = true, features = ["tui"] }
 bcode_tool = { workspace = true }
 bcode_tui_components = { workspace = true, features = [
     "tool-card",
 ], optional = true }
 bmux_tui = { workspace = true, optional = true }
+clap = { workspace = true, optional = true, features = ["derive", "std"] }
 serde = { workspace = true, features = ["derive", "std"] }
 serde_json = { workspace = true }
 thiserror = { workspace = true }
@@ -32,3 +34,5 @@ tempfile = { workspace = true }
 default          = []
 fail-on-warnings = []
 static-bundled   = ["bcode_tui_components", "bmux_tui"]
+# Interactive `bcode git` client. Disable to build bcode without it.
+git-ui = ["dep:bcode_git_ui", "dep:clap", "static-bundled"]

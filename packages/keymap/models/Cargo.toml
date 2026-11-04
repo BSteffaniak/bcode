@@ -1,0 +1,18 @@
+[package]
+authors     = { workspace = true }
+categories  = ["command-line-interface"]
+description = "Portable keymap action declarations for bcode"
+edition     = { workspace = true }
+keywords    = ["bcode", "keymap", "keybindings"]
+license     = { workspace = true }
+name        = "bcode_keymap_models"
+readme      = { workspace = true }
+repository  = { workspace = true }
+version     = { workspace = true }
+
+[dependencies]
+serde = { workspace = true, features = ["derive", "std"] }
+
+[features]
+default          = []
+fail-on-warnings = []

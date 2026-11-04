@@ -2,7 +2,9 @@
 
 ## Contributor registry
 
-The terminal SDK exposes `tui::keymap::KeymapRegistry`. Contributors register stable
+The `bcode_keymap` crate owns `KeymapRegistry`; the terminal SDK re-exports it as
+`tui::keymap::KeymapRegistry`, and standalone tools such as `bcode-git` use the crate directly
+without the plugin SDK. Contributors register stable
 namespaced action IDs, input scopes, descriptions, and default strokes through
 `PluginTuiRegistry::register_keymap_action`. The frontend incorporates enabled
 static TUI contributors and manifest-declared native dynamic plugin actions into
@@ -41,6 +43,16 @@ effective contributor snapshot; disabled plugins do not retain registered action
 Standalone readers resolve the same configuration before entering terminal mode.
 ASCII uppercase terminal events normalize to explicit `shift+letter` bindings;
 use `shift+a`, not bare `A`, in configuration. Unicode literal input remains unchanged.
+
+Bindings may be key sequences: whitespace-separated strokes such as `"g g"`.
+`KeymapRegistry::resolve_sequence` reports a complete match, a pending prefix or no match, and
+`continuations` lists the bindings that extend a pending prefix for "which key" hints.
+`KeySequence` tracks pending input for one handler; a stroke that breaks a sequence is retried on
+its own. A key cannot be both a binding and the prefix of another binding in the same scope:
+conflicting defaults are rejected, and a configured key displaces prefix-related defaults.
+
+The git client (`bcode git`) registers its actions in `git.*` scopes; see
+[the git client documentation](git-ui.md#keybindings) for the scope order and default keys.
 
 The child monitor toggle (`tui.monitor.toggle`) defaults to `Ctrl+G` in chat.
 Global session search (`tui.session.search`) is unbound by default and remains configurable.

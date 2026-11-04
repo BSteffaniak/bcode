@@ -91,6 +91,13 @@ pub static DOC_PAGES: &[DocPage] = &[
         nav_label: "Worktrees",
     },
     docs_markdown_page! {
+        source: "docs/git-ui.md",
+        route: "/docs/git-ui",
+        title: "Git client",
+        section: CAPABILITIES,
+        nav_label: "Git client",
+    },
+    docs_markdown_page! {
         source: "docs/permissions.md",
         route: "/docs/permissions",
         title: "Permissions",

@@ -198,6 +198,10 @@ fn forbidden_dependency(owner: &str, dependency: &str) -> bool {
     if let Some(parent) = owner.strip_suffix("_models") {
         return dependency == parent || implementation(dependency);
     }
+    // Repository access backs tools and non-terminal hosts; presentation stays in the UI crate.
+    if owner == "bcode_git" {
+        return terminal(dependency);
+    }
     owner == "brouter_router"
         && matches!(
             dependency,
@@ -250,80 +254,110 @@ pub fn check(target: &str) -> Result<()> {
     Ok(())
 }
 
+/// `(package, directory, features, required, denied)` resolved in isolated consumer workspaces.
+type FeatureProfile = (
+    &'static str,
+    &'static str,
+    &'static str,
+    &'static [&'static str],
+    &'static [&'static str],
+);
+
+const FEATURE_PROFILES: &[FeatureProfile] = &[
+    (
+        "bcode_recap_cli",
+        "packages/recap/cli",
+        "",
+        &[],
+        &[
+            "bmux_tui",
+            "bmux_tui_components",
+            "bmux_tui_runtime",
+            "bmux_keyboard",
+            "bmux_text_edit",
+            "bmux_image",
+            "crossterm",
+        ],
+    ),
+    (
+        "bcode_recap_cli",
+        "packages/recap/cli",
+        "tui",
+        &[
+            "bmux_tui",
+            "bmux_tui_components",
+            "bmux_tui_runtime",
+            "bmux_image",
+        ],
+        &[],
+    ),
+    (
+        "bcode",
+        "packages/bcode",
+        "app",
+        &[],
+        &[
+            "bcode_tesseract_sys",
+            "bcode_hyperchad",
+            "tantivy",
+            "bcode_git_ui",
+        ],
+    ),
+    (
+        "bcode",
+        "packages/bcode",
+        "distribution",
+        &[
+            "bcode_tesseract_sys",
+            "bcode_hyperchad",
+            "bcode_bundled_plugins",
+            "bcode_git_ui",
+        ],
+        &[],
+    ),
+    (
+        // The standalone git client stays independent of agent, daemon and plugin hosting.
+        "bcode_git_ui_cli",
+        "packages/git-ui/cli",
+        "",
+        &["bcode_git_ui", "bmux_tui_runtime"],
+        &[
+            "bcode_plugin_sdk",
+            "bcode_plugin",
+            "bcode_config",
+            "bcode_tui",
+            "bcode_client",
+            "bcode_server",
+            "bcode_session",
+            "bcode_agent_runtime",
+            "bcode_model",
+            "reqwest",
+        ],
+    ),
+    ("bcode_cli", "packages/cli", "", &[], &["bcode_hyperchad"]),
+    (
+        "bcode_cli",
+        "packages/cli",
+        "web-renderer",
+        &[
+            "bcode_hyperchad",
+            "hyperchad_renderer_html_actix",
+            "hyperchad_renderer_vanilla_js",
+        ],
+        &[],
+    ),
+    (
+        "bcode_bundled_plugins",
+        "packages/bundled-plugins",
+        "",
+        &[],
+        &["tantivy", "zstd"],
+    ),
+];
+
 fn check_feature_profiles(target: &str, failures: &mut Vec<String>) -> Result<()> {
     // Separate consumer workspaces prevent unrelated workspace members from unifying features.
-    for (package, directory, features, required, denied) in [
-        (
-            "bcode_recap_cli",
-            "packages/recap/cli",
-            "",
-            &[][..],
-            &[
-                "bmux_tui",
-                "bmux_tui_components",
-                "bmux_tui_runtime",
-                "bmux_keyboard",
-                "bmux_text_edit",
-                "bmux_image",
-                "crossterm",
-            ][..],
-        ),
-        (
-            "bcode_recap_cli",
-            "packages/recap/cli",
-            "tui",
-            &[
-                "bmux_tui",
-                "bmux_tui_components",
-                "bmux_tui_runtime",
-                "bmux_image",
-            ][..],
-            &[][..],
-        ),
-        (
-            "bcode",
-            "packages/bcode",
-            "app",
-            &[][..],
-            &["bcode_tesseract_sys", "bcode_hyperchad", "tantivy"][..],
-        ),
-        (
-            "bcode",
-            "packages/bcode",
-            "distribution",
-            &[
-                "bcode_tesseract_sys",
-                "bcode_hyperchad",
-                "bcode_bundled_plugins",
-            ][..],
-            &[][..],
-        ),
-        (
-            "bcode_cli",
-            "packages/cli",
-            "",
-            &[][..],
-            &["bcode_hyperchad"][..],
-        ),
-        (
-            "bcode_cli",
-            "packages/cli",
-            "web-renderer",
-            &[
-                "bcode_hyperchad",
-                "hyperchad_renderer_html_actix",
-                "hyperchad_renderer_vanilla_js",
-            ][..],
-            &[][..],
-        ),
-        (
-            "bcode_bundled_plugins",
-            "packages/bundled-plugins",
-            "",
-            &[][..],
-            &["tantivy", "zstd"][..],
-        ),
-    ] {
+    for (package, directory, features, required, denied) in FEATURE_PROFILES {
         check_profile(
             target, package, directory, features, required, denied, failures,
         )?;
@@ -450,7 +484,7 @@ fn profile_graph(target: &str, package: &str, directory: &str, features: &str) -
     let mut probe_manifest = manifest
         .parse::<toml_edit::DocumentMut>()
         .map_err(|error| format_error(format!("invalid probe manifest: {error}")))?;
-    if package == "bcode_recap_cli" {
+    if matches!(package, "bcode_recap_cli" | "bcode_git_ui_cli") {
         configure_binary_probe(&mut probe_manifest, &workspace_manifest, &path)?;
     }
     if let Some(patches) = workspace_manifest.get("patch") {

@@ -1,0 +1,19 @@
+[package]
+authors     = { workspace = true }
+categories  = ["command-line-interface"]
+description = "Contributor-extensible terminal keybinding registry for bcode"
+edition     = { workspace = true }
+keywords    = ["bcode", "keymap", "keybindings", "tui"]
+license     = { workspace = true }
+name        = "bcode_keymap"
+readme      = { workspace = true }
+repository  = { workspace = true }
+version     = { workspace = true }
+
+[dependencies]
+bcode_keymap_models = { workspace = true }
+bmux_keyboard       = { workspace = true }
+
+[features]
+default          = []
+fail-on-warnings = []

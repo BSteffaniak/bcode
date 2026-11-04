@@ -1,7 +1,6 @@
 //! Theme resolution and presentation state.
 
-pub mod definition;
-pub mod discovery;
+pub use bcode_tui_theme::{definition, discovery};
 
 use std::num::ParseIntError;
 
@@ -130,9 +129,11 @@ pub struct ContainerPresentation {
 impl ContainerPresentation {
     /// Adapt this resolved presentation into the reusable Bcode transcript recipe.
     #[must_use]
-    pub fn transcript_style(self) -> bcode_tui_components::transcript::TranscriptContainerStyle {
+    pub const fn transcript_style(
+        self,
+    ) -> bcode_tui_components::transcript::TranscriptContainerStyle {
         bcode_tui_components::transcript::TranscriptContainerStyle {
-            recipe: self.recipe.into(),
+            recipe: transcript_recipe(self.recipe),
             style: self.style,
         }
     }
@@ -806,6 +807,49 @@ fn fallback_agent_accent_color(agent_id: &str) -> Color {
         hash.wrapping_mul(33).wrapping_add(usize::from(byte))
     });
     PALETTE[hash % PALETTE.len()]
+}
+
+/// Transcript component recipe for a theme container recipe.
+const fn transcript_recipe(
+    recipe: definition::ContainerRecipe,
+) -> bcode_tui_components::transcript::TranscriptContainerRecipe {
+    use definition::{ContainerBorder, ContainerLayout, ContainerWidth};
+    {
+        bcode_tui_components::transcript::TranscriptContainerRecipe {
+            layout: match recipe.layout {
+                ContainerLayout::Plain => {
+                    bcode_tui_components::transcript::TranscriptContainerLayout::Plain
+                }
+                ContainerLayout::LeftBar => {
+                    bcode_tui_components::transcript::TranscriptContainerLayout::LeftBar
+                }
+                ContainerLayout::Panel => {
+                    bcode_tui_components::transcript::TranscriptContainerLayout::Panel
+                }
+            },
+            width: match recipe.width {
+                ContainerWidth::Content => {
+                    bcode_tui_components::transcript::TranscriptContainerWidth::Content
+                }
+                ContainerWidth::Full => {
+                    bcode_tui_components::transcript::TranscriptContainerWidth::Full
+                }
+            },
+            border: match recipe.border {
+                ContainerBorder::None => {
+                    bcode_tui_components::transcript::TranscriptContainerBorder::None
+                }
+                ContainerBorder::Left => {
+                    bcode_tui_components::transcript::TranscriptContainerBorder::Left
+                }
+                ContainerBorder::All => {
+                    bcode_tui_components::transcript::TranscriptContainerBorder::All
+                }
+            },
+            padding_x: recipe.padding_x,
+            padding_y: recipe.padding_y,
+        }
+    }
 }
 
 #[cfg(test)]

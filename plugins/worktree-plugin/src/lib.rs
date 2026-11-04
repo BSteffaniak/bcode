@@ -1484,7 +1484,7 @@ mod tests {
         let host = KeymapHost(registry);
         let input = |key| {
             ControlInput::from_host(
-                &host,
+                &host as &dyn bcode_plugin_sdk::tui::PluginTuiHost,
                 "worktree.list",
                 bmux_keyboard::parse_key_stroke(key).unwrap(),
                 ControlAction::NAVIGATION,

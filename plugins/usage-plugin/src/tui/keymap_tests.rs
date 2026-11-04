@@ -40,7 +40,7 @@ fn literal_input_and_explicit_unbind_are_distinct() {
     );
     assert_eq!(
         ControlInput::from_host(
-            &host,
+            &host as &dyn PluginTuiHost,
             "usage-model-picker",
             parse_key_stroke("z").unwrap(),
             ControlAction::TEXT,
@@ -50,7 +50,7 @@ fn literal_input_and_explicit_unbind_are_distinct() {
     );
     assert_eq!(
         ControlInput::from_host(
-            &host,
+            &host as &dyn PluginTuiHost,
             "usage-model-picker",
             KeyStroke::simple(KeyCode::Char('λ')),
             ControlAction::TEXT,

@@ -81,6 +81,7 @@ bundled-ocr-tesseract-v5-5-2 = [
 ]
 default = []
 fail-on-warnings = []
+git-ui = ["static-bundled-git-plugin", "bcode_git_plugin/git-ui"]
 static-bundled-auth-broker-plugin = [
     "dep:bcode_auth_broker_plugin",
     "bcode_auth_broker_plugin/static-bundled",
