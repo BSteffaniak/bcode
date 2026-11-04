@@ -40,6 +40,38 @@ system instructions. Legacy attribution is not invented. Existing scope/superses
 remain in the synthesis path; incomplete, invalid or oversized output is rejected, not clipped.
 Request-only guidance and assembled provider requests are not portable summary sources.
 
+### Host-preserved user context
+
+New capacity-aware operations use `bcode.compaction.protected.v1`. The host preserves selected
+canonical user records byte-for-byte in chronological order, with source sequences and complete
+fragment coverage. The model returns only `bcode.compaction.recollection.v1` derived continuation
+sections. There is no scope extraction, reconciliation or supersession field in this response.
+Unknown fields are rejected; invalid destructive proposals cannot remove restrictions.
+
+Model-context projection restores complete protected bodies as historical **user** messages,
+followed by assistant recollection. They are not system instructions. Later explicit corrections
+retain normal user chronology and scope; independent earlier constraints remain available. Prior
+accepted scope remains explicitly legacy attributed recollection, never promoted to exact user text.
+No normal read replays canonical history to reconstruct older user records.
+
+The host validates exact offsets, coverage, source/manifest identities and retained legacy scope
+on resume. New checkpoints contain `protected_contract: 1`; older executors reject this unknown
+field. Packing has a distinct compatibility identity. Operation lookup retains its frozen namespace
+so a changed prompt cannot hide exhausted or unresolved work. Incompatible retained operations
+continue through the existing fenced recovery path, not an allowance reset. Old scope-edit response
+contracts below remain compatibility handling, not the new synthesis path.
+
+Protection has a real capacity cost: user records are never shortened or clipped. Generated
+continuation can be consolidated, but the complete projected request must still fit the selected
+capacity and required reclaim. If protected content cannot fit, no marker is published and the
+`compaction_protected_capacity` error preserves the boundary when even the protected-context sizing floor cannot fit. Compaction is not unlimited archival compression.
+
+Semantic chunk-merge rejections emit bounded `compaction_rejection_diagnostic_v1` evidence containing
+request identity when available, chunk/attempt, contract, closed reason code, size and digest, without
+response bodies. `session compaction-status` exposes this normalized rejection history. Diagnostic
+recording is best-effort, not dispatch or provider-settlement authority, and does not yet provide
+complete operation-correlated rejection/publication lifecycle coverage.
+
 ### Scope-update compatibility contract
 
 Local synthesis uses `packages/server/src/context_compaction_synthesis.rs`. The model is asked for

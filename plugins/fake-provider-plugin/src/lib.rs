@@ -1292,14 +1292,19 @@ fn fake_compaction_synthesis(
     {
         return Ok(serde_json::json!({"format":"bcode.compaction.section-consolidation.v1", "sections":{}}).to_string());
     }
+    if prompt.starts_with("Return only JSON with format bcode.compaction.section-consolidation.v1")
+    {
+        return compaction_fixture::consolidate_progressive_prompt(prompt)
+            .or_else(|_| Ok(serde_json::json!({"format":"bcode.compaction.section-consolidation.v1", "sections":{}}).to_string()))
+            .map_err(|error: String| fake_structured_output_error(&error));
+    }
     if let Some(protocol) = request
         .provider_context
         .settings
         .get("fake_compaction_fixture")
     {
         return match protocol.as_str() {
-            "scope-v1" => compaction_fixture::synthesize(prompt),
-            "progressive-v1" => compaction_fixture::synthesize_progressive(prompt),
+            "scope-v1" | "progressive-v1" => compaction_fixture::synthesize_progressive(prompt),
             _ => Err("unsupported fake compaction fixture protocol".into()),
         }
         .map_err(|error| fake_structured_output_error(&error));
@@ -1329,6 +1334,12 @@ fn fake_compaction_synthesis(
         value["continuation"] = serde_json::Value::String(
             "Deterministic fake-provider compaction simulation.".to_owned(),
         );
+    }
+    if prompt
+        .split_once("Prior structured synthesis: ")
+        .is_some_and(|(instructions, _)| instructions.contains("bcode.compaction.recollection.v1"))
+    {
+        value = serde_json::json!({"format":"bcode.compaction.recollection.v1", "sections":{"background":value["continuation"]}});
     }
     serde_json::to_string(&value).map_err(|error| fake_structured_output_error(&error))
 }
@@ -1373,10 +1384,9 @@ fn fake_response_text(
     tool_result: Option<&str>,
     user_text: &str,
 ) -> Result<String, ProviderError> {
-    if let Some(summary) = fake_compaction_response(request, user_text) {
-        return summary;
-    }
-    if let Some(response) = fake_media_fixture_response(request, user_text) {
+    if let Some(response) = fake_compaction_response(request, user_text)
+        .or_else(|| fake_media_fixture_response(request, user_text))
+    {
         return response;
     }
     if let Some(result) = tool_result
@@ -1390,6 +1400,9 @@ fn fake_response_text(
         return Ok(format!("fake tool result: {result}"));
     }
     let Some(structured) = request.structured_output.as_ref() else {
+        if let Some(text) = compaction_control::amplified_source(request, user_text)? {
+            return Ok(text);
+        }
         return Ok(format!("fake: {user_text}"));
     };
     let malformed_mode = request

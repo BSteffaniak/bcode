@@ -65,7 +65,11 @@ class ProgressiveDriver(Driver):
             verify_sections(markers(restarted)[-1][1], selected)
         self.send("Repeated-compaction boundary advancement; no additional fixture claims.")
         self.send("Recent tail remains outside the selected prefix.")
-        self.save("compact-4.json", self.run("session", "compact", self.session, "--json").stdout)
+        try:
+            self.save("compact-4.json", self.run("session", "compact", self.session, "--json").stdout)
+        except RuntimeError:
+            self.export("failed-final.jsonl")
+            raise
         repeated = load_events([self.export("repeated.jsonl")])
         verify_sections(markers(repeated)[-1][1], selected)
         self.save("progressive-verification.json", json.dumps(verify_attempts(self.control), indent=2))

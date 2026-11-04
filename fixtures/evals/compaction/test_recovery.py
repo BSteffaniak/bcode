@@ -63,7 +63,7 @@ class RecoveryOracleTests(unittest.TestCase):
 
     def test_mismatch_corpus_is_small_without_bypassing_real_failure_gate(self):
         from unittest.mock import Mock
-        for mismatch, repeats in ((True, 80), (False, 1800)):
+        for mismatch, repeats in ((True, 80), (False, 80)):
             driver = RecoveryDriver.__new__(RecoveryDriver)
             driver.mismatch = mismatch
             driver.identity = {}

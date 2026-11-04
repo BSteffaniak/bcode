@@ -11,7 +11,7 @@ from pathlib import Path
 import uuid
 
 from run_automatic import Driver
-from verify import load_events, markers, verify_scope
+from verify import summary_consumed, load_events, markers, verify_scope
 from verify_automatic import attempts, exported_requests, strings
 
 
@@ -109,7 +109,9 @@ class RecoveryDriver(Driver):
         # This trial needs a genuine failed checkpoint and policy switch, not
         # multi-chunk stress. Keep adaptive original+repair requests feasible;
         # automatic/consolidation drivers own the large-corpus coverage gates.
-        source_repeat = 80 if self.mismatch else 1800
+        # Protected user text stays small; configured assistant amplification supplies
+        # the derived corpus instead of relying on clipping a huge user record.
+        source_repeat = 80
         self.identity["recovery_source_repeat"] = source_repeat
         self.send("lossless source fragment\n" + "evidence 🧭 漢字 e\u0301\n" * source_repeat)
         self.send("TAIL_CANARY_7391 retained canonical tail")
@@ -188,8 +190,7 @@ class RecoveryDriver(Driver):
         requests = [(sequence, request) for sequence, request in exported_requests(self.work, self.session)
                     if sequence > post_marker_sequence]
         summary = selected[0][0]["kind"]["context_compacted"]["summary"]
-        if not requests or not any(summary in "\n".join(strings(request.get("messages", [])))
-                                   for _, request in requests):
+        if not requests or not any(summary_consumed(summary, request) for _, request in requests):
             raise ValueError("actual post-restart continuation request did not consume recovered marker")
         self.identity["result"] = "passed"
         self.save("recovery-verification.json", json.dumps({"policy_mismatch": self.mismatch,

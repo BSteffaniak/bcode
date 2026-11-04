@@ -271,9 +271,13 @@ impl ResolvedSummaryPolicy {
             || (self.minimum_reclaim_tokens > 0
                 && self.before_tokens.saturating_sub(after.tokens) < self.minimum_reclaim_tokens)
         {
-            return Err(invalid(
-                "retained request exceeds capacity or fails required net reclaim",
-            ));
+            return Err(invalid(&format!(
+                "retained request exceeds capacity or fails required net reclaim (before={} after={} required_reclaim={} available={})",
+                self.before_tokens,
+                after.tokens,
+                self.minimum_reclaim_tokens,
+                self.retained_available_input_tokens
+            )));
         }
         Ok(())
     }

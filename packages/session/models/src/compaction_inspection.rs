@@ -182,6 +182,61 @@ pub struct SessionCompactionInspectionQuery {
     pub limit: usize,
 }
 
+/// Body-free rejection evidence. This is diagnostic history, never dispatch authority.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CompactionRejectionDiagnostic {
+    pub version: u32,
+    pub request_id: Option<String>,
+    pub chunk: usize,
+    pub attempt: usize,
+    pub contract: String,
+    pub reason: String,
+    pub response_bytes: usize,
+    pub response_sha256: String,
+}
+
+impl CompactionRejectionDiagnostic {
+    /// Reject unsupported or malformed diagnostics without exposing untrusted values.
+    #[must_use]
+    pub fn valid(&self) -> bool {
+        self.version == 1
+            && self.chunk > 0
+            && self.attempt > 0
+            && self.attempt <= 2
+            && self.request_id.as_ref().is_none_or(|id| {
+                id.len() <= 256
+                    && id
+                        .bytes()
+                        .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
+            })
+            && matches!(self.contract.as_str(), "recollection" | "legacy")
+            && matches!(
+                self.reason.as_str(),
+                "wire_budget"
+                    | "invalid_json"
+                    | "schema"
+                    | "invalid_shape"
+                    | "unsupported_format"
+                    | "empty_continuation"
+                    | "carry_budget"
+                    | "invalid_source"
+                    | "invalid_supersession"
+                    | "ambiguous_group_supersession"
+                    | "unauthorized_scope_change"
+                    | "missing_scope"
+                    | "invalid_reconciliation"
+                    | "incomplete_output"
+                    | "previous_attempt_unavailable"
+            )
+            && self.response_sha256.len() == 64
+            && self
+                .response_sha256
+                .bytes()
+                .all(|byte| byte.is_ascii_hexdigit())
+    }
+}
+
 /// Normalized historical evidence; never a raw canonical event or checkpoint payload.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SessionCompactionInspectionEntry {
@@ -190,6 +245,8 @@ pub struct SessionCompactionInspectionEntry {
     pub phase: Option<CompactionInspectionPhase>,
     pub progress: Option<CompactionProgressObservation>,
     pub blocker: Option<CompactionInspectionBlocker>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rejection: Option<CompactionRejectionDiagnostic>,
 }
 
 /// Bounded historical evidence page, not replayable execution state.

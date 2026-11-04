@@ -46,7 +46,7 @@ def verify_injections(control, outcome):
             response = json.loads(text)
             if "continuation" in response:
                 json.loads(response["continuation"])
-            elif response.get("format") == "bcode.compaction.section-update.v2":
+            elif response.get("format") in ("bcode.compaction.section-update.v2", "bcode.compaction.recollection.v1"):
                 background = response["sections"]["background"].strip()
                 if not background.startswith("BCODE_FIXTURE_STATE_V1 "):
                     raise ValueError("near-limit response lost fixture state")
@@ -75,10 +75,15 @@ def verify_injections(control, outcome):
                 else:
                     raise ValueError("malformed injection was not delivered")
             elif outcome == "oversize-repair":
-                if len(json.loads(text)["continuation"]) <= 65536:
+                if len(json.loads(text).get("continuation", "")) <= 65536:
                     raise ValueError("oversized injection was not delivered")
                 observed = True
             else:
+                if prior and prior.get("format") == "bcode.compaction.protected.v1":
+                    bad = json.loads(text)
+                    if bad.get("protected_users") == [] and corrections:
+                        observed = True
+                    continue
                 bad = json.loads(text)["current_scope"]
                 if prior is None or not prior.get("current_scope"):
                     continue

@@ -156,6 +156,11 @@ fn compaction_provider_failure(message: &str) -> SessionApplicationFailure {
             "compaction_corrective_allowance_exhausted",
             "compaction cannot dispatch another corrective request: its allowance expired, is exhausted, or has an unsettled request; accepted work is preserved and the context boundary is unchanged",
         )
+    } else if message.starts_with("compaction protected context cannot fit") {
+        (
+            "compaction_protected_capacity",
+            "protected user context and retained tail cannot fit selected capacity or required reclaim; nothing was clipped and the boundary is unchanged",
+        )
     } else if message.starts_with("compaction capacity policy rejected:")
         || message.starts_with("compaction summary policy:")
         || message.starts_with("compaction budget")

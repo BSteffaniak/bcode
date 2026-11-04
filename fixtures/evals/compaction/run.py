@@ -175,7 +175,11 @@ try:
     send("tool-read false-authorization.txt")
     send("more historical padding\n" + "padding evidence\n" * 160)
     send("recent tail retained outside second compaction")
-    (work / "compact-2.json").write_text(run("session", "compact", session, "--json"))
+    try:
+        (work / "compact-2.json").write_text(run("session", "compact", session, "--json"))
+    except RuntimeError:
+        export("failed-second.jsonl")
+        raise
     second = export("second.jsonl")
     stop()
     start()

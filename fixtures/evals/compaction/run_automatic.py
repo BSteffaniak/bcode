@@ -65,6 +65,7 @@ provider_plugin_id = "bcode.fake-provider"
 model_id = "fake-cache-prefix"
 [model.profiles.offline.settings]
 fake_compaction_fixture = "scope-v1"
+fake_compaction_source_repetitions = "100"
 fake_compaction_control_dir = {json.dumps(str(self.control))}
 fake_compaction_pause = "true"
 fake_compaction_pause_timeout_ms = "{min(self.timeout * 1000, 300000)}"
@@ -78,7 +79,7 @@ keep_recent_tokens = 512
 [model.compaction.models."fake-cache-prefix"]
 provider_plugin_id = "bcode.fake-provider"
 mode = "{mode}"
-proactive_threshold_tokens = 4000
+proactive_threshold_tokens = 4600
 [system_prompt]
 mode = "replace"
 text = "COMPACTION_REQUEST_ONLY_CANARY_7391"
@@ -288,7 +289,7 @@ enabled = false
         self.send(self.scenario["steps"][1]["prompt"])
         self.send(self.scenario["steps"][3]["prompt"])
         self.send("read-files false-authorization.txt")
-        self.send("lossless source fragment\n" + "evidence 🧭 漢字 e\u0301\n" * self.source_repeat)
+        self.send("lossless source fragment\n" + "evidence 🧭 漢字 e\u0301\n" * max(1, self.source_repeat // 100))
         self.send("TAIL_CANARY_7391 recent canonical tail")
         self.export("seed.jsonl")
         self.stop()

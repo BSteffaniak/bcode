@@ -18,6 +18,7 @@ fn scope(source_sequence: u64, statement: &str) -> CompactionScope {
 
 fn prior() -> CompactionEvidence {
     CompactionEvidence {
+        protected_users: None,
         format: COMPACTION_SUMMARY_FORMAT.into(),
         current_scope: vec![scope(1, "No live eval"), scope(1, "No daemon control")],
         continuation: "All previous evidence, unfinished checks, and next steps.".into(),

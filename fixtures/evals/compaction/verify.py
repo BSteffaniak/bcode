@@ -41,8 +41,46 @@ def markers(events):
     return selected
 
 
+def summary_consumed(summary, request):
+    """Verify the new semantic projection, not the obsolete opaque envelope spelling."""
+    from verify_automatic import strings
+    text = "\n".join(strings(request.get("messages", [])))
+    evidence = json.loads(summary)
+    if evidence.get("format") != "bcode.compaction.protected.v1":
+        return summary in text
+    if evidence["continuation"] not in text:
+        return False
+    users = [message for message in request.get("messages", []) if message.get("role") == "user"]
+    bodies = ["\n".join(strings(message.get("content", []))) for message in users]
+    position = 0
+    for record in evidence["protected_users"]:
+        body = record["text"].split(":\n",1)[1]
+        while position < len(bodies) and body not in bodies[position]:
+            position += 1
+        if position == len(bodies):
+            return False
+        position += 1
+    return True
+
+
 def verify_fixture_scope(events, through, evidence):
     """Check one accepted marker against canonical fixture directives, not model claims."""
+    if evidence.get("format") == "bcode.compaction.protected.v1":
+        if "COMPACTION_REQUEST_ONLY_CANARY_7391" in json.dumps(evidence):
+            raise ValueError("request-only canary became portable content")
+        expected = [(event["sequence"], user["text"]) for event in events if event["sequence"] <= through
+                    for user in [event["kind"].get("user_message", event["kind"].get("submission_activated"))] if user is not None]
+        actual = []
+        for record in evidence.get("protected_users", []):
+            if not record["complete"]:
+                raise ValueError("published incomplete protected record")
+            header, body = record["text"].split(":\n", 1)
+            if header != f"#{record['sequence']} user":
+                raise ValueError("wrong protected user attribution")
+            actual.append((record["sequence"], body))
+        if actual != expected:
+            raise ValueError("protected records differ from canonical chronological user text")
+        return
     if evidence.get("format") != "bcode.compaction.scope.v2":
         raise ValueError("not structured scope evidence")
     if "COMPACTION_REQUEST_ONLY_CANARY_7391" in json.dumps(evidence):
@@ -117,6 +155,14 @@ def verify_scope(events, selected):
     if continuation_facts(latest).get("early") != "violet-7391":
         raise ValueError("early fact did not survive real compaction")
     statements = {scope["statement"] for scope in latest["current_scope"]}
+    if latest.get("format") == "bcode.compaction.protected.v1":
+        current = {}
+        for record in latest["protected_users"]:
+            for line in record["text"].splitlines():
+                if line.startswith("BCODE_FIXTURE_SCOPE "):
+                    directive = json.loads(line.removeprefix("BCODE_FIXTURE_SCOPE "))
+                    current[directive["key"]] = directive["statement"]
+        statements = set(current.values())
     expected = {"No network access", "Read-only analysis; do not edit files"}
     if statements != expected:
         raise ValueError(f"incorrect final independent scope: {statements}")

@@ -414,7 +414,16 @@ pub fn serve_turn(
     let text = if tool_call.is_some() {
         String::new()
     } else {
-        format!("fake cache reply: {user_text}")
+        match super::compaction_control::amplified_source(request, &user_text) {
+            Ok(text) => text.unwrap_or_else(|| format!("fake cache reply: {user_text}")),
+            Err(error) => {
+                push(ProviderTurnEvent::Error { error });
+                push(ProviderTurnEvent::TurnFinished {
+                    stop_reason: StopReason::Error,
+                });
+                return;
+            }
+        }
     };
     let output_tokens = u32::try_from(text.split_whitespace().count().max(1)).unwrap_or(u32::MAX);
     let SimulatedCacheRound { usage, projection } =

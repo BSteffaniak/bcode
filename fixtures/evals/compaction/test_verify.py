@@ -66,7 +66,7 @@ class VerifierTests(unittest.TestCase):
         driver.configure("proactive")
         config = tomllib.loads(driver.config.read_text())
         self.assertIs(config["model"]["compaction"]["experimental_adaptive_packing"], True)
-        self.assertEqual(config["model"]["compaction"]["models"]["fake-cache-prefix"]["proactive_threshold_tokens"], 4000)
+        self.assertEqual(config["model"]["compaction"]["models"]["fake-cache-prefix"]["proactive_threshold_tokens"], 4600)
 
     def attempt(self, text="#1 user:\n漢字 🧭 e\u0301", offset=0):
         path = self.root / "attempt-test"

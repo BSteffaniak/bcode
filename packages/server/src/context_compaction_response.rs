@@ -7,6 +7,7 @@ pub(super) enum ResponseContract {
     Update,
     Replace,
     Consolidation,
+    Recollection,
 }
 
 impl ResponseContract {
@@ -19,7 +20,7 @@ impl ResponseContract {
                 serde_json::json!({
                     "contract": match self {
                         Self::Update => "update", Self::Replace => "replace",
-                        Self::Consolidation => "consolidation",
+                        Self::Consolidation => "consolidation", Self::Recollection => "recollection",
                     },
                     "accepted": result.is_ok(),
                     "response_bytes": text.len(),
@@ -33,12 +34,14 @@ impl ResponseContract {
 
     fn validate_inner(self, text: &str) -> Result<(), Rejection> {
         use std::sync::OnceLock;
+        static RECOLLECTION: OnceLock<jsonschema::Validator> = OnceLock::new();
         static REPLACE: OnceLock<jsonschema::Validator> = OnceLock::new();
         static UPDATE: OnceLock<jsonschema::Validator> = OnceLock::new();
         static CONSOLIDATION: OnceLock<jsonschema::Validator> = OnceLock::new();
         let value: serde_json::Value =
             serde_json::from_str(text).map_err(|error| decode_error(&error))?;
         let slot = match self {
+            Self::Recollection => &RECOLLECTION,
             Self::Replace => &REPLACE,
             Self::Update => &UPDATE,
             Self::Consolidation => &CONSOLIDATION,
@@ -103,6 +106,10 @@ impl ResponseContract {
 
     pub(super) fn request(self) -> bcode_model::StructuredOutputRequest {
         let (name, schema) = match self {
+            Self::Recollection => (
+                "compaction_recollection",
+                serde_json::to_value(schemars::schema_for!(super::protected::Recollection)),
+            ),
             Self::Update | Self::Replace => (
                 "compaction_section_update",
                 serde_json::to_value(schemars::schema_for!(sections::Update)),
@@ -115,6 +122,7 @@ impl ResponseContract {
         let mut schema = schema.expect("compaction schema is serializable");
         schema["properties"]["format"]["const"] = serde_json::Value::String(
             match self {
+                Self::Recollection => super::protected::RESPONSE_FORMAT,
                 Self::Replace => sections::SECTION_REPLACE_FORMAT,
                 Self::Update => sections::SECTION_UPDATE_FORMAT,
                 Self::Consolidation => sections::CONSOLIDATION_FORMAT,
@@ -159,10 +167,12 @@ mod tests {
                     "current_scope": [], "reconciles": [], "supersedes_statements": [],
                     "sections": {"decisions": null}
                 }),
-                ResponseContract::Consolidation => serde_json::json!({
-                    "format": "bcode.compaction.section-consolidation.v1",
-                    "sections": {"decisions": null}
-                }),
+                ResponseContract::Consolidation | ResponseContract::Recollection => {
+                    serde_json::json!({
+                        "format": "bcode.compaction.section-consolidation.v1",
+                        "sections": {"decisions": null}
+                    })
+                }
             };
             assert!(validator.is_valid(&response));
             response["sections"]["decisions"] = serde_json::json!(42);

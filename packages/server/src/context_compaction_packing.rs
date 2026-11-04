@@ -13,7 +13,7 @@ use super::budget::ResolvedSummaryPolicy;
 use super::compaction_capacity_tokens;
 
 /// Persisted packing identity. Changing request-fit semantics requires explicit supersession.
-pub(super) const ALGORITHM_ID: &str = "adaptive-complete-request-v3";
+pub(super) const ALGORITHM_ID: &str = "adaptive-complete-request-v4";
 
 #[derive(Clone, Copy)]
 pub(super) enum PackingGate {
@@ -176,17 +176,19 @@ fn pack_bounded(
     };
     let fits = |chunk: &str| {
         let evidence = CompactionEvidence {
-            format: COMPACTION_SUMMARY_FORMAT.into(),
+            protected_users: matches!(gate, PackingGate::Capacity).then(Vec::new),
+            format: if matches!(gate, PackingGate::Capacity) {
+                super::protected::FORMAT
+            } else {
+                COMPACTION_SUMMARY_FORMAT
+            }
+            .into(),
             current_scope: Vec::new(),
             continuation: carry_reserve.clone(),
         };
-        let Ok(prompt) = synthesis::section_update_prompt(
-            &evidence,
-            chunk,
-            &BTreeSet::new(),
-            &BTreeSet::new(),
-            limits,
-        ) else {
+        let Ok(prompt) =
+            super::synthesis_prompt(&evidence, chunk, &BTreeSet::new(), &BTreeSet::new(), limits)
+        else {
             return false;
         };
         // Eligibility overhead is bounded by the selected source bytes. The optional rejected
@@ -206,11 +208,6 @@ fn pack_bounded(
             },
             prompt,
         );
-        let prompt = if matches!(gate, PackingGate::Capacity) {
-            super::replacement_summary_prompt(&prompt)
-        } else {
-            prompt
-        };
         let repair = synthesis::repair_prompt_with_policy(
             &prompt,
             synthesis::Rejection::InvalidSupersession,

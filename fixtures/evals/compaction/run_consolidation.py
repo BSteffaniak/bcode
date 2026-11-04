@@ -76,7 +76,7 @@ class ConsolidationDriver(RecoveryDriver):
             text = text.replace('mode = "off"\nbackend = "local"', 'mode = "proactive"\nbackend = "local"')
             text = text.replace('provider_plugin_id = "bcode.fake-provider"\nmode = "off"',
                                 'provider_plugin_id = "bcode.fake-provider"\nmode = "proactive"')
-            text = text.replace('proactive_threshold_tokens = 4000',
+            text = text.replace('proactive_threshold_tokens = 4600',
                                 f'proactive_threshold_tokens = {self.threshold}')
         self.config.write_text(text)
 
@@ -90,7 +90,7 @@ class ConsolidationDriver(RecoveryDriver):
         # Explicit repeated propositions are genuinely redundant, not clipped
         # corpus claims. Keep source-reference keys and all qualifiers verbatim.
         base = records()[:6]
-        selected = [(kind, section, key, " Fixture restatement: ".join([statement] * 8))
+        selected = [(kind, section, key, " Fixture restatement: ".join([statement] * 3))
                     for kind, section, key, statement in base]
         for section in SECTIONS:
             batch = [record for record in selected if record[1] == section]
@@ -215,7 +215,7 @@ class ConsolidationDriver(RecoveryDriver):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--binary", type=Path, required=True)
-    parser.add_argument("--threshold-tokens", type=int, default=4000)
+    parser.add_argument("--threshold-tokens", type=int, default=4400)
     parser.add_argument("--finish-consolidation", action="store_true",
                         help="Require successful shortening, host net-reclaim acceptance and exact turn completion")
     args = parser.parse_args()

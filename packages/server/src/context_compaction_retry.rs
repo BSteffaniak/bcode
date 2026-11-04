@@ -15,7 +15,7 @@ pub(super) struct RequestState {
     pub(super) extra_requests: u32,
     pub(super) inherited_requests: u32,
     deadline_ms: u64,
-    request_id: Option<String>,
+    pub(super) request_id: Option<String>,
     outcome: Outcome,
     settled_failures: BTreeSet<String>,
     attempts: BTreeMap<String, u64>,
@@ -291,6 +291,60 @@ async fn collect_inner(
                 () = tokio::time::sleep(delay) => {}
             }
         }
+    }
+}
+
+pub(super) async fn record_semantic_rejection(
+    state: &ServerState,
+    session_id: SessionId,
+    checkpoint: Option<&(&mut checkpoint::LocalCheckpoint, &str)>,
+    position: (usize, usize),
+    protected: bool,
+    reason: synthesis::Rejection,
+    summary: &str,
+) {
+    let code = match reason {
+        synthesis::Rejection::Schema { .. } => "schema".to_owned(),
+        synthesis::Rejection::InvalidShape | synthesis::Rejection::UnknownField => {
+            "invalid_shape".to_owned()
+        }
+        synthesis::Rejection::JsonSyntax { .. } => "invalid_json".to_owned(),
+        _ => reason
+            .guidance()
+            .split(':')
+            .next()
+            .unwrap_or("invalid_shape")
+            .to_owned(),
+    };
+    let diagnostic = bcode_session_models::CompactionRejectionDiagnostic {
+        version: 1,
+        request_id: checkpoint
+            .and_then(|(checkpoint, _)| checkpoint.request_state.as_ref())
+            .and_then(|state| state.request_id.clone()),
+        chunk: position.0 + 1,
+        attempt: position.1 + 1,
+        contract: if protected { "recollection" } else { "legacy" }.into(),
+        reason: code,
+        response_bytes: summary.len(),
+        response_sha256: hex::encode(sha2::Sha256::digest(summary.as_bytes())),
+    };
+    if !diagnostic.valid() {
+        return;
+    }
+    let Ok(detail) = serde_json::to_string(&diagnostic) else {
+        return;
+    };
+    let trace = bcode_session_models::SessionTraceEvent {
+        timestamp_ms: current_unix_millis(),
+        turn_id: compaction_trace_owner(state, session_id).await,
+        phase: bcode_session_models::SessionTracePhase::ModelProviderEvent,
+        payload: bcode_session_models::SessionTracePayload::ProviderEvent {
+            event_type: "compaction_rejection_diagnostic_v1".into(),
+            detail: Some(detail),
+        },
+    };
+    if let Ok(event) = state.sessions.append_trace_event(session_id, trace).await {
+        publish_session_event(state, &event).await;
     }
 }
 

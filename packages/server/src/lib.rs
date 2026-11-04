@@ -38330,6 +38330,13 @@ fn session_events_to_sanitized_model_messages(
                     )));
                 }
             }
+            SessionEventKind::ContextCompacted { summary, .. } => {
+                append_pending_tool_exchange(&mut messages, &mut pending_tool_exchange);
+                messages.extend(
+                    context_compaction::protected_user_model_messages(summary)
+                        .unwrap_or_else(|| vec![historical_recollection(summary)]),
+                );
+            }
             SessionEventKind::ProviderContextCompacted { snapshot, .. } => {
                 append_pending_tool_exchange(&mut messages, &mut pending_tool_exchange);
                 let compatible = provider_plugin_id == Some(snapshot.provider_plugin_id.as_str())
@@ -38346,7 +38353,14 @@ fn session_events_to_sanitized_model_messages(
                 if let Some(provider_messages) = provider_messages {
                     messages.extend(provider_messages);
                 } else {
-                    messages.push(historical_recollection(&snapshot.portable_summary));
+                    messages.extend(
+                        context_compaction::protected_user_model_messages(
+                            &snapshot.portable_summary,
+                        )
+                        .unwrap_or_else(|| {
+                            vec![historical_recollection(&snapshot.portable_summary)]
+                        }),
+                    );
                 }
             }
             SessionEventKind::ModelTurnStarted { .. } => {
@@ -55612,13 +55626,20 @@ library = "test"
             .expect("tool result");
     }
 
-    async fn append_large_followup_fixture(sessions: &SessionManager, session_id: SessionId) {
+    async fn append_large_followup_fixture_with_user_padding(
+        sessions: &SessionManager,
+        session_id: SessionId,
+        user_padding: usize,
+    ) {
         for index in 0..8 {
             append_test_turn(
                 sessions,
                 session_id,
-                format!("historical user {index} {}", "x".repeat(800)),
-                format!("historical assistant {index} {}", "y".repeat(800)),
+                format!("historical user {index} {}", "x".repeat(user_padding)),
+                format!(
+                    "historical assistant {index} {}",
+                    "y".repeat(if user_padding == 40 { 2_000 } else { 800 })
+                ),
             )
             .await;
         }
@@ -60688,7 +60709,10 @@ library = "test"
                 .append_event(
                     session_id,
                     SessionEventKind::AssistantMessage {
-                        text: format!("history assistant {index}"),
+                        text: format!(
+                            "history assistant {index} {}",
+                            "observed evidence ".repeat(100)
+                        ),
                     },
                 )
                 .await
@@ -99463,7 +99487,7 @@ event_symbol = "bcode_plugin_handle_event_v1"
         assert!(
             snapshots[0]
                 .portable_summary
-                .contains("bcode.compaction.scope.v2")
+                .contains("bcode.compaction.protected.v1")
         );
         let stored: Vec<ModelMessage> =
             serde_json::from_str(&snapshots[0].messages_json).expect("native managed messages");
@@ -99490,11 +99514,10 @@ event_symbol = "bcode_plugin_handle_event_v1"
             Some(1),
             Some("other-surface"),
         );
-        assert_eq!(restarted[0].role, MessageRole::Assistant);
-        assert!(
-            matches!(&restarted[0].content[0], ContentBlock::Text { text }
-            if text.contains("bcode.compaction.scope.v2"))
-        );
+        let projected =
+            context_compaction::protected_user_model_messages(&snapshots[0].portable_summary)
+                .unwrap();
+        assert!(restarted.starts_with(&projected));
         drop(state);
     }
 
@@ -99976,7 +99999,7 @@ event_symbol = "bcode_plugin_handle_event_v1"
                     session_id,
                     SessionEventKind::UserMessage {
                         client_id: ClientId::new(),
-                        text: format!("historical user turn {index} {}", "x".repeat(1_000)),
+                        text: format!("historical user turn {index} {}", "x".repeat(40)),
                         admission: bcode_session_models::TurnAdmissionMetadata::default(),
                     },
                 )
@@ -99986,7 +100009,7 @@ event_symbol = "bcode_plugin_handle_event_v1"
                 .append_event(
                     session_id,
                     SessionEventKind::AssistantMessage {
-                        text: format!("historical response {index} {}", "y".repeat(1_000)),
+                        text: format!("historical response {index} {}", "y".repeat(2_000)),
                     },
                 )
                 .await
@@ -100528,15 +100551,20 @@ event_symbol = "bcode_plugin_handle_event_v1"
             .await
             .expect("session")
             .id;
-        append_large_followup_fixture(&sessions, session_id).await;
+        append_large_followup_fixture_with_user_padding(&sessions, session_id, 40).await;
         let mut state = test_server_state_with_fake_provider(sessions);
         isolate_compaction_request_fixture(&mut state);
         state.startup_config.model.compaction.mode = bcode_config::CompactionMode::Proactive;
         state.startup_config.model.compaction.keep_recent_tokens = 1;
-        state.startup_config.model.tool_output.context_chars = 20_000;
+        state.startup_config.model.tool_output.context_chars = 16_000;
+        state.selected_provider_context.settings.insert(
+            "fake_compaction_summary".into(),
+            "Tool evidence was inspected; continue the active request.".into(),
+        );
         let selection = SessionModelSelection {
             provider_plugin_id: Some("bcode.fake-provider".to_owned()),
             model_id: Some("fake-echo".to_owned()),
+            provider_context: state.selected_provider_context.clone(),
             ..SessionModelSelection::default()
         };
         let history = state
@@ -101198,11 +101226,9 @@ event_symbol = "bcode_plugin_handle_event_v1"
             None,
             None,
         );
-        assert!(incompatible_messages.iter().any(|message| {
-            message.content.iter().any(|block| {
-                matches!(block, ContentBlock::Text { text } if text.contains(&snapshot.portable_summary))
-            })
-        }));
+        assert!(incompatible_messages.starts_with(
+            &context_compaction::protected_user_model_messages(&snapshot.portable_summary).unwrap()
+        ));
         let incompatible_auth_messages = session_events_to_model_messages_for_target(
             &history,
             state.startup_config.model.tool_output.context_chars,
@@ -101212,11 +101238,9 @@ event_symbol = "bcode_plugin_handle_event_v1"
             Some(1),
             Some("bcode.fake-provider/context-v1"),
         );
-        assert!(incompatible_auth_messages.iter().any(|message| {
-            message.content.iter().any(|block| {
-                matches!(block, ContentBlock::Text { text } if text.contains(&snapshot.portable_summary))
-            })
-        }));
+        assert!(incompatible_auth_messages.starts_with(
+            &context_compaction::protected_user_model_messages(&snapshot.portable_summary).unwrap()
+        ));
         assert!(!incompatible_auth_messages.iter().any(|message| {
             message
                 .content

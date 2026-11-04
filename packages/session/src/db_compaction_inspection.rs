@@ -266,8 +266,45 @@ const fn invalid_entry(
         sequence,
         phase: None,
         progress: None,
+        rejection: None,
         blocker: Some(blocker),
     }
+}
+
+fn decode_rejection(
+    detail: Option<&str>,
+) -> Option<bcode_session_models::CompactionRejectionDiagnostic> {
+    detail
+        .filter(|text| text.len() <= 2048)
+        .and_then(|text| serde_json::from_str(text).ok())
+        .filter(bcode_session_models::CompactionRejectionDiagnostic::valid)
+}
+
+fn lifecycle_blocker(
+    phase: SessionTracePhase,
+    compacted: bool,
+    message: Option<&str>,
+) -> Option<CompactionInspectionBlocker> {
+    if compacted {
+        return None;
+    }
+    Some(
+        if phase == SessionTracePhase::ContextCompactionFinished
+            && message.is_some_and(|message| {
+                [
+                    "deadline exhausted",
+                    "allowance exhausted",
+                    "budget exhausted",
+                ]
+                .iter()
+                .any(|reason| message.contains(reason))
+            })
+        {
+            CompactionInspectionBlocker::BudgetExhausted
+        } else {
+            CompactionInspectionBlocker::ProgressNotRecorded
+        },
+    )
 }
 
 fn normalize(event: &SessionEvent) -> Option<SessionCompactionInspectionEntry> {
@@ -276,6 +313,7 @@ fn normalize(event: &SessionEvent) -> Option<SessionCompactionInspectionEntry> {
         sequence,
         phase: None,
         progress: None,
+        rejection: None,
         blocker: None,
     };
     match &event.kind {
@@ -284,6 +322,17 @@ fn normalize(event: &SessionEvent) -> Option<SessionCompactionInspectionEntry> {
             entry.phase = Some(CompactionInspectionPhase::Committed);
         }
         SessionEventKind::TraceEvent { trace } => match &trace.payload {
+            SessionTracePayload::ProviderEvent { event_type, detail }
+                if event_type == "compaction_rejection_diagnostic_v1" =>
+            {
+                entry.rejection = decode_rejection(detail.as_deref());
+                if entry.rejection.is_none() {
+                    return Some(invalid_entry(
+                        sequence,
+                        CompactionInspectionBlocker::InvalidEvidence,
+                    ));
+                }
+            }
             SessionTracePayload::ContextCompaction {
                 compacted, message, ..
             } => {
@@ -305,24 +354,7 @@ fn normalize(event: &SessionEvent) -> Option<SessionCompactionInspectionEntry> {
                         ));
                     }
                 };
-                entry.blocker =
-                    if trace.phase == SessionTracePhase::ContextCompactionFinished && !compacted {
-                        Some(
-                            if message.as_deref().is_some_and(|message| {
-                                message.contains("deadline exhausted")
-                                    || message.contains("allowance exhausted")
-                                    || message.contains("budget exhausted")
-                            }) {
-                                CompactionInspectionBlocker::BudgetExhausted
-                            } else {
-                                CompactionInspectionBlocker::ProgressNotRecorded
-                            },
-                        )
-                    } else if *compacted {
-                        None
-                    } else {
-                        Some(CompactionInspectionBlocker::ProgressNotRecorded)
-                    };
+                entry.blocker = lifecycle_blocker(trace.phase, *compacted, message.as_deref());
             }
             SessionTracePayload::ProviderEvent { event_type, detail }
                 if event_type == COMPACTION_PROGRESS_OBSERVATION_EVENT =>

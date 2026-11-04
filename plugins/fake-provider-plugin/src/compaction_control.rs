@@ -108,6 +108,10 @@ impl Control {
                     .get("current_scope")
                     .and_then(Value::as_array)
                     .is_some_and(|scopes| !scopes.is_empty())
+                    || prior
+                        .get("protected_users")
+                        .and_then(Value::as_array)
+                        .is_some_and(|records| !records.is_empty())
             });
         let control = Self {
             directory,
@@ -250,6 +254,18 @@ impl Control {
             "omit-scope-repair" | "paraphrase-scope-repair"
                 if !self.correction && self.carried_scope.is_some() =>
             {
+                if self
+                    .carried_scope
+                    .as_ref()
+                    .is_some_and(|prior| prior["format"] == "bcode.compaction.protected.v1")
+                {
+                    let mut value: Value = serde_json::from_str(&text?)
+                        .map_err(|error| fake_structured_output_error(&error))?;
+                    // New responses cannot mutate protected state. Inject an explicit forbidden
+                    // field instead of relying on obsolete scope fields being accepted.
+                    value["protected_users"] = json!([]);
+                    return Ok(value.to_string());
+                }
                 // Incremental omission means unchanged, not deletion. Mutate the actual
                 // full carried envelope so the preservation validator sees a real fault.
                 text?;
@@ -265,6 +281,34 @@ impl Control {
             _ => text,
         }
     }
+}
+
+pub fn amplified_source(
+    request: &ModelTurnRequest,
+    user_text: &str,
+) -> Result<Option<String>, ProviderError> {
+    if !user_text.starts_with("lossless source fragment\n") {
+        return Ok(None);
+    }
+    let Some(repeats) = request
+        .provider_context
+        .settings
+        .get("fake_compaction_source_repetitions")
+    else {
+        return Ok(None);
+    };
+    let repeats = repeats
+        .parse::<usize>()
+        .map_err(|error| fake_structured_output_error(&error))?;
+    if repeats == 0 || repeats > 100 || user_text.len().saturating_mul(repeats) > 2_000_000 {
+        return Err(fake_structured_output_error(
+            &"fixture source amplification exceeds bound",
+        ));
+    }
+    Ok(Some(format!(
+        "fake derived evidence: {}",
+        user_text.repeat(repeats)
+    )))
 }
 
 fn compaction_overload() -> ProviderError {

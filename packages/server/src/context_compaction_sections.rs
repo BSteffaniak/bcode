@@ -1,8 +1,10 @@
 //! Versioned derived-section patches; unchanged content is copied by the host.
 
+#[cfg(test)]
+use super::COMPACTION_SUMMARY_FORMAT;
+
 use super::{
-    BTreeSet, COMPACTION_SUMMARY_FORMAT, CompactionEvidence, CompactionScope, Rejection,
-    SynthesisPolicy, UPDATE_FORMAT,
+    BTreeSet, CompactionEvidence, CompactionScope, Rejection, SynthesisPolicy, UPDATE_FORMAT,
 };
 
 pub(in super::super) const SECTION_REPLACE_FORMAT: &str = "bcode.compaction.section-update.v2";
@@ -185,6 +187,14 @@ pub(super) fn validate_continuation(text: &str, policy: SynthesisPolicy) -> Resu
     Ok(())
 }
 
+pub(in super::super) fn replace_continuation(
+    text: &str,
+    patch: Patch,
+    policy: SynthesisPolicy,
+) -> Result<String, Rejection> {
+    Sections::from_prior(text)?.apply(patch, policy)
+}
+
 pub(super) fn merge(
     value: serde_json::Value,
     prior: &CompactionEvidence,
@@ -298,7 +308,7 @@ pub(in super::super) fn consolidate_response(
     super::super::response::ResponseContract::Consolidation.validate(response)?;
     let update: Consolidation = serde_json::from_value(value)
         .map_err(|error| super::super::response::decode_error(&error))?;
-    if update.format != CONSOLIDATION_FORMAT || prior.format != COMPACTION_SUMMARY_FORMAT {
+    if update.format != CONSOLIDATION_FORMAT || !super::super::protected::valid(prior) {
         return Err(Rejection::UnsupportedFormat);
     }
     let mut merged = prior.clone();

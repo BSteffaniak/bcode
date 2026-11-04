@@ -372,3 +372,48 @@ async fn append_unrelated_history(db: &SessionDb, id: SessionId) {
         .unwrap();
     }
 }
+
+#[test]
+fn rejection_inspection_preserves_body_free_identity_and_rejects_untrusted_reason() {
+    let id = SessionId::new();
+    let diagnostic = bcode_session_models::CompactionRejectionDiagnostic {
+        version: 1,
+        request_id: Some("request-1".into()),
+        chunk: 1,
+        attempt: 2,
+        contract: "recollection".into(),
+        reason: "invalid_shape".into(),
+        response_bytes: 100,
+        response_sha256: "a".repeat(64),
+    };
+    let make = |value: &bcode_session_models::CompactionRejectionDiagnostic| {
+        event(
+            id,
+            1,
+            SessionEventKind::TraceEvent {
+                trace: Box::new(SessionTraceEvent {
+                    timestamp_ms: 0,
+                    turn_id: None,
+                    phase: SessionTracePhase::ModelProviderEvent,
+                    payload: SessionTracePayload::ProviderEvent {
+                        event_type: "compaction_rejection_diagnostic_v1".into(),
+                        detail: Some(serde_json::to_string(value).unwrap()),
+                    },
+                }),
+            },
+        )
+    };
+    assert_eq!(
+        normalize(&make(&diagnostic)).unwrap().rejection,
+        Some(diagnostic.clone())
+    );
+    let mut bad = diagnostic;
+    bad.reason = "PRIVATE arbitrary response text".into();
+    let normalized = normalize(&make(&bad)).unwrap();
+    assert!(normalized.rejection.is_none());
+    assert!(
+        !serde_json::to_string(&normalized)
+            .unwrap()
+            .contains("PRIVATE")
+    );
+}

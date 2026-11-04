@@ -47,6 +47,8 @@ struct Scope {
 #[derive(Serialize, Deserialize)]
 struct Evidence {
     format: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    protected_users: Option<serde_json::Value>,
     current_scope: Vec<Scope>,
     continuation: String,
 }
@@ -100,6 +102,12 @@ pub fn synthesize_progressive(prompt: &str) -> Result<String, String> {
     let instructions = prompt
         .split_once("Prior structured synthesis: ")
         .map_or("", |(instructions, _)| instructions);
+    if instructions.contains("bcode.compaction.recollection.v1") {
+        let output = synthesize_inner(prompt, true)?;
+        let value: serde_json::Value =
+            serde_json::from_str(&output).map_err(|error| error.to_string())?;
+        return serde_json::to_string(&serde_json::json!({"format":"bcode.compaction.recollection.v1", "sections":value["sections"]})).map_err(|error| error.to_string());
+    }
     let replacement = instructions.contains("bcode.compaction.section-update.v2");
     if !replacement && !instructions.contains("bcode.compaction.section-update.v1") {
         return synthesize(prompt);
@@ -144,7 +152,7 @@ pub fn consolidate_progressive_prompt(prompt: &str) -> Result<String, String> {
         .next()
         .ok_or("missing complete consolidation carry")?;
     let evidence: Evidence = serde_json::from_str(carry).map_err(|error| error.to_string())?;
-    if evidence.format != FORMAT {
+    if evidence.format != FORMAT && evidence.format != "bcode.compaction.protected.v1" {
         return Err("unsupported consolidation envelope".into());
     }
     let prior: serde_json::Value =
@@ -261,7 +269,7 @@ fn synthesize_inner(prompt: &str, progressive: bool) -> Result<String, String> {
         .and_then(|(_, rest)| rest.split_once("\n\nSource fragments (JSON lines):\n"))
         .ok_or("fixture compaction prompt missing attributed fragments")?;
     let mut evidence: Evidence = serde_json::from_str(prior).map_err(|error| error.to_string())?;
-    if evidence.format != FORMAT {
+    if evidence.format != FORMAT && evidence.format != "bcode.compaction.protected.v1" {
         return Err("unsupported fixture evidence format".into());
     }
     let (mut state, background_base) = restore_fixture_state(&evidence, progressive)?;

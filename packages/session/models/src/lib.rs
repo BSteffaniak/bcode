@@ -15,7 +15,7 @@ pub mod compaction_inspection;
 pub use compaction_inspection::{
     COMPACTION_PROGRESS_OBSERVATION_EVENT, CompactionInspectionBlocker,
     CompactionInspectionBudgets, CompactionInspectionCount, CompactionInspectionPhase,
-    CompactionInspectionResume, CompactionProgressObservation,
+    CompactionInspectionResume, CompactionProgressObservation, CompactionRejectionDiagnostic,
     MAX_COMPACTION_INSPECTION_CANDIDATES, MAX_COMPACTION_PROGRESS_OBSERVATION_BYTES,
     SessionCompactionInspectionEntry, SessionCompactionInspectionPage,
     SessionCompactionInspectionQuery,

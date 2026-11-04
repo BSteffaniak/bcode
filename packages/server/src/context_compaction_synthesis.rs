@@ -87,7 +87,7 @@ impl Rejection {
                 "invalid_json: return only the specified JSON object, without fences or extra fields"
             }
             Self::UnsupportedFormat => {
-                "unsupported_format: use bcode.compaction.section-update.v1, bcode.compaction.scope-update.v1, or the strict full-envelope schema"
+                "unsupported_format: use the exact format and fields requested by the host; do not change response contracts"
             }
             Self::EmptyContinuation => {
                 "empty_continuation: supply nonempty continuation facts, retaining relevant previous continuation"
@@ -407,6 +407,7 @@ fn merge_response_inner(
         }
     }
     let mut merged = CompactionEvidence {
+        protected_users: None,
         format: COMPACTION_SUMMARY_FORMAT.into(),
         current_scope: prior
             .current_scope
@@ -526,6 +527,7 @@ mod tests {
 
     fn evidence(current_scope: Vec<CompactionScope>) -> CompactionEvidence {
         CompactionEvidence {
+            protected_users: None,
             format: COMPACTION_SUMMARY_FORMAT.into(),
             current_scope,
             continuation: "Previous evidence and unresolved checks.".into(),

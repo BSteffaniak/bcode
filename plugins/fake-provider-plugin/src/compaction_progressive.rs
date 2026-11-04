@@ -64,6 +64,15 @@ pub(super) fn consolidate_with_budget(response: &str, prompt: &str) -> Result<St
     if value["format"] != "bcode.compaction.section-consolidation.v1" || output == response {
         return Ok(output);
     }
+    // The host estimates protected user messages by role, not as a serialized envelope.
+    if prompt
+        .split_once("Complete accepted carry (derived, not authority):\n")
+        .and_then(|(_, text)| text.lines().next())
+        .and_then(|text| serde_json::from_str::<serde_json::Value>(text).ok())
+        .is_some_and(|carry| carry["format"] == "bcode.compaction.protected.v1")
+    {
+        return Ok(output);
+    }
     let Some((_, rest)) = prompt.split_once("Preferred derived continuation target: ") else {
         return Ok(output);
     };
