@@ -3285,6 +3285,10 @@ pub struct ShellToolConfig {
     /// Maximum bytes included inline per stdout/stderr stream in model-visible shell results.
     #[serde(default = "default_shell_inline_output_bytes")]
     pub inline_output_bytes: usize,
+    /// Environment variables removed from shell commands' environment, such as
+    /// credentials the host process holds that commands should not see.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub remove_env: Vec<String>,
 }
 
 impl Default for ShellToolConfig {
@@ -3294,6 +3298,7 @@ impl Default for ShellToolConfig {
             output: ShellToolOutputConfig::default(),
             max_output_bytes: default_shell_max_output_bytes(),
             inline_output_bytes: default_shell_inline_output_bytes(),
+            remove_env: Vec::new(),
         }
     }
 }

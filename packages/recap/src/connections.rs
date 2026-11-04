@@ -131,6 +131,7 @@ impl Selection {
             provider: self.provider.clone(),
             auth_profile: self.auth_profile.clone(),
             settings,
+            plugin_config: std::collections::BTreeMap::new(),
         }
     }
 

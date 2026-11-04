@@ -27,6 +27,26 @@ pub fn resolve_plugin_configs(
     static_plugins: &[bcode_plugin::StaticBundledPlugin],
     state_base: &Path,
 ) -> std::collections::BTreeMap<String, bcode_plugin::ResolvedPluginConfig> {
+    resolve_plugin_configs_with_overlays(
+        config,
+        static_plugins,
+        state_base,
+        &std::collections::BTreeMap::new(),
+    )
+}
+
+/// [`resolve_plugin_configs`] with host-supplied plugin configuration.
+///
+/// `overlays` (by plugin ID) are merged over each plugin's configured section,
+/// key by key. Embedded hosts use it for settings that apply only to them;
+/// nothing is persisted.
+#[must_use]
+pub fn resolve_plugin_configs_with_overlays(
+    config: &bcode_config::BcodeConfig,
+    static_plugins: &[bcode_plugin::StaticBundledPlugin],
+    state_base: &Path,
+    overlays: &std::collections::BTreeMap<String, serde_json::Value>,
+) -> std::collections::BTreeMap<String, bcode_plugin::ResolvedPluginConfig> {
     let mut manifests = std::collections::BTreeMap::new();
     for plugin in static_plugins {
         if let Ok(manifest) = toml::from_str::<bcode_plugin::PluginManifest>(plugin.manifest_toml) {
@@ -43,7 +63,10 @@ pub fn resolve_plugin_configs(
     manifests
         .values()
         .map(|manifest| {
-            let raw = resolved_plugin_config_value(config, manifest);
+            let mut raw = resolved_plugin_config_value(config, manifest);
+            if let Some(overlay) = overlays.get(&manifest.id) {
+                merge_json_values(&mut raw, overlay.clone());
+            }
             let delivered = sanitize_plugin_config_value(&raw);
             let redacted = redact_plugin_config_value(&raw);
             let plugin_id = manifest.id.clone();

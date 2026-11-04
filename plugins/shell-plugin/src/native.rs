@@ -1753,8 +1753,14 @@ fn encode_terminal_output(
     Ok((encoded, full_encoded, inline_output))
 }
 
-fn remove_private_shell_environment(command: &mut portable_pty::CommandBuilder) {
+fn remove_private_shell_environment(
+    command: &mut portable_pty::CommandBuilder,
+    configured: &[String],
+) {
     for name in DAEMON_PRIVATE_ENV_VARS {
+        command.env_remove(name);
+    }
+    for name in configured {
         command.env_remove(name);
     }
 }
@@ -1819,7 +1825,7 @@ fn run_terminal_shell_command_inner(
     }
     command.env("TERM", "xterm-256color");
     command.env("COLORTERM", "truecolor");
-    remove_private_shell_environment(&mut command);
+    remove_private_shell_environment(&mut command, &shell_config.remove_env);
 
     let mut child = pair
         .slave
@@ -3347,7 +3353,30 @@ mod tests {
         command.env("GITHUB_TOKEN", "synthetic-publication-token");
         command.env("GH_TOKEN", "synthetic-cli-token");
         command.env("BCODE_TEST_PUBLIC", "retained");
-        remove_private_shell_environment(&mut command);
+        remove_private_shell_environment(&mut command, &[]);
+        let mut child = pair.slave.spawn_command(command).unwrap();
+        assert!(child.wait().unwrap().success());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn shell_child_does_not_receive_configured_removed_environment() {
+        let pair = portable_pty::native_pty_system()
+            .openpty(portable_pty::PtySize {
+                rows: 24,
+                cols: 80,
+                pixel_width: 0,
+                pixel_height: 0,
+            })
+            .unwrap();
+        let mut command = portable_pty::CommandBuilder::new("/bin/sh");
+        command.args([
+            "-c",
+            "test -z \"${BCODE_TEST_SECRET+x}\" && test \"$BCODE_TEST_PUBLIC\" = retained",
+        ]);
+        command.env("BCODE_TEST_SECRET", "host-credential");
+        command.env("BCODE_TEST_PUBLIC", "retained");
+        remove_private_shell_environment(&mut command, &["BCODE_TEST_SECRET".to_string()]);
         let mut child = pair.slave.spawn_command(command).unwrap();
         assert!(child.wait().unwrap().success());
     }

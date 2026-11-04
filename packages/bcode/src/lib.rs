@@ -138,6 +138,9 @@ pub struct ConfiguredModelOptions {
     pub auth_profile: Option<String>,
     /// Provider-owned settings applied only to this SDK, never persisted to Bcode config.
     pub settings: BTreeMap<String, String>,
+    /// Plugin configuration (by plugin ID) merged over each plugin's configured
+    /// section for this SDK only, never persisted to Bcode config.
+    pub plugin_config: BTreeMap<String, serde_json::Value>,
 }
 
 /// Secret-free local discovery. Does not load plugins, authenticate, or contact providers.
@@ -5701,7 +5704,8 @@ impl Bcode {
             })??;
         let defaults = bcode_plugin::static_bundled_default_plugin_ids(static_plugins)?;
         let selection = bcode_config::plugin_selection_with_default_plugin_ids(&config, &defaults);
-        let plugins = load_configured_plugins(&config, &selection, static_plugins)?;
+        let plugins =
+            load_configured_plugins(&config, &selection, static_plugins, &options.plugin_config)?;
         let resolved = options.selection(&config);
         if resolved.model_id.is_none() || resolved.provider_plugin_id.is_none() {
             return Err(BcodeError::ProviderConfiguration(
@@ -5760,7 +5764,8 @@ impl Bcode {
         let default_plugin_ids = bcode_plugin::static_bundled_default_plugin_ids(static_plugins)?;
         let plugin_selection =
             bcode_config::plugin_selection_with_default_plugin_ids(&config, &default_plugin_ids);
-        let plugins = load_configured_plugins(&config, &plugin_selection, static_plugins)?;
+        let plugins =
+            load_configured_plugins(&config, &plugin_selection, static_plugins, &BTreeMap::new())?;
         Ok(Self::builder()
             .plugin_runtime(plugins)
             .provider_defaults_from_config(&config)
@@ -5821,7 +5826,8 @@ impl Bcode {
             })?;
         let defaults = bcode_plugin::static_bundled_default_plugin_ids(static_plugins)?;
         let selection = bcode_config::plugin_selection_with_default_plugin_ids(&config, &defaults);
-        let plugins = load_configured_plugins(&config, &selection, static_plugins)?;
+        let plugins =
+            load_configured_plugins(&config, &selection, static_plugins, &BTreeMap::new())?;
         let environment =
             bcode_config::ConfigEnvironmentSnapshot::new(BTreeMap::new(), PathBuf::from("."));
         let resolved = config.resolved_model_selection_with_environment(&environment);
@@ -6452,12 +6458,18 @@ fn load_configured_plugins(
     config: &bcode_config::BcodeConfig,
     selection: &bcode_plugin::PluginSelection,
     static_plugins: &[bcode_plugin::StaticBundledPlugin],
+    overlays: &BTreeMap<String, serde_json::Value>,
 ) -> Result<bcode_plugin::PluginRuntimeHost> {
     let state_base = bcode_config::default_state_dir()
         .join("derived")
         .join("plugins")
         .join("embedded");
-    let configs = bcode_plugin_config::resolve_plugin_configs(config, static_plugins, &state_base);
+    let configs = bcode_plugin_config::resolve_plugin_configs_with_overlays(
+        config,
+        static_plugins,
+        &state_base,
+        overlays,
+    );
     Ok(
         bcode_plugin::PluginRuntimeHost::load_defaults_with_static_bundled_and_config(
             selection,
