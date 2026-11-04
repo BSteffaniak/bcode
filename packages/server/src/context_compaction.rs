@@ -17,6 +17,8 @@ mod auto_recovery;
 mod budget;
 #[path = "context_compaction_checkpoint.rs"]
 mod checkpoint;
+#[path = "context_compaction_diagnostics.rs"]
+mod diagnostics;
 #[path = "context_compaction_packing.rs"]
 mod packing;
 #[path = "context_compaction_protected.rs"]
@@ -725,6 +727,35 @@ async fn compact_session_context_with_policy_inner(
     progress_requirement: Option<CompactionProgressRequirement>,
     planning_policy: CompactionPlanningPolicy,
 ) -> Result<CompactionCompletion, CompactionError> {
+    diagnostics::run(async {
+        let result = Box::pin(compact_session_context_with_policy_execution(
+            state,
+            session_id,
+            selection,
+            first_kept_sequence,
+            command_context,
+            cancel_state,
+            progress_requirement,
+            planning_policy,
+        ))
+        .await;
+        diagnostics::finish(state, session_id, &result).await?;
+        result
+    })
+    .await
+}
+
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
+async fn compact_session_context_with_policy_execution(
+    state: &ServerState,
+    session_id: SessionId,
+    selection: &SessionModelSelection,
+    first_kept_sequence: Option<u64>,
+    command_context: Option<&mut RuntimeCommandContext<'_>>,
+    cancel_state: &TurnCancelState,
+    progress_requirement: Option<CompactionProgressRequirement>,
+    planning_policy: CompactionPlanningPolicy,
+) -> Result<CompactionCompletion, CompactionError> {
     if cancel_state.is_cancelled() {
         return Err(CompactionError::Cancelled);
     }
@@ -757,7 +788,14 @@ async fn compact_session_context_with_policy_inner(
     );
     let checkpoint_key = RESTART_KEY.try_with(Clone::clone).unwrap_or(checkpoint_key);
     let (checkpoint_key, local_checkpoint) =
-        checkpoint::load_resolved(state, session_id, &checkpoint_key).await?;
+        match checkpoint::load_resolved(state, session_id, &checkpoint_key).await {
+            Ok(resolved) => resolved,
+            Err(error) => {
+                diagnostics::start(state, session_id, &checkpoint_key).await?;
+                return Err(error);
+            }
+        };
+    diagnostics::start(state, session_id, &checkpoint_key).await?;
     if local_checkpoint.as_ref().is_some_and(|checkpoint| {
         first_kept_sequence.is_some_and(|cutoff| checkpoint.boundary >= cutoff)
     }) {
@@ -1083,6 +1121,48 @@ async fn publish_compaction_plan(
     native_snapshot: Option<bcode_session_models::ProviderContextSnapshot>,
     portable_summary: String,
 ) -> Result<CompactionCompletion, CompactionError> {
+    diagnostics::emit(state, session_id, "publication", "validating", None, None).await?;
+    let result = Box::pin(publish_compaction_plan_inner(
+        state,
+        session_id,
+        selection,
+        cancel_state,
+        history,
+        plan,
+        transcript,
+        summary_budget,
+        checkpoint_key,
+        local_checkpoint,
+        native_snapshot,
+        portable_summary,
+    ))
+    .await;
+    if let Err(error) = &result {
+        let outcome = match error {
+            CompactionError::Cancelled => "cancelled",
+            CompactionError::OperationBlocked | CompactionError::RecoveryRequired(_) => "blocked",
+            _ => "failed",
+        };
+        diagnostics::emit(state, session_id, "publication", outcome, None, None).await?;
+    }
+    result
+}
+
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
+async fn publish_compaction_plan_inner(
+    state: &ServerState,
+    session_id: SessionId,
+    selection: &SessionModelSelection,
+    cancel_state: &TurnCancelState,
+    history: &[bcode_session_models::SessionEvent],
+    plan: &CompactionPlan,
+    transcript: &CompactionTranscript,
+    summary_budget: &budget::ResolvedSummaryPolicy,
+    checkpoint_key: &str,
+    local_checkpoint: Option<&checkpoint::LocalCheckpoint>,
+    native_snapshot: Option<bcode_session_models::ProviderContextSnapshot>,
+    portable_summary: String,
+) -> Result<CompactionCompletion, CompactionError> {
     if portable_summary.trim().is_empty() {
         return Err(CompactionError::Provider(
             "no complete bounded portable summary; boundary unchanged".into(),
@@ -1189,11 +1269,13 @@ async fn publish_compaction_plan(
             compacted_through_sequence: transcript.compacted_through_sequence,
         }
     };
+    diagnostics::emit(state, session_id, "publication", "committing", None, None).await?;
     let event = state
         .sessions
         .commit_compaction_checkpoint(
             session_id,
             bcode_session::CompactionCheckpointCommit {
+                diagnostic: diagnostics::publication(),
                 operation_key: commit_key,
                 expected_checkpoint_sequence,
                 expected_prior_marker,
@@ -2153,30 +2235,55 @@ pub async fn collect_compaction_summary(
     command_context: Option<&mut RuntimeCommandContext<'_>>,
     cancel_state: &TurnCancelState,
 ) -> Result<String, CompactionError> {
-    Box::pin(context_compaction_request_budget::scope(async {
-        let summary = Box::pin(collect_compaction_summary_resumable(
-            state,
-            session_id,
-            selection,
-            transcript,
-            command_context,
-            cancel_state,
-            None,
-            None,
-        ))
-        .await?;
-        validate_summary_publication(
-            state,
-            session_id,
-            selection,
-            transcript.compacted_through_sequence,
-            &summary,
-            0,
-            cancel_state,
-        )
-        .await?;
-        Ok(summary)
-    }))
+    Box::pin(diagnostics::run(context_compaction_request_budget::scope(
+        async {
+            let identity = serde_json::to_vec(&(
+                transcript.compacted_through_sequence,
+                &transcript.previous_summary,
+                &transcript.summary_input,
+            ))
+            .map_err(|_| {
+                CompactionError::Provider("cannot identify compaction transcript".into())
+            })?;
+            diagnostics::start(
+                state,
+                session_id,
+                &hex::encode(sha2::Sha256::digest(identity)),
+            )
+            .await?;
+            let result = Box::pin(async {
+                let summary = Box::pin(collect_compaction_summary_resumable(
+                    state,
+                    session_id,
+                    selection,
+                    transcript,
+                    command_context,
+                    cancel_state,
+                    None,
+                    None,
+                ))
+                .await?;
+                validate_summary_publication(
+                    state,
+                    session_id,
+                    selection,
+                    transcript.compacted_through_sequence,
+                    &summary,
+                    0,
+                    cancel_state,
+                )
+                .await?;
+                Ok(summary)
+            })
+            .await;
+            diagnostics::finish(state, session_id, &result).await?;
+            if let Ok(summary) = &result {
+                diagnostics::emit(state, session_id, "summary", "ready", None, Some(summary))
+                    .await?;
+            }
+            result
+        },
+    )))
     .await
 }
 
@@ -2199,10 +2306,12 @@ async fn consolidate_carry(
             .map_err(|reason| CompactionError::Provider(reason.guidance()))?,
         policy.preferred_summary_tokens()
     );
-    if let Some((checkpoint, key)) = checkpoint {
-        checkpoint
-            .reserve_consolidation(state, session_id, key)
-            .await?;
+    let consolidation_attempt = if let Some((checkpoint, key)) = checkpoint {
+        usize::from(
+            checkpoint
+                .reserve_consolidation(state, session_id, key)
+                .await?,
+        ) + 1
     } else {
         compaction_recovery::transition(
             state,
@@ -2210,10 +2319,12 @@ async fn consolidate_carry(
             compaction_recovery::Phase::ConsolidatingV1,
         )
         .await?;
-    }
+        1
+    };
     if cancel.is_cancelled() {
         return Err(CompactionError::Cancelled);
     }
+    diagnostics::position(None, consolidation_attempt);
     let response = retry::collect(
         state,
         session_id,
@@ -2232,22 +2343,31 @@ async fn consolidate_carry(
             .settle_contract_response(state, session_id, key)
             .await?;
     }
-    let validated = policy.validate_response(&response).and_then(|()| {
-        synthesis::consolidate_response(&response, evidence, limits).map_err(|reason| {
-            CompactionError::Provider(format!(
-                "derived consolidation rejected: {}; boundary unchanged",
-                reason.guidance()
-            ))
-        })
-    });
+    let validated = if policy.validate_response(&response).is_err() {
+        Err(synthesis::Rejection::WireBudget)
+    } else {
+        synthesis::consolidate_response(&response, evidence, limits)
+    };
     let candidate = match validated {
         Ok(candidate) => candidate,
-        Err(error) => {
+        Err(reason) => {
+            diagnostics::emit(
+                state,
+                session_id,
+                "consolidation",
+                "rejected",
+                Some(diagnostics::reason(reason)),
+                Some(&response),
+            )
+            .await?;
             if let Some((checkpoint, key)) = checkpoint {
                 checkpoint.reject_consolidation_response()?;
                 checkpoint.save(state, session_id, key).await?;
             }
-            return Err(error);
+            return Err(CompactionError::Provider(format!(
+                "derived consolidation rejected: {}; boundary unchanged",
+                reason.guidance()
+            )));
         }
     };
     if let Some((checkpoint, key)) = checkpoint {
@@ -2668,6 +2788,7 @@ async fn repair_synthesis_chunk(
                 .await?;
             repair
         };
+        diagnostics::position(Some(index + 1), repair + 1);
         let attempt_prompt = if repair == 0 {
             prompt.to_owned()
         } else {
@@ -2738,6 +2859,15 @@ async fn repair_synthesis_chunk(
             Err(error) => return Err(error),
         };
         if summary_budget.validate_response(&summary).is_err() {
+            diagnostics::emit(
+                state,
+                session_id,
+                "capacity",
+                "rejected",
+                Some("wire_budget"),
+                Some(&summary),
+            )
+            .await?;
             rejection = Some(synthesis::Rejection::WireBudget);
             rejected_output = None;
             continue;
@@ -2759,16 +2889,7 @@ async fn repair_synthesis_chunk(
                 break;
             }
             Err(reason) => {
-                retry::record_semantic_rejection(
-                    state,
-                    session_id,
-                    checkpoint.as_ref(),
-                    (index, repair),
-                    evidence.protected_users.is_some(),
-                    reason,
-                    &summary,
-                )
-                .await;
+                retry::record_semantic_rejection(state, session_id, reason, &summary).await?;
                 append_context_compaction_trace(state, session_id, CompactionTraceKind::Diagnostic,
                     "synthesis_response_semantic_diagnostic", 0, false,
                     Some(format!("chunk={}/{} reason={} response_bytes={} response_sha256={}; body not retained in public diagnostics",

@@ -144,6 +144,17 @@ async fn collect_inner(
             lifecycle.outcome = Outcome::Pending;
             checkpoint.save(state, session_id, key).await?;
         }
+        diagnostics::contract(contract);
+        diagnostics::request(&attempt.identity.request_id);
+        diagnostics::emit(
+            state,
+            session_id,
+            "request",
+            "dispatch_requested",
+            None,
+            None,
+        )
+        .await?;
         let result = dispatch_synthesis_request(
             state,
             session_id,
@@ -173,16 +184,42 @@ async fn collect_inner(
             };
             checkpoint.save(state, session_id, key).await?;
         }
-        let Err(CompactionError::ProviderFailure(error)) = &result else {
-            if let Ok(text) = &result {
-                record_response_rejection(
+        let outcome = match &result {
+            Ok(_) => "returned",
+            Err(CompactionError::Cancelled) => "cancelled",
+            Err(CompactionError::OperationBlocked) => "blocked",
+            _ => "failed",
+        };
+        diagnostics::emit(
+            state,
+            session_id,
+            "request",
+            outcome,
+            None,
+            result.as_ref().ok().map(String::as_str),
+        )
+        .await?;
+        if let Err(CompactionError::Provider(message)) = &result {
+            let reason = match message.as_str() {
+                "compaction output exceeds bounded synthesis budget" => Some("wire_budget"),
+                "incomplete compaction output" => Some("incomplete_output"),
+                _ => None,
+            };
+            if let Some(reason) = reason {
+                diagnostics::emit(
                     state,
                     session_id,
-                    &attempt.identity.request_id,
-                    contract,
-                    text,
+                    "contract",
+                    "rejected",
+                    Some(reason),
+                    None,
                 )
-                .await;
+                .await?;
+            }
+        }
+        let Err(CompactionError::ProviderFailure(error)) = &result else {
+            if let Ok(text) = &result {
+                record_response_rejection(state, session_id, contract, text).await?;
             }
             if let Some((checkpoint, _)) = checkpoint.as_ref()
                 && matches!(&result, Err(CompactionError::OperationBlocked))
@@ -297,70 +334,38 @@ async fn collect_inner(
 pub(super) async fn record_semantic_rejection(
     state: &ServerState,
     session_id: SessionId,
-    checkpoint: Option<&(&mut checkpoint::LocalCheckpoint, &str)>,
-    position: (usize, usize),
-    protected: bool,
     reason: synthesis::Rejection,
     summary: &str,
-) {
-    let code = match reason {
-        synthesis::Rejection::Schema { .. } => "schema".to_owned(),
-        synthesis::Rejection::InvalidShape | synthesis::Rejection::UnknownField => {
-            "invalid_shape".to_owned()
-        }
-        synthesis::Rejection::JsonSyntax { .. } => "invalid_json".to_owned(),
-        _ => reason
-            .guidance()
-            .split(':')
-            .next()
-            .unwrap_or("invalid_shape")
-            .to_owned(),
-    };
-    let diagnostic = bcode_session_models::CompactionRejectionDiagnostic {
-        version: 1,
-        request_id: checkpoint
-            .and_then(|(checkpoint, _)| checkpoint.request_state.as_ref())
-            .and_then(|state| state.request_id.clone()),
-        chunk: position.0 + 1,
-        attempt: position.1 + 1,
-        contract: if protected { "recollection" } else { "legacy" }.into(),
-        reason: code,
-        response_bytes: summary.len(),
-        response_sha256: hex::encode(sha2::Sha256::digest(summary.as_bytes())),
-    };
-    if !diagnostic.valid() {
-        return;
-    }
-    let Ok(detail) = serde_json::to_string(&diagnostic) else {
-        return;
-    };
-    let trace = bcode_session_models::SessionTraceEvent {
-        timestamp_ms: current_unix_millis(),
-        turn_id: compaction_trace_owner(state, session_id).await,
-        phase: bcode_session_models::SessionTracePhase::ModelProviderEvent,
-        payload: bcode_session_models::SessionTracePayload::ProviderEvent {
-            event_type: "compaction_rejection_diagnostic_v1".into(),
-            detail: Some(detail),
-        },
-    };
-    if let Ok(event) = state.sessions.append_trace_event(session_id, trace).await {
-        publish_session_event(state, &event).await;
-    }
+) -> Result<(), CompactionError> {
+    diagnostics::emit(
+        state,
+        session_id,
+        "merge",
+        "rejected",
+        Some(diagnostics::reason(reason)),
+        Some(summary),
+    )
+    .await
 }
 
 async fn record_response_rejection(
     state: &ServerState,
     session_id: SessionId,
-    request_id: &str,
     contract: response::ResponseContract,
     text: &str,
-) {
+) -> Result<(), CompactionError> {
     if let Err(reason) = contract.validate(text) {
-        append_context_compaction_trace(state, session_id, CompactionTraceKind::Diagnostic,
-            "synthesis_response_contract_diagnostic", 0, false,
-            Some(format!("request_id={request_id} contract={} response_bytes={} response_sha256={} {}; body not retained in public diagnostics",
-                contract.request().name, text.len(), hex::encode(sha2::Sha256::digest(text.as_bytes())), reason.guidance()))).await;
+        diagnostics::emit(
+            state,
+            session_id,
+            "contract",
+            "rejected",
+            Some(diagnostics::reason(reason)),
+            Some(text),
+        )
+        .await?;
     }
+    Ok(())
 }
 
 #[cfg(test)]

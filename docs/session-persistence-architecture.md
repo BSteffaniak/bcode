@@ -69,7 +69,12 @@ reindex, replay history or restore execution state.
 
 Only closed phase/resume/blocker vocabulary and optional validated counters are presented. Missing
 legacy progress is not fabricated; checkpoint presence alone does not establish resumability.
-Operation keys, summaries, source manifests, provider diagnostics and opaque carry remain absent.
+Operation keys, summaries, source manifests, arbitrary provider diagnostics and opaque carry remain absent.
+Versioned body-free compaction diagnostics expose only validated operation digests, activation/request
+identities, closed outcomes/reasons and response sizes/digests. These observations are not execution
+authority; missing terminal evidence is not completion. The commit observation is part of the same
+atomic marker/retirement publication, including in-memory sessions; normal inspection never reconstructs
+or backfills missing observations.
 Historical terminal evidence cannot reopen work.
 
 Canonical event storage, history/range/source-page APIs and export retain exact evidence. Semantic

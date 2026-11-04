@@ -66,11 +66,26 @@ continuation can be consolidated, but the complete projected request must still 
 capacity and required reclaim. If protected content cannot fit, no marker is published and the
 `compaction_protected_capacity` error preserves the boundary when even the protected-context sizing floor cannot fit. Compaction is not unlimited archival compression.
 
-Semantic chunk-merge rejections emit bounded `compaction_rejection_diagnostic_v1` evidence containing
-request identity when available, chunk/attempt, contract, closed reason code, size and digest, without
-response bodies. `session compaction-status` exposes this normalized rejection history. Diagnostic
-recording is best-effort, not dispatch or provider-settlement authority, and does not yet provide
-complete operation-correlated rejection/publication lifecycle coverage.
+Operation diagnostics use `compaction_diagnostic_v1`, exposed by bounded `session compaction-status`
+inspection. A SHA-256 identifier correlates the exact private operation namespace without exposing
+it. Each activation has a separate identifier; every provider attempt carries its actual request ID,
+contract and synthesis chunk/repair position (consolidation uses its own attempt and no source chunk).
+Contract/schema, complete-response capacity, semantic merge and consolidation rejection paths retain
+closed reason codes, byte counts and digests, never response bodies. Incomplete/oversized streamed
+responses report their rejection without pretending a digest of partial text represents a complete
+response. Request dispatch intent, returned/failed/blocked/cancelled outcomes, activation failure,
+publication validation/commit intent and publication outcomes are separately observable. A dispatch
+intent is not proof of provider dispatch or settlement.
+
+Diagnostic append errors propagate rather than silently dropping evidence. The committed observation
+(including canonical marker sequence) is appended **atomically with marker and checkpoint retirement**
+in both durable and memory storage; stale or failed commits cannot leave a false committed diagnostic.
+A crash or unavailable store can leave an activation/request without an outcome: inspection does not
+fabricate one or claim complete transport evidence. Observations never confer retry, resume or
+publication authority and do not reset budgets. Failures before operation resolution have an activation
+ID but explicitly no operation ID. Legacy rejection diagnostics remain readable without fabricated
+correlation. Unknown versions or invalid/untrusted fields surface degraded evidence without exposing
+arbitrary text. No historical data is repaired or backfilled during inspection.
 
 ### Scope-update compatibility contract
 

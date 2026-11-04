@@ -32,6 +32,7 @@ async fn memory_compaction_commit_validates_and_atomically_retires_native_and_lo
             .unwrap();
         let marker = marker(native, source_event.sequence);
         let request = CompactionCheckpointCommit {
+            diagnostic: None,
             operation_key: "operation".into(),
             expected_checkpoint_sequence: checkpoint.sequence,
             expected_prior_marker: None,
@@ -86,6 +87,106 @@ async fn memory_compaction_commit_validates_and_atomically_retires_native_and_lo
                 .await
                 .is_err()
         );
+        assert_eq!(manager.session_history(session.id).await.unwrap(), history);
+    }
+}
+
+fn publication_diagnostic() -> bcode_session_models::CompactionDiagnostic {
+    use sha2::{Digest as _, Sha256};
+    bcode_session_models::CompactionDiagnostic {
+        version: 1,
+        operation_id: Some(hex::encode(Sha256::digest(b"operation"))),
+        activation_id: uuid::Uuid::new_v4().to_string(),
+        request_id: None,
+        contract: None,
+        stage: "publication".into(),
+        outcome: "committed".into(),
+        reason: None,
+        chunk: None,
+        attempt: None,
+        response: None,
+        marker_sequence: None,
+    }
+}
+
+#[tokio::test]
+async fn publication_diagnostic_is_atomic_validated_and_inspectable_for_both_stores() {
+    for durable in [false, true] {
+        let root = tempfile::tempdir().unwrap();
+        let manager = if durable {
+            SessionManager::persistent(root.path()).unwrap()
+        } else {
+            SessionManager::default()
+        };
+        let session = manager
+            .create_session(None, root.path().to_owned())
+            .await
+            .unwrap();
+        let source = manager
+            .append_event(
+                session.id,
+                SessionEventKind::SystemMessage {
+                    text: "PRIVATE source".into(),
+                },
+            )
+            .await
+            .unwrap();
+        let checkpoint = manager
+            .append_compaction_checkpoint(session.id, "operation", Some("PRIVATE carry".into()))
+            .await
+            .unwrap();
+        let request = CompactionCheckpointCommit {
+            diagnostic: Some(publication_diagnostic()),
+            operation_key: "operation".into(),
+            expected_checkpoint_sequence: checkpoint.sequence,
+            expected_prior_marker: None,
+            source: vec![compaction_event_identity(&source).unwrap()],
+            marker: marker(false, source.sequence),
+        };
+        let before = manager.session_history(session.id).await.unwrap();
+        let mut bad = request.clone();
+        bad.diagnostic.as_mut().unwrap().operation_id = Some("f".repeat(64));
+        assert!(
+            manager
+                .commit_compaction_checkpoint(session.id, bad)
+                .await
+                .is_err()
+        );
+        assert_eq!(before, manager.session_history(session.id).await.unwrap());
+        let mut stale = request.clone();
+        stale.expected_checkpoint_sequence += 1;
+        assert!(
+            manager
+                .commit_compaction_checkpoint(session.id, stale)
+                .await
+                .is_err()
+        );
+        assert_eq!(before, manager.session_history(session.id).await.unwrap());
+        let committed = manager
+            .commit_compaction_checkpoint(session.id, request.clone())
+            .await
+            .unwrap();
+        let history = manager.session_history(session.id).await.unwrap();
+        assert_eq!(history.len(), before.len() + 3);
+        let page = manager
+            .session_compaction_inspection_page(
+                session.id,
+                bcode_session_models::SessionCompactionInspectionQuery {
+                    before: None,
+                    limit: 10,
+                },
+            )
+            .await
+            .unwrap();
+        let evidence = page
+            .entries
+            .iter()
+            .filter_map(|entry| entry.diagnostic.as_ref())
+            .collect::<Vec<_>>();
+        assert_eq!(evidence.len(), 1);
+        let mut expected = request.diagnostic.unwrap();
+        expected.marker_sequence = Some(committed.sequence);
+        assert_eq!(evidence[0], &expected);
         assert_eq!(manager.session_history(session.id).await.unwrap(), history);
     }
 }

@@ -22,6 +22,8 @@ pub struct CompactionEventIdentity {
 /// Compare-and-publish request; source is the ordered model-visible prefix excluding markers.
 #[derive(Debug, Clone)]
 pub struct CompactionCheckpointCommit {
+    /// Optional body-free commit observation, appended atomically with marker and retirement.
+    pub diagnostic: Option<bcode_session_models::CompactionDiagnostic>,
     /// Exact operational checkpoint namespace.
     pub operation_key: String,
     /// Latest active checkpoint sequence observed by the host.
@@ -32,6 +34,41 @@ pub struct CompactionCheckpointCommit {
     pub source: Vec<CompactionEventIdentity>,
     /// Existing local or provider compaction marker, never a partial checkpoint.
     pub marker: SessionEventKind,
+}
+
+impl CompactionCheckpointCommit {
+    pub(crate) fn diagnostic_event(
+        &self,
+        marker: &SessionEvent,
+    ) -> Result<Option<SessionEvent>, String> {
+        let Some(mut value) = self.diagnostic.clone() else {
+            return Ok(None);
+        };
+        // Native publication has a dedicated commit-ready checkpoint within the same operation.
+        let operation_key = self
+            .operation_key
+            .strip_suffix(":native-commit")
+            .unwrap_or(&self.operation_key);
+        let operation_id = hex::encode(Sha256::digest(operation_key.as_bytes()));
+        if value.stage != "publication"
+            || value.outcome != "committed"
+            || value.operation_id.as_deref() != Some(&operation_id)
+            || value.marker_sequence.is_some()
+        {
+            return Err("invalid compaction publication diagnostic".into());
+        }
+        value.marker_sequence = Some(marker.sequence);
+        let trace = value.into_trace(marker.timestamp_ms, None)?;
+        let mut event = marker.clone();
+        event.sequence = marker
+            .sequence
+            .checked_add(2)
+            .ok_or("compaction sequence exhausted")?;
+        event.kind = SessionEventKind::TraceEvent {
+            trace: Box::new(trace),
+        };
+        Ok(Some(event))
+    }
 }
 
 /// Exact compare-and-supersede request for an unpublished current-format operation.
@@ -178,6 +215,7 @@ impl CompactionCheckpointRestart {
 
     pub(crate) fn comparison(&self) -> CompactionCheckpointCommit {
         CompactionCheckpointCommit {
+            diagnostic: None,
             operation_key: self.operation_key.clone(),
             expected_checkpoint_sequence: self.expected_checkpoint_sequence,
             expected_prior_marker: self.expected_prior_marker.clone(),

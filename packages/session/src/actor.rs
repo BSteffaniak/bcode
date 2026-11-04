@@ -3758,10 +3758,16 @@ impl SessionActor {
             .db
             .as_ref()
             .ok_or(SessionError::DbUnavailable(self.state.summary.id))?;
+        let diagnostic = request
+            .diagnostic_event(&marker)
+            .map_err(SessionError::EventSerialization)?;
         db.commit_compaction_checkpoint(&request, &marker, &retirement)
             .await?;
         self.apply_appended_event(&marker, timestamp_ms).await?;
         self.apply_appended_event(&retirement, timestamp_ms).await?;
+        if let Some(diagnostic) = diagnostic {
+            self.apply_appended_event(&diagnostic, timestamp_ms).await?;
+        }
         self.update_manifest_and_schedule_catalog().await;
         self.state.load_status = SessionLoadStatusKind::Current;
         self.refresh_snapshot();
@@ -3855,9 +3861,12 @@ impl SessionActor {
         crate::ensure_durable_session_event_kind(&request.marker, None)?;
         // Reserve both sequence increments and perform all fallible construction before
         // publication. This actor command has no await point between the two applications.
-        self.state.next_sequence.checked_add(2).ok_or_else(|| {
-            SessionError::EventSerialization("compaction sequence exhausted".into())
-        })?;
+        self.state
+            .next_sequence
+            .checked_add(if request.diagnostic.is_some() { 3 } else { 2 })
+            .ok_or_else(|| {
+                SessionError::EventSerialization("compaction sequence exhausted".into())
+            })?;
         let marker = self
             .state
             .build_next_event(request.marker.clone(), timestamp_ms);
@@ -3875,10 +3884,21 @@ impl SessionActor {
         crate::persisted::encode_session_event(&retirement).map_err(|_| {
             SessionError::EventSerialization("invalid compaction retirement".into())
         })?;
+        let diagnostic = request
+            .diagnostic_event(&marker)
+            .map_err(SessionError::EventSerialization)?;
+        if let Some(event) = &diagnostic {
+            crate::persisted::encode_session_event(event).map_err(|_| {
+                SessionError::EventSerialization("invalid compaction diagnostic".into())
+            })?;
+        }
         self.state
             .apply_persisted_event(marker.clone(), timestamp_ms);
         self.retire_live_text_checkpoint_for_durable_event(&marker.kind);
         self.state.apply_persisted_event(retirement, timestamp_ms);
+        if let Some(diagnostic) = diagnostic {
+            self.state.apply_persisted_event(diagnostic, timestamp_ms);
+        }
         self.state.load_status = SessionLoadStatusKind::Current;
         self.refresh_snapshot();
         Ok(marker)

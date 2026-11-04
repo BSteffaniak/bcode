@@ -247,6 +247,8 @@ pub struct SessionCompactionInspectionEntry {
     pub blocker: Option<CompactionInspectionBlocker>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub rejection: Option<CompactionRejectionDiagnostic>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub diagnostic: Option<crate::CompactionDiagnostic>,
 }
 
 /// Bounded historical evidence page, not replayable execution state.

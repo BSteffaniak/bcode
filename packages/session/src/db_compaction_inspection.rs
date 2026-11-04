@@ -267,6 +267,7 @@ const fn invalid_entry(
         phase: None,
         progress: None,
         rejection: None,
+        diagnostic: None,
         blocker: Some(blocker),
     }
 }
@@ -278,6 +279,15 @@ fn decode_rejection(
         .filter(|text| text.len() <= 2048)
         .and_then(|text| serde_json::from_str(text).ok())
         .filter(bcode_session_models::CompactionRejectionDiagnostic::valid)
+}
+
+fn decode_diagnostic(detail: Option<&str>) -> Option<bcode_session_models::CompactionDiagnostic> {
+    detail
+        .filter(|text| text.len() <= 2048)
+        .and_then(|text| {
+            serde_json::from_str::<bcode_session_models::CompactionDiagnostic>(text).ok()
+        })
+        .filter(bcode_session_models::CompactionDiagnostic::valid)
 }
 
 fn lifecycle_blocker(
@@ -307,15 +317,42 @@ fn lifecycle_blocker(
     )
 }
 
+fn normalize_diagnostic(
+    sequence: u64,
+    phase: SessionTracePhase,
+    detail: Option<&str>,
+) -> SessionCompactionInspectionEntry {
+    let mut entry = invalid_entry(sequence, CompactionInspectionBlocker::InvalidEvidence);
+    if phase == SessionTracePhase::ModelProviderEvent
+        && let Some(diagnostic) = decode_diagnostic(detail)
+    {
+        entry.diagnostic = Some(diagnostic);
+        entry.blocker = None;
+    }
+    entry
+}
+
+fn diagnostic_entry(event: &SessionEvent) -> Option<SessionCompactionInspectionEntry> {
+    if let SessionEventKind::TraceEvent { trace } = &event.kind
+        && let SessionTracePayload::ProviderEvent { event_type, detail } = &trace.payload
+        && event_type == "compaction_diagnostic_v1"
+    {
+        return Some(normalize_diagnostic(
+            event.sequence,
+            trace.phase,
+            detail.as_deref(),
+        ));
+    }
+    None
+}
+
 fn normalize(event: &SessionEvent) -> Option<SessionCompactionInspectionEntry> {
+    if let Some(entry) = diagnostic_entry(event) {
+        return Some(entry);
+    }
     let sequence = event.sequence;
-    let mut entry = SessionCompactionInspectionEntry {
-        sequence,
-        phase: None,
-        progress: None,
-        rejection: None,
-        blocker: None,
-    };
+    let mut entry = invalid_entry(sequence, CompactionInspectionBlocker::InvalidEvidence);
+    entry.blocker = None;
     match &event.kind {
         SessionEventKind::ContextCompacted { .. }
         | SessionEventKind::ProviderContextCompacted { .. } => {
@@ -390,7 +427,8 @@ fn normalize(event: &SessionEvent) -> Option<SessionCompactionInspectionEntry> {
                 });
             }
             SessionTracePayload::ProviderEvent { event_type, .. }
-                if event_type.starts_with("compaction_progress_")
+                if event_type.starts_with("compaction_diagnostic_")
+                    || event_type.starts_with("compaction_progress_")
                     || event_type.starts_with("compaction_synthesis_checkpoint_") =>
             {
                 return Some(invalid_entry(

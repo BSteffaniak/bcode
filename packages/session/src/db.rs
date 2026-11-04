@@ -2715,6 +2715,9 @@ impl SessionDb {
         {
             return Err(invalid());
         }
+        let diagnostic = request
+            .diagnostic_event(marker)
+            .map_err(SessionDbError::InvalidData)?;
         let tx = self.db.begin_transaction().await?;
         configure_turso_connection(&*tx).await?;
         validate_storage_writer_contract(&*tx).await?;
@@ -2724,7 +2727,10 @@ impl SessionDb {
             .await?;
         self.validate_compaction_retirement(&*tx, request, retirement)
             .await?;
-        for event in [marker, retirement] {
+        for event in [Some(marker), Some(retirement), diagnostic.as_ref()]
+            .into_iter()
+            .flatten()
+        {
             validate_append_preconditions_without_writer(&*tx, event).await?;
             append_event_projections(&*tx, event, Some(event.timestamp_ms)).await?;
             validate_append_postconditions(&*tx, event).await?;
@@ -12861,6 +12867,7 @@ mod tests {
             .expect("kind"),
         );
         let mut request = crate::CompactionCheckpointCommit {
+            diagnostic: None,
             operation_key: "key".into(),
             expected_checkpoint_sequence: 1,
             expected_prior_marker: None,

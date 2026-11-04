@@ -417,3 +417,73 @@ fn rejection_inspection_preserves_body_free_identity_and_rejects_untrusted_reaso
             .contains("PRIVATE")
     );
 }
+
+#[test]
+fn operation_diagnostics_reject_future_and_untrusted_text_without_exposure() {
+    let id = SessionId::new();
+    let diagnostic = bcode_session_models::CompactionDiagnostic {
+        version: 1,
+        operation_id: Some("a".repeat(64)),
+        activation_id: uuid::Uuid::new_v4().to_string(),
+        request_id: Some("request-1".into()),
+        contract: Some("recollection".into()),
+        stage: "merge".into(),
+        outcome: "rejected".into(),
+        reason: Some("invalid_source".into()),
+        chunk: Some(3),
+        attempt: Some(2),
+        response: Some(bcode_session_models::CompactionResponseDiagnostic {
+            bytes: 123,
+            sha256: "b".repeat(64),
+        }),
+        marker_sequence: None,
+    };
+    let make = |value: &serde_json::Value| {
+        trace(
+            id,
+            1,
+            SessionTracePhase::ModelProviderEvent,
+            SessionTracePayload::ProviderEvent {
+                event_type: "compaction_diagnostic_v1".into(),
+                detail: Some(value.to_string()),
+            },
+        )
+    };
+    let encoded = serde_json::to_value(&diagnostic).unwrap();
+    let normalized = normalize(&make(&encoded)).unwrap();
+    assert_eq!(normalized.diagnostic, Some(diagnostic));
+    assert!(normalized.phase.is_none()); // Diagnostic observations cannot settle or reopen work.
+    for (field, value) in [
+        ("version", serde_json::json!(2)),
+        ("reason", serde_json::json!("PRIVATE response")),
+        ("operation_id", serde_json::json!("PRIVATE key")),
+        (
+            "response",
+            serde_json::json!({"bytes":1,"sha256":"PRIVATE body"}),
+        ),
+    ] {
+        let mut invalid = encoded.clone();
+        invalid[field] = value;
+        let normalized = normalize(&make(&invalid)).unwrap();
+        assert!(normalized.diagnostic.is_none());
+        assert!(normalized.blocker.is_some());
+        assert!(
+            !serde_json::to_string(&normalized)
+                .unwrap()
+                .contains("PRIVATE")
+        );
+    }
+    let future = trace(
+        id,
+        1,
+        SessionTracePhase::ModelProviderEvent,
+        SessionTracePayload::ProviderEvent {
+            event_type: "compaction_diagnostic_v2".into(),
+            detail: Some("PRIVATE future".into()),
+        },
+    );
+    assert_eq!(
+        normalize(&future).unwrap().blocker,
+        Some(CompactionInspectionBlocker::UnsupportedFormat)
+    );
+}
