@@ -77,6 +77,10 @@ pub struct Panels {
     side_sizes: BTreeMap<usize, PanelSize>,
     /// Where the layout is saved, when remembering is on.
     store: Option<PathBuf>,
+    /// Session state read with the layout, for the application to apply.
+    pub restored: Option<crate::session::Session>,
+    /// What was last written (or found) on disk, so unchanged state is not rewritten.
+    last_written: Option<String>,
 }
 
 impl Panels {
@@ -101,6 +105,8 @@ impl Panels {
             areas: RefCell::new(BTreeMap::new()),
             side_sizes: BTreeMap::new(),
             store,
+            restored: None,
+            last_written: None,
         };
         panels
             .sections
@@ -231,14 +237,43 @@ impl Panels {
         self.store = store;
     }
 
-    /// Save the layout for this directory, if remembering is on.
-    pub fn save(&mut self, windows: &[Vec<View>]) {
-        self.remember_side_sizes();
+    /// Save the layout and session for this directory, if remembering is on and anything
+    /// changed since the last save.
+    pub fn save(&mut self, windows: &[Vec<View>], session: &crate::session::Session) {
+        let Some(text) = self.serialize(windows, session) else {
+            return;
+        };
+        if self.last_written.as_deref() == Some(text.as_str()) {
+            return;
+        }
         let Some(path) = &self.store else {
             return;
         };
+        if let Some(parent) = path.parent()
+            && std::fs::create_dir_all(parent).is_ok()
+        {
+            let partial = path.with_extension("toml.partial");
+            if std::fs::write(&partial, &text).is_ok() && std::fs::rename(&partial, path).is_ok() {
+                self.last_written = Some(text);
+            }
+        }
+    }
+
+    /// Treat the current state as saved, without writing (after restoring it).
+    pub fn mark_saved(&mut self, windows: &[Vec<View>], session: &crate::session::Session) {
+        self.last_written = self.serialize(windows, session);
+    }
+
+    fn serialize(
+        &mut self,
+        windows: &[Vec<View>],
+        session: &crate::session::Session,
+    ) -> Option<String> {
+        self.remember_side_sizes();
+        self.store.as_ref()?;
         let key = |index: &usize| window_key(&windows[*index]);
         let saved = Saved {
+            session: session.clone(),
             version: 1,
             root: self
                 .root
@@ -280,18 +315,11 @@ impl Panels {
                 .get(1)
                 .map(|size| SavedSize::from(*size)),
         };
-        if let Ok(text) = toml::to_string(&saved)
-            && let Some(parent) = path.parent()
-            && std::fs::create_dir_all(parent).is_ok()
-        {
-            let partial = path.with_extension("toml.partial");
-            if std::fs::write(&partial, text).is_ok() {
-                let _ = std::fs::rename(&partial, path);
-            }
-        }
+        toml::to_string(&saved).ok()
     }
 
     fn restore(&mut self, saved: &Saved, windows: &[Vec<View>]) {
+        self.restored = Some(saved.session.clone());
         let lookup =
             |name: &String| (0..windows.len()).find(|index| window_key(&windows[*index]) == *name);
         if saved.root.len() == 2 {
@@ -410,7 +438,8 @@ fn default_side_size(tabs: &[View]) -> PanelSize {
 }
 
 /// Stable name of a side window in saved layouts: its tabs, in order.
-fn window_key(tabs: &[View]) -> String {
+#[must_use]
+pub fn window_key(tabs: &[View]) -> String {
     tabs.iter()
         .map(|view| crate::layout::view_name(*view))
         .collect::<Vec<_>>()
@@ -473,6 +502,7 @@ struct Saved {
     closed: Vec<String>,
     sections: Vec<SavedSize>,
     command_log: Option<SavedSize>,
+    session: crate::session::Session,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]

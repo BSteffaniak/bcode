@@ -145,7 +145,7 @@ pub fn build_app(options: RunOptions) -> Result<App, RunError> {
             .or_else(crate::panels::default_store_dir)
             .map(|dir| crate::panels::store_file(&dir, &launch));
         app.panels = crate::panels::Panels::new(&app.config.layout, &app.layout.windows, store);
-        app.sync_panels();
+        app.resume_session();
     }
     // Includes problems found while resolving the layout and commit settings.
     if let Some(first) = app.diagnostics.first().cloned() {

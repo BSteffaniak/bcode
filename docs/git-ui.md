@@ -80,10 +80,17 @@ Every window is a panel:
   has its own `✕`.
 * **Closed windows** come back through the layout menu (`ctrl+w r`) or by focusing them by
   number. `ctrl+w =` resets the layout.
-* **Remembered per directory**: sizes, collapsed and closed windows are saved for the directory
+* **Reopens where you left it**: everything about the session is saved for the directory
   `bcode git` was started in (`$XDG_STATE_HOME/bcode-git/layouts`, by default
-  `~/.local/state/bcode-git/layouts`) and restored next time. The configuration is the starting
-  point; `layout.remember = false` turns saving off.
+  `~/.local/state/bcode-git/layouts`): panel sizes, collapsed and closed windows, the screen mode
+  (including a maximized panel), the command log, the focused window and each window's tab, the
+  selected row of every list (followed by identity, so it survives history changes), filters,
+  tree or flat files and collapsed directories, diff context, the graph toggle, diffing mode,
+  the main view's position and line staging, drilled-in views (a remote's branches, a ref's
+  commits, a commit's or stash's files), copied commits, and undo/redo history. Changes are saved
+  as they happen and on quit; messages, open menus and running operations are not kept. The
+  configuration is the starting point for a directory without saved state; `ctrl+w =` resets the
+  layout and `layout.remember = false` turns saving off.
 
 Terminals narrower than 84 columns stack the side windows above the main view. Mouse clicks focus
 windows and select rows; clicking the selected row again opens it; the wheel scrolls. Every part of
@@ -253,7 +260,7 @@ portrait = "auto"               # stack side windows above the main view: auto |
 portrait_below_width = 84
 status_bar = true               # false hides key hints; progress and messages still show
 collapsed = []                  # side windows that start collapsed, e.g. ["stash"]
-remember = true                 # remember panel sizes and collapsed/closed windows per directory
+remember = true                 # reopen each directory as it was left (layout and session)
 
 [layout.command_log]
 show = false                    # `@` toggles it

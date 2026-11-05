@@ -77,6 +77,16 @@ impl Harness {
         self.relaunch_in(&path);
     }
 
+    /// Quit with `q`, then start again in the same directory with `config`.
+    fn quit_and_relaunch(&mut self, config: LoadedConfig) {
+        self.keys(&["q"]);
+        let mut config = config;
+        config.ui.refresh.watch = false;
+        config.ui.refresh.poll_seconds = 0;
+        self.app = launch(self.dir.path(), config, None, self.state.path());
+        self.send(RuntimeEvent::Message(bcode_git_ui::app::Msg::Watch));
+    }
+
     fn region(&self, id: &str) -> bmux_tui::geometry::Rect {
         self.app
             .hit_regions()
@@ -1401,4 +1411,103 @@ fn tabs_clipped_from_a_narrow_title_are_not_clickable() {
     assert!(!line_with(&screen, "[2] Files").contains("· S"), "{screen}");
     assert!(has(&harness, "tabs-2.files"));
     assert!(!has(&harness, "tabs-2.submodules"));
+}
+
+fn log_shown() -> LoadedConfig {
+    configured("[plugins.config.\"bcode.git\".ui.layout.command_log]\nshow = true")
+}
+
+#[test]
+fn a_closed_command_log_stays_closed_after_reopening() {
+    let mut harness = Harness::with_config(panel_repo, log_shown());
+    assert!(harness.screen(120, 30).contains("Command log"));
+    harness.click("pane-log.action.close");
+    assert!(!harness.screen(120, 30).contains("Command log"));
+    harness.quit_and_relaunch(log_shown());
+    let screen = harness.screen(120, 30);
+    assert!(!screen.contains("Command log"), "{screen}");
+    // Showing it again is remembered too.
+    harness.keys(&["@"]);
+    harness.quit_and_relaunch(log_shown());
+    assert!(harness.screen(120, 30).contains("Command log"));
+}
+
+#[test]
+fn reopening_resumes_focus_tabs_selection_and_modes() {
+    let mut harness = Harness::new(|path| {
+        commit(path, "a", "a", "first");
+        commit(path, "b", "b", "second");
+        commit(path, "c", "c", "third");
+        std::fs::create_dir_all(path.join("dir")).unwrap();
+        std::fs::write(path.join("dir/x.txt"), "x").unwrap();
+    });
+    harness.screen(120, 30);
+    // Flat files, tags tab, the second commit selected, more diff context, maximized.
+    harness.keys(&["2", "`", "3", "]", "]", "4", "j", "}", "ctrl+w", "o"]);
+    assert_eq!(harness.app.view_cursor(View::Commits), 1);
+    harness.quit_and_relaunch(LoadedConfig::default());
+    let screen = harness.screen(120, 30);
+    assert_eq!(harness.app.focused_window(), Window::Side(3));
+    assert_eq!(harness.app.view_cursor(View::Commits), 1);
+    // Maximized: only the commits window shows.
+    assert!(
+        screen.contains("[4] Commits") && !screen.contains("[2] Files"),
+        "{screen}"
+    );
+    harness.keys(&["ctrl+w", "o", "3"]);
+    assert_eq!(harness.app.current_view(), View::Tags);
+    let screen = harness.screen(120, 30);
+    assert!(screen.contains("dir/x.txt"), "files stay flat: {screen}");
+    // The selection follows its commit, not its index, when history changes meanwhile.
+    git(
+        harness.path(),
+        &["commit", "--quiet", "--allow-empty", "-m", "fourth"],
+    );
+    harness.quit_and_relaunch(LoadedConfig::default());
+    harness.screen(120, 30);
+    harness.keys(&["4"]);
+    let screen = harness.screen(120, 30);
+    assert_eq!(harness.app.view_cursor(View::Commits), 2, "{screen}");
+}
+
+#[test]
+fn reopening_resumes_drilled_in_views_and_line_staging() {
+    let mut harness = Harness::new(|path| {
+        commit(path, "a.txt", "a\n", "first");
+        commit(path, "b.txt", "b\n", "second");
+        std::fs::write(path.join("a.txt"), "one\ntwo\n").unwrap();
+    });
+    harness.screen(120, 30);
+    // The files of the latest commit, in the commits window.
+    harness.keys(&["4", "enter"]);
+    let screen = harness.screen(120, 30);
+    assert!(screen.contains("b.txt"), "{screen}");
+    harness.quit_and_relaunch(LoadedConfig::default());
+    let screen = harness.screen(120, 30);
+    assert!(line_with(&screen, "[4]").contains("Files ·"), "{screen}");
+    assert!(screen.contains("b.txt"), "{screen}");
+
+    // Line staging of a changed file.
+    harness.keys(&["escape", "2", "enter", "j"]);
+    let screen = harness.screen(120, 30);
+    assert!(screen.contains("[LINE]"), "{screen}");
+    harness.quit_and_relaunch(LoadedConfig::default());
+    let screen = harness.screen(120, 30);
+    assert!(screen.contains("[LINE]"), "{screen}");
+    assert_eq!(harness.app.focused_window(), Window::Main);
+}
+
+#[test]
+fn changes_are_saved_without_quitting() {
+    let mut harness = Harness::with_config(panel_repo, log_shown());
+    harness.screen(120, 30);
+    harness.click("pane-log.action.close");
+    harness.send(RuntimeEvent::Message(bcode_git_ui::app::Msg::Tick));
+    // Started again without quitting first (for example after a crash).
+    let mut config = log_shown();
+    config.ui.refresh.watch = false;
+    config.ui.refresh.poll_seconds = 0;
+    harness.app = launch(harness.path(), config, None, harness.state.path());
+    harness.send(RuntimeEvent::Message(bcode_git_ui::app::Msg::Watch));
+    assert!(!harness.screen(120, 30).contains("Command log"));
 }

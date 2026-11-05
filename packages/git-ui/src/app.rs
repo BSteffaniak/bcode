@@ -31,8 +31,12 @@ use crate::host::GitUiHost;
 use crate::keymap::{Action, Keymap, Resolution, Scope};
 use crate::layout::{Layout, Start};
 use crate::ops::{self, HeadPosition, Op};
-use crate::panels::{PanelView, Panels};
+use crate::panels::{PanelView, Panels, window_key};
 use crate::popup::{External, Popup, Prompt, PromptKind, Then};
+use crate::session::{
+    SavedCommitFiles, SavedJournal, SavedMain, SavedStaging, SavedSubCommits, SavedTarget, Session,
+    view_from_id, view_id,
+};
 use crate::theme::GitTheme;
 use bmux_text_edit::pointer::{ClickPolicy, ClickTracker};
 
@@ -304,6 +308,10 @@ pub struct App {
 
     pub(crate) layout: Layout,
     pub(crate) panels: Panels,
+    /// Main view position waiting for its content after a restore.
+    pub(crate) pending_main: Option<SavedMain>,
+    /// Drilled-in views waiting for repository data after a restore.
+    pub(crate) pending_drill: Option<(Option<SavedSubCommits>, Option<SavedCommitFiles>)>,
     pub(crate) clicks: ClickTracker,
     pub(crate) commit_sources: Vec<CommitMessageSource>,
     pub(crate) env_message: Option<String>,
@@ -358,6 +366,8 @@ const PENDING_TIMEOUT: Duration = Duration::from_millis(1500);
 
 impl App {
     /// Create application state.
+    // One initializer per state field; splitting it would only scatter the defaults.
+    #[allow(clippy::too_many_lines)]
     #[must_use]
     pub fn new(
         repo: Repository,
@@ -402,6 +412,8 @@ impl App {
             file_tree,
             layout,
             panels,
+            pending_main: None,
+            pending_drill: None,
             clicks: ClickTracker::new(),
             commit_sources,
             env_message: None,
@@ -918,9 +930,19 @@ impl App {
         revision: String,
         title: String,
     ) -> Option<Command<Msg>> {
+        self.load_commit_files_in(self.window, target, revision, title)
+    }
+
+    /// List the files of a commit or stash in `window`.
+    pub(crate) fn load_commit_files_in(
+        &mut self,
+        window: Window,
+        target: DiffTarget,
+        revision: String,
+        title: String,
+    ) -> Option<Command<Msg>> {
         self.commit_files_generation += 1;
         let generation = self.commit_files_generation;
-        let window = self.window;
         self.commit_files = Some(CommitFiles {
             target: target.clone(),
             title,
@@ -943,13 +965,23 @@ impl App {
         revision: String,
         title: String,
     ) -> Option<Command<Msg>> {
-        self.sub_commits_generation += 1;
-        let generation = self.sub_commits_generation;
         let window = if self.window == Window::Main {
             self.last_side
         } else {
             self.window
         };
+        self.load_sub_commits_in(window, revision, title)
+    }
+
+    /// List the commits of a ref in `window`.
+    pub(crate) fn load_sub_commits_in(
+        &mut self,
+        window: Window,
+        revision: String,
+        title: String,
+    ) -> Option<Command<Msg>> {
+        self.sub_commits_generation += 1;
+        let generation = self.sub_commits_generation;
         self.sub_commits = Some(SubCommits {
             window,
             title,
@@ -1444,7 +1476,235 @@ impl App {
 
     /// Save the panel layout for the launch directory.
     pub(crate) fn save_layout(&mut self) {
-        self.panels.save(&self.layout.windows);
+        self.persist();
+    }
+
+    /// Save the session (layout included) if it changed. Skipped while a divider is being
+    /// dragged; the drag's end is saved.
+    pub(crate) fn persist(&mut self) {
+        let dragging = crate::panels::GROUPS
+            .into_iter()
+            .any(|id| self.panel_group(id).1.borrow().active_divider().is_some());
+        if dragging {
+            return;
+        }
+        let session = self.capture_session();
+        self.panels.save(&self.layout.windows, &session);
+    }
+
+    /// Apply the session saved for this directory, then treat it as saved.
+    pub(crate) fn resume_session(&mut self) {
+        if let Some(session) = self.panels.restored.take() {
+            self.restore_session(session);
+        }
+        self.sync_panels();
+        let session = self.capture_session();
+        self.panels.mark_saved(&self.layout.windows, &session);
+    }
+
+    fn window_named(&self, name: &str) -> Option<Window> {
+        self.layout
+            .windows
+            .iter()
+            .position(|tabs| window_key(tabs) == name)
+            .map(Window::Side)
+    }
+
+    /// The state to reopen with.
+    #[must_use]
+    pub fn capture_session(&self) -> Session {
+        let name = |window: Window| match window {
+            Window::Side(index) => self.layout.windows.get(index).map(|tabs| window_key(tabs)),
+            Window::Main => None,
+        };
+        let journal = |entries: &[Journal]| {
+            entries
+                .iter()
+                .map(|entry| SavedJournal {
+                    label: entry.label.clone(),
+                    before: (entry.before.branch.clone(), entry.before.oid.clone()),
+                    after: (entry.after.branch.clone(), entry.after.oid.clone()),
+                })
+                .collect()
+        };
+        // Restored views not yet reloaded are kept as they were saved.
+        let (pending_sub, pending_files) = self.pending_drill.clone().unwrap_or_default();
+        Session {
+            screen_mode: Some(self.screen_mode),
+            side: name(self.last_side),
+            main_focused: self.window == Window::Main,
+            tabs: self
+                .tabs
+                .iter()
+                .filter_map(|(window, index)| {
+                    let view = self.tabs(*window).get(*index)?;
+                    Some((name(*window)?, view_id(*view).to_owned()))
+                })
+                .collect(),
+            selected: self
+                .keys
+                .iter()
+                .map(|(view, key)| (view_id(*view).to_owned(), key.clone()))
+                .collect(),
+            cursors: self
+                .cursors
+                .iter()
+                .map(|(view, index)| (view_id(*view).to_owned(), *index))
+                .collect(),
+            filters: self
+                .filters
+                .iter()
+                .filter(|(_, text)| !text.is_empty())
+                .map(|(view, text)| (view_id(*view).to_owned(), text.clone()))
+                .collect(),
+            file_tree: Some(self.file_tree),
+            collapsed_dirs: self.collapsed.iter().cloned().collect(),
+            command_log: Some(self.command_log),
+            diff_context: Some(self.cx.context),
+            show_graph: Some(self.cx.show_graph),
+            diff_base: self.diff_base.clone(),
+            remote: self.remote.clone(),
+            sub_commits: pending_sub.or_else(|| {
+                let sub = self.sub_commits.as_ref()?;
+                Some(SavedSubCommits {
+                    window: name(sub.window)?,
+                    revision: sub.revision.clone(),
+                    title: sub.title.clone(),
+                })
+            }),
+            commit_files: pending_files.or_else(|| {
+                let files = self.commit_files.as_ref()?;
+                let target = match &files.target {
+                    DiffTarget::Commit(oid) => SavedTarget::Commit(oid.clone()),
+                    DiffTarget::Stash(stash) => SavedTarget::Stash(stash.clone()),
+                    DiffTarget::Range { from, to } => SavedTarget::Range {
+                        from: from.clone(),
+                        to: to.clone(),
+                    },
+                    _ => return None,
+                };
+                Some(SavedCommitFiles {
+                    window: name(files.window)?,
+                    target,
+                    revision: files.revision.clone(),
+                    title: files.title.clone(),
+                })
+            }),
+            main: Some(self.pending_main.unwrap_or_else(|| SavedMain {
+                section: self.main_section,
+                cursor: self.main_cursor,
+                staging: self.staging.map(|staging| SavedStaging {
+                    anchor: staging.anchor,
+                    hunk_mode: staging.hunk_mode,
+                }),
+            })),
+            cherry: self.cherry.clone(),
+            undo: journal(&self.undo),
+            redo: journal(&self.redo),
+        }
+    }
+
+    /// Reopen as the session was left. Lists, the main view and drilled-in views settle as
+    /// their data arrives; anything that no longer exists is skipped.
+    pub fn restore_session(&mut self, session: Session) {
+        let view = |id: &String| view_from_id(id);
+        for (name, id) in &session.tabs {
+            if let (Some(window), Some(view)) = (self.window_named(name), view(id))
+                && let Some(position) = self.tabs(window).iter().position(|tab| *tab == view)
+            {
+                self.tabs.insert(window, position);
+            }
+        }
+        if let Some(window) = session
+            .side
+            .as_deref()
+            .and_then(|name| self.window_named(name))
+        {
+            self.focus(window);
+        }
+        if session.main_focused {
+            self.window = Window::Main;
+        }
+        if let Some(mode) = session.screen_mode {
+            self.screen_mode = mode;
+        }
+        self.keys = session
+            .selected
+            .iter()
+            .filter_map(|(id, key)| Some((view(id)?, key.clone())))
+            .collect();
+        self.cursors = session
+            .cursors
+            .iter()
+            .filter_map(|(id, index)| Some((view(id)?, *index)))
+            .collect();
+        self.filters = session
+            .filters
+            .iter()
+            .filter_map(|(id, text)| Some((view(id)?, text.clone())))
+            .collect();
+        if let Some(tree) = session.file_tree {
+            self.file_tree = tree;
+        }
+        self.collapsed = session.collapsed_dirs.into_iter().collect();
+        if let Some(shown) = session.command_log {
+            self.command_log = shown;
+        }
+        if let Some(context) = session.diff_context {
+            self.cx.context = context;
+        }
+        if let Some(graph) = session.show_graph {
+            self.cx.show_graph = graph;
+        }
+        self.diff_base = session.diff_base;
+        self.remote = session.remote;
+        if session.sub_commits.is_some() || session.commit_files.is_some() {
+            self.pending_drill = Some((session.sub_commits, session.commit_files));
+        }
+        self.pending_main = session.main;
+        self.cherry = session.cherry;
+        let journal = |entries: Vec<SavedJournal>| {
+            entries
+                .into_iter()
+                .map(|entry| Journal {
+                    label: entry.label,
+                    before: HeadPosition {
+                        branch: entry.before.0,
+                        oid: entry.before.1,
+                    },
+                    after: HeadPosition {
+                        branch: entry.after.0,
+                        oid: entry.after.1,
+                    },
+                })
+                .collect()
+        };
+        self.undo = journal(session.undo);
+        self.redo = journal(session.redo);
+    }
+
+    /// Reload drilled-in views of a restored session once repository data is in.
+    fn resume_drilled(&mut self) -> Vec<Command<Msg>> {
+        let Some((sub, files)) = self.pending_drill.take() else {
+            return Vec::new();
+        };
+        let mut commands = Vec::new();
+        if let Some(sub) = sub
+            && let Some(window) = self.window_named(&sub.window)
+        {
+            commands.extend(self.load_sub_commits_in(window, sub.revision, sub.title));
+        }
+        if let Some(files) = files
+            && let Some(window) = self.window_named(&files.window)
+        {
+            let target = match files.target {
+                SavedTarget::Commit(oid) => DiffTarget::Commit(oid),
+                SavedTarget::Stash(stash) => DiffTarget::Stash(stash),
+                SavedTarget::Range { from, to } => DiffTarget::Range { from, to },
+            };
+            commands.extend(self.load_commit_files_in(window, target, files.revision, files.title));
+        }
+        commands
     }
 
     /// The group and state behind a panel group id.
@@ -1775,6 +2035,7 @@ impl App {
     }
 
     fn tick(&mut self) -> Update<Msg> {
+        self.persist();
         let mut redraw = self.running.is_some();
         if redraw {
             self.spinner = self.spinner.wrapping_add(1);
@@ -1877,6 +2138,34 @@ impl App {
                 }
             } else {
                 self.snap_to_change(1);
+            }
+        }
+        // A restored session's position applies to the first content shown for its data.
+        if self.loaded_once
+            && let Some(saved) = self.pending_main.take()
+        {
+            if sections > 0 {
+                self.main_section = saved.section.min(sections - 1);
+                for section in 0..sections.min(2) {
+                    let len = self.main_rows(section);
+                    self.main_cursor[section] = saved.cursor[section].min(len.saturating_sub(1));
+                }
+            }
+            match saved.staging {
+                Some(staging) if self.main_section_kind() != SectionKind::Plain => {
+                    self.staging = Some(Staging {
+                        anchor: staging.anchor,
+                        hunk_mode: staging.hunk_mode,
+                    });
+                }
+                _ => {
+                    if self.window == Window::Main
+                        && self.main_section_kind() == SectionKind::Plain
+                        && saved.staging.is_some()
+                    {
+                        self.window = self.last_side;
+                    }
+                }
             }
         }
     }
@@ -2024,6 +2313,9 @@ impl App {
                     self.install_snapshot(*snapshot);
                 }
                 let mut update = Update::redraw();
+                for command in self.resume_drilled() {
+                    update = update.with_command(command);
+                }
                 if let Some(command) = self.sync_main(true) {
                     update = update.maybe(command);
                 }
@@ -2109,6 +2401,9 @@ impl Program for App {
         let watching_sources = self.commit_editor().is_some();
         let update = self.handle(event);
         self.sync_panels();
+        if self.quit {
+            self.persist();
+        }
         // Watch prefill sources exactly while a commit editor is open.
         let update = match (watching_sources, self.commit_editor().is_some()) {
             (false, true) => update.with_subscription(crate::commit_message::subscription(

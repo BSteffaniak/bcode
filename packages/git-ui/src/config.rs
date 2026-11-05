@@ -170,8 +170,9 @@ pub struct LayoutConfig {
     pub status_bar: bool,
     /// Side windows that start collapsed to their title, by any of their view names.
     pub collapsed: Vec<String>,
-    /// Remember panel sizes, collapsed and closed windows per launch directory (in
-    /// `$XDG_STATE_HOME/bcode-git/layouts`). The configuration is the starting point.
+    /// Reopen each launch directory as it was left: layout, focus, tabs, selections, modes
+    /// and history (in `$XDG_STATE_HOME/bcode-git/layouts`). The configuration is the
+    /// starting point.
     pub remember: bool,
 }
 
