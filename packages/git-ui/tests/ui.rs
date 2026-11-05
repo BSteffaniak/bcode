@@ -620,3 +620,94 @@ fn staged_and_unstaged_sections_sit_side_by_side_when_configured() {
         "{screen}"
     );
 }
+
+#[test]
+fn commit_editor_floats_over_a_visible_screen() {
+    let mut harness = Harness::new(|path| {
+        commit(path, "a.txt", "a\n", "earlier work");
+        std::fs::write(path.join("a.txt"), "b\n").unwrap();
+    });
+    harness.keys(&["c"]);
+    let screen = harness.screen(140, 40);
+    assert!(screen.contains("Summary"), "{screen}");
+    assert!(screen.contains("Description"), "{screen}");
+    // Panels around the popup are still drawn.
+    assert!(screen.contains("[2] Files"), "{screen}");
+    assert!(screen.contains("earlier work"), "{screen}");
+}
+
+#[test]
+fn summary_and_description_form_one_commit_message() {
+    let mut harness = Harness::new(|path| {
+        commit(path, "a.txt", "a\n", "init");
+        std::fs::write(path.join("a.txt"), "b\n").unwrap();
+    });
+    harness.keys(&["c"]);
+    harness.paste("Add the thing");
+    harness.keys(&["tab"]);
+    harness.paste("First detail");
+    // Enter adds a line in the description instead of committing.
+    harness.keys(&["enter"]);
+    harness.paste("Second detail");
+    assert_eq!(harness.log(), ["init"]);
+    harness.keys(&["alt+enter"]);
+    assert_eq!(
+        git(harness.path(), &["log", "-1", "--format=%B"]),
+        "Add the thing\n\nFirst detail\nSecond detail\n\n"
+    );
+}
+
+#[test]
+fn pasted_message_splits_into_summary_and_description() {
+    let mut harness = Harness::new(|path| {
+        commit(path, "a.txt", "a\n", "init");
+        std::fs::write(path.join("a.txt"), "b\n").unwrap();
+    });
+    harness.keys(&["c"]);
+    harness.paste("Subject line\n\nBody text");
+    harness.keys(&["tab", "enter"]);
+    assert_eq!(
+        git(harness.path(), &["log", "-1", "--format=%B"]),
+        "Subject line\n\nBody text\n\n"
+    );
+}
+
+#[test]
+fn description_alone_is_not_a_commit_message() {
+    let mut harness = Harness::new(|path| {
+        commit(path, "a.txt", "a\n", "init");
+        std::fs::write(path.join("a.txt"), "b\n").unwrap();
+    });
+    harness.keys(&["c", "tab"]);
+    harness.paste("Only details");
+    harness.keys(&["alt+enter"]);
+    assert_eq!(harness.log(), ["init"]);
+    let screen = harness.screen(140, 40);
+    assert!(screen.contains("A summary is required"), "{screen}");
+}
+
+#[test]
+fn reword_keeps_an_existing_description() {
+    let mut harness = Harness::new(|path| {
+        std::fs::write(path.join("a.txt"), "a\n").unwrap();
+        git(path, &["add", "--all"]);
+        git(
+            path,
+            &["commit", "--quiet", "-m", "Title", "-m", "Body line"],
+        );
+    });
+    harness.keys(&["4", "r"]);
+    let screen = harness.screen(140, 40);
+    assert!(line_with(&screen, "Title").contains('│'), "{screen}");
+    assert!(
+        !line_with(&screen, "Body line").contains("Title"),
+        "{screen}"
+    );
+    harness.keys(&["end"]);
+    harness.paste(" v2");
+    harness.keys(&["enter"]);
+    assert_eq!(
+        git(harness.path(), &["log", "-1", "--format=%B"]),
+        "Title v2\n\nBody line\n\n"
+    );
+}

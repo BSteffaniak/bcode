@@ -12,7 +12,9 @@ use bmux_tui::event::{Event, MouseButton, MouseEventKind};
 use bmux_tui::geometry::Point;
 use bmux_tui::hit::HitMap;
 use bmux_tui_components::selectable_list::SelectableListState;
-use bmux_tui_components::text_input::{TextInputControl, TextInputOutcome, TextInputPolicy};
+use bmux_tui_components::text_input::{
+    EnterBehavior, TextInputControl, TextInputOutcome, TextInputPolicy,
+};
 use bmux_tui_runtime::{Command, CommandKey, Program, RuntimeEvent, Update};
 
 use crate::config::GitUiConfig;
@@ -1187,8 +1189,21 @@ impl App {
                     Update::none()
                 }
             },
-            Some(Popup::Prompt(prompt)) => match action {
-                Some(Action::InputSubmit) => crate::actions::submit_prompt(self, prompt),
+            Some(Popup::Prompt(mut prompt)) => match action {
+                // Enter adds a line in the description; it submits from the summary.
+                Some(Action::InputSubmit) if prompt.body_focused => {
+                    prompt_input(&prompt, event);
+                    self.popups.push(Popup::Prompt(prompt));
+                    Update::redraw()
+                }
+                Some(Action::InputSubmit | Action::InputSubmitFromAnyField) => {
+                    crate::actions::submit_prompt(self, prompt)
+                }
+                Some(Action::InputSwitchField) if prompt.body.is_some() => {
+                    prompt.body_focused = !prompt.body_focused;
+                    self.popups.push(Popup::Prompt(prompt));
+                    Update::redraw()
+                }
                 Some(Action::InputCancel) => {
                     if matches!(prompt.kind, PromptKind::Filter) {
                         let view = self.current_view();
@@ -1197,7 +1212,6 @@ impl App {
                     Update::redraw()
                 }
                 Some(Action::InputToggleAmend) => {
-                    let mut prompt = prompt;
                     if let PromptKind::Commit {
                         amend,
                         no_verify,
@@ -1216,17 +1230,14 @@ impl App {
                                 .first()
                                 .and_then(|commit| self.repo.commit_message(&commit.oid).ok())
                                 .unwrap_or_default();
-                            prompt.input.borrow_mut().buffer_mut().insert_str(&message);
+                            prompt.set_text(&message);
                         }
                     }
                     self.popups.push(Popup::Prompt(prompt));
                     Update::redraw()
                 }
                 _ => {
-                    let policy = TextInputPolicy::chat_composer();
-                    let outcome = TextInputControl::new(&policy)
-                        .handle_event(&mut prompt.input.borrow_mut(), event);
-                    let edited = outcome == TextInputOutcome::Edited;
+                    let edited = prompt_input(&prompt, event) == TextInputOutcome::Edited;
                     self.popups.push(Popup::Prompt(prompt));
                     if edited {
                         return self.apply_live_filter();
@@ -1743,8 +1754,7 @@ impl Program for App {
                     let policy = TextInputPolicy::chat_composer();
                     match self.popups.last_mut() {
                         Some(Popup::Prompt(prompt)) => {
-                            TextInputControl::new(&policy)
-                                .handle_event(&mut prompt.input.borrow_mut(), &event);
+                            paste_into_prompt(prompt, &event);
                             return Ok(self.apply_live_filter());
                         }
                         Some(Popup::Menu(menu)) => {
@@ -1770,4 +1780,39 @@ impl Program for App {
         };
         Ok(if self.quit { Update::exit() } else { update })
     }
+}
+
+/// Editing behavior of a prompt field: the summary of a commit message is one line, its
+/// description and multi-line prompts take newlines.
+const fn field_policy(prompt: &Prompt) -> TextInputPolicy {
+    let mut policy = TextInputPolicy::chat_composer();
+    if prompt.body.is_some() && !prompt.body_focused {
+        policy.keyboard.shift_enter = None;
+    } else if prompt.body_focused {
+        policy.keyboard.enter = EnterBehavior::InsertNewline;
+    }
+    policy
+}
+
+/// Deliver an event to the focused field of a prompt.
+fn prompt_input(prompt: &Prompt, event: &Event) -> TextInputOutcome {
+    let policy = field_policy(prompt);
+    TextInputControl::new(&policy).handle_event(&mut prompt.focused_input().borrow_mut(), event)
+}
+
+/// Paste into a prompt. Multi-line text pasted into a summary keeps its first line there and
+/// moves the rest into the description, as a commit message would be split.
+fn paste_into_prompt(prompt: &mut Prompt, event: &Event) {
+    if let (Event::Paste(text), Some(_), false) = (event, &prompt.body, prompt.body_focused)
+        && text.contains('\n')
+    {
+        let (summary, rest) = crate::popup::split_message(text);
+        let policy = field_policy(prompt);
+        TextInputControl::new(&policy).handle_paste(&mut prompt.input.borrow_mut(), summary);
+        prompt.body_focused = true;
+        let policy = field_policy(prompt);
+        TextInputControl::new(&policy).handle_paste(&mut prompt.focused_input().borrow_mut(), rest);
+        return;
+    }
+    prompt_input(prompt, event);
 }

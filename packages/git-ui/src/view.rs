@@ -4,7 +4,7 @@ use std::cell::Cell;
 
 use bcode_git::models::{ChangeKind, DiffFileStatus, StatusEntry, SubmoduleState};
 use bmux_tui::component::Element;
-use bmux_tui::composition::{Column, Flex, Overlay, Row as BoxRow, SizeBox, Surface, TextBlock};
+use bmux_tui::composition::{Column, Flex, Row as BoxRow, SizeBox, Stack, Surface, TextBlock};
 use bmux_tui::geometry::{Insets, Rect, Size};
 use bmux_tui::style::{Modifier, Style};
 use bmux_tui::text::{Line, Span, Text, TextWrap};
@@ -43,6 +43,8 @@ pub struct Frame {
 }
 
 const MIN_WIDTH: u16 = 30;
+/// Visible rows of a commit description.
+const DESCRIPTION_ROWS: u16 = 6;
 const MIN_HEIGHT: u16 = 10;
 
 impl Frame {
@@ -1045,12 +1047,12 @@ pub fn tree<'a>(app: &'a App, frame: &'a Frame) -> Element<'a> {
     let screen = Surface::new(screen)
         .background(theme.canvas)
         .content_style(theme.text);
-    match popup(app, frame) {
-        Some(foreground) => Element::new(Overlay::new(screen, foreground)),
-        None => match which_key(app) {
-            Some(foreground) => Element::new(Overlay::new(screen, foreground)),
-            None => Element::new(screen),
-        },
+    // Popups float over the screen, which stays visible around them, as in lazygit. The modal
+    // frame paints only its own panel, so it is stacked rather than placed in an `Overlay`,
+    // which would blank everything behind the frame's full-screen placement area.
+    match popup(app, frame).or_else(|| which_key(app)) {
+        Some(foreground) => Element::new(Stack::new().child(screen).child(foreground)),
+        None => Element::new(screen),
     }
 }
 
@@ -1160,32 +1162,93 @@ fn popup<'a>(app: &'a App, frame: &'a Frame) -> Option<Element<'a>> {
         )),
         Popup::Prompt(prompt) => {
             let rows = if prompt.multiline { 8 } else { 1 };
-            let mut column = Column::new().child(
-                TextInputBoxComponent::new(
-                    "popup-input",
-                    TextInputPolicy::chat_composer(),
-                    &prompt.input,
+            let field = |id: &'static str,
+                         state: &'a std::cell::RefCell<_>,
+                         rows: u16,
+                         focused: bool,
+                         placeholder: &'static str| {
+                TextInputBoxComponent::new(id, TextInputPolicy::chat_composer(), state)
+                    .placeholder(placeholder)
+                    .policy(
+                        TextInputBoxPolicy::field()
+                            .focused(focused)
+                            .rows(rows, Some(rows)),
+                    )
+                    .styles(input_styles(app))
+            };
+            let label = |text: &'static str, focused: bool| {
+                TextBlock::new(Text::from_lines(vec![Line::from_spans(vec![
+                    Span::styled(
+                        text,
+                        if focused {
+                            theme.title_focused
+                        } else {
+                            theme.muted
+                        },
+                    ),
+                ])]))
+                .wrap(TextWrap::None)
+            };
+            let mut column = Column::new();
+            let field_rows = if let Some(body) = &prompt.body {
+                column = column
+                    .child(label("Summary", !prompt.body_focused))
+                    .child(field(
+                        "popup-input",
+                        &prompt.input,
+                        1,
+                        !prompt.body_focused,
+                        "First line of the message",
+                    ))
+                    .child(label("Description", prompt.body_focused))
+                    .child(field(
+                        "popup-body",
+                        body.as_ref(),
+                        DESCRIPTION_ROWS,
+                        prompt.body_focused,
+                        "Optional details",
+                    ));
+                // Labels plus a bordered one-line summary and the bordered description.
+                1 + 3 + 1 + DESCRIPTION_ROWS + 2
+            } else {
+                column = column.child(field("popup-input", &prompt.input, rows, true, ""));
+                rows + 2
+            };
+            let submit_label = if prompt.body.is_some() && prompt.body_focused {
+                format!(
+                    "{} newline  {} submit  ",
+                    key(app, Action::InputSubmit),
+                    key(app, Action::InputSubmitFromAnyField)
                 )
-                .policy(
-                    TextInputBoxPolicy::field()
-                        .focused(true)
-                        .rows(rows, Some(rows)),
-                )
-                .styles(input_styles(app)),
-            );
+            } else {
+                format!("{} submit  ", key(app, Action::InputSubmit))
+            };
             let mut hint = vec![
-                Span::styled(key(app, Action::InputSubmit), theme.key),
-                Span::styled(" submit  ", theme.muted),
-                Span::styled(key(app, Action::InputCancel), theme.key),
-                Span::styled(" cancel", theme.muted),
+                Span::styled(submit_label, theme.key),
+                Span::styled(
+                    format!("{} cancel", key(app, Action::InputCancel)),
+                    theme.muted,
+                ),
             ];
+            if prompt.body.is_some() {
+                hint.push(Span::styled(
+                    format!(
+                        "  {} {}",
+                        key(app, Action::InputSwitchField),
+                        if prompt.body_focused {
+                            "summary"
+                        } else {
+                            "description"
+                        }
+                    ),
+                    theme.muted,
+                ));
+            }
             if prompt.multiline {
                 hint.push(Span::styled("  shift+⏎ newline", theme.muted));
             }
             if let crate::popup::PromptKind::Commit { amend, .. } = &prompt.kind {
-                let text = prompt.text();
-                let summary = text.lines().next().unwrap_or_default();
-                let length = summary.chars().count();
+                let length = prompt.summary().chars().count();
                 hint.push(Span::styled("  ", theme.muted));
                 hint.push(Span::styled(
                     format!("{length}/50"),
@@ -1222,8 +1285,8 @@ fn popup<'a>(app: &'a App, frame: &'a Frame) -> Option<Element<'a>> {
                     .wrap(TextWrap::None),
                 );
             }
-            // Input rows plus its border, the hint row, an optional error row, and the frame.
-            let height = rows + 3 + u16::from(error.is_some()) + 4;
+            // Fields, the hint row, an optional error row, and the frame.
+            let height = field_rows + 1 + u16::from(error.is_some()) + 4;
             Some(modal(app, &prompt.title, 90, height, column))
         }
     }

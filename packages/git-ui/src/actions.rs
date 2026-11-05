@@ -992,6 +992,8 @@ impl App {
             | Action::InputSubmit
             | Action::InputCancel
             | Action::InputToggleAmend
+            | Action::InputSwitchField
+            | Action::InputSubmitFromAnyField
             | Action::ConfirmYes
             | Action::ConfirmNo => Update::none(),
         };
@@ -2102,6 +2104,12 @@ pub fn submit_prompt(app: &mut App, prompt: Prompt) -> Update<Msg> {
         app.popups.push(Popup::Prompt(prompt));
         Update::redraw()
     };
+    let summary_required = |app: &mut App, mut prompt: Prompt| {
+        app.toast("A summary is required", true);
+        prompt.body_focused = false;
+        app.popups.push(Popup::Prompt(prompt));
+        Update::redraw()
+    };
     match prompt.kind.clone() {
         PromptKind::Filter => Update::redraw(),
         PromptKind::Commit {
@@ -2109,8 +2117,8 @@ pub fn submit_prompt(app: &mut App, prompt: Prompt) -> Update<Msg> {
             no_verify,
             stage_all,
         } => {
-            if value.is_empty() {
-                return required(app, prompt);
+            if prompt.summary().trim().is_empty() {
+                return summary_required(app, prompt);
             }
             let entries = &app.snapshot.status.entries;
             if !amend && entries.is_empty() {
@@ -2137,8 +2145,8 @@ pub fn submit_prompt(app: &mut App, prompt: Prompt) -> Update<Msg> {
             })
         }
         PromptKind::Reword(oid) => {
-            if value.is_empty() {
-                return required(app, prompt);
+            if prompt.summary().trim().is_empty() {
+                return summary_required(app, prompt);
             }
             app.run_ops(vec![Op::Reword { oid, message: text }])
         }

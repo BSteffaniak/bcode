@@ -238,39 +238,109 @@ pub enum PromptKind {
 }
 
 /// A text prompt.
+///
+/// Commit messages use two fields, like lazygit: a one-line summary and an optional
+/// free-form description. They are one git message: the summary is its first line and the
+/// description follows after a blank line.
 #[derive(Debug)]
 pub struct Prompt {
     /// Title.
     pub title: String,
-    /// Input state.
+    /// Input state; the summary when the prompt has a description field.
     pub input: RefCell<TextInputState>,
+    /// Description field of a commit message (boxed: most prompts have none).
+    pub body: Option<Box<RefCell<TextInputState>>>,
+    /// Whether the description field has focus.
+    pub body_focused: bool,
     /// Purpose.
     pub kind: PromptKind,
-    /// Allow several lines.
+    /// Allow several lines in the single field.
     pub multiline: bool,
 }
 
 impl Prompt {
-    /// Create a prompt with initial text.
+    /// Create a prompt with initial text. Commit messages are split into summary and
+    /// description.
     #[must_use]
     pub fn new(title: impl Into<String>, initial: &str, kind: PromptKind) -> Self {
-        let multiline = matches!(
-            kind,
-            PromptKind::Commit { .. } | PromptKind::Reword(_) | PromptKind::TagMessage { .. }
-        );
-        Self {
+        let message = matches!(kind, PromptKind::Commit { .. } | PromptKind::Reword(_));
+        let mut prompt = Self {
             title: title.into(),
-            input: RefCell::new(TextInputState::new(TextEditBuffer::from_text(initial))),
+            input: RefCell::new(TextInputState::new(TextEditBuffer::from_text(""))),
+            body: message.then(|| {
+                Box::new(RefCell::new(TextInputState::new(
+                    TextEditBuffer::from_text(""),
+                )))
+            }),
+            body_focused: false,
+            multiline: matches!(kind, PromptKind::TagMessage { .. }),
             kind,
-            multiline,
+        };
+        prompt.set_text(initial);
+        prompt
+    }
+
+    /// Replace the content, splitting a message into summary and description when the
+    /// prompt has both fields.
+    pub fn set_text(&mut self, text: &str) {
+        let (summary, body) = if self.body.is_some() {
+            split_message(text)
+        } else {
+            (text, "")
+        };
+        *self.input.borrow_mut() = TextInputState::new(TextEditBuffer::from_text(summary));
+        if let Some(field) = &self.body {
+            *field.borrow_mut() = TextInputState::new(TextEditBuffer::from_text(body));
         }
     }
 
-    /// Entered text.
+    /// Entered text: for commit messages the summary, a blank line, then the description.
     #[must_use]
     pub fn text(&self) -> String {
+        let summary = self.summary();
+        let body = self.description();
+        let body = body.trim_end();
+        if body.trim().is_empty() {
+            summary
+        } else {
+            format!("{}\n\n{body}", summary.trim_end())
+        }
+    }
+
+    /// The summary field (or the only field).
+    #[must_use]
+    pub fn summary(&self) -> String {
         self.input.borrow().buffer().text().to_owned()
     }
+
+    /// The description field; empty when the prompt has none.
+    #[must_use]
+    pub fn description(&self) -> String {
+        self.body
+            .as_ref()
+            .map(|body| body.borrow().buffer().text().to_owned())
+            .unwrap_or_default()
+    }
+
+    /// The field that receives typing.
+    #[must_use]
+    pub fn focused_input(&self) -> &RefCell<TextInputState> {
+        match &self.body {
+            Some(body) if self.body_focused => body.as_ref(),
+            _ => &self.input,
+        }
+    }
+}
+
+/// Split a commit message into its first line and the rest, without the separating blank
+/// lines.
+#[must_use]
+pub fn split_message(text: &str) -> (&str, &str) {
+    let (summary, rest) = text.split_once('\n').unwrap_or((text, ""));
+    (
+        summary.trim_end_matches('\r'),
+        rest.trim_start_matches(['\n', '\r']),
+    )
 }
 
 /// Scrollable read-only text.

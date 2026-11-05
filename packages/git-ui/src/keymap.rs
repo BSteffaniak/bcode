@@ -327,6 +327,8 @@ actions! {
     InputSubmit => Input, "submit", "Submit", ["enter"];
     InputCancel => Input, "cancel", "Cancel", ["escape"];
     InputToggleAmend => Input, "toggle-amend", "Toggle amend (commit editor)", ["ctrl+a"];
+    InputSwitchField => Input, "switch-field", "Switch summary / description (commit editor)", ["tab", "shift+tab"];
+    InputSubmitFromAnyField => Input, "submit-any-field", "Submit from any field (commit editor)", ["alt+enter", "ctrl+s"];
 
     // Confirm
     ConfirmYes => Confirm, "yes", "Confirm", ["enter", "y"];

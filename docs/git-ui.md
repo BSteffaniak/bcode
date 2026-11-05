@@ -79,7 +79,11 @@ this is configurable; see [Layout settings](#layout-settings).
 * **Staging view** (`enter` on a file): stage, unstage or discard single lines, ranges (`v`) or
   hunks (`a`); `tab` switches between unstaged and staged changes; `e` opens the file at the line.
 * **Commits**: commit (stages everything when nothing is staged), commit without hooks, amend,
-  commit with `$EDITOR`. The commit prompt shows a summary length guide and `ctrl+a` toggles amend.
+  commit with `$EDITOR`. The commit editor floats over the screen with a one-line summary and an
+  optional description, which together form one message (summary, blank line, description).
+  `tab` switches fields, `enter` commits from the summary and adds a line in the description,
+  `alt+enter` or `ctrl+s` commits from either, pasting a multi-line message splits it, the summary
+  shows a length guide, and `ctrl+a` toggles amend. Rewording uses the same editor.
 * **History**: squash, fixup, drop, edit, reword and reorder commits (`ctrl+j`/`ctrl+k`) through
   interactive rebase; create fixup commits and autosquash; amend staged changes into an older
   commit; revert; cherry-pick copy (`C`) and paste (`V`); soft/mixed/hard reset; tags; new branch
@@ -496,6 +500,8 @@ currently use `StandaloneHost`, which contributes nothing.
 | `bcode.git.input.submit` | Submit | `enter` |
 | `bcode.git.input.cancel` | Cancel | `escape` |
 | `bcode.git.input.toggle-amend` | Toggle amend (commit editor) | `ctrl+a` |
+| `bcode.git.input.switch-field` | Switch summary / description (commit editor) | `tab`, `shift+tab` |
+| `bcode.git.input.submit-any-field` | Submit from any field (commit editor) | `alt+enter`, `ctrl+s` |
 
 ### `git.confirm`
 
