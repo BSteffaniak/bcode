@@ -335,6 +335,95 @@ pub struct RawLayers {
     pub value: toml::Value,
     /// Files that existed and were read, in precedence order (lowest first).
     pub files: Vec<PathBuf>,
+    /// Which layer supplied each merged value.
+    pub origins: Origins,
+}
+
+/// Inline (text) layer kinds.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum InlineLayer {
+    /// Environment TOML (for Bcode, `BCODE_CONFIG_TOML`).
+    Environment,
+    /// Command-line TOML.
+    Cli,
+}
+
+/// Where a configuration value came from.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum LayerOrigin {
+    /// A configuration file.
+    File(PathBuf),
+    /// An inline TOML layer.
+    Inline(InlineLayer),
+    /// Caller-supplied defaults or a value with no recorded layer.
+    Defaults,
+}
+
+impl std::fmt::Display for LayerOrigin {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::File(path) => write!(f, "{}", path.display()),
+            Self::Inline(InlineLayer::Environment) => f.write_str("environment TOML"),
+            Self::Inline(InlineLayer::Cli) => f.write_str("command-line TOML"),
+            Self::Defaults => f.write_str("defaults"),
+        }
+    }
+}
+
+/// Per-value provenance of merged raw layers. Paths use table keys only; array elements
+/// report the array's origin.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Origins {
+    values: BTreeMap<Vec<String>, LayerOrigin>,
+}
+
+impl Origins {
+    fn new(resolved: &bmux_config_composition::Resolved) -> Self {
+        use bmux_config_composition::PathSegment;
+        let layers: BTreeMap<_, _> = resolved
+            .sources
+            .iter()
+            .map(|source| {
+                let origin = match (&source.path, source.layer.as_str()) {
+                    (Some(path), _) => LayerOrigin::File(path.clone()),
+                    (None, "environment-inline") => LayerOrigin::Inline(InlineLayer::Environment),
+                    (None, "cli-inline") => LayerOrigin::Inline(InlineLayer::Cli),
+                    (None, _) => LayerOrigin::Defaults,
+                };
+                (source.id, origin)
+            })
+            .collect();
+        let values = resolved
+            .document
+            .provenance
+            .iter()
+            .filter_map(|(path, source)| {
+                let keys: Option<Vec<String>> = path
+                    .iter()
+                    .map(|segment| match segment {
+                        PathSegment::Key(key) => Some(key.clone()),
+                        PathSegment::Index(_) => None,
+                    })
+                    .collect();
+                Some((keys?, layers.get(source)?.clone()))
+            })
+            .collect();
+        Self { values }
+    }
+
+    /// Layer that set exactly `path`, if any did.
+    #[must_use]
+    pub fn exact(&self, path: &[String]) -> Option<&LayerOrigin> {
+        self.values.get(path)
+    }
+
+    /// Layer that set `path` or, failing that, its nearest recorded ancestor.
+    #[must_use]
+    pub fn nearest(&self, path: &[String]) -> Option<&LayerOrigin> {
+        (0..=path.len())
+            .rev()
+            .find_map(|len| self.values.get(&path[..len]))
+    }
 }
 
 enum TransformError<E> {
@@ -423,11 +512,14 @@ where
             TransformError::Layers(error) => E::from(error),
             TransformError::Hook(error) => error,
         })?;
-    let value = mapped
-        .resolve(&TomlCodec)
-        .and_then(|resolved| resolved.decode())
-        .map_err(LayersError::from)?;
-    Ok(RawLayers { value, files })
+    let resolved = mapped.resolve(&TomlCodec).map_err(LayersError::from)?;
+    let origins = Origins::new(&resolved);
+    let value = resolved.decode().map_err(LayersError::from)?;
+    Ok(RawLayers {
+        value,
+        files,
+        origins,
+    })
 }
 
 fn configuration_anchor(
@@ -638,6 +730,57 @@ pub struct Layered {
     pub resolution: CompositionResolution,
     /// Files that existed and were read, in precedence order (lowest first).
     pub files: Vec<PathBuf>,
+    /// Which layer supplied each raw value.
+    pub origins: Origins,
+}
+
+/// Where a composed value came from.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ValueOrigin {
+    /// The layer.
+    pub layer: LayerOrigin,
+    /// The composition profile whose patch set it, when it came from one.
+    pub profile: Option<String>,
+}
+
+impl std::fmt::Display for ValueOrigin {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match &self.profile {
+            Some(profile) => write!(f, "{} (profile {profile})", self.layer),
+            None => write!(f, "{}", self.layer),
+        }
+    }
+}
+
+impl Layered {
+    /// Best-effort origin of a composed value: the layer that set it directly, else the
+    /// active profile patch that set it, else the nearest ancestor's layer.
+    #[must_use]
+    pub fn origin(&self, path: &[String]) -> Option<ValueOrigin> {
+        let direct = |layer: &LayerOrigin| ValueOrigin {
+            layer: layer.clone(),
+            profile: None,
+        };
+        if let Some(layer) = self.origins.exact(path) {
+            return Some(direct(layer));
+        }
+        if let Some(profile) = &self.resolution.selected_profile {
+            let mut patched = vec![
+                "composition".to_owned(),
+                "profiles".to_owned(),
+                profile.clone(),
+                "patch".to_owned(),
+            ];
+            patched.extend_from_slice(path);
+            if let Some(layer) = self.origins.exact(&patched) {
+                return Some(ValueOrigin {
+                    layer: layer.clone(),
+                    profile: Some(profile.clone()),
+                });
+            }
+        }
+        self.origins.nearest(path).map(direct)
+    }
 }
 
 /// Discover, read, merge and compose configuration starting at `start`.
@@ -673,6 +816,7 @@ pub fn load_layered_from_paths(
         value,
         resolution,
         files: raw.files,
+        origins: raw.origins,
     })
 }
 
@@ -1018,5 +1162,44 @@ mod tests {
             get(&value, "model.profile").and_then(toml::Value::as_str),
             Some("fast \"x\"")
         );
+    }
+
+    #[test]
+    fn origins_name_the_layer_and_profile_that_set_each_value() {
+        let write = |dir: &Path, name: &str, text: &str| {
+            let path = dir.join(name);
+            fs::write(&path, text).unwrap();
+            path
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let user = write(
+            dir.path(),
+            "user.toml",
+            "[a]\nx = 1\n[composition]\nactive_profile = \"p\"\n\
+             [composition.profiles.p.patch.a]\ny = 2\n",
+        );
+        let project = write(dir.path(), "project.toml", "[a]\nz = 3\n");
+        let overrides = ConfigLoadOverrides {
+            env_config_toml: Some("[a]\nw = 4\n".into()),
+            ..ConfigLoadOverrides::default()
+        };
+        let layered = load_layered_from_paths(
+            &[user.clone(), project.clone()],
+            &overrides,
+            toml::Table::new(),
+        )
+        .unwrap();
+        let origin = |keys: &[&str]| {
+            layered
+                .origin(&keys.iter().map(|key| (*key).to_owned()).collect::<Vec<_>>())
+                .map(|origin| origin.to_string())
+        };
+        assert_eq!(origin(&["a", "x"]), Some(user.display().to_string()));
+        assert_eq!(origin(&["a", "z"]), Some(project.display().to_string()));
+        assert_eq!(
+            origin(&["a", "y"]),
+            Some(format!("{} (profile p)", user.display()))
+        );
+        assert_eq!(origin(&["a", "w"]).as_deref(), Some("environment TOML"));
     }
 }

@@ -10,14 +10,15 @@
 //! Files are discovered and composed by `bcode_config_layers`, the same policy bcode uses.
 
 use std::collections::BTreeMap;
+use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 
 use bcode_config_layers::ConfigLoadOverrides;
 use bcode_git::models::CommitMessageSource;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 /// Behavior and presentation settings.
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(default, deny_unknown_fields)]
 // Each flag is an independent user-facing toggle in the configuration file.
 #[allow(clippy::struct_excessive_bools)]
@@ -48,6 +49,11 @@ pub struct GitUiConfig {
     pub relative_dates: bool,
     /// User-defined commands.
     pub custom_commands: Vec<CustomCommand>,
+    /// Keybinding overrides, `scope -> key -> action id` (`""`, `"none"` or `"unbind"`
+    /// removes a binding). Applied over `[tui.keybindings.scopes."git.*"]` in `bcode.toml`.
+    pub keybindings: BTreeMap<String, BTreeMap<String, String>>,
+    /// Theme; unset fields fall back to `[tui.theme]` in `bcode.toml`.
+    pub theme: ThemeSettings,
 }
 
 impl Default for GitUiConfig {
@@ -66,12 +72,14 @@ impl Default for GitUiConfig {
             editor: None,
             relative_dates: true,
             custom_commands: Vec::new(),
+            keybindings: BTreeMap::new(),
+            theme: ThemeSettings::default(),
         }
     }
 }
 
 /// How much of the screen the focused window takes.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize, Serialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum ScreenMode {
     /// Every side window beside the main view.
@@ -84,7 +92,7 @@ pub enum ScreenMode {
 }
 
 /// How side windows other than the focused one appear in half screen mode.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize, Serialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum CollapsedWindows {
     /// One-line title bars that can be clicked.
@@ -95,7 +103,7 @@ pub enum CollapsedWindows {
 }
 
 /// How the staged and unstaged sections of the main view are arranged.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize, Serialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum MainSplit {
     /// Side by side on wide terminals, stacked otherwise.
@@ -108,7 +116,7 @@ pub enum MainSplit {
 }
 
 /// When side windows are stacked above the main view instead of beside it.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize, Serialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum Portrait {
     /// Below `portrait_below_width` columns.
@@ -121,7 +129,7 @@ pub enum Portrait {
 }
 
 /// Window arrangement and sizing (`[plugins.config."bcode.git".ui.layout]`).
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct LayoutConfig {
     /// Screen mode at startup; `+` and `_` change it for the session.
@@ -187,7 +195,7 @@ impl Default for LayoutConfig {
 }
 
 /// Command log settings.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct CommandLogConfig {
     /// Show the command log at startup; `@` toggles it.
@@ -206,7 +214,7 @@ impl Default for CommandLogConfig {
 }
 
 /// Files panel settings (`[plugins.config."bcode.git".ui.files]`).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct FilesConfig {
     /// Show files as a directory tree rather than a flat list; `` ` `` toggles it.
@@ -220,7 +228,7 @@ impl Default for FilesConfig {
 }
 
 /// Commit editor settings (`[plugins.config."bcode.git".ui.commit]`).
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct CommitConfig {
     /// Prefill the commit editor from the first source with text.
@@ -275,7 +283,7 @@ impl CommitConfig {
 }
 
 /// Syntax highlighting settings.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct HighlightConfig {
     /// Enable language-aware highlighting.
@@ -294,7 +302,7 @@ impl Default for HighlightConfig {
 }
 
 /// Refresh settings.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct RefreshConfig {
     /// Watch the worktree and git directory for changes.
@@ -316,7 +324,7 @@ impl Default for RefreshConfig {
 }
 
 /// Which destructive actions ask first.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(default, deny_unknown_fields)]
 // Each flag independently controls one confirmation prompt.
 #[allow(clippy::struct_excessive_bools)]
@@ -343,7 +351,7 @@ impl Default for ConfirmConfig {
 }
 
 /// A user-defined command bound to a key in a scope.
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct CustomCommand {
     /// Default key (any bcode key spelling, including sequences such as `g c`).
@@ -372,7 +380,7 @@ pub struct CustomCommand {
 }
 
 /// A prompt shown before a custom command runs.
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct CustomPrompt {
     /// Placeholder name (`{prompt.<name>}`).
@@ -388,7 +396,22 @@ fn default_custom_scope() -> String {
     "git.global".to_owned()
 }
 
-/// Theme selection from `[tui.theme]`.
+/// Theme settings in the git UI schema. Each unset field falls back to `[tui.theme]`.
+#[derive(Debug, Clone, PartialEq, Eq, Default, Deserialize, Serialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct ThemeSettings {
+    /// Theme id.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+    /// Overlays applied after the base theme.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub overlays: Option<Vec<String>>,
+    /// Extra theme files or directories.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub paths: Option<Vec<PathBuf>>,
+}
+
+/// Effective theme selection.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct ThemeChoice {
     /// Theme id; empty selects the default.
@@ -399,21 +422,55 @@ pub struct ThemeChoice {
     pub paths: Vec<PathBuf>,
 }
 
+/// Where the git UI settings live inside `bcode.toml`; the dedicated files use the same schema
+/// at their root.
+pub const BCODE_SECTION: [&str; 4] = ["plugins", "config", "bcode.git", "ui"];
+/// Environment variable naming an extra dedicated config file (layered on top; must exist).
+pub const GIT_CONFIG_ENV: &str = "BCODE_GIT_CONFIG";
+/// Environment variable holding inline dedicated config TOML.
+pub const GIT_CONFIG_TOML_ENV: &str = "BCODE_GIT_CONFIG_TOML";
+/// Dedicated config file name in the user directory.
+pub const GIT_CONFIG_FILE_NAME: &str = "config.toml";
+
+/// Command-line configuration layers, the topmost of the dedicated family.
+#[derive(Debug, Clone, Default)]
+pub struct ConfigOptions {
+    /// `--config FILE`.
+    pub file: Option<PathBuf>,
+    /// `--config-toml TEXT`.
+    pub toml: Option<String>,
+}
+
+/// Candidate files of both configuration families, in precedence order (later wins).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ConfigPaths {
+    /// `bcode.toml` family.
+    pub bcode: Vec<PathBuf>,
+    /// Dedicated `bcode-git` family.
+    pub git: Vec<PathBuf>,
+}
+
 /// Everything the UI reads from configuration files.
 #[derive(Debug, Clone, Default)]
 pub struct LoadedConfig {
-    /// UI settings.
+    /// UI settings, keybindings and theme included as configured.
     pub ui: GitUiConfig,
-    /// `scope -> key -> action` overrides for `git.*` scopes.
+    /// Effective `scope -> key -> action` overrides for `git.*` scopes.
     pub keybindings: BTreeMap<String, BTreeMap<String, String>>,
-    /// Theme selection.
+    /// Effective theme selection.
     pub theme: ThemeChoice,
     /// Problems found while loading; defaults are used for affected sections.
     pub diagnostics: Vec<String>,
     /// bcode user configuration directory.
     pub config_dir: PathBuf,
-    /// Files that were read, in precedence order.
+    /// Files that were read, in precedence order: the `bcode.toml` family first.
     pub files: Vec<PathBuf>,
+    /// Dedicated `bcode-git` files that were read, in precedence order.
+    pub git_files: Vec<PathBuf>,
+    /// Active `[composition]` profile of the `bcode.toml` family.
+    pub bcode_profile: Option<String>,
+    /// Active `[composition]` profile of the dedicated family.
+    pub git_profile: Option<String>,
     /// Whether `[plugins] disabled` lists the `bcode.git` plugin.
     pub plugin_disabled: bool,
 }
@@ -429,74 +486,270 @@ impl LoadedConfig {
 /// bcode user configuration directory (`$XDG_CONFIG_HOME/bcode` or `~/.config/bcode`).
 #[must_use]
 pub fn default_config_dir() -> PathBuf {
+    user_config_home().join("bcode")
+}
+
+/// Dedicated user configuration file (`$XDG_CONFIG_HOME/bcode-git/config.toml` or
+/// `~/.config/bcode-git/config.toml`).
+#[must_use]
+pub fn user_git_config_file() -> PathBuf {
+    user_config_home()
+        .join("bcode-git")
+        .join(GIT_CONFIG_FILE_NAME)
+}
+
+fn user_config_home() -> PathBuf {
     if let Some(home) = std::env::var_os("XDG_CONFIG_HOME") {
-        return PathBuf::from(home).join("bcode");
+        return PathBuf::from(home);
     }
     if let Some(home) = std::env::var_os("HOME") {
-        return PathBuf::from(home).join(".config").join("bcode");
+        return PathBuf::from(home).join(".config");
     }
-    std::env::temp_dir().join("bcode")
+    std::env::temp_dir()
 }
 
-/// Candidate configuration files for a starting directory in precedence order (later wins),
-/// whether or not they exist. Matches bcode's own discovery, including `$BCODE_CONFIG`.
+/// Candidate configuration files for a starting directory, existing or not.
 #[must_use]
-pub fn config_files(start: &Path) -> Vec<PathBuf> {
-    let mut files = bcode_config_layers::default_config_paths_from(start);
-    if let Some(path) = ConfigLoadOverrides::from_environment().env_config_path {
-        files.push(path);
-    }
-    files
+pub fn config_files(start: &Path, options: &ConfigOptions) -> ConfigPaths {
+    let mut bcode = bcode_config_layers::default_config_paths_from(start);
+    bcode.extend(ConfigLoadOverrides::from_environment().env_config_path);
+    let mut git = git_config_paths(start);
+    let overrides = git_overrides(options);
+    git.extend(overrides.env_config_path);
+    git.extend(overrides.cli_config_path);
+    ConfigPaths { bcode, git }
 }
 
-/// Load configuration exactly as bcode composes it: discovered files, `$BCODE_CONFIG`,
-/// `$BCODE_CONFIG_TOML`, and `[composition]` profiles.
+/// Dedicated files discovered for `start`: the user file, then the repository's
+/// `bcode-git.toml` and `.bcode-git/config.toml`, then the per-clone `bcode-git.toml` in
+/// the git directory.
+#[must_use]
+pub fn git_config_paths(start: &Path) -> Vec<PathBuf> {
+    let mut paths = vec![user_git_config_file()];
+    if let Some(root) = bcode_config_layers::discover_config_root(start) {
+        paths.push(root.join("bcode-git.toml"));
+        paths.push(root.join(".bcode-git").join(GIT_CONFIG_FILE_NAME));
+        if let Some(git_dir) = git_dir(&root) {
+            paths.push(git_dir.join("bcode-git.toml"));
+        }
+    }
+    paths
+}
+
+/// The git directory of a worktree root: `.git` itself, or where a `.git` file points.
+fn git_dir(root: &Path) -> Option<PathBuf> {
+    let dot_git = root.join(".git");
+    if dot_git.is_dir() {
+        return Some(dot_git);
+    }
+    let text = std::fs::read_to_string(&dot_git).ok()?;
+    let target = text
+        .lines()
+        .find_map(|line| line.strip_prefix("gitdir:"))?
+        .trim();
+    Some(root.join(target))
+}
+
+fn git_overrides(options: &ConfigOptions) -> ConfigLoadOverrides {
+    let var = |name: &str| {
+        std::env::var(name)
+            .ok()
+            .filter(|value| !value.trim().is_empty())
+    };
+    ConfigLoadOverrides {
+        env_config_path: var(GIT_CONFIG_ENV).map(PathBuf::from),
+        env_config_toml: var(GIT_CONFIG_TOML_ENV),
+        cli_config_path: options.file.clone(),
+        cli_config_toml: options.toml.clone(),
+        ..ConfigLoadOverrides::default()
+    }
+}
+
+/// Load configuration with no command-line layers. See [`load_with`].
 #[must_use]
 pub fn load(start: &Path) -> LoadedConfig {
+    load_with(start, &ConfigOptions::default())
+}
+
+/// Load configuration: bcode's `bcode.toml` family composed exactly as bcode does, then the
+/// dedicated `bcode-git` family composed on top of its git UI section, each with its own
+/// `[composition]` profiles.
+///
+/// Order, lowest first: defaults; `bcode.toml` layers (user, repository, `$BCODE_CONFIG`,
+/// `$BCODE_CONFIG_TOML`); the dedicated family's active profile; dedicated files (user,
+/// repository, per clone); `$BCODE_GIT_CONFIG`; `$BCODE_GIT_CONFIG_TOML`; `options`.
+#[must_use]
+pub fn load_with(start: &Path, options: &ConfigOptions) -> LoadedConfig {
     let mut loaded = LoadedConfig {
         config_dir: default_config_dir(),
         ..LoadedConfig::default()
     };
-    match bcode_config_layers::load_layered(
+    let bcode = match bcode_config_layers::load_layered(
         start,
         &ConfigLoadOverrides::from_environment(),
         toml::Table::new(),
     ) {
-        Ok(layered) => {
-            loaded.files = layered.files;
-            apply(&layered.value, &mut loaded);
+        Ok(layered) => Some(layered),
+        Err(error) => {
+            loaded
+                .diagnostics
+                .push(format!("bcode.toml configuration not loaded: {error}"));
+            None
         }
-        Err(error) => loaded
-            .diagnostics
-            .push(format!("configuration not loaded, using defaults: {error}")),
+    };
+    let bcode_table = bcode
+        .as_ref()
+        .map(|layered| layered.value.clone())
+        .unwrap_or_default();
+    let base = section(&bcode_table);
+    let git = match bcode_config_layers::load_layered_from_paths(
+        &git_config_paths(start),
+        &git_overrides(options),
+        base.clone(),
+    ) {
+        Ok(layered) => Some(layered),
+        Err(error) => {
+            loaded
+                .diagnostics
+                .push(format!("bcode-git configuration not loaded: {error}"));
+            None
+        }
+    };
+    if let Some(layered) = &bcode {
+        loaded.files.clone_from(&layered.files);
+        loaded
+            .bcode_profile
+            .clone_from(&layered.resolution.selected_profile);
     }
+    if let Some(layered) = &git {
+        loaded.git_files.clone_from(&layered.files);
+        loaded
+            .git_profile
+            .clone_from(&layered.resolution.selected_profile);
+    }
+    let ui = git.as_ref().map_or(base, |layered| layered.value.clone());
+    let locate = |path: &[String]| -> String {
+        let git_origin = git.as_ref().and_then(|layered| {
+            layered
+                .origin(path)
+                .filter(|origin| origin.layer != bcode_config_layers::LayerOrigin::Defaults)
+        });
+        if let Some(origin) = git_origin {
+            return format!(
+                "{}: {}",
+                describe_origin(&origin, GIT_CONFIG_TOML_ENV),
+                dotted(path)
+            );
+        }
+        let mut full: Vec<String> = BCODE_SECTION.iter().map(|key| (*key).to_owned()).collect();
+        full.extend_from_slice(path);
+        bcode
+            .as_ref()
+            .and_then(|layered| layered.origin(&full))
+            .map_or_else(
+                || dotted(&full),
+                |origin| {
+                    format!(
+                        "{}: {}",
+                        describe_origin(&origin, bcode_config_layers::BCODE_CONFIG_TOML_ENV),
+                        dotted(&full)
+                    )
+                },
+            )
+    };
+    apply(&bcode_table, &ui, &locate, &mut loaded);
     loaded
 }
 
-/// Interpret an already-merged configuration table.
+/// Name an origin, spelling inline layers as the variable or flag that supplied them.
+fn describe_origin(origin: &bcode_config_layers::ValueOrigin, environment: &str) -> String {
+    use bcode_config_layers::{InlineLayer, LayerOrigin};
+    let layer = match &origin.layer {
+        LayerOrigin::Inline(InlineLayer::Environment) => format!("${environment}"),
+        LayerOrigin::Inline(InlineLayer::Cli) => "--config-toml".to_owned(),
+        other => other.to_string(),
+    };
+    match &origin.profile {
+        Some(profile) => format!("{layer} (profile {profile})"),
+        None => layer,
+    }
+}
+
+/// Interpret an already-merged `bcode.toml` table, with no dedicated files.
 #[must_use]
 pub fn from_table(table: &toml::Table) -> LoadedConfig {
+    from_tables(table, None)
+}
+
+/// Interpret an already-merged `bcode.toml` table and, optionally, an already-merged dedicated
+/// table composed over its git UI section.
+#[must_use]
+pub fn from_tables(bcode: &toml::Table, git: Option<&toml::Table>) -> LoadedConfig {
     let mut loaded = LoadedConfig {
         config_dir: default_config_dir(),
         ..LoadedConfig::default()
     };
-    apply(table, &mut loaded);
+    let mut ui = section(bcode);
+    if let Some(git) = git {
+        let mut merged = toml::Value::Table(ui);
+        bcode_config_layers::merge_config_values(&mut merged, toml::Value::Table(git.clone()));
+        ui = match merged {
+            toml::Value::Table(table) => table,
+            _ => toml::Table::new(),
+        };
+    }
+    apply(bcode, &ui, &|path: &[String]| dotted(path), &mut loaded);
     loaded
 }
 
-fn apply(table: &toml::Table, loaded: &mut LoadedConfig) {
-    loaded.plugin_disabled = string_list(lookup(table, &["plugins", "disabled"]))
+/// The git UI section of a `bcode.toml` table.
+fn section(bcode: &toml::Table) -> toml::Table {
+    lookup(bcode, &BCODE_SECTION)
+        .and_then(toml::Value::as_table)
+        .cloned()
+        .unwrap_or_default()
+}
+
+fn dotted(path: &[String]) -> String {
+    path.iter()
+        .map(|key| {
+            if key
+                .chars()
+                .all(|ch| ch.is_ascii_alphanumeric() || ch == '_' || ch == '-')
+            {
+                key.clone()
+            } else {
+                format!("\"{key}\"")
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(".")
+}
+
+/// Decode the composed git UI table and combine it with bcode's shared sections.
+fn apply(
+    bcode: &toml::Table,
+    ui: &toml::Table,
+    locate: &dyn Fn(&[String]) -> String,
+    loaded: &mut LoadedConfig,
+) {
+    loaded.plugin_disabled = string_list(lookup(bcode, &["plugins", "disabled"]))
         .iter()
         .any(|id| id == "bcode.git");
-    if let Some(ui) = lookup(table, &["plugins", "config", "bcode.git", "ui"]) {
-        match ui.clone().try_into::<GitUiConfig>() {
-            Ok(config) => loaded.ui = config,
-            Err(error) => loaded
+    match toml::Value::Table(ui.clone()).try_into::<GitUiConfig>() {
+        Ok(config) => loaded.ui = config,
+        Err(error) => {
+            // The location is reported separately, with the file it came from.
+            let message = error.to_string();
+            let message = message.lines().next().unwrap_or_default().trim();
+            loaded
                 .diagnostics
-                .push(format!("[plugins.config.\"bcode.git\".ui]: {error}")),
+                .push(format!("{}: {message}", locate(&failing_path(ui))));
         }
     }
-    if let Some(toml::Value::Table(scopes)) = lookup(table, &["tui", "keybindings", "scopes"]) {
+
+    // Keybindings: bcode's shared scopes first, then the git UI schema's own.
+    if let Some(toml::Value::Table(scopes)) = lookup(bcode, &["tui", "keybindings", "scopes"]) {
         for (scope, bindings) in scopes {
             if !scope.starts_with("git.") {
                 continue;
@@ -507,26 +760,34 @@ fn apply(table: &toml::Table, loaded: &mut LoadedConfig) {
                     .push(format!("keybinding scope {scope} must be a table"));
                 continue;
             };
-            let mut resolved = BTreeMap::new();
+            let resolved = loaded.keybindings.entry(scope.clone()).or_default();
             for (key, action) in bindings {
                 match action.as_str() {
                     Some(action) => {
-                        let action = if matches!(action, "none" | "unbind") {
-                            ""
-                        } else {
-                            action
-                        };
-                        resolved.insert(key.clone(), action.to_owned());
+                        resolved.insert(key.clone(), binding(action));
                     }
                     None => loaded
                         .diagnostics
                         .push(format!("keybinding {scope}.{key} must be an action id")),
                 }
             }
-            loaded.keybindings.insert(scope.clone(), resolved);
         }
     }
-    if let Some(toml::Value::Table(theme)) = lookup(table, &["tui", "theme"]) {
+    for (scope, bindings) in &loaded.ui.keybindings {
+        if !scope.starts_with("git.") {
+            loaded.diagnostics.push(format!(
+                "keybindings.\"{scope}\": git UI scopes start with \"git.\""
+            ));
+            continue;
+        }
+        let resolved = loaded.keybindings.entry(scope.clone()).or_default();
+        for (key, action) in bindings {
+            resolved.insert(key.clone(), binding(action));
+        }
+    }
+
+    // Theme: bcode's shared selection, with the git UI schema's fields taking precedence.
+    if let Some(toml::Value::Table(theme)) = lookup(bcode, &["tui", "theme"]) {
         if let Some(name) = theme.get("name").and_then(toml::Value::as_str) {
             name.clone_into(&mut loaded.theme.name);
         }
@@ -535,6 +796,161 @@ fn apply(table: &toml::Table, loaded: &mut LoadedConfig) {
             .into_iter()
             .map(PathBuf::from)
             .collect();
+    }
+    let own = &loaded.ui.theme;
+    if let Some(name) = &own.name {
+        loaded.theme.name.clone_from(name);
+    }
+    if let Some(overlays) = &own.overlays {
+        loaded.theme.overlays.clone_from(overlays);
+    }
+    if let Some(paths) = &own.paths {
+        loaded.theme.paths.clone_from(paths);
+    }
+}
+
+fn binding(action: &str) -> String {
+    if matches!(action, "none" | "unbind") {
+        String::new()
+    } else {
+        action.to_owned()
+    }
+}
+
+/// Key path of the first value the schema rejects, for locating it in a file.
+fn failing_path(ui: &toml::Table) -> Vec<String> {
+    use bmux_config_composition::{Document, PathSegment, SourceId, TomlCodec};
+    let Ok(value) = TomlCodec::from_toml(toml::Value::Table(ui.clone())) else {
+        return Vec::new();
+    };
+    match Document::new(value, SourceId(0)).decode_located::<GitUiConfig>() {
+        Ok(_) => Vec::new(),
+        Err(failure) => failure
+            .path
+            .iter()
+            .map_while(|segment| match segment {
+                PathSegment::Key(key) => Some(key.clone()),
+                PathSegment::Index(_) => None,
+            })
+            .collect(),
+    }
+}
+
+/// The effective settings as a dedicated config file (or, with `nested`, as the `bcode.toml`
+/// section), with keybindings and theme as configured.
+///
+/// # Errors
+/// * The settings cannot be expressed as TOML.
+pub fn to_toml(config: &GitUiConfig, nested: bool) -> Result<String, String> {
+    let value = toml::Value::try_from(config).map_err(|error| error.to_string())?;
+    let toml::Value::Table(mut table) = value else {
+        return Err("settings are not a table".into());
+    };
+    if nested {
+        for key in BCODE_SECTION.iter().rev() {
+            let mut parent = toml::Table::new();
+            parent.insert((*key).to_owned(), toml::Value::Table(table));
+            table = parent;
+        }
+    }
+    toml::to_string(&table).map_err(|error| error.to_string())
+}
+
+/// Human-readable report of both configuration families: each candidate file with whether it
+/// was read, the active profiles, and any problems.
+#[must_use]
+pub fn describe_files(start: &Path, options: &ConfigOptions) -> String {
+    let loaded = load_with(start, options);
+    let paths = config_files(start, options);
+    let mut out = String::new();
+    let mut family =
+        |title: &str, candidates: &[PathBuf], read: &[PathBuf], profile: &Option<String>| {
+            out.push_str(title);
+            out.push('\n');
+            for path in candidates {
+                let state = if read.contains(path) {
+                    "read   "
+                } else {
+                    "missing"
+                };
+                let _ = writeln!(out, "  {state} {}", path.display());
+            }
+            if let Some(profile) = profile {
+                let _ = writeln!(out, "  profile {profile}");
+            }
+        };
+    family(
+        "bcode.toml ([plugins.config.\"bcode.git\".ui], tui.keybindings, tui.theme):",
+        &paths.bcode,
+        &loaded.files,
+        &loaded.bcode_profile,
+    );
+    family(
+        "bcode-git (same schema at the root, composed on top):",
+        &paths.git,
+        &loaded.git_files,
+        &loaded.git_profile,
+    );
+    for (variable, inline) in [
+        (bcode_config_layers::BCODE_CONFIG_TOML_ENV, "bcode.toml"),
+        (GIT_CONFIG_TOML_ENV, "bcode-git"),
+    ] {
+        if std::env::var(variable).is_ok_and(|value| !value.trim().is_empty()) {
+            let _ = writeln!(out, "inline ${variable} ({inline})");
+        }
+    }
+    if options.toml.is_some() {
+        out.push_str("inline --config-toml (bcode-git)\n");
+    }
+    for diagnostic in &loaded.diagnostics {
+        let _ = writeln!(out, "problem: {diagnostic}");
+    }
+    out
+}
+
+/// A configuration command offered by both `bcode-git` and `bcode git`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ConfigCommand {
+    /// `--print-config-paths`.
+    PrintPaths,
+    /// `--print-config [--nested]`.
+    Print {
+        /// Emit the `bcode.toml` form instead of a dedicated file.
+        nested: bool,
+    },
+    /// `--import-lazygit [FILE] [--nested]`.
+    ImportLazygit {
+        /// lazygit `config.yml`; found automatically when absent.
+        source: Option<PathBuf>,
+        /// Emit the `bcode.toml` form instead of a dedicated file.
+        nested: bool,
+    },
+}
+
+/// Run a configuration command and return what it prints.
+///
+/// # Errors
+/// * The lazygit configuration cannot be found or read, or settings cannot be written as TOML.
+pub fn run_command(
+    start: &Path,
+    options: &ConfigOptions,
+    command: ConfigCommand,
+) -> Result<String, String> {
+    match command {
+        ConfigCommand::PrintPaths => Ok(describe_files(start, options)),
+        ConfigCommand::Print { nested } => {
+            let loaded = load_with(start, options);
+            let mut text = String::new();
+            for diagnostic in &loaded.diagnostics {
+                let _ = writeln!(text, "# problem: {diagnostic}");
+            }
+            text.push_str(&to_toml(&loaded.ui, nested)?);
+            Ok(text)
+        }
+        ConfigCommand::ImportLazygit { source, nested } => {
+            let (path, import) = crate::lazygit::import_file(source, nested)?;
+            Ok(format!("# Source: {}\n{}", path.display(), import.toml))
+        }
     }
 }
 
@@ -633,6 +1049,178 @@ mod tests {
                 .files
                 .contains(&root.join(".bcode").join("bcode.toml"))
         );
+    }
+
+    /// The same settings body, in every part of the schema.
+    const BODY: &str = r#"
+        diff_context = 9
+        [layout]
+        screen_mode = "half"
+        windows = [["files"], ["commits"]]
+        [files]
+        tree = false
+        [commit]
+        sources = ["merge"]
+        [keybindings."git.list"]
+        n = "bcode.git.list.up"
+        x = "none"
+        [theme]
+        name = "nord"
+        [[custom_commands]]
+        key = "ctrl+b"
+        command = "echo {branch}"
+    "#;
+
+    fn nest(body: &str) -> toml::Table {
+        let mut table: toml::Table = body.parse().unwrap();
+        for key in BCODE_SECTION.iter().rev() {
+            let mut parent = toml::Table::new();
+            parent.insert((*key).to_owned(), toml::Value::Table(table));
+            table = parent;
+        }
+        table
+    }
+
+    #[test]
+    fn dedicated_files_and_bcode_toml_share_one_schema() {
+        let nested = from_table(&nest(BODY));
+        let dedicated = from_tables(&toml::Table::new(), Some(&BODY.parse().unwrap()));
+        assert!(nested.diagnostics.is_empty(), "{:?}", nested.diagnostics);
+        assert_eq!(nested.ui, dedicated.ui);
+        assert_eq!(nested.keybindings, dedicated.keybindings);
+        assert_eq!(nested.theme, dedicated.theme);
+        assert_eq!(nested.ui.diff_context, 9);
+        assert_eq!(nested.keybindings["git.list"]["x"], "");
+        assert_eq!(nested.theme.name, "nord");
+    }
+
+    #[test]
+    fn git_ui_keybindings_and_theme_refine_bcode_wide_ones() {
+        let mut bcode = nest(
+            "[keybindings.\"git.files\"]\nx = \"bcode.git.files.discard\"\n\
+             [theme]\noverlays = [\"mine\"]\n",
+        );
+        let shared: toml::Table = r#"
+            [tui.keybindings.scopes."git.files"]
+            x = "bcode.git.files.commit"
+            y = "bcode.git.files.stash"
+            [tui.theme]
+            name = "nord"
+            overlays = ["high-contrast"]
+        "#
+        .parse()
+        .unwrap();
+        bcode.extend(shared);
+        let loaded = from_table(&bcode);
+        assert!(loaded.diagnostics.is_empty(), "{:?}", loaded.diagnostics);
+        assert_eq!(
+            loaded.keybindings["git.files"]["x"],
+            "bcode.git.files.discard"
+        );
+        assert_eq!(
+            loaded.keybindings["git.files"]["y"],
+            "bcode.git.files.stash"
+        );
+        assert_eq!(loaded.theme.name, "nord");
+        assert_eq!(loaded.theme.overlays, ["mine"]);
+    }
+
+    fn repository() -> tempfile::TempDir {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join(".git")).unwrap();
+        std::fs::create_dir_all(dir.path().join(".bcode-git")).unwrap();
+        dir
+    }
+
+    #[test]
+    fn dedicated_layers_compose_over_bcode_toml_in_order() {
+        let dir = repository();
+        let root = dir.path();
+        let write = |name: &str, text: &str| std::fs::write(root.join(name), text).unwrap();
+        write(
+            "bcode.toml",
+            "[plugins.config.\"bcode.git\".ui]\ndiff_context = 1\nlog_page_size = 11\n\
+             [plugins.config.\"bcode.git\".ui.layout]\nside_panel_width = 21\n\
+             expanded_weight = 7\n",
+        );
+        write(
+            "bcode-git.toml",
+            "diff_context = 2\n[layout]\nside_panel_width = 22\n",
+        );
+        write(
+            ".bcode-git/config.toml",
+            "[layout]\nside_panel_width = 23\n[composition]\nactive_profile = \"p\"\n\
+             [composition.profiles.p.patch]\nrelative_dates = false\n\
+             [composition.profiles.p.patch.layout]\nportrait_below_width = 99\n",
+        );
+        write(
+            ".git/bcode-git.toml",
+            "[layout]\nhalf_side_panel_width = 44\n",
+        );
+        let options = ConfigOptions {
+            file: None,
+            toml: Some("[files]\ntree = false\n".into()),
+        };
+        let loaded = load_with(root, &options);
+        assert!(loaded.diagnostics.is_empty(), "{:?}", loaded.diagnostics);
+        let ui = &loaded.ui;
+        // bcode.toml values survive where nothing overrides them; tables merge deeply.
+        assert_eq!(ui.log_page_size, 11);
+        assert_eq!(ui.layout.expanded_weight, 7);
+        // Each dedicated layer overrides the ones before it.
+        assert_eq!(ui.diff_context, 2);
+        assert_eq!(ui.layout.side_panel_width, 23);
+        assert_eq!(ui.layout.half_side_panel_width, 44);
+        assert!(!ui.files.tree);
+        // The dedicated family's own profile applies on top of the bcode base.
+        assert!(!ui.relative_dates);
+        assert_eq!(ui.layout.portrait_below_width, 99);
+        assert_eq!(loaded.git_profile.as_deref(), Some("p"));
+        assert!(
+            loaded
+                .git_files
+                .contains(&root.join(".git").join("bcode-git.toml"))
+        );
+    }
+
+    #[test]
+    fn problems_name_the_dedicated_file_and_missing_files_are_reported() {
+        let dir = repository();
+        let root = dir.path();
+        std::fs::write(root.join("bcode-git.toml"), "[layout]\nscreen_mode = 3\n").unwrap();
+        let loaded = load(root);
+        assert!(
+            loaded.diagnostics.iter().any(|problem| problem
+                .contains(&root.join("bcode-git.toml").display().to_string())
+                && problem.contains("layout.screen_mode")),
+            "{:?}",
+            loaded.diagnostics
+        );
+        let missing = load_with(
+            root,
+            &ConfigOptions {
+                file: Some(root.join("nope.toml")),
+                toml: None,
+            },
+        );
+        assert!(
+            missing
+                .diagnostics
+                .iter()
+                .any(|problem| problem.contains("bcode-git configuration not loaded")),
+            "{:?}",
+            missing.diagnostics
+        );
+    }
+
+    #[test]
+    fn printed_configuration_reads_back_identically() {
+        let loaded = from_table(&nest(BODY));
+        let flat = to_toml(&loaded.ui, false).unwrap();
+        let again = from_tables(&toml::Table::new(), Some(&flat.parse().unwrap()));
+        assert_eq!(again.ui, loaded.ui);
+        let nested = to_toml(&loaded.ui, true).unwrap();
+        assert_eq!(from_table(&nested.parse().unwrap()).ui, loaded.ui);
     }
 
     #[test]

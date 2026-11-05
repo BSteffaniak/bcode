@@ -16,6 +16,7 @@ bcode_git = { workspace = true }
 bcode_keymap = { workspace = true }
 bcode_syntax_render = { workspace = true }
 bcode_tui_theme = { workspace = true }
+bmux_config_composition = { workspace = true }
 bmux_keyboard = { workspace = true, features = ["crossterm"] }
 bmux_text_edit = { workspace = true }
 bmux_tui = { workspace = true, features = ["crossterm"] }

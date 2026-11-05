@@ -2303,6 +2303,7 @@ dependencies = [
  "bcode_keymap",
  "bcode_syntax_render",
  "bcode_tui_theme",
+ "bmux_config_composition",
  "bmux_keyboard",
  "bmux_text_edit",
  "bmux_tui",

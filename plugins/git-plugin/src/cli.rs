@@ -12,11 +12,26 @@ struct GitCli {
     /// Run as if started in this directory.
     #[arg(short = 'C', long = "path", value_name = "DIR")]
     path: Option<PathBuf>,
-    /// Print bcode configuration converted from a lazygit config.yml (found automatically
-    /// when no path is given) and exit.
+    /// Extra configuration file, layered above every other bcode-git file.
+    #[arg(long, value_name = "FILE")]
+    config: Option<PathBuf>,
+    /// Inline configuration TOML, the topmost layer.
+    #[arg(long, value_name = "TOML")]
+    config_toml: Option<String>,
+    /// Print which configuration files are read, in order, and exit.
+    #[arg(long)]
+    print_config_paths: bool,
+    /// Print the effective configuration as a bcode-git config file and exit.
+    #[arg(long)]
+    print_config: bool,
+    /// Print settings converted from a lazygit config.yml (found automatically when no path
+    /// is given) and exit.
     #[arg(long, value_name = "CONFIG_YML")]
     #[allow(clippy::option_option)]
     import_lazygit: Option<Option<PathBuf>>,
+    /// With --print-config or --import-lazygit, emit the bcode.toml form instead.
+    #[arg(long)]
+    nested: bool,
 }
 
 pub fn registration() -> StaticCliRegistration {
@@ -30,17 +45,34 @@ pub fn registration() -> StaticCliRegistration {
 fn invoke(matches: clap::ArgMatches) -> StaticCliFuture {
     Box::pin(async move {
         let cli = GitCli::from_arg_matches(&matches).map_err(|error| error.to_string())?;
-        if let Some(source) = cli.import_lazygit {
-            let (path, import) = bcode_git_ui::lazygit::import_file(source)?;
-            println!("# Source: {}", path.display());
-            print!("{}", import.toml);
-            return Ok(StaticCliOutcome::default());
-        }
         let path = match cli.path {
-            Some(path) => path,
+            Some(path) => std::path::absolute(&path).unwrap_or(path),
             None => std::env::current_dir().map_err(|error| error.to_string())?,
         };
-        let config = bcode_git_ui::config::load(&path);
+        let options = bcode_git_ui::config::ConfigOptions {
+            file: cli.config,
+            toml: cli.config_toml,
+        };
+        let command = if let Some(source) = cli.import_lazygit {
+            Some(bcode_git_ui::config::ConfigCommand::ImportLazygit {
+                source,
+                nested: cli.nested,
+            })
+        } else if cli.print_config {
+            Some(bcode_git_ui::config::ConfigCommand::Print { nested: cli.nested })
+        } else if cli.print_config_paths {
+            Some(bcode_git_ui::config::ConfigCommand::PrintPaths)
+        } else {
+            None
+        };
+        if let Some(command) = command {
+            print!(
+                "{}",
+                bcode_git_ui::config::run_command(&path, &options, command)?
+            );
+            return Ok(StaticCliOutcome::default());
+        }
+        let config = bcode_git_ui::config::load_with(&path, &options);
         if !config.ui_enabled() {
             return Err(
                 "bcode git is disabled by configuration ([plugins] disabled or \

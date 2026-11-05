@@ -106,16 +106,69 @@ this is configurable; see [Layout settings](#layout-settings).
 
 ## Configuration
 
-Settings live in the ordinary bcode configuration files, and `bcode git` and `bcode-git` compose
-them with the same layering policy as bcode itself (`bcode_config_layers`): the user file
-`$XDG_CONFIG_HOME/bcode/bcode.toml`, then `bcode.toml` and `.bcode/bcode.toml` at the repository
-root, then the `$BCODE_CONFIG` file (which must exist when set), then inline `$BCODE_CONFIG_TOML`.
-Later layers override earlier ones, and `[composition]` profiles apply, so a profile can carry its
-own git UI layout. `bcode-git --print-config-paths` lists the candidate files and which were read.
-Invalid sections are reported in the UI and replaced by defaults.
+The git UI has one settings schema with two homes, and both `bcode git` and `bcode-git` read both:
+
+* **`bcode.toml`**, under `[plugins.config."bcode.git".ui]`, so bcode users (including generated
+  configurations such as a Nix-built `bcode.toml`) need nothing else.
+* **Dedicated `bcode-git` files**, which use the same schema at their root, without the prefix.
+
+The schema is one Rust type (`GitUiConfig`), so every key below works in either place:
+
+| Dedicated file | `bcode.toml` |
+|---|---|
+| `diff_context = 3` (root keys) | `[plugins.config."bcode.git".ui]` `diff_context = 3` |
+| `[layout]`, `[files]`, `[commit]`, `[refresh]`, … | `[plugins.config."bcode.git".ui.layout]`, … |
+| `[keybindings."git.files"]` | `[plugins.config."bcode.git".ui.keybindings."git.files"]` |
+| `[theme]` | `[plugins.config."bcode.git".ui.theme]` |
+| `[[custom_commands]]` | `[[plugins.config."bcode.git".ui.custom_commands]]` |
+
+Layers, lowest first (later layers override earlier ones; tables merge key by key, while values
+and arrays such as `windows` or `custom_commands` are replaced):
+
+1. Built-in defaults.
+2. The `bcode.toml` family, composed exactly as bcode composes it: the user file
+   `$XDG_CONFIG_HOME/bcode/bcode.toml`, `bcode.toml` and `.bcode/bcode.toml` at the repository root,
+   the `$BCODE_CONFIG` file (which must exist when set), inline `$BCODE_CONFIG_TOML`, and that
+   family's `[composition]` profiles.
+3. The dedicated family's own `[composition]` profiles (`active_profile`, `profiles.<name>.patch`,
+   `layer_order`), applied over the `bcode.toml` result.
+4. `$XDG_CONFIG_HOME/bcode-git/config.toml` (default `~/.config/bcode-git/config.toml`).
+5. `bcode-git.toml` and `.bcode-git/config.toml` at the repository root (shareable), then
+   `bcode-git.toml` in the git directory (per clone, never committed; per worktree for linked
+   worktrees).
+6. The `$BCODE_GIT_CONFIG` file (must exist when set).
+7. Inline `$BCODE_GIT_CONFIG_TOML`.
+8. `--config FILE`, then `--config-toml TEXT` (both entry points).
+
+Keybindings and the theme also honour bcode's shared sections: `[tui.keybindings.scopes."git.*"]`
+is the base that `keybindings` refines key by key, and each unset `theme` field falls back to
+`[tui.theme]`, so the git UI follows your bcode theme unless told otherwise.
+
+Problems are reported in the UI (and by `--print-config-paths`) with the file, profile and key
+that caused them, for example
+`~/.config/bcode-git/config.toml (profile laptop): layout.screen_mode: unknown variant ...`;
+affected settings use defaults.
+
+```sh
+bcode-git --print-config-paths      # both families: each file, read or missing; active profiles
+bcode-git --print-config            # effective settings as a dedicated file
+bcode-git --print-config --nested   # the same, as the bcode.toml section
+```
+
+A profile in a dedicated file:
 
 ```toml
-[plugins.config."bcode.git".ui]
+[composition]
+active_profile = "laptop"
+
+[composition.profiles.laptop.patch.layout]
+screen_mode = "half"
+```
+
+The examples below use the dedicated form; in `bcode.toml`, put each table under
+`plugins.config."bcode.git".ui`.
+
+```toml
 enabled = true                  # false hides `bcode git` (the standalone binary ignores it)
 diff_context = 3
 log_page_size = 300
@@ -123,25 +176,25 @@ show_graph = true
 relative_dates = true
 editor = "nvim"                 # default: $GIT_EDITOR, $VISUAL, $EDITOR, then vi
 
-[plugins.config."bcode.git".ui.files]
+[files]
 tree = true                     # false lists files flat; `` ` `` toggles for the session
 
-[plugins.config."bcode.git".ui.highlight]
+[highlight]
 enabled = true
 max_file_bytes = 1048576
 
-[plugins.config."bcode.git".ui.refresh]
+[refresh]
 watch = true                    # filesystem watching; falls back to polling
 poll_seconds = 10
 auto_fetch_seconds = 0          # 0 disables background fetch
 
-[plugins.config."bcode.git".ui.confirm]
+[confirm]
 discard = true
 force_push = true
 hard_reset = true
 delete = true
 
-[[plugins.config."bcode.git".ui.custom_commands]]
+[[custom_commands]]
 key = "ctrl+b"
 scope = "git.branches"
 command = "gh pr create --head {branch} --title {prompt.title}"
@@ -155,7 +208,7 @@ show_output = true
 ### Layout settings
 
 ```toml
-[plugins.config."bcode.git".ui.layout]
+[layout]
 screen_mode = "normal"          # normal | half | full at startup; `+`/`_` change it
 side_panel_width = 33           # percent of the width in normal mode (10–90)
 half_side_panel_width = 50      # percent of the width in half mode
@@ -176,7 +229,7 @@ portrait = "auto"               # stack side windows above the main view: auto |
 portrait_below_width = 84
 status_bar = true               # false hides key hints; progress and messages still show
 
-[plugins.config."bcode.git".ui.layout.command_log]
+[layout.command_log]
 show = false                    # `@` toggles it
 height = 8
 ```
@@ -188,11 +241,11 @@ wherever it lives. For example, one window on the left and the changes on the ri
 file list:
 
 ```toml
-[plugins.config."bcode.git".ui.layout]
+[layout]
 screen_mode = "half"
 initial_window = "files"
 
-[plugins.config."bcode.git".ui.files]
+[files]
 tree = false
 ```
 
@@ -230,7 +283,7 @@ Drafts follow the message:
 * Amending leaves drafts alone.
 
 ```toml
-[plugins.config."bcode.git".ui.commit]
+[commit]
 prefill = true
 sources = ["env", "bcode-draft", "lazygit-draft", "merge", "squash", "edit-msg", "template"]
 save_draft = true               # false: never write BCODE_GIT_COMMIT_MSG (still read it)
@@ -241,35 +294,42 @@ draft file and open the editor with `c`.
 
 ### Importing a lazygit configuration
 
-`bcode-git --import-lazygit [CONFIG_YML]` (or `bcode git --import-lazygit`) prints TOML converted
-from a lazygit `config.yml`. Without a path it uses `$LG_CONFIG_FILE` or lazygit's default
+`bcode-git --import-lazygit [CONFIG_YML]` (or `bcode git --import-lazygit`) prints settings
+converted from a lazygit `config.yml`, as a dedicated config file. Without a path it uses `$LG_CONFIG_FILE` or lazygit's default
 location. The output covers layout, file tree, diff context, graph, refresh settings and
 keybindings; values equal to bcode's defaults are left out, and anything without a bcode
 equivalent, or a key a panel binding would shadow, is listed in `# note:` comments. Review it and
-append it to `bcode.toml`:
+append it to a dedicated file, or add `--nested` for the `bcode.toml` form:
 
 ```sh
-bcode-git --import-lazygit >> ~/.config/bcode/bcode.toml
+bcode-git --import-lazygit >> ~/.config/bcode-git/config.toml
+bcode-git --import-lazygit --nested >> ~/.config/bcode/bcode.toml
 ```
 
 Custom command placeholders are `{file}`, `{branch}`, `{commit}`, `{remote}`, `{tag}`, `{stash}`,
 `{current_branch}`, `{repo}` and `{prompt.<name>}`. Values are shell-quoted.
 
-Themes come from `[tui.theme]` (default `bcode-dark`). Besides the standard roles the UI reads
+Themes come from `[theme]` (`name`, `overlays`, `paths`), falling back to bcode's `[tui.theme]`
+(default `bcode-dark`). Besides the standard roles the UI reads
 optional `git.*` roles; see [TUI themes](tui-themes.md#git-client-roles).
 
 ## Keybindings
 
-Every action is registered in the shared keymap registry. Override or unbind keys per scope:
+Every action is registered in the shared keymap registry. Override or unbind keys per scope in
+the git UI schema (a dedicated file shown; `[plugins.config."bcode.git".ui.keybindings."git.files"]`
+in `bcode.toml`):
 
 ```toml
-[tui.keybindings.scopes."git.files"]
+[keybindings."git.files"]
 "x" = "bcode.git.files.toggle-staged"
-"space" = ""                    # unbind
+"space" = ""                    # unbind ("none" and "unbind" work too)
 
-[tui.keybindings.scopes."git.global"]
+[keybindings."git.global"]
 "g s" = "bcode.git.global.focus-status"   # key sequences are space-separated strokes
 ```
+
+bcode's shared `[tui.keybindings.scopes."git.*"]` tables in `bcode.toml` work as well; the git
+UI schema's `keybindings` are applied over them.
 
 A key is resolved in the focused view's scope first, then `git.list` (list navigation), then
 `git.global`. The main view uses `git.main` (or `git.staging` while staging) before `git.global`.

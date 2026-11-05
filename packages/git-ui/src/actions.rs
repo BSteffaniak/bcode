@@ -281,12 +281,26 @@ impl App {
             Action::CopyToClipboard => self.copy_menu(),
 
             Action::StatusOpenConfig => {
-                // The most specific existing file, else the user file.
-                let path = crate::config::config_files(self.repo.root())
-                    .into_iter()
+                // The most specific existing file (the dedicated family outranks bcode.toml);
+                // with none, the dedicated user file, ready to be created.
+                let paths = crate::config::config_files(
+                    self.repo.root(),
+                    &crate::config::ConfigOptions::default(),
+                );
+                let path = paths
+                    .git
+                    .iter()
                     .rev()
-                    .find(|path| path.exists())
-                    .unwrap_or_else(|| crate::config::default_config_dir().join("bcode.toml"));
+                    .chain(paths.bcode.iter().rev())
+                    .find(|path| path.is_file())
+                    .cloned()
+                    .unwrap_or_else(|| {
+                        let path = crate::config::user_git_config_file();
+                        if let Some(parent) = path.parent() {
+                            let _ = std::fs::create_dir_all(parent);
+                        }
+                        path
+                    });
                 self.launch(External {
                     command: format!("{} {}", editor(self), quote(&path.to_string_lossy())),
                     cwd: self.repo.root().to_owned(),

@@ -14,7 +14,8 @@ use crate::keymap::{Action, Keymap, Scope};
 /// Result of a conversion.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Import {
-    /// TOML ready to merge into `bcode.toml`, with notes as leading comments.
+    /// TOML for a dedicated config file (or, nested, for `bcode.toml`), with notes as leading
+    /// comments.
     pub toml: String,
     /// Settings or bindings that could not be converted faithfully.
     pub notes: Vec<String>,
@@ -57,7 +58,7 @@ pub fn config_paths() -> Vec<PathBuf> {
 ///
 /// # Errors
 /// * No configuration file was found, or it cannot be read or parsed.
-pub fn import_file(path: Option<PathBuf>) -> Result<(PathBuf, Import), String> {
+pub fn import_file(path: Option<PathBuf>, nested: bool) -> Result<(PathBuf, Import), String> {
     let path = match path {
         Some(path) => path,
         None => config_paths()
@@ -67,7 +68,7 @@ pub fn import_file(path: Option<PathBuf>) -> Result<(PathBuf, Import), String> {
     };
     let yaml =
         std::fs::read_to_string(&path).map_err(|error| format!("{}: {error}", path.display()))?;
-    let import = import(&yaml).map_err(|error| format!("{}: {error}", path.display()))?;
+    let import = import(&yaml, nested).map_err(|error| format!("{}: {error}", path.display()))?;
     Ok((path, import))
 }
 
@@ -126,11 +127,12 @@ enum Keys {
     Other(serde::de::IgnoredAny),
 }
 
-/// Convert lazygit YAML into bcode TOML.
+/// Convert lazygit YAML into git UI settings: a dedicated `bcode-git` config file, or with
+/// `nested` the same settings under their `bcode.toml` section.
 ///
 /// # Errors
 /// * The YAML cannot be parsed into lazygit's configuration shape.
-pub fn import(yaml: &str) -> Result<Import, String> {
+pub fn import(yaml: &str, nested: bool) -> Result<Import, String> {
     let config: Lazygit = if yaml.trim().is_empty() {
         Lazygit::default()
     } else {
@@ -160,21 +162,9 @@ pub fn import(yaml: &str) -> Result<Import, String> {
     }
     prune_defaults(&mut ui, &[]);
     let scopes = convert_keys(&config.keybinding, &mut notes);
-
-    let mut root = toml::Table::new();
-    if !ui.is_empty() {
-        let mut git = toml::Table::new();
-        git.insert("ui".into(), ui.into());
-        let mut config = toml::Table::new();
-        config.insert("bcode.git".into(), git.into());
-        let mut plugins = toml::Table::new();
-        plugins.insert("config".into(), config.into());
-        root.insert("plugins".into(), plugins.into());
-    }
     if !scopes.is_empty() {
-        let mut keybindings = toml::Table::new();
-        keybindings.insert(
-            "scopes".into(),
+        ui.insert(
+            "keybindings".into(),
             toml::Value::Table(
                 scopes
                     .into_iter()
@@ -192,9 +182,15 @@ pub fn import(yaml: &str) -> Result<Import, String> {
                     .collect(),
             ),
         );
-        let mut tui = toml::Table::new();
-        tui.insert("keybindings".into(), keybindings.into());
-        root.insert("tui".into(), tui.into());
+    }
+    // The dedicated file's root is the git UI schema; `bcode.toml` nests the same table.
+    let mut root = ui;
+    if nested {
+        for key in crate::config::BCODE_SECTION.iter().rev() {
+            let mut parent = toml::Table::new();
+            parent.insert((*key).to_owned(), toml::Value::Table(root));
+            root = parent;
+        }
     }
     let body = toml::to_string(&root).map_err(|error| error.to_string())?;
     let mut text = String::from("# Converted from lazygit configuration by bcode-git.\n");
@@ -725,8 +721,13 @@ fn report_shadowing(scopes: &BTreeMap<String, BTreeMap<String, String>>, notes: 
 mod tests {
     use super::*;
 
+    /// Read converted output the way a dedicated config file is read.
+    fn loaded(import: &Import) -> crate::config::LoadedConfig {
+        crate::config::from_tables(&toml::Table::new(), Some(&import.toml.parse().unwrap()))
+    }
+
     fn bindings(import: &Import) -> BTreeMap<String, BTreeMap<String, String>> {
-        crate::config::from_table(&import.toml.parse().unwrap()).keybindings
+        loaded(import).keybindings
     }
 
     #[test]
@@ -734,9 +735,10 @@ mod tests {
         let import = import(
             "gui:\n  sidePanelWidth: 0.3333\n  screenMode: half\n  showFileTree: false\n  \
              mainPanelSplitMode: horizontal\n  showBottomLine: true\ngit:\n  diffContextSize: 5\n",
+            false,
         )
         .unwrap();
-        let loaded = crate::config::from_table(&import.toml.parse().unwrap());
+        let loaded = loaded(&import);
         assert!(loaded.diagnostics.is_empty(), "{:?}", loaded.diagnostics);
         assert_eq!(loaded.ui.layout.side_panel_width, 33);
         assert_eq!(
@@ -758,6 +760,7 @@ mod tests {
              prevItem-alt: n\n    nextItem-alt: t\n    quit: q\n    quit-alt1: <c-c>\n    \
              new: N\n    optionMenu: <disabled>\n    optionMenu-alt1: '?'\n  \
              commits:\n    moveDownCommit: <c-j>\n    pickCommit: p\n",
+            false,
         )
         .unwrap();
         let scopes = bindings(&import);
@@ -806,12 +809,23 @@ mod tests {
 
     #[test]
     fn empty_input_yields_only_a_header() {
-        let import = import("").unwrap();
+        let import = import("", false).unwrap();
         assert_eq!(import.notes, Vec::<String>::new());
-        assert!(
-            crate::config::from_table(&import.toml.parse().unwrap())
-                .keybindings
-                .is_empty()
+        assert!(loaded(&import).keybindings.is_empty());
+    }
+
+    #[test]
+    fn nested_output_is_the_same_settings_under_the_bcode_section() {
+        let yaml = "gui:\n  screenMode: half\n  showFileTree: false\n\
+                    keybinding:\n  universal:\n    prevItem-alt: n\n";
+        let flat = loaded(&import(yaml, false).unwrap());
+        let nested = crate::config::from_table(&import(yaml, true).unwrap().toml.parse().unwrap());
+        assert_eq!(flat.ui, nested.ui);
+        assert_eq!(flat.keybindings, nested.keybindings);
+        assert_eq!(
+            nested.ui.layout.screen_mode,
+            crate::config::ScreenMode::Half
         );
+        assert_eq!(nested.keybindings["git.list"]["n"], "bcode.git.list.up");
     }
 }

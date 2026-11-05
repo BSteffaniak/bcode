@@ -17,24 +17,57 @@ struct Args {
     /// Run as if started in this directory.
     #[arg(short = 'C', long = "path", value_name = "DIR")]
     path: Option<PathBuf>,
-    /// Print the configuration files that would be read and exit.
+    /// Extra configuration file, layered above every other bcode-git file.
+    #[arg(long, value_name = "FILE")]
+    config: Option<PathBuf>,
+    /// Inline configuration TOML, the topmost layer.
+    #[arg(long, value_name = "TOML")]
+    config_toml: Option<String>,
+    /// Print which configuration files are read, in order, and exit.
     #[arg(long)]
     print_config_paths: bool,
-    /// Print bcode configuration converted from a lazygit config.yml (found automatically
-    /// when no path is given) and exit.
+    /// Print the effective configuration as a bcode-git config file and exit.
+    #[arg(long)]
+    print_config: bool,
+    /// Print settings converted from a lazygit config.yml (found automatically when no path
+    /// is given) and exit.
     #[arg(long, value_name = "CONFIG_YML")]
     #[allow(clippy::option_option)]
     import_lazygit: Option<Option<PathBuf>>,
+    /// With --print-config or --import-lazygit, emit the bcode.toml form instead.
+    #[arg(long)]
+    nested: bool,
 }
 
 #[tokio::main]
 async fn main() -> ExitCode {
     let args = Args::parse();
-    if let Some(source) = args.import_lazygit {
-        return match bcode_git_ui::lazygit::import_file(source) {
-            Ok((path, import)) => {
-                println!("# Source: {}", path.display());
-                print!("{}", import.toml);
+    let path = args
+        .path
+        .unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")));
+    let path = std::path::absolute(&path).unwrap_or(path);
+    let config_options = bcode_git_ui::config::ConfigOptions {
+        file: args.config,
+        toml: args.config_toml,
+    };
+    let command = if let Some(source) = args.import_lazygit {
+        Some(bcode_git_ui::config::ConfigCommand::ImportLazygit {
+            source,
+            nested: args.nested,
+        })
+    } else if args.print_config {
+        Some(bcode_git_ui::config::ConfigCommand::Print {
+            nested: args.nested,
+        })
+    } else if args.print_config_paths {
+        Some(bcode_git_ui::config::ConfigCommand::PrintPaths)
+    } else {
+        None
+    };
+    if let Some(command) = command {
+        return match bcode_git_ui::config::run_command(&path, &config_options, command) {
+            Ok(text) => {
+                print!("{text}");
                 ExitCode::SUCCESS
             }
             Err(error) => {
@@ -43,26 +76,7 @@ async fn main() -> ExitCode {
             }
         };
     }
-    let path = args
-        .path
-        .unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")));
-    let path = std::path::absolute(&path).unwrap_or(path);
-    if args.print_config_paths {
-        let loaded = bcode_git_ui::config::load(&path);
-        for file in bcode_git_ui::config::config_files(&path) {
-            let state = if loaded.files.contains(&file) {
-                "read"
-            } else {
-                "missing"
-            };
-            println!("{state}\t{}", file.display());
-        }
-        for diagnostic in &loaded.diagnostics {
-            eprintln!("bcode-git: {diagnostic}");
-        }
-        return ExitCode::SUCCESS;
-    }
-    let config = bcode_git_ui::config::load(&path);
+    let config = bcode_git_ui::config::load_with(&path, &config_options);
     let options = bcode_git_ui::RunOptions {
         path,
         config,
