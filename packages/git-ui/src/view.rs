@@ -825,7 +825,7 @@ pub const fn sections_axis(app: &App) -> PanelGroupAxis {
     }
 }
 
-/// Position and filter after a side window's name or tabs.
+/// Position, filter and trailing padding after a side window's name or tabs.
 fn title_suffix(app: &App, view: View) -> Vec<Span> {
     let theme = &app.theme;
     let mut spans = Vec::new();
@@ -839,8 +839,7 @@ fn title_suffix(app: &App, view: View) -> Vec<Span> {
     if let Some(filter) = app.filters.get(&view).filter(|filter| !filter.is_empty()) {
         spans.push(Span::styled(format!(" /{filter}"), theme.warning));
     }
-    // No trailing padding: the title meets the border line on the right as it does on the
-    // left, whether or not a count follows.
+    spans.push(Span::raw(" "));
     spans
 }
 

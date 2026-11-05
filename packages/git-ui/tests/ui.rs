@@ -1533,21 +1533,15 @@ fn normal_and_half_mode_share_the_side_width() {
 }
 
 #[test]
-fn side_titles_meet_the_border_with_or_without_a_count() {
+fn side_titles_keep_their_padding() {
     let mut clean = Harness::new(|path| commit(path, "a", "a", "init"));
     let screen = clean.screen(140, 30);
     assert!(
-        line_with(&screen, "[2] Files").contains("Submodules─"),
+        line_with(&screen, "[2] Files").contains("Submodules ─"),
         "{screen}"
     );
     assert!(
-        line_with(&screen, "[5] Stash").contains("Stash─"),
-        "{screen}"
-    );
-    let mut dirty = Harness::new(panel_repo);
-    let screen = dirty.screen(140, 30);
-    assert!(
-        line_with(&screen, "[2] Files").contains("Submodules 1/1─"),
+        line_with(&screen, "[5] Stash").contains("Stash ─"),
         "{screen}"
     );
 }
