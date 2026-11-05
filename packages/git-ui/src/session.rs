@@ -58,6 +58,8 @@ pub struct Session {
     pub undo: Vec<SavedJournal>,
     /// Redo history, oldest first.
     pub redo: Vec<SavedJournal>,
+    /// Shell commands run from the `:` prompt, oldest first.
+    pub shell_history: Vec<String>,
 }
 
 /// Commits of a ref in a side window.

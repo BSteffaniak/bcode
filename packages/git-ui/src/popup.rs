@@ -347,6 +347,82 @@ pub fn split_message(text: &str) -> (&str, &str) {
     )
 }
 
+/// Previously submitted inputs, browsed with up and down like a shell's history.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct InputRecall {
+    entries: Vec<String>,
+    /// Entry being shown while browsing (index into `entries`).
+    index: Option<usize>,
+    /// What was typed before browsing started, restored when browsing past the newest entry.
+    draft: Option<String>,
+}
+
+impl InputRecall {
+    /// Most entries kept.
+    pub const CAPACITY: usize = 200;
+
+    /// History holding `entries`, oldest first.
+    #[must_use]
+    pub fn from_entries(entries: Vec<String>) -> Self {
+        let mut recall = Self::default();
+        for entry in entries {
+            recall.push(&entry);
+        }
+        recall
+    }
+
+    /// Entries, oldest first.
+    #[must_use]
+    pub fn entries(&self) -> &[String] {
+        &self.entries
+    }
+
+    /// Record a submitted input (blank or repeated inputs are not added) and stop browsing.
+    pub fn push(&mut self, text: &str) {
+        self.reset();
+        let text = text.trim_end();
+        if text.trim().is_empty() || self.entries.last().is_some_and(|last| last == text) {
+            return;
+        }
+        self.entries.push(text.to_owned());
+        if self.entries.len() > Self::CAPACITY {
+            self.entries.remove(0);
+        }
+    }
+
+    /// The entry before the one shown (or the newest, remembering `current` as the draft).
+    pub fn older(&mut self, current: &str) -> Option<&str> {
+        let index = match self.index {
+            Some(0) => return None,
+            Some(index) => index - 1,
+            None => {
+                let newest = self.entries.len().checked_sub(1)?;
+                self.draft = Some(current.to_owned());
+                newest
+            }
+        };
+        self.index = Some(index);
+        self.entries.get(index).map(String::as_str)
+    }
+
+    /// The entry after the one shown, or the draft after the newest. `None` when not browsing.
+    pub fn newer(&mut self) -> Option<String> {
+        let index = self.index?;
+        if index + 1 < self.entries.len() {
+            self.index = Some(index + 1);
+            return self.entries.get(index + 1).cloned();
+        }
+        self.index = None;
+        Some(self.draft.take().unwrap_or_default())
+    }
+
+    /// Stop browsing.
+    pub fn reset(&mut self) {
+        self.index = None;
+        self.draft = None;
+    }
+}
+
 /// Scrollable read-only text.
 #[derive(Debug)]
 pub struct TextView {
@@ -384,4 +460,35 @@ pub enum Popup {
     Prompt(Prompt),
     /// Read-only text.
     Text(TextView),
+}
+
+#[cfg(test)]
+mod recall_tests {
+    use super::InputRecall;
+
+    #[test]
+    fn browses_back_and_forth_and_restores_the_draft() {
+        let mut recall = InputRecall::from_entries(vec!["ls".into(), "git gc".into()]);
+        assert_eq!(recall.older("ech"), Some("git gc"));
+        assert_eq!(recall.older("git gc"), Some("ls"));
+        assert_eq!(recall.older("ls"), None);
+        assert_eq!(recall.newer().as_deref(), Some("git gc"));
+        assert_eq!(recall.newer().as_deref(), Some("ech"));
+        assert_eq!(recall.newer(), None);
+    }
+
+    #[test]
+    fn skips_blank_and_repeated_entries_and_stays_bounded() {
+        let mut recall = InputRecall::default();
+        recall.push("make");
+        recall.push("make");
+        recall.push("   ");
+        assert_eq!(recall.entries(), ["make"]);
+        for index in 0..InputRecall::CAPACITY + 5 {
+            recall.push(&index.to_string());
+        }
+        assert_eq!(recall.entries().len(), InputRecall::CAPACITY);
+        assert_eq!(recall.entries().last().map(String::as_str), Some("204"));
+        assert_eq!(InputRecall::default().older(""), None);
+    }
 }

@@ -128,6 +128,8 @@ this is configurable; see [Layout settings](#layout-settings).
   view and runs the chosen action, `ctrl+p` is a command palette over all actions, and a popup
   shows continuations while a key sequence (such as `g g`) is pending.
 * **Custom commands**: user-defined shell commands with prompts, placeholders and confirmation.
+* **Shell commands** (`:`): up and down recall earlier commands (down past the newest restores
+  what was being typed); the history is kept with the session for the directory.
 
 ## Configuration
 

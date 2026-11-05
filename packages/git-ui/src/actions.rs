@@ -271,7 +271,10 @@ impl App {
                 update
             }
             Action::DiffingMenu => self.diffing_menu(),
-            Action::ShellCommand => self.prompt("Shell command", "", PromptKind::Shell),
+            Action::ShellCommand => {
+                self.shell_history.reset();
+                self.prompt("Shell command", "", PromptKind::Shell)
+            }
             Action::CommandLog => {
                 self.command_log = !self.command_log;
                 Update::redraw()
@@ -2444,7 +2447,10 @@ pub fn submit_prompt(app: &mut App, prompt: Prompt) -> Update<Msg> {
             branch,
             create,
         }]),
-        PromptKind::Shell => app.run_ops_with_output(vec![Op::Shell(value)], true),
+        PromptKind::Shell => {
+            app.shell_history.push(&value);
+            app.run_ops_with_output(vec![Op::Shell(value)], true)
+        }
         PromptKind::RemoteCheckoutName(branch) => {
             let start = branch.full_name();
             app.run_ops(vec![

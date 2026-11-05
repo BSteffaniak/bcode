@@ -1566,3 +1566,31 @@ fn untitled_main_views_keep_an_unbroken_border() {
         "{screen}"
     );
 }
+
+#[test]
+fn shell_prompt_recalls_previous_commands_across_restarts() {
+    let mut harness = Harness::new(|path| commit(path, "a", "a", "init"));
+    // The input learns its width when drawn, as it is between keystrokes in the terminal.
+    let press = |harness: &mut Harness, key: &str| {
+        harness.screen(120, 30);
+        harness.keys(&[key]);
+        harness.screen(120, 30)
+    };
+    for command in ["echo first", "echo second"] {
+        harness.keys(&[":"]);
+        harness.paste(command);
+        harness.keys(&["enter", "escape"]);
+    }
+    harness.keys(&[":"]);
+    harness.paste("draft");
+    assert!(press(&mut harness, "up").contains("│ echo second"));
+    assert!(press(&mut harness, "up").contains("│ echo first"));
+    assert!(press(&mut harness, "down").contains("│ echo second"));
+    let screen = press(&mut harness, "down");
+    assert!(screen.contains("│ draft"), "{screen}");
+    harness.keys(&["escape"]);
+
+    harness.quit_and_relaunch(LoadedConfig::default());
+    harness.keys(&[":"]);
+    assert!(press(&mut harness, "up").contains("│ echo second"));
+}

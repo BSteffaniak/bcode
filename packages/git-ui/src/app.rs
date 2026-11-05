@@ -308,6 +308,8 @@ pub struct App {
 
     pub(crate) layout: Layout,
     pub(crate) panels: Panels,
+    /// Shell commands run from the `:` prompt.
+    pub(crate) shell_history: crate::popup::InputRecall,
     /// Main view position waiting for its content after a restore.
     pub(crate) pending_main: Option<SavedMain>,
     /// Drilled-in views waiting for repository data after a restore.
@@ -412,6 +414,7 @@ impl App {
             file_tree,
             layout,
             panels,
+            shell_history: crate::popup::InputRecall::default(),
             pending_main: None,
             pending_drill: None,
             clicks: ClickTracker::new(),
@@ -1296,7 +1299,9 @@ impl App {
                     Update::redraw()
                 }
                 _ => {
-                    let edited = prompt_input(&prompt, event) == TextInputOutcome::Edited;
+                    let outcome = prompt_input(&prompt, event);
+                    self.recall_input(&mut prompt, outcome);
+                    let edited = outcome == TextInputOutcome::Edited;
                     self.popups.push(Popup::Prompt(prompt));
                     if edited {
                         return self.apply_live_filter();
@@ -1368,6 +1373,21 @@ impl App {
         }
         prompt.title = title;
         Update::redraw()
+    }
+
+    /// Up on the first row and down on the last browse the history of prompts that keep one.
+    fn recall_input(&mut self, prompt: &mut Prompt, outcome: TextInputOutcome) {
+        if !matches!(prompt.kind, PromptKind::Shell) {
+            return;
+        }
+        let recalled = match outcome {
+            TextInputOutcome::EdgeUp => self.shell_history.older(&prompt.text()).map(str::to_owned),
+            TextInputOutcome::EdgeDown => self.shell_history.newer(),
+            _ => None,
+        };
+        if let Some(text) = recalled {
+            prompt.set_text(&text);
+        }
     }
 
     /// Apply the text of an open filter prompt to the focused view.
@@ -1601,6 +1621,7 @@ impl App {
             cherry: self.cherry.clone(),
             undo: journal(&self.undo),
             redo: journal(&self.redo),
+            shell_history: self.shell_history.entries().to_vec(),
         }
     }
 
@@ -1681,6 +1702,7 @@ impl App {
         };
         self.undo = journal(session.undo);
         self.redo = journal(session.redo);
+        self.shell_history = crate::popup::InputRecall::from_entries(session.shell_history);
     }
 
     /// Reload drilled-in views of a restored session once repository data is in.
