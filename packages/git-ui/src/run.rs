@@ -26,6 +26,20 @@ pub struct RunOptions {
     pub config: LoadedConfig,
     /// Host capabilities.
     pub host: Arc<dyn GitUiHost>,
+    /// Message for the first commit editor of the session; the binaries pass
+    /// `$BCODE_GIT_COMMIT_MSG` (see [`commit_message_from_env`]).
+    pub commit_message: Option<String>,
+}
+
+/// Environment variable holding a commit message to prefill.
+pub const COMMIT_MESSAGE_ENV: &str = "BCODE_GIT_COMMIT_MSG";
+
+/// The `BCODE_GIT_COMMIT_MSG` environment variable, when set and not blank.
+#[must_use]
+pub fn commit_message_from_env() -> Option<String> {
+    std::env::var(COMMIT_MESSAGE_ENV)
+        .ok()
+        .filter(|message| !message.trim().is_empty())
 }
 
 /// Failure starting or running the UI.
@@ -112,16 +126,11 @@ pub fn build_app(options: RunOptions) -> Result<App, RunError> {
     let (theme, theme_error) = GitTheme::load(&loaded.theme, &loaded.config_dir, repo.root());
     let mut diagnostics = loaded.diagnostics.clone();
     diagnostics.extend(theme_error);
-    let mut app = App::new(
-        repo,
-        loaded.ui,
-        keymap,
-        theme,
-        options.host,
-        diagnostics.clone(),
-    );
-    if let Some(first) = diagnostics.first() {
-        app.toast(first.clone(), true);
+    let mut app = App::new(repo, loaded.ui, keymap, theme, options.host, diagnostics);
+    app.env_message = options.commit_message;
+    // Includes problems found while resolving the layout and commit settings.
+    if let Some(first) = app.diagnostics.first().cloned() {
+        app.toast(first, true);
     }
     Ok(app)
 }

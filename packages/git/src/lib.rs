@@ -20,8 +20,8 @@ mod runner;
 
 pub use bcode_git_models as models;
 pub use repo::{
-    ApplyTarget, CommitOptions, ConflictSide, DiffTarget, LogQuery, PushOptions, Repository,
-    StashOptions,
+    ApplyTarget, BCODE_COMMIT_DRAFT, CommitOptions, ConflictSide, DiffTarget, LAZYGIT_COMMIT_DRAFT,
+    LogQuery, PushOptions, Repository, StashOptions,
 };
 pub use runner::{CommandLog, GitInvocation, GitOutput, GitRunner};
 

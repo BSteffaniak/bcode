@@ -5,7 +5,9 @@ use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use bcode_git::models::{ChangedFile, Commit, DiffLineId, RepoOperation, StatusEntry};
+use bcode_git::models::{
+    ChangedFile, Commit, CommitMessageSource, DiffLineId, RepoOperation, StatusEntry,
+};
 use bcode_git::{DiffTarget, LogQuery, Repository};
 use bmux_keyboard::KeyStroke;
 use bmux_tui::event::{Event, MouseButton, MouseEventKind};
@@ -295,6 +297,8 @@ pub struct App {
     pub(crate) file_tree: bool,
 
     pub(crate) layout: Layout,
+    pub(crate) commit_sources: Vec<CommitMessageSource>,
+    pub(crate) env_message: Option<String>,
     pub(crate) window: Window,
     pub(crate) last_side: Window,
     pub(crate) tabs: BTreeMap<Window, usize>,
@@ -365,8 +369,10 @@ impl App {
         };
         let file_tree = config.files.tree;
         let (layout, layout_diagnostics) = Layout::resolve(&config.layout);
+        let (commit_sources, commit_diagnostics) = config.commit.resolve_sources();
         let mut diagnostics = diagnostics;
         diagnostics.extend(layout_diagnostics);
+        diagnostics.extend(commit_diagnostics);
         let screen_mode = config.layout.screen_mode;
         let command_log = config.layout.command_log.show;
         let start = layout.start;
@@ -386,6 +392,8 @@ impl App {
             collapsed: BTreeSet::new(),
             file_tree,
             layout,
+            commit_sources,
+            env_message: None,
             window: Window::Side(0),
             last_side: Window::Side(0),
             tabs: BTreeMap::new(),
@@ -1204,7 +1212,14 @@ impl App {
                     self.popups.push(Popup::Prompt(prompt));
                     Update::redraw()
                 }
+                Some(Action::InputClear) if prompt.body.is_some() => {
+                    prompt.set_text("");
+                    prompt.body_focused = false;
+                    self.popups.push(Popup::Prompt(prompt));
+                    Update::redraw()
+                }
                 Some(Action::InputCancel) => {
+                    self.save_unsent_commit(&prompt);
                     if matches!(prompt.kind, PromptKind::Filter) {
                         let view = self.current_view();
                         self.filters.remove(&view);
@@ -1212,26 +1227,21 @@ impl App {
                     Update::redraw()
                 }
                 Some(Action::InputToggleAmend) => {
-                    if let PromptKind::Commit {
-                        amend,
-                        no_verify,
-                        stage_all,
-                    } = prompt.kind
-                    {
-                        prompt.kind = PromptKind::Commit {
-                            amend: !amend,
-                            no_verify,
-                            stage_all,
-                        };
-                        if !amend && prompt.text().trim().is_empty() {
-                            let message = self
-                                .snapshot
-                                .commits
-                                .first()
-                                .and_then(|commit| self.repo.commit_message(&commit.oid).ok())
-                                .unwrap_or_default();
-                            prompt.set_text(&message);
+                    let amending = match &mut prompt.kind {
+                        PromptKind::Commit { amend, .. } => {
+                            *amend = !*amend;
+                            Some(*amend)
                         }
+                        _ => None,
+                    };
+                    if amending == Some(true) && prompt.text().trim().is_empty() {
+                        let message = self
+                            .snapshot
+                            .commits
+                            .first()
+                            .and_then(|commit| self.repo.commit_message(&commit.oid).ok())
+                            .unwrap_or_default();
+                        prompt.set_text(&message);
                     }
                     self.popups.push(Popup::Prompt(prompt));
                     Update::redraw()

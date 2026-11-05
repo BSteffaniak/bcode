@@ -13,6 +13,7 @@ use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 use bcode_config_layers::ConfigLoadOverrides;
+use bcode_git::models::CommitMessageSource;
 use serde::Deserialize;
 
 /// Behavior and presentation settings.
@@ -29,6 +30,8 @@ pub struct GitUiConfig {
     pub layout: LayoutConfig,
     /// Files panel settings.
     pub files: FilesConfig,
+    /// Commit editor settings.
+    pub commit: CommitConfig,
     /// Maximum commits loaded per page.
     pub log_page_size: usize,
     /// Show the commit graph.
@@ -54,6 +57,7 @@ impl Default for GitUiConfig {
             diff_context: 3,
             layout: LayoutConfig::default(),
             files: FilesConfig::default(),
+            commit: CommitConfig::default(),
             log_page_size: 300,
             show_graph: true,
             highlight: HighlightConfig::default(),
@@ -212,6 +216,61 @@ pub struct FilesConfig {
 impl Default for FilesConfig {
     fn default() -> Self {
         Self { tree: true }
+    }
+}
+
+/// Commit editor settings (`[plugins.config."bcode.git".ui.commit]`).
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct CommitConfig {
+    /// Prefill the commit editor from the first source with text.
+    pub prefill: bool,
+    /// Prefill sources in precedence order; omitted sources are not read. Names: `env`,
+    /// `bcode-draft`, `lazygit-draft`, `merge`, `squash`, `edit-msg`, `template`.
+    pub sources: Vec<String>,
+    /// Keep an unsent message in `BCODE_GIT_COMMIT_MSG` in the git directory.
+    pub save_draft: bool,
+}
+
+impl Default for CommitConfig {
+    fn default() -> Self {
+        Self {
+            prefill: true,
+            sources: CommitMessageSource::ALL
+                .iter()
+                .map(|source| source.name().to_owned())
+                .collect(),
+            save_draft: true,
+        }
+    }
+}
+
+impl CommitConfig {
+    /// Prefill sources in order, with problems reported and the bad entries skipped.
+    #[must_use]
+    pub fn resolve_sources(&self) -> (Vec<CommitMessageSource>, Vec<String>) {
+        let mut sources = Vec::new();
+        let mut diagnostics = Vec::new();
+        if !self.prefill {
+            return (sources, diagnostics);
+        }
+        for name in &self.sources {
+            match CommitMessageSource::from_name(name) {
+                Some(source) if !sources.contains(&source) => sources.push(source),
+                Some(_) => diagnostics.push(format!(
+                    "commit.sources: \"{name}\" appears more than once; later uses are ignored"
+                )),
+                None => diagnostics.push(format!(
+                    "commit.sources: unknown source \"{name}\" (expected one of {})",
+                    CommitMessageSource::ALL
+                        .iter()
+                        .map(|source| source.name())
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                )),
+            }
+        }
+        (sources, diagnostics)
     }
 }
 

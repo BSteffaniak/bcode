@@ -83,7 +83,8 @@ this is configurable; see [Layout settings](#layout-settings).
   optional description, which together form one message (summary, blank line, description).
   `tab` switches fields, `enter` commits from the summary and adds a line in the description,
   `alt+enter` or `ctrl+s` commits from either, pasting a multi-line message splits it, the summary
-  shows a length guide, and `ctrl+a` toggles amend. Rewording uses the same editor.
+  shows a length guide, `ctrl+a` toggles amend and `ctrl+l` clears the message. Rewording uses the
+  same editor. The editor is prefilled; see [Commit message prefill](#commit-message-prefill).
 * **History**: squash, fixup, drop, edit, reword and reorder commits (`ctrl+j`/`ctrl+k`) through
   interactive rebase; create fixup commits and autosquash; amend staged changes into an older
   commit; revert; cherry-pick copy (`C`) and paste (`V`); soft/mixed/hard reset; tags; new branch
@@ -194,6 +195,43 @@ initial_window = "files"
 [plugins.config."bcode.git".ui.files]
 tree = false
 ```
+
+### Commit message prefill
+
+A new commit editor starts with the first message found in these sources:
+
+| Source (`sources` name) | Where | Notes |
+|---|---|---|
+| `env` | `$BCODE_GIT_COMMIT_MSG` environment variable | The message itself; used by the first commit editor of the session only. |
+| `bcode-draft` | `BCODE_GIT_COMMIT_MSG` in the git directory | bcode's draft; anything may write it. |
+| `lazygit-draft` | `LAZYGIT_PENDING_COMMIT` in the git directory | lazygit's unsent message; read, never written. |
+| `merge` | `MERGE_MSG` | Left by a merge, cherry-pick or revert that stopped. |
+| `squash` | `SQUASH_MSG` | Left by `git merge --squash`. |
+| `edit-msg` | `COMMIT_EDITMSG` | Only when it differs from `HEAD`'s message, that is, a commit that did not land. |
+| `template` | `commit.template` | Resolved like git (relative to the worktree, `~` expanded). |
+
+The git directory is per worktree, so each worktree has its own draft. Git-generated files and
+templates lose their comment lines; drafts keep lines starting with `#`, which are message
+content (messages are committed with `--cleanup=whitespace`). The editor title names the source
+and says when a draft replaces a `MERGE_MSG` or `SQUASH_MSG`.
+
+Drafts follow the message:
+
+* Cancelling an edited editor saves the text as the bcode draft; cancelling an emptied editor
+  removes it. Untouched text from git's own files is not copied into a draft.
+* Submitting saves the draft first, so a commit that fails (for example a rejecting hook) keeps it.
+  Once the commit lands, the bcode draft is removed, and so is lazygit's if its message was used.
+* Amending leaves drafts alone.
+
+```toml
+[plugins.config."bcode.git".ui.commit]
+prefill = true
+sources = ["env", "bcode-draft", "lazygit-draft", "merge", "squash", "edit-msg", "template"]
+save_draft = true               # false: never write BCODE_GIT_COMMIT_MSG (still read it)
+```
+
+For example, `BCODE_GIT_COMMIT_MSG="$(generate-message)" bcode-git`, or have a tool write the
+draft file and open the editor with `c`.
 
 ### Importing a lazygit configuration
 
@@ -501,6 +539,7 @@ currently use `StandaloneHost`, which contributes nothing.
 | `bcode.git.input.cancel` | Cancel | `escape` |
 | `bcode.git.input.toggle-amend` | Toggle amend (commit editor) | `ctrl+a` |
 | `bcode.git.input.switch-field` | Switch summary / description (commit editor) | `tab`, `shift+tab` |
+| `bcode.git.input.clear` | Clear the message (commit editor) | `ctrl+l` |
 | `bcode.git.input.submit-any-field` | Submit from any field (commit editor) | `alt+enter`, `ctrl+s` |
 
 ### `git.confirm`

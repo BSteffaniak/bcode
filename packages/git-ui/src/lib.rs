@@ -25,4 +25,7 @@ mod run;
 pub mod theme;
 mod view;
 
-pub use run::{RunError, RunOptions, build_app, find_repo_root, render_text, run};
+pub use run::{
+    COMMIT_MESSAGE_ENV, RunError, RunOptions, build_app, commit_message_from_env, find_repo_root,
+    render_text, run,
+};

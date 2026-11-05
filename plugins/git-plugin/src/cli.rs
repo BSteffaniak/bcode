@@ -52,6 +52,7 @@ fn invoke(matches: clap::ArgMatches) -> StaticCliFuture {
             path,
             config,
             host: Arc::new(bcode_git_ui::host::StandaloneHost),
+            commit_message: bcode_git_ui::commit_message_from_env(),
         })
         .await
         .map_err(|error| error.to_string())?;

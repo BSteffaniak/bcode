@@ -67,6 +67,7 @@ async fn main() -> ExitCode {
         path,
         config,
         host: Arc::new(bcode_git_ui::host::StandaloneHost),
+        commit_message: bcode_git_ui::commit_message_from_env(),
     };
     match bcode_git_ui::run(options).await {
         Ok(()) => ExitCode::SUCCESS,

@@ -3,7 +3,8 @@
 use std::collections::BTreeSet;
 
 use bcode_git::models::{
-    Commit, DiffLineKind, HeadState, RebaseAction, RebaseTodoItem, RepoOperation, ResetMode,
+    Commit, CommitMessageSource, DiffLineKind, HeadState, RebaseAction, RebaseTodoItem,
+    RepoOperation, ResetMode,
 };
 use bcode_git::{ApplyTarget, CommitOptions, ConflictSide, DiffTarget, PushOptions, StashOptions};
 use bmux_keyboard::KeyStroke;
@@ -15,7 +16,7 @@ use bmux_tui_runtime::Update;
 use crate::app::{App, Msg, Row, ScreenMode, Staging, UpdateExt, View, Window};
 use crate::data::{FileNode, SectionKind};
 use crate::keymap::{Action, Scope, display_key};
-use crate::ops::Op;
+use crate::ops::{DraftCleanup, Op};
 use crate::popup::{External, Menu, MenuItem, Popup, Prompt, PromptKind, TextView, Then};
 
 /// Action run by Enter (or a repeated click) in a view.
@@ -316,19 +317,39 @@ impl App {
                 let stage_all = !entries
                     .iter()
                     .any(bcode_git::models::StatusEntry::has_staged);
+                let state = if entries.is_empty() {
+                    Some("no changes yet")
+                } else if stage_all {
+                    Some("nothing staged: commits all changes")
+                } else {
+                    None
+                };
+                let (prefill, replaced) = self.commit_prefill();
+                let mut notes: Vec<String> = Vec::new();
+                if let Some((source, _)) = &prefill {
+                    notes.push(format!("from {}", source.label()));
+                }
+                if let Some(replaced) = replaced {
+                    notes.push(format!("replaces {}", replaced.label()));
+                }
+                notes.extend(state.map(str::to_owned));
+                let title = if notes.is_empty() {
+                    "Commit message".to_owned()
+                } else {
+                    format!("Commit message ({})", notes.join("; "))
+                };
+                let initial = prefill
+                    .as_ref()
+                    .map(|(_, text)| text.clone())
+                    .unwrap_or_default();
                 self.prompt(
-                    if entries.is_empty() {
-                        "Commit message (no changes yet)"
-                    } else if stage_all {
-                        "Commit message (nothing staged: commits all changes)"
-                    } else {
-                        "Commit message"
-                    },
-                    "",
+                    title,
+                    &initial,
                     PromptKind::Commit {
                         amend: false,
                         no_verify: action == Action::FileCommitNoVerify,
                         stage_all,
+                        prefill,
                     },
                 )
             }
@@ -336,12 +357,15 @@ impl App {
                 true,
                 "Amend last commit",
                 "Add the staged changes to the last commit, keeping its message?".into(),
-                Then::op(Op::Commit(CommitOptions {
-                    amend: true,
-                    no_edit: true,
-                    allow_empty: true,
-                    ..CommitOptions::default()
-                })),
+                Then::op(Op::Commit(
+                    CommitOptions {
+                        amend: true,
+                        no_edit: true,
+                        allow_empty: true,
+                        ..CommitOptions::default()
+                    },
+                    DraftCleanup::default(),
+                )),
             ),
             Action::FileCommitEditor => self.launch(External {
                 command: "git commit".into(),
@@ -994,6 +1018,7 @@ impl App {
             | Action::InputToggleAmend
             | Action::InputSwitchField
             | Action::InputSubmitFromAnyField
+            | Action::InputClear
             | Action::ConfirmYes
             | Action::ConfirmNo => Update::none(),
         };
@@ -1005,6 +1030,78 @@ impl App {
 
     fn page(&self) -> isize {
         isize::try_from(self.size.get().1 / 3).unwrap_or(10).max(1)
+    }
+
+    /// Text for a new commit editor: the first configured source with a message, and the
+    /// git-generated message a draft hides, if any. The environment message is used once.
+    fn commit_prefill(
+        &mut self,
+    ) -> (
+        Option<(CommitMessageSource, String)>,
+        Option<CommitMessageSource>,
+    ) {
+        let mut chosen = None;
+        for source in self.commit_sources.clone() {
+            let text = if source == CommitMessageSource::Env {
+                self.env_message.take()
+            } else {
+                match self.repo.commit_message_from(source) {
+                    Ok(text) => text,
+                    Err(error) => {
+                        self.toast(format!("{}: {}", source.label(), error.message()), true);
+                        None
+                    }
+                }
+            };
+            if let Some(text) = text {
+                chosen = Some((source, text));
+                break;
+            }
+        }
+        // Say when a draft takes the place of a merge or squash message git prepared.
+        let replaced = chosen
+            .as_ref()
+            .filter(|(source, _)| source.is_draft())
+            .and_then(|_| {
+                [CommitMessageSource::Merge, CommitMessageSource::Squash]
+                    .into_iter()
+                    .filter(|source| self.commit_sources.contains(source))
+                    .find(|source| {
+                        self.repo
+                            .commit_message_from(*source)
+                            .is_ok_and(|text| text.is_some())
+                    })
+            });
+        (chosen, replaced)
+    }
+
+    /// Keep an unsent commit message as the draft (or drop the draft when cleared). Untouched
+    /// text prefilled from git's own files is not copied into a draft.
+    pub(crate) fn save_unsent_commit(&mut self, prompt: &Prompt) {
+        let PromptKind::Commit {
+            amend: false,
+            prefill,
+            ..
+        } = &prompt.kind
+        else {
+            return;
+        };
+        if !self.config.commit.save_draft {
+            return;
+        }
+        let text = prompt.text();
+        let untouched = prefill.as_ref().is_some_and(|(source, original)| {
+            *original == text && *source != CommitMessageSource::Env
+        });
+        if untouched {
+            return;
+        }
+        if let Err(error) = self.repo.save_commit_draft(&text) {
+            self.toast(
+                format!("Could not save the draft: {}", error.message()),
+                true,
+            );
+        }
     }
 
     fn focus_named(&mut self, view: View) -> Update<Msg> {
@@ -2116,6 +2213,7 @@ pub fn submit_prompt(app: &mut App, prompt: Prompt) -> Update<Msg> {
             amend,
             no_verify,
             stage_all,
+            prefill,
         } => {
             if prompt.summary().trim().is_empty() {
                 return summary_required(app, prompt);
@@ -2131,13 +2229,35 @@ pub fn submit_prompt(app: &mut App, prompt: Prompt) -> Update<Msg> {
                 && !entries
                     .iter()
                     .any(bcode_git::models::StatusEntry::has_staged);
-            let commit = Op::Commit(CommitOptions {
-                message: text,
-                amend,
-                no_verify,
-                allow_empty: amend,
-                no_edit: false,
-            });
+            // Amending rewrites HEAD's own message and leaves drafts alone. Otherwise the message
+            // is saved first, so a commit that fails (a rejecting hook, say) keeps it as the
+            // draft, and the commit removes the drafts it consumed only once it lands.
+            let save_draft = app.config.commit.save_draft;
+            let drafts = if amend {
+                DraftCleanup::default()
+            } else {
+                if save_draft && let Err(error) = app.repo.save_commit_draft(&text) {
+                    app.toast(
+                        format!("Could not save the draft: {}", error.message()),
+                        true,
+                    );
+                }
+                let source = prefill.as_ref().map(|(source, _)| *source);
+                DraftCleanup {
+                    bcode: save_draft || source == Some(CommitMessageSource::BcodeDraft),
+                    lazygit: source == Some(CommitMessageSource::LazygitDraft),
+                }
+            };
+            let commit = Op::Commit(
+                CommitOptions {
+                    message: text,
+                    amend,
+                    no_verify,
+                    allow_empty: amend,
+                    no_edit: false,
+                },
+                drafts,
+            );
             app.run_ops(if stage_all {
                 vec![Op::StageAll, commit]
             } else {

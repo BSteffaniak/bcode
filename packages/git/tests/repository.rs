@@ -5,8 +5,8 @@ use std::path::Path;
 use std::process::Command;
 
 use bcode_git::models::{
-    DiffLineId, DiffLineKind, HeadState, RebaseAction, RebaseTodoItem, RepoOperation, ResetMode,
-    StatusEntryKind,
+    CommitMessageSource, DiffLineId, DiffLineKind, HeadState, RebaseAction, RebaseTodoItem,
+    RepoOperation, ResetMode, StatusEntryKind,
 };
 use bcode_git::{
     CommandLog, CommitOptions, ConflictSide, DiffTarget, LogQuery, Repository, StashOptions,
@@ -475,4 +475,128 @@ fn lists_changed_files_and_amends_into_older_commit() {
         b"1\nfixed\n"
     );
     assert!(repo.repo.unpushed().unwrap().is_empty());
+}
+
+fn message(repo: &TempRepo, source: CommitMessageSource) -> Option<String> {
+    repo.repo.commit_message_from(source).unwrap()
+}
+
+#[test]
+fn commit_message_sources_and_drafts() {
+    let repo = TempRepo::init();
+    let git_dir = repo.path().join(".git");
+    repo.write("a", b"a\n");
+    repo.commit_all("first");
+
+    // A successful commit leaves COMMIT_EDITMSG behind; it must not be offered again.
+    std::fs::write(git_dir.join("COMMIT_EDITMSG"), "first\n# Please enter...\n").unwrap();
+    assert_eq!(message(&repo, CommitMessageSource::EditMsg), None);
+    // A rejected commit's message differs from HEAD's and is offered without comments.
+    std::fs::write(
+        git_dir.join("COMMIT_EDITMSG"),
+        "attempt\n\n# comment\nbody\n",
+    )
+    .unwrap();
+    assert_eq!(
+        message(&repo, CommitMessageSource::EditMsg).as_deref(),
+        Some("attempt\n\nbody")
+    );
+
+    // Templates resolve relative to the worktree and lose comment lines.
+    repo.write("template.txt", b"feat: \n# describe the change\n");
+    git(repo.path(), &["config", "commit.template", "template.txt"]);
+    assert_eq!(
+        message(&repo, CommitMessageSource::Template).as_deref(),
+        Some("feat:")
+    );
+
+    // Drafts keep `#` lines, which are message content.
+    std::fs::write(git_dir.join("LAZYGIT_PENDING_COMMIT"), "#42 fix\n").unwrap();
+    assert_eq!(
+        message(&repo, CommitMessageSource::LazygitDraft).as_deref(),
+        Some("#42 fix")
+    );
+    repo.repo.save_commit_draft("Mine\n\nDetails").unwrap();
+    assert_eq!(
+        message(&repo, CommitMessageSource::BcodeDraft).as_deref(),
+        Some("Mine\n\nDetails")
+    );
+    repo.repo.save_commit_draft("  ").unwrap();
+    assert_eq!(message(&repo, CommitMessageSource::BcodeDraft), None);
+
+    repo.repo.save_commit_draft("again").unwrap();
+    repo.repo.clear_commit_drafts(true, false).unwrap();
+    assert_eq!(message(&repo, CommitMessageSource::BcodeDraft), None);
+    assert!(message(&repo, CommitMessageSource::LazygitDraft).is_some());
+    repo.repo.clear_commit_drafts(false, true).unwrap();
+    assert_eq!(message(&repo, CommitMessageSource::LazygitDraft), None);
+    assert_eq!(message(&repo, CommitMessageSource::Env), None);
+}
+
+#[test]
+fn conflicted_cherry_pick_offers_merge_msg() {
+    let repo = TempRepo::init();
+    repo.write("f", b"base\n");
+    repo.commit_all("base");
+    git(repo.path(), &["checkout", "--quiet", "-b", "other"]);
+    repo.write("f", b"other\n");
+    repo.commit_all("Other change");
+    git(repo.path(), &["checkout", "--quiet", "main"]);
+    repo.write("f", b"main\n");
+    repo.commit_all("Main change");
+    let failed = Command::new("git")
+        .args(["cherry-pick", "other"])
+        .current_dir(repo.path())
+        .output()
+        .unwrap();
+    assert!(!failed.status.success());
+    let text = message(&repo, CommitMessageSource::Merge).unwrap();
+    assert!(text.starts_with("Other change"), "{text}");
+    assert!(!text.contains('#'), "{text}");
+}
+
+#[test]
+fn commit_messages_keep_lines_starting_with_hash() {
+    let repo = TempRepo::init();
+    repo.write("a", b"a\n");
+    git(repo.path(), &["add", "a"]);
+    repo.repo
+        .commit(&CommitOptions {
+            message: "#12 fix the thing\n\n# not a comment".into(),
+            ..CommitOptions::default()
+        })
+        .unwrap();
+    assert_eq!(
+        git(repo.path(), &["log", "-1", "--format=%B"]),
+        "#12 fix the thing\n\n# not a comment\n\n"
+    );
+}
+
+#[test]
+fn worktrees_keep_their_own_draft() {
+    let repo = TempRepo::init();
+    repo.write("a", b"a\n");
+    repo.commit_all("first");
+    let other = repo.path().join("wt");
+    git(
+        repo.path(),
+        &[
+            "worktree",
+            "add",
+            "--quiet",
+            "-b",
+            "side",
+            other.to_str().unwrap(),
+        ],
+    );
+    let linked = Repository::discover(&other, CommandLog::default()).unwrap();
+    linked.save_commit_draft("linked draft").unwrap();
+    assert_eq!(message(&repo, CommitMessageSource::BcodeDraft), None);
+    assert_eq!(
+        linked
+            .commit_message_from(CommitMessageSource::BcodeDraft)
+            .unwrap()
+            .as_deref(),
+        Some("linked draft")
+    );
 }

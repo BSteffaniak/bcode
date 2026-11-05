@@ -5,9 +5,9 @@ use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 
 use bcode_git_models::{
-    Branch, ChangedFile, Commit, DiffFile, DiffLineId, GitCommandRecord, HeadState, RebaseTodoItem,
-    ReflogEntry, Remote, RemoteBranch, RepoOperation, RepoPaths, ResetMode, StashEntry,
-    StatusSnapshot, Submodule, Tag, Worktree,
+    Branch, ChangedFile, Commit, CommitMessageSource, DiffFile, DiffLineId, GitCommandRecord,
+    HeadState, RebaseTodoItem, ReflogEntry, Remote, RemoteBranch, RepoOperation, RepoPaths,
+    ResetMode, StashEntry, StatusSnapshot, Submodule, Tag, Worktree,
 };
 
 use crate::diff::parse_unified_diff;
@@ -903,10 +903,108 @@ impl Repository {
             args.push("--no-edit");
             GitInvocation::write(args)
         } else {
-            args.extend(["--cleanup=strip", "--file=-"]);
+            // The message is final text: lines starting with `#` are content, not comments.
+            args.extend(["--cleanup=whitespace", "--file=-"]);
             GitInvocation::write(args).stdin(options.message.as_bytes())
         };
         self.runner.run(&invocation).map(drop)
+    }
+
+    /// Prefill text from a file-backed commit message source, or `None` when it is absent or
+    /// blank. [`CommitMessageSource::Env`] belongs to the caller and always yields `None`.
+    ///
+    /// Drafts keep `#` lines (they are content); git-generated files and templates have
+    /// comment lines stripped as `git commit` would.
+    ///
+    /// # Errors
+    /// * [`GitError`] when git fails or a file cannot be read.
+    pub fn commit_message_from(
+        &self,
+        source: CommitMessageSource,
+    ) -> Result<Option<String>, GitError> {
+        let git_dir = &self.paths.git_dir;
+        let path = match source {
+            CommitMessageSource::Env => return Ok(None),
+            CommitMessageSource::BcodeDraft => git_dir.join(BCODE_COMMIT_DRAFT),
+            CommitMessageSource::LazygitDraft => git_dir.join(LAZYGIT_COMMIT_DRAFT),
+            CommitMessageSource::Merge => git_dir.join("MERGE_MSG"),
+            CommitMessageSource::Squash => git_dir.join("SQUASH_MSG"),
+            CommitMessageSource::EditMsg => git_dir.join("COMMIT_EDITMSG"),
+            CommitMessageSource::Template => {
+                let Some(template) = self.config_path("commit.template")? else {
+                    return Ok(None);
+                };
+                self.paths.root.join(template)
+            }
+        };
+        let Some(raw) = read_message_file(&path)? else {
+            return Ok(None);
+        };
+        let text = self.clean_message(&raw, !source.is_draft())?;
+        if text.is_empty() {
+            return Ok(None);
+        }
+        if source == CommitMessageSource::EditMsg && self.has_head() {
+            // After a successful commit the file still holds that commit's message.
+            let head = self.clean_message(&self.commit_message("HEAD")?, true)?;
+            if head == text {
+                return Ok(None);
+            }
+        }
+        Ok(Some(text))
+    }
+
+    /// Store an unsent commit message as bcode's draft; blank text removes the draft.
+    ///
+    /// # Errors
+    /// * [`GitError`] when the file cannot be written.
+    pub fn save_commit_draft(&self, message: &str) -> Result<(), GitError> {
+        let path = self.paths.git_dir.join(BCODE_COMMIT_DRAFT);
+        if message.trim().is_empty() {
+            return remove_if_present(&path);
+        }
+        // Write then rename, so readers never see a partial file.
+        let partial = self
+            .paths
+            .git_dir
+            .join(format!("{BCODE_COMMIT_DRAFT}.partial"));
+        std::fs::write(&partial, message)?;
+        std::fs::rename(&partial, &path)?;
+        Ok(())
+    }
+
+    /// Remove bcode's draft and, when its message was used, lazygit's.
+    ///
+    /// # Errors
+    /// * [`GitError`] when a file exists but cannot be removed.
+    pub fn clear_commit_drafts(&self, bcode: bool, lazygit: bool) -> Result<(), GitError> {
+        if bcode {
+            remove_if_present(&self.paths.git_dir.join(BCODE_COMMIT_DRAFT))?;
+        }
+        if lazygit {
+            remove_if_present(&self.paths.git_dir.join(LAZYGIT_COMMIT_DRAFT))?;
+        }
+        Ok(())
+    }
+
+    fn clean_message(&self, raw: &str, strip_comments: bool) -> Result<String, GitError> {
+        let args: &[&str] = if strip_comments {
+            &["stripspace", "--strip-comments"]
+        } else {
+            &["stripspace"]
+        };
+        let output = self
+            .runner
+            .run(&GitInvocation::read(args.iter().copied()).stdin(raw.as_bytes()))?;
+        Ok(output.stdout_lossy().trim_end().to_owned())
+    }
+
+    fn config_path(&self, key: &str) -> Result<Option<String>, GitError> {
+        match self.runner.read(["config", "--path", "--get", key]) {
+            Ok(value) if !value.trim().is_empty() => Ok(Some(value.trim().to_owned())),
+            Ok(_) | Err(GitError::Command { .. }) => Ok(None),
+            Err(error) => Err(error),
+        }
     }
 
     /// Reword `HEAD` or an older commit on the current branch.
@@ -936,7 +1034,7 @@ impl Repository {
                 target.clone(),
                 vec![
                     format!("pick {target}"),
-                    format!("exec git commit --amend --no-verify --allow-empty --cleanup=strip --file={quoted}"),
+                    format!("exec git commit --amend --no-verify --allow-empty --cleanup=whitespace --file={quoted}"),
                 ],
             )],
         );
@@ -1583,4 +1681,31 @@ impl Repository {
 
 fn shell_quote(value: &str) -> String {
     format!("'{}'", value.replace('\'', "'\\''"))
+}
+
+/// bcode's draft commit message, in the (per-worktree) git directory.
+pub const BCODE_COMMIT_DRAFT: &str = "BCODE_GIT_COMMIT_MSG";
+/// lazygit's unsent commit message, in the git directory.
+pub const LAZYGIT_COMMIT_DRAFT: &str = "LAZYGIT_PENDING_COMMIT";
+/// Larger files are not messages; they are ignored rather than loaded.
+const MAX_MESSAGE_BYTES: u64 = 1024 * 1024;
+
+fn read_message_file(path: &Path) -> Result<Option<String>, GitError> {
+    match std::fs::metadata(path) {
+        Ok(metadata) if metadata.is_file() && metadata.len() <= MAX_MESSAGE_BYTES => {
+            let bytes = std::fs::read(path)?;
+            Ok(Some(String::from_utf8_lossy(&bytes).into_owned()))
+        }
+        Ok(_) => Ok(None),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(error.into()),
+    }
+}
+
+fn remove_if_present(path: &Path) -> Result<(), GitError> {
+    match std::fs::remove_file(path) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error.into()),
+    }
 }

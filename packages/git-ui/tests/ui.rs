@@ -36,7 +36,15 @@ impl Harness {
         Self::with_config(setup, LoadedConfig::default())
     }
 
-    fn with_config(setup: impl FnOnce(&Path), mut config: LoadedConfig) -> Self {
+    fn with_config(setup: impl FnOnce(&Path), config: LoadedConfig) -> Self {
+        Self::with_options(setup, config, None)
+    }
+
+    fn with_options(
+        setup: impl FnOnce(&Path),
+        mut config: LoadedConfig,
+        commit_message: Option<String>,
+    ) -> Self {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path();
         git(path, &["init", "--quiet", "--initial-branch", "main"]);
@@ -50,6 +58,7 @@ impl Harness {
             path: path.to_owned(),
             config,
             host: Arc::new(bcode_git_ui::host::StandaloneHost),
+            commit_message,
         })
         .unwrap();
         app.set_inline(true);
@@ -710,4 +719,155 @@ fn reword_keeps_an_existing_description() {
         git(harness.path(), &["log", "-1", "--format=%B"]),
         "Title v2\n\nBody line\n\n"
     );
+}
+
+fn changed_repo(path: &Path) {
+    commit(path, "a.txt", "a\n", "init");
+    std::fs::write(path.join("a.txt"), "b\n").unwrap();
+}
+
+fn git_file(harness: &Harness, name: &str) -> Option<String> {
+    std::fs::read_to_string(harness.path().join(".git").join(name)).ok()
+}
+
+#[test]
+fn environment_message_wins_once_then_drafts_take_over() {
+    let mut harness = Harness::with_options(
+        |path| {
+            changed_repo(path);
+            std::fs::write(path.join(".git/BCODE_GIT_COMMIT_MSG"), "Saved draft\n").unwrap();
+        },
+        LoadedConfig::default(),
+        Some("From the environment".into()),
+    );
+    harness.keys(&["c"]);
+    let screen = harness.screen(140, 40);
+    assert!(screen.contains("from $BCODE_GIT_COMMIT_MSG"), "{screen}");
+    assert!(screen.contains("From the environment"), "{screen}");
+    // Cancelling keeps the environment message as the draft, since it cannot be read again.
+    harness.keys(&["escape"]);
+    assert_eq!(
+        git_file(&harness, "BCODE_GIT_COMMIT_MSG").as_deref(),
+        Some("From the environment")
+    );
+    harness.keys(&["c"]);
+    let screen = harness.screen(140, 40);
+    assert!(screen.contains("from BCODE_GIT_COMMIT_MSG"), "{screen}");
+    harness.keys(&["enter"]);
+    assert_eq!(harness.log(), ["From the environment", "init"]);
+    // The committed draft is gone, so the next editor starts empty.
+    assert_eq!(git_file(&harness, "BCODE_GIT_COMMIT_MSG"), None);
+}
+
+#[test]
+fn lazygit_draft_is_used_and_cleared_only_by_a_commit_that_used_it() {
+    let mut harness = Harness::new(|path| {
+        changed_repo(path);
+        std::fs::write(
+            path.join(".git/LAZYGIT_PENDING_COMMIT"),
+            "From lazygit\n\nWith body",
+        )
+        .unwrap();
+    });
+    harness.keys(&["c"]);
+    let screen = harness.screen(140, 40);
+    assert!(screen.contains("from LAZYGIT_PENDING_COMMIT"), "{screen}");
+    assert!(screen.contains("With body"), "{screen}");
+    harness.keys(&["alt+enter"]);
+    assert_eq!(
+        git(harness.path(), &["log", "-1", "--format=%B"]),
+        "From lazygit\n\nWith body\n\n"
+    );
+    assert_eq!(git_file(&harness, "LAZYGIT_PENDING_COMMIT"), None);
+}
+
+#[test]
+fn bcode_draft_outranks_lazygit_and_leaves_its_file_alone() {
+    let mut harness = Harness::new(|path| {
+        changed_repo(path);
+        std::fs::write(path.join(".git/BCODE_GIT_COMMIT_MSG"), "From bcode").unwrap();
+        std::fs::write(path.join(".git/LAZYGIT_PENDING_COMMIT"), "From lazygit").unwrap();
+    });
+    harness.keys(&["c", "enter"]);
+    assert_eq!(harness.log(), ["From bcode", "init"]);
+    assert_eq!(
+        git_file(&harness, "LAZYGIT_PENDING_COMMIT").as_deref(),
+        Some("From lazygit")
+    );
+}
+
+#[test]
+fn a_draft_replacing_merge_msg_is_announced_and_can_be_cleared() {
+    let mut harness = Harness::new(|path| {
+        changed_repo(path);
+        std::fs::write(
+            path.join(".git/MERGE_MSG"),
+            "Merge branch 'x'\n# Conflicts:\n",
+        )
+        .unwrap();
+        std::fs::write(path.join(".git/BCODE_GIT_COMMIT_MSG"), "Old draft").unwrap();
+    });
+    harness.keys(&["c"]);
+    let screen = harness.screen(140, 40);
+    assert!(screen.contains("replaces MERGE_MSG"), "{screen}");
+    harness.keys(&["ctrl+l"]);
+    let screen = harness.screen(140, 40);
+    assert!(!screen.contains("Old draft"), "{screen}");
+    // Leaving with an empty editor removes the draft, so git's message shows next time.
+    harness.keys(&["escape"]);
+    assert_eq!(git_file(&harness, "BCODE_GIT_COMMIT_MSG"), None);
+    harness.keys(&["c"]);
+    let screen = harness.screen(140, 40);
+    assert!(screen.contains("from MERGE_MSG"), "{screen}");
+    assert!(screen.contains("Merge branch 'x'"), "{screen}");
+    assert!(!screen.contains("# Conflicts"), "{screen}");
+    // Cancelling untouched git text does not turn it into a draft.
+    harness.keys(&["escape"]);
+    assert_eq!(git_file(&harness, "BCODE_GIT_COMMIT_MSG"), None);
+}
+
+#[test]
+fn a_rejected_commit_keeps_its_message_as_the_draft() {
+    let mut harness = Harness::new(|path| {
+        changed_repo(path);
+        // A user's global hooksPath would otherwise bypass this repository's hooks.
+        std::fs::create_dir_all(path.join("hooks")).unwrap();
+        git(path, &["config", "core.hooksPath", "hooks"]);
+        let hook = path.join("hooks/pre-commit");
+        std::fs::write(&hook, "#!/bin/sh\nexit 1\n").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&hook, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+    });
+    harness.keys(&["c"]);
+    harness.paste("Blocked by hook");
+    harness.keys(&["enter"]);
+    assert_eq!(harness.log(), ["init"]);
+    assert_eq!(
+        git_file(&harness, "BCODE_GIT_COMMIT_MSG").as_deref(),
+        Some("Blocked by hook")
+    );
+    harness.keys(&["c"]);
+    let screen = harness.screen(140, 40);
+    assert!(screen.contains("Blocked by hook"), "{screen}");
+}
+
+#[test]
+fn configured_sources_limit_and_order_the_prefill() {
+    let mut harness = Harness::with_config(
+        |path| {
+            changed_repo(path);
+            std::fs::write(path.join(".git/LAZYGIT_PENDING_COMMIT"), "From lazygit").unwrap();
+            std::fs::write(path.join(".git/MERGE_MSG"), "Merge message").unwrap();
+        },
+        configured(
+            "[plugins.config.\"bcode.git\".ui.commit]\nsources = [\"merge\", \"bcode-draft\"]",
+        ),
+    );
+    harness.keys(&["c"]);
+    let screen = harness.screen(140, 40);
+    assert!(screen.contains("Merge message"), "{screen}");
+    assert!(!screen.contains("From lazygit"), "{screen}");
 }

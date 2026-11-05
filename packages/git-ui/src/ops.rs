@@ -10,6 +10,15 @@ use bcode_git::{
     ApplyTarget, CommitOptions, ConflictSide, GitError, PushOptions, Repository, StashOptions,
 };
 
+/// Commit-message drafts to remove after a successful commit.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct DraftCleanup {
+    /// bcode's `BCODE_GIT_COMMIT_MSG` file.
+    pub bcode: bool,
+    /// lazygit's `LAZYGIT_PENDING_COMMIT` file.
+    pub lazygit: bool,
+}
+
 /// A repository mutation.
 #[derive(Debug, Clone)]
 #[allow(missing_docs)]
@@ -41,7 +50,8 @@ pub enum Op {
         target: ApplyTarget,
         reverse: bool,
     },
-    Commit(CommitOptions),
+    /// A commit, and the drafts to remove once it succeeds.
+    Commit(CommitOptions, DraftCleanup),
     Reword {
         oid: String,
         message: String,
@@ -202,8 +212,8 @@ impl Op {
             Self::UnstageLines { ids, .. } => format!("Unstaged {}", plural(ids.len(), "line")),
             Self::DiscardLines { ids, .. } => format!("Discarded {}", plural(ids.len(), "line")),
             Self::ApplyPatch { .. } => "Applied patch".into(),
-            Self::Commit(options) if options.amend => "Amended commit".into(),
-            Self::Commit(_) => "Committed".into(),
+            Self::Commit(options, _) if options.amend => "Amended commit".into(),
+            Self::Commit(..) => "Committed".into(),
             Self::Reword { .. } => "Reworded commit".into(),
             Self::Checkout(target) => format!("Checked out {target}"),
             Self::CheckoutRemote(branch) => format!("Checked out {}", branch.name),
@@ -299,7 +309,7 @@ impl Op {
     pub const fn moves_head(&self) -> bool {
         matches!(
             self,
-            Self::Commit(_)
+            Self::Commit(..)
                 | Self::Reword { .. }
                 | Self::Checkout(_)
                 | Self::CheckoutRemote(_)
@@ -404,7 +414,10 @@ fn run_worktree_op(repo: &Repository, op: &Op) -> Option<Result<(), GitError>> {
             target,
             reverse,
         } => repo.apply_patch(patch, *target, *reverse),
-        Op::Commit(options) => repo.commit(options),
+        Op::Commit(options, drafts) => repo.commit(options).and_then(|()| {
+            // Only a commit that landed consumes its drafts; a failed one keeps them.
+            repo.clear_commit_drafts(drafts.bcode, drafts.lazygit)
+        }),
         _ => return None,
     })
 }
@@ -496,7 +509,7 @@ pub fn run(repo: &Repository, op: &Op) -> Result<Option<String>, String> {
         | Op::UnstageLines { .. }
         | Op::DiscardLines { .. }
         | Op::ApplyPatch { .. }
-        | Op::Commit(_) => unreachable!("handled by run_worktree_op"),
+        | Op::Commit(..) => unreachable!("handled by run_worktree_op"),
         Op::Copy(text) => return copy_to_clipboard(text).map(|()| None),
         Op::BisectBegin => repo.runner().write(["bisect", "start"]).map(drop),
         Op::Restore { position, .. } => position.restore(repo),

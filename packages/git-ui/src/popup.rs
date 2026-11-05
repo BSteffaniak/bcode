@@ -4,7 +4,7 @@ use std::cell::{Cell, RefCell};
 use std::path::PathBuf;
 
 use bcode_git::StashOptions;
-use bcode_git::models::{RemoteBranch, StashEntry};
+use bcode_git::models::{CommitMessageSource, RemoteBranch, StashEntry};
 use bmux_text_edit::TextEditBuffer;
 use bmux_tui::text::Line;
 use bmux_tui_components::selectable_list::SelectableListState;
@@ -180,6 +180,8 @@ pub enum PromptKind {
         no_verify: bool,
         /// Stage everything first.
         stage_all: bool,
+        /// Where the prefilled text came from, and that text.
+        prefill: Option<(CommitMessageSource, String)>,
     },
     /// New message for a commit.
     Reword(String),

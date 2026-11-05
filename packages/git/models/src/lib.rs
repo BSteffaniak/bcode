@@ -684,6 +684,81 @@ pub struct RebaseTodoItem {
     pub summary: String,
 }
 
+/// Where a prefilled commit message comes from, in default precedence order.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum CommitMessageSource {
+    /// The `BCODE_GIT_COMMIT_MSG` environment variable (the message itself).
+    Env,
+    /// bcode's draft file, `BCODE_GIT_COMMIT_MSG` in the git directory.
+    BcodeDraft,
+    /// lazygit's unsent message, `LAZYGIT_PENDING_COMMIT` in the git directory.
+    LazygitDraft,
+    /// `MERGE_MSG`, written by a merge, cherry-pick or revert that stopped.
+    Merge,
+    /// `SQUASH_MSG`, written by `git merge --squash`.
+    Squash,
+    /// `COMMIT_EDITMSG`, used only when it does not match `HEAD` (a commit that did not land).
+    EditMsg,
+    /// The file named by `commit.template`.
+    Template,
+}
+
+impl CommitMessageSource {
+    /// Every source in default precedence order.
+    pub const ALL: [Self; 7] = [
+        Self::Env,
+        Self::BcodeDraft,
+        Self::LazygitDraft,
+        Self::Merge,
+        Self::Squash,
+        Self::EditMsg,
+        Self::Template,
+    ];
+
+    /// Configuration name.
+    #[must_use]
+    pub const fn name(self) -> &'static str {
+        match self {
+            Self::Env => "env",
+            Self::BcodeDraft => "bcode-draft",
+            Self::LazygitDraft => "lazygit-draft",
+            Self::Merge => "merge",
+            Self::Squash => "squash",
+            Self::EditMsg => "edit-msg",
+            Self::Template => "template",
+        }
+    }
+
+    /// Where the text lives, for display.
+    #[must_use]
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Env => "$BCODE_GIT_COMMIT_MSG",
+            Self::BcodeDraft => "BCODE_GIT_COMMIT_MSG",
+            Self::LazygitDraft => "LAZYGIT_PENDING_COMMIT",
+            Self::Merge => "MERGE_MSG",
+            Self::Squash => "SQUASH_MSG",
+            Self::EditMsg => "COMMIT_EDITMSG",
+            Self::Template => "commit.template",
+        }
+    }
+
+    /// Source with a configuration name.
+    #[must_use]
+    pub fn from_name(name: &str) -> Option<Self> {
+        Self::ALL
+            .into_iter()
+            .find(|source| source.name().eq_ignore_ascii_case(name.trim()))
+    }
+
+    /// Whether the text is a draft someone wrote rather than one git generated.
+    #[must_use]
+    pub const fn is_draft(self) -> bool {
+        matches!(self, Self::Env | Self::BcodeDraft | Self::LazygitDraft)
+    }
+}
+
 /// Reset mode.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
