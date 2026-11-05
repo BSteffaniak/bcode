@@ -1594,3 +1594,50 @@ fn shell_prompt_recalls_previous_commands_across_restarts() {
     harness.keys(&[":"]);
     assert!(press(&mut harness, "up").contains("│ echo second"));
 }
+
+#[test]
+fn panels_behind_a_popup_scroll_under_the_pointer() {
+    use bmux_tui::event::{MouseButton, MouseEventKind};
+
+    let mut harness = Harness::new(|path| {
+        commit(path, "a.txt", "a\n", "init");
+        let long: String = (0..60).map(|line| format!("line {line}\n")).collect();
+        std::fs::write(path.join("a.txt"), long).unwrap();
+    });
+    harness.screen(140, 40);
+    harness.keys(&["c"]);
+    harness.screen(140, 40);
+    let diff = harness.region("main-0");
+    // Over the diff, beside the commit editor (its right edge column).
+    let x = diff.right() - 2;
+    let y = diff.y + 2;
+    harness.mouse(MouseEventKind::ScrollDown, x, y);
+    harness.mouse(MouseEventKind::ScrollDown, x, y);
+    assert_eq!(harness.app.main_view_cursor(0), 6);
+    // The editor stays open and keeps the keyboard; focus behind it is unchanged.
+    let screen = harness.screen(140, 40);
+    assert!(screen.contains("Summary"), "{screen}");
+    assert_eq!(harness.app.focused_window(), Window::Side(1));
+    // A side list scrolls without taking focus.
+    let commits = harness.region("side-4");
+    harness.mouse(MouseEventKind::ScrollDown, commits.x + 1, commits.y);
+    assert_eq!(harness.app.focused_window(), Window::Side(1));
+    // Over the popup itself, and for clicks behind it, nothing happens.
+    let screen = harness.screen(140, 40);
+    let (row, line) = screen
+        .lines()
+        .enumerate()
+        .find(|(_, line)| line.contains("Summary"))
+        .unwrap();
+    let column = line[..line.find("Summary").unwrap()].chars().count();
+    harness.mouse(
+        MouseEventKind::ScrollUp,
+        u16::try_from(column).unwrap(),
+        u16::try_from(row).unwrap(),
+    );
+    harness.mouse(MouseEventKind::Down(MouseButton::Left), x, y);
+    assert_eq!(harness.app.main_view_cursor(0), 6);
+    assert_eq!(harness.app.focused_window(), Window::Side(1));
+    harness.paste("still typing");
+    assert!(harness.screen(140, 40).contains("still typing"));
+}

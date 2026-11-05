@@ -174,6 +174,9 @@ fn paint(app: &mut App, cx: &mut bmux_tui::paint::PaintCx<'_, '_>) {
                 .map(|area| (*id, area))
         })
         .collect();
+    // Pointer input inside the popup's panel belongs to the popup.
+    app.popup_area
+        .set(placed.find_visible_rect(&bmux_tui::component::LayoutId::new("popup.surface")));
 }
 
 fn commit(app: &mut App, hits: &bmux_tui::hit::HitMap, _focus: &bmux_tui::focus::FocusTrap) {

@@ -92,6 +92,9 @@ Every window is a panel:
   configuration is the starting point for a directory without saved state; `ctrl+w =` resets the
   layout and `layout.remember = false` turns saving off.
 
+While a popup such as the commit editor is open, the mouse wheel still scrolls the panel under
+the pointer behind it (outside the popup) without moving focus; clicks behind a popup are ignored.
+
 Terminals narrower than 84 columns stack the side windows above the main view. Mouse clicks focus
 windows and select rows; clicking the selected row again opens it; the wheel scrolls. Every part of
 this is configurable; see [Layout settings](#layout-settings).

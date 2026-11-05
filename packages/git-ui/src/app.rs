@@ -308,6 +308,8 @@ pub struct App {
 
     pub(crate) layout: Layout,
     pub(crate) panels: Panels,
+    /// Area of the open popup in the last painted frame.
+    pub(crate) popup_area: Cell<Option<bmux_tui::geometry::Rect>>,
     /// Shell commands run from the `:` prompt.
     pub(crate) shell_history: crate::popup::InputRecall,
     /// Main view position waiting for its content after a restore.
@@ -414,6 +416,7 @@ impl App {
             file_tree,
             layout,
             panels,
+            popup_area: Cell::new(None),
             shell_history: crate::popup::InputRecall::default(),
             pending_main: None,
             pending_drill: None,
@@ -516,6 +519,12 @@ impl App {
     #[must_use]
     pub fn view_cursor(&self, view: View) -> usize {
         self.cursor(view)
+    }
+
+    /// Cursor row of a main view section (for tests and automation).
+    #[must_use]
+    pub fn main_view_cursor(&self, section: usize) -> usize {
+        self.main_cursor[section.min(1)]
     }
 
     /// Record whether filesystem watching is active.
@@ -1409,10 +1418,22 @@ impl App {
         let Event::Mouse(mouse) = event else {
             return Update::none();
         };
-        if !self.popups.is_empty() {
-            return Update::none();
-        }
-        if let Some(update) = self.route_dividers(event) {
+        // With a popup open, only the scroll wheel reaches what is behind it, and only outside
+        // the popup itself; nothing behind changes focus.
+        let behind_popup = !self.popups.is_empty();
+        if behind_popup {
+            let scroll = matches!(
+                mouse.kind,
+                MouseEventKind::ScrollUp | MouseEventKind::ScrollDown
+            );
+            let over_popup = self
+                .popup_area
+                .get()
+                .is_some_and(|area| area.contains(Point::new(mouse.position.x, mouse.position.y)));
+            if !scroll || over_popup {
+                return Update::none();
+            }
+        } else if let Some(update) = self.route_dividers(event) {
             return update;
         }
         let id = {
@@ -1440,10 +1461,14 @@ impl App {
                     3
                 };
                 if window == Window::Main {
-                    self.move_main(delta);
+                    // The section under the pointer, which need not be the focused one.
+                    let section = item.map_or(self.main_section, |(section, _)| section);
+                    self.scroll_main_section(section, delta);
                     return Update::redraw();
                 }
-                self.focus(window);
+                if !behind_popup {
+                    self.focus(window);
+                }
                 let view = self.view(window);
                 self.move_cursor(view, delta)
             }
@@ -1992,6 +2017,18 @@ impl App {
             .as_ref()
             .and_then(|main| main.sections.get(section))
             .map_or(0, |section| section.rows.len())
+    }
+
+    /// Move one main section's cursor by `delta` rows, without changing focus.
+    pub(crate) fn scroll_main_section(&mut self, section: usize, delta: isize) {
+        let section = section.min(1);
+        let len = self.main_rows(section);
+        if len == 0 {
+            return;
+        }
+        self.main_cursor[section] = self.main_cursor[section]
+            .saturating_add_signed(delta)
+            .min(len - 1);
     }
 
     pub(crate) fn move_main(&mut self, delta: isize) {
