@@ -1,7 +1,7 @@
 //! Repository operations.
 
 use std::collections::BTreeSet;
-use std::ffi::OsString;
+use std::ffi::{OsStr, OsString};
 use std::path::{Path, PathBuf};
 
 use bcode_git_models::{
@@ -1355,27 +1355,51 @@ impl Repository {
             .map(drop)
     }
 
-    /// Fast-forward a local branch that is not checked out to its upstream.
+    /// Fast-forward a local branch to its upstream, fetching the upstream first.
+    ///
+    /// A branch checked out here or in another worktree is merged (fast-forward only) in
+    /// that worktree, so its files move with it; any other branch only has its ref moved.
     ///
     /// # Errors
-    /// * [`GitError`] when the branch has no upstream or cannot fast-forward.
+    /// * [`GitError`] when the branch has no upstream, the fetch fails, or the branch has
+    ///   diverged from its upstream or its worktree's changes are in the way.
     pub fn fast_forward(&self, branch: &Branch) -> Result<(), GitError> {
         let upstream = branch
             .upstream
             .as_deref()
             .ok_or_else(|| GitError::Unsupported(format!("{} has no upstream", branch.name)))?;
+        let (remote, remote_branch) = upstream
+            .split_once('/')
+            .ok_or_else(|| GitError::Unsupported(format!("unexpected upstream {upstream}")))?;
+        self.runner
+            .write(["fetch", "--quiet", remote, remote_branch])?;
         if branch.is_head {
             return self
                 .runner
                 .write(["merge", "--ff-only", upstream])
                 .map(drop);
         }
-        let (remote, remote_branch) = upstream
-            .split_once('/')
-            .ok_or_else(|| GitError::Unsupported(format!("unexpected upstream {upstream}")))?;
-        let refspec = format!("refs/heads/{remote_branch}:refs/heads/{}", branch.name);
+        let checked_out = self
+            .worktrees()?
+            .into_iter()
+            .find(|worktree| worktree.branch.as_deref() == Some(branch.name.as_str()));
+        if let Some(worktree) = checked_out {
+            return self
+                .runner
+                .write([
+                    OsStr::new("-C"),
+                    worktree.path.as_os_str(),
+                    OsStr::new("merge"),
+                    OsStr::new("--ff-only"),
+                    OsStr::new(upstream),
+                ])
+                .map(drop);
+        }
+        // Not checked out anywhere: a local fetch moves the ref, refusing anything but a
+        // fast-forward.
+        let refspec = format!("refs/remotes/{upstream}:refs/heads/{}", branch.name);
         self.runner
-            .write(["fetch", "--quiet", remote, &refspec])
+            .write(["fetch", "--quiet", ".", &refspec])
             .map(drop)
     }
 

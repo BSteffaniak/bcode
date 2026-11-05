@@ -1938,7 +1938,8 @@ fn command_log_shows_why_a_command_failed() {
         git(path, &["remote", "add", "origin", remote.to_str().unwrap()]);
         git(path, &["push", "--quiet", "-u", "origin", "main"]);
         git(path, &["branch", "--track", "other", "origin/main"]);
-        // `other` is checked out in another worktree, so git refuses to fetch into it.
+        // `other` is checked out in another worktree with a commit of its own, and its
+        // upstream moves on: it cannot fast-forward.
         let worktree = path.join(".git").join("other-worktree");
         git(
             path,
@@ -1950,13 +1951,21 @@ fn command_log_shows_why_a_command_failed() {
                 "other",
             ],
         );
+        commit(&worktree, "b", "b", "mine");
+        commit(path, "a", "changed", "theirs");
+        git(path, &["push", "--quiet", "origin", "main"]);
     });
-    harness.keys(&["3", "j", "f", "@"]);
+    // The failure opens git's full message; the command log keeps it after closing.
+    harness.keys(&["3", "j", "f"]);
+    let screen = harness.screen(160, 50);
+    assert!(screen.contains("Not possible to fast-forward"), "{screen}");
+    harness.keys(&["escape", "@"]);
     let screen = harness.screen(160, 50);
     let failed = screen
         .lines()
-        .position(|line| line.contains("✗ git fetch"))
+        .position(|line| line.contains("✗ git -C"))
         .unwrap_or_else(|| panic!("{screen}"));
+    // The reason comes first, before git's hints.
     let reason = screen.lines().nth(failed + 1).unwrap();
-    assert!(reason.contains("refusing to fetch into branch"), "{screen}");
+    assert!(reason.contains("Not possible to fast-forward"), "{screen}");
 }

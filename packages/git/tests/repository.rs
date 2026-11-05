@@ -629,3 +629,80 @@ fn failed_commands_keep_git_message_in_the_log() {
             .all(|record| record.error.is_none())
     );
 }
+
+#[test]
+fn fast_forwards_branches_here_elsewhere_and_in_other_worktrees() {
+    let remote_dir = tempfile::tempdir().unwrap();
+    git(
+        remote_dir.path(),
+        &["init", "--quiet", "--bare", "--initial-branch", "main"],
+    );
+    let url = remote_dir.path().to_string_lossy().into_owned();
+    let repo = TempRepo::init();
+    repo.write("f", b"1\n");
+    repo.commit_all("one");
+    git(repo.path(), &["remote", "add", "origin", &url]);
+    git(repo.path(), &["push", "--quiet", "-u", "origin", "main"]);
+    git(repo.path(), &["branch", "--track", "loose", "origin/main"]);
+    git(
+        repo.path(),
+        &["branch", "--track", "elsewhere", "origin/main"],
+    );
+    let worktrees = tempfile::tempdir().unwrap();
+    let worktree = worktrees.path().join("elsewhere");
+    git(
+        repo.path(),
+        &[
+            "worktree",
+            "add",
+            "--quiet",
+            worktree.to_str().unwrap(),
+            "elsewhere",
+        ],
+    );
+
+    // Someone else pushes a commit; nothing has been fetched yet.
+    let other = tempfile::tempdir().unwrap();
+    git(other.path(), &["clone", "--quiet", &url, "."]);
+    let push = |content: &str, message: &str| {
+        std::fs::write(other.path().join("f"), content).unwrap();
+        git(other.path(), &["commit", "--quiet", "-am", message]);
+        git(other.path(), &["push", "--quiet", "origin", "main"]);
+        git(other.path(), &["rev-parse", "HEAD"]).trim().to_owned()
+    };
+    let tip = push("2\n", "two");
+    let branch = |name: &str| {
+        repo.repo
+            .branches()
+            .unwrap()
+            .into_iter()
+            .find(|branch| branch.name == name)
+            .unwrap()
+    };
+
+    // A branch checked out nowhere only has its ref moved.
+    repo.repo.fast_forward(&branch("loose")).unwrap();
+    assert_eq!(git(repo.path(), &["rev-parse", "loose"]).trim(), tip);
+    // A branch checked out in another worktree moves with that worktree's files.
+    repo.repo.fast_forward(&branch("elsewhere")).unwrap();
+    assert_eq!(git(&worktree, &["rev-parse", "HEAD"]).trim(), tip);
+    assert_eq!(std::fs::read(worktree.join("f")).unwrap(), b"2\n");
+    assert!(git(&worktree, &["status", "--porcelain"]).trim().is_empty());
+    // The current branch is merged here.
+    repo.repo.fast_forward(&branch("main")).unwrap();
+    assert_eq!(repo.read("f"), b"2\n");
+
+    // Diverged: the worktree has a commit of its own, so it cannot fast-forward.
+    std::fs::write(worktree.join("g"), "mine\n").unwrap();
+    git(&worktree, &["add", "g"]);
+    git(&worktree, &["commit", "--quiet", "-m", "mine"]);
+    let mine = git(&worktree, &["rev-parse", "HEAD"]).trim().to_owned();
+    push("3\n", "three");
+    let error = repo.repo.fast_forward(&branch("elsewhere")).unwrap_err();
+    assert!(
+        error.message().contains("fast-forward"),
+        "{}",
+        error.message()
+    );
+    assert_eq!(git(&worktree, &["rev-parse", "HEAD"]).trim(), mine);
+}

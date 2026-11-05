@@ -128,8 +128,11 @@ configurable; see [Layout settings](#layout-settings).
   commit; revert; cherry-pick copy (`C`) and paste (`V`); soft/mixed/hard reset; tags; new branch
   from a commit; bisect; commit file lists with per-file checkout and custom patches.
 * **Branches and remotes**: checkout (including by name), create, rename, delete (local, forced,
-  remote), merge (fast-forward, no-ff, squash), rebase, fast-forward, upstream management, remote
-  branch checkout, add/edit/remove/fetch remotes, push tags.
+  remote), merge (fast-forward, no-ff, squash), rebase, fast-forward to upstream (`f`: fetches
+  first; a branch checked out in another worktree is fast-forwarded there, files included), upstream
+  management, remote branch checkout, add/edit/remove/fetch remotes, push tags.
+* **Errors**: a failed git command shows git's reason in a toast, with its full output in a popup
+  when long; the command log keeps the reason under the failed command.
 * **Sync**: fetch, pull (merge or rebase), push with upstream setup and force-with-lease when
   behind. Optional periodic background fetch.
 * **Operations in progress**: merges, rebases, cherry-picks and reverts show a banner; `m` offers

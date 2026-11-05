@@ -50,14 +50,19 @@ pub enum GitError {
 }
 
 impl GitError {
-    /// Short user-facing message.
+    /// Short user-facing message: git's reason first, then any of its hints.
     #[must_use]
     pub fn message(&self) -> String {
         match self {
             Self::Command { stderr, stdout, .. } => {
                 let text = if stderr.is_empty() { stdout } else { stderr };
-                text.lines()
+                let (hints, reasons): (Vec<&str>, Vec<&str>) = text
+                    .lines()
                     .map(|line| line.strip_prefix("error: ").unwrap_or(line))
+                    .partition(|line| line.starts_with("hint:"));
+                reasons
+                    .into_iter()
+                    .chain(hints)
                     .collect::<Vec<_>>()
                     .join("\n")
             }
@@ -101,5 +106,27 @@ impl std::error::Error for GitError {
 impl From<std::io::Error> for GitError {
     fn from(error: std::io::Error) -> Self {
         Self::Io(error)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::GitError;
+
+    #[test]
+    fn message_puts_the_reason_before_hints() {
+        let error = GitError::Command {
+            args: "merge --ff-only origin/main".into(),
+            code: Some(128),
+            stderr: "hint: Diverging branches can't be fast-forwarded\nhint: use rebase\n\
+                     fatal: Not possible to fast-forward, aborting."
+                .into(),
+            stdout: String::new(),
+        };
+        assert_eq!(
+            error.message(),
+            "fatal: Not possible to fast-forward, aborting.\n\
+             hint: Diverging branches can't be fast-forwarded\nhint: use rebase"
+        );
     }
 }
