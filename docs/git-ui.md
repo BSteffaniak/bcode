@@ -84,7 +84,8 @@ Every window is a panel:
   `bcode git` was started in (`$XDG_STATE_HOME/bcode-git/layouts`, by default
   `~/.local/state/bcode-git/layouts`): panel sizes, collapsed and closed windows, the screen mode
   (including a maximized panel), the command log, the focused window and each window's tab, the
-  selected row of every list (followed by identity, so it survives history changes), filters,
+  selected row (followed by identity, so it survives history changes) and scroll position of
+  every list, filters,
   tree or flat files and collapsed directories, diff context, the graph toggle, diffing mode,
   the main view's position and line staging, drilled-in views (a remote's branches, a ref's
   commits, a commit's or stash's files), copied commits, and undo/redo history. Changes are saved
@@ -92,14 +93,21 @@ Every window is a panel:
   configuration is the starting point for a directory without saved state; `ctrl+w =` resets the
   layout and `layout.remember = false` turns saving off.
 
+Scrolling moves the page, not the selection. The mouse wheel scrolls the panel under the pointer
+without moving its selected row or the focus, so the main view keeps showing what is selected;
+moving the selection with the keyboard scrolls it back into view. The main view reads as a page
+with no highlighted row: `j`/`k`, page keys, `home`/`end` and the hunk keys (`n`/`N`) scroll it.
+Only the staging view shows a cursor, for picking lines; clicking a line there moves it. Panels
+whose content overflows show a scrollbar on their right border, which can be dragged or clicked;
+popups show theirs inside the frame. Scroll positions are kept with the session.
+
 While a popup such as the commit editor is open, the mouse wheel still scrolls the panel under
-the pointer behind it (outside the popup) without moving focus; clicks behind a popup are ignored.
-Over a menu (help, palette, option menus) or a text viewer (command output), the wheel moves
-through its items.
+the pointer behind it (outside the popup); clicks behind a popup are ignored. Over a menu (help,
+palette, option menus) or a text viewer (command output), the wheel scrolls the popup.
 
 Terminals narrower than 84 columns stack the side windows above the main view. Mouse clicks focus
-windows and select rows; clicking the selected row again opens it; the wheel scrolls. Every part of
-this is configurable; see [Layout settings](#layout-settings).
+windows and select rows; clicking the selected row again opens it. Every part of this is
+configurable; see [Layout settings](#layout-settings).
 
 ## Features
 
@@ -443,8 +451,8 @@ currently use `StandaloneHost`, which contributes nothing.
 | `bcode.git.global.redo` | Redo | `ctrl+z` |
 | `bcode.git.global.screen-mode-next` | Enlarge focused view | `+` |
 | `bcode.git.global.screen-mode-previous` | Shrink focused view | `_` |
-| `bcode.git.global.scroll-main-up` | Scroll main view up | `ctrl+u`, `shift+k` |
-| `bcode.git.global.scroll-main-down` | Scroll main view down | `ctrl+d`, `shift+j` |
+| `bcode.git.global.scroll-main-up` | Scroll main view up half a page | `ctrl+u`, `shift+k` |
+| `bcode.git.global.scroll-main-down` | Scroll main view down half a page | `ctrl+d`, `shift+j` |
 | `bcode.git.global.diff-context-more` | More diff context | `}` |
 | `bcode.git.global.diff-context-less` | Less diff context | `{` |
 | `bcode.git.global.diffing-menu` | Diff against selection | `shift+w` |
@@ -627,6 +635,11 @@ currently use `StandaloneHost`, which contributes nothing.
 |---|---|---|
 | `bcode.git.main.line-up` | Scroll up | `k`, `up` |
 | `bcode.git.main.line-down` | Scroll down | `j`, `down` |
+| `bcode.git.main.page-up` | Previous page | `,`, `pageup` |
+| `bcode.git.main.page-down` | Next page | `.`, `pagedown` |
+| `bcode.git.main.top` | Top | `<`, `home`, `g g` |
+| `bcode.git.main.bottom` | Bottom | `>`, `end`, `shift+g` |
+| `bcode.git.main.next-hunk` | Next hunk | `n`, `]` |
 | `bcode.git.main.previous-hunk` | Previous hunk | `shift+n`, `[` |
 
 ### `git.staging`

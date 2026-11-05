@@ -30,6 +30,8 @@ pub struct Session {
     pub selected: BTreeMap<String, String>,
     /// Selected row index of each list, used when its key is gone.
     pub cursors: BTreeMap<String, usize>,
+    /// Scroll position of each list, in rows: view id to offset.
+    pub scroll: BTreeMap<String, u64>,
     /// Active list filters: view id to text.
     pub filters: BTreeMap<String, String>,
     /// Files as a tree rather than a flat list.
@@ -108,8 +110,11 @@ pub enum SavedTarget {
 pub struct SavedMain {
     /// Section with focus.
     pub section: usize,
-    /// Row of each section.
+    /// Staging cursor row of each section.
     pub cursor: [usize; 2],
+    /// Scroll position of each section, in rows.
+    #[serde(default)]
+    pub scroll: [u64; 2],
     /// Staging selection, when staging lines.
     pub staging: Option<SavedStaging>,
 }

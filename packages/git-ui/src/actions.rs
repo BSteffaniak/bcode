@@ -249,12 +249,17 @@ impl App {
                 };
                 Update::redraw()
             }
-            Action::ScrollMainUp => {
-                self.move_main(-10);
-                Update::redraw()
-            }
-            Action::ScrollMainDown => {
-                self.move_main(10);
+            Action::ScrollMainUp | Action::ScrollMainDown => {
+                let list = crate::scroll::main_list(self.main_section.min(1));
+                let half = (self.list_page(&list) / 2).max(1);
+                self.scroll_list(
+                    &list,
+                    if action == Action::ScrollMainUp {
+                        -half
+                    } else {
+                        half
+                    },
+                );
                 Update::redraw()
             }
             Action::DiffContextMore | Action::DiffContextLess => {
@@ -961,26 +966,65 @@ impl App {
                 _ => Update::none(),
             },
 
-            // ----- main and staging -----
-            Action::MainLineUp | Action::StageLineUp => {
+            // ----- main view: a page without a cursor -----
+            Action::MainLineUp | Action::MainLineDown => {
+                let list = crate::scroll::main_list(self.main_section.min(1));
+                self.scroll_list(&list, if action == Action::MainLineUp { -1 } else { 1 });
+                Update::redraw()
+            }
+            Action::MainPageUp | Action::MainPageDown => {
+                let list = crate::scroll::main_list(self.main_section.min(1));
+                let page = self.list_page(&list);
+                self.scroll_list(
+                    &list,
+                    if action == Action::MainPageUp {
+                        -page
+                    } else {
+                        page
+                    },
+                );
+                Update::redraw()
+            }
+            Action::MainTop | Action::MainBottom => {
+                let list = crate::scroll::main_list(self.main_section.min(1));
+                self.scroll_list_to(
+                    &list,
+                    if action == Action::MainTop {
+                        0
+                    } else {
+                        u64::MAX
+                    },
+                );
+                Update::redraw()
+            }
+            Action::MainNextHunk | Action::MainPreviousHunk => {
+                self.scroll_to_hunk(
+                    self.main_section.min(1),
+                    if action == Action::MainNextHunk {
+                        1
+                    } else {
+                        -1
+                    },
+                );
+                Update::redraw()
+            }
+
+            // ----- staging: the cursor picks lines -----
+            Action::StageLineUp => {
                 self.move_main(-1);
-                if self.staging.is_some() {
-                    self.snap_to_change(-1);
-                }
+                self.snap_to_change(-1);
                 Update::redraw()
             }
-            Action::MainLineDown | Action::StageLineDown => {
+            Action::StageLineDown => {
                 self.move_main(1);
-                if self.staging.is_some() {
-                    self.snap_to_change(1);
-                }
+                self.snap_to_change(1);
                 Update::redraw()
             }
-            Action::MainNextHunk | Action::StageNextHunk => {
+            Action::StageNextHunk => {
                 self.jump_hunk(1);
                 Update::redraw()
             }
-            Action::MainPreviousHunk | Action::StagePreviousHunk => {
+            Action::StagePreviousHunk => {
                 self.jump_hunk(-1);
                 Update::redraw()
             }
@@ -2247,20 +2291,17 @@ pub fn menu_key(
     Update::redraw()
 }
 
-/// Handle a key in a text viewer popup.
-pub fn text_key(app: &mut App, mut view: TextView, action: Option<Action>) -> Update<Msg> {
-    match action {
-        Some(Action::MenuClose | Action::MenuConfirm) => return Update::redraw(),
-        Some(Action::MenuUp) => view.selected = view.selected.saturating_sub(1),
-        Some(Action::MenuDown) => {
-            view.selected = (view.selected + 1).min(view.lines.len().saturating_sub(1));
-        }
-        _ => {}
+/// Handle a key in a text viewer popup, which reads as a page: keys scroll it.
+pub fn text_key(app: &mut App, view: TextView, action: Option<Action>) -> Update<Msg> {
+    if matches!(action, Some(Action::MenuClose | Action::MenuConfirm)) {
+        return Update::redraw();
     }
-    let mut state = view.list.get();
-    state.set_focused(Some(view.selected));
-    view.list.set(state);
     app.popups.push(Popup::Text(view));
+    match action {
+        Some(Action::MenuUp) => app.scroll_list(crate::scroll::TEXT_LIST, -1),
+        Some(Action::MenuDown) => app.scroll_list(crate::scroll::TEXT_LIST, 1),
+        _ => false,
+    };
     Update::redraw()
 }
 
@@ -2627,32 +2668,4 @@ pub fn head_label(app: &App) -> Line {
         ));
     }
     Line::from_spans(spans)
-}
-
-/// Move the selection of the top menu or text viewer by `delta` rows (mouse wheel).
-/// Returns `false` when the top popup does not scroll.
-pub fn scroll_popup(app: &mut App, delta: isize) -> bool {
-    let step = |selected: usize, len: usize| {
-        selected
-            .saturating_add_signed(delta)
-            .min(len.saturating_sub(1))
-    };
-    match app.popups.last_mut() {
-        Some(Popup::Menu(menu)) => {
-            menu.selected = step(menu.selected, menu.visible().len());
-            let mut state = menu.list.get();
-            state.set_focused(Some(menu.selected));
-            state.set_selected(Some(menu.selected));
-            menu.list.set(state);
-            true
-        }
-        Some(Popup::Text(view)) => {
-            view.selected = step(view.selected, view.lines.len());
-            let mut state = view.list.get();
-            state.set_focused(Some(view.selected));
-            view.list.set(state);
-            true
-        }
-        _ => false,
-    }
 }

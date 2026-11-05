@@ -310,6 +310,10 @@ pub struct App {
     pub(crate) panels: Panels,
     /// Area of the open popup in the last painted frame.
     pub(crate) popup_area: Cell<Option<bmux_tui::geometry::Rect>>,
+    /// Scroll geometry of every list in the last painted frame, by list id.
+    pub(crate) painted: std::cell::RefCell<BTreeMap<String, crate::scroll::Painted>>,
+    /// Scroll position of the command log.
+    pub(crate) log_list: Cell<SelectableListState>,
     /// Shell commands run from the `:` prompt.
     pub(crate) shell_history: crate::popup::InputRecall,
     /// Main view position waiting for its content after a restore.
@@ -417,6 +421,8 @@ impl App {
             layout,
             panels,
             popup_area: Cell::new(None),
+            painted: std::cell::RefCell::default(),
+            log_list: Cell::new(SelectableListState::new(None)),
             shell_history: crate::popup::InputRecall::default(),
             pending_main: None,
             pending_drill: None,
@@ -444,8 +450,8 @@ impl App {
             main_section: 0,
             main_cursor: [0, 0],
             main_lists: [
-                Cell::new(SelectableListState::new(Some(0))),
-                Cell::new(SelectableListState::new(Some(0))),
+                Cell::new(SelectableListState::new(None)),
+                Cell::new(SelectableListState::new(None)),
             ],
             staging: None,
             popups: Vec::new(),
@@ -519,12 +525,6 @@ impl App {
     #[must_use]
     pub fn view_cursor(&self, view: View) -> usize {
         self.cursor(view)
-    }
-
-    /// Cursor row of a main view section (for tests and automation).
-    #[must_use]
-    pub fn main_view_cursor(&self, section: usize) -> usize {
-        self.main_cursor[section.min(1)]
     }
 
     /// Record whether filesystem watching is active.
@@ -919,6 +919,7 @@ impl App {
         }
         if self.main_requested.as_ref() != Some(&request) {
             self.main_cursor = [0, 0];
+            self.reset_main_scroll();
             self.main_section = 0;
             if self.window != Window::Main {
                 self.staging = None;
@@ -1418,28 +1419,40 @@ impl App {
         let Event::Mouse(mouse) = event else {
             return Update::none();
         };
-        // With a popup open, only the scroll wheel does anything: over the popup it scrolls a
-        // menu or text viewer, elsewhere it reaches what is behind without changing focus.
-        let behind_popup = !self.popups.is_empty();
-        if behind_popup {
-            let delta = match mouse.kind {
-                MouseEventKind::ScrollUp => -3,
-                MouseEventKind::ScrollDown => 3,
-                _ => return Update::none(),
+        // Scrollbars first: a drag keeps the pointer wherever it goes.
+        if let Some(update) = self.route_scrollbars(event) {
+            return update;
+        }
+        let wheel = match mouse.kind {
+            MouseEventKind::ScrollUp => Some(-crate::scroll::WHEEL_ROWS),
+            MouseEventKind::ScrollDown => Some(crate::scroll::WHEEL_ROWS),
+            _ => None,
+        };
+        // With a popup open, only the scroll wheel does anything: over the popup it scrolls the
+        // popup, elsewhere it reaches what is behind.
+        if self.popups.is_empty() {
+            if let Some(update) = self.route_dividers(event) {
+                return update;
+            }
+        } else {
+            let Some(delta) = wheel else {
+                return Update::none();
             };
             let over_popup = self
                 .popup_area
                 .get()
                 .is_some_and(|area| area.contains(Point::new(mouse.position.x, mouse.position.y)));
             if over_popup {
-                return if crate::actions::scroll_popup(self, delta) {
+                let list = match self.popups.last() {
+                    Some(Popup::Text(_)) => crate::scroll::TEXT_LIST,
+                    _ => crate::scroll::MENU_LIST,
+                };
+                return if self.scroll_list(list, delta) {
                     Update::redraw()
                 } else {
                     Update::none()
                 };
             }
-        } else if let Some(update) = self.route_dividers(event) {
-            return update;
         }
         let id = {
             let hits = self.hits.borrow();
@@ -1449,6 +1462,10 @@ impl App {
         let Some(id) = id else {
             return Update::none();
         };
+        // The wheel scrolls the list under the pointer like a page: no cursor or focus moves.
+        if let Some(delta) = wheel {
+            return self.wheel(&id, delta);
+        }
         if mouse.kind == MouseEventKind::Down(MouseButton::Left)
             && let Some(update) = self.chrome_click(&id, mouse.position)
         {
@@ -1459,32 +1476,15 @@ impl App {
             return Update::none();
         };
         match mouse.kind {
-            MouseEventKind::ScrollUp | MouseEventKind::ScrollDown => {
-                let delta: isize = if mouse.kind == MouseEventKind::ScrollUp {
-                    -3
-                } else {
-                    3
-                };
-                if window == Window::Main {
-                    // The section under the pointer, which need not be the focused one.
-                    let section = item.map_or(self.main_section, |(section, _)| section);
-                    self.scroll_main_section(section, delta);
-                    return Update::redraw();
-                }
-                if !behind_popup {
-                    self.focus(window);
-                }
-                let view = self.view(window);
-                self.move_cursor(view, delta)
-            }
             MouseEventKind::Down(MouseButton::Left) => {
                 if window == Window::Main {
-                    if self.window != Window::Main {
-                        self.window = Window::Main;
-                    }
+                    // Focus the page; while staging, the clicked line takes the cursor.
+                    self.window = Window::Main;
                     if let Some((section, row)) = item {
-                        self.main_section = section;
-                        self.main_cursor[section.min(1)] = row;
+                        self.main_section = section.min(1);
+                        if self.staging.is_some() {
+                            self.main_cursor[section.min(1)] = row;
+                        }
                     }
                     return Update::redraw();
                 }
@@ -1560,6 +1560,19 @@ impl App {
             .map(Window::Side)
     }
 
+    /// Main view position and staging, to reopen with.
+    fn saved_main(&self) -> SavedMain {
+        SavedMain {
+            section: self.main_section,
+            cursor: self.main_cursor,
+            scroll: [0, 1].map(|section| self.main_lists[section].get().scroll.vertical_offset()),
+            staging: self.staging.map(|staging| SavedStaging {
+                anchor: staging.anchor,
+                hunk_mode: staging.hunk_mode,
+            }),
+        }
+    }
+
     /// The state to reopen with.
     #[must_use]
     pub fn capture_session(&self) -> Session {
@@ -1601,6 +1614,17 @@ impl App {
                 .iter()
                 .map(|(view, index)| (view_id(*view).to_owned(), *index))
                 .collect(),
+            scroll: self
+                .lists
+                .iter()
+                .map(|(view, list)| {
+                    (
+                        view_id(*view).to_owned(),
+                        list.get().scroll.vertical_offset(),
+                    )
+                })
+                .filter(|(_, offset)| *offset > 0)
+                .collect(),
             filters: self
                 .filters
                 .iter()
@@ -1640,14 +1664,7 @@ impl App {
                     title: files.title.clone(),
                 })
             }),
-            main: Some(self.pending_main.unwrap_or_else(|| SavedMain {
-                section: self.main_section,
-                cursor: self.main_cursor,
-                staging: self.staging.map(|staging| SavedStaging {
-                    anchor: staging.anchor,
-                    hunk_mode: staging.hunk_mode,
-                }),
-            })),
+            main: Some(self.pending_main.unwrap_or_else(|| self.saved_main())),
             cherry: self.cherry.clone(),
             undo: journal(&self.undo),
             redo: journal(&self.redo),
@@ -1689,6 +1706,13 @@ impl App {
             .iter()
             .filter_map(|(id, index)| Some((view(id)?, *index)))
             .collect();
+        for (id, offset) in &session.scroll {
+            if let Some(list) = view(id).and_then(|view| self.lists.get(&view)) {
+                let mut state = list.get();
+                state.scroll.set_vertical_offset(*offset);
+                list.set(state);
+            }
+        }
         self.filters = session
             .filters
             .iter()
@@ -2017,6 +2041,15 @@ impl App {
         update
     }
 
+    /// Show the top of the main view's sections, as for content not seen before.
+    pub(crate) fn reset_main_scroll(&self) {
+        for list in &self.main_lists {
+            let mut state = list.get();
+            state.scroll.set_vertical_offset(0);
+            list.set(state);
+        }
+    }
+
     pub(crate) fn main_rows(&self, section: usize) -> usize {
         self.main
             .as_ref()
@@ -2024,16 +2057,26 @@ impl App {
             .map_or(0, |section| section.rows.len())
     }
 
-    /// Move one main section's cursor by `delta` rows, without changing focus.
-    pub(crate) fn scroll_main_section(&mut self, section: usize, delta: isize) {
-        let section = section.min(1);
-        let len = self.main_rows(section);
-        if len == 0 {
-            return;
+    /// Scroll the list under a hit region by `delta` rows. Scrolling the commits list to its end
+    /// loads more commits, as moving the cursor there does.
+    fn wheel(&mut self, hit: &str, delta: i64) -> Update<Msg> {
+        let Some(list) = crate::scroll::list_under(hit) else {
+            return Update::none();
+        };
+        if !self.scroll_list(&list, delta) {
+            return Update::none();
         }
-        self.main_cursor[section] = self.main_cursor[section]
-            .saturating_add_signed(delta)
-            .min(len - 1);
+        let mut update = Update::redraw();
+        if delta > 0
+            && self.snapshot.more_commits
+            && self.list_at_end(&list)
+            && self.side_windows().any(|window| {
+                crate::scroll::side_list(window) == list && self.view(window) == View::Commits
+            })
+        {
+            update = update.maybe(self.load_more_commits());
+        }
+        update
     }
 
     pub(crate) fn move_main(&mut self, delta: isize) {
@@ -2179,6 +2222,7 @@ impl App {
         self.main = Some(content);
         if !preserve {
             self.main_cursor = [0, 0];
+            self.reset_main_scroll();
             self.main_section = 0;
         }
         let sections = self.main.as_ref().map_or(0, |main| main.sections.len());
@@ -2210,6 +2254,9 @@ impl App {
                 for section in 0..sections.min(2) {
                     let len = self.main_rows(section);
                     self.main_cursor[section] = saved.cursor[section].min(len.saturating_sub(1));
+                    let mut state = self.main_lists[section].get();
+                    state.scroll.set_vertical_offset(saved.scroll[section]);
+                    self.main_lists[section].set(state);
                 }
             }
             match saved.staging {

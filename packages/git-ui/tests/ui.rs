@@ -441,7 +441,7 @@ fn which_key_popup_shows_sequence_continuations() {
 }
 
 #[test]
-fn mouse_clicks_focus_and_select_rows_and_wheel_scrolls() {
+fn mouse_clicks_focus_and_select_rows() {
     use bmux_tui::event::{MouseButton, MouseEvent, MouseEventKind};
     use bmux_tui::geometry::Point;
 
@@ -468,8 +468,9 @@ fn mouse_clicks_focus_and_select_rows_and_wheel_scrolls() {
     assert_eq!(harness.app.focused_window(), Window::Side(3));
     assert_eq!(harness.app.view_cursor(View::Commits), 2);
     harness.screen(140, 40);
+    // The wheel scrolls the page; it does not select.
     harness.send(click(MouseEventKind::ScrollUp));
-    assert_eq!(harness.app.view_cursor(View::Commits), 0);
+    assert_eq!(harness.app.view_cursor(View::Commits), 2);
 }
 
 #[test]
@@ -1613,7 +1614,7 @@ fn panels_behind_a_popup_scroll_under_the_pointer() {
     let y = diff.y + 2;
     harness.mouse(MouseEventKind::ScrollDown, x, y);
     harness.mouse(MouseEventKind::ScrollDown, x, y);
-    assert_eq!(harness.app.main_view_cursor(0), 6);
+    assert_eq!(harness.app.list_scroll("main-0"), 6);
     // The editor stays open and keeps the keyboard; focus behind it is unchanged.
     let screen = harness.screen(140, 40);
     assert!(screen.contains("Summary"), "{screen}");
@@ -1636,7 +1637,7 @@ fn panels_behind_a_popup_scroll_under_the_pointer() {
         u16::try_from(row).unwrap(),
     );
     harness.mouse(MouseEventKind::Down(MouseButton::Left), x, y);
-    assert_eq!(harness.app.main_view_cursor(0), 6);
+    assert_eq!(harness.app.list_scroll("main-0"), 6);
     assert_eq!(harness.app.focused_window(), Window::Side(1));
     harness.paste("still typing");
     assert!(harness.screen(140, 40).contains("still typing"));
@@ -1644,7 +1645,7 @@ fn panels_behind_a_popup_scroll_under_the_pointer() {
 
 #[test]
 fn popups_scroll_with_the_mouse_wheel() {
-    use bmux_tui::event::MouseEventKind;
+    use bmux_tui::event::{MouseButton, MouseEventKind};
 
     let mut harness = Harness::new(|path| commit(path, "a", "a", "init"));
     harness.keys(&[":"]);
@@ -1671,6 +1672,22 @@ fn popups_scroll_with_the_mouse_wheel() {
         harness.mouse(MouseEventKind::ScrollUp, x, y);
     }
     assert!(harness.screen(120, 30).contains("row-001"));
+    // Its scrollbar, overlaid on the last column, drags to the end.
+    let lines = harness.region("popup-text");
+    let column = lines.right() - 1;
+    harness.mouse(MouseEventKind::Down(MouseButton::Left), column, lines.y);
+    harness.mouse(
+        MouseEventKind::Drag(MouseButton::Left),
+        column,
+        lines.bottom() + 3,
+    );
+    harness.mouse(
+        MouseEventKind::Up(MouseButton::Left),
+        column,
+        lines.bottom() + 3,
+    );
+    let screen = harness.screen(120, 30);
+    assert!(screen.contains("row-100"), "{screen}");
 
     // Menus scroll their items the same way.
     harness.keys(&["escape", "?"]);
@@ -1688,4 +1705,223 @@ fn popups_scroll_with_the_mouse_wheel() {
     let after = harness.screen(120, 30);
     assert!(after.contains("Keybindings"), "{after}");
     assert_ne!(before, after);
+}
+
+/// Background colors of a region's cells, row by row: what a cursor row would change.
+fn backgrounds(
+    harness: &mut Harness,
+    area: bmux_tui::geometry::Rect,
+) -> Vec<Vec<Option<bmux_tui::style::Color>>> {
+    use bmux_tui::geometry::Point;
+
+    let buffer = bcode_git_ui::render_buffer(&mut harness.app, 140, 40);
+    (area.y..area.bottom())
+        .map(|y| {
+            (area.x..area.right())
+                .map(|x| buffer.get(Point::new(x, y)).unwrap().style.bg)
+                .collect()
+        })
+        .collect()
+}
+
+fn long_change(path: &Path) {
+    let lines =
+        |prefix: &str| -> String { (0..120).map(|line| format!("{prefix} {line}\n")).collect() };
+    commit(path, "a.txt", &lines("old"), "init");
+    std::fs::write(path.join("a.txt"), lines("new")).unwrap();
+}
+
+fn many_commits(path: &Path) {
+    for index in 0..60 {
+        commit(
+            path,
+            "a.txt",
+            &format!("{index}\n"),
+            &format!("commit {index}"),
+        );
+    }
+}
+
+#[test]
+fn main_view_reads_as_a_page_until_staging() {
+    use bmux_tui::event::{MouseButton, MouseEventKind};
+
+    let mut harness = Harness::new(long_change);
+    harness.screen(140, 40);
+    let diff = harness.region("main-0");
+    let unfocused = backgrounds(&mut harness, diff);
+    // Focusing the page shows no cursor row.
+    harness.mouse(
+        MouseEventKind::Down(MouseButton::Left),
+        diff.x + 4,
+        diff.y + 3,
+    );
+    assert_eq!(harness.app.focused_window(), Window::Main);
+    assert_eq!(backgrounds(&mut harness, diff), unfocused);
+    // Keys scroll it like a page.
+    harness.keys(&["j", "j", "j"]);
+    assert_eq!(harness.app.list_scroll("main-0"), 3);
+    harness.keys(&["k"]);
+    assert_eq!(harness.app.list_scroll("main-0"), 2);
+    harness.keys(&["pagedown"]);
+    assert!(harness.app.list_scroll("main-0") > 20);
+    harness.keys(&["home"]);
+    assert_eq!(harness.app.list_scroll("main-0"), 0);
+    harness.keys(&["end"]);
+    let bottom = harness.app.list_scroll("main-0");
+    assert!(bottom > 200, "{bottom}");
+    harness.screen(140, 40);
+    harness.keys(&["home", "escape"]);
+
+    // Staging shows a cursor; the wheel scrolls past it without moving it.
+    harness.keys(&["enter"]);
+    harness.screen(140, 40);
+    assert_ne!(backgrounds(&mut harness, diff), unfocused);
+    let selected = harness.app.staging_selection();
+    assert!(!selected.is_empty());
+    harness.mouse(MouseEventKind::ScrollDown, diff.x + 4, diff.y + 3);
+    harness.mouse(MouseEventKind::ScrollDown, diff.x + 4, diff.y + 3);
+    assert_eq!(harness.app.list_scroll("main-0"), 6);
+    assert_eq!(harness.app.staging_selection(), selected);
+    // Moving the cursor brings it back into view.
+    harness.keys(&["j"]);
+    harness.screen(140, 40);
+    assert!(harness.app.list_scroll("main-0") < 6);
+}
+
+#[test]
+fn hunk_keys_scroll_the_page_to_each_hunk() {
+    let mut harness = Harness::new(|path| {
+        let text = |changed: &[usize]| -> String {
+            (0..200)
+                .map(|line| {
+                    if changed.contains(&line) {
+                        format!("changed {line}\n")
+                    } else {
+                        format!("line {line}\n")
+                    }
+                })
+                .collect()
+        };
+        commit(path, "a.txt", &text(&[]), "init");
+        // Ten hunks, more than a page.
+        let changed: Vec<usize> = (0..10).map(|hunk| hunk * 20 + 10).collect();
+        std::fs::write(path.join("a.txt"), text(&changed)).unwrap();
+    });
+    harness.screen(140, 40);
+    harness.click("main-0");
+    let first_row = |harness: &mut Harness| {
+        let diff = harness.region("main-0");
+        harness
+            .screen(140, 40)
+            .lines()
+            .nth(usize::from(diff.y))
+            .unwrap()
+            .to_owned()
+    };
+    harness.keys(&["n"]);
+    let row = first_row(&mut harness);
+    assert!(row.contains("@@"), "{row}");
+    let first = harness.app.list_scroll("main-0");
+    assert!(first > 0);
+    harness.keys(&["n"]);
+    assert!(first_row(&mut harness).contains("@@"));
+    assert!(harness.app.list_scroll("main-0") > first);
+    harness.keys(&["shift+n"]);
+    assert_eq!(harness.app.list_scroll("main-0"), first);
+}
+
+#[test]
+fn side_lists_scroll_without_moving_the_selection() {
+    use bmux_tui::event::MouseEventKind;
+
+    let mut harness = Harness::new(many_commits);
+    harness.screen(140, 40);
+    harness.keys(&["4"]);
+    let main = harness.screen(140, 40);
+    let commits = harness.region("side-4");
+    for _ in 0..5 {
+        harness.mouse(MouseEventKind::ScrollDown, commits.x + 2, commits.y + 1);
+    }
+    assert_eq!(harness.app.list_scroll("side-4"), 15);
+    assert_eq!(harness.app.view_cursor(View::Commits), 0);
+    // The selection, and so the main view, did not change.
+    let scrolled = harness.screen(140, 40);
+    let diff = harness.region("main-0");
+    let main_rows = |screen: &str| -> Vec<String> {
+        screen
+            .lines()
+            .skip(usize::from(diff.y))
+            .take(usize::from(diff.height))
+            .map(|line| line.chars().skip(usize::from(diff.x)).collect())
+            .collect()
+    };
+    assert_eq!(main_rows(&scrolled), main_rows(&main));
+
+    // The scroll position survives a restart.
+    harness.quit_and_relaunch(LoadedConfig::default());
+    harness.screen(140, 40);
+    assert_eq!(harness.app.list_scroll("side-4"), 15);
+
+    // Moving the selection brings it back into view.
+    harness.keys(&["j"]);
+    harness.screen(140, 40);
+    assert_eq!(harness.app.view_cursor(View::Commits), 1);
+    assert!(harness.app.list_scroll("side-4") <= 1);
+}
+
+#[test]
+fn border_scrollbars_appear_on_overflow_and_drag() {
+    use bmux_tui::event::{MouseButton, MouseEventKind};
+
+    let mut harness = Harness::new(many_commits);
+    harness.screen(140, 40);
+    let regions: Vec<String> = harness
+        .app
+        .hit_regions()
+        .into_iter()
+        .map(|(id, _)| id)
+        .collect();
+    // The commits overflow their pane; the one-line status does not.
+    assert!(
+        regions.iter().any(|id| id == "pane-4.scrollbar"),
+        "{regions:?}"
+    );
+    assert!(
+        !regions.iter().any(|id| id == "pane-1.scrollbar"),
+        "{regions:?}"
+    );
+    let track = harness.region("pane-4.scrollbar");
+    let screen = harness.screen(140, 40);
+    let column: String = screen
+        .lines()
+        .skip(usize::from(track.y))
+        .take(usize::from(track.height))
+        .filter_map(|line| line.chars().nth(usize::from(track.x)))
+        .collect();
+    assert!(column.starts_with('┃'), "{column}");
+
+    // Dragging the thumb to the bottom scrolls to the end without selecting anything.
+    harness.mouse(MouseEventKind::Down(MouseButton::Left), track.x, track.y);
+    harness.mouse(
+        MouseEventKind::Drag(MouseButton::Left),
+        track.x + 10,
+        track.bottom() + 5,
+    );
+    harness.mouse(
+        MouseEventKind::Up(MouseButton::Left),
+        track.x + 10,
+        track.bottom() + 5,
+    );
+    harness.screen(140, 40);
+    assert!(harness.app.list_scroll("side-4") > 0);
+    assert_eq!(harness.app.view_cursor(View::Commits), 0);
+    let column: String = harness
+        .screen(140, 40)
+        .lines()
+        .skip(usize::from(track.y))
+        .take(usize::from(track.height))
+        .filter_map(|line| line.chars().nth(usize::from(track.x)))
+        .collect();
+    assert!(column.ends_with('┃'), "{column}");
 }

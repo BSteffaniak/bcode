@@ -430,9 +430,7 @@ pub struct TextView {
     pub title: String,
     /// Content lines.
     pub lines: Vec<Line>,
-    /// Scroll position (first visible line).
-    pub selected: usize,
-    /// List state.
+    /// Scroll position.
     pub list: Cell<SelectableListState>,
 }
 
@@ -443,8 +441,7 @@ impl TextView {
         Self {
             title: title.into(),
             lines,
-            selected: 0,
-            list: Cell::new(SelectableListState::new(Some(0))),
+            list: Cell::new(SelectableListState::new(None)),
         }
     }
 }

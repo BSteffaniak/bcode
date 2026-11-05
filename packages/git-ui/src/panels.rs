@@ -379,21 +379,21 @@ pub struct PanelView<'a> {
 
 /// A resizable group: overlay dividers on the panes' shared borders, flex preserved.
 ///
-/// Side by side, the handle covers both adjacent border columns. Stacked, it covers only the
-/// upper pane's bottom border, because the lower pane's top border holds its title and
-/// buttons.
+/// Side by side, the handle covers only the right pane's left border, because the left pane's
+/// right border holds its scrollbar. Stacked, it covers only the upper pane's bottom border,
+/// because the lower pane's top border holds its title and buttons.
 #[must_use]
 pub const fn group(axis: PanelGroupAxis, theme: &GitTheme) -> PanelGroup {
-    let after = match axis {
-        PanelGroupAxis::Horizontal => 1,
-        PanelGroupAxis::Vertical => 0,
+    let (before, after) = match axis {
+        PanelGroupAxis::Horizontal => (0, 1),
+        PanelGroupAxis::Vertical => (1, 0),
     };
     PanelGroup::new(axis)
         .policy(PanelGroupPolicy {
             resize: PanelGroupResizePolicy::live().preserving_flex(true),
             ..PanelGroupPolicy::resize_only()
         })
-        .divider_mode(PanelDividerMode::Overlay { before: 1, after })
+        .divider_mode(PanelDividerMode::Overlay { before, after })
         .styles(PanelGroupStyles {
             divider: Style::new(),
             hovered_divider: theme.border_focused,

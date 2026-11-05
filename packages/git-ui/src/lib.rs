@@ -24,6 +24,7 @@ pub mod ops;
 pub mod panels;
 pub mod popup;
 mod run;
+mod scroll;
 pub mod session;
 pub mod theme;
 mod view;

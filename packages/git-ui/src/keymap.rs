@@ -168,8 +168,8 @@ actions! {
     Redo => Global, "redo", "Redo", ["ctrl+z"];
     ScreenModeNext => Global, "screen-mode-next", "Enlarge focused view", ["+"];
     ScreenModePrevious => Global, "screen-mode-previous", "Shrink focused view", ["_"];
-    ScrollMainUp => Global, "scroll-main-up", "Scroll main view up", ["ctrl+u", "shift+k"];
-    ScrollMainDown => Global, "scroll-main-down", "Scroll main view down", ["ctrl+d", "shift+j"];
+    ScrollMainUp => Global, "scroll-main-up", "Scroll main view up half a page", ["ctrl+u", "shift+k"];
+    ScrollMainDown => Global, "scroll-main-down", "Scroll main view down half a page", ["ctrl+d", "shift+j"];
     DiffContextMore => Global, "diff-context-more", "More diff context", ["}"];
     DiffContextLess => Global, "diff-context-less", "Less diff context", ["{"];
     DiffingMenu => Global, "diffing-menu", "Diff against selection", ["shift+w"];
@@ -310,6 +310,10 @@ actions! {
     // Main view
     MainLineUp => Main, "line-up", "Scroll up", ["k", "up"];
     MainLineDown => Main, "line-down", "Scroll down", ["j", "down"];
+    MainPageUp => Main, "page-up", "Previous page", [",", "pageup"];
+    MainPageDown => Main, "page-down", "Next page", [".", "pagedown"];
+    MainTop => Main, "top", "Top", ["<", "home", "g g"];
+    MainBottom => Main, "bottom", "Bottom", [">", "end", "shift+g"];
     MainNextHunk => Main, "next-hunk", "Next hunk", ["n", "]"];
     MainPreviousHunk => Main, "previous-hunk", "Previous hunk", ["shift+n", "["];
 

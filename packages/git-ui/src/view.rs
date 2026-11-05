@@ -16,7 +16,7 @@ use bmux_tui_components::panel_group::{PanelGroupAxis, PanelGroupComponent};
 use bmux_tui_components::scrollbar_layout::ScrollbarAxisLayoutMode;
 use bmux_tui_components::selectable_list::{
     SelectableListComponent, SelectableListHighlightPolicy, SelectableListItem,
-    SelectableListPolicy, SelectableListState, SelectableListStyles,
+    SelectableListPolicy, SelectableListState, SelectableListStyles, list_viewport_id,
 };
 use bmux_tui_components::tab_bar::{
     TabBarComponent, TabBarPolicy, TabBarState, TabBarStyles, TabItem,
@@ -46,7 +46,6 @@ pub struct Frame {
     tab_states: Vec<std::cell::RefCell<TabBarState>>,
     main_panes: [Cell<PaneState>; 2],
     log_pane: Cell<PaneState>,
-    log_state: Cell<SelectableListState>,
 }
 
 const MIN_WIDTH: u16 = 30;
@@ -130,7 +129,6 @@ impl Frame {
                 .collect(),
             main_panes: [pane_state(), pane_state()],
             log_pane: pane_state(),
-            log_state: Cell::new(SelectableListState::new(None)),
             side,
         }
     }
@@ -506,8 +504,10 @@ fn popup_items(app: &App) -> Vec<SelectableListItem> {
     }
 }
 
-/// Wraps a list so the focused row is revealed against the measured viewport before painting.
-struct Revealed<'a, 'state>(SelectableListComponent<'a, 'state>);
+/// Wraps a list so a cursor that moved since the last frame is revealed against the measured
+/// viewport before painting. Otherwise the list keeps its own scroll position, which the
+/// wheel and the scrollbar change without moving the cursor.
+struct Revealed<'a, 'state>(SelectableListComponent<'a, 'state>, bool);
 
 impl bmux_tui::component::Component for Revealed<'_, '_> {
     fn layout(
@@ -523,7 +523,9 @@ impl bmux_tui::component::Component for Revealed<'_, '_> {
         layout: &bmux_tui::component::LayoutNode,
         cx: &mut bmux_tui::paint::PaintCx<'_, '_>,
     ) {
-        self.0.reveal_focus(layout);
+        if self.1 {
+            self.0.reveal_focus(layout);
+        }
         self.0.paint(layout, cx);
     }
 
@@ -544,6 +546,7 @@ struct WrappedList<'a> {
     state: &'a Cell<SelectableListState>,
     policy: SelectableListPolicy,
     styles: SelectableListStyles,
+    reveal: bool,
     wrapped: std::cell::RefCell<Option<(u64, Vec<SelectableListItem>)>>,
 }
 
@@ -594,7 +597,9 @@ impl bmux_tui::component::Component for WrappedList<'_> {
     ) {
         self.with_items(layout.size.width, |items| {
             let list = self.component(items);
-            list.reveal_focus(layout);
+            if self.reveal {
+                list.reveal_focus(layout);
+            }
             list.paint(layout, cx);
         });
     }
@@ -664,14 +669,31 @@ fn wrap_item(item: &SelectableListItem, gutter: usize, width: usize) -> Selectab
     SelectableListItem::multiline(item.id.clone(), lines)
 }
 
-/// Selection, focus and styling shared by every list.
+/// Scrollbar of popup lists: inside the popup's frame, shown only while the list overflows.
+/// (Panes carry theirs on the border instead.)
+pub const POPUP_SCROLLBAR: ScrollbarAxisLayoutMode = ScrollbarAxisLayoutMode::OverlayOnOverflow;
+
+/// Behaviour shared by every list, with the given integrated scrollbar.
+pub const fn list_base_policy(scrollbar: ScrollbarAxisLayoutMode) -> SelectableListPolicy {
+    SelectableListPolicy {
+        highlight: SelectableListHighlightPolicy::new("", false),
+        ..SelectableListPolicy::interactive()
+    }
+    .scrollbar(scrollbar)
+}
+
+/// Selection, focus and styling shared by every list. `cursor` is the highlighted row, if
+/// any; lists read as pages have none. Also returns whether the cursor moved since the last
+/// frame, in which case it is scrolled into view.
 fn list_policy(
     app: &App,
     state: &Cell<SelectableListState>,
     cursor: Option<usize>,
     focused: bool,
-) -> (SelectableListPolicy, SelectableListStyles) {
+    scrollbar: ScrollbarAxisLayoutMode,
+) -> (SelectableListPolicy, SelectableListStyles, bool) {
     let mut current = state.get();
+    let moved = cursor.is_some() && current.focused() != cursor;
     current.set_focused(cursor);
     current.set_selected(cursor);
     current.interaction.focused = focused;
@@ -692,12 +714,7 @@ fn list_policy(
         disabled: Style::new(),
         ..SelectableListStyles::default()
     };
-    let policy = SelectableListPolicy {
-        highlight: SelectableListHighlightPolicy::new("", false),
-        ..SelectableListPolicy::interactive()
-    }
-    .scrollbar(ScrollbarAxisLayoutMode::Hidden);
-    (policy, styles)
+    (list_base_policy(scrollbar), styles, moved)
 }
 
 fn list<'a>(
@@ -707,12 +724,14 @@ fn list<'a>(
     state: &'a Cell<SelectableListState>,
     cursor: Option<usize>,
     focused: bool,
+    scrollbar: ScrollbarAxisLayoutMode,
 ) -> Revealed<'a, 'a> {
-    let (policy, styles) = list_policy(app, state, cursor, focused);
+    let (policy, styles, moved) = list_policy(app, state, cursor, focused, scrollbar);
     Revealed(
         SelectableListComponent::new(id, items, state)
             .policy(policy)
             .styles(styles),
+        moved,
     )
 }
 
@@ -753,6 +772,10 @@ impl<'a> PaneTitle<'a> {
     }
 }
 
+/// The list a pane scrolls through its border scrollbar: its layout id and state.
+type Scrolled<'a> = Option<(String, &'a Cell<SelectableListState>)>;
+
+#[allow(clippy::too_many_arguments)]
 fn pane_with<'a>(
     app: &'a App,
     id: impl Into<String>,
@@ -760,6 +783,7 @@ fn pane_with<'a>(
     focused: bool,
     state: &'a Cell<PaneState>,
     actions: &[(&str, &str)],
+    scrolled: Scrolled<'a>,
     child: impl bmux_tui::component::Component + 'a,
 ) -> PaneComponent<'a, 'a> {
     let mut current = state.get();
@@ -784,7 +808,13 @@ fn pane_with<'a>(
             Line::from_spans(vec![Span::styled((*label).to_owned(), app.theme.muted)]),
         ));
     }
-    let component = PaneComponent::new(id.into(), chrome, state, child);
+    let mut component = PaneComponent::new(id.into(), chrome, state, child);
+    if let Some((list, list_state)) = scrolled {
+        component = component.border_scrollbar(
+            list_viewport_id(&bmux_tui::component::LayoutId::new(list)),
+            list_state,
+        );
+    }
     match title_content {
         Some(title) => component.title_content(title),
         None => component,
@@ -1006,17 +1036,20 @@ fn side_pane<'a>(app: &'a App, frame: &'a Frame, position: usize) -> Element<'a>
             focused,
             &frame.side_panes[position],
             &actions,
+            None,
             TextBlock::new(""),
         ));
     }
     let cursor = (!app.rows(*view).is_empty()).then(|| app.cursor(*view));
+    let list_id = crate::scroll::side_list(*window);
     let content = list(
         app,
-        format!("side-{}", window.number()),
+        list_id.clone(),
         items,
         &app.lists[view],
         cursor,
         focused,
+        ScrollbarAxisLayoutMode::Hidden,
     );
     Element::new(pane_with(
         app,
@@ -1025,6 +1058,7 @@ fn side_pane<'a>(app: &'a App, frame: &'a Frame, position: usize) -> Element<'a>
         focused,
         &frame.side_panes[position],
         &actions,
+        Some((list_id, &app.lists[view])),
         content,
     ))
 }
@@ -1114,32 +1148,37 @@ fn main_column<'a>(app: &'a App, frame: &'a Frame) -> Element<'a> {
                 theme.muted,
             ));
         }
-        // The repository overview is not interactive, so it shows no cursor row.
-        let overview = matches!(
-            app.main.as_ref().map(|main| &main.request),
-            Some(crate::data::MainRequest::Status)
-        );
-        let cursor = (!overview).then(|| app.main_cursor[section]);
+        // The main view reads as a page; only staging shows a cursor, in its section.
+        let cursor = (focused && app.staging.is_some()).then(|| app.main_cursor[section]);
+        let list_id = crate::scroll::main_list(section);
         let content = if app.config.diff.wrap_lines {
-            let (policy, styles) = list_policy(app, &app.main_lists[section], cursor, focused);
+            let (policy, styles, reveal) = list_policy(
+                app,
+                &app.main_lists[section],
+                cursor,
+                focused,
+                ScrollbarAxisLayoutMode::Hidden,
+            );
             Element::new(WrappedList {
-                id: format!("main-{section}"),
+                id: list_id.clone(),
                 source: &frame.main[section],
                 gutters: &frame.main_gutters[section],
                 compact: &frame.main_compact[section],
                 state: &app.main_lists[section],
                 policy,
                 styles,
+                reveal,
                 wrapped: std::cell::RefCell::new(None),
             })
         } else {
             Element::new(list(
                 app,
-                format!("main-{section}"),
+                list_id.clone(),
                 &frame.main[section],
                 &app.main_lists[section],
                 cursor,
                 focused,
+                ScrollbarAxisLayoutMode::Hidden,
             ))
         };
         section_panes.push(pane_with(
@@ -1149,6 +1188,7 @@ fn main_column<'a>(app: &'a App, frame: &'a Frame) -> Element<'a> {
             focused,
             &frame.main_panes[section],
             &[("maximize", "□")],
+            Some((list_id, &app.main_lists[section])),
             content,
         ));
     }
@@ -1176,16 +1216,14 @@ fn main_column<'a>(app: &'a App, frame: &'a Frame) -> Element<'a> {
         None => group.child(column),
     };
     if app.command_log {
-        let content = SelectableListComponent::new("command-log", &frame.log, &frame.log_state)
-            .policy(SelectableListPolicy {
-                highlight: SelectableListHighlightPolicy::new("", false),
-                ..SelectableListPolicy::interactive()
-            })
-            .styles(SelectableListStyles {
-                focused: Style::new(),
-                selected: Style::new(),
-                ..SelectableListStyles::default()
-            });
+        let content =
+            SelectableListComponent::new(crate::scroll::LOG_LIST, &frame.log, &app.log_list)
+                .policy(list_base_policy(ScrollbarAxisLayoutMode::Hidden))
+                .styles(SelectableListStyles {
+                    focused: Style::new(),
+                    selected: Style::new(),
+                    ..SelectableListStyles::default()
+                });
         group = group.child(pane_with(
             app,
             "pane-log",
@@ -1196,6 +1234,7 @@ fn main_column<'a>(app: &'a App, frame: &'a Frame) -> Element<'a> {
             false,
             &frame.log_pane,
             &[("close", "✕")],
+            Some((crate::scroll::LOG_LIST.to_owned(), &app.log_list)),
             content,
         ));
     }
@@ -1458,11 +1497,12 @@ fn popup<'a>(app: &'a App, frame: &'a Frame) -> Option<Element<'a>> {
                 .min(30);
             let items = list(
                 app,
-                "popup-list".into(),
+                crate::scroll::MENU_LIST.into(),
                 &frame.popup,
                 &menu.list,
                 (visible > 0).then_some(menu.selected.min(visible.saturating_sub(1))),
                 true,
+                POPUP_SCROLLBAR,
             );
             let mut column = Column::new();
             if let Some(filter) = &menu.filter {
@@ -1485,13 +1525,15 @@ fn popup<'a>(app: &'a App, frame: &'a Frame) -> Option<Element<'a>> {
                 .unwrap_or(u16::MAX)
                 .saturating_add(4)
                 .min(40);
+            // Read as a page: no cursor row.
             let items = list(
                 app,
-                "popup-text".into(),
+                crate::scroll::TEXT_LIST.into(),
                 &frame.popup,
                 &view.list,
-                Some(view.selected),
+                None,
                 false,
+                POPUP_SCROLLBAR,
             );
             Some(modal(app, &view.title, 110, height, items))
         }

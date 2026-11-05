@@ -177,6 +177,8 @@ fn paint(app: &mut App, cx: &mut bmux_tui::paint::PaintCx<'_, '_>) {
     // Pointer input inside the popup's panel belongs to the popup.
     app.popup_area
         .set(placed.find_visible_rect(&bmux_tui::component::LayoutId::new("popup.surface")));
+    // Wheel, scrollbar and paging input scroll lists through the geometry painted here.
+    *app.painted.borrow_mut() = crate::scroll::capture(app, &layout, &placed);
 }
 
 fn commit(app: &mut App, hits: &bmux_tui::hit::HitMap, _focus: &bmux_tui::focus::FocusTrap) {
