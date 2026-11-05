@@ -11,7 +11,9 @@ repository  = { workspace = true }
 version     = { workspace = true }
 
 [dependencies]
-bcode_git_models = { workspace = true }
+bcode_git_models   = { workspace = true }
+bmux_pty           = { workspace = true }
+bmux_terminal_grid = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }

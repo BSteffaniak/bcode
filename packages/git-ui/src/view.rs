@@ -2,8 +2,8 @@
 
 use std::cell::Cell;
 
-use bcode_git::models::{ChangeKind, DiffFileStatus, StatusEntry, SubmoduleState};
-use bmux_tui::component::Element;
+use bcode_git::models::{ChangeKind, CommandStatus, DiffFileStatus, StatusEntry, SubmoduleState};
+use bmux_tui::component::{Element, LayoutId};
 use bmux_tui::composition::{Column, Flex, Row as BoxRow, SizeBox, Stack, Surface, TextBlock};
 use bmux_tui::geometry::{Insets, Rect, Size};
 use bmux_tui::style::{Modifier, Style};
@@ -13,6 +13,7 @@ use bmux_tui_components::modal_frame::{
 };
 use bmux_tui_components::pane::{Pane, PaneComponent, PaneState, PaneStyles, PaneTitleAction};
 use bmux_tui_components::panel_group::{PanelGroupAxis, PanelGroupComponent};
+use bmux_tui_components::scroll_view::{ScrollSource, ScrollViewComponent};
 use bmux_tui_components::scrollbar_layout::ScrollbarAxisLayoutMode;
 use bmux_tui_components::selectable_list::{
     SelectableListComponent, SelectableListHighlightPolicy, SelectableListItem,
@@ -20,6 +21,9 @@ use bmux_tui_components::selectable_list::{
 };
 use bmux_tui_components::tab_bar::{
     TabBarComponent, TabBarPolicy, TabBarState, TabBarStyles, TabItem,
+};
+use bmux_tui_components::terminal_view::{
+    TerminalState, TerminalStatus, TerminalViewComponent, TerminalViewMode,
 };
 use bmux_tui_components::text_input::TextInputPolicy;
 use bmux_tui_components::text_input_box::{
@@ -39,7 +43,6 @@ pub struct Frame {
     main: Vec<Vec<SelectableListItem>>,
     main_gutters: Vec<Vec<Option<usize>>>,
     main_compact: Vec<Vec<Option<Line>>>,
-    log: Vec<SelectableListItem>,
     popup: Vec<SelectableListItem>,
     side_panes: Vec<Cell<PaneState>>,
     side_tabs: Vec<Vec<TabItem<'static>>>,
@@ -81,41 +84,6 @@ impl Frame {
                     .unwrap_or_default()
             })
             .collect();
-        let records = app.repo.command_log();
-        let log: Vec<SelectableListItem> = records
-            .iter()
-            .enumerate()
-            .rev()
-            .take(100)
-            .map(|(index, record)| {
-                let mut lines = vec![Line::from_spans(vec![
-                    Span::styled(
-                        if record.success { "✓ " } else { "✗ " },
-                        if record.success {
-                            app.theme.success
-                        } else {
-                            app.theme.error
-                        },
-                    ),
-                    Span::styled(record.display(), app.theme.text),
-                    Span::styled(format!("  {}ms", record.duration_ms), app.theme.muted),
-                ])];
-                // A failure shows why, beneath the command.
-                lines.extend(
-                    record
-                        .error
-                        .iter()
-                        .flat_map(|error| error.lines())
-                        .map(|line| {
-                            Line::from_spans(vec![Span::styled(
-                                format!("  {line}"),
-                                app.theme.error,
-                            )])
-                        }),
-                );
-                SelectableListItem::multiline(index.to_string(), lines)
-            })
-            .collect();
         let popup = popup_items(app);
         let main_compact = (0..2)
             .map(|section| {
@@ -130,7 +98,6 @@ impl Frame {
             main,
             main_gutters,
             main_compact,
-            log,
             popup,
             side_panes: side.iter().map(|_| pane_state()).collect(),
             side_tabs: side_tab_items(app, &side),
@@ -783,8 +750,9 @@ impl<'a> PaneTitle<'a> {
     }
 }
 
-/// The list a pane scrolls through its border scrollbar: its layout id and state.
-type Scrolled<'a> = Option<(String, &'a Cell<SelectableListState>)>;
+/// What a pane scrolls through its border scrollbar: the scrolled viewport's layout id and
+/// the state holding its position.
+type Scrolled<'a> = Option<(LayoutId, &'a dyn ScrollSource)>;
 
 #[allow(clippy::too_many_arguments)]
 fn pane_with<'a>(
@@ -820,11 +788,8 @@ fn pane_with<'a>(
         ));
     }
     let mut component = PaneComponent::new(id.into(), chrome, state, child);
-    if let Some((list, list_state)) = scrolled {
-        component = component.border_scrollbar(
-            list_viewport_id(&bmux_tui::component::LayoutId::new(list)),
-            list_state,
-        );
+    if let Some((viewport, source)) = scrolled {
+        component = component.border_scrollbar(viewport, source);
     }
     match title_content {
         Some(title) => component.title_content(title),
@@ -1069,7 +1034,7 @@ fn side_pane<'a>(app: &'a App, frame: &'a Frame, position: usize) -> Element<'a>
         focused,
         &frame.side_panes[position],
         &actions,
-        Some((list_id, &app.lists[view])),
+        Some((list_viewport_id(&LayoutId::new(list_id)), &app.lists[view])),
         content,
     ))
 }
@@ -1199,7 +1164,10 @@ fn main_column<'a>(app: &'a App, frame: &'a Frame) -> Element<'a> {
             focused,
             &frame.main_panes[section],
             &[("maximize", "□")],
-            Some((list_id, &app.main_lists[section])),
+            Some((
+                list_viewport_id(&LayoutId::new(list_id.clone())),
+                &app.main_lists[section],
+            )),
             content,
         ));
     }
@@ -1227,14 +1195,6 @@ fn main_column<'a>(app: &'a App, frame: &'a Frame) -> Element<'a> {
         None => group.child(column),
     };
     if app.command_log {
-        let content =
-            SelectableListComponent::new(crate::scroll::LOG_LIST, &frame.log, &app.log_list)
-                .policy(list_base_policy(ScrollbarAxisLayoutMode::Hidden))
-                .styles(SelectableListStyles {
-                    focused: Style::new(),
-                    selected: Style::new(),
-                    ..SelectableListStyles::default()
-                });
         group = group.child(pane_with(
             app,
             "pane-log",
@@ -1245,11 +1205,87 @@ fn main_column<'a>(app: &'a App, frame: &'a Frame) -> Element<'a> {
             false,
             &frame.log_pane,
             &[("close", "✕")],
-            Some((crate::scroll::LOG_LIST.to_owned(), &app.log_list)),
-            content,
+            Some((LayoutId::new(crate::scroll::LOG_LIST), &app.log_scroll)),
+            command_log(app),
         ));
     }
     Element::new(group)
+}
+
+/// Rows of output shown under each command-log entry (its end, when longer).
+const LOG_OUTPUT_ROWS: u64 = 12;
+
+/// The command log, newest first: each command, its status and duration, and the end of its
+/// terminal output (live while it runs). The whole log scrolls.
+fn command_log(app: &App) -> Element<'_> {
+    let theme = &app.theme;
+    let text = |spans: Vec<Span>| {
+        TextBlock::new(Text::from_lines(vec![Line::from_spans(spans)])).wrap(TextWrap::None)
+    };
+    let mut entries = Column::new();
+    for record in &app.log_records {
+        let (mark, style) = match record.status {
+            CommandStatus::Running => ("● ", theme.warning),
+            CommandStatus::Succeeded => ("✓ ", theme.success),
+            CommandStatus::Failed => ("✗ ", theme.error),
+        };
+        let mut header = vec![
+            Span::styled(mark, style),
+            Span::styled(record.display(), theme.text),
+        ];
+        if !record.running() {
+            header.push(Span::styled(
+                format!("  {}ms", record.duration_ms),
+                theme.muted,
+            ));
+        }
+        entries = entries.child(text(header));
+        let output = app
+            .log_terminals
+            .get(&record.id)
+            .filter(|output| !output.terminal.is_empty());
+        if let Some(output) = output {
+            entries = entries.child(
+                Surface::new(
+                    TerminalViewComponent::new(format!("log-{}", record.id), &output.terminal)
+                        .mode(TerminalViewMode::Reflow)
+                        .max_rows(LOG_OUTPUT_ROWS)
+                        .cursor(false),
+                )
+                .padding(Insets::new(0, 0, 0, 2)),
+            );
+            if record.output_truncated {
+                entries = entries.child(text(vec![Span::styled(
+                    "  … later output not kept",
+                    theme.muted,
+                )]));
+            }
+        } else if let Some(error) = &record.error {
+            // Without recorded output (it ran on pipes), the failure's reason.
+            for line in error.lines() {
+                entries = entries.child(text(vec![Span::styled(format!("  {line}"), theme.error)]));
+            }
+        }
+    }
+    Element::new(
+        ScrollViewComponent::new(
+            crate::scroll::LOG_LIST,
+            bmux_tui::component::LogicalSize::new(0, 0),
+            app.log_scroll.get(),
+            entries,
+        )
+        .fill()
+        .retain_state(&app.log_scroll),
+    )
+}
+
+/// Widest a terminal popup gets.
+pub const TERMINAL_POPUP_WIDTH: u16 = 140;
+
+/// The view of a terminal popup's terminal (shared with scroll capture, so both agree on its
+/// scrollbar).
+pub fn terminal_popup_view(terminal: &TerminalState) -> TerminalViewComponent<'_> {
+    TerminalViewComponent::new(crate::scroll::TERMINAL_LIST, terminal).scrollbar(POPUP_SCROLLBAR)
 }
 
 fn key(app: &App, action: Action) -> String {
@@ -1547,6 +1583,24 @@ fn popup<'a>(app: &'a App, frame: &'a Frame) -> Option<Element<'a>> {
                 POPUP_SCROLLBAR,
             );
             Some(modal(app, &view.title, 110, height, items))
+        }
+        Popup::Terminal(run) => {
+            let status = match run.terminal.status() {
+                TerminalStatus::Running => {
+                    format!("running · {} stops", key(app, Action::MenuInterrupt))
+                }
+                TerminalStatus::Exited(Some(0)) => "done".to_owned(),
+                TerminalStatus::Exited(Some(code)) => format!("exit {code}"),
+                TerminalStatus::Exited(None) => "stopped".to_owned(),
+            };
+            let height = app.size.get().1.saturating_mul(4) / 5;
+            Some(modal(
+                app,
+                &format!("$ {} · {status}", run.command),
+                TERMINAL_POPUP_WIDTH,
+                height,
+                terminal_popup_view(&run.terminal),
+            ))
         }
         Popup::Confirm(confirm) => Some(modal(
             app,

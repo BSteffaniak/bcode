@@ -5,9 +5,11 @@ use std::path::PathBuf;
 
 use bcode_git::StashOptions;
 use bcode_git::models::{CommitMessageSource, RemoteBranch, StashEntry};
+use bmux_pty::PtyProcess;
 use bmux_text_edit::TextEditBuffer;
 use bmux_tui::text::Line;
 use bmux_tui_components::selectable_list::SelectableListState;
+use bmux_tui_components::terminal_view::TerminalState;
 use bmux_tui_components::text_input::TextInputState;
 
 use crate::keymap::Action;
@@ -35,6 +37,13 @@ pub enum Then {
     },
     /// Launch an external program with the terminal attached.
     External(External),
+    /// Run a shell command, showing its terminal output live in a popup.
+    Terminal {
+        /// The command line.
+        command: String,
+        /// Close the popup when the command succeeds (it stays open when it fails).
+        close_on_success: bool,
+    },
     /// Change the panel layout.
     Layout(crate::panels::LayoutCommand),
     /// Close without doing anything.
@@ -446,6 +455,21 @@ impl TextView {
     }
 }
 
+/// A shell command running (or finished) on a terminal, shown live.
+#[derive(Debug)]
+pub struct TerminalRun {
+    /// The command line.
+    pub command: String,
+    /// What it wrote to its terminal.
+    pub terminal: TerminalState,
+    /// The process while it runs.
+    pub process: Option<PtyProcess>,
+    /// Close when the command succeeds.
+    pub close_on_success: bool,
+    /// Whether it was interrupted; interrupting again kills it.
+    pub interrupted: bool,
+}
+
 /// A modal popup.
 #[derive(Debug)]
 pub enum Popup {
@@ -457,6 +481,8 @@ pub enum Popup {
     Prompt(Prompt),
     /// Read-only text.
     Text(TextView),
+    /// A command's live terminal (boxed: it holds a terminal emulator).
+    Terminal(Box<TerminalRun>),
 }
 
 #[cfg(test)]

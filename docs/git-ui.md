@@ -33,6 +33,12 @@ All repository work runs off the input thread. Panel data loads in parallel and 
 navigation coalesces to the latest request, so large repositories stay responsive. Mutations run
 one at a time in order and are recorded in the command log (`@`).
 
+Git commands shown in the command log run on a pseudo-terminal, so their output looks as it does
+in a terminal: progress counters, colors and hook output (for example pre-commit checks) appear
+live under the running command, and stay with it afterwards (the most recent 100 commands keep
+their output, up to 1 MiB each). Standard output stays a plain pipe, so what the client parses is
+unaffected. Commands it only reads with (status, log, diffs) run on pipes and are not logged.
+
 ### Partial staging
 
 Hunk, line and range staging build a minimal patch from the selected lines and apply it with
@@ -103,7 +109,7 @@ popups show theirs inside the frame. Scroll positions are kept with the session.
 
 While a popup such as the commit editor is open, the mouse wheel still scrolls the panel under
 the pointer behind it (outside the popup); clicks behind a popup are ignored. Over a menu (help,
-palette, option menus) or a text viewer (command output), the wheel scrolls the popup.
+palette, option menus), a text viewer or a command's terminal, the wheel scrolls the popup.
 
 Terminals narrower than 84 columns stack the side windows above the main view. Mouse clicks focus
 windows and select rows; clicking the selected row again opens it. Every part of this is
@@ -132,7 +138,7 @@ configurable; see [Layout settings](#layout-settings).
   first; a branch checked out in another worktree is fast-forwarded there, files included), upstream
   management, remote branch checkout, add/edit/remove/fetch remotes, push tags.
 * **Errors**: a failed git command shows git's reason in a toast, with its full output in a popup
-  when long; the command log keeps the reason under the failed command.
+  when long; the command log keeps its terminal output, ending with the reason.
 * **Sync**: fetch, pull (merge or rebase), push with upstream setup and force-with-lease when
   behind. Optional periodic background fetch.
 * **Operations in progress**: merges, rebases, cherry-picks and reverts show a banner; `m` offers
@@ -144,8 +150,11 @@ configurable; see [Layout settings](#layout-settings).
   view and runs the chosen action, `ctrl+p` is a command palette over all actions, and a popup
   shows continuations while a key sequence (such as `g g`) is pending.
 * **Custom commands**: user-defined shell commands with prompts, placeholders and confirmation.
-* **Shell commands** (`:`): up and down recall earlier commands (down past the newest restores
-  what was being typed); the history is kept with the session for the directory.
+* **Shell commands** (`:`): run on a terminal shown live in a popup, with colors, progress and
+  full-screen programs as a terminal shows them. `ctrl+c` stops a running command; the popup stays
+  open with how it ended, and `escape` closes it (stopping it if it still runs). Up and down recall
+  earlier commands (down past the newest restores what was being typed); the history is kept with
+  the session for the directory.
 
 ## Configuration
 
@@ -251,7 +260,7 @@ description = "Open a pull request"
 prompts = [{ name = "title", title = "PR title" }]
 confirm = false
 interactive = false             # true hands the terminal to the command
-show_output = true
+show_output = true              # keep the live output popup open when it succeeds
 ```
 
 ### Layout settings
@@ -668,6 +677,7 @@ currently use `StandaloneHost`, which contributes nothing.
 | `bcode.git.menu.down` | Next option | `j`, `down`, `ctrl+n` |
 | `bcode.git.menu.confirm` | Choose option | `enter` |
 | `bcode.git.menu.close` | Close | `escape`, `q` |
+| `bcode.git.menu.interrupt` | Interrupt running command | `ctrl+c` |
 
 ### `git.input`
 

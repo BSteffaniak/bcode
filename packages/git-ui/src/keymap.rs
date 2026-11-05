@@ -335,6 +335,7 @@ actions! {
     MenuDown => Menu, "down", "Next option", ["j", "down", "ctrl+n"];
     MenuConfirm => Menu, "confirm", "Choose option", ["enter"];
     MenuClose => Menu, "close", "Close", ["escape", "q"];
+    MenuInterrupt => Menu, "interrupt", "Interrupt running command", ["ctrl+c"];
 
     // Input
     InputSubmit => Input, "submit", "Submit", ["enter"];

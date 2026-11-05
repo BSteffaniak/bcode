@@ -1078,6 +1078,7 @@ impl App {
             | Action::MenuDown
             | Action::MenuConfirm
             | Action::MenuClose
+            | Action::MenuInterrupt
             | Action::InputSubmit
             | Action::InputCancel
             | Action::InputToggleAmend
@@ -1506,7 +1507,7 @@ impl App {
                 Then::Confirm {
                     title: "Clean".into(),
                     message: "Delete every untracked file and directory?".into(),
-                    then: Box::new(Then::op(Op::Shell("git clean -fd".into()))),
+                    then: Box::new(Then::op(Op::CleanUntracked)),
                 },
             ),
             MenuItem::new(
@@ -2490,7 +2491,7 @@ pub fn submit_prompt(app: &mut App, prompt: Prompt) -> Update<Msg> {
         }]),
         PromptKind::Shell => {
             app.shell_history.push(&value);
-            app.run_ops_with_output(vec![Op::Shell(value)], true)
+            app.run_in_terminal(value, false)
         }
         PromptKind::RemoteCheckoutName(branch) => {
             let start = branch.full_name();
@@ -2602,7 +2603,10 @@ pub fn custom_command(app: &mut App, index: usize, values: Vec<(String, String)>
             pause: true,
         })
     } else {
-        Then::Ops(vec![Op::Shell(text.clone())])
+        Then::Terminal {
+            command: text.clone(),
+            close_on_success: !command.show_output,
+        }
     };
     if command.confirm {
         return app.apply(Then::Confirm {

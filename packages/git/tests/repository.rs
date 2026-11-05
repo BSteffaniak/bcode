@@ -614,7 +614,7 @@ fn failed_commands_keep_git_message_in_the_log() {
         .rev()
         .find(|record| record.args.first().is_some_and(|arg| arg == "branch"))
         .unwrap();
-    assert!(!record.success);
+    assert!(!record.success());
     let error = record.error.unwrap();
     assert!(
         error.contains("missing") && error.contains("not found"),
@@ -625,7 +625,7 @@ fn failed_commands_keep_git_message_in_the_log() {
         repo.repo
             .command_log()
             .iter()
-            .filter(|record| record.success)
+            .filter(|record| record.success())
             .all(|record| record.error.is_none())
     );
 }
@@ -705,4 +705,127 @@ fn fast_forwards_branches_here_elsewhere_and_in_other_worktrees() {
         error.message()
     );
     assert_eq!(git(&worktree, &["rev-parse", "HEAD"]).trim(), mine);
+}
+
+/// Terminal output recorded for the last logged command whose arguments start with `first`.
+fn recorded_output(repo: &TempRepo, first: &str) -> (bcode_git::models::GitCommandRecord, String) {
+    let log = repo.repo.runner().log();
+    let record = log
+        .records()
+        .into_iter()
+        .rev()
+        .find(|record| record.args.first().is_some_and(|arg| arg == first))
+        .unwrap();
+    let output = String::from_utf8_lossy(&log.output(record.id, 0)).into_owned();
+    (record, output)
+}
+
+#[cfg(unix)]
+#[test]
+fn logged_commands_record_their_terminal_output_and_keep_stdout_exact() {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    let repo = TempRepo::init();
+    repo.write("f", b"1\n");
+    repo.commit_all("one");
+    // A hook that prints in color only on a terminal, as hook tools do.
+    // Use this repository's hooks, whatever the user's configuration says.
+    git(repo.path(), &["config", "core.hooksPath", ".git/hooks"]);
+    let hook = repo.path().join(".git/hooks/pre-commit");
+    std::fs::write(
+        &hook,
+        "#!/bin/sh\nif [ -t 1 ]; then printf '\\033[32mchecks passed\\033[0m\\n'; else echo 'no terminal'; fi\n",
+    )
+    .unwrap();
+    std::fs::set_permissions(&hook, std::fs::Permissions::from_mode(0o755)).unwrap();
+    repo.write("f", b"2\n");
+    git(repo.path(), &["add", "f"]);
+    repo.repo
+        .commit(&CommitOptions {
+            message: "two".into(),
+            ..CommitOptions::default()
+        })
+        .unwrap();
+    let (record, output) = recorded_output(&repo, "commit");
+    assert!(record.success() && !record.running() && !record.output_truncated);
+    // The hook saw a terminal (git sends hook output to standard error).
+    assert!(
+        output.contains("\u{1b}[32mchecks passed\u{1b}[0m\r\n"),
+        "{output:?}"
+    );
+
+    // Parsed output stays exact while its terminal copy is recorded.
+    let runner = repo.repo.runner();
+    let head = runner
+        .run(&bcode_git::GitInvocation::read(["rev-parse", "HEAD"]).logged())
+        .unwrap();
+    let head = head.stdout_lossy();
+    assert!(head.ends_with('\n') && !head.contains('\r'), "{head:?}");
+    let (_, output) = recorded_output(&repo, "rev-parse");
+    assert_eq!(output, format!("{}\r\n", head.trim_end()));
+}
+
+#[cfg(unix)]
+#[test]
+fn push_progress_is_recorded_on_a_terminal() {
+    let remote_dir = tempfile::tempdir().unwrap();
+    git(
+        remote_dir.path(),
+        &["init", "--quiet", "--bare", "--initial-branch", "main"],
+    );
+    let repo = TempRepo::init();
+    // Enough objects for git to report progress.
+    for index in 0..30 {
+        repo.write(&format!("file-{index}"), format!("{index}\n").as_bytes());
+    }
+    repo.commit_all("many");
+    let url = remote_dir.path().to_string_lossy().into_owned();
+    repo.repo.add_remote("origin", &url).unwrap();
+    repo.repo
+        .push(&bcode_git::PushOptions {
+            remote: Some("origin".into()),
+            refspec: Some("main".into()),
+            set_upstream: true,
+            ..bcode_git::PushOptions::default()
+        })
+        .unwrap();
+    let (record, output) = recorded_output(&repo, "push");
+    assert!(record.success());
+    // Progress is only written to a terminal.
+    assert!(output.contains("Writing objects"), "{output:?}");
+}
+
+#[cfg(unix)]
+#[test]
+fn terminal_output_is_capped_and_marked_truncated() {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    let repo = TempRepo::init();
+    // Use this repository's hooks, whatever the user's configuration says.
+    git(repo.path(), &["config", "core.hooksPath", ".git/hooks"]);
+    let hook = repo.path().join(".git/hooks/pre-commit");
+    // About 2 MiB, over the 1 MiB kept per command.
+    std::fs::write(
+        &hook,
+        "#!/bin/sh\nawk 'BEGIN { for (i = 0; i < 32768; i++) printf \"%063d\\n\", i }' >&2\n",
+    )
+    .unwrap();
+    std::fs::set_permissions(&hook, std::fs::Permissions::from_mode(0o755)).unwrap();
+    repo.write("f", b"1\n");
+    git(repo.path(), &["add", "f"]);
+    repo.repo
+        .commit(&CommitOptions {
+            message: "big".into(),
+            ..CommitOptions::default()
+        })
+        .unwrap();
+    let (record, _) = recorded_output(&repo, "commit");
+    assert!(record.output_truncated);
+    let kept = repo.repo.runner().log().output(record.id, 0).len();
+    assert_eq!(kept, 1024 * 1024);
+    // Reading from an offset returns only what follows it.
+    assert_eq!(
+        repo.repo.runner().log().output(record.id, kept - 10).len(),
+        10
+    );
 }

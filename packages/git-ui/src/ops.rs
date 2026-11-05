@@ -169,7 +169,7 @@ pub enum Op {
         path: String,
         side: ConflictSide,
     },
-    Shell(String),
+    CleanUntracked,
     Copy(String),
     BisectBegin,
     Restore {
@@ -268,7 +268,7 @@ impl Op {
             Self::Ignore(pattern) => format!("Ignored {pattern}"),
             Self::Exclude(pattern) => format!("Excluded {pattern}"),
             Self::ResolveConflict { path, .. } => format!("Resolved {path}"),
-            Self::Shell(command) => format!("Ran {command}"),
+            Self::CleanUntracked => "Deleted untracked files".into(),
             Self::Copy(_) => "Copied to clipboard".into(),
             Self::Restore {
                 journal: JournalMove::Undo,
@@ -498,7 +498,7 @@ pub fn run(repo: &Repository, op: &Op) -> Result<Option<String>, String> {
         Op::Ignore(pattern) => repo.ignore(pattern),
         Op::Exclude(pattern) => repo.exclude(pattern),
         Op::ResolveConflict { path, side } => repo.resolve_conflict(path, *side),
-        Op::Shell(command) => return run_shell(repo, command).map(Some),
+        Op::CleanUntracked => repo.clean_untracked(),
         Op::Stage(_)
         | Op::Unstage(_)
         | Op::StageAll
@@ -526,42 +526,26 @@ fn first_line_with(output: &str, needle: &str) -> Option<String> {
     output.contains(needle).then(|| output.trim().to_owned())
 }
 
-/// Run a shell command in the repository root, capturing combined output.
-///
-/// # Errors
-/// Returns the command's output when it fails.
-pub fn run_shell(repo: &Repository, command: &str) -> Result<String, String> {
-    let output = shell_command(command)
-        .current_dir(repo.root())
-        .stdin(std::process::Stdio::null())
-        .output()
-        .map_err(|error| error.to_string())?;
-    let mut text = String::from_utf8_lossy(&output.stdout).into_owned();
-    text.push_str(&String::from_utf8_lossy(&output.stderr));
-    if output.status.success() {
-        Ok(text.trim_end().to_owned())
+/// The platform shell's program and arguments for running `command`.
+#[must_use]
+pub fn shell_invocation(command: &str) -> (String, [String; 2]) {
+    if cfg!(windows) {
+        ("cmd".into(), ["/C".into(), command.into()])
     } else {
-        Err(if text.trim().is_empty() {
-            format!("{command} failed with {}", output.status)
-        } else {
-            text.trim_end().to_owned()
-        })
+        (
+            std::env::var("SHELL").unwrap_or_else(|_| "sh".into()),
+            ["-c".into(), command.into()],
+        )
     }
 }
 
 /// A platform shell invocation of `command`.
 #[must_use]
 pub fn shell_command(command: &str) -> std::process::Command {
-    if cfg!(windows) {
-        let mut process = std::process::Command::new("cmd");
-        process.args(["/C", command]);
-        process
-    } else {
-        let shell = std::env::var("SHELL").unwrap_or_else(|_| "sh".into());
-        let mut process = std::process::Command::new(shell);
-        process.args(["-c", command]);
-        process
-    }
+    let (program, args) = shell_invocation(command);
+    let mut process = std::process::Command::new(program);
+    process.args(args);
+    process
 }
 
 fn copy_to_clipboard(text: &str) -> Result<(), String> {

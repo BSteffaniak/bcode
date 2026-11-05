@@ -26,6 +26,7 @@ pub mod popup;
 mod run;
 mod scroll;
 pub mod session;
+mod terminal;
 pub mod theme;
 mod view;
 

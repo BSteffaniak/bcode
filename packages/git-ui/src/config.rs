@@ -420,7 +420,8 @@ pub struct CustomCommand {
     /// Suspend the UI and attach the command to the terminal.
     #[serde(default)]
     pub interactive: bool,
-    /// Show command output in a popup when it finishes.
+    /// Keep the command's live output popup open when it succeeds (it always stays open when
+    /// the command fails).
     #[serde(default)]
     pub show_output: bool,
 }

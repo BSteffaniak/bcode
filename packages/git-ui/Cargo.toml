@@ -18,6 +18,7 @@ bcode_syntax_render = { workspace = true }
 bcode_tui_theme = { workspace = true }
 bmux_config_composition = { workspace = true }
 bmux_keyboard = { workspace = true, features = ["crossterm"] }
+bmux_pty = { workspace = true }
 bmux_text_edit = { workspace = true }
 bmux_tui = { workspace = true, features = ["crossterm"] }
 bmux_tui_components = { workspace = true, features = [
@@ -27,6 +28,7 @@ bmux_tui_components = { workspace = true, features = [
     "scroll-view",
     "selectable-list",
     "tab-bar",
+    "terminal-view",
     "text-input",
     "text-input-box",
 ] }

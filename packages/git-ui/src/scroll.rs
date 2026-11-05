@@ -1,11 +1,10 @@
-//! Scroll positions of the lists, kept apart from their cursors.
+//! Scroll positions of the lists and other scrolled content, kept apart from cursors.
 //!
 //! Lists scroll like pages: the wheel and the scrollbars move what is shown, never the cursor,
 //! and a list scrolls to its cursor only when the cursor moves (see `view::list_policy`). Each
-//! paint records every list's scroll geometry from the laid-out frame; pointer and keyboard
+//! paint records every scrolled view's geometry from the laid-out frame; pointer and keyboard
 //! scrolling use that record instead of deriving geometry again.
 
-use std::cell::Cell;
 use std::collections::BTreeMap;
 
 use bmux_tui::component::{EventCx, LayoutId, LayoutNode};
@@ -13,20 +12,28 @@ use bmux_tui::event::Event;
 use bmux_tui::geometry::Rect;
 use bmux_tui_components::pane::Pane;
 use bmux_tui_components::scroll_view::{
-    ScrollExtent, ScrollView, ScrollViewOutcome, TrackScrollbar,
+    ScrollExtent, ScrollSource, ScrollView, ScrollViewOutcome, TrackScrollbar,
 };
-use bmux_tui_components::selectable_list::{SelectableListState, list_viewport_id};
+use bmux_tui_components::selectable_list::list_viewport_id;
+use bmux_tui_components::terminal_view::terminal_viewport_id;
 use bmux_tui_runtime::Update;
 
 use crate::app::{App, Msg, Window};
 use crate::popup::Popup;
 
-/// The command log's list.
+/// The command log.
 pub const LOG_LIST: &str = "command-log";
 /// A menu popup's list.
 pub const MENU_LIST: &str = "popup-list";
 /// A text popup's lines.
 pub const TEXT_LIST: &str = "popup-text";
+/// A terminal popup's terminal.
+pub const TERMINAL_LIST: &str = "popup-terminal";
+
+/// Whether a scrolled view belongs to a popup.
+fn in_popup(id: &str) -> bool {
+    [MENU_LIST, TEXT_LIST, TERMINAL_LIST].contains(&id)
+}
 
 /// The list of a side window.
 #[must_use]
@@ -51,36 +58,69 @@ pub struct Painted {
     pub tops: Vec<u64>,
 }
 
-/// Record the scroll geometry of every list laid out in `layout`. Pane lists have their
-/// scrollbar on the pane's border; popup lists overlay theirs on the list's last column.
+/// Where a view's scrollbar is drawn.
+enum Track {
+    /// On a pane's border.
+    Pane(String),
+    /// Over a popup list's last column.
+    PopupList,
+    /// Inside a terminal popup's view.
+    PopupTerminal,
+}
+
+/// Record the scroll geometry of every scrolled view laid out in `layout`.
 #[must_use]
 pub fn capture(app: &App, layout: &LayoutNode, placed: &EventCx<'_>) -> BTreeMap<String, Painted> {
-    let popup_scroll = ScrollView::new()
+    let popup_list = ScrollView::new()
         .policy(crate::view::list_base_policy(crate::view::POPUP_SCROLLBAR).scroll_view_policy());
-    let panes = app
-        .side_windows()
-        .map(|window| (side_list(window), Some(format!("pane-{}", window.number()))))
-        .chain((0..2).map(|section| (main_list(section), Some(format!("pane-main-{section}")))))
-        .chain([(LOG_LIST.to_owned(), Some("pane-log".to_owned()))]);
-    let popups = [MENU_LIST, TEXT_LIST].map(|list| (list.to_owned(), None));
-    panes
-        .chain(popups)
-        .filter_map(|(list, pane)| {
-            let id = LayoutId::new(list.clone());
-            let viewport = layout.find(&list_viewport_id(&id))?;
-            let track = pane.map_or_else(
-                || {
-                    placed
-                        .find_visible_rect(&id)
-                        .and_then(|area| popup_scroll.scrollbar_area(area))
-                },
-                |pane| {
-                    placed
-                        .find_visible_rect(&LayoutId::new(format!("{pane}.surface")))
-                        .and_then(|area| Pane::new().border_scrollbar_track(area))
-                },
-            );
-            let tops = if list.starts_with("main-") {
+    let list = |id: String, track: Track| {
+        let viewport = list_viewport_id(&LayoutId::new(id.clone()));
+        (id, viewport, track)
+    };
+    // The log's scroll view is its own viewport.
+    let others = [
+        (
+            LOG_LIST.to_owned(),
+            LayoutId::new(LOG_LIST),
+            Track::Pane("pane-log".to_owned()),
+        ),
+        (
+            TERMINAL_LIST.to_owned(),
+            terminal_viewport_id(&LayoutId::new(TERMINAL_LIST)),
+            Track::PopupTerminal,
+        ),
+    ];
+    app.side_windows()
+        .map(|window| {
+            list(
+                side_list(window),
+                Track::Pane(format!("pane-{}", window.number())),
+            )
+        })
+        .chain((0..2).map(|section| {
+            list(
+                main_list(section),
+                Track::Pane(format!("pane-main-{section}")),
+            )
+        }))
+        .chain([MENU_LIST, TEXT_LIST].map(|id| list(id.to_owned(), Track::PopupList)))
+        .chain(others)
+        .filter_map(|(id, viewport, track)| {
+            let viewport = layout.find(&viewport)?;
+            let area = || placed.find_visible_rect(&LayoutId::new(id.clone()));
+            let track = match track {
+                Track::Pane(pane) => placed
+                    .find_visible_rect(&LayoutId::new(format!("{pane}.surface")))
+                    .and_then(|area| Pane::new().border_scrollbar_track(area)),
+                Track::PopupList => area().and_then(|area| popup_list.scrollbar_area(area)),
+                Track::PopupTerminal => app.popups.iter().find_map(|popup| match popup {
+                    Popup::Terminal(run) => area().and_then(|area| {
+                        crate::view::terminal_popup_view(&run.terminal).scrollbar_area(area)
+                    }),
+                    _ => None,
+                }),
+            };
+            let tops = if id.starts_with("main-") {
                 viewport.children.first().map_or_else(Vec::new, |content| {
                     content.node.children.iter().map(|item| item.y).collect()
                 })
@@ -88,7 +128,7 @@ pub fn capture(app: &App, layout: &LayoutNode, placed: &EventCx<'_>) -> BTreeMap
                 Vec::new()
             };
             Some((
-                list,
+                id,
                 Painted {
                     extent: ScrollExtent::of(viewport),
                     track,
@@ -100,20 +140,24 @@ pub fn capture(app: &App, layout: &LayoutNode, placed: &EventCx<'_>) -> BTreeMap
 }
 
 impl App {
-    /// The state holding a list's scroll position.
-    pub(crate) fn list_state(&self, id: &str) -> Option<&Cell<SelectableListState>> {
+    /// The state holding a scrolled view's position.
+    pub(crate) fn scroll_source(&self, id: &str) -> Option<&dyn ScrollSource> {
         if let Some(number) = id.strip_prefix("side-") {
             let index = number.parse::<usize>().ok()?.checked_sub(1)?;
             let view = self.view(Window::Side(index));
-            return self.lists.get(&view);
+            return self.lists.get(&view).map(|list| list as &dyn ScrollSource);
         }
         if let Some(section) = id.strip_prefix("main-") {
-            return self.main_lists.get(section.parse::<usize>().ok()?);
+            return self
+                .main_lists
+                .get(section.parse::<usize>().ok()?)
+                .map(|list| list as &dyn ScrollSource);
         }
         match (id, self.popups.last()) {
-            (LOG_LIST, _) => Some(&self.log_list),
+            (LOG_LIST, _) => Some(&self.log_scroll),
             (MENU_LIST, Some(Popup::Menu(menu))) => Some(&menu.list),
             (TEXT_LIST, Some(Popup::Text(view))) => Some(&view.list),
+            (TERMINAL_LIST, Some(Popup::Terminal(run))) => Some(&run.terminal),
             _ => None,
         }
     }
@@ -124,33 +168,33 @@ impl App {
 
     /// Scroll a list by `delta` rows within its painted extent. Returns whether it moved.
     pub(crate) fn scroll_list(&self, id: &str, delta: i64) -> bool {
-        let (Some(state), Some(painted)) = (self.list_state(id), self.painted(id)) else {
+        let (Some(source), Some(painted)) = (self.scroll_source(id), self.painted(id)) else {
             return false;
         };
-        let mut list = state.get();
-        let moved = painted.extent.scroll_by(&mut list.scroll, delta) != ScrollViewOutcome::Ignored;
-        state.set(list);
+        let mut scroll = source.scroll_state();
+        let moved = painted.extent.scroll_by(&mut scroll, delta) != ScrollViewOutcome::Ignored;
+        source.set_scroll_state(scroll);
         moved
     }
 
     /// Scroll a list to `offset`, clamped to its painted extent.
     pub(crate) fn scroll_list_to(&self, id: &str, offset: u64) {
-        let Some(state) = self.list_state(id) else {
+        let Some(source) = self.scroll_source(id) else {
             return;
         };
         let maximum = self
             .painted(id)
             .map_or(offset, |painted| painted.extent.max_offset());
-        let mut list = state.get();
-        list.scroll.set_vertical_offset(offset.min(maximum));
-        state.set(list);
+        let mut scroll = source.scroll_state();
+        scroll.set_vertical_offset(offset.min(maximum));
+        source.set_scroll_state(scroll);
     }
 
     /// Current scroll offset of a list (for tests and automation).
     #[must_use]
     pub fn list_scroll(&self, id: &str) -> u64 {
-        self.list_state(id)
-            .map_or(0, |state| state.get().scroll.vertical_offset())
+        self.scroll_source(id)
+            .map_or(0, |source| source.scroll_state().vertical_offset())
     }
 
     /// Whether a list is scrolled to its end.
@@ -207,34 +251,29 @@ impl App {
         let painted = self.painted.borrow().clone();
         let popup = !self.popups.is_empty();
         let dragging = painted.keys().find(|id| {
-            self.list_state(id)
-                .is_some_and(|state| state.get().scroll.dragging_scrollbar())
+            self.scroll_source(id)
+                .is_some_and(|source| source.scroll_state().dragging_scrollbar())
         });
         let candidates: Vec<&String> = dragging.map_or_else(
-            || {
-                painted
-                    .keys()
-                    .filter(|id| (id.as_str() == MENU_LIST || id.as_str() == TEXT_LIST) == popup)
-                    .collect()
-            },
+            || painted.keys().filter(|id| in_popup(id) == popup).collect(),
             |id| vec![id],
         );
         for id in candidates {
-            let (Some(state), Some(geometry)) = (self.list_state(id), painted.get(id)) else {
+            let (Some(source), Some(geometry)) = (self.scroll_source(id), painted.get(id)) else {
                 continue;
             };
             let Some(track) = geometry.track else {
                 continue;
             };
-            let mut list = state.get();
-            let held = list.scroll.dragging_scrollbar();
+            let mut scroll = source.scroll_state();
+            let held = scroll.dragging_scrollbar();
             let outcome =
-                TrackScrollbar::new().handle_event(track, geometry.extent, &mut list.scroll, event);
-            state.set(list);
+                TrackScrollbar::new().handle_event(track, geometry.extent, &mut scroll, event);
+            source.set_scroll_state(scroll);
             if outcome != ScrollViewOutcome::Ignored {
                 return Some(Update::redraw());
             }
-            if held || list.scroll.dragging_scrollbar() {
+            if held || scroll.dragging_scrollbar() {
                 return Some(Update::none());
             }
         }

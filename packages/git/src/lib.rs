@@ -23,7 +23,10 @@ pub use repo::{
     ApplyTarget, BCODE_COMMIT_DRAFT, CommitOptions, ConflictSide, DiffTarget, LAZYGIT_COMMIT_DRAFT,
     LogQuery, PushOptions, Repository, StashOptions,
 };
-pub use runner::{CommandLog, GitInvocation, GitOutput, GitRunner};
+pub use runner::{
+    COMMAND_TERMINAL_COLUMNS, COMMAND_TERMINAL_ROWS, CommandLog, GitInvocation, GitOutput,
+    GitRunner,
+};
 
 /// Failure running or interpreting git.
 #[derive(Debug)]

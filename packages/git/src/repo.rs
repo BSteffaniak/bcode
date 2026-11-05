@@ -882,6 +882,14 @@ impl Repository {
         Ok(())
     }
 
+    /// Delete every untracked file and directory (ignored files stay).
+    ///
+    /// # Errors
+    /// * [`GitError`] when git fails.
+    pub fn clean_untracked(&self) -> Result<(), GitError> {
+        self.runner.write(["clean", "-f", "-d"]).map(drop)
+    }
+
     // ----- commits -----
 
     /// Create or amend a commit.
@@ -889,7 +897,7 @@ impl Repository {
     /// # Errors
     /// * [`GitError`] when hooks reject the commit or git fails.
     pub fn commit(&self, options: &CommitOptions) -> Result<(), GitError> {
-        let mut args = vec!["commit", "--quiet"];
+        let mut args = vec!["commit"];
         if options.amend {
             args.push("--amend");
         }
@@ -1083,9 +1091,7 @@ impl Repository {
     /// # Errors
     /// * [`GitError`] when git fails.
     pub fn reset(&self, target: &str, mode: ResetMode) -> Result<(), GitError> {
-        self.runner
-            .write(["reset", "--quiet", mode.flag(), target])
-            .map(drop)
+        self.runner.write(["reset", mode.flag(), target]).map(drop)
     }
 
     /// Create a `fixup!` commit for `oid` from the staged changes.
@@ -1094,7 +1100,7 @@ impl Repository {
     /// * [`GitError`] when git fails.
     pub fn create_fixup(&self, oid: &str) -> Result<(), GitError> {
         let fixup = format!("--fixup={oid}");
-        self.runner.write(["commit", "--quiet", &fixup]).map(drop)
+        self.runner.write(["commit", &fixup]).map(drop)
     }
 
     // ----- rebase -----
@@ -1256,7 +1262,7 @@ impl Repository {
     /// # Errors
     /// * [`GitError`] when local changes would be overwritten or git fails.
     pub fn checkout(&self, target: &str) -> Result<(), GitError> {
-        self.runner.write(["checkout", "--quiet", target]).map(drop)
+        self.runner.write(["checkout", target]).map(drop)
     }
 
     /// Check out a remote branch as a new tracking local branch.
@@ -1266,14 +1272,7 @@ impl Repository {
     pub fn checkout_remote_branch(&self, remote_branch: &RemoteBranch) -> Result<(), GitError> {
         let full = remote_branch.full_name();
         self.runner
-            .write([
-                "checkout",
-                "--quiet",
-                "--track",
-                "-b",
-                &remote_branch.name,
-                &full,
-            ])
+            .write(["checkout", "--track", "-b", &remote_branch.name, &full])
             .map(drop)
     }
 
@@ -1288,7 +1287,7 @@ impl Repository {
         checkout: bool,
     ) -> Result<(), GitError> {
         let mut args = if checkout {
-            vec!["checkout", "--quiet", "-b", name]
+            vec!["checkout", "-b", name]
         } else {
             vec!["branch", name]
         };
@@ -1319,7 +1318,7 @@ impl Repository {
     /// * [`GitError`] when the push fails.
     pub fn delete_remote_branch(&self, remote: &str, name: &str) -> Result<(), GitError> {
         self.runner
-            .write(["push", "--quiet", remote, "--delete", name])
+            .write(["push", remote, "--delete", name])
             .map(drop)
     }
 
@@ -1371,8 +1370,7 @@ impl Repository {
         let (remote, remote_branch) = upstream
             .split_once('/')
             .ok_or_else(|| GitError::Unsupported(format!("unexpected upstream {upstream}")))?;
-        self.runner
-            .write(["fetch", "--quiet", remote, remote_branch])?;
+        self.runner.write(["fetch", remote, remote_branch])?;
         if branch.is_head {
             return self
                 .runner
@@ -1410,7 +1408,7 @@ impl Repository {
     /// # Errors
     /// * [`GitError`] when the fetch fails.
     pub fn fetch(&self, remote: Option<&str>) -> Result<(), GitError> {
-        let mut args = vec!["fetch", "--prune", "--quiet"];
+        let mut args = vec!["fetch", "--prune"];
         match remote {
             Some(remote) => args.push(remote),
             None => args.push("--all"),
@@ -1423,7 +1421,7 @@ impl Repository {
     /// # Errors
     /// * [`GitError`] when the pull fails or conflicts.
     pub fn pull(&self, rebase: Option<bool>) -> Result<(), GitError> {
-        let mut args = vec!["pull", "--quiet", "--no-edit"];
+        let mut args = vec!["pull", "--no-edit"];
         match rebase {
             Some(true) => args.push("--rebase"),
             Some(false) => args.push("--no-rebase"),
@@ -1439,7 +1437,7 @@ impl Repository {
     /// # Errors
     /// * [`GitError`] when the push is rejected or fails.
     pub fn push(&self, options: &PushOptions) -> Result<(), GitError> {
-        let mut args = vec!["push".to_owned(), "--quiet".to_owned()];
+        let mut args = vec!["push".to_owned()];
         if options.force_with_lease {
             args.push("--force-with-lease".into());
         }
@@ -1527,9 +1525,7 @@ impl Repository {
     /// * [`GitError`] when the push fails.
     pub fn push_tag(&self, remote: &str, name: &str) -> Result<(), GitError> {
         let refspec = format!("refs/tags/{name}");
-        self.runner
-            .write(["push", "--quiet", remote, &refspec])
-            .map(drop)
+        self.runner.write(["push", remote, &refspec]).map(drop)
     }
 
     // ----- stash -----
@@ -1539,7 +1535,7 @@ impl Repository {
     /// # Errors
     /// * [`GitError`] when there is nothing to stash or git fails.
     pub fn stash_push(&self, options: &StashOptions) -> Result<(), GitError> {
-        let mut args = vec!["stash".to_owned(), "push".to_owned(), "--quiet".to_owned()];
+        let mut args = vec!["stash".to_owned(), "push".to_owned()];
         if options.include_untracked {
             args.push("--include-untracked".into());
         }
@@ -1566,10 +1562,10 @@ impl Repository {
     pub fn stash_apply(&self, selector: &str, pop: bool) -> Result<(), GitError> {
         let command = if pop { "pop" } else { "apply" };
         self.runner
-            .write(["stash", command, "--index", "--quiet", selector])
+            .write(["stash", command, "--index", selector])
             .or_else(|_| {
                 // Retry without restoring the index when it cannot be reinstated.
-                self.runner.write(["stash", command, "--quiet", selector])
+                self.runner.write(["stash", command, selector])
             })
             .map(drop)
     }
@@ -1579,9 +1575,7 @@ impl Repository {
     /// # Errors
     /// * [`GitError`] when the entry does not exist.
     pub fn stash_drop(&self, selector: &str) -> Result<(), GitError> {
-        self.runner
-            .write(["stash", "drop", "--quiet", selector])
-            .map(drop)
+        self.runner.write(["stash", "drop", selector]).map(drop)
     }
 
     /// Rename a stash entry.

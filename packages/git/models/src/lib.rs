@@ -608,23 +608,56 @@ pub enum SubmoduleState {
     Conflicted,
 }
 
-/// One executed git command, for the command log.
+/// One git command run for the command log: running, or finished. Its terminal output is
+/// kept by the log, by [`Self::id`].
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct GitCommandRecord {
+    /// Identity within the log, increasing in start order.
+    #[serde(default)]
+    pub id: u64,
     /// Arguments after `git`.
     pub args: Vec<String>,
     /// Whether the command mutates repository state.
     pub mutating: bool,
-    /// Whether the command exited successfully.
-    pub success: bool,
+    /// Whether it runs, or how it ended.
+    #[serde(default)]
+    pub status: CommandStatus,
     /// Wall time in milliseconds.
     pub duration_ms: u64,
     /// Why the command failed: git's message, when it did.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
+    /// Whether output beyond the log's per-command limit was dropped.
+    #[serde(default)]
+    pub output_truncated: bool,
+}
+
+/// Whether a logged command runs, or how it ended.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CommandStatus {
+    /// Still running; the record's duration is not final.
+    #[default]
+    Running,
+    /// Exited successfully.
+    Succeeded,
+    /// Failed (see the record's error).
+    Failed,
 }
 
 impl GitCommandRecord {
+    /// Whether the command finished successfully.
+    #[must_use]
+    pub fn success(&self) -> bool {
+        self.status == CommandStatus::Succeeded
+    }
+
+    /// Whether the command is still running.
+    #[must_use]
+    pub fn running(&self) -> bool {
+        self.status == CommandStatus::Running
+    }
+
     /// Shell-like display of the command.
     #[must_use]
     pub fn display(&self) -> String {
@@ -821,9 +854,11 @@ mod tests {
         let record = GitCommandRecord {
             args: vec!["commit".into(), "-m".into(), "it's done".into()],
             mutating: true,
-            success: true,
+            status: CommandStatus::Succeeded,
             duration_ms: 1,
             error: None,
+            id: 0,
+            output_truncated: false,
         };
         assert_eq!(record.display(), "git commit -m 'it'\\''s done'");
     }

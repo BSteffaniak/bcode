@@ -313,7 +313,13 @@ pub struct App {
     /// Scroll geometry of every list in the last painted frame, by list id.
     pub(crate) painted: std::cell::RefCell<BTreeMap<String, crate::scroll::Painted>>,
     /// Scroll position of the command log.
-    pub(crate) log_list: Cell<SelectableListState>,
+    pub(crate) log_scroll: Cell<bmux_tui_components::scroll_view::ScrollViewState>,
+    /// Command-log entries shown, newest first.
+    pub(crate) log_records: Vec<bcode_git::models::GitCommandRecord>,
+    /// Their terminal output, by record id.
+    pub(crate) log_terminals: crate::terminal::LogOutputs,
+    /// Command-log revision last synced.
+    pub(crate) log_revision: Option<u64>,
     /// Shell commands run from the `:` prompt.
     pub(crate) shell_history: crate::popup::InputRecall,
     /// Main view position waiting for its content after a restore.
@@ -422,7 +428,10 @@ impl App {
             panels,
             popup_area: Cell::new(None),
             painted: std::cell::RefCell::default(),
-            log_list: Cell::new(SelectableListState::new(None)),
+            log_scroll: Cell::default(),
+            log_records: Vec::new(),
+            log_terminals: crate::terminal::LogOutputs::new(),
+            log_revision: None,
             shell_history: crate::popup::InputRecall::default(),
             pending_main: None,
             pending_drill: None,
@@ -519,6 +528,15 @@ impl App {
     #[must_use]
     pub const fn focused_window(&self) -> Window {
         self.window
+    }
+
+    /// Whether a shell command started from the UI is still running (for tests and
+    /// automation).
+    #[must_use]
+    pub fn terminal_running(&self) -> bool {
+        self.popups
+            .iter()
+            .any(|popup| matches!(popup, Popup::Terminal(run) if run.process.is_some()))
     }
 
     /// Cursor index of a view.
@@ -1140,6 +1158,10 @@ impl App {
                 then: *then,
             })),
             Then::External(external) => self.launch(external),
+            Then::Terminal {
+                command,
+                close_on_success,
+            } => self.run_in_terminal(command, close_on_success),
             Then::Layout(crate::panels::LayoutCommand::Reopen(index)) => {
                 self.focus(Window::Side(index));
                 Update::redraw().maybe(self.sync_main(false))
@@ -1234,7 +1256,7 @@ impl App {
             return Update::none();
         };
         let scope = match popup {
-            Popup::Menu(_) | Popup::Text(_) => Scope::Menu,
+            Popup::Menu(_) | Popup::Text(_) | Popup::Terminal(_) => Scope::Menu,
             Popup::Confirm(_) => Scope::Confirm,
             Popup::Prompt(_) => Scope::Input,
         };
@@ -1251,6 +1273,7 @@ impl App {
         match self.popups.pop() {
             Some(Popup::Menu(menu)) => crate::actions::menu_key(self, menu, action, stroke, event),
             Some(Popup::Text(view)) => crate::actions::text_key(self, view, action),
+            Some(Popup::Terminal(run)) => self.terminal_key(run, action),
             Some(Popup::Confirm(confirm)) => match action {
                 Some(Action::ConfirmYes) => self.apply(confirm.then),
                 Some(Action::ConfirmNo) => Update::redraw(),
@@ -1445,6 +1468,7 @@ impl App {
             if over_popup {
                 let list = match self.popups.last() {
                     Some(Popup::Text(_)) => crate::scroll::TEXT_LIST,
+                    Some(Popup::Terminal(_)) => crate::scroll::TERMINAL_LIST,
                     _ => crate::scroll::MENU_LIST,
                 };
                 return if self.scroll_list(list, delta) {
@@ -2507,8 +2531,14 @@ impl Program for App {
 
     fn update(&mut self, event: RuntimeEvent<Msg>) -> Result<Update<Msg>, String> {
         let watching_sources = self.commit_editor().is_some();
-        let update = self.handle(event);
+        let mut update = self.handle(event);
         self.sync_panels();
+        // Live output: a running shell command's terminal and the git command log.
+        let (pumped, command) = self.pump_terminal();
+        if pumped | self.sync_command_log() {
+            update = update.merge(Update::redraw());
+        }
+        update = update.maybe(command);
         if self.quit {
             self.persist();
         }

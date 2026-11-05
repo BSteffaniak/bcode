@@ -355,6 +355,7 @@ bmux_mermaid_render = { default-features = false, version = "0.0.1-alpha.4" }
 bmux_plugin = { default-features = false, version = "0.0.1-alpha.4" }
 bmux_plugin_schema = { default-features = false, version = "0.0.1-alpha.4" }
 bmux_plugin_sdk = { default-features = false, version = "0.0.1-alpha.4" }
+bmux_pty = { default-features = false, version = "0.0.1-alpha.4" }
 bmux_syntax_render = { default-features = false, version = "0.0.1-alpha.4" }
 bmux_terminal_grid = { default-features = false, version = "0.0.1-alpha.4" }
 bmux_terminal_protocol = { default-features = false, version = "0.0.1-alpha.4" }
@@ -644,6 +645,7 @@ bmux_plugin                        = { git = "https://github.com/BSteffaniak/bmu
 bmux_plugin_runtime                = { git = "https://github.com/BSteffaniak/bmux", branch = "master" }
 bmux_plugin_schema                 = { git = "https://github.com/BSteffaniak/bmux", branch = "master" }
 bmux_plugin_sdk                    = { git = "https://github.com/BSteffaniak/bmux", branch = "master" }
+bmux_pty                           = { git = "https://github.com/BSteffaniak/bmux", branch = "master" }
 bmux_syntax_render                 = { git = "https://github.com/BSteffaniak/bmux", branch = "master" }
 bmux_terminal_grid                 = { git = "https://github.com/BSteffaniak/bmux", branch = "master" }
 bmux_terminal_protocol             = { git = "https://github.com/BSteffaniak/bmux", branch = "master" }

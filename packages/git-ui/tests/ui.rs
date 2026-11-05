@@ -156,6 +156,41 @@ impl Harness {
         self.send(RuntimeEvent::Terminal(Event::Paste(text.to_owned())));
     }
 
+    /// Tick, as the runtime does, until shell commands started from the UI finish (at most
+    /// ten seconds), painting in between so views size their terminals.
+    fn settle(&mut self, width: u16, height: u16) -> String {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        loop {
+            self.send(RuntimeEvent::Message(bcode_git_ui::app::Msg::Tick));
+            let screen = self.screen(width, height);
+            if !self.app.terminal_running() {
+                return screen;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "still running: {screen}"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+    }
+
+    /// Tick until `text` shows (at most ten seconds).
+    fn wait_for(&mut self, text: &str, width: u16, height: u16) -> String {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        loop {
+            self.send(RuntimeEvent::Message(bcode_git_ui::app::Msg::Tick));
+            let screen = self.screen(width, height);
+            if screen.contains(text) {
+                return screen;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "no {text:?}: {screen}"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+    }
+
     fn screen(&mut self, width: u16, height: u16) -> String {
         render_text(&mut self.app, width, height).join("\n")
     }
@@ -389,10 +424,13 @@ fn custom_commands_run_with_placeholders() {
         config,
     );
     harness.keys(&["ctrl+b"]);
+    let screen = harness.settle(120, 30);
     assert_eq!(
         std::fs::read_to_string(harness.path().join("a.bak")).unwrap(),
         "b\n"
     );
+    // Without `show_output`, its output popup closed when it succeeded.
+    assert!(!screen.contains("$ cp"), "{screen}");
 }
 
 #[test]
@@ -1651,41 +1689,34 @@ fn popups_scroll_with_the_mouse_wheel() {
     harness.keys(&[":"]);
     harness.paste("seq -f 'row-%03g' 1 100");
     harness.keys(&["enter"]);
-    let screen = harness.screen(120, 30);
-    assert!(screen.contains("row-001"), "{screen}");
-    assert!(!screen.contains("row-080"), "{screen}");
+    // A finished command's terminal shows the end of its output.
+    let screen = harness.settle(120, 30);
+    assert!(screen.contains("row-100"), "{screen}");
+    assert!(!screen.contains("row-001"), "{screen}");
     let (row, line) = screen
         .lines()
         .enumerate()
-        .find(|(_, line)| line.contains("row-005"))
+        .find(|(_, line)| line.contains("row-095"))
         .unwrap();
-    let x = u16::try_from(line[..line.find("row-005").unwrap()].chars().count()).unwrap();
+    let x = u16::try_from(line[..line.find("row-095").unwrap()].chars().count()).unwrap();
     let y = u16::try_from(row).unwrap();
-    for _ in 0..30 {
-        harness.mouse(MouseEventKind::ScrollDown, x, y);
-    }
-    let screen = harness.screen(120, 30);
-    assert!(screen.contains("row-080"), "{screen}");
-    assert!(!screen.contains("row-001"), "{screen}");
-    // Back up to the top, and no further.
     for _ in 0..40 {
         harness.mouse(MouseEventKind::ScrollUp, x, y);
     }
-    assert!(harness.screen(120, 30).contains("row-001"));
-    // Its scrollbar, overlaid on the last column, drags to the end.
-    let lines = harness.region("popup-text");
-    let column = lines.right() - 1;
-    harness.mouse(MouseEventKind::Down(MouseButton::Left), column, lines.y);
-    harness.mouse(
-        MouseEventKind::Drag(MouseButton::Left),
-        column,
-        lines.bottom() + 3,
-    );
-    harness.mouse(
-        MouseEventKind::Up(MouseButton::Left),
-        column,
-        lines.bottom() + 3,
-    );
+    let screen = harness.screen(120, 30);
+    assert!(screen.contains("row-001"), "{screen}");
+    assert!(!screen.contains("row-100"), "{screen}");
+    // Its scrollbar, inside the popup, drags back to the end: grab the thumb.
+    let (thumb_y, thumb_line) = screen
+        .lines()
+        .enumerate()
+        .find(|(_, line)| line.contains('█'))
+        .unwrap();
+    let column = u16::try_from(thumb_line.chars().position(|ch| ch == '█').unwrap()).unwrap();
+    let thumb_y = u16::try_from(thumb_y).unwrap();
+    harness.mouse(MouseEventKind::Down(MouseButton::Left), column, thumb_y);
+    harness.mouse(MouseEventKind::Drag(MouseButton::Left), column, 29);
+    harness.mouse(MouseEventKind::Up(MouseButton::Left), column, 29);
     let screen = harness.screen(120, 30);
     assert!(screen.contains("row-100"), "{screen}");
 
@@ -1965,7 +1996,99 @@ fn command_log_shows_why_a_command_failed() {
         .lines()
         .position(|line| line.contains("✗ git -C"))
         .unwrap_or_else(|| panic!("{screen}"));
-    // The reason comes first, before git's hints.
-    let reason = screen.lines().nth(failed + 1).unwrap();
-    assert!(reason.contains("Not possible to fast-forward"), "{screen}");
+    // Its terminal output follows, ending with git's reason.
+    assert!(
+        screen
+            .lines()
+            .skip(failed + 1)
+            .take(12)
+            .any(|line| line.contains("fatal: Not possible to fast-forward")),
+        "{screen}"
+    );
+}
+
+#[test]
+fn shell_commands_show_live_output_and_can_be_interrupted() {
+    let mut harness = Harness::new(|path| commit(path, "a", "a", "init"));
+    harness.keys(&[":"]);
+    // The command line (shown in the title) does not contain the words it prints.
+    harness.paste("printf '\\033[32mfi%st\\033[0m\\n' rs; sleep 30; echo ne''ver");
+    harness.keys(&["enter"]);
+    // Output shows while the command still runs.
+    let screen = harness.wait_for("first", 120, 30);
+    assert!(screen.contains("running"), "{screen}");
+    assert!(harness.app.terminal_running());
+    // Colors survive: the terminal is real.
+    let buffer = bcode_git_ui::render_buffer(&mut harness.app, 120, 30);
+    // The output line, not the title showing the command.
+    let (y, line) = screen
+        .lines()
+        .enumerate()
+        .find(|(_, line)| line.contains("first"))
+        .unwrap();
+    let x = line[..line.find("first").unwrap()].chars().count();
+    let cell = buffer
+        .get(bmux_tui::geometry::Point::new(
+            u16::try_from(x).unwrap(),
+            u16::try_from(y).unwrap(),
+        ))
+        .unwrap();
+    assert_eq!(cell.style.fg, Some(bmux_tui::style::Color::Green));
+    // Interrupting stops it, and the popup stays to show how it ended.
+    harness.keys(&["ctrl+c"]);
+    let screen = harness.settle(120, 30);
+    assert!(!screen.contains("never"), "{screen}");
+    assert!(screen.contains("$ printf"), "{screen}");
+    assert!(
+        screen.contains("stopped") || screen.contains("exit"),
+        "{screen}"
+    );
+    harness.keys(&["escape"]);
+    assert!(!harness.screen(120, 30).contains("$ printf"));
+}
+
+#[test]
+fn failing_shell_commands_keep_their_output_and_exit_status() {
+    let mut harness = Harness::new(|path| commit(path, "a", "a", "init"));
+    harness.keys(&[":"]);
+    harness.paste("echo oops; exit 3");
+    harness.keys(&["enter"]);
+    let screen = harness.settle(120, 30);
+    assert!(screen.contains("oops"), "{screen}");
+    assert!(screen.contains("exit 3"), "{screen}");
+}
+
+#[cfg(unix)]
+#[test]
+fn command_log_shows_hook_output_from_a_terminal() {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    let mut harness = Harness::new(|path| {
+        commit(path, "a", "a", "init");
+        git(path, &["config", "core.hooksPath", ".git/hooks"]);
+        let hook = path.join(".git/hooks/pre-commit");
+        std::fs::write(
+            &hook,
+            "#!/bin/sh\nif [ -t 1 ]; then echo 'checks passed on a terminal'; fi\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&hook, std::fs::Permissions::from_mode(0o755)).unwrap();
+        std::fs::write(path.join("a"), "changed").unwrap();
+    });
+    harness.keys(&["c"]);
+    harness.paste("change a");
+    harness.keys(&["enter", "@"]);
+    let screen = harness.screen(160, 50);
+    let commit = screen
+        .lines()
+        .position(|line| line.contains("✓ git commit"))
+        .unwrap_or_else(|| panic!("{screen}"));
+    assert!(
+        screen
+            .lines()
+            .skip(commit + 1)
+            .take(12)
+            .any(|line| line.contains("checks passed on a terminal")),
+        "{screen}"
+    );
 }
