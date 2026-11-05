@@ -140,9 +140,10 @@ pub enum Portrait {
 pub struct LayoutConfig {
     /// Screen mode at startup; `+` and `_` change it for the session.
     pub screen_mode: ScreenMode,
-    /// Percentage of the width used by the side windows in normal mode (10–90).
+    /// Percentage of the width used by the side windows (10–90). Normal and half mode share
+    /// one width, which the user can drag; this is its starting value.
     pub side_panel_width: u16,
-    /// Percentage of the width used by the side window in half mode (10–90).
+    /// Starting side width instead of `side_panel_width` when starting in half mode (10–90).
     pub half_side_panel_width: u16,
     /// How other side windows appear in half mode.
     pub collapsed_windows: CollapsedWindows,

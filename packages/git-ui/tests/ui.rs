@@ -1511,3 +1511,23 @@ fn changes_are_saved_without_quitting() {
     harness.send(RuntimeEvent::Message(bcode_git_ui::app::Msg::Watch));
     assert!(!harness.screen(120, 30).contains("Command log"));
 }
+
+#[test]
+fn normal_and_half_mode_share_the_side_width() {
+    let mut harness = Harness::new(panel_repo);
+    let x = |screen: &str| {
+        let row = line_with(screen, "┌ Unstaged");
+        let byte = row.find("┌ Unstaged").unwrap();
+        row[..byte].chars().count()
+    };
+    let before = x(&harness.screen(120, 30));
+    harness.drag("panels.root.divider.0", 10, 0);
+    let widened = x(&harness.screen(120, 30));
+    assert_eq!(widened, before + 10);
+    // Half mode keeps the width dragged in normal mode, and the other way around.
+    harness.keys(&["+"]);
+    assert_eq!(x(&harness.screen(120, 30)), widened);
+    harness.drag("panels.root.divider.0", -4, 0);
+    harness.keys(&["_"]);
+    assert_eq!(x(&harness.screen(120, 30)), widened - 4);
+}

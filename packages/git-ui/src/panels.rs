@@ -53,10 +53,8 @@ pub enum LayoutCommand {
 /// Runtime panel layout.
 #[derive(Debug)]
 pub struct Panels {
-    /// Side column beside (or above) the main column, in normal mode.
+    /// Side column beside (or above) the main column; one width for every screen mode.
     pub root: RefCell<PanelGroupState>,
-    /// The same split in half screen mode.
-    pub root_half: RefCell<PanelGroupState>,
     /// Visible side windows.
     pub side: RefCell<PanelGroupState>,
     /// Main content and the command log.
@@ -87,11 +85,15 @@ impl Panels {
     /// Build the configured layout, then apply what was saved for this directory.
     #[must_use]
     pub fn new(config: &LayoutConfig, windows: &[Vec<View>], store: Option<PathBuf>) -> Self {
-        let side_width = config.side_panel_width.clamp(10, 90);
-        let half_width = config.half_side_panel_width.clamp(10, 90);
+        // One width serves every screen mode; it starts at the width configured for the
+        // starting mode.
+        let side_width = match config.screen_mode {
+            ScreenMode::Half => config.half_side_panel_width,
+            ScreenMode::Normal | ScreenMode::Full => config.side_panel_width,
+        }
+        .clamp(10, 90);
         let mut panels = Self {
             root: RefCell::new(column_split(side_width)),
-            root_half: RefCell::new(column_split(half_width)),
             side: RefCell::new(PanelGroupState::new(Vec::new())),
             main: RefCell::new(PanelGroupState::new(Vec::new())),
             sections: RefCell::new(PanelGroupState::new([
@@ -121,7 +123,7 @@ impl Panels {
             }
         }
         if let Some(saved) = panels.store.as_deref().and_then(load) {
-            panels.restore(&saved, windows);
+            panels.restore(&saved, windows, config.screen_mode);
         }
         panels
     }
@@ -194,15 +196,6 @@ impl Panels {
             let mut main = PanelGroupState::new(sizes);
             main.set_constraints(constraints);
             *self.main.borrow_mut() = main;
-        }
-    }
-
-    /// The root split for a screen mode.
-    #[must_use]
-    pub const fn root_for(&self, screen_mode: ScreenMode) -> &RefCell<PanelGroupState> {
-        match screen_mode {
-            ScreenMode::Half => &self.root_half,
-            ScreenMode::Normal | ScreenMode::Full => &self.root,
         }
     }
 
@@ -283,14 +276,7 @@ impl Panels {
                 .copied()
                 .map(Into::into)
                 .collect(),
-            root_half: self
-                .root_half
-                .borrow()
-                .sizes()
-                .iter()
-                .copied()
-                .map(Into::into)
-                .collect(),
+            root_half: Vec::new(),
             side: self
                 .side_sizes
                 .iter()
@@ -318,25 +304,21 @@ impl Panels {
         toml::to_string(&saved).ok()
     }
 
-    fn restore(&mut self, saved: &Saved, windows: &[Vec<View>]) {
+    fn restore(&mut self, saved: &Saved, windows: &[Vec<View>], configured_mode: ScreenMode) {
         self.restored = Some(saved.session.clone());
         let lookup =
             |name: &String| (0..windows.len()).find(|index| window_key(&windows[*index]) == *name);
-        if saved.root.len() == 2 {
+        // Layouts saved while half screen mode had its own width keep the width of the mode
+        // the session was in (or, for saves without a session, the configured starting mode).
+        let half = saved.session.screen_mode.unwrap_or(configured_mode) == ScreenMode::Half;
+        let root = if saved.root_half.len() == 2 && half {
+            &saved.root_half
+        } else {
+            &saved.root
+        };
+        if root.len() == 2 {
             self.root.borrow_mut().set_sizes(
-                saved
-                    .root
-                    .iter()
-                    .copied()
-                    .map(PanelSize::from)
-                    .collect::<Vec<_>>(),
-            );
-        }
-        if saved.root_half.len() == 2 {
-            self.root_half.borrow_mut().set_sizes(
-                saved
-                    .root_half
-                    .iter()
+                root.iter()
                     .copied()
                     .map(PanelSize::from)
                     .collect::<Vec<_>>(),
@@ -495,6 +477,8 @@ fn load(path: &Path) -> Option<Saved> {
 struct Saved {
     version: u32,
     root: Vec<SavedSize>,
+    /// Half screen mode's former separate width, read from older saves only.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
     root_half: Vec<SavedSize>,
     side: BTreeMap<String, SavedSize>,
     side_resized: bool,

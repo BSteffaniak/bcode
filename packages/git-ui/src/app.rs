@@ -1717,10 +1717,7 @@ impl App {
     ) {
         use bmux_tui_components::panel_group::PanelGroupAxis;
         let (axis, state) = match id {
-            crate::panels::ROOT => (
-                crate::view::root_axis(self),
-                self.panels.root_for(self.screen_mode),
-            ),
+            crate::panels::ROOT => (crate::view::root_axis(self), &self.panels.root),
             crate::panels::MAIN => (PanelGroupAxis::Vertical, &self.panels.main),
             crate::panels::SECTIONS => (crate::view::sections_axis(self), &self.panels.sections),
             _ => (PanelGroupAxis::Vertical, &self.panels.side),

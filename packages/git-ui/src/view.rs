@@ -1372,7 +1372,7 @@ pub fn tree<'a>(app: &'a App, frame: &'a Frame) -> Element<'a> {
             PanelGroupComponent::new(
                 crate::panels::ROOT,
                 crate::panels::group(root_axis(app), theme),
-                app.panels.root_for(app.screen_mode),
+                &app.panels.root,
             )
             .child(side_column(app, frame))
             .child(main_column(app, frame)),

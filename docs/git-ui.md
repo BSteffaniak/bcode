@@ -241,8 +241,8 @@ show_output = true
 ```toml
 [layout]
 screen_mode = "normal"          # normal | half | full at startup; `+`/`_` change it
-side_panel_width = 33           # percent of the width in normal mode (10–90)
-half_side_panel_width = 50      # percent of the width in half mode
+side_panel_width = 33           # percent of the width (10–90); one width for every screen mode
+half_side_panel_width = 50      # starting width instead of side_panel_width when starting in half mode
 collapsed_windows = "titles"    # half mode: other windows as clickable titles, or "hidden"
 initial_window = "files"        # any view name below, or "main"
 windows = [                     # top to bottom; each window lists its tabs; omit views to hide them
