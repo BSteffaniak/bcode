@@ -26,6 +26,7 @@ bmux_tui_components = { workspace = true, features = [
     "panel-group",
     "scroll-view",
     "selectable-list",
+    "tab-bar",
     "text-input",
     "text-input-box",
 ] }

@@ -18,6 +18,9 @@ use bmux_tui_components::selectable_list::{
     SelectableListComponent, SelectableListHighlightPolicy, SelectableListItem,
     SelectableListPolicy, SelectableListState, SelectableListStyles,
 };
+use bmux_tui_components::tab_bar::{
+    TabBarComponent, TabBarPolicy, TabBarState, TabBarStyles, TabItem,
+};
 use bmux_tui_components::text_input::TextInputPolicy;
 use bmux_tui_components::text_input_box::{
     TextInputBoxComponent, TextInputBoxPolicy, TextInputBoxStyles,
@@ -39,6 +42,8 @@ pub struct Frame {
     log: Vec<SelectableListItem>,
     popup: Vec<SelectableListItem>,
     side_panes: Vec<Cell<PaneState>>,
+    side_tabs: Vec<Vec<TabItem<'static>>>,
+    tab_states: Vec<std::cell::RefCell<TabBarState>>,
     main_panes: [Cell<PaneState>; 2],
     log_pane: Cell<PaneState>,
     log_state: Cell<SelectableListState>,
@@ -118,6 +123,11 @@ impl Frame {
             log,
             popup,
             side_panes: side.iter().map(|_| pane_state()).collect(),
+            side_tabs: side_tab_items(app, &side),
+            tab_states: side
+                .iter()
+                .map(|_| std::cell::RefCell::new(TabBarState::new(None)))
+                .collect(),
             main_panes: [pane_state(), pane_state()],
             log_pane: pane_state(),
             log_state: Cell::new(SelectableListState::new(None)),
@@ -730,10 +740,23 @@ fn pane<'a>(
 }
 
 /// A pane whose title row is clickable and carries buttons.
+/// A pane title: text, or a component such as a row holding a tab bar.
+enum PaneTitle<'a> {
+    Text(Line),
+    Content(Element<'a>),
+}
+
+impl<'a> PaneTitle<'a> {
+    /// The tabbed title of a side window when it has one, else `text`.
+    fn side(app: &'a App, frame: &'a Frame, position: usize, text: Line) -> Self {
+        tabbed_title(app, frame, position).map_or(Self::Text(text), Self::Content)
+    }
+}
+
 fn pane_with<'a>(
     app: &'a App,
     id: impl Into<String>,
-    title: Line,
+    title: PaneTitle<'a>,
     focused: bool,
     state: &'a Cell<PaneState>,
     actions: &[(&str, &str)],
@@ -742,7 +765,15 @@ fn pane_with<'a>(
     let mut current = state.get();
     current.interaction.focused = focused;
     state.set(current);
-    let mut chrome = Pane::new().title(title).title_hit(true).styles(PaneStyles {
+    let (text, title_content) = match title {
+        PaneTitle::Text(line) => (Some(line), None),
+        PaneTitle::Content(content) => (None, Some(content)),
+    };
+    let mut chrome = Pane::new().title_hit(true);
+    if let Some(text) = text {
+        chrome = chrome.title(text);
+    }
+    chrome = chrome.styles(PaneStyles {
         background: None,
         border: app.theme.border,
         focused_border: app.theme.border_focused,
@@ -753,7 +784,11 @@ fn pane_with<'a>(
             Line::from_spans(vec![Span::styled((*label).to_owned(), app.theme.muted)]),
         ));
     }
-    PaneComponent::new(id.into(), chrome, state, child)
+    let component = PaneComponent::new(id.into(), chrome, state, child);
+    match title_content {
+        Some(title) => component.title_content(title),
+        None => component,
+    }
 }
 
 /// Whether side windows stack above the main view.
@@ -788,6 +823,85 @@ pub const fn sections_axis(app: &App) -> PanelGroupAxis {
     } else {
         PanelGroupAxis::Vertical
     }
+}
+
+/// Position, filter and trailing space after a side window's name or tabs.
+fn title_suffix(app: &App, view: View) -> Vec<Span> {
+    let theme = &app.theme;
+    let mut spans = Vec::new();
+    let count = app.rows(view).len();
+    if view != View::Status && count > 0 {
+        spans.push(Span::styled(
+            format!(" {}/{count}", (app.cursor(view) + 1).min(count)),
+            theme.muted,
+        ));
+    }
+    if let Some(filter) = app.filters.get(&view).filter(|filter| !filter.is_empty()) {
+        spans.push(Span::styled(format!(" /{filter}"), theme.warning));
+    }
+    spans.push(Span::raw(" "));
+    spans
+}
+
+/// Tab items of every side window, in frame order; ids are the views' configuration names, so a
+/// tab's hit region is `tabs-<window number>.<view name>`.
+fn side_tab_items(
+    app: &App,
+    side: &[(Window, View, Vec<SelectableListItem>)],
+) -> Vec<Vec<TabItem<'static>>> {
+    side.iter()
+        .map(|(window, _, _)| {
+            app.tabs(*window)
+                .iter()
+                .map(|view| TabItem::new(crate::layout::view_name(*view), view.label()))
+                .collect()
+        })
+        .collect()
+}
+
+/// A clickable title for a side window with several tabs showing one of them: its number,
+/// a tab bar, then its position and filter. Other windows keep a text title.
+fn tabbed_title<'a>(app: &'a App, frame: &'a Frame, position: usize) -> Option<Element<'a>> {
+    let (window, view, _) = &frame.side[position];
+    let tabs = app.tabs(*window);
+    let selected = tabs.iter().position(|tab| tab == view)?;
+    if tabs.len() < 2 {
+        return None;
+    }
+    let theme = &app.theme;
+    let title_style = if app.window == *window {
+        theme.title_focused
+    } else {
+        theme.title
+    };
+    frame.tab_states[position].replace(TabBarState::new(Some(selected)));
+    let bar = TabBarComponent::new(
+        format!("tabs-{}", window.number()),
+        &frame.side_tabs[position],
+        &frame.tab_states[position],
+    )
+    .policy(TabBarPolicy::interactive().padding("", "").separator(" · "))
+    .styles(TabBarStyles {
+        normal: theme.muted,
+        selected: title_style,
+        focused: Style::new(),
+        hovered: theme.text,
+        pressed: title_style,
+        disabled: theme.muted,
+        separator: theme.muted,
+    });
+    let text = |spans: Vec<Span>| {
+        TextBlock::new(Text::from_lines(vec![Line::from_spans(spans)])).wrap(TextWrap::None)
+    };
+    Some(Element::new(
+        BoxRow::new()
+            .child(text(vec![Span::styled(
+                format!("[{}] ", window.number()),
+                theme.key,
+            )]))
+            .child(bar)
+            .child(text(title_suffix(app, *view))),
+    ))
 }
 
 fn window_title(app: &App, window: Window, view: View) -> Line {
@@ -847,17 +961,7 @@ fn window_title(app: &App, window: Window, view: View) -> Line {
             }
         }
     }
-    let count = app.rows(view).len();
-    if view != View::Status && count > 0 {
-        spans.push(Span::styled(
-            format!(" {}/{count}", (app.cursor(view) + 1).min(count)),
-            theme.muted,
-        ));
-    }
-    if let Some(filter) = app.filters.get(&view).filter(|filter| !filter.is_empty()) {
-        spans.push(Span::styled(format!(" /{filter}"), theme.warning));
-    }
-    spans.push(Span::raw(" "));
+    spans.extend(title_suffix(app, view));
     Line::from_spans(spans)
 }
 
@@ -898,7 +1002,7 @@ fn side_pane<'a>(app: &'a App, frame: &'a Frame, position: usize) -> Element<'a>
         return Element::new(pane_with(
             app,
             id,
-            title,
+            PaneTitle::side(app, frame, position, title),
             focused,
             &frame.side_panes[position],
             &actions,
@@ -917,7 +1021,7 @@ fn side_pane<'a>(app: &'a App, frame: &'a Frame, position: usize) -> Element<'a>
     Element::new(pane_with(
         app,
         id,
-        title,
+        PaneTitle::side(app, frame, position, title),
         focused,
         &frame.side_panes[position],
         &actions,
@@ -1037,7 +1141,7 @@ fn main_column<'a>(app: &'a App, frame: &'a Frame) -> Element<'a> {
         section_panes.push(pane_with(
             app,
             format!("pane-main-{section}"),
-            Line::from_spans(title),
+            PaneTitle::Text(Line::from_spans(title)),
             focused,
             &frame.main_panes[section],
             &[("maximize", "□")],
@@ -1081,7 +1185,10 @@ fn main_column<'a>(app: &'a App, frame: &'a Frame) -> Element<'a> {
         group = group.child(pane_with(
             app,
             "pane-log",
-            Line::from_spans(vec![Span::styled(" Command log ", theme.title)]),
+            PaneTitle::Text(Line::from_spans(vec![Span::styled(
+                " Command log ",
+                theme.title,
+            )])),
             false,
             &frame.log_pane,
             &[("close", "✕")],

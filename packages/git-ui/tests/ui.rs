@@ -1346,3 +1346,59 @@ fn keyboard_resizes_and_resets_the_layout() {
     harness.relaunch();
     assert_eq!(main_column_x(&harness.screen(120, 30)), before);
 }
+
+#[test]
+fn clicking_title_tabs_switches_tabs() {
+    let mut harness = Harness::new(panel_repo);
+    let screen = harness.screen(140, 30);
+    assert!(
+        screen.contains("[2] Files · Worktrees · Submodules"),
+        "{screen}"
+    );
+    // A tab of the focused window.
+    harness.click("tabs-2.worktrees");
+    assert_eq!(harness.app.current_view(), View::Worktrees);
+    // A tab of another window focuses that window too.
+    harness.screen(140, 30);
+    harness.click("tabs-3.tags");
+    assert_eq!(harness.app.focused_window(), Window::Side(2));
+    assert_eq!(harness.app.current_view(), View::Tags);
+    let screen = harness.screen(140, 30);
+    assert!(screen.contains("No tags"), "{screen}");
+    // Keyboard tab switching still works from there.
+    harness.keys(&["["]);
+    assert_eq!(harness.app.current_view(), View::Remotes);
+
+    // Clicking a tab of a collapsed window expands it on that tab.
+    harness.click("pane-2.action.collapse");
+    harness.screen(140, 30);
+    harness.click("tabs-2.files");
+    let screen = harness.screen(140, 30);
+    assert_eq!(harness.app.current_view(), View::Files);
+    assert!(line_with(&screen, "[2] Files").contains('▾'), "{screen}");
+    assert!(screen.contains(" M a.txt"), "{screen}");
+}
+
+#[test]
+fn tabs_clipped_from_a_narrow_title_are_not_clickable() {
+    let mut harness = Harness::new(panel_repo);
+    let has = |harness: &Harness, id: &str| {
+        harness
+            .app
+            .hit_regions()
+            .iter()
+            .any(|(candidate, _)| candidate == id)
+    };
+    // At 100 columns only the "S" of "Submodules" fits: it is clickable on that cell only.
+    let screen = harness.screen(100, 40);
+    assert!(
+        line_with(&screen, "[2] Files").contains("Worktrees · S─"),
+        "{screen}"
+    );
+    assert_eq!(harness.region("tabs-2.submodules").width, 1);
+    // Narrower, the tab is clipped away entirely and has no region.
+    let screen = harness.screen(90, 40);
+    assert!(!line_with(&screen, "[2] Files").contains("· S"), "{screen}");
+    assert!(has(&harness, "tabs-2.files"));
+    assert!(!has(&harness, "tabs-2.submodules"));
+}

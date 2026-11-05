@@ -73,6 +73,8 @@ Every window is a panel:
   bottom edge of a side window, the main view or a staged/unstaged section); it lights up on
   hover. `ctrl+w >`/`ctrl+w <` widen or narrow the side column and `ctrl+w +`/`ctrl+w -` grow or
   shrink the focused panel.
+* **Tabs in titles** are clickable: click `Worktrees` in `[2] Files · Worktrees · Submodules` to
+  switch to it (a collapsed window expands). Tabs clipped off a narrow title are not clickable.
 * **Title buttons**: `▾`/`▸` collapses a side window to its title row or expands it, `□`
   maximizes, `✕` closes. Double-click a title to maximize or restore that panel. The command log
   has its own `✕`.

@@ -1507,6 +1507,13 @@ impl App {
 
     /// Clicks on pane titles and their buttons. A double click on a title maximizes the pane.
     fn chrome_click(&mut self, id: &str, position: Point) -> Option<Update<Msg>> {
+        if let Some(rest) = id.strip_prefix("tabs-") {
+            let (number, tab) = rest
+                .split_once('.')
+                .map_or((rest, None), |(n, t)| (n, Some(t)));
+            let index = number.parse::<usize>().ok()?.checked_sub(1)?;
+            return Some(self.select_tab(index, tab));
+        }
         let (pane, part) = id.split_once('.')?;
         let window = if pane == "pane-main" || pane.starts_with("pane-main-") {
             if let Some(section) = pane.strip_prefix("pane-main-").and_then(|n| n.parse().ok()) {
@@ -1542,6 +1549,42 @@ impl App {
             "action.close" => Some(self.close_window(window)),
             _ => None,
         }
+    }
+
+    /// Focus a side window and, when `tab` names one of its views, switch to that tab. A
+    /// collapsed window is expanded so the chosen tab shows.
+    pub(crate) fn select_tab(&mut self, index: usize, tab: Option<&str>) -> Update<Msg> {
+        let window = Window::Side(index);
+        self.focus(window);
+        if let Some(position) = tab.and_then(|name| {
+            self.tabs(window)
+                .iter()
+                .position(|view| crate::layout::view_name(*view) == name)
+        }) {
+            if self.tabs.get(&window).copied().unwrap_or(0) != position {
+                self.remote = None;
+                if self
+                    .sub_commits
+                    .as_ref()
+                    .is_some_and(|sub| sub.window == window)
+                {
+                    self.sub_commits = None;
+                }
+                if self
+                    .commit_files
+                    .as_ref()
+                    .is_some_and(|files| files.window == window)
+                {
+                    self.commit_files = None;
+                }
+                self.tabs.insert(window, position);
+            }
+            if self.panels.collapsed.remove(&index) {
+                self.sync_panels();
+                self.save_layout();
+            }
+        }
+        Update::redraw().maybe(self.sync_main(false))
     }
 
     /// Fill the screen with a window, or return to the configured screen mode.
