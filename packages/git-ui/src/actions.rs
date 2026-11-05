@@ -2628,3 +2628,31 @@ pub fn head_label(app: &App) -> Line {
     }
     Line::from_spans(spans)
 }
+
+/// Move the selection of the top menu or text viewer by `delta` rows (mouse wheel).
+/// Returns `false` when the top popup does not scroll.
+pub fn scroll_popup(app: &mut App, delta: isize) -> bool {
+    let step = |selected: usize, len: usize| {
+        selected
+            .saturating_add_signed(delta)
+            .min(len.saturating_sub(1))
+    };
+    match app.popups.last_mut() {
+        Some(Popup::Menu(menu)) => {
+            menu.selected = step(menu.selected, menu.visible().len());
+            let mut state = menu.list.get();
+            state.set_focused(Some(menu.selected));
+            state.set_selected(Some(menu.selected));
+            menu.list.set(state);
+            true
+        }
+        Some(Popup::Text(view)) => {
+            view.selected = step(view.selected, view.lines.len());
+            let mut state = view.list.get();
+            state.set_focused(Some(view.selected));
+            view.list.set(state);
+            true
+        }
+        _ => false,
+    }
+}

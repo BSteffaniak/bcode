@@ -1418,20 +1418,25 @@ impl App {
         let Event::Mouse(mouse) = event else {
             return Update::none();
         };
-        // With a popup open, only the scroll wheel reaches what is behind it, and only outside
-        // the popup itself; nothing behind changes focus.
+        // With a popup open, only the scroll wheel does anything: over the popup it scrolls a
+        // menu or text viewer, elsewhere it reaches what is behind without changing focus.
         let behind_popup = !self.popups.is_empty();
         if behind_popup {
-            let scroll = matches!(
-                mouse.kind,
-                MouseEventKind::ScrollUp | MouseEventKind::ScrollDown
-            );
+            let delta = match mouse.kind {
+                MouseEventKind::ScrollUp => -3,
+                MouseEventKind::ScrollDown => 3,
+                _ => return Update::none(),
+            };
             let over_popup = self
                 .popup_area
                 .get()
                 .is_some_and(|area| area.contains(Point::new(mouse.position.x, mouse.position.y)));
-            if !scroll || over_popup {
-                return Update::none();
+            if over_popup {
+                return if crate::actions::scroll_popup(self, delta) {
+                    Update::redraw()
+                } else {
+                    Update::none()
+                };
             }
         } else if let Some(update) = self.route_dividers(event) {
             return update;

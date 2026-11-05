@@ -94,6 +94,8 @@ Every window is a panel:
 
 While a popup such as the commit editor is open, the mouse wheel still scrolls the panel under
 the pointer behind it (outside the popup) without moving focus; clicks behind a popup are ignored.
+Over a menu (help, palette, option menus) or a text viewer (command output), the wheel moves
+through its items.
 
 Terminals narrower than 84 columns stack the side windows above the main view. Mouse clicks focus
 windows and select rows; clicking the selected row again opens it; the wheel scrolls. Every part of

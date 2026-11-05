@@ -1641,3 +1641,51 @@ fn panels_behind_a_popup_scroll_under_the_pointer() {
     harness.paste("still typing");
     assert!(harness.screen(140, 40).contains("still typing"));
 }
+
+#[test]
+fn popups_scroll_with_the_mouse_wheel() {
+    use bmux_tui::event::MouseEventKind;
+
+    let mut harness = Harness::new(|path| commit(path, "a", "a", "init"));
+    harness.keys(&[":"]);
+    harness.paste("seq -f 'row-%03g' 1 100");
+    harness.keys(&["enter"]);
+    let screen = harness.screen(120, 30);
+    assert!(screen.contains("row-001"), "{screen}");
+    assert!(!screen.contains("row-080"), "{screen}");
+    let (row, line) = screen
+        .lines()
+        .enumerate()
+        .find(|(_, line)| line.contains("row-005"))
+        .unwrap();
+    let x = u16::try_from(line[..line.find("row-005").unwrap()].chars().count()).unwrap();
+    let y = u16::try_from(row).unwrap();
+    for _ in 0..30 {
+        harness.mouse(MouseEventKind::ScrollDown, x, y);
+    }
+    let screen = harness.screen(120, 30);
+    assert!(screen.contains("row-080"), "{screen}");
+    assert!(!screen.contains("row-001"), "{screen}");
+    // Back up to the top, and no further.
+    for _ in 0..40 {
+        harness.mouse(MouseEventKind::ScrollUp, x, y);
+    }
+    assert!(harness.screen(120, 30).contains("row-001"));
+
+    // Menus scroll their items the same way.
+    harness.keys(&["escape", "?"]);
+    let before = harness.screen(120, 30);
+    let (row, line) = before
+        .lines()
+        .enumerate()
+        .find(|(_, line)| line.contains("Keybindings"))
+        .unwrap();
+    let x = u16::try_from(line[..line.find("Keybindings").unwrap()].chars().count()).unwrap();
+    let y = u16::try_from(row + 3).unwrap();
+    for _ in 0..20 {
+        harness.mouse(MouseEventKind::ScrollDown, x, y);
+    }
+    let after = harness.screen(120, 30);
+    assert!(after.contains("Keybindings"), "{after}");
+    assert_ne!(before, after);
+}
