@@ -263,16 +263,16 @@ impl App {
             }
             Action::FileEnter => self.enter_file(),
             Action::FileCommit | Action::FileCommitNoVerify | Action::StageCommit => {
+                // The editor always opens; whether there is anything to commit is checked when
+                // the message is submitted, against the status at that moment.
                 let entries = &self.snapshot.status.entries;
-                if entries.is_empty() {
-                    self.toast("Nothing to commit", true);
-                    return Update::redraw();
-                }
                 let stage_all = !entries
                     .iter()
                     .any(bcode_git::models::StatusEntry::has_staged);
                 self.prompt(
-                    if stage_all {
+                    if entries.is_empty() {
+                        "Commit message (no changes yet)"
+                    } else if stage_all {
                         "Commit message (nothing staged: commits all changes)"
                     } else {
                         "Commit message"
@@ -2061,6 +2061,17 @@ pub fn submit_prompt(app: &mut App, prompt: Prompt) -> Update<Msg> {
             if value.is_empty() {
                 return required(app, prompt);
             }
+            let entries = &app.snapshot.status.entries;
+            if !amend && entries.is_empty() {
+                app.toast("Nothing to commit: there are no changes", true);
+                app.popups.push(Popup::Prompt(prompt));
+                return Update::redraw();
+            }
+            // Re-evaluated at submit: staging may have changed while the editor was open.
+            let stage_all = stage_all
+                && !entries
+                    .iter()
+                    .any(bcode_git::models::StatusEntry::has_staged);
             let commit = Op::Commit(CommitOptions {
                 message: text,
                 amend,

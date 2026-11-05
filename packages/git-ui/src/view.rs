@@ -1144,7 +1144,22 @@ fn popup<'a>(app: &'a App, frame: &'a Frame) -> Option<Element<'a>> {
             column = column.child(
                 TextBlock::new(Text::from_lines(vec![Line::from_spans(hint)])).wrap(TextWrap::None),
             );
-            Some(modal(app, &prompt.title, 90, rows + 6, column))
+            // The status bar is covered while a popup is open, so errors show in the popup.
+            let error = app.toast.as_ref().filter(|toast| toast.error);
+            if let Some(toast) = error {
+                column = column.child(
+                    TextBlock::new(Text::from_lines(vec![Line::from_spans(vec![
+                        Span::styled(
+                            format!("✗ {}", toast.text.lines().next().unwrap_or_default()),
+                            theme.error,
+                        ),
+                    ])]))
+                    .wrap(TextWrap::None),
+                );
+            }
+            // Input rows plus its border, the hint row, an optional error row, and the frame.
+            let height = rows + 3 + u16::from(error.is_some()) + 4;
+            Some(modal(app, &prompt.title, 90, height, column))
         }
     }
 }

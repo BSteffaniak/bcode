@@ -142,6 +142,26 @@ fn stages_and_commits_with_keys() {
 }
 
 #[test]
+fn commit_editor_opens_on_a_clean_tree_and_reports_on_submit() {
+    let mut harness = Harness::new(|path| commit(path, "a.txt", "a\n", "init"));
+    harness.keys(&["2", "c"]);
+    harness.paste("Nothing yet");
+    let screen = harness.screen(120, 30);
+    assert!(screen.contains("Commit message"), "{screen}");
+    assert!(screen.contains("amend: off"), "{screen}");
+    harness.keys(&["enter"]);
+    assert_eq!(harness.log(), ["init"]);
+    let screen = harness.screen(120, 30);
+    assert!(screen.contains("Nothing to commit"), "{screen}");
+    // The editor stays open with the message intact; changes made meanwhile can be committed.
+    assert!(screen.contains("Nothing yet"), "{screen}");
+    std::fs::write(harness.path().join("a.txt"), "b\n").unwrap();
+    harness.send(RuntimeEvent::Message(bcode_git_ui::app::Msg::Watch));
+    harness.keys(&["enter"]);
+    assert_eq!(harness.log(), ["Nothing yet", "init"]);
+}
+
+#[test]
 fn stages_a_single_line_in_the_staging_view() {
     let mut harness = Harness::new(|path| {
         commit(path, "f.txt", "one\ntwo\nthree\n", "init");
