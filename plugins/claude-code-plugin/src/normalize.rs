@@ -84,7 +84,10 @@ impl Normalizer {
             .into_iter()
             .collect())
     }
-    fn observation(&mut self, kind: HarnessObservationKind) -> Option<HarnessObservation> {
+    pub(super) fn observation(
+        &mut self,
+        kind: HarnessObservationKind,
+    ) -> Option<HarnessObservation> {
         self.sequence = self.sequence.checked_add(1)?;
         let native_correlations = match &kind {
             HarnessObservationKind::Execution { event } => {

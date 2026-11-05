@@ -60,19 +60,20 @@ struct StreamState {
     retired_attempts: Vec<HarnessAttemptIdentity>,
 }
 impl StreamState {
-    fn tool_diagnostic(&mut self, identity: &str, diagnostic: diagnostics::Diagnostic) -> bool {
-        let target = &self.normalizer.target;
-        self.push(vec![HarnessObservation {
-            observation_id: format!("claude-mcp:{}:{identity}", target.generation()),
-            session_id: target.session_id().to_owned(),
-            generation: target.generation(),
-            native_correlations: Vec::new(),
-            completeness: HarnessCompleteness::Complete,
-            kind: HarnessObservationKind::Diagnostic {
+    fn tool_diagnostic(&mut self, _identity: &str, diagnostic: diagnostics::Diagnostic) -> bool {
+        // A bridge/request identity can recur across turns (bind, revoke, refresh).
+        // Each emitted diagnostic is a distinct observation, not a mutation replay.
+        let Some(observation) = self
+            .normalizer
+            .observation(HarnessObservationKind::Diagnostic {
                 code: diagnostic.code().into(),
                 message: diagnostic.message(),
-            },
-        }])
+            })
+        else {
+            self.gap = true;
+            return false;
+        };
+        self.push(vec![observation])
     }
 
     fn push(&mut self, observations: Vec<HarnessObservation>) -> bool {
@@ -1193,6 +1194,37 @@ fn native_init_host_tools_status(value: &Value) -> &'static str {
 #[cfg(test)]
 mod host_tools_diagnostic_tests {
     use super::*;
+
+    #[test]
+    fn recurring_bridge_diagnostics_have_distinct_canonical_observation_ids() {
+        let prepared = HarnessPreparedSession {
+            open_id: "open".into(),
+            session_id: "session".into(),
+            instance_id: "instance".into(),
+            generation: 1,
+            native_version: "tested-version".into(),
+            requested_native_session_id: None,
+        };
+        let mut stream = StreamState {
+            normalizer: Normalizer::with_target(
+                HarnessSessionTarget::Prepared(prepared),
+                "open".into(),
+            ),
+            observations: VecDeque::new(),
+            gap: false,
+            acknowledged: None,
+            retention: retention::PageRetention::new("diagnostic-test".into()),
+            retired_attempts: Vec::new(),
+        };
+        for _ in 0..2 {
+            assert!(stream.tool_diagnostic("same-bridge", diagnostics::Diagnostic::QueueRevoked));
+        }
+        assert_ne!(
+            stream.observations[0].observation_id,
+            stream.observations[1].observation_id
+        );
+        assert_eq!(stream.observations[0].kind, stream.observations[1].kind);
+    }
 
     #[test]
     fn system_init_status_is_sanitized_and_does_not_guess_unknowns() {

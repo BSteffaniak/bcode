@@ -180,6 +180,19 @@ def main():
                   "user_message_uuid":submission_uuid, "queued_turn_count":0})
             emit({"type":"system", "subtype":"session_state_changed",
                   "session_id":session, "state":"idle"})
+        elif (frame.get("type") == "control_request"
+              and frame.get("request", {}).get("subtype") == "mcp_status"):
+            emit({"type":"control_response", "response":{"subtype":"success",
+                  "request_id":frame["request_id"], "response":{"mcpServers":[
+                      {"name":"bcode-tools", "status":"connected"}]}}})
+        elif (frame.get("type") == "control_request"
+              and frame.get("request", {}).get("subtype") == "mcp_message"
+              and frame["request"].get("server_name") == "bcode-tools"
+              and frame["request"].get("message", {}).get("method")
+                  == "notifications/tools/list_changed"):
+            # Acknowledge notification receipt only, never invent catalog completion.
+            emit({"type":"control_response", "response":{"subtype":"success",
+                  "request_id":frame["request_id"], "response":{}}})
         elif frame.get("request", {}).get("subtype") == "interrupt":
             effect(root, "interrupt")
             emit({"type":"control_response", "response":{"subtype":"success",

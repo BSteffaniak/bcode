@@ -248,3 +248,27 @@ not replace, exact-version native acceptance. Native login behavior, background
 continuation, interruption and process-loss reconciliation require explicit release
 evidence. Unavailable executables, missing accounts and unapproved spending remain
 reported acceptance blockers; fixture success does not establish live compatibility.
+
+### Opt-in native CLI acceptance
+
+With explicit authorization to use the existing native Claude subscription, run:
+
+```sh
+cargo test --locked -p bcode --features app,static-bundled-claude-code-plugin \
+  --test harness_native_acceptance -- --ignored --nocapture
+```
+
+The test verifies the pinned Claude executable and wrapped executable hashes, uses
+native credential custody, and starts a matching client/daemon in private Bcode
+state without any model-provider credentials. It checks two sequential submissions,
+exact result/attempt correlation, foreground completion and settled activity, then
+compares canonical history after daemon restart with the adapter disabled. It does
+not establish native login handoff, safe recovery, managed-tool execution, or
+background-continuation settlement. `BCODE_NATIVE_CLAUDE_CONFIG_DIR` may select an
+existing native credential namespace; credentials must not be copied into test state.
+
+Observation clients must use the exact returned `next_after`, including `None` on
+an empty page, and adopt confirmed session bindings. Canonical history has a
+separate cursor: an empty page with an unchanged cursor is its current tail, not
+proof that future events cannot arrive. Diagnostics emitted on recurring bridge
+operations have distinct observation identities; bridge identity is not an event ID.

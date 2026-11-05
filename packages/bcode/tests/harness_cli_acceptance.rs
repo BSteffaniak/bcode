@@ -581,7 +581,7 @@ impl Cli {
             }
             // Retain this page's successor even when returning immediately:
             // future live observations must not replay an earlier predecessor.
-            after = page["next_after"].as_str().map(str::to_owned).or(after);
+            after = page["next_after"].as_str().map(str::to_owned);
             if target["state"] == "confirmed" {
                 if let Some(question) = question.take() {
                     return (target, question, after);
