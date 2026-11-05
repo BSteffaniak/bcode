@@ -600,3 +600,32 @@ fn worktrees_keep_their_own_draft() {
         Some("linked draft")
     );
 }
+
+#[test]
+fn failed_commands_keep_git_message_in_the_log() {
+    let repo = TempRepo::init();
+    repo.write("f", b"1\n");
+    repo.commit_all("one");
+    assert!(repo.repo.delete_branch("missing", false).is_err());
+    let record = repo
+        .repo
+        .command_log()
+        .into_iter()
+        .rev()
+        .find(|record| record.args.first().is_some_and(|arg| arg == "branch"))
+        .unwrap();
+    assert!(!record.success);
+    let error = record.error.unwrap();
+    assert!(
+        error.contains("missing") && error.contains("not found"),
+        "{error}"
+    );
+    // Successful commands carry no error.
+    assert!(
+        repo.repo
+            .command_log()
+            .iter()
+            .filter(|record| record.success)
+            .all(|record| record.error.is_none())
+    );
+}

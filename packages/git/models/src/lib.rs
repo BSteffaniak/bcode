@@ -619,6 +619,9 @@ pub struct GitCommandRecord {
     pub success: bool,
     /// Wall time in milliseconds.
     pub duration_ms: u64,
+    /// Why the command failed: git's message, when it did.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
 }
 
 impl GitCommandRecord {
@@ -820,6 +823,7 @@ mod tests {
             mutating: true,
             success: true,
             duration_ms: 1,
+            error: None,
         };
         assert_eq!(record.display(), "git commit -m 'it'\\''s done'");
     }

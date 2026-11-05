@@ -267,8 +267,25 @@ impl GitRunner {
         for (key, value) in &invocation.env {
             command.env(key, value);
         }
-        let result = spawn_and_wait(&mut command, invocation.stdin.as_deref());
-        let success = matches!(&result, Ok((status, _)) if status.success());
+        let result = spawn_and_wait(&mut command, invocation.stdin.as_deref()).and_then(
+            |(status, output)| {
+                if status.success() {
+                    Ok(output)
+                } else {
+                    Err(GitError::Command {
+                        args: invocation
+                            .args
+                            .iter()
+                            .map(|arg| arg.to_string_lossy().into_owned())
+                            .collect::<Vec<_>>()
+                            .join(" "),
+                        code: status.code(),
+                        stderr: String::from_utf8_lossy(&output.stderr).trim().to_owned(),
+                        stdout: String::from_utf8_lossy(&output.stdout).trim().to_owned(),
+                    })
+                }
+            },
+        );
         if invocation.log || invocation.mutating {
             self.log.push(GitCommandRecord {
                 args: invocation
@@ -277,26 +294,12 @@ impl GitRunner {
                     .map(|arg| arg.to_string_lossy().into_owned())
                     .collect(),
                 mutating: invocation.mutating,
-                success,
+                success: result.is_ok(),
                 duration_ms: u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX),
+                error: result.as_ref().err().map(GitError::message),
             });
         }
-        let (status, output) = result?;
-        if status.success() {
-            Ok(output)
-        } else {
-            Err(GitError::Command {
-                args: invocation
-                    .args
-                    .iter()
-                    .map(|arg| arg.to_string_lossy().into_owned())
-                    .collect::<Vec<_>>()
-                    .join(" "),
-                code: status.code(),
-                stderr: String::from_utf8_lossy(&output.stderr).trim().to_owned(),
-                stdout: String::from_utf8_lossy(&output.stdout).trim().to_owned(),
-            })
-        }
+        result
     }
 }
 

@@ -88,21 +88,32 @@ impl Frame {
             .rev()
             .take(100)
             .map(|(index, record)| {
-                SelectableListItem::rich(
-                    index.to_string(),
-                    Line::from_spans(vec![
-                        Span::styled(
-                            if record.success { "✓ " } else { "✗ " },
-                            if record.success {
-                                app.theme.success
-                            } else {
-                                app.theme.error
-                            },
-                        ),
-                        Span::styled(record.display(), app.theme.text),
-                        Span::styled(format!("  {}ms", record.duration_ms), app.theme.muted),
-                    ]),
-                )
+                let mut lines = vec![Line::from_spans(vec![
+                    Span::styled(
+                        if record.success { "✓ " } else { "✗ " },
+                        if record.success {
+                            app.theme.success
+                        } else {
+                            app.theme.error
+                        },
+                    ),
+                    Span::styled(record.display(), app.theme.text),
+                    Span::styled(format!("  {}ms", record.duration_ms), app.theme.muted),
+                ])];
+                // A failure shows why, beneath the command.
+                lines.extend(
+                    record
+                        .error
+                        .iter()
+                        .flat_map(|error| error.lines())
+                        .map(|line| {
+                            Line::from_spans(vec![Span::styled(
+                                format!("  {line}"),
+                                app.theme.error,
+                            )])
+                        }),
+                );
+                SelectableListItem::multiline(index.to_string(), lines)
             })
             .collect();
         let popup = popup_items(app);

@@ -1925,3 +1925,38 @@ fn border_scrollbars_appear_on_overflow_and_drag() {
         .collect();
     assert!(column.ends_with('┃'), "{column}");
 }
+
+#[test]
+fn command_log_shows_why_a_command_failed() {
+    let mut harness = Harness::new(|path| {
+        commit(path, "a", "a", "init");
+        let remote = path.join(".git").join("remote.git");
+        git(
+            path,
+            &["init", "--quiet", "--bare", remote.to_str().unwrap()],
+        );
+        git(path, &["remote", "add", "origin", remote.to_str().unwrap()]);
+        git(path, &["push", "--quiet", "-u", "origin", "main"]);
+        git(path, &["branch", "--track", "other", "origin/main"]);
+        // `other` is checked out in another worktree, so git refuses to fetch into it.
+        let worktree = path.join(".git").join("other-worktree");
+        git(
+            path,
+            &[
+                "worktree",
+                "add",
+                "--quiet",
+                worktree.to_str().unwrap(),
+                "other",
+            ],
+        );
+    });
+    harness.keys(&["3", "j", "f", "@"]);
+    let screen = harness.screen(160, 50);
+    let failed = screen
+        .lines()
+        .position(|line| line.contains("✗ git fetch"))
+        .unwrap_or_else(|| panic!("{screen}"));
+    let reason = screen.lines().nth(failed + 1).unwrap();
+    assert!(reason.contains("refusing to fetch into branch"), "{screen}");
+}
