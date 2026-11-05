@@ -27,5 +27,5 @@ mod view;
 
 pub use run::{
     COMMIT_MESSAGE_ENV, RunError, RunOptions, build_app, commit_message_from_env, find_repo_root,
-    render_text, run,
+    render_buffer, render_text, run,
 };

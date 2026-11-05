@@ -78,14 +78,7 @@ pub fn find_repo_root(path: &Path) -> Option<PathBuf> {
 /// discarded.
 #[must_use]
 pub fn render_text(app: &mut App, width: u16, height: u16) -> Vec<String> {
-    let mut buffer = bmux_tui::buffer::Buffer::empty(Rect::new(0, 0, width, height));
-    let mut frame = bmux_tui::frame::Frame::new(&mut buffer);
-    {
-        let mut cx = bmux_tui::paint::PaintCx::new(&mut frame);
-        paint(app, &mut cx);
-    }
-    *app.hits.borrow_mut() = frame.hits().clone();
-    drop(frame);
+    let buffer = render_buffer(app, width, height);
     (0..height)
         .map(|y| {
             buffer
@@ -95,6 +88,20 @@ pub fn render_text(app: &mut App, width: u16, height: u16) -> Vec<String> {
                 .to_owned()
         })
         .collect()
+}
+
+/// Render one frame headlessly into a cell buffer (symbols and styles), recording hit regions.
+#[must_use]
+pub fn render_buffer(app: &mut App, width: u16, height: u16) -> bmux_tui::buffer::Buffer {
+    let mut buffer = bmux_tui::buffer::Buffer::empty(Rect::new(0, 0, width, height));
+    let mut frame = bmux_tui::frame::Frame::new(&mut buffer);
+    {
+        let mut cx = bmux_tui::paint::PaintCx::new(&mut frame);
+        paint(app, &mut cx);
+    }
+    *app.hits.borrow_mut() = frame.hits().clone();
+    drop(frame);
+    buffer
 }
 
 /// Build application state without touching the terminal.

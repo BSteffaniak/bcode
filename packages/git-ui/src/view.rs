@@ -1059,18 +1059,28 @@ pub fn tree<'a>(app: &'a App, frame: &'a Frame) -> Element<'a> {
 const fn modal_theme(app: &App) -> ModalTheme {
     let theme = &app.theme;
     let background = theme.overlay;
+    // Every modal style carries the panel background: content inherits the text style, and a
+    // child that fills its area (labels, input boxes) would otherwise reset cells to the
+    // terminal default, punching holes in the panel.
     ModalTheme::new(
         background,
-        theme.border_focused.patch(Style {
-            fg: theme.border_focused.fg,
-            bg: background.bg,
+        Style {
             modifiers: Modifier::EMPTY,
-        }),
-        theme.title_focused,
-        theme.text,
-        theme.muted,
-        theme.accent,
+            ..on_panel(theme.border_focused, background)
+        },
+        on_panel(theme.title_focused, background),
+        on_panel(theme.text, background),
+        on_panel(theme.muted, background),
+        on_panel(theme.accent, background),
     )
+}
+
+/// `style` drawn on `panel`'s background.
+const fn on_panel(style: Style, panel: Style) -> Style {
+    Style {
+        bg: panel.bg,
+        ..style
+    }
 }
 
 fn modal<'a>(

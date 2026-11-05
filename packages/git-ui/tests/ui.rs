@@ -871,3 +871,48 @@ fn configured_sources_limit_and_order_the_prefill() {
     assert!(screen.contains("Merge message"), "{screen}");
     assert!(!screen.contains("From lazygit"), "{screen}");
 }
+
+/// No cell of the open modal, from its `╭` corner to its `╯` corner, falls back to the
+/// terminal's default background (highlighted rows may use their own color).
+fn assert_solid_modal(harness: &mut Harness) {
+    use bmux_tui::geometry::Point;
+
+    let (width, height) = (140u16, 40u16);
+    let buffer = bcode_git_ui::render_buffer(&mut harness.app, width, height);
+    let find = |corner: &str| {
+        (0..height).find_map(|y| {
+            (0..width).find_map(|x| {
+                (buffer.get(Point::new(x, y)).unwrap().symbol == corner).then_some((x, y))
+            })
+        })
+    };
+    let (left, top) = find("╭").expect("a modal is open");
+    let (right, bottom) = find("╯").expect("a modal is open");
+    for y in top..=bottom {
+        for x in left..=right {
+            let cell = buffer.get(Point::new(x, y)).unwrap();
+            assert!(
+                cell.style.bg.is_some(),
+                "cell ({x}, {y}) {:?} has no background in row {:?}",
+                cell.symbol,
+                buffer.row_symbols(y)
+            );
+        }
+    }
+}
+
+#[test]
+fn modals_have_a_solid_background() {
+    let mut harness = Harness::new(changed_repo);
+    harness.keys(&["c"]);
+    harness.paste("Typed summary");
+    assert_solid_modal(&mut harness);
+    harness.keys(&["tab"]);
+    harness.paste("Typed description");
+    assert_solid_modal(&mut harness);
+    harness.keys(&["escape", "?"]);
+    assert_solid_modal(&mut harness);
+    harness.keys(&["escape", "ctrl+p"]);
+    harness.paste("com");
+    assert_solid_modal(&mut harness);
+}
