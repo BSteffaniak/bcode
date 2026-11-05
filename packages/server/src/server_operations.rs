@@ -1,5 +1,7 @@
 //! Transport-neutral application operations for daemon status and lifecycle.
 
+pub mod shutdown_admission;
+
 use super::ServerState;
 use bcode_model_catalog_models::ModelCatalogDiagnostics;
 use std::collections::BTreeSet;
@@ -136,14 +138,196 @@ impl StopBlocked {
 pub async fn prepare_stop(
     state: &ServerState,
     mode: bcode_ipc::ServerStopMode,
-) -> Result<(), StopBlocked> {
+) -> Result<shutdown_admission::ShutdownReservation<'_>, StopBlocked> {
+    // Reserve before inspecting asynchronous blockers, not after a stale status snapshot.
+    // A rejected policy or failed acknowledgment drops the reservation and reopens admission.
+    let reservation = state
+        .shutdown_admission
+        .prepare(mode == bcode_ipc::ServerStopMode::Force)
+        .map_err(|blocker| {
+            match blocker {
+                shutdown_admission::AdmissionBlocked::Busy(snapshot) => {
+                    tracing::debug!(?snapshot, "shutdown admission blocked");
+                }
+                shutdown_admission::AdmissionBlocked::Unavailable => {
+                    tracing::debug!("shutdown admission unavailable");
+                }
+            }
+            StopBlocked
+        })?;
+    tracing::debug!(admission = ?state.shutdown_admission.snapshot(), "shutdown admission reserved");
     if state.active_migration_shutdown_blocker().await.is_some() {
         return Err(StopBlocked);
     }
     if mode == bcode_ipc::ServerStopMode::IfIdle && state.idle_shutdown_blocker().await.is_some() {
         return Err(StopBlocked);
     }
-    Ok(())
+    Ok(reservation)
+}
+
+/// Fail closed with a normalized lifecycle category.
+fn lifecycle_failure(code: &str) -> bcode_daemon_lifecycle::application::RuntimeApplicationFailure {
+    bcode_daemon_lifecycle::application::RuntimeApplicationFailure {
+        code: code.into(),
+        message: "runtime lifecycle observation or admission is unavailable".into(),
+    }
+}
+
+pub fn runtime_identity(
+    state: &ServerState,
+) -> Result<
+    bcode_ipc::RuntimeInstanceIdentity,
+    bcode_daemon_lifecycle::application::RuntimeApplicationFailure,
+> {
+    let daemon = &state.daemon_status;
+    let artifact = daemon
+        .artifact_id
+        .as_ref()
+        .ok_or_else(|| lifecycle_failure("runtime_identity_unavailable"))?;
+    let location = daemon
+        .state_location_id
+        .clone()
+        .ok_or_else(|| lifecycle_failure("runtime_identity_unavailable"))?;
+    if daemon.instance_id.is_empty() || location.is_empty() {
+        return Err(lifecycle_failure("runtime_identity_unavailable"));
+    }
+    Ok(bcode_ipc::RuntimeInstanceIdentity {
+        instance_id: daemon.instance_id.clone(),
+        artifact_id: artifact.to_string(),
+        state_location_id: location,
+    })
+}
+
+async fn quiescence(
+    state: &ServerState,
+) -> Result<
+    bcode_ipc::RuntimeQuiescence,
+    bcode_daemon_lifecycle::application::RuntimeApplicationFailure,
+> {
+    use bcode_ipc::{RuntimeIdleBlocker, RuntimeIdleBlockerKind as Kind};
+    let admission = state
+        .shutdown_admission
+        .snapshot()
+        .map_err(|_| lifecycle_failure("runtime_admission_unavailable"))?;
+    let mut blockers = Vec::new();
+    let mut add = |kind, count| {
+        if count > 0 {
+            blockers.push(RuntimeIdleBlocker { kind, count });
+        }
+    };
+    add(Kind::Admission, admission.active_operations);
+    add(
+        Kind::Stopping,
+        usize::from(admission.phase != shutdown_admission::AdmissionPhase::Running),
+    );
+    add(
+        Kind::Observation,
+        usize::from(
+            state.xray.observation_active().unwrap_or(true) || state.xray_endpoints.active().await,
+        ),
+    );
+    add(
+        Kind::Migration,
+        state.session_migrations.active_count().await,
+    );
+    add(
+        Kind::Clients,
+        state.clients.lock().await.len().saturating_sub(1),
+    );
+    add(
+        Kind::RecoveredInteraction,
+        state.recovered_interaction_owners.lock().await.len(),
+    );
+    add(Kind::ModelTurn, state.active_runtime_turn_count().await);
+    add(
+        Kind::QueuedCommand,
+        state
+            .session_runtimes
+            .lock()
+            .await
+            .values()
+            .map(|handle| {
+                handle
+                    .queued_followups
+                    .load(std::sync::atomic::Ordering::Acquire)
+            })
+            .sum(),
+    );
+    add(Kind::RuntimeWork, state.runtime_work.active_count().await);
+    add(
+        Kind::PluginTask,
+        state
+            .plugins
+            .executor_statuses()
+            .into_iter()
+            .map(|status| status.running)
+            .sum(),
+    );
+    Ok(bcode_ipc::RuntimeQuiescence {
+        version: 1,
+        instance: runtime_identity(state)?,
+        admission_generation: admission.generation,
+        blockers,
+    })
+}
+
+/// Subscribe before sampling so mutation between sampling and waiting is not lost.
+pub async fn wait_quiescence(
+    state: &ServerState,
+    expected: &bcode_ipc::RuntimeInstanceIdentity,
+    after: Option<&bcode_ipc::RuntimeQuiescence>,
+    wait_ms: u32,
+) -> Result<
+    bcode_ipc::RuntimeQuiescence,
+    bcode_daemon_lifecycle::application::RuntimeApplicationFailure,
+> {
+    if after.is_some_and(|snapshot| snapshot.version != 1 || snapshot.instance != *expected) {
+        return Err(lifecycle_failure("unsupported_runtime_observation"));
+    }
+    let deadline = tokio::time::Instant::now()
+        + std::time::Duration::from_millis(u64::from(wait_ms.min(30_000)));
+    let mut changes = state.activity_changes.subscribe();
+    let mut admission_changes = state.shutdown_admission.subscribe();
+    loop {
+        let snapshot = quiescence(state).await?;
+        if snapshot.instance != *expected {
+            return Err(lifecycle_failure("runtime_instance_changed"));
+        }
+        if after != Some(&snapshot) || tokio::time::Instant::now() >= deadline {
+            return Ok(snapshot);
+        }
+        tokio::select! {
+            _ = changes.recv() => {},
+            _ = admission_changes.changed() => {},
+            () = tokio::time::sleep_until(deadline) => return quiescence(state).await,
+        }
+    }
+}
+
+pub async fn prepare_quiescent_stop<'a>(
+    state: &'a ServerState,
+    expected: &bcode_ipc::RuntimeQuiescence,
+) -> Result<
+    shutdown_admission::ShutdownReservation<'a>,
+    bcode_daemon_lifecycle::application::RuntimeApplicationFailure,
+> {
+    if expected.version != 1 || !expected.blockers.is_empty() {
+        return Err(lifecycle_failure("unsupported_runtime_observation"));
+    }
+    if runtime_identity(state)? != expected.instance {
+        return Err(lifecycle_failure("runtime_instance_changed"));
+    }
+    let reservation = state
+        .shutdown_admission
+        .prepare_observed(expected.admission_generation)
+        .map_err(|_| lifecycle_failure("runtime_observation_changed"))?;
+    // Reserve before the authoritative blocker recheck. Snapshot idleness alone is not admission.
+    if state.active_migration_shutdown_blocker().await.is_some()
+        || state.idle_shutdown_blocker().await.is_some()
+    {
+        return Err(lifecycle_failure("daemon_busy"));
+    }
+    Ok(reservation)
 }
 
 /// Trigger daemon shutdown after transport acknowledgment.

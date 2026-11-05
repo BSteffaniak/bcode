@@ -13,6 +13,7 @@ version     = { workspace = true }
 [dependencies]
 bcode_client               = { workspace = true }
 bcode_config               = { workspace = true }
+bcode_daemon_lifecycle     = { workspace = true }
 bcode_eval_models          = { workspace = true }
 bcode_ipc                  = { workspace = true }
 bcode_model                = { workspace = true }
@@ -35,6 +36,7 @@ toml                       = { workspace = true, features = ["parse", "display",
 
 [dev-dependencies]
 tempfile = { workspace = true }
+tokio    = { workspace = true, features = ["test-util"] }
 
 [features]
 default          = []

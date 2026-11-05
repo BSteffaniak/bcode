@@ -321,6 +321,14 @@ impl PluginApplication for ServicesApplicationHandle<'_> {
                 code: code.into(),
                 message: message.into(),
             })?;
+        let _admission =
+            self.state
+                .shutdown_admission
+                .admit()
+                .map_err(|_| PluginApplicationFailure {
+                    code: "daemon_stopping".into(),
+                    message: "daemon is not admitting plugin work".into(),
+                })?;
         Box::pin(plugin_operations::invoke_service(
             self.state,
             &plugin_id,
@@ -343,6 +351,14 @@ impl PluginApplication for ServicesApplicationHandle<'_> {
                 code: code.into(),
                 message: message.into(),
             })?;
+        let _admission =
+            self.state
+                .shutdown_admission
+                .admit()
+                .map_err(|_| PluginApplicationFailure {
+                    code: "daemon_stopping".into(),
+                    message: "daemon is not admitting plugin work".into(),
+                })?;
         let result = if interface_id == bcode_session_import::SESSION_IMPORT_INTERFACE_ID {
             crate::session_import::call_import_service(self.state, &operation, &payload).await
         } else {
@@ -370,6 +386,14 @@ impl PluginApplication for ServicesApplicationHandle<'_> {
                 code: code.into(),
                 message: message.into(),
             })?;
+        let _admission =
+            self.state
+                .shutdown_admission
+                .admit()
+                .map_err(|_| PluginApplicationFailure {
+                    code: "daemon_stopping".into(),
+                    message: "daemon is not admitting plugin work".into(),
+                })?;
         Box::pin(crate::plugin_context::invoke(
             self.state,
             self.client_id,
@@ -664,6 +688,7 @@ impl bcode_provider_auth_models::application::AuthPoolApplication
 pub struct PreparedRuntimeShutdown<'a> {
     state: &'a ServerState,
     mode: bcode_daemon_lifecycle::application::RuntimeShutdownMode,
+    reservation: crate::server_operations::shutdown_admission::ShutdownReservation<'a>,
 }
 
 impl bcode_daemon_lifecycle::application::RuntimeShutdownOperation for PreparedRuntimeShutdown<'_> {
@@ -672,6 +697,7 @@ impl bcode_daemon_lifecycle::application::RuntimeShutdownOperation for PreparedR
     }
 
     fn commit(self) -> bcode_daemon_lifecycle::application::RuntimeShutdownAccepted {
+        self.reservation.commit();
         crate::server_operations::request_shutdown(self.state);
         bcode_daemon_lifecycle::application::RuntimeShutdownAccepted { mode: self.mode }
     }
@@ -702,7 +728,7 @@ impl bcode_daemon_lifecycle::application::RuntimeShutdownPreparationApplication
             RuntimeShutdownMode::Force => bcode_ipc::ServerStopMode::Force,
             RuntimeShutdownMode::IfIdle => bcode_ipc::ServerStopMode::IfIdle,
         };
-        crate::server_operations::prepare_stop(self.state, policy)
+        let reservation = crate::server_operations::prepare_stop(self.state, policy)
             .await
             .map_err(|_| RuntimeApplicationFailure {
                 code: crate::server_operations::StopBlocked::code().into(),
@@ -711,7 +737,49 @@ impl bcode_daemon_lifecycle::application::RuntimeShutdownPreparationApplication
         Ok(PreparedRuntimeShutdown {
             state: self.state,
             mode,
+            reservation,
         })
+    }
+}
+
+impl bcode_daemon_lifecycle::application::RuntimeQuiescenceApplication
+    for ServicesApplicationHandle<'_>
+{
+    async fn runtime_quiescence(
+        &self,
+        expected_instance: bcode_ipc::RuntimeInstanceIdentity,
+        after: Option<bcode_ipc::RuntimeQuiescence>,
+        wait_ms: u32,
+    ) -> Result<
+        bcode_ipc::RuntimeQuiescence,
+        bcode_daemon_lifecycle::application::RuntimeApplicationFailure,
+    > {
+        crate::server_operations::wait_quiescence(
+            self.state,
+            &expected_instance,
+            after.as_ref(),
+            wait_ms,
+        )
+        .await
+    }
+
+    async fn stop_quiescent_runtime(
+        &self,
+        expected: bcode_ipc::RuntimeQuiescence,
+    ) -> Result<
+        bcode_ipc::RuntimeStopReceipt,
+        bcode_daemon_lifecycle::application::RuntimeApplicationFailure,
+    > {
+        let reservation =
+            crate::server_operations::prepare_quiescent_stop(self.state, &expected).await?;
+        let receipt = bcode_ipc::RuntimeStopReceipt {
+            version: 1,
+            instance: expected.instance,
+            admission_generation: expected.admission_generation,
+        };
+        reservation.commit();
+        crate::server_operations::request_shutdown(self.state);
+        Ok(receipt)
     }
 }
 
@@ -1053,6 +1121,222 @@ mod tests {
                 .code
         };
         assert_eq!(final_error, "services_application_stopped");
+        drop(state);
+    }
+
+    #[tokio::test]
+    async fn quiescence_fences_instance_and_generation_without_endpoint_inference() {
+        let mut state = state();
+        let daemon = &mut Arc::get_mut(&mut state).unwrap().daemon_status;
+        daemon.instance_id = "quiescence-instance".into();
+        daemon.artifact_id = Some(bcode_ipc::ArtifactId::parse("quiescence-artifact").unwrap());
+        daemon.state_location_id = Some("quiescence-state".into());
+        let identity = crate::server_operations::runtime_identity(&state).unwrap();
+        let observed = crate::server_operations::wait_quiescence(&state, &identity, None, 0)
+            .await
+            .unwrap();
+        assert_eq!(observed.blockers, [] as [bcode_ipc::RuntimeIdleBlocker; 0]);
+        let mut replacement = identity.clone();
+        replacement.instance_id = "replacement".into();
+        assert_eq!(
+            crate::server_operations::wait_quiescence(&state, &replacement, None, 0)
+                .await
+                .unwrap_err()
+                .code,
+            "runtime_instance_changed"
+        );
+        drop(state.shutdown_admission.admit().unwrap());
+        assert!(
+            crate::server_operations::prepare_quiescent_stop(&state, &observed)
+                .await
+                .is_err()
+        );
+        let current =
+            crate::server_operations::wait_quiescence(&state, &identity, Some(&observed), 0)
+                .await
+                .unwrap();
+        assert!(current.admission_generation > observed.admission_generation);
+        let reservation = crate::server_operations::prepare_quiescent_stop(&state, &current)
+            .await
+            .unwrap();
+        assert!(state.shutdown_admission.admit().is_err());
+        drop(reservation);
+        drop(state.shutdown_admission.admit().unwrap());
+        drop(state);
+    }
+
+    #[tokio::test]
+    async fn prepared_shutdown_excludes_direct_graph_publication_and_background_restoration() {
+        use bcode_daemon_lifecycle::application::{
+            RuntimeShutdownMode, RuntimeShutdownPreparationApplication as _,
+        };
+        let state = state();
+        let app = ServicesApplicationHandle::new(&state, ClientId::new());
+        let reservation = app
+            .prepare_runtime_shutdown(RuntimeShutdownMode::IfIdle)
+            .await
+            .unwrap();
+        let before = state.shutdown_admission.snapshot().unwrap();
+        let edit = bcode_workflow::WorkflowRunGraphEditBatch {
+            version: 1,
+            run_id: "shutdown-barrier-run".into(),
+            expected_revision: 1,
+            mutation_id: "shutdown-barrier-edit".into(),
+            edits: Vec::new(),
+            reconciliation: Vec::new(),
+        };
+        for error in [
+            state
+                .publish_workflow_run_graph_edit(ClientId::new(), edit.clone())
+                .await
+                .unwrap_err(),
+            state
+                .accept_workflow_run_graph_publication(ClientId::new(), edit.clone())
+                .await
+                .unwrap_err(),
+            state
+                .publish_workflow_run_graph_edit_from_invocation(
+                    SessionId::new(),
+                    "plugin",
+                    edit.clone(),
+                    &crate::TurnCancelState::default(),
+                )
+                .await
+                .unwrap_err(),
+            state
+                .accept_workflow_run_graph_publication_from_invocation(
+                    SessionId::new(),
+                    "plugin",
+                    edit,
+                    &crate::TurnCancelState::default(),
+                )
+                .await
+                .unwrap_err(),
+        ] {
+            assert!(
+                matches!(error, crate::ServerError::WorkflowApplicationOperationUnauthorized(message) if message == "daemon is not admitting workflow publication")
+            );
+        }
+        // Exercise the production background roots while the reservation is retained.
+        crate::restore_workflow_runtime_work(&state).await;
+        crate::settle_restored_quiescent_workflow_runtime_work(&state).await;
+        assert!(state.workflow_driver_sender.get().is_none());
+        assert_eq!(state.runtime_work.active_count().await, 0);
+        assert_eq!(state.shutdown_admission.snapshot().unwrap(), before);
+        drop(reservation);
+        drop(state.shutdown_admission.admit().unwrap());
+        drop(state);
+    }
+
+    #[tokio::test]
+    async fn prepared_shutdown_excludes_admission_until_failed_acknowledgment_releases_it() {
+        use bcode_daemon_lifecycle::application::{
+            RuntimeShutdownMode, RuntimeShutdownOperation as _,
+            RuntimeShutdownPreparationApplication as _,
+        };
+        let state = state();
+        let app = ServicesApplicationHandle::new(&state, ClientId::new());
+        let initial = state.shutdown_admission.snapshot().unwrap();
+        let prepared = app
+            .prepare_runtime_shutdown(RuntimeShutdownMode::IfIdle)
+            .await
+            .unwrap();
+        assert!(state.shutdown_admission.admit().is_err());
+        assert!(
+            app.prepare_runtime_shutdown(RuntimeShutdownMode::Force)
+                .await
+                .is_err()
+        );
+        // Failed transport acknowledgment drops rather than commits the operation.
+        drop(prepared);
+        let admitted = state.shutdown_admission.admit().unwrap();
+        assert!(
+            app.prepare_runtime_shutdown(RuntimeShutdownMode::IfIdle)
+                .await
+                .is_err()
+        );
+        assert!(state.shutdown_admission.snapshot().unwrap().generation > initial.generation);
+        drop(admitted);
+        let _receipt = app
+            .prepare_runtime_shutdown(RuntimeShutdownMode::IfIdle)
+            .await
+            .unwrap()
+            .commit();
+        assert!(state.shutdown_admission.admit().is_err());
+        drop(state);
+    }
+
+    #[tokio::test]
+    async fn cancelling_runtime_work_remains_an_idle_shutdown_blocker_until_finish() {
+        use bcode_daemon_lifecycle::application::{
+            RuntimeShutdownMode, RuntimeShutdownOperation as _,
+            RuntimeShutdownPreparationApplication as _,
+        };
+        let state = state();
+        let app = ServicesApplicationHandle::new(&state, ClientId::new());
+        let session_id = SessionId::new();
+        let work_id = bcode_session_models::WorkId::new("shutdown-cancellation-barrier");
+        let cancellation_count = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        state
+            .runtime_work
+            .start(
+                session_id,
+                crate::RuntimeWorkSpec::new(
+                    work_id.clone(),
+                    bcode_session_models::RuntimeWorkKind::Tool,
+                    "shutdown cancellation barrier".into(),
+                    crate::CancellationHandle::Test(cancellation_count),
+                ),
+            )
+            .await;
+        assert!(
+            app.prepare_runtime_shutdown(RuntimeShutdownMode::IfIdle)
+                .await
+                .is_err()
+        );
+        let cancelled = state
+            .runtime_work
+            .cancel_with_children(session_id, &work_id)
+            .await;
+        assert_eq!(cancelled, vec![work_id.clone()]);
+        assert_eq!(
+            state.runtime_work.active_for_session(session_id).await[0].status,
+            bcode_session_models::RuntimeWorkStatus::Cancelling
+        );
+        assert!(
+            app.prepare_runtime_shutdown(RuntimeShutdownMode::IfIdle)
+                .await
+                .is_err()
+        );
+        state.runtime_work.finish(session_id, &work_id).await;
+        let _receipt = app
+            .prepare_runtime_shutdown(RuntimeShutdownMode::IfIdle)
+            .await
+            .unwrap()
+            .commit();
+        drop(state);
+    }
+
+    #[tokio::test]
+    async fn rejected_shutdown_policy_reopens_admission() {
+        use bcode_daemon_lifecycle::application::{
+            RuntimeShutdownMode, RuntimeShutdownPreparationApplication as _,
+        };
+        let state = state();
+        let app = ServicesApplicationHandle::new(&state, ClientId::new());
+        state.register_client(ClientId::new()).await;
+        state.register_client(ClientId::new()).await;
+        assert!(
+            app.prepare_runtime_shutdown(RuntimeShutdownMode::IfIdle)
+                .await
+                .is_err()
+        );
+        drop(state.shutdown_admission.admit().unwrap());
+        assert!(
+            !state
+                .shutdown_requested
+                .load(std::sync::atomic::Ordering::SeqCst)
+        );
         drop(state);
     }
 

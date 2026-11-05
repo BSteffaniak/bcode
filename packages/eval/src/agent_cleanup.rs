@@ -1,5 +1,8 @@
 //! Bounded direct-agent cleanup through public, non-starting client operations.
 use bcode_client::{BcodeClient, DaemonAvailability};
+use bcode_daemon_lifecycle::application::{
+    RuntimeInstanceIdentity, RuntimeQuiescenceApplication, RuntimeStopReceipt,
+};
 use bcode_session_models::SessionId;
 use serde::Serialize;
 use std::time::Duration;
@@ -26,8 +29,9 @@ pub enum IdleEvidence {
 pub enum StopEvidence {
     #[default]
     NotAcknowledged,
-    Acknowledged,
+    #[cfg(test)]
     EndpointUnavailableAfterAcknowledgement,
+    InstanceFencedAcknowledgement,
 }
 
 #[derive(Debug, Default, PartialEq, Eq, Serialize)]
@@ -35,6 +39,8 @@ pub enum StopEvidence {
 pub enum LifetimeEvidence {
     #[default]
     Unverified,
+    /// The exact instance released its durable execution capability, not OS exit proof.
+    ExecutionAuthorityReleased,
 }
 
 #[derive(Debug, Default, Serialize)]
@@ -43,12 +49,36 @@ pub struct CleanupEvidence {
     pub idle: IdleEvidence,
     pub stop: StopEvidence,
     pub execution_lifetime: LifetimeEvidence,
+    /// Exact last verified daemon, retained even when settlement cannot be proved.
+    pub last_observed_daemon: Option<bcode_ipc::DaemonStatus>,
+    /// Last server-reported blocker; never inferred from an elapsed timeout.
+    pub idle_shutdown_blocker: Option<String>,
+    pub active_runtime_work_count: usize,
+    pub stop_receipt: Option<RuntimeStopReceipt>,
     pub failure: Option<&'static str>,
 }
 
 impl CleanupEvidence {
-    pub fn endpoint_stop_observed(&self) -> bool {
-        self.stop == StopEvidence::EndpointUnavailableAfterAcknowledgement
+    fn observe_status(&mut self, status: &bcode_ipc::ServerStatus) -> bool {
+        if self
+            .last_observed_daemon
+            .as_ref()
+            .is_some_and(|previous| previous != &status.daemon)
+        {
+            self.failure = Some("daemon_instance_changed");
+            return false;
+        }
+        self.last_observed_daemon = Some(status.daemon.clone());
+        self.idle_shutdown_blocker
+            .clone_from(&status.idle_shutdown_blocker);
+        self.active_runtime_work_count = status.active_runtime_work.len();
+        true
+    }
+
+    pub fn execution_release_verified(&self) -> bool {
+        self.stop == StopEvidence::InstanceFencedAcknowledgement
+            && self.execution_lifetime == LifetimeEvidence::ExecutionAuthorityReleased
+            && self.stop_receipt.is_some()
             && self.idle == IdleEvidence::DaemonIdle
             && self.failure.is_none()
     }
@@ -89,50 +119,80 @@ fn quiescence(
     }
 }
 
-/// Await idle-only shutdown acknowledgement and bounded endpoint disappearance.
-/// Never treats protocol, identity or arbitrary status failures as exit evidence.
+/// Await an instance-fenced stop receipt and independent execution-authority release.
+/// Endpoint disappearance and cancellation acknowledgements never prove settlement.
 pub async fn stop_idle(timeout: Duration) -> CleanupEvidence {
+    stop_idle_until(tokio::time::Instant::now() + timeout).await
+}
+
+async fn stop_idle_until(deadline: tokio::time::Instant) -> CleanupEvidence {
     let client = probe();
     let mut evidence = CleanupEvidence::default();
-    let deadline = tokio::time::Instant::now() + timeout;
-    let mut unavailable_observations = 0;
     let operation = async {
-        loop {
-            if let Ok(status) = client.verified_server_status().await {
-                evidence.idle = quiescence(None, true, &status);
-                if evidence.idle == IdleEvidence::DaemonIdle {
-                    break;
-                }
-            } else {
-                evidence.failure = Some("status_unverified");
-                return;
-            }
-            // Socket closure and completed runtime registrations are observed
-            // asynchronously; wait within the existing deadline, never bypass
-            // the server's idle-only admission.
-            tokio::time::sleep(Duration::from_millis(100)).await;
-        }
-        if client.server_stop_if_idle().await.is_err() {
-            evidence.failure = Some("idle_stop_rejected");
+        let Ok(status) = client.verified_server_status().await else {
+            evidence.failure = Some("status_unverified");
+            return;
+        };
+        if !evidence.observe_status(&status) {
             return;
         }
-        evidence.stop = StopEvidence::Acknowledged;
+        let Some(artifact) = status.daemon.artifact_id.as_ref() else {
+            evidence.failure = Some("instance_unverified");
+            return;
+        };
+        let Some(location) = status.daemon.state_location_id.as_ref() else {
+            evidence.failure = Some("instance_unverified");
+            return;
+        };
+        let instance = RuntimeInstanceIdentity {
+            instance_id: status.daemon.instance_id.clone(),
+            artifact_id: artifact.to_string(),
+            state_location_id: location.clone(),
+        };
+        let mut previous = None;
+        let Ok(lifecycle) = client.runtime_lifecycle(instance.clone()).await else {
+            evidence.failure = Some("quiescence_unverified");
+            return;
+        };
         loop {
-            match client.verified_server_status().await {
-                Err(error) if error.is_daemon_unavailable() => {
-                    unavailable_observations += 1;
-                    if unavailable_observations >= 2 {
-                        evidence.stop = StopEvidence::EndpointUnavailableAfterAcknowledgement;
+            let Ok(snapshot) = lifecycle
+                .runtime_quiescence(instance.clone(), previous, 1_000)
+                .await
+            else {
+                evidence.failure = Some("quiescence_unverified");
+                return;
+            };
+            if snapshot.blockers.is_empty() {
+                evidence.idle = IdleEvidence::DaemonIdle;
+                match lifecycle.stop_quiescent_runtime(snapshot.clone()).await {
+                    Ok(receipt) => {
+                        evidence.stop = StopEvidence::InstanceFencedAcknowledgement;
+                        evidence.stop_receipt = Some(receipt);
+                        break;
+                    }
+                    Err(error) if error.code == "daemon_busy" => {}
+                    Err(_) => {
+                        evidence.failure = Some("idle_stop_rejected");
                         return;
                     }
                 }
-                Err(_) => {
-                    evidence.failure = Some("stop_status_unverified");
-                    return;
-                }
-                Ok(_) => unavailable_observations = 0,
             }
-            tokio::time::sleep(Duration::from_millis(100)).await;
+            previous = Some(snapshot);
+        }
+        // Release is verified by the lifecycle-owned exact-instance witness, not
+        // transport probes. The wait is bounded by the original absolute budget.
+        let receipt = evidence
+            .stop_receipt
+            .as_ref()
+            .expect("accepted stop receipt");
+        match client
+            .wait_runtime_execution_authority(receipt, deadline)
+            .await
+        {
+            bcode_daemon_lifecycle::application::RuntimeExecutionAuthority::Released => {
+                evidence.execution_lifetime = LifetimeEvidence::ExecutionAuthorityReleased;
+            }
+            _ => evidence.failure = Some("execution_lifetime_unverified"),
         }
     };
     if tokio::time::timeout_at(deadline, operation).await.is_err() {
@@ -144,6 +204,7 @@ pub async fn stop_idle(timeout: Duration) -> CleanupEvidence {
 pub async fn cleanup(session: Option<SessionId>, isolated: bool) -> CleanupEvidence {
     let client = probe();
     let mut evidence = CleanupEvidence::default();
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
     let operation = async {
         if let Some(session) = session {
             if client.cancel_session_turn(session).await.is_ok() {
@@ -155,6 +216,9 @@ pub async fn cleanup(session: Option<SessionId>, isolated: bool) -> CleanupEvide
         }
         loop {
             if let Ok(status) = client.verified_server_status().await {
+                if !evidence.observe_status(&status) {
+                    return;
+                }
                 evidence.idle = quiescence(session, isolated, &status);
                 if evidence.idle != IdleEvidence::NotObserved {
                     break;
@@ -166,15 +230,14 @@ pub async fn cleanup(session: Option<SessionId>, isolated: bool) -> CleanupEvide
             tokio::time::sleep(Duration::from_millis(100)).await;
         }
     };
-    if tokio::time::timeout(Duration::from_secs(5), operation)
-        .await
-        .is_err()
-    {
+    if tokio::time::timeout_at(deadline, operation).await.is_err() {
         evidence.failure = Some("cleanup_deadline_exceeded");
     }
     if isolated && evidence.idle == IdleEvidence::DaemonIdle && evidence.failure.is_none() {
-        let stopped = stop_idle(Duration::from_secs(5)).await;
+        let stopped = stop_idle_until(deadline).await;
         evidence.stop = stopped.stop;
+        evidence.execution_lifetime = stopped.execution_lifetime;
+        evidence.stop_receipt = stopped.stop_receipt;
         evidence.failure = stopped.failure;
     }
     evidence
@@ -243,6 +306,48 @@ mod tests {
     }
 
     #[test]
+    fn blocker_release_is_observed_without_inventing_cancellation_settlement() {
+        let mut status: bcode_ipc::ServerStatus = serde_json::from_value(serde_json::json!({
+            "connected_client_count": 1, "sessions": [],
+            "daemon": {"instance_id": "original"},
+            "idle_shutdown_blocker": "runtime work is settling"
+        }))
+        .unwrap();
+        let mut evidence = CleanupEvidence::default();
+        assert!(evidence.observe_status(&status));
+        assert_eq!(quiescence(None, true, &status), IdleEvidence::NotObserved);
+        assert_eq!(
+            evidence.idle_shutdown_blocker.as_deref(),
+            Some("runtime work is settling")
+        );
+        evidence.cancellation = CancellationEvidence::Acknowledged;
+        assert_eq!(quiescence(None, true, &status), IdleEvidence::NotObserved);
+        status.idle_shutdown_blocker = None;
+        assert!(evidence.observe_status(&status));
+        assert_eq!(quiescence(None, true, &status), IdleEvidence::DaemonIdle);
+        assert!(evidence.idle_shutdown_blocker.is_none());
+        assert_eq!(evidence.execution_lifetime, LifetimeEvidence::Unverified);
+    }
+
+    #[test]
+    fn replacement_daemon_cannot_complete_original_cleanup() {
+        let mut status: bcode_ipc::ServerStatus = serde_json::from_value(serde_json::json!({
+            "connected_client_count": 1, "sessions": [],
+            "daemon": {"instance_id": "original"}
+        }))
+        .unwrap();
+        let mut evidence = CleanupEvidence::default();
+        assert!(evidence.observe_status(&status));
+        status.daemon.instance_id = "replacement".into();
+        assert!(!evidence.observe_status(&status));
+        assert_eq!(evidence.failure, Some("daemon_instance_changed"));
+        assert_eq!(
+            evidence.last_observed_daemon.unwrap().instance_id,
+            "original"
+        );
+    }
+
+    #[test]
     fn endpoint_disappearance_never_claims_execution_lifetime_termination() {
         let mut evidence = CleanupEvidence {
             stop: StopEvidence::EndpointUnavailableAfterAcknowledgement,
@@ -251,8 +356,22 @@ mod tests {
         };
         assert_eq!(evidence.execution_lifetime, LifetimeEvidence::Unverified);
         assert_eq!(evidence.cancellation, CancellationEvidence::NotAcknowledged);
-        assert!(evidence.endpoint_stop_observed());
+        assert!(!evidence.execution_release_verified());
+        evidence.stop = StopEvidence::InstanceFencedAcknowledgement;
+        assert!(!evidence.execution_release_verified());
+        evidence.execution_lifetime = LifetimeEvidence::ExecutionAuthorityReleased;
+        assert!(!evidence.execution_release_verified());
+        evidence.stop_receipt = Some(RuntimeStopReceipt {
+            version: 1,
+            instance: RuntimeInstanceIdentity {
+                instance_id: "original".into(),
+                artifact_id: "artifact".into(),
+                state_location_id: "state".into(),
+            },
+            admission_generation: 1,
+        });
+        assert!(evidence.execution_release_verified());
         evidence.failure = Some("status_unverified");
-        assert!(!evidence.endpoint_stop_observed());
+        assert!(!evidence.execution_release_verified());
     }
 }

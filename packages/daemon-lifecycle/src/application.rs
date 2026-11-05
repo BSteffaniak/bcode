@@ -2,6 +2,62 @@
 
 use std::future::Future;
 
+// IPC owns the wire-compatible data boundary; lifecycle owns the application capability.
+pub use bcode_ipc::{
+    RuntimeIdleBlocker, RuntimeIdleBlockerKind, RuntimeInstanceIdentity, RuntimeQuiescence,
+    RuntimeStopReceipt,
+};
+
+/// Exact instance's durable execution-authority evidence; never process-death proof.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RuntimeExecutionAuthority {
+    Live,
+    Released,
+    Missing,
+    Unverifiable,
+}
+
+/// Observe only the retained instance, independently of registry or endpoint replacement.
+#[must_use]
+pub fn runtime_execution_authority(
+    state_root: &std::path::Path,
+    instance: &RuntimeInstanceIdentity,
+) -> RuntimeExecutionAuthority {
+    match crate::execution_lifetime_status(
+        state_root,
+        &instance.instance_id,
+        &instance.artifact_id,
+        &instance.state_location_id,
+    ) {
+        crate::ExecutionLifetimeStatus::Live => RuntimeExecutionAuthority::Live,
+        crate::ExecutionLifetimeStatus::Released => RuntimeExecutionAuthority::Released,
+        crate::ExecutionLifetimeStatus::Missing => RuntimeExecutionAuthority::Missing,
+        crate::ExecutionLifetimeStatus::Unverifiable => RuntimeExecutionAuthority::Unverifiable,
+    }
+}
+
+/// Caller-bound, instance-fenced shutdown operations. Waiting does not reserve idleness.
+pub trait RuntimeQuiescenceApplication: Sync {
+    /// Wait for a bounded change in facts, or return current facts at the deadline.
+    /// # Errors
+    /// Rejects unsupported observations and changed/unverifiable instances.
+    fn runtime_quiescence(
+        &self,
+        expected_instance: RuntimeInstanceIdentity,
+        after: Option<RuntimeQuiescence>,
+        wait_ms: u32,
+    ) -> impl Future<Output = Result<RuntimeQuiescence, RuntimeApplicationFailure>> + Send;
+
+    /// Atomically reserve and stop only the observed, still-quiescent instance.
+    /// # Errors
+    /// Rejects changed instance/generation or any live blocker.
+    fn stop_quiescent_runtime(
+        &self,
+        expected: RuntimeQuiescence,
+    ) -> impl Future<Output = Result<RuntimeStopReceipt, RuntimeApplicationFailure>> + Send;
+}
+
 /// Secret-safe extensible lifecycle failure.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct RuntimeApplicationFailure {
@@ -45,7 +101,7 @@ pub struct RuntimeShutdownAccepted {
 
 /// A prepared, single-use shutdown operation supplied by the owning application.
 ///
-/// Preparation neither signals shutdown nor reserves idleness. Dropping an uncommitted
+/// Preparation reserves new admission but does not signal shutdown. Dropping an uncommitted
 /// operation has no effect. This is not a serializable token or durable resume contract.
 pub trait RuntimeShutdownOperation: Send {
     /// Read the admission receipt before publishing an adapter acknowledgement.

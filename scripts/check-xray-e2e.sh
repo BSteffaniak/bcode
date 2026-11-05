@@ -79,11 +79,20 @@ env = {
     "BCODE_STATE_DIR": str(work / "state"),
     "BCODE_XRAY_TEST_BINARY": artifacts[0]["path"],
     "BCODE_XRAY_TEST_PROVIDER_LIBRARY": artifacts[3]["path"],
+    "BCODE_XRAY_EVAL_BINARY": artifacts[0]["path"],
+    "BCODE_XRAY_EVAL_SHA256": artifacts[0]["sha256"],
+    "BCODE_XRAY_ACCEPTANCE_ARTIFACTS": str(work),
     # Child fixtures retain their private roots on either outcome and print only
     # locators to this log; do not inline stderr (it may contain captured content).
     "RUST_BACKTRACE": "1",
 }
 results = []
+def interrupted(signum, _frame):
+    # Convert termination into the same evidence-preserving unwind as Ctrl-C.
+    # Do not restart the current exact case, even if admission is unresolved.
+    signal.signal(signum, signal.SIG_IGN)
+    raise KeyboardInterrupt
+signal.signal(signal.SIGTERM, interrupted)
 suites = artifacts[1:3] + artifacts[4:]
 if selection != "all":
     suites = [artifact for artifact in suites if artifact["name"] == selection]
@@ -99,10 +108,14 @@ for artifact in suites:
     if artifact["name"] == "recursive_server":
         command.append("xray_execution_acceptance_tests::")
     list_command = command + ["--list"]
-    command += ["--include-ignored", "--test-threads=1", "--nocapture"]
+    # Inventory once, then supervise each exact case independently. An aggregate
+    # suite deadline must not erase later cases or cause admission to be replayed.
+    suite = {"name": artifact["name"], "cases": [], "exit_code": None}
+    results.append(suite)
+    def retain_results():
+        (work / "results.json").write_text(json.dumps({"scope": scope, "artifacts": artifacts, "results": results}, indent=2) + "\n")
+    retain_results()
     try:
-        # Recheck before each suite: mutable local artifact paths must not silently
-        # become a different client or provider after the initial selection.
         for selected in artifacts:
             digest = hashlib.sha256()
             with Path(selected["path"]).open("rb") as source:
@@ -116,48 +129,70 @@ for artifact in suites:
                 list_command, cwd=work / "work", env=env, stdin=subprocess.DEVNULL,
                 stdout=listing, stderr=subprocess.STDOUT, timeout=30, check=False,
             )
-        listed_tests = len(re.findall(rb"^.+: test\r?$", list_path.read_bytes(), re.MULTILINE))
-        if inventory.returncode != 0 or listed_tests == 0:
-            raise SystemExit(f'{artifact["name"]}: missing nonempty test inventory; suite not run')
-        with (work / f'{artifact["name"]}.log').open("wb") as log:
-            process = subprocess.Popen(command, cwd=work / "work", env=env,
-                                       stdin=subprocess.DEVNULL, stdout=log,
-                                       stderr=subprocess.STDOUT, start_new_session=True)
-            try:
-                # The serial server suite includes six whole-app cases and a
-                # deliberate observer crash with up to 75s for verified reclamation.
-                # The 360s aggregate expired during its last production case despite
-                # preceding cases passing; keep per-operation/test bounds unchanged.
-                suite_timeout = 600 if artifact["name"] == "server" else 360
-                code = process.wait(timeout=suite_timeout)
-                results.append({"name": artifact["name"], "exit_code": code})
-            except subprocess.TimeoutExpired:
-                results.append({"name": artifact["name"], "timeout": True})
-            finally:
-                # Only this new process group: reap foreground fixture children even
-                # if the test process aborts before its RAII teardown. Never use a
-                # daemon registry, ambient PID lookup, or stop-all command.
+        names = re.findall(rb"^(.+): test\r?$", list_path.read_bytes(), re.MULTILINE)
+        if inventory.returncode != 0 or not names:
+            suite["inventory_failed"] = True
+            suite["exit_code"] = 1
+            retain_results()
+            continue
+        suite["listed_tests"] = len(names)
+        for index, raw_name in enumerate(names):
+            name = raw_name.decode("utf-8")
+            case = {"name": name, "state": "starting", "attempts": 1,
+                    "admission_replayed": False, "exit_code": None}
+            suite["cases"].append(case)
+            retain_results()
+            log_path = work / f'{artifact["name"]}-{index:04}.log'
+            case["log"] = log_path.name
+            with log_path.open("wb") as log:
+                process = None
                 try:
-                    os.killpg(process.pid, signal.SIGKILL)
-                except ProcessLookupError:
-                    pass
-                process.wait()
+                    process = subprocess.Popen(
+                        [artifact["path"], name, "--exact", "--include-ignored", "--test-threads=1", "--nocapture"],
+                        cwd=work / "work", env=env, stdin=subprocess.DEVNULL,
+                        stdout=log, stderr=subprocess.STDOUT, start_new_session=True)
+                    case["state"] = "running"
+                    retain_results()
+                    case["exit_code"] = process.wait(timeout=360)
+                    case["state"] = "finished"
+                except subprocess.TimeoutExpired:
+                    case["state"] = "timed_out"
+                except (KeyboardInterrupt, InterruptedError):
+                    case["state"] = "interrupted"
+                    raise
+                except OSError:
+                    case["state"] = "launch_failed"
+                finally:
+                    # Persist the primary result BEFORE teardown. Restrict reaping
+                    # to this newly owned process group; never consult registries.
+                    retain_results()
+                    case["cleanup"] = "started"
+                    retain_results()
+                    if process is not None:
+                        try:
+                            os.killpg(process.pid, signal.SIGKILL)
+                        except ProcessLookupError:
+                            pass
+                        process.wait()
+                    case["cleanup"] = "completed"
+                    retain_results()
+            if case["exit_code"] == 0:
+                summaries = re.findall(rb"test result: ok\. ([0-9]+) passed; ([0-9]+) failed; ([0-9]+) ignored;", log_path.read_bytes())
+                if len(summaries) != 1 or summaries[0] != (b"1", b"0", b"0"):
+                    case["acceptance_error"] = "exact_case_not_passed_unignored"
+                    case["exit_code"] = 1
+            retain_results()
+        suite["exit_code"] = int(any(case["exit_code"] != 0 for case in suite["cases"]))
     except subprocess.TimeoutExpired:
-        results.append({"name": artifact["name"], "inventory_timeout": True})
+        suite["inventory_timeout"] = True
+        suite["exit_code"] = 1
     except OSError:
-        results.append({"name": artifact["name"], "launch_failed": True})
-    if results[-1].get("exit_code") == 0:
-        log_bytes = (work / f'{artifact["name"]}.log').read_bytes()
-        summaries = re.findall(rb"test result: ok\. ([0-9]+) passed; ([0-9]+) failed; ([0-9]+) ignored;", log_bytes)
-        results[-1]["listed_tests"] = listed_tests
-        passed_tests = sum(int(passed) for passed, _, _ in summaries)
-        results[-1]["passed_tests"] = passed_tests
-        if not summaries or any(int(failed) or int(ignored) for _, failed, ignored in summaries) or passed_tests != listed_tests:
-            results[-1]["acceptance_error"] = "not_all_listed_tests_passed_unignored"
-            results[-1]["exit_code"] = 1
-    (work / "results.json").write_text(json.dumps({"scope": scope, "artifacts": artifacts, "results": results}, indent=2) + "\n")
-    if results[-1].get("exit_code") != 0:
-        print(f'{artifact["name"]} failed or timed out; see private log', file=sys.stderr)
-        raise SystemExit(1)
+        suite["launch_failed"] = True
+        suite["exit_code"] = 1
+    finally:
+        retain_results()
+if any(result["exit_code"] != 0 for result in results):
+    print("Selected cases failed or timed out; inspect private per-case evidence. No case retried.", file=sys.stderr)
+    raise SystemExit(1)
 print(f"Selected offline fixture suites passed: {', '.join(scope['selected_suites'])}. No suite was retried. Inspect results.json for scope; subset runs are not full-matrix acceptance. Fake-provider mechanics do not certify live provider quality or complete v1 coverage.")
 PY

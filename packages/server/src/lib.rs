@@ -628,6 +628,7 @@ pub struct ServerState {
     startup_started_at: Instant,
     first_hello_recorded: std::sync::atomic::AtomicBool,
     metrics: MetricsRegistry,
+    shutdown_admission: server_operations::shutdown_admission::ShutdownAdmissionGate,
     shutdown_requested: std::sync::atomic::AtomicBool,
     shutdown: broadcast::Sender<()>,
 }
@@ -2244,6 +2245,16 @@ impl ServerState {
         Ok(facts)
     }
 
+    fn admit_workflow_publication(
+        &self,
+    ) -> Result<server_operations::shutdown_admission::OperationAdmission<'_>, ServerError> {
+        self.shutdown_admission.admit().map_err(|_| {
+            ServerError::WorkflowApplicationOperationUnauthorized(
+                "daemon is not admitting workflow publication".into(),
+            )
+        })
+    }
+
     async fn run_graph_publication_from_invocation(
         &self,
         session_id: SessionId,
@@ -2252,6 +2263,7 @@ impl ServerState {
         cancellation: &TurnCancelState,
         accept_pending: bool,
     ) -> Result<bcode_workflow::WorkflowRunGraphPublicationStatus, ServerError> {
+        let _admission = self.admit_workflow_publication()?;
         let denied = || {
             ServerError::WorkflowApplicationOperationUnauthorized(
                 "publication requires an authorized current workflow execution".to_string(),
@@ -2373,6 +2385,7 @@ impl ServerState {
         client_id: ClientId,
         request: bcode_workflow::WorkflowRunGraphEditBatch,
     ) -> Result<u64, ServerError> {
+        let _admission = self.admit_workflow_publication()?;
         self.start_workflow_driver().await;
         let sender = self.workflow_driver_sender.get().ok_or_else(|| {
             ServerError::WorkflowApplicationOperationUnauthorized(
@@ -2400,6 +2413,7 @@ impl ServerState {
         client_id: ClientId,
         request: bcode_workflow::WorkflowRunGraphEditBatch,
     ) -> Result<bcode_workflow::WorkflowRunGraphPublicationStatus, ServerError> {
+        let _admission = self.admit_workflow_publication()?;
         self.start_workflow_driver().await;
         workflow_operations::accept_run_graph_publication(self, client_id, request).await
     }
@@ -2809,17 +2823,24 @@ impl ServerState {
             startup_started_at: init.startup_started_at.unwrap_or_else(Instant::now),
             first_hello_recorded: std::sync::atomic::AtomicBool::new(false),
             metrics: init.metrics,
+            shutdown_admission:
+                server_operations::shutdown_admission::ShutdownAdmissionGate::default(),
             shutdown_requested: std::sync::atomic::AtomicBool::new(false),
             shutdown,
         }
     }
 
     async fn register_client(&self, client_id: ClientId) {
+        let Ok(_admission) = self.shutdown_admission.admit() else {
+            return;
+        };
         self.clients.lock().await.insert(client_id);
+        self.activity_changes.notify();
     }
 
     async fn unregister_client(self: &Arc<Self>, client_id: ClientId) {
         self.clients.lock().await.remove(&client_id);
+        self.activity_changes.notify();
         self.activity_watches.remove_client(client_id);
         for check in self
             .model_checks
@@ -3828,6 +3849,19 @@ impl ServerState {
                 });
                 if now.duration_since(*since) >= idle_after {
                     tracing::info!(target: "bcode_server::idle_shutdown", idle_after_secs = idle_after.as_secs(), "daemon idle timeout reached; shutting down");
+                    let Ok(reservation) = state.shutdown_admission.prepare(false) else {
+                        idle_since = None;
+                        continue;
+                    };
+                    if state
+                        .idle_shutdown_blocker_with_client_allowance(0)
+                        .await
+                        .is_some()
+                    {
+                        idle_since = None;
+                        continue;
+                    }
+                    reservation.commit();
                     state.request_shutdown();
                     break;
                 }
@@ -6610,6 +6644,8 @@ const fn request_kind(request: &Request) -> &'static str {
         Request::ListApplicationCommands { .. } => "list_application_commands",
         Request::InvokeApplicationCommand { .. } => "invoke_application_command",
         Request::CancelApplicationCommand { .. } => "cancel_application_command",
+        Request::RuntimeQuiescence { .. } => "runtime_quiescence",
+        Request::StopQuiescentRuntime { .. } => "stop_quiescent_runtime",
         Request::RuntimeStatus => "runtime_status",
         Request::ModelCatalogSnapshot => "model_catalog_snapshot",
         Request::RefreshModelCatalog => "refresh_model_catalog",
@@ -7107,6 +7143,35 @@ async fn handle_request(
     writer: &SharedWriter,
     attached_session: &mut Option<SessionId>,
 ) -> Result<(), ServerError> {
+    // Lifecycle control does not itself count as admitted product work. All other
+    // request dispatch retains admission through registration or settlement.
+    let _admission = if matches!(
+        &request,
+        Request::RuntimeQuiescence { .. }
+            | Request::StopQuiescentRuntime { .. }
+            | Request::ServerStop { .. }
+            | Request::ServerStatus { .. }
+            | Request::RuntimeStatus
+            | Request::Ping
+            | Request::Hello { .. }
+    ) {
+        None
+    } else {
+        match state.shutdown_admission.admit() {
+            Ok(admission) => Some(admission),
+            Err(_) => {
+                return send_response(
+                    writer,
+                    request_id,
+                    Response::Err(ErrorResponse::new(
+                        "daemon_stopping",
+                        "daemon is not admitting work",
+                    )),
+                )
+                .await;
+            }
+        }
+    };
     // Typed auth transport deliberately bypasses ordinary request metrics/context creation.
     // Correlations and callback payload sizes are not session telemetry.
     if matches!(&request, Request::ManagedSession { request } if request.operation.is_auth()) {
@@ -7342,6 +7407,52 @@ fn handle_request_inner<'a>(
                 working_directory.as_deref(),
             ))
             .await
+        }),
+        SessionLifecycleRequest::RuntimeQuiescence {
+            expected_instance,
+            after,
+            wait_ms,
+        } => Box::pin(async move {
+            let result = server_operations::wait_quiescence(
+                state,
+                &expected_instance,
+                after.as_ref(),
+                wait_ms,
+            )
+            .await;
+            let response = result.map_or_else(
+                |error| Response::Err(ErrorResponse::new(error.code, error.message)),
+                |snapshot| Response::Ok(ResponsePayload::RuntimeQuiescence { snapshot }),
+            );
+            send_response(writer, request_id, response).await
+        }),
+        SessionLifecycleRequest::StopQuiescentRuntime { expected } => Box::pin(async move {
+            let reservation =
+                match server_operations::prepare_quiescent_stop(state, &expected).await {
+                    Ok(reservation) => reservation,
+                    Err(error) => {
+                        return send_response(
+                            writer,
+                            request_id,
+                            Response::Err(ErrorResponse::new(error.code, error.message)),
+                        )
+                        .await;
+                    }
+                };
+            let receipt = bcode_ipc::RuntimeStopReceipt {
+                version: 1,
+                instance: expected.instance,
+                admission_generation: expected.admission_generation,
+            };
+            send_response(
+                writer,
+                request_id,
+                Response::Ok(ResponsePayload::RuntimeStopped { receipt }),
+            )
+            .await?;
+            reservation.commit();
+            state.request_shutdown();
+            Ok(())
         }),
         SessionLifecycleRequest::RuntimeStatus => Box::pin(async move {
             let result =
@@ -16500,6 +16611,9 @@ async fn enqueue_prompt_submission(
     require_active_turn: bool,
     admission: bcode_session_models::TurnAdmissionMetadata,
 ) -> Result<bcode_session_models::SubmissionReceipt, ServerError> {
+    let _admission = state.shutdown_admission.admit().map_err(|_| {
+        ServerError::WorkflowApplicationOperationUnauthorized("daemon is not admitting work".into())
+    })?;
     Box::pin(enqueue_prompt_submission_inner(
         state,
         session_id,
@@ -20451,6 +20565,9 @@ async fn broadcast_workflow_event(
 }
 
 async fn recover_workflow_continuation(state: &Arc<ServerState>, run_id: &str) {
+    let Ok(_admission) = state.shutdown_admission.admit() else {
+        return;
+    };
     Box::pin(recover_workflow_continuation_inner(state, run_id)).await;
 }
 
@@ -20536,6 +20653,9 @@ async fn retry_prepared_workflow_dispatches(
 }
 
 async fn drive_workflow_run(state: &Arc<ServerState>, run_id: &str) -> Result<(), ServerError> {
+    let Ok(_admission) = state.shutdown_admission.admit() else {
+        return Ok(());
+    };
     let gate = workflow_drive_gate(state, run_id);
     let Ok(guard) = gate.try_lock() else {
         state.metrics.add_counter_with_labels(
@@ -43426,6 +43546,9 @@ fn workflow_run_artifact_is_launchable(state: &Arc<ServerState>, run_id: &str) -
 
 #[allow(clippy::too_many_lines)]
 async fn restore_workflow_runtime_work(state: &Arc<ServerState>) {
+    let Ok(_admission) = state.shutdown_admission.admit() else {
+        return;
+    };
     // Restoration is not a workflow request: leave transient initialization to admission.
     // In particular, startup must not recover storage and also leave a second restoration
     // scheduled for the driver.
@@ -43679,6 +43802,9 @@ async fn restore_workflow_runs_with_receipt_limit_inner(
 /// Settle run-level runtime work left registered by a prior daemon for runs that are now
 /// quiescent (terminal or paused), so restarted daemons do not inherit phantom active work.
 async fn settle_restored_quiescent_workflow_runtime_work(state: &ServerState) {
+    let Ok(_admission) = state.shutdown_admission.admit() else {
+        return;
+    };
     let runs = {
         let lock_phase = bcode_metrics::startup::phase("workflow_settle.store_lock");
         let store = state

@@ -17,7 +17,9 @@ pub mod xray;
 pub use session_observation::ClientSessionObservation;
 
 use bcode_agent_profile::{AgentInfo, PolicyStatusResponse};
-use bcode_daemon_lifecycle::{DaemonStartError, EnsureDaemonOptions, ensure_daemon_running};
+use bcode_daemon_lifecycle::{
+    DaemonStartError, EnsureDaemonOptions, ensure_daemon_running_with_budget,
+};
 mod contextual;
 use bcode_ipc::{
     ClientRuntimeContext, CodecError, EnvelopeKind, ErrorResponse, Event, IpcEndpoint,
@@ -2937,6 +2939,7 @@ fn decode_scoped_session_list(response: ResponsePayload) -> Result<SessionList, 
 }
 
 mod activity_watch;
+pub mod lifecycle;
 mod request_lanes;
 
 /// Client configured for a local Bcode server endpoint.
@@ -2944,6 +2947,8 @@ mod request_lanes;
 pub struct BcodeClient {
     explicit_daemon_target: Option<bcode_daemon_lifecycle::DaemonTarget>,
     expected_state_location: Option<bcode_config::StateLocationId>,
+    lifecycle_state_location: Option<bcode_config::StateLocation>,
+    lifecycle_scope_id: Option<String>,
     endpoint: IpcEndpoint,
     runtime_context: Option<ClientRuntimeContext>,
     runtime_context_error: Option<String>,
@@ -3466,6 +3471,17 @@ impl BcodeClient {
     }
 
     fn default_endpoint_with_context(context: Result<ClientRuntimeContext, ClientError>) -> Self {
+        // Capture the same process-selected root used by default endpoint routing once.
+        // Failed validation retains no authority rather than substituting another location.
+        let lifecycle_state_location = bcode_config::resolve_state_location_set(
+            &bcode_config::StateConfig::default(),
+            &bcode_config::StateLocationSelection {
+                root: Some(bcode_config::default_state_dir()),
+                profile: None,
+            },
+        )
+        .ok()
+        .map(|locations| locations.primary().clone());
         let (runtime_context, runtime_context_error) = match context {
             Ok(context) => (Some(context), None),
             Err(error) => (None, Some(error.to_string())),
@@ -3473,6 +3489,10 @@ impl BcodeClient {
         Self {
             explicit_daemon_target: None,
             expected_state_location: None,
+            lifecycle_scope_id: lifecycle_state_location.as_ref().map(|location| {
+                bcode_config::runtime_scope_id(location.root(), &bcode_config::default_config_dir())
+            }),
+            lifecycle_state_location,
             endpoint: default_endpoint(),
             runtime_context,
             runtime_context_error,
@@ -3494,6 +3514,8 @@ impl BcodeClient {
         Self {
             explicit_daemon_target: None,
             expected_state_location: None,
+            lifecycle_state_location: None,
+            lifecycle_scope_id: None,
             endpoint,
             runtime_context: None,
             runtime_context_error: None,
@@ -3521,6 +3543,8 @@ impl BcodeClient {
     ) -> Self {
         let mut client = Self::new(endpoint);
         client.expected_state_location = Some(location.id().clone());
+        client.lifecycle_state_location = Some(location.clone());
+        client.lifecycle_scope_id = Some(location.id().as_str().to_owned());
         client
     }
 
@@ -3639,27 +3663,40 @@ impl BcodeClient {
         {
             return Ok(());
         }
+        let deadline = tokio::time::Instant::now() + self.startup_timeout;
         let coordination_started = std::time::Instant::now();
-        let _startup_guard = self.startup_gate.lock().await;
+        let _startup_guard = tokio::time::timeout_at(deadline, self.startup_gate.lock())
+            .await
+            .map_err(|_| ClientError::DaemonStartupTimeout {
+                timeout: self.startup_timeout,
+            })?;
         tracing::debug!(
             target: "bcode_client::startup",
             elapsed_us = coordination_started.elapsed().as_micros(),
             "client startup gate acquired"
         );
-        if self
-            .connect_with_deadline("bcode-daemon-availability")
-            .await
-            .is_ok()
+        if tokio::time::timeout_at(
+            deadline,
+            self.connect_with_deadline("bcode-daemon-availability"),
+        )
+        .await
+        .map_err(|_| ClientError::DaemonStartupTimeout {
+            timeout: self.startup_timeout,
+        })?
+        .is_ok()
         {
             return Ok(());
         }
-        tokio::time::timeout(
-            self.startup_timeout,
-            ensure_daemon_running(&EnsureDaemonOptions {
-                endpoint: self.endpoint.clone(),
-                quiet: true,
-                log_path: bcode_daemon_lifecycle::default_daemon_log_path(),
-            }),
+        tokio::time::timeout_at(
+            deadline,
+            ensure_daemon_running_with_budget(
+                &EnsureDaemonOptions {
+                    endpoint: self.endpoint.clone(),
+                    quiet: true,
+                    log_path: bcode_daemon_lifecycle::default_daemon_log_path(),
+                },
+                deadline.saturating_duration_since(tokio::time::Instant::now()),
+            ),
         )
         .await
         .map_err(|_| ClientError::DaemonStartupTimeout {
@@ -13195,6 +13232,42 @@ mod client_timeout_tests {
         assert_eq!(status.state, SessionSearchBackfillOperationState::Running);
         server.await.expect("server task");
         std::fs::remove_dir_all(socket_dir).expect("socket cleanup");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn startup_budget_includes_waiting_for_another_callers_gate() {
+        let client = BcodeClient::default_endpoint().with_startup_timeout(Duration::from_secs(3));
+        let gate = client.startup_gate.lock().await;
+        let acquisition = client.ensure_daemon_available();
+        tokio::pin!(acquisition);
+        std::future::poll_fn(|cx| {
+            assert!(std::future::Future::poll(acquisition.as_mut(), cx).is_pending());
+            std::task::Poll::Ready(())
+        })
+        .await;
+        tokio::time::advance(Duration::from_secs(3)).await;
+        assert!(matches!(
+            acquisition.await,
+            Err(super::ClientError::DaemonStartupTimeout { timeout })
+                if timeout == Duration::from_secs(3)
+        ));
+        drop(gate);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn cancelling_startup_gate_wait_does_not_take_ownership_from_its_holder() {
+        let client = BcodeClient::default_endpoint();
+        let gate = client.startup_gate.lock().await;
+        let mut acquisition = Box::pin(client.ensure_daemon_available());
+        std::future::poll_fn(|cx| {
+            assert!(std::future::Future::poll(acquisition.as_mut(), cx).is_pending());
+            std::task::Poll::Ready(())
+        })
+        .await;
+        drop(acquisition);
+        assert!(client.startup_gate.try_lock().is_err());
+        drop(gate);
+        assert!(client.startup_gate.try_lock().is_ok());
     }
 
     #[cfg(unix)]

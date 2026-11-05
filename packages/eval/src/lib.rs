@@ -1938,7 +1938,7 @@ async fn run_agent_follow_up(
         client.release_idle_connections();
         let stopped = agent_cleanup::stop_idle(timeout).await;
         write_json(rep_dir.join("follow-up-stop.json"), &stopped)?;
-        if !stopped.endpoint_stop_observed() {
+        if !stopped.execution_release_verified() {
             return Err(EvalError::Client(
                 "idle daemon stop before follow-up was not verified".into(),
             ));

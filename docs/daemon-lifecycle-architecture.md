@@ -202,7 +202,36 @@ Lifecycle must preserve a responsive foreign endpoint and report incompatibility
 
 ## Timeouts and errors
 
-Connection, startup, and application-request deadlines are separate client settings. Startup errors preserve child exit, lifecycle, coordination timeout, log path, and recent-log context. Frontends may present those errors differently but do not replace them with alternate process ownership.
+Connection, startup, and application-request deadlines are separate client settings.
+The startup allowance is one absolute caller budget: waiting for the client gate,
+connection preflight, cross-process coordination, notification, and verified Hello
+consume the same allowance. Phases do not renew it. Exhaustion ends the caller's
+wait, not the independently owned child's execution; a later caller reconciles the
+existing attempt under its inherited startup lock rather than replaying spawn.
+Paused-clock and phase-gated tests establish those ordering and cancellation rules;
+real-process watchdogs bound hangs rather than certify startup performance.
+Startup errors preserve child exit, lifecycle, coordination timeout, log path, and
+recent-log context. Frontends may present those errors differently but do not
+replace them with alternate process ownership.
+
+### Quiescence and idle-only stop
+
+Versioned quiescence observations carry exact instance/artifact/state identity,
+admission generation, and typed blocker counts. Observation does not reserve idle
+state. The host subscribes before sampling, and idle-only stop reserves admission
+before checking asynchronous blockers. New work is excluded until commit or rollback;
+a failed acknowledgment drops the reservation. A successful acknowledgment is sent
+before commit. Stale instance, generation, or unsupported observations fail closed.
+
+Clients retain one verified, non-reconnecting control connection through observation
+and stop. Eval restart requires a matching stop receipt and independently observed
+release of that instance's durable execution-authority witness. Endpoint disappearance,
+PID reuse, cancellation acknowledgment, and terminal turn delivery are not release
+proof. Execution-authority release is explicitly not operating-system process-death
+proof. Lifetime observation currently uses bounded nonblocking checks with a yielding
+polling policy, not a gapless cross-process notification stream. Missing/unverifiable
+witnesses remain unverified. Cleanup records primary failures and last observed
+blockers separately; one absolute budget covers cancellation, quiescence, and stop.
 
 ## Session persistence boundary
 

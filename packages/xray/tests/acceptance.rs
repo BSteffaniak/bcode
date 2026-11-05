@@ -107,6 +107,65 @@ async fn receive(observer: &mut bcode_xray::XrayObservation) -> XrayEnvelope {
 }
 
 #[tokio::test]
+async fn completed_producers_before_delivery_retain_exact_first_request_and_cutoff_per_session() {
+    // Engine contract only: actual recursive admission/lineage is exercised by
+    // server's public recursive acceptance, not inferred from these session names.
+    let hub = XrayHub::new(XrayConfig {
+        queue_capacity: 16,
+        ..XrayConfig::default()
+    });
+    let mut observations = Vec::new();
+    for session in ["root", "child", "grandchild"] {
+        let mut observer = hub
+            .observe(request(session, true))
+            .expect("pre-dispatch capture");
+        let ready = receive(&mut observer).await;
+        assert_eq!(ready.sequence, 1);
+        assert_eq!(ready.event.name, "ready");
+        let (first_tx, first_rx) = tokio::sync::oneshot::channel();
+        let (complete_tx, complete_rx) = tokio::sync::oneshot::channel();
+        let producer_hub = hub.clone();
+        let producer = tokio::spawn(async move {
+            producer_hub.emit(event(session, Some("first-turn"), "first_request"));
+            first_tx.send(()).expect("first request barrier receiver");
+            complete_rx.await.expect("completion release");
+            producer_hub.emit(event(session, Some("first-turn"), "completed"));
+        });
+        // Causal barrier: the request has been emitted, but the consumer never
+        // reads it and finalization has not begun. Completion is independently released.
+        first_rx.await.expect("first request emitted");
+        complete_tx.send(()).expect("release completion");
+        producer.await.expect("producer completed before delivery");
+        observations.push(observer);
+    }
+    for mut observer in observations {
+        let cutoff = observer
+            .finalize()
+            .expect("cutoff after producer completion");
+        assert_eq!(observer.finalize().expect("stable cutoff"), cutoff);
+        assert_eq!(cutoff.dropped_events, 0);
+        assert_eq!(cutoff.hub_contention_drops, 0);
+        assert_eq!(cutoff.final_sequence, 4);
+        let first = receive(&mut observer).await;
+        assert_eq!(first.sequence, 2);
+        assert_eq!(first.event.name, "first_request");
+        assert_eq!(first.observation_id, cutoff.observation_id);
+        let completed = receive(&mut observer).await;
+        assert_eq!(completed.sequence, 3);
+        assert_eq!(completed.event.name, "completed");
+        let finalized = receive(&mut observer).await;
+        assert_eq!(finalized.sequence, cutoff.final_sequence);
+        assert_eq!(finalized.event.name, "finalized");
+        assert_eq!(
+            serde_json::from_value::<bcode_xray_models::XrayFinalization>(finalized.event.data)
+                .unwrap(),
+            cutoff
+        );
+        assert!(observer.recv().await.is_none());
+    }
+}
+
+#[tokio::test]
 async fn idle_readiness_precedes_submission_and_observation_spans_turns() {
     let hub = XrayHub::default();
     let mut observer = hub.observe(request("idle", false)).expect("attach idle");

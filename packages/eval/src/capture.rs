@@ -60,14 +60,21 @@ pub fn capture(
     }
 }
 
+#[derive(Debug, PartialEq, Eq)]
+pub enum ObservationCoverage {
+    Admission,
+    NotEnabled,
+}
+
 pub fn capture_observations(
     run_id: &str,
     directory: &Path,
     invoke: impl Fn(&[String], &str, Duration) -> Result<Value, EvalError>,
-) -> Result<(), EvalError> {
+) -> Result<ObservationCoverage, EvalError> {
     let mut after: Option<u64> = None;
     let mut through: Option<u64> = None;
     let mut index = 0_u64;
+    let mut scope = None;
     loop {
         let mut args = vec![
             "workflow".into(),
@@ -100,10 +107,30 @@ pub fn capture_observations(
             directory.join(format!("workflow-observations-{index:04}.json")),
             &value,
         )?;
-        if page.origin != bcode_workflow::WorkflowObservationOrigin::Admission {
+        if page.origin == bcode_workflow::WorkflowObservationOrigin::NotEnabled {
+            if index != 0
+                || page.through_sequence != 0
+                || page.next_after_sequence.is_some()
+                || !page.observations.is_empty()
+            {
+                return Err(EvalError::Validation(
+                    "disabled observation coverage contains transition claims".into(),
+                ));
+            }
+            // This explicit contract is not a transport/capture failure and must
+            // not invalidate independent canonical or X-ray evidence. It never
+            // certifies scalar transition coverage or semantic history.
+            return Ok(ObservationCoverage::NotEnabled);
+        }
+        if scope.as_ref().is_some_and(|(sources, limitations)| {
+            sources != &page.sources || limitations != &page.limitations
+        }) {
             return Err(EvalError::Validation(
-                "observation coverage was not enabled at admission".into(),
+                "observation scope changed within pinned capture".into(),
             ));
+        }
+        if scope.is_none() {
+            scope = Some((page.sources.clone(), page.limitations.clone()));
         }
         let mut previous = after.unwrap_or(0);
         for row in &page.observations {
@@ -115,7 +142,7 @@ pub fn capture_observations(
             previous = row.sequence;
         }
         let Some(next) = page.next_after_sequence else {
-            return Ok(());
+            return Ok(ObservationCoverage::Admission);
         };
         if next <= after.unwrap_or(0) || next != previous {
             return Err(EvalError::Validation("observation cursor mismatch".into()));
@@ -211,10 +238,18 @@ pub fn capture_history_with_capabilities(
             }),
         );
         match capture_observations(run_id, directory, &invoke) {
-            Ok(()) => {
+            Ok(ObservationCoverage::Admission) => {
                 boundaries.insert("observations".into(), serde_json::json!({
                     "status":"complete", "scope":"declared finite scalar sources at pinned high-water",
                     "semantic_history_complete":false
+                }));
+            }
+            Ok(ObservationCoverage::NotEnabled) => {
+                boundaries.insert("observations".into(), serde_json::json!({
+                    "status":"not_enabled", "origin":"not_enabled",
+                    "scope":"finite scalar transitions", "complete":false,
+                    "semantic_history_complete":false,
+                    "reason":"scalar observation was not enabled at admission; independent captures retain their own coverage"
                 }));
             }
             Err(error) => {
@@ -341,6 +376,175 @@ mod tests {
     use std::cell::Cell;
 
     #[test]
+    fn observation_scope_cannot_change_between_pinned_pages() {
+        for changed_field in ["sources", "limitations"] {
+            let directory = tempfile::tempdir().unwrap();
+            let calls = Cell::new(0);
+            let result = super::capture_observations("run", directory.path(), |_, _, _| {
+                let index = calls.get();
+                calls.set(index + 1);
+                let mut page = serde_json::json!({
+                    "version":1,"run_id":"run","origin":"admission",
+                    "sources":[{"table":"runs","columns":["status"],"operations":["update"]}],
+                    "limitations":["finite scalar sources only"],"through_sequence":8,
+                    "next_after_sequence":if index == 0 {Some(3)} else {None},
+                    "observations":[{"sequence":if index == 0 {3} else {8},"source":"runs",
+                        "operation":"update","facts":{},"recorded_at_ms":null,"timestamp_source":null}]
+                });
+                if index == 1 {
+                    page[changed_field] = serde_json::json!([]);
+                }
+                Ok(page)
+            });
+            assert!(result.is_err(), "changed {changed_field} must fail closed");
+            assert_eq!(calls.get(), 2);
+            assert!(
+                directory
+                    .path()
+                    .join("workflow-observations-0001.json")
+                    .exists()
+            );
+        }
+    }
+
+    #[test]
+    fn observation_interleaving_keeps_pinned_prefix_not_later_commits() {
+        let directory = tempfile::tempdir().unwrap();
+        let committed = Cell::new(8);
+        let calls = Cell::new(0);
+        super::capture_observations("run", directory.path(), |args, _, _| {
+            let index = calls.get();
+            calls.set(index + 1);
+            if index == 0 {
+                assert!(!args.iter().any(|arg| arg == "--through-sequence"));
+                // Deterministic commit barrier: the next inspection sees a newer
+                // store, but must request the original finite high-water.
+                committed.set(13);
+            } else {
+                assert_eq!(committed.get(), 13);
+                assert!(
+                    args.windows(2)
+                        .any(|pair| pair == ["--through-sequence", "8"])
+                );
+                assert!(
+                    args.windows(2)
+                        .any(|pair| pair == ["--after-sequence", "3"])
+                );
+            }
+            Ok(serde_json::json!({
+                "version":1,"run_id":"run","origin":"admission","sources":[],
+                "limitations":["finite"],"through_sequence":8,
+                "next_after_sequence":if index == 0 {Some(3)} else {None},
+                "observations":[{"sequence":if index == 0 {3} else {8},"source":"runs",
+                    "operation":"update","facts":{},"recorded_at_ms":null,"timestamp_source":null}]
+            }))
+        })
+        .unwrap();
+        assert_eq!(calls.get(), 2);
+    }
+
+    #[test]
+    fn disabled_observation_contract_cannot_hide_recorded_transitions() {
+        for (through, next, rows) in [
+            (1, None, serde_json::json!([])),
+            (0, Some(1), serde_json::json!([])),
+            (
+                1,
+                None,
+                serde_json::json!([{"sequence":1,"source":"runs","operation":"update",
+                "facts":{},"recorded_at_ms":null,"timestamp_source":null}]),
+            ),
+        ] {
+            let directory = tempfile::tempdir().unwrap();
+            let result = super::capture_observations("run", directory.path(), |_, _, _| {
+                Ok(serde_json::json!({
+                    "version":1,"run_id":"run","origin":"not_enabled","sources":[],
+                    "limitations":[],"through_sequence":through,
+                    "next_after_sequence":next,"observations":rows
+                }))
+            });
+            assert!(result.is_err());
+            assert!(
+                directory
+                    .path()
+                    .join("workflow-observations-0000.json")
+                    .exists()
+            );
+        }
+    }
+
+    #[test]
+    fn admission_observation_origin_cannot_be_downgraded_mid_scan() {
+        let directory = tempfile::tempdir().unwrap();
+        let calls = Cell::new(0);
+        let result = super::capture_observations("run", directory.path(), |_, _, _| {
+            let index = calls.get();
+            calls.set(index + 1);
+            Ok(if index == 0 {
+                serde_json::json!({
+                    "version":1,"run_id":"run","origin":"admission","sources":[],
+                    "limitations":[],"through_sequence":1,"next_after_sequence":1,
+                    "observations":[{"sequence":1,"source":"runs","operation":"update",
+                        "facts":{},"recorded_at_ms":null,"timestamp_source":null}]
+                })
+            } else {
+                serde_json::json!({
+                    "version":1,"run_id":"run","origin":"not_enabled","sources":[],
+                    "limitations":[],"through_sequence":1,"next_after_sequence":null,"observations":[]
+                })
+            })
+        });
+        assert!(result.is_err());
+        assert_eq!(calls.get(), 2);
+    }
+
+    #[test]
+    fn historical_observation_gap_survives_independent_attempt_capture() {
+        let directory = tempfile::tempdir().unwrap();
+        let result = super::capture_history_with_capabilities(
+            "historical",
+            directory.path(),
+            true,
+            |args, _, _| match args[1].as_str() {
+                "observations" => Ok(serde_json::json!({
+                    "version":1,"run_id":"historical","origin":"not_enabled","sources":[],
+                    "limitations":["not enabled at admission"],"through_sequence":0,
+                    "next_after_sequence":null,"observations":[]
+                })),
+                "attempts" => Ok(serde_json::json!([])),
+                other => panic!("unexpected collection: {other}"),
+            },
+        );
+        assert!(
+            result.is_ok(),
+            "disabled scalar logging must not fail independent capture"
+        );
+        let manifest: serde_json::Value = serde_json::from_slice(
+            &std::fs::read(directory.path().join("capture-completeness.json")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(manifest["complete"], false);
+        assert_eq!(
+            manifest["boundaries"]["observations"]["status"],
+            "not_enabled"
+        );
+        assert_eq!(manifest["boundaries"]["observations"]["complete"], false);
+        assert_eq!(manifest["boundaries"]["attempts"]["status"], "complete");
+        assert!(
+            !directory
+                .path()
+                .join("workflow-observations-error.json")
+                .exists()
+        );
+        assert!(
+            directory
+                .path()
+                .join("workflow-attempts-0000.json")
+                .exists()
+        );
+    }
+
+    #[test]
     fn current_capture_preserves_unsupported_events_and_finite_observation_scope() {
         let directory = tempfile::tempdir().unwrap();
         super::capture_history_with_capabilities("run", directory.path(), true, |args, _, _| {
@@ -412,7 +616,7 @@ mod tests {
                 serde_json::json!({"version":1,"run_id":"run","origin":"not_enabled","sources":[],"limitations":[],"through_sequence":0,"next_after_sequence":null,"observations":[]}),
             )
         });
-        assert!(result.is_err());
+        assert_eq!(result.unwrap(), super::ObservationCoverage::NotEnabled);
         let retained: serde_json::Value = serde_json::from_slice(
             &std::fs::read(directory.join("workflow-observations-0000.json")).unwrap(),
         )

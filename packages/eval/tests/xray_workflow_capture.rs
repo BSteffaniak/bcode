@@ -103,24 +103,26 @@ impl Fixture {
         }
         fs::write(root.join("config.toml"), CONFIG).unwrap();
         let state_id = bcode_config::runtime_scope_id(&root.join("state"), &root.join("xdg/bcode"));
-        let mut fixture = Self {
+        Self {
             root_run_id: format!("xray-eval-{state_id}"),
             state_id,
             root,
             binary: subject.binary.clone(),
             namespace: String::new(),
-        };
-        let status = fixture.invoke("identity", &["artifact-id"], Duration::from_secs(15));
+        }
+    }
+
+    fn identify(&mut self, subject: &Subject) {
+        let status = self.invoke("identity", &["artifact-id"], Duration::from_secs(15));
         assert!(status.success());
-        let artifact = fs::read_to_string(fixture.root.join("identity.stdout")).unwrap();
+        let artifact = fs::read_to_string(self.root.join("identity.stdout")).unwrap();
         let artifact = bcode_ipc::ArtifactId::parse(artifact.trim()).unwrap();
-        fixture.namespace = bcode_ipc::daemon_namespace_for(&artifact);
-        fs::write(fixture.root.join("subject.json"), serde_json::to_vec_pretty(&json!({
+        self.namespace = bcode_ipc::daemon_namespace_for(&artifact);
+        fs::write(self.root.join("subject.json"), serde_json::to_vec_pretty(&json!({
             "binary": subject.binary, "sha256": subject.sha256, "artifact_id": artifact.to_string(),
-            "namespace": fixture.namespace, "state_location_id": fixture.state_id,
-            "root_run_id": fixture.root_run_id, "plugin_root": subject.plugins,
+            "namespace": self.namespace, "state_location_id": self.state_id,
+            "root_run_id": self.root_run_id, "plugin_root": subject.plugins,
         })).unwrap()).unwrap();
-        fixture
     }
 
     fn command(&self) -> Command {
@@ -237,7 +239,7 @@ impl Fixture {
         );
     }
 
-    fn eval(&self, deep: bool) -> ExitStatus {
+    fn eval(&self, deep: bool, observed: bool) -> ExitStatus {
         let mut args = vec![
             "eval",
             "run",
@@ -246,12 +248,14 @@ impl Fixture {
             "runs",
             "--run-id",
             "capture",
-            "--xray",
             "--json",
             "--fail-under-pass-rate",
             "1",
         ];
-        if deep {
+        if observed {
+            args.push("--xray");
+        }
+        if deep && observed {
             args.push("--xray-deep");
         }
         self.invoke("eval", &args, Duration::from_secs(210))
@@ -446,6 +450,27 @@ fn assert_recorded(fixture: &Fixture, task_passed: bool) {
     );
     assert_eq!(metrics["eval.xray.evidence_complete"], json!(1.0));
     assert_eq!(metrics["eval.xray.ready_before_submission"], json!(1.0));
+    // Scalar transition logging is independently opt-in. X-ray consent does not
+    // enable durable scalar history; retain its truthful gap without weakening
+    // the recursive model/session evidence requirements below.
+    assert_eq!(metrics["eval.xray.workflow_children_complete"], json!(1.0));
+    let history_capture = read_json(&rep.join("capture-completeness.json"));
+    assert_eq!(
+        history_capture["boundaries"]["observations"]["status"],
+        "not_enabled"
+    );
+    assert_eq!(
+        history_capture["boundaries"]["observations"]["complete"],
+        false
+    );
+    assert_eq!(
+        history_capture["boundaries"]["observations"]["semantic_history_complete"],
+        false
+    );
+    let observations = read_json(&rep.join("workflow-observations-0000.json"));
+    assert_eq!(observations["origin"], "not_enabled");
+    assert_eq!(observations["observations"], json!([]));
+    assert!(!rep.join("workflow-observations-error.json").exists());
     let prepared = read_json(&rep.join("admission-prepare.stdout"));
     assert_eq!(prepared["run_id"], fixture.root_run_id);
     assert!(prepared.get("runtime_work_id").is_none());
@@ -480,22 +505,107 @@ fn assert_recorded(fixture: &Fixture, task_passed: bool) {
     assert!(fixture.root.join("runs/capture/summary.json").is_file());
 }
 
-fn panic_message(result: &std::thread::Result<()>) -> Option<&str> {
-    result.as_ref().err().map(|panic| {
+fn record_phase(root: &Path, phase: &str, state: &str, failure: Option<&str>) {
+    fs::write(
+        root.join(format!("phase-{phase}.json")),
+        serde_json::to_vec_pretty(&json!({
+            "schema_version":1, "phase":phase, "state":state,
+            "failure":failure, "admission_replayed":false,
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+}
+
+fn case_phase<T>(root: &Path, phase: &str, work: impl FnOnce() -> T) -> std::thread::Result<T> {
+    record_phase(root, phase, "started", None);
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(work));
+    let failure = result.as_ref().err().map(|panic| {
         panic
             .downcast_ref::<String>()
             .map(String::as_str)
             .or_else(|| panic.downcast_ref::<&str>().copied())
             .unwrap_or("non-string test failure")
+    });
+    record_phase(
+        root,
+        phase,
+        if result.is_ok() { "passed" } else { "failed" },
+        failure,
+    );
+    result
+}
+
+#[test]
+fn phase_failure_retains_prior_evidence_and_cleanup_result() {
+    let directory = tempfile::tempdir().unwrap();
+    let root = directory.path();
+    let setup = case_phase(root, "setup", || ());
+    let execution = case_phase(root, "execution", || {
+        fs::write(
+            root.join("admission.json"),
+            b"{\"run_id\":\"acknowledged\"}",
+        )
+        .unwrap();
+        panic!("transport interrupted after acknowledgment");
+    });
+    let cleanup = case_phase(root, "cleanup", || panic!("release unverified"));
+    assert!(setup.is_ok());
+    assert!(execution.is_err());
+    assert!(cleanup.is_err());
+    assert_eq!(read_json(&root.join("phase-setup.json"))["state"], "passed");
+    assert_eq!(
+        read_json(&root.join("phase-execution.json"))["state"],
+        "failed"
+    );
+    assert_eq!(
+        read_json(&root.join("phase-cleanup.json"))["state"],
+        "failed"
+    );
+    assert_eq!(
+        read_json(&root.join("admission.json"))["run_id"],
+        "acknowledged"
+    );
+}
+
+#[test]
+fn started_phase_is_retained_before_work_can_interrupt() {
+    let directory = tempfile::tempdir().unwrap();
+    case_phase(directory.path(), "execution", || {
+        let phase = read_json(&directory.path().join("phase-execution.json"));
+        assert_eq!(phase["state"], "started");
+        assert_eq!(phase["admission_replayed"], false);
     })
+    .unwrap();
+    assert_eq!(
+        read_json(&directory.path().join("phase-execution.json"))["state"],
+        "passed"
+    );
 }
 
 /// Each test owns one attempt and one private scope. Never replay admission after
-/// a missing response. Catch assertions only to preserve cleanup AND primary evidence.
+/// a missing response. Each phase is durable before the next phase begins, so
+/// interruption or cleanup failure cannot erase the original execution evidence.
+fn configure_historical(fixture: &Fixture) {
+    let path = fixture.root.join("suite.toml");
+    let mut suite: toml::Value = toml::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
+    suite["variants"][0]["metadata"]
+        .as_table_mut()
+        .unwrap()
+        .remove("xray_root_run_id");
+    fs::write(path, toml::to_string_pretty(&suite).unwrap()).unwrap();
+}
+
 fn run_case(label: &str, grant: Grant, deep: bool, expected: Option<bool>) {
     let subject = Subject::selected();
-    let fixture = Fixture::new(&subject, label);
-    let primary = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+    let mut fixture = Fixture::new(&subject, label);
+    for phase in ["setup", "execution", "finalization", "cleanup"] {
+        record_phase(&fixture.root, phase, "not_started", None);
+    }
+    let historical = label == "historical-unobserved";
+    let root = fixture.root.clone();
+    let setup = case_phase(&root, "setup", || {
+        fixture.identify(&subject);
         fixture.configure(
             grant,
             deep,
@@ -505,6 +615,24 @@ fn run_case(label: &str, grant: Grant, deep: bool, expected: Option<bool>) {
                 "evaluated"
             },
         );
+        if historical {
+            configure_historical(&fixture);
+        }
+        if label == "positive-warm" {
+            assert!(
+                fixture
+                    .invoke(
+                        "warm-status",
+                        &["server", "status"],
+                        // The warm precondition is a verified application response,
+                        // not a second startup performance assertion. Use the same
+                        // process watchdog as execution; startup budget races have
+                        // deterministic coverage in the lifecycle owner.
+                        Duration::from_secs(210)
+                    )
+                    .success()
+            );
+        }
         let fingerprints = ["config.toml", "suite.toml"].map(|name| {
             let bytes = fs::read(fixture.root.join(name)).unwrap();
             (name, hex::encode(Sha256::digest(bytes)))
@@ -514,33 +642,61 @@ fn run_case(label: &str, grant: Grant, deep: bool, expected: Option<bool>) {
             serde_json::to_vec_pretty(&json!({"sha256": fingerprints})).unwrap(),
         )
         .unwrap();
-        let status = fixture.eval(true);
-        if let Some(passed) = expected {
-            assert_eq!(status.success(), passed, "task outcome differs from oracle");
-            assert_recorded(&fixture, passed);
-        } else {
-            assert_nonadmission(&fixture, status);
-        }
-    }));
-    let cleanup = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        fixture.stop("stop");
-    }));
-    fs::write(
-        fixture.root.join("case-outcome.json"),
-        serde_json::to_vec_pretty(&json!({
-            "schema_version": 1, "case": label, "attempts": 1,
-            "root_run_id": fixture.root_run_id,
-            "primary_passed": primary.is_ok(), "primary_failure": panic_message(&primary),
-            "cleanup_passed": cleanup.is_ok(), "cleanup_failure": panic_message(&cleanup),
+    });
+    let execution = if setup.is_ok() {
+        Some(case_phase(&fixture.root, "execution", || {
+            fixture.eval(true, !historical)
         }))
-        .unwrap(),
-    )
-    .unwrap();
+    } else {
+        None
+    };
+    let finalization = match execution.as_ref() {
+        Some(Ok(status)) => Some(case_phase(&fixture.root, "finalization", || {
+            if historical {
+                assert!(status.success());
+                let admitted = read_json(&fixture.repetition().join("admission.json"));
+                let run = admitted["run_id"].as_str().unwrap();
+                assert!(
+                    fixture
+                        .invoke(
+                            "historical-observations",
+                            &["workflow", "observations", "--run-id", run],
+                            Duration::from_secs(15)
+                        )
+                        .success()
+                );
+                let page = read_json(&fixture.root.join("historical-observations.stdout"));
+                assert_eq!(page["origin"], "not_enabled");
+                assert_eq!(page["observations"], json!([]));
+                assert!(
+                    !fixture
+                        .repetition()
+                        .join("xray-execution/evidence.json")
+                        .exists()
+                );
+            } else if let Some(passed) = expected {
+                assert_eq!(status.success(), passed, "task outcome differs from oracle");
+                assert_recorded(&fixture, passed);
+            } else {
+                assert_nonadmission(&fixture, *status);
+            }
+        })),
+        _ => None,
+    };
+    let cleanup = case_phase(&fixture.root, "cleanup", || fixture.stop("stop"));
+    let passed = setup.is_ok()
+        && execution.as_ref().is_some_and(Result::is_ok)
+        && finalization.as_ref().is_some_and(Result::is_ok)
+        && cleanup.is_ok();
+    fs::write(fixture.root.join("case-outcome.json"),
+        serde_json::to_vec_pretty(&json!({
+            "schema_version":2,"case":label,"attempts":1,"root_run_id":fixture.root_run_id,
+            "passed":passed,"admission_replayed":false,
+            "phases":["phase-setup.json","phase-execution.json","phase-finalization.json","phase-cleanup.json"],
+        })).unwrap()).unwrap();
     assert!(
-        primary.is_ok() && cleanup.is_ok(),
-        "case {label}: primary={:?}, cleanup={:?}; evidence: {}",
-        panic_message(&primary),
-        panic_message(&cleanup),
+        passed,
+        "case {label} failed; inspect phase records: {}",
         fixture.root.display()
     );
 }
@@ -601,11 +757,29 @@ macro_rules! acceptance_case {
     };
 }
 
-// Fixed campaign: three positive samples, one task-failure independence case,
-// and the full negative matrix once. Rust test failures do not skip later cases.
-acceptance_case!(positive_1, "positive-1", Grant::Exact, true, Some(true));
-acceptance_case!(positive_2, "positive-2", Grant::Exact, true, Some(true));
-acceptance_case!(positive_3, "positive-3", Grant::Exact, true, Some(true));
+// Distinct admission cases, one task-failure independence case, and the full
+// negative matrix once. Genuine recursive execution stays in recursive_server.
+acceptance_case!(
+    positive_cold,
+    "positive-cold",
+    Grant::Exact,
+    true,
+    Some(true)
+);
+acceptance_case!(
+    positive_warm,
+    "positive-warm",
+    Grant::Exact,
+    true,
+    Some(true)
+);
+acceptance_case!(
+    historical_unobserved,
+    "historical-unobserved",
+    Grant::Absent,
+    false,
+    Some(true)
+);
 acceptance_case!(
     task_failure,
     "task-failure",

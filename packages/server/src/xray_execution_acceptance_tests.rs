@@ -120,8 +120,14 @@ async fn isolated_acceptance(test_name: &str) -> bool {
         "private recursive child logs retained: {}",
         directory.display()
     );
-    let status = tokio::time::timeout(Duration::from_secs(180), child.wait())
-        .await
+    let result = tokio::time::timeout(Duration::from_secs(180), child.wait()).await;
+    std::fs::write(directory.join("child-outcome.json"), json!({
+        "completed":matches!(&result, Ok(Ok(status)) if status.success()),
+        "timed_out":result.is_err(), "wait_failed":matches!(&result, Ok(Err(_))),
+        "exit_code":result.as_ref().ok().and_then(|status| status.as_ref().ok()).and_then(std::process::ExitStatus::code),
+        "admission_replayed":false,"stdout":"stdout.log","stderr":"stderr.log",
+    }).to_string()).expect("retain isolated case failure receipt");
+    let status = result
         .expect("isolated acceptance deadline")
         .expect("child exit");
     assert!(
@@ -403,6 +409,12 @@ async fn immediate_observed_start_captures_first_provider_calls_in_child_and_gra
 }
 
 #[tokio::test]
+async fn public_recursive_completion_before_delivery_preserves_first_requests_and_exact_cutoffs() {
+    Box::pin(acceptance_with_delivery(true, true, false, Delivery::AfterCompletion,
+        "xray_execution_acceptance_tests::public_recursive_completion_before_delivery_preserves_first_requests_and_exact_cutoffs")).await;
+}
+
+#[tokio::test]
 async fn public_connection_observed_start_preserves_recursive_first_call_evidence() {
     Box::pin(acceptance(true, true, false, "xray_execution_acceptance_tests::public_connection_observed_start_preserves_recursive_first_call_evidence")).await;
 }
@@ -634,7 +646,64 @@ async fn connect_fixture(
         socket_directory,
     }
 }
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Delivery {
+    Live,
+    AfterCompletion,
+}
+
+struct PhaseReceipt {
+    path: std::path::PathBuf,
+    phase: &'static str,
+    passed: bool,
+}
+impl PhaseReceipt {
+    fn new(root: &std::path::Path) -> Self {
+        let receipt = Self {
+            path: root.join("recursive-case-outcome.json"),
+            phase: "admission",
+            passed: false,
+        };
+        receipt.retain();
+        receipt
+    }
+    fn advance(&mut self, phase: &'static str) {
+        self.phase = phase;
+        self.retain();
+    }
+    fn retain(&self) {
+        let _ = std::fs::write(
+            &self.path,
+            json!({"phase":self.phase,"passed":self.passed,
+            "interrupted_or_failed":std::thread::panicking(),"admission_replayed":false})
+            .to_string(),
+        );
+    }
+}
+impl Drop for PhaseReceipt {
+    fn drop(&mut self) {
+        self.retain();
+    }
+}
+
 async fn acceptance(immediate: bool, public: bool, shared_parent: bool, test_name: &str) {
+    Box::pin(acceptance_with_delivery(
+        immediate,
+        public,
+        shared_parent,
+        Delivery::Live,
+        test_name,
+    ))
+    .await;
+}
+
+async fn acceptance_with_delivery(
+    immediate: bool,
+    public: bool,
+    shared_parent: bool,
+    delivery: Delivery,
+    test_name: &str,
+) {
     let guard = crate::tests::WORKFLOW_RUNTIME_TEST_LOCK.lock().await;
     if isolated_acceptance(test_name).await {
         return;
@@ -642,26 +711,35 @@ async fn acceptance(immediate: bool, public: bool, shared_parent: bool, test_nam
     eprintln!("xray acceptance phase: setup begin");
     let mut fixture = Box::pin(AcceptanceFixture::setup(immediate, public, shared_parent)).await;
     eprintln!("xray acceptance phase: setup complete; register begin");
+    let mut receipt = PhaseReceipt::new(&fixture.root);
     let (start, lock, digest) = fixture.register().await;
     eprintln!("xray acceptance phase: register complete; admission begin");
     let ready = Box::pin(fixture.admit(start, &lock, &digest)).await;
     eprintln!("xray acceptance phase: admission complete; verify admission begin");
     fixture.verify_admission(&ready).await;
     eprintln!("xray acceptance phase: verify admission complete; drive begin");
-    let driven = Box::pin(fixture.drive(&ready)).await;
+    receipt.advance("execution_delivery_held");
+    let driven = Box::pin(fixture.drive(&ready, delivery)).await;
     eprintln!("xray acceptance phase: drive complete; foreign drive begin");
     fixture.drive_foreign().await;
     eprintln!("xray acceptance phase: foreign drive complete; finalize begin");
+    receipt.advance("finalization");
     let runs = driven.runs.clone();
-    let (events, cutoff, cursor) = fixture.finalize(&ready, driven).await;
+    let (events, cutoff, cursor) = fixture
+        .finalize(&ready, driven, delivery == Delivery::AfterCompletion)
+        .await;
     eprintln!("xray acceptance phase: finalize complete; verify evidence begin");
+    receipt.advance("verify_child_coverage");
     fixture
         .verify_evidence(&ready, &events, &cutoff, &runs)
         .await;
     eprintln!("xray acceptance phase: verify evidence complete; late/revoke begin");
     fixture.verify_late_and_revoke(ready, cursor).await;
     eprintln!("xray acceptance phase: late/revoke complete; finish begin");
+    receipt.advance("cleanup");
     fixture.finish().await;
+    receipt.passed = true;
+    receipt.advance("completed");
     eprintln!("xray acceptance phase: finish complete");
     drop(fixture);
     drop(guard);
@@ -993,7 +1071,10 @@ impl AcceptanceFixture {
             "foreign principal cannot cut off selected capture"
         );
     }
-    async fn drive(&mut self, ready: &dto::ExecutionWatchReady) -> Driven {
+    async fn drive(&mut self, ready: &dto::ExecutionWatchReady, delivery: Delivery) -> Driven {
+        // Subscribe before the first canonical read. Delivery/finalization are
+        // deliberately not driven by these notifications; only workflow state is.
+        let mut progress = crate::workflow_test_support::Progress::subscribe(&self.fixture.0);
         let mut cursor = 0;
         let mut events = Vec::new();
         let mut runs = BTreeSet::from([RUN.to_owned()]);
@@ -1014,14 +1095,16 @@ impl AcceptanceFixture {
                     }
                 }
             }
-            let page = diagnostic!(self,read_execution_watch, self.transport.caller, dto::ReadExecutionWatchRequest { schema_version: 1, watch_id: ready.watch_id.clone(), cursor, limit: ready.max_page_items }).expect("authorized live watch page");
-            assert_eq!(page.omitted_links, 0);
-            assert_eq!(page.omitted_events, 0);
-            assert_eq!(page.contention_gaps, 0);
-            cursor = page.next_cursor;
-            events.extend(page.events);
+            if delivery == Delivery::Live {
+                let page = diagnostic!(self,read_execution_watch, self.transport.caller, dto::ReadExecutionWatchRequest { schema_version: 1, watch_id: ready.watch_id.clone(), cursor, limit: ready.max_page_items }).expect("authorized live watch page");
+                assert_eq!(page.omitted_links, 0);
+                assert_eq!(page.omitted_events, 0);
+                assert_eq!(page.contention_gaps, 0);
+                cursor = page.next_cursor;
+                events.extend(page.events);
+            }
             if runs.len() == 3 && crate::workflow_representation::status(&self.fixture.0, RUN).await.expect("root status").expect("root exists").status == workflow::RunStatus::Completed { break; }
-            tokio::time::sleep(Duration::from_millis(10)).await;
+            progress.changed().await;
         }
     }).await;
         eprintln!("xray acceptance phase: drive loop ended; retain diagnostics begin");
@@ -1038,6 +1121,28 @@ impl AcceptanceFixture {
             if self.immediate { 0 } else { 3 },
             "immediate observed admission cannot be implemented by silently adding execution gates"
         );
+        if delivery == Delivery::AfterCompletion {
+            assert_eq!(cursor, 0, "no delivery may precede the completion barrier");
+            assert_eq!(events.len(), 0);
+            for run in &runs {
+                assert_eq!(
+                    crate::workflow_representation::status(&self.fixture.0, run)
+                        .await
+                        .expect("completion barrier status")
+                        .expect("canonical run")
+                        .status,
+                    workflow::RunStatus::Completed
+                );
+            }
+            std::fs::write(
+                self.root.join("completion-before-delivery.json"),
+                serde_json::to_vec_pretty(&json!({"runs":runs,"all_completed":true,
+                    "watch_cursor":cursor,"delivered_events":events.len(),
+                    "finalization_requested":false,"admission_replayed":false}))
+                .expect("barrier receipt"),
+            )
+            .expect("retain completion barrier");
+        }
         Driven {
             cursor,
             events,
@@ -1151,6 +1256,7 @@ impl AcceptanceFixture {
         &mut self,
         ready: &dto::ExecutionWatchReady,
         driven: Driven,
+        delayed_delivery: bool,
     ) -> (
         Vec<dto::ExecutionWatchEvent>,
         dto::ExecutionWatchFinalEvidence,
@@ -1159,7 +1265,7 @@ impl AcceptanceFixture {
         let Driven {
             mut cursor,
             mut events,
-            ..
+            runs: driven_runs,
         } = driven;
         let cutoff = diagnostic!(
             self,
@@ -1203,7 +1309,94 @@ impl AcceptanceFixture {
             }
             events.extend(page.events);
         }
+        retain_diagnostics(&self.fixture.0, &self.root, &driven_runs, &events).await;
+        std::fs::write(
+            self.root.join("watch-final-evidence.json"),
+            serde_json::to_vec_pretty(&cutoff).expect("cutoff receipt"),
+        )
+        .expect("retain exact cutoff receipt");
+        if delayed_delivery {
+            Self::verify_delayed_cutoffs(&events, &cutoff, &driven_runs);
+        }
         (events, cutoff, cursor)
+    }
+    fn verify_delayed_cutoffs(
+        events: &[dto::ExecutionWatchEvent],
+        cutoff: &dto::ExecutionWatchFinalEvidence,
+        driven_runs: &BTreeSet<String>,
+    ) {
+        let cutoff_runs: BTreeSet<_> = cutoff
+            .cutoffs
+            .iter()
+            .map(|cutoff| cutoff.run_id.as_str())
+            .collect();
+        assert_eq!(cutoff_runs.len(), 3, "root, child and grandchild cutoffs");
+        assert_eq!(
+            cutoff_runs,
+            driven_runs.iter().map(String::as_str).collect()
+        );
+        let delivered_scopes: BTreeSet<_> = events
+            .iter()
+            .map(|event| {
+                (
+                    event.run_id.as_str(),
+                    event.session_id.as_str(),
+                    event.envelope.observation_id.as_str(),
+                )
+            })
+            .collect();
+        let cutoff_scopes: BTreeSet<_> = cutoff
+            .cutoffs
+            .iter()
+            .map(|cutoff| {
+                (
+                    cutoff.run_id.as_str(),
+                    cutoff.session_id.as_str(),
+                    cutoff
+                        .finalization
+                        .as_ref()
+                        .expect("no missing engine cutoff")
+                        .observation_id
+                        .as_str(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            delivered_scopes, cutoff_scopes,
+            "no unfinalized or unobserved child scope"
+        );
+        for boundary in &cutoff.cutoffs {
+            let finalization = boundary.finalization.as_ref().expect("exact engine cutoff");
+            let matching: Vec<_> = events
+                .iter()
+                .filter(|event| {
+                    event.run_id == boundary.run_id
+                        && event.session_id == boundary.session_id
+                        && event.envelope.observation_id == finalization.observation_id
+                })
+                .collect();
+            assert!(
+                !matching.is_empty(),
+                "every cutoff must have delivered evidence"
+            );
+            let sequences: Vec<_> = matching
+                .iter()
+                .map(|event| event.envelope.sequence)
+                .collect();
+            assert_eq!(
+                sequences,
+                (1..=finalization.final_sequence).collect::<Vec<_>>(),
+                "delayed delivery must retain the exact contiguous engine prefix"
+            );
+            let terminal = matching.last().expect("cutoff envelope");
+            assert_eq!(terminal.envelope.event.name, "finalized");
+            let delivered: bcode_xray_models::XrayFinalization =
+                serde_json::from_value(terminal.envelope.event.data.clone())
+                    .expect("delivered cutoff");
+            assert_eq!(&delivered, finalization);
+            assert_eq!(finalization.dropped_events, 0);
+            assert_eq!(finalization.hub_contention_drops, 0);
+        }
     }
     async fn verify_evidence(
         &mut self,

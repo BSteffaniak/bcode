@@ -623,6 +623,14 @@ pub enum Request {
         #[serde(default)]
         working_directory: Option<PathBuf>,
     },
+    RuntimeQuiescence {
+        expected_instance: RuntimeInstanceIdentity,
+        after: Option<RuntimeQuiescence>,
+        wait_ms: u32,
+    },
+    StopQuiescentRuntime {
+        expected: RuntimeQuiescence,
+    },
     ServerStop {
         #[serde(default)]
         mode: ServerStopMode,
@@ -2027,6 +2035,55 @@ fn default_metrics_report_box() -> Box<bcode_metrics::MetricsReport> {
     Box::default()
 }
 
+/// Exact runtime identity, independent of an endpoint or process identifier.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RuntimeInstanceIdentity {
+    pub instance_id: String,
+    pub artifact_id: String,
+    pub state_location_id: String,
+}
+
+/// Secret-safe categories that prevent an idle stop.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RuntimeIdleBlockerKind {
+    Admission,
+    Observation,
+    Migration,
+    Clients,
+    RecoveredInteraction,
+    ModelTurn,
+    QueuedCommand,
+    RuntimeWork,
+    PluginTask,
+    Stopping,
+    Unavailable,
+}
+
+/// A bounded count of live registrations, not an inference about side effects.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RuntimeIdleBlocker {
+    pub kind: RuntimeIdleBlockerKind,
+    pub count: usize,
+}
+
+/// Version-one bounded quiescence observation. This does not reserve idleness.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RuntimeQuiescence {
+    pub version: u32,
+    pub instance: RuntimeInstanceIdentity,
+    pub admission_generation: u64,
+    pub blockers: Vec<RuntimeIdleBlocker>,
+}
+
+/// Exact instance's accepted idle stop, not process-death evidence.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RuntimeStopReceipt {
+    pub version: u32,
+    pub instance: RuntimeInstanceIdentity,
+    pub admission_generation: u64,
+}
+
 /// Server process identity and lifecycle metadata.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub struct DaemonStatus {
@@ -2462,6 +2519,12 @@ pub enum ResponsePayload {
     Pong,
     ServerStatus {
         status: ServerStatus,
+    },
+    RuntimeQuiescence {
+        snapshot: RuntimeQuiescence,
+    },
+    RuntimeStopped {
+        receipt: RuntimeStopReceipt,
     },
     ServerStopping,
     SessionCreated {

@@ -32,7 +32,7 @@ mod tests {
         assert!(!dispatched.get());
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn stalled_operation_drops_and_cannot_renew_the_shared_allowance() {
         struct Dropped<'a>(&'a Cell<bool>);
         impl Drop for Dropped<'_> {

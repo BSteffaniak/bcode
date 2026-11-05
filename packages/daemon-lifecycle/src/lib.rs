@@ -2052,9 +2052,18 @@ mod tests {
             session_event_schema_version: Some(
                 bcode_session_models::CURRENT_SESSION_EVENT_SCHEMA_VERSION,
             ),
+            state_location_id: Some(bcode_ipc::state_location_id()),
             ..bcode_ipc::DaemonStatus::default()
         };
         assert!(daemon_status_matches_current_executable(&matching));
+        for state_location_id in [Some("different-state".to_owned()), None] {
+            assert!(!daemon_status_matches_current_executable(
+                &bcode_ipc::DaemonStatus {
+                    state_location_id,
+                    ..matching.clone()
+                }
+            ));
+        }
         assert!(!daemon_status_matches_current_executable(
             &bcode_ipc::DaemonStatus {
                 executable_digest: Some("different-bytes".into()),
@@ -3079,7 +3088,26 @@ pub async fn prepare_daemon_image(endpoint: &IpcEndpoint) -> Result<(), DaemonSt
 /// Returns an error when stale-record cleanup fails, spawning the daemon fails,
 /// or the daemon does not pass bounded readiness checks.
 pub async fn ensure_daemon_running(options: &EnsureDaemonOptions) -> Result<(), DaemonStartError> {
+    ensure_daemon_running_with_budget(options, DEFAULT_STARTUP_BUDGET).await
+}
+
+/// Ensure a daemon is running within one caller-selected acquisition budget.
+///
+/// The budget covers coordination, notification, and verified readiness together.
+/// Expiration or cancellation abandons observation, not a detached child or its
+/// durable startup ownership. A later caller reconciles that same attempt.
+/// Synchronous executable preparation cannot be preempted, but is charged to the budget.
+///
+/// # Errors
+///
+/// Returns startup errors or a timeout when the acquisition budget is exhausted.
+pub async fn ensure_daemon_running_with_budget(
+    options: &EnsureDaemonOptions,
+    budget: Duration,
+) -> Result<(), DaemonStartError> {
     use tracing::Instrument as _;
+
+    let deadline = tokio::time::Instant::now() + budget;
 
     let startup_id = diagnostic_startup_id();
     let launcher_pid = std::process::id();
@@ -3093,102 +3121,106 @@ pub async fn ensure_daemon_running(options: &EnsureDaemonOptions) -> Result<(), 
         "launcher.acquire",
         &format!("{launcher_pid}-{startup_id}"),
     );
-    let result = ensure_daemon_running_with_start(options, |options, startup_lock| {
-        #[cfg(unix)]
-        let handoff = format!("{}-{startup_id}", std::process::id());
-        let inherited_startup_lock = startup_lock.file.try_clone();
-        #[cfg(unix)]
-        let descriptor_file = startup_lock.file.try_clone();
-        let endpoint = options.endpoint.clone();
-        let log_path = options.log_path.clone();
-        async move {
-            let log_file = open_startup_log(&log_path)?;
-            let stderr_log = log_file.try_clone()?;
-
-            let spawn_started_at = std::time::Instant::now();
-            let phase = bcode_metrics::startup::phase("launcher.artifact_prepare");
-            let cached_exe = ensure_current_executable_cached()?;
-            phase.finish();
-            let executable_digest = require_cached_executable_digest(&cached_exe)?;
-            // Always spawn from the immutable content-addressed image. Spawning from the
-            // bootstrap source path would pin the daemon to a mutable pathname (for example
-            // `target/<triple>/release/bcode`), so rebuilding that path would later make the
-            // running daemon's own identity unverifiable even though it keeps serving its
-            // original artifact correctly.
-            let exe = cached_exe;
-            tracing::debug!(
-                target: "bcode_daemon_lifecycle::startup",
-                elapsed_ms = spawn_started_at.elapsed().as_millis(),
-                "daemon image ready"
-            );
-            let (endpoint_env_name, endpoint_env_value) =
-                bcode_ipc::endpoint_env_pair(&endpoint)
-                    .map_err(|error| std::io::Error::other(error.to_string()))?;
+    let result =
+        ensure_daemon_running_with_start_until(options, deadline, |options, startup_lock| {
             #[cfg(unix)]
-            write_startup_owner(
-                &descriptor_file?,
-                &StartupOwnerDescriptor::current("handoff_pending", handoff.clone())?,
-            )?;
-            let mut command = daemon_command(&exe);
+            let handoff = format!("{}-{startup_id}", std::process::id());
+            let inherited_startup_lock = startup_lock.file.try_clone();
             #[cfg(unix)]
-            command.env("BCODE_STARTUP_HANDOFF_V1", handoff);
-            let spawn_phase = bcode_metrics::startup::phase("launcher.process_spawn");
-            let mut child = command
-                .args(["server", "run"])
-                .env(endpoint_env_name, endpoint_env_value)
-                .env(
-                    bcode_ipc::BCODE_IPC_ENDPOINT_NAMESPACE_ENV,
-                    bcode_ipc::daemon_namespace(),
-                )
-                // The daemon must serve the runtime scope this client resolved — both the
-                // state location and the config directory — not whatever it would infer
-                // from inherited environment. An explicit command-line `--state-root`
-                // selection is process-scoped and would otherwise be lost across the
-                // process boundary, silently starting a daemon on a different canonical
-                // session root or under different plugin/permission policy.
-                .env(
-                    bcode_config::BCODE_STATE_DIR_ENV,
-                    bcode_config::default_state_dir(),
-                )
-                .env(
-                    bcode_config::BCODE_SESSION_STORE_DIR_ENV,
-                    bcode_config::default_session_store_dir(),
-                )
-                .env(
-                    "XDG_CONFIG_HOME",
-                    config_home_for_daemon(&bcode_config::default_config_dir()),
-                )
-                .env(BCODE_EXECUTABLE_DIGEST_ENV, executable_digest)
-                .env("BCODE_DAEMON_LOG", &log_path)
-                .env("BCODE_DAEMON_READY_STDOUT", "v1")
-                .env(
-                    "BCODE_STARTUP_CORRELATION",
-                    format!("{launcher_pid}-{startup_id}"),
-                )
-                // The daemon remains detached on cancellation. On Unix its inherited
-                // startup lock fences later launchers even before endpoint publication.
-                .kill_on_drop(false)
-                // On Unix the inherited open file description retains startup ownership
-                // even if the launcher exits before the child binds its endpoint.
-                .stdin(startup_lock_stdio(inherited_startup_lock?))
-                .stdout(std::process::Stdio::piped())
-                .stderr(std::process::Stdio::from(stderr_log))
-                .spawn()?;
-            // Release Command's configured stdin duplicate; the child and scoped
-            // StartupLock are now the only intentional owners of this OFD.
-            drop(command);
-            spawn_phase.finish();
-            tracing::debug!(
-                target: "bcode_daemon_lifecycle::startup",
-                elapsed_ms = spawn_started_at.elapsed().as_millis(),
-                "daemon child spawned"
-            );
+            let descriptor_file = startup_lock.file.try_clone();
+            let endpoint = options.endpoint.clone();
+            let log_path = options.log_path.clone();
+            async move {
+                let log_file = open_startup_log(&log_path)?;
+                let stderr_log = log_file.try_clone()?;
 
-            measured_child_readiness(&endpoint, &mut child, &log_path).await
-        }
-    })
-    .instrument(span)
-    .await;
+                let spawn_started_at = std::time::Instant::now();
+                let phase = bcode_metrics::startup::phase("launcher.artifact_prepare");
+                let cached_exe = ensure_current_executable_cached()?;
+                phase.finish();
+                let executable_digest = require_cached_executable_digest(&cached_exe)?;
+                // Always spawn from the immutable content-addressed image. Spawning from the
+                // bootstrap source path would pin the daemon to a mutable pathname (for example
+                // `target/<triple>/release/bcode`), so rebuilding that path would later make the
+                // running daemon's own identity unverifiable even though it keeps serving its
+                // original artifact correctly.
+                let exe = cached_exe;
+                tracing::debug!(
+                    target: "bcode_daemon_lifecycle::startup",
+                    elapsed_ms = spawn_started_at.elapsed().as_millis(),
+                    "daemon image ready"
+                );
+                if tokio::time::Instant::now() >= deadline {
+                    return Err(startup_timeout(&log_path));
+                }
+                let (endpoint_env_name, endpoint_env_value) =
+                    bcode_ipc::endpoint_env_pair(&endpoint)
+                        .map_err(|error| std::io::Error::other(error.to_string()))?;
+                #[cfg(unix)]
+                write_startup_owner(
+                    &descriptor_file?,
+                    &StartupOwnerDescriptor::current("handoff_pending", handoff.clone())?,
+                )?;
+                let mut command = daemon_command(&exe);
+                #[cfg(unix)]
+                command.env("BCODE_STARTUP_HANDOFF_V1", handoff);
+                let spawn_phase = bcode_metrics::startup::phase("launcher.process_spawn");
+                let mut child = command
+                    .args(["server", "run"])
+                    .env(endpoint_env_name, endpoint_env_value)
+                    .env(
+                        bcode_ipc::BCODE_IPC_ENDPOINT_NAMESPACE_ENV,
+                        bcode_ipc::daemon_namespace(),
+                    )
+                    // The daemon must serve the runtime scope this client resolved — both the
+                    // state location and the config directory — not whatever it would infer
+                    // from inherited environment. An explicit command-line `--state-root`
+                    // selection is process-scoped and would otherwise be lost across the
+                    // process boundary, silently starting a daemon on a different canonical
+                    // session root or under different plugin/permission policy.
+                    .env(
+                        bcode_config::BCODE_STATE_DIR_ENV,
+                        bcode_config::default_state_dir(),
+                    )
+                    .env(
+                        bcode_config::BCODE_SESSION_STORE_DIR_ENV,
+                        bcode_config::default_session_store_dir(),
+                    )
+                    .env(
+                        "XDG_CONFIG_HOME",
+                        config_home_for_daemon(&bcode_config::default_config_dir()),
+                    )
+                    .env(BCODE_EXECUTABLE_DIGEST_ENV, executable_digest)
+                    .env("BCODE_DAEMON_LOG", &log_path)
+                    .env("BCODE_DAEMON_READY_STDOUT", "v1")
+                    .env(
+                        "BCODE_STARTUP_CORRELATION",
+                        format!("{launcher_pid}-{startup_id}"),
+                    )
+                    // The daemon remains detached on cancellation. On Unix its inherited
+                    // startup lock fences later launchers even before endpoint publication.
+                    .kill_on_drop(false)
+                    // On Unix the inherited open file description retains startup ownership
+                    // even if the launcher exits before the child binds its endpoint.
+                    .stdin(startup_lock_stdio(inherited_startup_lock?))
+                    .stdout(std::process::Stdio::piped())
+                    .stderr(std::process::Stdio::from(stderr_log))
+                    .spawn()?;
+                // Release Command's configured stdin duplicate; the child and scoped
+                // StartupLock are now the only intentional owners of this OFD.
+                drop(command);
+                spawn_phase.finish();
+                tracing::debug!(
+                    target: "bcode_daemon_lifecycle::startup",
+                    elapsed_ms = spawn_started_at.elapsed().as_millis(),
+                    "daemon child spawned"
+                );
+
+                measured_child_readiness(&endpoint, &mut child, &log_path, deadline).await
+            }
+        })
+        .instrument(span)
+        .await;
     acquisition_phase.finish_result(&result);
     result
 }
@@ -3269,23 +3301,59 @@ async fn daemon_child_has_a_new_session_and_process_group() {
 /// pass bounded readiness checks.
 pub async fn ensure_daemon_running_in_process(
     options: &EnsureDaemonOptions,
+    start: impl FnMut() -> Result<(), DaemonStartError>,
+) -> Result<(), DaemonStartError> {
+    ensure_daemon_running_in_process_with_budget(options, DEFAULT_STARTUP_BUDGET, start).await
+}
+
+/// Ensure an in-process daemon is running within one caller-selected budget.
+///
+/// # Errors
+///
+/// Returns callback, coordination, or readiness errors, including budget exhaustion.
+pub async fn ensure_daemon_running_in_process_with_budget(
+    options: &EnsureDaemonOptions,
+    budget: Duration,
     mut start: impl FnMut() -> Result<(), DaemonStartError>,
 ) -> Result<(), DaemonStartError> {
+    let deadline = tokio::time::Instant::now() + budget;
     let log_path = options.log_path.clone();
-    ensure_daemon_running_with_start(options, move |options, _startup_lock| {
+    ensure_daemon_running_with_start_until(options, deadline, move |options, _startup_lock| {
         let result = start();
         let endpoint = options.endpoint.clone();
         let log_path = log_path.clone();
         async move {
             result?;
-            wait_for_daemon_ready(&endpoint, &log_path).await
+            wait_for_daemon_ready_until(&endpoint, &log_path, deadline).await
         }
     })
     .await
 }
 
-async fn ensure_daemon_running_with_start<F, Fut>(
+async fn ensure_daemon_running_with_start_until<F, Fut>(
     options: &EnsureDaemonOptions,
+    deadline: tokio::time::Instant,
+    start: F,
+) -> Result<(), DaemonStartError>
+where
+    F: FnMut(&EnsureDaemonOptions, &StartupLock) -> Fut,
+    Fut: std::future::Future<Output = Result<(), DaemonStartError>>,
+{
+    if tokio::time::Instant::now() >= deadline {
+        return Err(startup_timeout(&options.log_path));
+    }
+    let result = tokio::time::timeout_at(deadline, acquire_daemon_until(options, deadline, start))
+        .await
+        .unwrap_or_else(|_| Err(startup_timeout(&options.log_path)));
+    if result.is_ok() && tokio::time::Instant::now() >= deadline {
+        return Err(startup_timeout(&options.log_path));
+    }
+    result
+}
+
+async fn acquire_daemon_until<F, Fut>(
+    options: &EnsureDaemonOptions,
+    deadline: tokio::time::Instant,
     mut start: F,
 ) -> Result<(), DaemonStartError>
 where
@@ -3298,7 +3366,11 @@ where
     }
 
     let phase = bcode_metrics::startup::phase("launcher.startup_lock");
-    let acquired = StartupLock::acquire(&options.endpoint).await;
+    let acquired = StartupLock::acquire_with_timeout(
+        &options.endpoint,
+        deadline.saturating_duration_since(tokio::time::Instant::now()),
+    )
+    .await;
     phase.finish_result(&acquired);
     let Some(lock) = acquired? else {
         print_daemon_status(options, "server already running");
@@ -3306,14 +3378,15 @@ where
     };
     #[cfg(unix)]
     if endpoint_has_listener(&options.endpoint).await {
-        if wait_for_existing_daemon(&options.endpoint).await {
+        if wait_for_daemon_ready_until(&options.endpoint, &options.log_path, deadline)
+            .await
+            .is_ok()
+        {
             drop(lock);
             print_daemon_status(options, "server already running");
             return Ok(());
         }
-        return Err(DaemonStartError::EndpointOccupied {
-            endpoint: format!("{:?}", options.endpoint),
-        });
+        return Err(startup_timeout(&options.log_path));
     }
     let image_use_guard = DaemonImageUseGuard::acquire(&bcode_config::default_state_dir())?;
     #[cfg(unix)]
@@ -3325,6 +3398,9 @@ where
         return Ok(());
     }
 
+    if tokio::time::Instant::now() >= deadline {
+        return Err(startup_timeout(&options.log_path));
+    }
     start(options, &lock).await?;
     drop(image_use_guard);
     let _cleanup_task = tokio::spawn(async {
@@ -3597,6 +3673,13 @@ impl StartupLock {
     const POLL_INTERVAL: Duration = Duration::from_millis(25);
 
     async fn acquire(endpoint: &IpcEndpoint) -> Result<Option<Self>, DaemonStartError> {
+        Self::acquire_with_timeout(endpoint, Self::ACQUIRE_TIMEOUT).await
+    }
+
+    async fn acquire_with_timeout(
+        endpoint: &IpcEndpoint,
+        timeout: Duration,
+    ) -> Result<Option<Self>, DaemonStartError> {
         let path = startup_lock_path(
             &bcode_config::default_state_dir(),
             &daemon_namespace(),
@@ -3607,7 +3690,7 @@ impl StartupLock {
         let scope = format!("{artifact}.{state}");
         let acquired = Self::acquire_observed(
             path,
-            Self::ACQUIRE_TIMEOUT,
+            timeout,
             &scope,
             || ping_ready(endpoint),
             |observation, elapsed| {
@@ -3658,7 +3741,7 @@ impl StartupLock {
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent)?;
         }
-        let started = std::time::Instant::now();
+        let started = tokio::time::Instant::now();
         let wait_phase = bcode_metrics::startup::phase_for("launcher.lock_wait", scope);
         let mut waiting = false;
         loop {
@@ -3697,6 +3780,7 @@ impl StartupLock {
                     if tokio::time::timeout(remaining, ready())
                         .await
                         .unwrap_or(false)
+                        && started.elapsed() < timeout
                     {
                         observe(StartupLockObservation::ConcurrentReady, started.elapsed());
                         wait_phase.finish();
@@ -3778,7 +3862,8 @@ impl Drop for StartupLock {
     }
 }
 
-const READINESS_TIMEOUT: Duration = Duration::from_secs(20);
+/// Default total acquisition budget used by convenience startup entry points.
+pub const DEFAULT_STARTUP_BUDGET: Duration = Duration::from_secs(20);
 const READINESS_RETRY_DELAY: Duration = Duration::from_millis(25);
 
 /// Notify the launching client that the daemon is ready to accept connections.
@@ -3804,46 +3889,81 @@ async fn measured_child_readiness(
     endpoint: &IpcEndpoint,
     child: &mut tokio::process::Child,
     log_path: &Path,
+    deadline: tokio::time::Instant,
 ) -> Result<(), DaemonStartError> {
     let phase = bcode_metrics::startup::phase("launcher.spawn_to_notification");
-    let result = wait_for_child_notification(endpoint, child, log_path).await;
+    let result = wait_for_child_notification_until(endpoint, child, log_path, deadline).await;
     phase.finish_result(&result);
     result
 }
 
+#[cfg(test)]
 async fn wait_for_child_notification(
     endpoint: &IpcEndpoint,
     child: &mut tokio::process::Child,
     log_path: &Path,
 ) -> Result<(), DaemonStartError> {
-    wait_for_child_notification_with_timeout(endpoint, child, log_path, READINESS_TIMEOUT).await
+    wait_for_child_notification_with_timeout(endpoint, child, log_path, DEFAULT_STARTUP_BUDGET)
+        .await
 }
 
+#[cfg(test)]
 async fn wait_for_child_notification_with_timeout(
     endpoint: &IpcEndpoint,
     child: &mut tokio::process::Child,
     log_path: &Path,
     timeout: Duration,
 ) -> Result<(), DaemonStartError> {
-    use tokio::io::AsyncReadExt as _;
+    wait_for_child_notification_until(
+        endpoint,
+        child,
+        log_path,
+        tokio::time::Instant::now() + timeout,
+    )
+    .await
+}
 
-    let started = std::time::Instant::now();
-    let mut stdout = child
+async fn wait_for_child_notification_until(
+    endpoint: &IpcEndpoint,
+    child: &mut tokio::process::Child,
+    log_path: &Path,
+    deadline: tokio::time::Instant,
+) -> Result<(), DaemonStartError> {
+    let stdout = child
         .stdout
         .take()
         .ok_or_else(|| std::io::Error::other("daemon startup notification channel missing"))?;
+    wait_for_startup_signal(stdout, child.wait(), log_path, deadline, || {
+        ping_ready(endpoint)
+    })
+    .await
+}
+
+// The signal is only a wakeup. Retain child-exit observation through the verified
+// handshake, and never reset the caller's deadline at a phase boundary.
+async fn wait_for_startup_signal<R, E, S, F, Fut>(
+    mut stdout: R,
+    exit: E,
+    log_path: &Path,
+    deadline: tokio::time::Instant,
+    ready: F,
+) -> Result<(), DaemonStartError>
+where
+    R: tokio::io::AsyncRead + Unpin,
+    E: std::future::Future<Output = std::io::Result<S>>,
+    S: std::fmt::Display,
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = bool>,
+{
+    use tokio::io::AsyncReadExt as _;
+
+    let started = tokio::time::Instant::now();
     let mut token = [0_u8; 15];
-    let notification = tokio::time::timeout(timeout, stdout.read_exact(&mut token));
-    tokio::pin!(notification);
+    tokio::pin!(exit);
     tokio::select! {
-        status = child.wait() => {
-            return Err(DaemonStartError::Exited {
-                status: status?.to_string(),
-                log_path: display_from_current_dir(log_path).to_string(),
-                recent_log: recent_log_excerpt(log_path),
-            });
-        }
-        result = &mut notification => {
+        biased;
+        status = &mut exit => return Err(child_exit_error(status?, log_path)),
+        result = tokio::time::timeout_at(deadline, stdout.read_exact(&mut token)) => {
             match result {
                 Ok(Ok(_)) if &token == b"BCODE_READY_V1\n" => {}
                 Ok(_) => return Err(std::io::Error::other("invalid or closed daemon startup notification channel").into()),
@@ -3859,37 +3979,425 @@ async fn wait_for_child_notification_with_timeout(
         elapsed_us = started.elapsed().as_micros(),
         "daemon readiness notification received"
     );
-    // A notification is only a wakeup, not verified readiness.
-    let remaining = timeout.saturating_sub(started.elapsed());
     let phase = bcode_metrics::startup::phase("launcher.verified_handshake");
-    let result = tokio::time::timeout(remaining, wait_for_daemon_ready(endpoint, log_path))
-        .await
-        .unwrap_or_else(|_| {
-            Err(DaemonStartError::HealthCheckFailed {
-                log_path: display_from_current_dir(log_path).to_string(),
-                recent_log: recent_log_excerpt(log_path),
-            })
-        });
+    let result = tokio::select! {
+        biased;
+        status = &mut exit => Err(child_exit_error(status?, log_path)),
+        result = wait_for_verified_ready(log_path, deadline, ready) => result.map_err(|error| {
+            if matches!(error, DaemonStartError::StartTimeout { .. }) {
+                DaemonStartError::HealthCheckFailed {
+                    log_path: display_from_current_dir(log_path).to_string(),
+                    recent_log: recent_log_excerpt(log_path),
+                }
+            } else {
+                error
+            }
+        }),
+    };
     phase.finish_result(&result);
     result
 }
 
-async fn wait_for_daemon_ready(
+fn child_exit_error(status: impl std::fmt::Display, log_path: &Path) -> DaemonStartError {
+    DaemonStartError::Exited {
+        status: status.to_string(),
+        log_path: display_from_current_dir(log_path).to_string(),
+        recent_log: recent_log_excerpt(log_path),
+    }
+}
+
+fn startup_timeout(log_path: &Path) -> DaemonStartError {
+    DaemonStartError::StartTimeout {
+        log_path: display_from_current_dir(log_path).to_string(),
+        recent_log: recent_log_excerpt(log_path),
+    }
+}
+
+async fn wait_for_daemon_ready_until(
     endpoint: &IpcEndpoint,
     log_path: &Path,
+    deadline: tokio::time::Instant,
 ) -> Result<(), DaemonStartError> {
-    let deadline = tokio::time::Instant::now() + READINESS_TIMEOUT;
+    wait_for_verified_ready(log_path, deadline, || ping_ready(endpoint)).await
+}
+
+async fn wait_for_verified_ready<F, Fut>(
+    log_path: &Path,
+    deadline: tokio::time::Instant,
+    mut ready: F,
+) -> Result<(), DaemonStartError>
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = bool>,
+{
+    // Check time before every probe as well as bounding probes themselves: a
+    // late success must not turn an exhausted acquisition into apparent success.
     loop {
-        if ping_ready(endpoint).await {
-            return Ok(());
-        }
         if tokio::time::Instant::now() >= deadline {
-            return Err(DaemonStartError::StartTimeout {
-                log_path: display_from_current_dir(log_path).to_string(),
-                recent_log: recent_log_excerpt(log_path),
-            });
+            return Err(startup_timeout(log_path));
         }
-        tokio::time::sleep(READINESS_RETRY_DELAY).await;
+        match tokio::time::timeout_at(deadline, ready()).await {
+            Ok(true) if tokio::time::Instant::now() < deadline => return Ok(()),
+            Err(_) => return Err(startup_timeout(log_path)),
+            Ok(_) => {}
+        }
+        tokio::time::sleep_until(
+            (tokio::time::Instant::now() + READINESS_RETRY_DELAY).min(deadline),
+        )
+        .await;
+    }
+}
+
+#[cfg(test)]
+mod startup_budget_tests {
+    use super::*;
+    use std::future::{Future, pending, ready};
+    use std::pin::Pin;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    use std::task::{Context, Waker};
+    use tokio::io::AsyncWriteExt as _;
+
+    fn assert_pending<F: Future>(future: Pin<&mut F>) {
+        assert!(
+            future
+                .poll(&mut Context::from_waker(Waker::noop()))
+                .is_pending()
+        );
+    }
+
+    fn deadline() -> tokio::time::Instant {
+        tokio::time::Instant::now() + Duration::from_secs(10)
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn exhausted_caller_budget_does_not_start_an_attempt() {
+        let directory = tempfile::tempdir().unwrap();
+        let options = EnsureDaemonOptions {
+            endpoint: bcode_ipc::default_endpoint(),
+            quiet: true,
+            log_path: directory.path().join("daemon.log"),
+        };
+        let result = ensure_daemon_running_in_process_with_budget(&options, Duration::ZERO, || {
+            panic!("exhausted caller cannot start an attempt")
+        })
+        .await;
+        assert!(matches!(result, Err(DaemonStartError::StartTimeout { .. })));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn notification_and_handshake_share_one_deadline() {
+        let (reader, mut writer) = tokio::io::duplex(32);
+        let directory = tempfile::tempdir().unwrap();
+        let log = directory.path().join("daemon.log");
+        let probes = AtomicUsize::new(0);
+        let end = deadline();
+        let wait = wait_for_startup_signal(
+            reader,
+            pending::<std::io::Result<&str>>(),
+            &log,
+            end,
+            || {
+                probes.fetch_add(1, Ordering::SeqCst);
+                ready(false)
+            },
+        );
+        tokio::pin!(wait);
+        assert_pending(wait.as_mut());
+        tokio::time::advance(Duration::from_secs(9)).await;
+        writer.write_all(b"BCODE_READY_V1\n").await.unwrap();
+        assert_pending(wait.as_mut());
+        assert_eq!(probes.load(Ordering::SeqCst), 1);
+        tokio::time::advance(Duration::from_secs(1)).await;
+        assert!(matches!(
+            wait.await,
+            Err(DaemonStartError::HealthCheckFailed { .. })
+        ));
+        assert_eq!(tokio::time::Instant::now(), end);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn notification_timeout_does_not_poll_handshake_or_reopen_outcome() {
+        let (reader, mut writer) = tokio::io::duplex(32);
+        let directory = tempfile::tempdir().unwrap();
+        let log = directory.path().join("daemon.log");
+        let mut wait = Box::pin(wait_for_startup_signal(
+            reader,
+            pending::<std::io::Result<&str>>(),
+            &log,
+            deadline(),
+            || async { panic!("no handshake without notification") },
+        ));
+        assert_pending(wait.as_mut());
+        tokio::time::advance(Duration::from_secs(10)).await;
+        let result = wait.await;
+        assert!(matches!(
+            result,
+            Err(DaemonStartError::NotificationTimeout { .. })
+        ));
+        assert!(writer.write_all(b"BCODE_READY_V1\n").await.is_err());
+        assert!(matches!(
+            result,
+            Err(DaemonStartError::NotificationTimeout { .. })
+        ));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn cancellation_in_either_phase_preserves_attempt_ownership() {
+        for notified in [false, true] {
+            let directory = tempfile::tempdir().unwrap();
+            let path = directory.path().join("startup.lock");
+            let owner = StartupLock::acquire_observed(
+                path.clone(),
+                Duration::from_secs(10),
+                "test",
+                || ready(false),
+                |_, _| {},
+            )
+            .await
+            .unwrap()
+            .unwrap();
+            // Model the inherited child OFD, which survives its launcher's drop.
+            let inherited = owner.file.try_clone().unwrap();
+            let (reader, mut writer) = tokio::io::duplex(32);
+            let log = directory.path().join("daemon.log");
+            let mut wait = Box::pin(wait_for_startup_signal(
+                reader,
+                pending::<std::io::Result<&str>>(),
+                &log,
+                deadline(),
+                || ready(false),
+            ));
+            assert_pending(wait.as_mut());
+            if notified {
+                writer.write_all(b"BCODE_READY_V1\n").await.unwrap();
+                assert_pending(wait.as_mut());
+            }
+            drop(wait);
+            drop(owner);
+            #[cfg(unix)]
+            assert!(matches!(
+                StartupLock::acquire_observed(
+                    path.clone(),
+                    Duration::ZERO,
+                    "test",
+                    || ready(false),
+                    |_, _| {}
+                )
+                .await,
+                Err(DaemonStartError::StartupCoordinationTimeout { .. })
+            ));
+            drop(inherited);
+            assert!(
+                StartupLock::acquire_observed(
+                    path,
+                    Duration::from_secs(10),
+                    "test",
+                    || ready(false),
+                    |_, _| {}
+                )
+                .await
+                .unwrap()
+                .is_some()
+            );
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn late_verified_readiness_is_not_success() {
+        let directory = tempfile::tempdir().unwrap();
+        let log = directory.path().join("daemon.log");
+        let end = deadline();
+        let wait = wait_for_verified_ready(&log, end, || async {
+            tokio::time::sleep_until(end + Duration::from_secs(1)).await;
+            true
+        });
+        tokio::pin!(wait);
+        assert_pending(wait.as_mut());
+        tokio::time::advance(Duration::from_secs(10)).await;
+        assert!(matches!(
+            wait.await,
+            Err(DaemonStartError::StartTimeout { .. })
+        ));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn gated_readiness_before_deadline_succeeds() {
+        let (reader, mut writer) = tokio::io::duplex(32);
+        let directory = tempfile::tempdir().unwrap();
+        let log = directory.path().join("daemon.log");
+        let verified = AtomicBool::new(false);
+        let wait = wait_for_startup_signal(
+            reader,
+            pending::<std::io::Result<&str>>(),
+            &log,
+            deadline(),
+            || ready(verified.load(Ordering::SeqCst)),
+        );
+        tokio::pin!(wait);
+        assert_pending(wait.as_mut());
+        writer.write_all(b"BCODE_READY_V1\n").await.unwrap();
+        assert_pending(wait.as_mut());
+        verified.store(true, Ordering::SeqCst);
+        tokio::time::advance(READINESS_RETRY_DELAY).await;
+        wait.await.unwrap();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn child_exit_is_observed_in_both_startup_phases() {
+        for notified in [false, true] {
+            let (reader, mut writer) = tokio::io::duplex(32);
+            let (exit, exited) = tokio::sync::oneshot::channel();
+            let directory = tempfile::tempdir().unwrap();
+            let log = directory.path().join("daemon.log");
+            let wait = wait_for_startup_signal(
+                reader,
+                async { Ok::<_, std::io::Error>(exited.await.unwrap()) },
+                &log,
+                deadline(),
+                || ready(false),
+            );
+            tokio::pin!(wait);
+            assert_pending(wait.as_mut());
+            if notified {
+                writer.write_all(b"BCODE_READY_V1\n").await.unwrap();
+                assert_pending(wait.as_mut());
+            }
+            exit.send("exit 7").unwrap();
+            assert!(
+                matches!(wait.await, Err(DaemonStartError::Exited { status, .. }) if status == "exit 7")
+            );
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn malformed_notification_never_probes_readiness() {
+        let directory = tempfile::tempdir().unwrap();
+        let result = wait_for_startup_signal(
+            &b"BCODE_READY_V2\n"[..],
+            pending::<std::io::Result<&str>>(),
+            &directory.path().join("daemon.log"),
+            deadline(),
+            || async { panic!("malformed notification cannot authorize handshake") },
+        )
+        .await;
+        assert!(matches!(result, Err(DaemonStartError::Io(_))));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn cancelled_waiter_and_later_call_reconcile_same_owned_attempt() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("startup.lock");
+        let owner = StartupLock::acquire_observed(
+            path.clone(),
+            Duration::from_secs(10),
+            "test",
+            || ready(false),
+            |_, _| {},
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        let mut waiter = Box::pin(StartupLock::acquire_observed(
+            path.clone(),
+            Duration::from_secs(10),
+            "test",
+            || ready(false),
+            |_, _| {},
+        ));
+        assert_pending(waiter.as_mut());
+        drop(waiter);
+        // Cancellation releases only the observer. Neither cancellation nor a
+        // deadline can clear the original attempt's kernel ownership.
+        assert!(matches!(
+            StartupLock::acquire_observed(
+                path.clone(),
+                Duration::ZERO,
+                "test",
+                || ready(false),
+                |_, _| {}
+            )
+            .await,
+            Err(DaemonStartError::StartupCoordinationTimeout { .. })
+        ));
+        let verified = Arc::new(AtomicBool::new(false));
+        let mut first = Box::pin(StartupLock::acquire_observed(
+            path.clone(),
+            Duration::from_secs(10),
+            "test",
+            || ready(verified.load(Ordering::SeqCst)),
+            |_, _| {},
+        ));
+        let mut second = Box::pin(StartupLock::acquire_observed(
+            path.clone(),
+            Duration::from_secs(10),
+            "test",
+            || ready(verified.load(Ordering::SeqCst)),
+            |_, _| {},
+        ));
+        assert_pending(first.as_mut());
+        assert_pending(second.as_mut());
+        verified.store(true, Ordering::SeqCst);
+        tokio::time::advance(StartupLock::POLL_INTERVAL).await;
+        assert!(first.await.unwrap().is_none());
+        assert!(second.await.unwrap().is_none());
+        drop(owner);
+        assert!(
+            StartupLock::acquire_observed(
+                path,
+                Duration::from_secs(10),
+                "test",
+                || ready(false),
+                |_, _| {}
+            )
+            .await
+            .unwrap()
+            .is_some()
+        );
+    }
+
+    #[test]
+    fn readiness_rejects_wrong_or_missing_state_and_artifact_evidence() {
+        let exact = bcode_ipc::DaemonStatus {
+            namespace: daemon_namespace(),
+            protocol_version: u32::from(CURRENT_PROTOCOL_VERSION),
+            artifact_id: Some(bcode_ipc::ArtifactId::current()),
+            build_fingerprint: BUILD_FINGERPRINT.to_owned(),
+            executable_digest: Some(initialize_artifact_bootstrap().unwrap().digest().unwrap()),
+            storage_writer_epoch: Some(bcode_ipc::CURRENT_SESSION_STORAGE_WRITER_EPOCH),
+            state_location_id: Some(bcode_ipc::state_location_id()),
+            session_event_schema_version: Some(
+                bcode_session_models::CURRENT_SESSION_EVENT_SCHEMA_VERSION,
+            ),
+            pid: Some(std::process::id()),
+            instance_id: "test".to_owned(),
+            started_at_unix_ms: 0,
+        };
+        assert!(daemon_status_matches_current_executable(&exact));
+        for candidate in [
+            bcode_ipc::DaemonStatus {
+                state_location_id: Some("other-state".to_owned()),
+                ..exact.clone()
+            },
+            bcode_ipc::DaemonStatus {
+                state_location_id: None,
+                ..exact.clone()
+            },
+            bcode_ipc::DaemonStatus {
+                artifact_id: None,
+                ..exact.clone()
+            },
+            bcode_ipc::DaemonStatus {
+                executable_digest: Some("wrong-digest".to_owned()),
+                ..exact.clone()
+            },
+            bcode_ipc::DaemonStatus {
+                build_fingerprint: "other-build".to_owned(),
+                ..exact
+            },
+        ] {
+            assert!(!daemon_status_matches_current_executable(&candidate));
+        }
     }
 }
 
@@ -3908,6 +4416,7 @@ async fn ping_ready(endpoint: &IpcEndpoint) -> bool {
 
 fn daemon_status_matches_current_executable(status: &bcode_ipc::DaemonStatus) -> bool {
     status.namespace == daemon_namespace()
+        && status.state_location_id.as_deref() == Some(bcode_ipc::state_location_id().as_str())
         && initialize_artifact_bootstrap()
             .and_then(ArtifactBootstrap::digest)
             .is_ok_and(|digest| status.executable_digest.as_deref() == Some(digest.as_str()))
@@ -3917,17 +4426,6 @@ fn daemon_status_matches_current_executable(status: &bcode_ipc::DaemonStatus) ->
         && status.storage_writer_epoch == Some(bcode_ipc::CURRENT_SESSION_STORAGE_WRITER_EPOCH)
         && status.session_event_schema_version
             == Some(bcode_session_models::CURRENT_SESSION_EVENT_SCHEMA_VERSION)
-}
-
-#[cfg(unix)]
-async fn wait_for_existing_daemon(endpoint: &IpcEndpoint) -> bool {
-    for delay in [50, 100, 200, 400, 800, 1_000] {
-        if ping_ready(endpoint).await {
-            return true;
-        }
-        tokio::time::sleep(Duration::from_millis(delay)).await;
-    }
-    false
 }
 
 #[cfg(unix)]
@@ -4233,14 +4731,18 @@ mod startup_lock_tests {
         };
         let starts = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let observed_starts = std::sync::Arc::clone(&starts);
-        let error = ensure_daemon_running_with_start(&options, move |_, _| {
-            observed_starts.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-            async { Ok(()) }
-        })
+        let error = ensure_daemon_running_with_start_until(
+            &options,
+            tokio::time::Instant::now() + Duration::from_millis(100),
+            move |_, _| {
+                observed_starts.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                async { Ok(()) }
+            },
+        )
         .await
         .expect_err("occupied endpoint must block startup");
 
-        assert!(matches!(error, DaemonStartError::EndpointOccupied { .. }));
+        assert!(matches!(error, DaemonStartError::StartTimeout { .. }));
         assert_eq!(starts.load(std::sync::atomic::Ordering::SeqCst), 0);
         drop(listener);
         fs::remove_file(socket_path).expect("socket cleanup");

@@ -91,6 +91,14 @@ pub enum SessionLifecycleRequest {
     },
     /// Inspect effective model catalog and refresh state.
     ModelCatalogDiagnostics,
+    RuntimeQuiescence {
+        expected_instance: bcode_ipc::RuntimeInstanceIdentity,
+        after: Option<bcode_ipc::RuntimeQuiescence>,
+        wait_ms: u32,
+    },
+    StopQuiescentRuntime {
+        expected: bcode_ipc::RuntimeQuiescence,
+    },
     RuntimeStatus,
     ModelCatalogSnapshot,
     RefreshModelCatalog,
@@ -1161,6 +1169,20 @@ impl RoutedRequest {
             Request::ServerStatus { working_directory } => {
                 Self::SessionLifecycle(Box::new(SessionLifecycleRequest::ServerStatus {
                     working_directory,
+                }))
+            }
+            Request::RuntimeQuiescence {
+                expected_instance,
+                after,
+                wait_ms,
+            } => Self::SessionLifecycle(Box::new(SessionLifecycleRequest::RuntimeQuiescence {
+                expected_instance,
+                after,
+                wait_ms,
+            })),
+            Request::StopQuiescentRuntime { expected } => {
+                Self::SessionLifecycle(Box::new(SessionLifecycleRequest::StopQuiescentRuntime {
+                    expected,
                 }))
             }
             Request::ServerStop { mode } => {

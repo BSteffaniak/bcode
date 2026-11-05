@@ -2442,6 +2442,53 @@ pub fn terminal_status(value: &serde_json::Value) -> bool {
 #[cfg(test)]
 mod observation_tests {
     use super::*;
+
+    #[test]
+    fn disabled_scalar_log_preserves_canonical_readiness_not_xray_child_coverage() {
+        let directory = tempfile::tempdir().unwrap();
+        let history = crate::capture::capture_history_with_capabilities(
+            "run",
+            directory.path(),
+            true,
+            |args, _, _| match args[1].as_str() {
+                "observations" => Ok(serde_json::json!({
+                    "version":1,"run_id":"run","origin":"not_enabled","sources":[],
+                    "limitations":["not enabled at admission"],"through_sequence":0,
+                    "next_after_sequence":null,"observations":[]
+                })),
+                "attempts" => Ok(serde_json::json!([])),
+                operation => panic!("unexpected operation: {operation}"),
+            },
+        );
+        // Exercise the executor's capture-failure gate: valid absence of optional
+        // scalar history must not poison an independently verified canonical run.
+        let capture_failed = history.is_err();
+        let readiness = eval_readiness(true, !capture_failed, false);
+        assert!(readiness.complete);
+        assert_eq!(
+            readiness.scope,
+            EvalReadinessScope::TerminalCanonicalAttempt
+        );
+        let manifest: serde_json::Value = serde_json::from_slice(
+            &fs::read(directory.path().join("capture-completeness.json")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(manifest["complete"], false);
+        assert_eq!(
+            manifest["boundaries"]["observations"]["status"],
+            "not_enabled"
+        );
+        // Scalar coverage cannot stand in for pre-dispatch descendant recording.
+        // Missing child evidence remains incomplete regardless of task/readiness.
+        let mut children = crate::xray_capture::EvalXrayAggregation::new(
+            crate::xray_capture::CaptureLimits::default(),
+        );
+        children.expect_session("child-run", "child-session");
+        let evidence = children.finish();
+        assert!(!evidence.evidence_complete);
+        assert_eq!(evidence.expected_sessions, 1);
+        assert_eq!(evidence.observed_sessions, 0);
+    }
     use std::cell::Cell;
 
     #[test]
