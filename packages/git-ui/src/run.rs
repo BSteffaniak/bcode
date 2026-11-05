@@ -200,7 +200,7 @@ async fn session(mut app: App) -> Result<(App, Option<String>), RunError> {
     let terminal = Terminal::new(std::io::stdout(), Rect::new(0, 0, size.width, size.height));
     let presenter: Presenter = TerminalPresenter::with_commit(terminal, paint, commit);
     let watcher = if app.config.refresh.watch {
-        watch(app.repo.root())
+        watch(app.repo.paths())
     } else {
         None
     };
@@ -275,8 +275,9 @@ async fn session(mut app: App) -> Result<(App, Option<String>), RunError> {
 }
 
 /// Watch the worktree (including the git directory), signalling on relevant changes.
+/// Watch the worktree and, for linked worktrees, the git directories that live outside it.
 fn watch(
-    root: &Path,
+    paths: &bcode_git::models::RepoPaths,
 ) -> Option<(
     notify::RecommendedWatcher,
     tokio::sync::mpsc::UnboundedReceiver<()>,
@@ -303,7 +304,16 @@ fn watch(
         }
     })
     .ok()?;
-    watcher.watch(root, RecursiveMode::Recursive).ok()?;
+    watcher.watch(&paths.root, RecursiveMode::Recursive).ok()?;
+    // A linked worktree's index and HEAD live in its own git directory, and branch refs in the
+    // shared one; both sit outside the worktree. Watching them is best-effort.
+    if !paths.git_dir.starts_with(&paths.root) {
+        let _ = watcher.watch(&paths.git_dir, RecursiveMode::NonRecursive);
+    }
+    if !paths.common_dir.starts_with(&paths.root) {
+        let _ = watcher.watch(&paths.common_dir, RecursiveMode::NonRecursive);
+        let _ = watcher.watch(&paths.common_dir.join("refs"), RecursiveMode::Recursive);
+    }
     Some((watcher, receiver))
 }
 

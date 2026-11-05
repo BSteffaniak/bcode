@@ -17,7 +17,7 @@ use bmux_tui_components::selectable_list::SelectableListState;
 use bmux_tui_components::text_input::{
     EnterBehavior, TextInputControl, TextInputOutcome, TextInputPolicy,
 };
-use bmux_tui_runtime::{Command, CommandKey, Program, RuntimeEvent, Update};
+use bmux_tui_runtime::{Command, CommandKey, Program, RuntimeEvent, SubscriptionKey, Update};
 
 use crate::config::GitUiConfig;
 pub use crate::config::ScreenMode;
@@ -189,6 +189,10 @@ pub enum Msg {
     OpDone(Box<OpResult>),
     /// Repository files changed on disk.
     Watch,
+    /// A commit message prefill source may have changed while the commit editor is open.
+    CommitSourcesChanged,
+    /// Prefill found after a change, for an editor that is still empty.
+    CommitPrefill(Box<crate::commit_message::Prefill>),
     /// Periodic tick.
     Tick,
     /// Terminal input failed.
@@ -1259,6 +1263,68 @@ impl App {
         }
     }
 
+    /// The open commit editor (not an amend), wherever it sits in the popup stack.
+    fn commit_editor(&mut self) -> Option<&mut Prompt> {
+        self.popups.iter_mut().find_map(|popup| match popup {
+            Popup::Prompt(prompt) if matches!(prompt.kind, PromptKind::Commit { .. }) => {
+                Some(prompt)
+            }
+            _ => None,
+        })
+    }
+
+    /// Whether a source change may fill the open commit editor: it is not amending and both
+    /// fields are empty, however they got that way.
+    fn commit_editor_accepts_prefill(&mut self) -> bool {
+        self.commit_editor().is_some_and(|prompt| {
+            matches!(prompt.kind, PromptKind::Commit { amend: false, .. })
+                && prompt.summary().trim().is_empty()
+                && prompt.description().trim().is_empty()
+        })
+    }
+
+    /// Look for a prefill off the input thread when the open commit editor can take one.
+    fn check_commit_prefill(&mut self) -> Option<Command<Msg>> {
+        if !self.commit_editor_accepts_prefill() {
+            return None;
+        }
+        let repo = self.repo.clone();
+        // The environment message is offered to the first editor only.
+        let sources: Vec<CommitMessageSource> = self
+            .commit_sources
+            .iter()
+            .copied()
+            .filter(|source| *source != CommitMessageSource::Env)
+            .collect();
+        self.spawn(
+            Some("commit-prefill"),
+            move || crate::commit_message::find(&repo, &sources, None),
+            |prefill| Msg::CommitPrefill(Box::new(prefill)),
+        )
+    }
+
+    /// Fill the commit editor with a found prefill, if it is still empty.
+    fn apply_commit_prefill(&mut self, prefill: crate::commit_message::Prefill) -> Update<Msg> {
+        if !self.commit_editor_accepts_prefill() {
+            return Update::none();
+        }
+        let title = self.commit_title(&prefill);
+        let Some(prompt) = self.commit_editor() else {
+            return Update::none();
+        };
+        if let Some((_, text)) = &prefill.chosen {
+            prompt.set_text(text);
+        }
+        if let PromptKind::Commit {
+            prefill: current, ..
+        } = &mut prompt.kind
+        {
+            *current = prefill.chosen;
+        }
+        prompt.title = title;
+        Update::redraw()
+    }
+
     /// Apply the text of an open filter prompt to the focused view.
     fn apply_live_filter(&mut self) -> Update<Msg> {
         let Some(Popup::Prompt(prompt)) = self.popups.last() else {
@@ -1467,7 +1533,9 @@ impl App {
             && self.running.is_none()
         {
             self.last_poll = Instant::now();
-            update = update.maybe(self.refresh());
+            update = update
+                .maybe(self.refresh())
+                .maybe(self.check_commit_prefill());
         }
         let fetch = self.config.refresh.auto_fetch_seconds;
         if fetch > 0
@@ -1736,12 +1804,16 @@ impl App {
             }
             Msg::OpDone(result) => self.finish_op(&result),
             Msg::Watch => {
+                // The main watcher also sees prefill files that live inside the worktree.
+                let update = Update::none().maybe(self.check_commit_prefill());
                 if self.running.is_none() {
-                    Update::none().maybe(self.refresh())
+                    update.maybe(self.refresh())
                 } else {
-                    Update::none()
+                    update
                 }
             }
+            Msg::CommitSourcesChanged => Update::none().maybe(self.check_commit_prefill()),
+            Msg::CommitPrefill(prefill) => self.apply_commit_prefill(*prefill),
             Msg::Tick => self.tick(),
             Msg::InputFailed(error) => {
                 self.diagnostics.push(error);
@@ -1757,6 +1829,24 @@ impl Program for App {
     type Error = String;
 
     fn update(&mut self, event: RuntimeEvent<Msg>) -> Result<Update<Msg>, String> {
+        let watching_sources = self.commit_editor().is_some();
+        let update = self.handle(event);
+        // Watch prefill sources exactly while a commit editor is open.
+        let update = match (watching_sources, self.commit_editor().is_some()) {
+            (false, true) => update.with_subscription(crate::commit_message::subscription(
+                crate::commit_message::watched_files(&self.repo, &self.commit_sources),
+            )),
+            (true, false) => {
+                update.cancel_subscription(SubscriptionKey::new(crate::commit_message::WATCH_KEY))
+            }
+            _ => update,
+        };
+        Ok(update)
+    }
+}
+
+impl App {
+    fn handle(&mut self, event: RuntimeEvent<Msg>) -> Update<Msg> {
         let update = match event {
             RuntimeEvent::Terminal(event) => match &event {
                 Event::Key(stroke) => self.key(*stroke, &event),
@@ -1765,7 +1855,7 @@ impl Program for App {
                     match self.popups.last_mut() {
                         Some(Popup::Prompt(prompt)) => {
                             paste_into_prompt(prompt, &event);
-                            return Ok(self.apply_live_filter());
+                            return self.apply_live_filter();
                         }
                         Some(Popup::Menu(menu)) => {
                             if let Some(filter) = &menu.filter {
@@ -1788,7 +1878,7 @@ impl Program for App {
             RuntimeEvent::Message(message) => self.message(message),
             RuntimeEvent::Timer(_) => Update::none(),
         };
-        Ok(if self.quit { Update::exit() } else { update })
+        if self.quit { Update::exit() } else { update }
     }
 }
 

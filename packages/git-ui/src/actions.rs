@@ -317,31 +317,21 @@ impl App {
                 let stage_all = !entries
                     .iter()
                     .any(bcode_git::models::StatusEntry::has_staged);
-                let state = if entries.is_empty() {
-                    Some("no changes yet")
-                } else if stage_all {
-                    Some("nothing staged: commits all changes")
-                } else {
-                    None
-                };
-                let (prefill, replaced) = self.commit_prefill();
-                let mut notes: Vec<String> = Vec::new();
-                if let Some((source, _)) = &prefill {
-                    notes.push(format!("from {}", source.label()));
+                let prefill = crate::commit_message::find(
+                    &self.repo,
+                    &self.commit_sources,
+                    self.env_message.take(),
+                );
+                for error in &prefill.errors {
+                    self.toast(error.clone(), true);
                 }
-                if let Some(replaced) = replaced {
-                    notes.push(format!("replaces {}", replaced.label()));
-                }
-                notes.extend(state.map(str::to_owned));
-                let title = if notes.is_empty() {
-                    "Commit message".to_owned()
-                } else {
-                    format!("Commit message ({})", notes.join("; "))
-                };
+                let title = self.commit_title(&prefill);
                 let initial = prefill
+                    .chosen
                     .as_ref()
                     .map(|(_, text)| text.clone())
                     .unwrap_or_default();
+                let prefill = prefill.chosen;
                 self.prompt(
                     title,
                     &initial,
@@ -1032,47 +1022,30 @@ impl App {
         isize::try_from(self.size.get().1 / 3).unwrap_or(10).max(1)
     }
 
-    /// Text for a new commit editor: the first configured source with a message, and the
-    /// git-generated message a draft hides, if any. The environment message is used once.
-    fn commit_prefill(
-        &mut self,
-    ) -> (
-        Option<(CommitMessageSource, String)>,
-        Option<CommitMessageSource>,
-    ) {
-        let mut chosen = None;
-        for source in self.commit_sources.clone() {
-            let text = if source == CommitMessageSource::Env {
-                self.env_message.take()
-            } else {
-                match self.repo.commit_message_from(source) {
-                    Ok(text) => text,
-                    Err(error) => {
-                        self.toast(format!("{}: {}", source.label(), error.message()), true);
-                        None
-                    }
-                }
-            };
-            if let Some(text) = text {
-                chosen = Some((source, text));
-                break;
-            }
+    /// Commit editor title: where the text came from, what it replaces, and what will be
+    /// committed.
+    pub(crate) fn commit_title(&self, prefill: &crate::commit_message::Prefill) -> String {
+        let entries = &self.snapshot.status.entries;
+        let mut notes: Vec<String> = Vec::new();
+        if let Some((source, _)) = &prefill.chosen {
+            notes.push(format!("from {}", source.label()));
         }
-        // Say when a draft takes the place of a merge or squash message git prepared.
-        let replaced = chosen
-            .as_ref()
-            .filter(|(source, _)| source.is_draft())
-            .and_then(|_| {
-                [CommitMessageSource::Merge, CommitMessageSource::Squash]
-                    .into_iter()
-                    .filter(|source| self.commit_sources.contains(source))
-                    .find(|source| {
-                        self.repo
-                            .commit_message_from(*source)
-                            .is_ok_and(|text| text.is_some())
-                    })
-            });
-        (chosen, replaced)
+        if let Some(replaced) = prefill.replaced {
+            notes.push(format!("replaces {}", replaced.label()));
+        }
+        if entries.is_empty() {
+            notes.push("no changes yet".into());
+        } else if !entries
+            .iter()
+            .any(bcode_git::models::StatusEntry::has_staged)
+        {
+            notes.push("nothing staged: commits all changes".into());
+        }
+        if notes.is_empty() {
+            "Commit message".to_owned()
+        } else {
+            format!("Commit message ({})", notes.join("; "))
+        }
     }
 
     /// Keep an unsent commit message as the draft (or drop the draft when cleared). Untouched

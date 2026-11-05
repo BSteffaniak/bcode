@@ -916,3 +916,68 @@ fn modals_have_a_solid_background() {
     harness.paste("com");
     assert_solid_modal(&mut harness);
 }
+
+fn sources_changed(harness: &mut Harness) {
+    harness.send(RuntimeEvent::Message(
+        bcode_git_ui::app::Msg::CommitSourcesChanged,
+    ));
+}
+
+#[test]
+fn an_empty_commit_editor_takes_messages_written_while_open() {
+    let mut harness = Harness::new(changed_repo);
+    harness.keys(&["c"]);
+    std::fs::write(
+        harness.path().join(".git/BCODE_GIT_COMMIT_MSG"),
+        "Written meanwhile\n\nWith details",
+    )
+    .unwrap();
+    sources_changed(&mut harness);
+    let screen = harness.screen(140, 40);
+    assert!(screen.contains("from BCODE_GIT_COMMIT_MSG"), "{screen}");
+    assert!(screen.contains("With details"), "{screen}");
+    harness.keys(&["enter"]);
+    assert_eq!(
+        git(harness.path(), &["log", "-1", "--format=%B"]),
+        "Written meanwhile\n\nWith details\n\n"
+    );
+}
+
+#[test]
+fn typed_text_is_never_replaced_but_an_emptied_editor_is_filled() {
+    let mut harness = Harness::new(changed_repo);
+    harness.keys(&["c"]);
+    harness.paste("Mine");
+    std::fs::write(harness.path().join(".git/MERGE_MSG"), "From git").unwrap();
+    sources_changed(&mut harness);
+    let screen = harness.screen(140, 40);
+    assert!(screen.contains("Mine"), "{screen}");
+    assert!(!screen.contains("From git"), "{screen}");
+    // Typing and then deleting everything leaves an editor that accepts a prefill again.
+    harness.keys(&["backspace", "backspace", "backspace", "backspace"]);
+    sources_changed(&mut harness);
+    let screen = harness.screen(140, 40);
+    assert!(screen.contains("From git"), "{screen}");
+    assert!(screen.contains("from MERGE_MSG"), "{screen}");
+}
+
+#[test]
+fn source_watching_follows_the_commit_editor() {
+    let mut harness = Harness::new(changed_repo);
+    let key = |key: &str| {
+        RuntimeEvent::Terminal(Event::Key(bmux_keyboard::parse_key_stroke(key).unwrap()))
+    };
+    let opened = harness.app.update(key("c")).unwrap();
+    assert_eq!(opened.subscriptions.len(), 1);
+    let typed = harness.app.update(key("x")).unwrap();
+    assert!(typed.subscriptions.is_empty() && typed.cancelled_subscriptions.is_empty());
+    let closed = harness.app.update(key("escape")).unwrap();
+    assert_eq!(
+        closed
+            .cancelled_subscriptions
+            .iter()
+            .map(|key| key.as_str())
+            .collect::<Vec<_>>(),
+        [bcode_git_ui::commit_message::WATCH_KEY]
+    );
+}

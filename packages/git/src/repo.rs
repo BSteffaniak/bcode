@@ -922,20 +922,8 @@ impl Repository {
         &self,
         source: CommitMessageSource,
     ) -> Result<Option<String>, GitError> {
-        let git_dir = &self.paths.git_dir;
-        let path = match source {
-            CommitMessageSource::Env => return Ok(None),
-            CommitMessageSource::BcodeDraft => git_dir.join(BCODE_COMMIT_DRAFT),
-            CommitMessageSource::LazygitDraft => git_dir.join(LAZYGIT_COMMIT_DRAFT),
-            CommitMessageSource::Merge => git_dir.join("MERGE_MSG"),
-            CommitMessageSource::Squash => git_dir.join("SQUASH_MSG"),
-            CommitMessageSource::EditMsg => git_dir.join("COMMIT_EDITMSG"),
-            CommitMessageSource::Template => {
-                let Some(template) = self.config_path("commit.template")? else {
-                    return Ok(None);
-                };
-                self.paths.root.join(template)
-            }
+        let Some(path) = self.commit_message_path(source)? else {
+            return Ok(None);
         };
         let Some(raw) = read_message_file(&path)? else {
             return Ok(None);
@@ -952,6 +940,31 @@ impl Repository {
             }
         }
         Ok(Some(text))
+    }
+
+    /// File holding a commit message source, whether or not it exists yet; `None` for the
+    /// environment and for an unset `commit.template`.
+    ///
+    /// # Errors
+    /// * [`GitError`] when git fails reading `commit.template`.
+    pub fn commit_message_path(
+        &self,
+        source: CommitMessageSource,
+    ) -> Result<Option<PathBuf>, GitError> {
+        let git_dir = &self.paths.git_dir;
+        Ok(Some(match source {
+            CommitMessageSource::Env => return Ok(None),
+            CommitMessageSource::BcodeDraft => git_dir.join(BCODE_COMMIT_DRAFT),
+            CommitMessageSource::LazygitDraft => git_dir.join(LAZYGIT_COMMIT_DRAFT),
+            CommitMessageSource::Merge => git_dir.join("MERGE_MSG"),
+            CommitMessageSource::Squash => git_dir.join("SQUASH_MSG"),
+            CommitMessageSource::EditMsg => git_dir.join("COMMIT_EDITMSG"),
+            CommitMessageSource::Template => match self.config_path("commit.template")? {
+                // Relative templates resolve against the worktree, as for `git commit`.
+                Some(template) => self.paths.root.join(template),
+                None => return Ok(None),
+            },
+        }))
     }
 
     /// Store an unsent commit message as bcode's draft; blank text removes the draft.

@@ -215,6 +215,12 @@ templates lose their comment lines; drafts keep lines starting with `#`, which a
 content (messages are committed with `--cleanup=whitespace`). The editor title names the source
 and says when a draft replaces a `MERGE_MSG` or `SQUASH_MSG`.
 
+While the editor is open, these files are watched (the worktree's git directory and the
+`commit.template` file). When one is written, created or removed, the sources are read again and
+the editor is filled, but only if both fields are empty at that moment. Typed text is never
+replaced; an editor emptied by deleting what was typed counts as empty. The environment message
+is not offered again. Without filesystem watching, the poll interval does the same.
+
 Drafts follow the message:
 
 * Cancelling an edited editor saves the text as the bcode draft; cancelling an emptied editor
