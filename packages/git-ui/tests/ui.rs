@@ -1088,3 +1088,50 @@ fn unbinding_a_panel_key_lets_the_shared_list_binding_through() {
     let screen = harness.screen(120, 30);
     assert!(!screen.contains("New branch"), "{screen}");
 }
+
+#[test]
+fn overview_logo_fits_its_width_and_never_wraps() {
+    use bmux_tui::geometry::Point;
+
+    let rows = [
+        "█                 █             ▀ █",
+        "█▀▀█ █▀▀▀ █▀▀█ █▀▀█ █▀▀█   █▀▀▀ █ █▀▀",
+        "█  █ █    █  █ █  █ █▀▀▀   █ ▀█ █ █",
+        "▀▀▀▀ ▀▀▀▀ ▀▀▀▀ ▀▀▀▀ ▀▀▀▀   ▀▀▀▀ ▀ ▀▀▀",
+    ];
+    let mut harness = Harness::new(|path| commit(path, "a.txt", "a\n", "Initial commit"));
+    harness.keys(&["1"]);
+    let indented = |screen: &str, row: &str| screen.matches(&format!("│  {row}")).count();
+    let screen = harness.screen(140, 30);
+    for row in rows {
+        assert_eq!(indented(&screen, row), 1, "{screen}");
+    }
+    assert!(screen.contains("Last commit"), "{screen}");
+    // One cell too narrow for the indent: the letters stay whole, flush left.
+    let screen = harness.screen(40, 40);
+    for row in rows {
+        assert_eq!(screen.matches(&format!("│{row}")).count(), 1, "{screen}");
+    }
+
+    // The overview is not interactive: its first row has no cursor highlight.
+    let buffer = bcode_git_ui::render_buffer(&mut harness.app, 140, 30);
+    let row_of = |needle: &str| {
+        (0..30u16)
+            .find(|y| buffer.row_symbols(*y).unwrap_or_default().contains(needle))
+            .unwrap()
+    };
+    let (blank, logo) = (row_of("bcode git") + 1, row_of(rows[1]));
+    let x = u16::try_from(
+        buffer
+            .row_symbols(logo)
+            .unwrap()
+            .chars()
+            .count()
+            .saturating_sub(3),
+    )
+    .unwrap();
+    assert_eq!(
+        buffer.get(Point::new(x, logo)).unwrap().style.bg,
+        buffer.get(Point::new(x, blank)).unwrap().style.bg
+    );
+}

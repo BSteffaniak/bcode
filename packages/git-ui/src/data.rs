@@ -863,93 +863,193 @@ const fn civil_from_days(days: i64) -> (i64, i64, i64) {
     (year, month, day)
 }
 
+/// Wordmark glyphs drawn with block elements: one-cell vertical strokes, half-cell horizontal
+/// strokes, four rows with b, d, i and t rising into the top row. Rows of a glyph share a width.
+const WORDMARK_GLYPHS: [(char, [&str; 4]); 8] = [
+    ('b', ["█   ", "█▀▀█", "█  █", "▀▀▀▀"]),
+    ('c', ["    ", "█▀▀▀", "█   ", "▀▀▀▀"]),
+    ('o', ["    ", "█▀▀█", "█  █", "▀▀▀▀"]),
+    ('d', ["   █", "█▀▀█", "█  █", "▀▀▀▀"]),
+    ('e', ["    ", "█▀▀█", "█▀▀▀", "▀▀▀▀"]),
+    ('g', ["    ", "█▀▀▀", "█ ▀█", "▀▀▀▀"]),
+    ('i', ["▀", "█", "█", "▀"]),
+    ('t', ["█  ", "█▀▀", "█  ", "▀▀▀"]),
+];
+
+/// The overview wordmark: "bcode" in the text color and "git" in the accent color, as block
+/// letters 37 cells wide. Rows are fixed: never wrapped; narrow views drop the indent, and
+/// only views narrower than the letters clip them.
+fn logo_rows(theme: &crate::theme::GitTheme) -> Vec<DiffRow> {
+    const INDENT: &str = "  ";
+    let words = [
+        ("bcode", theme.text.add_modifier(Modifier::BOLD)),
+        ("git", theme.accent.add_modifier(Modifier::BOLD)),
+    ];
+    let mut rows = Vec::new();
+    for row in 0..4 {
+        let mut spans = vec![Span::raw(INDENT)];
+        for (word_index, (word, style)) in words.iter().enumerate() {
+            if word_index > 0 {
+                spans.push(Span::raw("   "));
+            }
+            for (index, letter) in word.chars().enumerate() {
+                if index > 0 {
+                    spans.push(Span::raw(" "));
+                }
+                if let Some((_, glyph)) = WORDMARK_GLYPHS.iter().find(|(name, _)| *name == letter) {
+                    spans.push(Span::styled(glyph[row], *style));
+                }
+            }
+        }
+        // Narrow views drop the indent rather than clipping the letters.
+        let compact = Line::from_spans(spans[1..].to_vec());
+        let mut logo = DiffRow::fixed(Line::from_spans(spans));
+        logo.compact = Some(compact);
+        rows.push(logo);
+    }
+    rows
+}
+
 fn status_rows(repo: &Repository, cx: &PresentContext) -> Vec<DiffRow> {
     let theme = &cx.theme;
-    let logo = [
-        "  ██████╗  ██████╗ ██████╗ ██████╗ ███████╗     ██████╗ ██╗████████╗",
-        "  ██╔══██╗██╔════╝██╔═══██╗██╔══██╗██╔════╝    ██╔════╝ ██║╚══██╔══╝",
-        "  ██████╔╝██║     ██║   ██║██║  ██║█████╗      ██║  ███╗██║   ██║   ",
-        "  ██╔══██╗██║     ██║   ██║██║  ██║██╔══╝      ██║   ██║██║   ██║   ",
-        "  ██████╔╝╚██████╗╚██████╔╝██████╔╝███████╗    ╚██████╔╝██║   ██║   ",
-        "  ╚═════╝  ╚═════╝ ╚═════╝ ╚═════╝ ╚══════╝     ╚═════╝ ╚═╝   ╚═╝   ",
-    ];
-    let mut rows: Vec<DiffRow> = logo
-        .iter()
-        .enumerate()
-        .map(|(index, line)| {
-            DiffRow::info(Line::from_spans(vec![Span::styled(
-                (*line).to_owned(),
-                theme.lane(index).add_modifier(Modifier::BOLD),
-            )]))
-        })
-        .collect();
+    let mut rows = vec![DiffRow::info(Line::new())];
+    rows.extend(logo_rows(theme));
     rows.push(DiffRow::info(Line::new()));
-    let label = |name: &str| Span::styled(format!("  {name:<12}"), theme.muted);
-    rows.push(DiffRow::info(Line::from_spans(vec![
-        label("Repository"),
-        Span::styled(
-            repo.root().display().to_string(),
-            theme.text.add_modifier(Modifier::BOLD),
-        ),
-    ])));
-    if let Ok(status) = repo.status() {
-        let branch = status
-            .branch
-            .head
-            .clone()
-            .unwrap_or_else(|| "(detached)".into());
-        rows.push(DiffRow::info(Line::from_spans(vec![
-            label("Branch"),
-            Span::styled(branch, theme.branch_head),
-            Span::styled(
-                status.branch.upstream.as_ref().map_or_else(
-                    || "  no upstream".to_owned(),
-                    |upstream| format!("  → {upstream}"),
-                ),
-                theme.branch_remote,
-            ),
-            Span::styled(format!("  ↑{}", status.branch.ahead), theme.success),
-            Span::styled(format!(" ↓{}", status.branch.behind), theme.warning),
-        ])));
-        let staged = status
-            .entries
-            .iter()
-            .filter(|entry| entry.has_staged())
-            .count();
-        let unstaged = status
-            .entries
-            .iter()
-            .filter(|entry| entry.has_unstaged() && !entry.is_untracked())
-            .count();
-        let untracked = status
-            .entries
-            .iter()
-            .filter(|entry| entry.is_untracked())
-            .count();
-        rows.push(DiffRow::info(Line::from_spans(vec![
-            label("Changes"),
-            Span::styled(format!("{staged} staged"), theme.staged),
-            Span::styled("  ·  ", theme.muted),
-            Span::styled(format!("{unstaged} unstaged"), theme.unstaged),
-            Span::styled("  ·  ", theme.muted),
-            Span::styled(format!("{untracked} untracked"), theme.untracked),
-        ])));
-    }
-    let operation = repo.operation();
-    if operation != RepoOperation::None {
-        rows.push(DiffRow::info(Line::from_spans(vec![
-            label("In progress"),
-            Span::styled(
-                operation.label().to_uppercase(),
-                theme.warning.add_modifier(Modifier::BOLD),
-            ),
-        ])));
-    }
+    rows.extend(summary_rows(repo, cx));
     rows.push(DiffRow::info(Line::new()));
     rows.push(DiffRow::info(Line::from_spans(vec![Span::styled(
         "  Press ? for keybindings in any panel, ctrl+p for the command palette.",
         theme.muted,
     )])));
+    rows
+}
+
+/// Repository, branch, changes, last commit and any operation in progress.
+/// Branch and change counts of the overview.
+fn status_summary(
+    status: &bcode_git::models::StatusSnapshot,
+    theme: &crate::theme::GitTheme,
+) -> Vec<DiffRow> {
+    let label = |icon: &str, name: &str| summary_label(theme, icon, name);
+    let mut rows = Vec::new();
+    let branch = status
+        .branch
+        .head
+        .clone()
+        .unwrap_or_else(|| "(detached)".into());
+    rows.push(labeled(vec![
+        label("⎇", "Branch"),
+        Span::styled(branch, theme.branch_head),
+        Span::styled(
+            status.branch.upstream.as_ref().map_or_else(
+                || "  no upstream".to_owned(),
+                |upstream| format!("  → {upstream}"),
+            ),
+            theme.branch_remote,
+        ),
+        Span::styled(format!("  ↑{}", status.branch.ahead), theme.success),
+        Span::styled(format!(" ↓{}", status.branch.behind), theme.warning),
+    ]));
+    let staged = status
+        .entries
+        .iter()
+        .filter(|entry| entry.has_staged())
+        .count();
+    let unstaged = status
+        .entries
+        .iter()
+        .filter(|entry| entry.has_unstaged() && !entry.is_untracked())
+        .count();
+    let untracked = status
+        .entries
+        .iter()
+        .filter(|entry| entry.is_untracked())
+        .count();
+    rows.push(labeled(vec![
+        label("±", "Changes"),
+        Span::styled(format!("{staged} staged"), theme.staged),
+        Span::styled("  ·  ", theme.muted),
+        Span::styled(format!("{unstaged} unstaged"), theme.unstaged),
+        Span::styled("  ·  ", theme.muted),
+        Span::styled(format!("{untracked} untracked"), theme.untracked),
+    ]));
+    rows
+}
+
+/// Labeled overview row; wrapped text continues under the value, not under the label.
+fn labeled(spans: Vec<Span>) -> DiffRow {
+    let mut row = DiffRow::info(Line::from_spans(spans));
+    row.gutter_spans = 1;
+    row
+}
+
+/// Overview label, padded to a shared column measured in terminal cells.
+fn summary_label(theme: &crate::theme::GitTheme, icon: &str, name: &str) -> Span {
+    let text = format!("  {icon} {name}");
+    let pad = 16usize.saturating_sub(bmux_tui::text_width::display_width(&text));
+    Span::styled(format!("{text}{}", " ".repeat(pad)), theme.muted)
+}
+
+fn summary_rows(repo: &Repository, cx: &PresentContext) -> Vec<DiffRow> {
+    let theme = &cx.theme;
+    let label = |icon: &str, name: &str| summary_label(theme, icon, name);
+    let mut rows = Vec::new();
+    let root = repo.root();
+    let name = root.file_name().map_or_else(
+        || root.display().to_string(),
+        |name| name.to_string_lossy().into_owned(),
+    );
+    let location = root.parent().map(|parent| {
+        let parent = parent.display().to_string();
+        std::env::var("HOME")
+            .ok()
+            .filter(|home| !home.is_empty())
+            .and_then(|home| parent.strip_prefix(&home).map(|rest| format!("~{rest}")))
+            .unwrap_or(parent)
+    });
+    let mut repository = vec![
+        label("⌂", "Repository"),
+        Span::styled(name, theme.text.add_modifier(Modifier::BOLD)),
+    ];
+    if let Some(location) = location {
+        repository.push(Span::styled(format!("  {location}"), theme.muted));
+    }
+    rows.push(labeled(repository));
+    if let Ok(status) = repo.status() {
+        rows.extend(status_summary(&status, theme));
+    }
+    if let Some(last) = repo
+        .log(&LogQuery {
+            limit: 1,
+            ..LogQuery::default()
+        })
+        .ok()
+        .and_then(|commits| commits.into_iter().next())
+    {
+        rows.push(labeled(vec![
+            label("●", "Last commit"),
+            Span::styled(last.short_oid.clone(), theme.sha),
+            Span::styled(format!(" {}", last.summary), theme.text),
+            Span::styled(
+                format!(
+                    "  {} · {}",
+                    last.author_name,
+                    format_time(last.commit_time, cx.relative_dates)
+                ),
+                theme.muted,
+            ),
+        ]));
+    }
+    let operation = repo.operation();
+    if operation != RepoOperation::None {
+        rows.push(labeled(vec![
+            label("⚠", "In progress"),
+            Span::styled(
+                operation.label().to_uppercase(),
+                theme.warning.add_modifier(Modifier::BOLD),
+            ),
+        ]));
+    }
     rows
 }
 

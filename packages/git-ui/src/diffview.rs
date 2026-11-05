@@ -56,9 +56,21 @@ pub struct DiffRow {
     /// Leading spans that form the gutter (line numbers and sign); wrapped continuation rows
     /// repeat them as blank padding so content stays aligned.
     pub gutter_spans: usize,
+    /// Whether the row may wrap. Art is kept whole and clipped at the edge instead.
+    pub wrap: bool,
+    /// Narrower rendering of a fixed row, used when `line` does not fit the view.
+    pub compact: Option<Line>,
 }
 
 impl DiffRow {
+    /// Row that never wraps (clipped at the edge), for fixed-width art.
+    #[must_use]
+    pub const fn fixed(line: Line) -> Self {
+        let mut row = Self::info(line);
+        row.wrap = false;
+        row
+    }
+
     /// Plain informational row.
     #[must_use]
     pub const fn info(line: Line) -> Self {
@@ -70,6 +82,8 @@ impl DiffRow {
             id: None,
             new_line: None,
             gutter_spans: 0,
+            wrap: true,
+            compact: None,
         }
     }
 }
@@ -190,7 +204,6 @@ pub fn present_file(
                 DiffLineKind::Context => RowKind::Context,
             };
             rows.push(DiffRow {
-                line: Line::from_spans(row),
                 kind,
                 file: Some(file_index),
                 hunk: Some(hunk_index),
@@ -200,6 +213,7 @@ pub fn present_file(
                 }),
                 new_line: line.new_line.or(line.old_line),
                 gutter_spans: 2,
+                ..DiffRow::info(Line::from_spans(row))
             });
         }
     }
@@ -302,6 +316,8 @@ fn file_header(file_index: usize, file: &DiffFile, theme: &GitTheme) -> DiffRow 
         id: None,
         new_line: None,
         gutter_spans: 0,
+        wrap: true,
+        compact: None,
     }
 }
 
@@ -324,6 +340,8 @@ fn hunk_header(file_index: usize, hunk_index: usize, hunk: &DiffHunk, theme: &Gi
         id: None,
         new_line: Some(hunk.new_start),
         gutter_spans: 0,
+        wrap: true,
+        compact: None,
     }
 }
 

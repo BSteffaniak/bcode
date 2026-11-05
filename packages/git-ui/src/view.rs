@@ -33,7 +33,8 @@ use crate::popup::Popup;
 pub struct Frame {
     side: Vec<(Window, View, Vec<SelectableListItem>)>,
     main: Vec<Vec<SelectableListItem>>,
-    main_gutters: Vec<Vec<usize>>,
+    main_gutters: Vec<Vec<Option<usize>>>,
+    main_compact: Vec<Vec<Option<Line>>>,
     log: Vec<SelectableListItem>,
     popup: Vec<SelectableListItem>,
     side_panes: Vec<Cell<PaneState>>,
@@ -78,7 +79,13 @@ impl Frame {
                 app.main
                     .as_ref()
                     .and_then(|main| main.sections.get(section))
-                    .map(|section| section.rows.iter().map(|row| row.gutter_spans).collect())
+                    .map(|section| {
+                        section
+                            .rows
+                            .iter()
+                            .map(|row| row.wrap.then_some(row.gutter_spans))
+                            .collect()
+                    })
                     .unwrap_or_default()
             })
             .collect();
@@ -107,9 +114,19 @@ impl Frame {
             })
             .collect();
         let popup = popup_items(app);
+        let main_compact = (0..2)
+            .map(|section| {
+                app.main
+                    .as_ref()
+                    .and_then(|main| main.sections.get(section))
+                    .map(|section| section.rows.iter().map(|row| row.compact.clone()).collect())
+                    .unwrap_or_default()
+            })
+            .collect();
         Self {
             main,
             main_gutters,
+            main_compact,
             log,
             popup,
             side_panes: side.iter().map(|_| pane_state()).collect(),
@@ -520,11 +537,13 @@ impl bmux_tui::component::Component for Revealed<'_, '_> {
 
 /// A main-view list whose rows wrap to the width layout gives it. Each source row stays one
 /// selectable item (so staging selections and hit regions keep their row identity); its gutter
-/// spans start the first visual row and become blank padding on the continuation rows.
+/// spans start the first visual row and become blank padding on the continuation rows. Rows
+/// without a gutter entry are fixed and clipped instead.
 struct WrappedList<'a> {
     id: String,
     source: &'a [SelectableListItem],
-    gutters: &'a [usize],
+    gutters: &'a [Option<usize>],
+    compact: &'a [Option<Line>],
     state: &'a Cell<SelectableListState>,
     policy: SelectableListPolicy,
     styles: SelectableListStyles,
@@ -542,7 +561,10 @@ impl WrappedList<'_> {
                 .iter()
                 .enumerate()
                 .map(|(index, item)| {
-                    wrap_item(item, self.gutters.get(index).copied().unwrap_or(0), columns)
+                    self.gutters.get(index).copied().flatten().map_or_else(
+                        || fit_fixed(item, self.compact.get(index).cloned().flatten(), columns),
+                        |gutter| wrap_item(item, gutter, columns),
+                    )
                 })
                 .collect();
             *cache = Some((width, items));
@@ -582,6 +604,23 @@ impl bmux_tui::component::Component for WrappedList<'_> {
 
     fn revision(&self) -> bmux_tui::component::ComponentRevision {
         self.component(self.source).revision()
+    }
+}
+
+/// A fixed row as is when it fits `width`, else its compact rendering (clipped if needed).
+fn fit_fixed(item: &SelectableListItem, compact: Option<Line>, width: usize) -> SelectableListItem {
+    use bmux_tui::text_width::display_width;
+
+    let fits = item.lines.iter().all(|line| {
+        line.spans
+            .iter()
+            .map(|span| display_width(&span.content))
+            .sum::<usize>()
+            <= width
+    });
+    match compact {
+        Some(compact) if !fits => SelectableListItem::rich(item.id.clone(), compact),
+        _ => item.clone(),
     }
 }
 
@@ -923,13 +962,19 @@ fn main_column<'a>(app: &'a App, frame: &'a Frame) -> Element<'a> {
                 theme.muted,
             ));
         }
-        let cursor = Some(app.main_cursor[section]);
+        // The repository overview is not interactive, so it shows no cursor row.
+        let overview = matches!(
+            app.main.as_ref().map(|main| &main.request),
+            Some(crate::data::MainRequest::Status)
+        );
+        let cursor = (!overview).then(|| app.main_cursor[section]);
         let content = if app.config.diff.wrap_lines {
             let (policy, styles) = list_policy(app, &app.main_lists[section], cursor, focused);
             Element::new(WrappedList {
                 id: format!("main-{section}"),
                 source: &frame.main[section],
                 gutters: &frame.main_gutters[section],
+                compact: &frame.main_compact[section],
                 state: &app.main_lists[section],
                 policy,
                 styles,
