@@ -173,6 +173,15 @@ actions! {
     DiffContextMore => Global, "diff-context-more", "More diff context", ["}"];
     DiffContextLess => Global, "diff-context-less", "Less diff context", ["{"];
     DiffingMenu => Global, "diffing-menu", "Diff against selection", ["shift+w"];
+    PanelWider => Global, "panel-wider", "Widen the side column", ["ctrl+w >"];
+    PanelNarrower => Global, "panel-narrower", "Narrow the side column", ["ctrl+w <"];
+    PanelTaller => Global, "panel-taller", "Make the focused panel taller", ["ctrl+w +"];
+    PanelShorter => Global, "panel-shorter", "Make the focused panel shorter", ["ctrl+w -"];
+    PanelCollapse => Global, "panel-collapse", "Collapse / expand the focused window", ["ctrl+w z"];
+    PanelClose => Global, "panel-close", "Close the focused window", ["ctrl+w c"];
+    PanelMaximize => Global, "panel-maximize", "Maximize / restore the focused panel", ["ctrl+w o"];
+    PanelReset => Global, "panel-reset", "Reset the panel layout", ["ctrl+w ="];
+    LayoutMenu => Global, "layout-menu", "Layout menu (reopen closed windows)", ["ctrl+w r"];
     ShellCommand => Global, "shell-command", "Run shell command", [":"];
     CommandLog => Global, "command-log", "Toggle command log", ["@"];
 

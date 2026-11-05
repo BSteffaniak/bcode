@@ -29,6 +29,8 @@ pub struct RunOptions {
     /// Message for the first commit editor of the session; the binaries pass
     /// `$BCODE_GIT_COMMIT_MSG` (see [`commit_message_from_env`]).
     pub commit_message: Option<String>,
+    /// Where panel layouts are remembered; `None` uses the default state directory.
+    pub state_dir: Option<PathBuf>,
 }
 
 /// Environment variable holding a commit message to prefill.
@@ -135,6 +137,16 @@ pub fn build_app(options: RunOptions) -> Result<App, RunError> {
     diagnostics.extend(theme_error);
     let mut app = App::new(repo, loaded.ui, keymap, theme, options.host, diagnostics);
     app.env_message = options.commit_message;
+    // Layouts are remembered for the directory the client was started in.
+    if app.config.layout.remember {
+        let launch = std::path::absolute(&options.path).unwrap_or_else(|_| options.path.clone());
+        let store = options
+            .state_dir
+            .or_else(crate::panels::default_store_dir)
+            .map(|dir| crate::panels::store_file(&dir, &launch));
+        app.panels = crate::panels::Panels::new(&app.config.layout, &app.layout.windows, store);
+        app.sync_panels();
+    }
     // Includes problems found while resolving the layout and commit settings.
     if let Some(first) = app.diagnostics.first().cloned() {
         app.toast(first, true);
@@ -152,6 +164,16 @@ fn paint(app: &mut App, cx: &mut bmux_tui::paint::PaintCx<'_, '_>) {
         &mut LayoutCx::default(),
     );
     root.paint(&layout, cx);
+    // Pointer input reaches panel dividers through the areas this frame placed them in.
+    let placed = bmux_tui::component::EventCx::new(&layout);
+    *app.panels.areas.borrow_mut() = crate::panels::GROUPS
+        .iter()
+        .filter_map(|id| {
+            placed
+                .find_visible_rect(&bmux_tui::component::LayoutId::new(*id))
+                .map(|area| (*id, area))
+        })
+        .collect();
 }
 
 fn commit(app: &mut App, hits: &bmux_tui::hit::HitMap, _focus: &bmux_tui::focus::FocusTrap) {

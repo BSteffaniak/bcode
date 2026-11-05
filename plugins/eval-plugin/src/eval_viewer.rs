@@ -3129,7 +3129,8 @@ impl PluginTuiSurface for EvalGenerationDetailSurface {
             event,
         ) {
             TabBarOutcome::Selected(_) | TabBarOutcome::Redraw => return PluginTuiAction::Redraw,
-            TabBarOutcome::Ignored => {}
+            // These tab bars have no close buttons.
+            TabBarOutcome::Ignored | TabBarOutcome::Close(_) => {}
         }
         match themed_action_row(&generation_detail_actions()).handle_event(
             self.action_area,
@@ -3413,7 +3414,8 @@ impl PluginTuiSurface for EvalRunViewerSurface {
             event,
         ) {
             TabBarOutcome::Selected(_) | TabBarOutcome::Redraw => return PluginTuiAction::Redraw,
-            TabBarOutcome::Ignored => {}
+            // These tab bars have no close buttons.
+            TabBarOutcome::Ignored | TabBarOutcome::Close(_) => {}
         }
         if self.handle_selected_table_event(event) {
             return PluginTuiAction::Redraw;

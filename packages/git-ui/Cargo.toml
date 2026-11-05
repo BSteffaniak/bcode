@@ -23,6 +23,7 @@ bmux_tui = { workspace = true, features = ["crossterm"] }
 bmux_tui_components = { workspace = true, features = [
     "modal-frame",
     "pane",
+    "panel-group",
     "scroll-view",
     "selectable-list",
     "text-input",

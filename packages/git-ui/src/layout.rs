@@ -106,6 +106,16 @@ impl Layout {
     }
 }
 
+/// Configuration name of a placeable view (`"files"`, `"commits"`, …); other views use their
+/// label.
+#[must_use]
+pub fn view_name(view: View) -> &'static str {
+    PLACEABLE
+        .iter()
+        .find(|(_, candidate)| *candidate == view)
+        .map_or_else(|| view.label(), |(name, _)| *name)
+}
+
 fn view_named(name: &str) -> Option<View> {
     PLACEABLE
         .iter()

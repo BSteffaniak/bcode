@@ -168,6 +168,11 @@ pub struct LayoutConfig {
     pub command_log: CommandLogConfig,
     /// Show the bottom key-hint bar. When hidden, it still appears for progress and messages.
     pub status_bar: bool,
+    /// Side windows that start collapsed to their title, by any of their view names.
+    pub collapsed: Vec<String>,
+    /// Remember panel sizes, collapsed and closed windows per launch directory (in
+    /// `$XDG_STATE_HOME/bcode-git/layouts`). The configuration is the starting point.
+    pub remember: bool,
 }
 
 impl Default for LayoutConfig {
@@ -196,6 +201,8 @@ impl Default for LayoutConfig {
             portrait_below_width: 84,
             command_log: CommandLogConfig::default(),
             status_bar: true,
+            collapsed: Vec::new(),
+            remember: true,
         }
     }
 }

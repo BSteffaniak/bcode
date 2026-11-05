@@ -2737,7 +2737,8 @@ impl WorkflowStatusSurface {
                     return PluginTuiAction::Redraw;
                 }
                 TabBarOutcome::Redraw => return PluginTuiAction::Redraw,
-                TabBarOutcome::Ignored => {}
+                // These tab bars have no close buttons.
+                TabBarOutcome::Ignored | TabBarOutcome::Close(_) => {}
             }
         }
         let pane_area = match self.workspace_focus {
@@ -2837,7 +2838,8 @@ impl WorkflowStatusSurface {
                     return PluginTuiAction::Redraw;
                 }
                 TabBarOutcome::Redraw => return PluginTuiAction::Redraw,
-                TabBarOutcome::Ignored => {}
+                // These tab bars have no close buttons.
+                TabBarOutcome::Ignored | TabBarOutcome::Close(_) => {}
             }
             if self.active_detail_tab == 5 {
                 let outer_tab_height = u16::from(
@@ -2876,7 +2878,8 @@ impl WorkflowStatusSurface {
                         return PluginTuiAction::Redraw;
                     }
                     TabBarOutcome::Redraw => return PluginTuiAction::Redraw,
-                    TabBarOutcome::Ignored => {}
+                    // These tab bars have no close buttons.
+                    TabBarOutcome::Ignored | TabBarOutcome::Close(_) => {}
                 }
             }
             if let Event::Mouse(mouse) = event
@@ -3479,7 +3482,8 @@ impl WorkflowStatusSurface {
                 return PluginTuiAction::Redraw;
             }
             TabBarOutcome::Redraw => return PluginTuiAction::Redraw,
-            TabBarOutcome::Ignored => {}
+            // These tab bars have no close buttons.
+            TabBarOutcome::Ignored | TabBarOutcome::Close(_) => {}
         }
         let Some(page) = self.launch_catalog.as_ref() else {
             return PluginTuiAction::None;

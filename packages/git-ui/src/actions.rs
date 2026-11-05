@@ -212,6 +212,20 @@ impl App {
                 }
                 Update::redraw()
             }
+            Action::PanelWider | Action::PanelNarrower => self.resize_panel(
+                crate::panels::ROOT,
+                0,
+                if action == Action::PanelWider { 2 } else { -2 },
+            ),
+            Action::PanelTaller | Action::PanelShorter => {
+                let grow = action == Action::PanelTaller;
+                self.resize_focused_panel(if grow { 1 } else { -1 })
+            }
+            Action::PanelCollapse => self.toggle_collapsed(self.last_side),
+            Action::PanelClose => self.close_window(self.last_side),
+            Action::PanelMaximize => self.toggle_maximized(self.window),
+            Action::PanelReset => self.reset_layout(),
+            Action::LayoutMenu => self.layout_menu(),
             Action::Help => self.help(),
             Action::Palette => self.palette(),
             Action::Refresh => Update::redraw().maybe(self.refresh()),
@@ -1089,6 +1103,84 @@ impl App {
                 true,
             );
         }
+    }
+
+    /// Grow (positive) or shrink the focused panel along its column.
+    fn resize_focused_panel(&mut self, delta: i32) -> Update<Msg> {
+        match self.window {
+            Window::Side(index) => {
+                let Some(position) = self.panels.position(index) else {
+                    return Update::none();
+                };
+                // Move the divider below the window, or above it for the last one.
+                if position + 1 < self.panels.visible.len() {
+                    self.resize_panel(crate::panels::SIDE, position, delta)
+                } else if position > 0 {
+                    self.resize_panel(crate::panels::SIDE, position - 1, -delta)
+                } else {
+                    Update::none()
+                }
+            }
+            Window::Main if self.command_log => self.resize_panel(crate::panels::MAIN, 0, delta),
+            Window::Main => Update::none(),
+        }
+    }
+
+    /// Layout actions, including reopening closed side windows.
+    fn layout_menu(&mut self) -> Update<Msg> {
+        let window = self.last_side;
+        let name = |app: &Self, index: usize| {
+            app.layout.windows[index]
+                .iter()
+                .map(|view| view.label())
+                .collect::<Vec<_>>()
+                .join(" · ")
+        };
+        let Window::Side(focused) = window else {
+            return Update::none();
+        };
+        let collapsed = self.panels.collapsed.contains(&focused);
+        let mut items = vec![
+            MenuItem::new(
+                'z',
+                format!(
+                    "{} {}",
+                    if collapsed { "Expand" } else { "Collapse" },
+                    name(self, focused)
+                ),
+                Then::Action(Action::PanelCollapse),
+            ),
+            MenuItem::new(
+                'o',
+                if self.screen_mode == ScreenMode::Full {
+                    "Restore panels".to_owned()
+                } else {
+                    "Maximize the focused panel".to_owned()
+                },
+                Then::Action(Action::PanelMaximize),
+            ),
+            MenuItem::new(
+                'c',
+                format!("Close {}", name(self, focused)),
+                Then::Action(Action::PanelClose),
+            ),
+        ];
+        for (number, index) in self.panels.closed.clone().into_iter().enumerate() {
+            let label = format!("Show {}", name(self, index));
+            let then = Then::Layout(crate::panels::LayoutCommand::Reopen(index));
+            items.push(
+                match char::from_digit(u32::try_from(number + 1).unwrap_or(0), 10) {
+                    Some(digit) if number < 9 => MenuItem::new(digit, label, then),
+                    _ => MenuItem::plain(label, "", then),
+                },
+            );
+        }
+        items.push(MenuItem::new(
+            '=',
+            "Reset layout",
+            Then::Layout(crate::panels::LayoutCommand::Reset),
+        ));
+        self.open(Popup::Menu(Menu::new("Layout", items)))
     }
 
     fn focus_named(&mut self, view: View) -> Update<Msg> {

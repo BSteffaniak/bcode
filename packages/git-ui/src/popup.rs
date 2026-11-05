@@ -35,6 +35,8 @@ pub enum Then {
     },
     /// Launch an external program with the terminal attached.
     External(External),
+    /// Change the panel layout.
+    Layout(crate::panels::LayoutCommand),
     /// Close without doing anything.
     Nothing,
 }

@@ -31,8 +31,10 @@ use crate::host::GitUiHost;
 use crate::keymap::{Action, Keymap, Resolution, Scope};
 use crate::layout::{Layout, Start};
 use crate::ops::{self, HeadPosition, Op};
+use crate::panels::{PanelView, Panels};
 use crate::popup::{External, Popup, Prompt, PromptKind, Then};
 use crate::theme::GitTheme;
+use bmux_text_edit::pointer::{ClickPolicy, ClickTracker};
 
 /// Top-level focus target.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -301,6 +303,8 @@ pub struct App {
     pub(crate) file_tree: bool,
 
     pub(crate) layout: Layout,
+    pub(crate) panels: Panels,
+    pub(crate) clicks: ClickTracker,
     pub(crate) commit_sources: Vec<CommitMessageSource>,
     pub(crate) env_message: Option<String>,
     pub(crate) window: Window,
@@ -380,6 +384,7 @@ impl App {
         let screen_mode = config.layout.screen_mode;
         let command_log = config.layout.command_log.show;
         let start = layout.start;
+        let panels = Panels::new(&config.layout, &layout.windows, None);
         let mut app = Self {
             repo,
             config,
@@ -396,6 +401,8 @@ impl App {
             collapsed: BTreeSet::new(),
             file_tree,
             layout,
+            panels,
+            clicks: ClickTracker::new(),
             commit_sources,
             env_message: None,
             window: Window::Side(0),
@@ -458,6 +465,7 @@ impl App {
                 app.window = Window::Main;
             }
         }
+        app.sync_panels();
         app
     }
 
@@ -1087,6 +1095,11 @@ impl App {
                 then: *then,
             })),
             Then::External(external) => self.launch(external),
+            Then::Layout(crate::panels::LayoutCommand::Reopen(index)) => {
+                self.focus(Window::Side(index));
+                Update::redraw().maybe(self.sync_main(false))
+            }
+            Then::Layout(crate::panels::LayoutCommand::Reset) => self.reset_layout(),
             Then::Nothing => Update::redraw(),
         }
     }
@@ -1347,6 +1360,9 @@ impl App {
         if !self.popups.is_empty() {
             return Update::none();
         }
+        if let Some(update) = self.route_dividers(event) {
+            return update;
+        }
         let id = {
             let hits = self.hits.borrow();
             hits.hit_test(Point::new(mouse.position.x, mouse.position.y))
@@ -1355,6 +1371,11 @@ impl App {
         let Some(id) = id else {
             return Update::none();
         };
+        if mouse.kind == MouseEventKind::Down(MouseButton::Left)
+            && let Some(update) = self.chrome_click(&id, mouse.position)
+        {
+            return update;
+        }
         let (window, item) = parse_hit(&id);
         let Some(window) = window else {
             return Update::none();
@@ -1405,7 +1426,220 @@ impl App {
         }
     }
 
+    /// Bring the panel layout in line with windows, focus, screen mode and command log.
+    pub(crate) fn sync_panels(&mut self) {
+        let focused = match (self.window, self.last_side) {
+            (Window::Side(index), _) | (Window::Main, Window::Side(index)) => Some(index),
+            _ => None,
+        };
+        let view = PanelView {
+            config: &self.config.layout,
+            windows: &self.layout.windows,
+            focused,
+            screen_mode: self.screen_mode,
+            command_log: self.command_log,
+        };
+        self.panels.sync(&view);
+    }
+
+    /// Save the panel layout for the launch directory.
+    pub(crate) fn save_layout(&mut self) {
+        self.panels.save(&self.layout.windows);
+    }
+
+    /// The group and state behind a panel group id.
+    pub(crate) fn panel_group(
+        &self,
+        id: &str,
+    ) -> (
+        bmux_tui_components::panel_group::PanelGroup,
+        &std::cell::RefCell<bmux_tui_components::panel_group::PanelGroupState>,
+    ) {
+        use bmux_tui_components::panel_group::PanelGroupAxis;
+        let (axis, state) = match id {
+            crate::panels::ROOT => (
+                crate::view::root_axis(self),
+                self.panels.root_for(self.screen_mode),
+            ),
+            crate::panels::MAIN => (PanelGroupAxis::Vertical, &self.panels.main),
+            crate::panels::SECTIONS => (crate::view::sections_axis(self), &self.panels.sections),
+            _ => (PanelGroupAxis::Vertical, &self.panels.side),
+        };
+        (crate::panels::group(axis, &self.theme), state)
+    }
+
+    /// Offer pointer input to the panel dividers: an ongoing drag first, then each group from
+    /// the innermost out. Returns the update when a divider took the event.
+    fn route_dividers(&mut self, event: &Event) -> Option<Update<Msg>> {
+        use bmux_tui_components::panel_group::PanelGroupOutcome;
+        let areas = self.panels.areas.borrow().clone();
+        let dragging = crate::panels::GROUPS
+            .into_iter()
+            .find(|id| self.panel_group(id).1.borrow().active_divider().is_some());
+        let candidates: Vec<&'static str> =
+            dragging.map_or_else(|| crate::panels::GROUPS.to_vec(), |id| vec![id]);
+        let mut redraw = false;
+        for id in candidates {
+            let Some(area) = areas.get(id).copied() else {
+                continue;
+            };
+            let (group, state) = self.panel_group(id);
+            let outcome = group.handle_event(area, &mut state.borrow_mut(), event);
+            match outcome {
+                PanelGroupOutcome::Ignored => {}
+                PanelGroupOutcome::Resized { .. } => {
+                    self.panels.resized(id);
+                    return Some(Update::redraw());
+                }
+                PanelGroupOutcome::DividerDragEnded { .. } => {
+                    self.save_layout();
+                    return Some(Update::redraw());
+                }
+                PanelGroupOutcome::DividerDragStarted { .. } => return Some(Update::redraw()),
+                // Hover changes: every group updates its own hover state.
+                PanelGroupOutcome::Redraw
+                | PanelGroupOutcome::Handled
+                | PanelGroupOutcome::Focused { .. } => redraw = true,
+            }
+        }
+        redraw.then(Update::redraw)
+    }
+
+    /// Clicks on pane titles and their buttons. A double click on a title maximizes the pane.
+    fn chrome_click(&mut self, id: &str, position: Point) -> Option<Update<Msg>> {
+        let (pane, part) = id.split_once('.')?;
+        let window = if pane == "pane-main" || pane.starts_with("pane-main-") {
+            if let Some(section) = pane.strip_prefix("pane-main-").and_then(|n| n.parse().ok()) {
+                self.main_section = section;
+            }
+            Window::Main
+        } else if pane == "pane-log" {
+            return (part == "action.close").then(|| {
+                self.command_log = false;
+                Update::redraw()
+            });
+        } else {
+            let number: usize = pane.strip_prefix("pane-")?.parse().ok()?;
+            Window::Side(number.checked_sub(1)?)
+        };
+        match part {
+            "title" => {
+                let clicks = self.clicks.register(
+                    position.x,
+                    position.y,
+                    Instant::now(),
+                    &ClickPolicy::with_max_count(2),
+                );
+                self.focus(window);
+                if clicks >= 2 {
+                    self.clicks.reset();
+                    return Some(self.toggle_maximized(window));
+                }
+                Some(Update::redraw().maybe(self.sync_main(false)))
+            }
+            "action.maximize" => Some(self.toggle_maximized(window)),
+            "action.collapse" => Some(self.toggle_collapsed(window)),
+            "action.close" => Some(self.close_window(window)),
+            _ => None,
+        }
+    }
+
+    /// Fill the screen with a window, or return to the configured screen mode.
+    pub(crate) fn toggle_maximized(&mut self, window: Window) -> Update<Msg> {
+        self.focus(window);
+        self.screen_mode = if self.screen_mode == ScreenMode::Full {
+            self.config.layout.screen_mode
+        } else {
+            ScreenMode::Full
+        };
+        Update::redraw()
+    }
+
+    /// Collapse a side window to its title, or expand it again.
+    pub(crate) fn toggle_collapsed(&mut self, window: Window) -> Update<Msg> {
+        let Window::Side(index) = window else {
+            return Update::none();
+        };
+        // In half mode, unfocused windows are collapsed by the mode: show the window instead.
+        if self.screen_mode == ScreenMode::Half && !self.panels.collapsed.contains(&index) {
+            self.focus(window);
+            if self.window == window && self.panels.is_collapsed(index) {
+                return Update::redraw();
+            }
+        }
+        if !self.panels.collapsed.remove(&index) {
+            self.panels.collapsed.insert(index);
+        }
+        self.sync_panels();
+        self.save_layout();
+        Update::redraw()
+    }
+
+    /// Close a side window until it is reopened from the layout menu or focused by number.
+    pub(crate) fn close_window(&mut self, window: Window) -> Update<Msg> {
+        let Window::Side(index) = window else {
+            return Update::none();
+        };
+        let open = self.layout.windows.len() - self.panels.closed.len();
+        if open <= 1 {
+            self.toast("The last side window cannot be closed", true);
+            return Update::redraw();
+        }
+        self.panels.closed.insert(index);
+        if self.last_side == window
+            && let Some(next) =
+                (0..self.layout.windows.len()).find(|other| !self.panels.closed.contains(other))
+        {
+            self.focus(Window::Side(next));
+        }
+        self.sync_panels();
+        self.save_layout();
+        Update::redraw().maybe(self.sync_main(false))
+    }
+
+    /// Move a divider of a panel group by `delta` cells and remember the result.
+    pub(crate) fn resize_panel(
+        &mut self,
+        id: &'static str,
+        divider: usize,
+        delta: i32,
+    ) -> Update<Msg> {
+        let Some(area) = self.panels.areas.borrow().get(id).copied() else {
+            return Update::none();
+        };
+        let (group, state) = self.panel_group(id);
+        let outcome = group.resize_divider(area, &mut state.borrow_mut(), divider, delta);
+        if matches!(
+            outcome,
+            bmux_tui_components::panel_group::PanelGroupOutcome::Resized { .. }
+        ) {
+            self.panels.resized(id);
+            self.save_layout();
+        }
+        Update::redraw()
+    }
+
+    /// Restore the configured layout and forget the remembered one.
+    pub(crate) fn reset_layout(&mut self) -> Update<Msg> {
+        self.panels.reset(&self.config.layout, &self.layout.windows);
+        self.screen_mode = self.config.layout.screen_mode;
+        self.sync_panels();
+        self.toast("Layout reset", false);
+        Update::redraw()
+    }
+
+    /// Show a closed side window again.
+    pub(crate) fn reopen_window(&mut self, index: usize) {
+        if self.panels.closed.remove(&index) {
+            self.sync_panels();
+            self.save_layout();
+        }
+    }
+
     pub(crate) fn focus(&mut self, window: Window) {
+        if let Window::Side(index) = window {
+            self.reopen_window(index);
+        }
         if window != Window::Main {
             self.last_side = window;
             self.staging = None;
@@ -1831,6 +2065,7 @@ impl Program for App {
     fn update(&mut self, event: RuntimeEvent<Msg>) -> Result<Update<Msg>, String> {
         let watching_sources = self.commit_editor().is_some();
         let update = self.handle(event);
+        self.sync_panels();
         // Watch prefill sources exactly while a commit editor is open.
         let update = match (watching_sources, self.commit_editor().is_some()) {
             (false, true) => update.with_subscription(crate::commit_message::subscription(

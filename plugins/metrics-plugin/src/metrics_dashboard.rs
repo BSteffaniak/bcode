@@ -505,7 +505,8 @@ impl MetricsDashboardSurface {
             .handle_event(self.tab_area, &mut self.tab_state, event)
         {
             TabBarOutcome::Selected(_) | TabBarOutcome::Redraw => return PluginTuiAction::Redraw,
-            TabBarOutcome::Ignored => {}
+            // These tab bars have no close buttons.
+            TabBarOutcome::Ignored | TabBarOutcome::Close(_) => {}
         }
         if self.handle_tables(event) {
             return PluginTuiAction::Redraw;
@@ -702,7 +703,8 @@ impl PluginTuiSurface for MetricsDashboardSurface {
             .handle_event(self.tab_area, &mut self.tab_state, event)
         {
             TabBarOutcome::Selected(_) | TabBarOutcome::Redraw => return PluginTuiAction::Redraw,
-            TabBarOutcome::Ignored => {}
+            // These tab bars have no close buttons.
+            TabBarOutcome::Ignored | TabBarOutcome::Close(_) => {}
         }
         if self.handle_tables(event) {
             return PluginTuiAction::Redraw;

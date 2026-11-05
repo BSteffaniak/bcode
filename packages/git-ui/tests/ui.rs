@@ -28,6 +28,7 @@ fn git(cwd: &Path, args: &[&str]) -> String {
 
 struct Harness {
     dir: TempDir,
+    state: TempDir,
     app: App,
 }
 
@@ -54,17 +55,70 @@ impl Harness {
         setup(path);
         config.ui.refresh.watch = false;
         config.ui.refresh.poll_seconds = 0;
-        let mut app = build_app(RunOptions {
-            path: path.to_owned(),
-            config,
-            host: Arc::new(bcode_git_ui::host::StandaloneHost),
-            commit_message,
-        })
-        .unwrap();
-        app.set_inline(true);
-        let mut harness = Self { dir, app };
+        let state = tempfile::tempdir().unwrap();
+        let app = launch(path, config, commit_message, state.path());
+        let mut harness = Self { dir, state, app };
         harness.send(RuntimeEvent::Message(bcode_git_ui::app::Msg::Watch));
         harness
+    }
+
+    /// Start the client again from `cwd` (inside the same repository), with the same
+    /// remembered state.
+    fn relaunch_in(&mut self, cwd: &Path) {
+        let mut config = LoadedConfig::default();
+        config.ui.refresh.watch = false;
+        config.ui.refresh.poll_seconds = 0;
+        self.app = launch(cwd, config, None, self.state.path());
+        self.send(RuntimeEvent::Message(bcode_git_ui::app::Msg::Watch));
+    }
+
+    fn relaunch(&mut self) {
+        let path = self.dir.path().to_owned();
+        self.relaunch_in(&path);
+    }
+
+    fn region(&self, id: &str) -> bmux_tui::geometry::Rect {
+        self.app
+            .hit_regions()
+            .into_iter()
+            .find(|(candidate, _)| candidate == id)
+            .map(|(_, area)| area)
+            .unwrap_or_else(|| panic!("no region {id}"))
+    }
+
+    fn mouse(&mut self, kind: bmux_tui::event::MouseEventKind, x: u16, y: u16) {
+        self.send(RuntimeEvent::Terminal(Event::Mouse(
+            bmux_tui::event::MouseEvent::new(kind, bmux_tui::geometry::Point::new(x, y)),
+        )));
+    }
+
+    fn click(&mut self, id: &str) {
+        let area = self.region(id);
+        self.mouse(
+            bmux_tui::event::MouseEventKind::Down(bmux_tui::event::MouseButton::Left),
+            area.x,
+            area.y,
+        );
+        self.mouse(
+            bmux_tui::event::MouseEventKind::Up(bmux_tui::event::MouseButton::Left),
+            area.x,
+            area.y,
+        );
+    }
+
+    /// Drag the handle with this hit id by `dx`, `dy` cells.
+    fn drag(&mut self, id: &str, dx: i32, dy: i32) {
+        use bmux_tui::event::{MouseButton, MouseEventKind};
+        let area = self.region(id);
+        let (x, y) = (area.x, area.y);
+        let to = |value: u16, delta: i32| u16::try_from(i32::from(value) + delta).unwrap();
+        self.mouse(MouseEventKind::Down(MouseButton::Left), x, y);
+        self.mouse(
+            MouseEventKind::Drag(MouseButton::Left),
+            to(x, dx),
+            to(y, dy),
+        );
+        self.mouse(MouseEventKind::Up(MouseButton::Left), to(x, dx), to(y, dy));
     }
 
     fn path(&self) -> &Path {
@@ -102,6 +156,19 @@ impl Harness {
             .map(str::to_owned)
             .collect()
     }
+}
+
+fn launch(path: &Path, config: LoadedConfig, commit_message: Option<String>, state: &Path) -> App {
+    let mut app = build_app(RunOptions {
+        path: path.to_owned(),
+        config,
+        host: Arc::new(bcode_git_ui::host::StandaloneHost),
+        commit_message,
+        state_dir: Some(state.to_owned()),
+    })
+    .unwrap();
+    app.set_inline(true);
+    app
 }
 
 fn commit(path: &Path, file: &str, content: &str, message: &str) {
@@ -543,7 +610,7 @@ fn half_mode_shows_one_side_window_beside_the_changes() {
         .app
         .hit_regions()
         .into_iter()
-        .find(|(id, _)| id.starts_with("side-4."))
+        .find(|(id, _)| id == "pane-4.title")
         .map(|(_, area)| area)
         .expect("collapsed commits title is clickable");
     harness.send(RuntimeEvent::Terminal(Event::Mouse(MouseEvent::new(
@@ -1134,4 +1201,148 @@ fn overview_logo_fits_its_width_and_never_wraps() {
         buffer.get(Point::new(x, logo)).unwrap().style.bg,
         buffer.get(Point::new(x, blank)).unwrap().style.bg
     );
+}
+
+fn panel_repo(path: &Path) {
+    commit(path, "a.txt", "a\n", "first commit");
+    std::fs::write(path.join("a.txt"), "changed\n").unwrap();
+}
+
+/// Column where the main column's border starts on the first screen row.
+fn main_column_x(screen: &str) -> usize {
+    let row = line_with(screen, "Unstaged changes");
+    row.chars()
+        .position(|ch| ch == '┌')
+        .and_then(|first| {
+            row.chars()
+                .skip(first + 1)
+                .position(|ch| ch == '┌')
+                .map(|offset| first + 1 + offset)
+        })
+        .expect("two panes on the row")
+}
+
+#[test]
+fn dragging_dividers_resizes_panels_and_is_remembered_per_directory() {
+    let mut harness = Harness::new(panel_repo);
+    let before = main_column_x(&harness.screen(120, 30));
+    harness.drag("panels.root.divider.0", 10, 0);
+    let after = main_column_x(&harness.screen(120, 30));
+    assert_eq!(after, before + 10);
+
+    // A side divider: files gives three rows to branches.
+    let files_height = |screen: &str| {
+        let lines: Vec<&str> = screen.lines().collect();
+        let top = lines
+            .iter()
+            .position(|line| line.contains("[2] Files"))
+            .unwrap();
+        let next = lines
+            .iter()
+            .position(|line| line.contains("[3] Local"))
+            .unwrap();
+        next - top
+    };
+    let screen = harness.screen(120, 30);
+    let files = files_height(&screen);
+    harness.drag("panels.side.divider.1", 0, -3);
+    assert_eq!(files_height(&harness.screen(120, 30)), files - 3);
+
+    // Started again in the same directory: the same layout.
+    harness.relaunch();
+    let screen = harness.screen(120, 30);
+    assert_eq!(main_column_x(&screen), after);
+    assert_eq!(files_height(&screen), files - 3);
+
+    // Started from another directory: that directory's own (default) layout.
+    let sub = harness.path().join("sub");
+    std::fs::create_dir_all(&sub).unwrap();
+    harness.relaunch_in(&sub);
+    assert_eq!(main_column_x(&harness.screen(120, 30)), before);
+}
+
+#[test]
+fn title_buttons_collapse_close_and_reopen_windows() {
+    let mut harness = Harness::new(panel_repo);
+    harness.screen(120, 30);
+    harness.click("pane-4.action.collapse");
+    let screen = harness.screen(120, 30);
+    assert!(
+        !screen.contains("first commit  T"),
+        "commits list hidden: {screen}"
+    );
+    assert!(line_with(&screen, "[4] Commits").contains('▸'), "{screen}");
+
+    harness.click("pane-5.action.close");
+    let screen = harness.screen(120, 30);
+    assert!(!screen.contains("[5] Stash"), "{screen}");
+
+    // Both survive a restart.
+    harness.relaunch();
+    let screen = harness.screen(120, 30);
+    assert!(!screen.contains("[5] Stash"), "{screen}");
+    assert!(line_with(&screen, "[4] Commits").contains('▸'), "{screen}");
+
+    // The layout menu reopens the closed window; the expand button restores commits.
+    harness.keys(&["ctrl+w", "r"]);
+    let screen = harness.screen(120, 30);
+    assert!(screen.contains("Show Stash"), "{screen}");
+    harness.keys(&["1"]);
+    harness.click("pane-4.action.collapse");
+    let screen = harness.screen(120, 30);
+    assert!(screen.contains("[5] Stash"), "{screen}");
+    assert!(screen.contains("first commit"), "{screen}");
+    // The last open window cannot be closed.
+    for number in ["2", "3", "4", "5"] {
+        harness.click(&format!("pane-{number}.action.close"));
+        harness.screen(120, 30);
+    }
+    harness.click("pane-1.action.close");
+    let screen = harness.screen(120, 30);
+    assert!(screen.contains("[1] Status"), "{screen}");
+}
+
+#[test]
+fn double_clicking_a_title_maximizes_and_restores_the_pane() {
+    let mut harness = Harness::new(panel_repo);
+    harness.screen(120, 30);
+    harness.click("pane-2.title");
+    harness.click("pane-2.title");
+    let screen = harness.screen(120, 30);
+    assert!(screen.contains("[2] Files"), "{screen}");
+    assert!(!screen.contains("[4] Commits"), "{screen}");
+    assert!(!screen.contains("Unstaged changes"), "{screen}");
+    harness.click("pane-2.title");
+    harness.click("pane-2.title");
+    let screen = harness.screen(120, 30);
+    assert!(
+        screen.contains("[4] Commits") && screen.contains("Unstaged changes"),
+        "{screen}"
+    );
+    // The main view's maximize button.
+    harness.click("pane-main-0.action.maximize");
+    let screen = harness.screen(120, 30);
+    assert!(
+        screen.contains("Unstaged changes") && !screen.contains("[2] Files"),
+        "{screen}"
+    );
+}
+
+#[test]
+fn keyboard_resizes_and_resets_the_layout() {
+    let mut harness = Harness::new(panel_repo);
+    let before = main_column_x(&harness.screen(120, 30));
+    harness.keys(&["ctrl+w", ">", "ctrl+w", ">"]);
+    let wider = main_column_x(&harness.screen(120, 30));
+    assert_eq!(wider, before + 4);
+    harness.keys(&["ctrl+w", "z"]);
+    let screen = harness.screen(120, 30);
+    assert!(line_with(&screen, "[2] Files").contains('▸'), "{screen}");
+    harness.keys(&["ctrl+w", "="]);
+    let screen = harness.screen(120, 30);
+    assert_eq!(main_column_x(&screen), before);
+    assert!(line_with(&screen, "[2] Files").contains('▾'), "{screen}");
+    // Reset also forgets the remembered layout.
+    harness.relaunch();
+    assert_eq!(main_column_x(&harness.screen(120, 30)), before);
 }

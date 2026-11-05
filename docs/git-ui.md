@@ -67,6 +67,22 @@ the screen mode:
   titles you can click (or disappear with `collapsed_windows = "hidden"`).
 * **full**: the focused window fills the screen.
 
+Every window is a panel:
+
+* **Resize** by dragging the border between two panels (the side column's right edge, or the
+  bottom edge of a side window, the main view or a staged/unstaged section); it lights up on
+  hover. `ctrl+w >`/`ctrl+w <` widen or narrow the side column and `ctrl+w +`/`ctrl+w -` grow or
+  shrink the focused panel.
+* **Title buttons**: `▾`/`▸` collapses a side window to its title row or expands it, `□`
+  maximizes, `✕` closes. Double-click a title to maximize or restore that panel. The command log
+  has its own `✕`.
+* **Closed windows** come back through the layout menu (`ctrl+w r`) or by focusing them by
+  number. `ctrl+w =` resets the layout.
+* **Remembered per directory**: sizes, collapsed and closed windows are saved for the directory
+  `bcode git` was started in (`$XDG_STATE_HOME/bcode-git/layouts`, by default
+  `~/.local/state/bcode-git/layouts`) and restored next time. The configuration is the starting
+  point; `layout.remember = false` turns saving off.
+
 Terminals narrower than 84 columns stack the side windows above the main view. Mouse clicks focus
 windows and select rows; clicking the selected row again opens it; the wheel scrolls. Every part of
 this is configurable; see [Layout settings](#layout-settings).
@@ -234,6 +250,8 @@ main_split_min_width = 180      # flexible: side by side from this terminal widt
 portrait = "auto"               # stack side windows above the main view: auto | always | never
 portrait_below_width = 84
 status_bar = true               # false hides key hints; progress and messages still show
+collapsed = []                  # side windows that start collapsed, e.g. ["stash"]
+remember = true                 # remember panel sizes and collapsed/closed windows per directory
 
 [layout.command_log]
 show = false                    # `@` toggles it
@@ -414,6 +432,15 @@ currently use `StandaloneHost`, which contributes nothing.
 | `bcode.git.global.diff-context-more` | More diff context | `}` |
 | `bcode.git.global.diff-context-less` | Less diff context | `{` |
 | `bcode.git.global.diffing-menu` | Diff against selection | `shift+w` |
+| `bcode.git.global.panel-wider` | Widen the side column | `ctrl+w >` |
+| `bcode.git.global.panel-narrower` | Narrow the side column | `ctrl+w <` |
+| `bcode.git.global.panel-taller` | Make the focused panel taller | `ctrl+w +` |
+| `bcode.git.global.panel-shorter` | Make the focused panel shorter | `ctrl+w -` |
+| `bcode.git.global.panel-collapse` | Collapse / expand the focused window | `ctrl+w z` |
+| `bcode.git.global.panel-close` | Close the focused window | `ctrl+w c` |
+| `bcode.git.global.panel-maximize` | Maximize / restore the focused panel | `ctrl+w o` |
+| `bcode.git.global.panel-reset` | Reset the panel layout | `ctrl+w =` |
+| `bcode.git.global.layout-menu` | Layout menu (reopen closed windows) | `ctrl+w r` |
 | `bcode.git.global.shell-command` | Run shell command | `:` |
 | `bcode.git.global.command-log` | Toggle command log | `@` |
 

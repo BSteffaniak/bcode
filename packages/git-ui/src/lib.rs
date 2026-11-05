@@ -21,6 +21,7 @@ pub mod keymap;
 pub mod layout;
 pub mod lazygit;
 pub mod ops;
+pub mod panels;
 pub mod popup;
 mod run;
 pub mod theme;

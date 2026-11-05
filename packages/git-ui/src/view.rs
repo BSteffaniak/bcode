@@ -11,7 +11,8 @@ use bmux_tui::text::{Line, Span, Text, TextWrap};
 use bmux_tui_components::modal_frame::{
     ModalFrame, ModalFrameComponent, ModalPlacement, ModalSizing, ModalTheme,
 };
-use bmux_tui_components::pane::{Pane, PaneComponent, PaneState, PaneStyles};
+use bmux_tui_components::pane::{Pane, PaneComponent, PaneState, PaneStyles, PaneTitleAction};
+use bmux_tui_components::panel_group::{PanelGroupAxis, PanelGroupComponent};
 use bmux_tui_components::scrollbar_layout::ScrollbarAxisLayoutMode;
 use bmux_tui_components::selectable_list::{
     SelectableListComponent, SelectableListHighlightPolicy, SelectableListItem,
@@ -24,7 +25,7 @@ use bmux_tui_components::text_input_box::{
 
 use crate::actions::head_label;
 use crate::app::{App, Row, ScreenMode, View, Window};
-use crate::config::{CollapsedWindows, MainSplit, Portrait};
+use crate::config::{MainSplit, Portrait};
 use crate::data::{FileNode, SectionKind, commit_line, format_time, status_style};
 use crate::keymap::{Action, Scope, display_key};
 use crate::popup::Popup;
@@ -41,7 +42,6 @@ pub struct Frame {
     main_panes: [Cell<PaneState>; 2],
     log_pane: Cell<PaneState>,
     log_state: Cell<SelectableListState>,
-    collapsed: Vec<(Vec<SelectableListItem>, Cell<SelectableListState>)>,
 }
 
 const MIN_WIDTH: u16 = 30;
@@ -58,18 +58,6 @@ impl Frame {
             .map(|window| {
                 let view = app.view(window);
                 (window, view, side_items(app, view))
-            })
-            .collect();
-        let collapsed = side
-            .iter()
-            .map(|(window, view, _)| {
-                (
-                    vec![SelectableListItem::rich(
-                        "title",
-                        window_title(app, *window, *view),
-                    )],
-                    Cell::new(SelectableListState::new(None)),
-                )
             })
             .collect();
         let pane_state = || Cell::new(PaneState::new(Rect::default()));
@@ -133,7 +121,6 @@ impl Frame {
             main_panes: [pane_state(), pane_state()],
             log_pane: pane_state(),
             log_state: Cell::new(SelectableListState::new(None)),
-            collapsed,
             side,
         }
     }
@@ -742,6 +729,67 @@ fn pane<'a>(
     )
 }
 
+/// A pane whose title row is clickable and carries buttons.
+fn pane_with<'a>(
+    app: &'a App,
+    id: impl Into<String>,
+    title: Line,
+    focused: bool,
+    state: &'a Cell<PaneState>,
+    actions: &[(&str, &str)],
+    child: impl bmux_tui::component::Component + 'a,
+) -> PaneComponent<'a, 'a> {
+    let mut current = state.get();
+    current.interaction.focused = focused;
+    state.set(current);
+    let mut chrome = Pane::new().title(title).title_hit(true).styles(PaneStyles {
+        background: None,
+        border: app.theme.border,
+        focused_border: app.theme.border_focused,
+    });
+    for (id, label) in actions {
+        chrome = chrome.action(PaneTitleAction::new(
+            *id,
+            Line::from_spans(vec![Span::styled((*label).to_owned(), app.theme.muted)]),
+        ));
+    }
+    PaneComponent::new(id.into(), chrome, state, child)
+}
+
+/// Whether side windows stack above the main view.
+pub const fn portrait(app: &App) -> bool {
+    let layout = &app.config.layout;
+    match layout.portrait {
+        Portrait::Auto => app.size.get().0 < layout.portrait_below_width,
+        Portrait::Always => true,
+        Portrait::Never => false,
+    }
+}
+
+/// Axis of the split between the side column and the main column.
+pub const fn root_axis(app: &App) -> PanelGroupAxis {
+    if portrait(app) {
+        PanelGroupAxis::Vertical
+    } else {
+        PanelGroupAxis::Horizontal
+    }
+}
+
+/// Axis of the staged/unstaged split.
+pub const fn sections_axis(app: &App) -> PanelGroupAxis {
+    let layout = &app.config.layout;
+    let beside = match layout.main_split {
+        MainSplit::SideBySide => true,
+        MainSplit::Stacked => false,
+        MainSplit::Flexible => app.size.get().0 >= layout.main_split_min_width,
+    };
+    if beside {
+        PanelGroupAxis::Horizontal
+    } else {
+        PanelGroupAxis::Vertical
+    }
+}
+
 fn window_title(app: &App, window: Window, view: View) -> Line {
     let theme = &app.theme;
     let focused = app.window == window;
@@ -814,71 +862,67 @@ fn window_title(app: &App, window: Window, view: View) -> Line {
 }
 
 fn side_column<'a>(app: &'a App, frame: &'a Frame) -> Element<'a> {
-    let layout = &app.config.layout;
-    let mut column = Column::new();
-    let focus_window = if app.window == Window::Main {
-        app.last_side
-    } else {
-        app.window
-    };
-    let half = app.screen_mode == ScreenMode::Half;
-    for (position, (window, view, items)) in frame.side.iter().enumerate() {
-        let focused = app.window == *window;
-        if half && *window != focus_window {
-            // Other windows shrink to a clickable title row, or disappear.
-            if layout.collapsed_windows == CollapsedWindows::Titles {
-                let (title, state) = &frame.collapsed[position];
-                column = column.child(
-                    SizeBox::new(
-                        SelectableListComponent::new(
-                            format!("side-{}", window.number()),
-                            title,
-                            state,
-                        )
-                        .policy(SelectableListPolicy {
-                            highlight: SelectableListHighlightPolicy::new("", false),
-                            ..SelectableListPolicy::interactive()
-                        })
-                        .styles(SelectableListStyles {
-                            focused: Style::new(),
-                            selected: Style::new(),
-                            ..SelectableListStyles::default()
-                        }),
-                    )
-                    .height(1),
-                );
-            }
-            continue;
-        }
-        let cursor = (!app.rows(*view).is_empty()).then(|| app.cursor(*view));
-        let content = list(
-            app,
-            format!("side-{}", window.number()),
-            items,
-            &app.lists[view],
-            cursor,
-            focused,
-        );
-        let panel = pane(
-            app,
-            format!("pane-{}", window.number()),
-            window_title(app, *window, *view),
-            focused,
-            &frame.side_panes[position],
-            content,
-        );
-        if !half && app.tabs(*window) == [View::Status] {
-            column = column.child(SizeBox::new(panel).height(3));
-        } else {
-            let weight = if *window == focus_window && layout.expand_focused {
-                layout.expanded_weight.max(1)
-            } else {
-                1
-            };
-            column = column.flex(Flex::new(weight, panel));
+    let mut group = PanelGroupComponent::new(
+        crate::panels::SIDE,
+        crate::panels::group(PanelGroupAxis::Vertical, &app.theme),
+        &app.panels.side,
+    );
+    for index in &app.panels.visible {
+        if let Some(position) = frame
+            .side
+            .iter()
+            .position(|(window, _, _)| *window == Window::Side(*index))
+        {
+            group = group.child(side_pane(app, frame, position));
         }
     }
-    Element::new(column)
+    Element::new(group)
+}
+
+/// One side window: its list, or only its title row while collapsed.
+fn side_pane<'a>(app: &'a App, frame: &'a Frame, position: usize) -> Element<'a> {
+    let (window, view, items) = &frame.side[position];
+    let Window::Side(index) = *window else {
+        return Element::new(TextBlock::new(""));
+    };
+    let focused = app.window == *window;
+    let collapsed = app.panels.is_collapsed(index);
+    let actions = [
+        ("collapse", if collapsed { "▸" } else { "▾" }),
+        ("maximize", "□"),
+        ("close", "✕"),
+    ];
+    let title = window_title(app, *window, *view);
+    let id = format!("pane-{}", window.number());
+    if collapsed {
+        return Element::new(pane_with(
+            app,
+            id,
+            title,
+            focused,
+            &frame.side_panes[position],
+            &actions,
+            TextBlock::new(""),
+        ));
+    }
+    let cursor = (!app.rows(*view).is_empty()).then(|| app.cursor(*view));
+    let content = list(
+        app,
+        format!("side-{}", window.number()),
+        items,
+        &app.lists[view],
+        cursor,
+        focused,
+    );
+    Element::new(pane_with(
+        app,
+        id,
+        title,
+        focused,
+        &frame.side_panes[position],
+        &actions,
+        content,
+    ))
 }
 
 #[allow(clippy::too_many_lines)]
@@ -990,33 +1034,39 @@ fn main_column<'a>(app: &'a App, frame: &'a Frame) -> Element<'a> {
                 focused,
             ))
         };
-        section_panes.push(pane(
+        section_panes.push(pane_with(
             app,
             format!("pane-main-{section}"),
             Line::from_spans(title),
             focused,
             &frame.main_panes[section],
+            &[("maximize", "□")],
             content,
         ));
     }
-    let layout = &app.config.layout;
-    let beside = section_panes.len() == 2
-        && match layout.main_split {
-            MainSplit::SideBySide => true,
-            MainSplit::Stacked => false,
-            MainSplit::Flexible => app.size.get().0 >= layout.main_split_min_width,
-        };
-    if beside {
-        let mut row = BoxRow::new();
-        for panel in section_panes {
-            row = row.flex(Flex::new(1, panel));
-        }
-        column = column.flex(Flex::new(1, row));
-    } else {
-        for panel in section_panes {
-            column = column.flex(Flex::new(1, panel));
-        }
-    }
+    let mut panes = section_panes.into_iter();
+    let content: Option<Element<'a>> = match (panes.next(), panes.next()) {
+        (Some(first), Some(second)) => Some(Element::new(
+            PanelGroupComponent::new(
+                crate::panels::SECTIONS,
+                crate::panels::group(sections_axis(app), theme),
+                &app.panels.sections,
+            )
+            .child(first)
+            .child(second),
+        )),
+        (Some(only), None) => Some(Element::new(only)),
+        _ => None,
+    };
+    let mut group = PanelGroupComponent::new(
+        crate::panels::MAIN,
+        crate::panels::group(PanelGroupAxis::Vertical, theme),
+        &app.panels.main,
+    );
+    group = match content {
+        Some(content) => group.child(content),
+        None => group.child(column),
+    };
     if app.command_log {
         let content = SelectableListComponent::new("command-log", &frame.log, &frame.log_state)
             .policy(SelectableListPolicy {
@@ -1028,19 +1078,17 @@ fn main_column<'a>(app: &'a App, frame: &'a Frame) -> Element<'a> {
                 selected: Style::new(),
                 ..SelectableListStyles::default()
             });
-        column = column.child(
-            SizeBox::new(pane(
-                app,
-                "pane-log",
-                Line::from_spans(vec![Span::styled(" Command log ", theme.title)]),
-                false,
-                &frame.log_pane,
-                content,
-            ))
-            .height(u64::from(layout.command_log.height.max(3))),
-        );
+        group = group.child(pane_with(
+            app,
+            "pane-log",
+            Line::from_spans(vec![Span::styled(" Command log ", theme.title)]),
+            false,
+            &frame.log_pane,
+            &[("close", "✕")],
+            content,
+        ));
     }
-    Element::new(column)
+    Element::new(group)
 }
 
 fn key(app: &App, action: Action) -> String {
@@ -1199,33 +1247,28 @@ pub fn tree<'a>(app: &'a App, frame: &'a Frame) -> Element<'a> {
         );
     }
     let layout = &app.config.layout;
-    let portrait = match layout.portrait {
-        Portrait::Auto => width < layout.portrait_below_width,
-        Portrait::Always => true,
-        Portrait::Never => false,
-    };
     let full = app.screen_mode == ScreenMode::Full;
     let body: Element<'a> = if full && app.window == Window::Main {
         main_column(app, frame)
     } else if full {
-        side_column(app, frame)
-    } else if portrait {
-        Element::new(
-            Column::new()
-                .flex(Flex::new(1, side_column(app, frame)))
-                .flex(Flex::new(1, main_column(app, frame))),
-        )
+        // The focused side window alone.
+        frame
+            .side
+            .iter()
+            .position(|(window, _, _)| *window == app.last_side)
+            .map_or_else(
+                || side_column(app, frame),
+                |position| side_pane(app, frame, position),
+            )
     } else {
-        let side_percent = if app.screen_mode == ScreenMode::Half {
-            layout.half_side_panel_width
-        } else {
-            layout.side_panel_width
-        }
-        .clamp(10, 90);
         Element::new(
-            BoxRow::new()
-                .flex(Flex::new(side_percent, side_column(app, frame)))
-                .flex(Flex::new(100 - side_percent, main_column(app, frame))),
+            PanelGroupComponent::new(
+                crate::panels::ROOT,
+                crate::panels::group(root_axis(app), theme),
+                app.panels.root_for(app.screen_mode),
+            )
+            .child(side_column(app, frame))
+            .child(main_column(app, frame)),
         )
     };
     let mut screen = Column::new().flex(Flex::new(1, body));
