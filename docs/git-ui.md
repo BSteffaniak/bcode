@@ -183,6 +183,12 @@ tree = true                     # false lists files flat; `` ` `` toggles for th
 enabled = true
 max_file_bytes = 1048576
 
+[diff]
+wrap_lines = true               # wrap long diff lines; continuation rows keep the gutter blank
+
+[staging]
+hunk_mode = false               # start the staging view selecting whole hunks
+
 [refresh]
 watch = true                    # filesystem watching; falls back to polling
 poll_seconds = 10
@@ -282,11 +288,17 @@ Drafts follow the message:
   Once the commit lands, the bcode draft is removed, and so is lazygit's if its message was used.
 * Amending leaves drafts alone.
 
+When committing, description lines longer than `wrap_width` are wrapped at word boundaries
+(indented lines, such as code, are kept as written; the summary is never wrapped), and a summary
+starting with `skip_hook_prefix` commits with `--no-verify`.
+
 ```toml
 [commit]
 prefill = true
 sources = ["env", "bcode-draft", "lazygit-draft", "merge", "squash", "edit-msg", "template"]
 save_draft = true               # false: never write BCODE_GIT_COMMIT_MSG (still read it)
+wrap_width = 72                 # wrap description lines at commit (0 keeps them as typed)
+skip_hook_prefix = ""           # e.g. "WIP": summaries starting with it commit without hooks
 ```
 
 For example, `BCODE_GIT_COMMIT_MSG="$(generate-message)" bcode-git`, or have a tool write the
@@ -296,9 +308,10 @@ draft file and open the editor with `c`.
 
 `bcode-git --import-lazygit [CONFIG_YML]` (or `bcode git --import-lazygit`) prints settings
 converted from a lazygit `config.yml`, as a dedicated config file. Without a path it uses `$LG_CONFIG_FILE` or lazygit's default
-location. The output covers layout, file tree, diff context, graph, refresh settings and
-keybindings; values equal to bcode's defaults are left out, and anything without a bcode
-equivalent, or a key a panel binding would shadow, is listed in `# note:` comments. Review it and
+location. The output covers layout, file tree, diff context and line wrapping, staging hunk
+mode, commit message wrapping and hook-skip prefix, graph, refresh settings and keybindings;
+values equal to bcode's defaults are left out, and anything without a bcode equivalent, or a key a
+panel binding would shadow, is listed in `# note:` comments. Review it and
 append it to a dedicated file, or add `--nested` for the `bcode.toml` form:
 
 ```sh

@@ -33,6 +33,10 @@ pub struct GitUiConfig {
     pub files: FilesConfig,
     /// Commit editor settings.
     pub commit: CommitConfig,
+    /// Diff presentation in the main view.
+    pub diff: DiffConfig,
+    /// Staging view settings.
+    pub staging: StagingConfig,
     /// Maximum commits loaded per page.
     pub log_page_size: usize,
     /// Show the commit graph.
@@ -64,6 +68,8 @@ impl Default for GitUiConfig {
             layout: LayoutConfig::default(),
             files: FilesConfig::default(),
             commit: CommitConfig::default(),
+            diff: DiffConfig::default(),
+            staging: StagingConfig::default(),
             log_page_size: 300,
             show_graph: true,
             highlight: HighlightConfig::default(),
@@ -238,6 +244,12 @@ pub struct CommitConfig {
     pub sources: Vec<String>,
     /// Keep an unsent message in `BCODE_GIT_COMMIT_MSG` in the git directory.
     pub save_draft: bool,
+    /// Wrap description lines longer than this many columns when committing (git's
+    /// convention is 72); `0` keeps lines as typed. The summary is never wrapped.
+    pub wrap_width: u16,
+    /// Commit without hooks (`--no-verify`) when the summary starts with this text, for
+    /// example `"WIP"`; empty disables it.
+    pub skip_hook_prefix: String,
 }
 
 impl Default for CommitConfig {
@@ -249,6 +261,8 @@ impl Default for CommitConfig {
                 .map(|source| source.name().to_owned())
                 .collect(),
             save_draft: true,
+            wrap_width: 72,
+            skip_hook_prefix: String::new(),
         }
     }
 }
@@ -280,6 +294,29 @@ impl CommitConfig {
         }
         (sources, diagnostics)
     }
+}
+
+/// Diff presentation in the main view (`[diff]`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct DiffConfig {
+    /// Wrap long lines to the view width instead of cutting them off. Continuation rows keep
+    /// the line-number gutter blank.
+    pub wrap_lines: bool,
+}
+
+impl Default for DiffConfig {
+    fn default() -> Self {
+        Self { wrap_lines: true }
+    }
+}
+
+/// Staging view settings (`[staging]`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize, Serialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct StagingConfig {
+    /// Start in hunk selection instead of line selection.
+    pub hunk_mode: bool,
 }
 
 /// Syntax highlighting settings.

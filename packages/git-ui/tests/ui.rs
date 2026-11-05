@@ -981,3 +981,110 @@ fn source_watching_follows_the_commit_editor() {
         [bcode_git_ui::commit_message::WATCH_KEY]
     );
 }
+
+#[test]
+fn long_diff_lines_wrap_with_a_blank_gutter_and_stage_as_one_line() {
+    let long = "let value = alpha + bravo + charlie + delta + echo + foxtrot + golf + hotel + india + juliet + kilo;";
+    let mut harness = Harness::new(|path| {
+        commit(path, "f.rs", "fn a() {}\n", "init");
+        std::fs::write(path.join("f.rs"), format!("fn a() {{}}\n{long}\n")).unwrap();
+    });
+    let screen = harness.screen(120, 40);
+    // The whole line is visible across rows, and its tail starts after a blank gutter.
+    assert!(screen.contains("kilo;"), "{screen}");
+    let tail = line_with(&screen, "kilo;");
+    assert!(
+        !tail.contains("+let"),
+        "continuation rows carry no sign: {screen}"
+    );
+    // Staging selects the source line, not a visual row.
+    harness.keys(&["enter", "space"]);
+    assert!(
+        git(harness.path(), &["diff", "--cached"]).contains(long),
+        "the whole wrapped line is staged"
+    );
+    let unwrapped = configured("[plugins.config.\"bcode.git\".ui.diff]\nwrap_lines = false");
+    let mut plain = Harness::with_config(
+        |path| {
+            commit(path, "f.rs", "fn a() {}\n", "init");
+            std::fs::write(path.join("f.rs"), format!("fn a() {{}}\n{long}\n")).unwrap();
+        },
+        unwrapped,
+    );
+    let screen = plain.screen(120, 40);
+    assert!(!screen.contains("kilo;"), "{screen}");
+}
+
+#[test]
+fn staging_can_start_in_hunk_mode() {
+    let mut harness = Harness::with_config(
+        |path| {
+            commit(path, "f.txt", "one\ntwo\n", "init");
+            std::fs::write(path.join("f.txt"), "ONE\nTWO\n").unwrap();
+        },
+        configured("[plugins.config.\"bcode.git\".ui.staging]\nhunk_mode = true"),
+    );
+    harness.keys(&["enter"]);
+    let screen = harness.screen(120, 30);
+    assert!(screen.contains("[HUNK]"), "{screen}");
+    harness.keys(&["space"]);
+    assert_eq!(git(harness.path(), &["show", ":f.txt"]), "ONE\nTWO\n");
+}
+
+#[test]
+fn skip_hook_prefix_and_description_wrapping_apply_on_commit() {
+    let mut harness = Harness::with_config(
+        |path| {
+            changed_repo(path);
+            std::fs::create_dir_all(path.join("hooks")).unwrap();
+            git(path, &["config", "core.hooksPath", "hooks"]);
+            let hook = path.join("hooks/pre-commit");
+            std::fs::write(&hook, "#!/bin/sh\nexit 1\n").unwrap();
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                std::fs::set_permissions(&hook, std::fs::Permissions::from_mode(0o755)).unwrap();
+            }
+        },
+        configured(
+            "[plugins.config.\"bcode.git\".ui.commit]\nskip_hook_prefix = \"WIP\"\nwrap_width = 20",
+        ),
+    );
+    harness.keys(&["c"]);
+    harness.paste("WIP: a summary line that stays whole");
+    harness.keys(&["tab"]);
+    harness.paste("one two three four five six seven\n    indented code stays as it is");
+    harness.keys(&["alt+enter"]);
+    assert_eq!(
+        git(harness.path(), &["log", "-1", "--format=%B"]),
+        "WIP: a summary line that stays whole\n\none two three four\nfive six seven\n    indented code stays as it is\n\n"
+    );
+}
+
+#[test]
+fn unbinding_a_panel_key_lets_the_shared_list_binding_through() {
+    let mut harness = Harness::with_config(
+        |path| {
+            commit(path, "a", "a", "first");
+            commit(path, "b", "b", "second");
+        },
+        configured(
+            r#"
+            [plugins.config."bcode.git".ui.keybindings."git.list"]
+            n = "bcode.git.list.up"
+            t = "bcode.git.list.down"
+            down = "bcode.git.list.down"
+            [plugins.config."bcode.git".ui.keybindings."git.commits"]
+            n = "none"
+            "#,
+        ),
+    );
+    // "t" stays the commits panel's revert key; move with the arrow instead.
+    harness.keys(&["4", "down"]);
+    assert_eq!(harness.app.view_cursor(View::Commits), 1);
+    harness.keys(&["n"]);
+    assert_eq!(harness.app.view_cursor(View::Commits), 0);
+    // "n" no longer opens the new-branch prompt in the commits panel.
+    let screen = harness.screen(120, 30);
+    assert!(!screen.contains("New branch"), "{screen}");
+}

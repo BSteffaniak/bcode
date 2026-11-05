@@ -53,6 +53,9 @@ pub struct DiffRow {
     pub id: Option<DiffLineId>,
     /// New-side line number, for opening an editor at this row.
     pub new_line: Option<u32>,
+    /// Leading spans that form the gutter (line numbers and sign); wrapped continuation rows
+    /// repeat them as blank padding so content stays aligned.
+    pub gutter_spans: usize,
 }
 
 impl DiffRow {
@@ -66,6 +69,7 @@ impl DiffRow {
             hunk: None,
             id: None,
             new_line: None,
+            gutter_spans: 0,
         }
     }
 }
@@ -195,6 +199,7 @@ pub fn present_file(
                     line: line_index,
                 }),
                 new_line: line.new_line.or(line.old_line),
+                gutter_spans: 2,
             });
         }
     }
@@ -296,6 +301,7 @@ fn file_header(file_index: usize, file: &DiffFile, theme: &GitTheme) -> DiffRow 
         hunk: None,
         id: None,
         new_line: None,
+        gutter_spans: 0,
     }
 }
 
@@ -317,6 +323,7 @@ fn hunk_header(file_index: usize, hunk_index: usize, hunk: &DiffHunk, theme: &Gi
         hunk: Some(hunk_index),
         id: None,
         new_line: Some(hunk.new_start),
+        gutter_spans: 0,
     }
 }
 

@@ -94,15 +94,26 @@ struct Gui {
     show_bottom_line: Option<bool>,
     screen_mode: Option<String>,
     portrait_mode: Option<String>,
+    wrap_lines_in_diff_view: Option<bool>,
+    use_hunk_mode_in_diff_view: Option<bool>,
 }
 
 #[derive(Debug, Default, Deserialize)]
 #[serde(default, rename_all = "camelCase")]
 struct Git {
     diff_context_size: Option<u32>,
+    skip_hook_prefix: Option<String>,
+    commit: GitCommit,
     auto_fetch: Option<bool>,
     auto_refresh: Option<bool>,
     log: GitLog,
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(default, rename_all = "camelCase")]
+struct GitCommit {
+    auto_wrap_commit_message: Option<bool>,
+    auto_wrap_width: Option<u16>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -276,6 +287,7 @@ fn convert_settings(
     if let Some(tree) = gui.show_file_tree {
         files.insert("tree".into(), tree.into());
     }
+    convert_editing(config, ui);
     let git = &config.git;
     if let Some(context) = git.diff_context_size {
         ui.insert("diff_context".into(), i64::from(context).into());
@@ -306,6 +318,41 @@ fn convert_settings(
             );
         }
         _ => {}
+    }
+}
+
+/// Diff wrapping, staging hunk mode, and commit message wrapping and hook skipping.
+fn convert_editing(config: &Lazygit, ui: &mut toml::Table) {
+    let gui = &config.gui;
+    let mut section = |name: &str, key: &str, value: toml::Value| {
+        if let toml::Value::Table(table) = ui
+            .entry(name.to_owned())
+            .or_insert_with(|| toml::Value::Table(toml::Table::new()))
+        {
+            table.insert(key.to_owned(), value);
+        }
+    };
+    if let Some(wrap) = gui.wrap_lines_in_diff_view {
+        section("diff", "wrap_lines", wrap.into());
+    }
+    if let Some(hunk) = gui.use_hunk_mode_in_diff_view {
+        section("staging", "hunk_mode", hunk.into());
+    }
+    let git = &config.git;
+    match (
+        git.commit.auto_wrap_commit_message,
+        git.commit.auto_wrap_width,
+    ) {
+        (Some(false), _) => section("commit", "wrap_width", 0.into()),
+        (_, Some(width)) => section("commit", "wrap_width", i64::from(width).into()),
+        _ => {}
+    }
+    if let Some(prefix) = git
+        .skip_hook_prefix
+        .as_ref()
+        .filter(|prefix| !prefix.is_empty())
+    {
+        section("commit", "skip_hook_prefix", prefix.clone().into());
     }
 }
 
@@ -734,7 +781,10 @@ mod tests {
     fn converts_layout_and_file_settings() {
         let import = import(
             "gui:\n  sidePanelWidth: 0.3333\n  screenMode: half\n  showFileTree: false\n  \
-             mainPanelSplitMode: horizontal\n  showBottomLine: true\ngit:\n  diffContextSize: 5\n",
+             mainPanelSplitMode: horizontal\n  showBottomLine: true\n  \
+             wrapLinesInDiffView: false\n  useHunkModeInDiffView: true\n\
+             git:\n  diffContextSize: 5\n  skipHookPrefix: WIP\n  \
+             commit:\n    autoWrapCommitMessage: true\n    autoWrapWidth: 80\n",
             false,
         )
         .unwrap();
@@ -751,6 +801,10 @@ mod tests {
         );
         assert!(!loaded.ui.files.tree);
         assert_eq!(loaded.ui.diff_context, 5);
+        assert!(!loaded.ui.diff.wrap_lines);
+        assert!(loaded.ui.staging.hunk_mode);
+        assert_eq!(loaded.ui.commit.wrap_width, 80);
+        assert_eq!(loaded.ui.commit.skip_hook_prefix, "WIP");
     }
 
     #[test]

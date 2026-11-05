@@ -1211,7 +1211,10 @@ impl App {
                         return Update::none();
                     }
                     self.window = Window::Main;
-                    self.staging = Some(Staging::default());
+                    self.staging = Some(Staging {
+                        hunk_mode: self.config.staging.hunk_mode,
+                        ..Staging::default()
+                    });
                     self.main_section = 0;
                     self.snap_to_change(1);
                     Update::redraw()
@@ -2235,9 +2238,16 @@ pub fn submit_prompt(app: &mut App, prompt: Prompt) -> Update<Msg> {
                     lazygit: source == Some(CommitMessageSource::LazygitDraft),
                 }
             };
+            // A configured prefix such as "WIP" skips hooks, as in lazygit.
+            let prefix = app.config.commit.skip_hook_prefix.trim();
+            let no_verify = no_verify
+                || (!prefix.is_empty() && prompt.summary().trim_start().starts_with(prefix));
             let commit = Op::Commit(
                 CommitOptions {
-                    message: text,
+                    message: crate::commit_message::wrap_description(
+                        &text,
+                        app.config.commit.wrap_width,
+                    ),
                     amend,
                     no_verify,
                     allow_empty: amend,

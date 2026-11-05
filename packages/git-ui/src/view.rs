@@ -33,6 +33,7 @@ use crate::popup::Popup;
 pub struct Frame {
     side: Vec<(Window, View, Vec<SelectableListItem>)>,
     main: Vec<Vec<SelectableListItem>>,
+    main_gutters: Vec<Vec<usize>>,
     log: Vec<SelectableListItem>,
     popup: Vec<SelectableListItem>,
     side_panes: Vec<Cell<PaneState>>,
@@ -72,6 +73,15 @@ impl Frame {
             .collect();
         let pane_state = || Cell::new(PaneState::new(Rect::default()));
         let main = (0..2).map(|section| main_items(app, section)).collect();
+        let main_gutters = (0..2)
+            .map(|section| {
+                app.main
+                    .as_ref()
+                    .and_then(|main| main.sections.get(section))
+                    .map(|section| section.rows.iter().map(|row| row.gutter_spans).collect())
+                    .unwrap_or_default()
+            })
+            .collect();
         let records = app.repo.command_log();
         let log: Vec<SelectableListItem> = records
             .iter()
@@ -99,6 +109,7 @@ impl Frame {
         let popup = popup_items(app);
         Self {
             main,
+            main_gutters,
             log,
             popup,
             side_panes: side.iter().map(|_| pane_state()).collect(),
@@ -507,14 +518,123 @@ impl bmux_tui::component::Component for Revealed<'_, '_> {
     }
 }
 
-fn list<'a>(
-    app: &'a App,
+/// A main-view list whose rows wrap to the width layout gives it. Each source row stays one
+/// selectable item (so staging selections and hit regions keep their row identity); its gutter
+/// spans start the first visual row and become blank padding on the continuation rows.
+struct WrappedList<'a> {
     id: String,
-    items: &'a [SelectableListItem],
+    source: &'a [SelectableListItem],
+    gutters: &'a [usize],
     state: &'a Cell<SelectableListState>,
+    policy: SelectableListPolicy,
+    styles: SelectableListStyles,
+    wrapped: std::cell::RefCell<Option<(u64, Vec<SelectableListItem>)>>,
+}
+
+impl WrappedList<'_> {
+    /// Rows wrapped for `width`, computed once per width.
+    fn with_items<T>(&self, width: u64, use_items: impl FnOnce(&[SelectableListItem]) -> T) -> T {
+        let mut cache = self.wrapped.borrow_mut();
+        if cache.as_ref().is_none_or(|(cached, _)| *cached != width) {
+            let columns = usize::try_from(width).unwrap_or(usize::MAX);
+            let items = self
+                .source
+                .iter()
+                .enumerate()
+                .map(|(index, item)| {
+                    wrap_item(item, self.gutters.get(index).copied().unwrap_or(0), columns)
+                })
+                .collect();
+            *cache = Some((width, items));
+        }
+        use_items(cache.as_ref().map_or(&[], |(_, items)| items.as_slice()))
+    }
+
+    fn component<'b>(&'b self, items: &'b [SelectableListItem]) -> SelectableListComponent<'b, 'b> {
+        SelectableListComponent::new(self.id.clone(), items, self.state)
+            .policy(self.policy)
+            .styles(self.styles)
+    }
+}
+
+impl bmux_tui::component::Component for WrappedList<'_> {
+    fn layout(
+        &self,
+        constraints: bmux_tui::component::Constraints,
+        cx: &mut bmux_tui::component::LayoutCx,
+    ) -> bmux_tui::component::LayoutNode {
+        self.with_items(constraints.max_width(), |items| {
+            self.component(items).layout(constraints, cx)
+        })
+    }
+
+    fn paint(
+        &self,
+        layout: &bmux_tui::component::LayoutNode,
+        cx: &mut bmux_tui::paint::PaintCx<'_, '_>,
+    ) {
+        self.with_items(layout.size.width, |items| {
+            let list = self.component(items);
+            list.reveal_focus(layout);
+            list.paint(layout, cx);
+        });
+    }
+
+    fn revision(&self) -> bmux_tui::component::ComponentRevision {
+        self.component(self.source).revision()
+    }
+}
+
+/// Wrap one row's content to `width` columns, keeping its first `gutter` spans as a prefix.
+fn wrap_item(item: &SelectableListItem, gutter: usize, width: usize) -> SelectableListItem {
+    use bmux_tui::text::{TextWrap, TextWrapGeometry, wrap_line_with_geometry};
+    use bmux_tui::text_width::display_width;
+
+    let Some(line) = item.lines.first() else {
+        return item.clone();
+    };
+    let split = gutter.min(line.spans.len());
+    let (prefix, body) = line.spans.split_at(split);
+    let prefix_width: usize = prefix.iter().map(|span| display_width(&span.content)).sum();
+    // Too narrow for any content beside the gutter: leave the row to be clipped.
+    let Some(content_width) = width.checked_sub(prefix_width).filter(|width| *width > 0) else {
+        return item.clone();
+    };
+    let rows = wrap_line_with_geometry(
+        &Line::from_spans(body.to_vec()),
+        TextWrapGeometry::uniform(content_width),
+        TextWrap::Word,
+    );
+    if rows.len() <= 1 {
+        return item.clone();
+    }
+    let padding: Vec<Span> = prefix
+        .iter()
+        .map(|span| Span::styled(" ".repeat(display_width(&span.content)), span.style))
+        .collect();
+    let lines = rows
+        .into_iter()
+        .enumerate()
+        .map(|(index, row)| {
+            let mut spans = if index == 0 {
+                prefix.to_vec()
+            } else {
+                padding.clone()
+            };
+            spans.extend(row.spans);
+            Line::from_spans(spans)
+        })
+        .collect::<Vec<_>>();
+    SelectableListItem::multiline(item.id.clone(), lines)
+}
+
+/// Selection, focus and styling shared by every list.
+fn list_policy(
+    app: &App,
+    state: &Cell<SelectableListState>,
     cursor: Option<usize>,
     focused: bool,
-) -> Revealed<'a, 'a> {
+) -> (SelectableListPolicy, SelectableListStyles) {
     let mut current = state.get();
     current.set_focused(cursor);
     current.set_selected(cursor);
@@ -541,6 +661,18 @@ fn list<'a>(
         ..SelectableListPolicy::interactive()
     }
     .scrollbar(ScrollbarAxisLayoutMode::Hidden);
+    (policy, styles)
+}
+
+fn list<'a>(
+    app: &'a App,
+    id: String,
+    items: &'a [SelectableListItem],
+    state: &'a Cell<SelectableListState>,
+    cursor: Option<usize>,
+    focused: bool,
+) -> Revealed<'a, 'a> {
+    let (policy, styles) = list_policy(app, state, cursor, focused);
     Revealed(
         SelectableListComponent::new(id, items, state)
             .policy(policy)
@@ -792,14 +924,27 @@ fn main_column<'a>(app: &'a App, frame: &'a Frame) -> Element<'a> {
             ));
         }
         let cursor = Some(app.main_cursor[section]);
-        let content = list(
-            app,
-            format!("main-{section}"),
-            &frame.main[section],
-            &app.main_lists[section],
-            cursor,
-            focused,
-        );
+        let content = if app.config.diff.wrap_lines {
+            let (policy, styles) = list_policy(app, &app.main_lists[section], cursor, focused);
+            Element::new(WrappedList {
+                id: format!("main-{section}"),
+                source: &frame.main[section],
+                gutters: &frame.main_gutters[section],
+                state: &app.main_lists[section],
+                policy,
+                styles,
+                wrapped: std::cell::RefCell::new(None),
+            })
+        } else {
+            Element::new(list(
+                app,
+                format!("main-{section}"),
+                &frame.main[section],
+                &app.main_lists[section],
+                cursor,
+                focused,
+            ))
+        };
         section_panes.push(pane(
             app,
             format!("pane-main-{section}"),

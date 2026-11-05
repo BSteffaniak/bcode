@@ -69,6 +69,35 @@ pub fn find(repo: &Repository, sources: &[CommitMessageSource], env: Option<Stri
     prefill
 }
 
+/// Wrap a commit message's description to `width` display columns at word boundaries.
+///
+/// The summary (first line) is kept whole, and lines that already fit, blank lines, and
+/// indented lines (code, quoted output) are kept as written. `0` disables wrapping.
+#[must_use]
+pub fn wrap_description(message: &str, width: u16) -> String {
+    use bmux_tui::text::{TextWrap, TextWrapGeometry, wrap_text};
+    use bmux_tui::text_width::display_width;
+
+    let width = usize::from(width);
+    if width == 0 {
+        return message.to_owned();
+    }
+    let mut lines = message.split('\n');
+    let mut out: Vec<String> = lines.next().map(str::to_owned).into_iter().collect();
+    for line in lines {
+        if display_width(line) <= width || line.starts_with([' ', '\t']) {
+            out.push(line.to_owned());
+        } else {
+            out.extend(wrap_text(
+                line,
+                TextWrapGeometry::uniform(width),
+                TextWrap::Word,
+            ));
+        }
+    }
+    out.join("\n")
+}
+
 /// Files holding the file-backed `sources`, existing or not.
 #[must_use]
 pub fn watched_files(repo: &Repository, sources: &[CommitMessageSource]) -> Vec<PathBuf> {
