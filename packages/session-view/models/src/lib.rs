@@ -8,6 +8,7 @@
 //! web, and future renderers should be able to consume them without depending on terminal frames,
 //! browser DOM primitives, daemon clients, or application orchestration.
 
+pub mod execution;
 pub mod external;
 pub mod presentation;
 
@@ -285,6 +286,9 @@ pub enum SessionViewNoticeLevel {
 /// Snapshot of the renderer-neutral state for one session.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SessionViewSnapshot {
+    /// Independent managed lifecycle evidence; older snapshots default to unknown coverage.
+    #[serde(default)]
+    pub execution_lifecycle: execution::ExecutionLifecycleView,
     /// Snapshot schema version.
     pub schema_version: u16,
     /// Current view revision.
@@ -353,6 +357,7 @@ impl SessionViewSnapshot {
     #[must_use]
     pub fn empty() -> Self {
         Self {
+            execution_lifecycle: execution::ExecutionLifecycleView::default(),
             schema_version: Self::SCHEMA_VERSION,
             revision: 0,
             session_id: None,
@@ -836,6 +841,9 @@ where
 }
 
 fn snapshot_requires_reset(base: &SessionViewSnapshot, next: &SessionViewSnapshot) -> bool {
+    if base.execution_lifecycle != next.execution_lifecycle {
+        return true;
+    }
     base.schema_version != next.schema_version
         || base.session_id != next.session_id
         || base.title != next.title

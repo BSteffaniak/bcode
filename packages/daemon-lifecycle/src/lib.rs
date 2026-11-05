@@ -1388,10 +1388,11 @@ fn ensure_current_executable_cached_in_state(
 ) -> Result<PathBuf, DaemonLifecycleError> {
     let bootstrap = initialize_artifact_bootstrap()?;
     let source = bootstrap.source_path().to_path_buf();
+    // Publication and interrupted-temp cleanup must exclude other publishers, not
+    // only image retention. Publishers otherwise hold compatible shared use guards.
+    let _publication = acquire_daemon_image_publication_lock(state_dir)?;
     remove_interrupted_image_publications(state_dir)?;
-    if let Some((target, _digest)) = current_cached_daemon_image(state_dir)?
-        && target != source
-    {
+    if let Some((target, _digest)) = current_cached_daemon_image(state_dir)? {
         return Ok(target);
     }
     let temp_parent = daemon_image_dir(state_dir);
@@ -1626,6 +1627,32 @@ impl Drop for DaemonImageCleanupGuard {
         // Closing alone can leave the lock held by a duplicated/inherited handle.
         let _ = self.file.unlock();
     }
+}
+
+// Separate from the global retention lock: callers may already hold that lock
+// shared while preparing their image, and must not attempt a lock upgrade.
+fn acquire_daemon_image_publication_lock(
+    state_dir: &Path,
+) -> Result<DaemonImageCleanupGuard, DaemonLifecycleError> {
+    let parent = daemon_image_dir(state_dir);
+    fs::create_dir_all(&parent).map_err(|source| DaemonLifecycleError::Io {
+        path: parent.clone(),
+        source,
+    })?;
+    let path = parent.join("publication.lock");
+    let file = fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(&path)
+        .map_err(|source| DaemonLifecycleError::Io {
+            path: path.clone(),
+            source,
+        })?;
+    file.lock()
+        .map_err(|source| DaemonLifecycleError::Io { path, source })?;
+    Ok(DaemonImageCleanupGuard { file })
 }
 
 fn try_acquire_daemon_image_cleanup_lock(
@@ -2709,6 +2736,66 @@ mod tests {
                     .starts_with(".bcode.tmp-"))
         );
         fs::remove_dir_all(state_dir).unwrap();
+    }
+
+    #[test]
+    fn image_publication_excludes_competitors_without_upgrading_retention_lock() {
+        let root = tempfile::tempdir().unwrap();
+        let _use_guard = DaemonImageUseGuard::acquire(root.path()).unwrap();
+        let publication = acquire_daemon_image_publication_lock(root.path()).unwrap();
+        let competitor = fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(daemon_image_dir(root.path()).join("publication.lock"))
+            .unwrap();
+        assert!(matches!(
+            competitor.try_lock(),
+            Err(std::fs::TryLockError::WouldBlock)
+        ));
+        drop(publication);
+        competitor.try_lock().unwrap();
+        competitor.unlock().unwrap();
+    }
+
+    #[test]
+    fn concurrent_image_publications_retain_one_verified_target() {
+        let root = tempfile::tempdir().unwrap();
+        let start = std::sync::Arc::new(std::sync::Barrier::new(4));
+        let paths = std::thread::scope(|scope| {
+            // Start every participant before joining: lazy spawn/join iteration
+            // would block the first participant at the four-party barrier.
+            let handles: [_; 4] = std::array::from_fn(|_| {
+                let start = std::sync::Arc::clone(&start);
+                let root = root.path();
+                scope.spawn(move || {
+                    start.wait();
+                    ensure_current_executable_cached_in_state(root).unwrap()
+                })
+            });
+            handles
+                .into_iter()
+                .map(|handle| handle.join().unwrap())
+                .collect::<Vec<_>>()
+        });
+        let (_, digest) = current_executable_identity().unwrap();
+        for path in paths {
+            assert_eq!(
+                path,
+                cached_daemon_executable_path_for_digest(root.path(), &digest)
+            );
+            assert!(daemon_image_is_valid(&path, &digest).unwrap());
+        }
+        assert!(
+            fs::read_dir(daemon_image_dir(root.path()))
+                .unwrap()
+                .all(|entry| {
+                    !entry
+                        .unwrap()
+                        .file_name()
+                        .to_string_lossy()
+                        .starts_with(".bcode.tmp-")
+                })
+        );
     }
 
     #[test]

@@ -16,29 +16,157 @@ pub struct Config {
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct InstanceConfig {
+    /// Native is the compatibility default. API mode requires an exact host credential grant.
+    #[serde(default)]
+    pub billing: ApiBilling,
+
     pub executable: PathBuf,
     pub config_directory: PathBuf,
     pub exact_version: String,
     /// Operator attestation for this exact executable/version, not a version-number guess.
     #[serde(default)]
     pub verified_session_state: bool,
+    /// Exact-version local status attestation only; never authorizes login handoff.
+    #[serde(default)]
+    pub verified_native_auth_status: bool,
+    /// Exact-version combined local status and login handoff attestation.
     #[serde(default)]
     pub verified_native_auth: bool,
     /// Explicit inherited settings sources; None preserves native defaults and managed policy.
     pub setting_sources: Option<Vec<String>>,
 }
+#[derive(Default, Deserialize)]
+#[serde(tag = "route", rename_all = "snake_case", deny_unknown_fields)]
+pub enum ApiBilling {
+    #[default]
+    Native,
+    ApiKey {
+        provider_id: String,
+        profile: String,
+        credential_namespace: String,
+    },
+}
+
 impl InstanceConfig {
+    /// Resolve non-secret selection only; these fields never grant credential access.
+    /// # Errors
+    /// Rejects any custody, provider, profile or namespace mismatch.
+    pub fn credential_selection(
+        &self,
+        instance: &HarnessInstance,
+    ) -> Result<Option<bcode_plugin_sdk::PluginCredentialSelection>, HarnessFailure> {
+        match &self.billing {
+            ApiBilling::Native
+                if instance.auth.custody == HarnessAuthCustody::NativeManaged
+                    && instance.auth.provider_id == "claude-code"
+                    && instance.auth.credential_namespace == instance.config_namespace =>
+            {
+                Ok(None)
+            }
+            ApiBilling::ApiKey {
+                provider_id,
+                profile,
+                credential_namespace,
+            } if instance.auth.custody == HarnessAuthCustody::VaultManaged
+                && provider_id == "claude-code"
+                && instance.auth.provider_id == *provider_id
+                && instance.auth.profile == *profile
+                && instance.auth.credential_namespace == *credential_namespace =>
+            {
+                let selection = bcode_plugin_sdk::PluginCredentialSelection {
+                    instance_id: instance.instance_id.clone(),
+                    provider_id: provider_id.clone(),
+                    profile: profile.clone(),
+                    credential_namespace: credential_namespace.clone(),
+                    custody: instance.auth.custody,
+                    credential_id: "api_key".into(),
+                };
+                selection.validate().map_err(|_| HarnessFailure::Policy)?;
+                Ok(Some(selection))
+            }
+            _ => Err(HarnessFailure::Policy),
+        }
+    }
+
+    /// Validate non-secret launch selection for catalog inspection, without fetching credentials.
+    /// # Errors
+    /// Rejects mismatched launch selection or unsupported ambient authentication routes.
+    pub fn inspection_options(
+        &self,
+        instance: &HarnessInstance,
+    ) -> Result<LaunchOptions, HarnessFailure> {
+        self.options_selected(instance, self.config_directory.clone(), None)
+    }
+
+    /// Build the exact launch route with invocation-only credential delivery.
+    /// # Errors
+    /// Rejects invalid configuration, missing/revoked host grants or unavailable credentials.
+    pub fn options_with_context(
+        &self,
+        instance: &HarnessInstance,
+        cwd: PathBuf,
+        resume: Option<String>,
+        context: &bcode_plugin_sdk::NativeServiceContext,
+    ) -> Result<LaunchOptions, HarnessFailure> {
+        let selection = self.credential_selection(instance)?;
+        let mut options = self.options_selected(instance, cwd, resume)?;
+        if let Some(selection) = selection {
+            Self::inject_api_credential(&mut options, context, &selection)?;
+        }
+        Ok(options)
+    }
+
+    fn inject_api_credential(
+        options: &mut LaunchOptions,
+        context: &bcode_plugin_sdk::NativeServiceContext,
+        selection: &bcode_plugin_sdk::PluginCredentialSelection,
+    ) -> Result<(), HarnessFailure> {
+        if options.billing_route != BillingRoute::ApiKey
+            || options.environment.0.contains_key("ANTHROPIC_API_KEY")
+        {
+            return Err(HarnessFailure::Policy);
+        }
+        let key = context
+            .credential(selection)
+            .map_err(|_| HarnessFailure::Authentication)?;
+        options
+            .environment
+            .0
+            .insert("ANTHROPIC_API_KEY".into(), key.expose().into());
+        Ok(())
+    }
+
+    pub const fn native_auth_support(&self) -> NativeAuthSupport {
+        if self.verified_native_auth {
+            NativeAuthSupport::VerifiedStatusAndLogin
+        } else if self.verified_native_auth_status {
+            NativeAuthSupport::VerifiedStatus
+        } else {
+            NativeAuthSupport::Unknown
+        }
+    }
+
     pub fn options(
         &self,
         instance: &HarnessInstance,
         cwd: PathBuf,
         resume: Option<String>,
     ) -> Result<LaunchOptions, HarnessFailure> {
+        if self.credential_selection(instance)?.is_some() {
+            return Err(HarnessFailure::Authentication);
+        }
+        self.options_selected(instance, cwd, resume)
+    }
+
+    fn options_selected(
+        &self,
+        instance: &HarnessInstance,
+        cwd: PathBuf,
+        resume: Option<String>,
+    ) -> Result<LaunchOptions, HarnessFailure> {
+        let api = self.credential_selection(instance)?.is_some();
         if instance.executable != self.executable.to_string_lossy()
             || instance.config_namespace != self.config_directory.to_string_lossy()
-            || instance.auth.provider_id != "claude-code"
-            || instance.auth.credential_namespace != instance.config_namespace
-            || instance.auth.custody != HarnessAuthCustody::NativeManaged
             || !self.executable.is_absolute()
             || !self.config_directory.is_absolute()
             || !cwd.is_absolute()
@@ -82,7 +210,11 @@ impl InstanceConfig {
             cwd,
             config_directory: self.config_directory.clone(),
             environment: NativeEnvironment(environment),
-            billing_route: BillingRoute::NativeAccount,
+            billing_route: if api {
+                BillingRoute::ApiKey
+            } else {
+                BillingRoute::NativeAccount
+            },
             settings: if self.setting_sources.is_some() {
                 SettingsInheritance::ExplicitSources
             } else {
@@ -95,12 +227,12 @@ impl InstanceConfig {
             } else {
                 SettlementSupport::Unknown
             },
-            auth_support: if self.verified_native_auth {
-                NativeAuthSupport::VerifiedStatusAndLogin
-            } else {
-                NativeAuthSupport::Unknown
-            },
+            auth_support: self.native_auth_support(),
             limits: Limits::default(),
         })
     }
 }
+
+#[cfg(test)]
+#[path = "api_configuration_tests.rs"]
+mod api_configuration_tests;

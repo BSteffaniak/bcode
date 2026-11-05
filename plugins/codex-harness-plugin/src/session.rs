@@ -11,6 +11,10 @@ use bcode_harness_models::{
 use serde_json::{Value, json};
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
+#[cfg(all(test, unix))]
+#[path = "session_retention_tests.rs"]
+mod retention_tests;
+
 struct Callback {
     native_id: Value,
     interaction: HarnessInteraction,
@@ -20,6 +24,12 @@ struct Callback {
     answers: BTreeMap<String, Value>,
     pending_question: bool,
     turn_id: String,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum InventoryState {
+    Current,
+    RefreshRequired,
 }
 
 /// One admitted native thread owner. Create only after host permission and ownership checks.
@@ -41,6 +51,16 @@ pub struct CodexSession {
     pending_acceptance: Option<HarnessObservation>,
     last_terminal_turn: Option<String>,
     fresh_first_input: bool,
+    execution: crate::execution::Execution,
+    pending_execution: VecDeque<HarnessObservation>,
+    inventory: InventoryState,
+    retention: crate::retention::Retention,
+    waiting_native: VecDeque<Value>,
+    inventory_cursor: Option<String>,
+    inventory_scan: Option<(String, u64)>,
+    inventory_page: Option<bcode_harness_models::HarnessInventoryPage>,
+    resolved_native: BTreeSet<bcode_harness_models::HarnessNativeReference>,
+    inventory_response: Option<Value>,
 }
 
 const fn unknown_status() -> HarnessExecutionStatus {
@@ -189,6 +209,16 @@ impl CodexSession {
             pending_acceptance: None,
             last_terminal_turn: None,
             fresh_first_input: !resume,
+            execution: crate::execution::Execution::default(),
+            pending_execution: VecDeque::new(),
+            inventory: InventoryState::Current,
+            retention: crate::retention::Retention::default(),
+            waiting_native: VecDeque::new(),
+            inventory_cursor: None,
+            inventory_scan: None,
+            inventory_page: None,
+            resolved_native: BTreeSet::new(),
+            inventory_response: None,
         })
     }
 
@@ -473,6 +503,7 @@ impl CodexSession {
                 self.server.fence();
                 return Err(CodexError::Protocol);
             }
+            self.execution.accept(&turn_id, submission)?;
             self.accepted_turn = Some(turn_id.clone());
             self.active_turn = Some(turn_id);
             self.pending_acceptance = Some(acceptance);
@@ -507,11 +538,20 @@ impl CodexSession {
         if self.observation_gap || gap || closed {
             return Err(CodexError::Uncertain);
         }
-        self.server.call(
+        let result = self.server.call(
             "turn/interrupt",
             json!({"threadId":self.binding.native_session_id,"turnId":turn_id}),
-        )?;
-        Ok(())
+        );
+        if result
+            .as_ref()
+            .is_err_and(|error| *error != CodexError::Rejected)
+        {
+            self.observation_gap = true;
+            self.status.completeness = HarnessCompleteness::Gap;
+            self.callbacks.clear();
+            self.server.fence();
+        }
+        result.map(|_| ())
     }
 
     /// Interrupt only the currently observed native turn; never guess a turn after reconnection.
@@ -541,7 +581,11 @@ impl CodexSession {
             Some("idle") => HarnessActivity::Idle,
             _ => HarnessActivity::Unknown,
         };
-        self.status.completeness = HarnessCompleteness::Partial;
+        self.status.completeness = if self.observation_gap {
+            HarnessCompleteness::Gap
+        } else {
+            HarnessCompleteness::Partial
+        };
         Ok(self.status.clone())
     }
 
@@ -556,10 +600,16 @@ impl CodexSession {
         if limit == 0 || limit > MAX_HARNESS_OBSERVATIONS {
             return Err(CodexError::Bounds);
         }
+        if !self.retention.ready() {
+            return Err(CodexError::Uncertain);
+        }
         if let Some(acceptance) = self.pending_acceptance.take() {
             // An explicit acknowledged association remains evidence even if transport was
             // subsequently lost. Deliver it before any started/completed/settlement event.
             return Ok((vec![acceptance], HarnessCompleteness::Partial));
+        }
+        if self.execution_observation_gap()? {
+            return Ok((Vec::new(), HarnessCompleteness::Gap));
         }
         if self.pending_terminal.is_some() {
             let (gap, closed) = self.server.health()?;
@@ -570,17 +620,48 @@ impl CodexSession {
                 return Ok((vec![terminal], HarnessCompleteness::Partial));
             }
         }
-        let (events, gap, closed) = self.server.events((limit / 2).max(1))?;
+        if let Some(observation) = self.pending_execution.pop_front() {
+            return Ok((vec![observation], HarnessCompleteness::Partial));
+        }
+        self.poll_execution_inventory()?;
+        if let Some(observation) = self.pending_execution.pop_front() {
+            return Ok((vec![observation], HarnessCompleteness::Partial));
+        }
+        if self.retention.enabled()
+            && self.inventory_response.is_some()
+            && !self.retention.requests().is_empty()
+        {
+            return Ok((Vec::new(), HarnessCompleteness::Partial));
+        }
+        self.observe_native_events(limit)
+    }
+
+    fn observe_native_events(
+        &mut self,
+        limit: usize,
+    ) -> Result<(Vec<HarnessObservation>, HarnessCompleteness), CodexError> {
+        let (events, gap, closed) = if let Some(event) = self.waiting_native.pop_front() {
+            (vec![event], false, false)
+        } else {
+            self.server.events(if self.retention.enabled() {
+                1
+            } else {
+                (limit / 2).max(1)
+            })?
+        };
         if gap || closed {
             self.observation_gap = true;
             self.callbacks.clear();
-            self.status = unknown_status();
             self.status.connectivity = HarnessConnectivity::Disconnected;
             self.status.completeness = HarnessCompleteness::Gap;
             return Ok((Vec::new(), HarnessCompleteness::Gap));
         }
         let mut observations = Vec::new();
         for event in events {
+            if !self.native_hydration_ready(&event)? {
+                self.waiting_native.push_back(event);
+                break;
+            }
             let terminal_turn = if !self.observation_gap
                 && !self.uncertain_submission
                 && event["method"] == "turn/completed"
@@ -600,6 +681,7 @@ impl CodexSession {
                 Err(error) => {
                     self.observation_gap = true;
                     self.callbacks.clear();
+                    self.pending_execution.clear();
                     self.server.fence();
                     return Err(error);
                 }
@@ -618,27 +700,8 @@ impl CodexSession {
         }
         if observations.is_empty()
             && !self.observation_gap
-            && let Some(callback) = self
-                .callbacks
-                .values_mut()
-                .find(|callback| callback.pending_question)
+            && let Some(observation) = self.pending_question_observation()?
         {
-            callback.pending_question = false;
-            self.sequence = self.sequence.checked_add(1).ok_or(CodexError::Bounds)?;
-            let observation = HarnessObservation {
-                observation_id: format!(
-                    "codex:{}:{}:{}",
-                    self.binding.generation, self.observation_epoch, self.sequence
-                ),
-                session_id: self.binding.session_id.clone(),
-                generation: self.binding.generation,
-                native_correlations: vec![callback.turn_id.clone()],
-                completeness: HarnessCompleteness::Complete,
-                kind: HarnessObservationKind::Interaction {
-                    interaction: callback.interaction.clone(),
-                },
-            };
-            observation.validate().map_err(|_| CodexError::Protocol)?;
             observations.push(observation);
         }
         let completeness = if gap || self.observation_gap {
@@ -650,6 +713,326 @@ impl CodexSession {
         };
         self.status.completeness = completeness;
         Ok((observations, completeness))
+    }
+
+    fn execution_observation_gap(&mut self) -> Result<bool, CodexError> {
+        let (gap, closed) = self.server.health()?;
+        if self.observation_gap || gap || closed {
+            self.observation_gap = true;
+            self.callbacks.clear();
+            self.status.completeness = HarnessCompleteness::Gap;
+            if closed {
+                self.status.connectivity = HarnessConnectivity::Disconnected;
+            }
+            // Retain already-normalized outcomes, but never serve queued coverage as
+            // a healthy page after ambiguity. Loss cannot revise terminal/output facts.
+            return Ok(true);
+        }
+        Ok(false)
+    }
+
+    fn pending_question_observation(&mut self) -> Result<Option<HarnessObservation>, CodexError> {
+        let Some(callback) = self
+            .callbacks
+            .values_mut()
+            .find(|callback| callback.pending_question)
+        else {
+            return Ok(None);
+        };
+        callback.pending_question = false;
+        self.sequence = self.sequence.checked_add(1).ok_or(CodexError::Bounds)?;
+        let observation = HarnessObservation {
+            observation_id: format!(
+                "codex:{}:{}:{}",
+                self.binding.generation, self.observation_epoch, self.sequence
+            ),
+            session_id: self.binding.session_id.clone(),
+            generation: self.binding.generation,
+            native_correlations: vec![callback.turn_id.clone()],
+            completeness: HarnessCompleteness::Complete,
+            kind: HarnessObservationKind::Interaction {
+                interaction: callback.interaction.clone(),
+            },
+        };
+        observation.validate().map_err(|_| CodexError::Protocol)?;
+        Ok(Some(observation))
+    }
+
+    pub(super) fn apply_retention(
+        &mut self,
+        context: &bcode_harness_models::HarnessRetentionContext,
+    ) -> Result<(), CodexError> {
+        let (recorded, replies) =
+            self.retention
+                .apply(context, &self.binding.session_id, self.binding.generation)?;
+        self.execution.retire_acknowledged(&recorded);
+        for reply in replies {
+            use bcode_harness_models::HarnessHydrationResolution as Resolution;
+            match reply.resolution {
+                Resolution::Found { observations } => {
+                    self.execution.hydrate(&observations)?;
+                    self.execution
+                        .bind_reference(&reply.reference, &observations);
+                    self.resolved_native.insert(reply.reference);
+                }
+                Resolution::Absent => {
+                    self.resolved_native.insert(reply.reference);
+                }
+                Resolution::Unavailable => {
+                    self.retention.request(reply.reference)?;
+                }
+            }
+        }
+        Ok(())
+    }
+    pub(super) fn retention_page(
+        &mut self,
+        observations: &[HarnessObservation],
+    ) -> Result<bcode_harness_models::HarnessRetentionPage, CodexError> {
+        self.retention.deliver(observations)
+    }
+    #[must_use]
+    pub(super) fn hydration_requests(&self) -> Vec<bcode_harness_models::HarnessHydrationRequest> {
+        self.retention.requests()
+    }
+    pub(super) const fn take_inventory_page(
+        &mut self,
+    ) -> Option<bcode_harness_models::HarnessInventoryPage> {
+        self.inventory_page.take()
+    }
+
+    fn native_hydration_ready(&mut self, event: &Value) -> Result<bool, CodexError> {
+        use bcode_harness_models::{
+            HarnessNativeReference as Reference, HarnessNativeReferenceKind as Kind,
+        };
+        if !self.retention.enabled()
+            || event["params"]["threadId"].as_str() != Some(self.binding.native_session_id.as_str())
+        {
+            return Ok(true);
+        }
+        let params = &event["params"];
+        let method = event["method"].as_str().unwrap_or_default();
+        let mut references = Vec::new();
+        let turn = params["turnId"]
+            .as_str()
+            .or_else(|| params["turn"]["id"].as_str());
+        if let Some(id) = turn
+            && !self.execution.tracks_turn(id)
+        {
+            references.push(Reference {
+                kind: Kind::Turn,
+                native_id: id.to_owned(),
+                native_turn_id: None,
+            });
+        }
+        if let Some(root) = params["turn"]["rootTurnId"].as_str()
+            && !self.execution.tracks_turn(root)
+        {
+            references.push(Reference {
+                kind: Kind::Turn,
+                native_id: root.to_owned(),
+                native_turn_id: None,
+            });
+        }
+        if method == "item/started" || method == "item/completed" {
+            let item = &params["item"];
+            if item["type"] == "collabAgentToolCall"
+                && let Some(agents) = item["receiverThreadIds"].as_array()
+            {
+                if agents.len() > bcode_harness_models::MAX_HARNESS_ITEMS {
+                    return Err(CodexError::Bounds);
+                }
+                for agent in agents {
+                    let id = agent.as_str().ok_or(CodexError::Protocol)?;
+                    if !self.execution.has_native_work(id) {
+                        references.push(Reference {
+                            kind: Kind::Agent,
+                            native_id: id.to_owned(),
+                            native_turn_id: None,
+                        });
+                    }
+                }
+            }
+            if matches!(
+                item["type"].as_str(),
+                Some("commandExecution" | "mcpToolCall" | "dynamicToolCall")
+            ) {
+                if let Some(id) = item["processId"].as_str() {
+                    if !self.execution.has_native_work(id) {
+                        references.push(Reference {
+                            kind: Kind::Process,
+                            native_id: id.to_owned(),
+                            native_turn_id: None,
+                        });
+                    }
+                } else if let (Some(id), Some(turn)) = (item["id"].as_str(), turn)
+                    && !self.execution.has_native_work(id)
+                {
+                    references.push(Reference {
+                        kind: Kind::Item,
+                        native_id: id.to_owned(),
+                        native_turn_id: Some(turn.to_owned()),
+                    });
+                }
+                if let (Some(id), Some(turn)) = (item["id"].as_str(), turn)
+                    && !self.execution.has_native_work(id)
+                {
+                    let reference = Reference {
+                        kind: Kind::Item,
+                        native_id: id.to_owned(),
+                        native_turn_id: Some(turn.to_owned()),
+                    };
+                    if !references.contains(&reference) {
+                        references.push(reference);
+                    }
+                }
+            }
+        }
+        let mut ready = true;
+        for reference in &references {
+            if !self.resolved_native.contains(reference) {
+                self.retention.request(reference.clone())?;
+                ready = false;
+            }
+        }
+        if ready {
+            for reference in references {
+                self.resolved_native.remove(&reference);
+            }
+        }
+        Ok(ready)
+    }
+
+    fn poll_execution_inventory(&mut self) -> Result<(), CodexError> {
+        if self.inventory != InventoryState::RefreshRequired
+            || self.observation_gap
+            || self.uncertain_submission
+        {
+            return Ok(());
+        }
+        if self.inventory_response.is_none() {
+            if let Ok(response) = self.server.call("thread/backgroundTerminals/list", json!({
+                "threadId":self.binding.native_session_id,"limit":4,"cursor":self.inventory_cursor
+            })) {
+                self.inventory_response = Some(response);
+            } else {
+                self.inventory = InventoryState::Current;
+                return Ok(());
+            }
+        }
+        let response = self
+            .inventory_response
+            .as_ref()
+            .ok_or(CodexError::Protocol)?;
+        let data = response["data"].as_array().ok_or(CodexError::Protocol)?;
+        if data.len() > 4 {
+            return Err(CodexError::Bounds);
+        }
+        let mut references = Vec::new();
+        if self.retention.enabled() {
+            for terminal in data {
+                let id = terminal["processId"].as_str().ok_or(CodexError::Protocol)?;
+                if !self.execution.has_native_work(id) {
+                    references.push(bcode_harness_models::HarnessNativeReference {
+                        kind: bcode_harness_models::HarnessNativeReferenceKind::Process,
+                        native_id: id.to_owned(),
+                        native_turn_id: None,
+                    });
+                }
+            }
+        }
+        let mut ready = true;
+        for reference in &references {
+            if !self.resolved_native.contains(reference) {
+                self.retention.request(reference.clone())?;
+                ready = false;
+            }
+        }
+        if !ready {
+            return Ok(());
+        }
+        for reference in references {
+            self.resolved_native.remove(&reference);
+        }
+        let response = self.inventory_response.take().ok_or(CodexError::Protocol)?;
+        let next = response["nextCursor"].as_str().map(str::to_owned);
+        if next.is_some() && next == self.inventory_cursor {
+            return Err(CodexError::Protocol);
+        }
+        let events = self.execution.inventory(&response)?;
+        self.queue_execution(events)?;
+        let (scan, index) = self
+            .inventory_scan
+            .get_or_insert_with(|| (uuid::Uuid::new_v4().to_string(), 0));
+        self.inventory_page = Some(bcode_harness_models::HarnessInventoryPage {
+            scan_id: scan.clone(),
+            page_index: *index,
+            next_cursor: next.clone(),
+            consistency: bcode_harness_models::HarnessInventoryConsistency::NonAtomic,
+        });
+        *index = index.checked_add(1).ok_or(CodexError::Bounds)?;
+        self.inventory_cursor = next;
+        if self.inventory_cursor.is_none() {
+            self.inventory = InventoryState::Current;
+            self.inventory_scan = None;
+        }
+        Ok(())
+    }
+
+    fn retain_execution_event(&mut self, event: &Value) -> Result<(), CodexError> {
+        let params = &event["params"];
+        if event.get("id").is_some()
+            || params["threadId"].as_str() != Some(self.binding.native_session_id.as_str())
+            || self.observation_gap
+            || self.uncertain_submission
+        {
+            return Ok(());
+        }
+        let method = event["method"].as_str().ok_or(CodexError::Protocol)?;
+        if method == "turn/completed" && self.inventory_scan.is_none() {
+            self.inventory = InventoryState::RefreshRequired;
+        }
+        let events = self.execution.observe(method, params)?;
+        let count = events.len();
+        self.queue_execution(events)?;
+        let correlations = [
+            params["turnId"]
+                .as_str()
+                .or_else(|| params["turn"]["id"].as_str()),
+            params["item"]["id"].as_str(),
+            params["item"]["processId"].as_str(),
+        ]
+        .into_iter()
+        .flatten()
+        .map(str::to_owned)
+        .collect::<Vec<_>>();
+        for observation in self.pending_execution.iter_mut().rev().take(count) {
+            observation.native_correlations.clone_from(&correlations);
+            observation.validate().map_err(|_| CodexError::Protocol)?;
+        }
+        Ok(())
+    }
+
+    fn queue_execution(
+        &mut self,
+        events: Vec<bcode_harness_models::HarnessExecutionEvent>,
+    ) -> Result<(), CodexError> {
+        for event in events {
+            if self.pending_execution.len() >= bcode_harness_models::MAX_HARNESS_EXECUTION_ITEMS {
+                return Err(CodexError::Bounds);
+            }
+            let observation = HarnessObservation {
+                observation_id: format!("codex-execution:{}", uuid::Uuid::new_v4()),
+                session_id: self.binding.session_id.clone(),
+                generation: self.binding.generation,
+                native_correlations: Vec::new(),
+                completeness: HarnessCompleteness::Complete,
+                kind: HarnessObservationKind::Execution { event },
+            };
+            observation.validate().map_err(|_| CodexError::Protocol)?;
+            self.pending_execution.push_back(observation);
+        }
+        Ok(())
     }
 
     fn terminal_observation(
@@ -727,6 +1110,7 @@ impl CodexSession {
         {
             return Ok(None);
         }
+        self.retain_execution_event(event)?;
         self.retain_file_change_diff(method, params)?;
         if method == "thread/started" {
             if params["thread"]["id"].as_str() != Some(self.binding.native_session_id.as_str()) {
@@ -799,7 +1183,10 @@ impl CodexSession {
                 return Err(CodexError::Uncertain);
             }
             let turn_id = params["turn"]["id"].as_str().ok_or(CodexError::Protocol)?;
-            if self.last_terminal_turn.as_deref() == Some(turn_id) {
+            if self.last_terminal_turn.as_deref() == Some(turn_id)
+                || self.execution.terminal_turn(turn_id)
+                || !self.execution.tracks_turn(turn_id)
+            {
                 return Ok(false);
             }
             if turn_id.is_empty() || turn_id.len() > MAX_HARNESS_ID_BYTES {
@@ -1138,7 +1525,8 @@ impl CodexSession {
                         }
                     }
                     Some("collabAgentToolCall") => {
-                        self.observation_gap = true;
+                        // Delegation has its own lifecycle/unknown coverage. It does not
+                        // invalidate exact foreground acceptance or native terminal evidence.
                         self.status.continuation = HarnessContinuation::Unknown;
                         HarnessObservationKind::Subagent {
                             native_agent_id: item["id"]

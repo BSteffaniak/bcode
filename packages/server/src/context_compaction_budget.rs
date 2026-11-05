@@ -333,6 +333,87 @@ mod tests {
     }
 
     #[test]
+    fn forty_tokens_of_headroom_cannot_hold_complete_structured_summary() {
+        use super::super::{ContentBlock, MessageRole, ModelMessage, build_compaction_request};
+        let summary = serde_json::json!({
+            "format":"bcode.compaction.scope.v2", "current_scope":[],
+            "continuation":serde_json::json!({
+                "format":"bcode.compaction.continuation-sections.v1", "decisions":"",
+                "active_work_blockers":"", "findings_evidence":"",
+                "background":"Deterministic fake-provider compaction simulation."
+            }).to_string()
+        })
+        .to_string();
+        let mut retained = build_compaction_request(
+            crate::SessionId::new(),
+            "fake-echo".into(),
+            bcode_model::ProviderRequestContext::default(),
+            "",
+            "envelope-capacity".into(),
+        );
+        retained.parameters.max_output_tokens = None;
+        // Find a complete request with the measured 6,800-token retained baseline
+        // using the canonical estimator, not a separate characters/token formula.
+        let (mut low, mut high) = (0, 28_000);
+        while low < high {
+            let padding = low + (high - low) / 2;
+            retained.messages = vec![ModelMessage {
+                role: MessageRole::User,
+                content: vec![ContentBlock::Text {
+                    text: "x".repeat(padding),
+                }],
+            }];
+            if local_request_estimate(&retained).tokens < 6_800 {
+                low = padding + 1;
+            } else {
+                high = padding;
+            }
+        }
+        retained.messages = vec![ModelMessage {
+            role: MessageRole::User,
+            content: vec![ContentBlock::Text {
+                text: "x".repeat(low),
+            }],
+        }];
+        assert_eq!(local_request_estimate(&retained).tokens, 6_800);
+        let baseline = retained;
+        let mut original = baseline.clone();
+        original.messages.push(ModelMessage {
+            role: MessageRole::Assistant,
+            content: vec![ContentBlock::Text {
+                text: "historical evidence ".repeat(800),
+            }],
+        });
+        let mut value = input();
+        value.model_id = baseline.model_id.clone();
+        value.context_window = 8_000;
+        value.requested_max_output_tokens = None;
+        value.retained_requested_max_output_tokens = None;
+        value.provider_max_output_tokens = Some(1_000);
+        value.before = local_request_estimate(&original);
+        value.retained_without_summary = local_request_estimate(&baseline);
+        value.minimum_reclaim_tokens = 1_748;
+        let policy = ResolvedSummaryPolicy::resolve(value).unwrap();
+        assert_eq!(policy.retained_available_input_tokens, 6_840);
+        assert_eq!(policy.maximum_retained_tokens(), 40);
+        let mut after = baseline;
+        after
+            .messages
+            .push(crate::historical_recollection(&summary));
+        let estimate = local_request_estimate(&after);
+        assert!(
+            policy.before_tokens.saturating_sub(estimate.tokens) >= policy.minimum_reclaim_tokens,
+            "reclaim must pass so this exercises only complete-envelope capacity"
+        );
+        assert!(estimate.tokens > policy.retained_available_input_tokens);
+        assert!(
+            policy
+                .validate_retained_request(&summary, "", &after)
+                .is_err()
+        );
+    }
+
+    #[test]
     fn native_projection_below_portable_baseline_uses_actual_capacity_and_reclaim() {
         let policy = ResolvedSummaryPolicy::resolve(input()).unwrap();
         let mut request = super::super::build_compaction_request(

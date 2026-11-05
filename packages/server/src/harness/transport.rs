@@ -4,6 +4,22 @@ use std::{sync::Arc, time::Duration};
 
 use bcode_harness_models::{HarnessRequest, HarnessServiceResponse};
 
+tokio::task_local! {
+    static CREDENTIAL_CALLER: (crate::harness_dispatch::ManagedCaller, super::HarnessOwner, Arc<bcode_ipc::harness::ManagedSessionCall>);
+}
+
+/// Retain authenticated admission independently of native request bytes.
+pub async fn with_credential_admission<T>(
+    caller: crate::harness_dispatch::ManagedCaller,
+    owner: super::HarnessOwner,
+    call: bcode_ipc::harness::ManagedSessionCall,
+    operation: impl std::future::Future<Output = T>,
+) -> T {
+    CREDENTIAL_CALLER
+        .scope((caller, owner, Arc::new(call)), operation)
+        .await
+}
+
 /// Selected-plugin semantic transport. Implementations never dispatch Bcode tools or model turns.
 pub trait ManagedHarnessTransport: Send + Sync {
     /// Deliver one validated envelope. Failure after invocation may have native effects.
@@ -352,6 +368,65 @@ impl HarnessPluginTransport {
         decode_readonly_auth(&request, &payload)
     }
 
+    fn credential_bridge(
+        &self,
+        request: &HarnessRequest,
+    ) -> Option<bcode_plugin::PluginInvocationBridge> {
+        // Only an owning auth declaration opts into exact semantic credential delivery.
+        // Existing harnesses without such a declaration retain their legacy delivery contract.
+        let registered = self
+            .state
+            .plugins
+            .auth_provider(&request.instance.auth.provider_id)?;
+        if registered.plugin_id != request.instance.plugin_id {
+            return None;
+        }
+        let admitted = CREDENTIAL_CALLER.try_with(Clone::clone).ok();
+        Some(if let Some((caller, owner, call)) = admitted {
+            let state = Arc::clone(&self.state);
+            let runtime = tokio::runtime::Handle::current();
+            let resolver: bcode_plugin::SensitiveCredentialResolver =
+                Arc::new(move |selection, cancellation| {
+                    if cancellation.is_cancelled() {
+                        return Err(());
+                    }
+                    let admission = crate::harness::CanonicalManagedAdmission::new(
+                        crate::harness::CanonicalHarnessStore::new(&state),
+                    );
+                    // The SDK callback may run inside the plugin's own Tokio runtime.
+                    // Enter the host runtime on a bounded scoped thread, never nested block_on.
+                    let secret = std::thread::scope(|scope| {
+                        scope
+                            .spawn(|| {
+                                runtime.block_on(async {
+                                    tokio::time::timeout(
+                                        CALL_TIMEOUT,
+                                        admission.credential(&caller, &owner, &call, selection),
+                                    )
+                                    .await
+                                    .map_err(|_| ())?
+                                    .map_err(|_| ())
+                                })
+                            })
+                            .join()
+                            .map_err(|_| ())?
+                    })?;
+                    if cancellation.is_cancelled() {
+                        return Err(());
+                    }
+                    Ok(secret)
+                });
+            bcode_plugin::PluginInvocationBridge::new(|_, _| {
+                Err("unsupported bridge operation".into())
+            })
+            .with_credentials(resolver)
+        } else {
+            // Suppress legacy serialized secret maps even when no admission exists.
+            bcode_plugin::PluginInvocationBridge::new(|_, _| Err("unadmitted bridge".into()))
+                .with_credentials(Arc::new(|_, _| Err(())))
+        })
+    }
+
     async fn auth_payload(&self, request: &HarnessRequest) -> Result<Vec<u8>, ManagedHarnessError> {
         request
             .validate()
@@ -381,19 +456,20 @@ impl HarnessPluginTransport {
         }
         // Direct selected-plugin service plumbing has routing-only instrumentation. Do not
         // route through public plugin-service IPC, tool invocation, or request/event tracing.
-        let response = self
-            .state
-            .plugins
-            .invoke_service_scoped_with_timeout(
+        let response = tokio::time::timeout(
+            CALL_TIMEOUT,
+            self.state.plugins.invoke_service_with_bridge_scoped(
                 plugin_id,
                 bcode_harness_models::HARNESS_INTERFACE_ID,
                 request.kind.operation().as_str(),
                 bytes,
                 bcode_plugin::PluginInvocationScope::Global,
-                CALL_TIMEOUT,
-            )
-            .await
-            .map_err(|_| ManagedHarnessError::Unavailable)?;
+                self.credential_bridge(request),
+            ),
+        )
+        .await
+        .map_err(|_| ManagedHarnessError::Deadline)?
+        .map_err(|_| ManagedHarnessError::Unavailable)?;
         if response.payload.len() > MAX_CALL_BYTES || response.error.is_some() {
             return Err(ManagedHarnessError::Invalid);
         }
@@ -446,19 +522,21 @@ impl HarnessPluginTransport {
         }
         // Error payloads may contain native diagnostics or secret-bearing protocol material.
         // Never forward them to public errors, logs or canonical events.
-        let response = self
-            .state
-            .plugins
-            .invoke_service_scoped_with_timeout(
+        let bridge = self.credential_bridge(request);
+        let response = tokio::time::timeout(
+            CALL_TIMEOUT,
+            self.state.plugins.invoke_service_with_bridge_scoped(
                 plugin_id,
                 bcode_harness_models::HARNESS_INTERFACE_ID,
                 operation,
                 bytes,
                 bcode_plugin::PluginInvocationScope::Global,
-                CALL_TIMEOUT,
-            )
-            .await
-            .map_err(|_| ManagedHarnessError::Unavailable)?;
+                bridge,
+            ),
+        )
+        .await
+        .map_err(|_| ManagedHarnessError::Deadline)?
+        .map_err(|_| ManagedHarnessError::Unavailable)?;
         if response.payload.len() > MAX_CALL_BYTES || response.error.is_some() {
             return Err(ManagedHarnessError::Invalid);
         }

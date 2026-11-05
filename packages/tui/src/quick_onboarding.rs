@@ -64,6 +64,7 @@ struct QuickProgram {
     choice_area: Rect,
     outcome: QuickOnboardingOutcome,
     form: Option<ConnectionForm>,
+    backend_selection: bool,
     theme: PresentedTheme,
     keymap: crate::keymap::BmuxKeyMap,
 }
@@ -83,6 +84,7 @@ impl QuickProgram {
             choice_area: Rect::new(0, 0, 0, 0),
             outcome: QuickOnboardingOutcome::Close,
             form: None,
+            backend_selection: false,
             theme: *theme,
             keymap: crate::keymap::BmuxKeyMap::from_config(&bcode_config::TuiConfig::default()),
         }
@@ -107,7 +109,9 @@ impl QuickProgram {
                 self.outcome = QuickOnboardingOutcome::Advanced;
                 return Lifecycle::Exit;
             }
-            Some("tui.quick.connect") => self.form = Some(ConnectionForm::quick()),
+            Some("tui.quick.connect") if !self.backend_selection => {
+                self.form = Some(ConnectionForm::quick());
+            }
             Some(action)
                 if matches!(
                     action,
@@ -143,7 +147,9 @@ impl QuickProgram {
                 self.list.set_selected(Some(self.selected));
             }
             Some("tui.control.submit") if self.input.choices.is_empty() => {
-                self.form = Some(ConnectionForm::quick());
+                if !self.backend_selection {
+                    self.form = Some(ConnectionForm::quick());
+                }
             }
             Some("tui.control.submit") => {
                 self.outcome = QuickOnboardingOutcome::Selected(self.selected);
@@ -206,6 +212,12 @@ impl QuickProgram {
                 width,
                 self.theme.focused,
             ));
+        } else if self.backend_selection {
+            footer.extend(wrapped_rows(
+                "No execution backend is selected.",
+                width,
+                self.theme.muted,
+            ));
         } else {
             footer.extend(wrapped_rows(
                 &format!(
@@ -216,15 +228,26 @@ impl QuickProgram {
                 self.theme.focused,
             ));
         }
-        footer.extend(wrapped_rows(
-            &format!(
-                "{}: Connect another (Sign in / Add key) • {}: Advanced",
-                self.keymap.hint("quick_onboarding", "tui.quick.connect"),
-                self.keymap.hint("quick_onboarding", "tui.quick.advanced")
-            ),
-            width,
-            self.theme.text,
-        ));
+        if self.backend_selection {
+            footer.extend(wrapped_rows(
+                &format!(
+                    "{}: Advanced",
+                    self.keymap.hint("quick_onboarding", "tui.quick.advanced")
+                ),
+                width,
+                self.theme.text,
+            ));
+        } else {
+            footer.extend(wrapped_rows(
+                &format!(
+                    "{}: Connect another (Sign in / Add key) • {}: Advanced",
+                    self.keymap.hint("quick_onboarding", "tui.quick.connect"),
+                    self.keymap.hint("quick_onboarding", "tui.quick.advanced")
+                ),
+                width,
+                self.theme.text,
+            ));
+        }
         footer.extend(wrapped_rows(
             &format!(
                 "{}/{}: choose • {}: Close",
@@ -252,13 +275,21 @@ impl QuickProgram {
             self.input
                 .recovery
                 .as_deref()
-                .unwrap_or("Choose an account and model to start coding."),
+                .unwrap_or(if self.backend_selection {
+                    "Choose how this conversation will execute."
+                } else {
+                    "Choose an account and model to start coding."
+                }),
             width,
             self.theme.text,
         ));
         if self.input.choices.is_empty() {
             header.extend(wrapped_rows(
-                "No usable account is available.",
+                if self.backend_selection {
+                    "No execution backend is available."
+                } else {
+                    "No usable account is available."
+                },
                 width,
                 self.theme.text,
             ));
@@ -273,9 +304,14 @@ impl QuickProgram {
                 0,
                 &wrapped_rows(
                     &format!(
-                        "Resize to choose • {}: continue • {}: connect • {}: Advanced • {}: close",
+                        "Resize to choose • {}: continue • {}: {} • {}: Advanced • {}: close",
                         self.keymap.hint("quick_onboarding", "tui.control.submit"),
                         self.keymap.hint("quick_onboarding", "tui.quick.connect"),
+                        if self.backend_selection {
+                            "unavailable"
+                        } else {
+                            "connect"
+                        },
                         self.keymap.hint("quick_onboarding", "tui.quick.advanced"),
                         self.keymap.hint("quick_onboarding", "tui.control.cancel")
                     ),
@@ -446,9 +482,29 @@ pub async fn run_quick_onboarding_in_shell(
     shell: &mut crate::TerminalShell,
     input: QuickOnboardingInput,
 ) -> Result<QuickOnboardingOutcome, TuiError> {
+    run_picker_in_shell(shell, input, false).await
+}
+
+/// Select an execution backend without offering provider enrollment.
+/// Selection is caller-owned; this screen never discovers, prepares, or starts execution.
+/// # Errors
+/// Returns configuration or terminal errors without closing the caller's shell.
+pub async fn run_backend_selection_in_shell(
+    shell: &mut crate::TerminalShell,
+    input: QuickOnboardingInput,
+) -> Result<QuickOnboardingOutcome, TuiError> {
+    run_picker_in_shell(shell, input, true).await
+}
+
+async fn run_picker_in_shell(
+    shell: &mut crate::TerminalShell,
+    input: QuickOnboardingInput,
+    backend_selection: bool,
+) -> Result<QuickOnboardingOutcome, TuiError> {
     let config = bcode_config::load_config()?;
     let theme = crate::theme::resolve_configured_theme(&config.tui, std::path::Path::new("."));
     let mut program = QuickProgram::new(input, &theme);
+    program.backend_selection = backend_selection;
     program.keymap = crate::keymap::BmuxKeyMap::from_config(&config.tui);
     let mut terminal = shell.terminal()?;
     let (runtime, handle) = bmux_tui_runtime::Runtime::new(
@@ -535,6 +591,31 @@ mod tests {
             ),
         )
     }
+    #[test]
+    fn backend_picker_cannot_enroll_and_keeps_native_choice_semantics() {
+        let mut program = program();
+        program.backend_selection = true;
+        assert_eq!(program.key(KeyCode::Char('c')), Lifecycle::Continue);
+        assert!(program.form.is_none());
+        for (width, height) in [(0, 0), (1, 2), (20, 8), (100, 24)] {
+            let mut buffer = bmux_tui::buffer::Buffer::empty(Rect::new(0, 0, width, height));
+            program.render(&mut PaintCx::new(&mut bmux_tui::frame::Frame::new(
+                &mut buffer,
+            )));
+            let rendered = (0..height)
+                .filter_map(|row| buffer.row_symbols(row))
+                .collect::<String>();
+            assert!(!rendered.contains("Connect another"));
+        }
+        assert_eq!(program.key(KeyCode::Enter), Lifecycle::Exit);
+        assert_eq!(program.outcome, QuickOnboardingOutcome::Selected(0));
+        program.input.choices.clear();
+        assert_eq!(program.key(KeyCode::Enter), Lifecycle::Continue);
+        assert!(program.form.is_none());
+        assert_eq!(program.key(KeyCode::F(2)), Lifecycle::Exit);
+        assert_eq!(program.outcome, QuickOnboardingOutcome::Advanced);
+    }
+
     #[test]
     fn one_confirmation_selects_without_enrollment() {
         let mut program = program();

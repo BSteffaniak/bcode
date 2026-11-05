@@ -2098,6 +2098,31 @@ async fn compaction_trace_declares_only_its_scalar_projection() {
                 .expect("valid no-ref declaration"),
             [] as [bcode_xray::XrayPayloadRef; 0]
         );
+        // Publishing the durable trace also emits its separately declared
+        // canonical-event projection. Consume and verify that event rather than
+        // mistaking it for the next compaction producer observation.
+        let canonical = observation
+            .recv()
+            .await
+            .expect("canonical trace event")
+            .event;
+        assert_eq!(canonical.domain, "session");
+        assert_eq!(canonical.name, "trace_event");
+        assert_eq!(canonical.data["detail"], "no_safe_domain_projection");
+        assert!(!canonical.sensitive);
+        assert_eq!(
+            canonical.capture,
+            Some(bcode_xray_models::XrayCaptureAttachments::new(Vec::new()))
+        );
+        assert_eq!(
+            canonical.payload_references().expect("no canonical refs"),
+            [] as [bcode_xray::XrayPayloadRef; 0]
+        );
+        assert!(
+            !serde_json::to_string(&canonical)
+                .expect("scalar event")
+                .contains("private-provider")
+        );
     }
     drop(state);
 }
@@ -3069,6 +3094,7 @@ async fn synthesis_chunks(
     })?;
     let semantics = serde_json::to_vec(&(
         packing::ALGORITHM_ID,
+        "serialized-fragment-records-v1",
         window,
         status.max_output_tokens,
         super::context_accounting::LOCAL_CONTEXT_ESTIMATOR_VERSION,
@@ -3134,12 +3160,7 @@ async fn synthesis_chunks(
         })?;
         let mut packing_template = complete;
         packing_template.messages.clear();
-        packing::pack_with_policy(
-            packing::PackingGate::Capacity,
-            &chunks,
-            &packing_template,
-            policy,
-        )?
+        packing::pack_fragment_records_with_policy(&chunks, &packing_template, policy)?
     };
     Ok((packed, packing_identity))
 }
@@ -5135,6 +5156,70 @@ mod coverage_tests {
             event_count: 10,
             estimated_reclaimable_tokens: 10_000,
         }
+    }
+
+    #[test]
+    fn serialized_fragment_extraction_and_capacity_packing_preserve_exact_coverage() {
+        let transcript = transcript(
+            (1..=80)
+                .map(|sequence| format!("#{sequence} user:\n{}", "界🙂\"\n".repeat(96)))
+                .collect(),
+            None,
+        );
+        let source = compaction_evidence_input_bounded(&transcript, None, 65_536).unwrap();
+        assert!(
+            source.len() < 80,
+            "extraction aggregates records for storage, not capacity units"
+        );
+        let records: Vec<serde_json::Value> = source
+            .iter()
+            .flat_map(|chunk| chunk.lines())
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        assert_eq!(records.len(), transcript.summary_input.len());
+        for (index, (record, original)) in records.iter().zip(&transcript.summary_input).enumerate()
+        {
+            assert_eq!(record["sequence"], index + 1);
+            assert_eq!(record["provenance"], "user");
+            assert_eq!(record["text"].as_str(), Some(original.as_str()));
+            assert_eq!(record["byte_offset"], 0);
+            assert_eq!(record["final_fragment"], true);
+        }
+        let mut request = build_compaction_request(
+            SessionId::new(),
+            "fake-echo".into(),
+            bcode_model::ProviderRequestContext::default(),
+            "",
+            "coverage".into(),
+        );
+        request.structured_output = Some(response::ResponseContract::Replace.request());
+        let mut before = local_request_estimate(&request);
+        before.tokens += 80_000;
+        let policy = budget::ResolvedSummaryPolicy::resolve(budget::SummaryBudgetInput {
+            provider_id: "test-provider".into(),
+            model_id: request.model_id.clone(),
+            context_window: 4_000,
+            requested_max_output_tokens: request.parameters.max_output_tokens,
+            retained_requested_max_output_tokens: request.parameters.max_output_tokens,
+            provider_max_output_tokens: None,
+            before,
+            retained_without_summary: local_request_estimate(&request),
+            minimum_reclaim_tokens: 10_000,
+            preferred_summary_tokens: 1_500,
+            maximum_summary_bytes: 8_192,
+            maximum_response_bytes: 16_384,
+        })
+        .unwrap();
+        let packed =
+            packing::pack_fragment_records_with_policy(&source, &request, &policy).unwrap();
+        assert!(
+            packed.len() > source.len(),
+            "storage_chunks={} capacity_chunks={} source_bytes={} policy={policy:?}",
+            source.len(),
+            packed.len(),
+            source.concat().len()
+        );
+        assert_eq!(packed.concat(), source.concat());
     }
 
     fn evidence(scopes: Vec<CompactionScope>) -> CompactionEvidence {

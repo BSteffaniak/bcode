@@ -1,6 +1,6 @@
 //! Typed harness service adapter for native plugins.
 //!
-//! Plugins declare `bcode.harness/v2` in their ordinary manifest `services` list.
+//! Plugins declare `bcode.harness/v3` in their ordinary manifest `services` list.
 //! Registration uses that existing manifest boundary, not a new native ABI callback.
 //! The host remains responsible for admission, credential delivery and ownership fencing.
 

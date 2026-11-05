@@ -1,6 +1,8 @@
 #![cfg_attr(feature = "fail-on-warnings", deny(warnings))]
 #![warn(clippy::all, clippy::pedantic, clippy::nursery, clippy::cargo)]
 #![allow(clippy::multiple_crate_versions)]
+// Managed startup composes native terminal and HTTP futures across the CLI boundary.
+#![recursion_limit = "256"]
 
 //! Command-line interface for Bcode.
 
@@ -4620,11 +4622,15 @@ async fn handle_session_io_command(
             json,
         } => cancel_session_turn(session_id, clear_queue, turn_id, json).await?,
         Commands::Attach { session_id } => attach_session(session_id).await?,
-        Commands::Tui { session_id } => {
-            bcode_tui::run_with_static_bundled_and_options(
+        Commands::Tui {
+            session_id,
+            managed_instance,
+            managed_generation,
+        } => {
+            run_selected_tui(
                 session_id,
-                &static_bundled_plugins(),
-                build_info().clone(),
+                managed_instance,
+                managed_generation,
                 launch_options,
             )
             .await?;
@@ -5266,6 +5272,12 @@ enum Commands {
     },
     Tui {
         session_id: Option<SessionId>,
+        /// Explicitly reattach an existing native-managed session, never create or resume a process.
+        #[arg(long, requires_all = ["session_id", "managed_generation"])]
+        managed_instance: Option<String>,
+        /// Exact retained managed generation; mismatch fails without model fallback.
+        #[arg(long, requires = "managed_instance", value_parser = clap::value_parser!(u64).range(1..))]
+        managed_generation: Option<u64>,
     },
     Send {
         session_id: SessionId,
@@ -5314,7 +5326,11 @@ enum Commands {
 
 impl Default for Commands {
     fn default() -> Self {
-        Self::Tui { session_id: None }
+        Self::Tui {
+            session_id: None,
+            managed_instance: None,
+            managed_generation: None,
+        }
     }
 }
 
@@ -21466,6 +21482,43 @@ async fn watch_session(
     }
 }
 
+async fn run_selected_tui(
+    session_id: Option<SessionId>,
+    managed_instance: Option<String>,
+    managed_generation: Option<u64>,
+    launch_options: bcode_tui::TuiLaunchOptions,
+) -> Result<(), CliError> {
+    if let Some(instance) = managed_instance {
+        let session_id = session_id.ok_or_else(|| {
+            CliError::InvalidArguments("managed reattachment requires a session ID".into())
+        })?;
+        let generation = managed_generation.ok_or_else(|| {
+            CliError::InvalidArguments("managed reattachment requires a generation".into())
+        })?;
+        bcode_tui::initialize_build_info(build_info().clone());
+        let mut shell = bcode_tui::TerminalShell::enter()?;
+        let result = Box::pin(shell.run_managed_reattach(
+            session_id,
+            &instance,
+            generation,
+            &static_bundled_plugins(),
+            launch_options,
+        ))
+        .await;
+        shell.finish()?;
+        result?;
+    } else {
+        Box::pin(bcode_tui::run_with_static_bundled_and_options(
+            session_id,
+            &static_bundled_plugins(),
+            build_info().clone(),
+            launch_options,
+        ))
+        .await?;
+    }
+    Ok(())
+}
+
 async fn attach_session(session_id: SessionId) -> Result<(), CliError> {
     let client = BcodeClient::default_endpoint();
     let mut watcher = client
@@ -22180,6 +22233,15 @@ fn write_unverified_observation(
             "cancellation_acknowledged": cancellation_acknowledged,
         }),
     )
+}
+
+#[cfg(all(test, unix))]
+fn private_ipc_test_directory() -> tempfile::TempDir {
+    use std::os::unix::fs::PermissionsExt as _;
+    let directory = tempfile::tempdir().expect("IPC fixture directory");
+    std::fs::set_permissions(directory.path(), std::fs::Permissions::from_mode(0o700))
+        .expect("private IPC fixture permissions");
+    directory
 }
 
 #[cfg(all(test, unix))]
@@ -28768,7 +28830,7 @@ mod send_cli_tests {
             (SubmissionPlacement::Steer, false),
             (SubmissionPlacement::Steer, true),
         ] {
-            let directory = tempfile::tempdir().unwrap();
+            let directory = super::private_ipc_test_directory();
             let endpoint = bcode_ipc::IpcEndpoint::unix_socket(directory.path().join("s.sock"));
             let listener = bcode_ipc::LocalIpcListener::bind(&endpoint).unwrap();
             let session_id = bcode_session_models::SessionId::new();
@@ -30674,7 +30736,7 @@ mod json_stream_output_tests {
             .into_iter()
             .flat_map(|raw| (0..3).map(move |outcome| (raw, outcome)))
         {
-            let directory = tempfile::tempdir().unwrap();
+            let directory = super::private_ipc_test_directory();
             let endpoint = bcode_ipc::IpcEndpoint::unix_socket(directory.path().join("a.sock"));
             let listener = bcode_ipc::LocalIpcListener::bind(&endpoint).unwrap();
             let session_id = bcode_session_models::SessionId::new();
@@ -32225,6 +32287,68 @@ mod interaction_cli_tests {
         assert!(matches!(parsed.command, Some(Commands::Interaction {
             command: InteractionCommand::Input { session_id: actual, payload, json: true }
         }) if actual == session_id && payload == std::path::Path::new("-")));
+    }
+
+    #[test]
+    fn managed_tui_reattachment_requires_explicit_session_instance_and_generation() {
+        let session = bcode_session_models::SessionId::new().to_string();
+        for args in [
+            vec![
+                "bcode",
+                "tui",
+                "--managed-instance",
+                "primary",
+                "--managed-generation",
+                "1",
+            ],
+            vec![
+                "bcode",
+                "tui",
+                session.as_str(),
+                "--managed-instance",
+                "primary",
+            ],
+            vec![
+                "bcode",
+                "tui",
+                session.as_str(),
+                "--managed-generation",
+                "1",
+            ],
+            vec![
+                "bcode",
+                "tui",
+                session.as_str(),
+                "--managed-instance",
+                "primary",
+                "--managed-generation",
+                "0",
+            ],
+        ] {
+            assert!(Cli::try_parse_from(args).is_err());
+        }
+        let cli = Cli::try_parse_from([
+            "bcode",
+            "tui",
+            session.as_str(),
+            "--managed-instance",
+            "primary",
+            "--managed-generation",
+            "1",
+        ])
+        .unwrap();
+        assert!(
+            matches!(cli.command, Some(Commands::Tui { session_id: Some(_), managed_instance: Some(instance), managed_generation: Some(1) }) if instance == "primary")
+        );
+        let cli = Cli::try_parse_from(["bcode", "tui", session.as_str()]).unwrap();
+        assert!(matches!(
+            cli.command,
+            Some(Commands::Tui {
+                managed_instance: None,
+                managed_generation: None,
+                ..
+            })
+        ));
     }
 
     #[test]

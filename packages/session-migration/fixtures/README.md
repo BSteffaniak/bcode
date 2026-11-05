@@ -112,6 +112,30 @@ external evidence and forward-only 17-to-18 planning. Session-owned offline beha
 bounded indexed reads, correlation, deduplication, generation fencing and terminal evidence. Neither
 historical migration nor reconstruction of a locator authorizes native execution or ownership transfer.
 
+## Writer-21/22 compatibility and evidence scope
+
+Writers 21 and 22 remain accepted historical source contracts. No authentic producer snapshot or
+source-store fixture is available for those epochs. Their absence is a provenance limitation, not
+proof that those writers never ran and not a reason to withdraw compatibility.
+
+The fixture gate counts every edge in a fixture's complete planned upgrade path, including
+20→21→22→23. Source-writer coverage remains separate: traversing these edges does not claim that
+writer 21 or 22 emitted a fixture. No historical producer attestation is required for these two
+epochs. Reconstructed inputs must be labeled as contract tests, never authentic historical exports.
+
+Migration-owned normalization tests exercise exact writer-21/22 commitment preservation, malformed
+commitment rejection, writer-22 managed-tool claim metadata preservation and its rejection for older
+writers. Isolated real-database contract tests exercise reconstructed writer-21/22 stores through
+ordinary-read refusal, production migration, strict current readiness, receipt validation, indexed
+evidence checks and repeated reopen. Existing historical-store tests exercise complete upgrade paths.
+These tests validate the represented contracts, not the behavior of an unavailable historical binary.
+
+The migration planner, source admission, canonical transformations and version fences are unchanged.
+Writer-21/22 commitments must not be cleared or regenerated. Claim metadata attributed to writers
+at or below 21 remains rejected. The current target populates canonical event-row identity keys and
+independently validates payload-derived keys and claim evidence before writer publication. Unknown
+versions and unsupported stores continue to fail closed without guessing their representation.
+
 ## Manifest
 
 `manifest.json` is the machine-enforced inventory for permanent sanitized fixtures. Every listed

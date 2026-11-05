@@ -1,3 +1,6 @@
+#[path = "observation_cycle_tests.rs"]
+mod observation_cycle_tests;
+
 use super::*;
 use bcode_claude_code::{Event, NativeMessage, Settlement};
 use bcode_harness_models::{
@@ -5,6 +8,256 @@ use bcode_harness_models::{
     HarnessObservationKind, HarnessResponseValue, HarnessSessionBinding,
 };
 use serde_json::json;
+
+#[test]
+fn native_auth_configuration_and_capability_matrix() {
+    use bcode_claude_code::NativeAuthSupport;
+    for (status, full, expected) in [
+        (false, false, NativeAuthSupport::Unknown),
+        (true, false, NativeAuthSupport::VerifiedStatus),
+        (false, true, NativeAuthSupport::VerifiedStatusAndLogin),
+        (true, true, NativeAuthSupport::VerifiedStatusAndLogin),
+    ] {
+        let config: InstanceConfig = serde_json::from_value(json!({
+            "executable": "/isolated/claude",
+            "config_directory": "/isolated/config",
+            "exact_version": "test-only",
+            "verified_native_auth_status": status,
+            "verified_native_auth": full
+        }))
+        .unwrap();
+        assert_eq!(config.native_auth_support(), expected);
+        let capability = native_auth_capability(config.native_auth_support());
+        assert_eq!(
+            capability.support,
+            if status || full {
+                HarnessSupportLevel::Constrained
+            } else {
+                HarnessSupportLevel::Unsupported
+            }
+        );
+    }
+    let defaults: InstanceConfig = serde_json::from_value(json!({
+        "executable": "/isolated/claude",
+        "config_directory": "/isolated/config",
+        "exact_version": "test-only"
+    }))
+    .unwrap();
+    assert_eq!(defaults.native_auth_support(), NativeAuthSupport::Unknown);
+}
+
+#[test]
+fn execution_terminal_is_only_exact_attribution_plus_native_result_not_idle() {
+    use bcode_claude_code::{AttributionStage, SubmissionAttribution};
+    use bcode_harness_models::{HarnessExecutionEvent, HarnessTerminalDisposition};
+    let mut normalizer = normalizer();
+    normalizer.configure_execution(true, true);
+    let submission = HarnessSubmission {
+        submission_id: "foreground".into(),
+        attempt_id: "00000000-0000-4000-8000-000000000001".into(),
+        session_id: "session".into(),
+        generation: 7,
+        text: "hello".into(),
+        placement: HarnessPlacement::NextTurn,
+    };
+    let uuid = normalizer.retain_submission(&submission).unwrap();
+    let idle = normalizer.event(Event::Message(NativeMessage::System(
+        json!({"type":"system","subtype":"session_state_changed","state":"idle"}),
+    )));
+    assert!(!idle.iter().any(|observation| matches!(
+        observation.kind,
+        HarnessObservationKind::Execution {
+            event: HarnessExecutionEvent::SubmissionTerminal { .. }
+        }
+    )));
+    let frame = "00000000-0000-4000-8000-000000000002";
+    normalizer.event(Event::Attribution(SubmissionAttribution {
+        native_frame_uuid: frame.into(),
+        primary: uuid.clone(),
+        consumed: vec![uuid],
+        resumed: false,
+        stage: AttributionStage::Result {
+            is_error: false,
+            queued_turn_count: Some(0),
+        },
+    }));
+    let result = Event::Message(NativeMessage::Result(
+        json!({"type":"result","uuid":frame,"subtype":"success","is_error":false,"result":"complete output"}),
+    ));
+    let observations = normalizer.event(result.clone());
+    assert!(observations.iter().any(|observation| matches!(&observation.kind,
+        HarnessObservationKind::Execution { event: HarnessExecutionEvent::SubmissionTerminal {
+            attempt, native_turn_id: None, native_frame_id: Some(id), disposition: HarnessTerminalDisposition::Completed, output: Some(text)
+        }} if attempt.submission_id == "foreground" && id == frame && text == "complete output")));
+    assert!(!normalizer.event(result).iter().any(|observation| matches!(
+        observation.kind,
+        HarnessObservationKind::Execution {
+            event: HarnessExecutionEvent::SubmissionTerminal { .. }
+        }
+    )));
+}
+
+#[test]
+fn acknowledged_normalized_execution_exceeds_1024_sequential_attempts() {
+    use bcode_claude_code::{AttributionStage, SubmissionAttribution};
+    let mut normalizer = normalizer();
+    normalizer.configure_execution(true, true);
+    normalizer.event(Event::Message(NativeMessage::System(
+        json!({"type":"system","subtype":"init"}),
+    )));
+    for serial in 0..1100 {
+        let submission = HarnessSubmission {
+            submission_id: format!("submission-{serial}"),
+            attempt_id: format!("00000000-0000-4000-8000-{serial:012x}"),
+            session_id: "session".into(),
+            generation: 7,
+            text: "hello".into(),
+            placement: HarnessPlacement::NextTurn,
+        };
+        let uuid = normalizer.retain_submission(&submission).unwrap();
+        let frame = format!("11111111-1111-4111-8111-{serial:012x}");
+        let mut observations = normalizer.event(Event::Attribution(SubmissionAttribution {
+            native_frame_uuid: frame.clone(),
+            primary: uuid.clone(),
+            consumed: vec![uuid],
+            resumed: false,
+            stage: AttributionStage::Result {
+                is_error: false,
+                queued_turn_count: Some(0),
+            },
+        }));
+        observations.extend(normalizer.event(Event::Message(NativeMessage::Result(
+            json!({"type":"result","uuid":frame,
+            "subtype":"success","is_error":false,"result":"answer"}),
+        ))));
+        observations.extend(normalizer.event(Event::Message(NativeMessage::System(
+            json!({"type":"system","subtype":"session_state_changed","state":"idle"}),
+        ))));
+        assert_eq!(normalizer.retire_acknowledged(), Vec::new());
+        for observation in observations {
+            normalizer.acknowledge_execution(&observation.observation_id);
+        }
+        assert_eq!(normalizer.retire_acknowledged().len(), 1);
+        assert_eq!(normalizer.retained_attribution(), []);
+    }
+}
+
+fn retained_page_ack(
+    metadata: bcode_harness_models::HarnessRetentionPage,
+    canonical_revision: u64,
+) -> bcode_harness_models::HarnessRetentionContext {
+    bcode_harness_models::HarnessRetentionContext {
+        connection_id: metadata.connection_id,
+        acknowledgment: Some(bcode_harness_models::HarnessCanonicalAck {
+            page_id: metadata.page_id,
+            observations_digest: metadata.observations_digest,
+            canonical_revision,
+        }),
+        hydration: Vec::new(),
+    }
+}
+
+#[test]
+fn observation_ack_boundary_retires_1100_attempts_without_losing_pending_work() {
+    use bcode_claude_code::{AttributionStage, SubmissionAttribution};
+    let mut normalized = normalizer();
+    normalized.configure_execution(true, true);
+    normalized.event(Event::Message(NativeMessage::System(
+        json!({"type":"system","subtype":"init"}),
+    )));
+    let prepared = HarnessPreparedSession {
+        open_id: "open".into(),
+        session_id: "session".into(),
+        instance_id: "instance".into(),
+        generation: 7,
+        native_version: "tested-version".into(),
+        requested_native_session_id: Some("native".into()),
+    };
+    let mut stream = StreamState {
+        normalizer: normalized,
+        retention: retention::PageRetention::new("test-connection".into()),
+        observations: VecDeque::new(),
+        gap: false,
+        acknowledged: None,
+        retired_attempts: Vec::new(),
+    };
+    let mut after = None;
+    let mut pending_empty_ack = None;
+    for serial in 0..1100 {
+        let submission = HarnessSubmission {
+            submission_id: format!("submission-{serial}"),
+            attempt_id: format!("00000000-0000-4000-8000-{serial:012x}"),
+            session_id: "session".into(),
+            generation: 7,
+            text: "hello".into(),
+            placement: HarnessPlacement::NextTurn,
+        };
+        let uuid = stream.normalizer.retain_submission(&submission).unwrap();
+        let frame = format!("11111111-1111-4111-8111-{serial:012x}");
+        let events = [
+            Event::Attribution(SubmissionAttribution {
+                native_frame_uuid: frame.clone(),
+                primary: uuid.clone(),
+                consumed: vec![uuid],
+                resumed: false,
+                stage: AttributionStage::Result {
+                    is_error: false,
+                    queued_turn_count: Some(0),
+                },
+            }),
+            Event::Message(NativeMessage::Result(
+                json!({"type":"result","uuid":frame,"subtype":"success","is_error":false,"result":"answer"}),
+            )),
+            Event::Message(NativeMessage::System(
+                json!({"type":"system","subtype":"session_state_changed","state":"idle"}),
+            )),
+        ];
+        for event in events {
+            let observations = stream.normalizer.event(event);
+            assert!(stream.push(observations));
+        }
+        let request = HarnessObserveRequest {
+            retention: pending_empty_ack.take(),
+            target: HarnessSessionTarget::Confirmed(binding()),
+            after: after.clone(),
+            limit: 32,
+            wait_millis: 0,
+        };
+        let HarnessServiceResponseKind::Observations(page) = stream
+            .observation_page(&prepared, &request, &Settlement::Settled)
+            .unwrap()
+        else {
+            panic!("page")
+        };
+        after = page.next_after;
+        assert_eq!(stream.retired_attempts, Vec::new());
+        let metadata = page.retention.expect("retained page");
+        let request = HarnessObserveRequest {
+            retention: Some(retained_page_ack(metadata, serial + 1)),
+            after: after.clone(),
+            ..request
+        };
+        let HarnessServiceResponseKind::Observations(empty) = stream
+            .observation_page(&prepared, &request, &Settlement::Settled)
+            .unwrap()
+        else {
+            panic!("empty retained page");
+        };
+        assert_eq!(empty.observations, Vec::new());
+        pending_empty_ack = Some(retained_page_ack(
+            empty.retention.expect("empty poll retention"),
+            serial + 1,
+        ));
+        assert_eq!(
+            std::mem::take(&mut stream.retired_attempts).len(),
+            1,
+            "serial={serial}, retained={:?}, delivered={:?}",
+            stream.normalizer.retained_attribution(),
+            page.observations
+        );
+        assert_eq!(stream.normalizer.retained_attribution(), []);
+    }
+}
 
 #[test]
 fn attributed_attempts_are_retained_without_claiming_turn_acceptance() {
@@ -172,7 +425,7 @@ fn attributed_attempts_reject_wrong_owner_resume_and_nonuuid_attempts() {
 #[test]
 fn attribution_retention_is_bounded_and_never_recycles_attempts() {
     let mut normalizer = normalizer();
-    for index in 0..256 {
+    for index in 0..bcode_harness_models::MAX_HARNESS_EXECUTION_ITEMS {
         let submission = HarnessSubmission {
             submission_id: format!("submission-{index}"),
             attempt_id: format!("00000000-0000-4000-8000-{index:012x}"),
@@ -194,8 +447,17 @@ fn attribution_retention_is_bounded_and_never_recycles_attempts() {
     assert!(normalizer.retain_submission(&overflow).is_err());
 }
 
-#[test]
-fn eof_after_confirmation_and_interaction_keeps_retained_evidence_readable() {
+fn eof_observe_request(prepared_target: HarnessSessionTarget) -> HarnessObserveRequest {
+    HarnessObserveRequest {
+        retention: None,
+        target: prepared_target,
+        after: None,
+        limit: 8,
+        wait_millis: 0,
+    }
+}
+
+fn eof_stream_fixture() -> (HarnessPreparedSession, HarnessSessionTarget, StreamState) {
     let prepared = HarnessPreparedSession {
         open_id: "open-eof".into(),
         session_id: "session".into(),
@@ -205,12 +467,20 @@ fn eof_after_confirmation_and_interaction_keeps_retained_evidence_readable() {
         requested_native_session_id: Some("native".into()),
     };
     let prepared_target = HarnessSessionTarget::Prepared(prepared.clone());
-    let mut stream = StreamState {
+    let stream = StreamState {
         normalizer: Normalizer::with_target(prepared_target.clone(), prepared.open_id.clone()),
+        retention: retention::PageRetention::new("test-connection".into()),
         observations: VecDeque::new(),
         gap: false,
         acknowledged: None,
+        retired_attempts: Vec::new(),
     };
+    (prepared, prepared_target, stream)
+}
+
+#[test]
+fn eof_after_confirmation_and_interaction_keeps_retained_evidence_readable() {
+    let (prepared, prepared_target, mut stream) = eof_stream_fixture();
     let confirmation = stream.normalizer.confirmation("native").unwrap();
     assert!(stream.push(confirmation));
     let interaction = stream
@@ -220,12 +490,7 @@ fn eof_after_confirmation_and_interaction_keeps_retained_evidence_readable() {
     // The reader's EOF path invalidates live callbacks, not the evidence queue.
     stream.disconnected();
     assert!(stream.normalizer.pending.is_empty());
-    let mut observe = HarnessObserveRequest {
-        target: prepared_target,
-        after: None,
-        limit: 8,
-        wait_millis: 0,
-    };
+    let mut observe = eof_observe_request(prepared_target);
     let HarnessServiceResponseKind::Observations(page) = stream
         .observation_page(&prepared, &observe, &Settlement::Uncertain)
         .unwrap()
@@ -280,6 +545,27 @@ fn eof_after_confirmation_and_interaction_keeps_retained_evidence_readable() {
     ));
     observe.target = stream.normalizer.target.clone();
     observe.after = page.next_after;
+    let replayed = stream
+        .observation_page(&prepared, &observe, &Settlement::Uncertain)
+        .unwrap();
+    let HarnessServiceResponseKind::Observations(replayed) = replayed else {
+        panic!("retained replay")
+    };
+    assert_eq!(
+        replayed.observations.len(),
+        2,
+        "after alone cannot retire evidence"
+    );
+    let metadata = page.retention.unwrap();
+    observe.retention = Some(bcode_harness_models::HarnessRetentionContext {
+        connection_id: metadata.connection_id,
+        acknowledgment: Some(bcode_harness_models::HarnessCanonicalAck {
+            page_id: metadata.page_id,
+            canonical_revision: 1,
+            observations_digest: metadata.observations_digest,
+        }),
+        hydration: Vec::new(),
+    });
     let HarnessServiceResponseKind::Observations(drained) = stream
         .observation_page(&prepared, &observe, &Settlement::Uncertain)
         .unwrap()
@@ -619,9 +905,11 @@ fn native_cancellation_invalidates_assistance_without_stopping_observations() {
 fn bounded_queue_never_silently_evicts_unacknowledged_history() {
     let mut stream = StreamState {
         normalizer: normalizer(),
+        retention: retention::PageRetention::new("test-connection".into()),
         observations: VecDeque::new(),
         gap: false,
         acknowledged: None,
+        retired_attempts: Vec::new(),
     };
     for _ in 0..MAX_RETAINED_OBSERVATIONS {
         let observations = stream
@@ -766,6 +1054,43 @@ fn oversized_or_malformed_requests_do_not_start_a_runtime() {
     }
 }
 #[test]
+fn terminal_auth_alias_preserves_legacy_preparation_validation_without_starting_runtime() {
+    for interface in [
+        NATIVE_HANDOFF_INTERFACE_ID,
+        bcode_harness_models::TERMINAL_AUTH_INTERFACE_ID,
+    ] {
+        for (operation, payload) in [
+            (NATIVE_HANDOFF_OPERATION, b"not-json".to_vec()),
+            (
+                NATIVE_HANDOFF_OPERATION,
+                vec![b'x'; MAX_HARNESS_WIRE_BYTES + 1],
+            ),
+            ("launch", b"{}".to_vec()),
+        ] {
+            let mut plugin = ClaudeCodePlugin::default();
+            let context = NativeServiceContext {
+                plugin_id: PLUGIN_ID.into(),
+                request: bcode_plugin_sdk::ServiceRequest {
+                    interface_id: interface.into(),
+                    operation: operation.into(),
+                    payload,
+                },
+                config: bcode_plugin_sdk::PluginConfigContext::default(),
+                events: bcode_plugin_sdk::ServiceEventEmitter::default(),
+                diagnostics: None,
+                cancellation: bcode_plugin_sdk::ServiceCancellation::default(),
+                bridge: bcode_plugin_sdk::ServiceBridge::default(),
+                transient_progress_limits: bcode_plugin_sdk::TransientProgressLimits::default(),
+            };
+            let response = plugin.invoke_service(context);
+            assert_eq!(response.error.unwrap().code, "invalid_request");
+            assert!(plugin.runtime.is_none());
+            assert!(plugin.processes.is_empty());
+        }
+    }
+}
+
+#[test]
 fn handoff_is_explicit_namespace_specific_and_nonexecuting() {
     use bcode_claude_code::{
         BillingRoute, LaunchOptions, Limits, NativeAuthSupport, NativeEnvironment,
@@ -797,6 +1122,17 @@ fn handoff_is_explicit_namespace_specific_and_nonexecuting() {
         auth_support: NativeAuthSupport::VerifiedStatusAndLogin,
         limits: Limits::default(),
     };
+    for support in [
+        NativeAuthSupport::Unknown,
+        NativeAuthSupport::VerifiedStatus,
+    ] {
+        options.auth_support = support;
+        assert!(matches!(
+            native_login_handoff_data(&instance, &options),
+            Err(HarnessFailure::Policy)
+        ));
+    }
+    options.auth_support = NativeAuthSupport::VerifiedStatusAndLogin;
     let handoff = native_login_handoff_data(&instance, &options).unwrap();
     assert_eq!(handoff.arguments, ["auth", "login"]);
     assert_eq!(handoff.method.method_id, "native-login");

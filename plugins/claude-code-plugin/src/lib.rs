@@ -6,8 +6,13 @@ mod attribution;
 mod auth;
 mod capabilities;
 mod config;
+mod diagnostics;
+mod execution;
 mod normalize;
 mod parent_bridge;
+mod recovery;
+mod retention;
+mod tool_bridge;
 pub use attribution::RetainedAttribution;
 pub use auth::{
     NATIVE_HANDOFF_INTERFACE_ID, NATIVE_HANDOFF_OPERATION, NativeLoginExecution,
@@ -18,19 +23,23 @@ pub use auth::{
 mod tests;
 
 use bcode_claude_code::{ClaudeClient, ClaudeSession, Event, Settlement};
+#[cfg(test)]
+use bcode_harness_models::HarnessAuthCustody;
 use bcode_harness_models::{
-    HARNESS_INTERFACE_ID, HARNESS_SCHEMA_VERSION, HarnessAttention, HarnessAuthCustody,
+    HARNESS_INTERFACE_ID, HARNESS_SCHEMA_VERSION, HarnessAttemptIdentity, HarnessAttention,
     HarnessCapability, HarnessCompleteness, HarnessContractError, HarnessControlRequest,
     HarnessDeliveryState, HarnessFailure, HarnessInspection, HarnessInstance,
-    HarnessInteractionKind, HarnessObservation, HarnessObservationPage, HarnessObserveRequest,
-    HarnessOpenRequest, HarnessPlacement, HarnessPreparedSession, HarnessReceipt,
-    HarnessReconcileRequest, HarnessReconciliation, HarnessRequest, HarnessRequestKind,
-    HarnessResponse, HarnessServiceResponse, HarnessServiceResponseKind, HarnessSessionTarget,
-    HarnessSubmission, HarnessSupportLevel, MAX_HARNESS_ID_BYTES, MAX_HARNESS_WIRE_BYTES,
+    HarnessInteractionKind, HarnessObservation, HarnessObservationKind, HarnessObservationPage,
+    HarnessObserveRequest, HarnessOpenRequest, HarnessPlacement, HarnessPreparedSession,
+    HarnessReceipt, HarnessReconcileRequest, HarnessReconciliation, HarnessRequest,
+    HarnessRequestKind, HarnessResponse, HarnessServiceResponse, HarnessServiceResponseKind,
+    HarnessSessionTarget, HarnessSubmission, HarnessSupportLevel, MAX_HARNESS_ID_BYTES,
+    MAX_HARNESS_WIRE_BYTES,
 };
 use bcode_plugin_sdk::prelude::*;
 use config::{Config, InstanceConfig};
 use normalize::Normalizer;
+use serde_json::Value;
 use std::{
     collections::{BTreeMap, VecDeque},
     path::PathBuf,
@@ -47,8 +56,25 @@ struct StreamState {
     observations: VecDeque<HarnessObservation>,
     gap: bool,
     acknowledged: Option<String>,
+    retention: retention::PageRetention,
+    retired_attempts: Vec<HarnessAttemptIdentity>,
 }
 impl StreamState {
+    fn tool_diagnostic(&mut self, identity: &str, diagnostic: diagnostics::Diagnostic) -> bool {
+        let target = &self.normalizer.target;
+        self.push(vec![HarnessObservation {
+            observation_id: format!("claude-mcp:{}:{identity}", target.generation()),
+            session_id: target.session_id().to_owned(),
+            generation: target.generation(),
+            native_correlations: Vec::new(),
+            completeness: HarnessCompleteness::Complete,
+            kind: HarnessObservationKind::Diagnostic {
+                code: diagnostic.code().into(),
+                message: diagnostic.message(),
+            },
+        }])
+    }
+
     fn push(&mut self, observations: Vec<HarnessObservation>) -> bool {
         if self.observations.len().saturating_add(observations.len()) > MAX_RETAINED_OBSERVATIONS {
             self.gap = true;
@@ -67,7 +93,8 @@ impl StreamState {
 impl StreamState {
     fn disconnected(&mut self) {
         self.gap = true;
-        self.normalizer.invalidate_callbacks();
+        let evidence = self.normalizer.connection_lost();
+        let _ = self.push(evidence);
     }
 
     fn observation_page(
@@ -79,17 +106,33 @@ impl StreamState {
         if !retained_target_matches(&self.normalizer.target, prepared, &observe.target) {
             return Err(HarnessFailure::StaleGeneration);
         }
-        // Cursor acknowledgement only discards the exact known prefix; arbitrary cursors fail closed.
-        if let Some(after) = &observe.after
-            && self.acknowledged.as_ref() != Some(after)
-        {
-            let index = self
-                .observations
-                .iter()
-                .position(|item| &item.observation_id == after)
-                .ok_or(HarnessFailure::Conflict)?;
-            self.observations.drain(..=index);
-            self.acknowledged = Some(after.clone());
+        let acknowledged = self.retention.apply(observe.retention.as_ref())?;
+        for observation in &acknowledged {
+            if self.observations.front().map(|item| &item.observation_id)
+                != Some(&observation.observation_id)
+            {
+                return Err(HarnessFailure::Conflict);
+            }
+            self.observations.pop_front();
+            self.normalizer
+                .acknowledge_execution(&observation.observation_id);
+            self.normalizer.acknowledge_record(observation);
+            self.acknowledged = Some(observation.observation_id.clone());
+        }
+        if !acknowledged.is_empty() {
+            self.retired_attempts
+                .extend(self.normalizer.retire_acknowledged());
+        }
+        if let Some(retention) = &observe.retention {
+            self.normalizer
+                .apply_hydration(&retention.hydration)
+                .map_err(|_| HarnessFailure::Conflict)?;
+        }
+        if !self.retention.pending() {
+            let staged = self.normalizer.pump();
+            if !staged.is_empty() && !self.push(staged) {
+                return Err(HarnessFailure::Uncertain);
+            }
         }
         let mut observations = Vec::new();
         let mut bytes = 0_usize;
@@ -103,6 +146,7 @@ impl StreamState {
             bytes += size;
             observations.push(observation.clone());
         }
+        let (retention, observations) = self.retention.offer(observations)?;
         let mut execution_status = normalize::status(settlement);
         if *settlement != Settlement::Uncertain
             && self
@@ -115,6 +159,9 @@ impl StreamState {
         }
         Ok(HarnessServiceResponseKind::Observations(
             HarnessObservationPage {
+                retention: Some(retention),
+                hydration_requests: self.normalizer.hydration_requests(),
+                inventory_page: self.normalizer.inventory_page(),
                 next_after: observations.last().map(|item| item.observation_id.clone()),
                 observations,
                 completeness: if self.gap {
@@ -149,6 +196,7 @@ struct Process {
     submissions: BTreeMap<String, (HarnessSubmission, HarnessReceipt)>,
     responses: BTreeMap<String, HarnessResponse>,
     controls: BTreeMap<String, &'static str>,
+    released_close: Option<HarnessControlRequest>,
     closed: bool,
 }
 /// Native plugin with a persistent I/O runtime. No plugin-owned persistence or recovery journal.
@@ -159,11 +207,243 @@ pub struct ClaudeCodePlugin {
     /// Failed opens are uncertain and cannot be silently repeated during this runtime.
     opens: BTreeMap<String, HarnessOpenRequest>,
     auth: auth::AuthFlows,
+    tool_queues: BTreeMap<String, Arc<Mutex<tool_bridge::Queue>>>,
 }
+impl ClaudeCodePlugin {
+    fn record_host_tools_status(&self, process: &Process, identity: String) -> Option<()> {
+        let client = process.client.clone();
+        let stream = Arc::clone(&process.stream);
+        self.runtime.as_ref()?.spawn(async move {
+            let status = client.host_tools_status().await.unwrap_or("unavailable");
+            if let Ok(mut stream) = stream.lock() {
+                let _ = stream.tool_diagnostic(
+                    &identity,
+                    diagnostics::Diagnostic::NativeStatus(diagnostics::Connection::from_label(
+                        status,
+                    )),
+                );
+                drop(stream);
+            }
+        });
+        Some(())
+    }
+
+    fn refresh_host_tools(&self, process: &Process, identity: String) -> Option<()> {
+        let client = process.client.clone();
+        let stream = Arc::clone(&process.stream);
+        let counts = client.sdk_metadata_counts();
+        if let Ok(mut state) = stream.lock() {
+            let _ = state.tool_diagnostic(
+                &format!("{identity}-metadata-before-refresh"),
+                diagnostics::Diagnostic::Metadata { counts },
+            );
+            let _ = state.tool_diagnostic(
+                &format!("{identity}-metadata-unavailable"),
+                diagnostics::Diagnostic::MetadataUnavailable,
+            );
+        }
+        self.runtime.as_ref()?.spawn(async move {
+            let outcome = client.refresh_sdk_catalogs_acknowledged().await;
+            let counts = client.sdk_metadata_counts();
+            if let Ok(mut state) = stream.lock() {
+                let _ = state.tool_diagnostic(
+                    &format!("{identity}-refresh"),
+                    diagnostics::Diagnostic::Refresh(diagnostics::Refresh::classify(&outcome)),
+                );
+                let _ = state.tool_diagnostic(
+                    &format!("{identity}-metadata"),
+                    diagnostics::Diagnostic::Metadata { counts },
+                );
+            }
+        });
+        Some(())
+    }
+
+    fn complete_tool_queue(
+        &self,
+        scope: &bcode_harness_models::ManagedToolQueueScope,
+        response: bcode_harness_models::ManagedToolResponse,
+    ) -> Option<bcode_harness_models::ManagedToolQueueResponse> {
+        let catalog_diagnostic = diagnostics::CatalogResponse::classify(&response.outcome);
+        let diagnostic_id = response.request_id.clone();
+        let completed = self
+            .tool_queues
+            .get(&scope.session_id)?
+            .lock()
+            .ok()?
+            .complete(scope, response)
+            .ok()?;
+        if let Some((callback_id, response)) = completed {
+            let process = self.processes.get(&scope.session_id)?;
+            let client = process.client.clone();
+            let stream = Arc::clone(&process.stream);
+            self.runtime.as_ref()?.spawn(async move {
+                let delivered = client.respond(&callback_id, response).await.is_ok();
+                if let Some(message) = catalog_diagnostic {
+                    let identity = format!("{diagnostic_id}-catalog");
+                    if let Ok(mut stream) = stream.lock() {
+                        let _ = stream.tool_diagnostic(
+                            &identity,
+                            diagnostics::Diagnostic::CatalogDelivery {
+                                response: message,
+                                written: delivered,
+                            },
+                        );
+                        drop(stream);
+                    }
+                }
+            });
+        }
+        Some(bcode_harness_models::ManagedToolQueueResponse::Completed)
+    }
+
+    fn tool_queue_service(&mut self, context: &NativeServiceContext) -> ServiceResponse {
+        use bcode_harness_models::{
+            ManagedToolQueueRequest as Request, ManagedToolQueueResponse as Response,
+        };
+        if context.request.payload.len() > bcode_harness_models::MAX_MANAGED_TOOL_MESSAGE_BYTES {
+            return ServiceResponse::json(&Response::Rejected)
+                .unwrap_or_else(|_| ServiceResponse::error("invalid_request", "Queue rejected"));
+        }
+        let result = (|| {
+            let request: Request = context.request.payload_json().ok()?;
+            if request.validate().is_err() || request.operation() != context.request.operation {
+                return None;
+            }
+            let scope = request.scope().clone();
+            match request {
+                Request::Bind { .. } => {
+                    // Only the host queue route admits this Bind. Existing inert SDK
+                    // registration can activate after ordinary Open has prepared its target.
+                    if let Some(process) = self.processes.get(&scope.session_id) {
+                        let current = self.tool_queues.get(&scope.session_id)?;
+                        if process.closed || process.open.generation != scope.generation {
+                            return None;
+                        }
+                        let mut queue = current.lock().ok()?;
+                        if queue.scope() == Some(&scope) {
+                            return Some(Response::Bound);
+                        }
+                        // The host must have revoked the prior principal. This queue existed
+                        // at process launch; a process restored without it cannot gain tools.
+                        if queue.scope().is_some() || !queue.bind(scope.clone()) {
+                            return None;
+                        }
+                        drop(queue);
+                        // The task waits outside this exclusive service call and queue lock.
+                        // Until catalog delivery, observations explicitly mark metadata unavailable.
+                        self.refresh_host_tools(process, scope.bridge_id.clone())?;
+                        self.record_host_tools_status(process, scope.bridge_id.clone())?;
+                        return Some(Response::Bound);
+                    }
+                    self.tool_queues.retain(|id, queue| {
+                        self.processes.contains_key(id)
+                            || queue.lock().is_ok_and(|queue| queue.scope().is_some())
+                    });
+                    if self.tool_queues.len() >= 128 {
+                        return None;
+                    }
+                    let queue = self
+                        .tool_queues
+                        .entry(scope.session_id.clone())
+                        .or_default();
+                    if !queue.lock().ok()?.bind(scope) {
+                        return None;
+                    }
+                    Some(Response::Bound)
+                }
+                Request::Drain { .. } => {
+                    if let Some(process) = self.processes.get(&scope.session_id)
+                        && (process.closed || process.open.generation != scope.generation)
+                    {
+                        return None;
+                    }
+                    let requests = self
+                        .tool_queues
+                        .get(&scope.session_id)?
+                        .lock()
+                        .ok()?
+                        .drain(&scope)?;
+                    Some(Response::Requests { requests })
+                }
+                Request::Complete { response, .. } => self.complete_tool_queue(&scope, response),
+                Request::Revoke { .. } => {
+                    let replies = self
+                        .tool_queues
+                        .get(&scope.session_id)?
+                        .lock()
+                        .ok()?
+                        .revoke(&scope)?;
+                    if let Some(process) = self.processes.get(&scope.session_id) {
+                        if let Ok(mut stream) = process.stream.lock() {
+                            let _ = stream.tool_diagnostic(
+                                &format!("{}-revoked", scope.bridge_id),
+                                diagnostics::Diagnostic::QueueRevoked,
+                            );
+                        }
+                        let client = process.client.clone();
+                        self.runtime.as_ref()?.spawn(async move {
+                            for (id, response) in replies {
+                                let _ = client.respond(&id, response).await;
+                            }
+                        });
+                    }
+                    Some(Response::Revoked)
+                }
+            }
+        })()
+        .unwrap_or(Response::Rejected);
+        ServiceResponse::json(&result)
+            .unwrap_or_else(|_| ServiceResponse::error("invalid_request", "Queue rejected"))
+    }
+}
+
 impl RustPlugin for ClaudeCodePlugin {
+    fn register_auth_providers(&mut self, registrar: AuthRegistrar) -> Result<(), PluginError> {
+        use bcode_provider_auth_models::{
+            AUTH_PROVIDER_CONTRIBUTION_SCHEMA_VERSION, AuthMethodContribution,
+            AuthProviderContribution, AuthSecretField,
+        };
+        registrar
+            .register(&AuthProviderContribution {
+                schema_version: AUTH_PROVIDER_CONTRIBUTION_SCHEMA_VERSION,
+                provider_id: "claude-code".into(),
+                display_name: "Claude Code".into(),
+                methods: vec![AuthMethodContribution::SecretFields {
+                    method_id: "api_key".into(),
+                    display_name: "Anthropic API key".into(),
+                    fields: vec![AuthSecretField {
+                        credential_id: "api_key".into(),
+                        storage_key: "ANTHROPIC_API_KEY".into(),
+                        prompt: "Anthropic API key".into(),
+                        optional: false,
+                        validation: bcode_provider_auth_models::AuthSecretValidation::default(),
+                        discovery_sources: Vec::new(),
+                        invocation_env: Vec::new(),
+                    }],
+                    supports_verification: false,
+                    supports_revocation: false,
+                }],
+            })
+            .map_err(|_| PluginError::failed("Claude auth registration failed"))
+    }
+
     fn invoke_service(&mut self, context: NativeServiceContext) -> ServiceResponse {
         if context.plugin_id == PLUGIN_ID
-            && context.request.interface_id == NATIVE_HANDOFF_INTERFACE_ID
+            && context.request.interface_id == bcode_harness_models::HARNESS_RECOVERY_INTERFACE_ID
+        {
+            return self.recovery_service(&context);
+        }
+        if context.plugin_id == PLUGIN_ID
+            && context.request.interface_id == bcode_harness_models::MANAGED_TOOL_QUEUE_INTERFACE_ID
+        {
+            return self.tool_queue_service(&context);
+        }
+        if context.plugin_id == PLUGIN_ID
+            && matches!(
+                context.request.interface_id.as_str(),
+                NATIVE_HANDOFF_INTERFACE_ID | bcode_harness_models::TERMINAL_AUTH_INTERFACE_ID
+            )
         {
             return prepare_handoff(&context);
         }
@@ -228,7 +508,7 @@ impl RustPlugin for ClaudeCodePlugin {
                 HarnessServiceResponseKind::Failure(HarnessFailure::Unavailable),
             );
         };
-        let result = runtime.block_on(self.invoke(&request, selected));
+        let result = runtime.block_on(self.invoke(&request, selected, &context));
         self.runtime = Some(runtime);
         reply(
             &request,
@@ -260,12 +540,11 @@ impl ClaudeCodePlugin {
         &mut self,
         request: &HarnessRequest,
         selected: &InstanceConfig,
+        context: &NativeServiceContext,
     ) -> Result<HarnessServiceResponseKind, HarnessFailure> {
+        selected.credential_selection(&request.instance)?;
         if request.instance.executable != selected.executable.to_string_lossy()
             || request.instance.config_namespace != selected.config_directory.to_string_lossy()
-            || request.instance.auth.credential_namespace != request.instance.config_namespace
-            || request.instance.auth.provider_id != "claude-code"
-            || request.instance.auth.custody != HarnessAuthCustody::NativeManaged
         {
             return Err(HarnessFailure::Policy);
         }
@@ -290,17 +569,14 @@ impl ClaudeCodePlugin {
         }
         match &request.kind {
             HarnessRequestKind::Inspect => {
-                let options =
-                    selected.options(&request.instance, selected.config_directory.clone(), None)?;
+                let options = selected.inspection_options(&request.instance)?;
                 let mut capabilities = capabilities::capabilities(options.settlement_support);
-                if !selected.verified_native_auth {
-                    capabilities.authentication = HarnessCapability {
-                        support: HarnessSupportLevel::Unsupported,
-                        constraints: vec![
-                            "Exact native auth status/login support has not been verified".into(),
-                        ],
+                capabilities.authentication =
+                    if options.billing_route == bcode_claude_code::BillingRoute::ApiKey {
+                        capabilities::api_auth_capability()
+                    } else {
+                        native_auth_capability(options.auth_support)
                     };
-                }
                 Ok(HarnessServiceResponseKind::Inspection(HarnessInspection {
                     native_version: selected.exact_version.clone(),
                     executable_identity: request.instance.executable.clone(),
@@ -308,7 +584,9 @@ impl ClaudeCodePlugin {
                     capabilities,
                 }))
             }
-            HarnessRequestKind::Open(open) => self.open(&request.instance, open, selected).await,
+            HarnessRequestKind::Open(open) => {
+                self.open(&request.instance, open, selected, context).await
+            }
             HarnessRequestKind::Submit { target, submission } => {
                 self.submit(&request.instance, target, submission).await
             }
@@ -331,8 +609,12 @@ impl ClaudeCodePlugin {
             | HarnessRequestKind::AuthBegin(_)
             | HarnessRequestKind::AuthContinue(_)
             | HarnessRequestKind::AuthCancel(_) => {
-                let options =
-                    selected.options(&request.instance, selected.config_directory.clone(), None)?;
+                let options = selected.options_with_context(
+                    &request.instance,
+                    selected.config_directory.clone(),
+                    None,
+                    context,
+                )?;
                 self.auth.invoke(request, &options).await
             }
         }
@@ -377,7 +659,7 @@ impl ClaudeCodePlugin {
             .map_err(|_| HarnessFailure::Unavailable)?
             .normalizer
             .submitted
-            && process.client.settlement() != Settlement::Settled
+            && !process.client.can_submit_next_turn()
         {
             return Err(HarnessFailure::Conflict);
         }
@@ -437,7 +719,23 @@ impl ClaudeCodePlugin {
             .stream
             .lock()
             .map_err(|_| HarnessFailure::Unavailable)?;
-        stream.observation_page(&process.prepared, observe, &process.client.settlement())
+        let page =
+            stream.observation_page(&process.prepared, observe, &process.client.settlement())?;
+        let retired = std::mem::take(&mut stream.retired_attempts);
+        drop(stream);
+        for attempt in retired {
+            let uuid = bcode_claude_code::SubmissionUuid::new(attempt.attempt_id.clone())
+                .map_err(|_| HarnessFailure::Uncertain)?;
+            process.client.retire_acknowledged_submission(&uuid);
+            if process
+                .submissions
+                .get(&attempt.submission_id)
+                .is_some_and(|(submission, _)| submission.attempt_id == attempt.attempt_id)
+            {
+                process.submissions.remove(&attempt.submission_id);
+            }
+        }
+        Ok(page)
     }
     async fn respond(
         &mut self,
@@ -508,6 +806,14 @@ impl ClaudeCodePlugin {
                 .normalizer
                 .invalidate_callbacks();
             process.client.terminate();
+            // Signal/acknowledgement is not release. Only a successful supervisor OS
+            // wait allows this process to become eligible for local capacity release.
+            process
+                .client
+                .wait_reaped()
+                .await
+                .map_err(|_| HarnessFailure::Uncertain)?;
+            process.released_close = Some(control.clone());
             process.closed = true;
         } else {
             process
@@ -615,11 +921,26 @@ impl ClaudeCodePlugin {
         }
         Ok(process)
     }
+    fn release_closed_processes(&mut self) {
+        let closed: Vec<_> = self
+            .processes
+            .iter()
+            .filter(|(_, process)| process.closed)
+            .map(|(id, _)| id.clone())
+            .collect();
+        for id in closed {
+            self.processes.remove(&id);
+            self.opens.remove(&id);
+            self.tool_queues.remove(&id);
+        }
+    }
+
     async fn open(
         &mut self,
         instance: &HarnessInstance,
         open: &HarnessOpenRequest,
         selected: &InstanceConfig,
+        context: &NativeServiceContext,
     ) -> Result<HarnessServiceResponseKind, HarnessFailure> {
         if let Some(process) = self.processes.get(&open.session_id) {
             if process.closed || !process.client.is_control_ready() {
@@ -639,42 +960,22 @@ impl ClaudeCodePlugin {
         }
         // Closed instances release process capacity. Host admission must fence old canonical
         // open/submission identities across eviction and plugin restart.
-        let closed: Vec<_> = self
-            .processes
-            .iter()
-            .filter(|(_, process)| process.closed)
-            .map(|(id, _)| id.clone())
-            .collect();
-        for id in closed {
-            self.processes.remove(&id);
-            self.opens.remove(&id);
-        }
+        self.release_closed_processes();
         if self.opens.contains_key(&open.session_id) {
             return Err(HarnessFailure::Uncertain);
         }
         if self.opens.len() >= MAX_PROCESSES {
             return Err(HarnessFailure::Unavailable);
         }
-        let options = selected.options(
+        validate_open_selection(instance, open, selected)?;
+        let options = selected.options_with_context(
             instance,
             PathBuf::from(&open.working_directory),
             open.resume
                 .as_ref()
                 .map(|binding| binding.native_session_id.clone()),
+            context,
         )?;
-        if let Some(binding) = &open.resume {
-            let version_matches = binding.native_version == selected.exact_version;
-            let instance_matches = binding.instance_id == instance.instance_id;
-            if !version_matches || !instance_matches {
-                return Err(HarnessFailure::Conflict);
-            }
-        }
-        if open.resume.is_none() {
-            // Host session IDs are UUIDs. Reserve that exact UUID as the new native identity;
-            // do not publish it as a binding until the native process confirms it.
-            bcode_claude_code::validate_session_uuid(&open.session_id)
-                .map_err(|_| HarnessFailure::InvalidRequest)?;
-        }
         // This DTO is correlation, not proof of authorization: host admission must
         // replace/verify client input against both current owner scopes before dispatch.
         let admitted_assistance_grant = open.parent_assistance.clone();
@@ -683,11 +984,20 @@ impl ClaudeCodePlugin {
                 .validate_for(open)
                 .map_err(|_| HarnessFailure::StaleGeneration)?;
         }
-        let sdk_servers = if admitted_assistance_grant.is_some() {
+        // The SDK server is inert until an explicit host Bind. Keeping the queue object
+        // from launch permits a later authorized workflow receipt to bootstrap it without
+        // recreating the native process or inferring authority from its arguments.
+        let tool_queue = Some(Arc::clone(
+            self.tool_queues.entry(open.session_id.clone()).or_default(),
+        ));
+        let mut sdk_servers = if admitted_assistance_grant.is_some() {
             vec![parent_bridge::SERVER.to_owned()]
         } else {
             Vec::new()
         };
+        if tool_queue.is_some() {
+            sdk_servers.push(tool_bridge::SERVER.to_owned());
+        }
         self.opens.insert(open.session_id.clone(), open.clone());
         let session = if open.resume.is_some() {
             ClaudeSession::spawn_with_sdk_servers(options, sdk_servers).await
@@ -708,7 +1018,7 @@ impl ClaudeCodePlugin {
             admitted_assistance_grant,
         )
         .await?;
-        let _reader = tokio::spawn(drain_session(session, Arc::clone(&stream)));
+        let _reader = tokio::spawn(drain_session(session, Arc::clone(&stream), tool_queue));
         self.processes.insert(
             open.session_id.clone(),
             Process {
@@ -720,12 +1030,57 @@ impl ClaudeCodePlugin {
                 submissions: BTreeMap::new(),
                 responses: BTreeMap::new(),
                 controls: BTreeMap::new(),
+                released_close: None,
                 closed: false,
             },
         );
         Ok(opened)
     }
 }
+fn validate_open_selection(
+    instance: &HarnessInstance,
+    open: &HarnessOpenRequest,
+    selected: &InstanceConfig,
+) -> Result<(), HarnessFailure> {
+    if let Some(binding) = &open.resume {
+        recovery::validate_resume(instance, open, selected)?;
+        let version_matches = binding.native_version == selected.exact_version;
+        let instance_matches = binding.instance_id == instance.instance_id;
+        if !version_matches || !instance_matches {
+            return Err(HarnessFailure::Conflict);
+        }
+    } else {
+        // Reserve the exact host UUID; only native confirmation establishes binding.
+        bcode_claude_code::validate_session_uuid(&open.session_id)
+            .map_err(|_| HarnessFailure::InvalidRequest)?;
+    }
+    Ok(())
+}
+
+fn native_auth_capability(support: bcode_claude_code::NativeAuthSupport) -> HarnessCapability {
+    use bcode_claude_code::NativeAuthSupport;
+    match support {
+        NativeAuthSupport::VerifiedStatusAndLogin => HarnessCapability {
+            support: HarnessSupportLevel::Constrained,
+            constraints: vec![
+                "Native account namespace only; explicit supported CLI login handoff, no invented auth RPC or API-key extraction".into(),
+            ],
+        },
+        NativeAuthSupport::VerifiedStatus => HarnessCapability {
+            support: HarnessSupportLevel::Constrained,
+            constraints: vec![
+                "Exact-version local auth status only; native login handoff is unsupported".into(),
+            ],
+        },
+        NativeAuthSupport::Unknown => HarnessCapability {
+            support: HarnessSupportLevel::Unsupported,
+            constraints: vec![
+                "Exact native auth status/login support has not been verified".into(),
+            ],
+        },
+    }
+}
+
 struct PreparedStream {
     client: ClaudeClient,
     prepared: HarnessPreparedSession,
@@ -779,9 +1134,24 @@ async fn prepare_stream(
         _ => return Err(HarnessFailure::Uncertain),
     }
     let opened = open_response(&normalizer.target);
+    normalizer.configure_execution(
+        selected.verified_session_state && selected.exact_version == "2.1.308 (Claude Code)",
+        open.resume.is_none(),
+    );
+    normalizer.enable_retention();
     normalizer.assistance_grant = admitted_assistance_grant;
     let stream = Arc::new(Mutex::new(StreamState {
+        retention: retention::PageRetention::new(format!(
+            "claude:{}:{}:{}",
+            std::process::id(),
+            open.generation,
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_err(|_| HarnessFailure::Unavailable)?
+                .as_nanos()
+        )),
         acknowledged: None,
+        retired_attempts: Vec::new(),
         normalizer,
         observations: VecDeque::new(),
         gap: false,
@@ -794,13 +1164,186 @@ async fn prepare_stream(
     })
 }
 
-async fn drain_session(mut session: ClaudeSession, reader_state: Arc<Mutex<StreamState>>) {
+fn native_init_host_tools_status(value: &Value) -> &'static str {
+    let Some(servers) = value.get("mcp_servers").and_then(Value::as_array) else {
+        return "unknown";
+    };
+    if servers.len() > 256 {
+        return "unknown";
+    }
+    let mut selected = servers
+        .iter()
+        .filter(|server| server["name"] == tool_bridge::SERVER);
+    let Some(server) = selected.next() else {
+        return "missing";
+    };
+    if selected.next().is_some() {
+        return "unknown";
+    }
+    match server["status"].as_str() {
+        Some("connected") => "connected",
+        Some("failed") => "failed",
+        Some("pending") => "pending",
+        Some("disabled") => "disabled",
+        Some("needs-auth") => "needs_auth",
+        _ => "unknown",
+    }
+}
+
+#[cfg(test)]
+mod host_tools_diagnostic_tests {
+    use super::*;
+
+    #[test]
+    fn system_init_status_is_sanitized_and_does_not_guess_unknowns() {
+        assert_eq!(
+            native_init_host_tools_status(&serde_json::json!({"mcp_servers":[{
+                "name":"bcode-tools", "status":"connected", "error":"SECRET", "config":{"url":"SECRET"},
+            }]})),
+            "connected"
+        );
+        assert_eq!(
+            native_init_host_tools_status(&serde_json::json!({"mcp_servers":[]})),
+            "missing"
+        );
+        assert_eq!(
+            native_init_host_tools_status(&serde_json::json!({"mcp_servers":[{
+                "name":"bcode-tools", "status":"future-status",
+            }]})),
+            "unknown"
+        );
+        assert_eq!(
+            native_init_host_tools_status(&serde_json::json!({})),
+            "unknown"
+        );
+    }
+}
+
+async fn handle_tool_callback(
+    client: &ClaudeClient,
+    reader_state: &Mutex<StreamState>,
+    queue: Option<&Arc<Mutex<tool_bridge::Queue>>>,
+    request_id: &str,
+    request: &bcode_claude_code::CallbackRequest,
+) -> bool {
+    let Some(queue) = queue else {
+        return false;
+    };
+    let (handled, disposition) = queue.lock().map_or_else(
+        |_| (None, diagnostics::CallbackDisposition::Unavailable),
+        |mut queue| {
+            let bound = queue.scope().is_some();
+            let action = queue.callback(request_id, request);
+            let disposition = diagnostics::CallbackDisposition::classify(bound, action.as_ref());
+            (action, disposition)
+        },
+    );
+    if matches!(request, bcode_claude_code::CallbackRequest::McpMessage { server_name, message }
+                    if server_name == "bcode-tools" && message["method"] == "tools/list")
+        && let Ok(mut stream) = reader_state.lock()
+    {
+        let _ = stream.tool_diagnostic(
+            &format!("{request_id}-disposition"),
+            diagnostics::Diagnostic::Callback(disposition),
+        );
+    }
+    let Some(action) = handled else {
+        return false;
+    };
+    if let tool_bridge::CallbackAction::Reply(response) = action {
+        let _ = client.respond(request_id, response).await;
+    }
+    true
+}
+
+async fn normalize_session_event(
+    client: &bcode_claude_code::ClaudeClient,
+    reader_state: &Arc<Mutex<StreamState>>,
+    event: Event,
+) -> bool {
+    let mut confirmation = Vec::new();
+    if let bcode_claude_code::IdentityState::Confirmed { native_session_id } =
+        client.identity_state()
+    {
+        let promoted = reader_state
+            .lock()
+            .map_or(Err(HarnessContractError::WrongOwner), |mut stream| {
+                stream.normalizer.confirmation(&native_session_id)
+            });
+        if let Ok(observations) = promoted {
+            confirmation = observations;
+        } else {
+            client.terminate();
+            return false;
+        }
+    }
+    let unsupported_callback = if let Event::Callback { request_id, .. } = &event {
+        Some(request_id.clone())
+    } else {
+        None
+    };
+    let (accepted, reject_callback) = reader_state.lock().map_or((false, None), |mut stream| {
+        let mut observations = confirmation;
+        observations.extend(stream.normalizer.event(event));
+        let reject = unsupported_callback.filter(|id| !stream.normalizer.pending.contains_key(id));
+        (stream.push(observations), reject)
+    });
+    if let Some(id) = reject_callback {
+        let _ = client
+            .respond(&id, bcode_claude_code::CallbackResponse::Error)
+            .await;
+    }
+    if !accepted {
+        client.terminate();
+        return false;
+    }
+    true
+}
+
+async fn drain_session(
+    mut session: ClaudeSession,
+    reader_state: Arc<Mutex<StreamState>>,
+    tool_queue: Option<Arc<Mutex<tool_bridge::Queue>>>,
+) {
     while let Ok(event) = session.next_event().await {
+        if let Event::Message(bcode_claude_code::NativeMessage::System(value)) = &event
+            && value["subtype"] == "init"
+            && let Ok(mut stream) = reader_state.lock()
+        {
+            let status = native_init_host_tools_status(value);
+            let _ = stream.tool_diagnostic(
+                "native-init",
+                diagnostics::Diagnostic::SystemInit(diagnostics::Connection::from_label(status)),
+            );
+            drop(stream);
+        }
         if let Event::Callback {
             request_id,
             request,
         } = &event
         {
+            if matches!(request, bcode_claude_code::CallbackRequest::McpMessage { server_name, message }
+                if server_name == "bcode-tools" && message["method"] == "tools/list")
+                && let Ok(mut stream) = reader_state.lock()
+            {
+                let _ = stream.tool_diagnostic(
+                    &format!("{request_id}-catalog-request"),
+                    diagnostics::Diagnostic::Metadata {
+                        counts: session.client().sdk_metadata_counts(),
+                    },
+                );
+            }
+            if handle_tool_callback(
+                &session.client(),
+                &reader_state,
+                tool_queue.as_ref(),
+                request_id,
+                request,
+            )
+            .await
+            {
+                continue;
+            }
             let bridge_call = reader_state.lock().map_or(None, |stream| {
                 parent_bridge::handle(
                     request_id,
@@ -818,45 +1361,15 @@ async fn drain_session(mut session: ClaudeSession, reader_state: Arc<Mutex<Strea
                 continue;
             }
         }
-        let mut confirmation = Vec::new();
-        if let bcode_claude_code::IdentityState::Confirmed { native_session_id } =
-            session.client().identity_state()
-        {
-            let promoted = reader_state
-                .lock()
-                .map_or(Err(HarnessContractError::WrongOwner), |mut stream| {
-                    stream.normalizer.confirmation(&native_session_id)
-                });
-            if let Ok(observations) = promoted {
-                confirmation = observations;
-            } else {
-                session.client().terminate();
-                break;
-            }
-        }
-        let unsupported_callback = if let Event::Callback { request_id, .. } = &event {
-            Some(request_id.clone())
-        } else {
-            None
-        };
-        let (accepted, reject_callback) =
-            reader_state.lock().map_or((false, None), |mut stream| {
-                let mut observations = confirmation;
-                observations.extend(stream.normalizer.event(event));
-                let reject =
-                    unsupported_callback.filter(|id| !stream.normalizer.pending.contains_key(id));
-                (stream.push(observations), reject)
-            });
-        if let Some(id) = reject_callback {
-            let _ = session
-                .client()
-                .respond(&id, bcode_claude_code::CallbackResponse::Error)
-                .await;
-        }
-        if !accepted {
-            session.client().terminate();
+        if !normalize_session_event(&session.client(), &reader_state, event).await {
             break;
         }
+    }
+    if let Some(queue) = &tool_queue
+        && let Ok(mut queue) = queue.lock()
+        && let Some(scope) = queue.scope().cloned()
+    {
+        let _ = queue.revoke(&scope);
     }
     if let Ok(mut stream) = reader_state.lock() {
         stream.disconnected();

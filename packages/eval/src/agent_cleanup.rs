@@ -97,15 +97,20 @@ pub async fn stop_idle(timeout: Duration) -> CleanupEvidence {
     let deadline = tokio::time::Instant::now() + timeout;
     let mut unavailable_observations = 0;
     let operation = async {
-        if let Ok(status) = client.verified_server_status().await {
-            evidence.idle = quiescence(None, true, &status);
-            if evidence.idle != IdleEvidence::DaemonIdle {
-                evidence.failure = Some("daemon_not_idle");
+        loop {
+            if let Ok(status) = client.verified_server_status().await {
+                evidence.idle = quiescence(None, true, &status);
+                if evidence.idle == IdleEvidence::DaemonIdle {
+                    break;
+                }
+            } else {
+                evidence.failure = Some("status_unverified");
                 return;
             }
-        } else {
-            evidence.failure = Some("status_unverified");
-            return;
+            // Socket closure and completed runtime registrations are observed
+            // asynchronously; wait within the existing deadline, never bypass
+            // the server's idle-only admission.
+            tokio::time::sleep(Duration::from_millis(100)).await;
         }
         if client.server_stop_if_idle().await.is_err() {
             evidence.failure = Some("idle_stop_rejected");

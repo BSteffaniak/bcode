@@ -145,6 +145,15 @@ async fn lookup_at(path: &Path, run_id: &str) -> Result<RunLookup, ServerError> 
         .map_err(backpressure::normalize)
 }
 
+async fn lookup_snapshot(path: &Path, run_id: &str) -> Result<RunLookup, ServerError> {
+    let db = open(path, false)?;
+    // Diagnostic/status snapshot reads cannot wait for owner publication: origin
+    // lookup can run while that publication is waiting on its write queue.
+    backpressure::retry(|| representation::runs::lookup(&db, run_id))
+        .await
+        .map_err(backpressure::normalize)
+}
+
 /// Exact status routing. Only a verified legacy identity reaches the legacy reader.
 pub async fn status(
     state: &ServerState,
@@ -152,7 +161,7 @@ pub async fn status(
 ) -> Result<Option<bcode_workflow::WorkflowRunSummary>, ServerError> {
     let retained = retained_store(state).await?;
     let path = retained.path();
-    match lookup_at(path, run_id).await? {
+    match lookup_snapshot(path, run_id).await? {
         RunLookup::Legacy => Ok(crate::workflow_operations::run_status(state, run_id)?),
         RunLookup::Missing => Ok(None),
         RunLookup::Available(_) => {
@@ -218,6 +227,16 @@ pub async fn admit_prepared_package(
     run: &bcode_workflow_store::NewWorkflowRun,
     package: Option<(&str, &str)>,
 ) -> Result<Option<bcode_workflow::WorkflowRunSummary>, ServerError> {
+    // Keep representation installation/admission futures out of callers that
+    // retain session ownership through the first production driver pass.
+    Box::pin(admit_prepared_package_inner(state, run, package)).await
+}
+
+async fn admit_prepared_package_inner(
+    state: &ServerState,
+    run: &bcode_workflow_store::NewWorkflowRun,
+    package: Option<(&str, &str)>,
+) -> Result<Option<bcode_workflow::WorkflowRunSummary>, ServerError> {
     use representation::AdmissionFamily;
     let retained = retained_store(state).await?;
     let db = open(retained.path(), false)?;
@@ -225,7 +244,7 @@ pub async fn admit_prepared_package(
         .await
         .map_err(|_| unavailable())?
     {
-        AdmissionFamily::Historical43 => return Ok(None),
+        AdmissionFamily::Historical43 | AdmissionFamily::Legacy44 => return Ok(None),
         AdmissionFamily::Baseline42Installable | AdmissionFamily::Installed => {}
     }
     // Existing identities keep their canonical family. New supported runs, numeric
@@ -348,7 +367,15 @@ pub async fn drive_if_represented(
             {
                 return Err(unsupported());
             }
+            #[cfg(test)]
+            if std::env::var_os("BCODE_TEST_WORKFLOW_STACK_TRACE").is_some() {
+                eprintln!("workflow-stack phase=represented_driver.begin");
+            }
             Box::pin(driver::drive(state, run_id)).await?;
+            #[cfg(test)]
+            if std::env::var_os("BCODE_TEST_WORKFLOW_STACK_TRACE").is_some() {
+                eprintln!("workflow-stack phase=represented_driver.end");
+            }
             Ok(true)
         }
         RunLookup::UnsupportedRepresentation => Err(unsupported()),

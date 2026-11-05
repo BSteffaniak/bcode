@@ -1415,6 +1415,70 @@ fn resolve_declared_environment_context_with(
     })
 }
 
+/// Resolve one explicitly mapped vault credential without process-environment fallback.
+///
+/// The caller must retain current ownership and verify the plugin's credential declaration.
+/// Namespace is the JSON encoding of `[absolute_vault_path, storage_profile]`.
+/// # Errors
+/// Returns only fixed diagnostics for invalid selection, namespace mismatch or missing material.
+pub fn resolve_exact_vault_credential(
+    profile_name: &str,
+    profile: &bcode_config::AuthProfileConfig,
+    credential_id: &str,
+    namespace: &str,
+) -> Result<String, &'static str> {
+    if profile.backend != "sshenv" || profile_name.is_empty() {
+        return Err("vault credential unavailable");
+    }
+    let vault = profile
+        .settings
+        .get("vault")
+        .map_or_else(bcode_config::default_auth_vault_path, PathBuf::from);
+    let storage_profile = profile
+        .settings
+        .get("profile")
+        .map_or(profile_name, String::as_str);
+    if !vault.is_absolute()
+        || storage_profile.is_empty()
+        || !vault.components().all(|part| {
+            matches!(
+                part,
+                std::path::Component::RootDir
+                    | std::path::Component::Prefix(_)
+                    | std::path::Component::Normal(_)
+            )
+        })
+    {
+        return Err("vault credential unavailable");
+    }
+    let expected = serde_json::to_string(&(
+        vault.to_str().ok_or("vault credential unavailable")?,
+        storage_profile,
+    ))
+    .map_err(|_| "vault credential unavailable")?;
+    if expected != namespace {
+        return Err("vault credential namespace mismatch");
+    }
+    let mapping = profile
+        .map
+        .get(credential_id)
+        .ok_or("vault credential unavailable")?;
+    // `env` is also the canonical vault storage-key spelling; never read the process here.
+    let key = mapping
+        .key
+        .as_ref()
+        .or(mapping.env.as_ref())
+        .ok_or("vault credential unavailable")?;
+    let values = security::read_auth_vault_profile(&vault, storage_profile)
+        .map_err(|_| "vault credential unavailable")?
+        .ok_or("vault credential unavailable")?;
+    values
+        .get(key)
+        .filter(|value| !value.trim().is_empty() && value.len() <= 16_384)
+        .cloned()
+        .ok_or("vault credential unavailable")
+}
+
 /// Resolve one configured auth profile.
 #[must_use]
 pub fn resolve_auth_profile(
@@ -3455,6 +3519,38 @@ profiles = ["account"]
         assert_eq!(
             routing.priming_required_windows,
             BTreeMap::from([("custom".to_string(), vec!["daily".to_string()])])
+        );
+    }
+}
+
+#[cfg(test)]
+mod exact_vault_selection_tests {
+    use super::*;
+
+    #[test]
+    fn nonvault_and_wrong_namespace_reject_before_any_vault_read() {
+        let mut profile = bcode_config::AuthProfileConfig {
+            backend: "env".into(),
+            ..Default::default()
+        };
+        assert!(resolve_exact_vault_credential("selected", &profile, "api_key", "wrong").is_err());
+        profile.backend = "sshenv".into();
+        profile
+            .settings
+            .insert("vault".into(), "/fixture/not-opened/vault".into());
+        profile
+            .settings
+            .insert("profile".into(), "stored-account".into());
+        // The profile label and a caller-selected namespace cannot alias the actual
+        // vault path/storage-profile pair. This test never creates or reads a vault.
+        assert!(
+            resolve_exact_vault_credential("selected", &profile, "api_key", "selected").is_err()
+        );
+        let namespace =
+            serde_json::to_string(&("/fixture/not-opened/vault", "stored-account")).unwrap();
+        // Even the exact namespace cannot authorize a credential without a mapping.
+        assert!(
+            resolve_exact_vault_credential("selected", &profile, "api_key", &namespace).is_err()
         );
     }
 }

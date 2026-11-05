@@ -399,10 +399,18 @@ fn shared_fallback_preserves_source_and_removes_terminal_controls() {
     )
     .unwrap();
     let blocks = external_fallback_blocks(&view).unwrap();
-    assert!(blocks[0].text.contains("disabled-plugin"));
-    assert!(!blocks[1].text.contains('\u{1b}'));
-    assert!(blocks[1].text.contains("界👩‍💻e\u{301}"));
-    assert!(blocks[1].id.contains("observation"));
+    let metadata = blocks
+        .iter()
+        .find(|block| block.id == "external:metadata")
+        .unwrap();
+    assert!(metadata.text.contains("disabled-plugin"));
+    let observation = blocks
+        .iter()
+        .find(|block| block.id.contains("observation"))
+        .unwrap();
+    assert!(!observation.text.contains('\u{1b}'));
+    assert!(observation.text.contains("界👩‍💻e\u{301}"));
+    assert_eq!(view.transcript[0].text, "hello\u{1b}[31m界👩‍💻e\u{301}");
 }
 
 #[test]
@@ -466,6 +474,7 @@ fn prepared_service_outcome_is_visible_in_real_session_view_without_claiming_ide
         }),
     };
     let operation = ExternalHarnessOperation {
+        inventory_commitments: Vec::new(),
         version: 1,
         owner: ExternalHarnessOwner {
             session_id,

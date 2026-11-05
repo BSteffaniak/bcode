@@ -324,6 +324,53 @@ fn workspace_inventory_preserves_non_utf8_incompleteness_and_valid_peers() {
 }
 
 #[test]
+fn inventory_keeps_invalid_byte_omissions_partial_across_cache_reuse() {
+    use std::os::unix::ffi::OsStringExt as _;
+
+    let root = Fixture::new();
+    root.file("visible.rs");
+    let invalid = root.0.join(std::ffi::OsString::from_vec(vec![b'x', 255]));
+    if let Err(error) = fs::write(&invalid, "content") {
+        #[cfg(target_os = "macos")]
+        {
+            assert_eq!(error.raw_os_error(), Some(libc::EILSEQ));
+            assert!(!invalid.exists());
+            return;
+        }
+        #[cfg(not(target_os = "macos"))]
+        panic!("non-UTF-8 fixture creation failed: {error}");
+    }
+    let grant = root.grant();
+    // Exercise the production inventory route, then the same snapshot with a
+    // different query. Both must retain the capture's omitted-name evidence.
+    for query in ["", "visible"] {
+        let response = super::inventory_search(
+            &SearchPathsRequest {
+                query: query.into(),
+                ..request()
+            },
+            &grant,
+            &|| false,
+            &|path| {
+                Some(WorkspaceResourceGrant {
+                    workspace_root: grant.workspace_root.clone(),
+                    path: path.into(),
+                })
+            },
+        );
+        assert_eq!(response.state, SearchPathsState::Incomplete, "{response:?}");
+        assert_eq!(response.reason.as_deref(), Some("non_utf8_path"));
+        assert_eq!(paths(&response), ["visible.rs"]);
+        assert!(
+            response
+                .entries
+                .iter()
+                .all(|entry| !entry.path.contains('\u{fffd}'))
+        );
+    }
+}
+
+#[test]
 fn ignore_file_presence_is_explicitly_unavailable_without_content_authority() {
     let root = Fixture::new();
     root.file("candidate");

@@ -32,13 +32,28 @@ impl RegisteredStorageRead {
         };
         // Register before lookup: existence can change, and metadata failure is not proof that
         // this operation cannot consume persistent content.
-        Self::begin(root, session_id).await.map(Some).map_err(|_| {
-            bcode_session::db::SessionDbError::Io(io::Error::new(
-                io::ErrorKind::WouldBlock,
-                "session storage admission unavailable; retry after coordination recovers",
-            ))
-            .into()
-        })
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(1);
+        loop {
+            match Self::begin(root.clone(), session_id).await {
+                Ok(admission) => return Ok(Some(admission)),
+                Err(error)
+                    if error.kind() == io::ErrorKind::WouldBlock
+                        && tokio::time::Instant::now() < deadline =>
+                {
+                    // Maintenance and short registry scans hold the same gate.
+                    // Yield boundedly; never read content without admission or
+                    // interpret contention as permission to bypass maintenance.
+                    tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                }
+                Err(_) => {
+                    return Err(bcode_session::db::SessionDbError::Io(io::Error::new(
+                        io::ErrorKind::WouldBlock,
+                        "session storage admission unavailable; retry after coordination recovers",
+                    ))
+                    .into());
+                }
+            }
+        }
     }
 
     /// Persist access before completing admission. Failure leaves a durable dirty participant.
@@ -295,13 +310,28 @@ mod tests {
                 .expect("access unchanged"),
             before
         );
-        drop(maintenance);
-        assert_eq!(
-            crate::session_operations::complete_history(&state, client, session.id)
-                .await
-                .expect("retry after release"),
-            expected
-        );
+        // A short-lived owner should be waited out within the same bounded read,
+        // while the preceding assertion proves a held owner still rejects it.
+        {
+            let read = crate::session_operations::complete_history(&state, client, session.id);
+            tokio::pin!(read);
+            assert!(
+                tokio::time::timeout(std::time::Duration::from_millis(20), &mut read)
+                    .await
+                    .is_err()
+            );
+            assert_eq!(
+                bcode_session::storage_access::observe_session_access(root.path(), session.id)
+                    .expect("still no content consumed"),
+                before
+            );
+            drop(maintenance);
+            assert_eq!(
+                read.await
+                    .expect("same read obtains admission after release"),
+                expected
+            );
+        }
         assert!(
             !state
                 .storage_tracking_failed

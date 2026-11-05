@@ -636,6 +636,11 @@ async fn execute_owned_legacy_storage(
         let progress = progress.clone();
         Arc::new(move |update| progress.publish(update)) as db::SessionMigrationProgressCallback
     });
+    let source_writer_epoch = u32::try_from(writer_epoch).map_err(|_| {
+        SessionError::Db(db::SessionDbError::InvalidData(
+            "migration source writer epoch exceeds supported range".into(),
+        ))
+    })?;
     let migrated = db::SessionDb::migrate_turso_in_root_observed_with_operation(
         session_id,
         root,
@@ -645,9 +650,12 @@ async fn execute_owned_legacy_storage(
         db_progress,
         Some(operation_id),
         bcode_session_migration_target::MigrationPolicyCallbacks {
-            normalize: Arc::new(|row| {
-                bcode_session_migration::normalize_canonical_row(row)
-                    .map_err(|error| error.to_string())
+            normalize: Arc::new(move |row| {
+                bcode_session_migration::normalize_canonical_row_for_writer_epoch(
+                    row,
+                    source_writer_epoch,
+                )
+                .map_err(|error| error.to_string())
             }),
             build_receipt: Arc::new(bcode_session_migration::build_target_receipt),
         },

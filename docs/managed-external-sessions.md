@@ -45,11 +45,45 @@ constrained; capability declarations must not infer support from a vendor name.
 
 `SubmissionAccepted` records native proof linking an exact submission and attempt
 to a native turn, under the enclosing observation's session and generation. Request
-acknowledgments cannot supply that mapping. Workflow settlement requires both this
-canonical, boundedly indexed correlation and authoritative native lifecycle evidence.
-The current Claude integration cannot prove this mapping and therefore cannot complete
-workflow assignments; it does not manufacture acceptance from result or assistant IDs.
-Codex emits the mapping only from verified native turn-start/steering acknowledgments.
+acknowledgments cannot supply that mapping. Codex supplies genuine native turn
+identities; Claude's prompt/result UUIDs identify native frames, not native turns.
+The legacy strict settlement path retains its stronger correlation requirements.
+
+### Separated lifecycle contract
+
+The `bcode.harness/v3` interface adds `Execution` observations without changing the
+schema-one request envelope. Schema 55 / writer epoch 20 fences their durable
+representation; earlier history is converted by session-migration and does not
+acquire invented lifecycle evidence.
+
+* `SubmissionTerminal` retains the exact Bcode submission and attempt, native
+  terminal evidence, disposition, and complete output when available. A genuine
+  result frame suffices structurally without fabricating a native turn identity.
+* `BackgroundWork` retains adapter-owned work identity, optional genuine native
+  task identity and exact origin, state, parent relationship, and notification
+  status. Completed work can still owe a completion notification.
+* `Continuation` identifies a distinct automatic native follow-up and its causal
+  origin. It cannot reopen the terminal foreground attempt or authorize Bcode
+  worker dispatch. Native turn identity remains optional, never synthesized.
+* `Coverage` describes supported tracking through the current observation. It is
+  not a no-future-work certificate, does not erase retained work or notifications,
+  and cannot make an unobserved native activity class authoritative.
+
+Callers choose a completion boundary: foreground, associated work (the default),
+or workspace release. Foreground requires authoritative exact-attempt outcome and
+complete attributed output, not universal quiescence. Associated work additionally
+requires complete relevant tracking, resolved background work, notifications and
+required continuations. Uncorrelated outstanding work fences session-wide safety;
+unknown tracking is not an empty authoritative roster. Workspace release additionally
+requires host-owned release authority; coverage alone cannot establish it.
+Background failure can fail an enclosing assignment while its foreground success
+remains unchanged. Native continuation execution and explicit asynchronous handoff
+must retain responsibility separately; neither may be inferred from idle or a
+successful response.
+
+These are compatibility and implementation contracts, not a claim of completed
+native, workflow, or frontend acceptance. Each adapter's supported tracking and the
+production persistence/policy journey require separate verification.
 
 ## Canonical delivery and recovery
 
@@ -98,6 +132,23 @@ callback or login mutation. Sensitive URLs, codes and input never enter ordinary
 session history, model context, tool traces or workflow payloads. Readiness status,
 refresh and remote verification are distinct operations.
 
+Plugins may explicitly declare the query service `bcode.harness.terminal-auth/v1`
+(`TERMINAL_AUTH_INTERFACE_ID`). Its `prepare_login` operation accepts the existing
+schema-one `{schema_version, request_id, instance}` request and returns
+`{schema_version, request_id, handoff}`, using the existing verified native login plan.
+The owning plugin interprets configuration; the host validates correlation, namespace,
+executable, custody and current admission before issuing the plan.
+
+`ManagedSessionCommandHandle::terminal_auth_interface()` returns `Option<String>`
+from the enabled service metadata for the canonically bound plugin only. Exactly one
+matching declaration is required; duplicates fail closed and absent declarations return
+`None`. Discovery grants neither readiness nor permission and does not launch native
+programs. Callers must explicitly yield terminal ownership and obtain consent before
+`ManagedSessionAuthFlow::terminal_handoff(interface_id)`. Reaping the exact child and
+host reinspection remain mandatory; successful exit is not authentication readiness.
+Claude additionally retains `bcode.claude-code.handoff/v1` for existing explicit clients;
+generic discovery never derives or falls back to a vendor-specific interface.
+
 Claude configuration selection consistently scopes status, login, execution and
 resume through the same native configuration directory. Native login handoff belongs
 on an explicitly connected client terminal, never daemon-inherited standard input.
@@ -113,18 +164,84 @@ Frontend response controls require current capabilities and exact interaction
 correlation. Sensitive auth surfaces remain separate from the ordinary chat composer.
 BMUX remains the terminal layout authority.
 
+### Explicit Claude API-key custody
+
+Claude native-account login remains the default (`billing.route = "native"`). API billing is a
+separate, explicit route; it never imports native subscription credentials or falls back to them.
+The API route requires a `VaultManaged` instance and an exact plugin-owned `sshenv` auth profile.
+No key belongs in plugin configuration, workflow JSON, instance catalogs, or command arguments.
+
+Example non-secret configuration (replace paths and verify the installed native version):
+
+```toml
+[auth.profiles.claude-api]
+backend = "sshenv"
+provider_id = "claude-code"
+owner_plugin_id = "bcode.claude-code"
+scheme = "api_key"
+
+[auth.profiles.claude-api.map.api_key]
+key = "ANTHROPIC_API_KEY"
+
+[auth.profiles.claude-api.settings]
+vault = "/absolute/path/to/auth-vault"
+profile = "stored-api-account"
+
+[plugins.config."bcode.claude-code".instances.api]
+executable = "/absolute/path/to/claude"
+config_directory = "/absolute/path/to/isolated-claude-config"
+exact_version = "<exact installed --version output>"
+setting_sources = []
+
+[plugins.config."bcode.claude-code".instances.api.billing]
+route = "api_key"
+provider_id = "claude-code"
+profile = "claude-api"
+credential_namespace = '["/absolute/path/to/auth-vault","stored-api-account"]'
+```
+
+Enroll the API key through the existing provider-auth secret-field/vault enrollment surface owned
+by `bcode.claude-code`; this example contains no secret and does not create a profile or grant.
+The generic configured harness instance must use the same instance ID, executable and config
+namespace, and this auth binding:
+
+```json
+{"provider_id":"claude-code","profile":"claude-api","credential_namespace":"[\"/absolute/path/to/auth-vault\",\"stored-api-account\"]","custody":"vault_managed"}
+```
+
+The credential namespace is the compact JSON array of the absolute vault path and actual vault
+storage-profile name, not a display label. The profile's declared credential mapping must match
+the owning plugin's registered API-key field. Current caller/workflow authorization and canonical
+managed-session ownership are rechecked for every credential lookup. Matching configuration alone
+never grants access. Missing, changed or revoked ownership, wrong custody/provider/profile/namespace,
+unavailable material and cancellation fail closed. Ambient API keys and alternate native billing
+routes remain rejected rather than silently selecting another account.
+
+Local API readiness means that exact credential material is available for the selected launch;
+it is not remote verification. API launch does not execute native-account `auth status` or login.
+The key is injected only into the explicitly selected API process's cleared environment. Native
+account status/login continues to use the native configuration namespace unchanged.
+
+The plugin declares `bcode.plugin.sensitive-credentials/v1`. Its invocation-only callback carries
+bounded non-secret selection metadata and returns raw secret bytes outside ordinary config,
+bridge-response serialization, events and diagnostics. Unknown/older loaders reject the callback;
+API execution is unavailable on those hosts, never downgraded to native-account billing. This
+capability does not change the native callback ABI or the managed-session IPC schema.
+
 ## Compatibility and verification
 
-The independently evolving service interface is `bcode.harness/v2`; v1 plugins
-are not admitted through the v2 registry. The envelope shape remains schema one.
-V2 distinguishes native-turn acceptance, consumed-prompt attribution, result
-attribution, terminal disposition and background-work settlement. None substitutes
-for another. Operation
+The independently evolving service interface is `bcode.harness/v3`; older plugins
+are not admitted through the v3 registry. The envelope shape remains schema one.
+V2 introduced native-turn acceptance, consumed-prompt attribution, result
+attribution, terminal disposition and background-work settlement. V3 additionally
+separates foreground outcomes, retained work, notifications, continuations and
+tracking coverage; none substitutes for another. Operation
 requests and responses validate correlation, operation family, instance, generation
 and bounded payloads. Durable session-event changes follow the existing migration
 and writer-epoch mechanisms rather than a parallel event database. Event schema
-54 / writer epoch 19 fences the new closed observation variants and indexes;
-existing epoch-18 data requires the explicit registered migration.
+55 / writer epoch 20 fences the new closed observation variants and indexes;
+existing epoch-19 data requires the explicit registered migration, preserving the
+previous epoch-18 migration chain.
 
 Deterministic protocol fixtures and isolated application tests supplement, but do
 not replace, exact-version native acceptance. Native login behavior, background

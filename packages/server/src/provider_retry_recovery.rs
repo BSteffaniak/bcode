@@ -495,7 +495,18 @@ mod tests {
             .expect("session");
         let id = session.id;
         drop(session);
-        let state = Arc::new(crate::tests::test_server_state_with_fake_provider(sessions));
+        let fixture_state_root = sessions
+            .session_store_root()
+            .map(|root| root.join("retry-fixture-state"));
+        let state = Arc::new({
+            let mut state = crate::tests::test_server_state_with_fake_provider(sessions);
+            if let Some(root) = fixture_state_root {
+                // Persistent attachment fixtures must not contend with process-wide
+                // account-routing state before reaching compaction recovery.
+                state.state_root = root;
+            }
+            state
+        });
         state.session_model_selections.lock().await.insert(
             id,
             SessionModelSelection {
@@ -916,6 +927,7 @@ mod tests {
         id: SessionId,
         root: &std::path::Path,
     ) -> Arc<ServerState> {
+        let state_root = state.state_root.clone();
         let selection = state
             .session_model_selections
             .lock()
@@ -931,7 +943,11 @@ mod tests {
         drop(state);
         let sessions =
             bcode_session::SessionManager::persistent(root).expect("new daemon session manager");
-        let state = Arc::new(crate::tests::test_server_state_with_fake_provider(sessions));
+        let state = Arc::new({
+            let mut state = crate::tests::test_server_state_with_fake_provider(sessions);
+            state.state_root = state_root;
+            state
+        });
         // The v1 fixture's immutable descriptor requires this exact configuration, not defaults.
         state
             .session_model_selections

@@ -107,6 +107,36 @@ impl ManagedSessionAdmission for CanonicalManagedAdmission {
         caller: &'a ManagedCaller,
         call: &'a ManagedSessionCall,
     ) -> Task<'a, HarnessOwner> {
+        self.existing_tool_authority(caller, call, false)
+    }
+
+    fn create<'a>(
+        &'a self,
+        caller: &'a ManagedCaller,
+        call: &'a ManagedSessionCall,
+    ) -> Task<'a, HarnessOwner> {
+        Box::pin(self.prepare_open(caller, call))
+    }
+
+    fn auth_scope<'a>(
+        &'a self,
+        caller: &'a ManagedCaller,
+        session_id: SessionId,
+        instance_id: &'a str,
+    ) -> Task<'a, crate::harness_dispatch::ManagedAuthAdmission> {
+        Box::pin(async move { self.authorize_auth(caller, session_id, instance_id).await })
+    }
+}
+
+impl CanonicalManagedAdmission {
+    // Only already-issued tool grants may follow a verified confirmation of their
+    // original prepared open. Fresh dispatch continues to require an exact target.
+    pub(super) fn existing_tool_authority<'a>(
+        &'a self,
+        caller: &'a ManagedCaller,
+        call: &'a ManagedSessionCall,
+        retained_grant: bool,
+    ) -> Task<'a, HarnessOwner> {
         Box::pin(async move {
             call.harness
                 .validate()
@@ -118,7 +148,7 @@ impl ManagedSessionAdmission for CanonicalManagedAdmission {
             let session_id = target(call)?;
             let (cwd, workflow_hold) = self
                 .authorize_existing_call(caller, call, session_id)
-                .await?;
+                .await.inspect_err(|_| { tracing::warn!(target: "bcode_server::harness", category = "retained_caller_authority", "managed admission rejected"); })?;
             let state = self.store.state()?;
             let summary = state
                 .sessions
@@ -126,6 +156,7 @@ impl ManagedSessionAdmission for CanonicalManagedAdmission {
                 .await
                 .map_err(|_| ManagedHarnessError::Storage)?;
             if canonical_directory(&summary.working_directory).await? != cwd {
+                tracing::warn!(target: "bcode_server::harness", category = "retained_workspace", "managed admission rejected");
                 return Err(ManagedHarnessError::StaleOwner);
             }
             if call.parent_session_id.as_ref().is_some_and(|parent| {
@@ -169,34 +200,24 @@ impl ManagedSessionAdmission for CanonicalManagedAdmission {
             };
             if selected.instance != call.harness.instance
                 || supplied_binding.is_some_and(|value| selected.binding.as_ref() != Some(value))
-                || supplied_target.is_some_and(|value| selected.target.as_ref() != Some(value))
             {
+                tracing::warn!(target: "bcode_server::harness", category = "retained_instance_or_binding", "managed admission rejected");
                 return Err(ManagedHarnessError::Conflict);
             }
-            Self::enabled(&state, &selected.instance)?;
+            if let Some(value) = supplied_target {
+                if retained_grant {
+                    validate_retained_target(&selected, value).inspect_err(|_| { tracing::warn!(target: "bcode_server::harness", category = "retained_target_confirmation", "managed admission rejected"); })?;
+                } else if selected.target.as_ref() != Some(value) {
+                    return Err(ManagedHarnessError::Conflict);
+                }
+            }
+            Self::enabled(&state, &selected.instance).inspect_err(|_| { tracing::warn!(target: "bcode_server::harness", category = "retained_plugin_enabled", "managed admission rejected"); })?;
             drop(state);
             // Acquire is mandatory here as well as at runtime: admission never converts a
             // foreign daemon binding into this daemon's authority merely by rewriting its ID.
-            let _ownership = self.store.acquire(&owner).await?;
+            let _ownership = self.store.acquire(&owner).await.inspect_err(|_| { tracing::warn!(target: "bcode_server::harness", category = "retained_owner_acquire", "managed admission rejected"); })?;
             drop(workflow_hold);
             Ok(owner)
         })
-    }
-
-    fn create<'a>(
-        &'a self,
-        caller: &'a ManagedCaller,
-        call: &'a ManagedSessionCall,
-    ) -> Task<'a, HarnessOwner> {
-        Box::pin(self.prepare_open(caller, call))
-    }
-
-    fn auth_scope<'a>(
-        &'a self,
-        caller: &'a ManagedCaller,
-        session_id: SessionId,
-        instance_id: &'a str,
-    ) -> Task<'a, crate::harness_dispatch::ManagedAuthAdmission> {
-        Box::pin(async move { self.authorize_auth(caller, session_id, instance_id).await })
     }
 }

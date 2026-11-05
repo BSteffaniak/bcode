@@ -8,8 +8,23 @@ use bcode_session_models::external_harness::{
     ExternalHarnessOwner, ExternalHarnessResponseKind, ExternalHarnessState,
 };
 
+type ReleaseVerifier = Box<
+    dyn FnOnce(
+            &bcode_session_models::external_harness::ExternalHarnessTransportRelease,
+        ) -> Result<(), String>
+        + Send,
+>;
+
 pub enum HarnessAction {
     State,
+    Recover {
+        recovery: Box<bcode_session_models::external_harness::ExternalHarnessRecovery>,
+        verify_release: ReleaseVerifier,
+    },
+    ReleaseTransport {
+        release: Box<bcode_session_models::external_harness::ExternalHarnessTransportRelease>,
+        verify_reap: ReleaseVerifier,
+    },
     Write(Box<ExternalHarnessOperationRecord>),
     Page {
         after: Option<String>,
@@ -40,6 +55,59 @@ fn op(event: &SessionEvent) -> Result<&ExternalHarnessOperation, SessionError> {
         Err(failure())
     }
 }
+// The callbacks are host-owned proof checks, never serialized permissions or IPC flags.
+fn verify_recovery_action(
+    action: HarnessAction,
+    owner: &ExternalHarnessOwner,
+) -> Result<HarnessAction, SessionError> {
+    match action {
+        HarnessAction::ReleaseTransport {
+            release,
+            verify_reap,
+        } => {
+            if bcode_session_models::CURRENT_SESSION_EVENT_SCHEMA_VERSION < 56
+                || bcode_session_models::CURRENT_SESSION_STORAGE_WRITER_EPOCH < 24
+            {
+                return Err(failure());
+            }
+            release
+                .validate_for(owner)
+                .map_err(SessionError::EventSerialization)?;
+            verify_reap(&release).map_err(SessionError::EventSerialization)?;
+            Ok(HarnessAction::Write(Box::new(
+                ExternalHarnessOperationRecord::TransportReleased { release: *release },
+            )))
+        }
+        HarnessAction::Recover {
+            recovery,
+            verify_release,
+        } => {
+            if bcode_session_models::CURRENT_SESSION_EVENT_SCHEMA_VERSION < 56
+                || bcode_session_models::CURRENT_SESSION_STORAGE_WRITER_EPOCH < 24
+            {
+                return Err(failure());
+            }
+            recovery
+                .validate_for(owner)
+                .map_err(SessionError::EventSerialization)?;
+            verify_release(&recovery.release).map_err(SessionError::EventSerialization)?;
+            Ok(HarnessAction::Write(Box::new(
+                ExternalHarnessOperationRecord::RecoveryPrepared { recovery },
+            )))
+        }
+        HarnessAction::Write(record)
+            if matches!(
+                record.as_ref(),
+                ExternalHarnessOperationRecord::RecoveryPrepared { .. }
+                    | ExternalHarnessOperationRecord::TransportReleased { .. }
+            ) =>
+        {
+            Err(failure())
+        }
+        other => Ok(other),
+    }
+}
+
 impl SessionActor {
     pub(super) async fn harness_operation(
         &mut self,
@@ -60,9 +128,33 @@ impl SessionActor {
         {
             return Err(failure());
         }
+        let action = verify_recovery_action(action, &owner)?;
+        // These transitions are dormant until the reviewed writer/schema fence is published.
+        // No existing schema-55 writer may append generation-transfer semantics.
+        let recovery = matches!(&action, HarnessAction::Write(record)
+            if matches!(record.as_ref(), ExternalHarnessOperationRecord::RecoveryPrepared { .. }
+                | ExternalHarnessOperationRecord::TransportReleased { .. }));
+        if recovery
+            && (bcode_session_models::CURRENT_SESSION_EVENT_SCHEMA_VERSION < 56
+                || bcode_session_models::CURRENT_SESSION_STORAGE_WRITER_EPOCH < 24)
+        {
+            return Err(failure());
+        }
+        if matches!(&action, HarnessAction::State | HarnessAction::Page { .. }) {
+            tracing::warn!(target: "bcode_session::harness", stage = "operation_db_enter", "managed actor progress");
+        }
         self.ensure_session_db_for_write().await?;
         let db = self.db.as_ref().ok_or_else(failure)?;
-        let state = db.harness_state(&owner).await?;
+        if matches!(&action, HarnessAction::State | HarnessAction::Page { .. }) {
+            tracing::warn!(target: "bcode_session::harness", stage = "operation_db_exit", "managed actor progress");
+            tracing::warn!(target: "bcode_session::harness", stage = "operation_state_enter", "managed actor progress");
+        }
+        let state = db
+            .harness_state(operation_state_owner(&owner, &action))
+            .await?;
+        if matches!(&action, HarnessAction::State | HarnessAction::Page { .. }) {
+            tracing::warn!(target: "bcode_session::harness", stage = "operation_state_exit", "managed actor progress");
+        }
         let action = if let HarnessAction::Page { after, page } = action {
             let instance = state.as_ref().ok_or_else(failure)?.instance.clone();
             HarnessAction::Write(Box::new(ExternalHarnessOperationRecord::ObservationPage {
@@ -74,7 +166,9 @@ impl SessionActor {
             action
         };
         match action {
-            HarnessAction::Page { .. } => Err(failure()),
+            HarnessAction::Page { .. }
+            | HarnessAction::Recover { .. }
+            | HarnessAction::ReleaseTransport { .. } => Err(failure()),
             HarnessAction::State => Ok(HarnessResult::State(state.map(Box::new))),
             HarnessAction::Receipt {
                 submission_id,
@@ -119,8 +213,7 @@ impl SessionActor {
                 Ok(HarnessResult::Interaction(interaction))
             }
             HarnessAction::Write(record) => {
-                self.write_harness_operation(owner, *record, state, timestamp)
-                    .await
+                Box::pin(self.write_harness_operation(owner, *record, state, timestamp)).await
             }
         }
     }
@@ -136,12 +229,26 @@ impl SessionActor {
             version: 1,
             owner: owner.clone(),
             record,
+            inventory_commitments: Vec::new(),
         };
         operation
             .validate()
             .map_err(SessionError::EventSerialization)?;
+        let page_diagnostic = matches!(
+            &operation.record,
+            ExternalHarnessOperationRecord::ObservationPage { .. }
+        );
+        if page_diagnostic {
+            tracing::warn!(target: "bcode_session::harness", stage = "page_retry_enter", "managed actor progress");
+        }
         if let Some(result) = retained_retry(db, &owner, state.as_ref(), &operation).await? {
+            if page_diagnostic {
+                tracing::warn!(target: "bcode_session::harness", stage = "page_retry_retained", "managed actor progress");
+            }
             return Ok(result);
+        }
+        if page_diagnostic {
+            tracing::warn!(target: "bcode_session::harness", stage = "page_retry_exit", "managed actor progress");
         }
         let claim = matches!(
             operation.record,
@@ -149,6 +256,9 @@ impl SessionActor {
         );
         // Reuses canonical actor append: write lock, refreshed generation, transactional
         // preconditions + canonical event + locators + post-commit fanout.
+        if page_diagnostic {
+            tracing::warn!(target: "bcode_session::harness", stage = "page_append_enter", "managed actor progress");
+        }
         self.append_event(
             SessionEventKind::ExternalHarnessOperation {
                 operation: Box::new(operation),
@@ -157,11 +267,29 @@ impl SessionActor {
             timestamp,
         )
         .await?;
+        if page_diagnostic {
+            tracing::warn!(target: "bcode_session::harness", stage = "page_append_exit", "managed actor progress");
+        }
         Ok(if claim {
             HarnessResult::Claim(ExternalHarnessClaim::New)
         } else {
             HarnessResult::Committed
         })
+    }
+}
+
+fn operation_state_owner<'a>(
+    owner: &'a ExternalHarnessOwner,
+    action: &'a HarnessAction,
+) -> &'a ExternalHarnessOwner {
+    match action {
+        HarnessAction::Write(record) => match record.as_ref() {
+            ExternalHarnessOperationRecord::RecoveryPrepared { recovery } => {
+                &recovery.previous_owner
+            }
+            _ => owner,
+        },
+        _ => owner,
     }
 }
 
@@ -173,6 +301,8 @@ async fn retained_retry(
 ) -> Result<Option<HarnessResult>, SessionError> {
     // All retries are compared inside this same serialized writer operation.
     match &operation.record {
+        ExternalHarnessOperationRecord::TransportReleased { .. }
+        | ExternalHarnessOperationRecord::RecoveryPrepared { .. } => {}
         ExternalHarnessOperationRecord::Configured {
             instance,
             capabilities,
@@ -222,32 +352,81 @@ async fn retained_retry(
                 .harness_latest(owner.session_id, "completion", &request.request_id)
                 .await?
             {
-                if op(&event)? != operation {
+                let retained = op(&event)?;
+                // Commitments are host-computed at append, not caller operation identity.
+                // Exact retry compares every caller-owned fact against canonical history.
+                if retained.version != operation.version
+                    || retained.owner != operation.owner
+                    || retained.record != operation.record
+                {
                     return Err(failure());
                 }
                 return Ok(Some(HarnessResult::Committed));
             }
         }
-        ExternalHarnessOperationRecord::ObservationPage { after, .. } => {
-            state.ok_or_else(failure)?;
-            let id = format!(
-                "{}:{}",
-                owner.generation,
-                serde_json::to_string(after).map_err(|_| failure())?
-            );
-            if let Some(event) = db
-                .harness_latest(owner.session_id, "page_input", &id)
-                .await?
+        ExternalHarnessOperationRecord::ObservationPage { after, page, .. } => {
+            return retained_page_retry(
+                db,
+                owner,
+                state.ok_or_else(failure)?,
+                operation,
+                after.as_deref(),
+                page,
+            )
+            .await;
+        }
+    }
+    Ok(None)
+}
+
+async fn retained_page_retry(
+    db: &super::SessionDb,
+    owner: &ExternalHarnessOwner,
+    current: &ExternalHarnessState,
+    operation: &ExternalHarnessOperation,
+    after: Option<&str>,
+    page: &HarnessObservationPage,
+) -> Result<Option<HarnessResult>, SessionError> {
+    if let Some(retained_page) = &page.retention {
+        if let Some(event) = db.harness_retained_page_event(owner, retained_page).await? {
+            let retained = op(&event)?;
+            if retained.version != operation.version
+                || retained.owner != operation.owner
+                || retained.record != operation.record
             {
-                if op(&event)? == operation {
-                    return Ok(Some(HarnessResult::Committed));
-                }
-                // Empty unchanged-cursor long polls are replaceable observations only.
-                if !matches!(&op(&event)?.record,ExternalHarnessOperationRecord::ObservationPage { page,.. } if page.observations.is_empty() && &page.next_after==after)
-                {
-                    return Err(failure());
-                }
+                return Err(failure());
             }
+            return Ok(Some(HarnessResult::Committed));
+        }
+        // A cursor may recur after an empty page. New retained-page identities
+        // must extend the current committed predecessor, not an older input
+        // cursor collision. Transactional append validates that predecessor again.
+        if current.observation_after.as_deref() != after {
+            return Err(failure());
+        }
+        return Ok(None);
+    }
+    let id = format!(
+        "{}:{}",
+        owner.generation,
+        serde_json::to_string(&after).map_err(|_| failure())?
+    );
+    if let Some(event) = db
+        .harness_latest(owner.session_id, "page_input", &id)
+        .await?
+    {
+        let retained = op(&event)?;
+        if retained.version == operation.version
+            && retained.owner == operation.owner
+            && retained.record == operation.record
+        {
+            return Ok(Some(HarnessResult::Committed));
+        }
+        // Preserve legacy non-retained page conflict behavior.
+        if !matches!(&retained.record, ExternalHarnessOperationRecord::ObservationPage { page, .. }
+            if page.observations.is_empty() && page.next_after.as_deref() == after)
+        {
+            return Err(failure());
         }
     }
     Ok(None)

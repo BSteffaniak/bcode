@@ -167,6 +167,9 @@ impl SnapshotState {
         {
             return Err("unsupported snapshot identity or schema");
         }
+        if !next.snapshot.execution_lifecycle.is_bounded() {
+            return Err("execution lifecycle exceeds presentation bounds");
+        }
         let mut ids = BTreeSet::new();
         if next
             .snapshot

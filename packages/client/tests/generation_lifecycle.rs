@@ -51,10 +51,20 @@ fn fixture(fail_history: bool) -> Fixture {
     fixture_with_pending(fail_history, |_| false)
 }
 
+fn private_fixture_directory(session_id: SessionId) -> std::path::PathBuf {
+    use std::os::unix::fs::DirBuilderExt as _;
+    let directory = std::path::PathBuf::from(format!("/tmp/bcg-{session_id}"));
+    // Binding never repairs caller-owned permissions.
+    std::fs::DirBuilder::new()
+        .mode(0o700)
+        .create(&directory)
+        .unwrap();
+    directory
+}
+
 fn fixture_with_pending(fail_history: bool, hold: fn(&Request) -> bool) -> Fixture {
     let session_id = SessionId::new();
-    let directory = std::path::PathBuf::from(format!("/tmp/bcg-{session_id}"));
-    std::fs::create_dir(&directory).unwrap();
+    let directory = private_fixture_directory(session_id);
     let endpoint = bcode_ipc::IpcEndpoint::unix_socket(directory.join("test.sock"));
     let listener = bcode_ipc::LocalIpcListener::bind(&endpoint).unwrap();
     let (history_tx, history) = tokio::sync::mpsc::unbounded_channel();

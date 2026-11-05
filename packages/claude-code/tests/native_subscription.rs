@@ -117,6 +117,300 @@ async fn next(session: &mut ClaudeSession) -> Event {
         .expect("native protocol event")
 }
 
+fn status_only_probe_options(cwd: PathBuf) -> LaunchOptions {
+    assert_eq!(
+        std::env::var("BCODE_NATIVE_STATUS_STATE_PROBE").as_deref(),
+        Ok("one-input-authorized"),
+        "explicit one-input probe authorization required"
+    );
+    for key in [
+        "ANTHROPIC_API_KEY",
+        "ANTHROPIC_AUTH_TOKEN",
+        "ANTHROPIC_BASE_URL",
+        "ANTHROPIC_PROFILE",
+        "CLAUDE_CODE_OAUTH_TOKEN",
+        "CLAUDE_CODE_USE_BEDROCK",
+        "CLAUDE_CODE_USE_VERTEX",
+        "CLAUDE_CODE_USE_FOUNDRY",
+    ] {
+        assert!(
+            std::env::var_os(key).is_none(),
+            "ambient alternate billing route rejected"
+        );
+    }
+    let config = std::env::var_os("BCODE_NATIVE_CLAUDE_CONFIG_DIR")
+        .map(PathBuf::from)
+        .expect("explicit existing native namespace required");
+    assert!(config.is_absolute(), "absolute native namespace required");
+    let mut environment = BTreeMap::new();
+    for key in [
+        "HOME",
+        "USER",
+        "PATH",
+        "TMPDIR",
+        "LANG",
+        "LC_ALL",
+        "SYSTEMROOT",
+    ] {
+        if let Ok(value) = std::env::var(key) {
+            environment.insert(key.into(), value);
+        }
+    }
+    LaunchOptions {
+        executable: PathBuf::from(EXECUTABLE),
+        expected_version: "2.1.308 (Claude Code)".into(),
+        cwd,
+        config_directory: config,
+        environment: NativeEnvironment(environment),
+        billing_route: BillingRoute::NativeAccount,
+        settings: SettingsInheritance::ExplicitSources,
+        setting_sources: Vec::new(),
+        resume_session_id: None,
+        settlement_support: SettlementSupport::Unknown,
+        auth_support: NativeAuthSupport::VerifiedStatus,
+        limits: Limits {
+            request_timeout: Duration::from_secs(30),
+            ..Limits::default()
+        },
+    }
+}
+
+#[derive(Default)]
+struct StatusStateEvidence {
+    running: bool,
+    idle_after_running: bool,
+    sdk_host_marker: bool,
+    consumed: bool,
+    attributed_result: bool,
+    exact_output: bool,
+    tools_disabled: bool,
+    attributed_result_frame: Option<String>,
+    output_frame: Option<String>,
+}
+impl StatusStateEvidence {
+    fn complete(&self) -> bool {
+        self.running
+            && self.idle_after_running
+            && self.sdk_host_marker
+            && self.consumed
+            && self.attributed_result
+            && self.exact_output
+            && self.tools_disabled
+            && self.attributed_result_frame.is_some()
+            && self.attributed_result_frame == self.output_frame
+    }
+
+    fn record(&mut self, event: Event, uuid: &SubmissionUuid) {
+        match event {
+            Event::Attribution(evidence) => {
+                assert!(
+                    evidence.primary == *uuid && evidence.consumed == [uuid.clone()],
+                    "unexpected prompt attribution"
+                );
+                assert!(!evidence.resumed, "unexpected resume attribution");
+                match evidence.stage {
+                    AttributionStage::Reply => self.consumed = true,
+                    AttributionStage::Result {
+                        is_error,
+                        queued_turn_count,
+                    } => {
+                        assert!(
+                            !is_error && queued_turn_count == Some(0),
+                            "native result failed or reported queued inputs"
+                        );
+                        self.attributed_result = true;
+                        self.attributed_result_frame = Some(evidence.native_frame_uuid);
+                    }
+                }
+            }
+            Event::Message(NativeMessage::System(value)) => {
+                match value.get("subtype").and_then(serde_json::Value::as_str) {
+                    Some("session_state_changed") => {
+                        let sdk_host_only = value
+                            .get("sdk_host_only")
+                            .and_then(serde_json::Value::as_bool)
+                            == Some(true);
+                        assert!(
+                            sdk_host_only,
+                            "state marker lacked exact SDK producer provenance"
+                        );
+                        self.sdk_host_marker = true;
+                        match value.get("state").and_then(serde_json::Value::as_str) {
+                            Some("running") => {
+                                self.running = true;
+                                self.idle_after_running = false;
+                            }
+                            Some("idle") if self.running => self.idle_after_running = true,
+                            _ => {}
+                        }
+                    }
+                    Some("init") => {
+                        assert!(
+                            value
+                                .get("apiKeySource")
+                                .and_then(serde_json::Value::as_str)
+                                == Some("none"),
+                            "unexpected native billing source"
+                        );
+                        self.tools_disabled = value
+                            .get("tools")
+                            .and_then(serde_json::Value::as_array)
+                            .is_some_and(Vec::is_empty);
+                        assert!(self.tools_disabled, "native tools were not disabled");
+                    }
+                    _ => {}
+                }
+            }
+            Event::Message(NativeMessage::Assistant(value)) => {
+                assert!(
+                    !value
+                        .pointer("/message/content")
+                        .and_then(serde_json::Value::as_array)
+                        .into_iter()
+                        .flatten()
+                        .any(
+                            |block| block.get("type").and_then(serde_json::Value::as_str)
+                                == Some("tool_use")
+                        ),
+                    "unexpected native tool use"
+                );
+            }
+            Event::Message(NativeMessage::Result(value)) => {
+                assert!(
+                    value.get("subtype").and_then(serde_json::Value::as_str) == Some("success")
+                        && value.get("is_error").and_then(serde_json::Value::as_bool)
+                            == Some(false),
+                    "native result was not successful"
+                );
+                self.output_frame = value
+                    .get("uuid")
+                    .and_then(serde_json::Value::as_str)
+                    .map(str::to_owned);
+                self.exact_output = value
+                    .get("result")
+                    .and_then(serde_json::Value::as_str)
+                    .is_some_and(|text| text.trim() == "STATUS_STATE_OK");
+                assert!(self.exact_output, "native sentinel mismatch");
+            }
+            Event::Callback { .. } => panic!("unexpected callback; no response authorized"),
+            Event::Settlement(Settlement::Settled) => panic!("Unknown support invented settlement"),
+            _ => {}
+        }
+    }
+}
+
+fn initialize_schema_types(value: &serde_json::Value) -> Vec<(&'static str, &'static str)> {
+    // Fixed schema paths only: never enumerate native account, command, model,
+    // tool, or extension names, and never retain arbitrary scalar values.
+    [
+        "",
+        "/sdk_session_state_events",
+        "/capabilities",
+        "/capabilities/sdk_session_state_events",
+        "/response",
+        "/response/sdk_session_state_events",
+        "/commands",
+        "/models",
+        "/account",
+        "/output_styles",
+        "/fast_mode_state",
+    ]
+    .into_iter()
+    .map(|path| {
+        let kind = match value.pointer(path) {
+            None => "missing",
+            Some(serde_json::Value::Null) => "null",
+            Some(serde_json::Value::Bool(_)) => "boolean",
+            Some(serde_json::Value::Number(_)) => "number",
+            Some(serde_json::Value::String(_)) => "string",
+            Some(serde_json::Value::Array(_)) => "array",
+            Some(serde_json::Value::Object(_)) => "object",
+        };
+        (path, kind)
+    })
+    .collect()
+}
+
+#[test]
+fn initialize_schema_diagnostic_omits_native_values_and_unknown_keys() {
+    let first = serde_json::json!({
+        "account":{"private":"first"}, "commands":["private-name"],
+        "capabilities":{"sdk_session_state_events":true}, "unknown-secret":"first"
+    });
+    let second = serde_json::json!({
+        "account":{"other":"second"}, "commands":["other-name"],
+        "capabilities":{"sdk_session_state_events":false}, "different-secret":"second"
+    });
+    assert_eq!(
+        initialize_schema_types(&first),
+        initialize_schema_types(&second)
+    );
+    assert!(initialize_schema_types(&first).contains(&("/sdk_session_state_events", "missing")));
+    assert!(
+        initialize_schema_types(&first)
+            .contains(&("/capabilities/sdk_session_state_events", "boolean"))
+    );
+}
+
+#[tokio::test(flavor = "current_thread")]
+#[ignore = "one subscription input; explicit status-only compatibility probe authorization required"]
+async fn installed_native_status_only_session_state_one_input() {
+    let directory = tempfile::tempdir().unwrap();
+    let options = status_only_probe_options(directory.path().to_path_buf());
+    verify_artifacts();
+    let session_uuid = fresh_uuid();
+    let uuid = SubmissionUuid::new(fresh_uuid()).unwrap();
+    let mut session = ClaudeSession::spawn_new_without_tools(options, &session_uuid)
+        .await
+        .expect("status-only native spawn failed");
+    let mut evidence = StatusStateEvidence::default();
+    let result = tokio::time::timeout(Duration::from_secs(120), async {
+        let initialize = session.client().initialize().await.expect("native initialize failed");
+        eprintln!("status_state_probe initialize_schema_types={:?}", initialize_schema_types(&initialize));
+        // These exact wrapper/native hashes bind the inspected producer contract:
+        // CLAUDE_CODE_SDK_READS_SESSION_STATE=1 emits session_state_changed with
+        // sdk_host_only=true. There is no initialize capability field for this.
+        // stream_command injects that reserved environment flag independently of
+        // settlement support. Only observed markers below can pass this probe;
+        // the source contract alone never enables verified settlement.
+        eprintln!("status_state_probe exact_artifact_producer_contract=true settlement_unknown=true auth_status_only=true");
+        session.client().submit_with_uuid(
+            "Reply with exactly STATUS_STATE_OK. Do not use tools.",
+            Some(&session_uuid), uuid.clone(),
+        ).await.expect("single submission uncertain; never resend");
+        for _ in 0..512 {
+            let event = session.next_event().await.expect("native observation failed");
+            evidence.record(event, &uuid);
+            if evidence.complete() {
+                assert_eq!(session.client().settlement(), Settlement::Unsupported);
+                assert!(!session.client().can_submit_next_turn(),
+                    "Unknown support must not authorize follow-up from a result");
+                assert!(matches!(session.client().identity_state(),
+                    IdentityState::Confirmed { native_session_id } if native_session_id == session_uuid));
+                eprintln!("status_state_probe running=true idle_after_running=true sdk_host_marker=true consumed_exact=true result_exact=true output_exact=true tools_disabled=true authoritative_settlement=false inputs=1");
+                return;
+            }
+        }
+        panic!("bounded event count exhausted; no resend");
+    }).await;
+    session.close().await;
+    eprintln!(
+        "status_state_probe running={} idle_after_running={} sdk_host_marker={} consumed_exact={} result_exact={} output_exact={} tools_disabled={} deadline_ok={}",
+        evidence.running,
+        evidence.idle_after_running,
+        evidence.sdk_host_marker,
+        evidence.consumed,
+        evidence.attributed_result,
+        evidence.exact_output,
+        evidence.tools_disabled,
+        result.is_ok(),
+    );
+    assert!(
+        result.is_ok(),
+        "120-second probe deadline exhausted; no resend"
+    );
+}
+
 #[tokio::test(flavor = "current_thread")]
 #[ignore = "spends existing Claude subscription; explicit native compatibility authorization required"]
 async fn installed_native_long_lived_two_exact_uuid_submissions() {
@@ -369,8 +663,8 @@ async fn installed_native_background_shell_never_settles_on_false_idle() {
     assert!(saw_intent && completed && results >= 2);
     assert!(snapshot_live && snapshot_empty_after_live && result_background_id);
     eprintln!(
-        "native_library background_intent=true tool_result_id=true snapshot_live=true snapshot_empty_after_live=true completion_notification=true results={results} settlement=unsupported"
+        "native_library background_intent=true tool_result_id=true snapshot_live=true snapshot_empty_after_live=true completion_notification=true results={results} settlement=running_background_continuation_not_proven"
     );
-    assert_eq!(session.client().settlement(), Settlement::Unsupported);
+    assert_eq!(session.client().settlement(), Settlement::Running);
     session.close().await;
 }

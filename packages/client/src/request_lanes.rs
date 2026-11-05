@@ -15,6 +15,18 @@ pub struct RequestLanes {
     background: Lane,
 }
 
+impl RequestLanes {
+    /// Release only pooled connections; checked-out requests retain ownership.
+    pub(super) fn clear_idle(&self) {
+        for lane in [&self.interactive, &self.background] {
+            lane.idle
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .clear();
+        }
+    }
+}
+
 impl Default for RequestLanes {
     fn default() -> Self {
         Self {

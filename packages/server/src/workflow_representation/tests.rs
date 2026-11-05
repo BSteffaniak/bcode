@@ -138,10 +138,32 @@ pub(super) async fn admit_extension_with_observations(state: &ServerState, obser
 async fn exact_new_status_and_detachment_do_not_acquire_execution_authority() {
     let (_root, state) = fixture_with_store(true);
     admit_extension(&state).await;
-    let run = status(&state, "new")
+    // Route inspection is a snapshot read, not another owner mutation. It
+    // remains available while receipt publication holds the write queue.
+    let queue = backpressure::write_queue(state.workflow_store.lock().unwrap().path()).unwrap();
+    let held = queue.lock().await;
+    let run = tokio::time::timeout(std::time::Duration::from_secs(5), status(&state, "new"))
         .await
+        .expect("status does not wait for owner publication")
         .expect("status")
         .expect("new run");
+    // Status is independently readable, but authority routing must still
+    // serialize with the owner queue instead of competing with its writer.
+    {
+        let path = crate::workflow_store_path(&state);
+        let routing = lookup_at(&path, "new");
+        tokio::pin!(routing);
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(20), &mut routing)
+                .await
+                .is_err()
+        );
+        drop(held);
+        assert!(matches!(
+            routing.await.expect("routing after publication"),
+            RunLookup::Available(_)
+        ));
+    }
     assert_eq!(run.parent_session_id.as_deref(), Some("parent"));
     assert_eq!(run.status, bcode_workflow::RunStatus::Paused);
     assert!(require_legacy(&state, "new").await.is_err());

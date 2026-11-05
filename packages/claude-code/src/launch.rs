@@ -123,8 +123,12 @@ impl LaunchOptions {
                 ));
             }
         }
-        let api_key = env.get("ANTHROPIC_API_KEY").is_some_and(|v| !v.is_empty());
-        if api_key != (self.billing_route == BillingRoute::ApiKey) {
+        let route_matches = match (self.billing_route, env.get("ANTHROPIC_API_KEY")) {
+            (BillingRoute::NativeAccount, None) => true,
+            (BillingRoute::ApiKey, Some(key)) => !key.trim().is_empty(),
+            _ => false,
+        };
+        if !route_matches {
             return Err(Error::InvalidConfiguration(
                 "explicit billing route does not match credentials",
             ));
@@ -202,6 +206,7 @@ impl LaunchOptions {
         command
     }
 }
+
 /// Validate the UUID required by the native `--session-id` create option.
 /// # Errors
 /// Returns `Protocol` for anything other than a canonical hyphenated UUID.
@@ -229,4 +234,59 @@ pub fn validate_id(id: &str) -> Result<(), Error> {
         return Err(Error::Protocol);
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn options() -> LaunchOptions {
+        LaunchOptions {
+            executable: PathBuf::from("/isolated/claude"),
+            expected_version: "fixture".into(),
+            cwd: PathBuf::from("/isolated/work"),
+            config_directory: PathBuf::from("/isolated/config"),
+            environment: NativeEnvironment::default(),
+            billing_route: BillingRoute::NativeAccount,
+            settings: SettingsInheritance::Native,
+            setting_sources: Vec::new(),
+            resume_session_id: None,
+            settlement_support: SettlementSupport::Unknown,
+            auth_support: NativeAuthSupport::Unknown,
+            limits: Limits::default(),
+        }
+    }
+
+    #[test]
+    fn billing_route_requires_explicit_nonblank_api_credentials() {
+        let mut options = options();
+        assert!(options.validate().is_ok());
+        for key in ["", " ", "\t\n", "fixture-key"] {
+            options
+                .environment
+                .0
+                .insert("ANTHROPIC_API_KEY".into(), key.into());
+            assert!(options.validate().is_err());
+        }
+        options.billing_route = BillingRoute::ApiKey;
+        options.environment.0.remove("ANTHROPIC_API_KEY");
+        assert!(options.validate().is_err());
+        for key in ["", " ", "\t\n"] {
+            options
+                .environment
+                .0
+                .insert("ANTHROPIC_API_KEY".into(), key.into());
+            assert!(options.validate().is_err());
+        }
+        options
+            .environment
+            .0
+            .insert("ANTHROPIC_API_KEY".into(), "fixture-key".into());
+        assert!(options.validate().is_ok());
+        options
+            .environment
+            .0
+            .insert("ANTHROPIC_AUTH_TOKEN".into(), "alternate-route".into());
+        assert!(options.validate().is_err());
+    }
 }

@@ -60,6 +60,10 @@ use output::{
     settle_output_successors, stored_activation_output, successor_already_admitted,
     successor_dependencies_ready, transform_run_json,
 };
+mod obligation;
+pub use bcode_workflow::{
+    WorkflowObligationAdoption, WorkflowObligationAdoptionProof, WorkflowObligationAttempt,
+};
 mod receipts;
 use receipts::fan_out_retirement_pending;
 mod recovery;
@@ -83,9 +87,9 @@ const RESET_BACKUP_DIRECTORY: &str = "reset-backups";
 /// Stable destructive confirmation required by public workflow-store reset surfaces.
 pub const WORKFLOW_STORE_RESET_CONFIRMATION: &str = "DELETE-INCOMPATIBLE-WORKFLOW-STATE";
 /// Current clean-break workflow store schema version.
-pub const WORKFLOW_STORE_SCHEMA_VERSION: u32 = 43;
+pub const WORKFLOW_STORE_SCHEMA_VERSION: u32 = 44;
 // Changes only when existing readers/writers would become unsafe, not for additive DDL.
-const WORKFLOW_STORE_COMPATIBILITY: u32 = 3;
+const WORKFLOW_STORE_COMPATIBILITY: u32 = 4;
 /// Current bounded workflow-store reset receipt version.
 pub const WORKFLOW_STORE_RESET_RECEIPT_VERSION: u32 = 1;
 /// Current explicit workflow-store migration receipt contract.
@@ -1377,7 +1381,7 @@ impl WorkflowStore {
                     match Self::open_with_ownership(&path, ownership) {
                         Ok(store) => return Ok(store),
                         Err(WorkflowStoreError::UnsupportedStore {
-                            actual: Some(14..=42),
+                            actual: Some(14..=43),
                             ..
                         }) => {}
                         Err(error) => return Err(error),
@@ -1719,6 +1723,13 @@ impl WorkflowStore {
         continuation::initialize(db)?;
         recovery::initialize(db)?;
         initialize_compatibility_contract(db)?;
+        crate::database::block_on(
+            db.exec_update_count(
+                &update("workflow_storage_compatibility")
+                    .value("compatibility", i64::from(WORKFLOW_STORE_COMPATIBILITY))
+                    .where_eq("contract_id", 1_i64),
+            ),
+        )?;
         migrate_recursion_policy(db)?;
 
         crate::database::block_on(
@@ -7331,7 +7342,7 @@ fn verify_migration_source(db: &dyn switchy_database::Database) -> Result<u32, W
             "workflow store migration cannot read the source schema".to_string(),
         )
     })?;
-    if !matches!(previous_schema_version, 14..=42) {
+    if !matches!(previous_schema_version, 14..=43) {
         return Err(WorkflowStoreError::UnsupportedStore {
             actual: Some(previous_schema_version),
             expected: WORKFLOW_STORE_SCHEMA_VERSION,

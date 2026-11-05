@@ -243,10 +243,252 @@ pub struct ExternalHarnessOperation {
     pub version: u16,
     pub owner: ExternalHarnessOwner,
     pub record: ExternalHarnessOperationRecord,
+    /// Host-computed current-inventory commitments; never supplied by a native adapter.
+    #[serde(default)]
+    pub inventory_commitments: Vec<HarnessInventoryCommitment>,
 }
+
+/// Counters committed by the host over validated canonical lifecycle observations.
+///
+/// These establish historical lifecycle facts at the committed revision, not availability
+/// or integrity of every derived proof descendant. They do not establish coverage, complete
+/// output, adapter acknowledgement, or workflow success. Output must be selected and verified
+/// independently against exact canonical observations. Missing descendants remain repair-required.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HarnessInventorySummary {
+    /// Number of retained identities, including terminal failures.
+    pub identities: u64,
+    /// Nonterminal or unknown work/continuations.
+    pub unfinished: u64,
+    /// Notification or attribution obligations not yet discharged.
+    pub obligations: u64,
+    /// Retained immutable failed outcomes.
+    pub failed: u64,
+    /// Retained immutable interrupted outcomes.
+    pub interrupted: u64,
+}
+
+/// Canonical commitment for one exact inventory namespace at one event revision.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HarnessInventoryCommitment {
+    /// Generation-scoped namespace, including exact attempt and lifecycle kind.
+    pub snapshot_key: String,
+    /// Canonical operation sequence that produced this root.
+    pub revision: u64,
+    /// Content address of a bounded immutable proof node; absent for an empty inventory.
+    pub root: Option<String>,
+    /// Authenticated subtree totals. Coverage and physical proof availability are separate;
+    /// a root hash does not certify that every descendant is present in derived storage.
+    pub summary: HarnessInventorySummary,
+}
+
+/// Exact portable inventory selection. Unknown-origin obligations are session-wide.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum HarnessInventoryScope {
+    /// Exact retained submission attempt.
+    Attempt(bcode_harness_models::HarnessAttemptIdentity),
+    /// Uncorrelated work, continuations, and unanswered interactions.
+    Uncorrelated,
+}
+
+/// Lifecycle inventory family; no arbitrary namespace is accepted from consumers.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum HarnessInventoryKind {
+    Terminal,
+    Coverage,
+    Work,
+    Continuation,
+    Interaction,
+}
+
+/// Restart-portable position inside a canonical, immutable inventory snapshot.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HarnessInventoryCursor {
+    pub owner: ExternalHarnessOwner,
+    pub commitment: HarnessInventoryCommitment,
+    /// Number of identities before the next window; not a claim that they were inspected.
+    pub offset: u64,
+}
+
+/// One bounded canonical membership reference. Resolve only at this retained revision.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HarnessInventoryEntry {
+    pub key: String,
+    pub event_sequence: u64,
+    /// Exact retained canonical observation; never refreshed from a later lifecycle version.
+    pub observation: bcode_harness_models::HarnessObservation,
+}
+
+/// Authenticated canonical summary without enumerating physical descendants.
+/// This is historical lifecycle truth, not proof of complete output or execution success.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HarnessInventorySummaryRead {
+    pub owner: ExternalHarnessOwner,
+    pub commitment: HarnessInventoryCommitment,
+    pub observed_through_sequence: u64,
+}
+
+/// Exact identity lookup at a caller-selected canonical commitment, not an adapter ACK.
+/// Verifies the selected proof path only, not availability of the complete inventory.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HarnessInventoryItemRead {
+    pub owner: ExternalHarnessOwner,
+    pub commitment: HarnessInventoryCommitment,
+    pub observed_through_sequence: u64,
+    /// None proves absence only in the selected snapshot, never future silence.
+    pub entry: Option<HarnessInventoryEntry>,
+}
+
+/// Bounded page from an authenticated snapshot. Exhaustion is not execution success.
+///
+/// Only accessed proof paths and returned canonical observations are verified; this response
+/// does not certify physical integrity of unvisited descendants, even on the final window.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HarnessInventoryPage {
+    pub owner: ExternalHarnessOwner,
+    pub commitment: HarnessInventoryCommitment,
+    /// Canonical session tail inspected for this read. A multi-family consumer must pin
+    /// or recheck this value before combining independently returned current snapshots.
+    pub observed_through_sequence: u64,
+    pub entries: Vec<HarnessInventoryEntry>,
+    pub next_cursor: Option<HarnessInventoryCursor>,
+    /// This window reaches the end; does not certify that a caller inspected earlier windows.
+    pub inventory_exhausted: bool,
+}
+/// Exact daemon lifetime provenance, supplied by the authenticated serving runtime.
+/// The artifact identity is deliberately separate from the legacy owner fingerprint.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ExternalHarnessLifetime {
+    pub daemon_instance_id: String,
+    pub artifact_id: String,
+    pub state_location_id: String,
+}
+impl ExternalHarnessLifetime {
+    /// Validate bounded identity shape, not physical ownership or lock release.
+    /// # Errors
+    /// Rejects absent, oversized or control-bearing identities.
+    pub fn validate(&self) -> Result<(), String> {
+        if [
+            &self.daemon_instance_id,
+            &self.artifact_id,
+            &self.state_location_id,
+        ]
+        .iter()
+        .any(|value| {
+            value.is_empty()
+                || value.len() > MAX_HARNESS_ID_BYTES
+                || value.chars().any(char::is_control)
+        }) {
+            return Err("invalid managed lifetime provenance".into());
+        }
+        Ok(())
+    }
+}
+
+/// Host recording of an exact native transport's physical release, not work settlement.
+/// A Close acknowledgement alone must never be converted into this record.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ExternalHarnessTransportRelease {
+    pub close_request_id: String,
+    pub instance: HarnessInstance,
+    pub binding: HarnessSessionBinding,
+    pub lifetime: ExternalHarnessLifetime,
+    /// Exact native integration's bounded reap evidence identity.
+    pub reap_id: String,
+}
+impl ExternalHarnessTransportRelease {
+    /// Validate shape and owner correlation, never infer a reap or released lifetime.
+    /// # Errors
+    /// Rejects foreign bindings, daemon identities and malformed evidence.
+    pub fn validate_for(&self, owner: &ExternalHarnessOwner) -> Result<(), String> {
+        owner.validate()?;
+        self.lifetime.validate()?;
+        self.instance
+            .validate()
+            .map_err(|_| "invalid release instance")?;
+        self.binding
+            .validate_owner(&owner.session_id.to_string(), owner.generation)
+            .map_err(|_| "invalid release binding")?;
+        if self.binding.instance_id != self.instance.instance_id
+            || self.lifetime.daemon_instance_id != owner.daemon_id
+            || [&self.close_request_id, &self.reap_id].iter().any(|value| {
+                value.is_empty()
+                    || value.len() > MAX_HARNESS_ID_BYTES
+                    || value.chars().any(char::is_control)
+            })
+        {
+            return Err("invalid transport release correlation".into());
+        }
+        Ok(())
+    }
+}
+
+/// Explicit generation-fenced resume intent. It contains no previous submission text.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ExternalHarnessRecovery {
+    pub previous_owner: ExternalHarnessOwner,
+    pub release_event_sequence: u64,
+    pub release: ExternalHarnessTransportRelease,
+    pub capabilities: HarnessCapabilities,
+    pub resume_request: ExternalHarnessRequest,
+}
+impl ExternalHarnessRecovery {
+    /// Validate the exact next generation and retained native identity.
+    /// # Errors
+    /// Rejects overflow, same-daemon transfer, changed instance/native identity and non-resume intent.
+    pub fn validate_for(&self, owner: &ExternalHarnessOwner) -> Result<(), String> {
+        owner.validate()?;
+        self.release.validate_for(&self.previous_owner)?;
+        self.capabilities
+            .validate()
+            .map_err(|_| "invalid recovery capabilities")?;
+        self.resume_request
+            .request()
+            .validate()
+            .map_err(|_| "invalid recovery request")?;
+        if self.capabilities.resume.support
+            == bcode_harness_models::HarnessSupportLevel::Unsupported
+        {
+            return Err("native resume is unsupported".into());
+        }
+        let ExternalHarnessRequestKind::Open(open) = &self.resume_request.kind else {
+            return Err("recovery requires explicit resume".into());
+        };
+        let Some(binding) = &open.resume else {
+            return Err("recovery cannot create a native session".into());
+        };
+        let mut expected = self.release.binding.clone();
+        expected.generation = owner.generation;
+        if self.release_event_sequence == 0
+            || self.previous_owner.session_id != owner.session_id
+            || self.previous_owner.generation.checked_add(1) != Some(owner.generation)
+            || self.previous_owner.daemon_id == owner.daemon_id
+            || self.resume_request.instance != self.release.instance
+            || self.resume_request.request_id != open.open_id
+            || open.open_id == self.release.close_request_id
+            || open.session_id != owner.session_id.to_string()
+            || open.generation != owner.generation
+            || binding != &expected
+            || open.parent_assistance.is_some()
+        {
+            return Err("invalid recovery transition".into());
+        }
+        Ok(())
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum ExternalHarnessOperationRecord {
+    TransportReleased {
+        release: ExternalHarnessTransportRelease,
+    },
+    RecoveryPrepared {
+        recovery: Box<ExternalHarnessRecovery>,
+    },
     Configured {
         instance: HarnessInstance,
         capabilities: HarnessCapabilities,
@@ -274,12 +516,28 @@ impl ExternalHarnessOperation {
             return Err("unsupported harness operation version".into());
         }
         self.owner.validate()?;
+        if self.inventory_commitments.len() > MAX_HARNESS_OBSERVATIONS * 3 + 6
+            || self.inventory_commitments.iter().any(|value| {
+                value.snapshot_key.len() > MAX_HARNESS_ID_BYTES * 8 + 512
+                    || value.root.as_ref().is_some_and(|root| {
+                        root.len() != 64 || !root.bytes().all(|byte| byte.is_ascii_hexdigit())
+                    })
+            })
+        {
+            return Err("invalid host inventory commitments".into());
+        }
         self.validate_record()?;
         serde_json::to_writer(Counter(0), self)
             .map_err(|_| "canonical operation budget exceeded".into())
     }
     fn validate_record(&self) -> Result<(), String> {
         match &self.record {
+            ExternalHarnessOperationRecord::TransportReleased { release } => {
+                release.validate_for(&self.owner)?;
+            }
+            ExternalHarnessOperationRecord::RecoveryPrepared { recovery } => {
+                recovery.validate_for(&self.owner)?;
+            }
             ExternalHarnessOperationRecord::Configured {
                 instance,
                 capabilities,

@@ -6,18 +6,36 @@
 //! Host admission and durable ownership fencing must precede every mutation.
 //! Unknown versions and variants fail closed; an uncertain receipt never authorizes replay.
 
+mod execution;
 mod lifecycle;
+mod recovery;
+pub use execution::*;
+pub use recovery::*;
+mod retention;
+pub use retention::*;
 mod service;
+mod tool_invocation;
+mod tool_queue;
 pub use lifecycle::*;
 pub use service::*;
+pub use tool_invocation::*;
+pub use tool_queue::*;
 
 use serde::{Deserialize, Serialize};
 
 /// Independently versioned plugin service boundary.
 ///
-/// Version two adds explicit consumed-prompt attribution and terminal disposition.
-/// V1 plugins are not admitted through this interface; the envelope shape remains schema one.
-pub const HARNESS_INTERFACE_ID: &str = "bcode.harness/v2";
+/// Version three separates foreground outcomes, background work, and continuations.
+/// Earlier plugins are not admitted through this interface; the envelope shape remains schema one.
+pub const HARNESS_INTERFACE_ID: &str = "bcode.harness/v3";
+/// Optional plugin-declared native terminal authentication preparation service.
+///
+/// `prepare_login` accepts the existing schema-one request identity and selected instance,
+/// and returns its correlated namespace-bound verified native login plan. Declaration alone
+/// establishes neither readiness nor permission. Execution uses the managed auth caller's
+/// prepare/handoff/reaped/reinspection lifecycle, never generic UI service invocation.
+pub const TERMINAL_AUTH_INTERFACE_ID: &str = "bcode.harness.terminal-auth/v1";
+
 /// Current envelope schema; other versions are rejected, not coerced.
 pub const HARNESS_SCHEMA_VERSION: u16 = 1;
 /// Maximum encoded request or response, checked before decoding.

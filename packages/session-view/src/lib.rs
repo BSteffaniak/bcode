@@ -14,6 +14,7 @@ mod actions;
 pub mod child_activity;
 pub mod child_attention;
 pub mod compaction_activity;
+pub mod execution;
 pub mod external;
 pub mod navigation;
 pub mod presentation;
@@ -3351,7 +3352,17 @@ mod text_update_retention_tests {
     fn empty_projector_clone_accounts_both_semantic_roots() {
         let view = SessionView::default();
         let usage = view.observation_retention_usage(limits()).unwrap();
-        assert_eq!(usage.value_nodes, 77);
+        let execution = bcode_session_view_models::retention::inspect_execution_lifecycle(
+            &view.snapshot().execution_lifecycle,
+            limits(),
+        )
+        .unwrap();
+        // Eight owned root fields plus the optional session identity node; empty vectors
+        // and absent identity retain no scalar capacity or collection slots.
+        assert_eq!(execution.value_nodes, 9);
+        assert_eq!(execution.scalar_capacity_bytes, 0);
+        assert_eq!(execution.collection_entries, 0);
+        assert_eq!(usage.value_nodes, 77 + execution.value_nodes);
         let mut ledger = usage;
         let before = ledger;
         assert!(view.try_clone_bounded(&mut ledger, limits()).is_err());
@@ -6061,10 +6072,16 @@ impl SessionView {
             depth: source.depth,
             copies: 2,
         };
+        let old_lifecycle = bcode_session_view_models::retention::inspect_execution_lifecycle(
+            &self.snapshot.execution_lifecycle,
+            limits,
+        )?;
         let mut peak = *retained;
         peak.try_add(temporary, limits)?;
+        peak.try_add(old_lifecycle, limits)?;
+        let mut lifecycle = self.snapshot.execution_lifecycle.clone();
         if let Some(text) =
-            external::canonical_external_text(event).map_err(|_| ObservationRetentionExceeded)?
+            execution::text(&mut lifecycle, event).map_err(|_| ObservationRetentionExceeded)?
         {
             let (mut item, replacement, mut next) =
                 self.stage_system_message_bounded(event, &text, peak, limits)?;
@@ -6073,6 +6090,13 @@ impl SessionView {
             if let TranscriptViewItemKind::SystemMessage { message } = &mut item.kind {
                 message.format = TextFormat::PlainText;
             }
+            let new_lifecycle = bcode_session_view_models::retention::inspect_execution_lifecycle(
+                &lifecycle, limits,
+            )?;
+            next.try_release(old_lifecycle)?;
+            next.try_release(old_lifecycle)?;
+            next.try_add(new_lifecycle, limits)?;
+            self.snapshot.execution_lifecycle = lifecycle;
             self.commit_system_message(item, replacement);
             self.finish_admitted_event(event);
             *retained = next;
@@ -10034,7 +10058,7 @@ impl SessionView {
             self.snapshot.latest_sequence = Some(event.sequence);
         }
         if external::is_external_event(&event.kind) {
-            match external::canonical_external_text(event) {
+            match execution::text(&mut self.snapshot.execution_lifecycle, event) {
                 Ok(Some(text)) => {
                     self.push_item(
                         TranscriptViewItemId::event(event.sequence),

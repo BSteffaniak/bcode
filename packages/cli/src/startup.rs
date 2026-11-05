@@ -44,6 +44,21 @@ pub async fn route(no_discovery: bool) -> Result<bool, CliError> {
         return Ok(false);
     }
     let config = bcode_config::load_config()?;
+    let mut host = load_cli_plugin_host()?;
+    let mut shell = bcode_tui::TerminalShell::enter()?;
+    let backend = Box::pin(route_backend_selection(&host, &mut shell, no_discovery)).await;
+    host.deactivate_all()?;
+    match backend {
+        Ok(true) => {
+            shell.finish()?;
+            return Ok(true);
+        }
+        Ok(false) => {}
+        Err(error) => {
+            shell.finish()?;
+            return Err(error);
+        }
+    }
     let remembered = bcode_config::startup::load();
     let mut host = load_cli_plugin_host()?;
     register_enabled(&host)?;
@@ -52,6 +67,7 @@ pub async fn route(no_discovery: bool) -> Result<bool, CliError> {
     let route = startup_route(readiness.is_ok(), explicit_selection, remembered.is_ok());
     if route == StartupRoute::Continue {
         host.deactivate_all()?;
+        shell.finish()?;
         return Ok(false);
     }
     let discovery_enabled = config
@@ -68,7 +84,6 @@ pub async fn route(no_discovery: bool) -> Result<bool, CliError> {
     };
     host.deactivate_all()?;
     let input = quick_input(remembered.is_ok(), readiness, &candidates, &choices);
-    let mut shell = bcode_tui::TerminalShell::enter()?;
     let result = run_startup_journey(
         &mut shell,
         input,
@@ -82,6 +97,287 @@ pub async fn route(no_discovery: bool) -> Result<bool, CliError> {
     shell.finish()?;
     result?;
     Ok(true)
+}
+
+const HARNESS_CONFIGURATION_INTERFACE: &str = "bcode.harness.configuration/v1";
+
+// Wire DTOs for the plugin-owned configuration service. These are non-secret
+// references, never readiness evidence or authority to invoke native processes.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+enum BackendSelection {
+    Default {},
+    Instance { instance_id: String },
+}
+
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct BackendCatalog {
+    default_instance: Option<String>,
+    instances: std::collections::BTreeMap<String, bcode_harness_models::HarnessInstance>,
+}
+
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PreparedBackend {
+    selection: BackendSelection,
+    instance: bcode_harness_models::HarnessInstance,
+}
+
+fn backend_choices(catalog: &BackendCatalog) -> Result<Vec<BackendSelection>, CliError> {
+    if catalog.instances.len() > 128
+        || catalog
+            .instances
+            .iter()
+            .any(|(id, instance)| id != &instance.instance_id || instance.validate().is_err())
+        || catalog
+            .default_instance
+            .as_ref()
+            .is_some_and(|id| !catalog.instances.contains_key(id))
+    {
+        return Err(CliError::InvalidArguments(
+            "Invalid configured execution backend catalog".into(),
+        ));
+    }
+    let mut choices = Vec::new();
+    if catalog.default_instance.is_some() {
+        choices.push(BackendSelection::Default {});
+    }
+    choices.extend(
+        catalog
+            .instances
+            .keys()
+            .map(|instance_id| BackendSelection::Instance {
+                instance_id: instance_id.clone(),
+            }),
+    );
+    Ok(choices)
+}
+
+fn verify_prepared_backend(
+    catalog: &BackendCatalog,
+    selection: &BackendSelection,
+    prepared: &PreparedBackend,
+) -> Result<(), CliError> {
+    let id = match selection {
+        BackendSelection::Default {} => catalog.default_instance.as_deref(),
+        BackendSelection::Instance { instance_id } => Some(instance_id.as_str()),
+    };
+    if prepared.selection != *selection
+        || prepared.instance.validate().is_err()
+        || id.and_then(|id| catalog.instances.get(id)) != Some(&prepared.instance)
+    {
+        return Err(CliError::InvalidArguments(
+            "Selected execution backend changed; no session was started".into(),
+        ));
+    }
+    Ok(())
+}
+
+async fn route_backend_selection(
+    host: &bcode_plugin::PluginHost,
+    shell: &mut bcode_tui::TerminalShell,
+    no_discovery: bool,
+) -> Result<bool, CliError> {
+    if !host.has_service("bcode.harness", HARNESS_CONFIGURATION_INTERFACE) {
+        return Ok(false);
+    }
+    let catalog: BackendCatalog = match host.invoke_service_json(
+        "bcode.harness",
+        HARNESS_CONFIGURATION_INTERFACE,
+        "catalog",
+        &serde_json::json!({}),
+    ) {
+        Ok(catalog) => catalog,
+        Err(bcode_plugin::PluginServiceCallError::Service { code, .. })
+            if code == "configuration_disabled" =>
+        {
+            return Ok(false);
+        }
+        Err(_) => {
+            return Err(CliError::InvalidArguments(
+                "Configured execution backends could not be read; no selection was changed".into(),
+            ));
+        }
+    };
+    let selections = backend_choices(&catalog)?;
+    if selections.is_empty() {
+        return Ok(false);
+    }
+    let mut choices = vec![bcode_tui::QuickConnectionChoice {
+        label: "Model provider conversation".into(),
+        detail: "Use the existing model/account selection and provider readiness checks.".into(),
+    }];
+    choices.extend(selections.iter().map(|selection| {
+        let label = match selection {
+            BackendSelection::Default {} => format!("Configured execution default ({})", catalog.default_instance.as_deref().unwrap_or("unavailable")),
+            BackendSelection::Instance { instance_id } => format!("Managed conversation: {instance_id}"),
+        };
+        bcode_tui::QuickConnectionChoice {
+            label,
+            detail: "Start a normal conversation using this exact configured instance. Authentication and billing stay with its plugin; no model-provider fallback.".into(),
+        }
+    }));
+    let result = Box::pin(async {
+        let outcome = bcode_tui::run_backend_selection_in_shell(shell, bcode_tui::QuickOnboardingInput {
+            choices,
+            recovery: None,
+        }).await?;
+        match outcome {
+            bcode_tui::QuickOnboardingOutcome::Selected(0) => Ok(false),
+            bcode_tui::QuickOnboardingOutcome::Selected(index) => {
+                let selection = selections.get(index - 1).ok_or_else(|| CliError::InvalidArguments("Selected execution backend is unavailable".into()))?;
+                let prepared: PreparedBackend = host.invoke_service_json(
+                    "bcode.harness", HARNESS_CONFIGURATION_INTERFACE, "prepare",
+                    &serde_json::json!({"selection":selection}),
+                ).map_err(|_| CliError::InvalidArguments("Selected execution backend could not be prepared; no fallback was selected".into()))?;
+                verify_prepared_backend(&catalog, selection, &prepared)?;
+                Box::pin(launch_managed_backend(shell, prepared.instance)).await?;
+                Ok(true)
+            }
+            bcode_tui::QuickOnboardingOutcome::Advanced => {
+                advanced_in_shell(shell, no_discovery).await?;
+                Ok(true)
+            }
+            bcode_tui::QuickOnboardingOutcome::Close => Ok(true),
+            bcode_tui::QuickOnboardingOutcome::Connected { .. } => Err(CliError::InvalidArguments("Backend selection cannot enroll a provider connection".into())),
+        }
+    }).await;
+    if result.is_err() {
+        // Start may have committed: show one safe recovery screen, never reopen
+        // the picker or fall through into model onboarding after managed failure.
+        let _ = shell.show_error_without_retry("Execution startup did not complete. Inspect Sessions before starting another session. No provider fallback or billing change was selected.").await;
+    }
+    result
+}
+
+fn managed_start_call(
+    instance: bcode_harness_models::HarnessInstance,
+    session_id: bcode_session_models::SessionId,
+    open_id: String,
+    working_directory: &std::path::Path,
+) -> Result<bcode_ipc::harness::ManagedSessionCall, CliError> {
+    let working_directory = working_directory
+        .to_str()
+        .filter(|_| working_directory.is_absolute())
+        .ok_or_else(|| {
+            CliError::InvalidArguments(
+                "Managed startup requires an absolute UTF-8 working directory".into(),
+            )
+        })?;
+    let call = bcode_ipc::harness::ManagedSessionCall {
+        session_id: Some(session_id),
+        parent_session_id: None,
+        assistance_destination_session_id: None,
+        harness: bcode_harness_models::HarnessRequest {
+            schema_version: bcode_harness_models::HARNESS_SCHEMA_VERSION,
+            request_id: open_id.clone(),
+            instance,
+            kind: bcode_harness_models::HarnessRequestKind::Open(
+                bcode_harness_models::HarnessOpenRequest {
+                    open_id,
+                    session_id: session_id.to_string(),
+                    generation: 1,
+                    working_directory: working_directory.into(),
+                    resume: None,
+                    parent_assistance: None,
+                },
+            ),
+        },
+    };
+    call.harness
+        .validate()
+        .map_err(|_| CliError::InvalidArguments("Invalid managed startup selection".into()))?;
+    Ok(call)
+}
+
+fn managed_started_session(
+    response: &bcode_harness_models::HarnessServiceResponse,
+    session_id: bcode_session_models::SessionId,
+    request_id: &str,
+    instance_id: &str,
+) -> Result<bcode_session_models::SessionId, CliError> {
+    response
+        .validate()
+        .map_err(|_| CliError::InvalidArguments("Invalid managed startup response".into()))?;
+    let target_matches = match &response.kind {
+        bcode_harness_models::HarnessServiceResponseKind::Prepared(target) => {
+            target.session_id == session_id.to_string()
+                && target.open_id == request_id
+                && target.instance_id == instance_id
+                && target.generation == 1
+        }
+        bcode_harness_models::HarnessServiceResponseKind::Opened(target) => {
+            target.session_id == session_id.to_string()
+                && target.instance_id == instance_id
+                && target.generation == 1
+        }
+        _ => false,
+    };
+    if response.request_id != request_id
+        || response.operation != bcode_harness_models::HarnessOperation::Open
+        || !target_matches
+    {
+        return Err(CliError::InvalidArguments(
+            "Managed startup is unavailable or uncertain; inspect session status before retrying"
+                .into(),
+        ));
+    }
+    Ok(session_id)
+}
+
+fn decode_managed_start_response(
+    response: &bcode_plugin_sdk::application::PluginServiceResponse,
+) -> Result<bcode_harness_models::HarnessServiceResponse, &'static str> {
+    if response.error.is_some()
+        || response.payload.len() > bcode_harness_models::MAX_HARNESS_WIRE_BYTES
+    {
+        return Err("managed startup response unavailable");
+    }
+    serde_json::from_slice(&response.payload).map_err(|_| "invalid managed startup response")
+}
+
+async fn launch_managed_backend(
+    shell: &mut bcode_tui::TerminalShell,
+    instance: bcode_harness_models::HarnessInstance,
+) -> Result<(), CliError> {
+    let cwd = std::fs::canonicalize(std::env::current_dir()?)?;
+    let session_id = bcode_session_models::SessionId::new();
+    let open_id = uuid::Uuid::new_v4().to_string();
+    let instance_id = instance.instance_id.clone();
+    let call = managed_start_call(instance, session_id, open_id.clone(), &cwd)?;
+    let session = Box::pin(shell.wait("Starting your managed conversation", async {
+        // Sealed managed-only facade retains caller config and verified daemon
+        // routing without materializing unrelated model-provider credentials.
+        let client = bcode_client::ManagedSessionClient::default_endpoint();
+        let request = bcode_ipc::harness::ManagedSessionRequest {
+            schema_version: bcode_ipc::harness::MANAGED_SESSION_VERSION,
+            operation: bcode_ipc::harness::ManagedSessionOperation::Start,
+            request_json: serde_json::to_string(&call).map_err(|_| bcode_tui::TuiError::Io(std::io::Error::other("Invalid managed startup request")))?,
+        };
+        let payload = serde_json::to_vec(&request).map_err(|_| bcode_tui::TuiError::Io(std::io::Error::other("Invalid managed startup envelope")))?;
+        let response = client.call_plugin_service(
+            bcode_ipc::harness::MANAGED_SESSION_INTERFACE_ID.into(),
+            request.operation.as_str().into(),
+            payload,
+        ).await.map_err(|_| bcode_tui::TuiError::Io(std::io::Error::other("Managed startup did not complete; inspect session status before retrying")))?;
+        let response = decode_managed_start_response(&response)
+            .map_err(|_| bcode_tui::TuiError::Io(std::io::Error::other("Managed startup response is unavailable or invalid; inspect session status before retrying")))?;
+        managed_started_session(&response, session_id, &open_id, &instance_id).map_err(|_| bcode_tui::TuiError::Io(std::io::Error::other("Managed startup is uncertain or unavailable; inspect session status before retrying")))
+    })).await?;
+    if !shell.stop_requested()
+        && let Some(session_id) = session
+    {
+        shell
+            .run_managed_chat(
+                bcode_client::ManagedSessionClient::default_endpoint(),
+                session_id,
+                &super::static_bundled_plugins(),
+                bcode_tui::TuiLaunchOptions::default(),
+            )
+            .await?;
+    }
+    Ok(())
 }
 
 async fn run_startup_journey(
@@ -865,6 +1161,179 @@ fn local_readiness_with_policy(
 
 #[cfg(test)]
 mod tests {
+    fn backend_instance() -> bcode_harness_models::HarnessInstance {
+        bcode_harness_models::HarnessInstance {
+            instance_id: "native-account".into(),
+            plugin_id: "test.harness".into(),
+            executable: "/isolated/native".into(),
+            config_namespace: "/isolated/config".into(),
+            auth: bcode_harness_models::HarnessAuthBinding {
+                provider_id: "native.auth".into(),
+                profile: "selected".into(),
+                credential_namespace: "/isolated/config".into(),
+                custody: bcode_harness_models::HarnessAuthCustody::NativeManaged,
+            },
+        }
+    }
+
+    #[test]
+    fn backend_catalog_is_not_readiness_or_implicit_default_consent() {
+        let instance = backend_instance();
+        let mut catalog = super::BackendCatalog {
+            default_instance: None,
+            instances: [(instance.instance_id.clone(), instance.clone())].into(),
+        };
+        let selection = super::BackendSelection::Instance {
+            instance_id: instance.instance_id.clone(),
+        };
+        assert_eq!(
+            super::backend_choices(&catalog).unwrap(),
+            vec![selection.clone()]
+        );
+        let mut prepared = super::PreparedBackend {
+            selection: selection.clone(),
+            instance,
+        };
+        assert!(super::verify_prepared_backend(&catalog, &selection, &prepared).is_ok());
+        catalog.default_instance = Some(prepared.instance.instance_id.clone());
+        assert_eq!(
+            super::backend_choices(&catalog).unwrap()[0],
+            super::BackendSelection::Default {}
+        );
+        // Requesting an exact reference cannot be answered as default, even when
+        // both currently resolve to the same instance.
+        prepared.selection = super::BackendSelection::Default {};
+        assert!(super::verify_prepared_backend(&catalog, &selection, &prepared).is_err());
+        assert!(
+            super::verify_prepared_backend(
+                &catalog,
+                &super::BackendSelection::Default {},
+                &prepared
+            )
+            .is_ok()
+        );
+        prepared.selection = selection.clone();
+        prepared.instance.auth.profile = "different-billing-profile".into();
+        assert!(super::verify_prepared_backend(&catalog, &selection, &prepared).is_err());
+        catalog.default_instance = Some("missing".into());
+        assert!(super::backend_choices(&catalog).is_err());
+        // Model route remains recovery-required even when a harness is configured.
+        assert_eq!(
+            super::startup_route(false, true, true),
+            super::StartupRoute::Recover {
+                allow_choices: false
+            }
+        );
+    }
+
+    #[test]
+    fn managed_start_keeps_one_canonical_session_and_rejects_uncertain_or_foreign_reply() {
+        use bcode_harness_models::{
+            HarnessOperation, HarnessPreparedSession, HarnessServiceResponse,
+            HarnessServiceResponseKind,
+        };
+        let session = bcode_session_models::SessionId::new();
+        let call = super::managed_start_call(
+            backend_instance(),
+            session,
+            "retained-open".into(),
+            std::path::Path::new("/isolated/work"),
+        )
+        .unwrap();
+        assert_eq!(call.session_id, Some(session));
+        assert!(call.parent_session_id.is_none());
+        let bcode_harness_models::HarnessRequestKind::Open(open) = &call.harness.kind else {
+            panic!("open required")
+        };
+        assert_eq!(open.session_id, session.to_string());
+        assert_eq!(open.open_id, call.harness.request_id);
+        assert!(open.resume.is_none() && open.parent_assistance.is_none());
+        let mut response = HarnessServiceResponse {
+            schema_version: bcode_harness_models::HARNESS_SCHEMA_VERSION,
+            request_id: "retained-open".into(),
+            operation: HarnessOperation::Open,
+            kind: HarnessServiceResponseKind::Prepared(HarnessPreparedSession {
+                open_id: "retained-open".into(),
+                session_id: session.to_string(),
+                instance_id: "native-account".into(),
+                generation: 1,
+                native_version: "fixture".into(),
+                requested_native_session_id: None,
+            }),
+        };
+        assert_eq!(
+            super::managed_started_session(&response, session, "retained-open", "native-account")
+                .unwrap(),
+            session
+        );
+        response.kind =
+            HarnessServiceResponseKind::Opened(bcode_harness_models::HarnessSessionBinding {
+                schema_version: bcode_harness_models::HARNESS_SCHEMA_VERSION,
+                session_id: session.to_string(),
+                instance_id: "native-account".into(),
+                native_session_id: "native-confirmed".into(),
+                native_version: "fixture".into(),
+                generation: 1,
+            });
+        assert_eq!(
+            super::managed_started_session(&response, session, "retained-open", "native-account")
+                .unwrap(),
+            session
+        );
+        assert!(
+            super::managed_started_session(
+                &response,
+                bcode_session_models::SessionId::new(),
+                "retained-open",
+                "native-account"
+            )
+            .is_err()
+        );
+        response.kind =
+            HarnessServiceResponseKind::Failure(bcode_harness_models::HarnessFailure::Uncertain);
+        assert!(
+            super::managed_started_session(&response, session, "retained-open", "native-account")
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn sealed_managed_reply_rejects_service_errors_and_invalid_payloads() {
+        use bcode_plugin_sdk::application::{PluginServiceError, PluginServiceResponse};
+        let mut response = PluginServiceResponse {
+            payload: serde_json::to_vec(&bcode_harness_models::HarnessServiceResponse {
+                schema_version: bcode_harness_models::HARNESS_SCHEMA_VERSION,
+                request_id: "retained-open".into(),
+                operation: bcode_harness_models::HarnessOperation::Open,
+                kind: bcode_harness_models::HarnessServiceResponseKind::Failure(
+                    bcode_harness_models::HarnessFailure::Uncertain,
+                ),
+            })
+            .unwrap(),
+            error: None,
+        };
+        let decoded = super::decode_managed_start_response(&response).unwrap();
+        assert!(
+            super::managed_started_session(
+                &decoded,
+                bcode_session_models::SessionId::new(),
+                "retained-open",
+                "native-account"
+            )
+            .is_err()
+        );
+        response.error = Some(PluginServiceError {
+            code: "denied".into(),
+            message: "not rendered".into(),
+        });
+        assert!(super::decode_managed_start_response(&response).is_err());
+        response.error = None;
+        response.payload = b"invalid-json".to_vec();
+        assert!(super::decode_managed_start_response(&response).is_err());
+        response.payload = vec![b' '; bcode_harness_models::MAX_HARNESS_WIRE_BYTES + 1];
+        assert!(super::decode_managed_start_response(&response).is_err());
+    }
+
     #[test]
     fn headless_auth_source_is_explicit_and_unambiguous() {
         let mut config = BcodeConfig::default();

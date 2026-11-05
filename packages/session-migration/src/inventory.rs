@@ -928,10 +928,12 @@ fn fixture_writer_edges(manifest: &ReleasedFixtureManifest) -> BTreeSet<(u32, u3
                 .source_writer_epochs
                 .iter()
                 .chain(&fixture.lifecycle_matrix.source_writer_epochs)
-                .filter_map(|writer_epoch| {
-                    MIGRATION_STEPS
-                        .iter()
-                        .find(|step| step.source_writer_epoch == *writer_epoch)
+                .flat_map(|writer_epoch| {
+                    // Edge coverage describes the full planned upgrade path;
+                    // source provenance remains a separate fixture property.
+                    crate::plan_writer_epoch_migration(*writer_epoch)
+                        .into_iter()
+                        .flat_map(|plan| plan.steps)
                         .map(|step| (step.source_writer_epoch, step.target_writer_epoch))
                 })
         })
@@ -1422,7 +1424,7 @@ impl ReleasedEventVariantDescriptor {
     #[must_use]
     pub fn supports_schema(self, schema: u16) -> bool {
         let (first, last) = released_event_schema_range(self.kind);
-        schema >= first && schema <= last
+        (schema >= first && schema <= last) || (self.kind == "session_forked" && schema == 54)
     }
 }
 
@@ -1460,7 +1462,7 @@ pub fn is_released_event_kind_schema(kind: &str, schema: u16) -> bool {
 ///
 /// Event kinds that the current build still persists remain historically decodable through this
 /// schema; the current schema itself is classified by [`classify_event_kind_schema`].
-pub const LATEST_HISTORICAL_EVENT_SCHEMA: u16 = 53;
+pub const LATEST_HISTORICAL_EVENT_SCHEMA: u16 = 54;
 
 fn released_event_schema_range(kind: &str) -> (u16, u16) {
     let live = LATEST_HISTORICAL_EVENT_SCHEMA;
@@ -2284,7 +2286,27 @@ pub struct MigrationStepDescriptor {
     pub target_writer_epoch: u32,
 }
 
-pub const MIGRATION_STEPS: [MigrationStepDescriptor; 18] = [
+pub const MIGRATION_STEPS: [MigrationStepDescriptor; 22] = [
+    MigrationStepDescriptor {
+        id: "session-writer-epoch-22-to-23",
+        source_writer_epoch: 22,
+        target_writer_epoch: 23,
+    },
+    MigrationStepDescriptor {
+        id: "session-writer-epoch-21-to-22",
+        source_writer_epoch: 21,
+        target_writer_epoch: 22,
+    },
+    MigrationStepDescriptor {
+        id: "session-writer-epoch-20-to-21",
+        source_writer_epoch: 20,
+        target_writer_epoch: 21,
+    },
+    MigrationStepDescriptor {
+        id: "session-writer-epoch-19-to-20",
+        source_writer_epoch: 19,
+        target_writer_epoch: 20,
+    },
     MigrationStepDescriptor {
         id: "session-writer-epoch-18-to-19",
         source_writer_epoch: 18,
@@ -2468,11 +2490,19 @@ pub const RELEASED_WRITER_SCHEMA_COMBINATIONS: &[ReleasedWriterSchemaDescriptor]
         writer_epoch: 18,
         event_schema: 53,
     },
+    ReleasedWriterSchemaDescriptor {
+        writer_epoch: 19,
+        event_schema: 54,
+    },
+    ReleasedWriterSchemaDescriptor {
+        writer_epoch: 20,
+        event_schema: 55,
+    },
 ];
 
 /// Released historical writer epochs that must migrate to [`CURRENT_WRITER_EPOCH`].
 pub const RELEASED_HISTORICAL_WRITER_EPOCHS: &[u32] = &[
-    1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18,
+    1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20,
 ];
 
 /// Released historical event schemas currently evidenced by Git history.
@@ -2483,6 +2513,7 @@ pub const RELEASED_HISTORICAL_WRITER_EPOCHS: &[u32] = &[
 pub const RELEASED_HISTORICAL_EVENT_SCHEMAS: &[u16] = &[
     1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26,
     27, 28, 29, 30, 31, 32, 35, 37, 38, 39, 40, 41, 42, 43, 44, 45, 46, 47, 48, 49, 50, 51, 52, 53,
+    54,
 ];
 
 /// Event schemas between the first released schema and the current schema that no writer emitted.
@@ -2599,7 +2630,8 @@ mod tests {
             {
                 assert_eq!(
                     variant.supports_schema(schema),
-                    schema >= first && schema <= last,
+                    (schema >= first && schema <= last)
+                        || (variant.kind == "session_forked" && schema == 54),
                     "schema membership for {} at {schema}",
                     variant.kind
                 );
@@ -2815,6 +2847,40 @@ mod tests {
                 "003_global_composer_drafts_table",
             ])
         );
+    }
+
+    #[test]
+    fn fixture_upgrade_path_coverage_is_distinct_from_source_provenance() {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("fixtures");
+        let mut manifest = load_released_fixture_manifest(&root).unwrap();
+        manifest
+            .fixtures
+            .retain(|fixture| fixture.lifecycle_matrix.source_writer_epochs.contains(&20));
+        for fixture in &mut manifest.fixtures {
+            fixture.source_writer_epochs.retain(|epoch| *epoch == 20);
+            fixture
+                .lifecycle_matrix
+                .source_writer_epochs
+                .retain(|epoch| *epoch == 20);
+        }
+        let edges = fixture_writer_edges(&manifest);
+        let plan = crate::plan_writer_epoch_migration(20).unwrap();
+        assert_eq!(
+            edges,
+            plan.steps
+                .iter()
+                .map(|step| (step.source_writer_epoch, step.target_writer_epoch))
+                .collect()
+        );
+        assert!(edges.contains(&(21, 22)));
+        assert!(edges.contains(&(22, 23)));
+        let source_coverage = released_fixture_writer_coverage(&manifest);
+        assert!(!source_coverage.contains_key(&21));
+        assert!(!source_coverage.contains_key(&22));
+        manifest.fixtures.clear();
+        let gaps = released_fixture_coverage_gaps(&manifest);
+        assert!(gaps.writer_edges.contains(&(21, 22)));
+        assert!(gaps.writer_edges.contains(&(22, 23)));
     }
 
     #[test]
@@ -3083,6 +3149,14 @@ mod tests {
                 ReleasedWriterSchemaDescriptor {
                     writer_epoch: 18,
                     event_schema: 53
+                },
+                ReleasedWriterSchemaDescriptor {
+                    writer_epoch: 19,
+                    event_schema: 54
+                },
+                ReleasedWriterSchemaDescriptor {
+                    writer_epoch: 20,
+                    event_schema: 55
                 },
             ]
         );

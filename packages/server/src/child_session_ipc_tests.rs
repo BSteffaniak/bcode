@@ -188,7 +188,7 @@ async fn verify_child_pages(
 #[tokio::test]
 async fn child_sessions_typed_ipc_creation_retry_navigation_and_activity() {
     let state = Arc::new(crate::tests::test_server_state(SessionManager::default()));
-    let socket_dir = tempfile::tempdir().unwrap();
+    let socket_dir = crate::tests::test_socket_dir().unwrap();
     let endpoint = bcode_ipc::IpcEndpoint::unix_socket(socket_dir.path().join("children.sock"));
     let listener = LocalIpcListener::bind(&endpoint).unwrap();
     let serving = Arc::clone(&state);

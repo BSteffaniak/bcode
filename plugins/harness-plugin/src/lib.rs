@@ -5,6 +5,7 @@
 //! External-session entry points. This plugin owns no process, session store or scheduler.
 //! The invocation-scoped application bridge owns admission and canonical receipts.
 
+pub mod configuration;
 mod protocol;
 mod tools;
 mod workflow;
@@ -58,6 +59,7 @@ impl RustPlugin for HarnessPlugin {
             context.request.interface_id.as_str(),
             context.request.operation.as_str(),
         ) {
+            (configuration::INTERFACE_ID, _) => configuration::invoke(&context),
             (bcode_tool::TOOL_SERVICE_INTERFACE_ID, _) => tools::invoke(&context),
             (bcode_workflow::WORKFLOW_BLOCK_INTERFACE_ID, _) => workflow::invoke(&context),
             (COMMAND_INTERFACE_ID, OP_INVOKE_COMMAND) => invoke_command(&context),

@@ -335,8 +335,10 @@ pub struct ChatLoopState {
     pub(crate) composer_interaction: super::composer_interaction::ComposerInteraction,
     slash_palette: Option<slash_palette::SlashPalette>,
     slash_completion: slash_palette::SlashCompletionState,
-    foreground_client: BcodeClient,
-    passive_client: BcodeClient,
+    foreground_client: Option<BcodeClient>,
+    passive_client: Option<BcodeClient>,
+    managed_commands: Option<bcode_client::ManagedSessionCommandHandle>,
+    managed_generation: Option<u64>,
     viewport_input_task: Option<tokio::task::JoinHandle<()>>,
     viewport_input_connection:
         std::sync::Arc<tokio::sync::Mutex<Option<bcode_client::ClientConnection>>>,
@@ -366,7 +368,7 @@ pub struct ChatLoopState {
     session_picker_generation: u64,
     session_picker_launch_directory: std::path::PathBuf,
     interactive_surface_queue: InteractiveSurfaceQueue,
-    artifact_stream: ArtifactStreamCoordinator,
+    artifact_stream: Option<ArtifactStreamCoordinator>,
     markdown_projection: super::markdown_projection_coordinator::MarkdownProjectionCoordinator,
     markdown_presentation: Option<super::markdown_image::MarkdownPresentationRuntime>,
     markdown_mermaid: Option<super::markdown_mermaid::MarkdownMermaidRuntime>,
@@ -378,7 +380,7 @@ pub struct ChatLoopState {
     markdown_image_compositor: bmux_image::tui::TuiImageCompositor,
     markdown_image_capabilities: bmux_image::HostImageCapabilities,
     markdown_image_config: bmux_image::ImageConfig,
-    telemetry: super::telemetry::TuiTelemetry,
+    telemetry: Option<super::telemetry::TuiTelemetry>,
     runtime_stats: super::runtime_adapter::RuntimeStatsRecorder,
     request_draft_handoff: RequestDraftHandoff,
     pub(super) declarative_streaming_policy: bcode_session_view_models::StreamingPresentationPolicy,
@@ -401,14 +403,39 @@ impl ChatLoopState {
         passive_client: &BcodeClient,
         metrics_enabled: bool,
     ) -> Self {
+        Self::new_access(
+            Some(foreground_client.clone()),
+            Some(passive_client),
+            None,
+            metrics_enabled,
+        )
+    }
+
+    pub fn new_managed(
+        commands: bcode_client::ManagedSessionCommandHandle,
+        generation: u64,
+    ) -> Self {
+        let mut state = Self::new_access(None, None, Some(commands), false);
+        state.managed_generation = Some(generation);
+        state
+    }
+
+    pub(super) fn new_access(
+        foreground_client: Option<BcodeClient>,
+        passive_client: Option<&BcodeClient>,
+        managed_commands: Option<bcode_client::ManagedSessionCommandHandle>,
+        metrics_enabled: bool,
+    ) -> Self {
         Self {
             render_launch: None,
             palette: None,
             slash_palette: None,
             composer_interaction: super::composer_interaction::ComposerInteraction::default(),
             slash_completion: slash_palette::SlashCompletionState::default(),
-            foreground_client: foreground_client.clone(),
-            passive_client: passive_client.clone(),
+            managed_commands,
+            managed_generation: None,
+            foreground_client,
+            passive_client: passive_client.cloned(),
             viewport_input_task: None,
             viewport_input_connection: std::sync::Arc::default(),
             viewport_input_retry_at: Instant::now(),
@@ -437,7 +464,7 @@ impl ChatLoopState {
             session_picker_generation: 0,
             session_picker_launch_directory: std::path::PathBuf::new(),
             interactive_surface_queue: InteractiveSurfaceQueue::default(),
-            artifact_stream: ArtifactStreamCoordinator::new(passive_client.clone()),
+            artifact_stream: passive_client.cloned().map(ArtifactStreamCoordinator::new),
             markdown_projection:
                 super::markdown_projection_coordinator::MarkdownProjectionCoordinator::new(),
             markdown_presentation: super::markdown_image::MarkdownPresentationRuntime::new().ok(),
@@ -448,7 +475,9 @@ impl ChatLoopState {
             markdown_image_compositor: bmux_image::tui::TuiImageCompositor::new(),
             markdown_image_capabilities: bmux_image::host_caps::detect_from_env(),
             markdown_image_config: bmux_image::ImageConfig::default(),
-            telemetry: super::telemetry::TuiTelemetry::new(passive_client.clone(), metrics_enabled),
+            telemetry: passive_client
+                .cloned()
+                .map(|client| super::telemetry::TuiTelemetry::new(client, metrics_enabled)),
             runtime_stats: super::runtime_adapter::RuntimeStatsRecorder::default(),
             request_draft_handoff: RequestDraftHandoff::default(),
             declarative_streaming_policy:
@@ -459,10 +488,12 @@ impl ChatLoopState {
     }
 
     pub fn set_render_launch(&mut self, launch: super::plugin_surface_host::FreshSessionSettings) {
-        if let Some(surface) = self.plugin_surface.as_mut() {
+        if let Some(surface) = self.plugin_surface.as_mut()
+            && let Some(client) = self.foreground_client.clone()
+        {
             let host = super::plugin_surface_host::root_host(
                 surface.invalidation.clone(),
-                self.foreground_client.clone(),
+                client,
                 launch.clone(),
                 std::sync::Arc::clone(&surface.active_tasks),
             );
@@ -656,7 +687,10 @@ impl ChatLoopState {
     pub fn take_artifact_completion_receiver(
         &mut self,
     ) -> tokio::sync::mpsc::Receiver<ActiveArtifactFetchCompletion> {
-        self.artifact_stream.take_completion_receiver()
+        self.artifact_stream.as_mut().map_or_else(
+            || tokio::sync::mpsc::channel(1).1,
+            ArtifactStreamCoordinator::take_completion_receiver,
+        )
     }
 
     pub fn take_pending_effects(
@@ -686,8 +720,10 @@ impl ChatLoopState {
             .map(|(schedule, effect)| {
                 effect.command(
                     schedule,
-                    &self.foreground_client,
-                    &self.passive_client,
+                    self.foreground_client.as_ref(),
+                    self.passive_client.as_ref(),
+                    self.managed_commands.clone(),
+                    self.managed_generation,
                     handle.clone(),
                 )
             })
@@ -702,8 +738,10 @@ impl ChatLoopState {
     ) -> bmux_tui_runtime::Command<super::root_program::BcodeRuntimeMessage> {
         effect.command(
             super::effects::EffectSchedule::StartIfIdle,
-            &self.foreground_client,
-            &self.passive_client,
+            self.foreground_client.as_ref(),
+            self.passive_client.as_ref(),
+            self.managed_commands.clone(),
+            self.managed_generation,
             handle.clone(),
         )
     }
@@ -723,7 +761,9 @@ impl ChatLoopState {
     }
 
     pub fn record_runtime_stats(&mut self, stats: &bmux_tui_runtime::RuntimeStats) {
-        self.runtime_stats.record(&mut self.telemetry, stats);
+        if let Some(telemetry) = &mut self.telemetry {
+            self.runtime_stats.record(telemetry, stats);
+        }
     }
 
     pub(crate) fn child_picker_watch_generation(&self) -> Option<u64> {
@@ -776,24 +816,32 @@ impl ChatLoopState {
         }
     }
 
-    pub fn foreground_client(&self) -> BcodeClient {
+    pub fn foreground_client(&self) -> Option<BcodeClient> {
         self.foreground_client.clone()
     }
 
     pub fn flush_telemetry_if_due(&mut self, now: Instant) {
-        self.telemetry.flush_if_due(now);
+        if let Some(telemetry) = &mut self.telemetry {
+            telemetry.flush_if_due(now);
+        }
     }
 
-    pub const fn next_telemetry_flush_at(&self) -> Option<Instant> {
-        self.telemetry.next_flush_at()
+    pub fn next_telemetry_flush_at(&self) -> Option<Instant> {
+        self.telemetry
+            .as_ref()
+            .and_then(super::telemetry::TuiTelemetry::next_flush_at)
     }
 
     pub fn next_artifact_retry_at(&self) -> Option<Instant> {
-        self.artifact_stream.next_retry_at()
+        self.artifact_stream
+            .as_ref()
+            .and_then(ArtifactStreamCoordinator::next_retry_at)
     }
 
     pub fn start_due_artifact_fetches(&mut self, now: Instant) {
-        self.artifact_stream.start_due_fetches(now);
+        if let Some(stream) = &mut self.artifact_stream {
+            stream.start_due_fetches(now);
+        }
     }
 
     /// Apply renderer-neutral completion configuration on startup or reload.
@@ -1974,7 +2022,9 @@ impl ChatLoopState {
         self.viewport_input_retry_at = Instant::now();
         self.request_draft_handoff.clear();
         self.markdown_projection.invalidate();
-        self.artifact_stream.retain_session(session_id);
+        if let Some(stream) = &mut self.artifact_stream {
+            stream.retain_session(session_id);
+        }
     }
 
     fn prepare_viewport_inputs(&mut self, chat: &ActiveChat, frame_area: Rect) {
@@ -1993,7 +2043,10 @@ impl ChatLoopState {
             return;
         };
         let area = super::render::transcript_area_for_frame(&chat.app, frame_area);
-        let inputs = self.artifact_stream.viewport_inputs(
+        let Some(stream) = &self.artifact_stream else {
+            return;
+        };
+        let inputs = stream.viewport_inputs(
             session_id,
             presentation,
             bmux_tui::geometry::Size::new(area.width, area.height.saturating_sub(3).max(1)),
@@ -2003,7 +2056,9 @@ impl ChatLoopState {
         if inputs.is_empty() {
             return;
         }
-        let client = self.foreground_client.clone();
+        let Some(client) = self.foreground_client.clone() else {
+            return;
+        };
         let connection = std::sync::Arc::clone(&self.viewport_input_connection);
         self.viewport_input_task = Some(tokio::spawn(async move {
             let mut connection = connection.lock().await;
@@ -2034,7 +2089,9 @@ impl ChatLoopState {
         frame_area: Rect,
     ) -> super::invalidation::UiInvalidation {
         self.prepare_viewport_inputs(chat, frame_area);
-        self.artifact_stream.start_due_fetches(Instant::now());
+        if let Some(stream) = &mut self.artifact_stream {
+            stream.start_due_fetches(Instant::now());
+        }
         self.request_latest_markdown_projection(chat, frame_area.width);
         record_artifact_stream_stats(self);
         let changed = chat
@@ -2910,8 +2967,9 @@ impl ChatLoopState {
         }
         let render_duration_ms =
             u64::try_from(completion.render_duration.as_millis()).unwrap_or(u64::MAX);
-        self.telemetry
-            .record_histogram("tui.markdown.projection.render_ms", render_duration_ms);
+        if let Some(telemetry) = &mut self.telemetry {
+            telemetry.record_histogram("tui.markdown.projection.render_ms", render_duration_ms);
+        }
         match completion.outcome {
             super::markdown_projection_coordinator::MarkdownProjectionOutcome::Rendered(result) => {
                 chat.app.transcript_markdown_cache().install(
@@ -2921,15 +2979,17 @@ impl ChatLoopState {
                     result,
                 );
                 self.markdown_projection.complete(&completion.generation);
-                self.telemetry
-                    .add_counter("tui.markdown.projection.accepted_total", 1);
+                if let Some(telemetry) = &mut self.telemetry {
+                    telemetry.add_counter("tui.markdown.projection.accepted_total", 1);
+                }
                 chat.app.mark_transcript_item_dirty(index);
                 true
             }
             super::markdown_projection_coordinator::MarkdownProjectionOutcome::Failed(_) => {
                 self.markdown_projection.complete(&completion.generation);
-                self.telemetry
-                    .add_counter("tui.markdown.projection.failed_total", 1);
+                if let Some(telemetry) = &mut self.telemetry {
+                    telemetry.add_counter("tui.markdown.projection.failed_total", 1);
+                }
                 false
             }
         }
@@ -2964,12 +3024,14 @@ impl ChatLoopState {
         {
             return;
         }
-        if self.markdown_projection.latest_requested().is_some() {
-            self.telemetry
-                .add_counter("tui.markdown.projection.coalesced_total", 1);
+        if self.markdown_projection.latest_requested().is_some()
+            && let Some(telemetry) = &mut self.telemetry
+        {
+            telemetry.add_counter("tui.markdown.projection.coalesced_total", 1);
         }
-        self.telemetry
-            .add_counter("tui.markdown.projection.requested_total", 1);
+        if let Some(telemetry) = &mut self.telemetry {
+            telemetry.add_counter("tui.markdown.projection.requested_total", 1);
+        }
         self.markdown_projection.request(
             super::markdown_projection_coordinator::MarkdownProjectionRequest {
                 generation: super::markdown_projection_coordinator::MarkdownProjectionGeneration {
@@ -3389,32 +3451,36 @@ pub fn apply_effect_result(
             has_older_history,
             result,
         } => {
-            if result.is_ok() {
-                loop_state.artifact_stream.retain_session(Some(session_id));
+            if result.is_ok()
+                && let Some(stream) = &mut loop_state.artifact_stream
+            {
+                stream.retain_session(Some(session_id));
             }
             if let Ok((attached, _)) = result.as_ref() {
                 let presentation = chat.app.plugin_presentation();
                 for event in &attached.history {
-                    loop_state.artifact_stream.observe_finalized_artifact(
-                        event.session_id,
-                        event.sequence,
-                        &event.kind,
-                        |producer_plugin_id,
-                         schema,
-                         schema_version,
-                         reference_key,
-                         content_type| {
-                            presentation.is_some_and(|presentation| {
-                                presentation.accepts_artifact_reference(
-                                    producer_plugin_id,
-                                    schema,
-                                    schema_version,
-                                    reference_key,
-                                    content_type,
-                                )
-                            })
-                        },
-                    );
+                    if let Some(stream) = &mut loop_state.artifact_stream {
+                        stream.observe_finalized_artifact(
+                            event.session_id,
+                            event.sequence,
+                            &event.kind,
+                            |producer_plugin_id,
+                             schema,
+                             schema_version,
+                             reference_key,
+                             content_type| {
+                                presentation.is_some_and(|presentation| {
+                                    presentation.accepts_artifact_reference(
+                                        producer_plugin_id,
+                                        schema,
+                                        schema_version,
+                                        reference_key,
+                                        content_type,
+                                    )
+                                })
+                            },
+                        );
+                    }
                 }
             }
             session_flow::complete_switch_session(chat, session_id, has_older_history, *result);
@@ -4110,7 +4176,14 @@ pub fn apply_effect_result(
             apply_cancel_runtime_work_result(chat, &work_id, result);
         }
         TuiEffectResult::CancelTurn { session_id, result } => {
-            apply_cancel_turn_result(chat, loop_state, session_id, result);
+            if chat.app.managed_execution_session() == Some(session_id) {
+                match result {
+                    Ok(_) => chat.app.set_status("Native interruption acknowledged; foreground/background settlement is still observed independently".into()),
+                    Err(error) => report_nonfatal_client_error(chat, "Native interruption failed", &error),
+                }
+            } else {
+                apply_cancel_turn_result(chat, loop_state, session_id, result);
+            }
         }
         TuiEffectResult::PermissionResolved {
             permission_id,
@@ -4156,7 +4229,9 @@ pub fn apply_config_result(
             loop_state.invalidate_slash_palette_discovery();
             loop_state.refresh_slash_palette(chat);
             settings.set_metrics_enabled(config.metrics.enabled);
-            loop_state.telemetry.set_enabled(config.metrics.enabled);
+            if let Some(telemetry) = &mut loop_state.telemetry {
+                telemetry.set_enabled(config.metrics.enabled);
+            }
             let default_plugin_ids =
                 bcode_plugin::static_bundled_default_plugin_ids(settings.static_plugins())
                     .unwrap_or_default();
@@ -4216,25 +4291,12 @@ pub fn apply_config_result(
                 surface.update_keymap(&settings.keymap);
             }
             loop_state.declarative_streaming_policy = config.presentation.streaming.policy();
-            match streaming_presentation {
-                Ok(streaming_override) => {
-                    loop_state.streaming_presentation_override = streaming_override;
-                    let effective =
-                        streaming_override.unwrap_or(loop_state.declarative_streaming_policy);
-                    let _ = chat.app.apply_streaming_presentation_policy(effective);
-                }
-                Err(error) => {
-                    loop_state.streaming_presentation_override = None;
-                    let _ = chat.app.apply_streaming_presentation_policy(
-                        loop_state.declarative_streaming_policy,
-                    );
-                    chat.app
-                        .set_status(format!("TUI streaming state unavailable: {error}"));
-                }
+            apply_streaming_config(chat, loop_state, streaming_presentation);
+            if chat.app.managed_execution_session().is_none() {
+                chat.replace_effect(TuiEffect::ReconcileAuthSecurity {
+                    config: Box::new(config),
+                });
             }
-            chat.replace_effect(TuiEffect::ReconcileAuthSecurity {
-                config: Box::new(config),
-            });
             if chat.viewing_session_id().is_none() {
                 chat.replace_effect(TuiEffect::LoadDraftStatus {
                     launch_working_directory: settings.launch_working_directory().to_path_buf(),
@@ -4242,6 +4304,31 @@ pub fn apply_config_result(
             }
         }
         Err(error) => chat.app.set_status(format!("Config unavailable: {error}")),
+    }
+}
+
+fn apply_streaming_config(
+    chat: &mut ActiveChat,
+    loop_state: &mut ChatLoopState,
+    streaming_presentation: Result<
+        Option<bcode_session_view_models::StreamingPresentationPolicy>,
+        String,
+    >,
+) {
+    match streaming_presentation {
+        Ok(streaming_override) => {
+            loop_state.streaming_presentation_override = streaming_override;
+            let effective = streaming_override.unwrap_or(loop_state.declarative_streaming_policy);
+            let _ = chat.app.apply_streaming_presentation_policy(effective);
+        }
+        Err(error) => {
+            loop_state.streaming_presentation_override = None;
+            let _ = chat
+                .app
+                .apply_streaming_presentation_policy(loop_state.declarative_streaming_policy);
+            chat.app
+                .set_status(format!("TUI streaming state unavailable: {error}"));
+        }
     }
 }
 
@@ -4348,22 +4435,24 @@ fn hydrate_history_artifacts(
 ) {
     let presentation = chat.app.plugin_presentation();
     for event in events {
-        loop_state.artifact_stream.observe_finalized_artifact(
-            event.session_id,
-            event.sequence,
-            &event.kind,
-            |producer, schema, version, key, content_type| {
-                presentation.is_some_and(|presentation| {
-                    presentation.accepts_artifact_reference(
-                        producer,
-                        schema,
-                        version,
-                        key,
-                        content_type,
-                    )
-                })
-            },
-        );
+        if let Some(stream) = &mut loop_state.artifact_stream {
+            stream.observe_finalized_artifact(
+                event.session_id,
+                event.sequence,
+                &event.kind,
+                |producer, schema, version, key, content_type| {
+                    presentation.is_some_and(|presentation| {
+                        presentation.accepts_artifact_reference(
+                            producer,
+                            schema,
+                            version,
+                            key,
+                            content_type,
+                        )
+                    })
+                },
+            );
+        }
     }
 }
 
@@ -5538,9 +5627,14 @@ pub fn start_cancel_turn(chat: &mut ActiveChat, _loop_state: &mut ChatLoopState)
         return;
     }
     chat.start_effect(effect);
-    chat.app.set_cancelling();
-    chat.app
-        .set_status("turn cancellation requested".to_owned());
+    if chat.app.managed_execution_session().is_some() {
+        chat.app
+            .set_status("Native interruption requested; settlement remains independent".into());
+    } else {
+        chat.app.set_cancelling();
+        chat.app
+            .set_status("turn cancellation requested".to_owned());
+    }
 }
 
 pub fn start_draft_save(chat: &mut ActiveChat, draft_autosave: &mut DraftAutosave) {
@@ -5631,41 +5725,52 @@ fn report_nonfatal_client_error(chat: &mut ActiveChat, label: &str, error: &Clie
 }
 
 fn record_artifact_stream_stats(loop_state: &mut ChatLoopState) {
-    let stats = loop_state.artifact_stream.drain_stats();
-    loop_state
-        .telemetry
-        .add_counter("tui.artifact.target_observed_total", stats.observed_targets);
-    loop_state.telemetry.add_counter(
-        "tui.artifact.target_coalesced_total",
-        stats.coalesced_targets,
-    );
-    loop_state
-        .telemetry
-        .add_counter("tui.artifact.fetch_started_total", stats.fetches_started);
-    loop_state
-        .telemetry
-        .add_counter("tui.artifact.completion_total", stats.completions);
-    loop_state.telemetry.add_counter(
-        "tui.artifact.stale_completion_total",
-        stats.stale_completions,
-    );
-    loop_state
-        .telemetry
-        .add_counter("tui.artifact.delivered_total", stats.delivered_chunks);
-    loop_state
-        .telemetry
-        .add_counter("tui.artifact.delivered_bytes", stats.delivered_bytes);
-    loop_state
-        .telemetry
-        .add_counter("tui.artifact.retry_total", stats.retries);
-    loop_state.telemetry.add_counter(
-        "tui.artifact.terminal_failure_total",
-        stats.terminal_failures,
-    );
-    loop_state.telemetry.set_gauge(
-        "tui.artifact.backlog",
-        i64::try_from(stats.backlog).unwrap_or(i64::MAX),
-    );
+    let Some(stream) = &mut loop_state.artifact_stream else {
+        return;
+    };
+    let stats = stream.drain_stats();
+    if let Some(telemetry) = &mut loop_state.telemetry {
+        telemetry.add_counter("tui.artifact.target_observed_total", stats.observed_targets);
+    }
+    if let Some(telemetry) = &mut loop_state.telemetry {
+        telemetry.add_counter(
+            "tui.artifact.target_coalesced_total",
+            stats.coalesced_targets,
+        );
+    }
+    if let Some(telemetry) = &mut loop_state.telemetry {
+        telemetry.add_counter("tui.artifact.fetch_started_total", stats.fetches_started);
+    }
+    if let Some(telemetry) = &mut loop_state.telemetry {
+        telemetry.add_counter("tui.artifact.completion_total", stats.completions);
+    }
+    if let Some(telemetry) = &mut loop_state.telemetry {
+        telemetry.add_counter(
+            "tui.artifact.stale_completion_total",
+            stats.stale_completions,
+        );
+    }
+    if let Some(telemetry) = &mut loop_state.telemetry {
+        telemetry.add_counter("tui.artifact.delivered_total", stats.delivered_chunks);
+    }
+    if let Some(telemetry) = &mut loop_state.telemetry {
+        telemetry.add_counter("tui.artifact.delivered_bytes", stats.delivered_bytes);
+    }
+    if let Some(telemetry) = &mut loop_state.telemetry {
+        telemetry.add_counter("tui.artifact.retry_total", stats.retries);
+    }
+    if let Some(telemetry) = &mut loop_state.telemetry {
+        telemetry.add_counter(
+            "tui.artifact.terminal_failure_total",
+            stats.terminal_failures,
+        );
+    }
+    if let Some(telemetry) = &mut loop_state.telemetry {
+        telemetry.set_gauge(
+            "tui.artifact.backlog",
+            i64::try_from(stats.backlog).unwrap_or(i64::MAX),
+        );
+    }
 }
 
 fn markdown_destination_cache_source(
@@ -5839,7 +5944,11 @@ pub fn draw_chat_frame<W: Write>(
     } else {
         damage
     };
-    let frame_started = loop_state.telemetry.is_enabled().then(Instant::now);
+    let frame_started = loop_state
+        .telemetry
+        .as_ref()
+        .is_some_and(super::telemetry::TuiTelemetry::is_enabled)
+        .then(Instant::now);
     let prepare_started = frame_started;
     if fast_temporal_presentation
         && terminal.retained_buffer().is_some()
@@ -5971,7 +6080,11 @@ pub fn draw_chat_frame<W: Write>(
         )
     };
     for stats in chat.app.transcript_layout_mut().drain_sync_stats() {
-        if !loop_state.telemetry.is_enabled() {
+        if !loop_state
+            .telemetry
+            .as_ref()
+            .is_some_and(super::telemetry::TuiTelemetry::is_enabled)
+        {
             continue;
         }
         let mut labels = bcode_metrics::MetricLabels::new();
@@ -5979,69 +6092,93 @@ pub fn draw_chat_frame<W: Write>(
             "invalidation".to_owned(),
             stats.invalidation.label().to_owned(),
         );
-        loop_state.telemetry.add_counter_with_labels(
-            "tui.transcript.sync_total",
-            1,
-            labels.clone(),
-        );
-        loop_state.telemetry.add_counter_with_labels(
-            "tui.transcript.entries_scanned",
-            u64::try_from(stats.entries_scanned).unwrap_or(u64::MAX),
-            labels.clone(),
-        );
-        loop_state.telemetry.add_counter_with_labels(
-            "tui.transcript.signatures_changed",
-            u64::try_from(stats.signatures_changed).unwrap_or(u64::MAX),
-            labels.clone(),
-        );
-        loop_state.telemetry.add_counter_with_labels(
-            "tui.transcript.entries_rebuilt",
-            u64::try_from(stats.entries_rebuilt).unwrap_or(u64::MAX),
-            labels.clone(),
-        );
-        loop_state.telemetry.add_counter_with_labels(
-            "tui.transcript.rows_regenerated",
-            u64::try_from(stats.rows_regenerated).unwrap_or(u64::MAX),
-            labels.clone(),
-        );
-        loop_state.telemetry.record_histogram_with_labels(
-            "tui.transcript.sync_us",
-            stats.duration_micros,
-            labels,
-        );
+        if let Some(telemetry) = &mut loop_state.telemetry {
+            telemetry.add_counter_with_labels("tui.transcript.sync_total", 1, labels.clone());
+        }
+        if let Some(telemetry) = &mut loop_state.telemetry {
+            telemetry.add_counter_with_labels(
+                "tui.transcript.entries_scanned",
+                u64::try_from(stats.entries_scanned).unwrap_or(u64::MAX),
+                labels.clone(),
+            );
+        }
+        if let Some(telemetry) = &mut loop_state.telemetry {
+            telemetry.add_counter_with_labels(
+                "tui.transcript.signatures_changed",
+                u64::try_from(stats.signatures_changed).unwrap_or(u64::MAX),
+                labels.clone(),
+            );
+        }
+        if let Some(telemetry) = &mut loop_state.telemetry {
+            telemetry.add_counter_with_labels(
+                "tui.transcript.entries_rebuilt",
+                u64::try_from(stats.entries_rebuilt).unwrap_or(u64::MAX),
+                labels.clone(),
+            );
+        }
+        if let Some(telemetry) = &mut loop_state.telemetry {
+            telemetry.add_counter_with_labels(
+                "tui.transcript.rows_regenerated",
+                u64::try_from(stats.rows_regenerated).unwrap_or(u64::MAX),
+                labels.clone(),
+            );
+        }
+        if let Some(telemetry) = &mut loop_state.telemetry {
+            telemetry.record_histogram_with_labels(
+                "tui.transcript.sync_us",
+                stats.duration_micros,
+                labels,
+            );
+        }
     }
     if let Some(presentation) = chat.app.plugin_presentation() {
         for diagnostic in presentation.drain_diagnostics() {
-            if !loop_state.telemetry.is_enabled() {
+            if !loop_state
+                .telemetry
+                .as_ref()
+                .is_some_and(super::telemetry::TuiTelemetry::is_enabled)
+            {
                 continue;
             }
             let mut labels = bcode_metrics::MetricLabels::new();
             labels.insert("plugin_id".to_owned(), diagnostic.plugin_id);
             labels.insert("diagnostic".to_owned(), diagnostic.name);
-            loop_state.telemetry.add_counter_with_labels(
-                "tui.plugin_visual.work",
-                diagnostic.value,
-                labels,
-            );
+            if let Some(telemetry) = &mut loop_state.telemetry {
+                telemetry.add_counter_with_labels(
+                    "tui.plugin_visual.work",
+                    diagnostic.value,
+                    labels,
+                );
+            }
         }
         for timing in presentation.drain_timings() {
-            if !loop_state.telemetry.is_enabled() {
+            if !loop_state
+                .telemetry
+                .as_ref()
+                .is_some_and(super::telemetry::TuiTelemetry::is_enabled)
+            {
                 continue;
             }
             let mut labels = bcode_metrics::MetricLabels::new();
             labels.insert("operation".to_owned(), timing.operation.to_owned());
             labels.insert("plugin_id".to_owned(), timing.plugin_id);
             labels.insert("schema".to_owned(), timing.schema);
-            loop_state.telemetry.record_histogram_with_labels(
-                "tui.plugin_visual.duration_us",
-                timing.duration_micros,
-                labels,
-            );
+            if let Some(telemetry) = &mut loop_state.telemetry {
+                telemetry.record_histogram_with_labels(
+                    "tui.plugin_visual.duration_us",
+                    timing.duration_micros,
+                    labels,
+                );
+            }
         }
     }
     let prepare_ms = prepare_started.map_or(0, elapsed_millis);
     let theme = render::TuiTheme::for_app(&chat.app);
-    let draw_started = loop_state.telemetry.is_enabled().then(Instant::now);
+    let draw_started = loop_state
+        .telemetry
+        .as_ref()
+        .is_some_and(super::telemetry::TuiTelemetry::is_enabled)
+        .then(Instant::now);
     let regions = damage.retained_regions().to_vec();
     let full_damage = damage.is_full();
     let intersects = |area: bmux_tui::geometry::Rect| {
@@ -6254,10 +6391,12 @@ fn paint_plugin_foreground(
         let area = Rect::new(0, 0, frame.area().width, frame.area().height);
         let plugin_theme = render::plugin_theme_for_app(&chat.app);
         if let Some(active) = surface.surface.as_mut() {
-            if let Some(launch) = loop_state.render_launch.clone() {
+            if let Some(launch) = loop_state.render_launch.clone()
+                && let Some(client) = loop_state.foreground_client.clone()
+            {
                 let host = super::plugin_surface_host::root_host(
                     surface.invalidation.clone(),
-                    loop_state.foreground_client.clone(),
+                    client,
                     launch,
                     std::sync::Arc::clone(&surface.active_tasks),
                 );
@@ -6474,7 +6613,11 @@ fn draw_temporal_frame<W: Write>(
                 .iter()
                 .any(|region| !area.intersection(*region).is_empty())
     };
-    let draw_started = loop_state.telemetry.is_enabled().then(Instant::now);
+    let draw_started = loop_state
+        .telemetry
+        .as_ref()
+        .is_some_and(super::telemetry::TuiTelemetry::is_enabled)
+        .then(Instant::now);
     // Output may fail after emitting image protocol bytes, including at flush.
     // Keep committed residency separate from the candidate and preserve repair debt.
     let compositor = std::cell::RefCell::new(loop_state.markdown_image_compositor.clone());
@@ -6557,45 +6700,48 @@ fn record_frame_telemetry(
     draw_started: Option<Instant>,
     prepare_ms: u64,
 ) {
-    if !loop_state.telemetry.is_enabled() {
-        return;
+    if let Some(telemetry) = &mut loop_state.telemetry {
+        telemetry.record_histogram(
+            "tui.frame.changed_cells",
+            u64::try_from(draw_stats.changed_cells).unwrap_or(u64::MAX),
+        );
     }
-    loop_state.telemetry.record_histogram(
-        "tui.frame.changed_cells",
-        u64::try_from(draw_stats.changed_cells).unwrap_or(u64::MAX),
-    );
-    if draw_stats.full_repaint {
-        loop_state
-            .telemetry
-            .add_counter("tui.frame.full_repaint_total", 1);
+    if draw_stats.full_repaint
+        && let Some(telemetry) = &mut loop_state.telemetry
+    {
+        telemetry.add_counter("tui.frame.full_repaint_total", 1);
     }
     let draw_ms = draw_started.map_or(0, elapsed_millis);
     let total_ms = frame_started.map_or(0, elapsed_millis);
-    loop_state.telemetry.add_counter("tui.frame.total", 1);
+    if let Some(telemetry) = &mut loop_state.telemetry {
+        telemetry.add_counter("tui.frame.total", 1);
+    }
     let frame_budget_ms = frame_interval.map_or(u64::MAX, |interval| {
         u64::try_from(interval.as_millis()).unwrap_or(u64::MAX)
     });
-    if total_ms >= frame_budget_ms {
-        loop_state
-            .telemetry
-            .add_counter("tui.frame.over_budget_total", 1);
+    if total_ms >= frame_budget_ms
+        && let Some(telemetry) = &mut loop_state.telemetry
+    {
+        telemetry.add_counter("tui.frame.over_budget_total", 1);
     }
     let frame_index = loop_state.frame_index;
     loop_state.frame_index = loop_state.frame_index.wrapping_add(1);
     if frame_index.is_multiple_of(16) || total_ms >= frame_budget_ms {
-        loop_state
-            .telemetry
-            .record_histogram("tui.frame.prepare_ms", prepare_ms);
-        loop_state
-            .telemetry
-            .record_histogram("tui.frame.draw_ms", draw_ms);
-        loop_state
-            .telemetry
-            .record_histogram("tui.frame.total_ms", total_ms);
-        loop_state.telemetry.record_histogram(
-            "tui.frame.schedule_delay_ms",
-            u64::try_from(schedule_delay.as_millis()).unwrap_or(u64::MAX),
-        );
+        if let Some(telemetry) = &mut loop_state.telemetry {
+            telemetry.record_histogram("tui.frame.prepare_ms", prepare_ms);
+        }
+        if let Some(telemetry) = &mut loop_state.telemetry {
+            telemetry.record_histogram("tui.frame.draw_ms", draw_ms);
+        }
+        if let Some(telemetry) = &mut loop_state.telemetry {
+            telemetry.record_histogram("tui.frame.total_ms", total_ms);
+        }
+        if let Some(telemetry) = &mut loop_state.telemetry {
+            telemetry.record_histogram(
+                "tui.frame.schedule_delay_ms",
+                u64::try_from(schedule_delay.as_millis()).unwrap_or(u64::MAX),
+            );
+        }
     }
 }
 
@@ -6713,19 +6859,18 @@ fn handle_artifact_completion(
     completion: ActiveArtifactFetchCompletion,
 ) -> bool {
     let presentation = chat.app.plugin_presentation();
-    let changed = loop_state.artifact_stream.handle_completion(
-        chat.viewing_session_id(),
-        completion,
-        |chunk| {
-            presentation.map_or_else(
-                || Err("plugin presentation unavailable".to_owned()),
-                |presentation| presentation.deliver_artifact_chunk(chunk),
-            )
-        },
-    );
-    let failures = loop_state.artifact_stream.failed_invocations();
+    let Some(stream) = &mut loop_state.artifact_stream else {
+        return false;
+    };
+    let changed = stream.handle_completion(chat.viewing_session_id(), completion, |chunk| {
+        presentation.map_or_else(
+            || Err("plugin presentation unavailable".to_owned()),
+            |presentation| presentation.deliver_artifact_chunk(chunk),
+        )
+    });
+    let failures = stream.failed_invocations();
     if let Some(presentation) = presentation.as_ref() {
-        for invocation_id in loop_state.artifact_stream.recovered_invocations() {
+        for invocation_id in stream.recovered_invocations() {
             presentation.clear_artifact_failure(&invocation_id);
         }
         for invocation_id in &failures {
@@ -6769,9 +6914,9 @@ fn absorb_session_stream_update(
         history_flow::SessionStreamUpdate::ResyncStarted { session_id }
             if chat.viewing_session_id() == Some(session_id) =>
         {
-            loop_state
-                .telemetry
-                .add_counter("tui.session_view.resync_started_total", 1);
+            if let Some(telemetry) = &mut loop_state.telemetry {
+                telemetry.add_counter("tui.session_view.resync_started_total", 1);
+            }
             // The stream connection is dropped for replacement while identity stays valid, so the
             // view is stale but session-scoped commands remain dispatchable.
             chat.mark_stream_detached(session_id);
@@ -6808,27 +6953,29 @@ fn apply_session_stream_resynchronization(
     chat.agents
         .apply_runtime_selection(&mut chat.app, attached.runtime_selection.clone());
 
-    loop_state
-        .artifact_stream
-        .reset_session(attached.session.id);
+    if let Some(stream) = &mut loop_state.artifact_stream {
+        stream.reset_session(attached.session.id);
+    }
     let presentation = chat.app.plugin_presentation();
     for event in &attached.history {
-        loop_state.artifact_stream.observe_finalized_artifact(
-            event.session_id,
-            event.sequence,
-            &event.kind,
-            |producer_plugin_id, schema, schema_version, reference_key, content_type| {
-                presentation.is_some_and(|presentation| {
-                    presentation.accepts_artifact_reference(
-                        producer_plugin_id,
-                        schema,
-                        schema_version,
-                        reference_key,
-                        content_type,
-                    )
-                })
-            },
-        );
+        if let Some(stream) = &mut loop_state.artifact_stream {
+            stream.observe_finalized_artifact(
+                event.session_id,
+                event.sequence,
+                &event.kind,
+                |producer_plugin_id, schema, schema_version, reference_key, content_type| {
+                    presentation.is_some_and(|presentation| {
+                        presentation.accepts_artifact_reference(
+                            producer_plugin_id,
+                            schema,
+                            schema_version,
+                            reference_key,
+                            content_type,
+                        )
+                    })
+                },
+            );
+        }
     }
     loop_state.interactive_surface = None;
     loop_state.interactive_surface_queue.clear();
@@ -6836,9 +6983,9 @@ fn apply_session_stream_resynchronization(
         session_id: attached.session.id,
     });
     chat.replace_effect(TuiEffect::ListPermissions);
-    loop_state
-        .telemetry
-        .add_counter("tui.session_view.resync_completed_total", 1);
+    if let Some(telemetry) = &mut loop_state.telemetry {
+        telemetry.add_counter("tui.session_view.resync_completed_total", 1);
+    }
     chat.app
         .set_status("Session view resynchronized".to_owned());
 }
@@ -6887,22 +7034,24 @@ fn absorb_bcode_event(
     match event {
         BcodeEvent::Session(event) if Some(event.session_id) == chat.viewing_session_id() => {
             let presentation = chat.app.plugin_presentation();
-            loop_state.artifact_stream.observe_finalized_artifact(
-                event.session_id,
-                event.sequence,
-                &event.kind,
-                |producer_plugin_id, schema, schema_version, reference_key, content_type| {
-                    presentation.is_some_and(|presentation| {
-                        presentation.accepts_artifact_reference(
-                            producer_plugin_id,
-                            schema,
-                            schema_version,
-                            reference_key,
-                            content_type,
-                        )
-                    })
-                },
-            );
+            if let Some(stream) = &mut loop_state.artifact_stream {
+                stream.observe_finalized_artifact(
+                    event.session_id,
+                    event.sequence,
+                    &event.kind,
+                    |producer_plugin_id, schema, schema_version, reference_key, content_type| {
+                        presentation.is_some_and(|presentation| {
+                            presentation.accepts_artifact_reference(
+                                producer_plugin_id,
+                                schema,
+                                schema_version,
+                                reference_key,
+                                content_type,
+                            )
+                        })
+                    },
+                );
+            }
             if let SessionEventKind::AgentChanged { agent_id } = &event.kind {
                 chat.agents
                     .apply_agent_to_app(&mut chat.app, agent_id.clone());
@@ -6946,7 +7095,11 @@ fn absorb_bcode_event(
             true
         }
         BcodeEvent::SessionLive(event) if Some(event.session_id) == chat.viewing_session_id() => {
-            absorb_session_live_event(&mut chat.app, &mut loop_state.artifact_stream, &event);
+            if let Some(stream) = &mut loop_state.artifact_stream {
+                absorb_session_live_event(&mut chat.app, stream, &event);
+            } else {
+                chat.app.absorb_session_live_event(&event);
+            }
             true
         }
         BcodeEvent::RuntimeWork(event) if Some(event.session_id) == chat.viewing_session_id() => {

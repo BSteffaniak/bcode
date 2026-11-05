@@ -11,6 +11,39 @@ use bcode_harness_models::{
 use bcode_session_models::{ClientId, SessionId};
 use std::{sync::Arc, sync::atomic::Ordering};
 
+type ObservationGuards = std::collections::BTreeMap<
+    (SessionId, u64, String, String),
+    std::sync::Weak<tokio::sync::Mutex<()>>,
+>;
+
+fn observation_guard(
+    owner: &HarnessOwner,
+) -> Result<Arc<tokio::sync::Mutex<()>>, ManagedHarnessError> {
+    static GUARDS: std::sync::OnceLock<std::sync::Mutex<ObservationGuards>> =
+        std::sync::OnceLock::new();
+    let mut guards = GUARDS
+        .get_or_init(Default::default)
+        .lock()
+        .map_err(|_| ManagedHarnessError::Unavailable)?;
+    guards.retain(|_, guard| guard.strong_count() > 0);
+    let key = (
+        owner.session_id,
+        owner.generation,
+        owner.artifact_id.clone(),
+        owner.daemon_id.clone(),
+    );
+    if let Some(guard) = guards.get(&key).and_then(std::sync::Weak::upgrade) {
+        return Ok(guard);
+    }
+    if guards.len() >= 1024 {
+        return Err(ManagedHarnessError::Unavailable);
+    }
+    let guard = Arc::new(tokio::sync::Mutex::new(()));
+    guards.insert(key, Arc::downgrade(&guard));
+    drop(guards);
+    Ok(guard)
+}
+
 /// Application access bound to a caller already authenticated by the daemon.
 ///
 /// Construction is not portable authorization. The daemon request dispatcher must supply its
@@ -70,6 +103,56 @@ impl<'a, S: ManagedHarnessStore, T: ManagedHarnessTransport> ManagedHarnessAppli
         {
             return Err(ManagedHarnessError::StaleOwner);
         }
+        Ok(())
+    }
+
+    /// Drive one bounded native page using actor-owned cursor evidence. Concurrent attachment
+    /// pollers serialize by full owner; controls never acquire this observer-only guard.
+    /// # Errors
+    /// Rejects stale caller/instance/generation, unavailable state and failed canonical commits.
+    pub async fn poll_observations(
+        &self,
+        query: &bcode_ipc::harness::ManagedSessionPollRequest,
+    ) -> Result<(), ManagedHarnessError> {
+        query.validate().map_err(|_| ManagedHarnessError::Invalid)?;
+        let initial = self.owner(query.session_id).await?;
+        if initial.generation != query.generation {
+            return Err(ManagedHarnessError::StaleOwner);
+        }
+        let guard = observation_guard(&initial)?;
+        let observer = guard.lock().await;
+        let owner = self.owner(query.session_id).await?;
+        if owner != initial {
+            return Err(ManagedHarnessError::StaleOwner);
+        }
+        let canonical = super::CanonicalHarnessStore::new(self.state);
+        let durable = canonical.durable(&owner)?;
+        let ownership = canonical.acquire(&owner).await?;
+        let current = self
+            .state
+            .sessions
+            .external_harness_state(&durable)
+            .await
+            .map_err(|_| ManagedHarnessError::Storage)?;
+        if current.instance.instance_id != query.instance_id
+            || current.owner.generation != query.generation
+            || current.target.is_none()
+        {
+            return Err(ManagedHarnessError::StaleOwner);
+        }
+        // Native ack uses exactly the atomically committed actor cursor, including empty pages.
+        // The runtime selects the latest target, obtains retention and commits before returning.
+        Box::pin(self.runtime.observe(
+            &owner,
+            format!("attachment-poll:{}", uuid::Uuid::new_v4()),
+            current.observation_after,
+            query.limit,
+            0,
+        ))
+        .await?;
+        drop(ownership);
+        drop(canonical);
+        drop(observer);
         Ok(())
     }
 
@@ -147,6 +230,9 @@ impl<'a, S: ManagedHarnessStore, T: ManagedHarnessTransport> ManagedHarnessAppli
         let owner = self.owner(session_id).await.inspect_err(|error| {
             tracing::warn!(target: "bcode_server::harness", stage = "observe_owner", category = %error, "managed observation admission failed");
         })?;
+        let guard = observation_guard(&owner)?;
+        let _observer = guard.lock().await;
+        self.owner(session_id).await?;
         self.runtime
             .observe(&owner, request_id, after, limit, wait_millis)
             .await

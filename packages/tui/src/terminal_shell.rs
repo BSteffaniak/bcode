@@ -30,12 +30,37 @@ pub enum TerminalRecoveryAction {
 /// Screens borrow its writer sequentially and await input shutdown before returning.
 /// Dropping the shell restores the terminal, including on errors.
 pub struct TerminalShell {
-    guard: CrosstermTerminalGuard<Stdout>,
+    guard: Option<CrosstermTerminalGuard<Stdout>>,
     stop_requested: bool,
     // Retain a failed wait's presentation/cleanup independently from its operation result.
     // No fresh terminal may replace uncertain output authority.
     screen_error: Option<TuiError>,
     handoff_blocked: bool,
+}
+
+// Own the yielded writer across the native future. Cancellation discards that
+// auth channel but must not leave a surviving shell without terminal ownership.
+#[cfg(unix)]
+struct YieldedTerminal<'a> {
+    slot: &'a mut Option<CrosstermTerminalGuard<Stdout>>,
+    writer: Option<Stdout>,
+}
+
+#[cfg(unix)]
+impl YieldedTerminal<'_> {
+    fn restore(&mut self) -> io::Result<()> {
+        if let Some(writer) = self.writer.take() {
+            *self.slot = Some(CrosstermTerminalGuard::enter(writer)?);
+        }
+        Ok(())
+    }
+}
+
+#[cfg(unix)]
+impl Drop for YieldedTerminal<'_> {
+    fn drop(&mut self) {
+        let _ = self.restore();
+    }
 }
 
 impl TerminalShell {
@@ -45,7 +70,7 @@ impl TerminalShell {
     /// Returns terminal setup errors.
     pub fn enter() -> Result<Self, TuiError> {
         Ok(Self {
-            guard: CrosstermTerminalGuard::enter(io::stdout())?,
+            guard: Some(CrosstermTerminalGuard::enter(io::stdout())?),
             stop_requested: false,
             screen_error: None,
             handoff_blocked: false,
@@ -61,6 +86,8 @@ impl TerminalShell {
         let area = crate::terminal_area()?;
         let writer = self
             .guard
+            .as_mut()
+            .ok_or_else(|| io::Error::other("terminal shell is yielded to native authentication"))?
             .writer_mut()
             .ok_or_else(|| io::Error::other("terminal shell writer unavailable"))?;
         Ok(Terminal::new(writer, area))
@@ -145,6 +172,165 @@ impl TerminalShell {
             options,
         ))
         .await
+    }
+
+    /// Attach the exact canonical managed session without constructing a model client.
+    /// The caller retains the sealed connection for managed controls and must consume
+    /// its filtered stream; no raw transport or model submission route is returned.
+    /// # Errors
+    /// Returns terminal, canonical binding, bounded projection or attach errors.
+    pub async fn prepare_managed_chat(
+        &mut self,
+        client: bcode_client::ManagedSessionClient,
+        session_id: bcode_session_models::SessionId,
+        request: bcode_session_models::ProjectionWindowRequest,
+    ) -> Result<
+        Option<(
+            bcode_client::ManagedSessionConnection,
+            bcode_client::AttachedSessionHistory,
+        )>,
+        TuiError,
+    > {
+        Box::pin(self.wait("Connecting to the managed session…", async {
+            client
+                .attach_session_projection_window(session_id, request)
+                .await
+                .map_err(TuiError::from)
+        }))
+        .await
+    }
+
+    /// Run the existing root conversation UI with sealed managed application access.
+    /// # Errors
+    /// Returns canonical attachment, configuration or terminal errors without fallback.
+    #[allow(clippy::future_not_send)]
+    pub async fn run_managed_chat(
+        &mut self,
+        client: bcode_client::ManagedSessionClient,
+        session_id: bcode_session_models::SessionId,
+        plugins: &[bcode_plugin::StaticBundledPlugin],
+        options: TuiLaunchOptions,
+    ) -> Result<(), TuiError> {
+        let expected_config = bcode_config::encode_effective_config(&bcode_config::load_config()?)?;
+        let mut expected_binding = None;
+        let mut client = client;
+        loop {
+            if bcode_config::encode_effective_config(&bcode_config::load_config()?)?
+                != expected_config
+            {
+                return Err(io::Error::other(
+                    "Managed configuration changed during auth recovery; reattach explicitly",
+                )
+                .into());
+            }
+            let request =
+                crate::history_flow::initial_transcript_window_request(self.terminal()?.area());
+            let Some((connection, attached)) =
+                Box::pin(self.prepare_managed_chat(client, session_id, request)).await?
+            else {
+                return Ok(());
+            };
+            if self.stop_requested() {
+                return Ok(());
+            }
+            let binding = connection.binding().await?;
+            let claim = (binding.instance, binding.target.generation());
+            if expected_binding
+                .as_ref()
+                .is_some_and(|previous| previous != &claim)
+            {
+                return Err(io::Error::other(
+                    "Managed instance or generation changed during auth recovery; no fallback",
+                )
+                .into());
+            }
+            expected_binding = Some(claim);
+            let commands = Box::pin(crate::runtime::run_managed_chat(
+                &mut self.terminal()?,
+                connection,
+                attached,
+                plugins,
+                options,
+            ))
+            .await?;
+            let Some(commands) = commands else {
+                return Ok(());
+            };
+            self.recover_managed_auth(&commands).await?;
+            // This is explicit auth recovery, not execution replay: only the same
+            // canonical session is attached again, never Start or a prompt.
+            client = bcode_client::ManagedSessionClient::default_endpoint();
+        }
+    }
+
+    async fn recover_managed_auth(
+        &mut self,
+        commands: &bcode_client::ManagedSessionCommandHandle,
+    ) -> Result<(), TuiError> {
+        let interface = commands.terminal_auth_interface().await;
+        let interface = match interface {
+            Ok(Some(interface)) => interface,
+            Ok(None) => {
+                self.show_error_without_retry("The selected instance declares no native terminal login service. No fallback was selected.").await?;
+                return Ok(());
+            }
+            Err(_) => {
+                self.show_error_without_retry("Native login metadata is unavailable or ambiguous. No login was launched and no fallback was selected.").await?;
+                return Ok(());
+            }
+        };
+        #[cfg(unix)]
+        {
+            let mut flow = commands.auth_flow().await?;
+            let result = Box::pin(self.run_managed_auth_handoff(&mut flow, interface)).await;
+            let message = match result {
+                Ok((_, status)) => managed_auth_outcome(status.readiness),
+                Err(_) => {
+                    "Native login outcome is unavailable; inspect /auth status before explicitly attempting login again. No automatic retry."
+                }
+            };
+            self.show_error_without_retry(message).await?;
+        }
+        #[cfg(not(unix))]
+        {
+            drop(interface);
+            self.show_error_without_retry("Native terminal authentication is unsupported on this platform; no fallback was selected.").await?;
+        }
+        Ok(())
+    }
+
+    /// Explicitly yield this terminal to the existing native-managed login flow.
+    /// Call only after the root runtime and its input reader have stopped, and
+    /// after consent for the interface resolved from selected instance metadata.
+    /// This does not infer readiness from child exit, retry login, or change custody.
+    /// # Errors
+    /// Returns terminal ownership, sealed auth admission or native handoff failures.
+    #[cfg(unix)]
+    pub async fn run_managed_auth_handoff(
+        &mut self,
+        flow: &mut bcode_client::ManagedSessionAuthFlow,
+        interface_id: String,
+    ) -> Result<
+        (
+            bool,
+            bcode_provider_auth_models::managed::ManagedFlowSnapshot,
+        ),
+        TuiError,
+    > {
+        let guard = self
+            .guard
+            .take()
+            .ok_or_else(|| io::Error::other("terminal shell is already yielded"))?;
+        let writer = guard.leave()?;
+        let mut yielded = YieldedTerminal {
+            slot: &mut self.guard,
+            writer: Some(writer),
+        };
+        let result = flow.terminal_handoff(interface_id).await;
+        // Restore on both success and failure; cancellation also restores through
+        // the ownership guard. No auth payload enters the ordinary chat channel.
+        yielded.restore()?;
+        result.map_err(TuiError::from)
     }
 
     /// Dispatch a supported plugin startup surface while borrowing this terminal owner.
@@ -453,9 +639,12 @@ impl TerminalShell {
     ///
     /// # Errors
     /// Returns terminal restoration errors.
-    pub fn finish(self) -> Result<(), TuiError> {
-        let result = self.screen_error.map_or(Ok(()), Err);
-        with_cleanup(result, self.guard.leave().map(|_| ()).map_err(Into::into))
+    pub fn finish(mut self) -> Result<(), TuiError> {
+        let result = self.screen_error.take().map_or(Ok(()), Err);
+        let cleanup = self.guard.take().map_or(Ok(()), |guard| {
+            guard.leave().map(|_| ()).map_err(Into::into)
+        });
+        with_cleanup(result, cleanup)
     }
 
     /// Finish the journey without replacing its primary failure with a cleanup failure.
@@ -502,6 +691,26 @@ fn finish_screen<T, W: std::io::Write>(
     terminal: &mut Terminal<&mut W>,
 ) -> Result<T, TuiError> {
     with_cleanup(result, terminal.restore_pointer().map_err(Into::into))
+}
+
+const fn managed_auth_outcome(
+    readiness: bcode_provider_auth_models::managed::AuthReadiness,
+) -> &'static str {
+    use bcode_provider_auth_models::managed::AuthReadiness;
+    match readiness {
+        AuthReadiness::Ready | AuthReadiness::Verified => {
+            "Native authentication readiness was observed by the host. Return to the same conversation; no prompt was replayed."
+        }
+        AuthReadiness::LoginRequired => {
+            "Native authentication still requires login. Return to /auth status; no automatic retry or account fallback."
+        }
+        AuthReadiness::Unknown => {
+            "Native authentication readiness remains unknown. Child exit does not prove readiness; no automatic retry."
+        }
+        AuthReadiness::Blocked(_) => {
+            "Native authentication is blocked. No account or billing fallback was selected."
+        }
+    }
 }
 
 // The production and offline-test paths share the exact input/drain loop. No terminal guard
@@ -672,6 +881,15 @@ fn paint_text<W: std::io::Write>(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn native_child_exit_is_not_auth_readiness() {
+        use bcode_provider_auth_models::managed::AuthReadiness;
+        assert!(super::managed_auth_outcome(AuthReadiness::Unknown).contains("unknown"));
+        assert!(
+            super::managed_auth_outcome(AuthReadiness::LoginRequired).contains("still requires")
+        );
+        assert!(super::managed_auth_outcome(AuthReadiness::Ready).contains("observed by the host"));
+    }
     use super::*;
     use bmux_keyboard::{KeyCode, KeyStroke};
 

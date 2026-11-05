@@ -8,7 +8,7 @@ use switchy_database::schema::{
 use switchy_database::{Database, DatabaseValue};
 
 pub fn initialize(db: &dyn Database, version: u32) -> Result<(), WorkflowStoreError> {
-    if !matches!(version, 42 | 43) {
+    if !matches!(version, 42..=44) {
         return Err(WorkflowStoreError::UnsupportedStore {
             actual: Some(version),
             expected: crate::WORKFLOW_STORE_SCHEMA_VERSION,
@@ -115,7 +115,7 @@ fn run_limit_columns(version: u32) -> Vec<Column> {
     vec![
         column("deadline_at_ms", DataType::Int, true, None),
         column("node_execution_cap", DataType::Int, false, None),
-        column("concurrency_cap", DataType::Int, version == 43, None),
+        column("concurrency_cap", DataType::Int, version >= 43, None),
         column("cycle_cap", DataType::Int, false, None),
         column("retry_cap", DataType::Int, false, None),
         column(

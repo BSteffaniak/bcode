@@ -1,4 +1,7 @@
 //! Native protocol normalization. Raw messages and tool inputs never leave this module.
+#[path = "normalizer_retention.rs"]
+mod retention;
+
 use bcode_claude_code::{CallbackRequest, CallbackResponse, Event, NativeMessage, Settlement};
 use bcode_harness_models::{
     HARNESS_SCHEMA_VERSION, HarnessActivity, HarnessAssistanceGrant, HarnessAttention,
@@ -25,6 +28,8 @@ pub struct Normalizer {
     pub assistance_grant: Option<HarnessAssistanceGrant>,
     pending_grants: BTreeMap<String, HarnessAssistanceGrant>,
     attribution: crate::attribution::Producer,
+    staging: retention::Staging,
+    execution: crate::execution::Tracker,
 }
 impl Normalizer {
     #[cfg(test)]
@@ -45,6 +50,8 @@ impl Normalizer {
             assistance_grant: None,
             pending_grants: BTreeMap::new(),
             attribution: crate::attribution::Producer::new(),
+            staging: retention::Staging::new(),
+            execution: crate::execution::Tracker::new(),
         }
     }
     pub fn confirmation(
@@ -79,19 +86,41 @@ impl Normalizer {
     }
     fn observation(&mut self, kind: HarnessObservationKind) -> Option<HarnessObservation> {
         self.sequence = self.sequence.checked_add(1)?;
+        let native_correlations = match &kind {
+            HarnessObservationKind::Execution { event } => {
+                self.execution.native_correlations(event)
+            }
+            _ => Vec::new(),
+        };
         let observation = HarnessObservation {
             observation_id: format!("claude:{}:{}", self.target.generation(), self.sequence),
             session_id: self.target.session_id().to_owned(),
             generation: self.target.generation(),
-            native_correlations: Vec::new(),
+            native_correlations,
             completeness: HarnessCompleteness::Complete,
             kind,
         };
-        observation.validate().ok().map(|()| observation)
+        observation.validate().ok()?;
+        if let HarnessObservationKind::Execution { event } = &observation.kind {
+            self.execution.published(event, &observation.observation_id);
+        }
+        Some(observation)
+    }
+    pub fn acknowledge_execution(&mut self, observation: &str) {
+        self.execution.acknowledge(observation);
+    }
+    pub fn retire_acknowledged(&mut self) -> Vec<bcode_harness_models::HarnessAttemptIdentity> {
+        let mut retired = self.execution.retire_canonical_attempts();
+        retired.extend(self.execution.retire_completed());
+        self.attribution.retire(&retired);
+        retired
     }
     #[must_use]
     pub fn retained_attribution(&self) -> &[crate::RetainedAttribution] {
         self.attribution.evidence()
+    }
+    pub const fn configure_execution(&mut self, supported: bool, fresh: bool) {
+        self.execution.configure(supported, fresh);
     }
     pub fn retain_submission(
         &mut self,
@@ -102,16 +131,39 @@ impl Normalizer {
         {
             return Err(HarnessContractError::WrongOwner);
         }
-        self.attribution.retain(submission)
+        self.execution.check_retain()?;
+        self.attribution.retain(submission).and_then(|uuid| {
+            self.execution
+                .retain(bcode_harness_models::HarnessAttemptIdentity {
+                    submission_id: submission.submission_id.clone(),
+                    attempt_id: submission.attempt_id.clone(),
+                })?;
+            Ok(uuid)
+        })
     }
-    pub fn event(&mut self, event: Event) -> Vec<HarnessObservation> {
-        let mut kinds = Vec::new();
+    fn event_ready(&mut self, event: Event) -> Vec<HarnessObservation> {
+        let mut kinds = match self.execution.event(&event) {
+            Ok(events) => events
+                .into_iter()
+                .map(|event| HarnessObservationKind::Execution { event })
+                .collect::<Vec<_>>(),
+            Err(_) => return self.gap(),
+        };
         match event {
             Event::Attribution(evidence) => {
                 // Only typed native correlation plus an exact retained pair can
                 // publish these events. Neither establishes a native turn identity.
                 match self.attribution.record(&evidence) {
-                    Ok(observations) => kinds.extend(observations),
+                    Ok(observations) => {
+                        if self
+                            .execution
+                            .attribute(&evidence, self.attribution.evidence())
+                            .is_err()
+                        {
+                            return self.gap();
+                        }
+                        kinds.extend(observations);
+                    }
                     Err(_) => return self.gap(),
                 }
             }
@@ -159,6 +211,13 @@ impl Normalizer {
                         .insert(request_id, (interaction.clone(), request));
                     kinds.push(HarnessObservationKind::Interaction { interaction });
                 } else {
+                    self.execution.lose_coverage();
+                    kinds.extend(
+                        self.execution
+                            .coverage()
+                            .into_iter()
+                            .map(|event| HarnessObservationKind::Execution { event }),
+                    );
                     kinds.push(HarnessObservationKind::Diagnostic { code: "unsupported_callback".into(), message: "Native callback requires unsupported or unscoped behavior; no action authorized".into() });
                 }
             }
@@ -167,16 +226,7 @@ impl Normalizer {
                 self.pending_grants.remove(&request_id);
             }
             Event::Settlement(Settlement::Settled) => {
-                if let Some(native_turn_id) = &self.turn_id {
-                    kinds.push(HarnessObservationKind::Settlement {
-                        native_turn_id: native_turn_id.clone(),
-                    });
-                } else {
-                    kinds.push(HarnessObservationKind::Status {
-                        status: status(&Settlement::Settled),
-                    });
-                    kinds.push(HarnessObservationKind::Diagnostic { code: "settlement_turn_unavailable".into(), message: "Native settled state observed without a native turn correlation; no turn settlement synthesized".into() });
-                }
+                kinds.extend(self.settled_kinds());
             }
             Event::Settlement(state) => {
                 kinds.push(HarnessObservationKind::Status {
@@ -187,6 +237,12 @@ impl Normalizer {
                 NativeMessage::User(_) | NativeMessage::Stream(_) | NativeMessage::Notice(_),
             ) => {}
         }
+        self.observations_from_kinds(kinds)
+    }
+    fn observations_from_kinds(
+        &mut self,
+        kinds: Vec<HarnessObservationKind>,
+    ) -> Vec<HarnessObservation> {
         let expected = kinds.len();
         let observations: Vec<_> = kinds
             .into_iter()
@@ -196,6 +252,20 @@ impl Normalizer {
             return self.gap();
         }
         observations
+    }
+    fn settled_kinds(&self) -> Vec<HarnessObservationKind> {
+        self.turn_id.as_ref().map_or_else(
+            || vec![
+                HarnessObservationKind::Status { status: status(&Settlement::Settled) },
+                HarnessObservationKind::Diagnostic {
+                    code: "settlement_turn_unavailable".into(),
+                    message: "Native settled state observed without a native turn correlation; no turn settlement synthesized".into(),
+                },
+            ],
+            |native_turn_id| vec![HarnessObservationKind::Settlement {
+                native_turn_id: native_turn_id.clone(),
+            }],
+        )
     }
     fn assistant(value: &Value) -> Option<Vec<HarnessObservationKind>> {
         let mut kinds = Vec::new();
@@ -389,21 +459,39 @@ impl Normalizer {
         self.pending.remove(request_id);
         self.pending_grants.remove(request_id);
     }
+    pub fn connection_lost(&mut self) -> Vec<HarnessObservation> {
+        self.invalidate_callbacks();
+        let events = self.execution.disconnected();
+        events
+            .into_iter()
+            .filter_map(|event| self.observation(HarnessObservationKind::Execution { event }))
+            .collect()
+    }
     pub fn invalidate_callbacks(&mut self) {
+        self.execution.lose_coverage();
         self.pending.clear();
         self.pending_grants.clear();
         self.assistance_grant = None;
     }
     pub fn gap(&mut self) -> Vec<HarnessObservation> {
-        self.observation(HarnessObservationKind::Diagnostic {
-            code: "native_observation_gap".into(),
-            message: "Native observations exceeded a bound; reconcile before continuing".into(),
-        })
-        .map(|mut observation| {
-            observation.completeness = HarnessCompleteness::Gap;
-            vec![observation]
-        })
-        .unwrap_or_default()
+        self.execution.lose_coverage();
+        let events = self.execution.coverage();
+        let mut observations: Vec<_> = events
+            .into_iter()
+            .filter_map(|event| self.observation(HarnessObservationKind::Execution { event }))
+            .collect();
+        observations.extend(
+            self.observation(HarnessObservationKind::Diagnostic {
+                code: "native_observation_gap".into(),
+                message: "Native observations exceeded a bound; reconcile before continuing".into(),
+            })
+            .map(|mut observation| {
+                observation.completeness = HarnessCompleteness::Gap;
+                vec![observation]
+            })
+            .unwrap_or_default(),
+        );
+        observations
     }
 }
 fn bounded_text(value: Option<&Value>) -> Option<String> {

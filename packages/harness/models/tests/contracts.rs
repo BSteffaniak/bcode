@@ -103,6 +103,7 @@ fn retained_submission_and_steering_are_generation_fenced() {
 #[test]
 fn native_result_does_not_imply_settlement_and_page_is_bounded() {
     let request = request(HarnessRequestKind::Observe(HarnessObserveRequest {
+        retention: None,
         target: HarnessSessionTarget::Confirmed(binding()),
         after: None,
         limit: 1,
@@ -113,6 +114,9 @@ fn native_result_does_not_imply_settlement_and_page_is_bounded() {
         request_id: "request".into(),
         operation: HarnessOperation::Observe,
         kind: HarnessServiceResponseKind::Observations(HarnessObservationPage {
+            retention: None,
+            hydration_requests: Vec::new(),
+            inventory_page: None,
             observations: vec![observation("one")],
             next_after: Some("cursor".into()),
             completeness: HarnessCompleteness::Partial,
@@ -132,6 +136,7 @@ fn native_result_does_not_imply_settlement_and_page_is_bounded() {
 #[test]
 fn stale_observation_and_duplicate_identity_are_rejected() {
     let request = request(HarnessRequestKind::Observe(HarnessObserveRequest {
+        retention: None,
         target: HarnessSessionTarget::Confirmed(binding()),
         after: None,
         limit: 2,
@@ -142,6 +147,9 @@ fn stale_observation_and_duplicate_identity_are_rejected() {
         request_id: "request".into(),
         operation: HarnessOperation::Observe,
         kind: HarnessServiceResponseKind::Observations(HarnessObservationPage {
+            retention: None,
+            hydration_requests: Vec::new(),
+            inventory_page: None,
             observations: vec![observation("one"), observation("one")],
             next_after: None,
             completeness: HarnessCompleteness::Complete,
@@ -273,6 +281,7 @@ fn instance_and_native_binding_cannot_be_substituted() {
     foreign.instance_id = "other".into();
     assert_eq!(
         request(HarnessRequestKind::Observe(HarnessObserveRequest {
+            retention: None,
             target: HarnessSessionTarget::Confirmed(foreign),
             after: None,
             limit: 1,

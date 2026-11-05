@@ -1149,9 +1149,9 @@ impl RuntimeCurrentTurn {
                 normalized_selection
                     .requested_model_id
                     .clone_from(&active_selection.requested_model_id);
-                // Freezing records that the active request's account route has been resolved;
-                // it does not itself select a different provider/account. Compare actual routing
-                // facts unchanged, ignoring only this resolved-state bookkeeping bit.
+                // Frozen state records representation, not permission to change selection.
+                // Normalize only this marker; actual auth, candidates, routing and environment
+                // still participate in the full equality check. Never resolve accounts here.
                 normalized_selection.provider_context.account_routing_frozen =
                     active_selection.provider_context.account_routing_frozen;
                 active_selection == &normalized_selection
@@ -3232,6 +3232,14 @@ impl ServerState {
     }
 
     async fn idle_shutdown_blocker(&self) -> Option<String> {
+        // Explicit idle-only stop keeps its one control/status caller exemption.
+        self.idle_shutdown_blocker_with_client_allowance(1).await
+    }
+
+    async fn idle_shutdown_blocker_with_client_allowance(
+        &self,
+        allowed_clients: usize,
+    ) -> Option<String> {
         if self.xray.observation_active().unwrap_or(true) || self.xray_endpoints.active().await {
             return Some("daemon has live X-ray endpoints; refusing idle-only stop".into());
         }
@@ -3239,7 +3247,7 @@ impl ServerState {
             return Some(blocker);
         }
         let connected_clients = self.clients.lock().await.len();
-        if connected_clients > 1 {
+        if connected_clients > allowed_clients {
             return Some(format!(
                 "daemon has {connected_clients} connected clients; refusing idle-only stop"
             ));
@@ -3798,7 +3806,7 @@ impl ServerState {
                 let blocker = tokio::select! {
                     biased;
                     _ = shutdown.recv() => break,
-                    blocker = state.idle_shutdown_blocker() => blocker,
+                    blocker = state.idle_shutdown_blocker_with_client_allowance(0) => blocker,
                 };
                 if let Some(blocker) = blocker {
                     if idle_since.take().is_some() {
@@ -5225,7 +5233,7 @@ async fn run_with_services(
             .expect("new server lifetime slot is empty");
     }
     construction_phase.finish();
-    run_constructed_server(
+    Box::pin(run_constructed_server(
         state,
         listener,
         &config.daemon,
@@ -5233,12 +5241,32 @@ async fn run_with_services(
         &configured_agent_ids,
         host_shutdown,
         workflow_ready,
-    )
+    ))
     .await
 }
 
+fn run_constructed_server<'a>(
+    state: Arc<ServerState>,
+    listener: LocalIpcListener,
+    daemon: &'a bcode_config::DaemonConfig,
+    session_search_enabled: bool,
+    configured_agent_ids: &'a [String],
+    host_shutdown: bcode_agent_runtime::CancellationToken,
+    workflow_ready: Option<EmbeddedWorkflowReady>,
+) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), ServerError>> + Send + 'a>> {
+    Box::pin(run_constructed_server_inner(
+        state,
+        listener,
+        daemon,
+        session_search_enabled,
+        configured_agent_ids,
+        host_shutdown,
+        workflow_ready,
+    ))
+}
+
 #[allow(clippy::too_many_lines)]
-async fn run_constructed_server(
+async fn run_constructed_server_inner(
     state: Arc<ServerState>,
     listener: LocalIpcListener,
     daemon: &bcode_config::DaemonConfig,
@@ -8244,9 +8272,11 @@ fn handle_request_inner<'a>(
         SessionLifecycleRequest::PrepareSessionCompactionRecovery { request } => {
             Box::pin(async move {
                 use bcode_session_models::SessionCompactionRecoveryDiscoveryApplication as _;
-                let result = SessionApplicationHandle::new(state, client_id)
-                    .prepare_session_compaction_recovery(request)
-                    .await;
+                let result = Box::pin(
+                    SessionApplicationHandle::new(state, client_id)
+                        .prepare_session_compaction_recovery(request),
+                )
+                .await;
                 send_response(
                     writer,
                     request_id,
@@ -8695,13 +8725,13 @@ async fn handle_turn_workflow_model_request(
                 )
                 .await;
             }
-            let response = match submission_recovery::prepare(
+            let response = match Box::pin(submission_recovery::prepare(
                 state,
                 session_id,
                 client_id,
                 submission_id,
                 expected_accepted_sequence,
-            )
+            ))
             .await
             {
                 Ok(confirmation) => {
@@ -10925,7 +10955,7 @@ async fn handle_core_runtime_request(
             session_id,
             request,
         } => {
-            let response = match bcode_provider_auth_models::application::AccountRoutingApplication::set_account_routing(&ServicesApplicationHandle::new(state, client_id), session_id.to_string(), request).await {
+            let response = match Box::pin(bcode_provider_auth_models::application::AccountRoutingApplication::set_account_routing(&ServicesApplicationHandle::new(state, client_id), session_id.to_string(), request)).await {
                 Ok(routing) => Response::Ok(ResponsePayload::AccountRouting { routing }),
                 Err(error) => Response::Err(ErrorResponse::new(error.code, error.message)),
             };
@@ -10935,7 +10965,7 @@ async fn handle_core_runtime_request(
             session_id,
             request,
         } => {
-            let response = match bcode_provider_auth_models::application::AccountRoutingApplication::set_account_pause(&ServicesApplicationHandle::new(state, client_id), session_id.to_string(), request).await {
+            let response = match Box::pin(bcode_provider_auth_models::application::AccountRoutingApplication::set_account_pause(&ServicesApplicationHandle::new(state, client_id), session_id.to_string(), request)).await {
                 Ok(routing) => Response::Ok(ResponsePayload::AccountRouting { routing }),
                 Err(error) => Response::Err(ErrorResponse::new(error.code, error.message)),
             };
@@ -10945,7 +10975,15 @@ async fn handle_core_runtime_request(
             session_id,
             request,
         } => {
-            let response = match bcode_provider_auth_models::application::AccountRoutingApplication::rename_account(&ServicesApplicationHandle::new(state, client_id), session_id.to_string(), request).await {
+            let response = match Box::pin(
+                bcode_provider_auth_models::application::AccountRoutingApplication::rename_account(
+                    &ServicesApplicationHandle::new(state, client_id),
+                    session_id.to_string(),
+                    request,
+                ),
+            )
+            .await
+            {
                 Ok(routing) => Response::Ok(ResponsePayload::AccountRouting { routing }),
                 Err(error) => Response::Err(ErrorResponse::new(error.code, error.message)),
             };
@@ -20413,6 +20451,10 @@ async fn broadcast_workflow_event(
 }
 
 async fn recover_workflow_continuation(state: &Arc<ServerState>, run_id: &str) {
+    Box::pin(recover_workflow_continuation_inner(state, run_id)).await;
+}
+
+async fn recover_workflow_continuation_inner(state: &Arc<ServerState>, run_id: &str) {
     match workflow_representation::recovery::is_represented(state, run_id).await {
         Ok(true) => {
             if let Err(error) = drive_workflow_run(state, run_id).await {
@@ -20578,9 +20620,18 @@ async fn drive_workflow_run_exclusive(
     run_id: &str,
 ) -> Result<(), ServerError> {
     let labels = MetricLabels::from([("run_id".to_owned(), run_id.to_owned())]);
-    if drive_represented_workflow_phase(state, run_id, &labels).await? {
+    if Box::pin(drive_represented_workflow_phase(state, run_id, &labels)).await? {
         return Ok(());
     }
+    Box::pin(drive_legacy_workflow_run(state, run_id)).await
+}
+
+// Keep legacy execution's polling frame out of represented workflow dispatch.
+// The caller retains the exclusive drive gate while either path is awaited.
+async fn drive_legacy_workflow_run(
+    state: &Arc<ServerState>,
+    run_id: &str,
+) -> Result<(), ServerError> {
     let authority = required_workflow_drive_authority(state, run_id).await?;
     let started_at = std::time::Instant::now();
     let store = retained_workflow_store(state)?;
@@ -24779,6 +24830,11 @@ fn provider_error_message(error: &bcode_model::ProviderError) -> String {
     )
 }
 
+tokio::task_local! {
+    /// Explicit non-model invocation provenance, inherited only by the polled host execution.
+    static HOST_TOOL_INVOCATION_PROVENANCE: PluginInvocationScope;
+}
+
 async fn active_plugin_scope_for_session(
     state: &ServerState,
     session_id: SessionId,
@@ -24796,6 +24852,9 @@ async fn active_plugin_scope_for_tool_call(
     session_id: SessionId,
     tool_call_id: &str,
 ) -> PluginInvocationScope {
+    if let Ok(scope) = HOST_TOOL_INVOCATION_PROVENANCE.try_with(Clone::clone) {
+        return scope.with_work_id(format!("tool_{tool_call_id}"));
+    }
     state
         .session_current_turn(session_id)
         .await
@@ -25446,6 +25505,38 @@ async fn ingest_provider_stream_event_payload(
     stream_progress: &mut ModelStreamProgress,
     command_context: &mut RuntimeCommandContext<'_>,
 ) -> Option<bool> {
+    Box::pin(ingest_provider_stream_event_payload_inner(
+        state,
+        session_id,
+        provider_plugin_id,
+        provider_turn_id,
+        turn_id,
+        next_assistant_segment_order,
+        output_position_base,
+        payload,
+        stream,
+        outcome,
+        stream_progress,
+        command_context,
+    ))
+    .await
+}
+
+#[allow(clippy::too_many_arguments, clippy::needless_pass_by_ref_mut)]
+async fn ingest_provider_stream_event_payload_inner(
+    state: &ServerState,
+    session_id: SessionId,
+    provider_plugin_id: Option<&str>,
+    provider_turn_id: &str,
+    turn_id: &str,
+    next_assistant_segment_order: &mut u32,
+    output_position_base: u64,
+    payload: Vec<u8>,
+    stream: &mut ModelStreamAccumulator,
+    outcome: &mut ModelPollOutcome,
+    stream_progress: &mut ModelStreamProgress,
+    command_context: &mut RuntimeCommandContext<'_>,
+) -> Option<bool> {
     outcome.stream.events_received = outcome.stream.events_received.saturating_add(1);
     let Ok(event) = serde_json::from_slice::<ProviderTurnEvent>(&payload) else {
         outcome.stream.events_decode_failed = outcome.stream.events_decode_failed.saturating_add(1);
@@ -25887,7 +25978,7 @@ async fn stream_model_turn_events(
 
         match event {
             Ok(StreamingServiceInvocationEvent::Event(payload)) => {
-                if ingest_provider_stream_event_payload(
+                if Box::pin(ingest_provider_stream_event_payload(
                     state,
                     session_id,
                     provider_plugin_id,
@@ -25900,7 +25991,7 @@ async fn stream_model_turn_events(
                     &mut outcome,
                     &mut stream_progress,
                     command_context,
-                )
+                ))
                 .await
                     == Some(true)
                 {
@@ -25935,7 +26026,7 @@ async fn stream_model_turn_events(
                         .stream
                         .events_drained_after_response
                         .saturating_add(1);
-                    let _ = ingest_provider_stream_event_payload(
+                    let _ = Box::pin(ingest_provider_stream_event_payload(
                         state,
                         session_id,
                         provider_plugin_id,
@@ -25948,7 +26039,7 @@ async fn stream_model_turn_events(
                         &mut outcome,
                         &mut stream_progress,
                         command_context,
-                    )
+                    ))
                     .await;
                     if outcome.stop_reason.is_some() || outcome.completion.is_some() {
                         outcome.stream.record_close("provider_event");
@@ -26544,12 +26635,40 @@ async fn publish_stream_tool_request_draft_live(
     .await;
 }
 
+#[allow(clippy::too_many_arguments)]
+async fn handle_provider_turn_event(
+    state: &ServerState,
+    session_id: SessionId,
+    provider_turn_id: &str,
+    turn_id: &str,
+    next_assistant_segment_order: &mut u32,
+    event: ProviderTurnEvent,
+    stream: &mut ModelStreamAccumulator,
+    outcome: &mut ModelPollOutcome,
+    stream_progress: &mut ModelStreamProgress,
+    command_context: &RuntimeCommandContext<'_>,
+) {
+    Box::pin(handle_provider_turn_event_inner(
+        state,
+        session_id,
+        provider_turn_id,
+        turn_id,
+        next_assistant_segment_order,
+        event,
+        stream,
+        outcome,
+        stream_progress,
+        command_context,
+    ))
+    .await;
+}
+
 #[allow(
     clippy::large_stack_frames,
     clippy::too_many_arguments,
     clippy::too_many_lines
 )]
-async fn handle_provider_turn_event(
+async fn handle_provider_turn_event_inner(
     state: &ServerState,
     session_id: SessionId,
     provider_turn_id: &str,
@@ -32626,6 +32745,9 @@ struct ServerToolInvoker<'a> {
         Option<&'a BTreeMap<String, (String, bcode_session_models::TurnOutputPosition)>>,
     persist_requests: bool,
     persist_lifecycle: bool,
+    /// Explicit host provenance for non-model invocations; never inferred from a model turn.
+    invocation_provenance: Option<PluginInvocationScope>,
+    record_dispatch_start: bool,
 }
 
 impl<'a> ServerToolInvoker<'a> {
@@ -32643,6 +32765,21 @@ impl<'a> ServerToolInvoker<'a> {
             output_positions: None,
             persist_requests: false,
             persist_lifecycle: true,
+            invocation_provenance: None,
+            record_dispatch_start: true,
+        }
+    }
+
+    fn with_invocation_provenance(mut self, provenance: PluginInvocationScope) -> Self {
+        self.invocation_provenance = Some(provenance);
+        self
+    }
+
+    async fn plugin_scope(&self, invocation_id: &str) -> PluginInvocationScope {
+        if let Some(scope) = &self.invocation_provenance {
+            scope.clone().with_work_id(format!("tool_{invocation_id}"))
+        } else {
+            active_plugin_scope_for_tool_call(self.state, self.session_id, invocation_id).await
         }
     }
 
@@ -32686,12 +32823,7 @@ impl ToolInvoker for ServerToolInvoker<'_> {
                     TOOL_SERVICE_INTERFACE_ID,
                     OP_PREPARE_TOOL,
                     &request,
-                    active_plugin_scope_for_tool_call(
-                        self.state,
-                        self.session_id,
-                        &request.invocation.invocation_id,
-                    )
-                    .await,
+                    self.plugin_scope(&request.invocation.invocation_id).await,
                 )
                 .await
                 .map_err(|error| RuntimeError::ToolPreparation {
@@ -32775,28 +32907,30 @@ async fn invoke_server_registered_tool(
     // This append is the dispatch boundary, not a best-effort presentation update.
     // Without a durable start marker, a replacement owner cannot distinguish an
     // approved-but-unstarted request from an invocation with ambiguous effects.
-    let started = invoker
-        .state
-        .sessions
-        .append_event(
-            invoker.session_id,
-            SessionEventKind::ToolInvocationLifecycle {
-                event: bcode_session_models::ToolInvocationLifecycleEvent {
-                    invocation_id: call.id.clone(),
-                    sequence: 0,
-                    stage: bcode_session_models::ToolInvocationLifecycleStage::Started,
-                    message: None,
-                    metadata: serde_json::json!({"dispatch_boundary_version": 1}),
+    if invoker.record_dispatch_start {
+        let started = invoker
+            .state
+            .sessions
+            .append_event(
+                invoker.session_id,
+                SessionEventKind::ToolInvocationLifecycle {
+                    event: bcode_session_models::ToolInvocationLifecycleEvent {
+                        invocation_id: call.id.clone(),
+                        sequence: 0,
+                        stage: bcode_session_models::ToolInvocationLifecycleStage::Started,
+                        message: None,
+                        metadata: serde_json::json!({"dispatch_boundary_version": 1}),
+                    },
                 },
-            },
-        )
-        .await
-        .map_err(|_| RuntimeError::ToolExecution {
-            tool_name: call.name.clone(),
-            message: "tool dispatch could not be recorded; tool was not executed".into(),
-        })?;
-    publish_session_event(invoker.state, &started).await;
-    let result = invoke_plugin_tool_transport(
+            )
+            .await
+            .map_err(|_| RuntimeError::ToolExecution {
+                tool_name: call.name.clone(),
+                message: "tool dispatch could not be recorded; tool was not executed".into(),
+            })?;
+        publish_session_event(invoker.state, &started).await;
+    }
+    let transport = invoke_plugin_tool_transport(
         invoker.state,
         invoker.session_id,
         &call,
@@ -32806,8 +32940,15 @@ async fn invoke_server_registered_tool(
         invoker.cancel_state,
         Some(scope),
         !invoker.persist_lifecycle,
-    )
-    .await
+        invoker.invocation_provenance.as_ref(),
+    );
+    let result = if let Some(provenance) = &invoker.invocation_provenance {
+        HOST_TOOL_INVOCATION_PROVENANCE
+            .scope(provenance.clone(), transport)
+            .await
+    } else {
+        transport.await
+    }
     .unwrap_or_else(tool_error);
     if invoker.cancel_state.is_cancelled() || !scope.accepts_work() {
         let _ = scope.turn().control().begin_cancellation();
@@ -33653,7 +33794,9 @@ async fn finish_server_registered_tool(
         .cancel_state
         .settled_tool_observations
         .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    observe_settled_tool_triage(invoker, &call, &result).await;
+    if invoker.invocation_provenance.is_none() {
+        observe_settled_tool_triage(invoker, &call, &result).await;
+    }
     Ok(result)
 }
 
@@ -34079,7 +34222,6 @@ async fn collect_server_tool_catalog(state: &ServerState) -> Result<UnifiedToolC
     snapshot.catalog_for_runtime(&state.plugins)
 }
 
-#[cfg(test)]
 async fn registered_server_tool(
     state: &ServerState,
     tool_name: &str,
@@ -34097,13 +34239,35 @@ async fn prepare_registered_server_tool(
     call: &bcode_model::ToolCall,
     cancel_state: &TurnCancelState,
 ) -> Result<ToolPreparationResponse, String> {
+    prepare_registered_server_tool_with_provenance(
+        state,
+        session_id,
+        tool,
+        call,
+        cancel_state,
+        None,
+    )
+    .await
+}
+
+async fn prepare_registered_server_tool_with_provenance(
+    state: &ServerState,
+    session_id: SessionId,
+    tool: RegisteredTool,
+    call: &bcode_model::ToolCall,
+    cancel_state: &TurnCancelState,
+    provenance: Option<PluginInvocationScope>,
+) -> Result<ToolPreparationResponse, String> {
+    tracing::warn!(target: "bcode_server::harness", stage = "tool_directory_start", "managed preparation progress");
     let working_directory = state
         .sessions
         .session_working_directory(session_id)
         .await
         .map_err(|error| error.to_string())?;
+    tracing::warn!(target: "bcode_server::harness", stage = "tool_directory_done", "managed preparation progress");
     let host_context =
         invocation_service_host_context(state, session_id, &working_directory).await?;
+    tracing::warn!(target: "bcode_server::harness", stage = "tool_context_done", "managed preparation progress");
     let request = ToolPreparationRequest {
         invocation: ToolInvocationDescriptor {
             invocation_id: call.id.clone(),
@@ -34132,8 +34296,16 @@ async fn prepare_registered_server_tool(
             TOOL_SERVICE_INTERFACE_ID,
             OP_PREPARE_TOOL,
             &request,
-            active_plugin_scope_for_tool_call(state, session_id, &request.invocation.invocation_id)
-                .await,
+            if let Some(provenance) = provenance {
+                provenance.with_work_id(format!("tool_{}", request.invocation.invocation_id))
+            } else {
+                active_plugin_scope_for_tool_call(
+                    state,
+                    session_id,
+                    &request.invocation.invocation_id,
+                )
+                .await
+            },
         )
         .await
         .map_err(|error| error.to_string())?;
@@ -35568,12 +35740,12 @@ fn write_workflow_bridge_artifact(
 }
 
 fn managed_callback_route_refusal(route_id: &str) -> Option<ToolInvocationServiceResolution> {
-    (route_id == bcode_ipc::harness::MANAGED_SESSION_INTERFACE_ID).then(|| {
-        ToolInvocationServiceResolution::Failed {
+    (route_id == bcode_ipc::harness::MANAGED_SESSION_INTERFACE_ID
+        || route_id == bcode_harness_models::MANAGED_TOOL_QUEUE_INTERFACE_ID)
+        .then(|| ToolInvocationServiceResolution::Failed {
             code: "managed_session_invocation_context_required".into(),
             message: "managed sessions require the authenticated plugin callback".into(),
-        }
-    })
+        })
 }
 
 fn server_workflow_plugin_bridge_observed(
@@ -36783,6 +36955,7 @@ async fn invoke_plugin_tool_transport(
     cancel_state: &TurnCancelState,
     invocation_scope: Option<&InvocationScope>,
     route_canonical_events_to_scope: bool,
+    invocation_provenance: Option<&PluginInvocationScope>,
 ) -> Result<ToolInvocationResponse, String> {
     if cancel_state.is_cancelled() {
         return Ok(ToolInvocationResponse {
@@ -36858,7 +37031,11 @@ async fn invoke_plugin_tool_transport(
         preparation_descriptor,
     };
     let payload = serde_json::to_vec(&request).map_err(|error| error.to_string())?;
-    let scope = active_plugin_scope_for_tool_call(state, session_id, &call.id).await;
+    let scope = if let Some(provenance) = invocation_provenance {
+        provenance.clone().with_work_id(format!("tool_{}", call.id))
+    } else {
+        active_plugin_scope_for_tool_call(state, session_id, &call.id).await
+    };
     let (bridge, bridge_requests) = server_plugin_bridge();
     let mut bridge_requests = Some(bridge_requests);
     let mut bridge_resolutions = futures::stream::FuturesUnordered::new();
@@ -42346,11 +42523,21 @@ async fn prepare_workflow_execution_child(
     provenance: &ExecutionSessionProvenance,
     immediate_parent_id: SessionId,
 ) -> Result<bcode_session_models::SessionSummary, WorkflowStoreError> {
-    let parent = state
-        .sessions
-        .session_summary_non_owning(provenance.parent_session_id)
-        .await
-        .map_err(|error| WorkflowStoreError::InvalidData(error.to_string()))?;
+    #[cfg(test)]
+    if std::env::var_os("BCODE_TEST_WORKFLOW_STACK_TRACE").is_some() {
+        eprintln!("workflow-stack phase=child_parent_read.begin");
+    }
+    let parent = Box::pin(
+        state
+            .sessions
+            .session_summary_non_owning(provenance.parent_session_id),
+    )
+    .await
+    .map_err(|error| WorkflowStoreError::InvalidData(error.to_string()))?;
+    #[cfg(test)]
+    if std::env::var_os("BCODE_TEST_WORKFLOW_STACK_TRACE").is_some() {
+        eprintln!("workflow-stack phase=child_parent_read.end");
+    }
     let directory = if let Some(directory) = configuration.worktree_directory.as_deref() {
         bcode_worktree::validate_registered_worktree(
             &parent.working_directory,
@@ -42373,7 +42560,11 @@ async fn prepare_workflow_execution_child(
         name: Some(format!("workflow {}", request.activation.node.name)),
         working_directory: directory,
     };
-    match configuration.execution_target {
+    #[cfg(test)]
+    if std::env::var_os("BCODE_TEST_WORKFLOW_STACK_TRACE").is_some() {
+        eprintln!("workflow-stack phase=child_session_create.begin");
+    }
+    let child = match configuration.execution_target {
         bcode_workflow::PromptContextTarget::FreshIsolated => {
             // Heap-pin child preparation so its migration/storage state is not
             // retained inline in the already nested dispatch future.
@@ -42400,7 +42591,12 @@ async fn prepare_workflow_execution_child(
             unreachable!("shared execution handled separately")
         }
     }
-    .map_err(|error| WorkflowStoreError::InvalidData(error.to_string()))
+    .map_err(|error| WorkflowStoreError::InvalidData(error.to_string()))?;
+    #[cfg(test)]
+    if std::env::var_os("BCODE_TEST_WORKFLOW_STACK_TRACE").is_some() {
+        eprintln!("workflow-stack phase=child_session_create.end");
+    }
+    Ok(child)
 }
 
 async fn dispatch_workflow_prompt_turn(
@@ -42427,6 +42623,104 @@ async fn dispatch_workflow_prompt_turn_after_admission(
     .await
 }
 
+// Keep isolated lookup/create/link polling state separate from prompt admission.
+// The caller retains its admission and execution-authority guards across this await.
+async fn resolve_workflow_isolated_execution_child(
+    state: &ServerState,
+    request: &bcode_workflow_store::PreparedActivationDispatch,
+    configuration: &bcode_workflow::WorkflowPromptConfiguration,
+    provenance: &ExecutionSessionProvenance,
+    immediate_parent_id: SessionId,
+    authority: &bcode_workflow_store::WorkflowExecutionAuthority,
+    workspace_snapshot: &str,
+) -> Result<bcode_session_models::SessionSummary, WorkflowStoreError> {
+    // Recovery keys include the complete run/node/activation/attempt tuple. Repeat
+    // generations, retry attempts, fan-out members, and child runs therefore cannot share
+    // isolated context accidentally, while exact duplicate delivery recovers one session.
+    #[cfg(test)]
+    let lookup_timer = workflow_representation::fanout_stages::StageTimer::new(
+        &request.activation.run_id,
+        None,
+        Some(&request.dispatch_identity),
+        workflow_representation::fanout_stages::FanoutAdmissionStage::ChildLookup,
+    );
+    let existing_child = workflow_child_session_for_activation(
+        state,
+        &request.activation.run_id,
+        &request.activation.node_id,
+        &request.activation.activation_id,
+        request.attempt,
+    )
+    .await?;
+    #[cfg(test)]
+    drop(lookup_timer);
+    let child = if let Some(existing) = existing_child {
+        if existing.parent_id != Some(immediate_parent_id) {
+            return Err(WorkflowStoreError::InvalidData("recovered execution session has incompatible immediate parent; explicit maintenance required".into()));
+        }
+        if let Some(directory) = &configuration.worktree_directory {
+            let parent = state
+                .sessions
+                .session_summary(provenance.parent_session_id)
+                .await
+                .map_err(|error| WorkflowStoreError::InvalidData(error.to_string()))?;
+            let worktree = bcode_worktree::validate_registered_worktree(
+                &parent.working_directory,
+                Path::new(directory),
+            )
+            .map_err(|error| WorkflowStoreError::InvalidData(error.to_string()))?;
+            if existing.working_directory.canonicalize().ok().as_deref() != Some(worktree.path()) {
+                return Err(WorkflowStoreError::InvalidData(
+                    "recovered workflow session does not match the declared worktree".into(),
+                ));
+            }
+        }
+        existing
+    } else {
+        #[cfg(test)]
+        if std::env::var_os("BCODE_TEST_WORKFLOW_STACK_TRACE").is_some() {
+            eprintln!("workflow-stack phase=isolated_child_prepare.begin");
+        }
+        let child = prepare_workflow_execution_child(
+            state,
+            request,
+            configuration,
+            provenance,
+            immediate_parent_id,
+        )
+        .await?;
+        #[cfg(test)]
+        if std::env::var_os("BCODE_TEST_WORKFLOW_STACK_TRACE").is_some() {
+            eprintln!("workflow-stack phase=isolated_child_prepare.end");
+        }
+        #[cfg(test)]
+        let link_timer = workflow_representation::fanout_stages::StageTimer::new(
+            &request.activation.run_id,
+            Some(child.id),
+            Some(&request.dispatch_identity),
+            workflow_representation::fanout_stages::FanoutAdmissionStage::SessionLink,
+        );
+        workflow_representation::owner::link_execution_session(
+            state,
+            authority,
+            &bcode_workflow_store::WorkflowExecutionSessionLink::new(
+                request.activation.run_id.clone(),
+                request.activation.node_id.clone(),
+                request.activation.activation_id.clone(),
+                request.attempt,
+                child.id.to_string(),
+                workspace_snapshot.to_owned(),
+                current_unix_millis(),
+            ),
+        )
+        .await?;
+        #[cfg(test)]
+        drop(link_timer);
+        child
+    };
+    Ok(child)
+}
+
 #[allow(clippy::too_many_lines)]
 async fn dispatch_workflow_prompt_turn_with_publication_hook<F, Fut>(
     state: &Arc<ServerState>,
@@ -42437,6 +42731,10 @@ where
     F: FnOnce() -> Fut + Send,
     Fut: Future<Output = Result<(), WorkflowStoreError>> + Send,
 {
+    #[cfg(test)]
+    if std::env::var_os("BCODE_TEST_WORKFLOW_STACK_TRACE").is_some() {
+        eprintln!("workflow-stack phase=prompt_dispatch.begin");
+    }
     let admission = workflow_prompt_admission(state, &request.dispatch_identity);
     #[cfg(test)]
     let stage_timer = workflow_representation::fanout_stages::StageTimer::new(
@@ -42586,100 +42884,16 @@ where
     let (target_session_id, shared_permit) = match execution_target {
         bcode_workflow::PromptContextTarget::FreshIsolated
         | bcode_workflow::PromptContextTarget::FixedGenerationFork => {
-            // Recovery keys include the complete run/node/activation/attempt tuple. Repeat
-            // generations, retry attempts, fan-out members, and child runs therefore cannot share
-            // isolated context accidentally, while exact duplicate delivery recovers one session.
-            #[cfg(test)]
-            let lookup_timer = workflow_representation::fanout_stages::StageTimer::new(
-                &request.activation.run_id,
-                None,
-                Some(&request.dispatch_identity),
-                workflow_representation::fanout_stages::FanoutAdmissionStage::ChildLookup,
-            );
-            let existing_child = workflow_child_session_for_activation(
+            let child = Box::pin(resolve_workflow_isolated_execution_child(
                 state,
-                &request.activation.run_id,
-                &request.activation.node_id,
-                &request.activation.activation_id,
-                request.attempt,
-            )
+                request,
+                &configuration,
+                &provenance,
+                immediate_parent_id,
+                &dispatch_authority,
+                &run.workspace_snapshot,
+            ))
             .await?;
-            #[cfg(test)]
-            drop(lookup_timer);
-            let child = if let Some(existing) = existing_child {
-                if existing.parent_id != Some(immediate_parent_id) {
-                    return Err(WorkflowStoreError::InvalidData("recovered execution session has incompatible immediate parent; explicit maintenance required".into()));
-                }
-                if let Some(directory) = &configuration.worktree_directory {
-                    let parent = state
-                        .sessions
-                        .session_summary(parent_session_id)
-                        .await
-                        .map_err(|error| WorkflowStoreError::InvalidData(error.to_string()))?;
-                    let worktree = bcode_worktree::validate_registered_worktree(
-                        &parent.working_directory,
-                        Path::new(directory),
-                    )
-                    .map_err(|error| WorkflowStoreError::InvalidData(error.to_string()))?;
-                    if existing.working_directory.canonicalize().ok().as_deref()
-                        != Some(worktree.path())
-                    {
-                        return Err(WorkflowStoreError::InvalidData(
-                            "recovered workflow session does not match the declared worktree"
-                                .into(),
-                        ));
-                    }
-                }
-                workflow_representation::owner::observe_execution_session(
-                    state,
-                    &dispatch_authority,
-                    &bcode_workflow_store::WorkflowExecutionSessionLink::new(
-                        request.activation.run_id.clone(),
-                        request.activation.node_id.clone(),
-                        request.activation.activation_id.clone(),
-                        request.attempt,
-                        existing.id.to_string(),
-                        run.workspace_snapshot.clone(),
-                        current_unix_millis(),
-                    ),
-                    true,
-                )
-                .await;
-                existing
-            } else {
-                let child = prepare_workflow_execution_child(
-                    state,
-                    request,
-                    &configuration,
-                    &provenance,
-                    immediate_parent_id,
-                )
-                .await?;
-                #[cfg(test)]
-                let link_timer = workflow_representation::fanout_stages::StageTimer::new(
-                    &request.activation.run_id,
-                    Some(child.id),
-                    Some(&request.dispatch_identity),
-                    workflow_representation::fanout_stages::FanoutAdmissionStage::SessionLink,
-                );
-                workflow_representation::owner::link_execution_session(
-                    state,
-                    &dispatch_authority,
-                    &bcode_workflow_store::WorkflowExecutionSessionLink::new(
-                        request.activation.run_id.clone(),
-                        request.activation.node_id.clone(),
-                        request.activation.activation_id.clone(),
-                        request.attempt,
-                        child.id.to_string(),
-                        run.workspace_snapshot.clone(),
-                        current_unix_millis(),
-                    ),
-                )
-                .await?;
-                #[cfg(test)]
-                drop(link_timer);
-                child
-            };
             (child.id, None)
         }
         bcode_workflow::PromptContextTarget::SharedParentSequential => {
@@ -43271,8 +43485,25 @@ async fn restore_workflow_runs_observation_only(state: &Arc<ServerState>, run_id
     restore_workflow_runs_with_receipt_limit(state, run_ids, false, 1_000).await;
 }
 
-#[allow(clippy::too_many_lines)]
 async fn restore_workflow_runs_with_receipt_limit(
+    state: &Arc<ServerState>,
+    run_ids: Vec<String>,
+    restore_prepared: bool,
+    receipt_limit: usize,
+) {
+    // Bound every restoration caller without moving gate/authority ownership to
+    // another task or adding cancellation/replay semantics.
+    Box::pin(restore_workflow_runs_with_receipt_limit_inner(
+        state,
+        run_ids,
+        restore_prepared,
+        receipt_limit,
+    ))
+    .await;
+}
+
+#[allow(clippy::too_many_lines)]
+async fn restore_workflow_runs_with_receipt_limit_inner(
     state: &Arc<ServerState>,
     run_ids: Vec<String>,
     restore_prepared: bool,
@@ -46415,6 +46646,56 @@ fn default_session_artifact_dir(session_id: SessionId) -> PathBuf {
 #[cfg(test)]
 mod tests {
     include!("artifact_lifecycle_tests.rs");
+    /// Create an owner-private directory for a strict local IPC socket fixture.
+    pub fn test_socket_dir() -> std::io::Result<tempfile::TempDir> {
+        let mut builder = tempfile::Builder::new();
+        builder.prefix("bcode-ipc-");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            builder.permissions(std::fs::Permissions::from_mode(0o700));
+        }
+        builder.tempdir()
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn socket_fixture_directory_is_private_and_supports_strict_ipc() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let directory = test_socket_dir().expect("socket directory");
+        assert_eq!(
+            directory
+                .path()
+                .metadata()
+                .expect("directory metadata")
+                .permissions()
+                .mode()
+                & 0o777,
+            0o700
+        );
+        let endpoint = IpcEndpoint::unix_socket(directory.path().join("fixture.sock"));
+        let listener = LocalIpcListener::bind(&endpoint).expect("strict listener");
+        let mut client = LocalIpcStream::connect(&endpoint).await.expect("client");
+        let mut server = listener.accept().await.expect("server");
+        let request = bcode_ipc::request_envelope(1, &Request::Ping).expect("request");
+        bcode_ipc::send_envelope(&mut client, &request)
+            .await
+            .expect("send");
+        let received = tokio::time::timeout(
+            Duration::from_secs(2),
+            bcode_ipc::recv_envelope(&mut server),
+        )
+        .await
+        .expect("bounded receive")
+        .expect("receive");
+        assert_eq!(received.request_id, 1);
+        assert!(matches!(
+            bcode_ipc::decode_request(&received.payload).expect("decode"),
+            Request::Ping
+        ));
+    }
+
     include!("session_operations/submission_tests.rs");
     mod collaboration_execution;
     mod goal_entry;
@@ -47512,7 +47793,7 @@ mod tests {
                 "test.fast-session-search",
                 TestProviderBehavior::GatedStatus,
             )]));
-            let directory = tempfile::tempdir().unwrap();
+            let directory = test_socket_dir().unwrap();
             let endpoint = IpcEndpoint::unix_socket(directory.path().join("optional-status.sock"));
             let listener = LocalIpcListener::bind(&endpoint).unwrap();
             let shutdown = bcode_agent_runtime::CancellationToken::new();
@@ -47724,7 +48005,7 @@ mod tests {
         let _guard = session_search::tests::lock_search_tests().await;
         let state = slow_backfill_test_state();
         let session_id = create_ipc_backfill_session(&state).await;
-        let socket_dir = tempfile::tempdir().expect("IPC socket directory");
+        let socket_dir = test_socket_dir().expect("IPC socket directory");
         let endpoint = bcode_ipc::IpcEndpoint::unix_socket(socket_dir.path().join("first.sock"));
         let listener = LocalIpcListener::bind(&endpoint).expect("IPC listener");
         let server_state = Arc::clone(&state);
@@ -47864,7 +48145,7 @@ mod tests {
         state.session_search_dirty.mark_committed(session.id).await;
         session_search::process_dirty_sessions(&state).await;
 
-        let socket_dir = tempfile::tempdir().expect("IPC socket directory");
+        let socket_dir = test_socket_dir().expect("IPC socket directory");
         let endpoint = bcode_ipc::IpcEndpoint::unix_socket(socket_dir.path().join("server.sock"));
         let listener = LocalIpcListener::bind(&endpoint).expect("IPC listener");
         let server_state = Arc::clone(&state);
@@ -47962,7 +48243,7 @@ mod tests {
             .await
             .expect("session");
         let state = Arc::new(test_server_state(sessions.clone()));
-        let socket_dir = tempfile::tempdir().expect("IPC socket directory");
+        let socket_dir = test_socket_dir().expect("IPC socket directory");
         let endpoint = bcode_ipc::IpcEndpoint::unix_socket(socket_dir.path().join("server.sock"));
         let listener = LocalIpcListener::bind(&endpoint).expect("IPC listener");
         let server_state = Arc::clone(&state);
@@ -48021,7 +48302,7 @@ mod tests {
             .await
             .expect("session");
         let state = Arc::new(test_server_state(sessions.clone()));
-        let socket_dir = tempfile::tempdir().expect("IPC socket directory");
+        let socket_dir = test_socket_dir().expect("IPC socket directory");
         let endpoint = bcode_ipc::IpcEndpoint::unix_socket(socket_dir.path().join("server.sock"));
         let listener = LocalIpcListener::bind(&endpoint).expect("IPC listener");
         let server_state = Arc::clone(&state);
@@ -48710,7 +48991,7 @@ mod tests {
             };
         let state = Arc::new(state);
         *policy_state.lock().expect("policy state") = Arc::downgrade(&state);
-        let socket_dir = tempfile::tempdir().expect("IPC socket directory");
+        let socket_dir = test_socket_dir().expect("IPC socket directory");
         let endpoint = bcode_ipc::IpcEndpoint::unix_socket(socket_dir.path().join("server.sock"));
         let listener = LocalIpcListener::bind(&endpoint).expect("IPC listener");
         let server_state = Arc::clone(&state);
@@ -48850,7 +49131,7 @@ mod tests {
             .workflows
             .run_publication_plugins =
             BTreeSet::from(["publication.only".into(), "both.grants".into()]);
-        let socket_dir = tempfile::tempdir().expect("IPC socket directory");
+        let socket_dir = test_socket_dir().expect("IPC socket directory");
         let endpoint = bcode_ipc::IpcEndpoint::unix_socket(socket_dir.path().join("server.sock"));
         let listener = LocalIpcListener::bind(&endpoint).expect("IPC listener");
         let server_state = Arc::clone(&state);
@@ -49063,7 +49344,7 @@ mod tests {
         let state = Arc::new(test_server_state_with_fake_provider_and_workflow_store(
             sessions, store,
         ));
-        let socket_dir = tempfile::tempdir().expect("IPC socket directory");
+        let socket_dir = test_socket_dir().expect("IPC socket directory");
         let endpoint = bcode_ipc::IpcEndpoint::unix_socket(socket_dir.path().join("server.sock"));
         let listener = LocalIpcListener::bind(&endpoint).expect("IPC listener");
         let server_state = Arc::clone(&state);
@@ -49147,7 +49428,7 @@ mod tests {
         let state = Arc::new(test_server_state_with_fake_provider_and_workflow_store(
             sessions, store,
         ));
-        let socket_dir = tempfile::tempdir().expect("IPC socket directory");
+        let socket_dir = test_socket_dir().expect("IPC socket directory");
         let endpoint = bcode_ipc::IpcEndpoint::unix_socket(socket_dir.path().join("server.sock"));
         let listener = LocalIpcListener::bind(&endpoint).expect("IPC listener");
         let server_state = Arc::clone(&state);
@@ -49242,7 +49523,7 @@ mod tests {
         let state = Arc::new(test_server_state_with_fake_provider_and_workflow_store(
             sessions, store,
         ));
-        let socket_dir = tempfile::tempdir().expect("IPC socket directory");
+        let socket_dir = test_socket_dir().expect("IPC socket directory");
         let endpoint = bcode_ipc::IpcEndpoint::unix_socket(socket_dir.path().join("server.sock"));
         let listener = LocalIpcListener::bind(&endpoint).expect("IPC listener");
         let server_state = Arc::clone(&state);
@@ -49826,7 +50107,7 @@ mod tests {
         for fail_send in [true, false] {
             let state = Arc::new(test_server_state(SessionManager::default()));
             let capacity = state.workflow_discovery_capacity.available_permits();
-            let socket_dir = tempfile::tempdir().unwrap();
+            let socket_dir = test_socket_dir().unwrap();
             let endpoint = bcode_ipc::IpcEndpoint::unix_socket(socket_dir.path().join("send.sock"));
             let listener = bcode_ipc::LocalIpcListener::bind(&endpoint).unwrap();
             let (server, peer) =
@@ -50486,7 +50767,7 @@ mod tests {
         let (release_tx, release_rx) = std::sync::mpsc::channel();
         *state.workflow_detail_barrier.lock().await = Some((started_tx, release_rx));
         {
-            let socket_dir = tempfile::tempdir().unwrap();
+            let socket_dir = test_socket_dir().unwrap();
             let endpoint =
                 bcode_ipc::IpcEndpoint::unix_socket(socket_dir.path().join("detail.sock"));
             let listener = LocalIpcListener::bind(&endpoint).unwrap();
@@ -50836,7 +51117,7 @@ mod tests {
         let state = Arc::new(test_server_state_with_shell_plugin(
             SessionManager::default(),
         ));
-        let socket_dir = tempfile::tempdir().expect("IPC socket directory");
+        let socket_dir = test_socket_dir().expect("IPC socket directory");
         let endpoint = bcode_ipc::IpcEndpoint::unix_socket(socket_dir.path().join("source.sock"));
         let listener = LocalIpcListener::bind(&endpoint).expect("IPC listener");
         let server_state = Arc::clone(&state);
@@ -51989,7 +52270,7 @@ mod tests {
         let session_root = tempfile::tempdir().expect("session root");
         let sessions = SessionManager::persistent(session_root.path()).expect("sessions");
         let state = Arc::new(test_server_state(sessions));
-        let socket_dir = tempfile::tempdir().expect("IPC socket directory");
+        let socket_dir = test_socket_dir().expect("IPC socket directory");
         let endpoint = bcode_ipc::IpcEndpoint::unix_socket(socket_dir.path().join("server.sock"));
         let listener = LocalIpcListener::bind(&endpoint).expect("IPC listener");
         let server_state = Arc::clone(&state);
@@ -53068,6 +53349,41 @@ event_symbol = "bcode_plugin_handle_event_v1"
         )
         .await;
         assert_eq!(state.idle_shutdown_blocker().await, None);
+        drop(state);
+    }
+
+    #[tokio::test]
+    async fn idle_shutdown_watcher_preserves_one_client_until_disconnect() {
+        let state = Arc::new(test_server_state(SessionManager::default()));
+        let client = ClientId::new();
+        state.register_client(client).await;
+        // Explicit idle-only stop still exempts its own caller, unlike the watcher.
+        assert!(state.idle_shutdown_blocker().await.is_none());
+        assert!(
+            state
+                .idle_shutdown_blocker_with_client_allowance(0)
+                .await
+                .is_some()
+        );
+        let mut shutdown = state.subscribe_shutdown();
+        state
+            .start_idle_shutdown_watcher(Duration::from_millis(10))
+            .await;
+        assert!(
+            tokio::time::timeout(Duration::from_millis(60), shutdown.recv())
+                .await
+                .is_err()
+        );
+        assert!(!state.shutdown_requested.load(Ordering::SeqCst));
+        state.unregister_client(client).await;
+        tokio::time::timeout(Duration::from_secs(1), shutdown.recv())
+            .await
+            .expect("disconnected daemon reaches idle shutdown")
+            .expect("shutdown channel");
+        state
+            .stop_idle_shutdown_watcher()
+            .await
+            .expect("watcher joined");
         drop(state);
     }
 
@@ -55138,7 +55454,7 @@ library = "test"
             schema_version: 2,
             payload: serde_json::json!(["λ", {"opaque": true}]),
         };
-        let socket_dir = tempfile::tempdir().expect("socket directory");
+        let socket_dir = test_socket_dir().expect("socket directory");
         let endpoint = bcode_ipc::IpcEndpoint::unix_socket(socket_dir.path().join("input.sock"));
         let listener = LocalIpcListener::bind(&endpoint).expect("listener");
         let (shutdown, stopped) = tokio::sync::oneshot::channel();
@@ -68922,7 +69238,7 @@ library = "test"
         request: bcode_workflow::WorkflowRunGraphEditBatch,
         publish: bool,
     ) -> bcode_workflow::WorkflowRunGraphPublicationStatus {
-        let socket_dir = tempfile::tempdir().expect("socket directory");
+        let socket_dir = test_socket_dir().expect("socket directory");
         let endpoint =
             bcode_ipc::IpcEndpoint::unix_socket(socket_dir.path().join("publication.sock"));
         let listener = LocalIpcListener::bind(&endpoint).expect("listener");
@@ -69449,7 +69765,7 @@ library = "test"
                 }),
             };
         let state = Arc::new(state);
-        let socket_dir = tempfile::tempdir().expect("socket directory");
+        let socket_dir = test_socket_dir().expect("socket directory");
         let endpoint =
             bcode_ipc::IpcEndpoint::unix_socket(socket_dir.path().join("registration.sock"));
         let listener = LocalIpcListener::bind(&endpoint).expect("listener");
@@ -70348,7 +70664,7 @@ library = "test"
             direct.id
         );
 
-        let socket_dir = tempfile::tempdir().expect("IPC socket directory");
+        let socket_dir = test_socket_dir().expect("IPC socket directory");
         let endpoint = bcode_ipc::IpcEndpoint::unix_socket(socket_dir.path().join("server.sock"));
         let listener = LocalIpcListener::bind(&endpoint).expect("IPC listener");
         let server_state = Arc::clone(&state);
@@ -70423,7 +70739,7 @@ library = "test"
             .await
             .expect("catalog loaded");
         state.session_catalog.refresh_native_now(&state).await;
-        let socket_dir = tempfile::tempdir().expect("socket directory");
+        let socket_dir = test_socket_dir().expect("socket directory");
         let endpoint = bcode_ipc::IpcEndpoint::unix_socket(socket_dir.path().join("server.sock"));
         let listener = LocalIpcListener::bind(&endpoint).expect("listener");
         let (shutdown, stopped) = tokio::sync::oneshot::channel();
@@ -70561,7 +70877,7 @@ library = "test"
         let session = session_operations::create(&state, None, directory.path().to_path_buf())
             .await
             .expect("session");
-        let socket_dir = tempfile::tempdir().expect("socket directory");
+        let socket_dir = test_socket_dir().expect("socket directory");
         let endpoint = bcode_ipc::IpcEndpoint::unix_socket(socket_dir.path().join("server.sock"));
         let listener = LocalIpcListener::bind(&endpoint).expect("listener");
         let server_state = Arc::clone(&state);
@@ -70676,7 +70992,7 @@ library = "test"
                 .await
                 .expect("direct history around");
 
-        let socket_dir = tempfile::tempdir().expect("IPC socket directory");
+        let socket_dir = test_socket_dir().expect("IPC socket directory");
         let endpoint = bcode_ipc::IpcEndpoint::unix_socket(socket_dir.path().join("server.sock"));
         let listener = LocalIpcListener::bind(&endpoint).expect("IPC listener");
         let server_state = Arc::clone(&state);
@@ -71646,7 +71962,7 @@ library = "test"
     #[tokio::test]
     async fn artifact_invalid_lengths_match_real_ipc_errors() {
         let state = Arc::new(test_server_state(SessionManager::default()));
-        let socket_dir = tempfile::tempdir().expect("artifact socket directory");
+        let socket_dir = test_socket_dir().expect("artifact socket directory");
         let endpoint = bcode_ipc::IpcEndpoint::unix_socket(socket_dir.path().join("server.sock"));
         let listener = LocalIpcListener::bind(&endpoint).expect("artifact listener");
         let (shutdown, stopped) = tokio::sync::oneshot::channel();
@@ -71699,7 +72015,7 @@ library = "test"
         );
         let direct: bcode_model_catalog_models::ModelCatalogDiagnostics =
             server_operations::model_catalog_diagnostics(&state).await;
-        let socket_dir = tempfile::tempdir().expect("diagnostics socket directory");
+        let socket_dir = test_socket_dir().expect("diagnostics socket directory");
         let endpoint = bcode_ipc::IpcEndpoint::unix_socket(socket_dir.path().join("server.sock"));
         let listener = LocalIpcListener::bind(&endpoint).expect("diagnostics listener");
         let (shutdown, stopped) = tokio::sync::oneshot::channel();
@@ -71795,7 +72111,7 @@ event_symbol = "bcode_plugin_handle_event_v1"
             1
         );
 
-        let socket_dir = tempfile::tempdir().expect("IPC socket directory");
+        let socket_dir = test_socket_dir().expect("IPC socket directory");
         let endpoint = bcode_ipc::IpcEndpoint::unix_socket(socket_dir.path().join("server.sock"));
         let listener = LocalIpcListener::bind(&endpoint).expect("IPC listener");
         let (shutdown, stopped) = tokio::sync::oneshot::channel();
@@ -72031,7 +72347,7 @@ event_symbol = "bcode_plugin_handle_event_v1"
         let direct_error =
             session_operations::describe_skill(&state, &missing_id).expect_err("missing skill");
 
-        let socket_dir = tempfile::tempdir().expect("socket directory");
+        let socket_dir = test_socket_dir().expect("socket directory");
         let endpoint = bcode_ipc::IpcEndpoint::unix_socket(socket_dir.path().join("server.sock"));
         let listener = LocalIpcListener::bind(&endpoint).expect("IPC listener");
         let server_state = Arc::clone(&state);
@@ -73481,6 +73797,67 @@ event_symbol = "bcode_plugin_handle_event_v1"
     }
 
     #[test]
+    fn steering_normalizes_only_frozen_routing_representation() {
+        let execution = TurnExecutionOptions::default();
+        for active_frozen in [false, true] {
+            let mut selection = SessionModelSelection::default();
+            selection.provider_context.account_routing_frozen = active_frozen;
+            let turn = RuntimeCurrentTurn {
+                interaction_route: None,
+                kind: RuntimeOperationKind::ModelTurn,
+                client_id: ClientId::new(),
+                turn_id: "frozen-routing-compatibility".into(),
+                cancel_state: Arc::new(TurnCancelState::default()),
+                model: None,
+                agent_profile: None,
+                execution: Some(execution.clone()),
+                selection: Some(selection.clone()),
+            };
+            let mut requested = selection.clone();
+            requested.provider_context.account_routing_frozen = !active_frozen;
+            assert!(turn.accepts_steering(&execution, &requested));
+            assert_eq!(turn.selection.as_ref(), Some(&selection));
+            assert_eq!(
+                requested.provider_context.account_routing_frozen,
+                !active_frozen
+            );
+            let mut changes = Vec::new();
+            let mut context = requested.provider_context.clone();
+            context.auth = Some(bcode_model::ProviderAuthContext::default());
+            changes.push(context);
+            let mut context = requested.provider_context.clone();
+            context.auth_profile = Some("different-profile".into());
+            changes.push(context);
+            let mut context = requested.provider_context.clone();
+            context
+                .auth_candidates
+                .push(bcode_model::ProviderAuthCandidate::default());
+            changes.push(context);
+            let mut context = requested.provider_context.clone();
+            context.auth_pool = Some("different-pool".into());
+            changes.push(context);
+            let mut context = requested.provider_context.clone();
+            context.auth_pool_routing.strategy = Some("different-strategy".into());
+            changes.push(context);
+            let mut context = requested.provider_context.clone();
+            context.env.insert("DIFFERENT_ENV".into(), "fixture".into());
+            changes.push(context);
+            for provider_context in changes {
+                let incompatible_selection = SessionModelSelection {
+                    provider_context,
+                    ..requested.clone()
+                };
+                assert!(!turn.accepts_steering(&execution, &incompatible_selection));
+            }
+            let changed_execution = TurnExecutionOptions {
+                permission_mode: bcode_session_models::TurnPermissionMode::Bypass,
+                ..execution.clone()
+            };
+            assert!(!turn.accepts_steering(&changed_execution, &requested));
+        }
+    }
+
+    #[test]
     fn steering_requires_immutable_execution_compatibility() {
         let execution = TurnExecutionOptions::default();
         let mut turn = RuntimeCurrentTurn {
@@ -74069,6 +74446,67 @@ event_symbol = "bcode_plugin_handle_event_v1"
         .expect("terminal turn");
     }
 
+    fn steering_end_turn_gate_context(gate: &str) -> bcode_model::ProviderRequestContext {
+        let script = bcode_fake_provider_plugin::FakeProviderEventScript {
+            steps: vec![
+                bcode_fake_provider_plugin::FakeProviderEventScriptStep {
+                    gate: None,
+                    delay_ms: None,
+                    event: ProviderTurnEvent::TextDelta {
+                        text: "first".into(),
+                    },
+                },
+                bcode_fake_provider_plugin::FakeProviderEventScriptStep {
+                    gate: Some(gate.to_owned()),
+                    delay_ms: None,
+                    event: ProviderTurnEvent::TurnFinished {
+                        stop_reason: bcode_model::StopReason::EndTurn,
+                    },
+                },
+            ],
+        };
+        bcode_model::ProviderRequestContext {
+            settings: BTreeMap::from([(
+                "fake_event_script".into(),
+                serde_json::to_string(&script).unwrap(),
+            )]),
+            ..bcode_model::ProviderRequestContext::default()
+        }
+    }
+
+    async fn wait_for_steering_end_turn_gate(
+        state: &ServerState,
+        session_id: SessionId,
+        gate: &str,
+    ) {
+        let reached = tokio::time::timeout(
+            Duration::from_secs(5),
+            bcode_fake_provider_plugin::wait_for_fake_event_script_gate_ready(gate),
+        )
+        .await;
+        let active = state
+            .session_current_turn(session_id)
+            .await
+            .is_some_and(|turn| turn.model.is_some());
+        let history = state.sessions.session_history(session_id).await.unwrap();
+        let finished = history
+            .iter()
+            .any(|event| matches!(event.kind, SessionEventKind::ModelTurnFinished { .. }));
+        if reached.is_err() || !active || finished {
+            bcode_fake_provider_plugin::release_fake_event_script_gate(gate);
+            bcode_fake_provider_plugin::forget_fake_event_script_gate_ready(gate);
+        }
+        reached.expect("first provider completion must reach this fixture's held gate");
+        assert!(
+            active,
+            "first model turn must still be active at the provider gate"
+        );
+        assert!(
+            !finished,
+            "steering must be submitted before the first EndTurn"
+        );
+    }
+
     #[tokio::test]
     async fn streaming_steering_continues_same_turn_after_end_turn() {
         let sessions = SessionManager::default();
@@ -74077,10 +74515,8 @@ event_symbol = "bcode_plugin_handle_event_v1"
             .await
             .unwrap();
         let state = Arc::new(test_server_state_with_fake_provider(sessions));
-        let mut provider_context = bcode_model::ProviderRequestContext::default();
-        provider_context
-            .settings
-            .insert("fake_turn_delay_ms".into(), "250".into());
+        let gate = format!("streaming-steering-end-turn-{}", session.id);
+        let provider_context = steering_end_turn_gate_context(&gate);
         state.session_model_selections.lock().await.insert(
             session.id,
             SessionModelSelection {
@@ -74103,6 +74539,7 @@ event_symbol = "bcode_plugin_handle_event_v1"
         .await
         .unwrap();
         wait_for_streaming_turn(&state, session.id).await;
+        wait_for_steering_end_turn_gate(&state, session.id, &gate).await;
         let steering = enqueue_prompt_submission(
             &state,
             session.id,
@@ -74110,12 +74547,16 @@ event_symbol = "bcode_plugin_handle_event_v1"
             bcode_session_models::SubmissionId("stream-steer".into()),
             "second".into(),
             bcode_session_models::SubmissionPlacement::Steer,
-            false,
+            true,
             bcode_session_models::TurnAdmissionMetadata::default(),
         )
-        .await
-        .unwrap();
+        .await;
+        // Completion stays provider-held until steering admission returns. Release even on
+        // admission failure, without resetting gates belonging to any other fixture.
+        bcode_fake_provider_plugin::release_fake_event_script_gate(&gate);
+        let steering = steering.unwrap();
         wait_for_terminal_turn(&state, session.id).await;
+        bcode_fake_provider_plugin::forget_fake_event_script_gate_ready(&gate);
         let first = state
             .sessions
             .submission(session.id, initial.submission_id)
@@ -75051,6 +75492,7 @@ event_symbol = "bcode_plugin_handle_event_v1"
             cancel_state,
             None,
             false,
+            None,
         )
         .await
     }
@@ -75519,7 +75961,7 @@ event_symbol = "bcode_plugin_handle_event_v1"
             },
         );
         assert_routed_exchange(&state, source, destination).await;
-        let socket_dir = tempfile::tempdir().unwrap();
+        let socket_dir = test_socket_dir().unwrap();
         let endpoint = bcode_ipc::IpcEndpoint::unix_socket(socket_dir.path().join("routed.sock"));
         let listener = LocalIpcListener::bind(&endpoint).unwrap();
         let server_state = Arc::clone(&state);
@@ -78314,7 +78756,7 @@ event_symbol = "bcode_plugin_handle_event_v1"
         let (mut state,) = (test_server_state_with_shell_plugin(sessions),);
         state.trace_store = TraceStore::new(workspace.path().join("traces"));
         let state = Arc::new(state);
-        let socket_dir = tempfile::tempdir().unwrap();
+        let socket_dir = test_socket_dir().unwrap();
         let (mut connection, server) =
             cancellation_test_client(&state, session_id, socket_dir.path()).await;
         let cancel_state = Arc::new(TurnCancelState::default());
@@ -78952,7 +79394,7 @@ event_symbol = "bcode_plugin_handle_event_v1"
 
         let sessions = SessionManager::persistent(&session_root).expect("restored sessions");
         let state = Arc::new(test_server_state(sessions));
-        let socket_dir = tempfile::tempdir().expect("IPC socket directory");
+        let socket_dir = test_socket_dir().expect("IPC socket directory");
         let endpoint = bcode_ipc::IpcEndpoint::unix_socket(socket_dir.path().join("server.sock"));
         let listener = LocalIpcListener::bind(&endpoint).expect("IPC listener");
         let server_state = Arc::clone(&state);
@@ -79024,7 +79466,7 @@ event_symbol = "bcode_plugin_handle_event_v1"
 
         let sessions = SessionManager::persistent(&session_root).expect("restored sessions");
         let state = Arc::new(test_server_state(sessions));
-        let socket_dir = tempfile::tempdir().expect("IPC socket directory");
+        let socket_dir = test_socket_dir().expect("IPC socket directory");
         let endpoint = bcode_ipc::IpcEndpoint::unix_socket(socket_dir.path().join("server.sock"));
         let listener = LocalIpcListener::bind(&endpoint).expect("IPC listener");
         let server_state = Arc::clone(&state);
@@ -79101,7 +79543,7 @@ event_symbol = "bcode_plugin_handle_event_v1"
 
         let sessions = SessionManager::persistent(&session_root).expect("restored sessions");
         let state = Arc::new(test_server_state(sessions));
-        let socket_dir = tempfile::tempdir().expect("IPC socket directory");
+        let socket_dir = test_socket_dir().expect("IPC socket directory");
         let endpoint = bcode_ipc::IpcEndpoint::unix_socket(socket_dir.path().join("server.sock"));
         let listener = LocalIpcListener::bind(&endpoint).expect("IPC listener");
         let server_state = Arc::clone(&state);
@@ -79240,7 +79682,7 @@ event_symbol = "bcode_plugin_handle_event_v1"
             );
             Arc::new(state)
         };
-        let socket_dir = tempfile::tempdir().expect("IPC socket directory");
+        let socket_dir = test_socket_dir().expect("IPC socket directory");
         let endpoint = bcode_ipc::IpcEndpoint::unix_socket(socket_dir.path().join("server.sock"));
         let listener = LocalIpcListener::bind(&endpoint).expect("IPC listener");
         let server_state = Arc::clone(&state);
@@ -79765,7 +80207,7 @@ event_symbol = "bcode_plugin_handle_event_v1"
             .await
             .expect("other session");
         let state = Arc::new(test_server_state(sessions));
-        let socket_dir = tempfile::tempdir().expect("IPC socket directory");
+        let socket_dir = test_socket_dir().expect("IPC socket directory");
         let endpoint = bcode_ipc::IpcEndpoint::unix_socket(socket_dir.path().join("server.sock"));
         let listener = LocalIpcListener::bind(&endpoint).expect("IPC listener");
         let server_state = Arc::clone(&state);
@@ -80079,7 +80521,7 @@ event_symbol = "bcode_plugin_handle_event_v1"
             .expect("append lifecycle event");
 
         let state = Arc::new(test_server_state(sessions));
-        let socket_dir = tempfile::tempdir().expect("IPC socket directory");
+        let socket_dir = test_socket_dir().expect("IPC socket directory");
         let endpoint = bcode_ipc::IpcEndpoint::unix_socket(socket_dir.path().join("server.sock"));
         let listener = LocalIpcListener::bind(&endpoint).expect("IPC listener");
         let server_state = Arc::clone(&state);
@@ -80172,7 +80614,7 @@ event_symbol = "bcode_plugin_handle_event_v1"
             .expect("session");
         let session_id = session.id;
         let state = Arc::new(test_server_state(sessions));
-        let socket_dir = tempfile::tempdir().expect("IPC socket directory");
+        let socket_dir = test_socket_dir().expect("IPC socket directory");
         let endpoint = bcode_ipc::IpcEndpoint::unix_socket(socket_dir.path().join("server.sock"));
         let listener = LocalIpcListener::bind(&endpoint).expect("IPC listener");
         let server_state = Arc::clone(&state);
@@ -80534,7 +80976,7 @@ event_symbol = "bcode_plugin_handle_event_v1"
 
     #[tokio::test(start_paused = true)]
     async fn session_forwarder_flushes_due_frame_before_ready_live_input_drains() {
-        let socket_dir = tempfile::tempdir().expect("IPC socket directory");
+        let socket_dir = test_socket_dir().expect("IPC socket directory");
         let endpoint = bcode_ipc::IpcEndpoint::unix_socket(socket_dir.path().join("fairness.sock"));
         let metrics = MetricsRegistry::default();
         let (writer, _peer, _listener) = fairness_test_writer(&endpoint, metrics.clone()).await;
@@ -80645,7 +81087,7 @@ event_symbol = "bcode_plugin_handle_event_v1"
             .expect("session");
         let session_id = session.id;
         let state = Arc::new(test_server_state(sessions));
-        let socket_dir = tempfile::tempdir().expect("IPC socket directory");
+        let socket_dir = test_socket_dir().expect("IPC socket directory");
         let endpoint = bcode_ipc::IpcEndpoint::unix_socket(socket_dir.path().join("server.sock"));
         let listener = LocalIpcListener::bind(&endpoint).expect("IPC listener");
         let server_state = Arc::clone(&state);
@@ -80805,7 +81247,7 @@ event_symbol = "bcode_plugin_handle_event_v1"
             .expect("session")
             .id;
         let state = Arc::new(test_server_state(sessions));
-        let socket_dir = tempfile::tempdir().expect("IPC socket directory");
+        let socket_dir = test_socket_dir().expect("IPC socket directory");
         let endpoint = bcode_ipc::IpcEndpoint::unix_socket(socket_dir.path().join("server.sock"));
         let listener = LocalIpcListener::bind(&endpoint).expect("IPC listener");
         let server_state = Arc::clone(&state);
@@ -81009,7 +81451,7 @@ event_symbol = "bcode_plugin_handle_event_v1"
             .await
             .insert("permission-ipc".to_owned(), pending);
 
-        let socket_dir = tempfile::tempdir().expect("IPC socket directory");
+        let socket_dir = test_socket_dir().expect("IPC socket directory");
         let endpoint = bcode_ipc::IpcEndpoint::unix_socket(socket_dir.path().join("server.sock"));
         let listener = LocalIpcListener::bind(&endpoint).expect("IPC listener");
         let server_state = Arc::clone(&state);
@@ -81155,7 +81597,7 @@ event_symbol = "bcode_plugin_handle_event_v1"
                 .ok()
                 .map(|(_path, digest)| digest);
         let state = Arc::new(state);
-        let socket_dir = tempfile::tempdir().expect("IPC socket directory");
+        let socket_dir = test_socket_dir().expect("IPC socket directory");
         let endpoint = bcode_ipc::IpcEndpoint::unix_socket(socket_dir.path().join("server.sock"));
         let listener = LocalIpcListener::bind(&endpoint).expect("IPC listener");
         let server_state = Arc::clone(&state);
@@ -81707,7 +82149,7 @@ event_symbol = "bcode_plugin_handle_event_v1"
             "question-call-question"
         );
 
-        let socket_dir = tempfile::tempdir().expect("IPC socket directory");
+        let socket_dir = test_socket_dir().expect("IPC socket directory");
         let endpoint = bcode_ipc::IpcEndpoint::unix_socket(socket_dir.path().join("server.sock"));
         let listener = LocalIpcListener::bind(&endpoint).expect("IPC listener");
         let server_state = Arc::clone(&state);
@@ -82658,7 +83100,7 @@ event_symbol = "bcode_plugin_handle_event_v1"
     async fn judgement_operation_stops_when_client_disconnects() {
         let state = Arc::new(test_server_state(SessionManager::default()));
         let (request_end, _) = tokio::sync::watch::channel(false);
-        let socket_dir = tempfile::tempdir().expect("IPC socket directory");
+        let socket_dir = test_socket_dir().expect("IPC socket directory");
         let endpoint = bcode_ipc::IpcEndpoint::unix_socket(socket_dir.path().join("server.sock"));
         let listener = LocalIpcListener::bind(&endpoint).expect("IPC listener");
         let connecting =
@@ -82845,7 +83287,7 @@ event_symbol = "bcode_plugin_handle_event_v1"
             },
         );
         let state = Arc::new(server_state);
-        let socket_dir = tempfile::tempdir().expect("IPC directory");
+        let socket_dir = test_socket_dir().expect("IPC directory");
         let endpoint = bcode_ipc::IpcEndpoint::unix_socket(socket_dir.path().join("server.sock"));
         let listener = LocalIpcListener::bind(&endpoint).expect("IPC listener");
         let (shutdown, stopped) = tokio::sync::oneshot::channel();
@@ -82937,7 +83379,7 @@ event_symbol = "bcode_plugin_handle_event_v1"
         let mut server_state = test_server_state(SessionManager::default());
         server_state.plugins = plugins;
         let state = Arc::new(server_state);
-        let socket_dir = tempfile::tempdir().expect("IPC directory");
+        let socket_dir = test_socket_dir().expect("IPC directory");
         let endpoint = bcode_ipc::IpcEndpoint::unix_socket(socket_dir.path().join("server.sock"));
         let listener = LocalIpcListener::bind(&endpoint).expect("IPC listener");
         let (shutdown, stopped) = tokio::sync::oneshot::channel();
@@ -83077,7 +83519,7 @@ event_symbol = "bcode_plugin_handle_event_v1"
             },
         );
         let state = Arc::new(server_state);
-        let socket_dir = tempfile::tempdir().expect("IPC socket directory");
+        let socket_dir = test_socket_dir().expect("IPC socket directory");
         let endpoint = bcode_ipc::IpcEndpoint::unix_socket(socket_dir.path().join("server.sock"));
         let listener = LocalIpcListener::bind(&endpoint).expect("IPC listener");
         let (shutdown, stopped) = tokio::sync::oneshot::channel();
@@ -84256,7 +84698,7 @@ event_symbol = "bcode_plugin_handle_event_v1"
     #[cfg(unix)]
     #[tokio::test]
     async fn embedded_resolved_locations_initialize_only_the_supplied_roots() {
-        let directory = tempfile::tempdir().expect("temporary directory");
+        let directory = test_socket_dir().expect("temporary directory");
         let ready = tokio::sync::Barrier::new(2);
         let created = tokio::sync::Barrier::new(2);
         let directory = &directory;
@@ -85103,7 +85545,7 @@ event_symbol = "bcode_plugin_handle_event_v1"
                 .all(|event| user_message_text(event).is_none())
         );
         if cancel {
-            let socket_root = tempfile::tempdir().expect("socket root");
+            let socket_root = test_socket_dir().expect("socket root");
             let endpoint =
                 bcode_ipc::IpcEndpoint::unix_socket(socket_root.path().join("cancel.sock"));
             let listener = LocalIpcListener::bind(&endpoint).expect("listener");
@@ -85175,6 +85617,15 @@ event_symbol = "bcode_plugin_handle_event_v1"
 
     #[allow(clippy::too_many_lines, clippy::items_after_statements)]
     async fn verify_startup_admission_reuse(mixed: bool) {
+        const SECOND_TURN_MARKER: &str = "startup-mixed-second-held-provider";
+        struct HeldSecondTurn(String);
+        impl Drop for HeldSecondTurn {
+            fn drop(&mut self) {
+                bcode_fake_provider_plugin::release_fake_event_script_gate(&self.0);
+                bcode_fake_provider_plugin::forget_fake_event_script_gate_ready(&self.0);
+            }
+        }
+
         let session_root = tempfile::tempdir().expect("session root");
         let workflow_root = tempfile::tempdir().expect("workflow root");
         let process_root = std::env::var_os("BCODE_TEST_ADMISSION_PROCESS_ROOT").map(PathBuf::from);
@@ -85238,6 +85689,11 @@ event_symbol = "bcode_plugin_handle_event_v1"
             let mut second = definition.nodes["agent"].clone();
             second.id = "second".into();
             second.name = "second".into();
+            let original_prompt = second.configuration["system_prompt"]
+                .as_str()
+                .expect("second prompt");
+            second.configuration["system_prompt"] =
+                serde_json::Value::String(format!("{original_prompt}\n{SECOND_TURN_MARKER}"));
             definition.nodes.insert("second".into(), second);
             definition.entries.push("second".into());
             definition.exits.push("second".into());
@@ -85276,7 +85732,32 @@ event_symbol = "bcode_plugin_handle_event_v1"
             .selected_provider_context
             .settings
             .insert("fake_structured_output_json".to_string(), "0".to_string());
-        if mixed {
+        let mut held_second_turn = None;
+        if mixed && process_root.is_none() {
+            let held = HeldSecondTurn(uuid::Uuid::new_v4().to_string());
+            let script = bcode_fake_provider_plugin::FakeProviderEventScript {
+                steps: vec![
+                    bcode_fake_provider_plugin::FakeProviderEventScriptStep {
+                        gate: Some(held.0.clone()),
+                        delay_ms: None,
+                        event: bcode_model::ProviderTurnEvent::TextDelta { text: "0".into() },
+                    },
+                    bcode_fake_provider_plugin::FakeProviderEventScriptStep {
+                        gate: None,
+                        delay_ms: None,
+                        event: bcode_model::ProviderTurnEvent::TurnFinished {
+                            stop_reason: bcode_model::StopReason::EndTurn,
+                        },
+                    },
+                ],
+            };
+            state.selected_provider_context.settings.insert(
+                "fake_event_scripts_by_prompt_marker".into(),
+                serde_json::to_string(&BTreeMap::from([(SECOND_TURN_MARKER, script)]))
+                    .expect("second-turn script"),
+            );
+            held_second_turn = Some(held);
+        } else if mixed {
             state
                 .selected_provider_context
                 .settings
@@ -85293,6 +85774,14 @@ event_symbol = "bcode_plugin_handle_event_v1"
                 .set(wake_sender)
                 .expect("hold driver wakes for startup");
         }
+        // Completion observers continue runs directly, independently of held wake
+        // messages. Fence this run while constructing the interrupted admissions.
+        let admission_gate = workflow_drive_gate(&state, "redispatch-run");
+        let exclusive_workflow_admission = if mixed && process_root.is_none() {
+            Some(admission_gate.lock().await)
+        } else {
+            None
+        };
         let store_path = state
             .workflow_store
             .lock()
@@ -85430,6 +85919,14 @@ event_symbol = "bcode_plugin_handle_event_v1"
                     .await
                     .is_err()
                 );
+                tokio::time::timeout(
+                    Duration::from_secs(15),
+                    bcode_fake_provider_plugin::wait_for_fake_event_script_gate_ready(
+                        &held_second_turn.as_ref().expect("second-turn gate").0,
+                    ),
+                )
+                .await
+                .expect("second accepted turn reaches held provider gate");
                 assert!(
                     !state
                         .workflow_store
@@ -85461,6 +85958,10 @@ event_symbol = "bcode_plugin_handle_event_v1"
                 assert!(page.deferred, "live genuine admission must defer");
             }
         }
+        // The explicit recovery page above runs under the same run-scoped fence.
+        // Startup restoration acquires that fence itself; release before invoking it.
+        drop(exclusive_workflow_admission);
+        drop(admission_gate);
         let children_before = state
             .sessions
             .all_session_summaries()
@@ -85497,6 +85998,9 @@ event_symbol = "bcode_plugin_handle_event_v1"
                     .any(|attempt| attempt.status == "admitted" && attempt.has_receipt),
                 "{attempts:?}"
             );
+            // The second turn cannot finish until startup has proved the mixed
+            // completed/live receipt state. Release only before final recovery.
+            drop(held_second_turn.take());
             let attempts = tokio::time::timeout(Duration::from_secs(15), async {
                 loop {
                     restore_workflow_runtime_work(&state).await;
@@ -89677,7 +90181,7 @@ event_symbol = "bcode_plugin_handle_event_v1"
             .expect("unique state")
             .workflow_store_unavailable =
             StdMutex::new(Some("workflow maintenance required".into()));
-        let socket_dir = tempfile::tempdir().expect("socket directory");
+        let socket_dir = test_socket_dir().expect("socket directory");
         let endpoint = bcode_ipc::IpcEndpoint::unix_socket(socket_dir.path().join("server.sock"));
         let listener = LocalIpcListener::bind(&endpoint).expect("listener");
         let server_state = Arc::clone(&state);
@@ -89727,7 +90231,7 @@ event_symbol = "bcode_plugin_handle_event_v1"
             .workflow_initialization
             .lock()
             .expect("initialization") = Some(receiver);
-        let socket_dir = tempfile::tempdir().expect("socket directory");
+        let socket_dir = test_socket_dir().expect("socket directory");
         let endpoint = bcode_ipc::IpcEndpoint::unix_socket(socket_dir.path().join("server.sock"));
         let listener = LocalIpcListener::bind(&endpoint).expect("listener");
         let server_state = Arc::clone(&state);
@@ -90613,8 +91117,19 @@ event_symbol = "bcode_plugin_handle_event_v1"
         verify_orphaned_workflow_cancellation(true, true).await;
     }
 
-    #[allow(clippy::too_many_lines)]
     async fn verify_orphaned_workflow_cancellation(terminal_evidence: bool, recovery_only: bool) {
+        Box::pin(verify_orphaned_workflow_cancellation_inner(
+            terminal_evidence,
+            recovery_only,
+        ))
+        .await;
+    }
+
+    #[allow(clippy::too_many_lines)]
+    async fn verify_orphaned_workflow_cancellation_inner(
+        terminal_evidence: bool,
+        recovery_only: bool,
+    ) {
         let sessions = SessionManager::default();
         let parent = sessions
             .create_session(
@@ -92027,7 +92542,7 @@ event_symbol = "bcode_plugin_handle_event_v1"
         let state = Arc::new(test_server_state_with_fake_provider_and_workflow_store(
             sessions, store,
         ));
-        let socket_dir = tempfile::tempdir().expect("IPC socket directory");
+        let socket_dir = test_socket_dir().expect("IPC socket directory");
         let endpoint = bcode_ipc::IpcEndpoint::unix_socket(socket_dir.path().join("server.sock"));
         let listener = LocalIpcListener::bind(&endpoint).expect("IPC listener");
         let server_state = Arc::clone(&state);
@@ -92445,7 +92960,7 @@ event_symbol = "bcode_plugin_handle_event_v1"
         let state = Arc::new(test_server_state_with_fake_provider_and_workflow_store(
             sessions, store,
         ));
-        let socket_dir = tempfile::tempdir().expect("socket directory");
+        let socket_dir = test_socket_dir().expect("socket directory");
         let endpoint = bcode_ipc::IpcEndpoint::unix_socket(socket_dir.path().join("server.sock"));
         let listener = LocalIpcListener::bind(&endpoint).expect("listener");
         let server_state = Arc::clone(&state);
@@ -92823,7 +93338,7 @@ event_symbol = "bcode_plugin_handle_event_v1"
         .into_iter()
         .next()
         .expect("input wait");
-        let socket_dir = tempfile::tempdir().expect("IPC socket directory");
+        let socket_dir = test_socket_dir().expect("IPC socket directory");
         let endpoint = bcode_ipc::IpcEndpoint::unix_socket(socket_dir.path().join("server.sock"));
         let listener = LocalIpcListener::bind(&endpoint).expect("IPC listener");
         let server_state = Arc::clone(&state);
@@ -93213,7 +93728,7 @@ event_symbol = "bcode_plugin_handle_event_v1"
             .expect("waits")
             .pop()
             .expect("wait");
-        let socket_dir = tempfile::tempdir().expect("IPC socket directory");
+        let socket_dir = test_socket_dir().expect("IPC socket directory");
         let endpoint = bcode_ipc::IpcEndpoint::unix_socket(socket_dir.path().join("server.sock"));
         let listener = LocalIpcListener::bind(&endpoint).expect("IPC listener");
         let server_state = Arc::clone(&state);
@@ -93260,7 +93775,7 @@ event_symbol = "bcode_plugin_handle_event_v1"
     }
 
     async fn assert_staging_over_ipc(state: &Arc<ServerState>, run_id: &str) {
-        let socket_dir = tempfile::tempdir().expect("socket directory");
+        let socket_dir = test_socket_dir().expect("socket directory");
         let endpoint = bcode_ipc::IpcEndpoint::unix_socket(socket_dir.path().join("stage.sock"));
         let listener = LocalIpcListener::bind(&endpoint).expect("listener");
         let server_state = Arc::clone(state);
@@ -94999,7 +95514,7 @@ event_symbol = "bcode_plugin_handle_event_v1"
                     }
                 }),
             };
-        let root = tempfile::tempdir().expect("socket root");
+        let root = test_socket_dir().expect("socket root");
         let endpoint = bcode_ipc::IpcEndpoint::unix_socket(root.path().join("apply.sock"));
         let listener = LocalIpcListener::bind(&endpoint).expect("listener");
         let (shutdown, stopped) = tokio::sync::oneshot::channel();
@@ -95129,7 +95644,7 @@ event_symbol = "bcode_plugin_handle_event_v1"
         let state = unavailable_workflow_state();
         assert_workflow_creation_absent(&state);
         let observed_state = Arc::clone(&state);
-        let socket_dir = tempfile::tempdir().expect("socket directory");
+        let socket_dir = test_socket_dir().expect("socket directory");
         let endpoint =
             bcode_ipc::IpcEndpoint::unix_socket(socket_dir.path().join("definitions.sock"));
         let listener = LocalIpcListener::bind(&endpoint).expect("listener");
@@ -95356,7 +95871,7 @@ event_symbol = "bcode_plugin_handle_event_v1"
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn observed_template_launch_dispatches_over_real_ipc_on_default_workers() {
-        let root = tempfile::tempdir().expect("plugin and workflow root");
+        let root = test_socket_dir().expect("plugin and workflow root");
         let sessions_root = tempfile::tempdir().expect("sessions root");
         let state = observed_template_test_state(root.path(), sessions_root.path());
         let parent = observed_template_test_parent(&state, root.path()).await;
@@ -95459,7 +95974,7 @@ event_symbol = "bcode_plugin_handle_event_v1"
 
     #[tokio::test]
     async fn external_template_start_is_inspectable_over_ipc() {
-        let root = tempfile::tempdir().expect("plugin root");
+        let root = test_socket_dir().expect("plugin root");
         let state = external_template_test_state(root.path());
         let parent = state
             .sessions
@@ -95556,7 +96071,7 @@ event_symbol = "bcode_plugin_handle_event_v1"
 
     #[tokio::test]
     async fn external_template_instantiation_returns_persisted_draft_over_ipc() {
-        let root = tempfile::tempdir().expect("plugin root");
+        let root = test_socket_dir().expect("plugin root");
         let state = external_template_test_state(root.path());
         let preview = workflow_operations::authoring_catalog(&state)
             .await
@@ -95694,7 +96209,7 @@ event_symbol = "bcode_plugin_handle_event_v1"
                 .pop()
                 .expect("template")
                 .into();
-        let socket_dir = tempfile::tempdir().expect("socket directory");
+        let socket_dir = test_socket_dir().expect("socket directory");
         let endpoint =
             bcode_ipc::IpcEndpoint::unix_socket(socket_dir.path().join("templates.sock"));
         let listener = LocalIpcListener::bind(&endpoint).expect("listener");
@@ -95764,7 +96279,7 @@ event_symbol = "bcode_plugin_handle_event_v1"
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .persist_definition("typed-inspection", 1, workflow.definition())
             .expect("persist");
-        let socket_dir = tempfile::tempdir().expect("socket directory");
+        let socket_dir = test_socket_dir().expect("socket directory");
         let endpoint = bcode_ipc::IpcEndpoint::unix_socket(socket_dir.path().join("typed.sock"));
         let listener = LocalIpcListener::bind(&endpoint).expect("listener");
         let (shutdown, stopped) = tokio::sync::oneshot::channel();
@@ -95803,7 +96318,7 @@ event_symbol = "bcode_plugin_handle_event_v1"
     async fn workflow_definition_queries_preserve_exact_versions_over_ipc() {
         let state = Arc::new(test_server_state(SessionManager::default()));
         let fixture_state = Arc::clone(&state);
-        let socket_dir = tempfile::tempdir().expect("IPC socket directory");
+        let socket_dir = test_socket_dir().expect("IPC socket directory");
         let endpoint =
             bcode_ipc::IpcEndpoint::unix_socket(socket_dir.path().join("definitions.sock"));
         let listener = LocalIpcListener::bind(&endpoint).expect("IPC listener");
@@ -95927,7 +96442,7 @@ event_symbol = "bcode_plugin_handle_event_v1"
                 })
                 .expect("run");
         }
-        let socket_dir = tempfile::tempdir().expect("IPC socket directory");
+        let socket_dir = test_socket_dir().expect("IPC socket directory");
         let endpoint = bcode_ipc::IpcEndpoint::unix_socket(socket_dir.path().join("reads.sock"));
         let listener = LocalIpcListener::bind(&endpoint).expect("IPC listener");
         let server = tokio::spawn(async move {
@@ -96380,7 +96895,7 @@ event_symbol = "bcode_plugin_handle_event_v1"
             .await
             .expect("direct history");
 
-        let socket_dir = tempfile::tempdir().expect("IPC socket directory");
+        let socket_dir = test_socket_dir().expect("IPC socket directory");
         let endpoint = bcode_ipc::IpcEndpoint::unix_socket(socket_dir.path().join("server.sock"));
         let listener = LocalIpcListener::bind(&endpoint).expect("IPC listener");
         let (shutdown, stopped) = tokio::sync::oneshot::channel();
@@ -100365,11 +100880,12 @@ event_symbol = "bcode_plugin_handle_event_v1"
     #[allow(clippy::too_many_lines)]
     async fn proactive_local_compaction_runs_inside_owning_model_turn() {
         let temp_dir = tempfile::tempdir().expect("temp dir");
+        let compaction_cwd = tempfile::tempdir().expect("isolated compaction cwd");
         let sessions = SessionManager::persistent(temp_dir.path()).expect("persistent sessions");
         let summary = sessions
             .create_session(
                 Some("proactive runtime".to_owned()),
-                test_working_directory(),
+                compaction_cwd.path().to_path_buf(),
             )
             .await
             .expect("session should be created");
@@ -100383,7 +100899,7 @@ event_symbol = "bcode_plugin_handle_event_v1"
             )
             .await
             .expect("select fake provider");
-        for index in 0..14 {
+        for index in 0..56 {
             sessions
                 .append_event(
                     session_id,
@@ -100411,7 +100927,14 @@ event_symbol = "bcode_plugin_handle_event_v1"
                 SessionEventKind::UserMessage {
                     client_id: ClientId::new(),
                     text: "continue after proactive compaction".to_string(),
-                    admission: bcode_session_models::TurnAdmissionMetadata::default(),
+                    admission: bcode_session_models::TurnAdmissionMetadata {
+                        execution: bcode_session_models::TurnExecutionOptions {
+                            // Exercise history compaction, not the bundled tool catalog's size.
+                            tool_allowlist: Some(Vec::new()),
+                            ..bcode_session_models::TurnExecutionOptions::default()
+                        },
+                        ..bcode_session_models::TurnAdmissionMetadata::default()
+                    },
                 },
             )
             .await
@@ -100453,6 +100976,70 @@ event_symbol = "bcode_plugin_handle_event_v1"
             state.startup_config.model.compaction.keep_recent_tokens = 1;
             state
         });
+        let selection = SessionModelSelection {
+            provider_plugin_id: Some("bcode.fake-provider".into()),
+            model_id: Some("fake-echo".into()),
+            provider_context: state.selected_provider_context.clone(),
+            ..SessionModelSelection::default()
+        };
+        let history = state
+            .sessions
+            .session_history(session_id)
+            .await
+            .expect("fixture history");
+        let cancel = TurnCancelState::default();
+        let before = context_compaction_request_budget::project(
+            &state, session_id, &selection, &history, &cancel,
+        )
+        .await
+        .expect("complete pre-compaction request");
+        assert!(
+            before.tools.is_empty(),
+            "the actual request must honor the empty allowlist"
+        );
+        assert!(
+            request_exceeds_compaction_capacity(
+                &state,
+                session_id,
+                &selection,
+                &before,
+                local_request_estimate(&before).tokens
+            )
+            .await
+            .is_some(),
+            "history must exceed the unchanged model threshold"
+        );
+        let boundary = history
+            .iter()
+            .rev()
+            .find(|event| matches!(event.kind, SessionEventKind::AssistantMessage { .. }))
+            .expect("historical boundary")
+            .sequence;
+        let replaced = context_compaction_request_budget::replaced_history(
+            &history,
+            boundary,
+            "Older synthetic historical pairs; no tools or changes.",
+        )
+        .expect("replace complete prefix");
+        let after = context_compaction_request_budget::project(
+            &state, session_id, &selection, &replaced, &cancel,
+        )
+        .await
+        .expect("complete post-compaction request");
+        assert!(
+            request_exceeds_compaction_capacity(
+                &state,
+                session_id,
+                &selection,
+                &after,
+                local_request_estimate(&after).tokens
+            )
+            .await
+            .is_none(),
+            "retained request plus summary must fit before testing execution"
+        );
+        drop((before, after, history));
+
         let mut permit = SessionTurnPermit::new(session_id);
         let (_followup_tx, mut followup_rx) = mpsc::channel(1);
         let (_steering_tx, mut steering_rx) = mpsc::channel(1);
@@ -100932,6 +101519,71 @@ event_symbol = "bcode_plugin_handle_event_v1"
         drop(state);
     }
 
+    async fn assert_large_followup_summary_prefit(
+        state: &ServerState,
+        session_id: SessionId,
+        selection: &SessionModelSelection,
+        history: &[SessionEvent],
+    ) {
+        let plan = context_compaction::structural_compaction_plan_with_policy(
+            history,
+            state.startup_config.model.tool_output.context_chars,
+            context_compaction::CompactionPlanningPolicy::Proactive {
+                keep_recent_tokens: 1,
+            },
+        )
+        .expect("complete historical prefix with protected active tool turn");
+        let summary = serde_json::json!({
+            "format":"bcode.compaction.scope.v2", "current_scope":[],
+            "continuation":serde_json::json!({
+                "format":"bcode.compaction.continuation-sections.v1", "decisions":"",
+                "active_work_blockers":"", "findings_evidence":"",
+                "background":"Deterministic fake-provider compaction simulation."
+            }).to_string()
+        })
+        .to_string();
+        let retained = context_compaction_request_budget::replaced_history(
+            history,
+            plan.compacted_through_sequence,
+            &summary,
+        )
+        .expect("complete valid retained envelope");
+        let request = context_compaction_request_budget::project(
+            state,
+            session_id,
+            selection,
+            &retained,
+            &TurnCancelState::default(),
+        )
+        .await
+        .expect("canonical retained request projection");
+        assert!(request.messages.iter().flat_map(|message| &message.content).any(|block| {
+                matches!(block, ContentBlock::ToolResult { result } if result.output == "z".repeat(20_000))
+            }), "prefit must preserve the complete active 20k tool result");
+        assert!(
+            request_exceeds_compaction_capacity(
+                state,
+                session_id,
+                selection,
+                &request,
+                local_request_estimate(&request).tokens,
+            )
+            .await
+            .is_none(),
+            "complete retained request including structured summary must fit unchanged capacity"
+        );
+        drop(request);
+    }
+
+    fn configure_tool_evidence_compaction_prompt(state: &mut ServerState) {
+        // Test retained tool evidence independently of the evolving coding prompt.
+        state.startup_config.system_prompt.mode = bcode_config::SystemPromptMode::Replace;
+        state.startup_config.system_prompt.text =
+            Some("Summarize synthetic history faithfully; preserve active tool evidence.".into());
+        state.startup_config.system_prompt.sections.agent_suffix = false;
+        state.startup_config.system_prompt.sections.model_profile = false;
+    }
+
     #[tokio::test]
     async fn large_tool_result_followup_triggers_one_useful_proactive_compaction() {
         let compaction_cwd = tempfile::tempdir().expect("isolated compaction cwd");
@@ -100947,9 +101599,10 @@ event_symbol = "bcode_plugin_handle_event_v1"
         append_large_followup_fixture_with_user_padding(&sessions, session_id, 40).await;
         let mut state = test_server_state_with_fake_provider(sessions);
         isolate_compaction_request_fixture(&mut state);
+        configure_tool_evidence_compaction_prompt(&mut state);
         state.startup_config.model.compaction.mode = bcode_config::CompactionMode::Proactive;
         state.startup_config.model.compaction.keep_recent_tokens = 1;
-        state.startup_config.model.tool_output.context_chars = 16_000;
+        state.startup_config.model.tool_output.context_chars = 20_000;
         state.selected_provider_context.settings.insert(
             "fake_compaction_summary".into(),
             "Tool evidence was inspected; continue the active request.".into(),
@@ -100970,6 +101623,7 @@ event_symbol = "bcode_plugin_handle_event_v1"
             state.startup_config.model.tool_output.context_chars,
         );
         let followup_tokens = estimated_model_messages_tokens(&followup_messages);
+        assert_large_followup_summary_prefit(&state, session_id, &selection, &history).await;
         let (_followup_tx, mut followup_rx) = mpsc::channel(1);
         let (_steering_tx, mut steering_rx) = mpsc::channel(1);
         let (_cancel_tx, mut cancel_rx) = mpsc::channel(1);
@@ -101151,6 +101805,53 @@ event_symbol = "bcode_plugin_handle_event_v1"
         drop(state);
     }
 
+    async fn cancel_at_held_proactive_summary(
+        gate: &str,
+        signal: &str,
+        cancel_state: &TurnCancelState,
+    ) -> bool {
+        let reached = tokio::time::timeout(
+            Duration::from_secs(5),
+            bcode_fake_provider_plugin::wait_for_fake_event_script_gate_ready(gate),
+        )
+        .await
+        .is_ok();
+        let own_summary_started =
+            bcode_fake_provider_plugin::fake_compaction_summary_signal_started(signal);
+        cancel_state.cancel().await;
+        reached && own_summary_started
+    }
+
+    fn held_proactive_summary_selection(signal: &str, gate: &str) -> SessionModelSelection {
+        let script = bcode_fake_provider_plugin::FakeProviderEventScript {
+            steps: vec![bcode_fake_provider_plugin::FakeProviderEventScriptStep {
+                gate: Some(gate.to_owned()),
+                delay_ms: None,
+                event: ProviderTurnEvent::TextDelta {
+                    text: "summary must not commit".into(),
+                },
+            }],
+        };
+        SessionModelSelection {
+            provider_plugin_id: Some("bcode.fake-provider".to_owned()),
+            model_id: Some("fake-echo".to_owned()),
+            provider_context: bcode_model::ProviderRequestContext {
+                settings: BTreeMap::from([
+                    (
+                        "fake_compaction_summary_signal".to_owned(),
+                        signal.to_owned(),
+                    ),
+                    (
+                        "fake_event_script".to_owned(),
+                        serde_json::to_string(&script).expect("script"),
+                    ),
+                ]),
+                ..bcode_model::ProviderRequestContext::default()
+            },
+            ..SessionModelSelection::default()
+        }
+    }
+
     #[tokio::test]
     async fn proactive_compaction_cancellation_persists_no_marker() {
         let compaction_cwd = tempfile::tempdir().expect("isolated compaction cwd");
@@ -101163,39 +101864,40 @@ event_symbol = "bcode_plugin_handle_event_v1"
             .await
             .expect("session");
         let session_id = summary.id;
-        for index in 0..14 {
-            append_test_turn(
-                &sessions,
-                session_id,
-                format!("historical user {index} {}", "x".repeat(1_000)),
-                format!("historical assistant {index} {}", "y".repeat(1_000)),
-            )
-            .await;
-        }
+        // Same aggregate padding, but each complete evidence unit is small enough
+        // for the fixed 8k model's summary input/carry/repair capacity.
+        append_test_history(&sessions, session_id, 56, 250).await;
         sessions
             .append_event(
                 session_id,
                 SessionEventKind::UserMessage {
                     client_id: ClientId::new(),
                     text: "active turn".to_owned(),
-                    admission: bcode_session_models::TurnAdmissionMetadata::default(),
+                    admission: bcode_session_models::TurnAdmissionMetadata {
+                        execution: bcode_session_models::TurnExecutionOptions {
+                            tool_allowlist: Some(Vec::new()),
+                            ..bcode_session_models::TurnExecutionOptions::default()
+                        },
+                        ..bcode_session_models::TurnAdmissionMetadata::default()
+                    },
                 },
             )
             .await
             .expect("append active turn");
         let mut state = test_server_state_with_fake_provider(sessions);
         isolate_compaction_request_fixture(&mut state);
+        // Compaction behavior does not depend on the product coding prompt's
+        // evolving protected overhead. Keep capacity and threshold unchanged.
+        state.startup_config.system_prompt.mode = bcode_config::SystemPromptMode::Replace;
+        state.startup_config.system_prompt.text =
+            Some("Summarize synthetic history faithfully; answer the active user.".into());
+        state.startup_config.system_prompt.sections.agent_suffix = false;
+        state.startup_config.system_prompt.sections.model_profile = false;
         state.startup_config.model.compaction.mode = bcode_config::CompactionMode::Proactive;
         state.startup_config.model.compaction.keep_recent_tokens = 1;
-        let selection = SessionModelSelection {
-            provider_plugin_id: Some("bcode.fake-provider".to_owned()),
-            model_id: Some("fake-echo".to_owned()),
-            provider_context: bcode_model::ProviderRequestContext {
-                settings: BTreeMap::from([("fake_turn_delay_ms".to_owned(), "100".to_owned())]),
-                ..bcode_model::ProviderRequestContext::default()
-            },
-            ..SessionModelSelection::default()
-        };
+        let signal = format!("proactive-cancel-{session_id}");
+        let gate = format!("{signal}-summary-held");
+        let selection = held_proactive_summary_selection(&signal, &gate);
         let cancel_state = TurnCancelState::default();
         let (_followup_tx, mut followup_rx) = mpsc::channel(1);
         let (_steering_tx, mut steering_rx) = mpsc::channel(1);
@@ -101208,8 +101910,7 @@ event_symbol = "bcode_plugin_handle_event_v1"
             &queued_followups,
             Arc::new(Mutex::new(None)),
         );
-        let _fake_compaction_guard = bcode_fake_provider_plugin::fake_compaction_test_guard().await;
-        bcode_fake_provider_plugin::reset_fake_compaction_started();
+        bcode_fake_provider_plugin::reset_fake_compaction_summary_signal(&signal);
 
         let compaction = maybe_auto_compact_session_context(
             &state,
@@ -101228,14 +101929,26 @@ event_symbol = "bcode_plugin_handle_event_v1"
                 previous_compacted_through_sequence: None,
             },
         );
-        let cancellation = async {
-            while !bcode_fake_provider_plugin::fake_compaction_summary_started() {
-                tokio::task::yield_now().await;
-            }
-            cancel_state.cancel().await;
-        };
-        let (result, ()) = tokio::join!(compaction, cancellation);
-        assert!(matches!(result, Err(CompactionError::Cancelled)));
+        let cancellation = cancel_at_held_proactive_summary(&gate, &signal, &cancel_state);
+        let outcome = Box::pin(tokio::time::timeout(Duration::from_secs(15), async {
+            tokio::join!(compaction, cancellation)
+        }))
+        .await;
+        // Release only after cancellation has settled (or the bounded attempt failed).
+        // Cleanup is scoped to this test's unique gate/signal, never other fixtures.
+        cancel_state.cancel().await;
+        bcode_fake_provider_plugin::release_fake_event_script_gate(&gate);
+        bcode_fake_provider_plugin::forget_fake_event_script_gate_ready(&gate);
+        bcode_fake_provider_plugin::reset_fake_compaction_summary_signal(&signal);
+        let (result, reached_own_summary) = outcome.expect("bounded proactive cancellation");
+        assert!(
+            reached_own_summary,
+            "own summary must reach held gate before cancellation: {result:?}"
+        );
+        assert!(
+            matches!(result, Err(CompactionError::Cancelled)),
+            "compaction result: {result:?}"
+        );
         let history = state
             .sessions
             .session_history(session_id)
@@ -102866,7 +103579,10 @@ event_symbol = "bcode_plugin_handle_event_v1"
             &event.kind,
             SessionEventKind::ContextCompacted { summary, .. }
                 if serde_json::from_str::<serde_json::Value>(summary)
-                    .is_ok_and(|value| value["continuation"] == "Historical fixture exchanges completed; continue the active tool turn.")
+                    .is_ok_and(|value| serde_json::from_value::<String>(value["continuation"].clone())
+                        .ok()
+                        .and_then(|text| serde_json::from_str::<serde_json::Value>(&text).ok())
+                        .is_some_and(|sections| sections["background"] == "Historical fixture exchanges completed; continue the active tool turn."))
         )), "compaction must use the bounded fixture summary, not echo its transcript: {:?}", history.iter().filter_map(|event| match &event.kind { SessionEventKind::ContextCompacted { summary, .. } => Some(summary), _ => None }).collect::<Vec<_>>());
         assert_eq!(
             history
@@ -102878,12 +103594,10 @@ event_symbol = "bcode_plugin_handle_event_v1"
         assert_eq!(
             history
                 .iter()
-                .filter(|event| {
-                    matches!(
-                        event.kind,
-                        SessionEventKind::ToolInvocationResultRecorded { .. }
-                    )
-                })
+                .filter(|event| matches!(
+                    event.kind,
+                    SessionEventKind::ToolInvocationResultRecorded { .. }
+                ))
                 .count(),
             5,
             "completion: {completion:?}; history: {history:#?}"
@@ -105559,7 +106273,7 @@ event_symbol = "bcode_plugin_handle_event_v1"
         state.workflow_store = StdMutex::new(store).into();
         let state = Arc::new(state);
 
-        let socket_dir = tempfile::tempdir().expect("socket directory");
+        let socket_dir = test_socket_dir().expect("socket directory");
         let endpoint = bcode_ipc::IpcEndpoint::unix_socket(socket_dir.path().join("server.sock"));
         let listener = LocalIpcListener::bind(&endpoint).expect("listener");
         let server_state = Arc::clone(&state);
@@ -105743,7 +106457,7 @@ event_symbol = "bcode_plugin_handle_event_v1"
     #[tokio::test(start_paused = true)]
     async fn listener_release_preserves_owned_catalog_cleanup_past_diagnostic_deadline() {
         let state = Arc::new(test_server_state(SessionManager::default()));
-        let directory = tempfile::tempdir().expect("listener directory");
+        let directory = test_socket_dir().expect("listener directory");
         let endpoint = IpcEndpoint::unix_socket(directory.path().join("shutdown.sock"));
         let listener = LocalIpcListener::bind(&endpoint).expect("listener");
         let (release, gate) = tokio::sync::oneshot::channel();
@@ -106171,7 +106885,7 @@ event_symbol = "bcode_plugin_handle_event_v1"
         for panic_on_poll in [false, true] {
             let (state,) = (Arc::new(test_server_state(SessionManager::default())),);
             let weak = Arc::downgrade(&state);
-            let directory = tempfile::tempdir().expect("socket directory");
+            let directory = test_socket_dir().expect("socket directory");
             let endpoint = bcode_ipc::IpcEndpoint::unix_socket(directory.path().join("panic.sock"));
             let listener = LocalIpcListener::bind(&endpoint).expect("listener");
             let ready: EmbeddedWorkflowReady = Box::new(move |_| {
@@ -106205,7 +106919,7 @@ event_symbol = "bcode_plugin_handle_event_v1"
     #[tokio::test]
     async fn embedded_workflow_ready_borrows_application_and_drains() {
         use bcode_workflow::WorkflowRunApplication as _;
-        let socket_dir = tempfile::tempdir().expect("socket directory");
+        let socket_dir = test_socket_dir().expect("socket directory");
         let endpoint = bcode_ipc::IpcEndpoint::unix_socket(socket_dir.path().join("ready.sock"));
         let listener = LocalIpcListener::bind(&endpoint).expect("listener");
         let shutdown = bcode_agent_runtime::CancellationToken::new();
@@ -106252,7 +106966,7 @@ event_symbol = "bcode_plugin_handle_event_v1"
     async fn embedded_interaction_registration_is_explicit_and_cleanup_is_bounded() {
         for mode in 0..3 {
             let state = Arc::new(test_server_state(SessionManager::default()));
-            let root = tempfile::tempdir().unwrap();
+            let root = test_socket_dir().unwrap();
             let endpoint = bcode_ipc::IpcEndpoint::unix_socket(root.path().join("consumer.sock"));
             let listener = LocalIpcListener::bind(&endpoint).unwrap();
             let shutdown = bcode_agent_runtime::CancellationToken::new();
@@ -106333,7 +107047,7 @@ event_symbol = "bcode_plugin_handle_event_v1"
     async fn constructed_server_shutdown_drains_idle_clients() {
         for cancel_from_host in [false, true] {
             let state = Arc::new(test_server_state(SessionManager::default()));
-            let socket_dir = tempfile::tempdir().expect("socket directory");
+            let socket_dir = test_socket_dir().expect("socket directory");
             let endpoint =
                 bcode_ipc::IpcEndpoint::unix_socket(socket_dir.path().join("drain.sock"));
             let listener = LocalIpcListener::bind(&endpoint).expect("listener");
@@ -106478,7 +107192,7 @@ event_symbol = "bcode_plugin_handle_event_v1"
     async fn constructed_server_shutdown_before_start_does_not_launch_forwarders() {
         for cancel_from_host in [false, true] {
             let state = Arc::new(test_server_state(SessionManager::default()));
-            let socket_dir = tempfile::tempdir().expect("socket directory");
+            let socket_dir = test_socket_dir().expect("socket directory");
             let endpoint =
                 bcode_ipc::IpcEndpoint::unix_socket(socket_dir.path().join("stopped.sock"));
             let listener = LocalIpcListener::bind(&endpoint).expect("listener");
@@ -106562,7 +107276,7 @@ event_symbol = "bcode_plugin_handle_event_v1"
     #[tokio::test]
     async fn client_observes_shutdown_before_first_poll() {
         let state = Arc::new(test_server_state(SessionManager::default()));
-        let socket_dir = tempfile::tempdir().expect("socket directory");
+        let socket_dir = test_socket_dir().expect("socket directory");
         let endpoint = bcode_ipc::IpcEndpoint::unix_socket(socket_dir.path().join("early.sock"));
         let listener = LocalIpcListener::bind(&endpoint).expect("listener");
         let peer = LocalIpcStream::connect(&endpoint).await.expect("connect");
@@ -106597,7 +107311,7 @@ event_symbol = "bcode_plugin_handle_event_v1"
     async fn pipelined_mutations_survive_write_half_close() {
         use tokio::io::AsyncWriteExt as _;
         let state = Arc::new(test_server_state(SessionManager::default()));
-        let socket_dir = tempfile::tempdir().unwrap();
+        let socket_dir = test_socket_dir().unwrap();
         let workspace = tempfile::tempdir().unwrap();
         let endpoint = bcode_ipc::IpcEndpoint::unix_socket(socket_dir.path().join("pipeline.sock"));
         let listener = LocalIpcListener::bind(&endpoint).unwrap();
@@ -106753,7 +107467,7 @@ event_symbol = "bcode_plugin_handle_event_v1"
         .await
         .expect("observation open deadline")
         .unwrap();
-        let socket_dir = tempfile::tempdir().unwrap();
+        let socket_dir = test_socket_dir().unwrap();
         let endpoint =
             bcode_ipc::IpcEndpoint::unix_socket(socket_dir.path().join("observation.sock"));
         let listener = LocalIpcListener::bind(&endpoint).unwrap();
@@ -106931,7 +107645,7 @@ event_symbol = "bcode_plugin_handle_event_v1"
     #[tokio::test]
     async fn in_flight_server_status_cancels_on_shutdown_without_unlocking_clients() {
         let state = Arc::new(test_server_state(SessionManager::default()));
-        let socket_dir = tempfile::tempdir().expect("socket directory");
+        let socket_dir = test_socket_dir().expect("socket directory");
         let endpoint = bcode_ipc::IpcEndpoint::unix_socket(socket_dir.path().join("status.sock"));
         let listener = LocalIpcListener::bind(&endpoint).expect("listener");
         let peer = LocalIpcStream::connect(&endpoint).await.expect("connect");
@@ -106980,7 +107694,7 @@ event_symbol = "bcode_plugin_handle_event_v1"
     #[tokio::test]
     async fn idle_client_shutdown_closes_handler_and_unregisters_client() {
         let state = Arc::new(test_server_state(SessionManager::default()));
-        let socket_dir = tempfile::tempdir().expect("socket directory");
+        let socket_dir = test_socket_dir().expect("socket directory");
         let endpoint = bcode_ipc::IpcEndpoint::unix_socket(socket_dir.path().join("shutdown.sock"));
         let listener = LocalIpcListener::bind(&endpoint).expect("listener");
         let peer = LocalIpcStream::connect(&endpoint).await.expect("connect");

@@ -6,6 +6,13 @@ pub use operation_owners::{cancel_operation_receipt, observe_operation_receipt};
 
 use bcode_workflow_store::WorkflowStoreError;
 
+#[cfg(test)]
+fn trace_admission_stack_phase(phase: &str) {
+    if std::env::var_os("BCODE_TEST_WORKFLOW_STACK_TRACE").is_some() {
+        eprintln!("workflow-stack phase={phase}");
+    }
+}
+
 /// Route receipt observation by its compatibility-defined owner. Managed session receipts
 /// never enter the model-turn decoder; mixed graphs retain the ordinary workflow scheduler.
 pub struct WorkflowOperationReceiptObserver<'a> {
@@ -1605,6 +1612,101 @@ impl bcode_workflow::WorkflowAuthoringApplication for WorkflowAuthoringApplicati
 
 #[cfg(test)]
 mod authoring_boundary_tests {
+    #[test]
+    fn report_template_admission_future_sizes_without_polling() {
+        fn report<F: std::future::Future>(name: &str, future: F) {
+            eprintln!(
+                "workflow-stack future={name} bytes={}",
+                std::mem::size_of_val(&future)
+            );
+            drop(future);
+        }
+        let state = std::sync::Arc::new(crate::tests::test_server_state(
+            bcode_session::SessionManager::default(),
+        ));
+        let parent = bcode_session_models::SessionId::new();
+        report(
+            "start_template",
+            super::start_template(
+                &state,
+                bcode_workflow::WorkflowTemplateStartRequest {
+                    owner_plugin_id: "test.unavailable".into(),
+                    template_id: "missing".into(),
+                    template_version: 1,
+                    run_id: None,
+                    workspace_snapshot: None,
+                    parent_session_id: parent,
+                    configuration: serde_json::json!({}),
+                    limits: bcode_workflow::WorkflowRunLimits::default(),
+                },
+            ),
+        );
+        let request = bcode_workflow::WorkflowRunStartRequest {
+            definition_id: "not-polled".into(),
+            definition_version: 1,
+            run_id: None,
+            workspace_snapshot: String::new(),
+            parent_session_id: parent,
+            parent_session_generation: None,
+            binding: None,
+            input: None,
+            limits: bcode_workflow::WorkflowRunLimits::default(),
+        };
+        let mut phase = "not-polled";
+        report(
+            "prepare_workflow_run",
+            super::prepare_workflow_run(&state, request.clone(), None, &mut phase),
+        );
+        report(
+            "start_run_with_stage",
+            super::start_run_with_stage(&state, request, None, None, &mut phase),
+        );
+        report(
+            "drive_if_represented",
+            crate::workflow_representation::drive_if_represented(&state, "not-polled"),
+        );
+        assert_eq!(phase, "not-polled");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn unavailable_template_does_not_admit_or_acquire_parent_ownership() {
+        let state = std::sync::Arc::new(crate::tests::test_server_state(
+            bcode_session::SessionManager::default(),
+        ));
+        // No parent exists: template resolution must fail before parent/session
+        // admission, rather than adopting an unrelated available definition.
+        let result = super::start_template(
+            &state,
+            bcode_workflow::WorkflowTemplateStartRequest {
+                owner_plugin_id: "test.unavailable".into(),
+                template_id: "missing".into(),
+                template_version: 1,
+                run_id: Some("unavailable-template".into()),
+                workspace_snapshot: None,
+                parent_session_id: bcode_session_models::SessionId::new(),
+                configuration: serde_json::json!({}),
+                limits: bcode_workflow::WorkflowRunLimits::default(),
+            },
+        )
+        .await;
+        assert!(matches!(
+            result,
+            Err(crate::ServerError::WorkflowStore(
+                bcode_workflow_store::WorkflowStoreError::InvalidData(message)
+            )) if message == "workflow template not found or disabled"
+        ));
+        assert!(
+            state
+                .workflow_store
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .run_summary("unavailable-template")
+                .expect("run lookup")
+                .is_none()
+        );
+        drop(state);
+    }
+
     #[test]
     fn failures_hide_host_details_and_preserve_authorization_code() {
         let denied = super::authoring_failure(
@@ -7850,8 +7952,19 @@ async fn start_run_with_stage(
     package: Option<(&str, &str)>,
     phase: &mut &'static str,
 ) -> Result<bcode_workflow::WorkflowRunStartResponse, super::ServerError> {
-    let (new_run, workflow_session_ownership) =
-        prepare_workflow_run(state, request, authored_provenance, phase).await?;
+    #[cfg(test)]
+    trace_admission_stack_phase("prepare_run.begin");
+    // Session/profile resolution and ownership acquisition have independently
+    // large futures; keep them out of the admission/initial-dispatch frame.
+    let (new_run, workflow_session_ownership) = Box::pin(prepare_workflow_run(
+        state,
+        request,
+        authored_provenance,
+        phase,
+    ))
+    .await?;
+    #[cfg(test)]
+    trace_admission_stack_phase("prepare_run.end");
     let run_id = new_run.run_id.clone();
     let parent_session_id = new_run
         .parent_session_id
@@ -7861,6 +7974,8 @@ async fn start_run_with_stage(
         .map_err(|_| {
             bcode_workflow_store::WorkflowStoreError::InvalidData("invalid prepared parent".into())
         })?;
+    #[cfg(test)]
+    trace_admission_stack_phase("represented_admission.begin");
     let represented = if package.is_some() {
         Box::pin(crate::workflow_representation::admit_prepared_package(
             state, &new_run, package,
@@ -7872,6 +7987,8 @@ async fn start_run_with_stage(
         ))
         .await?
     };
+    #[cfg(test)]
+    trace_admission_stack_phase("represented_admission.end");
     let run = if let Some(run) = represented {
         run
     } else {
@@ -7898,6 +8015,8 @@ async fn start_run_with_stage(
     .await;
     let context = crate::xray_workflow::run_context(bcode_xray::CaptureContext::current(), &run_id);
     crate::xray_workflow::fact(context.as_ref(), "run.admitted", "persisted");
+    #[cfg(test)]
+    trace_admission_stack_phase("initial_execution.begin");
     *phase = "initial_execution";
     if let Err(error) =
         crate::xray_workflow::scope(context, Box::pin(super::drive_workflow_run(state, &run_id)))
@@ -7912,6 +8031,8 @@ async fn start_run_with_stage(
         }
         return Err(error);
     }
+    #[cfg(test)]
+    trace_admission_stack_phase("initial_execution.end");
     drop(workflow_session_ownership);
     Ok(bcode_workflow::WorkflowRunStartResponse {
         run,
@@ -8132,6 +8253,20 @@ pub async fn start_template(
     state: &std::sync::Arc<ServerState>,
     request: bcode_workflow::WorkflowTemplateStartRequest,
 ) -> Result<bcode_workflow::WorkflowRunStartResponse, super::ServerError> {
+    // Template compilation and schema validation do not need to remain on the
+    // polling stack while admission reaches session ownership and initial dispatch.
+    #[cfg(test)]
+    trace_admission_stack_phase("template_compile.begin");
+    let start_request = prepare_template_start(state, request)?;
+    #[cfg(test)]
+    trace_admission_stack_phase("template_compile.end");
+    Box::pin(start(state, start_request)).await
+}
+
+fn prepare_template_start(
+    state: &ServerState,
+    request: bcode_workflow::WorkflowTemplateStartRequest,
+) -> Result<bcode_workflow::WorkflowStartRequest, super::ServerError> {
     let template = find_workflow_template(
         state,
         &request.owner_plugin_id,
@@ -8176,26 +8311,22 @@ pub async fn start_template(
         &definition,
     )
     .map_err(|error| bcode_workflow_store::WorkflowStoreError::InvalidData(error.to_string()))?;
-    start(
-        state,
-        bcode_workflow::WorkflowStartRequest {
-            identity,
-            definition,
-            run_id: request.run_id,
-            workspace_snapshot: request.workspace_snapshot,
-            parent_session_id: request.parent_session_id,
-            input: request.configuration,
-            binding: bcode_workflow_store::WorkflowRunBinding {
-                owner_plugin_id: request.owner_plugin_id,
-                workflow_kind: binding_kind,
-                scope_key: request.template_version.to_string(),
-                display_label: Some(template.title.clone()),
-                single_active: false,
-            },
-            limits: request.limits,
+    Ok(bcode_workflow::WorkflowStartRequest {
+        identity,
+        definition,
+        run_id: request.run_id,
+        workspace_snapshot: request.workspace_snapshot,
+        parent_session_id: request.parent_session_id,
+        input: request.configuration,
+        binding: bcode_workflow_store::WorkflowRunBinding {
+            owner_plugin_id: request.owner_plugin_id,
+            workflow_kind: binding_kind,
+            scope_key: request.template_version.to_string(),
+            display_label: Some(template.title.clone()),
+            single_active: false,
         },
-    )
-    .await
+        limits: request.limits,
+    })
 }
 
 /// Request cancellation of a workflow tree while holding its durable execution authority.

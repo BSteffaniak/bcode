@@ -13,6 +13,7 @@ if "--version" in sys.argv:
 ready = False
 local_only = False
 first_input = True
+terminal_inventory = []
 
 def emit(value):
     print(json.dumps(value), flush=True)
@@ -109,6 +110,35 @@ for line in sys.stdin:
             sys.stderr.flush()
         result(request, {"turn": turn("inProgress")} if method == "turn/start" else {"turnId": "turn-1"})
         emit({"method": "turn/started", "params": {"threadId": "native-thread", "turn": turn("inProgress")}})
+        if text.startswith("lifecycle-"):
+            def item_event(method, item, turn_id="turn-1", thread_id="native-thread"):
+                emit({"method": method, "params": {"threadId": thread_id, "turnId": turn_id, "item": item}})
+            if text == "lifecycle-inventory":
+                terminal_inventory = [{"itemId": f"inventory-{i}", "processId": str(1000+i),
+                                       "command": "fixture only", "cwd": os.getcwd()} for i in range(40)]
+            command = {"type": "commandExecution", "id": "command-live", "processId": "42",
+                       "command": "fixture only", "cwd": os.getcwd(), "status": "inProgress",
+                       "commandActions": [], "aggregatedOutput": None, "exitCode": None, "durationMs": None}
+            item_event("item/started", command)
+            item_event("item/started", {"type": "mcpToolCall", "id": "persistent-tool", "status": "inProgress"})
+            item_event("item/completed", {"type": "agentMessage", "id": "final", "phase": "final_answer", "text": "foreground complete"})
+            completed()
+            # Work may complete after foreground terminal; no new Bcode submission.
+            command["status"] = "completed"
+            command["exitCode"] = 0
+            item_event("item/completed", command, thread_id="foreign" if text == "lifecycle-foreign" else "native-thread")
+            if text == "lifecycle-race":
+                followup = {"id": "automatic-turn", "rootTurnId": "turn-1", "status": "inProgress", "items": [], "error": None}
+                emit({"method": "turn/started", "params": {"threadId": "native-thread", "turn": followup}})
+                # A late primary answer cannot overwrite the closed foreground output.
+                item_event("item/completed", {"type": "agentMessage", "id": "late", "phase": "final_answer", "text": "wrong late answer"})
+                item_event("item/completed", {"type": "agentMessage", "id": "followup", "phase": "final_answer", "text": "followup complete"}, "automatic-turn")
+                followup["status"] = "completed"
+                emit({"method": "turn/completed", "params": {"threadId": "native-thread", "turn": followup}})
+                # Duplicate running notification must not reopen terminal work.
+                command["status"] = "inProgress"
+                item_event("item/started", command)
+            continue
         if text == "overflow":
             for index in range(300):
                 emit({"id": 100 + index, "method": "item/tool/requestUserInput", "params": {
@@ -207,6 +237,11 @@ for line in sys.stdin:
         emit({"method": "item/agentMessage/delta", "params": {"threadId": "native-thread", "turnId": "turn-1", "delta": "fixture text"}})
         if text not in ("approval", "question", "multi-question", "duplicate-question", "secret-question", "resolved-question", "foreign-resolved-question", "assistance", "dynamic"):
             completed(text if text in ("failed", "interrupted") else "completed")
+    elif method == "thread/backgroundTerminals/list":
+        start = int(params.get("cursor") or "0")
+        end = min(start + int(params.get("limit", 4)), len(terminal_inventory))
+        result(request, {"data": terminal_inventory[start:end],
+                         "nextCursor": str(end) if end < len(terminal_inventory) else None})
     elif method == "turn/interrupt":
         if os.path.exists("lost-interrupt-ack"):
             sys.exit(0)

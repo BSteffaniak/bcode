@@ -407,6 +407,40 @@ mod tests {
     }
 
     #[test]
+    fn epoch_20_requires_migration_even_with_complete_schema_55_ledger() {
+        assert_eq!(CURRENT_EVENT_SCHEMA, 55);
+        assert_eq!(CURRENT_WRITER_EPOCH, 23);
+        let mut facts = StorageCompatibilityFacts {
+            current_migration_ids: vec!["current-schema".into()],
+            migration_rows: vec![MigrationLedgerRow {
+                id: "current-schema".into(),
+                status: "completed".into(),
+            }],
+            contract_table_exists: true,
+            contract_schema_version: Some(1),
+            writer_epoch: Some(20),
+            expected_contract_schema_version: 1,
+            legacy_writer_epoch: 1,
+        };
+        assert!(matches!(
+            classify_storage_facts(&facts).unwrap(),
+            StorageCompatibility::MigrationRequired { .. }
+        ));
+        facts.writer_epoch = Some(22);
+        assert!(matches!(
+            classify_storage_facts(&facts).unwrap(),
+            StorageCompatibility::MigrationRequired { .. }
+        ));
+        facts.writer_epoch = Some(23);
+        assert!(matches!(
+            classify_storage_facts(&facts).unwrap(),
+            StorageCompatibility::Current { .. }
+        ));
+        facts.writer_epoch = Some(24);
+        assert!(classify_storage_facts(&facts).is_err());
+    }
+
+    #[test]
     fn storage_prefix_uses_contract_order_not_query_or_identifier_order() {
         let mut facts = StorageCompatibilityFacts {
             current_migration_ids: vec!["base".into(), "z_existing".into(), "a_new".into()],

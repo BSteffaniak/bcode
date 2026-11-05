@@ -159,6 +159,7 @@ fn prepared_observe_and_control_reject_foreign_instance_and_zero_generation() {
         let target = HarnessSessionTarget::Prepared(invalid);
         assert!(
             request(HarnessRequestKind::Observe(HarnessObserveRequest {
+                retention: None,
                 target: target.clone(),
                 after: None,
                 limit: 1,
@@ -195,6 +196,7 @@ fn prepared_observe_and_control_reject_foreign_instance_and_zero_generation() {
     );
     assert!(
         request(HarnessRequestKind::Observe(HarnessObserveRequest {
+            retention: None,
             target: target.clone(),
             after: None,
             limit: 1,
@@ -262,6 +264,7 @@ fn confirmation_is_fenced_to_exact_prepared_selection_and_native_evidence() {
         Err(HarnessContractError::StaleGeneration)
     );
     let observe = request(HarnessRequestKind::Observe(HarnessObserveRequest {
+        retention: None,
         target,
         after: None,
         limit: 1,
@@ -281,6 +284,9 @@ fn confirmation_is_fenced_to_exact_prepared_selection_and_native_evidence() {
     let response = reply(
         HarnessOperation::Observe,
         HarnessServiceResponseKind::Observations(HarnessObservationPage {
+            retention: None,
+            hydration_requests: Vec::new(),
+            inventory_page: None,
             observations: vec![observation],
             next_after: Some("binding-observed".into()),
             completeness: HarnessCompleteness::Complete,

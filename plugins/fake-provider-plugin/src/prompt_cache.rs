@@ -492,11 +492,22 @@ fn read_ordinal(id: &str) -> Option<usize> {
 }
 
 fn continuation_state(summary: &str) -> Option<ReadTaskContinuation> {
-    let value: serde_json::Value = serde_json::from_str(summary).ok()?;
-    if value.get("fake_cache_read_task").is_some() {
-        return serde_json::from_value(value).ok();
+    let mut value: serde_json::Value = serde_json::from_str(summary).ok()?;
+    // Only the host's two envelope layers and the simulator payload are supported.
+    for _ in 0..3 {
+        if value.get("fake_cache_read_task").is_some() {
+            return serde_json::from_value(value).ok();
+        }
+        let nested = if value.get("format").and_then(serde_json::Value::as_str)
+            == Some("bcode.compaction.continuation-sections.v1")
+        {
+            value.get("background")?.as_str()?
+        } else {
+            value.get("continuation")?.as_str()?
+        };
+        value = serde_json::from_str(nested).ok()?;
     }
-    serde_json::from_str(value.get("continuation")?.as_str()?).ok()
+    None
 }
 
 /// Carry only the cache simulator's explicit read-files protocol through host synthesis.
@@ -718,6 +729,40 @@ mod tests {
         let next = next_call(&request);
         assert_eq!(next.arguments["path"], "first.txt");
         assert_ne!(first.id, next.id);
+    }
+
+    #[test]
+    fn section_replacement_preserves_read_task_through_host_envelopes() {
+        let mut request = request();
+        request.structured_output = Some(bcode_model::StructuredOutputRequest {
+            name: "replacement".into(),
+            schema: serde_json::json!({"properties":{"format":{"const":"bcode.compaction.section-update.v2"}}}),
+            strict: true,
+        });
+        let source = fragment(
+            10,
+            "user",
+            0,
+            true,
+            "#10 user:\nread-files first.txt second.txt",
+        );
+        let prompt =
+            format!("Prior structured synthesis: {{}}\n\nSource fragments (JSON lines):\n{source}");
+        let response: serde_json::Value =
+            serde_json::from_str(&crate::fake_compaction_synthesis(&request, &prompt).unwrap())
+                .unwrap();
+        let carry = serde_json::json!({
+            "format":"bcode.compaction.continuation-sections.v1",
+            "decisions":"", "active_work_blockers":"", "findings_evidence":"",
+            "background":response["sections"]["background"]
+        });
+        let envelope = serde_json::json!({"format":"bcode.compaction.scope.v2", "current_scope":[], "continuation":carry.to_string()});
+        let task = continuation_state(&envelope.to_string()).unwrap();
+        assert_eq!(
+            task.fake_cache_read_task.instruction,
+            "read-files first.txt second.txt"
+        );
+        assert_eq!(task.fake_cache_read_task.source_sequence, 10);
     }
 
     fn synthesis(prior: &serde_json::Value, fragments: &[serde_json::Value]) -> serde_json::Value {

@@ -1,5 +1,7 @@
 //! CLI application adapter. Native programs and credentials are never command-line arguments.
-use crate::{BcodeClient, CliError};
+mod configured;
+
+use crate::CliError;
 use bcode_ipc::harness::{
     MANAGED_SESSION_INTERFACE_ID, MANAGED_SESSION_VERSION, ManagedSessionOperation as Op,
     ManagedSessionRequest,
@@ -10,6 +12,26 @@ use std::{fs::File, io::Read as _, path::PathBuf};
 /// Managed external-session commands. All output is renderer-neutral JSON.
 #[derive(Debug, Subcommand)]
 pub enum HarnessCommand {
+    /// List configured enabled instances; discovery does not prove authentication readiness.
+    #[command(alias = "catalog")]
+    List,
+    /// Open an explicitly selected configured instance; prepared transport is not confirmation.
+    Open {
+        #[command(flatten)]
+        options: configured::OpenOptions,
+    },
+    /// Explicitly resume one gracefully released existing managed native session.
+    /// Never resends previous input or adopts the latest unrelated native conversation.
+    Recover {
+        session_id: bcode_session_models::SessionId,
+        #[arg(long)]
+        instance: String,
+        #[arg(long, value_parser = clap::value_parser!(u64).range(1..))]
+        generation: u64,
+        /// Fresh retained recovery identity; repeat only to inspect, never to force replay.
+        #[arg(long)]
+        recovery_id: String,
+    },
     /// Create/open native transport. Prepared is not native creation success; retain its
     /// exact target for first submission and wait for `BindingConfirmed` observations.
     Start {
@@ -113,6 +135,24 @@ fn read_request(path: &PathBuf) -> Result<String, CliError> {
         .map_err(|_| CliError::InvalidArguments("managed request must be UTF-8 JSON".into()))
 }
 
+fn recovery_request_json(
+    session_id: bcode_session_models::SessionId,
+    instance_id: String,
+    expected_generation: u64,
+    recovery_id: String,
+) -> Result<String, CliError> {
+    let recovery = bcode_ipc::harness::ManagedSessionRecoveryRequest {
+        session_id,
+        instance_id,
+        expected_generation,
+        recovery_id,
+    };
+    recovery
+        .validate()
+        .map_err(|message| CliError::InvalidArguments(message.into()))?;
+    Ok(serde_json::to_string(&recovery)?)
+}
+
 pub async fn execute(command: HarnessCommand) -> Result<(), CliError> {
     if let HarnessCommand::Auth {
         command:
@@ -125,6 +165,17 @@ pub async fn execute(command: HarnessCommand) -> Result<(), CliError> {
         return execute_handoff(request).await;
     }
     let (operation, request_json) = match command {
+        HarnessCommand::List => return configured::list().await,
+        HarnessCommand::Open { options } => return configured::open(options).await,
+        HarnessCommand::Recover {
+            session_id,
+            instance,
+            generation,
+            recovery_id,
+        } => (
+            Op::Recover,
+            recovery_request_json(session_id, instance, generation, recovery_id)?,
+        ),
         HarnessCommand::Start { request } => (Op::Start, read_request(&request)?),
         HarnessCommand::Status { request } => (Op::Inspect, read_request(&request)?),
         HarnessCommand::Send { request } => (Op::Followup, read_request(&request)?),
@@ -180,14 +231,14 @@ pub async fn execute(command: HarnessCommand) -> Result<(), CliError> {
         request
             .decode_history()
             .map_err(|message| CliError::InvalidArguments(message.into()))?;
-    } else if !operation.is_auth() {
+    } else if operation != Op::Recover && !operation.is_auth() {
         request
             .decode_call()
             .map_err(|message| CliError::InvalidArguments(message.into()))?;
     }
     // This interface is reserved by the daemon dispatcher, not resolved by plugin discovery.
     // Reuse the existing public client handshake/config/state-root routing, with no raw socket.
-    let response = BcodeClient::default_endpoint()
+    let response = bcode_client::ManagedSessionClient::default_endpoint()
         .call_plugin_service(
             MANAGED_SESSION_INTERFACE_ID.into(),
             operation.as_str().into(),
@@ -201,181 +252,42 @@ pub async fn execute(command: HarnessCommand) -> Result<(), CliError> {
             "managed session response unavailable".into(),
         ));
     }
-    let value: serde_json::Value = serde_json::from_slice(&response.payload)
+    print_managed_response(&response.payload)
+}
+
+fn print_managed_response(payload: &[u8]) -> Result<(), CliError> {
+    let value: serde_json::Value = serde_json::from_slice(payload)
         .map_err(|_| CliError::InvalidArguments("invalid managed session response".into()))?;
     println!("{}", serde_json::to_string_pretty(&value)?);
     Ok(())
 }
 
-async fn terminal_request(
-    client: &mut bcode_client::ClientConnection,
-    operation: Op,
-    request_json: String,
-) -> Result<bcode_ipc::ManagedSessionResponse, CliError> {
-    client
-        .managed_session_auth(ManagedSessionRequest {
-            schema_version: MANAGED_SESSION_VERSION,
-            operation,
-            request_json,
-        })
-        .await
-        .map_err(|source| CliError::ManagedAuth { operation, source })
+#[cfg(not(unix))]
+async fn execute_handoff(_path: &PathBuf) -> Result<(), CliError> {
+    Err(CliError::InvalidArguments(
+        "native terminal handoff is unsupported on this platform".into(),
+    ))
 }
 
-async fn prepare_verified_handoff(
-    client: &mut bcode_client::ClientConnection,
-    path: &PathBuf,
-) -> Result<
-    (
-        bcode_ipc::harness::ManagedSessionHandoffRequest,
-        bcode_ipc::harness::ManagedNativeLoginPlan,
-    ),
-    CliError,
-> {
-    use bcode_ipc::harness::{
-        ManagedNativeLoginPlan, ManagedSessionHandoffRequest, ManagedSessionPrepareHandoffRequest,
-    };
-    let input: ManagedSessionPrepareHandoffRequest = serde_json::from_str(&read_request(path)?)
-        .map_err(|_| CliError::InvalidArguments("invalid native handoff preparation".into()))?;
-    let response =
-        terminal_request(client, Op::AuthPrepare, serde_json::to_string(&input)?).await?;
-    let snapshot: bcode_provider_auth_models::managed::ManagedFlowSnapshot =
-        serde_json::from_str(&response.response_json)
-            .map_err(|_| CliError::InvalidArguments("invalid native handoff reservation".into()))?;
-    let mut selection = ManagedSessionHandoffRequest {
-        session_id: input.session_id,
-        instance_id: input.instance_id,
-        interface_id: input.interface_id,
-        handle: snapshot.handle,
-        interaction_id: String::new(),
-    };
-    let response =
-        terminal_request(client, Op::AuthStatus, serde_json::to_string(&selection)?).await?;
-    let interaction: Option<(
-        u64,
-        bcode_provider_auth_models::managed::SensitiveAuthInteraction,
-    )> = serde_json::from_str(&response.response_json)
-        .map_err(|_| CliError::InvalidArguments("invalid native handoff interaction".into()))?;
-    let Some((
-        _,
-        bcode_provider_auth_models::managed::SensitiveAuthInteraction::NativeHandoff {
-            ref request_id,
-        },
-    )) = interaction
-    else {
-        return Err(CliError::InvalidArguments(
-            "native handoff not available".into(),
-        ));
-    };
-    selection.interaction_id = request_id.clone();
-    let response =
-        terminal_request(client, Op::AuthHandoff, serde_json::to_string(&selection)?).await?;
-    let plan: ManagedNativeLoginPlan = serde_json::from_str(&response.response_json)
-        .map_err(|_| CliError::InvalidArguments("invalid native login plan".into()))?;
-    verify_handoff_executable(&plan).await?;
-    Ok((selection, plan))
-}
-
-async fn verify_handoff_executable(
-    plan: &bcode_ipc::harness::ManagedNativeLoginPlan,
-) -> Result<(), CliError> {
-    use std::process::Stdio;
-    plan.validate()
-        .map_err(|message| CliError::InvalidArguments(message.into()))?;
-    // Use the admitted absolute executable directly. Never launch a shell or inherit ambient
-    // credential overrides. Verify version under the same namespace before interactive login.
-    let mut version = tokio::process::Command::new(&plan.executable);
-    version
-        .arg("--version")
-        .env_clear()
-        .envs(&plan.environment)
-        .current_dir(&plan.working_directory)
-        .stdin(Stdio::null())
-        .stderr(Stdio::null())
-        .stdout(Stdio::piped())
-        .kill_on_drop(true);
-    let mut child = version.spawn()?;
-    let mut stdout = child
-        .stdout
-        .take()
-        .ok_or_else(|| CliError::InvalidArguments("native version unavailable".into()))?;
-    let verified = tokio::time::timeout(std::time::Duration::from_secs(10), async {
-        use tokio::io::AsyncReadExt as _;
-        let mut bytes = Vec::new();
-        (&mut stdout).take(4097).read_to_end(&mut bytes).await?;
-        if bytes.len() > 4096 {
-            return Ok::<_, std::io::Error>(false);
-        }
-        let status = child.wait().await?;
-        Ok(status.success()
-            && std::str::from_utf8(&bytes).is_ok_and(|text| {
-                text.trim() == plan.expected_version
-                    || text
-                        .split_whitespace()
-                        .any(|part| part == plan.expected_version)
-            }))
-    })
-    .await;
-    if !matches!(verified, Ok(Ok(true))) {
-        let _ = child.kill().await;
-        return Err(CliError::InvalidArguments(
-            "native executable version does not match admitted plan".into(),
-        ));
-    }
-    Ok(())
-}
-
+#[cfg(unix)]
 async fn execute_handoff(path: &PathBuf) -> Result<(), CliError> {
-    use std::{io::IsTerminal as _, process::Stdio};
+    use std::io::IsTerminal as _;
     if !std::io::stdin().is_terminal() || !std::io::stdout().is_terminal() {
         return Err(CliError::InvalidArguments(
             "native login requires an interactive client terminal".into(),
         ));
     }
-    // This entry point is reached only after the explicit --execute consent gate.
-    let mut client = BcodeClient::default_endpoint()
-        .connect("bcode-cli-auth-terminal")
+    let input: bcode_ipc::harness::ManagedSessionPrepareHandoffRequest =
+        serde_json::from_str(&read_request(path)?)
+            .map_err(|_| CliError::InvalidArguments("invalid native handoff preparation".into()))?;
+    // Reached only after the explicit --execute consent gate. Keep the caller sealed and
+    // bound to canonical session/instance evidence; unrelated model auth is not materialized.
+    let mut flow = bcode_client::ManagedSessionClient::default_endpoint()
+        .session_auth_flow(input.session_id, &input.instance_id)
         .await?;
-    let (selection, plan) = prepare_verified_handoff(&mut client, path).await?;
-    let status = tokio::process::Command::new(&plan.executable)
-        .args(&plan.arguments)
-        .env_clear()
-        .envs(&plan.environment)
-        .current_dir(&plan.working_directory)
-        .stdin(Stdio::inherit())
-        .stdout(Stdio::inherit())
-        .stderr(Stdio::inherit())
-        .kill_on_drop(true)
-        .status()
-        .await?;
-    // status() has waited for/reaped this exact child. Exit success is not auth readiness.
-    terminal_request(
-        &mut client,
-        Op::AuthReaped,
-        serde_json::to_string(&selection)?,
-    )
-    .await?;
-    let response = terminal_request(
-        &mut client,
-        Op::AuthContinue,
-        serde_json::to_string(&selection)?,
-    )
-    .await?;
-    let snapshot: bcode_provider_auth_models::managed::ManagedFlowSnapshot =
-        serde_json::from_str(&response.response_json)
-            .map_err(|_| CliError::InvalidArguments("invalid auth reinspection snapshot".into()))?;
-    if snapshot.phase == bcode_provider_auth_models::managed::ManagedFlowPhase::Settled {
-        terminal_request(
-            &mut client,
-            Op::AuthAcknowledge,
-            serde_json::to_string(&selection)?,
-        )
-        .await?;
-    }
-    let value: serde_json::Value = serde_json::from_str(&response.response_json)
-        .map_err(|_| CliError::InvalidArguments("invalid auth status response".into()))?;
-    println!("{}", serde_json::to_string_pretty(&value)?);
-    if !status.success() {
+    let (exit_success, snapshot) = flow.terminal_handoff(input.interface_id).await?;
+    println!("{}", serde_json::to_string_pretty(&snapshot)?);
+    if !exit_success {
         return Err(CliError::InvalidArguments(
             "native login exited unsuccessfully; auth was reinspected without replay".into(),
         ));
@@ -392,6 +304,33 @@ mod tests {
         #[command(subcommand)]
         command: HarnessCommand,
     }
+    #[test]
+    fn recovery_request_preserves_exact_identity_and_rejects_invalid_generation() {
+        let session = bcode_session_models::SessionId::new();
+        let encoded = super::recovery_request_json(
+            session,
+            "selected-instance".into(),
+            7,
+            "retained-recovery".into(),
+        )
+        .unwrap();
+        let decoded: bcode_ipc::harness::ManagedSessionRecoveryRequest =
+            serde_json::from_str(&encoded).unwrap();
+        assert_eq!(decoded.session_id, session);
+        assert_eq!(decoded.instance_id, "selected-instance");
+        assert_eq!(decoded.expected_generation, 7);
+        assert_eq!(decoded.recovery_id, "retained-recovery");
+        assert!(
+            super::recovery_request_json(
+                session,
+                "selected-instance".into(),
+                0,
+                "retained-recovery".into()
+            )
+            .is_err()
+        );
+    }
+
     #[test]
     fn commands_require_files_not_inline_credentials() {
         assert!(

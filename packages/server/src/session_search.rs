@@ -292,8 +292,34 @@ fn backfill_continuation_cursor(
 ///
 /// Returns a normalized error when selection is invalid, search is disabled, no eligible provider
 /// exists, or catalog discovery fails.
+pub fn complete_backfill<'a>(
+    state: &'a ServerState,
+    request: bcode_session_search::CompleteSessionSearchBackfillRequest,
+    cancellation: &'a bcode_plugin_sdk::ServiceCancellation,
+    progress: Option<
+        &'a (dyn Fn(bcode_session_search::CompleteSessionSearchBackfillProgress) + Send + Sync),
+    >,
+) -> std::pin::Pin<
+    Box<
+        dyn std::future::Future<
+                Output = Result<
+                    bcode_session_search::CompleteSessionSearchBackfillResponse,
+                    SessionSearchServiceError,
+                >,
+            > + Send
+            + 'a,
+    >,
+> {
+    Box::pin(complete_backfill_inner(
+        state,
+        request,
+        cancellation,
+        progress,
+    ))
+}
+
 #[allow(clippy::too_many_lines)]
-pub async fn complete_backfill(
+async fn complete_backfill_inner(
     state: &ServerState,
     request: bcode_session_search::CompleteSessionSearchBackfillRequest,
     cancellation: &bcode_plugin_sdk::ServiceCancellation,

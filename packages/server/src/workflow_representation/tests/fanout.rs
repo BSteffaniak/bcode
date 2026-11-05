@@ -4,6 +4,32 @@ use super::*;
 // Do not make two host-saturation fixtures compete for the same process resources.
 static FANOUT_FIXTURE: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
+async fn fanout_provider_fixture() -> (
+    tempfile::TempDir,
+    tempfile::TempDir,
+    std::sync::Arc<ServerState>,
+    bcode_workflow::WorkflowDefinition,
+) {
+    let (root, sessions, mut state, definition) =
+        typed_provider_fixture_with_delegation(true).await;
+    // The workflow database and session roots do not scope account-routing writes.
+    // Keep this fixture's routing writer off the ambient/default daemon state root.
+    std::sync::Arc::get_mut(&mut state)
+        .expect("fixture not yet shared")
+        .state_root = root.path().to_path_buf();
+    // Hold all 100 provider callbacks concurrently, plus 28 bounded service slots.
+    // This is fixture policy, not a change to the runtime's production default.
+    std::sync::Arc::get_mut(&mut state)
+        .expect("fixture not yet shared")
+        .plugins
+        .configure_invocation_limits(
+            std::num::NonZeroUsize::new(128).unwrap(),
+            std::num::NonZeroUsize::new(4).unwrap(),
+        )
+        .expect("fanout invocation capacity");
+    (root, sessions, state, definition)
+}
+
 fn fanout_definition(
     leaf: bcode_workflow::NodeDefinition,
     count: u32,
@@ -48,25 +74,36 @@ async fn fanout_real_provider_members_overlap_at_32_and_100() {
 }
 
 async fn fanout_overlap(count: u32) {
-    let (_root, _sessions, mut state, _) = typed_provider_fixture_with_delegation(true).await;
-    // This fixture proves simultaneous provider overlap, not queued admission. Explicitly
-    // provision enough work slots for every held member plus its setup service calls.
-    std::sync::Arc::get_mut(&mut state)
-        .expect("unshared fixture state")
-        .plugins
-        .configure_invocation_limits(
-            std::num::NonZeroUsize::new(count as usize + 16).unwrap(),
-            std::num::NonZeroUsize::new(4).unwrap(),
-        )
-        .expect("fixture invocation capacity");
+    let (_root, _sessions, state, _) = fanout_provider_fixture().await;
     let mut cleanup = FixtureCleanup::new(&state);
+    let experiment_id = format!("overlap-{count}");
+    let _stages = ArmStages(super::super::fanout_stages::Experiment::begin(
+        &experiment_id,
+        "fanout",
+        &std::env::current_dir().expect("fixture workspace"),
+    ));
     let _release =
         ReleaseGate(state.selected_provider_context.settings["delegation_fixture_gate"].clone());
     let db = admit_overlap_fixture(&state, count).await;
     // A completed scheduler pass proves admission, independently of host speed.
-    crate::drive_workflow_run(&state, "fanout")
-        .await
-        .expect("materialize and dispatch");
+    eprintln!("fanout checkpoint count={count} materialize_dispatch=pending");
+    let admission = crate::drive_workflow_run(&state, "fanout").await;
+    eprintln!(
+        "fanout checkpoint count={count} materialize_dispatch_ok={}",
+        admission.is_ok(),
+    );
+    if let Err(error) = admission {
+        // The driver drains sibling admissions before returning an error. Release
+        // admitted providers and join fixture work before propagating that error;
+        // panic fallback alone cannot finish on a runtime being torn down.
+        bcode_fake_provider_plugin::release_fake_event_script_gate(
+            &state.selected_provider_context.settings["delegation_fixture_gate"],
+        );
+        report_overlap_failure(&state, &db, count).await;
+        cleanup.finish().await;
+        panic!("materialize and dispatch: {error:?}");
+    }
+    eprintln!("fanout checkpoint count={count} pending_attempts=reading");
     let pending = representation::attempts::pending(&db, "fanout", None, 100)
         .await
         .expect("overlap");
@@ -75,18 +112,11 @@ async fn fanout_overlap(count: u32) {
         pending.iter().all(|attempt| attempt.receipt.is_some()),
         "all provider owners admitted before releasing any"
     );
-    let ready = tokio::time::timeout(
-        std::time::Duration::from_secs(15),
-        bcode_fake_provider_plugin::wait_for_fake_event_script_gate_members(
-            &state.selected_provider_context.settings["delegation_fixture_gate"],
-            count as usize,
-        ),
-    )
-    .await;
-    ready.expect("all admitted members must reach provider gate");
+    wait_overlap_barrier(&state, count, &mut cleanup).await;
     bcode_fake_provider_plugin::release_fake_event_script_gate(
         &state.selected_provider_context.settings["delegation_fixture_gate"],
     );
+    eprintln!("fanout checkpoint count={count} settlement=pending");
     let mut progress = crate::workflow_test_support::Progress::subscribe(&state);
     loop {
         crate::drive_workflow_run(&state, "fanout")
@@ -109,8 +139,91 @@ async fn fanout_overlap(count: u32) {
         }
         progress.changed().await;
     }
+    eprintln!("fanout checkpoint count={count} cleanup=pending");
     cleanup.finish_run("fanout").await;
+    eprintln!("fanout checkpoint count={count} cleanup=complete");
     drop(cleanup);
+}
+
+async fn wait_overlap_barrier(state: &ServerState, count: u32, cleanup: &mut FixtureCleanup) {
+    eprintln!("fanout checkpoint count={count} provider_barrier=pending");
+    if tokio::time::timeout(
+        std::time::Duration::from_secs(120),
+        bcode_fake_provider_plugin::wait_for_fake_event_script_gate_members(
+            &state.selected_provider_context.settings["delegation_fixture_gate"],
+            count as usize,
+        ),
+    )
+    .await
+    .is_err()
+    {
+        eprintln!(
+            "fanout barrier failed count={count} executors={:?}",
+            state.plugins.executor_statuses(),
+        );
+        eprintln!(
+            "fanout barrier state={}",
+            bounded_run_diagnostic(state, "fanout").await
+        );
+        bcode_fake_provider_plugin::release_fake_event_script_gate(
+            &state.selected_provider_context.settings["delegation_fixture_gate"],
+        );
+        // Retain normal provider settlement during failure cleanup. A cleanup deadline
+        // is diagnostic only; FixtureCleanup's drop retains unresolved owned tasks.
+        let drained =
+            tokio::time::timeout(std::time::Duration::from_secs(120), cleanup.finish()).await;
+        assert!(
+            drained.is_ok(),
+            "fanout barrier failed; cleanup remains unresolved"
+        );
+        panic!("all {count} providers must overlap before release");
+    }
+    eprintln!("fanout checkpoint count={count} provider_barrier=ready");
+}
+
+async fn report_overlap_failure(state: &ServerState, db: &dyn Database, count: u32) {
+    let pending = representation::attempts::pending(db, "fanout", None, 100).await;
+    let pending_facts = pending.as_ref().ok().map(|attempts| {
+        attempts
+            .iter()
+            .map(|attempt| {
+                (
+                    &attempt.prepared.node_id,
+                    attempt.prepared.attempt,
+                    attempt.receipt.is_some(),
+                )
+            })
+            .collect::<Vec<_>>()
+    });
+    let observations =
+        representation::admission_observation::inspect(db, "fanout", None, 100).await;
+    let observation_facts = observations.as_ref().ok().map(|observations| {
+        observations
+            .iter()
+            .map(|observation| {
+                (
+                    &observation.node_id,
+                    observation.phase,
+                    observation.category,
+                )
+            })
+            .collect::<Vec<_>>()
+    });
+    let snapshot = state.metrics.snapshot();
+    let owner_counters = snapshot
+        .counters
+        .iter()
+        .filter(|(name, _)| {
+            name.starts_with("workflow.owner.") || name.starts_with("workflow.persistence.")
+        })
+        .take(32)
+        .collect::<Vec<_>>();
+    eprintln!(
+        "fanout checkpoint count={count} store_poisoned={} pending_read_ok={} pending={pending_facts:?} admission_read_ok={} admission={observation_facts:?} owner_counters={owner_counters:?}",
+        state.workflow_store.is_poisoned(),
+        pending.is_ok(),
+        observations.is_ok(),
+    );
 }
 
 async fn admit_overlap_fixture(
@@ -189,7 +302,7 @@ impl Drop for ArmStages {
 async fn normal_start_fanout_respects_cap8_and_uncapped32() {
     let _fixture = FANOUT_FIXTURE.lock().await;
     for cap in [Some(8), None] {
-        let (_root, _sessions, state, _) = typed_provider_fixture_with_delegation(true).await;
+        let (_root, _sessions, state, _) = fanout_provider_fixture().await;
         let mut cleanup = FixtureCleanup::new(&state);
         let _stages = ArmStages(super::super::fanout_stages::Experiment::begin(
             if cap.is_some() {
@@ -312,7 +425,7 @@ async fn probe_workspace(experiment_id: &str, minimal: bool, cap: Option<u32>) {
             .canonicalize()
             .expect("checkout workspace")
     };
-    let (_root, _sessions, state, _) = typed_provider_fixture_with_delegation(true).await;
+    let (_root, _sessions, state, _) = fanout_provider_fixture().await;
     let gate =
         ReleaseGate(state.selected_provider_context.settings["delegation_fixture_gate"].clone());
     bcode_fake_provider_plugin::forget_fake_event_script_gate_ready(&gate.0);

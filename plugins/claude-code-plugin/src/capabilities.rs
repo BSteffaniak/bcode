@@ -21,6 +21,13 @@ fn unsupported(message: &str) -> HarnessCapability {
     }
 }
 
+/// API custody provides local credential readiness, not native login or remote verification.
+pub fn api_auth_capability() -> HarnessCapability {
+    constrained(
+        "Exact host-admitted vault profile required; no native login, ambient key, subscription fallback or implicit remote verification",
+    )
+}
+
 pub fn capabilities(settlement: SettlementSupport) -> HarnessCapabilities {
     let authoritative = settlement == SettlementSupport::VerifiedSessionState;
     HarnessCapabilities {

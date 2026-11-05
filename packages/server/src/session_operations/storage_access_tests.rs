@@ -185,7 +185,7 @@ async fn projection_history_pages_survive_client_reconnect_over_real_ipc() {
         .expect("newest event")
         .sequence;
     let state = std::sync::Arc::new(crate::tests::test_server_state(sessions));
-    let socket_dir = tempfile::tempdir().expect("socket directory");
+    let socket_dir = crate::tests::test_socket_dir().expect("socket directory");
     let request = |anchor, direction| ProjectionWindowRequest {
         projection: SessionProjectionKind::Transcript,
         anchor,

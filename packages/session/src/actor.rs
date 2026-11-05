@@ -1,5 +1,6 @@
 //! Session actor, handle, and snapshot plumbing.
 pub mod harness;
+pub mod managed_tool;
 
 #[cfg(test)]
 #[path = "milestone/actor_tests.rs"]
@@ -677,6 +678,21 @@ impl SessionHandle {
         timestamp: u64,
     ) -> Result<harness::HarnessResult, SessionError> {
         self.send(|reply| SessionCommand::HarnessOperation {
+            owner,
+            action,
+            timestamp,
+            reply,
+        })
+        .await?
+    }
+
+    pub(crate) async fn managed_tool_action(
+        &self,
+        owner: bcode_session_models::ExternalHarnessOwner,
+        action: managed_tool::Action,
+        timestamp: u64,
+    ) -> Result<managed_tool::Reply, SessionError> {
+        self.send(|reply| SessionCommand::ManagedTool {
             owner,
             action,
             timestamp,
@@ -1849,6 +1865,12 @@ enum SessionCommand {
         limit: u16,
         reply: oneshot::Sender<Result<bcode_harness_models::HarnessObservationPage, SessionError>>,
     },
+    ManagedTool {
+        owner: bcode_session_models::ExternalHarnessOwner,
+        action: managed_tool::Action,
+        timestamp: u64,
+        reply: oneshot::Sender<Result<managed_tool::Reply, SessionError>>,
+    },
     HarnessOperation {
         owner: bcode_session_models::ExternalHarnessOwner,
         action: harness::HarnessAction,
@@ -2932,6 +2954,7 @@ impl SessionActor {
                 false
             }),
             SessionCommand::HarnessSnapshot(reply) => Box::pin(async move {
+                tracing::warn!(target: "bcode_session::harness", stage = "snapshot_enter", "managed actor progress");
                 // Observation does not reacquire a runtime lease. Reuse a live actor DB,
                 // otherwise make a short-lived non-migrating open and retain no handle.
                 let result = if let Some(db) = self.db.as_ref() {
@@ -2951,6 +2974,7 @@ impl SessionActor {
                 } else {
                     Ok(None)
                 };
+                tracing::warn!(target: "bcode_session::harness", stage = "snapshot_exit", success = result.is_ok(), "managed actor progress");
                 let _ = reply.send(result);
                 false
             }),
@@ -2967,13 +2991,34 @@ impl SessionActor {
                 let _ = reply.send(result);
                 false
             }),
+            SessionCommand::ManagedTool {
+                owner,
+                action,
+                timestamp,
+                reply,
+            } => Box::pin(async move {
+                let result = Box::pin(self.managed_tool_action(owner, action, timestamp)).await;
+                let _ = reply.send(result);
+                false
+            }),
             SessionCommand::HarnessOperation {
                 owner,
                 action,
                 timestamp,
                 reply,
             } => Box::pin(async move {
+                let diagnostic = match &action {
+                    harness::HarnessAction::State => Some("state"),
+                    harness::HarnessAction::Page { .. } => Some("page"),
+                    _ => None,
+                };
+                if let Some(operation) = diagnostic {
+                    tracing::warn!(target: "bcode_session::harness", stage = "operation_enter", operation, "managed actor progress");
+                }
                 let result = Box::pin(self.harness_operation(owner, action, timestamp)).await;
+                if let Some(operation) = diagnostic {
+                    tracing::warn!(target: "bcode_session::harness", stage = "operation_exit", operation, success = result.is_ok(), "managed actor progress");
+                }
                 let _ = reply.send(result);
                 false
             }),
@@ -4358,6 +4403,40 @@ impl SessionActor {
     }
 
     fn validate_harness_append_owner(&self, kind: &SessionEventKind) -> Result<(), SessionError> {
+        if let SessionEventKind::ToolInvocationLifecycle { event } = kind
+            && event
+                .metadata
+                .get(bcode_session_models::MANAGED_TOOL_CLAIM_KEY)
+                .is_some()
+        {
+            let transition: bcode_session_models::ManagedToolClaimEvent = serde_json::from_value(
+                event.metadata[bcode_session_models::MANAGED_TOOL_CLAIM_KEY].clone(),
+            )
+            .map_err(|_| SessionError::EventSerialization("invalid managed tool claim".into()))?;
+            let owner = match &transition {
+                bcode_session_models::ManagedToolClaimEvent::Claimed { identity }
+                | bcode_session_models::ManagedToolClaimEvent::Started { identity, .. } => {
+                    &identity.owner
+                }
+            };
+            let lease = self
+                .lease
+                .as_ref()
+                .ok_or_else(|| {
+                    SessionError::EventSerialization(
+                        "managed tool claim requires live lease".into(),
+                    )
+                })?
+                .owner();
+            if owner.session_id != self.state.summary.id
+                || lease.build_fingerprint.as_deref() != Some(owner.artifact_id.as_str())
+                || lease.daemon_instance_id.as_deref() != Some(owner.daemon_id.as_str())
+            {
+                return Err(SessionError::EventSerialization(
+                    "managed tool lease mismatch".into(),
+                ));
+            }
+        }
         if let SessionEventKind::ExternalHarnessOperation { operation } = kind {
             operation
                 .validate()
@@ -4403,7 +4482,7 @@ impl SessionActor {
 
     async fn append_event_conditionally(
         &mut self,
-        kind: SessionEventKind,
+        mut kind: SessionEventKind,
         provenance: Option<SessionEventProvenance>,
         activity_timestamp_ms: u64,
         expected_generation: Option<u64>,
@@ -4440,6 +4519,13 @@ impl SessionActor {
             let readiness_started_at = Instant::now();
             self.ensure_session_db_for_write().await?;
             self.refresh_state_from_db_for_write().await?;
+            if let SessionEventKind::ExternalHarnessOperation { operation } = &mut kind {
+                self.db
+                    .as_ref()
+                    .ok_or(SessionError::DbUnavailable(self.state.summary.id))?
+                    .prepare_harness_inventory_operation(operation, self.state.next_sequence)
+                    .await?;
+            }
             self.validate_append_generation(expected_generation)?;
             if self.child_transition_recorded(child_transition).await? {
                 return Ok(None);

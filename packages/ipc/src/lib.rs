@@ -146,8 +146,9 @@ const MAX_CHUNK_DATA_SIZE: usize = MAX_FRAME_PAYLOAD_SIZE / 2;
 /// Version 58 adds explicit session-scoped local X-ray endpoint bootstrap and revocation.
 /// Version 59 adds non-owning bounded activity and child-window watch delivery.
 /// Older positional request/response layouts are rejected rather than misinterpreted.
-/// Version 60 adds the managed-session application boundary alongside the upstream layout.
-pub const CURRENT_PROTOCOL_VERSION: u16 = 60;
+/// Version 61 combines upstream contracts with managed execution lifecycle observations.
+/// Older positional payloads are rejected.
+pub const CURRENT_PROTOCOL_VERSION: u16 = 61;
 
 /// Durable session-storage writer epoch expected by this IPC build.
 pub const CURRENT_SESSION_STORAGE_WRITER_EPOCH: u32 =
@@ -4693,9 +4694,11 @@ mod tests {
             panic!("typed discovery response");
         };
         assert_eq!(actual, page);
-        assert_eq!(CURRENT_PROTOCOL_VERSION, 60);
+        assert_eq!(CURRENT_PROTOCOL_VERSION, 61);
         assert_ne!(ProtocolVersion(56), ProtocolVersion::current());
         assert_ne!(ProtocolVersion(59), ProtocolVersion::current());
+        assert_ne!(ProtocolVersion(57), ProtocolVersion::current());
+        assert_ne!(ProtocolVersion(60), ProtocolVersion::current());
     }
 
     #[test]

@@ -73,6 +73,37 @@ pub(super) fn pack(
     )
 }
 
+/// Pack complete JSON-line fragment records, not storage-oriented aggregations.
+/// JSON serialization escapes embedded newlines; record bytes and chronological
+/// provenance remain unchanged. Genuine indivisible overflow still fails closed.
+pub(super) fn pack_fragment_records_with_policy(
+    source: &[String],
+    template: &ModelTurnRequest,
+    policy: &ResolvedSummaryPolicy,
+) -> Result<Vec<String>, CompactionError> {
+    let mut records = Vec::new();
+    for chunk in source {
+        for record in chunk.split_inclusive('\n') {
+            if record.len() > COMPACTION_MAX_SUMMARY_INPUT_CHARS
+                || !record.ends_with('\n')
+                || !serde_json::from_str::<serde_json::Value>(record)
+                    .is_ok_and(|value| value.is_object())
+            {
+                return Err(CompactionError::Provider(
+                    "incomplete serialized compaction fragment; coverage unchanged".into(),
+                ));
+            }
+            records.push(record.to_owned());
+        }
+    }
+    if records.is_empty() {
+        return Err(CompactionError::Provider(
+            "no serialized compaction fragments; coverage unchanged".into(),
+        ));
+    }
+    pack_with_policy(PackingGate::Capacity, &records, template, policy)
+}
+
 /// Capacity-aware packing uses the frozen policy for carry and actual complete-request checks.
 /// Disabled packing still preserves the original chronological chunks byte-for-byte. The parent
 /// must validate every actual request, even when packing is disabled.
@@ -294,6 +325,61 @@ mod tests {
             maximum_response_bytes: summary_bytes * 2,
         })
         .unwrap()
+    }
+
+    #[test]
+    fn complete_fragment_records_repack_large_storage_chunks_without_loss() {
+        let mut request = template();
+        request.structured_output =
+            Some(super::super::response::ResponseContract::Replace.request());
+        let policy = policy_for_window(&request, 8_192, 8_000);
+        let records: Vec<_> = (0..80).map(|index| {
+            format!("{}\n", serde_json::json!({
+                "sequence":index, "provenance":"user", "byte_offset":0,
+                "final_fragment":true, "text":format!("record-{index}: {}", "界🙂\\\"\n".repeat(24))
+            }))
+        }).collect();
+        let source = vec![records.concat()];
+        // The storage aggregation is too large as one indivisible packing unit.
+        assert!(pack_with_policy(PackingGate::Capacity, &source, &request, &policy).is_err());
+        let packed = pack_fragment_records_with_policy(&source, &request, &policy).unwrap();
+        assert!(packed.len() > 1);
+        assert_eq!(packed.concat(), source.concat());
+        let decoded: Vec<serde_json::Value> = packed
+            .iter()
+            .flat_map(|chunk| chunk.lines())
+            .map(|record| serde_json::from_str(record).unwrap())
+            .collect();
+        assert_eq!(decoded.len(), records.len());
+        for (index, value) in decoded.iter().enumerate() {
+            assert_eq!(value["sequence"], index);
+            assert_eq!(value["byte_offset"], 0);
+            assert_eq!(value["final_fragment"], true);
+        }
+        // Rechecking each produced batch exercises carry, instruction and repair
+        // headroom through the same complete-request capacity policy.
+        for chunk in &packed {
+            assert!(
+                pack_fragment_records_with_policy(std::slice::from_ref(chunk), &request, &policy)
+                    .is_ok()
+            );
+        }
+    }
+
+    #[test]
+    fn genuine_indivisible_fragment_overcapacity_fails_without_clipping() {
+        let request = template();
+        let policy = policy_for_window(&request, 8_192, 8_000);
+        let source = vec![format!(
+            "{}\n",
+            serde_json::json!({
+                "sequence":1, "provenance":"user", "byte_offset":0,
+                "final_fragment":true, "text":"x".repeat(64_000)
+            })
+        )];
+        assert!(pack_fragment_records_with_policy(&source, &request, &policy).is_err());
+        let incomplete = vec!["{\"sequence\":1}".to_owned()];
+        assert!(pack_fragment_records_with_policy(&incomplete, &request, &policy).is_err());
     }
 
     #[test]

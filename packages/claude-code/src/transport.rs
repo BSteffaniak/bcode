@@ -57,7 +57,22 @@ impl Fault {
         }
     }
 }
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ReapState {
+    Pending,
+    Reaped,
+    Failed,
+}
+
+/// Supervisor-observed successful OS process wait, not a protocol acknowledgement.
+/// This proves transport release only; it does not establish absence of tool effects.
+#[derive(Debug)]
+pub struct PhysicalReap {
+    _private: (),
+}
+
 struct Shared {
+    reaped: watch::Sender<ReapState>,
     state: Mutex<State>,
     stop: watch::Sender<bool>,
     writes: mpsc::Sender<Write>,
@@ -65,6 +80,8 @@ struct Shared {
     initialized: AtomicU8,
     identity_changed: Notify,
     limits: crate::Limits,
+    sdk_servers: BTreeSet<String>,
+    sdk_metadata: [AtomicU64; 3],
 }
 impl Shared {
     fn lock(&self) -> MutexGuard<'_, State> {
@@ -159,6 +176,65 @@ pub struct InitializedSession {
 pub struct DeliveryReceipt {
     pub bytes_written: bool,
 }
+/// Secret-free native connection state for the registered host-tools server.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum HostToolsConnection {
+    /// Native reports a connected server; does not prove catalog visibility.
+    Connected,
+    /// Native reports failed connection.
+    Failed,
+    /// Native is still connecting.
+    Pending,
+    /// Native reports a disabled server.
+    Disabled,
+    /// Native reports authentication is required.
+    NeedsAuth,
+    /// No matching server was present in a valid bounded status response.
+    Missing,
+    /// Unsupported native status or response shape.
+    Unknown,
+}
+impl HostToolsConnection {
+    /// Stable sanitized diagnostic label; never contains native errors or configuration.
+    #[must_use]
+    const fn label(self) -> &'static str {
+        match self {
+            Self::Connected => "connected",
+            Self::Failed => "failed",
+            Self::Pending => "pending",
+            Self::Disabled => "disabled",
+            Self::NeedsAuth => "needs_auth",
+            Self::Missing => "missing",
+            Self::Unknown => "unknown",
+        }
+    }
+}
+fn host_tools_connection(value: &Value) -> HostToolsConnection {
+    let Some(servers) = value.get("mcpServers").and_then(Value::as_array) else {
+        return HostToolsConnection::Unknown;
+    };
+    if servers.len() > 256 {
+        return HostToolsConnection::Unknown;
+    }
+    let mut selected = servers
+        .iter()
+        .filter(|server| server["name"] == "bcode-tools");
+    let Some(server) = selected.next() else {
+        return HostToolsConnection::Missing;
+    };
+    if selected.next().is_some() {
+        return HostToolsConnection::Unknown;
+    }
+    match server["status"].as_str() {
+        Some("connected") => HostToolsConnection::Connected,
+        Some("failed") => HostToolsConnection::Failed,
+        Some("pending") => HostToolsConnection::Pending,
+        Some("disabled") => HostToolsConnection::Disabled,
+        Some("needs-auth") => HostToolsConnection::NeedsAuth,
+        _ => HostToolsConnection::Unknown,
+    }
+}
+
 /// Cloneable control handle. All clones address only the originally spawned process.
 #[derive(Clone)]
 pub struct ClaudeClient {
@@ -298,6 +374,7 @@ impl ClaudeSession {
         without_tools: bool,
     ) -> Result<Self, Error> {
         let native_servers = sdk_server_configuration(servers)?;
+        let sdk_servers = native_servers.keys().cloned().collect();
         let auth = crate::auth_status(&options).await?;
         if !auth.logged_in {
             return Err(Error::InvalidConfiguration(
@@ -326,8 +403,9 @@ impl ClaudeSession {
         let stderr = child.stderr.take().ok_or(Error::Closed)?;
         let (event_tx, events) = mpsc::channel(options.limits.queued_events);
         let (write_tx, write_rx) = mpsc::channel(options.limits.queued_writes);
-        let (stop, mut stopped) = watch::channel(false);
+        let (stop, stopped) = watch::channel(false);
         let shared = Arc::new(Shared {
+            reaped: watch::channel(ReapState::Pending).0,
             state: Mutex::new(State {
                 pending: BTreeMap::new(),
                 callbacks: BTreeMap::new(),
@@ -346,14 +424,16 @@ impl ClaudeSession {
             initialized: AtomicU8::new(0),
             identity_changed: Notify::new(),
             limits: options.limits,
+            sdk_servers,
+            sdk_metadata: std::array::from_fn(|_| AtomicU64::new(0)),
         });
         let reader_shared = Arc::clone(&shared);
-        let mut reader = tokio::spawn(async move {
+        let reader = tokio::spawn(async move {
             read_stdout(stdout, reader_shared, event_tx).await;
         });
         // Stderr is intentionally drained without retaining secret-bearing diagnostics.
         let err_shared = Arc::clone(&shared);
-        let mut stderr_reader = tokio::spawn(async move {
+        let stderr_reader = tokio::spawn(async move {
             if drain(stderr).await.is_err() {
                 err_shared.fail(Fault::Closed);
             }
@@ -362,23 +442,7 @@ impl ClaudeSession {
         let writer = tokio::spawn(async move {
             write_stdin(stdin, write_rx, writer_shared).await;
         });
-        let supervisor_shared = Arc::clone(&shared);
-        let supervisor = tokio::spawn(async move {
-            tokio::select! {
-                _ = child.wait() => {},
-                _ = stopped.changed() => { let _ = child.kill().await; let _ = child.wait().await; },
-            }
-            // Abort writes on exit but drain final buffered observations before terminal uncertainty.
-            writer.abort();
-            let readers = async {
-                let _ = (&mut reader).await;
-                let _ = (&mut stderr_reader).await;
-            };
-            let _ = tokio::time::timeout(Duration::from_secs(2), readers).await;
-            supervisor_shared.fail(Fault::Closed);
-            reader.abort();
-            stderr_reader.abort();
-        });
+        let supervisor = supervise_process(child, stopped, reader, stderr_reader, writer, &shared);
         Ok(Self {
             client: ClaudeClient { shared },
             events,
@@ -408,6 +472,18 @@ impl ClaudeSession {
                 .error()),
         }
     }
+    /// Stop and await supervisor-observed physical reap, unlike protocol Close acknowledgement.
+    /// # Errors
+    /// Returns `Closed` when process release cannot be proved within the request deadline.
+    pub async fn close_reaped(mut self) -> Result<PhysicalReap, Error> {
+        self.client.terminate();
+        let proof = self.client.wait_reaped().await?;
+        if let Some(supervisor) = self.supervisor.take() {
+            supervisor.await.map_err(|_| Error::Closed)?;
+        }
+        Ok(proof)
+    }
+
     /// Kill and reap the process. Cancellation is never reported as proof of no effects.
     pub async fn close(mut self) {
         self.client.terminate();
@@ -416,6 +492,49 @@ impl ClaudeSession {
         }
     }
 }
+// Own process lifetime and pipe cleanup together; publish physical release only after join.
+fn supervise_process(
+    mut child: tokio::process::Child,
+    mut stopped: watch::Receiver<bool>,
+    mut reader: JoinHandle<()>,
+    mut stderr_reader: JoinHandle<()>,
+    writer: JoinHandle<()>,
+    shared: &Arc<Shared>,
+) -> JoinHandle<()> {
+    let supervisor_shared = Arc::clone(shared);
+    let supervisor = tokio::spawn(async move {
+        let waited = tokio::select! {
+            result = child.wait() => result,
+            _ = stopped.changed() => {
+                let _ = child.start_kill();
+                child.wait().await
+            },
+        };
+        // Abort writes on exit but drain final buffered observations before terminal uncertainty.
+        writer.abort();
+        let readers = async {
+            let _ = (&mut reader).await;
+            let _ = (&mut stderr_reader).await;
+        };
+        let _ = tokio::time::timeout(Duration::from_secs(2), readers).await;
+        supervisor_shared.fail(Fault::Closed);
+        reader.abort();
+        stderr_reader.abort();
+        waited.is_ok()
+    });
+    // Only the join observer publishes proof: native Ack, signal delivery and
+    // an OS wait before supervisor cleanup are insufficient.
+    let completion_shared = Arc::clone(shared);
+    tokio::spawn(async move {
+        let completed = matches!(supervisor.await, Ok(true));
+        let _ = completion_shared.reaped.send_replace(if completed {
+            ReapState::Reaped
+        } else {
+            ReapState::Failed
+        });
+    })
+}
+
 impl Drop for ClaudeSession {
     fn drop(&mut self) {
         self.client.terminate();
@@ -425,6 +544,22 @@ impl ClaudeClient {
     #[must_use]
     pub fn settlement(&self) -> Settlement {
         self.shared.lock().settlement()
+    }
+    /// Current live transport admission for a subsequent foreground turn.
+    /// Background work need not be settled. This is not host execution authority,
+    /// a conditional native start, or a guarantee against future native wake work.
+    #[must_use]
+    pub fn can_submit_next_turn(&self) -> bool {
+        let state = self.shared.lock();
+        state.fault.is_none()
+            && state.callbacks.values().all(is_mcp_catalog)
+            && state.lifecycle.can_submit()
+    }
+    /// Release process-local attribution only after host-acknowledged terminal and
+    /// associated-work evidence. Does not authorize replay; the host retains durable
+    /// submission fencing beyond the bounded recent-duplicate window.
+    pub fn retire_acknowledged_submission(&self, uuid: &crate::SubmissionUuid) {
+        self.shared.lock().attribution.retire(uuid);
     }
     /// Whether the control handshake succeeded and the process has no observed fault.
     /// Does not imply identity confirmation, settlement, or durable resume.
@@ -455,6 +590,28 @@ impl ClaudeClient {
         drop(state);
         identity
     }
+    /// Wait for supervisor-confirmed physical process release without issuing a stop.
+    /// # Errors
+    /// Returns `Closed` if wait fails or the configured request deadline expires.
+    /// Failure never proves release or absence of side effects.
+    pub async fn wait_reaped(&self) -> Result<PhysicalReap, Error> {
+        let mut reaped = self.shared.reaped.subscribe();
+        let wait = async {
+            loop {
+                let state = *reaped.borrow_and_update();
+                match state {
+                    ReapState::Reaped => return Ok(PhysicalReap { _private: () }),
+                    ReapState::Failed => return Err(Error::Closed),
+                    ReapState::Pending => {}
+                }
+                reaped.changed().await.map_err(|_| Error::Closed)?;
+            }
+        };
+        tokio::time::timeout(self.shared.limits.request_timeout, wait)
+            .await
+            .map_err(|_| Error::Closed)?
+    }
+
     /// Hard stop; use `interrupt` for the native cooperative control operation.
     pub fn terminate(&self) {
         self.shared.fail(Fault::Closed);
@@ -546,8 +703,21 @@ impl ClaudeClient {
             limit: self.shared.limits.frame_bytes,
         };
         serde_json::to_writer(&mut bound, &request).map_err(|_| Error::Capacity)?;
-        let native_request: Value =
+        let mut native_request: Value =
             serde_json::from_slice(&bound.bytes).map_err(|_| Error::Protocol)?;
+        add_sdk_registration(
+            &mut native_request,
+            initialization,
+            &self.shared.sdk_servers,
+        );
+        self.request_wire(native_request, initialization).await
+    }
+
+    async fn request_wire(
+        &self,
+        native_request: Value,
+        initialization: bool,
+    ) -> Result<ControlTicket, Error> {
         let id = format!(
             "rust_{}",
             self.shared.counter.fetch_add(1, Ordering::Relaxed)
@@ -597,8 +767,9 @@ impl ClaudeClient {
     }
     /// Submit one exact client-selected attempt UUID, retained before enqueueing.
     /// The UUID is a correlation key, never a native turn ID. A failed/uncertain
-    /// write does not release it or authorize retry. At most 256 UUIDs are retained
-    /// for this process lifetime; callers must not mix attributed and legacy sends.
+    /// write does not release it or authorize retry. At most 256 live/recent UUIDs
+    /// are retained; explicit acknowledged retirement permits longer sessions.
+    /// Callers must not mix attributed and legacy sends.
     /// # Errors
     /// Same as `submit`, plus reused UUID or exhausted retained-attempt capacity.
     pub async fn submit_with_uuid(
@@ -609,6 +780,70 @@ impl ClaudeClient {
     ) -> Result<DeliveryReceipt, Error> {
         self.submit_inner(text, native_session_id, Some(uuid)).await
     }
+    /// Read native MCP status and return only the host-tools connection category.
+    /// Raw native errors, server URLs and account metadata are never returned.
+    /// # Errors
+    /// Uninitialized/closed transport, unsupported native operation or bounded timeout.
+    pub async fn host_tools_status(&self) -> Result<&'static str, Error> {
+        if !self.is_control_ready() {
+            return Err(Error::InvalidConfiguration("not initialized"));
+        }
+        let response = self
+            .request_wire(json!({"subtype":"mcp_status"}), false)
+            .await?
+            .wait()
+            .await?;
+        Ok(host_tools_connection(&response).label())
+    }
+
+    /// Saturating counts of startup initialize, startup empty catalog and live catalog requests.
+    /// No native content or identifiers are retained.
+    #[must_use]
+    pub fn sdk_metadata_counts(&self) -> [u64; 3] {
+        std::array::from_fn(|index| self.shared.sdk_metadata[index].load(Ordering::Relaxed))
+    }
+
+    /// Deliver catalog-change notifications using retained, bounded control requests.
+    /// Acknowledgement proves receipt only, not catalog discovery. Call outside service/queue locks.
+    /// # Errors
+    /// Returns sanitized rejection, closed transport, capacity or uncertain timeout. Never retries.
+    pub async fn refresh_sdk_catalogs_acknowledged(&self) -> Result<(), Error> {
+        if !self.is_control_ready() {
+            return Err(Error::InvalidConfiguration("not initialized"));
+        }
+        for server in &self.shared.sdk_servers {
+            self.request_wire(
+                json!({"subtype":"mcp_message", "server_name":server,
+                "message":{"jsonrpc":"2.0", "method":"notifications/tools/list_changed"}}),
+                false,
+            )
+            .await?
+            .wait()
+            .await?;
+        }
+        Ok(())
+    }
+
+    /// Queue metadata rediscovery after host binding, before the next input frame.
+    /// Never waits for native discovery or callbacks; callers may hold a plugin service
+    /// lock, but must release their queue mutex before calling. This grants no authority.
+    /// # Errors
+    /// Closed transport or bounded write-queue capacity pressure.
+    pub fn refresh_sdk_catalogs(&self) -> Result<(), Error> {
+        if !self.is_control_ready() {
+            return Err(Error::InvalidConfiguration("not initialized"));
+        }
+        for server in &self.shared.sdk_servers {
+            let id = format!(
+                "rust_{}",
+                self.shared.counter.fetch_add(1, Ordering::Relaxed)
+            );
+            let message = sdk_catalog_changed(&id, server);
+            let _written = self.shared.enqueue(&message, None)?;
+        }
+        Ok(())
+    }
+
     async fn submit_inner(
         &self,
         text: &str,
@@ -643,7 +878,7 @@ impl ClaudeClient {
             if let Some(fault) = state.fault {
                 return Err(fault.error());
             }
-            if !state.lifecycle.can_submit() || !state.callbacks.is_empty() {
+            if !state.lifecycle.can_submit() || !state.callbacks.values().all(is_mcp_catalog) {
                 return Err(Error::InvalidConfiguration(
                     "active turn steering is unsupported; wait for authoritative settlement",
                 ));
@@ -875,6 +1110,68 @@ fn handle_control_response(value: &Value, shared: &Shared, state: &mut State) ->
     }
     Ok(())
 }
+fn is_mcp_catalog(request: &CallbackRequest) -> bool {
+    matches!(request, CallbackRequest::McpMessage { message, .. }
+        if message["jsonrpc"] == "2.0" && message["method"] == "tools/list")
+}
+
+fn sdk_catalog_changed(id: &str, server: &str) -> Value {
+    json!({"type":"control_request", "request_id":id,
+        "request":{"subtype":"mcp_message", "server_name":server,
+            "message":{"jsonrpc":"2.0", "method":"notifications/tools/list_changed"}}})
+}
+
+fn add_sdk_registration(request: &mut Value, initializing: bool, servers: &BTreeSet<String>) {
+    if initializing && !servers.is_empty() {
+        request["sdkMcpServers"] = json!(servers);
+    }
+}
+
+fn record_sdk_metadata(request: &CallbackRequest, shared: &Shared) {
+    let CallbackRequest::McpMessage {
+        server_name,
+        message,
+    } = request
+    else {
+        return;
+    };
+    if !shared.sdk_servers.contains(server_name) || message["jsonrpc"] != "2.0" {
+        return;
+    }
+    let initializing = shared.initialized.load(Ordering::Acquire) != 2;
+    let index = match message["method"].as_str() {
+        Some("initialize") => 0,
+        Some("tools/list") if initializing => 1,
+        Some("tools/list") => 2,
+        _ => return,
+    };
+    let _ = shared.sdk_metadata[index].try_update(Ordering::Relaxed, Ordering::Relaxed, |value| {
+        Some(value.saturating_add(1))
+    });
+}
+
+fn sdk_startup_response(request: &CallbackRequest, initializing: bool) -> Option<Value> {
+    let CallbackRequest::McpMessage { message, .. } = request else {
+        return None;
+    };
+    if message["jsonrpc"] != "2.0" {
+        return None;
+    }
+    let result = match message["method"].as_str()? {
+        "initialize" => json!({
+            "protocolVersion": "2024-11-05",
+            "capabilities": {"tools": {"listChanged": true}},
+            "serverInfo": {"name": "bcode-sdk", "version": "1.0.0"},
+        }),
+        "ping" | "notifications/initialized" => json!({}),
+        "tools/list" if initializing => json!({"tools": []}),
+        _ => return None,
+    };
+    // CLI stream-json acknowledges notifications with an empty result as well.
+    let id = message.get("id").cloned().unwrap_or_else(|| json!(0));
+    Some(json!({"mcp_response": {"jsonrpc":"2.0", "id":id, "result":result}}))
+}
+
 fn handle_control_request(
     value: &Value,
     shared: &Shared,
@@ -895,7 +1192,21 @@ fn handle_control_request(
     let request: CallbackRequest =
         serde_json::from_value(value.get("request").cloned().ok_or(Error::Protocol)?)
             .map_err(|_| Error::Protocol)?;
-    state.lifecycle.attention();
+    record_sdk_metadata(&request, shared);
+    if let CallbackRequest::McpMessage { server_name, .. } = &request
+        && shared.sdk_servers.contains(server_name)
+        && let Some(payload) =
+            sdk_startup_response(&request, shared.initialized.load(Ordering::Acquire) != 2)
+    {
+        let response = json!({"type":"control_response","response":{"subtype":"success","request_id":id,"response":payload}});
+        // Initialization must not depend on a plugin drain that starts only after Open.
+        // Only protocol negotiation and an empty pre-grant catalog are handled here.
+        let _written = shared.enqueue(&response, None)?;
+        return Ok(());
+    }
+    if !is_mcp_catalog(&request) {
+        state.lifecycle.attention();
+    }
     state.callbacks.insert(id.to_owned(), request.clone());
     send_event(
         events,
@@ -961,7 +1272,7 @@ fn route(value: Value, shared: &Shared, events: &mpsc::Sender<Event>) -> Result<
                     return Err(Error::SessionIdentity);
                 }
             }
-            let attribution = state.attribution.observe(&value)?;
+            let attribution = state.attribution.observe_delivery(&value)?;
             if attribution.is_some() {
                 let id = value
                     .get("session_id")
@@ -999,4 +1310,440 @@ fn route(value: Value, shared: &Shared, events: &mpsc::Sender<Event>) -> Result<
         _ => return Err(Error::Protocol),
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod sdk_handshake_tests {
+    use super::*;
+
+    #[test]
+    fn native_mcp_status_exposes_only_typed_connection_category() {
+        assert_eq!(host_tools_connection(&json!({"mcpServers":[{
+            "name":"bcode-tools", "status":"connected", "error":"DO_NOT_EXPORT", "config":{"url":"SECRET"},
+        }]})).label(), "connected");
+        assert_eq!(
+            host_tools_connection(&json!({"mcpServers":[]})).label(),
+            "missing"
+        );
+        assert_eq!(
+            host_tools_connection(
+                &json!({"mcpServers":[{"name":"bcode-tools","status":"future"}]})
+            )
+            .label(),
+            "unknown"
+        );
+        assert_eq!(
+            host_tools_connection(
+                &json!({"mcpServers":[{"name":"bcode-tools","status":"failed"}]})
+            )
+            .label(),
+            "failed"
+        );
+        assert_eq!(
+            host_tools_connection(&json!({"unexpected":"SECRET"})).label(),
+            "unknown"
+        );
+    }
+
+    #[test]
+    fn initialize_registers_sdk_servers_only_on_negotiation() {
+        let servers = BTreeSet::from(["bcode-tools".into()]);
+        let mut initialize =
+            serde_json::to_value(ControlRequest::Initialize { hooks: None }).unwrap();
+        add_sdk_registration(&mut initialize, true, &servers);
+        assert_eq!(initialize["sdkMcpServers"], json!(["bcode-tools"]));
+        let mut interrupt = serde_json::to_value(ControlRequest::Interrupt).unwrap();
+        add_sdk_registration(&mut interrupt, false, &servers);
+        assert!(interrupt.get("sdkMcpServers").is_none());
+    }
+
+    #[tokio::test]
+    async fn termination_signal_is_not_physical_reap_evidence() {
+        let (client, _written) = handshake_transport();
+        client.terminate();
+        let waiting = client.wait_reaped();
+        tokio::pin!(waiting);
+        tokio::select! {
+            biased;
+            _ = &mut waiting => panic!("termination is not proof of reap"),
+            () = tokio::task::yield_now() => {},
+        }
+        let _ = client.shared.reaped.send_replace(ReapState::Reaped);
+        assert!(waiting.await.is_ok());
+        // A later observer sees retained proof; no notification race or second stop.
+        assert!(client.wait_reaped().await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn failed_process_wait_cannot_prove_release() {
+        let (client, _written) = handshake_transport();
+        let _ = client.shared.reaped.send_replace(ReapState::Failed);
+        assert!(client.wait_reaped().await.is_err());
+    }
+
+    fn handshake_transport() -> (ClaudeClient, mpsc::Receiver<Write>) {
+        let (writes, written) = mpsc::channel(8);
+        let (stop, _stopped) = watch::channel(false);
+        let shared = Shared {
+            reaped: watch::channel(ReapState::Pending).0,
+            state: Mutex::new(State {
+                pending: BTreeMap::new(),
+                callbacks: BTreeMap::new(),
+                responding: BTreeSet::new(),
+                lifecycle: Lifecycle::new(crate::SettlementSupport::VerifiedSessionState, 8),
+                attribution: crate::attribution::AttributionLedger::new(),
+                attributed_mode: None,
+                fault: None,
+                expected_session_id: None,
+                confirmed_session_id: None,
+                initialization_request_id: None,
+            }),
+            stop,
+            writes,
+            counter: AtomicU64::new(1),
+            initialized: AtomicU8::new(1),
+            identity_changed: Notify::new(),
+            limits: crate::Limits::default(),
+            sdk_servers: BTreeSet::from(["bcode-tools".into()]),
+            sdk_metadata: std::array::from_fn(|_| AtomicU64::new(0)),
+        };
+        (
+            ClaudeClient {
+                shared: Arc::new(shared),
+            },
+            written,
+        )
+    }
+
+    #[tokio::test]
+    async fn approval_response_allows_correlated_mcp_call_without_replaying_approval() {
+        let (client, mut written) = handshake_transport();
+        client.shared.initialized.store(2, Ordering::Release);
+        let (events, mut received) = mpsc::channel(8);
+        route(
+            json!({"type":"control_request","request_id":"approval",
+                "request":{"subtype":"can_use_tool","tool_name":"mcp__bcode-tools__filesystem_read",
+                "input":{"path":"fixture.txt"},"tool_use_id":"native-read"}}),
+            &client.shared,
+            &events,
+        )
+        .unwrap();
+        assert!(
+            matches!(received.recv().await.unwrap(), Event::Callback { request_id, .. } if request_id == "approval")
+        );
+        let responding = client.respond(
+            "approval",
+            CallbackResponse::Allow {
+                updated_input: json!({"path":"fixture.txt"}),
+            },
+        );
+        let native = async {
+            let write = written.recv().await.unwrap();
+            assert_eq!(write.callback.as_deref(), Some("approval"));
+            let frame: Value = serde_json::from_slice(&write.frame).unwrap();
+            assert_eq!(frame["response"]["request_id"], "approval");
+            // Match the writer's one-time callback consumption before acknowledging bytes.
+            {
+                let mut state = client.shared.lock();
+                assert!(state.responding.remove("approval"));
+                assert!(state.callbacks.remove("approval").is_some());
+                drop(state);
+            }
+            write.ack.send(Ok(())).unwrap();
+            route(
+                json!({"type":"control_request","request_id":"mcp-call",
+                    "request":{"subtype":"mcp_message","server_name":"bcode-tools",
+                    "message":{"jsonrpc":"2.0","id":9,"method":"tools/call",
+                    "params":{"name":"filesystem_read","arguments":{"path":"fixture.txt"}}}}}),
+                &client.shared,
+                &events,
+            )
+            .unwrap();
+        };
+        let (delivered, ()) = tokio::time::timeout(Duration::from_secs(1), async {
+            tokio::join!(responding, native)
+        })
+        .await
+        .unwrap();
+        assert!(delivered.unwrap().bytes_written);
+        assert!(
+            matches!(received.recv().await.unwrap(), Event::Callback { request_id, .. } if request_id == "mcp-call")
+        );
+        assert!(matches!(
+            client.respond("approval", CallbackResponse::Error).await,
+            Err(Error::StaleCallback)
+        ));
+        assert!(written.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn refresh_timeout_is_unknown_and_does_not_replay() {
+        let (mut client, mut written) = handshake_transport();
+        Arc::get_mut(&mut client.shared)
+            .unwrap()
+            .limits
+            .request_timeout = Duration::from_millis(10);
+        client.shared.initialized.store(2, Ordering::Release);
+        let refresh = client.refresh_sdk_catalogs_acknowledged();
+        let native = async {
+            written.recv().await.unwrap().ack.send(Ok(())).unwrap();
+        };
+        let (result, ()) = tokio::join!(refresh, native);
+        assert!(matches!(result, Err(Error::Uncertain)));
+        assert!(client.shared.lock().pending.is_empty());
+        assert!(written.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn refresh_rejection_and_cancellation_retire_only_the_waiter() {
+        let (client, mut written) = handshake_transport();
+        client.shared.initialized.store(2, Ordering::Release);
+        let rejecting = client.refresh_sdk_catalogs_acknowledged();
+        let native = async {
+            let write = written.recv().await.unwrap();
+            let notification: Value = serde_json::from_slice(&write.frame).unwrap();
+            write.ack.send(Ok(())).unwrap();
+            handle_control_response(
+                &json!({"response":{"subtype":"error",
+                "request_id":notification["request_id"],"error":"secret native error"}}),
+                &client.shared,
+                &mut client.shared.lock(),
+            )
+            .unwrap();
+        };
+        let (result, ()) = tokio::join!(rejecting, native);
+        assert!(matches!(result, Err(Error::Protocol)));
+        assert!(client.shared.lock().pending.is_empty());
+        let mut cancelling = Box::pin(client.refresh_sdk_catalogs_acknowledged());
+        tokio::select! {
+            result = &mut cancelling => panic!("unexpected completion: {result:?}"),
+            write = written.recv() => {
+                let write = write.unwrap();
+                assert_eq!(client.shared.lock().pending.len(), 1);
+                write.ack.send(Ok(())).unwrap();
+            }
+        }
+        drop(cancelling);
+        assert!(client.shared.lock().pending.is_empty());
+        assert!(written.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn refresh_retains_correlation_and_routes_catalog_after_startup() {
+        let (client, mut written) = handshake_transport();
+        let (events, mut received) = mpsc::channel(8);
+        route(
+            json!({"type":"control_request","request_id":"startup-list",
+            "request":{"subtype":"mcp_message","server_name":"bcode-tools",
+            "message":{"jsonrpc":"2.0","id":1,"method":"tools/list"}}}),
+            &client.shared,
+            &events,
+        )
+        .unwrap();
+        let startup = written.recv().await.unwrap();
+        let payload: Value = serde_json::from_slice(&startup.frame).unwrap();
+        assert_eq!(
+            payload["response"]["response"]["mcp_response"]["result"]["tools"],
+            json!([])
+        );
+        assert!(received.try_recv().is_err());
+        client.shared.initialized.store(2, Ordering::Release);
+        let refreshing = client.refresh_sdk_catalogs_acknowledged();
+        let native = async {
+            let write = written.recv().await.unwrap();
+            let notification: Value = serde_json::from_slice(&write.frame).unwrap();
+            assert_eq!(
+                notification["request"]["message"]["method"],
+                "notifications/tools/list_changed"
+            );
+            let id = notification["request_id"].as_str().unwrap();
+            assert!(client.shared.lock().pending.contains_key(id));
+            write.ack.send(Ok(())).unwrap();
+            route(
+                json!({"type":"control_request","request_id":"current-list",
+                "request":{"subtype":"mcp_message","server_name":"bcode-tools",
+                "message":{"jsonrpc":"2.0","id":2,"method":"tools/list"}}}),
+                &client.shared,
+                &events,
+            )
+            .unwrap();
+            assert!(matches!(
+                received.recv().await.unwrap(),
+                Event::Callback { .. }
+            ));
+            route(
+                json!({"type":"control_response","response":{"subtype":"success",
+                "request_id":id,"response":{}}}),
+                &client.shared,
+                &events,
+            )
+            .unwrap();
+        };
+        let (result, ()) = tokio::join!(refreshing, native);
+        result.unwrap();
+        assert!(client.shared.lock().pending.is_empty());
+        assert!(client.shared.lock().callbacks.contains_key("current-list"));
+        assert_eq!(client.sdk_metadata_counts(), [0, 1, 1]);
+    }
+
+    #[test]
+    fn bound_catalog_notification_never_waits_for_native_or_callback_pump() {
+        let (client, mut written) = handshake_transport();
+        client.shared.initialized.store(2, Ordering::Release);
+        client.refresh_sdk_catalogs().unwrap();
+        // No writer task, native process or acknowledgement exists. Enqueue must suffice.
+        let notification: Value =
+            serde_json::from_slice(&written.try_recv().unwrap().frame).unwrap();
+        assert_eq!(notification["request"]["subtype"], "mcp_message");
+        assert_eq!(notification["request"]["server_name"], "bcode-tools");
+        assert_eq!(
+            notification["request"]["message"],
+            json!({
+                "jsonrpc":"2.0", "method":"notifications/tools/list_changed",
+            })
+        );
+        // Neither canonical effects nor a pending control waiter are created.
+        assert!(client.shared.lock().pending.is_empty());
+        assert!(client.shared.lock().callbacks.is_empty());
+        for _ in 0..8 {
+            client.refresh_sdk_catalogs().unwrap();
+        }
+        assert!(matches!(
+            client.refresh_sdk_catalogs(),
+            Err(Error::Capacity)
+        ));
+        drop(client);
+    }
+
+    #[test]
+    fn startup_negotiation_needs_no_plugin_consumer_or_tool_grant() {
+        let (client, mut written) = handshake_transport();
+        let shared = &client.shared;
+        let (events, mut received) = mpsc::channel(8);
+        for (id, method) in [
+            (Some(json!(0)), "initialize"),
+            (None, "notifications/initialized"),
+            (Some(json!(1)), "tools/list"),
+        ] {
+            let mut message = json!({"jsonrpc":"2.0","method":method});
+            if let Some(id) = id {
+                message["id"] = id;
+            }
+            route(
+                json!({"type":"control_request","request_id":"sdk-handshake",
+                "request":{"subtype":"mcp_message","server_name":"bcode-tools","message":message}}),
+                shared,
+                &events,
+            )
+            .unwrap();
+            let response: Value =
+                serde_json::from_slice(&written.try_recv().unwrap().frame).unwrap();
+            assert_eq!(response["response"]["request_id"], "sdk-handshake");
+            if method == "initialize" {
+                assert_eq!(
+                    response["response"]["response"]["mcp_response"]["result"]["capabilities"],
+                    json!({"tools":{"listChanged":true}})
+                );
+            }
+            assert!(
+                response["response"]["response"]["mcp_response"]
+                    .get("error")
+                    .is_none()
+            );
+        }
+        assert!(received.try_recv().is_err());
+        assert!(shared.lock().callbacks.is_empty());
+        shared.initialized.store(2, Ordering::Release);
+        route(
+            json!({"type":"control_request","request_id":"catalog-after-init",
+            "request":{"subtype":"mcp_message","server_name":"bcode-tools",
+                "message":{"jsonrpc":"2.0","id":2,"method":"tools/list"}}}),
+            shared,
+            &events,
+        )
+        .unwrap();
+        assert!(matches!(
+            received.try_recv().unwrap(),
+            Event::Callback { .. }
+        ));
+        assert!(written.try_recv().is_err());
+        assert!(
+            client.can_submit_next_turn(),
+            "metadata refresh is not foreground tool execution"
+        );
+        client.shared.lock().callbacks.insert("actual-call".into(), CallbackRequest::McpMessage {
+            server_name: "bcode-tools".into(),
+            message: json!({"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"filesystem.read","arguments":{}}}),
+        });
+        assert!(
+            !client.can_submit_next_turn(),
+            "actual tool callbacks still block new input"
+        );
+        drop(client);
+    }
+}
+
+#[cfg(test)]
+mod retired_delivery_tests {
+    use super::*;
+
+    #[test]
+    fn retired_tool_frame_never_reaches_message_consumers_or_later_task_origin() {
+        const A: &str = "00000000-0000-4000-8000-000000000001";
+        const B: &str = "00000000-0000-4000-8000-000000000002";
+        const FRAME: &str = "11111111-1111-4111-8111-000000000001";
+        for frame_id in [FRAME, A] {
+            let mut attribution = crate::attribution::AttributionLedger::new();
+            let a = crate::SubmissionUuid::new(A.into()).unwrap();
+            attribution.retain(a.clone()).unwrap();
+            attribution
+                .observe(&json!({"type":"assistant","uuid":FRAME,"user_message_uuid":A}))
+                .unwrap();
+            attribution.retire(&a);
+            attribution
+                .retain(crate::SubmissionUuid::new(B.into()).unwrap())
+                .unwrap();
+            let (writes, _writer) = mpsc::channel(8);
+            let (stop, _stopped) = watch::channel(false);
+            let shared = Shared {
+                reaped: watch::channel(ReapState::Pending).0,
+                state: Mutex::new(State {
+                    pending: BTreeMap::new(),
+                    callbacks: BTreeMap::new(),
+                    responding: BTreeSet::new(),
+                    lifecycle: Lifecycle::new(crate::SettlementSupport::VerifiedSessionState, 8),
+                    attribution,
+                    attributed_mode: Some(true),
+                    fault: None,
+                    expected_session_id: None,
+                    confirmed_session_id: None,
+                    initialization_request_id: None,
+                }),
+                stop,
+                writes,
+                counter: AtomicU64::new(1),
+                initialized: AtomicU8::new(0),
+                identity_changed: Notify::new(),
+                limits: crate::Limits::default(),
+                sdk_servers: BTreeSet::new(),
+                sdk_metadata: std::array::from_fn(|_| AtomicU64::new(0)),
+            };
+            let (events, mut received) = mpsc::channel(8);
+            assert!(
+                route(
+                    json!({"type":"assistant","uuid":frame_id,"user_message_uuid":A,
+                "message":{"content":[{"type":"tool_use","id":"late-tool","name":"Bash"}]}}),
+                    &shared,
+                    &events
+                )
+                .is_err()
+            );
+            // Same fail-closed transition used by read_stdout. Subsequent native
+            // task frames cannot escape the fault and be associated with B.
+            shared.fail(Fault::Protocol);
+            route(json!({"type":"system","subtype":"task_started","task_id":"late-task","tool_use_id":"late-tool"}), &shared, &events).unwrap();
+            assert!(received.try_recv().is_err());
+            assert_eq!(shared.lock().settlement(), Settlement::Uncertain);
+        }
+    }
 }

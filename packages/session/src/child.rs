@@ -372,6 +372,10 @@ impl SessionManager {
         request: SessionChildCreateRequest,
         provenance: crate::ExecutionSessionProvenance,
     ) -> Result<SessionSummary, SessionError> {
+        #[cfg(test)]
+        if std::env::var_os("BCODE_TEST_WORKFLOW_STACK_TRACE").is_some() {
+            eprintln!("workflow-stack phase=execution_child.enter");
+        }
         crate::validate_execution_session_provenance(Some(&provenance))?;
         if provenance.context_mode
             != bcode_session_models::ExecutionSessionContextMode::FreshIsolated
@@ -469,61 +473,87 @@ impl SessionManager {
 
     async fn create_child_session_inner(
         &self,
+        request: SessionChildCreateRequest,
+        execution: Option<crate::ExecutionSessionProvenance>,
+        spawning: Option<bcode_session_models::SessionSpawnRequest>,
+    ) -> Result<SessionSummary, SessionError> {
+        #[cfg(test)]
+        if std::env::var_os("BCODE_TEST_WORKFLOW_STACK_TRACE").is_some() {
+            eprintln!("workflow-stack phase=child_inner.enter");
+        }
+        Box::pin(self.create_child_session_record(request, execution, spawning)).await
+    }
+
+    async fn create_child_session_record(
+        &self,
         mut request: SessionChildCreateRequest,
         execution: Option<crate::ExecutionSessionProvenance>,
         spawning: Option<bcode_session_models::SessionSpawnRequest>,
     ) -> Result<SessionSummary, SessionError> {
+        #[cfg(test)]
+        if std::env::var_os("BCODE_TEST_WORKFLOW_STACK_TRACE").is_some() {
+            eprintln!("workflow-stack phase=child_record.enter");
+        }
         request.working_directory = normalize_working_directory(&request.working_directory);
         if request.child_id == request.parent_id {
             return Err(invalid("a child session cannot be its own parent"));
         }
         let Some(store) = &self.store else {
-            if spawning.is_some() {
-                return Err(invalid(
-                    "composed spawning requires canonical persistent storage",
-                ));
-            }
-            let lock = {
-                let mut locks = self.shared_execution_locks.lock().await;
-                std::sync::Arc::clone(
-                    locks
-                        .entry(request.child_id)
-                        .or_insert_with(|| std::sync::Arc::new(tokio::sync::Mutex::new(()))),
-                )
-            };
-            let _guard = lock.lock().await;
-            let existing = self
-                .inner
-                .lock()
-                .await
-                .sessions
-                .get(&request.child_id)
-                .cloned();
-            if let Some(handle) = existing {
-                let events = handle.events_range(0, 1, 2).await?;
-                verify_composed_request(&events, &request, spawning.as_ref())?;
-                let summary = handle.snapshot().summary;
-                self.link_child_session(request.parent_id, request.child_id)
-                    .await?;
-                return Ok(summary);
-            }
-            self.session_summary_non_owning(request.parent_id).await?;
-            self.record_child_link(request.parent_id, request.child_id, false)
-                .await?;
-            let summary = self
-                .create_session_record(
-                    request.name.clone(),
-                    request.working_directory.clone(),
-                    execution,
-                    Some(request.clone()),
-                )
-                .await?;
+            return Box::pin(self.create_in_memory_child_record(request, execution, spawning))
+                .await;
+        };
+        Box::pin(self.create_persistent_child(request, execution, spawning, store)).await
+    }
+
+    async fn create_in_memory_child_record(
+        &self,
+        request: SessionChildCreateRequest,
+        execution: Option<crate::ExecutionSessionProvenance>,
+        spawning: Option<bcode_session_models::SessionSpawnRequest>,
+    ) -> Result<SessionSummary, SessionError> {
+        if spawning.is_some() {
+            return Err(invalid(
+                "composed spawning requires canonical persistent storage",
+            ));
+        }
+        let lock = {
+            let mut locks = self.shared_execution_locks.lock().await;
+            std::sync::Arc::clone(
+                locks
+                    .entry(request.child_id)
+                    .or_insert_with(|| std::sync::Arc::new(tokio::sync::Mutex::new(()))),
+            )
+        };
+        let _guard = lock.lock().await;
+        let existing = self
+            .inner
+            .lock()
+            .await
+            .sessions
+            .get(&request.child_id)
+            .cloned();
+        if let Some(handle) = existing {
+            let events = handle.events_range(0, 1, 2).await?;
+            verify_composed_request(&events, &request, spawning.as_ref())?;
+            let summary = handle.snapshot().summary;
             self.link_child_session(request.parent_id, request.child_id)
                 .await?;
             return Ok(summary);
-        };
-        self.create_persistent_child(request, execution, spawning, store)
-            .await
+        }
+        self.session_summary_non_owning(request.parent_id).await?;
+        self.record_child_link(request.parent_id, request.child_id, false)
+            .await?;
+        let summary = self
+            .create_session_record(
+                request.name.clone(),
+                request.working_directory.clone(),
+                execution,
+                Some(request.clone()),
+            )
+            .await?;
+        self.link_child_session(request.parent_id, request.child_id)
+            .await?;
+        Ok(summary)
     }
 
     /// Validate an exact retry through its resident owner before publishing the parent receipt.
@@ -571,6 +601,10 @@ impl SessionManager {
         spawning: Option<bcode_session_models::SessionSpawnRequest>,
         store: &crate::store_executor::SessionStoreExecutor,
     ) -> Result<SessionSummary, SessionError> {
+        #[cfg(test)]
+        if std::env::var_os("BCODE_TEST_WORKFLOW_STACK_TRACE").is_some() {
+            eprintln!("workflow-stack phase=persistent_child.enter");
+        }
         let root = store.root_path();
         validate_session_path(&root, request.child_id)?;
         validate_session_path(&root, request.parent_id)?;
@@ -584,14 +618,13 @@ impl SessionManager {
                 .filter(|handle| handle.snapshot().owned)
                 .cloned();
             if let Some(handle) = resident {
-                return self
-                    .publish_resident_child_retry(
-                        &handle,
-                        &request,
-                        execution.as_ref(),
-                        spawning.as_ref(),
-                    )
-                    .await;
+                return Box::pin(self.publish_resident_child_retry(
+                    &handle,
+                    &request,
+                    execution.as_ref(),
+                    spawning.as_ref(),
+                ))
+                .await;
             }
             let child = self.session_summary_non_owning(request.child_id).await?;
             if child.parent_id != Some(request.parent_id) {
@@ -602,60 +635,112 @@ impl SessionManager {
         }
         // This guard verifies all live owners and serializes both publication and crash recovery.
         let stage_timer = timer(request.child_id, Stage::ParentIntent);
-        self.record_child_link(request.parent_id, request.child_id, false)
-            .await?;
+        #[cfg(test)]
+        if std::env::var_os("BCODE_TEST_WORKFLOW_STACK_TRACE").is_some() {
+            eprintln!("workflow-stack phase=persistent_child_intent.begin");
+        }
+        Box::pin(self.record_child_link(request.parent_id, request.child_id, false)).await?;
+        #[cfg(test)]
+        if std::env::var_os("BCODE_TEST_WORKFLOW_STACK_TRACE").is_some() {
+            eprintln!("workflow-stack phase=persistent_child_intent.end");
+        }
         drop(stage_timer);
         let stage_timer = timer(request.child_id, Stage::MaintenanceOwnership);
         let ownership = lease::acquire_session_maintenance_guard(&root, request.child_id)?;
         drop(stage_timer);
         let canonical = db::session_dir_path(&root, request.child_id);
         if canonical.exists() {
-            let database =
-                db::SessionDb::open_existing_turso_in_root(request.child_id, &root).await?;
-            let result: Result<SessionSummary, SessionError> = async {
-                database.validate_write_readiness().await?;
-                verify_composed_request(
-                    &database.events_range(0, 1, 2).await?,
-                    &request,
-                    spawning.as_ref(),
-                )?;
-                Ok(self
-                    .load_db_session_state(request.child_id, &database)
-                    .await?
-                    .summary())
-            }
+            return Box::pin(self.recover_persistent_child_record(
+                &request,
+                execution.as_ref(),
+                spawning.as_ref(),
+                &root,
+                ownership,
+            ))
             .await;
-            let close = database.close().await;
-            let summary = result?;
-            close?;
-            if summary.execution.as_ref().map(|value| &value.provenance) != execution.as_ref() {
-                return Err(invalid(
-                    "child execution provenance conflicts with original creation",
-                ));
-            }
-            drop(ownership);
-            self.link_child_session(request.parent_id, request.child_id)
-                .await?;
-            self.register_child_summary(summary.clone()).await;
-            return Ok(summary);
+        }
+        Box::pin(self.create_fresh_persistent_child(request, execution, spawning, &root, ownership))
+            .await
+    }
+
+    // The maintenance guard remains owned until the reopened database has closed.
+    async fn recover_persistent_child_record(
+        &self,
+        request: &SessionChildCreateRequest,
+        execution: Option<&crate::ExecutionSessionProvenance>,
+        spawning: Option<&bcode_session_models::SessionSpawnRequest>,
+        root: &std::path::Path,
+        ownership: lease::SessionMaintenanceGuard,
+    ) -> Result<SessionSummary, SessionError> {
+        let database = db::SessionDb::open_existing_turso_in_root(request.child_id, root).await?;
+        let result: Result<SessionSummary, SessionError> = async {
+            database.validate_write_readiness().await?;
+            verify_composed_request(&database.events_range(0, 1, 2).await?, request, spawning)?;
+            Ok(self
+                .load_db_session_state(request.child_id, &database)
+                .await?
+                .summary())
+        }
+        .await;
+        let close = database.close().await;
+        let summary = result?;
+        close?;
+        if summary.execution.as_ref().map(|value| &value.provenance) != execution {
+            return Err(invalid(
+                "child execution provenance conflicts with original creation",
+            ));
+        }
+        drop(ownership);
+        self.link_child_session(request.parent_id, request.child_id)
+            .await?;
+        self.register_child_summary(summary.clone()).await;
+        Ok(summary)
+    }
+
+    // Keep fresh storage preparation/finalization out of the retry-recovery poll
+    // frame. Ownership is transferred, never released at this phase boundary.
+    async fn create_fresh_persistent_child(
+        &self,
+        request: SessionChildCreateRequest,
+        execution: Option<crate::ExecutionSessionProvenance>,
+        spawning: Option<bcode_session_models::SessionSpawnRequest>,
+        root: &std::path::Path,
+        ownership: lease::SessionMaintenanceGuard,
+    ) -> Result<SessionSummary, SessionError> {
+        let canonical = db::session_dir_path(root, request.child_id);
+        #[cfg(test)]
+        if std::env::var_os("BCODE_TEST_WORKFLOW_STACK_TRACE").is_some() {
+            eprintln!("workflow-stack phase=persistent_child_parent_read.begin");
         }
         // Only exact local canonical storage establishes the parent; catalog metadata is not authority.
-        self.session_summary_non_owning(request.parent_id).await?;
+        Box::pin(self.session_summary_non_owning(request.parent_id)).await?;
+        #[cfg(test)]
+        if std::env::var_os("BCODE_TEST_WORKFLOW_STACK_TRACE").is_some() {
+            eprintln!("workflow-stack phase=persistent_child_parent_read.end");
+        }
         let stage_timer = timer(request.child_id, Stage::Staging);
-        let staging = child_staging_path(&root, &request, spawning.as_ref())?;
+        let staging = child_staging_path(root, &request, spawning.as_ref())?;
         drop(stage_timer);
-        let (summary, ownership) = self
-            .prepare_owned_child_storage(
-                staging.clone(),
-                request.clone(),
-                execution,
-                spawning,
-                ownership,
-            )
-            .await?;
+        #[cfg(test)]
+        if std::env::var_os("BCODE_TEST_WORKFLOW_STACK_TRACE").is_some() {
+            eprintln!("workflow-stack phase=persistent_child_storage.begin");
+        }
+        let (summary, ownership) = Box::pin(self.prepare_owned_child_storage(
+            staging.clone(),
+            request.clone(),
+            execution,
+            spawning,
+            ownership,
+        ))
+        .await?;
+        #[cfg(test)]
+        if std::env::var_os("BCODE_TEST_WORKFLOW_STACK_TRACE").is_some() {
+            eprintln!("workflow-stack phase=persistent_child_storage.end");
+            eprintln!("workflow-stack phase=persistent_child_finalize.begin");
+        }
         let stage_timer = timer(request.child_id, Stage::RenameAndSync);
         fs::rename(db::session_dir_path(&staging, request.child_id), &canonical)?;
-        bcode_confined_fs::sync_directory_path(&root)?;
+        bcode_confined_fs::sync_directory_path(root)?;
         drop(stage_timer);
         drop(ownership);
         let stage_timer = timer(request.child_id, Stage::Publication);
@@ -663,6 +748,10 @@ impl SessionManager {
             .await?;
         self.register_child_summary(summary.clone()).await;
         drop(stage_timer);
+        #[cfg(test)]
+        if std::env::var_os("BCODE_TEST_WORKFLOW_STACK_TRACE").is_some() {
+            eprintln!("workflow-stack phase=persistent_child_finalize.end");
+        }
         Ok(summary)
     }
 

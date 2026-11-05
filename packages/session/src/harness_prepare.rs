@@ -53,6 +53,7 @@ impl crate::SessionManager {
         let operation = ExternalHarnessOperation {
             version: 1,
             owner: owner.clone(),
+            inventory_commitments: Vec::new(),
             record: ExternalHarnessOperationRecord::Configured {
                 instance: request.instance.clone(),
                 capabilities,
@@ -156,10 +157,14 @@ impl crate::SessionManager {
                     working_directory: cwd.to_path_buf(),
                 },
             };
+            let mut prepared_operation = operation.clone();
+            database
+                .prepare_harness_inventory_operation(&mut prepared_operation, 1)
+                .await?;
             let configured = SessionEvent {
                 sequence: 1,
                 kind: SessionEventKind::ExternalHarnessOperation {
-                    operation: Box::new(operation.clone()),
+                    operation: Box::new(prepared_operation),
                 },
                 ..created.clone()
             };

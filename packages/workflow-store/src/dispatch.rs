@@ -9,6 +9,75 @@ use switchy_database::query::{
 use switchy_database::{Database, DatabaseError, DatabaseValue, TransactionMode};
 
 impl WorkflowStore {
+    pub(super) fn prepare_adopted_activation_in(
+        db: &dyn Database,
+        activation: &PendingActivation,
+        adoption: &bcode_workflow::WorkflowObligationAdoption,
+        intent: &serde_json::Value,
+        prepared_at_ms: u64,
+    ) -> Result<PreparedActivationDispatch, WorkflowStoreError> {
+        let attempt = next_attempt(
+            db,
+            &activation.run_id,
+            &activation.node_id,
+            &activation.activation_id,
+        )?;
+        if attempt != adoption.destination.attempt {
+            return Err(WorkflowStoreError::InvalidData(
+                "adoption destination attempt changed".into(),
+            ));
+        }
+        let intent_json = bounded_json("adoption destination intent", intent)?;
+        let prepared = PreparedAttempt {
+            run_id: activation.run_id.clone(),
+            node_id: activation.node_id.clone(),
+            activation_id: activation.activation_id.clone(),
+            attempt,
+            side_effect: DispatchSideEffect::Mutating,
+            intent: intent.clone(),
+            prepared_at_ms,
+        };
+        enforce_attempt_limits(db, &prepared)?;
+        let identity = prepared.dispatch_identity();
+        if identity != adoption.destination.dispatch_identity {
+            return Err(WorkflowStoreError::InvalidData(
+                "adoption destination identity changed".into(),
+            ));
+        }
+        mark_pending_activation_running(
+            db,
+            &activation.run_id,
+            &activation.node_id,
+            &activation.activation_id,
+        )?;
+        insert_prepared(
+            db,
+            &prepared,
+            &identity,
+            &intent_json,
+            &sha256_hex(intent_json.as_bytes()),
+        )?;
+        block_on(
+            db.insert("workflow_dispatch_handoffs")
+                .value("dispatch_identity", identity.as_str())
+                .value("handed_off", 1)
+                .execute(db),
+        )?;
+        append_event_in(
+            db,
+            &activation.run_id,
+            "attempt_prepared",
+            &serde_json::to_string(&prepared)?,
+            prepared_at_ms,
+        )?;
+        Ok(PreparedActivationDispatch {
+            activation: activation.clone(),
+            attempt,
+            dispatch_identity: identity,
+            intent: intent.clone(),
+        })
+    }
+
     /// Admit and dispatch a bounded snapshot of pending executable activations.
     ///
     /// For each activation, owner planning happens before mutation, then activation reservation and
@@ -270,6 +339,14 @@ impl WorkflowStore {
         let Some(activation) = activation else {
             return Ok(None);
         };
+        if bcode_workflow::WorkflowPreparedAdmission::from_descriptor(
+            &intent["preparation"]["descriptor"],
+        )? == bcode_workflow::WorkflowPreparedAdmission::DeferredUntilAdopted
+        {
+            // Owner-issued preparation remains subject to ordinary policy/approval.
+            // Reservation happens before resource acquisition and attempt publication.
+            return Ok(None);
+        }
         Self::acquire_activation_resources_in_transaction(
             transaction.as_ref(),
             &activation,

@@ -1811,7 +1811,116 @@ impl PluginConfigContext {
     }
 }
 
+/// Independently versioned sensitive callback envelope. Old loaders reject this prefix.
+pub const SENSITIVE_CREDENTIAL_PREFIX: &[u8] = b"bcode-sensitive-credential/v1\n";
+/// Exact non-secret selection; possession of these fields grants no access.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PluginCredentialSelection {
+    pub instance_id: String,
+    pub provider_id: String,
+    pub profile: String,
+    pub credential_namespace: String,
+    pub custody: bcode_provider_auth_models::managed::AuthCustodyMode,
+    pub credential_id: String,
+}
+impl PluginCredentialSelection {
+    /// Validate only bounds and identifiers, never authorization.
+    /// # Errors
+    /// Rejects malformed identifiers or an empty, excessive or control-bearing namespace.
+    pub fn validate(&self) -> Result<(), PluginCredentialError> {
+        for (value, field) in [
+            (&self.instance_id, "instance_id"),
+            (&self.provider_id, "provider_id"),
+            (&self.profile, "profile"),
+            (&self.credential_id, "credential_id"),
+        ] {
+            semantic_credential_id(value, field)?;
+        }
+        if self.credential_namespace.trim().is_empty()
+            || self.credential_namespace.len() > 4096
+            || self.credential_namespace.chars().any(char::is_control)
+        {
+            return Err(PluginCredentialError::Unavailable);
+        }
+        Ok(())
+    }
+}
+/// Secret bytes never implement serde and never appear in Debug.
+pub struct SensitiveCredential(String);
+impl std::fmt::Debug for SensitiveCredential {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("SensitiveCredential([REDACTED])")
+    }
+}
+impl Drop for SensitiveCredential {
+    fn drop(&mut self) {
+        zeroize::Zeroize::zeroize(&mut self.0);
+    }
+}
+impl SensitiveCredential {
+    /// Construct bounded UTF-8 credential material. Errors contain no input.
+    /// # Errors
+    /// Rejects empty, excessive or NUL-containing material.
+    pub fn new(value: String) -> Result<Self, PluginCredentialError> {
+        if value.trim().is_empty() || value.len() > 16_384 || value.contains('\0') {
+            return Err(PluginCredentialError::Unavailable);
+        }
+        Ok(Self(value))
+    }
+    /// Borrow only for the selected process environment or sensitive transport.
+    #[must_use]
+    pub const fn expose(&self) -> &str {
+        self.0.as_str()
+    }
+}
+
 impl NativeServiceContext {
+    /// Fetch exact host-admitted credentials without ordinary bridge serialization.
+    /// Missing, old, denied or cancelled hosts fail closed.
+    /// # Errors
+    /// Rejects invalid selection, missing admission, cancellation or malformed callback output.
+    pub fn credential(
+        &self,
+        selection: &PluginCredentialSelection,
+    ) -> Result<SensitiveCredential, PluginCredentialError> {
+        selection.validate()?;
+        if self.cancellation.is_cancelled() || self.bridge.cancellation.is_cancelled() {
+            return Err(PluginCredentialError::Unavailable);
+        }
+        let callback = self
+            .bridge
+            .callback
+            .ok_or(PluginCredentialError::Unavailable)?;
+        let mut request = SENSITIVE_CREDENTIAL_PREFIX.to_vec();
+        request
+            .extend(serde_json::to_vec(selection).map_err(|_| PluginCredentialError::Unavailable)?);
+        if request.len() > 8192 {
+            return Err(PluginCredentialError::Unavailable);
+        }
+        let mut output = vec![0_u8; 16_384];
+        let mut length = 0;
+        let status = callback(
+            request.as_ptr(),
+            request.len(),
+            output.as_mut_ptr(),
+            output.len(),
+            &raw mut length,
+            self.bridge.user_data as *mut c_void,
+        );
+        if status != SERVICE_BRIDGE_STATUS_OK
+            || length > output.len()
+            || self.cancellation.is_cancelled()
+            || self.bridge.cancellation.is_cancelled()
+        {
+            output.fill(0);
+            return Err(PluginCredentialError::Unavailable);
+        }
+        output.truncate(length);
+        let value = String::from_utf8(output).map_err(|_| PluginCredentialError::Unavailable)?;
+        SensitiveCredential::new(value)
+    }
+
     /// Return semantic credentials scoped to this host-bound plugin invocation.
     #[must_use]
     pub fn credentials(&self) -> PluginCredentials<'_> {

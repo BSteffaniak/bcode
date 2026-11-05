@@ -379,10 +379,18 @@ async fn upgrade_worker_fixture(state: &Arc<ServerState>, root: &std::path::Path
     db.database().close().await.expect("close fixture");
     drop(db);
     tokio::time::timeout(Duration::from_secs(15), async {
+        let initial = crate::session_operations::prepare_open(state, id)
+            .await
+            .unwrap_or_else(|_| panic!("application upgrade admission rejected for session {id}"));
+        let operation = state
+            .session_migrations
+            .operations()
+            .get(id, initial.operation_id)
+            .await
+            .expect("retained upgrade operation");
+        let mut progress = operation.subscribe();
         loop {
-            let snapshot = crate::session_operations::prepare_open(state, id)
-                .await
-                .unwrap_or_else(|_| panic!("application upgrade rejected"));
+            let snapshot = progress.borrow_and_update().clone();
             if let Some(outcome) = snapshot.outcome {
                 assert!(matches!(
                     outcome,
@@ -390,8 +398,13 @@ async fn upgrade_worker_fixture(state: &Arc<ServerState>, root: &std::path::Path
                 ));
                 break;
             }
-            tokio::time::sleep(Duration::from_millis(10)).await;
+            progress
+                .changed()
+                .await
+                .expect("upgrade operation remains open");
         }
+        drop(progress);
+        drop(operation);
     })
     .await
     .expect("upgrade completes");
@@ -514,7 +527,7 @@ async fn constructed_server_starts_storage_worker_and_releases_registration() {
         .expect("retire fixture");
     let access = root.path().join(id.to_string()).join("storage-access.bin");
     std::fs::remove_file(&access).expect("remove tracking");
-    let socket_dir = tempfile::tempdir().expect("socket directory");
+    let socket_dir = crate::tests::test_socket_dir().expect("socket directory");
     let endpoint = bcode_ipc::IpcEndpoint::unix_socket(socket_dir.path().join("storage.sock"));
     let listener = crate::LocalIpcListener::bind(&endpoint).expect("listener");
     let state = Arc::new(state);

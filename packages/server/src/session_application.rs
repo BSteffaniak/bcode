@@ -321,11 +321,11 @@ impl bcode_session_models::SessionCompactionRecoveryDiscoveryApplication
             self.state.client_runtime_context(self.client_id).await,
         )
         .await;
-        super::context_compaction::prepare_compaction_recovery(self.state, &selection, &request)
-            .await
-            .map_err(|error| {
-                compaction_failure(session_operations::CompactError::Compaction(error))
-            })
+        Box::pin(super::context_compaction::prepare_compaction_recovery(
+            self.state, &selection, &request,
+        ))
+        .await
+        .map_err(|error| compaction_failure(session_operations::CompactError::Compaction(error)))
     }
 }
 
@@ -1124,10 +1124,13 @@ impl SessionApplication for SessionApplicationHandle<'_> {
         request: CreateSessionRequest,
     ) -> Result<SessionSummary, SessionApplicationFailure> {
         self.require_running()?;
-        let session =
-            session_operations::create(self.state, request.name, request.working_directory)
-                .await
-                .map_err(|error| failure(error.code(), error.message()))?;
+        let session = Box::pin(session_operations::create(
+            self.state,
+            request.name,
+            request.working_directory,
+        ))
+        .await
+        .map_err(|error| failure(error.code(), error.message()))?;
         let runtime = self.state.client_runtime_context(self.client_id).await;
         self.state
             .set_session_config_from_runtime_context(session.id, runtime.as_ref())
@@ -1851,8 +1854,15 @@ mod tests {
     #[tokio::test]
     async fn typed_drafts_reasoning_and_skills_keep_canonical_ownership() {
         let root = tempfile::tempdir().unwrap();
-        let sessions = bcode_session::SessionManager::persistent(root.path()).unwrap();
-        let mut state = Arc::new(crate::tests::test_server_state(sessions));
+        let mut state = Arc::new({
+            let mut state = crate::tests::test_server_state(
+                bcode_session::SessionManager::persistent(root.path()).unwrap(),
+            );
+            // Account routing is persisted even without a model provider. Do not
+            // share its nonblocking auth lock with unrelated parallel fixtures.
+            state.state_root = root.path().join("application-state");
+            state
+        });
         // Session creation discovers skills from configuration, independently of the
         // constructor's absent registry. Exercise the disabled configuration explicitly.
         Arc::get_mut(&mut state)

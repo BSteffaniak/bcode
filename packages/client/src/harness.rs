@@ -41,7 +41,7 @@ fn decode_target_snapshot(
     Ok(snapshot)
 }
 
-fn submission_call(
+pub(crate) fn submission_call(
     instance: bcode_harness_models::HarnessInstance,
     target: bcode_harness_models::HarnessSessionTarget,
     submission: bcode_harness_models::HarnessSubmission,

@@ -417,6 +417,14 @@ impl Default for ChildWatchPresentation {
 pub struct ManagedComposerState {
     pub requests: std::collections::BTreeMap<String, bcode_session_models::ExternalHarnessRequest>,
     pub placement: Option<bcode_harness_models::HarnessPlacement>,
+    execution: ManagedExecutionPolicy,
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+struct ManagedExecutionPolicy {
+    session_id: Option<SessionId>,
+    input_ready: bool,
+    auth_requested: bool,
 }
 
 /// State owned by the terminal user interface.
@@ -780,6 +788,9 @@ impl BmuxApp {
 
     /// Move app-level presentation/runtime state from another app after recreating session state.
     pub(crate) fn take_cross_session_state_from(&mut self, source: &Self) {
+        // Explicit managed entry is sticky across reconstruction; only a new
+        // ordinary root may materialize model application access.
+        self.managed_composer.execution = source.managed_composer.execution;
         self.managed_composer
             .requests
             .clone_from(&source.managed_composer.requests);
@@ -5256,6 +5267,14 @@ impl BmuxApp {
             | SessionEventKind::ExternalObservationRecorded { .. } => {
                 // Native history identifies the backend, not execution authority. Default Send
                 // explicitly queues a follow-up; steering requires a user-selected native turn.
+                if self
+                    .session_view_snapshot()
+                    .execution_lifecycle
+                    .session_id
+                    .is_some()
+                {
+                    self.set_status(self.session_view_snapshot().execution_lifecycle.summary());
+                }
                 if self.managed_composer.placement.is_none() {
                     self.managed_composer.placement =
                         Some(bcode_harness_models::HarnessPlacement::NextTurn);
@@ -5794,6 +5813,51 @@ impl BmuxApp {
 
     /// Apply bounded authoritative submission lifecycle hydration.
     /// Remove only the optimistic item covered by a managed delivery receipt.
+    /// Bind input policy before the first managed composer submission.
+    pub fn set_managed_execution(&mut self, session_id: SessionId) {
+        self.managed_composer.execution = ManagedExecutionPolicy {
+            session_id: Some(session_id),
+            input_ready: true,
+            auth_requested: false,
+        };
+        self.managed_composer.placement = Some(bcode_harness_models::HarnessPlacement::NextTurn);
+        self.set_execution_mode_indicator(Some(
+            "Managed conversation; native permissions and billing".into(),
+        ));
+    }
+
+    /// Explicit managed entry remains managed even when transport/binding is unavailable.
+    #[must_use]
+    pub const fn managed_execution_session(&self) -> Option<SessionId> {
+        self.managed_composer.execution.session_id
+    }
+
+    /// Fence managed input when canonical event continuity is lost.
+    pub const fn suspend_managed_input(&mut self) {
+        if self.managed_composer.execution.session_id.is_some() {
+            self.managed_composer.execution.input_ready = false;
+        }
+    }
+
+    #[must_use]
+    pub const fn managed_input_ready(&self) -> bool {
+        self.managed_composer.execution.input_ready
+    }
+
+    /// Request an explicit root-to-shell native authentication handoff.
+    pub const fn request_managed_auth(&mut self) {
+        if self.managed_composer.execution.session_id.is_some() {
+            self.managed_composer.execution.auth_requested = true;
+            self.managed_composer.execution.input_ready = false;
+        }
+    }
+
+    /// Whether this root exited specifically for explicit native auth recovery.
+    #[must_use]
+    pub const fn managed_auth_requested(&self) -> bool {
+        self.managed_composer.execution.auth_requested
+    }
+
     pub fn acknowledge_managed_composer(&mut self, id: &bcode_session_models::SubmissionId) {
         self.pending_submissions.remove_id(id);
     }

@@ -120,6 +120,7 @@ pub struct SurfaceState {
     presentation_generation: u64,
     committed_generation: Option<u64>,
     cancel_pending: Option<String>,
+    committed_lifecycle_summary: String,
     permission_buttons: [Cell<ButtonState>; 6],
 }
 
@@ -169,6 +170,7 @@ impl SessionSurface {
                 presentation_generation: 0,
                 committed_generation: None,
                 cancel_pending: None,
+                committed_lifecycle_summary: String::new(),
                 permission_buttons: std::array::from_fn(|_| Cell::new(ButtonState::new())),
             },
         })
@@ -543,7 +545,7 @@ impl SessionSurface {
             })
             .collect::<Vec<_>>();
         serde_json::to_string(&serde_json::json!({
-            "label": "Bcode session", "description": "", "regions": regions,
+            "label": "Bcode session", "description": if hidden { "" } else { &self.inner.committed_lifecycle_summary }, "regions": regions,
         }))
         .map_err(|_| "invalid accessibility metadata")
     }
@@ -1144,6 +1146,13 @@ impl SessionSurface {
                 && !self.inner.area.is_empty()
                 && self.inner.permission.is_none(),
         );
+        self.inner.committed_lifecycle_summary = self
+            .inner
+            .semantic
+            .snapshot()
+            .filter(|snapshot| snapshot.execution_lifecycle.session_id.is_some())
+            .map(|snapshot| snapshot.execution_lifecycle.summary())
+            .unwrap_or_default();
         self.inner.committed_permission = if self
             .local
             .presentation()
@@ -1467,6 +1476,34 @@ impl SurfaceState {
         (question_height, pinned_height)
     }
 
+    fn lifecycle_summary(&self) -> String {
+        self.semantic
+            .snapshot()
+            .filter(|snapshot| snapshot.execution_lifecycle.session_id.is_some())
+            .map(|snapshot| snapshot.execution_lifecycle.summary())
+            .unwrap_or_default()
+    }
+
+    fn navigation_row<'a>(
+        history: &WindowHistory,
+        show_latest: bool,
+        states: &'a [Cell<ButtonState>; 3],
+    ) -> Row<'a> {
+        let [older, newer, latest] = states;
+        let mut navigation = Row::new();
+        if history.older {
+            navigation = navigation.child(ButtonComponent::new(OLDER, "Older history", older));
+        }
+        if history.newer {
+            navigation = navigation.child(ButtonComponent::new(NEWER, "Newer history", newer));
+        }
+        if show_latest {
+            navigation =
+                navigation.child(ButtonComponent::new(LATEST, "New messages below", latest));
+        }
+        navigation
+    }
+
     pub(crate) fn paint(&mut self, cx: &mut PaintCx<'_, '_>) {
         self.question.prepare(&self.bindings.effective);
         self.question.invalidate_geometry();
@@ -1493,28 +1530,18 @@ impl SurfaceState {
         ] = self.presentation_styles();
         let transcript = &self.transcript;
         let focused = self.focused;
-        let [older_state, newer_state, latest_state] = &self.navigation_buttons;
+        let navigation_states = &self.navigation_buttons;
         self.sync_navigation_focus();
         let history = WindowHistory::from_snapshot(self.semantic.snapshot());
         let show_latest = history.newer || !self.ui.viewport.follows_bottom();
+        let lifecycle_summary = self.lifecycle_summary();
         let build = |top| {
-            let mut navigation = Row::new();
-            if history.older {
-                navigation =
-                    navigation.child(ButtonComponent::new(OLDER, "Older history", older_state));
-            }
-            if history.newer {
-                navigation =
-                    navigation.child(ButtonComponent::new(NEWER, "Newer history", newer_state));
-            }
-            if show_latest {
-                navigation = navigation.child(ButtonComponent::new(
-                    LATEST,
-                    "New messages below",
-                    latest_state,
-                ));
-            }
+            let navigation = Self::navigation_row(&history, show_latest, navigation_states);
             let transcript_panel = Column::new()
+                .child(
+                    SizeBox::new(TextBlock::new(lifecycle_summary.clone()))
+                        .height(u64::from(!lifecycle_summary.is_empty())),
+                )
                 .child(
                     SizeBox::new(navigation)
                         .height(u64::from(history.older || history.newer || show_latest)),

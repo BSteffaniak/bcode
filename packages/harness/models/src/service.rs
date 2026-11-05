@@ -127,6 +127,9 @@ pub struct HarnessOpenRequest {
 /// Bounded observation page request. A cursor is opaque, not evidence of retention.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct HarnessObserveRequest {
+    /// Optional post-commit retention acknowledgement and read-only hydration.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub retention: Option<crate::HarnessRetentionContext>,
     pub target: HarnessSessionTarget,
     pub after: Option<String>,
     pub limit: u16,
@@ -243,6 +246,9 @@ impl HarnessRequest {
                     id(cursor)?;
                 }
                 validate_target_instance(&value.target, &self.instance)?;
+                if let Some(retention) = &value.retention {
+                    retention.validate_for(value.target.session_id(), value.target.generation())?;
+                }
             }
             HarnessRequestKind::Respond { target, response } => {
                 id(&response.response_id)?;
@@ -317,11 +323,50 @@ pub struct HarnessInspection {
 /// Bounded page with explicit retention/completeness. Empty does not mean settled.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct HarnessObservationPage {
+    /// Retry-stable identity/digest for canonical post-commit acknowledgment.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub retention: Option<crate::HarnessRetentionPage>,
+    /// Bounded canonical read requests; these grant no native mutation authority.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub hydration_requests: Vec<crate::HarnessHydrationRequest>,
+    /// Positive-evidence native scan progress, never comprehensive settlement.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub inventory_page: Option<crate::HarnessInventoryPage>,
     pub observations: Vec<HarnessObservation>,
     pub next_after: Option<String>,
     pub completeness: HarnessCompleteness,
     pub status: HarnessExecutionStatus,
 }
+impl HarnessObservationPage {
+    /// Validate optional retention, hydration requests and non-atomic inventory progress.
+    /// # Errors
+    /// Rejects excessive/duplicate requests, malformed metadata or mismatched digest.
+    pub fn validate_retention(&self) -> Result<(), HarnessContractError> {
+        if let Some(retention) = &self.retention {
+            retention.validate()?;
+            if retention.observations_digest
+                != crate::harness_observations_digest(&self.observations)?
+            {
+                return Err(HarnessContractError::InvalidShape);
+            }
+        }
+        if self.hydration_requests.len() > crate::MAX_HARNESS_ITEMS {
+            return Err(HarnessContractError::BoundsExceeded);
+        }
+        let mut seen = std::collections::BTreeSet::new();
+        for request in &self.hydration_requests {
+            request.validate()?;
+            if !seen.insert(&request.request_id) {
+                return Err(HarnessContractError::InvalidShape);
+            }
+        }
+        if let Some(inventory) = &self.inventory_page {
+            inventory.validate()?;
+        }
+        wire(self, MAX_HARNESS_WIRE_BYTES)
+    }
+}
+
 /// No-effect proof is explicit and separate from unknown delivery.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "state", rename_all = "snake_case")]
@@ -411,6 +456,7 @@ impl HarnessServiceResponse {
             HarnessServiceResponseKind::Opened(value) => value.validate()?,
             HarnessServiceResponseKind::Receipt(value) => validate_receipt(value)?,
             HarnessServiceResponseKind::Observations(value) => {
+                value.validate_retention()?;
                 if value.observations.len() > MAX_HARNESS_OBSERVATIONS {
                     return Err(HarnessContractError::BoundsExceeded);
                 }
@@ -588,6 +634,15 @@ fn validate_observation_page_for(
     page: &HarnessObservationPage,
     observe: &HarnessObserveRequest,
 ) -> Result<(), HarnessContractError> {
+    if let Some(context) = &observe.retention {
+        let retention = page
+            .retention
+            .as_ref()
+            .ok_or(HarnessContractError::InvalidShape)?;
+        if retention.connection_id != context.connection_id {
+            return Err(HarnessContractError::WrongOwner);
+        }
+    }
     if page.observations.len() > usize::from(observe.limit) {
         return Err(HarnessContractError::BoundsExceeded);
     }

@@ -1867,6 +1867,7 @@ async fn execute_agent_variant_async(
         })
     }
     .await;
+    client.release_idle_connections();
     let cleanup = agent_cleanup::cleanup(
         cleanup_session,
         agent_daemon_isolation_mode(variant) != "shared",
@@ -1934,6 +1935,7 @@ async fn run_agent_follow_up(
             "agent follow-up: variant={} case={} rep={} restarting isolated daemon",
             variant.id, case.id, repetition
         ));
+        client.release_idle_connections();
         let stopped = agent_cleanup::stop_idle(timeout).await;
         write_json(rep_dir.join("follow-up-stop.json"), &stopped)?;
         if !stopped.endpoint_stop_observed() {

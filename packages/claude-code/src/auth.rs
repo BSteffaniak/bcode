@@ -9,7 +9,11 @@ use tokio::{
 /// Exact-version native auth handoff support must be tested by the integrating plugin.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum NativeAuthSupport {
+    /// Neither local status nor login has been verified.
     Unknown,
+    /// Exact-version local status only; does not authorize login handoff.
+    VerifiedStatus,
+    /// Exact-version local status and native login handoff have both been verified.
     VerifiedStatusAndLogin,
 }
 /// Sanitized route classification; no email, account ID, token, URL or login code.
@@ -78,7 +82,17 @@ impl NativeLoginHandoff {
 /// Unsupported auth mode, version mismatch, malformed/mismatched namespace or billing route,
 /// process failure, timeout or bounded output overflow. Native payloads are not included in errors.
 pub async fn auth_status(options: &LaunchOptions) -> Result<AuthStatus, Error> {
-    if options.auth_support != NativeAuthSupport::VerifiedStatusAndLogin {
+    if options.billing_route == BillingRoute::ApiKey {
+        // Explicit credential presence is local readiness only, never remote verification.
+        // Do not ask native account status to reinterpret an admitted API billing route.
+        options.verify().await?;
+        return Ok(AuthStatus {
+            logged_in: true,
+            method: AuthMethod::ApiKey,
+            config_directory: options.config_directory.clone(),
+        });
+    }
+    if options.auth_support == NativeAuthSupport::Unknown {
         return Err(Error::InvalidConfiguration(
             "native auth status support unverified",
         ));
@@ -95,8 +109,16 @@ pub async fn auth_status(options: &LaunchOptions) -> Result<AuthStatus, Error> {
     if !matches!(status.code(), Some(0 | 1)) {
         return Err(Error::Protocol);
     }
-    let native: NativeStatus = serde_json::from_slice(&output).map_err(|_| Error::Protocol)?;
-    if native.config_directory != options.config_directory || native.logged_in != status.success() {
+    validated_status(options, status.success(), &output)
+}
+
+fn validated_status(
+    options: &LaunchOptions,
+    success: bool,
+    output: &[u8],
+) -> Result<AuthStatus, Error> {
+    let native: NativeStatus = serde_json::from_slice(output).map_err(|_| Error::Protocol)?;
+    if native.config_directory != options.config_directory || native.logged_in != success {
         return Err(Error::Protocol);
     }
     let acceptable = match options.billing_route {
@@ -193,4 +215,98 @@ async fn discard(mut reader: impl AsyncRead + Unpin) -> std::io::Result<()> {
     let mut chunk = [0_u8; 4096];
     while reader.read(&mut chunk).await? != 0 {}
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{Limits, NativeEnvironment, SettingsInheritance, SettlementSupport};
+
+    fn options(support: NativeAuthSupport) -> LaunchOptions {
+        LaunchOptions {
+            executable: PathBuf::from("/nonexistent/bcode-auth-test/claude"),
+            expected_version: "test-only".into(),
+            cwd: PathBuf::from("/nonexistent/bcode-auth-test"),
+            config_directory: PathBuf::from("/isolated/native-config"),
+            environment: NativeEnvironment::default(),
+            billing_route: BillingRoute::NativeAccount,
+            settings: SettingsInheritance::ExplicitSources,
+            setting_sources: Vec::new(),
+            resume_session_id: None,
+            settlement_support: SettlementSupport::Unknown,
+            auth_support: support,
+            limits: Limits::default(),
+        }
+    }
+
+    #[tokio::test]
+    async fn auth_support_matrix_fences_before_child_spawn() {
+        for support in [
+            NativeAuthSupport::Unknown,
+            NativeAuthSupport::VerifiedStatus,
+            NativeAuthSupport::VerifiedStatusAndLogin,
+        ] {
+            let options = options(support);
+            let status = auth_status(&options).await;
+            if support == NativeAuthSupport::Unknown {
+                assert!(matches!(
+                    status,
+                    Err(Error::InvalidConfiguration(
+                        "native auth status support unverified"
+                    ))
+                ));
+            } else {
+                // Missing executable proves verified status reached version preflight.
+                assert!(matches!(status, Err(Error::Io(_))));
+            }
+            let login = login_handoff(&options).await;
+            if support == NativeAuthSupport::VerifiedStatusAndLogin {
+                assert!(matches!(login, Err(Error::Io(_))));
+            } else {
+                // This exact rejection precedes even executable verification.
+                assert!(matches!(
+                    login,
+                    Err(Error::InvalidConfiguration(
+                        "native account login handoff unavailable"
+                    ))
+                ));
+            }
+        }
+    }
+
+    #[test]
+    fn verified_status_preserves_namespace_exit_and_billing_checks() {
+        for support in [
+            NativeAuthSupport::VerifiedStatus,
+            NativeAuthSupport::VerifiedStatusAndLogin,
+        ] {
+            let options = options(support);
+            let native = br#"{"loggedIn":true,"authMethod":"claude.ai","configDirectory":"/isolated/native-config"}"#;
+            let status = validated_status(&options, true, native).unwrap();
+            assert_eq!(status.method, AuthMethod::ClaudeAccount);
+            assert_eq!(status.config_directory, options.config_directory);
+            assert!(matches!(
+                validated_status(&options, false, native),
+                Err(Error::Protocol)
+            ));
+            let wrong_namespace =
+                br#"{"loggedIn":true,"authMethod":"claude.ai","configDirectory":"/other"}"#;
+            assert!(matches!(
+                validated_status(&options, true, wrong_namespace),
+                Err(Error::Protocol)
+            ));
+            let api = br#"{"loggedIn":true,"authMethod":"api_key","configDirectory":"/isolated/native-config"}"#;
+            assert!(matches!(
+                validated_status(&options, true, api),
+                Err(Error::InvalidConfiguration(_))
+            ));
+            let mut api_options = options;
+            api_options.billing_route = BillingRoute::ApiKey;
+            assert!(validated_status(&api_options, true, api).is_ok());
+            assert!(matches!(
+                validated_status(&api_options, true, native),
+                Err(Error::InvalidConfiguration(_))
+            ));
+        }
+    }
 }

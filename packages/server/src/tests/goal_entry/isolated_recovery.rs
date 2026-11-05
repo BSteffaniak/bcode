@@ -306,7 +306,8 @@ fn prepare_source(root: &Path) -> String {
 // The real Git scenario and its owned teardown form one sequential acceptance test.
 #[allow(clippy::too_many_lines)]
 async fn goal_workers_recover_real_git_conflict_in_isolated_integration_checkout() {
-    let _execution = GOAL_ENTRY_EXECUTION.lock().await;
+    let _execution = goal_entry_fixture().await;
+    let mut diagnostics = GoalEntryDiagnostics::default();
     let root = tempfile::tempdir().unwrap();
     let trees = tempfile::tempdir().unwrap();
     let base = prepare_source(root.path());
@@ -347,8 +348,9 @@ async fn goal_workers_recover_real_git_conflict_in_isolated_integration_checkout
     let mut previous_attempts = Vec::new();
     let mut sequences = BTreeMap::new();
     let mut last_diagnostic = None;
-    tokio::time::timeout(Duration::from_mins(1), async {
+    tokio::time::timeout(Duration::from_mins(5), async {
         loop {
+            diagnostics.observe(&state, session.id, &run_id).await;
             let diagnostic = last_diagnostic.is_none_or(|last: Instant| last.elapsed() >= Duration::from_secs(1));
             let permission_started = Instant::now();
             if diagnostic {

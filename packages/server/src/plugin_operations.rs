@@ -314,6 +314,16 @@ fn command_callback_owner(
         })
 }
 
+fn require_public_service(interface_id: &str) -> Result<(), PublicPluginError> {
+    if interface_id == bcode_harness_models::MANAGED_TOOL_QUEUE_INTERFACE_ID {
+        return Err(PublicPluginError {
+            code: "host_only_service",
+            message: "managed tool queue requires daemon admission",
+        });
+    }
+    Ok(())
+}
+
 pub async fn invoke_service(
     state: &ServerState,
     plugin_id: &str,
@@ -321,6 +331,7 @@ pub async fn invoke_service(
     operation: String,
     payload: Vec<u8>,
 ) -> Result<PluginServiceOperationResult, PublicPluginError> {
+    require_public_service(interface_id)?;
     let plugin_id = plugin_id.to_owned();
     let interface_id = interface_id.to_owned();
     let mut payload = payload;
@@ -604,6 +615,12 @@ pub async fn call_service(
 ) -> Result<PluginServiceOperationResult, PublicPluginError> {
     // Activity identity is scoped to an explicitly selected producer. Interface discovery
     // alone must not bypass the producer/revision checks in `invoke_service`.
+    if interface_id == bcode_harness_models::MANAGED_TOOL_QUEUE_INTERFACE_ID {
+        return Err(PublicPluginError {
+            code: "host_only_service",
+            message: "managed tool queue requires daemon admission",
+        });
+    }
     if interface_id == bcode_session_models::ACTIVITY_PRESENTATION_INTERFACE_ID {
         return Err(PublicPluginError {
             code: "activity_producer_required",

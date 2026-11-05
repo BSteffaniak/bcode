@@ -18,9 +18,19 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::sync::Arc;
 
+#[path = "harness/obligation.rs"]
+mod obligation;
+pub use obligation::adopt_execution;
+
+#[cfg(test)]
+pub(crate) use obligation::with_after_planning as with_adoption_after_planning;
+#[path = "harness/execution_outcome.rs"]
+mod execution_outcome;
+
 /// Portable compatibility identity; unknown receipt owners are not interpreted as model turns.
 pub(crate) const HARNESS_WORKFLOW_OWNER: &str = "bcode.server.managed-harness/v1";
 const EXECUTE_OPERATION: &str = "harness.execute";
+const AWAIT_OPERATION: &str = "harness.await";
 const MANAGED_INTERFACE: &str = "bcode.managed-session/v1";
 
 /// Stable recovery handle, published before native delivery. Its existence is not acceptance.
@@ -43,6 +53,10 @@ pub(crate) struct HarnessWorkflowReceipt {
     node: bcode_workflow::NodeDefinition,
     block: bcode_workflow::WorkflowBlockDefinition,
     complete_input: Value,
+    #[serde(default)]
+    workflow_obligation_adoption: Option<bcode_workflow::WorkflowObligationAdoptionProof>,
+    #[serde(default)]
+    completion_requirement: bcode_harness_models::HarnessCompletionRequirement,
 }
 
 fn invalid(message: impl Into<String>) -> WorkflowStoreError {
@@ -89,6 +103,43 @@ impl HarnessWorkflowReceipt {
             }
         }
         validate_call(&receipt.call)?;
+        if !matches!(
+            (
+                receipt.block.block_version,
+                receipt.block.output.type_name.as_str()
+            ),
+            (1, "bcode.harness.assignment-result/v1") | (2, "bcode.harness.assignment-result/v2")
+        ) || (receipt.block.block_version == 1
+            && receipt.completion_requirement
+                != bcode_harness_models::HarnessCompletionRequirement::AssociatedWork)
+        {
+            return Err(invalid("unsupported managed workflow block compatibility"));
+        }
+        let prepared = bcode_workflow::prepare_workflow_node_dataflow(
+            receipt.node.dataflow,
+            &receipt.node.input,
+            &receipt.block.input,
+            &receipt.complete_input,
+        )
+        .map_err(|error| invalid(error.to_string()))?;
+        let retained_requirement: bcode_harness_models::HarnessCompletionRequirement =
+            serde_json::from_value(
+                prepared
+                    .owner_input()
+                    .get("completion_requirement")
+                    .cloned()
+                    .unwrap_or_else(|| json!("associated_work")),
+            )?;
+        if retained_requirement != receipt.completion_requirement {
+            return Err(invalid("managed completion requirement changed"));
+        }
+        if receipt.completion_requirement
+            == bcode_harness_models::HarnessCompletionRequirement::WorkspaceRelease
+        {
+            return Err(invalid(
+                "workspace release requires separate host authorization",
+            ));
+        }
         let HarnessRequestKind::Submit { submission, .. } = &receipt.call.harness.kind else {
             return Err(invalid("managed execution receipt requires submission"));
         };
@@ -96,6 +147,21 @@ impl HarnessWorkflowReceipt {
             || submission.generation != receipt.generation
         {
             return Err(invalid("managed workflow receipt owner mismatch"));
+        }
+        if receipt.block.operation == AWAIT_OPERATION
+            && (receipt
+                .workflow_obligation_adoption
+                .as_ref()
+                .is_none_or(|proof| {
+                    proof.request.destination.dispatch_identity != receipt.dispatch_identity
+                        || proof.request.run_id != receipt.run_id
+                })
+                || receipt.completion_requirement
+                    != bcode_harness_models::HarnessCompletionRequirement::AssociatedWork)
+        {
+            return Err(invalid(
+                "await receipt requires durable adoption and associated-work responsibility",
+            ));
         }
         Ok(receipt)
     }
@@ -123,8 +189,10 @@ fn validate_call(call: &ManagedSessionCall) -> Result<(), WorkflowStoreError> {
 
 /// Recognize the portable prepared application contract, never a native harness vendor.
 pub(crate) fn owns_block(block: &bcode_workflow::WorkflowBlockDefinition) -> bool {
-    block.operation == EXECUTE_OPERATION
-        && block.input.type_name == "bcode.harness.managed-operation/v1"
+    matches!(
+        block.operation.as_str(),
+        EXECUTE_OPERATION | AWAIT_OPERATION
+    ) && block.input.type_name == "bcode.harness.managed-operation/v1"
 }
 
 fn prepared_call(
@@ -152,6 +220,24 @@ fn prepared_call(
         || preparation.descriptor["execution"] != json!(true)
     {
         return Err(invalid("managed execution descriptor mismatch"));
+    }
+    let requirement: bcode_harness_models::HarnessCompletionRequirement = serde_json::from_value(
+        owner_input
+            .get("completion_requirement")
+            .cloned()
+            .unwrap_or_else(|| json!("associated_work")),
+    )?;
+    if preparation
+        .descriptor
+        .get("completion_requirement")
+        .is_some_and(|value| value != &json!(requirement))
+    {
+        return Err(invalid("managed prepared completion requirement changed"));
+    }
+    if requirement == bcode_harness_models::HarnessCompletionRequirement::WorkspaceRelease {
+        return Err(invalid(
+            "workspace release requires separate host authorization",
+        ));
     }
     let encoded = owner_input
         .get("request_json")
@@ -181,8 +267,14 @@ pub(crate) async fn dispatch_block(
     if !owns_block(&block) {
         return Ok(None);
     }
+    if block.operation == AWAIT_OPERATION {
+        return Err(invalid(
+            "await nodes are admitted only by explicit canonical obligation adoption",
+        ));
+    }
     if block.operation == EXECUTE_OPERATION
-        && (block.output.type_name != "bcode.harness.assignment-result/v1"
+        && (block.block_version != 2
+            || block.output.type_name != "bcode.harness.assignment-result/v2"
             || !block.preparation_required
             || block.reconciliation != bcode_workflow::WorkflowBlockReconciliation::ReceiptStatus)
     {
@@ -218,6 +310,12 @@ pub(crate) async fn dispatch_block(
     {
         let receipt = HarnessWorkflowReceipt::decode(&value)?;
         if receipt.dispatch_identity != request.dispatch_identity
+            || receipt.complete_input
+                != request
+                    .activation
+                    .input
+                    .clone()
+                    .ok_or_else(|| invalid("managed input missing"))?
             || serde_json::to_value(&receipt.call)? != serde_json::to_value(&call)?
         {
             return Err(invalid("conflicting managed workflow receipt"));
@@ -244,6 +342,13 @@ pub(crate) async fn dispatch_block(
         call,
         plugin_id: block.plugin_id.clone(),
         output_schema: request.activation.node.output.clone(),
+        workflow_obligation_adoption: None,
+        completion_requirement: serde_json::from_value(
+            crate::workflow_plugin_block_input(request, &block)?
+                .get("completion_requirement")
+                .cloned()
+                .unwrap_or_else(|| json!("associated_work")),
+        )?,
         node: request.activation.node.clone(),
         block: block.clone(),
         complete_input: request
@@ -521,8 +626,68 @@ async fn settlement_authority(
     }))
 }
 
+fn adopted_link_identity<'a>(
+    receipt: &'a HarnessWorkflowReceipt,
+    dispatch_identity: &str,
+) -> Option<(&'a String, &'a String, u32)> {
+    receipt
+        .workflow_obligation_adoption
+        .as_ref()
+        .filter(|proof| proof.request.source.dispatch_identity == dispatch_identity)
+        .map(|proof| {
+            (
+                &proof.request.destination.node_id,
+                &proof.request.destination.activation_id,
+                proof.request.destination.attempt,
+            )
+        })
+}
+
 /// Verify the exact workflow-owned application grant for lane3 admission. The caller must
 /// retain the returned authority guard through the native operation; parentage is not a grant.
+/// Resolve the ordinary tool ceiling only from a currently authorized exact receipt.
+/// Native arguments and parent session configuration cannot raise this capability.
+pub(crate) async fn managed_tool_ceiling(
+    state: &ServerState,
+    run_id: &str,
+    dispatch_identity: &str,
+    session_id: SessionId,
+    plugin_id: &str,
+    call: &ManagedSessionCall,
+) -> Result<bcode_session_models::TurnExecutionOptions, WorkflowStoreError> {
+    let _guard = authorize_call(
+        state,
+        run_id,
+        dispatch_identity,
+        session_id,
+        plugin_id,
+        call,
+    )
+    .await?;
+    let stored =
+        crate::workflow_representation::owner::execution_receipt(state, run_id, dispatch_identity)
+            .await?
+            .ok_or_else(|| invalid("managed tool receipt unavailable"))?;
+    let receipt = HarnessWorkflowReceipt::decode(&stored.receipt)?;
+    let tools = match receipt.block.authorization.capability {
+        bcode_workflow::WorkflowToolCapability::Disabled => {
+            bcode_session_models::TurnToolPolicy::Disabled
+        }
+        bcode_workflow::WorkflowToolCapability::ReadOnly => {
+            bcode_session_models::TurnToolPolicy::ReadOnly
+        }
+        bcode_workflow::WorkflowToolCapability::Mutating => {
+            bcode_session_models::TurnToolPolicy::Enabled
+        }
+    };
+    Ok(bcode_session_models::TurnExecutionOptions {
+        tools,
+        allow_user_questions: false,
+        permission_mode: bcode_session_models::TurnPermissionMode::Enforce,
+        ..Default::default()
+    })
+}
+
 pub(crate) async fn authorize_call(
     state: &ServerState,
     run_id: &str,
@@ -550,12 +715,15 @@ pub(crate) async fn authorize_call(
     {
         return Err(invalid("managed workflow application grant mismatch"));
     }
+    let link_identity = adopted_link_identity(&receipt, dispatch_identity);
+    let (link_node, link_activation, link_attempt) =
+        link_identity.unwrap_or((&stored.node_id, &stored.activation_id, stored.attempt));
     let link = crate::workflow_representation::owner::execution_session_link(
         state,
         run_id,
-        &stored.node_id,
-        &stored.activation_id,
-        stored.attempt,
+        link_node,
+        link_activation,
+        link_attempt,
     )
     .await?
     .ok_or_else(|| invalid("managed workflow execution link missing"))?;
@@ -566,6 +734,12 @@ pub(crate) async fn authorize_call(
         return Err(invalid("managed workflow submission missing"));
     };
     match &call.harness.kind {
+        HarnessRequestKind::Submit { .. }
+            if receipt.block.operation == AWAIT_OPERATION
+                || receipt.workflow_obligation_adoption.is_some() =>
+        {
+            return Err(invalid("adopted obligation cannot resubmit native work"));
+        }
         HarnessRequestKind::Submit { .. }
             if serde_json::to_value(call)? == serde_json::to_value(&receipt.call)? =>
         {
@@ -644,6 +818,18 @@ pub(crate) async fn observe_receipt(
     request: &AttemptReconciliationRequest,
 ) -> Result<AttemptObservation, WorkflowStoreError> {
     let receipt = HarnessWorkflowReceipt::decode(&request.receipt)?;
+    if receipt.block.operation == AWAIT_OPERATION
+        && receipt
+            .workflow_obligation_adoption
+            .as_ref()
+            .is_none_or(|proof| {
+                proof.request.destination.dispatch_identity != request.dispatch_identity
+            })
+    {
+        return Err(invalid(
+            "await observation requires exact canonical adoption proof",
+        ));
+    }
     if receipt.dispatch_identity != request.dispatch_identity
         || receipt.run_id != request.run_id
         || receipt.node_id != request.node_id
@@ -671,11 +857,18 @@ pub(crate) async fn observe_receipt(
     .map_err(invalid)?;
     call.harness.request_id = poll_id;
     let after = canonical_poll_cursor(state, receipt.session_id, receipt.generation).await?;
+    let owner = canonical_session_owner(state, receipt.session_id, receipt.generation)?;
+    let retention = state
+        .sessions
+        .session_harness_retention_context(&owner, &target, after.as_deref())
+        .await
+        .map_err(|_| invalid("canonical managed retention context unavailable"))?;
     call.harness.kind = HarnessRequestKind::Observe(bcode_harness_models::HarnessObserveRequest {
         target,
         after,
         limit: 128,
         wait_millis: 0,
+        retention,
     });
     // Runtime drains continuously and commits normalized observations canonically. Re-reading
     // evidence after this poll does not interpret an empty page as completion.
@@ -703,6 +896,20 @@ async fn canonical_outcome(
     state: &ServerState,
     receipt: &HarnessWorkflowReceipt,
 ) -> Result<AttemptObservation, WorkflowStoreError> {
+    let receipt = obligation::refresh_receipt(state, receipt).await?;
+    canonical_outcome_snapshot(state, &receipt).await
+}
+
+async fn canonical_outcome_snapshot(
+    state: &ServerState,
+    receipt: &HarnessWorkflowReceipt,
+) -> Result<AttemptObservation, WorkflowStoreError> {
+    if receipt.completion_requirement
+        == bcode_harness_models::HarnessCompletionRequirement::AsyncHandoff
+        && receipt.workflow_obligation_adoption.is_none()
+    {
+        return Ok(deferred("async handoff awaits durable canonical adoption"));
+    }
     let HarnessRequestKind::Submit { submission, .. } = &receipt.call.harness.kind else {
         return Err(invalid("missing managed submission"));
     };
@@ -737,6 +944,29 @@ async fn canonical_outcome(
         || page.status.completeness == HarnessCompleteness::Gap
     {
         return Ok(deferred("managed evidence gap"));
+    }
+    if page
+        .observations
+        .iter()
+        .any(|observation| matches!(&observation.kind, HarnessObservationKind::Execution { .. }))
+        && receipt.completion_requirement
+            == bcode_harness_models::HarnessCompletionRequirement::AssociatedWork
+        && page.status.attention != bcode_harness_models::HarnessAttention::None
+    {
+        return Ok(deferred("managed interaction coverage unresolved"));
+    }
+    if receipt.block.block_version == 1
+        && receipt.block.output.type_name == "bcode.harness.assignment-result/v1"
+        && page.observations.iter().any(|observation| {
+            matches!(&observation.kind, HarnessObservationKind::Execution { .. })
+        })
+    {
+        return Ok(deferred(
+            "legacy managed receipt cannot adopt v3 execution semantics",
+        ));
+    }
+    if let Some(verdict) = execution_outcome::evaluate(&page.observations, receipt)? {
+        return Ok(verdict);
     }
     let mut acceptances = page.observations.iter().filter(|observation| {
         matches!(
@@ -883,19 +1113,41 @@ fn outcome(
             "settled native turn has no bounded assignment result",
         ));
     };
-    complete_assignment_output(receipt, native_id, &result)
+    complete_assignment_output(receipt, Some(native_id), &result)
 }
 
 // Terminal evidence is checked by outcome before entering ordinary workflow dataflow.
 fn complete_assignment_output(
     receipt: &HarnessWorkflowReceipt,
-    native_id: &str,
+    native_id: Option<&str>,
     result: &str,
 ) -> Result<AttemptObservation, WorkflowStoreError> {
     let HarnessRequestKind::Submit { submission, .. } = &receipt.call.harness.kind else {
         return Err(invalid("missing managed submission"));
     };
-    let output = json!({"session_id":receipt.session_id,"submission_id":submission.submission_id,"native_turn_id":native_id,"result":result});
+    let mut output = json!({"session_id":receipt.session_id,"submission_id":submission.submission_id,"native_turn_id":native_id,"result":result});
+    if matches!(
+        receipt.completion_requirement,
+        bcode_harness_models::HarnessCompletionRequirement::Foreground
+            | bcode_harness_models::HarnessCompletionRequirement::AsyncHandoff
+    ) {
+        // Foreground handles retain correlation only. Async handles additionally name
+        // the canonical destination receipt which now owns resource responsibility.
+        let adopted = receipt
+            .workflow_obligation_adoption
+            .as_ref()
+            .filter(|proof| proof.request.source.dispatch_identity == receipt.dispatch_identity);
+        output["execution_handle"] = json!({
+            "session_id":receipt.session_id, "generation":receipt.generation,
+            "submission_id":submission.submission_id, "attempt_id":submission.attempt_id,
+            "dispatch_identity":adopted.map_or(receipt.dispatch_identity.as_str(),
+                |proof| proof.request.destination.dispatch_identity.as_str()),
+        });
+        if let Some(proof) = adopted {
+            output["execution_handle"]["obligation_id"] = json!(proof.request.obligation_id);
+            output["execution_handle"]["adoption_revision"] = json!(proof.adopted_revision);
+        }
+    }
     crate::validate_workflow_output_semantics(&receipt.block.output, &output).map_err(invalid)?;
     let prepared = bcode_workflow::prepare_workflow_node_dataflow(
         receipt.node.dataflow,
@@ -929,6 +1181,54 @@ fn complete_assignment_output(
 
 /// Deliver cancellation only after canonical intent. Acknowledgement never settles an attempt.
 pub(crate) async fn cancel_receipt(
+    state: &ServerState,
+    attempt: &bcode_workflow_store::ActiveAttemptCancellation,
+) -> Result<(), WorkflowStoreError> {
+    let stored = crate::workflow_representation::owner::execution_receipt(
+        state,
+        &attempt.run_id,
+        &attempt.dispatch_identity,
+    )
+    .await?
+    .ok_or_else(|| invalid("managed cancellation receipt missing"))?;
+    let current = HarnessWorkflowReceipt::decode(&stored.receipt)?;
+    if let Some(proof) = &current.workflow_obligation_adoption
+        && proof.request.source.dispatch_identity == attempt.dispatch_identity
+    {
+        let guard = settlement_authority(state, &attempt.run_id)
+            .await?
+            .ok_or_else(|| invalid("adopted cancellation authority unavailable"))?;
+        state
+            .workflow_store
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .propagate_owned_obligation_cancellation(
+                &attempt.run_id,
+                &attempt.dispatch_identity,
+                &guard.authority,
+                crate::current_unix_millis(),
+            )?;
+        let destination = crate::workflow_representation::owner::execution_receipt(
+            state,
+            &attempt.run_id,
+            &proof.request.destination.dispatch_identity,
+        )
+        .await?
+        .ok_or_else(|| invalid("adopted cancellation destination unavailable"))?;
+        let forwarded = bcode_workflow_store::ActiveAttemptCancellation {
+            run_id: destination.run_id,
+            node_id: destination.node_id,
+            activation_id: destination.activation_id,
+            attempt: destination.attempt,
+            dispatch_identity: destination.dispatch_identity,
+            receipt: Some(destination.receipt),
+        };
+        return Box::pin(cancel_receipt_inner(state, &forwarded)).await;
+    }
+    cancel_receipt_inner(state, attempt).await
+}
+
+async fn cancel_receipt_inner(
     state: &ServerState,
     attempt: &bcode_workflow_store::ActiveAttemptCancellation,
 ) -> Result<(), WorkflowStoreError> {
@@ -986,12 +1286,12 @@ mod tests {
     fn receipt() -> HarnessWorkflowReceipt {
         let session = SessionId::new();
         let schema = bcode_workflow::ValueSchema {
-            type_name: "bcode.harness.assignment-result/v1".into(),
+            type_name: "bcode.harness.assignment-result/v2".into(),
             schema: json!({"type":"object"}),
         };
         let block = bcode_workflow::WorkflowBlockDefinition {
             block_id: EXECUTE_OPERATION.into(),
-            block_version: 1,
+            block_version: 2,
             plugin_id: "test.generic-harness".into(),
             operation: EXECUTE_OPERATION.into(),
             input: bcode_workflow::ValueSchema {
@@ -1041,6 +1341,8 @@ mod tests {
             node,
             block,
             complete_input: json!({}),
+            workflow_obligation_adoption: None,
+            completion_requirement: bcode_harness_models::HarnessCompletionRequirement::default(),
         }
     }
 
@@ -1539,6 +1841,306 @@ mod tests {
             panic!("submission expected");
         };
         assert_eq!(target, prepared);
+    }
+
+    #[test]
+    fn legacy_receipt_stays_legacy_and_cannot_select_foreground() {
+        let mut receipt = receipt();
+        receipt.block.block_version = 1;
+        receipt.block.output.type_name = "bcode.harness.assignment-result/v1".into();
+        receipt.node.output = receipt.block.output.clone();
+        receipt.output_schema = receipt.node.output.clone();
+        receipt.node.configuration = serde_json::to_value(&receipt.block).unwrap();
+        assert!(HarnessWorkflowReceipt::decode(&serde_json::to_value(&receipt).unwrap()).is_ok());
+        receipt.completion_requirement =
+            bcode_harness_models::HarnessCompletionRequirement::Foreground;
+        receipt.complete_input = json!({"completion_requirement":"foreground"});
+        assert!(HarnessWorkflowReceipt::decode(&serde_json::to_value(&receipt).unwrap()).is_err());
+    }
+
+    #[test]
+    fn async_source_cannot_complete_before_canonical_adoption() {
+        use bcode_harness_models::{
+            HarnessAttemptIdentity, HarnessCompletionRequirement, HarnessExecutionEvent,
+        };
+        let mut receipt = receipt();
+        receipt.completion_requirement = HarnessCompletionRequirement::AsyncHandoff;
+        let event = observation(
+            &receipt,
+            HarnessObservationKind::Execution {
+                event: HarnessExecutionEvent::SubmissionTerminal {
+                    attempt: HarnessAttemptIdentity {
+                        submission_id: "submission".into(),
+                        attempt_id: "attempt".into(),
+                    },
+                    native_turn_id: None,
+                    native_frame_id: Some("frame".into()),
+                    disposition: HarnessTerminalDisposition::Completed,
+                    output: Some("answer".into()),
+                },
+            },
+        );
+        assert!(matches!(
+            execution_outcome::evaluate(&[event], &receipt).unwrap(),
+            Some(AttemptObservation::Deferred { .. })
+        ));
+    }
+
+    #[test]
+    fn completion_requirement_cannot_change_after_receipt_publication() {
+        use bcode_harness_models::HarnessCompletionRequirement;
+        let receipt = receipt();
+        let mut legacy = serde_json::to_value(&receipt).unwrap();
+        legacy
+            .as_object_mut()
+            .unwrap()
+            .remove("completion_requirement");
+        let retained = HarnessWorkflowReceipt::decode(&legacy).unwrap();
+        assert_eq!(
+            retained.completion_requirement,
+            HarnessCompletionRequirement::AssociatedWork
+        );
+        let mut receipt = receipt;
+        receipt.completion_requirement = HarnessCompletionRequirement::Foreground;
+        assert!(HarnessWorkflowReceipt::decode(&serde_json::to_value(&receipt).unwrap()).is_err());
+        receipt.complete_input = json!({"completion_requirement":"foreground"});
+        assert!(HarnessWorkflowReceipt::decode(&serde_json::to_value(&receipt).unwrap()).is_ok());
+        receipt.completion_requirement = HarnessCompletionRequirement::WorkspaceRelease;
+        receipt.complete_input = json!({"completion_requirement":"workspace_release"});
+        assert!(HarnessWorkflowReceipt::decode(&serde_json::to_value(&receipt).unwrap()).is_err());
+    }
+
+    #[test]
+    fn execution_foreground_is_exact_without_fabricated_native_turn() {
+        use bcode_harness_models::{
+            HarnessAttemptIdentity, HarnessCompletionRequirement, HarnessExecutionEvent,
+        };
+        let mut receipt = receipt();
+        receipt.completion_requirement = HarnessCompletionRequirement::Foreground;
+        let event = observation(
+            &receipt,
+            HarnessObservationKind::Execution {
+                event: HarnessExecutionEvent::SubmissionTerminal {
+                    attempt: HarnessAttemptIdentity {
+                        submission_id: "submission".into(),
+                        attempt_id: "attempt".into(),
+                    },
+                    native_turn_id: None,
+                    native_frame_id: Some("native-result-frame".into()),
+                    disposition: HarnessTerminalDisposition::Completed,
+                    output: Some("foreground answer".into()),
+                },
+            },
+        );
+        let Some(AttemptObservation::Succeeded { output }) =
+            execution_outcome::evaluate(std::slice::from_ref(&event), &receipt).unwrap()
+        else {
+            panic!("exact foreground must complete");
+        };
+        assert!(output.value["native_turn_id"].is_null());
+        receipt.completion_requirement = HarnessCompletionRequirement::AssociatedWork;
+        assert!(matches!(
+            execution_outcome::evaluate(std::slice::from_ref(&event), &receipt).unwrap(),
+            Some(AttemptObservation::Deferred { .. })
+        ));
+        let mut stale = event;
+        stale.generation += 1;
+        assert!(matches!(
+            execution_outcome::evaluate(&[stale], &receipt).unwrap(),
+            Some(AttemptObservation::Deferred { .. })
+        ));
+    }
+
+    #[test]
+    fn execution_foreground_non_success_needs_no_result_or_native_turn() {
+        use bcode_harness_models::{
+            HarnessAttemptIdentity, HarnessCompletionRequirement, HarnessExecutionEvent,
+        };
+        let mut receipt = receipt();
+        receipt.completion_requirement = HarnessCompletionRequirement::Foreground;
+        for disposition in [
+            HarnessTerminalDisposition::Interrupted,
+            HarnessTerminalDisposition::Failed,
+        ] {
+            let event = observation(
+                &receipt,
+                HarnessObservationKind::Execution {
+                    event: HarnessExecutionEvent::SubmissionTerminal {
+                        attempt: HarnessAttemptIdentity {
+                            submission_id: "submission".into(),
+                            attempt_id: "attempt".into(),
+                        },
+                        native_turn_id: None,
+                        native_frame_id: Some("frame".into()),
+                        disposition,
+                        output: None,
+                    },
+                },
+            );
+            match execution_outcome::evaluate(&[event], &receipt).unwrap() {
+                Some(AttemptObservation::Cancelled) => {
+                    assert_eq!(disposition, HarnessTerminalDisposition::Interrupted);
+                }
+                Some(AttemptObservation::Failed { message }) => {
+                    assert_eq!(disposition, HarnessTerminalDisposition::Failed);
+                    assert_eq!(message, "managed foreground failed");
+                }
+                other => panic!("exact native non-success must terminalize: {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn execution_foreign_attempt_and_gap_do_not_complete_associated_work() {
+        use bcode_harness_models::{HarnessAttemptIdentity, HarnessExecutionEvent};
+        let receipt = receipt();
+        let mut event = observation(
+            &receipt,
+            HarnessObservationKind::Execution {
+                event: HarnessExecutionEvent::SubmissionTerminal {
+                    attempt: HarnessAttemptIdentity {
+                        submission_id: "foreign".into(),
+                        attempt_id: "attempt".into(),
+                    },
+                    native_turn_id: None,
+                    native_frame_id: Some("frame".into()),
+                    disposition: HarnessTerminalDisposition::Completed,
+                    output: Some("answer".into()),
+                },
+            },
+        );
+        assert!(matches!(
+            execution_outcome::evaluate(std::slice::from_ref(&event), &receipt).unwrap(),
+            Some(AttemptObservation::Deferred { .. })
+        ));
+        event.completeness = HarnessCompleteness::Gap;
+        assert!(matches!(
+            execution_outcome::evaluate(&[event], &receipt).unwrap(),
+            Some(AttemptObservation::Deferred { .. })
+        ));
+    }
+
+    #[test]
+    fn execution_associated_work_requires_coverage_and_preserves_foreground() {
+        use bcode_harness_models::{
+            HarnessAttemptIdentity, HarnessExecutionEvent as E, HarnessNotificationState as N,
+            HarnessTrackingCoverage as C, HarnessWorkKind, HarnessWorkState as W,
+        };
+        let receipt = receipt();
+        let attempt = HarnessAttemptIdentity {
+            submission_id: "submission".into(),
+            attempt_id: "attempt".into(),
+        };
+        let terminal = observation(
+            &receipt,
+            HarnessObservationKind::Execution {
+                event: E::SubmissionTerminal {
+                    attempt: attempt.clone(),
+                    native_turn_id: None,
+                    native_frame_id: Some("native-frame".into()),
+                    disposition: HarnessTerminalDisposition::Completed,
+                    output: Some("answer".into()),
+                },
+            },
+        );
+        let coverage = observation(
+            &receipt,
+            HarnessObservationKind::Execution {
+                event: E::Coverage {
+                    attempt: attempt.clone(),
+                    background: C::Complete,
+                    continuations: C::Complete,
+                },
+            },
+        );
+        let mut events = vec![terminal.clone(), coverage];
+        assert!(matches!(
+            execution_outcome::evaluate(&events, &receipt).unwrap(),
+            Some(AttemptObservation::Succeeded { .. })
+        ));
+        events.push(observation(
+            &receipt,
+            HarnessObservationKind::Execution {
+                event: E::BackgroundWork {
+                    work_id: "work".into(),
+                    native_task_id: None,
+                    origin: Some(attempt),
+                    parent_work_id: None,
+                    work_kind: HarnessWorkKind::Command,
+                    label: "native command".into(),
+                    state: W::Failed,
+                    notification: N::NotExpected,
+                },
+            },
+        ));
+        assert!(matches!(
+            execution_outcome::evaluate(&events, &receipt).unwrap(),
+            Some(AttemptObservation::Failed { .. })
+        ));
+        assert_eq!(events[0], terminal);
+        let mut foreign = self::receipt();
+        foreign.generation += 1;
+        assert!(matches!(
+            execution_outcome::evaluate(&events, &foreign).unwrap(),
+            Some(AttemptObservation::Deferred { .. })
+        ));
+    }
+
+    #[test]
+    fn execution_snapshot_bound_counts_items_not_terminal_and_coverage_records() {
+        use bcode_harness_models::{
+            HarnessAttemptIdentity, HarnessExecutionEvent as E, HarnessNotificationState as N,
+            HarnessTrackingCoverage as C, HarnessWorkKind, HarnessWorkState as W,
+            MAX_HARNESS_EXECUTION_ITEMS,
+        };
+        let receipt = receipt();
+        let attempt = HarnessAttemptIdentity {
+            submission_id: "submission".into(),
+            attempt_id: "attempt".into(),
+        };
+        let mut events = vec![observation(
+            &receipt,
+            HarnessObservationKind::Execution {
+                event: E::SubmissionTerminal {
+                    attempt: attempt.clone(),
+                    native_turn_id: None,
+                    native_frame_id: Some("frame".into()),
+                    disposition: HarnessTerminalDisposition::Completed,
+                    output: Some("answer".into()),
+                },
+            },
+        )];
+        for index in 0..MAX_HARNESS_EXECUTION_ITEMS {
+            events.push(observation(
+                &receipt,
+                HarnessObservationKind::Execution {
+                    event: E::BackgroundWork {
+                        work_id: format!("work-{index}"),
+                        native_task_id: None,
+                        origin: Some(attempt.clone()),
+                        parent_work_id: None,
+                        work_kind: HarnessWorkKind::Command,
+                        label: "completed command".into(),
+                        state: W::Completed,
+                        notification: N::NotExpected,
+                    },
+                },
+            ));
+        }
+        events.push(observation(
+            &receipt,
+            HarnessObservationKind::Execution {
+                event: E::Coverage {
+                    attempt,
+                    background: C::Complete,
+                    continuations: C::Complete,
+                },
+            },
+        ));
+        assert!(matches!(
+            execution_outcome::evaluate(&events, &receipt).unwrap(),
+            Some(AttemptObservation::Succeeded { .. })
+        ));
     }
 
     #[test]

@@ -1125,3 +1125,81 @@ fn markdown_snapshot_and_configured_editor_share_a_local_surface() {
         surface.present::<()>(|_| Ok(())).unwrap();
     }
 }
+
+#[test]
+fn browser_lifecycle_summary_preserves_terminal_reply_and_late_continuation() {
+    use bcode_session_view_models::execution::{
+        ExecutionAttemptView, ExecutionItemView, ExecutionLifecycleView, ExecutionNotificationView,
+        ExecutionStateView,
+    };
+    let item = |id: &str, state| ExecutionItemView {
+        generation: 3,
+        id: id.into(),
+        native_id: None,
+        origin: Some(ExecutionAttemptView {
+            submission_id: "s".into(),
+            attempt_id: "a".into(),
+        }),
+        source_work_id: None,
+        label: "界 👩‍💻 task".into(),
+        state,
+        notification: ExecutionNotificationView::Pending,
+    };
+    let mut snapshot = SessionViewSnapshot::empty();
+    snapshot.session_id = Some(SESSION.parse().unwrap());
+    snapshot.execution_lifecycle = ExecutionLifecycleView {
+        session_id: Some(SESSION.into()),
+        generation: Some(3),
+        submissions: vec![item("reply", ExecutionStateView::Completed)],
+        background: vec![
+            item("one", ExecutionStateView::Running),
+            item("two", ExecutionStateView::Running),
+        ],
+        ..ExecutionLifecycleView::default()
+    };
+    let mut surface = SessionSurface::new(SESSION.into(), 100, 8).unwrap();
+    surface
+        .accept_snapshot(
+            &serde_json::json!({"schema_version":1,"epoch":EPOCH,"revision":1,"snapshot":snapshot})
+                .to_string(),
+        )
+        .unwrap();
+    surface
+        .present::<()>(|frame| {
+            assert!(
+                frame
+                    .hits()
+                    .regions()
+                    .iter()
+                    .all(|region| !region.id.as_str().contains("native-task")),
+                "task observations never invent controls"
+            );
+            Ok(())
+        })
+        .unwrap();
+    assert!(
+        surface
+            .accessibility()
+            .unwrap()
+            .contains("Reply complete + 2 background")
+    );
+    snapshot
+        .execution_lifecycle
+        .continuations
+        .push(item("late", ExecutionStateView::Pending));
+    snapshot.execution_lifecycle.uncertain = true;
+    surface
+        .accept_snapshot(
+            &serde_json::json!({"schema_version":1,"epoch":EPOCH,"revision":2,"snapshot":snapshot})
+                .to_string(),
+        )
+        .unwrap();
+    surface.present::<()>(|_| Ok(())).unwrap();
+    let visible = surface.accessibility().unwrap();
+    assert!(visible.contains("Reply complete + 2 background"));
+    assert!(visible.contains("1 continuation pending"));
+    assert!(visible.contains("coverage unknown"));
+    let stale =
+        serde_json::json!({"schema_version":1,"epoch":EPOCH,"revision":1,"snapshot":snapshot});
+    assert!(surface.accept_snapshot(&stale.to_string()).is_err());
+}

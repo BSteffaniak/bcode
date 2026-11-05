@@ -5,6 +5,32 @@ See [Child sessions](child-sessions.md) for immutable recursive session relation
 See [Session storage tiering](session-storage-tiering.md) for the implemented bounded storage
 measurement command and the remaining transparent-compression design.
 
+## Managed harness notification-gate storage upgrade
+
+Writer epoch 21 retains event schema 55 and requires immutable `NotificationGateV1`
+proof roots for exact-attempt work inventories. The private root binds the source tree,
+a source-keyed terminal-continuation witness tree, deduplicated eligible sources, and
+an exact canonical coverage observation. Coverage changes replace bounded gate metadata
+rather than enumerating a historical roster. Summary, page and item verification use
+the same retained gate; failed/interrupted counters and pinned historical observations
+are preserved. Unknown origins never establish eligibility.
+
+The `session-writer-epoch-20-to-21` transition is an exclusive, backup-protected
+migration, not a normal-open or read-side rebuild. Migration-owned writer-scoped
+normalization validates old typed operations and removes only their derived host
+commitments. The existing chronological target prepares each event against the already
+ingested prefix, persists its regenerated commitments, then ingests the canonical
+projector once. Schema-53/54 conversion follows the same single replay into schema 55;
+writer-chain edges do not cause additional projection passes. Canonical observation
+semantics, sequences, provenance and timestamps remain unchanged.
+
+The canonical projector owns reverse keys, membership-version locators and proof nodes.
+Migration does not duplicate that inventory. Exact `keys(op)` locator verification and
+full private-proof validation precede successful receipt publication and writer-contract
+advancement. Epoch-20 writers cannot mutate epoch-21 storage; missing or corrupt current
+proofs require explicit maintenance. Current-format repair retains and verifies existing
+canonical commitments instead of accepting old commitments or silently replacing them.
+
 ## Native harness terminal-evidence upgrade
 
 Writer epoch 19 and event schema 54 introduce the closed observation variants
@@ -770,7 +796,25 @@ owner blocks migration. Unknown, future, dirty, ambiguous, or corrupt storage st
 
 `session_storage_contract` contains a singleton versioned writer epoch. Mutation-capable processes
 advertise their epoch in session leases and validate the durable row before mutation. The current
-writer contract is epoch `12`, adding durable submission lifecycle projections. Epoch `11` histories
+writer contract is epoch `23`, retaining event payload schema `55`. Epoch `22` introduced
+canonical managed-tool claim/start metadata and its disposable claim projection. Epoch `23` adds
+`events.managed_tool_key` and `idx_events_managed_tool_key`: independently indexed reserved
+claim/result identities on the canonical event rows, populated atomically with each append.
+The bounded claim API strict-loads indexed canonical evidence before treating a missing projected
+claim as absence and cross-checks projected claim/start/result sequences. Deleted or stale claim
+rows and unavailable identity indexes fail closed; they never authorize replay. This does not
+provide authenticity against arbitrary coordinated modification of canonical event rows.
+
+Epoch-22 stores, including partially populated representations, require exclusive migration before
+current reads or writes. Chronological normalization writes the canonical identity column before
+projector ingestion. Before publishing the writer contract, the migration verifier visits canonical
+events in bounded pages, recomputes each key from strict payload decoding, compares the stored
+column and authenticates claim projections against exact canonical events. This full verification
+is maintenance-only, never a routine read repair. Earlier writers are fenced by the durable epoch
+comparison. Epoch `21` notification commitments remain intact; only epochs through `20` replace
+old host-derived commitments during migration.
+
+Epoch `12` added durable submission lifecycle projections. Epoch `11` histories
 upgrade without inferred submission obligations; earlier supported upgrades retain their existing
 migration chain. Epoch `8` adds private original billing capture and disposable staging
 through exclusive migration. Epoch `7` adds separated derived cost and first-observed request

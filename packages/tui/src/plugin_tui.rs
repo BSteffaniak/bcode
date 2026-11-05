@@ -1727,12 +1727,25 @@ library = "libdynamic_visual_test.dylib"
 
     #[derive(Default)]
     struct DynamicVisualTestPlugin {
-        artifact_revisions: BTreeMap<String, u64>,
+        artifact_revisions: std::sync::Mutex<BTreeMap<String, u64>>,
     }
 
-    impl bcode_plugin_sdk::RustPlugin for DynamicVisualTestPlugin {
-        fn invoke_service(
-            &mut self,
+    impl DynamicVisualTestPlugin {
+        fn record_artifact(&self, invocation_id: String) {
+            self.artifact_revisions
+                .lock()
+                .unwrap()
+                .entry(invocation_id)
+                .and_modify(|revision| *revision = revision.wrapping_add(1))
+                .or_insert(1);
+        }
+    }
+
+    impl bcode_plugin_sdk::RustPlugin for DynamicVisualTestPlugin {}
+
+    impl bcode_plugin_sdk::ConcurrentRustPlugin for DynamicVisualTestPlugin {
+        fn invoke_service_concurrent(
+            &self,
             context: bcode_plugin_sdk::NativeServiceContext,
         ) -> bcode_plugin_sdk::ServiceResponse {
             match context.request.operation.as_str() {
@@ -1774,6 +1787,8 @@ library = "libdynamic_visual_test.dylib"
                         "success" => {
                             let artifact_revision = self
                                 .artifact_revisions
+                                .lock()
+                                .unwrap()
                                 .get(&request.invocation_id)
                                 .copied()
                                 .unwrap_or_default();
@@ -1821,11 +1836,7 @@ library = "libdynamic_visual_test.dylib"
                             "artifact request did not decode",
                         );
                     };
-                    let revision = self
-                        .artifact_revisions
-                        .entry(request.chunk.tool_call_id)
-                        .or_default();
-                    *revision = revision.wrapping_add(1);
+                    self.record_artifact(request.chunk.tool_call_id);
                     bcode_plugin_sdk::ServiceResponse::json(&serde_json::json!({"accepted": true}))
                         .expect("encode artifact response")
                 }
@@ -1840,7 +1851,10 @@ library = "libdynamic_visual_test.dylib"
     fn dynamic_visual_test_plugin() -> StaticBundledPlugin {
         StaticBundledPlugin::new(
             DYNAMIC_TEST_MANIFEST,
-            bcode_plugin_sdk::static_plugin_vtable!(DynamicVisualTestPlugin, DYNAMIC_TEST_MANIFEST),
+            bcode_plugin_sdk::static_concurrent_plugin_vtable!(
+                DynamicVisualTestPlugin,
+                DYNAMIC_TEST_MANIFEST
+            ),
         )
     }
 
@@ -2237,8 +2251,22 @@ library = "libcomposer_fixture.dylib"
             if let Some(fallback) = render() {
                 assert_ne!(fallback.route.plugin_id, "test.dynamic-visual");
             }
-            wait_for_dynamic_completion(&presentation);
-            let visual = render().expect("completed serialized projection");
+            // Artifact completion and adapter rendering are independent. A dirty
+            // notification alone need not mean this exact render has completed.
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+            let visual = loop {
+                let _ = presentation.poll_dynamic_visuals();
+                if let Some(visual) = render()
+                    && visual.route.plugin_id == "test.dynamic-visual"
+                {
+                    break visual;
+                }
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "exact serialized projection did not complete"
+                );
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            };
             assert_eq!(visual.route.plugin_id, "test.dynamic-visual");
             assert_eq!(
                 routed_text(&visual),

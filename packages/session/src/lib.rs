@@ -91,6 +91,8 @@ mod spawning;
 pub use invocation_recovery::{InvocationRecoveryCheckpoint, InvocationRecoveryObservation};
 mod runtime_work;
 pub use runtime_work::InterruptedRecoveryWork;
+mod db_managed_tool;
+mod managed_tool;
 pub(crate) mod state;
 pub mod storage_access;
 pub mod storage_admission;
@@ -1617,8 +1619,21 @@ impl SessionManager {
             .await
     }
 
+    fn create_session_record(
+        &self,
+        name: Option<String>,
+        working_directory: PathBuf,
+        execution: Option<ExecutionSessionProvenance>,
+        child: Option<bcode_session_models::SessionChildCreateRequest>,
+    ) -> std::pin::Pin<
+        Box<dyn std::future::Future<Output = Result<SessionSummary, SessionError>> + Send + '_>,
+    > {
+        // Erase the storage implementation's future type at its owning boundary.
+        Box::pin(self.create_session_record_inner(name, working_directory, execution, child))
+    }
+
     #[allow(clippy::too_many_lines)]
-    async fn create_session_record(
+    async fn create_session_record_inner(
         &self,
         name: Option<String>,
         working_directory: PathBuf,

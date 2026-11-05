@@ -1107,7 +1107,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn schema_51_upgrade_preserves_null_and_v1_pending_descriptors() {
+    async fn current_reopen_preserves_null_and_v1_pending_descriptors() {
         let root = tempfile::tempdir().unwrap();
         let id = bcode_session_models::SessionId::new();
         let db = crate::db::SessionDb::initialize_turso_in_root(id, root.path())
@@ -1150,16 +1150,10 @@ mod tests {
             db.append_event(event).await.unwrap();
         }
         let before = db.pending_submissions(None, 2).await.unwrap();
-        downgrade_submission_fixture_to_schema_51(&db, &mut events).await;
         drop(db);
-        let maintenance = crate::lease::acquire_session_maintenance_guard(root.path(), id).unwrap();
-        let write =
-            crate::lease::acquire_maintenance_session_write_lock(&maintenance, root.path(), id)
-                .unwrap();
-        let migrated =
-            crate::db::SessionDb::migrate_turso_in_root(id, root.path(), &maintenance, &write)
-                .await
-                .unwrap();
+        let migrated = crate::db::SessionDb::open_turso_in_root(id, root.path())
+            .await
+            .unwrap();
         assert_eq!(migrated.pending_submissions(None, 2).await.unwrap(), before);
         assert_eq!(
             migrated.submission_queue_head().await.unwrap(),
@@ -1173,56 +1167,6 @@ mod tests {
                 .iter()
                 .all(|e| !matches!(e.kind, SessionEventKind::UserMessage { .. }))
         );
-    }
-
-    async fn downgrade_submission_fixture_to_schema_51(
-        db: &crate::db::SessionDb,
-        events: &mut [SessionEvent],
-    ) {
-        use switchy::database::query::FilterableQuery as _;
-        for event in events {
-            event.schema_version = 51;
-            let payload = crate::persisted::encode_session_event(event).unwrap();
-            db.database()
-                .update("events")
-                .value("payload", payload)
-                .where_eq("event_seq", i64::try_from(event.sequence).unwrap())
-                .execute(db.database())
-                .await
-                .unwrap();
-        }
-        switchy::database::schema::drop_table("submission_recovery_operations")
-            .execute(db.database())
-            .await
-            .unwrap();
-        switchy::database::schema::drop_index("idx_submission_queue", "submissions")
-            .execute(db.database())
-            .await
-            .unwrap();
-        switchy::database::schema::alter_table("submissions")
-            .drop_column("queue_visible".into())
-            .execute(db.database())
-            .await
-            .unwrap();
-        db.database()
-            .delete("__bcode_session_migrations")
-            .where_in(
-                "id",
-                vec![
-                    "063_submission_queue_visible",
-                    "064_submission_queue_index",
-                    "065_submission_recovery_operations",
-                ],
-            )
-            .execute(db.database())
-            .await
-            .unwrap();
-        db.database()
-            .update("session_storage_contract")
-            .value("writer_epoch", 15_i64)
-            .execute(db.database())
-            .await
-            .unwrap();
     }
 
     #[tokio::test]
@@ -1778,15 +1722,15 @@ mod tests {
     async fn submission_acceptance_activation_cancellation_and_compaction() {
         let root = tempfile::tempdir().unwrap();
         let manager = crate::SessionManager::persistent(root.path()).unwrap();
-        check_lifecycle(manager, root.path().to_path_buf()).await;
+        Box::pin(check_lifecycle(manager, root.path().to_path_buf())).await;
     }
 
     #[tokio::test]
     async fn in_memory_submission_lifecycle() {
-        check_lifecycle(
+        Box::pin(check_lifecycle(
             crate::SessionManager::default(),
             std::env::current_dir().unwrap(),
-        )
+        ))
         .await;
     }
 

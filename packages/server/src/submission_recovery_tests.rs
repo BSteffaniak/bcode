@@ -468,7 +468,7 @@ async fn assert_restarted_selection(
 
 async fn persistent_restart_dispatches_two_original_recipes_once_in_fifo_order_inner() {
     let (_directory, state, session_id, first, second) = Box::pin(restarted_fifo_fixture()).await;
-    assert_restarted_selection(&state, session_id, &first).await;
+    Box::pin(assert_restarted_selection(&state, session_id, &first)).await;
     let _handle = live_submission_runtime(&state, session_id).await;
     let history = wait_for_terminals(&state, session_id, 2).await;
     let activations = history

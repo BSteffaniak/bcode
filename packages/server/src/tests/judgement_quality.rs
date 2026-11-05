@@ -1079,7 +1079,7 @@ async fn context_client_boundary_ranks_before_constrained_admission() {
             );
             state
         });
-        let socket = tempfile::tempdir().unwrap();
+        let socket = crate::tests::test_socket_dir().unwrap();
         let endpoint = bcode_ipc::IpcEndpoint::unix_socket(socket.path().join("context.sock"));
         let listener = LocalIpcListener::bind(&endpoint).unwrap();
         let (shutdown, stopped) = oneshot::channel();
@@ -1144,7 +1144,7 @@ async fn eval_diagnosis_client_boundary_preserves_measured_failure() {
         QualityArm::AutoEligible,
     ] {
         let state = Arc::new(state(arm, Feature::EvalCategorization));
-        let socket = tempfile::tempdir().unwrap();
+        let socket = crate::tests::test_socket_dir().unwrap();
         let endpoint = bcode_ipc::IpcEndpoint::unix_socket(socket.path().join("eval.sock"));
         let listener = LocalIpcListener::bind(&endpoint).unwrap();
         let (shutdown, stopped) = oneshot::channel();

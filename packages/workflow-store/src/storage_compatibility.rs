@@ -31,7 +31,7 @@ pub fn verify(db: &dyn Database) -> Result<(), WorkflowStoreError> {
     let compatibility = contract(db, "workflow_storage_compatibility", "compatibility")?;
     if !matches!(
         (actual, compatibility),
-        (Some(42..), Some(2)) | (Some(43..), Some(3))
+        (Some(42..), Some(2)) | (Some(43..), Some(3)) | (Some(44..), Some(4))
     ) {
         return Err(WorkflowStoreError::UnsupportedStore {
             actual,

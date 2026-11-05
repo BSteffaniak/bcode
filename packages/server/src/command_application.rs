@@ -360,7 +360,7 @@ library = "libtest_blocked_command.dylib"
     async fn active_typed_command_cancellation_is_same_caller_and_reaches_owner() {
         use std::sync::atomic::Ordering;
         use std::time::Duration;
-        let root = tempfile::tempdir().unwrap();
+        let root = crate::tests::test_socket_dir().unwrap();
         let directory = root.path().canonicalize().unwrap();
         let (_state, endpoint, stop, server) = blocked_command_server(&directory);
         let client = bcode_client::BcodeClient::new(endpoint.clone()).with_runtime_context(Some(

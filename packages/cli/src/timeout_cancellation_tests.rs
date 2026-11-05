@@ -80,7 +80,7 @@ async fn attach_peer(watch: &mut bcode_ipc::LocalIpcStream, session_id: SessionI
 #[tokio::test]
 async fn observation_failure_without_timeout_authority_performs_no_transport_work() {
     for timeout_error in [false, true] {
-        let directory = tempfile::tempdir().unwrap();
+        let directory = super::private_ipc_test_directory();
         let endpoint = bcode_ipc::IpcEndpoint::unix_socket(directory.path().join("n.sock"));
         let listener = bcode_ipc::LocalIpcListener::bind(&endpoint).unwrap();
         let session_id = SessionId::new();
@@ -128,7 +128,7 @@ async fn observation_failure_without_timeout_authority_performs_no_transport_wor
 
 #[tokio::test]
 async fn cancellation_recovery_deadline_preserves_original_timeout_without_retry() {
-    let directory = tempfile::tempdir().unwrap();
+    let directory = super::private_ipc_test_directory();
     let endpoint = bcode_ipc::IpcEndpoint::unix_socket(directory.path().join("d.sock"));
     let listener = bcode_ipc::LocalIpcListener::bind(&endpoint).unwrap();
     let session_id = SessionId::new();
@@ -194,7 +194,7 @@ async fn cancellation_recovery_deadline_preserves_original_timeout_without_retry
 
 #[tokio::test]
 async fn unanswered_cancellation_is_bounded_by_recovery_grace() {
-    let directory = tempfile::tempdir().unwrap();
+    let directory = super::private_ipc_test_directory();
     let endpoint = bcode_ipc::IpcEndpoint::unix_socket(directory.path().join("grace.sock"));
     let listener = bcode_ipc::LocalIpcListener::bind(&endpoint).unwrap();
     let session_id = SessionId::new();
@@ -254,7 +254,7 @@ async fn unanswered_cancellation_is_bounded_by_recovery_grace() {
 
 #[tokio::test]
 async fn delayed_acknowledgement_does_not_restart_recovery_grace() {
-    let directory = tempfile::tempdir().unwrap();
+    let directory = super::private_ipc_test_directory();
     let endpoint = bcode_ipc::IpcEndpoint::unix_socket(directory.path().join("shared.sock"));
     let listener = bcode_ipc::LocalIpcListener::bind(&endpoint).unwrap();
     let session_id = SessionId::new();
@@ -321,7 +321,7 @@ async fn delayed_acknowledgement_does_not_restart_recovery_grace() {
 
 #[tokio::test]
 async fn headless_permission_wait_fails_without_answering_it() {
-    let directory = tempfile::tempdir().unwrap();
+    let directory = super::private_ipc_test_directory();
     let endpoint = bcode_ipc::IpcEndpoint::unix_socket(directory.path().join("permission.sock"));
     let listener = bcode_ipc::LocalIpcListener::bind(&endpoint).unwrap();
     let session_id = SessionId::new();
@@ -389,7 +389,7 @@ async fn headless_permission_wait_fails_without_answering_it() {
 async fn headless_observes_authoritative_success_and_failure() {
     use bcode_session_models::{ModelTurnOutcome, SessionEvent, SessionEventKind, TurnReceipt};
     for outcome in [ModelTurnOutcome::Completed, ModelTurnOutcome::Cancelled] {
-        let directory = tempfile::tempdir().unwrap();
+        let directory = super::private_ipc_test_directory();
         let endpoint = bcode_ipc::IpcEndpoint::unix_socket(directory.path().join("terminal.sock"));
         let listener = bcode_ipc::LocalIpcListener::bind(&endpoint).unwrap();
         let session_id = SessionId::new();
@@ -453,7 +453,7 @@ async fn headless_observes_authoritative_success_and_failure() {
 
 #[tokio::test]
 async fn headless_lost_admission_response_is_unknown_and_never_replayed() {
-    let directory = tempfile::tempdir().unwrap();
+    let directory = super::private_ipc_test_directory();
     let endpoint = bcode_ipc::IpcEndpoint::unix_socket(directory.path().join("lost.sock"));
     let listener = bcode_ipc::LocalIpcListener::bind(&endpoint).unwrap();
     let session_id = SessionId::new();
@@ -491,7 +491,7 @@ async fn headless_lost_admission_response_is_unknown_and_never_replayed() {
 
 #[tokio::test]
 async fn headless_subscription_uses_total_budget_not_transport_timeout() {
-    let directory = tempfile::tempdir().unwrap();
+    let directory = super::private_ipc_test_directory();
     let endpoint = bcode_ipc::IpcEndpoint::unix_socket(directory.path().join("subscribe.sock"));
     let listener = bcode_ipc::LocalIpcListener::bind(&endpoint).unwrap();
     let session_id = SessionId::new();
@@ -526,7 +526,7 @@ async fn headless_subscription_uses_total_budget_not_transport_timeout() {
 
 #[tokio::test]
 async fn invalid_prompt_never_connects_or_submits() {
-    let directory = tempfile::tempdir().unwrap();
+    let directory = super::private_ipc_test_directory();
     let endpoint = bcode_ipc::IpcEndpoint::unix_socket(directory.path().join("input.sock"));
     let listener = bcode_ipc::LocalIpcListener::bind(&endpoint).unwrap();
     let client = BcodeClient::new(endpoint);
@@ -639,7 +639,7 @@ async fn send_timeout_recovers_terminal_outcome_after_false_or_lost_ack() {
     use bcode_session_models::{ModelTurnOutcome, SessionEvent, SessionEventKind, TurnReceipt};
     for acknowledged in [Some(false), Some(true), None] {
         for outcome in [ModelTurnOutcome::Completed, ModelTurnOutcome::Cancelled] {
-            let directory = tempfile::tempdir().unwrap();
+            let directory = super::private_ipc_test_directory();
             let endpoint = bcode_ipc::IpcEndpoint::unix_socket(directory.path().join("r.sock"));
             let listener = bcode_ipc::LocalIpcListener::bind(&endpoint).unwrap();
             let session_id = SessionId::new();
@@ -799,7 +799,7 @@ fn unverified_observation_propagates_output_and_flush_failures() {
 #[tokio::test]
 async fn timeout_cancellation_preserves_exact_target_and_unknown_acknowledgement() {
     for acknowledged in [Some(false), Some(true), None] {
-        let directory = tempfile::tempdir().unwrap();
+        let directory = super::private_ipc_test_directory();
         let endpoint = bcode_ipc::IpcEndpoint::unix_socket(directory.path().join("c.sock"));
         let listener = bcode_ipc::LocalIpcListener::bind(&endpoint).unwrap();
         let session_id = SessionId::new();

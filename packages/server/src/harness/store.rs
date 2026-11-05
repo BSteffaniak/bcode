@@ -131,6 +131,20 @@ pub trait ManagedHarnessStore: Send + Sync {
         attempt_id: &str,
     ) -> impl Future<Output = Result<Option<HarnessReceipt>, ManagedHarnessError>> + Send;
 
+    /// Build exact post-commit retention evidence for the current native connection.
+    /// Implementations without canonical retention support must not assert acknowledgment.
+    fn retention_context(
+        &self,
+        owner: &HarnessOwner,
+        target: &bcode_harness_models::HarnessSessionTarget,
+        after: Option<&str>,
+    ) -> impl Future<
+        Output = Result<Option<bcode_harness_models::HarnessRetentionContext>, ManagedHarnessError>,
+    > + Send {
+        let _ = (owner, target, after);
+        async { Ok(None) }
+    }
+
     /// Canonical append/dedup by stable observation identity. Conflicting duplicate content is an
     /// error. Persist page and cursor atomically, then broadcast committed observations. Tool and
     /// subagent observations remain inert external evidence. This never marks assignment complete.

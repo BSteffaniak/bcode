@@ -925,6 +925,9 @@ fn prepared(owner: &ExternalHarnessOwner) -> HarnessPreparedSession {
 }
 fn page(owner: &ExternalHarnessOwner) -> HarnessObservationPage {
     HarnessObservationPage {
+        retention: None,
+        hydration_requests: Vec::new(),
+        inventory_page: None,
         observations: vec![HarnessObservation {
             observation_id: "observation".into(),
             session_id: owner.session_id.to_string(),
@@ -1627,5 +1630,2589 @@ async fn authentication_and_unconfigured_native_claims_are_never_retained() {
             .external_harness_history(session.id, Some("native-cursor".into()), 128)
             .await
             .is_err()
+    );
+}
+
+async fn execution_fixture(root: &std::path::Path) -> (SessionManager, ExternalHarnessOwner) {
+    execution_fixture_with_manager(root, manager(root)).await
+}
+
+async fn execution_fixture_with_manager(
+    root: &std::path::Path,
+    sessions: SessionManager,
+) -> (SessionManager, ExternalHarnessOwner) {
+    let session = sessions.create_session(None, root.into()).await.unwrap();
+    let owner = owner(session.id);
+    sessions
+        .configure_external_harness(&owner, instance(), capabilities())
+        .await
+        .unwrap();
+    let opening = open(&owner);
+    sessions
+        .claim_external_harness_request(&owner, &opening)
+        .await
+        .unwrap();
+    sessions
+        .complete_external_harness_request(
+            &owner,
+            &opening,
+            &HarnessServiceResponse {
+                schema_version: HARNESS_SCHEMA_VERSION,
+                request_id: opening.request_id.clone(),
+                operation: HarnessOperation::Open,
+                kind: HarnessServiceResponseKind::Prepared(prepared(&owner)),
+            },
+        )
+        .await
+        .unwrap();
+    let submit = HarnessRequest {
+        schema_version: HARNESS_SCHEMA_VERSION,
+        request_id: "execution-submit".into(),
+        instance: instance(),
+        kind: HarnessRequestKind::Submit {
+            target: HarnessSessionTarget::Prepared(prepared(&owner)),
+            submission: HarnessSubmission {
+                submission_id: "execution-input".into(),
+                attempt_id: "execution-attempt".into(),
+                session_id: owner.session_id.to_string(),
+                generation: owner.generation,
+                text: "execution".into(),
+                placement: HarnessPlacement::NextTurn,
+            },
+        },
+    };
+    sessions
+        .claim_external_harness_request(&owner, &submit)
+        .await
+        .unwrap();
+    (sessions, owner)
+}
+
+fn execution_attempt() -> HarnessAttemptIdentity {
+    HarnessAttemptIdentity {
+        submission_id: "execution-input".into(),
+        attempt_id: "execution-attempt".into(),
+    }
+}
+
+fn execution_page(
+    owner: &ExternalHarnessOwner,
+    id: &str,
+    event: HarnessExecutionEvent,
+) -> HarnessObservationPage {
+    let mut result = page(owner);
+    result.next_after = Some(id.into());
+    result.observations[0].observation_id = id.into();
+    result.observations[0].native_correlations.clear();
+    result.observations[0].kind = HarnessObservationKind::Execution { event };
+    result
+}
+
+fn execution_terminal() -> HarnessExecutionEvent {
+    HarnessExecutionEvent::SubmissionTerminal {
+        attempt: execution_attempt(),
+        native_turn_id: None,
+        native_frame_id: Some("native-result".into()),
+        disposition: HarnessTerminalDisposition::Completed,
+        output: Some("foreground done".into()),
+    }
+}
+
+fn execution_work(
+    origin: Option<HarnessAttemptIdentity>,
+    state: HarnessWorkState,
+) -> HarnessExecutionEvent {
+    HarnessExecutionEvent::BackgroundWork {
+        work_id: "work-1".into(),
+        native_task_id: Some("native-task".into()),
+        origin,
+        parent_work_id: None,
+        work_kind: HarnessWorkKind::Command,
+        label: "background".into(),
+        state,
+        notification: HarnessNotificationState::Pending,
+    }
+}
+
+#[tokio::test]
+async fn retained_pages_allow_null_cursor_reuse_without_losing_exact_retry_fences() {
+    use bcode_harness_models::HarnessRetentionPage;
+    let root = tempfile::tempdir().unwrap();
+    let (sessions, owner) = execution_fixture(root.path()).await;
+    let target = sessions
+        .session_external_harness_state(owner.session_id)
+        .await
+        .unwrap()
+        .unwrap()
+        .target
+        .unwrap();
+    let mut first = execution_page(
+        &owner,
+        "cursor-a",
+        execution_work(None, HarnessWorkState::Running),
+    );
+    let mut empty = first.clone();
+    empty.observations.clear();
+    empty.next_after = None;
+    let mut third = first.clone();
+    third.observations[0].observation_id = "cursor-b".into();
+    third.next_after = Some("cursor-b".into());
+    for (index, page) in [&mut first, &mut empty, &mut third].into_iter().enumerate() {
+        page.retention = Some(HarnessRetentionPage {
+            connection_id: "cursor-connection".into(),
+            page_id: format!("cursor-page-{index}"),
+            observations_digest: bcode_harness_models::harness_observations_digest(
+                &page.observations,
+            )
+            .unwrap(),
+        });
+    }
+    let mut previous_revision = 0;
+    for (after, page) in [(None, &first), (Some("cursor-a"), &empty), (None, &third)] {
+        sessions
+            .commit_external_harness_page(&owner, after, page)
+            .await
+            .unwrap();
+        let context = sessions
+            .session_harness_retention_context(&owner, &target, page.next_after.as_deref())
+            .await
+            .unwrap()
+            .unwrap();
+        let ack = context.acknowledgment.unwrap();
+        assert_eq!(ack.page_id, page.retention.as_ref().unwrap().page_id);
+        assert_eq!(
+            ack.observations_digest,
+            page.retention.as_ref().unwrap().observations_digest
+        );
+        assert!(ack.canonical_revision > previous_revision);
+        previous_revision = ack.canonical_revision;
+        sessions
+            .commit_external_harness_page(&owner, after, page)
+            .await
+            .unwrap();
+        assert_eq!(
+            sessions
+                .session_harness_canonical_page_ack(&owner, page.retention.as_ref().unwrap(),)
+                .await
+                .unwrap(),
+            ack
+        );
+        let mut changed_digest = page.clone();
+        changed_digest
+            .retention
+            .as_mut()
+            .unwrap()
+            .observations_digest = "0".repeat(64);
+        assert!(
+            sessions
+                .commit_external_harness_page(&owner, after, &changed_digest)
+                .await
+                .is_err()
+        );
+        assert!(
+            sessions
+                .session_harness_canonical_page_ack(
+                    &owner,
+                    changed_digest.retention.as_ref().unwrap(),
+                )
+                .await
+                .is_err()
+        );
+        let repeated_context = sessions
+            .session_harness_retention_context(&owner, &target, page.next_after.as_deref())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(repeated_context.acknowledgment.as_ref(), Some(&ack));
+        let mut changed_record = page.clone();
+        changed_record.status.activity = bcode_harness_models::HarnessActivity::Unknown;
+        changed_record.status.attention = bcode_harness_models::HarnessAttention::Assistance;
+        assert!(
+            sessions
+                .commit_external_harness_page(&owner, after, &changed_record)
+                .await
+                .is_err()
+        );
+    }
+    // Historical exact retries stay idempotent after their cursor has been reused.
+    sessions
+        .commit_external_harness_page(&owner, None, &first)
+        .await
+        .unwrap();
+    sessions
+        .commit_external_harness_page(&owner, Some("cursor-a"), &empty)
+        .await
+        .unwrap();
+    let current = sessions
+        .session_harness_retention_context(&owner, &target, Some("cursor-b"))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        current.acknowledgment.unwrap().canonical_revision,
+        previous_revision
+    );
+    assert!(
+        sessions
+            .session_harness_retention_context(&owner, &target, None)
+            .await
+            .is_err()
+    );
+    let mut stale = third.clone();
+    stale.retention.as_mut().unwrap().page_id = "fresh-but-stale-input".into();
+    assert!(
+        sessions
+            .commit_external_harness_page(&owner, None, &stale)
+            .await
+            .is_err()
+    );
+    let mut changed_observations = first.clone();
+    changed_observations.observations[0].observation_id = "conflicting-observation".into();
+    changed_observations.next_after = Some("conflicting-observation".into());
+    changed_observations
+        .retention
+        .as_mut()
+        .unwrap()
+        .observations_digest =
+        bcode_harness_models::harness_observations_digest(&changed_observations.observations)
+            .unwrap();
+    assert!(
+        sessions
+            .commit_external_harness_page(&owner, None, &changed_observations)
+            .await
+            .is_err()
+    );
+}
+
+#[tokio::test]
+async fn retention_context_reads_exact_previous_page_and_committed_requests() {
+    use bcode_harness_models::{
+        HarnessHydrationRequest, HarnessHydrationResolution, HarnessNativeReference,
+        HarnessNativeReferenceKind, HarnessRetentionPage,
+    };
+    let root = tempfile::tempdir().unwrap();
+    let (sessions, owner) = execution_fixture(root.path()).await;
+    let state = sessions
+        .session_external_harness_state(owner.session_id)
+        .await
+        .unwrap()
+        .unwrap();
+    let target = state.target.unwrap();
+    assert_eq!(
+        sessions
+            .session_harness_retention_context(&owner, &target, None)
+            .await
+            .unwrap(),
+        None
+    );
+    assert!(
+        sessions
+            .session_harness_retention_context(&owner, &target, Some("uncommitted"))
+            .await
+            .is_err()
+    );
+    let mut page = execution_page(
+        &owner,
+        "context-work",
+        execution_work(None, HarnessWorkState::Running),
+    );
+    page.hydration_requests.push(HarnessHydrationRequest {
+        request_id: "context-hydrate".into(),
+        reference: HarnessNativeReference {
+            kind: HarnessNativeReferenceKind::Process,
+            native_id: "native-task".into(),
+            native_turn_id: None,
+        },
+    });
+    page.retention = Some(HarnessRetentionPage {
+        connection_id: "context-connection".into(),
+        page_id: "context-page".into(),
+        observations_digest: bcode_harness_models::harness_observations_digest(&page.observations)
+            .unwrap(),
+    });
+    sessions
+        .commit_external_harness_page(&owner, None, &page)
+        .await
+        .unwrap();
+    let first = sessions
+        .session_harness_retention_context(&owner, &target, Some("context-work"))
+        .await
+        .unwrap()
+        .unwrap();
+    let second = sessions
+        .session_harness_retention_context(&owner, &target, Some("context-work"))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(first, second);
+    assert_eq!(first.connection_id, "context-connection");
+    let ack = first.acknowledgment.as_ref().unwrap();
+    assert_eq!(ack.page_id, "context-page");
+    assert_eq!(
+        ack.observations_digest,
+        page.retention.as_ref().unwrap().observations_digest
+    );
+    assert_eq!(first.hydration.len(), 1);
+    assert_eq!(first.hydration[0].request_id, "context-hydrate");
+    assert!(
+        matches!(&first.hydration[0].resolution, HarnessHydrationResolution::Found { observations }
+        if observations.contains(&page.observations[0]))
+    );
+    assert!(
+        sessions
+            .session_harness_retention_context(&owner, &target, None)
+            .await
+            .is_err()
+    );
+    let oversized: Vec<_> = (0..33)
+        .map(|index| HarnessHydrationRequest {
+            request_id: format!("excess-{index}"),
+            reference: page.hydration_requests[0].reference.clone(),
+        })
+        .collect();
+    assert!(
+        sessions
+            .session_harness_native_hydration(&owner, &oversized)
+            .await
+            .is_err()
+    );
+    assert!(
+        sessions
+            .session_harness_retention_context(&owner, &target, Some("foreign-cursor"))
+            .await
+            .is_err()
+    );
+    let mut foreign = owner.clone();
+    foreign.generation += 1;
+    assert!(
+        sessions
+            .session_harness_retention_context(&foreign, &target, Some("context-work"))
+            .await
+            .is_err()
+    );
+    sessions
+        .release_idle_session_resources(owner.session_id)
+        .await
+        .unwrap();
+    let restarted = sessions
+        .session_harness_retention_context(&owner, &target, Some("context-work"))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(restarted, first);
+    let without_metadata = execution_page(
+        &owner,
+        "context-no-metadata",
+        execution_work(None, HarnessWorkState::Completed),
+    );
+    sessions
+        .commit_external_harness_page(&owner, Some("context-work"), &without_metadata)
+        .await
+        .unwrap();
+    assert!(
+        sessions
+            .session_harness_retention_context(&owner, &target, Some("context-no-metadata"))
+            .await
+            .unwrap()
+            .is_none()
+    );
+}
+
+#[tokio::test]
+async fn retention_hydration_damage_is_unavailable_not_indexed_absence() {
+    use bcode_harness_models::{
+        HarnessHydrationRequest, HarnessHydrationResolution, HarnessNativeReference,
+        HarnessNativeReferenceKind, HarnessRetentionPage,
+    };
+    use switchy::database::query::FilterableQuery;
+    let root = tempfile::tempdir().unwrap();
+    let (sessions, owner) = execution_fixture(root.path()).await;
+    let state = sessions
+        .session_external_harness_state(owner.session_id)
+        .await
+        .unwrap()
+        .unwrap();
+    let target = state.target.unwrap();
+    let mut page = execution_page(
+        &owner,
+        "damage-work",
+        execution_work(None, HarnessWorkState::Running),
+    );
+    page.hydration_requests.push(HarnessHydrationRequest {
+        request_id: "damage-request".into(),
+        reference: HarnessNativeReference {
+            kind: HarnessNativeReferenceKind::Process,
+            native_id: "never-indexed".into(),
+            native_turn_id: None,
+        },
+    });
+    page.retention = Some(HarnessRetentionPage {
+        connection_id: "damage-connection".into(),
+        page_id: "damage-page".into(),
+        observations_digest: bcode_harness_models::harness_observations_digest(&page.observations)
+            .unwrap(),
+    });
+    sessions
+        .commit_external_harness_page(&owner, None, &page)
+        .await
+        .unwrap();
+    let before = sessions
+        .session_harness_retention_context(&owner, &target, Some("damage-work"))
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(matches!(
+        before.hydration[0].resolution,
+        HarnessHydrationResolution::Absent
+    ));
+    sessions
+        .release_idle_session_resources(owner.session_id)
+        .await
+        .unwrap();
+    let db =
+        bcode_session::db::SessionDb::open_existing_turso_in_root(owner.session_id, root.path())
+            .await
+            .unwrap();
+    let tail = db.last_event_sequence().await.unwrap();
+    let namespace = format!(
+        "execution_v3:{}:inventory:native_reference_v1",
+        owner.generation
+    );
+    db.database()
+        .delete("snapshots")
+        .where_eq("snapshot_name", namespace.clone())
+        .execute(db.database())
+        .await
+        .unwrap();
+    let damaged = db
+        .harness_retention_context(&owner, &target, Some("damage-work"))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(damaged.acknowledgment, before.acknowledgment);
+    assert!(matches!(
+        damaged.hydration[0].resolution,
+        HarnessHydrationResolution::Unavailable
+    ));
+    assert_eq!(db.last_event_sequence().await.unwrap(), tail);
+    assert!(
+        db.database()
+            .select("snapshots")
+            .columns(&["snapshot_name"])
+            .where_eq("snapshot_name", namespace)
+            .execute(db.database())
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    let page_key = bcode_session_models::external_backend::external_backend_key("page", "current");
+    db.database()
+        .delete("turn_evidence")
+        .where_eq("turn_id", page_key)
+        .where_eq("evidence_kind", "harness_operation_v1")
+        .execute(db.database())
+        .await
+        .unwrap();
+    assert!(
+        db.harness_retention_context(&owner, &target, Some("damage-work"))
+            .await
+            .is_err()
+    );
+    assert_eq!(db.last_event_sequence().await.unwrap(), tail);
+}
+
+#[tokio::test]
+async fn native_hydration_uses_exact_canonical_reference_and_ack_digest() {
+    use bcode_harness_models::{
+        HarnessHydrationRequest, HarnessHydrationResolution, HarnessNativeReference,
+        HarnessNativeReferenceKind, HarnessRetentionPage,
+    };
+    let root = tempfile::tempdir().unwrap();
+    let (sessions, owner) = execution_fixture(root.path()).await;
+    let mut work = execution_page(
+        &owner,
+        "hydrate-running",
+        execution_work(Some(execution_attempt()), HarnessWorkState::Running),
+    );
+    let retention = HarnessRetentionPage {
+        connection_id: "hydrate-connection".into(),
+        page_id: "hydrate-page".into(),
+        observations_digest: bcode_harness_models::harness_observations_digest(&work.observations)
+            .unwrap(),
+    };
+    work.retention = Some(retention.clone());
+    sessions
+        .commit_external_harness_page(&owner, None, &work)
+        .await
+        .unwrap();
+    let ack = sessions
+        .session_harness_canonical_page_ack(&owner, &retention)
+        .await
+        .unwrap();
+    assert_eq!(ack.page_id, retention.page_id);
+    assert_eq!(ack.observations_digest, retention.observations_digest);
+    let mut forged = retention.clone();
+    forged.observations_digest = "0".repeat(64);
+    assert!(
+        sessions
+            .session_harness_canonical_page_ack(&owner, &forged)
+            .await
+            .is_err()
+    );
+    let completed = execution_page(
+        &owner,
+        "hydrate-completed",
+        execution_work(Some(execution_attempt()), HarnessWorkState::Completed),
+    );
+    sessions
+        .commit_external_harness_page(&owner, Some("hydrate-running"), &completed)
+        .await
+        .unwrap();
+    let request = HarnessHydrationRequest {
+        request_id: "hydrate-request".into(),
+        reference: HarnessNativeReference {
+            kind: HarnessNativeReferenceKind::Process,
+            native_id: "native-task".into(),
+            native_turn_id: None,
+        },
+    };
+    let found = sessions
+        .session_harness_native_hydration(&owner, std::slice::from_ref(&request))
+        .await
+        .unwrap();
+    assert!(found[0].canonical_revision > ack.canonical_revision);
+    let HarnessHydrationResolution::Found { observations } = &found[0].resolution else {
+        panic!("retained work");
+    };
+    assert!(observations.iter().any(|observation| matches!(
+        observation.kind,
+        HarnessObservationKind::Execution {
+            event: HarnessExecutionEvent::BackgroundWork {
+                state: HarnessWorkState::Completed,
+                ..
+            }
+        }
+    )));
+    let mut acceptance = page(&owner);
+    acceptance.next_after = Some("hydrate-accepted".into());
+    acceptance.observations[0].observation_id = "hydrate-accepted".into();
+    acceptance.observations[0].kind = HarnessObservationKind::SubmissionAccepted {
+        submission_id: "execution-input".into(),
+        attempt_id: "execution-attempt".into(),
+        native_turn_id: "hydrated-turn".into(),
+    };
+    sessions
+        .commit_external_harness_page(&owner, Some("hydrate-completed"), &acceptance)
+        .await
+        .unwrap();
+    let turn_request = HarnessHydrationRequest {
+        request_id: "hydrate-turn".into(),
+        reference: HarnessNativeReference {
+            kind: HarnessNativeReferenceKind::Turn,
+            native_id: "hydrated-turn".into(),
+            native_turn_id: None,
+        },
+    };
+    let turn = sessions
+        .session_harness_native_hydration(&owner, &[turn_request])
+        .await
+        .unwrap();
+    assert!(
+        matches!(&turn[0].resolution, HarnessHydrationResolution::Found { observations }
+        if observations.iter().any(|observation| matches!(observation.kind, HarnessObservationKind::SubmissionAccepted { .. })))
+    );
+    let mut item_request = request.clone();
+    item_request.reference.kind = HarnessNativeReferenceKind::Item;
+    item_request.reference.native_turn_id = Some("hydrated-turn".into());
+    let item = sessions
+        .session_harness_native_hydration(&owner, &[item_request])
+        .await
+        .unwrap();
+    assert!(matches!(
+        item[0].resolution,
+        HarnessHydrationResolution::Unavailable
+    ));
+    let mut missing = request.clone();
+    missing.reference.native_id = "never-recorded".into();
+    let absent = sessions
+        .session_harness_native_hydration(&owner, &[missing])
+        .await
+        .unwrap();
+    assert!(matches!(
+        absent[0].resolution,
+        HarnessHydrationResolution::Absent
+    ));
+    let mut wrong_kind = request;
+    wrong_kind.reference.kind = HarnessNativeReferenceKind::Agent;
+    let absent = sessions
+        .session_harness_native_hydration(&owner, &[wrong_kind])
+        .await
+        .unwrap();
+    assert!(matches!(
+        absent[0].resolution,
+        HarnessHydrationResolution::Absent
+    ));
+}
+
+#[tokio::test]
+async fn inventory_item_reads_bind_identity_scope_kind_and_retained_revision() {
+    use bcode_session_models::{HarnessInventoryKind, HarnessInventoryScope};
+    let root = tempfile::tempdir().unwrap();
+    let (sessions, owner) = execution_fixture(root.path()).await;
+    let scope = HarnessInventoryScope::Attempt(execution_attempt());
+    let running = execution_page(
+        &owner,
+        "item-running",
+        execution_work(Some(execution_attempt()), HarnessWorkState::Running),
+    );
+    sessions
+        .commit_external_harness_page(&owner, None, &running)
+        .await
+        .unwrap();
+    let page = sessions
+        .session_harness_inventory_page(&owner, &scope, HarnessInventoryKind::Work, None)
+        .await
+        .unwrap();
+    let completed = execution_page(
+        &owner,
+        "item-completed",
+        execution_work(Some(execution_attempt()), HarnessWorkState::Completed),
+    );
+    sessions
+        .commit_external_harness_page(&owner, Some("item-running"), &completed)
+        .await
+        .unwrap();
+    let retained = sessions
+        .session_harness_inventory_item(
+            &owner,
+            &scope,
+            HarnessInventoryKind::Work,
+            "work-1",
+            &page.commitment,
+        )
+        .await
+        .unwrap();
+    assert_eq!(retained.commitment, page.commitment);
+    assert_eq!(
+        retained.entry.unwrap().observation,
+        page.entries[0].observation
+    );
+    let absent = sessions
+        .session_harness_inventory_item(
+            &owner,
+            &scope,
+            HarnessInventoryKind::Work,
+            "missing-work",
+            &page.commitment,
+        )
+        .await
+        .unwrap();
+    assert!(absent.entry.is_none());
+    assert!(
+        sessions
+            .session_harness_inventory_item(
+                &owner,
+                &HarnessInventoryScope::Uncorrelated,
+                HarnessInventoryKind::Work,
+                "work-1",
+                &page.commitment
+            )
+            .await
+            .is_err()
+    );
+    assert!(
+        sessions
+            .session_harness_inventory_item(
+                &owner,
+                &scope,
+                HarnessInventoryKind::Continuation,
+                "work-1",
+                &page.commitment
+            )
+            .await
+            .is_err()
+    );
+    let mut forged = page.commitment.clone();
+    forged.summary.identities += 1;
+    assert!(
+        sessions
+            .session_harness_inventory_item(
+                &owner,
+                &scope,
+                HarnessInventoryKind::Work,
+                "work-1",
+                &forged
+            )
+            .await
+            .is_err()
+    );
+}
+
+#[tokio::test]
+async fn inventory_pages_retain_more_than_32_uncorrelated_obligations_without_lifetime_cap() {
+    use bcode_session_models::{HarnessInventoryKind, HarnessInventoryScope};
+    let root = tempfile::tempdir().unwrap();
+    let (sessions, owner) = execution_fixture(root.path()).await;
+    let mut after: Option<String> = None;
+    for index in 0..40 {
+        let mut work = execution_work(None, HarnessWorkState::Running);
+        if let HarnessExecutionEvent::BackgroundWork {
+            work_id,
+            native_task_id,
+            ..
+        } = &mut work
+        {
+            *work_id = format!("unknown-{index}");
+            *native_task_id = None;
+        }
+        let page = execution_page(&owner, &format!("unknown-page-{index}"), work);
+        sessions
+            .commit_external_harness_page(&owner, after.as_deref(), &page)
+            .await
+            .unwrap();
+        after = page.next_after;
+    }
+    let first = sessions
+        .session_harness_inventory_page(
+            &owner,
+            &HarnessInventoryScope::Uncorrelated,
+            HarnessInventoryKind::Work,
+            None,
+        )
+        .await
+        .unwrap();
+    assert_eq!(first.commitment.summary.identities, 40);
+    assert_eq!(first.commitment.summary.unfinished, 40);
+    assert_eq!(first.commitment.summary.obligations, 40);
+    let second = sessions
+        .session_harness_inventory_page(
+            &owner,
+            &HarnessInventoryScope::Uncorrelated,
+            HarnessInventoryKind::Work,
+            first.next_cursor.as_ref(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(first.entries.len(), 32);
+    assert_eq!(second.entries.len(), 8);
+    assert!(second.inventory_exhausted);
+    assert!(second.next_cursor.is_none());
+}
+
+#[tokio::test]
+async fn inventory_observed_notification_requires_verified_terminal_continuation_to_discharge() {
+    use bcode_session_models::{HarnessInventoryKind, HarnessInventoryScope};
+    let root = tempfile::tempdir().unwrap();
+    let (sessions, owner) = execution_fixture(root.path()).await;
+    let mut work = execution_work(None, HarnessWorkState::Failed);
+    if let HarnessExecutionEvent::BackgroundWork { notification, .. } = &mut work {
+        *notification = HarnessNotificationState::Observed;
+    }
+    sessions
+        .commit_external_harness_page(
+            &owner,
+            None,
+            &execution_page(&owner, "observed-source", work),
+        )
+        .await
+        .unwrap();
+    let before = sessions
+        .session_harness_inventory_page(
+            &owner,
+            &HarnessInventoryScope::Uncorrelated,
+            HarnessInventoryKind::Work,
+            None,
+        )
+        .await
+        .unwrap();
+    assert_eq!(before.commitment.summary.obligations, 1);
+    assert_eq!(before.commitment.summary.failed, 1);
+    let continuation = HarnessExecutionEvent::Continuation {
+        continuation_id: "verified-follow-up".into(),
+        origin: None,
+        source_work_id: Some("work-1".into()),
+        native_turn_id: Some("follow-up-turn".into()),
+        state: HarnessWorkState::Completed,
+        output: Some("follow-up done".into()),
+    };
+    let linked = execution_page(&owner, "verified-follow-up", continuation);
+    sessions
+        .commit_external_harness_page(&owner, Some("observed-source"), &linked)
+        .await
+        .unwrap();
+    let after = sessions
+        .session_harness_inventory_page(
+            &owner,
+            &HarnessInventoryScope::Uncorrelated,
+            HarnessInventoryKind::Work,
+            None,
+        )
+        .await
+        .unwrap();
+    assert_eq!(after.commitment.summary.identities, 1);
+    // Equal unknown origins are not exact attribution, even with a source-work link.
+    assert_eq!(after.commitment.summary.obligations, 1);
+    assert_eq!(after.commitment.summary.failed, 1);
+    assert_eq!(after.entries[0].observation, before.entries[0].observation);
+}
+
+#[tokio::test]
+async fn inventory_notification_discharge_requires_exact_origin_and_complete_coverage() {
+    use bcode_harness_models::HarnessTrackingCoverage;
+    use bcode_session_models::{HarnessInventoryKind, HarnessInventoryScope};
+    let root = tempfile::tempdir().unwrap();
+    let (sessions, owner) = execution_fixture(root.path()).await;
+    let scope = HarnessInventoryScope::Attempt(execution_attempt());
+    let mut work = execution_work(Some(execution_attempt()), HarnessWorkState::Failed);
+    if let HarnessExecutionEvent::BackgroundWork { notification, .. } = &mut work {
+        *notification = HarnessNotificationState::Observed;
+    }
+    sessions
+        .commit_external_harness_page(
+            &owner,
+            None,
+            &execution_page(&owner, "exact-source", work.clone()),
+        )
+        .await
+        .unwrap();
+    let continuation = HarnessExecutionEvent::Continuation {
+        continuation_id: "exact-followup".into(),
+        origin: Some(execution_attempt()),
+        source_work_id: Some("work-1".into()),
+        native_turn_id: Some("exact-followup-turn".into()),
+        state: HarnessWorkState::Completed,
+        output: Some("done".into()),
+    };
+    sessions
+        .commit_external_harness_page(
+            &owner,
+            Some("exact-source"),
+            &execution_page(&owner, "no-coverage", continuation.clone()),
+        )
+        .await
+        .unwrap();
+    let summary = sessions
+        .session_harness_inventory_summary(&owner, &scope, HarnessInventoryKind::Work)
+        .await
+        .unwrap();
+    assert_eq!(summary.commitment.summary.obligations, 1);
+    let coverage = HarnessExecutionEvent::Coverage {
+        attempt: execution_attempt(),
+        background: HarnessTrackingCoverage::Complete,
+        continuations: HarnessTrackingCoverage::Complete,
+    };
+    sessions
+        .commit_external_harness_page(
+            &owner,
+            Some("no-coverage"),
+            &execution_page(&owner, "coverage-only", coverage),
+        )
+        .await
+        .unwrap();
+    let summary = sessions
+        .session_harness_inventory_summary(&owner, &scope, HarnessInventoryKind::Work)
+        .await
+        .unwrap();
+    assert_eq!(summary.commitment.summary.obligations, 0);
+    sessions
+        .commit_external_harness_page(
+            &owner,
+            Some("coverage-only"),
+            &execution_page(&owner, "verified-chain", continuation),
+        )
+        .await
+        .unwrap();
+    let summary = sessions
+        .session_harness_inventory_summary(&owner, &scope, HarnessInventoryKind::Work)
+        .await
+        .unwrap();
+    assert_eq!(summary.commitment.summary.obligations, 0);
+    assert_eq!(summary.commitment.summary.failed, 1);
+    let page = sessions
+        .session_harness_inventory_page(&owner, &scope, HarnessInventoryKind::Work, None)
+        .await
+        .unwrap();
+    assert_eq!(page.commitment, summary.commitment);
+    assert_eq!(
+        page.observed_through_sequence,
+        summary.observed_through_sequence
+    );
+    sessions
+        .commit_external_harness_page(
+            &owner,
+            Some("verified-chain"),
+            &execution_page(&owner, "duplicate-source", work),
+        )
+        .await
+        .unwrap();
+    let summary = sessions
+        .session_harness_inventory_summary(&owner, &scope, HarnessInventoryKind::Work)
+        .await
+        .unwrap();
+    assert_eq!(summary.commitment.summary.obligations, 0);
+    assert_eq!(summary.commitment.summary.failed, 1);
+}
+
+#[tokio::test]
+async fn inventory_notification_discharge_is_independent_of_evidence_order() {
+    use bcode_harness_models::HarnessTrackingCoverage;
+    use bcode_session_models::{HarnessInventoryKind, HarnessInventoryScope};
+
+    // Each permutation supplies exact, complete evidence once. Neither coverage
+    // nor source notification arriving last may require continuation replay.
+    for order in [
+        [0, 1, 2],
+        [0, 2, 1],
+        [1, 0, 2],
+        [1, 2, 0],
+        [2, 0, 1],
+        [2, 1, 0],
+    ] {
+        let root = tempfile::tempdir().unwrap();
+        let (sessions, owner) = execution_fixture(root.path()).await;
+        let scope = HarnessInventoryScope::Attempt(execution_attempt());
+        let work = execution_work(Some(execution_attempt()), HarnessWorkState::Failed);
+        sessions
+            .commit_external_harness_page(
+                &owner,
+                None,
+                &execution_page(&owner, "pending-source", work.clone()),
+            )
+            .await
+            .unwrap();
+        let pending = sessions
+            .session_harness_inventory_page(&owner, &scope, HarnessInventoryKind::Work, None)
+            .await
+            .unwrap();
+        assert_eq!(pending.commitment.summary.obligations, 1);
+        let mut observed = work;
+        if let HarnessExecutionEvent::BackgroundWork { notification, .. } = &mut observed {
+            *notification = HarnessNotificationState::Observed;
+        }
+        let continuation = HarnessExecutionEvent::Continuation {
+            continuation_id: "ordered-followup".into(),
+            origin: Some(execution_attempt()),
+            source_work_id: Some("work-1".into()),
+            native_turn_id: Some("ordered-followup-turn".into()),
+            state: HarnessWorkState::Completed,
+            output: Some("done".into()),
+        };
+        let evidence = [
+            ("observed-source", observed),
+            (
+                "complete-coverage",
+                HarnessExecutionEvent::Coverage {
+                    attempt: execution_attempt(),
+                    background: HarnessTrackingCoverage::Complete,
+                    continuations: HarnessTrackingCoverage::Complete,
+                },
+            ),
+            ("terminal-continuation", continuation.clone()),
+        ];
+        let mut after = "pending-source";
+        for index in order {
+            let (id, event) = &evidence[index];
+            sessions
+                .commit_external_harness_page(
+                    &owner,
+                    Some(after),
+                    &execution_page(&owner, id, event.clone()),
+                )
+                .await
+                .unwrap();
+            after = id;
+        }
+        let summary = sessions
+            .session_harness_inventory_summary(&owner, &scope, HarnessInventoryKind::Work)
+            .await
+            .unwrap();
+        assert_eq!(
+            summary.commitment.summary.obligations, 0,
+            "arrival order: {order:?}"
+        );
+        assert_eq!(summary.commitment.summary.identities, 1);
+        assert_eq!(summary.commitment.summary.failed, 1);
+        assert_eq!(summary.commitment.summary.unfinished, 0);
+        let page = sessions
+            .session_harness_inventory_page(&owner, &scope, HarnessInventoryKind::Work, None)
+            .await
+            .unwrap();
+        assert_eq!(page.commitment, summary.commitment);
+        assert_eq!(
+            page.observed_through_sequence,
+            summary.observed_through_sequence
+        );
+
+        sessions
+            .commit_external_harness_page(
+                &owner,
+                Some(after),
+                &execution_page(&owner, "repeated-continuation", continuation),
+            )
+            .await
+            .unwrap();
+        let summary = sessions
+            .session_harness_inventory_summary(&owner, &scope, HarnessInventoryKind::Work)
+            .await
+            .unwrap();
+        assert_eq!(summary.commitment.summary.obligations, 0);
+        assert_eq!(summary.commitment.summary.failed, 1);
+        let pinned_cursor = bcode_session_models::HarnessInventoryCursor {
+            owner: owner.clone(),
+            commitment: pending.commitment.clone(),
+            offset: 0,
+        };
+        let pinned = sessions
+            .session_harness_inventory_page(
+                &owner,
+                &scope,
+                HarnessInventoryKind::Work,
+                Some(&pinned_cursor),
+            )
+            .await
+            .unwrap();
+        assert_eq!(pinned.commitment, pending.commitment);
+        assert_eq!(pinned.entries, pending.entries);
+        let item = sessions
+            .session_harness_inventory_item(
+                &owner,
+                &scope,
+                HarnessInventoryKind::Work,
+                "work-1",
+                &summary.commitment,
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            item.entry.as_ref().unwrap().observation,
+            page.entries[0].observation
+        );
+
+        // Damage each private dependency in separate permutations. Historical
+        // pins remain readable when only a later gate or witness is removed.
+        sessions
+            .release_idle_session_resources(owner.session_id)
+            .await
+            .unwrap();
+        let db = bcode_session::db::SessionDb::open_existing_turso_in_root(
+            owner.session_id,
+            root.path(),
+        )
+        .await
+        .unwrap();
+        use switchy::database::query::FilterableQuery;
+        let root_name = format!(
+            "harness_inventory_node_v1:{}",
+            summary.commitment.root.as_ref().unwrap()
+        );
+        let row = db
+            .database()
+            .select("snapshots")
+            .columns(&["payload"])
+            .where_eq("snapshot_name", root_name.clone())
+            .execute_first(db.database())
+            .await
+            .unwrap()
+            .unwrap();
+        let payload: serde_json::Value =
+            serde_json::from_str(row.get("payload").unwrap().as_str().unwrap()).unwrap();
+        if order[0] == 2 {
+            let origin = execution_attempt();
+            let attempt_key = format!(
+                "{}:{}:{}",
+                origin.submission_id.len(),
+                origin.submission_id,
+                origin.attempt_id
+            );
+            let (namespace, identity, sequence) = if order[1] == 0 {
+                (
+                    format!(
+                        "execution_v3:{}:inventory:attempt:{attempt_key}:coverage",
+                        owner.generation
+                    ),
+                    attempt_key,
+                    payload["gate"]["coverage"].as_u64().unwrap(),
+                )
+            } else {
+                let reverse_name = format!(
+                    "harness_inventory_node_v1:{}",
+                    payload["gate"]["reverse"]["hash"].as_str().unwrap()
+                );
+                let reverse_row = db
+                    .database()
+                    .select("snapshots")
+                    .columns(&["payload"])
+                    .where_eq("snapshot_name", reverse_name)
+                    .execute_first(db.database())
+                    .await
+                    .unwrap()
+                    .unwrap();
+                let reverse: serde_json::Value =
+                    serde_json::from_str(reverse_row.get("payload").unwrap().as_str().unwrap())
+                        .unwrap();
+                (
+                    format!(
+                        "execution_v3:{}:inventory:attempt:{attempt_key}:notification_reverse_v1",
+                        owner.generation
+                    ),
+                    "work-1".into(),
+                    reverse["sequence"].as_u64().unwrap(),
+                )
+            };
+            let key =
+                bcode_session_models::external_backend::external_backend_key(&namespace, &identity);
+            let version = bcode_session_models::external_backend::external_backend_key(
+                "inventory_member_v1",
+                &format!("{}:{key}:{sequence}", key.len()),
+            );
+            db.database()
+                .delete("turn_evidence")
+                .where_eq("turn_id", version)
+                .execute(db.database())
+                .await
+                .unwrap();
+        }
+        let damaged = match order[0] {
+            0 if order[1] == 1 => root_name,
+            0 => format!(
+                "harness_inventory_node_v1:{}",
+                payload["gate"]["eligible"]["hash"].as_str().unwrap()
+            ),
+            1 => format!(
+                "harness_inventory_node_v1:{}",
+                payload["gate"]["reverse"]["hash"].as_str().unwrap()
+            ),
+            _ => "no-such-proof-node".into(),
+        };
+        db.database()
+            .delete("snapshots")
+            .where_eq("snapshot_name", damaged)
+            .execute(db.database())
+            .await
+            .unwrap();
+        assert!(
+            db.harness_inventory_summary(&owner, &scope, HarnessInventoryKind::Work)
+                .await
+                .is_err()
+        );
+        assert!(
+            db.harness_inventory_page(&owner, &scope, HarnessInventoryKind::Work, None)
+                .await
+                .is_err()
+        );
+        assert!(
+            db.harness_inventory_item(
+                &owner,
+                &scope,
+                HarnessInventoryKind::Work,
+                "work-1",
+                &summary.commitment
+            )
+            .await
+            .is_err()
+        );
+        let historical = db
+            .harness_inventory_page(
+                &owner,
+                &scope,
+                HarnessInventoryKind::Work,
+                Some(&pinned_cursor),
+            )
+            .await
+            .unwrap();
+        assert_eq!(historical.commitment, pending.commitment);
+        assert_eq!(historical.entries, pending.entries);
+    }
+}
+
+#[tokio::test]
+async fn inventory_notification_gate_requires_complete_pages_and_observations() {
+    use bcode_harness_models::HarnessTrackingCoverage;
+    use bcode_session_models::{HarnessInventoryKind, HarnessInventoryScope};
+    for damaged_event in 0..3 {
+        for partial_page in [false, true] {
+            let root = tempfile::tempdir().unwrap();
+            let (sessions, owner) = execution_fixture(root.path()).await;
+            let scope = HarnessInventoryScope::Attempt(execution_attempt());
+            let mut work = execution_work(Some(execution_attempt()), HarnessWorkState::Failed);
+            if let HarnessExecutionEvent::BackgroundWork { notification, .. } = &mut work {
+                *notification = HarnessNotificationState::Observed;
+            }
+            let events = [
+                work,
+                HarnessExecutionEvent::Coverage {
+                    attempt: execution_attempt(),
+                    background: HarnessTrackingCoverage::Complete,
+                    continuations: HarnessTrackingCoverage::Complete,
+                },
+                HarnessExecutionEvent::Continuation {
+                    continuation_id: "complete-followup".into(),
+                    origin: Some(execution_attempt()),
+                    source_work_id: Some("work-1".into()),
+                    native_turn_id: None,
+                    state: HarnessWorkState::Completed,
+                    output: None,
+                },
+            ];
+            let ids = ["partial-source", "partial-coverage", "partial-continuation"];
+            let mut after = None;
+            for (index, event) in events.iter().enumerate() {
+                let mut page = execution_page(&owner, ids[index], event.clone());
+                if index == damaged_event {
+                    if partial_page {
+                        page.completeness = HarnessCompleteness::Partial;
+                    } else {
+                        page.observations[0].completeness = HarnessCompleteness::Partial;
+                    }
+                }
+                sessions
+                    .commit_external_harness_page(&owner, after, &page)
+                    .await
+                    .unwrap();
+                after = Some(ids[index]);
+            }
+            let summary = sessions
+                .session_harness_inventory_summary(&owner, &scope, HarnessInventoryKind::Work)
+                .await
+                .unwrap();
+            assert_eq!(summary.commitment.summary.obligations, 1);
+            let page = sessions
+                .session_harness_inventory_page(&owner, &scope, HarnessInventoryKind::Work, None)
+                .await
+                .unwrap();
+            assert_eq!(page.commitment, summary.commitment);
+            sessions
+                .commit_external_harness_page(
+                    &owner,
+                    after,
+                    &execution_page(
+                        &owner,
+                        "complete-replacement",
+                        events[damaged_event].clone(),
+                    ),
+                )
+                .await
+                .unwrap();
+            let summary = sessions
+                .session_harness_inventory_summary(&owner, &scope, HarnessInventoryKind::Work)
+                .await
+                .unwrap();
+            assert_eq!(summary.commitment.summary.obligations, 0);
+            assert_eq!(summary.commitment.summary.failed, 1);
+        }
+    }
+}
+
+#[tokio::test]
+async fn inventory_notification_gate_deduplicates_sources_and_pins_coverage() {
+    use bcode_harness_models::HarnessTrackingCoverage;
+    use bcode_session_models::{HarnessInventoryKind, HarnessInventoryScope};
+    let root = tempfile::tempdir().unwrap();
+    let (sessions, owner) = execution_fixture(root.path()).await;
+    let scope = HarnessInventoryScope::Attempt(execution_attempt());
+    let mut work = execution_work(Some(execution_attempt()), HarnessWorkState::Failed);
+    if let HarnessExecutionEvent::BackgroundWork { notification, .. } = &mut work {
+        *notification = HarnessNotificationState::Observed;
+    }
+    let coverage = HarnessExecutionEvent::Coverage {
+        attempt: execution_attempt(),
+        background: HarnessTrackingCoverage::Complete,
+        continuations: HarnessTrackingCoverage::Complete,
+    };
+    sessions
+        .commit_external_harness_page(&owner, None, &execution_page(&owner, "dedup-source", work))
+        .await
+        .unwrap();
+    sessions
+        .commit_external_harness_page(
+            &owner,
+            Some("dedup-source"),
+            &execution_page(&owner, "dedup-coverage", coverage.clone()),
+        )
+        .await
+        .unwrap();
+    let mut after = "dedup-coverage";
+    for id in ["dedup-followup-a", "dedup-followup-b"] {
+        let continuation = HarnessExecutionEvent::Continuation {
+            continuation_id: id.into(),
+            origin: Some(execution_attempt()),
+            source_work_id: Some("work-1".into()),
+            native_turn_id: None,
+            state: HarnessWorkState::Completed,
+            output: None,
+        };
+        sessions
+            .commit_external_harness_page(
+                &owner,
+                Some(after),
+                &execution_page(&owner, id, continuation),
+            )
+            .await
+            .unwrap();
+        after = id;
+        let summary = sessions
+            .session_harness_inventory_summary(&owner, &scope, HarnessInventoryKind::Work)
+            .await
+            .unwrap();
+        assert_eq!(summary.commitment.summary.identities, 1);
+        assert_eq!(summary.commitment.summary.obligations, 0);
+        assert_eq!(summary.commitment.summary.failed, 1);
+    }
+    let settled = sessions
+        .session_harness_inventory_page(&owner, &scope, HarnessInventoryKind::Work, None)
+        .await
+        .unwrap();
+    let mut partial = execution_page(&owner, "coverage-revoked", coverage.clone());
+    partial.observations[0].completeness = HarnessCompleteness::Partial;
+    sessions
+        .commit_external_harness_page(&owner, Some(after), &partial)
+        .await
+        .unwrap();
+    let current = sessions
+        .session_harness_inventory_summary(&owner, &scope, HarnessInventoryKind::Work)
+        .await
+        .unwrap();
+    assert_eq!(current.commitment.summary.obligations, 1);
+    let cursor = bcode_session_models::HarnessInventoryCursor {
+        owner: owner.clone(),
+        commitment: settled.commitment.clone(),
+        offset: 0,
+    };
+    let pinned = sessions
+        .session_harness_inventory_page(&owner, &scope, HarnessInventoryKind::Work, Some(&cursor))
+        .await
+        .unwrap();
+    assert_eq!(pinned.commitment, settled.commitment);
+    assert_eq!(pinned.entries, settled.entries);
+    let item = sessions
+        .session_harness_inventory_item(
+            &owner,
+            &scope,
+            HarnessInventoryKind::Work,
+            "work-1",
+            &settled.commitment,
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        item.entry.as_ref().unwrap().observation,
+        settled.entries[0].observation
+    );
+    sessions
+        .commit_external_harness_page(
+            &owner,
+            Some("coverage-revoked"),
+            &execution_page(&owner, "coverage-restored", coverage),
+        )
+        .await
+        .unwrap();
+    let summary = sessions
+        .session_harness_inventory_summary(&owner, &scope, HarnessInventoryKind::Work)
+        .await
+        .unwrap();
+    assert_eq!(summary.commitment.summary.obligations, 0);
+    assert_eq!(summary.commitment.summary.failed, 1);
+}
+
+#[tokio::test]
+async fn inventory_pages_pin_more_than_1024_same_attempt_identities_across_restart_and_damage() {
+    use bcode_session_models::{HarnessInventoryKind, HarnessInventoryScope};
+    use switchy::database::query::FilterableQuery;
+    let root = tempfile::tempdir().unwrap();
+    let (sessions, owner) = execution_fixture(root.path()).await;
+    let mut after = None;
+    for index in 0..1030 {
+        let mut work = execution_work(Some(execution_attempt()), HarnessWorkState::Running);
+        if let HarnessExecutionEvent::BackgroundWork {
+            work_id,
+            native_task_id,
+            notification,
+            state,
+            ..
+        } = &mut work
+        {
+            *work_id = format!("paged-work-{index}");
+            *native_task_id = None;
+            *notification = HarnessNotificationState::NotExpected;
+            if index == 0 {
+                *state = HarnessWorkState::Failed;
+            }
+        }
+        let observation_id = format!("paged-observation-{index}");
+        let page = execution_page(&owner, &observation_id, work);
+        sessions
+            .commit_external_harness_page(&owner, after.as_deref(), &page)
+            .await
+            .unwrap();
+        after = page.next_after;
+    }
+    let scope = HarnessInventoryScope::Attempt(execution_attempt());
+    let first = sessions
+        .session_harness_inventory_page(&owner, &scope, HarnessInventoryKind::Work, None)
+        .await
+        .unwrap();
+    let summary = sessions
+        .session_harness_inventory_summary(&owner, &scope, HarnessInventoryKind::Work)
+        .await
+        .unwrap();
+    assert_eq!(summary.commitment, first.commitment);
+    assert_eq!(
+        summary.observed_through_sequence,
+        first.observed_through_sequence
+    );
+    assert_eq!(summary.commitment.summary.identities, 1030);
+    assert_eq!(first.entries.len(), 32);
+    assert_eq!(first.commitment.summary.identities, 1030);
+    assert_eq!(first.commitment.summary.failed, 1);
+    assert_eq!(first.commitment.summary.unfinished, 1029);
+    let mut update = execution_work(Some(execution_attempt()), HarnessWorkState::Completed);
+    if let HarnessExecutionEvent::BackgroundWork {
+        work_id,
+        native_task_id,
+        notification,
+        ..
+    } = &mut update
+    {
+        *work_id = "paged-work-500".into();
+        *native_task_id = None;
+        *notification = HarnessNotificationState::NotExpected;
+    }
+    let page = execution_page(&owner, "paged-concurrent-update", update);
+    sessions
+        .commit_external_harness_page(&owner, after.as_deref(), &page)
+        .await
+        .unwrap();
+    sessions
+        .release_idle_session_resources(owner.session_id)
+        .await
+        .unwrap();
+    let db =
+        bcode_session::db::SessionDb::open_existing_turso_in_root(owner.session_id, root.path())
+            .await
+            .unwrap();
+    let mut cursor = first.next_cursor;
+    let mut entries = first.entries;
+    while let Some(position) = cursor {
+        let next = db
+            .harness_inventory_page(&owner, &scope, HarnessInventoryKind::Work, Some(&position))
+            .await
+            .unwrap();
+        assert_eq!(next.commitment, first.commitment);
+        assert!(next.entries.len() <= 32);
+        entries.extend(next.entries);
+        cursor = next.next_cursor;
+    }
+    assert_eq!(entries.len(), 1030);
+    assert_eq!(
+        entries
+            .iter()
+            .map(|entry| &entry.key)
+            .collect::<std::collections::BTreeSet<_>>()
+            .len(),
+        1030
+    );
+    let current = db
+        .harness_inventory_page(&owner, &scope, HarnessInventoryKind::Work, None)
+        .await
+        .unwrap();
+    assert_eq!(current.commitment.summary.unfinished, 1028);
+    assert_eq!(current.commitment.summary.failed, 1);
+    let middle_cursor = bcode_session_models::HarnessInventoryCursor {
+        owner: owner.clone(),
+        commitment: first.commitment.clone(),
+        offset: 512,
+    };
+    let middle_page = db
+        .harness_inventory_page(
+            &owner,
+            &scope,
+            HarnessInventoryKind::Work,
+            Some(&middle_cursor),
+        )
+        .await
+        .unwrap();
+    let middle = &middle_page.entries[0];
+    let version = bcode_session_models::external_backend::external_backend_key(
+        "inventory_member_v1",
+        &format!(
+            "{}:{}:{}",
+            middle.key.len(),
+            middle.key,
+            middle.event_sequence
+        ),
+    );
+    db.database()
+        .delete("turn_evidence")
+        .where_eq("turn_id", version)
+        .execute(db.database())
+        .await
+        .unwrap();
+    assert!(
+        db.harness_inventory_page(
+            &owner,
+            &scope,
+            HarnessInventoryKind::Work,
+            Some(&middle_cursor)
+        )
+        .await
+        .is_err()
+    );
+    let mut foreign = middle_cursor.clone();
+    foreign.owner.generation += 1;
+    assert!(
+        db.harness_inventory_page(&owner, &scope, HarnessInventoryKind::Work, Some(&foreign))
+            .await
+            .is_err()
+    );
+    let damaged = &current.entries[0];
+    db.database()
+        .delete("turn_evidence")
+        .where_eq("turn_id", damaged.key.clone())
+        .where_eq("event_seq", i64::try_from(damaged.event_sequence).unwrap())
+        .execute(db.database())
+        .await
+        .unwrap();
+    assert!(
+        db.harness_inventory_page(&owner, &scope, HarnessInventoryKind::Work, None)
+            .await
+            .is_err()
+    );
+    let name = format!(
+        "harness_inventory_node_v1:{}",
+        first.commitment.root.as_ref().unwrap()
+    );
+    db.database()
+        .delete("snapshots")
+        .where_eq("snapshot_name", name)
+        .execute(db.database())
+        .await
+        .unwrap();
+    let forged = bcode_session_models::HarnessInventoryCursor {
+        owner: owner.clone(),
+        commitment: first.commitment,
+        offset: 32,
+    };
+    assert!(
+        db.harness_inventory_page(&owner, &scope, HarnessInventoryKind::Work, Some(&forged))
+            .await
+            .is_err()
+    );
+}
+
+#[tokio::test]
+async fn execution_evidence_survives_long_prefix_empty_snapshot_and_process_loss() {
+    let root = tempfile::tempdir().unwrap();
+    let (sessions, owner) = execution_fixture(root.path()).await;
+    let mut cursor = None;
+    for batch in 0..9 {
+        let mut prefix = page(&owner);
+        prefix.next_after = Some(format!("execution-prefix-{batch}"));
+        let template = prefix.observations[0].clone();
+        prefix.observations = (0..128)
+            .map(|offset| {
+                let mut observation = template.clone();
+                observation.observation_id = format!("execution-prefix-{batch}-{offset}");
+                observation.native_correlations.clear();
+                observation
+            })
+            .collect();
+        sessions
+            .commit_external_harness_page(&owner, cursor.as_deref(), &prefix)
+            .await
+            .unwrap();
+        cursor = prefix.next_after;
+    }
+    let terminal = execution_page(&owner, "foreground", execution_terminal());
+    sessions
+        .commit_external_harness_page(&owner, cursor.as_deref(), &terminal)
+        .await
+        .unwrap();
+    let work = execution_page(
+        &owner,
+        "work-running",
+        execution_work(None, HarnessWorkState::Running),
+    );
+    sessions
+        .commit_external_harness_page(&owner, Some("foreground"), &work)
+        .await
+        .unwrap();
+    let coverage = execution_page(
+        &owner,
+        "coverage",
+        HarnessExecutionEvent::Coverage {
+            attempt: execution_attempt(),
+            background: HarnessTrackingCoverage::Complete,
+            continuations: HarnessTrackingCoverage::Complete,
+        },
+    );
+    sessions
+        .commit_external_harness_page(&owner, Some("work-running"), &coverage)
+        .await
+        .unwrap();
+    let mut empty = page(&owner);
+    empty.observations.clear();
+    empty.next_after = Some("empty".into());
+    sessions
+        .commit_external_harness_page(&owner, Some("coverage"), &empty)
+        .await
+        .unwrap();
+    let unknown = execution_page(
+        &owner,
+        "process-lost",
+        execution_work(None, HarnessWorkState::Unknown),
+    );
+    sessions
+        .commit_external_harness_page(&owner, Some("empty"), &unknown)
+        .await
+        .unwrap();
+    let foreign = manager(root.path());
+    let (actual_owner, evidence) = foreign
+        .session_external_harness_submission_evidence(
+            owner.session_id,
+            "execution-input",
+            "execution-attempt",
+        )
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(actual_owner, owner);
+    let events: Vec<_> = evidence
+        .observations
+        .iter()
+        .filter_map(|observation| match &observation.kind {
+            HarnessObservationKind::Execution { event } => Some(event),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(events.len(), 3);
+    assert!(events.contains(&&execution_terminal()));
+    assert!(events.iter().any(|event| matches!(
+        event,
+        HarnessExecutionEvent::BackgroundWork {
+            origin: None,
+            state: HarnessWorkState::Unknown,
+            notification: HarnessNotificationState::Pending,
+            ..
+        }
+    )));
+    assert!(
+        foreign
+            .session_external_harness_submission_acceptance(
+                owner.session_id,
+                "execution-input",
+                "execution-attempt"
+            )
+            .await
+            .unwrap()
+            .is_none()
+    );
+}
+
+#[tokio::test]
+async fn execution_rejects_forged_origins_terminal_overwrite_and_reused_work() {
+    let root = tempfile::tempdir().unwrap();
+    let (sessions, owner) = execution_fixture(root.path()).await;
+    let mut forged = execution_attempt();
+    forged.attempt_id = "unretained".into();
+    let invalid = execution_page(
+        &owner,
+        "forged",
+        execution_work(Some(forged), HarnessWorkState::Running),
+    );
+    assert!(
+        sessions
+            .commit_external_harness_page(&owner, None, &invalid)
+            .await
+            .is_err()
+    );
+    let terminal = execution_page(&owner, "terminal", execution_terminal());
+    sessions
+        .commit_external_harness_page(&owner, None, &terminal)
+        .await
+        .unwrap();
+    // Exact retained poll retry remains idempotent; a late conflicting outcome does not.
+    sessions
+        .commit_external_harness_page(&owner, None, &terminal)
+        .await
+        .unwrap();
+    let duplicate = execution_page(&owner, "duplicate-terminal", execution_terminal());
+    assert!(
+        sessions
+            .commit_external_harness_page(&owner, Some("terminal"), &duplicate)
+            .await
+            .is_err()
+    );
+    let mut changed = execution_terminal();
+    if let HarnessExecutionEvent::SubmissionTerminal { disposition, .. } = &mut changed {
+        *disposition = HarnessTerminalDisposition::Failed;
+    }
+    let invalid = execution_page(&owner, "late-terminal", changed);
+    assert!(
+        sessions
+            .commit_external_harness_page(&owner, Some("terminal"), &invalid)
+            .await
+            .is_err()
+    );
+    let completed = execution_page(
+        &owner,
+        "work-completed",
+        execution_work(Some(execution_attempt()), HarnessWorkState::Completed),
+    );
+    sessions
+        .commit_external_harness_page(&owner, Some("terminal"), &completed)
+        .await
+        .unwrap();
+    let mut reused = execution_work(Some(execution_attempt()), HarnessWorkState::Running);
+    if let HarnessExecutionEvent::BackgroundWork { work_id, .. } = &mut reused {
+        *work_id = "alias".into();
+    }
+    let reused = execution_page(&owner, "native-task-reused", reused);
+    assert!(
+        sessions
+            .commit_external_harness_page(&owner, Some("work-completed"), &reused)
+            .await
+            .is_err()
+    );
+    let reopened = execution_page(
+        &owner,
+        "work-reopened",
+        execution_work(Some(execution_attempt()), HarnessWorkState::Running),
+    );
+    assert!(
+        sessions
+            .commit_external_harness_page(&owner, Some("work-completed"), &reopened)
+            .await
+            .is_err()
+    );
+    let uncorrelated = execution_page(
+        &owner,
+        "work-rebound",
+        execution_work(None, HarnessWorkState::Completed),
+    );
+    assert!(
+        sessions
+            .commit_external_harness_page(&owner, Some("work-completed"), &uncorrelated)
+            .await
+            .is_err()
+    );
+    let invalid = execution_page(
+        &owner,
+        "forged-continuation",
+        HarnessExecutionEvent::Continuation {
+            continuation_id: "followup".into(),
+            origin: None,
+            source_work_id: Some("work-1".into()),
+            native_turn_id: None,
+            state: HarnessWorkState::Pending,
+            output: None,
+        },
+    );
+    assert!(
+        sessions
+            .commit_external_harness_page(&owner, Some("work-completed"), &invalid)
+            .await
+            .is_err()
+    );
+}
+
+#[tokio::test]
+async fn execution_monotonic_enrichment_preserves_identity_and_rejects_reassignment() {
+    let root = tempfile::tempdir().unwrap();
+    let (sessions, owner) = execution_fixture(root.path()).await;
+    let mut roster = execution_work(None, HarnessWorkState::Running);
+    if let HarnessExecutionEvent::BackgroundWork { work_kind, .. } = &mut roster {
+        *work_kind = HarnessWorkKind::Other;
+    }
+    let roster = execution_page(&owner, "roster", roster);
+    sessions
+        .commit_external_harness_page(&owner, None, &roster)
+        .await
+        .unwrap();
+    let enriched = execution_page(
+        &owner,
+        "enriched",
+        execution_work(Some(execution_attempt()), HarnessWorkState::Running),
+    );
+    sessions
+        .commit_external_harness_page(&owner, Some("roster"), &enriched)
+        .await
+        .unwrap();
+    let evidence = sessions
+        .session_external_harness_submission_evidence(
+            owner.session_id,
+            "execution-input",
+            "execution-attempt",
+        )
+        .await
+        .unwrap()
+        .unwrap()
+        .1;
+    assert_eq!(evidence.observations.len(), 1);
+    assert_eq!(evidence.observations[0], enriched.observations[0]);
+    let mut downgraded = execution_work(Some(execution_attempt()), HarnessWorkState::Running);
+    if let HarnessExecutionEvent::BackgroundWork { work_kind, .. } = &mut downgraded {
+        *work_kind = HarnessWorkKind::Other;
+    }
+    let downgraded = execution_page(&owner, "downgraded", downgraded);
+    assert!(
+        sessions
+            .commit_external_harness_page(&owner, Some("enriched"), &downgraded)
+            .await
+            .is_err()
+    );
+    let reassigned = execution_page(
+        &owner,
+        "reassigned",
+        execution_work(None, HarnessWorkState::Running),
+    );
+    assert!(
+        sessions
+            .commit_external_harness_page(&owner, Some("enriched"), &reassigned)
+            .await
+            .is_err()
+    );
+}
+
+fn record_execution_phase(
+    phases: &mut std::collections::BTreeMap<&'static str, (u64, std::time::Duration)>,
+    phase: &'static str,
+    elapsed: std::time::Duration,
+) {
+    let entry = phases.entry(phase).or_default();
+    entry.0 += 1;
+    entry.1 += elapsed;
+}
+
+#[tokio::test]
+async fn execution_many_completed_origins_remain_exactly_readable_without_global_cap() {
+    let root = tempfile::tempdir().unwrap();
+    let metrics = bcode_metrics::MetricsRegistry::in_memory();
+    let sessions = SessionManager::persistent_with_metrics_and_lease_owner(
+        root.path(),
+        metrics.clone(),
+        SessionLeaseOwnerContext {
+            build_fingerprint: Some("artifact".into()),
+            daemon_instance_id: Some("daemon".into()),
+            ..SessionLeaseOwnerContext::default()
+        },
+    )
+    .unwrap();
+    let (sessions, owner) = execution_fixture_with_manager(root.path(), sessions).await;
+    let mut phases = std::collections::BTreeMap::<&str, (u64, std::time::Duration)>::new();
+    let binding = HarnessSessionBinding {
+        schema_version: HARNESS_SCHEMA_VERSION,
+        session_id: owner.session_id.to_string(),
+        instance_id: "fixture".into(),
+        native_session_id: "native-confirmed".into(),
+        native_version: "fixture-v1".into(),
+        generation: owner.generation,
+    };
+    let mut confirmation = page(&owner);
+    confirmation.next_after = Some("confirmed".into());
+    confirmation.observations[0].observation_id = "confirmed".into();
+    confirmation.observations[0].native_correlations.clear();
+    confirmation.observations[0].kind = HarnessObservationKind::BindingConfirmed {
+        open_id: "open".into(),
+        binding: binding.clone(),
+    };
+    sessions
+        .commit_external_harness_page(&owner, None, &confirmation)
+        .await
+        .unwrap();
+    let mut cursor = "confirmed".to_owned();
+    for index in 0..1030 {
+        let attempt = HarnessAttemptIdentity {
+            submission_id: format!("sequential-{index}"),
+            attempt_id: format!("attempt-{index}"),
+        };
+        let request = HarnessRequest {
+            schema_version: HARNESS_SCHEMA_VERSION,
+            request_id: format!("submit-{index}"),
+            instance: instance(),
+            kind: HarnessRequestKind::Submit {
+                target: HarnessSessionTarget::Confirmed(binding.clone()),
+                submission: HarnessSubmission {
+                    submission_id: attempt.submission_id.clone(),
+                    attempt_id: attempt.attempt_id.clone(),
+                    session_id: owner.session_id.to_string(),
+                    generation: owner.generation,
+                    text: "sequential".into(),
+                    placement: HarnessPlacement::NextTurn,
+                },
+            },
+        };
+        let phase_started = std::time::Instant::now();
+        sessions
+            .claim_external_harness_request(&owner, &request)
+            .await
+            .unwrap();
+        record_execution_phase(&mut phases, "claim", phase_started.elapsed());
+        // First uncorrelated roster, then verified enrichment and explicit retirement.
+        let mut running = execution_work(None, HarnessWorkState::Running);
+        if let HarnessExecutionEvent::BackgroundWork {
+            work_id,
+            native_task_id,
+            ..
+        } = &mut running
+        {
+            *work_id = format!("work-{index}");
+            *native_task_id = Some(format!("task-{index}"));
+        }
+        let next = format!("roster-{index}");
+        let phase_started = std::time::Instant::now();
+        sessions
+            .commit_external_harness_page(
+                &owner,
+                Some(&cursor),
+                &execution_page(&owner, &next, running.clone()),
+            )
+            .await
+            .unwrap();
+        record_execution_phase(&mut phases, "roster", phase_started.elapsed());
+        cursor = next;
+        if let HarnessExecutionEvent::BackgroundWork {
+            origin,
+            state,
+            notification,
+            ..
+        } = &mut running
+        {
+            *origin = Some(attempt.clone());
+            *state = HarnessWorkState::Completed;
+            *notification = HarnessNotificationState::NotExpected;
+        }
+        let next = format!("completed-{index}");
+        let phase_started = std::time::Instant::now();
+        sessions
+            .commit_external_harness_page(
+                &owner,
+                Some(&cursor),
+                &execution_page(&owner, &next, running),
+            )
+            .await
+            .unwrap();
+        record_execution_phase(&mut phases, "completion", phase_started.elapsed());
+        cursor = next;
+        let terminal = HarnessExecutionEvent::SubmissionTerminal {
+            attempt,
+            native_turn_id: None,
+            native_frame_id: Some(format!("result-{index}")),
+            disposition: HarnessTerminalDisposition::Completed,
+            output: Some(format!("output-{index}")),
+        };
+        let next = format!("terminal-{index}");
+        let phase_started = std::time::Instant::now();
+        sessions
+            .commit_external_harness_page(
+                &owner,
+                Some(&cursor),
+                &execution_page(&owner, &next, terminal),
+            )
+            .await
+            .unwrap();
+        record_execution_phase(&mut phases, "terminal", phase_started.elapsed());
+        cursor = next;
+        if index % 64 == 0 || index == 1029 {
+            let snapshot = metrics.snapshot();
+            let selected: Vec<_> = [
+                "database.operation.duration_ms",
+                "session.actor.append_event.db_transaction_ms",
+                "session.actor.append_event.manifest_duration_ms",
+                "session.actor.append_event.duration_ms",
+            ]
+            .into_iter()
+            .filter_map(|name| {
+                snapshot
+                    .histograms
+                    .get(name)
+                    .map(|value| (name, value.count, value.sum, value.max))
+            })
+            .collect();
+            let db_path = bcode_session::db::session_db_path(root.path(), owner.session_id);
+            let physical: Vec<_> = [
+                db_path.clone(),
+                db_path.with_file_name(format!(
+                    "{}-wal",
+                    db_path.file_name().unwrap().to_string_lossy()
+                )),
+            ]
+            .iter()
+            .map(|path| {
+                (
+                    path.extension().map(|v| v.to_string_lossy().into_owned()),
+                    std::fs::metadata(path)
+                        .map(|metadata| metadata.len())
+                        .unwrap_or(0),
+                )
+            })
+            .collect();
+            let physical_operations: Vec<_> = snapshot
+                .histograms
+                .iter()
+                .filter(|(name, _)| name.starts_with("database.physical."))
+                .map(|(name, value)| (name, value.count, value.sum, value.max))
+                .collect();
+            eprintln!(
+                "execution origins completed={} phases={phases:?} selected_count_sum_max={selected:?} physical_bytes={physical:?} db_operations={:?} physical_operations_count_sum_max={physical_operations:?}",
+                index + 1,
+                snapshot.counters.get("database.operation.total")
+            );
+        }
+    }
+    for phase in ["claim", "roster", "completion", "terminal"] {
+        assert_eq!(phases[phase].0, 1030, "missing production phase {phase}");
+    }
+    for index in [0, 1029] {
+        let evidence = sessions
+            .session_external_harness_submission_evidence(
+                owner.session_id,
+                &format!("sequential-{index}"),
+                &format!("attempt-{index}"),
+            )
+            .await
+            .unwrap()
+            .unwrap()
+            .1;
+        assert_eq!(evidence.observations.len(), 2);
+        assert!(evidence.observations.iter().any(|v| matches!(&v.kind,
+            HarnessObservationKind::Execution { event: HarnessExecutionEvent::SubmissionTerminal { output: Some(output), .. } }
+                if output == &format!("output-{index}"))));
+    }
+}
+
+#[tokio::test]
+async fn execution_uncorrelated_retirement_requires_terminal_and_no_notification_debt() {
+    let root = tempfile::tempdir().unwrap();
+    let (sessions, owner) = execution_fixture(root.path()).await;
+    let terminal = execution_page(&owner, "terminal", execution_terminal());
+    sessions
+        .commit_external_harness_page(&owner, None, &terminal)
+        .await
+        .unwrap();
+    let mut cursor = "terminal".to_owned();
+    for index in 0..40 {
+        let mut event = execution_work(None, HarnessWorkState::Completed);
+        if let HarnessExecutionEvent::BackgroundWork {
+            work_id,
+            native_task_id,
+            notification,
+            ..
+        } = &mut event
+        {
+            *work_id = format!("retired-{index}");
+            *native_task_id = Some(format!("retired-native-{index}"));
+            *notification = HarnessNotificationState::NotExpected;
+        }
+        let next = format!("retired-{index}");
+        sessions
+            .commit_external_harness_page(
+                &owner,
+                Some(&cursor),
+                &execution_page(&owner, &next, event),
+            )
+            .await
+            .unwrap();
+        cursor = next;
+    }
+    let pending = execution_page(
+        &owner,
+        "pending-notification",
+        execution_work(None, HarnessWorkState::Completed),
+    );
+    sessions
+        .commit_external_harness_page(&owner, Some(&cursor), &pending)
+        .await
+        .unwrap();
+    let mut observed = execution_work(None, HarnessWorkState::Completed);
+    if let HarnessExecutionEvent::BackgroundWork { notification, .. } = &mut observed {
+        *notification = HarnessNotificationState::Observed;
+    }
+    let observed = execution_page(&owner, "observed-notification", observed);
+    sessions
+        .commit_external_harness_page(&owner, Some("pending-notification"), &observed)
+        .await
+        .unwrap();
+    let evidence = sessions
+        .session_external_harness_submission_evidence(
+            owner.session_id,
+            "execution-input",
+            "execution-attempt",
+        )
+        .await
+        .unwrap()
+        .unwrap()
+        .1;
+    assert_eq!(evidence.observations.len(), 2);
+    assert!(evidence.observations.iter().any(|v| matches!(
+        &v.kind,
+        HarnessObservationKind::Execution {
+            event: HarnessExecutionEvent::BackgroundWork {
+                notification: HarnessNotificationState::Observed,
+                ..
+            }
+        }
+    )));
+}
+
+#[tokio::test]
+async fn execution_current_inventory_corruption_fails_without_replay() {
+    use bcode_session::db::SessionDb;
+    use switchy::database::query::FilterableQuery;
+    let root = tempfile::tempdir().unwrap();
+    let (sessions, owner) = execution_fixture(root.path()).await;
+    let terminal = execution_page(&owner, "terminal", execution_terminal());
+    sessions
+        .commit_external_harness_page(&owner, None, &terminal)
+        .await
+        .unwrap();
+    let pending = execution_page(
+        &owner,
+        "pending",
+        execution_work(None, HarnessWorkState::Running),
+    );
+    sessions
+        .commit_external_harness_page(&owner, Some("terminal"), &pending)
+        .await
+        .unwrap();
+    sessions
+        .release_idle_session_resources(owner.session_id)
+        .await
+        .unwrap();
+    let db = SessionDb::open_existing_turso_in_root(owner.session_id, root.path())
+        .await
+        .unwrap();
+    let tail = db.last_event_sequence().await.unwrap();
+    let namespace = format!("execution_v3:{}:inventory:unknown:work", owner.generation);
+    let key = bcode_session_models::external_backend::external_backend_key(&namespace, "work-1");
+    db.database()
+        .delete("turn_evidence")
+        .where_eq("evidence_kind", "harness_operation_v1")
+        .where_eq("turn_id", key.clone())
+        .execute(db.database())
+        .await
+        .unwrap();
+    assert!(
+        db.external_harness_submission_evidence("execution-input", "execution-attempt")
+            .await
+            .is_err()
+    );
+    assert_eq!(db.last_event_sequence().await.unwrap(), tail);
+    assert!(
+        db.database()
+            .select("turn_evidence")
+            .columns(&["event_seq"])
+            .where_eq("turn_id", key)
+            .execute(db.database())
+            .await
+            .unwrap()
+            .is_empty()
+    );
+}
+
+#[tokio::test]
+async fn execution_batched_transitions_return_final_state_and_resolved_attention() {
+    let root = tempfile::tempdir().unwrap();
+    let (sessions, owner) = execution_fixture(root.path()).await;
+    let mut batch = execution_page(&owner, "batch", execution_terminal());
+    let mut running = batch.observations[0].clone();
+    running.observation_id = "running".into();
+    running.kind = HarnessObservationKind::Execution {
+        event: execution_work(Some(execution_attempt()), HarnessWorkState::Running),
+    };
+    let mut completed = running.clone();
+    completed.observation_id = "completed".into();
+    completed.kind = HarnessObservationKind::Execution {
+        event: execution_work(Some(execution_attempt()), HarnessWorkState::Completed),
+    };
+    let mut notified = completed.clone();
+    notified.observation_id = "notified".into();
+    if let HarnessObservationKind::Execution {
+        event: HarnessExecutionEvent::BackgroundWork { notification, .. },
+    } = &mut notified.kind
+    {
+        *notification = HarnessNotificationState::Observed;
+    }
+    batch
+        .observations
+        .extend([running, completed, notified.clone()]);
+    sessions
+        .commit_external_harness_page(&owner, None, &batch)
+        .await
+        .unwrap();
+    let evidence = sessions
+        .session_external_harness_submission_evidence(
+            owner.session_id,
+            "execution-input",
+            "execution-attempt",
+        )
+        .await
+        .unwrap()
+        .unwrap()
+        .1;
+    assert_eq!(evidence.status.attention, HarnessAttention::None);
+    assert_eq!(evidence.observations.len(), 2);
+    assert!(evidence.observations.contains(&notified));
+    let mut updated = execution_work(Some(execution_attempt()), HarnessWorkState::Completed);
+    if let HarnessExecutionEvent::BackgroundWork { notification, .. } = &mut updated {
+        *notification = HarnessNotificationState::Observed;
+    }
+    let mut cursor = "batch".to_owned();
+    for index in 0..128 {
+        let next = format!("update-{index}");
+        sessions
+            .commit_external_harness_page(
+                &owner,
+                Some(&cursor),
+                &execution_page(&owner, &next, updated.clone()),
+            )
+            .await
+            .unwrap();
+        cursor = next;
+    }
+    // Current membership cardinality remains one despite repeated updates.
+    let evidence = sessions
+        .session_external_harness_submission_evidence(
+            owner.session_id,
+            "execution-input",
+            "execution-attempt",
+        )
+        .await
+        .unwrap()
+        .unwrap()
+        .1;
+    assert_eq!(evidence.observations.len(), 2);
+    let reopened = execution_page(
+        &owner,
+        "reopened",
+        execution_work(Some(execution_attempt()), HarnessWorkState::Running),
+    );
+    assert!(
+        sessions
+            .commit_external_harness_page(&owner, Some(&cursor), &reopened)
+            .await
+            .is_err()
+    );
+}
+
+#[tokio::test]
+async fn execution_attention_tracks_pending_and_acknowledged_interaction() {
+    let root = tempfile::tempdir().unwrap();
+    let (sessions, owner) = execution_fixture(root.path()).await;
+    let terminal = execution_page(&owner, "terminal", execution_terminal());
+    sessions
+        .commit_external_harness_page(&owner, None, &terminal)
+        .await
+        .unwrap();
+    let mut question = page(&owner);
+    question.next_after = Some("question".into());
+    question.observations[0].observation_id = "question".into();
+    question.observations[0].native_correlations.clear();
+    question.observations[0].kind = HarnessObservationKind::Interaction {
+        interaction: HarnessInteraction {
+            request_id: "question".into(),
+            session_id: owner.session_id.to_string(),
+            generation: owner.generation,
+            kind: HarnessInteractionKind::Approval,
+            prompt: "Proceed?".into(),
+            scope: "fixture".into(),
+            choices: vec![],
+        },
+    };
+    question.status.attention = HarnessAttention::Approval;
+    sessions
+        .commit_external_harness_page(&owner, Some("terminal"), &question)
+        .await
+        .unwrap();
+    let evidence = sessions
+        .session_external_harness_submission_evidence(
+            owner.session_id,
+            "execution-input",
+            "execution-attempt",
+        )
+        .await
+        .unwrap()
+        .unwrap()
+        .1;
+    assert_eq!(evidence.status.attention, HarnessAttention::Approval);
+    let request = HarnessRequest {
+        schema_version: HARNESS_SCHEMA_VERSION,
+        request_id: "answer".into(),
+        instance: instance(),
+        kind: HarnessRequestKind::Respond {
+            target: HarnessSessionTarget::Prepared(prepared(&owner)),
+            response: HarnessResponse {
+                response_id: "answer".into(),
+                request_id: "question".into(),
+                session_id: owner.session_id.to_string(),
+                generation: owner.generation,
+                value: HarnessResponseValue::Approval { approved: true },
+            },
+        },
+    };
+    sessions
+        .claim_external_harness_request(&owner, &request)
+        .await
+        .unwrap();
+    // Claiming the response is not native acknowledgment and cannot clear attention.
+    let evidence = sessions
+        .session_external_harness_submission_evidence(
+            owner.session_id,
+            "execution-input",
+            "execution-attempt",
+        )
+        .await
+        .unwrap()
+        .unwrap()
+        .1;
+    assert_ne!(evidence.status.attention, HarnessAttention::None);
+    sessions
+        .complete_external_harness_request(
+            &owner,
+            &request,
+            &HarnessServiceResponse {
+                schema_version: HARNESS_SCHEMA_VERSION,
+                request_id: "answer".into(),
+                operation: HarnessOperation::Respond,
+                kind: HarnessServiceResponseKind::Acknowledged {
+                    mutation_id: "answer".into(),
+                },
+            },
+        )
+        .await
+        .unwrap();
+    let evidence = sessions
+        .session_external_harness_submission_evidence(
+            owner.session_id,
+            "execution-input",
+            "execution-attempt",
+        )
+        .await
+        .unwrap()
+        .unwrap()
+        .1;
+    assert_eq!(evidence.status.attention, HarnessAttention::None);
+}
+
+#[tokio::test]
+async fn execution_snapshot_rejects_physical_and_cardinality_overflow_without_repair() {
+    use bcode_session::db::SessionDb;
+    use switchy::database::query::FilterableQuery;
+    let root = tempfile::tempdir().unwrap();
+    let (sessions, owner) = execution_fixture(root.path()).await;
+    let terminal = execution_page(&owner, "terminal", execution_terminal());
+    sessions
+        .commit_external_harness_page(&owner, None, &terminal)
+        .await
+        .unwrap();
+    sessions
+        .release_idle_session_resources(owner.session_id)
+        .await
+        .unwrap();
+    let db = SessionDb::open_existing_turso_in_root(owner.session_id, root.path())
+        .await
+        .unwrap();
+    let tail = db.last_event_sequence().await.unwrap();
+    let namespace = format!("execution_v3:{}:inventory:unknown:work", owner.generation);
+    let physical = format!("[{}]", " ".repeat(200_000));
+    let cardinal =
+        serde_json::to_string(&vec![("locator", 1_u64); MAX_HARNESS_EXECUTION_ITEMS + 1]).unwrap();
+    for payload in [physical, cardinal] {
+        db.database()
+            .update("snapshots")
+            .value("payload", payload.clone())
+            .where_eq("snapshot_name", namespace.clone())
+            .execute(db.database())
+            .await
+            .unwrap();
+        assert!(
+            db.external_harness_submission_evidence("execution-input", "execution-attempt")
+                .await
+                .is_err()
+        );
+        assert_eq!(db.last_event_sequence().await.unwrap(), tail);
+        let retained = db
+            .database()
+            .select("snapshots")
+            .columns(&["payload"])
+            .where_eq("snapshot_name", namespace.clone())
+            .limit(1)
+            .execute(db.database())
+            .await
+            .unwrap();
+        assert_eq!(retained.len(), 1);
+        assert_eq!(
+            retained[0].get("payload").unwrap().as_str(),
+            Some(payload.as_str())
+        );
+    }
+}
+
+#[tokio::test]
+async fn execution_missing_projection_fails_without_hidden_replay() {
+    use bcode_session::db::SessionDb;
+    use switchy::database::query::FilterableQuery;
+    let root = tempfile::tempdir().unwrap();
+    let (sessions, owner) = execution_fixture(root.path()).await;
+    let terminal = execution_page(&owner, "terminal", execution_terminal());
+    sessions
+        .commit_external_harness_page(&owner, None, &terminal)
+        .await
+        .unwrap();
+    sessions
+        .release_idle_session_resources(owner.session_id)
+        .await
+        .unwrap();
+    let db = SessionDb::open_existing_turso_in_root(owner.session_id, root.path())
+        .await
+        .unwrap();
+    let tail = db.last_event_sequence().await.unwrap();
+    let key = bcode_session_models::external_backend::external_backend_key(
+        "execution_coverage_v3",
+        "current",
+    );
+    db.database()
+        .delete("turn_evidence")
+        .where_eq("evidence_kind", "harness_operation_v1")
+        .where_eq("turn_id", key.clone())
+        .execute(db.database())
+        .await
+        .unwrap();
+    assert!(
+        db.external_harness_submission_evidence("execution-input", "execution-attempt")
+            .await
+            .is_err()
+    );
+    assert_eq!(db.last_event_sequence().await.unwrap(), tail);
+    let missing = db
+        .database()
+        .select("turn_evidence")
+        .columns(&["event_seq"])
+        .where_eq("evidence_kind", "harness_operation_v1")
+        .where_eq("turn_id", key)
+        .execute(db.database())
+        .await
+        .unwrap();
+    assert!(missing.is_empty());
+}
+
+#[tokio::test]
+async fn execution_inventory_is_bounded_and_continuation_is_not_notification() {
+    use bcode_session_models::{HarnessInventoryKind, HarnessInventoryScope};
+    let root = tempfile::tempdir().unwrap();
+    let (sessions, owner) = execution_fixture(root.path()).await;
+    let mut work = execution_work(Some(execution_attempt()), HarnessWorkState::Completed);
+    if let HarnessExecutionEvent::BackgroundWork { notification, .. } = &mut work {
+        *notification = HarnessNotificationState::Observed;
+    }
+    let work = execution_page(&owner, "work", work);
+    sessions
+        .commit_external_harness_page(&owner, None, &work)
+        .await
+        .unwrap();
+    let continuation = execution_page(
+        &owner,
+        "followup",
+        HarnessExecutionEvent::Continuation {
+            continuation_id: "followup".into(),
+            origin: Some(execution_attempt()),
+            source_work_id: Some("work-1".into()),
+            native_turn_id: None,
+            state: HarnessWorkState::Pending,
+            output: None,
+        },
+    );
+    sessions
+        .commit_external_harness_page(&owner, Some("work"), &continuation)
+        .await
+        .unwrap();
+    let evidence = sessions
+        .session_external_harness_submission_evidence(
+            owner.session_id,
+            "execution-input",
+            "execution-attempt",
+        )
+        .await
+        .unwrap()
+        .unwrap()
+        .1;
+    assert_eq!(evidence.completeness, HarnessCompleteness::Partial);
+    assert!(evidence.observations.iter().any(|v| matches!(
+        &v.kind,
+        HarnessObservationKind::Execution {
+            event: HarnessExecutionEvent::Continuation {
+                state: HarnessWorkState::Pending,
+                ..
+            }
+        }
+    )));
+    let mut cursor = "followup".to_owned();
+    for index in 0..MAX_HARNESS_EXECUTION_ITEMS - 1 {
+        let mut event = execution_work(Some(execution_attempt()), HarnessWorkState::Running);
+        if let HarnessExecutionEvent::BackgroundWork {
+            work_id,
+            native_task_id,
+            ..
+        } = &mut event
+        {
+            *work_id = format!("bounded-{index}");
+            *native_task_id = Some(format!("native-bounded-{index}"));
+        }
+        let next = format!("bounded-{index}");
+        let next_page = execution_page(&owner, &next, event);
+        sessions
+            .commit_external_harness_page(&owner, Some(&cursor), &next_page)
+            .await
+            .unwrap();
+        cursor = next;
+    }
+    let mut event = execution_work(Some(execution_attempt()), HarnessWorkState::Running);
+    if let HarnessExecutionEvent::BackgroundWork {
+        work_id,
+        native_task_id,
+        ..
+    } = &mut event
+    {
+        *work_id = "overflow".into();
+        *native_task_id = Some("native-overflow".into());
+    }
+    let overflow = execution_page(&owner, "overflow", event);
+    sessions
+        .commit_external_harness_page(&owner, Some(&cursor), &overflow)
+        .await
+        .unwrap();
+    let scope = HarnessInventoryScope::Attempt(execution_attempt());
+    let page = sessions
+        .session_harness_inventory_page(&owner, &scope, HarnessInventoryKind::Work, None)
+        .await
+        .unwrap();
+    assert_eq!(page.entries.len(), 32);
+    assert_eq!(
+        page.commitment.summary.identities,
+        MAX_HARNESS_EXECUTION_ITEMS as u64 + 1
+    );
+    assert!(page.next_cursor.is_some());
+    let continuation = sessions
+        .session_harness_inventory_summary(&owner, &scope, HarnessInventoryKind::Continuation)
+        .await
+        .unwrap();
+    assert_eq!(continuation.commitment.summary.unfinished, 1);
+    let next = sessions
+        .session_harness_inventory_page(
+            &owner,
+            &scope,
+            HarnessInventoryKind::Work,
+            page.next_cursor.as_ref(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(next.commitment, page.commitment);
+    assert_eq!(next.entries.len(), 1);
+    assert!(next.inventory_exhausted);
+    assert!(next.next_cursor.is_none());
+    assert!(
+        !page
+            .entries
+            .iter()
+            .any(|entry| entry.key == next.entries[0].key)
     );
 }

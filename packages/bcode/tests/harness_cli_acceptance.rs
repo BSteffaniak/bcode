@@ -108,6 +108,73 @@ fn bounded_failure_code(stderr: &mut std::fs::File) -> &'static str {
         .map_or("no_recognized_error_in_prefix", |(_, code)| code)
 }
 
+fn startup_phase_summary(root: &Path) -> Value {
+    let mut reports = Vec::new();
+    for slot in 0..32 {
+        let path = root
+            .join("state/startup-reports")
+            .join(format!("{slot}.json"));
+        let Ok(file) = std::fs::File::open(path) else {
+            continue;
+        };
+        if !file.metadata().is_ok_and(|meta| meta.len() <= BUDGET) {
+            continue;
+        }
+        let Ok(report) = serde_json::from_reader::<_, Value>(file.take(BUDGET + 1)) else {
+            continue;
+        };
+        let mut phases = report["phases"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(|phase| {
+                let name = phase["name"].as_str()?;
+                if name.len() > 128
+                    || !name
+                        .bytes()
+                        .all(|b| b.is_ascii_alphanumeric() || b"._-".contains(&b))
+                {
+                    return None;
+                }
+                let start = phase["start_us"].as_u64()?;
+                let end = phase["end_us"].as_u64();
+                let duration = end
+                    .unwrap_or_else(|| report["elapsed_us"].as_u64().unwrap_or(start))
+                    .saturating_sub(start);
+                Some((
+                    duration,
+                    json!({"name":name,"duration_us":duration,"complete":end.is_some()}),
+                ))
+            })
+            .collect::<Vec<_>>();
+        phases.sort_by_key(|(duration, _)| std::cmp::Reverse(*duration));
+        reports.push(json!({"pid":report["pid"].as_u64(),"ready":report["ready"].as_bool(),
+            "elapsed_us":report["elapsed_us"].as_u64(),"unattributed_us":report["unattributed_us"].as_u64(),
+            "phases":phases.into_iter().take(8).map(|(_, phase)|phase).collect::<Vec<_>>() }));
+    }
+    json!(reports)
+}
+
+#[test]
+fn startup_diagnostics_keep_phase_timing_without_native_or_path_material() {
+    let root = tempfile::tempdir().unwrap();
+    let directory = root.path().join("state/startup-reports");
+    std::fs::create_dir_all(&directory).unwrap();
+    std::fs::write(directory.join("0.json"), serde_json::to_vec(&json!({
+        "pid":1,"ready":false,"elapsed_us":35000000,"unattributed_us":10,
+        "private":SECRET,"phases":[
+            {"name":"launcher.artifact_prepare","start_us":10,"end_us":30000000,"subject":SECRET},
+            {"name":"/private/native/path","start_us":0,"end_us":35000000}
+        ]
+    })).unwrap()).unwrap();
+    let summary = startup_phase_summary(root.path());
+    assert_eq!(summary[0]["phases"][0]["name"], "launcher.artifact_prepare");
+    assert_eq!(summary[0]["phases"][0]["duration_us"], 29999990);
+    let encoded = serde_json::to_string(&summary).unwrap();
+    assert!(!encoded.contains(SECRET));
+    assert!(!encoded.contains("/private/native/path"));
+}
+
 #[test]
 fn budget_failure_diagnostics_are_fixed_and_do_not_echo_output() {
     use std::io::Write as _;
@@ -166,6 +233,16 @@ impl Cli {
                 "VERSION = \"bcode-offline-claude-fixture 1.0.0\"",
                 "VERSION = \"2.1.308\"",
             );
+            // Controls exist only in this generated offline executable. They neither alter
+            // the admitted plan nor consult a real native account or credential store.
+            source = source.replace(
+                "effect(root, \"terminal-login\")",
+                "effect(root, \"terminal-login\" + ((root / \"terminal-login.case\").read_text(encoding=\"ascii\") if (root / \"terminal-login.case\").exists() else \"\"))",
+            );
+            source = source.replace(
+                "(root / \"terminal-login.finished\").touch()\n        return",
+                "(root / \"terminal-login.finished\").touch()\n        raise SystemExit(int((root / \"terminal-login.exit-code\").read_text(encoding=\"ascii\")) if (root / \"terminal-login.exit-code\").exists() else 0)",
+            );
         }
         let (_, body) = source.split_once('\n').unwrap();
         std::fs::write(&executable, format!("#!{interpreter}\n{body}")).unwrap();
@@ -184,8 +261,13 @@ impl Cli {
         if scenario == "terminal_auth" {
             settings = settings.replace("bcode-offline-claude-fixture 1.0.0", "2.1.308");
         }
+        settings.push_str("\n[metrics]\nstartup_reports = true\n");
         std::fs::write(&config, settings).unwrap();
-        std::fs::write(&offline, "[plugins]\ndefault = \"none\"\nenabled = []\n").unwrap();
+        std::fs::write(
+            &offline,
+            "[plugins]\ndefault = \"none\"\nenabled = []\n\n[metrics]\nstartup_reports = true\n",
+        )
+        .unwrap();
         record_test_artifact(root.path());
         let instance = json!({"instance_id":"offline-claude","plugin_id":"bcode.claude-code",
             "executable":executable,"config_namespace":native,
@@ -275,9 +357,10 @@ impl Cli {
                 let _ = child.wait();
                 let code = bounded_failure_code(&mut err);
                 panic!(
-                    "bounded isolated CLI failure: operation={} deadline_exceeded={deadline_exceeded} stdout_cap_exceeded={stdout_cap_exceeded} stderr_cap_exceeded={stderr_cap_exceeded} stdout_bytes={stdout_bytes} stderr_bytes={stderr_bytes} elapsed={:?} diagnostic_code={code}",
+                    "bounded isolated CLI failure: operation={} deadline_exceeded={deadline_exceeded} stdout_cap_exceeded={stdout_cap_exceeded} stderr_cap_exceeded={stderr_cap_exceeded} stdout_bytes={stdout_bytes} stderr_bytes={stderr_bytes} elapsed={:?} diagnostic_code={code} startup_phases={}",
                     operation_label(args),
                     started.elapsed(),
+                    startup_phase_summary(self.root.path()),
                 );
             }
             std::thread::sleep(Duration::from_millis(10));
@@ -302,6 +385,12 @@ impl Cli {
         out.take(BUDGET + 1).read_to_string(&mut stdout).unwrap();
         err.take(BUDGET + 1).read_to_string(&mut stderr).unwrap();
         assert!(stdout.len() <= BUDGET as usize && stderr.len() <= BUDGET as usize);
+        if args.starts_with(&["server", "start"]) {
+            eprintln!(
+                "isolated server startup phases={}",
+                startup_phase_summary(self.root.path())
+            );
+        }
         let value = serde_json::from_str(&stdout).unwrap_or(Value::Null);
         let output = stdout + &stderr;
         assert!(!output.contains(SECRET), "secret leaked through CLI output");
@@ -478,7 +567,15 @@ impl Cli {
                         }
                         target = json!({"state":"confirmed","session":binding});
                     }
-                    Some("interaction") => question = Some(item["kind"]["interaction"].clone()),
+                    Some("interaction")
+                        if item["kind"]["interaction"]["kind"] == "question"
+                            && item["kind"]["interaction"]["session_id"]
+                                == prepared["session"]["session_id"]
+                            && item["kind"]["interaction"]["generation"]
+                                == prepared["session"]["generation"] =>
+                    {
+                        question = Some(item["kind"]["interaction"].clone());
+                    }
                     _ => {}
                 }
             }
@@ -714,7 +811,10 @@ fn managed_start_respond_stale_cancel_and_offline_bounded_history() {
     );
     assert!(
         history.ok,
-        "canonical history must not require enabled native plugin"
+        "canonical history must not require enabled native plugin; operation_ok={} failure={} startup_phases={}",
+        history.ok,
+        response_failure_label(&history.value),
+        startup_phase_summary(cli.root.path())
     );
     assert!(history.value["observations"].as_array().unwrap().len() <= 2);
     assert_eq!(
@@ -1011,8 +1111,9 @@ fn daemon_auth_status_is_sanitized_and_missing_native_admission_blocks_shared_be
 fn client_terminal_handoff_is_offline_one_shot_and_history_clean() {
     const PROBE: &str = "BCODE_HARNESS_TERMINAL_PROBE";
     if std::env::var_os(PROBE).is_some() {
+        install_terminal_probe_panic_hook();
         tokio::runtime::Runtime::new().unwrap().block_on(async {
-            tokio::time::timeout(Duration::from_secs(45), terminal_claim_probe())
+            tokio::time::timeout(Duration::from_secs(90), terminal_claim_probe())
                 .await
                 .expect("same-socket claim probe exceeded bounded deadline");
         });
@@ -1096,6 +1197,7 @@ fn client_terminal_handoff_is_offline_one_shot_and_history_clean() {
         ])
         .env_clear()
         .env(PROBE, "1")
+        .env("BCODE_HARNESS_FIXTURE_PYTHON", fixture_python::python())
         .env("HOME", cli.root.path())
         .env("BCODE_STATE_DIR", cli.root.path().join("state"))
         .env("BCODE_CONFIG", &cli.config)
@@ -1108,7 +1210,7 @@ fn client_terminal_handoff_is_offline_one_shot_and_history_clean() {
         .stderr(Stdio::null())
         .spawn()
         .unwrap();
-    let deadline = Instant::now() + Duration::from_secs(49);
+    let deadline = Instant::now() + Duration::from_secs(94);
     loop {
         if let Some(status) = child.try_wait().unwrap() {
             let mut diagnostics = String::new();
@@ -1159,6 +1261,27 @@ fn client_terminal_handoff_is_offline_one_shot_and_history_clean() {
 }
 
 #[cfg(all(unix, feature = "daemon-client"))]
+fn install_terminal_probe_panic_hook() {
+    // Preserve only numeric source location, never panic text or payload-bearing values.
+    std::panic::set_hook(Box::new(|panic| {
+        use std::io::Write as _;
+        let Ok(root) = std::env::current_dir() else {
+            return;
+        };
+        let path = root.join("terminal-probe-stages.txt");
+        if let Ok(mut file) = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(path)
+            && file.metadata().is_ok_and(|metadata| metadata.len() < 8192)
+        {
+            let line = panic.location().map_or(0, |location| location.line());
+            let _ = writeln!(file, "probe:panic_line:{line}");
+        }
+    }));
+}
+
+#[cfg(all(unix, feature = "daemon-client"))]
 fn terminal_probe_stage(stage: &str) {
     use std::io::Write as _;
     // Only source-authored labels enter this bounded sidecar. Child stdout,
@@ -1195,6 +1318,11 @@ fn terminal_probe_error(error: &bcode_client::ClientError) {
                 "error:managed_session_sensitive_transport_required"
             }
             "managed_session_unsupported" => "error:managed_session_unsupported",
+            "managed_session_continue_issue_uncertain" => "error:continue_issue_uncertain",
+            "managed_session_continue_delivery_uncertain" => "error:continue_delivery_uncertain",
+            "managed_session_ack_stale" => "error:ack_stale",
+            "managed_session_ack_not_found" => "error:ack_not_found",
+            "managed_session_ack_not_settled" => "error:ack_not_settled",
             _ => "error:server_other",
         },
         E::Transport(_) => "error:transport",
@@ -1420,6 +1548,7 @@ async fn terminal_claim_probe() {
         .await
         .inspect_err(terminal_probe_error)
         .unwrap();
+    terminal_completion_matrix(&mut owner, &mut waiter).await;
     let prepare = json!({"session_id":PROBE_SESSION,"instance_id":"offline-claude",
         "interface_id":"bcode.claude-code.handoff/v1"});
     terminal_probe_stage("owner:prepare");
@@ -1545,6 +1674,282 @@ async fn terminal_claim_probe() {
             .is_err()
     );
     terminal_probe_stage("complete");
+}
+
+#[cfg(all(unix, feature = "daemon-client"))]
+async fn terminal_completion_matrix(
+    owner: &mut bcode_client::ClientConnection,
+    foreign: &mut bcode_client::ClientConnection,
+) {
+    let native = std::env::current_dir().unwrap().join("native");
+    assert!(native.join("terminal-login.release").is_file());
+    for exit_success in [true, false] {
+        for ready in [true, false] {
+            terminal_probe_stage(match (exit_success, ready) {
+                (true, true) => "completion:success_ready",
+                (true, false) => "completion:success_login_required",
+                (false, true) => "completion:failure_ready",
+                (false, false) => "completion:failure_login_required",
+            });
+            let case = format!("-completion-{}-{}", u8::from(exit_success), u8::from(ready));
+            std::fs::write(native.join("terminal-login.case"), &case).unwrap();
+            std::fs::write(
+                native.join("terminal-login.exit-code"),
+                if exit_success { "0" } else { "7" },
+            )
+            .unwrap();
+            std::fs::write(native.join("auth-login-required"), "offline-expired").unwrap();
+            terminal_completion_case(owner, foreign, &native, exit_success, ready).await;
+            assert!(
+                native
+                    .join(format!("terminal-login{case}.effect"))
+                    .is_file()
+            );
+            assert!(
+                !native
+                    .join(format!("terminal-login{case}.duplicate"))
+                    .exists()
+            );
+        }
+    }
+    std::fs::remove_file(native.join("terminal-login.case")).unwrap();
+    std::fs::remove_file(native.join("terminal-login.exit-code")).unwrap();
+    // Preserve the original unexecuted-claim recovery probe's login-required premise.
+    std::fs::write(native.join("auth-login-required"), "offline-expired").unwrap();
+}
+
+#[cfg(all(unix, feature = "daemon-client"))]
+async fn terminal_completion_case(
+    owner: &mut bcode_client::ClientConnection,
+    foreign: &mut bcode_client::ClientConnection,
+    native: &Path,
+    exit_success: bool,
+    ready: bool,
+) {
+    use bcode_ipc::harness::ManagedSessionOperation as Op;
+    let prepare = json!({"session_id":PROBE_SESSION,"instance_id":"offline-claude",
+        "interface_id":"bcode.claude-code.handoff/v1"});
+    let first = terminal_auth_call(owner, Op::AuthPrepare, &prepare)
+        .await
+        .unwrap();
+    let mut selection = prepare;
+    selection["handle"] = first["handle"].clone();
+    selection["interaction_id"] = json!("");
+    let interaction = terminal_auth_call(owner, Op::AuthStatus, &selection)
+        .await
+        .unwrap();
+    selection["interaction_id"] = interaction[1]["request_id"].clone();
+    let plan = terminal_auth_call(owner, Op::AuthHandoff, &selection)
+        .await
+        .unwrap();
+    let pinned = selection.clone();
+    terminal_probe_stage("completion:claim_denials");
+    assert_terminal_claim_denials(owner, foreign, &selection).await;
+    terminal_probe_stage("completion:execute_plan");
+    let status = execute_terminal_fixture_plan(plan, native).await;
+    terminal_probe_stage("completion:physical_reap_returned");
+    assert_eq!(status.code(), Some(if exit_success { 0 } else { 7 }));
+    // Change only the offline producer's local readiness, not exit evidence or the claim.
+    // Even a failed child can leave locally usable configuration; success need not do so.
+    if !ready {
+        std::fs::write(native.join("auth-login-required"), "offline-expired").unwrap();
+    }
+    assert_eq!(selection, pinned);
+    finish_terminal_fixture_claim(owner, &selection, native, ready).await;
+    assert_eq!(selection, pinned);
+}
+
+#[cfg(all(unix, feature = "daemon-client"))]
+async fn finish_terminal_fixture_claim(
+    owner: &mut bcode_client::ClientConnection,
+    selection: &Value,
+    native: &Path,
+    ready: bool,
+) {
+    use bcode_ipc::harness::ManagedSessionOperation as Op;
+    terminal_probe_stage("completion:report_reap");
+    let reaped = terminal_auth_call(owner, Op::AuthReaped, selection)
+        .await
+        .unwrap();
+    assert_eq!(reaped, json!({"reaped":true}));
+    assert!(reaped.get("acknowledged").is_none());
+    terminal_probe_stage("completion:readiness_continue");
+    let inspected = terminal_auth_call(owner, Op::AuthContinue, selection)
+        .await
+        .unwrap();
+    assert_eq!(
+        inspected["readiness"],
+        if ready { "ready" } else { "login_required" }
+    );
+    assert_eq!(
+        inspected["phase"],
+        if ready { "settled" } else { "pending" }
+    );
+    if !ready {
+        assert!(
+            terminal_auth_call(owner, Op::AuthAcknowledge, selection)
+                .await
+                .is_err()
+        );
+        // Explicitly reinspect changed fixture readiness; never relaunch the claimed child.
+        std::fs::remove_file(native.join("auth-login-required")).unwrap();
+        let settled = terminal_auth_call(owner, Op::AuthContinue, selection)
+            .await
+            .unwrap();
+        assert_eq!(settled["readiness"], "ready");
+        assert_eq!(settled["phase"], "settled");
+    }
+    terminal_probe_stage("completion:acknowledge");
+    let acknowledged = terminal_auth_call(owner, Op::AuthAcknowledge, selection)
+        .await
+        .unwrap();
+    assert_eq!(acknowledged, json!({"acknowledged":true}));
+    assert!(
+        terminal_auth_call(owner, Op::AuthReaped, selection)
+            .await
+            .is_err()
+    );
+    assert!(
+        terminal_auth_call(owner, Op::AuthContinue, selection)
+            .await
+            .is_err()
+    );
+}
+
+#[cfg(all(unix, feature = "daemon-client"))]
+async fn assert_terminal_claim_denials(
+    owner: &mut bcode_client::ClientConnection,
+    foreign: &mut bcode_client::ClientConnection,
+    selection: &Value,
+) {
+    use bcode_ipc::harness::ManagedSessionOperation as Op;
+    assert!(
+        terminal_auth_call(owner, Op::AuthContinue, selection)
+            .await
+            .is_err()
+    );
+    assert!(
+        terminal_auth_call(foreign, Op::AuthReaped, selection)
+            .await
+            .is_err()
+    );
+    let mut stale = selection.clone();
+    stale["handle"]["daemon_epoch"] = json!("stale-offline-epoch");
+    for operation in [Op::AuthReaped, Op::AuthContinue, Op::AuthAcknowledge] {
+        assert!(terminal_auth_call(owner, operation, &stale).await.is_err());
+    }
+}
+
+#[cfg(all(unix, feature = "daemon-client"))]
+async fn execute_terminal_fixture_plan(plan: Value, native: &Path) -> std::process::ExitStatus {
+    terminal_probe_stage("completion:descriptor_decode");
+    let plan: bcode_ipc::harness::ManagedNativeLoginPlan = serde_json::from_value(plan).unwrap();
+    plan.validate().unwrap();
+    terminal_probe_stage("completion:descriptor_verify");
+    let digest = verify_terminal_fixture_plan(&plan, native).await;
+    terminal_probe_stage("completion:pty_spawn");
+    // A PTY supplies the exact returned native plan's terminal. The bounded driver owns
+    // and physically waits for that child; no output or secret is returned to the test.
+    let driver = r#"
+import os, pty, subprocess, sys
+master, slave = pty.openpty()
+child = None
+try:
+    child = subprocess.Popen(sys.argv[1:], stdin=slave, stdout=slave, stderr=slave)
+    os.close(slave)
+    slave = None
+    code = child.wait(timeout=10)
+finally:
+    if child is not None and child.poll() is None:
+        child.kill()
+        child.wait()
+    if slave is not None:
+        os.close(slave)
+    os.close(master)
+sys.exit(code if code >= 0 else 128 - code)
+"#;
+    terminal_probe_stage("completion:python_resolve");
+    let python = fixture_python::python();
+    terminal_probe_stage("completion:python_resolved");
+    let status = tokio::time::timeout(
+        Duration::from_secs(15),
+        tokio::process::Command::new(python)
+            .args(["-c", driver])
+            .arg(&plan.executable)
+            .args(&plan.arguments)
+            .env_clear()
+            .envs(&plan.environment)
+            .current_dir(&plan.working_directory)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .kill_on_drop(true)
+            .status(),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    assert_eq!(
+        bcode_daemon_lifecycle::executable_sha256(&plan.executable).unwrap(),
+        digest
+    );
+    status
+}
+
+#[cfg(all(unix, feature = "daemon-client"))]
+async fn verify_terminal_fixture_plan(
+    plan: &bcode_ipc::harness::ManagedNativeLoginPlan,
+    native: &Path,
+) -> String {
+    let root = std::env::current_dir().unwrap();
+    terminal_probe_stage("completion:descriptor_binding");
+    assert_eq!(plan.executable, root.join("offline-claude"));
+    assert_eq!(plan.working_directory, native);
+    assert_eq!(
+        plan.namespace.credential_namespace,
+        native.to_str().unwrap()
+    );
+    assert_eq!(
+        plan.environment.get("CLAUDE_CONFIG_DIR").unwrap(),
+        native.to_str().unwrap()
+    );
+    assert_eq!(plan.arguments, ["auth", "login"]);
+    assert_eq!(plan.namespace.plugin_id, "bcode.claude-code");
+    assert_eq!(plan.method.method_id, "native-login");
+    assert!(matches!(
+        plan.method.execution,
+        bcode_ipc::harness::ManagedNativeLoginExecution::ClientTerminal
+    ));
+    assert_eq!(plan.expected_version, "2.1.308");
+    let digest = bcode_daemon_lifecycle::executable_sha256(&plan.executable).unwrap();
+    terminal_probe_stage("completion:version_probe");
+    let version = tokio::time::timeout(
+        Duration::from_secs(10),
+        tokio::process::Command::new(&plan.executable)
+            .arg("--version")
+            .env_clear()
+            .envs(&plan.environment)
+            .current_dir(&plan.working_directory)
+            .stdin(Stdio::null())
+            .stderr(Stdio::null())
+            .kill_on_drop(true)
+            .output(),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    terminal_probe_stage("completion:version_result");
+    assert!(version.status.success());
+    assert!(version.stdout.len() <= 4096);
+    assert_eq!(
+        std::str::from_utf8(&version.stdout).unwrap().trim(),
+        plan.expected_version
+    );
+    assert_eq!(
+        bcode_daemon_lifecycle::executable_sha256(&plan.executable).unwrap(),
+        digest
+    );
+    digest
 }
 
 #[test]

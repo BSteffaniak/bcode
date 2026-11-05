@@ -2,16 +2,113 @@
 use bcode_harness_models::{HarnessRequest, HarnessRequestKind, MAX_HARNESS_WIRE_BYTES};
 use serde::{Deserialize, Serialize};
 
-/// Host application interface. Native plugins use `bcode.harness/v2` instead.
+/// Host application interface. Native plugins use `bcode.harness/v3` instead.
 pub const MANAGED_SESSION_INTERFACE_ID: &str = "bcode.managed-session/v1";
 /// Application envelope version.
 pub const MANAGED_SESSION_VERSION: u16 = 1;
+
+/// Attachment-owned native polling intent. Cursor and retention evidence are host-selected.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ManagedSessionPollRequest {
+    /// Canonical Bcode session, never a native process identity.
+    pub session_id: bcode_session_models::SessionId,
+    /// Explicit retained configured instance.
+    pub instance_id: String,
+    /// Expected canonical ownership generation.
+    pub generation: u64,
+    /// Bounded native page size.
+    pub limit: u16,
+}
+impl ManagedSessionPollRequest {
+    /// Validate shape only; caller and canonical ownership are admitted by the host.
+    /// # Errors
+    /// Rejects invalid identity, zero generation or excessive page size.
+    pub fn validate(&self) -> Result<(), &'static str> {
+        if self.instance_id.is_empty()
+            || self.instance_id.len() > 256
+            || self.instance_id.trim() != self.instance_id
+            || self.instance_id.chars().any(char::is_control)
+            || self.generation == 0
+            || self.limit == 0
+            || usize::from(self.limit) > bcode_harness_models::MAX_HARNESS_OBSERVATIONS
+        {
+            return Err("invalid managed poll request");
+        }
+        Ok(())
+    }
+}
+
+/// Explicit existing-session recovery intent. Host selects the new owner and generation.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ManagedSessionRecoveryRequest {
+    pub session_id: bcode_session_models::SessionId,
+    pub instance_id: String,
+    pub expected_generation: u64,
+    pub recovery_id: String,
+}
+impl ManagedSessionRecoveryRequest {
+    /// Validate bounded shape, never caller authority or prior owner quiescence.
+    /// # Errors
+    /// Rejects malformed identities and invalid/overflowing generation expectations.
+    pub fn validate(&self) -> Result<(), &'static str> {
+        if self.expected_generation == 0
+            || self.expected_generation == u64::MAX
+            || [&self.instance_id, &self.recovery_id].iter().any(|value| {
+                value.is_empty()
+                    || value.len() > 256
+                    || value.trim() != value.as_str()
+                    || value.chars().any(char::is_control)
+            })
+        {
+            return Err("invalid managed recovery request");
+        }
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod recovery_tests {
+    use super::*;
+
+    #[test]
+    fn recovery_transport_requires_explicit_bounded_identity_and_distinct_family() {
+        let mut query = ManagedSessionRecoveryRequest {
+            session_id: bcode_session_models::SessionId::new(),
+            instance_id: "selected".into(),
+            expected_generation: 1,
+            recovery_id: "fresh-recovery".into(),
+        };
+        let envelope = |query: &ManagedSessionRecoveryRequest| ManagedSessionRequest {
+            schema_version: 1,
+            operation: ManagedSessionOperation::Recover,
+            request_json: serde_json::to_string(query).unwrap(),
+        };
+        assert!(envelope(&query).decode_recovery().is_ok());
+        assert!(envelope(&query).decode_call().is_err());
+        query.expected_generation = u64::MAX;
+        assert!(envelope(&query).decode_recovery().is_err());
+        query.expected_generation = 1;
+        query.recovery_id = "x".repeat(257);
+        assert!(envelope(&query).decode_recovery().is_err());
+        query.recovery_id = "fresh-recovery".into();
+        let mut request = envelope(&query);
+        request.operation = ManagedSessionOperation::Start;
+        assert!(request.decode_recovery().is_err());
+        request.operation = ManagedSessionOperation::Recover;
+        request.request_json = serde_json::json!({"session_id":query.session_id,"instance_id":"selected", "expected_generation":1,
+            "recovery_id":"fresh-recovery","replay_submission":"forbidden"}).to_string();
+        assert!(request.decode_recovery().is_err());
+    }
+}
 
 /// Semantic application operations; correlation never conveys authority.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ManagedSessionOperation {
     Start,
+    Recover,
     Inspect,
     Followup,
     Respond,
@@ -37,6 +134,7 @@ impl ManagedSessionOperation {
     pub const fn as_str(self) -> &'static str {
         match self {
             Self::Start => "start",
+            Self::Recover => "recover",
             Self::Binding => "binding",
             Self::Inspect => "inspect",
             Self::Followup => "followup",
@@ -234,6 +332,20 @@ impl ManagedSessionRequest {
         }
         Ok(())
     }
+    /// Decode an explicit recovery intent without interpreting it as a native call.
+    /// # Errors
+    /// Rejects wrong family, malformed/oversized envelopes and invalid exact identities.
+    pub fn decode_recovery(&self) -> Result<ManagedSessionRecoveryRequest, &'static str> {
+        self.validate_envelope()?;
+        if self.operation != ManagedSessionOperation::Recover {
+            return Err("managed session operation mismatch");
+        }
+        let request: ManagedSessionRecoveryRequest = serde_json::from_str(&self.request_json)
+            .map_err(|_| "invalid managed recovery request")?;
+        request.validate()?;
+        Ok(request)
+    }
+
     /// Validate an offline history page request.
     /// # Errors
     /// Rejects invalid shape, excessive page sizes and unbounded cursors.
@@ -396,6 +508,29 @@ impl std::fmt::Debug for ManagedSessionResponse {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn attachment_poll_request_is_bounded_and_cannot_supply_cursor_or_retention() {
+        let mut query = super::ManagedSessionPollRequest {
+            session_id: bcode_session_models::SessionId::new(),
+            instance_id: "primary".into(),
+            generation: 1,
+            limit: 64,
+        };
+        query.validate().unwrap();
+        for field in ["after", "retention", "target"] {
+            let mut json = serde_json::to_value(&query).unwrap();
+            json[field] = serde_json::json!("client-inferred");
+            assert!(serde_json::from_value::<super::ManagedSessionPollRequest>(json).is_err());
+        }
+        query.limit = 0;
+        assert!(query.validate().is_err());
+        query.limit = u16::MAX;
+        assert!(query.validate().is_err());
+        query.limit = 1;
+        query.generation = 0;
+        assert!(query.validate().is_err());
+    }
+
     use super::*;
     #[test]
     fn incompatible_and_oversized_requests_fail_closed() {

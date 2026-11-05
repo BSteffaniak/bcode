@@ -155,6 +155,16 @@ pub async fn prepare(
     id: bcode_session_models::SubmissionId,
     expected: u64,
 ) -> Result<SubmissionResumeConfirmation, ErrorResponse> {
+    Box::pin(prepare_inner(state, session_id, client_id, id, expected)).await
+}
+
+async fn prepare_inner(
+    state: &ServerState,
+    session_id: SessionId,
+    client_id: ClientId,
+    id: bcode_session_models::SubmissionId,
+    expected: u64,
+) -> Result<SubmissionResumeConfirmation, ErrorResponse> {
     let record = exact_record(state, session_id, id.clone()).await?;
     validate_pending(&record, expected)?;
     if matches!(record.submission.target, SubmissionTarget::Steering { .. }) {
@@ -271,13 +281,13 @@ async fn resume_inner(
     {
         return Ok(result);
     }
-    let prepared = prepare(
+    let prepared = Box::pin(prepare(
         state,
         session_id,
         client_id,
         confirmation.submission_id.clone(),
         confirmation.expected_accepted_sequence,
-    )
+    ))
     .await?;
     if prepared != confirmation {
         return Err(rejected(

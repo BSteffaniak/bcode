@@ -81,7 +81,7 @@ pub use diagnosis::{
 pub use execution::{
     AuthoritativeMigrationState, CanonicalNormalizationSummary, HistoricalSessionEventError,
     NormalizedCanonicalEvent, build_target_receipt, metric, normalize_canonical_event,
-    normalize_canonical_row, ordered_payload_digest,
+    normalize_canonical_row, normalize_canonical_row_for_writer_epoch, ordered_payload_digest,
 };
 pub use inventory::{
     CURRENT_EVENT_SCHEMA, CURRENT_WRITER_EPOCH, LATEST_HISTORICAL_EVENT_SCHEMA, MIGRATION_STEPS,

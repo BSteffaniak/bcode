@@ -377,10 +377,7 @@ async fn spawn_with_admission(
         Ok(context) => context,
         Err(error) => return failed(SessionSpawnStage::Preparation, &error.code, &error.message),
     };
-    let Ok(session) = state
-        .sessions
-        .create_spawning_session(request.clone())
-        .await
+    let Ok(session) = Box::pin(state.sessions.create_spawning_session(request.clone())).await
     else {
         let mut result = failed(
             SessionSpawnStage::Creation,

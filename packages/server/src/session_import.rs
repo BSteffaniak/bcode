@@ -1565,7 +1565,7 @@ mod tests {
             ),
         );
         for both in [true, false] {
-            let directory = tempfile::tempdir().unwrap();
+            let directory = crate::tests::test_socket_dir().unwrap();
             let endpoint =
                 bcode_ipc::IpcEndpoint::unix_socket(directory.path().join("imports.sock"));
             let listener = bcode_ipc::LocalIpcListener::bind(&endpoint).unwrap();

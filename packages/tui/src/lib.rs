@@ -55,8 +55,8 @@ pub(crate) mod older_history;
 pub mod onboarding;
 mod quick_onboarding;
 pub use quick_onboarding::{
-    QuickConnectionChoice, QuickOnboardingInput, QuickOnboardingOutcome, run_quick_onboarding,
-    run_quick_onboarding_in_shell,
+    QuickConnectionChoice, QuickOnboardingInput, QuickOnboardingOutcome,
+    run_backend_selection_in_shell, run_quick_onboarding, run_quick_onboarding_in_shell,
 };
 pub mod browser_presentation;
 pub(crate) mod composer_interaction;

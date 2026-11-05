@@ -82,8 +82,13 @@ async fn production_initialization_preserves_baseline_handles_during_install_and
 #[tokio::test]
 async fn production_initialization_never_downgrades_existing_43() {
     let temp = tempfile::tempdir().unwrap();
-    // The historical explicit open creates the shipped compatibility3 schema.
-    let historical = crate::WorkflowStore::open_in_state_dir(temp.path()).unwrap();
+    // Create the actual historical schema rather than relabeling current tables.
+    let directory = temp.path().join("workflows");
+    std::fs::create_dir_all(&directory).unwrap();
+    let path = directory.join(crate::DATABASE_FILE);
+    let historical_db = switchy_database_connection::init_sqlite_rusqlite(Some(&path)).unwrap();
+    crate::schema::initialize(&*historical_db, 43).unwrap();
+    let historical = crate::WorkflowStore::initialize_in_state_dir(temp.path(), 1).unwrap();
     assert_eq!(
         crate::detected_store_schema(&historical.connection),
         Some(43)

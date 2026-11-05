@@ -19,9 +19,10 @@ pub struct ReleasedFixtureCoverageError {
 
 /// Require complete released-format fixture coverage.
 ///
-/// This includes every writer edge, writer/schema/event combination, migration-ledger endpoint,
-/// and preserved authoritative record. Ledger-only formats may use migration-owned non-payload
-/// cases rather than JSONL event fixtures.
+/// This includes every planned writer edge, writer/schema/event combination, migration-ledger
+/// endpoint, and preserved authoritative record. Edge coverage follows the complete upgrade path
+/// of each fixture; it is not an attestation that each intermediate writer produced a fixture.
+/// Ledger-only formats may use migration-owned non-payload cases rather than JSONL event fixtures.
 ///
 /// # Errors
 ///
@@ -272,6 +273,37 @@ mod tests {
     use super::*;
 
     #[test]
+    fn recovery_candidate_edge_is_forward_only_without_publishing_it() {
+        // Local candidate registry only: production versions and registration stay frozen.
+        let candidate = MigrationStepDescriptor {
+            id: "session-writer-epoch-23-to-24",
+            source_writer_epoch: 23,
+            target_writer_epoch: 24,
+        };
+        let mut registry = MIGRATION_STEPS.to_vec();
+        registry.push(candidate);
+        let plan = plan_writer_epoch_migration_with_registry(23, 24, &registry).unwrap();
+        assert_eq!(plan.steps, [candidate]);
+        assert_eq!(plan.source_writer_epoch, 23);
+        assert_eq!(plan.target_writer_epoch, 24);
+        let from_22 = plan_writer_epoch_migration_with_registry(22, 24, &registry).unwrap();
+        assert_eq!(from_22.steps.len(), 2);
+        assert_eq!(from_22.steps[0].id, "session-writer-epoch-22-to-23");
+        assert_eq!(from_22.steps[1], candidate);
+        assert!(matches!(
+            plan_writer_epoch_migration_with_registry(23, 24, &MIGRATION_STEPS),
+            Err(MigrationPlanError::MissingStep {
+                writer_epoch: 23,
+                target_writer_epoch: 24
+            })
+        ));
+        assert!(matches!(
+            plan_writer_epoch_migration_with_registry(24, 23, &registry),
+            Err(MigrationPlanError::FutureWriter { .. })
+        ));
+    }
+
+    #[test]
     fn fixture_release_gate_accepts_complete_exact_coverage() {
         let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("fixtures");
         let manifest = crate::load_released_fixture_manifest(&root).expect("fixture manifest");
@@ -427,6 +459,26 @@ mod tests {
                     id: "session-writer-epoch-18-to-19",
                     source_writer_epoch: 18,
                     target_writer_epoch: 19,
+                },
+                MigrationStepDescriptor {
+                    id: "session-writer-epoch-19-to-20",
+                    source_writer_epoch: 19,
+                    target_writer_epoch: 20,
+                },
+                MigrationStepDescriptor {
+                    id: "session-writer-epoch-20-to-21",
+                    source_writer_epoch: 20,
+                    target_writer_epoch: 21,
+                },
+                MigrationStepDescriptor {
+                    id: "session-writer-epoch-21-to-22",
+                    source_writer_epoch: 21,
+                    target_writer_epoch: 22,
+                },
+                MigrationStepDescriptor {
+                    id: "session-writer-epoch-22-to-23",
+                    source_writer_epoch: 22,
+                    target_writer_epoch: 23,
                 }
             ]
         );
@@ -443,7 +495,7 @@ mod tests {
     #[test]
     fn external_backend_epoch_has_a_lossless_forward_only_projection_upgrade() {
         let plan = plan_writer_epoch_migration(17).expect("external locator projection upgrade");
-        assert_eq!(plan.target_writer_epoch, 19);
+        assert_eq!(plan.target_writer_epoch, CURRENT_WRITER_EPOCH);
         assert_eq!(
             plan.steps,
             [
@@ -456,6 +508,26 @@ mod tests {
                     id: "session-writer-epoch-18-to-19",
                     source_writer_epoch: 18,
                     target_writer_epoch: 19,
+                },
+                MigrationStepDescriptor {
+                    id: "session-writer-epoch-19-to-20",
+                    source_writer_epoch: 19,
+                    target_writer_epoch: 20,
+                },
+                MigrationStepDescriptor {
+                    id: "session-writer-epoch-20-to-21",
+                    source_writer_epoch: 20,
+                    target_writer_epoch: 21,
+                },
+                MigrationStepDescriptor {
+                    id: "session-writer-epoch-21-to-22",
+                    source_writer_epoch: 21,
+                    target_writer_epoch: 22,
+                },
+                MigrationStepDescriptor {
+                    id: "session-writer-epoch-22-to-23",
+                    source_writer_epoch: 22,
+                    target_writer_epoch: 23,
                 },
             ]
         );
@@ -470,7 +542,8 @@ mod tests {
 
     #[test]
     fn terminal_evidence_epoch_has_an_explicit_forward_only_step() {
-        let plan = plan_writer_epoch_migration(18).expect("terminal evidence upgrade");
+        let plan = plan_writer_epoch_migration_with_registry(18, 19, &MIGRATION_STEPS)
+            .expect("terminal evidence upgrade");
         assert_eq!(plan.target_writer_epoch, 19);
         assert_eq!(
             plan.steps,

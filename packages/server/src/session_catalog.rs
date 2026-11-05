@@ -2616,7 +2616,7 @@ mod tests {
         let gate = std::sync::Arc::new(tokio::sync::Semaphore::new(0));
         *state.session_catalog.discovery_gate.lock().await = Some(gate.clone());
         state.start_catalog_event_forwarder().await;
-        let socket_dir = tempfile::tempdir().unwrap();
+        let socket_dir = crate::tests::test_socket_dir().unwrap();
         let endpoint = bcode_ipc::IpcEndpoint::unix_socket(socket_dir.path().join("catalog.sock"));
         let listener = bcode_ipc::LocalIpcListener::bind(&endpoint).unwrap();
         let server_state = state.clone();

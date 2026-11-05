@@ -1428,12 +1428,7 @@ library = "libtest_command_context.dylib"
         use bcode_command::application::{
             CommandApplication as _, CommandInvocationOutcome, CommandInvocationRequest,
         };
-        let temp = tempfile::tempdir().unwrap();
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt as _;
-            std::fs::set_permissions(temp.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
-        }
+        let temp = crate::tests::test_socket_dir().unwrap();
         let plugins = command_plugins();
         let state = std::sync::Arc::new(super::super::tests::test_server_state_with_plugins(
             bcode_session::SessionManager::default(),
@@ -1524,7 +1519,7 @@ library = "libtest_command_context.dylib"
         use bcode_command::application::{
             CommandApplication as _, CommandInvocationOutcome, CommandInvocationRequest,
         };
-        let temp = tempfile::tempdir().unwrap();
+        let temp = crate::tests::test_socket_dir().unwrap();
         let root = temp.path().canonicalize().unwrap();
         let bundles = [
             bcode_plugin::StaticBundledPlugin::new(
@@ -1924,7 +1919,7 @@ library = "libtest_wait_second.dylib"
             fixture.lock().is_ok(),
             "bridge cancellation must not poison plugin lifecycle state"
         );
-        let temp = tempfile::tempdir().unwrap();
+        let temp = crate::tests::test_socket_dir().unwrap();
         let (state, _, stop, server) = start_wait_service(temp.path());
         stop.send(()).unwrap();
         server.await.unwrap();
@@ -1995,7 +1990,7 @@ library = "libtest_wait_second.dylib"
 
     #[tokio::test]
     async fn contextual_client_cancellation_reaches_real_ipc_invocation() {
-        let temp = tempfile::tempdir().unwrap();
+        let temp = crate::tests::test_socket_dir().unwrap();
         let (state, endpoint, stop, server) = start_wait_service(temp.path());
         let root = temp.path().canonicalize().unwrap();
         let client = bcode_client::BcodeClient::new(endpoint).with_runtime_context(Some(
@@ -2072,7 +2067,7 @@ library = "libtest_wait_second.dylib"
 
     #[tokio::test]
     async fn early_client_cancellation_survives_connect_and_admission() {
-        let temp = tempfile::tempdir().unwrap();
+        let temp = crate::tests::test_socket_dir().unwrap();
         let (state, endpoint, stop, server) = start_wait_service(temp.path());
         let root = temp.path().canonicalize().unwrap();
         let client = bcode_client::BcodeClient::new(endpoint).with_runtime_context(Some(
@@ -2132,7 +2127,7 @@ library = "libtest_wait_second.dylib"
 
     #[tokio::test]
     async fn nested_invocation_inherits_outer_deadline() {
-        let temp = tempfile::tempdir().unwrap();
+        let temp = crate::tests::test_socket_dir().unwrap();
         let (state, endpoint, stop, server) = start_wait_service(temp.path());
         let root = temp.path().canonicalize().unwrap();
         let client = bcode_client::BcodeClient::new(endpoint).with_runtime_context(Some(
@@ -2454,7 +2449,7 @@ library = "libtest_wait_second.dylib"
         ) {
             return;
         }
-        let temp = tempfile::tempdir().unwrap();
+        let temp = crate::tests::test_socket_dir().unwrap();
         let root = temp.path().canonicalize().unwrap();
         std::fs::write(root.join("visible.rs"), "NO_CONTENT_IN_RESPONSE").unwrap();
         stage_fixture_paths(&root, &["visible.rs"]);

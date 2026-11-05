@@ -152,17 +152,32 @@ impl HistoricalEnvelope {
         })
     }
 
-    /// Reject observation variants that were not part of the schema-53 closed contract.
+    /// Reject recovery and observation variants introduced after the declared historical schema.
     /// This is historical decoding policy, not native protocol interpretation.
     ///
     /// # Errors
-    /// Returns an error if the historical kind envelope is malformed or contains an
-    /// observation variant introduced after its declared schema.
+    /// Returns an error if the historical kind envelope is malformed or contains a
+    /// recovery or observation variant introduced after its declared schema.
     pub fn validate_observation_compatibility(&self) -> Result<(), HistoricalSessionEventError> {
-        if self.schema_version >= 54 {
+        let (event_kind, payload) = source_kind(self)?;
+        if self.schema_version < 56
+            && event_kind == "external_harness_operation"
+            && matches!(
+                payload
+                    .pointer("/operation/record/kind")
+                    .and_then(serde_json::Value::as_str),
+                Some("transport_released" | "recovery_prepared")
+            )
+        {
+            return Err(HistoricalSessionEventError::InvalidEvent {
+                schema_version: self.schema_version,
+                event_kind: event_kind.to_owned(),
+                reason: "recovery operation requires event schema 56".into(),
+            });
+        }
+        if self.schema_version >= 55 {
             return Ok(());
         }
-        let (event_kind, payload) = source_kind(self)?;
         let observations: Vec<&serde_json::Value> = match event_kind {
             "external_observation_recorded" => {
                 payload.pointer("/observation").into_iter().collect()
@@ -174,18 +189,30 @@ impl HistoricalEnvelope {
                 .unwrap_or_default(),
             _ => Vec::new(),
         };
-        if observations.iter().any(|observation| {
-            matches!(
-                observation
+        let required_schema = observations
+            .iter()
+            .filter_map(|observation| {
+                match observation
                     .pointer("/kind/kind")
-                    .and_then(serde_json::Value::as_str),
-                Some("submission_consumed" | "submission_result_observed" | "native_turn_terminal")
-            )
-        }) {
+                    .and_then(serde_json::Value::as_str)
+                {
+                    Some("execution") => Some(55),
+                    Some(
+                        "submission_consumed"
+                        | "submission_result_observed"
+                        | "native_turn_terminal",
+                    ) => Some(54),
+                    _ => None,
+                }
+            })
+            .max();
+        if let Some(required_schema) =
+            required_schema.filter(|required| self.schema_version < *required)
+        {
             return Err(HistoricalSessionEventError::InvalidEvent {
                 schema_version: self.schema_version,
                 event_kind: event_kind.to_owned(),
-                reason: "observation variant requires event schema 54".to_owned(),
+                reason: format!("observation variant requires event schema {required_schema}"),
             });
         }
         Ok(())

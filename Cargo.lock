@@ -2331,6 +2331,7 @@ dependencies = [
  "bcode_provider_auth_models",
  "serde",
  "serde_json",
+ "sha2 0.11.1",
 ]
 
 [[package]]
@@ -2346,6 +2347,7 @@ dependencies = [
  "bcode_workflow",
  "serde",
  "serde_json",
+ "toml 1.1.8+spec-1.1.0",
 ]
 
 [[package]]
@@ -2802,8 +2804,8 @@ dependencies = [
 name = "bcode_plugin_models"
 version = "0.0.1-alpha.0"
 dependencies = [
- "bcode_keymap_models",
  "bcode_harness_models",
+ "bcode_keymap_models",
  "bcode_tool_models",
  "serde",
  "serde_json",
@@ -2815,8 +2817,8 @@ version = "0.0.1-alpha.0"
 dependencies = [
  "bcode_agent_profile",
  "bcode_command",
- "bcode_keymap",
  "bcode_harness_models",
+ "bcode_keymap",
  "bcode_model",
  "bcode_plugin_models",
  "bcode_plugin_sdk",
@@ -2841,6 +2843,7 @@ dependencies = [
  "sha2 0.11.1",
  "tokio",
  "trybuild",
+ "zeroize",
 ]
 
 [[package]]

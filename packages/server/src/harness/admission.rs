@@ -33,6 +33,230 @@ impl CanonicalManagedAdmission {
         Self { store }
     }
 
+    /// Recheck current authenticated interactive caller before recovery evidence discovery.
+    /// # Errors
+    /// Rejects non-client callers and ordinary workspace/location/bootstrap admission failures.
+    pub async fn authorize_recovery_request(
+        &self,
+        caller: &ManagedCaller,
+        session_id: SessionId,
+    ) -> Result<(), ManagedHarnessError> {
+        if !matches!(caller, ManagedCaller::Client(_)) {
+            return Err(ManagedHarnessError::Unsupported);
+        }
+        self.authorize(caller, session_id, false).await.map(|_| ())
+    }
+
+    /// Authorize and fence one explicit graceful-restart recovery before native resume.
+    /// The supplied host-owned validator must inspect the exact resume constraints without
+    /// spawning native transport or replaying input. Constrained support is never promoted
+    /// globally. A subsequent native dispatch still needs the ordinary durable claim gate.
+    /// # Errors
+    /// Rejects unpublished storage support, non-client callers, changed bootstrap/workspace,
+    /// stale release evidence, unverifiable old lifetimes and failed exact native constraints.
+    pub async fn prepare_recovery<F, Fut>(
+        &self,
+        caller: &ManagedCaller,
+        recovery: bcode_session_models::external_harness::ExternalHarnessRecovery,
+        validate_resume: F,
+    ) -> Result<HarnessOwner, ManagedHarnessError>
+    where
+        F: FnOnce(bcode_harness_models::HarnessRequest) -> Fut + Send,
+        Fut: Future<Output = Result<(), ManagedHarnessError>> + Send,
+    {
+        if bcode_session_models::CURRENT_SESSION_EVENT_SCHEMA_VERSION < 56
+            || bcode_session_models::CURRENT_SESSION_STORAGE_WRITER_EPOCH < 24
+        {
+            return Err(ManagedHarnessError::Unsupported);
+        }
+        let ManagedCaller::Client(client_id) = caller else {
+            return Err(ManagedHarnessError::Unsupported);
+        };
+        let session_id = recovery.previous_owner.session_id;
+        let cwd = self.authorize(caller, session_id, false).await?;
+        let state = self.store.state()?;
+        let bootstrap = state
+            .client_runtime_context(*client_id)
+            .await
+            .ok_or(ManagedHarnessError::StaleOwner)?;
+        let snapshot = state
+            .sessions
+            .session_external_harness_state(session_id)
+            .await
+            .map_err(|_| ManagedHarnessError::Storage)?
+            .ok_or(ManagedHarnessError::Conflict)?;
+        let owner = Self::daemon_owner(
+            &state,
+            session_id,
+            snapshot
+                .owner
+                .generation
+                .checked_add(1)
+                .ok_or(ManagedHarnessError::Conflict)?,
+        )?;
+        let durable = self.store.durable(&owner)?;
+        recovery
+            .validate_for(&durable)
+            .map_err(|_| ManagedHarnessError::Invalid)?;
+        if snapshot.owner != recovery.previous_owner
+            || snapshot.instance != recovery.release.instance
+            || snapshot.binding.as_ref() != Some(&recovery.release.binding)
+            || snapshot.capabilities != recovery.capabilities
+        {
+            return Err(ManagedHarnessError::Conflict);
+        }
+        Self::enabled(&state, &snapshot.instance)?;
+        let summary = state
+            .sessions
+            .session_summary(session_id)
+            .await
+            .map_err(|_| ManagedHarnessError::Storage)?;
+        if summary.execution.is_some() {
+            // Interactive recovery cannot take over a workflow-owned execution. Its durable
+            // receipt/authority owner must implement its own explicit recovery journey.
+            return Err(ManagedHarnessError::Unsupported);
+        }
+        let resume_request = recovery.resume_request.request();
+        let HarnessRequestKind::Open(open) = &resume_request.kind else {
+            return Err(ManagedHarnessError::Invalid);
+        };
+        if canonical_directory(&summary.working_directory).await? != cwd
+            || canonical_directory(Path::new(&open.working_directory)).await? != cwd
+        {
+            return Err(ManagedHarnessError::StaleOwner);
+        }
+        let retained = state
+            .sessions
+            .session_external_harness_transport_release(&snapshot.owner)
+            .await
+            .map_err(|_| ManagedHarnessError::Storage)?
+            .ok_or(ManagedHarnessError::Conflict)?;
+        if retained != (recovery.release_event_sequence, recovery.release.clone()) {
+            return Err(ManagedHarnessError::Conflict);
+        }
+        self.store.verify_recovery_lifetime(&recovery.release)?;
+        validate_resume(recovery.resume_request.request()).await?;
+        // Recheck current caller admission after plugin preflight; authority is not a
+        // property of a previously selected session or retained recovery payload.
+        if self.authorize(caller, session_id, false).await? != cwd
+            || state.client_runtime_context(*client_id).await.as_ref() != Some(&bootstrap)
+        {
+            return Err(ManagedHarnessError::StaleOwner);
+        }
+        Self::enabled(&state, &snapshot.instance)?;
+        let store = self.store.clone();
+        state
+            .sessions
+            .prepare_external_harness_recovery(&durable, recovery, move |release| {
+                store
+                    .verify_recovery_lifetime(release)
+                    .map_err(|_| "managed recovery lifetime proof rejected".into())
+            })
+            .await
+            .map_err(|_| ManagedHarnessError::Conflict)?;
+        drop(state);
+        Ok(owner)
+    }
+
+    /// Resolve a single API credential only under current managed caller/owner authority.
+    /// No native-login readiness inspection or plugin-wide credential binding is consulted.
+    /// # Errors
+    /// Rejects missing/revoked caller authority, stale owner, mismatched selection,
+    /// undeclared credential access or unavailable exact vault material.
+    pub(super) async fn credential(
+        &self,
+        caller: &ManagedCaller,
+        owner: &HarnessOwner,
+        call: &ManagedSessionCall,
+        selection: &bcode_plugin_sdk::PluginCredentialSelection,
+    ) -> Result<bcode_plugin_sdk::SensitiveCredential, ManagedHarnessError> {
+        selection
+            .validate()
+            .map_err(|_| ManagedHarnessError::Invalid)?;
+        if selection.instance_id != call.harness.instance.instance_id
+            || selection.provider_id != call.harness.instance.auth.provider_id
+            || selection.profile != call.harness.instance.auth.profile
+            || selection.credential_namespace != call.harness.instance.auth.credential_namespace
+            || selection.custody != call.harness.instance.auth.custody
+            || selection.custody != bcode_harness_models::HarnessAuthCustody::VaultManaged
+        {
+            return Err(ManagedHarnessError::StaleOwner);
+        }
+        let (_cwd, _workflow) = self
+            .authorize_existing_call(caller, call, owner.session_id)
+            .await?;
+        let _ownership = self.store.acquire(owner).await?;
+        let selected = self.store.selected(owner).await?;
+        if selected.instance != call.harness.instance {
+            return Err(ManagedHarnessError::StaleOwner);
+        }
+        let state = self.store.state()?;
+        Self::enabled(&state, &selected.instance)?;
+        let config = state.session_config(owner.session_id).await;
+        let runtime = bcode_config::load_runtime_auth_subscriptions();
+        let resolved_profile = bcode_provider_auth::resolve_auth_provider_profile(
+            &config,
+            &selection.provider_id,
+            &selected.instance.plugin_id,
+            Some(&selection.profile),
+            &runtime,
+        )
+        .map_err(|_| ManagedHarnessError::Unavailable)?;
+        let profile = &resolved_profile.profile;
+        // Namespace is an explicit non-secret profile binding, not inferred from its name.
+        let declared = state.plugins.auth_provider(&selection.provider_id)
+            .filter(|registered| registered.plugin_id == selected.instance.plugin_id)
+            .is_some_and(|registered| registered.contribution.methods.iter().any(|method| {
+                matches!(method,
+                    bcode_provider_auth_models::AuthMethodContribution::SecretFields { method_id, fields, .. }
+                    if profile.scheme.as_deref() == Some(method_id.as_str())
+                        && fields.iter().any(|field| {
+                            let mapped = profile.map.get(&selection.credential_id)
+                                .and_then(|mapping| mapping.key.as_ref().or(mapping.env.as_ref()));
+                            field.credential_id == selection.credential_id
+                                && mapped == Some(&field.storage_key)
+                        }))
+            }));
+        if !declared
+            || profile.owner_plugin_id.as_deref() != Some(selected.instance.plugin_id.as_str())
+            || profile.provider_id.as_deref() != Some(selection.provider_id.as_str())
+        {
+            return Err(ManagedHarnessError::StaleOwner);
+        }
+        let secret = bcode_plugin_sdk::SensitiveCredential::new(
+            bcode_provider_auth::resolve_exact_vault_credential(
+                &selection.profile,
+                profile,
+                &selection.credential_id,
+                &selection.credential_namespace,
+            )
+            .map_err(|_| ManagedHarnessError::Unavailable)?,
+        )
+        .map_err(|_| ManagedHarnessError::Unavailable)?;
+        // Resolution may touch the vault. Recheck ordinary caller/workflow grants
+        // and the exact canonical generation before releasing the material.
+        self.authorize_existing_call(caller, call, owner.session_id)
+            .await?;
+        if self.store.selected(owner).await?.instance != call.harness.instance {
+            return Err(ManagedHarnessError::StaleOwner);
+        }
+        let current_config = state.session_config(owner.session_id).await;
+        drop(state);
+        let current_runtime = bcode_config::load_runtime_auth_subscriptions();
+        let current = bcode_provider_auth::resolve_auth_provider_profile(
+            &current_config,
+            &selection.provider_id,
+            &selected.instance.plugin_id,
+            Some(&selection.profile),
+            &current_runtime,
+        )
+        .map_err(|_| ManagedHarnessError::StaleOwner)?;
+        if current.profile != *profile {
+            return Err(ManagedHarnessError::StaleOwner);
+        }
+        Ok(secret)
+    }
+
     /// Issue live assistance consent only after host policy and authenticated caller checks.
     /// Call before retaining the exact returned grant in the child's canonical open. The child
     /// must already be an ordinary canonical child with a current daemon lease; this API never
@@ -167,9 +391,34 @@ impl CanonicalManagedAdmission {
         let selected = self
             .auth_read_selection(caller, session_id, instance_id)
             .await?;
-        let inspected = super::HarnessPluginTransport::new(self.store.state()?)
-            .inspect_auth_readonly(&selected.instance)
-            .await?;
+        let transport = super::HarnessPluginTransport::new(self.store.state()?);
+        let inspected = if selected.instance.auth.custody
+            == bcode_harness_models::HarnessAuthCustody::VaultManaged
+        {
+            let (owner, _, _hold) = self
+                .ownership_guard(caller, session_id, instance_id)
+                .await?;
+            let call = ManagedSessionCall {
+                session_id: Some(session_id),
+                parent_session_id: None,
+                assistance_destination_session_id: None,
+                harness: HarnessRequest {
+                    schema_version: HARNESS_SCHEMA_VERSION,
+                    request_id: format!("credential-status:{}", uuid::Uuid::new_v4()),
+                    instance: selected.instance.clone(),
+                    kind: HarnessRequestKind::AuthStatus { verify: false },
+                },
+            };
+            super::transport::with_credential_admission(
+                caller.clone(),
+                owner,
+                call,
+                transport.inspect_auth_readonly(&selected.instance),
+            )
+            .await?
+        } else {
+            transport.inspect_auth_readonly(&selected.instance).await?
+        };
         let current = self
             .auth_read_selection(caller, session_id, instance_id)
             .await?;
@@ -209,9 +458,9 @@ impl CanonicalManagedAdmission {
         if selected.instance.instance_id != instance_id {
             return Err(ManagedHarnessError::Conflict);
         }
-        if selected.capabilities.authentication.support == HarnessSupportLevel::Unsupported {
-            return Err(ManagedHarnessError::Unsupported);
-        }
+        // Cached launch capabilities may predate a status-only plugin correction.
+        // Read-only readiness asks the enabled selected plugin for current evidence;
+        // it grants no login method, inactivity proof or native mutation authority.
         Self::enabled(&state, &selected.instance)?;
         drop(state);
         Ok(selected)
@@ -389,8 +638,8 @@ impl CanonicalManagedAdmission {
         if !creating {
             crate::session_operations::require_selected_location(&state, target)
                 .await
-                .map_err(|failure| {
-                    tracing::debug!(stage = "existing_location", code = %failure.code, "managed harness admission rejected");
+                .map_err(|_failure| {
+                    tracing::warn!(target: "bcode_server::harness", category = "caller_selected_location", "managed harness admission rejected");
                     ManagedHarnessError::StaleOwner
                 })?;
         }
@@ -620,7 +869,7 @@ impl CanonicalManagedAdmission {
     }
 }
 
-fn validate_retained_target(
+pub(super) fn validate_retained_target(
     selected: &bcode_session_models::external_harness::ExternalHarnessState,
     supplied: &bcode_harness_models::HarnessSessionTarget,
 ) -> Result<(), ManagedHarnessError> {
@@ -896,6 +1145,21 @@ mod tests {
             ),
         };
         assert_eq!(validate_retained_target(&selected, &prepared), Ok(()));
+        let original = selected.target.clone();
+        for changed in 0..4 {
+            let Some(HarnessSessionTarget::Confirmed(mut binding)) = original.clone() else {
+                unreachable!()
+            };
+            match changed {
+                0 => binding.native_session_id = "different-native".into(),
+                1 => binding.native_version = "different-version".into(),
+                2 => binding.generation += 1,
+                _ => binding.session_id = SessionId::new().to_string(),
+            }
+            selected.target = Some(HarnessSessionTarget::Confirmed(binding));
+            assert!(validate_retained_target(&selected, &prepared).is_err());
+        }
+        selected.target = original;
         selected.prepared_open = None;
         assert_eq!(
             validate_retained_target(&selected, &prepared),
@@ -964,5 +1228,94 @@ mod tests {
             canonical_directory(&file).await,
             Err(ManagedHarnessError::Invalid)
         );
+    }
+}
+
+#[cfg(test)]
+mod credential_admission_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn mismatched_credential_selection_is_rejected_before_owner_or_vault_access() {
+        let state = Arc::new(crate::tests::test_server_state(
+            crate::SessionManager::default(),
+        ));
+        let admission = CanonicalManagedAdmission::new(CanonicalHarnessStore::new(&state));
+        let session_id = SessionId::new();
+        let owner = HarnessOwner {
+            session_id,
+            generation: 1,
+            artifact_id: "fixture".into(),
+            daemon_id: "fixture".into(),
+        };
+        let call = ManagedSessionCall {
+            session_id: Some(session_id),
+            parent_session_id: None,
+            assistance_destination_session_id: None,
+            harness: HarnessRequest {
+                schema_version: HARNESS_SCHEMA_VERSION,
+                request_id: "inspect".into(),
+                kind: HarnessRequestKind::Inspect,
+                instance: HarnessInstance {
+                    instance_id: "api".into(),
+                    plugin_id: "test.api".into(),
+                    executable: "/native".into(),
+                    config_namespace: "/config".into(),
+                    auth: bcode_harness_models::HarnessAuthBinding {
+                        provider_id: "test-api".into(),
+                        profile: "profile".into(),
+                        credential_namespace: "namespace".into(),
+                        custody: bcode_harness_models::HarnessAuthCustody::VaultManaged,
+                    },
+                },
+            },
+        };
+        let caller = ManagedCaller::Client(bcode_session_models::ClientId::new());
+        let selection = bcode_plugin_sdk::PluginCredentialSelection {
+            instance_id: "api".into(),
+            provider_id: "test-api".into(),
+            profile: "profile".into(),
+            credential_namespace: "namespace".into(),
+            custody: bcode_harness_models::HarnessAuthCustody::VaultManaged,
+            credential_id: "api_key".into(),
+        };
+        for field in 0..5 {
+            let mut wrong = selection.clone();
+            match field {
+                0 => wrong.instance_id = "other".into(),
+                1 => wrong.provider_id = "other".into(),
+                2 => wrong.profile = "other".into(),
+                3 => wrong.credential_namespace = "other".into(),
+                _ => wrong.custody = bcode_harness_models::HarnessAuthCustody::NativeManaged,
+            }
+            assert!(matches!(
+                admission.credential(&caller, &owner, &call, &wrong).await,
+                Err(ManagedHarnessError::StaleOwner)
+            ));
+        }
+        // Exact strings still grant nothing when the caller/current owner is absent.
+        for caller in [
+            caller,
+            ManagedCaller::Invocation {
+                session_id,
+                plugin_id: "test.api".into(),
+                invocation_id: "unregistered".into(),
+            },
+            ManagedCaller::Workflow {
+                run_id: "unadmitted".into(),
+                dispatch_identity: "unadmitted".into(),
+                session_id,
+                plugin_id: "test.api".into(),
+            },
+        ] {
+            assert!(
+                admission
+                    .credential(&caller, &owner, &call, &selection)
+                    .await
+                    .is_err()
+            );
+        }
+        drop(admission);
+        drop(state);
     }
 }

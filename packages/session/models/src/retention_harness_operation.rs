@@ -163,22 +163,78 @@ fn request(i: &mut Inspector, v: &ExternalHarnessRequest) -> Result {
     }
     Ok(())
 }
+fn inventory_commitments(i: &mut Inspector, op: &ExternalHarnessOperation) -> Result {
+    i.collection(op.inventory_commitments.capacity(), 4)?;
+    for commitment in &op.inventory_commitments {
+        i.nodes(10, 5)?;
+        i.text(&commitment.snapshot_key, 6)?;
+        i.optional_text(commitment.root.as_ref(), 6)?;
+    }
+    Ok(())
+}
+
+fn transport_release(
+    i: &mut Inspector,
+    release: &crate::external_harness::ExternalHarnessTransportRelease,
+) -> Result {
+    i.nodes(3, 4)?;
+    instance(i, &release.instance)?;
+    binding(i, &release.binding)?;
+    for text in [
+        &release.close_request_id,
+        &release.reap_id,
+        &release.lifetime.daemon_instance_id,
+        &release.lifetime.artifact_id,
+        &release.lifetime.state_location_id,
+    ] {
+        i.text(text, 6)?;
+    }
+    Ok(())
+}
+
+fn recovery(
+    i: &mut Inspector,
+    recovery: &crate::external_harness::ExternalHarnessRecovery,
+) -> Result {
+    transport_release(i, &recovery.release)?;
+    i.nodes(2, 4)?;
+    i.text(&recovery.previous_owner.artifact_id, 5)?;
+    i.text(&recovery.previous_owner.daemon_id, 5)?;
+    capabilities(i, &recovery.capabilities)?;
+    request(i, &recovery.resume_request)
+}
+
+fn configured(
+    i: &mut Inspector,
+    value: &HarnessInstance,
+    policy: &HarnessCapabilities,
+    open: Option<&ExternalHarnessRequest>,
+) -> Result {
+    instance(i, value)?;
+    capabilities(i, policy)?;
+    if let Some(open) = open {
+        request(i, open)?;
+    }
+    Ok(())
+}
+
 pub(super) fn inspect(i: &mut Inspector, op: &ExternalHarnessOperation) -> Result {
     i.nodes(3, 3)?;
     i.text(&op.owner.artifact_id, 4)?;
     i.text(&op.owner.daemon_id, 4)?;
+    inventory_commitments(i, op)?;
     match &op.record {
+        ExternalHarnessOperationRecord::TransportReleased { release } => {
+            transport_release(i, release)?;
+        }
+        ExternalHarnessOperationRecord::RecoveryPrepared { recovery } => {
+            self::recovery(i, recovery)?;
+        }
         ExternalHarnessOperationRecord::Configured {
             instance: v,
             capabilities: c,
             open_request,
-        } => {
-            instance(i, v)?;
-            capabilities(i, c)?;
-            if let Some(v) = open_request {
-                request(i, v)?;
-            }
-        }
+        } => configured(i, v, c, open_request.as_ref())?,
         ExternalHarnessOperationRecord::DeliveryClaimed { request: v } => request(i, v)?,
         ExternalHarnessOperationRecord::DeliveryCompleted {
             request: v,
@@ -237,6 +293,24 @@ pub(super) fn inspect(i: &mut Inspector, op: &ExternalHarnessOperation) -> Resul
             instance(i, v)?;
             i.optional_text(after.as_ref(), 4)?;
             i.optional_text(page.next_after.as_ref(), 5)?;
+            if let Some(retention) = &page.retention {
+                i.nodes(3, 5)?;
+                i.text(&retention.connection_id, 6)?;
+                i.text(&retention.page_id, 6)?;
+                i.text(&retention.observations_digest, 6)?;
+            }
+            i.collection(page.hydration_requests.capacity(), 5)?;
+            for request in &page.hydration_requests {
+                i.nodes(4, 6)?;
+                i.text(&request.request_id, 7)?;
+                i.text(&request.reference.native_id, 7)?;
+                i.optional_text(request.reference.native_turn_id.as_ref(), 7)?;
+            }
+            if let Some(inventory) = &page.inventory_page {
+                i.nodes(4, 5)?;
+                i.text(&inventory.scan_id, 6)?;
+                i.optional_text(inventory.next_cursor.as_ref(), 6)?;
+            }
             i.nodes(7, 4)?;
             i.collection(page.observations.capacity(), 5)?;
             for observation in &page.observations {

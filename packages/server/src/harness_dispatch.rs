@@ -106,6 +106,31 @@ pub trait ManagedSessionBackend: Send + Sync {
         caller: &'a ManagedCaller,
         call: ManagedSessionCall,
     ) -> Task<'a, HarnessServiceResponse>;
+    /// Retain an explicitly recovered current owner for normal shutdown cleanup.
+    /// Implementations without canonical runtime ownership must reject this operation.
+    fn retain_recovery_owner(&self, owner: HarnessOwner) -> Task<'_, ()> {
+        let _ = owner;
+        Box::pin(async { Err(ManagedHarnessError::Unsupported) })
+    }
+    /// Deliver an already-CAS-published exact resume under renewed caller admission.
+    fn resume_recovery<'a>(
+        &'a self,
+        caller: &'a ManagedCaller,
+        owner: HarnessOwner,
+        call: ManagedSessionCall,
+    ) -> Task<'a, HarnessServiceResponse> {
+        let _ = (caller, owner, call);
+        Box::pin(async { Err(ManagedHarnessError::Unsupported) })
+    }
+    /// Poll canonical native observations for an admitted interactive attachment.
+    fn poll_observations<'a>(
+        &'a self,
+        caller: &'a ManagedCaller,
+        query: &'a bcode_ipc::harness::ManagedSessionPollRequest,
+    ) -> Task<'a, ()> {
+        let _ = (caller, query);
+        Box::pin(async { Err(ManagedHarnessError::Unsupported) })
+    }
     /// Resolve auth from the same admitted canonical runtime.
     fn auth_scope<'a>(
         &'a self,
@@ -119,6 +144,197 @@ impl std::fmt::Debug for dyn ManagedSessionBackend {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter.write_str("ManagedSessionBackend { .. }")
     }
+}
+
+use bcode_harness_models::{
+    HARNESS_RECOVERY_INTERFACE_ID as NATIVE_RECOVERY_INTERFACE, HARNESS_RECOVERY_SCHEMA_VERSION,
+    HarnessRecoveryRequest as NativeRecoveryRequest,
+    HarnessRecoveryRequestKind as NativeRecoveryKind,
+    HarnessRecoveryResponse as NativeRecoveryResponse,
+    HarnessRecoveryResponseKind as NativeRecoveryResult,
+};
+
+fn validate_native_recovery_request(
+    request: &NativeRecoveryRequest,
+) -> Result<(), ManagedHarnessError> {
+    if request.schema_version != HARNESS_RECOVERY_SCHEMA_VERSION
+        || request.request_id.is_empty()
+        || request.request_id.len() > bcode_harness_models::MAX_HARNESS_ID_BYTES
+        || request.request_id.chars().any(char::is_control)
+    {
+        return Err(ManagedHarnessError::Invalid);
+    }
+    let kind = match &request.kind {
+        NativeRecoveryKind::PrepareResume { request: open } if open.resume.is_some() => {
+            HarnessRequestKind::Open(open.clone())
+        }
+        NativeRecoveryKind::PrepareResume { .. } => return Err(ManagedHarnessError::Invalid),
+        NativeRecoveryKind::ReleaseTransport { request: control } => {
+            HarnessRequestKind::Close(control.clone())
+        }
+    };
+    bcode_harness_models::HarnessRequest {
+        schema_version: bcode_harness_models::HARNESS_SCHEMA_VERSION,
+        request_id: request.request_id.clone(),
+        instance: request.instance.clone(),
+        kind,
+    }
+    .validate()
+    .map_err(|_| ManagedHarnessError::Invalid)
+}
+
+fn validate_native_recovery_result(
+    request: &NativeRecoveryRequest,
+    response: NativeRecoveryResponse,
+) -> Result<NativeRecoveryResult, ManagedHarnessError> {
+    validate_native_recovery_request(request)?;
+    if response.schema_version != HARNESS_RECOVERY_SCHEMA_VERSION
+        || response.request_id != request.request_id
+    {
+        return Err(ManagedHarnessError::Invalid);
+    }
+    match (&request.kind, &response.kind) {
+        (
+            NativeRecoveryKind::PrepareResume { request: expected },
+            NativeRecoveryResult::ResumeValidated { request: actual },
+        ) if expected == actual => {}
+        (
+            NativeRecoveryKind::ReleaseTransport { request: expected },
+            NativeRecoveryResult::TransportReleased {
+                target,
+                mutation_id,
+                reap_id,
+            },
+        ) if target == &expected.target
+            && mutation_id == &expected.mutation_id
+            && !reap_id.is_empty()
+            && reap_id.len() <= bcode_harness_models::MAX_HARNESS_ID_BYTES
+            && !reap_id.chars().any(char::is_control) => {}
+        _ => return Err(ManagedHarnessError::Invalid),
+    }
+    Ok(response.kind)
+}
+
+async fn native_recovery_service(
+    state: &Arc<crate::ServerState>,
+    request: &NativeRecoveryRequest,
+) -> Result<NativeRecoveryResult, ManagedHarnessError> {
+    validate_native_recovery_request(request)?;
+    let operation = match &request.kind {
+        NativeRecoveryKind::PrepareResume { .. } => "prepare_resume",
+        NativeRecoveryKind::ReleaseTransport { .. } => "release_transport",
+    };
+    // No vendor fallback or generic arbitrary service route. Exactly one declared
+    // service on the canonically selected enabled plugin is required.
+    if state
+        .plugins
+        .service_summaries()
+        .iter()
+        .filter(|(plugin, service)| {
+            plugin == &request.instance.plugin_id
+                && service.interface_id == NATIVE_RECOVERY_INTERFACE
+        })
+        .count()
+        != 1
+    {
+        return Err(ManagedHarnessError::Unsupported);
+    }
+    let payload = serde_json::to_vec(request).map_err(|_| ManagedHarnessError::Invalid)?;
+    if payload.len() > bcode_harness_models::MAX_HARNESS_WIRE_BYTES {
+        return Err(ManagedHarnessError::Invalid);
+    }
+    let response = tokio::time::timeout(
+        std::time::Duration::from_secs(30),
+        state.plugins.invoke_service_with_bridge_scoped(
+            &request.instance.plugin_id,
+            NATIVE_RECOVERY_INTERFACE,
+            operation,
+            payload,
+            bcode_plugin::PluginInvocationScope::session(match &request.kind {
+                NativeRecoveryKind::PrepareResume { request: open } => open.session_id.clone(),
+                NativeRecoveryKind::ReleaseTransport { request: control } => {
+                    control.target.session_id().to_owned()
+                }
+            }),
+            None,
+        ),
+    )
+    .await
+    .map_err(|_| ManagedHarnessError::Uncertain)?
+    .map_err(|_| ManagedHarnessError::Unavailable)?;
+    if response.error.is_some()
+        || response.payload.len() > bcode_harness_models::MAX_HARNESS_WIRE_BYTES
+    {
+        return Err(ManagedHarnessError::Unavailable);
+    }
+    let response: NativeRecoveryResponse =
+        serde_json::from_slice(&response.payload).map_err(|_| ManagedHarnessError::Invalid)?;
+    validate_native_recovery_result(request, response)
+}
+
+async fn record_shutdown_transport_release(
+    state: &Arc<crate::ServerState>,
+    owner: &HarnessOwner,
+    mutation_id: String,
+    response: &HarnessServiceResponse,
+) -> Result<(), ManagedHarnessError> {
+    if !matches!(&response.kind, bcode_harness_models::HarnessServiceResponseKind::Acknowledged { mutation_id: acknowledged }
+        if acknowledged == &mutation_id)
+    {
+        return Err(ManagedHarnessError::Uncertain);
+    }
+    let store = crate::harness::CanonicalHarnessStore::new(state);
+    let _hold = store.acquire(owner).await?;
+    let selected = store.selected(owner).await?;
+    let Some(bcode_harness_models::HarnessSessionTarget::Confirmed(binding)) = selected.target
+    else {
+        // Prepared-only sessions cannot be resumed and receive no fabricated native identity.
+        return Ok(());
+    };
+    let target = bcode_harness_models::HarnessSessionTarget::Confirmed(binding.clone());
+    let request = NativeRecoveryRequest {
+        schema_version: 1,
+        request_id: mutation_id.clone(),
+        instance: selected.instance.clone(),
+        kind: NativeRecoveryKind::ReleaseTransport {
+            request: bcode_harness_models::HarnessControlRequest {
+                target: target.clone(),
+                mutation_id: mutation_id.clone(),
+            },
+        },
+    };
+    let native = native_recovery_service(state, &request).await?;
+    let NativeRecoveryResult::TransportReleased {
+        target: released,
+        mutation_id: completed,
+        reap_id,
+    } = native
+    else {
+        return Err(ManagedHarnessError::Invalid);
+    };
+    if released != target || completed != mutation_id {
+        return Err(ManagedHarnessError::Invalid);
+    }
+    let release = bcode_session_models::external_harness::ExternalHarnessTransportRelease {
+        close_request_id: mutation_id,
+        instance: selected.instance,
+        binding,
+        lifetime: store.release_lifetime_provenance()?,
+        reap_id,
+    };
+    let expected = release.clone();
+    drop(store);
+    state
+        .sessions
+        .release_external_harness_transport(&selected.owner, release, move |actual| {
+            if actual == &expected {
+                Ok(())
+            } else {
+                Err("physical release proof changed".into())
+            }
+        })
+        .await
+        .map_err(|_| ManagedHarnessError::Storage)
 }
 
 struct DaemonTransport(std::sync::Weak<crate::ServerState>);
@@ -137,17 +353,134 @@ struct CanonicalBackend<S, A> {
     runtime: ManagedHarnessRuntime<S, DaemonTransport>,
     admission: A,
     owners: tokio::sync::Mutex<std::collections::BTreeMap<SessionId, HarnessOwner>>,
+    tool_queues: crate::harness::ToolQueueHost,
 }
 impl<S: ManagedHarnessStore, A: ManagedSessionAdmission> ManagedSessionBackend
     for CanonicalBackend<S, A>
 {
+    fn retain_recovery_owner(&self, owner: HarnessOwner) -> Task<'_, ()> {
+        Box::pin(async move {
+            self.runtime.verify_owner(&owner).await?;
+            self.owners.lock().await.insert(owner.session_id, owner);
+            Ok(())
+        })
+    }
+
+    fn resume_recovery<'a>(
+        &'a self,
+        caller: &'a ManagedCaller,
+        owner: HarnessOwner,
+        call: ManagedSessionCall,
+    ) -> Task<'a, HarnessServiceResponse> {
+        Box::pin(async move {
+            if !matches!(caller, ManagedCaller::Client(_))
+                || self.admission.existing(caller, &call).await? != owner
+            {
+                return Err(ManagedHarnessError::StaleOwner);
+            }
+            let state = self
+                .state
+                .upgrade()
+                .ok_or(ManagedHarnessError::Unavailable)?;
+            self.retain_recovery_owner(owner.clone()).await?;
+            let credential_call = serde_json::from_value(
+                serde_json::to_value(&call).map_err(|_| ManagedHarnessError::Invalid)?,
+            )
+            .map_err(|_| ManagedHarnessError::Invalid)?;
+            self.admit_tool_queue(&state, caller, &owner, &call).await?;
+            let HarnessRequestKind::Open(open) = call.harness.kind else {
+                return Err(ManagedHarnessError::Invalid);
+            };
+            crate::harness::with_credential_admission(
+                caller.clone(),
+                owner.clone(),
+                credential_call,
+                Box::pin(self.runtime.open_validated_recovery(&owner, open)),
+            )
+            .await
+        })
+    }
+
+    fn poll_observations<'a>(
+        &'a self,
+        caller: &'a ManagedCaller,
+        query: &'a bcode_ipc::harness::ManagedSessionPollRequest,
+    ) -> Task<'a, ()> {
+        Box::pin(async move {
+            let ManagedCaller::Client(client) = caller else {
+                return Err(ManagedHarnessError::Unsupported);
+            };
+            let state = self
+                .state
+                .upgrade()
+                .ok_or(ManagedHarnessError::Unavailable)?;
+            query.validate().map_err(|_| ManagedHarnessError::Invalid)?;
+            let snapshot = state
+                .sessions
+                .session_external_harness_state(query.session_id)
+                .await
+                .map_err(|_| ManagedHarnessError::Storage)?
+                .ok_or(ManagedHarnessError::Conflict)?;
+            if snapshot.owner.generation != query.generation
+                || snapshot.instance.instance_id != query.instance_id
+            {
+                return Err(ManagedHarnessError::StaleOwner);
+            }
+            let call = ManagedSessionCall {
+                session_id: Some(query.session_id),
+                harness: bcode_harness_models::HarnessRequest {
+                    schema_version: bcode_harness_models::HARNESS_SCHEMA_VERSION,
+                    request_id: format!("attachment-admission:{}", uuid::Uuid::new_v4()),
+                    instance: snapshot.instance,
+                    kind: HarnessRequestKind::Observe(
+                        bcode_harness_models::HarnessObserveRequest {
+                            target: snapshot.target.ok_or(ManagedHarnessError::Conflict)?,
+                            // Admission shape only: the application reads the real actor cursor
+                            // under its observer guard before constructing any native request.
+                            retention: None,
+                            after: None,
+                            limit: query.limit,
+                            wait_millis: 0,
+                        },
+                    ),
+                },
+                parent_session_id: None,
+                assistance_destination_session_id: None,
+            };
+            let owner = self.admission.existing(caller, &call).await?;
+            let result = Box::pin(
+                crate::harness::ManagedHarnessApplication::with_owner(
+                    &state,
+                    *client,
+                    &self.runtime,
+                    owner,
+                )
+                .poll_observations(query),
+            )
+            .await;
+            drop(state);
+            result
+        })
+    }
+
     fn shutdown(&self) -> Task<'_, ()> {
         Box::pin(async move {
+            self.tool_queues.shutdown().await;
             let owners = std::mem::take(&mut *self.owners.lock().await);
             let closes = owners.into_values().map(|owner| async move {
-                self.runtime
-                    .close(&owner, format!("shutdown:{}", uuid::Uuid::new_v4()))
-                    .await
+                let mutation_id = format!("shutdown:{}", uuid::Uuid::new_v4());
+                let response = self.runtime.close(&owner, mutation_id.clone()).await?;
+                if bcode_session_models::CURRENT_SESSION_EVENT_SCHEMA_VERSION >= 56
+                    && bcode_session_models::CURRENT_SESSION_STORAGE_WRITER_EPOCH >= 24
+                {
+                    let state = self
+                        .state
+                        .upgrade()
+                        .ok_or(ManagedHarnessError::Unavailable)?;
+                    record_shutdown_transport_release(&state, &owner, mutation_id, &response)
+                        .await?;
+                }
+                Ok::<_, ManagedHarnessError>(response)
             });
             let results = tokio::time::timeout(
                 std::time::Duration::from_secs(10),
@@ -171,15 +504,7 @@ impl<S: ManagedHarnessStore, A: ManagedSessionAdmission> ManagedSessionBackend
             call.harness
                 .validate()
                 .map_err(|_| ManagedHarnessError::Invalid)?;
-            let supplied_target = match &call.harness.kind {
-                HarnessRequestKind::Submit { target, .. }
-                | HarnessRequestKind::Respond { target, .. } => Some(target),
-                HarnessRequestKind::Observe(value) => Some(&value.target),
-                HarnessRequestKind::Interrupt(value) | HarnessRequestKind::Close(value) => {
-                    Some(&value.target)
-                }
-                _ => None,
-            };
+            let supplied_target = call_target(&call);
             let state = self
                 .state
                 .upgrade()
@@ -245,7 +570,31 @@ impl<S: ManagedHarnessStore, A: ManagedSessionAdmission> ManagedSessionBackend
                 }
                 owners.insert(owner.session_id, owner.clone());
             }
-            let result = Box::pin(self.execute_admitted(&state, caller, &owner, call)).await;
+            let credential_call = serde_json::from_value(
+                serde_json::to_value(&call).map_err(|_| ManagedHarnessError::Invalid)?,
+            )
+            .map_err(|_| ManagedHarnessError::Invalid)?;
+            let failed_submit_scope = self.admit_tool_queue(&state, caller, &owner, &call).await?;
+            let operation = call.harness.kind.operation();
+            let release_mutation = match &call.harness.kind {
+                HarnessRequestKind::Close(control) => Some(control.mutation_id.clone()),
+                _ => None,
+            };
+            let result = crate::harness::with_credential_admission(
+                caller.clone(),
+                owner.clone(),
+                credential_call,
+                Box::pin(self.execute_admitted(&state, caller, &owner, call)),
+            )
+            .await;
+            self.record_explicit_release(&state, &owner, release_mutation, &result)
+                .await?;
+            if let Err(error) = &result {
+                log_admitted_failure(operation, *error, failed_submit_scope.is_some());
+                if let Some(scope) = failed_submit_scope {
+                    self.tool_queues.revoke_exact(&state, &scope).await;
+                }
+            }
             drop(workflow_hold);
             drop(state);
             result
@@ -259,6 +608,40 @@ impl<S: ManagedHarnessStore, A: ManagedSessionAdmission> ManagedSessionBackend
     ) -> Task<'a, ManagedAuthAdmission> {
         self.admission.auth_scope(caller, session_id, instance_id)
     }
+}
+
+const fn call_target(
+    call: &ManagedSessionCall,
+) -> Option<&bcode_harness_models::HarnessSessionTarget> {
+    match &call.harness.kind {
+        HarnessRequestKind::Submit { target, .. } | HarnessRequestKind::Respond { target, .. } => {
+            Some(target)
+        }
+        HarnessRequestKind::Observe(value) => Some(&value.target),
+        HarnessRequestKind::Interrupt(value) | HarnessRequestKind::Close(value) => {
+            Some(&value.target)
+        }
+        _ => None,
+    }
+}
+
+fn log_admitted_failure(
+    operation: bcode_harness_models::HarnessOperation,
+    error: ManagedHarnessError,
+    revoke_submit_scope: bool,
+) {
+    let category = match error {
+        ManagedHarnessError::Invalid => "invalid",
+        ManagedHarnessError::Storage => "storage",
+        ManagedHarnessError::StaleOwner => "stale_owner",
+        ManagedHarnessError::Conflict => "conflict",
+        ManagedHarnessError::Uncertain => "uncertain",
+        ManagedHarnessError::Unavailable => "unavailable",
+        ManagedHarnessError::Deadline => "deadline",
+        ManagedHarnessError::Unsupported => "unsupported",
+    };
+    tracing::warn!(target: "bcode_server::harness", operation = operation.as_str(), category,
+                    revoke_submit_scope, "managed admitted operation failed");
 }
 
 impl<S: ManagedHarnessStore, A: ManagedSessionAdmission> CanonicalBackend<S, A> {
@@ -279,6 +662,23 @@ impl<S: ManagedHarnessStore, A: ManagedSessionAdmission> CanonicalBackend<S, A> 
             operation: bcode_harness_models::HarnessOperation::Inspect,
             kind: bcode_harness_models::HarnessServiceResponseKind::Inspection(value),
         })
+    }
+
+    async fn record_explicit_release(
+        &self,
+        state: &Arc<crate::ServerState>,
+        owner: &HarnessOwner,
+        mutation: Option<String>,
+        result: &Result<HarnessServiceResponse, ManagedHarnessError>,
+    ) -> Result<(), ManagedHarnessError> {
+        if bcode_session_models::CURRENT_SESSION_EVENT_SCHEMA_VERSION >= 56
+            && bcode_session_models::CURRENT_SESSION_STORAGE_WRITER_EPOCH >= 24
+            && let (Some(mutation), Ok(response)) = (mutation, result)
+        {
+            record_shutdown_transport_release(state, owner, mutation, response).await?;
+            self.owners.lock().await.remove(&owner.session_id);
+        }
+        Ok(())
     }
 
     async fn observe_admitted(
@@ -314,6 +714,25 @@ impl<S: ManagedHarnessStore, A: ManagedSessionAdmission> CanonicalBackend<S, A> 
             operation: bcode_harness_models::HarnessOperation::Observe,
             kind: bcode_harness_models::HarnessServiceResponseKind::Observations(value),
         })
+    }
+
+    async fn admit_tool_queue(
+        &self,
+        state: &Arc<crate::ServerState>,
+        caller: &ManagedCaller,
+        owner: &HarnessOwner,
+        call: &ManagedSessionCall,
+    ) -> Result<Option<bcode_harness_models::ManagedToolQueueScope>, ManagedHarnessError> {
+        // Retained-result early return must precede this admission; replay never issues grants.
+        if matches!(
+            call.harness.kind,
+            HarnessRequestKind::Interrupt(_) | HarnessRequestKind::Close(_)
+        ) {
+            self.tool_queues.revoke(state, owner.session_id).await;
+            Ok(None)
+        } else {
+            self.tool_queues.install(state, caller, call).await
+        }
     }
 
     async fn execute_admitted(
@@ -431,6 +850,7 @@ impl crate::ServerState {
             runtime: ManagedHarnessRuntime::new(store, DaemonTransport(Arc::downgrade(self))),
             admission,
             owners: tokio::sync::Mutex::new(std::collections::BTreeMap::new()),
+            tool_queues: crate::harness::ToolQueueHost::default(),
         };
         self.managed_sessions
             .set(Arc::new(backend))
@@ -512,6 +932,354 @@ async fn dispatch_binding(
     auth_response(&snapshot)
 }
 
+async fn dispatch_attachment_poll(
+    state: &Arc<crate::ServerState>,
+    caller: &ManagedCaller,
+    query: &bcode_ipc::harness::ManagedSessionPollRequest,
+) -> Result<ManagedSessionResponse, ErrorResponse> {
+    query
+        .validate()
+        .map_err(|_| failure(ManagedHarnessError::Invalid))?;
+    state
+        .managed_sessions
+        .get()
+        .ok_or_else(|| failure(ManagedHarnessError::Unavailable))?
+        .poll_observations(caller, query)
+        .await
+        .map_err(failure)?;
+    Ok(ManagedSessionResponse {
+        schema_version: MANAGED_SESSION_VERSION,
+        response_json: "{\"committed\":true}".into(),
+    })
+}
+
+fn recovery_intent(
+    query: &bcode_ipc::harness::ManagedSessionRecoveryRequest,
+    snapshot: bcode_session_models::external_harness::ExternalHarnessState,
+    sequence: u64,
+    release: bcode_session_models::external_harness::ExternalHarnessTransportRelease,
+    directory: &std::path::Path,
+) -> Result<
+    (
+        bcode_harness_models::HarnessRequest,
+        bcode_session_models::external_harness::ExternalHarnessRecovery,
+    ),
+    ManagedHarnessError,
+> {
+    let generation = query
+        .expected_generation
+        .checked_add(1)
+        .ok_or(ManagedHarnessError::Conflict)?;
+    let mut binding = release.binding.clone();
+    binding.generation = generation;
+    let open = bcode_harness_models::HarnessOpenRequest {
+        open_id: query.recovery_id.clone(),
+        session_id: query.session_id.to_string(),
+        generation,
+        working_directory: directory
+            .to_str()
+            .ok_or(ManagedHarnessError::Invalid)?
+            .to_owned(),
+        resume: Some(binding),
+        parent_assistance: None,
+    };
+    let request = bcode_harness_models::HarnessRequest {
+        schema_version: 1,
+        request_id: query.recovery_id.clone(),
+        instance: snapshot.instance,
+        kind: HarnessRequestKind::Open(open),
+    };
+    let recovery = bcode_session_models::external_harness::ExternalHarnessRecovery {
+        previous_owner: snapshot.owner,
+        release_event_sequence: sequence,
+        release,
+        capabilities: snapshot.capabilities,
+        resume_request:
+            bcode_session_models::external_harness::ExternalHarnessRequest::from_request(&request)
+                .map_err(|_| ManagedHarnessError::Invalid)?,
+    };
+    Ok((request, recovery))
+}
+
+async fn preflight_recovery_resume(
+    state: &Arc<crate::ServerState>,
+    request: bcode_harness_models::HarnessRequest,
+) -> Result<(), ManagedHarnessError> {
+    let HarnessRequestKind::Open(open) = request.kind else {
+        return Err(ManagedHarnessError::Invalid);
+    };
+    let native = NativeRecoveryRequest {
+        schema_version: 1,
+        request_id: request.request_id,
+        instance: request.instance,
+        kind: NativeRecoveryKind::PrepareResume { request: open },
+    };
+    match native_recovery_service(state, &native).await? {
+        NativeRecoveryResult::ResumeValidated { .. } => Ok(()),
+        NativeRecoveryResult::TransportReleased { .. } => Err(ManagedHarnessError::Invalid),
+    }
+}
+
+async fn dispatch_recovery(
+    state: &Arc<crate::ServerState>,
+    caller: &ManagedCaller,
+    query: bcode_ipc::harness::ManagedSessionRecoveryRequest,
+) -> Result<ManagedSessionResponse, ErrorResponse> {
+    query
+        .validate()
+        .map_err(|_| failure(ManagedHarnessError::Invalid))?;
+    if bcode_session_models::CURRENT_SESSION_EVENT_SCHEMA_VERSION < 56
+        || bcode_session_models::CURRENT_SESSION_STORAGE_WRITER_EPOCH < 24
+    {
+        return Err(failure(ManagedHarnessError::Unsupported));
+    }
+    let store = crate::harness::CanonicalHarnessStore::new(state);
+    let admission = crate::harness::CanonicalManagedAdmission::new(store.clone());
+    // Caller authorization precedes release discovery and all plugin preflight/native effects.
+    admission
+        .authorize_recovery_request(caller, query.session_id)
+        .await
+        .map_err(failure)?;
+    let snapshot = state
+        .sessions
+        .session_external_harness_state(query.session_id)
+        .await
+        .map_err(|_| failure(ManagedHarnessError::Storage))?
+        .ok_or_else(|| failure(ManagedHarnessError::Conflict))?;
+    if snapshot.instance.instance_id != query.instance_id
+        || snapshot.owner.generation != query.expected_generation
+    {
+        return Err(failure(ManagedHarnessError::StaleOwner));
+    }
+    let (sequence, release) = state
+        .sessions
+        .session_external_harness_transport_release(&snapshot.owner)
+        .await
+        .map_err(|_| failure(ManagedHarnessError::Storage))?
+        .ok_or_else(|| failure(ManagedHarnessError::Conflict))?;
+    let summary = state
+        .sessions
+        .session_summary(query.session_id)
+        .await
+        .map_err(|_| failure(ManagedHarnessError::Storage))?;
+    let (request, recovery) = recovery_intent(
+        &query,
+        snapshot,
+        sequence,
+        release,
+        &summary.working_directory,
+    )
+    .map_err(failure)?;
+    let plugin_state = Arc::clone(state);
+    let owner = admission
+        .prepare_recovery(caller, recovery, move |request| async move {
+            preflight_recovery_resume(&plugin_state, request).await
+        })
+        .await
+        .map_err(failure)?;
+    drop(admission);
+    let backend = state
+        .managed_sessions
+        .get()
+        .ok_or_else(|| failure(ManagedHarnessError::Unavailable))?;
+    let call = ManagedSessionCall {
+        session_id: Some(query.session_id),
+        harness: request,
+        parent_session_id: None,
+        assistance_destination_session_id: None,
+    };
+    // Canonical intent was CAS-published first. The retained claim authorizes one resume;
+    // dropped acknowledgements remain uncertain and never trigger input/native replay.
+    let response = backend
+        .resume_recovery(caller, owner, call)
+        .await
+        .map_err(failure)?;
+    Ok(ManagedSessionResponse {
+        schema_version: MANAGED_SESSION_VERSION,
+        response_json: serde_json::to_string(&response)
+            .map_err(|_| failure(ManagedHarnessError::Invalid))?,
+    })
+}
+
+#[cfg(test)]
+mod recovery_route_tests {
+    use super::*;
+
+    fn release_request() -> NativeRecoveryRequest {
+        let session = SessionId::new().to_string();
+        let instance = serde_json::from_value(serde_json::json!({
+            "instance_id":"fixture","plugin_id":"fixture","executable":"/not-invoked","config_namespace":"fixture",
+            "auth":{"provider_id":"fixture","profile":"native","credential_namespace":"fixture","custody":"native_managed"}
+        })).unwrap();
+        NativeRecoveryRequest {
+            schema_version: 1,
+            request_id: "close".into(),
+            instance,
+            kind: NativeRecoveryKind::ReleaseTransport {
+                request: bcode_harness_models::HarnessControlRequest {
+                    target: bcode_harness_models::HarnessSessionTarget::Confirmed(
+                        bcode_harness_models::HarnessSessionBinding {
+                            schema_version: 1,
+                            session_id: session,
+                            instance_id: "fixture".into(),
+                            native_session_id: "exact-native".into(),
+                            native_version: "exact-version".into(),
+                            generation: 3,
+                        },
+                    ),
+                    mutation_id: "close".into(),
+                },
+            },
+        }
+    }
+
+    #[test]
+    fn native_recovery_rejects_unknown_versions_unbounded_ids_and_nonresume_open() {
+        let mut request = release_request();
+        validate_native_recovery_request(&request).unwrap();
+        request.schema_version = HARNESS_RECOVERY_SCHEMA_VERSION + 1;
+        assert!(validate_native_recovery_request(&request).is_err());
+        request.schema_version = HARNESS_RECOVERY_SCHEMA_VERSION;
+        request.request_id = "x".repeat(bcode_harness_models::MAX_HARNESS_ID_BYTES + 1);
+        assert!(validate_native_recovery_request(&request).is_err());
+        request.request_id = "close".into();
+        request.kind = NativeRecoveryKind::PrepareResume {
+            request: bcode_harness_models::HarnessOpenRequest {
+                open_id: "close".into(),
+                session_id: SessionId::new().to_string(),
+                generation: 1,
+                working_directory: "/workspace".into(),
+                resume: None,
+                parent_assistance: None,
+            },
+        };
+        assert!(
+            validate_native_recovery_request(&request).is_err(),
+            "new native creation is not recovery"
+        );
+    }
+
+    #[test]
+    fn physical_release_requires_exact_target_mutation_and_nonempty_reap() {
+        let request = release_request();
+        let NativeRecoveryKind::ReleaseTransport { request: control } = &request.kind else {
+            unreachable!()
+        };
+        let response = |target, mutation_id, reap_id| NativeRecoveryResponse {
+            schema_version: 1,
+            request_id: "close".into(),
+            kind: NativeRecoveryResult::TransportReleased {
+                target,
+                mutation_id,
+                reap_id,
+            },
+        };
+        assert!(
+            validate_native_recovery_result(
+                &request,
+                response(control.target.clone(), "close".into(), "reaped".into())
+            )
+            .is_ok()
+        );
+        assert!(
+            validate_native_recovery_result(
+                &request,
+                response(control.target.clone(), "other".into(), "reaped".into())
+            )
+            .is_err()
+        );
+        assert!(
+            validate_native_recovery_result(
+                &request,
+                response(control.target.clone(), "close".into(), String::new())
+            )
+            .is_err()
+        );
+        let mut foreign = control.target.clone();
+        if let bcode_harness_models::HarnessSessionTarget::Confirmed(binding) = &mut foreign {
+            binding.generation += 1;
+        }
+        assert!(
+            validate_native_recovery_result(
+                &request,
+                response(foreign, "close".into(), "reaped".into())
+            )
+            .is_err()
+        );
+        let acknowledged = serde_json::json!({"schema_version":1,"request_id":"close","kind":{"kind":"acknowledged","mutation_id":"close"}});
+        assert!(
+            serde_json::from_value::<NativeRecoveryResponse>(acknowledged).is_err(),
+            "Ack cannot deserialize as physical release"
+        );
+    }
+
+    #[test]
+    fn resume_preflight_must_preserve_exact_complete_intent() {
+        let release = release_request();
+        let NativeRecoveryKind::ReleaseTransport { request: control } = release.kind else {
+            unreachable!()
+        };
+        let bcode_harness_models::HarnessSessionTarget::Confirmed(binding) = control.target else {
+            unreachable!()
+        };
+        let open = bcode_harness_models::HarnessOpenRequest {
+            open_id: "resume".into(),
+            session_id: binding.session_id.clone(),
+            generation: binding.generation,
+            working_directory: "/workspace".into(),
+            resume: Some(binding),
+            parent_assistance: None,
+        };
+        let request = NativeRecoveryRequest {
+            schema_version: 1,
+            request_id: "resume".into(),
+            instance: release.instance,
+            kind: NativeRecoveryKind::PrepareResume {
+                request: open.clone(),
+            },
+        };
+        let response = |open| NativeRecoveryResponse {
+            schema_version: 1,
+            request_id: "resume".into(),
+            kind: NativeRecoveryResult::ResumeValidated { request: open },
+        };
+        assert!(validate_native_recovery_result(&request, response(open.clone())).is_ok());
+        let mut changed = open;
+        changed.working_directory = "/foreign-workspace".into();
+        assert!(validate_native_recovery_result(&request, response(changed)).is_err());
+    }
+
+    #[tokio::test]
+    async fn unpublished_recovery_route_has_no_effects() {
+        if bcode_session_models::CURRENT_SESSION_EVENT_SCHEMA_VERSION >= 56
+            && bcode_session_models::CURRENT_SESSION_STORAGE_WRITER_EPOCH >= 24
+        {
+            return;
+        }
+        let state = Arc::new(crate::tests::test_server_state(
+            crate::SessionManager::default(),
+        ));
+        let query = bcode_ipc::harness::ManagedSessionRecoveryRequest {
+            session_id: SessionId::new(),
+            instance_id: "fixture".into(),
+            expected_generation: 1,
+            recovery_id: "explicit".into(),
+        };
+        let session_id = query.session_id;
+        assert!(
+            dispatch_recovery(
+                &state,
+                &ManagedCaller::Client(crate::ClientId::new()),
+                query
+            )
+            .await
+            .is_err()
+        );
+        assert!(state.sessions.session_summary(session_id).await.is_err());
+        drop(state);
+    }
+}
+
 pub(crate) async fn dispatch(
     state: &Arc<crate::ServerState>,
     caller: ManagedCaller,
@@ -525,6 +1293,12 @@ pub(crate) async fn dispatch(
         .load(std::sync::atomic::Ordering::SeqCst)
     {
         return Err(failure(ManagedHarnessError::Unavailable));
+    }
+    if request.operation == ManagedSessionOperation::Recover {
+        let query = request
+            .decode_recovery()
+            .map_err(|_| failure(ManagedHarnessError::Invalid))?;
+        return dispatch_recovery(state, &caller, query).await;
     }
     if request.operation.is_auth() {
         if request.operation == ManagedSessionOperation::AuthPrepare {
@@ -549,6 +1323,13 @@ pub(crate) async fn dispatch(
             return prepare_handoff(state, caller, request).await;
         }
         return dispatch_auth(state, caller, request).await;
+    }
+    if request.operation == ManagedSessionOperation::Observe
+        && let Ok(query) = serde_json::from_str::<bcode_ipc::harness::ManagedSessionPollRequest>(
+            &request.request_json,
+        )
+    {
+        return dispatch_attachment_poll(state, &caller, &query).await;
     }
     if request.operation == ManagedSessionOperation::Binding {
         return dispatch_binding(state, caller, &request).await;

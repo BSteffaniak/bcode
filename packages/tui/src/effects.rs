@@ -310,6 +310,10 @@ mod activity_watch_lifetime_tests {
 }
 
 const TRANSCRIPT_PAGE_TARGET_ITEMS: usize = 4;
+
+#[cfg(test)]
+#[path = "managed_effect_error_tests.rs"]
+mod managed_effect_error_tests;
 const TRANSCRIPT_PAGE_MAX_ITEMS: usize = 16;
 const TRANSCRIPT_PAGE_TARGET_ROWS: usize = 24;
 const TRANSCRIPT_PAGE_MAX_EVENTS_SCANNED: usize = 512;
@@ -407,6 +411,178 @@ async fn load_transcript_history_page(
     let records = client
         .submissions_for_history(session_id, &page.events)
         .await?;
+    Ok((page, records))
+}
+
+async fn managed_submit_message(
+    commands: &bcode_client::ManagedSessionCommandHandle,
+    request: SubmitMessageRequest,
+    generation: Option<u64>,
+) -> TuiEffectResult {
+    let session_id = commands.session_id();
+    let submission_id = request.submission_id.clone();
+    let message = request.message.clone();
+    let result = async {
+        if request.session_id != Some(session_id) {
+            return Err(ClientError::Protocol("Managed composer session mismatch".into()));
+        }
+        validate_managed_composer_request(&request)?;
+        let mut request = request;
+        let mut auth = commands.auth_flow().await?;
+        let readiness = auth.readiness().await?;
+        if !matches!(readiness.readiness, bcode_provider_auth_models::managed::AuthReadiness::Ready | bcode_provider_auth_models::managed::AuthReadiness::Verified) {
+            return Err(ClientError::Protocol("Native authentication is not ready; use the dedicated managed auth surface before sending".into()));
+        }
+        let mut result = SubmitMessageResult::empty(session_id);
+        if let Some(retained) = request.managed.take() {
+            if Some(retained.target().1) != generation {
+                return Err(ClientError::Protocol("Retained managed input belongs to another generation".into()));
+            }
+            result.receipt = Some(ComposerReceipt::Managed(Box::new(commands.submit_managed_composer_request(retained).await?)));
+        } else {
+            let retained = commands.prepare_managed_composer_submission(
+                (request.submission_id.0.clone(), request.attempt_id.clone()),
+                request.message.clone(), request.placement == PromptPlacement::Steering,
+                request.expected_native_turn_id.clone(),
+            ).await?;
+            if Some(retained.target().1) != generation {
+                return Err(ClientError::Protocol("Managed generation changed during preparation; no input sent".into()));
+            }
+            request.managed = Some(retained);
+            request.managed_only = true;
+            result.prepared_request = Some(Box::new(request));
+        }
+        Ok(result)
+    }.await;
+    TuiEffectResult::SubmitMessage {
+        submission_id,
+        message,
+        result: Box::new(result),
+    }
+}
+
+fn parse_native_response_json(
+    text: &str,
+) -> Result<bcode_harness_models::HarnessResponseValue, ClientError> {
+    serde_json::from_str(text).map_err(|_| ClientError::Protocol(
+        "Expected typed native response JSON, for example {\"kind\":\"approval\",\"approved\":true}; no native response sent".into(),
+    ))
+}
+
+#[cfg(test)]
+mod native_response_json_tests {
+    #[test]
+    fn typed_permission_examples_parse_without_shell_or_verb_interpretation() {
+        use bcode_harness_models::HarnessResponseValue;
+        for (json, expected) in [
+            (
+                r#"{"kind":"approval","approved":true}"#,
+                HarnessResponseValue::Approval { approved: true },
+            ),
+            (
+                r#"{"kind":"approval","approved":false}"#,
+                HarnessResponseValue::Approval { approved: false },
+            ),
+            (
+                r#"{"kind":"answer","choice_id":null,"text":"two words"}"#,
+                HarnessResponseValue::Answer {
+                    choice_id: None,
+                    text: "two words".into(),
+                },
+            ),
+            (r#"{"kind":"cancel"}"#, HarnessResponseValue::Cancel),
+        ] {
+            assert_eq!(super::parse_native_response_json(json).unwrap(), expected);
+        }
+        for invalid in ["approve", "deny", "true", r#"{"kind":"approval"}"#] {
+            assert!(super::parse_native_response_json(invalid).is_err());
+        }
+    }
+}
+
+async fn managed_slash_command(
+    commands: &bcode_client::ManagedSessionCommandHandle,
+    message: String,
+    generation: Option<u64>,
+) -> TuiEffectResult {
+    let result = async {
+        let args: Vec<_> = message.split_whitespace().collect();
+        match args.as_slice() {
+            ["/auth"] | ["/auth", "status"] => {
+                let mut auth = commands.auth_flow().await?;
+                let status = auth.readiness().await?;
+                let message = match status.readiness {
+                    bcode_provider_auth_models::managed::AuthReadiness::Ready => "Selected managed instance authentication is locally ready",
+                    bcode_provider_auth_models::managed::AuthReadiness::Verified => "Selected managed instance authentication is verified",
+                    bcode_provider_auth_models::managed::AuthReadiness::LoginRequired => "Selected managed instance requires native login; use the dedicated terminal handoff, not provider enrollment",
+                    bcode_provider_auth_models::managed::AuthReadiness::Unknown => "Selected managed instance authentication readiness is unknown; no login or billing change was attempted",
+                    bcode_provider_auth_models::managed::AuthReadiness::Blocked(_) => "Selected managed instance authentication is blocked; no account or billing fallback was selected",
+                };
+                Ok(super::slash_commands::SlashCommandOutcome::Handled(message.into()))
+            }
+            ["/auth", ..] => Err(ClientError::Protocol("Managed /auth is bound to the attached configured instance. Only /auth status is currently available; provider/account selectors and credential input are not accepted in chat".into())),
+            ["/native", "interrupt"] => {
+                let expected = generation.ok_or_else(|| ClientError::Protocol("Managed generation is missing".into()))?;
+                commands.interrupt(expected, uuid::Uuid::new_v4().to_string()).await?;
+                Ok(super::slash_commands::SlashCommandOutcome::Handled("Native interrupt acknowledged; settlement remains independent".into()))
+            }
+            ["/native", "respond", supplied_generation, request_id, response_id, rest @ ..] => {
+                let supplied = supplied_generation.parse::<u64>().map_err(|_| ClientError::Protocol("Invalid native generation".into()))?;
+                if Some(supplied) != generation {
+                    return Err(ClientError::Protocol("Native response generation differs from attached session".into()));
+                }
+                let value = parse_native_response_json(&rest.join(" "))?;
+                commands.managed_session_respond(supplied, (*request_id).into(), (*response_id).into(), value).await?;
+                Ok(super::slash_commands::SlashCommandOutcome::Handled("Native response recorded".into()))
+            }
+            ["/native", "composer", "next"] => Ok(super::slash_commands::SlashCommandOutcome::ManagedComposer { expected_native_turn_id: None, retry_submission_id: None }),
+            ["/native", "composer", "steer", turn] => Ok(super::slash_commands::SlashCommandOutcome::ManagedComposer { expected_native_turn_id: Some((*turn).into()), retry_submission_id: None }),
+            ["/native", "retry", submission] => Ok(super::slash_commands::SlashCommandOutcome::ManagedComposer { expected_native_turn_id: None, retry_submission_id: Some((*submission).into()) }),
+            _ => Err(ClientError::Protocol("Managed commands: /native composer next|steer <turn>, /native interrupt, /native respond <generation> <request> <response> <JSON>, /native retry <submission>".into())),
+        }
+    }.await;
+    TuiEffectResult::SlashCommandExecuted { message, result }
+}
+
+async fn managed_transcript_page(
+    commands: &bcode_client::ManagedSessionCommandHandle,
+    cursor: SessionHistoryCursor,
+    width_columns: u16,
+    older: bool,
+) -> Result<
+    (
+        SessionHistoryPage,
+        Vec<bcode_session_models::SubmissionRecord>,
+    ),
+    ClientError,
+> {
+    let request = ProjectionWindowRequest {
+        projection: SessionProjectionKind::Transcript,
+        anchor: if older {
+            ProjectionWindowAnchor::BeforeSequence(cursor.sequence.saturating_add(1))
+        } else {
+            ProjectionWindowAnchor::AfterSequence(cursor.sequence.saturating_sub(1))
+        },
+        direction: if older {
+            ProjectionWindowDirection::Backward
+        } else {
+            ProjectionWindowDirection::Forward
+        },
+        target: ProjectionWindowTarget {
+            min_items: Some(TRANSCRIPT_PAGE_TARGET_ITEMS),
+            min_estimated_rows: Some(TRANSCRIPT_PAGE_TARGET_ROWS),
+            min_bytes: None,
+            width_columns: Some(width_columns.max(1)),
+        },
+        limits: ProjectionWindowLimits {
+            max_items: TRANSCRIPT_PAGE_MAX_ITEMS,
+            max_events_scanned: TRANSCRIPT_PAGE_MAX_EVENTS_SCANNED,
+            max_bytes: TRANSCRIPT_PAGE_MAX_BYTES,
+        },
+    };
+    let page = commands.session_projection_history_page(request).await?;
+    let page = projection_page_as_history_page(commands.session_id(), cursor, older, page)?;
+    let records = commands.submissions_for_history(&page.events).await?;
     Ok((page, records))
 }
 
@@ -1617,8 +1793,10 @@ enum EffectDaemonIntent {
 }
 
 impl TuiEffect {
+    /// Complete any rejected effect without assuming that only foreground work can fail.
+    /// Managed callers have no model/client fallback; preserve correlation for stale-result fences.
     #[allow(clippy::too_many_lines, dead_code)]
-    fn daemon_start_failed(self, client_error: ClientError) -> TuiEffectResult {
+    fn application_access_failed(self, client_error: ClientError) -> TuiEffectResult {
         match self {
             Self::QueueRecovery {
                 session_id,
@@ -1647,19 +1825,49 @@ impl TuiEffect {
                 generation,
                 result: Err(client_error),
             },
+            Self::LoadOlderHistory {
+                session_id,
+                cursor,
+                generation,
+                ..
+            } => TuiEffectResult::OlderHistoryLoaded {
+                session_id,
+                cursor,
+                generation,
+                result: Err(client_error),
+            },
+            Self::LoadNewerHistory {
+                session_id,
+                cursor,
+                generation,
+                ..
+            } => TuiEffectResult::NewerHistoryLoaded {
+                session_id,
+                cursor,
+                generation,
+                result: Err(client_error),
+            },
+            Self::SaveDraft { text, .. } => TuiEffectResult::SaveDraft {
+                text,
+                result: Err(client_error),
+            },
+            Self::ExecuteSlashCommand { message, .. } => TuiEffectResult::SlashCommandExecuted {
+                message,
+                result: Err(client_error),
+            },
             Self::OpenSession { session_id, .. } => TuiEffectResult::SessionOpened {
                 session_id,
                 has_older_history: true,
                 result: Box::new(Err(TuiError::Client(client_error))),
             },
             Self::LoadDraftStatus { .. } => TuiEffectResult::DraftStatusLoaded {
-                daemon_connected: false,
+                daemon_connected: !client_error.is_daemon_unavailable(),
                 model: None,
                 composer_draft: None,
                 error: Some(client_error.to_string()),
             },
             Self::LoadSessionStatus { session_id } => TuiEffectResult::SessionStatusLoaded {
-                daemon_connected: false,
+                daemon_connected: !client_error.is_daemon_unavailable(),
                 session_id,
                 hydration: Box::new(SessionStatusHydration {
                     model: None,
@@ -1680,9 +1888,6 @@ impl TuiEffect {
                 session_id,
                 plugin_status: Vec::new(),
                 error: Some(client_error.to_string()),
-            },
-            Self::LoadAgentCatalog => TuiEffectResult::AgentCatalogLoaded {
-                agents: Err(client_error.to_string()),
             },
             Self::SubmitMessage { request } => TuiEffectResult::SubmitMessage {
                 submission_id: request.submission_id,
@@ -1757,46 +1962,157 @@ impl TuiEffect {
                 apply_to_batch,
                 result: Err(client_error),
             },
-            Self::LoadConfig
-            | Self::PersistThemeSelection { .. }
-            | Self::ClearThemeSelection
-            | Self::PersistStreamingPresentation { .. }
-            | Self::ClearStreamingPresentation
-            | Self::ReconcileAuthSecurity { .. }
-            | Self::LoadOlderHistory { .. }
-            | Self::LoadNewerHistory { .. }
-            | Self::ListPermissions
-            | Self::SaveDraft { .. }
-            | Self::LoadSlashPalette { .. }
-            | Self::LoadCommandPalette
-            | Self::LoadSessionPicker { .. }
-            | Self::ImportSession { .. }
-            | Self::RenameSession { .. }
-            | Self::DeleteSession { .. }
-            | Self::SearchSessions { .. }
-            | Self::StartBulkMigration { .. }
-            | Self::CancelBulkMigration { .. }
-            | Self::WaitBulkMigration { .. }
-            | Self::StartSearchIndexing { .. }
-            | Self::CancelSearchIndexing { .. }
-            | Self::WaitSearchIndexing { .. }
-            | Self::ExecuteSlashCommand { .. }
-            | Self::RalphAction { .. }
-            | Self::RalphStart { .. }
-            | Self::OpenPluginSurface { .. }
-            | Self::LoadModelProviders
-            | Self::LoadAuthPoolPicker { .. }
-            | Self::SetAuthPoolPreference { .. }
-            | Self::CheckSelectedModel { .. }
-            | Self::LoadModelPicker { .. }
-            | Self::LoadSkillPicker
-            | Self::DescribeSkill { .. }
-            | Self::LoadThinkingDialog { .. }
-            | Self::LoadMilestones { .. }
-            | Self::LoadTimelineJump { .. }
-            | Self::InvokePluginCommand { .. } => {
-                unreachable!("daemon start failure for non-foreground effect")
+            Self::ListPermissions => TuiEffectResult::PermissionList {
+                result: Err(client_error),
+            },
+            Self::LoadCommandPalette => TuiEffectResult::CommandPaletteLoaded {
+                result: Err(client_error),
+            },
+            Self::LoadSessionPicker { generation, .. } => TuiEffectResult::SessionPickerLoaded {
+                generation,
+                result: Err(client_error),
+                restart: false,
+            },
+            Self::LoadAgentCatalog => TuiEffectResult::AgentCatalogLoaded {
+                agents: Err(client_error.to_string()),
+            },
+            Self::LoadConfig => TuiEffectResult::ConfigLoaded {
+                config: Box::new(Err(client_error.to_string())),
+                theme_selection: Err(client_error.to_string()),
+                streaming_presentation: Err(client_error.to_string()),
+            },
+            Self::PersistThemeSelection { name } => TuiEffectResult::ThemeSelectionPersisted {
+                name: Some(name),
+                result: Err(client_error.to_string()),
+            },
+            Self::ClearThemeSelection => TuiEffectResult::ThemeSelectionPersisted {
+                name: None,
+                result: Err(client_error.to_string()),
+            },
+            Self::PersistStreamingPresentation { policy } => {
+                TuiEffectResult::StreamingPresentationPersisted {
+                    policy: Some(policy),
+                    result: Err(client_error.to_string()),
+                }
             }
+            Self::ClearStreamingPresentation => TuiEffectResult::StreamingPresentationPersisted {
+                policy: None,
+                result: Err(client_error.to_string()),
+            },
+            Self::ReconcileAuthSecurity { .. } => TuiEffectResult::AuthSecurityReconciled {
+                status: Some(client_error.to_string()),
+            },
+            Self::LoadSlashPalette {
+                generation, query, ..
+            } => {
+                let palette = slash_palette::SlashPalette::immediate(
+                    &query,
+                    bcode_config::CompletionConfig::default(),
+                );
+                TuiEffectResult::SlashPaletteLoaded {
+                    generation,
+                    query,
+                    palette,
+                }
+            }
+            Self::ImportSession { .. } => TuiEffectResult::SessionImported {
+                result: Err(client_error),
+            },
+            Self::RenameSession { .. } => TuiEffectResult::SessionRenamed {
+                result: Err(client_error),
+            },
+            Self::DeleteSession { .. } => TuiEffectResult::SessionDeleted {
+                result: Err(client_error),
+            },
+            Self::SearchSessions { .. } => TuiEffectResult::SessionsSearched {
+                result: Err(client_error),
+            },
+            Self::StartBulkMigration { .. } | Self::CancelBulkMigration { .. } => {
+                TuiEffectResult::BulkMigrationUpdated {
+                    result: Err(client_error),
+                }
+            }
+            Self::WaitBulkMigration { .. } => TuiEffectResult::BulkMigrationWaited {
+                result: Err(client_error),
+            },
+            Self::StartSearchIndexing { .. } => TuiEffectResult::SearchIndexingStarted {
+                result: Err(client_error),
+            },
+            Self::CancelSearchIndexing { .. } => TuiEffectResult::SearchIndexingUpdated {
+                result: Err(client_error),
+            },
+            Self::WaitSearchIndexing { .. } => TuiEffectResult::SearchIndexingWaited {
+                result: Err(client_error),
+            },
+            Self::RalphAction { action, .. } => TuiEffectResult::RalphAction {
+                action,
+                result: Err(client_error.into()),
+            },
+            Self::RalphStart { .. } => TuiEffectResult::RalphStarted {
+                result: Err(client_error.into()),
+            },
+            Self::OpenPluginSurface { plugin_id, .. } => TuiEffectResult::PluginSurfaceOpened {
+                plugin_id,
+                result: Err(client_error.into()),
+            },
+            Self::LoadModelProviders => TuiEffectResult::ModelProvidersLoaded {
+                result: Err(client_error),
+            },
+            Self::LoadAuthPoolPicker { session_id } => TuiEffectResult::AuthPoolPickerLoaded {
+                session_id,
+                result: Err(client_error),
+            },
+            Self::SetAuthPoolPreference { session_id, .. } => {
+                TuiEffectResult::AuthPoolPreferenceSet {
+                    session_id,
+                    result: Err(client_error),
+                }
+            }
+            Self::CheckSelectedModel {
+                session_id,
+                provider_plugin_id,
+                generation,
+                ..
+            } => TuiEffectResult::SelectedModelChecked {
+                session_id,
+                provider_plugin_id,
+                generation,
+                models: Err(ClientError::Protocol(client_error.to_string())),
+                result: Err(client_error),
+            },
+            Self::LoadModelPicker { provider_plugin_id } => TuiEffectResult::ModelPickerLoaded {
+                provider_plugin_id,
+                result: Err(client_error),
+            },
+            Self::LoadSkillPicker => TuiEffectResult::SkillPickerLoaded {
+                result: Err(client_error),
+            },
+            Self::DescribeSkill { skill_id } => TuiEffectResult::SkillDescribed {
+                skill_id,
+                result: Err(client_error),
+            },
+            Self::LoadThinkingDialog { focus, .. } => TuiEffectResult::ThinkingDialogLoaded {
+                focus,
+                result: Err(client_error),
+            },
+            Self::LoadMilestones { request } => TuiEffectResult::MilestonesLoaded {
+                request,
+                result: Err(client_error),
+            },
+            Self::LoadTimelineJump {
+                session_id,
+                generation,
+                sequence,
+            } => TuiEffectResult::TimelineJumpLoaded {
+                session_id,
+                generation,
+                sequence,
+                result: Err(client_error.into()),
+            },
+            Self::InvokePluginCommand { plugin_id, .. } => TuiEffectResult::PluginCommandInvoked {
+                plugin_id,
+                result: Err(client_error.into()),
+            },
         }
     }
 
@@ -2019,8 +2335,10 @@ impl TuiEffect {
     pub(super) fn command(
         self,
         schedule: EffectSchedule,
-        foreground_client: &BcodeClient,
-        passive_client: &BcodeClient,
+        foreground_client: Option<&BcodeClient>,
+        passive_client: Option<&BcodeClient>,
+        managed_commands: Option<bcode_client::ManagedSessionCommandHandle>,
+        managed_generation: Option<u64>,
         handle: bmux_tui_runtime::RuntimeHandle<super::root_program::BcodeRuntimeMessage>,
     ) -> bmux_tui_runtime::Command<super::root_program::BcodeRuntimeMessage> {
         let key = self.command_key();
@@ -2028,13 +2346,23 @@ impl TuiEffect {
             return bmux_tui_runtime::Command::cancel(key);
         }
         let client = match self.daemon_intent() {
-            EffectDaemonIntent::Background => passive_client.clone(),
-            EffectDaemonIntent::Foreground => foreground_client.clone(),
+            EffectDaemonIntent::Background => passive_client.cloned(),
+            EffectDaemonIntent::Foreground => foreground_client.cloned(),
         };
         let future = async move {
             let (streaming_sender, mut streaming_receiver) =
                 mpsc::channel(TUI_EFFECT_STREAM_CAPACITY);
-            let effect = Box::pin(self.run(client, streaming_sender));
+            let effect = Box::pin(async move {
+                if let Some(managed) = managed_commands {
+                    Box::pin(self.run_managed(managed, managed_generation)).await
+                } else if let Some(client) = client {
+                    Box::pin(self.run(client, streaming_sender)).await
+                } else {
+                    self.application_access_failed(ClientError::Protocol(
+                        "No application access for this execution mode".into(),
+                    ))
+                }
+            });
             tokio::pin!(effect);
             loop {
                 tokio::select! {
@@ -2153,6 +2481,101 @@ impl TuiEffect {
         session_id: SessionId,
     ) -> TuiEffectResult {
         Box::pin(load_session_status(client, session_id)).await
+    }
+
+    pub(super) async fn run_managed(
+        self,
+        commands: bcode_client::ManagedSessionCommandHandle,
+        generation: Option<u64>,
+    ) -> TuiEffectResult {
+        let session_id = commands.session_id();
+        match commands.binding().await {
+            Ok(binding) if Some(binding.target.generation()) == generation => {}
+            Ok(_) => {
+                return self.application_access_failed(ClientError::Protocol(
+                    "Managed generation changed; reattach explicitly without replay".into(),
+                ));
+            }
+            Err(error) => return self.application_access_failed(error),
+        }
+        match self {
+            Self::SubmitMessage { request } => {
+                Box::pin(managed_submit_message(&commands, *request, generation)).await
+            }
+            Self::CancelTurn { session_id: owner } if owner == session_id => {
+                let result = async {
+                    let expected = generation.ok_or_else(|| {
+                        ClientError::Protocol("Managed generation is missing".into())
+                    })?;
+                    commands
+                        .interrupt(expected, uuid::Uuid::new_v4().to_string())
+                        .await?;
+                    Ok(true)
+                }
+                .await;
+                TuiEffectResult::CancelTurn { session_id, result }
+            }
+            Self::LoadOlderHistory {
+                session_id: owner,
+                cursor,
+                generation,
+                width_columns,
+            } if owner == session_id => {
+                let result = managed_transcript_page(&commands, cursor, width_columns, true).await;
+                TuiEffectResult::OlderHistoryLoaded {
+                    session_id,
+                    cursor,
+                    generation,
+                    result,
+                }
+            }
+            Self::LoadNewerHistory {
+                session_id: owner,
+                cursor,
+                generation,
+                width_columns,
+            } if owner == session_id => {
+                let result = managed_transcript_page(&commands, cursor, width_columns, false).await;
+                TuiEffectResult::NewerHistoryLoaded {
+                    session_id,
+                    cursor,
+                    generation,
+                    result,
+                }
+            }
+            Self::ExecuteSlashCommand {
+                message,
+                session_id: owner,
+                ..
+            } if owner == Some(session_id) => {
+                managed_slash_command(&commands, message, generation).await
+            }
+            Self::SaveDraft {
+                scope: ComposerDraftScope::Session { session_id: owner },
+                text,
+            } if owner == session_id => {
+                let result = commands.set_composer_draft(text.clone()).await;
+                TuiEffectResult::SaveDraft { text, result }
+            }
+            Self::LoadSessionStatus { session_id: owner } if owner == session_id => {
+                let binding = commands.binding().await;
+                TuiEffectResult::SessionStatusLoaded {
+                    daemon_connected: binding.is_ok(),
+                    session_id,
+                    hydration: Box::new(SessionStatusHydration {
+                        model: None,
+                        active_skills: None,
+                        runtime_work: None,
+                        interactions: None,
+                        plugin_status: Vec::new(),
+                        error: binding.err().map(|error| error.to_string()),
+                    }),
+                }
+            }
+            other => other.application_access_failed(ClientError::Protocol(
+                "Operation is unavailable in this managed conversation; no model fallback".into(),
+            )),
+        }
     }
 
     #[allow(clippy::too_many_lines, clippy::large_stack_frames)]
@@ -3702,8 +4125,10 @@ mod projection_paging_tests {
                     Update::none()
                         .with_command(effect.command(
                             EffectSchedule::Cancel,
-                            &client,
-                            &client,
+                            Some(&client),
+                            Some(&client),
+                            None,
+                            None,
                             handle,
                         ))
                         .with_command(Command::concurrent(async move {

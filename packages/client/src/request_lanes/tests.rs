@@ -168,6 +168,33 @@ async fn sequential_requests_reuse_handshake_and_clone_ownership_is_acyclic() {
 }
 
 #[tokio::test]
+async fn releasing_idle_connections_from_clone_preserves_inflight_request() {
+    let server = Server::new(Reply::Pong);
+    server.replies.add_permits(1);
+    server.client.send_request(Request::Ping).await.unwrap();
+    let sibling = server.client.clone();
+    sibling.release_idle_connections();
+    let request = server.client.send_request(Request::Ping);
+    tokio::pin!(request);
+    assert!(
+        tokio::time::timeout(Duration::from_millis(20), &mut request)
+            .await
+            .is_err()
+    );
+    sibling.release_idle_connections();
+    server.replies.add_permits(1);
+    assert!(matches!(request.await, Ok(ResponsePayload::Pong)));
+    assert_eq!(server.handshakes.load(Ordering::SeqCst), 2);
+    sibling.release_idle_connections();
+    server.replies.add_permits(1);
+    assert!(matches!(
+        server.client.send_request(Request::Ping).await,
+        Ok(ResponsePayload::Pong)
+    ));
+    assert_eq!(server.handshakes.load(Ordering::SeqCst), 3);
+}
+
+#[tokio::test]
 async fn simultaneous_requests_are_bounded_and_background_cannot_take_interactive_capacity() {
     let server = Server::new(Reply::Pong);
     let mut requests = tokio::task::JoinSet::new();

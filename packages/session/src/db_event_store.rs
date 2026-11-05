@@ -45,6 +45,10 @@ pub async fn insert_event_payload(
             "created_at_ms",
             seq_to_value(activity_timestamp_ms.unwrap_or_else(|| event_created_at_ms(event))),
         )
+        .value(
+            "managed_tool_key",
+            crate::db_managed_tool::canonical_key(event)?,
+        )
         .value("payload", payload)
         .execute(db)
         .await?;
@@ -144,9 +148,10 @@ pub fn strict_event_from_row(
 pub async fn last_sequence(db: &dyn Database) -> SessionDbResult<Option<u64>> {
     let row = db
         .select("events")
-        .columns(&["event_seq"])
-        .sort("event_seq", SortDirection::Desc)
-        .limit(1)
+        .project_as(
+            switchy::database::query::max(switchy::database::query::identifier("event_seq")),
+            "event_seq",
+        )
         .execute_first(db)
         .await?;
     let value = row

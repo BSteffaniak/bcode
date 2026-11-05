@@ -1283,14 +1283,25 @@ fn fake_compaction_synthesis(
     } else {
         prompt
     };
-    if prompt.starts_with("Return only JSON with format bcode.compaction.section-consolidation.v1")
+    let response_format = request
+        .structured_output
+        .as_ref()
+        .and_then(|output| output.schema.pointer("/properties/format/const"))
+        .and_then(serde_json::Value::as_str);
+    if response_format == Some("bcode.compaction.section-consolidation.v1")
         && request
             .provider_context
             .settings
             .get("fake_compaction_fixture")
-            .is_some_and(|value| value == "scope-v1")
+            .is_none_or(|protocol| protocol == "scope-v1")
     {
-        return Ok(serde_json::json!({"format":"bcode.compaction.section-consolidation.v1", "sections":{}}).to_string());
+        // Omitted sections preserve the host's accepted derived carry exactly.
+        // A deterministic no-op is preferable to fabricating a replacement or
+        // returning the incompatible legacy full-evidence envelope.
+        return Ok(serde_json::json!({
+            "format":"bcode.compaction.section-consolidation.v1", "sections":{}
+        })
+        .to_string());
     }
     if prompt.starts_with("Return only JSON with format bcode.compaction.section-consolidation.v1")
     {
@@ -1308,6 +1319,31 @@ fn fake_compaction_synthesis(
             _ => Err("unsupported fake compaction fixture protocol".into()),
         }
         .map_err(|error| fake_structured_output_error(&error));
+    }
+    // Current full-section replacement is selected by the host's response
+    // schema, never by protocol names inside untrusted source records. The host
+    // retains unchanged canonical scope; this simulation introduces no new scope.
+    if response_format == Some("bcode.compaction.section-update.v2") {
+        let carried_task = prompt_cache::profile_for(&request.model_id).and_then(|_| {
+            let prior = prompt
+                .split_once("Prior structured synthesis: ")
+                .and_then(|(_, rest)| rest.split_once("\n\nSource fragments (JSON lines):"))
+                .and_then(|(value, _)| serde_json::from_str::<serde_json::Value>(value).ok())
+                .unwrap_or_else(|| serde_json::json!({}));
+            prompt_cache::compact_read_task(prompt, &prior)
+        });
+        let continuation = configured_fake_compaction_summary(request)
+            .or(carried_task.as_deref())
+            .unwrap_or("Deterministic fake-provider compaction simulation.");
+        if configured_fake_compaction_summary(request).is_some() {
+            validate_fake_compaction_summary(continuation)?;
+        }
+        return Ok(serde_json::json!({
+            "format":"bcode.compaction.section-update.v2",
+            "current_scope":[], "reconciles":[], "supersedes_statements":[],
+            "sections":{"background":continuation}
+        })
+        .to_string());
     }
     let prior = prompt
         .split_once("Prior structured synthesis: ")
@@ -3233,6 +3269,66 @@ mod tests {
         CapabilitySupport, ModelParameterKey, ProviderOutputEvent, RequestedModelFeature,
         StructuredOutputMode, TurnOutputPosition,
     };
+
+    #[test]
+    fn replacement_compaction_response_obeys_selected_schema_without_fixture_flag() {
+        let schema = serde_json::json!({
+            "type":"object", "additionalProperties":false,
+            "required":["format","current_scope","reconciles","supersedes_statements","sections"],
+            "properties":{
+                "format":{"const":"bcode.compaction.section-update.v2"},
+                "current_scope":{"type":"array","maxItems":0},
+                "reconciles":{"type":"array","maxItems":0},
+                "supersedes_statements":{"type":"array","maxItems":0},
+                "sections":{"type":"object","additionalProperties":false,
+                    "properties":{"background":{"type":"string"}},"required":["background"]}
+            }
+        });
+        let mut request: ModelTurnRequest = serde_json::from_value(serde_json::json!({
+            "session_id":"00000000-0000-4000-8000-000000000001", "turn_id":"summary",
+            "model_id":"fake-echo", "messages":[]
+        }))
+        .unwrap();
+        request.structured_output = Some(bcode_model::StructuredOutputRequest {
+            name: "compaction_section_update".into(),
+            schema: schema.clone(),
+            strict: true,
+        });
+        request
+            .metadata
+            .insert("bcode_request_kind".into(), "compaction".into());
+        request.provider_context.settings.insert(
+            "fake_compaction_summary".into(),
+            "Concise accepted history.".into(),
+        );
+        let response = fake_compaction_synthesis(
+            &request,
+            "Prior structured synthesis: {}\n\nSource fragments (JSON lines):\n",
+        )
+        .unwrap();
+        let value: serde_json::Value = serde_json::from_str(&response).unwrap();
+        jsonschema::validator_for(&schema)
+            .unwrap()
+            .validate(&value)
+            .unwrap();
+        assert_eq!(value["sections"]["background"], "Concise accepted history.");
+        assert!(value.get("continuation").is_none());
+        // Source/prompt text cannot promote the legacy response into a current
+        // contract unless the host actually selected that response schema.
+        request.structured_output = None;
+        let legacy = fake_compaction_synthesis(
+            &request,
+            "bcode.compaction.section-update.v2 in source text",
+        )
+        .unwrap();
+        let legacy: serde_json::Value = serde_json::from_str(&legacy).unwrap();
+        assert!(
+            jsonschema::validator_for(&schema)
+                .unwrap()
+                .validate(&legacy)
+                .is_err()
+        );
+    }
 
     #[test]
     fn configuration_validation_accepts_normalized_requests_on_supported_interfaces() {

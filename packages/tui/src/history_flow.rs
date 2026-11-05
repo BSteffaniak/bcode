@@ -42,7 +42,8 @@ pub enum SessionStreamUpdate {
     },
     /// Bounded queue hydration failed; not an execution outcome.
     QueueUnavailable { session_id: SessionId },
-    /// Event continuity was lost and the stream is reconnecting.
+    /// Event continuity was lost. Ordinary views reconnect; managed views remain fenced
+    /// until an explicit session/instance/generation-bound reattachment.
     ResyncStarted { session_id: SessionId },
     /// Fresh bounded state installed by a replacement attachment.
     Resynchronized {
@@ -328,6 +329,102 @@ pub async fn attach_session_event_stream_with_window_request(
         connection,
     );
     Ok((attached, event_task))
+}
+
+pub async fn forward_managed_session_events(
+    connection: bcode_client::ManagedSessionConnection,
+    sender: mpsc::Sender<SessionStreamUpdate>,
+) {
+    let owner = connection.session_id();
+    let commands = connection.command_handle();
+    let binding = {
+        let binding_request = Box::pin(commands.binding());
+        tokio::pin!(binding_request);
+        if let Ok(binding) = tokio::select! {
+            result = &mut binding_request => result,
+            () = sender.closed() => return,
+        } {
+            binding
+        } else {
+            let _ = sender
+                .send(SessionStreamUpdate::ResyncStarted { session_id: owner })
+                .await;
+            return;
+        }
+    };
+    let receive = Box::pin(receive_managed_session_events(connection, sender.clone()));
+    let poll = Box::pin(drive_managed_native_observations(
+        commands.clone(),
+        binding.instance.instance_id,
+        binding.target.generation(),
+    ));
+    tokio::pin!(receive, poll);
+    tokio::select! {
+        () = &mut receive => {},
+        () = sender.closed() => {},
+        _ = &mut poll => {
+            let _ = sender.send(SessionStreamUpdate::ResyncStarted { session_id: owner }).await;
+        }
+    }
+    // Both futures are attachment-owned. Dropping this task cancels them together; no detached
+    // observer survives reentry, a cancelled receive, closed UI, or canonical resync.
+}
+
+async fn drive_managed_native_observations(
+    commands: bcode_client::ManagedSessionCommandHandle,
+    instance_id: String,
+    generation: u64,
+) -> Result<(), bcode_client::ClientError> {
+    loop {
+        Box::pin(commands.poll_native_observations(&instance_id, generation)).await?;
+        // Empty pages advance only host-owned state and never imply settlement or end draining.
+        tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+    }
+}
+
+async fn receive_managed_session_events(
+    mut connection: bcode_client::ManagedSessionConnection,
+    sender: mpsc::Sender<SessionStreamUpdate>,
+) {
+    let session_id = connection.session_id();
+    let mut pending = BTreeMap::new();
+    let timer = tokio::time::sleep(SUPERSEDED_PROGRESS_FLUSH_INTERVAL);
+    tokio::pin!(timer);
+    loop {
+        let Some(received) = receive_with_progress_flush(
+            connection.recv_event_without_reconnect(),
+            &sender,
+            &mut pending,
+            timer.as_mut(),
+        )
+        .await
+        else {
+            return;
+        };
+        match received {
+            Ok(BcodeEvent::SessionViewResyncRequired { .. }) | Err(_) => {
+                if flush_superseded_progress(&sender, &mut pending).await {
+                    let _ = sender
+                        .send(SessionStreamUpdate::ResyncStarted { session_id })
+                        .await;
+                }
+                // Managed continuity is not a durable resume contract. Stop this receiver;
+                // the explicit managed TUI route installs a bounded replacement snapshot.
+                // Never replay input, Start, or recreate a native process on transport loss.
+                return;
+            }
+            Ok(event) => {
+                let Some(reset) = forward_stream_event(&sender, &mut pending, event).await else {
+                    return;
+                };
+                if reset {
+                    timer
+                        .as_mut()
+                        .reset(tokio::time::Instant::now() + SUPERSEDED_PROGRESS_FLUSH_INTERVAL);
+                }
+            }
+        }
+    }
 }
 
 async fn attach_projection_window(

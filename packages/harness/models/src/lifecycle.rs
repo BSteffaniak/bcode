@@ -547,6 +547,10 @@ pub enum HarnessTerminalDisposition {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum HarnessObservationKind {
+    /// Independent foreground, background, continuation, and tracking-coverage evidence.
+    Execution {
+        event: crate::HarnessExecutionEvent,
+    },
     /// Native acceptance evidence for the exact retained submission and attempt.
     ///
     /// Session and generation are inherited from the enclosing observation. Native
@@ -647,6 +651,7 @@ impl HarnessObservation {
             id(correlation)?;
         }
         match &self.kind {
+            HarnessObservationKind::Execution { event } => event.validate(),
             HarnessObservationKind::SubmissionAccepted {
                 submission_id,
                 attempt_id,

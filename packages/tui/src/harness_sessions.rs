@@ -93,12 +93,149 @@ mod tests {
     }
 
     #[test]
+    fn terminal_reply_keeps_background_and_late_continuation_visible_without_controls() {
+        use bcode_harness_models::{
+            HarnessAttemptIdentity, HarnessCompleteness, HarnessExecutionEvent,
+            HarnessNotificationState, HarnessObservation, HarnessObservationKind,
+            HarnessTerminalDisposition, HarnessWorkKind, HarnessWorkState,
+        };
+        use bcode_session_models::{
+            CURRENT_SESSION_EVENT_SCHEMA_VERSION, SessionEvent, SessionEventKind, SessionId,
+        };
+        let session_id = SessionId::new();
+        let origin = HarnessAttemptIdentity {
+            submission_id: "submit".into(),
+            attempt_id: "attempt".into(),
+        };
+        let mut app = crate::app::BmuxApp::new_with_history(Some(session_id), &[], &[], false);
+        let terminal = HarnessExecutionEvent::SubmissionTerminal {
+            attempt: origin.clone(),
+            native_turn_id: None,
+            native_frame_id: Some("result".into()),
+            disposition: HarnessTerminalDisposition::Completed,
+            output: None,
+        };
+        let work = |id: &str| HarnessExecutionEvent::BackgroundWork {
+            work_id: id.into(),
+            native_task_id: None,
+            origin: Some(origin.clone()),
+            parent_work_id: None,
+            work_kind: HarnessWorkKind::Subagent,
+            label: "界 task".into(),
+            state: HarnessWorkState::Running,
+            notification: HarnessNotificationState::Pending,
+        };
+        let events = [
+            terminal,
+            work("one"),
+            work("two"),
+            HarnessExecutionEvent::Continuation {
+                continuation_id: "later".into(),
+                origin: Some(origin.clone()),
+                source_work_id: Some("one".into()),
+                native_turn_id: None,
+                state: HarnessWorkState::Pending,
+                output: None,
+            },
+        ];
+        for (index, execution) in events.into_iter().enumerate() {
+            let sequence = u64::try_from(index).unwrap() + 1;
+            app.absorb_session_event(&SessionEvent {
+                schema_version: CURRENT_SESSION_EVENT_SCHEMA_VERSION,
+                session_id,
+                sequence,
+                timestamp_ms: sequence,
+                provenance: None,
+                kind: SessionEventKind::ExternalObservationRecorded {
+                    version: 1,
+                    observation: Box::new(HarnessObservation {
+                        observation_id: format!("execution-{index}"),
+                        session_id: session_id.to_string(),
+                        generation: 3,
+                        native_correlations: vec![],
+                        completeness: HarnessCompleteness::Complete,
+                        kind: HarnessObservationKind::Execution { event: execution },
+                    }),
+                },
+            });
+        }
+        assert!(
+            app.session_view_snapshot()
+                .execution_lifecycle
+                .summary()
+                .contains("Reply complete + 2 background")
+        );
+        assert!(
+            app.transcript()
+                .iter()
+                .any(|item| item.text().contains("1 continuation pending"))
+        );
+        app.absorb_session_event(&coverage_loss_event(session_id));
+        assert!(
+            app.session_view_snapshot()
+                .execution_lifecycle
+                .summary()
+                .contains("coverage unknown")
+        );
+        assert!(
+            app.session_view_snapshot()
+                .execution_lifecycle
+                .summary()
+                .contains("Reply complete")
+        );
+        assert!(app.session_view_snapshot().tools.is_empty());
+        assert_eq!(
+            app.session_view_snapshot().permissions,
+            [] as [bcode_session_view_models::PermissionView; 0]
+        );
+        assert!(
+            app.session_view_snapshot().execution_lifecycle.submissions[0]
+                .native_id
+                .is_none()
+        );
+        drop(app);
+    }
+
+    fn coverage_loss_event(
+        session_id: bcode_session_models::SessionId,
+    ) -> bcode_session_models::SessionEvent {
+        use bcode_harness_models::{
+            HarnessCompleteness, HarnessObservation, HarnessObservationKind,
+        };
+        use bcode_session_models::{
+            CURRENT_SESSION_EVENT_SCHEMA_VERSION, SessionEvent, SessionEventKind,
+        };
+        SessionEvent {
+            schema_version: CURRENT_SESSION_EVENT_SCHEMA_VERSION,
+            session_id,
+            sequence: 5,
+            timestamp_ms: 5,
+            provenance: None,
+            kind: SessionEventKind::ExternalObservationRecorded {
+                version: 1,
+                observation: Box::new(HarnessObservation {
+                    observation_id: "gap".into(),
+                    session_id: session_id.to_string(),
+                    generation: 3,
+                    native_correlations: vec![],
+                    completeness: HarnessCompleteness::Gap,
+                    kind: HarnessObservationKind::Text {
+                        text: "coverage lost".into(),
+                    },
+                }),
+            },
+        }
+    }
+
+    #[test]
     fn painting_external_history_is_bounded_and_installs_no_tool_hits() {
         use bcode_session_view_models::external::{
             ExternalActivityView, ExternalProvenanceView, ExternalSessionMetadataView,
         };
         use bmux_tui::{buffer::Buffer, frame::Frame, geometry::Rect};
         let view = ExternalSessionView {
+            execution_lifecycle:
+                bcode_session_view_models::execution::ExecutionLifecycleView::default(),
             provenance: ExternalProvenanceView {
                 session_id: "session".into(),
                 instance_id: "界".into(),

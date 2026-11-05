@@ -7,6 +7,73 @@ use bcode_provider_auth_models::{
     RenameAccountRequest, SetAccountPauseRequest, SetAccountRoutingRequest,
 };
 
+use std::{
+    collections::BTreeMap,
+    path::{Path, PathBuf},
+    sync::{Arc, Mutex, OnceLock, Weak},
+};
+
+type WriterKey = (PathBuf, String);
+type WriterQueues = BTreeMap<WriterKey, Weak<tokio::sync::Mutex<()>>>;
+
+async fn writer_root(root: &Path) -> Result<PathBuf, String> {
+    let mut existing =
+        std::path::absolute(root).map_err(|_| "account routing state root unavailable")?;
+    let mut missing = Vec::new();
+    loop {
+        match tokio::fs::canonicalize(&existing).await {
+            Ok(mut canonical) => {
+                for component in missing.into_iter().rev() {
+                    canonical.push(component);
+                }
+                return Ok(canonical);
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                // update() creates absent routing directories. Resolve their existing
+                // ancestor without creating anything before the mutation boundary.
+                missing.push(
+                    existing
+                        .file_name()
+                        .ok_or("account routing state root unavailable")?
+                        .to_os_string(),
+                );
+                if !existing.pop() {
+                    return Err("account routing state root unavailable".into());
+                }
+            }
+            Err(_) => return Err("account routing state root unavailable".into()),
+        }
+    }
+}
+
+// Coordinate local callers only. The durable account-settings lock still rejects
+// foreign writers; this queue neither retries mutations nor grants authorization.
+async fn routing_writer(
+    root: &Path,
+    key: &str,
+) -> Result<tokio::sync::OwnedMutexGuard<()>, String> {
+    let root = writer_root(root).await?;
+    Ok(writer_queue(root, key).lock_owned().await)
+}
+
+fn writer_queue(root: PathBuf, key: &str) -> Arc<tokio::sync::Mutex<()>> {
+    static QUEUES: OnceLock<Mutex<WriterQueues>> = OnceLock::new();
+    let mut queues = QUEUES
+        .get_or_init(Mutex::default)
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    queues.retain(|_, queue| queue.strong_count() > 0);
+    let identity = (root, key.to_owned());
+    queues
+        .get(&identity)
+        .and_then(Weak::upgrade)
+        .unwrap_or_else(|| {
+            let queue = Arc::new(tokio::sync::Mutex::new(()));
+            queues.insert(identity, Arc::downgrade(&queue));
+            queue
+        })
+}
+
 fn now() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -122,7 +189,18 @@ pub async fn set_route(
     session: SessionId,
     request: SetAccountRoutingRequest,
 ) -> Result<AccountRouting, String> {
+    // Bound application callers while keeping validation, persistence, and the
+    // canonical response read in the same task and in their original order.
+    Box::pin(set_route_inner(state, session, request)).await
+}
+
+async fn set_route_inner(
+    state: &ServerState,
+    session: SessionId,
+    request: SetAccountRoutingRequest,
+) -> Result<AccountRouting, String> {
     let context = context(state, session).await?;
+    let writer = routing_writer(&state.state_root, &context.key).await?;
     let settings = account_settings::load(&state.state_root, &context.key)
         .map_err(|_| "account settings unavailable")?;
     let visible = bcode_provider_auth::account_routing::accounts(
@@ -169,6 +247,7 @@ pub async fn set_route(
         Ok(())
     })
     .map_err(|_| "could not persist account routing")?;
+    drop(writer);
     read(state, session).await
 }
 
@@ -184,7 +263,20 @@ async fn metadata(
     label: LabelChange,
     pause: Option<AccountPauseState>,
 ) -> Result<AccountRouting, String> {
+    // Pause and rename share this persistence boundary; do not duplicate boxes
+    // in each application adapter or change account/configuration resolution.
+    Box::pin(metadata_inner(state, session, account, label, pause)).await
+}
+
+async fn metadata_inner(
+    state: &ServerState,
+    session: SessionId,
+    account: AccountId,
+    label: LabelChange,
+    pause: Option<AccountPauseState>,
+) -> Result<AccountRouting, String> {
     let context = context(state, session).await?;
+    let writer = routing_writer(&state.state_root, &context.key).await?;
     let settings = account_settings::load(&state.state_root, &context.key)
         .map_err(|_| "account settings unavailable")?;
     let visible = bcode_provider_auth::account_routing::accounts(
@@ -219,6 +311,7 @@ async fn metadata(
         Ok(())
     })
     .map_err(|_| "could not persist account metadata")?;
+    drop(writer);
     read(state, session).await
 }
 
@@ -278,6 +371,7 @@ pub async fn freeze(
     if selection.provider_context.account_routing_frozen {
         return Ok(());
     }
+    let writer = routing_writer(&state.state_root, &context.key).await?;
     let root = state.state_root.clone();
     let (context, settings, route) = tokio::task::spawn_blocking(move || {
         account_settings::update_waiting(&root, &context.key, |settings| {
@@ -298,6 +392,7 @@ pub async fn freeze(
     .await
     .map_err(|_| "session routing worker failed")?
     .map_err(|_| "could not freeze session routing")?;
+    drop(writer);
     bcode_provider_auth::account_routing::freeze(
         &context.config,
         &context.registry,
@@ -332,6 +427,9 @@ pub async fn record_usage(
     let account = AccountId {
         provider_id: provider.clone(),
         profile: profile.clone(),
+    };
+    let Ok(_writer) = routing_writer(&state.state_root, &context.key).await else {
+        return;
     };
     let Ok(settings) = account_settings::load(&state.state_root, &context.key) else {
         return;
@@ -371,6 +469,7 @@ pub async fn record_usage(
 /// Capture inherited routing at creation without materializing credentials.
 pub async fn initialize(state: &ServerState, session: SessionId) -> Result<(), String> {
     let context = context(state, session).await?;
+    let _writer = routing_writer(&state.state_root, &context.key).await?;
     account_settings::update(&state.state_root, &context.key, |settings| {
         let inherited = context
             .preset
@@ -386,6 +485,10 @@ pub async fn initialize(state: &ServerState, session: SessionId) -> Result<(), S
     })
     .map_err(|_| "could not initialize account routing".into())
 }
+
+#[cfg(test)]
+#[path = "account_routing/writer_tests.rs"]
+mod writer_tests;
 
 #[cfg(test)]
 mod tests {

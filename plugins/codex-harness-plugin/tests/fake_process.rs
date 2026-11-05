@@ -735,6 +735,15 @@ fn lost_interrupt_ack_remains_uncertain_without_successful_settlement() {
     assert_eq!(completeness, HarnessCompleteness::Gap);
     assert!(events.is_empty());
     assert_ne!(session.status().activity, HarnessActivity::Interrupted);
+    assert_eq!(session.status().completeness, HarnessCompleteness::Gap);
+    // Already-queued execution coverage must not mask the sticky transport gap on
+    // subsequent pages, nor can polling replay cancellation or invent settlement.
+    for _ in 0..3 {
+        let (events, completeness) = session.observe(1).unwrap();
+        assert!(events.is_empty());
+        assert_eq!(completeness, HarnessCompleteness::Gap);
+        assert_eq!(session.status().completeness, HarnessCompleteness::Gap);
+    }
     assert_eq!(session.interrupt_active(7), Err(CodexError::Uncertain));
     assert_eq!(
         calls(&temp)
@@ -1147,6 +1156,159 @@ fn login_cancel_distinguishes_not_found_and_does_not_replay() {
             1
         );
     }
+}
+
+fn execution_events(
+    session: &mut CodexSession,
+) -> Vec<bcode_harness_models::HarnessExecutionEvent> {
+    let deadline = Instant::now() + Duration::from_millis(500);
+    let mut events = Vec::new();
+    while Instant::now() < deadline {
+        let (page, _) = session.observe(1).unwrap();
+        assert!(page.len() <= 1);
+        for observation in page {
+            observation.validate().unwrap();
+            assert_eq!(observation.session_id, "bcode-session");
+            assert_eq!(observation.generation, 7);
+            if let HarnessObservationKind::Execution { event } = observation.kind {
+                events.push(event);
+            }
+        }
+        std::thread::sleep(Duration::from_millis(2));
+    }
+    events
+}
+
+#[test]
+fn execution_foreground_survives_background_and_empty_inventory() {
+    use bcode_harness_models::{
+        HarnessExecutionEvent as E, HarnessTrackingCoverage, HarnessWorkState,
+    };
+    let (temp, launch) = fixture();
+    let mut session = CodexSession::open(&launch, binding(), false).unwrap();
+    let input = submission("lifecycle-background");
+    session.submit(&input).unwrap();
+    let events = execution_events(&mut session);
+    let terminal = events.iter().position(|event| matches!(event, E::SubmissionTerminal {
+        attempt, native_turn_id: Some(turn), disposition: HarnessTerminalDisposition::Completed,
+        output: Some(output), ..
+    } if attempt.attempt_id == input.attempt_id && turn == "turn-1" && output == "foreground complete")).unwrap();
+    let completed = events
+        .iter()
+        .position(|event| {
+            matches!(event, E::BackgroundWork {
+        native_task_id: Some(id), state: HarnessWorkState::Completed, ..
+    } if id == "42")
+        })
+        .unwrap();
+    assert!(terminal < completed);
+    assert!(
+        events
+            .iter()
+            .any(|event| matches!(event, E::BackgroundWork {
+        native_task_id: Some(id), state: HarnessWorkState::Running, ..
+    } if id == "persistent-tool"))
+    );
+    assert!(
+        !events
+            .iter()
+            .any(|event| matches!(event, E::BackgroundWork {
+        native_task_id: Some(id), state: HarnessWorkState::Completed, ..
+    } if id == "persistent-tool"))
+    );
+    assert!(events.iter().any(|event| matches!(event, E::BackgroundWork {
+        native_task_id: Some(id), notification: bcode_harness_models::HarnessNotificationState::Pending, ..
+    } if id == "42")));
+    assert!(!events.iter().any(|event| matches!(
+        event,
+        E::Coverage {
+            background: HarnessTrackingCoverage::Complete,
+            ..
+        }
+    )));
+    assert!(
+        calls(&temp)
+            .iter()
+            .any(|call| call["method"] == "thread/backgroundTerminals/list")
+    );
+    assert!(matches!(
+        session.submit(&HarnessSubmission {
+            placement: HarnessPlacement::NextTurn,
+            ..submission("not-delivered")
+        }),
+        Err(CodexError::Unsupported)
+    ));
+}
+
+#[test]
+fn execution_notification_race_keeps_terminal_and_links_root_continuation() {
+    use bcode_harness_models::{HarnessExecutionEvent as E, HarnessWorkState};
+    let (_temp, launch) = fixture();
+    let mut session = CodexSession::open(&launch, binding(), false).unwrap();
+    let input = submission("lifecycle-race");
+    session.submit(&input).unwrap();
+    let events = execution_events(&mut session);
+    assert_eq!(
+        events
+            .iter()
+            .filter(|event| matches!(event, E::SubmissionTerminal { .. }))
+            .count(),
+        1
+    );
+    let followups = events
+        .iter()
+        .filter_map(|event| match event {
+            E::Continuation {
+                continuation_id,
+                origin: Some(origin),
+                native_turn_id: Some(turn),
+                state,
+                output,
+                ..
+            } if turn == "automatic-turn" => {
+                assert_eq!(origin.attempt_id, input.attempt_id);
+                assert_ne!(continuation_id, turn);
+                Some((continuation_id, *state, output))
+            }
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(followups.len(), 2);
+    assert_eq!(followups[0].0, followups[1].0);
+    assert_eq!(followups[0].1, HarnessWorkState::Running);
+    assert_eq!(followups[1].1, HarnessWorkState::Completed);
+    assert_eq!(followups[1].2.as_deref(), Some("followup complete"));
+    let command = events
+        .iter()
+        .filter_map(|event| match event {
+            E::BackgroundWork {
+                native_task_id: Some(id),
+                state,
+                ..
+            } if id == "42" => Some(*state),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        command,
+        vec![HarnessWorkState::Running, HarnessWorkState::Completed]
+    );
+}
+
+#[test]
+fn execution_foreign_completion_cannot_terminalize_owned_work() {
+    use bcode_harness_models::{HarnessExecutionEvent as E, HarnessWorkState};
+    let (_temp, launch) = fixture();
+    let mut session = CodexSession::open(&launch, binding(), false).unwrap();
+    session.submit(&submission("lifecycle-foreign")).unwrap();
+    let events = execution_events(&mut session);
+    assert!(
+        !events
+            .iter()
+            .any(|event| matches!(event, E::BackgroundWork {
+        native_task_id: Some(id), state: HarnessWorkState::Completed, ..
+    } if id == "42"))
+    );
 }
 
 #[test]

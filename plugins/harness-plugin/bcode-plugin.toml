@@ -16,6 +16,12 @@ invocation_operations = ["invoke"]
 name                  = "Managed External Session Commands"
 
 [[services]]
+class                 = "service"
+interface_id          = "bcode.harness.configuration/v1"
+invocation_operations = ["catalog", "prepare"]
+name                  = "Configured Managed Harness Instances"
+
+[[services]]
 class        = "service"
 interface_id = "bcode.workflow-block/v1"
 name         = "Managed Session Workflow Operations"
@@ -157,7 +163,7 @@ explicit_grant_required = true
 
 [[services.workflow_blocks]]
 block_id               = "harness.execute"
-block_version          = 1
+block_version          = 2
 cancellation_supported = true
 effect                 = "mutating"
 operation              = "harness.execute"
@@ -168,7 +174,10 @@ timeout_ms             = 30000
 [services.workflow_blocks.input]
 schema = { type = "object", additionalProperties = false, required = [
     "request_json",
-], properties = { request_json = { type = "string", maxLength = 65536 } } }
+], properties = { request_json = { type = "string", maxLength = 65536 }, completion_requirement = { type = "string", enum = [
+    "foreground",
+    "associated_work",
+] } } }
 type_name = "bcode.harness.managed-operation/v1"
 [services.workflow_blocks.output]
 schema = { type = "object", additionalProperties = false, required = [
@@ -176,8 +185,17 @@ schema = { type = "object", additionalProperties = false, required = [
     "submission_id",
     "native_turn_id",
     "result",
-], properties = { session_id = { type = "string" }, submission_id = { type = "string" }, native_turn_id = { type = "string" }, result = { type = "string", maxLength = 65536 } } }
-type_name = "bcode.harness.assignment-result/v1"
+], properties = { session_id = { type = "string" }, submission_id = { type = "string" }, native_turn_id = { type = [
+    "string",
+    "null",
+] }, result = { type = "string", maxLength = 65536 }, execution_handle = { type = "object", additionalProperties = false, required = [
+    "session_id",
+    "generation",
+    "submission_id",
+    "attempt_id",
+    "dispatch_identity",
+], properties = { session_id = { type = "string" }, generation = { type = "integer", minimum = 1 }, submission_id = { type = "string" }, attempt_id = { type = "string" }, dispatch_identity = { type = "string" } } } } }
+type_name = "bcode.harness.assignment-result/v2"
 [services.workflow_blocks.authorization]
 capability              = "mutating"
 explicit_grant_required = true

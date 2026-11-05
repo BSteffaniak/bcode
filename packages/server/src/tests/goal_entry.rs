@@ -9,6 +9,99 @@ mod isolated_recovery;
 // copies of the same expensive fixture; waiting for admission is not execution.
 static GOAL_ENTRY_EXECUTION: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
+async fn goal_entry_fixture() -> tokio::sync::MutexGuard<'static, ()> {
+    let thread = std::thread::current();
+    let fixture = thread.name().unwrap_or("unnamed");
+    eprintln!("goal-entry checkpoint fixture={fixture} mutex=waiting");
+    let guard = GOAL_ENTRY_EXECUTION.lock().await;
+    eprintln!("goal-entry checkpoint fixture={fixture} mutex=acquired");
+    guard
+}
+
+// Observe only bounded status/identity facts, never prompts, arguments, outputs or errors.
+// Deduplication and a per-fixture cap keep polling diagnostics bounded even on a stall.
+#[derive(Default)]
+struct GoalEntryDiagnostics {
+    last: String,
+    emitted: usize,
+}
+
+impl GoalEntryDiagnostics {
+    async fn observe(&mut self, state: &ServerState, session: SessionId, run_id: &str) {
+        if self.emitted >= 64 {
+            return;
+        }
+        let permissions = interaction_operations::list_permissions(state).await;
+        let routes = permissions
+            .iter()
+            .take(32)
+            .map(|permission| {
+                (
+                    &permission.permission_id,
+                    permission.session_id,
+                    permission
+                        .interaction_route
+                        .as_ref()
+                        .map(|route| (route.version, route.destination_session_id)),
+                    permission.is_addressed_to(session),
+                )
+            })
+            .collect::<Vec<_>>();
+        let (attempts, outputs, waits, terminal) = {
+            let store = state.workflow_store.lock().unwrap();
+            (
+                store.attempt_history(run_id, None, 100).unwrap(),
+                store.validated_outputs(run_id, 100).unwrap(),
+                store.waiting_activations(run_id, 32).unwrap(),
+                store.canonical_terminal_output(run_id).unwrap().is_some(),
+            )
+        };
+        let attempts = attempts
+            .iter()
+            .map(|attempt| {
+                (
+                    &attempt.node_id,
+                    attempt.attempt,
+                    &attempt.status,
+                    attempt.has_receipt,
+                    attempt.terminal_at_ms.is_some(),
+                )
+            })
+            .collect::<Vec<_>>();
+        let outputs = outputs
+            .iter()
+            .map(|output| {
+                (
+                    &output.node_id,
+                    output
+                        .value
+                        .get("condition_met")
+                        .and_then(serde_json::Value::as_bool),
+                )
+            })
+            .collect::<Vec<_>>();
+        let waits = waits
+            .iter()
+            .map(|wait| (&wait.node_id, &wait.activation_id, &wait.kind))
+            .collect::<Vec<_>>();
+        let facts = format!(
+            "pending_count={} routes={routes:?} attempts(node,attempt,status,receipt,terminal)={attempts:?} outputs(node,condition_met)={outputs:?} waits={waits:?} terminal={terminal}",
+            permissions.len(),
+        );
+        if facts != self.last {
+            self.emitted += 1;
+            eprintln!(
+                "goal-entry checkpoint session={session} run={run_id} sample={} {facts}",
+                self.emitted,
+            );
+            self.last = facts;
+            if self.emitted == 64 {
+                eprintln!("goal-entry checkpoint session={session} diagnostic_cap=64");
+            }
+        }
+    }
+}
+
 struct GoalEntryHost {
     session: SessionId,
     state: Arc<ServerState>,
@@ -68,7 +161,7 @@ impl PluginTuiHost for GoalEntryHost {
     ) -> PluginWorkflowDelegationPreflightFuture {
         let state = Arc::clone(&self.state);
         Box::pin(async move {
-            let directory = tempfile::tempdir()
+            let directory = test_socket_dir()
                 .map_err(|error| PluginTuiHostError::Internal(error.to_string()))?;
             let endpoint =
                 bcode_ipc::IpcEndpoint::unix_socket(directory.path().join("preflight.sock"));
@@ -129,6 +222,7 @@ impl PluginTuiHost for GoalEntryHost {
         self.starts.lock().unwrap().push(request.clone());
         let state = Arc::clone(&self.state);
         Box::pin(async move {
+            eprintln!("goal-entry checkpoint workflow_start=pending");
             let started = bcode_workflow::WorkflowRunApplication::start_workflow(
                 &workflow_operations::WorkflowAuthoringApplication::new(&state, ClientId::new()),
                 bcode_workflow::WorkflowStartRequest {
@@ -156,8 +250,12 @@ impl PluginTuiHost for GoalEntryHost {
                     },
                 },
             )
-            .await
-            .expect("goal host application launch");
+            .await;
+            eprintln!(
+                "goal-entry checkpoint workflow_start_ok={}",
+                started.is_ok()
+            );
+            let started = started.expect("goal host application launch");
             Ok(PluginWorkflowStartResponse {
                 run_id: started.run.run_id,
                 runtime_work_id: started.runtime_work_id.to_string(),
@@ -328,6 +426,7 @@ async fn goal_entry_request_with_workspace(
     execution_cap: Option<u64>,
     isolated_workspace: Option<PathBuf>,
 ) -> PluginWorkflowStartRequest {
+    eprintln!("goal-entry checkpoint session={session} goal_entry_request=pending");
     let registry = bcode_bundled_plugins::tui_registry("bcode.loop").unwrap();
     let mut surface = registry
         .open(
@@ -373,11 +472,12 @@ async fn goal_entry_request_with_workspace(
         }
         surface.poll(&host);
     }
-    host.starts
-        .lock()
-        .unwrap()
-        .pop()
-        .expect("goal surface started a workflow")
+    let request = host.starts.lock().unwrap().pop();
+    eprintln!(
+        "goal-entry checkpoint session={session} goal_entry_request_returned={}",
+        request.is_some(),
+    );
+    request.expect("goal surface started a workflow")
 }
 
 fn configure_goal_execution(server: &mut ServerState, root: &Path) {
@@ -708,7 +808,8 @@ async fn approve_goal_permissions(state: &ServerState, session: SessionId) {
 
 #[tokio::test]
 async fn real_goal_entry_denied_delegation_prevents_worker_effects() {
-    let _execution = GOAL_ENTRY_EXECUTION.lock().await;
+    let _execution = goal_entry_fixture().await;
+    let mut diagnostics = GoalEntryDiagnostics::default();
     let root = tempfile::tempdir().unwrap();
     let sessions = publication_fixture_sessions(root.path(), true);
     let session = sessions
@@ -728,6 +829,7 @@ async fn real_goal_entry_denied_delegation_prevents_worker_effects() {
     Box::pin(async {
         let mut progress = crate::workflow_test_support::Progress::subscribe(&state);
         loop {
+            diagnostics.observe(&state, session.id, run_id).await;
             for permission in interaction_operations::list_permissions(&state).await {
                 assert!(permission.is_addressed_to(session.id));
                 assert!(
@@ -784,7 +886,8 @@ async fn real_goal_entry_denied_delegation_prevents_worker_effects() {
 
 #[tokio::test]
 async fn real_goal_entry_approval_resumes_correction_without_false_completion() {
-    let _execution = GOAL_ENTRY_EXECUTION.lock().await;
+    let _execution = goal_entry_fixture().await;
+    let mut diagnostics = GoalEntryDiagnostics::default();
     let root = tempfile::tempdir().unwrap();
     let sessions = publication_fixture_sessions(root.path(), true);
     let session = sessions
@@ -803,6 +906,7 @@ async fn real_goal_entry_approval_resumes_correction_without_false_completion() 
     let wait = Box::pin(async {
         let mut progress = crate::workflow_test_support::Progress::subscribe(&state);
         loop {
+            diagnostics.observe(&state, session.id, run_id).await;
             for permission in interaction_operations::list_permissions(&state).await {
                 assert!(permission.is_addressed_to(session.id));
                 assert!(
@@ -840,6 +944,7 @@ async fn real_goal_entry_approval_resumes_correction_without_false_completion() 
     Box::pin(async {
         let mut progress = crate::workflow_test_support::Progress::subscribe(&state);
         loop {
+            diagnostics.observe(&state, session.id, run_id).await;
             approve_goal_permissions(&state, session.id).await;
             if resumed_goal_reached_completion(&state, run_id, root.path(), &request.input) {
                 break;
@@ -854,7 +959,8 @@ async fn real_goal_entry_approval_resumes_correction_without_false_completion() 
 
 #[tokio::test]
 async fn real_goal_entry_denied_verification_does_not_delegate_correction() {
-    let _execution = GOAL_ENTRY_EXECUTION.lock().await;
+    let _execution = goal_entry_fixture().await;
+    let mut diagnostics = GoalEntryDiagnostics::default();
     let root = tempfile::tempdir().unwrap();
     let sessions = publication_fixture_sessions(root.path(), true);
     let session = sessions
@@ -873,6 +979,7 @@ async fn real_goal_entry_denied_verification_does_not_delegate_correction() {
     Box::pin(async {
         let mut progress = crate::workflow_test_support::Progress::subscribe(&state);
         loop {
+            diagnostics.observe(&state, session.id, run_id).await;
             for permission in interaction_operations::list_permissions(&state).await {
                 assert!(permission.is_addressed_to(session.id));
                 let allow = permission.tool_name != "shell.run";
@@ -1218,8 +1325,9 @@ async fn assert_goal_config_mismatch_rejected(
 
 #[tokio::test]
 async fn exhausted_goal_resumes_after_idempotent_ipc_allowance_grant() {
-    let _execution = GOAL_ENTRY_EXECUTION.lock().await;
-    let root = tempfile::tempdir().unwrap();
+    let _execution = goal_entry_fixture().await;
+    let mut diagnostics = GoalEntryDiagnostics::default();
+    let root = test_socket_dir().unwrap();
     let sessions = publication_fixture_sessions(root.path(), true);
     let session = sessions
         .create_session(None, root.path().into())
@@ -1240,6 +1348,7 @@ async fn exhausted_goal_resumes_after_idempotent_ipc_allowance_grant() {
     let observation = Box::pin(async {
         let mut progress = crate::workflow_test_support::Progress::subscribe(&state);
         loop {
+            diagnostics.observe(&state, session.id, &run_id).await;
             approve_goal_permissions(&state, session.id).await;
             let inspection = client
                 .inspect_workflow_run(run_id.clone(), 10)
@@ -1284,6 +1393,7 @@ async fn exhausted_goal_resumes_after_idempotent_ipc_allowance_grant() {
     Box::pin(async {
         let mut progress = crate::workflow_test_support::Progress::subscribe(&state);
         loop {
+            diagnostics.observe(&state, session.id, &run_id).await;
             approve_goal_permissions(&state, session.id).await;
             if resumed_goal_reached_completion(&state, &run_id, root.path(), &request.input) {
                 break;
@@ -1315,7 +1425,8 @@ async fn goal_stale_verification_marker_does_not_prove_delivery() {
 }
 
 async fn assert_goal_integration_conflict(stale_marker: bool) {
-    let _execution = GOAL_ENTRY_EXECUTION.lock().await;
+    let _execution = goal_entry_fixture().await;
+    let mut diagnostics = GoalEntryDiagnostics::default();
     let root = tempfile::tempdir().unwrap();
     let sessions = publication_fixture_sessions(root.path(), true);
     let session = sessions
@@ -1338,6 +1449,7 @@ async fn assert_goal_integration_conflict(stale_marker: bool) {
     Box::pin(async {
         let mut progress = crate::workflow_test_support::Progress::subscribe(&state);
         loop {
+            diagnostics.observe(&state, session.id, &run_id).await;
             approve_goal_permissions(&state, session.id).await;
             let outputs = state
                 .workflow_store
@@ -1388,7 +1500,8 @@ async fn assert_goal_integration_conflict(stale_marker: bool) {
 
 #[tokio::test]
 async fn real_goal_entry_publishes_and_executes_two_workers() {
-    let _execution = GOAL_ENTRY_EXECUTION.lock().await;
+    let _execution = goal_entry_fixture().await;
+    let mut diagnostics = GoalEntryDiagnostics::default();
     let root = tempfile::tempdir().unwrap();
     let sessions = publication_fixture_sessions(root.path(), true);
     let session = sessions
@@ -1410,6 +1523,7 @@ async fn real_goal_entry_publishes_and_executes_two_workers() {
     Box::pin(async {
         let mut progress = crate::workflow_test_support::Progress::subscribe(&state);
         loop {
+            diagnostics.observe(&state, session.id, &run_id).await;
             approve_goal_permissions(&state, session.id).await;
             let attempts = state
                 .workflow_store

@@ -6,7 +6,7 @@ use bcode_harness_models::{
     HarnessActivity, HarnessAttention, HarnessCapabilities, HarnessCapability, HarnessCompleteness,
     HarnessConnectivity, HarnessContinuation, HarnessContractError, HarnessExecutionStatus,
     HarnessInstance, HarnessInteraction, HarnessInteractionKind, HarnessObservation,
-    HarnessObservationKind, HarnessSessionBinding, HarnessSupportLevel,
+    HarnessObservationKind, HarnessResponseValue, HarnessSessionBinding, HarnessSupportLevel,
 };
 use bcode_session_view_models::external::{
     ExternalActionKind, ExternalActionView, ExternalActivityView, ExternalChoiceView,
@@ -39,6 +39,18 @@ pub enum ExternalInteractionAvailability {
 /// # Errors
 /// Rejects excessive entry counts or total retained UTF-8 bytes; never silently drops history.
 pub fn validate_external_view(view: &ExternalSessionView) -> Result<(), HarnessContractError> {
+    let lifecycle = &view.execution_lifecycle;
+    if !lifecycle.is_bounded() {
+        return Err(HarnessContractError::BoundsExceeded);
+    }
+    if lifecycle.submissions.len()
+        + lifecycle.background.len()
+        + lifecycle.continuations.len()
+        + lifecycle.coverage.len()
+        > bcode_harness_models::MAX_HARNESS_EXECUTION_ITEMS
+    {
+        return Err(HarnessContractError::BoundsExceeded);
+    }
     if view
         .transcript
         .len()
@@ -50,6 +62,7 @@ pub fn validate_external_view(view: &ExternalSessionView) -> Result<(), HarnessC
         return Err(HarnessContractError::BoundsExceeded);
     }
     let mut bytes = provenance_bytes(&view.provenance)
+        .saturating_add(view.execution_lifecycle.details().len())
         .saturating_add(view.metadata.executable.len())
         .saturating_add(view.metadata.native_version.len())
         .saturating_add(view.metadata.config_namespace.len());
@@ -291,6 +304,10 @@ fn external_observation_content(
     kind: &HarnessObservationKind,
 ) -> (ExternalTranscriptCategory, String) {
     match kind {
+        HarnessObservationKind::Execution { event } => (
+            ExternalTranscriptCategory::Status,
+            crate::execution::event_label(event),
+        ),
         HarnessObservationKind::SubmissionAccepted {
             submission_id,
             attempt_id,
@@ -436,6 +453,8 @@ fn external_history_view(
     has_more: bool,
 ) -> ExternalSessionView {
     ExternalSessionView {
+        execution_lifecycle: bcode_session_view_models::execution::ExecutionLifecycleView::default(
+        ),
         provenance,
         metadata,
         activity: external_activity(&HarnessExecutionStatus {
@@ -482,6 +501,7 @@ pub fn external_history_page(
     );
     let mut previous = None;
     for event in &page.events {
+        let _ = crate::execution::apply(&mut view.execution_lifecycle, event);
         if event.session_id.to_string() != binding.session_id
             || previous.is_some_and(|sequence| sequence >= event.sequence)
         {
@@ -607,6 +627,8 @@ fn canonical_operation_text(
     operation.validate()?;
     let text = match &operation.record {
         R::Configured { instance, .. } => format!("Managed external configured · plugin {} · instance {}\nNo native conversation confirmed by configuration.", instance.plugin_id, instance.instance_id),
+        R::TransportReleased { .. } => "Native transport release recorded; foreground outcomes are unchanged. No resume or replay authority implied.".into(),
+        R::RecoveryPrepared { .. } => "Managed recovery prepared for this generation; native resume is not yet confirmed. Prior submissions are not replayed.".into(),
         R::DeliveryClaimed { .. } => "Native delivery claimed; outcome pending or uncertain. No replay or settlement implied.".into(),
         R::DeliveryCompleted { response, .. } => match &response.kind {
             S::Opened(binding) => format!("Native identity confirmed: {} · generation {} (not settled or assignment completion)", binding.native_session_id, binding.generation),
@@ -703,7 +725,7 @@ pub fn canonical_external_text(
                 for choice in &interaction.choices {
                     let _ = writeln!(text, "{}: {}", choice.choice_id, choice.label);
                 }
-                text.push_str("Use /native respond <generation> <request-id> <response-id> <approve|deny|answer|choose|assist> [text or choice-id]. Current capability and ownership are rechecked; historical requests may be unavailable.");
+                text.push_str(&native_response_usage());
             }
             text
         }
@@ -835,6 +857,12 @@ pub fn external_fallback_blocks(
             },
         ),
     }];
+    if view.execution_lifecycle.session_id.is_some() {
+        blocks.push(ExternalFallbackBlock {
+            id: "external:execution".into(),
+            text: view.execution_lifecycle.details(),
+        });
+    }
     for item in &view.transcript {
         blocks.push(ExternalFallbackBlock {
             id: format!(
@@ -881,6 +909,67 @@ pub fn external_fallback_blocks(
             .retain(|ch| !ch.is_control() || ch == '\n' || ch == '\t');
     }
     Ok(blocks)
+}
+
+fn native_response_usage() -> String {
+    let examples = [
+        HarnessResponseValue::Approval { approved: true },
+        HarnessResponseValue::Approval { approved: false },
+        HarnessResponseValue::Answer {
+            choice_id: None,
+            text: "your answer".into(),
+        },
+        HarnessResponseValue::Answer {
+            choice_id: Some("choice-id".into()),
+            text: String::new(),
+        },
+        HarnessResponseValue::Assistance {
+            text: "your assistance".into(),
+        },
+        HarnessResponseValue::Cancel,
+    ];
+    let mut text = String::from(
+        "Use /native respond <generation> <request-id> <retained-response-id> <JSON>. JSON examples (choose only the matching request kind):",
+    );
+    for example in examples {
+        if let Ok(json) = serde_json::to_string(&example) {
+            let _ = write!(text, "\n{json}");
+        }
+    }
+    text.push_str("\nCurrent capability and ownership are rechecked; historical requests may be unavailable. Retain the response identity after an uncertain result; do not replay automatically.");
+    text
+}
+
+#[cfg(test)]
+mod native_response_usage_tests {
+    #[test]
+    fn rendered_native_response_examples_decode_as_typed_values() {
+        let usage = super::native_response_usage();
+        let values: Vec<bcode_harness_models::HarnessResponseValue> = usage
+            .lines()
+            .filter(|line| line.starts_with('{'))
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        assert_eq!(
+            values,
+            vec![
+                bcode_harness_models::HarnessResponseValue::Approval { approved: true },
+                bcode_harness_models::HarnessResponseValue::Approval { approved: false },
+                bcode_harness_models::HarnessResponseValue::Answer {
+                    choice_id: None,
+                    text: "your answer".into()
+                },
+                bcode_harness_models::HarnessResponseValue::Answer {
+                    choice_id: Some("choice-id".into()),
+                    text: String::new()
+                },
+                bcode_harness_models::HarnessResponseValue::Assistance {
+                    text: "your assistance".into()
+                },
+                bcode_harness_models::HarnessResponseValue::Cancel,
+            ]
+        );
+    }
 }
 
 #[cfg(test)]

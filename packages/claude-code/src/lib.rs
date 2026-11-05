@@ -23,6 +23,7 @@ pub use protocol::{
 };
 pub use transport::{
     ClaudeClient, ClaudeSession, ControlTicket, DeliveryReceipt, IdentityState, InitializedSession,
+    PhysicalReap,
 };
 
 /// Transport errors deliberately omit native output and credential-bearing payloads.

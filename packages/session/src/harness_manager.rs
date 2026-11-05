@@ -15,12 +15,244 @@ fn mismatch() -> SessionError {
     SessionError::EventSerialization("invalid canonical harness result".into())
 }
 impl SessionManager {
-    /// Read bounded indexed acceptance/result/native-terminal/settlement evidence under one
-    /// canonical snapshot. The tuple includes current owner; observations retain canonical
-    /// sequence/page-offset order (at most four), and `next_after` is the acceptance h1 cursor.
-    /// Complete requires all four complete observations; Partial may still include an explicit
-    /// failed/interrupted terminal. Gap fences loss since acceptance. No ownership acquisition
-    /// or history scan occurs; attribution frames alone never establish a native terminal.
+    /// Retain a physically reaped native transport under its exact current owner.
+    /// The trusted native integration must supply actual reap evidence; an acknowledgement
+    /// or caller-provided boolean is not evidence. This never dispatches native operations.
+    /// # Errors
+    /// Rejects unpublished schema support, stale owners, missing Close completion or changed binding.
+    pub async fn release_external_harness_transport<F>(
+        &self,
+        owner: &ExternalHarnessOwner,
+        release: bcode_session_models::external_harness::ExternalHarnessTransportRelease,
+        verify_reap: F,
+    ) -> Result<(), SessionError>
+    where
+        F: FnOnce(
+                &bcode_session_models::external_harness::ExternalHarnessTransportRelease,
+            ) -> Result<(), String>
+            + Send
+            + 'static,
+    {
+        if bcode_session_models::CURRENT_SESSION_EVENT_SCHEMA_VERSION < 56
+            || bcode_session_models::CURRENT_SESSION_STORAGE_WRITER_EPOCH < 24
+        {
+            return Err(mismatch());
+        }
+        release
+            .validate_for(owner)
+            .map_err(SessionError::EventSerialization)?;
+        match self
+            .session_handle(owner.session_id)
+            .await?
+            .harness_operation(
+                owner.clone(),
+                A::ReleaseTransport {
+                    release: Box::new(release),
+                    verify_reap: Box::new(verify_reap),
+                },
+                self.next_activity_timestamp_ms(),
+            )
+            .await?
+        {
+            R::Committed => Ok(()),
+            _ => Err(mismatch()),
+        }
+    }
+
+    /// Atomically fence an explicitly authorized recovery intent to the next generation.
+    /// The host verifier must check exact retained lifetime provenance is released and the
+    /// native transport's reap evidence is valid. It runs inside the writer mailbox before
+    /// the transactional CAS. This API neither resumes native work nor replays prior input.
+    /// # Errors
+    /// Rejects unpublished schema support, failed host proof, stale CAS and conflicting intent.
+    pub async fn prepare_external_harness_recovery<F>(
+        &self,
+        owner: &ExternalHarnessOwner,
+        recovery: bcode_session_models::external_harness::ExternalHarnessRecovery,
+        verify_release: F,
+    ) -> Result<(), SessionError>
+    where
+        F: FnOnce(
+                &bcode_session_models::external_harness::ExternalHarnessTransportRelease,
+            ) -> Result<(), String>
+            + Send
+            + 'static,
+    {
+        if bcode_session_models::CURRENT_SESSION_EVENT_SCHEMA_VERSION < 56
+            || bcode_session_models::CURRENT_SESSION_STORAGE_WRITER_EPOCH < 24
+        {
+            return Err(mismatch());
+        }
+        recovery
+            .validate_for(owner)
+            .map_err(SessionError::EventSerialization)?;
+        match self
+            .session_handle(owner.session_id)
+            .await?
+            .harness_operation(
+                owner.clone(),
+                A::Recover {
+                    recovery: Box::new(recovery),
+                    verify_release: Box::new(verify_release),
+                },
+                self.next_activity_timestamp_ms(),
+            )
+            .await?
+        {
+            R::Committed => Ok(()),
+            _ => Err(mismatch()),
+        }
+    }
+
+    /// Inspect retained transport-release provenance without acquiring native authority.
+    /// Current application access authorization is required separately. No lifetime proof,
+    /// native process creation, mutation replay, repair or history scan is performed.
+    /// # Errors
+    /// Rejects stale owners, damaged locators, missing storage and concurrent changes.
+    pub async fn session_external_harness_transport_release(
+        &self,
+        owner: &ExternalHarnessOwner,
+    ) -> Result<
+        Option<(
+            u64,
+            bcode_session_models::external_harness::ExternalHarnessTransportRelease,
+        )>,
+        SessionError,
+    > {
+        owner.validate().map_err(SessionError::EventSerialization)?;
+        let gate = self.session_load_gate(owner.session_id).await;
+        let _guard = gate.lock().await;
+        let store = self.store.as_ref().ok_or_else(mismatch)?;
+        let db =
+            crate::db::SessionDb::open_existing_turso_in_root(owner.session_id, &store.root_path())
+                .await?;
+        Ok(db.harness_transport_release(owner).await?)
+    }
+
+    /// Read one bounded, revision-pinned lifecycle inventory page without native execution.
+    /// The caller supplies the exact inspected owner; no ownership or completion is inferred.
+    /// # Errors
+    /// Rejects foreign owners, missing proofs, malformed cursors and unavailable session stores.
+    pub async fn session_harness_inventory_page(
+        &self,
+        owner: &ExternalHarnessOwner,
+        scope: &bcode_session_models::HarnessInventoryScope,
+        kind: bcode_session_models::HarnessInventoryKind,
+        cursor: Option<&bcode_session_models::HarnessInventoryCursor>,
+    ) -> Result<bcode_session_models::HarnessInventoryPage, SessionError> {
+        let gate = self.session_load_gate(owner.session_id).await;
+        let _guard = gate.lock().await;
+        let store = self.store.as_ref().ok_or_else(mismatch)?;
+        let db =
+            crate::db::SessionDb::open_existing_turso_in_root(owner.session_id, &store.root_path())
+                .await?;
+        Ok(db
+            .harness_inventory_page(owner, scope, kind, cursor)
+            .await?)
+    }
+
+    /// Read canonical lifecycle summary truth without collecting an inventory.
+    /// # Errors
+    /// Rejects foreign owners, missing stores, damaged accessed proofs and concurrent changes.
+    pub async fn session_harness_inventory_summary(
+        &self,
+        owner: &ExternalHarnessOwner,
+        scope: &bcode_session_models::HarnessInventoryScope,
+        kind: bcode_session_models::HarnessInventoryKind,
+    ) -> Result<bcode_session_models::external_harness::HarnessInventorySummaryRead, SessionError>
+    {
+        let gate = self.session_load_gate(owner.session_id).await;
+        let _guard = gate.lock().await;
+        let store = self.store.as_ref().ok_or_else(mismatch)?;
+        let db =
+            crate::db::SessionDb::open_existing_turso_in_root(owner.session_id, &store.root_path())
+                .await?;
+        Ok(db.harness_inventory_summary(owner, scope, kind).await?)
+    }
+
+    /// Read exact previous-page acknowledgment and bounded canonical hydration for a target.
+    /// None means retention metadata is unknown, not that native effects are absent.
+    /// # Errors
+    /// Rejects foreign/stale targets, missing canonical pages, mismatched cursors,
+    /// damaged pages and concurrent changes.
+    pub async fn session_harness_retention_context(
+        &self,
+        owner: &ExternalHarnessOwner,
+        target: &bcode_harness_models::HarnessSessionTarget,
+        after: Option<&str>,
+    ) -> Result<Option<bcode_harness_models::HarnessRetentionContext>, SessionError> {
+        let gate = self.session_load_gate(owner.session_id).await;
+        let _guard = gate.lock().await;
+        let store = self.store.as_ref().ok_or_else(mismatch)?;
+        let db =
+            crate::db::SessionDb::open_existing_turso_in_root(owner.session_id, &store.root_path())
+                .await?;
+        Ok(db.harness_retention_context(owner, target, after).await?)
+    }
+
+    /// Hydrate a bounded native-reference batch from exact canonical locators, never a scan.
+    /// # Errors
+    /// Rejects malformed/foreign requests, missing stores and concurrent canonical changes.
+    pub async fn session_harness_native_hydration(
+        &self,
+        owner: &ExternalHarnessOwner,
+        requests: &[bcode_harness_models::HarnessHydrationRequest],
+    ) -> Result<Vec<bcode_harness_models::HarnessHydrationReply>, SessionError> {
+        let gate = self.session_load_gate(owner.session_id).await;
+        let _guard = gate.lock().await;
+        let store = self.store.as_ref().ok_or_else(mismatch)?;
+        let db =
+            crate::db::SessionDb::open_existing_turso_in_root(owner.session_id, &store.root_path())
+                .await?;
+        Ok(db.harness_native_hydration(owner, requests).await?)
+    }
+
+    /// Recover an exact canonical page acknowledgment; not an execution authorization.
+    /// # Errors
+    /// Rejects foreign owner/page, digest mismatches and missing canonical recording.
+    pub async fn session_harness_canonical_page_ack(
+        &self,
+        owner: &ExternalHarnessOwner,
+        page: &bcode_harness_models::HarnessRetentionPage,
+    ) -> Result<bcode_harness_models::HarnessCanonicalAck, SessionError> {
+        let gate = self.session_load_gate(owner.session_id).await;
+        let _guard = gate.lock().await;
+        let store = self.store.as_ref().ok_or_else(mismatch)?;
+        let db =
+            crate::db::SessionDb::open_existing_turso_in_root(owner.session_id, &store.root_path())
+                .await?;
+        Ok(db.harness_canonical_page_ack(owner, page).await?)
+    }
+
+    /// Resolve a stable lifecycle identity at an explicit owner/scope/kind commitment.
+    /// Returns retained evidence only; acknowledgement and adapter hydration are separate.
+    /// # Errors
+    /// Rejects unavailable stores, foreign identities and missing or damaged proof state.
+    pub async fn session_harness_inventory_item(
+        &self,
+        owner: &ExternalHarnessOwner,
+        scope: &bcode_session_models::HarnessInventoryScope,
+        kind: bcode_session_models::HarnessInventoryKind,
+        identity: &str,
+        commitment: &bcode_session_models::HarnessInventoryCommitment,
+    ) -> Result<bcode_session_models::HarnessInventoryItemRead, SessionError> {
+        let gate = self.session_load_gate(owner.session_id).await;
+        let _guard = gate.lock().await;
+        let store = self.store.as_ref().ok_or_else(mismatch)?;
+        let db =
+            crate::db::SessionDb::open_existing_turso_in_root(owner.session_id, &store.root_path())
+                .await?;
+        Ok(db
+            .harness_inventory_item(owner, scope, kind, identity, commitment)
+            .await?)
+    }
+
+    /// Read bounded indexed legacy and v3 execution evidence under one canonical snapshot.
+    /// The tuple includes current owner. V3 retains the latest lifecycle entry for each exact
+    /// attempt identity plus uncorrelated session-wide work/continuations, independently of
+    /// history-prefix length. Overflow and missing coverage fail closed; reads never reindex.
+    /// Legacy acceptance/result/native-terminal/settlement remains the strict fallback.
+    /// Evidence completeness is not successful disposition, work settlement, or workflow policy.
     /// # Errors
     /// Rejects stale/missing indexes, foreign/conflicting evidence and concurrent changes.
     pub async fn session_external_harness_submission_evidence(
@@ -134,11 +366,21 @@ impl SessionManager {
         &self,
         session_id: bcode_session_models::SessionId,
     ) -> Result<Option<ExternalHarnessState>, SessionError> {
+        tracing::warn!(target: "bcode_session::harness", operation = "snapshot", stage = "enter", "managed manager progress");
+        tracing::warn!(target: "bcode_session::harness", operation = "snapshot", stage = "gate_lookup_start", "managed manager progress");
         let gate = self.session_load_gate(session_id).await;
+        tracing::warn!(target: "bcode_session::harness", operation = "snapshot", stage = "gate_lookup_done", "managed manager progress");
+        tracing::warn!(target: "bcode_session::harness", operation = "snapshot", stage = "gate_lock_start", "managed manager progress");
         let _guard = gate.lock().await;
+        tracing::warn!(target: "bcode_session::harness", operation = "snapshot", stage = "gate_lock_done", "managed manager progress");
+        tracing::warn!(target: "bcode_session::harness", operation = "snapshot", stage = "cache_lock_start", "managed manager progress");
         let cached = self.inner.lock().await.sessions.get(&session_id).cloned();
+        tracing::warn!(target: "bcode_session::harness", operation = "snapshot", stage = "cache_lock_done", "managed manager progress");
         if let Some(handle) = cached {
-            return handle.harness_snapshot().await;
+            tracing::warn!(target: "bcode_session::harness", operation = "snapshot", stage = "actor_start", "managed manager progress");
+            let result = handle.harness_snapshot().await;
+            tracing::warn!(target: "bcode_session::harness", operation = "snapshot", stage = "actor_done", "managed manager progress");
+            return result;
         }
         let Some(store) = self.store.as_ref() else {
             return Ok(None);
@@ -162,11 +404,21 @@ impl SessionManager {
         if limit == 0 || usize::from(limit) > MAX_HARNESS_OBSERVATIONS {
             return Err(mismatch());
         }
+        tracing::warn!(target: "bcode_session::harness", operation = "history", stage = "enter", "managed manager progress");
+        tracing::warn!(target: "bcode_session::harness", operation = "history", stage = "gate_lookup_start", "managed manager progress");
         let gate = self.session_load_gate(session_id).await;
+        tracing::warn!(target: "bcode_session::harness", operation = "history", stage = "gate_lookup_done", "managed manager progress");
+        tracing::warn!(target: "bcode_session::harness", operation = "history", stage = "gate_lock_start", "managed manager progress");
         let _guard = gate.lock().await;
+        tracing::warn!(target: "bcode_session::harness", operation = "history", stage = "gate_lock_done", "managed manager progress");
+        tracing::warn!(target: "bcode_session::harness", operation = "history", stage = "cache_lock_start", "managed manager progress");
         let cached = self.inner.lock().await.sessions.get(&session_id).cloned();
+        tracing::warn!(target: "bcode_session::harness", operation = "history", stage = "cache_lock_done", "managed manager progress");
         if let Some(handle) = cached {
-            return handle.harness_history(after, limit).await;
+            tracing::warn!(target: "bcode_session::harness", operation = "history", stage = "actor_start", "managed manager progress");
+            let result = handle.harness_history(after, limit).await;
+            tracing::warn!(target: "bcode_session::harness", operation = "history", stage = "actor_done", "managed manager progress");
+            return result;
         }
         let store = self.store.as_ref().ok_or_else(mismatch)?;
         let db = crate::db::SessionDb::open_existing_turso_in_root(session_id, &store.root_path())

@@ -811,6 +811,40 @@ mod tests {
     }
 
     #[test]
+    fn intermediate_path_epochs_remain_admitted_historical_source_contracts() {
+        for writer in [21, 22] {
+            let plan = plan_writer_epoch_migration(writer).expect("internal suffix exists");
+            assert_eq!(plan.target_writer_epoch, CURRENT_WRITER_EPOCH);
+            assert_eq!(
+                classify_writer_epoch(writer),
+                WriterEpochCompatibility::ReleasedHistorical
+            );
+            let facts = StorageContractFacts {
+                table_exists: true,
+                contract: Some(StorageContractRow {
+                    schema_version: 1,
+                    writer_epoch: u64::from(writer),
+                }),
+            };
+            assert!(matches!(
+                classify_source_storage(ValidatedMigrationLedger { completed_prefix_len: 1, current_migration_count: 1 }, facts, 1, 1),
+                Ok(SourceStorageCompatibility::ReleasedHistorical { writer_epoch }) if writer_epoch == u64::from(writer)
+            ));
+        }
+        for &writer in crate::RELEASED_HISTORICAL_WRITER_EPOCHS {
+            assert_eq!(
+                classify_writer_epoch(writer),
+                WriterEpochCompatibility::ReleasedHistorical
+            );
+            let plan = plan_writer_epoch_migration(writer).unwrap();
+            assert_eq!(
+                plan.steps.last().unwrap().target_writer_epoch,
+                CURRENT_WRITER_EPOCH
+            );
+        }
+    }
+
+    #[test]
     fn writer_epoch_classification_and_finalization_are_migration_owned() {
         assert_eq!(
             classify_writer_epoch(CURRENT_WRITER_EPOCH),
@@ -882,6 +916,10 @@ mod tests {
                 "session-writer-epoch-16-to-17",
                 "session-writer-epoch-17-to-18",
                 "session-writer-epoch-18-to-19",
+                "session-writer-epoch-19-to-20",
+                "session-writer-epoch-20-to-21",
+                "session-writer-epoch-21-to-22",
+                "session-writer-epoch-22-to-23",
             ]
         );
         assert_eq!(receipt.source_event_digest_sha256, "source");

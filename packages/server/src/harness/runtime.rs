@@ -198,6 +198,32 @@ impl<S: ManagedHarnessStore, T: ManagedHarnessTransport> ManagedHarnessRuntime<S
         owner: &HarnessOwner,
         open: HarnessOpenRequest,
     ) -> Result<HarnessServiceResponse, ManagedHarnessError> {
+        self.open_admitted(owner, open, false).await
+    }
+
+    // Only explicit application recovery may use a per-intent native constraint receipt.
+    // The canonical store requires this exact CAS-published prepared_open; this is not
+    // a blanket promotion of Constrained resume capability for ordinary Open calls.
+    pub(crate) async fn open_validated_recovery(
+        &self,
+        owner: &HarnessOwner,
+        open: HarnessOpenRequest,
+    ) -> Result<HarnessServiceResponse, ManagedHarnessError> {
+        if open.resume.is_none()
+            || bcode_session_models::CURRENT_SESSION_EVENT_SCHEMA_VERSION < 56
+            || bcode_session_models::CURRENT_SESSION_STORAGE_WRITER_EPOCH < 24
+        {
+            return Err(ManagedHarnessError::Unsupported);
+        }
+        self.open_admitted(owner, open, true).await
+    }
+
+    async fn open_admitted(
+        &self,
+        owner: &HarnessOwner,
+        open: HarnessOpenRequest,
+        constraints_validated: bool,
+    ) -> Result<HarnessServiceResponse, ManagedHarnessError> {
         let _ownership = self.store.acquire(owner).await?;
         if open.session_id != owner.session_id.to_string() || open.generation != owner.generation {
             return Err(ManagedHarnessError::StaleOwner);
@@ -209,13 +235,18 @@ impl<S: ManagedHarnessStore, T: ManagedHarnessTransport> ManagedHarnessRuntime<S
             return Err(ManagedHarnessError::Invalid);
         };
         if let Some(resume) = &open.resume
-            && (session.target.as_ref() != Some(&HarnessSessionTarget::Confirmed(resume.clone()))
+            && ((!constraints_validated
+                && session.target.as_ref()
+                    != Some(&HarnessSessionTarget::Confirmed(resume.clone())))
+                || (constraints_validated && session.target.is_some())
                 || session.binding.as_ref() != Some(resume))
         {
             return Err(ManagedHarnessError::Conflict);
         }
         if open.resume.is_some()
             && session.capabilities.resume.support != HarnessSupportLevel::Supported
+            && !(constraints_validated
+                && session.capabilities.resume.support == HarnessSupportLevel::Constrained)
         {
             return Err(ManagedHarnessError::Unsupported);
         }
@@ -314,12 +345,17 @@ impl<S: ManagedHarnessStore, T: ManagedHarnessTransport> ManagedHarnessRuntime<S
             .clone()
             .ok_or(ManagedHarnessError::Conflict)?;
         let previous_after = after.clone();
+        let retention = self
+            .store
+            .retention_context(owner, &target, previous_after.as_deref())
+            .await?;
         let (_, request) = self
             .request(
                 owner,
                 request_id,
                 HarnessRequestKind::Observe(HarnessObserveRequest {
                     target: target.clone(),
+                    retention,
                     after,
                     limit,
                     wait_millis,

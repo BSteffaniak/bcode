@@ -5,6 +5,8 @@
 //! Codex native app-server backend. This plugin never acts as a model provider,
 //! dispatches observed native tools, or stores a recovery journal.
 pub mod auth;
+mod execution;
+mod retention;
 pub mod session;
 pub mod transport;
 
@@ -407,11 +409,13 @@ impl CodexHarnessPlugin {
         if observe.after != owner.next {
             return Err(CodexError::Uncertain);
         }
-        let (observations, completeness) = owner
-            .session
-            .as_mut()
-            .ok_or(CodexError::Uncertain)?
-            .observe(usize::from(observe.limit.min(4)))?;
+        let (observations, completeness) = {
+            let session = owner.session.as_mut().ok_or(CodexError::Uncertain)?;
+            if let Some(retention) = &observe.retention {
+                session.apply_retention(retention)?;
+            }
+            session.observe(usize::from(observe.limit.min(4)))?
+        };
         owner.page_number = owner.page_number.checked_add(1).ok_or(CodexError::Bounds)?;
         let next_after = Some(format!(
             "codex-page-{}-{}",
@@ -422,7 +426,14 @@ impl CodexHarnessPlugin {
             .as_ref()
             .ok_or(CodexError::Uncertain)?
             .status();
+        let session = owner.session.as_mut().ok_or(CodexError::Uncertain)?;
+        let retention = Some(session.retention_page(&observations)?);
+        let hydration_requests = session.hydration_requests();
+        let inventory_page = session.take_inventory_page();
         let page = HarnessObservationPage {
+            retention,
+            hydration_requests,
+            inventory_page,
             observations,
             next_after: next_after.clone(),
             completeness,

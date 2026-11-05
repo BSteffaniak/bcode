@@ -3,9 +3,15 @@ name    = "Claude Code Harness"
 version = "0.0.1"
 
 [[services]]
+class        = "query"
+description  = "Requires exact host admission; disables legacy serialized credential maps; unknown hosts cannot supply API credentials"
+interface_id = "bcode.plugin.sensitive-credentials/v1"
+name         = "Invocation-bound sensitive credential delivery"
+
+[[services]]
 class        = "service"
 description  = "Typed native Claude Code lifecycle; not a model provider or Bcode tool executor"
-interface_id = "bcode.harness/v2"
+interface_id = "bcode.harness/v3"
 name         = "Claude Code managed sessions"
 
 [[services]]
@@ -13,6 +19,24 @@ class        = "query"
 description  = "Explicit namespace-bound client-terminal plan; never launches native login in the daemon"
 interface_id = "bcode.claude-code.handoff/v1"
 name         = "Claude Code native login handoff plan"
+
+[[services]]
+class        = "query"
+description  = "Generic namespace-bound client-terminal authentication preparation; declaration is not readiness or permission"
+interface_id = "bcode.harness.terminal-auth/v1"
+name         = "Native terminal authentication preparation"
+
+[[services]]
+class        = "service"
+description  = "Ephemeral bounded queue; daemon admission only, no credentials or synchronous nested tool calls"
+interface_id = "bcode.harness.tool-queue/v1"
+name         = "Host-issued ordinary-tool queue"
+
+[[services]]
+class        = "service"
+description  = "Optional independently negotiated evidence; Close acknowledgement alone never proves release"
+interface_id = "bcode.harness.recovery/v1"
+name         = "Exact constrained resume and physical transport release evidence"
 
 [concurrency]
 type = "exclusive"

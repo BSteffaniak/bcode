@@ -524,6 +524,8 @@ pub enum AdmissionFamily {
     Installed,
     /// Historical nullable representation, preserved without conversion.
     Historical43,
+    /// Current ownership-transfer store; represented execution is not installed.
+    Legacy44,
 }
 
 /// Select a recognized storage family without mutating it.
@@ -539,7 +541,7 @@ pub async fn admission_family(db: &dyn Database) -> Result<AdmissionFamily, Repr
         .execute(&*tx)
         .await?;
     match rows.first().and_then(|row| row.get("compatibility")) {
-        Some(DatabaseValue::Int64(3)) => {
+        Some(DatabaseValue::Int64(compatibility @ (3 | 4))) => {
             let versions = tx
                 .select("workflow_store_contract")
                 .columns(&["schema_version"])
@@ -547,7 +549,8 @@ pub async fn admission_family(db: &dyn Database) -> Result<AdmissionFamily, Repr
                 .limit(1)
                 .execute(&*tx)
                 .await?;
-            if !matches!(versions.first().and_then(|row|row.get("schema_version")),Some(DatabaseValue::Int64(n)) if n>=43)
+            let minimum_schema = if compatibility == 4 { 44 } else { 43 };
+            if !matches!(versions.first().and_then(|row|row.get("schema_version")),Some(DatabaseValue::Int64(n)) if n>=minimum_schema)
             {
                 return Err(RepresentationError::UnsupportedStore);
             }
@@ -555,7 +558,11 @@ pub async fn admission_family(db: &dyn Database) -> Result<AdmissionFamily, Repr
                 return Err(RepresentationError::MaintenanceRequired);
             }
             tx.commit().await?;
-            return Ok(AdmissionFamily::Historical43);
+            return Ok(if compatibility == 4 {
+                AdmissionFamily::Legacy44
+            } else {
+                AdmissionFamily::Historical43
+            });
         }
         Some(DatabaseValue::Int64(2)) => {}
         _ => return Err(RepresentationError::UnsupportedStore),

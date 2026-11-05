@@ -24,17 +24,85 @@ fn elapsed_ms(started: Option<Instant>) -> u64 {
     })
 }
 
+// Fixed buckets only: never SQL, expressions, values, or user-supplied identifiers.
+fn record_timing(
+    timings: &bcode_metrics::MetricsRegistry,
+    operation: DatabaseOperation,
+    table: Option<&str>,
+    started: Option<Instant>,
+) {
+    if !timings.is_enabled() {
+        return;
+    }
+    let operation = match operation {
+        DatabaseOperation::Select => "select",
+        DatabaseOperation::Insert => "insert",
+        DatabaseOperation::Update => "update",
+        DatabaseOperation::Delete => "delete",
+        DatabaseOperation::Upsert => "upsert",
+        DatabaseOperation::Begin => "begin",
+        DatabaseOperation::Commit => "commit",
+        DatabaseOperation::Rollback => "rollback",
+        _ => "other",
+    };
+    let table = match table {
+        Some("events") => "events",
+        Some("turn_evidence") => "turn_evidence",
+        Some("snapshots") => "snapshots",
+        None => "none",
+        Some(_) => "other",
+    };
+    timings.record_histogram_with_exact_labels(
+        format!("database.physical.{operation}.{table}.duration_ms"),
+        elapsed_ms(started),
+        bcode_metrics::MetricLabels::new(),
+    );
+}
+
+fn record_select_timing(
+    timings: &bcode_metrics::MetricsRegistry,
+    query: &SelectQuery<'_>,
+    started: Option<Instant>,
+) {
+    if !timings.is_enabled() {
+        return;
+    }
+    let table = match query.table_name {
+        "turn_evidence" => "turn_evidence",
+        "events" => "events",
+        "snapshots" => "snapshots",
+        _ => "other",
+    };
+    // Inspect only structural flags, never format expressions or inspect bound values.
+    let sorted = query.sorts.as_ref().is_some_and(|sorts| !sorts.is_empty());
+    let shape = match (sorted, query.limit) {
+        (true, Some(1)) => "sorted_one",
+        (true, Some(_)) => "sorted_bounded",
+        (true, None) => "sorted_unbounded",
+        (false, Some(1)) => "one",
+        (false, Some(_)) => "bounded",
+        (false, None) => "unbounded",
+    };
+    timings.record_histogram_with_exact_labels(
+        format!("database.physical.select_shape.{table}.{shape}.duration_ms"),
+        elapsed_ms(started),
+        bcode_metrics::MetricLabels::new(),
+    );
+}
+
 /// A database decorator that records stable operation metadata without SQL or values.
 #[derive(Debug)]
 pub struct ObservedDatabase {
     inner: Arc<Box<dyn Database>>,
     metrics: DatabaseMetrics,
+    timings: bcode_metrics::MetricsRegistry,
 }
 
 #[derive(Debug)]
 struct ObservedTransaction {
     inner: Box<dyn DatabaseTransaction>,
     metrics: DatabaseMetrics,
+    timings: bcode_metrics::MetricsRegistry,
 }
 
 impl ObservedTransaction {
@@ -45,6 +113,7 @@ impl ObservedTransaction {
         started: Option<Instant>,
         result: &Result<T, DatabaseError>,
     ) {
+        record_timing(&self.timings, operation, table, started);
         self.metrics.record(
             operation,
             table,
@@ -71,7 +140,8 @@ impl ObservedDatabase {
     ) -> Self {
         Self {
             inner: Arc::new(inner),
-            metrics: DatabaseMetrics::new(metrics, role, backend),
+            metrics: DatabaseMetrics::new(metrics.clone(), role, backend),
+            timings: metrics,
         }
     }
 
@@ -82,6 +152,7 @@ impl ObservedDatabase {
         started: Option<Instant>,
         result: &Result<T, DatabaseError>,
     ) {
+        record_timing(&self.timings, operation, table, started);
         self.metrics.record(
             operation,
             table,
@@ -179,6 +250,7 @@ impl Database for ObservedDatabase {
             Box::new(ObservedTransaction {
                 inner,
                 metrics: self.metrics.clone(),
+                timings: self.timings.clone(),
             }) as Box<dyn DatabaseTransaction>
         })
     }
@@ -186,6 +258,7 @@ impl Database for ObservedDatabase {
     async fn query(&self, query: &SelectQuery<'_>) -> Result<Vec<Row>, DatabaseError> {
         let started = self.metrics.started_at();
         let result = self.inner.query(query).await;
+        record_select_timing(&self.timings, query, started);
         self.record(
             DatabaseOperation::Select,
             Some(query.table_name),
@@ -198,6 +271,7 @@ impl Database for ObservedDatabase {
     async fn query_first(&self, query: &SelectQuery<'_>) -> Result<Option<Row>, DatabaseError> {
         let started = self.metrics.started_at();
         let result = self.inner.query_first(query).await;
+        record_select_timing(&self.timings, query, started);
         self.record(
             DatabaseOperation::Select,
             Some(query.table_name),
@@ -332,6 +406,7 @@ impl Database for ObservedDatabase {
             Box::new(ObservedTransaction {
                 inner,
                 metrics: self.metrics.clone(),
+                timings: self.timings.clone(),
             }) as Box<dyn DatabaseTransaction>
         })
     }
@@ -578,6 +653,7 @@ impl Database for ObservedTransaction {
             Box::new(Self {
                 inner,
                 metrics: self.metrics.clone(),
+                timings: self.timings.clone(),
             }) as Box<dyn DatabaseTransaction>
         })
     }
@@ -585,6 +661,7 @@ impl Database for ObservedTransaction {
     async fn query(&self, query: &SelectQuery<'_>) -> Result<Vec<Row>, DatabaseError> {
         let started = self.metrics.started_at();
         let result = self.inner.query(query).await;
+        record_select_timing(&self.timings, query, started);
         self.record(
             DatabaseOperation::Select,
             Some(query.table_name),
@@ -597,6 +674,7 @@ impl Database for ObservedTransaction {
     async fn query_first(&self, query: &SelectQuery<'_>) -> Result<Option<Row>, DatabaseError> {
         let started = self.metrics.started_at();
         let result = self.inner.query_first(query).await;
+        record_select_timing(&self.timings, query, started);
         self.record(
             DatabaseOperation::Select,
             Some(query.table_name),
@@ -731,6 +809,7 @@ impl Database for ObservedTransaction {
             Box::new(Self {
                 inner,
                 metrics: self.metrics.clone(),
+                timings: self.timings.clone(),
             }) as Box<dyn DatabaseTransaction>
         })
     }
@@ -893,9 +972,14 @@ impl Database for ObservedTransaction {
 #[async_trait]
 impl DatabaseTransaction for ObservedTransaction {
     async fn commit(self: Box<Self>) -> Result<(), DatabaseError> {
-        let Self { inner, metrics } = *self;
+        let Self {
+            inner,
+            metrics,
+            timings,
+        } = *self;
         let started = metrics.started_at();
         let result = inner.commit().await;
+        record_timing(&timings, DatabaseOperation::Commit, None, started);
         metrics.record(
             DatabaseOperation::Commit,
             None,
@@ -907,9 +991,14 @@ impl DatabaseTransaction for ObservedTransaction {
     }
 
     async fn rollback(self: Box<Self>) -> Result<(), DatabaseError> {
-        let Self { inner, metrics } = *self;
+        let Self {
+            inner,
+            metrics,
+            timings,
+        } = *self;
         let started = metrics.started_at();
         let result = inner.rollback().await;
+        record_timing(&timings, DatabaseOperation::Rollback, None, started);
         metrics.record(
             DatabaseOperation::Rollback,
             None,
@@ -1122,6 +1211,87 @@ mod tests {
     fn median(values: &mut [u128]) -> u128 {
         values.sort_unstable();
         values[values.len() / 2]
+    }
+
+    #[tokio::test]
+    async fn physical_timings_cover_real_operations_and_commit_without_values() {
+        let metrics = MetricsRegistry::in_memory();
+        let database = observed(&metrics);
+        run_benchmark_workload(&database, 3).await;
+        let transaction = database.begin_transaction().await.expect("begin");
+        transaction
+            .query(&select("benchmark_items").columns(&["id"]).limit(1))
+            .await
+            .expect("transaction query");
+        transaction.commit().await.expect("commit");
+        let snapshot = metrics.snapshot();
+        for (name, count) in [
+            ("database.physical.insert.other.duration_ms", 3),
+            ("database.physical.select.other.duration_ms", 4),
+            ("database.physical.delete.other.duration_ms", 3),
+            ("database.physical.begin.none.duration_ms", 1),
+            ("database.physical.commit.none.duration_ms", 1),
+        ] {
+            assert_eq!(
+                snapshot
+                    .histograms
+                    .get(name)
+                    .expect("timed operation")
+                    .count,
+                count
+            );
+        }
+        assert!(
+            snapshot
+                .histograms
+                .keys()
+                .all(|key| !key.contains("benchmark_items"))
+        );
+    }
+
+    #[test]
+    fn select_shapes_distinguish_sorted_latest_from_bounded_inventory() {
+        use switchy::database::query::SortDirection;
+        let metrics = MetricsRegistry::in_memory();
+        let latest = select("turn_evidence")
+            .columns(&["event_seq"])
+            .sort("event_seq", SortDirection::Desc)
+            .limit(1);
+        record_select_timing(&metrics, &latest, Some(Instant::now()));
+        let inventory = select("turn_evidence")
+            .columns(&["event_seq"])
+            .sort("turn_id", SortDirection::Asc)
+            .limit(33);
+        record_select_timing(&metrics, &inventory, Some(Instant::now()));
+        let snapshot = metrics.snapshot();
+        for name in [
+            "database.physical.select_shape.turn_evidence.sorted_one.duration_ms",
+            "database.physical.select_shape.turn_evidence.sorted_bounded.duration_ms",
+        ] {
+            assert_eq!(snapshot.histograms[name].count, 1);
+        }
+    }
+
+    #[test]
+    fn physical_timing_buckets_are_bounded_and_disabled_is_noop() {
+        let metrics = MetricsRegistry::in_memory();
+        for index in 0..100 {
+            record_timing(
+                &metrics,
+                DatabaseOperation::Select,
+                Some(&format!("private_table_{index}")),
+                Some(Instant::now()),
+            );
+        }
+        let snapshot = metrics.snapshot();
+        assert_eq!(snapshot.histograms.len(), 1);
+        assert_eq!(
+            snapshot.histograms["database.physical.select.other.duration_ms"].count,
+            100
+        );
+        let disabled = MetricsRegistry::disabled();
+        record_timing(&disabled, DatabaseOperation::Select, Some("events"), None);
+        assert!(disabled.snapshot().histograms.is_empty());
     }
 
     #[tokio::test]

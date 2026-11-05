@@ -4,6 +4,11 @@
 
 //! Programmatic client API for Bcode.
 
+mod managed_bootstrap;
+pub use managed_bootstrap::{
+    ManagedSessionAuthFlow, ManagedSessionClient, ManagedSessionCommandHandle,
+    ManagedSessionConnection,
+};
 mod generation;
 pub mod harness;
 mod session_observation;
@@ -2602,15 +2607,19 @@ mod startup_environment_tests {
     }
 }
 
+fn load_current_client_config()
+-> Result<(bcode_config::BcodeConfig, bcode_config::ConfigLaunchContext), ClientError> {
+    bcode_config::recovery::load_current_config_with_recovery_context().map_err(|_| {
+        ClientError::Protocol(
+            "Client configuration could not be loaded; daemon defaults were not substituted."
+                .to_owned(),
+        )
+    })
+}
+
 fn current_runtime_context() -> Result<ClientRuntimeContext, ClientError> {
     let working_directory = current_working_directory();
-    let (config, launch) = bcode_config::recovery::load_current_config_with_recovery_context()
-        .map_err(|_| {
-            ClientError::Protocol(
-                "Client configuration could not be loaded; daemon defaults were not substituted."
-                    .to_owned(),
-            )
-        })?;
+    let (config, launch) = load_current_client_config()?;
     let mut context = configured_runtime_context(&config, working_directory)?;
     context.config_launch = Some(Box::new(launch));
     Ok(context)
@@ -2619,6 +2628,23 @@ fn current_runtime_context() -> Result<ClientRuntimeContext, ClientError> {
 fn configured_runtime_context(
     config: &bcode_config::BcodeConfig,
     working_directory: PathBuf,
+) -> Result<ClientRuntimeContext, ClientError> {
+    configured_runtime_context_with_auth(config, working_directory, |config, selection| {
+        bcode_provider_auth::try_resolve_provider_request_context(
+            bcode_provider_auth::ProviderRequestContextResolution { config, selection },
+        ).map_err(|_| ClientError::Protocol(
+            "Authentication selection could not be verified. Inspect the selected account, pool membership, and authentication metadata before connecting. No substitute account was selected.".to_owned(),
+        ))
+    })
+}
+
+fn configured_runtime_context_with_auth(
+    config: &bcode_config::BcodeConfig,
+    working_directory: PathBuf,
+    materialize: impl FnOnce(
+        &bcode_config::BcodeConfig,
+        bcode_config::ResolvedModelSelection,
+    ) -> Result<bcode_model::ProviderRequestContext, ClientError>,
 ) -> Result<ClientRuntimeContext, ClientError> {
     let effective_config_toml =
         Some(bcode_config::encode_effective_config(config).map_err(|_| {
@@ -2641,14 +2667,7 @@ fn configured_runtime_context(
             .map(|source| source.name.as_str()),
         |name| std::env::var(name).ok(),
     );
-    let provider_context = bcode_provider_auth::try_resolve_provider_request_context(
-        bcode_provider_auth::ProviderRequestContextResolution {
-            config,
-            selection: resolved.clone(),
-        },
-    ).map_err(|_| ClientError::Protocol(
-        "Authentication selection could not be verified. Inspect the selected account, pool membership, and authentication metadata before connecting. No substitute account was selected.".to_owned(),
-    ))?;
+    let provider_context = materialize(config, resolved.clone())?;
     let mut context = runtime_context_from_selection(
         working_directory,
         effective_config_toml,
@@ -3390,6 +3409,14 @@ impl bcode_session_models::SessionCompactionRestartApplication for BcodeClient {
 }
 
 impl BcodeClient {
+    /// Release idle request connections shared by this client and its clones.
+    ///
+    /// In-flight requests and explicit event watches are unchanged. Useful before
+    /// an idle-only daemon stop; this does not establish daemon quiescence.
+    pub fn release_idle_connections(&self) {
+        self.request_lanes.clear_idle();
+    }
+
     /// Construct an independent consumer for an explicitly verified running daemon.
     ///
     /// Configuration and authentication are resolved from the supplied configuration, not
@@ -3435,7 +3462,11 @@ impl BcodeClient {
     /// Create a client that connects to the default endpoint.
     #[must_use]
     pub fn default_endpoint() -> Self {
-        let (runtime_context, runtime_context_error) = match current_runtime_context() {
+        Self::default_endpoint_with_context(current_runtime_context())
+    }
+
+    fn default_endpoint_with_context(context: Result<ClientRuntimeContext, ClientError>) -> Self {
+        let (runtime_context, runtime_context_error) = match context {
             Ok(context) => (Some(context), None),
             Err(error) => (None, Some(error.to_string())),
         };
@@ -14390,6 +14421,17 @@ mod portable_application_adapter_tests {
     #[tokio::test]
     async fn explicit_target_propagates_to_every_connection_and_rechecks_executable() {
         use std::os::unix::fs::PermissionsExt as _;
+        const CHILD: &str = "BCODE_TEST_EXPLICIT_TARGET_CHILD";
+        if std::env::var_os(CHILD).is_none() {
+            // This fixture deliberately selects process-wide configuration. Run
+            // alone so unrelated parallel client identity tests cannot observe it.
+            let status = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", "portable_application_adapter_tests::explicit_target_propagates_to_every_connection_and_rechecks_executable", "--nocapture"])
+                .env(CHILD, "1")
+                .status().unwrap();
+            assert!(status.success(), "isolated explicit-target fixture failed");
+            return;
+        }
         let directory = tempfile::Builder::new()
             .prefix("bct-")
             .tempdir_in("/tmp")

@@ -133,7 +133,10 @@ fn genuine_schema_42_upgrade_preserves_cap_and_defers_to_old_owner() {
             .concurrency_cap,
         Some(7)
     );
-    assert_eq!(detected_store_schema(&upgraded.connection), Some(43));
+    assert_eq!(
+        detected_store_schema(&upgraded.connection),
+        Some(WORKFLOW_STORE_SCHEMA_VERSION)
+    );
     let contracts = database::rows(
         &upgraded.connection,
         &switchy_database::query::select("workflow_storage_compatibility")
@@ -143,7 +146,9 @@ fn genuine_schema_42_upgrade_preserves_cap_and_defers_to_old_owner() {
     .unwrap();
     assert_eq!(
         contracts[0].get("compatibility"),
-        Some(switchy_database::DatabaseValue::Int64(3))
+        Some(switchy_database::DatabaseValue::Int64(i64::from(
+            WORKFLOW_STORE_COMPATIBILITY
+        )))
     );
 }
 #[test]

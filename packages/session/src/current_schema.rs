@@ -213,6 +213,11 @@ fn add_submission_recovery_migrations(source: &mut CurrentMigrationSource) {
             .columns(vec!["queue_visible", "accepted_seq"]),
         drop_index("idx_submission_queue", "submissions"),
     );
+    add_submission_recovery_migration(source);
+    add_managed_tool_migrations(source);
+}
+
+fn add_submission_recovery_migration(source: &mut CurrentMigrationSource) {
     add_migration(
         source,
         "065_submission_recovery_operations",
@@ -460,6 +465,37 @@ impl Executable for InitializeDurableInteractions {
         }
         Ok(())
     }
+}
+
+fn add_managed_tool_migrations(source: &mut CurrentMigrationSource) {
+    add_migration(
+        source,
+        "078_managed_tool_claims",
+        create_table("managed_tool_claims")
+            .if_not_exists(true)
+            .column(schema_column("invocation_id", DataType::Text, false))
+            .primary_key("invocation_id")
+            .column(schema_column("claim_sequence", DataType::Int, false))
+            .column(schema_column("started_sequence", DataType::Int, true))
+            .column(schema_column("result_sequence", DataType::Int, true))
+            .column(schema_column("record", DataType::Text, false)),
+        drop_table("managed_tool_claims").if_exists(true),
+    );
+    add_migration(
+        source,
+        "079_managed_tool_canonical_key",
+        alter_table("events").add_column("managed_tool_key".into(), DataType::Text, true, None),
+        alter_table("events").drop_column("managed_tool_key".into()),
+    );
+    add_migration(
+        source,
+        "080_managed_tool_canonical_key_index",
+        create_index("idx_events_managed_tool_key")
+            .if_not_exists(true)
+            .table("events")
+            .columns(vec!["managed_tool_key", "event_seq"]),
+        drop_index("idx_events_managed_tool_key", "events"),
+    );
 }
 
 fn add_milestone_migrations(source: &mut CurrentMigrationSource) {

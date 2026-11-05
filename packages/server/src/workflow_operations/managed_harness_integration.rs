@@ -24,14 +24,14 @@ version = "0.0.1"
 [[services]]
 interface_id = "bcode.agent-profile/v1"
 [[services]]
-interface_id = "bcode.harness/v2"
+interface_id = "bcode.harness/v3"
 [[services]]
 interface_id = "test.workflow-control/v1"
 [[services]]
 interface_id = "bcode.workflow-block/v1"
 [[services.workflow_blocks]]
 block_id = "harness.execute"
-block_version = 1
+block_version = 2
 plugin_id = "test.workflow-managed-boundary"
 operation = "harness.execute"
 effect = "mutating"
@@ -41,9 +41,28 @@ preparation_required = true
 timeout_ms = 30000
 [services.workflow_blocks.input]
 type_name = "bcode.harness.managed-operation/v1"
-schema = { type = "object", additionalProperties = false, required = ["request_json"], properties = { request_json = { type = "string" } } }
+schema = { type = "object", additionalProperties = false, required = ["request_json"], properties = { request_json = { type = "string" }, completion_requirement = { type = "string", enum = ["foreground", "associated_work", "async_handoff", "workspace_release"] } } }
 [services.workflow_blocks.output]
-type_name = "bcode.harness.assignment-result/v1"
+type_name = "bcode.harness.assignment-result/v2"
+schema = { type = "object", required = ["session_id", "submission_id", "native_turn_id", "result"] }
+[services.workflow_blocks.authorization]
+capability = "mutating"
+explicit_grant_required = true
+[[services.workflow_blocks]]
+block_id = "harness.await"
+block_version = 2
+plugin_id = "test.workflow-managed-boundary"
+operation = "harness.await"
+effect = "mutating"
+reconciliation = "receipt_status"
+cancellation_supported = true
+preparation_required = true
+timeout_ms = 30000
+[services.workflow_blocks.input]
+type_name = "bcode.harness.managed-operation/v1"
+schema = { type = "object", additionalProperties = false, required = ["request_json"], properties = { request_json = { type = "string" }, completion_requirement = { type = "string", enum = ["associated_work"] } } }
+[services.workflow_blocks.output]
+type_name = "bcode.harness.assignment-result/v2"
 schema = { type = "object", required = ["session_id", "submission_id", "native_turn_id", "result"] }
 [services.workflow_blocks.authorization]
 capability = "mutating"
@@ -73,6 +92,8 @@ struct OfflineHarness {
     polls: usize,
     accepted_submission: Option<(String, String)>,
     disposition: Option<HarnessTerminalDisposition>,
+    execution_requirement: Option<HarnessCompletionRequirement>,
+    background_failed: bool,
 }
 
 fn response(value: &impl serde::Serialize) -> ServiceResponse {
@@ -89,6 +110,14 @@ impl RustPlugin for OfflineHarness {
                     "reset" => *self = Self::default(),
                     "release" => self.released = EvidencePhase::Quiescent,
                     "terminal" => self.released = self.released.max(EvidencePhase::Terminal),
+                    "execution" => {
+                        self.execution_requirement =
+                            Some(HarnessCompletionRequirement::AssociatedWork);
+                    }
+                    "foreground" => {
+                        self.execution_requirement = Some(HarnessCompletionRequirement::Foreground);
+                    }
+                    "background_failed" => self.background_failed = true,
                     "fail" => self.disposition = Some(HarnessTerminalDisposition::Failed),
                     "interrupt" => self.disposition = Some(HarnessTerminalDisposition::Interrupted),
                     _ => {}
@@ -163,6 +192,10 @@ fn preparation(context: &NativeServiceContext) -> ServiceResponse {
     request.validate().unwrap();
     let payload: Value =
         serde_json::from_str(request.input["request_json"].as_str().unwrap()).unwrap();
+    let mut descriptor = json!({"interface_id":"bcode.managed-session/v1","operation":request.block.operation,"execution":true,"payload":payload});
+    if request.block.operation == "harness.await" {
+        descriptor["admission"] = json!("deferred_until_adopted");
+    }
     response(&bcode_workflow::WorkflowBlockPreparationResponse {
         version: bcode_workflow::WORKFLOW_BLOCK_PREPARATION_VERSION,
         input_sha256: bcode_workflow::workflow_block_input_sha256(&request.input).unwrap(),
@@ -178,12 +211,91 @@ fn preparation(context: &NativeServiceContext) -> ServiceResponse {
             },
         )
         .unwrap(),
-        descriptor: json!({"interface_id":"bcode.managed-session/v1","operation":"harness.execute","execution":true,"payload":payload}),
+        descriptor,
         diagnostics: vec![],
     })
 }
 
 impl OfflineHarness {
+    fn execution_attempt(&self) -> HarnessAttemptIdentity {
+        let (submission_id, attempt_id) = self
+            .accepted_submission
+            .as_ref()
+            .expect("retained submission");
+        HarnessAttemptIdentity {
+            submission_id: submission_id.clone(),
+            attempt_id: attempt_id.clone(),
+        }
+    }
+
+    fn execution_work(&self, state: HarnessWorkState) -> HarnessExecutionEvent {
+        HarnessExecutionEvent::BackgroundWork {
+            work_id: "adapter-command".into(),
+            native_task_id: Some("native-command".into()),
+            origin: Some(self.execution_attempt()),
+            parent_work_id: None,
+            work_kind: HarnessWorkKind::Command,
+            label: "fixture command".into(),
+            state,
+            notification: HarnessNotificationState::NotExpected,
+        }
+    }
+
+    fn execution_events(
+        &self,
+        events: Vec<(&'static str, HarnessObservationKind)>,
+    ) -> Vec<(&'static str, HarnessObservationKind)> {
+        if self.execution_requirement.is_none() {
+            return events;
+        }
+        let quiescent = events.iter().any(|(id, _)| *id == "settled");
+        let mut events: Vec<_> = events
+            .into_iter()
+            .filter_map(|(id, kind)| {
+                let kind = match kind {
+                    HarnessObservationKind::Settlement { .. } => return None,
+                    HarnessObservationKind::NativeTurnTerminal { disposition, .. } => {
+                        HarnessObservationKind::Execution {
+                            event: HarnessExecutionEvent::SubmissionTerminal {
+                                attempt: self.execution_attempt(),
+                                native_turn_id: None,
+                                native_frame_id: Some("native-result-frame".into()),
+                                disposition,
+                                output: (disposition == HarnessTerminalDisposition::Completed)
+                                    .then(|| "verified native result".into()),
+                            },
+                        }
+                    }
+                    other => other,
+                };
+                Some((id, kind))
+            })
+            .collect();
+        if quiescent {
+            events.push((
+                "work-ended",
+                HarnessObservationKind::Execution {
+                    event: self.execution_work(if self.background_failed {
+                        HarnessWorkState::Failed
+                    } else {
+                        HarnessWorkState::Completed
+                    }),
+                },
+            ));
+            events.push((
+                "coverage",
+                HarnessObservationKind::Execution {
+                    event: HarnessExecutionEvent::Coverage {
+                        attempt: self.execution_attempt(),
+                        background: HarnessTrackingCoverage::Complete,
+                        continuations: HarnessTrackingCoverage::Complete,
+                    },
+                },
+            ));
+        }
+        events
+    }
+
     fn native(&mut self, request: &HarnessRequest) -> HarnessServiceResponseKind {
         request.validate().unwrap();
         match &request.kind {
@@ -253,10 +365,19 @@ impl OfflineHarness {
                     native_turn_id: "native-turn".into(),
                 },
             ));
-            if self
-                .disposition
-                .unwrap_or(HarnessTerminalDisposition::Completed)
-                == HarnessTerminalDisposition::Completed
+            if self.execution_requirement.is_some() {
+                events.push((
+                    "work-started",
+                    HarnessObservationKind::Execution {
+                        event: self.execution_work(HarnessWorkState::Running),
+                    },
+                ));
+            }
+            if self.execution_requirement.is_none()
+                && self
+                    .disposition
+                    .unwrap_or(HarnessTerminalDisposition::Completed)
+                    == HarnessTerminalDisposition::Completed
             {
                 events.push((
                     "result",
@@ -287,6 +408,15 @@ impl OfflineHarness {
                 },
             ));
         }
+        let events = self.execution_events(events);
+        self.observation_page(query, events)
+    }
+
+    fn observation_page(
+        &self,
+        query: &HarnessObserveRequest,
+        events: Vec<(&str, HarnessObservationKind)>,
+    ) -> HarnessServiceResponseKind {
         let observations: Vec<_> = events
             .into_iter()
             .map(|(id, kind)| HarnessObservation {
@@ -299,6 +429,9 @@ impl OfflineHarness {
             })
             .collect();
         HarnessServiceResponseKind::Observations(HarnessObservationPage {
+            retention: None,
+            hydration_requests: vec![],
+            inventory_page: None,
             next_after: Some(observations.last().map_or_else(
                 || format!("idle-{}", self.polls),
                 |event| event.observation_id.clone(),
@@ -581,11 +714,526 @@ async fn managed_workflow_production_interrupted_turn_settles_without_result() {
     .await;
 }
 
-async fn check_production_dispatch(disposition: HarnessTerminalDisposition) {
+#[tokio::test]
+async fn async_adoption_retains_one_native_effect_and_workspace_until_destination_settles() {
+    Box::pin(check_async_adoption()).await;
+}
+
+fn adoption_submission(child: SessionId) -> HarnessSubmission {
+    HarnessSubmission {
+        submission_id: "submission".into(),
+        attempt_id: "attempt".into(),
+        session_id: child.to_string(),
+        generation: 1,
+        text: "single adopted task".into(),
+        placement: HarnessPlacement::NextTurn,
+    }
+}
+
+async fn check_async_adoption() {
     let _fixture_lifetime = FIXTURE_LIFETIME.lock().await;
     let root = tempfile::tempdir().unwrap();
     let state = fixture(root.path());
     assert_eq!(control(&state, "reset").await, 0);
+    assert_eq!(control(&state, "execution").await, 0);
+    let parent = state
+        .sessions
+        .create_session(None, root.path().into())
+        .await
+        .unwrap();
+    let (opening, target) = Box::pin(opened_child(&state, parent.id, root.path())).await;
+    let child: SessionId = target.session_id().parse().unwrap();
+    let submission = adoption_submission(child);
+    let encoded = serde_json::to_string(&json!({"session_id":child,"parent_session_id":null,
+        "assistance_destination_session_id":null,"harness":{"schema_version":1,"request_id":"submission",
+        "instance":opening.instance,"kind":{"operation":"submit","request":{"target":target,"submission":submission}}}})).unwrap();
+    let input = json!({"schema_version":1,"state":{"normal_predecessor":"retained"},
+        "value":{"request_json":encoded,"completion_requirement":"async_handoff"}});
+    let blocks = state.plugins.registry().workflow_blocks();
+    let source_block = blocks
+        .iter()
+        .find(|b| b.operation == "harness.execute")
+        .unwrap();
+    let await_block = blocks
+        .iter()
+        .find(|b| b.operation == "harness.await")
+        .unwrap();
+    let mut graph = definition(source_block);
+    let source_id = graph
+        .nodes
+        .values()
+        .find(|n| n.name == "external")
+        .unwrap()
+        .id
+        .clone();
+    let mut destination = graph.nodes[&source_id].clone();
+    destination.id = "adopted-await".into();
+    destination.name = "adopted-await".into();
+    destination.configuration = serde_json::to_value(await_block).unwrap();
+    let claim = bcode_workflow::ResourceClaim {
+        resource: "fixture-workspace".into(),
+        access: bcode_workflow::ResourceAccess::Write,
+    };
+    graph.nodes.get_mut(&source_id).unwrap().resources = vec![claim.clone()];
+    destination.resources = vec![claim];
+    let mut gate = graph
+        .nodes
+        .values()
+        .find(|node| node.name == "before")
+        .unwrap()
+        .clone();
+    gate.id = "adoption-input".into();
+    gate.name = "adoption-input".into();
+    graph.entries.push(gate.id.clone());
+    graph.exits.push(destination.id.clone());
+    graph
+        .edges
+        .push(serde_json::from_value(json!({"from":gate.id,"to":destination.id})).unwrap());
+    graph.nodes.insert(gate.id.clone(), gate);
+    graph.nodes.insert(destination.id.clone(), destination);
+    let start = start_request(parent.id, input.clone(), root.path());
+    retain_legacy_run(&state, &start, &graph);
+    start_run(&state, start, None).await.unwrap();
+    resolve_gate(&state, "before", input.clone()).await;
+    approve_async_nodes(&state).await;
+    wait_for_canonical_confirmation(&state, child).await;
+    assert_eq!(control(&state, "count").await, 1);
+    assert_eq!(control(&state, "terminal").await, 1);
+    observe_adoption_foreground(&state, child).await;
+    let mut destination_input = input.clone();
+    destination_input["value"]["completion_requirement"] = json!("associated_work");
+    resolve_gate(&state, "adoption-input", destination_input).await;
+    approve_async_nodes(&state).await;
+    let (source, destination, authority, revision, leases) = adoption_ready_snapshot(&state);
+    Box::pin(complete_async_adoption(
+        &state,
+        child,
+        &graph,
+        source,
+        destination,
+        authority,
+        (revision, leases),
+    ))
+    .await;
+    assert_eq!(control(&state, "count").await, 1);
+    drop(state);
+}
+
+async fn observe_adoption_foreground(state: &Arc<ServerState>, child: SessionId) {
+    for _ in 0..8 {
+        let _ = production_receipt_observation(state).await.unwrap();
+        let evidence = state
+            .sessions
+            .session_external_harness_submission_evidence(child, "submission", "attempt")
+            .await
+            .unwrap()
+            .unwrap()
+            .1;
+        if evidence.observations.iter().any(|o| {
+            matches!(
+                &o.kind,
+                HarnessObservationKind::Execution {
+                    event: HarnessExecutionEvent::SubmissionTerminal { .. }
+                }
+            )
+        }) {
+            break;
+        }
+    }
+}
+
+fn adoption_ready_snapshot(
+    state: &Arc<ServerState>,
+) -> (
+    bcode_workflow::AttemptSummary,
+    bcode_workflow_store::PendingActivation,
+    bcode_workflow_store::WorkflowExecutionAuthority,
+    u64,
+    Vec<bcode_workflow::WorkflowResourceLease>,
+) {
+    let store = state.workflow_store.lock().unwrap();
+    let source = store
+        .attempt_history(RUN, None, 8)
+        .unwrap()
+        .into_iter()
+        .find(|a| a.has_receipt)
+        .unwrap();
+    let authority = store.execution_authority(RUN).unwrap().unwrap();
+    let pending = store
+        .pending_activations_for_run(RUN, 8)
+        .unwrap()
+        .into_iter()
+        .find(|a| a.node_id == "adopted-await")
+        .unwrap();
+    let revision = store.run_graph_revision(RUN).unwrap().unwrap();
+    let leases = store.resource_leases_for_run(RUN, 100).unwrap();
+    drop(store);
+    (source, pending, authority, revision, leases)
+}
+
+fn adoption_grant_fixture(
+    state: &Arc<ServerState>,
+    destination: &bcode_workflow_store::PendingActivation,
+    intent: &Value,
+) -> (Value, bcode_workflow_store::WorkflowGrant) {
+    let block: WorkflowBlockDefinition =
+        serde_json::from_value(destination.node.configuration.clone()).unwrap();
+    let preparation: bcode_workflow::WorkflowBlockPreparationResponse =
+        serde_json::from_value(intent["preparation"].clone()).unwrap();
+    let scope =
+        crate::workflow_mutation_grant_scope(state, destination, &block, Some(&preparation))
+            .unwrap();
+    let scope = serde_json::to_value(scope).unwrap();
+    let grant = state
+        .workflow_store
+        .lock()
+        .unwrap()
+        .grants_for_run(RUN, 100)
+        .unwrap()
+        .into_iter()
+        .find(|grant| grant.scope == scope)
+        .unwrap();
+    (scope, grant)
+}
+
+async fn complete_async_adoption(
+    state: &Arc<ServerState>,
+    child: SessionId,
+    graph: &bcode_workflow::WorkflowDefinition,
+    source: bcode_workflow::AttemptSummary,
+    destination: bcode_workflow_store::PendingActivation,
+    authority: bcode_workflow_store::WorkflowExecutionAuthority,
+    snapshot: (u64, Vec<bcode_workflow::WorkflowResourceLease>),
+) {
+    use bcode_workflow_store::ActivationDispatchOwner as _;
+    let (revision, leases) = snapshot;
+    let plan = (crate::WorkflowActivationOwner { state })
+        .plan(&destination)
+        .await
+        .unwrap()
+        .unwrap();
+    let (scope, grant) = adoption_grant_fixture(state, &destination, &plan.intent);
+    let stored = state
+        .workflow_store
+        .lock()
+        .unwrap()
+        .dispatch_receipt(&source.dispatch_identity)
+        .unwrap()
+        .unwrap();
+    let canonical = state
+        .sessions
+        .session_external_harness_state(child)
+        .await
+        .unwrap()
+        .unwrap();
+    let inventory = state
+        .sessions
+        .session_harness_inventory_page(
+            &canonical.owner,
+            &bcode_session_models::HarnessInventoryScope::Attempt(HarnessAttemptIdentity {
+                submission_id: "submission".into(),
+                attempt_id: "attempt".into(),
+            }),
+            bcode_session_models::HarnessInventoryKind::Terminal,
+            None,
+        )
+        .await
+        .unwrap();
+    let summary = state
+        .sessions
+        .session_harness_inventory_summary(
+            &canonical.owner,
+            &bcode_session_models::HarnessInventoryScope::Attempt(HarnessAttemptIdentity {
+                submission_id: "submission".into(),
+                attempt_id: "attempt".into(),
+            }),
+            bcode_session_models::HarnessInventoryKind::Terminal,
+        )
+        .await
+        .unwrap();
+    assert_eq!(inventory.commitment, summary.commitment);
+    let request = bcode_workflow::WorkflowObligationAdoption {
+        obligation_id: source.dispatch_identity.clone(),
+        run_id: RUN.into(),
+        expected_revision: revision,
+        ownership_generation: authority.generation,
+        source: bcode_workflow::WorkflowObligationAttempt {
+            node_id: source.node_id,
+            activation_id: source.activation_id,
+            attempt: source.attempt,
+            dispatch_identity: source.dispatch_identity.clone(),
+        },
+        destination: bcode_workflow::WorkflowObligationAttempt {
+            node_id: destination.node_id.clone(),
+            activation_id: destination.activation_id.clone(),
+            attempt: 1,
+            dispatch_identity: bcode_workflow_store::dispatch_identity(
+                RUN,
+                &destination.node_id,
+                &destination.activation_id,
+                1,
+            ),
+        },
+        source_receipt_sha256: bcode_workflow::workflow_canonical_value_sha256(&stored.receipt)
+            .unwrap(),
+        evidence_subject: bcode_workflow::workflow_canonical_value_sha256(
+            &json!({"session_id":child,"generation":1,
+            "submission_id":"submission","attempt_id":"attempt"}),
+        )
+        .unwrap(),
+        evidence_revision: summary.observed_through_sequence,
+        evidence_sha256: bcode_workflow::workflow_canonical_value_sha256(
+            &serde_json::to_value(summary).unwrap(),
+        )
+        .unwrap(),
+        resource_lease_ids: leases.into_iter().map(|lease| lease.lease_id).collect(),
+        destination_grant_id: grant.grant_id,
+        destination_grant_scope_sha256: bcode_workflow::workflow_canonical_value_sha256(&scope)
+            .unwrap(),
+    };
+    reject_adoption_evidence_race(state, child, &request).await;
+    Box::pin(settle_adopted_destination(
+        state,
+        child,
+        graph,
+        &destination,
+        request,
+        &canonical.owner,
+    ))
+    .await;
+}
+
+async fn reject_adoption_evidence_race(
+    state: &Arc<ServerState>,
+    child: SessionId,
+    request: &bcode_workflow::WorkflowObligationAdoption,
+) {
+    let hook_state = Arc::clone(state);
+    let hook = Arc::new(
+        move || -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>> {
+            let state = Arc::clone(&hook_state);
+            Box::pin(async move {
+                state.sessions.append_event(child,
+                bcode_session_models::SessionEventKind::SystemMessage {
+                    text:"canonical evidence revision advanced while destination planning awaited".into(),
+                }).await.unwrap();
+            })
+        },
+    );
+    let rejected = Box::pin(crate::harness_workflow::with_adoption_after_planning(
+        hook,
+        crate::harness_workflow::adopt_execution(state, request),
+    ))
+    .await;
+    assert!(
+        rejected.is_err(),
+        "canonical evidence changed during ordinary destination authorization"
+    );
+    assert_eq!(
+        state
+            .workflow_store
+            .lock()
+            .unwrap()
+            .grant(&request.destination_grant_id)
+            .unwrap()
+            .unwrap()
+            .uses_consumed,
+        0
+    );
+    assert!(
+        state
+            .workflow_store
+            .lock()
+            .unwrap()
+            .dispatch_receipt(&request.destination.dispatch_identity)
+            .unwrap()
+            .is_none()
+    );
+    assert_eq!(
+        state
+            .workflow_store
+            .lock()
+            .unwrap()
+            .resource_leases_for_run(RUN, 100)
+            .unwrap()[0]
+            .activation_id,
+        request.source.activation_id
+    );
+}
+
+async fn settle_adopted_destination(
+    state: &Arc<ServerState>,
+    child: SessionId,
+    graph: &bcode_workflow::WorkflowDefinition,
+    destination: &bcode_workflow_store::PendingActivation,
+    request: bcode_workflow::WorkflowObligationAdoption,
+    owner: &ExternalHarnessOwner,
+) {
+    // Reinspect and explicitly approve the new pinned evidence; the rejected operation
+    // consumed neither the native effect nor the destination's canonical grant.
+    let revised = state
+        .sessions
+        .session_harness_inventory_summary(
+            owner,
+            &bcode_session_models::HarnessInventoryScope::Attempt(HarnessAttemptIdentity {
+                submission_id: "submission".into(),
+                attempt_id: "attempt".into(),
+            }),
+            bcode_session_models::HarnessInventoryKind::Terminal,
+        )
+        .await
+        .unwrap();
+    let mut request = request;
+    request.evidence_revision = revised.observed_through_sequence;
+    request.evidence_sha256 =
+        bcode_workflow::workflow_canonical_value_sha256(&serde_json::to_value(revised).unwrap())
+            .unwrap();
+    let proof = crate::harness_workflow::adopt_execution(state, &request)
+        .await
+        .unwrap();
+    assert_eq!(
+        crate::harness_workflow::adopt_execution(state, &request)
+            .await
+            .unwrap(),
+        proof,
+        "lost adoption acknowledgement must recover without native delivery"
+    );
+    let held = state
+        .workflow_store
+        .lock()
+        .unwrap()
+        .resource_leases_for_run(RUN, 100)
+        .unwrap();
+    assert_eq!(held.len(), 1);
+    assert_eq!(held[0].activation_id, destination.activation_id);
+    let output = wait_for_external_output(state, graph, child).await;
+    assert_eq!(
+        output.value["value"]["execution_handle"]["dispatch_identity"],
+        request.destination.dispatch_identity
+    );
+    assert_eq!(control(state, "count").await, 1);
+    assert_eq!(
+        state
+            .workflow_store
+            .lock()
+            .unwrap()
+            .resource_leases_for_run(RUN, 100)
+            .unwrap()
+            .len(),
+        1
+    );
+    assert_eq!(control(state, "release").await, 1);
+    let mut settled = false;
+    for _ in 0..8 {
+        crate::drive_workflow_run(state, RUN).await.unwrap();
+        settled = state
+            .workflow_store
+            .lock()
+            .unwrap()
+            .attempt_history(RUN, None, 10)
+            .unwrap()
+            .into_iter()
+            .any(|attempt| {
+                attempt.dispatch_identity == request.destination.dispatch_identity
+                    && attempt.status == "succeeded"
+            });
+        if settled {
+            break;
+        }
+    }
+    assert!(
+        settled,
+        "adopted operation must settle from canonical lifecycle evidence"
+    );
+    assert_eq!(
+        state
+            .workflow_store
+            .lock()
+            .unwrap()
+            .resource_leases_for_run(RUN, 100)
+            .unwrap(),
+        [] as [bcode_workflow::WorkflowResourceLease; 0]
+    );
+    assert_eq!(control(state, "count").await, 1);
+}
+
+async fn approve_async_nodes(state: &Arc<ServerState>) {
+    for _ in 0..4 {
+        let approvals = state
+            .workflow_store
+            .lock()
+            .unwrap()
+            .pending_mutation_approvals(RUN, 8)
+            .unwrap();
+        if approvals.is_empty() {
+            break;
+        }
+        for approval in approvals {
+            resolve_mutation_approval(
+                state,
+                &approval.approval_id,
+                bcode_workflow::WorkflowMutationApprovalDecision::Approve,
+            )
+            .await
+            .unwrap();
+        }
+    }
+}
+
+async fn check_production_dispatch(disposition: HarnessTerminalDisposition) {
+    Box::pin(check_execution_dispatch(disposition, None, false)).await;
+}
+
+#[tokio::test]
+async fn production_foreground_completes_with_retained_background_handle() {
+    Box::pin(check_execution_dispatch(
+        HarnessTerminalDisposition::Completed,
+        Some(HarnessCompletionRequirement::Foreground),
+        false,
+    ))
+    .await;
+}
+
+#[tokio::test]
+async fn production_associated_work_waits_and_does_not_resubmit() {
+    Box::pin(check_execution_dispatch(
+        HarnessTerminalDisposition::Completed,
+        Some(HarnessCompletionRequirement::AssociatedWork),
+        false,
+    ))
+    .await;
+}
+
+#[tokio::test]
+async fn production_background_failure_fails_assignment_not_foreground() {
+    Box::pin(check_execution_dispatch(
+        HarnessTerminalDisposition::Completed,
+        Some(HarnessCompletionRequirement::AssociatedWork),
+        true,
+    ))
+    .await;
+}
+
+async fn check_execution_dispatch(
+    disposition: HarnessTerminalDisposition,
+    requirement: Option<HarnessCompletionRequirement>,
+    background_failed: bool,
+) {
+    let _fixture_lifetime = FIXTURE_LIFETIME.lock().await;
+    let root = tempfile::tempdir().unwrap();
+    let state = fixture(root.path());
+    assert_eq!(control(&state, "reset").await, 0);
+    if let Some(requirement) = requirement {
+        let operation = if requirement == HarnessCompletionRequirement::Foreground {
+            "foreground"
+        } else {
+            "execution"
+        };
+        assert_eq!(control(&state, operation).await, 0);
+    }
+    if background_failed {
+        assert_eq!(control(&state, "background_failed").await, 0);
+    }
     match disposition {
         HarnessTerminalDisposition::Completed => {}
         HarnessTerminalDisposition::Failed => {
@@ -610,10 +1258,13 @@ async fn check_production_dispatch(disposition: HarnessTerminalDisposition) {
         text: "offline native assignment".into(),
         placement: HarnessPlacement::NextTurn,
     };
-    let input = json!({"schema_version":1,"state":{"normal_predecessor":"retained"},"value":{"request_json":serde_json::to_string(&json!({
+    let mut input = json!({"schema_version":1,"state":{"normal_predecessor":"retained"},"value":{"request_json":serde_json::to_string(&json!({
         "session_id":target.session_id(),"parent_session_id":null,"assistance_destination_session_id":null,
         "harness":{"schema_version":1,"request_id":"submission","instance":opening.instance,"kind":{"operation":"submit","request":{"target":target,"submission":submission}}}
     })).unwrap()}});
+    if let Some(requirement) = requirement {
+        input["value"]["completion_requirement"] = serde_json::to_value(requirement).unwrap();
+    }
     let block = state
         .plugins
         .registry()
@@ -636,7 +1287,15 @@ async fn check_production_dispatch(disposition: HarnessTerminalDisposition) {
         0,
         "policy preparation cannot deliver native input"
     );
-    approve_and_observe_execution(Arc::clone(&state), &graph, child, disposition).await;
+    approve_and_observe_execution(
+        Arc::clone(&state),
+        &graph,
+        child,
+        disposition,
+        requirement,
+        background_failed,
+    )
+    .await;
     // Retain the daemon, its canonical session writers, and workflow authority through
     // the final awaited application call; release only after all assertions finish.
     drop(state);
@@ -647,6 +1306,8 @@ async fn approve_and_observe_execution(
     graph: &bcode_workflow::WorkflowDefinition,
     child: SessionId,
     disposition: HarnessTerminalDisposition,
+    requirement: Option<HarnessCompletionRequirement>,
+    background_failed: bool,
 ) {
     let approvals = state
         .workflow_store
@@ -699,13 +1360,24 @@ async fn approve_and_observe_execution(
         "retry observation must not resubmit"
     );
     assert_no_external_output(&state);
-    assert_terminal_without_quiescence(&state, child, disposition).await;
-    assert_eq!(control(&state, "release").await, 1);
+    if requirement == Some(HarnessCompletionRequirement::Foreground) {
+        // A completed foreground returns a retained handle; it must not discharge or
+        // interrupt the independently running native background command.
+        assert_eq!(control(&state, "terminal").await, 1);
+    } else {
+        assert_terminal_without_quiescence(&state, child, disposition).await;
+        assert_eq!(control(&state, "release").await, 1);
+    }
+    if background_failed {
+        assert_background_failure(&state, child).await;
+        return;
+    }
     if disposition != HarnessTerminalDisposition::Completed {
         assert_non_success_terminal(&state, child, disposition).await;
         return;
     }
     let output = wait_for_external_output(&state, graph, child).await;
+    assert_foreground_handoff(state.as_ref(), child, requirement, &output.value).await;
     assert_eq!(output.value["state"]["normal_predecessor"], "retained");
     assert_eq!(output.value["value"]["result"], "verified native result");
     assert_eq!(output.value["value"]["submission_id"], "submission");
@@ -720,6 +1392,34 @@ async fn approve_and_observe_execution(
     assert_eq!(run.status, bcode_workflow::RunStatus::Completed);
     assert_eq!(control(&state, "count").await, 1);
     drop(state);
+}
+
+async fn assert_foreground_handoff(
+    state: &ServerState,
+    child: SessionId,
+    requirement: Option<HarnessCompletionRequirement>,
+    output: &Value,
+) {
+    if requirement != Some(HarnessCompletionRequirement::Foreground) {
+        return;
+    }
+    assert!(output["value"]["native_turn_id"].is_null());
+    assert_eq!(output["value"]["execution_handle"]["attempt_id"], "attempt");
+    let (_, evidence) = state
+        .sessions
+        .session_external_harness_submission_evidence(child, "submission", "attempt")
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(evidence.observations.iter().any(|o| matches!(
+        &o.kind,
+        HarnessObservationKind::Execution {
+            event: HarnessExecutionEvent::BackgroundWork {
+                state: HarnessWorkState::Running,
+                ..
+            }
+        }
+    )));
 }
 
 async fn assert_terminal_without_quiescence(
@@ -744,7 +1444,9 @@ async fn assert_terminal_without_quiescence(
                 &event.kind,
                 HarnessObservationKind::NativeTurnTerminal { disposition: actual, .. }
                     if *actual == disposition
-            )
+            ) || matches!(&event.kind, HarnessObservationKind::Execution {
+                event: HarnessExecutionEvent::SubmissionTerminal { disposition: actual, .. }
+            } if *actual == disposition)
         }) {
             assert!(
                 !evidence
@@ -758,6 +1460,56 @@ async fn assert_terminal_without_quiescence(
         tokio::task::yield_now().await;
     }
     panic!("native terminal evidence was not retained");
+}
+
+async fn assert_background_failure(state: &Arc<ServerState>, child: SessionId) {
+    let mut failed = false;
+    for _ in 0..8 {
+        match production_receipt_observation(state).await.unwrap() {
+            bcode_workflow_store::AttemptObservation::Failed { message } => {
+                assert_eq!(message, "managed associated work failed");
+                failed = true;
+                break;
+            }
+            bcode_workflow_store::AttemptObservation::Deferred { .. } => {}
+            other => panic!("background failure must not become success: {other:?}"),
+        }
+        tokio::task::yield_now().await;
+    }
+    assert!(failed);
+    let (_, evidence) = state
+        .sessions
+        .session_external_harness_submission_evidence(child, "submission", "attempt")
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(evidence.observations.iter().any(|o| matches!(
+        &o.kind,
+        HarnessObservationKind::Execution {
+            event: HarnessExecutionEvent::SubmissionTerminal {
+                disposition: HarnessTerminalDisposition::Completed,
+                ..
+            }
+        }
+    )));
+    assert_no_external_output(state);
+    for _ in 0..8 {
+        crate::drive_workflow_run(state, RUN).await.unwrap();
+        let failed = state
+            .workflow_store
+            .lock()
+            .unwrap()
+            .attempt_history(RUN, None, 8)
+            .unwrap()
+            .into_iter()
+            .any(|attempt| attempt.has_receipt && attempt.status == "failed");
+        if failed {
+            assert_eq!(control(state, "count").await, 1);
+            return;
+        }
+        tokio::task::yield_now().await;
+    }
+    panic!("associated failure did not persist as failed workflow attempt");
 }
 
 async fn assert_non_success_terminal(

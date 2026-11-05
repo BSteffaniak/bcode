@@ -39,6 +39,64 @@ fn image_lease_child() {
     }
 }
 
+#[test]
+#[ignore = "subprocess fixture for interrupted image publication"]
+fn interrupted_publication_child() {
+    let root = PathBuf::from(std::env::var_os("BCODE_IMAGE_LEASE_TEST_ROOT").unwrap());
+    let _publication = acquire_daemon_image_publication_lock(&root).unwrap();
+    let temporary = daemon_image_dir(&root).join(format!(".bcode.tmp-{}", std::process::id()));
+    fs::write(&temporary, b"interrupted publication").unwrap();
+    fs::write(root.join("publication-ready"), b"ready").unwrap();
+    loop {
+        std::thread::sleep(Duration::from_millis(10));
+    }
+}
+
+#[test]
+fn publisher_death_releases_lock_and_recovers_abandoned_bytes() {
+    let root = tempfile::tempdir().unwrap();
+    let mut child = LeaseProcess(
+        Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "image_retention_tests::interrupted_publication_child",
+                "--ignored",
+            ])
+            .env("BCODE_IMAGE_LEASE_TEST_ROOT", root.path())
+            .stdout(Stdio::null())
+            .spawn()
+            .unwrap(),
+    );
+    let deadline = std::time::Instant::now() + Duration::from_secs(30);
+    while !root.path().join("publication-ready").exists() {
+        assert!(
+            child.0.try_wait().unwrap().is_none(),
+            "publisher exited early"
+        );
+        assert!(std::time::Instant::now() < deadline, "publisher timed out");
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    let temporary = daemon_image_dir(root.path()).join(format!(".bcode.tmp-{}", child.0.id()));
+    let competitor = fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(daemon_image_dir(root.path()).join("publication.lock"))
+        .unwrap();
+    assert!(matches!(
+        competitor.try_lock(),
+        Err(std::fs::TryLockError::WouldBlock)
+    ));
+    assert!(temporary.exists());
+    child.0.kill().unwrap();
+    child.0.wait().unwrap();
+    competitor.try_lock().unwrap();
+    competitor.unlock().unwrap();
+    let image = ensure_current_executable_cached_in_state(root.path()).unwrap();
+    let (_, digest) = current_executable_identity().unwrap();
+    assert!(daemon_image_is_valid(&image, &digest).unwrap());
+    assert!(!temporary.exists());
+}
+
 fn spawn_lease(root: &Path) -> LeaseProcess {
     LeaseProcess(
         Command::new(std::env::current_exe().unwrap())

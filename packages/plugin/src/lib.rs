@@ -183,7 +183,41 @@ type StreamingServiceFn = unsafe extern "C" fn(
 ) -> i32;
 type EventFn = unsafe extern "C" fn(*const u8, usize) -> i32;
 
+/// Sensitive invocation-only credential resolver. Never stores or serializes secret material.
+pub type SensitiveCredentialResolver = Arc<
+    dyn Fn(
+            &bcode_plugin_sdk::PluginCredentialSelection,
+            &bcode_plugin_sdk::ServiceCancellation,
+        ) -> Result<bcode_plugin_sdk::SensitiveCredential, ()>
+        + Send
+        + Sync,
+>;
+
+#[derive(Clone)]
+struct SensitiveInvocationContext {
+    plugin_id: String,
+    interface_id: String,
+    operation: String,
+    resolver: SensitiveCredentialResolver,
+}
+
+thread_local! {
+    static INVOCATION_CREDENTIALS: std::cell::RefCell<Option<SensitiveInvocationContext>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+struct SensitiveInvocationGuard(Option<SensitiveInvocationContext>);
+impl Drop for SensitiveInvocationGuard {
+    fn drop(&mut self) {
+        INVOCATION_CREDENTIALS.with(|slot| {
+            slot.replace(self.0.take());
+        });
+    }
+}
+
 struct ServiceCallbackState<'a> {
+    credentials: Option<SensitiveCredentialResolver>,
+    credential_reads: usize,
     on_event: &'a mut dyn FnMut(Vec<u8>),
     on_bridge: &'a mut dyn FnMut(
         ServiceBridgeRequest,
@@ -320,6 +354,43 @@ fn service_bridge_callback_with_state(
         return SERVICE_BRIDGE_STATUS_CANCELLED;
     }
     let request = unsafe { std::slice::from_raw_parts(request_ptr, request_len) };
+    if let Some(encoded) = request.strip_prefix(bcode_plugin_sdk::SENSITIVE_CREDENTIAL_PREFIX) {
+        // This reply deliberately bypasses ordinary bridge responses, serde and events.
+        if state.credential_reads >= 4 {
+            return SERVICE_BRIDGE_STATUS_FAILED;
+        }
+        state.credential_reads += 1;
+        if encoded.len() > 8192 {
+            return SERVICE_BRIDGE_STATUS_INVALID_ARGUMENT;
+        }
+        let Ok(selection) =
+            serde_json::from_slice::<bcode_plugin_sdk::PluginCredentialSelection>(encoded)
+        else {
+            return SERVICE_BRIDGE_STATUS_INVALID_ARGUMENT;
+        };
+        if selection.validate().is_err() {
+            return SERVICE_BRIDGE_STATUS_INVALID_ARGUMENT;
+        }
+        let Some(resolver) = &state.credentials else {
+            return SERVICE_BRIDGE_STATUS_FAILED;
+        };
+        let Ok(secret) = resolver(&selection, &state.cancellation) else {
+            return SERVICE_BRIDGE_STATUS_FAILED;
+        };
+        if state.cancellation.is_cancelled() {
+            return SERVICE_BRIDGE_STATUS_CANCELLED;
+        }
+        let bytes = secret.expose().as_bytes();
+        if output_ptr.is_null() || output_capacity < bytes.len() {
+            return SERVICE_BRIDGE_STATUS_FAILED;
+        }
+        // SAFETY: the callback supplies a writable buffer of output_capacity bytes.
+        unsafe {
+            std::ptr::copy_nonoverlapping(bytes.as_ptr(), output_ptr, bytes.len());
+            *output_len = bytes.len();
+        }
+        return SERVICE_BRIDGE_STATUS_OK;
+    }
     let Ok(request) = serde_json::from_slice::<ServiceBridgeRequest>(request) else {
         return SERVICE_BRIDGE_STATUS_INVALID_ARGUMENT;
     };
@@ -1639,6 +1710,36 @@ impl LoadedPlugin {
         )
     }
 
+    fn resolve_service_secrets(
+        &self,
+        interface_id: &str,
+        operation: &str,
+        has_invocation_credentials: bool,
+    ) -> Result<BTreeMap<String, String>, PluginLoadError> {
+        // Credential material is never ordinary configuration for a plugin that
+        // declares the independently versioned sensitive callback service.
+        let sensitive_only = self
+            .manifest
+            .services
+            .iter()
+            .any(|service| service.interface_id == "bcode.plugin.sensitive-credentials/v1");
+        if sensitive_only || has_invocation_credentials {
+            Ok(BTreeMap::new())
+        } else {
+            self.config
+                .resolve_secrets(interface_id, operation)
+                .map_err(|error| match error {
+                    PluginLoadError::SecretResolution { message, .. } => {
+                        PluginLoadError::SecretResolution {
+                            plugin_id: self.manifest.id.clone(),
+                            message,
+                        }
+                    }
+                    other => other,
+                })
+        }
+    }
+
     /// Invoke a service operation with incremental events and a generic bounded bridge.
     ///
     /// # Errors
@@ -1659,18 +1760,21 @@ impl LoadedPlugin {
     ) -> Result<ServiceResponse, PluginLoadError> {
         let interface_id = interface_id.into();
         let operation = operation.into();
-        let secrets = self
-            .config
-            .resolve_secrets(&interface_id, &operation)
-            .map_err(|error| match error {
-                PluginLoadError::SecretResolution { message, .. } => {
-                    PluginLoadError::SecretResolution {
-                        plugin_id: self.manifest.id.clone(),
-                        message,
-                    }
-                }
-                other => other,
-            })?;
+        let invocation_credentials = INVOCATION_CREDENTIALS.with(|slot| {
+            slot.borrow()
+                .as_ref()
+                .filter(|context| {
+                    context.plugin_id == self.manifest.id
+                        && context.interface_id == interface_id
+                        && context.operation == operation
+                })
+                .map(|context| Arc::clone(&context.resolver))
+        });
+        let secrets = self.resolve_service_secrets(
+            &interface_id,
+            &operation,
+            invocation_credentials.is_some(),
+        )?;
         let mut context = NativeServiceContext {
             diagnostics: None,
             plugin_id: self.manifest.id.clone(),
@@ -1694,6 +1798,8 @@ impl LoadedPlugin {
         let mut output_len = 0_usize;
         let mut output = vec![0_u8; output_capacity];
         let mut callback_state = ServiceCallbackState {
+            credentials: invocation_credentials,
+            credential_reads: 0,
             on_event: &mut on_event,
             on_bridge: &mut on_bridge,
             response_chunks: Vec::new(),
@@ -2654,10 +2760,18 @@ enum InvocationBridgeHandler {
 /// Thread-safe request/reply handler attached to one plugin invocation.
 #[derive(Clone)]
 pub struct PluginInvocationBridge {
+    credentials: Option<SensitiveCredentialResolver>,
     handler: Arc<InvocationBridgeHandler>,
 }
 
 impl PluginInvocationBridge {
+    /// Attach a host-admitted resolver to this invocation, not to plugin configuration.
+    #[must_use]
+    pub fn with_credentials(mut self, resolver: SensitiveCredentialResolver) -> Self {
+        self.credentials = Some(resolver);
+        self
+    }
+
     fn require_synchronous(&self, plugin_id: &str) -> Result<(), PluginLoadError> {
         match self.handler.as_ref() {
             InvocationBridgeHandler::Synchronous(_) => Ok(()),
@@ -2681,6 +2795,7 @@ impl PluginInvocationBridge {
         + 'static,
     ) -> Self {
         Self {
+            credentials: None,
             handler: Arc::new(InvocationBridgeHandler::Synchronous(Arc::new(handler))),
         }
     }
@@ -2699,6 +2814,7 @@ impl PluginInvocationBridge {
         Fut: std::future::Future<Output = Result<ServiceBridgeResponse, String>> + Send + 'static,
     {
         Self {
+            credentials: None,
             handler: Arc::new(InvocationBridgeHandler::Asynchronous(
                 bcode_plugin_sdk::AsyncServiceBridge::new(move |request, cancellation| {
                     let future = handler(request, cancellation);
@@ -4377,6 +4493,33 @@ impl PluginRuntimeHost {
         self
     }
 
+    /// Configure bounded capacity for non-query/control service invocations.
+    ///
+    /// Call before sharing this runtime or starting work. Capacity is shared across
+    /// plugins; manifest concurrency limits and authorization remain independently
+    /// enforced. Query/control capacity is unchanged. The default remains 64 global
+    /// invocations and four per session. Permits retain their normal invocation lifetime.
+    ///
+    /// # Errors
+    /// Returns an error for capacities outside `1..=1024`, a per-session capacity
+    /// exceeding the global capacity, or a shared, active, or closed limiter.
+    pub fn set_invocation_capacity(
+        &mut self,
+        global: u16,
+        per_session: u16,
+    ) -> Result<(), &'static str> {
+        if global == 0 || global > 1024 || per_session == 0 || per_session > global {
+            return Err("invocation capacity must satisfy 1 <= per_session <= global <= 1024");
+        }
+        let resources = Arc::get_mut(&mut self.resources)
+            .ok_or("invocation capacity requires an unshared runtime")?;
+        if Arc::strong_count(&resources.global) != 1 || resources.global.is_closed() {
+            return Err("invocation capacity cannot replace an active or closed limiter");
+        }
+        *resources = PluginResourceLimiter::new(usize::from(global), usize::from(per_session));
+        Ok(())
+    }
+
     /// Invoke a service operation on a loaded plugin by ID.
     ///
     /// # Errors
@@ -5287,6 +5430,18 @@ fn execute_plugin_service_invocation(
         "plugin service invocation started"
     );
     let bridge = invocation.bridge.clone();
+    let credentials = bridge
+        .as_ref()
+        .and_then(|bridge| bridge.credentials.clone());
+    let previous = INVOCATION_CREDENTIALS.with(|slot| {
+        slot.replace(credentials.map(|resolver| SensitiveInvocationContext {
+            plugin_id: plugin.manifest.id.clone(),
+            interface_id: invocation.interface_id.clone(),
+            operation: invocation.operation.clone(),
+            resolver,
+        }))
+    });
+    let _sensitive_guard = SensitiveInvocationGuard(previous);
     let mut delivered_events = 0_u64;
     let capture = invocation.diagnostics.0.clone();
     let invoke = || {
@@ -9880,6 +10035,66 @@ library = "libexample_plugin.dylib"
     }
 
     #[tokio::test]
+    async fn explicit_invocation_capacity_is_bounded_and_retains_live_permits() {
+        let mut host = PluginRuntimeHost::from(PluginHost::default());
+        let scope = PluginInvocationScope::Global;
+        let mut held = Vec::new();
+        for _ in 0..64 {
+            held.push(host.resources.acquire(&scope).await.unwrap());
+        }
+        let mut waiting = Box::pin(host.resources.acquire(&scope));
+        assert_admission_pending(waiting.as_mut()).await;
+        drop(waiting);
+        assert!(host.set_invocation_capacity(128, 4).is_err());
+        drop(held);
+        host.set_invocation_capacity(128, 4).unwrap();
+        let clone = host.clone();
+        assert!(host.set_invocation_capacity(256, 4).is_err());
+        drop(clone);
+        let mut held = Vec::new();
+        for _ in 0..128 {
+            held.push(host.resources.acquire(&scope).await.unwrap());
+        }
+        let mut waiting = Box::pin(host.resources.acquire(&scope));
+        assert_admission_pending(waiting.as_mut()).await;
+        drop(held.pop());
+        let permit = waiting.await.unwrap();
+        assert!(host.set_invocation_capacity(256, 4).is_err());
+        drop(permit);
+        drop(held);
+        host.set_invocation_capacity(64, 4).unwrap();
+    }
+
+    #[tokio::test]
+    async fn invocation_capacity_rejects_invalid_policy_and_keeps_session_isolation() {
+        let mut host = PluginRuntimeHost::from(PluginHost::default());
+        for (global, session) in [(0, 1), (1, 0), (2, 3), (1025, 4), (u16::MAX, 4)] {
+            assert!(host.set_invocation_capacity(global, session).is_err());
+        }
+        host.set_invocation_capacity(1024, 1024).unwrap();
+        host.set_invocation_capacity(128, 4).unwrap();
+        let session = PluginInvocationScope::session("bounded-session");
+        let mut held = Vec::new();
+        for _ in 0..4 {
+            held.push(host.resources.acquire(&session).await.unwrap());
+        }
+        let mut waiting = Box::pin(host.resources.acquire(&session));
+        assert_admission_pending(waiting.as_mut()).await;
+        let other = host
+            .resources
+            .acquire(&PluginInvocationScope::session("other"))
+            .await
+            .unwrap();
+        drop(held.pop());
+        drop(waiting.await.unwrap());
+        drop(held);
+        drop(other);
+        host.resources.close();
+        assert!(host.set_invocation_capacity(128, 4).is_err());
+        drop(host);
+    }
+
+    #[tokio::test]
     async fn saturated_plugin_waiters_leave_shared_capacity_available() {
         let mut host = PluginRuntimeHost::from(PluginHost::default());
         host.resources = Arc::new(PluginResourceLimiter::new(2, 2));
@@ -12869,5 +13084,115 @@ library = "libexample_plugin.dylib"
             .expect("system clock should be after epoch")
             .as_nanos();
         std::env::temp_dir().join(format!("bcode-plugin-test-{nanos}"))
+    }
+}
+
+#[cfg(test)]
+mod sensitive_credential_tests {
+    use super::*;
+
+    #[test]
+    fn raw_sensitive_reply_never_enters_events_or_ordinary_bridge_and_cancellation_denies() {
+        let selection = bcode_plugin_sdk::PluginCredentialSelection {
+            instance_id: "selected".into(),
+            provider_id: "test-api".into(),
+            profile: "profile".into(),
+            credential_namespace: "namespace".into(),
+            custody: bcode_provider_auth_models::managed::AuthCustodyMode::VaultManaged,
+            credential_id: "api_key".into(),
+        };
+        let exact = selection.clone();
+        let resolver: SensitiveCredentialResolver = Arc::new(move |requested, cancelled| {
+            if requested != &exact || cancelled.is_cancelled() {
+                return Err(());
+            }
+            bcode_plugin_sdk::SensitiveCredential::new("synthetic-secret".into()).map_err(|_| ())
+        });
+        let event_count = std::cell::Cell::new(0);
+        let ordinary_count = std::cell::Cell::new(0);
+        let cancellation = bcode_plugin_sdk::ServiceCancellation::default();
+        let mut events = |_: Vec<u8>| {
+            event_count.set(event_count.get() + 1);
+        };
+        let mut ordinary = |_, _| {
+            ordinary_count.set(ordinary_count.get() + 1);
+            Err("must not route sensitive replies through ordinary bridge".into())
+        };
+        let mut state = ServiceCallbackState {
+            credentials: Some(resolver),
+            credential_reads: 0,
+            on_event: &mut events,
+            on_bridge: &mut ordinary,
+            response_chunks: Vec::new(),
+            cancellation,
+        };
+        let mut request = bcode_plugin_sdk::SENSITIVE_CREDENTIAL_PREFIX.to_vec();
+        request.extend(serde_json::to_vec(&selection).unwrap());
+        let mut output = [0_u8; 64];
+        let mut length = 0;
+        assert_eq!(
+            service_bridge_callback_with_state(
+                request.as_ptr(),
+                request.len(),
+                output.as_mut_ptr(),
+                output.len(),
+                &raw mut length,
+                &mut state,
+            ),
+            SERVICE_BRIDGE_STATUS_OK
+        );
+        assert_eq!(&output[..length], b"synthetic-secret");
+        output.fill(0);
+        // Validly shaped but ungranted profile must not be forwarded to the
+        // ordinary bridge or leave material in the caller's response buffer.
+        let mut wrong = selection;
+        wrong.profile = "ungranted".into();
+        let mut wrong_request = bcode_plugin_sdk::SENSITIVE_CREDENTIAL_PREFIX.to_vec();
+        wrong_request.extend(serde_json::to_vec(&wrong).unwrap());
+        assert_eq!(
+            service_bridge_callback_with_state(
+                wrong_request.as_ptr(),
+                wrong_request.len(),
+                output.as_mut_ptr(),
+                output.len(),
+                &raw mut length,
+                &mut state,
+            ),
+            SERVICE_BRIDGE_STATUS_FAILED
+        );
+        assert!(output.iter().all(|byte| *byte == 0));
+        // Revocation/cancellation during the resolver, not just before entry,
+        // must prevent raw secret bytes from being copied to the plugin.
+        state.credentials = Some(Arc::new(|_, cancellation| {
+            cancellation.cancel();
+            bcode_plugin_sdk::SensitiveCredential::new("must-not-be-delivered".into())
+                .map_err(|_| ())
+        }));
+        assert_eq!(
+            service_bridge_callback_with_state(
+                request.as_ptr(),
+                request.len(),
+                output.as_mut_ptr(),
+                output.len(),
+                &raw mut length,
+                &mut state,
+            ),
+            SERVICE_BRIDGE_STATUS_CANCELLED
+        );
+        assert!(output.iter().all(|byte| *byte == 0));
+        assert_eq!(
+            service_bridge_callback_with_state(
+                request.as_ptr(),
+                request.len(),
+                output.as_mut_ptr(),
+                output.len(),
+                &raw mut length,
+                &mut state,
+            ),
+            SERVICE_BRIDGE_STATUS_CANCELLED
+        );
+        assert!(output.iter().all(|byte| *byte == 0));
+        assert_eq!(event_count.get(), 0);
+        assert_eq!(ordinary_count.get(), 0);
     }
 }

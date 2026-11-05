@@ -26,8 +26,16 @@ Resolved plugin configuration is a typed `instances` map. Each instance has:
   fresh idle required after task completion. Unknown task classes disable that
   evidence; unverified mode reports unknown activity, never settlement. These
   enforced producer guarantees are not free-text host admission constraints.
+* `verified_native_auth_status`: defaults false; only enable after testing the exact
+  executable's local `auth status` contract, namespace output, exit status, and
+  native-account billing classification. Allows status preflight and runtime launch
+  for an already logged-in account, but never login handoff. Authentication capability
+  remains `Unsupported` with an explicit status-only constraint; local status is
+  available, not remote credential verification. This does not verify settlement.
 * `verified_native_auth`: defaults false; only enable after testing the exact
   executable's `auth status` namespace output and supported native login handoff.
+  Retains the combined status-and-login attestation for backward compatibility and
+  takes precedence over `verified_native_auth_status` when both are true.
 * `setting_sources`: absent preserves native settings inheritance; a list selects
   explicit native sources (an empty list excludes optional sources). Managed
   policy is never bypassed.

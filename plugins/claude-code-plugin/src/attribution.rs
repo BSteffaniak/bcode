@@ -52,6 +52,18 @@ impl Producer {
         );
         Ok(uuid)
     }
+    pub(crate) fn retire(&mut self, retired: &[bcode_harness_models::HarnessAttemptIdentity]) {
+        self.attempts.retain(|_, (submission, attempt)| {
+            !retired
+                .iter()
+                .any(|old| &old.submission_id == submission && &old.attempt_id == attempt)
+        });
+        self.evidence.retain(|entry| {
+            !retired.iter().any(|old| {
+                old.submission_id == entry.submission_id && old.attempt_id == entry.attempt_id
+            })
+        });
+    }
     pub(crate) fn record(
         &mut self,
         evidence: &SubmissionAttribution,

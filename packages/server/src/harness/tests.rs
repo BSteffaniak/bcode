@@ -19,6 +19,8 @@ struct Store {
     revocations: Arc<AtomicUsize>,
     claims: Arc<Mutex<std::collections::BTreeMap<String, Vec<u8>>>>,
     completed: Arc<Mutex<std::collections::BTreeMap<String, Vec<u8>>>>,
+    retention: Option<HarnessRetentionContext>,
+    retention_failure: bool,
 }
 
 impl Store {
@@ -35,6 +37,8 @@ impl Store {
             revocations: Arc::default(),
             claims: Arc::default(),
             completed: Arc::default(),
+            retention: None,
+            retention_failure: false,
         }
     }
     fn verify(&self, owner: &HarnessOwner) -> Result<(), ManagedHarnessError> {
@@ -228,6 +232,18 @@ impl ManagedHarnessStore for Store {
     {
         std::future::poll_fn(move |_| std::task::Poll::Ready(Ok(None)))
     }
+    async fn retention_context(
+        &self,
+        owner: &HarnessOwner,
+        _: &HarnessSessionTarget,
+        _: Option<&str>,
+    ) -> Result<Option<HarnessRetentionContext>, ManagedHarnessError> {
+        std::future::ready(self.verify(owner)).await?;
+        if self.retention_failure {
+            return Err(ManagedHarnessError::Storage);
+        }
+        Ok(self.retention.clone())
+    }
     fn observations(
         &self,
         owner: &HarnessOwner,
@@ -244,6 +260,9 @@ impl ManagedHarnessStore for Store {
     {
         std::future::poll_fn(move |_| {
             std::task::Poll::Ready(Ok(HarnessObservationPage {
+                retention: None,
+                hydration_requests: vec![],
+                inventory_page: None,
                 observations: vec![],
                 next_after: None,
                 completeness: HarnessCompleteness::Partial,
@@ -257,6 +276,63 @@ impl ManagedHarnessStore for Store {
             }))
         })
     }
+}
+
+#[derive(Clone)]
+struct ObserveRetention {
+    expected: HarnessRetentionContext,
+    calls: Arc<AtomicUsize>,
+}
+impl ManagedHarnessTransport for ObserveRetention {
+    async fn invoke(
+        &self,
+        request: &HarnessRequest,
+    ) -> Result<HarnessServiceResponse, ManagedHarnessError> {
+        std::future::ready(()).await;
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        let HarnessRequestKind::Observe(observe) = &request.kind else {
+            panic!("expected read-only observation");
+        };
+        assert_eq!(observe.retention.as_ref(), Some(&self.expected));
+        Err(ManagedHarnessError::Unavailable)
+    }
+}
+
+#[tokio::test]
+async fn observation_receives_only_store_retention_and_storage_failure_prevents_poll() {
+    let retention = HarnessRetentionContext {
+        connection_id: "connection".into(),
+        acknowledgment: Some(HarnessCanonicalAck {
+            page_id: "page".into(),
+            canonical_revision: 7,
+            observations_digest: "a".repeat(64),
+        }),
+        hydration: vec![],
+    };
+    let mut store = Store::new();
+    store.retention = Some(retention.clone());
+    let owner = store.owner.clone();
+    let transport = ObserveRetention {
+        expected: retention,
+        calls: Arc::default(),
+    };
+    let runtime = ManagedHarnessRuntime::new(store.clone(), transport.clone());
+    assert!(matches!(
+        runtime
+            .observe(&owner, "poll".into(), Some("committed".into()), 1, 0)
+            .await,
+        Err(ManagedHarnessError::Unavailable)
+    ));
+    assert_eq!(transport.calls.load(Ordering::SeqCst), 1);
+    store.retention_failure = true;
+    let runtime = ManagedHarnessRuntime::new(store, transport.clone());
+    assert!(matches!(
+        runtime
+            .observe(&owner, "poll-next".into(), Some("committed".into()), 1, 0)
+            .await,
+        Err(ManagedHarnessError::Storage)
+    ));
+    assert_eq!(transport.calls.load(Ordering::SeqCst), 1);
 }
 
 #[derive(Clone, Default)]

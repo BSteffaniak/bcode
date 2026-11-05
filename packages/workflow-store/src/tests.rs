@@ -3802,7 +3802,10 @@ fn current_schema_accepts_uncapped_default_limits_without_rewriting_policy() {
     store
         .persist_definition("example", 1, &definition("example"))
         .expect("definition");
-    assert_eq!(detected_typed_store_schema(&store.connection), Some(43));
+    assert_eq!(
+        detected_typed_store_schema(&store.connection),
+        Some(WORKFLOW_STORE_SCHEMA_VERSION)
+    );
     let run = new_run();
     assert_eq!(run.limits.concurrency_cap, None);
     store.create_run(&run).expect("uncapped admission");
@@ -3822,7 +3825,10 @@ fn current_schema_accepts_uncapped_default_limits_without_rewriting_policy() {
             .concurrency_cap,
         None
     );
-    assert_eq!(detected_typed_store_schema(&reopened.connection), Some(43));
+    assert_eq!(
+        detected_typed_store_schema(&reopened.connection),
+        Some(WORKFLOW_STORE_SCHEMA_VERSION)
+    );
 }
 
 fn initialized_store() -> (tempfile::TempDir, WorkflowStore) {

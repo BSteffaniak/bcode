@@ -13,8 +13,15 @@ mod history;
 mod policy;
 mod runtime;
 mod store;
+mod tool_invocation;
+mod tool_queue;
 mod transport;
+pub use tool_invocation::{ManagedToolBridge, ManagedToolEndpoint};
+pub(crate) use tool_queue::ToolQueueHost;
+pub(crate) use transport::with_credential_admission;
 
+#[cfg(test)]
+mod auth_status_tests;
 #[cfg(test)]
 mod canonical_tests;
 #[cfg(test)]

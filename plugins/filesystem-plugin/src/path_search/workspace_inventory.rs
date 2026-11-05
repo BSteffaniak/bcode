@@ -12,7 +12,7 @@ const fn resource_identity(metadata: &Metadata) -> ResourceIdentity {
     (metadata.identity(), metadata.len(), metadata.modified())
 }
 type CapturedInventory = (BTreeSet<String>, PolicyDigests, Option<String>);
-type LoadedInventory = (Arc<BTreeSet<String>>, Option<String>);
+pub(super) type LoadedInventory = (Arc<BTreeSet<String>>, Option<String>);
 pub(super) type PolicyDigests = BTreeMap<String, Option<[u8; 32]>>;
 pub(super) struct Progress {
     pub pending: Vec<(PathBuf, usize, Vec<super::ignore_policy::Rule>)>,

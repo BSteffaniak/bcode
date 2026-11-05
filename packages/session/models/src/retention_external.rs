@@ -120,6 +120,7 @@ pub(super) fn observation(
         i.text(correlation, 6)?;
     }
     match &observation.kind {
+        HarnessObservationKind::Execution { event } => execution(i, event)?,
         HarnessObservationKind::SubmissionAccepted {
             submission_id,
             attempt_id,
@@ -193,4 +194,73 @@ pub(super) fn observation(
         }
     }
     Ok(())
+}
+
+fn execution(i: &mut Inspector, event: &bcode_harness_models::HarnessExecutionEvent) -> Result {
+    use bcode_harness_models::HarnessExecutionEvent as E;
+    i.nodes(8, 6)?;
+    match event {
+        E::SubmissionTerminal {
+            attempt,
+            native_turn_id,
+            native_frame_id,
+            output,
+            ..
+        } => {
+            attempt_identity(i, attempt)?;
+            for value in [native_turn_id, native_frame_id, output]
+                .into_iter()
+                .flatten()
+            {
+                i.text(value, 7)?;
+            }
+        }
+        E::BackgroundWork {
+            work_id,
+            native_task_id,
+            origin,
+            parent_work_id,
+            label,
+            ..
+        } => {
+            i.text(work_id, 7)?;
+            i.text(label, 7)?;
+            for value in [native_task_id, parent_work_id].into_iter().flatten() {
+                i.text(value, 7)?;
+            }
+            if let Some(origin) = origin {
+                attempt_identity(i, origin)?;
+            }
+        }
+        E::Continuation {
+            continuation_id,
+            origin,
+            source_work_id,
+            native_turn_id,
+            output,
+            ..
+        } => {
+            i.text(continuation_id, 7)?;
+            for value in [source_work_id, native_turn_id, output]
+                .into_iter()
+                .flatten()
+            {
+                i.text(value, 7)?;
+            }
+            if let Some(origin) = origin {
+                attempt_identity(i, origin)?;
+            }
+        }
+        E::Coverage { attempt, .. } => attempt_identity(i, attempt)?,
+    }
+    Ok(())
+}
+
+fn attempt_identity(
+    i: &mut Inspector,
+    attempt: &bcode_harness_models::HarnessAttemptIdentity,
+) -> Result {
+    i.nodes(2, 7)?;
+    i.text(&attempt.submission_id, 8)?;
+    i.text(&attempt.attempt_id, 8)
 }

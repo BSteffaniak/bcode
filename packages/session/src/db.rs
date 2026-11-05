@@ -13,7 +13,7 @@ mod external_backend_manager;
 #[path = "harness_manager.rs"]
 mod harness_manager;
 #[path = "db_harness_operation.rs"]
-mod harness_operation;
+pub(crate) mod harness_operation;
 #[path = "harness_prepare.rs"]
 mod harness_prepare;
 use external_backend::{project_external_backend, validate_external_backend_append};
@@ -2100,25 +2100,46 @@ impl SessionDb {
         }))
     }
 
-    async fn latest_agent_selection(&self) -> SessionDbResult<Option<String>> {
+    async fn latest_summary_event_row(
+        &self,
+        event_type: &str,
+    ) -> SessionDbResult<Option<switchy::database::Row>> {
+        let locator = self
+            .db
+            .select("events")
+            .project_as(
+                switchy::database::query::max(switchy::database::query::identifier("event_seq")),
+                "event_seq",
+            )
+            .where_eq("event_type", event_type)
+            .execute_first(&**self.db)
+            .await?
+            .ok_or_else(|| SessionDbError::InvalidRow {
+                column: "event_seq".into(),
+            })?;
+        if matches!(locator.get("event_seq"), Some(DatabaseValue::Null)) {
+            return Ok(None);
+        }
+        let sequence = required_non_negative_u64(&locator, "event_seq")?;
+        // Fetch by canonical primary key, retaining the type predicate. A vanished or
+        // changed locator is damage/racing state, not evidence that the type is absent.
         let row = self
             .db
             .select("events")
             .columns(&["event_seq", "payload"])
-            .where_eq("event_type", "agent_changed")
-            .sort("event_seq", SortDirection::Desc)
-            .limit(1)
+            .where_eq("event_seq", seq_to_value(sequence))
+            .where_eq("event_type", event_type)
             .execute_first(&**self.db)
-            .await?;
-        let message_row = self
-            .db
-            .select("events")
-            .columns(&["event_seq", "payload"])
-            .where_eq("event_type", "user_message")
-            .sort("event_seq", SortDirection::Desc)
-            .limit(1)
-            .execute_first(&**self.db)
-            .await?;
+            .await?
+            .ok_or_else(|| SessionDbError::InvalidRow {
+                column: "event_seq".into(),
+            })?;
+        Ok(Some(row))
+    }
+
+    async fn latest_agent_selection(&self) -> SessionDbResult<Option<String>> {
+        let row = self.latest_summary_event_row("agent_changed").await?;
+        let message_row = self.latest_summary_event_row("user_message").await?;
         if let Some(message_row) = message_row {
             let message = strict_event_from_row(&message_row, self.session_id)?;
             let legacy_sequence = row
@@ -5126,15 +5147,7 @@ impl SessionDb {
     async fn latest_context_compaction_event(&self) -> SessionDbResult<Option<SessionEvent>> {
         let mut latest = None;
         for event_type in ["context_compacted", "provider_context_compacted"] {
-            let row = self
-                .db
-                .select("events")
-                .columns(&["payload"])
-                .where_eq("event_type", event_type)
-                .sort("event_seq", SortDirection::Desc)
-                .limit(1)
-                .execute_first(&**self.db)
-                .await?;
+            let row = self.latest_summary_event_row(event_type).await?;
             let Some(row) = row.as_ref() else {
                 continue;
             };
@@ -5802,7 +5815,10 @@ async fn rebuild_migration_projections(
                 metrics.increment_counter(counter);
             }
             validate_canonical_event_identity(&current_row.event, event_seq, session_id)?;
-            let event = current_row.event;
+            let mut event = current_row.event;
+            // Preparation is current-format target behavior over the already-ingested prefix.
+            // Persist the prepared event, not the stateless normalization intermediate.
+            target.prepare_current_event(&mut event).await?;
             let original = crate::persisted::original_usage(&payload)
                 .map_err(|column| SessionDbError::InvalidRow { column })?;
             let current_payload =
@@ -6064,6 +6080,25 @@ pub(crate) struct SessionMigrationTarget<'a> {
 }
 
 impl<'a> SessionMigrationTarget<'a> {
+    /// Prepare one normalized current event against the already-ingested canonical prefix.
+    /// Call before inserting this event, then ingest it before preparing the next event.
+    /// This computes commitments only; it grants no migration ownership or append authority.
+    /// Existing nonempty commitments must match exactly. Projection repeats the comparison.
+    pub(crate) async fn prepare_current_event(
+        &self,
+        event: &mut SessionEvent,
+    ) -> SessionDbResult<()> {
+        if let SessionEventKind::ExternalHarnessOperation { operation } = &mut event.kind {
+            harness_operation::prepare_current_inventory_operation(
+                self.db,
+                operation,
+                event.sequence,
+            )
+            .await?;
+        }
+        Ok(())
+    }
+
     #[must_use]
     #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) const fn new(db: &'a dyn Database, metrics: &'a MetricsRegistry) -> Self {
@@ -6101,6 +6136,7 @@ impl bcode_session_migration_target::MigrationTarget for SessionMigrationTarget<
             "projection_checkpoints",
             "artifact_references",
             "runtime_work",
+            "managed_tool_claims",
             "tool_runs",
             "transcript_items",
             "input_messages",
@@ -6126,6 +6162,20 @@ impl bcode_session_migration_target::MigrationTarget for SessionMigrationTarget<
                 .execute(self.db)
                 .await?;
         }
+        // Exclusive migration target only. Old materialized roots cannot be used
+        // while preparing the new chronological prefix. Canonical commitments
+        // are handled by migration-owned normalization, never by current reindex.
+        for (start, end) in [
+            ("execution_v3:", "execution_v3;"),
+            ("harness_inventory_node_v1:", "harness_inventory_node_v1;"),
+        ] {
+            self.db
+                .delete("snapshots")
+                .where_gte("snapshot_name", start)
+                .where_lt("snapshot_name", end)
+                .execute(self.db)
+                .await?;
+        }
         Ok(())
     }
 
@@ -6147,6 +6197,12 @@ impl bcode_session_migration_target::MigrationTarget for SessionMigrationTarget<
             .value(
                 "schema_version",
                 DatabaseValue::Int32(i32::from(row.schema_version)),
+            )
+            .value(
+                "managed_tool_key",
+                crate::db_managed_tool::canonical_key(&crate::persisted::decode_session_event(
+                    &row.payload,
+                )?)?,
             )
             .value("payload", row.payload)
             .where_eq("event_seq", seq_to_value(row.sequence))
@@ -6198,6 +6254,7 @@ impl bcode_session_migration_target::MigrationTarget for SessionMigrationTarget<
     ) -> Result<bcode_session_migration_target::StrictValidation, Self::Error> {
         let canonical_tail = last_sequence(self.db).await?;
         harness_operation::validate_migration_keys(self.db).await?;
+        crate::db_managed_tool::validate_migration_keys(self.db).await?;
         let facts = migration_target_validation_facts(self.db, canonical_tail).await?;
         Ok(facts)
     }
@@ -7057,6 +7114,7 @@ async fn project_event(
         update_session_state(db, event).await?;
     }
     crate::milestone::project(db, event).await?;
+    crate::db_managed_tool::project(db, event).await?;
     match &event.kind {
         SessionEventKind::SessionCreated {
             name,
@@ -7954,6 +8012,235 @@ mod tests {
                 (name, bytes)
             })
             .collect()
+    }
+
+    #[tokio::test]
+    async fn summary_latest_locators_preserve_agent_precedence_and_decode_errors() {
+        let root = tempfile::tempdir().expect("temporary root");
+        let id = SessionId::new();
+        let db = SessionDb::open_turso_in_root(id, root.path())
+            .await
+            .expect("current DB");
+        assert_eq!(
+            db.latest_agent_selection().await.expect("empty agent"),
+            None
+        );
+        assert!(
+            db.latest_context_compaction_event()
+                .await
+                .expect("empty marker")
+                .is_none()
+        );
+        for sequence in [7, 2] {
+            insert_event(
+                db.database(),
+                &event(
+                    id,
+                    sequence,
+                    SessionEventKind::AgentChanged {
+                        agent_id: format!("agent-{sequence}"),
+                    },
+                ),
+                None,
+            )
+            .await
+            .expect("agent row");
+        }
+        assert_eq!(
+            db.latest_agent_selection()
+                .await
+                .expect("newest agent")
+                .as_deref(),
+            Some("agent-7")
+        );
+        let mut admission = bcode_session_models::TurnAdmissionMetadata::default();
+        admission.execution.agent_profile = Some("admitted-agent".into());
+        insert_event(
+            db.database(),
+            &event(
+                id,
+                9,
+                SessionEventKind::UserMessage {
+                    client_id: ClientId::new(),
+                    text: "prompt".into(),
+                    admission,
+                },
+            ),
+            None,
+        )
+        .await
+        .expect("admitted message");
+        assert_eq!(
+            db.latest_agent_selection()
+                .await
+                .expect("admission wins")
+                .as_deref(),
+            Some("admitted-agent")
+        );
+        insert_event(
+            db.database(),
+            &event(
+                id,
+                10,
+                SessionEventKind::UserMessage {
+                    client_id: ClientId::new(),
+                    text: "prompt".into(),
+                    admission: bcode_session_models::TurnAdmissionMetadata::default(),
+                },
+            ),
+            None,
+        )
+        .await
+        .expect("message without agent");
+        assert_eq!(
+            db.latest_agent_selection()
+                .await
+                .expect("legacy fallback")
+                .as_deref(),
+            Some("agent-7")
+        );
+        db.database()
+            .update("events")
+            .value("payload", "malformed current payload")
+            .where_eq("event_seq", 10_i64)
+            .execute(db.database())
+            .await
+            .expect("damage latest");
+        assert!(db.latest_agent_selection().await.is_err());
+    }
+
+    #[tokio::test]
+    async fn summary_compaction_locator_preserves_boundaries_and_rejects_damage() {
+        let root = tempfile::tempdir().expect("temporary root");
+        let id = SessionId::new();
+        let db = SessionDb::open_turso_in_root(id, root.path())
+            .await
+            .expect("current DB");
+        for (sequence, boundary) in [(8, 7), (3, 2)] {
+            insert_event(
+                db.database(),
+                &event(
+                    id,
+                    sequence,
+                    SessionEventKind::ContextCompacted {
+                        summary: "summary".into(),
+                        compacted_through_sequence: boundary,
+                    },
+                ),
+                None,
+            )
+            .await
+            .expect("compaction row");
+        }
+        assert_eq!(
+            db.latest_context_compaction_sequence()
+                .await
+                .expect("newest boundary"),
+            Some(7)
+        );
+        insert_event(
+            db.database(),
+            &event(
+                id,
+                9,
+                SessionEventKind::ContextCompacted {
+                    summary: "invalid boundary".into(),
+                    compacted_through_sequence: 10,
+                },
+            ),
+            None,
+        )
+        .await
+        .expect("invalid marker fixture");
+        assert!(matches!(
+            db.latest_context_compaction_event().await,
+            Err(SessionDbError::InvalidCompactionMarker { .. })
+        ));
+        db.database()
+            .delete("events")
+            .execute(db.database())
+            .await
+            .expect("clear fixture");
+        db.database()
+            .insert("events")
+            .value("event_seq", -1_i64)
+            .value("event_type", "agent_changed")
+            .value(
+                "schema_version",
+                i64::from(bcode_session_models::CURRENT_SESSION_EVENT_SCHEMA_VERSION),
+            )
+            .value("payload", "negative locator fixture")
+            .execute(db.database())
+            .await
+            .expect("negative fixture");
+        assert!(matches!(db.latest_agent_selection().await,
+            Err(SessionDbError::InvalidRow { column }) if column == "event_seq"));
+    }
+
+    #[tokio::test]
+    async fn canonical_tail_extremum_handles_empty_unordered_and_invalid_sequences() {
+        let root = tempfile::tempdir().expect("temporary root");
+        let id = SessionId::new();
+        let db = SessionDb::open_turso_in_root(id, root.path())
+            .await
+            .expect("current DB");
+        assert_eq!(
+            last_sequence(db.database()).await.expect("empty tail"),
+            None
+        );
+        // Exercise the canonical-row reader directly, not append admission: physical
+        // insertion order must not determine the maximum retained sequence.
+        for sequence in [7, 2, 5] {
+            let retained = event(
+                id,
+                sequence,
+                SessionEventKind::SessionCreated {
+                    name: None,
+                    working_directory: root.path().to_path_buf(),
+                },
+            );
+            insert_event(db.database(), &retained, None)
+                .await
+                .expect("canonical row");
+            assert_eq!(
+                last_sequence(db.database()).await.expect("newest tail"),
+                Some(7)
+            );
+        }
+        let retained = event(
+            id,
+            i64::MAX.cast_unsigned(),
+            SessionEventKind::SessionCreated {
+                name: None,
+                working_directory: root.path().to_path_buf(),
+            },
+        );
+        insert_event(db.database(), &retained, None)
+            .await
+            .expect("scalar boundary");
+        assert_eq!(
+            last_sequence(db.database()).await.expect("bounded scalar"),
+            Some(i64::MAX.cast_unsigned())
+        );
+        db.database()
+            .delete("events")
+            .execute(db.database())
+            .await
+            .expect("clear fixture");
+        db.database()
+            .insert("events")
+            .value("event_seq", -1_i64)
+            .value("event_type", "session_created")
+            .value(
+                "schema_version",
+                i64::from(bcode_session_models::CURRENT_SESSION_EVENT_SCHEMA_VERSION),
+            )
+            .value("payload", "invalid sequence fixture")
+            .execute(db.database())
+            .await
+            .expect("negative fixture");
+        assert!(matches!(last_sequence(db.database()).await,
+            Err(SessionDbError::InvalidRow { column }) if column == "event_seq"));
     }
 
     #[tokio::test]
@@ -11124,18 +11411,20 @@ mod tests {
                 text: "incompatible writer must not commit".to_string(),
             },
         );
-        let error = migrated
-            .append_event_for_writer_epoch(&rejected, None, LEGACY_SESSION_STORAGE_WRITER_EPOCH)
-            .await
-            .expect_err("legacy writer must be fenced before canonical insert");
-        assert!(matches!(
-            error,
-            SessionDbError::WriterIncompatible {
-                actual: Some(actual),
-                expected
-            } if actual == u64::from(CURRENT_SESSION_STORAGE_WRITER_EPOCH)
-                && expected == u64::from(LEGACY_SESSION_STORAGE_WRITER_EPOCH)
-        ));
+        for writer_epoch in [LEGACY_SESSION_STORAGE_WRITER_EPOCH, 21, 22] {
+            let error = migrated
+                .append_event_for_writer_epoch(&rejected, None, writer_epoch)
+                .await
+                .expect_err("older writer must be fenced before canonical insert");
+            assert!(matches!(
+                error,
+                SessionDbError::WriterIncompatible {
+                    actual: Some(actual),
+                    expected
+                } if actual == u64::from(CURRENT_SESSION_STORAGE_WRITER_EPOCH)
+                    && expected == u64::from(writer_epoch)
+            ));
+        }
         assert_eq!(
             migrated
                 .last_event_sequence()
@@ -11697,6 +11986,20 @@ mod tests {
     }
 
     async fn remove_milestone_projection_fixture(db: &SessionDb) {
+        switchy::database::schema::drop_index("idx_events_managed_tool_key", "events")
+            .execute(db.database())
+            .await
+            .unwrap();
+        switchy::database::schema::alter_table("events")
+            .drop_column("managed_tool_key".into())
+            .execute(db.database())
+            .await
+            .unwrap();
+        switchy::database::schema::drop_table("managed_tool_claims")
+            .execute(db.database())
+            .await
+            .unwrap();
+
         for table in [
             "milestone_evaluations",
             "session_milestones",

@@ -180,7 +180,16 @@ impl AuthFlows {
         request: &HarnessRequest,
         options: &LaunchOptions,
     ) -> Result<HarnessServiceResponseKind, HarnessFailure> {
-        if options.auth_support != NativeAuthSupport::VerifiedStatusAndLogin {
+        if options.billing_route == bcode_claude_code::BillingRoute::ApiKey {
+            return api_readiness(request);
+        }
+        let status_only = matches!(
+            request.kind,
+            HarnessRequestKind::AuthStatus { verify: false }
+        );
+        if options.auth_support != NativeAuthSupport::VerifiedStatusAndLogin
+            && !(options.auth_support == NativeAuthSupport::VerifiedStatus && status_only)
+        {
             return Err(HarnessFailure::Unsupported);
         }
         match &request.kind {
@@ -268,6 +277,20 @@ impl AuthFlows {
         }
     }
 }
+fn api_readiness(request: &HarnessRequest) -> Result<HarnessServiceResponseKind, HarnessFailure> {
+    if !matches!(
+        request.kind,
+        HarnessRequestKind::AuthStatus { verify: false }
+    ) {
+        return Err(HarnessFailure::Unsupported);
+    }
+    Ok(HarnessServiceResponseKind::AuthStatus(ManagedAuthStatus {
+        namespace: namespace(&request.instance),
+        custody: AuthCustodyMode::VaultManaged,
+        readiness: AuthReadiness::Ready,
+    }))
+}
+
 fn namespace(instance: &HarnessInstance) -> AuthNamespace {
     AuthNamespace {
         plugin_id: instance.plugin_id.clone(),
@@ -290,4 +313,85 @@ async fn inspect(
             AuthReadiness::LoginRequired
         },
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use bcode_claude_code::{
+        BillingRoute, Limits, NativeEnvironment, SettingsInheritance, SettlementSupport,
+    };
+    use bcode_harness_models::{HARNESS_SCHEMA_VERSION, HarnessAuthBinding, HarnessAuthRequest};
+
+    #[tokio::test]
+    async fn status_only_admission_preserves_login_fences() {
+        let instance = HarnessInstance {
+            instance_id: "test".into(),
+            plugin_id: "bcode.claude-code".into(),
+            executable: "/nonexistent/bcode-auth-test/claude".into(),
+            config_namespace: "/isolated/config".into(),
+            auth: HarnessAuthBinding {
+                provider_id: "claude-code".into(),
+                profile: "native".into(),
+                credential_namespace: "/isolated/config".into(),
+                custody: HarnessAuthCustody::NativeManaged,
+            },
+        };
+        for support in [
+            NativeAuthSupport::Unknown,
+            NativeAuthSupport::VerifiedStatus,
+            NativeAuthSupport::VerifiedStatusAndLogin,
+        ] {
+            let options = LaunchOptions {
+                executable: instance.executable.clone().into(),
+                expected_version: "test-only".into(),
+                cwd: "/isolated".into(),
+                config_directory: instance.config_namespace.clone().into(),
+                environment: NativeEnvironment::default(),
+                billing_route: BillingRoute::NativeAccount,
+                settings: SettingsInheritance::ExplicitSources,
+                setting_sources: Vec::new(),
+                resume_session_id: None,
+                settlement_support: SettlementSupport::Unknown,
+                auth_support: support,
+                limits: Limits::default(),
+            };
+            let flow = || HarnessAuthRequest {
+                flow_id: "flow".into(),
+                method_id: "native-login".into(),
+                input: None,
+            };
+            for kind in [
+                HarnessRequestKind::AuthStatus { verify: false },
+                HarnessRequestKind::AuthStatus { verify: true },
+                HarnessRequestKind::AuthBegin(flow()),
+                HarnessRequestKind::AuthContinue(flow()),
+            ] {
+                let local_status = matches!(kind, HarnessRequestKind::AuthStatus { verify: false });
+                let remote_status = matches!(kind, HarnessRequestKind::AuthStatus { verify: true });
+                let request = HarnessRequest {
+                    schema_version: HARNESS_SCHEMA_VERSION,
+                    request_id: "request".into(),
+                    instance: instance.clone(),
+                    kind,
+                };
+                let mut flows = AuthFlows::default();
+                let result = flows.invoke(&request, &options).await;
+                if support == NativeAuthSupport::Unknown
+                    || remote_status
+                    || (support == NativeAuthSupport::VerifiedStatus && !local_status)
+                {
+                    assert!(matches!(result, Err(HarnessFailure::Unsupported)));
+                    assert!(flows.flows.is_empty());
+                } else if local_status || matches!(request.kind, HarnessRequestKind::AuthBegin(_)) {
+                    // The missing executable reaches sanitized status preflight failure,
+                    // rather than the support gate. No native program can be launched.
+                    assert!(matches!(result, Err(HarnessFailure::Authentication)));
+                } else {
+                    // Full-support continuation still requires a previously admitted flow.
+                    assert!(matches!(result, Err(HarnessFailure::Conflict)));
+                }
+            }
+        }
+    }
 }

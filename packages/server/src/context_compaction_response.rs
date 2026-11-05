@@ -153,6 +153,109 @@ mod tests {
     use super::*;
 
     #[test]
+    fn fake_provider_default_and_fixture_responses_satisfy_actual_replace_and_consolidation_schemas()
+     {
+        use bcode_plugin_sdk::ConcurrentRustPlugin as _;
+        let provider = bcode_fake_provider_plugin::FakeProviderPlugin::default();
+        for (fixture, contract) in [
+            (false, ResponseContract::Replace),
+            (true, ResponseContract::Replace),
+            (false, ResponseContract::Consolidation),
+            (true, ResponseContract::Consolidation),
+        ] {
+            let mut context = bcode_model::ProviderRequestContext::default();
+            if fixture {
+                context
+                    .settings
+                    .insert("fake_compaction_fixture".into(), "scope-v1".into());
+            }
+            let prompt = concat!(
+                "Return only JSON with format bcode.compaction.section-update.v2\n",
+                "Prior structured synthesis: {\"format\":\"bcode.compaction.scope.v2\",\"current_scope\":[],\"continuation\":\"\"}",
+                "\n\nSource fragments (JSON lines):\n",
+                "{\"sequence\":1,\"provenance\":\"user\",\"byte_offset\":0,\"final_fragment\":true,\"text\":\"historical padding\"}\n"
+            );
+            let mut request = super::super::build_compaction_request(
+                crate::SessionId::new(),
+                "fake-echo".into(),
+                context,
+                prompt,
+                "replace-schema".into(),
+            );
+            request.structured_output = Some(contract.request());
+            let invocation = |operation: &str, payload: Vec<u8>| {
+                serde_json::from_value::<bcode_plugin_sdk::NativeServiceContext>(serde_json::json!({
+                    "plugin_id":"bcode.fake-provider",
+                    "request":{"interface_id":bcode_model::MODEL_PROVIDER_INTERFACE_ID,"operation":operation,"payload":payload}
+                })).unwrap()
+            };
+            let started = provider.invoke_service_concurrent(invocation(
+                bcode_model::OP_START_TURN,
+                serde_json::to_vec(&request).unwrap(),
+            ));
+            assert!(started.error.is_none(), "{started:?}");
+            let started: bcode_model::StartTurnResponse =
+                serde_json::from_slice(&started.payload).unwrap();
+            let polled = provider.invoke_service_concurrent(invocation(
+                bcode_model::OP_POLL_TURN_EVENTS,
+                serde_json::to_vec(&bcode_model::PollTurnEventsRequest {
+                    provider_turn_id: started.provider_turn_id,
+                })
+                .unwrap(),
+            ));
+            assert!(polled.error.is_none(), "{polled:?}");
+            let polled: bcode_model::PollTurnEventsResponse =
+                serde_json::from_slice(&polled.payload).unwrap();
+            let text: String = polled
+                .events
+                .iter()
+                .filter_map(|event| match event {
+                    bcode_model::ProviderTurnEvent::TextDelta { text } => Some(text.as_str()),
+                    _ => None,
+                })
+                .collect();
+            contract.validate(&text).unwrap();
+            // Responses for the other independently selected contract must fail;
+            // prompt wording deliberately remains Replace in this matrix.
+            let other = match contract {
+                ResponseContract::Consolidation => ResponseContract::Replace,
+                _ => ResponseContract::Consolidation,
+            };
+            assert!(other.validate(&text).is_err());
+            let value: serde_json::Value = serde_json::from_str(&text).unwrap();
+            assert!(value.get("continuation").is_none());
+            if matches!(contract, ResponseContract::Consolidation) {
+                let prior = super::super::CompactionEvidence {
+                    format: super::super::COMPACTION_SUMMARY_FORMAT.into(),
+                    protected_users: None,
+                    current_scope: Vec::new(), continuation: serde_json::json!({
+                        "format":"bcode.compaction.continuation-sections.v1", "decisions":"",
+                        "active_work_blockers":"", "findings_evidence":"", "background":"Accepted carry must remain exact."
+                    }).to_string(),
+                };
+                let retained = super::super::synthesis::consolidate_response(
+                    &text,
+                    &prior,
+                    super::super::synthesis::SynthesisPolicy {
+                        carry_chars: 8_192,
+                        wire_bytes: 16_384,
+                        section_chars: 8_192,
+                    },
+                )
+                .unwrap();
+                assert_eq!(
+                    serde_json::from_str::<serde_json::Value>(&retained.continuation).unwrap(),
+                    serde_json::from_str::<serde_json::Value>(&prior.continuation).unwrap(),
+                );
+                assert_eq!(
+                    serde_json::to_value(&retained.current_scope).unwrap(),
+                    serde_json::to_value(&prior.current_scope).unwrap(),
+                );
+            }
+        }
+    }
+
+    #[test]
     fn response_schemas_accept_null_as_unchanged_and_reject_wrong_shapes() {
         for contract in [
             ResponseContract::Update,

@@ -1052,6 +1052,10 @@ mod tests {
                 "session-writer-epoch-16-to-17",
                 "session-writer-epoch-17-to-18",
                 "session-writer-epoch-18-to-19",
+                "session-writer-epoch-19-to-20",
+                "session-writer-epoch-20-to-21",
+                "session-writer-epoch-21-to-22",
+                "session-writer-epoch-22-to-23",
             ]
         );
         assert_eq!(request.session_id, session_id);

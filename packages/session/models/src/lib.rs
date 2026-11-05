@@ -14,6 +14,9 @@ pub mod compaction_diagnostic;
 /// Canonical typed managed external session evidence and bounded indexed query contracts.
 pub mod external_backend;
 /// Canonical actor-backed native operation claims, completion and cursor commits.
+pub mod managed_tool;
+pub use managed_tool::*;
+
 pub mod external_harness;
 pub use external_backend::{
     ExternalBackendEnvelope, ExternalBackendPage, ExternalBackendQuery, ExternalBackendRecord,
@@ -79,7 +82,10 @@ pub trait SessionCompactionRecoveryDiscoveryApplication: Sync {
 }
 
 /// Durable session-storage writer epoch shared by runtime and daemon compatibility handshakes.
-pub const CURRENT_SESSION_STORAGE_WRITER_EPOCH: u32 = 19;
+///
+/// Epoch 23 indexes managed claim identity directly on canonical event rows, fencing the
+/// incomplete epoch-22 projection. Event payload schema remains 55.
+pub const CURRENT_SESSION_STORAGE_WRITER_EPOCH: u32 = 23;
 
 /// Identifies retained turn observations in the existing system-message text contract.
 ///
@@ -1503,7 +1509,7 @@ mod checked_tool_projection_tests {
 }
 
 /// Current persisted session event schema version.
-pub const CURRENT_SESSION_EVENT_SCHEMA_VERSION: u16 = 54;
+pub const CURRENT_SESSION_EVENT_SCHEMA_VERSION: u16 = 55;
 
 /// Stable persisted event kinds emitted by the current session schema.
 ///

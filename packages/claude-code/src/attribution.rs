@@ -52,11 +52,13 @@ pub struct SubmissionAttribution {
     pub stage: AttributionStage,
 }
 
-/// Bounded process-local evidence. No eviction can make an old UUID reusable.
-/// A full ledger requires a new transport, not an automatic resend.
+/// Bounded process-local attribution and recent retirement tombstones.
+/// Retirement requires explicit host acknowledgement; the canonical host owns
+/// lifetime replay fencing beyond the recent duplicate window.
 pub struct AttributionLedger {
     submissions: BTreeSet<SubmissionUuid>,
     frames: BTreeMap<String, SubmissionAttribution>,
+    retired: std::collections::VecDeque<SubmissionUuid>,
     current: Option<SubmissionUuid>,
 }
 impl AttributionLedger {
@@ -67,12 +69,13 @@ impl AttributionLedger {
         Self {
             submissions: BTreeSet::new(),
             frames: BTreeMap::new(),
+            retired: std::collections::VecDeque::new(),
             current: None,
         }
     }
 
     pub(crate) fn retain(&mut self, uuid: SubmissionUuid) -> Result<(), Error> {
-        if self.submissions.contains(&uuid) {
+        if self.submissions.contains(&uuid) || self.retired.contains(&uuid) {
             return Err(Error::Protocol);
         }
         if self.submissions.len() >= Self::MAX_SUBMISSIONS {
@@ -83,6 +86,24 @@ impl AttributionLedger {
         Ok(())
     }
 
+    /// Retire an exact attempt only after its canonical terminal/lifecycle evidence
+    /// was acknowledged and the caller proved no outstanding associated work.
+    /// Recent tombstones reject duplicates; canonical host admission owns lifetime
+    /// replay fencing after bounded cache retirement. Retirement never proves retry safety.
+    pub(crate) fn retire(&mut self, uuid: &SubmissionUuid) {
+        if !self.submissions.remove(uuid) {
+            return;
+        }
+        self.frames
+            .retain(|_, frame| !frame.consumed.contains(uuid));
+        if self.current.as_ref() == Some(uuid) {
+            self.current = None;
+        }
+        if self.retired.len() >= Self::MAX_SUBMISSIONS {
+            self.retired.pop_front();
+        }
+        self.retired.push_back(uuid.clone());
+    }
     pub(crate) fn answers_current(&self, attribution: Option<&SubmissionAttribution>) -> bool {
         attribution.is_some_and(|evidence| {
             matches!(evidence.stage, AttributionStage::Result { .. })
@@ -94,11 +115,36 @@ impl AttributionLedger {
         })
     }
 
+    /// Classify validated frames before they reach consumers that use current-turn
+    /// fallback for genuinely unattributed native activity.
+    pub(crate) fn observe_delivery(
+        &mut self,
+        value: &Value,
+    ) -> Result<Option<SubmissionAttribution>, Error> {
+        let evidence = self.observe(value)?;
+        let retired = matches!(
+            value.get("type").and_then(Value::as_str),
+            Some("assistant" | "stream_event" | "result")
+        ) && value.get("parent_tool_use_id").is_none_or(Value::is_null)
+            && value
+                .get("user_message_uuid")
+                .and_then(|value| parse_uuid(value).ok())
+                .is_some_and(|uuid| self.retired.contains(&uuid));
+        // Retired frame content is no longer retained, so even a repeated UUID
+        // cannot prove an exact duplicate. Require reconciliation/coverage loss
+        // rather than silently losing new work or delivering stale provenance
+        // as current-turn activity. The reader's fault path emits Uncertain.
+        if retired {
+            return Err(Error::Protocol);
+        }
+        Ok(evidence)
+    }
+
     pub(crate) fn observe(
         &mut self,
         value: &Value,
     ) -> Result<Option<SubmissionAttribution>, Error> {
-        if self.submissions.is_empty() {
+        if self.submissions.is_empty() && self.retired.is_empty() {
             return Ok(None);
         }
         let kind = value.get("type").and_then(Value::as_str);
@@ -130,10 +176,7 @@ impl AttributionLedger {
             vec![primary.clone()]
         };
         let unique: BTreeSet<_> = consumed.iter().collect();
-        if unique.len() != consumed.len()
-            || !consumed.contains(&primary)
-            || consumed.iter().any(|uuid| !self.submissions.contains(uuid))
-        {
+        if unique.len() != consumed.len() || !consumed.contains(&primary) {
             return Err(Error::Protocol);
         }
         let resumed = match value.get("resume_reason") {
@@ -161,6 +204,15 @@ impl AttributionLedger {
             .and_then(Value::as_str)
             .ok_or(Error::Protocol)?;
         validate_session_uuid(frame_id)?;
+        // Late duplicates for canonically retired attempts are not new consumption
+        // evidence. Ignore only an entirely retired set; mixed or unknown UUIDs
+        // still fail closed rather than settling a different active attempt.
+        if consumed.iter().all(|uuid| self.retired.contains(uuid)) {
+            return Ok(None);
+        }
+        if consumed.iter().any(|uuid| !self.submissions.contains(uuid)) {
+            return Err(Error::Protocol);
+        }
         let attribution = SubmissionAttribution {
             native_frame_uuid: frame_id.to_owned(),
             primary,
@@ -364,6 +416,74 @@ mod tests {
         let mut frame = reply();
         frame["uuid"] = json!("00000000-0000-4000-8000-ffffffffffff");
         assert!(matches!(retained.observe(&frame), Err(Error::Capacity)));
+    }
+
+    #[test]
+    fn explicit_retirement_allows_1100_sequential_submissions_with_bounded_tombstones() {
+        let mut ledger = AttributionLedger::new();
+        for serial in 0..1100 {
+            let uuid =
+                SubmissionUuid::new(format!("00000000-0000-4000-8000-{serial:012x}")).unwrap();
+            ledger.retain(uuid.clone()).unwrap();
+            let frame = json!({"type":"result","uuid":format!("11111111-1111-4111-8111-{serial:012x}"),
+                "user_message_uuid":uuid.as_str(),"is_error":false});
+            assert!(ledger.observe(&frame).unwrap().is_some());
+            ledger.retire(&uuid);
+            assert!(ledger.submissions.is_empty() && ledger.frames.is_empty());
+            assert!(ledger.retired.len() <= AttributionLedger::MAX_SUBMISSIONS);
+            assert!(ledger.retain(uuid).is_err());
+        }
+    }
+
+    #[test]
+    fn late_retired_frames_do_not_fault_or_settle_a_new_attempt() {
+        let mut retained = ledger();
+        let old = SubmissionUuid::new(A.into()).unwrap();
+        retained.observe(&reply()).unwrap();
+        retained.retire(&old);
+        let mut late = reply();
+        late["type"] = json!("result");
+        late["is_error"] = json!(false);
+        let evidence = retained.observe(&late).unwrap();
+        assert!(evidence.is_none());
+        assert!(!retained.answers_current(evidence.as_ref()));
+        // A new frame UUID is still stale evidence for the retired attempt.
+        late["uuid"] = json!(A);
+        assert!(retained.observe(&late).unwrap().is_none());
+        late["user_message_uuids"] = json!([A, B]);
+        assert!(retained.observe(&late).is_err());
+        late["user_message_uuids"] = json!([A]);
+        late["uuid"] = json!("malformed");
+        assert!(retained.observe(&late).is_err());
+        retained.retire(&SubmissionUuid::new(B.into()).unwrap());
+        late["uuid"] = json!(FRAME);
+        assert!(retained.observe(&late).unwrap().is_none());
+        late["user_message_uuid"] = json!(FRAME);
+        late["user_message_uuids"] = json!([FRAME]);
+        assert!(retained.observe(&late).is_err());
+    }
+
+    #[test]
+    fn retired_assistant_old_and_new_frame_uuids_require_reconciliation() {
+        let mut retained = ledger();
+        retained.observe(&reply()).unwrap();
+        retained.retire(&SubmissionUuid::new(A.into()).unwrap());
+        for frame_id in [FRAME, A] {
+            let mut late = reply();
+            late["uuid"] = json!(frame_id);
+            late["message"] =
+                json!({"content":[{"type":"tool_use","id":"late-tool","name":"Bash"}]});
+            assert!(retained.observe_delivery(&late).is_err());
+            assert_eq!(retained.current.as_ref().unwrap().as_str(), B);
+        }
+        assert!(
+            retained
+                .observe_delivery(
+                    &json!({"type":"system","subtype":"task_started","task_id":"late-task"})
+                )
+                .unwrap()
+                .is_none()
+        );
     }
 
     #[test]

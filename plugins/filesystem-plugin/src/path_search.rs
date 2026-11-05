@@ -539,16 +539,16 @@ mod walk {
                 &mut |progress| self.resume_workspace(progress, &build_request, grant, rules),
             );
             match inventory {
-                Ok((paths, incomplete)) => {
-                    if let Some(reason) = incomplete {
-                        self.mark(&reason);
-                    }
+                Ok((paths, capture_incomplete)) => {
                     if let Ok(workspace_root) =
                         super::super::confined::open_directory(&grant.workspace_root)
                     {
                         self.tracked(&workspace_root, &paths, grant);
                     } else {
                         self.mark("root_unavailable");
+                    }
+                    if let Some(reason) = capture_incomplete {
+                        self.mark(&reason);
                     }
                 }
                 Err(reason) => self.mark(&reason),
@@ -635,6 +635,11 @@ mod walk {
                 progress.directories.insert(relative, before);
                 progress.paths.extend(captured);
                 progress.resources.extend(build.resources);
+                // UTF-8 omissions are not traversal failure: retain valid peers,
+                // but preserve the incomplete evidence through publication/cache hits.
+                if progress.incomplete.is_none() {
+                    progress.incomplete = build.response.reason;
+                }
             }
             Ok(())
         }

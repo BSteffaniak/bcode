@@ -225,6 +225,82 @@ pub fn normalize_canonical_row(
     })
 }
 
+/// Normalize a row under the compatibility plan for an inspected durable writer epoch.
+///
+/// Epochs through 20 retain schema-55 observation shapes but require regenerated host
+/// commitments. Only this migration-owned boundary removes those derived commitments;
+/// current-epoch repair and ordinary normalization retain exact commitment verification.
+/// The caller must prepare the returned event against the ingested prefix, persist it,
+/// then ingest the canonical projectors once before normalizing the next row.
+///
+/// # Errors
+/// Returns an error for an unsupported writer, malformed source event, or invalid
+/// typed harness operation. It never retries using a different source epoch.
+pub fn normalize_canonical_row_for_writer_epoch(
+    row: &bcode_session_migration_target::CanonicalRow,
+    source_writer_epoch: u32,
+) -> Result<bcode_session_migration_target::NormalizedCanonicalRow, HistoricalSessionEventError> {
+    crate::plan_writer_epoch_migration(source_writer_epoch).map_err(|error| {
+        HistoricalSessionEventError::InvalidEvent {
+            schema_version: row.schema_version,
+            event_kind: row.event_kind.clone(),
+            reason: format!(
+                "unsupported migration source writer epoch {source_writer_epoch}: {error}"
+            ),
+        }
+    })?;
+    let mut normalized = normalize_canonical_row(row)?;
+    validate_recovery_writer(&normalized.event, source_writer_epoch)?;
+    if source_writer_epoch <= 21
+        && let SessionEventKind::ToolInvocationLifecycle { event } = &normalized.event.kind
+        && event
+            .metadata
+            .get(bcode_session_models::MANAGED_TOOL_CLAIM_KEY)
+            .is_some()
+    {
+        return Err(HistoricalSessionEventError::InvalidEvent {
+            schema_version: row.schema_version,
+            event_kind: row.event_kind.clone(),
+            reason: "managed tool claim metadata requires source writer epoch 22".into(),
+        });
+    }
+    if source_writer_epoch <= 20
+        && let SessionEventKind::ExternalHarnessOperation { operation } = &mut normalized.event.kind
+    {
+        operation
+            .validate()
+            .map_err(|reason| HistoricalSessionEventError::InvalidEvent {
+                schema_version: row.schema_version,
+                event_kind: row.event_kind.clone(),
+                reason,
+            })?;
+        operation.inventory_commitments.clear();
+    }
+    Ok(normalized)
+}
+
+fn validate_recovery_writer(
+    event: &SessionEvent,
+    source_writer_epoch: u32,
+) -> Result<(), HistoricalSessionEventError> {
+    use bcode_session_models::ExternalHarnessOperationRecord;
+    if source_writer_epoch <= 23
+        && let SessionEventKind::ExternalHarnessOperation { operation } = &event.kind
+        && matches!(
+            operation.record,
+            ExternalHarnessOperationRecord::TransportReleased { .. }
+                | ExternalHarnessOperationRecord::RecoveryPrepared { .. }
+        )
+    {
+        return Err(HistoricalSessionEventError::InvalidEvent {
+            schema_version: event.schema_version,
+            event_kind: "external_harness_operation".into(),
+            reason: "recovery operation requires source writer epoch 24".into(),
+        });
+    }
+    Ok(())
+}
+
 /// Normalize one canonical payload into the final current representation.
 ///
 /// `decode_current` must be the strict current persistence decoder. Historical adapters are used
@@ -310,8 +386,9 @@ fn decode_for_migration(
     payload: &str,
     decode_current: impl FnOnce(&str) -> Result<SessionEvent, String>,
 ) -> Result<HistoricalDecode, HistoricalSessionEventError> {
-    let current = decode_current(payload);
     let envelope = serde_json::from_str::<HistoricalEnvelope>(payload)?;
+    envelope.validate_observation_compatibility()?;
+    let current = decode_current(payload);
     if envelope.schema_version() == 52 {
         return envelope.decode_schema_52(current);
     }
@@ -330,7 +407,6 @@ fn decode_for_migration(
             schema_version: envelope.schema_version(),
         });
     }
-    envelope.validate_observation_compatibility()?;
     let source_kind = envelope.source_kind_name()?;
     if source_kind == "child_session_created"
         && envelope.schema_version() < 52
@@ -338,16 +414,16 @@ fn decode_for_migration(
     {
         return envelope.decode_child_session_created();
     }
-    // Schemas 51 through 53 are representation-compatible except for child creation above.
+    // Schemas 51 through 54 are representation-compatible except for child creation above.
     // Schema 53 external observations retain their original evidence class: replay must never
     // promote a result, acceptance or settlement into a newly introduced terminal disposition.
     // Preserve recorded usage and all admission identities rather than applying older policy.
-    if matches!(envelope.schema_version(), 51..=53)
+    if matches!(envelope.schema_version(), 51..=54)
         && crate::is_released_event_kind_schema(source_kind, envelope.schema_version())
         && crate::RELEASED_EVENT_VARIANTS.iter().any(|variant| {
             variant.kind == source_kind
                 && (variant.treatment == crate::ReleasedEventTreatment::CurrentEquivalent
-                    || (envelope.schema_version() == 53
+                    || (matches!(envelope.schema_version(), 53 | 54)
                         && variant.treatment == crate::ReleasedEventTreatment::ExplicitConversion))
         })
     {
@@ -480,10 +556,14 @@ mod tests {
     fn schema_52_fixture_migrates_losslessly_without_creating_checkpoints() {
         let plan = crate::plan_writer_epoch_migration(16).expect("known lossless upgrade");
         assert_eq!(plan.target_writer_epoch, crate::CURRENT_WRITER_EPOCH);
-        assert_eq!(plan.steps.len(), 3);
+        assert_eq!(plan.steps.len(), 7);
         assert_eq!(plan.steps[0].id, "session-writer-epoch-16-to-17");
         assert_eq!(plan.steps[1].id, "session-writer-epoch-17-to-18");
         assert_eq!(plan.steps[2].id, "session-writer-epoch-18-to-19");
+        assert_eq!(plan.steps[3].id, "session-writer-epoch-19-to-20");
+        assert_eq!(plan.steps[4].id, "session-writer-epoch-20-to-21");
+        assert_eq!(plan.steps[5].id, "session-writer-epoch-21-to-22");
+        assert_eq!(plan.steps[6].id, "session-writer-epoch-22-to-23");
         let fixture = include_str!("../fixtures/stores/epoch-16-schema-52-events.jsonl");
         let mut seen = BTreeSet::new();
         for payload in fixture.lines() {
@@ -496,7 +576,7 @@ mod tests {
                 payload: payload.to_owned(),
             };
             let normalized = normalize_canonical_row(&row).expect("released schema-52 fixture");
-            assert_eq!(normalized.event.schema_version, 54);
+            assert_eq!(normalized.event.schema_version, 55);
             assert_eq!(normalized.event.sequence, row.sequence);
             assert_eq!(normalized.historical_source, Some(format!("52:{kind}")));
             assert!(normalized.metric_counter.is_none());
@@ -793,8 +873,8 @@ mod tests {
         let HistoricalDecode::Converted { event, metadata } = decoded else {
             panic!("historical usage should be migration-owned conversion");
         };
-        assert_eq!(crate::CURRENT_EVENT_SCHEMA, 54);
-        assert_eq!(crate::LATEST_HISTORICAL_EVENT_SCHEMA, 53);
+        assert_eq!(crate::CURRENT_EVENT_SCHEMA, 55);
+        assert_eq!(crate::LATEST_HISTORICAL_EVENT_SCHEMA, 54);
         // Classification preserves the source envelope; canonical normalization alone
         // advances its schema after historical semantics have been interpreted.
         assert_eq!(event.schema_version, metadata.source_schema);
@@ -1756,7 +1836,7 @@ mod tests {
         assert!(normalized.metric_counter.is_none());
         let plan = crate::plan_writer_epoch_migration(17).unwrap();
         assert_eq!(plan.target_writer_epoch, crate::CURRENT_WRITER_EPOCH);
-        assert_eq!(plan.steps.len(), 2);
+        assert_eq!(plan.steps.len(), 6);
     }
 
     #[test]
@@ -2126,6 +2206,63 @@ mod tests {
     }
 
     #[test]
+    fn schema_51_submission_preserves_null_and_v1_execution_descriptors() {
+        use bcode_session_models::{
+            ClientId, PromptSubmission, SubmissionId, SubmissionPlacement, SubmissionTarget,
+            TurnAdmissionMetadata, TurnId,
+        };
+        let descriptor = bcode_session_models::SubmissionExecutionDescriptor {
+            version: 1,
+            provider: "provider".into(),
+            model: "model".into(),
+            reasoning: None,
+            model_profile: Some("coding".into()),
+            auth_profile: Some("work".into()),
+            config_identity: "config-digest".into(),
+            recovery_recipe: None,
+        };
+        for execution_descriptor in [None, Some(descriptor)] {
+            let source = SessionEvent {
+                schema_version: 51,
+                session_id: SESSION_ID.parse().unwrap(),
+                sequence: 1,
+                timestamp_ms: 2,
+                provenance: None,
+                kind: SessionEventKind::SubmissionAccepted {
+                    submission: PromptSubmission {
+                        id: SubmissionId("retained-submission".into()),
+                        client_id: ClientId::new(),
+                        text: "preserve exact input".into(),
+                        admission: TurnAdmissionMetadata::default(),
+                        requested_placement: SubmissionPlacement::FollowUp,
+                        target: SubmissionTarget::OwnTurn {
+                            turn_id: TurnId("retained-turn".into()),
+                        },
+                        execution_descriptor,
+                    },
+                },
+            };
+            let payload = serde_json::to_string(&source).unwrap();
+            let normalized =
+                normalize_canonical_row(&bcode_session_migration_target::CanonicalRow {
+                    sequence: 1,
+                    event_kind: "submission_accepted".into(),
+                    schema_version: 51,
+                    payload,
+                })
+                .unwrap();
+            let mut expected = source;
+            expected.schema_version = crate::CURRENT_EVENT_SCHEMA;
+            assert_eq!(normalized.event, expected);
+            assert_eq!(
+                normalized.historical_source.as_deref(),
+                Some("51:submission_accepted")
+            );
+            assert!(!normalized.retired_known);
+        }
+    }
+
+    #[test]
     fn schema_51_upgrade_preserves_other_events_and_rejects_fabricated_composition() {
         let payload = serde_json::json!({
             "schema_version": 51, "sequence": 7, "timestamp_ms": 13,
@@ -2167,6 +2304,582 @@ mod tests {
         assert!(matches!(
             decode_for_migration(&future.to_string(), reject_current),
             Err(HistoricalSessionEventError::UnsupportedSchema { .. })
+        ));
+    }
+
+    #[test]
+    fn historical_harness_operations_prepare_empty_inventory_commitments_without_execution() {
+        for fixture in [
+            include_str!("../fixtures/stores/epoch-18-schema-53-harness.jsonl"),
+            include_str!("../fixtures/stores/epoch-19-schema-54-harness.jsonl"),
+        ] {
+            let mut operations = 0;
+            for payload in fixture.lines() {
+                let source: serde_json::Value = serde_json::from_str(payload).unwrap();
+                let event_kind = source["kind"].as_object().unwrap().keys().next().unwrap();
+                let normalized =
+                    normalize_canonical_row(&bcode_session_migration_target::CanonicalRow {
+                        sequence: source["sequence"].as_u64().unwrap(),
+                        event_kind: event_kind.clone(),
+                        schema_version: u16::try_from(source["schema_version"].as_u64().unwrap())
+                            .unwrap(),
+                        payload: payload.into(),
+                    })
+                    .expect("historical prepared operation");
+                if let SessionEventKind::ExternalHarnessOperation { operation } =
+                    &normalized.event.kind
+                {
+                    operations += 1;
+                    assert!(
+                        operation.inventory_commitments.is_empty(),
+                        "normalization cannot invent stateful projector roots"
+                    );
+                    let mut expected =
+                        source["kind"]["external_harness_operation"]["operation"].clone();
+                    expected["inventory_commitments"] = serde_json::json!([]);
+                    assert_eq!(
+                        serde_json::to_value(operation).unwrap(),
+                        expected,
+                        "all source evidence and identities survive preparation"
+                    );
+                    operation.validate().unwrap();
+                }
+            }
+            assert!(operations > 0);
+        }
+    }
+
+    #[test]
+    fn schema_54_retired_fork_fixture_preserves_original_payload_as_inert_history() {
+        let payload = include_str!("../fixtures/stores/epoch-19-schema-54-retired-fork.jsonl");
+        let source: serde_json::Value = serde_json::from_str(payload).unwrap();
+        let normalized = normalize_canonical_row(&bcode_session_migration_target::CanonicalRow {
+            sequence: 0,
+            event_kind: "session_forked".into(),
+            schema_version: 54,
+            payload: payload.into(),
+        })
+        .expect("released retired fork normalization");
+        assert!(normalized.retired_known);
+        assert_eq!(
+            normalized.historical_source.as_deref(),
+            Some("54:session_forked")
+        );
+        let mut expected = source.clone();
+        expected["schema_version"] = crate::CURRENT_EVENT_SCHEMA.into();
+        expected["kind"] = serde_json::json!({"inert_history":{
+            "event_type":"session_forked", "payload":source["kind"]["session_forked"]
+        }});
+        assert_eq!(serde_json::to_value(normalized.event).unwrap(), expected);
+    }
+
+    #[test]
+    fn schema_54_fixture_preserves_every_released_kind_and_evidence() {
+        let mut kinds = std::collections::BTreeSet::new();
+        for (fixture, count) in [
+            (
+                include_str!("../fixtures/stores/epoch-19-schema-54-events.jsonl"),
+                75,
+            ),
+            (
+                include_str!("../fixtures/stores/epoch-19-schema-54-harness.jsonl"),
+                12,
+            ),
+        ] {
+            assert_eq!(fixture.lines().count(), count);
+            for (sequence, payload) in fixture.lines().enumerate() {
+                let source: SessionEvent = serde_json::from_str(payload).unwrap();
+                let kind = bcode_session_models::persisted_session_event_kind_name(&source.kind);
+                kinds.insert(kind);
+                let normalized =
+                    normalize_canonical_row(&bcode_session_migration_target::CanonicalRow {
+                        sequence: source.sequence,
+                        event_kind: kind.into(),
+                        schema_version: 54,
+                        payload: payload.into(),
+                    })
+                    .expect("released schema-54 event");
+                let mut expected = source;
+                expected.schema_version = crate::CURRENT_EVENT_SCHEMA;
+                assert_eq!(expected.sequence, u64::try_from(sequence).unwrap());
+                assert_eq!(normalized.event, expected);
+                assert!(!normalized.retired_known);
+                if let SessionEventKind::ExternalHarnessOperation { operation } =
+                    &normalized.event.kind
+                {
+                    operation.validate().unwrap();
+                    let value = serde_json::to_value(operation).unwrap();
+                    if let Some(observations) = value
+                        .pointer("/record/page/observations")
+                        .and_then(serde_json::Value::as_array)
+                    {
+                        assert!(
+                            observations
+                                .iter()
+                                .all(|observation| observation["kind"]["kind"] != "execution")
+                        );
+                    }
+                }
+            }
+        }
+        let expected: std::collections::BTreeSet<_> = crate::RELEASED_EVENT_VARIANTS
+            .iter()
+            .filter(|variant| crate::is_released_event_kind_schema(variant.kind, 54))
+            .filter(|variant| variant.treatment != crate::ReleasedEventTreatment::RetiredKnown)
+            .map(|variant| variant.kind)
+            .collect();
+        assert_eq!(kinds, expected);
+    }
+
+    #[test]
+    fn schema_54_retains_v2_observations_in_both_envelopes() {
+        let mut checked = 0;
+        for line in include_str!("../fixtures/stores/epoch-19-schema-54-harness.jsonl").lines() {
+            let mut source: serde_json::Value = serde_json::from_str(line).unwrap();
+            let Some(observation) = source
+                .pointer("/kind/external_harness_operation/operation/record/page/observations/0")
+                .cloned()
+            else {
+                continue;
+            };
+            if !matches!(
+                observation["kind"]["kind"].as_str(),
+                Some("submission_consumed" | "submission_result_observed" | "native_turn_terminal")
+            ) {
+                continue;
+            }
+            checked += 1;
+            source["kind"] = serde_json::json!({"external_observation_recorded":{"version":1,"observation":observation}});
+            let row = bcode_session_migration_target::CanonicalRow {
+                sequence: source["sequence"].as_u64().unwrap(),
+                event_kind: "external_observation_recorded".into(),
+                schema_version: 54,
+                payload: source.to_string(),
+            };
+            let converted =
+                normalize_canonical_row(&row).expect("v2 evidence remains supported at schema54");
+            source["schema_version"] = crate::CURRENT_EVENT_SCHEMA.into();
+            assert_eq!(serde_json::to_value(converted.event).unwrap(), source);
+            source["schema_version"] = 53.into();
+            assert!(matches!(
+                normalize_canonical_row(&bcode_session_migration_target::CanonicalRow {
+                    schema_version: 53,
+                    payload: source.to_string(),
+                    ..row
+                }),
+                Err(HistoricalSessionEventError::InvalidEvent { .. })
+            ));
+        }
+        assert_eq!(checked, 3);
+    }
+
+    #[test]
+    fn execution_wrapper_is_schema_55_only_in_both_observation_envelopes() {
+        let source: serde_json::Value = serde_json::from_str(
+            include_str!("../fixtures/stores/epoch-19-schema-54-harness.jsonl")
+                .lines()
+                .nth(6)
+                .unwrap(),
+        )
+        .unwrap();
+        let attempt = serde_json::json!({"submission_id":"submission", "attempt_id":"attempt"});
+        for event in [
+            serde_json::json!({"event":"submission_terminal", "attempt":attempt,
+                "native_turn_id":null, "native_frame_id":"native-frame", "disposition":"completed", "output":"done"}),
+            serde_json::json!({"event":"background_work", "work_id":"owned-work", "native_task_id":null,
+                "origin":null, "parent_work_id":null, "work_kind":"command", "label":"background",
+                "state":"completed", "notification":"pending"}),
+            serde_json::json!({"event":"continuation", "continuation_id":"owned-continuation", "origin":attempt,
+                "source_work_id":"owned-work", "native_turn_id":null, "state":"running", "output":null}),
+            serde_json::json!({"event":"coverage", "attempt":attempt, "background":"unknown", "continuations":"complete"}),
+        ] {
+            for page_envelope in [false, true] {
+                let mut payload = source.clone();
+                let mut observation = payload
+                    .pointer(
+                        "/kind/external_harness_operation/operation/record/page/observations/0",
+                    )
+                    .unwrap()
+                    .clone();
+                observation["kind"] = serde_json::json!({"kind":"execution", "event":event});
+                let kind = if page_envelope {
+                    payload["kind"]["external_harness_operation"]["operation"]["record"]["page"]
+                        ["observations"] = serde_json::json!([observation]);
+                    "external_harness_operation"
+                } else {
+                    payload["kind"] = serde_json::json!({"external_observation_recorded":{"version":1,"observation":observation}});
+                    "external_observation_recorded"
+                };
+                for schema in [53, 54] {
+                    payload["schema_version"] = schema.into();
+                    assert!(matches!(
+                        normalize_canonical_row(&bcode_session_migration_target::CanonicalRow {
+                            sequence: 6,
+                            event_kind: kind.into(),
+                            schema_version: schema,
+                            payload: payload.to_string(),
+                        }),
+                        Err(HistoricalSessionEventError::InvalidEvent { .. })
+                    ));
+                }
+                payload["schema_version"] = crate::CURRENT_EVENT_SCHEMA.into();
+                let normalized =
+                    normalize_canonical_row(&bcode_session_migration_target::CanonicalRow {
+                        sequence: 6,
+                        event_kind: kind.into(),
+                        schema_version: crate::CURRENT_EVENT_SCHEMA,
+                        payload: payload.to_string(),
+                    })
+                    .expect("current execution event");
+                if let SessionEventKind::ExternalHarnessOperation { operation } =
+                    &normalized.event.kind
+                {
+                    operation
+                        .validate()
+                        .expect("valid current execution observation");
+                }
+                if page_envelope {
+                    payload["kind"]["external_harness_operation"]["operation"]["inventory_commitments"] =
+                        serde_json::json!([]);
+                }
+                assert_eq!(serde_json::to_value(normalized.event).unwrap(), payload);
+                assert!(!normalized.retired_known);
+                assert!(normalized.historical_source.is_none());
+            }
+        }
+    }
+
+    #[test]
+    fn managed_claim_metadata_requires_writer_22_even_with_schema_55() {
+        use bcode_session_models::{
+            ExternalHarnessOwner, ManagedToolClaimEvent, ManagedToolIdentity,
+            ToolInvocationLifecycleEvent, ToolInvocationLifecycleStage,
+        };
+        // Synthetic decoder input only; this is not historical producer evidence.
+        let source = include_str!("../fixtures/stores/epoch-19-schema-54-harness.jsonl")
+            .lines()
+            .nth(6)
+            .unwrap();
+        let mut event = normalize_canonical_row(&bcode_session_migration_target::CanonicalRow {
+            sequence: 6,
+            event_kind: "external_harness_operation".into(),
+            schema_version: 54,
+            payload: source.into(),
+        })
+        .unwrap()
+        .event;
+        let identity = ManagedToolIdentity {
+            owner: ExternalHarnessOwner {
+                session_id: event.session_id,
+                generation: 1,
+                artifact_id: "artifact".into(),
+                daemon_id: "daemon".into(),
+            },
+            grant_id: "grant".into(),
+            invocation_id: "invocation".into(),
+            producer_plugin_id: "producer".into(),
+            tool_name: "tool".into(),
+            arguments_sha256: "a".repeat(64),
+            preparation_sha256: "b".repeat(64),
+            working_directory: "/workspace".into(),
+        };
+        event.kind = SessionEventKind::ToolInvocationLifecycle {
+            event: ToolInvocationLifecycleEvent {
+                invocation_id: identity.invocation_id.clone(),
+                sequence: 0,
+                stage: ToolInvocationLifecycleStage::Waiting,
+                message: None,
+                metadata: serde_json::json!({
+                    (bcode_session_models::MANAGED_TOOL_CLAIM_KEY):
+                        ManagedToolClaimEvent::Claimed { identity }
+                }),
+            },
+        };
+        let mut row = bcode_session_migration_target::CanonicalRow {
+            sequence: event.sequence,
+            event_kind: "tool_invocation_lifecycle".into(),
+            schema_version: 55,
+            payload: serde_json::to_string(&event).unwrap(),
+        };
+        for writer in [18, 19, 20, 21] {
+            assert!(normalize_canonical_row_for_writer_epoch(&row, writer).is_err());
+        }
+        for writer in [22, 23] {
+            assert_eq!(
+                normalize_canonical_row_for_writer_epoch(&row, writer)
+                    .unwrap()
+                    .event,
+                event
+            );
+        }
+        if let SessionEventKind::ToolInvocationLifecycle { event } = &mut event.kind {
+            event.metadata = serde_json::json!({});
+        }
+        row.payload = serde_json::to_string(&event).unwrap();
+        for writer in [18, 19, 20, 21, 22] {
+            assert_eq!(
+                normalize_canonical_row_for_writer_epoch(&row, writer)
+                    .unwrap()
+                    .event,
+                event
+            );
+        }
+    }
+
+    #[test]
+    fn writer_scoped_normalization_replaces_only_old_host_commitments() {
+        let source: serde_json::Value = serde_json::from_str(
+            include_str!("../fixtures/stores/epoch-19-schema-54-harness.jsonl")
+                .lines()
+                .nth(6)
+                .unwrap(),
+        )
+        .unwrap();
+        let mut payload = source;
+        payload["schema_version"] = 55.into();
+        // This is a normalization unit input, not the historical database fixture.
+        let operation = payload
+            .pointer_mut("/kind/external_harness_operation/operation")
+            .unwrap();
+        operation["inventory_commitments"] = serde_json::json!([{
+            "snapshot_key": "execution_v3:1:inventory:unknown:work", "revision": 6,
+            "root": "a".repeat(64), "summary": {
+                "identities": 1, "unfinished": 0, "obligations": 1,
+                "failed": 1, "interrupted": 0
+            }
+        }]);
+        let row = bcode_session_migration_target::CanonicalRow {
+            sequence: 6,
+            event_kind: "external_harness_operation".into(),
+            schema_version: 55,
+            payload: payload.to_string(),
+        };
+        let current = normalize_canonical_row(&row).unwrap();
+        for writer in [21, 22, 23] {
+            let repaired = normalize_canonical_row_for_writer_epoch(&row, writer).unwrap();
+            assert_eq!(repaired.event, current.event);
+        }
+        assert_eq!(serde_json::to_value(&current.event).unwrap(), payload);
+        for writer in [18, 19, 20] {
+            let migrated = normalize_canonical_row_for_writer_epoch(&row, writer).unwrap();
+            let mut expected = payload.clone();
+            expected["kind"]["external_harness_operation"]["operation"]["inventory_commitments"] =
+                serde_json::json!([]);
+            assert_eq!(serde_json::to_value(migrated.event).unwrap(), expected);
+            assert!(migrated.historical_source.is_none());
+            assert!(!migrated.retired_known);
+        }
+        for writer in [0, 24] {
+            assert!(matches!(
+                normalize_canonical_row_for_writer_epoch(&row, writer),
+                Err(HistoricalSessionEventError::InvalidEvent { .. })
+            ));
+        }
+        let mut malformed = payload;
+        malformed["kind"]["external_harness_operation"]["operation"]["inventory_commitments"][0]
+            ["root"] = "invalid".into();
+        assert!(
+            normalize_canonical_row_for_writer_epoch(
+                &bcode_session_migration_target::CanonicalRow {
+                    payload: malformed.to_string(),
+                    ..row
+                },
+                20
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn recovery_schema_gate_precedes_even_a_successful_current_decoder() {
+        for record in ["transport_released", "recovery_prepared"] {
+            for schema in [53, 54, 55] {
+                let payload = serde_json::json!({
+                    "schema_version": schema,
+                    "sequence": 0,
+                    "timestamp_ms": 0,
+                    "session_id": SESSION_ID,
+                    "kind": { "external_harness_operation": {
+                        "operation": { "record": { "kind": record } }
+                    } }
+                })
+                .to_string();
+                // Decoder stub intentionally accepts the input: migration's historical
+                // representation gate must reject before adopting that decoder's result.
+                let result = decode_for_migration(&payload, |_| {
+                    Ok(SessionEvent {
+                        schema_version: crate::CURRENT_EVENT_SCHEMA,
+                        sequence: 0,
+                        timestamp_ms: 0,
+                        session_id: SESSION_ID.parse().unwrap(),
+                        provenance: None,
+                        kind: SessionEventKind::SessionRenamed { name: None },
+                    })
+                });
+                assert!(matches!(result,
+                    Err(HistoricalSessionEventError::InvalidEvent { reason, .. })
+                        if reason == "recovery operation requires event schema 56"
+                ));
+            }
+        }
+    }
+
+    #[test]
+    fn recovery_schema_gate_does_not_promote_or_rewrite_older_records() {
+        for schema in [53, 54, 55, 56] {
+            for kind in ["configured", "transport_released", "recovery_prepared"] {
+                let envelope: HistoricalEnvelope = serde_json::from_value(serde_json::json!({
+                    "schema_version": schema,
+                    "sequence": 0,
+                    "session_id": SESSION_ID,
+                    "kind": { "external_harness_operation": {
+                        "operation": { "record": { "kind": kind } }
+                    } }
+                }))
+                .unwrap();
+                assert_eq!(
+                    envelope.validate_observation_compatibility().is_ok(),
+                    schema >= 56 || kind == "configured"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn recovery_writer_gate_uses_actual_typed_records_without_rewriting_evidence() {
+        // Synthetic type/compatibility inputs, never historical release evidence.
+        let payload: serde_json::Value = serde_json::from_str(
+            include_str!("../fixtures/stores/epoch-19-schema-54-harness.jsonl")
+                .lines()
+                .nth(1)
+                .unwrap(),
+        )
+        .unwrap();
+        let operation = &payload["kind"]["external_harness_operation"]["operation"];
+        let owner = operation["owner"].clone();
+        let instance = operation["record"]["instance"].clone();
+        let capabilities = operation["record"]["capabilities"].clone();
+        let binding = serde_json::json!({
+            "schema_version": 1,
+            "session_id": owner["session_id"],
+            "instance_id": "fixture",
+            "native_session_id": "native",
+            "native_version": "exact",
+            "generation": 1
+        });
+        let release = serde_json::json!({
+            "close_request_id": "close",
+            "instance": instance,
+            "binding": binding,
+            "lifetime": {
+                "daemon_instance_id": owner["daemon_id"],
+                "artifact_id": "exact-artifact",
+                "state_location_id": "isolated-location"
+            },
+            "reap_id": "synthetic-reap"
+        });
+        let mut next_binding = binding;
+        next_binding["generation"] = 2.into();
+        let recovery = serde_json::json!({
+            "previous_owner": owner,
+            "release_event_sequence": 7,
+            "release": release,
+            "capabilities": capabilities,
+            "resume_request": {
+                "schema_version": 1,
+                "request_id": "recover",
+                "instance": instance,
+                "kind": { "operation": "open", "request": {
+                    "open_id": "recover",
+                    "session_id": owner["session_id"],
+                    "generation": 2,
+                    "working_directory": "/tmp",
+                    "resume": next_binding,
+                    "parent_assistance": null
+                } }
+            }
+        });
+        let release: bcode_session_models::external_harness::ExternalHarnessTransportRelease =
+            serde_json::from_value(release).unwrap();
+        let mut event: SessionEvent = serde_json::from_value(payload.clone()).unwrap();
+        let SessionEventKind::ExternalHarnessOperation { operation } = &mut event.kind else {
+            panic!("operation fixture")
+        };
+        operation.record =
+            bcode_session_models::ExternalHarnessOperationRecord::TransportReleased { release };
+        for writer in [1, 20, 21, 22, 23] {
+            assert!(validate_recovery_writer(&event, writer).is_err());
+        }
+        let before = event.clone();
+        validate_recovery_writer(&event, 24).unwrap();
+        assert_eq!(event, before);
+        let recovery: bcode_session_models::external_harness::ExternalHarnessRecovery =
+            serde_json::from_value(recovery).unwrap();
+        let SessionEventKind::ExternalHarnessOperation { operation } = &mut event.kind else {
+            panic!("operation fixture")
+        };
+        operation.owner.generation = 2;
+        operation.owner.daemon_id = "new-daemon".into();
+        recovery.validate_for(&operation.owner).unwrap();
+        operation.record = bcode_session_models::ExternalHarnessOperationRecord::RecoveryPrepared {
+            recovery: Box::new(recovery),
+        };
+        for writer in [1, 20, 21, 22, 23] {
+            assert!(validate_recovery_writer(&event, writer).is_err());
+        }
+        let before = event.clone();
+        validate_recovery_writer(&event, 24).unwrap();
+        assert_eq!(event, before);
+        let configured = serde_json::from_value::<SessionEvent>(payload).unwrap();
+        for writer in [21, 22, 23, 24] {
+            validate_recovery_writer(&configured, writer).unwrap();
+        }
+    }
+
+    #[test]
+    fn execution_epoch_preserves_the_released_upgrade_chain() {
+        let latest = crate::plan_writer_epoch_migration(20).unwrap();
+        assert_eq!(latest.target_writer_epoch, 23);
+        assert_eq!(
+            latest.steps,
+            [
+                crate::MigrationStepDescriptor {
+                    id: "session-writer-epoch-20-to-21",
+                    source_writer_epoch: 20,
+                    target_writer_epoch: 21,
+                },
+                crate::MigrationStepDescriptor {
+                    id: "session-writer-epoch-21-to-22",
+                    source_writer_epoch: 21,
+                    target_writer_epoch: 22,
+                },
+                crate::MigrationStepDescriptor {
+                    id: "session-writer-epoch-22-to-23",
+                    source_writer_epoch: 22,
+                    target_writer_epoch: 23,
+                }
+            ]
+        );
+        let plan = crate::plan_writer_epoch_migration(19).unwrap();
+        assert_eq!(plan.target_writer_epoch, 23);
+        assert_eq!(plan.steps.len(), 4);
+        assert_eq!(
+            plan.steps[0],
+            crate::MigrationStepDescriptor {
+                id: "session-writer-epoch-19-to-20",
+                source_writer_epoch: 19,
+                target_writer_epoch: 20,
+            }
+        );
+        assert_eq!(plan.steps[1..], latest.steps);
+        let old = crate::plan_writer_epoch_migration(18).unwrap();
+        assert_eq!(old.steps.len(), 5);
+        assert_eq!(old.steps[0].id, "session-writer-epoch-18-to-19");
+        assert_eq!(old.steps[1..], plan.steps);
+        assert_eq!(crate::CURRENT_EVENT_SCHEMA, 55);
+        assert!(matches!(
+            crate::plan_writer_epoch_migration_with_registry(21, 20, &crate::MIGRATION_STEPS),
+            Err(crate::MigrationPlanError::FutureWriter { .. })
         ));
     }
 

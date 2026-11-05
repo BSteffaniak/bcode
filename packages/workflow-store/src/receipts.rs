@@ -1088,6 +1088,17 @@ pub fn apply_attempt_observation(
             request.dispatch_identity, current_status
         )));
     }
+    if matches!(
+        &observation,
+        AttemptObservation::Succeeded { .. }
+            | AttemptObservation::Failed { .. }
+            | AttemptObservation::RetryableFailure { .. }
+            | AttemptObservation::Cancelled
+            | AttemptObservation::Unknown
+            | AttemptObservation::Paused { .. }
+    ) {
+        crate::obligation::require_terminal_obligation_fence(transaction, request)?;
+    }
     let cancellation_requested = cancellation_requested_for_run(transaction, &request.run_id)?
         || sibling_cancellation_requested_for_attempt(transaction, &request.dispatch_identity)?;
     // Intent is not evidence that the owner stopped. Keep every owner kind

@@ -1000,8 +1000,63 @@ pub fn clone_snapshot_bounded(
     Ok(cloned)
 }
 
+/// Account for every retained lifecycle field, including spare collection and string capacity.
+/// # Errors
+/// Rejects values exceeding the observation retention budget.
+pub fn inspect_execution_lifecycle(
+    value: &crate::execution::ExecutionLifecycleView,
+    limits: ObservationRetentionLimits,
+) -> Result<ObservationRetentionUsage, ObservationRetentionExceeded> {
+    if !value.is_bounded() {
+        return Err(ObservationRetentionExceeded);
+    }
+    let mut walker = Walker::new(limits, 8)?;
+    walker.optional_text(value.session_id.as_ref(), 2)?;
+    for items in [&value.submissions, &value.background, &value.continuations] {
+        walker.usage.try_add(
+            ObservationRetentionUsage {
+                scalar_capacity_bytes: items
+                    .capacity()
+                    .saturating_mul(std::mem::size_of::<crate::execution::ExecutionItemView>()),
+                collection_entries: items.capacity(),
+                value_nodes: items.len().saturating_mul(9),
+                depth: 5,
+                ..ObservationRetentionUsage::default()
+            },
+            limits,
+        )?;
+        for item in items {
+            walker.text(&item.id, 4)?;
+            walker.text(&item.label, 4)?;
+            walker.optional_text(item.native_id.as_ref(), 4)?;
+            walker.optional_text(item.source_work_id.as_ref(), 4)?;
+            if let Some(origin) = &item.origin {
+                walker.text(&origin.submission_id, 5)?;
+                walker.text(&origin.attempt_id, 5)?;
+            }
+        }
+    }
+    walker.usage.try_add(
+        ObservationRetentionUsage {
+            scalar_capacity_bytes: value
+                .coverage
+                .capacity()
+                .saturating_mul(std::mem::size_of::<crate::execution::ExecutionCoverageView>()),
+            collection_entries: value.coverage.capacity(),
+            value_nodes: value.coverage.len().saturating_mul(5),
+            depth: 5,
+            ..ObservationRetentionUsage::default()
+        },
+        limits,
+    )?;
+    for item in &value.coverage {
+        walker.text(&item.attempt.submission_id, 5)?;
+        walker.text(&item.attempt.attempt_id, 5)?;
+    }
+    Ok(walker.usage)
+}
+
 /// Inspect the complete retained semantic snapshot without serializing or cloning it.
-///
 /// # Errors
 /// Returns an error on an owning nested rejection, structural limit, or overflow.
 pub fn inspect_snapshot(
@@ -1009,6 +1064,7 @@ pub fn inspect_snapshot(
     limits: ObservationRetentionLimits,
 ) -> Result<ObservationRetentionUsage, ObservationRetentionExceeded> {
     let crate::SessionViewSnapshot {
+        execution_lifecycle,
         schema_version: _,
         revision: _,
         session_id: _,
@@ -1035,6 +1091,7 @@ pub fn inspect_snapshot(
         session_summary: _,
     } = value;
     let mut walker = Walker::new(limits, 8)?;
+    walker.nested(inspect_execution_lifecycle(execution_lifecycle, limits)?, 1)?;
     walker.optional_text(title.as_ref(), 2)?;
     if let Some(path) = working_directory {
         walker.usage.try_add(

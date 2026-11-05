@@ -559,6 +559,29 @@ impl HyperChadAppState {
         Ok(self)
     }
 
+    fn lifecycle_page(
+        mut page: hyperchad::template::Containers,
+        snapshot: &SessionViewSnapshot,
+    ) -> hyperchad::template::Containers {
+        if snapshot.execution_lifecycle.session_id.is_some() {
+            let summary = snapshot.execution_lifecycle.summary();
+            let details = snapshot.execution_lifecycle.details();
+            let blocks = hyperchad::template::container! {
+                section {
+                    h3 { (summary) }
+                    details {
+                        summary { "Native tasks and automatic continuations" }
+                        div white-space="preserve-wrap" { (details) }
+                    }
+                }
+            };
+            if let Some(shell) = page.first_mut() {
+                shell.children.splice(0..0, blocks);
+            }
+        }
+        page
+    }
+
     #[cfg(feature = "renderer-html-actix")]
     fn render_home(
         &self,
@@ -566,7 +589,10 @@ impl HyperChadAppState {
         sessions: &[SessionSummary],
     ) -> hyperchad::template::Containers {
         let context = html_actix::HtmlActixPresentationContext::new(Arc::clone(&self.access_token));
-        bcode_hyperchad_ui::pages::home::home(snapshot, sessions, &context)
+        Self::lifecycle_page(
+            bcode_hyperchad_ui::pages::home::home(snapshot, sessions, &context),
+            snapshot,
+        )
     }
 
     #[cfg(not(feature = "renderer-html-actix"))]
@@ -576,10 +602,13 @@ impl HyperChadAppState {
         sessions: &[SessionSummary],
     ) -> hyperchad::template::Containers {
         let _ = self;
-        bcode_hyperchad_ui::pages::home::home(
+        Self::lifecycle_page(
+            bcode_hyperchad_ui::pages::home::home(
+                snapshot,
+                sessions,
+                &bcode_hyperchad_ui::context::StaticPresentationContext,
+            ),
             snapshot,
-            sessions,
-            &bcode_hyperchad_ui::context::StaticPresentationContext,
         )
     }
 
@@ -3523,6 +3552,10 @@ where
                 let mut page = application.managed_composer_page(vec![fragment], session_id);
                 fragment = page.remove(0);
             }
+            if update.snapshot.execution_lifecycle.session_id.is_some() {
+                let mut page = HyperChadAppState::lifecycle_page(vec![fragment], &update.snapshot);
+                fragment = page.remove(0);
+            }
             let view = hyperchad::renderer::View::builder()
                 .with_fragment(fragment)
                 .build();
@@ -3541,6 +3574,70 @@ mod tests {
         containers.iter().any(|container| matches!(&container.element,
             hyperchad::renderer::transformer::Element::Input { name: Some(name), .. } if name == "managed_request")
             || has_retained_field(&container.children))
+    }
+
+    fn lifecycle_test_text(
+        containers: &[hyperchad::renderer::transformer::Container],
+        output: &mut String,
+    ) {
+        for container in containers {
+            if let hyperchad::renderer::transformer::Element::Text { value } = &container.element {
+                output.push_str(value);
+            }
+            assert!(!matches!(
+                container.element,
+                hyperchad::renderer::transformer::Element::Input { .. }
+            ));
+            lifecycle_test_text(&container.children, output);
+        }
+    }
+
+    #[test]
+    fn lifecycle_html_uses_portable_summary_and_keeps_native_text_escaped() {
+        use bcode_session_view_models::execution::{
+            ExecutionAttemptView, ExecutionItemView, ExecutionLifecycleView,
+            ExecutionNotificationView, ExecutionStateView,
+        };
+        let item = |id: &str, state| ExecutionItemView {
+            generation: 3,
+            id: id.into(),
+            native_id: None,
+            origin: Some(ExecutionAttemptView {
+                submission_id: "s".into(),
+                attempt_id: "a".into(),
+            }),
+            source_work_id: None,
+            label: "<script>native</script>".into(),
+            state,
+            notification: ExecutionNotificationView::Pending,
+        };
+        let lifecycle = ExecutionLifecycleView {
+            session_id: Some(SessionId::new().to_string()),
+            generation: Some(3),
+            submissions: vec![item("reply", ExecutionStateView::Completed)],
+            background: vec![
+                item("one", ExecutionStateView::Running),
+                item("two", ExecutionStateView::Running),
+            ],
+            continuations: vec![item("automatic", ExecutionStateView::Pending)],
+            ..ExecutionLifecycleView::default()
+        };
+        let mut snapshot = SessionViewSnapshot::empty();
+        snapshot.execution_lifecycle = lifecycle;
+        snapshot.execution_lifecycle.uncertain = true; // Same sticky fence published after page/status coverage loss.
+        let page = HyperChadAppState::lifecycle_page(
+            hyperchad::template::container! { div { } },
+            &snapshot,
+        );
+        let mut visible = String::new();
+        lifecycle_test_text(&page, &mut visible);
+        assert!(visible.contains("Reply complete + 2 background"));
+        assert!(visible.contains("1 continuation pending"));
+        assert!(visible.contains("coverage unknown"));
+        assert!(
+            visible.contains("<script>native</script>"),
+            "native content remains escaped Text, never Raw markup"
+        );
     }
 
     #[test]

@@ -1,0 +1,240 @@
+//! Offline plugin boundary coverage. The ledger below models the managed host's
+//! commit-before-ACK ordering; it is not a database or server integration test.
+use super::*;
+use bcode_claude_code::{AttributionStage, SubmissionAttribution};
+use bcode_harness_models::{
+    HarnessExecutionEvent, HarnessObservationPage, HarnessTrackingCoverage,
+    harness_observations_digest,
+};
+
+#[derive(Default)]
+struct CommittedPages {
+    pages: Vec<HarnessObservationPage>,
+}
+impl CommittedPages {
+    fn commit(
+        &mut self,
+        page: &HarnessObservationPage,
+    ) -> bcode_harness_models::HarnessRetentionContext {
+        page.validate_retention().unwrap();
+        assert_eq!(page.hydration_requests, Vec::new());
+        let metadata = page.retention.clone().expect("retained page");
+        assert_eq!(
+            metadata.observations_digest,
+            harness_observations_digest(&page.observations).unwrap()
+        );
+        // Preserve the exact returned page before issuing its acknowledgment.
+        self.pages.push(page.clone());
+        retained_page_ack(metadata, u64::try_from(self.pages.len()).unwrap())
+    }
+}
+
+fn poll(
+    stream: &mut StreamState,
+    prepared: &HarnessPreparedSession,
+    request: &HarnessObserveRequest,
+    cycle: usize,
+) -> HarnessObservationPage {
+    let HarnessServiceResponseKind::Observations(page) = stream
+        .observation_page(prepared, request, &Settlement::Unsupported)
+        .unwrap_or_else(|error| panic!("observation cycle {cycle}: {error:?}"))
+    else {
+        panic!("observation page required");
+    };
+    assert_eq!(page.status.activity, HarnessActivity::Unknown);
+    assert_eq!(page.completeness, HarnessCompleteness::Complete);
+    page
+}
+
+fn staged_foreground(
+    result_subtype: Option<&str>,
+) -> (
+    HarnessPreparedSession,
+    HarnessSessionTarget,
+    StreamState,
+    HarnessSubmission,
+) {
+    const REPLY: &str = "11111111-1111-4111-8111-000000000001";
+    const FRAME: &str = "11111111-1111-4111-8111-000000000002";
+    let (prepared, target, mut stream) = eof_stream_fixture();
+    stream.normalizer.configure_execution(false, true);
+    stream.normalizer.enable_retention();
+    let submission = HarnessSubmission {
+        submission_id: "foreground".into(),
+        attempt_id: "00000000-0000-4000-8000-000000000001".into(),
+        session_id: prepared.session_id.clone(),
+        generation: prepared.generation,
+        text: "offline sentinel".into(),
+        placement: HarnessPlacement::NextTurn,
+    };
+    let uuid = stream.normalizer.retain_submission(&submission).unwrap();
+    let mut result = json!({
+        "type":"result", "uuid":FRAME, "is_error":false, "result":"offline sentinel"
+    });
+    if let Some(subtype) = result_subtype {
+        result["subtype"] = json!(subtype);
+    }
+    let events = [
+        Event::Message(NativeMessage::System(
+            json!({"type":"system","subtype":"init"}),
+        )),
+        Event::Message(NativeMessage::Notice(json!({"type":"rate_limit_event"}))),
+        Event::Message(NativeMessage::Stream(
+            json!({"type":"stream_event","event":{"type":"message_start"}}),
+        )),
+        Event::Attribution(SubmissionAttribution {
+            native_frame_uuid: REPLY.into(),
+            primary: uuid.clone(),
+            consumed: vec![uuid.clone()],
+            resumed: false,
+            stage: AttributionStage::Reply,
+        }),
+        Event::Message(NativeMessage::Assistant(json!({
+            "type":"assistant", "uuid":REPLY,
+            "message":{"content":[{"type":"text","text":"offline sentinel"}]}
+        }))),
+        Event::Attribution(SubmissionAttribution {
+            native_frame_uuid: FRAME.into(),
+            primary: uuid.clone(),
+            consumed: vec![uuid],
+            resumed: false,
+            stage: AttributionStage::Result {
+                is_error: false,
+                queued_turn_count: Some(0),
+            },
+        }),
+        Event::Message(NativeMessage::Result(result)),
+    ];
+    for event in events {
+        let observations = stream.normalizer.event(event);
+        assert!(stream.push(observations));
+    }
+    (prepared, target, stream, submission)
+}
+
+#[test]
+fn missing_result_subtype_fails_closed_on_seventh_advancing_cycle() {
+    let (prepared, target, mut stream, _) = staged_foreground(None);
+    let mut request = eof_observe_request(target);
+    let mut committed = CommittedPages::default();
+    for cycle in 1..=6 {
+        let page = poll(&mut stream, &prepared, &request, cycle);
+        assert!(!page.observations.iter().any(|item| matches!(
+            item.kind,
+            HarnessObservationKind::Result { .. }
+                | HarnessObservationKind::Execution {
+                    event: HarnessExecutionEvent::SubmissionTerminal { .. }
+                }
+        )));
+        request.retention = Some(committed.commit(&page));
+        request.after = page.next_after;
+    }
+    // Missing native disposition is malformed evidence, not a retention failure.
+    // The exact cycle-six ACK is valid; pumping cycle seven produces a gap.
+    assert!(matches!(
+        stream.observation_page(&prepared, &request, &Settlement::Unsupported),
+        Err(HarnessFailure::Uncertain)
+    ));
+    assert!(stream.gap);
+    assert!(!stream.observations.iter().any(|item| matches!(
+        item.kind,
+        HarnessObservationKind::Result { .. }
+            | HarnessObservationKind::Execution {
+                event: HarnessExecutionEvent::SubmissionTerminal { .. }
+            }
+    )));
+}
+
+#[test]
+fn staged_empty_pages_need_exact_committed_ack_before_text_and_result_advance() {
+    let (prepared, target, mut stream, submission) = staged_foreground(Some("success"));
+    let mut request = eof_observe_request(target);
+    let mut committed = CommittedPages::default();
+    let mut delivered = Vec::new();
+    for cycle in 1..=7 {
+        let page = poll(&mut stream, &prepared, &request, cycle);
+        if cycle == 2 || cycle == 3 {
+            assert_eq!(page.observations, Vec::new());
+            assert!(page.next_after.is_none());
+        }
+        if cycle == 5 {
+            assert!(page.observations.iter().any(|item| matches!(&item.kind,
+                HarnessObservationKind::Text { text } if text == "offline sentinel")));
+        }
+        if cycle == 7 {
+            assert!(page.observations.iter().any(|item| matches!(&item.kind,
+                HarnessObservationKind::Result { text } if text == "offline sentinel")));
+        }
+        // A cursor alone never releases even an empty retained page.
+        let mut unacknowledged = request.clone();
+        unacknowledged.retention = None;
+        unacknowledged.after = page.next_after.clone();
+        let repeated = poll(&mut stream, &prepared, &unacknowledged, cycle);
+        assert_eq!(
+            serde_json::to_value(&repeated).unwrap(),
+            serde_json::to_value(&page).unwrap()
+        );
+        let acknowledgment = committed.commit(&page);
+        let mut wrong = acknowledgment.clone();
+        wrong.acknowledgment.as_mut().unwrap().observations_digest = "0".repeat(64);
+        let invalid = HarnessObserveRequest {
+            retention: Some(wrong),
+            ..request.clone()
+        };
+        assert!(matches!(
+            stream.observation_page(&prepared, &invalid, &Settlement::Unsupported),
+            Err(HarnessFailure::Conflict)
+        ));
+        request.retention = Some(acknowledgment);
+        // Match the immediately preceding committed page, including null after an
+        // empty page. Do not carry forward the last nonempty observation ID.
+        request.after = page.next_after.clone();
+        delivered.extend(page.observations);
+        if cycle < 5 {
+            assert!(
+                !delivered
+                    .iter()
+                    .any(|item| matches!(item.kind, HarnessObservationKind::Text { .. }))
+            );
+        }
+        if cycle < 7 {
+            assert!(
+                !delivered
+                    .iter()
+                    .any(|item| matches!(item.kind, HarnessObservationKind::Result { .. }))
+            );
+        }
+    }
+    assert!(delivered.iter().any(|item| matches!(&item.kind,
+        HarnessObservationKind::Text { text } if text == "offline sentinel")));
+    assert!(delivered.iter().any(|item| matches!(&item.kind,
+        HarnessObservationKind::Result { text } if text == "offline sentinel")));
+    assert!(delivered.iter().any(|item| matches!(&item.kind,
+        HarnessObservationKind::Execution { event: HarnessExecutionEvent::SubmissionTerminal { attempt, .. } }
+            if attempt.submission_id == submission.submission_id && attempt.attempt_id == submission.attempt_id)));
+    assert!(delivered.iter().any(|item| matches!(
+        &item.kind,
+        HarnessObservationKind::Execution {
+            event: HarnessExecutionEvent::Coverage { .. }
+        }
+    )));
+    for item in &delivered {
+        if let HarnessObservationKind::Execution {
+            event:
+                HarnessExecutionEvent::Coverage {
+                    background,
+                    continuations,
+                    ..
+                },
+        } = &item.kind
+        {
+            assert_eq!(*background, HarnessTrackingCoverage::Unknown);
+            assert_eq!(*continuations, HarnessTrackingCoverage::Unknown);
+        }
+    }
+    // Eighth successful cycle acknowledges the foreground result's exact page.
+    let final_page = poll(&mut stream, &prepared, &request, 8);
+    assert_eq!(final_page.observations, Vec::new());
+    committed.commit(&final_page);
+    assert_eq!(committed.pages.len(), 8);
+}

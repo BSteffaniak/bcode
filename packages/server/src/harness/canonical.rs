@@ -32,6 +32,101 @@ fn storage_failure(
     ManagedHarnessError::Storage
 }
 
+#[cfg(test)]
+mod recovery_lifetime_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn recovery_lifetime_requires_exact_released_identity_not_fingerprint() {
+        let root = tempfile::tempdir().unwrap();
+        let sessions_root = tempfile::tempdir().unwrap();
+        let sessions = crate::SessionManager::persistent(sessions_root.path()).unwrap();
+        let mut state = crate::tests::test_server_state(sessions);
+        state.state_root = root.path().to_path_buf();
+        let record = bcode_daemon_lifecycle::DaemonRecord::current(
+            &bcode_ipc::default_endpoint(),
+            root.path().join("unused.log"),
+            None,
+            "previous-daemon".into(),
+        )
+        .unwrap();
+        state
+            .daemon_status
+            .state_location_id
+            .clone_from(&record.state_location_id);
+        let lifetime =
+            bcode_daemon_lifecycle::ExecutionLifetime::begin(root.path(), &record).unwrap();
+        let instance: HarnessInstance = serde_json::from_value(serde_json::json!({
+            "instance_id":"fixture","plugin_id":"fixture","executable":"/not-invoked","config_namespace":"namespace",
+            "auth":{"provider_id":"fixture","profile":"native","credential_namespace":"namespace","custody":"native_managed"}
+        })).unwrap();
+        let mut release = bcode_session_models::external_harness::ExternalHarnessTransportRelease {
+            close_request_id: "close".into(),
+            instance,
+            reap_id: "actual-reap".into(),
+            binding: HarnessSessionBinding {
+                schema_version: 1,
+                session_id: SessionId::new().to_string(),
+                instance_id: "fixture".into(),
+                native_session_id: "exact-native".into(),
+                native_version: "exact-version".into(),
+                generation: 1,
+            },
+            lifetime: bcode_session_models::external_harness::ExternalHarnessLifetime {
+                daemon_instance_id: record.instance_id.clone(),
+                artifact_id: record.artifact_id.as_ref().unwrap().to_string(),
+                state_location_id: record.state_location_id.clone().unwrap(),
+            },
+        };
+        assert!(
+            verify_recorded_release_lifetime(&state, &release).is_err(),
+            "live old owner must block"
+        );
+        drop(lifetime);
+        verify_recorded_release_lifetime(&state, &release).unwrap();
+        let exact = release.lifetime.artifact_id.clone();
+        release
+            .lifetime
+            .artifact_id
+            .clone_from(&state.daemon_status.build_fingerprint);
+        assert!(
+            verify_recorded_release_lifetime(&state, &release).is_err(),
+            "fingerprint is not artifact identity"
+        );
+        release.lifetime.artifact_id = exact;
+        release.lifetime.state_location_id = "other-location".into();
+        assert!(verify_recorded_release_lifetime(&state, &release).is_err());
+        release.lifetime.state_location_id = record.state_location_id.unwrap();
+        release.lifetime.daemon_instance_id = "missing-owner".into();
+        assert!(
+            verify_recorded_release_lifetime(&state, &release).is_err(),
+            "missing lifetime is not death proof"
+        );
+        drop(state);
+    }
+
+    #[tokio::test]
+    async fn release_provenance_requires_published_runtime_lifetime() {
+        if bcode_session_models::CURRENT_SESSION_EVENT_SCHEMA_VERSION >= 56
+            && bcode_session_models::CURRENT_SESSION_STORAGE_WRITER_EPOCH >= 24
+        {
+            return;
+        }
+        // Shape construction is deliberately isolated in the session projector tests;
+        // production admission remains disabled before any plugin inspection or dispatch.
+        let state = Arc::new(crate::tests::test_server_state(
+            crate::SessionManager::default(),
+        ));
+        let store = CanonicalHarnessStore::new(&state);
+        assert!(
+            store.release_lifetime_provenance().is_err(),
+            "unpublished runtime lifetime cannot be invented"
+        );
+        drop(store);
+        drop(state);
+    }
+}
+
 /// Production adapter; weak state avoids a backend/ServerState reference cycle.
 #[derive(Clone)]
 pub struct CanonicalHarnessStore {
@@ -39,7 +134,99 @@ pub struct CanonicalHarnessStore {
     pub(super) assistance: Arc<super::assistance::AssistanceRegistry>,
 }
 
+fn verify_recorded_release_lifetime(
+    state: &crate::ServerState,
+    release: &bcode_session_models::external_harness::ExternalHarnessTransportRelease,
+) -> Result<(), ManagedHarnessError> {
+    let provenance = &release.lifetime;
+    provenance
+        .validate()
+        .map_err(|_| ManagedHarnessError::Invalid)?;
+    if provenance.daemon_instance_id == state.daemon_status.instance_id
+        || state.daemon_status.state_location_id.as_deref()
+            != Some(provenance.state_location_id.as_str())
+        || bcode_daemon_lifecycle::execution_lifetime_status(
+            &state.state_root,
+            &provenance.daemon_instance_id,
+            &provenance.artifact_id,
+            &provenance.state_location_id,
+        ) != bcode_daemon_lifecycle::ExecutionLifetimeStatus::Released
+    {
+        return Err(ManagedHarnessError::StaleOwner);
+    }
+    let root = state
+        .sessions
+        .session_store_root()
+        .ok_or(ManagedHarnessError::Storage)?;
+    let session: SessionId = release
+        .binding
+        .session_id
+        .parse()
+        .map_err(|_| ManagedHarnessError::Invalid)?;
+    let owners = bcode_session::lease::session_owner_observations(&root, session)
+        .map_err(|_| ManagedHarnessError::StaleOwner)?;
+    if owners.iter().any(|observation| {
+        observation.owner.daemon_instance_id.as_deref()
+            == Some(provenance.daemon_instance_id.as_str())
+            && matches!(
+                observation.liveness,
+                bcode_session::lease::SessionOwnerLiveness::Live
+                    | bcode_session::lease::SessionOwnerLiveness::Unverifiable
+            )
+    }) {
+        return Err(ManagedHarnessError::StaleOwner);
+    }
+    Ok(())
+}
+
 impl CanonicalHarnessStore {
+    /// Capture exact lifetime provenance from this authenticated serving daemon.
+    /// No native release, settlement or quiescence is inferred by this read.
+    /// # Errors
+    /// Rejects runtimes without a published lifetime or complete artifact/location identity.
+    pub fn release_lifetime_provenance(
+        &self,
+    ) -> Result<bcode_session_models::external_harness::ExternalHarnessLifetime, ManagedHarnessError>
+    {
+        let state = self.state()?;
+        if state.execution_lifetime.get().is_none() {
+            return Err(ManagedHarnessError::Unavailable);
+        }
+        let provenance = bcode_session_models::external_harness::ExternalHarnessLifetime {
+            daemon_instance_id: state.daemon_status.instance_id.clone(),
+            artifact_id: state
+                .daemon_status
+                .artifact_id
+                .as_ref()
+                .ok_or(ManagedHarnessError::StaleOwner)?
+                .to_string(),
+            state_location_id: state
+                .daemon_status
+                .state_location_id
+                .clone()
+                .ok_or(ManagedHarnessError::StaleOwner)?,
+        };
+        drop(state);
+        provenance
+            .validate()
+            .map_err(|_| ManagedHarnessError::StaleOwner)?;
+        Ok(provenance)
+    }
+
+    /// Verify the exact recorded old daemon has released its execution lifetime.
+    /// A retained physical-reap record is required independently; this never converts
+    /// Close acknowledgement, PID absence or a fingerprint into native release evidence.
+    /// # Errors
+    /// Rejects foreign locations, the current daemon, missing/unverifiable/live lifetime
+    /// evidence and any live or unverifiable prior session lease.
+    pub fn verify_recovery_lifetime(
+        &self,
+        release: &bcode_session_models::external_harness::ExternalHarnessTransportRelease,
+    ) -> Result<(), ManagedHarnessError> {
+        let state = self.state()?;
+        verify_recorded_release_lifetime(&state, release)
+    }
+
     pub(super) async fn admitted_assistance(
         &self,
         owner: &HarnessOwner,
@@ -166,16 +353,14 @@ impl CanonicalHarnessStore {
         }
         // Verify the retained open/workspace/parent atomically again in the owning domain.
         // Returning true does not authorize native delivery; actor claim remains separate.
-        state
-            .sessions
-            .prepare_external_harness_open(
-                &self.durable(owner)?,
-                request,
-                selected.capabilities,
-                parent_id,
-            )
-            .await
-            .map_err(|_| ManagedHarnessError::Conflict)?;
+        Box::pin(state.sessions.prepare_external_harness_open(
+            &self.durable(owner)?,
+            request,
+            selected.capabilities,
+            parent_id,
+        ))
+        .await
+        .map_err(|_| ManagedHarnessError::Conflict)?;
         drop(state);
         Ok(true)
     }
@@ -189,16 +374,14 @@ impl CanonicalHarnessStore {
     ) -> Result<(), ManagedHarnessError> {
         let state = self.state()?;
         Self::local_owner(&state, owner)?;
-        let summary = state
-            .sessions
-            .prepare_external_harness_open(
-                &self.durable(owner)?,
-                request,
-                inspection.capabilities.clone(),
-                parent_id,
-            )
-            .await
-            .map_err(|error| storage_failure("prepare_canonical_open", &error))?;
+        let summary = Box::pin(state.sessions.prepare_external_harness_open(
+            &self.durable(owner)?,
+            request,
+            inspection.capabilities.clone(),
+            parent_id,
+        ))
+        .await
+        .map_err(|error| storage_failure("prepare_canonical_open", &error))?;
         state.session_catalog.upsert_native_session(summary).await;
         drop(state);
         Ok(())
@@ -214,15 +397,19 @@ impl CanonicalHarnessStore {
         session_id: SessionId,
     ) -> Result<HarnessOwner, ManagedHarnessError> {
         let state = self.state()?;
+        tracing::warn!(target: "bcode_server::harness", stage = "owner_location_start", "managed owner progress");
         crate::session_operations::require_selected_location(&state, session_id)
             .await
             .map_err(|_| ManagedHarnessError::StaleOwner)?;
+        tracing::warn!(target: "bcode_server::harness", stage = "owner_location_done", "managed owner progress");
+        tracing::warn!(target: "bcode_server::harness", stage = "owner_snapshot_start", "managed owner progress");
         let snapshot = state
             .sessions
             .session_external_harness_state(session_id)
             .await
-            .map_err(|_| ManagedHarnessError::Storage)?
+            .map_err(|error| storage_failure("current_owner_snapshot", &error))?
             .ok_or(ManagedHarnessError::Conflict)?;
+        tracing::warn!(target: "bcode_server::harness", stage = "owner_snapshot_done", "managed owner progress");
         if snapshot.owner.daemon_id != state.daemon_status.instance_id
             || snapshot.owner.artifact_id != state.daemon_status.build_fingerprint
         {
@@ -237,11 +424,34 @@ impl CanonicalHarnessStore {
             .to_string();
         Self::local_owner(&state, &owner)?;
         drop(state);
+        tracing::warn!(target: "bcode_server::harness", stage = "owner_acquire_start", "managed owner progress");
         let _hold = self.acquire(&owner).await?;
-        if self.selected(&owner).await? != snapshot {
+        tracing::warn!(target: "bcode_server::harness", stage = "owner_acquire_done", "managed owner progress");
+        tracing::warn!(target: "bcode_server::harness", stage = "owner_selected_start", "managed owner progress");
+        let selected = self.selected(&owner).await?;
+        tracing::warn!(target: "bcode_server::harness", stage = "owner_selected_done", "managed owner progress");
+        Self::validate_owner_observation(&snapshot, &selected)?;
+        Ok(owner)
+    }
+
+    pub(super) fn validate_owner_observation(
+        before: &bcode_session_models::external_harness::ExternalHarnessState,
+        current: &bcode_session_models::external_harness::ExternalHarnessState,
+    ) -> Result<(), ManagedHarnessError> {
+        Self::owner_from_snapshot(current.owner.session_id, current)?;
+        if current.owner != before.owner
+            || current.instance != before.instance
+            || current.capabilities != before.capabilities
+            || current.prepared_open != before.prepared_open
+        {
             return Err(ManagedHarnessError::StaleOwner);
         }
-        Ok(owner)
+        match &before.target {
+            Some(target) => super::admission::validate_retained_target(current, target)
+                .map_err(|_| ManagedHarnessError::StaleOwner),
+            None if current.target.is_none() && current.binding == before.binding => Ok(()),
+            None => Err(ManagedHarnessError::StaleOwner),
+        }
     }
 
     pub(super) fn owner_from_snapshot(
@@ -348,6 +558,24 @@ impl ManagedHarnessStore for CanonicalHarnessStore {
             .await
             .map_err(|_| ManagedHarnessError::StaleOwner)
     }
+    async fn retention_context(
+        &self,
+        owner: &HarnessOwner,
+        target: &HarnessSessionTarget,
+        after: Option<&str>,
+    ) -> Result<Option<bcode_harness_models::HarnessRetentionContext>, ManagedHarnessError> {
+        let state = self.state()?;
+        Self::local_owner(&state, owner)?;
+        crate::session_operations::require_selected_location(&state, owner.session_id)
+            .await
+            .map_err(|_| ManagedHarnessError::StaleOwner)?;
+        state
+            .sessions
+            .session_harness_retention_context(&self.durable(owner)?, target, after)
+            .await
+            .map_err(|error| storage_failure("retention_context", &error))
+    }
+
     async fn load(&self, owner: &HarnessOwner) -> Result<ManagedSession, ManagedHarnessError> {
         let selected = self.selected(owner).await?;
         Ok(ManagedSession {
@@ -408,12 +636,15 @@ impl ManagedHarnessStore for CanonicalHarnessStore {
     ) -> Result<DeliveryClaim, ManagedHarnessError> {
         let state = self.state()?;
         Self::local_owner(&state, owner)?;
-        match state
+        tracing::warn!(target: "bcode_server::harness", stage = "claim_start", "managed canonical progress");
+        let claim = state
             .sessions
             .claim_external_harness_request(&self.durable(owner)?, request)
             .await
-            .map_err(|_| ManagedHarnessError::Conflict)?
-        {
+            .map_err(|_| ManagedHarnessError::Conflict)?;
+        drop(state);
+        tracing::warn!(target: "bcode_server::harness", stage = "claim_done", "managed canonical progress");
+        match claim {
             ExternalHarnessClaim::New => Ok(DeliveryClaim::New),
             ExternalHarnessClaim::Recorded(response) => {
                 Ok(DeliveryClaim::Recorded(Box::new(response.response())))
@@ -429,11 +660,15 @@ impl ManagedHarnessStore for CanonicalHarnessStore {
     ) -> Result<(), ManagedHarnessError> {
         let state = self.state()?;
         Self::local_owner(&state, owner)?;
-        state
+        tracing::warn!(target: "bcode_server::harness", stage = "commit_start", "managed canonical progress");
+        let result = state
             .sessions
             .complete_external_harness_request(&self.durable(owner)?, request, response)
             .await
-            .map_err(|_| ManagedHarnessError::Storage)
+            .map_err(|_| ManagedHarnessError::Storage);
+        drop(state);
+        tracing::warn!(target: "bcode_server::harness", stage = "commit_done", success = result.is_ok(), "managed canonical progress");
+        result
     }
     async fn uncertain(
         &self,

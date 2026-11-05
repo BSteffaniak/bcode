@@ -449,7 +449,9 @@ impl BcodeRuntimeModel {
         );
         match self.focused_input_owner {
             Some(FocusedInputOwner::RootSurface) => {
-                let client = self.loop_state.foreground_client();
+                let Some(client) = self.loop_state.foreground_client() else {
+                    return rejected;
+                };
                 let launch = self.fresh_session_settings();
                 let Some(result) = self
                     .loop_state
@@ -720,7 +722,9 @@ impl BcodeRuntimeModel {
         let Some(handle) = self.runtime_handle.clone() else {
             return;
         };
-        let client = self.loop_state.foreground_client();
+        let Some(client) = self.loop_state.foreground_client() else {
+            return;
+        };
         let task_client = client.clone();
         let context = bcode_ipc::PluginServiceContext {
             invocation_id: request.request_id.clone(),
@@ -1145,6 +1149,12 @@ impl BcodeRuntimeModel {
         &mut self,
         result: bcode_plugin_sdk::tui::PluginTuiEventResult,
     ) -> super::invalidation::UiInvalidation {
+        if self.chat.app.managed_execution_session().is_some() {
+            self.chat
+                .app
+                .set_status("Plugin execution is disabled in this managed conversation".into());
+            return super::invalidation::UiInvalidation::Structural;
+        }
         let has_effect = result.outcome == bmux_tui::event::EventOutcome::Redraw
             || !matches!(result.action, bcode_plugin_sdk::tui::PluginTuiAction::None);
         match result.action {
@@ -1185,7 +1195,9 @@ impl BcodeRuntimeModel {
             }
             bcode_plugin_sdk::tui::PluginTuiAction::SubscribeWorkflowRuns => {
                 let (updates, requests) = super::plugin_surface_host::subscribe_workflow_views(
-                    self.loop_state.foreground_client(),
+                    self.loop_state
+                        .foreground_client()
+                        .expect("ordinary plugin action requires model application access"),
                     self.loop_state
                         .root_plugin_surface_invalidation()
                         .expect("plugin surface invalidation"),
@@ -1239,18 +1251,54 @@ impl BcodeRuntimeModel {
     // fallback dispatcher; focused-input composition lives outside this handler.
     #[allow(clippy::let_and_return, clippy::too_many_lines)]
     fn handle_basic_terminal_event(&mut self, event: Event) -> super::invalidation::UiInvalidation {
+        if self.chat.app.managed_execution_session().is_some() {
+            if let Event::Key(stroke) = &event {
+                let action = self.settings.keymap().action("chat", *stroke);
+                if action == Some("app.interrupt") {
+                    super::chat_loop::start_cancel_turn(&mut self.chat, &mut self.loop_state);
+                    return super::invalidation::UiInvalidation::Structural;
+                }
+                if matches!(
+                    action,
+                    Some(
+                        "app.command_palette"
+                            | "tui.session.search"
+                            | "tui.agent.cycle"
+                            | "tui.thinking.effort.cycle"
+                            | "tui.session.new"
+                            | "tui.session.rename"
+                            | "tui.session.delete"
+                            | "tui.skill.invoke"
+                            | "tui.skill.activate"
+                            | "tui.skill.deactivate"
+                            | "tui.monitor.toggle"
+                    )
+                ) {
+                    self.chat.app.set_status(
+                        "Model/provider controls are unavailable in this managed conversation"
+                            .into(),
+                    );
+                    return super::invalidation::UiInvalidation::Structural;
+                }
+            }
+            self.focused_visual = None;
+        }
         self.synchronize_selection_lifecycle();
         if self.return_from_borrowed_chat(&event) {
             return super::invalidation::UiInvalidation::Structural;
         }
         if self.loop_state.has_root_plugin_surface()
             && !self.loop_state.root_plugin_surface_is_suspended()
+            && self.loop_state.foreground_client().is_some()
         {
             let result = self
                 .loop_state
                 .handle_root_plugin_surface_event(
                     &event,
-                    &self.loop_state.foreground_client(),
+                    &self
+                        .loop_state
+                        .foreground_client()
+                        .expect("ordinary plugin action requires model application access"),
                     self.fresh_session_settings(),
                 )
                 .expect("plugin surface was present");
@@ -1716,7 +1764,9 @@ impl BcodeRuntimeModel {
                     }
                     let host = super::plugin_surface_host::root_host(
                         bmux_tui_runtime::InvalidationSignal::new(),
-                        self.loop_state.foreground_client(),
+                        self.loop_state
+                            .foreground_client()
+                            .expect("ordinary plugin action requires model application access"),
                         self.fresh_session_settings(),
                         std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
                     );
@@ -1985,12 +2035,15 @@ impl BcodeRuntimeModel {
                                 area.contains(mouse.position).then_some(identity)
                             })
                     && let Some(presentation) = self.chat.app.plugin_presentation()
+                    && self.loop_state.foreground_client().is_some()
                     && presentation.content_event_with_host(
                         identity,
                         &Event::Mouse(mouse),
                         &super::plugin_surface_host::root_host(
                             bmux_tui_runtime::InvalidationSignal::new(),
-                            self.loop_state.foreground_client(),
+                            self.loop_state
+                                .foreground_client()
+                                .expect("ordinary plugin action requires model application access"),
                             self.fresh_session_settings(),
                             std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
                         ),
@@ -2540,6 +2593,13 @@ impl BcodeRuntimeModel {
                 }
             }
             super::composer_flow::RootSubmission::SlashCommand(message) => {
+                if self.chat.app.managed_execution_session().is_some()
+                    && message.split_whitespace().eq(["/auth", "login"])
+                {
+                    self.chat.app.request_managed_auth();
+                    self.exit_requested = true;
+                    return;
+                }
                 if matches!(
                     message.trim(),
                     "/queue-resume"
@@ -2658,6 +2718,12 @@ impl BcodeRuntimeModel {
     }
 
     fn apply_root_command_action(&mut self, request: super::chat_loop::CommandDispatchRequest) {
+        if self.chat.app.managed_execution_session().is_some() {
+            self.chat.app.set_status(
+                "Model and plugin commands are disabled in this managed conversation".into(),
+            );
+            return;
+        }
         let super::chat_loop::CommandDispatchRequest { action, session } = request;
         match action {
             bcode_command::CommandAction::Host { route } => match route.as_str() {
@@ -2792,6 +2858,13 @@ impl BcodeRuntimeModel {
         bmux_tui_runtime::Command::start_if_idle(
             bmux_tui_runtime::CommandKey::new("bcode.interactive_surface_resolution"),
             async move {
+                let Some(client) = client else {
+                    return Some(BcodeRuntimeMessage::InteractiveSurfaceResolved(Err(
+                        bcode_client::ClientError::Protocol(
+                            "Managed interactions require native response admission".into(),
+                        ),
+                    )));
+                };
                 let result = bcode_session_view::execute_session_view_action(
                     &client,
                     bcode_session_view_models::SessionViewAction::ResolveExchange {
@@ -2850,7 +2923,7 @@ impl BcodeRuntimeModel {
                         &super::static_bundled_plugins(),
                     ) {
                         Ok(runtime) => {
-                            if let Some(session_id) = session_id {
+                            if let (Some(session_id), Some(client)) = (session_id, client) {
                                 let exchange_id = request.interaction_id().to_owned();
                                 let changed = std::sync::Arc::new(move |terminal, error| {
                                     let runtime_handle = runtime_handle.clone();
@@ -3065,7 +3138,9 @@ impl BcodeRuntimeModel {
         let Some(scope) = scope else {
             return Some(bmux_tui_runtime::Command::cancel(key));
         };
-        let client = self.loop_state.foreground_client();
+        let Some(client) = self.loop_state.foreground_client() else {
+            return Some(bmux_tui_runtime::Command::cancel(key));
+        };
         let handle = handle.clone();
         Some(bmux_tui_runtime::Command::replace(
             key,
@@ -4045,6 +4120,26 @@ impl bmux_tui_runtime::Program for BcodeRuntimeModel {
             }
             bmux_tui_runtime::RuntimeEvent::Terminal(event)
             | bmux_tui_runtime::RuntimeEvent::Message(BcodeRuntimeMessage::Terminal(event)) => {
+                if self.chat.app.managed_execution_session().is_some()
+                    && let Event::Key(stroke) = &event
+                    && matches!(
+                        self.settings.keymap().action("chat", *stroke),
+                        Some(
+                            "app.command_palette"
+                                | "tui.session.search"
+                                | "tui.agent.cycle"
+                                | "tui.thinking.effort.cycle"
+                                | "tui.session.new"
+                                | "tui.skill.invoke"
+                                | "tui.monitor.toggle"
+                        )
+                    )
+                {
+                    self.chat.app.set_status(
+                        "Model and unrelated plugin controls are disabled in managed mode".into(),
+                    );
+                    return Ok(bmux_tui_runtime::Update::redraw());
+                }
                 if self.return_from_borrowed_chat(&event) {
                     return Ok(bmux_tui_runtime::Update::redraw());
                 }
@@ -4272,6 +4367,12 @@ impl bmux_tui_runtime::Program for BcodeRuntimeModel {
                                 )
                         )
                 );
+                if matches!(
+                    update.as_ref(),
+                    super::history_flow::SessionStreamUpdate::ResyncStarted { .. }
+                ) {
+                    self.chat.app.suspend_managed_input();
+                }
                 let changed = self
                     .loop_state
                     .apply_session_stream_update(&mut self.chat, *update);
@@ -4288,7 +4389,9 @@ impl bmux_tui_runtime::Program for BcodeRuntimeModel {
             bmux_tui_runtime::RuntimeEvent::Message(
                 BcodeRuntimeMessage::PluginSurfaceInvalidated,
             ) => {
-                let client = self.loop_state.foreground_client();
+                let Some(client) = self.loop_state.foreground_client() else {
+                    return Ok(bmux_tui_runtime::Update::none());
+                };
                 let action = self
                     .loop_state
                     .poll_root_plugin_surface(&client, self.fresh_session_settings());
@@ -4347,7 +4450,9 @@ impl bmux_tui_runtime::Program for BcodeRuntimeModel {
                     Some(bcode_plugin_sdk::tui::PluginTuiAction::SubscribeWorkflowRuns) => {
                         let (updates, requests) =
                             super::plugin_surface_host::subscribe_workflow_views(
-                                self.loop_state.foreground_client(),
+                                self.loop_state.foreground_client().expect(
+                                    "ordinary plugin action requires model application access",
+                                ),
                                 self.loop_state
                                     .root_plugin_surface_invalidation()
                                     .expect("plugin surface invalidation"),
@@ -4464,7 +4569,7 @@ impl bmux_tui_runtime::Program for BcodeRuntimeModel {
                 } = result.as_ref()
                 {
                     if self.pending_timeline_jump != Some((*session_id, *generation, *sequence)) {
-                        return Ok(bmux_tui_runtime::Update::default());
+                        return Ok(bmux_tui_runtime::Update::none());
                     }
                     self.pending_timeline_jump = None;
                 }
@@ -10154,6 +10259,68 @@ mod tests {
         );
         assert_eq!(model.chat.app.composer().text(), "#topic");
         assert_eq!(model.chat.app.take_pending_submission(), "");
+        drop(model);
+    }
+
+    #[test]
+    fn managed_root_blocks_model_controls_without_constructing_any_model_client() {
+        let owner = bcode_session_models::SessionId::new();
+        let mut config = bcode_config::TuiConfig::default();
+        config.keybindings.scopes.insert(
+            "chat".into(),
+            [
+                ("f6".into(), "tui.agent.cycle".into()),
+                ("f7".into(), "tui.thinking.effort.cycle".into()),
+                ("f8".into(), "app.command_palette".into()),
+            ]
+            .into(),
+        );
+        let mut settings =
+            crate::chat_loop::TuiRuntimeSettings::bootstrap(std::path::PathBuf::from("."), &[]);
+        settings.apply_tui_config(&config);
+        let loop_state = crate::chat_loop::ChatLoopState::new_access(None, None, None, false);
+        let mut model = super::BcodeRuntimeModel::new(
+            {
+                let mut chat = root_test_chat_with_history(owner, &[]);
+                chat.app.set_managed_execution(owner);
+                chat
+            },
+            settings,
+            loop_state,
+        );
+        let agent = model.chat.app.current_agent_id().to_owned();
+        let reasoning = model.chat.app.reasoning_effort().map(str::to_owned);
+        for key in [
+            bmux_keyboard::KeyCode::F(6),
+            bmux_keyboard::KeyCode::F(7),
+            bmux_keyboard::KeyCode::F(8),
+        ] {
+            model.handle_basic_terminal_event(bmux_tui::event::Event::Key(
+                bmux_keyboard::KeyStroke::simple(key),
+            ));
+            assert!(model.chat.pending_effects.drain_runtime().0.is_empty());
+            assert_eq!(model.chat.app.current_agent_id(), agent);
+            assert_eq!(model.chat.app.reasoning_effort(), reasoning.as_deref());
+            assert!(model.loop_state.foreground_client().is_none());
+        }
+        model.chat.app.suspend_managed_input();
+        model
+            .chat
+            .app
+            .replace_composer_with("retained during disconnect");
+        model.chat.app.stage_submission();
+        assert!(!crate::composer_flow::stage_session_message(
+            std::path::Path::new("."),
+            crate::TuiLaunchOptions::default(),
+            &mut model.chat,
+            bcode_ipc::PromptPlacement::FollowUp
+        ));
+        assert!(model.chat.pending_effects.drain_runtime().0.is_empty());
+        assert_eq!(
+            model.chat.app.composer().text(),
+            "retained during disconnect"
+        );
+        assert_eq!(model.chat.app.managed_execution_session(), Some(owner));
         drop(model);
     }
 

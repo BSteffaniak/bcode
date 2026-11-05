@@ -138,6 +138,9 @@ pub struct ExternalSessionMetadataView {
 /// Bounded renderer-neutral external-session page, readable without a plugin.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ExternalSessionView {
+    /// Bounded lifecycle evidence from the selected window; never execution authority.
+    #[serde(default)]
+    pub execution_lifecycle: crate::execution::ExecutionLifecycleView,
     /// Retained binding metadata.
     pub provenance: ExternalProvenanceView,
     /// Native executable/version/config selection retained independently of plugin loading.

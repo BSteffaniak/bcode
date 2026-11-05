@@ -28,6 +28,12 @@ pub use scheduling_page::{
     WORKFLOW_SCHEDULING_PAGE_VERSION, WorkflowSchedulingPage, WorkflowSchedulingPageRequest,
 };
 
+mod obligation;
+pub use obligation::{
+    WorkflowObligationAdoption, WorkflowObligationAdoptionProof, WorkflowObligationAttempt,
+    WorkflowPreparedAdmission,
+};
+
 mod run_contracts;
 pub use run_contracts::{
     AUTHORED_WORKFLOW_RUN_PROVENANCE_VERSION, AttemptCursor, AttemptSummary,

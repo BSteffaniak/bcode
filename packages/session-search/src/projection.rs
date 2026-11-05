@@ -254,7 +254,8 @@ const fn classify_external_observation(
     match kind {
         HarnessObservationKind::Result { .. } => PersistedEventClassification::Searchable,
         HarnessObservationKind::Text { .. } => PersistedEventClassification::NonFinal,
-        HarnessObservationKind::SubmissionAccepted { .. }
+        HarnessObservationKind::Execution { .. }
+        | HarnessObservationKind::SubmissionAccepted { .. }
         | HarnessObservationKind::SubmissionConsumed { .. }
         | HarnessObservationKind::SubmissionResultObserved { .. }
         | HarnessObservationKind::BindingConfirmed { .. }
@@ -1038,7 +1039,8 @@ fn project_external_transcript_event(
                         ProjectionExclusion::NonFinalContent,
                     ));
                 }
-                HarnessObservationKind::SubmissionAccepted { .. }
+                HarnessObservationKind::Execution { .. }
+                | HarnessObservationKind::SubmissionAccepted { .. }
                 | HarnessObservationKind::SubmissionConsumed { .. }
                 | HarnessObservationKind::SubmissionResultObserved { .. }
                 | HarnessObservationKind::BindingConfirmed { .. }

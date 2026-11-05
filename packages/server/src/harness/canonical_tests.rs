@@ -144,6 +144,188 @@ async fn record_prepared_submission(
         .unwrap();
 }
 
+#[derive(Clone)]
+struct AttachmentPollTransport {
+    calls: std::sync::Arc<tokio::sync::Mutex<Vec<Option<String>>>>,
+    owner: ExternalHarnessOwner,
+}
+impl super::ManagedHarnessTransport for AttachmentPollTransport {
+    async fn invoke(
+        &self,
+        request: &HarnessRequest,
+    ) -> Result<HarnessServiceResponse, super::ManagedHarnessError> {
+        let HarnessRequestKind::Observe(query) = &request.kind else {
+            panic!("only native Observe allowed")
+        };
+        query
+            .target
+            .validate_owner(&self.owner.session_id.to_string(), 1)
+            .unwrap();
+        let index = {
+            let mut calls = self.calls.lock().await;
+            let index = calls.len();
+            assert_eq!(query.after, (index > 0).then(|| format!("poll-{index}")));
+            calls.push(query.after.clone());
+            index
+        };
+        Ok(HarnessServiceResponse {
+            schema_version: HARNESS_SCHEMA_VERSION,
+            request_id: request.request_id.clone(),
+            operation: HarnessOperation::Observe,
+            kind: HarnessServiceResponseKind::Observations(HarnessObservationPage {
+                retention: None,
+                hydration_requests: Vec::new(),
+                inventory_page: None,
+                observations: if index == 0 {
+                    Vec::new()
+                } else {
+                    vec![HarnessObservation {
+                        observation_id: format!("poll-output-{index}"),
+                        session_id: self.owner.session_id.to_string(),
+                        generation: 1,
+                        native_correlations: Vec::new(),
+                        completeness: HarnessCompleteness::Complete,
+                        kind: HarnessObservationKind::Diagnostic {
+                            code: "native_output".into(),
+                            message: "UI receives native output".into(),
+                        },
+                    }]
+                },
+                next_after: Some(format!("poll-{}", index + 1)),
+                completeness: HarnessCompleteness::Complete,
+                status: HarnessExecutionStatus {
+                    connectivity: HarnessConnectivity::Connected,
+                    activity: HarnessActivity::Running,
+                    attention: HarnessAttention::None,
+                    continuation: HarnessContinuation::Available,
+                    completeness: HarnessCompleteness::Complete,
+                },
+            }),
+        })
+    }
+}
+
+#[tokio::test]
+async fn attachment_poll_commits_empty_cursor_before_next_native_observe() {
+    let (_root, sessions, durable, opening, _) = Box::pin(prepared_observation_fixture()).await;
+    let mut state = std::sync::Arc::new(crate::tests::test_server_state(sessions.clone()));
+    {
+        let state = std::sync::Arc::get_mut(&mut state).unwrap();
+        state
+            .daemon_status
+            .instance_id
+            .clone_from(&durable.daemon_id);
+        state
+            .daemon_status
+            .build_fingerprint
+            .clone_from(&durable.artifact_id);
+        state.daemon_status.artifact_id = Some(bcode_ipc::ArtifactId::current());
+    }
+    let store = super::CanonicalHarnessStore::new(&state);
+    let owner = store.current_owner(durable.session_id).await.unwrap();
+    drop(store);
+    let calls = std::sync::Arc::default();
+    let transport = AttachmentPollTransport {
+        calls: std::sync::Arc::clone(&calls),
+        owner: durable.clone(),
+    };
+    let runtime =
+        super::ManagedHarnessRuntime::new(super::CanonicalHarnessStore::new(&state), transport);
+    let app = super::ManagedHarnessApplication::with_owner(
+        &state,
+        bcode_session_models::ClientId::new(),
+        &runtime,
+        owner.clone(),
+    );
+    let query = bcode_ipc::harness::ManagedSessionPollRequest {
+        session_id: durable.session_id,
+        instance_id: opening.instance.instance_id,
+        generation: 1,
+        limit: 16,
+    };
+    app.poll_observations(&query).await.unwrap();
+    assert_eq!(
+        sessions
+            .external_harness_state(&durable)
+            .await
+            .unwrap()
+            .observation_after
+            .as_deref(),
+        Some("poll-1")
+    );
+    // Two overlapping attachment polls must select the cursor only after the observer guard.
+    let (left, right) = tokio::join!(app.poll_observations(&query), app.poll_observations(&query));
+    left.unwrap();
+    right.unwrap();
+    assert_eq!(calls.lock().await.len(), 3);
+    assert_eq!(
+        sessions
+            .external_harness_state(&durable)
+            .await
+            .unwrap()
+            .observation_after
+            .as_deref(),
+        Some("poll-3")
+    );
+    assert_attachment_poll_history(&sessions, durable.session_id).await;
+    let wrong = bcode_ipc::harness::ManagedSessionPollRequest {
+        generation: 2,
+        ..query.clone()
+    };
+    assert!(app.poll_observations(&wrong).await.is_err());
+    let wrong = bcode_ipc::harness::ManagedSessionPollRequest {
+        instance_id: "foreign".into(),
+        ..query
+    };
+    assert!(app.poll_observations(&wrong).await.is_err());
+    assert_eq!(calls.lock().await.len(), 3);
+    drop(app);
+    runtime.verify_owner(&owner).await.unwrap();
+    drop(runtime);
+    drop(state);
+}
+
+async fn assert_attachment_poll_history(
+    sessions: &bcode_session::SessionManager,
+    session_id: SessionId,
+) {
+    let mut after = None;
+    let mut observations = Vec::new();
+    // Indexed history returns one committed native page per read, not up to `limit`
+    // pages. The first empty committed page must remain visible as cursor progress.
+    for index in 0..3 {
+        let page = sessions
+            .external_harness_history(session_id, after.clone(), 16)
+            .await
+            .unwrap();
+        if index == 0 {
+            assert_eq!(
+                page.observations,
+                [] as [bcode_harness_models::HarnessObservation; 0]
+            );
+            assert_eq!(page.completeness, HarnessCompleteness::Partial);
+        }
+        let next = page
+            .next_after
+            .expect("each committed page has a history continuation");
+        assert_ne!(
+            Some(&next),
+            after.as_ref(),
+            "empty pages must advance history too"
+        );
+        observations.extend(page.observations);
+        after = Some(next);
+    }
+    assert_eq!(observations.len(), 2);
+    for (event, expected_id) in observations.iter().zip(["poll-output-1", "poll-output-2"]) {
+        assert_eq!(event.observation_id, expected_id);
+        assert!(
+            matches!(&event.kind, HarnessObservationKind::Diagnostic { message, .. }
+            if message == "UI receives native output")
+        );
+    }
+}
+
 async fn prepared_observation_fixture() -> (
     tempfile::TempDir,
     bcode_session::SessionManager,
@@ -194,8 +376,7 @@ async fn prepared_observation_fixture() -> (
         background_continuation: capability.clone(),
         authentication: capability,
     };
-    sessions
-        .prepare_external_harness_open(&owner, &opening, capabilities, None)
+    Box::pin(sessions.prepare_external_harness_open(&owner, &opening, capabilities, None))
         .await
         .unwrap();
     sessions
@@ -288,6 +469,9 @@ fn confirmation_question_page(
         kind,
     };
     HarnessObservationPage {
+        retention: None,
+        hydration_requests: vec![],
+        inventory_page: None,
         observations: vec![
             event(
                 "confirmation",
@@ -407,6 +591,9 @@ async fn assert_settlement_cursor(
             .is_err()
     );
     let next = HarnessObservationPage {
+        retention: None,
+        hydration_requests: vec![],
+        inventory_page: None,
         observations: vec![event(
             "settled",
             HarnessObservationKind::Settlement {
