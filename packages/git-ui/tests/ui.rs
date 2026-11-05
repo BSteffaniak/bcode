@@ -1531,3 +1531,23 @@ fn normal_and_half_mode_share_the_side_width() {
     harness.keys(&["_"]);
     assert_eq!(x(&harness.screen(120, 30)), widened - 4);
 }
+
+#[test]
+fn side_titles_meet_the_border_with_or_without_a_count() {
+    let mut clean = Harness::new(|path| commit(path, "a", "a", "init"));
+    let screen = clean.screen(140, 30);
+    assert!(
+        line_with(&screen, "[2] Files").contains("Submodules─"),
+        "{screen}"
+    );
+    assert!(
+        line_with(&screen, "[5] Stash").contains("Stash─"),
+        "{screen}"
+    );
+    let mut dirty = Harness::new(panel_repo);
+    let screen = dirty.screen(140, 30);
+    assert!(
+        line_with(&screen, "[2] Files").contains("Submodules 1/1─"),
+        "{screen}"
+    );
+}
