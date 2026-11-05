@@ -1551,3 +1551,24 @@ fn side_titles_meet_the_border_with_or_without_a_count() {
         "{screen}"
     );
 }
+
+#[test]
+fn untitled_main_views_keep_an_unbroken_border() {
+    let mut clean = Harness::new(|path| commit(path, "a", "a", "init"));
+    let screen = clean.screen(140, 30);
+    let top = screen.lines().next().unwrap();
+    assert!(top.contains("┐┌──"), "{top}");
+    assert!(!top.contains("┌ "), "{top}");
+    assert!(screen.contains("Working tree clean"), "{screen}");
+    // Titled views keep their padding.
+    let mut dirty = Harness::new(panel_repo);
+    let screen = dirty.screen(140, 30);
+    assert!(
+        screen
+            .lines()
+            .next()
+            .unwrap()
+            .contains("┌ Unstaged changes a.txt ─"),
+        "{screen}"
+    );
+}

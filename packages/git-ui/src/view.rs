@@ -1055,7 +1055,7 @@ fn main_column<'a>(app: &'a App, frame: &'a Frame) -> Element<'a> {
             pane(
                 app,
                 "pane-main",
-                Line::raw(" "),
+                Line::new(),
                 false,
                 &frame.main_panes[0],
                 loading,
@@ -1072,14 +1072,18 @@ fn main_column<'a>(app: &'a App, frame: &'a Frame) -> Element<'a> {
             continue;
         };
         let focused = app.window == Window::Main && app.main_section == section;
-        let mut title = vec![Span::styled(
-            format!(" {} ", data.title),
-            if focused {
-                theme.title_focused
-            } else {
-                theme.title
-            },
-        )];
+        // Untitled sections (messages) leave the border unbroken instead of padding nothing.
+        let mut title = Vec::new();
+        if !data.title.is_empty() {
+            title.push(Span::styled(
+                format!(" {} ", data.title),
+                if focused {
+                    theme.title_focused
+                } else {
+                    theme.title
+                },
+            ));
+        }
         if let Some(crate::data::MainRequest::File(entry)) =
             app.main.as_ref().map(|main| &main.request)
         {
