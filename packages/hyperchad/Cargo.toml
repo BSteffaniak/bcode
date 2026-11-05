@@ -19,6 +19,7 @@ required-features = ["renderer-html-actix"]
 [dependencies]
 bcode_bundled_plugins = { workspace = true, optional = true }
 bcode_client = { workspace = true }
+bcode_harness_models = { workspace = true }
 bcode_hyperchad_ui = { workspace = true }
 bcode_ipc = { workspace = true }
 bcode_plugin_sdk = { workspace = true }

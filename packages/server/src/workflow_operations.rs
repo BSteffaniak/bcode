@@ -1,4 +1,53 @@
+#[cfg(test)]
+#[path = "workflow_operations/managed_harness_integration.rs"]
+mod managed_harness_integration;
+mod operation_owners;
+pub use operation_owners::{cancel_operation_receipt, observe_operation_receipt};
+
 use bcode_workflow_store::WorkflowStoreError;
+
+/// Route receipt observation by its compatibility-defined owner. Managed session receipts
+/// never enter the model-turn decoder; mixed graphs retain the ordinary workflow scheduler.
+pub struct WorkflowOperationReceiptObserver<'a> {
+    pub state: &'a super::ServerState,
+}
+
+impl bcode_workflow_store::AsyncAttemptStatusObserver for WorkflowOperationReceiptObserver<'_> {
+    fn observe_async<'a>(
+        &'a self,
+        request: &'a bcode_workflow_store::AttemptReconciliationRequest,
+    ) -> std::pin::Pin<
+        Box<
+            dyn std::future::Future<
+                    Output = Result<bcode_workflow_store::AttemptObservation, WorkflowStoreError>,
+                > + Send
+                + 'a,
+        >,
+    > {
+        Box::pin(async move {
+            if let Some(observation) = observe_operation_receipt(self.state, request).await? {
+                return Ok(observation);
+            }
+            bcode_workflow_store::AsyncAttemptStatusObserver::observe_async(
+                &super::WorkflowTurnReceiptObserver { state: self.state },
+                request,
+            )
+            .await
+        })
+    }
+}
+
+/// Signal an operation owner only after the workflow has retained cancellation intent.
+/// No control acknowledgement is interpreted as workflow settlement.
+pub async fn signal_operation_cancellation(
+    state: &super::ServerState,
+    attempt: &bcode_workflow_store::ActiveAttemptCancellation,
+) -> Result<(), WorkflowStoreError> {
+    if cancel_operation_receipt(state, attempt).await? {
+        return Ok(());
+    }
+    super::signal_workflow_attempt_cancellation(state, attempt).await
+}
 
 /// Host policy for explicit attempt repair; evaluated before authority acquisition.
 #[derive(Clone)]

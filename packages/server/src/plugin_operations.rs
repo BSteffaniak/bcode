@@ -295,6 +295,25 @@ fn project_service_response(
     }
 }
 
+fn command_callback_owner(
+    plugin_id: &str,
+    interface_id: &str,
+    operation: &str,
+    payload: &[u8],
+) -> Option<(String, String, String)> {
+    (interface_id == bcode_command::COMMAND_INTERFACE_ID
+        && operation == bcode_command::OP_INVOKE_COMMAND)
+        .then(|| serde_json::from_slice::<bcode_command::InvokeCommandRequest>(payload).ok())
+        .flatten()
+        .map(|request| {
+            (
+                plugin_id.to_owned(),
+                format!("command:{}", uuid::Uuid::new_v4()),
+                request.command_id,
+            )
+        })
+}
+
 pub async fn invoke_service(
     state: &ServerState,
     plugin_id: &str,
@@ -349,13 +368,9 @@ pub async fn invoke_service(
     let labels = plugin_service_metric_labels(Some(&plugin_id), &interface_id, &operation);
     let authorized_session_id =
         super::command_invocation_session(&interface_id, &operation, &payload);
+    let command_owner = command_callback_owner(&plugin_id, &interface_id, &operation, &payload);
     let (bridge, bridge_requests) = super::server_plugin_bridge();
-    let activity_revision =
-        if interface_id == bcode_session_models::ACTIVITY_PRESENTATION_INTERFACE_ID {
-            Some(validate_activity_request(&operation, &payload)?)
-        } else {
-            None
-        };
+    let activity_revision = activity_request_revision(&interface_id, &operation, &payload)?;
     let invocation = async {
         let call = state.plugins.invoke_service_with_bridge_scoped(
             &plugin_id,
@@ -390,6 +405,7 @@ pub async fn invoke_service(
             bridge_requests,
             invocation,
             owner_for_driver,
+            command_owner,
         ),
     ))
     .await
@@ -399,6 +415,18 @@ pub async fn invoke_service(
         validate_activity_response(&plugin_id, revision, &result.payload)?;
     }
     Ok(result)
+}
+
+fn activity_request_revision(
+    interface_id: &str,
+    operation: &str,
+    payload: &[u8],
+) -> Result<Option<u64>, PublicPluginError> {
+    if interface_id == bcode_session_models::ACTIVITY_PRESENTATION_INTERFACE_ID {
+        validate_activity_request(operation, payload).map(Some)
+    } else {
+        Ok(None)
+    }
 }
 
 fn validate_activity_request(operation: &str, payload: &[u8]) -> Result<u64, PublicPluginError> {
@@ -470,6 +498,7 @@ async fn drive_service_bridge<T>(
         bridge_requests,
         invocation,
         None,
+        None,
     )
     .await
 }
@@ -480,6 +509,7 @@ async fn drive_service_bridge_owned<T>(
     mut bridge_requests: mpsc::UnboundedReceiver<super::ServerPluginBridgeCall>,
     invocation: impl std::future::Future<Output = T>,
     model_owner: Option<(String, String)>,
+    command_owner: Option<(String, String, String)>,
 ) -> T {
     let _owner_guard = ModelOwnerGuard {
         host: state.model_host.clone(),
@@ -535,6 +565,22 @@ async fn drive_service_bridge_owned<T>(
                         ) => result,
                     };
                     Ok(bcode_plugin_sdk::ServiceBridgeResponse::Service(result))
+                } else if let bcode_plugin_sdk::ServiceBridgeRequest::InvokeService(request) = &bridge_call.request
+                    && request.interface_id == bcode_ipc::harness::MANAGED_SESSION_INTERFACE_ID
+                {
+                    match &command_owner {
+                        Some((producer, invocation_id, command_id))
+                            if request.invocation_id == *command_id && request.route_id.is_none() => {
+                            let mut request = request.clone();
+                            request.invocation_id.clone_from(invocation_id);
+                            super::resolve_authenticated_command_plugin_bridge_request(
+                                state, authorized_session_id, producer, invocation_id,
+                                bcode_plugin_sdk::ServiceBridgeRequest::InvokeService(request),
+                                &bridge_call.cancellation,
+                            ).await
+                        }
+                        _ => Err("managed callback requires its admitted command identity".into()),
+                    }
                 } else {
                     super::resolve_command_plugin_bridge_request(
                         state,

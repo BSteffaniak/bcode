@@ -47,6 +47,10 @@ mod model_request_target;
 pub use command_application::CommandApplicationHandle;
 mod activity_changes;
 mod activity_watch;
+pub mod harness;
+pub mod harness_auth;
+pub mod harness_dispatch;
+pub mod harness_workflow;
 mod plugin_context;
 mod plugin_operations;
 mod provider_retry_recovery;
@@ -442,6 +446,11 @@ mod context_generation;
 pub struct ServerState {
     #[cfg(test)]
     test_state_root: Option<Arc<tempfile::TempDir>>,
+    managed_sessions: std::sync::OnceLock<Arc<dyn harness_dispatch::ManagedSessionBackend>>,
+    managed_auth: tokio::sync::OnceCell<harness_auth::HarnessAuthService>,
+    // Ephemeral native-login handoff claims, boot-scoped like the auth registry. They are
+    // never durable execution/session state and are never cleared by frontend disconnect.
+    managed_auth_handoffs: Mutex<BTreeMap<u64, String>>,
     usage_index: Mutex<bcode_usage::index::UsageIndex>,
     locations: Option<bcode_config::StateLocationSet>,
     state_root: PathBuf,
@@ -2614,6 +2623,9 @@ impl ServerState {
             locations: None,
             state_root,
             bcode_runtime_context: bcode_runtime_context.into_boxed_str(),
+            managed_sessions: std::sync::OnceLock::new(),
+            managed_auth: tokio::sync::OnceCell::new(),
+            managed_auth_handoffs: Mutex::new(BTreeMap::new()),
             sessions,
             storage_worker: storage_maintenance_worker::StorageMaintenanceWorker::default(),
             storage_tracking_failed: std::sync::atomic::AtomicBool::new(false),
@@ -5246,10 +5258,30 @@ async fn run_constructed_server(
         storage_read_admission::register_startup(&state, root).await;
         phase.finish();
     }
+    // Install the real canonical session-actor store/admission pair before callbacks or IPC
+    // can admit managed work. Optional-domain installation failure never selects a fake store.
+    if let Err(error) = harness::install_canonical_backend(&state) {
+        tracing::warn!(code = %error, "managed session canonical backend unavailable");
+    }
+    // The registry is daemon-lifetime, not tied to a frontend connection. Failure is isolated
+    // to this optional domain and never triggers a fallback authentication route.
+    let _ = state
+        .managed_auth
+        .get_or_try_init(|| async {
+            bcode_provider_auth::managed::ManagedAuthCoordinator::new(
+                state.daemon_status.instance_id.clone(),
+                64,
+                128,
+                Duration::from_secs(600),
+            )
+            .map(harness_auth::HarnessAuthService::new)
+        })
+        .await;
     state.model_host.bind_server(&state);
     {
         let weak = Arc::downgrade(&state);
         tokio::spawn(async move {
+            let mut auth_after_flow_id = None;
             loop {
                 tokio::time::sleep(Duration::from_secs(1)).await;
                 let Some(state) = weak.upgrade() else {
@@ -5259,6 +5291,37 @@ async fn run_constructed_server(
                     break;
                 }
                 state.model_host.reap().await;
+                // Expiry removes sensitive callback material without treating native login
+                // uncertainty as cancellation settlement or releasing its namespace claim.
+                if let Some(auth) = state.managed_auth.get() {
+                    auth.expire().await;
+                    // Bounded pages keep maintenance work independent of total session history.
+                    // Never treat unresolved native login as terminal merely to reclaim space.
+                    let mut after = auth_after_flow_id;
+                    for _ in 0..4 {
+                        let Ok(page) = auth.lifecycle_page(after, 16).await else {
+                            auth_after_flow_id = None;
+                            break;
+                        };
+                        for item in page.items {
+                            if item.phase
+                                == bcode_provider_auth_models::managed::ManagedFlowPhase::Settled
+                                && auth.retire(&item.ticket.handle).await.is_ok()
+                            {
+                                state
+                                    .managed_auth_handoffs
+                                    .lock()
+                                    .await
+                                    .remove(&item.ticket.handle.flow_id);
+                            }
+                        }
+                        auth_after_flow_id = page.next_after_flow_id;
+                        let Some(next) = page.next_after_flow_id else {
+                            break;
+                        };
+                        after = Some(next);
+                    }
+                }
             }
         });
     }
@@ -5561,6 +5624,15 @@ async fn shutdown_constructed_server(
     accept_result: Result<(), ServerError>,
 ) -> Result<(), ServerError> {
     state.request_shutdown();
+    trace_shutdown_stage("managed_sessions", async {
+        if let Some(backend) = state.managed_sessions.get()
+            && let Err(error) = backend.shutdown().await
+        {
+            // Close timeout/refusal is uncertainty, never evidence of native settlement.
+            // Plugin deactivation must still terminate/reap its already-owned transports.
+            tracing::warn!(code = %error, "managed session shutdown incomplete; native evidence remains uncertain");
+        }
+    }).await;
     trace_shutdown_stage("model_host", state.model_host.shutdown()).await;
     // The blocking worker may finish safely, but cannot publish a store after shutdown.
     state
@@ -6502,6 +6574,7 @@ const fn request_session_id(request: &Request) -> Option<SessionId> {
 #[allow(clippy::too_many_lines)]
 const fn request_kind(request: &Request) -> &'static str {
     match request {
+        Request::ManagedSession { .. } => "managed_session",
         Request::Hello { .. } => "hello",
         Request::Ping => "ping",
         Request::IngestClientMetrics { .. } => "ingest_client_metrics",
@@ -6801,6 +6874,106 @@ const fn request_kind(request: &Request) -> &'static str {
     }
 }
 
+fn managed_plugin_interface(request: &AgentSkillPluginRequest) -> bool {
+    match request {
+        AgentSkillPluginRequest::CallPluginService { interface_id, .. }
+        | AgentSkillPluginRequest::InvokePluginService { interface_id, .. }
+        | AgentSkillPluginRequest::InvokePluginServiceContextual { interface_id, .. } => {
+            interface_id == bcode_ipc::harness::MANAGED_SESSION_INTERFACE_ID
+                || interface_id == bcode_harness_models::HARNESS_INTERFACE_ID
+        }
+        _ => false,
+    }
+}
+
+async fn handle_managed_routed_request(
+    request: RoutedRequest,
+    request_id: u64,
+    client_id: ClientId,
+    state: &Arc<ServerState>,
+    writer: &SharedWriter,
+) -> Result<(), ServerError> {
+    match request {
+        RoutedRequest::ManagedSession(request) => {
+            let sensitive = request.operation.is_auth();
+            let response = harness_dispatch::dispatch(
+                state,
+                harness_dispatch::ManagedCaller::Client(client_id),
+                *request,
+            )
+            .await
+            .map_or_else(Response::Err, |response| {
+                Response::Ok(ResponsePayload::ManagedSession { response })
+            });
+            if sensitive {
+                send_sensitive_response(writer, request_id, response).await
+            } else {
+                send_response(writer, request_id, response).await
+            }
+        }
+        RoutedRequest::AgentSkillPlugin(AgentSkillPluginRequest::CallPluginService {
+            interface_id,
+            operation,
+            payload,
+        }) if interface_id == bcode_ipc::harness::MANAGED_SESSION_INTERFACE_ID => {
+            let response = harness_dispatch::service(state, client_id, operation, payload)
+                .await
+                .map_or_else(Response::Err, |response| {
+                    Response::Ok(ResponsePayload::PluginServiceResult { response })
+                });
+            send_response(writer, request_id, response).await
+        }
+        RoutedRequest::AgentSkillPlugin(AgentSkillPluginRequest::InvokePluginService {
+            interface_id,
+            ..
+        }) if interface_id == bcode_ipc::harness::MANAGED_SESSION_INTERFACE_ID => {
+            send_response(
+                writer,
+                request_id,
+                Response::Err(ErrorResponse::new(
+                    "managed_session_host_owned",
+                    "managed sessions must use the host application boundary",
+                )),
+            )
+            .await
+        }
+        RoutedRequest::AgentSkillPlugin(
+            request @ (AgentSkillPluginRequest::CallPluginService { .. }
+            | AgentSkillPluginRequest::InvokePluginService { .. }
+            | AgentSkillPluginRequest::InvokePluginServiceContextual { .. }),
+        ) if match &request {
+            AgentSkillPluginRequest::CallPluginService { interface_id, .. }
+            | AgentSkillPluginRequest::InvokePluginService { interface_id, .. }
+            | AgentSkillPluginRequest::InvokePluginServiceContextual { interface_id, .. } => {
+                interface_id == bcode_harness_models::HARNESS_INTERFACE_ID
+            }
+            _ => false,
+        } =>
+        {
+            send_response(
+                writer,
+                request_id,
+                Response::Err(ErrorResponse::new(
+                    "managed_session_host_owned",
+                    "native harness services require canonical managed-session admission",
+                )),
+            )
+            .await
+        }
+        _ => {
+            send_response(
+                writer,
+                request_id,
+                Response::Err(ErrorResponse::new(
+                    "managed_session_invalid",
+                    "invalid managed host route",
+                )),
+            )
+            .await
+        }
+    }
+}
+
 /// Dispatch a request to the single dispatcher that owns its domain.
 ///
 /// Each arm boxes and awaits exactly one dispatcher, so only that dispatcher's future is live. The
@@ -6816,6 +6989,22 @@ async fn dispatch_routed_request(
     attached_session: &mut Option<SessionId>,
 ) -> Result<(), ServerError> {
     match request {
+        request @ RoutedRequest::ManagedSession(_) => {
+            Box::pin(handle_managed_routed_request(
+                request, request_id, client_id, state, writer,
+            ))
+            .await
+        }
+        RoutedRequest::AgentSkillPlugin(request) if managed_plugin_interface(&request) => {
+            Box::pin(handle_managed_routed_request(
+                RoutedRequest::AgentSkillPlugin(request),
+                request_id,
+                client_id,
+                state,
+                writer,
+            ))
+            .await
+        }
         RoutedRequest::SessionLifecycle(request) => {
             handle_request_inner(*request, request_id, client_id, state, writer).await
         }
@@ -6890,6 +7079,19 @@ async fn handle_request(
     writer: &SharedWriter,
     attached_session: &mut Option<SessionId>,
 ) -> Result<(), ServerError> {
+    // Typed auth transport deliberately bypasses ordinary request metrics/context creation.
+    // Correlations and callback payload sizes are not session telemetry.
+    if matches!(&request, Request::ManagedSession { request } if request.operation.is_auth()) {
+        return dispatch_routed_request(
+            RoutedRequest::from_request(request),
+            request_id,
+            client_id,
+            state,
+            writer,
+            attached_session,
+        )
+        .await;
+    }
     let labels = request_metric_labels(&request);
     let context = request_metrics_context(&request, request_id, client_id, *attached_session);
     Box::pin(state.metrics.in_context(context, async {
@@ -21989,7 +22191,7 @@ async fn run_model_turn_lifecycle(
         recovering,
     ))
     .await;
-    settle_turn_lifecycle(
+    Box::pin(settle_turn_lifecycle(
         state,
         session_id,
         trigger_event,
@@ -22004,7 +22206,7 @@ async fn run_model_turn_lifecycle(
             cancel_state,
         },
         completion,
-    )
+    ))
     .await
 }
 
@@ -32260,6 +32462,19 @@ async fn invocation_service_routes(
     session_id: SessionId,
 ) -> Vec<ServerInvocationServiceRoute> {
     let mut routes = provider_invocation_service_routes(state, session_id).await;
+    // Host-owned application route: no plugin discovery or provider fallback.
+    routes.push(ServerInvocationServiceRoute {
+        advertised: bcode_tool::ToolInvocationServiceRoute {
+            route_id: bcode_ipc::harness::MANAGED_SESSION_INTERFACE_ID.to_owned(),
+            interface_id: bcode_ipc::harness::MANAGED_SESSION_INTERFACE_ID.to_owned(),
+            operations: ["start", "inspect", "followup", "respond", "interrupt"]
+                .into_iter()
+                .map(str::to_owned)
+                .collect(),
+        },
+        target_plugin_id: None,
+        payload_overlay: serde_json::Value::Null,
+    });
     let mut workflow_operations = vec![
         "execution_context".to_owned(),
         bcode_workflow::contributor_evidence::OPERATION.to_owned(),
@@ -35322,6 +35537,45 @@ fn server_workflow_plugin_bridge(
     )
 }
 
+fn write_workflow_bridge_artifact(
+    state: &ServerState,
+    parent_session_id: SessionId,
+    dispatch_identity: &str,
+    artifacts: Option<&Arc<StdMutex<WorkflowArtifactReferences>>>,
+    artifact: bcode_tool::ToolArtifactWriteRequest,
+    cancellation: &bcode_plugin_sdk::ServiceCancellation,
+) -> Result<ServiceBridgeResponse, String> {
+    let cancel_state = TurnCancelState::default();
+    if cancellation.is_cancelled() {
+        cancel_state.close();
+    }
+    let scope = InvocationScope::new(
+        TurnScope::without_events(
+            format!("workflow-artifact:{parent_session_id}"),
+            TurnGeneration::new(0),
+        ),
+        dispatch_identity.to_owned(),
+    );
+    let sink = SessionArtifactSink::new(
+        session_artifact_dir(state, parent_session_id)?,
+        dispatch_identity,
+        &cancel_state,
+    );
+    let resolution =
+        futures::executor::block_on(sink.write(artifact, scope.artifact_commit_guard()));
+    record_workflow_artifact_reference(artifacts, &resolution);
+    Ok(ServiceBridgeResponse::Artifact(resolution))
+}
+
+fn managed_callback_route_refusal(route_id: &str) -> Option<ToolInvocationServiceResolution> {
+    (route_id == bcode_ipc::harness::MANAGED_SESSION_INTERFACE_ID).then(|| {
+        ToolInvocationServiceResolution::Failed {
+            code: "managed_session_invocation_context_required".into(),
+            message: "managed sessions require the authenticated plugin callback".into(),
+        }
+    })
+}
+
 fn server_workflow_plugin_bridge_observed(
     state: Arc<ServerState>,
     config: bcode_config::BcodeConfig,
@@ -35339,26 +35593,14 @@ fn server_workflow_plugin_bridge_observed(
         ServiceBridgeRequest::WriteArtifact(artifact)
             if artifact.invocation_id == dispatch_identity =>
         {
-            let cancel_state = TurnCancelState::default();
-            if cancellation.is_cancelled() {
-                cancel_state.close();
-            }
-            let scope = InvocationScope::new(
-                TurnScope::without_events(
-                    format!("workflow-artifact:{parent_session_id}"),
-                    TurnGeneration::new(0),
-                ),
-                dispatch_identity.clone(),
-            );
-            let sink = SessionArtifactSink::new(
-                session_artifact_dir(&state, parent_session_id)?,
+            write_workflow_bridge_artifact(
+                &state,
+                parent_session_id,
                 &dispatch_identity,
-                &cancel_state,
-            );
-            let resolution =
-                futures::executor::block_on(sink.write(artifact, scope.artifact_commit_guard()));
-            record_workflow_artifact_reference(artifacts.as_ref(), &resolution);
-            Ok(ServiceBridgeResponse::Artifact(resolution))
+                artifacts.as_ref(),
+                artifact,
+                &cancellation,
+            )
         }
         ServiceBridgeRequest::WriteArtifact(_) => Ok(ServiceBridgeResponse::Artifact(
             ToolArtifactWriteResolution::Failed {
@@ -35372,6 +35614,35 @@ fn server_workflow_plugin_bridge_observed(
         ServiceBridgeRequest::ReceiveInput { .. } => Ok(ServiceBridgeResponse::Input(
             ToolInvocationInputResolution::Closed,
         )),
+        ServiceBridgeRequest::InvokeService(request)
+            if request.invocation_id == dispatch_identity
+                && request.interface_id == bcode_ipc::harness::MANAGED_SESSION_INTERFACE_ID =>
+        {
+            if cancellation.is_cancelled() {
+                Ok(ServiceBridgeResponse::Service(
+                    ToolInvocationServiceResolution::Cancelled,
+                ))
+            } else {
+                Ok(ServiceBridgeResponse::Service(runtime.block_on(
+                    harness_dispatch::workflow_invocation(
+                        &state,
+                        &run_id,
+                        &dispatch_identity,
+                        &caller_plugin_id,
+                        request,
+                    ),
+                )))
+            }
+        }
+        ServiceBridgeRequest::InvokeService(request)
+            if request.interface_id == bcode_harness_models::HARNESS_INTERFACE_ID =>
+        {
+            // Native lifecycle services are never workflow application callbacks. Only the
+            // invocation-scoped managed facade may reach them after receipt/authority admission.
+            Ok(ServiceBridgeResponse::Service(
+                ToolInvocationServiceResolution::Unsupported,
+            ))
+        }
         ServiceBridgeRequest::InvokeService(request)
             if request.invocation_id == dispatch_identity
                 && request.interface_id == bcode_workflow::WORKFLOW_EVIDENCE_INTERFACE_ID =>
@@ -35714,6 +35985,13 @@ impl<'a> ServerServiceRouter<'a> {
     }
 }
 
+fn invalid_routed_service_payload() -> ToolInvocationServiceResolution {
+    ToolInvocationServiceResolution::Failed {
+        code: "invalid_request".to_owned(),
+        message: "routed service payload must be a JSON object".to_owned(),
+    }
+}
+
 impl InvocationServiceRouter for ServerServiceRouter<'_> {
     fn invoke(
         &self,
@@ -35732,6 +36010,9 @@ impl InvocationServiceRouter for ServerServiceRouter<'_> {
             let Some(route_id) = request.route_id.as_deref() else {
                 return ToolInvocationServiceResolution::Unsupported;
             };
+            if let Some(refusal) = managed_callback_route_refusal(route_id) {
+                return refusal;
+            }
             if route_id == bcode_model::judgement::WORKFLOW_APPLICATION_INTERFACE_ID
                 && request.interface_id == bcode_model::judgement::WORKFLOW_APPLICATION_INTERFACE_ID
                 && request.operation == "optional_judge"
@@ -35767,10 +36048,7 @@ impl InvocationServiceRouter for ServerServiceRouter<'_> {
                 return ToolInvocationServiceResolution::Unsupported;
             };
             let Some(mut payload) = request.payload.as_object().cloned() else {
-                return ToolInvocationServiceResolution::Failed {
-                    code: "invalid_request".to_owned(),
-                    message: "routed service payload must be a JSON object".to_owned(),
-                };
+                return invalid_routed_service_payload();
             };
             if let Some(overlay) = route.payload_overlay.as_object() {
                 payload.extend(overlay.clone());
@@ -36242,6 +36520,25 @@ async fn resolve_server_plugin_bridge_request(
             } else {
                 receive.await
             })
+        }
+        ServiceBridgeRequest::InvokeService(request)
+            if request.interface_id == bcode_ipc::harness::MANAGED_SESSION_INTERFACE_ID =>
+        {
+            let resolution = if request.invocation_id == call.id && !cancel_state.is_cancelled() {
+                harness_dispatch::invocation(
+                    state,
+                    harness_dispatch::ManagedCaller::Invocation {
+                        session_id,
+                        plugin_id: plugin_id.to_owned(),
+                        invocation_id: call.id.clone(),
+                    },
+                    request,
+                )
+                .await
+            } else {
+                ToolInvocationServiceResolution::Cancelled
+            };
+            ServiceBridgeResponse::Service(resolution)
         }
         ServiceBridgeRequest::InvokeService(request)
             if request.interface_id == bcode_tool::PROCESS_ADMISSION_INTERFACE_ID
@@ -39567,6 +39864,11 @@ impl bcode_workflow_store::AsyncAttemptStatusObserver for WorkflowTurnReceiptObs
                     request,
                 );
             }
+            if let Some(observation) =
+                workflow_operations::observe_operation_receipt(self.state, request).await?
+            {
+                return Ok(observation);
+            }
             if request
                 .receipt
                 .get("owner")
@@ -41076,6 +41378,9 @@ async fn dispatch_workflow_plugin_block(
         return Err(WorkflowStoreError::InvalidData(
             "workflow block invocation is missing its persisted owner preparation".to_string(),
         ));
+    }
+    if let Some(receipt) = harness_workflow::dispatch_block(state, request).await? {
+        return Ok(receipt);
     }
     workflow_representation::plugin::check_supported(state, &request.activation.run_id, &block)
         .await?;
@@ -43288,6 +43593,9 @@ async fn signal_workflow_attempt_cancellation(
     state: &ServerState,
     attempt: &bcode_workflow_store::ActiveAttemptCancellation,
 ) -> Result<(), WorkflowStoreError> {
+    if workflow_operations::cancel_operation_receipt(state, attempt).await? {
+        return Ok(());
+    }
     if attempt
         .receipt
         .as_ref()
@@ -44291,6 +44599,59 @@ fn command_invocation_session(
         .and_then(|context| context.session_id)
 }
 
+/// Resolve a nested command application call with producer identity retained by the host.
+/// `plugin_id` and `invocation_id` must come from the admitted command receipt, not its payload.
+async fn resolve_authenticated_command_plugin_bridge_request(
+    state: &ServerState,
+    authorized_session_id: Option<SessionId>,
+    plugin_id: &str,
+    invocation_id: &str,
+    request: ServiceBridgeRequest,
+    cancellation: &bcode_plugin_sdk::ServiceCancellation,
+) -> Result<ServiceBridgeResponse, String> {
+    if let ServiceBridgeRequest::InvokeService(call) = &request
+        && call.interface_id == bcode_ipc::harness::MANAGED_SESSION_INTERFACE_ID
+    {
+        if cancellation.is_cancelled() {
+            return Ok(ServiceBridgeResponse::Service(
+                ToolInvocationServiceResolution::Cancelled,
+            ));
+        }
+        let session_id = authorized_session_id
+            .ok_or_else(|| "managed command requires canonical session context".to_owned())?;
+        if call.invocation_id != invocation_id || plugin_id.is_empty() {
+            return Err("managed command invocation scope mismatch".into());
+        }
+        // Only admitted command drivers call this resolver with a host-owned identity.
+        // Retain the registration across nested canonical admission and native delivery.
+        let (inputs, _unused_inputs) = mpsc::channel(1);
+        let _registration = ActivePluginInvocationRegistration::register(
+            Arc::clone(&state.active_plugin_invocations),
+            Arc::clone(&state.active_artifacts),
+            session_id,
+            invocation_id,
+            ActivePluginInvocation {
+                producer_plugin_id: plugin_id.to_owned(),
+                inputs,
+            },
+            None,
+        )?;
+        return Ok(ServiceBridgeResponse::Service(
+            harness_dispatch::invocation(
+                state,
+                harness_dispatch::ManagedCaller::Invocation {
+                    session_id,
+                    plugin_id: plugin_id.to_owned(),
+                    invocation_id: invocation_id.to_owned(),
+                },
+                call.clone(),
+            )
+            .await,
+        ));
+    }
+    resolve_command_plugin_bridge_request(state, authorized_session_id, request, cancellation).await
+}
+
 async fn resolve_command_plugin_bridge_request(
     state: &ServerState,
     authorized_session_id: Option<SessionId>,
@@ -44319,6 +44680,12 @@ async fn resolve_session_plugin_application_request(
             "command invocation bridge supports nested application services only".to_owned(),
         );
     };
+    if request.interface_id == bcode_ipc::harness::MANAGED_SESSION_INTERFACE_ID {
+        return Ok(ServiceBridgeResponse::Service(ToolInvocationServiceResolution::Failed {
+            code: "managed_session_authenticated_caller_required".into(),
+            message: "managed command callbacks must retain their authenticated plugin and invocation identity".into(),
+        }));
+    }
     if request.interface_id == bcode_plugin_sdk::milestones::MILESTONES_HOST_INTERFACE_ID {
         let payload =
             serde_json::from_value::<bcode_plugin_sdk::milestones::MilestonesHostRequest>(
@@ -44674,6 +45041,12 @@ const fn session_event_kind_name(kind: &SessionEventKind) -> &'static str {
         SessionEventKind::SubmissionPendingCancelled { .. } => "submission_pending_cancelled",
         SessionEventKind::DurableInteractionCommitted { .. } => "durable_interaction_committed",
         SessionEventKind::TurnContinuationCommitted { .. } => "turn_continuation_committed",
+        SessionEventKind::ExternalHarnessOperation { .. } => "external_harness_operation",
+        SessionEventKind::ExternalBackendBound { .. } => "external_backend_bound",
+        SessionEventKind::ExternalSubmissionAccepted { .. } => "external_submission_accepted",
+        SessionEventKind::ExternalDeliveryObserved { .. } => "external_delivery_observed",
+        SessionEventKind::ExternalObservationRecorded { .. } => "external_observation_recorded",
+        SessionEventKind::ExternalInteractionResponded { .. } => "external_interaction_responded",
         SessionEventKind::InertHistory { .. } => "inert_history",
     }
 }
@@ -45541,6 +45914,20 @@ fn compact_attach_history(
     compacted
 }
 
+/// Dedicated typed auth response write, without ordinary telemetry or debug projection.
+async fn send_sensitive_response(
+    writer: &SharedWriter,
+    request_id: u64,
+    response: Response,
+) -> Result<(), ServerError> {
+    let envelope = response_envelope(request_id, &response)?;
+    let frames = encode_envelope_frames(&envelope)?;
+    let mut guard = writer.writer.lock().await;
+    write_encoded_envelope_frames(&mut *guard, &frames).await?;
+    drop(guard);
+    Ok(())
+}
+
 pub(crate) async fn send_response(
     writer: &SharedWriter,
     request_id: u64,
@@ -45622,6 +46009,7 @@ const fn response_kind(response: &Response) -> &'static str {
 const fn response_payload_kind(response: &Response) -> &'static str {
     match response {
         Response::Ok(payload) => match payload {
+            ResponsePayload::ManagedSession { .. } => "managed_session",
             ResponsePayload::Attached { .. } => "attached",
             ResponsePayload::SessionHistory { .. } => "session_history",
             ResponsePayload::SessionAdmission { .. } => "session_admission",
@@ -67739,8 +68127,8 @@ library = "test"
 
     #[tokio::test]
     async fn terminal_session_admission_recovers_missing_workflow_receipt() {
-        verify_session_admission_receipt_recovery(true).await;
-        verify_session_admission_receipt_recovery(false).await;
+        Box::pin(verify_session_admission_receipt_recovery(true)).await;
+        Box::pin(verify_session_admission_receipt_recovery(false)).await;
     }
 
     async fn verify_live_admission_deferral(

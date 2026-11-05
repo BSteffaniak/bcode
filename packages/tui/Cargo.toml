@@ -105,6 +105,7 @@ bcode_agent_runtime     = { workspace = true }
 bcode_daemon_lifecycle  = { workspace = true }
 bcode_filesystem_plugin = { workspace = true, features = ["static-bundled"] }
 bcode_git_plugin        = { workspace = true, features = ["static-bundled"] }
+bcode_harness_models    = { workspace = true }
 bcode_hello_plugin      = { workspace = true }
 bcode_model_catalog     = { workspace = true }
 bcode_question_plugin   = { workspace = true, features = ["static-bundled"] }

@@ -4,6 +4,7 @@
 #![warn(clippy::all, clippy::pedantic, clippy::nursery, clippy::cargo)]
 #![allow(clippy::multiple_crate_versions)]
 
+pub mod harness_sessions;
 mod terminal_shell;
 pub use terminal_shell::{TerminalRecoveryAction, TerminalShell};
 

@@ -785,7 +785,7 @@ pub async fn cancel(state: &ServerState, run_id: &str) -> Result<Option<bool>, S
             super::backpressure::retry(|| owner_boundary::verify(&db, run_id, &guard.authority))
                 .await
                 .map_err(|_| unavailable())?;
-            if crate::signal_workflow_attempt_cancellation(
+            if crate::workflow_operations::signal_operation_cancellation(
                 state,
                 &bcode_workflow_store::ActiveAttemptCancellation {
                     run_id: receipt.run_id.clone(),
@@ -1002,7 +1002,7 @@ async fn reconcile_cancellation_receipt(
     .await
     .map_err(|_| unavailable())?
     .ok_or_else(unavailable)?;
-    let observation = crate::WorkflowTurnReceiptObserver { state }
+    let observation = crate::workflow_operations::WorkflowOperationReceiptObserver { state }
         .observe_async(&bcode_workflow_store::AttemptReconciliationRequest {
             run_id: receipt.run_id.clone(),
             node_id: receipt.node_id.clone(),
@@ -1052,6 +1052,36 @@ async fn reconcile_cancellation_receipt(
     )
     .await?;
     Ok(true)
+}
+
+/// Read one exact canonical dispatch receipt without scanning attempts or replaying work.
+pub async fn execution_receipt(
+    state: &ServerState,
+    run_id: &str,
+    dispatch_identity: &str,
+) -> Result<Option<bcode_workflow_store::DispatchReceipt>, WorkflowStoreError> {
+    let retained = retained_store(state).await.map_err(store_error)?;
+    match lookup_at(retained.path(), run_id)
+        .await
+        .map_err(store_error)?
+    {
+        RunLookup::Available(_) => {
+            let db = open(retained.path(), false).map_err(store_error)?;
+            let value =
+                super::backpressure::retry(|| owner_boundary::receipt(&db, dispatch_identity))
+                    .await
+                    .map_err(store_error)?;
+            if value
+                .as_ref()
+                .is_some_and(|receipt| receipt.run_id != run_id)
+            {
+                return Err(store_error("receipt belongs to another run"));
+            }
+            Ok(value)
+        }
+        RunLookup::Legacy => Ok(retained.dispatch_receipt(dispatch_identity)?),
+        _ => Err(store_error("managed receipt storage unavailable")),
+    }
 }
 
 /// Read the exact admitted intent even after terminal settlement, without replaying effects.

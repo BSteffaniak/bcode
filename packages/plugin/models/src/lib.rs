@@ -9,6 +9,7 @@
 //! describe plugin-owned schemas, not host implementation versions.
 
 pub mod composer;
+pub mod harness;
 pub mod interaction_controller;
 pub mod keymap;
 pub mod tui_selection;

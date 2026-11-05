@@ -15,6 +15,7 @@ async-trait = { workspace = true }
 base64 = { workspace = true }
 bcode_confined_fs = { workspace = true }
 bcode_database_observability = { workspace = true }
+bcode_harness_models = { workspace = true }
 bcode_metrics = { workspace = true }
 bcode_plugin_sdk = { workspace = true }
 bcode_session_migration_target = { workspace = true }

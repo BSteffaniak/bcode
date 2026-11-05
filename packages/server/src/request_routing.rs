@@ -1118,6 +1118,7 @@ pub enum AgentSkillPluginRequest {
 /// A request bound to the domain that owns it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RoutedRequest {
+    ManagedSession(Box<bcode_ipc::ManagedSessionRequest>),
     SessionLifecycle(Box<SessionLifecycleRequest>),
     SessionSearchAttach(SessionSearchAttachRequest),
     SessionTurn(SessionTurnRequest),
@@ -1140,6 +1141,7 @@ impl RoutedRequest {
     #[allow(clippy::too_many_lines)]
     pub fn from_request(request: Request) -> Self {
         match request {
+            Request::ManagedSession { request } => Self::ManagedSession(request),
             Request::Hello {
                 client_name,
                 runtime_context,

@@ -1,0 +1,28 @@
+[package]
+authors     = { workspace = true }
+categories  = ["development-tools"]
+description = "Managed Claude Code session harness plugin"
+edition     = { workspace = true }
+keywords    = ["bcode", "claude", "harness", "sessions", "plugin"]
+license     = { workspace = true }
+name        = "bcode_claude_code_plugin"
+readme      = { workspace = true }
+repository  = { workspace = true }
+version     = { workspace = true }
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+bcode_claude_code          = { workspace = true }
+bcode_harness_models       = { workspace = true }
+bcode_plugin_sdk           = { workspace = true }
+bcode_provider_auth_models = { workspace = true }
+serde                      = { workspace = true, features = ["derive", "std"] }
+serde_json                 = { workspace = true }
+tokio                      = { workspace = true, features = ["rt-multi-thread", "sync", "time"] }
+
+[features]
+default          = []
+fail-on-warnings = []
+static-bundled   = []

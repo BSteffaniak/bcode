@@ -1,0 +1,24 @@
+id      = "bcode.claude-code"
+name    = "Claude Code Harness"
+version = "0.0.1"
+
+[[services]]
+class        = "service"
+description  = "Typed native Claude Code lifecycle; not a model provider or Bcode tool executor"
+interface_id = "bcode.harness/v1"
+name         = "Claude Code managed sessions"
+
+[[services]]
+class        = "query"
+description  = "Explicit namespace-bound client-terminal plan; never launches native login in the daemon"
+interface_id = "bcode.claude-code.handoff/v1"
+name         = "Claude Code native login handoff plan"
+
+[concurrency]
+type = "exclusive"
+
+[runtime]
+abi_version  = 5
+event_symbol = "bcode_plugin_handle_event_v1"
+library      = "libbcode_claude_code_plugin.dylib"
+type         = "native"

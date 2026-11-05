@@ -532,10 +532,14 @@ fn command_application_request_allowed(
     request: &bcode_tool::ToolInvocationServiceRequest,
 ) -> bool {
     command_id.is_some_and(|command_id| {
-        bound_identity(&request.invocation_id, bound_id) || request.invocation_id == command_id
+        request.invocation_id == command_id
+            || request.invocation_id == bound_id
+            || (request.interface_id != bcode_ipc::harness::MANAGED_SESSION_INTERFACE_ID
+                && bound_identity(&request.invocation_id, bound_id))
     }) && request.route_id.is_none()
         && (request.interface_id == bcode_plugin_sdk::SESSION_DERIVATION_INTERFACE_ID
-            || request.interface_id == bcode_plugin_sdk::milestones::MILESTONES_HOST_INTERFACE_ID)
+            || request.interface_id == bcode_plugin_sdk::milestones::MILESTONES_HOST_INTERFACE_ID
+            || request.interface_id == bcode_ipc::harness::MANAGED_SESSION_INTERFACE_ID)
 }
 
 fn route<'a>(
@@ -595,13 +599,16 @@ fn route<'a>(
                             if call.cancellation.is_cancelled() { ToolInvocationServiceResolution::Cancelled }
                             else { state.model_host.clone().dispatch(plugin, request).await }
                         }
-                        ServiceBridgeRequest::InvokeService(request)
+                        ServiceBridgeRequest::InvokeService(mut request)
                             if command_application_request_allowed(command_id.as_deref(), &bound.id, &request) => {
                             // Only the admitted top-level command receives the existing session
                             // application bridge. Nested providers and composers cannot inherit it.
-                            match super::resolve_command_plugin_bridge_request(
+                            request.invocation_id.clone_from(&bound.id);
+                            match super::resolve_authenticated_command_plugin_bridge_request(
                                 state,
                                 bound.session,
+                                plugin,
+                                &bound.id,
                                 ServiceBridgeRequest::InvokeService(request),
                                 &call.cancellation,
                             ).await {
@@ -1303,6 +1310,18 @@ library = "libtest_command_context.dylib"
             interface
         ));
         assert!(!allowed(0, "bound-invocation", None, "unrelated/v1"));
+        let managed = bcode_ipc::harness::MANAGED_SESSION_INTERFACE_ID;
+        assert!(allowed(0, "bound-invocation", None, managed));
+        assert!(allowed(0, "registered.command", None, managed));
+        assert!(!allowed(0, "", None, managed));
+        assert!(!allowed(0, "forged", None, managed));
+        assert!(!allowed(1, "bound-invocation", None, managed));
+        assert!(!allowed(
+            0,
+            "bound-invocation",
+            Some(managed.into()),
+            managed
+        ));
     }
 
     #[tokio::test]

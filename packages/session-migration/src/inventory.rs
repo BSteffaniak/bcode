@@ -1465,6 +1465,12 @@ pub const LATEST_HISTORICAL_EVENT_SCHEMA: u16 = 52;
 fn released_event_schema_range(kind: &str) -> (u16, u16) {
     let live = LATEST_HISTORICAL_EVENT_SCHEMA;
     match kind {
+        "external_harness_operation"
+        | "external_backend_bound"
+        | "external_submission_accepted"
+        | "external_delivery_observed"
+        | "external_observation_recorded"
+        | "external_interaction_responded" => (53, CURRENT_EVENT_SCHEMA),
         "automatic_title_updated"
         | "milestone_evaluation_requested"
         | "milestone_evaluation_completed"
@@ -1611,6 +1617,30 @@ pub const RELEASED_EVENT_VARIANTS: &[ReleasedEventVariantDescriptor] = &[
     ReleasedEventVariantDescriptor {
         kind: "execution_session_created",
         treatment: ReleasedEventTreatment::ExplicitConversion,
+    },
+    ReleasedEventVariantDescriptor {
+        kind: "external_backend_bound",
+        treatment: ReleasedEventTreatment::CurrentEquivalent,
+    },
+    ReleasedEventVariantDescriptor {
+        kind: "external_delivery_observed",
+        treatment: ReleasedEventTreatment::CurrentEquivalent,
+    },
+    ReleasedEventVariantDescriptor {
+        kind: "external_harness_operation",
+        treatment: ReleasedEventTreatment::CurrentEquivalent,
+    },
+    ReleasedEventVariantDescriptor {
+        kind: "external_interaction_responded",
+        treatment: ReleasedEventTreatment::CurrentEquivalent,
+    },
+    ReleasedEventVariantDescriptor {
+        kind: "external_observation_recorded",
+        treatment: ReleasedEventTreatment::CurrentEquivalent,
+    },
+    ReleasedEventVariantDescriptor {
+        kind: "external_submission_accepted",
+        treatment: ReleasedEventTreatment::CurrentEquivalent,
     },
     ReleasedEventVariantDescriptor {
         kind: "inert_history",
@@ -2253,7 +2283,12 @@ pub struct MigrationStepDescriptor {
     pub target_writer_epoch: u32,
 }
 
-pub const MIGRATION_STEPS: [MigrationStepDescriptor; 16] = [
+pub const MIGRATION_STEPS: [MigrationStepDescriptor; 17] = [
+    MigrationStepDescriptor {
+        id: "session-writer-epoch-17-to-18",
+        source_writer_epoch: 17,
+        target_writer_epoch: 18,
+    },
     MigrationStepDescriptor {
         id: "session-writer-epoch-16-to-17",
         source_writer_epoch: 16,
@@ -2419,11 +2454,15 @@ pub const RELEASED_WRITER_SCHEMA_COMBINATIONS: &[ReleasedWriterSchemaDescriptor]
         writer_epoch: 16,
         event_schema: 52,
     },
+    ReleasedWriterSchemaDescriptor {
+        writer_epoch: 17,
+        event_schema: 52,
+    },
 ];
 
 /// Released historical writer epochs that must migrate to [`CURRENT_WRITER_EPOCH`].
 pub const RELEASED_HISTORICAL_WRITER_EPOCHS: &[u32] =
-    &[1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16];
+    &[1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17];
 
 /// Released historical event schemas currently evidenced by Git history.
 ///
@@ -2581,6 +2620,11 @@ mod tests {
     #[test]
     fn current_only_event_kinds_fail_closed_outside_their_released_schema_ranges() {
         for (kind, first_schema) in [
+            ("external_backend_bound", 53),
+            ("external_submission_accepted", 53),
+            ("external_delivery_observed", 53),
+            ("external_observation_recorded", 53),
+            ("external_interaction_responded", 53),
             ("child_session_created", 49),
             ("durable_interaction_committed", 53),
             ("turn_continuation_committed", 53),
@@ -3019,6 +3063,10 @@ mod tests {
                 },
                 ReleasedWriterSchemaDescriptor {
                     writer_epoch: 16,
+                    event_schema: 52
+                },
+                ReleasedWriterSchemaDescriptor {
+                    writer_epoch: 17,
                     event_schema: 52
                 },
             ]

@@ -20,6 +20,7 @@ bcode_command = { workspace = true }
 bcode_config = { workspace = true }
 bcode_confined_fs = { workspace = true }
 bcode_daemon_lifecycle = { workspace = true }
+bcode_harness_models = { workspace = true }
 bcode_ipc = { workspace = true }
 bcode_metrics = { workspace = true }
 bcode_model = { workspace = true }

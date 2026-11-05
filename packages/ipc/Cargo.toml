@@ -14,6 +14,7 @@ version     = { workspace = true }
 bcode_agent_profile        = { workspace = true }
 bcode_command              = { workspace = true }
 bcode_config               = { workspace = true }
+bcode_harness_models       = { workspace = true }
 bcode_metrics              = { workspace = true }
 bcode_model                = { workspace = true }
 bcode_model_catalog_models = { workspace = true }
@@ -41,6 +42,7 @@ serde_json                 = { workspace = true, features = ["std"] }
 sha2                       = { workspace = true }
 thiserror                  = { workspace = true }
 tokio                      = { workspace = true, features = ["io-util"] }
+zeroize                    = { workspace = true }
 
 [target.'cfg(windows)'.dependencies]
 windows-sys = { workspace = true, features = [

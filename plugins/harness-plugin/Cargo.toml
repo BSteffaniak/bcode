@@ -1,0 +1,30 @@
+[package]
+authors     = { workspace = true }
+categories  = ["development-tools"]
+description = "Managed external-session tools and commands for Bcode"
+edition     = { workspace = true }
+keywords    = ["bcode", "harness", "session", "plugin"]
+license     = { workspace = true }
+name        = "bcode_harness_plugin"
+readme      = { workspace = true }
+repository  = { workspace = true }
+version     = { workspace = true }
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+bcode_agent_profile  = { workspace = true }
+bcode_command        = { workspace = true }
+bcode_harness_models = { workspace = true }
+bcode_plugin_sdk     = { workspace = true }
+bcode_session_models = { workspace = true }
+bcode_tool           = { workspace = true }
+bcode_workflow       = { workspace = true }
+serde                = { workspace = true, features = ["derive", "std"] }
+serde_json           = { workspace = true }
+
+[features]
+default          = []
+fail-on-warnings = []
+static-bundled   = []

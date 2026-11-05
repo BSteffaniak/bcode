@@ -1,5 +1,10 @@
 [workspace]
 members = [
+    "packages/harness/models",
+    "packages/claude-code",
+    "plugins/claude-code-plugin",
+    "plugins/codex-harness-plugin",
+    "plugins/harness-plugin",
     "packages/recap",
     "packages/recap/cli",
     "packages/vox",
@@ -161,6 +166,11 @@ repository = "https://github.com/BSteffaniak/bcode"
 version    = "0.0.1-alpha.0"
 
 [workspace.dependencies]
+bcode_claude_code = { version = "0.0.1-alpha.0", default-features = false, path = "packages/claude-code" }
+bcode_claude_code_plugin = { version = "0.0.1-alpha.0", default-features = false, path = "plugins/claude-code-plugin" }
+bcode_codex_harness_plugin = { version = "0.0.1-alpha.0", default-features = false, path = "plugins/codex-harness-plugin" }
+bcode_harness_models = { version = "0.0.1-alpha.0", default-features = false, path = "packages/harness/models" }
+bcode_harness_plugin = { version = "0.0.1-alpha.0", default-features = false, path = "plugins/harness-plugin" }
 bcode_xray = { version = "0.0.1-alpha.0", default-features = false, path = "packages/xray" }
 bcode_xray_models = { version = "0.0.1-alpha.0", default-features = false, path = "packages/xray/models" }
 ruff_formatter = { version = "0.0.17", default-features = false }

@@ -823,6 +823,17 @@ async fn execute_builtin(
     use slash_registry::BuiltinCommandId;
 
     match command {
+        BuiltinCommandId::Native => {
+            let Some(session_id) = session_id else {
+                return Ok(SlashCommandOutcome::SystemPlain(
+                    "Open a managed external session first".into(),
+                ));
+            };
+            client
+                .managed_session_command(session_id, message)
+                .await
+                .map(SlashCommandOutcome::SystemPlain)
+        }
         BuiltinCommandId::Version => Ok(SlashCommandOutcome::SystemMarkdown(
             format_build_info_markdown(&super::build_info()),
         )),
@@ -1041,6 +1052,32 @@ mod tests {
         assert_eq!(
             format_unix_timestamp_utc(1_735_689_600),
             "2025-01-01T00:00:00Z"
+        );
+    }
+
+    #[tokio::test]
+    async fn native_builtin_is_available_without_plugin_and_requires_an_attached_session() {
+        let outcome = execute_builtin(
+            &BcodeClient::default_endpoint(),
+            None,
+            SlashExecutionContext {
+                working_directory: std::path::Path::new("."),
+                current_agent_id: "build",
+                reasoning_display_mode: bcode_config::TuiThinkingMode::All,
+                reasoning_visible: true,
+            },
+            "/native history",
+            &["/native", "history"],
+            slash_registry::BuiltinCommandId::Native,
+        )
+        .await
+        .unwrap();
+        assert!(
+            matches!(outcome, SlashCommandOutcome::SystemPlain(text) if text.contains("managed external session"))
+        );
+        assert_eq!(
+            slash_registry::builtin_command("native").unwrap().id(),
+            slash_registry::BuiltinCommandId::Native
         );
     }
 

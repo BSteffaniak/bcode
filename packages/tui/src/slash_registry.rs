@@ -7,6 +7,8 @@ use bcode_skill_models::SkillId;
 /// Stable identity for a host-owned slash command.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BuiltinCommandId {
+    /// Host-owned managed external session controls; never native tool execution.
+    Native,
     Version,
     Sessions,
     Monitor,
@@ -87,6 +89,20 @@ macro_rules! completion {
 }
 
 const BUILTIN_COMMANDS: &[BuiltinCommandSpec] = &[
+    BuiltinCommandSpec {
+        id: BuiltinCommandId::Native,
+        names: &["native"],
+        completions: &[
+            completion!(
+                "/native status",
+                "Inspect canonical prepared/confirmed native target without plugin calls"
+            ),
+            completion!(
+                "/native history",
+                "Read bounded canonical native history; /native respond answers a native request"
+            ),
+        ],
+    },
     BuiltinCommandSpec {
         id: BuiltinCommandId::Version,
         names: &["version"],

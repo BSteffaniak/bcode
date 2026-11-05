@@ -351,6 +351,11 @@ async fn execute_submit_message(
             .await?
             .id
     };
+    if client.managed_session_binding(session_id).await?.is_some() {
+        return Err(ClientError::Protocol(
+            "Managed external sessions use /native status to inspect the exact prepared/confirmed target, then /native send <generation> <submission-id> <attempt-id> <text>, or /native steer with an exact expected native turn; Bcode model execution is not a fallback".into(),
+        ));
+    }
     let receipt = client
         .submit_prompt(
             session_id,

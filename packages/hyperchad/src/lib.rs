@@ -6,6 +6,7 @@
 
 mod browser_api;
 mod browser_origin;
+pub mod harness_sessions;
 
 #[cfg(feature = "renderer-html-actix")]
 mod html_actix;
@@ -1898,6 +1899,25 @@ impl HyperChadAppState {
             );
         };
         let session_id = form.session_id.as_deref().and_then(parse_session_id);
+        if form.text.split_whitespace().next() == Some("/native") {
+            let Some(session_id) = session_id else {
+                return error_page("Open a managed external session before using /native");
+            };
+            return match self
+                .client
+                .managed_session_command(session_id, &form.text)
+                .await
+            {
+                Ok(message) => {
+                    self.render_session_or_initial(Some(session_id), &message)
+                        .await
+                }
+                Err(error) => {
+                    self.render_session_or_initial(Some(session_id), &client_error_message(&error))
+                        .await
+                }
+            };
+        }
         if form.text.trim().is_empty() {
             return self
                 .render_session_or_initial(session_id, "prompt cannot be empty")
@@ -4291,6 +4311,64 @@ mod tests {
         );
         assert!(rendered.contains("active invocations"));
         assert!(!rendered.contains("active tool"));
+    }
+
+    #[test]
+    fn external_canonical_question_is_visible_in_the_real_home_page_without_plugin() {
+        use bcode_harness_models::{
+            HarnessCompleteness, HarnessInteraction, HarnessInteractionKind, HarnessObservation,
+            HarnessObservationKind,
+        };
+        use bcode_session_models::external_backend::{
+            ExternalBackendEnvelope, ExternalBackendRecord,
+        };
+        let session_id = SessionId::new();
+        let event = bcode_session_models::SessionEvent {
+            schema_version: bcode_session_models::CURRENT_SESSION_EVENT_SCHEMA_VERSION,
+            session_id,
+            sequence: 1,
+            timestamp_ms: 0,
+            provenance: None,
+            kind: ExternalBackendEnvelope {
+                version: 1,
+                record: ExternalBackendRecord::Observation {
+                    observation: HarnessObservation {
+                        observation_id: "native-question".into(),
+                        session_id: session_id.to_string(),
+                        generation: 4,
+                        native_correlations: vec![],
+                        completeness: HarnessCompleteness::Partial,
+                        kind: HarnessObservationKind::Interaction {
+                            interaction: HarnessInteraction {
+                                request_id: "question-4".into(),
+                                session_id: session_id.to_string(),
+                                generation: 4,
+                                kind: HarnessInteractionKind::Question,
+                                prompt: "native-question-visible-marker".into(),
+                                scope: "workspace".into(),
+                                choices: vec![],
+                            },
+                        },
+                    },
+                },
+            }
+            .into_event_kind()
+            .unwrap(),
+        };
+        let mut view = SessionView::new();
+        view.apply_event(&event);
+        let rendered = format!(
+            "{:?}",
+            bcode_hyperchad_ui::pages::home::home(
+                view.snapshot(),
+                &[],
+                &bcode_hyperchad_ui::context::StaticPresentationContext
+            )
+        );
+        assert!(rendered.contains("native-question-visible-marker"));
+        assert!(rendered.contains("question-4"));
+        assert!(rendered.contains("/native respond"));
+        assert!(view.snapshot().tools.is_empty());
     }
 
     #[test]

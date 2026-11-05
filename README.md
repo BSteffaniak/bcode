@@ -97,6 +97,7 @@ Start with the [plugin guide](docs/plugins.md) and the [dynamic plugin example](
 * [Git client (`bcode git`)](docs/git-ui.md)
 * [Skills](docs/skills.md)
 * [Session imports](docs/session-import-plugins.md)
+* [Managed external sessions](docs/managed-external-sessions.md)
 * [Reasoning presentation](docs/reasoning-presentation.md)
 * [Windows support](docs/windows-support.md)
 

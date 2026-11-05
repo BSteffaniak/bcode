@@ -1,0 +1,193 @@
+categories = ["session", "automation"]
+id         = "bcode.harness"
+name       = "Bcode Managed Harness Plugin"
+version    = "0.0.1"
+
+[[services]]
+class        = "tool_execution"
+description  = "Start, inspect, follow up, respond to, and interrupt managed external sessions through host admission"
+interface_id = "bcode.tool/v1"
+name         = "Managed External Sessions"
+
+[[services]]
+class                 = "service"
+interface_id          = "bcode.command/v1"
+invocation_operations = ["invoke"]
+name                  = "Managed External Session Commands"
+
+[[services]]
+class        = "service"
+interface_id = "bcode.workflow-block/v1"
+name         = "Managed Session Workflow Operations"
+
+[[services.workflow_blocks]]
+block_id               = "harness.start"
+block_version          = 1
+cancellation_supported = true
+effect                 = "mutating"
+operation              = "harness.start"
+plugin_id              = "bcode.harness"
+preparation_required   = true
+reconciliation         = "receipt_status"
+timeout_ms             = 30000
+[services.workflow_blocks.input]
+schema = { type = "object", additionalProperties = false, required = [
+    "request_json",
+], properties = { request_json = { type = "string", maxLength = 1048576 } } }
+type_name = "bcode.harness.managed-operation/v1"
+[services.workflow_blocks.output]
+schema = { type = "object", required = [
+    "schema_version",
+    "request_id",
+    "operation",
+    "kind",
+] }
+type_name = "bcode.harness.operation-evidence/v1"
+[services.workflow_blocks.authorization]
+capability              = "mutating"
+explicit_grant_required = true
+
+[[services.workflow_blocks]]
+block_id               = "harness.inspect"
+block_version          = 1
+cancellation_supported = true
+effect                 = "read_only"
+operation              = "harness.inspect"
+plugin_id              = "bcode.harness"
+preparation_required   = true
+reconciliation         = "receipt_status"
+timeout_ms             = 30000
+[services.workflow_blocks.input]
+schema = { type = "object", additionalProperties = false, required = [
+    "request_json",
+], properties = { request_json = { type = "string", maxLength = 1048576 } } }
+type_name = "bcode.harness.managed-operation/v1"
+[services.workflow_blocks.output]
+schema = { type = "object", required = [
+    "schema_version",
+    "request_id",
+    "operation",
+    "kind",
+] }
+type_name = "bcode.harness.operation-evidence/v1"
+[services.workflow_blocks.authorization]
+capability              = "read_only"
+explicit_grant_required = false
+
+[[services.workflow_blocks]]
+block_id               = "harness.followup"
+block_version          = 1
+cancellation_supported = true
+effect                 = "mutating"
+operation              = "harness.followup"
+plugin_id              = "bcode.harness"
+preparation_required   = true
+reconciliation         = "receipt_status"
+timeout_ms             = 30000
+[services.workflow_blocks.input]
+schema = { type = "object", additionalProperties = false, required = [
+    "request_json",
+], properties = { request_json = { type = "string", maxLength = 1048576 } } }
+type_name = "bcode.harness.managed-operation/v1"
+[services.workflow_blocks.output]
+schema = { type = "object", required = [
+    "schema_version",
+    "request_id",
+    "operation",
+    "kind",
+] }
+type_name = "bcode.harness.operation-evidence/v1"
+[services.workflow_blocks.authorization]
+capability              = "mutating"
+explicit_grant_required = true
+
+[[services.workflow_blocks]]
+block_id               = "harness.respond"
+block_version          = 1
+cancellation_supported = true
+effect                 = "mutating"
+operation              = "harness.respond"
+plugin_id              = "bcode.harness"
+preparation_required   = true
+reconciliation         = "receipt_status"
+timeout_ms             = 30000
+[services.workflow_blocks.input]
+schema = { type = "object", additionalProperties = false, required = [
+    "request_json",
+], properties = { request_json = { type = "string", maxLength = 1048576 } } }
+type_name = "bcode.harness.managed-operation/v1"
+[services.workflow_blocks.output]
+schema = { type = "object", required = [
+    "schema_version",
+    "request_id",
+    "operation",
+    "kind",
+] }
+type_name = "bcode.harness.operation-evidence/v1"
+[services.workflow_blocks.authorization]
+capability              = "mutating"
+explicit_grant_required = true
+
+[[services.workflow_blocks]]
+block_id               = "harness.interrupt"
+block_version          = 1
+cancellation_supported = true
+effect                 = "mutating"
+operation              = "harness.interrupt"
+plugin_id              = "bcode.harness"
+preparation_required   = true
+reconciliation         = "receipt_status"
+timeout_ms             = 30000
+[services.workflow_blocks.input]
+schema = { type = "object", additionalProperties = false, required = [
+    "request_json",
+], properties = { request_json = { type = "string", maxLength = 1048576 } } }
+type_name = "bcode.harness.managed-operation/v1"
+[services.workflow_blocks.output]
+schema = { type = "object", required = [
+    "schema_version",
+    "request_id",
+    "operation",
+    "kind",
+] }
+type_name = "bcode.harness.operation-evidence/v1"
+[services.workflow_blocks.authorization]
+capability              = "mutating"
+explicit_grant_required = true
+
+[[services.workflow_blocks]]
+block_id               = "harness.execute"
+block_version          = 1
+cancellation_supported = true
+effect                 = "mutating"
+operation              = "harness.execute"
+plugin_id              = "bcode.harness"
+preparation_required   = true
+reconciliation         = "receipt_status"
+timeout_ms             = 30000
+[services.workflow_blocks.input]
+schema = { type = "object", additionalProperties = false, required = [
+    "request_json",
+], properties = { request_json = { type = "string", maxLength = 65536 } } }
+type_name = "bcode.harness.managed-operation/v1"
+[services.workflow_blocks.output]
+schema = { type = "object", additionalProperties = false, required = [
+    "session_id",
+    "submission_id",
+    "native_turn_id",
+    "result",
+], properties = { session_id = { type = "string" }, submission_id = { type = "string" }, native_turn_id = { type = "string" }, result = { type = "string", maxLength = 65536 } } }
+type_name = "bcode.harness.assignment-result/v1"
+[services.workflow_blocks.authorization]
+capability              = "mutating"
+explicit_grant_required = true
+
+[concurrency]
+max  = 8
+type = "limited"
+
+[runtime]
+abi_version  = 5
+event_symbol = "bcode_plugin_handle_event_v1"
+library      = "libbcode_harness_plugin.dylib"
+type         = "native"

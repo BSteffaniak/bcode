@@ -91,6 +91,27 @@ Replay tests verify accepted and retired synthesis envelopes, preserve unsupport
 and reject unsupported versions rather than downgrading them. Finalization tests ensure interrupted
 or stale evidence rebuilds cannot advance the writer contract and that interruption permits retry.
 
+## Managed external evidence projection upgrade
+
+Writer epoch 18 adds reserved external evidence locator kinds in the existing `turn_evidence`
+projection. Canonical event schema advances from 52 to 53. The 17-to-18 edge preserves canonical events and
+rebuilds derived locators through the existing exclusive, interruption-safe migration path; an
+older writer cannot safely maintain these locators and must remain fenced. Current-format external
+evidence uses explicit semantic `SessionEventKind` variants, rejects unsupported versions, and retains typed normalized
+bindings, accepted submissions, delivery receipts, observations and interaction responses. There is
+no native protocol recovery journal or implicit mutation replay.
+
+`stores/epoch-17-schema-52-events.jsonl` adds schema-52 classification coverage for existing
+semantic variants, including submission recovery/cancellation. It claims schema/event matrix
+coverage only, not complete writable-store lifecycle behavior or ledger/table authority.
+The earlier epoch-16 evidence fixture now expects historical conversion rather than current-schema
+passthrough. Diagnostic trace contents remain opaque and never become external semantic events.
+
+Fixture lifecycle matrices now include epoch 17. Migration tests cover lossless normalization of
+external evidence and forward-only 17-to-18 planning. Session-owned offline behavioral tests cover
+bounded indexed reads, correlation, deduplication, generation fencing and terminal evidence. Neither
+historical migration nor reconstruction of a locator authorizes native execution or ownership transfer.
+
 ## Manifest
 
 `manifest.json` is the machine-enforced inventory for permanent sanitized fixtures. Every listed

@@ -1,0 +1,32 @@
+[package]
+authors     = { workspace = true }
+categories  = ["development-tools"]
+description = "Managed Codex app-server session backend for Bcode"
+edition     = { workspace = true }
+keywords    = ["bcode", "codex", "harness", "plugin"]
+license     = { workspace = true }
+name        = "bcode_codex_harness_plugin"
+readme      = { workspace = true }
+repository  = { workspace = true }
+version     = { workspace = true }
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[features]
+default          = []
+fail-on-warnings = []
+static-bundled   = []
+
+[dependencies]
+bcode_harness_models       = { workspace = true }
+bcode_plugin_sdk           = { workspace = true }
+bcode_provider_auth_models = { workspace = true }
+serde                      = { workspace = true, features = ["derive", "std"] }
+serde_json                 = { workspace = true }
+thiserror                  = { workspace = true }
+uuid                       = { workspace = true, features = ["v4"] }
+zeroize                    = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }

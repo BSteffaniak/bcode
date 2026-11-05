@@ -1,0 +1,20 @@
+[package]
+authors     = { workspace = true }
+categories  = ["development-tools"]
+description = "Portable versioned managed execution harness contracts"
+edition     = { workspace = true }
+keywords    = ["bcode", "harness", "session"]
+license     = { workspace = true }
+name        = "bcode_harness_models"
+readme      = { workspace = true }
+repository  = { workspace = true }
+version     = { workspace = true }
+
+[dependencies]
+bcode_provider_auth_models = { workspace = true }
+serde                      = { workspace = true, features = ["derive", "std"] }
+serde_json                 = { workspace = true }
+
+[features]
+default          = []
+fail-on-warnings = []

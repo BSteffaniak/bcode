@@ -1,0 +1,30 @@
+[package]
+authors     = { workspace = true }
+categories  = ["api-bindings", "asynchronous"]
+description = "Independent Rust transport for the Claude Code streaming CLI"
+edition     = { workspace = true }
+keywords    = ["claude", "agent", "cli", "protocol", "transport"]
+license     = { workspace = true }
+name        = "bcode_claude_code"
+repository  = { workspace = true }
+version     = { workspace = true }
+
+[dependencies]
+serde = { workspace = true, features = ["derive"] }
+serde_json = { workspace = true, features = ["std"] }
+thiserror = { workspace = true }
+tokio = { workspace = true, features = [
+    "io-util",
+    "process",
+    "rt",
+    "sync",
+    "time",
+    "macros",
+] }
+
+[dev-dependencies]
+tempfile = { workspace = true }
+
+[features]
+default          = []
+fail-on-warnings = []

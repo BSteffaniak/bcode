@@ -11,6 +11,7 @@ repository  = { workspace = true }
 version     = { workspace = true }
 
 [dependencies]
+bcode_harness_models = { workspace = true }
 bcode_session_models = { workspace = true }
 hex                  = { workspace = true }
 serde                = { workspace = true, features = ["derive", "std"] }

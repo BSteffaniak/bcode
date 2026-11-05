@@ -482,6 +482,9 @@ pub enum PersistedSessionEventError {
     /// Durable interaction envelope is malformed, oversized or unsupported.
     #[error("invalid or unsupported durable interaction envelope")]
     InvalidDurableInteraction,
+    /// Typed managed external evidence is invalid, oversized or unsupported.
+    #[error("invalid or unsupported canonical external session evidence")]
+    InvalidExternalBackendRecord,
     /// Private original usage is malformed; ordinary reads must not conceal damaged evidence.
     #[error("invalid original billing usage in canonical event")]
     InvalidOriginalUsage,
@@ -552,14 +555,25 @@ impl PersistedSessionEvent {
         };
         crate::submission::validate_descriptor(descriptor)
             .map_err(|_| PersistedSessionEventError::InvalidSubmissionDescriptor)?;
-        Ok(SessionEvent {
+        let event = SessionEvent {
             schema_version: self.schema_version,
             sequence: self.sequence,
             timestamp_ms: self.timestamp_ms,
             session_id: self.session_id,
             provenance: self.provenance,
             kind,
-        })
+        };
+        if let SessionEventKind::ExternalHarnessOperation { operation } = &event.kind {
+            operation
+                .validate()
+                .map_err(|_| PersistedSessionEventError::InvalidExternalBackendRecord)?;
+            if operation.owner.session_id != event.session_id {
+                return Err(PersistedSessionEventError::InvalidExternalBackendRecord);
+            }
+        }
+        bcode_session_models::ExternalBackendEnvelope::from_event(&event)
+            .map_err(|_| PersistedSessionEventError::InvalidExternalBackendRecord)?;
+        Ok(event)
     }
 }
 
@@ -935,6 +949,36 @@ enum PersistedSessionEventKind {
     TurnContinuationCommitted {
         operation: Box<bcode_session_models::TurnContinuationOperation>,
     },
+    ExternalHarnessOperation {
+        operation: Box<bcode_session_models::ExternalHarnessOperation>,
+    },
+    /// Durable verified association with a managed native session, not diagnostic trace.
+    ExternalBackendBound {
+        version: u16,
+        instance: Box<bcode_harness_models::HarnessInstance>,
+        binding: Box<bcode_harness_models::HarnessSessionBinding>,
+    },
+    /// Retained managed input admission; does not itself deliver native input.
+    ExternalSubmissionAccepted {
+        version: u16,
+        submission: Box<bcode_harness_models::HarnessSubmission>,
+    },
+    /// Correlated native delivery/execution/settlement evidence; never replay authority.
+    ExternalDeliveryObserved {
+        version: u16,
+        receipt: Box<bcode_harness_models::HarnessReceipt>,
+    },
+    /// Normalized semantic native output. Observed tools never dispatch Bcode tools.
+    ExternalObservationRecorded {
+        version: u16,
+        observation: Box<bcode_harness_models::HarnessObservation>,
+    },
+    /// Canonical resolution of an exact previously observed interaction.
+    ExternalInteractionResponded {
+        version: u16,
+        interaction: Box<bcode_harness_models::HarnessInteraction>,
+        response: Box<bcode_harness_models::HarnessResponse>,
+    },
 }
 
 impl From<&SessionEventKind> for PersistedSessionEventKind {
@@ -951,6 +995,50 @@ impl From<&SessionEventKind> for PersistedSessionEventKind {
                     operation: operation.clone(),
                 }
             }
+            SessionEventKind::ExternalHarnessOperation { operation } => {
+                Self::ExternalHarnessOperation {
+                    operation: operation.clone(),
+                }
+            }
+            SessionEventKind::ExternalBackendBound {
+                version,
+                instance,
+                binding,
+            } => Self::ExternalBackendBound {
+                version: *version,
+                instance: instance.clone(),
+                binding: binding.clone(),
+            },
+            SessionEventKind::ExternalSubmissionAccepted {
+                version,
+                submission,
+            } => Self::ExternalSubmissionAccepted {
+                version: *version,
+                submission: submission.clone(),
+            },
+            SessionEventKind::ExternalDeliveryObserved { version, receipt } => {
+                Self::ExternalDeliveryObserved {
+                    version: *version,
+                    receipt: receipt.clone(),
+                }
+            }
+            SessionEventKind::ExternalObservationRecorded {
+                version,
+                observation,
+            } => Self::ExternalObservationRecorded {
+                version: *version,
+                observation: observation.clone(),
+            },
+            SessionEventKind::ExternalInteractionResponded {
+                version,
+                interaction,
+                response,
+            } => Self::ExternalInteractionResponded {
+                version: *version,
+                interaction: interaction.clone(),
+                response: response.clone(),
+            },
+
             SessionEventKind::MilestoneEvaluationRequested { request } => {
                 Self::MilestoneEvaluationRequested {
                     request: request.clone(),
@@ -1474,6 +1562,45 @@ impl PersistedSessionEventKind {
             Self::DurableInteractionCommitted { operation } => {
                 SessionEventKind::DurableInteractionCommitted { operation }
             }
+            Self::ExternalHarnessOperation { operation } => {
+                SessionEventKind::ExternalHarnessOperation { operation }
+            }
+            Self::ExternalBackendBound {
+                version,
+                instance,
+                binding,
+            } => SessionEventKind::ExternalBackendBound {
+                version,
+                instance,
+                binding,
+            },
+            Self::ExternalSubmissionAccepted {
+                version,
+                submission,
+            } => SessionEventKind::ExternalSubmissionAccepted {
+                version,
+                submission,
+            },
+            Self::ExternalDeliveryObserved { version, receipt } => {
+                SessionEventKind::ExternalDeliveryObserved { version, receipt }
+            }
+            Self::ExternalObservationRecorded {
+                version,
+                observation,
+            } => SessionEventKind::ExternalObservationRecorded {
+                version,
+                observation,
+            },
+            Self::ExternalInteractionResponded {
+                version,
+                interaction,
+                response,
+            } => SessionEventKind::ExternalInteractionResponded {
+                version,
+                interaction,
+                response,
+            },
+
             Self::SessionChildrenReconciled { verified_children } => {
                 SessionEventKind::SessionChildrenReconciled { verified_children }
             }

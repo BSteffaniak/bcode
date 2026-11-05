@@ -5,6 +5,7 @@
 //! Programmatic client API for Bcode.
 
 mod generation;
+pub mod harness;
 mod session_observation;
 /// Public local HTTP/SSE X-ray observation client.
 pub mod xray;

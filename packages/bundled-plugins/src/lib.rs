@@ -253,6 +253,12 @@ pub fn static_bundled_plugins() -> Vec<bcode_plugin::StaticBundledPlugin> {
 }
 
 fn append_static_bundled_plugins(plugins: &mut Vec<bcode_plugin::StaticBundledPlugin>) {
+    #[cfg(feature = "static-bundled-claude-code-plugin")]
+    plugins.push(claude_code_plugin());
+    #[cfg(feature = "static-bundled-codex-harness-plugin")]
+    plugins.push(codex_harness_plugin());
+    #[cfg(feature = "static-bundled-harness-plugin")]
+    plugins.push(harness_plugin());
     plugins.reserve(0);
     #[cfg(feature = "static-bundled-bedrock-provider-plugin")]
     plugins.push(bedrock_provider_plugin());
@@ -343,6 +349,30 @@ fn append_static_bundled_plugins(plugins: &mut Vec<bcode_plugin::StaticBundledPl
     plugins.push(worktree_plugin());
     #[cfg(feature = "static-bundled-workflow-plugin")]
     plugins.push(workflow_plugin());
+}
+
+#[cfg(feature = "static-bundled-claude-code-plugin")]
+fn claude_code_plugin() -> bcode_plugin::StaticBundledPlugin {
+    bcode_plugin::StaticBundledPlugin::new(
+        include_str!("../../../plugins/claude-code-plugin/bcode-plugin.toml"),
+        bcode_claude_code_plugin::static_plugin(),
+    )
+}
+
+#[cfg(feature = "static-bundled-codex-harness-plugin")]
+fn codex_harness_plugin() -> bcode_plugin::StaticBundledPlugin {
+    bcode_plugin::StaticBundledPlugin::new(
+        include_str!("../../../plugins/codex-harness-plugin/bcode-plugin.toml"),
+        bcode_codex_harness_plugin::static_plugin(),
+    )
+}
+
+#[cfg(feature = "static-bundled-harness-plugin")]
+fn harness_plugin() -> bcode_plugin::StaticBundledPlugin {
+    bcode_plugin::StaticBundledPlugin::new(
+        include_str!("../../../plugins/harness-plugin/bcode-plugin.toml"),
+        bcode_harness_plugin::static_plugin(),
+    )
 }
 
 #[cfg(feature = "static-bundled-bedrock-provider-plugin")]
@@ -1179,6 +1209,45 @@ mod tests {
             bcode_config::plugin_selection_with_default_plugin_ids(&all_config, &default_ids);
         assert!(all_selection.is_enabled("bcode.tantivy-session-search"));
         assert!(!all_selection.is_enabled("bcode.compressed-session-search"));
+    }
+
+    #[cfg(all(
+        feature = "static-bundled-claude-code-plugin",
+        feature = "static-bundled-codex-harness-plugin",
+        feature = "static-bundled-harness-plugin"
+    ))]
+    #[test]
+    fn managed_harness_distribution_defaults_remain_individually_disableable() {
+        let plugins = super::static_bundled_plugins();
+        let defaults = bcode_plugin::static_bundled_default_plugin_ids(&plugins)
+            .expect("bundled manifests parse");
+        let ids = ["bcode.claude-code", "bcode.codex-harness", "bcode.harness"];
+        let selection = bcode_config::plugin_selection_with_default_plugin_ids(
+            &bcode_config::BcodeConfig::default(),
+            &defaults,
+        );
+        for id in ids {
+            assert!(selection.is_enabled(id));
+            let config = bcode_config::BcodeConfig {
+                plugins: bcode_config::PluginConfig {
+                    disabled: std::collections::BTreeSet::from([id.to_owned()]),
+                    ..bcode_config::PluginConfig::default()
+                },
+                ..bcode_config::BcodeConfig::default()
+            };
+            let selection =
+                bcode_config::plugin_selection_with_default_plugin_ids(&config, &defaults);
+            let selected = bcode_plugin::filter_selected_static_plugins(&plugins, &selection)
+                .expect("bundle selection succeeds");
+            let selected_ids = selected
+                .iter()
+                .map(|(manifest, _)| manifest.id.as_str())
+                .collect::<Vec<_>>();
+            assert!(!selected_ids.contains(&id));
+            for other in ids.into_iter().filter(|other| *other != id) {
+                assert!(selected_ids.contains(&other));
+            }
+        }
     }
 
     #[cfg(feature = "static-bundled-vim-edit-plugin")]

@@ -1,0 +1,1989 @@
+//! Central managed-session dispatch.
+//!
+//! All entry points retain authenticated caller context.
+//! Canonical mutation storage/admission is injected together; absence is a hard failure,
+//! never an in-memory substitute or a direct native-service fallback.
+use crate::harness::{
+    HarnessOwner, HarnessPluginTransport, ManagedHarnessError, ManagedHarnessRuntime,
+    ManagedHarnessStore,
+};
+use bcode_harness_models::{HarnessRequestKind, HarnessServiceResponse};
+use bcode_ipc::harness::{
+    MANAGED_SESSION_INTERFACE_ID, MANAGED_SESSION_VERSION, ManagedSessionCall,
+    ManagedSessionOperation,
+};
+use bcode_ipc::{ErrorResponse, ManagedSessionRequest, ManagedSessionResponse};
+use bcode_session_models::{ClientId, SessionId};
+use std::{future::Future, pin::Pin, sync::Arc};
+
+/// Sendable application operation tied to the caller/admission borrow.
+pub type ManagedSessionTask<'a, T> =
+    Pin<Box<dyn Future<Output = Result<T, ManagedHarnessError>> + Send + 'a>>;
+type Task<'a, T> = ManagedSessionTask<'a, T>;
+
+/// Identity retained by the daemon bridge, never decoded from a plugin payload.
+#[derive(Debug, Clone)]
+pub enum ManagedCaller {
+    /// Authenticated IPC connection.
+    Client(ClientId),
+    /// Tool/command/workflow invocation with its exact host-authorized session.
+    Invocation {
+        session_id: SessionId,
+        plugin_id: String,
+        invocation_id: String,
+    },
+    /// Workflow-owned application call; exact grant is checked against the retained
+    /// dispatch receipt and current workflow authority, not inferred from session parentage.
+    Workflow {
+        run_id: String,
+        dispatch_identity: String,
+        session_id: SessionId,
+        plugin_id: String,
+    },
+}
+
+/// A current canonical lease retained through native auth dispatch and response handling.
+/// Admission must supply its real ownership guard, not a process-local lock.
+pub struct ManagedAuthAdmission {
+    /// Host-verified auth namespace, waiter, custody and method.
+    pub scope: crate::harness_auth::VerifiedHarnessAuthScope,
+    /// Exact enabled plugin/executable/config binding.
+    pub instance: bcode_harness_models::HarnessInstance,
+    /// Canonical ownership guard retained until this operation finishes.
+    pub ownership_hold: Box<dyn Send + Sync>,
+    /// Positive host evidence that this credential namespace has no unresolved native login
+    /// from an earlier daemon. Ready/login-required status alone is not inactivity proof.
+    pub fresh_begin_authorized: bool,
+}
+
+/// Canonical admission paired with the runtime store.
+///
+/// Implementations must verify active authorization, workspace and exact plugin/config
+/// selection on every call. Live delivery additionally requires the current durable lease;
+/// reading exact retained outcomes never transfers that lease.
+/// Parent or assistance hints are never execution/response/interrupt authority.
+pub trait ManagedSessionAdmission: Send + Sync {
+    /// Read exact retained mutation evidence after current caller, workspace, plugin/config,
+    /// parent and target-association authorization, but without acquiring a live owner.
+    /// Returns only a canonical response or explicit uncertainty; this grants no execution
+    /// authority. Conflicting request content and unverifiable canonical storage must fail.
+    /// `None` means normal live-owner admission is still required, never permission to replay.
+    fn retained_result<'a>(
+        &'a self,
+        caller: &'a ManagedCaller,
+        call: &'a ManagedSessionCall,
+    ) -> Task<'a, Option<HarnessServiceResponse>>;
+    /// Authorize an existing operation and resolve its current durable owner. The supplied
+    /// instance and any native binding must equal canonical state, not replace it.
+    fn existing<'a>(
+        &'a self,
+        caller: &'a ManagedCaller,
+        call: &'a ManagedSessionCall,
+    ) -> Task<'a, HarnessOwner>;
+    /// Create an ordinary canonical top-level/child session and durable pre-open claim.
+    /// Must compare the retained open ID before creating; never replay a lost native open.
+    fn create<'a>(
+        &'a self,
+        caller: &'a ManagedCaller,
+        call: &'a ManagedSessionCall,
+    ) -> Task<'a, HarnessOwner>;
+    /// Resolve current auth scope from canonical bindings, not a client profile or generation.
+    fn auth_scope<'a>(
+        &'a self,
+        caller: &'a ManagedCaller,
+        session_id: SessionId,
+        instance_id: &'a str,
+    ) -> Task<'a, ManagedAuthAdmission>;
+}
+
+/// Object-safe application adapter. Only typed managed operations cross this boundary.
+pub trait ManagedSessionBackend: Send + Sync {
+    /// Close only transports admitted by this daemon, preserving ambiguous delivery evidence.
+    fn shutdown(&self) -> Task<'_, ()>;
+    /// Dispatch through the canonical runtime, after caller admission.
+    fn execute<'a>(
+        &'a self,
+        caller: &'a ManagedCaller,
+        call: ManagedSessionCall,
+    ) -> Task<'a, HarnessServiceResponse>;
+    /// Resolve auth from the same admitted canonical runtime.
+    fn auth_scope<'a>(
+        &'a self,
+        caller: &'a ManagedCaller,
+        session_id: SessionId,
+        instance_id: &'a str,
+    ) -> Task<'a, ManagedAuthAdmission>;
+}
+
+impl std::fmt::Debug for dyn ManagedSessionBackend {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("ManagedSessionBackend { .. }")
+    }
+}
+
+struct DaemonTransport(std::sync::Weak<crate::ServerState>);
+impl crate::harness::ManagedHarnessTransport for DaemonTransport {
+    async fn invoke(
+        &self,
+        request: &bcode_harness_models::HarnessRequest,
+    ) -> Result<HarnessServiceResponse, ManagedHarnessError> {
+        let state = self.0.upgrade().ok_or(ManagedHarnessError::Unavailable)?;
+        HarnessPluginTransport::new(state).invoke(request).await
+    }
+}
+
+struct CanonicalBackend<S, A> {
+    state: std::sync::Weak<crate::ServerState>,
+    runtime: ManagedHarnessRuntime<S, DaemonTransport>,
+    admission: A,
+    owners: tokio::sync::Mutex<std::collections::BTreeMap<SessionId, HarnessOwner>>,
+}
+impl<S: ManagedHarnessStore, A: ManagedSessionAdmission> ManagedSessionBackend
+    for CanonicalBackend<S, A>
+{
+    fn shutdown(&self) -> Task<'_, ()> {
+        Box::pin(async move {
+            let owners = std::mem::take(&mut *self.owners.lock().await);
+            let closes = owners.into_values().map(|owner| async move {
+                self.runtime
+                    .close(&owner, format!("shutdown:{}", uuid::Uuid::new_v4()))
+                    .await
+            });
+            let results = tokio::time::timeout(
+                std::time::Duration::from_secs(10),
+                futures::future::join_all(closes),
+            )
+            .await
+            .map_err(|_| ManagedHarnessError::Uncertain)?;
+            for result in results {
+                result?;
+            }
+            Ok(())
+        })
+    }
+
+    fn execute<'a>(
+        &'a self,
+        caller: &'a ManagedCaller,
+        call: ManagedSessionCall,
+    ) -> Task<'a, HarnessServiceResponse> {
+        Box::pin(async move {
+            call.harness
+                .validate()
+                .map_err(|_| ManagedHarnessError::Invalid)?;
+            let supplied_target = match &call.harness.kind {
+                HarnessRequestKind::Submit { target, .. }
+                | HarnessRequestKind::Respond { target, .. } => Some(target),
+                HarnessRequestKind::Observe(value) => Some(&value.target),
+                HarnessRequestKind::Interrupt(value) | HarnessRequestKind::Close(value) => {
+                    Some(&value.target)
+                }
+                _ => None,
+            };
+            let state = self
+                .state
+                .upgrade()
+                .ok_or(ManagedHarnessError::Unavailable)?;
+            let workflow_hold = if let ManagedCaller::Workflow {
+                run_id,
+                dispatch_identity,
+                session_id,
+                plugin_id,
+            } = caller
+            {
+                Some(
+                    crate::harness_workflow::authorize_call(
+                        &state,
+                        run_id,
+                        dispatch_identity,
+                        *session_id,
+                        plugin_id,
+                        &call,
+                    )
+                    .await
+                    .map_err(|_| ManagedHarnessError::StaleOwner)?,
+                )
+            } else {
+                None
+            };
+            // Retained mutation evidence is an authorized canonical read, not an owner
+            // transfer. Keep workflow authority pinned, but do not require this daemon's
+            // live native lease merely to return an identical historical outcome.
+            if matches!(
+                &call.harness.kind,
+                HarnessRequestKind::Open(_)
+                    | HarnessRequestKind::Submit { .. }
+                    | HarnessRequestKind::Respond { .. }
+                    | HarnessRequestKind::Interrupt(_)
+                    | HarnessRequestKind::Close(_)
+                    | HarnessRequestKind::Reconcile(_)
+            ) && let Some(response) = self.admission.retained_result(caller, &call).await?
+            {
+                response
+                    .validate_for(&call.harness)
+                    .map_err(|_| ManagedHarnessError::Storage)?;
+                return Ok(response);
+            }
+            let owner = if matches!(&call.harness.kind, HarnessRequestKind::Open(value) if value.resume.is_none())
+            {
+                self.admission.create(caller, &call).await?
+            } else {
+                self.admission.existing(caller, &call).await?
+            };
+            if let Some(target) = supplied_target {
+                target
+                    .validate_owner(&owner.session_id.to_string(), owner.generation)
+                    .map_err(|_| ManagedHarnessError::StaleOwner)?;
+            }
+            {
+                let mut owners = self.owners.lock().await;
+                if state
+                    .shutdown_requested
+                    .load(std::sync::atomic::Ordering::SeqCst)
+                {
+                    return Err(ManagedHarnessError::Unavailable);
+                }
+                owners.insert(owner.session_id, owner.clone());
+            }
+            let result = Box::pin(self.execute_admitted(&state, caller, &owner, call)).await;
+            drop(workflow_hold);
+            drop(state);
+            result
+        })
+    }
+    fn auth_scope<'a>(
+        &'a self,
+        caller: &'a ManagedCaller,
+        session_id: SessionId,
+        instance_id: &'a str,
+    ) -> Task<'a, ManagedAuthAdmission> {
+        self.admission.auth_scope(caller, session_id, instance_id)
+    }
+}
+
+impl<S: ManagedHarnessStore, A: ManagedSessionAdmission> CanonicalBackend<S, A> {
+    async fn inspect_admitted(
+        &self,
+        application: Option<&crate::harness::ManagedHarnessApplication<'_, S, DaemonTransport>>,
+        owner: &HarnessOwner,
+        request_id: String,
+    ) -> Result<HarnessServiceResponse, ManagedHarnessError> {
+        let value = if let Some(app) = application {
+            app.inspect(owner.session_id, request_id.clone()).await?
+        } else {
+            self.runtime.inspect(owner, request_id.clone()).await?
+        };
+        Ok(HarnessServiceResponse {
+            schema_version: bcode_harness_models::HARNESS_SCHEMA_VERSION,
+            request_id,
+            operation: bcode_harness_models::HarnessOperation::Inspect,
+            kind: bcode_harness_models::HarnessServiceResponseKind::Inspection(value),
+        })
+    }
+
+    async fn observe_admitted(
+        &self,
+        application: Option<&crate::harness::ManagedHarnessApplication<'_, S, DaemonTransport>>,
+        owner: &HarnessOwner,
+        request_id: String,
+        value: bcode_harness_models::HarnessObserveRequest,
+    ) -> Result<HarnessServiceResponse, ManagedHarnessError> {
+        let value = if let Some(app) = application {
+            app.observe(
+                owner.session_id,
+                request_id.clone(),
+                value.after,
+                value.limit,
+                value.wait_millis,
+            )
+            .await?
+        } else {
+            self.runtime
+                .observe(
+                    owner,
+                    request_id.clone(),
+                    value.after,
+                    value.limit,
+                    value.wait_millis,
+                )
+                .await?
+        };
+        Ok(HarnessServiceResponse {
+            schema_version: bcode_harness_models::HARNESS_SCHEMA_VERSION,
+            request_id,
+            operation: bcode_harness_models::HarnessOperation::Observe,
+            kind: bcode_harness_models::HarnessServiceResponseKind::Observations(value),
+        })
+    }
+
+    async fn execute_admitted(
+        &self,
+        state: &Arc<crate::ServerState>,
+        caller: &ManagedCaller,
+        owner: &HarnessOwner,
+        call: ManagedSessionCall,
+    ) -> Result<HarnessServiceResponse, ManagedHarnessError> {
+        let check = |session: &str, generation: u64| {
+            if session == owner.session_id.to_string() && generation == owner.generation {
+                Ok(())
+            } else {
+                Err(ManagedHarnessError::StaleOwner)
+            }
+        };
+        let application =
+            match caller {
+                ManagedCaller::Client(client) => Some(
+                    crate::harness::ManagedHarnessApplication::new(state, *client, &self.runtime),
+                ),
+                ManagedCaller::Invocation { .. } | ManagedCaller::Workflow { .. } => None,
+            };
+        let request_id = call.harness.request_id;
+        let result = match call.harness.kind {
+            HarnessRequestKind::Inspect => {
+                self.inspect_admitted(application.as_ref(), owner, request_id)
+                    .await
+            }
+            HarnessRequestKind::Open(value) => {
+                check(&value.session_id, value.generation)?;
+                if let Some(app) = &application {
+                    app.open(owner, value).await
+                } else {
+                    self.runtime.open(owner, value).await
+                }
+            }
+            HarnessRequestKind::Submit { submission, .. } => {
+                check(&submission.session_id, submission.generation)?;
+                if let Some(app) = &application {
+                    app.submit(owner.session_id, submission).await
+                } else {
+                    self.runtime.submit(owner, submission).await
+                }
+            }
+            HarnessRequestKind::Respond { response, .. } => {
+                check(&response.session_id, response.generation)?;
+                if let Some(app) = &application {
+                    app.respond(owner.session_id, response).await
+                } else {
+                    self.runtime.respond(owner, response).await
+                }
+            }
+            HarnessRequestKind::Observe(value) => {
+                check(value.target.session_id(), value.target.generation())?;
+                self.observe_admitted(application.as_ref(), owner, request_id, value)
+                    .await
+            }
+            HarnessRequestKind::Interrupt(value) => {
+                check(value.target.session_id(), value.target.generation())?;
+                if let Some(app) = &application {
+                    app.cancel(owner.session_id, value.mutation_id).await
+                } else {
+                    self.runtime.cancel(owner, value.mutation_id).await
+                }
+            }
+            HarnessRequestKind::Close(value) => {
+                check(value.target.session_id(), value.target.generation())?;
+                if let Some(app) = &application {
+                    app.close(owner.session_id, value.mutation_id).await
+                } else {
+                    self.runtime.close(owner, value.mutation_id).await
+                }
+            }
+            HarnessRequestKind::Reconcile(value) => {
+                check(&value.session_id, value.generation)?;
+                if let Some(app) = &application {
+                    app.reconcile(owner.session_id, request_id, value).await
+                } else {
+                    self.runtime.reconcile(owner, request_id, value).await
+                }
+            }
+            // Native auth envelopes are never accepted from ordinary/model callers.
+            HarnessRequestKind::AuthStatus { .. }
+            | HarnessRequestKind::AuthBegin(_)
+            | HarnessRequestKind::AuthContinue(_)
+            | HarnessRequestKind::AuthCancel(_) => Err(ManagedHarnessError::Invalid),
+        };
+        drop(application);
+        result
+    }
+}
+
+impl crate::ServerState {
+    /// Install canonical persistence and admission atomically for this daemon. There is no
+    /// default/fake store. Must run during startup before admitting managed operations.
+    /// # Errors
+    /// Rejects replacing the runtime after installation.
+    pub fn install_managed_sessions<
+        S: ManagedHarnessStore + 'static,
+        A: ManagedSessionAdmission + 'static,
+    >(
+        self: &Arc<Self>,
+        store: S,
+        admission: A,
+    ) -> Result<(), ManagedHarnessError> {
+        if self
+            .shutdown_requested
+            .load(std::sync::atomic::Ordering::SeqCst)
+        {
+            return Err(ManagedHarnessError::Unavailable);
+        }
+        let backend = CanonicalBackend {
+            state: Arc::downgrade(self),
+            runtime: ManagedHarnessRuntime::new(store, DaemonTransport(Arc::downgrade(self))),
+            admission,
+            owners: tokio::sync::Mutex::new(std::collections::BTreeMap::new()),
+        };
+        self.managed_sessions
+            .set(Arc::new(backend))
+            .map_err(|_| ManagedHarnessError::Conflict)
+    }
+}
+
+fn failure(error: ManagedHarnessError) -> ErrorResponse {
+    let code = match error {
+        ManagedHarnessError::Invalid => "managed_session_invalid",
+        ManagedHarnessError::Storage => "managed_session_storage_unavailable",
+        ManagedHarnessError::StaleOwner => "managed_session_stale_owner",
+        ManagedHarnessError::Conflict => "managed_session_conflict",
+        ManagedHarnessError::Uncertain => "managed_session_uncertain",
+        ManagedHarnessError::Unavailable => "managed_session_unavailable",
+        ManagedHarnessError::Deadline => "managed_session_deadline",
+        ManagedHarnessError::Unsupported => "managed_session_unsupported",
+    };
+    ErrorResponse::new(code, error.to_string())
+}
+
+async fn dispatch_binding(
+    state: &Arc<crate::ServerState>,
+    caller: ManagedCaller,
+    request: &ManagedSessionRequest,
+) -> Result<ManagedSessionResponse, ErrorResponse> {
+    #[derive(serde::Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct Query {
+        session_id: SessionId,
+    }
+    let query: Query = serde_json::from_str(&request.request_json)
+        .map_err(|_| failure(ManagedHarnessError::Invalid))?;
+    let ManagedCaller::Client(client) = caller else {
+        return Err(failure(ManagedHarnessError::Unsupported));
+    };
+    crate::session_operations::require_selected_location(state, query.session_id)
+        .await
+        .map_err(|_| failure(ManagedHarnessError::StaleOwner))?;
+    if state
+        .active_session_namespace_mismatch(query.session_id, client)
+        .await
+        .is_some()
+    {
+        return Err(failure(ManagedHarnessError::StaleOwner));
+    }
+    let canonical = state
+        .sessions
+        .session_external_harness_state(query.session_id)
+        .await
+        .map_err(|_| failure(ManagedHarnessError::Storage))?;
+    if let Some(value) = &canonical {
+        if value.owner.session_id != query.session_id {
+            return Err(failure(ManagedHarnessError::StaleOwner));
+        }
+        if let Some(target) = &value.target {
+            target
+                .validate_owner(&query.session_id.to_string(), value.owner.generation)
+                .map_err(|_| failure(ManagedHarnessError::Storage))?;
+        }
+    }
+    let snapshot = canonical.and_then(|value| {
+        value
+            .target
+            .map(|target| bcode_ipc::harness::ManagedSessionTargetSnapshot {
+                session_id: value.owner.session_id,
+                instance: value.instance,
+                target,
+            })
+    });
+    if let Some(value) = &snapshot {
+        value
+            .validate()
+            .map_err(|_| failure(ManagedHarnessError::Storage))?;
+        if value.session_id != query.session_id {
+            return Err(failure(ManagedHarnessError::StaleOwner));
+        }
+    }
+    auth_response(&snapshot)
+}
+
+pub(crate) async fn dispatch(
+    state: &Arc<crate::ServerState>,
+    caller: ManagedCaller,
+    request: ManagedSessionRequest,
+) -> Result<ManagedSessionResponse, ErrorResponse> {
+    request
+        .validate_envelope()
+        .map_err(|message| ErrorResponse::new("managed_session_invalid", message))?;
+    if state
+        .shutdown_requested
+        .load(std::sync::atomic::Ordering::SeqCst)
+    {
+        return Err(failure(ManagedHarnessError::Unavailable));
+    }
+    if request.operation.is_auth() {
+        if request.operation == ManagedSessionOperation::AuthPrepare {
+            return prepare_client_terminal(state, caller, request).await;
+        }
+        if matches!(
+            request.operation,
+            ManagedSessionOperation::AuthHandoff | ManagedSessionOperation::AuthReaped
+        ) {
+            return prepare_handoff(state, caller, request).await;
+        }
+        if matches!(
+            request.operation,
+            ManagedSessionOperation::AuthContinue
+                | ManagedSessionOperation::AuthStatus
+                | ManagedSessionOperation::AuthAcknowledge
+        ) && serde_json::from_str::<bcode_ipc::harness::ManagedSessionHandoffRequest>(
+            &request.request_json,
+        )
+        .is_ok()
+        {
+            return prepare_handoff(state, caller, request).await;
+        }
+        return dispatch_auth(state, caller, request).await;
+    }
+    if request.operation == ManagedSessionOperation::Binding {
+        return dispatch_binding(state, caller, &request).await;
+    }
+    let json = if request.operation == ManagedSessionOperation::History {
+        let query = request
+            .decode_history()
+            .map_err(|message| ErrorResponse::new("managed_session_invalid", message))?;
+        match caller {
+            ManagedCaller::Client(client) => {
+                crate::session_operations::require_selected_location(state, query.session_id)
+                    .await
+                    .map_err(|_| failure(ManagedHarnessError::StaleOwner))?;
+                if state
+                    .active_session_namespace_mismatch(query.session_id, client)
+                    .await
+                    .is_some()
+                {
+                    return Err(failure(ManagedHarnessError::StaleOwner));
+                }
+            }
+            ManagedCaller::Invocation { session_id, .. } if session_id == query.session_id => {}
+            ManagedCaller::Invocation { .. } | ManagedCaller::Workflow { .. } => {
+                return Err(failure(ManagedHarnessError::StaleOwner));
+            }
+        }
+        let page =
+            crate::harness::canonical_history(state, query.session_id, query.after, query.limit)
+                .await
+                .map_err(failure)?;
+        serde_json::to_string(&page)
+    } else {
+        let call = request
+            .decode_call()
+            .map_err(|message| ErrorResponse::new("managed_session_invalid", message))?;
+        let backend = state.managed_sessions.get().ok_or_else(|| {
+            ErrorResponse::new(
+                "managed_session_storage_unavailable",
+                "canonical managed-session admission/store bridge is not installed",
+            )
+        })?;
+        let response = backend.execute(&caller, call).await.map_err(failure)?;
+        serde_json::to_string(&response)
+    }
+    .map_err(|_| failure(ManagedHarnessError::Invalid))?;
+    if json.len() > bcode_harness_models::MAX_HARNESS_WIRE_BYTES {
+        return Err(failure(ManagedHarnessError::Invalid));
+    }
+    Ok(ManagedSessionResponse {
+        schema_version: MANAGED_SESSION_VERSION,
+        response_json: json,
+    })
+}
+
+/// Compatibility adapter for existing public service clients. This reserves the application
+/// interface in the host; it must never resolve a vendor plugin through service discovery.
+pub(crate) async fn service(
+    state: &Arc<crate::ServerState>,
+    client_id: ClientId,
+    operation: String,
+    payload: Vec<u8>,
+) -> Result<bcode_ipc::PluginServiceResponse, ErrorResponse> {
+    if payload.len() > bcode_harness_models::MAX_HARNESS_WIRE_BYTES {
+        return Err(failure(ManagedHarnessError::Invalid));
+    }
+    let request: ManagedSessionRequest =
+        serde_json::from_slice(&payload).map_err(|_| failure(ManagedHarnessError::Invalid))?;
+    if request.operation.as_str() != operation {
+        return Err(failure(ManagedHarnessError::Invalid));
+    }
+    if matches!(
+        request.operation,
+        ManagedSessionOperation::AuthPrepare
+            | ManagedSessionOperation::AuthHandoff
+            | ManagedSessionOperation::AuthReaped
+    ) {
+        return Err(ErrorResponse::new(
+            "managed_session_sensitive_transport_required",
+            "client terminal lifecycle requires typed managed-session IPC",
+        ));
+    }
+    if request.operation == ManagedSessionOperation::AuthStatus {
+        let auth: bcode_ipc::harness::ManagedSessionAuthRequest =
+            serde_json::from_str(&request.request_json)
+                .map_err(|_| failure(ManagedHarnessError::Invalid))?;
+        if auth.sensitive_interaction {
+            return Err(ErrorResponse::new(
+                "managed_session_sensitive_transport_required",
+                "sensitive auth interactions require typed managed-session IPC",
+            ));
+        }
+    }
+    let mut response = dispatch(state, ManagedCaller::Client(client_id), request).await?;
+    Ok(bcode_ipc::PluginServiceResponse {
+        payload: std::mem::take(&mut response.response_json).into_bytes(),
+        error: None,
+    })
+}
+
+/// Resolve workflow caller identity from the retained dispatch link, never its parent
+/// session or request JSON. The backend subsequently holds `authorize_call`'s verified
+/// authority guard across canonical admission and native delivery.
+pub(crate) async fn workflow_invocation(
+    state: &crate::ServerState,
+    run_id: &str,
+    dispatch_identity: &str,
+    plugin_id: &str,
+    request: bcode_tool::ToolInvocationServiceRequest,
+) -> bcode_tool::ToolInvocationServiceResolution {
+    use bcode_tool::ToolInvocationServiceResolution as R;
+    if request.invocation_id != dispatch_identity {
+        return R::Failed {
+            code: "invocation_id_mismatch".into(),
+            message: "managed operation does not belong to this workflow dispatch".into(),
+        };
+    }
+    let session = async {
+        let stored = crate::workflow_representation::owner::execution_receipt(
+            state,
+            run_id,
+            dispatch_identity,
+        )
+        .await
+        .ok()??;
+        let link = crate::workflow_representation::owner::execution_session_link(
+            state,
+            run_id,
+            &stored.node_id,
+            &stored.activation_id,
+            stored.attempt,
+        )
+        .await
+        .ok()??;
+        link.session_id.parse::<SessionId>().ok()
+    }
+    .await;
+    let Some(session_id) = session else {
+        return R::Failed {
+            code: "managed_session_scope_mismatch".into(),
+            message: "managed workflow requires its canonical dispatch receipt and session link"
+                .into(),
+        };
+    };
+    invocation(
+        state,
+        ManagedCaller::Workflow {
+            run_id: run_id.into(),
+            dispatch_identity: dispatch_identity.into(),
+            session_id,
+            plugin_id: plugin_id.into(),
+        },
+        request,
+    )
+    .await
+}
+
+fn invocation_operation(operation: &str, workflow: bool) -> Option<ManagedSessionOperation> {
+    Some(match operation {
+        "start" => ManagedSessionOperation::Start,
+        "inspect" => ManagedSessionOperation::Inspect,
+        "followup" => ManagedSessionOperation::Followup,
+        "respond" => ManagedSessionOperation::Respond,
+        "interrupt" => ManagedSessionOperation::Interrupt,
+        "observe" if workflow => ManagedSessionOperation::Observe,
+        "reconcile" if workflow => ManagedSessionOperation::Reconcile,
+        _ => return None,
+    })
+}
+
+pub(crate) async fn invocation(
+    state: &crate::ServerState,
+    caller: ManagedCaller,
+    request: bcode_tool::ToolInvocationServiceRequest,
+) -> bcode_tool::ToolInvocationServiceResolution {
+    use bcode_tool::ToolInvocationServiceResolution as R;
+    if request.interface_id != MANAGED_SESSION_INTERFACE_ID {
+        return R::Unsupported;
+    }
+    let (session_id, plugin_id, invocation_id) = match &caller {
+        ManagedCaller::Invocation {
+            session_id,
+            plugin_id,
+            invocation_id,
+        } => (session_id, plugin_id, invocation_id),
+        ManagedCaller::Workflow {
+            session_id,
+            plugin_id,
+            dispatch_identity,
+            ..
+        } => (session_id, plugin_id, dispatch_identity),
+        ManagedCaller::Client(_) => return R::Unsupported,
+    };
+    if &request.invocation_id != invocation_id {
+        return R::Failed {
+            code: "invocation_id_mismatch".into(),
+            message: "managed operation does not belong to this invocation".into(),
+        };
+    }
+    if plugin_id.is_empty()
+        || !state.plugins.registry().manifests().contains_key(plugin_id)
+        || request
+            .route_id
+            .as_deref()
+            .is_some_and(|route| route != MANAGED_SESSION_INTERFACE_ID)
+        || crate::session_operations::require_selected_location(state, *session_id)
+            .await
+            .is_err()
+    {
+        return R::Failed {
+            code: "managed_session_scope_mismatch".into(),
+            message: "managed session requires the current authenticated plugin/session scope"
+                .into(),
+        };
+    }
+    let Some(operation) = invocation_operation(
+        &request.operation,
+        matches!(&caller, ManagedCaller::Workflow { .. }),
+    ) else {
+        return R::Unsupported;
+    };
+    let Ok(request_json) = serde_json::to_string(&request.payload) else {
+        return R::Unsupported;
+    };
+    let envelope = ManagedSessionRequest {
+        schema_version: MANAGED_SESSION_VERSION,
+        operation,
+        request_json,
+    };
+    let Ok(call) = envelope.decode_call() else {
+        return R::Failed {
+            code: "managed_session_invalid".into(),
+            message: "invalid managed session contract".into(),
+        };
+    };
+    let Some(backend) = state.managed_sessions.get() else {
+        return R::Failed {
+            code: "managed_session_storage_unavailable".into(),
+            message: "canonical managed-session admission/store bridge is not installed".into(),
+        };
+    };
+    match backend.execute(&caller, call).await {
+        Ok(response) => match serde_json::to_value(response) {
+            Ok(payload)
+                if serde_json::to_vec(&payload).is_ok_and(|bytes| {
+                    bytes.len() <= bcode_harness_models::MAX_HARNESS_WIRE_BYTES
+                }) =>
+            {
+                R::Responded { payload }
+            }
+            _ => R::Failed {
+                code: "managed_session_invalid".into(),
+                message: "invalid managed session response".into(),
+            },
+        },
+        Err(error) => {
+            let error = failure(error);
+            R::Failed {
+                code: error.code,
+                message: error.message,
+            }
+        }
+    }
+}
+
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct NativeHandoffReply {
+    schema_version: u16,
+    request_id: String,
+    handoff: bcode_ipc::harness::ManagedNativeLoginPlan,
+}
+
+async fn selected_handoff_plan(
+    state: &Arc<crate::ServerState>,
+    instance: &bcode_harness_models::HarnessInstance,
+    interface_id: &str,
+    namespace: &bcode_provider_auth_models::managed::AuthNamespace,
+) -> Result<bcode_ipc::harness::ManagedNativeLoginPlan, ErrorResponse> {
+    let declared = state
+        .plugins
+        .registry()
+        .manifests()
+        .get(&instance.plugin_id)
+        .is_some_and(|manifest| {
+            manifest
+                .services
+                .iter()
+                .any(|service| service.interface_id == interface_id)
+        });
+    if !declared {
+        return Err(failure(ManagedHarnessError::Unsupported));
+    }
+    // Only the selected enabled plugin can prepare this read-only extension. There is no
+    // daemon subprocess launch, arbitrary method forwarding, or inferred vendor argument list.
+    let request_id = format!("handoff:{}", uuid::Uuid::new_v4());
+    let payload = serde_json::to_vec(
+        &serde_json::json!({"schema_version":1,"request_id":request_id,"instance":instance}),
+    )
+    .map_err(|_| failure(ManagedHarnessError::Invalid))?;
+    let response = state
+        .plugins
+        .invoke_service_scoped_with_timeout(
+            &instance.plugin_id,
+            interface_id,
+            "prepare_login",
+            payload,
+            bcode_plugin::PluginInvocationScope::Global,
+            std::time::Duration::from_secs(30),
+        )
+        .await
+        .map_err(|_| failure(ManagedHarnessError::Unavailable))?;
+    if response.error.is_some()
+        || response.payload.len() > bcode_harness_models::MAX_HARNESS_WIRE_BYTES
+    {
+        return Err(failure(ManagedHarnessError::Invalid));
+    }
+    let reply: NativeHandoffReply = serde_json::from_slice(&response.payload)
+        .map_err(|_| failure(ManagedHarnessError::Invalid))?;
+    reply
+        .handoff
+        .validate()
+        .map_err(|_| failure(ManagedHarnessError::Invalid))?;
+    if reply.schema_version != 1
+        || reply.request_id != request_id
+        || reply.handoff.namespace != *namespace
+        || reply.handoff.executable != std::path::Path::new(&instance.executable)
+    {
+        return Err(failure(ManagedHarnessError::Conflict));
+    }
+    Ok(reply.handoff)
+}
+
+fn terminal_fence_path(
+    state: &crate::ServerState,
+    namespace: &bcode_provider_auth_models::managed::AuthNamespace,
+) -> Result<std::path::PathBuf, ErrorResponse> {
+    use sha2::{Digest as _, Sha256};
+    let bytes = serde_json::to_vec(namespace).map_err(|_| failure(ManagedHarnessError::Invalid))?;
+    let key = hex::encode(Sha256::digest(bytes));
+    Ok(state
+        .state_root
+        .join("managed-auth-terminal-claims")
+        .join(key))
+}
+
+fn require_unissued_terminal(
+    state: &crate::ServerState,
+    namespace: &bcode_provider_auth_models::managed::AuthNamespace,
+) -> Result<(), ErrorResponse> {
+    match std::fs::symlink_metadata(terminal_fence_path(state, namespace)?) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Ok(_) => Err(failure(ManagedHarnessError::Uncertain)),
+        Err(_) => Err(failure(ManagedHarnessError::Storage)),
+    }
+}
+
+fn issue_terminal_fence(
+    state: &crate::ServerState,
+    namespace: &bcode_provider_auth_models::managed::AuthNamespace,
+    claim: &bcode_provider_auth::managed::ClientTerminalClaim,
+) -> Result<(), ErrorResponse> {
+    use std::io::Write as _;
+    let path = terminal_fence_path(state, namespace)?;
+    let directory = path
+        .parent()
+        .ok_or_else(|| failure(ManagedHarnessError::Storage))?;
+    std::fs::create_dir_all(directory).map_err(|_| failure(ManagedHarnessError::Storage))?;
+    std::fs::File::open(&state.state_root)
+        .and_then(|file| file.sync_all())
+        .map_err(|_| failure(ManagedHarnessError::Storage))?;
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&path)
+        .map_err(|_| failure(ManagedHarnessError::Uncertain))?;
+    file.write_all(claim.claim_id.as_bytes())
+        .and_then(|()| file.sync_all())
+        .map_err(|_| failure(ManagedHarnessError::Storage))?;
+    std::fs::File::open(directory)
+        .and_then(|file| file.sync_all())
+        .map_err(|_| failure(ManagedHarnessError::Storage))?;
+    Ok(())
+}
+
+fn retire_terminal_fence(
+    state: &crate::ServerState,
+    namespace: &bcode_provider_auth_models::managed::AuthNamespace,
+    claim: &bcode_provider_auth::managed::ClientTerminalClaim,
+) -> Result<(), ErrorResponse> {
+    let path = terminal_fence_path(state, namespace)?;
+    let retained =
+        std::fs::read_to_string(&path).map_err(|_| failure(ManagedHarnessError::Storage))?;
+    if retained != claim.claim_id {
+        return Err(failure(ManagedHarnessError::Conflict));
+    }
+    std::fs::remove_file(&path).map_err(|_| failure(ManagedHarnessError::Storage))?;
+    std::fs::File::open(
+        path.parent()
+            .ok_or_else(|| failure(ManagedHarnessError::Storage))?,
+    )
+    .and_then(|file| file.sync_all())
+    .map_err(|_| failure(ManagedHarnessError::Storage))?;
+    Ok(())
+}
+
+async fn terminal_admission(
+    state: &Arc<crate::ServerState>,
+    caller: &ManagedCaller,
+    session_id: SessionId,
+    instance_id: &str,
+    interface_id: &str,
+) -> Result<
+    (
+        ManagedAuthAdmission,
+        crate::harness::HarnessAuthMethodEvidence,
+        bcode_ipc::harness::ManagedNativeLoginPlan,
+    ),
+    ErrorResponse,
+> {
+    if interface_id.is_empty() || interface_id.len() > 256 {
+        return Err(failure(ManagedHarnessError::Invalid));
+    }
+    let backend = state
+        .managed_sessions
+        .get()
+        .ok_or_else(|| failure(ManagedHarnessError::Storage))?;
+    let initial = backend
+        .auth_scope(caller, session_id, instance_id)
+        .await
+        .map_err(failure)?;
+    let plan = selected_handoff_plan(
+        state,
+        &initial.instance,
+        interface_id,
+        &initial.scope.namespace,
+    )
+    .await?;
+    // Plugin preparation awaits external I/O; reauthorize without recursively holding a lease.
+    let previous_instance = initial.instance.clone();
+    let previous_namespace = initial.scope.namespace.clone();
+    let previous_waiter = initial.scope.waiter.clone();
+    let previous_custody = initial.scope.custody;
+    drop(initial);
+    let mut current = backend
+        .auth_scope(caller, session_id, instance_id)
+        .await
+        .map_err(failure)?;
+    if previous_instance != current.instance
+        || previous_namespace != current.scope.namespace
+        || previous_waiter != current.scope.waiter
+        || previous_custody != current.scope.custody
+    {
+        return Err(failure(ManagedHarnessError::StaleOwner));
+    }
+    let method = serde_json::from_value(
+        serde_json::to_value(&plan.method).map_err(|_| failure(ManagedHarnessError::Invalid))?,
+    )
+    .map_err(|_| failure(ManagedHarnessError::Invalid))?;
+    crate::harness::CanonicalManagedAdmission::bind_client_terminal_preparation(
+        &mut current,
+        &method,
+    )
+    .map_err(failure)?;
+    Ok((current, method, plan))
+}
+
+async fn prepare_client_terminal(
+    state: &Arc<crate::ServerState>,
+    caller: ManagedCaller,
+    request: ManagedSessionRequest,
+) -> Result<ManagedSessionResponse, ErrorResponse> {
+    use bcode_provider_auth::managed::ManagedAuthCoordinator;
+    let ManagedCaller::Client(client) = &caller else {
+        return Err(failure(ManagedHarnessError::Unsupported));
+    };
+    let input: bcode_ipc::harness::ManagedSessionPrepareHandoffRequest =
+        serde_json::from_str(&request.request_json)
+            .map_err(|_| failure(ManagedHarnessError::Invalid))?;
+    let (admission, method, _plan) = terminal_admission(
+        state,
+        &caller,
+        input.session_id,
+        &input.instance_id,
+        &input.interface_id,
+    )
+    .await?;
+    require_unissued_terminal(state, &admission.scope.namespace)?;
+    let authority = AuthAuthority {
+        scope: crate::harness_auth::VerifiedHarnessAuthScope {
+            waiter: admission.scope.waiter.clone(),
+            namespace: admission.scope.namespace.clone(),
+            custody: admission.scope.custody,
+            method: admission.scope.method.clone(),
+        },
+        caller_id: client.to_string(),
+        instance_id: input.instance_id.clone(),
+    };
+    let auth = state
+        .managed_auth
+        .get_or_try_init(|| async {
+            ManagedAuthCoordinator::new(
+                state.daemon_status.instance_id.clone(),
+                64,
+                128,
+                std::time::Duration::from_secs(600),
+            )
+            .map(crate::harness_auth::HarnessAuthService::new)
+        })
+        .await
+        .map_err(|_| failure(ManagedHarnessError::Unavailable))?;
+    let joined = auth
+        .begin_client_terminal(
+            &authority,
+            &authority.caller_id,
+            &input.session_id.to_string(),
+            &input.instance_id,
+        )
+        .await
+        .map_err(|_| failure(ManagedHarnessError::Uncertain))?;
+    let Some(command) = joined.command else {
+        return auth_response(&joined.snapshot);
+    };
+    let ticket = command.ticket.clone();
+    let (outgoing, invocation) =
+        crate::harness::SensitiveHarnessAuthRequest::from_client_terminal_invocation(
+            command,
+            admission.instance.clone(),
+            &method,
+        )
+        .map_err(failure)?;
+    let response = crate::harness::HarnessPluginTransport::new(state.clone())
+        .invoke_sensitive_auth(&admission, outgoing)
+        .await;
+    let Ok(response) = response else {
+        let _ = auth.delivery_uncertain(&ticket).await;
+        return Err(failure(ManagedHarnessError::Uncertain));
+    };
+    let (snapshot, pending) = auth
+        .accept_harness_response(&admission.instance.plugin_id, &invocation, response)
+        .await
+        .map_err(|_| failure(ManagedHarnessError::Uncertain))?;
+    if let Some(command) = pending {
+        let _ = auth.delivery_uncertain(&command.ticket).await;
+        return Err(failure(ManagedHarnessError::Uncertain));
+    }
+    auth_response(&snapshot)
+}
+
+async fn acknowledge_terminal_reap(
+    state: &crate::ServerState,
+    auth: &crate::harness_auth::HarnessAuthService,
+    authority: &AuthAuthority,
+    input: &bcode_ipc::harness::ManagedSessionHandoffRequest,
+) -> Result<ManagedSessionResponse, ErrorResponse> {
+    auth.status(
+        authority,
+        &authority.caller_id,
+        &input.session_id.to_string(),
+        &input.instance_id,
+        &input.handle,
+    )
+    .await
+    .map_err(|_| failure(ManagedHarnessError::StaleOwner))?;
+    let claim = auth
+        .client_terminal_claim(&input.handle)
+        .await
+        .map_err(|_| failure(ManagedHarnessError::StaleOwner))?
+        .ok_or_else(|| failure(ManagedHarnessError::Conflict))?;
+    auth.client_terminal_reaped(&authority.caller_id, &claim)
+        .await
+        .map_err(|_| failure(ManagedHarnessError::StaleOwner))?;
+    retire_terminal_fence(state, &authority.scope.namespace, &claim)?;
+    auth_response(&serde_json::json!({"reaped": true}))
+}
+
+async fn issue_terminal_plan(
+    state: &crate::ServerState,
+    auth: &crate::harness_auth::HarnessAuthService,
+    authority: &AuthAuthority,
+    input: &bcode_ipc::harness::ManagedSessionHandoffRequest,
+    handoff: &bcode_ipc::harness::ManagedNativeLoginPlan,
+) -> Result<ManagedSessionResponse, ErrorResponse> {
+    let interaction = auth
+        .sensitive_interaction(
+            authority,
+            &authority.caller_id,
+            &input.session_id.to_string(),
+            &input.instance_id,
+            &input.handle,
+        )
+        .await
+        .map_err(|_| failure(ManagedHarnessError::StaleOwner))?;
+    if !matches!(interaction, Some((_, bcode_provider_auth_models::managed::SensitiveAuthInteraction::NativeHandoff { ref request_id })) if request_id == &input.interaction_id)
+    {
+        return Err(failure(ManagedHarnessError::Conflict));
+    }
+    let claim = auth
+        .claim_client_terminal(
+            authority,
+            &authority.caller_id,
+            &input.session_id.to_string(),
+            &input.instance_id,
+            crate::harness_auth::ClientTerminalClaimRequest {
+                handle: &input.handle,
+                interaction_id: &input.interaction_id,
+                claim_id: uuid::Uuid::new_v4().to_string(),
+            },
+        )
+        .await
+        .map_err(|_| failure(ManagedHarnessError::Uncertain))?;
+    issue_terminal_fence(state, &authority.scope.namespace, &claim)?;
+    // The client's explicit action launches this exact plan. Result is not credential readiness;
+    // client must continue the same live auth flow after native exit and let the plugin inspect.
+    auth_response(handoff)
+}
+
+async fn continue_terminal_auth(
+    state: &Arc<crate::ServerState>,
+    auth: &crate::harness_auth::HarnessAuthService,
+    authority: &AuthAuthority,
+    input: &bcode_ipc::harness::ManagedSessionHandoffRequest,
+    instance: bcode_harness_models::HarnessInstance,
+) -> Result<ManagedSessionResponse, ErrorResponse> {
+    let command = auth
+        .continue_flow(
+            authority,
+            &authority.caller_id,
+            &input.session_id.to_string(),
+            &input.instance_id,
+            &input.handle,
+            None,
+        )
+        .await
+        .map_err(|_| {
+            ErrorResponse::new(
+                "managed_session_continue_issue_uncertain",
+                "The retained auth flow cannot issue this continuation; reconcile without replay.",
+            )
+        })?;
+    let snapshot = deliver_auth(state, auth, instance, command).await.map_err(|error| {
+        if error.code == "managed_session_uncertain" {
+            ErrorResponse::new("managed_session_continue_delivery_uncertain",
+                "Auth continuation delivery or response acceptance is uncertain; do not replay.")
+        } else { error }
+    })?;
+    auth_response(&snapshot)
+}
+
+fn terminal_ack_failure(cause: bcode_provider_auth::managed::CoordinationError) -> ErrorResponse {
+    use bcode_provider_auth::managed::CoordinationError as E;
+    let code = match cause {
+        E::Invalid => "managed_session_ack_invalid",
+        E::NotFound => "managed_session_ack_not_found",
+        E::Stale => "managed_session_ack_stale",
+        E::Conflict => "managed_session_ack_conflict",
+        E::Capacity => "managed_session_ack_capacity",
+        E::Busy => "managed_session_ack_not_settled",
+        E::Terminal => "managed_session_ack_terminal",
+    };
+    ErrorResponse::new(
+        code,
+        "Terminal authentication acknowledgment was rejected; readiness and replay authority are unchanged.",
+    )
+}
+
+async fn prepare_handoff(
+    state: &Arc<crate::ServerState>,
+    caller: ManagedCaller,
+    request: ManagedSessionRequest,
+) -> Result<ManagedSessionResponse, ErrorResponse> {
+    use bcode_ipc::harness::ManagedSessionHandoffRequest;
+    let ManagedCaller::Client(client) = &caller else {
+        return Err(failure(ManagedHarnessError::Unsupported));
+    };
+    let input: ManagedSessionHandoffRequest = serde_json::from_str(&request.request_json)
+        .map_err(|_| failure(ManagedHarnessError::Invalid))?;
+    if (input.interaction_id.is_empty() && request.operation != ManagedSessionOperation::AuthStatus)
+        || input.interaction_id.len() > 256
+        || input.interface_id.is_empty()
+        || input.interface_id.len() > 256
+    {
+        return Err(failure(ManagedHarnessError::Invalid));
+    }
+    let (admission, _method, handoff) = terminal_admission(
+        state,
+        &caller,
+        input.session_id,
+        &input.instance_id,
+        &input.interface_id,
+    )
+    .await?;
+    let ManagedAuthAdmission {
+        scope,
+        instance,
+        ownership_hold: _hold,
+        ..
+    } = admission;
+    if instance.instance_id != input.instance_id
+        || scope.waiter.session_id != input.session_id.to_string()
+        || scope.namespace.plugin_id != instance.plugin_id
+        || scope.namespace.credential_namespace != instance.auth.credential_namespace
+        || scope.custody != instance.auth.custody
+    {
+        return Err(failure(ManagedHarnessError::StaleOwner));
+    }
+    let caller_id = client.to_string();
+    let authority = AuthAuthority {
+        scope,
+        caller_id: caller_id.clone(),
+        instance_id: input.instance_id.clone(),
+    };
+    let auth = state
+        .managed_auth
+        .get()
+        .ok_or_else(|| failure(ManagedHarnessError::StaleOwner))?;
+    if request.operation == ManagedSessionOperation::AuthStatus {
+        let interaction = auth
+            .sensitive_interaction(
+                &authority,
+                &authority.caller_id,
+                &input.session_id.to_string(),
+                &input.instance_id,
+                &input.handle,
+            )
+            .await
+            .map_err(|_| failure(ManagedHarnessError::StaleOwner))?;
+        return auth_response(&interaction);
+    }
+    if request.operation == ManagedSessionOperation::AuthReaped {
+        return acknowledge_terminal_reap(state, auth, &authority, &input).await;
+    }
+    if request.operation == ManagedSessionOperation::AuthAcknowledge {
+        auth.acknowledge_terminal(
+            &authority,
+            &authority.caller_id,
+            &input.session_id.to_string(),
+            &input.instance_id,
+            &input.handle,
+        )
+        .await
+        .map_err(terminal_ack_failure)?;
+        return auth_response(&serde_json::json!({"acknowledged": true}));
+    }
+    if request.operation == ManagedSessionOperation::AuthContinue {
+        return continue_terminal_auth(state, auth, &authority, &input, instance).await;
+    }
+    issue_terminal_plan(state, auth, &authority, &input, &handoff).await
+}
+
+struct AuthAuthority {
+    scope: crate::harness_auth::VerifiedHarnessAuthScope,
+    caller_id: String,
+    instance_id: String,
+}
+impl crate::harness_auth::HarnessAuthAuthority for AuthAuthority {
+    fn resolve(
+        &self,
+        caller: &str,
+        session_id: &str,
+        instance_id: &str,
+    ) -> Result<
+        crate::harness_auth::VerifiedHarnessAuthScope,
+        bcode_provider_auth::managed::CoordinationError,
+    > {
+        // The enclosing route has just resolved this scope for one authenticated connection;
+        // none of these caller/lease facts came from the portable auth payload.
+        if caller != self.caller_id
+            || session_id != self.scope.waiter.session_id
+            || instance_id != self.instance_id
+        {
+            return Err(bcode_provider_auth::managed::CoordinationError::Stale);
+        }
+        Ok(crate::harness_auth::VerifiedHarnessAuthScope {
+            waiter: self.scope.waiter.clone(),
+            namespace: self.scope.namespace.clone(),
+            custody: self.scope.custody,
+            method: self.scope.method.clone(),
+        })
+    }
+}
+
+async fn dispatch_auth_status(
+    state: &Arc<crate::ServerState>,
+    auth: &crate::harness_auth::HarnessAuthService,
+    authority: &AuthAuthority,
+    caller_id: &str,
+    session: &str,
+    input: &bcode_ipc::harness::ManagedSessionAuthRequest,
+    instance: &bcode_harness_models::HarnessInstance,
+) -> Result<ManagedSessionResponse, ErrorResponse> {
+    let rejected = |_| failure(ManagedHarnessError::Invalid);
+    if input.input.is_some() {
+        return Err(failure(ManagedHarnessError::Invalid));
+    }
+    if input.handle.is_none() {
+        if input.sensitive_interaction {
+            return Err(failure(ManagedHarnessError::Invalid));
+        }
+        let outgoing = bcode_harness_models::HarnessRequest {
+            schema_version: bcode_harness_models::HARNESS_SCHEMA_VERSION,
+            request_id: format!("auth-status:{}", uuid::Uuid::new_v4()),
+            instance: instance.clone(),
+            kind: HarnessRequestKind::AuthStatus { verify: false },
+        };
+        let response = invoke_sensitive_auth(state, &outgoing)
+            .await
+            .map_err(failure)?;
+        response
+            .validate_for(&outgoing)
+            .map_err(|_| failure(ManagedHarnessError::Invalid))?;
+        let bcode_harness_models::HarnessServiceResponseKind::AuthStatus(status) = response.kind
+        else {
+            return Err(failure(ManagedHarnessError::Invalid));
+        };
+        return auth_response(&status);
+    }
+    let handle = input
+        .handle
+        .as_ref()
+        .ok_or_else(|| failure(ManagedHarnessError::Invalid))?;
+    if input.sensitive_interaction {
+        let interaction = auth
+            .sensitive_interaction(authority, caller_id, session, &input.instance_id, handle)
+            .await
+            .map_err(rejected)?;
+        return auth_response(&interaction);
+    }
+    let snapshot = auth
+        .status(authority, caller_id, session, &input.instance_id, handle)
+        .await
+        .map_err(rejected)?;
+    auth_response(&snapshot)
+}
+
+async fn acknowledge_auth(
+    state: &Arc<crate::ServerState>,
+    auth: &crate::harness_auth::HarnessAuthService,
+    authority: &AuthAuthority,
+    caller_id: &str,
+    session: &str,
+    input: &bcode_ipc::harness::ManagedSessionAuthRequest,
+) -> Result<ManagedSessionResponse, ErrorResponse> {
+    let rejected = |_| failure(ManagedHarnessError::Invalid);
+    if input.input.is_some() {
+        return Err(failure(ManagedHarnessError::Invalid));
+    }
+    let handle = input
+        .handle
+        .as_ref()
+        .ok_or_else(|| failure(ManagedHarnessError::Invalid))?;
+    auth.acknowledge_terminal(authority, caller_id, session, &input.instance_id, handle)
+        .await
+        .map_err(rejected)?;
+    // Other waiters retain their terminal state. Retirement succeeds only when the
+    // domain confirms all terminal waiters acknowledged or expired.
+    let _ = auth.retire(handle).await;
+    state
+        .managed_auth_handoffs
+        .lock()
+        .await
+        .remove(&handle.flow_id);
+    auth_response(&serde_json::json!({"acknowledged":true}))
+}
+
+async fn begin_auth(
+    state: &Arc<crate::ServerState>,
+    auth: &crate::harness_auth::HarnessAuthService,
+    authority: &AuthAuthority,
+    input: &bcode_ipc::harness::ManagedSessionAuthRequest,
+    instance: bcode_harness_models::HarnessInstance,
+    fresh_begin_authorized: bool,
+) -> Result<bcode_provider_auth::managed::ManagedFlowSnapshot, ErrorResponse> {
+    let rejected = |_| failure(ManagedHarnessError::Invalid);
+    require_unissued_terminal(state, &authority.scope.namespace)?;
+    if !fresh_begin_authorized {
+        return Err(failure(ManagedHarnessError::Uncertain));
+    }
+    if input.handle.is_some() || input.input.is_some() || input.sensitive_interaction {
+        return Err(failure(ManagedHarnessError::Invalid));
+    }
+    let joined = auth
+        .begin(
+            authority,
+            &authority.caller_id,
+            &authority.scope.waiter.session_id,
+            &input.instance_id,
+        )
+        .await
+        .map_err(rejected)?;
+    if let Some(command) = joined.command {
+        deliver_auth(state, auth, instance, command).await
+    } else {
+        Ok(joined.snapshot)
+    }
+}
+
+fn decode_auth_input(
+    request: &ManagedSessionRequest,
+) -> Result<bcode_ipc::harness::ManagedSessionAuthRequest, ErrorResponse> {
+    let input: bcode_ipc::harness::ManagedSessionAuthRequest =
+        serde_json::from_str(&request.request_json)
+            .map_err(|_| failure(ManagedHarnessError::Invalid))?;
+    if input.instance_id.is_empty()
+        || input.instance_id.len() > bcode_harness_models::MAX_HARNESS_ID_BYTES
+        || input.input.as_ref().is_some_and(|value| !value.is_valid())
+    {
+        return Err(failure(ManagedHarnessError::Invalid));
+    }
+    if input.sensitive_interaction && request.operation != ManagedSessionOperation::AuthStatus {
+        return Err(failure(ManagedHarnessError::Invalid));
+    }
+    Ok(input)
+}
+
+async fn dispatch_readonly_auth_status(
+    state: &Arc<crate::ServerState>,
+    caller: &ManagedCaller,
+    input: &bcode_ipc::harness::ManagedSessionAuthRequest,
+) -> Result<ManagedSessionResponse, ErrorResponse> {
+    if input.input.is_some() || input.sensitive_interaction {
+        return Err(failure(ManagedHarnessError::Invalid));
+    }
+    state
+        .managed_sessions
+        .get()
+        .ok_or_else(|| failure(ManagedHarnessError::Storage))?;
+    let admission = crate::harness::CanonicalManagedAdmission::new(
+        crate::harness::CanonicalHarnessStore::new(state),
+    );
+    let inspected = admission
+        .authorize_auth_status(caller, input.session_id, &input.instance_id)
+        .await
+        .map_err(failure)?;
+    drop(admission);
+    auth_response(&inspected.status)
+}
+
+async fn auth_coordinator(
+    state: &crate::ServerState,
+) -> Result<&crate::harness_auth::HarnessAuthService, ErrorResponse> {
+    use bcode_provider_auth::managed::ManagedAuthCoordinator;
+    state
+        .managed_auth
+        .get_or_try_init(|| async {
+            ManagedAuthCoordinator::new(
+                state.daemon_status.instance_id.clone(),
+                64,
+                128,
+                std::time::Duration::from_secs(600),
+            )
+            .map(crate::harness_auth::HarnessAuthService::new)
+        })
+        .await
+        .map_err(|_| failure(ManagedHarnessError::Unavailable))
+}
+
+fn validate_auth_admission(
+    scope: &crate::harness_auth::VerifiedHarnessAuthScope,
+    instance: &bcode_harness_models::HarnessInstance,
+    input: &bcode_ipc::harness::ManagedSessionAuthRequest,
+) -> Result<(), ErrorResponse> {
+    if instance.instance_id != input.instance_id
+        || scope.waiter.session_id != input.session_id.to_string()
+        || instance.plugin_id != scope.namespace.plugin_id
+        || instance.auth.credential_namespace != scope.namespace.credential_namespace
+        || instance.auth.custody != scope.custody
+        || instance.validate().is_err()
+        || !scope.namespace.is_valid()
+    {
+        return Err(failure(ManagedHarnessError::StaleOwner));
+    }
+    Ok(())
+}
+
+async fn dispatch_auth(
+    state: &Arc<crate::ServerState>,
+    caller: ManagedCaller,
+    request: ManagedSessionRequest,
+) -> Result<ManagedSessionResponse, ErrorResponse> {
+    use bcode_provider_auth::managed::ManagedFlowSnapshot;
+    let ManagedCaller::Client(client_id) = &caller else {
+        return Err(failure(ManagedHarnessError::Unsupported));
+    };
+    let caller_id = client_id.to_string();
+    let input = decode_auth_input(&request)?;
+    if request.operation == ManagedSessionOperation::AuthStatus && input.handle.is_none() {
+        return dispatch_readonly_auth_status(state, &caller, &input).await;
+    }
+    let backend = state
+        .managed_sessions
+        .get()
+        .ok_or_else(|| failure(ManagedHarnessError::Storage))?;
+    let ManagedAuthAdmission {
+        scope,
+        instance,
+        ownership_hold: _ownership_hold,
+        fresh_begin_authorized,
+    } = backend
+        .auth_scope(&caller, input.session_id, &input.instance_id)
+        .await
+        .map_err(failure)?;
+    validate_auth_admission(&scope, &instance, &input)?;
+    let authority = AuthAuthority {
+        scope,
+        caller_id: caller_id.clone(),
+        instance_id: input.instance_id.clone(),
+    };
+    let auth = auth_coordinator(state).await?;
+    let session = input.session_id.to_string();
+    let rejected = |_| failure(ManagedHarnessError::StaleOwner);
+    let snapshot: ManagedFlowSnapshot = match request.operation {
+        ManagedSessionOperation::AuthAcknowledge => {
+            return acknowledge_auth(state, auth, &authority, &caller_id, &session, &input).await;
+        }
+        ManagedSessionOperation::AuthBegin => {
+            begin_auth(
+                state,
+                auth,
+                &authority,
+                &input,
+                instance,
+                fresh_begin_authorized,
+            )
+            .await?
+        }
+        ManagedSessionOperation::AuthStatus => {
+            return dispatch_auth_status(
+                state, auth, &authority, &caller_id, &session, &input, &instance,
+            )
+            .await;
+        }
+        ManagedSessionOperation::AuthContinue => {
+            let handle = input
+                .handle
+                .as_ref()
+                .ok_or_else(|| failure(ManagedHarnessError::Invalid))?;
+            let command = auth
+                .continue_flow(
+                    &authority,
+                    &caller_id,
+                    &session,
+                    &input.instance_id,
+                    handle,
+                    input.input,
+                )
+                .await
+                .map_err(rejected)?;
+            deliver_auth(state, auth, instance, command).await?
+        }
+        ManagedSessionOperation::AuthCancel => {
+            if input.input.is_some() {
+                return Err(failure(ManagedHarnessError::Invalid));
+            }
+            let handle = input
+                .handle
+                .as_ref()
+                .ok_or_else(|| failure(ManagedHarnessError::Invalid))?;
+            if let Some(command) = auth
+                .cancel(&authority, &caller_id, &session, &input.instance_id, handle)
+                .await
+                .map_err(rejected)?
+            {
+                deliver_auth(state, auth, instance, command).await?
+            } else {
+                return auth_response(&serde_json::json!({"detached": true}));
+            }
+        }
+        _ => return Err(failure(ManagedHarnessError::Invalid)),
+    };
+    auth_response(&snapshot)
+}
+
+fn auth_response(value: &impl serde::Serialize) -> Result<ManagedSessionResponse, ErrorResponse> {
+    let response_json =
+        serde_json::to_string(value).map_err(|_| failure(ManagedHarnessError::Invalid))?;
+    if response_json.len() > bcode_harness_models::MAX_HARNESS_WIRE_BYTES {
+        return Err(failure(ManagedHarnessError::Invalid));
+    }
+    Ok(ManagedSessionResponse {
+        schema_version: MANAGED_SESSION_VERSION,
+        response_json,
+    })
+}
+
+/// Auth-only selected-plugin channel. Inputs are daemon-issued and ephemeral; no ordinary
+/// runtime store, observation broadcast, raw plugin errors, or model callback sees them.
+async fn invoke_sensitive_auth(
+    state: &Arc<crate::ServerState>,
+    request: &bcode_harness_models::HarnessRequest,
+) -> Result<HarnessServiceResponse, ManagedHarnessError> {
+    if !matches!(
+        request.kind,
+        HarnessRequestKind::AuthStatus { .. }
+            | HarnessRequestKind::AuthBegin(_)
+            | HarnessRequestKind::AuthContinue(_)
+            | HarnessRequestKind::AuthCancel(_)
+    ) {
+        return Err(ManagedHarnessError::Invalid);
+    }
+    request
+        .validate()
+        .map_err(|_| ManagedHarnessError::Invalid)?;
+    let manifest = state
+        .plugins
+        .registry()
+        .manifests()
+        .get(&request.instance.plugin_id)
+        .ok_or(ManagedHarnessError::Unavailable)?;
+    bcode_plugin::harness::harness_contribution(manifest)
+        .map_err(|_| ManagedHarnessError::Unavailable)?;
+    let bytes = serde_json::to_vec(request).map_err(|_| ManagedHarnessError::Invalid)?;
+    if bytes.len() > bcode_harness_models::MAX_HARNESS_WIRE_BYTES {
+        return Err(ManagedHarnessError::Invalid);
+    }
+    let response = state
+        .plugins
+        .invoke_service_scoped_with_timeout(
+            &request.instance.plugin_id,
+            bcode_harness_models::HARNESS_INTERFACE_ID,
+            request.kind.operation().as_str(),
+            bytes,
+            bcode_plugin::PluginInvocationScope::Global,
+            std::time::Duration::from_secs(30),
+        )
+        .await
+        .map_err(|_| ManagedHarnessError::Unavailable)?;
+    if response.error.is_some()
+        || response.payload.len() > bcode_harness_models::MAX_HARNESS_WIRE_BYTES
+    {
+        return Err(ManagedHarnessError::Invalid);
+    }
+    let decoded: HarnessServiceResponse =
+        serde_json::from_slice(&response.payload).map_err(|_| ManagedHarnessError::Invalid)?;
+    decoded
+        .validate_for(request)
+        .map_err(|_| ManagedHarnessError::Invalid)?;
+    Ok(decoded)
+}
+
+async fn deliver_auth(
+    state: &Arc<crate::ServerState>,
+    auth: &crate::harness_auth::HarnessAuthService,
+    instance: bcode_harness_models::HarnessInstance,
+    command: bcode_provider_auth::managed::ManagedAuthCommand,
+) -> Result<bcode_provider_auth::managed::ManagedFlowSnapshot, ErrorResponse> {
+    let ticket = command.ticket.clone();
+    let plugin_id = instance.plugin_id.clone();
+    let Ok(mut invocation) =
+        crate::harness_auth::HarnessAuthInvocation::prepare(command, instance.clone())
+    else {
+        let _ = auth.delivery_uncertain(&ticket).await;
+        return Err(failure(ManagedHarnessError::Uncertain));
+    };
+    let outgoing = invocation
+        .take_request()
+        .ok_or_else(|| failure(ManagedHarnessError::Conflict))?;
+    let Ok(response) = invoke_sensitive_auth(state, &outgoing).await else {
+        let _ = auth.delivery_uncertain(&ticket).await;
+        return Err(failure(ManagedHarnessError::Uncertain));
+    };
+    let (snapshot, cancellation) = auth
+        .accept_harness_response(&plugin_id, &invocation, response)
+        .await
+        .map_err(|_| failure(ManagedHarnessError::Uncertain))?;
+    if let Some(command) = cancellation {
+        // Bounded follow-up is issued by the coordinator, never reconstructed from client data.
+        let next_ticket = command.ticket.clone();
+        let Ok(mut cancel) = crate::harness_auth::HarnessAuthInvocation::prepare(command, instance)
+        else {
+            let _ = auth.delivery_uncertain(&next_ticket).await;
+            return Err(failure(ManagedHarnessError::Uncertain));
+        };
+        let outgoing = cancel
+            .take_request()
+            .ok_or_else(|| failure(ManagedHarnessError::Conflict))?;
+        let Ok(response) = invoke_sensitive_auth(state, &outgoing).await else {
+            let _ = auth.delivery_uncertain(&next_ticket).await;
+            return Err(failure(ManagedHarnessError::Uncertain));
+        };
+        let (snapshot, pending) = auth
+            .accept_harness_response(&plugin_id, &cancel, response)
+            .await
+            .map_err(|_| failure(ManagedHarnessError::Uncertain))?;
+        if let Some(pending) = pending {
+            let _ = auth.delivery_uncertain(&pending.ticket).await;
+        }
+        return Ok(snapshot);
+    }
+    Ok(snapshot)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use bcode_harness_models::{
+        HARNESS_SCHEMA_VERSION, HarnessAuthBinding, HarnessAuthCustody, HarnessInstance,
+        HarnessRequest,
+    };
+
+    fn request(operation: ManagedSessionOperation) -> ManagedSessionRequest {
+        let call = ManagedSessionCall {
+            session_id: Some(SessionId::new()),
+            harness: HarnessRequest {
+                schema_version: HARNESS_SCHEMA_VERSION,
+                request_id: "inspection".into(),
+                instance: HarnessInstance {
+                    instance_id: "instance".into(),
+                    plugin_id: "native".into(),
+                    executable: "/explicit/native".into(),
+                    config_namespace: "/explicit/config".into(),
+                    auth: HarnessAuthBinding {
+                        provider_id: "auth".into(),
+                        profile: "native".into(),
+                        credential_namespace: "credentials".into(),
+                        custody: HarnessAuthCustody::NativeManaged,
+                    },
+                },
+                kind: HarnessRequestKind::Inspect,
+            },
+            parent_session_id: None,
+            assistance_destination_session_id: None,
+        };
+        ManagedSessionRequest {
+            schema_version: MANAGED_SESSION_VERSION,
+            operation,
+            request_json: serde_json::to_string(&call).unwrap(),
+        }
+    }
+
+    #[tokio::test]
+    async fn prior_terminal_issue_is_fenced_independently_of_daemon_memory() {
+        let root = tempfile::tempdir().unwrap();
+        let mut state = crate::tests::test_server_state(bcode_session::SessionManager::default());
+        state.state_root = root.path().to_path_buf();
+        let namespace = bcode_provider_auth_models::managed::AuthNamespace {
+            plugin_id: "native".into(),
+            credential_namespace: "/explicit/config".into(),
+        };
+        assert!(require_unissued_terminal(&state, &namespace).is_ok());
+        let path = terminal_fence_path(&state, &namespace).unwrap();
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        // Even a partially written prior issue must not become another launch permit.
+        std::fs::write(&path, []).unwrap();
+        assert_eq!(
+            require_unissued_terminal(&state, &namespace)
+                .unwrap_err()
+                .code,
+            "managed_session_uncertain"
+        );
+        assert!(path.exists());
+        drop(state);
+    }
+
+    #[tokio::test]
+    async fn missing_canonical_bridge_fails_closed_without_native_dispatch() {
+        let state = Arc::new(crate::tests::test_server_state(
+            bcode_session::SessionManager::default(),
+        ));
+        let result = dispatch(
+            &state,
+            ManagedCaller::Client(ClientId::new()),
+            request(ManagedSessionOperation::Inspect),
+        )
+        .await;
+        assert_eq!(
+            result.unwrap_err().code,
+            "managed_session_storage_unavailable"
+        );
+        assert!(state.managed_sessions.get().is_none());
+        drop(state);
+    }
+
+    #[tokio::test]
+    async fn workflow_callback_rejects_forged_invocation_before_receipt_lookup() {
+        let state = crate::tests::test_server_state(bcode_session::SessionManager::default());
+        let result = workflow_invocation(
+            &state,
+            "run",
+            "dispatch",
+            "plugin",
+            bcode_tool::ToolInvocationServiceRequest {
+                invocation_id: "different-dispatch".into(),
+                request_id: "callback".into(),
+                route_id: None,
+                interface_id: MANAGED_SESSION_INTERFACE_ID.into(),
+                operation: "followup".into(),
+                payload: serde_json::json!({}),
+            },
+        )
+        .await;
+        assert!(
+            matches!(result, bcode_tool::ToolInvocationServiceResolution::Failed { code, .. } if code == "invocation_id_mismatch")
+        );
+        assert!(state.managed_sessions.get().is_none());
+        drop(state);
+    }
+
+    #[tokio::test]
+    async fn workflow_caller_cannot_use_native_service_callback() {
+        let state = crate::tests::test_server_state(bcode_session::SessionManager::default());
+        let result = invocation(
+            &state,
+            ManagedCaller::Workflow {
+                run_id: "run".into(),
+                dispatch_identity: "dispatch".into(),
+                session_id: SessionId::new(),
+                plugin_id: "plugin".into(),
+            },
+            bcode_tool::ToolInvocationServiceRequest {
+                invocation_id: "dispatch".into(),
+                request_id: "callback".into(),
+                route_id: None,
+                interface_id: bcode_harness_models::HARNESS_INTERFACE_ID.into(),
+                operation: "submit".into(),
+                payload: serde_json::json!({}),
+            },
+        )
+        .await;
+        assert!(matches!(
+            result,
+            bcode_tool::ToolInvocationServiceResolution::Unsupported
+        ));
+        assert!(state.managed_sessions.get().is_none());
+        drop(state);
+    }
+
+    #[tokio::test]
+    async fn generic_service_route_never_returns_sensitive_interaction_material() {
+        let state = Arc::new(crate::tests::test_server_state(
+            bcode_session::SessionManager::default(),
+        ));
+        let request = ManagedSessionRequest {
+            schema_version: MANAGED_SESSION_VERSION,
+            operation: ManagedSessionOperation::AuthStatus,
+            request_json:
+                serde_json::json!({"session_id":SessionId::new(), "instance_id":"instance",
+                "handle":null, "input":null, "sensitive_interaction":true})
+                .to_string(),
+        };
+        let error = service(
+            &state,
+            ClientId::new(),
+            "auth_status".into(),
+            serde_json::to_vec(&request).unwrap(),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(error.code, "managed_session_sensitive_transport_required");
+        assert!(state.managed_auth.get().is_none());
+        drop(state);
+    }
+
+    #[tokio::test]
+    async fn auth_only_channel_rejects_non_auth_before_plugin_dispatch() {
+        let state = Arc::new(crate::tests::test_server_state(
+            bcode_session::SessionManager::default(),
+        ));
+        let request = request(ManagedSessionOperation::Inspect)
+            .decode_call()
+            .unwrap();
+        let error = invoke_sensitive_auth(&state, &request.harness)
+            .await
+            .unwrap_err();
+        drop(state);
+        assert_eq!(error, ManagedHarnessError::Invalid);
+    }
+
+    #[tokio::test]
+    async fn operation_mismatch_rejects_before_admission() {
+        let state = Arc::new(crate::tests::test_server_state(
+            bcode_session::SessionManager::default(),
+        ));
+        let result = dispatch(
+            &state,
+            ManagedCaller::Client(ClientId::new()),
+            request(ManagedSessionOperation::Respond),
+        )
+        .await;
+        assert_eq!(result.unwrap_err().code, "managed_session_invalid");
+        assert!(state.managed_sessions.get().is_none());
+        drop(state);
+    }
+
+    #[tokio::test]
+    async fn model_invocations_cannot_enter_sensitive_auth_route() {
+        let state = Arc::new(crate::tests::test_server_state(
+            bcode_session::SessionManager::default(),
+        ));
+        let result = dispatch(
+            &state,
+            ManagedCaller::Invocation {
+                session_id: SessionId::new(),
+                plugin_id: "native".into(),
+                invocation_id: "invocation".into(),
+            },
+            request(ManagedSessionOperation::AuthBegin),
+        )
+        .await;
+        assert_eq!(result.unwrap_err().code, "managed_session_unsupported");
+        assert!(state.managed_auth.get().is_none());
+        drop(state);
+    }
+
+    #[test]
+    fn fresh_start_or_callback_material_is_not_ordinary_runtime_authority() {
+        let value = request(ManagedSessionOperation::AuthContinue);
+        assert!(value.decode_call().is_err());
+        assert!(!format!("{value:?}").contains("credentials"));
+    }
+
+    #[tokio::test]
+    async fn history_cannot_inherit_cross_session_authority_from_parentage() {
+        let state = Arc::new(crate::tests::test_server_state(
+            bcode_session::SessionManager::default(),
+        ));
+        let query = bcode_ipc::harness::ManagedSessionHistoryRequest {
+            session_id: SessionId::new(),
+            after: None,
+            limit: 1,
+        };
+        let result = dispatch(
+            &state,
+            ManagedCaller::Invocation {
+                session_id: SessionId::new(),
+                plugin_id: "native".into(),
+                invocation_id: "invocation".into(),
+            },
+            ManagedSessionRequest {
+                schema_version: MANAGED_SESSION_VERSION,
+                operation: ManagedSessionOperation::History,
+                request_json: serde_json::to_string(&query).unwrap(),
+            },
+        )
+        .await;
+        drop(state);
+        assert_eq!(result.unwrap_err().code, "managed_session_stale_owner");
+    }
+}

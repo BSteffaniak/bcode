@@ -34,6 +34,11 @@ impl CliDiagnosticError {
     #[must_use]
     pub fn from_error(error: &CliError) -> Self {
         match error {
+            CliError::ManagedAuth { operation, source } => {
+                let mut diagnostic = Self::from_client(source);
+                diagnostic.phase = operation.as_str();
+                diagnostic
+            }
             CliError::WorkflowInspection { source } => Self::from_inspection_error(source),
             CliError::Client(error)
             | CliError::ChildSessionCreate { source: error, .. }
@@ -182,7 +187,86 @@ impl CliDiagnosticError {
         }
     }
 
+    fn terminal_ack(code: &str) -> Option<Self> {
+        let code = match code {
+            "managed_session_ack_invalid" => "managed_session_ack_invalid",
+            "managed_session_ack_not_found" => "managed_session_ack_not_found",
+            "managed_session_ack_stale" => "managed_session_ack_stale",
+            "managed_session_ack_conflict" => "managed_session_ack_conflict",
+            "managed_session_ack_capacity" => "managed_session_ack_capacity",
+            "managed_session_ack_not_settled" => "managed_session_ack_not_settled",
+            "managed_session_ack_terminal" => "managed_session_ack_terminal",
+            _ => return None,
+        };
+        Some(Self::diagnostic(
+            code,
+            "auth_acknowledge",
+            "Terminal authentication acknowledgment was rejected; readiness and replay authority are unchanged.",
+        ))
+    }
+
+    fn managed_session(code: &str) -> Option<Self> {
+        if let Some(diagnostic) = Self::terminal_ack(code) {
+            return Some(diagnostic);
+        }
+        let (code, message) = match code {
+            "managed_session_invalid" => (
+                "managed_session_invalid",
+                "Managed request or response is invalid.",
+            ),
+            "managed_session_storage_unavailable" => (
+                "managed_session_storage_unavailable",
+                "Canonical managed-session storage is unavailable; preserve existing evidence.",
+            ),
+            "managed_session_stale_owner" => (
+                "managed_session_stale_owner",
+                "Managed-session caller, namespace or ownership is stale; reinspect without replay.",
+            ),
+            "managed_session_conflict" => (
+                "managed_session_conflict",
+                "Managed-session request conflicts with retained state; do not substitute another request.",
+            ),
+            "managed_session_continue_issue_uncertain" => (
+                "managed_session_continue_issue_uncertain",
+                "The retained auth flow cannot issue continuation; reconcile without replay.",
+            ),
+            "managed_session_continue_delivery_uncertain" => (
+                "managed_session_continue_delivery_uncertain",
+                "Auth continuation delivery or acceptance is uncertain; do not replay.",
+            ),
+            "managed_session_uncertain" => (
+                "managed_session_uncertain",
+                "Managed-session effects are uncertain; reconcile without replay.",
+            ),
+            "managed_session_unavailable" => (
+                "managed_session_unavailable",
+                "Managed-session service is unavailable; this does not prove absence of effects.",
+            ),
+            "managed_session_deadline" => (
+                "managed_session_deadline",
+                "Managed-session deadline elapsed; reconcile effects before retrying.",
+            ),
+            "managed_session_unsupported" => (
+                "managed_session_unsupported",
+                "The selected managed-session operation is unsupported.",
+            ),
+            "managed_session_scope_mismatch" => (
+                "managed_session_scope_mismatch",
+                "Managed-session scope does not match the authenticated caller.",
+            ),
+            "managed_session_sensitive_transport_required" => (
+                "managed_session_sensitive_transport_required",
+                "Authentication requires the dedicated sensitive client transport.",
+            ),
+            _ => return None,
+        };
+        Some(Self::diagnostic(code, "managed_session", message))
+    }
+
     fn application(code: &str) -> Self {
+        if let Some(diagnostic) = Self::managed_session(code) {
+            return diagnostic;
+        }
         match code {
             "workflow_activity_snapshot_start_failed" => Self::diagnostic(
                 "workflow_activity_snapshot_start_failed",
@@ -597,6 +681,102 @@ mod tests {
             },
         ));
         assert_eq!(scoped, generic);
+    }
+
+    #[test]
+    fn terminal_ack_categories_do_not_assert_readiness_or_expose_messages() {
+        for code in [
+            "managed_session_ack_invalid",
+            "managed_session_ack_not_found",
+            "managed_session_ack_stale",
+            "managed_session_ack_conflict",
+            "managed_session_ack_capacity",
+            "managed_session_ack_not_settled",
+            "managed_session_ack_terminal",
+        ] {
+            let error = CliError::ManagedAuth {
+                operation: bcode_ipc::harness::ManagedSessionOperation::AuthAcknowledge,
+                source: bcode_client::ClientError::Server {
+                    code: code.into(),
+                    message: "SECRET_FIXTURE_MARKER".into(),
+                },
+            };
+            let diagnostic = CliDiagnosticError::from_error(&error);
+            assert_eq!(diagnostic.code, code);
+            assert_eq!(diagnostic.phase, "auth_acknowledge");
+            assert!(
+                !serde_json::to_string(&diagnostic)
+                    .unwrap()
+                    .contains("SECRET_FIXTURE_MARKER")
+            );
+        }
+    }
+
+    #[test]
+    fn managed_auth_phase_preserves_code_without_sensitive_context() {
+        for operation in [
+            bcode_ipc::harness::ManagedSessionOperation::AuthPrepare,
+            bcode_ipc::harness::ManagedSessionOperation::AuthReaped,
+            bcode_ipc::harness::ManagedSessionOperation::AuthContinue,
+            bcode_ipc::harness::ManagedSessionOperation::AuthAcknowledge,
+        ] {
+            let error = CliError::ManagedAuth {
+                operation,
+                source: bcode_client::ClientError::Server {
+                    code: "managed_session_uncertain".into(),
+                    message: "SECRET_FIXTURE_MARKER".into(),
+                },
+            };
+            let diagnostic = CliDiagnosticError::from_error(&error);
+            assert_eq!(diagnostic.code, "managed_session_uncertain");
+            assert_eq!(diagnostic.phase, operation.as_str());
+            assert!(
+                !serde_json::to_string(&diagnostic)
+                    .unwrap()
+                    .contains("SECRET_FIXTURE_MARKER")
+            );
+            assert!(!error.to_string().contains("SECRET_FIXTURE_MARKER"));
+        }
+    }
+
+    #[test]
+    fn managed_server_codes_are_preserved_without_raw_messages() {
+        for code in [
+            "managed_session_invalid",
+            "managed_session_storage_unavailable",
+            "managed_session_stale_owner",
+            "managed_session_conflict",
+            "managed_session_uncertain",
+            "managed_session_unavailable",
+            "managed_session_deadline",
+            "managed_session_unsupported",
+            "managed_session_scope_mismatch",
+            "managed_session_sensitive_transport_required",
+        ] {
+            let error = CliError::Client(bcode_client::ClientError::Server {
+                code: code.into(),
+                message: "SECRET_FIXTURE_MARKER".into(),
+            });
+            let diagnostic = CliDiagnosticError::from_error(&error);
+            assert_eq!(diagnostic.code, code);
+            assert_eq!(diagnostic.phase, "managed_session");
+            assert!(
+                !serde_json::to_string(&diagnostic)
+                    .unwrap()
+                    .contains("SECRET_FIXTURE_MARKER")
+            );
+        }
+        let error = CliError::Client(bcode_client::ClientError::Server {
+            code: "managed_session_SECRET_FIXTURE_MARKER".into(),
+            message: "SECRET_FIXTURE_MARKER".into(),
+        });
+        let diagnostic = CliDiagnosticError::from_error(&error);
+        assert_eq!(diagnostic.code, "unclassified_application_error");
+        assert!(
+            !serde_json::to_string(&diagnostic)
+                .unwrap()
+                .contains("SECRET_FIXTURE_MARKER")
+        );
     }
 
     #[test]

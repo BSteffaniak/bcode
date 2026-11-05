@@ -60,6 +60,14 @@ fn main() {
         std::process::exit(code);
     }
     bcode_cli::record_process_entry();
+    match bcode_cli::try_run_artifact_id_probe() {
+        Ok(true) => return,
+        Ok(false) => {}
+        Err(_) => {
+            eprintln!("artifact identity output unavailable");
+            std::process::exit(1);
+        }
+    }
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()

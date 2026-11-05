@@ -71,6 +71,15 @@ pub enum CliError {
     StartupReportUnavailable,
     #[error("client error: {0}")]
     Client(#[from] ClientError),
+    /// Authentication operation context without raw native or server diagnostics.
+    #[error(
+        "managed authentication {operation:?} failed; inspect typed diagnostics without replay"
+    )]
+    ManagedAuth {
+        operation: bcode_ipc::harness::ManagedSessionOperation,
+        #[source]
+        source: ClientError,
+    },
     /// Failure of the bounded public workflow inspection read, not an execution outcome.
     #[error("workflow inspection failed: {source}")]
     WorkflowInspection {
@@ -307,6 +316,7 @@ impl CliError {
             Self::StartupReportUnavailable | Self::CategoryRankingInput(_) => 1,
             Self::Signal(_) => 1,
             Self::Client(_)
+            | Self::ManagedAuth { .. }
             | Self::ChildSessionCreate { .. }
             | Self::DaemonLifecycle(_)
             | Self::DaemonStart(_)
@@ -782,6 +792,27 @@ fn validate_cli_execution_mode(
     Ok(())
 }
 
+/// Handle the exact bare artifact identity probe before runtime or plugin bootstrap.
+///
+/// Returns `false` for every other argument shape so ordinary parsing remains authoritative.
+/// Raw builds still derive identity from final executable bytes; no advertised or cached
+/// replacement identity is accepted.
+///
+/// # Errors
+/// Returns an error if writing or flushing the identity fails.
+pub fn try_run_artifact_id_probe() -> Result<bool, CliError> {
+    if !is_bare_artifact_id_probe(std::env::args_os().skip(1)) {
+        return Ok(false);
+    }
+    write_artifact_id()?;
+    Ok(true)
+}
+
+fn is_bare_artifact_id_probe(mut arguments: impl Iterator<Item = std::ffi::OsString>) -> bool {
+    arguments.next().as_deref() == Some(std::ffi::OsStr::new("artifact-id"))
+        && arguments.next().is_none()
+}
+
 fn write_artifact_id() -> Result<(), CliError> {
     let mut output = std::io::stdout().lock();
     writeln!(output, "{}", bcode_ipc::ArtifactId::current())?;
@@ -858,6 +889,7 @@ async fn handle_cli(cli: Cli) -> Result<(), CliError> {
         }
         Commands::ArtifactId => write_artifact_id()?,
         Commands::Server { command } => handle_server_command(command).await?,
+        Commands::Harness { command } => harness::execute(command).await?,
         Commands::Session { command } => handle_session_command(Box::new(command)).await?,
         Commands::State { command } => handle_state_command(
             command,
@@ -4642,6 +4674,7 @@ async fn handle_session_io_command(
         | Commands::Settings { .. }
         | Commands::ArtifactId
         | Commands::Server { .. }
+        | Commands::Harness { .. }
         | Commands::Session { .. }
         | Commands::State { .. }
         | Commands::Plugin { .. }
@@ -4882,6 +4915,23 @@ mod build_version_tests {
     use super::*;
 
     #[test]
+    fn early_artifact_probe_only_accepts_exact_bare_command() {
+        for (arguments, expected) in [
+            (vec!["artifact-id"], true),
+            (vec![], false),
+            (vec!["artifact-id", "--help"], false),
+            (vec!["--state-root", "/tmp/example", "artifact-id"], false),
+            (vec!["--json-errors", "artifact-id"], false),
+            (vec!["version"], false),
+        ] {
+            assert_eq!(
+                is_bare_artifact_id_probe(arguments.into_iter().map(std::ffi::OsString::from)),
+                expected,
+            );
+        }
+    }
+
+    #[test]
     fn root_command_uses_exact_canonical_build_label() {
         let cases = [
             (
@@ -5028,6 +5078,11 @@ impl Cli {
 
 #[derive(Debug, Subcommand)]
 enum Commands {
+    /// Manage external execution backends through the daemon application.
+    Harness {
+        #[command(subcommand)]
+        command: harness::HarnessCommand,
+    },
     /// Execute one prompt headlessly with explicit trusted configuration and JSON settlement.
     Run(headless::RunOptions),
     /// Bounded non-conversational advisory judgement operations.
@@ -12707,6 +12762,7 @@ mod auth_login;
 mod auth_management;
 mod auth_prompts;
 mod credential_setup;
+mod harness;
 mod headless;
 mod startup;
 
@@ -17221,13 +17277,11 @@ async fn wait_for_daemon_exit(
 ) -> Result<(), CliError> {
     let deadline = Instant::now() + Duration::from_secs(5);
     loop {
-        let still_live = matches!(
-            bcode_daemon_lifecycle::classify_daemon_record(expected).await,
-            bcode_daemon_lifecycle::DaemonRecordClassification::CurrentHealthy
-                | bcode_daemon_lifecycle::DaemonRecordClassification::HistoricalExactResponsive
-                | bcode_daemon_lifecycle::DaemonRecordClassification::HistoricalProcessVerifiedProtocolUnsupported
-        );
-        if !still_live {
+        // Only positive process-identity evidence of absence/reuse proves this exact
+        // daemon ended. Unreachable or unverifiable does not mean stopped.
+        if bcode_daemon_lifecycle::classify_daemon_record(expected).await
+            == bcode_daemon_lifecycle::DaemonRecordClassification::UnreachableStale
+        {
             return Ok(());
         }
         if Instant::now() >= deadline {
@@ -17238,6 +17292,45 @@ async fn wait_for_daemon_exit(
         }
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
+}
+
+/// Reverify the full daemon record immediately before sending a signal.
+/// This must not depend on a shell utility being present in the selected PATH.
+#[cfg(unix)]
+async fn signal_verified_daemon(
+    expected: &bcode_daemon_lifecycle::DaemonRecord,
+    signal: libc::c_int,
+) -> Result<(), CliError> {
+    let classification = bcode_daemon_lifecycle::classify_daemon_record(expected).await;
+    if !matches!(
+        classification,
+        bcode_daemon_lifecycle::DaemonRecordClassification::CurrentHealthy
+            | bcode_daemon_lifecycle::DaemonRecordClassification::HistoricalExactResponsive
+            | bcode_daemon_lifecycle::DaemonRecordClassification::HistoricalProcessVerifiedProtocolUnsupported
+    ) {
+        return Err(CliError::InvalidArguments(format!(
+            "refusing signal because daemon identity is {classification:?}"
+        )));
+    }
+    let pid = expected.pid.ok_or_else(|| {
+        CliError::InvalidArguments("verified daemon record has no process id".into())
+    })?;
+    let pid = libc::pid_t::try_from(pid)
+        .ok()
+        .filter(|pid| *pid > 0)
+        .ok_or_else(|| CliError::InvalidArguments("verified daemon PID is out of range".into()))?;
+    // SAFETY: kill has no pointer arguments. A positive, representable PID cannot select a
+    // process group; the caller verifies daemon ownership before each signal/escalation.
+    if unsafe { libc::kill(pid, signal) } == 0 {
+        return Ok(());
+    }
+    let error = std::io::Error::last_os_error();
+    // The process may exit between verification and signaling. The caller still performs
+    // its exact-identity exit observation; absence here alone is not reported as stopped.
+    if error.raw_os_error() == Some(libc::ESRCH) {
+        return Ok(());
+    }
+    Err(error.into())
 }
 
 async fn terminate_verified_daemon(
@@ -17254,20 +17347,13 @@ async fn terminate_verified_daemon(
             "refusing termination because daemon identity is {classification:?}"
         )));
     }
+    #[cfg(not(unix))]
     let pid = expected.pid.ok_or_else(|| {
         CliError::InvalidArguments("verified daemon record has no process id".to_owned())
     })?;
     #[cfg(unix)]
     {
-        let status = tokio::process::Command::new("kill")
-            .args(["-TERM", &pid.to_string()])
-            .status()
-            .await?;
-        if !status.success() {
-            return Err(CliError::InvalidArguments(format!(
-                "failed to terminate verified daemon process {pid}"
-            )));
-        }
+        signal_verified_daemon(expected, libc::SIGTERM).await?;
         if wait_for_daemon_exit(expected).await.is_ok() {
             return Ok(());
         }
@@ -17282,15 +17368,7 @@ async fn terminate_verified_daemon(
                 "refusing SIGKILL because daemon identity changed after SIGTERM".to_owned(),
             ));
         }
-        let status = tokio::process::Command::new("kill")
-            .args(["-KILL", &pid.to_string()])
-            .status()
-            .await?;
-        if !status.success() {
-            return Err(CliError::InvalidArguments(format!(
-                "failed to force-kill verified daemon process {pid}"
-            )));
-        }
+        signal_verified_daemon(expected, libc::SIGKILL).await?;
         return wait_for_daemon_exit(expected).await;
     }
     #[cfg(windows)]
@@ -20887,6 +20965,12 @@ const fn session_event_kind_name(kind: &SessionEventKind) -> &'static str {
         SessionEventKind::AssistantReasoningActivity { .. } => "assistant_reasoning_activity",
         SessionEventKind::RalphLifecycle { .. } => "ralph_lifecycle",
         SessionEventKind::PluginStatusNote { .. } => "plugin_status_note",
+        SessionEventKind::ExternalHarnessOperation { .. } => "external_harness_operation",
+        SessionEventKind::ExternalBackendBound { .. } => "external_backend_bound",
+        SessionEventKind::ExternalSubmissionAccepted { .. } => "external_submission_accepted",
+        SessionEventKind::ExternalDeliveryObserved { .. } => "external_delivery_observed",
+        SessionEventKind::ExternalObservationRecorded { .. } => "external_observation_recorded",
+        SessionEventKind::ExternalInteractionResponded { .. } => "external_interaction_responded",
         SessionEventKind::InertHistory { .. } => "inert_history",
     }
 }
@@ -22338,6 +22422,26 @@ fn reasoning_activity_description(
 #[allow(clippy::too_many_lines)]
 fn print_non_trace_session_event(event: &SessionEvent) {
     match &event.kind {
+        SessionEventKind::ExternalHarnessOperation { .. }
+        | SessionEventKind::ExternalBackendBound { .. }
+        | SessionEventKind::ExternalSubmissionAccepted { .. }
+        | SessionEventKind::ExternalDeliveryObserved { .. }
+        | SessionEventKind::ExternalObservationRecorded { .. }
+        | SessionEventKind::ExternalInteractionResponded { .. } => {
+            match bcode_session_view::external::canonical_external_text(event) {
+                Ok(Some(text)) => println!("#{} {text}", event.sequence),
+                Ok(None) => println!(
+                    "#{} {}: canonical external evidence retained",
+                    event.sequence,
+                    session_event_kind_name(&event.kind)
+                ),
+                Err(_) => println!(
+                    "#{} {}: invalid or unsupported canonical external evidence",
+                    event.sequence,
+                    session_event_kind_name(&event.kind)
+                ),
+            }
+        }
         SessionEventKind::MilestonePublished { milestone } => println!(
             "#{} milestone: {}\n{}\nsource {}–{} (navigation {})",
             event.sequence,

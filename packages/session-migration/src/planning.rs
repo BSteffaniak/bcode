@@ -409,14 +409,21 @@ mod tests {
     #[test]
     fn compaction_checkpoint_epoch_has_a_lossless_forward_only_path() {
         let plan = plan_writer_epoch_migration(16).expect("epoch 16 projection upgrade");
-        assert_eq!(plan.target_writer_epoch, 17);
+        assert_eq!(plan.target_writer_epoch, CURRENT_WRITER_EPOCH);
         assert_eq!(
             plan.steps,
-            [MigrationStepDescriptor {
-                id: "session-writer-epoch-16-to-17",
-                source_writer_epoch: 16,
-                target_writer_epoch: 17,
-            }]
+            [
+                MigrationStepDescriptor {
+                    id: "session-writer-epoch-16-to-17",
+                    source_writer_epoch: 16,
+                    target_writer_epoch: 17,
+                },
+                MigrationStepDescriptor {
+                    id: "session-writer-epoch-17-to-18",
+                    source_writer_epoch: 17,
+                    target_writer_epoch: 18,
+                }
+            ]
         );
         // An older artifact's inventory must not reinterpret the new writer contract.
         assert!(matches!(
@@ -424,6 +431,27 @@ mod tests {
             Err(MigrationPlanError::FutureWriter {
                 source_writer_epoch: 17,
                 current_writer_epoch: 16,
+            })
+        ));
+    }
+
+    #[test]
+    fn external_backend_epoch_has_a_lossless_forward_only_projection_upgrade() {
+        let plan = plan_writer_epoch_migration(17).expect("external locator projection upgrade");
+        assert_eq!(plan.target_writer_epoch, 18);
+        assert_eq!(
+            plan.steps,
+            [MigrationStepDescriptor {
+                id: "session-writer-epoch-17-to-18",
+                source_writer_epoch: 17,
+                target_writer_epoch: 18,
+            }]
+        );
+        assert!(matches!(
+            plan_writer_epoch_migration_with_registry(18, 17, &MIGRATION_STEPS),
+            Err(MigrationPlanError::FutureWriter {
+                source_writer_epoch: 18,
+                current_writer_epoch: 17
             })
         ));
     }

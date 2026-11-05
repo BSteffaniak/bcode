@@ -9,6 +9,7 @@ pub mod application;
 pub mod auxiliary_generation;
 pub mod composer;
 pub mod generation;
+pub mod harness;
 pub mod interaction;
 pub mod interaction_application;
 pub mod milestones;

@@ -11,6 +11,7 @@ pub mod account_lifecycle;
 pub mod account_routing;
 pub use account_routing::*;
 pub mod application;
+pub mod managed;
 pub mod refresh;
 pub mod startup;
 pub use refresh::{

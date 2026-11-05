@@ -16,6 +16,7 @@ pub mod discovery;
 pub mod enrollment;
 pub mod interactive;
 pub mod lifecycle;
+pub mod managed;
 pub mod managed_pool;
 #[cfg(target_os = "macos")]
 pub mod native_device;

@@ -1738,7 +1738,9 @@ dependencies = [
  "bcode_auth_broker_provider_plugin",
  "bcode_bedrock_provider_plugin",
  "bcode_blims_plugin",
+ "bcode_claude_code_plugin",
  "bcode_code_review_plugin",
+ "bcode_codex_harness_plugin",
  "bcode_command",
  "bcode_compressed_session_search_plugin",
  "bcode_config",
@@ -1750,6 +1752,7 @@ dependencies = [
  "bcode_filesystem_plugin",
  "bcode_git_plugin",
  "bcode_github_review_publisher_plugin",
+ "bcode_harness_plugin",
  "bcode_jev_provider_plugin",
  "bcode_loop_plugin",
  "bcode_metrics_plugin",
@@ -1781,6 +1784,30 @@ dependencies = [
 ]
 
 [[package]]
+name = "bcode_claude_code"
+version = "0.0.1-alpha.0"
+dependencies = [
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror 2.0.21",
+ "tokio",
+]
+
+[[package]]
+name = "bcode_claude_code_plugin"
+version = "0.0.1-alpha.0"
+dependencies = [
+ "bcode_claude_code",
+ "bcode_harness_models",
+ "bcode_plugin_sdk",
+ "bcode_provider_auth_models",
+ "serde",
+ "serde_json",
+ "tokio",
+]
+
+[[package]]
 name = "bcode_cli"
 version = "0.0.1-alpha.0"
 dependencies = [
@@ -1792,6 +1819,7 @@ dependencies = [
  "bcode_config",
  "bcode_daemon_lifecycle",
  "bcode_eval",
+ "bcode_harness_models",
  "bcode_hyperchad",
  "bcode_ipc",
  "bcode_metrics",
@@ -1810,6 +1838,7 @@ dependencies = [
  "bcode_session_migration",
  "bcode_session_models",
  "bcode_session_search",
+ "bcode_session_view",
  "bcode_settings",
  "bcode_skill_models",
  "bcode_tool_models",
@@ -1850,6 +1879,7 @@ dependencies = [
  "bcode_command",
  "bcode_config",
  "bcode_daemon_lifecycle",
+ "bcode_harness_models",
  "bcode_ipc",
  "bcode_metrics",
  "bcode_model",
@@ -1922,6 +1952,21 @@ dependencies = [
  "thiserror 2.0.21",
  "tokio",
  "toml 1.1.8+spec-1.1.0",
+]
+
+[[package]]
+name = "bcode_codex_harness_plugin"
+version = "0.0.1-alpha.0"
+dependencies = [
+ "bcode_harness_models",
+ "bcode_plugin_sdk",
+ "bcode_provider_auth_models",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror 2.0.21",
+ "uuid",
+ "zeroize",
 ]
 
 [[package]]
@@ -2280,6 +2325,30 @@ dependencies = [
 ]
 
 [[package]]
+name = "bcode_harness_models"
+version = "0.0.1-alpha.0"
+dependencies = [
+ "bcode_provider_auth_models",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
+name = "bcode_harness_plugin"
+version = "0.0.1-alpha.0"
+dependencies = [
+ "bcode_agent_profile",
+ "bcode_command",
+ "bcode_harness_models",
+ "bcode_plugin_sdk",
+ "bcode_session_models",
+ "bcode_tool",
+ "bcode_workflow",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "bcode_hello_plugin"
 version = "0.0.1-alpha.0"
 dependencies = [
@@ -2299,6 +2368,7 @@ dependencies = [
  "bcode_config",
  "bcode_fake_provider_plugin",
  "bcode_filesystem_plugin",
+ "bcode_harness_models",
  "bcode_hyperchad_ui",
  "bcode_ipc",
  "bcode_model_catalog",
@@ -2346,6 +2416,7 @@ dependencies = [
  "bcode_agent_profile",
  "bcode_command",
  "bcode_config",
+ "bcode_harness_models",
  "bcode_metrics",
  "bcode_model",
  "bcode_model_catalog_models",
@@ -2374,6 +2445,7 @@ dependencies = [
  "thiserror 2.0.21",
  "tokio",
  "windows-sys 0.61.2",
+ "zeroize",
 ]
 
 [[package]]
@@ -2688,6 +2760,7 @@ name = "bcode_plugin"
 version = "0.0.1-alpha.0"
 dependencies = [
  "bcode_command",
+ "bcode_harness_models",
  "bcode_hello_plugin",
  "bcode_metrics",
  "bcode_plugin_models",
@@ -2730,6 +2803,7 @@ name = "bcode_plugin_models"
 version = "0.0.1-alpha.0"
 dependencies = [
  "bcode_keymap_models",
+ "bcode_harness_models",
  "bcode_tool_models",
  "serde",
  "serde_json",
@@ -2742,6 +2816,7 @@ dependencies = [
  "bcode_agent_profile",
  "bcode_command",
  "bcode_keymap",
+ "bcode_harness_models",
  "bcode_model",
  "bcode_plugin_models",
  "bcode_plugin_sdk",
@@ -2857,6 +2932,7 @@ version = "0.0.1-alpha.0"
 dependencies = [
  "serde",
  "serde_json",
+ "zeroize",
 ]
 
 [[package]]
@@ -3009,6 +3085,7 @@ dependencies = [
  "bcode_fake_provider_plugin",
  "bcode_file_references_plugin",
  "bcode_filesystem_plugin",
+ "bcode_harness_models",
  "bcode_hyperchad",
  "bcode_hyperchad_ui",
  "bcode_ipc",
@@ -3103,6 +3180,7 @@ dependencies = [
  "base64 0.22.1",
  "bcode_confined_fs",
  "bcode_database_observability",
+ "bcode_harness_models",
  "bcode_metrics",
  "bcode_plugin_sdk",
  "bcode_session_migration_target",
@@ -3190,6 +3268,7 @@ dependencies = [
 name = "bcode_session_models"
 version = "0.0.1-alpha.0"
 dependencies = [
+ "bcode_harness_models",
  "bcode_model_catalog_models",
  "bcode_skill_models",
  "bcode_tool_models",
@@ -3203,6 +3282,7 @@ dependencies = [
 name = "bcode_session_search"
 version = "0.0.1-alpha.0"
 dependencies = [
+ "bcode_harness_models",
  "bcode_session_models",
  "hex",
  "serde",
@@ -3216,6 +3296,7 @@ version = "0.0.1-alpha.0"
 dependencies = [
  "bcode_client",
  "bcode_daemon_lifecycle",
+ "bcode_harness_models",
  "bcode_ipc",
  "bcode_plugin_sdk",
  "bcode_session",
@@ -3458,6 +3539,7 @@ dependencies = [
  "bcode_daemon_lifecycle",
  "bcode_filesystem_plugin",
  "bcode_git_plugin",
+ "bcode_harness_models",
  "bcode_hello_plugin",
  "bcode_ipc",
  "bcode_markdown_render",

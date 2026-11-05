@@ -11,6 +11,15 @@
 //! required fallback for every other surface.
 
 pub mod compaction_diagnostic;
+/// Canonical typed managed external session evidence and bounded indexed query contracts.
+pub mod external_backend;
+/// Canonical actor-backed native operation claims, completion and cursor commits.
+pub mod external_harness;
+pub use external_backend::{
+    ExternalBackendEnvelope, ExternalBackendPage, ExternalBackendQuery, ExternalBackendRecord,
+};
+pub use external_harness::*;
+
 /// Bounded, secret-safe compaction diagnostics and host observation contracts.
 pub mod compaction_inspection;
 pub use compaction_diagnostic::{CompactionDiagnostic, CompactionResponseDiagnostic};
@@ -70,7 +79,7 @@ pub trait SessionCompactionRecoveryDiscoveryApplication: Sync {
 }
 
 /// Durable session-storage writer epoch shared by runtime and daemon compatibility handshakes.
-pub const CURRENT_SESSION_STORAGE_WRITER_EPOCH: u32 = 17;
+pub const CURRENT_SESSION_STORAGE_WRITER_EPOCH: u32 = 18;
 
 /// Identifies retained turn observations in the existing system-message text contract.
 ///
@@ -1501,6 +1510,12 @@ pub const CURRENT_SESSION_EVENT_SCHEMA_VERSION: u16 = 53;
 /// Historical schema ranges and conversion policy remain migration-owned. This list is the
 /// policy-free current-format capability inventory used to prevent migration classification drift.
 pub const CURRENT_PERSISTED_SESSION_EVENT_KINDS: &[&str] = &[
+    "external_harness_operation",
+    "external_backend_bound",
+    "external_submission_accepted",
+    "external_delivery_observed",
+    "external_observation_recorded",
+    "external_interaction_responded",
     "submission_accepted",
     "submission_activated",
     "submission_cancelled",
@@ -1579,6 +1594,12 @@ pub const fn persisted_session_event_kind_name(kind: &SessionEventKind) -> &'sta
     match kind {
         SessionEventKind::TurnContinuationCommitted { .. } => "turn_continuation_committed",
         SessionEventKind::DurableInteractionCommitted { .. } => "durable_interaction_committed",
+        SessionEventKind::ExternalHarnessOperation { .. } => "external_harness_operation",
+        SessionEventKind::ExternalBackendBound { .. } => "external_backend_bound",
+        SessionEventKind::ExternalSubmissionAccepted { .. } => "external_submission_accepted",
+        SessionEventKind::ExternalDeliveryObserved { .. } => "external_delivery_observed",
+        SessionEventKind::ExternalObservationRecorded { .. } => "external_observation_recorded",
+        SessionEventKind::ExternalInteractionResponded { .. } => "external_interaction_responded",
         SessionEventKind::SessionCreated { .. } => "session_created",
         SessionEventKind::ClientAttached { .. } => "client_attached",
         SessionEventKind::ClientDetached { .. } => "client_detached",
@@ -5305,6 +5326,37 @@ pub enum SessionEventKind {
     /// Original accepted-turn continuation transition; staged and publication-disabled.
     TurnContinuationCommitted {
         operation: Box<TurnContinuationOperation>,
+    },
+    /// Atomic owner-fenced native request claim, outcome, configuration or observation-page commit.
+    ExternalHarnessOperation {
+        operation: Box<ExternalHarnessOperation>,
+    },
+    /// Durable verified association with a managed native session, not diagnostic trace.
+    ExternalBackendBound {
+        version: u16,
+        instance: Box<bcode_harness_models::HarnessInstance>,
+        binding: Box<bcode_harness_models::HarnessSessionBinding>,
+    },
+    /// Retained managed input admission; does not itself deliver native input.
+    ExternalSubmissionAccepted {
+        version: u16,
+        submission: Box<bcode_harness_models::HarnessSubmission>,
+    },
+    /// Correlated native delivery/execution/settlement evidence; never replay authority.
+    ExternalDeliveryObserved {
+        version: u16,
+        receipt: Box<bcode_harness_models::HarnessReceipt>,
+    },
+    /// Normalized semantic native output. Observed tools never dispatch Bcode tools.
+    ExternalObservationRecorded {
+        version: u16,
+        observation: Box<bcode_harness_models::HarnessObservation>,
+    },
+    /// Canonical resolution of an exact previously observed interaction.
+    ExternalInteractionResponded {
+        version: u16,
+        interaction: Box<bcode_harness_models::HarnessInteraction>,
+        response: Box<bcode_harness_models::HarnessResponse>,
     },
 }
 

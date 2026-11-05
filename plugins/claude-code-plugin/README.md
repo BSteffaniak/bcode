@@ -1,0 +1,186 @@
+# Claude Code managed harness
+
+`ClaudeCodePlugin` is a native Rust plugin (`cdylib` and statically usable `rlib`).
+Its manifest declares `bcode.harness/v1`; it never registers a model provider or
+executes an observed native tool through Bcode's tool dispatcher.
+
+## Integration
+
+The coordinator must register workspace membership/dependencies for
+`bcode_claude_code_plugin`, `bcode_claude_code`, and `bcode_harness_models`, and add
+the plugin to the bundled inventory. Other dependencies are existing workspace
+`bcode_plugin_sdk`, `bcode_provider_auth_models`, `serde`, `serde_json`, and `tokio`.
+Static entry type: `bcode_claude_code_plugin::ClaudeCodePlugin`.
+Dynamic entrypoints are emitted by `bcode_plugin_sdk::export_plugin!`.
+
+Resolved plugin configuration is a typed `instances` map. Each instance has:
+
+* `executable`: explicit absolute executable path.
+* `config_directory`: explicit absolute `CLAUDE_CONFIG_DIR`; the incoming config
+  namespace and auth credential namespace must both equal this selected path.
+* `exact_version`: exact expected native `--version` output.
+* `verified_session_state`: defaults false; only enable after testing this exact
+  executable's native session-state/background-task behavior. This mode declares
+  authoritative settlement `Supported`: the SDK itself requires idle plus a
+  result and completed tracked background tasks before emitting settlement, with
+  fresh idle required after task completion. Unknown task classes disable that
+  evidence; unverified mode reports unknown activity, never settlement. These
+  enforced producer guarantees are not free-text host admission constraints.
+* `verified_native_auth`: defaults false; only enable after testing the exact
+  executable's `auth status` namespace output and supported native login handoff.
+* `setting_sources`: absent preserves native settings inheritance; a list selects
+  explicit native sources (an empty list excludes optional sources). Managed
+  policy is never bypassed.
+
+Only explicitly selected native-account custody with auth provider ID `claude-code`
+is implemented. Ambient API-key,
+cloud, alternate endpoint, and token routes fail closed instead of silently
+changing billing. The process receives a narrow non-auth environment allowlist.
+No native credential files, keychains, or token stores are read.
+
+The host must admit each operation under current canonical session ownership and
+serialize mutations before dispatch. Plugin binding comparisons are additional
+process-generation checks, not a replacement for canonical fencing. Normalized
+observations must be persisted before the host advances the opaque page cursor.
+Pages are bounded by item and wire size. Retained observation reads validate the
+exact instance/target/generation independently of native process liveness: EOF
+invalidates live callbacks but does not erase queued confirmation or interaction
+evidence. Post-EOF pages report disconnected/unknown status and a gap; they do not
+authorize responding, submitting, replaying, or reviving the transport. Native pipes are drained on a persistent
+Tokio runtime independently of service polling. Queue overflow stops the process
+and exposes a gap; unread history is never silently dropped. `wait_millis` is
+currently satisfied with an immediate bounded poll.
+
+## Implemented semantics
+
+* Typed routing for inspect/open/submit/observe/respond/interrupt/close/reconcile
+  and all four auth operations.
+* Exact session/instance/native binding checks and retained mutation correlations.
+* Interrupt capability `Supported` means correlated native interrupt delivery on
+  the exact host-owned, control-ready Prepared or Confirmed transport. It does not
+  promise settlement, rollback, stopped background work, or absence of effects.
+  The plugin returns `Acknowledged` only after the native control response; write
+  completion, idle hints, and result observations cannot fabricate that response.
+  Timeout/disconnect remains uncertain and cannot authorize replay. `Constrained`
+  is reserved for actual capability prerequisites the host must explicitly verify,
+  such as the parent-assistance grant—not generic limits on acknowledgement meaning.
+* Native write completion remains `DeliveryAttempted`, not `NativeAccepted`.
+  Missing state after restart reconciles as uncertain, never not-applied.
+* Results remain nonterminal. Only verified native settlement is classified as
+  settled. No quiet timeout becomes a successful execution result.
+* Assistant text, native tool/subagent observations, single-question single-select
+  clarification, native approval, callback cancellation and scoped MCP assistance
+  normalization. Raw protocol/tool inputs remain transient and are not emitted.
+* Native MCP callbacks are never promoted into parent assistance from observed
+  names alone. Until a verified host parent scope is available, discovery exposes
+  no tools and requests receive explicit unsupported protocol responses.
+* Local native auth status (not remote verification), explicit `NativeHandoff`
+  interaction, status reinspection on continuation, local-flow cancellation
+  without logout or credential deletion. Sensitive auth input is rejected rather
+  than sent as ordinary stream text.
+
+## Integration gaps and constraints
+
+* Uses library control `initialize()` without waiting for identity. New sessions
+  select the retained Bcode UUID via `spawn_new_with_sdk_servers`; exact resume
+  selects only the host-provided native ID. Open returns `Prepared` while the
+  selection is merely requested, and `Opened` only for library-confirmed identity.
+  The exact retained `HarnessSessionTarget::Prepared` permits one first submission
+  on the same live transport. Native confirmation produces typed `BindingConfirmed`
+  before normalized activity. Contradictory IDs terminate; process loss remains
+  uncertain. No sentinel binding, dummy prompt, or automatic retry is used.
+  Host must persist Prepared before submission and confirmation before target
+  promotion. End-to-end create/resume behavior remains unvalidated.
+* Public `native_login_handoff_data(instance, options)` returns a versioned,
+  namespace-bound direct-execution plan. Manifest-declared plugin extension
+  `bcode.claude-code.handoff/v1`, operation `prepare_login`, accepts
+  `NativeLoginHandoffRequest` and returns `NativeLoginHandoffResponse` without
+  starting a runtime or process. Lane 11 must route this plan to a user-authorized
+  client terminal, verify exact version, clear ambient environment and use the
+  plan's complete allowlisted environment, then reinspect native status.
+  The shared `NativeHandoff` interaction still carries only a request ID; this
+  extension supplies the concrete execution data. Never run it on daemon stdio.
+  Native-auth provider contribution/registry routing remains coordinator-owned.
+* Parent assistance has real SDK MCP protocol handling in `parent_bridge.rs`:
+  initialize, tool discovery, exact `request_parent_assistance` calls, bounded
+  single-question argument validation, and typed pending `Assistance` interactions.
+  The normalizer retains the original MCP correlation, continues other observations
+  while waiting, fences responses against the exact generation/current scope, and
+  invalidates cancelled native callbacks. No arbitrary native tool dispatch exists.
+  Open validates the shared `HarnessAssistanceGrant` against child identity and
+  generation, retains the exact grant in the immutable open and every pending
+  assistance call, and registers the SDK MCP server only when the admitted grant
+  is present. Responses and cancellation require that exact retained grant,
+  including admission ID and parent generation—not merely equal scope text.
+  The host must issue/verify the grant against both current owners before open,
+  reauthorize each response, and close the native process on grant revocation or
+  owner change. The plugin cannot independently query canonical parent ownership.
+  No plugin-config self-grant exists. No shared types were duplicated or edited.
+  Source integration is implemented; native/end-to-end behavior is unvalidated.
+* Active steering is unsupported: native stream input has no atomic expected-turn
+  comparison. Unknown session-state modes cannot safely accept a second turn.
+* Mutation caches retain at most 256 recent entries per live process and rotate
+  only at a verified settled boundary. Canonical host admission must deduplicate
+  lifetime identities **before** dispatch, including after cache eviction/restart.
+  A cache miss always reconciles uncertain, never not-applied. This integration
+  requirement must be verified before enabling mutation routing.
+* Session-state markers may lack a native turn identity. Such evidence is emitted
+  as settled status plus an explicit diagnostic, never a fabricated turn ID.
+* Inspection reports configured compatibility/provenance; spawning/auth status
+  performs actual executable version verification. It is not a remote auth or
+  executable digest verification.
+
+## Submission acceptance limitation
+
+The shared `SubmissionAccepted { submission_id, attempt_id, native_turn_id }`
+observation requires native protocol proof of that exact association, with owner
+and generation taken from its enclosing observation. The currently integrated
+Claude SDK `submit` reports only frame write completion and carries no verified
+native acceptance event or stable turn mapping. Consequently this plugin emits
+no `SubmissionAccepted`: successful writes remain `DeliveryAttempted`, failed
+writes uncertain, and `native_request_id` stays absent. Raw assistant `turn_id`,
+message IDs/UUIDs, user echoes, result IDs/text, binding confirmation and idle
+cannot fill the missing association. Verified transport settlement may still be
+reported as status, but cannot complete a workflow assignment without accepted
+turn correlation. No automatic resend is authorized by missing acceptance.
+
+Production workflow acceptance remains blocked pending a behaviorally verified
+native/SDK contract that carries submission correlation and stable native turn
+identity. This needs protocol-owner evidence and a typed SDK event before a
+producer can safely emit the shared observation; configuration/version strings
+alone cannot assert it. Plugin tests cover rejection of raw identity lookalikes.
+
+## Native login evidence and client-terminal integration
+
+The `prepare_login` extension returns a direct-execution plan with typed `method`
+evidence: fixed `native-login`, `Supported`, `NativeManaged`, `ClientTerminal`, and
+`native_inactivity: unknown`. Support is gated by exact-version
+`VerifiedStatusAndLogin` configuration and namespace checks, not inferred from
+readiness. The added method object is additive v1 response data; consumers of
+older responses lacking it must not infer method support. No global inactivity
+proof is available from the native CLI status API. The plugin never enumerates
+processes or reads credentials to invent one.
+
+Host/client integration must distinguish a **fresh reserved terminal handoff**
+from recovery of an ambiguous prior login. Before fresh execution the canonical
+host must authorize the caller and reserve the actual credential namespace,
+exclude competing managed logins across instances, and retain the reservation
+through terminal child exit/reap and subsequent read-only status inspection.
+The client verifies the exact executable version, clears ambient environment,
+executes the fixed argv directly in its explicit terminal, and owns cancellation
+and reap of that child. Native URLs/codes stay in that terminal, never daemon
+stdio, session history, or model context. Exit alone is not readiness.
+
+A reservation covers cooperating host-managed flows only, not arbitrary external
+native processes. It cannot be represented as positive native-wide inactivity.
+A daemon restart, lost terminal connection, or unresolved prior flow must remain
+uncertain until the actual owned child is reconciled; `Ready`, an empty registry,
+and cancellation of the plugin's bookkeeping are not process-liveness evidence.
+If host admission requires global native inactivity even for a fresh flow, that
+API prerequisite is unsatisfiable with the currently supported CLI. A generic
+typed host-reservation/client-owned execution contract is required instead;
+this plugin cannot relax admission or silently substitute that contract.
+
+Behavioral tests are written in `src/tests.rs` and `src/capabilities.rs`. They have
+not been compiled or executed. Runtime/package/plugin/architecture validation and
+end-to-end acceptance remain pending.

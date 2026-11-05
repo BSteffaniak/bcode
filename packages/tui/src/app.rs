@@ -6850,7 +6850,16 @@ const fn event_breaks_sticky_entry_anchor(event: &SessionEvent) -> bool {
 
 const fn event_affects_transcript_rows(event: &SessionEvent) -> bool {
     match &event.kind {
-        SessionEventKind::SessionChildPublished { .. }
+        // Shared SessionView projects these as inert canonical transcript content. Include them
+        // in bounded window retention and below-viewport activity without dispatching native tools
+        // or interpreting receipts/observations as Bcode turn completion.
+        SessionEventKind::ExternalHarnessOperation { .. }
+        | SessionEventKind::ExternalBackendBound { .. }
+        | SessionEventKind::ExternalSubmissionAccepted { .. }
+        | SessionEventKind::ExternalDeliveryObserved { .. }
+        | SessionEventKind::ExternalObservationRecorded { .. }
+        | SessionEventKind::ExternalInteractionResponded { .. }
+        | SessionEventKind::SessionChildPublished { .. }
         | SessionEventKind::ChildSessionCreated { .. }
         | SessionEventKind::SubmissionAccepted { .. }
         | SessionEventKind::SubmissionActivated { .. }
@@ -9428,6 +9437,95 @@ mod tests {
                 .iter()
                 .any(|item| item.text() == "still streaming")
         );
+        drop(app);
+    }
+
+    #[test]
+    fn native_observations_invalidate_and_retain_transcript_without_bcode_execution() {
+        use bcode_harness_models::{
+            HarnessCompleteness, HarnessInteraction, HarnessInteractionKind, HarnessObservation,
+            HarnessObservationKind, HarnessPlacement, HarnessSubmission,
+        };
+        use bcode_session_models::{SessionEvent, SessionEventKind, SessionId};
+        let session_id = SessionId::new();
+        let mut app = BmuxApp::new_with_history(Some(session_id), &[], &[], false);
+        let kinds = [
+            SessionEventKind::ExternalSubmissionAccepted {
+                version: 1,
+                submission: Box::new(HarnessSubmission {
+                    submission_id: "native-input".into(),
+                    attempt_id: "attempt".into(),
+                    session_id: session_id.to_string(),
+                    generation: 1,
+                    text: "native submitted instructions".into(),
+                    placement: HarnessPlacement::NextTurn,
+                }),
+            },
+            SessionEventKind::ExternalObservationRecorded {
+                version: 1,
+                observation: Box::new(HarnessObservation {
+                    observation_id: "native-tool".into(),
+                    session_id: session_id.to_string(),
+                    generation: 1,
+                    native_correlations: vec![],
+                    completeness: HarnessCompleteness::Partial,
+                    kind: HarnessObservationKind::Tool {
+                        native_tool_id: "tool".into(),
+                        name: "native tool marker".into(),
+                        status: "observed".into(),
+                    },
+                }),
+            },
+            SessionEventKind::ExternalObservationRecorded {
+                version: 1,
+                observation: Box::new(HarnessObservation {
+                    observation_id: "native-question".into(),
+                    session_id: session_id.to_string(),
+                    generation: 1,
+                    native_correlations: vec![],
+                    completeness: HarnessCompleteness::Partial,
+                    kind: HarnessObservationKind::Interaction {
+                        interaction: HarnessInteraction {
+                            request_id: "question".into(),
+                            session_id: session_id.to_string(),
+                            generation: 1,
+                            kind: HarnessInteractionKind::Question,
+                            prompt: "native question marker".into(),
+                            scope: "workspace".into(),
+                            choices: vec![],
+                        },
+                    },
+                }),
+            },
+        ];
+        for (index, kind) in kinds.into_iter().enumerate() {
+            let event = SessionEvent {
+                schema_version: bcode_session_models::CURRENT_SESSION_EVENT_SCHEMA_VERSION,
+                session_id,
+                sequence: u64::try_from(index).unwrap() + 1,
+                timestamp_ms: 1,
+                provenance: None,
+                kind,
+            };
+            assert!(super::event_affects_transcript_rows(&event));
+            assert!(!super::event_breaks_sticky_entry_anchor(&event));
+            app.absorb_session_event(&event);
+            app.absorb_session_event(&event);
+        }
+        assert_eq!(app.session_view_snapshot().transcript.items.len(), 3);
+        for marker in [
+            "native submitted instructions",
+            "native tool marker",
+            "native question marker",
+        ] {
+            assert!(
+                app.transcript()
+                    .iter()
+                    .any(|item| item.text().contains(marker))
+            );
+        }
+        assert!(app.session_view_snapshot().tools.is_empty());
+        assert_eq!(app.session_view_snapshot().permissions, Vec::new());
         drop(app);
     }
 

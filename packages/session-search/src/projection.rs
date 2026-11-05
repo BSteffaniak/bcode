@@ -5,6 +5,7 @@ use crate::{
     ContractValidationError, DEFAULT_MAX_TEXT_BYTES_PER_RECORD, SearchContentKind, SearchField,
     SessionSearchLocator, SessionSearchRecord,
 };
+use bcode_harness_models::HarnessObservationKind;
 use bcode_session_models::{
     CURRENT_SESSION_EVENT_SCHEMA_VERSION, ReasoningActivity, SessionEvent, SessionEventKind,
     ToolInvocationLifecycleStage, ToolInvocationResult,
@@ -145,6 +146,9 @@ pub enum PersistedEventClassification {
 #[allow(clippy::unnested_or_patterns)]
 pub const fn classify_persisted_event(kind: &SessionEventKind) -> PersistedEventClassification {
     match kind {
+        SessionEventKind::ExternalObservationRecorded { observation, .. } => {
+            classify_external_observation(&observation.kind)
+        }
         SessionEventKind::AutomaticTitleUpdated { .. }
         | SessionEventKind::SessionCreated { name: Some(_), .. }
         | SessionEventKind::SubmissionAccepted { .. }
@@ -172,7 +176,8 @@ pub const fn classify_persisted_event(kind: &SessionEventKind) -> PersistedEvent
             PersistedEventClassification::PolicyControlled
         }
         SessionEventKind::ToolInvocationResultRecorded { record } => classify_tool_result(record),
-        SessionEventKind::ToolInvocationLifecycle {
+        SessionEventKind::ExternalSubmissionAccepted { .. }
+        | SessionEventKind::ToolInvocationLifecycle {
             event:
                 bcode_session_models::ToolInvocationLifecycleEvent {
                     stage:
@@ -185,7 +190,11 @@ pub const fn classify_persisted_event(kind: &SessionEventKind) -> PersistedEvent
         | SessionEventKind::AssistantReasoningDelta { .. } => {
             PersistedEventClassification::NonFinal
         }
-        SessionEventKind::MilestoneEvaluationRequested { .. }
+        SessionEventKind::ExternalHarnessOperation { .. }
+        | SessionEventKind::ExternalBackendBound { .. }
+        | SessionEventKind::ExternalDeliveryObserved { .. }
+        | SessionEventKind::ExternalInteractionResponded { .. }
+        | SessionEventKind::MilestoneEvaluationRequested { .. }
         | SessionEventKind::MilestonePublicationRequested { .. }
         | SessionEventKind::MilestoneEvaluationCompleted { .. }
         | SessionEventKind::SubmissionActivated { .. }
@@ -234,6 +243,26 @@ pub const fn classify_persisted_event(kind: &SessionEventKind) -> PersistedEvent
         SessionEventKind::InertHistory { .. }
         | SessionEventKind::ToolContribution { .. }
         | SessionEventKind::ToolContributionPlaced { .. } => PersistedEventClassification::Excluded,
+    }
+}
+
+/// Native activity is not a Bcode tool exchange. Interactive prompts and vendor
+/// detail have no approved search category and must not leak via generic JSON.
+const fn classify_external_observation(
+    kind: &HarnessObservationKind,
+) -> PersistedEventClassification {
+    match kind {
+        HarnessObservationKind::Result { .. } => PersistedEventClassification::Searchable,
+        HarnessObservationKind::Text { .. } => PersistedEventClassification::NonFinal,
+        HarnessObservationKind::SubmissionAccepted { .. }
+        | HarnessObservationKind::BindingConfirmed { .. }
+        | HarnessObservationKind::Tool { .. }
+        | HarnessObservationKind::Subagent { .. }
+        | HarnessObservationKind::Interaction { .. }
+        | HarnessObservationKind::Status { .. }
+        | HarnessObservationKind::Diagnostic { .. }
+        | HarnessObservationKind::Settlement { .. }
+        | HarnessObservationKind::Vendor { .. } => PersistedEventClassification::Excluded,
     }
 }
 
@@ -454,7 +483,13 @@ fn project_non_transcript_event(
         SessionEventKind::AssistantReasoningMessage { .. } => {
             EventProjection::Excluded(ProjectionExclusion::DisabledByPolicy)
         }
-        SessionEventKind::MilestoneEvaluationRequested { .. }
+        // Journals retain config/namespace details and duplicate transcript content;
+        // auth has no canonical variant. Metadata never receives a JSON fallback.
+        SessionEventKind::ExternalHarnessOperation { .. }
+        | SessionEventKind::ExternalBackendBound { .. }
+        | SessionEventKind::ExternalDeliveryObserved { .. }
+        | SessionEventKind::ExternalInteractionResponded { .. }
+        | SessionEventKind::MilestoneEvaluationRequested { .. }
         | SessionEventKind::MilestonePublicationRequested { .. }
         | SessionEventKind::MilestoneEvaluationCompleted { .. }
         | SessionEventKind::SubmissionActivated { .. }
@@ -503,7 +538,9 @@ fn project_non_transcript_event(
         | SessionEventKind::SessionChildrenReconciled { .. } => {
             EventProjection::Excluded(ProjectionExclusion::NoSearchableContent)
         }
-        SessionEventKind::SessionCreated { name: Some(_), .. }
+        SessionEventKind::ExternalSubmissionAccepted { .. }
+        | SessionEventKind::ExternalObservationRecorded { .. }
+        | SessionEventKind::SessionCreated { name: Some(_), .. }
         | SessionEventKind::SessionRenamed { name: Some(_) }
         | SessionEventKind::SubmissionAccepted { .. }
         | SessionEventKind::UserMessage { .. }
@@ -962,10 +999,83 @@ fn project_artifact_metadata(
     )
 }
 
+/// Project only approved transcript semantics, never raw protocol or journal payloads.
+/// Result text is a finalized message, not an assertion of assignment settlement.
+fn project_external_transcript_event(
+    event: &SessionEvent,
+    policy: &SearchProjectionPolicy,
+) -> Option<EventProjection> {
+    let (record_kind, content_kind, text) = match &event.kind {
+        SessionEventKind::ExternalSubmissionAccepted {
+            version: 1,
+            submission,
+        } if submission.session_id == event.session_id.to_string()
+            && submission.validate().is_ok() =>
+        {
+            (
+                "external-user-message",
+                SearchContentKind::UserMessage,
+                &submission.text,
+            )
+        }
+        SessionEventKind::ExternalObservationRecorded {
+            version: 1,
+            observation,
+        } if observation.session_id == event.session_id.to_string()
+            && observation.validate().is_ok() =>
+        {
+            match &observation.kind {
+                HarnessObservationKind::Result { text } => (
+                    "external-assistant-result",
+                    SearchContentKind::AssistantMessage,
+                    text,
+                ),
+                HarnessObservationKind::Text { .. } => {
+                    return Some(EventProjection::Excluded(
+                        ProjectionExclusion::NonFinalContent,
+                    ));
+                }
+                HarnessObservationKind::SubmissionAccepted { .. }
+                | HarnessObservationKind::BindingConfirmed { .. }
+                | HarnessObservationKind::Tool { .. }
+                | HarnessObservationKind::Subagent { .. }
+                | HarnessObservationKind::Interaction { .. }
+                | HarnessObservationKind::Status { .. }
+                | HarnessObservationKind::Diagnostic { .. }
+                | HarnessObservationKind::Settlement { .. }
+                | HarnessObservationKind::Vendor { .. } => {
+                    return Some(EventProjection::Excluded(
+                        ProjectionExclusion::NoSearchableContent,
+                    ));
+                }
+            }
+        }
+        SessionEventKind::ExternalSubmissionAccepted { .. }
+        | SessionEventKind::ExternalObservationRecorded { .. } => {
+            return Some(EventProjection::Excluded(
+                ProjectionExclusion::NoSearchableContent,
+            ));
+        }
+        _ => return None,
+    };
+    Some(project_text(
+        event,
+        record_kind,
+        content_kind,
+        SearchField::Text,
+        text,
+        BTreeMap::from([("source".to_owned(), "external_harness".to_owned())]),
+        policy.max_text_bytes_per_record,
+    ))
+}
+
 fn project_transcript_event(
     event: &SessionEvent,
     policy: &SearchProjectionPolicy,
 ) -> Option<EventProjection> {
+    if let Some(projection) = project_external_transcript_event(event, policy) {
+        return Some(projection);
+    }
     let (record_kind, content_kind, field, text) = match &event.kind {
         SessionEventKind::AutomaticTitleUpdated {
             evaluation_id,
@@ -1935,6 +2045,183 @@ mod tests {
             provenance: None,
             kind,
         }
+    }
+
+    fn external_observation_event(
+        kind: bcode_harness_models::HarnessObservationKind,
+    ) -> SessionEvent {
+        let mut event = event(
+            81,
+            SessionEventKind::SystemMessage {
+                text: String::new(),
+            },
+        );
+        event.kind = SessionEventKind::ExternalObservationRecorded {
+            version: 1,
+            observation: Box::new(bcode_harness_models::HarnessObservation {
+                observation_id: "native-observation".into(),
+                session_id: event.session_id.to_string(),
+                generation: 7,
+                native_correlations: Vec::new(),
+                completeness: bcode_harness_models::HarnessCompleteness::Complete,
+                kind,
+            }),
+        };
+        event
+    }
+
+    #[test]
+    fn external_result_is_bounded_searchable_transcript_not_tool_execution() {
+        let event =
+            external_observation_event(bcode_harness_models::HarnessObservationKind::Result {
+                text: "\u{1b}[31mFinal native answer\u{1b}[0m".into(),
+            });
+        let policy = SearchProjectionPolicy {
+            max_text_bytes_per_record: 12,
+            ..SearchProjectionPolicy::default()
+        };
+        assert_eq!(
+            classify_persisted_event(&event.kind),
+            PersistedEventClassification::Searchable
+        );
+        let EventProjection::Records(records) = project_event(&event, &policy).unwrap() else {
+            panic!("result must be searchable");
+        };
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].content_kind, SearchContentKind::AssistantMessage);
+        assert!(records[0].text.as_ref().unwrap().len() <= 12);
+        assert!(!records[0].text.as_ref().unwrap().contains('\u{1b}'));
+        assert!(!records[0].attributes.contains_key("tool_name"));
+    }
+
+    #[test]
+    fn external_submission_is_user_content_with_canonical_locator() {
+        let mut event = event(
+            82,
+            SessionEventKind::SystemMessage {
+                text: String::new(),
+            },
+        );
+        event.kind = SessionEventKind::ExternalSubmissionAccepted {
+            version: 1,
+            submission: Box::new(bcode_harness_models::HarnessSubmission {
+                submission_id: "submitted".into(),
+                attempt_id: "attempt".into(),
+                session_id: event.session_id.to_string(),
+                generation: 7,
+                text: "Find the ownership bug".into(),
+                placement: bcode_harness_models::HarnessPlacement::NextTurn,
+            }),
+        };
+        let EventProjection::Records(records) =
+            project_event(&event, &SearchProjectionPolicy::default()).unwrap()
+        else {
+            panic!("submission must be searchable");
+        };
+        assert_eq!(records[0].content_kind, SearchContentKind::UserMessage);
+        assert_eq!(records[0].text.as_deref(), Some("Find the ownership bug"));
+        assert_eq!(records[0].locator.sequence, 82);
+    }
+
+    #[test]
+    fn native_incremental_tools_and_vendor_detail_are_never_search_tool_calls() {
+        use bcode_harness_models::HarnessObservationKind;
+        for kind in [
+            HarnessObservationKind::Text {
+                text: "incremental".into(),
+            },
+            HarnessObservationKind::Tool {
+                native_tool_id: "native-tool".into(),
+                name: "shell.run".into(),
+                status: "secret command".into(),
+            },
+            HarnessObservationKind::Subagent {
+                native_agent_id: "native-agent".into(),
+                status: "native-only".into(),
+            },
+            HarnessObservationKind::Vendor {
+                namespace: "vendor".into(),
+                detail: serde_json::json!({"callback": "must-not-index"}),
+            },
+            HarnessObservationKind::Diagnostic {
+                code: "native-error".into(),
+                message: "must-not-index".into(),
+            },
+        ] {
+            let event = external_observation_event(kind);
+            let projection = project_event(&event, &SearchProjectionPolicy::default()).unwrap();
+            assert!(matches!(projection, EventProjection::Excluded(_)));
+        }
+    }
+
+    #[test]
+    fn native_submission_acceptance_is_inert_search_metadata() {
+        let event = external_observation_event(HarnessObservationKind::SubmissionAccepted {
+            submission_id: "submission-not-searchable".into(),
+            attempt_id: "attempt-not-searchable".into(),
+            native_turn_id: "native-turn-not-searchable".into(),
+        });
+        assert_eq!(
+            classify_persisted_event(&event.kind),
+            PersistedEventClassification::Excluded
+        );
+        assert_eq!(
+            project_event(&event, &SearchProjectionPolicy::default()).unwrap(),
+            EventProjection::Excluded(ProjectionExclusion::NoSearchableContent)
+        );
+    }
+
+    #[test]
+    fn external_delivery_evidence_is_metadata_not_replayed_search_content() {
+        let event = event(
+            83,
+            SessionEventKind::ExternalDeliveryObserved {
+                version: 1,
+                receipt: Box::new(bcode_harness_models::HarnessReceipt {
+                    submission_id: "submission".into(),
+                    attempt_id: "attempt".into(),
+                    session_id: "child".into(),
+                    generation: 7,
+                    state: bcode_harness_models::HarnessDeliveryState::Uncertain,
+                    native_request_id: Some("native-request".into()),
+                }),
+            },
+        );
+        assert_eq!(
+            classify_persisted_event(&event.kind),
+            PersistedEventClassification::MetadataOnly
+        );
+        assert_eq!(
+            project_event(&event, &SearchProjectionPolicy::default()).unwrap(),
+            EventProjection::Excluded(ProjectionExclusion::NoSearchableContent)
+        );
+    }
+
+    #[test]
+    fn unknown_external_version_and_wrong_session_fail_closed() {
+        let mut event =
+            external_observation_event(bcode_harness_models::HarnessObservationKind::Result {
+                text: "must-not-index".into(),
+            });
+        if let SessionEventKind::ExternalObservationRecorded { version, .. } = &mut event.kind {
+            *version = 2;
+        }
+        assert_eq!(
+            project_event(&event, &SearchProjectionPolicy::default()).unwrap(),
+            EventProjection::Excluded(ProjectionExclusion::NoSearchableContent)
+        );
+        if let SessionEventKind::ExternalObservationRecorded {
+            version,
+            observation,
+        } = &mut event.kind
+        {
+            *version = 1;
+            observation.session_id = "other-session".into();
+        }
+        assert_eq!(
+            project_event(&event, &SearchProjectionPolicy::default()).unwrap(),
+            EventProjection::Excluded(ProjectionExclusion::NoSearchableContent)
+        );
     }
 
     #[test]

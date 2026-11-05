@@ -1,4 +1,5 @@
 //! Session actor, handle, and snapshot plumbing.
+pub mod harness;
 
 #[cfg(test)]
 #[path = "milestone/actor_tests.rs"]
@@ -609,6 +610,75 @@ impl SessionHandle {
             reply,
         })
         .await?
+    }
+
+    pub(crate) async fn harness_submission_acceptance(
+        &self,
+        submission_id: String,
+        attempt_id: String,
+    ) -> Result<Option<bcode_harness_models::HarnessObservation>, SessionError> {
+        self.send(|reply| SessionCommand::HarnessSubmissionAcceptance {
+            submission_id,
+            attempt_id,
+            reply,
+        })
+        .await?
+    }
+    pub(crate) async fn harness_retained_request(
+        &self,
+        request: bcode_session_models::ExternalHarnessRequest,
+    ) -> Result<Option<bcode_session_models::ExternalHarnessClaim>, SessionError> {
+        self.send(|reply| SessionCommand::HarnessRetainedRequest {
+            request: Box::new(request),
+            reply,
+        })
+        .await?
+    }
+    pub(crate) async fn harness_snapshot(
+        &self,
+    ) -> Result<Option<bcode_session_models::ExternalHarnessState>, SessionError> {
+        self.send(SessionCommand::HarnessSnapshot).await?
+    }
+    pub(crate) async fn harness_history(
+        &self,
+        after: Option<String>,
+        limit: u16,
+    ) -> Result<bcode_harness_models::HarnessObservationPage, SessionError> {
+        self.send(|reply| SessionCommand::HarnessHistory {
+            after,
+            limit,
+            reply,
+        })
+        .await?
+    }
+    pub(crate) async fn harness_operation(
+        &self,
+        owner: bcode_session_models::ExternalHarnessOwner,
+        action: harness::HarnessAction,
+        timestamp: u64,
+    ) -> Result<harness::HarnessResult, SessionError> {
+        self.send(|reply| SessionCommand::HarnessOperation {
+            owner,
+            action,
+            timestamp,
+            reply,
+        })
+        .await?
+    }
+
+    pub(crate) async fn external_backend_page(
+        &self,
+        query: bcode_session_models::external_backend::ExternalBackendQuery,
+    ) -> Result<bcode_session_models::external_backend::ExternalBackendPage, SessionError> {
+        self.send(|reply| SessionCommand::ExternalBackendPage { query, reply })
+            .await?
+    }
+
+    pub(crate) async fn external_backend_binding(
+        &self,
+    ) -> Result<Option<SessionEvent>, SessionError> {
+        self.send(|reply| SessionCommand::ExternalBackendBinding { reply })
+            .await?
     }
 
     pub async fn append_event(
@@ -1727,6 +1797,41 @@ enum SessionCommand {
         timestamp_ms: u64,
         reply: oneshot::Sender<Result<SessionEvent, SessionError>>,
     },
+    HarnessSubmissionAcceptance {
+        submission_id: String,
+        attempt_id: String,
+        reply:
+            oneshot::Sender<Result<Option<bcode_harness_models::HarnessObservation>, SessionError>>,
+    },
+    HarnessRetainedRequest {
+        request: Box<bcode_session_models::ExternalHarnessRequest>,
+        reply: oneshot::Sender<
+            Result<Option<bcode_session_models::ExternalHarnessClaim>, SessionError>,
+        >,
+    },
+    HarnessSnapshot(
+        oneshot::Sender<Result<Option<bcode_session_models::ExternalHarnessState>, SessionError>>,
+    ),
+    HarnessHistory {
+        after: Option<String>,
+        limit: u16,
+        reply: oneshot::Sender<Result<bcode_harness_models::HarnessObservationPage, SessionError>>,
+    },
+    HarnessOperation {
+        owner: bcode_session_models::ExternalHarnessOwner,
+        action: harness::HarnessAction,
+        timestamp: u64,
+        reply: oneshot::Sender<Result<harness::HarnessResult, SessionError>>,
+    },
+    ExternalBackendPage {
+        query: bcode_session_models::external_backend::ExternalBackendQuery,
+        reply: oneshot::Sender<
+            Result<bcode_session_models::external_backend::ExternalBackendPage, SessionError>,
+        >,
+    },
+    ExternalBackendBinding {
+        reply: oneshot::Sender<Result<Option<SessionEvent>, SessionError>>,
+    },
     CompactionCheckpoint {
         key: String,
         reply: oneshot::Sender<Result<Option<SessionEvent>, SessionError>>,
@@ -2705,6 +2810,126 @@ impl SessionActor {
             } => Box::pin(async move {
                 let result =
                     Box::pin(self.restart_compaction_checkpoint(request, timestamp_ms)).await;
+                let _ = reply.send(result);
+                false
+            }),
+            SessionCommand::HarnessSubmissionAcceptance {
+                submission_id,
+                attempt_id,
+                reply,
+            } => Box::pin(async move {
+                let result = if let Some(db) = self.db.as_ref() {
+                    db.external_harness_submission_acceptance(&submission_id, &attempt_id)
+                        .await
+                        .map_err(Into::into)
+                } else if let Some(store) = self.store.as_ref() {
+                    let root = store.root_path();
+                    if crate::db::session_db_path(&root, self.state.summary.id).exists() {
+                        match SessionDb::open_existing_turso_in_root(self.state.summary.id, &root)
+                            .await
+                        {
+                            Ok(db) => db
+                                .external_harness_submission_acceptance(&submission_id, &attempt_id)
+                                .await
+                                .map_err(Into::into),
+                            Err(error) => Err(error.into()),
+                        }
+                    } else {
+                        Ok(None)
+                    }
+                } else {
+                    Ok(None)
+                };
+                let _ = reply.send(result);
+                false
+            }),
+            SessionCommand::HarnessRetainedRequest { request, reply } => Box::pin(async move {
+                let result = if let Some(db) = self.db.as_ref() {
+                    db.external_harness_retained_request(&request)
+                        .await
+                        .map_err(Into::into)
+                } else if let Some(store) = self.store.as_ref() {
+                    let root = store.root_path();
+                    if crate::db::session_db_path(&root, self.state.summary.id).exists() {
+                        match SessionDb::open_existing_turso_in_root(self.state.summary.id, &root)
+                            .await
+                        {
+                            Ok(db) => db
+                                .external_harness_retained_request(&request)
+                                .await
+                                .map_err(Into::into),
+                            Err(error) => Err(error.into()),
+                        }
+                    } else {
+                        Ok(None)
+                    }
+                } else {
+                    Ok(None)
+                };
+                let _ = reply.send(result);
+                false
+            }),
+            SessionCommand::HarnessSnapshot(reply) => Box::pin(async move {
+                // Observation does not reacquire a runtime lease. Reuse a live actor DB,
+                // otherwise make a short-lived non-migrating open and retain no handle.
+                let result = if let Some(db) = self.db.as_ref() {
+                    db.external_harness_snapshot().await.map_err(Into::into)
+                } else if let Some(store) = self.store.as_ref() {
+                    let root = store.root_path();
+                    if crate::db::session_db_path(&root, self.state.summary.id).exists() {
+                        match SessionDb::open_existing_turso_in_root(self.state.summary.id, &root)
+                            .await
+                        {
+                            Ok(db) => db.external_harness_snapshot().await.map_err(Into::into),
+                            Err(error) => Err(error.into()),
+                        }
+                    } else {
+                        Ok(None)
+                    }
+                } else {
+                    Ok(None)
+                };
+                let _ = reply.send(result);
+                false
+            }),
+            SessionCommand::HarnessHistory {
+                after,
+                limit,
+                reply,
+            } => Box::pin(async move {
+                let result = match self.existing_session_db().await {
+                    Ok(Some(db)) => db.harness_history(after, limit).await.map_err(Into::into),
+                    Ok(None) => Err(SessionError::DbUnavailable(self.state.summary.id)),
+                    Err(error) => Err(error),
+                };
+                let _ = reply.send(result);
+                false
+            }),
+            SessionCommand::HarnessOperation {
+                owner,
+                action,
+                timestamp,
+                reply,
+            } => Box::pin(async move {
+                let result = Box::pin(self.harness_operation(owner, action, timestamp)).await;
+                let _ = reply.send(result);
+                false
+            }),
+            SessionCommand::ExternalBackendPage { query, reply } => Box::pin(async move {
+                let result = match self.existing_session_db().await {
+                    Ok(Some(db)) => db.external_backend_page(&query).await.map_err(Into::into),
+                    Ok(None) => Err(SessionError::DbUnavailable(self.state.summary.id)),
+                    Err(error) => Err(error),
+                };
+                let _ = reply.send(result);
+                false
+            }),
+            SessionCommand::ExternalBackendBinding { reply } => Box::pin(async move {
+                let result = match self.existing_session_db().await {
+                    Ok(Some(db)) => db.external_backend_binding().await.map_err(Into::into),
+                    Ok(None) => Err(SessionError::DbUnavailable(self.state.summary.id)),
+                    Err(error) => Err(error),
+                };
                 let _ = reply.send(result);
                 false
             }),
@@ -4070,6 +4295,50 @@ impl SessionActor {
             .is_some_and(|done| !published || done))
     }
 
+    fn validate_harness_append_owner(&self, kind: &SessionEventKind) -> Result<(), SessionError> {
+        if let SessionEventKind::ExternalHarnessOperation { operation } = kind {
+            operation
+                .validate()
+                .map_err(SessionError::EventSerialization)?;
+            let lease = self
+                .lease
+                .as_ref()
+                .ok_or_else(|| {
+                    SessionError::EventSerialization(
+                        "managed operation requires canonical lease".into(),
+                    )
+                })?
+                .owner();
+            if operation.owner.session_id != self.state.summary.id
+                || lease.build_fingerprint.as_deref() != Some(operation.owner.artifact_id.as_str())
+                || lease.daemon_instance_id.as_deref() != Some(operation.owner.daemon_id.as_str())
+            {
+                return Err(SessionError::EventSerialization(
+                    "managed operation owner mismatch".into(),
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    fn external_append_evidence(
+        &self,
+        kind: &SessionEventKind,
+    ) -> Result<Option<bcode_session_models::ExternalBackendEnvelope>, SessionError> {
+        let external = if matches!(kind, SessionEventKind::ExternalHarnessOperation { .. }) {
+            None
+        } else {
+            bcode_session_models::external_backend::ExternalBackendEnvelope::from_event_kind(kind)
+                .map_err(SessionError::EventSerialization)?
+        };
+        if external.is_some() && self.store.is_none() {
+            return Err(SessionError::EventSerialization(
+                "managed external sessions require durable storage".into(),
+            ));
+        }
+        Ok(external)
+    }
+
     async fn append_event_conditionally(
         &mut self,
         kind: SessionEventKind,
@@ -4079,6 +4348,7 @@ impl SessionActor {
         child_transition: Option<(SessionId, bool)>,
     ) -> Result<Option<SessionEvent>, SessionError> {
         self.ensure_ownership()?;
+        self.validate_harness_append_owner(&kind)?;
         let total_started_at = Instant::now();
         let metrics = self.store.as_ref().map(SessionStoreExecutor::metrics);
         crate::ensure_durable_session_event_kind(&kind, metrics.as_ref())?;
@@ -4087,6 +4357,7 @@ impl SessionActor {
         if let Some(metrics) = &metrics {
             metrics.increment_counter("session.actor.append_event.total");
         }
+        let external = self.external_append_evidence(&kind)?;
         let event_timestamp_ms = provenance
             .as_ref()
             .and_then(|provenance| provenance.source_timestamp_ms)
@@ -4116,6 +4387,15 @@ impl SessionActor {
                     "session.actor.append_event.readiness_duration_ms",
                     elapsed_ms(readiness_started_at),
                 );
+            }
+            if let Some(external) = &external {
+                let db = self
+                    .db
+                    .as_ref()
+                    .ok_or(SessionError::DbUnavailable(self.state.summary.id))?;
+                if let Some(prior) = db.external_backend_retry(&external.record).await? {
+                    return Ok(Some(prior));
+                }
             }
             let mut event = self.state.build_next_event(kind, event_timestamp_ms);
             event.provenance = provenance;
@@ -4150,11 +4430,28 @@ impl SessionActor {
             event.provenance = provenance;
             event
         };
-        self.apply_appended_event(&event, activity_timestamp_ms)
+        self.finish_canonical_append(
+            &event,
+            activity_timestamp_ms,
+            metrics.as_ref(),
+            total_started_at,
+        )
+        .await?;
+        Ok(Some(event))
+    }
+
+    async fn finish_canonical_append(
+        &mut self,
+        event: &SessionEvent,
+        activity_timestamp_ms: u64,
+        metrics: Option<&bcode_metrics::MetricsRegistry>,
+        total_started_at: Instant,
+    ) -> Result<(), SessionError> {
+        self.apply_appended_event(event, activity_timestamp_ms)
             .await?;
         let manifest_started_at = Instant::now();
         self.update_manifest_and_schedule_catalog().await;
-        if let Some(metrics) = &metrics {
+        if let Some(metrics) = metrics {
             metrics.record_histogram(
                 "session.actor.append_event.manifest_duration_ms",
                 elapsed_ms(manifest_started_at),
@@ -4162,13 +4459,13 @@ impl SessionActor {
         }
         self.state.load_status = SessionLoadStatusKind::Current;
         self.refresh_snapshot();
-        if let Some(metrics) = &metrics {
+        if let Some(metrics) = metrics {
             metrics.record_histogram(
                 "session.actor.append_event.duration_ms",
                 elapsed_ms(total_started_at),
             );
         }
-        Ok(Some(event))
+        Ok(())
     }
 
     async fn apply_appended_event(

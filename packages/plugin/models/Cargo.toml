@@ -11,10 +11,11 @@ repository  = { workspace = true }
 version     = { workspace = true }
 
 [dependencies]
-bcode_keymap_models = { workspace = true }
-bcode_tool_models   = { workspace = true }
-serde               = { workspace = true, features = ["derive", "std"] }
-serde_json          = { workspace = true }
+bcode_harness_models = { workspace = true }
+bcode_keymap_models  = { workspace = true }
+bcode_tool_models    = { workspace = true }
+serde                = { workspace = true, features = ["derive", "std"] }
+serde_json           = { workspace = true }
 
 [features]
 default          = []

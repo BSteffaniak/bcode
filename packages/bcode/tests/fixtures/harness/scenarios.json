@@ -1,0 +1,47 @@
+{
+  "pi_turn": [
+    {"expect":{"type":"prompt","message":"fixture-only"},"capture":{"request":"id"},"effect":"pi-prompt","emit":[{"type":"response","id":"$request","command":"prompt","success":true,"data":{"disposition":"started"}},{"type":"agent_start"},{"type":"agent_end","messages":[]}]},
+    {"gate":"pi-settlement","emit":[{"type":"agent_settled","aborted":false}]}
+  ],
+  "pi_handled_without_turn": [
+    {"expect":{"type":"prompt"},"capture":{"request":"id"},"emit":[{"type":"response","id":"$request","command":"prompt","success":true,"data":{"disposition":"handled"}}]}
+  ],
+  "pi_question": [
+    {"expect":{"type":"prompt"},"capture":{"request":"id"},"emit":[{"type":"response","id":"$request","command":"prompt","success":true,"data":{"disposition":"started"}},{"type":"extension_ui_request","id":"question-native-1","method":"select","title":"Choose fixture mode","options":["safe","inspect"]}]},
+    {"expect":{"type":"extension_ui_response","id":"question-native-1","value":"safe"},"effect":"question-answer","emit":[{"type":"agent_end","messages":[]},{"type":"agent_settled","aborted":false}]}
+  ],
+  "pi_confirm_not_security_approval": [
+    {"expect":{"type":"prompt"},"capture":{"request":"id"},"emit":[{"type":"response","id":"$request","command":"prompt","success":true,"data":{"disposition":"started"}},{"type":"extension_ui_request","id":"confirm-native-1","method":"confirm","title":"Continue extension?","message":"This is UI consent, not a native tool security boundary"}]},
+    {"expect":{"type":"extension_ui_response","id":"confirm-native-1","confirmed":false},"emit":[{"type":"agent_settled","aborted":false}]}
+  ],
+  "pi_lost_ack": [
+    {"expect":{"type":"prompt"},"effect":"pi-prompt","exit":81}
+  ],
+  "pi_stale_response": [
+    {"expect":{"type":"get_state"},"capture":{"request":"id"},"emit":[{"type":"response","id":"previous-owner-request","command":"get_state","success":true,"data":{"isStreaming":false,"isCompacting":false,"steeringMessageCount":0,"followUpMessageCount":0}},{"type":"response","id":"$request","command":"get_state","success":true,"data":{"isStreaming":true,"isCompacting":false,"steeringMessageCount":0,"followUpMessageCount":0}}]}
+  ],
+  "pi_abort_lost_ack": [
+    {"expect":{"type":"abort"},"effect":"pi-abort","exit":82}
+  ],
+  "pi_sensitive_error": [
+    {"expect":{"type":"prompt"},"capture":{"request":"id"},"emit":[{"type":"response","id":"$request","command":"prompt","success":false,"error":"authorization failed: fixture-secret-DO-NOT-PERSIST"}],"exit":1}
+  ],
+  "codex_lost_turn_ack": [
+    {"expect":{"method":"initialize"},"capture":{"initialize":"id"},"emit":[{"id":"$initialize","result":{"userAgent":"offline-fixture"}}]},
+    {"expect":{"method":"initialized"}},
+    {"expect":{"method":"turn/start","params":{"threadId":"fixture-thread"}},"effect":"codex-turn","exit":83}
+  ],
+  "codex_expected_turn_mismatch": [
+    {"expect":{"method":"turn/steer","params":{"threadId":"fixture-thread","expectedTurnId":"stale-turn"}},"capture":{"request":"id"},"emit":[{"id":"$request","error":{"code":-32602,"message":"Expected turn does not match active turn"}}]}
+  ],
+  "claude_result_before_background": [
+    {"expect":{"type":"user"},"effect":"claude-user","emit":[{"type":"system","subtype":"session_state_changed","session_id":"fixture-session","state":"running"},{"type":"system","subtype":"task_started","task_id":"fixture-background","task_type":"local_agent","session_id":"fixture-session"},{"type":"result","subtype":"success","is_error":false,"result":"foreground result","session_id":"fixture-session","num_turns":1,"duration_ms":1,"duration_api_ms":1,"total_cost_usd":0,"usage":{}}]},
+    {"gate":"claude-background","emit":[{"type":"system","subtype":"task_notification","task_id":"fixture-background","status":"completed","output_file":"fixture-output","summary":"background finished","session_id":"fixture-session"},{"type":"result","subtype":"success","is_error":false,"result":"background continuation result","session_id":"fixture-session","num_turns":2,"duration_ms":1,"duration_api_ms":1,"total_cost_usd":0,"usage":{}},{"type":"system","subtype":"session_state_changed","session_id":"fixture-session","state":"idle"}]}
+  ],
+  "malformed_frame": [
+    {"expect":{"type":"get_state"},"raw":"{not-json\n","exit":84}
+  ],
+  "partial_frame_then_exit": [
+    {"expect":{"type":"get_state"},"raw":"{\"type\":\"response\"","exit":85}
+  ]
+}

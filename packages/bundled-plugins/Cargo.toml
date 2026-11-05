@@ -15,7 +15,9 @@ bcode_auth_broker_plugin                = { workspace = true, optional = true }
 bcode_auth_broker_provider_plugin       = { workspace = true, optional = true }
 bcode_bedrock_provider_plugin           = { workspace = true, optional = true }
 bcode_blims_plugin                      = { workspace = true, optional = true }
+bcode_claude_code_plugin                = { workspace = true, optional = true }
 bcode_code_review_plugin                = { workspace = true, optional = true }
+bcode_codex_harness_plugin              = { workspace = true, optional = true }
 bcode_compressed_session_search_plugin  = { workspace = true, optional = true }
 bcode_default_agents_plugin             = { workspace = true, optional = true }
 bcode_document_plugin                   = { workspace = true, optional = true }
@@ -25,6 +27,7 @@ bcode_file_references_plugin            = { workspace = true, optional = true }
 bcode_filesystem_plugin                 = { workspace = true, optional = true }
 bcode_git_plugin                        = { workspace = true, optional = true }
 bcode_github_review_publisher_plugin    = { workspace = true, optional = true }
+bcode_harness_plugin                    = { workspace = true, optional = true }
 bcode_jev_provider_plugin               = { workspace = true, optional = true }
 bcode_loop_plugin                       = { workspace = true, optional = true }
 bcode_metrics_plugin                    = { workspace = true, optional = true }
@@ -98,9 +101,17 @@ static-bundled-blims-plugin = [
     "dep:bcode_blims_plugin",
     "bcode_blims_plugin/static-bundled",
 ]
+static-bundled-claude-code-plugin = [
+    "dep:bcode_claude_code_plugin",
+    "bcode_claude_code_plugin/static-bundled",
+]
 static-bundled-code-review-plugin = [
     "dep:bcode_code_review_plugin",
     "bcode_code_review_plugin/static-bundled",
+]
+static-bundled-codex-harness-plugin = [
+    "dep:bcode_codex_harness_plugin",
+    "bcode_codex_harness_plugin/static-bundled",
 ]
 static-bundled-compressed-session-search-plugin = [
     "dep:bcode_compressed_session_search_plugin",
@@ -138,6 +149,10 @@ static-bundled-github-review-publisher-plugin = [
     "dep:bcode_github_review_publisher_plugin",
     "bcode_github_review_publisher_plugin/static-bundled",
 ]
+static-bundled-harness-plugin = [
+    "dep:bcode_harness_plugin",
+    "bcode_harness_plugin/static-bundled",
+]
 static-bundled-jev-provider-plugin = [
     "dep:bcode_jev_provider_plugin",
     "bcode_jev_provider_plugin/static-bundled",
@@ -171,6 +186,9 @@ static-bundled-pi-session-import-plugin = [
     "bcode_pi_session_import_plugin/static-bundled",
 ]
 static-bundled-plugins = [
+    "static-bundled-claude-code-plugin",
+    "static-bundled-codex-harness-plugin",
+    "static-bundled-harness-plugin",
     "static-bundled-bedrock-provider-plugin",
     "static-bundled-blims-plugin",
     "static-bundled-code-review-plugin",

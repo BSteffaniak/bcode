@@ -1,0 +1,19 @@
+id      = "bcode.codex-harness"
+name    = "Bcode Codex Harness"
+version = "0.0.1"
+
+[[services]]
+class        = "service"
+description  = "Native Codex app-server managed session backend"
+interface_id = "bcode.harness/v1"
+name         = "Codex managed sessions"
+
+[concurrency]
+max  = 1
+type = "limited"
+
+[runtime]
+abi_version  = 5
+event_symbol = "bcode_plugin_handle_event_v1"
+library      = "libbcode_codex_harness_plugin.dylib"
+type         = "native"

@@ -14,6 +14,7 @@ mod actions;
 pub mod child_activity;
 pub mod child_attention;
 pub mod compaction_activity;
+pub mod external;
 pub mod navigation;
 pub mod presentation;
 
@@ -1809,6 +1810,27 @@ struct RichToolCheckpoint {
     tool_invocations: BTreeMap<String, ToolInvocationAggregate>,
     contribution_sequences: BTreeMap<String, u64>,
     contribution_placements: BTreeMap<String, bcode_session_models::ToolContributionPlacement>,
+}
+
+/// These durable events advance the observation cursor without retaining semantic view owners.
+const fn is_cursor_only_observed_event(kind: &SessionEventKind) -> bool {
+    matches!(
+        kind,
+        SessionEventKind::ClientAttached { .. }
+            | SessionEventKind::ClientDetached { .. }
+            | SessionEventKind::TraceEvent { .. }
+            | SessionEventKind::SessionImported { .. }
+            | SessionEventKind::SessionDerived { .. }
+            | SessionEventKind::InertHistory { .. }
+            | SessionEventKind::ModelFeatureFidelityNegotiated { .. }
+            | SessionEventKind::ExecutionSessionCreated { .. }
+            | SessionEventKind::SessionChildLinked { .. }
+            | SessionEventKind::SessionChildrenReconciled { .. }
+            | SessionEventKind::MilestoneEvaluationRequested { .. }
+            | SessionEventKind::MilestonePublicationRequested { .. }
+            | SessionEventKind::MilestonePublished { .. }
+            | SessionEventKind::MilestoneEvaluationCompleted { .. }
+    )
 }
 
 /// Renderer-neutral session view projection.
@@ -6004,12 +6026,77 @@ impl SessionView {
         Ok(())
     }
 
+    fn apply_external_event_bounded(
+        &mut self,
+        event: &SessionEvent,
+        retained: &mut bcode_session_view_models::retention::ObservationRetentionUsage,
+        limits: bcode_session_view_models::retention::ObservationRetentionLimits,
+    ) -> Result<(), bcode_session_view_models::retention::ObservationRetentionExceeded> {
+        use bcode_session_view_models::retention::{
+            ObservationRetentionExceeded, ObservationRetentionUsage,
+        };
+        let source_limits = bcode_session_view_models::retention::SessionObservationSourceLimits {
+            max_scalar_capacity_bytes: limits.scalar_capacity_bytes,
+            max_collection_entries: limits.collection_entries,
+            max_value_nodes: limits.value_nodes,
+            max_depth: limits.depth,
+            max_queued_events: 1,
+            max_in_flight_events: 0,
+        };
+        let source =
+            bcode_session_models::retention_events::inspect_durable(event, &source_limits)?;
+        let temporary = ObservationRetentionUsage {
+            scalar_capacity_bytes: source
+                .scalar_capacity_bytes
+                .checked_mul(16)
+                .ok_or(ObservationRetentionExceeded)?,
+            collection_entries: source
+                .collection_entries
+                .checked_mul(4)
+                .ok_or(ObservationRetentionExceeded)?,
+            value_nodes: source
+                .value_nodes
+                .checked_mul(4)
+                .ok_or(ObservationRetentionExceeded)?,
+            depth: source.depth,
+            copies: 2,
+        };
+        let mut peak = *retained;
+        peak.try_add(temporary, limits)?;
+        if let Some(text) =
+            external::canonical_external_text(event).map_err(|_| ObservationRetentionExceeded)?
+        {
+            let (mut item, replacement, mut next) =
+                self.stage_system_message_bounded(event, &text, peak, limits)?;
+            next.try_release(temporary)?;
+            next.depth = retained.depth.max(7);
+            if let TranscriptViewItemKind::SystemMessage { message } = &mut item.kind {
+                message.format = TextFormat::PlainText;
+            }
+            self.commit_system_message(item, replacement);
+            self.finish_admitted_event(event);
+            *retained = next;
+            return Ok(());
+        }
+        Ok(())
+    }
+
     fn apply_observed_event_bounded(
         &mut self,
         event: &SessionEvent,
         retained: &mut bcode_session_view_models::retention::ObservationRetentionUsage,
         limits: bcode_session_view_models::retention::ObservationRetentionLimits,
     ) -> Result<(), bcode_session_view_models::retention::ObservationRetentionExceeded> {
+        if external::is_external_event(&event.kind) {
+            return self.apply_external_event_bounded(event, retained, limits);
+        }
+        if is_cursor_only_observed_event(&event.kind) {
+            self.snapshot.session_id = Some(event.session_id);
+            if event.sequence != 0 {
+                self.snapshot.latest_sequence = Some(event.sequence);
+            }
+            return Ok(());
+        }
         match &event.kind {
             SessionEventKind::ToolContribution { .. }
             | SessionEventKind::ToolContributionPlaced { .. } => {
@@ -6056,26 +6143,6 @@ impl SessionView {
                     retained,
                     limits,
                 );
-            }
-            SessionEventKind::ClientAttached { .. }
-            | SessionEventKind::ClientDetached { .. }
-            | SessionEventKind::TraceEvent { .. }
-            | SessionEventKind::SessionImported { .. }
-            | SessionEventKind::SessionDerived { .. }
-            | SessionEventKind::InertHistory { .. }
-            | SessionEventKind::ModelFeatureFidelityNegotiated { .. }
-            | SessionEventKind::ExecutionSessionCreated { .. }
-            | SessionEventKind::SessionChildLinked { .. }
-            | SessionEventKind::SessionChildrenReconciled { .. }
-            | SessionEventKind::MilestoneEvaluationRequested { .. }
-            | SessionEventKind::MilestonePublicationRequested { .. }
-            | SessionEventKind::MilestonePublished { .. }
-            | SessionEventKind::MilestoneEvaluationCompleted { .. } => {
-                self.snapshot.session_id = Some(event.session_id);
-                if event.sequence != 0 {
-                    self.snapshot.latest_sequence = Some(event.sequence);
-                }
-                return Ok(());
             }
             SessionEventKind::ModelUsage { usage, .. } => {
                 return self.apply_usage_bounded(event, usage, retained, limits);
@@ -9965,6 +10032,36 @@ impl SessionView {
                 return;
             }
             self.snapshot.latest_sequence = Some(event.sequence);
+        }
+        if external::is_external_event(&event.kind) {
+            match external::canonical_external_text(event) {
+                Ok(Some(text)) => {
+                    self.push_item(
+                        TranscriptViewItemId::event(event.sequence),
+                        event.sequence,
+                        Some(event.timestamp_ms),
+                        false,
+                        TranscriptViewItemKind::SystemMessage {
+                            message: ChatMessageView::plain(text),
+                        },
+                    );
+                }
+                Err(_) => {
+                    self.push_item(
+                        TranscriptViewItemId::event(event.sequence),
+                        event.sequence,
+                        Some(event.timestamp_ms),
+                        false,
+                        TranscriptViewItemKind::SystemMessage {
+                            message: ChatMessageView::plain(
+                                "External history unavailable: invalid canonical evidence",
+                            ),
+                        },
+                    );
+                }
+                Ok(None) => {}
+            }
+            return;
         }
         if let Some(invocation_id) = tool_invocation_id(event) {
             let aggregate = self

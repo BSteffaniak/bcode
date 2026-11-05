@@ -92,11 +92,13 @@ bcode_daemon_lifecycle     = { workspace = true }
 bcode_hello_plugin         = { workspace = true }
 bcode_ipc                  = { workspace = true }
 bcode_plugin               = { workspace = true }
+bcode_provider_auth        = { workspace = true }
 bcode_question_plugin      = { workspace = true, features = ["static-bundled"] }
 bcode_server               = { workspace = true }
 bcode_shell_plugin         = { workspace = true, features = ["static-bundled"] }
 bcode_workflow_store       = { workspace = true }
 bcode_workflow_view_models = { workspace = true }
+hex                        = { workspace = true }
 sshenv_vault               = { workspace = true }
 tempfile                   = { workspace = true }
 tokio                      = { workspace = true, features = ["macros", "rt", "test-util"] }
@@ -185,11 +187,19 @@ static-bundled-blims-plugin = [
     "bundled-plugins",
     "bcode_bundled_plugins/static-bundled-blims-plugin",
 ]
+static-bundled-claude-code-plugin = [
+    "bundled-plugins",
+    "bcode_bundled_plugins/static-bundled-claude-code-plugin",
+]
 static-bundled-code-review-plugin = [
     "bundled-plugins",
     "cli",
     "bcode_bundled_plugins/static-bundled-code-review-plugin",
     "bcode_cli/static-bundled-code-review-plugin",
+]
+static-bundled-codex-harness-plugin = [
+    "bundled-plugins",
+    "bcode_bundled_plugins/static-bundled-codex-harness-plugin",
 ]
 static-bundled-compressed-session-search-plugin = [
     "bundled-plugins",
@@ -234,6 +244,10 @@ static-bundled-github-review-publisher-plugin = [
     "bundled-plugins",
     "bcode_bundled_plugins/static-bundled-github-review-publisher-plugin",
 ]
+static-bundled-harness-plugin = [
+    "bundled-plugins",
+    "bcode_bundled_plugins/static-bundled-harness-plugin",
+]
 static-bundled-jev-provider-plugin = [
     "bundled-plugins",
     "bcode_bundled_plugins/static-bundled-jev-provider-plugin",
@@ -260,6 +274,9 @@ static-bundled-pi-session-import-plugin = [
     "bcode_bundled_plugins/static-bundled-pi-session-import-plugin",
 ]
 static-bundled-plugins = [
+    "static-bundled-claude-code-plugin",
+    "static-bundled-codex-harness-plugin",
+    "static-bundled-harness-plugin",
     "bundled-plugins",
     "cli",
     "static-bundled-compressed-session-search-plugin",

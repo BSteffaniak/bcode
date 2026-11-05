@@ -332,14 +332,15 @@ fn decode_for_migration(
     }
     let source_kind = envelope.source_kind_name()?;
     if source_kind == "child_session_created"
+        && envelope.schema_version() < 52
         && crate::is_released_event_kind_schema(source_kind, envelope.schema_version())
     {
         return envelope.decode_child_session_created();
     }
-    // Schema 51 is losslessly representation-compatible except for child creation above.
+    // Schemas 51 and 52 are losslessly representation-compatible except for child creation above.
     // Preserve recorded usage and all admission identities rather than applying older policy.
-    if envelope.schema_version() == 51
-        && crate::is_released_event_kind_schema(source_kind, 51)
+    if matches!(envelope.schema_version(), 51 | 52)
+        && crate::is_released_event_kind_schema(source_kind, envelope.schema_version())
         && crate::RELEASED_EVENT_VARIANTS.iter().any(|variant| {
             variant.kind == source_kind
                 && variant.treatment == crate::ReleasedEventTreatment::CurrentEquivalent
@@ -349,12 +350,12 @@ fn decode_for_migration(
             .map(|event| HistoricalDecode::Converted {
                 event,
                 metadata: HistoricalEventMetadata {
-                    source_schema: 51,
+                    source_schema: envelope.schema_version(),
                     source_kind: source_kind.to_owned(),
                 },
             })
             .map_err(|reason| HistoricalSessionEventError::InvalidEvent {
-                schema_version: 51,
+                schema_version: envelope.schema_version(),
                 event_kind: source_kind.to_owned(),
                 reason,
             });
@@ -473,9 +474,10 @@ mod tests {
     #[test]
     fn schema_52_fixture_migrates_losslessly_without_creating_checkpoints() {
         let plan = crate::plan_writer_epoch_migration(16).expect("known lossless upgrade");
-        assert_eq!(plan.target_writer_epoch, 17);
-        assert_eq!(plan.steps.len(), 1);
+        assert_eq!(plan.target_writer_epoch, crate::CURRENT_WRITER_EPOCH);
+        assert_eq!(plan.steps.len(), 2);
         assert_eq!(plan.steps[0].id, "session-writer-epoch-16-to-17");
+        assert_eq!(plan.steps[1].id, "session-writer-epoch-17-to-18");
         let fixture = include_str!("../fixtures/stores/epoch-16-schema-52-events.jsonl");
         let mut seen = BTreeSet::new();
         for payload in fixture.lines() {
@@ -787,6 +789,12 @@ mod tests {
         };
         assert_eq!(crate::CURRENT_EVENT_SCHEMA, 53);
         assert_eq!(crate::LATEST_HISTORICAL_EVENT_SCHEMA, 52);
+        // Classification preserves the source envelope; canonical normalization alone
+        // advances its schema after historical semantics have been interpreted.
+        assert_eq!(event.schema_version, metadata.source_schema);
+        assert!(crate::is_released_historical_event_schema(
+            metadata.source_schema
+        ));
         assert_eq!(metadata.source_schema, 46);
         let SessionEventKind::ModelUsage { usage, .. } = event.kind else {
             panic!("converted event should remain model usage");
@@ -1366,6 +1374,63 @@ mod tests {
     }
 
     #[test]
+    fn epoch_17_replay_preserves_normalized_external_evidence_without_vendor_runtime() {
+        use bcode_session_models::external_backend::ExternalBackendEnvelope;
+        let mut event = serde_json::from_str::<SessionEvent>(
+            include_str!("../fixtures/stores/epoch-16-schema-52-events.jsonl")
+                .lines()
+                .next()
+                .unwrap(),
+        )
+        .unwrap();
+        let record = serde_json::from_value(serde_json::json!({
+            "kind": "observation",
+            "observation": {
+                "observation_id": "external-output", "session_id": event.session_id.to_string(),
+                "generation": 1, "native_correlations": ["native-turn"], "completeness": "partial",
+                "kind": { "kind": "text", "text": "retained offline: 🦀" }
+            }
+        }))
+        .unwrap();
+        let envelope = ExternalBackendEnvelope { version: 1, record };
+        event.schema_version = crate::CURRENT_EVENT_SCHEMA;
+        event.kind = envelope.clone().into_event_kind().unwrap();
+        let payload = serde_json::to_string(&event).unwrap();
+        // Typed external evidence was introduced at schema 53. Never accept it as
+        // a fabricated schema-52 event merely because serde recognizes its shape.
+        let mut historical = event.clone();
+        historical.schema_version = 52;
+        assert!(matches!(
+            normalize_canonical_row(&bcode_session_migration_target::CanonicalRow {
+                sequence: historical.sequence,
+                event_kind: "external_observation_recorded".into(),
+                schema_version: 52,
+                payload: serde_json::to_string(&historical).unwrap(),
+            }),
+            Err(HistoricalSessionEventError::UnsupportedEventKind {
+                schema_version: 52,
+                ..
+            })
+        ));
+        let normalized = normalize_canonical_row(&bcode_session_migration_target::CanonicalRow {
+            sequence: event.sequence,
+            event_kind: "external_observation_recorded".into(),
+            schema_version: event.schema_version,
+            payload,
+        })
+        .unwrap();
+        assert_eq!(normalized.event, event);
+        assert_eq!(
+            ExternalBackendEnvelope::from_event(&normalized.event).unwrap(),
+            Some(envelope)
+        );
+        assert!(normalized.metric_counter.is_none());
+        let plan = crate::plan_writer_epoch_migration(17).unwrap();
+        assert_eq!(plan.target_writer_epoch, crate::CURRENT_WRITER_EPOCH);
+        assert_eq!(plan.steps.len(), 1);
+    }
+
+    #[test]
     fn epoch_16_replay_preserves_identity_through_historical_conversion() {
         let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("fixtures");
         let manifest = crate::load_released_fixture_manifest(&root).expect("fixture inventory");
@@ -1376,6 +1441,7 @@ mod tests {
             .event_schema;
         let fixtures = manifest.fixtures.iter().filter(|fixture| {
             fixture.lifecycle_matrix.source_writer_epochs.contains(&16)
+                && fixture.path == std::path::Path::new("stores/epoch-16-schema-52-events.jsonl")
                 && fixture.event_schemas == [source_schema]
         });
         let mut replayed = 0;

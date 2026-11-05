@@ -12,6 +12,11 @@ use crate::{
     SessionLiveEventKind, TextStreamOperation,
 };
 
+#[path = "retention_external.rs"]
+mod external;
+#[path = "retention_harness_operation.rs"]
+mod harness_operation;
+
 pub(crate) struct Inspector {
     pub(crate) usage: ObservationRetentionUsage,
     pub(crate) limits: ObservationRetentionLimits,
@@ -1524,6 +1529,14 @@ fn durable_child_and_results(
         SessionEventKind::ToolInvocationResultRecorded { record } => {
             terminal_result_record(i, record)?;
         }
+        SessionEventKind::ExternalHarnessOperation { operation } => {
+            harness_operation::inspect(i, operation)?;
+        }
+        SessionEventKind::ExternalBackendBound { .. }
+        | SessionEventKind::ExternalSubmissionAccepted { .. }
+        | SessionEventKind::ExternalDeliveryObserved { .. }
+        | SessionEventKind::ExternalObservationRecorded { .. }
+        | SessionEventKind::ExternalInteractionResponded { .. } => external::inspect(i, kind)?,
         SessionEventKind::TraceEvent { trace: value } => trace(i, value, 3)?,
         _ => return Err(ObservationRetentionExceeded),
     }

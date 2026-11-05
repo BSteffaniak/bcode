@@ -11,6 +11,7 @@ repository  = { workspace = true }
 version     = { workspace = true }
 
 [dependencies]
+bcode_harness_models       = { workspace = true }
 bcode_model_catalog_models = { workspace = true }
 bcode_skill_models         = { workspace = true }
 bcode_tool_models          = { workspace = true }

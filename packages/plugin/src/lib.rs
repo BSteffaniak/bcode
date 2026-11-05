@@ -6,6 +6,7 @@
 #[cfg(feature = "bmux-host")]
 mod bmux_host_adapter;
 mod diagnostics;
+pub mod harness;
 pub mod interaction_controller;
 mod invocation_callbacks;
 

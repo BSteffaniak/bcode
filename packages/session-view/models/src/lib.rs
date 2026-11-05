@@ -8,6 +8,7 @@
 //! web, and future renderers should be able to consume them without depending on terminal frames,
 //! browser DOM primitives, daemon clients, or application orchestration.
 
+pub mod external;
 pub mod presentation;
 
 use bcode_session_models::{

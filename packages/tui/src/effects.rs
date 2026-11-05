@@ -3190,6 +3190,18 @@ fn submission_attach_error(error: TuiError) -> ClientError {
     }
 }
 
+async fn require_model_submission_target(
+    client: &BcodeClient,
+    session_id: bcode_session_models::SessionId,
+) -> Result<(), ClientError> {
+    if client.managed_session_binding(session_id).await?.is_some() {
+        return Err(ClientError::Protocol(
+            "Managed external session: use /native status to inspect the exact prepared/confirmed target, then /native send <generation> <submission-id> <attempt-id> <text>; model/agent/reasoning selections are not applied to native execution".into(),
+        ));
+    }
+    Ok(())
+}
+
 async fn submit_message(
     client: &BcodeClient,
     request: SubmitMessageRequest,
@@ -3254,6 +3266,7 @@ async fn submit_message(
         event_stream_release = Some(release);
         session_id
     };
+    require_model_submission_target(client, session_id).await?;
     apply_submit_runtime_selections(
         client,
         session_id,

@@ -6,6 +6,18 @@
 //! intentionally keeps Turso-specific details at connection boundaries and uses
 //! `switchy` database traits for migrations and repository operations.
 
+#[path = "db_external_backend.rs"]
+mod external_backend;
+#[path = "external_backend_manager.rs"]
+mod external_backend_manager;
+#[path = "harness_manager.rs"]
+mod harness_manager;
+#[path = "db_harness_operation.rs"]
+mod harness_operation;
+#[path = "harness_prepare.rs"]
+mod harness_prepare;
+use external_backend::{project_external_backend, validate_external_backend_append};
+
 use std::{
     collections::BTreeMap,
     fs,
@@ -6503,6 +6515,8 @@ async fn validate_append_preconditions_inner(
 ) -> SessionDbResult<()> {
     bcode_session_models::CompactionSynthesisCheckpoint::from_event(event)
         .map_err(SessionDbError::InvalidData)?;
+    validate_external_backend_append(db, event).await?;
+    harness_operation::validate(db, event).await?;
     let canonical_tail = last_sequence(db).await?;
     validate_append_identity(event, canonical_tail)?;
     Box::pin(crate::turn_continuation::validate_member_result(db, event)).await?;
@@ -6817,6 +6831,12 @@ async fn project_appended_event(db: &dyn Database, event: &SessionEvent) -> Sess
 }
 
 async fn project_turn_evidence(db: &dyn Database, event: &SessionEvent) -> SessionDbResult<()> {
+    if harness_operation::project(db, event).await? {
+        return Ok(());
+    }
+    if project_external_backend(db, event).await? {
+        return Ok(());
+    }
     if let Some(checkpoint) = bcode_session_models::CompactionSynthesisCheckpoint::from_event(event)
         .map_err(SessionDbError::InvalidData)?
     {

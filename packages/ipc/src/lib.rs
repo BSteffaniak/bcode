@@ -4,6 +4,9 @@
 
 //! Client/server IPC protocol for bcode.
 
+pub mod harness;
+pub use harness::{ManagedSessionRequest, ManagedSessionResponse, ManagedSessionTargetSnapshot};
+
 use bcode_agent_profile::{AgentInfo, PolicyStatusResponse};
 use bcode_metrics::MetricsSnapshot;
 #[cfg(unix)]
@@ -143,7 +146,8 @@ const MAX_CHUNK_DATA_SIZE: usize = MAX_FRAME_PAYLOAD_SIZE / 2;
 /// Version 58 adds explicit session-scoped local X-ray endpoint bootstrap and revocation.
 /// Version 59 adds non-owning bounded activity and child-window watch delivery.
 /// Older positional request/response layouts are rejected rather than misinterpreted.
-pub const CURRENT_PROTOCOL_VERSION: u16 = 59;
+/// Version 60 adds the managed-session application boundary alongside the upstream layout.
+pub const CURRENT_PROTOCOL_VERSION: u16 = 60;
 
 /// Durable session-storage writer epoch expected by this IPC build.
 pub const CURRENT_SESSION_STORAGE_WRITER_EPOCH: u32 =
@@ -594,6 +598,10 @@ mod milestone_wire_tests {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Request {
+    /// Host-admitted managed sessions; never direct native service authority.
+    ManagedSession {
+        request: Box<ManagedSessionRequest>,
+    },
     Hello {
         client_name: String,
         #[serde(default)]
@@ -2441,6 +2449,9 @@ pub enum ResponsePayload {
     },
     RevokeXrayExecutionWatch {
         revoked: bcode_xray_models::execution_watch::ExecutionWatchRevoked,
+    },
+    ManagedSession {
+        response: ManagedSessionResponse,
     },
     Hello {
         protocol_version: ProtocolVersion,
@@ -4682,8 +4693,9 @@ mod tests {
             panic!("typed discovery response");
         };
         assert_eq!(actual, page);
-        assert_eq!(CURRENT_PROTOCOL_VERSION, 59);
+        assert_eq!(CURRENT_PROTOCOL_VERSION, 60);
         assert_ne!(ProtocolVersion(56), ProtocolVersion::current());
+        assert_ne!(ProtocolVersion(59), ProtocolVersion::current());
     }
 
     #[test]

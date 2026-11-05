@@ -1,0 +1,14 @@
+# Expanded into a private temporary test directory by harness_cli_acceptance.rs.
+# This configuration selects only the statically bundled native adapter; it does
+# not configure a model provider, a real native executable, or ambient auth.
+[plugins]
+default = "none"
+enabled = ["bcode.claude-code"]
+
+[plugins.config."bcode.claude-code".instances.offline-claude]
+executable = @EXECUTABLE@
+config_directory = @NAMESPACE@
+exact_version = "bcode-offline-claude-fixture 1.0.0"
+verified_session_state = true
+verified_native_auth = true
+setting_sources = []
