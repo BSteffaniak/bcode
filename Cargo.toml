@@ -66,6 +66,7 @@ members = [
     "packages/client",
     "packages/command",
     "packages/config",
+    "packages/config/layers",
     "packages/confined-fs",
     "packages/database-observability",
     "packages/docs-site",
@@ -233,6 +234,7 @@ bcode_code_review_plugin                = { version = "0.0.1-alpha.0", default-f
 bcode_command                           = { version = "0.0.1-alpha.0", default-features = false, path = "packages/command" }
 bcode_compressed_session_search_plugin  = { version = "0.0.1-alpha.0", default-features = false, path = "plugins/compressed-session-search-plugin" }
 bcode_config                            = { version = "0.0.1-alpha.0", default-features = false, path = "packages/config" }
+bcode_config_layers                     = { version = "0.0.1-alpha.0", default-features = false, path = "packages/config/layers" }
 bcode_confined_fs                       = { version = "0.0.1-alpha.0", default-features = false, path = "packages/confined-fs" }
 bcode_daemon_lifecycle                  = { version = "0.0.1-alpha.0", default-features = false, path = "packages/daemon-lifecycle" }
 bcode_database_observability            = { version = "0.0.1-alpha.0", default-features = false, path = "packages/database-observability" }

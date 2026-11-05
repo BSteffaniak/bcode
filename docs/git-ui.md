@@ -51,7 +51,7 @@ Paired removed/added lines get word-level emphasis on the changed span.
 
 ## Layout
 
-The left column holds five windows; the right side is the main view.
+By default the left column holds five windows and the right side is the main view.
 
 1. **Status**: repository, branch, ahead/behind, operation in progress.
 2. **Files** · Worktrees · Submodules: changes as a collapsible tree (`` ` `` toggles a flat list).
@@ -59,9 +59,17 @@ The left column holds five windows; the right side is the main view.
 4. **Commits** · Reflog: history with a colored graph; unpushed commits are highlighted.
 5. **Stash**.
 
-`]`/`[` switch tabs, `1`–`5` and `0` focus windows, `+`/`_` enlarge or shrink the focused window,
-and terminals narrower than 84 columns stack the side windows above the main view. Mouse clicks
-focus windows and select rows; clicking the selected row again opens it; the wheel scrolls.
+`]`/`[` switch tabs, `1`–`9` focus side windows by position and `0` the main view. `+`/`_` cycle
+the screen mode:
+
+* **normal**: every side window beside the main view.
+* **half**: only the focused side window beside the main view; the others shrink to one-line
+  titles you can click (or disappear with `collapsed_windows = "hidden"`).
+* **full**: the focused window fills the screen.
+
+Terminals narrower than 84 columns stack the side windows above the main view. Mouse clicks focus
+windows and select rows; clicking the selected row again opens it; the wheel scrolls. Every part of
+this is configurable; see [Layout settings](#layout-settings).
 
 ## Features
 
@@ -93,21 +101,25 @@ focus windows and select rows; clicking the selected row again opens it; the whe
 
 ## Configuration
 
-Settings live in the ordinary bcode configuration files, so `bcode git` and `bcode-git` read the
-same values: `$XDG_CONFIG_HOME/bcode/bcode.toml` (or `$BCODE_CONFIG`), then `<repo>/bcode.toml`,
-then `<repo>/.bcode/bcode.toml`, later files overriding earlier ones. `BCODE_CONFIG_TOML` is applied
-last. Invalid sections are reported in the UI and replaced by defaults.
+Settings live in the ordinary bcode configuration files, and `bcode git` and `bcode-git` compose
+them with the same layering policy as bcode itself (`bcode_config_layers`): the user file
+`$XDG_CONFIG_HOME/bcode/bcode.toml`, then `bcode.toml` and `.bcode/bcode.toml` at the repository
+root, then the `$BCODE_CONFIG` file (which must exist when set), then inline `$BCODE_CONFIG_TOML`.
+Later layers override earlier ones, and `[composition]` profiles apply, so a profile can carry its
+own git UI layout. `bcode-git --print-config-paths` lists the candidate files and which were read.
+Invalid sections are reported in the UI and replaced by defaults.
 
 ```toml
 [plugins.config."bcode.git".ui]
 enabled = true                  # false hides `bcode git` (the standalone binary ignores it)
 diff_context = 3
-side_panel_percent = 33
 log_page_size = 300
 show_graph = true
-file_tree = true
 relative_dates = true
 editor = "nvim"                 # default: $GIT_EDITOR, $VISUAL, $EDITOR, then vi
+
+[plugins.config."bcode.git".ui.files]
+tree = true                     # false lists files flat; `` ` `` toggles for the session
 
 [plugins.config."bcode.git".ui.highlight]
 enabled = true
@@ -133,6 +145,63 @@ prompts = [{ name = "title", title = "PR title" }]
 confirm = false
 interactive = false             # true hands the terminal to the command
 show_output = true
+```
+
+### Layout settings
+
+```toml
+[plugins.config."bcode.git".ui.layout]
+screen_mode = "normal"          # normal | half | full at startup; `+`/`_` change it
+side_panel_width = 33           # percent of the width in normal mode (10–90)
+half_side_panel_width = 50      # percent of the width in half mode
+collapsed_windows = "titles"    # half mode: other windows as clickable titles, or "hidden"
+initial_window = "files"        # any view name below, or "main"
+windows = [                     # top to bottom; each window lists its tabs; omit views to hide them
+  ["status"],
+  ["files", "worktrees", "submodules"],
+  ["branches", "remotes", "tags"],
+  ["commits", "reflog"],
+  ["stash"],
+]
+expand_focused = true           # give the focused side window more height
+expanded_weight = 3             # its height relative to the others
+main_split = "flexible"         # staged/unstaged sections: flexible | stacked | side-by-side
+main_split_min_width = 180      # flexible: side by side from this terminal width
+portrait = "auto"               # stack side windows above the main view: auto | always | never
+portrait_below_width = 84
+status_bar = true               # false hides key hints; progress and messages still show
+
+[plugins.config."bcode.git".ui.layout.command_log]
+show = false                    # `@` toggles it
+height = 8
+```
+
+View names are `status`, `files`, `worktrees`, `submodules`, `branches`, `remotes`, `tags`,
+`commits`, `reflog` and `stash`. Unknown or repeated names are reported and skipped. Number keys
+follow the configured order, and the `focus-<view>` actions (unbound by default) jump to a view
+wherever it lives. For example, one window on the left and the changes on the right, with a flat
+file list:
+
+```toml
+[plugins.config."bcode.git".ui.layout]
+screen_mode = "half"
+initial_window = "files"
+
+[plugins.config."bcode.git".ui.files]
+tree = false
+```
+
+### Importing a lazygit configuration
+
+`bcode-git --import-lazygit [CONFIG_YML]` (or `bcode git --import-lazygit`) prints TOML converted
+from a lazygit `config.yml`. Without a path it uses `$LG_CONFIG_FILE` or lazygit's default
+location. The output covers layout, file tree, diff context, graph, refresh settings and
+keybindings; values equal to bcode's defaults are left out, and anything without a bcode
+equivalent, or a key a panel binding would shadow, is listed in `# note:` comments. Review it and
+append it to `bcode.toml`:
+
+```sh
+bcode-git --import-lazygit >> ~/.config/bcode/bcode.toml
 ```
 
 Custom command placeholders are `{file}`, `{branch}`, `{commit}`, `{remote}`, `{tag}`, `{stash}`,
@@ -187,11 +256,25 @@ currently use `StandaloneHost`, which contributes nothing.
 | `bcode.git.global.back` | Back / close | `escape` |
 | `bcode.git.global.next-panel` | Focus next panel | `tab`, `l`, `right` |
 | `bcode.git.global.previous-panel` | Focus previous panel | `shift+tab`, `h`, `left` |
-| `bcode.git.global.focus-status` | Focus status panel | `1` |
-| `bcode.git.global.focus-files` | Focus files panel | `2` |
-| `bcode.git.global.focus-branches` | Focus branches panel | `3` |
-| `bcode.git.global.focus-commits` | Focus commits panel | `4` |
-| `bcode.git.global.focus-stash` | Focus stash panel | `5` |
+| `bcode.git.global.focus-window-1` | Focus side window 1 | `1` |
+| `bcode.git.global.focus-window-2` | Focus side window 2 | `2` |
+| `bcode.git.global.focus-window-3` | Focus side window 3 | `3` |
+| `bcode.git.global.focus-window-4` | Focus side window 4 | `4` |
+| `bcode.git.global.focus-window-5` | Focus side window 5 | `5` |
+| `bcode.git.global.focus-window-6` | Focus side window 6 | `6` |
+| `bcode.git.global.focus-window-7` | Focus side window 7 | `7` |
+| `bcode.git.global.focus-window-8` | Focus side window 8 | `8` |
+| `bcode.git.global.focus-window-9` | Focus side window 9 | `9` |
+| `bcode.git.global.focus-status` | Focus the status view | — |
+| `bcode.git.global.focus-files` | Focus the files view | — |
+| `bcode.git.global.focus-worktrees` | Focus the worktrees view | — |
+| `bcode.git.global.focus-submodules` | Focus the submodules view | — |
+| `bcode.git.global.focus-branches` | Focus the local branches view | — |
+| `bcode.git.global.focus-remotes` | Focus the remotes view | — |
+| `bcode.git.global.focus-tags` | Focus the tags view | — |
+| `bcode.git.global.focus-commits` | Focus the commits view | — |
+| `bcode.git.global.focus-reflog` | Focus the reflog view | — |
+| `bcode.git.global.focus-stash` | Focus the stash view | — |
 | `bcode.git.global.focus-main` | Focus main view | `0` |
 | `bcode.git.global.previous-tab` | Previous tab | `[` |
 | `bcode.git.global.help` | Keybindings for this view | `?` |
@@ -219,7 +302,7 @@ currently use `StandaloneHost`, which contributes nothing.
 |---|---|---|
 | `bcode.git.list.up` | Previous item | `k`, `up` |
 | `bcode.git.list.down` | Next item | `j`, `down` |
-| `bcode.git.list.page-up` | Previous page | ``, ``, `pageup` |
+| `bcode.git.list.page-up` | Previous page | `,`, `pageup` |
 | `bcode.git.list.page-down` | Next page | `.`, `pagedown` |
 | `bcode.git.list.top` | First item | `<`, `home`, `g g` |
 | `bcode.git.list.bottom` | Last item | `>`, `end`, `shift+g` |
@@ -420,4 +503,3 @@ currently use `StandaloneHost`, which contributes nothing.
 |---|---|---|
 | `bcode.git.confirm.yes` | Confirm | `enter`, `y` |
 | `bcode.git.confirm.no` | Cancel | `escape`, `n`, `q` |
-

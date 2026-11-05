@@ -16,6 +16,7 @@ use bmux_tui_components::text_input::{TextInputControl, TextInputOutcome, TextIn
 use bmux_tui_runtime::{Command, CommandKey, Program, RuntimeEvent, Update};
 
 use crate::config::GitUiConfig;
+pub use crate::config::ScreenMode;
 use crate::data::{
     FileNode, MainContent, MainRequest, PresentContext, SectionKind, Snapshot, file_rows,
     load_main, load_snapshot,
@@ -24,6 +25,7 @@ use crate::diffview::RowKind;
 use crate::graph;
 use crate::host::GitUiHost;
 use crate::keymap::{Action, Keymap, Resolution, Scope};
+use crate::layout::{Layout, Start};
 use crate::ops::{self, HeadPosition, Op};
 use crate::popup::{External, Popup, Prompt, PromptKind, Then};
 use crate::theme::GitTheme;
@@ -31,53 +33,19 @@ use crate::theme::GitTheme;
 /// Top-level focus target.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum Window {
-    /// Repository status.
-    Status,
-    /// Files, worktrees and submodules.
-    Files,
-    /// Branches, remotes and tags.
-    Branches,
-    /// Commits and reflog.
-    Commits,
-    /// Stash.
-    Stash,
+    /// A side window, by position in the configured layout (top first).
+    Side(usize),
     /// Main view.
     Main,
 }
 
-/// Side windows in display order.
-pub const SIDE: [Window; 5] = [
-    Window::Status,
-    Window::Files,
-    Window::Branches,
-    Window::Commits,
-    Window::Stash,
-];
-
 impl Window {
-    /// Window number shown in titles.
+    /// Window number shown in titles: side windows count from 1, the main view is 0.
     #[must_use]
     pub const fn number(self) -> usize {
         match self {
-            Self::Status => 1,
-            Self::Files => 2,
-            Self::Branches => 3,
-            Self::Commits => 4,
-            Self::Stash => 5,
+            Self::Side(index) => index + 1,
             Self::Main => 0,
-        }
-    }
-
-    /// Tabs shown in the window title.
-    #[must_use]
-    pub const fn tabs(self) -> &'static [View] {
-        match self {
-            Self::Status => &[View::Status],
-            Self::Files => &[View::Files, View::Worktrees, View::Submodules],
-            Self::Branches => &[View::Branches, View::Remotes, View::Tags],
-            Self::Commits => &[View::Commits, View::Reflog],
-            Self::Stash => &[View::Stash],
-            Self::Main => &[],
         }
     }
 }
@@ -257,9 +225,11 @@ pub struct CommitFiles {
     pub patch: BTreeSet<String>,
 }
 
-/// Commits of a selected ref shown in the branches window.
+/// Commits of a selected ref, shown in the window it was opened from.
 #[derive(Debug, Clone)]
 pub struct SubCommits {
+    /// Window hosting the view.
+    pub window: Window,
     /// Title.
     pub title: String,
     /// Revision.
@@ -268,17 +238,6 @@ pub struct SubCommits {
     pub commits: Vec<Commit>,
     /// Graph cells.
     pub graph: Vec<Vec<graph::Cell>>,
-}
-
-/// How much space the focused window takes.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ScreenMode {
-    /// Side panels and main side by side.
-    Normal,
-    /// Focused side enlarged.
-    Half,
-    /// Focused window only.
-    Full,
 }
 
 /// Line selection while staging.
@@ -333,6 +292,7 @@ pub struct App {
     pub(crate) collapsed: BTreeSet<String>,
     pub(crate) file_tree: bool,
 
+    pub(crate) layout: Layout,
     pub(crate) window: Window,
     pub(crate) last_side: Window,
     pub(crate) tabs: BTreeMap<Window, usize>,
@@ -401,8 +361,14 @@ impl App {
             relative_dates: config.relative_dates,
             show_graph: config.show_graph,
         };
-        let file_tree = config.file_tree;
-        Self {
+        let file_tree = config.files.tree;
+        let (layout, layout_diagnostics) = Layout::resolve(&config.layout);
+        let mut diagnostics = diagnostics;
+        diagnostics.extend(layout_diagnostics);
+        let screen_mode = config.layout.screen_mode;
+        let command_log = config.layout.command_log.show;
+        let start = layout.start;
+        let mut app = Self {
             repo,
             config,
             keymap,
@@ -417,8 +383,9 @@ impl App {
             file_nodes: Vec::new(),
             collapsed: BTreeSet::new(),
             file_tree,
-            window: Window::Files,
-            last_side: Window::Files,
+            layout,
+            window: Window::Side(0),
+            last_side: Window::Side(0),
             tabs: BTreeMap::new(),
             cursors: BTreeMap::new(),
             keys: BTreeMap::new(),
@@ -449,8 +416,8 @@ impl App {
             queue: VecDeque::new(),
             running: None,
             spinner: 0,
-            command_log: false,
-            screen_mode: ScreenMode::Normal,
+            command_log,
+            screen_mode,
             cherry: Vec::new(),
             undo: Vec::new(),
             redo: Vec::new(),
@@ -465,7 +432,19 @@ impl App {
             diagnostics,
             inline: false,
             inbox: VecDeque::new(),
+        };
+        match start {
+            Start::View(view) => {
+                app.focus_view(view);
+            }
+            Start::Main => {
+                if !app.focus_view(View::Files) {
+                    app.focus(Window::Side(0));
+                }
+                app.window = Window::Main;
+            }
         }
+        app
     }
 
     /// External program requested before the runtime exited, if any.
@@ -512,25 +491,59 @@ impl App {
     /// View shown in a side window.
     #[must_use]
     pub fn view(&self, window: Window) -> View {
+        if window == Window::Main {
+            return self.view(self.last_side);
+        }
         if let Some(files) = &self.commit_files
             && files.window == window
         {
             return View::CommitFiles;
         }
+        if let Some(sub) = &self.sub_commits
+            && sub.window == window
+        {
+            return View::SubCommits;
+        }
+        let tabs = self.tabs(window);
+        let Some(last) = tabs.len().checked_sub(1) else {
+            return View::Status;
+        };
+        match tabs[self.tabs.get(&window).copied().unwrap_or(0).min(last)] {
+            View::Remotes if self.remote.is_some() => View::RemoteBranches,
+            view => view,
+        }
+    }
+
+    /// Side windows from top to bottom.
+    pub fn side_windows(&self) -> impl Iterator<Item = Window> + use<> {
+        (0..self.layout.windows.len()).map(Window::Side)
+    }
+
+    /// Tabs of a side window.
+    #[must_use]
+    pub fn tabs(&self, window: Window) -> &[View] {
         match window {
-            Window::Branches if self.sub_commits.is_some() => View::SubCommits,
-            Window::Branches if self.remote.is_some() => View::RemoteBranches,
-            Window::Main => self.view(self.last_side),
-            _ => {
-                let tabs = window.tabs();
-                tabs[self
-                    .tabs
-                    .get(&window)
-                    .copied()
-                    .unwrap_or(0)
-                    .min(tabs.len() - 1)]
+            Window::Side(index) => self.layout.windows.get(index).map_or(&[], Vec::as_slice),
+            Window::Main => &[],
+        }
+    }
+
+    /// Focus the window holding a view and switch to its tab. Returns `false` when the
+    /// layout hides the view.
+    pub(crate) fn focus_view(&mut self, view: View) -> bool {
+        let Some((window, tab)) = self.layout.position(view) else {
+            return false;
+        };
+        let remotes = self.layout.windows[window].contains(&View::Remotes);
+        let window = Window::Side(window);
+        if self.tabs.get(&window).copied().unwrap_or(0) != tab {
+            self.tabs.insert(window, tab);
+            if remotes {
+                self.remote = None;
             }
         }
+        self.focus(window);
+        true
     }
 
     /// Focused side view (the last side view when the main view is focused).
@@ -910,7 +923,13 @@ impl App {
     ) -> Option<Command<Msg>> {
         self.sub_commits_generation += 1;
         let generation = self.sub_commits_generation;
+        let window = if self.window == Window::Main {
+            self.last_side
+        } else {
+            self.window
+        };
         self.sub_commits = Some(SubCommits {
+            window,
             title,
             revision: revision.clone(),
             commits: Vec::new(),
@@ -1443,7 +1462,6 @@ impl App {
     }
 
     fn install_snapshot(&mut self, snapshot: Snapshot) {
-        let first = !self.loaded_once;
         self.loaded_once = true;
         self.commit_graph = graph::layout(&snapshot.commits);
         self.file_nodes = file_rows(&snapshot.status, self.file_tree, &self.collapsed);
@@ -1461,9 +1479,6 @@ impl App {
             self.remote = None;
         }
         self.restore_cursors();
-        if first && self.snapshot.status.entries.is_empty() {
-            self.focus(Window::Commits);
-        }
     }
 
     pub(crate) fn rebuild_files(&mut self) {
@@ -1575,7 +1590,7 @@ impl App {
                         ),
                         true,
                     );
-                    self.focus(Window::Files);
+                    self.focus_view(View::Files);
                 } else {
                     self.toast(error.clone(), true);
                 }
@@ -1617,15 +1632,16 @@ impl UpdateExt for Update<Msg> {
 fn parse_hit(id: &str) -> (Option<Window>, Option<(usize, usize)>) {
     let mut parts = id.split('.');
     let window = match parts.next() {
-        Some("side-1") => Window::Status,
-        Some("side-2") => Window::Files,
-        Some("side-3") => Window::Branches,
-        Some("side-4") => Window::Commits,
-        Some("side-5") => Window::Stash,
         Some(main) if main.starts_with("main-") => {
             let section = main.trim_start_matches("main-").parse().unwrap_or(0);
             let row = parts.find_map(|part| part.parse::<usize>().ok());
             return (Some(Window::Main), row.map(|row| (section, row)));
+        }
+        Some(side) if side.starts_with("side-") => {
+            match side.trim_start_matches("side-").parse::<usize>() {
+                Ok(number) if number > 0 => Window::Side(number - 1),
+                _ => return (None, None),
+            }
         }
         _ => return (None, None),
     };

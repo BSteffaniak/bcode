@@ -23,7 +23,8 @@ use bmux_tui_components::text_input_box::{
 };
 
 use crate::actions::head_label;
-use crate::app::{App, Row, SIDE, ScreenMode, View, Window};
+use crate::app::{App, Row, ScreenMode, View, Window};
+use crate::config::{CollapsedWindows, MainSplit, Portrait};
 use crate::data::{FileNode, SectionKind, commit_line, format_time, status_style};
 use crate::keymap::{Action, Scope, display_key};
 use crate::popup::Popup;
@@ -34,8 +35,11 @@ pub struct Frame {
     main: Vec<Vec<SelectableListItem>>,
     log: Vec<SelectableListItem>,
     popup: Vec<SelectableListItem>,
-    panes: Vec<Cell<PaneState>>,
+    side_panes: Vec<Cell<PaneState>>,
+    main_panes: [Cell<PaneState>; 2],
+    log_pane: Cell<PaneState>,
     log_state: Cell<SelectableListState>,
+    collapsed: Vec<(Vec<SelectableListItem>, Cell<SelectableListState>)>,
 }
 
 const MIN_WIDTH: u16 = 30;
@@ -45,13 +49,26 @@ impl Frame {
     /// Build items for the current state.
     #[must_use]
     pub fn new(app: &App) -> Self {
-        let side = SIDE
-            .iter()
+        let side: Vec<_> = app
+            .side_windows()
             .map(|window| {
-                let view = app.view(*window);
-                (*window, view, side_items(app, view))
+                let view = app.view(window);
+                (window, view, side_items(app, view))
             })
             .collect();
+        let collapsed = side
+            .iter()
+            .map(|(window, view, _)| {
+                (
+                    vec![SelectableListItem::rich(
+                        "title",
+                        window_title(app, *window, *view),
+                    )],
+                    Cell::new(SelectableListState::new(None)),
+                )
+            })
+            .collect();
+        let pane_state = || Cell::new(PaneState::new(Rect::default()));
         let main = (0..2).map(|section| main_items(app, section)).collect();
         let records = app.repo.command_log();
         let log: Vec<SelectableListItem> = records
@@ -79,14 +96,15 @@ impl Frame {
             .collect();
         let popup = popup_items(app);
         Self {
-            side,
             main,
             log,
             popup,
-            panes: (0..10)
-                .map(|_| Cell::new(PaneState::new(Rect::default())))
-                .collect(),
+            side_panes: side.iter().map(|_| pane_state()).collect(),
+            main_panes: [pane_state(), pane_state()],
+            log_pane: pane_state(),
             log_state: Cell::new(SelectableListState::new(None)),
+            collapsed,
+            side,
         }
     }
 }
@@ -560,7 +578,7 @@ fn window_title(app: &App, window: Window, view: View) -> Line {
         theme.title
     };
     let mut spans = vec![Span::styled(format!("[{}] ", window.number()), theme.key)];
-    let tabs = window.tabs();
+    let tabs = app.tabs(window);
     match view {
         View::RemoteBranches => {
             spans.push(Span::styled(
@@ -623,14 +641,42 @@ fn window_title(app: &App, window: Window, view: View) -> Line {
 }
 
 fn side_column<'a>(app: &'a App, frame: &'a Frame) -> Element<'a> {
+    let layout = &app.config.layout;
     let mut column = Column::new();
     let focus_window = if app.window == Window::Main {
         app.last_side
     } else {
         app.window
     };
+    let half = app.screen_mode == ScreenMode::Half;
     for (position, (window, view, items)) in frame.side.iter().enumerate() {
         let focused = app.window == *window;
+        if half && *window != focus_window {
+            // Other windows shrink to a clickable title row, or disappear.
+            if layout.collapsed_windows == CollapsedWindows::Titles {
+                let (title, state) = &frame.collapsed[position];
+                column = column.child(
+                    SizeBox::new(
+                        SelectableListComponent::new(
+                            format!("side-{}", window.number()),
+                            title,
+                            state,
+                        )
+                        .policy(SelectableListPolicy {
+                            highlight: SelectableListHighlightPolicy::new("", false),
+                            ..SelectableListPolicy::interactive()
+                        })
+                        .styles(SelectableListStyles {
+                            focused: Style::new(),
+                            selected: Style::new(),
+                            ..SelectableListStyles::default()
+                        }),
+                    )
+                    .height(1),
+                );
+            }
+            continue;
+        }
         let cursor = (!app.rows(*view).is_empty()).then(|| app.cursor(*view));
         let content = list(
             app,
@@ -645,18 +691,14 @@ fn side_column<'a>(app: &'a App, frame: &'a Frame) -> Element<'a> {
             format!("pane-{}", window.number()),
             window_title(app, *window, *view),
             focused,
-            &frame.panes[position],
+            &frame.side_panes[position],
             content,
         );
-        if *window == Window::Status {
+        if !half && app.tabs(*window) == [View::Status] {
             column = column.child(SizeBox::new(panel).height(3));
         } else {
-            let weight = if *window == focus_window {
-                if app.screen_mode == ScreenMode::Half {
-                    6
-                } else {
-                    3
-                }
+            let weight = if *window == focus_window && layout.expand_focused {
+                layout.expanded_weight.max(1)
             } else {
                 1
             };
@@ -693,11 +735,12 @@ fn main_column<'a>(app: &'a App, frame: &'a Frame) -> Element<'a> {
                 "pane-main",
                 Line::raw(" "),
                 false,
-                &frame.panes[5],
+                &frame.main_panes[0],
                 loading,
             ),
         ));
     }
+    let mut section_panes = Vec::with_capacity(sections);
     for section in 0..sections {
         let Some(data) = app
             .main
@@ -755,17 +798,32 @@ fn main_column<'a>(app: &'a App, frame: &'a Frame) -> Element<'a> {
             cursor,
             focused,
         );
-        column = column.flex(Flex::new(
-            1,
-            pane(
-                app,
-                format!("pane-main-{section}"),
-                Line::from_spans(title),
-                focused,
-                &frame.panes[5 + section],
-                content,
-            ),
+        section_panes.push(pane(
+            app,
+            format!("pane-main-{section}"),
+            Line::from_spans(title),
+            focused,
+            &frame.main_panes[section],
+            content,
         ));
+    }
+    let layout = &app.config.layout;
+    let beside = section_panes.len() == 2
+        && match layout.main_split {
+            MainSplit::SideBySide => true,
+            MainSplit::Stacked => false,
+            MainSplit::Flexible => app.size.get().0 >= layout.main_split_min_width,
+        };
+    if beside {
+        let mut row = BoxRow::new();
+        for panel in section_panes {
+            row = row.flex(Flex::new(1, panel));
+        }
+        column = column.flex(Flex::new(1, row));
+    } else {
+        for panel in section_panes {
+            column = column.flex(Flex::new(1, panel));
+        }
     }
     if app.command_log {
         let content = SelectableListComponent::new("command-log", &frame.log, &frame.log_state)
@@ -784,10 +842,10 @@ fn main_column<'a>(app: &'a App, frame: &'a Frame) -> Element<'a> {
                 "pane-log",
                 Line::from_spans(vec![Span::styled(" Command log ", theme.title)]),
                 false,
-                &frame.panes[7],
+                &frame.log_pane,
                 content,
             ))
-            .height(8),
+            .height(u64::from(layout.command_log.height.max(3))),
         );
     }
     Element::new(column)
@@ -948,7 +1006,12 @@ pub fn tree<'a>(app: &'a App, frame: &'a Frame) -> Element<'a> {
             .content_style(theme.text),
         );
     }
-    let portrait = width < 84;
+    let layout = &app.config.layout;
+    let portrait = match layout.portrait {
+        Portrait::Auto => width < layout.portrait_below_width,
+        Portrait::Always => true,
+        Portrait::Never => false,
+    };
     let full = app.screen_mode == ScreenMode::Full;
     let body: Element<'a> = if full && app.window == Window::Main {
         main_column(app, frame)
@@ -961,25 +1024,27 @@ pub fn tree<'a>(app: &'a App, frame: &'a Frame) -> Element<'a> {
                 .flex(Flex::new(1, main_column(app, frame))),
         )
     } else {
-        let side_percent = app.config.side_panel_percent.clamp(10, 90);
-        let side_percent = if app.screen_mode == ScreenMode::Half && app.window != Window::Main {
-            50
+        let side_percent = if app.screen_mode == ScreenMode::Half {
+            layout.half_side_panel_width
         } else {
-            side_percent
-        };
+            layout.side_panel_width
+        }
+        .clamp(10, 90);
         Element::new(
             BoxRow::new()
                 .flex(Flex::new(side_percent, side_column(app, frame)))
                 .flex(Flex::new(100 - side_percent, main_column(app, frame))),
         )
     };
-    let screen = Surface::new(
-        Column::new()
-            .flex(Flex::new(1, body))
-            .child(SizeBox::new(status_bar(app)).height(1)),
-    )
-    .background(theme.canvas)
-    .content_style(theme.text);
+    let mut screen = Column::new().flex(Flex::new(1, body));
+    // A hidden status bar still appears while work runs or a message is showing.
+    if layout.status_bar || app.running.is_some() || app.toast.is_some() || !app.pending.is_empty()
+    {
+        screen = screen.child(SizeBox::new(status_bar(app)).height(1));
+    }
+    let screen = Surface::new(screen)
+        .background(theme.canvas)
+        .content_style(theme.text);
     match popup(app, frame) {
         Some(foreground) => Element::new(Overlay::new(screen, foreground)),
         None => match which_key(app) {

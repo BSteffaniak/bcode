@@ -202,6 +202,12 @@ fn forbidden_dependency(owner: &str, dependency: &str) -> bool {
     if owner == "bcode_git" {
         return terminal(dependency);
     }
+    // Raw config layering serves lightweight binaries; typed config and hosts stay out.
+    if owner == "bcode_config_layers" {
+        return implementation(dependency)
+            || dependency.starts_with("bcode_")
+            || dependency.starts_with("hyperchad");
+    }
     owner == "brouter_router"
         && matches!(
             dependency,
@@ -316,11 +322,12 @@ const FEATURE_PROFILES: &[FeatureProfile] = &[
         &[],
     ),
     (
-        // The standalone git client stays independent of agent, daemon and plugin hosting.
+        // The standalone git client stays independent of agent, daemon and plugin hosting,
+        // yet composes configuration through the same layering policy as bcode.
         "bcode_git_ui_cli",
         "packages/git-ui/cli",
         "",
-        &["bcode_git_ui", "bmux_tui_runtime"],
+        &["bcode_git_ui", "bmux_tui_runtime", "bcode_config_layers"],
         &[
             "bcode_plugin_sdk",
             "bcode_plugin",
@@ -545,5 +552,21 @@ mod tests {
         assert!(graph.path("a", |name| name == "dev_only").is_none());
         assert!(graph.path("a", |name| name == "absent").is_none());
         assert!(graph.root("absent").is_err());
+    }
+
+    #[test]
+    fn config_layers_reject_bcode_hosts_and_terminals_but_allow_composition() {
+        for dependency in [
+            "bcode_config",
+            "bcode_plugin_sdk",
+            "bcode_tui",
+            "bmux_tui",
+            "reqwest",
+        ] {
+            assert!(forbidden_dependency("bcode_config_layers", dependency));
+        }
+        for dependency in ["bmux_config_composition", "toml", "serde", "thiserror"] {
+            assert!(!forbidden_dependency("bcode_config_layers", dependency));
+        }
     }
 }

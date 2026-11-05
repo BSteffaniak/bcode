@@ -11,6 +11,7 @@ repository  = { workspace = true }
 version     = { workspace = true }
 
 [dependencies]
+bcode_config_layers = { workspace = true }
 bcode_git = { workspace = true }
 bcode_keymap = { workspace = true }
 bcode_syntax_render = { workspace = true }
@@ -35,7 +36,8 @@ tokio = { workspace = true, features = [
     "sync",
     "time",
 ] }
-toml = { workspace = true }
+toml = { workspace = true, features = ["display"] }
+yaml_serde = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }

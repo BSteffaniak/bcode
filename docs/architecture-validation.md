@@ -24,6 +24,9 @@ dev-only edges, includes build edges, and reports a dependency path for each vio
 * The standalone `bcode-git` binary excludes plugin hosting, configuration, the main TUI, client,
   server, session, agent runtime, model and HTTP crates.
 * The `bcode_git` repository layer cannot reach terminal renderers.
+* `bcode_config_layers` (raw config discovery, overlay and `[composition]` layering shared with
+  lightweight binaries) cannot reach any other Bcode crate, HyperChad, host implementations or
+  terminal renderers; typed configuration stays in `bcode_config`.
 * Production/build graphs exclude nonportable `sha2-asm`.
 
 Workspace-default resolution checks model/router boundaries. Portable frontend and feature profiles

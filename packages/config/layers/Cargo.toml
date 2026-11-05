@@ -1,0 +1,24 @@
+[package]
+authors     = { workspace = true }
+categories  = ["config"]
+description = "Raw configuration file discovery and layering policy for bcode"
+edition     = { workspace = true }
+keywords    = ["bcode", "config"]
+license     = { workspace = true }
+name        = "bcode_config_layers"
+readme      = { workspace = true }
+repository  = { workspace = true }
+version     = { workspace = true }
+
+[dependencies]
+bmux_config_composition = { workspace = true }
+serde                   = { workspace = true, features = ["derive", "std"] }
+thiserror               = { workspace = true, features = ["std"] }
+toml                    = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }
+
+[features]
+default          = []
+fail-on-warnings = []

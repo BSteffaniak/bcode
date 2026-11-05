@@ -17,6 +17,8 @@ pub mod diffview;
 pub mod graph;
 pub mod host;
 pub mod keymap;
+pub mod layout;
+pub mod lazygit;
 pub mod ops;
 pub mod popup;
 mod run;

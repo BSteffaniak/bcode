@@ -2003,6 +2003,7 @@ name = "bcode_config"
 version = "0.0.1-alpha.0"
 dependencies = [
  "bcode_agent_policy_models",
+ "bcode_config_layers",
  "bcode_confined_fs",
  "bcode_model",
  "bcode_plugin_models",
@@ -2022,6 +2023,17 @@ dependencies = [
  "thiserror 2.0.21",
  "toml 1.1.8+spec-1.1.0",
  "toml_edit 0.23.10+spec-1.0.0",
+]
+
+[[package]]
+name = "bcode_config_layers"
+version = "0.0.1-alpha.0"
+dependencies = [
+ "bmux_config_composition",
+ "serde",
+ "tempfile",
+ "thiserror 2.0.21",
+ "toml 1.1.8+spec-1.1.0",
 ]
 
 [[package]]
@@ -2286,6 +2298,7 @@ dependencies = [
 name = "bcode_git_ui"
 version = "0.0.1-alpha.0"
 dependencies = [
+ "bcode_config_layers",
  "bcode_git",
  "bcode_keymap",
  "bcode_syntax_render",
@@ -2300,6 +2313,7 @@ dependencies = [
  "tempfile",
  "tokio",
  "toml 1.1.8+spec-1.1.0",
+ "yaml_serde",
 ]
 
 [[package]]

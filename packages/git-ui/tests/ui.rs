@@ -5,7 +5,7 @@ use std::path::Path;
 use std::process::Command;
 use std::sync::Arc;
 
-use bcode_git_ui::app::App;
+use bcode_git_ui::app::{App, View, Window};
 use bcode_git_ui::config::LoadedConfig;
 use bcode_git_ui::{RunOptions, build_app, render_text};
 use bmux_tui::event::Event;
@@ -144,7 +144,7 @@ fn stages_and_commits_with_keys() {
 #[test]
 fn commit_editor_opens_on_a_clean_tree_and_reports_on_submit() {
     let mut harness = Harness::new(|path| commit(path, "a.txt", "a\n", "init"));
-    harness.keys(&["2", "c"]);
+    harness.keys(&["c"]);
     harness.paste("Nothing yet");
     let screen = harness.screen(120, 30);
     assert!(screen.contains("Commit message"), "{screen}");
@@ -356,7 +356,6 @@ fn which_key_popup_shows_sequence_continuations() {
 
 #[test]
 fn mouse_clicks_focus_and_select_rows_and_wheel_scrolls() {
-    use bcode_git_ui::app::{View, Window};
     use bmux_tui::event::{MouseButton, MouseEvent, MouseEventKind};
     use bmux_tui::geometry::Point;
 
@@ -380,7 +379,7 @@ fn mouse_clicks_focus_and_select_rows_and_wheel_scrolls() {
         )))
     };
     harness.send(click(MouseEventKind::Down(MouseButton::Left)));
-    assert_eq!(harness.app.focused_window(), Window::Commits);
+    assert_eq!(harness.app.focused_window(), Window::Side(3));
     assert_eq!(harness.app.view_cursor(View::Commits), 2);
     harness.screen(140, 40);
     harness.send(click(MouseEventKind::ScrollUp));
@@ -490,4 +489,134 @@ fn filters_lists_and_drills_into_commit_files() {
     harness.keys(&["escape", "escape"]);
     let screen = harness.screen(140, 40);
     assert!(screen.contains("✱ main add gamma"), "{screen}");
+}
+
+fn configured(toml: &str) -> LoadedConfig {
+    let loaded = bcode_git_ui::config::from_table(&toml.parse().unwrap());
+    assert!(loaded.diagnostics.is_empty(), "{:?}", loaded.diagnostics);
+    loaded
+}
+
+fn line_with<'a>(screen: &'a str, needle: &str) -> &'a str {
+    screen
+        .lines()
+        .find(|line| line.contains(needle))
+        .unwrap_or_else(|| panic!("no line contains {needle:?}:\n{screen}"))
+}
+
+#[test]
+fn half_mode_shows_one_side_window_beside_the_changes() {
+    use bmux_tui::event::{MouseButton, MouseEvent, MouseEventKind};
+    use bmux_tui::geometry::Point;
+
+    let mut harness = Harness::with_config(
+        |path| {
+            commit(path, "a.txt", "a\n", "first commit");
+            std::fs::write(path.join("a.txt"), "changed\n").unwrap();
+        },
+        configured(
+            r#"
+            [plugins.config."bcode.git".ui.layout]
+            screen_mode = "half"
+            half_side_panel_width = 40
+            "#,
+        ),
+    );
+    let screen = harness.screen(120, 30);
+    // Files is the only framed side window; the others are single title rows.
+    assert!(line_with(&screen, "[2] Files").contains('┌'), "{screen}");
+    assert!(!line_with(&screen, "[4] Commits").contains('┌'), "{screen}");
+    assert!(!screen.contains("first commit"), "{screen}");
+    assert!(screen.contains("Unstaged changes"), "{screen}");
+
+    // Clicking a collapsed title focuses that window, which then expands.
+    let area = harness
+        .app
+        .hit_regions()
+        .into_iter()
+        .find(|(id, _)| id.starts_with("side-4."))
+        .map(|(_, area)| area)
+        .expect("collapsed commits title is clickable");
+    harness.send(RuntimeEvent::Terminal(Event::Mouse(MouseEvent::new(
+        MouseEventKind::Down(MouseButton::Left),
+        Point::new(area.x + 1, area.y),
+    ))));
+    assert_eq!(harness.app.focused_window(), Window::Side(3));
+    let screen = harness.screen(120, 30);
+    assert!(screen.contains("first commit"), "{screen}");
+    assert!(!line_with(&screen, "[2] Files").contains('┌'), "{screen}");
+}
+
+#[test]
+fn starts_in_the_configured_window_with_a_flat_file_list() {
+    let mut harness = Harness::with_config(
+        |path| {
+            commit(path, "a.txt", "a\n", "init");
+            std::fs::create_dir_all(path.join("src/deep")).unwrap();
+            std::fs::write(path.join("src/deep/lib.rs"), "fn x() {}\n").unwrap();
+        },
+        configured(
+            r#"
+            [plugins.config."bcode.git".ui.layout]
+            initial_window = "commits"
+            [plugins.config."bcode.git".ui.files]
+            tree = false
+            "#,
+        ),
+    );
+    assert_eq!(harness.app.focused_window(), Window::Side(3));
+    let screen = harness.screen(120, 30);
+    assert!(screen.contains("src/deep/lib.rs"), "{screen}");
+}
+
+#[test]
+fn regrouped_windows_follow_the_configured_order() {
+    let mut harness = Harness::with_config(
+        |path| commit(path, "a.txt", "a\n", "init"),
+        configured(
+            r#"
+            [plugins.config."bcode.git".ui.layout]
+            windows = [["files", "stash"], ["commits", "branches"]]
+            "#,
+        ),
+    );
+    let screen = harness.screen(120, 30);
+    assert!(screen.contains("[1] Files · Stash"), "{screen}");
+    assert!(screen.contains("[2] Commits · Local"), "{screen}");
+    assert!(!screen.contains("Remotes"), "{screen}");
+    harness.keys(&["2"]);
+    assert_eq!(harness.app.focused_window(), Window::Side(1));
+    // There is no third window; the key does nothing.
+    harness.keys(&["3"]);
+    assert_eq!(harness.app.focused_window(), Window::Side(1));
+    harness.keys(&["]"]);
+    assert_eq!(harness.app.current_view(), View::Branches);
+}
+
+#[test]
+fn staged_and_unstaged_sections_sit_side_by_side_when_configured() {
+    let setup = |path: &Path| {
+        commit(path, "f.txt", "one\ntwo\n", "init");
+        std::fs::write(path.join("f.txt"), "ONE\ntwo\n").unwrap();
+        git(path, &["add", "f.txt"]);
+        std::fs::write(path.join("f.txt"), "ONE\nTWO\n").unwrap();
+    };
+    let mut beside = Harness::with_config(
+        setup,
+        configured("[plugins.config.\"bcode.git\".ui.layout]\nmain_split = \"side-by-side\""),
+    );
+    let screen = beside.screen(140, 30);
+    assert!(
+        line_with(&screen, "Unstaged changes").contains("Staged changes"),
+        "{screen}"
+    );
+    let mut stacked = Harness::with_config(
+        setup,
+        configured("[plugins.config.\"bcode.git\".ui.layout]\nmain_split = \"stacked\""),
+    );
+    let screen = stacked.screen(140, 30);
+    assert!(
+        !line_with(&screen, "Unstaged changes").contains("Staged changes"),
+        "{screen}"
+    );
 }

@@ -17,12 +17,12 @@ use std::path::{Path, PathBuf};
 use std::{env, fs};
 use thiserror::Error;
 
-/// Default Bcode config file name.
-pub const DEFAULT_CONFIG_FILE_NAME: &str = "bcode.toml";
-/// Environment variable containing a config file path overlay.
-pub const BCODE_CONFIG_ENV: &str = "BCODE_CONFIG";
-/// Environment variable containing raw TOML config overlay data.
-pub const BCODE_CONFIG_TOML_ENV: &str = "BCODE_CONFIG_TOML";
+pub use bcode_config_layers::{
+    BCODE_CONFIG_ENV, BCODE_CONFIG_TOML_ENV, BCODE_MODEL_PROFILE_ENV, CompositionResolution,
+    ConfigEnvironment, ConfigLoadOverrides, DEFAULT_CONFIG_FILE_NAME, ProcessConfigEnvironment,
+    default_config_paths, default_config_paths_from, default_config_paths_from_with_environment,
+    default_config_paths_with_environment, merge_config_values, model_profile_override_toml,
+};
 pub mod shell_presentation;
 pub use shell_presentation::{
     SHELL_OUTPUT_PRESENTATION_POLICY_VERSION, ShellOutputPresentationPolicy,
@@ -39,38 +39,8 @@ pub use milestones::MilestonesConfig;
 pub mod startup;
 pub use judgement::{JudgementConfig, JudgementMode};
 
-/// Environment variable selecting the active model profile.
-pub const BCODE_MODEL_PROFILE_ENV: &str = "BCODE_MODEL_PROFILE";
 /// Environment variable selecting the active auth profile for this client.
 pub const BCODE_AUTH_PROFILE_ENV: &str = "BCODE_AUTH_PROFILE";
-
-/// Source of environment-dependent config inputs.
-pub trait ConfigEnvironment {
-    /// Return an environment variable value as UTF-8 text.
-    fn var(&self, name: &str) -> Option<String>;
-    /// Return an environment variable value as OS-native text.
-    fn var_os(&self, name: &str) -> Option<OsString>;
-    /// Return the current working directory used for default config discovery.
-    fn current_dir(&self) -> PathBuf;
-}
-
-/// Config environment backed by the current process.
-#[derive(Debug, Clone, Copy, Default)]
-pub struct ProcessConfigEnvironment;
-
-impl ConfigEnvironment for ProcessConfigEnvironment {
-    fn var(&self, name: &str) -> Option<String> {
-        env::var(name).ok()
-    }
-
-    fn var_os(&self, name: &str) -> Option<OsString> {
-        env::var_os(name)
-    }
-
-    fn current_dir(&self) -> PathBuf {
-        env::current_dir().unwrap_or_else(|_| PathBuf::from("."))
-    }
-}
 
 /// Owned config environment useful for deterministic callers and tests.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -936,17 +906,6 @@ pub struct CompositionProfile {
     pub patch: toml::Table,
 }
 
-/// Config load resolution details.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct CompositionResolution {
-    /// Profile selected by composition, if any.
-    pub selected_profile: Option<String>,
-    /// Effective layer order after defaulting.
-    pub layer_order: Vec<String>,
-    /// Profile ids available while resolving composition.
-    pub available_profiles: Vec<String>,
-}
-
 /// Non-secret configuration launch provenance. This contains no config contents or environment dump.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ConfigLaunchContext {
@@ -994,110 +953,6 @@ pub fn config_launch_context(cwd: &Path) -> ConfigLaunchContext {
     }
 }
 
-/// Config loading overrides layered above discovered config files.
-#[derive(Clone, Default, PartialEq, Eq)]
-pub struct ConfigLoadOverrides {
-    /// Load only this required file, bypassing discovered and environment layers.
-    /// Explicit CLI TOML remains applicable above this file.
-    pub exclusive_config_path: Option<PathBuf>,
-    /// Optional base layer merged below discovered config files.
-    pub base_config_path: Option<PathBuf>,
-    /// Config file path from environment or caller-provided equivalent.
-    pub env_config_path: Option<PathBuf>,
-    /// Raw TOML config data from environment or caller-provided equivalent.
-    pub env_config_toml: Option<String>,
-    /// Config file path from CLI arguments.
-    pub cli_config_path: Option<PathBuf>,
-    /// Raw TOML config data synthesized from CLI arguments.
-    pub cli_config_toml: Option<String>,
-}
-
-impl std::fmt::Debug for ConfigLoadOverrides {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        formatter
-            .debug_struct("ConfigLoadOverrides")
-            .field(
-                "exclusive_config_path",
-                &self.exclusive_config_path.is_some(),
-            )
-            .field("base_config_path", &self.base_config_path.is_some())
-            .field("env_config_path", &self.env_config_path.is_some())
-            .field("env_config_toml", &self.env_config_toml.is_some())
-            .field("cli_config_path", &self.cli_config_path.is_some())
-            .field("cli_config_toml", &self.cli_config_toml.is_some())
-            .finish()
-    }
-}
-
-impl ConfigLoadOverrides {
-    /// Build overrides from `BCODE_CONFIG`, `BCODE_CONFIG_TOML`, and optional CLI values.
-    #[must_use]
-    pub fn from_env_with_cli(
-        cli_config_path: Option<PathBuf>,
-        cli_config_toml: Option<String>,
-    ) -> Self {
-        Self::from_config_environment_with_cli(
-            &ProcessConfigEnvironment,
-            cli_config_path,
-            cli_config_toml,
-        )
-    }
-
-    /// Build overrides from an explicit config environment and optional CLI values.
-    #[must_use]
-    pub fn from_config_environment_with_cli(
-        environment: &impl ConfigEnvironment,
-        cli_config_path: Option<PathBuf>,
-        cli_config_toml: Option<String>,
-    ) -> Self {
-        Self {
-            exclusive_config_path: None,
-            base_config_path: None,
-            env_config_path: environment.var_os(BCODE_CONFIG_ENV).map(PathBuf::from),
-            env_config_toml: merge_config_toml_overrides(
-                environment.var(BCODE_CONFIG_TOML_ENV),
-                environment
-                    .var(BCODE_MODEL_PROFILE_ENV)
-                    .filter(|profile| !profile.trim().is_empty())
-                    .map(|profile| model_profile_override_toml(&profile)),
-            ),
-            cli_config_path,
-            cli_config_toml,
-        }
-    }
-
-    /// Return true when no override layers are configured.
-    #[must_use]
-    pub const fn is_empty(&self) -> bool {
-        self.exclusive_config_path.is_none()
-            && self.base_config_path.is_none()
-            && self.env_config_path.is_none()
-            && self.env_config_toml.is_none()
-            && self.cli_config_path.is_none()
-            && self.cli_config_toml.is_none()
-    }
-
-    /// Set base config path.
-    #[must_use]
-    pub fn with_base_config_path(mut self, path: Option<PathBuf>) -> Self {
-        self.base_config_path = path;
-        self
-    }
-
-    /// Fluent setter for the CLI raw TOML override.
-    #[must_use]
-    pub fn with_cli_config_toml(mut self, toml: Option<String>) -> Self {
-        self.cli_config_toml = merge_config_toml_overrides(self.cli_config_toml, toml);
-        self
-    }
-}
-
-/// Build a TOML override selecting a model profile.
-#[must_use]
-pub fn model_profile_override_toml(profile: &str) -> String {
-    format!("[model]\nprofile = {}\n", toml_string(profile))
-}
-
 /// Build a TOML override for worktree base ref.
 #[must_use]
 pub fn worktree_base_ref_override_toml(base_ref: WorktreeBaseRefConfig) -> String {
@@ -1107,21 +962,6 @@ pub fn worktree_base_ref_override_toml(base_ref: WorktreeBaseRefConfig) -> Strin
         WorktreeBaseRefConfig::Head => "head",
     };
     format!("[worktree]\nbase_ref = {}\n", toml_string(value))
-}
-
-fn merge_config_toml_overrides(left: Option<String>, right: Option<String>) -> Option<String> {
-    match (left, right) {
-        (Some(mut left), Some(right)) => {
-            if !left.ends_with('\n') {
-                left.push('\n');
-            }
-            left.push_str(&right);
-            Some(left)
-        }
-        (Some(left), None) => Some(left),
-        (None, Some(right)) => Some(right),
-        (None, None) => None,
-    }
 }
 
 fn process_config_overrides() -> &'static std::sync::RwLock<Option<ConfigLoadOverrides>> {
@@ -1198,170 +1038,32 @@ pub fn process_exclusive_config_path() -> Option<PathBuf> {
         .and_then(|overrides| overrides.exclusive_config_path.clone())
 }
 
-fn canonical_profile_id(profile_id: &str) -> String {
-    profile_id.trim().to_ascii_lowercase()
-}
-
-/// Recursively merge TOML config values.
-///
-/// Tables are merged key-by-key. Non-table overlay values replace the base
-/// value at the same path.
-pub fn merge_config_values(base: &mut toml::Value, overlay: toml::Value) {
-    merge_toml_value(base, overlay);
-}
-
 /// Merge TOML documents using the shared format-neutral composition engine.
 fn merge_toml_value(base: &mut toml::Value, overlay: toml::Value) {
-    use bmux_config_composition::TomlCodec;
-    let mut value =
-        TomlCodec::from_toml(base.clone()).expect("configuration values are valid TOML");
-    value.overlay_replace(
-        TomlCodec::from_toml(overlay).expect("configuration overlay is valid TOML"),
-    );
-    *base = TomlCodec::to_toml(&value).expect("composed configuration is valid TOML");
+    merge_config_values(base, overlay);
 }
 
-fn parse_composition_config(root: &toml::Table) -> Result<CompositionConfig, ConfigError> {
-    let Some(value) = root.get("composition") else {
-        return Ok(CompositionConfig::default());
-    };
-    value
-        .clone()
-        .try_into()
-        .map_err(|source| ConfigError::Composition {
-            message: format!("invalid [composition] config: {source}"),
-        })
-}
-
-fn resolve_profile_patch(
-    requested_profile_id: &str,
-    profiles: &BTreeMap<String, CompositionProfile>,
-) -> Result<toml::Table, ConfigError> {
-    use bmux_config_composition::{Profile, ProfileLimits, resolve_profile_cached};
-    let profiles = profiles
-        .iter()
-        .map(|(name, profile)| {
-            (
-                name.clone(),
-                Profile {
-                    parents: profile
-                        .extends
-                        .iter()
-                        .map(|parent| canonical_profile_id(parent))
-                        .collect(),
-                    value: profile.patch.clone(),
-                },
-            )
-        })
-        .collect();
-    resolve_profile_cached(
-        &canonical_profile_id(requested_profile_id),
-        &profiles,
-        ProfileLimits {
-            max_depth: 128,
-            max_expansions: 65_536,
-        },
-        |base, overlay| {
-            let mut value = toml::Value::Table(std::mem::take(base));
-            merge_toml_value(&mut value, toml::Value::Table(overlay));
-            *base = value.as_table().cloned().unwrap_or_default();
-            Ok(())
-        },
-    )
-    .map_err(|error| ConfigError::Composition {
-        message: format!("profile inheritance: {error}"),
-    })
-}
-
+/// Apply `[composition]` over typed defaults, then resolve contexts.
 fn resolve_composed_config_value(
     raw: &toml::Value,
 ) -> Result<(toml::Value, CompositionResolution), ConfigError> {
-    let mut raw_table = raw
-        .as_table()
-        .cloned()
-        .ok_or_else(|| ConfigError::Composition {
-            message: "config root must be a table".to_string(),
-        })?;
-    let composition = parse_composition_config(&raw_table)?;
-    raw_table.remove("composition");
-
-    let mut profiles = BTreeMap::new();
-    for (profile_id, profile) in composition.profiles {
-        let canonical_id = canonical_profile_id(&profile_id);
-        if canonical_id.is_empty() {
+    let defaults = match toml::Value::try_from(BcodeConfig::default()) {
+        Ok(toml::Value::Table(defaults)) => defaults,
+        Ok(_) => {
             return Err(ConfigError::Composition {
-                message: "composition profile id must not be empty".to_string(),
+                message: "default config must serialize to a table".to_owned(),
             });
         }
-        if profiles.insert(canonical_id, profile).is_some() {
+        Err(source) => {
             return Err(ConfigError::Composition {
-                message: "composition profile IDs must be distinct after normalization".to_owned(),
+                message: format!("failed to serialize default config: {source}"),
             });
         }
-    }
-
-    let active_profile = composition
-        .active_profile
-        .as_deref()
-        .map(canonical_profile_id);
-    let layer_order = if composition.layer_order.is_empty() {
-        if active_profile.is_some() {
-            vec![
-                "defaults".to_string(),
-                "profile:active".to_string(),
-                "config".to_string(),
-            ]
-        } else {
-            vec!["defaults".to_string(), "config".to_string()]
-        }
-    } else {
-        composition.layer_order
     };
-
-    let mut resolved = toml::Value::try_from(BcodeConfig::default()).map_err(|source| {
-        ConfigError::Composition {
-            message: format!("failed to serialize default config: {source}"),
-        }
-    })?;
-
-    for layer in &layer_order {
-        match layer.as_str() {
-            "defaults" => {}
-            "config" => merge_toml_value(&mut resolved, toml::Value::Table(raw_table.clone())),
-            "profile:active" => {
-                let Some(active_profile) = active_profile.as_deref() else {
-                    return Err(ConfigError::Composition {
-                        message: "layer 'profile:active' requires composition.active_profile"
-                            .to_string(),
-                    });
-                };
-                let patch = resolve_profile_patch(active_profile, &profiles)?;
-                merge_toml_value(&mut resolved, toml::Value::Table(patch));
-            }
-            _ if layer.starts_with("profile:") => {
-                let profile_id = layer.trim_start_matches("profile:");
-                let patch = resolve_profile_patch(profile_id, &profiles)?;
-                merge_toml_value(&mut resolved, toml::Value::Table(patch));
-            }
-            unknown => {
-                return Err(ConfigError::Composition {
-                    message: format!("unknown composition layer '{unknown}'"),
-                });
-            }
-        }
-    }
-
+    let (resolved, resolution) = bcode_config_layers::resolve_composition(raw, defaults)?;
+    let mut resolved = toml::Value::Table(resolved);
     contexts::resolve(&mut resolved)?;
-    let mut available_profiles = profiles.keys().cloned().collect::<Vec<_>>();
-    available_profiles.sort();
-    Ok((
-        resolved,
-        CompositionResolution {
-            selected_profile: active_profile,
-            layer_order,
-            available_profiles,
-        },
-    ))
+    Ok((resolved, resolution))
 }
 
 /// Return true when environment variables imply Bedrock should be selected.
@@ -9318,72 +9020,7 @@ fn toml_key(value: &str) -> String {
 }
 
 fn toml_string(value: &str) -> String {
-    let escaped = value
-        .replace('\\', "\\\\")
-        .replace('"', "\\\"")
-        .replace('\n', "\\n");
-    format!("\"{escaped}\"")
-}
-
-/// Return default config paths in merge order.
-#[must_use]
-pub fn default_config_paths() -> Vec<PathBuf> {
-    default_config_paths_with_environment(&ProcessConfigEnvironment)
-}
-
-/// Return default config paths in merge order for an explicit environment.
-#[must_use]
-pub fn default_config_paths_with_environment(environment: &impl ConfigEnvironment) -> Vec<PathBuf> {
-    default_config_paths_from_with_environment(&environment.current_dir(), environment)
-}
-
-/// Return default config paths in merge order for a starting directory.
-#[must_use]
-pub fn default_config_paths_from(start: &Path) -> Vec<PathBuf> {
-    default_config_paths_from_with_environment(start, &ProcessConfigEnvironment)
-}
-
-/// Return default config paths in merge order for a starting directory and environment.
-#[must_use]
-pub fn default_config_paths_from_with_environment(
-    start: &Path,
-    environment: &impl ConfigEnvironment,
-) -> Vec<PathBuf> {
-    let mut paths = Vec::new();
-    if let Some(config_home) = environment.var("XDG_CONFIG_HOME") {
-        paths.push(
-            PathBuf::from(config_home)
-                .join("bcode")
-                .join(DEFAULT_CONFIG_FILE_NAME),
-        );
-    } else if let Some(home) = environment.var("HOME") {
-        paths.push(
-            PathBuf::from(home)
-                .join(".config")
-                .join("bcode")
-                .join(DEFAULT_CONFIG_FILE_NAME),
-        );
-    }
-    let root = discover_config_root(start).unwrap_or_else(|| start.to_path_buf());
-    paths.push(root.join(DEFAULT_CONFIG_FILE_NAME));
-    paths.push(root.join(".bcode").join(DEFAULT_CONFIG_FILE_NAME));
-    paths
-}
-
-fn discover_config_root(start: &Path) -> Option<PathBuf> {
-    let mut current = if start.is_file() {
-        start.parent()?.to_path_buf()
-    } else {
-        start.to_path_buf()
-    };
-    loop {
-        if current.join(".git").exists() {
-            return Some(current);
-        }
-        if !current.pop() {
-            return None;
-        }
-    }
+    bcode_config_layers::toml_basic_string(value)
 }
 
 /// Load configuration from default paths.
@@ -9591,82 +9228,22 @@ fn merged_raw_config_value_with_overrides(
     paths: &[PathBuf],
     overrides: &ConfigLoadOverrides,
 ) -> Result<toml::Value, ConfigError> {
-    use bmux_config_composition::{DuplicatePolicy, LoadContext, Loader, Requirement, TomlCodec};
-    let builder = Loader::builder().duplicates(DuplicatePolicy::Allow);
-    let builder = if let Some(path) = &overrides.exclusive_config_path {
-        builder.file("exclusive", Some(path), Requirement::Required)
-    } else {
-        builder
-            .file(
-                "base",
-                overrides.base_config_path.as_deref(),
-                Requirement::Optional,
-            )
-            .files("discovered", paths.iter().cloned(), Requirement::Optional)
-            .file(
-                "environment-file",
-                overrides.env_config_path.as_deref(),
-                Requirement::Required,
-            )
-            .text("environment-inline", overrides.env_config_toml.as_deref())
-            .file(
-                "cli-file",
-                overrides.cli_config_path.as_deref(),
-                Requirement::Required,
-            )
-    }
-    .text("cli-inline", overrides.cli_config_toml.as_deref());
-    let cwd = configuration_anchor(paths, overrides)?;
-    let context = LoadContext::new(cwd, BTreeMap::new()).map_err(composition_error)?;
-    let captured = builder
-        .build()
-        .and_then(|loader| loader.capture(&context))
-        .map_err(composition_error)?;
-    // File-relative references remain a product policy. Transform individual
-    // captured documents, then compose the transformed layers in their exact order.
-    let mapped = captured.try_map_documents(&TomlCodec, |source, value| {
-        let mut value = TomlCodec::to_toml(&value).map_err(composition_error)?;
-        if let Some(path) = &source.path {
-            shared_pools::expand(&mut value, path)?;
-        }
-        TomlCodec::from_toml(value).map_err(composition_error)
-    })?;
-    mapped
-        .resolve(&TomlCodec)
-        .and_then(|resolved| resolved.decode())
-        .map_err(composition_error)
+    // File-relative shared pool references are product policy applied per file.
+    bcode_config_layers::load_raw_layers(paths, overrides, |path, value| {
+        shared_pools::expand(value, path)
+    })
+    .map(|raw| raw.value)
 }
 
-fn configuration_anchor(
-    paths: &[PathBuf],
-    overrides: &ConfigLoadOverrides,
-) -> Result<PathBuf, ConfigError> {
-    env::current_dir()
-        .or_else(|error| {
-            let relative = paths
-                .iter()
-                .chain(
-                    [
-                        overrides.exclusive_config_path.as_ref(),
-                        overrides.base_config_path.as_ref(),
-                        overrides.env_config_path.as_ref(),
-                        overrides.cli_config_path.as_ref(),
-                    ]
-                    .into_iter()
-                    .flatten(),
-                )
-                .any(|path| path.is_relative());
-            if relative {
-                Err(error)
-            } else {
-                // Absolute-file and memory-only plans do not consult this anchor.
-                Ok(env::temp_dir())
+impl From<bcode_config_layers::LayersError> for ConfigError {
+    fn from(error: bcode_config_layers::LayersError) -> Self {
+        match error {
+            bcode_config_layers::LayersError::Io { path, source } => Self::Io { path, source },
+            bcode_config_layers::LayersError::Composition { message } => {
+                Self::Composition { message }
             }
-        })
-        .map_err(|source| ConfigError::Io {
-            path: PathBuf::from("."),
-            source,
-        })
+        }
+    }
 }
 
 impl From<bmux_config_composition::Error> for ConfigError {

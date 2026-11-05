@@ -6,10 +6,13 @@
 //! * `[plugins.config."bcode.git".ui]` — [`GitUiConfig`]
 //! * `[tui.keybindings.scopes."git.*"]` — keybinding overrides
 //! * `[tui.theme]` — theme selection shared with the rest of bcode
+//!
+//! Files are discovered and composed by `bcode_config_layers`, the same policy bcode uses.
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
+use bcode_config_layers::ConfigLoadOverrides;
 use serde::Deserialize;
 
 /// Behavior and presentation settings.
@@ -22,14 +25,14 @@ pub struct GitUiConfig {
     pub enabled: bool,
     /// Lines of diff context.
     pub diff_context: u32,
-    /// Percentage of the width used by the side panels (10–90).
-    pub side_panel_percent: u16,
+    /// Window arrangement and sizing.
+    pub layout: LayoutConfig,
+    /// Files panel settings.
+    pub files: FilesConfig,
     /// Maximum commits loaded per page.
     pub log_page_size: usize,
     /// Show the commit graph.
     pub show_graph: bool,
-    /// Show files as a directory tree.
-    pub file_tree: bool,
     /// Syntax highlighting settings.
     pub highlight: HighlightConfig,
     /// Refresh settings.
@@ -49,10 +52,10 @@ impl Default for GitUiConfig {
         Self {
             enabled: true,
             diff_context: 3,
-            side_panel_percent: 33,
+            layout: LayoutConfig::default(),
+            files: FilesConfig::default(),
             log_page_size: 300,
             show_graph: true,
-            file_tree: true,
             highlight: HighlightConfig::default(),
             refresh: RefreshConfig::default(),
             confirm: ConfirmConfig::default(),
@@ -60,6 +63,155 @@ impl Default for GitUiConfig {
             relative_dates: true,
             custom_commands: Vec::new(),
         }
+    }
+}
+
+/// How much of the screen the focused window takes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum ScreenMode {
+    /// Every side window beside the main view.
+    #[default]
+    Normal,
+    /// Only the focused side window beside the main view.
+    Half,
+    /// The focused window fills the screen.
+    Full,
+}
+
+/// How side windows other than the focused one appear in half screen mode.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum CollapsedWindows {
+    /// One-line title bars that can be clicked.
+    #[default]
+    Titles,
+    /// Not shown.
+    Hidden,
+}
+
+/// How the staged and unstaged sections of the main view are arranged.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum MainSplit {
+    /// Side by side on wide terminals, stacked otherwise.
+    #[default]
+    Flexible,
+    /// One above the other.
+    Stacked,
+    /// Next to each other.
+    SideBySide,
+}
+
+/// When side windows are stacked above the main view instead of beside it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum Portrait {
+    /// Below `portrait_below_width` columns.
+    #[default]
+    Auto,
+    /// Always.
+    Always,
+    /// Never.
+    Never,
+}
+
+/// Window arrangement and sizing (`[plugins.config."bcode.git".ui.layout]`).
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct LayoutConfig {
+    /// Screen mode at startup; `+` and `_` change it for the session.
+    pub screen_mode: ScreenMode,
+    /// Percentage of the width used by the side windows in normal mode (10–90).
+    pub side_panel_width: u16,
+    /// Percentage of the width used by the side window in half mode (10–90).
+    pub half_side_panel_width: u16,
+    /// How other side windows appear in half mode.
+    pub collapsed_windows: CollapsedWindows,
+    /// View focused at startup: a view name (`files`, `branches`, `commits`, …) or `main`.
+    pub initial_window: String,
+    /// Side windows from top to bottom, each an ordered list of tabs. Views left out are
+    /// hidden. Names: `status`, `files`, `worktrees`, `submodules`, `branches`, `remotes`,
+    /// `tags`, `commits`, `reflog`, `stash`.
+    pub windows: Vec<Vec<String>>,
+    /// Give the focused side window more height.
+    pub expand_focused: bool,
+    /// Height weight of the focused side window relative to the others.
+    pub expanded_weight: u16,
+    /// Arrangement of the staged and unstaged sections.
+    pub main_split: MainSplit,
+    /// Terminal width from which the flexible split puts sections side by side.
+    pub main_split_min_width: u16,
+    /// When to stack side windows above the main view.
+    pub portrait: Portrait,
+    /// Terminal width below which the automatic portrait layout applies.
+    pub portrait_below_width: u16,
+    /// Command log settings.
+    pub command_log: CommandLogConfig,
+    /// Show the bottom key-hint bar. When hidden, it still appears for progress and messages.
+    pub status_bar: bool,
+}
+
+impl Default for LayoutConfig {
+    fn default() -> Self {
+        Self {
+            screen_mode: ScreenMode::Normal,
+            side_panel_width: 33,
+            half_side_panel_width: 50,
+            collapsed_windows: CollapsedWindows::Titles,
+            initial_window: "files".to_owned(),
+            windows: [
+                &["status"][..],
+                &["files", "worktrees", "submodules"],
+                &["branches", "remotes", "tags"],
+                &["commits", "reflog"],
+                &["stash"],
+            ]
+            .iter()
+            .map(|tabs| tabs.iter().map(|tab| (*tab).to_owned()).collect())
+            .collect(),
+            expand_focused: true,
+            expanded_weight: 3,
+            main_split: MainSplit::Flexible,
+            main_split_min_width: 180,
+            portrait: Portrait::Auto,
+            portrait_below_width: 84,
+            command_log: CommandLogConfig::default(),
+            status_bar: true,
+        }
+    }
+}
+
+/// Command log settings.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct CommandLogConfig {
+    /// Show the command log at startup; `@` toggles it.
+    pub show: bool,
+    /// Height in rows, including the border.
+    pub height: u16,
+}
+
+impl Default for CommandLogConfig {
+    fn default() -> Self {
+        Self {
+            show: false,
+            height: 8,
+        }
+    }
+}
+
+/// Files panel settings (`[plugins.config."bcode.git".ui.files]`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct FilesConfig {
+    /// Show files as a directory tree rather than a flat list; `` ` `` toggles it.
+    pub tree: bool,
+}
+
+impl Default for FilesConfig {
+    fn default() -> Self {
+        Self { tree: true }
     }
 }
 
@@ -227,51 +379,38 @@ pub fn default_config_dir() -> PathBuf {
     std::env::temp_dir().join("bcode")
 }
 
-/// Configuration files in precedence order (later wins).
+/// Candidate configuration files for a starting directory in precedence order (later wins),
+/// whether or not they exist. Matches bcode's own discovery, including `$BCODE_CONFIG`.
 #[must_use]
-pub fn config_files(project_root: Option<&Path>) -> Vec<PathBuf> {
-    let mut files = vec![
-        std::env::var_os("BCODE_CONFIG")
-            .map_or_else(|| default_config_dir().join("bcode.toml"), PathBuf::from),
-    ];
-    if let Some(root) = project_root {
-        files.push(root.join("bcode.toml"));
-        files.push(root.join(".bcode").join("bcode.toml"));
+pub fn config_files(start: &Path) -> Vec<PathBuf> {
+    let mut files = bcode_config_layers::default_config_paths_from(start);
+    if let Some(path) = ConfigLoadOverrides::from_environment().env_config_path {
+        files.push(path);
     }
     files
 }
 
-/// Load configuration from the standard bcode files for a project.
+/// Load configuration exactly as bcode composes it: discovered files, `$BCODE_CONFIG`,
+/// `$BCODE_CONFIG_TOML`, and `[composition]` profiles.
 #[must_use]
-pub fn load(project_root: Option<&Path>) -> LoadedConfig {
-    let mut merged = toml::Table::new();
+pub fn load(start: &Path) -> LoadedConfig {
     let mut loaded = LoadedConfig {
         config_dir: default_config_dir(),
         ..LoadedConfig::default()
     };
-    for path in config_files(project_root) {
-        let Ok(text) = std::fs::read_to_string(&path) else {
-            continue;
-        };
-        match text.parse::<toml::Table>() {
-            Ok(table) => {
-                merge(&mut merged, table);
-                loaded.files.push(path);
-            }
-            Err(error) => loaded
-                .diagnostics
-                .push(format!("{}: {error}", path.display())),
+    match bcode_config_layers::load_layered(
+        start,
+        &ConfigLoadOverrides::from_environment(),
+        toml::Table::new(),
+    ) {
+        Ok(layered) => {
+            loaded.files = layered.files;
+            apply(&layered.value, &mut loaded);
         }
+        Err(error) => loaded
+            .diagnostics
+            .push(format!("configuration not loaded, using defaults: {error}")),
     }
-    if let Ok(inline) = std::env::var("BCODE_CONFIG_TOML") {
-        match inline.parse::<toml::Table>() {
-            Ok(table) => merge(&mut merged, table),
-            Err(error) => loaded
-                .diagnostics
-                .push(format!("BCODE_CONFIG_TOML: {error}")),
-        }
-    }
-    apply(&merged, &mut loaded);
     loaded
 }
 
@@ -361,19 +500,6 @@ fn lookup<'a>(table: &'a toml::Table, path: &[&str]) -> Option<&'a toml::Value> 
     Some(value)
 }
 
-fn merge(base: &mut toml::Table, overlay: toml::Table) {
-    for (key, value) in overlay {
-        match (base.get_mut(&key), value) {
-            (Some(toml::Value::Table(existing)), toml::Value::Table(incoming)) => {
-                merge(existing, incoming);
-            }
-            (_, value) => {
-                base.insert(key, value);
-            }
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -414,6 +540,43 @@ mod tests {
     }
 
     #[test]
+    fn loads_project_files_and_composition_profiles_like_bcode() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        std::fs::create_dir_all(root.join(".git")).unwrap();
+        std::fs::create_dir_all(root.join(".bcode")).unwrap();
+        std::fs::create_dir_all(root.join("sub")).unwrap();
+        std::fs::write(
+            root.join("bcode.toml"),
+            r#"
+            [plugins.config."bcode.git".ui]
+            diff_context = 7
+            [composition]
+            active_profile = "laptop"
+            [composition.profiles.laptop.patch.plugins.config."bcode.git".ui.layout]
+            screen_mode = "half"
+            "#,
+        )
+        .unwrap();
+        std::fs::write(
+            root.join(".bcode").join("bcode.toml"),
+            "[plugins.config.\"bcode.git\".ui.files]\ntree = false\n",
+        )
+        .unwrap();
+        // Discovery walks up from a subdirectory to the repository root.
+        let loaded = load(&root.join("sub"));
+        assert!(loaded.diagnostics.is_empty(), "{:?}", loaded.diagnostics);
+        assert_eq!(loaded.ui.diff_context, 7);
+        assert_eq!(loaded.ui.layout.screen_mode, ScreenMode::Half);
+        assert!(!loaded.ui.files.tree);
+        assert!(
+            loaded
+                .files
+                .contains(&root.join(".bcode").join("bcode.toml"))
+        );
+    }
+
+    #[test]
     fn plugin_disable_and_ui_toggle_turn_the_command_off() {
         let disabled: toml::Table = "[plugins]\ndisabled = [\"bcode.git\"]".parse().unwrap();
         assert!(!from_table(&disabled).ui_enabled());
@@ -434,13 +597,5 @@ mod tests {
         let loaded = from_table(&table);
         assert_eq!(loaded.ui, GitUiConfig::default());
         assert_eq!(loaded.diagnostics.len(), 1);
-    }
-
-    #[test]
-    fn later_tables_deep_merge_over_earlier_ones() {
-        let mut base: toml::Table = "[a]\nx = 1\ny = 2".parse().unwrap();
-        merge(&mut base, "[a]\ny = 3".parse().unwrap());
-        assert_eq!(base["a"]["x"].as_integer(), Some(1));
-        assert_eq!(base["a"]["y"].as_integer(), Some(3));
     }
 }

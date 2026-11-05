@@ -12,7 +12,7 @@ use bmux_tui::text::{Line, Span};
 use bmux_tui_components::text_input::{TextInputControl, TextInputPolicy};
 use bmux_tui_runtime::Update;
 
-use crate::app::{App, Msg, Row, SIDE, ScreenMode, Staging, UpdateExt, View, Window};
+use crate::app::{App, Msg, Row, ScreenMode, Staging, UpdateExt, View, Window};
 use crate::data::{FileNode, SectionKind};
 use crate::keymap::{Action, Scope, display_key};
 use crate::ops::Op;
@@ -127,20 +127,53 @@ impl App {
                 {
                     return Update::none();
                 }
-                let index = SIDE.iter().position(|window| *window == self.window);
-                let next = match (index, action) {
-                    (Some(index), Action::NextPanel) => SIDE[(index + 1) % SIDE.len()],
-                    (Some(index), _) => SIDE[(index + SIDE.len() - 1) % SIDE.len()],
-                    (None, _) => self.last_side,
+                let count = self.layout.windows.len();
+                let next = match (self.window, action) {
+                    (Window::Side(index), Action::NextPanel) => Window::Side((index + 1) % count),
+                    (Window::Side(index), _) => Window::Side((index + count - 1) % count),
+                    (Window::Main, _) => self.last_side,
                 };
                 self.focus(next);
                 Update::redraw()
             }
-            Action::FocusStatus => self.focus_window(Window::Status),
-            Action::FocusFiles => self.focus_window(Window::Files),
-            Action::FocusBranches => self.focus_window(Window::Branches),
-            Action::FocusCommits => self.focus_window(Window::Commits),
-            Action::FocusStash => self.focus_window(Window::Stash),
+            Action::FocusWindow1
+            | Action::FocusWindow2
+            | Action::FocusWindow3
+            | Action::FocusWindow4
+            | Action::FocusWindow5
+            | Action::FocusWindow6
+            | Action::FocusWindow7
+            | Action::FocusWindow8
+            | Action::FocusWindow9 => {
+                let index = [
+                    Action::FocusWindow1,
+                    Action::FocusWindow2,
+                    Action::FocusWindow3,
+                    Action::FocusWindow4,
+                    Action::FocusWindow5,
+                    Action::FocusWindow6,
+                    Action::FocusWindow7,
+                    Action::FocusWindow8,
+                    Action::FocusWindow9,
+                ]
+                .iter()
+                .position(|candidate| *candidate == action)
+                .unwrap_or(0);
+                if index < self.layout.windows.len() {
+                    self.focus(Window::Side(index));
+                }
+                Update::redraw()
+            }
+            Action::FocusStatus => self.focus_named(View::Status),
+            Action::FocusFiles => self.focus_named(View::Files),
+            Action::FocusWorktrees => self.focus_named(View::Worktrees),
+            Action::FocusSubmodules => self.focus_named(View::Submodules),
+            Action::FocusBranches => self.focus_named(View::Branches),
+            Action::FocusRemotes => self.focus_named(View::Remotes),
+            Action::FocusTags => self.focus_named(View::Tags),
+            Action::FocusCommits => self.focus_named(View::Commits),
+            Action::FocusReflog => self.focus_named(View::Reflog),
+            Action::FocusStash => self.focus_named(View::Stash),
             Action::FocusMain | Action::CommitFileView => {
                 self.window = Window::Main;
                 Update::redraw()
@@ -151,11 +184,23 @@ impl App {
                 } else {
                     self.window
                 };
-                let tabs = window.tabs().len();
+                let tabs = self.tabs(window).len();
                 if tabs > 1 {
                     self.remote = None;
-                    self.sub_commits = None;
-                    self.commit_files = None;
+                    if self
+                        .sub_commits
+                        .as_ref()
+                        .is_some_and(|sub| sub.window == window)
+                    {
+                        self.sub_commits = None;
+                    }
+                    if self
+                        .commit_files
+                        .as_ref()
+                        .is_some_and(|files| files.window == window)
+                    {
+                        self.commit_files = None;
+                    }
                     let current = self.tabs.get(&window).copied().unwrap_or(0);
                     let next = if action == Action::NextTab {
                         (current + 1) % tabs
@@ -235,8 +280,10 @@ impl App {
             Action::CopyToClipboard => self.copy_menu(),
 
             Action::StatusOpenConfig => {
-                let path = crate::config::config_files(Some(self.repo.root()))
+                // The most specific existing file, else the user file.
+                let path = crate::config::config_files(self.repo.root())
                     .into_iter()
+                    .rev()
                     .find(|path| path.exists())
                     .unwrap_or_else(|| crate::config::default_config_dir().join("bcode.toml"));
                 self.launch(External {
@@ -497,7 +544,6 @@ impl App {
             | Action::RemoteBranchViewCommits
             | Action::TagViewCommits => self.selected_ref().map_or_else(Update::none, |revision| {
                 let command = self.load_sub_commits(revision.clone(), revision);
-                self.focus(Window::Branches);
                 Update::redraw().maybe(command)
             }),
             Action::BranchCopyName => self
@@ -959,8 +1005,13 @@ impl App {
         isize::try_from(self.size.get().1 / 3).unwrap_or(10).max(1)
     }
 
-    fn focus_window(&mut self, window: Window) -> Update<Msg> {
-        self.focus(window);
+    fn focus_named(&mut self, view: View) -> Update<Msg> {
+        if !self.focus_view(view) {
+            self.toast(
+                format!("The {} view is not in the layout", view.label()),
+                true,
+            );
+        }
         Update::redraw()
     }
 
@@ -989,8 +1040,8 @@ impl App {
             self.remote = None;
         } else if self.diff_base.take().is_some() {
             self.toast("Left diffing mode", false);
-        } else if self.screen_mode != ScreenMode::Normal {
-            self.screen_mode = ScreenMode::Normal;
+        } else if self.screen_mode != self.config.layout.screen_mode {
+            self.screen_mode = self.config.layout.screen_mode;
         }
         Update::redraw()
     }

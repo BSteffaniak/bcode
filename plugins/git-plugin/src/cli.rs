@@ -12,6 +12,11 @@ struct GitCli {
     /// Run as if started in this directory.
     #[arg(short = 'C', long = "path", value_name = "DIR")]
     path: Option<PathBuf>,
+    /// Print bcode configuration converted from a lazygit config.yml (found automatically
+    /// when no path is given) and exit.
+    #[arg(long, value_name = "CONFIG_YML")]
+    #[allow(clippy::option_option)]
+    import_lazygit: Option<Option<PathBuf>>,
 }
 
 pub fn registration() -> StaticCliRegistration {
@@ -25,12 +30,17 @@ pub fn registration() -> StaticCliRegistration {
 fn invoke(matches: clap::ArgMatches) -> StaticCliFuture {
     Box::pin(async move {
         let cli = GitCli::from_arg_matches(&matches).map_err(|error| error.to_string())?;
+        if let Some(source) = cli.import_lazygit {
+            let (path, import) = bcode_git_ui::lazygit::import_file(source)?;
+            println!("# Source: {}", path.display());
+            print!("{}", import.toml);
+            return Ok(StaticCliOutcome::default());
+        }
         let path = match cli.path {
             Some(path) => path,
             None => std::env::current_dir().map_err(|error| error.to_string())?,
         };
-        let root = bcode_git_ui::find_repo_root(&path);
-        let config = bcode_git_ui::config::load(root.as_deref());
+        let config = bcode_git_ui::config::load(&path);
         if !config.ui_enabled() {
             return Err(
                 "bcode git is disabled by configuration ([plugins] disabled or \
