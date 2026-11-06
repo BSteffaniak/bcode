@@ -13,7 +13,7 @@ use std::collections::BTreeMap;
 use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 
-use bcode_config_layers::ConfigLoadOverrides;
+use bcode_config_layers::{ConfigEnvironment, ConfigLoadOverrides, ProcessConfigEnvironment};
 use bcode_git::models::CommitMessageSource;
 use serde::{Deserialize, Serialize};
 
@@ -657,23 +657,27 @@ impl LoadedConfig {
 /// bcode user configuration directory (`$XDG_CONFIG_HOME/bcode` or `~/.config/bcode`).
 #[must_use]
 pub fn default_config_dir() -> PathBuf {
-    user_config_home().join("bcode")
+    user_config_home(&ProcessConfigEnvironment).join("bcode")
 }
 
 /// Dedicated user configuration file (`$XDG_CONFIG_HOME/bcode-git/config.toml` or
 /// `~/.config/bcode-git/config.toml`).
 #[must_use]
 pub fn user_git_config_file() -> PathBuf {
-    user_config_home()
+    user_git_config_file_in(&ProcessConfigEnvironment)
+}
+
+fn user_git_config_file_in(environment: &impl ConfigEnvironment) -> PathBuf {
+    user_config_home(environment)
         .join("bcode-git")
         .join(GIT_CONFIG_FILE_NAME)
 }
 
-fn user_config_home() -> PathBuf {
-    if let Some(home) = std::env::var_os("XDG_CONFIG_HOME") {
+fn user_config_home(environment: &impl ConfigEnvironment) -> PathBuf {
+    if let Some(home) = environment.var_os("XDG_CONFIG_HOME") {
         return PathBuf::from(home);
     }
-    if let Some(home) = std::env::var_os("HOME") {
+    if let Some(home) = environment.var_os("HOME") {
         return PathBuf::from(home).join(".config");
     }
     std::env::temp_dir()
@@ -682,10 +686,22 @@ fn user_config_home() -> PathBuf {
 /// Candidate configuration files for a starting directory, existing or not.
 #[must_use]
 pub fn config_files(start: &Path, options: &ConfigOptions) -> ConfigPaths {
-    let mut bcode = bcode_config_layers::default_config_paths_from(start);
-    bcode.extend(ConfigLoadOverrides::from_environment().env_config_path);
-    let mut git = git_config_paths(start);
-    let overrides = git_overrides(options);
+    config_files_in(start, options, &ProcessConfigEnvironment)
+}
+
+fn config_files_in(
+    start: &Path,
+    options: &ConfigOptions,
+    environment: &impl ConfigEnvironment,
+) -> ConfigPaths {
+    let mut bcode =
+        bcode_config_layers::default_config_paths_from_with_environment(start, environment);
+    bcode.extend(
+        ConfigLoadOverrides::from_config_environment_with_cli(environment, None, None)
+            .env_config_path,
+    );
+    let mut git = git_config_paths_in(start, environment);
+    let overrides = git_overrides(options, environment);
     git.extend(overrides.env_config_path);
     git.extend(overrides.cli_config_path);
     ConfigPaths { bcode, git }
@@ -696,7 +712,11 @@ pub fn config_files(start: &Path, options: &ConfigOptions) -> ConfigPaths {
 /// the git directory.
 #[must_use]
 pub fn git_config_paths(start: &Path) -> Vec<PathBuf> {
-    let mut paths = vec![user_git_config_file()];
+    git_config_paths_in(start, &ProcessConfigEnvironment)
+}
+
+fn git_config_paths_in(start: &Path, environment: &impl ConfigEnvironment) -> Vec<PathBuf> {
+    let mut paths = vec![user_git_config_file_in(environment)];
     if let Some(root) = bcode_config_layers::discover_config_root(start) {
         paths.push(root.join("bcode-git.toml"));
         paths.push(root.join(".bcode-git").join(GIT_CONFIG_FILE_NAME));
@@ -721,10 +741,13 @@ fn git_dir(root: &Path) -> Option<PathBuf> {
     Some(root.join(target))
 }
 
-fn git_overrides(options: &ConfigOptions) -> ConfigLoadOverrides {
+fn git_overrides(
+    options: &ConfigOptions,
+    environment: &impl ConfigEnvironment,
+) -> ConfigLoadOverrides {
     let var = |name: &str| {
-        std::env::var(name)
-            .ok()
+        environment
+            .var(name)
             .filter(|value| !value.trim().is_empty())
     };
     ConfigLoadOverrides {
@@ -751,13 +774,24 @@ pub fn load(start: &Path) -> LoadedConfig {
 /// repository, per clone); `$BCODE_GIT_CONFIG`; `$BCODE_GIT_CONFIG_TOML`; `options`.
 #[must_use]
 pub fn load_with(start: &Path, options: &ConfigOptions) -> LoadedConfig {
+    load_in(start, options, &ProcessConfigEnvironment)
+}
+
+/// [`load_with`] reading environment variables (including `$XDG_CONFIG_HOME` and `$HOME`,
+/// which locate the user files) from `environment` instead of the process.
+#[must_use]
+pub fn load_in(
+    start: &Path,
+    options: &ConfigOptions,
+    environment: &impl ConfigEnvironment,
+) -> LoadedConfig {
     let mut loaded = LoadedConfig {
-        config_dir: default_config_dir(),
+        config_dir: user_config_home(environment).join("bcode"),
         ..LoadedConfig::default()
     };
-    let bcode = match bcode_config_layers::load_layered(
-        start,
-        &ConfigLoadOverrides::from_environment(),
+    let bcode = match bcode_config_layers::load_layered_from_paths(
+        &bcode_config_layers::default_config_paths_from_with_environment(start, environment),
+        &ConfigLoadOverrides::from_config_environment_with_cli(environment, None, None),
         toml::Table::new(),
     ) {
         Ok(layered) => Some(layered),
@@ -774,8 +808,8 @@ pub fn load_with(start: &Path, options: &ConfigOptions) -> LoadedConfig {
         .unwrap_or_default();
     let base = section(&bcode_table);
     let git = match bcode_config_layers::load_layered_from_paths(
-        &git_config_paths(start),
-        &git_overrides(options),
+        &git_config_paths_in(start, environment),
+        &git_overrides(options, environment),
         base.clone(),
     ) {
         Ok(layered) => Some(layered),
@@ -1149,6 +1183,38 @@ fn lookup<'a>(table: &'a toml::Table, path: &[&str]) -> Option<&'a toml::Value> 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// No variables at all, with the user configuration home inside the test's own directory,
+    /// so the developer's real user files and `$BCODE_*` variables never leak into a test.
+    struct IsolatedEnvironment {
+        config_home: PathBuf,
+    }
+
+    impl ConfigEnvironment for IsolatedEnvironment {
+        fn var(&self, name: &str) -> Option<String> {
+            self.var_os(name)?.into_string().ok()
+        }
+
+        fn var_os(&self, name: &str) -> Option<std::ffi::OsString> {
+            (name == "XDG_CONFIG_HOME").then(|| self.config_home.clone().into_os_string())
+        }
+
+        fn current_dir(&self) -> PathBuf {
+            self.config_home.clone()
+        }
+    }
+
+    // Shadow the process-environment loaders for every test in this module.
+    fn load_with(start: &Path, options: &ConfigOptions) -> LoadedConfig {
+        let environment = IsolatedEnvironment {
+            config_home: start.join(".test-config-home"),
+        };
+        load_in(start, options, &environment)
+    }
+
+    fn load(start: &Path) -> LoadedConfig {
+        load_with(start, &ConfigOptions::default())
+    }
 
     #[test]
     fn reads_ui_keybindings_and_theme_sections() {
