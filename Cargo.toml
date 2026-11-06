@@ -74,6 +74,8 @@ members = [
     "packages/daemon-lifecycle",
     "packages/eval",
     "packages/eval/models",
+    "packages/forge",
+    "packages/forge/models",
     "packages/git",
     "packages/git/models",
     "packages/git-ui",
@@ -247,6 +249,8 @@ bcode_eval_plugin                       = { version = "0.0.1-alpha.0", default-f
 bcode_fake_provider_plugin              = { version = "0.0.1-alpha.0", default-features = false, path = "plugins/fake-provider-plugin" }
 bcode_file_references_plugin            = { version = "0.0.1-alpha.0", default-features = false, path = "plugins/file-references-plugin" }
 bcode_filesystem_plugin                 = { version = "0.0.1-alpha.0", default-features = false, path = "plugins/filesystem-plugin" }
+bcode_forge                             = { version = "0.0.1-alpha.0", default-features = false, path = "packages/forge" }
+bcode_forge_models                      = { version = "0.0.1-alpha.0", default-features = false, path = "packages/forge/models" }
 bcode_git                               = { version = "0.0.1-alpha.0", default-features = false, path = "packages/git" }
 bcode_git_models                        = { version = "0.0.1-alpha.0", default-features = false, path = "packages/git/models" }
 bcode_git_plugin                        = { version = "0.0.1-alpha.0", default-features = false, path = "plugins/git-plugin" }

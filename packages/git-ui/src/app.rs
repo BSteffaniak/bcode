@@ -201,6 +201,16 @@ pub enum Msg {
     CommitPrefill(Box<crate::commit_message::Prefill>),
     /// Periodic tick.
     Tick,
+    /// The forge answered about pull requests.
+    PullRequests(
+        u64,
+        Result<bcode_forge_models::PullRequestList, bcode_forge_models::ForgeError>,
+    ),
+    /// Local branches were matched to pull requests.
+    PullRequestMatches(
+        u64,
+        std::collections::BTreeMap<String, crate::pulls::Matched>,
+    ),
     /// Terminal input failed.
     InputFailed(String),
 }
@@ -218,6 +228,8 @@ pub struct OpResult {
     pub after: Option<HeadPosition>,
     /// Show output in a popup.
     pub show_output: bool,
+    /// Whether the operation talked to a remote (so pull requests may have changed).
+    pub network: bool,
     /// Undo-journal movement.
     pub journal: Option<ops::JournalMove>,
 }
@@ -298,6 +310,8 @@ pub struct App {
     pub(crate) host: Arc<dyn GitUiHost>,
 
     pub(crate) snapshot: Snapshot,
+    /// Pull requests from the forge.
+    pub(crate) pulls: crate::pulls::PullRequests,
     pub(crate) snapshot_requested: u64,
     pub(crate) snapshot_loaded: u64,
     pub(crate) loaded_once: bool,
@@ -399,6 +413,7 @@ impl App {
             relative_dates: config.relative_dates,
             show_graph: config.show_graph,
             branches: crate::branches::BranchColors::default(),
+            pull_status: None,
         };
         let file_tree = config.files.tree;
         let (layout, layout_diagnostics) = Layout::resolve(&config.layout);
@@ -422,6 +437,7 @@ impl App {
             theme,
             cx,
             host,
+            pulls: crate::pulls::PullRequests::new(None, None),
             snapshot: Snapshot::default(),
             snapshot_requested: 0,
             snapshot_loaded: 0,
@@ -782,7 +798,7 @@ impl App {
 
     // ----- loading -----
 
-    fn spawn<T: Send + 'static>(
+    pub(crate) fn spawn<T: Send + 'static>(
         &mut self,
         key: Option<&str>,
         work: impl FnOnce() -> T + Send + 'static,
@@ -1093,6 +1109,7 @@ impl App {
         let repo = self.repo.clone();
         let record = op.moves_head();
         let journal = op.journal();
+        let network = op.is_network();
         self.spawn(
             None,
             move || {
@@ -1105,6 +1122,7 @@ impl App {
                     before,
                     after,
                     show_output,
+                    network,
                     journal,
                 }
             },
@@ -2196,6 +2214,7 @@ impl App {
         } else {
             Update::none()
         };
+        update = update.maybe(self.request_pull_requests(false));
         let poll = if self.watching {
             0
         } else {
@@ -2225,16 +2244,15 @@ impl App {
 
     fn install_snapshot(&mut self, snapshot: Snapshot) {
         self.loaded_once = true;
-        self.cx.branches = self
-            .cx
-            .branches
-            .with_branches(&snapshot.branches, &snapshot.merged);
         self.commit_graph = graph::layout(&snapshot.commits);
         self.file_nodes = file_rows(&snapshot.status, self.file_tree, &self.collapsed);
         if let Some(error) = snapshot.errors.first() {
             self.toast(error.clone(), true);
         }
         self.snapshot = snapshot;
+        self.pulls
+            .set_remote(&self.snapshot.remotes, &self.config.pull_requests.remote);
+        self.refresh_branch_colors();
         if self.remote.as_ref().is_some_and(|remote| {
             !self
                 .snapshot
@@ -2342,6 +2360,10 @@ impl App {
 
     fn finish_op(&mut self, result: &OpResult) -> Update<Msg> {
         self.running = None;
+        // Fetches, pulls and pushes may have changed pull requests.
+        let pulls = (result.network && result.result.is_ok())
+            .then(|| self.request_pull_requests(true))
+            .flatten();
         match &result.result {
             Ok(output) => {
                 if let Some(journal) = result.journal {
@@ -2402,7 +2424,7 @@ impl App {
                 }
             }
         }
-        let mut update = Update::redraw().maybe(self.refresh());
+        let mut update = Update::redraw().maybe(self.refresh()).maybe(pulls);
         if let Some(command) = self.start_next_op() {
             update = update.maybe(command);
         }
@@ -2463,6 +2485,14 @@ impl App {
                     update = update.maybe(command);
                 }
                 update
+                    .maybe(self.request_pull_requests(false))
+                    .maybe(self.match_pull_requests())
+            }
+            Msg::PullRequests(generation, result) => {
+                self.pull_requests_answered(generation, result)
+            }
+            Msg::PullRequestMatches(generation, matched) => {
+                self.pull_requests_matched(generation, matched)
             }
             Msg::Main(generation, content) => {
                 if generation == self.main_generation {

@@ -30,6 +30,8 @@ struct Harness {
     dir: TempDir,
     state: TempDir,
     app: App,
+    pulls: Option<Arc<dyn bcode_forge_models::PullRequestSource>>,
+    host: Arc<dyn bcode_git_ui::host::GitUiHost>,
 }
 
 impl Harness {
@@ -43,8 +45,24 @@ impl Harness {
 
     fn with_options(
         setup: impl FnOnce(&Path),
+        config: LoadedConfig,
+        commit_message: Option<String>,
+    ) -> Self {
+        Self::with_forge(
+            setup,
+            config,
+            commit_message,
+            None,
+            Arc::new(bcode_git_ui::host::StandaloneHost),
+        )
+    }
+
+    fn with_forge(
+        setup: impl FnOnce(&Path),
         mut config: LoadedConfig,
         commit_message: Option<String>,
+        pulls: Option<Arc<dyn bcode_forge_models::PullRequestSource>>,
+        host: Arc<dyn bcode_git_ui::host::GitUiHost>,
     ) -> Self {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path();
@@ -56,8 +74,21 @@ impl Harness {
         config.ui.refresh.watch = false;
         config.ui.refresh.poll_seconds = 0;
         let state = tempfile::tempdir().unwrap();
-        let app = launch(path, config, commit_message, state.path());
-        let mut harness = Self { dir, state, app };
+        let app = launch_with(
+            path,
+            config,
+            commit_message,
+            state.path(),
+            pulls.clone(),
+            host.clone(),
+        );
+        let mut harness = Self {
+            dir,
+            state,
+            app,
+            pulls,
+            host,
+        };
         harness.send(RuntimeEvent::Message(bcode_git_ui::app::Msg::Watch));
         harness
     }
@@ -68,7 +99,14 @@ impl Harness {
         let mut config = LoadedConfig::default();
         config.ui.refresh.watch = false;
         config.ui.refresh.poll_seconds = 0;
-        self.app = launch(cwd, config, None, self.state.path());
+        self.app = launch_with(
+            cwd,
+            config,
+            None,
+            self.state.path(),
+            self.pulls.clone(),
+            self.host.clone(),
+        );
         self.send(RuntimeEvent::Message(bcode_git_ui::app::Msg::Watch));
     }
 
@@ -83,7 +121,14 @@ impl Harness {
         let mut config = config;
         config.ui.refresh.watch = false;
         config.ui.refresh.poll_seconds = 0;
-        self.app = launch(self.dir.path(), config, None, self.state.path());
+        self.app = launch_with(
+            self.dir.path(),
+            config,
+            None,
+            self.state.path(),
+            self.pulls.clone(),
+            self.host.clone(),
+        );
         self.send(RuntimeEvent::Message(bcode_git_ui::app::Msg::Watch));
     }
 
@@ -204,12 +249,31 @@ impl Harness {
 }
 
 fn launch(path: &Path, config: LoadedConfig, commit_message: Option<String>, state: &Path) -> App {
+    launch_with(
+        path,
+        config,
+        commit_message,
+        state,
+        None,
+        Arc::new(bcode_git_ui::host::StandaloneHost),
+    )
+}
+
+fn launch_with(
+    path: &Path,
+    config: LoadedConfig,
+    commit_message: Option<String>,
+    state: &Path,
+    pull_requests: Option<Arc<dyn bcode_forge_models::PullRequestSource>>,
+    host: Arc<dyn bcode_git_ui::host::GitUiHost>,
+) -> App {
     let mut app = build_app(RunOptions {
         path: path.to_owned(),
         config,
-        host: Arc::new(bcode_git_ui::host::StandaloneHost),
+        host,
         commit_message,
         state_dir: Some(state.to_owned()),
+        pull_requests,
     })
     .unwrap();
     app.set_inline(true);
@@ -571,9 +635,12 @@ fn copies_and_pastes_commits_with_cherry_pick() {
         commit(path, "picked", "picked", "pick me");
         git(path, &["checkout", "--quiet", "main"]);
     });
-    // View "other" branch commits, copy the top commit, go back and paste onto main.
+    // View "other" branch commits (found by filtering, since branches are ordered by commit
+    // time), copy the top commit, go back and paste onto main.
+    harness.keys(&["3", "/"]);
+    harness.paste("other");
     harness.keys(&[
-        "3", "j", "enter", "shift+c", "escape", "4", "shift+v", "enter",
+        "enter", "enter", "shift+c", "escape", "4", "shift+v", "enter",
     ]);
     assert_eq!(harness.log(), ["pick me", "base"]);
 }
@@ -2214,4 +2281,253 @@ fn branch_help_explains_the_colors() {
     // Views without branch names do not show it.
     harness.keys(&["escape", "2", "?"]);
     assert!(!harness.screen(160, 50).contains("Branch colors"));
+}
+
+/// A forge that answers with a fixed list (or error), counting requests.
+struct FakeForge {
+    answer: std::sync::Mutex<
+        Result<Vec<bcode_forge_models::PullRequest>, bcode_forge_models::ForgeError>,
+    >,
+    calls: std::sync::atomic::AtomicUsize,
+}
+
+impl FakeForge {
+    fn new(
+        answer: Result<Vec<bcode_forge_models::PullRequest>, bcode_forge_models::ForgeError>,
+    ) -> Arc<Self> {
+        Arc::new(Self {
+            answer: std::sync::Mutex::new(answer),
+            calls: std::sync::atomic::AtomicUsize::new(0),
+        })
+    }
+
+    fn calls(&self) -> usize {
+        self.calls.load(std::sync::atomic::Ordering::SeqCst)
+    }
+}
+
+impl bcode_forge_models::PullRequestSource for FakeForge {
+    fn serves(&self, repository: &bcode_forge_models::RepositoryRef) -> bool {
+        repository.host == "github.com"
+    }
+
+    fn pull_requests(
+        &self,
+        _: &bcode_forge_models::RepositoryRef,
+    ) -> Result<bcode_forge_models::PullRequestList, bcode_forge_models::ForgeError> {
+        self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        self.answer.lock().unwrap().clone().map(|pull_requests| {
+            bcode_forge_models::PullRequestList {
+                pull_requests,
+                via: bcode_forge_models::Transport::Http,
+            }
+        })
+    }
+}
+
+/// A host that records the pages it is asked to open.
+#[derive(Default)]
+struct RecordingHost {
+    opened: std::sync::Mutex<Vec<String>>,
+}
+
+impl bcode_git_ui::host::GitUiHost for RecordingHost {
+    fn open_url(&self, url: &str) -> Result<(), String> {
+        self.opened.lock().unwrap().push(url.to_owned());
+        Ok(())
+    }
+}
+
+fn pull(
+    number: u64,
+    head: &str,
+    state: bcode_forge_models::PullRequestState,
+    head_oid: &str,
+) -> bcode_forge_models::PullRequest {
+    bcode_forge_models::PullRequest {
+        number,
+        title: format!("Change {number}"),
+        url: format!("https://github.com/octo/hello/pull/{number}"),
+        state,
+        head: head.into(),
+        head_repository: Some("octo/hello".into()),
+        head_oid: head_oid.into(),
+        base: "main".into(),
+        review: None,
+        checks: None,
+        updated_at: "2026-11-05T00:00:00Z".into(),
+    }
+}
+
+/// A repository on github.com with: `feature/login` (an open, approved, passing pull
+/// request), `squashed` (merged by squash: its tip is not in main), and `continued` (merged,
+/// then more local work). Returns the pull requests the forge reports.
+fn forge_repo(path: &Path) -> Vec<bcode_forge_models::PullRequest> {
+    use bcode_forge_models::{ChecksState, PullRequestState, ReviewDecision};
+
+    commit(path, "a", "a", "init");
+    git(
+        path,
+        &["remote", "add", "origin", "git@github.com:octo/hello.git"],
+    );
+    let branch = |name: &str, file: &str| {
+        git(path, &["checkout", "--quiet", "-b", name, "main"]);
+        commit(path, file, name, name);
+        git(path, &["rev-parse", "HEAD"]).trim().to_owned()
+    };
+    branch("feature/login", "login");
+    let squashed = branch("squashed", "squash");
+    let merged = branch("continued", "continued");
+    commit(path, "continued", "more", "after the merge");
+    git(path, &["checkout", "--quiet", "main"]);
+    let mut login = pull(12, "feature/login", PullRequestState::Open, "x");
+    login.review = Some(ReviewDecision::Approved);
+    login.checks = Some(ChecksState::Passing);
+    vec![
+        login,
+        pull(9, "squashed", PullRequestState::Merged, &squashed),
+        pull(8, "continued", PullRequestState::Merged, &merged),
+    ]
+}
+
+#[test]
+fn branches_show_their_pull_requests() {
+    use bmux_tui::style::{Color, Modifier};
+
+    let forge = FakeForge::new(Ok(Vec::new()));
+    let host = Arc::new(RecordingHost::default());
+    let mut harness = Harness::with_forge(
+        |path| *forge.answer.lock().unwrap() = Ok(forge_repo(path)),
+        configured(
+            "[plugins.config.\"bcode.git\".ui.branches]\n\
+             colors = [{ pr = \"open\", review = \"approved\", color = \"#123456\" }]\n",
+        ),
+        None,
+        Some(forge.clone()),
+        host.clone(),
+    );
+    harness.keys(&["3"]);
+    let screen = harness.screen(160, 40);
+    assert!(forge.calls() >= 1);
+    assert!(
+        line_with(&screen, "feature/login").contains("#12 open ✓ ✔"),
+        "{screen}"
+    );
+    assert!(
+        line_with(&screen, "squashed").contains("#9 merged"),
+        "{screen}"
+    );
+    // Rules can test the pull request; merged-by-squash dims, newer local work does not.
+    assert_eq!(
+        style_at(&mut harness, "feature/login", "#12").fg,
+        Some(Color::Rgb(0x12, 0x34, 0x56))
+    );
+    assert!(
+        style_at(&mut harness, "squashed", "#9")
+            .modifiers
+            .contains(Modifier::DIM)
+    );
+    assert!(
+        !style_at(&mut harness, "continued", "#8")
+            .modifiers
+            .contains(Modifier::DIM)
+    );
+    // `o` opens the selected branch's pull request.
+    let row = screen
+        .lines()
+        .position(|line| line.contains("feature/login"))
+        .unwrap();
+    // Branches start on the row after the window's title.
+    let first = screen
+        .lines()
+        .position(|line| line.contains("[3] Local"))
+        .unwrap()
+        + 1;
+    harness.keys(&["<"]);
+    for _ in first..row {
+        harness.keys(&["j"]);
+    }
+    harness.keys(&["o"]);
+    assert_eq!(
+        host.opened.lock().unwrap().as_slice(),
+        ["https://github.com/octo/hello/pull/12"]
+    );
+    // Its log in the main view starts with the pull request.
+    let screen = harness.screen(160, 40);
+    assert!(
+        screen.contains("Pull request #12 Change 12 · open · approved · checks passing"),
+        "{screen}"
+    );
+    // The legend explains the markers.
+    harness.keys(&["?"]);
+    assert!(
+        harness
+            .screen(160, 50)
+            .contains("checks passing, failing, running")
+    );
+}
+
+#[test]
+fn pull_requests_are_cached_and_failures_are_explained() {
+    let forge = FakeForge::new(Ok(Vec::new()));
+    let mut harness = Harness::with_forge(
+        |path| *forge.answer.lock().unwrap() = Ok(forge_repo(path)),
+        LoadedConfig::default(),
+        None,
+        Some(forge.clone()),
+        Arc::new(bcode_git_ui::host::StandaloneHost),
+    );
+    // The next session cannot reach GitHub, but shows what was cached and why it is stale.
+    harness.pulls = Some(FakeForge::new(Err(
+        bcode_forge_models::ForgeError::Unauthenticated("no GitHub token for github.com".into()),
+    )));
+    harness.relaunch();
+    harness.keys(&["3"]);
+    assert!(line_with(&harness.screen(160, 40), "feature/login").contains("#12 open"));
+    harness.keys(&["1"]);
+    let screen = harness.screen(160, 40);
+    assert!(screen.contains("Pull request"), "{screen}");
+    assert!(
+        screen.contains("unavailable: no GitHub token for github.com"),
+        "{screen}"
+    );
+}
+
+#[test]
+fn other_forges_and_disabled_pull_requests_ask_nothing() {
+    let forge = FakeForge::new(Ok(Vec::new()));
+    let mut harness = Harness::with_forge(
+        |path| {
+            commit(path, "a", "a", "init");
+            git(
+                path,
+                &["remote", "add", "origin", "git@gitlab.com:octo/hello.git"],
+            );
+        },
+        LoadedConfig::default(),
+        None,
+        Some(forge.clone()),
+        Arc::new(bcode_git_ui::host::StandaloneHost),
+    );
+    harness.keys(&["1"]);
+    let screen = harness.screen(160, 40);
+    assert_eq!(forge.calls(), 0);
+    assert!(screen.contains("gitlab.com is not GitHub"), "{screen}");
+
+    let forge = FakeForge::new(Ok(Vec::new()));
+    let mut harness = Harness::with_forge(
+        forge_repo_ignoring,
+        configured("[plugins.config.\"bcode.git\".ui.pull_requests]\nenabled = false\n"),
+        None,
+        Some(forge.clone()),
+        Arc::new(bcode_git_ui::host::StandaloneHost),
+    );
+    harness.keys(&["1"]);
+    let screen = harness.screen(160, 40);
+    assert_eq!(forge.calls(), 0);
+    assert!(!screen.contains("Pull request"), "{screen}");
+}
+
+fn forge_repo_ignoring(path: &Path) {
+    forge_repo(path);
 }

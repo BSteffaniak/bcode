@@ -1,0 +1,66 @@
+{
+  "data": {
+    "repository": {
+      "pullRequests": {
+        "nodes": [
+          {
+            "number": 12,
+            "title": "Add login",
+            "url": "https://github.com/octo/hello/pull/12",
+            "state": "OPEN",
+            "isDraft": false,
+            "headRefName": "feature/login",
+            "headRefOid": "1111111111111111111111111111111111111111",
+            "baseRefName": "main",
+            "headRepository": { "nameWithOwner": "octo/hello" },
+            "reviewDecision": "APPROVED",
+            "updatedAt": "2026-11-05T12:00:00Z",
+            "commits": { "nodes": [{ "commit": { "statusCheckRollup": { "state": "SUCCESS" } } }] }
+          },
+          {
+            "number": 11,
+            "title": "WIP: search",
+            "url": "https://github.com/octo/hello/pull/11",
+            "state": "OPEN",
+            "isDraft": true,
+            "headRefName": "search",
+            "headRefOid": "2222222222222222222222222222222222222222",
+            "baseRefName": "main",
+            "headRepository": { "nameWithOwner": "octo/hello" },
+            "reviewDecision": "REVIEW_REQUIRED",
+            "updatedAt": "2026-11-04T12:00:00Z",
+            "commits": { "nodes": [{ "commit": { "statusCheckRollup": { "state": "FAILURE" } } }] }
+          },
+          {
+            "number": 9,
+            "title": "Fix typo",
+            "url": "https://github.com/octo/hello/pull/9",
+            "state": "MERGED",
+            "isDraft": false,
+            "headRefName": "fix/typo",
+            "headRefOid": "3333333333333333333333333333333333333333",
+            "baseRefName": "main",
+            "headRepository": { "nameWithOwner": "octo/hello" },
+            "reviewDecision": null,
+            "updatedAt": "2026-11-01T12:00:00Z",
+            "commits": { "nodes": [{ "commit": { "statusCheckRollup": null } }] }
+          },
+          {
+            "number": 7,
+            "title": "From a fork",
+            "url": "https://github.com/octo/hello/pull/7",
+            "state": "CLOSED",
+            "isDraft": false,
+            "headRefName": "search",
+            "headRefOid": "4444444444444444444444444444444444444444",
+            "baseRefName": "main",
+            "headRepository": { "nameWithOwner": "someone/hello" },
+            "reviewDecision": null,
+            "updatedAt": "2026-10-01T12:00:00Z",
+            "commits": { "nodes": [{ "commit": { "statusCheckRollup": { "state": "PENDING" } } }] }
+          }
+        ]
+      }
+    }
+  }
+}

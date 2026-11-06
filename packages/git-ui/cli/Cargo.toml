@@ -15,6 +15,7 @@ name = "bcode-git"
 path = "src/main.rs"
 
 [dependencies]
+bcode_forge = { workspace = true }
 bcode_git_ui = { workspace = true }
 clap = { workspace = true, features = [
     "derive",

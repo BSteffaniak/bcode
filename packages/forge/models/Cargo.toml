@@ -1,0 +1,21 @@
+[package]
+authors     = { workspace = true }
+categories  = ["development-tools"]
+description = "Code forge models (repositories, pull requests) for bcode"
+edition     = { workspace = true }
+keywords    = ["bcode", "github", "pull-request", "models"]
+license     = { workspace = true }
+name        = "bcode_forge_models"
+readme      = { workspace = true }
+repository  = { workspace = true }
+version     = { workspace = true }
+
+[dependencies]
+serde = { workspace = true, features = ["derive", "std"] }
+
+[dev-dependencies]
+serde_json = { workspace = true }
+
+[features]
+default          = []
+fail-on-warnings = []

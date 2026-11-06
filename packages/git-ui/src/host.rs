@@ -27,6 +27,31 @@ pub trait GitUiHost: Send + Sync {
     fn menu_items(&self, _context: &HostContext) -> Vec<MenuItem> {
         Vec::new()
     }
+
+    /// Open a web page (such as a pull request) in the user's browser, without suspending the
+    /// UI. The default runs the platform opener (`open`, `xdg-open`, `start`).
+    ///
+    /// # Errors
+    /// Returns a description when the opener cannot be started.
+    fn open_url(&self, url: &str) -> Result<(), String> {
+        let mut command = if cfg!(target_os = "macos") {
+            std::process::Command::new("open")
+        } else if cfg!(windows) {
+            let mut command = std::process::Command::new("cmd");
+            command.args(["/C", "start", ""]);
+            command
+        } else {
+            std::process::Command::new("xdg-open")
+        };
+        command
+            .arg(url)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .map(drop)
+            .map_err(|error| error.to_string())
+    }
 }
 
 /// Host with no extra capabilities.

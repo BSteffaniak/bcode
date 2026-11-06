@@ -1,0 +1,24 @@
+[package]
+authors     = { workspace = true }
+categories  = ["development-tools"]
+description = "Code forge access (GitHub pull requests) for bcode"
+edition     = { workspace = true }
+keywords    = ["bcode", "github", "pull-request"]
+license     = { workspace = true }
+name        = "bcode_forge"
+readme      = { workspace = true }
+repository  = { workspace = true }
+version     = { workspace = true }
+
+[dependencies]
+bcode_forge_models = { workspace = true }
+reqwest            = { workspace = true, optional = true }
+serde              = { workspace = true, features = ["derive", "std"] }
+serde_json         = { workspace = true }
+tokio              = { workspace = true, features = ["rt", "net", "time"], optional = true }
+
+[features]
+default          = []
+fail-on-warnings = []
+# GitHub's HTTPS API (with the `gh` fallback). Without it, only `gh` is used.
+http = ["dep:reqwest", "dep:tokio"]

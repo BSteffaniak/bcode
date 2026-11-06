@@ -29,8 +29,12 @@ pub struct RunOptions {
     /// Message for the first commit editor of the session; the binaries pass
     /// `$BCODE_GIT_COMMIT_MSG` (see [`commit_message_from_env`]).
     pub commit_message: Option<String>,
-    /// Where panel layouts are remembered; `None` uses the default state directory.
+    /// Where panel layouts are remembered; `None` uses the default state directory. When
+    /// set, cached pull requests are kept in its `pull-requests` directory too.
     pub state_dir: Option<PathBuf>,
+    /// Where pull requests come from (for example `bcode_forge::GitHub`); `None` turns them
+    /// off. Ignored when `pull_requests.enabled` is false.
+    pub pull_requests: Option<Arc<dyn bcode_forge_models::PullRequestSource>>,
 }
 
 /// Environment variable holding a commit message to prefill.
@@ -137,6 +141,16 @@ pub fn build_app(options: RunOptions) -> Result<App, RunError> {
     diagnostics.extend(theme_error);
     let mut app = App::new(repo, loaded.ui, keymap, theme, options.host, diagnostics);
     app.env_message = options.commit_message;
+    let cache = options
+        .state_dir
+        .as_ref()
+        .map_or_else(crate::pulls::default_cache_dir, |dir| {
+            Some(dir.join("pull-requests"))
+        });
+    let source = options
+        .pull_requests
+        .filter(|_| app.config.pull_requests.enabled);
+    app.pulls = crate::pulls::PullRequests::new(source, cache);
     // Layouts are remembered for the directory the client was started in.
     if app.config.layout.remember {
         let launch = std::path::absolute(&options.path).unwrap_or_else(|_| options.path.clone());

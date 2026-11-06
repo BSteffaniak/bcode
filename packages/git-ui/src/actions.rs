@@ -549,6 +549,7 @@ impl App {
                 )
             }
             Action::BranchDelete => self.delete_branch(),
+            Action::BranchOpenPullRequest => self.open_pull_request(),
             Action::BranchRename => match self.selected(View::Branches) {
                 Some(Row::Branch(index)) => {
                     let name = self.snapshot.branches[index].name.clone();
@@ -2176,6 +2177,9 @@ impl App {
                 theme.title,
             )])];
             notes.extend(self.cx.branches.legend(theme));
+            if self.cx.pull_status.is_some() {
+                notes.extend(crate::pulls::legend(theme));
+            }
             notes.push(Line::new());
             menu = menu.with_notes(notes);
         }

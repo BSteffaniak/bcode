@@ -24,6 +24,7 @@ pub mod lazygit;
 pub mod ops;
 pub mod panels;
 pub mod popup;
+pub mod pulls;
 mod run;
 mod scroll;
 pub mod session;

@@ -237,6 +237,7 @@ actions! {
     BranchRebase => Branches, "rebase", "Rebase current branch onto", ["r"];
     BranchCheckoutByName => Branches, "checkout-by-name", "Checkout by name", ["c"];
     BranchFastForward => Branches, "fast-forward", "Fast-forward to upstream", ["f"];
+    BranchOpenPullRequest => Branches, "open-pull-request", "Open pull request in browser", ["o"];
     BranchUpstream => Branches, "upstream", "Upstream options", ["u"];
     BranchTag => Branches, "tag", "Tag branch tip", ["shift+t"];
     BranchViewCommits => Branches, "view-commits", "View commits", ["enter"];

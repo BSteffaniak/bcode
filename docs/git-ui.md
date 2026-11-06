@@ -241,6 +241,14 @@ wrap_lines = true               # wrap long diff lines; continuation rows keep t
 [staging]
 hunk_mode = false               # start the staging view selecting whole hunks
 
+[pull_requests]
+enabled = true                  # pull requests from GitHub (see Pull requests)
+transport = "auto"              # "auto" (HTTPS API, then gh) | "http" | "cli" (gh)
+refresh_seconds = 120
+remote = "origin"               # whose host and repository are asked about
+enterprise_hosts = []           # GitHub Enterprise hosts to treat as GitHub
+# token_env = "MY_GITHUB_TOKEN" # read before GITHUB_TOKEN and GH_TOKEN
+
 [branches]
 dim_merged = true               # dim branches already merged into the base branch
 colors = [                      # checked in order before the state colors; see Branch colors
@@ -360,6 +368,46 @@ remote color (purple by default), and the branch part takes the first rule witho
 whose `pattern` (if any) matches, else the remote color too. Author initials and graph lanes use a separate set
 of bright colors, so they are not mistaken for a branch state. `?` on a view showing branches
 starts with a legend of these colors.
+
+### Pull requests
+
+For a repository whose remote (`origin`, or `remote`) is on GitHub, branches show their pull
+request: `#12 open`, `draft`, `merged` or `closed`, then `✓`, `✗` or `●` for checks passing,
+failing or running, and `✔` or `✎` for approved or changes requested. A branch's log in the main
+view starts with its pull request (title, state, review, checks and link), the status overview
+shows the current branch's, and `o` on a branch opens it in the browser.
+
+A local branch matches the pull request whose head is its upstream branch (`origin/feature-x` →
+`feature-x`), or its own name without an upstream, in the same repository; pull requests from
+forks are ignored, and an open one wins over older closed or merged ones. A merged pull request
+also marks the branch merged (dimmed, safe to delete) even after a squash or rebase merge, but
+only when the branch has nothing newer than what was merged.
+
+Branch color rules can test pull requests: `pr` (`open`, `draft`, `merged`, `closed`, or `none`
+for no pull request), `review` (`approved`, `changes-requested`, `review-required`) and `checks`
+(`passing`, `failing`, `pending`):
+
+```toml
+[plugins.config."bcode.git".ui.branches]
+colors = [
+  { checks = "failing", color = "red" },
+  { pr = "merged", color = "gray" },
+]
+```
+
+Pull requests load in the background at startup, after fetch, pull and push, and every
+`refresh_seconds`; they are cached per repository (in `$XDG_CACHE_HOME/bcode-git/pull-requests`),
+so the next launch shows them at once. With `transport = "auto"`, the client asks GitHub's GraphQL
+API over HTTPS with a token from `token_env`, `GITHUB_TOKEN`, `GH_TOKEN` (for Enterprise hosts,
+`GH_ENTERPRISE_TOKEN` or `GITHUB_ENTERPRISE_TOKEN`) or `gh auth token`, and falls back to
+`gh api graphql`, which uses `gh`'s own login and network settings. The standalone `bcode-git`
+binary has no HTTP client (it stays lightweight), so it always uses `gh`, which reads the same
+token variables. The status overview says which answered, or why pull requests are unavailable;
+nothing pops up.
+
+What is sent: the repository's owner and name, with your token, to the remote's GitHub host
+(`api.github.com` for github.com, `https://<host>/api/graphql` for an Enterprise host), one
+request per refresh. Nothing is sent for other hosts, or with `enabled = false`.
 
 ### Commit message prefill
 
@@ -603,6 +651,7 @@ currently use `StandaloneHost`, which contributes nothing.
 | `bcode.git.branches.rebase` | Rebase current branch onto | `r` |
 | `bcode.git.branches.checkout-by-name` | Checkout by name | `c` |
 | `bcode.git.branches.fast-forward` | Fast-forward to upstream | `f` |
+| `bcode.git.branches.open-pull-request` | Open pull request in browser | `o` |
 | `bcode.git.branches.upstream` | Upstream options | `u` |
 | `bcode.git.branches.tag` | Tag branch tip | `shift+t` |
 | `bcode.git.branches.view-commits` | View commits | `enter` |

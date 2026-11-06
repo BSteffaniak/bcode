@@ -12,6 +12,7 @@ version     = { workspace = true }
 
 [dependencies]
 bcode_config_layers = { workspace = true }
+bcode_forge_models = { workspace = true }
 bcode_git = { workspace = true }
 bcode_keymap = { workspace = true }
 bcode_syntax_render = { workspace = true }
@@ -36,6 +37,7 @@ bmux_tui_runtime = { workspace = true, features = ["crossterm"] }
 notify = { workspace = true, features = ["macos_fsevent"] }
 regex = { workspace = true, features = ["std", "unicode"] }
 serde = { workspace = true, features = ["derive", "std"] }
+serde_json = { workspace = true }
 tokio = { workspace = true, features = [
     "macros",
     "rt-multi-thread",

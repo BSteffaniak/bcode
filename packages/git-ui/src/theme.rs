@@ -62,6 +62,8 @@ pub struct GitTheme {
     pub branch_states: [Style; 7],
     /// Applied over a branch merged into the base branch.
     pub branch_merged: Style,
+    /// Pull request markers by state: open, draft, merged, closed.
+    pub pull_states: [Style; 4],
     /// Colors for identities (graph lanes, authors): distinct from state colors.
     pub graph: Vec<Color>,
     /// Named theme colors, for configuration that refers to them.
@@ -264,6 +266,12 @@ impl GitTheme {
                 git("branch.state.local", text),
             ],
             branch_merged: git("branch.merged", Style::new().add_modifier(Modifier::DIM)),
+            pull_states: [
+                git("pr.open", Style::new().fg(green)),
+                git("pr.draft", muted),
+                git("pr.merged", Style::new().fg(violet)),
+                git("pr.closed", Style::new().fg(red)),
+            ],
             // Bright variants, so a lane or an author never reads as a branch state, tag or
             // remote.
             graph: vec![

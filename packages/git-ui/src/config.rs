@@ -39,6 +39,8 @@ pub struct GitUiConfig {
     pub staging: StagingConfig,
     /// Branch colors and merged-branch dimming.
     pub branches: crate::branches::BranchesConfig,
+    /// Pull request state from the repository's forge.
+    pub pull_requests: PullRequestsConfig,
     /// Maximum commits loaded per page.
     pub log_page_size: usize,
     /// Show the commit graph.
@@ -73,6 +75,7 @@ impl Default for GitUiConfig {
             diff: DiffConfig::default(),
             staging: StagingConfig::default(),
             branches: crate::branches::BranchesConfig::default(),
+            pull_requests: PullRequestsConfig::default(),
             log_page_size: 300,
             show_graph: true,
             highlight: HighlightConfig::default(),
@@ -320,6 +323,39 @@ pub struct DiffConfig {
 impl Default for DiffConfig {
     fn default() -> Self {
         Self { wrap_lines: true }
+    }
+}
+
+/// Pull request state from GitHub (`[pull_requests]`).
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct PullRequestsConfig {
+    /// Show pull requests for repositories on GitHub (or a listed Enterprise host).
+    pub enabled: bool,
+    /// How GitHub is reached: `auto` (HTTPS API with a token, falling back to `gh`), `http`,
+    /// or `cli` (`gh`).
+    pub transport: bcode_forge_models::Transport,
+    /// Seconds between refreshes while the client is open (also refreshed after fetch, pull
+    /// and push).
+    pub refresh_seconds: u64,
+    /// Remote whose host and repository are asked about.
+    pub remote: String,
+    /// GitHub Enterprise hosts to treat as GitHub.
+    pub enterprise_hosts: Vec<String>,
+    /// Environment variable to read a token from before `GITHUB_TOKEN` and `GH_TOKEN`.
+    pub token_env: Option<String>,
+}
+
+impl Default for PullRequestsConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            transport: bcode_forge_models::Transport::Auto,
+            refresh_seconds: 120,
+            remote: "origin".into(),
+            enterprise_hosts: Vec::new(),
+            token_env: None,
+        }
     }
 }
 

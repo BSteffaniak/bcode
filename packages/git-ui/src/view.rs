@@ -282,6 +282,9 @@ fn row_line(app: &App, row: Row) -> Line {
             if branch.worktree.is_some() {
                 spans.push(Span::styled(" (worktree)", theme.info));
             }
+            if let Some(pull) = app.cx.branches.pull(&branch.name) {
+                spans.extend(crate::pulls::marker(pull, theme));
+            }
             spans.push(Span::styled(format!("  {}", branch.summary), theme.muted));
             Line::from_spans(spans)
         }

@@ -458,7 +458,7 @@ pub fn store_file(dir: &Path, cwd: &Path) -> PathBuf {
 }
 
 /// Stable 64-bit FNV-1a, so file names survive toolchain changes.
-fn fnv1a(bytes: &[u8]) -> u64 {
+pub(crate) fn fnv1a(bytes: &[u8]) -> u64 {
     bytes.iter().fold(0xcbf2_9ce4_8422_2325, |hash, byte| {
         (hash ^ u64::from(*byte)).wrapping_mul(0x0100_0000_01b3)
     })

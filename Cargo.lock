@@ -2264,6 +2264,25 @@ dependencies = [
 ]
 
 [[package]]
+name = "bcode_forge"
+version = "0.0.1-alpha.0"
+dependencies = [
+ "bcode_forge_models",
+ "reqwest 0.12.28",
+ "serde",
+ "serde_json",
+ "tokio",
+]
+
+[[package]]
+name = "bcode_forge_models"
+version = "0.0.1-alpha.0"
+dependencies = [
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "bcode_git"
 version = "0.0.1-alpha.0"
 dependencies = [
@@ -2285,6 +2304,8 @@ name = "bcode_git_plugin"
 version = "0.0.1-alpha.0"
 dependencies = [
  "bcode_config",
+ "bcode_forge",
+ "bcode_forge_models",
  "bcode_git_ui",
  "bcode_plugin_sdk",
  "bcode_tool",
@@ -2302,6 +2323,7 @@ name = "bcode_git_ui"
 version = "0.0.1-alpha.0"
 dependencies = [
  "bcode_config_layers",
+ "bcode_forge_models",
  "bcode_git",
  "bcode_keymap",
  "bcode_syntax_render",
@@ -2316,6 +2338,7 @@ dependencies = [
  "notify",
  "regex",
  "serde",
+ "serde_json",
  "tempfile",
  "tokio",
  "toml 1.1.8+spec-1.1.0",
@@ -2326,6 +2349,7 @@ dependencies = [
 name = "bcode_git_ui_cli"
 version = "0.0.1-alpha.0"
 dependencies = [
+ "bcode_forge",
  "bcode_git_ui",
  "clap",
  "tokio",
@@ -2336,6 +2360,7 @@ name = "bcode_github_review_publisher_plugin"
 version = "0.0.1-alpha.0"
 dependencies = [
  "bcode_code_review_models",
+ "bcode_forge",
  "bcode_plugin_sdk",
  "reqwest 0.12.28",
  "serde",

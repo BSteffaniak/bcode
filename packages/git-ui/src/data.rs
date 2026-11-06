@@ -368,8 +368,10 @@ pub struct PresentContext {
     pub relative_dates: bool,
     /// Show the commit graph in logs.
     pub show_graph: bool,
-    /// Branch name colors.
+    /// Branch name colors, and what is known about local branches (pull requests).
     pub branches: crate::branches::BranchColors,
+    /// How pull requests are being found, for the overview; `None` when turned off.
+    pub pull_status: Option<String>,
 }
 
 /// Build the main view for a request.
@@ -457,13 +459,34 @@ pub fn load_main(repo: &Repository, request: MainRequest, cx: &PresentContext) -
                     ..LogQuery::default()
                 })
                 .unwrap_or_default();
-            vec![plain(
-                &format!("Log · {revision}"),
-                log_rows(&commits, &BTreeSet::new(), cx),
-            )]
+            // A branch with a pull request starts with it.
+            let mut rows = pull_request_rows(revision, cx);
+            rows.extend(log_rows(&commits, &BTreeSet::new(), cx));
+            vec![plain(&format!("Log · {revision}"), rows)]
         }
     };
     MainContent { request, sections }
+}
+
+/// Rows describing the pull request of branch `revision`, when it has one.
+fn pull_request_rows(revision: &str, cx: &PresentContext) -> Vec<DiffRow> {
+    cx.branches
+        .pull(revision)
+        .map(|pull| {
+            vec![
+                DiffRow::info(Line::from_spans(
+                    std::iter::once(Span::styled("Pull request ", cx.theme.muted))
+                        .chain(crate::pulls::summary(pull, &cx.theme))
+                        .collect::<Vec<_>>(),
+                )),
+                DiffRow::info(Line::from_spans(vec![Span::styled(
+                    pull.url.clone(),
+                    cx.theme.muted,
+                )])),
+                DiffRow::info(Line::new()),
+            ]
+        })
+        .unwrap_or_default()
 }
 
 fn path_filter(path: Option<&String>) -> Vec<&str> {
@@ -978,6 +1001,16 @@ fn status_summary(status: &bcode_git::models::StatusSnapshot, cx: &PresentContex
         Span::styled(format!("  ↑{}", status.branch.ahead), theme.success),
         Span::styled(format!(" ↓{}", status.branch.behind), theme.warning),
     ]));
+    // The current branch's pull request, or why pull requests are not shown.
+    if let Some(pull_status) = &cx.pull_status {
+        let mut spans = vec![label("⇄", "Pull request")];
+        match cx.branches.pull(&branch) {
+            Some(pull) => spans.extend(crate::pulls::summary(pull, theme)),
+            None => spans.push(Span::styled("none", theme.muted)),
+        }
+        spans.push(Span::styled(format!("  ({pull_status})"), theme.muted));
+        rows.push(labeled(spans));
+    }
     let staged = status
         .entries
         .iter()

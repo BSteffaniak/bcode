@@ -7,6 +7,7 @@ mod cli;
 #[cfg(feature = "static-bundled")]
 mod git_tui;
 
+use bcode_forge_models::RepositoryRef;
 use bcode_plugin_sdk::prelude::*;
 use bcode_tool::{
     ListToolsRequest, OP_INVOKE_TOOL, OP_LIST_TOOLS, TOOL_SERVICE_INTERFACE_ID, ToolArtifact,
@@ -426,73 +427,57 @@ struct GitRemote {
     repo: String,
 }
 
+/// A clonable remote: the shared remote URL parsing, plus cloning's own rules (allowed schemes,
+/// `.git` for unknown hosts, the URL to clone from).
 fn parse_git_remote(url: &str) -> Result<GitRemote, GitError> {
-    if !url.contains("://")
-        && let Some(remote) = parse_scp_like_remote(url)
+    let scheme = url
+        .split_once("://")
+        .map(|(scheme, _)| scheme.to_ascii_lowercase());
+    if let Some(scheme) = &scheme
+        && !matches!(scheme.as_str(), "http" | "https" | "ssh" | "git")
     {
-        return Ok(remote);
-    }
-    let Some((scheme, rest)) = url.split_once("://") else {
-        return Err(GitError::InvalidRequest(
-            "url must be an http(s), ssh, git, or scp-like Git remote URL".to_string(),
-        ));
-    };
-    match scheme.to_ascii_lowercase().as_str() {
-        "http" | "https" | "ssh" | "git" => parse_scheme_remote(scheme, url, rest),
-        _ => Err(GitError::InvalidRequest(format!(
+        return Err(GitError::InvalidRequest(format!(
             "unsupported Git URL scheme: {scheme}"
-        ))),
+        )));
     }
-}
-
-fn parse_scp_like_remote(url: &str) -> Option<GitRemote> {
-    let (user_host, path) = url.split_once(':')?;
-    if user_host.contains('/') || path.is_empty() {
-        return None;
-    }
-    let host = user_host.rsplit('@').next()?.to_string();
-    let (owner, repo) = owner_repo_from_path(path)?;
-    Some(GitRemote {
-        clone_url: url.to_string(),
-        host,
-        owner: Some(owner),
-        repo,
-    })
-}
-
-fn parse_scheme_remote(scheme: &str, original: &str, rest: &str) -> Result<GitRemote, GitError> {
-    let host_path = rest
-        .split_once('@')
-        .map_or(rest, |(_, host_path)| host_path);
-    let (host_port, path) = host_path.split_once('/').ok_or_else(|| {
-        GitError::InvalidRequest("Git URL must include host and repository path".to_string())
-    })?;
-    let host = host_port
-        .split(':')
-        .next()
-        .filter(|host| !host.is_empty())
-        .ok_or_else(|| GitError::InvalidRequest("Git URL host must not be empty".to_string()))?
-        .to_string();
-    let (owner, repo) = owner_repo_from_path(path).ok_or_else(|| {
-        GitError::InvalidRequest("Git URL must include owner/group and repository".to_string())
-    })?;
-    let original_is_git_remote = has_git_suffix(original);
-    if matches!(scheme, "http" | "https") && !is_known_git_host(&host) && !original_is_git_remote {
+    let repository = RepositoryRef::from_remote_url(url)
+        .filter(|repository| !is_known_non_repo_path(&repository.owner))
+        .ok_or_else(|| {
+            GitError::InvalidRequest(if scheme.is_some() {
+                "Git URL must include host, owner/group and repository".to_string()
+            } else {
+                "url must be an http(s), ssh, git, or scp-like Git remote URL".to_string()
+            })
+        })?;
+    let RepositoryRef { host, owner, name } = repository;
+    let Some(scheme) = scheme else {
+        return Ok(GitRemote {
+            clone_url: url.to_string(),
+            host,
+            owner: Some(owner),
+            repo: name,
+        });
+    };
+    let original_is_git_remote = has_git_suffix(url);
+    if matches!(scheme.as_str(), "http" | "https")
+        && !is_known_git_host(&host)
+        && !original_is_git_remote
+    {
         return Err(GitError::InvalidRequest(
             "generic http(s) Git URLs must end with .git unless the host is a known Git forge"
                 .to_string(),
         ));
     }
     let clone_url = if original_is_git_remote {
-        original.to_string()
+        url.to_string()
     } else {
-        format!("https://{host}/{owner}/{repo}.git")
+        format!("https://{host}/{owner}/{name}.git")
     };
     Ok(GitRemote {
         clone_url,
         host,
         owner: Some(owner),
-        repo,
+        repo: name,
     })
 }
 
@@ -507,20 +492,6 @@ fn is_known_git_host(host: &str) -> bool {
         host,
         "github.com" | "gitlab.com" | "codeberg.org" | "bitbucket.org"
     )
-}
-
-fn owner_repo_from_path(path: &str) -> Option<(String, String)> {
-    let mut segments = path
-        .trim_start_matches('/')
-        .split('/')
-        .filter(|segment| !segment.is_empty());
-    let owner = segments.next()?.to_string();
-    let repo = segments.next()?.trim_end_matches(".git").to_string();
-    if owner.is_empty() || repo.is_empty() || is_known_non_repo_path(&owner) {
-        None
-    } else {
-        Some((owner, repo))
-    }
 }
 
 fn is_known_non_repo_path(segment: &str) -> bool {

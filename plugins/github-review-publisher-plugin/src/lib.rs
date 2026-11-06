@@ -648,23 +648,14 @@ impl GitHubPublishOptions {
     }
 
     fn resolve_auth(&self) -> Result<ResolvedAuth, GitHubPublisherError> {
-        if let Some(token) = env_token(&self.token_env) {
-            return Ok(ResolvedAuth::new(token));
-        }
-        if self.token_env != DEFAULT_TOKEN_ENV
-            && let Some(token) = env_token(DEFAULT_TOKEN_ENV)
-        {
-            return Ok(ResolvedAuth::new(token));
-        }
-        if let Some(token) = env_token("GH_TOKEN") {
-            return Ok(ResolvedAuth::new(token));
-        }
-        let token = gh_output(&["auth", "token"], &self.repo_root)
-            .map_err(|_| GitHubPublisherError::MissingToken)?;
-        if token.trim().is_empty() {
-            return Err(GitHubPublisherError::MissingToken);
-        }
-        Ok(ResolvedAuth::new(token))
+        // The shared lookup: the configured variable, GITHUB_TOKEN, GH_TOKEN, then gh.
+        bcode_forge::resolve_token(
+            bcode_forge::GITHUB_HOST,
+            Some(&self.token_env),
+            &self.repo_root,
+        )
+        .map(|token| ResolvedAuth::new(token.value().to_owned()))
+        .map_err(|_| GitHubPublisherError::MissingToken)
     }
 }
 

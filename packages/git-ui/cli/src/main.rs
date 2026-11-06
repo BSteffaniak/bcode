@@ -77,12 +77,14 @@ async fn main() -> ExitCode {
         };
     }
     let config = bcode_git_ui::config::load_with(&path, &config_options);
+    let pull_requests = Some(github(&config, &path));
     let options = bcode_git_ui::RunOptions {
         path,
         config,
         host: Arc::new(bcode_git_ui::host::StandaloneHost),
         commit_message: bcode_git_ui::commit_message_from_env(),
         state_dir: None,
+        pull_requests,
     };
     match bcode_git_ui::run(options).await {
         Ok(()) => ExitCode::SUCCESS,
@@ -91,4 +93,19 @@ async fn main() -> ExitCode {
             ExitCode::FAILURE
         }
     }
+}
+
+/// GitHub as the source of pull requests, configured by `[pull_requests]`.
+fn github(
+    config: &bcode_git_ui::config::LoadedConfig,
+    path: &std::path::Path,
+) -> Arc<dyn bcode_forge::models::PullRequestSource> {
+    let settings = &config.ui.pull_requests;
+    let mut github = bcode_forge::GitHub::new(path)
+        .transport(settings.transport)
+        .enterprise_hosts(settings.enterprise_hosts.clone());
+    if let Some(name) = &settings.token_env {
+        github = github.token_env(name);
+    }
+    Arc::new(github)
 }

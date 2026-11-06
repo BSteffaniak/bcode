@@ -9,12 +9,14 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
+use bcode_forge_models::{ChecksState, PullRequest, PullRequestState, ReviewDecision};
 use bcode_git::models::Branch;
 use bmux_tui::style::{Color, Modifier, Style};
 use bmux_tui::text::{Line, Span};
 use regex::Regex;
 use serde::{Deserialize, Serialize};
 
+use crate::pulls::Matched;
 use crate::theme::GitTheme;
 
 /// Where a local branch stands; each branch has exactly one state.
@@ -101,21 +103,61 @@ impl BranchState {
     }
 }
 
-/// States a rule applies to: one, or any of several.
+/// A rule condition's values: one, or any of several.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(untagged)]
-pub enum States {
-    /// One state.
-    One(BranchState),
-    /// Any of these states.
-    Any(Vec<BranchState>),
+pub enum OneOrMany<T> {
+    /// One value.
+    One(T),
+    /// Any of these values.
+    Any(Vec<T>),
 }
 
-impl States {
-    fn list(&self) -> Vec<BranchState> {
+impl<T: Clone> OneOrMany<T> {
+    fn list(&self) -> Vec<T> {
         match self {
-            Self::One(state) => vec![*state],
-            Self::Any(states) => states.clone(),
+            Self::One(value) => vec![value.clone()],
+            Self::Any(values) => values.clone(),
+        }
+    }
+}
+
+/// A branch's pull request, as a rule condition.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Deserialize, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum PullMatch {
+    /// An open pull request.
+    Open,
+    /// A draft pull request.
+    Draft,
+    /// A merged pull request.
+    Merged,
+    /// A pull request closed without merging.
+    Closed,
+    /// No pull request.
+    None,
+}
+
+impl PullMatch {
+    const fn of(pull: Option<&PullRequest>) -> Self {
+        match pull {
+            Some(pull) => match pull.state {
+                PullRequestState::Open => Self::Open,
+                PullRequestState::Draft => Self::Draft,
+                PullRequestState::Merged => Self::Merged,
+                PullRequestState::Closed => Self::Closed,
+            },
+            None => Self::None,
+        }
+    }
+
+    const fn name(self) -> &'static str {
+        match self {
+            Self::Open => "open",
+            Self::Draft => "draft",
+            Self::Merged => "merged",
+            Self::Closed => "closed",
+            Self::None => "none",
         }
     }
 }
@@ -130,7 +172,16 @@ pub struct BranchColorRule {
     pub pattern: Option<String>,
     /// State (or list of states) the branch must be in.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub state: Option<States>,
+    pub state: Option<OneOrMany<BranchState>>,
+    /// State of the branch's pull request (`none`: it has none).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pr: Option<OneOrMany<PullMatch>>,
+    /// Review decision on the branch's pull request.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub review: Option<OneOrMany<ReviewDecision>>,
+    /// Checks on the branch's pull request.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub checks: Option<OneOrMany<ChecksState>>,
     /// Color: a name (`cyan`, `bright-magenta`), `#rrggbb`, or a theme palette color. When
     /// unset, the branch keeps its state's color.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -165,20 +216,50 @@ impl Default for BranchesConfig {
 struct Rule {
     pattern: Option<Regex>,
     states: Vec<BranchState>,
+    pulls: Vec<PullMatch>,
+    reviews: Vec<ReviewDecision>,
+    checks: Vec<ChecksState>,
     style: Style,
     description: String,
 }
 
 impl Rule {
-    fn matches(&self, name: &str, state: Option<BranchState>) -> bool {
+    /// Whether the rule applies to a branch called `name`. `local` is what is known about a
+    /// local branch (its state and pull request); remote branches have none, so only rules
+    /// about names apply to them.
+    fn matches(&self, name: &str, local: Option<(BranchState, Option<&PullRequest>)>) -> bool {
         let named = self
             .pattern
             .as_ref()
             .is_none_or(|pattern| pattern.is_match(name));
-        let stated =
-            self.states.is_empty() || state.is_some_and(|state| self.states.contains(&state));
-        named && stated
+        let about_local = !(self.states.is_empty()
+            && self.pulls.is_empty()
+            && self.reviews.is_empty()
+            && self.checks.is_empty());
+        let Some((state, pull)) = local else {
+            return named && !about_local;
+        };
+        let any = |values: &[_], value| values.is_empty() || values.contains(&value);
+        named
+            && (self.states.is_empty() || self.states.contains(&state))
+            && any(&self.pulls, PullMatch::of(pull))
+            && (self.reviews.is_empty()
+                || pull
+                    .and_then(|pull| pull.review)
+                    .is_some_and(|review| self.reviews.contains(&review)))
+            && (self.checks.is_empty()
+                || pull
+                    .and_then(|pull| pull.checks)
+                    .is_some_and(|checks| self.checks.contains(&checks)))
     }
+}
+
+/// What is known about a local branch.
+#[derive(Debug, Clone)]
+struct Facts {
+    state: BranchState,
+    merged: bool,
+    pull: Option<PullRequest>,
 }
 
 /// How branch names are colored: the rules, plus what is known about each local branch.
@@ -190,7 +271,7 @@ pub struct BranchColors {
     merged: Style,
     remote: Style,
     dim_merged: bool,
-    known: Arc<BTreeMap<String, (BranchState, bool)>>,
+    known: Arc<BTreeMap<String, Facts>>,
 }
 
 impl BranchColors {
@@ -222,26 +303,46 @@ impl BranchColors {
             if rule.bold {
                 style = style.add_modifier(Modifier::BOLD);
             }
-            let states = rule.state.as_ref().map(States::list).unwrap_or_default();
+            let states = rule.state.as_ref().map(OneOrMany::list).unwrap_or_default();
+            let pulls = rule.pr.as_ref().map(OneOrMany::list).unwrap_or_default();
+            let reviews = rule
+                .review
+                .as_ref()
+                .map(OneOrMany::list)
+                .unwrap_or_default();
+            let checks = rule
+                .checks
+                .as_ref()
+                .map(OneOrMany::list)
+                .unwrap_or_default();
             let mut description = Vec::new();
             if let Some(pattern) = &rule.pattern {
                 description.push(format!("/{pattern}/"));
             }
-            if !states.is_empty() {
-                description.push(
-                    states
-                        .iter()
-                        .map(|state| state.name())
-                        .collect::<Vec<_>>()
-                        .join(" or "),
-                );
-            }
+            let mut describe = |label: &str, names: Vec<&str>| {
+                if !names.is_empty() {
+                    description.push(format!("{label}{}", names.join(" or ")));
+                }
+            };
+            describe("", states.iter().map(|state| state.name()).collect());
+            describe("PR ", pulls.iter().map(|pull| pull.name()).collect());
+            describe(
+                "review ",
+                reviews.iter().map(|review| review.name()).collect(),
+            );
+            describe(
+                "checks ",
+                checks.iter().map(|checks| checks.name()).collect(),
+            );
             if description.is_empty() {
                 description.push("every branch".into());
             }
             rules.push(Rule {
                 pattern,
                 states,
+                pulls,
+                reviews,
+                checks,
                 style,
                 description: description.join(", "),
             });
@@ -259,17 +360,29 @@ impl BranchColors {
         )
     }
 
-    /// The same rules with the current local branches and which are merged.
+    /// The same rules with the current local branches: which are merged into the base
+    /// branch, and their pull requests (a merged pull request also counts as merged).
     #[must_use]
-    pub fn with_branches(&self, branches: &[Branch], merged: &BTreeSet<String>) -> Self {
+    pub fn with_branches(
+        &self,
+        branches: &[Branch],
+        merged: &BTreeSet<String>,
+        pulls: &BTreeMap<String, Matched>,
+    ) -> Self {
         Self {
             known: Arc::new(
                 branches
                     .iter()
                     .map(|branch| {
+                        let matched = pulls.get(&branch.name);
                         (
                             branch.name.clone(),
-                            (BranchState::of(branch), merged.contains(&branch.name)),
+                            Facts {
+                                state: BranchState::of(branch),
+                                merged: merged.contains(&branch.name)
+                                    || matched.is_some_and(|matched| matched.merged),
+                                pull: matched.map(|matched| matched.pull.clone()),
+                            },
                         )
                     })
                     .collect(),
@@ -278,14 +391,26 @@ impl BranchColors {
         }
     }
 
-    /// The color of a local branch called `name` in `state`.
+    /// The pull request of the local branch `name`, when known.
     #[must_use]
-    pub fn style(&self, name: &str, state: BranchState, merged: bool) -> Style {
+    pub fn pull(&self, name: &str) -> Option<&PullRequest> {
+        self.known.get(name)?.pull.as_ref()
+    }
+
+    /// The color of a local branch called `name` in `state`, with its pull request.
+    #[must_use]
+    pub fn style(
+        &self,
+        name: &str,
+        state: BranchState,
+        merged: bool,
+        pull: Option<&PullRequest>,
+    ) -> Style {
         let base = self.states[state.index()];
         let style = self
             .rules
             .iter()
-            .find(|rule| rule.matches(name, Some(state)))
+            .find(|rule| rule.matches(name, Some((state, pull))))
             .map_or(base, |rule| base.patch(rule.style));
         if merged && self.dim_merged && state != BranchState::Current {
             style.patch(self.merged)
@@ -297,12 +422,10 @@ impl BranchColors {
     /// The color of the local branch `name`, by what is known about it.
     #[must_use]
     pub fn local(&self, name: &str) -> Style {
-        let (state, merged) = self
-            .known
-            .get(name)
-            .copied()
-            .unwrap_or((BranchState::Local, false));
-        self.style(name, state, merged)
+        self.known.get(name).map_or_else(
+            || self.style(name, BranchState::Local, false, None),
+            |facts| self.style(name, facts.state, facts.merged, facts.pull.as_ref()),
+        )
     }
 
     /// Colors of a remote branch's remote prefix and branch name.
@@ -463,26 +586,28 @@ mod tests {
         assert!(diagnostics.is_empty(), "{diagnostics:?}");
         let state = |state: BranchState| theme.branch_states[state as usize];
         // Name rule, whatever the state.
-        let release = colors.style("release/1", BranchState::Behind, false);
+        let release = colors.style("release/1", BranchState::Behind, false, None);
         assert_eq!(release.fg, Some(Color::Rgb(0x11, 0x22, 0x33)));
         assert!(release.modifiers.contains(Modifier::BOLD));
         // Name and state must both hold.
         assert_eq!(
-            colors.style("feature/x", BranchState::Ahead, false).fg,
+            colors
+                .style("feature/x", BranchState::Ahead, false, None)
+                .fg,
             Some(Color::Magenta)
         );
         assert_eq!(
-            colors.style("feature/x", BranchState::Synced, false),
+            colors.style("feature/x", BranchState::Synced, false, None),
             state(BranchState::Synced)
         );
         // State rule.
         assert_eq!(
-            colors.style("x", BranchState::Diverged, false).fg,
+            colors.style("x", BranchState::Diverged, false, None).fg,
             Some(Color::BrightRed)
         );
         // Nothing matches: the state's color.
         assert_eq!(
-            colors.style("x", BranchState::Gone, false),
+            colors.style("x", BranchState::Gone, false, None),
             state(BranchState::Gone)
         );
     }
@@ -490,13 +615,13 @@ mod tests {
     #[test]
     fn merged_branches_dim_except_the_current_one() {
         let (colors, _, theme) = compile("");
-        let merged = colors.style("x", BranchState::Synced, true);
+        let merged = colors.style("x", BranchState::Synced, true, None);
         assert!(merged.modifiers.contains(Modifier::DIM));
-        let current = colors.style("x", BranchState::Current, true);
+        let current = colors.style("x", BranchState::Current, true, None);
         assert_eq!(current, theme.branch_states[BranchState::Current as usize]);
         let (off, _, _) = compile("dim_merged = false");
         assert!(
-            !off.style("x", BranchState::Synced, true)
+            !off.style("x", BranchState::Synced, true, None)
                 .modifiers
                 .contains(Modifier::DIM)
         );
@@ -513,6 +638,7 @@ mod tests {
                 branch("old", false, true, 0, 0, false),
             ],
             &BTreeSet::from(["old".to_owned()]),
+            &BTreeMap::new(),
         );
         assert_eq!(colors.local("main"), theme.branch_states[0]);
         assert_eq!(colors.local("feature/x").fg, Some(Color::Magenta));
@@ -533,6 +659,54 @@ mod tests {
     }
 
     #[test]
+    fn rules_can_test_pull_requests_reviews_and_checks() {
+        let (colors, diagnostics, theme) = compile(
+            r#"
+            colors = [
+                { checks = "failing", color = "red" },
+                { pr = "merged", color = "gray" },
+                { pr = ["open", "draft"], review = "approved", color = "green" },
+                { pr = "none", state = "ahead", color = "yellow" },
+            ]
+            "#,
+        );
+        assert!(diagnostics.is_empty(), "{diagnostics:?}");
+        let pull = |state, review, checks| PullRequest {
+            number: 1,
+            title: String::new(),
+            url: String::new(),
+            state,
+            head: "x".into(),
+            head_repository: None,
+            head_oid: String::new(),
+            base: "main".into(),
+            review,
+            checks,
+            updated_at: String::new(),
+        };
+        let style = |pull: Option<&PullRequest>| colors.style("x", BranchState::Ahead, false, pull);
+        let failing = pull(PullRequestState::Open, None, Some(ChecksState::Failing));
+        assert_eq!(style(Some(&failing)).fg, Some(Color::Red));
+        let merged = pull(PullRequestState::Merged, None, None);
+        assert_eq!(style(Some(&merged)).fg, Some(Color::BrightBlack));
+        let approved = pull(
+            PullRequestState::Draft,
+            Some(ReviewDecision::Approved),
+            None,
+        );
+        assert_eq!(style(Some(&approved)).fg, Some(Color::Green));
+        assert_eq!(style(None).fg, Some(Color::Yellow));
+        // An open, unreviewed pull request matches nothing: the state's color.
+        let open = pull(PullRequestState::Open, None, None);
+        assert_eq!(
+            style(Some(&open)),
+            theme.branch_states[BranchState::Ahead as usize]
+        );
+        // Remote branches have no pull request facts, so these rules never apply to them.
+        assert_eq!(colors.remote("x").1, theme.branch_remote);
+    }
+
+    #[test]
     fn unusable_rules_are_reported_and_skipped() {
         let (colors, diagnostics, theme) = compile(
             r#"colors = [{ pattern = "(", color = "red" }, { pattern = "x", color = "nope" }]"#,
@@ -541,7 +715,7 @@ mod tests {
         assert!(diagnostics[0].contains("branches.colors[0]: invalid pattern"));
         assert!(diagnostics[1].contains("unknown color \"nope\""));
         assert_eq!(
-            colors.style("x", BranchState::Local, false),
+            colors.style("x", BranchState::Local, false, None),
             theme.branch_states[6]
         );
     }
