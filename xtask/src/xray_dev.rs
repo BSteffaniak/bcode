@@ -54,7 +54,9 @@ fn launch_args(args: Vec<OsString>) -> Result<Vec<OsString>> {
     }
     while let Some(arg) = args.next() {
         match arg.to_str() {
-            Some("--demo" | "--no-open" | "--help" | "-h") => forwarded.push(arg),
+            Some("--demo" | "--no-open" | "--require-pairing" | "--help" | "-h") => {
+                forwarded.push(arg);
+            }
             Some("--lifetime-seconds") => {
                 let value = args
                     .next()
@@ -70,7 +72,7 @@ fn launch_args(args: Vec<OsString>) -> Result<Vec<OsString>> {
             }
             _ => {
                 return Err(format_error(
-                    "xray-dev accepts --demo, --no-open, --lifetime-seconds N, --help only; state/config/endpoint overrides are intentionally not forwarded",
+                    "xray-dev accepts --demo, --no-open, --require-pairing, --lifetime-seconds N, --help only; state/config/endpoint overrides are intentionally not forwarded",
                 ));
             }
         }

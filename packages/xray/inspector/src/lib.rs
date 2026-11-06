@@ -35,6 +35,16 @@ impl From<std::io::Error> for InspectorError {
     }
 }
 
+/// Browser access policy for the loopback inspector.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum PairingMode {
+    /// Any local visitor may open the selected observation.
+    #[default]
+    Open,
+    /// Require a short-lived single-use launch ticket or code.
+    Required,
+}
+
 /// Explicit observation options, never execution or model selection.
 #[derive(Clone, Debug)]
 pub struct LaunchOptions {
@@ -48,6 +58,8 @@ pub struct LaunchOptions {
     pub lifetime_seconds: u64,
     /// Explicitly open browser on serving host even over SSH.
     pub local_browser: bool,
+    /// Optional browser pairing; localhost access is open by default.
+    pub pairing: PairingMode,
 }
 impl Default for LaunchOptions {
     fn default() -> Self {
@@ -57,6 +69,7 @@ impl Default for LaunchOptions {
             deep: false,
             lifetime_seconds: 3600,
             local_browser: false,
+            pairing: PairingMode::Open,
         }
     }
 }
@@ -136,6 +149,7 @@ async fn launch(
         deep: options.deep,
         lifetime_seconds: options.lifetime_seconds,
         local_browser: options.local_browser,
+        pairing: options.pairing,
     };
     let (shutdown, stopped) = watch::channel(false);
     let (ready, started) = oneshot::channel();

@@ -1,6 +1,6 @@
 import { useEffect, useMemo, useRef, useState, type ChangeEvent } from 'react';
 import type { InspectorSnapshot } from './api';
-import { redeemPairing, PAIRING_FAILURE, type LaunchTicket } from './components/pairing';
+import { redeemPairing, PAIRING_FAILURE, PairingRequired, type LaunchTicket } from './components/pairing';
 import { InspectorClient } from './core/client';
 import { openRecording, exportEvents, createRecordingReader, type RecordingReader } from './recording/index';
 import type { XrayEnvelope } from './contracts';
@@ -33,6 +33,7 @@ export default function App({ launchTicket }: { launchTicket?: LaunchTicket } = 
   const [demo, setDemo] = useState(false);
   const [working, setWorking] = useState(!!launchTicket);
   const [pairingCode, setPairingCode] = useState('');
+  const [showPairing, setShowPairing] = useState(!launchTicket);
   const client = useRef<InspectorClient | null>(null);
   const search = useRef<HTMLInputElement>(null);
   const fileInput = useRef<HTMLInputElement>(null);
@@ -49,7 +50,7 @@ export default function App({ launchTicket }: { launchTicket?: LaunchTicket } = 
     try { instance = new InspectorClient(setSnapshot); }
     catch {
       setSnapshot({ ...empty, state: 'disconnected' });
-      setWorking(false); setNotice(PAIRING_FAILURE);
+      setWorking(false); setShowPairing(true); setNotice(PAIRING_FAILURE);
       return;
     }
     client.current = instance;
@@ -61,8 +62,8 @@ export default function App({ launchTicket }: { launchTicket?: LaunchTicket } = 
         if (cancelled) return;
         setDemo(bootstrap.demo === true);
         await instance.connect(bootstrap);
-      }).catch(() => {
-        if (!cancelled) { instance.failConnection(); setNotice(PAIRING_FAILURE); }
+      }).catch((error: unknown) => {
+        if (!cancelled) { instance.failConnection(); setShowPairing(true); if (!(error instanceof PairingRequired)) setNotice(PAIRING_FAILURE); }
       }).finally(() => { if (!cancelled) setWorking(false); });
     }
     return () => { cancelled = true; instance.dispose(); client.current = null; };
@@ -101,6 +102,7 @@ export default function App({ launchTicket }: { launchTicket?: LaunchTicket } = 
     try {
       const bootstrap = await redeemPairing(code);
       setDemo(bootstrap.demo === true);
+      setShowPairing(false);
       recordingReader.current = null;
       await client.current?.connect(bootstrap);
       setPaused(false); setFollow(true);
@@ -146,8 +148,8 @@ export default function App({ launchTicket }: { launchTicket?: LaunchTicket } = 
   }
   const active = ['bootstrapping', 'connecting', 'live', 'finalizing'].includes(snapshot.state);
   return <div className={`app ${prefs.compact ? 'compact' : ''}`}>
-    <header className="app-header"><a className="brand" href="#main"><span className="brand-mark">✳</span> X-ray <span className="badge">INSPECTOR</span></a><div className="header-status"><span className={`status-dot ${snapshot.state === 'live' ? 'live' : ''}`} /> <span aria-label="Connection state">{snapshot.state}</span><span className="muted">/ observation only</span></div><div className="header-actions"><form className="pairing-form" onSubmit={event => { event.preventDefault(); void connect(); }}><label htmlFor="pairing-code">CLI pairing code</label><input id="pairing-code" type="password" autoComplete="off" spellCheck={false} autoCapitalize="none" maxLength={4096} value={pairingCode} disabled={working || active} onChange={event => setPairingCode(event.target.value)} placeholder="Paste one-time code" aria-describedby="pairing-help" /><button type="submit" disabled={working || active || !pairingCode}>Connect live</button></form><button disabled={!active || working} onClick={() => { setWorking(true); void client.current?.stop().catch(() => setNotice('Observation cutoff not confirmed; evidence remains incomplete.')).finally(() => setWorking(false)); }}>Stop observation</button><button onClick={() => fileInput.current?.click()} disabled={working}>Open files</button><button onClick={() => directoryInput.current?.click()} disabled={working}>Open folder</button><button onClick={download} disabled={!display.events.length}>Export window ↗</button></div></header>
-    <div id="pairing-help" className="pairing-help">Paste the one-time code printed by the local CLI launcher. Memory only; cleared on submission. Never put pairing codes in URLs.</div>
+    <header className="app-header"><a className="brand" href="#main"><span className="brand-mark">✳</span> X-ray <span className="badge">INSPECTOR</span></a><div className="header-status"><span className={`status-dot ${snapshot.state === 'live' ? 'live' : ''}`} /> <span aria-label="Connection state">{snapshot.state}</span><span className="muted">/ observation only</span></div><div className="header-actions">{showPairing && <form className="pairing-form" onSubmit={event => { event.preventDefault(); void connect(); }}><label htmlFor="pairing-code">CLI pairing code</label><input id="pairing-code" type="password" autoComplete="off" spellCheck={false} autoCapitalize="none" maxLength={4096} value={pairingCode} disabled={working || active} onChange={event => setPairingCode(event.target.value)} placeholder="Paste one-time code" aria-describedby="pairing-help" /><button type="submit" disabled={working || active || !pairingCode}>Connect live</button></form>}<button disabled={!active || working} onClick={() => { setWorking(true); void client.current?.stop().catch(() => setNotice('Observation cutoff not confirmed; evidence remains incomplete.')).finally(() => setWorking(false)); }}>Stop observation</button><button onClick={() => fileInput.current?.click()} disabled={working}>Open files</button><button onClick={() => directoryInput.current?.click()} disabled={working}>Open folder</button><button onClick={download} disabled={!display.events.length}>Export window ↗</button></div></header>
+    {showPairing && <div id="pairing-help" className="pairing-help">Paste the one-time code printed by the local CLI launcher. Memory only; cleared on submission. Never put pairing codes in URLs.</div>}
     <input hidden ref={fileInput} type="file" multiple accept=".json,.jsonl,.ndjson,.bin" onChange={event => void openFiles(event)} aria-label="Open recording files" />
     <input hidden ref={directoryInput} type="file" multiple {...{ webkitdirectory: '' }} onChange={event => void openFiles(event)} aria-label="Open recording folder" />
     <div className="toolbar"><div className="searchbox"><span aria-hidden="true">⌕</span><input ref={search} value={prefs.query} onChange={event => { setPaused(false); setFollow(false); setPrefs(previous => ({ ...previous, query: event.target.value })); }} placeholder="Search evidence or filter: domain:provider" aria-label="Search retained evidence" /><kbd>⌘/Ctrl K</kbd>{prefs.query && <button aria-label="Clear search" onClick={() => setPrefs(previous => ({ ...previous, query: '' }))}>×</button>}</div><button onClick={() => setPrefs(previous => ({ ...previous, saved: [...new Set([...previous.saved, previous.query])].filter(Boolean).slice(-12) }))} disabled={!prefs.query}>Save filter</button><button aria-pressed={prefs.compact} onClick={() => setPrefs(previous => ({ ...previous, compact: !previous.compact }))}>Compact</button></div>

@@ -15,8 +15,10 @@ Or use `bcode xray` for a bounded session picker. In the TUI, choose **Open X-ra
 from the command palette or use `/xray`. The enabled X-ray command plugin supplies
 this action; disabling it does not disable the standalone CLI.
 
-The launcher serves version-matched bundled assets and opens the browser already
-paired. Launching does not run npm, download assets, or require the repository as
+The launcher serves version-matched bundled assets. By default, opening its localhost
+URL connects directly: no pairing code, launch ticket or login is required.
+Any local visitor/process able to reach that port can observe the selected session
+while the launcher is running; use `--require-pairing` when that is not appropriate. Launching does not run npm, download assets, or require the repository as
 its working directory. Preserve your normal configuration, profile, and state-root
 options. `--deep` explicitly authorizes sensitive capture; it is not the default.
 
@@ -31,7 +33,8 @@ with isolated configuration/state and no provider requests. Use `--no-open` to
 open the printed URL yourself. A packaged executable also supports `bcode xray
 --demo` without building anything.
 
-Automatic pairing uses a short-lived single-use ticket in the URL fragment. The
+Optional `bcode xray SESSION_ID --require-pairing` uses a short-lived single-use
+ticket in the URL fragment when opening the browser automatically. The
 frontend removes it before asynchronous startup, redeems it once, and keeps the
 resulting credential in memory, not persistent browser storage. The initial
 fragment can still be visible to browser history/extensions; keep launch links
@@ -46,7 +49,8 @@ Existing custom X-ray host/security policy remains authoritative.
 
 Over SSH, the launcher avoids opening the remote machine's browser and prints a
 single-port forwarding command. Deliberately supply your SSH destination, retain
-the printed local port, open the printed URL locally and enter the pairing code.
+the printed local port and open the printed URL locally. Enter a pairing code only
+if `--require-pairing` was enabled.
 No SSH destination is guessed. `--local-browser` explicitly opts into opening a
 browser on the serving host.
 

@@ -9,6 +9,7 @@ fn fixture() -> (Arc<HostState>, tokio::sync::watch::Sender<bool>) {
         csp: content_security_policy("http://127.0.0.1:1234/").unwrap(),
         assets: BTreeMap::new(),
         pairing: Mutex::new(Pairing {
+            required: true,
             code: "one-use-ticket".into(),
             expires: Instant::now() + PAIRING_LIFETIME,
             attempts: PAIRING_ATTEMPTS,

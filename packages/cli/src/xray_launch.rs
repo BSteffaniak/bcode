@@ -30,6 +30,9 @@ pub struct XrayLaunchArgs {
     /// Open on serving host even through SSH.
     #[arg(long)]
     pub local_browser: bool,
+    /// Require a one-time browser pairing ticket or code.
+    #[arg(long, action = clap::ArgAction::SetTrue)]
+    pub require_pairing: Option<bool>,
     /// Explicitly authorize sensitive capture.
     #[arg(long, conflicts_with = "demo")]
     pub deep: bool,
@@ -69,6 +72,7 @@ const fn web_args(args: &XrayLaunchArgs, session_id: SessionId) -> xray_web::Xra
         asset_dir: None,
         no_open: args.no_open,
         local_browser: args.local_browser,
+        require_pairing: args.require_pairing,
         deep: args.deep,
         lifetime_seconds: args.lifetime_seconds,
     }
@@ -218,6 +222,17 @@ mod tests {
     struct Launch {
         #[command(flatten)]
         args: XrayLaunchArgs,
+    }
+
+    #[test]
+    fn pairing_is_opt_in_for_both_launch_routes() {
+        let open = Launch::try_parse_from(["xray"]).unwrap();
+        assert!(!open.args.require_pairing.unwrap_or(false));
+        let protected = Launch::try_parse_from(["xray", "--require-pairing"]).unwrap();
+        assert_eq!(
+            web_args(&protected.args, SessionId::default()).require_pairing,
+            Some(true)
+        );
     }
 
     #[test]

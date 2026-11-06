@@ -18,6 +18,9 @@ pub struct XrayWebArgs {
     /// Open on serving host even through SSH.
     #[arg(long)]
     pub local_browser: bool,
+    /// Require a one-time browser pairing ticket or code.
+    #[arg(long, action = clap::ArgAction::SetTrue)]
+    pub require_pairing: Option<bool>,
     /// Explicitly authorize sensitive payload capture.
     #[arg(long)]
     pub deep: bool,
@@ -46,6 +49,11 @@ fn options(args: &XrayWebArgs) -> bcode_xray_inspector::LaunchOptions {
         deep: args.deep,
         lifetime_seconds: args.lifetime_seconds,
         local_browser: args.local_browser,
+        pairing: if args.require_pairing.unwrap_or(false) {
+            bcode_xray_inspector::PairingMode::Required
+        } else {
+            bcode_xray_inspector::PairingMode::Open
+        },
     }
 }
 async fn wait(handle: bcode_xray_inspector::InspectorHandle) -> Result<(), CliError> {

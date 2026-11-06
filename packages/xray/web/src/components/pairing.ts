@@ -36,3 +36,25 @@ export function takeLaunchTicket(location: Pick<Location, 'hash' | 'pathname' | 
     return redemption;
   } };
 }
+
+/** Pairing-required responses are normal when opening a protected inspector manually. */
+export class PairingRequired extends Error {}
+
+/** Probe the same-Origin local host once; StrictMode shares the result. */
+export function openLocalInspector(fetcher: typeof fetch = fetch): LaunchTicket {
+  let result: Promise<InspectorBootstrap> | undefined;
+  return { redeem() {
+    result ??= (async () => {
+      const response = await fetcher('/__xray/bootstrap', {
+        method: 'POST', credentials: 'omit', cache: 'no-store', redirect: 'error', referrerPolicy: 'no-referrer',
+        headers: { Accept: 'application/json' },
+      });
+      if (response.status === 403) throw new PairingRequired();
+      if (!response.ok) throw new Error('Local inspector unavailable');
+      const bootstrap = await response.json() as InspectorBootstrap;
+      validateBootstrap(bootstrap);
+      return bootstrap;
+    })();
+    return result;
+  } };
+}

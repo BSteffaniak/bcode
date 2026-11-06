@@ -49,10 +49,11 @@ pub struct XrayWebArgs {
     /// Endpoint Origin grant lifetime; expiry stops this launcher, not session execution.
     pub lifetime_seconds: u64,
     pub local_browser: bool,
+    pub pairing: crate::PairingMode,
 }
 
 // Intentionally not Debug: bearer bytes must never enter diagnostic formatting.
-#[derive(Serialize)]
+#[derive(Clone, Serialize)]
 struct InspectorBootstrap {
     schema_version: u16,
     endpoint: String,
@@ -64,6 +65,7 @@ struct InspectorBootstrap {
 }
 
 struct Pairing {
+    required: bool,
     code: String,
     expires: Instant,
     attempts: u8,
@@ -72,6 +74,12 @@ struct Pairing {
 
 impl Pairing {
     fn redeem(&mut self, code: &str, now: Instant) -> Option<InspectorBootstrap> {
+        if !self.required {
+            return self.bootstrap.clone();
+        }
+        if code.is_empty() {
+            return None;
+        }
         if now >= self.expires || self.attempts == 0 {
             self.bootstrap = None;
             return None;
@@ -209,6 +217,7 @@ pub async fn run_demo(
         deep: true,
         lifetime_seconds: args.lifetime_seconds,
         local_browser: args.local_browser,
+        pairing: args.pairing,
     };
     eprintln!("SYNTHETIC X-ray demo. No session is opened and no model/provider request is made.");
     host(
@@ -250,6 +259,7 @@ async fn host(
             stopped,
             assets,
             pairing: Mutex::new(Pairing {
+                required: true,
                 code: code.clone(),
                 expires: Instant::now() + PAIRING_LIFETIME,
                 attempts: PAIRING_ATTEMPTS,
@@ -264,9 +274,12 @@ async fn host(
             }),
         });
         eprintln!("X-ray inspector: {origin}/");
-        eprintln!(
-            "Enter this one-time pairing code in the inspector (expires in 45 seconds): {code}"
-        );
+        let browser_url = if args.pairing == crate::PairingMode::Required {
+            eprintln!("Enter this one-time pairing code in the inspector (expires in 45 seconds): {code}");
+            format!("{origin}/#xray-ticket={code}")
+        } else {
+            format!("{origin}/")
+        };
         eprintln!("Observation only. Ctrl-C closes this endpoint, not the session.");
         let remote = !args.local_browser && (std::env::var_os("SSH_CONNECTION").is_some()
             || std::env::var_os("SSH_CLIENT").is_some()
@@ -274,9 +287,9 @@ async fn host(
         if remote {
             let port = listener.local_addr().map_err(|_| invalid("inspector address unavailable"))?.port();
             eprintln!("SSH: forward this single port, preserving the local port: ssh -L {port}:127.0.0.1:{port} <your-ssh-destination>");
-            eprintln!("Then open {origin}/ locally and enter the pairing code. The SSH destination is not inferred.");
+            eprintln!("Then open {origin}/ locally. If pairing is enabled, enter the printed code. The SSH destination is not inferred.");
         }
-        if !remote && !args.no_open && open::that_detached(format!("{origin}/#xray-ticket={code}")).is_err() {
+        if !remote && !args.no_open && open::that_detached(browser_url).is_err() {
             eprintln!("Browser could not be opened; open the local URL above manually.");
         }
         let app = Router::new().fallback(serve).with_state(state.clone());
@@ -392,7 +405,8 @@ async fn serve(State(state): State<Arc<HostState>>, request: Request) -> Respons
     } else if operation {
         gateway::forward(state.clone(), request).await
     } else if bootstrap && request.method() == Method::POST {
-        // No request body is consumed. All authority is in this one-time memory-only handoff.
+        // No body is consumed. Open localhost mode permits same-Origin bootstrap;
+        // protected mode additionally requires the single-use code.
         let code = single_header(request.headers(), "x-xray-pairing-code").unwrap_or("");
         let value = state
             .pairing
@@ -746,6 +760,7 @@ mod tests {
             gateway: None,
             stopped: tokio::sync::watch::channel(false).1,
             pairing: Mutex::new(Pairing {
+                required: true,
                 code: "test-pairing".to_owned(),
                 expires: Instant::now() + PAIRING_LIFETIME,
                 attempts: PAIRING_ATTEMPTS,
@@ -767,10 +782,64 @@ mod tests {
             .unwrap()
     }
 
+    #[tokio::test]
+    async fn open_localhost_bootstrap_is_repeatable_and_still_origin_fenced() {
+        let mut host = Arc::new(state());
+        Arc::get_mut(&mut host)
+            .unwrap()
+            .pairing
+            .get_mut()
+            .unwrap()
+            .required = false;
+        for _ in 0..2 {
+            let mut request = request();
+            request.headers_mut().remove("x-xray-pairing-code");
+            assert_eq!(
+                serve(State(host.clone()), request).await.status(),
+                StatusCode::OK
+            );
+        }
+        for header in ["origin", "host", "sec-fetch-site"] {
+            let mut request = request();
+            request.headers_mut().remove("x-xray-pairing-code");
+            request
+                .headers_mut()
+                .insert(header, "foreign.example".parse().unwrap());
+            assert_eq!(
+                serve(State(host.clone()), request).await.status(),
+                StatusCode::FORBIDDEN
+            );
+        }
+        drop(host);
+    }
+
+    #[tokio::test]
+    async fn protected_bootstrap_probe_does_not_spend_attempts_or_ticket() {
+        let host = Arc::new(state());
+        for _ in 0..=PAIRING_ATTEMPTS {
+            let mut request = request();
+            request.headers_mut().remove("x-xray-pairing-code");
+            assert_eq!(
+                serve(State(host.clone()), request).await.status(),
+                StatusCode::FORBIDDEN
+            );
+        }
+        assert_eq!(
+            serve(State(host.clone()), request()).await.status(),
+            StatusCode::OK
+        );
+        assert_eq!(
+            serve(State(host.clone()), request()).await.status(),
+            StatusCode::FORBIDDEN
+        );
+        drop(host);
+    }
+
     #[test]
     fn pairing_is_single_use_expiring_and_attempt_bounded() {
         let now = Instant::now();
         let mut pairing = Pairing {
+            required: true,
             code: "correct".to_owned(),
             expires: now + PAIRING_LIFETIME,
             attempts: PAIRING_ATTEMPTS,
