@@ -4,7 +4,9 @@ X-ray is an opt-in, session-scoped live diagnostic channel. Attach to an idle or
 active session, receive readiness, submit work through the ordinary application
 API, and keep observing across turns and idle periods. Stopping observation does
 not cancel session work. X-ray is neither canonical history nor a durable replay,
-repair, steering, cross-session aggregation, or web-inspector facility.
+repair, steering, or cross-session aggregation facility. The optional
+[web inspector](xray-web.md) adapts the same observation contracts into a local
+browser UI; it does not change execution semantics.
 
 **Implementation status:** this checkout contains live capture, typed reference export,
 independently negotiated native payload transfer, bounded CLI consumption/recovery,

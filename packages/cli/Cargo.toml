@@ -11,6 +11,7 @@ repository  = { workspace = true }
 version     = { workspace = true }
 
 [dependencies]
+axum = { workspace = true, features = ["http1", "json", "tokio"] }
 base64 = { workspace = true }
 bcode_agent_profile = { workspace = true }
 bcode_build_info = { workspace = true }
@@ -55,7 +56,7 @@ chrono = { workspace = true }
 clap = { workspace = true, features = ["derive", "help", "std", "usage"] }
 crossterm = { workspace = true, features = ["events"] }
 libc = { workspace = true }
-open = { workspace = true, optional = true }
+open = { workspace = true }
 rand = { workspace = true }
 rpassword = { workspace = true }
 serde = { workspace = true, features = ["derive"] }
@@ -160,8 +161,4 @@ static-bundled-workflow-plugin = [
     "bcode_tui/static-bundled-workflow-plugin",
 ]
 static-bundled-worktree-plugin = ["_static-bundled"]
-web-renderer = [
-    "dep:bcode_hyperchad",
-    "dep:open",
-    "bcode_hyperchad/renderer-html-actix",
-]
+web-renderer = ["dep:bcode_hyperchad", "bcode_hyperchad/renderer-html-actix"]

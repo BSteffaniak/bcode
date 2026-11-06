@@ -593,7 +593,7 @@ fn invalid(message: &str) -> CliError {
     CliError::InvalidArguments(message.to_owned())
 }
 
-fn read_token(path: &Path) -> Result<String, CliError> {
+pub fn read_token(path: &Path) -> Result<String, CliError> {
     let before = std::fs::symlink_metadata(path)
         .map_err(|_| invalid("X-ray credential file unavailable"))?;
     if !before.is_file() || before.file_type().is_symlink() {

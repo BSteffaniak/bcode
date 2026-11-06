@@ -1811,6 +1811,7 @@ dependencies = [
 name = "bcode_cli"
 version = "0.0.1-alpha.0"
 dependencies = [
+ "axum",
  "base64 0.22.1",
  "bcode_agent_profile",
  "bcode_build_info",
