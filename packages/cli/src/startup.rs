@@ -194,10 +194,10 @@ async fn route_backend_selection(
         {
             return Ok(false);
         }
-        Err(_) => {
-            return Err(CliError::InvalidArguments(
-                "Configured execution backends could not be read; no selection was changed".into(),
-            ));
+        Err(error) => {
+            return Err(CliError::InvalidArguments(format!(
+                "Configured execution backends could not be read ({error}); no selection was changed"
+            )));
         }
     };
     let selections = backend_choices(&catalog)?;
@@ -230,7 +230,7 @@ async fn route_backend_selection(
                 let prepared: PreparedBackend = host.invoke_service_json(
                     "bcode.harness", HARNESS_CONFIGURATION_INTERFACE, "prepare",
                     &serde_json::json!({"selection":selection}),
-                ).map_err(|_| CliError::InvalidArguments("Selected execution backend could not be prepared; no fallback was selected".into()))?;
+                ).map_err(|error| CliError::InvalidArguments(format!("Selected execution backend could not be prepared ({error}); no fallback was selected")))?;
                 verify_prepared_backend(&catalog, selection, &prepared)?;
                 Box::pin(launch_managed_backend(shell, prepared.instance)).await?;
                 Ok(true)
