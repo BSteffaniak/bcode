@@ -397,6 +397,61 @@ impl DiffFile {
     }
 }
 
+/// Lines added and removed in a file, or summed over several files.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub struct LineStats {
+    /// Lines added.
+    pub added: u64,
+    /// Lines removed.
+    pub removed: u64,
+    /// Whether any binary change is included; binary files add no lines.
+    pub binary: bool,
+}
+
+impl LineStats {
+    /// Counts of a text change.
+    #[must_use]
+    pub const fn text(added: u64, removed: u64) -> Self {
+        Self {
+            added,
+            removed,
+            binary: false,
+        }
+    }
+
+    /// Counts of a binary change.
+    #[must_use]
+    pub const fn binary() -> Self {
+        Self {
+            added: 0,
+            removed: 0,
+            binary: true,
+        }
+    }
+
+    /// Both counts together: lines summed, binary when either is.
+    #[must_use]
+    pub const fn combined(self, other: Self) -> Self {
+        Self {
+            added: self.added.saturating_add(other.added),
+            removed: self.removed.saturating_add(other.removed),
+            binary: self.binary || other.binary,
+        }
+    }
+
+    /// Whether nothing changed: no lines and no binary change.
+    #[must_use]
+    pub const fn is_empty(&self) -> bool {
+        self.added == 0 && self.removed == 0 && !self.binary
+    }
+}
+
+impl std::iter::Sum for LineStats {
+    fn sum<I: Iterator<Item = Self>>(iter: I) -> Self {
+        iter.fold(Self::default(), Self::combined)
+    }
+}
+
 /// A path changed by a commit or stash, from a name-status listing.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ChangedFile {

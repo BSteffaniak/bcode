@@ -5,8 +5,8 @@ use std::path::Path;
 use std::process::Command;
 
 use bcode_git::models::{
-    CommitMessageSource, DiffLineId, DiffLineKind, HeadState, RebaseAction, RebaseTodoItem,
-    RepoOperation, ResetMode, StatusEntryKind,
+    CommitMessageSource, DiffLineId, DiffLineKind, HeadState, LineStats, RebaseAction,
+    RebaseTodoItem, RepoOperation, ResetMode, StatusEntryKind,
 };
 use bcode_git::{
     CommandLog, CommitOptions, ConflictSide, DiffTarget, LogQuery, Repository, StashOptions,
@@ -875,4 +875,64 @@ fn merged_branches_are_those_already_in_the_base_branch() {
         !merged.contains("main") && merged.contains("done"),
         "{merged:?}"
     );
+}
+
+#[test]
+fn counts_changed_lines_per_file() {
+    let repo = TempRepo::init();
+    // Before the first commit the total is against the empty tree.
+    repo.write("a.txt", b"one\ntwo\n");
+    git(repo.path(), &["add", "a.txt"]);
+    assert_eq!(
+        repo.repo.worktree_numstat().unwrap()["a.txt"],
+        LineStats::text(2, 0)
+    );
+
+    repo.write("old.txt", b"1\n2\n3\n4\n5\n");
+    repo.commit_all("init");
+    // Staged and unstaged edits to one file; the total is against HEAD.
+    repo.write("a.txt", b"one\nTWO\n");
+    git(repo.path(), &["add", "a.txt"]);
+    repo.write("a.txt", b"one\nTWO\nthree\n");
+    git(repo.path(), &["mv", "old.txt", "new.txt"]);
+    repo.write("logo.bin", b"\x89PNG\0\0");
+    git(repo.path(), &["add", "logo.bin"]);
+
+    let total = repo.repo.worktree_numstat().unwrap();
+    assert_eq!(total["a.txt"], LineStats::text(2, 1));
+    assert_eq!(total["new.txt"], LineStats::text(0, 0));
+    assert_eq!(total["logo.bin"], LineStats::binary());
+    let staged = repo.repo.numstat(&DiffTarget::Staged).unwrap();
+    assert_eq!(staged["a.txt"], LineStats::text(1, 1));
+    let unstaged = repo.repo.numstat(&DiffTarget::Unstaged).unwrap();
+    assert_eq!(unstaged["a.txt"], LineStats::text(1, 0));
+    assert!(!unstaged.contains_key("logo.bin"));
+
+    // Untracked files are counted directly, within the limits.
+    repo.write("notes.md", b"a\nb\nno newline");
+    repo.write("blob.dat", b"text\0more");
+    repo.write("big.txt", &[b'x'; 64]);
+    let untracked =
+        repo.repo
+            .untracked_line_stats(["notes.md", "blob.dat", "big.txt", "missing.txt"], 10, 32);
+    assert_eq!(untracked["notes.md"], LineStats::text(3, 0));
+    assert_eq!(untracked["blob.dat"], LineStats::binary());
+    assert!(!untracked.contains_key("big.txt"));
+    assert!(!untracked.contains_key("missing.txt"));
+    assert_eq!(
+        repo.repo
+            .untracked_line_stats(["notes.md", "blob.dat"], 1, 1024)
+            .len(),
+        1
+    );
+
+    repo.commit_all("second");
+    let head = git(repo.path(), &["rev-parse", "HEAD"]).trim().to_owned();
+    let commit = repo.repo.numstat(&DiffTarget::Commit(head)).unwrap();
+    assert_eq!(commit["a.txt"], LineStats::text(2, 1));
+    assert_eq!(commit["notes.md"], LineStats::text(3, 0));
+    assert!(matches!(
+        repo.repo.numstat(&DiffTarget::Untracked),
+        Err(bcode_git::GitError::Unsupported(_))
+    ));
 }

@@ -2720,3 +2720,223 @@ fn views_show_what_is_loading_into_them() {
     let screen = harness.screen(160, 40);
     assert!(!screen.contains('…'), "{screen}");
 }
+
+/// The files panel row (the text between its side borders) containing `needle`.
+fn files_row(screen: &str, needle: &str) -> String {
+    screen
+        .lines()
+        .filter_map(|line| line.split('│').nth(1))
+        .find(|row| row.contains(needle))
+        .unwrap_or_else(|| panic!("no files row contains {needle:?}:\n{screen}"))
+        .to_owned()
+}
+
+/// The bottom border of the panel titled `title`: the first one after its title row.
+fn footer(screen: &str, title: &str) -> String {
+    let lines: Vec<&str> = screen.lines().collect();
+    let title = lines
+        .iter()
+        .position(|line| line.contains(title))
+        .unwrap_or_else(|| panic!("no {title:?} panel:\n{screen}"));
+    let footer = lines[title..]
+        .iter()
+        .find(|line| line.starts_with('└'))
+        .unwrap_or_else(|| panic!("no panel border:\n{screen}"));
+    // Only the side panel's part of the row.
+    footer.split('┘').next().unwrap_or_default().to_owned()
+}
+
+#[test]
+fn line_counts_show_on_files_folders_and_the_footer() {
+    let mut harness = Harness::new(|path| {
+        std::fs::create_dir_all(path.join("src")).unwrap();
+        std::fs::write(path.join("src/lib.rs"), "x\ny\n").unwrap();
+        commit(path, "a.txt", "1\n2\n3\n", "init");
+        std::fs::write(path.join("a.txt"), "1\nTWO\n3\n4\n").unwrap();
+        std::fs::write(path.join("src/lib.rs"), "x\n").unwrap();
+        std::fs::write(path.join("src/new.rs"), "a\nb\n").unwrap();
+        std::fs::write(path.join("logo.bin"), b"\x89PNG\0\x01").unwrap();
+    });
+    let screen = harness.screen(140, 40);
+    assert!(
+        files_row(&screen, "a.txt").contains("a.txt +2 -1"),
+        "{screen}"
+    );
+    assert!(
+        files_row(&screen, "lib.rs").contains("lib.rs -1"),
+        "{screen}"
+    );
+    // An untracked file counts as added; a binary one is marked.
+    assert!(
+        files_row(&screen, "new.rs").contains("new.rs +2"),
+        "{screen}"
+    );
+    assert!(
+        files_row(&screen, "logo.bin").contains("logo.bin bin"),
+        "{screen}"
+    );
+    // A folder sums everything beneath it, and the title sums every file.
+    assert!(
+        files_row(&screen, "src/").contains("src/ +2 -1"),
+        "{screen}"
+    );
+    assert!(footer(&screen, "[2] Files").contains(" +4 -2 "), "{screen}");
+
+    // A collapsed folder keeps its total.
+    harness.keys(&["enter"]);
+    let screen = harness.screen(140, 40);
+    assert!(!screen.contains("new.rs"), "{screen}");
+    assert!(
+        files_row(&screen, "src/").contains("src/ +2 -1"),
+        "{screen}"
+    );
+}
+
+#[test]
+fn split_line_counts_and_filtered_totals() {
+    let mut harness = Harness::with_config(
+        |path| {
+            std::fs::write(path.join("b.txt"), "b\n").unwrap();
+            commit(path, "a.txt", "1\n2\n", "init");
+            std::fs::write(path.join("a.txt"), "1\nX\n").unwrap();
+            std::fs::write(path.join("b.txt"), "c\n").unwrap();
+            git(path, &["add", "--all"]);
+            std::fs::write(path.join("a.txt"), "1\nX\n3\n").unwrap();
+        },
+        configured(
+            r#"
+            [plugins.config."bcode.git".ui.files.line_counts]
+            show = "split"
+            "#,
+        ),
+    );
+    let screen = harness.screen(140, 40);
+    assert!(
+        files_row(&screen, "a.txt").contains("a.txt +1 -1 · +1"),
+        "{screen}"
+    );
+    assert!(
+        files_row(&screen, "b.txt").contains("b.txt +1 -1 ·"),
+        "{screen}"
+    );
+    assert!(
+        footer(&screen, "[2] Files").contains(" +2 -2 · +1 "),
+        "{screen}"
+    );
+
+    // Filtered, the title counts only the files left.
+    harness.keys(&["/"]);
+    harness.paste("b.txt");
+    harness.keys(&["enter"]);
+    let screen = harness.screen(140, 40);
+    let footer = footer(&screen, "[2] Files");
+    assert!(footer.contains(" +1 -1 · "), "{screen}");
+    assert!(!footer.contains("+2"), "{screen}");
+}
+
+#[test]
+fn line_counts_can_be_turned_off() {
+    let mut harness = Harness::with_config(
+        |path| {
+            commit(path, "a.txt", "1\n", "init");
+            std::fs::write(path.join("a.txt"), "1\n2\n").unwrap();
+        },
+        configured(
+            r#"
+            [plugins.config."bcode.git".ui.files.line_counts]
+            show = "off"
+            "#,
+        ),
+    );
+    let screen = harness.screen(140, 40);
+    assert!(!files_row(&screen, "a.txt").contains('+'), "{screen}");
+    assert!(!footer(&screen, "[2] Files").contains('+'), "{screen}");
+}
+
+#[test]
+fn line_count_position_follows_alignment_and_floating() {
+    const LONG: &str = "a/very/long/directory/path/to/the/changed/file.rs";
+    let setup = |path: &Path| {
+        commit(path, "a.txt", "1\n", "init");
+        std::fs::write(path.join("a.txt"), "1\n2\n").unwrap();
+        std::fs::create_dir_all(path.join("a/very/long/directory/path/to/the/changed")).unwrap();
+        std::fs::write(path.join(LONG), "x\n").unwrap();
+        std::fs::write(
+            path.join("日本語🙂e\u{301}ファイル名とても長い名前.txt"),
+            "y\n",
+        )
+        .unwrap();
+    };
+    let rows = |align: &str, floating: bool| {
+        let mut harness = Harness::with_config(
+            setup,
+            configured(&format!(
+                r#"
+                [plugins.config."bcode.git".ui.files]
+                tree = false
+                [plugins.config."bcode.git".ui.files.line_counts]
+                align = "{align}"
+                floating = {floating}
+                "#
+            )),
+        );
+        let screen = harness.screen(90, 30);
+        (
+            files_row(&screen, "a.txt"),
+            files_row(&screen, "a/very"),
+            files_row(&screen, "日本語"),
+            screen,
+        )
+    };
+
+    // After the name: long names push the counts out of view.
+    let (short, long, wide, screen) = rows("after-name", false);
+    assert!(short.contains("a.txt +1 "), "{screen}");
+    assert!(!long.contains("+1"), "{screen}");
+    assert!(!wide.contains("+1"), "{screen}");
+
+    // Floating after the name: long names are shortened to keep them visible.
+    let (short, long, wide, screen) = rows("after-name", true);
+    assert!(short.contains("a.txt +1 "), "{screen}");
+    assert!(long.contains("… +1"), "{screen}");
+    assert!(wide.contains("… +1"), "{screen}");
+
+    // Right-aligned: against the edge when there is room, else clipped like the name.
+    let (short, long, _, screen) = rows("right", false);
+    assert!(short.trim_end().ends_with("   +1"), "{screen}");
+    assert!(!long.contains("+1"), "{screen}");
+
+    // Floating right: always against the edge.
+    let (short, long, wide, screen) = rows("right", true);
+    for row in [&short, &long, &wide] {
+        assert!(row.trim_end().ends_with(" +1"), "{screen}");
+    }
+    assert!(long.contains('…') && wide.contains('…'), "{screen}");
+    // Every row ends at the same column, wide characters included.
+    let width = |row: &str| bmux_tui::text_width::display_width(row.trim_end());
+    assert_eq!(width(&short), width(&long), "{screen}");
+    assert_eq!(width(&short), width(&wide), "{screen}");
+}
+
+#[test]
+fn commit_files_show_line_counts() {
+    let mut harness = Harness::new(|path| {
+        commit(path, "alpha.rs", "a\n", "add alpha");
+        std::fs::write(path.join("alpha.rs"), "A\n").unwrap();
+        commit(path, "beta.rs", "b\nc\n", "add beta");
+    });
+    harness.keys(&["4", "enter"]);
+    let screen = harness.wait_for("Files ·", 140, 40);
+    assert!(
+        files_row(&screen, "beta.rs").contains("beta.rs +2"),
+        "{screen}"
+    );
+    assert!(
+        files_row(&screen, "alpha.rs").contains("alpha.rs +1 -1"),
+        "{screen}"
+    );
+    assert!(
+        footer(&screen, "[4] Files ·").contains(" +3 -1 "),
+        "{screen}"
+    );
+}

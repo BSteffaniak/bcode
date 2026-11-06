@@ -120,6 +120,11 @@ configurable; see [Layout settings](#layout-settings).
 * **Files**: stage/unstage files or whole directories, stage all, discard (all or unstaged only),
   reset menu (`D`), ignore or exclude, stash variants (`S`), edit or open files, resolve conflicts
   with ours/theirs.
+* **Line counts**: files show the lines they add and remove (`+12 -3`, `bin` for binary
+  files), folders in the tree show the total of everything beneath them, and the files panel's
+  bottom border shows the total of the files listed (only those matching a filter). Untracked
+  files count as added, up to 2000 files of at most 4 MiB each. Commit and stash file lists show
+  the same. See [`[files.line_counts]`](#configuration) for what they measure and where they sit.
 * **Staging view** (`enter` on a file): stage, unstage or discard single lines, ranges (`v`) or
   hunks (`a`); `tab` switches between unstaged and staged changes; `e` opens the file at the line.
 * **Commits**: commit (stages everything when nothing is staged), commit without hooks, amend,
@@ -239,6 +244,12 @@ editor = "nvim"                 # default: $GIT_EDITOR, $VISUAL, $EDITOR, then v
 
 [files]
 tree = true                     # false lists files flat; `` ` `` toggles for the session
+
+[files.line_counts]
+show = "total"                  # total: staged and unstaged against HEAD; split: staged · unstaged
+                                # side by side; off: none (and no counting)
+align = "after-name"            # or "right": against the panel's right edge
+floating = false                # true shortens long names (…) so the counts stay visible
 
 [highlight]
 enabled = true
@@ -478,7 +489,7 @@ draft file and open the editor with `c`.
 
 `bcode-git --import-lazygit [CONFIG_YML]` (or `bcode git --import-lazygit`) prints settings
 converted from a lazygit `config.yml`, as a dedicated config file. Without a path it uses `$LG_CONFIG_FILE` or lazygit's default
-location. The output covers layout, file tree, diff context and line wrapping, staging hunk
+location. The output covers layout, file tree, line counts (`gui.showNumstatInFilesView`), diff context and line wrapping, staging hunk
 mode, commit message wrapping and hook-skip prefix, graph, refresh settings, branch color
 patterns (`gui.branchColorPatterns`, and the older `gui.branchColors`), the spinner
 (`gui.spinner`) and keybindings;

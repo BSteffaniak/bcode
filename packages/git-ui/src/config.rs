@@ -243,12 +243,53 @@ impl Default for CommandLogConfig {
 pub struct FilesConfig {
     /// Show files as a directory tree rather than a flat list; `` ` `` toggles it.
     pub tree: bool,
+    /// Lines added and removed beside files, folders and the panel title.
+    pub line_counts: LineCountsConfig,
 }
 
 impl Default for FilesConfig {
     fn default() -> Self {
-        Self { tree: true }
+        Self {
+            tree: true,
+            line_counts: LineCountsConfig::default(),
+        }
     }
+}
+
+/// Line count settings (`[plugins.config."bcode.git".ui.files.line_counts]`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize, Serialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct LineCountsConfig {
+    /// What the counts measure.
+    pub show: LineCountsShow,
+    /// Where the counts sit on a row.
+    pub align: LineCountsAlign,
+    /// Keep the counts visible by shortening names that would push them out of view.
+    pub floating: bool,
+}
+
+/// What file line counts measure.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum LineCountsShow {
+    /// Staged and unstaged changes together, against `HEAD`.
+    #[default]
+    Total,
+    /// Staged and unstaged changes side by side.
+    Split,
+    /// No counts.
+    Off,
+}
+
+/// Where line counts sit on a row.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum LineCountsAlign {
+    /// Right after the name.
+    #[default]
+    AfterName,
+    /// Against the right edge of the panel.
+    Right,
 }
 
 /// Commit editor settings (`[plugins.config."bcode.git".ui.commit]`).

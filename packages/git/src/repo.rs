@@ -1,13 +1,13 @@
 //! Repository operations.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::{OsStr, OsString};
 use std::path::{Path, PathBuf};
 
 use bcode_git_models::{
     Branch, ChangedFile, Commit, CommitMessageSource, DiffFile, DiffLineId, GitCommandRecord,
-    HeadState, RebaseTodoItem, ReflogEntry, Remote, RemoteBranch, RepoOperation, RepoPaths,
-    ResetMode, StashEntry, StatusSnapshot, Submodule, Tag, Worktree,
+    HeadState, LineStats, RebaseTodoItem, ReflogEntry, Remote, RemoteBranch, RepoOperation,
+    RepoPaths, ResetMode, StashEntry, StatusSnapshot, Submodule, Tag, Worktree,
 };
 
 use crate::diff::parse_unified_diff;
@@ -416,6 +416,114 @@ impl Repository {
             }
         };
         Ok(parse::parse_name_status(&output))
+    }
+
+    /// Lines added and removed per (new) path for a target. Untracked files are not
+    /// included; see [`Self::untracked_line_stats`].
+    ///
+    /// # Errors
+    /// * [`GitError`] when git fails.
+    /// * [`GitError::Unsupported`] for [`DiffTarget::Untracked`].
+    pub fn numstat(&self, target: &DiffTarget) -> Result<BTreeMap<String, LineStats>, GitError> {
+        let output = match target {
+            DiffTarget::Unstaged => {
+                self.runner
+                    .read(["diff", "--no-ext-diff", "--numstat", "-z"])?
+            }
+            DiffTarget::Staged => self.runner.read([
+                "diff",
+                "--no-ext-diff",
+                "--cached",
+                "--numstat",
+                "-z",
+                "--find-renames",
+            ])?,
+            DiffTarget::Commit(oid) => self.runner.read([
+                "show",
+                "--no-ext-diff",
+                "--format=",
+                "--numstat",
+                "-z",
+                "--find-renames",
+                "--first-parent",
+                "-m",
+                oid,
+            ])?,
+            DiffTarget::Stash(selector) => self.runner.read([
+                "stash",
+                "show",
+                "--no-ext-diff",
+                "--numstat",
+                "-z",
+                "--include-untracked",
+                selector,
+            ])?,
+            DiffTarget::Range { from, to } => self.runner.read([
+                "diff",
+                "--no-ext-diff",
+                "--numstat",
+                "-z",
+                "--find-renames",
+                from,
+                to,
+            ])?,
+            DiffTarget::Untracked => {
+                return Err(GitError::Unsupported(
+                    "count untracked files with untracked_line_stats".into(),
+                ));
+            }
+        };
+        Ok(parse::parse_numstat(&output))
+    }
+
+    /// Lines added and removed per (new) path between `HEAD` and the worktree, staged and
+    /// unstaged together. Before the first commit, against the empty tree. Untracked files
+    /// are not included; see [`Self::untracked_line_stats`].
+    ///
+    /// # Errors
+    /// * [`GitError`] when git fails.
+    pub fn worktree_numstat(&self) -> Result<BTreeMap<String, LineStats>, GitError> {
+        let against = |base: &str| {
+            self.runner.read([
+                "diff",
+                "--no-ext-diff",
+                "--numstat",
+                "-z",
+                "--find-renames",
+                base,
+            ])
+        };
+        let output = match against("HEAD") {
+            Ok(output) => output,
+            Err(error) => {
+                // No commits yet: compare against the empty tree of this object format.
+                let Ok(empty) = self.runner.read(["hash-object", "-t", "tree", "/dev/null"]) else {
+                    return Err(error);
+                };
+                against(empty.trim()).map_err(|_| error)?
+            }
+        };
+        Ok(parse::parse_numstat(&output))
+    }
+
+    /// Lines of untracked files, counted as added, by path. Files larger than `max_bytes`,
+    /// unreadable files, and paths beyond the first `max_files` are left out. A file with a
+    /// NUL byte in its first 8000 bytes counts as binary, as git decides.
+    #[must_use]
+    pub fn untracked_line_stats<'p>(
+        &self,
+        paths: impl IntoIterator<Item = &'p str>,
+        max_files: usize,
+        max_bytes: u64,
+    ) -> BTreeMap<String, LineStats> {
+        paths
+            .into_iter()
+            .take(max_files)
+            .filter_map(|path| {
+                let stats = count_lines(&self.root().join(path), max_bytes)?;
+                Some((path.to_owned(), stats))
+            })
+            .collect()
     }
 
     /// Commits reachable from `HEAD` but not its upstream (unpushed commits).
@@ -1797,4 +1905,21 @@ fn remove_if_present(path: &Path) -> Result<(), GitError> {
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
         Err(error) => Err(error.into()),
     }
+}
+
+/// Lines of a file as an addition, or `None` when it is unreadable, not a regular file, or
+/// larger than `max_bytes`.
+fn count_lines(path: &Path, max_bytes: u64) -> Option<LineStats> {
+    let metadata = std::fs::symlink_metadata(path).ok()?;
+    if !metadata.is_file() || metadata.len() > max_bytes {
+        return None;
+    }
+    let bytes = std::fs::read(path).ok()?;
+    if bytes[..bytes.len().min(8000)].contains(&0) {
+        return Some(LineStats::binary());
+    }
+    // Pieces between newlines, less the empty one after a final newline (or of an empty file).
+    let pieces = bytes.split(|byte| *byte == b'\n').count();
+    let lines = pieces - usize::from(bytes.is_empty() || bytes.ends_with(b"\n"));
+    Some(LineStats::text(u64::try_from(lines).unwrap_or(u64::MAX), 0))
 }

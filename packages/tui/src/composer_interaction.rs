@@ -423,11 +423,7 @@ impl ComposerInteraction {
                 if let Some(detail) = &candidate.detail {
                     spans.push(Span::raw(format!("  {detail}")));
                 }
-                SelectableListItem {
-                    id: candidate.id.clone(),
-                    lines: vec![Line::from_spans(spans)],
-                    disabled: false,
-                }
+                SelectableListItem::rich(candidate.id.clone(), Line::from_spans(spans))
             })
             .collect();
         // BMUX reconciles candidate identity, focus and pointer state.

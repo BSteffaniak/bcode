@@ -4,7 +4,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use bcode_git::models::{
-    Branch, ChangedFile, Commit, DiffFile, HeadState, ReflogEntry, Remote, RemoteBranch,
+    Branch, ChangedFile, Commit, DiffFile, HeadState, LineStats, ReflogEntry, Remote, RemoteBranch,
     RepoOperation, StashEntry, StatusEntry, StatusSnapshot, Submodule, Tag, Worktree,
 };
 use bcode_git::{DiffTarget, LogQuery, Repository};
@@ -12,6 +12,7 @@ use bcode_syntax_render::SyntaxHighlighter;
 use bmux_tui::style::{Modifier, Style};
 use bmux_tui::text::{Line, Span};
 
+use crate::config::LineCountsShow;
 use crate::diffview::{DiffOptions, DiffRow, SideTexts, present_file};
 use crate::graph;
 use crate::theme::GitTheme;
@@ -49,13 +50,125 @@ pub struct Snapshot {
     pub worktrees: Vec<Worktree>,
     /// Submodules.
     pub submodules: Vec<Submodule>,
+    /// Lines changed in working tree files.
+    pub line_counts: LineCounts,
     /// Non-fatal load failures.
     pub errors: Vec<String>,
 }
 
+/// Untracked files counted for line counts; the rest show none.
+const UNTRACKED_COUNT_FILES: usize = 2000;
+/// Largest untracked file counted for line counts.
+const UNTRACKED_COUNT_BYTES: u64 = 4 * 1024 * 1024;
+
+/// Lines changed in working tree files, by path.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub enum LineCounts {
+    /// Not loaded.
+    #[default]
+    Off,
+    /// Staged and unstaged changes together, against `HEAD`.
+    Total(BTreeMap<String, LineStats>),
+    /// Staged and unstaged changes apart; untracked files count as unstaged.
+    Split {
+        /// `HEAD` to index.
+        staged: BTreeMap<String, LineStats>,
+        /// Index to worktree.
+        unstaged: BTreeMap<String, LineStats>,
+    },
+}
+
+/// Line counts summed over some files, as one row or title shows them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ShownCounts {
+    /// One count.
+    Total(LineStats),
+    /// Staged and unstaged counts.
+    Split {
+        /// Staged.
+        staged: LineStats,
+        /// Unstaged.
+        unstaged: LineStats,
+    },
+}
+
+impl LineCounts {
+    /// Counts of tracked files, measured as `show` asks.
+    fn tracked(repo: &Repository, show: LineCountsShow) -> Result<Self, bcode_git::GitError> {
+        Ok(match show {
+            LineCountsShow::Off => Self::Off,
+            LineCountsShow::Total => Self::Total(repo.worktree_numstat()?),
+            LineCountsShow::Split => Self::Split {
+                staged: repo.numstat(&DiffTarget::Staged)?,
+                unstaged: repo.numstat(&DiffTarget::Unstaged)?,
+            },
+        })
+    }
+
+    /// These counts plus the untracked files of `status`, as unstaged changes.
+    fn with_untracked(mut self, repo: &Repository, status: &StatusSnapshot) -> Self {
+        let (Self::Total(counts)
+        | Self::Split {
+            unstaged: counts, ..
+        }) = &mut self
+        else {
+            return self;
+        };
+        counts.extend(
+            repo.untracked_line_stats(
+                status
+                    .entries
+                    .iter()
+                    .filter(|entry| entry.is_untracked())
+                    .map(|entry| entry.path.as_str()),
+                UNTRACKED_COUNT_FILES,
+                UNTRACKED_COUNT_BYTES,
+            ),
+        );
+        self
+    }
+
+    /// Counts of `paths` summed, or `None` when there is nothing to show.
+    #[must_use]
+    pub fn sum<'p>(&self, paths: impl IntoIterator<Item = &'p str>) -> Option<ShownCounts> {
+        let sum = |counts: &BTreeMap<String, LineStats>, paths: &[&str]| -> LineStats {
+            paths
+                .iter()
+                .filter_map(|path| counts.get(*path).copied())
+                .sum()
+        };
+        let paths: Vec<&str> = paths.into_iter().collect();
+        let shown = match self {
+            Self::Off => return None,
+            Self::Total(total) => ShownCounts::Total(sum(total, &paths)),
+            Self::Split { staged, unstaged } => ShownCounts::Split {
+                staged: sum(staged, &paths),
+                unstaged: sum(unstaged, &paths),
+            },
+        };
+        (!shown.is_empty()).then_some(shown)
+    }
+}
+
+impl ShownCounts {
+    /// Whether every count is empty.
+    #[must_use]
+    pub const fn is_empty(&self) -> bool {
+        match self {
+            Self::Total(stats) => stats.is_empty(),
+            Self::Split { staged, unstaged } => staged.is_empty() && unstaged.is_empty(),
+        }
+    }
+}
+
 /// Load all panel data, running independent queries in parallel.
 #[must_use]
-pub fn load_snapshot(repo: &Repository, commit_limit: usize, merged: bool) -> Snapshot {
+pub fn load_snapshot(
+    repo: &Repository,
+    commit_limit: usize,
+    merged: bool,
+    line_counts: LineCountsShow,
+) -> Snapshot {
     fn join<T>(
         handle: std::thread::ScopedJoinHandle<'_, Result<T, bcode_git::GitError>>,
     ) -> Result<T, bcode_git::GitError> {
@@ -88,6 +201,7 @@ pub fn load_snapshot(repo: &Repository, commit_limit: usize, merged: bool) -> Sn
         stashes,
         worktrees,
         submodules,
+        line_counts,
     ) = std::thread::scope(|scope| {
         let head = scope.spawn(|| repo.head());
         let status = scope.spawn(|| repo.status());
@@ -108,6 +222,7 @@ pub fn load_snapshot(repo: &Repository, commit_limit: usize, merged: bool) -> Sn
         let stashes = scope.spawn(|| repo.stashes());
         let worktrees = scope.spawn(|| repo.worktrees());
         let submodules = scope.spawn(|| repo.submodules());
+        let line_counts = scope.spawn(move || LineCounts::tracked(repo, line_counts));
         (
             join(head).map(Some),
             join(status),
@@ -122,15 +237,18 @@ pub fn load_snapshot(repo: &Repository, commit_limit: usize, merged: bool) -> Sn
             join(stashes),
             join(worktrees),
             join(submodules),
+            join(line_counts),
         )
     });
+    let status = take(status, &mut errors);
+    let line_counts = take(line_counts, &mut errors).with_untracked(repo, &status);
     let mut commits: Vec<Commit> = take(commits, &mut errors);
     let more_commits = commits.len() > commit_limit;
     commits.truncate(commit_limit);
     Snapshot {
         head: take(head, &mut errors),
         operation: repo.operation(),
-        status: take(status, &mut errors),
+        status,
         branches: take(branches, &mut errors),
         remotes: take(remotes, &mut errors),
         remote_branches: take(remote_branches, &mut errors),
@@ -143,6 +261,7 @@ pub fn load_snapshot(repo: &Repository, commit_limit: usize, merged: bool) -> Sn
         stashes: take(stashes, &mut errors),
         worktrees: take(worktrees, &mut errors),
         submodules: take(submodules, &mut errors),
+        line_counts,
         errors,
     }
 }
@@ -1115,14 +1234,39 @@ fn summary_rows(repo: &Repository, cx: &PresentContext) -> Vec<DiffRow> {
 }
 
 /// Paths of a commit or stash, for the commit files view.
+#[derive(Debug, Clone, Default)]
+pub struct ChangedFiles {
+    /// Paths in listing order.
+    pub files: Vec<ChangedFile>,
+    /// Lines changed by (new) path; empty when not loaded or the count failed.
+    pub counts: BTreeMap<String, LineStats>,
+}
+
+/// Paths of a commit or stash, with their line counts when `counts` is set.
 ///
 /// # Errors
-/// Returns git's message when the listing fails.
+/// Returns git's message when the listing fails. A failed count leaves the counts empty.
 pub fn load_changed_files(
     repo: &Repository,
     target: &DiffTarget,
-) -> Result<Vec<ChangedFile>, String> {
-    repo.changed_files(target).map_err(|error| error.message())
+    counts: bool,
+) -> Result<ChangedFiles, String> {
+    std::thread::scope(|scope| {
+        let stats = scope.spawn(|| {
+            if counts {
+                repo.numstat(target).unwrap_or_default()
+            } else {
+                BTreeMap::new()
+            }
+        });
+        let files = repo
+            .changed_files(target)
+            .map_err(|error| error.message())?;
+        Ok(ChangedFiles {
+            files,
+            counts: stats.join().unwrap_or_default(),
+        })
+    })
 }
 
 /// Style for a status entry's two-letter code.

@@ -1,11 +1,12 @@
 //! Parsers for machine-readable git output.
 
+use std::collections::BTreeMap;
 use std::path::PathBuf;
 
 use bcode_git_models::{
-    Branch, BranchStatus, ChangeKind, ChangedFile, Commit, ConflictKind, DiffFileStatus, Progress,
-    ReflogEntry, Remote, RemoteBranch, StashEntry, StatusEntry, StatusEntryKind, StatusSnapshot,
-    Submodule, SubmoduleState, Tag, Worktree,
+    Branch, BranchStatus, ChangeKind, ChangedFile, Commit, ConflictKind, DiffFileStatus, LineStats,
+    Progress, ReflogEntry, Remote, RemoteBranch, StashEntry, StatusEntry, StatusEntryKind,
+    StatusSnapshot, Submodule, SubmoduleState, Tag, Worktree,
 };
 
 use crate::GitError;
@@ -478,6 +479,39 @@ pub fn parse_name_status(output: &str) -> Vec<ChangedFile> {
     files
 }
 
+/// Parse `--numstat -z` output into counts by (new) path.
+///
+/// Records are `<added>\t<removed>\t<path>\0`, or `<added>\t<removed>\t\0<old>\0<new>\0` for
+/// renames and copies; binary files report `-` for both counts.
+#[must_use]
+pub fn parse_numstat(output: &str) -> BTreeMap<String, LineStats> {
+    let mut stats = BTreeMap::new();
+    let mut fields = output.split('\0');
+    while let Some(record) = fields.next() {
+        let mut parts = record.trim_start_matches('\n').splitn(3, '\t');
+        let (Some(added), Some(removed), Some(path)) = (parts.next(), parts.next(), parts.next())
+        else {
+            continue;
+        };
+        let path = if path.is_empty() {
+            // A rename: the old path, then the new one.
+            let (Some(_), Some(new)) = (fields.next(), fields.next()) else {
+                break;
+            };
+            new
+        } else {
+            path
+        };
+        let counts = match (added.parse(), removed.parse()) {
+            (Ok(added), Ok(removed)) => LineStats::text(added, removed),
+            _ => LineStats::binary(),
+        };
+        let entry: &mut LineStats = stats.entry(path.to_owned()).or_default();
+        *entry = entry.combined(counts);
+    }
+    stats
+}
+
 /// The latest progress a git command printed, from its terminal text.
 ///
 /// That is the last line among the final few reading `[remote: ]<phase>: <n>%`, followed by
@@ -515,6 +549,16 @@ fn records(output: &str) -> impl Iterator<Item = &str> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn parses_numstat_with_renames_and_binary_files() {
+        let stats = parse_numstat("3\t1\tsrc/a b.rs\0-\t-\tlogo.png\x005\t0\t\0old.rs\0new.rs\0");
+        assert_eq!(stats.len(), 3);
+        assert_eq!(stats["src/a b.rs"], LineStats::text(3, 1));
+        assert_eq!(stats["logo.png"], LineStats::binary());
+        assert_eq!(stats["new.rs"], LineStats::text(5, 0));
+        assert!(parse_numstat("").is_empty());
+    }
 
     #[test]
     fn parses_porcelain_v2_status() {

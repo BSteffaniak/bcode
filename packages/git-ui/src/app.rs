@@ -6,7 +6,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use bcode_git::models::{
-    ChangedFile, Commit, CommitMessageSource, DiffLineId, RepoOperation, StatusEntry,
+    ChangedFile, Commit, CommitMessageSource, DiffLineId, LineStats, RepoOperation, StatusEntry,
 };
 use bcode_git::{DiffTarget, LogQuery, Repository};
 use bmux_keyboard::KeyStroke;
@@ -186,7 +186,7 @@ pub enum Msg {
     /// Main view loaded.
     Main(u64, Box<MainContent>),
     /// Commit files loaded.
-    CommitFiles(u64, Result<Vec<ChangedFile>, String>),
+    CommitFiles(u64, Result<crate::data::ChangedFiles, String>),
     /// Sub-commits loaded.
     SubCommits(u64, Result<Vec<Commit>, String>),
     /// More history loaded.
@@ -247,6 +247,8 @@ pub struct CommitFiles {
     pub revision: String,
     /// Files.
     pub files: Vec<ChangedFile>,
+    /// Lines changed by (new) path.
+    pub counts: BTreeMap<String, LineStats>,
     /// Window hosting the view.
     pub window: Window,
     /// Paths included in the custom patch.
@@ -850,10 +852,11 @@ impl App {
         let repo = self.repo.clone();
         let limit = self.snapshot.commits.len().max(self.config.log_page_size);
         let merged = self.config.branches.dim_merged;
+        let line_counts = self.config.files.line_counts.show;
         self.activity.begin(crate::activity::Load::Repository);
         self.spawn(
             Some("snapshot"),
-            move || load_snapshot(&repo, limit, merged),
+            move || load_snapshot(&repo, limit, merged, line_counts),
             move |snapshot| Msg::Snapshot(generation, Box::new(snapshot)),
         )
     }
@@ -1016,15 +1019,17 @@ impl App {
             title,
             revision,
             files: Vec::new(),
+            counts: BTreeMap::new(),
             window,
             patch: BTreeSet::new(),
         });
         self.cursors.insert(View::CommitFiles, 0);
         let repo = self.repo.clone();
+        let counts = self.config.files.line_counts.show != crate::config::LineCountsShow::Off;
         self.activity.begin(crate::activity::Load::CommitFiles);
         self.spawn(
             None,
-            move || crate::data::load_changed_files(&repo, &target),
+            move || crate::data::load_changed_files(&repo, &target, counts),
             move |files| Msg::CommitFiles(generation, files),
         )
     }
@@ -2555,7 +2560,10 @@ impl App {
                     && let Some(view) = &mut self.commit_files
                 {
                     match files {
-                        Ok(files) => view.files = files,
+                        Ok(listing) => {
+                            view.files = listing.files;
+                            view.counts = listing.counts;
+                        }
                         Err(error) => self.toast(error, true),
                     }
                 }

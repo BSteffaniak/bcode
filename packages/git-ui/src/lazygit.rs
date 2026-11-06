@@ -89,6 +89,7 @@ struct Gui {
     expanded_side_panel_weight: Option<u16>,
     main_panel_split_mode: Option<String>,
     show_file_tree: Option<bool>,
+    show_numstat_in_files_view: Option<bool>,
     show_command_log: Option<bool>,
     command_log_size: Option<u16>,
     show_bottom_line: Option<bool>,
@@ -298,6 +299,12 @@ fn convert_settings(
     }
     if let Some(tree) = gui.show_file_tree {
         files.insert("tree".into(), tree.into());
+    }
+    // Counts showing is bcode's default.
+    if gui.show_numstat_in_files_view == Some(false) {
+        let mut counts = toml::Table::new();
+        counts.insert("show".into(), "off".into());
+        files.insert("line_counts".into(), counts.into());
     }
     convert_editing(config, ui);
     convert_spinner(&gui.spinner, ui);
@@ -850,6 +857,7 @@ mod tests {
     fn converts_layout_and_file_settings() {
         let import = import(
             "gui:\n  sidePanelWidth: 0.3333\n  screenMode: half\n  showFileTree: false\n  \
+             showNumstatInFilesView: false\n  \
              mainPanelSplitMode: horizontal\n  showBottomLine: true\n  \
              wrapLinesInDiffView: false\n  useHunkModeInDiffView: true\n  \
              spinner:\n    frames: ['|', '/']\n    rate: 50\n\
@@ -870,6 +878,10 @@ mod tests {
             crate::config::MainSplit::SideBySide
         );
         assert!(!loaded.ui.files.tree);
+        assert_eq!(
+            loaded.ui.files.line_counts.show,
+            crate::config::LineCountsShow::Off
+        );
         assert_eq!(loaded.ui.diff_context, 5);
         assert!(!loaded.ui.diff.wrap_lines);
         assert!(loaded.ui.staging.hunk_mode);

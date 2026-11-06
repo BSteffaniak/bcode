@@ -2,14 +2,16 @@
 
 use std::cell::Cell;
 
-use bcode_git::models::{ChangeKind, CommandStatus, DiffFileStatus, StatusEntry, SubmoduleState};
+use bcode_git::models::{
+    ChangeKind, CommandStatus, DiffFileStatus, LineStats, StatusEntry, SubmoduleState,
+};
 use bmux_tui::component::{Element, LayoutId};
 use bmux_tui::composition::{
     Column, Flex, HitArea, Row as BoxRow, SizeBox, Stack, Surface, TextBlock,
 };
 use bmux_tui::geometry::{Insets, Rect, Size};
 use bmux_tui::style::{Modifier, Style};
-use bmux_tui::text::{Line, Span, Text, TextWrap};
+use bmux_tui::text::{Line, Span, Text, TextWrap, TrailingAlign, TrailingPlacement};
 use bmux_tui_components::modal_frame::{
     ModalFrame, ModalFrameComponent, ModalPlacement, ModalSizing, ModalTheme,
 };
@@ -35,10 +37,11 @@ use bmux_tui_components::text_input_box::{
 use crate::actions::head_label;
 use crate::activity::{Load, Subject};
 use crate::app::{App, Row, ScreenMode, View, Window};
-use crate::config::{MainSplit, Portrait};
-use crate::data::{FileNode, SectionKind, commit_line, format_time, status_style};
+use crate::config::{LineCountsAlign, MainSplit, Portrait};
+use crate::data::{FileNode, SectionKind, ShownCounts, commit_line, format_time, status_style};
 use crate::keymap::{Action, Scope, display_key};
 use crate::popup::Popup;
+use crate::theme::GitTheme;
 
 /// Items and per-frame state owned for one layout and paint pass.
 pub struct Frame {
@@ -137,10 +140,117 @@ fn side_items(app: &App, view: View) -> Vec<SelectableListItem> {
             .disabled(true),
         ];
     }
+    let counts = &app.config.files.line_counts;
+    let placement = TrailingPlacement::new(match counts.align {
+        LineCountsAlign::AfterName => TrailingAlign::AfterContent,
+        LineCountsAlign::Right => TrailingAlign::Right,
+    })
+    .keep_visible(counts.floating);
     rows.iter()
         .enumerate()
-        .map(|(index, row)| SelectableListItem::rich(index.to_string(), row_line(app, *row)))
+        .map(|(index, row)| {
+            let item = SelectableListItem::rich(index.to_string(), row_line(app, *row));
+            match row_counts(app, *row) {
+                Some(counts) => item.trailing(counts_line(counts, theme), placement),
+                None => item,
+            }
+        })
         .collect()
+}
+
+/// Line counts of working tree status entries summed, leaving out submodules.
+fn entry_counts(app: &App, entries: impl IntoIterator<Item = usize>) -> Option<ShownCounts> {
+    let status = &app.snapshot.status;
+    app.snapshot.line_counts.sum(
+        entries
+            .into_iter()
+            .map(|entry| &status.entries[entry])
+            .filter(|entry| !entry.submodule)
+            .map(|entry| entry.path.as_str()),
+    )
+}
+
+/// Line counts of commit files summed.
+fn commit_file_counts(app: &App, files: impl IntoIterator<Item = usize>) -> Option<ShownCounts> {
+    let listing = app.commit_files.as_ref()?;
+    let stats: LineStats = files
+        .into_iter()
+        .filter_map(|file| listing.counts.get(&listing.files[file].path).copied())
+        .sum();
+    (!stats.is_empty()).then_some(ShownCounts::Total(stats))
+}
+
+/// Line counts shown on a row: a file's, or everything under a folder.
+fn row_counts(app: &App, row: Row) -> Option<ShownCounts> {
+    match row {
+        Row::File(index) => entry_counts(app, app.file_nodes[index].entries()),
+        Row::CommitFile(index) => commit_file_counts(app, [index]),
+        _ => None,
+    }
+}
+
+/// Line counts of every row of a view that shows them, as filtered.
+fn view_counts(app: &App, view: View) -> Option<ShownCounts> {
+    let rows = app.rows(view);
+    match view {
+        View::Files => {
+            let entries: std::collections::BTreeSet<usize> = rows
+                .iter()
+                .filter_map(|row| match row {
+                    Row::File(index) => Some(app.file_nodes[*index].entries()),
+                    _ => None,
+                })
+                .flatten()
+                .collect();
+            entry_counts(app, entries)
+        }
+        View::CommitFiles => commit_file_counts(
+            app,
+            rows.iter().filter_map(|row| match row {
+                Row::CommitFile(index) => Some(*index),
+                _ => None,
+            }),
+        ),
+        _ => None,
+    }
+}
+
+/// `+added -removed`, leaving out a side that is zero; `bin` for only binary changes.
+fn stats_spans(stats: LineStats, theme: &GitTheme) -> Vec<Span> {
+    let mut spans = Vec::new();
+    if stats.added > 0 {
+        spans.push(Span::styled(format!("+{}", stats.added), theme.added));
+    }
+    if stats.removed > 0 {
+        if !spans.is_empty() {
+            spans.push(Span::raw(" "));
+        }
+        spans.push(Span::styled(format!("-{}", stats.removed), theme.removed));
+    }
+    if spans.is_empty() && stats.binary {
+        spans.push(Span::styled("bin", theme.muted));
+    }
+    spans
+}
+
+/// Line counts as shown on rows and footers; split counts read `staged · unstaged`.
+fn counts_line(counts: ShownCounts, theme: &GitTheme) -> Line {
+    let spans = match counts {
+        ShownCounts::Total(stats) => stats_spans(stats, theme),
+        ShownCounts::Split { staged, unstaged } => {
+            let mut spans = stats_spans(staged, theme);
+            let unstaged = stats_spans(unstaged, theme);
+            let separator = match (spans.is_empty(), unstaged.is_empty()) {
+                (false, false) => " · ",
+                (true, _) => "· ",
+                (false, true) => " ·",
+            };
+            spans.push(Span::styled(separator, theme.muted));
+            spans.extend(unstaged);
+            spans
+        }
+    };
+    Line::from_spans(spans)
 }
 
 fn entry_spans(entry: &StatusEntry, app: &App) -> Vec<Span> {
@@ -782,6 +892,7 @@ fn pane_with<'a>(
     state: &'a Cell<PaneState>,
     actions: &[(&str, &str)],
     scrolled: Scrolled<'a>,
+    footer: Option<Line>,
     child: impl bmux_tui::component::Component + 'a,
 ) -> PaneComponent<'a, 'a> {
     let mut current = state.get();
@@ -794,6 +905,9 @@ fn pane_with<'a>(
     let mut chrome = Pane::new().title_hit(true);
     if let Some(text) = text {
         chrome = chrome.title(text);
+    }
+    if let Some(footer) = footer {
+        chrome = chrome.footer(footer);
     }
     chrome = chrome.styles(PaneStyles {
         background: None,
@@ -1043,6 +1157,7 @@ fn side_pane<'a>(app: &'a App, frame: &'a Frame, position: usize) -> Element<'a>
             &frame.side_panes[position],
             &actions,
             None,
+            None,
             TextBlock::new(""),
         ));
     }
@@ -1065,6 +1180,12 @@ fn side_pane<'a>(app: &'a App, frame: &'a Frame, position: usize) -> Element<'a>
         &frame.side_panes[position],
         &actions,
         Some((list_viewport_id(&LayoutId::new(list_id)), &app.lists[view])),
+        view_counts(app, *view).map(|counts| {
+            let mut spans = vec![Span::raw(" ")];
+            spans.extend(counts_line(counts, &app.theme).spans);
+            spans.push(Span::raw(" "));
+            Line::from_spans(spans)
+        }),
         content,
     ))
 }
@@ -1210,6 +1331,7 @@ fn main_column<'a>(app: &'a App, frame: &'a Frame) -> Element<'a> {
                 list_viewport_id(&LayoutId::new(list_id.clone())),
                 &app.main_lists[section],
             )),
+            None,
             content,
         ));
     }
@@ -1248,6 +1370,7 @@ fn main_column<'a>(app: &'a App, frame: &'a Frame) -> Element<'a> {
             &frame.log_pane,
             &[("close", "✕")],
             Some((LayoutId::new(crate::scroll::LOG_LIST), &app.log_scroll)),
+            None,
             command_log(app),
         ));
     }
