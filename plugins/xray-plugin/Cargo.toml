@@ -1,0 +1,25 @@
+[package]
+authors     = { workspace = true }
+categories  = ["development-tools"]
+description = "Plugin-owned X-ray observation launch commands"
+edition     = { workspace = true }
+keywords    = ["bcode", "diagnostics", "observability"]
+license     = { workspace = true }
+name        = "bcode_xray_plugin"
+readme      = { workspace = true }
+repository  = { workspace = true }
+version     = { workspace = true }
+
+[lib]
+crate-type = ["rlib", "cdylib"]
+
+[dependencies]
+bcode_command        = { workspace = true }
+bcode_plugin_sdk     = { workspace = true }
+bcode_session_models = { workspace = true }
+serde_json           = { workspace = true }
+
+[features]
+default          = []
+fail-on-warnings = []
+static-bundled   = []

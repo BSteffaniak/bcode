@@ -100,6 +100,12 @@ pub enum CommandTextFormat {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum CommandEffect {
+    /// Open a shallow local X-ray observation for the exact canonical session.
+    /// The frontend retains its existing application target; this is not session control.
+    OpenXray {
+        /// Canonical session identity supplied by typed invocation context.
+        session_id: SessionId,
+    },
     /// Copy literal text to the frontend's clipboard. Report write failures to the user.
     CopyText {
         /// Complete text to copy without presentation formatting.

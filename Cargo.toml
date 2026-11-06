@@ -156,6 +156,8 @@ members = [
     "plugins/worktree-plugin",
     "packages/session/models",
     "packages/xray",
+    "packages/xray/inspector",
+    "plugins/xray-plugin",
     "packages/xray/models",
 ]
 resolver = "2"
@@ -175,7 +177,9 @@ bcode_codex_harness_plugin = { version = "0.0.1-alpha.0", default-features = fal
 bcode_harness_models = { version = "0.0.1-alpha.0", default-features = false, path = "packages/harness/models" }
 bcode_harness_plugin = { version = "0.0.1-alpha.0", default-features = false, path = "plugins/harness-plugin" }
 bcode_xray = { version = "0.0.1-alpha.0", default-features = false, path = "packages/xray" }
+bcode_xray_inspector = { version = "0.0.1-alpha.0", default-features = false, path = "packages/xray/inspector" }
 bcode_xray_models = { version = "0.0.1-alpha.0", default-features = false, path = "packages/xray/models" }
+bcode_xray_plugin = { version = "0.0.1-alpha.0", default-features = false, path = "plugins/xray-plugin" }
 ruff_formatter = { version = "0.0.17", default-features = false }
 ruff_python_formatter = { version = "0.0.17", default-features = false, features = [
     "serde",

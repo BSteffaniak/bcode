@@ -51,6 +51,7 @@ bcode_vim_edit_plugin                   = { workspace = true, optional = true }
 bcode_web_search_plugin                 = { workspace = true, optional = true }
 bcode_workflow_plugin                   = { workspace = true, optional = true }
 bcode_worktree_plugin                   = { workspace = true, optional = true }
+bcode_xray_plugin                       = { workspace = true, features = ["static-bundled"] }
 
 bcode_recap_plugin = { workspace = true, optional = true }
 bcode_vox_plugin   = { workspace = true, optional = true }

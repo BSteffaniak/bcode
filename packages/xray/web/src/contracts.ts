@@ -28,9 +28,12 @@ export interface XrayEnvelope {
 export interface InspectorBootstrap {
   schema_version: 1;
   endpoint: string;
+  /** Gateway bearer for gateway endpoints; never a daemon credential in gateway mode. */
   bearer: string;
   session_id: string;
   deep_capture: boolean;
+  /** Synthetic evidence must be visibly distinguished from real observations. */
+  demo?: boolean;
 }
 
 export type SearchScope = 'retained-live' | 'opened-recording';

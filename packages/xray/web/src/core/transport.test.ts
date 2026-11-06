@@ -67,6 +67,31 @@ class InlinePort implements WorkerPort {
   terminate(): void {}
 }
 describe('bounded worker integration', () => {
+  it('publishes bootstrap and failed-redemption states through the worker without making requests', async () => {
+    const port = new InlinePort(); const fetcher = vi.fn<typeof fetch>();
+    let bootstrapping!: () => void; let failed!: () => void;
+    const started = new Promise<void>(resolve => { bootstrapping = resolve; });
+    const ended = new Promise<void>(resolve => { failed = resolve; });
+    const client = new InspectorClient(snapshot => {
+      if (snapshot.state === 'bootstrapping') bootstrapping();
+      if (snapshot.state === 'disconnected') failed();
+    }, { worker: port, fetch: fetcher });
+    client.beginConnection(); await started;
+    expect(port.engine.store.snapshot().state).toBe('bootstrapping');
+    client.failConnection(); await ended;
+    expect(port.engine.store.snapshot().state).toBe('disconnected');
+    expect(fetcher).not.toHaveBeenCalled(); client.dispose();
+  });
+  it('rejects wrong gateway authorization without retries or evidence', async () => {
+    const fetcher = vi.fn<typeof fetch>().mockResolvedValue(new Response('private auth failure', { status: 401 }));
+    const h = hooks(); const transport = new ObservationTransport(bootstrap, h, fetcher);
+    await expect(transport.connect()).rejects.toThrow('Observation interrupted or incompatible');
+    expect(fetcher).toHaveBeenCalledTimes(1);
+    expect(h.events).not.toHaveBeenCalled();
+    expect(h.state).toHaveBeenCalledExactlyOnceWith('disconnected');
+    expect(h.issue.mock.calls.flat().join('')).not.toContain('private auth failure');
+    transport.dispose();
+  });
   it('enforces pending-control bound and settles acknowledged requests', async () => {
     const port = new InlinePort(); const bridge = new StoreBridge(port, () => {});
     const requests = Array.from({ length: 8 }, () => bridge.send({ kind: 'state', state: 'idle' }));

@@ -5,6 +5,7 @@
 //! Bcode release and repository validation tasks.
 
 mod architecture;
+mod xray_dev;
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::env;
@@ -267,6 +268,9 @@ fn main() {
 }
 
 fn run() -> Result<()> {
+    if env::args_os().nth(1).is_some_and(|arg| arg == "xray-dev") {
+        return xray_dev::run(env::args_os().skip(2).collect());
+    }
     let options = Options::parse()?;
     match options.command {
         CommandName::Architecture => architecture::check(&options.target),
@@ -1333,8 +1337,11 @@ fn build_bcode_release(
     purpose: BcodeBuildPurpose,
 ) -> Result<()> {
     let artifact_id = generated_artifact_id();
+    // Build deliberately before Cargo; build.rs only verifies and snapshots these bytes.
+    let web_dist = xray_dev::build_web_dist(&workspace_root())?;
     let mut command = Command::new("cargo");
     command
+        .env("BCODE_XRAY_WEB_DIST", &web_dist)
         .env("BCODE_ARTIFACT_ID", &artifact_id)
         .env("BCODE_DISTRIBUTION_BUILD", purpose.distribution_env());
     if purpose == BcodeBuildPurpose::Distribution {
@@ -4003,6 +4010,7 @@ fn print_help() {
         "Bcode release tasks\n\n\
          Usage:\n\
            cargo xtask architecture [--target <triple>]\n\
+           cargo xtask xray-dev [--demo] [--no-open] [--lifetime-seconds <1..86400>]\n\
            cargo xtask build [--target <triple>] [--features <feature,...>]\n\
            cargo xtask release --target <triple> --version <version> [--features <feature,...>]\n\
            cargo xtask verify-release --target <triple> --version <version> [--features <feature,...>]\n\

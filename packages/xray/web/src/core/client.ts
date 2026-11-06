@@ -17,6 +17,13 @@ export class InspectorClient implements InspectorController {
     this.bridge = new StoreBridge(worker, onSnapshot);
     this.command({ kind: 'state', state: 'idle' });
   }
+  beginConnection(): void {
+    ++this.operation;
+    this.transport?.dispose();
+    this.transport = undefined;
+    this.command({ kind: 'state', state: 'bootstrapping' });
+  }
+  failConnection(): void { this.command({ kind: 'state', state: 'disconnected' }); }
   async connect(bootstrap: InspectorBootstrap): Promise<void> {
     if (this.disposed) throw new Error('Inspector disposed');
     validateBootstrap(bootstrap);

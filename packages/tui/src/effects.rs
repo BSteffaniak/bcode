@@ -719,6 +719,10 @@ pub struct SkillActionRequest {
 
 /// Background work requested by local TUI event handling.
 pub enum TuiEffect {
+    /// Start shallow observation using the existing application client in background work.
+    OpenXray {
+        request: super::xray_inspectors::OpenRequest,
+    },
     /// Attach to a session and start its event stream.
     OpenSession {
         /// Session to open.
@@ -1121,6 +1125,11 @@ impl DaemonObservation {
 
 /// Completed TUI background work.
 pub enum TuiEffectResult {
+    /// Secret-safe result of a shallow observation launch.
+    XrayOpened {
+        session_id: SessionId,
+        message: &'static str,
+    },
     /// Targeted recovery action and fresh bounded status.
     QueueRecovery {
         session_id: SessionId,
@@ -1544,6 +1553,7 @@ impl TuiEffectResult {
     #[must_use]
     pub fn daemon_observation(&self) -> DaemonObservation {
         match self {
+            Self::XrayOpened { .. } => DaemonObservation::None,
             Self::QueueRecovery { result, .. } => DaemonObservation::from_client_result(result),
             Self::SessionChildrenLoaded { result, .. } => {
                 DaemonObservation::from_client_result(result)
@@ -1722,6 +1732,7 @@ impl SubmitMessageResult {
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 enum EffectKey {
+    Xray,
     QueueRecovery,
     SessionOpen,
     Config,
@@ -1798,6 +1809,10 @@ impl TuiEffect {
     #[allow(clippy::too_many_lines, dead_code)]
     fn application_access_failed(self, client_error: ClientError) -> TuiEffectResult {
         match self {
+            Self::OpenXray { request } => TuiEffectResult::XrayOpened {
+                session_id: request.session_id,
+                message: "X-ray requires existing application access",
+            },
             Self::QueueRecovery {
                 session_id,
                 generation,
@@ -2138,6 +2153,7 @@ impl TuiEffect {
             | Self::WaitWorktreeCreate { .. }
             | Self::CancelTurn { .. }
             | Self::ResolvePermission { .. }
+            | Self::OpenXray { .. }
             | Self::InvokePluginCommand { .. } => EffectDaemonIntent::Foreground,
             Self::OpenSession {
                 allow_daemon_start: false,
@@ -2398,6 +2414,7 @@ impl TuiEffect {
 
     fn key(&self) -> EffectKey {
         match self {
+            Self::OpenXray { .. } => EffectKey::Xray,
             Self::QueueRecovery { .. } => EffectKey::QueueRecovery,
             Self::OpenSession { .. } => EffectKey::SessionOpen,
             Self::LoadConfig => EffectKey::Config,
@@ -2585,6 +2602,14 @@ impl TuiEffect {
         streaming_sender: mpsc::Sender<TuiEffectResult>,
     ) -> TuiEffectResult {
         match self {
+            Self::OpenXray { request } => {
+                let session_id = request.session_id;
+                let message = request.run(client).await;
+                TuiEffectResult::XrayOpened {
+                    session_id,
+                    message,
+                }
+            }
             Self::QueueRecovery {
                 session_id,
                 generation,

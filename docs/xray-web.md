@@ -5,38 +5,57 @@ submit prompts, cancel work, repair sessions, or reconstruct canonical history.
 
 ## Run
 
-Build the assets once:
+With a packaged Bcode build:
 
 ```sh
-cd packages/xray/web
-npm ci --ignore-scripts
-npm run build
+bcode xray SESSION_ID
 ```
 
-From the repository root, using a Bcode executable built from this revision:
+Or use `bcode xray` for a bounded session picker. In the TUI, choose **Open X-ray**
+from the command palette or use `/xray`. The enabled X-ray command plugin supplies
+this action; disabling it does not disable the standalone CLI.
+
+The launcher serves version-matched bundled assets and opens the browser already
+paired. Launching does not run npm, download assets, or require the repository as
+its working directory. Preserve your normal configuration, profile, and state-root
+options. `--deep` explicitly authorizes sensitive capture; it is not the default.
+
+For an isolated synthetic demo while developing Bcode:
 
 ```sh
-/path/to/bcode session xray-web SESSION_ID --asset-dir "$PWD/packages/xray/web/dist"
+cargo xtask xray-dev
 ```
 
-Preserve the normal configuration, model profile, and state-root options for your
-session. `--no-open` leaves browser opening to you. Paste the one-time code printed
-by the launcher into the password field. It expires after 45 seconds and permits
-eight attempts; start a new launcher for a new code. Credentials are never placed
-in URLs or persistent browser storage. Keep the terminal output private.
+This deliberately builds the locked frontend and a test executable, then launches
+with isolated configuration/state and no provider requests. Use `--no-open` to
+open the printed URL yourself. A packaged executable also supports `bcode xray
+--demo` without building anything.
 
-The launcher binds only loopback, grants the exact inspector Origin for the
-selected session and lifetime, and revokes its endpoint on exit. Closing the
-launcher does not cancel session execution. Deep capture requires explicit
-`--deep`; ordinary observation cannot silently upgrade itself. Existing custom
-X-ray host/security policy remains authoritative. For SSH, deliberately forward
-both loopback endpoints and preserve their exact Origins; this initial launcher
-does not automatically configure forwarded ports or remote exposure.
+Automatic pairing uses a short-lived single-use ticket in the URL fragment. The
+frontend removes it before asynchronous startup, redeems it once, and keeps the
+resulting credential in memory, not persistent browser storage. The initial
+fragment can still be visible to browser history/extensions; keep launch links
+private. Manual fallback uses the credential-free printed URL and the one-time
+code. Codes expire after 45 seconds and allow eight attempts; restart the launcher
+for a fresh code.
 
-Assets are an explicit built directory, not fetched from a CDN. Missing, unsafe,
-symlinked, oversized, or unbuilt asset trees fail closed. Production hosting uses
-restrictive CSP and exact Host/Origin/fetch-metadata checks. Vite's development
-server is for frontend development, not a replacement capability host.
+The launcher binds only loopback and serves assets, pairing and the typed X-ray
+gateway on one Origin. It grants access for the selected session and lifetime and
+revokes its endpoint on exit. Stopping observation never cancels session execution.
+Existing custom X-ray host/security policy remains authoritative.
+
+Over SSH, the launcher avoids opening the remote machine's browser and prints a
+single-port forwarding command. Deliberately supply your SSH destination, retain
+the printed local port, open the printed URL locally and enter the pairing code.
+No SSH destination is guessed. `--local-browser` explicitly opts into opening a
+browser on the serving host.
+
+Release packaging builds assets explicitly before embedding them. Source builds
+without embedded assets fail with build guidance; they do not install tooling at
+launch. `session xray-web SESSION_ID --asset-dir /absolute/dist` remains an explicit
+developer override. Unsafe, symlinked, oversized or unbuilt asset trees fail closed.
+Production hosting uses restrictive CSP and exact Host/Origin/fetch-metadata checks;
+Vite's development server is not a replacement capability host.
 
 ## Inspect
 
@@ -75,5 +94,6 @@ npm run test:browser
 `PLAYWRIGHT_CHROMIUM_EXECUTABLE` may select an explicit existing test browser.
 Browser tests exercise real React/worker ingestion and offline import with a
 controlled HTTP boundary; they are not evidence of a real daemon/provider run.
-Launcher behavior tests live in `bcode_cli::xray_web::tests`. No production provider
+Host/gateway behavior tests live in `bcode_xray_inspector`; CLI picker and routing
+tests live in `bcode_cli::xray_launch::tests`. No production provider
 requests are needed for these tests.

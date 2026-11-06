@@ -11,7 +11,6 @@ repository  = { workspace = true }
 version     = { workspace = true }
 
 [dependencies]
-axum = { workspace = true, features = ["http1", "json", "tokio"] }
 base64 = { workspace = true }
 bcode_agent_profile = { workspace = true }
 bcode_build_info = { workspace = true }
@@ -51,6 +50,7 @@ bcode_workflow_discovery = { workspace = true }
 bcode_workflow_store = { workspace = true }
 bcode_worktree_models = { workspace = true }
 bcode_xray = { workspace = true }
+bcode_xray_inspector = { workspace = true }
 bcode_xray_models = { workspace = true }
 chrono = { workspace = true }
 clap = { workspace = true, features = ["derive", "help", "std", "usage"] }

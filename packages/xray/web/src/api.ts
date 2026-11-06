@@ -2,7 +2,7 @@ import type { EvidenceIssue, InspectorBootstrap, SearchScope, XrayEnvelope } fro
 
 /** Stable browser-side integration contract shared by transport/store and React. */
 export interface InspectorSnapshot {
-  state: 'idle' | 'connecting' | 'live' | 'finalizing' | 'stopped' | 'disconnected' | 'recording';
+  state: 'idle' | 'bootstrapping' | 'connecting' | 'live' | 'finalizing' | 'stopped' | 'disconnected' | 'recording';
   events: XrayEnvelope[];
   issues: EvidenceIssue[];
   retained: number;
@@ -15,6 +15,10 @@ export interface InspectorSnapshot {
 }
 
 export interface InspectorController {
+  /** Enter the memory-only ticket redemption phase before attaching transport. */
+  beginConnection(): void;
+  /** Surface a failed redemption without retrying or attaching. */
+  failConnection(): void;
   connect(bootstrap: InspectorBootstrap): Promise<void>;
   stop(): Promise<void>;
   dispose(): void;

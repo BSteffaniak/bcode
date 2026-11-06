@@ -1,6 +1,6 @@
 import { useEffect, useMemo, useRef, useState, type ChangeEvent } from 'react';
 import type { InspectorSnapshot } from './api';
-import { redeemPairing } from './components/pairing';
+import { redeemPairing, PAIRING_FAILURE, type LaunchTicket } from './components/pairing';
 import { InspectorClient } from './core/client';
 import { openRecording, exportEvents, createRecordingReader, type RecordingReader } from './recording/index';
 import type { XrayEnvelope } from './contracts';
@@ -20,7 +20,7 @@ function preferences(): Preferences {
   } catch { /* Storage is optional. */ }
   return { query: '', compact: false, saved: [] };
 }
-export default function App() {
+export default function App({ launchTicket }: { launchTicket?: LaunchTicket } = {}) {
   const [prefs, setPrefs] = useState(preferences);
   const [snapshot, setSnapshot] = useState(empty);
   const [follow, setFollow] = useState(true);
@@ -30,7 +30,8 @@ export default function App() {
   const [offset, setOffset] = useState(0);
   const [navigation, setNavigation] = useState('activities');
   const [notice, setNotice] = useState('');
-  const [working, setWorking] = useState(false);
+  const [demo, setDemo] = useState(false);
+  const [working, setWorking] = useState(!!launchTicket);
   const [pairingCode, setPairingCode] = useState('');
   const client = useRef<InspectorClient | null>(null);
   const search = useRef<HTMLInputElement>(null);
@@ -44,10 +45,28 @@ export default function App() {
   const display = paused && frozen ? frozen : snapshot;
   const lastPage = Math.max(0, snapshot.matches - WINDOW);
   useEffect(() => {
-    const instance = new InspectorClient(setSnapshot);
+    let instance: InspectorClient;
+    try { instance = new InspectorClient(setSnapshot); }
+    catch {
+      setSnapshot({ ...empty, state: 'disconnected' });
+      setWorking(false); setNotice(PAIRING_FAILURE);
+      return;
+    }
     client.current = instance;
-    return () => { instance.dispose(); client.current = null; };
-  }, []);
+    let cancelled = false;
+    if (launchTicket) {
+      instance.beginConnection();
+      setWorking(true);
+      void launchTicket.redeem().then(async bootstrap => {
+        if (cancelled) return;
+        setDemo(bootstrap.demo === true);
+        await instance.connect(bootstrap);
+      }).catch(() => {
+        if (!cancelled) { instance.failConnection(); setNotice(PAIRING_FAILURE); }
+      }).finally(() => { if (!cancelled) setWorking(false); });
+    }
+    return () => { cancelled = true; instance.dispose(); client.current = null; };
+  }, [launchTicket]);
   useEffect(() => { client.current?.setQuery(prefs.query); setOffset(0); }, [prefs.query]);
   useEffect(() => { if (follow && !paused) setOffset(lastPage); }, [lastPage, follow, paused]);
   useEffect(() => { client.current?.setWindow(offset, WINDOW); if (list.current) list.current.scrollTop = 0; }, [offset]);
@@ -74,25 +93,29 @@ export default function App() {
   const filter = (key: string, value: string) => { const fields: Record<string, string> = { session_id: 'session', turn_id: 'turn', request_id: 'request', tool_call_id: 'tool', run_id: 'run', activation_id: 'activation', attempt_id: 'attempt' }; setPaused(false); setFollow(false); setPrefs(previous => ({ ...previous, query: `${previous.query} ${fields[key] ?? key}:${queryValue(value)}`.trim() })); };
   async function connect() {
     if (!pairingCode || working) return;
+    if (!client.current) { setPairingCode(''); setNotice(PAIRING_FAILURE); return; }
     const code = pairingCode;
     setPairingCode('');
-    setWorking(true); setNotice('');
+    setWorking(true); setNotice(''); setDemo(false);
+    client.current?.beginConnection();
     try {
       const bootstrap = await redeemPairing(code);
+      setDemo(bootstrap.demo === true);
       recordingReader.current = null;
       await client.current?.connect(bootstrap);
       setPaused(false); setFollow(true);
-    } catch { setNotice('Pairing unavailable or live connection failed. Codes are one-time and expire; use a fresh CLI launcher code to retry, or open a recording. The code was cleared and was not saved.'); }
+    } catch { client.current?.failConnection(); setNotice(PAIRING_FAILURE); }
     finally { setWorking(false); }
   }
   async function openFiles(event: ChangeEvent<HTMLInputElement>) {
     const files = Array.from(event.target.files ?? []);
     event.target.value = '';
     if (!files.length) return;
-    if (['connecting', 'live', 'finalizing'].includes(snapshot.state)) { setNotice('Stop observation before replacing the view with a recording. Session execution is unaffected.'); return; }
+    if (['bootstrapping', 'connecting', 'live', 'finalizing'].includes(snapshot.state)) { setNotice('Stop observation before replacing the view with a recording. Session execution is unaffected.'); return; }
     setWorking(true); setNotice('');
     try {
       const recording = await openRecording(files);
+      setDemo(false);
       recordingReader.current = await createRecordingReader(files);
       setOfflineOffset(0); setOfflineMore(false);
       client.current?.loadRecording(recording.events, recording.issues);
@@ -121,15 +144,16 @@ export default function App() {
     const anchor = document.createElement('a'); anchor.href = url; anchor.download = 'xray-event-window.jsonl'; anchor.click();
     setTimeout(() => URL.revokeObjectURL(url), 0);
   }
-  const active = ['connecting', 'live', 'finalizing'].includes(snapshot.state);
+  const active = ['bootstrapping', 'connecting', 'live', 'finalizing'].includes(snapshot.state);
   return <div className={`app ${prefs.compact ? 'compact' : ''}`}>
-    <header className="app-header"><a className="brand" href="#main"><span className="brand-mark">✳</span> X-ray <span className="badge">INSPECTOR</span></a><div className="header-status"><span className={`status-dot ${snapshot.state === 'live' ? 'live' : ''}`} />{snapshot.state}<span className="muted">/ observation only</span></div><div className="header-actions"><form className="pairing-form" onSubmit={event => { event.preventDefault(); void connect(); }}><label htmlFor="pairing-code">CLI pairing code</label><input id="pairing-code" type="password" autoComplete="off" spellCheck={false} autoCapitalize="none" maxLength={4096} value={pairingCode} disabled={working || active} onChange={event => setPairingCode(event.target.value)} placeholder="Paste one-time code" aria-describedby="pairing-help" /><button type="submit" disabled={working || active || !pairingCode}>Connect live</button></form><button disabled={!active || working} onClick={() => { setWorking(true); void client.current?.stop().catch(() => setNotice('Observation cutoff not confirmed; evidence remains incomplete.')).finally(() => setWorking(false)); }}>Stop observation</button><button onClick={() => fileInput.current?.click()} disabled={working}>Open files</button><button onClick={() => directoryInput.current?.click()} disabled={working}>Open folder</button><button onClick={download} disabled={!display.events.length}>Export window ↗</button></div></header>
+    <header className="app-header"><a className="brand" href="#main"><span className="brand-mark">✳</span> X-ray <span className="badge">INSPECTOR</span></a><div className="header-status"><span className={`status-dot ${snapshot.state === 'live' ? 'live' : ''}`} /> <span aria-label="Connection state">{snapshot.state}</span><span className="muted">/ observation only</span></div><div className="header-actions"><form className="pairing-form" onSubmit={event => { event.preventDefault(); void connect(); }}><label htmlFor="pairing-code">CLI pairing code</label><input id="pairing-code" type="password" autoComplete="off" spellCheck={false} autoCapitalize="none" maxLength={4096} value={pairingCode} disabled={working || active} onChange={event => setPairingCode(event.target.value)} placeholder="Paste one-time code" aria-describedby="pairing-help" /><button type="submit" disabled={working || active || !pairingCode}>Connect live</button></form><button disabled={!active || working} onClick={() => { setWorking(true); void client.current?.stop().catch(() => setNotice('Observation cutoff not confirmed; evidence remains incomplete.')).finally(() => setWorking(false)); }}>Stop observation</button><button onClick={() => fileInput.current?.click()} disabled={working}>Open files</button><button onClick={() => directoryInput.current?.click()} disabled={working}>Open folder</button><button onClick={download} disabled={!display.events.length}>Export window ↗</button></div></header>
     <div id="pairing-help" className="pairing-help">Paste the one-time code printed by the local CLI launcher. Memory only; cleared on submission. Never put pairing codes in URLs.</div>
     <input hidden ref={fileInput} type="file" multiple accept=".json,.jsonl,.ndjson,.bin" onChange={event => void openFiles(event)} aria-label="Open recording files" />
     <input hidden ref={directoryInput} type="file" multiple {...{ webkitdirectory: '' }} onChange={event => void openFiles(event)} aria-label="Open recording folder" />
     <div className="toolbar"><div className="searchbox"><span aria-hidden="true">⌕</span><input ref={search} value={prefs.query} onChange={event => { setPaused(false); setFollow(false); setPrefs(previous => ({ ...previous, query: event.target.value })); }} placeholder="Search evidence or filter: domain:provider" aria-label="Search retained evidence" /><kbd>⌘/Ctrl K</kbd>{prefs.query && <button aria-label="Clear search" onClick={() => setPrefs(previous => ({ ...previous, query: '' }))}>×</button>}</div><button onClick={() => setPrefs(previous => ({ ...previous, saved: [...new Set([...previous.saved, previous.query])].filter(Boolean).slice(-12) }))} disabled={!prefs.query}>Save filter</button><button aria-pressed={prefs.compact} onClick={() => setPrefs(previous => ({ ...previous, compact: !previous.compact }))}>Compact</button></div>
     <div className="filterbar"><span className="muted">QUICK FILTERS</span>{['provider', 'tool', 'workflow', 'xray'].map(domain => <button className="chip" key={domain} onClick={() => filter('domain', domain)}>{domain}</button>)}{prefs.saved.map(query => <span className="saved-filter" key={query}><button className="chip" onClick={() => setPrefs(previous => ({ ...previous, query }))}>{query}</button><button aria-label={`Delete saved filter ${query}`} onClick={() => setPrefs(previous => ({ ...previous, saved: previous.saved.filter(item => item !== query) }))}>×</button></span>)}</div>
     {recordingReader.current && <div className="offline-search"><label htmlFor="offline-text">Recording file text scan</label><input id="offline-text" value={offlineText} maxLength={1024} onChange={event => { setOfflineText(event.target.value); setOfflineOffset(0); setOfflineMore(false); }} placeholder="Literal text across recording (not filter syntax)" /><button disabled={working} onClick={() => void scanRecording()}>Scan file</button><button disabled={working || !offlineMore} onClick={() => void scanRecording(offlineOffset + WINDOW)}>Next matches</button><small>Explicit bounded scan · 100,000 events per operation</small></div>}
+    {demo && <div className="banner" role="status"><strong>Synthetic demo</strong> — generated evidence, not a real session observation.</div>}
     {(notice || snapshot.queryError) && <div className="banner" role="status">{snapshot.queryError ? `Search: ${snapshot.queryError}` : notice}<button aria-label="Dismiss notice" onClick={() => setNotice('')}>×</button></div>}
     <main id="main" className="workspace">
       <aside className="navigation"><nav className="tabs" aria-label="Evidence navigation"><button aria-pressed={navigation === 'activities'} onClick={() => setNavigation('activities')}>Activities</button><button aria-pressed={navigation === 'issues'} onClick={() => setNavigation('issues')}>Issues <span className="count">{snapshot.issues.length}</span></button></nav><div className="navigation-body">{navigation === 'activities' ? <><p className="section-label">OBSERVED GROUPS · THIS WINDOW</p>{!groups.length && <p className="muted">Sessions and workflows appear as events arrive.</p>}{groups.map(group => <button className="activity" key={`${group.key}:${group.value}`} onClick={() => filter(group.key, group.value)}><span>{group.domain} <span className="count">{group.count}</span></span><strong className="mono">{group.value}</strong><span className="waterfall"><span style={{ width: `${Math.min(100, Math.max(3, (group.last - group.first) / Math.max(1, ...groups.map(item => item.last - item.first)) * 100))}%` }} /></span><small>{Math.max(0, group.last - group.first).toLocaleString()} ms · observed wall clock</small></button>)}<p className="footnote">Grouped by explicit IDs, not inferred parentage. Wall-clock spans are not execution duration or causal authority.</p></> : <><p className="section-label">EVIDENCE HEALTH</p>{snapshot.issues.length === 0 && <p className="muted">No reported issues. This does not prove complete evidence.</p>}{snapshot.issues.map((issue, index) => <section className="issue" key={`${issue.kind}:${issue.observation_id}:${issue.sequence}:${index}`}><strong>{issue.kind}</strong><p>{issue.message}</p>{issue.sequence !== undefined && <small>Observed sequence #{issue.sequence}</small>}</section>)}</>}</div></aside>

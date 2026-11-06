@@ -1779,6 +1779,7 @@ dependencies = [
  "bcode_web_search_plugin",
  "bcode_workflow_plugin",
  "bcode_worktree_plugin",
+ "bcode_xray_plugin",
  "serde_json",
  "tokio",
 ]
@@ -1811,7 +1812,6 @@ dependencies = [
 name = "bcode_cli"
 version = "0.0.1-alpha.0"
 dependencies = [
- "axum",
  "base64 0.22.1",
  "bcode_agent_profile",
  "bcode_build_info",
@@ -1849,6 +1849,7 @@ dependencies = [
  "bcode_workflow_store",
  "bcode_worktree_models",
  "bcode_xray",
+ "bcode_xray_inspector",
  "bcode_xray_models",
  "chrono",
  "clap",
@@ -3621,6 +3622,7 @@ dependencies = [
  "bcode_workflow_store",
  "bcode_workflow_view_models",
  "bcode_worktree_models",
+ "bcode_xray_inspector",
  "bmux_image",
  "bmux_keyboard",
  "bmux_mermaid_render",
@@ -3990,10 +3992,41 @@ dependencies = [
 ]
 
 [[package]]
+name = "bcode_xray_inspector"
+version = "0.0.1-alpha.0"
+dependencies = [
+ "axum",
+ "bcode_client",
+ "bcode_ipc",
+ "bcode_session_models",
+ "bcode_xray",
+ "bcode_xray_models",
+ "futures-util",
+ "libc",
+ "open",
+ "rand 0.9.5",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror 2.0.21",
+ "tokio",
+]
+
+[[package]]
 name = "bcode_xray_models"
 version = "0.0.1-alpha.0"
 dependencies = [
  "serde",
+ "serde_json",
+]
+
+[[package]]
+name = "bcode_xray_plugin"
+version = "0.0.1-alpha.0"
+dependencies = [
+ "bcode_command",
+ "bcode_plugin_sdk",
+ "bcode_session_models",
  "serde_json",
 ]
 

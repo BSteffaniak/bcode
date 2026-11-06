@@ -19,6 +19,7 @@ mod session_migration_adapter;
 pub use xray::xray_export_process_entry;
 
 mod xray;
+mod xray_launch;
 mod xray_web;
 
 use base64::Engine as _;
@@ -895,6 +896,7 @@ async fn handle_cli(cli: Cli) -> Result<(), CliError> {
             )
             .await?;
         }
+        Commands::Xray(args) => Box::pin(xray_launch::run(&args)).await?,
         Commands::ArtifactId => write_artifact_id()?,
         Commands::Server { command } => handle_server_command(command).await?,
         Commands::Harness { command } => harness::execute(command).await?,
@@ -4700,6 +4702,7 @@ async fn handle_session_io_command(
         | Commands::Worktree { .. }
         | Commands::RuntimeWork { .. }
         | Commands::Ralph { .. }
+        | Commands::Xray(_)
         | Commands::Workflow { .. } => unreachable!("handled by handle_cli"),
         #[cfg(feature = "web-renderer")]
         Commands::Web { .. } => unreachable!("handled by handle_cli"),
@@ -5122,6 +5125,8 @@ impl Cli {
 
 #[derive(Debug, Subcommand)]
 enum Commands {
+    /// Open the browser X-ray inspector for a session, or explicitly choose one.
+    Xray(xray_launch::XrayLaunchArgs),
     /// Manage external execution backends through the daemon application.
     Harness {
         #[command(subcommand)]

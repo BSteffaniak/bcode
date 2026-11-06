@@ -335,6 +335,7 @@ pub struct ChatLoopState {
     pub(crate) composer_interaction: super::composer_interaction::ComposerInteraction,
     slash_palette: Option<slash_palette::SlashPalette>,
     slash_completion: slash_palette::SlashCompletionState,
+    xray_inspectors: super::xray_inspectors::Inspectors,
     foreground_client: Option<BcodeClient>,
     passive_client: Option<BcodeClient>,
     managed_commands: Option<bcode_client::ManagedSessionCommandHandle>,
@@ -427,6 +428,7 @@ impl ChatLoopState {
         metrics_enabled: bool,
     ) -> Self {
         Self {
+            xray_inspectors: super::xray_inspectors::Inspectors::default(),
             render_launch: None,
             palette: None,
             slash_palette: None,
@@ -3045,6 +3047,7 @@ impl ChatLoopState {
     }
 
     pub fn abort_all_effects(&mut self) {
+        self.xray_inspectors.shutdown();
         self.markdown_projection.invalidate();
         if let Some(markdown) = &mut self.markdown_presentation {
             markdown.cancel_all();
@@ -3404,6 +3407,14 @@ pub fn apply_effect_result(
     result: TuiEffectResult,
 ) {
     match result {
+        TuiEffectResult::XrayOpened {
+            session_id,
+            message,
+        } => {
+            if chat.attached_session_id() == Some(session_id) {
+                chat.app.set_status(message.to_owned());
+            }
+        }
         TuiEffectResult::SessionChildrenLoaded {
             parent_id,
             generation,
@@ -4057,6 +4068,17 @@ pub fn apply_effect_result(
                 }
                 for effect in effects {
                     match effect {
+                        bcode_command::CommandEffect::OpenXray { session_id } => {
+                            if chat.attached_session_id() == Some(session_id) {
+                                let request = loop_state.xray_inspectors.request(session_id);
+                                chat.queue_latest_effect(TuiEffect::OpenXray { request });
+                                chat.app.set_status("opening X-ray…".to_owned());
+                            } else {
+                                chat.app.set_status(
+                                    "X-ray target is not the current session".to_owned(),
+                                );
+                            }
+                        }
                         bcode_command::CommandEffect::Status { message } => {
                             chat.app.set_status(message);
                         }

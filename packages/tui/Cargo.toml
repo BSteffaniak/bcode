@@ -60,6 +60,7 @@ bcode_workflow = { workspace = true }
 bcode_workflow_store = { workspace = true }
 bcode_workflow_view_models = { workspace = true }
 bcode_worktree_models = { workspace = true }
+bcode_xray_inspector = { workspace = true }
 bmux_image = { workspace = true, features = ["iterm2", "kitty", "sixel"] }
 bmux_keyboard = { workspace = true }
 bmux_mermaid_render = { workspace = true }

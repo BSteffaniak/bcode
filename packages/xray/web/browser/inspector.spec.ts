@@ -40,6 +40,95 @@ test('pairs without persistent secrets, ingests through worker, filters and insp
   expect(errors).toEqual([]);
 });
 
+test('auto attaches a fragment ticket once in StrictMode after clearing history, with a visible demo label', async ({ page }) => {
+  let bootstraps = 0;
+  let release!: () => void;
+  const barrier = new Promise<void>(resolve => { release = resolve; });
+  await page.addInitScript(() => {
+    const replace = history.replaceState.bind(history);
+    history.replaceState = (state, unused, url) => {
+      if (location.hash.startsWith('#xray-ticket=')) {
+        (window as unknown as { clearedBeforeMount: boolean }).clearedBeforeMount = !document.getElementById('root')?.hasChildNodes();
+      }
+      replace(state, unused, url);
+    };
+  });
+  await page.route('**/__xray/bootstrap', async route => {
+    bootstraps++;
+    expect(route.request().headers()['x-xray-pairing-code']).toBe('fragment-ticket');
+    expect(route.request().headers().cookie).toBeUndefined();
+    expect(await page.evaluate(() => location.hash)).toBe('');
+    await barrier;
+    await route.fulfill({ json: { schema_version: 1, endpoint: '/', bearer: 'gateway-memory-only', session_id: 'browser-session', deep_capture: false, demo: true } });
+  });
+  await page.route('**/v1/xray/observe', async route => {
+    expect(new URL(route.request().url()).origin).toBe(new URL(page.url()).origin);
+    expect(route.request().headers().authorization).toBe('Bearer gateway-memory-only');
+    const events = [
+      event(1, 'ready', 'xray', { schema_version: 1, deep_capture: false, durable_replay: false, queue_capacity: 100, max_event_bytes: 100000, max_payload_bytes: 10000, max_retained_payload_bytes: 10000, max_retained_payloads: 10, max_payload_range_bytes: 1000 }),
+      event(2, 'auto-attached'),
+    ];
+    await route.fulfill({ contentType: 'text/event-stream', body: events.map(value => `event: xray\ndata: ${JSON.stringify(value)}\n\n`).join('') });
+  });
+  await page.goto('/#xray-ticket=fragment-ticket');
+  await expect(page.getByText('bootstrapping', { exact: true })).toBeVisible();
+  expect(await page.evaluate(() => location.hash)).toBe('');
+  expect(await page.evaluate(() => (window as unknown as { clearedBeforeMount: boolean }).clearedBeforeMount)).toBe(true);
+  release();
+  await expect(page.getByText('auto-attached', { exact: true }).first()).toBeVisible();
+  await expect(page.getByText('Synthetic demo', { exact: true })).toBeVisible();
+  expect(bootstraps).toBe(1);
+  expect(await page.evaluate(() => JSON.stringify([localStorage, sessionStorage, history.state]))).not.toMatch(/fragment-ticket|gateway-memory-only/);
+  await page.reload();
+  await expect(page.getByRole('button', { name: 'Connect live' })).toBeVisible();
+  expect(bootstraps).toBe(1);
+});
+
+for (const failure of ['expired ticket', 'wrong gateway bearer', 'foreign endpoint'] as const) {
+  test(`auto launch fails closed: ${failure}`, async ({ page }) => {
+    let bootstraps = 0; let observations = 0; let foreign = 0;
+    await page.route('https://foreign.invalid/**', route => { foreign++; return route.abort(); });
+    await page.route('**/__xray/bootstrap', route => {
+      bootstraps++;
+      return failure === 'expired ticket'
+        ? route.fulfill({ status: 403, body: 'private-expiry-detail' })
+        : route.fulfill({ json: { schema_version: 1, endpoint: failure === 'foreign endpoint' ? 'https://foreign.invalid/' : '/', bearer: 'wrong-gateway-bearer', session_id: 'browser-session', deep_capture: false } });
+    });
+    await page.route('**/v1/xray/observe', route => {
+      observations++;
+      expect(route.request().headers().authorization).toBe('Bearer wrong-gateway-bearer');
+      return route.fulfill({ status: 401, body: 'private-auth-detail' });
+    });
+    await page.goto('/#xray-ticket=one-use-ticket');
+    await expect(page.getByText(/This launch link expired/)).toBeVisible();
+    await expect(page.getByText('disconnected', { exact: true })).toBeVisible();
+    await expect(page.getByRole('button', { name: 'Connect live' })).toBeVisible();
+    expect(await page.evaluate(() => location.hash)).toBe('');
+    expect(await page.locator('body').innerText()).not.toMatch(/private-expiry-detail|private-auth-detail|wrong-gateway-bearer|one-use-ticket/);
+    expect(await page.evaluate(() => JSON.stringify([localStorage, sessionStorage, history.state]))).not.toMatch(/one-use-ticket|wrong-gateway-bearer/);
+    expect(bootstraps).toBe(1);
+    expect(observations).toBe(failure === 'wrong gateway bearer' ? 1 : 0);
+    expect(foreign).toBe(0);
+    await page.reload();
+    await expect(page.getByRole('button', { name: 'Connect live' })).toBeVisible();
+    expect(bootstraps).toBe(1);
+  });
+}
+
+test('browser worker failure is friendly and does not spend the ticket', async ({ page }) => {
+  let bootstraps = 0;
+  await page.addInitScript(() => {
+    window.Worker = class { constructor() { throw new Error('private-browser-detail'); } } as unknown as typeof Worker;
+  });
+  await page.route('**/__xray/bootstrap', route => { bootstraps++; return route.abort(); });
+  await page.goto('/#xray-ticket=unspent-ticket');
+  await expect(page.getByText(/This launch link expired/)).toBeVisible();
+  await expect(page.getByText('disconnected', { exact: true })).toBeVisible();
+  expect(await page.evaluate(() => location.hash)).toBe('');
+  expect(await page.locator('body').innerText()).not.toContain('private-browser-detail');
+  expect(bootstraps).toBe(0);
+});
+
 test('opens explicit incomplete recording without any live bootstrap', async ({ page }) => {
   let bootstraps = 0;
   await page.route('**/__xray/bootstrap', route => { bootstraps++; return route.abort(); });

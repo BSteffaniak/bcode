@@ -1,9 +1,12 @@
 import type { InspectorBootstrap, XrayEnvelope } from '../contracts';
 import { declaredReferences, envelope, MAX_FRAME_BYTES, MAX_PAYLOAD_BYTES, object, payloadRef, refKey, SequenceTracker, SseParser, uint, validateFinalization, type PayloadRef } from './protocol';
 export interface TransportHooks { events: (events: XrayEnvelope[]) => Promise<void>; state: (state: 'live' | 'stopped' | 'disconnected' | 'finalizing') => void; issue: (message: string) => void }
-export function validateBootstrap(b: InspectorBootstrap): URL {
-  const u = new URL(b.endpoint);
-  if (b.schema_version !== 1 || typeof b.bearer !== 'string' || !b.bearer || /[\r\n]/.test(b.bearer) || typeof b.session_id !== 'string' || !b.session_id || typeof b.deep_capture !== 'boolean' || u.protocol !== 'http:' || !['127.0.0.1', '[::1]'].includes(u.hostname) || u.pathname !== '/' || u.search || u.hash || u.username || u.password) throw new Error('Invalid provisioned loopback observation bootstrap');
+export function validateBootstrap(b: InspectorBootstrap, browserOrigin = globalThis.location?.origin): URL {
+  // Only '/' is a supported relative endpoint. Never resolve arbitrary relative or protocol-relative URLs.
+  const u = new URL(b.endpoint === '/' && browserOrigin ? `${browserOrigin}/` : b.endpoint);
+  const sameOrigin = browserOrigin !== undefined && u.origin === browserOrigin && ['http:', 'https:'].includes(u.protocol);
+  const loopback = u.protocol === 'http:' && ['127.0.0.1', '[::1]'].includes(u.hostname);
+  if (b.schema_version !== 1 || typeof b.bearer !== 'string' || !b.bearer || /[^\x21-\x7e]/u.test(b.bearer) || typeof b.session_id !== 'string' || !b.session_id || typeof b.deep_capture !== 'boolean' || (b.demo !== undefined && typeof b.demo !== 'boolean') || (!sameOrigin && !loopback) || u.pathname !== '/' || u.search || u.hash || u.username || u.password) throw new Error('Invalid provisioned observation bootstrap');
   return u;
 }
 async function boundedJson(response: Response, max = MAX_FRAME_BYTES): Promise<unknown> {

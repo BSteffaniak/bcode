@@ -331,6 +331,10 @@ fn append_static_bundled_plugins(plugins: &mut Vec<bcode_plugin::StaticBundledPl
     plugins.push(read_plugin());
     #[cfg(feature = "static-bundled-session-derivation-plugin")]
     plugins.push(session_derivation_plugin());
+    plugins.push(bcode_plugin::StaticBundledPlugin::new(
+        include_str!("../../../plugins/xray-plugin/bcode-plugin.toml"),
+        bcode_xray_plugin::static_plugin(),
+    ));
     #[cfg(feature = "static-bundled-session-milestones-plugin")]
     plugins.push(session_milestones_plugin());
     #[cfg(feature = "static-bundled-shell-plugin")]

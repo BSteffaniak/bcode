@@ -161,6 +161,12 @@ pub async fn consume_effects(
                     },
                 )
             }
+            bcode_command::CommandEffect::OpenXray { .. } => {
+                failed = true;
+                EffectOutcome::NotApplied {
+                    reason: "use_bcode_xray_or_a_frontend_with_owned_observation_lifetime",
+                }
+            }
             bcode_command::CommandEffect::ToggleSurface { surface_id } => {
                 failed = true;
                 EffectOutcome::Unsupported {
