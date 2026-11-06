@@ -177,8 +177,24 @@ impl App {
                     .finish(TerminalStatus::Exited(Some(i32::from(!record.success()))));
             }
         }
+        // Git's progress for the running operation, from its newest command.
+        let progress = self.operation_progress(&records);
+        self.activity.set_progress(progress);
         self.log_records = records;
         true
+    }
+}
+
+impl App {
+    fn operation_progress(
+        &self,
+        records: &[GitCommandRecord],
+    ) -> Option<bcode_git::models::Progress> {
+        let record = records
+            .first()
+            .filter(|record| self.activity.owns_record(record.id))?;
+        let output = self.log_terminals.get(&record.id)?;
+        bcode_git::parse::parse_progress(&output.terminal.text())
     }
 }
 

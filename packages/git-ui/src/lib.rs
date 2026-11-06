@@ -10,6 +10,7 @@
 //! (`bcode git`) and reads the same configuration in both.
 
 mod actions;
+mod activity;
 pub mod app;
 pub mod branches;
 pub mod commit_message;

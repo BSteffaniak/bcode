@@ -141,6 +141,15 @@ configurable; see [Layout settings](#layout-settings).
   when long; the command log keeps its terminal output, ending with the reason.
 * **Sync**: fetch, pull (merge or rebase), push with upstream setup and force-with-lease when
   behind. Optional periodic background fetch.
+* **Running work**: what an operation affects shows it while it runs. A pushed branch reads
+  `⠹ pushing 45%`, a fetched remote and the branches tracking it read `⠹ fetching`, waiting
+  operations read `queued`, and for a moment afterwards the row reads `✓ pushed` or `✗ failed`.
+  The status bar shows the running operation with git's own progress
+  (`⠹ Pushing main · Writing objects 45% · 3s  +1 queued`); clicking it opens the command log
+  with its live output. Pane titles show a spinner while their content loads (a branch's commits,
+  older history, the main view, pull requests in the branches title). Local work shows only once
+  it has run for a moment, so quick work never flickers; network work shows at once. Automatic
+  background fetches show only in the status bar, muted. See `[activity]` below.
 * **Operations in progress**: merges, rebases, cherry-picks and reverts show a banner; `m` offers
   continue, abort and skip.
 * **Undo/redo** (`z`, `ctrl+z`): a journal of `HEAD` positions for every operation that moves it.
@@ -254,6 +263,13 @@ dim_merged = true               # dim branches already merged into the base bran
 colors = [                      # checked in order before the state colors; see Branch colors
   { pattern = "^release/", color = "bright-cyan", bold = true },
 ]
+
+[activity]
+spinner = "braille"             # "braille" | "dot" | "ascii", or frames: ["◐", "◓", "◑", "◒"]
+rate_ms = 80                    # each frame's time
+show_delay_ms = 150             # local work shows after this long; network work at once
+result_ms = 1500                # how long "✓ pushed" / "✗ failed" stays; 0 turns it off
+animate = true                  # false shows a still "…"
 
 [refresh]
 watch = true                    # filesystem watching; falls back to polling
@@ -464,7 +480,8 @@ draft file and open the editor with `c`.
 converted from a lazygit `config.yml`, as a dedicated config file. Without a path it uses `$LG_CONFIG_FILE` or lazygit's default
 location. The output covers layout, file tree, diff context and line wrapping, staging hunk
 mode, commit message wrapping and hook-skip prefix, graph, refresh settings, branch color
-patterns (`gui.branchColorPatterns`, and the older `gui.branchColors`) and keybindings;
+patterns (`gui.branchColorPatterns`, and the older `gui.branchColors`), the spinner
+(`gui.spinner`) and keybindings;
 values equal to bcode's defaults are left out, and anything without a bcode equivalent, or a key a
 panel binding would shadow, is listed in `# note:` comments. Review it and
 append it to a dedicated file, or add `--nested` for the `bcode.toml` form:

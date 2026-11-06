@@ -608,6 +608,15 @@ pub enum SubmoduleState {
     Conflicted,
 }
 
+/// How far a git command has got, from the progress it prints (`Writing objects:  45% (9/20)`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Progress {
+    /// What it is doing (`Writing objects`).
+    pub phase: String,
+    /// Percent of that phase done, 0 to 100.
+    pub percent: u8,
+}
+
 /// One git command run for the command log: running, or finished. Its terminal output is
 /// kept by the log, by [`Self::id`].
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

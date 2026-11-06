@@ -99,6 +99,15 @@ struct Gui {
     branch_color_patterns: BTreeMap<String, String>,
     /// Deprecated in lazygit: branch "type" (the part before `/`) to color.
     branch_colors: BTreeMap<String, String>,
+    spinner: GuiSpinner,
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(default, rename_all = "camelCase")]
+struct GuiSpinner {
+    frames: Option<Vec<String>>,
+    /// Milliseconds per frame.
+    rate: Option<u64>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -291,6 +300,7 @@ fn convert_settings(
         files.insert("tree".into(), tree.into());
     }
     convert_editing(config, ui);
+    convert_spinner(&gui.spinner, ui);
     let git = &config.git;
     if let Some(context) = git.diff_context_size {
         ui.insert("diff_context".into(), i64::from(context).into());
@@ -321,6 +331,26 @@ fn convert_settings(
             );
         }
         _ => {}
+    }
+}
+
+/// `gui.spinner` frames and rate.
+fn convert_spinner(spinner: &GuiSpinner, ui: &mut toml::Table) {
+    let mut activity = toml::Table::new();
+    if let Some(frames) = spinner.frames.as_ref().filter(|frames| !frames.is_empty()) {
+        activity.insert(
+            "spinner".into(),
+            toml::Value::Array(frames.iter().cloned().map(toml::Value::String).collect()),
+        );
+    }
+    if let Some(rate) = spinner.rate {
+        activity.insert(
+            "rate_ms".into(),
+            i64::try_from(rate).unwrap_or(i64::MAX).into(),
+        );
+    }
+    if !activity.is_empty() {
+        ui.insert("activity".into(), activity.into());
     }
 }
 
@@ -821,7 +851,8 @@ mod tests {
         let import = import(
             "gui:\n  sidePanelWidth: 0.3333\n  screenMode: half\n  showFileTree: false\n  \
              mainPanelSplitMode: horizontal\n  showBottomLine: true\n  \
-             wrapLinesInDiffView: false\n  useHunkModeInDiffView: true\n\
+             wrapLinesInDiffView: false\n  useHunkModeInDiffView: true\n  \
+             spinner:\n    frames: ['|', '/']\n    rate: 50\n\
              git:\n  diffContextSize: 5\n  skipHookPrefix: WIP\n  \
              commit:\n    autoWrapCommitMessage: true\n    autoWrapWidth: 80\n",
             false,
@@ -844,6 +875,11 @@ mod tests {
         assert!(loaded.ui.staging.hunk_mode);
         assert_eq!(loaded.ui.commit.wrap_width, 80);
         assert_eq!(loaded.ui.commit.skip_hook_prefix, "WIP");
+        assert_eq!(
+            loaded.ui.activity.spinner,
+            crate::config::SpinnerSetting::Frames(vec!["|".into(), "/".into()])
+        );
+        assert_eq!(loaded.ui.activity.rate_ms, 50);
     }
 
     #[test]

@@ -3,7 +3,7 @@
 use std::path::PathBuf;
 
 use bcode_git_models::{
-    Branch, BranchStatus, ChangeKind, ChangedFile, Commit, ConflictKind, DiffFileStatus,
+    Branch, BranchStatus, ChangeKind, ChangedFile, Commit, ConflictKind, DiffFileStatus, Progress,
     ReflogEntry, Remote, RemoteBranch, StashEntry, StatusEntry, StatusEntryKind, StatusSnapshot,
     Submodule, SubmoduleState, Tag, Worktree,
 };
@@ -478,6 +478,33 @@ pub fn parse_name_status(output: &str) -> Vec<ChangedFile> {
     files
 }
 
+/// The latest progress a git command printed, from its terminal text.
+///
+/// That is the last line among the final few reading `[remote: ]<phase>: <n>%`, followed by
+/// nothing, ` (…` or `,`. Git redraws its progress line in place, so terminal text holds only
+/// the latest state of each phase.
+#[must_use]
+pub fn parse_progress(text: &str) -> Option<Progress> {
+    text.lines().rev().take(8).find_map(|line| {
+        let line = line.trim();
+        let line = line.strip_prefix("remote:").map_or(line, str::trim_start);
+        let (phase, rest) = line.split_once(": ")?;
+        let digits = rest.trim_start();
+        let (number, after) = digits.split_once('%')?;
+        if !(after.is_empty() || after.starts_with(" (") || after.starts_with(',')) {
+            return None;
+        }
+        let percent = number
+            .parse::<u8>()
+            .ok()
+            .filter(|percent| *percent <= 100)?;
+        (!phase.is_empty()).then(|| Progress {
+            phase: phase.to_owned(),
+            percent,
+        })
+    })
+}
+
 fn records(output: &str) -> impl Iterator<Item = &str> {
     output
         .split(RECORD)
@@ -559,5 +586,25 @@ u UU N... 100644 100644 100644 100644 a b c conflict.rs\0\
         let submodules = parse_submodules(" abc lib/x (v1.0)\n-def lib/y\n");
         assert_eq!(submodules[0].describe.as_deref(), Some("v1.0"));
         assert_eq!(submodules[1].state, SubmoduleState::Uninitialized);
+    }
+
+    #[test]
+    fn reads_the_latest_progress_line() {
+        let text = "Enumerating objects: 5, done.\nCounting objects: 100% (5/5), done.\n\
+remote: Compressing objects:  40% (2/5)\n";
+        assert_eq!(
+            parse_progress(text),
+            Some(Progress {
+                phase: "Compressing objects".into(),
+                percent: 40,
+            })
+        );
+        let pushed = "Writing objects: 100% (3/3), 280 bytes | 280.00 KiB/s, done.\nTo ../origin.git\n   abc..def  main -> main";
+        assert_eq!(
+            parse_progress(pushed).map(|progress| progress.percent),
+            Some(100)
+        );
+        assert_eq!(parse_progress("Already up to date.\nfatal: 50%: odd"), None);
+        assert_eq!(parse_progress(""), None);
     }
 }

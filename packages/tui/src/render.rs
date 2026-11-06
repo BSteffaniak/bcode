@@ -323,7 +323,8 @@ use super::transcript::{
 use super::transcript_layout::TranscriptLayoutSignature;
 use bmux_tui::text_width::{display_width as text_display_width, truncate_to_display_width};
 
-const SPINNER_FRAMES: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
+static SPINNER: std::sync::LazyLock<bmux_tui_components::spinner::Spinner> =
+    std::sync::LazyLock::new(bmux_tui_components::spinner::Spinner::braille);
 const MAX_COMPOSER_ROWS: u16 = 6;
 const MAX_INLINE_TOOL_TEXT_ROWS: usize = 28;
 const LATEST_BAR_ACTIVE_WINDOW: Duration = Duration::from_millis(420);
@@ -5772,8 +5773,11 @@ fn tool_activity_label(tool_name: &str) -> String {
     format!("tool {tool_name}")
 }
 
-const fn spinner_frame(activity_frame: usize) -> &'static str {
-    SPINNER_FRAMES[activity_frame % SPINNER_FRAMES.len()]
+/// The spinner frame for the `activity_frame`th activity tick.
+fn spinner_frame(activity_frame: usize) -> &'static str {
+    // Frames repeat, so only the position within a cycle matters.
+    let step = u32::try_from(activity_frame % 1_000).unwrap_or_default();
+    SPINNER.frame(SPINNER.interval() * step)
 }
 
 fn render_composer(app: &mut BmuxApp, area: Rect, frame: &mut PaintCx<'_, '_>, theme: TuiTheme) {

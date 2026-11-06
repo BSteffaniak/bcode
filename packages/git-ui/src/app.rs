@@ -201,6 +201,8 @@ pub enum Msg {
     CommitPrefill(Box<crate::commit_message::Prefill>),
     /// Periodic tick.
     Tick,
+    /// Time for the next spinner frame (sent while [`App::animation`] says so).
+    Frame,
     /// The forge answered about pull requests.
     PullRequests(
         u64,
@@ -369,8 +371,10 @@ pub struct App {
     pub(crate) pending_since: Option<Instant>,
     pub(crate) toast: Option<Toast>,
     pub(crate) queue: VecDeque<(Op, bool)>,
-    pub(crate) running: Option<String>,
-    pub(crate) spinner: usize,
+    /// Running, queued and just-finished work, shown where it lands.
+    pub(crate) activity: crate::activity::Activity,
+    /// Set while something animates, so the runtime sends spinner frames.
+    pub(crate) animating: Arc<std::sync::atomic::AtomicBool>,
     pub(crate) command_log: bool,
     pub(crate) screen_mode: ScreenMode,
     pub(crate) cherry: Vec<Commit>,
@@ -422,7 +426,9 @@ impl App {
             crate::branches::BranchColors::new(&config.branches, &theme);
         let mut cx = cx;
         cx.branches = branch_colors;
+        let (activity, activity_diagnostics) = crate::activity::Activity::new(&config.activity);
         let mut diagnostics = diagnostics;
+        diagnostics.extend(activity_diagnostics);
         diagnostics.extend(branch_diagnostics);
         diagnostics.extend(layout_diagnostics);
         diagnostics.extend(commit_diagnostics);
@@ -490,8 +496,8 @@ impl App {
             pending_since: None,
             toast: None,
             queue: VecDeque::new(),
-            running: None,
-            spinner: 0,
+            activity,
+            animating: Arc::default(),
             command_log,
             screen_mode,
             cherry: Vec::new(),
@@ -522,6 +528,12 @@ impl App {
         }
         app.sync_panels();
         app
+    }
+
+    /// A flag set while something animates, and how often to send [`Msg::Frame`] then.
+    #[must_use]
+    pub fn animation(&self) -> (Arc<std::sync::atomic::AtomicBool>, Duration) {
+        (self.animating.clone(), self.activity.interval())
     }
 
     /// External program requested before the runtime exited, if any.
@@ -838,6 +850,7 @@ impl App {
         let repo = self.repo.clone();
         let limit = self.snapshot.commits.len().max(self.config.log_page_size);
         let merged = self.config.branches.dim_merged;
+        self.activity.begin(crate::activity::Load::Repository);
         self.spawn(
             Some("snapshot"),
             move || load_snapshot(&repo, limit, merged),
@@ -971,6 +984,7 @@ impl App {
         let generation = self.main_generation;
         let repo = self.repo.clone();
         let cx = self.cx.clone();
+        self.activity.begin(crate::activity::Load::Main);
         self.spawn(
             Some("main"),
             move || load_main(&repo, request, &cx),
@@ -1007,6 +1021,7 @@ impl App {
         });
         self.cursors.insert(View::CommitFiles, 0);
         let repo = self.repo.clone();
+        self.activity.begin(crate::activity::Load::CommitFiles);
         self.spawn(
             None,
             move || crate::data::load_changed_files(&repo, &target),
@@ -1046,6 +1061,7 @@ impl App {
         self.cursors.insert(View::SubCommits, 0);
         let repo = self.repo.clone();
         let limit = self.config.log_page_size;
+        self.activity.begin(crate::activity::Load::SubCommits);
         self.spawn(
             None,
             move || {
@@ -1064,6 +1080,7 @@ impl App {
         let repo = self.repo.clone();
         let skip = self.snapshot.commits.len();
         let limit = self.config.log_page_size;
+        self.activity.begin(crate::activity::Load::MoreCommits);
         self.spawn(
             Some("more-commits"),
             move || {
@@ -1086,6 +1103,14 @@ impl App {
     }
 
     pub(crate) fn run_ops_with_output(&mut self, ops: Vec<Op>, show_output: bool) -> Update<Msg> {
+        self.queue_ops(ops, show_output, false)
+    }
+
+    /// Queue operations; `automatic` ones (auto-fetch) show only in the status bar.
+    fn queue_ops(&mut self, ops: Vec<Op>, show_output: bool, automatic: bool) -> Update<Msg> {
+        for op in &ops {
+            self.activity.queue(op, &self.snapshot, automatic);
+        }
         self.queue
             .extend(ops.into_iter().map(|op| (op, show_output)));
         let mut update = Update::redraw();
@@ -1096,16 +1121,19 @@ impl App {
     }
 
     fn start_next_op(&mut self) -> Option<Command<Msg>> {
-        if self.running.is_some() {
+        if self.activity.running() {
             return None;
         }
         let (op, show_output) = self.queue.pop_front()?;
         let label = op.label();
-        self.running = Some(if op.is_network() {
-            format!("{}…", label.trim_end_matches('d').trim_end_matches('e'))
-        } else {
-            label.clone()
-        });
+        let records_before = self
+            .repo
+            .runner()
+            .log()
+            .records()
+            .last()
+            .map(|record| record.id);
+        self.activity.start(records_before);
         let repo = self.repo.clone();
         let record = op.moves_head();
         let journal = op.journal();
@@ -1889,6 +1917,12 @@ impl App {
 
     /// Clicks on pane titles and their buttons. A double click on a title maximizes the pane.
     fn chrome_click(&mut self, id: &str, position: Point) -> Option<Update<Msg>> {
+        // Running work in the status bar: show the command log, with its live output.
+        if id == crate::view::STATUS_ACTIVITY {
+            self.command_log = true;
+            self.sync_panels();
+            return Some(Update::redraw());
+        }
         if let Some(rest) = id.strip_prefix("tabs-") {
             let (number, tab) = rest
                 .split_once('.')
@@ -2189,27 +2223,21 @@ impl App {
 
     fn tick(&mut self) -> Update<Msg> {
         self.persist();
-        let mut redraw = self.running.is_some();
-        if redraw {
-            self.spinner = self.spinner.wrapping_add(1);
-        }
-        if self
+        let toast_expired = self
             .toast
             .as_ref()
-            .is_some_and(|toast| Instant::now() > toast.until)
-        {
+            .is_some_and(|toast| Instant::now() > toast.until);
+        if toast_expired {
             self.toast = None;
-            redraw = true;
         }
-        if self
+        let pending_expired = self
             .pending_since
-            .is_some_and(|since| since.elapsed() > PENDING_TIMEOUT)
-        {
+            .is_some_and(|since| since.elapsed() > PENDING_TIMEOUT);
+        if pending_expired {
             self.pending.clear();
             self.pending_since = None;
-            redraw = true;
         }
-        let mut update = if redraw {
+        let mut update = if self.activity.expire() | toast_expired | pending_expired {
             Update::redraw()
         } else {
             Update::none()
@@ -2222,7 +2250,7 @@ impl App {
         };
         if poll > 0
             && self.last_poll.elapsed() >= Duration::from_secs(poll)
-            && self.running.is_none()
+            && !self.activity.busy()
         {
             self.last_poll = Instant::now();
             update = update
@@ -2231,13 +2259,13 @@ impl App {
         }
         let fetch = self.config.refresh.auto_fetch_seconds;
         if fetch > 0
-            && self.running.is_none()
+            && !self.activity.busy()
             && self.queue.is_empty()
             && self.last_fetch.elapsed() >= Duration::from_secs(fetch)
             && !self.snapshot.remotes.is_empty()
         {
             self.last_fetch = Instant::now();
-            update = update.merge(self.run_ops(vec![Op::Fetch(None)]));
+            update = update.merge(self.queue_ops(vec![Op::Fetch(None)], false, true));
         }
         update
     }
@@ -2359,7 +2387,7 @@ impl App {
     }
 
     fn finish_op(&mut self, result: &OpResult) -> Update<Msg> {
-        self.running = None;
+        self.activity.finish(result.result.is_ok());
         // Fetches, pulls and pushes may have changed pull requests.
         let pulls = (result.network && result.result.is_ok())
             .then(|| self.request_pull_requests(true))
@@ -2401,6 +2429,7 @@ impl App {
             }
             Err(error) => {
                 self.queue.clear();
+                self.activity.clear_queued();
                 let conflict = self.repo.operation() != RepoOperation::None;
                 if conflict {
                     self.toast(
@@ -2470,7 +2499,28 @@ fn parse_hit(id: &str) -> (Option<Window>, Option<(usize, usize)>) {
 }
 
 impl App {
+    /// End the load a current result completes.
+    fn end_load(&mut self, message: &Msg) {
+        use crate::activity::Load;
+        let load = match message {
+            Msg::Snapshot(generation, _) if *generation == self.snapshot_requested => {
+                Load::Repository
+            }
+            Msg::Main(generation, _) if *generation == self.main_generation => Load::Main,
+            Msg::CommitFiles(generation, _) if *generation == self.commit_files_generation => {
+                Load::CommitFiles
+            }
+            Msg::SubCommits(generation, _) if *generation == self.sub_commits_generation => {
+                Load::SubCommits
+            }
+            Msg::MoreCommits(_) => Load::MoreCommits,
+            _ => return,
+        };
+        self.activity.end(load);
+    }
+
     fn message(&mut self, message: Msg) -> Update<Msg> {
+        self.end_load(&message);
         match message {
             Msg::Snapshot(generation, snapshot) => {
                 if generation >= self.snapshot_loaded {
@@ -2548,15 +2598,17 @@ impl App {
             Msg::Watch => {
                 // The main watcher also sees prefill files that live inside the worktree.
                 let update = Update::none().maybe(self.check_commit_prefill());
-                if self.running.is_none() {
-                    update.maybe(self.refresh())
-                } else {
+                if self.activity.running() {
                     update
+                } else {
+                    update.maybe(self.refresh())
                 }
             }
             Msg::CommitSourcesChanged => Update::none().maybe(self.check_commit_prefill()),
             Msg::CommitPrefill(prefill) => self.apply_commit_prefill(*prefill),
             Msg::Tick => self.tick(),
+            Msg::Frame if self.activity.animating() => Update::redraw(),
+            Msg::Frame => Update::none(),
             Msg::InputFailed(error) => {
                 self.diagnostics.push(error);
                 self.quit = true;
@@ -2580,6 +2632,10 @@ impl Program for App {
             update = update.merge(Update::redraw());
         }
         update = update.maybe(command);
+        self.animating.store(
+            self.activity.animating(),
+            std::sync::atomic::Ordering::Relaxed,
+        );
         if self.quit {
             self.persist();
         }

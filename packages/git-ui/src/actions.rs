@@ -2662,6 +2662,10 @@ pub fn head_label(app: &App) -> Line {
     match &app.snapshot.head {
         Some(HeadState::Branch { name } | HeadState::Unborn { name }) => {
             spans.push(Span::styled(name.clone(), app.cx.branches.local(name)));
+            spans.extend(
+                app.activity
+                    .row_spans(&crate::activity::Subject::Branch(name.clone()), theme),
+            );
         }
         Some(HeadState::Detached { oid }) => {
             spans.push(Span::styled(

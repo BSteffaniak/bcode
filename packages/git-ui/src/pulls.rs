@@ -228,6 +228,7 @@ impl crate::app::App {
         let refresh = Duration::from_secs(self.config.pull_requests.refresh_seconds.max(30));
         let (source, repository, generation) = self.pulls.due(refresh, force)?;
         self.sync_pull_status();
+        self.activity.begin(crate::activity::Load::PullRequests);
         self.spawn(
             Some("pull-requests"),
             move || source.pull_requests(&repository),
@@ -263,6 +264,9 @@ impl crate::app::App {
         result: Result<PullRequestList, ForgeError>,
     ) -> bmux_tui_runtime::Update<crate::app::Msg> {
         let changed = self.pulls.answer(generation, result);
+        if !self.pulls.loading {
+            self.activity.end(crate::activity::Load::PullRequests);
+        }
         self.sync_pull_status();
         let update = bmux_tui_runtime::Update::redraw();
         if changed {

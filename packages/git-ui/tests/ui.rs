@@ -197,6 +197,19 @@ impl Harness {
         }
     }
 
+    /// Press a key without applying finished background work, so the screen shows work as it
+    /// runs; [`Self::drain`] applies it.
+    fn key_held(&mut self, key: &str) {
+        let stroke = bmux_keyboard::parse_key_stroke(key).unwrap();
+        self.app
+            .update(RuntimeEvent::Terminal(Event::Key(stroke)))
+            .unwrap();
+    }
+
+    fn drain(&mut self) {
+        self.app.drain_inline().unwrap();
+    }
+
     fn paste(&mut self, text: &str) {
         self.send(RuntimeEvent::Terminal(Event::Paste(text.to_owned())));
     }
@@ -2530,4 +2543,180 @@ fn other_forges_and_disabled_pull_requests_ask_nothing() {
 
 fn forge_repo_ignoring(path: &Path) {
     forge_repo(path);
+}
+
+/// A repository whose `main` tracks `origin/main` in a bare remote and is one commit ahead.
+fn ahead_of_origin(path: &Path, remote: &Path) {
+    git(
+        remote,
+        &["init", "--quiet", "--bare", "--initial-branch", "main"],
+    );
+    commit(path, "a", "a", "init");
+    git(
+        path,
+        &["remote", "add", "origin", &remote.to_string_lossy()],
+    );
+    git(path, &["push", "--quiet", "-u", "origin", "main"]);
+    commit(path, "b", "b", "second");
+}
+
+/// The local branch row of `main` (the side pane's part of its line).
+fn main_row(screen: &str) -> String {
+    screen
+        .lines()
+        .map(|line| line.chars().take(52).collect::<String>())
+        .find(|left| left.contains("✱ main") && !left.contains('●') && !left.contains('→'))
+        .unwrap_or_default()
+}
+
+fn status_bar(screen: &str) -> &str {
+    screen.lines().last().unwrap_or_default()
+}
+
+#[test]
+fn a_push_shows_on_its_branch_and_in_the_status_bar_while_it_runs() {
+    let remote = tempfile::tempdir().unwrap();
+    let mut harness = Harness::with_config(
+        |path| ahead_of_origin(path, remote.path()),
+        configured(
+            "[plugins.config.\"bcode.git\".ui.activity]\nanimate = false\nresult_ms = 1000\n",
+        ),
+    );
+    harness.keys(&["3"]);
+    assert!(
+        main_row(&harness.screen(160, 40)).contains("↑1"),
+        "{}",
+        harness.screen(160, 40)
+    );
+    harness.key_held("shift+p");
+    let screen = harness.screen(160, 40);
+    // Network work shows at once, with git's own progress.
+    let row = main_row(&screen);
+    assert!(row.contains("… pushing"), "{screen}");
+    assert!(row.contains('%'), "{screen}");
+    let bar = status_bar(&screen);
+    assert!(bar.contains("… Pushing main · Writing objects"), "{screen}");
+    // The remote and its branch show it too.
+    harness.drain();
+    let screen = harness.screen(160, 40);
+    let row = main_row(&screen);
+    assert!(row.contains("✓ pushed"), "{screen}");
+    assert!(!row.contains("↑1"), "{screen}");
+    assert!(!status_bar(&screen).contains("Pushing"), "{screen}");
+    // The result mark goes after a moment.
+    std::thread::sleep(std::time::Duration::from_millis(1100));
+    harness.send(RuntimeEvent::Message(bcode_git_ui::app::Msg::Tick));
+    let screen = harness.screen(160, 40);
+    assert!(!main_row(&screen).contains("pushed"), "{screen}");
+}
+
+#[test]
+fn a_failed_push_marks_its_branch() {
+    let remote = tempfile::tempdir().unwrap();
+    let mut harness = Harness::new(|path| {
+        ahead_of_origin(path, remote.path());
+        // A global `core.hooksPath` would bypass the remote's own hooks.
+        git(remote.path(), &["config", "core.hooksPath", "hooks"]);
+        let hook = remote.path().join("hooks/pre-receive");
+        std::fs::write(&hook, "#!/bin/sh\necho no pushes today >&2\nexit 1\n").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            std::fs::set_permissions(&hook, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+    });
+    harness.keys(&["3", "shift+p"]);
+    // Close the error popup to see the row behind it.
+    harness.keys(&["escape"]);
+    let screen = harness.screen(160, 40);
+    assert!(main_row(&screen).contains("✗ failed"), "{screen}");
+}
+
+#[test]
+fn quick_local_work_never_flashes_a_spinner() {
+    let mut harness = Harness::new(|path| {
+        commit(path, "a.txt", "a\n", "init");
+        std::fs::write(path.join("a.txt"), "changed\n").unwrap();
+    });
+    harness.keys(&["2"]);
+    harness.key_held("space");
+    let screen = harness.screen(120, 30);
+    assert!(
+        !screen
+            .chars()
+            .any(|c| ('\u{2800}'..='\u{28ff}').contains(&c)),
+        "{screen}"
+    );
+    assert!(!status_bar(&screen).contains("Staged"), "{screen}");
+    harness.drain();
+}
+
+#[test]
+fn automatic_fetches_show_only_in_the_status_bar() {
+    let remote = tempfile::tempdir().unwrap();
+    let mut harness = Harness::with_config(
+        |path| ahead_of_origin(path, remote.path()),
+        configured(
+            "[plugins.config.\"bcode.git\".ui.refresh]\nauto_fetch_seconds = 1\n\
+             [plugins.config.\"bcode.git\".ui.activity]\nanimate = false\n",
+        ),
+    );
+    harness.keys(&["3"]);
+    std::thread::sleep(std::time::Duration::from_millis(1100));
+    harness
+        .app
+        .update(RuntimeEvent::Message(bcode_git_ui::app::Msg::Tick))
+        .unwrap();
+    let screen = harness.screen(160, 40);
+    assert!(status_bar(&screen).contains("… Fetching"), "{screen}");
+    assert!(!main_row(&screen).contains("fetching"), "{screen}");
+    harness.drain();
+    let screen = harness.screen(160, 40);
+    assert!(!main_row(&screen).contains("fetched"), "{screen}");
+    assert!(!status_bar(&screen).contains("Fetching"), "{screen}");
+}
+
+#[test]
+fn clicking_running_work_opens_the_command_log() {
+    let remote = tempfile::tempdir().unwrap();
+    let mut harness = Harness::with_config(
+        |path| ahead_of_origin(path, remote.path()),
+        configured("[plugins.config.\"bcode.git\".ui.layout.command_log]\nshow = false\n"),
+    );
+    harness.keys(&["3"]);
+    assert!(!harness.screen(160, 40).contains("Command log"));
+    harness.key_held("shift+p");
+    harness.screen(160, 40);
+    harness.click("status-activity");
+    harness.drain();
+    let screen = harness.screen(160, 40);
+    assert!(screen.contains("Command log"), "{screen}");
+    assert!(screen.contains("git push"), "{screen}");
+}
+
+#[test]
+fn views_show_what_is_loading_into_them() {
+    let mut harness = Harness::with_config(
+        |path| {
+            commit(path, "a", "a", "init");
+            git(path, &["branch", "topic"]);
+        },
+        configured(
+            "[plugins.config.\"bcode.git\".ui.activity]\nanimate = false\nshow_delay_ms = 0\n",
+        ),
+    );
+    harness.keys(&["3"]);
+    let before = harness.screen(160, 40);
+    assert!(!before.contains('…'), "{before}");
+    // Opening a branch loads its commits into the side window and its log into the main view.
+    harness.key_held("enter");
+    let screen = harness.screen(160, 40);
+    let titled = screen
+        .lines()
+        .filter(|line| line.contains('┌') && line.contains('…'))
+        .count();
+    assert!(titled >= 1, "{screen}");
+    harness.drain();
+    let screen = harness.screen(160, 40);
+    assert!(!screen.contains('…'), "{screen}");
 }

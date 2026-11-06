@@ -306,6 +306,7 @@ colorful fallback derived from the theme's state colors and `accent`/`violet` pa
   [branch colors](git-ui.md#branch-colors)), and `git.branch.merged`, patched over a merged
   branch (dim by default)
 * `git.pr.open`, `git.pr.draft`, `git.pr.merged`, `git.pr.closed`: pull request markers
+* `git.activity`: spinners and progress of running work (bold accent by default)
 * `git.commit.sha`, `git.commit.author`, `git.commit.date`
 
 Graph lanes and author initials cycle through bright colors, kept apart from the state colors, so

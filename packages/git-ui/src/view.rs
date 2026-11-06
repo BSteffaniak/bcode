@@ -4,7 +4,9 @@ use std::cell::Cell;
 
 use bcode_git::models::{ChangeKind, CommandStatus, DiffFileStatus, StatusEntry, SubmoduleState};
 use bmux_tui::component::{Element, LayoutId};
-use bmux_tui::composition::{Column, Flex, Row as BoxRow, SizeBox, Stack, Surface, TextBlock};
+use bmux_tui::composition::{
+    Column, Flex, HitArea, Row as BoxRow, SizeBox, Stack, Surface, TextBlock,
+};
 use bmux_tui::geometry::{Insets, Rect, Size};
 use bmux_tui::style::{Modifier, Style};
 use bmux_tui::text::{Line, Span, Text, TextWrap};
@@ -31,6 +33,7 @@ use bmux_tui_components::text_input_box::{
 };
 
 use crate::actions::head_label;
+use crate::activity::{Load, Subject};
 use crate::app::{App, Row, ScreenMode, View, Window};
 use crate::config::{MainSplit, Portrait};
 use crate::data::{FileNode, SectionKind, commit_line, format_time, status_style};
@@ -265,6 +268,10 @@ fn row_line(app: &App, row: Row) -> Line {
                 Span::styled(if branch.is_head { "✱ " } else { "  " }, style),
                 Span::styled(branch.name.clone(), style),
             ];
+            spans.extend(
+                app.activity
+                    .row_spans(&Subject::Branch(branch.name.clone()), theme),
+            );
             if branch.upstream_gone {
                 spans.push(Span::styled(" ⊘ gone", theme.error));
             } else if branch.upstream.is_some() {
@@ -295,38 +302,56 @@ fn row_line(app: &App, row: Row) -> Line {
                 .iter()
                 .filter(|branch| branch.remote == remote.name)
                 .count();
-            Line::from_spans(vec![
+            let mut spans = vec![
                 Span::styled("☁ ", theme.branch_remote),
                 Span::styled(
                     remote.name.clone(),
                     theme.branch_remote.add_modifier(Modifier::BOLD),
                 ),
-                Span::styled(format!("  {count} branches"), theme.muted),
-                Span::styled(
-                    format!("  {}", remote.fetch_url.clone().unwrap_or_default()),
-                    theme.muted,
-                ),
-            ])
+            ];
+            spans.extend(
+                app.activity
+                    .row_spans(&Subject::Remote(remote.name.clone()), theme),
+            );
+            spans.push(Span::styled(format!("  {count} branches"), theme.muted));
+            spans.push(Span::styled(
+                format!("  {}", remote.fetch_url.clone().unwrap_or_default()),
+                theme.muted,
+            ));
+            Line::from_spans(spans)
         }
         Row::RemoteBranch(index) => {
             let branch = &snapshot.remote_branches[index];
             let (_, style) = app.cx.branches.remote(&branch.name);
-            Line::from_spans(vec![
+            let mut spans = vec![
                 Span::styled(
                     format!("{:>3} ", format_time(branch.commit_time, true)),
                     theme.date,
                 ),
                 Span::styled(branch.name.clone(), style),
-                Span::styled(format!("  {}", branch.summary), theme.muted),
-            ])
+            ];
+            spans.extend(app.activity.row_spans(
+                &Subject::RemoteBranch {
+                    remote: branch.remote.clone(),
+                    name: branch.name.clone(),
+                },
+                theme,
+            ));
+            spans.push(Span::styled(format!("  {}", branch.summary), theme.muted));
+            Line::from_spans(spans)
         }
         Row::Tag(index) => {
             let tag = &snapshot.tags[index];
-            Line::from_spans(vec![
+            let mut spans = vec![
                 Span::styled(if tag.annotated { "◆ " } else { "◇ " }, theme.tag),
                 Span::styled(tag.name.clone(), theme.tag),
-                Span::styled(format!("  {}", tag.summary), theme.muted),
-            ])
+            ];
+            spans.extend(
+                app.activity
+                    .row_spans(&Subject::Tag(tag.name.clone()), theme),
+            );
+            spans.push(Span::styled(format!("  {}", tag.summary), theme.muted));
+            Line::from_spans(spans)
         }
         Row::SubCommit(index) => app.sub_commits.as_ref().map_or_else(Line::new, |sub| {
             commit_line(
@@ -839,6 +864,20 @@ fn title_suffix(app: &App, view: View) -> Vec<Span> {
     if let Some(filter) = app.filters.get(&view).filter(|filter| !filter.is_empty()) {
         spans.push(Span::styled(format!(" /{filter}"), theme.warning));
     }
+    // What is loading into this view.
+    let load = match view {
+        View::Status => Some((Load::Repository, "")),
+        View::Branches => Some((Load::PullRequests, " PRs")),
+        View::Commits => Some((Load::MoreCommits, " more")),
+        View::CommitFiles => Some((Load::CommitFiles, "")),
+        View::SubCommits => Some((Load::SubCommits, "")),
+        _ => None,
+    };
+    if let Some((_, label)) = load.filter(|(load, _)| app.activity.loading(*load)) {
+        spans.push(Span::raw(" "));
+        spans.push(app.activity.spinner_span(theme.activity));
+        spans.push(Span::styled(label, theme.muted));
+    }
     spans.push(Span::raw(" "));
     spans
 }
@@ -1040,16 +1079,23 @@ fn main_column<'a>(app: &'a App, frame: &'a Frame) -> Element<'a> {
         .map_or(0, |main| main.sections.len())
         .min(2);
     if sections == 0 {
-        let loading = TextBlock::new(Text::from_lines(vec![Line::from_spans(vec![
-            Span::styled(
-                if app.loaded_once {
-                    ""
-                } else {
-                    "  Loading repository…"
-                },
-                theme.muted,
-            ),
-        ])]));
+        let spans = if app.loaded_once && !app.activity.loading(Load::Main) {
+            Vec::new()
+        } else {
+            vec![
+                Span::raw("  "),
+                app.activity.spinner_span(theme.activity),
+                Span::styled(
+                    if app.loaded_once {
+                        " Loading…"
+                    } else {
+                        " Loading repository…"
+                    },
+                    theme.muted,
+                ),
+            ]
+        };
+        let loading = TextBlock::new(Text::from_lines(vec![Line::from_spans(spans)]));
         column = column.flex(Flex::new(
             1,
             pane(
@@ -1088,6 +1134,11 @@ fn main_column<'a>(app: &'a App, frame: &'a Frame) -> Element<'a> {
             app.main.as_ref().map(|main| &main.request)
         {
             title.push(Span::styled(format!("{} ", entry.path), theme.text));
+        }
+        // The old content stays while new content loads.
+        if section == 0 && app.activity.loading(Load::Main) {
+            title.push(app.activity.spinner_span(theme.activity));
+            title.push(Span::raw(" "));
         }
         if focused && app.staging.is_some() {
             let mode = match app.staging {
@@ -1215,13 +1266,14 @@ fn command_log(app: &App) -> Element<'_> {
     };
     let mut entries = Column::new();
     for record in &app.log_records {
-        let (mark, style) = match record.status {
-            CommandStatus::Running => ("● ", theme.warning),
-            CommandStatus::Succeeded => ("✓ ", theme.success),
-            CommandStatus::Failed => ("✗ ", theme.error),
+        let mark = match record.status {
+            CommandStatus::Running => app.activity.spinner_span(theme.activity),
+            CommandStatus::Succeeded => Span::styled("✓", theme.success),
+            CommandStatus::Failed => Span::styled("✗", theme.error),
         };
         let mut header = vec![
-            Span::styled(mark, style),
+            mark,
+            Span::raw(" "),
             Span::styled(record.display(), theme.text),
         ];
         if !record.running() {
@@ -1363,8 +1415,6 @@ fn hints(app: &App) -> Line {
     Line::from_spans(spans)
 }
 
-const SPINNER: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
-
 fn status_bar(app: &App) -> Element<'_> {
     let theme = &app.theme;
     let mut right = Vec::new();
@@ -1381,12 +1431,12 @@ fn status_bar(app: &App) -> Element<'_> {
             theme.warning,
         ));
     }
-    if let Some(running) = &app.running {
-        right.push(Span::styled(
-            format!("{} {running} ", SPINNER[app.spinner % SPINNER.len()]),
-            theme.accent.add_modifier(Modifier::BOLD),
-        ));
-    } else if let Some(toast) = &app.toast {
+    // Running work shows over messages; clicking it opens the command log, which shows its
+    // live output.
+    let activity = app.activity.status_spans(theme);
+    if activity.is_none()
+        && let Some(toast) = &app.toast
+    {
         right.push(Span::styled(
             format!(
                 "{} {} ",
@@ -1400,18 +1450,24 @@ fn status_bar(app: &App) -> Element<'_> {
             },
         ));
     }
-    Element::new(
-        BoxRow::new()
-            .flex_child(
-                1,
-                TextBlock::new(Text::from_lines(vec![hints(app)])).wrap(TextWrap::None),
-            )
-            .child(
-                TextBlock::new(Text::from_lines(vec![Line::from_spans(right)]))
-                    .wrap(TextWrap::None),
-            ),
-    )
+    let text = |spans| TextBlock::new(Text::from_lines(vec![Line::from_spans(spans)]));
+    let mut row = BoxRow::new()
+        .flex_child(
+            1,
+            TextBlock::new(Text::from_lines(vec![hints(app)])).wrap(TextWrap::None),
+        )
+        .child(text(right).wrap(TextWrap::None));
+    if let Some(activity) = activity {
+        row = row.child(HitArea::new(
+            STATUS_ACTIVITY,
+            text(activity).wrap(TextWrap::None),
+        ));
+    }
+    Element::new(row)
 }
+
+/// Hit region of the running work in the status bar.
+pub const STATUS_ACTIVITY: &str = "status-activity";
 
 /// Build the whole screen.
 #[must_use]
@@ -1461,7 +1517,7 @@ pub fn tree<'a>(app: &'a App, frame: &'a Frame) -> Element<'a> {
     };
     let mut screen = Column::new().flex(Flex::new(1, body));
     // A hidden status bar still appears while work runs or a message is showing.
-    if layout.status_bar || app.running.is_some() || app.toast.is_some() || !app.pending.is_empty()
+    if layout.status_bar || app.activity.running() || app.toast.is_some() || !app.pending.is_empty()
     {
         screen = screen.child(SizeBox::new(status_bar(app)).height(1));
     }

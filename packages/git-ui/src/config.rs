@@ -49,6 +49,8 @@ pub struct GitUiConfig {
     pub highlight: HighlightConfig,
     /// Refresh settings.
     pub refresh: RefreshConfig,
+    /// How running work is shown.
+    pub activity: ActivityConfig,
     /// Confirmation settings.
     pub confirm: ConfirmConfig,
     /// Editor command; defaults to `$GIT_EDITOR`, `$VISUAL`, `$EDITOR`, then `vi`.
@@ -80,6 +82,7 @@ impl Default for GitUiConfig {
             show_graph: true,
             highlight: HighlightConfig::default(),
             refresh: RefreshConfig::default(),
+            activity: ActivityConfig::default(),
             confirm: ConfirmConfig::default(),
             editor: None,
             relative_dates: true,
@@ -404,6 +407,47 @@ impl Default for RefreshConfig {
             watch: true,
             poll_seconds: 10,
             auto_fetch_seconds: 0,
+        }
+    }
+}
+
+/// Spinner frames: a preset name or the frames themselves.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(untagged)]
+pub enum SpinnerSetting {
+    /// `braille`, `dot` or `ascii`.
+    Preset(String),
+    /// Frames shown in order.
+    Frames(Vec<String>),
+}
+
+/// How running work is shown (`[activity]`): spinners on what it affects, git's progress,
+/// and a brief result mark.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct ActivityConfig {
+    /// Spinner: `braille`, `dot`, `ascii`, or a list of frames.
+    pub spinner: SpinnerSetting,
+    /// Milliseconds each spinner frame shows.
+    pub rate_ms: u64,
+    /// Milliseconds local work runs before it shows (network work shows at once), so quick
+    /// work does not flicker.
+    pub show_delay_ms: u64,
+    /// Milliseconds a finished operation's `✓` or `✗` stays on what it affected; `0` turns
+    /// the mark off.
+    pub result_ms: u64,
+    /// Animate spinners; when off, running work shows a still `…`.
+    pub animate: bool,
+}
+
+impl Default for ActivityConfig {
+    fn default() -> Self {
+        Self {
+            spinner: SpinnerSetting::Preset("braille".into()),
+            rate_ms: 80,
+            show_delay_ms: 150,
+            result_ms: 1500,
+            animate: true,
         }
     }
 }
