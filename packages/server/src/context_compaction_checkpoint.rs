@@ -1,5 +1,9 @@
 //! Local synthesis checkpoints: bounded operational evidence, never model instructions.
 
+#[cfg(test)]
+#[path = "context_compaction_recovery_report_tests.rs"]
+mod recovery_report_tests;
+
 use super::*;
 use sha2::Sha256;
 
@@ -1602,6 +1606,8 @@ fn validate_restart_tail(
     for event in events.iter().skip(1) {
         match &event.kind {
             SessionEventKind::TraceEvent { trace }
+                if trace.turn_id.as_deref() == owner && recovery_failure_report(trace) => {}
+            SessionEventKind::TraceEvent { trace }
                 if trace.turn_id.as_deref() == owner
                     && matches!(&trace.payload, SessionTracePayload::ProviderEvent { event_type, detail: None }
                         if event_type == bcode_session_models::PROVIDER_RETRY_CHECKPOINT_EVENT) => {
@@ -1830,6 +1836,13 @@ fn validate_settled_attempts(
             continue;
         };
         match trace.phase {
+            SessionTracePhase::ContextCompactionFinished if recovery_failure_report(trace) => {
+                // Recovery reports do not begin or finish synthesis. Only an already closed
+                // activation with the same owner may contribute this diagnostic.
+                if active || owner.as_ref() != Some(&trace.turn_id) {
+                    return Err(invalid_checkpoint());
+                }
+            }
             SessionTracePhase::ContextCompactionFinished => {
                 if !active || owner.as_ref().is_some_and(|value| value != &trace.turn_id) {
                     return Err(invalid_checkpoint());
@@ -1856,6 +1869,16 @@ fn validate_settled_attempts(
         return Err(invalid_checkpoint());
     }
     Ok(())
+}
+
+/// A failed recovery is a diagnostic about a closed attempt, not another terminal attempt.
+fn recovery_failure_report(trace: &SessionTraceEvent) -> bool {
+    trace.phase == SessionTracePhase::ContextCompactionFinished
+        && matches!(&trace.payload, SessionTracePayload::ContextCompaction {
+            reason, compacted: false, message: Some(message), ..
+        } if reason == "compaction_recovery_failed"
+            && message.starts_with("context compaction failed:")
+            && message.ends_with("; boundary unchanged"))
 }
 
 type RestartRequestUsages = BTreeSet<(String, String)>;
@@ -4043,11 +4066,23 @@ mod tests {
         .await;
     }
 
+    #[tokio::test]
+    async fn manual_compaction_recovers_after_failed_policy_recovery() {
+        Box::pin(automatic_policy_recovery_case(
+            false,
+            false,
+            true,
+            RecoverySource::RecoveryFailed,
+        ))
+        .await;
+    }
+
     #[derive(Clone, Copy)]
     enum RecoverySource {
         Frozen,
         Expanded,
         ManualExpanded,
+        RecoveryFailed,
     }
 
     #[tokio::test]
@@ -4086,7 +4121,10 @@ mod tests {
         manual: bool,
         source: RecoverySource,
     ) {
-        let expand = !matches!(source, RecoverySource::Frozen);
+        let expand = matches!(
+            source,
+            RecoverySource::Expanded | RecoverySource::ManualExpanded
+        );
         let manual_expansion = matches!(source, RecoverySource::ManualExpanded);
         let _guard = bcode_fake_provider_plugin::fake_compaction_test_guard().await;
         let root = tempfile::tempdir().unwrap();
@@ -4328,6 +4366,11 @@ mod tests {
         append_context_compaction_trace(&state, id, CompactionTraceKind::Finished,
             "compaction_finished", 0, false,
             Some("context compaction failed: invalid or incompatible compaction checkpoint; boundary unchanged".into())).await;
+        if matches!(source, RecoverySource::RecoveryFailed) {
+            append_context_compaction_trace(&state, id, CompactionTraceKind::Finished,
+                "compaction_recovery_failed", 0, false,
+                Some("context compaction failed: invalid or incompatible compaction checkpoint; boundary unchanged".into())).await;
+        }
         let result = if manual {
             let completion = crate::session_operations::compact(&state, ClientId::new(), id)
                 .await

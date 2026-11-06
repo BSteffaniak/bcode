@@ -319,8 +319,8 @@ async fn prepare_compaction_recovery_with_policy(
             SessionEventKind::TraceEvent { trace }
                 if trace.phase == SessionTracePhase::ContextCompactionFinished
                     && matches!(&trace.payload, SessionTracePayload::ContextCompaction {
-                        compacted: false, message: Some(message), ..
-                    } if message.starts_with("context compaction failed:")))
+                        reason, compacted: false, message: Some(message), ..
+                    } if reason == "compaction_finished" && message.starts_with("context compaction failed:")))
     });
     let Some(terminal) = terminal else {
         return Ok(blocked(Blocker::EvidenceUnavailable));

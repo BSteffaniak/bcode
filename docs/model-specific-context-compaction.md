@@ -491,6 +491,13 @@ Successful responses reset consecutive backoff/policy counters, not cumulative c
 poll consumers use the same output-before-error and cancellation rules. Consolidation uses the
 same bounded retry path.
 
+A failed policy-recovery diagnostic is not a second synthesis attempt or terminal outcome.
+Recovery discovery selects the actual `compaction_finished` rejection; intervening
+`compaction_recovery_failed` reports are accepted only after a closed activation with the same
+owner, and remain part of the exact compare-and-supersede evidence. This lets a later manual
+Compact replace known incompatible work without deleting the old checkpoint, reopening an
+activation, settling an unknown provider response, or advancing the context boundary on failure.
+
 Blocked proactive operations are reported once per activation and are not dispatched on every
 subsequent tool round. Ordinary generation may continue only while the normal input-capacity
 check permits it; capacity exhaustion reports explicit recovery-required failure. Semantic
