@@ -2092,3 +2092,126 @@ fn command_log_shows_hook_output_from_a_terminal() {
         "{screen}"
     );
 }
+
+/// Style of the first cell of the first `text` on screen in a line containing `context`.
+fn style_at(harness: &mut Harness, text: &str, context: &str) -> bmux_tui::style::Style {
+    use bmux_tui::geometry::Point;
+
+    let screen = harness.screen(160, 40);
+    let buffer = bcode_git_ui::render_buffer(&mut harness.app, 160, 40);
+    let (y, line) = screen
+        .lines()
+        .enumerate()
+        .find(|(_, line)| line.contains(text) && line.contains(context))
+        .unwrap_or_else(|| panic!("no {text:?} with {context:?}: {screen}"));
+    let x = line[..line.find(text).unwrap()].chars().count();
+    buffer
+        .get(Point::new(
+            u16::try_from(x).unwrap(),
+            u16::try_from(y).unwrap(),
+        ))
+        .unwrap()
+        .style
+}
+
+const FEATURE_RULE: &str = "[plugins.config.\"bcode.git\".ui.branches]\n\
+    colors = [{ pattern = \"^feature/\", color = \"magenta\" }]\n";
+
+#[test]
+fn branch_colors_follow_rules_and_match_across_views() {
+    use bmux_tui::style::{Color, Modifier};
+
+    let config = configured(&format!("{FEATURE_RULE}dim_merged = false\n"));
+    let mut harness = Harness::with_config(
+        |path| {
+            commit(path, "a", "a", "init");
+            git(path, &["branch", "feature/x"]);
+        },
+        config,
+    );
+    harness.keys(&["3"]);
+    let listed = style_at(&mut harness, "feature/x", "init");
+    assert_eq!(listed.fg, Some(Color::Magenta));
+    let current = style_at(&mut harness, "main", "✱");
+    assert!(current.modifiers.contains(Modifier::BOLD));
+    assert_ne!(current.fg, listed.fg);
+    // The same branch on a commit in the commits list has the same color.
+    harness.keys(&["4"]);
+    let labelled = style_at(&mut harness, "feature/x", "✱ main");
+    assert_eq!(labelled.fg, listed.fg);
+    assert_eq!(style_at(&mut harness, "main", "✱ main").fg, current.fg);
+}
+
+#[test]
+fn merged_branches_are_dimmed_but_never_the_current_one() {
+    use bmux_tui::style::Modifier;
+
+    let mut harness = Harness::new(|path| {
+        commit(path, "a", "a", "init");
+        git(path, &["branch", "old"]);
+        git(path, &["checkout", "--quiet", "-b", "open"]);
+        commit(path, "a", "b", "work");
+        git(path, &["checkout", "--quiet", "main"]);
+        commit(path, "a", "c", "more");
+    });
+    harness.keys(&["3"]);
+    assert!(
+        style_at(&mut harness, "old", "init")
+            .modifiers
+            .contains(Modifier::DIM)
+    );
+    assert!(
+        !style_at(&mut harness, "open", "work")
+            .modifiers
+            .contains(Modifier::DIM)
+    );
+    assert!(
+        !style_at(&mut harness, "main", "✱")
+            .modifiers
+            .contains(Modifier::DIM)
+    );
+}
+
+#[test]
+fn remote_branches_keep_the_remote_color_for_their_prefix() {
+    let config = configured(
+        "[plugins.config.\"bcode.git\".ui.branches]\n\
+         colors = [{ pattern = \"^feature/\", color = \"#ff8800\" }]\n",
+    );
+    let mut harness = Harness::with_config(
+        |path| {
+            commit(path, "a", "a", "init");
+            let remote = path.join(".git").join("remote.git");
+            git(
+                path,
+                &["init", "--quiet", "--bare", remote.to_str().unwrap()],
+            );
+            git(path, &["remote", "add", "origin", remote.to_str().unwrap()]);
+            git(path, &["push", "--quiet", "origin", "main:feature/x"]);
+            git(path, &["fetch", "--quiet", "origin"]);
+        },
+        config,
+    );
+    harness.keys(&["4"]);
+    let prefix = style_at(&mut harness, "origin/feature/x", "✱ main");
+    let name = style_at(&mut harness, "feature/x init", "✱ main");
+    assert_eq!(name.fg, Some(bmux_tui::style::Color::Rgb(255, 136, 0)));
+    assert_ne!(prefix.fg, name.fg);
+}
+
+#[test]
+fn branch_help_explains_the_colors() {
+    let mut harness = Harness::with_config(
+        |path| commit(path, "a", "a", "init"),
+        configured(FEATURE_RULE),
+    );
+    harness.keys(&["3", "?"]);
+    let screen = harness.screen(160, 50);
+    assert!(screen.contains("Branch colors"), "{screen}");
+    assert!(screen.contains("/^feature//"), "{screen}");
+    assert!(screen.contains("behind  has commits to pull"), "{screen}");
+    assert!(screen.contains("merged into the base branch"), "{screen}");
+    // Views without branch names do not show it.
+    harness.keys(&["escape", "2", "?"]);
+    assert!(!harness.screen(160, 50).contains("Branch colors"));
+}

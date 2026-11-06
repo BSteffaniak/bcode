@@ -119,6 +119,8 @@ pub struct Menu {
     pub selected: usize,
     /// List state.
     pub list: Cell<SelectableListState>,
+    /// Lines shown above the items (for example a color legend).
+    pub notes: Vec<Line>,
 }
 
 impl Menu {
@@ -131,7 +133,15 @@ impl Menu {
             filter: None,
             selected: 0,
             list: Cell::new(SelectableListState::new(Some(0))),
+            notes: Vec::new(),
         }
+    }
+
+    /// The same menu with `notes` shown above its items.
+    #[must_use]
+    pub fn with_notes(mut self, notes: Vec<Line>) -> Self {
+        self.notes = notes;
+        self
     }
 
     /// Create a menu filtered by typing.

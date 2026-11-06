@@ -224,16 +224,9 @@ fn row_line(app: &App, row: Row) -> Line {
             let current = worktree.path == app.repo.root();
             Line::from_spans(vec![
                 Span::styled(if current { "● " } else { "  " }, theme.success),
-                Span::styled(
-                    worktree
-                        .branch
-                        .clone()
-                        .unwrap_or_else(|| "(detached)".into()),
-                    if current {
-                        theme.branch_head
-                    } else {
-                        theme.branch_local
-                    },
+                worktree.branch.as_ref().map_or_else(
+                    || Span::styled("(detached)", theme.warning),
+                    |branch| Span::styled(branch.clone(), app.cx.branches.local(branch)),
                 ),
                 Span::styled(format!("  {}", worktree.path.display()), theme.muted),
                 Span::styled(if worktree.locked { "  locked" } else { "" }, theme.warning),
@@ -262,20 +255,15 @@ fn row_line(app: &App, row: Row) -> Line {
         }
         Row::Branch(index) => {
             let branch = &snapshot.branches[index];
+            // The name's color says what state the branch is in (or what a rule says).
+            let style = app.cx.branches.local(&branch.name);
             let mut spans = vec![
                 Span::styled(
                     format!("{:>3} ", format_time(branch.commit_time, true)),
                     theme.date,
                 ),
-                Span::styled(if branch.is_head { "✱ " } else { "  " }, theme.branch_head),
-                Span::styled(
-                    branch.name.clone(),
-                    if branch.is_head {
-                        theme.branch_head.add_modifier(Modifier::BOLD)
-                    } else {
-                        theme.hashed(&branch.name)
-                    },
-                ),
+                Span::styled(if branch.is_head { "✱ " } else { "  " }, style),
+                Span::styled(branch.name.clone(), style),
             ];
             if branch.upstream_gone {
                 spans.push(Span::styled(" ⊘ gone", theme.error));
@@ -319,12 +307,13 @@ fn row_line(app: &App, row: Row) -> Line {
         }
         Row::RemoteBranch(index) => {
             let branch = &snapshot.remote_branches[index];
+            let (_, style) = app.cx.branches.remote(&branch.name);
             Line::from_spans(vec![
                 Span::styled(
                     format!("{:>3} ", format_time(branch.commit_time, true)),
                     theme.date,
                 ),
-                Span::styled(branch.name.clone(), theme.hashed(&branch.name)),
+                Span::styled(branch.name.clone(), style),
                 Span::styled(format!("  {}", branch.summary), theme.muted),
             ])
         }
@@ -345,6 +334,7 @@ fn row_line(app: &App, row: Row) -> Line {
                     .flatten(),
                 false,
                 theme,
+                &app.cx.branches,
                 app.cx.relative_dates,
             )
         }),
@@ -358,6 +348,7 @@ fn row_line(app: &App, row: Row) -> Line {
                     .flatten(),
                 snapshot.unpushed.contains(&commit.oid),
                 theme,
+                &app.cx.branches,
                 app.cx.relative_dates,
             );
             if app.cherry.iter().any(|copied| copied.oid == commit.oid) {
@@ -928,16 +919,13 @@ fn window_title(app: &App, window: Window, view: View) -> Line {
             ));
         }
         View::SubCommits => {
-            spans.push(Span::styled(
-                format!(
-                    "Commits · {}",
-                    app.sub_commits
-                        .as_ref()
-                        .map(|sub| sub.title.clone())
-                        .unwrap_or_default()
-                ),
-                title_style,
-            ));
+            spans.push(Span::styled("Commits · ", title_style));
+            // A branch's commits: its name in its branch color.
+            if let Some(sub) = &app.sub_commits {
+                for (text, style) in app.cx.branches.reference(&sub.title) {
+                    spans.push(Span::styled(text, style.add_modifier(Modifier::BOLD)));
+                }
+            }
         }
         View::CommitFiles => {
             spans.push(Span::styled(
@@ -1538,10 +1526,12 @@ fn popup<'a>(app: &'a App, frame: &'a Frame) -> Option<Element<'a>> {
     match app.popups.last()? {
         Popup::Menu(menu) => {
             let visible = frame.popup.len();
+            let notes = u16::try_from(menu.notes.len()).unwrap_or(u16::MAX);
             let height = u16::try_from(visible)
                 .unwrap_or(u16::MAX)
                 .saturating_add(if menu.filter.is_some() { 7 } else { 4 })
-                .min(30);
+                .saturating_add(notes)
+                .min(30u16.saturating_add(notes));
             let items = list(
                 app,
                 crate::scroll::MENU_LIST.into(),
@@ -1552,6 +1542,11 @@ fn popup<'a>(app: &'a App, frame: &'a Frame) -> Option<Element<'a>> {
                 POPUP_SCROLLBAR,
             );
             let mut column = Column::new();
+            if !menu.notes.is_empty() {
+                column = column.child(
+                    TextBlock::new(Text::from_lines(menu.notes.clone())).wrap(TextWrap::None),
+                );
+            }
             if let Some(filter) = &menu.filter {
                 column = column.child(
                     TextInputBoxComponent::new(

@@ -2159,10 +2159,27 @@ impl App {
     fn help(&mut self) -> Update<Msg> {
         let scopes = self.help_scopes();
         let items = self.action_items(&scopes);
-        self.open(Popup::Menu(Menu::filtered(
-            format!("Keybindings · {}", self.current_view().label()),
-            items,
-        )))
+        let view = self.current_view();
+        let mut menu = Menu::filtered(format!("Keybindings · {}", view.label()), items);
+        // Views that color branch names explain what the colors mean.
+        if matches!(
+            view,
+            View::Branches
+                | View::RemoteBranches
+                | View::Commits
+                | View::SubCommits
+                | View::Worktrees
+        ) {
+            let theme = &self.theme;
+            let mut notes = vec![Line::from_spans(vec![Span::styled(
+                "Branch colors",
+                theme.title,
+            )])];
+            notes.extend(self.cx.branches.legend(theme));
+            notes.push(Line::new());
+            menu = menu.with_notes(notes);
+        }
+        self.open(Popup::Menu(menu))
     }
 
     fn palette(&mut self) -> Update<Msg> {
@@ -2640,7 +2657,7 @@ pub fn head_label(app: &App) -> Line {
     ];
     match &app.snapshot.head {
         Some(HeadState::Branch { name } | HeadState::Unborn { name }) => {
-            spans.push(Span::styled(name.clone(), theme.branch_head));
+            spans.push(Span::styled(name.clone(), app.cx.branches.local(name)));
         }
         Some(HeadState::Detached { oid }) => {
             spans.push(Span::styled(

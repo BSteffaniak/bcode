@@ -300,10 +300,16 @@ colorful fallback derived from the theme's state colors and `accent`/`violet` pa
 * `git.status.staged`, `git.status.unstaged`, `git.status.untracked`, `git.status.conflict`
 * `git.directory`
 * `git.branch.head`, `git.branch.local`, `git.branch.remote`, `git.tag`
+* `git.branch.state.current`, `git.branch.state.synced`, `git.branch.state.ahead`,
+  `git.branch.state.behind`, `git.branch.state.diverged`, `git.branch.state.gone`,
+  `git.branch.state.local`: branch names by state (see the git client's
+  [branch colors](git-ui.md#branch-colors)), and `git.branch.merged`, patched over a merged
+  branch (dim by default)
 * `git.commit.sha`, `git.commit.author`, `git.commit.date`
 
-Graph lanes, authors and branch names cycle through a palette built from the theme's accent, state
-and violet colors so each keeps a stable color.
+Graph lanes and author initials cycle through bright colors, kept apart from the state colors, so
+each keeps a stable color without reading as a branch state. Palette entries `blue` and `orange`,
+when a theme defines them, color `ahead` and `diverged` branches.
 
 ## Reload and errors
 

@@ -241,6 +241,12 @@ wrap_lines = true               # wrap long diff lines; continuation rows keep t
 [staging]
 hunk_mode = false               # start the staging view selecting whole hunks
 
+[branches]
+dim_merged = true               # dim branches already merged into the base branch
+colors = [                      # checked in order before the state colors; see Branch colors
+  { pattern = "^release/", color = "bright-cyan", bold = true },
+]
+
 [refresh]
 watch = true                    # filesystem watching; falls back to polling
 poll_seconds = 10
@@ -309,6 +315,52 @@ initial_window = "files"
 tree = false
 ```
 
+### Branch colors
+
+A branch name's color says something about the branch, and the same branch has the same color
+everywhere it appears: the branches list, branch labels on commits (in the commits list and the
+commit details), sub-commit titles, worktrees and the status overview. By default the color
+shows the branch's state:
+
+| State | Meaning | Default color |
+|---|---|---|
+| `current` | Checked out here (also marked `✱`) | bold green |
+| `synced` | Level with its upstream | accent (cyan) |
+| `ahead` | Has commits to push (`↑N`) | blue |
+| `behind` | Has commits to pull (`↓N`) | yellow |
+| `diverged` | Both (`↑N ↓M`) | orange (bright red without a theme `orange`) |
+| `gone` | Its upstream was deleted (`⊘ gone`) | red |
+| `local` | Has no upstream | normal text |
+
+With `dim_merged` (the default), branches already merged into the base branch, so safe to
+delete, are dimmed on top of their color. The base branch is the remote's default branch
+(`origin/HEAD`), else a local `main` or `master`; the current branch is never dimmed.
+
+Rules in `[branches] colors` are checked first, in order; the first that applies sets the color
+(and `bold`), and a branch no rule applies to keeps its state's color. A rule can name a
+`pattern` (a regular expression over the branch name), a `state` (one state or a list), or both,
+in which case both must hold:
+
+```toml
+[plugins.config."bcode.git".ui.branches]
+colors = [
+  { pattern = "^(main|master|develop)$", color = "blue", bold = true },
+  { pattern = "^feature/", state = "ahead", color = "magenta" },
+  { state = ["behind", "diverged"], color = "#ff8800" },
+]
+```
+
+Colors are names (`cyan`, `bright-magenta`, `gray`, …), `#rrggbb`, or a color from the theme's
+palette. A rule without `color` keeps the state color and only adds `bold`. Invalid patterns and
+unknown colors are reported at startup and skipped. A rule matching the current branch also
+overrides its green; put `{ state = "current", color = "green", bold = true }` first to keep it.
+
+Remote branches have no state of their own: in `origin/feature/x` the `origin/` prefix is in the
+remote color (purple by default), and the branch part takes the first rule without a `state`
+whose `pattern` (if any) matches, else the remote color too. Author initials and graph lanes use a separate set
+of bright colors, so they are not mistaken for a branch state. `?` on a view showing branches
+starts with a legend of these colors.
+
 ### Commit message prefill
 
 A new commit editor starts with the first message found in these sources:
@@ -363,7 +415,8 @@ draft file and open the editor with `c`.
 `bcode-git --import-lazygit [CONFIG_YML]` (or `bcode git --import-lazygit`) prints settings
 converted from a lazygit `config.yml`, as a dedicated config file. Without a path it uses `$LG_CONFIG_FILE` or lazygit's default
 location. The output covers layout, file tree, diff context and line wrapping, staging hunk
-mode, commit message wrapping and hook-skip prefix, graph, refresh settings and keybindings;
+mode, commit message wrapping and hook-skip prefix, graph, refresh settings, branch color
+patterns (`gui.branchColorPatterns`, and the older `gui.branchColors`) and keybindings;
 values equal to bcode's defaults are left out, and anything without a bcode equivalent, or a key a
 panel binding would shadow, is listed in `# note:` comments. Review it and
 append it to a dedicated file, or add `--nested` for the `bcode.toml` form:

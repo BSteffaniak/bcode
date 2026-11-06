@@ -829,3 +829,50 @@ fn terminal_output_is_capped_and_marked_truncated() {
         10
     );
 }
+
+#[test]
+fn merged_branches_are_those_already_in_the_base_branch() {
+    let repo = TempRepo::init();
+    // No base branch yet: nothing is reported as merged.
+    git(repo.path(), &["checkout", "--quiet", "-b", "work"]);
+    repo.write("f", b"1\n");
+    repo.commit_all("one");
+    assert_eq!(repo.repo.base_branch().unwrap(), None);
+    assert!(repo.repo.merged_branches().unwrap().is_empty());
+
+    git(repo.path(), &["branch", "main"]);
+    git(repo.path(), &["checkout", "--quiet", "main"]);
+    git(repo.path(), &["branch", "done"]);
+    git(repo.path(), &["checkout", "--quiet", "-b", "open"]);
+    repo.write("f", b"2\n");
+    repo.commit_all("unmerged work");
+    git(repo.path(), &["checkout", "--quiet", "main"]);
+    assert_eq!(repo.repo.base_branch().unwrap().as_deref(), Some("main"));
+    let merged = repo.repo.merged_branches().unwrap();
+    // `done` and `work` point into main's history; `open` has its own commit; the base
+    // itself is never reported.
+    assert_eq!(
+        merged,
+        BTreeSet::from(["done".to_owned(), "work".to_owned()])
+    );
+
+    // A remote's default branch takes precedence, and its local counterpart is excluded.
+    let remote_dir = tempfile::tempdir().unwrap();
+    git(
+        remote_dir.path(),
+        &["init", "--quiet", "--bare", "--initial-branch", "main"],
+    );
+    let url = remote_dir.path().to_string_lossy().into_owned();
+    git(repo.path(), &["remote", "add", "origin", &url]);
+    git(repo.path(), &["push", "--quiet", "origin", "main"]);
+    git(repo.path(), &["remote", "set-head", "origin", "main"]);
+    assert_eq!(
+        repo.repo.base_branch().unwrap().as_deref(),
+        Some("origin/main")
+    );
+    let merged = repo.repo.merged_branches().unwrap();
+    assert!(
+        !merged.contains("main") && merged.contains("done"),
+        "{merged:?}"
+    );
+}

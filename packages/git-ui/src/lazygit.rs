@@ -96,6 +96,9 @@ struct Gui {
     portrait_mode: Option<String>,
     wrap_lines_in_diff_view: Option<bool>,
     use_hunk_mode_in_diff_view: Option<bool>,
+    branch_color_patterns: BTreeMap<String, String>,
+    /// Deprecated in lazygit: branch "type" (the part before `/`) to color.
+    branch_colors: BTreeMap<String, String>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -337,6 +340,26 @@ fn convert_editing(config: &Lazygit, ui: &mut toml::Table) {
     }
     if let Some(hunk) = gui.use_hunk_mode_in_diff_view {
         section("staging", "hunk_mode", hunk.into());
+    }
+    // Branch color patterns become name rules, checked before the state colors.
+    let rules: Vec<toml::Value> = gui
+        .branch_color_patterns
+        .iter()
+        .map(|(pattern, color)| (pattern.clone(), color))
+        .chain(
+            gui.branch_colors
+                .iter()
+                .map(|(kind, color)| (format!("^{}/", regex::escape(kind)), color)),
+        )
+        .map(|(pattern, color)| {
+            let mut rule = toml::Table::new();
+            rule.insert("pattern".into(), pattern.into());
+            rule.insert("color".into(), color.clone().into());
+            toml::Value::Table(rule)
+        })
+        .collect();
+    if !rules.is_empty() {
+        section("branches", "colors", toml::Value::Array(rules));
     }
     let git = &config.git;
     match (
@@ -775,6 +798,22 @@ mod tests {
 
     fn bindings(import: &Import) -> BTreeMap<String, BTreeMap<String, String>> {
         loaded(import).keybindings
+    }
+
+    #[test]
+    fn branch_color_patterns_become_name_rules() {
+        let yaml = "gui:\n  branchColorPatterns:\n    'docs/.+': '#11aaff'\n  branchColors:\n    feature: magenta\n";
+        let imported = import(yaml, false).unwrap();
+        let table: toml::Table = toml::from_str(&imported.toml).unwrap();
+        let rules = table["branches"]["colors"].as_array().unwrap();
+        assert_eq!(rules[0]["pattern"].as_str(), Some("docs/.+"));
+        assert_eq!(rules[0]["color"].as_str(), Some("#11aaff"));
+        assert_eq!(rules[1]["pattern"].as_str(), Some("^feature/"));
+        assert_eq!(rules[1]["color"].as_str(), Some("magenta"));
+        // The result loads without diagnostics.
+        let loaded = crate::config::from_tables(&toml::Table::new(), Some(&table));
+        assert!(loaded.diagnostics.is_empty(), "{:?}", loaded.diagnostics);
+        assert_eq!(loaded.ui.branches.colors.len(), 2);
     }
 
     #[test]

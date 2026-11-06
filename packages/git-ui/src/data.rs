@@ -39,6 +39,8 @@ pub struct Snapshot {
     pub more_commits: bool,
     /// Commits not yet pushed to upstream.
     pub unpushed: BTreeSet<String>,
+    /// Local branches already merged into the base branch (loaded only when shown).
+    pub merged: BTreeSet<String>,
     /// `HEAD` reflog.
     pub reflog: Vec<ReflogEntry>,
     /// Stash entries.
@@ -53,7 +55,7 @@ pub struct Snapshot {
 
 /// Load all panel data, running independent queries in parallel.
 #[must_use]
-pub fn load_snapshot(repo: &Repository, commit_limit: usize) -> Snapshot {
+pub fn load_snapshot(repo: &Repository, commit_limit: usize, merged: bool) -> Snapshot {
     fn join<T>(
         handle: std::thread::ScopedJoinHandle<'_, Result<T, bcode_git::GitError>>,
     ) -> Result<T, bcode_git::GitError> {
@@ -81,6 +83,7 @@ pub fn load_snapshot(repo: &Repository, commit_limit: usize) -> Snapshot {
         tags,
         commits,
         unpushed,
+        merged,
         reflog,
         stashes,
         worktrees,
@@ -94,6 +97,13 @@ pub fn load_snapshot(repo: &Repository, commit_limit: usize) -> Snapshot {
         let tags = scope.spawn(|| repo.tags());
         let commits = scope.spawn(|| repo.log(&query));
         let unpushed = scope.spawn(|| repo.unpushed());
+        let merged = scope.spawn(move || {
+            if merged {
+                repo.merged_branches()
+            } else {
+                Ok(BTreeSet::new())
+            }
+        });
         let reflog = scope.spawn(|| repo.reflog(200));
         let stashes = scope.spawn(|| repo.stashes());
         let worktrees = scope.spawn(|| repo.worktrees());
@@ -107,6 +117,7 @@ pub fn load_snapshot(repo: &Repository, commit_limit: usize) -> Snapshot {
             join(tags),
             join(commits),
             join(unpushed),
+            join(merged),
             join(reflog),
             join(stashes),
             join(worktrees),
@@ -127,6 +138,7 @@ pub fn load_snapshot(repo: &Repository, commit_limit: usize) -> Snapshot {
         commits,
         more_commits,
         unpushed: take(unpushed, &mut errors),
+        merged: take(merged, &mut errors),
         reflog: take(reflog, &mut errors),
         stashes: take(stashes, &mut errors),
         worktrees: take(worktrees, &mut errors),
@@ -356,6 +368,8 @@ pub struct PresentContext {
     pub relative_dates: bool,
     /// Show the commit graph in logs.
     pub show_graph: bool,
+    /// Branch name colors.
+    pub branches: crate::branches::BranchColors,
 }
 
 /// Build the main view for a request.
@@ -688,18 +702,19 @@ fn commit_header(repo: &Repository, oid: &str, cx: &PresentContext) -> Vec<DiffR
     let [sha, name, email, time, refs, message] = fields[..] else {
         return Vec::new();
     };
-    let mut rows = vec![DiffRow::info(Line::from_spans(vec![
-        Span::styled("commit ", theme.muted),
-        Span::styled(sha.to_owned(), theme.sha.add_modifier(Modifier::BOLD)),
-        Span::styled(
-            if refs.is_empty() {
-                String::new()
-            } else {
-                format!("  ({refs})")
-            },
-            theme.branch_local,
-        ),
-    ]))];
+    let mut rows = vec![DiffRow::info(Line::from_spans(
+        vec![
+            Span::styled("commit ", theme.muted),
+            Span::styled(sha.to_owned(), theme.sha.add_modifier(Modifier::BOLD)),
+        ]
+        .into_iter()
+        .chain(ref_spans(
+            refs.split(", ").filter(|reference| !reference.is_empty()),
+            &cx.branches,
+            theme,
+        ))
+        .collect::<Vec<_>>(),
+    ))];
     rows.push(DiffRow::info(Line::from_spans(vec![
         Span::styled("Author ", theme.muted),
         Span::styled(
@@ -751,6 +766,7 @@ pub fn log_rows(
                     .map(Vec::as_slice),
                 unpushed.contains(&commit.oid),
                 &cx.theme,
+                &cx.branches,
                 cx.relative_dates,
             ))
         })
@@ -764,6 +780,7 @@ pub fn commit_line(
     graph: Option<&[graph::Cell]>,
     unpushed: bool,
     theme: &GitTheme,
+    branches: &crate::branches::BranchColors,
     relative_dates: bool,
 ) -> Line {
     let mut spans = vec![Span::styled(
@@ -776,11 +793,11 @@ pub fn commit_line(
             spans.push(Span::styled(graph::glyph(*cell), style));
         }
     }
-    for reference in &commit.refs {
-        let (text, style) = ref_label(reference, theme);
-        spans.push(Span::styled(text, style.add_modifier(Modifier::BOLD)));
-        spans.push(Span::raw(" "));
-    }
+    spans.extend(ref_spans(
+        commit.refs.iter().map(String::as_str),
+        branches,
+        theme,
+    ));
     spans.push(Span::styled(commit.summary.clone(), theme.text));
     spans.push(Span::styled(
         format!("  {} ", initials(&commit.author_name)),
@@ -793,24 +810,37 @@ pub fn commit_line(
     Line::from_spans(spans)
 }
 
-fn ref_label(reference: &str, theme: &GitTheme) -> (String, Style) {
-    if let Some(tag) = reference.strip_prefix("tag: ") {
-        return (format!("◆ {tag}"), theme.tag);
+/// Labels for refs on a commit (as `git log --decorate` names them), each followed by a
+/// space: branches in their branch colors, tags and `HEAD` in theirs.
+fn ref_spans<'a>(
+    references: impl Iterator<Item = &'a str>,
+    branches: &crate::branches::BranchColors,
+    theme: &GitTheme,
+) -> Vec<Span> {
+    let mut spans = Vec::new();
+    for reference in references {
+        if let Some(tag) = reference.strip_prefix("tag: ") {
+            spans.push(Span::styled(
+                format!("◆ {tag}"),
+                theme.tag.add_modifier(Modifier::BOLD),
+            ));
+        } else if reference == "HEAD" {
+            spans.push(Span::styled(
+                "✱ HEAD",
+                theme.branch_head.add_modifier(Modifier::BOLD),
+            ));
+        } else {
+            let name = reference.strip_prefix("HEAD -> ");
+            if let Some(name) = name {
+                spans.push(Span::styled("✱ ", branches.local(name)));
+            }
+            for (text, style) in branches.reference(name.unwrap_or(reference)) {
+                spans.push(Span::styled(text, style));
+            }
+        }
+        spans.push(Span::raw(" "));
     }
-    if let Some(branch) = reference.strip_prefix("HEAD -> ") {
-        return (format!("✱ {branch}"), theme.branch_head);
-    }
-    let style = match reference {
-        "HEAD" => theme.branch_head,
-        remote if remote.contains('/') => theme.branch_remote,
-        _ => theme.branch_local,
-    };
-    let text = if reference == "HEAD" {
-        "✱ HEAD".to_owned()
-    } else {
-        reference.to_owned()
-    };
-    (text, style)
+    spans
 }
 
 fn initials(name: &str) -> String {
@@ -926,10 +956,8 @@ fn status_rows(repo: &Repository, cx: &PresentContext) -> Vec<DiffRow> {
 
 /// Repository, branch, changes, last commit and any operation in progress.
 /// Branch and change counts of the overview.
-fn status_summary(
-    status: &bcode_git::models::StatusSnapshot,
-    theme: &crate::theme::GitTheme,
-) -> Vec<DiffRow> {
+fn status_summary(status: &bcode_git::models::StatusSnapshot, cx: &PresentContext) -> Vec<DiffRow> {
+    let theme = &cx.theme;
     let label = |icon: &str, name: &str| summary_label(theme, icon, name);
     let mut rows = Vec::new();
     let branch = status
@@ -939,7 +967,7 @@ fn status_summary(
         .unwrap_or_else(|| "(detached)".into());
     rows.push(labeled(vec![
         label("⎇", "Branch"),
-        Span::styled(branch, theme.branch_head),
+        Span::styled(branch.clone(), cx.branches.local(&branch)),
         Span::styled(
             status.branch.upstream.as_ref().map_or_else(
                 || "  no upstream".to_owned(),
@@ -1016,7 +1044,7 @@ fn summary_rows(repo: &Repository, cx: &PresentContext) -> Vec<DiffRow> {
     }
     rows.push(labeled(repository));
     if let Ok(status) = repo.status() {
-        rows.extend(status_summary(&status, theme));
+        rows.extend(status_summary(&status, cx));
     }
     if let Some(last) = repo
         .log(&LogQuery {

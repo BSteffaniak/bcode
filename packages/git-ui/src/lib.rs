@@ -11,6 +11,7 @@
 
 mod actions;
 pub mod app;
+pub mod branches;
 pub mod commit_message;
 pub mod config;
 pub mod data;

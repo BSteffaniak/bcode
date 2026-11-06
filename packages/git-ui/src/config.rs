@@ -37,6 +37,8 @@ pub struct GitUiConfig {
     pub diff: DiffConfig,
     /// Staging view settings.
     pub staging: StagingConfig,
+    /// Branch colors and merged-branch dimming.
+    pub branches: crate::branches::BranchesConfig,
     /// Maximum commits loaded per page.
     pub log_page_size: usize,
     /// Show the commit graph.
@@ -70,6 +72,7 @@ impl Default for GitUiConfig {
             commit: CommitConfig::default(),
             diff: DiffConfig::default(),
             staging: StagingConfig::default(),
+            branches: crate::branches::BranchesConfig::default(),
             log_page_size: 300,
             show_graph: true,
             highlight: HighlightConfig::default(),

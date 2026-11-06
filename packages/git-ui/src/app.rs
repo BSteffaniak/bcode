@@ -398,11 +398,17 @@ impl App {
             max_file_bytes: config.highlight.max_file_bytes,
             relative_dates: config.relative_dates,
             show_graph: config.show_graph,
+            branches: crate::branches::BranchColors::default(),
         };
         let file_tree = config.files.tree;
         let (layout, layout_diagnostics) = Layout::resolve(&config.layout);
         let (commit_sources, commit_diagnostics) = config.commit.resolve_sources();
+        let (branch_colors, branch_diagnostics) =
+            crate::branches::BranchColors::new(&config.branches, &theme);
+        let mut cx = cx;
+        cx.branches = branch_colors;
         let mut diagnostics = diagnostics;
+        diagnostics.extend(branch_diagnostics);
         diagnostics.extend(layout_diagnostics);
         diagnostics.extend(commit_diagnostics);
         let screen_mode = config.layout.screen_mode;
@@ -815,9 +821,10 @@ impl App {
         let generation = self.snapshot_requested;
         let repo = self.repo.clone();
         let limit = self.snapshot.commits.len().max(self.config.log_page_size);
+        let merged = self.config.branches.dim_merged;
         self.spawn(
             Some("snapshot"),
-            move || load_snapshot(&repo, limit),
+            move || load_snapshot(&repo, limit, merged),
             move |snapshot| Msg::Snapshot(generation, Box::new(snapshot)),
         )
     }
@@ -2218,6 +2225,10 @@ impl App {
 
     fn install_snapshot(&mut self, snapshot: Snapshot) {
         self.loaded_once = true;
+        self.cx.branches = self
+            .cx
+            .branches
+            .with_branches(&snapshot.branches, &snapshot.merged);
         self.commit_graph = graph::layout(&snapshot.commits);
         self.file_nodes = file_rows(&snapshot.status, self.file_tree, &self.collapsed);
         if let Some(error) = snapshot.errors.first() {

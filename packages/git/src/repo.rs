@@ -430,6 +430,64 @@ impl Repository {
         }
     }
 
+    /// The branch others merge into: the remote's default branch (`origin/HEAD`), else a
+    /// local `main` or `master`. `None` when there is none.
+    ///
+    /// # Errors
+    /// * [`GitError::Io`] when git cannot be run.
+    pub fn base_branch(&self) -> Result<Option<String>, GitError> {
+        match self.runner.read([
+            "symbolic-ref",
+            "--quiet",
+            "--short",
+            "refs/remotes/origin/HEAD",
+        ]) {
+            Ok(output) if !output.trim().is_empty() => return Ok(Some(output.trim().to_owned())),
+            Ok(_) | Err(GitError::Command { .. }) => {}
+            Err(error) => return Err(error),
+        }
+        for name in ["main", "master"] {
+            let reference = format!("refs/heads/{name}");
+            match self
+                .runner
+                .read(["rev-parse", "--verify", "--quiet", &reference])
+            {
+                Ok(_) => return Ok(Some(name.to_owned())),
+                Err(GitError::Command { .. }) => {}
+                Err(error) => return Err(error),
+            }
+        }
+        Ok(None)
+    }
+
+    /// Local branches whose work is already in [`Self::base_branch`] (safe to delete). The
+    /// base and its local counterpart are not included. Empty without a base branch.
+    ///
+    /// # Errors
+    /// * [`GitError::Io`] when git cannot be run.
+    pub fn merged_branches(&self) -> Result<BTreeSet<String>, GitError> {
+        let Some(base) = self.base_branch()? else {
+            return Ok(BTreeSet::new());
+        };
+        let local_base = base.split_once('/').map_or(base.as_str(), |(_, name)| name);
+        let output = match self.runner.read([
+            "for-each-ref",
+            "--merged",
+            &base,
+            "--format=%(refname:short)",
+            "refs/heads",
+        ]) {
+            Ok(output) => output,
+            Err(GitError::Command { .. }) => return Ok(BTreeSet::new()),
+            Err(error) => return Err(error),
+        };
+        Ok(output
+            .lines()
+            .filter(|name| !name.is_empty() && *name != base && *name != local_base)
+            .map(str::to_owned)
+            .collect())
+    }
+
     /// Check out one path as it was in a revision.
     ///
     /// # Errors

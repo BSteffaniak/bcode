@@ -58,7 +58,14 @@ pub struct GitTheme {
     pub author: Style,
     pub date: Style,
     pub key: Style,
+    /// Branch name colors by state (see [`crate::branches::BranchState`]), in its order.
+    pub branch_states: [Style; 7],
+    /// Applied over a branch merged into the base branch.
+    pub branch_merged: Style,
+    /// Colors for identities (graph lanes, authors): distinct from state colors.
     pub graph: Vec<Color>,
+    /// Named theme colors, for configuration that refers to them.
+    pub palette: std::collections::BTreeMap<String, Color>,
     syntax: [Style; 13],
 }
 
@@ -238,16 +245,35 @@ impl GitTheme {
                 "key",
                 Style::new().fg(accent_color).add_modifier(Modifier::BOLD),
             ),
-            graph: vec![
-                accent_color,
-                violet,
-                green,
-                yellow,
-                blue,
-                red,
-                Color::BrightCyan,
-                Color::BrightMagenta,
+            branch_states: [
+                git(
+                    "branch.state.current",
+                    Style::new().fg(green).add_modifier(Modifier::BOLD),
+                ),
+                git("branch.state.synced", Style::new().fg(accent_color)),
+                git(
+                    "branch.state.ahead",
+                    Style::new().fg(theme.color("blue").unwrap_or(Color::Blue)),
+                ),
+                git("branch.state.behind", Style::new().fg(yellow)),
+                git(
+                    "branch.state.diverged",
+                    Style::new().fg(theme.color("orange").unwrap_or(Color::BrightRed)),
+                ),
+                git("branch.state.gone", Style::new().fg(red)),
+                git("branch.state.local", text),
             ],
+            branch_merged: git("branch.merged", Style::new().add_modifier(Modifier::DIM)),
+            // Bright variants, so a lane or an author never reads as a branch state, tag or
+            // remote.
+            graph: vec![
+                Color::BrightBlue,
+                Color::BrightMagenta,
+                Color::BrightCyan,
+                Color::BrightGreen,
+                Color::BrightWhite,
+            ],
+            palette: theme.palette.clone(),
             syntax: [
                 syntax_role("text", text.fg.unwrap_or(Color::Default)),
                 syntax_role("comment", Color::BrightBlack).add_modifier(Modifier::ITALIC),
@@ -295,7 +321,7 @@ impl GitTheme {
         Style::new().fg(self.graph[lane % self.graph.len()])
     }
 
-    /// Stable color for a name, so authors and branches keep their colors.
+    /// Stable identity color for a name, so each author keeps a color.
     #[must_use]
     pub fn hashed(&self, name: &str) -> Style {
         let hash = name.bytes().fold(0usize, |acc, byte| {
