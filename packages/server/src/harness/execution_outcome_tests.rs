@@ -41,6 +41,114 @@ fn deferred_work(work: &Work) -> bool {
     matches!(work.verdict(), Some(AttemptObservation::Deferred { .. }))
 }
 
+fn snapshot(session: bcode_session_models::SessionId, events: Vec<E>) -> Vec<HarnessObservation> {
+    events
+        .into_iter()
+        .enumerate()
+        .map(|(index, event)| HarnessObservation {
+            observation_id: format!("evidence-{index}"),
+            session_id: session.to_string(),
+            generation: 1,
+            native_correlations: Vec::new(),
+            completeness: HarnessCompleteness::Complete,
+            kind: HarnessObservationKind::Execution { event },
+        })
+        .collect()
+}
+
+fn foreground() -> E {
+    E::SubmissionTerminal {
+        attempt: exact(),
+        native_turn_id: Some("observed-turn".into()),
+        native_frame_id: Some("observed-frame".into()),
+        disposition: D::Completed,
+        output: Some(r#"{"ok":true}"#.into()),
+    }
+}
+
+#[test]
+fn shared_assignment_evaluator_keeps_foreground_background_and_continuation_distinct() {
+    let session = bcode_session_models::SessionId::new();
+    let events = vec![foreground(), task(W::Running, N::Pending), coverage()];
+    assert!(matches!(
+        evaluate_assignment(
+            &snapshot(session, events.clone()),
+            session,
+            1,
+            &exact(),
+            HarnessCompletionRequirement::Foreground
+        )
+        .unwrap(),
+        Some(AssignmentVerdict::Completed { .. })
+    ));
+    assert!(matches!(
+        evaluate_assignment(
+            &snapshot(session, events),
+            session,
+            1,
+            &exact(),
+            HarnessCompletionRequirement::AssociatedWork
+        )
+        .unwrap(),
+        Some(AssignmentVerdict::Pending(
+            AttemptObservation::Deferred { .. }
+        ))
+    ));
+    for (state, completed) in [(W::Running, false), (W::Completed, true)] {
+        let page = snapshot(
+            session,
+            vec![
+                foreground(),
+                task(W::Completed, N::Observed),
+                continuation(state),
+                coverage(),
+            ],
+        );
+        let verdict = evaluate_assignment(
+            &page,
+            session,
+            1,
+            &exact(),
+            HarnessCompletionRequirement::AssociatedWork,
+        )
+        .unwrap();
+        assert_eq!(
+            matches!(verdict, Some(AssignmentVerdict::Completed { .. })),
+            completed
+        );
+    }
+    let page = snapshot(
+        session,
+        vec![foreground(), task(W::Failed, N::NotExpected), coverage()],
+    );
+    assert!(matches!(
+        evaluate_assignment(
+            &page,
+            session,
+            1,
+            &exact(),
+            HarnessCompletionRequirement::AssociatedWork
+        )
+        .unwrap(),
+        Some(AssignmentVerdict::Pending(
+            AttemptObservation::Failed { .. }
+        ))
+    ));
+    assert!(matches!(
+        evaluate_assignment(
+            &page,
+            bcode_session_models::SessionId::new(),
+            1,
+            &exact(),
+            HarnessCompletionRequirement::AssociatedWork
+        )
+        .unwrap(),
+        Some(AssignmentVerdict::Pending(
+            AttemptObservation::Deferred { .. }
+        ))
+    ));
+}
+
 #[test]
 fn coverage_does_not_erase_pending_work_or_notifications() {
     let mut work = Work::default();

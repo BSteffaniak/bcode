@@ -17,6 +17,14 @@ serde                = { workspace = true, features = ["derive"] }
 thiserror            = { workspace = true }
 
 [dev-dependencies]
+bcode_harness_models    = { workspace = true }
+bcode_metrics           = { workspace = true }
+bcode_session           = { workspace = true }
+bcode_session_migration = { workspace = true }
+serde_json              = { workspace = true }
+switchy                 = { workspace = true, features = ["database"] }
+tempfile                = { workspace = true }
+tokio                   = { workspace = true, features = ["macros", "rt"] }
 
 [features]
 default          = []

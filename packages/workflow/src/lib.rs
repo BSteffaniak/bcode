@@ -5554,6 +5554,7 @@ impl WorkflowStructuredSourceConcisePrompt {
             agent_profile: self.agent_profile.clone(),
             provider: self.provider.clone(),
             model: self.model.clone(),
+            execution_model_selection: None,
             output: WorkflowPromptOutputPolicy::Structured {
                 result: PromptStructuredOutputPolicy {
                     schema: self.output.clone(),
@@ -12563,7 +12564,7 @@ impl ResourceClaim {
 }
 
 /// Stable durable prompt-node configuration version.
-pub const WORKFLOW_PROMPT_CONFIGURATION_VERSION: u32 = 5;
+pub const WORKFLOW_PROMPT_CONFIGURATION_VERSION: u32 = 6;
 const LEGACY_WORKFLOW_PROMPT_CONFIGURATION_VERSION: u32 = 2;
 
 /// Maximum result-only correction rounds accepted by a workflow prompt contract.
@@ -12820,6 +12821,9 @@ pub fn bind_execution_parent(
     Ok(admitted)
 }
 
+/// Exact backend-neutral selection resolved by the shared model catalog before execution.
+pub use bcode_model::execution::ExecutionModelSelection;
+
 /// Versioned serializable durable prompt-node configuration.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(deny_unknown_fields)]
@@ -12836,6 +12840,10 @@ pub struct WorkflowPromptConfiguration {
     pub agent_profile: String,
     pub provider: Option<String>,
     pub model: Option<String>,
+    /// Exact catalog request, mutually exclusive with legacy provider/model overrides.
+    /// Not evidence of authorization or native execution.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub execution_model_selection: Option<ExecutionModelSelection>,
     pub output: WorkflowPromptOutputPolicy,
     pub read_only: bool,
     pub tool_capability: WorkflowToolCapability,
@@ -12862,6 +12870,8 @@ struct WorkflowPromptConfigurationWire {
     agent_profile: String,
     provider: Option<String>,
     model: Option<String>,
+    #[serde(default)]
+    execution_model_selection: Option<ExecutionModelSelection>,
     #[serde(default)]
     output: Option<WorkflowPromptOutputPolicy>,
     #[serde(default)]
@@ -12895,11 +12905,19 @@ impl<'de> Deserialize<'de> for WorkflowPromptConfiguration {
                 "unsupported or invalid execution parent binding",
             ));
         }
-        if wire.worktree_directory.is_some()
-            && wire.version != WORKFLOW_PROMPT_CONFIGURATION_VERSION
-        {
+        if wire.worktree_directory.is_some() && wire.version < 5 {
             return Err(D::Error::custom(
                 "worktree selection requires current prompt configuration version",
+            ));
+        }
+        if wire.execution_model_selection.is_some()
+            && (wire.version < 6
+                || wire.version != WORKFLOW_PROMPT_CONFIGURATION_VERSION
+                || wire.provider.is_some()
+                || wire.model.is_some())
+        {
+            return Err(D::Error::custom(
+                "execution model selection requires current configuration and no provider/model overrides",
             ));
         }
         if wire.version < 4 && !wire.allow_user_questions {
@@ -12922,7 +12940,7 @@ impl<'de> Deserialize<'de> for WorkflowPromptConfiguration {
                     })?,
                 }
             }
-            3 | 4 | WORKFLOW_PROMPT_CONFIGURATION_VERSION => {
+            3 | 4 | 5 | WORKFLOW_PROMPT_CONFIGURATION_VERSION => {
                 if wire.structured_output.is_some() {
                     return Err(D::Error::custom(
                         "prompt configuration version 3 must not contain structured_output",
@@ -12945,6 +12963,7 @@ impl<'de> Deserialize<'de> for WorkflowPromptConfiguration {
             agent_profile: wire.agent_profile,
             provider: wire.provider,
             model: wire.model,
+            execution_model_selection: wire.execution_model_selection,
             output,
             read_only: wire.read_only,
             tool_capability: wire.tool_capability,
@@ -13005,6 +13024,7 @@ impl WorkflowPromptConfiguration {
             agent_profile: agent_profile.into(),
             provider: None,
             model: None,
+            execution_model_selection: None,
             output,
             read_only: true,
             tool_capability: WorkflowToolCapability::ReadOnly,
@@ -13032,6 +13052,14 @@ impl WorkflowPromptConfiguration {
     ) -> Self {
         self.provider = Some(provider.into());
         self.model = Some(model.into());
+        self
+    }
+
+    /// Request an exact catalog model, backend and account without resolving or authorizing it.
+    /// Conflicting legacy overrides fail validation rather than being silently replaced.
+    #[must_use]
+    pub fn with_execution_model_selection(mut self, selection: ExecutionModelSelection) -> Self {
+        self.execution_model_selection = Some(selection);
         self
     }
 
@@ -13116,6 +13144,7 @@ impl WorkflowPromptConfiguration {
                         .to_string(),
             });
         }
+        validate_execution_model_selection(self)?;
         if self.read_only && self.tool_capability != WorkflowToolCapability::ReadOnly {
             return Err(WorkflowError::Build {
                 path: "prompt.tool_capability".to_string(),
@@ -13178,6 +13207,45 @@ impl WorkflowPromptConfiguration {
         }
         Ok(())
     }
+}
+
+fn validate_execution_model_selection(
+    configuration: &WorkflowPromptConfiguration,
+) -> Result<(), WorkflowError> {
+    use bcode_model::execution::ExecutionRoute;
+
+    let Some(selection) = &configuration.execution_model_selection else {
+        return Ok(());
+    };
+    let invalid_identity = |value: &str, max: usize| {
+        value.trim().is_empty() || value.len() > max || value.chars().any(char::is_control)
+    };
+    let invalid_route = match &selection.route {
+        None => false,
+        Some(ExecutionRoute::ModelProvider { provider_plugin_id }) => {
+            invalid_identity(provider_plugin_id, 256)
+        }
+        Some(ExecutionRoute::ManagedHarness {
+            instance_id,
+            plugin_id,
+        }) => invalid_identity(instance_id, 4096) || invalid_identity(plugin_id, 256),
+    };
+    if configuration.version < 6
+        || configuration.provider.is_some()
+        || configuration.model.is_some()
+        || invalid_identity(&selection.model_id, 512)
+        || selection
+            .account_reference
+            .as_deref()
+            .is_some_and(|value| invalid_identity(value, 4096))
+        || invalid_route
+    {
+        return Err(WorkflowError::Build {
+            path: "prompt.execution_model_selection".into(),
+            message: "execution selection requires prompt configuration version 6 or later, bounded nonblank identities and no provider/model overrides".into(),
+        });
+    }
+    Ok(())
 }
 
 /// Read-only configured prerequisites for plugin-origin workflow graph edits.
@@ -17947,8 +18015,73 @@ mod tests {
         );
     }
 
+    #[test]
+    fn version_five_worktree_configuration_remains_readable_without_execution_selection() {
+        let mut wire = serde_json::to_value(valid_prompt_configuration()).unwrap();
+        wire["version"] = serde_json::json!(5);
+        wire["worktree_directory"] = serde_json::json!("/workspace/registered");
+        let decoded: WorkflowPromptConfiguration = serde_json::from_value(wire).unwrap();
+        assert_eq!(decoded.version, WORKFLOW_PROMPT_CONFIGURATION_VERSION);
+        assert_eq!(
+            decoded.worktree_directory.as_deref(),
+            Some("/workspace/registered")
+        );
+        assert!(decoded.execution_model_selection.is_none());
+        decoded.validate().unwrap();
+    }
+
+    #[test]
+    fn execution_selection_preserves_exact_constraints_and_rejects_conflicts() {
+        let selection = ExecutionModelSelection {
+            model_id: "discovered-model".into(),
+            route: Some(bcode_model::execution::ExecutionRoute::ManagedHarness {
+                instance_id: "configured-instance".into(),
+                plugin_id: "native-adapter".into(),
+            }),
+            account_reference: Some("native-account".into()),
+        };
+        let selected =
+            valid_prompt_configuration().with_execution_model_selection(selection.clone());
+        let wire = serde_json::to_value(&selected).unwrap();
+        assert_eq!(
+            wire["execution_model_selection"],
+            serde_json::to_value(&selection).unwrap()
+        );
+        if WORKFLOW_PROMPT_CONFIGURATION_VERSION < 6 {
+            assert!(selected.validate().is_err());
+            assert!(serde_json::from_value::<WorkflowPromptConfiguration>(wire).is_err());
+            return;
+        }
+        selected.validate().unwrap();
+        let restored: WorkflowPromptConfiguration = serde_json::from_value(wire.clone()).unwrap();
+        assert_eq!(restored, selected);
+        let conflicted = selected.with_model_selection("provider", "model");
+        assert!(conflicted.validate().is_err());
+        assert!(
+            serde_json::from_value::<WorkflowPromptConfiguration>(
+                serde_json::to_value(conflicted).unwrap()
+            )
+            .is_err()
+        );
+        for invalid in [
+            serde_json::json!({"model_id":" "}),
+            serde_json::json!({"model_id":"m","account_reference":""}),
+            serde_json::json!({"model_id":"m","route":{"kind":"managed_harness","instance_id":"","plugin_id":"adapter"}}),
+        ] {
+            let mut invalid_wire = wire.clone();
+            invalid_wire["execution_model_selection"] = invalid;
+            let configuration: WorkflowPromptConfiguration =
+                serde_json::from_value(invalid_wire).unwrap();
+            assert!(configuration.validate().is_err());
+        }
+        let mut old_wire = wire;
+        old_wire["version"] = serde_json::json!(5);
+        assert!(serde_json::from_value::<WorkflowPromptConfiguration>(old_wire).is_err());
+    }
+
     fn valid_prompt_configuration() -> WorkflowPromptConfiguration {
         WorkflowPromptConfiguration {
+            execution_model_selection: None,
             version: WORKFLOW_PROMPT_CONFIGURATION_VERSION,
             worktree_directory: None,
             activity_producer: None,
@@ -18159,6 +18292,7 @@ mod tests {
                             execution_parent: None,
                             execution_target: PromptContextTarget::FreshIsolated,
                             agent_profile: "review".to_string(),
+                            execution_model_selection: None,
                             provider: None,
                             model: None,
                             output: WorkflowPromptOutputPolicy::Structured {
@@ -19778,6 +19912,7 @@ steps:
             execution_parent: None,
             execution_target: PromptContextTarget::FixedGenerationFork,
             agent_profile: "review".to_string(),
+            execution_model_selection: None,
             provider: None,
             model: None,
             output: WorkflowPromptOutputPolicy::Structured {
@@ -24252,6 +24387,7 @@ steps:
             execution_parent: None,
             execution_target: PromptContextTarget::FreshIsolated,
             agent_profile: "build".to_string(),
+            execution_model_selection: None,
             provider: Some("configured".to_string()),
             model: Some("configured".to_string()),
             output: WorkflowPromptOutputPolicy::Structured {
@@ -26486,6 +26622,7 @@ steps:
 
     fn prompt_configuration(schema: &ValueSchema, read_only: bool) -> WorkflowPromptConfiguration {
         WorkflowPromptConfiguration {
+            execution_model_selection: None,
             version: WORKFLOW_PROMPT_CONFIGURATION_VERSION,
             worktree_directory: None,
             activity_producer: None,

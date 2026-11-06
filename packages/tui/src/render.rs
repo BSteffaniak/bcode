@@ -363,7 +363,12 @@ impl TuiTheme {
 
     #[must_use]
     pub const fn for_app(app: &BmuxApp) -> Self {
-        let theme = app.presented_theme();
+        Self::from_presented(&app.presented_theme())
+    }
+
+    /// Adapt semantic theme roles for pre-session screens.
+    #[must_use]
+    pub const fn from_presented(theme: &super::theme::PresentedTheme) -> Self {
         Self {
             text: theme.text,
             muted: theme.muted,

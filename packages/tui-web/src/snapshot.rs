@@ -480,6 +480,7 @@ impl SnapshotState {
         {
             request
                 .request()
+                .map_err(|_| "invalid recovered native request")?
                 .validate()
                 .map_err(|_| "invalid recovered native request")?;
             let bcode_session_view_models::ManagedComposerRequestKind::Submit {
@@ -624,6 +625,7 @@ impl SnapshotState {
             };
             request
                 .request()
+                .map_err(|_| "invalid preparation")?
                 .validate()
                 .map_err(|_| "invalid preparation")?;
             if submission.submission_id != pending.identity
@@ -686,7 +688,8 @@ impl SnapshotState {
                     .ok_or("unexpected native receipt")?;
                 response
                     .response()
-                    .validate_for(&retained.request())
+                    .map_err(|_| "native receipt mismatch")?
+                    .validate_for(&retained.request().map_err(|_| "native receipt mismatch")?)
                     .map_err(|_| "native receipt mismatch")?;
                 let bcode_session_view_models::ManagedComposerResponseKind::Receipt(receipt) =
                     response.kind

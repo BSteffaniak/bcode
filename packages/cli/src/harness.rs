@@ -32,6 +32,16 @@ pub enum HarnessCommand {
         #[arg(long)]
         recovery_id: String,
     },
+    /// Discover exact execution models through caller-bound managed application admission.
+    Models {
+        #[arg(long)]
+        request: PathBuf,
+    },
+    /// Create a session for an exact discovered model/route/account selection without fallback.
+    StartSelected {
+        #[arg(long)]
+        request: PathBuf,
+    },
     /// Create/open native transport. Prepared is not native creation success; retain its
     /// exact target for first submission and wait for `BindingConfirmed` observations.
     Start {
@@ -176,6 +186,8 @@ pub async fn execute(command: HarnessCommand) -> Result<(), CliError> {
             Op::Recover,
             recovery_request_json(session_id, instance, generation, recovery_id)?,
         ),
+        HarnessCommand::Models { request } => return execute_models(&request).await,
+        HarnessCommand::StartSelected { request } => return execute_selected_start(&request).await,
         HarnessCommand::Start { request } => (Op::Start, read_request(&request)?),
         HarnessCommand::Status { request } => (Op::Inspect, read_request(&request)?),
         HarnessCommand::Send { request } => (Op::Followup, read_request(&request)?),
@@ -245,6 +257,12 @@ pub async fn execute(command: HarnessCommand) -> Result<(), CliError> {
             serde_json::to_vec(&request)?,
         )
         .await?;
+    validate_and_print_managed_response(&response)
+}
+
+fn validate_and_print_managed_response(
+    response: &bcode_ipc::PluginServiceResponse,
+) -> Result<(), CliError> {
     if response.error.is_some()
         || response.payload.len() > bcode_harness_models::MAX_HARNESS_WIRE_BYTES
     {
@@ -253,6 +271,49 @@ pub async fn execute(command: HarnessCommand) -> Result<(), CliError> {
         ));
     }
     print_managed_response(&response.payload)
+}
+
+async fn execute_models(path: &PathBuf) -> Result<(), CliError> {
+    let input: bcode_ipc::harness::ManagedExecutionCatalogRequest =
+        serde_json::from_str(&read_request(path)?)
+            .map_err(|_| CliError::InvalidArguments("invalid execution catalog request".into()))?;
+    input
+        .validate()
+        .map_err(|_| CliError::InvalidArguments("invalid execution catalog request".into()))?;
+    let response = bcode_client::ManagedSessionClient::default_endpoint()
+        .discover_execution_catalog(input)
+        .await
+        .map_err(|_| {
+            CliError::InvalidArguments(
+                "execution catalog unavailable; no execution or fallback was attempted".into(),
+            )
+        })?;
+    print_execution_response(&response)
+}
+
+async fn execute_selected_start(path: &PathBuf) -> Result<(), CliError> {
+    let input: bcode_ipc::harness::ManagedSelectedStartRequest =
+        serde_json::from_str(&read_request(path)?)
+            .map_err(|_| CliError::InvalidArguments("invalid selected start request".into()))?;
+    input
+        .validate()
+        .map_err(|_| CliError::InvalidArguments("invalid selected start request".into()))?;
+    let response = bcode_client::ManagedSessionClient::default_endpoint()
+        .start_selected_session(input).await
+        .map_err(|_| CliError::InvalidArguments("selected start unavailable or uncertain; inspect canonical session history before any further creation attempt. No replay or fallback was attempted".into()))?;
+    print_execution_response(&response)
+}
+
+fn print_execution_response(response: &impl serde::Serialize) -> Result<(), CliError> {
+    let payload = serde_json::to_vec(response)
+        .map_err(|_| CliError::InvalidArguments("invalid execution application response".into()))?;
+    if payload.len() > bcode_harness_models::MAX_HARNESS_WIRE_BYTES {
+        return Err(CliError::InvalidArguments(
+            "execution application response exceeds bounds; inspect session status without replay"
+                .into(),
+        ));
+    }
+    print_managed_response(&payload)
 }
 
 fn print_managed_response(payload: &[u8]) -> Result<(), CliError> {
@@ -329,6 +390,22 @@ mod tests {
             )
             .is_err()
         );
+    }
+
+    #[test]
+    fn execution_commands_accept_only_explicit_request_files() {
+        for command in ["models", "start-selected"] {
+            assert!(Args::try_parse_from(["harness", command]).is_err());
+            assert!(Args::try_parse_from(["harness", command, "--model", "unselected"]).is_err());
+        }
+        assert!(matches!(
+            Args::try_parse_from(["harness", "models", "--request", "catalog.json"]).unwrap().command,
+            HarnessCommand::Models { request } if request == std::path::Path::new("catalog.json")
+        ));
+        assert!(matches!(
+            Args::try_parse_from(["harness", "start-selected", "--request", "selected.json"]).unwrap().command,
+            HarnessCommand::StartSelected { request } if request == std::path::Path::new("selected.json")
+        ));
     }
 
     #[test]

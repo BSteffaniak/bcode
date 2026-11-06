@@ -189,6 +189,74 @@ impl<S: ManagedHarnessStore, T: ManagedHarnessTransport> ManagedHarnessRuntime<S
         Ok(inspection)
     }
 
+    /// Deliver an exact selected Open under a selected canonical claim, never a legacy claim.
+    /// # Errors
+    /// Rejects invalid ownership, unsupported persistence, conflicts and ambiguous delivery.
+    pub async fn open_selected(
+        &self,
+        owner: &HarnessOwner,
+        request: &bcode_harness_models::HarnessModelsRequest,
+    ) -> Result<bcode_harness_models::HarnessModelsResponse, ManagedHarnessError> {
+        use super::store::SelectedDeliveryClaim;
+        use bcode_harness_models::{HarnessModelsRequestKind, HarnessModelsResponseKind};
+        request
+            .validate()
+            .map_err(|_| ManagedHarnessError::Invalid)?;
+        let HarnessModelsRequestKind::OpenSelected { open, .. } = &request.kind else {
+            return Err(ManagedHarnessError::Invalid);
+        };
+        if open.resume.is_some() || open.parent_assistance.is_some() {
+            return Err(ManagedHarnessError::Unsupported);
+        }
+        if open.session_id != owner.session_id.to_string() || open.generation != owner.generation {
+            return Err(ManagedHarnessError::StaleOwner);
+        }
+        let _ownership = self.store.acquire(owner).await?;
+        let selected = self.store.load(owner).await?;
+        if selected.instance != request.instance {
+            return Err(ManagedHarnessError::Conflict);
+        }
+        match self.store.claim_selected(owner, request).await? {
+            SelectedDeliveryClaim::Recorded(response) => {
+                response
+                    .validate_for(request)
+                    .map_err(|_| ManagedHarnessError::Conflict)?;
+                return Ok(*response);
+            }
+            SelectedDeliveryClaim::Uncertain => return Err(ManagedHarnessError::Uncertain),
+            SelectedDeliveryClaim::New => {}
+        }
+        // Only the exact selected claim above authorizes this extension. Cancellation or a
+        // dropped future leaves the claim non-replayable even if uncertainty append fails.
+        let response = self.transport.invoke_selected(request).await;
+        let response = match response {
+            Ok(response)
+                if response.validate_for(request).is_ok()
+                    && matches!(
+                        &response.kind,
+                        HarnessModelsResponseKind::Selected { .. }
+                            | HarnessModelsResponseKind::Failure(_)
+                    ) =>
+            {
+                response
+            }
+            _ => {
+                let _ = self.store.uncertain_selected(owner, request).await;
+                return Err(ManagedHarnessError::Uncertain);
+            }
+        };
+        if self
+            .store
+            .commit_selected(owner, request, &response)
+            .await
+            .is_err()
+        {
+            let _ = self.store.uncertain_selected(owner, request).await;
+            return Err(ManagedHarnessError::Uncertain);
+        }
+        Ok(response)
+    }
+
     /// Open native execution for an already-created ordinary top-level or child Bcode session.
     /// Caller creation must use the existing session application and immutable parent contract.
     /// # Errors
@@ -209,10 +277,7 @@ impl<S: ManagedHarnessStore, T: ManagedHarnessTransport> ManagedHarnessRuntime<S
         owner: &HarnessOwner,
         open: HarnessOpenRequest,
     ) -> Result<HarnessServiceResponse, ManagedHarnessError> {
-        if open.resume.is_none()
-            || bcode_session_models::CURRENT_SESSION_EVENT_SCHEMA_VERSION < 56
-            || bcode_session_models::CURRENT_SESSION_STORAGE_WRITER_EPOCH < 24
-        {
+        if open.resume.is_none() || !crate::harness::recovery_published() {
             return Err(ManagedHarnessError::Unsupported);
         }
         self.open_admitted(owner, open, true).await

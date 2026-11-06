@@ -6945,6 +6945,8 @@ fn managed_plugin_interface(request: &AgentSkillPluginRequest) -> bool {
         | AgentSkillPluginRequest::InvokePluginServiceContextual { interface_id, .. } => {
             interface_id == bcode_ipc::harness::MANAGED_SESSION_INTERFACE_ID
                 || interface_id == bcode_harness_models::HARNESS_INTERFACE_ID
+                || interface_id == bcode_harness_models::HARNESS_MODELS_INTERFACE_ID
+                || interface_id == bcode_harness_models::HARNESS_CANDIDATES_INTERFACE_ID
         }
         _ => false,
     }
@@ -7010,6 +7012,8 @@ async fn handle_managed_routed_request(
             | AgentSkillPluginRequest::InvokePluginService { interface_id, .. }
             | AgentSkillPluginRequest::InvokePluginServiceContextual { interface_id, .. } => {
                 interface_id == bcode_harness_models::HARNESS_INTERFACE_ID
+                    || interface_id == bcode_harness_models::HARNESS_MODELS_INTERFACE_ID
+                    || interface_id == bcode_harness_models::HARNESS_CANDIDATES_INTERFACE_ID
             }
             _ => false,
         } =>
@@ -35927,7 +35931,10 @@ fn server_workflow_plugin_bridge_observed(
             }
         }
         ServiceBridgeRequest::InvokeService(request)
-            if request.interface_id == bcode_harness_models::HARNESS_INTERFACE_ID =>
+            if request.interface_id == bcode_harness_models::HARNESS_INTERFACE_ID
+                || request.interface_id == bcode_harness_models::HARNESS_MODELS_INTERFACE_ID
+                || request.interface_id
+                    == bcode_harness_models::HARNESS_CANDIDATES_INTERFACE_ID =>
         {
             // Native lifecycle services are never workflow application callbacks. Only the
             // invocation-scoped managed facade may reach them after receipt/authority admission.
@@ -40161,6 +40168,14 @@ impl bcode_workflow_store::AsyncAttemptStatusObserver for WorkflowTurnReceiptObs
                     request,
                 );
             }
+            if request
+                .receipt
+                .get("owner")
+                .and_then(serde_json::Value::as_str)
+                == Some(harness_workflow::SELECTED_PROMPT_OWNER)
+            {
+                return harness_workflow::observe_selected_prompt(self.state, request).await;
+            }
             if let Some(observation) =
                 workflow_operations::observe_operation_receipt(self.state, request).await?
             {
@@ -41949,7 +41964,10 @@ impl ActivationDispatchOwner for WorkflowPromptTurnOwner<'_> {
                 return Ok(None);
             }
             let configuration = workflow_prompt_configuration(&activation.node.configuration)?;
-            let read_only = configuration.read_only;
+            // Selected native Open/assignment is a retained mutation even when the prompt's
+            // tool ceiling is read-only. Never authorize replay after an ambiguous delivery.
+            let read_only =
+                configuration.read_only && configuration.execution_model_selection.is_none();
             let intent = serde_json::json!({
                 "owner": "bcode.server.agent-turn/v1",
                 "input": activation.input,
@@ -42903,7 +42921,19 @@ where
     if let Some(receipt) = existing_receipt {
         return Ok(receipt);
     }
-    let configuration = workflow_prompt_configuration_from_intent(request)?;
+    let mut configuration = workflow_prompt_configuration_from_intent(request)?;
+    // Resolve before child creation; managed routes never enter the provider turn loop.
+    let selected_execution =
+        workflow_operations::execution_selection::plan(state, request, &configuration).await?;
+    if let Some((resolved, None)) = &selected_execution
+        && let bcode_model::execution::ExecutionRoute::ModelProvider { provider_plugin_id } =
+            &resolved.target.route
+    {
+        // Provider resolution above admitted the inherited account/pool context. Leave runtime
+        // auth untouched and use ordinary provider turn admission for this exact model.
+        configuration.provider = Some(provider_plugin_id.clone());
+        configuration.model = Some(resolved.target.model.model_id.clone());
+    }
     let execution_target = configuration.execution_target;
     let input = request.activation.input.as_ref().ok_or_else(|| {
         WorkflowStoreError::InvalidData("workflow prompt activation has no input".to_string())
@@ -43045,6 +43075,25 @@ where
     };
     #[cfg(test)]
     drop(stage_timer);
+    if let Some((resolved, Some(instance))) = selected_execution.as_ref() {
+        before_publication().await?;
+        let mut assignment_prompt = prompt;
+        if let Some(policy) = configuration.output.structured() {
+            assignment_prompt
+                .push_str("\n\nReturn only one JSON value matching this exact output schema:\n");
+            assignment_prompt.push_str(&serde_json::to_string(&policy.schema.schema)?);
+        }
+        return Box::pin(harness_workflow::dispatch_selected_prompt(
+            state,
+            request,
+            resolved.clone(),
+            instance.clone(),
+            (target_session_id, immediate_parent_id),
+            configuration,
+            assignment_prompt,
+        ))
+        .await;
+    }
     let cancellation = Arc::new(TurnCancelState::default());
     let run_work_id = WorkId::new(format!("workflow:{}", request.activation.run_id));
     register_workflow_node_runtime_work(
@@ -43950,6 +43999,15 @@ async fn signal_workflow_attempt_cancellation(
     state: &ServerState,
     attempt: &bcode_workflow_store::ActiveAttemptCancellation,
 ) -> Result<(), WorkflowStoreError> {
+    if attempt
+        .receipt
+        .as_ref()
+        .and_then(|receipt| receipt.get("owner"))
+        .and_then(serde_json::Value::as_str)
+        == Some(harness_workflow::SELECTED_PROMPT_OWNER)
+    {
+        return harness_workflow::cancel_selected_prompt(state, attempt).await;
+    }
     if workflow_operations::cancel_operation_receipt(state, attempt).await? {
         return Ok(());
     }
@@ -79568,14 +79626,15 @@ event_symbol = "bcode_plugin_handle_event_v1"
         server.abort();
     }
 
-    /// A session written by the immediately preceding build must migrate transparently.
-    ///
-    /// Schema bumps that do not extend the released historical inventory orphan every session the
-    /// previous build wrote, so the newest historical schema is exercised end to end here.
+    /// The newest supported released historical session must migrate transparently.
+    /// Reserved schema numbers are not previous released builds and remain unsupported.
     #[cfg(unix)]
     #[tokio::test]
     async fn previous_build_event_schema_session_migrates_on_real_open_ipc() {
-        let previous_schema = bcode_session_models::CURRENT_SESSION_EVENT_SCHEMA_VERSION - 1;
+        let previous_schema = (1..bcode_session_models::CURRENT_SESSION_EVENT_SCHEMA_VERSION)
+            .rev()
+            .find(|schema| bcode_session_migration::is_released_historical_event_schema(*schema))
+            .expect("supported released historical schema");
         assert!(
             bcode_session_migration::is_released_historical_event_schema(previous_schema),
             "schema {previous_schema} written by the previous build must remain migratable"
@@ -82992,6 +83051,7 @@ event_symbol = "bcode_plugin_handle_event_v1"
     ) -> bcode_workflow::WorkflowPromptConfiguration {
         bcode_workflow::WorkflowPromptConfiguration {
             version: bcode_workflow::WORKFLOW_PROMPT_CONFIGURATION_VERSION,
+            execution_model_selection: None,
             worktree_directory: None,
             activity_producer: None,
             execution_parent: None,
@@ -87226,6 +87286,7 @@ event_symbol = "bcode_plugin_handle_event_v1"
         };
         let configuration = bcode_workflow::WorkflowPromptConfiguration {
             version: bcode_workflow::WORKFLOW_PROMPT_CONFIGURATION_VERSION,
+            execution_model_selection: None,
             worktree_directory: None,
             activity_producer: None,
             execution_parent: None,
@@ -89634,6 +89695,7 @@ event_symbol = "bcode_plugin_handle_event_v1"
             resources: Vec::new(),
             configuration: serde_json::to_value(bcode_workflow::WorkflowPromptConfiguration {
                 version: bcode_workflow::WORKFLOW_PROMPT_CONFIGURATION_VERSION,
+                execution_model_selection: None,
                 worktree_directory: None,
                 activity_producer: None,
                 execution_parent: None,
@@ -89851,6 +89913,7 @@ event_symbol = "bcode_plugin_handle_event_v1"
             resources: Vec::new(),
             configuration: serde_json::to_value(bcode_workflow::WorkflowPromptConfiguration {
                 version: bcode_workflow::WORKFLOW_PROMPT_CONFIGURATION_VERSION,
+                execution_model_selection: None,
                 worktree_directory: None,
                 activity_producer: None,
                 execution_parent: None,
@@ -90146,6 +90209,7 @@ event_symbol = "bcode_plugin_handle_event_v1"
                         configuration: serde_json::to_value(
                             bcode_workflow::WorkflowPromptConfiguration {
                                 version: bcode_workflow::WORKFLOW_PROMPT_CONFIGURATION_VERSION,
+                                execution_model_selection: None,
                                 worktree_directory: None,
                                 activity_producer: None,
                                 execution_parent: None,
@@ -91047,6 +91111,7 @@ event_symbol = "bcode_plugin_handle_event_v1"
         };
         let configuration = bcode_workflow::WorkflowPromptConfiguration {
             version: bcode_workflow::WORKFLOW_PROMPT_CONFIGURATION_VERSION,
+            execution_model_selection: None,
             worktree_directory: None,
             activity_producer: None,
             execution_parent: None,
@@ -91544,6 +91609,7 @@ event_symbol = "bcode_plugin_handle_event_v1"
                     configuration: serde_json::to_value(
                         bcode_workflow::WorkflowPromptConfiguration {
                             version: bcode_workflow::WORKFLOW_PROMPT_CONFIGURATION_VERSION,
+                            execution_model_selection: None,
                             worktree_directory: None,
                             activity_producer: None,
                             execution_parent: None,
@@ -91970,6 +92036,7 @@ event_symbol = "bcode_plugin_handle_event_v1"
                     configuration: serde_json::to_value(
                         bcode_workflow::WorkflowPromptConfiguration {
                             version: bcode_workflow::WORKFLOW_PROMPT_CONFIGURATION_VERSION,
+                            execution_model_selection: None,
                             worktree_directory: None,
                             activity_producer: None,
                             execution_parent: None,
@@ -103573,32 +103640,8 @@ event_symbol = "bcode_plugin_handle_event_v1"
                 ("fake_tool_rounds".to_owned(), "5".to_owned()),
                 (
                     "fake_compaction_summary".to_owned(),
-                    "Historical fixture exchanges completed; continue the active tool turn.".to_owned(),
-                ),
-                (
-                    "fake_event_scripts_by_prompt_marker".to_owned(),
-                    serde_json::to_string(&BTreeMap::from([(
-                        "Compact this Bcode session transcript".to_owned(),
-                        bcode_fake_provider_plugin::FakeProviderEventScript {
-                            steps: vec![
-                                bcode_fake_provider_plugin::FakeProviderEventScriptStep {
-                                    gate: None,
-                                    delay_ms: None,
-                                    event: ProviderTurnEvent::TextDelta {
-                                        text: "Historical fixture exchanges completed; continue the active tool turn.".to_owned(),
-                                    },
-                                },
-                                bcode_fake_provider_plugin::FakeProviderEventScriptStep {
-                                    gate: None,
-                                    delay_ms: None,
-                                    event: ProviderTurnEvent::TurnFinished {
-                                        stop_reason: bcode_model::StopReason::EndTurn,
-                                    },
-                                },
-                            ],
-                        },
-                    )]))
-                    .expect("bounded deterministic compaction summary"),
+                    "Historical fixture exchanges completed; continue the active tool turn."
+                        .to_owned(),
                 ),
             ]),
             ..bcode_model::ProviderRequestContext::default()
@@ -103626,6 +103669,20 @@ event_symbol = "bcode_plugin_handle_event_v1"
         state.startup_config.model.compaction.keep_recent_tokens = 1;
     }
 
+    async fn append_reducible_compaction_history(sessions: &SessionManager, session_id: SessionId) {
+        // Force compaction with reducible assistant evidence. Canonical user records are
+        // retained verbatim, so they must themselves fit the fake model after compaction.
+        for index in 0..12 {
+            append_test_turn(
+                sessions,
+                session_id,
+                format!("historical user {index}"),
+                format!("historical assistant {index} {}", "y".repeat(8_000)),
+            )
+            .await;
+        }
+    }
+
     #[tokio::test]
     async fn repeated_tool_rounds_do_not_recompact_an_unchanged_boundary() {
         let temp_dir = tempfile::tempdir().expect("temp dir");
@@ -103638,8 +103695,7 @@ event_symbol = "bcode_plugin_handle_event_v1"
             .await
             .expect("session")
             .id;
-        // Force compaction from history, not the size of the evolving bundled tool catalog.
-        append_test_history(&sessions, session_id, 12, 4_000).await;
+        append_reducible_compaction_history(&sessions, session_id).await;
         let trigger = sessions
             .append_event(
                 session_id,

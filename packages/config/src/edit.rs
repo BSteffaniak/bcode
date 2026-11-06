@@ -142,6 +142,308 @@ pub fn plan_field_edit(
     plan_validated_field_edit(path, keys, value)
 }
 
+/// Plan an explicit execution default without changing provider or authentication settings.
+///
+/// This does not establish catalog membership, readiness, or permission to execute. The caller
+/// must present the exact route/account choice for approval; managed admission still applies.
+/// Passing `None` removes only this preference and restores ordinary provider default behavior.
+///
+/// # Errors
+/// Rejects invalid references, malformed configuration, and inaccessible destinations.
+pub fn plan_execution_preference(
+    path: PathBuf,
+    preference: Option<&crate::ExecutionPreference>,
+) -> Result<ConfigEdit, ConfigError> {
+    let value = preference
+        .map(|preference| {
+            preference.validate().map_err(invalid)?;
+            toml::Value::try_from(preference).map_err(|_| invalid("Invalid execution preference"))
+        })
+        .transpose()?;
+    let keys = ["execution", "default_selection"].map(str::to_owned);
+    plan_validated_field_edit(path, &keys, value)
+}
+
+/// Plan one reviewed plugin settings replacement, fenced against stale discovery/setup input.
+///
+/// Plugin-owned typed preparation supplies `settings`; this editor does not interpret native
+/// protocols or credentials. `expected` must equal the destination's current plugin settings
+/// (`None` means absent). Other plugins, provider defaults, and auth bindings are untouched.
+///
+/// # Errors
+/// Rejects invalid plugin IDs, non-table settings, stale input, malformed files, or I/O failure.
+pub fn plan_plugin_configuration(
+    path: PathBuf,
+    plugin_id: &str,
+    expected: Option<&toml::Value>,
+    settings: &toml::Value,
+) -> Result<ConfigEdit, ConfigError> {
+    if plugin_id.is_empty()
+        || plugin_id.len() > 256
+        || !plugin_id
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || b"._-".contains(&byte))
+        || !settings.is_table()
+    {
+        return Err(invalid("Invalid plugin configuration target"));
+    }
+    let original = read_optional(&path)?;
+    let parsed: toml::Value = toml::from_str(original.as_deref().unwrap_or(""))
+        .map_err(|_| invalid("Existing configuration cannot be edited safely"))?;
+    let current = parsed
+        .get("plugins")
+        .and_then(|value| value.get("config"))
+        .and_then(|value| value.get(plugin_id));
+    if current != expected {
+        return Err(invalid(
+            "Plugin configuration changed since setup preparation",
+        ));
+    }
+    let keys = ["plugins", "config", plugin_id].map(str::to_owned);
+    let edit = plan_validated_field_edit(path, &keys, Some(settings.clone()))?;
+    if edit.original != original {
+        return Err(invalid(
+            "Configuration changed during plugin setup; review again",
+        ));
+    }
+    Ok(edit)
+}
+
+/// Reviewed edit retaining the current configuration policy/provenance fence.
+/// No configuration contents are exposed through Debug or serialization.
+pub struct PolicyConfigEdit {
+    edit: ConfigEdit,
+    reference: crate::recovery::ConfigRecoveryReference,
+    allowed_roots: Vec<PathBuf>,
+}
+
+impl PolicyConfigEdit {
+    /// Exact destination verified against retained load-time provenance.
+    #[must_use]
+    pub fn path(&self) -> &Path {
+        self.edit.path()
+    }
+
+    /// Explicitly commit after review, rejecting changed policy or destination contents.
+    ///
+    /// # Errors
+    /// Returns an error for changed policy, concurrent edits, locking, or I/O failures.
+    pub fn apply(self) -> Result<PathBuf, ConfigError> {
+        crate::recovery::resolve_with_roots(&self.reference, &self.allowed_roots)
+            .map_err(|_| invalid("Configuration policy changed since review; prepare again"))?;
+        self.edit.apply()
+    }
+}
+
+/// Plan remembering a default in the current, verified single-file configuration context.
+///
+/// # Errors
+/// Rejects inline, layered, context-scoped, stale, unconfined, or otherwise unreproducible
+/// policy. Explicit multi-file/context editing requires a separate caller-owned workflow.
+pub fn plan_execution_preference_with_policy(
+    effective: &BcodeConfig,
+    reference: &crate::recovery::ConfigRecoveryReference,
+    allowed_roots: &[PathBuf],
+    preference: Option<&crate::ExecutionPreference>,
+) -> Result<PolicyConfigEdit, ConfigError> {
+    let path = policy_edit_path(effective, reference, allowed_roots)?;
+    let edit = plan_execution_preference(path, preference)?;
+    Ok(PolicyConfigEdit {
+        edit,
+        reference: reference.clone(),
+        allowed_roots: allowed_roots.to_vec(),
+    })
+}
+
+/// Plan reviewed plugin setup in the same policy-fenced destination as execution preferences.
+///
+/// `expected` is the destination's current plugin settings, not merged effective settings.
+/// This changes no provider selection, authentication profile, pool, or binding.
+///
+/// # Errors
+/// Rejects unsupported policy, stale settings, malformed configuration, or inaccessible files.
+pub fn plan_plugin_configuration_with_policy(
+    effective: &BcodeConfig,
+    reference: &crate::recovery::ConfigRecoveryReference,
+    allowed_roots: &[PathBuf],
+    plugin_id: &str,
+    expected: Option<&toml::Value>,
+    settings: &toml::Value,
+) -> Result<PolicyConfigEdit, ConfigError> {
+    let path = policy_edit_path(effective, reference, allowed_roots)?;
+    let edit = plan_plugin_configuration(path, plugin_id, expected, settings)?;
+    Ok(PolicyConfigEdit {
+        edit,
+        reference: reference.clone(),
+        allowed_roots: allowed_roots.to_vec(),
+    })
+}
+
+/// One reviewed plugin replacement in an atomic execution setup edit.
+/// Settings are produced by plugin-owned preparation, never interpreted as native protocol here.
+pub struct PluginConfigurationUpdate<'a> {
+    /// Exact plugin whose settings are being reviewed.
+    pub plugin_id: &'a str,
+    /// Current destination settings (`None` requires absence).
+    pub expected: Option<&'a toml::Value>,
+    /// Complete proposed settings, retaining unrelated instance entries.
+    pub settings: &'a toml::Value,
+}
+
+/// Plan one atomic file replacement for plugin setup and the remembered execution default.
+///
+/// Pass both adapter and generic catalog updates in `updates`. All expected values and the
+/// current configuration provenance are checked before any write. The returned edit requires
+/// explicit approval/application. No provider defaults or auth profiles/pools/bindings change.
+/// Native preparation must be revalidated immediately before application by the caller.
+///
+/// # Errors
+/// Rejects unsupported/stale policy, duplicate targets, invalid plugin IDs/settings, stale
+/// expected values, invalid preference, malformed files, or I/O errors.
+pub fn plan_execution_setup_with_policy(
+    effective: &BcodeConfig,
+    reference: &crate::recovery::ConfigRecoveryReference,
+    allowed_roots: &[PathBuf],
+    updates: &[PluginConfigurationUpdate<'_>],
+    preference: &crate::ExecutionPreference,
+) -> Result<PolicyConfigEdit, ConfigError> {
+    let path = policy_edit_path(effective, reference, allowed_roots)?;
+    preference.validate().map_err(invalid)?;
+    if updates.is_empty() || updates.len() > 16 {
+        return Err(invalid("Invalid execution setup update count"));
+    }
+    let original = read_optional(&path)?;
+    let parsed: toml::Value = toml::from_str(original.as_deref().unwrap_or(""))
+        .map_err(|_| invalid("Existing configuration cannot be edited safely"))?;
+    let mut document = original
+        .as_deref()
+        .unwrap_or("")
+        .parse::<toml_edit::DocumentMut>()
+        .map_err(|_| invalid("Existing configuration cannot be edited safely"))?;
+    let mut targets = std::collections::BTreeSet::new();
+    for update in updates {
+        if update.plugin_id.is_empty()
+            || update.plugin_id.len() > 256
+            || !update
+                .plugin_id
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || b"._-".contains(&byte))
+            || !update.settings.is_table()
+            || !targets.insert(update.plugin_id)
+        {
+            return Err(invalid("Invalid or duplicate plugin configuration target"));
+        }
+        let current = parsed
+            .get("plugins")
+            .and_then(|v| v.get("config"))
+            .and_then(|v| v.get(update.plugin_id));
+        if current != update.expected {
+            return Err(invalid(
+                "Plugin configuration changed since setup preparation",
+            ));
+        }
+        set_setup_value(
+            &mut document,
+            &["plugins", "config", update.plugin_id],
+            update.settings,
+        )?;
+    }
+    let preference =
+        toml::Value::try_from(preference).map_err(|_| invalid("Invalid execution preference"))?;
+    set_setup_value(
+        &mut document,
+        &["execution", "default_selection"],
+        &preference,
+    )?;
+    let rendered = document.to_string();
+    let mut resolved: toml::Value =
+        toml::from_str(&rendered).map_err(|_| invalid("Invalid execution setup configuration"))?;
+    crate::shared_pools::expand(&mut resolved, &path)?;
+    resolved
+        .try_into::<BcodeConfig>()
+        .map_err(|_| invalid("Invalid execution setup configuration"))?;
+    // Recheck provenance after constructing the entire proposal, not just at entry.
+    policy_edit_path(effective, reference, allowed_roots)?;
+    Ok(PolicyConfigEdit {
+        edit: ConfigEdit {
+            path,
+            original,
+            updated: rendered,
+        },
+        reference: reference.clone(),
+        allowed_roots: allowed_roots.to_vec(),
+    })
+}
+
+fn set_setup_value(
+    document: &mut toml_edit::DocumentMut,
+    keys: &[&str],
+    value: &toml::Value,
+) -> Result<(), ConfigError> {
+    let mut table = document.as_table_mut();
+    for key in &keys[..keys.len() - 1] {
+        if !table.contains_key(key) {
+            table.insert(key, toml_edit::Item::Table(toml_edit::Table::new()));
+        }
+        table = table
+            .get_mut(key)
+            .and_then(toml_edit::Item::as_table_mut)
+            .ok_or_else(|| invalid("Configuration setup path is not a table"))?;
+    }
+    let encoded = format!("value = {value}");
+    let parsed = encoded
+        .parse::<toml_edit::DocumentMut>()
+        .map_err(|_| invalid("Invalid setup TOML value"))?;
+    table.insert(keys[keys.len() - 1], parsed["value"].clone());
+    Ok(())
+}
+
+fn policy_edit_path(
+    effective: &BcodeConfig,
+    reference: &crate::recovery::ConfigRecoveryReference,
+    allowed_roots: &[PathBuf],
+) -> Result<PathBuf, ConfigError> {
+    let replayed = crate::recovery::resolve_with_roots(reference, allowed_roots)
+        .map_err(|_| invalid("Current configuration policy cannot be verified for editing"))?;
+    if crate::recovery::execution_fingerprint(effective)
+        .map_err(|_| invalid("Current configuration policy cannot be verified for editing"))?
+        != reference.execution_digest
+        || effective.active_context.is_some()
+        || replayed.active_context.is_some()
+        || reference.sources.active_context.is_some()
+        || reference.sources.inline_overrides
+    {
+        return Err(invalid(
+            "Current context requires explicit configuration editing",
+        ));
+    }
+    let sources = &reference.sources;
+    let paths: Vec<&PathBuf> = sources.exclusive_config_path.as_ref().map_or_else(
+        || {
+            sources
+                .base_config_path
+                .iter()
+                .chain(sources.discovered_paths.iter())
+                .chain(sources.env_config_path.iter())
+                .chain(sources.cli_config_path.iter())
+                .collect()
+        },
+        |path| vec![path],
+    );
+    // Even absent layers are retained policy: do not pick a guessed writable winner.
+    if paths.len() != 1 {
+        return Err(invalid(
+            "Remembering this selection requires one explicit configuration file",
+        ));
+    }
+    let path = paths[0];
+    Ok(if path.is_absolute() {
+        path.clone()
+    } else {
+        sources.cwd.join(path)
+    })
+}
+
 fn plan_validated_field_edit(
     path: PathBuf,
     keys: &[String],
@@ -390,6 +692,168 @@ fn io_error(path: &Path, source: std::io::Error) -> ConfigError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn atomic_execution_setup_updates_both_plugins_and_default_in_one_fenced_write() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("bcode.toml");
+        let original = "# keep\n[model]\nmodel_id = 'ordinary'\nauth_pool = 'existing'\n[plugins.config.other]\nkeep = true\n";
+        std::fs::write(&path, original).unwrap();
+        let effective = crate::load_config_from_paths(std::slice::from_ref(&path)).unwrap();
+        let sources = crate::recovery::ConfigRecoverySources {
+            cwd: temp.path().to_owned(),
+            exclusive_config_path: Some(path.clone()),
+            ..Default::default()
+        };
+        let roots = vec![temp.path().to_owned()];
+        let reference =
+            crate::recovery::capture_with_sources(&effective, &sources, &roots).unwrap();
+        let adapter: toml::Value =
+            toml::from_str("[instances.primary]\nexecutable = '/native'\n").unwrap();
+        let catalog: toml::Value =
+            toml::from_str("enabled = true\ndefault_instance = 'primary'\n").unwrap();
+        let updates = [
+            PluginConfigurationUpdate {
+                plugin_id: "example.native",
+                expected: None,
+                settings: &adapter,
+            },
+            PluginConfigurationUpdate {
+                plugin_id: "bcode.harness",
+                expected: None,
+                settings: &catalog,
+            },
+        ];
+        let preference = crate::ExecutionPreference {
+            model_id: "observed-model".into(),
+            route: bcode_model::execution::ExecutionRoute::ManagedHarness {
+                instance_id: "primary".into(),
+                plugin_id: "example.native".into(),
+            },
+            account_reference: Some("native-account".into()),
+        };
+        let first =
+            plan_execution_setup_with_policy(&effective, &reference, &roots, &updates, &preference)
+                .unwrap();
+        let stale =
+            plan_execution_setup_with_policy(&effective, &reference, &roots, &updates, &preference)
+                .unwrap();
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), original);
+        first.apply().unwrap();
+        assert!(stale.apply().is_err());
+        let text = std::fs::read_to_string(&path).unwrap();
+        let config: BcodeConfig = toml::from_str(&text).unwrap();
+        assert_eq!(config.execution.default_selection, Some(preference));
+        assert_eq!(config.plugins.config["example.native"], adapter);
+        assert_eq!(config.plugins.config["bcode.harness"], catalog);
+        assert_eq!(config.model, effective.model);
+        assert_eq!(config.auth, effective.auth);
+        assert_eq!(
+            config.plugins.config["other"],
+            effective.plugins.config["other"]
+        );
+        assert!(text.starts_with("# keep"));
+    }
+
+    #[test]
+    fn policy_edit_requires_current_single_file_and_rejects_changed_provenance() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("bcode.toml");
+        std::fs::write(&path, "[model]\nmodel_id = 'ordinary'\n").unwrap();
+        let effective = crate::load_config_from_paths(std::slice::from_ref(&path)).unwrap();
+        let sources = crate::recovery::ConfigRecoverySources {
+            cwd: temp.path().to_owned(),
+            exclusive_config_path: Some(path.clone()),
+            ..Default::default()
+        };
+        let roots = vec![temp.path().to_owned()];
+        let reference =
+            crate::recovery::capture_with_sources(&effective, &sources, &roots).unwrap();
+        let edit =
+            plan_execution_preference_with_policy(&effective, &reference, &roots, None).unwrap();
+        assert_eq!(edit.path(), path);
+        std::fs::write(&path, "[model]\nmodel_id = 'changed'\n").unwrap();
+        assert!(edit.apply().is_err());
+        assert!(
+            plan_execution_preference_with_policy(&effective, &reference, &roots, None).is_err()
+        );
+        let mut layered = reference;
+        layered.sources.exclusive_config_path = None;
+        layered.sources.discovered_paths = vec![path, temp.path().join("optional.toml")];
+        assert!(plan_execution_preference_with_policy(&effective, &layered, &roots, None).is_err());
+    }
+
+    #[test]
+    fn execution_preference_is_reviewed_clearable_and_preserves_provider_auth() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("bcode.toml");
+        let original = "# keep\n[model]\nmodel_id = 'ordinary'\nprovider_plugin_id = 'ordinary.provider'\nauth_pool = 'existing-pool'\n[plugins.config.other]\nkeep = true\n";
+        std::fs::write(&path, original).unwrap();
+        let preference = crate::ExecutionPreference {
+            model_id: "discovered-model".into(),
+            route: bcode_model::execution::ExecutionRoute::ManagedHarness {
+                instance_id: "primary".into(),
+                plugin_id: "example.native".into(),
+            },
+            account_reference: Some("native-account".into()),
+        };
+        let edit = plan_execution_preference(path.clone(), Some(&preference)).unwrap();
+        let stale = plan_execution_preference(path.clone(), Some(&preference)).unwrap();
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), original);
+        edit.apply().unwrap();
+        assert!(stale.apply().is_err());
+        let config: crate::BcodeConfig =
+            toml::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(config.execution.default_selection, Some(preference));
+        let before: toml::Value = toml::from_str(original).unwrap();
+        let after: toml::Value = toml::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(before["model"], after["model"]);
+        assert_eq!(before["plugins"], after["plugins"]);
+        assert!(
+            std::fs::read_to_string(&path)
+                .unwrap()
+                .starts_with("# keep")
+        );
+        plan_execution_preference(path.clone(), None)
+            .unwrap()
+            .apply()
+            .unwrap();
+        let cleared: crate::BcodeConfig =
+            toml::from_str(&std::fs::read_to_string(path).unwrap()).unwrap();
+        assert!(cleared.execution.default_selection.is_none());
+        assert_eq!(cleared.model, config.model);
+    }
+
+    #[test]
+    fn plugin_setup_is_scoped_and_checks_preparation_and_apply_fences() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("bcode.toml");
+        let original =
+            "# keep\n[model]\nmodel_id = 'ordinary'\n[plugins.config.other]\nkeep = true\n";
+        std::fs::write(&path, original).unwrap();
+        let settings: toml::Value = toml::from_str("enabled = true\n[instances]\n").unwrap();
+        let first =
+            plan_plugin_configuration(path.clone(), "example.native", None, &settings).unwrap();
+        let stale =
+            plan_plugin_configuration(path.clone(), "example.native", None, &settings).unwrap();
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), original);
+        first.apply().unwrap();
+        assert!(stale.apply().is_err());
+        assert!(
+            plan_plugin_configuration(path.clone(), "example.native", None, &settings).is_err()
+        );
+        let after: toml::Value = toml::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(after["plugins"]["config"]["example.native"], settings);
+        assert_eq!(after["model"]["model_id"].as_str(), Some("ordinary"));
+        assert_eq!(
+            after["plugins"]["config"]["other"]["keep"].as_bool(),
+            Some(true)
+        );
+        assert!(
+            plan_plugin_configuration(path, "example.native", Some(&settings), &settings).is_ok()
+        );
+    }
+
     #[test]
     fn context_account_declaration_is_reviewed_and_uses_isolated_storage() {
         let temp = tempfile::tempdir().unwrap();

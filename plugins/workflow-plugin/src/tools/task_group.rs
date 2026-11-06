@@ -34,8 +34,15 @@ struct Prompt {
 }
 
 #[derive(Deserialize, serde::Serialize)]
+#[serde(untagged)]
+pub(super) enum ModelSelection {
+    Legacy(LegacyModelSelection),
+    Execution(bcode_workflow::ExecutionModelSelection),
+}
+
+#[derive(Deserialize, serde::Serialize)]
 #[serde(deny_unknown_fields)]
-pub(super) struct ModelSelection {
+pub(super) struct LegacyModelSelection {
     provider: String,
     model: String,
 }
@@ -45,11 +52,43 @@ impl ModelSelection {
         self,
         configuration: WorkflowPromptConfiguration,
     ) -> Result<WorkflowPromptConfiguration, String> {
-        if self.provider.trim().is_empty() || self.model.trim().is_empty() {
-            return Err("model selection requires provider and model".into());
-        }
-        Ok(configuration.with_model_selection(self.provider, self.model))
+        let configuration = match self {
+            Self::Legacy(selection) => {
+                if selection.provider.trim().is_empty() || selection.model.trim().is_empty() {
+                    return Err("model selection requires provider and model".into());
+                }
+                configuration.with_model_selection(selection.provider, selection.model)
+            }
+            Self::Execution(selection) => configuration.with_execution_model_selection(selection),
+        };
+        configuration
+            .validate()
+            .map_err(|error| error.to_string())?;
+        Ok(configuration)
     }
+}
+
+pub(super) fn model_selection_schema() -> serde_json::Value {
+    json!({"description":"Exact catalog selection; no provider/model/account fallback or execution authority. Omission preserves inherited runtime selection.",
+    "oneOf":[
+        {"type":"object","additionalProperties":false,"required":["provider","model"],"properties":{
+            "provider":{"type":"string","minLength":1,"maxLength":256},
+            "model":{"type":"string","minLength":1,"maxLength":512}}},
+        {"type":"object","additionalProperties":false,"required":["model_id"],"properties":{
+            "model_id":{"type":"string","minLength":1,"maxLength":512},
+            "account_reference":{"type":["string","null"],"minLength":1,"maxLength":4096},
+            "route":{"oneOf":[
+                {"type":"null"},
+                {"type":"object","additionalProperties":false,"required":["kind","provider_plugin_id"],"properties":{
+                    "kind":{"type":"string","const":"model_provider"},
+                    "provider_plugin_id":{"type":"string","minLength":1,"maxLength":256}}},
+                {"type":"object","additionalProperties":false,"required":["kind","instance_id","plugin_id"],"properties":{
+                    "kind":{"type":"string","const":"managed_harness"},
+                    "instance_id":{"type":"string","minLength":1,"maxLength":4096},
+                    "plugin_id":{"type":"string","minLength":1,"maxLength":256}}}
+            ]}
+        }}
+    ]})
 }
 
 const fn request_version() -> u32 {
@@ -1108,7 +1147,7 @@ pub(super) fn definition() -> bcode_tool::ToolDefinition {
         "tool_allowlist":{"type":"array","items":{"type":"string","minLength":1},"description":"Restricts available tools; empty retains normal agent-policy selection. Never grants permission."},
         "read_only":{"type":"boolean","default":true,"description":"False declares mutating execution; normal workflow ceiling, agent policy and tool permissions still apply. Does not isolate filesystem writes."},
         "resources":{"type":"array","description":"Canonical scheduler claims, not tool authority or filesystem isolation. Omitted means no declared claims.","items":{"type":"object","additionalProperties":false,"required":["resource","access"],"properties":{"resource":{"type":"string","minLength":1},"access":{"type":"string","enum":["read","write"]}}}},
-        "model_selection":{"type":"object","additionalProperties":false,"required":["provider","model"],"properties":{"provider":{"type":"string","minLength":1},"model":{"type":"string","minLength":1}}},
+        "model_selection":model_selection_schema(),
         "output":{"type":"object","description":"ValueSchema: type_name and schema"}}});
     let mut worker = task.clone();
     worker["required"] = json!(["task_id", "objective"]);
@@ -2490,6 +2529,42 @@ mod tests {
             }
         }
         assert_eq!(edit, parse(&request).unwrap());
+    }
+
+    #[test]
+    fn mixed_backend_group_retains_each_exact_selection_and_continuation() {
+        let mut request = request();
+        let provider = json!({"model_id":"provider-model",
+            "route":{"kind":"model_provider","provider_plugin_id":"configured-provider"},
+            "account_reference":"inherited-account"});
+        let harness = json!({"model_id":"observed-native-model",
+            "route":{"kind":"managed_harness","instance_id":"configured-instance","plugin_id":"adapter"},
+            "account_reference":"native-account"});
+        request["tasks"][0]["model_selection"] = provider.clone();
+        request["tasks"][1]["model_selection"] = harness.clone();
+        request["continuation"]["model_selection"] = provider.clone();
+        if bcode_workflow::WORKFLOW_PROMPT_CONFIGURATION_VERSION < 6 {
+            assert!(parse(&request).is_err());
+            return;
+        }
+        let candidate = parse(&request).unwrap();
+        assert_eq!(candidate, parse(&request).unwrap());
+        for (id, selection) in [("a", &provider), ("b", &harness), ("resume", &provider)] {
+            let node = candidate
+                .edits
+                .iter()
+                .find_map(|edit| match edit {
+                    WorkflowRunGraphEdit::AddNode { node, .. } if node.id == id => Some(node),
+                    _ => None,
+                })
+                .unwrap();
+            assert_eq!(&node.configuration["execution_model_selection"], selection);
+            assert_eq!(node.configuration["provider"], json!(null));
+            assert_eq!(node.configuration["model"], json!(null));
+            assert_eq!(node.configuration["allow_user_questions"], json!(false));
+        }
+        request["tasks"][1]["model_selection"]["account_reference"] = json!("");
+        assert!(parse(&request).is_err());
     }
 
     #[test]

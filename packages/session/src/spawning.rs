@@ -30,6 +30,7 @@ mod tests {
                 ..TurnAdmissionMetadata::default()
             },
             auth_profile: None,
+            managed: None,
         }
     }
 

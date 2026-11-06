@@ -107,9 +107,7 @@ mod recovery_lifetime_tests {
 
     #[tokio::test]
     async fn release_provenance_requires_published_runtime_lifetime() {
-        if bcode_session_models::CURRENT_SESSION_EVENT_SCHEMA_VERSION >= 56
-            && bcode_session_models::CURRENT_SESSION_STORAGE_WRITER_EPOCH >= 24
-        {
+        if crate::harness::recovery_published() {
             return;
         }
         // Shape construction is deliberately isolated in the session projector tests;
@@ -363,6 +361,86 @@ impl CanonicalHarnessStore {
         .map_err(|_| ManagedHarnessError::Conflict)?;
         drop(state);
         Ok(true)
+    }
+
+    /// Compare selected intent before any native inspection; true means exact retained prepare.
+    pub(super) async fn prepared_selected_open(
+        &self,
+        owner: &HarnessOwner,
+        request: &bcode_harness_models::HarnessModelsRequest,
+        parent_id: Option<SessionId>,
+    ) -> Result<bool, ManagedHarnessError> {
+        let state = self.state()?;
+        Self::local_owner(&state, owner)?;
+        let summary = match state.sessions.session_summary(owner.session_id).await {
+            Err(bcode_session::SessionError::NotFound(_)) => return Ok(false),
+            Err(error) => return Err(storage_failure("selected_prepare_lookup", &error)),
+            Ok(summary) => summary,
+        };
+        let retained =
+            bcode_session_models::external_harness::ExternalHarnessRequest::from_models_request(
+                request,
+            )
+            .map_err(|_| ManagedHarnessError::Invalid)?;
+        let open = retained.open().ok_or(ManagedHarnessError::Invalid)?;
+        if summary.parent_id != parent_id
+            || super::admission::canonical_directory(&summary.working_directory).await?
+                != super::admission::canonical_directory(std::path::Path::new(
+                    &open.working_directory,
+                ))
+                .await?
+        {
+            return Err(ManagedHarnessError::Conflict);
+        }
+        if state
+            .sessions
+            .session_external_harness_state(owner.session_id)
+            .await
+            .map_err(|error| storage_failure("selected_prepare_snapshot", &error))?
+            .is_none()
+        {
+            // A workflow may create its provenance-bearing child before selected Open.
+            // Canonical preparation still verifies the existing child's parent and workspace.
+            return Ok(false);
+        }
+        let selected = self.selected(owner).await?;
+        if selected.instance != request.instance
+            || selected.prepared_open.as_ref() != Some(&retained)
+        {
+            return Err(ManagedHarnessError::Conflict);
+        }
+        Box::pin(state.sessions.prepare_external_harness_selected_open(
+            &self.durable(owner)?,
+            request,
+            selected.capabilities,
+            parent_id,
+        ))
+        .await
+        .map_err(|_| ManagedHarnessError::Conflict)?;
+        drop(state);
+        Ok(true)
+    }
+
+    pub(super) async fn prepare_selected_open(
+        &self,
+        owner: &HarnessOwner,
+        request: &bcode_harness_models::HarnessModelsRequest,
+        inspection: &HarnessInspection,
+        parent_id: Option<SessionId>,
+    ) -> Result<(), ManagedHarnessError> {
+        let state = self.state()?;
+        Self::local_owner(&state, owner)?;
+        let summary = Box::pin(state.sessions.prepare_external_harness_selected_open(
+            &self.durable(owner)?,
+            request,
+            inspection.capabilities.clone(),
+            parent_id,
+        ))
+        .await
+        .map_err(|error| storage_failure("prepare_selected_open", &error))?;
+        state.session_catalog.upsert_native_session(summary).await;
+        drop(state);
+        Ok(())
     }
 
     pub(super) async fn prepare_open(
@@ -629,6 +707,73 @@ impl ManagedHarnessStore for CanonicalHarnessStore {
         Ok(Box::new(()))
     }
 
+    async fn claim_selected(
+        &self,
+        owner: &HarnessOwner,
+        request: &bcode_harness_models::HarnessModelsRequest,
+    ) -> Result<super::store::SelectedDeliveryClaim, ManagedHarnessError> {
+        use bcode_session_models::external_harness::ExternalHarnessRequest;
+        let state = self.state()?;
+        Self::local_owner(&state, owner)?;
+        let retained = ExternalHarnessRequest::from_models_request(request)
+            .map_err(|_| ManagedHarnessError::Invalid)?;
+        let claim = state
+            .sessions
+            .claim_external_harness_selected_open(&self.durable(owner)?, request)
+            .await
+            .map_err(|_| ManagedHarnessError::Conflict)?;
+        drop(state);
+        match claim {
+            ExternalHarnessClaim::New => Ok(super::store::SelectedDeliveryClaim::New),
+            ExternalHarnessClaim::Uncertain => Ok(super::store::SelectedDeliveryClaim::Uncertain),
+            ExternalHarnessClaim::Recorded(response) => {
+                let response = response
+                    .models_response(&retained)
+                    .map_err(|_| ManagedHarnessError::Conflict)?;
+                Ok(super::store::SelectedDeliveryClaim::Recorded(Box::new(
+                    response,
+                )))
+            }
+        }
+    }
+
+    async fn commit_selected(
+        &self,
+        owner: &HarnessOwner,
+        request: &bcode_harness_models::HarnessModelsRequest,
+        response: &bcode_harness_models::HarnessModelsResponse,
+    ) -> Result<(), ManagedHarnessError> {
+        let state = self.state()?;
+        Self::local_owner(&state, owner)?;
+        state
+            .sessions
+            .complete_external_harness_selected_open(&self.durable(owner)?, request, response)
+            .await
+            .map_err(|_| ManagedHarnessError::Storage)
+    }
+
+    async fn uncertain_selected(
+        &self,
+        owner: &HarnessOwner,
+        request: &bcode_harness_models::HarnessModelsRequest,
+    ) -> Result<(), ManagedHarnessError> {
+        let state = self.state()?;
+        Self::local_owner(&state, owner)?;
+        let response = bcode_harness_models::HarnessModelsResponse {
+            schema_version: request.schema_version,
+            request_id: request.request_id.clone(),
+            instance_id: request.instance.instance_id.clone(),
+            kind: bcode_harness_models::HarnessModelsResponseKind::Failure(
+                bcode_harness_models::HarnessFailure::Uncertain,
+            ),
+        };
+        state
+            .sessions
+            .complete_external_harness_selected_open(&self.durable(owner)?, request, &response)
+            .await
+            .map_err(|_| ManagedHarnessError::Storage)
+    }
+
     async fn claim(
         &self,
         owner: &HarnessOwner,
@@ -646,9 +791,11 @@ impl ManagedHarnessStore for CanonicalHarnessStore {
         tracing::warn!(target: "bcode_server::harness", stage = "claim_done", "managed canonical progress");
         match claim {
             ExternalHarnessClaim::New => Ok(DeliveryClaim::New),
-            ExternalHarnessClaim::Recorded(response) => {
-                Ok(DeliveryClaim::Recorded(Box::new(response.response())))
-            }
+            ExternalHarnessClaim::Recorded(response) => Ok(DeliveryClaim::Recorded(Box::new(
+                response
+                    .response()
+                    .map_err(|_| ManagedHarnessError::Conflict)?,
+            ))),
             ExternalHarnessClaim::Uncertain => Ok(DeliveryClaim::Uncertain),
         }
     }

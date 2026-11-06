@@ -144,6 +144,24 @@ impl Grant {
             grant_rejected("workspace_changed");
             return Err(());
         }
+        // A session-derived profile is live authority, not a permanent grant. In particular,
+        // switching build to plan must invalidate a retained queue and any pending approval.
+        // Explicit execution profiles remain pinned by the admitted turn/workflow ceiling.
+        if self.ceiling.agent_profile.is_none() {
+            let selected = state
+                .sessions
+                .current_agent_selection(self.owner.session_id)
+                .await
+                .map_err(|_| grant_rejected("agent_selection_unavailable"))?;
+            let selected = match selected {
+                Some(agent) => agent,
+                None => default_agent_id(&list_profiles(state, None).await),
+            };
+            if selected != self.agent_id {
+                grant_rejected("agent_selection_changed");
+                return Err(());
+            }
+        }
         if self.cancellation.is_cancelled() {
             grant_rejected("cancelled_after_admission");
             return Err(());

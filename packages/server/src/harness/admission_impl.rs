@@ -85,7 +85,9 @@ impl ManagedSessionAdmission for CanonicalManagedAdmission {
             drop(rechecked);
             match retained {
                 Some(bcode_session_models::ExternalHarnessClaim::Recorded(response)) => {
-                    let response = response.response();
+                    let response = response
+                        .response()
+                        .map_err(|_| ManagedHarnessError::Conflict)?;
                     response
                         .validate_for(&call.harness)
                         .map_err(|_| ManagedHarnessError::Conflict)?;
@@ -108,6 +110,39 @@ impl ManagedSessionAdmission for CanonicalManagedAdmission {
         call: &'a ManagedSessionCall,
     ) -> Task<'a, HarnessOwner> {
         self.existing_tool_authority(caller, call, false)
+    }
+
+    fn create_selected<'a>(
+        &'a self,
+        caller: &'a ManagedCaller,
+        request: &'a bcode_ipc::harness::ManagedSelectedStartRequest,
+    ) -> Task<'a, HarnessOwner> {
+        Box::pin(async move {
+            let owner = self.selected_open_owner(caller, request).await?;
+            let native = bcode_harness_models::HarnessModelsRequest {
+                schema_version: HARNESS_SCHEMA_VERSION,
+                request_id: request.open.open_id.clone(),
+                instance: request.instance.clone(),
+                kind: bcode_harness_models::HarnessModelsRequestKind::OpenSelected {
+                    open: Box::new(request.open.clone()),
+                    selection: bcode_harness_models::HarnessModelSelection {
+                        model_id: request.selection.model_id.clone(),
+                    },
+                },
+            };
+            if self
+                .store
+                .prepared_selected_open(&owner, &native, request.parent_session_id)
+                .await?
+            {
+                return Ok(owner);
+            }
+            let inspection = self.inspect_selected_creation(request).await?;
+            self.store
+                .prepare_selected_open(&owner, &native, &inspection, request.parent_session_id)
+                .await?;
+            Ok(owner)
+        })
     }
 
     fn create<'a>(

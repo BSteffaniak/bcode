@@ -362,6 +362,27 @@ pub fn decode_session_event(payload: &str) -> Result<SessionEvent, PersistedSess
 ///
 /// Returns an error when the event cannot be serialized as JSON.
 pub fn encode_session_event(event: &SessionEvent) -> Result<String, serde_json::Error> {
+    if let SessionEventKind::ChildSessionCreated {
+        spawning: Some(spawn),
+        ..
+    } = &event.kind
+    {
+        spawn
+            .validate_storage(
+                event.schema_version,
+                bcode_session_models::CURRENT_SESSION_STORAGE_WRITER_EPOCH,
+            )
+            .map_err(<serde_json::Error as serde::ser::Error>::custom)?;
+    }
+    if let SessionEventKind::ExternalHarnessOperation { operation } = &event.kind {
+        operation
+            .validate_event_schema(event.schema_version)
+            .map_err(|_| {
+                <serde_json::Error as serde::ser::Error>::custom(
+                    "invalid or unsupported managed harness envelope",
+                )
+            })?;
+    }
     if let SessionEventKind::DurableInteractionCommitted { operation } = &event.kind {
         operation.validate().map_err(|_| {
             <serde_json::Error as serde::ser::Error>::custom(
@@ -563,9 +584,21 @@ impl PersistedSessionEvent {
             provenance: self.provenance,
             kind,
         };
+        if let SessionEventKind::ChildSessionCreated {
+            spawning: Some(spawn),
+            ..
+        } = &event.kind
+        {
+            spawn
+                .validate_storage(
+                    event.schema_version,
+                    bcode_session_models::CURRENT_SESSION_STORAGE_WRITER_EPOCH,
+                )
+                .map_err(|_| PersistedSessionEventError::InvalidExternalBackendRecord)?;
+        }
         if let SessionEventKind::ExternalHarnessOperation { operation } = &event.kind {
             operation
-                .validate()
+                .validate_event_schema(event.schema_version)
                 .map_err(|_| PersistedSessionEventError::InvalidExternalBackendRecord)?;
             if operation.owner.session_id != event.session_id {
                 return Err(PersistedSessionEventError::InvalidExternalBackendRecord);
@@ -2125,6 +2158,7 @@ mod tests {
                 input: "immutable input".to_owned(),
                 admission: TurnAdmissionMetadata::default(),
                 auth_profile: Some("configured-profile".to_owned()),
+                managed: None,
             })
         });
         SessionEvent {

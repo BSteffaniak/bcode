@@ -420,6 +420,7 @@ fn authored_store_fixture() -> (
                                 execution_parent: None,
                                 provider: None,
                                 model: None,
+                                execution_model_selection: None,
                                 output: bcode_workflow::WorkflowPromptOutputPolicy::Structured {
                                     result: bcode_workflow::PromptStructuredOutputPolicy {
                                         schema,

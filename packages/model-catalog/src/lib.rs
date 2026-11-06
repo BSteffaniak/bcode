@@ -5,6 +5,8 @@
 //! Model catalog loading, validation, and static artifact generation.
 
 pub mod application;
+/// Shared execution-route projection and exact selection for providers and configured harnesses.
+pub mod execution;
 
 use bcode_model::{
     CapabilitySource, CapabilitySupport, MediaInputFeature, ModelCacheCapability, ModelCacheInfo,

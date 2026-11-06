@@ -152,7 +152,7 @@ impl HistoricalEnvelope {
         })
     }
 
-    /// Reject recovery and observation variants introduced after the declared historical schema.
+    /// Reject unpublished recovery/interaction families and observations newer than their schema.
     /// This is historical decoding policy, not native protocol interpretation.
     ///
     /// # Errors
@@ -160,8 +160,21 @@ impl HistoricalEnvelope {
     /// recovery or observation variant introduced after its declared schema.
     pub fn validate_observation_compatibility(&self) -> Result<(), HistoricalSessionEventError> {
         let (event_kind, payload) = source_kind(self)?;
-        if self.schema_version < 56
-            && event_kind == "external_harness_operation"
+        if self.schema_version == 56 {
+            return Err(HistoricalSessionEventError::UnsupportedSchema {
+                schema_version: self.schema_version,
+            });
+        }
+        if matches!(
+            event_kind,
+            "durable_interaction_committed" | "turn_continuation_committed"
+        ) {
+            return Err(HistoricalSessionEventError::UnsupportedEventKind {
+                schema_version: self.schema_version,
+                event_kind: event_kind.to_owned(),
+            });
+        }
+        if event_kind == "external_harness_operation"
             && matches!(
                 payload
                     .pointer("/operation/record/kind")
@@ -172,9 +185,52 @@ impl HistoricalEnvelope {
             return Err(HistoricalSessionEventError::InvalidEvent {
                 schema_version: self.schema_version,
                 event_kind: event_kind.to_owned(),
-                reason: "recovery operation requires event schema 56".into(),
+                reason: "recovery operations are unpublished and unsupported".into(),
             });
         }
+        if self.schema_version <= 55 && event_kind == "external_harness_operation" {
+            let selected_request = [
+                "/operation/record/open_request/kind/operation",
+                "/operation/record/request/kind/operation",
+            ]
+            .iter()
+            .any(|pointer| {
+                payload.pointer(pointer).and_then(serde_json::Value::as_str)
+                    == Some("open_selected")
+            });
+            let selected_response = payload
+                .pointer("/operation/record/response/kind/kind")
+                .and_then(serde_json::Value::as_str)
+                == Some("selected");
+            if selected_request || selected_response {
+                return Err(HistoricalSessionEventError::InvalidEvent {
+                    schema_version: self.schema_version,
+                    event_kind: event_kind.to_owned(),
+                    reason: "selected-open evidence is absent from released schema 55".into(),
+                });
+            }
+        }
+        if self.schema_version <= 55
+            && event_kind == "external_harness_operation"
+            && payload
+                .pointer("/operation/version")
+                .and_then(serde_json::Value::as_u64)
+                .is_some_and(|version| version != 1)
+        {
+            return Err(HistoricalSessionEventError::InvalidEvent {
+                schema_version: self.schema_version,
+                event_kind: event_kind.to_owned(),
+                reason: "released harness operations require version 1".into(),
+            });
+        }
+        self.validate_legacy_observation_variants(event_kind, payload)
+    }
+
+    fn validate_legacy_observation_variants(
+        &self,
+        event_kind: &str,
+        payload: &serde_json::Value,
+    ) -> Result<(), HistoricalSessionEventError> {
         if self.schema_version >= 55 {
             return Ok(());
         }

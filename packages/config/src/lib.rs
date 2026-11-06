@@ -29,6 +29,9 @@ pub use shell_presentation::{
 };
 pub mod contexts;
 pub mod edit;
+/// Explicit execution defaults, independent of provider authentication configuration.
+pub mod execution;
+pub use execution::{ExecutionConfig, ExecutionPreference};
 pub mod judgement;
 pub mod milestones;
 /// Verified declarative configuration restart recovery.
@@ -214,6 +217,9 @@ pub struct BcodeConfig {
     pub milestones: MilestonesConfig,
     #[serde(default)]
     pub model: ModelConfig,
+    /// Explicit execution override; absent selection preserves ordinary provider defaults.
+    #[serde(default)]
+    pub execution: ExecutionConfig,
     /// Per-agent permission and tool configuration.
     ///
     /// Keys are agent IDs (for example `build`, `plan`). When a key is absent,
@@ -276,6 +282,7 @@ impl Default for BcodeConfig {
             composition: CompositionConfig::default(),
             plugins: PluginConfig::default(),
             model: ModelConfig::default(),
+            execution: ExecutionConfig::default(),
             judgement: JudgementConfig::default(),
             milestones: MilestonesConfig::default(),
             agent: BTreeMap::new(),
@@ -326,6 +333,10 @@ impl ConfigDocSchema for BcodeConfig {
             schema_section_doc::<MilestonesConfig>(
                 "milestones",
                 "Explicit opt-in paid session milestone generation.",
+            ),
+            schema_section_doc::<ExecutionConfig>(
+                "execution",
+                "Explicit model, route, and nonsecret account execution preference.",
             ),
             schema_section_doc::<ModelConfig>(
                 "model",

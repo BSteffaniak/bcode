@@ -1745,6 +1745,7 @@ impl SessionDb {
         op: &mut ExternalHarnessOperation,
         revision: u64,
     ) -> SessionDbResult<()> {
+        verify_operation_writer(&**self.db, op).await?;
         // Construction fills empty commitments; retained commitments must compare exactly.
         prepare_current_inventory_operation(&**self.db, op, revision).await?;
         Ok(())
@@ -2041,7 +2042,9 @@ async fn inventory_canonical_event(
         .execute_first(db)
         .await?
         .ok_or_else(evidence_maintenance_required)?;
-    strict_event_from_row(&row, session)
+    let event = strict_event_from_row(&row, session)?;
+    verify_operation_writer(db, operation(&event)?).await?;
+    Ok(event)
 }
 
 const KIND: &str = "harness_operation_v1";
@@ -2062,12 +2065,27 @@ fn operation(event: &SessionEvent) -> SessionDbResult<&ExternalHarnessOperation>
     let SessionEventKind::ExternalHarnessOperation { operation } = &event.kind else {
         return Err(invalid());
     };
-    operation.validate().map_err(SessionDbError::InvalidData)?;
+    operation
+        .validate_event_schema(event.schema_version)
+        .map_err(SessionDbError::InvalidData)?;
     if operation.owner.session_id != event.session_id {
         return Err(invalid());
     }
     Ok(operation)
 }
+async fn verify_operation_writer(
+    db: &dyn Database,
+    op: &ExternalHarnessOperation,
+) -> SessionDbResult<()> {
+    if op.is_selected_open()
+        && super::storage_writer_epoch_for(db).await?
+            != u64::from(bcode_session_models::external_harness::SELECTED_OPEN_STORAGE_WRITER_EPOCH)
+    {
+        return Err(invalid());
+    }
+    Ok(())
+}
+
 async fn latest(
     db: &dyn Database,
     session: SessionId,
@@ -2119,6 +2137,7 @@ async fn latest(
         .await?;
     let event = strict_event_from_row(rows.first().ok_or_else(invalid)?, session)?;
     let op = operation(&event)?;
+    verify_operation_writer(db, op).await?;
     if !keys(op)
         .iter()
         .any(|(ns, identity)| ns == namespace && identity == id)
@@ -2130,7 +2149,7 @@ async fn latest(
 fn mutation_key(request: &ExternalHarnessRequest) -> String {
     use ExternalHarnessRequestKind as R;
     match &request.kind {
-        R::Open(_) => "open".into(),
+        R::Open(_) | R::OpenSelected(_) => "open".into(),
         R::Submit { submission, .. } => format!("submit:{}", submission.submission_id),
         R::Respond { response, .. } => format!("respond:{}", response.request_id),
         R::Interrupt(v) => format!("interrupt:{}", v.mutation_id),
@@ -2170,7 +2189,8 @@ fn completion_keys(
 ) -> Vec<(String, String)> {
     let mut keys = vec![("completion".into(), request.request_id.clone())];
     match &response.kind {
-        ExternalHarnessResponseKind::Prepared(_)
+        ExternalHarnessResponseKind::Selected { .. }
+        | ExternalHarnessResponseKind::Prepared(_)
         | ExternalHarnessResponseKind::Opened(_)
         | ExternalHarnessResponseKind::Reconciled(
             bcode_harness_models::HarnessReconciliation::Known { .. }
@@ -2704,6 +2724,7 @@ pub(super) async fn project(db: &dyn Database, event: &SessionEvent) -> SessionD
         return Ok(false);
     }
     let op = operation(event)?;
+    verify_operation_writer(db, op).await?;
     let (expected, nodes) = prepare_inventory_commitments(db, op, event.sequence).await?;
     if op.inventory_commitments != expected {
         return Err(invalid());
@@ -3052,17 +3073,26 @@ fn apply_binding_record(result: &mut ExternalHarnessState, record: &R) -> Sessio
     match record {
         R::DeliveryCompleted { response, .. } => {
             result.binding = match &response.kind {
-                ExternalHarnessResponseKind::Opened(binding)
+                ExternalHarnessResponseKind::Selected {
+                    target: bcode_harness_models::HarnessSessionTarget::Confirmed(binding),
+                    ..
+                }
+                | ExternalHarnessResponseKind::Opened(binding)
                 | ExternalHarnessResponseKind::Reconciled(
                     bcode_harness_models::HarnessReconciliation::Known { binding, .. },
                 ) => Some(binding.clone()),
-                ExternalHarnessResponseKind::Prepared(_)
+                ExternalHarnessResponseKind::Selected {
+                    target: bcode_harness_models::HarnessSessionTarget::Prepared(_),
+                    ..
+                }
+                | ExternalHarnessResponseKind::Prepared(_)
                 | ExternalHarnessResponseKind::Reconciled(
                     bcode_harness_models::HarnessReconciliation::KnownPrepared { .. },
                 ) => None,
                 _ => return Err(invalid()),
             };
             result.target = match &response.kind {
+                ExternalHarnessResponseKind::Selected { target, .. } => Some(target.clone()),
                 ExternalHarnessResponseKind::Prepared(prepared)
                 | ExternalHarnessResponseKind::Reconciled(
                     bcode_harness_models::HarnessReconciliation::KnownPrepared { prepared, .. },
@@ -3110,133 +3140,9 @@ pub(super) async fn validate(db: &dyn Database, event: &SessionEvent) -> Session
     Box::pin(validate_operation(db, event)).await
 }
 
-#[cfg(test)]
-async fn validate_recovery_operation(
-    db: &dyn Database,
-    op: &ExternalHarnessOperation,
-) -> SessionDbResult<()> {
-    validate_recovery_operation_in_prefix(db, op, None).await
-}
-
-async fn validate_release_close_completion(
-    db: &dyn Database,
-    op: &ExternalHarnessOperation,
-    release: &bcode_session_models::external_harness::ExternalHarnessTransportRelease,
-) -> SessionDbResult<()> {
-    let completed = latest(
-        db,
-        op.owner.session_id,
-        "completion",
-        &release.close_request_id,
-    )
-    .await?
-    .ok_or_else(invalid)?;
-    let completed = operation(&completed)?;
-    let R::DeliveryCompleted { request, response } = &completed.record else {
-        return Err(invalid());
-    };
-    if completed.owner != op.owner
-        || request.instance != release.instance
-        || !matches!(&request.kind, ExternalHarnessRequestKind::Close(control)
-            if control.target == bcode_harness_models::HarnessSessionTarget::Confirmed(release.binding.clone())
-                && control.mutation_id == release.close_request_id)
-        || !matches!(&response.kind, ExternalHarnessResponseKind::Acknowledged { mutation_id }
-            if mutation_id == &release.close_request_id)
-    {
-        return Err(invalid());
-    }
-    Ok(())
-}
-
-async fn validate_recovery_operation_in_prefix(
-    db: &dyn Database,
-    op: &ExternalHarnessOperation,
-    before: Option<u64>,
-) -> SessionDbResult<()> {
-    match &op.record {
-        R::TransportReleased { release } => {
-            let current = state_in_prefix(db, &op.owner, before)
-                .await?
-                .ok_or_else(invalid)?;
-            if current.instance != release.instance
-                || current.binding.as_ref() != Some(&release.binding)
-                || latest(
-                    db,
-                    op.owner.session_id,
-                    "transport_release",
-                    &format!("generation:{}", op.owner.generation),
-                )
-                .await?
-                .is_some()
-            {
-                return Err(invalid());
-            }
-            validate_release_close_completion(db, op, release).await?;
-        }
-        R::RecoveryPrepared { recovery } => {
-            recovery
-                .validate_for(&op.owner)
-                .map_err(SessionDbError::InvalidData)?;
-            let current = state_in_prefix(db, &recovery.previous_owner, before)
-                .await?
-                .ok_or_else(invalid)?;
-            // The indexed canonical tail, not absence of a consumed locator, fences
-            // release reuse even if a mutable config/recovery locator is stale or lost.
-            let tail = canonical_harness_tail(db, op.owner.session_id, before)
-                .await?
-                .ok_or_else(invalid)?;
-            if tail.sequence != recovery.release_event_sequence {
-                return Err(invalid());
-            }
-            let release_event = latest(
-                db,
-                op.owner.session_id,
-                "transport_release",
-                &format!("generation:{}", recovery.previous_owner.generation),
-            )
-            .await?
-            .ok_or_else(invalid)?;
-            let release_op = operation(&release_event)?;
-            if current.instance != recovery.release.instance
-                || current.binding.as_ref() != Some(&recovery.release.binding)
-                || release_event.sequence != recovery.release_event_sequence
-                || release_op.owner != recovery.previous_owner
-                || !matches!(&release_op.record, R::TransportReleased { release } if release == &recovery.release)
-                || latest(
-                    db,
-                    op.owner.session_id,
-                    "recovery",
-                    &recovery.resume_request.request_id,
-                )
-                .await?
-                .is_some()
-                || latest(
-                    db,
-                    op.owner.session_id,
-                    "claim",
-                    &recovery.resume_request.request_id,
-                )
-                .await?
-                .is_some()
-                || latest(
-                    db,
-                    op.owner.session_id,
-                    "completion",
-                    &recovery.resume_request.request_id,
-                )
-                .await?
-                .is_some()
-            {
-                return Err(invalid());
-            }
-        }
-        _ => return Err(invalid()),
-    }
-    Ok(())
-}
-
 async fn validate_operation(db: &dyn Database, event: &SessionEvent) -> SessionDbResult<()> {
     let op = operation(event)?;
+    verify_operation_writer(db, op).await?;
     let (expected, _) = prepare_inventory_commitments(db, op, event.sequence).await?;
     if op.inventory_commitments != expected {
         return Err(invalid());
@@ -3245,15 +3151,7 @@ async fn validate_operation(db: &dyn Database, event: &SessionEvent) -> SessionD
         op.record,
         R::TransportReleased { .. } | R::RecoveryPrepared { .. }
     ) {
-        if event.schema_version < 56 {
-            return Err(invalid());
-        }
-        return Box::pin(validate_recovery_operation_in_prefix(
-            db,
-            op,
-            Some(event.sequence),
-        ))
-        .await;
+        return Err(invalid());
     }
     if let Some(tail) =
         canonical_harness_tail(db, op.owner.session_id, Some(event.sequence)).await?
@@ -4118,6 +4016,56 @@ impl SessionDb {
         }
         Ok(result)
     }
+    /// Read exact canonical selected-open locators and result, without delivery authority.
+    /// # Errors
+    /// Rejects conflicting requests, stale locators, wrong owners and concurrent appends.
+    pub async fn external_harness_selected_open_receipt(
+        &self,
+        request: &ExternalHarnessRequest,
+    ) -> SessionDbResult<Option<bcode_session_models::ManagedSessionSpawnOpenReceipt>> {
+        if !request.is_selected_open() {
+            return Err(invalid());
+        }
+        let before = last_sequence(&**self.db).await?;
+        let Some(bcode_session_models::ExternalHarnessClaim::Recorded(response)) =
+            self.external_harness_retained_request(request).await?
+        else {
+            return Ok(None);
+        };
+        let config = latest(&**self.db, self.session_id, "config", "current")
+            .await?
+            .ok_or_else(invalid)?;
+        let claim = latest(&**self.db, self.session_id, "claim", &request.request_id)
+            .await?
+            .ok_or_else(invalid)?;
+        let completed = latest(
+            &**self.db,
+            self.session_id,
+            "completion",
+            &request.request_id,
+        )
+        .await?
+        .ok_or_else(invalid)?;
+        let configured = operation(&config)?;
+        if !matches!(&configured.record, R::Configured { open_request: Some(open), .. } if open == request)
+            || operation(&claim)?.owner != configured.owner
+            || operation(&completed)?.owner != configured.owner
+            || config.sequence >= claim.sequence
+            || claim.sequence >= completed.sequence
+            || last_sequence(&**self.db).await? != before
+        {
+            return Err(invalid());
+        }
+        Ok(Some(bcode_session_models::ManagedSessionSpawnOpenReceipt {
+            owner: configured.owner.clone(),
+            request: request.clone(),
+            response: *response,
+            configured_event_sequence: config.sequence,
+            claimed_event_sequence: claim.sequence,
+            completed_event_sequence: completed.sequence,
+        }))
+    }
+
     /// Compare a complete retained request without adopting its historical execution owner.
     /// # Errors
     /// Rejects conflicting content, stale locators, malformed evidence and concurrent appends.
@@ -4126,7 +4074,7 @@ impl SessionDb {
         request: &ExternalHarnessRequest,
     ) -> SessionDbResult<Option<bcode_session_models::ExternalHarnessClaim>> {
         use bcode_session_models::ExternalHarnessClaim;
-        request.request().validate().map_err(|_| invalid())?;
+        request.validate().map_err(|_| invalid())?;
         if request.target().0 != self.session_id.to_string() {
             return Err(invalid());
         }
@@ -4417,8 +4365,9 @@ async fn validate_claim(
     request: &ExternalHarnessRequest,
 ) -> SessionDbResult<()> {
     if current.instance != request.instance
-        || (matches!(request.kind, ExternalHarnessRequestKind::Open(_))
+        || (request.open().is_some()
             && current.prepared_open.as_ref().is_some_and(|v| v != request))
+        || (request.is_selected_open() && current.prepared_open.as_ref() != Some(request))
         || latest(db, op.owner.session_id, "claim", &request.request_id)
             .await?
             .is_some()
@@ -4443,6 +4392,14 @@ async fn validate_claim(
         ExternalHarnessRequestKind::Interrupt(control)
         | ExternalHarnessRequestKind::Close(control) => {
             if current.target.as_ref() != Some(&control.target) {
+                return Err(invalid());
+            }
+        }
+        ExternalHarnessRequestKind::OpenSelected(_) => {
+            if current.binding.is_some()
+                || current.target.is_some()
+                || request.open().is_none_or(|open| open.resume.is_some())
+            {
                 return Err(invalid());
             }
         }
@@ -4490,7 +4447,11 @@ async fn validate_completion(
 ) -> SessionDbResult<()> {
     if let Some(target) = &current.target {
         match &response.kind {
-            ExternalHarnessResponseKind::Opened(binding)
+            ExternalHarnessResponseKind::Selected {
+                target: bcode_harness_models::HarnessSessionTarget::Confirmed(binding),
+                ..
+            }
+            | ExternalHarnessResponseKind::Opened(binding)
             | ExternalHarnessResponseKind::Reconciled(
                 bcode_harness_models::HarnessReconciliation::Known { binding, .. },
             ) => {
@@ -4502,7 +4463,11 @@ async fn validate_completion(
                     .validate_confirmation(open_id, binding)
                     .map_err(|_| invalid())?;
             }
-            ExternalHarnessResponseKind::Prepared(prepared)
+            ExternalHarnessResponseKind::Selected {
+                target: bcode_harness_models::HarnessSessionTarget::Prepared(prepared),
+                ..
+            }
+            | ExternalHarnessResponseKind::Prepared(prepared)
             | ExternalHarnessResponseKind::Reconciled(
                 bcode_harness_models::HarnessReconciliation::KnownPrepared { prepared, .. },
             ) if target
@@ -5282,390 +5247,8 @@ mod migration_key_tests {
     use bcode_session_migration_target::{MigrationReceipt, MigrationTarget as _};
     use std::collections::BTreeMap;
 
-    async fn released_recovery_fixture() -> (
-        tempfile::TempDir,
-        SessionDb,
-        ExternalHarnessOwner,
-        bcode_session_models::external_harness::ExternalHarnessTransportRelease,
-        bcode_harness_models::HarnessCapabilities,
-    ) {
-        let root = tempfile::tempdir().unwrap();
-        let session = SessionId::new();
-        let db = SessionDb::open_turso_in_root(session, root.path())
-            .await
-            .unwrap();
-        let owner = ExternalHarnessOwner {
-            session_id: session,
-            generation: 1,
-            artifact_id: "legacy-fingerprint".into(),
-            daemon_id: "old-daemon".into(),
-        };
-        let instance = recovery_test_instance();
-        let capabilities = recovery_test_capabilities();
-        let binding = bcode_harness_models::HarnessSessionBinding {
-            schema_version: 1,
-            session_id: session.to_string(),
-            instance_id: "fixture".into(),
-            native_session_id: "retained-native".into(),
-            native_version: "exact-version".into(),
-            generation: 1,
-        };
-        let configured = recovery_test_event(
-            &owner,
-            1,
-            R::Configured {
-                instance: instance.clone(),
-                capabilities: capabilities.clone(),
-                open_request: None,
-            },
-        );
-        append_recovery_test_event(&db, configured).await;
-        let opening = bcode_harness_models::HarnessRequest {
-            schema_version: 1,
-            request_id: "opening".into(),
-            instance: instance.clone(),
-            kind: bcode_harness_models::HarnessRequestKind::Open(
-                bcode_harness_models::HarnessOpenRequest {
-                    open_id: "opening".into(),
-                    session_id: session.to_string(),
-                    generation: 1,
-                    working_directory: "/tmp".into(),
-                    resume: None,
-                    parent_assistance: None,
-                },
-            ),
-        };
-        let retained = ExternalHarnessRequest::from_request(&opening).unwrap();
-        append_recovery_test_event(
-            &db,
-            recovery_test_event(
-                &owner,
-                2,
-                R::DeliveryClaimed {
-                    request: retained.clone(),
-                },
-            ),
-        )
-        .await;
-        let opened = bcode_harness_models::HarnessServiceResponse {
-            schema_version: 1,
-            request_id: "opening".into(),
-            operation: bcode_harness_models::HarnessOperation::Open,
-            kind: bcode_harness_models::HarnessServiceResponseKind::Opened(binding.clone()),
-        };
-        append_recovery_test_event(
-            &db,
-            recovery_test_event(
-                &owner,
-                3,
-                R::DeliveryCompleted {
-                    request: retained,
-                    response: ExternalHarnessResponse::from_response(&opening, &opened).unwrap(),
-                },
-            ),
-        )
-        .await;
-        let old_page = recovery_test_page("old-cursor");
-        append_recovery_test_event(
-            &db,
-            recovery_test_event(
-                &owner,
-                4,
-                R::ObservationPage {
-                    instance: instance.clone(),
-                    after: None,
-                    page: old_page,
-                },
-            ),
-        )
-        .await;
-        let release = close_recovery_fixture(&db, &owner, &binding, &instance).await;
-        (root, db, owner, release, capabilities)
-    }
-
-    async fn close_recovery_fixture(
-        db: &SessionDb,
-        owner: &ExternalHarnessOwner,
-        binding: &bcode_harness_models::HarnessSessionBinding,
-        instance: &bcode_harness_models::HarnessInstance,
-    ) -> bcode_session_models::external_harness::ExternalHarnessTransportRelease {
-        let close = bcode_harness_models::HarnessRequest {
-            schema_version: 1,
-            request_id: "closing".into(),
-            instance: instance.clone(),
-            kind: bcode_harness_models::HarnessRequestKind::Close(
-                bcode_harness_models::HarnessControlRequest {
-                    target: bcode_harness_models::HarnessSessionTarget::Confirmed(binding.clone()),
-                    mutation_id: "closing".into(),
-                },
-            ),
-        };
-        let retained = ExternalHarnessRequest::from_request(&close).unwrap();
-        append_recovery_test_event(
-            db,
-            recovery_test_event(
-                owner,
-                5,
-                R::DeliveryClaimed {
-                    request: retained.clone(),
-                },
-            ),
-        )
-        .await;
-        let release = bcode_session_models::external_harness::ExternalHarnessTransportRelease {
-            close_request_id: "closing".into(),
-            instance: instance.clone(),
-            binding: binding.clone(),
-            reap_id: "physical-reap".into(),
-            lifetime: bcode_session_models::external_harness::ExternalHarnessLifetime {
-                daemon_instance_id: owner.daemon_id.clone(),
-                artifact_id: "exact-artifact-not-fingerprint".into(),
-                state_location_id: "exact-location".into(),
-            },
-        };
-        let premature = recovery_test_event(
-            owner,
-            6,
-            R::TransportReleased {
-                release: release.clone(),
-            },
-        );
-        assert!(
-            validate_recovery_operation(db.database(), operation(&premature).unwrap())
-                .await
-                .is_err()
-        );
-        let ack = bcode_harness_models::HarnessServiceResponse {
-            schema_version: 1,
-            request_id: "closing".into(),
-            operation: bcode_harness_models::HarnessOperation::Close,
-            kind: bcode_harness_models::HarnessServiceResponseKind::Acknowledged {
-                mutation_id: "closing".into(),
-            },
-        };
-        append_recovery_test_event(
-            db,
-            recovery_test_event(
-                owner,
-                6,
-                R::DeliveryCompleted {
-                    request: retained,
-                    response: ExternalHarnessResponse::from_response(&close, &ack).unwrap(),
-                },
-            ),
-        )
-        .await;
-        append_recovery_test_event(
-            db,
-            recovery_test_event(
-                owner,
-                7,
-                R::TransportReleased {
-                    release: release.clone(),
-                },
-            ),
-        )
-        .await;
-        assert!(
-            validate_recovery_operation(db.database(), operation(&premature).unwrap())
-                .await
-                .is_err()
-        );
-        release
-    }
-
-    #[tokio::test]
-    async fn release_and_recovery_projector_fence_exact_generations_without_replay() {
-        // Candidate event fixtures become decodable only after coordinated schema publication.
-        // Until then the separate admission test proves the production path is disabled.
-        if bcode_session_models::CURRENT_SESSION_EVENT_SCHEMA_VERSION < 56 {
-            return;
-        }
-        let (_root, db, owner, release, capabilities) = released_recovery_fixture().await;
-        assert_eq!(
-            db.harness_transport_release(&owner).await.unwrap(),
-            Some((7, release.clone()))
-        );
-        let session = owner.session_id;
-        let (next, recovery) = recovery_test_intent(&owner, release, capabilities);
-        let event = recovery_test_event(
-            &next,
-            8,
-            R::RecoveryPrepared {
-                recovery: Box::new(recovery.clone()),
-            },
-        );
-        let mut wrong = recovery.clone();
-        wrong.release_event_sequence = 5;
-        let wrong = recovery_test_event(
-            &next,
-            8,
-            R::RecoveryPrepared {
-                recovery: Box::new(wrong),
-            },
-        );
-        assert!(
-            validate_recovery_operation(db.database(), operation(&wrong).unwrap())
-                .await
-                .is_err()
-        );
-        append_recovery_test_event(&db, event.clone()).await;
-        reject_competing_recovery_transaction(&db, &event).await;
-        assert!(state(db.database(), &owner).await.is_err());
-        let current = state(db.database(), &next).await.unwrap().unwrap();
-        assert_eq!(current.prepared_open, Some(recovery.resume_request));
-        assert!(
-            current.target.is_none(),
-            "CAS is not native preparation or confirmation"
-        );
-        assert_recovery_cursor_isolation(&db, &next, &current).await;
-        assert!(
-            latest(db.database(), session, "claim", "explicit-recovery")
-                .await
-                .unwrap()
-                .is_none(),
-            "no implicit native dispatch"
-        );
-        assert!(
-            latest(db.database(), session, "completion", "closing")
-                .await
-                .unwrap()
-                .is_some(),
-            "prior outcomes retained"
-        );
-        assert!(
-            validate_recovery_operation(db.database(), operation(&event).unwrap())
-                .await
-                .is_err(),
-            "release CAS consumed exactly once"
-        );
-        // Delete mutable recovery/current locators: canonical tail must still reject
-        // reuse of the old release, even when the old config becomes visible again.
-        for (namespace, id) in [("config", "current"), ("recovery", "explicit-recovery")] {
-            db.database()
-                .delete("turn_evidence")
-                .where_eq("evidence_kind", KIND)
-                .where_eq("turn_id", op_key(namespace, id))
-                .where_eq("event_seq", seq_to_value(8))
-                .execute(db.database())
-                .await
-                .unwrap();
-        }
-        assert!(
-            validate_recovery_operation(db.database(), operation(&event).unwrap())
-                .await
-                .is_err()
-        );
-        assert!(
-            state(db.database(), &owner).await.is_err(),
-            "missing recovery/config locators cannot restore the prior canonical owner"
-        );
-        drop(db);
-    }
-
-    fn recovery_test_intent(
-        previous: &ExternalHarnessOwner,
-        release: bcode_session_models::external_harness::ExternalHarnessTransportRelease,
-        capabilities: bcode_harness_models::HarnessCapabilities,
-    ) -> (
-        ExternalHarnessOwner,
-        bcode_session_models::external_harness::ExternalHarnessRecovery,
-    ) {
-        let owner = ExternalHarnessOwner {
-            generation: 2,
-            daemon_id: "new-daemon".into(),
-            ..previous.clone()
-        };
-        let mut binding = release.binding.clone();
-        binding.generation = owner.generation;
-        let request = bcode_harness_models::HarnessRequest {
-            schema_version: 1,
-            request_id: "explicit-recovery".into(),
-            instance: release.instance.clone(),
-            kind: bcode_harness_models::HarnessRequestKind::Open(
-                bcode_harness_models::HarnessOpenRequest {
-                    open_id: "explicit-recovery".into(),
-                    session_id: owner.session_id.to_string(),
-                    generation: owner.generation,
-                    working_directory: "/tmp".into(),
-                    resume: Some(binding),
-                    parent_assistance: None,
-                },
-            ),
-        };
-        let recovery = bcode_session_models::external_harness::ExternalHarnessRecovery {
-            previous_owner: previous.clone(),
-            release_event_sequence: 7,
-            release,
-            capabilities,
-            resume_request: ExternalHarnessRequest::from_request(&request).unwrap(),
-        };
-        (owner, recovery)
-    }
-
-    async fn assert_recovery_cursor_isolation(
-        db: &SessionDb,
-        owner: &ExternalHarnessOwner,
-        current: &ExternalHarnessState,
-    ) {
-        let page = recovery_test_page("new-cursor");
-        let record = ExternalHarnessOperation {
-            version: 1,
-            owner: owner.clone(),
-            record: R::ObservationPage {
-                instance: current.instance.clone(),
-                after: Some("old-cursor".into()),
-                page: page.clone(),
-            },
-            inventory_commitments: Vec::new(),
-        };
-        let mut confirmed = current.clone();
-        confirmed.target = confirmed
-            .binding
-            .clone()
-            .map(bcode_harness_models::HarnessSessionTarget::Confirmed);
-        assert!(
-            validate_page(
-                db.database(),
-                &record,
-                &confirmed,
-                Some("old-cursor"),
-                &page,
-                &current.instance
-            )
-            .await
-            .is_err(),
-            "a new generation must not adopt the previous cursor"
-        );
-        assert!(
-            validate_page(
-                db.database(),
-                &record,
-                &confirmed,
-                None,
-                &page,
-                &current.instance
-            )
-            .await
-            .is_ok(),
-            "first new-generation page starts without the previous cursor"
-        );
-        assert_eq!(current.observation_after, None);
-        assert_eq!(db.harness_transport_release(owner).await.unwrap(), None);
-        assert_eq!(
-            db.harness_binding_event().await.unwrap(),
-            None,
-            "an old binding locator must not expose a new-generation native binding"
-        );
-    }
-
     #[tokio::test]
     async fn unpublished_recovery_rejects_before_host_verification_or_session_creation() {
-        if bcode_session_models::CURRENT_SESSION_EVENT_SCHEMA_VERSION >= 56
-            && bcode_session_models::CURRENT_SESSION_STORAGE_WRITER_EPOCH >= 24
-        {
-            return;
-        }
         let root = tempfile::tempdir().unwrap();
         let sessions = crate::SessionManager::persistent(root.path()).unwrap();
         let owner = ExternalHarnessOwner {
@@ -5692,6 +5275,20 @@ mod migration_key_tests {
                 state_location_id: "location".into(),
             },
         };
+        let gated = ExternalHarnessOperation {
+            version: 1,
+            owner: owner.clone(),
+            inventory_commitments: Vec::new(),
+            record: R::TransportReleased {
+                release: release.clone(),
+            },
+        };
+        for schema in [55, 56, 57, 58] {
+            assert!(
+                gated.validate_storage(schema, 25).is_err(),
+                "later schemas must not activate recovery"
+            );
+        }
         let verified = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         let called = std::sync::Arc::clone(&verified);
         assert!(
@@ -5792,71 +5389,6 @@ mod migration_key_tests {
         assert!(recovery.validate_for(&next).is_err());
     }
 
-    async fn reject_competing_recovery_transaction(db: &SessionDb, winner: &SessionEvent) {
-        let before = last_sequence(db.database()).await.unwrap();
-        let mut competitor = winner.clone();
-        let SessionEventKind::ExternalHarnessOperation { operation: op } = &mut competitor.kind
-        else {
-            unreachable!()
-        };
-        op.owner.daemon_id = "competing-daemon".into();
-        let R::RecoveryPrepared { recovery } = &mut op.record else {
-            unreachable!()
-        };
-        recovery.resume_request.request_id = "competing-recovery".into();
-        let ExternalHarnessRequestKind::Open(open) = &mut recovery.resume_request.kind else {
-            unreachable!()
-        };
-        open.open_id = "competing-recovery".into();
-        op.validate().unwrap();
-        let tx = db.database().begin_transaction().await.unwrap();
-        assert!(
-            validate_recovery_operation_in_prefix(&*tx, op, None)
-                .await
-                .is_err()
-        );
-        tx.rollback().await.unwrap();
-        assert_eq!(last_sequence(db.database()).await.unwrap(), before);
-        assert!(
-            latest(
-                db.database(),
-                winner.session_id,
-                "recovery",
-                "competing-recovery"
-            )
-            .await
-            .unwrap()
-            .is_none()
-        );
-        let winner_op = operation(winner).unwrap();
-        assert_eq!(
-            state(db.database(), &winner_op.owner)
-                .await
-                .unwrap()
-                .unwrap()
-                .owner,
-            winner_op.owner
-        );
-    }
-
-    fn recovery_test_page(cursor: &str) -> HarnessObservationPage {
-        HarnessObservationPage {
-            retention: None,
-            hydration_requests: Vec::new(),
-            inventory_page: None,
-            observations: Vec::new(),
-            next_after: Some(cursor.into()),
-            completeness: HarnessCompleteness::Complete,
-            status: HarnessExecutionStatus {
-                connectivity: HarnessConnectivity::Connected,
-                activity: HarnessActivity::Idle,
-                attention: HarnessAttention::None,
-                continuation: HarnessContinuation::Unknown,
-                completeness: HarnessCompleteness::Complete,
-            },
-        }
-    }
-
     fn recovery_test_instance() -> bcode_harness_models::HarnessInstance {
         serde_json::from_value(serde_json::json!({"instance_id":"fixture","plugin_id":"fixture",
             "executable":"/not-invoked","config_namespace":"fixture", "auth":{"provider_id":"fixture",
@@ -5879,9 +5411,9 @@ mod migration_key_tests {
             authentication: capability,
         }
     }
-    fn recovery_test_event(owner: &ExternalHarnessOwner, sequence: u64, record: R) -> SessionEvent {
+    fn selected_test_event(owner: &ExternalHarnessOwner, sequence: u64, record: R) -> SessionEvent {
         SessionEvent {
-            schema_version: 56,
+            schema_version: 57,
             sequence,
             timestamp_ms: sequence,
             session_id: owner.session_id,
@@ -5896,7 +5428,700 @@ mod migration_key_tests {
             },
         }
     }
-    async fn append_recovery_test_event(db: &SessionDb, mut event: SessionEvent) {
+    fn selected_request(
+        owner: &ExternalHarnessOwner,
+        model: &str,
+    ) -> bcode_harness_models::HarnessModelsRequest {
+        bcode_harness_models::HarnessModelsRequest {
+            schema_version: 1,
+            request_id: "selected-open".into(),
+            instance: recovery_test_instance(),
+            kind: bcode_harness_models::HarnessModelsRequestKind::OpenSelected {
+                open: Box::new(bcode_harness_models::HarnessOpenRequest {
+                    open_id: "selected-open".into(),
+                    session_id: owner.session_id.to_string(),
+                    generation: owner.generation,
+                    working_directory: "/tmp".into(),
+                    resume: None,
+                    parent_assistance: None,
+                }),
+                selection: bcode_harness_models::HarnessModelSelection {
+                    model_id: model.into(),
+                },
+            },
+        }
+    }
+
+    fn selected_result(
+        request: &bcode_harness_models::HarnessModelsRequest,
+    ) -> bcode_harness_models::HarnessModelsResponse {
+        let bcode_harness_models::HarnessModelsRequestKind::OpenSelected { open, selection } =
+            &request.kind
+        else {
+            unreachable!()
+        };
+        bcode_harness_models::HarnessModelsResponse {
+            schema_version: 1,
+            request_id: request.request_id.clone(),
+            instance_id: request.instance.instance_id.clone(),
+            kind: bcode_harness_models::HarnessModelsResponseKind::Selected {
+                target: bcode_harness_models::HarnessSessionTarget::Prepared(
+                    bcode_harness_models::HarnessPreparedSession {
+                        open_id: open.open_id.clone(),
+                        session_id: open.session_id.clone(),
+                        instance_id: request.instance.instance_id.clone(),
+                        generation: open.generation,
+                        native_version: "fixture-version".into(),
+                        requested_native_session_id: None,
+                    },
+                ),
+                evidence: bcode_harness_models::HarnessModelEvidence {
+                    requested_model_id: selection.model_id.clone(),
+                    effective_model_id: None,
+                },
+            },
+        }
+    }
+
+    #[test]
+    fn selected_family_preserves_exact_envelope_and_separates_result_evidence() {
+        let owner = ExternalHarnessOwner {
+            session_id: SessionId::new(),
+            generation: 1,
+            artifact_id: "artifact".into(),
+            daemon_id: "daemon".into(),
+        };
+        let request = selected_request(&owner, "discovered-model");
+        let retained = ExternalHarnessRequest::from_models_request(&request).unwrap();
+        assert!(
+            retained.request().is_err(),
+            "selected delivery must never become legacy Open"
+        );
+        let serialized = serde_json::to_string(&retained).unwrap();
+        let decoded: ExternalHarnessRequest = serde_json::from_str(&serialized).unwrap();
+        assert_eq!(decoded, retained);
+        decoded.validate().unwrap();
+        let response =
+            ExternalHarnessResponse::from_models_response(&request, &selected_result(&request))
+                .unwrap();
+        response.validate_for(&retained).unwrap();
+        assert!(response.response().is_err());
+        assert!(
+            matches!(response.kind, ExternalHarnessResponseKind::Selected { target: bcode_harness_models::HarnessSessionTarget::Prepared(_), ref evidence } if evidence.effective_model_id.is_none())
+        );
+        let changed =
+            ExternalHarnessRequest::from_models_request(&selected_request(&owner, "other-model"))
+                .unwrap();
+        assert!(response.validate_for(&changed).is_err());
+        let mut corrupt = retained.clone();
+        if let ExternalHarnessRequestKind::OpenSelected(selected) = &mut corrupt.kind {
+            selected.version = 2;
+        }
+        assert!(corrupt.validate().is_err());
+        let mut corrupt = retained.clone();
+        corrupt.request_id = "wrong-request".into();
+        assert!(corrupt.validate().is_err());
+        let mut corrupt = retained.clone();
+        corrupt.instance.auth.profile = "other-account".into();
+        assert!(corrupt.validate().is_err());
+        let configured = ExternalHarnessOperation {
+            version: 1,
+            owner,
+            inventory_commitments: Vec::new(),
+            record: R::Configured {
+                instance: request.instance,
+                capabilities: recovery_test_capabilities(),
+                open_request: Some(retained),
+            },
+        };
+        assert!(configured.validate_storage(55, 23).is_err());
+        assert!(configured.validate_storage(56, 24).is_err());
+        configured.validate_storage(57, 25).unwrap();
+        assert!(configured.validate_storage(57, 24).is_err());
+    }
+
+    async fn assert_selected_claim_identity_fences(
+        db: &SessionDb,
+        owner: &ExternalHarnessOwner,
+        request: &bcode_harness_models::HarnessModelsRequest,
+        retained: &ExternalHarnessRequest,
+        current: &ExternalHarnessState,
+    ) {
+        let legacy = ExternalHarnessRequest::from_request(&bcode_harness_models::HarnessRequest {
+            schema_version: 1,
+            request_id: "legacy-open".into(),
+            instance: request.instance.clone(),
+            kind: bcode_harness_models::HarnessRequestKind::Open(
+                bcode_harness_models::HarnessOpenRequest {
+                    open_id: "legacy-open".into(),
+                    ..retained.open().unwrap().clone()
+                },
+            ),
+        })
+        .unwrap();
+        assert_eq!(mutation_key(retained), mutation_key(&legacy));
+        legacy.validate().unwrap();
+        assert!(
+            matches!(
+                legacy.request().unwrap().kind,
+                bcode_harness_models::HarnessRequestKind::Open(_)
+            ),
+            "legacy Open remains legacy"
+        );
+        let mut different_id = bcode_harness_models::HarnessModelsRequest {
+            schema_version: request.schema_version,
+            request_id: request.request_id.clone(),
+            instance: request.instance.clone(),
+            kind: request.kind.clone(),
+        };
+        different_id.request_id = "other-open".into();
+        if let bcode_harness_models::HarnessModelsRequestKind::OpenSelected { open, .. } =
+            &mut different_id.kind
+        {
+            open.open_id = "other-open".into();
+        }
+        let different_id = ExternalHarnessRequest::from_models_request(&different_id).unwrap();
+        let different_op = ExternalHarnessOperation {
+            version: 1,
+            owner: owner.clone(),
+            record: R::DeliveryClaimed {
+                request: different_id.clone(),
+            },
+            inventory_commitments: Vec::new(),
+        };
+        assert!(
+            validate_claim(db.database(), &different_op, current, &different_id)
+                .await
+                .is_err()
+        );
+        let op = ExternalHarnessOperation {
+            version: 1,
+            owner: owner.clone(),
+            record: R::DeliveryClaimed {
+                request: legacy.clone(),
+            },
+            inventory_commitments: Vec::new(),
+        };
+        assert!(
+            validate_claim(db.database(), &op, current, &legacy)
+                .await
+                .is_err()
+        );
+    }
+
+    async fn assert_selected_database_completion(
+        db: &SessionDb,
+        owner: &ExternalHarnessOwner,
+        request: &bcode_harness_models::HarnessModelsRequest,
+        retained: &ExternalHarnessRequest,
+    ) {
+        let response =
+            ExternalHarnessResponse::from_models_response(request, &selected_result(request))
+                .unwrap();
+        append_selected_test_event(
+            db,
+            selected_test_event(
+                owner,
+                3,
+                R::DeliveryCompleted {
+                    request: retained.clone(),
+                    response: response.clone(),
+                },
+            ),
+        )
+        .await;
+        assert!(matches!(
+            db.external_harness_retained_request(retained)
+                .await
+                .unwrap(),
+            Some(bcode_session_models::ExternalHarnessClaim::Recorded(_))
+        ));
+        let receipt = db
+            .external_harness_selected_open_receipt(retained)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(&receipt.owner, owner);
+        assert_eq!(&receipt.request, retained);
+        assert_eq!(
+            (
+                receipt.configured_event_sequence,
+                receipt.claimed_event_sequence,
+                receipt.completed_event_sequence
+            ),
+            (1, 2, 3)
+        );
+        let prepared = state(db.database(), owner).await.unwrap().unwrap();
+        assert!(prepared.binding.is_none());
+        assert!(matches!(
+            prepared.target,
+            Some(bcode_harness_models::HarnessSessionTarget::Prepared(_))
+        ));
+        let mut corrupt = response;
+        if let ExternalHarnessResponseKind::Selected { evidence, .. } = &mut corrupt.kind {
+            evidence.requested_model_id = "wrong-model".into();
+        }
+        assert!(corrupt.validate_for(retained).is_err());
+        super::super::set_storage_writer_contract(db.database(), 24)
+            .await
+            .unwrap();
+        assert!(
+            state(db.database(), owner).await.is_err(),
+            "schema57 cannot substitute for a writer25 fence"
+        );
+        super::super::set_storage_writer_contract(db.database(), 25)
+            .await
+            .unwrap();
+        db.database()
+            .delete("turn_evidence")
+            .where_eq("evidence_kind", KIND)
+            .where_eq("turn_id", op_key("config", "current"))
+            .execute(db.database())
+            .await
+            .unwrap();
+        assert!(
+            state(db.database(), owner).await.is_err(),
+            "missing configuration must not reconstruct authority"
+        );
+    }
+
+    async fn append_selected_session_created(
+        db: &SessionDb,
+        owner: &ExternalHarnessOwner,
+        root: &std::path::Path,
+    ) {
+        db.append_event(&SessionEvent {
+            schema_version: bcode_session_models::CURRENT_SESSION_EVENT_SCHEMA_VERSION,
+            sequence: 0,
+            timestamp_ms: 0,
+            session_id: owner.session_id,
+            provenance: None,
+            kind: serde_json::from_value(serde_json::json!({"session_created": {
+                "name": "selected claim fixture", "working_directory": root
+            }}))
+            .unwrap(),
+        })
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn selected_database_claims_are_exact_exclusive_and_uncertain_without_replay() {
+        // Canonical decoding remains current-format only; publication belongs to the coordinator.
+        if bcode_session_models::CURRENT_SESSION_EVENT_SCHEMA_VERSION != 57 {
+            return;
+        }
+        let root = tempfile::tempdir().unwrap();
+        let owner = ExternalHarnessOwner {
+            session_id: SessionId::new(),
+            generation: 1,
+            artifact_id: "artifact".into(),
+            daemon_id: "daemon".into(),
+        };
+        let db = SessionDb::open_turso_in_root(owner.session_id, root.path())
+            .await
+            .unwrap();
+        // Candidate-fence test only; production CURRENT constants remain coordinator-owned.
+        super::super::set_storage_writer_contract(db.database(), 25)
+            .await
+            .unwrap();
+        append_selected_session_created(&db, &owner, root.path()).await;
+        let request = selected_request(&owner, "discovered-model");
+        let retained = ExternalHarnessRequest::from_models_request(&request).unwrap();
+        append_selected_test_event(
+            &db,
+            selected_test_event(
+                &owner,
+                1,
+                R::Configured {
+                    instance: request.instance.clone(),
+                    capabilities: recovery_test_capabilities(),
+                    open_request: Some(retained.clone()),
+                },
+            ),
+        )
+        .await;
+        let current = state(db.database(), &owner).await.unwrap().unwrap();
+        assert!(
+            current.binding.is_none() && current.target.is_none(),
+            "configuration is not native evidence"
+        );
+        append_selected_test_event(
+            &db,
+            selected_test_event(
+                &owner,
+                2,
+                R::DeliveryClaimed {
+                    request: retained.clone(),
+                },
+            ),
+        )
+        .await;
+        assert!(matches!(
+            db.external_harness_retained_request(&retained)
+                .await
+                .unwrap(),
+            Some(bcode_session_models::ExternalHarnessClaim::Uncertain)
+        ));
+        let changed =
+            ExternalHarnessRequest::from_models_request(&selected_request(&owner, "other-model"))
+                .unwrap();
+        assert!(
+            db.external_harness_retained_request(&changed)
+                .await
+                .is_err()
+        );
+        assert_selected_claim_identity_fences(&db, &owner, &request, &retained, &current).await;
+        let other = ExternalHarnessRequest::from_models_request(&selected_request(
+            &ExternalHarnessOwner {
+                generation: 2,
+                ..owner.clone()
+            },
+            "discovered-model",
+        ))
+        .unwrap();
+        let stale = ExternalHarnessOperation {
+            version: 1,
+            owner: owner.clone(),
+            record: R::DeliveryClaimed { request: other },
+            inventory_commitments: Vec::new(),
+        };
+        assert!(stale.validate().is_err());
+        assert!(
+            state(
+                db.database(),
+                &ExternalHarnessOwner {
+                    daemon_id: "stale-daemon".into(),
+                    ..owner.clone()
+                }
+            )
+            .await
+            .is_err()
+        );
+        assert_selected_database_completion(&db, &owner, &request, &retained).await;
+    }
+
+    fn selected_actor_fixture(
+        root: &std::path::Path,
+    ) -> (crate::SessionManager, ExternalHarnessOwner) {
+        let sessions = crate::SessionManager::persistent_with_metrics_and_lease_owner(
+            root,
+            bcode_metrics::MetricsRegistry::default(),
+            crate::SessionLeaseOwnerContext {
+                build_fingerprint: Some("artifact".into()),
+                daemon_instance_id: Some("daemon".into()),
+                ..crate::SessionLeaseOwnerContext::default()
+            },
+        )
+        .unwrap();
+        let owner = ExternalHarnessOwner {
+            session_id: SessionId::new(),
+            generation: 1,
+            artifact_id: "artifact".into(),
+            daemon_id: "daemon".into(),
+        };
+        (sessions, owner)
+    }
+
+    async fn assert_selected_actor_changed_request_rejected(
+        sessions: &crate::SessionManager,
+        owner: &ExternalHarnessOwner,
+        request: &bcode_harness_models::HarnessModelsRequest,
+    ) {
+        let mut changed = bcode_harness_models::HarnessModelsRequest {
+            schema_version: request.schema_version,
+            request_id: request.request_id.clone(),
+            instance: request.instance.clone(),
+            kind: request.kind.clone(),
+        };
+        if let bcode_harness_models::HarnessModelsRequestKind::OpenSelected { selection, .. } =
+            &mut changed.kind
+        {
+            selection.model_id = "other-model".into();
+        }
+        assert!(
+            sessions
+                .prepare_external_harness_selected_open(
+                    owner,
+                    &changed,
+                    recovery_test_capabilities(),
+                    None
+                )
+                .await
+                .is_err()
+        );
+        assert!(
+            sessions
+                .claim_external_harness_selected_open(owner, &changed)
+                .await
+                .is_err()
+        );
+        assert!(
+            sessions
+                .claim_external_harness_selected_open(
+                    &ExternalHarnessOwner {
+                        daemon_id: "stale-daemon".into(),
+                        ..owner.clone()
+                    },
+                    request
+                )
+                .await
+                .is_err()
+        );
+        assert!(matches!(
+            sessions
+                .read_external_harness_retained_selected_request(owner.session_id, request)
+                .await
+                .unwrap(),
+            Some(bcode_session_models::ExternalHarnessClaim::Uncertain)
+        ));
+        assert!(
+            sessions
+                .read_external_harness_retained_selected_request(owner.session_id, &changed)
+                .await
+                .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn selected_actor_retry_is_uncertain_and_rejects_changed_model_and_owner() {
+        if bcode_session_models::CURRENT_SESSION_EVENT_SCHEMA_VERSION != 57
+            || bcode_session_models::CURRENT_SESSION_STORAGE_WRITER_EPOCH != 25
+        {
+            return;
+        }
+        let root = tempfile::tempdir().unwrap();
+        let (sessions, owner) = selected_actor_fixture(root.path());
+        let mut request = selected_request(&owner, "discovered-model");
+        if let bcode_harness_models::HarnessModelsRequestKind::OpenSelected { open, .. } =
+            &mut request.kind
+        {
+            open.working_directory = root.path().to_string_lossy().into_owned();
+        }
+        sessions
+            .prepare_external_harness_selected_open(
+                &owner,
+                &request,
+                recovery_test_capabilities(),
+                None,
+            )
+            .await
+            .unwrap();
+        assert!(matches!(
+            sessions
+                .claim_external_harness_selected_open(&owner, &request)
+                .await
+                .unwrap(),
+            bcode_session_models::ExternalHarnessClaim::New
+        ));
+        assert!(matches!(
+            sessions
+                .claim_external_harness_selected_open(&owner, &request)
+                .await
+                .unwrap(),
+            bcode_session_models::ExternalHarnessClaim::Uncertain
+        ));
+        assert_selected_actor_changed_request_rejected(&sessions, &owner, &request).await;
+        sessions
+            .complete_external_harness_selected_open(&owner, &request, &selected_result(&request))
+            .await
+            .unwrap();
+        assert!(matches!(
+            sessions
+                .claim_external_harness_selected_open(&owner, &request)
+                .await
+                .unwrap(),
+            bcode_session_models::ExternalHarnessClaim::Recorded(_)
+        ));
+        let Some(bcode_session_models::ExternalHarnessClaim::Recorded(response)) = sessions
+            .read_external_harness_retained_selected_request(owner.session_id, &request)
+            .await
+            .unwrap()
+        else {
+            panic!("selected result was not retained")
+        };
+        let retained = ExternalHarnessRequest::from_models_request(&request).unwrap();
+        assert!(response.models_response(&retained).is_ok());
+        assert!(response.response().is_err());
+        let receipt = sessions
+            .read_external_harness_selected_open_receipt(owner.session_id, &request)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(receipt.request, retained);
+        assert!(receipt.configured_event_sequence < receipt.claimed_event_sequence);
+        assert!(receipt.claimed_event_sequence < receipt.completed_event_sequence);
+    }
+
+    #[tokio::test]
+    async fn selected_top_level_publication_keeps_workspace_in_first_catalog_actor() {
+        let root = tempfile::tempdir().unwrap();
+        let workspace = tempfile::tempdir().unwrap();
+        let (sessions, owner) = selected_actor_fixture(root.path());
+        let directory = std::fs::canonicalize(workspace.path()).unwrap();
+        let mut request = selected_request(&owner, "discovered-model");
+        let bcode_harness_models::HarnessModelsRequestKind::OpenSelected { open, .. } =
+            &mut request.kind
+        else {
+            unreachable!()
+        };
+        open.working_directory = directory.to_string_lossy().into_owned();
+        sessions
+            .prepare_external_harness_selected_open(
+                &owner,
+                &request,
+                recovery_test_capabilities(),
+                None,
+            )
+            .await
+            .unwrap();
+        // This first summary actor must not seed itself from a root-only degraded catalog row.
+        let summary = sessions.session_summary(owner.session_id).await.unwrap();
+        assert_eq!(summary.working_directory, directory);
+        assert_eq!(summary.parent_id, None);
+        sessions
+            .prepare_external_harness_selected_open(
+                &owner,
+                &request,
+                recovery_test_capabilities(),
+                None,
+            )
+            .await
+            .unwrap();
+        let history = sessions.session_history(owner.session_id).await.unwrap();
+        assert_eq!(history.iter().filter(|event| matches!(event.kind, SessionEventKind::ExternalHarnessOperation { ref operation } if matches!(operation.record, R::Configured { .. }))).count(), 1);
+        assert!(matches!(
+            sessions
+                .claim_external_harness_selected_open(&owner, &request)
+                .await
+                .unwrap(),
+            bcode_session_models::ExternalHarnessClaim::New
+        ));
+    }
+
+    fn selected_spawn_request(
+        native: &bcode_harness_models::HarnessModelsRequest,
+        owner: &ExternalHarnessOwner,
+        parent_id: SessionId,
+        directory: std::path::PathBuf,
+    ) -> bcode_session_models::SessionSpawnRequest {
+        let retained = ExternalHarnessRequest::from_models_request(native).unwrap();
+        let ExternalHarnessRequestKind::OpenSelected(selected) = &retained.kind else {
+            unreachable!()
+        };
+        bcode_session_models::SessionSpawnRequest {
+            version: 2,
+            creation: bcode_session_models::SessionChildCreateRequest {
+                child_id: owner.session_id,
+                parent_id,
+                name: None,
+                working_directory: directory,
+            },
+            worktree_directory: None,
+            input: "immutable initial input".into(),
+            auth_profile: None,
+            admission: bcode_session_models::TurnAdmissionMetadata {
+                idempotency_key: Some("spawn-input".into()),
+                origin: Some(bcode_session_models::TurnOrigin {
+                    producer: "test.spawn".into(),
+                    correlation_id: None,
+                    display_label: None,
+                }),
+                ..bcode_session_models::TurnAdmissionMetadata::default()
+            },
+            managed: Some(bcode_session_models::ManagedSessionSpawnIntent {
+                selected_open: selected.clone(),
+                source: bcode_session_models::ManagedSessionSpawnSource::Explicit,
+            }),
+        }
+    }
+
+    #[tokio::test]
+    async fn selected_spawn_retains_composed_intent_and_canonical_open_receipt() {
+        let root = tempfile::tempdir().unwrap();
+        let (sessions, owner) = selected_actor_fixture(root.path());
+        let directory = std::fs::canonicalize(root.path()).unwrap();
+        let parent = sessions
+            .create_session(None, directory.clone())
+            .await
+            .unwrap();
+        let mut native = selected_request(&owner, "discovered-model");
+        if let bcode_harness_models::HarnessModelsRequestKind::OpenSelected { open, .. } =
+            &mut native.kind
+        {
+            open.working_directory = directory.to_string_lossy().into_owned();
+        }
+        let request = selected_spawn_request(&native, &owner, parent.id, directory);
+        let session = sessions
+            .prepare_external_harness_selected_spawn(&owner, &request, recovery_test_capabilities())
+            .await
+            .unwrap();
+        sessions
+            .prepare_external_harness_selected_spawn(&owner, &request, recovery_test_capabilities())
+            .await
+            .unwrap();
+        let mut changed = request.clone();
+        changed.input.push_str(" conflicting input");
+        assert!(
+            sessions
+                .prepare_external_harness_selected_spawn(
+                    &owner,
+                    &changed,
+                    recovery_test_capabilities()
+                )
+                .await
+                .is_err()
+        );
+        let history = sessions.session_history(owner.session_id).await.unwrap();
+        assert!(
+            matches!(&history[1].kind, SessionEventKind::ChildSessionCreated { spawning: Some(exact), .. } if exact.as_ref() == &request)
+        );
+        assert!(matches!(
+            sessions
+                .claim_external_harness_selected_open(&owner, &native)
+                .await
+                .unwrap(),
+            bcode_session_models::ExternalHarnessClaim::New
+        ));
+        sessions
+            .complete_external_harness_selected_open(&owner, &native, &selected_result(&native))
+            .await
+            .unwrap();
+        let receipt = sessions
+            .read_external_harness_selected_open_receipt(owner.session_id, &native)
+            .await
+            .unwrap()
+            .unwrap();
+        let result = bcode_session_models::ManagedSessionSpawnResult {
+            version: 2,
+            open: Some(receipt),
+            outcome: bcode_session_models::SessionSpawnResult {
+                session: Some(session),
+                admission: None,
+                failure: Some(bcode_session_models::SessionSpawnFailure {
+                    stage: bcode_session_models::SessionSpawnStage::Admission,
+                    code: "not-dispatched".into(),
+                    message: "test stops before admission".into(),
+                }),
+            },
+        };
+        result.validate_for(&request).unwrap();
+        let mut wrong_open = request.clone();
+        if let bcode_harness_models::HarnessModelsRequestKind::OpenSelected { selection, .. } =
+            &mut wrong_open
+                .managed
+                .as_mut()
+                .unwrap()
+                .selected_open
+                .request
+                .kind
+        {
+            selection.model_id = "other-model".into();
+        }
+        assert!(result.validate_for(&wrong_open).is_err());
+    }
+
+    async fn append_selected_test_event(db: &SessionDb, mut event: SessionEvent) {
         let SessionEventKind::ExternalHarnessOperation { operation: op } = &mut event.kind else {
             unreachable!()
         };
@@ -5908,10 +6133,9 @@ mod migration_key_tests {
         // schema explicitly, without changing production writer/schema constants.
         let tx = db.database().begin_transaction().await.unwrap();
         validate_operation(&*tx, &event).await.unwrap();
-        super::super::insert_event(&*tx, &event, None)
+        super::super::append_event_projections(&*tx, &event, None)
             .await
             .unwrap();
-        project(&*tx, &event).await.unwrap();
         tx.commit().await.unwrap();
     }
 

@@ -34,11 +34,81 @@ impl ExternalHarnessOwner {
     }
 }
 
+/// Recovery storage is independently unpublished; later event schemas never enable it.
+#[must_use]
+pub const fn recovery_storage_available() -> bool {
+    false
+}
+
+/// Selected-open storage allocation, independent of unpublished recovery storage.
+pub const SELECTED_OPEN_EVENT_SCHEMA_VERSION: u16 = 57;
+/// Old-writer fence required before selected-open operations may be written.
+pub const SELECTED_OPEN_STORAGE_WRITER_EPOCH: u32 = 25;
+
+/// Exact extension envelope retained in configuration, claim and completion.
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ExternalHarnessSelectedOpen {
+    pub version: u16,
+    pub request: bcode_harness_models::HarnessModelsRequest,
+}
+
+fn clone_models_request(
+    request: &bcode_harness_models::HarnessModelsRequest,
+) -> bcode_harness_models::HarnessModelsRequest {
+    let bcode_harness_models::HarnessModelsRequest {
+        schema_version,
+        request_id,
+        instance,
+        kind,
+    } = request;
+    bcode_harness_models::HarnessModelsRequest {
+        schema_version: *schema_version,
+        request_id: request_id.clone(),
+        instance: instance.clone(),
+        kind: kind.clone(),
+    }
+}
+
+impl Clone for ExternalHarnessSelectedOpen {
+    fn clone(&self) -> Self {
+        Self {
+            version: self.version,
+            request: clone_models_request(&self.request),
+        }
+    }
+}
+
+impl PartialEq for ExternalHarnessSelectedOpen {
+    fn eq(&self, other: &Self) -> bool {
+        let bcode_harness_models::HarnessModelsRequest {
+            schema_version,
+            request_id,
+            instance,
+            kind,
+        } = &self.request;
+        let bcode_harness_models::HarnessModelsRequest {
+            schema_version: other_schema,
+            request_id: other_id,
+            instance: other_instance,
+            kind: other_kind,
+        } = &other.request;
+        self.version == other.version
+            && schema_version == other_schema
+            && request_id == other_id
+            && instance == other_instance
+            && kind == other_kind
+    }
+}
+impl Eq for ExternalHarnessSelectedOpen {}
+
 /// Secret-free native request retained before attempted delivery.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "operation", content = "request", rename_all = "snake_case")]
 pub enum ExternalHarnessRequestKind {
     Open(HarnessOpenRequest),
+    /// Independently fenced selected-open durable family v1; never a legacy Open.
+    OpenSelected(ExternalHarnessSelectedOpen),
     Submit {
         target: HarnessSessionTarget,
         submission: HarnessSubmission,
@@ -60,6 +130,70 @@ pub struct ExternalHarnessRequest {
     pub kind: ExternalHarnessRequestKind,
 }
 impl ExternalHarnessRequest {
+    /// Retain a complete selected-open extension without reinterpreting it as legacy Open.
+    /// # Errors
+    /// Rejects discovery, malformed envelopes and mismatched Open identities.
+    pub fn from_models_request(
+        value: &bcode_harness_models::HarnessModelsRequest,
+    ) -> Result<Self, String> {
+        value
+            .validate()
+            .map_err(|_| "invalid selected-open request")?;
+        let bcode_harness_models::HarnessModelsRequestKind::OpenSelected { open, .. } = &value.kind
+        else {
+            return Err("only selected open can enter canonical storage".into());
+        };
+        if value.request_id != open.open_id || open.resume.is_some() {
+            return Err("selected-open identity mismatch or unsupported resume".into());
+        }
+        Ok(Self {
+            schema_version: value.schema_version,
+            request_id: value.request_id.clone(),
+            instance: value.instance.clone(),
+            kind: ExternalHarnessRequestKind::OpenSelected(ExternalHarnessSelectedOpen {
+                version: 1,
+                request: clone_models_request(value),
+            }),
+        })
+    }
+
+    /// Validate the retained family and redundant correlation fields exactly.
+    /// # Errors
+    /// Rejects malformed requests, unsupported versions and envelope divergence.
+    pub fn validate(&self) -> Result<(), String> {
+        if let ExternalHarnessRequestKind::OpenSelected(selected) = &self.kind {
+            if selected.version != 1 || Self::from_models_request(&selected.request)? != *self {
+                return Err("invalid selected-open durable envelope".into());
+            }
+            Ok(())
+        } else {
+            self.request()?
+                .validate()
+                .map_err(|_| "invalid retained harness request".into())
+        }
+    }
+
+    /// Open payload for either family. This is not delivery authority.
+    #[must_use]
+    pub fn open(&self) -> Option<&HarnessOpenRequest> {
+        match &self.kind {
+            ExternalHarnessRequestKind::Open(open) => Some(open),
+            ExternalHarnessRequestKind::OpenSelected(selected) => match &selected.request.kind {
+                bcode_harness_models::HarnessModelsRequestKind::OpenSelected { open, .. } => {
+                    Some(open)
+                }
+                bcode_harness_models::HarnessModelsRequestKind::DiscoverModels => None,
+            },
+            _ => None,
+        }
+    }
+
+    /// Whether this request uses the independently fenced selected-open family.
+    #[must_use]
+    pub const fn is_selected_open(&self) -> bool {
+        matches!(self.kind, ExternalHarnessRequestKind::OpenSelected(_))
+    }
+
     /// Retain only supported non-auth operation families.
     /// # Errors
     /// Rejects malformed, read-only and authentication requests before persistence.
@@ -94,10 +228,14 @@ impl ExternalHarnessRequest {
         })
     }
     /// Reconstruct bounded non-secret plugin request without consulting current config.
-    #[must_use]
-    pub fn request(&self) -> HarnessRequest {
+    /// # Errors
+    /// Rejects selected requests; use their retained extension envelope instead.
+    pub fn request(&self) -> Result<HarnessRequest, String> {
         let kind = match &self.kind {
             ExternalHarnessRequestKind::Open(v) => HarnessRequestKind::Open(v.clone()),
+            ExternalHarnessRequestKind::OpenSelected(_) => {
+                return Err("selected open cannot be downgraded to legacy Open".into());
+            }
             ExternalHarnessRequestKind::Submit { target, submission } => {
                 HarnessRequestKind::Submit {
                     target: target.clone(),
@@ -114,18 +252,21 @@ impl ExternalHarnessRequest {
             ExternalHarnessRequestKind::Close(v) => HarnessRequestKind::Close(v.clone()),
             ExternalHarnessRequestKind::Reconcile(v) => HarnessRequestKind::Reconcile(v.clone()),
         };
-        HarnessRequest {
+        Ok(HarnessRequest {
             schema_version: self.schema_version,
             request_id: self.request_id.clone(),
             instance: self.instance.clone(),
             kind,
-        }
+        })
     }
     /// Session and ownership generation claimed by the exact request.
     #[must_use]
     pub fn target(&self) -> (&str, u64) {
         match &self.kind {
             ExternalHarnessRequestKind::Open(v) => (&v.session_id, v.generation),
+            ExternalHarnessRequestKind::OpenSelected(_) => self
+                .open()
+                .map_or(("", 0), |open| (open.session_id.as_str(), open.generation)),
             ExternalHarnessRequestKind::Submit { submission, .. } => {
                 (&submission.session_id, submission.generation)
             }
@@ -144,10 +285,17 @@ impl ExternalHarnessRequest {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", content = "response", rename_all = "snake_case")]
 pub enum ExternalHarnessResponseKind {
+    /// Native result evidence, not inspected capabilities.
+    Selected {
+        target: HarnessSessionTarget,
+        evidence: bcode_harness_models::HarnessModelEvidence,
+    },
     Prepared(HarnessPreparedSession),
     Opened(HarnessSessionBinding),
     Receipt(HarnessReceipt),
-    Acknowledged { mutation_id: String },
+    Acknowledged {
+        mutation_id: String,
+    },
     Reconciled(HarnessReconciliation),
     Failure(HarnessFailure),
 }
@@ -159,6 +307,90 @@ pub struct ExternalHarnessResponse {
     pub kind: ExternalHarnessResponseKind,
 }
 impl ExternalHarnessResponse {
+    /// Retain selected evidence against its exact extension request.
+    /// # Errors
+    /// Rejects discovery, wrong families and uncorrelated results.
+    pub fn from_models_response(
+        request: &bcode_harness_models::HarnessModelsRequest,
+        response: &bcode_harness_models::HarnessModelsResponse,
+    ) -> Result<Self, String> {
+        ExternalHarnessRequest::from_models_request(request)?;
+        response
+            .validate_for(request)
+            .map_err(|_| "invalid selected-open response")?;
+        let kind = match &response.kind {
+            bcode_harness_models::HarnessModelsResponseKind::Selected { target, evidence } => {
+                ExternalHarnessResponseKind::Selected {
+                    target: target.clone(),
+                    evidence: evidence.clone(),
+                }
+            }
+            bcode_harness_models::HarnessModelsResponseKind::Failure(failure) => {
+                ExternalHarnessResponseKind::Failure(*failure)
+            }
+            bcode_harness_models::HarnessModelsResponseKind::Models { .. } => {
+                return Err("discovery cannot enter mutation storage".into());
+            }
+        };
+        Ok(Self {
+            schema_version: response.schema_version,
+            request_id: response.request_id.clone(),
+            operation: HarnessOperation::Open,
+            kind,
+        })
+    }
+
+    /// Reconstruct selected evidence without native redispatch.
+    /// # Errors
+    /// Rejects legacy requests and mismatched result evidence.
+    pub fn models_response(
+        &self,
+        request: &ExternalHarnessRequest,
+    ) -> Result<bcode_harness_models::HarnessModelsResponse, String> {
+        request.validate()?;
+        let ExternalHarnessRequestKind::OpenSelected(selected) = &request.kind else {
+            return Err("not a selected-open request".into());
+        };
+        if self.operation != HarnessOperation::Open {
+            return Err("selected-open operation mismatch".into());
+        }
+        let kind = match &self.kind {
+            ExternalHarnessResponseKind::Selected { target, evidence } => {
+                bcode_harness_models::HarnessModelsResponseKind::Selected {
+                    target: target.clone(),
+                    evidence: evidence.clone(),
+                }
+            }
+            ExternalHarnessResponseKind::Failure(failure) => {
+                bcode_harness_models::HarnessModelsResponseKind::Failure(*failure)
+            }
+            _ => return Err("selected open requires selected result evidence".into()),
+        };
+        let response = bcode_harness_models::HarnessModelsResponse {
+            schema_version: self.schema_version,
+            request_id: self.request_id.clone(),
+            instance_id: request.instance.instance_id.clone(),
+            kind,
+        };
+        response
+            .validate_for(&selected.request)
+            .map_err(|_| "invalid selected-open result")?;
+        Ok(response)
+    }
+
+    /// Validate against the exact retained family, never a downgraded Open.
+    /// # Errors
+    /// Rejects mismatched families, identities, targets and model evidence.
+    pub fn validate_for(&self, request: &ExternalHarnessRequest) -> Result<(), String> {
+        request.validate()?;
+        if request.is_selected_open() {
+            self.models_response(request).map(|_| ())
+        } else {
+            self.response()?
+                .validate_for(&request.request()?)
+                .map_err(|_| "invalid retained harness response".into())
+        }
+    }
     /// Validate a non-auth result against the exact retained request.
     /// # Errors
     /// Rejects unsupported families, mismatches and malformed native responses.
@@ -196,9 +428,13 @@ impl ExternalHarnessResponse {
         })
     }
     /// Reproduce the committed result without another native invocation.
-    #[must_use]
-    pub fn response(&self) -> HarnessServiceResponse {
+    /// # Errors
+    /// Rejects selected results; use `models_response` with the retained request.
+    pub fn response(&self) -> Result<HarnessServiceResponse, String> {
         let kind = match &self.kind {
+            ExternalHarnessResponseKind::Selected { .. } => {
+                return Err("selected result cannot be downgraded".into());
+            }
             ExternalHarnessResponseKind::Prepared(v) => {
                 HarnessServiceResponseKind::Prepared(v.clone())
             }
@@ -216,12 +452,12 @@ impl ExternalHarnessResponse {
             }
             ExternalHarnessResponseKind::Failure(v) => HarnessServiceResponseKind::Failure(*v),
         };
-        HarnessServiceResponse {
+        Ok(HarnessServiceResponse {
             schema_version: self.schema_version,
             request_id: self.request_id.clone(),
             operation: self.operation,
             kind,
-        }
+        })
     }
 }
 
@@ -446,7 +682,7 @@ impl ExternalHarnessRecovery {
             .validate()
             .map_err(|_| "invalid recovery capabilities")?;
         self.resume_request
-            .request()
+            .request()?
             .validate()
             .map_err(|_| "invalid recovery request")?;
         if self.capabilities.resume.support
@@ -530,13 +766,52 @@ impl ExternalHarnessOperation {
         serde_json::to_writer(Counter(0), self)
             .map_err(|_| "canonical operation budget exceeded".into())
     }
+    /// Whether this operation carries selected-open canonical authority.
+    #[must_use]
+    pub const fn is_selected_open(&self) -> bool {
+        match &self.record {
+            ExternalHarnessOperationRecord::Configured {
+                open_request: Some(request),
+                ..
+            }
+            | ExternalHarnessOperationRecord::DeliveryClaimed { request }
+            | ExternalHarnessOperationRecord::DeliveryCompleted { request, .. } => {
+                request.is_selected_open()
+            }
+            _ => false,
+        }
+    }
+
+    /// Validate the event representation without inferring writer authority.
+    /// # Errors
+    /// Rejects selected-open records outside their allocated event schema.
+    pub fn validate_event_schema(&self, schema_version: u16) -> Result<(), String> {
+        self.validate()?;
+        if self.is_selected_open() && schema_version != SELECTED_OPEN_EVENT_SCHEMA_VERSION {
+            return Err("selected-open event schema is unavailable".into());
+        }
+        Ok(())
+    }
+
+    /// Validate the independently allocated event and writer fence.
+    /// # Errors
+    /// Rejects selected-open records outside schema57/writer25 and all recovery records.
+    pub fn validate_storage(&self, schema_version: u16, writer_epoch: u32) -> Result<(), String> {
+        self.validate()?;
+        if self.is_selected_open()
+            && (schema_version != SELECTED_OPEN_EVENT_SCHEMA_VERSION
+                || writer_epoch != SELECTED_OPEN_STORAGE_WRITER_EPOCH)
+        {
+            return Err("selected-open storage fence is unavailable".into());
+        }
+        Ok(())
+    }
+
     fn validate_record(&self) -> Result<(), String> {
         match &self.record {
-            ExternalHarnessOperationRecord::TransportReleased { release } => {
-                release.validate_for(&self.owner)?;
-            }
-            ExternalHarnessOperationRecord::RecoveryPrepared { recovery } => {
-                recovery.validate_for(&self.owner)?;
+            ExternalHarnessOperationRecord::TransportReleased { .. }
+            | ExternalHarnessOperationRecord::RecoveryPrepared { .. } => {
+                return Err("managed harness recovery storage is unpublished".into());
             }
             ExternalHarnessOperationRecord::Configured {
                 instance,
@@ -551,7 +826,7 @@ impl ExternalHarnessOperation {
                     .map_err(|_| "invalid harness capabilities".to_owned())?;
                 if let Some(request) = open_request {
                     if request.instance != *instance
-                        || !matches!(request.kind, ExternalHarnessRequestKind::Open(_))
+                        || request.open().is_none()
                         || request.target()
                             != (
                                 self.owner.session_id.to_string().as_str(),
@@ -560,18 +835,12 @@ impl ExternalHarnessOperation {
                     {
                         return Err("invalid retained pre-open preparation".into());
                     }
-                    request
-                        .request()
-                        .validate()
-                        .map_err(|_| "invalid retained open request".to_owned())?;
+                    request.validate()?;
                 }
             }
             ExternalHarnessOperationRecord::DeliveryClaimed { request }
             | ExternalHarnessOperationRecord::DeliveryCompleted { request, .. } => {
-                request
-                    .request()
-                    .validate()
-                    .map_err(|_| "invalid retained harness request".to_owned())?;
+                request.validate()?;
                 let (session, generation) = request.target();
                 if session != self.owner.session_id.to_string()
                     || generation != self.owner.generation
@@ -581,10 +850,7 @@ impl ExternalHarnessOperation {
                 if let ExternalHarnessOperationRecord::DeliveryCompleted { response, .. } =
                     &self.record
                 {
-                    response
-                        .response()
-                        .validate_for(&request.request())
-                        .map_err(|_| "invalid retained response".to_owned())?;
+                    response.validate_for(request)?;
                 }
             }
             ExternalHarnessOperationRecord::ObservationPage {

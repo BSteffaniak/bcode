@@ -123,6 +123,21 @@ async fn prepare_runtime_context(
         }
         None => state.startup_config.clone(),
     };
+    if request.admission.execution.provider_plugin_id.is_none()
+        && matches!(
+            config
+                .execution
+                .default_selection
+                .as_ref()
+                .map(|selection| &selection.route),
+            Some(bcode_model::execution::ExecutionRoute::ManagedHarness { .. })
+        )
+    {
+        // V1 composed spawn has no selected-harness intent or native admission receipt.
+        // Never inherit an unrelated provider merely because the canonical request cannot
+        // represent this configured backend. A versioned managed spawn contract is required.
+        return Err("managed child selection requires a versioned managed spawn contract");
+    }
     if let Some(agent) = request.admission.execution.agent_profile.as_deref()
         && crate::resolve_agent_id(state, agent).await.is_none()
     {
@@ -619,6 +634,7 @@ mod tests {
                 ..Default::default()
             },
             auth_profile: None,
+            managed: None,
         };
         (root, state, request)
     }
@@ -746,6 +762,44 @@ mod tests {
             .await
             .unwrap_err();
         assert_eq!(failure.code, "session_spawn_selection_unavailable");
+        let result = Box::pin(spawn(&state, client_id, request.clone())).await;
+        assert_eq!(
+            result.failure.unwrap().stage,
+            SessionSpawnStage::Preparation
+        );
+        assert!(
+            state
+                .sessions
+                .session_summary_non_owning(request.creation.child_id)
+                .await
+                .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn managed_default_child_never_materializes_an_unrelated_provider() {
+        let (_root, state, request) = fixture().await;
+        let client_id = ClientId::new();
+        let mut config = state.startup_config.clone();
+        config.execution.default_selection = Some(bcode_config::ExecutionPreference {
+            model_id: "native-advertised-key".into(),
+            route: bcode_model::execution::ExecutionRoute::ManagedHarness {
+                instance_id: "configured".into(),
+                plugin_id: "native".into(),
+            },
+            account_reference: Some("native-account".into()),
+        });
+        state
+            .set_client_runtime_context(
+                client_id,
+                Some(crate::ClientRuntimeContext {
+                    effective_config_toml: Some(Box::new(
+                        bcode_config::encode_effective_config(&config).unwrap(),
+                    )),
+                    ..Default::default()
+                }),
+            )
+            .await;
         let result = Box::pin(spawn(&state, client_id, request.clone())).await;
         assert_eq!(
             result.failure.unwrap().stage,

@@ -412,6 +412,87 @@ async fn installed_native_status_only_session_state_one_input() {
 }
 
 #[tokio::test(flavor = "current_thread")]
+#[ignore = "uses existing native Claude subscription; explicit live-run authorization required"]
+async fn installed_native_model_discovery_and_selected_prompt() {
+    verify_artifacts();
+    let directory = tempfile::tempdir().unwrap();
+    let session_uuid = fresh_uuid();
+    let launch = options(directory.path().to_path_buf());
+    let auth = bcode_claude_code::auth_status(&launch).await.unwrap();
+    assert!(auth.logged_in);
+    assert_eq!(auth.method, AuthMethod::ClaudeAccount);
+    let mut session = ClaudeSession::spawn_new_without_tools(launch, &session_uuid)
+        .await
+        .unwrap();
+    let initialized = session.client().initialize().await.unwrap();
+    let models = bcode_claude_code::available_models(&initialized).unwrap();
+    assert!(!models.is_empty());
+    eprintln!(
+        "native-discovered models={:?}",
+        models.iter().map(|model| &model.value).collect::<Vec<_>>()
+    );
+    let model = models
+        .iter()
+        .find(|model| model.value == "haiku")
+        .unwrap_or(&models[0]);
+    let selected = session
+        .client()
+        .select_model_before_prompt(&initialized, &model.value)
+        .await
+        .unwrap();
+    assert_eq!(selected.requested, model.value);
+    let submission = SubmissionUuid::new(fresh_uuid()).unwrap();
+    session
+        .client()
+        .submit_with_uuid(
+            "Reply with exactly SELECTED_MODEL_OK. Do not use tools.",
+            Some(&session_uuid),
+            submission,
+        )
+        .await
+        .unwrap();
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(120);
+    let mut output = false;
+    let mut terminal = false;
+    while !output || !terminal {
+        match tokio::time::timeout_at(deadline, next(&mut session))
+            .await
+            .unwrap()
+        {
+            Event::Message(NativeMessage::Assistant(value)) => {
+                let effective = selected.effective.as_deref().expect(
+                    "native selection must report effective model for this acceptance test",
+                );
+                assert_eq!(
+                    value
+                        .pointer("/message/model")
+                        .and_then(serde_json::Value::as_str),
+                    Some(effective)
+                );
+                output |= value
+                    .pointer("/message/content")
+                    .and_then(serde_json::Value::as_array)
+                    .is_some_and(|blocks| {
+                        blocks.iter().any(|block| {
+                            block.get("text").and_then(serde_json::Value::as_str)
+                                == Some("SELECTED_MODEL_OK")
+                        })
+                    });
+            }
+            Event::Message(NativeMessage::Result(value)) => {
+                assert_eq!(
+                    value.get("is_error").and_then(serde_json::Value::as_bool),
+                    Some(false)
+                );
+                terminal = true;
+            }
+            _ => {}
+        }
+    }
+    session.close().await;
+}
+
+#[tokio::test(flavor = "current_thread")]
 #[ignore = "spends existing Claude subscription; explicit native compatibility authorization required"]
 async fn installed_native_long_lived_two_exact_uuid_submissions() {
     let directory = tempfile::tempdir().unwrap();

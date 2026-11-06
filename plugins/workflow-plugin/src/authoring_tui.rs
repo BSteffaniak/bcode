@@ -2659,6 +2659,7 @@ fn generic_node(
                 agent_profile: profile,
                 provider: None,
                 model: None,
+                execution_model_selection: None,
                 output: bcode_workflow::WorkflowPromptOutputPolicy::Structured {
                     result: bcode_workflow::PromptStructuredOutputPolicy {
                         schema: schema.clone(),

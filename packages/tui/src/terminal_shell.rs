@@ -63,6 +63,28 @@ impl Drop for YieldedTerminal<'_> {
     }
 }
 
+fn validate_selected_attachment(
+    expected: &bcode_harness_models::HarnessSessionTarget,
+    actual: &bcode_harness_models::HarnessSessionTarget,
+) -> Result<(), TuiError> {
+    use bcode_harness_models::HarnessSessionTarget;
+    let compatible = match (expected, actual) {
+        (HarnessSessionTarget::Prepared(prepared), HarnessSessionTarget::Confirmed(binding)) => {
+            expected
+                .validate_confirmation(&prepared.open_id, binding)
+                .is_ok()
+        }
+        _ => expected == actual,
+    };
+    if !compatible {
+        return Err(io::Error::other(
+            "Selected managed target changed before attachment; no fallback or replay",
+        )
+        .into());
+    }
+    Ok(())
+}
+
 impl TerminalShell {
     /// Enter the terminal once for an interactive journey.
     ///
@@ -211,6 +233,42 @@ impl TerminalShell {
         plugins: &[bcode_plugin::StaticBundledPlugin],
         options: TuiLaunchOptions,
     ) -> Result<(), TuiError> {
+        self.run_managed_chat_bound(client, session_id, None, plugins, options)
+            .await
+    }
+
+    /// Attach exactly the target acknowledged by selected canonical creation.
+    /// Prepared identity may only advance to matching confirmed identity; no replacement route
+    /// or ownership generation is accepted and no native operation is replayed.
+    /// # Errors
+    /// Returns target validation, attachment, terminal, or changed-binding errors.
+    pub async fn run_selected_managed_chat(
+        &mut self,
+        client: bcode_client::ManagedSessionClient,
+        target: bcode_harness_models::HarnessSessionTarget,
+        plugins: &[bcode_plugin::StaticBundledPlugin],
+        options: TuiLaunchOptions,
+    ) -> Result<(), TuiError> {
+        target
+            .validate()
+            .map_err(|_| io::Error::other("Invalid selected session target"))?;
+        let session_id = target
+            .session_id()
+            .parse()
+            .map_err(|_| io::Error::other("Invalid selected session identity"))?;
+        self.run_managed_chat_bound(client, session_id, Some(target), plugins, options)
+            .await
+    }
+
+    #[allow(clippy::future_not_send)]
+    async fn run_managed_chat_bound(
+        &mut self,
+        client: bcode_client::ManagedSessionClient,
+        session_id: bcode_session_models::SessionId,
+        selected_target: Option<bcode_harness_models::HarnessSessionTarget>,
+        plugins: &[bcode_plugin::StaticBundledPlugin],
+        options: TuiLaunchOptions,
+    ) -> Result<(), TuiError> {
         let expected_config = bcode_config::encode_effective_config(&bcode_config::load_config()?)?;
         let mut expected_binding = None;
         let mut client = client;
@@ -234,6 +292,9 @@ impl TerminalShell {
                 return Ok(());
             }
             let binding = connection.binding().await?;
+            if let Some(expected) = &selected_target {
+                validate_selected_attachment(expected, &binding.target)?;
+            }
             let claim = (binding.instance, binding.target.generation());
             if expected_binding
                 .as_ref()
@@ -881,6 +942,46 @@ fn paint_text<W: std::io::Write>(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn selected_attachment_rejects_replacement_identity_or_generation() {
+        use bcode_harness_models::{HarnessPreparedSession, HarnessSessionTarget};
+        let expected = HarnessSessionTarget::Prepared(HarnessPreparedSession {
+            open_id: "open".into(),
+            session_id: "session".into(),
+            instance_id: "instance".into(),
+            generation: 1,
+            native_version: "verified-version".into(),
+            requested_native_session_id: None,
+        });
+        assert!(super::validate_selected_attachment(&expected, &expected).is_ok());
+        for replacement in [
+            HarnessPreparedSession {
+                open_id: "other-open".into(),
+                session_id: "session".into(),
+                instance_id: "instance".into(),
+                generation: 1,
+                native_version: "verified-version".into(),
+                requested_native_session_id: None,
+            },
+            HarnessPreparedSession {
+                open_id: "open".into(),
+                session_id: "session".into(),
+                instance_id: "instance".into(),
+                generation: 2,
+                native_version: "verified-version".into(),
+                requested_native_session_id: None,
+            },
+        ] {
+            assert!(
+                super::validate_selected_attachment(
+                    &expected,
+                    &HarnessSessionTarget::Prepared(replacement)
+                )
+                .is_err()
+            );
+        }
+    }
+
     #[test]
     fn native_child_exit_is_not_auth_readiness() {
         use bcode_provider_auth_models::managed::AuthReadiness;

@@ -565,9 +565,9 @@ pub async fn check_owner_admission(
     request: &PreparedActivationDispatch,
     owner: &WorkflowExecutionAuthority,
 ) -> Result<Option<serde_json::Value>, Error> {
-    let tx = db
-        .begin_transaction_with_mode(TransactionMode::Immediate)
-        .await?;
+    // Admission observes one consistent snapshot; the later receipt mutation fences
+    // authority again. Do not reserve the writer slot for this read-only check.
+    let tx = db.begin_transaction().await?;
     super::super::verified(&*tx).await?;
     let root = run(&*tx, &request.activation.run_id).await?;
     authority(&root, owner)?;

@@ -2,6 +2,182 @@
 use super::*;
 
 #[tokio::test]
+async fn selected_provider_prompt_preserves_ordinary_execution_without_auth_override() {
+    let (_root, mut state, session_id) = admission_fixture().await;
+    {
+        let mutable = Arc::get_mut(&mut state).unwrap();
+        mutable.selected_provider_plugin_id = Some("bcode.fake-provider".into());
+        mutable.selected_model_id = Some("fake-echo".into());
+    }
+    let mut store = bcode_workflow_store::WorkflowStore::open_at_path(
+        state.workflow_store.lock().unwrap().path(),
+    )
+    .unwrap();
+    let pending = store
+        .pending_activations_for_run("admission-run", 1)
+        .unwrap()
+        .pop()
+        .unwrap();
+    let mut plan = WorkflowActivationOwner { state: &state }
+        .plan(&pending)
+        .await
+        .unwrap()
+        .unwrap();
+    let inherited = session_model_selection(&state, session_id).await;
+    let provider = inherited.provider_plugin_id.clone().unwrap();
+    let model = inherited.model_id.clone().unwrap();
+    let mut configuration: bcode_workflow::WorkflowPromptConfiguration =
+        serde_json::from_value(plan.intent["configuration"].clone()).unwrap();
+    configuration.provider = None;
+    configuration.model = None;
+    configuration.execution_model_selection = Some(bcode_workflow::ExecutionModelSelection {
+        model_id: model,
+        route: Some(bcode_model::execution::ExecutionRoute::ModelProvider {
+            provider_plugin_id: provider,
+        }),
+        account_reference: None,
+    });
+    plan.intent["configuration"] = serde_json::to_value(configuration).unwrap();
+    let prepared = store
+        .prepare_pending_activation(
+            &pending.run_id,
+            &pending.node_id,
+            &pending.activation_id,
+            bcode_workflow::DispatchSideEffect::Mutating,
+            plan.intent,
+            2,
+        )
+        .unwrap()
+        .unwrap();
+    let receipt = dispatch_workflow_prompt_turn(&state, &prepared)
+        .await
+        .unwrap();
+    assert_eq!(receipt["owner"], workflow_receipts::AGENT_TURN_OWNER);
+    let after = session_model_selection(&state, session_id).await;
+    assert_eq!(after.provider_context, inherited.provider_context);
+    assert_eq!(after.provider_plugin_id, inherited.provider_plugin_id);
+    // An explicit foreign account fails before native/provider dispatch, never becoming an override.
+    let mut config = workflow_prompt_configuration_from_intent(&prepared).unwrap();
+    config
+        .execution_model_selection
+        .as_mut()
+        .unwrap()
+        .account_reference = Some("foreign-account".into());
+    assert!(
+        workflow_operations::execution_selection::plan(&state, &prepared, &config)
+            .await
+            .is_err()
+    );
+}
+
+#[tokio::test]
+async fn selected_prompt_plan_retains_mutation_custody_even_with_read_only_tools() {
+    let (_root, state, _) = admission_fixture().await;
+    let mut pending = state
+        .workflow_store
+        .lock()
+        .unwrap()
+        .pending_activations_for_run("admission-run", 1)
+        .unwrap()
+        .pop()
+        .unwrap();
+    let mut configuration: bcode_workflow::WorkflowPromptConfiguration =
+        serde_json::from_value(pending.node.configuration.clone()).unwrap();
+    configuration.execution_target = bcode_workflow::PromptContextTarget::FreshIsolated;
+    configuration.provider = None;
+    configuration.model = None;
+    configuration.read_only = true;
+    configuration.execution_model_selection = Some(bcode_workflow::ExecutionModelSelection {
+        model_id: "native-model".into(),
+        route: Some(bcode_model::execution::ExecutionRoute::ManagedHarness {
+            instance_id: "instance".into(),
+            plugin_id: "adapter".into(),
+        }),
+        account_reference: Some("native-account".into()),
+    });
+    pending.node.configuration = serde_json::to_value(&configuration).unwrap();
+    let plan = WorkflowPromptTurnOwner { state: &state }
+        .plan(&pending)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        plan.side_effect,
+        bcode_workflow::DispatchSideEffect::Mutating
+    );
+    assert_eq!(
+        plan.intent["configuration"],
+        serde_json::to_value(configuration).unwrap()
+    );
+}
+
+#[tokio::test]
+async fn selected_prompt_dispatch_unavailable_discovery_never_falls_back_to_provider() {
+    let (_root, state, session_id) = admission_fixture().await;
+    let mut store = bcode_workflow_store::WorkflowStore::open_at_path(
+        state.workflow_store.lock().unwrap().path(),
+    )
+    .unwrap();
+    let pending = store
+        .pending_activations_for_run("admission-run", 1)
+        .unwrap()
+        .pop()
+        .unwrap();
+    let mut plan = WorkflowActivationOwner { state: &state }
+        .plan(&pending)
+        .await
+        .unwrap()
+        .unwrap();
+    // Exercise the prompt dispatch boundary with an exact selected request in its durable
+    // intent. There is deliberately no harness configuration/discovery service in this fixture.
+    let mut configuration: bcode_workflow::WorkflowPromptConfiguration =
+        serde_json::from_value(plan.intent["configuration"].clone()).unwrap();
+    configuration.execution_target = bcode_workflow::PromptContextTarget::FreshIsolated;
+    configuration.provider = None;
+    configuration.model = None;
+    configuration.execution_model_selection = Some(bcode_workflow::ExecutionModelSelection {
+        model_id: "explicit-native-model".into(),
+        route: Some(bcode_model::execution::ExecutionRoute::ManagedHarness {
+            instance_id: "unavailable-instance".into(),
+            plugin_id: "unavailable-adapter".into(),
+        }),
+        account_reference: Some("native-account".into()),
+    });
+    plan.intent["configuration"] = serde_json::to_value(configuration).unwrap();
+    let prepared = store
+        .prepare_pending_activation(
+            &pending.run_id,
+            &pending.node_id,
+            &pending.activation_id,
+            plan.side_effect,
+            plan.intent,
+            2,
+        )
+        .unwrap()
+        .unwrap();
+    let before = state.sessions.all_session_summaries().await.len();
+    assert!(
+        dispatch_workflow_prompt_turn(&state, &prepared)
+            .await
+            .is_err()
+    );
+    assert_eq!(state.sessions.all_session_summaries().await.len(), before);
+    assert!(
+        state
+            .sessions
+            .session_history(session_id)
+            .await
+            .unwrap()
+            .iter()
+            .all(|event| !matches!(
+                event.kind,
+                SessionEventKind::UserMessage { .. } | SessionEventKind::SubmissionAccepted { .. }
+            ))
+    );
+    assert!(!store.attempt_history("admission-run", None, 1).unwrap()[0].has_receipt);
+}
+
+#[tokio::test]
 async fn transient_storage_recovery_drives_canonical_run_once() {
     let (root, mut state, _session_id) = admission_fixture().await;
     let placeholder = tempfile::tempdir().unwrap();

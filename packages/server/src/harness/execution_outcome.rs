@@ -167,13 +167,15 @@ impl Work {
 
 fn evidence_fence(
     observation: &HarnessObservation,
-    receipt: &HarnessWorkflowReceipt,
+    session_id: bcode_session_models::SessionId,
+    generation: u64,
+    requirement: HarnessCompletionRequirement,
 ) -> Result<Option<AttemptObservation>, WorkflowStoreError> {
     observation
         .validate()
         .map_err(|_| invalid("invalid managed execution observation"))?;
-    if observation.session_id != receipt.session_id.to_string()
-        || observation.generation != receipt.generation
+    if observation.session_id != session_id.to_string()
+        || observation.generation != generation
         || observation.completeness == HarnessCompleteness::Gap
         || (matches!(&observation.kind, HarnessObservationKind::Execution { .. })
             && observation.completeness != HarnessCompleteness::Complete)
@@ -184,7 +186,7 @@ fn evidence_fence(
     }
     if matches!(&observation.kind, HarnessObservationKind::Status { status }
         if status.completeness == HarnessCompleteness::Gap)
-        || (receipt.completion_requirement == HarnessCompletionRequirement::AssociatedWork
+        || (requirement == HarnessCompletionRequirement::AssociatedWork
             && matches!(
                 &observation.kind,
                 HarnessObservationKind::Interaction { .. }
@@ -242,11 +244,60 @@ pub(super) fn evaluate(
         )));
     }
     let exact = attempt(receipt)?;
+    match evaluate_assignment(
+        observations,
+        receipt.session_id,
+        receipt.generation,
+        &exact,
+        receipt.completion_requirement,
+    )? {
+        None => Ok(None),
+        Some(AssignmentVerdict::Pending(observation)) => Ok(Some(observation)),
+        Some(AssignmentVerdict::Completed {
+            native_turn_id,
+            output,
+        }) => complete_assignment_output(receipt, native_turn_id.as_deref(), &output).map(Some),
+    }
+}
+
+/// Shared canonical verdict independent of block or prompt output representation.
+pub(super) enum AssignmentVerdict {
+    Pending(AttemptObservation),
+    Completed {
+        native_turn_id: Option<String>,
+        output: String,
+    },
+}
+
+/// Evaluate exact foreground and associated work without acquiring authority or replaying work.
+pub(super) fn evaluate_assignment(
+    observations: &[HarnessObservation],
+    session_id: bcode_session_models::SessionId,
+    generation: u64,
+    exact: &HarnessAttemptIdentity,
+    requirement: HarnessCompletionRequirement,
+) -> Result<Option<AssignmentVerdict>, WorkflowStoreError> {
+    if !observations
+        .iter()
+        .any(|o| matches!(&o.kind, HarnessObservationKind::Execution { .. }))
+    {
+        return Ok(None);
+    }
+    if observations.len() > bcode_harness_models::MAX_HARNESS_OBSERVATIONS
+        || !matches!(
+            requirement,
+            HarnessCompletionRequirement::Foreground | HarnessCompletionRequirement::AssociatedWork
+        )
+    {
+        return Ok(Some(AssignmentVerdict::Pending(deferred(
+            "unsupported completion responsibility or excessive snapshot",
+        ))));
+    }
     let mut terminal = None;
     let mut work = Work::default();
     for observation in observations {
-        if let Some(fence) = evidence_fence(observation, receipt)? {
-            return Ok(Some(fence));
+        if let Some(fence) = evidence_fence(observation, session_id, generation, requirement)? {
+            return Ok(Some(AssignmentVerdict::Pending(fence)));
         }
         if let HarnessObservationKind::Execution { event } = &observation.kind {
             if let E::SubmissionTerminal {
@@ -256,41 +307,50 @@ pub(super) fn evaluate(
                 output,
                 ..
             } = event
-                && attempt == &exact
+                && attempt == exact
             {
                 let next = (*disposition, native_turn_id.clone(), output.clone());
                 if terminal.as_ref().is_some_and(|prior| prior != &next) {
-                    return Ok(Some(deferred("conflicting managed foreground terminal")));
+                    return Ok(Some(AssignmentVerdict::Pending(deferred(
+                        "conflicting managed foreground terminal",
+                    ))));
                 }
                 terminal = Some(next);
             }
-            if receipt.completion_requirement == HarnessCompletionRequirement::AssociatedWork
-                && !work.observe(event, &exact)
+            if requirement == HarnessCompletionRequirement::AssociatedWork
+                && !work.observe(event, exact)
             {
-                return Ok(Some(deferred(
+                return Ok(Some(AssignmentVerdict::Pending(deferred(
                     "conflicting or excessive managed execution evidence",
-                )));
+                ))));
             }
         }
     }
     let Some((disposition, native_turn_id, output)) = terminal else {
-        return Ok(Some(deferred("awaiting exact managed foreground terminal")));
+        return Ok(Some(AssignmentVerdict::Pending(deferred(
+            "awaiting exact managed foreground terminal",
+        ))));
     };
-    if receipt.completion_requirement == HarnessCompletionRequirement::AssociatedWork
+    if requirement == HarnessCompletionRequirement::AssociatedWork
         && let Some(verdict) = work.verdict()
     {
-        return Ok(Some(verdict));
+        return Ok(Some(AssignmentVerdict::Pending(verdict)));
     }
     Ok(Some(match disposition {
-        D::Interrupted => AttemptObservation::Cancelled,
-        D::Failed => AttemptObservation::Failed {
+        D::Interrupted => AssignmentVerdict::Pending(AttemptObservation::Cancelled),
+        D::Failed => AssignmentVerdict::Pending(AttemptObservation::Failed {
             message: "managed foreground failed".into(),
-        },
+        }),
         D::Completed => {
             let Some(output) = output else {
-                return Ok(Some(deferred("managed foreground output incomplete")));
+                return Ok(Some(AssignmentVerdict::Pending(deferred(
+                    "managed foreground output incomplete",
+                ))));
             };
-            complete_assignment_output(receipt, native_turn_id.as_deref(), &output)?
+            AssignmentVerdict::Completed {
+                native_turn_id,
+                output,
+            }
         }
     }))
 }

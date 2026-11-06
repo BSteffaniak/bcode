@@ -27,6 +27,7 @@ pub(crate) mod cursor_blink;
 pub(crate) mod daemon_issue;
 pub(crate) mod effects;
 pub mod eval_launcher;
+mod execution_picker;
 pub(crate) mod exit_state;
 pub(crate) mod filtered_list;
 pub(crate) mod foreground;
@@ -53,11 +54,13 @@ pub mod monitor_presentation;
 pub(crate) mod mouse_flow;
 pub(crate) mod older_history;
 pub mod onboarding;
+pub use execution_picker::{ExecutionPickerOutcome, run_execution_picker_in_shell};
 mod quick_onboarding;
 mod xray_inspectors;
 pub use quick_onboarding::{
     QuickConnectionChoice, QuickOnboardingInput, QuickOnboardingOutcome,
-    run_backend_selection_in_shell, run_quick_onboarding, run_quick_onboarding_in_shell,
+    run_backend_selection_in_shell, run_execution_confirmation_in_shell, run_quick_onboarding,
+    run_quick_onboarding_in_shell,
 };
 pub mod browser_presentation;
 pub(crate) mod composer_interaction;

@@ -5,7 +5,11 @@
 
 mod attribution;
 mod auth;
+mod discovery;
+pub use discovery::{inspect_installed_account, installed_version};
 mod launch;
+mod models;
+pub use models::{NativeModel, NativeModelSelection, available_models};
 mod protocol;
 mod transport;
 

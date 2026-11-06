@@ -65,6 +65,8 @@ struct QuickProgram {
     outcome: QuickOnboardingOutcome,
     form: Option<ConnectionForm>,
     backend_selection: bool,
+    require_visible_confirmation: bool,
+    confirmation_visible: bool,
     theme: PresentedTheme,
     keymap: crate::keymap::BmuxKeyMap,
 }
@@ -85,6 +87,8 @@ impl QuickProgram {
             outcome: QuickOnboardingOutcome::Close,
             form: None,
             backend_selection: false,
+            require_visible_confirmation: false,
+            confirmation_visible: false,
             theme: *theme,
             keymap: crate::keymap::BmuxKeyMap::from_config(&bcode_config::TuiConfig::default()),
         }
@@ -145,12 +149,17 @@ impl QuickProgram {
                 );
                 self.selected = self.list.focused().unwrap_or(0);
                 self.list.set_selected(Some(self.selected));
+                if self.require_visible_confirmation {
+                    self.confirmation_visible = false;
+                }
             }
             Some("tui.control.submit") if self.input.choices.is_empty() => {
                 if !self.backend_selection {
                     self.form = Some(ConnectionForm::quick());
                 }
             }
+            Some("tui.control.submit")
+                if self.require_visible_confirmation && !self.confirmation_visible => {}
             Some("tui.control.submit") => {
                 self.outcome = QuickOnboardingOutcome::Selected(self.selected);
                 return Lifecycle::Exit;
@@ -269,6 +278,7 @@ impl QuickProgram {
             form.render_with_keymap(frame, &self.theme, &self.keymap);
             return;
         }
+        self.confirmation_visible = false;
         let width = self.area.width;
         let mut header = wrapped_rows("Welcome to Bcode", width, self.theme.focused);
         header.extend(wrapped_rows(
@@ -332,6 +342,7 @@ impl QuickProgram {
                 .saturating_sub(header_height)
                 .saturating_sub(footer_height),
         );
+        self.confirmation_visible = width > 0 && self.choice_area.height > 0;
         paint_rows(frame, 0, &header);
         if !self.input.choices.is_empty() {
             let items = self.items();
@@ -482,7 +493,7 @@ pub async fn run_quick_onboarding_in_shell(
     shell: &mut crate::TerminalShell,
     input: QuickOnboardingInput,
 ) -> Result<QuickOnboardingOutcome, TuiError> {
-    run_picker_in_shell(shell, input, false).await
+    run_picker_in_shell(shell, input, false, false).await
 }
 
 /// Select an execution backend without offering provider enrollment.
@@ -493,18 +504,30 @@ pub async fn run_backend_selection_in_shell(
     shell: &mut crate::TerminalShell,
     input: QuickOnboardingInput,
 ) -> Result<QuickOnboardingOutcome, TuiError> {
-    run_picker_in_shell(shell, input, true).await
+    run_picker_in_shell(shell, input, true, false).await
+}
+
+/// Review an execution preference only after its full bounded review screen is visible.
+/// # Errors
+/// Returns terminal/configuration failures without applying any preference.
+pub async fn run_execution_confirmation_in_shell(
+    shell: &mut crate::TerminalShell,
+    input: QuickOnboardingInput,
+) -> Result<QuickOnboardingOutcome, TuiError> {
+    run_picker_in_shell(shell, input, true, true).await
 }
 
 async fn run_picker_in_shell(
     shell: &mut crate::TerminalShell,
     input: QuickOnboardingInput,
     backend_selection: bool,
+    require_visible_confirmation: bool,
 ) -> Result<QuickOnboardingOutcome, TuiError> {
     let config = bcode_config::load_config()?;
     let theme = crate::theme::resolve_configured_theme(&config.tui, std::path::Path::new("."));
     let mut program = QuickProgram::new(input, &theme);
     program.backend_selection = backend_selection;
+    program.require_visible_confirmation = require_visible_confirmation;
     program.keymap = crate::keymap::BmuxKeyMap::from_config(&config.tui);
     let mut terminal = shell.terminal()?;
     let (runtime, handle) = bmux_tui_runtime::Runtime::new(
@@ -614,6 +637,33 @@ mod tests {
         assert!(program.form.is_none());
         assert_eq!(program.key(KeyCode::F(2)), Lifecycle::Exit);
         assert_eq!(program.outcome, QuickOnboardingOutcome::Advanced);
+    }
+
+    #[test]
+    fn execution_confirmation_requires_a_visible_review_after_navigation() {
+        let mut program = program();
+        program.backend_selection = true;
+        program.require_visible_confirmation = true;
+        assert_eq!(program.key(KeyCode::Enter), Lifecycle::Continue);
+        for (width, height, permitted) in [(1, 1, false), (100, 30, true), (1, 1, false)] {
+            let mut buffer = bmux_tui::buffer::Buffer::empty(Rect::new(0, 0, width, height));
+            program.render(&mut PaintCx::new(&mut bmux_tui::frame::Frame::new(
+                &mut buffer,
+            )));
+            assert_eq!(program.confirmation_visible, permitted);
+        }
+        assert_eq!(program.key(KeyCode::Enter), Lifecycle::Continue);
+        let mut buffer = bmux_tui::buffer::Buffer::empty(Rect::new(0, 0, 100, 30));
+        program.render(&mut PaintCx::new(&mut bmux_tui::frame::Frame::new(
+            &mut buffer,
+        )));
+        assert_eq!(program.key(KeyCode::Down), Lifecycle::Continue);
+        assert!(!program.confirmation_visible);
+        assert_eq!(program.key(KeyCode::Enter), Lifecycle::Continue);
+        program.render(&mut PaintCx::new(&mut bmux_tui::frame::Frame::new(
+            &mut buffer,
+        )));
+        assert_eq!(program.key(KeyCode::Enter), Lifecycle::Exit);
     }
 
     #[test]

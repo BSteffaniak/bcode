@@ -9,7 +9,13 @@ mod application;
 mod assistance;
 mod auth_inspection;
 mod canonical;
+pub(crate) mod execution_catalog;
 mod history;
+
+/// Recovery remains independently unpublished, regardless of selected-launch writer versions.
+pub(crate) const fn recovery_published() -> bool {
+    false
+}
 mod policy;
 mod runtime;
 mod store;

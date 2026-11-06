@@ -2124,6 +2124,7 @@ impl HyperChadAppState {
     ) -> Result<(), &'static str> {
         retained
             .request()
+            .map_err(|_| "Invalid native composer envelope")?
             .validate()
             .map_err(|_| "Invalid native composer envelope")?;
         let bcode_session_models::ExternalHarnessRequestKind::Submit { submission, .. } =

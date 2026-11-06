@@ -127,6 +127,14 @@ pub enum ManagedSessionOperation {
     AuthReaped,
     AuthAcknowledge,
     Binding,
+    /// Explicit opt-in execution catalog; does not select an ambient provider.
+    ExecutionCatalog,
+    /// Exact model-selected creation, never legacy Open fallback.
+    StartSelected,
+    /// Bounded enabled-plugin installation discovery before instance configuration.
+    DiscoverCandidates,
+    /// Revalidate one selected installation without committing configuration.
+    PrepareCandidate,
 }
 impl ManagedSessionOperation {
     /// Stable interface operation.
@@ -134,6 +142,10 @@ impl ManagedSessionOperation {
     pub const fn as_str(self) -> &'static str {
         match self {
             Self::Start => "start",
+            Self::ExecutionCatalog => "execution_catalog",
+            Self::StartSelected => "start_selected",
+            Self::DiscoverCandidates => "discover_candidates",
+            Self::PrepareCandidate => "prepare_candidate",
             Self::Recover => "recover",
             Self::Binding => "binding",
             Self::Inspect => "inspect",
@@ -168,6 +180,239 @@ impl ManagedSessionOperation {
                 | Self::AuthReaped
                 | Self::AuthAcknowledge
         )
+    }
+}
+
+/// Bounded installation discovery across enabled manifest-declared harness plugins.
+/// No native launch inputs or implicit provider credentials are accepted.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ManagedCandidatesRequest {
+    pub request_id: String,
+}
+impl ManagedCandidatesRequest {
+    /// Validate correlation before any plugin inspection.
+    /// # Errors
+    /// Rejects empty, excessive or malformed identities.
+    pub fn validate(&self) -> Result<(), &'static str> {
+        if execution_id(&self.request_id) {
+            Ok(())
+        } else {
+            Err("invalid candidate discovery identity")
+        }
+    }
+}
+
+/// Correlated per-plugin candidate results, including explicit incomplete/failure evidence.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ManagedCandidatesResponse {
+    pub request_id: String,
+    pub plugins: Vec<bcode_harness_models::HarnessCandidatesResponse>,
+    /// False if enabled service fanout exceeded the bounded inspection budget.
+    pub complete: bool,
+}
+
+/// Bounded discovery inputs. Instances are references revalidated by their owning plugin.
+/// Omitting the provider explicitly excludes provider discovery and credential materialization.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ManagedExecutionCatalogRequest {
+    pub request_id: String,
+    pub instances: Vec<bcode_harness_models::HarnessInstance>,
+    pub provider_plugin_id: Option<String>,
+}
+
+/// Secret-safe discovery issue; a failed instance is not an empty successful catalog.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ManagedExecutionCatalogIssue {
+    pub instance_id: Option<String>,
+    pub code: String,
+}
+
+/// One bounded execution inventory. Advertisement is not proof of model entitlement.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ManagedExecutionCatalog {
+    pub request_id: String,
+    pub models: Vec<bcode_model::execution::ExecutionModel>,
+    pub issues: Vec<ManagedExecutionCatalogIssue>,
+}
+
+/// Immutable selected creation intent. The host resolves selection, never native default fallback.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ManagedSelectedStartRequest {
+    pub selection: bcode_model::execution::ExecutionModelSelection,
+    pub instance: bcode_harness_models::HarnessInstance,
+    pub open: bcode_harness_models::HarnessOpenRequest,
+    pub parent_session_id: Option<bcode_session_models::SessionId>,
+}
+
+/// Successful canonical selected creation and exact native acknowledgment.
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ManagedSelectedStartResponse {
+    pub selection: bcode_model::execution::ResolvedExecutionModel,
+    pub response: bcode_harness_models::HarnessModelsResponse,
+}
+
+impl ManagedExecutionCatalogRequest {
+    /// Validate bounded identities before any discovery I/O.
+    /// # Errors
+    /// Rejects malformed identities, duplicate instances and excessive fanout.
+    pub fn validate(&self) -> Result<(), &'static str> {
+        if !execution_id(&self.request_id)
+            || self.instances.len() > 16
+            || self
+                .provider_plugin_id
+                .as_ref()
+                .is_some_and(|id| !execution_id(id))
+        {
+            return Err("invalid execution catalog request");
+        }
+        let mut instances = std::collections::BTreeSet::new();
+        for instance in &self.instances {
+            instance
+                .validate()
+                .map_err(|_| "invalid execution instance")?;
+            if !instances.insert(&instance.instance_id) {
+                return Err("duplicate execution instance");
+            }
+        }
+        Ok(())
+    }
+}
+
+impl ManagedSelectedStartRequest {
+    /// Validate exact selected fresh-open correlation without granting execution authority.
+    /// # Errors
+    /// Rejects resume, malformed selection, foreign route/account and invalid open identity.
+    pub fn validate(&self) -> Result<(), &'static str> {
+        use bcode_model::execution::ExecutionRoute;
+        if self.open.open_id.is_empty() || self.open.open_id.len() > 256 {
+            return Err("invalid selected start open identity");
+        }
+        if !execution_id(&self.selection.model_id)
+            || self.open.resume.is_some()
+            || self.open.parent_assistance.is_some()
+            || self.open.generation != 1
+            || self
+                .selection
+                .account_reference
+                .as_ref()
+                .is_some_and(|account| account != &self.instance.auth.profile)
+            || !matches!(&self.selection.route,
+                Some(ExecutionRoute::ManagedHarness { instance_id, plugin_id })
+                    if instance_id == &self.instance.instance_id && plugin_id == &self.instance.plugin_id)
+        {
+            return Err("invalid selected start route");
+        }
+        let session: bcode_session_models::SessionId = self
+            .open
+            .session_id
+            .parse()
+            .map_err(|_| "invalid selected start session")?;
+        if self.parent_session_id == Some(session) {
+            return Err("invalid selected start parent");
+        }
+        let request = bcode_harness_models::HarnessModelsRequest {
+            schema_version: bcode_harness_models::HARNESS_SCHEMA_VERSION,
+            request_id: self.open.open_id.clone(),
+            instance: self.instance.clone(),
+            kind: bcode_harness_models::HarnessModelsRequestKind::OpenSelected {
+                open: Box::new(self.open.clone()),
+                selection: bcode_harness_models::HarnessModelSelection {
+                    model_id: self.selection.model_id.clone(),
+                },
+            },
+        };
+        request
+            .validate()
+            .map_err(|_| "invalid selected start contract")
+    }
+}
+
+fn execution_id(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= 256
+        && value.trim() == value
+        && !value.chars().any(char::is_control)
+}
+
+#[cfg(test)]
+mod execution_contract_tests {
+    use super::*;
+
+    fn instance() -> bcode_harness_models::HarnessInstance {
+        bcode_harness_models::HarnessInstance {
+            instance_id: "configured".into(),
+            plugin_id: "native".into(),
+            executable: "/native".into(),
+            config_namespace: "/account".into(),
+            auth: bcode_harness_models::HarnessAuthBinding {
+                provider_id: "native-auth".into(),
+                profile: "account".into(),
+                credential_namespace: "/account".into(),
+                custody: bcode_harness_models::HarnessAuthCustody::NativeManaged,
+            },
+        }
+    }
+
+    #[test]
+    fn catalog_is_explicit_bounded_and_not_a_legacy_call() {
+        let mut query = ManagedExecutionCatalogRequest {
+            request_id: "discover".into(),
+            instances: vec![instance()],
+            provider_plugin_id: None,
+        };
+        assert!(query.validate().is_ok());
+        let envelope = ManagedSessionRequest {
+            schema_version: MANAGED_SESSION_VERSION,
+            operation: ManagedSessionOperation::ExecutionCatalog,
+            request_json: serde_json::to_string(&query).unwrap(),
+        };
+        assert!(envelope.decode_execution_catalog().is_ok());
+        assert!(envelope.decode_call().is_err());
+        assert!(envelope.decode_selected_start().is_err());
+        query.instances.push(instance());
+        assert!(query.validate().is_err());
+        query.instances.clear();
+        query.provider_plugin_id = Some(" ".into());
+        assert!(query.validate().is_err());
+    }
+
+    #[test]
+    fn selected_start_requires_exact_route_and_fresh_open() {
+        let instance = instance();
+        let mut query = ManagedSelectedStartRequest {
+            selection: bcode_model::execution::ExecutionModelSelection {
+                model_id: "advertised-key".into(),
+                route: Some(bcode_model::execution::ExecutionRoute::ManagedHarness {
+                    instance_id: instance.instance_id.clone(),
+                    plugin_id: instance.plugin_id.clone(),
+                }),
+                account_reference: Some(instance.auth.profile.clone()),
+            },
+            instance,
+            open: bcode_harness_models::HarnessOpenRequest {
+                open_id: "open".into(),
+                session_id: bcode_session_models::SessionId::new().to_string(),
+                generation: 1,
+                working_directory: "/workspace".into(),
+                resume: None,
+                parent_assistance: None,
+            },
+            parent_session_id: None,
+        };
+        assert!(query.validate().is_ok());
+        query.selection.route = None;
+        assert!(query.validate().is_err());
+        query.selection.route = Some(bcode_model::execution::ExecutionRoute::ModelProvider {
+            provider_plugin_id: "unrelated".into(),
+        });
+        assert!(query.validate().is_err());
     }
 }
 
@@ -247,6 +492,34 @@ pub struct ManagedSessionHistoryRequest {
     pub limit: u16,
 }
 impl ManagedSessionRequest {
+    /// Decode the opt-in execution inventory without accepting native mutation payloads.
+    /// # Errors
+    /// Rejects other operations, incompatible envelopes and invalid bounded queries.
+    pub fn decode_execution_catalog(&self) -> Result<ManagedExecutionCatalogRequest, &'static str> {
+        self.validate_envelope()?;
+        if self.operation != ManagedSessionOperation::ExecutionCatalog {
+            return Err("execution catalog operation mismatch");
+        }
+        let query: ManagedExecutionCatalogRequest = serde_json::from_str(&self.request_json)
+            .map_err(|_| "invalid execution catalog request")?;
+        query.validate()?;
+        Ok(query)
+    }
+
+    /// Decode exact selected creation without interpreting it as legacy Open.
+    /// # Errors
+    /// Rejects other operations, incompatible envelopes and invalid selection correlation.
+    pub fn decode_selected_start(&self) -> Result<ManagedSelectedStartRequest, &'static str> {
+        self.validate_envelope()?;
+        if self.operation != ManagedSessionOperation::StartSelected {
+            return Err("selected start operation mismatch");
+        }
+        let query: ManagedSelectedStartRequest = serde_json::from_str(&self.request_json)
+            .map_err(|_| "invalid selected start request")?;
+        query.validate()?;
+        Ok(query)
+    }
+
     /// Decode shared native semantics without deriving any caller or owner authority.
     /// # Errors
     /// Rejects incompatible versions, excessive input, malformed data and operation mismatch.

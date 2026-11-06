@@ -1508,6 +1508,21 @@ fn durable_child_and_results(
                 i.text(&spawn.input, 5)?;
                 i.optional_text(spawn.auth_profile.as_ref(), 5)?;
                 admission(i, &spawn.admission, 5)?;
+                i.nodes(1, 5)?;
+                if let Some(managed) = &spawn.managed {
+                    harness_operation::selected_open(i, &managed.selected_open)?;
+                    i.nodes(1, 6)?;
+                    if let crate::ManagedSessionSpawnSource::Inherited {
+                        owner,
+                        selected_open,
+                    } = &managed.source
+                    {
+                        i.nodes(2, 7)?;
+                        i.text(&owner.artifact_id, 8)?;
+                        i.text(&owner.daemon_id, 8)?;
+                        harness_operation::selected_open(i, selected_open)?;
+                    }
+                }
             }
         }
         SessionEventKind::MilestoneEvaluationRequested { request } => {

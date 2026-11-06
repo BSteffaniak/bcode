@@ -408,8 +408,8 @@ mod tests {
 
     #[test]
     fn epoch_20_requires_migration_even_with_complete_schema_55_ledger() {
-        assert_eq!(CURRENT_EVENT_SCHEMA, 55);
-        assert_eq!(CURRENT_WRITER_EPOCH, 23);
+        assert_eq!(CURRENT_EVENT_SCHEMA, 57);
+        assert_eq!(CURRENT_WRITER_EPOCH, 25);
         let mut facts = StorageCompatibilityFacts {
             current_migration_ids: vec!["current-schema".into()],
             migration_rows: vec![MigrationLedgerRow {
@@ -434,10 +434,20 @@ mod tests {
         facts.writer_epoch = Some(23);
         assert!(matches!(
             classify_storage_facts(&facts).unwrap(),
+            StorageCompatibility::MigrationRequired { .. }
+        ));
+        facts.writer_epoch = Some(25);
+        assert!(matches!(
+            classify_storage_facts(&facts).unwrap(),
             StorageCompatibility::Current { .. }
         ));
+        // The policy-free target reports non-current facts; migration-owned source
+        // classification rejects reserved writer 24 before selecting a plan.
         facts.writer_epoch = Some(24);
-        assert!(classify_storage_facts(&facts).is_err());
+        assert!(matches!(
+            classify_storage_facts(&facts).unwrap(),
+            StorageCompatibility::MigrationRequired { .. }
+        ));
     }
 
     #[test]

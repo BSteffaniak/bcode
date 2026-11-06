@@ -137,6 +137,13 @@ impl LiveCli {
         response["kind"]["response"].clone()
     }
 
+    fn application(&self, command: &str, request: &Value) -> Value {
+        let path = self.root.path().join("application.json");
+        std::fs::write(&path, serde_json::to_vec(request).unwrap()).unwrap();
+        serde_json::from_str(&self.run(&["harness", command, "--request", path.to_str().unwrap()]))
+            .unwrap()
+    }
+
     fn history(&self) -> Vec<Value> {
         let mut observations = Vec::new();
         let mut after: Option<String> = None;
@@ -258,6 +265,58 @@ fn observe_turn(cli: &LiveCli, target: &mut Value, after: &mut Option<String>, s
         std::thread::sleep(Duration::from_millis(100));
     }
     eprintln!("live host turn={serial} correlated_result=true completed=true settled=true");
+}
+
+#[test]
+#[ignore = "uses existing native Claude subscription; explicit live-run authorization required"]
+fn native_discovered_model_selected_before_two_turns() {
+    let cli = LiveCli::new();
+    let artifact = cli.run(&["artifact-id"]);
+    eprintln!("selected-model test artifact: {}", artifact.trim());
+    cli.run(&["server", "start"]);
+    assert!(cli.run(&["server", "status"]).contains(artifact.trim()));
+    let catalog = cli.application("models", &json!({
+        "request_id":"live-model-catalog", "instances":[cli.instance], "provider_plugin_id":null,
+    }));
+    assert_eq!(catalog["request_id"], "live-model-catalog");
+    assert!(
+        catalog["issues"].as_array().unwrap().is_empty(),
+        "native discovery was incomplete"
+    );
+    let models = catalog["models"].as_array().unwrap();
+    assert!(!models.is_empty(), "no native-advertised models");
+    let model = models
+        .iter()
+        .find(|entry| entry["native_model_id"] == "haiku")
+        .unwrap_or(&models[0]);
+    assert_eq!(model["route"]["kind"], "managed_harness");
+    let selection = json!({"model_id":model["model"]["model_id"],
+        "route":model["route"], "account_reference":model["account_reference"]});
+    let started = cli.application(
+        "start-selected",
+        &json!({
+            "selection":selection,"instance":cli.instance,
+            "open":{"open_id":"live-selected-open","session_id":SESSION,"generation":1,
+                "working_directory":cli.root.path(),"resume":null},"parent_session_id":null,
+        }),
+    );
+    assert_eq!(started["selection"]["requested"], selection);
+    assert_eq!(started["response"]["kind"]["kind"], "selected");
+    assert_eq!(
+        started["response"]["kind"]["response"]["evidence"]["requested_model_id"],
+        model["native_model_id"]
+    );
+    let mut target = started["response"]["kind"]["response"]["target"].clone();
+    assert_eq!(target["state"], "prepared");
+    let mut after = None;
+    observe_turn(&cli, &mut target, &mut after, 1);
+    observe_turn(&cli, &mut target, &mut after, 2);
+    assert!(
+        cli.history()
+            .iter()
+            .any(|observation| observation["kind"]["kind"] == "result"
+                && observation["kind"]["text"] == "BCODE_HOST_LIVE_OK_2")
+    );
 }
 
 #[test]

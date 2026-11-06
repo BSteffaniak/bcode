@@ -493,7 +493,7 @@ async fn assert_historical_harness_receipt(
         bcode_session_models::CURRENT_SESSION_STORAGE_WRITER_EPOCH
     );
     assert_eq!(receipt["session_id"], id.to_string());
-    let steps = if writer == 18 {
+    let mut steps = if writer == 18 {
         vec![
             "session-writer-epoch-18-to-19",
             "session-writer-epoch-19-to-20",
@@ -523,6 +523,7 @@ async fn assert_historical_harness_receipt(
             "session-writer-epoch-22-to-23",
         ]
     };
+    steps.push("session-writer-epoch-23-to-25");
     assert_eq!(receipt["migration_step_ids"], serde_json::json!(steps));
     for field in ["source_event_count", "target_event_count"] {
         assert_eq!(receipt[field], serde_json::json!(expected.len()));
@@ -669,7 +670,10 @@ async fn check_historical_harness_cold_upgrade(fixture: &str, writer: i64, schem
         .await
         .expect("strict canonical history");
     assert_migrated_harness_semantics(&db, &actual, &expected).await;
-    assert!(actual.iter().all(|event| event.schema_version == 55));
+    assert!(
+        actual.iter().all(|event| event.schema_version
+            == bcode_session_models::CURRENT_SESSION_EVENT_SCHEMA_VERSION)
+    );
     assert_harness_fixture_indexes(&db, schema).await;
     assert_historical_harness_receipt(&db, id, writer, &expected).await;
     db.database().close().await.expect("close migrated DB");

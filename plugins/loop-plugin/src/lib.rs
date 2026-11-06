@@ -3179,6 +3179,7 @@ fn commit_message_agent_configuration(
         agent_profile: "plan".to_string(),
         provider: None,
         model: None,
+        execution_model_selection: None,
         output: bcode_workflow::WorkflowPromptOutputPolicy::Structured {
             result: bcode_workflow::PromptStructuredOutputPolicy {
                 schema: bcode_workflow::ValueSchema::of::<CommitMessageResult>(),
@@ -3245,6 +3246,7 @@ fn loop_agent_configuration<O: JsonSchema>(
         agent_profile: agent_profile.to_string(),
         provider: None,
         model: None,
+        execution_model_selection: None,
         output: bcode_workflow::WorkflowPromptOutputPolicy::Structured {
             result: bcode_workflow::PromptStructuredOutputPolicy {
                 schema: bcode_workflow::ValueSchema::of::<O>(),

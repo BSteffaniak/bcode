@@ -72,6 +72,7 @@ pub struct PhysicalReap {
 }
 
 struct Shared {
+    model_selection_contract: crate::models::ModelSelectionContract,
     reaped: watch::Sender<ReapState>,
     state: Mutex<State>,
     stop: watch::Sender<bool>,
@@ -405,6 +406,9 @@ impl ClaudeSession {
         let (write_tx, write_rx) = mpsc::channel(options.limits.queued_writes);
         let (stop, stopped) = watch::channel(false);
         let shared = Arc::new(Shared {
+            model_selection_contract: crate::models::ModelSelectionContract::for_version(
+                &options.expected_version,
+            ),
             reaped: watch::channel(ReapState::Pending).0,
             state: Mutex::new(State {
                 pending: BTreeMap::new(),
@@ -541,6 +545,14 @@ impl Drop for ClaudeSession {
     }
 }
 impl ClaudeClient {
+    pub(crate) fn model_selection_contract(&self) -> crate::models::ModelSelectionContract {
+        self.shared.model_selection_contract
+    }
+
+    pub(crate) fn is_before_first_prompt(&self) -> bool {
+        self.is_control_ready() && self.shared.lock().attributed_mode.is_none()
+    }
+
     #[must_use]
     pub fn settlement(&self) -> Settlement {
         self.shared.lock().settlement()
@@ -1385,6 +1397,7 @@ mod sdk_handshake_tests {
         let (writes, written) = mpsc::channel(8);
         let (stop, _stopped) = watch::channel(false);
         let shared = Shared {
+            model_selection_contract: crate::models::ModelSelectionContract::ExactIdentity,
             reaped: watch::channel(ReapState::Pending).0,
             state: Mutex::new(State {
                 pending: BTreeMap::new(),
@@ -1413,6 +1426,95 @@ mod sdk_handshake_tests {
             },
             written,
         )
+    }
+
+    #[tokio::test]
+    async fn unknown_model_selection_never_writes_or_allows_default_prompt() {
+        let (client, mut written) = handshake_transport();
+        client.shared.initialized.store(2, Ordering::Release);
+        let result = client
+            .select_model_before_prompt(
+                &json!({"models":[{"value":"known","displayName":"Known"}]}),
+                "unknown",
+            )
+            .await;
+        assert!(result.is_err());
+        assert!(written.try_recv().is_err());
+        assert!(!client.is_control_ready());
+        assert!(client.submit("must not be delivered", None).await.is_err());
+        assert!(written.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn model_selection_waits_for_exact_control_ack_before_prompt() {
+        let (client, mut written) = handshake_transport();
+        client.shared.initialized.store(2, Ordering::Release);
+        let (events, _received) = mpsc::channel(8);
+        let initialize = json!({"models":[{"value":"known","displayName":"Known"}]});
+        let select = client.select_model_before_prompt(&initialize, "known");
+        let native = async {
+            let write = written.recv().await.unwrap();
+            let frame: Value = serde_json::from_slice(&write.frame).unwrap();
+            assert_eq!(frame["request"]["subtype"], "set_model");
+            assert_eq!(frame["request"]["model"], "known");
+            let request_id = frame["request_id"].as_str().unwrap().to_owned();
+            write.ack.send(Ok(())).unwrap();
+            assert!(written.try_recv().is_err());
+            route(
+                json!({"type":"control_response","response":{
+                    "subtype":"success","request_id":request_id,"response":{}
+                }}),
+                &client.shared,
+                &events,
+            )
+            .unwrap();
+        };
+        let (selected, ()) = tokio::time::timeout(Duration::from_secs(1), async {
+            tokio::join!(select, native)
+        })
+        .await
+        .unwrap();
+        let selected = selected.unwrap();
+        assert_eq!(selected.requested, "known");
+        assert_eq!(selected.effective, None);
+        assert!(client.is_control_ready());
+    }
+
+    #[tokio::test]
+    async fn advertised_alias_effective_model_requires_exact_control_correlation() {
+        let (mut client, mut written) = handshake_transport();
+        Arc::get_mut(&mut client.shared)
+            .unwrap()
+            .model_selection_contract =
+            crate::models::ModelSelectionContract::AdvertisedAliasResolution;
+        client.shared.initialized.store(2, Ordering::Release);
+        let (events, _received) = mpsc::channel(8);
+        let initialize = json!({"models":[{"value":"haiku","displayName":"Native alias"}]});
+        let select = client.select_model_before_prompt(&initialize, "haiku");
+        let native = async {
+            let write = written.recv().await.unwrap();
+            let frame: Value = serde_json::from_slice(&write.frame).unwrap();
+            assert_eq!(frame["request"]["model"], "haiku");
+            let request_id = frame["request_id"].as_str().unwrap().to_owned();
+            write.ack.send(Ok(())).unwrap();
+            // An unrelated success cannot settle this ticket or supply its effective model.
+            route(json!({"type":"control_response","response":{
+                "subtype":"success","request_id":"unrelated","response":{"model":"claude-other-1"}
+            }}), &client.shared, &events).unwrap();
+            assert!(client.shared.lock().pending.contains_key(&request_id));
+            route(json!({"type":"control_response","response":{
+                "subtype":"success","request_id":request_id,"response":{"model":"claude-haiku-5-5"}
+            }}), &client.shared, &events).unwrap();
+        };
+        let (selected, ()) = tokio::time::timeout(Duration::from_secs(1), async {
+            tokio::join!(select, native)
+        })
+        .await
+        .unwrap();
+        let selected = selected.unwrap();
+        assert_eq!(selected.requested, "haiku");
+        assert_eq!(selected.effective.as_deref(), Some("claude-haiku-5-5"));
+        assert!(written.try_recv().is_err());
     }
 
     #[tokio::test]
@@ -1706,6 +1808,7 @@ mod retired_delivery_tests {
             let (writes, _writer) = mpsc::channel(8);
             let (stop, _stopped) = watch::channel(false);
             let shared = Shared {
+                model_selection_contract: crate::models::ModelSelectionContract::ExactIdentity,
                 reaped: watch::channel(ReapState::Pending).0,
                 state: Mutex::new(State {
                     pending: BTreeMap::new(),

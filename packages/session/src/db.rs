@@ -2644,20 +2644,7 @@ impl SessionDb {
     ///
     /// Returns an error when compatibility inspection finds unsupported or damaged storage.
     pub async fn storage_writer_epoch(&self) -> SessionDbResult<u64> {
-        if !self.db.table_exists("session_storage_contract").await? {
-            return Ok(u64::from(LEGACY_SESSION_STORAGE_WRITER_EPOCH));
-        }
-        let row = self
-            .db
-            .select("session_storage_contract")
-            .columns(&["writer_epoch"])
-            .where_eq("contract_id", SESSION_STORAGE_CONTRACT_ID)
-            .execute_first(&**self.db)
-            .await?;
-        row.as_ref().map_or_else(
-            || Ok(u64::from(LEGACY_SESSION_STORAGE_WRITER_EPOCH)),
-            |row| required_non_negative_u64(row, "writer_epoch"),
-        )
+        storage_writer_epoch_for(&**self.db).await
     }
 
     /// Return a turn receipt by producer-scoped idempotency identity.
@@ -5500,6 +5487,22 @@ impl SessionDb {
             .execute(&**self.db)
             .await
     }
+}
+
+async fn storage_writer_epoch_for(db: &dyn Database) -> SessionDbResult<u64> {
+    if !db.table_exists("session_storage_contract").await? {
+        return Ok(u64::from(LEGACY_SESSION_STORAGE_WRITER_EPOCH));
+    }
+    let row = db
+        .select("session_storage_contract")
+        .columns(&["writer_epoch"])
+        .where_eq("contract_id", SESSION_STORAGE_CONTRACT_ID)
+        .execute_first(db)
+        .await?;
+    row.as_ref().map_or_else(
+        || Ok(u64::from(LEGACY_SESSION_STORAGE_WRITER_EPOCH)),
+        |row| required_non_negative_u64(row, "writer_epoch"),
+    )
 }
 
 async fn run_global_migrations(db: &dyn Database) -> Result<(), MigrationError> {

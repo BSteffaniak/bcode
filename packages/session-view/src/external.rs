@@ -631,6 +631,7 @@ fn canonical_operation_text(
         R::RecoveryPrepared { .. } => "Managed recovery prepared for this generation; native resume is not yet confirmed. Prior submissions are not replayed.".into(),
         R::DeliveryClaimed { .. } => "Native delivery claimed; outcome pending or uncertain. No replay or settlement implied.".into(),
         R::DeliveryCompleted { response, .. } => match &response.kind {
+            S::Selected { target, evidence } => format!("Native model selection acknowledged: requested {} · effective {} · generation {} (not settlement or assignment completion)", evidence.requested_model_id, evidence.effective_model_id.as_deref().unwrap_or("unreported"), target.generation()),
             S::Opened(binding) => format!("Native identity confirmed: {} · generation {} (not settled or assignment completion)", binding.native_session_id, binding.generation),
             S::Prepared(prepared) | S::Reconciled(bcode_harness_models::HarnessReconciliation::KnownPrepared { prepared, .. }) => prepared_session_text(prepared)?,
             S::Receipt(receipt) => format!("Native delivery {:?} · submission {} · attempt {} (not assignment completion)", receipt.state, receipt.submission_id, receipt.attempt_id),

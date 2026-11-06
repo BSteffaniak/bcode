@@ -354,6 +354,133 @@ async fn postapproval_owner_generation_recheck_prevents_claim() {
 }
 
 #[tokio::test]
+async fn session_agent_change_revokes_queue_and_postapproval_authority_before_claim() {
+    let (_root, state, caller, call) = fixture().await;
+    let session = call.session_id.unwrap();
+    state
+        .sessions
+        .set_current_agent(session, "build".into())
+        .await
+        .unwrap();
+    let (grant, (retained, endpoint, serving)) = {
+        let bridge = bridge(Arc::clone(&state), caller, call).await;
+        assert_eq!(bridge.grant.agent_id, "build");
+        assert!(bridge.grant.check(&state).await.is_ok());
+        (Arc::clone(&bridge.grant), make_endpoint(bridge))
+    };
+    state
+        .sessions
+        .set_current_agent(session, "plan".into())
+        .await
+        .unwrap();
+    let outcome = Mutex::new(None);
+    let scope = InvocationScope::new(
+        TurnScope::without_events("managed", TurnGeneration::new(1)),
+        retained.call.id.clone(),
+    );
+    assert!(
+        PinnedInvoker {
+            state: &state,
+            grant: &grant,
+            retained: &retained,
+            outcome: &outcome,
+        }
+        .invoke_tool(
+            &retained.tool,
+            &PreparedToolInvocation {
+                invocation: ToolInvocationDescriptor {
+                    invocation_id: retained.call.id.clone(),
+                    tool_name: retained.call.name.clone(),
+                    arguments: retained.call.arguments.clone(),
+                },
+                preparation: retained.preparation.clone(),
+            },
+            &scope,
+        )
+        .await
+        .is_err()
+    );
+    assert_eq!(*outcome.lock().await, Some(ManagedToolOutcome::Rejected));
+    assert!(
+        state
+            .sessions
+            .inspect_managed_tool(&grant.durable_owner, retained.call.id.clone())
+            .await
+            .unwrap()
+            .is_none()
+    );
+    drop(grant);
+    let response = endpoint
+        .request(request(ManagedToolOperation::Catalog {
+            after: None,
+            limit: 1,
+        }))
+        .await
+        .unwrap();
+    assert_eq!(response.request_id, "correlation");
+    assert_eq!(response.outcome, ManagedToolOutcome::Rejected);
+    drop(endpoint);
+    serving.await.unwrap();
+}
+
+#[tokio::test]
+async fn explicit_execution_profile_is_not_replaced_by_session_agent_changes() {
+    let (_root, state, caller, call) = fixture().await;
+    let session = call.session_id.unwrap();
+    state
+        .sessions
+        .set_current_agent(session, "build".into())
+        .await
+        .unwrap();
+    let (_endpoint, bridge) = ManagedToolBridge::issue(
+        Arc::clone(&state),
+        caller,
+        call,
+        TurnExecutionOptions {
+            agent_profile: Some("plan".into()),
+            tools: bcode_session_models::TurnToolPolicy::ReadOnly,
+            ..Default::default()
+        },
+        Arc::new(TurnCancelState::default()),
+    )
+    .await
+    .unwrap();
+    assert_eq!(bridge.grant.agent_id, "plan");
+    assert!(bridge.grant.check(&state).await.is_ok());
+    state
+        .sessions
+        .set_current_agent(session, "plan".into())
+        .await
+        .unwrap();
+    assert!(bridge.grant.check(&state).await.is_ok());
+    state
+        .sessions
+        .set_current_agent(session, "build".into())
+        .await
+        .unwrap();
+    assert!(bridge.grant.check(&state).await.is_ok());
+    let retained = pinned(&bridge.grant);
+    assert_eq!(
+        InvocationRunner {
+            state: Arc::clone(&state),
+            grant: Arc::clone(&bridge.grant),
+        }
+        .invoke(Arc::clone(&retained))
+        .await
+        .unwrap(),
+        ManagedToolOutcome::Denied
+    );
+    assert!(
+        state
+            .sessions
+            .inspect_managed_tool(&bridge.grant.durable_owner, retained.call.id.clone())
+            .await
+            .unwrap()
+            .is_none()
+    );
+}
+
+#[tokio::test]
 async fn conflicting_preparation_id_is_rejected_without_repreparing() {
     let (_root, state, caller, call) = fixture().await;
     let mut bridge = bridge(state, caller, call).await;

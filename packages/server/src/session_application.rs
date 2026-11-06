@@ -1995,6 +1995,7 @@ mod tests {
                     input: "must not execute".to_owned(),
                     admission: TurnAdmissionMetadata::default(),
                     auth_profile: None,
+                    managed: None,
                 })
                 .await;
             assert!(result.session.is_none());

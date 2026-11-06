@@ -167,7 +167,7 @@ fn prompt_task_definition() -> ToolDefinition {
                 "acceptance_criteria":{"type":"array","items":{"type":"string","minLength":1},"description":"Evidence requirements included in the task prompt; not an automatic completion verdict. Blank criteria reject."},
                 "timeout_ms":{"type":"integer","minimum":1,"description":"Positive per-task timeout; omission retains canonical default. Does not extend run allowances."},
                 "tool_allowlist":{"type":"array","items":{"type":"string","minLength":1},"description":"Restricts tools without granting authority. Empty retains normal agent-policy selection; blank entries reject."},
-                "model_selection":{"type":"object","additionalProperties":false,"required":["provider","model"],"properties":{"provider":{"type":"string","minLength":1},"model":{"type":"string","minLength":1}},"description":"Optional selection through normal model resolution; grants no capability or permission."},
+                "model_selection":task_group::model_selection_schema(),
                 "context":{"type":"string","enum":["fresh_isolated","fixed_generation_fork","shared_parent_sequential"],"default":"fresh_isolated","description":"Model context only, not filesystem isolation or authority. Fork uses pinned parent generation; shared parent executes sequentially."},
                 "resources":{"type":"array","description":"Canonical scheduler claims, not tool authority or filesystem isolation. Omission declares no claims.","items":{"type":"object","additionalProperties":false,"required":["resource","access"],"properties":{"resource":{"type":"string","minLength":1},"access":{"type":"string","enum":["read","write"]}}}},
                 "depends_on":{"type":"object","additionalProperties":false,"required":["node_id","edge_id"],"properties":{"node_id":{"type":"string","minLength":1},"edge_id":{"type":"integer","minimum":0}},"description":"Direct dependency on one existing source; requires entry:false. Input must match its output. Supply an unused edge ID. Does not remove existing successors or publish."},
@@ -1714,6 +1714,38 @@ mod tests {
             json!({"provider":"p", "model":" "}),
             json!({"provider":"p"}),
             json!({"provider":"p","model":"m","secret":"x"}),
+        ] {
+            arguments["model_selection"] = invalid;
+            assert!(parse_prompt_task(&arguments).is_err());
+        }
+    }
+
+    #[test]
+    fn prompt_task_execution_selection_retains_exact_route_and_account() {
+        let selection = json!({"model_id":"observed-model",
+            "route":{"kind":"managed_harness","instance_id":"configured-instance","plugin_id":"adapter"},
+            "account_reference":"native-account"});
+        let mut arguments = json!({"run_id":"run","expected_revision":1,"mutation_id":"proposal",
+            "task_id":"review","objective":"Review correctness.","agent_profile":"plan",
+            "input":{"type_name":"bool","schema":{"type":"boolean"}},
+            "entry":true,"exit":true,"reconciliation":[],"model_selection":selection});
+        if bcode_workflow::WORKFLOW_PROMPT_CONFIGURATION_VERSION < 6 {
+            assert!(parse_prompt_task(&arguments).is_err());
+            return;
+        }
+        let task = parse_prompt_task(&arguments).unwrap();
+        assert_eq!(
+            task.node.configuration["execution_model_selection"],
+            selection
+        );
+        assert_eq!(task.node.configuration["provider"], json!(null));
+        assert_eq!(task.node.configuration["model"], json!(null));
+        for invalid in [
+            json!({"model_id":""}),
+            json!({"model_id":"m","provider":"p","model":"m"}),
+            json!({"model_id":"m","account_reference":" "}),
+            json!({"model_id":"m","route":{"kind":"managed_harness","instance_id":"i"}}),
+            json!({"model_id":"m","unknown":true}),
         ] {
             arguments["model_selection"] = invalid;
             assert!(parse_prompt_task(&arguments).is_err());

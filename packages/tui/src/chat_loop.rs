@@ -7597,7 +7597,7 @@ mod scheduler_tests {
         let _ = chat.pending_effects.drain_runtime();
         let session_id = chat.attached_session_id().unwrap();
         let response = bcode_session_models::ExternalHarnessResponse::from_response(
-            &retained.request(),
+            &retained.request().unwrap(),
             &bcode_harness_models::HarnessServiceResponse {
                 schema_version: 1,
                 request_id: identity.0.clone(),

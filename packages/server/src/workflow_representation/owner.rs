@@ -86,6 +86,17 @@ fn store_error(_: impl std::fmt::Display) -> WorkflowStoreError {
     WorkflowStoreError::InvalidData("workflow owner storage is unavailable or inconsistent".into())
 }
 
+fn admission_store_error(error: representation::RepresentationError) -> WorkflowStoreError {
+    if matches!(
+        error,
+        representation::RepresentationError::Database(switchy_database::DatabaseError::Busy)
+    ) {
+        WorkflowStoreError::StructuredDatabase(switchy_database::DatabaseError::Busy)
+    } else {
+        store_error(error)
+    }
+}
+
 /// Check a prepared handoff in its canonical representation before external effects.
 pub async fn check_owner_admission(
     state: &ServerState,
@@ -126,7 +137,7 @@ async fn check_owner_admission_inner(
                 || owner_boundary::check_owner_admission(&db, request, authority),
             )
             .await
-            .map_err(store_error)
+            .map_err(admission_store_error)
         }
         _ => Err(store_error("unsupported owner storage")),
     }
@@ -1567,13 +1578,16 @@ mod cancellation_tests {
         let work =
             crate::register_workflow_runtime_work(&state, parent, "new", "failed start".into())
                 .await;
-        let failure =
-            crate::dispatch_workflow_prompt_turn_after_admission(&state, &dispatch, || {
+        let failure = Box::pin(crate::dispatch_workflow_prompt_turn_after_admission(
+            &state,
+            &dispatch,
+            || {
                 Err(WorkflowStoreError::InvalidData(
                     "injected failed initial execution".into(),
                 ))
-            })
-            .await;
+            },
+        ))
+        .await;
         assert!(matches!(failure, Err(WorkflowStoreError::InvalidData(_))));
         assert!(
             owner_boundary::receipt(&db, &dispatch.dispatch_identity)

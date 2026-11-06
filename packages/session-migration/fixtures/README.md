@@ -3,6 +3,21 @@
 These fixtures are sanitized compatibility inputs. They must never contain private session text,
 paths, credentials, or identifiers copied from a user store.
 
+## Reconstructed released writer-23/schema-55 compatibility inputs
+
+`stores/epoch-23-schema-55-events.jsonl` reconstructs the released schema-55 event
+representation from the sanitized schema-54 family matrix. Only the outer schema changes:
+no model selection, effective-model evidence, request correlation, native turn identity,
+or host inventory commitment is synthesized. It is a compatibility matrix, not a captured
+writer-23 database or evidence of a successful database migration. Its lifecycle matrix
+requests the existing store harness exercise all released writer sources through 23;
+those claims remain subject to the concrete session-domain DB lifecycle tests.
+
+Schema 56 and writer 24 are reserved, unsupported inputs. The selected-model transition
+is the explicit writer 23 to 25 edge, targeting schema 57 only after version publication.
+The earlier monotonic edges remain intact. Disabled recovery and interaction families
+remain unsupported even when the target schema is 57.
+
 ## Confirmed schema-28 incident family
 
 Read-only inspection of the retained epoch-2 backup for incident session

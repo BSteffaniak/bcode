@@ -494,7 +494,9 @@ impl BcodeClient {
         &self,
         retained: bcode_session_models::ExternalHarnessRequest,
     ) -> Result<bcode_session_models::ExternalHarnessResponse, ClientError> {
-        let request = retained.request();
+        let request = retained
+            .request()
+            .map_err(|_| ClientError::Protocol("Invalid retained managed submission".into()))?;
         request
             .validate()
             .map_err(|_| ClientError::Protocol("Invalid retained managed submission".into()))?;

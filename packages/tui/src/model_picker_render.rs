@@ -26,18 +26,29 @@ pub fn render_model_picker_with_keymap(
     } else {
         "model_picker_actions"
     };
-    let help = format!(
-        "  {} selects  {} cancels  {} filter  {} sort  {} reverse  {} ignore  {} unignore  {} ignored  {} check selected model (quota/cost)",
-        keymap.hint(scope, "tui.control.submit"),
-        keymap.hint(scope, "tui.control.cancel"),
-        keymap.hint("model_picker_actions", "tui.model.filter"),
-        keymap.hint("model_picker_actions", "tui.model.sort"),
-        keymap.hint("model_picker_actions", "tui.model.reverseSort"),
-        keymap.hint("model_picker_actions", "tui.model.ignore"),
-        keymap.hint("model_picker_actions", "tui.model.unignore"),
-        keymap.hint("model_picker_actions", "tui.model.showIgnored"),
-        keymap.hint("model_picker_actions", "tui.model.check")
-    );
+    let help = if app.is_execution_picker() {
+        format!(
+            "  {} selects  {} closes  {} filter  {} sort  {} reverse",
+            keymap.hint(scope, "tui.control.submit"),
+            keymap.hint(scope, "tui.control.cancel"),
+            keymap.hint("model_picker_actions", "tui.model.filter"),
+            keymap.hint("model_picker_actions", "tui.model.sort"),
+            keymap.hint("model_picker_actions", "tui.model.reverseSort")
+        )
+    } else {
+        format!(
+            "  {} selects  {} cancels  {} filter  {} sort  {} reverse  {} ignore  {} unignore  {} ignored  {} check selected model (quota/cost)",
+            keymap.hint(scope, "tui.control.submit"),
+            keymap.hint(scope, "tui.control.cancel"),
+            keymap.hint("model_picker_actions", "tui.model.filter"),
+            keymap.hint("model_picker_actions", "tui.model.sort"),
+            keymap.hint("model_picker_actions", "tui.model.reverseSort"),
+            keymap.hint("model_picker_actions", "tui.model.ignore"),
+            keymap.hint("model_picker_actions", "tui.model.unignore"),
+            keymap.hint("model_picker_actions", "tui.model.showIgnored"),
+            keymap.hint("model_picker_actions", "tui.model.check")
+        )
+    };
     let Some((inner, list_y)) = render_picker_chrome(
         " Models ",
         &Line::from_spans(vec![

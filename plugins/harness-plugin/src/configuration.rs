@@ -20,6 +20,8 @@ pub const INTERFACE_ID: &str = "bcode.harness.configuration/v1";
 pub const CATALOG_OPERATION: &str = "catalog";
 /// Resolve exactly one explicit reference or explicitly request the configured default.
 pub const PREPARE_OPERATION: &str = "prepare";
+/// Preview configuration for one explicitly selected native-owned candidate; never writes it.
+pub const PREPARE_SETUP_OPERATION: &str = "prepare_setup";
 const MAX_CONFIG_BYTES: usize = 256 * 1024;
 const MAX_INSTANCES: usize = 128;
 const MAX_REQUEST_BYTES: usize = 4096;
@@ -63,6 +65,153 @@ pub struct InstanceCatalog {
     pub default_instance: Option<String>,
     /// Enabled entries in stable reference order.
     pub instances: BTreeMap<String, HarnessInstance>,
+}
+
+/// Explicit setup request. The candidate must come from native-owned discovery or user input.
+/// No executable, account, configuration namespace, or default is inferred here.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PrepareSetupRequest {
+    /// Exact nonsecret instance selected by the user.
+    #[serde(deserialize_with = "deserialize_instance")]
+    pub instance: HarnessInstance,
+    /// Explicit consent to replace the configured default reference.
+    pub make_default: bool,
+}
+
+/// Explicit candidate-backed setup, retaining discovery identity for commit-time revalidation.
+/// The native adapter must supply `instance`; the generic plugin never invents auth references.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PrepareCandidateSetupRequest {
+    /// Exact selected native-owned observation; not authority to run its executable.
+    pub candidate: bcode_harness_models::HarnessInstallationCandidate,
+    /// Exact adapter-produced instance binding and explicit default choice.
+    pub setup: PrepareSetupRequest,
+}
+
+impl PrepareCandidateSetupRequest {
+    /// Verify candidate membership in fresh, exactly correlated native discovery before commit.
+    ///
+    /// Call again immediately before applying reviewed settings; do not silently substitute a
+    /// new candidate when identity, namespace, custody, readiness, or executable metadata changes.
+    /// This validates observations, not filesystem freshness or dispatch authorization itself.
+    ///
+    /// # Errors
+    /// Rejects mismatched correlation, changed candidates, failed discovery, or binding mismatch.
+    pub fn revalidate(
+        &self,
+        request: &bcode_harness_models::HarnessCandidatesRequest,
+        response: &bcode_harness_models::HarnessCandidatesResponse,
+    ) -> Result<(), &'static str> {
+        response
+            .validate_for(request, &self.candidate.plugin_id)
+            .map_err(|_| "invalid candidate discovery correlation")?;
+        let bcode_harness_models::HarnessCandidatesResponseKind::Candidates { candidates, .. } =
+            &response.kind
+        else {
+            return Err("candidate discovery unavailable");
+        };
+        if !candidates.contains(&self.candidate) {
+            return Err("selected candidate changed; review setup again");
+        }
+        self.validate()
+    }
+
+    /// Check exact instance/candidate agreement without interpreting native credential behavior.
+    ///
+    /// # Errors
+    /// Rejects invalid observations, unsupported readiness, or inconsistent instance bindings.
+    pub fn validate(&self) -> Result<(), &'static str> {
+        self.candidate
+            .validate()
+            .map_err(|_| "invalid setup candidate")?;
+        self.setup
+            .instance
+            .validate()
+            .map_err(|_| "invalid setup instance")?;
+        let instance = &self.setup.instance;
+        if instance.plugin_id != self.candidate.plugin_id
+            || instance.executable != self.candidate.executable.canonical_path
+            || instance.config_namespace != self.candidate.config_namespace
+            || instance.auth.custody != self.candidate.custody
+            || !matches!(
+                self.candidate.readiness,
+                bcode_harness_models::HarnessCandidateReadiness::ExistingNativeLogin
+                    | bcode_harness_models::HarnessCandidateReadiness::LoginRequired
+            )
+        {
+            return Err("candidate and instance binding mismatch");
+        }
+        Ok(())
+    }
+}
+
+/// Native-correlated setup input accepted by the existing `prepare_setup` operation.
+/// Adapter settings are proposals only and retain native-plugin ownership.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PrepareNativeSetupRequest {
+    /// Exact native preparation request, including selected candidate and instance ID.
+    pub request: bcode_harness_models::HarnessPrepareCandidateRequest,
+    /// Correlated response from the selected native plugin's `prepare_candidate` operation.
+    pub response: bcode_harness_models::HarnessPrepareCandidateResponse,
+    /// Existing complete native plugin settings (nonsecret configuration only).
+    pub adapter_configuration: serde_json::Value,
+    /// Explicit consent to make this instance the generic catalog default.
+    pub make_default: bool,
+}
+
+/// Both plugin proposals, suitable for one policy-fenced atomic config edit.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PreparedNativeSetup {
+    /// Native proposal retaining exact candidate, instance binding, and adapter entry.
+    pub native: bcode_harness_models::HarnessPreparedCandidate,
+    /// Full native plugin settings with only the selected instance inserted.
+    pub adapter_configuration: serde_json::Value,
+    /// Full generic catalog settings and exact prepared instance.
+    pub harness: PreparedInstanceSetup,
+}
+
+impl PreparedNativeSetup {
+    /// Require a freshly prepared response to equal the reviewed proposal before commit.
+    ///
+    /// # Errors
+    /// Rejects native correlation failure, unavailable preparation, or any changed proposal.
+    pub fn revalidate(
+        &self,
+        request: &bcode_harness_models::HarnessPrepareCandidateRequest,
+        response: &bcode_harness_models::HarnessPrepareCandidateResponse,
+    ) -> Result<(), &'static str> {
+        response
+            .validate_for(request, &self.native.instance.plugin_id)
+            .map_err(|_| "invalid native setup correlation")?;
+        match &response.kind {
+            bcode_harness_models::HarnessPrepareCandidateResponseKind::Prepared(prepared)
+                if prepared.as_ref() == &self.native =>
+            {
+                Ok(())
+            }
+            _ => Err("native setup changed; prepare and review again"),
+        }
+    }
+}
+
+/// Reviewable settings only, not a write receipt or evidence of native availability/readiness.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PreparedInstanceSetup {
+    /// Exact instance preparation, suitable for existing managed admission after configuration.
+    pub prepared: PreparedInstance,
+    /// Full proposed nonsecret generic-plugin configuration; unrelated instances are retained.
+    pub configuration: serde_json::Value,
+}
+
+fn deserialize_instance<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<HarnessInstance, D::Error> {
+    InstanceDefinition::deserialize(deserializer).map(InstanceDefinition::into_instance)
 }
 
 #[derive(Deserialize)]
@@ -124,6 +273,10 @@ impl InstanceDefinition {
 }
 
 fn catalog(context: &NativeServiceContext) -> Result<InstanceCatalog, ServiceResponse> {
+    catalog_from_config(&context.config.config)
+}
+
+fn catalog_from_config(config: &serde_json::Value) -> Result<InstanceCatalog, ServiceResponse> {
     // Check the encoded budget without allocating an unbounded serialization buffer.
     struct Budget(usize);
     impl std::io::Write for Budget {
@@ -152,12 +305,12 @@ fn catalog(context: &NativeServiceContext) -> Result<InstanceCatalog, ServiceRes
         )
     };
     // An absent section means the feature is unconfigured, not a malformed configuration.
-    let raw = &context.config.config;
+    let raw = config;
     if raw.is_null() || raw.as_object().is_some_and(serde_json::Map::is_empty) {
         return Err(disabled());
     }
     serde_json::to_writer(Budget(MAX_CONFIG_BYTES), raw).map_err(|_| invalid())?;
-    let settings: Settings = context.config().map_err(|_| invalid())?;
+    let settings: Settings = serde_json::from_value(config.clone()).map_err(|_| invalid())?;
     if !settings.enabled {
         return Err(disabled());
     }
@@ -191,7 +344,12 @@ pub(crate) fn invoke(context: &NativeServiceContext) -> ServiceResponse {
     if context.plugin_id != crate::PLUGIN_ID || context.request.interface_id != INTERFACE_ID {
         return ServiceResponse::error("invalid_context", "invalid managed configuration context");
     }
-    if context.request.payload.len() > MAX_REQUEST_BYTES {
+    let request_budget = if context.request.operation == PREPARE_SETUP_OPERATION {
+        MAX_CONFIG_BYTES
+    } else {
+        MAX_REQUEST_BYTES
+    };
+    if context.request.payload.len() > request_budget {
         return ServiceResponse::error("invalid_request", "invalid managed configuration request");
     }
     match context.request.operation.as_str() {
@@ -207,6 +365,7 @@ pub(crate) fn invoke(context: &NativeServiceContext) -> ServiceResponse {
                 Err(error) => error,
             }
         }
+        PREPARE_SETUP_OPERATION => prepare_setup(context),
         PREPARE_OPERATION => {
             let Ok(request) = context.request.payload_json::<PrepareRequest>() else {
                 return ServiceResponse::error("invalid_request", "invalid instance selection");
@@ -235,6 +394,181 @@ pub(crate) fn invoke(context: &NativeServiceContext) -> ServiceResponse {
             "unsupported managed configuration operation",
         ),
     }
+}
+
+fn prepare_setup(context: &NativeServiceContext) -> ServiceResponse {
+    if let Ok(request) = context.request.payload_json::<PrepareNativeSetupRequest>() {
+        return prepare_native_setup(context, request);
+    }
+    let request = if let Ok(request) = context.request.payload_json::<PrepareSetupRequest>() {
+        request
+    } else if let Ok(request) = context
+        .request
+        .payload_json::<PrepareCandidateSetupRequest>()
+    {
+        if request.validate().is_err() {
+            return ServiceResponse::error(
+                "invalid_request",
+                "candidate and instance binding mismatch",
+            );
+        }
+        request.setup
+    } else {
+        return ServiceResponse::error("invalid_request", "invalid managed setup request");
+    };
+    prepare_instance_setup(context, &request)
+}
+
+fn prepare_instance_setup(
+    context: &NativeServiceContext,
+    request: &PrepareSetupRequest,
+) -> ServiceResponse {
+    if request.instance.validate().is_err() {
+        return ServiceResponse::error("invalid_request", "invalid managed instance reference");
+    }
+    // Only absent/empty settings permit first setup. Disabled or malformed existing settings
+    // cannot be silently repaired or re-enabled by selecting a candidate.
+    let mut configuration = if context.config.config.is_null()
+        || context
+            .config
+            .config
+            .as_object()
+            .is_some_and(serde_json::Map::is_empty)
+    {
+        serde_json::json!({"enabled": true, "instances": {}})
+    } else {
+        if let Err(error) = catalog(context) {
+            return error;
+        }
+        context.config.config.clone()
+    };
+    let reference = request.instance.instance_id.clone();
+    let Some(instances) = configuration
+        .get_mut("instances")
+        .and_then(serde_json::Value::as_object_mut)
+    else {
+        return ServiceResponse::error("invalid_configuration", "invalid managed configuration");
+    };
+    // Setup cannot overwrite/re-enable an existing instance. Reusing an identical enabled
+    // entry is harmless; changed account/custody/namespace needs a separate reviewed editor.
+    let entry = serde_json::json!({"enabled": true, "instance": request.instance});
+    if instances
+        .get(&reference)
+        .is_some_and(|existing| existing != &entry)
+    {
+        return ServiceResponse::error(
+            "instance_conflict",
+            "instance reference already configured",
+        );
+    }
+    instances.insert(reference.clone(), entry);
+    if request.make_default {
+        configuration["default_instance"] = serde_json::Value::String(reference.clone());
+    }
+    // Reuse the catalog validator and budgets, not a second resolver or native readiness probe.
+    let catalog = match catalog_from_config(&configuration) {
+        Ok(catalog) => catalog,
+        Err(error) => return error,
+    };
+    let Some(instance) = catalog.instances.get(&reference) else {
+        return ServiceResponse::error(
+            "instance_unavailable",
+            "selected managed instance unavailable",
+        );
+    };
+    crate::json_response(&PreparedInstanceSetup {
+        prepared: PreparedInstance {
+            selection: InstanceSelection::Instance {
+                instance_id: reference,
+            },
+            instance: instance.clone(),
+        },
+        configuration,
+    })
+}
+
+fn prepare_native_setup(
+    context: &NativeServiceContext,
+    request: PrepareNativeSetupRequest,
+) -> ServiceResponse {
+    let invalid = || ServiceResponse::error("invalid_request", "invalid native setup proposal");
+    if request
+        .response
+        .validate_for(&request.request, &request.request.candidate.plugin_id)
+        .is_err()
+    {
+        return invalid();
+    }
+    let bcode_harness_models::HarnessPrepareCandidateResponseKind::Prepared(native) =
+        request.response.kind
+    else {
+        return ServiceResponse::error(
+            "candidate_unavailable",
+            "native setup preparation unavailable",
+        );
+    };
+    if native.instance.plugin_id == crate::PLUGIN_ID {
+        return invalid();
+    }
+    let mut adapter = request.adapter_configuration;
+    if adapter.is_null() {
+        adapter = serde_json::json!({});
+    }
+    let Some(table) = adapter.as_object_mut() else {
+        return invalid();
+    };
+    if table
+        .get("enabled")
+        .is_some_and(|value| value != &serde_json::Value::Bool(true))
+    {
+        return ServiceResponse::error(
+            "configuration_disabled",
+            "native configuration is disabled",
+        );
+    }
+    let instances = table
+        .entry("instances")
+        .or_insert_with(|| serde_json::json!({}));
+    let Some(instances) = instances.as_object_mut() else {
+        return invalid();
+    };
+    if instances.len() >= MAX_INSTANCES && !instances.contains_key(&native.instance.instance_id) {
+        return invalid();
+    }
+    if instances
+        .get(&native.instance.instance_id)
+        .is_some_and(|value| value != &native.adapter_settings)
+    {
+        return ServiceResponse::error(
+            "instance_conflict",
+            "native instance reference already configured",
+        );
+    }
+    instances.insert(
+        native.instance.instance_id.clone(),
+        native.adapter_settings.clone(),
+    );
+    if serde_json::to_vec(&adapter).map_or(true, |bytes| bytes.len() > MAX_CONFIG_BYTES) {
+        return invalid();
+    }
+    let response = prepare_instance_setup(
+        context,
+        &PrepareSetupRequest {
+            instance: native.instance.clone(),
+            make_default: request.make_default,
+        },
+    );
+    if response.error.is_some() {
+        return response;
+    }
+    let Ok(harness) = response.payload_json::<PreparedInstanceSetup>() else {
+        return invalid();
+    };
+    crate::json_response(&PreparedNativeSetup {
+        native: *native,
+        adapter_configuration: adapter,
+        harness,
+    })
 }
 
 #[cfg(test)]

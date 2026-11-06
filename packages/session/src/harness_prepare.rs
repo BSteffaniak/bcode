@@ -3,7 +3,7 @@ use super::{SessionEvent, SessionEventKind, SessionId};
 use bcode_harness_models::{HarnessCapabilities, HarnessRequest};
 use bcode_session_models::external_harness::{
     ExternalHarnessOperation, ExternalHarnessOperationRecord, ExternalHarnessOwner,
-    ExternalHarnessRequest, ExternalHarnessRequestKind,
+    ExternalHarnessRequest,
 };
 
 impl crate::SessionManager {
@@ -21,15 +21,91 @@ impl crate::SessionManager {
         capabilities: HarnessCapabilities,
         parent_id: Option<SessionId>,
     ) -> Result<bcode_session_models::SessionSummary, crate::SessionError> {
+        let retained = ExternalHarnessRequest::from_request(request)
+            .map_err(crate::SessionError::EventSerialization)?;
+        self.prepare_external_harness_retained_open(owner, retained, capabilities, parent_id, None)
+            .await
+    }
+
+    /// Prepare an exact selected-model Open using canonical managed-session publication.
+    /// # Errors
+    /// Rejects unavailable durable fences, conflicting requests, stale owners and resume.
+    pub async fn prepare_external_harness_selected_open(
+        &self,
+        owner: &ExternalHarnessOwner,
+        request: &bcode_harness_models::HarnessModelsRequest,
+        capabilities: HarnessCapabilities,
+        parent_id: Option<SessionId>,
+    ) -> Result<bcode_session_models::SessionSummary, crate::SessionError> {
+        let retained = ExternalHarnessRequest::from_models_request(request)
+            .map_err(crate::SessionError::EventSerialization)?;
+        self.prepare_external_harness_retained_open(owner, retained, capabilities, parent_id, None)
+            .await
+    }
+
+    /// Canonically retain the entire v2 spawn intent before preparing its exact selected Open.
+    /// # Errors
+    /// Rejects conflicting child intent, stale owner, mixed execution and unavailable storage fences.
+    pub async fn prepare_external_harness_selected_spawn(
+        &self,
+        owner: &ExternalHarnessOwner,
+        request: &bcode_session_models::SessionSpawnRequest,
+        capabilities: HarnessCapabilities,
+    ) -> Result<bcode_session_models::SessionSummary, crate::SessionError> {
+        request
+            .validate_storage(
+                bcode_session_models::CURRENT_SESSION_EVENT_SCHEMA_VERSION,
+                bcode_session_models::CURRENT_SESSION_STORAGE_WRITER_EPOCH,
+            )
+            .map_err(crate::SessionError::EventSerialization)?;
+        let intent = request.managed.as_ref().ok_or_else(|| {
+            crate::SessionError::EventSerialization("managed spawn intent required".into())
+        })?;
+        let retained = ExternalHarnessRequest::from_models_request(&intent.selected_open.request)
+            .map_err(crate::SessionError::EventSerialization)?;
+        if owner.session_id != request.creation.child_id
+            || retained.target() != (owner.session_id.to_string().as_str(), owner.generation)
+        {
+            return Err(crate::SessionError::EventSerialization(
+                "managed spawn owner mismatch".into(),
+            ));
+        }
+        self.prepare_external_harness_retained_open(
+            owner,
+            retained,
+            capabilities,
+            Some(request.creation.parent_id),
+            Some(request),
+        )
+        .await
+    }
+
+    async fn prepare_external_harness_retained_open(
+        &self,
+        owner: &ExternalHarnessOwner,
+        retained: ExternalHarnessRequest,
+        capabilities: HarnessCapabilities,
+        parent_id: Option<SessionId>,
+        spawning: Option<&bcode_session_models::SessionSpawnRequest>,
+    ) -> Result<bcode_session_models::SessionSummary, crate::SessionError> {
         use crate::actor::harness::{HarnessAction, HarnessResult};
         let invalid =
             || crate::SessionError::EventSerialization("managed open preparation conflict".into());
         owner
             .validate()
             .map_err(crate::SessionError::EventSerialization)?;
-        let retained = ExternalHarnessRequest::from_request(request)
+        retained
+            .validate()
             .map_err(crate::SessionError::EventSerialization)?;
-        let ExternalHarnessRequestKind::Open(open) = &retained.kind else {
+        if retained.is_selected_open()
+            && (bcode_session_models::CURRENT_SESSION_EVENT_SCHEMA_VERSION
+                != bcode_session_models::external_harness::SELECTED_OPEN_EVENT_SCHEMA_VERSION
+                || bcode_session_models::CURRENT_SESSION_STORAGE_WRITER_EPOCH
+                    != bcode_session_models::external_harness::SELECTED_OPEN_STORAGE_WRITER_EPOCH)
+        {
+            return Err(invalid());
+        }
+        let Some(open) = retained.open() else {
             return Err(invalid());
         };
         if open.session_id != owner.session_id.to_string()
@@ -55,22 +131,21 @@ impl crate::SessionManager {
             owner: owner.clone(),
             inventory_commitments: Vec::new(),
             record: ExternalHarnessOperationRecord::Configured {
-                instance: request.instance.clone(),
+                instance: retained.instance.clone(),
                 capabilities,
                 open_request: Some(retained.clone()),
             },
         };
         operation
-            .validate()
+            .validate_storage(
+                bcode_session_models::CURRENT_SESSION_EVENT_SCHEMA_VERSION,
+                bcode_session_models::CURRENT_SESSION_STORAGE_WRITER_EPOCH,
+            )
             .map_err(crate::SessionError::EventSerialization)?;
-        let summary = if let Some(parent_id) = parent_id {
-            self.create_child_session(bcode_session_models::SessionChildCreateRequest {
-                child_id: owner.session_id,
-                parent_id,
-                name: None,
-                working_directory: cwd.clone(),
-            })
-            .await?
+        let summary = if let Some(spawning) = spawning {
+            self.create_spawning_session(spawning.clone()).await?
+        } else if let Some(parent_id) = parent_id {
+            self.prepare_external_child(owner, parent_id, &cwd).await?
         } else {
             self.prepare_external_top_level(owner, &cwd, &operation)
                 .await?
@@ -93,6 +168,57 @@ impl crate::SessionManager {
         }
         Ok(summary)
     }
+    async fn prepare_external_child(
+        &self,
+        owner: &ExternalHarnessOwner,
+        parent_id: SessionId,
+        cwd: &std::path::Path,
+    ) -> Result<bcode_session_models::SessionSummary, crate::SessionError> {
+        let invalid =
+            || crate::SessionError::EventSerialization("managed open preparation conflict".into());
+        let creation = bcode_session_models::SessionChildCreateRequest {
+            child_id: owner.session_id,
+            parent_id,
+            name: None,
+            working_directory: cwd.to_path_buf(),
+        };
+        Ok(
+            match self.session_summary_non_owning(owner.session_id).await {
+                Ok(existing) if existing.execution.is_some() => {
+                    let events = self
+                        .session_handle(owner.session_id)
+                        .await?
+                        .events_range(0, 1, 2)
+                        .await?;
+                    let retained_creation = events
+                        .iter()
+                        .find_map(|event| match &event.kind {
+                            SessionEventKind::ChildSessionCreated { request, .. }
+                                if event.sequence == 1 && event.session_id == owner.session_id =>
+                            {
+                                Some(request.as_ref().clone())
+                            }
+                            _ => None,
+                        })
+                        .ok_or_else(invalid)?;
+                    if retained_creation.child_id != creation.child_id
+                        || retained_creation.parent_id != creation.parent_id
+                        || std::fs::canonicalize(&retained_creation.working_directory)? != cwd
+                    {
+                        return Err(invalid());
+                    }
+                    let provenance = existing.execution.ok_or_else(invalid)?.provenance;
+                    self.create_child_execution_session(retained_creation, provenance)
+                        .await?
+                }
+                Ok(_) | Err(crate::SessionError::NotFound(_)) => {
+                    self.create_child_session(creation).await?
+                }
+                Err(error) => return Err(error),
+            },
+        )
+    }
+
     async fn prepare_external_top_level(
         &self,
         owner: &ExternalHarnessOwner,
@@ -171,9 +297,19 @@ impl crate::SessionManager {
             let result = database
                 .append_event_batch(&[(created, Some(now)), (configured, Some(now))])
                 .await;
+            let summary = async {
+                result?;
+                Ok::<_, crate::SessionError>(
+                    self.load_db_session_state(owner.session_id, &database)
+                        .await?
+                        .summary(),
+                )
+            }
+            .await;
             let close = database.close().await;
-            result?;
+            let summary = summary?;
             close?;
+            crate::derivation::write_staged_manifest(&staging, &summary)?;
             let staged = crate::db::session_dir_path(&staging, owner.session_id);
             std::fs::File::open(&staged)?.sync_all()?;
             std::fs::rename(&staged, &canonical)?;

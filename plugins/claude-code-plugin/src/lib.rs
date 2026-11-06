@@ -4,10 +4,12 @@
 //! Claude Code execution backend. The host owns admission and canonical persistence.
 mod attribution;
 mod auth;
+mod candidates;
 mod capabilities;
 mod config;
 mod diagnostics;
 mod execution;
+mod model_selection;
 mod normalize;
 mod parent_bridge;
 mod recovery;
@@ -207,6 +209,7 @@ pub struct ClaudeCodePlugin {
     processes: BTreeMap<String, Process>,
     /// Failed opens are uncertain and cannot be silently repeated during this runtime.
     opens: BTreeMap<String, HarnessOpenRequest>,
+    model_selections: BTreeMap<String, model_selection::RetainedSelection>,
     auth: auth::AuthFlows,
     tool_queues: BTreeMap<String, Arc<Mutex<tool_bridge::Queue>>>,
 }
@@ -430,6 +433,16 @@ impl RustPlugin for ClaudeCodePlugin {
     }
 
     fn invoke_service(&mut self, context: NativeServiceContext) -> ServiceResponse {
+        if context.plugin_id == PLUGIN_ID
+            && context.request.interface_id == bcode_harness_models::HARNESS_CANDIDATES_INTERFACE_ID
+        {
+            return self.candidates_service(&context);
+        }
+        if context.plugin_id == PLUGIN_ID
+            && context.request.interface_id == bcode_harness_models::HARNESS_MODELS_INTERFACE_ID
+        {
+            return self.invoke_models_service(&context);
+        }
         if context.plugin_id == PLUGIN_ID
             && context.request.interface_id == bcode_harness_models::HARNESS_RECOVERY_INTERFACE_ID
         {
@@ -932,6 +945,7 @@ impl ClaudeCodePlugin {
         for id in closed {
             self.processes.remove(&id);
             self.opens.remove(&id);
+            self.model_selections.remove(&id);
             self.tool_queues.remove(&id);
         }
     }
@@ -943,6 +957,15 @@ impl ClaudeCodePlugin {
         selected: &InstanceConfig,
         context: &NativeServiceContext,
     ) -> Result<HarnessServiceResponseKind, HarnessFailure> {
+        self.open_with_model(instance, open, selected, context, None)
+            .await
+    }
+
+    fn retained_open_response(
+        &self,
+        instance: &HarnessInstance,
+        open: &HarnessOpenRequest,
+    ) -> Result<Option<HarnessServiceResponseKind>, HarnessFailure> {
         if let Some(process) = self.processes.get(&open.session_id) {
             if process.closed || !process.client.is_control_ready() {
                 return Err(HarnessFailure::Uncertain);
@@ -950,14 +973,34 @@ impl ClaudeCodePlugin {
             if process.instance != *instance || process.open != *open {
                 return Err(HarnessFailure::Conflict);
             }
-            return Ok(open_response(
+            return Ok(Some(open_response(
                 &process
                     .stream
                     .lock()
                     .map_err(|_| HarnessFailure::Unavailable)?
                     .normalizer
                     .target,
-            ));
+            )));
+        }
+        Ok(None)
+    }
+
+    async fn open_with_model(
+        &mut self,
+        instance: &HarnessInstance,
+        open: &HarnessOpenRequest,
+        selected: &InstanceConfig,
+        context: &NativeServiceContext,
+        model: Option<&bcode_harness_models::HarnessModelSelection>,
+    ) -> Result<HarnessServiceResponseKind, HarnessFailure> {
+        if (self.opens.contains_key(&open.session_id)
+            || self.processes.contains_key(&open.session_id))
+            && !model_selection::same_selection(self.model_selections.get(&open.session_id), model)
+        {
+            return Err(HarnessFailure::Conflict);
+        }
+        if let Some(response) = self.retained_open_response(instance, open)? {
+            return Ok(response);
         }
         // Closed instances release process capacity. Host admission must fence old canonical
         // open/submission identities across eviction and plugin restart.
@@ -1000,6 +1043,15 @@ impl ClaudeCodePlugin {
             sdk_servers.push(tool_bridge::SERVER.to_owned());
         }
         self.opens.insert(open.session_id.clone(), open.clone());
+        if let Some(model) = model {
+            self.model_selections.insert(
+                open.session_id.clone(),
+                model_selection::RetainedSelection {
+                    selection: model.clone(),
+                    evidence: None,
+                },
+            );
+        }
         let session = if open.resume.is_some() {
             ClaudeSession::spawn_with_sdk_servers(options, sdk_servers).await
         } else {
@@ -1011,14 +1063,19 @@ impl ClaudeCodePlugin {
             prepared,
             opened,
             stream,
+            model_evidence,
         } = prepare_stream(
             &session,
             instance,
             open,
             selected,
             admitted_assistance_grant,
+            model,
         )
         .await?;
+        if let Some(retained) = self.model_selections.get_mut(&open.session_id) {
+            retained.evidence = model_evidence;
+        }
         let _reader = tokio::spawn(drain_session(session, Arc::clone(&stream), tool_queue));
         self.processes.insert(
             open.session_id.clone(),
@@ -1083,6 +1140,7 @@ fn native_auth_capability(support: bcode_claude_code::NativeAuthSupport) -> Harn
 }
 
 struct PreparedStream {
+    model_evidence: Option<bcode_harness_models::HarnessModelEvidence>,
     client: ClaudeClient,
     prepared: HarnessPreparedSession,
     opened: HarnessServiceResponseKind,
@@ -1095,12 +1153,25 @@ async fn prepare_stream(
     open: &HarnessOpenRequest,
     selected: &InstanceConfig,
     admitted_assistance_grant: Option<bcode_harness_models::HarnessAssistanceGrant>,
+    model: Option<&bcode_harness_models::HarnessModelSelection>,
 ) -> Result<PreparedStream, HarnessFailure> {
     let client = session.client();
-    client
+    let initialize = client
         .initialize()
         .await
         .map_err(|_| HarnessFailure::Uncertain)?;
+    let model_evidence = if let Some(model) = model {
+        let evidence = client
+            .select_model_before_prompt(&initialize, &model.model_id)
+            .await
+            .map_err(|_| HarnessFailure::Uncertain)?;
+        Some(bcode_harness_models::HarnessModelEvidence {
+            requested_model_id: evidence.requested,
+            effective_model_id: evidence.effective,
+        })
+    } else {
+        None
+    };
     if !client.is_control_ready() {
         return Err(HarnessFailure::Uncertain);
     }
@@ -1158,6 +1229,7 @@ async fn prepare_stream(
         gap: false,
     }));
     Ok(PreparedStream {
+        model_evidence,
         client,
         prepared,
         opened,

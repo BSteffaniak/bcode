@@ -38,7 +38,7 @@ fn canonical_delivery_contract_retains_full_open_and_rejects_auth() {
     let mut input = request();
     let retained = ExternalHarnessRequest::from_request(&input).unwrap();
     assert_eq!(
-        serde_json::to_value(retained.request()).unwrap(),
+        serde_json::to_value(retained.request().unwrap()).unwrap(),
         serde_json::to_value(&input).unwrap()
     );
     input.kind = HarnessRequestKind::AuthStatus { verify: false };
@@ -67,9 +67,9 @@ fn recorded_result_preserves_correlation_without_native_redispatch() {
         }),
     };
     let retained = ExternalHarnessResponse::from_response(&input, &response).unwrap();
-    retained.response().validate_for(&input).unwrap();
+    retained.response().unwrap().validate_for(&input).unwrap();
     assert_eq!(
-        serde_json::to_value(retained.response()).unwrap(),
+        serde_json::to_value(retained.response().unwrap()).unwrap(),
         serde_json::to_value(response).unwrap()
     );
 }

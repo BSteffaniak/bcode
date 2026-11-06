@@ -34,6 +34,16 @@ pub struct ManagedSession {
     pub capabilities: HarnessCapabilities,
 }
 
+/// Canonical selected-open claim; legacy Open claims cannot authorize this extension.
+pub enum SelectedDeliveryClaim {
+    /// Exactly one selected native mutation is authorized.
+    New,
+    /// Identical canonical completion; return it without native I/O.
+    Recorded(Box<bcode_harness_models::HarnessModelsResponse>),
+    /// Prior delivery may have happened. Never replay.
+    Uncertain,
+}
+
 /// Result of an atomic exact-request comparison and delivery claim.
 pub enum DeliveryClaim {
     /// Only this result authorizes one native call, and only for the supplied owner.
@@ -86,6 +96,38 @@ pub trait ManagedHarnessStore: Send + Sync {
             }
             Ok(Box::new(()) as Box<dyn Send + Sync>)
         }
+    }
+
+    /// Claim the exact selected envelope, independently of legacy Open.
+    /// Stores without selected-launch persistence must fail before native effects.
+    fn claim_selected(
+        &self,
+        owner: &HarnessOwner,
+        request: &bcode_harness_models::HarnessModelsRequest,
+    ) -> impl Future<Output = Result<SelectedDeliveryClaim, ManagedHarnessError>> + Send {
+        let _ = (owner, request);
+        async { Err(ManagedHarnessError::Unsupported) }
+    }
+
+    /// Commit selected target and requested/effective model evidence under the exact claim.
+    fn commit_selected(
+        &self,
+        owner: &HarnessOwner,
+        request: &bcode_harness_models::HarnessModelsRequest,
+        response: &bcode_harness_models::HarnessModelsResponse,
+    ) -> impl Future<Output = Result<(), ManagedHarnessError>> + Send {
+        let _ = (owner, request, response);
+        async { Err(ManagedHarnessError::Unsupported) }
+    }
+
+    /// Preserve uncertainty without authorizing another selected delivery.
+    fn uncertain_selected(
+        &self,
+        owner: &HarnessOwner,
+        request: &bcode_harness_models::HarnessModelsRequest,
+    ) -> impl Future<Output = Result<(), ManagedHarnessError>> + Send {
+        let _ = (owner, request);
+        async { Err(ManagedHarnessError::Unsupported) }
     }
 
     /// Atomically accept the exact bounded request and mark delivery attempted before returning

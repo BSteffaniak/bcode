@@ -33,6 +33,602 @@ const EXECUTE_OPERATION: &str = "harness.execute";
 const AWAIT_OPERATION: &str = "harness.await";
 const MANAGED_INTERFACE: &str = "bcode.managed-session/v1";
 
+/// Selected ordinary prompt assignment, distinct from plugin-prepared block contracts.
+pub(crate) const SELECTED_PROMPT_OWNER: &str = "bcode.server.selected-harness-prompt/v1";
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct SelectedPromptReceipt {
+    owner: String,
+    dispatch_identity: String,
+    run_id: String,
+    node_id: String,
+    activation_id: String,
+    attempt: u32,
+    session_id: SessionId,
+    start: bcode_ipc::harness::ManagedSelectedStartRequest,
+    resolved: bcode_model::execution::ResolvedExecutionModel,
+    configuration: bcode_workflow::WorkflowPromptConfiguration,
+    submission: bcode_harness_models::HarnessSubmission,
+    input: Value,
+    output: bcode_workflow::ValueSchema,
+}
+
+impl SelectedPromptReceipt {
+    fn decode(value: &Value) -> Result<Self, WorkflowStoreError> {
+        if serde_json::to_vec(value)?.len() > bcode_workflow::MAX_WORKFLOW_BLOCK_PREPARATION_BYTES {
+            return Err(invalid("selected workflow receipt exceeds bound"));
+        }
+        let receipt: Self = serde_json::from_value(value.clone())?;
+        receipt
+            .start
+            .validate()
+            .map_err(|_| invalid("invalid selected workflow Start"))?;
+        receipt
+            .configuration
+            .validate()
+            .map_err(|_| invalid("invalid selected workflow configuration"))?;
+        receipt
+            .submission
+            .validate()
+            .map_err(|_| invalid("invalid selected workflow assignment"))?;
+        let checked = crate::workflow_operations::execution_selection::resolve(
+            &receipt.configuration,
+            std::slice::from_ref(&receipt.resolved.target),
+        )?
+        .ok_or_else(|| invalid("selected workflow configuration missing selection"))?;
+        let expected_start =
+            crate::workflow_operations::execution_selection::selected_start_request(
+                &receipt.resolved,
+                receipt.start.instance.clone(),
+                receipt.start.open.clone(),
+                receipt
+                    .start
+                    .parent_session_id
+                    .ok_or_else(|| invalid("selected workflow parent missing"))?,
+            )?;
+        if serde_json::to_value(expected_start)? != serde_json::to_value(&receipt.start)? {
+            return Err(invalid("selected workflow Start changed resolved instance"));
+        }
+        if receipt.owner != SELECTED_PROMPT_OWNER
+            || checked.requested != receipt.resolved.requested
+            || checked.eligibility != receipt.resolved.eligibility
+            || receipt.start.selection.model_id != receipt.resolved.target.model.model_id
+            || receipt.start.selection.route.as_ref() != Some(&receipt.resolved.target.route)
+            || receipt.start.selection.account_reference
+                != receipt.resolved.target.account_reference
+            || receipt.start.open.session_id != receipt.session_id.to_string()
+            || receipt.start.open.open_id != format!("{}:open", receipt.dispatch_identity)
+            || receipt.submission.placement != bcode_harness_models::HarnessPlacement::NextTurn
+            || receipt.submission.session_id != receipt.start.open.session_id
+            || receipt.submission.generation != 1
+            || receipt.submission.submission_id != receipt.dispatch_identity
+            || receipt.submission.attempt_id != receipt.dispatch_identity
+            || receipt.dispatch_identity
+                != bcode_workflow_store::dispatch_identity(
+                    &receipt.run_id,
+                    &receipt.node_id,
+                    &receipt.activation_id,
+                    receipt.attempt,
+                )
+        {
+            return Err(invalid("selected workflow receipt correlation mismatch"));
+        }
+        Ok(receipt)
+    }
+}
+
+/// Verify pre-Open discovery scope from the exact prepared prompt intent and workflow authority.
+/// This grants read-only discovery, not selected Open or assignment dispatch.
+pub(crate) async fn authorize_selected_discovery(
+    state: &ServerState,
+    run_id: &str,
+    dispatch_identity: &str,
+    parent_session_id: SessionId,
+) -> Result<crate::workflow_operations::AuthorityGuard, WorkflowStoreError> {
+    let guard = settlement_authority(state, run_id)
+        .await?
+        .ok_or_else(|| invalid("selected discovery authority required"))?;
+    let intent =
+        crate::workflow_representation::owner::dispatch_intent(state, run_id, dispatch_identity)
+            .await?;
+    let configuration: bcode_workflow::WorkflowPromptConfiguration = serde_json::from_value(
+        intent
+            .get("configuration")
+            .cloned()
+            .ok_or_else(|| invalid("selected discovery configuration missing"))?,
+    )?;
+    configuration
+        .validate()
+        .map_err(|_| invalid("invalid selected discovery configuration"))?;
+    if configuration.execution_model_selection.is_none() {
+        return Err(invalid("selected discovery requires exact model selection"));
+    }
+    let run = crate::workflow_representation::status(state, run_id)
+        .await
+        .map_err(|_| invalid("selected discovery run unavailable"))?
+        .ok_or_else(|| invalid("selected discovery run missing"))?;
+    if run.parent_session_id.as_deref() != Some(parent_session_id.to_string().as_str()) {
+        let stored = crate::workflow_representation::owner::execution_receipt(
+            state,
+            run_id,
+            dispatch_identity,
+        )
+        .await?
+        .ok_or_else(|| invalid("selected discovery parent mismatch"))?;
+        let receipt = SelectedPromptReceipt::decode(&stored.receipt)?;
+        if receipt.session_id != parent_session_id {
+            return Err(invalid("selected discovery session mismatch"));
+        }
+        return authorize_selected_start(
+            state,
+            run_id,
+            dispatch_identity,
+            receipt.session_id,
+            &receipt.start.instance.plugin_id,
+            &receipt.start,
+        )
+        .await;
+    }
+    Ok(guard)
+}
+
+/// Hold current workflow authority and validate exact immutable selected Open before host I/O.
+/// Host admission must independently verify instance, workspace, policy and native capabilities.
+pub(crate) async fn authorize_selected_start(
+    state: &ServerState,
+    run_id: &str,
+    dispatch_identity: &str,
+    session_id: SessionId,
+    plugin_id: &str,
+    request: &bcode_ipc::harness::ManagedSelectedStartRequest,
+) -> Result<crate::workflow_operations::AuthorityGuard, WorkflowStoreError> {
+    let guard = settlement_authority(state, run_id)
+        .await?
+        .ok_or_else(|| invalid("selected workflow authority required"))?;
+    let stored =
+        crate::workflow_representation::owner::execution_receipt(state, run_id, dispatch_identity)
+            .await?
+            .ok_or_else(|| invalid("selected workflow receipt required"))?;
+    let receipt = SelectedPromptReceipt::decode(&stored.receipt)?;
+    let intent =
+        crate::workflow_representation::owner::dispatch_intent(state, run_id, dispatch_identity)
+            .await?;
+    if intent.get("configuration") != Some(&serde_json::to_value(&receipt.configuration)?)
+        || intent.get("input") != Some(&receipt.input)
+        || intent.get("node").and_then(|node| node.get("output"))
+            != Some(&serde_json::to_value(&receipt.output)?)
+    {
+        return Err(invalid(
+            "selected workflow receipt differs from prepared intent",
+        ));
+    }
+    if receipt.run_id != run_id
+        || receipt.dispatch_identity != dispatch_identity
+        || receipt.session_id != session_id
+        || receipt.start.instance.plugin_id != plugin_id
+        || serde_json::to_value(&receipt.start)? != serde_json::to_value(request)?
+    {
+        return Err(invalid("selected workflow Start grant mismatch"));
+    }
+    let link = crate::workflow_representation::owner::execution_session_link(
+        state,
+        run_id,
+        &receipt.node_id,
+        &receipt.activation_id,
+        receipt.attempt,
+    )
+    .await?
+    .ok_or_else(|| invalid("selected workflow link required"))?;
+    let summary = state
+        .sessions
+        .session_summary(session_id)
+        .await
+        .map_err(|_| invalid("selected workflow child unavailable"))?;
+    let provenance = summary
+        .execution
+        .as_ref()
+        .map(|execution| &execution.provenance)
+        .ok_or_else(|| invalid("selected workflow child provenance missing"))?;
+    if link.session_id != session_id.to_string()
+        || summary.parent_id != receipt.start.parent_session_id
+        || summary.working_directory.to_string_lossy() != receipt.start.open.working_directory
+        || provenance.owner != "bcode.workflow"
+        || provenance.run_id != receipt.run_id
+        || provenance.node_id != receipt.node_id
+        || provenance.activation_id.as_ref() != Some(&receipt.activation_id)
+        || provenance.attempt != receipt.attempt
+    {
+        return Err(invalid("selected workflow Start link mismatch"));
+    }
+    Ok(guard)
+}
+
+/// Persist correlation before selected native Open. An ambiguous delivery is observation-owned;
+/// this function never retries a native mutation or falls back to a provider.
+pub(crate) async fn dispatch_selected_prompt(
+    state: &Arc<ServerState>,
+    request: &PreparedActivationDispatch,
+    resolved: bcode_model::execution::ResolvedExecutionModel,
+    instance: bcode_harness_models::HarnessInstance,
+    session_ids: (SessionId, SessionId),
+    configuration: bcode_workflow::WorkflowPromptConfiguration,
+    text: String,
+) -> Result<Value, WorkflowStoreError> {
+    let (session_id, parent_session_id) = session_ids;
+    let guard = settlement_authority(state, &request.activation.run_id)
+        .await?
+        .ok_or_else(|| invalid("selected prompt authority required"))?;
+    let summary = state
+        .sessions
+        .session_summary(session_id)
+        .await
+        .map_err(|_| invalid("selected prompt child unavailable"))?;
+    let open_id = format!("{}:open", request.dispatch_identity);
+    let start = crate::workflow_operations::execution_selection::selected_start_request(
+        &resolved,
+        instance,
+        bcode_harness_models::HarnessOpenRequest {
+            open_id,
+            session_id: session_id.to_string(),
+            generation: 1,
+            working_directory: summary.working_directory.to_string_lossy().into_owned(),
+            resume: None,
+            parent_assistance: None,
+        },
+        parent_session_id,
+    )?;
+    let receipt = SelectedPromptReceipt {
+        owner: SELECTED_PROMPT_OWNER.into(),
+        dispatch_identity: request.dispatch_identity.clone(),
+        run_id: request.activation.run_id.clone(),
+        node_id: request.activation.node_id.clone(),
+        activation_id: request.activation.activation_id.clone(),
+        attempt: request.attempt,
+        session_id,
+        start,
+        resolved,
+        configuration,
+        submission: bcode_harness_models::HarnessSubmission {
+            submission_id: request.dispatch_identity.clone(),
+            attempt_id: request.dispatch_identity.clone(),
+            session_id: session_id.to_string(),
+            generation: 1,
+            text,
+            placement: bcode_harness_models::HarnessPlacement::NextTurn,
+        },
+        input: request
+            .activation
+            .input
+            .clone()
+            .ok_or_else(|| invalid("selected prompt input missing"))?,
+        output: request.activation.node.output.clone(),
+    };
+    let value = serde_json::to_value(&receipt)?;
+    SelectedPromptReceipt::decode(&value)?;
+    crate::workflow_representation::owner::persist_receipt(
+        state,
+        &DispatchReceipt {
+            run_id: receipt.run_id.clone(),
+            node_id: receipt.node_id.clone(),
+            activation_id: receipt.activation_id.clone(),
+            attempt: receipt.attempt,
+            dispatch_identity: receipt.dispatch_identity.clone(),
+            receipt: value.clone(),
+            admitted_at_ms: crate::current_unix_millis(),
+        },
+        &guard.authority,
+    )
+    .await?;
+    if crate::workflow_representation::owner::cancellation_intended(
+        state,
+        &receipt.run_id,
+        &receipt.dispatch_identity,
+    )
+    .await?
+    {
+        return Ok(value);
+    }
+    let caller = crate::harness_dispatch::ManagedCaller::Workflow {
+        run_id: receipt.run_id.clone(),
+        dispatch_identity: receipt.dispatch_identity.clone(),
+        session_id,
+        plugin_id: receipt.start.instance.plugin_id.clone(),
+    };
+    let response =
+        crate::harness::execution_catalog::start_selected(state, &caller, receipt.start.clone())
+            .await;
+    let Ok(response) = response else {
+        return Ok(value);
+    };
+    let target = crate::workflow_operations::execution_selection::accepted_start_target(
+        &receipt.resolved,
+        &receipt.start,
+        &response,
+    );
+    let Ok(target) = target else {
+        return Ok(value);
+    };
+    submit_selected_assignment(state, &caller, &receipt, target).await;
+    Ok(value)
+}
+
+async fn submit_selected_assignment(
+    state: &Arc<ServerState>,
+    caller: &crate::harness_dispatch::ManagedCaller,
+    receipt: &SelectedPromptReceipt,
+    target: HarnessSessionTarget,
+) {
+    // Prepared is a live transport correlation only. Native host admission must explicitly
+    // admit a first submission; no confirmed native identity is synthesized here.
+    let call = selected_submission_call(receipt, target);
+    if let Some(backend) = state.managed_sessions.get() {
+        let _ = backend.execute(caller, call).await;
+    }
+}
+
+fn selected_submission_call(
+    receipt: &SelectedPromptReceipt,
+    target: HarnessSessionTarget,
+) -> ManagedSessionCall {
+    ManagedSessionCall {
+        session_id: Some(receipt.session_id),
+        parent_session_id: None,
+        assistance_destination_session_id: None,
+        harness: bcode_harness_models::HarnessRequest {
+            schema_version: bcode_harness_models::HARNESS_SCHEMA_VERSION,
+            request_id: receipt.submission.submission_id.clone(),
+            instance: receipt.start.instance.clone(),
+            kind: HarnessRequestKind::Submit {
+                target,
+                submission: receipt.submission.clone(),
+            },
+        },
+    }
+}
+
+/// Observe only canonical, exactly accepted selected assignments. Never reopen or resubmit.
+fn selected_native_turn(
+    receipt: &SelectedPromptReceipt,
+    observations: &[bcode_harness_models::HarnessObservation],
+) -> Result<Result<Option<String>, AttemptObservation>, WorkflowStoreError> {
+    let exact = bcode_harness_models::HarnessAttemptIdentity {
+        submission_id: receipt.submission.submission_id.clone(),
+        attempt_id: receipt.submission.attempt_id.clone(),
+    };
+    if let Some(verdict) = execution_outcome::evaluate_assignment(
+        observations,
+        receipt.session_id,
+        1,
+        &exact,
+        bcode_harness_models::HarnessCompletionRequirement::AssociatedWork,
+    )? {
+        return match verdict {
+            execution_outcome::AssignmentVerdict::Pending(observation) => Ok(Err(observation)),
+            execution_outcome::AssignmentVerdict::Completed { output, .. } => {
+                complete_selected_prompt(receipt, &output).map(Err)
+            }
+        };
+    }
+    let mut native = None;
+    for observation in observations {
+        if let HarnessObservationKind::SubmissionAccepted {
+            submission_id,
+            attempt_id,
+            native_turn_id,
+        } = &observation.kind
+        {
+            if observation.session_id != receipt.session_id.to_string()
+                || observation.generation != 1
+                || observation.completeness != HarnessCompleteness::Complete
+                || submission_id != &receipt.submission.submission_id
+                || attempt_id != &receipt.submission.attempt_id
+                || native
+                    .as_ref()
+                    .is_some_and(|previous| previous != native_turn_id)
+            {
+                return Ok(Err(deferred(
+                    "selected workflow acceptance is incomplete or conflicting",
+                )));
+            }
+            native = Some(native_turn_id.clone());
+        }
+    }
+    Ok(Ok(native))
+}
+
+pub(crate) async fn observe_selected_prompt(
+    state: &ServerState,
+    request: &AttemptReconciliationRequest,
+) -> Result<AttemptObservation, WorkflowStoreError> {
+    let receipt = SelectedPromptReceipt::decode(&request.receipt)?;
+    if receipt.run_id != request.run_id
+        || receipt.node_id != request.node_id
+        || receipt.activation_id != request.activation_id
+        || receipt.attempt != request.attempt
+        || receipt.dispatch_identity != request.dispatch_identity
+    {
+        return Err(invalid("selected workflow observation mismatch"));
+    }
+    let _guard = authorize_selected_start(
+        state,
+        &receipt.run_id,
+        &receipt.dispatch_identity,
+        receipt.session_id,
+        &receipt.start.instance.plugin_id,
+        &receipt.start,
+    )
+    .await?;
+    let owner = canonical_session_owner(state, receipt.session_id, 1)?;
+    let current = state
+        .sessions
+        .external_harness_state(&owner)
+        .await
+        .map_err(|_| invalid("selected workflow state unavailable"))?;
+    if current.instance != receipt.start.instance {
+        return Err(invalid("selected workflow instance changed"));
+    }
+    let Some(HarnessSessionTarget::Confirmed(target)) = current.target else {
+        return Ok(deferred(
+            "selected workflow native session remains unconfirmed",
+        ));
+    };
+    let evidence = state
+        .sessions
+        .session_external_harness_submission_evidence(
+            receipt.session_id,
+            &receipt.submission.submission_id,
+            &receipt.submission.attempt_id,
+        )
+        .await
+        .map_err(|_| invalid("selected workflow assignment evidence unavailable"))?;
+    let Some((evidence_owner, page)) = evidence else {
+        return Ok(deferred(
+            "selected workflow assignment acceptance unavailable",
+        ));
+    };
+    if evidence_owner != owner {
+        return Err(invalid("selected workflow evidence owner changed"));
+    }
+    if page.completeness == HarnessCompleteness::Gap
+        || page.status.completeness == HarnessCompleteness::Gap
+        || page.status.attention != bcode_harness_models::HarnessAttention::None
+    {
+        return Ok(deferred(
+            "selected workflow evidence gap or interaction coverage unresolved",
+        ));
+    }
+    let native = match selected_native_turn(&receipt, &page.observations)? {
+        Ok(native) => native,
+        Err(observation) => return Ok(observation),
+    };
+    let Some(native) = native else {
+        return Ok(deferred("selected workflow assignment not accepted"));
+    };
+    // Canonical runtime owns draining. No native turn IDs are guessed or derived from a request.
+    let _ = target;
+    match settled_assignment_result(&page.observations, receipt.session_id, 1, &native)? {
+        Err(observation) => Ok(observation),
+        Ok(result) => complete_selected_prompt(&receipt, &result),
+    }
+}
+
+fn complete_selected_prompt(
+    receipt: &SelectedPromptReceipt,
+    result: &str,
+) -> Result<AttemptObservation, WorkflowStoreError> {
+    let output = selected_prompt_output(receipt, result)?;
+    Ok(AttemptObservation::Succeeded {
+        output: bcode_workflow_store::ValidatedOutput {
+            output_id: format!("{}:selected-output", receipt.dispatch_identity),
+            run_id: receipt.run_id.clone(),
+            node_id: receipt.node_id.clone(),
+            activation_id: receipt.activation_id.clone(),
+            schema_id: receipt.output.type_name.clone(),
+            schema_version: 1,
+            artifact_reference: None,
+            value: output,
+            created_at_ms: crate::current_unix_millis(),
+        },
+    })
+}
+
+fn selected_prompt_output(
+    receipt: &SelectedPromptReceipt,
+    result: &str,
+) -> Result<Value, WorkflowStoreError> {
+    let output = if receipt.configuration.output
+        == bcode_workflow::WorkflowPromptOutputPolicy::PreserveInput
+    {
+        receipt.input.clone()
+    } else {
+        let contribution: Value = serde_json::from_str(result)?;
+        if let Some(policy) = receipt.configuration.output.structured() {
+            policy
+                .schema
+                .validate_value("selected assignment", &contribution)
+                .map_err(|_| invalid("selected assignment violates structured output schema"))?;
+        }
+        receipt
+            .configuration
+            .output
+            .retain_contribution(Some(&receipt.input), contribution)
+            .map_err(invalid)?
+    };
+    crate::validate_workflow_output_semantics(&receipt.output, &output).map_err(invalid)?;
+    Ok(output)
+}
+
+/// Signal cancellation only after canonical workflow intent; acknowledgment is not settlement.
+pub(crate) async fn cancel_selected_prompt(
+    state: &ServerState,
+    attempt: &bcode_workflow_store::ActiveAttemptCancellation,
+) -> Result<(), WorkflowStoreError> {
+    let receipt = SelectedPromptReceipt::decode(
+        attempt
+            .receipt
+            .as_ref()
+            .ok_or_else(|| invalid("selected cancellation receipt missing"))?,
+    )?;
+    if receipt.dispatch_identity != attempt.dispatch_identity || receipt.run_id != attempt.run_id {
+        return Err(invalid("selected cancellation identity mismatch"));
+    }
+    let _guard = authorize_selected_start(
+        state,
+        &receipt.run_id,
+        &receipt.dispatch_identity,
+        receipt.session_id,
+        &receipt.start.instance.plugin_id,
+        &receipt.start,
+    )
+    .await?;
+    if !crate::workflow_representation::owner::cancellation_intended(
+        state,
+        &receipt.run_id,
+        &receipt.dispatch_identity,
+    )
+    .await?
+    {
+        return Err(invalid("selected cancellation intent required"));
+    }
+    let owner = canonical_session_owner(state, receipt.session_id, 1)?;
+    let current = state
+        .sessions
+        .external_harness_state(&owner)
+        .await
+        .map_err(|_| invalid("selected cancellation state unavailable"))?;
+    if current.instance != receipt.start.instance {
+        return Err(invalid("selected cancellation instance changed"));
+    }
+    let target = current
+        .target
+        .ok_or_else(|| invalid("selected cancellation target unconfirmed"))?;
+    let mut call = selected_submission_call(&receipt, target.clone());
+    call.harness.request_id = format!("{}:interrupt", receipt.dispatch_identity);
+    call.harness.kind =
+        HarnessRequestKind::Interrupt(bcode_harness_models::HarnessControlRequest {
+            target,
+            mutation_id: call.harness.request_id.clone(),
+        });
+    let backend = state
+        .managed_sessions
+        .get()
+        .ok_or_else(|| invalid("managed backend unavailable"))?;
+    backend
+        .execute(
+            &crate::harness_dispatch::ManagedCaller::Workflow {
+                run_id: receipt.run_id,
+                dispatch_identity: receipt.dispatch_identity,
+                session_id: receipt.session_id,
+                plugin_id: receipt.start.instance.plugin_id,
+            },
+            call,
+        )
+        .await
+        .map_err(|_| invalid("selected cancellation unresolved"))?;
+    Ok(())
+}
+
 /// Stable recovery handle, published before native delivery. Its existence is not acceptance.
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -668,6 +1264,28 @@ pub(crate) async fn managed_tool_ceiling(
         crate::workflow_representation::owner::execution_receipt(state, run_id, dispatch_identity)
             .await?
             .ok_or_else(|| invalid("managed tool receipt unavailable"))?;
+    if stored.receipt.get("owner").and_then(Value::as_str) == Some(SELECTED_PROMPT_OWNER) {
+        let receipt = SelectedPromptReceipt::decode(&stored.receipt)?;
+        return Ok(bcode_session_models::TurnExecutionOptions {
+            tools: match receipt.configuration.tool_capability {
+                bcode_workflow::WorkflowToolCapability::Disabled => {
+                    bcode_session_models::TurnToolPolicy::Disabled
+                }
+                bcode_workflow::WorkflowToolCapability::ReadOnly => {
+                    bcode_session_models::TurnToolPolicy::ReadOnly
+                }
+                bcode_workflow::WorkflowToolCapability::Mutating => {
+                    bcode_session_models::TurnToolPolicy::Enabled
+                }
+            },
+            agent_profile: Some(receipt.configuration.agent_profile),
+            allow_user_questions: receipt.configuration.allow_user_questions,
+            tool_allowlist: (!receipt.configuration.tool_allowlist.is_empty())
+                .then_some(receipt.configuration.tool_allowlist),
+            permission_mode: bcode_session_models::TurnPermissionMode::Enforce,
+            ..Default::default()
+        });
+    }
     let receipt = HarnessWorkflowReceipt::decode(&stored.receipt)?;
     let tools = match receipt.block.authorization.capability {
         bcode_workflow::WorkflowToolCapability::Disabled => {
@@ -688,6 +1306,108 @@ pub(crate) async fn managed_tool_ceiling(
     })
 }
 
+async fn validate_selected_call(
+    state: &ServerState,
+    session_id: SessionId,
+    receipt: &SelectedPromptReceipt,
+    call: &ManagedSessionCall,
+) -> Result<(), WorkflowStoreError> {
+    if call.harness.instance != receipt.start.instance
+        || call.parent_session_id.is_some()
+        || call.assistance_destination_session_id.is_some()
+        || call.session_id != Some(session_id)
+    {
+        return Err(invalid("selected workflow application grant mismatch"));
+    }
+    let owner = canonical_session_owner(state, session_id, 1)?;
+    let current = state
+        .sessions
+        .external_harness_state(&owner)
+        .await
+        .map_err(|_| invalid("selected workflow target unavailable"))?;
+    if current.instance != receipt.start.instance {
+        return Err(invalid("selected workflow instance changed"));
+    }
+    let current_target = current
+        .target
+        .ok_or_else(|| invalid("selected workflow target missing"))?;
+    match &call.harness.kind {
+        HarnessRequestKind::Submit { target, submission } => {
+            if target != &current_target {
+                return Err(invalid("selected workflow target changed"));
+            }
+            target
+                .validate_owner(&session_id.to_string(), 1)
+                .map_err(|_| invalid("selected workflow target changed"))?;
+            if submission != &receipt.submission
+                || call.harness.request_id != submission.submission_id
+            {
+                return Err(invalid("selected workflow assignment changed"));
+            }
+        }
+        HarnessRequestKind::Observe(query) if query.target == current_target => {}
+        HarnessRequestKind::Reconcile(query)
+            if query.session_id == receipt.session_id.to_string()
+                && query.generation == 1
+                && query.open_id.as_ref() == Some(&receipt.start.open.open_id)
+                && query.submission_id.as_ref() == Some(&receipt.submission.submission_id)
+                && query.attempt_id.as_ref() == Some(&receipt.submission.attempt_id) => {}
+        HarnessRequestKind::Interrupt(control)
+            if control.target == current_target
+                && control.mutation_id == format!("{}:interrupt", receipt.dispatch_identity)
+                && call.harness.request_id == control.mutation_id => {}
+        _ => return Err(invalid("selected workflow operation unsupported")),
+    }
+    Ok(())
+}
+
+fn validate_legacy_call_identity(
+    receipt: &HarnessWorkflowReceipt,
+    run_id: &str,
+    dispatch_identity: &str,
+    session_id: SessionId,
+    plugin_id: &str,
+    call: &ManagedSessionCall,
+) -> Result<(), WorkflowStoreError> {
+    if receipt.run_id != run_id
+        || receipt.dispatch_identity != dispatch_identity
+        || receipt.session_id != session_id
+        || plugin_id != receipt.plugin_id
+        || call.harness.instance != receipt.call.harness.instance
+        || call.parent_session_id.is_some()
+        || call.assistance_destination_session_id != receipt.call.assistance_destination_session_id
+    {
+        return Err(invalid("managed workflow application grant mismatch"));
+    }
+    Ok(())
+}
+
+async fn validate_legacy_execution_link(
+    state: &ServerState,
+    receipt: &HarnessWorkflowReceipt,
+    stored: &bcode_workflow_store::DispatchReceipt,
+    run_id: &str,
+    dispatch_identity: &str,
+    session_id: SessionId,
+) -> Result<(), WorkflowStoreError> {
+    let link_identity = adopted_link_identity(receipt, dispatch_identity);
+    let (link_node, link_activation, link_attempt) =
+        link_identity.unwrap_or((&stored.node_id, &stored.activation_id, stored.attempt));
+    let link = crate::workflow_representation::owner::execution_session_link(
+        state,
+        run_id,
+        link_node,
+        link_activation,
+        link_attempt,
+    )
+    .await?
+    .ok_or_else(|| invalid("managed workflow execution link missing"))?;
+    if link.session_id != session_id.to_string() {
+        return Err(invalid("managed workflow execution link mismatch"));
+    }
+    Ok(())
+}
+
 pub(crate) async fn authorize_call(
     state: &ServerState,
     run_id: &str,
@@ -704,32 +1424,38 @@ pub(crate) async fn authorize_call(
         crate::workflow_representation::owner::execution_receipt(state, run_id, dispatch_identity)
             .await?
             .ok_or_else(|| invalid("managed workflow admission receipt required"))?;
+    if stored.receipt.get("owner").and_then(Value::as_str) == Some(SELECTED_PROMPT_OWNER) {
+        let receipt = SelectedPromptReceipt::decode(&stored.receipt)?;
+        let _start_guard = authorize_selected_start(
+            state,
+            run_id,
+            dispatch_identity,
+            session_id,
+            plugin_id,
+            &receipt.start,
+        )
+        .await?;
+        validate_selected_call(state, session_id, &receipt, call).await?;
+        return Ok(guard);
+    }
     let receipt = HarnessWorkflowReceipt::decode(&stored.receipt)?;
-    if receipt.run_id != run_id
-        || receipt.dispatch_identity != dispatch_identity
-        || receipt.session_id != session_id
-        || plugin_id != receipt.plugin_id
-        || call.harness.instance != receipt.call.harness.instance
-        || call.parent_session_id.is_some()
-        || call.assistance_destination_session_id != receipt.call.assistance_destination_session_id
-    {
-        return Err(invalid("managed workflow application grant mismatch"));
-    }
-    let link_identity = adopted_link_identity(&receipt, dispatch_identity);
-    let (link_node, link_activation, link_attempt) =
-        link_identity.unwrap_or((&stored.node_id, &stored.activation_id, stored.attempt));
-    let link = crate::workflow_representation::owner::execution_session_link(
-        state,
+    validate_legacy_call_identity(
+        &receipt,
         run_id,
-        link_node,
-        link_activation,
-        link_attempt,
+        dispatch_identity,
+        session_id,
+        plugin_id,
+        call,
+    )?;
+    validate_legacy_execution_link(
+        state,
+        &receipt,
+        &stored,
+        run_id,
+        dispatch_identity,
+        session_id,
     )
-    .await?
-    .ok_or_else(|| invalid("managed workflow execution link missing"))?;
-    if link.session_id != session_id.to_string() {
-        return Err(invalid("managed workflow execution link mismatch"));
-    }
+    .await?;
     let HarnessRequestKind::Submit { submission, .. } = &receipt.call.harness.kind else {
         return Err(invalid("managed workflow submission missing"));
     };
@@ -1027,6 +1753,24 @@ fn outcome(
     receipt: &HarnessWorkflowReceipt,
     native_id: &str,
 ) -> Result<AttemptObservation, WorkflowStoreError> {
+    match settled_assignment_result(
+        observations,
+        receipt.session_id,
+        receipt.generation,
+        native_id,
+    )? {
+        Ok(result) => complete_assignment_output(receipt, Some(native_id), &result),
+        Err(observation) => Ok(observation),
+    }
+}
+
+// Shared evidence interpretation for plugin blocks and ordinary selected prompt assignments.
+fn settled_assignment_result(
+    observations: &[bcode_harness_models::HarnessObservation],
+    session_id: SessionId,
+    generation: u64,
+    native_id: &str,
+) -> Result<Result<String, AttemptObservation>, WorkflowStoreError> {
     let mut settled = false;
     let mut terminal = None;
     let mut result = None;
@@ -1034,10 +1778,9 @@ fn outcome(
         observation
             .validate()
             .map_err(|_| invalid("invalid managed observation"))?;
-        if observation.session_id != receipt.session_id.to_string()
-            || observation.generation != receipt.generation
+        if observation.session_id != session_id.to_string() || observation.generation != generation
         {
-            return Ok(deferred("foreign or stale managed observation"));
+            return Ok(Err(deferred("foreign or stale managed observation")));
         }
         // Partial progress is not incomplete terminal evidence. Explicit loss remains a
         // fence even when a producer also supplies a complete result and settlement.
@@ -1045,7 +1788,7 @@ fn outcome(
             || matches!(&observation.kind, HarnessObservationKind::Status { status }
                 if status.completeness == HarnessCompleteness::Gap)
         {
-            return Ok(deferred("managed evidence gap"));
+            return Ok(Err(deferred("managed evidence gap")));
         }
     }
     for observation in observations {
@@ -1061,7 +1804,7 @@ fn outcome(
             {
                 continue;
             }
-            return Ok(deferred("managed evidence incomplete"));
+            return Ok(Err(deferred("managed evidence incomplete")));
         }
         match &observation.kind {
             HarnessObservationKind::NativeTurnTerminal {
@@ -1069,7 +1812,9 @@ fn outcome(
                 disposition,
             } if native_turn_id == native_id => {
                 if terminal.is_some_and(|previous| previous != *disposition) {
-                    return Ok(deferred("conflicting managed native terminal evidence"));
+                    return Ok(Err(deferred(
+                        "conflicting managed native terminal evidence",
+                    )));
                 }
                 terminal = Some(*disposition);
             }
@@ -1090,30 +1835,30 @@ fn outcome(
         }
     }
     if !settled {
-        return Ok(deferred(
+        return Ok(Err(deferred(
             "awaiting authoritative assignment-correlated native settlement",
-        ));
+        )));
     }
     let Some(terminal) = terminal else {
-        return Ok(deferred(
+        return Ok(Err(deferred(
             "awaiting authoritative native terminal disposition",
-        ));
+        )));
     };
     match terminal {
-        HarnessTerminalDisposition::Interrupted => return Ok(AttemptObservation::Cancelled),
+        HarnessTerminalDisposition::Interrupted => return Ok(Err(AttemptObservation::Cancelled)),
         HarnessTerminalDisposition::Failed => {
-            return Ok(AttemptObservation::Failed {
+            return Ok(Err(AttemptObservation::Failed {
                 message: "managed native turn failed".into(),
-            });
+            }));
         }
         HarnessTerminalDisposition::Completed => {}
     }
     let Some(result) = result else {
-        return Ok(deferred(
+        return Ok(Err(deferred(
             "settled native turn has no bounded assignment result",
-        ));
+        )));
     };
-    complete_assignment_output(receipt, Some(native_id), &result)
+    Ok(Ok(result))
 }
 
 // Terminal evidence is checked by outcome before entering ordinary workflow dataflow.
@@ -1371,6 +2116,125 @@ mod tests {
                 disposition,
             },
         )
+    }
+
+    fn selected_receipt() -> SelectedPromptReceipt {
+        use bcode_model::execution::*;
+        let legacy = receipt();
+        let session_id = legacy.session_id;
+        let instance = legacy.call.harness.instance;
+        let output = bcode_workflow::ValueSchema {
+            type_name: "selected-result/v1".into(),
+            schema: json!({"type":"object","additionalProperties":false,
+                "required":["ok"],"properties":{"ok":{"type":"boolean"}}}),
+        };
+        let route = ExecutionRoute::ManagedHarness {
+            instance_id: instance.instance_id.clone(),
+            plugin_id: instance.plugin_id.clone(),
+        };
+        let selection = ExecutionModelSelection {
+            model_id: "observed-model".into(),
+            route: Some(route.clone()),
+            account_reference: Some(instance.auth.profile.clone()),
+        };
+        let configuration = bcode_workflow::WorkflowPromptConfiguration::structured(
+            "build",
+            output.clone(),
+            "task",
+        )
+        .with_execution_model_selection(selection.clone());
+        let entry = ExecutionModel {
+            model: bcode_model::ModelInfo {
+                model_id: selection.model_id.clone(),
+                display_name: "Observed".into(),
+                is_default: false,
+                context_window: None,
+                max_output_tokens: None,
+                max_image_input_base64_bytes: None,
+                capabilities: std::collections::BTreeSet::default(),
+                feature_support: bcode_model::ModelFeatureSupport::default(),
+                reasoning: None,
+                cache: bcode_model::ModelCacheInfo::default(),
+                metadata_source: None,
+                pricing: None,
+                api_surface: None,
+                visibility: bcode_model::ModelVisibility::Visible,
+            },
+            route,
+            account_reference: selection.account_reference,
+            billing_route: ExecutionBillingRoute::Unknown,
+            native_model_id: "observed-model".into(),
+            confirmed_model_id: None,
+            provenance: ExecutionModelProvenance::HarnessDiscovery,
+            readiness: ExecutionModelReadiness::Ready,
+        };
+        let resolved =
+            crate::workflow_operations::execution_selection::resolve(&configuration, &[entry])
+                .unwrap()
+                .unwrap();
+        let dispatch_identity =
+            bcode_workflow_store::dispatch_identity("run", "selected", "activation", 1);
+        let start = crate::workflow_operations::execution_selection::selected_start_request(
+            &resolved,
+            instance,
+            bcode_harness_models::HarnessOpenRequest {
+                open_id: format!("{dispatch_identity}:open"),
+                session_id: session_id.to_string(),
+                generation: 1,
+                working_directory: "/workspace".into(),
+                resume: None,
+                parent_assistance: None,
+            },
+            legacy.parent_session_id,
+        )
+        .unwrap();
+        SelectedPromptReceipt {
+            owner: SELECTED_PROMPT_OWNER.into(),
+            run_id: "run".into(),
+            node_id: "selected".into(),
+            activation_id: "activation".into(),
+            attempt: 1,
+            session_id,
+            submission: bcode_harness_models::HarnessSubmission {
+                submission_id: dispatch_identity.clone(),
+                attempt_id: dispatch_identity.clone(),
+                session_id: session_id.to_string(),
+                generation: 1,
+                text: "task".into(),
+                placement: bcode_harness_models::HarnessPlacement::NextTurn,
+            },
+            dispatch_identity,
+            start,
+            resolved,
+            configuration,
+            input: json!({"retained":true}),
+            output,
+        }
+    }
+
+    #[test]
+    fn selected_prompt_receipt_and_result_boundaries_fail_closed() {
+        let receipt = selected_receipt();
+        let wire = serde_json::to_value(&receipt).unwrap();
+        SelectedPromptReceipt::decode(&wire).unwrap();
+        for field in ["dispatch_identity", "activation_id", "run_id"] {
+            let mut changed = wire.clone();
+            changed[field] = json!("foreign");
+            assert!(SelectedPromptReceipt::decode(&changed).is_err());
+        }
+        let mut changed = wire;
+        changed["start"]["instance"]["auth"]["profile"] = json!("foreign-account");
+        assert!(SelectedPromptReceipt::decode(&changed).is_err());
+        assert_eq!(
+            selected_prompt_output(&receipt, r#"{"ok":true}"#).unwrap(),
+            json!({"ok":true})
+        );
+        assert!(selected_prompt_output(&receipt, r#"{"ok":"not-a-boolean"}"#).is_err());
+        assert!(selected_prompt_output(&receipt, "not-json").is_err());
+        assert!(matches!(
+            settled_assignment_result(&[], receipt.session_id, 1, "observed-turn").unwrap(),
+            Err(AttemptObservation::Deferred { .. })
+        ));
     }
 
     #[test]

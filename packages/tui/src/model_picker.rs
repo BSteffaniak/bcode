@@ -54,6 +54,7 @@ pub enum ModelPickerMode {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ModelPickerApp {
     models: Vec<ModelInfo>,
+    execution_models: Option<Vec<bcode_model::execution::ExecutionModel>>,
     availability: BTreeMap<String, ModelAvailability>,
     rendered_item_area: Option<bmux_tui::geometry::Rect>,
     check_model_id: Option<String>,
@@ -74,6 +75,7 @@ impl ModelPickerApp {
         let list = FilteredListState::new(models.len());
         let mut app = Self {
             models,
+            execution_models: None,
             availability: BTreeMap::new(),
             rendered_item_area: None,
             check_model_id: None,
@@ -90,6 +92,75 @@ impl ModelPickerApp {
         app
     }
 
+    /// Present exact execution members without collapsing duplicate model identities.
+    #[must_use]
+    pub fn from_execution_models(
+        models: Vec<bcode_model::execution::ExecutionModel>,
+        status: impl Into<String>,
+    ) -> Self {
+        let mut app = Self::new_with_status(
+            models.iter().map(|entry| entry.model.clone()).collect(),
+            status,
+        );
+        app.execution_models = Some(models);
+        app
+    }
+
+    /// Exact highlighted intent; the application must resolve and admit it again.
+    pub fn selected_execution(&self) -> Option<bcode_model::execution::ExecutionModelSelection> {
+        let index = self.list.selected_source_index()?;
+        let entry = self.execution_models.as_ref()?.get(index)?;
+        Some(bcode_model::execution::ExecutionModelSelection {
+            model_id: entry.model.model_id.clone(),
+            route: Some(entry.route.clone()),
+            account_reference: entry.account_reference.clone(),
+        })
+    }
+
+    /// Highlight a remembered exact choice without treating it as availability evidence.
+    pub fn highlight_execution(
+        &mut self,
+        selection: &bcode_model::execution::ExecutionModelSelection,
+    ) {
+        if let Some(entries) = &self.execution_models
+            && let Some(row) = self.list.indices().iter().position(|index| {
+                let entry = &entries[*index];
+                entry.model.model_id == selection.model_id
+                    && selection.route.as_ref() == Some(&entry.route)
+                    && selection.account_reference == entry.account_reference
+            })
+        {
+            self.list.select_visible(row);
+        }
+    }
+
+    /// Test only whether an exact preference is displayed, without resolving or authorizing it.
+    #[must_use]
+    pub fn execution_preference_present(
+        &self,
+        selection: &bcode_model::execution::ExecutionModelSelection,
+    ) -> bool {
+        self.execution_models.as_ref().is_some_and(|entries| {
+            entries.iter().any(|entry| {
+                entry.model.model_id == selection.model_id
+                    && selection.route.as_ref() == Some(&entry.route)
+                    && selection.account_reference == entry.account_reference
+            })
+        })
+    }
+
+    /// Whether this picker carries exact execution routes rather than a provider-only list.
+    #[must_use]
+    pub const fn is_execution_picker(&self) -> bool {
+        self.execution_models.is_some()
+    }
+
+    /// Whether a nonempty model row area was retained by this frame's renderer.
+    #[must_use]
+    pub const fn has_visible_rows(&self) -> bool {
+        self.rendered_item_area.is_some()
+    }
+
     /// Create a picker retaining centralized, scope-specific availability decisions.
     #[must_use]
     pub fn from_model_list(models: ModelList, status: impl Into<String>) -> Self {
@@ -104,6 +175,27 @@ impl ModelPickerApp {
         let Some(index) = self.list.selected_source_index() else {
             return "Scope: active provider configuration".to_owned();
         };
+        if let Some(entry) = self
+            .execution_models
+            .as_ref()
+            .and_then(|entries| entries.get(index))
+        {
+            let route = match &entry.route {
+                bcode_model::execution::ExecutionRoute::ModelProvider { provider_plugin_id } => {
+                    format!("Provider {provider_plugin_id}")
+                }
+                bcode_model::execution::ExecutionRoute::ManagedHarness {
+                    instance_id,
+                    plugin_id,
+                } => {
+                    format!("Managed {instance_id} ({plugin_id})")
+                }
+            };
+            return format!(
+                "{route} · Account: {}",
+                entry.account_reference.as_deref().unwrap_or("unspecified")
+            );
+        }
         self.availability
             .get(&self.models[index].model_id)
             .map_or_else(
@@ -130,6 +222,18 @@ impl ModelPickerApp {
         let Some(index) = self.list.selected_source_index() else {
             return "No model selected".to_owned();
         };
+        if let Some(entry) = self
+            .execution_models
+            .as_ref()
+            .and_then(|entries| entries.get(index))
+        {
+            return format!(
+                "{} · {:?} · billing {:?}; selection is not native acceptance",
+                execution_readiness_label(entry.readiness),
+                entry.provenance,
+                entry.billing_route
+            );
+        }
         let model_id = &self.models[index].model_id;
         self.availability.get(model_id).map_or_else(
             || "Unverified · no current evidence".to_owned(),
@@ -454,6 +558,29 @@ impl ModelPickerApp {
             .map(|index| {
                 let model = &self.models[*index];
                 let mut row = ModelPickerRow::from_model(model);
+                if let Some(entry) = self
+                    .execution_models
+                    .as_ref()
+                    .and_then(|entries| entries.get(*index))
+                {
+                    let route = match &entry.route {
+                        bcode_model::execution::ExecutionRoute::ModelProvider {
+                            provider_plugin_id,
+                        } => provider_plugin_id.as_str(),
+                        bcode_model::execution::ExecutionRoute::ManagedHarness {
+                            instance_id,
+                            ..
+                        } => instance_id.as_str(),
+                    };
+                    row.model_id = format!(
+                        "{} · {} / {}",
+                        row.model_id,
+                        route,
+                        entry.account_reference.as_deref().unwrap_or("unspecified")
+                    );
+                    row.state = execution_readiness_label(entry.readiness).into();
+                    return row;
+                }
                 let status = self
                     .availability
                     .get(&model.model_id)
@@ -475,6 +602,26 @@ impl ModelPickerApp {
         let rows = self.visible_rows();
         let widths = ModelPickerColumnWidths::from_rows(&rows, usable_list_width(width));
         rows.iter().map(|row| format_row(row, &widths)).collect()
+    }
+}
+
+const fn execution_readiness_label(
+    readiness: bcode_model::execution::ExecutionModelReadiness,
+) -> &'static str {
+    use bcode_model::execution::{ExecutionModelAccess, ExecutionModelReadiness};
+    match readiness {
+        ExecutionModelReadiness::Ready => "Model access confirmed",
+        ExecutionModelReadiness::RouteReady {
+            model_access: ExecutionModelAccess::Unknown,
+        } => "Route ready · model access unverified",
+        ExecutionModelReadiness::RouteReady {
+            model_access: ExecutionModelAccess::Confirmed,
+        } => "Route ready · model access confirmed",
+        ExecutionModelReadiness::RouteReady {
+            model_access: ExecutionModelAccess::Unavailable,
+        } => "Model access unavailable",
+        ExecutionModelReadiness::Unavailable => "Unavailable",
+        ExecutionModelReadiness::Unknown => "Unknown readiness",
     }
 }
 
@@ -1006,6 +1153,74 @@ mod tests {
             api_surface: None,
             visibility: ModelVisibility::Visible,
         }
+    }
+
+    #[test]
+    fn execution_picker_retains_duplicate_model_routes_and_unknown_readiness() {
+        use bcode_model::execution::{
+            ExecutionBillingRoute, ExecutionModel, ExecutionModelProvenance,
+            ExecutionModelReadiness, ExecutionRoute,
+        };
+        let member = |instance: &str| ExecutionModel {
+            model: model("same-model", None, None, None),
+            route: ExecutionRoute::ManagedHarness {
+                instance_id: instance.into(),
+                plugin_id: "example.native".into(),
+            },
+            native_model_id: "native-selector".into(),
+            confirmed_model_id: None,
+            account_reference: Some("native-account".into()),
+            billing_route: ExecutionBillingRoute::Unknown,
+            provenance: ExecutionModelProvenance::HarnessDiscovery,
+            readiness: ExecutionModelReadiness::Unknown,
+        };
+        let entries = vec![member("first"), member("second")];
+        let remembered = bcode_model::execution::ExecutionModelSelection {
+            model_id: "same-model".into(),
+            route: Some(entries[1].route.clone()),
+            account_reference: entries[1].account_reference.clone(),
+        };
+        let mut picker = ModelPickerApp::from_execution_models(entries, "Select");
+        picker.highlight_execution(&remembered);
+        let selection = picker.selected_execution().unwrap();
+        assert_eq!(selection.route, remembered.route);
+        assert_eq!(selection.account_reference, remembered.account_reference);
+        assert_eq!(picker.visible_rows().len(), 2);
+        assert!(picker.selected_availability_summary().contains("Unknown"));
+        assert!(picker.selected_scope_summary().contains("second"));
+        assert!(
+            picker
+                .visible_rows()
+                .iter()
+                .all(|row| row.state == "Unknown readiness")
+        );
+        picker.select_previous();
+        assert_ne!(picker.selected_execution().unwrap().route, remembered.route);
+    }
+
+    #[test]
+    fn route_ready_is_not_displayed_as_confirmed_model_access() {
+        use bcode_model::execution::{ExecutionModelAccess, ExecutionModelReadiness};
+        let label = execution_readiness_label(ExecutionModelReadiness::RouteReady {
+            model_access: ExecutionModelAccess::Unknown,
+        });
+        assert_eq!(label, "Route ready · model access unverified");
+        assert_ne!(
+            label,
+            execution_readiness_label(ExecutionModelReadiness::Ready)
+        );
+    }
+
+    #[test]
+    fn missing_execution_preference_does_not_create_a_catalog_member() {
+        let mut picker = ModelPickerApp::from_execution_models(Vec::new(), "Unavailable");
+        picker.highlight_execution(&bcode_model::execution::ExecutionModelSelection {
+            model_id: "not-discovered".into(),
+            route: None,
+            account_reference: None,
+        });
+        assert!(picker.selected_execution().is_none());
+        assert_eq!(picker.visible_rows(), [] as [ModelPickerRow; 0]);
     }
 
     #[test]

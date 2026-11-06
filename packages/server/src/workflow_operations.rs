@@ -1,3 +1,4 @@
+pub mod execution_selection;
 #[cfg(test)]
 #[path = "workflow_operations/managed_harness_integration.rs"]
 mod managed_harness_integration;
@@ -1940,6 +1941,7 @@ pub async fn stage_run_graph_edit(
     facts.validate().map_err(|error| {
         super::ServerError::WorkflowApplicationOperationUnauthorized(error.to_string())
     })?;
+    execution_selection::require_edit_dispatch_support(&facts.request)?;
     let policy = state
         .workflow_run_graph_edit_policy
         .as_ref()
@@ -2039,6 +2041,7 @@ async fn local_run_graph_publication(
     facts.validate().map_err(|error| {
         super::ServerError::WorkflowApplicationOperationUnauthorized(error.to_string())
     })?;
+    execution_selection::require_edit_dispatch_support(&facts.request)?;
     let policy = state
         .workflow_run_graph_publication_policy
         .as_ref()
@@ -7293,6 +7296,13 @@ pub fn validate_workflow_definition_for_production(
         return Err(super::ServerError::WorkflowDefinitionUnsupported(summary));
     }
     for node in definition.nodes.values() {
+        if node.kind == bcode_workflow::NodeKind::Agent {
+            let configuration: bcode_workflow::WorkflowPromptConfiguration =
+                serde_json::from_value(node.configuration.clone()).map_err(|error| {
+                    super::ServerError::WorkflowDefinitionUnsupported(error.to_string())
+                })?;
+            execution_selection::require_dispatch_support(&configuration)?;
+        }
         if node.kind != bcode_workflow::NodeKind::PluginBlock {
             continue;
         }

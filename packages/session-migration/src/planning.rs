@@ -167,6 +167,12 @@ pub enum MigrationPlanError {
         /// Current writer epoch supported by this build.
         current_writer_epoch: u32,
     },
+    /// The source belongs to an unpublished, reserved writer contract.
+    #[error("session writer epoch {writer_epoch} is reserved and unsupported")]
+    ReservedWriter {
+        /// Reserved writer observed in storage.
+        writer_epoch: u32,
+    },
     /// The migration graph has no edge from a required writer epoch.
     #[error(
         "no session migration step from writer epoch {writer_epoch} to target epoch {target_writer_epoch}"
@@ -216,6 +222,9 @@ pub fn plan_writer_epoch_migration_with_registry(
     target_writer_epoch: u32,
     steps_registry: &[MigrationStepDescriptor],
 ) -> Result<MigrationPlan, MigrationPlanError> {
+    if source_writer_epoch == 24 || target_writer_epoch == 24 {
+        return Err(MigrationPlanError::ReservedWriter { writer_epoch: 24 });
+    }
     if source_writer_epoch > target_writer_epoch {
         return Err(MigrationPlanError::FutureWriter {
             source_writer_epoch,
@@ -239,6 +248,12 @@ pub fn plan_writer_epoch_migration_with_registry(
                 step_id: step.id,
                 source_writer_epoch: step.source_writer_epoch,
                 target_writer_epoch: step.target_writer_epoch,
+            });
+        }
+        if step.target_writer_epoch > target_writer_epoch || step.target_writer_epoch == 24 {
+            return Err(MigrationPlanError::MissingStep {
+                writer_epoch,
+                target_writer_epoch,
             });
         }
         writer_epoch = step.target_writer_epoch;
@@ -273,32 +288,39 @@ mod tests {
     use super::*;
 
     #[test]
-    fn recovery_candidate_edge_is_forward_only_without_publishing_it() {
-        // Local candidate registry only: production versions and registration stay frozen.
+    fn selected_model_edge_skips_reserved_writer_and_preserves_all_sources() {
         let candidate = MigrationStepDescriptor {
-            id: "session-writer-epoch-23-to-24",
+            id: "session-writer-epoch-23-to-25",
             source_writer_epoch: 23,
-            target_writer_epoch: 24,
+            target_writer_epoch: 25,
         };
-        let mut registry = MIGRATION_STEPS.to_vec();
-        registry.push(candidate);
-        let plan = plan_writer_epoch_migration_with_registry(23, 24, &registry).unwrap();
+        for source in RELEASED_HISTORICAL_WRITER_EPOCHS {
+            let plan = plan_writer_epoch_migration_with_registry(*source, 25, &MIGRATION_STEPS)
+                .expect("supported source reaches selected-model writer");
+            assert_eq!(plan.steps.last(), Some(&candidate));
+            assert!(
+                plan.steps.iter().all(|step| {
+                    step.source_writer_epoch != 24 && step.target_writer_epoch != 24
+                })
+            );
+            assert!(
+                plan.steps
+                    .windows(2)
+                    .all(|pair| { pair[0].target_writer_epoch == pair[1].source_writer_epoch })
+            );
+        }
+        let plan = plan_writer_epoch_migration_with_registry(23, 25, &MIGRATION_STEPS).unwrap();
         assert_eq!(plan.steps, [candidate]);
-        assert_eq!(plan.source_writer_epoch, 23);
-        assert_eq!(plan.target_writer_epoch, 24);
-        let from_22 = plan_writer_epoch_migration_with_registry(22, 24, &registry).unwrap();
-        assert_eq!(from_22.steps.len(), 2);
-        assert_eq!(from_22.steps[0].id, "session-writer-epoch-22-to-23");
-        assert_eq!(from_22.steps[1], candidate);
         assert!(matches!(
-            plan_writer_epoch_migration_with_registry(23, 24, &MIGRATION_STEPS),
-            Err(MigrationPlanError::MissingStep {
-                writer_epoch: 23,
-                target_writer_epoch: 24
-            })
+            plan_writer_epoch_migration_with_registry(24, 25, &MIGRATION_STEPS),
+            Err(MigrationPlanError::ReservedWriter { writer_epoch: 24 })
         ));
         assert!(matches!(
-            plan_writer_epoch_migration_with_registry(24, 23, &registry),
+            plan_writer_epoch_migration_with_registry(23, 24, &MIGRATION_STEPS),
+            Err(MigrationPlanError::ReservedWriter { writer_epoch: 24 })
+        ));
+        assert!(matches!(
+            plan_writer_epoch_migration_with_registry(25, 23, &MIGRATION_STEPS),
             Err(MigrationPlanError::FutureWriter { .. })
         ));
     }
@@ -428,9 +450,16 @@ mod tests {
     #[test]
     fn writer_epoch_4_requires_complete_migration_to_current_epoch() {
         let plan = plan_writer_epoch_migration(4).expect("epoch 4 corrective plan");
+        let expected_edges = (4..23)
+            .map(|source| (source, source + 1))
+            .chain(std::iter::once((23, 25)))
+            .collect::<Vec<_>>();
         assert_eq!(
-            plan.steps.len(),
-            usize::try_from(CURRENT_WRITER_EPOCH - 4).unwrap()
+            plan.steps
+                .iter()
+                .map(|step| (step.source_writer_epoch, step.target_writer_epoch))
+                .collect::<Vec<_>>(),
+            expected_edges
         );
         assert_eq!(plan.target_writer_epoch, CURRENT_WRITER_EPOCH);
         assert_eq!(plan.steps[0].id, "session-writer-epoch-4-to-5");
@@ -479,6 +508,11 @@ mod tests {
                     id: "session-writer-epoch-22-to-23",
                     source_writer_epoch: 22,
                     target_writer_epoch: 23,
+                },
+                MigrationStepDescriptor {
+                    id: "session-writer-epoch-23-to-25",
+                    source_writer_epoch: 23,
+                    target_writer_epoch: 25,
                 }
             ]
         );
@@ -528,6 +562,11 @@ mod tests {
                     id: "session-writer-epoch-22-to-23",
                     source_writer_epoch: 22,
                     target_writer_epoch: 23,
+                },
+                MigrationStepDescriptor {
+                    id: "session-writer-epoch-23-to-25",
+                    source_writer_epoch: 23,
+                    target_writer_epoch: 25,
                 },
             ]
         );

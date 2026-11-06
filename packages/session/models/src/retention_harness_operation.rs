@@ -85,31 +85,50 @@ fn receipt(i: &mut Inspector, v: &HarnessReceipt) -> Result {
     i.optional_text(v.native_request_id.as_ref(), 6)?;
     i.nodes(2, 5)
 }
+fn open(i: &mut Inspector, v: &bcode_harness_models::HarnessOpenRequest) -> Result {
+    for text in [&v.open_id, &v.session_id, &v.working_directory] {
+        i.text(text, 6)?;
+    }
+    i.nodes(2, 5)?;
+    if let Some(v) = &v.resume {
+        binding(i, v)?;
+    }
+    if let Some(v) = &v.parent_assistance {
+        i.nodes(2, 6)?;
+        for text in [
+            &v.admission_id,
+            &v.child_session_id,
+            &v.parent_session_id,
+            &v.scope,
+        ] {
+            i.text(text, 7)?;
+        }
+    }
+    Ok(())
+}
+pub(super) fn selected_open(
+    i: &mut Inspector,
+    selected: &crate::external_harness::ExternalHarnessSelectedOpen,
+) -> Result {
+    i.nodes(3, 5)?;
+    i.text(&selected.request.request_id, 6)?;
+    instance(i, &selected.request.instance)?;
+    if let bcode_harness_models::HarnessModelsRequestKind::OpenSelected { open: v, selection } =
+        &selected.request.kind
+    {
+        open(i, v)?;
+        i.text(&selection.model_id, 7)?;
+    }
+    Ok(())
+}
+
 fn request(i: &mut Inspector, v: &ExternalHarnessRequest) -> Result {
     i.nodes(2, 4)?;
     i.text(&v.request_id, 5)?;
     instance(i, &v.instance)?;
     match &v.kind {
-        ExternalHarnessRequestKind::Open(v) => {
-            for text in [&v.open_id, &v.session_id, &v.working_directory] {
-                i.text(text, 6)?;
-            }
-            i.nodes(2, 5)?;
-            if let Some(v) = &v.resume {
-                binding(i, v)?;
-            }
-            if let Some(v) = &v.parent_assistance {
-                i.nodes(2, 6)?;
-                for text in [
-                    &v.admission_id,
-                    &v.child_session_id,
-                    &v.parent_session_id,
-                    &v.scope,
-                ] {
-                    i.text(text, 7)?;
-                }
-            }
-        }
+        ExternalHarnessRequestKind::Open(v) => open(i, v)?,
+        ExternalHarnessRequestKind::OpenSelected(selected) => selected_open(i, selected)?,
         ExternalHarnessRequestKind::Submit {
             target: v,
             submission,
@@ -218,12 +237,27 @@ fn configured(
     Ok(())
 }
 
+fn selected_result(
+    i: &mut Inspector,
+    v: &HarnessSessionTarget,
+    evidence: &bcode_harness_models::HarnessModelEvidence,
+) -> Result {
+    i.nodes(1, 5)?;
+    target(i, v)?;
+    i.text(&evidence.requested_model_id, 6)?;
+    i.optional_text(evidence.effective_model_id.as_ref(), 6)
+}
+
 pub(super) fn inspect(i: &mut Inspector, op: &ExternalHarnessOperation) -> Result {
     i.nodes(3, 3)?;
     i.text(&op.owner.artifact_id, 4)?;
     i.text(&op.owner.daemon_id, 4)?;
     inventory_commitments(i, op)?;
-    match &op.record {
+    record(i, &op.record)
+}
+
+fn record(i: &mut Inspector, record: &ExternalHarnessOperationRecord) -> Result {
+    match record {
         ExternalHarnessOperationRecord::TransportReleased { release } => {
             transport_release(i, release)?;
         }
@@ -244,6 +278,10 @@ pub(super) fn inspect(i: &mut Inspector, op: &ExternalHarnessOperation) -> Resul
             i.nodes(2, 4)?;
             i.text(&response.request_id, 5)?;
             match &response.kind {
+                ExternalHarnessResponseKind::Selected {
+                    target: v,
+                    evidence,
+                } => selected_result(i, v, evidence)?,
                 ExternalHarnessResponseKind::Prepared(v) => {
                     i.nodes(1, 5)?;
                     for text in [&v.open_id, &v.session_id, &v.instance_id, &v.native_version] {
@@ -319,4 +357,121 @@ pub(super) fn inspect(i: &mut Inspector, op: &ExternalHarnessOperation) -> Resul
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod selected_tests {
+    use super::*;
+
+    fn inspector() -> Inspector {
+        Inspector {
+            usage: crate::ObservationRetentionUsage::default(),
+            limits: crate::ObservationRetentionLimits {
+                scalar_capacity_bytes: usize::MAX,
+                collection_entries: usize::MAX,
+                value_nodes: usize::MAX,
+                depth: usize::MAX,
+                copies: usize::MAX,
+            },
+        }
+    }
+
+    #[test]
+    fn selected_evidence_accounts_for_effective_model_spare_capacity() {
+        let target = HarnessSessionTarget::Prepared(bcode_harness_models::HarnessPreparedSession {
+            open_id: "open".into(),
+            session_id: "session".into(),
+            instance_id: "instance".into(),
+            generation: 1,
+            native_version: "version".into(),
+            requested_native_session_id: None,
+        });
+        let mut evidence = bcode_harness_models::HarnessModelEvidence {
+            requested_model_id: "requested-model".into(),
+            effective_model_id: Some("effective-model".into()),
+        };
+        let mut before = inspector();
+        selected_result(&mut before, &target, &evidence).unwrap();
+        let effective = evidence.effective_model_id.as_mut().unwrap();
+        let old_capacity = effective.capacity();
+        effective.reserve(4096);
+        let added_capacity = effective.capacity() - old_capacity;
+        let mut after = inspector();
+        selected_result(&mut after, &target, &evidence).unwrap();
+        assert_eq!(
+            after.usage.scalar_capacity_bytes - before.usage.scalar_capacity_bytes,
+            added_capacity
+        );
+        assert_eq!(after.usage.value_nodes, before.usage.value_nodes);
+        assert_eq!(after.usage.depth, before.usage.depth);
+    }
+
+    #[test]
+    fn selected_request_accounts_for_spare_model_and_nested_envelope_capacity() {
+        let instance = HarnessInstance {
+            instance_id: "instance".into(),
+            plugin_id: "plugin".into(),
+            executable: "/native".into(),
+            config_namespace: "namespace".into(),
+            auth: bcode_harness_models::HarnessAuthBinding {
+                provider_id: "provider".into(),
+                profile: "profile".into(),
+                credential_namespace: "credentials".into(),
+                custody: bcode_harness_models::HarnessAuthCustody::NativeManaged,
+            },
+        };
+        let mut retained = ExternalHarnessRequest::from_models_request(
+            &bcode_harness_models::HarnessModelsRequest {
+                schema_version: 1,
+                request_id: "open".into(),
+                instance,
+                kind: bcode_harness_models::HarnessModelsRequestKind::OpenSelected {
+                    open: Box::new(bcode_harness_models::HarnessOpenRequest {
+                        open_id: "open".into(),
+                        session_id: "session".into(),
+                        generation: 1,
+                        working_directory: "/workspace".into(),
+                        resume: None,
+                        parent_assistance: None,
+                    }),
+                    selection: bcode_harness_models::HarnessModelSelection {
+                        model_id: "model".into(),
+                    },
+                },
+            },
+        )
+        .unwrap();
+        let mut before = inspector();
+        request(&mut before, &retained).unwrap();
+        let ExternalHarnessRequestKind::OpenSelected(selected) = &mut retained.kind else {
+            unreachable!()
+        };
+        let bcode_harness_models::HarnessModelsRequestKind::OpenSelected { selection, .. } =
+            &mut selected.request.kind
+        else {
+            unreachable!()
+        };
+        let old_capacity = selection.model_id.capacity();
+        selection.model_id.reserve(4096);
+        let added_capacity = selection.model_id.capacity() - old_capacity;
+        let mut after = inspector();
+        request(&mut after, &retained).unwrap();
+        assert_eq!(
+            after.usage.scalar_capacity_bytes - before.usage.scalar_capacity_bytes,
+            added_capacity
+        );
+        assert_eq!(after.usage.value_nodes, before.usage.value_nodes);
+        let ExternalHarnessRequestKind::OpenSelected(selected) = &mut retained.kind else {
+            unreachable!()
+        };
+        let old_capacity = selected.request.instance.auth.profile.capacity();
+        selected.request.instance.auth.profile.reserve(2048);
+        let added_capacity = selected.request.instance.auth.profile.capacity() - old_capacity;
+        let mut nested = inspector();
+        request(&mut nested, &retained).unwrap();
+        assert_eq!(
+            nested.usage.scalar_capacity_bytes - after.usage.scalar_capacity_bytes,
+            added_capacity
+        );
+    }
 }

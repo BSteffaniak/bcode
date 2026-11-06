@@ -471,7 +471,7 @@ impl ManagedSessionCommandHandle {
         retained: ExternalHarnessRequest,
     ) -> Result<ExternalHarnessResponse, ClientError> {
         verify_submission(self.session_id, &retained)?;
-        let request = retained.request();
+        let request = retained.request().map_err(|_| invalid())?;
         let HarnessRequestKind::Submit { target, submission } = &request.kind else {
             return Err(invalid());
         };
@@ -579,7 +579,7 @@ fn verify_submission(
     session_id: SessionId,
     retained: &ExternalHarnessRequest,
 ) -> Result<(), ClientError> {
-    let request = retained.request();
+    let request = retained.request().map_err(|_| invalid())?;
     request.validate().map_err(|_| invalid())?;
     let HarnessRequestKind::Submit { target, submission } = &request.kind else {
         return Err(invalid());

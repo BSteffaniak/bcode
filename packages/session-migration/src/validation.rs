@@ -479,6 +479,9 @@ pub enum WriterEpochCompatibility {
 /// Classify an observed writer epoch without leaking the migration graph into current runtime code.
 #[must_use]
 pub fn classify_writer_epoch(writer_epoch: u32) -> WriterEpochCompatibility {
+    if writer_epoch == 24 {
+        return WriterEpochCompatibility::Unsupported;
+    }
     if writer_epoch == CURRENT_WRITER_EPOCH {
         return WriterEpochCompatibility::Current;
     }
@@ -486,7 +489,9 @@ pub fn classify_writer_epoch(writer_epoch: u32) -> WriterEpochCompatibility {
         Ok(_) => WriterEpochCompatibility::ReleasedHistorical,
         Err(MigrationPlanError::FutureWriter { .. }) => WriterEpochCompatibility::UnknownFuture,
         Err(
-            MigrationPlanError::MissingStep { .. } | MigrationPlanError::NonMonotonicStep { .. },
+            MigrationPlanError::MissingStep { .. }
+            | MigrationPlanError::NonMonotonicStep { .. }
+            | MigrationPlanError::ReservedWriter { .. },
         ) => WriterEpochCompatibility::Unsupported,
     }
 }
@@ -519,7 +524,7 @@ pub const fn validate_writer_finalization(
     if !target_validation_complete {
         return Err(WriterFinalizationError::ValidationIncomplete);
     }
-    if requested_writer_epoch != CURRENT_WRITER_EPOCH {
+    if requested_writer_epoch == 24 || requested_writer_epoch != CURRENT_WRITER_EPOCH {
         return Err(WriterFinalizationError::NonCurrentTarget {
             requested: requested_writer_epoch,
             current: CURRENT_WRITER_EPOCH,
@@ -847,6 +852,10 @@ mod tests {
     #[test]
     fn writer_epoch_classification_and_finalization_are_migration_owned() {
         assert_eq!(
+            classify_writer_epoch(24),
+            WriterEpochCompatibility::Unsupported
+        );
+        assert_eq!(
             classify_writer_epoch(CURRENT_WRITER_EPOCH),
             WriterEpochCompatibility::Current
         );
@@ -920,6 +929,7 @@ mod tests {
                 "session-writer-epoch-20-to-21",
                 "session-writer-epoch-21-to-22",
                 "session-writer-epoch-22-to-23",
+                "session-writer-epoch-23-to-25",
             ]
         );
         assert_eq!(receipt.source_event_digest_sha256, "source");

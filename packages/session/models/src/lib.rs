@@ -85,7 +85,7 @@ pub trait SessionCompactionRecoveryDiscoveryApplication: Sync {
 ///
 /// Epoch 23 indexes managed claim identity directly on canonical event rows, fencing the
 /// incomplete epoch-22 projection. Event payload schema remains 55.
-pub const CURRENT_SESSION_STORAGE_WRITER_EPOCH: u32 = 23;
+pub const CURRENT_SESSION_STORAGE_WRITER_EPOCH: u32 = 25;
 
 /// Identifies retained turn observations in the existing system-message text contract.
 ///
@@ -1509,7 +1509,7 @@ mod checked_tool_projection_tests {
 }
 
 /// Current persisted session event schema version.
-pub const CURRENT_SESSION_EVENT_SCHEMA_VERSION: u16 = 55;
+pub const CURRENT_SESSION_EVENT_SCHEMA_VERSION: u16 = 57;
 
 /// Stable persisted event kinds emitted by the current session schema.
 ///

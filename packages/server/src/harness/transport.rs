@@ -23,6 +23,17 @@ pub async fn with_credential_admission<T>(
 /// Selected-plugin semantic transport. Implementations never dispatch Bcode tools or model turns.
 pub trait ManagedHarnessTransport: Send + Sync {
     /// Deliver one validated envelope. Failure after invocation may have native effects.
+    /// Deliver a model-selected Open only after its independent canonical delivery claim.
+    fn invoke_selected(
+        &self,
+        request: &bcode_harness_models::HarnessModelsRequest,
+    ) -> impl std::future::Future<
+        Output = Result<bcode_harness_models::HarnessModelsResponse, ManagedHarnessError>,
+    > + Send {
+        let _ = request;
+        async { Err(ManagedHarnessError::Unsupported) }
+    }
+
     fn invoke(
         &self,
         request: &HarnessRequest,
@@ -30,6 +41,36 @@ pub trait ManagedHarnessTransport: Send + Sync {
 }
 
 impl ManagedHarnessTransport for HarnessPluginTransport {
+    async fn invoke_selected(
+        &self,
+        request: &bcode_harness_models::HarnessModelsRequest,
+    ) -> Result<bcode_harness_models::HarnessModelsResponse, ManagedHarnessError> {
+        if !matches!(
+            &request.kind,
+            bcode_harness_models::HarnessModelsRequestKind::OpenSelected { .. }
+        ) {
+            return Err(ManagedHarnessError::Invalid);
+        }
+        // Selected mutations are inaccessible without an admitted canonical owner scope.
+        let admitted = CREDENTIAL_CALLER
+            .try_with(|(_, owner, call)| {
+                let bcode_harness_models::HarnessModelsRequestKind::OpenSelected { open, .. } =
+                    &request.kind
+                else {
+                    return false;
+                };
+                call.harness.instance == request.instance
+                    && owner.session_id.to_string() == open.session_id
+                    && owner.generation == open.generation
+                    && call.harness.request_id == request.request_id
+            })
+            .unwrap_or(false);
+        if !admitted {
+            return Err(ManagedHarnessError::StaleOwner);
+        }
+        self.call_models(request).await
+    }
+
     async fn invoke(
         &self,
         request: &HarnessRequest,
@@ -480,6 +521,191 @@ impl HarnessPluginTransport {
     #[must_use]
     pub const fn new(state: Arc<crate::ServerState>) -> Self {
         Self { state }
+    }
+
+    /// Discover native installation candidates with manifest ownership and no credential bridge.
+    pub(super) async fn discover_candidates(
+        &self,
+        plugin_id: &str,
+        request: &bcode_harness_models::HarnessCandidatesRequest,
+    ) -> Result<bcode_harness_models::HarnessCandidatesResponse, ManagedHarnessError> {
+        use bcode_harness_models::{
+            HARNESS_CANDIDATES_INTERFACE_ID, HARNESS_DISCOVER_CANDIDATES_OPERATION,
+        };
+        request
+            .validate()
+            .map_err(|_| ManagedHarnessError::Invalid)?;
+        let manifest = self
+            .state
+            .plugins
+            .registry()
+            .manifests()
+            .get(plugin_id)
+            .ok_or(ManagedHarnessError::Unavailable)?;
+        bcode_plugin::harness::harness_contribution(manifest)
+            .map_err(|_| ManagedHarnessError::Unavailable)?;
+        if manifest
+            .services
+            .iter()
+            .filter(|service| service.interface_id == HARNESS_CANDIDATES_INTERFACE_ID)
+            .count()
+            != 1
+        {
+            return Err(ManagedHarnessError::Unsupported);
+        }
+        let bytes = serde_json::to_vec(request).map_err(|_| ManagedHarnessError::Invalid)?;
+        let response = tokio::time::timeout(
+            CALL_TIMEOUT,
+            self.state.plugins.invoke_service_with_bridge_scoped(
+                plugin_id,
+                HARNESS_CANDIDATES_INTERFACE_ID,
+                HARNESS_DISCOVER_CANDIDATES_OPERATION,
+                bytes,
+                bcode_plugin::PluginInvocationScope::Global,
+                None,
+            ),
+        )
+        .await
+        .map_err(|_| ManagedHarnessError::Deadline)?
+        .map_err(|_| ManagedHarnessError::Unavailable)?;
+        if response.error.is_some()
+            || response.payload.len() > bcode_harness_models::MAX_HARNESS_WIRE_BYTES
+        {
+            return Err(ManagedHarnessError::Invalid);
+        }
+        let response: bcode_harness_models::HarnessCandidatesResponse =
+            serde_json::from_slice(&response.payload).map_err(|_| ManagedHarnessError::Invalid)?;
+        response
+            .validate_for(request, plugin_id)
+            .map_err(|_| ManagedHarnessError::Invalid)?;
+        Ok(response)
+    }
+
+    pub(crate) async fn prepare_candidate(
+        &self,
+        request: &bcode_harness_models::HarnessPrepareCandidateRequest,
+    ) -> Result<bcode_harness_models::HarnessPrepareCandidateResponse, ManagedHarnessError> {
+        use bcode_harness_models::{
+            HARNESS_CANDIDATES_INTERFACE_ID, HARNESS_PREPARE_CANDIDATE_OPERATION,
+        };
+        request
+            .validate()
+            .map_err(|_| ManagedHarnessError::Invalid)?;
+        let plugin_id = &request.candidate.plugin_id;
+        let manifest = self
+            .state
+            .plugins
+            .registry()
+            .manifests()
+            .get(plugin_id)
+            .ok_or(ManagedHarnessError::Unavailable)?;
+        bcode_plugin::harness::harness_contribution(manifest)
+            .map_err(|_| ManagedHarnessError::Unavailable)?;
+        if manifest
+            .services
+            .iter()
+            .filter(|service| service.interface_id == HARNESS_CANDIDATES_INTERFACE_ID)
+            .count()
+            != 1
+        {
+            return Err(ManagedHarnessError::Unsupported);
+        }
+        let bytes = serde_json::to_vec(request).map_err(|_| ManagedHarnessError::Invalid)?;
+        let response = tokio::time::timeout(
+            CALL_TIMEOUT,
+            self.state.plugins.invoke_service_with_bridge_scoped(
+                plugin_id,
+                HARNESS_CANDIDATES_INTERFACE_ID,
+                HARNESS_PREPARE_CANDIDATE_OPERATION,
+                bytes,
+                bcode_plugin::PluginInvocationScope::Global,
+                None,
+            ),
+        )
+        .await
+        .map_err(|_| ManagedHarnessError::Deadline)?
+        .map_err(|_| ManagedHarnessError::Unavailable)?;
+        if response.error.is_some()
+            || response.payload.len() > bcode_harness_models::MAX_HARNESS_WIRE_BYTES
+        {
+            return Err(ManagedHarnessError::Invalid);
+        }
+        let response: bcode_harness_models::HarnessPrepareCandidateResponse =
+            serde_json::from_slice(&response.payload).map_err(|_| ManagedHarnessError::Invalid)?;
+        response
+            .validate_for(request, plugin_id)
+            .map_err(|_| ManagedHarnessError::Conflict)?;
+        Ok(response)
+    }
+
+    /// Discover models without opening a conversation or authorizing a selected mutation.
+    /// # Errors
+    /// Rejects selected opens, disabled plugins and uncorrelated or excessive responses.
+    pub(super) async fn discover_models(
+        &self,
+        request: &bcode_harness_models::HarnessModelsRequest,
+    ) -> Result<bcode_harness_models::HarnessModelsResponse, ManagedHarnessError> {
+        if !matches!(
+            &request.kind,
+            bcode_harness_models::HarnessModelsRequestKind::DiscoverModels
+        ) {
+            return Err(ManagedHarnessError::Unsupported);
+        }
+        self.call_models(request).await
+    }
+
+    async fn call_models(
+        &self,
+        request: &bcode_harness_models::HarnessModelsRequest,
+    ) -> Result<bcode_harness_models::HarnessModelsResponse, ManagedHarnessError> {
+        use bcode_harness_models::HARNESS_MODELS_INTERFACE_ID;
+        request
+            .validate()
+            .map_err(|_| ManagedHarnessError::Invalid)?;
+        let plugin_id = &request.instance.plugin_id;
+        let manifest = self
+            .state
+            .plugins
+            .registry()
+            .manifests()
+            .get(plugin_id)
+            .ok_or(ManagedHarnessError::Unavailable)?;
+        bcode_plugin::harness::harness_contribution(manifest)
+            .map_err(|_| ManagedHarnessError::Unavailable)?;
+        let bytes = serde_json::to_vec(request).map_err(|_| ManagedHarnessError::Invalid)?;
+        let inspect = HarnessRequest {
+            schema_version: request.schema_version,
+            request_id: request.request_id.clone(),
+            instance: request.instance.clone(),
+            kind: bcode_harness_models::HarnessRequestKind::Inspect,
+        };
+        // No canonical credential admission is minted by discovery. Native subscription
+        // custody stays native; API-key resolution without an admitted owner fails closed.
+        let response = tokio::time::timeout(
+            CALL_TIMEOUT,
+            self.state.plugins.invoke_service_with_bridge_scoped(
+                plugin_id,
+                HARNESS_MODELS_INTERFACE_ID,
+                request.kind.operation(),
+                bytes,
+                bcode_plugin::PluginInvocationScope::Global,
+                self.credential_bridge(&inspect),
+            ),
+        )
+        .await
+        .map_err(|_| ManagedHarnessError::Deadline)?
+        .map_err(|_| ManagedHarnessError::Unavailable)?;
+        if response.payload.len() > bcode_harness_models::MAX_HARNESS_WIRE_BYTES
+            || response.error.is_some()
+        {
+            return Err(ManagedHarnessError::Invalid);
+        }
+        let response: bcode_harness_models::HarnessModelsResponse =
+            serde_json::from_slice(&response.payload).map_err(|_| ManagedHarnessError::Invalid)?;
+        response
+            .validate_for(request)
+            .map_err(|_| ManagedHarnessError::Invalid)?;
+        Ok(response)
     }
 
     pub(super) async fn call(

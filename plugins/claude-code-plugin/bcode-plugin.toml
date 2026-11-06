@@ -16,6 +16,18 @@ name         = "Claude Code managed sessions"
 
 [[services]]
 class        = "query"
+description  = "Bounded non-mutating installed CLI candidates with native namespace readiness"
+interface_id = "bcode.harness.candidates/v1"
+name         = "Claude Code setup candidates"
+
+[[services]]
+class        = "service"
+description  = "Bounded native-advertised models and exact pre-prompt selected session preparation"
+interface_id = "bcode.harness.models/v1"
+name         = "Claude Code model selection"
+
+[[services]]
+class        = "query"
 description  = "Explicit namespace-bound client-terminal plan; never launches native login in the daemon"
 interface_id = "bcode.claude-code.handoff/v1"
 name         = "Claude Code native login handoff plan"

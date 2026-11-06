@@ -347,11 +347,19 @@ impl SessionManager {
     ) -> Result<SessionSummary, SessionError> {
         request.creation.working_directory =
             normalize_working_directory(&request.creation.working_directory);
-        if request.version != 1 || request.creation.parent_id == request.creation.child_id {
+        if request.validate_execution().is_err()
+            || request.creation.parent_id == request.creation.child_id
+        {
             return Err(invalid(
                 "invalid composed spawning request version or parentage",
             ));
         }
+        request
+            .validate_storage(
+                bcode_session_models::CURRENT_SESSION_EVENT_SCHEMA_VERSION,
+                bcode_session_models::CURRENT_SESSION_STORAGE_WRITER_EPOCH,
+            )
+            .map_err(invalid)?;
         if request.admission.idempotency_identity().is_none() {
             return Err(invalid(
                 "composed spawning requires a retained admission identity",
@@ -1149,7 +1157,7 @@ fn validate_child_prefix(events: &[SessionEvent], id: SessionId) -> Result<(), S
                 spawning: Some(spawning),
                 ..
             } = &relationship.kind
-                && (spawning.version != 1 || spawning.creation != **request)
+                && (spawning.validate_execution().is_err() || spawning.creation != **request)
             {
                 return Err(invalid(
                     "composed spawning prefix is inconsistent or unsupported",
@@ -1216,6 +1224,7 @@ mod tests {
             input: "original".into(),
             admission: bcode_session_models::TurnAdmissionMetadata::default(),
             auth_profile: None,
+            managed: None,
         };
         let staging = child_staging_path(root.path(), &creation, Some(&original)).unwrap();
         let evidence = fs::read(staging.join("request.json")).unwrap();

@@ -112,7 +112,7 @@ pub async fn auth_status(options: &LaunchOptions) -> Result<AuthStatus, Error> {
     validated_status(options, status.success(), &output)
 }
 
-fn validated_status(
+pub fn validated_status(
     options: &LaunchOptions,
     success: bool,
     output: &[u8],

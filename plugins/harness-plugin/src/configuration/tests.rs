@@ -55,6 +55,234 @@ fn invoke(config: Value, operation: &str, payload: &Value) -> ServiceResponse {
 }
 
 #[test]
+fn native_setup_combines_exact_proposals_and_rejects_changed_preparation() {
+    let instance: HarnessInstance =
+        serde_json::from_value(settings()["instances"]["primary"]["instance"].clone()).unwrap();
+    let candidate = bcode_harness_models::HarnessInstallationCandidate {
+        plugin_id: instance.plugin_id.clone(),
+        executable: bcode_harness_models::HarnessCandidateExecutableIdentity {
+            canonical_path: instance.executable.clone(),
+            byte_len: 12,
+            modified_unix_nanos: Some(10),
+            file_key: None,
+        },
+        native_version: "exact-version".into(),
+        config_namespace: instance.config_namespace.clone(),
+        custody: instance.auth.custody,
+        readiness: bcode_harness_models::HarnessCandidateReadiness::ExistingNativeLogin,
+    };
+    let request = bcode_harness_models::HarnessPrepareCandidateRequest {
+        schema_version: bcode_harness_models::HARNESS_SCHEMA_VERSION,
+        request_id: "prepare-exact".into(),
+        instance_id: instance.instance_id.clone(),
+        candidate: candidate.clone(),
+    };
+    let native = bcode_harness_models::HarnessPreparedCandidate {
+        candidate,
+        instance,
+        adapter_settings: json!({"native_owned": "opaque-setting"}),
+    };
+    let mut response = bcode_harness_models::HarnessPrepareCandidateResponse {
+        schema_version: request.schema_version,
+        request_id: request.request_id.clone(),
+        plugin_id: native.instance.plugin_id.clone(),
+        kind: bcode_harness_models::HarnessPrepareCandidateResponseKind::Prepared(Box::new(
+            native.clone(),
+        )),
+    };
+    let payload = PrepareNativeSetupRequest {
+        request: request.clone(),
+        response: response.clone(),
+        adapter_configuration: json!({"instances": {"other": {"keep": true}}, "unrelated": true}),
+        make_default: true,
+    };
+    let result = invoke(
+        json!({}),
+        PREPARE_SETUP_OPERATION,
+        &serde_json::to_value(payload).unwrap(),
+    );
+    assert!(result.error.is_none());
+    let prepared: PreparedNativeSetup = result.payload_json().unwrap();
+    assert_eq!(prepared.native, native);
+    assert_eq!(
+        prepared.adapter_configuration["instances"]["other"],
+        json!({"keep": true})
+    );
+    assert_eq!(
+        prepared.adapter_configuration["instances"]["primary"],
+        native.adapter_settings
+    );
+    assert_eq!(
+        prepared.harness.configuration["default_instance"],
+        json!("primary")
+    );
+    assert!(prepared.revalidate(&request, &response).is_ok());
+    let mut changed = native;
+    changed.adapter_settings = json!({"native_owned": "changed"});
+    response.kind =
+        bcode_harness_models::HarnessPrepareCandidateResponseKind::Prepared(Box::new(changed));
+    assert!(prepared.revalidate(&request, &response).is_err());
+    response.request_id = "different-request".into();
+    assert!(prepared.revalidate(&request, &response).is_err());
+}
+
+#[test]
+fn candidate_setup_requires_exact_binding_and_fresh_correlated_membership() {
+    let instance: HarnessInstance =
+        serde_json::from_value(settings()["instances"]["primary"]["instance"].clone()).unwrap();
+    let candidate = bcode_harness_models::HarnessInstallationCandidate {
+        plugin_id: instance.plugin_id.clone(),
+        executable: bcode_harness_models::HarnessCandidateExecutableIdentity {
+            canonical_path: instance.executable.clone(),
+            byte_len: 12,
+            modified_unix_nanos: Some(10),
+            file_key: Some("device:inode".into()),
+        },
+        native_version: "exact-version".into(),
+        config_namespace: instance.config_namespace.clone(),
+        custody: instance.auth.custody,
+        readiness: bcode_harness_models::HarnessCandidateReadiness::ExistingNativeLogin,
+    };
+    let setup = PrepareCandidateSetupRequest {
+        candidate: candidate.clone(),
+        setup: PrepareSetupRequest {
+            instance,
+            make_default: true,
+        },
+    };
+    let request = bcode_harness_models::HarnessCandidatesRequest {
+        schema_version: bcode_harness_models::HARNESS_SCHEMA_VERSION,
+        request_id: "fresh-discovery".into(),
+    };
+    let mut response = bcode_harness_models::HarnessCandidatesResponse {
+        schema_version: request.schema_version,
+        request_id: request.request_id.clone(),
+        plugin_id: candidate.plugin_id.clone(),
+        kind: bcode_harness_models::HarnessCandidatesResponseKind::Candidates {
+            candidates: vec![candidate.clone()],
+            complete: true,
+        },
+    };
+    assert!(setup.revalidate(&request, &response).is_ok());
+    let prepared = invoke(
+        json!({}),
+        PREPARE_SETUP_OPERATION,
+        &serde_json::to_value(&setup).unwrap(),
+    );
+    assert!(prepared.error.is_none());
+    response.request_id = "stale-discovery".into();
+    assert!(setup.revalidate(&request, &response).is_err());
+    response.request_id = request.request_id;
+    let mut changed = candidate;
+    changed.executable.byte_len += 1;
+    response.kind = bcode_harness_models::HarnessCandidatesResponseKind::Candidates {
+        candidates: vec![changed],
+        complete: true,
+    };
+    assert!(
+        setup
+            .revalidate(
+                &bcode_harness_models::HarnessCandidatesRequest {
+                    schema_version: response.schema_version,
+                    request_id: response.request_id.clone(),
+                },
+                &response
+            )
+            .is_err()
+    );
+    let mut mismatch = setup;
+    mismatch.setup.instance.config_namespace = "/other/config".into();
+    assert!(mismatch.validate().is_err());
+}
+
+#[test]
+fn setup_prepares_an_explicit_candidate_without_mutation_or_default_inference() {
+    let instance = settings()["instances"]["primary"]["instance"].clone();
+    let response = invoke(
+        json!({}),
+        PREPARE_SETUP_OPERATION,
+        &json!({"instance": instance, "make_default": false}),
+    );
+    assert!(response.error.is_none());
+    let setup: PreparedInstanceSetup = response.payload_json().unwrap();
+    assert_eq!(
+        setup.prepared.selection,
+        InstanceSelection::Instance {
+            instance_id: "primary".into()
+        }
+    );
+    assert!(setup.configuration.get("default_instance").is_none());
+    assert_eq!(
+        setup.configuration["instances"]["primary"]["instance"],
+        instance
+    );
+    // The returned settings feed the existing catalog/prepare path, not a parallel resolver.
+    let catalog_response = invoke(setup.configuration, CATALOG_OPERATION, &json!({}));
+    let catalog: InstanceCatalog = catalog_response.payload_json().unwrap();
+    assert_eq!(catalog.instances["primary"], setup.prepared.instance);
+    assert!(catalog.default_instance.is_none());
+    assert!(
+        !response
+            .payload_text()
+            .unwrap()
+            .contains("never-return-this")
+    );
+}
+
+#[test]
+fn setup_preserves_other_instances_and_requires_explicit_default_consent() {
+    let config = settings();
+    let mut instance = config["instances"]["primary"]["instance"].clone();
+    instance["instance_id"] = json!("secondary");
+    for make_default in [false, true] {
+        let response = invoke(
+            config.clone(),
+            PREPARE_SETUP_OPERATION,
+            &json!({"instance": instance, "make_default": make_default}),
+        );
+        assert!(response.error.is_none());
+        let setup: PreparedInstanceSetup = response.payload_json().unwrap();
+        assert_eq!(
+            setup.configuration["instances"]["primary"],
+            config["instances"]["primary"]
+        );
+        assert_eq!(
+            setup.configuration["default_instance"],
+            json!(if make_default { "secondary" } else { "primary" })
+        );
+    }
+}
+
+#[test]
+fn setup_rejects_overwrites_disabled_configuration_and_inline_secrets() {
+    let config = settings();
+    let mut changed = config["instances"]["primary"]["instance"].clone();
+    changed["auth"]["profile"] = json!("different-account");
+    let response = invoke(
+        config.clone(),
+        PREPARE_SETUP_OPERATION,
+        &json!({"instance": changed, "make_default": true}),
+    );
+    assert_eq!(response.error.unwrap().code, "instance_conflict");
+    let mut disabled = config.clone();
+    disabled["enabled"] = json!(false);
+    let response = invoke(
+        disabled,
+        PREPARE_SETUP_OPERATION,
+        &json!({"instance": config["instances"]["primary"]["instance"], "make_default": true}),
+    );
+    assert_eq!(response.error.unwrap().code, "configuration_disabled");
+    changed["auth"]["api_key"] = json!("must-not-escape");
+    let response = invoke(
+        json!({}),
+        PREPARE_SETUP_OPERATION,
+        &json!({"instance": changed, "make_default": true}),
+    );
+    assert_eq!(response.error.as_ref().unwrap().code, "invalid_request");
+    assert!(!response.error.unwrap().message.contains("must-not-escape"));
+}
+
+#[test]
 fn catalog_and_explicit_default_return_the_exact_non_secret_instance() {
     let response = invoke(settings(), CATALOG_OPERATION, &json!({}));
     assert!(response.error.is_none());

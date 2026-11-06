@@ -65,9 +65,7 @@ fn verify_recovery_action(
             release,
             verify_reap,
         } => {
-            if bcode_session_models::CURRENT_SESSION_EVENT_SCHEMA_VERSION < 56
-                || bcode_session_models::CURRENT_SESSION_STORAGE_WRITER_EPOCH < 24
-            {
+            if !bcode_session_models::external_harness::recovery_storage_available() {
                 return Err(failure());
             }
             release
@@ -82,9 +80,7 @@ fn verify_recovery_action(
             recovery,
             verify_release,
         } => {
-            if bcode_session_models::CURRENT_SESSION_EVENT_SCHEMA_VERSION < 56
-                || bcode_session_models::CURRENT_SESSION_STORAGE_WRITER_EPOCH < 24
-            {
+            if !bcode_session_models::external_harness::recovery_storage_available() {
                 return Err(failure());
             }
             recovery
@@ -129,15 +125,11 @@ impl SessionActor {
             return Err(failure());
         }
         let action = verify_recovery_action(action, &owner)?;
-        // These transitions are dormant until the reviewed writer/schema fence is published.
-        // No existing schema-55 writer may append generation-transfer semantics.
+        // Recovery storage remains independently unpublished, including under schema57.
         let recovery = matches!(&action, HarnessAction::Write(record)
             if matches!(record.as_ref(), ExternalHarnessOperationRecord::RecoveryPrepared { .. }
                 | ExternalHarnessOperationRecord::TransportReleased { .. }));
-        if recovery
-            && (bcode_session_models::CURRENT_SESSION_EVENT_SCHEMA_VERSION < 56
-                || bcode_session_models::CURRENT_SESSION_STORAGE_WRITER_EPOCH < 24)
-        {
+        if recovery {
             return Err(failure());
         }
         if matches!(&action, HarnessAction::State | HarnessAction::Page { .. }) {
@@ -232,7 +224,10 @@ impl SessionActor {
             inventory_commitments: Vec::new(),
         };
         operation
-            .validate()
+            .validate_storage(
+                bcode_session_models::CURRENT_SESSION_EVENT_SCHEMA_VERSION,
+                bcode_session_models::CURRENT_SESSION_STORAGE_WRITER_EPOCH,
+            )
             .map_err(SessionError::EventSerialization)?;
         let page_diagnostic = matches!(
             &operation.record,

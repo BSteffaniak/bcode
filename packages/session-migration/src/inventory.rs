@@ -1424,13 +1424,23 @@ impl ReleasedEventVariantDescriptor {
     #[must_use]
     pub fn supports_schema(self, schema: u16) -> bool {
         let (first, last) = released_event_schema_range(self.kind);
-        (schema >= first && schema <= last) || (self.kind == "session_forked" && schema == 54)
+        !NEVER_RELEASED_EVENT_SCHEMAS.contains(&schema)
+            && ((schema >= first && schema <= last)
+                || (self.kind == "session_forked" && schema == 54))
     }
 }
 
 /// Classify one persisted event kind/schema pair against released migration inventory.
 #[must_use]
 pub fn classify_event_kind_schema(kind: &str, schema: u16) -> ReleasedEventKindClassification {
+    if NEVER_RELEASED_EVENT_SCHEMAS.contains(&schema)
+        || matches!(
+            kind,
+            "durable_interaction_committed" | "turn_continuation_committed"
+        )
+    {
+        return ReleasedEventKindClassification::Unknown;
+    }
     if schema == CURRENT_EVENT_SCHEMA
         && bcode_session_models::CURRENT_PERSISTED_SESSION_EVENT_KINDS.contains(&kind)
     {
@@ -1462,7 +1472,7 @@ pub fn is_released_event_kind_schema(kind: &str, schema: u16) -> bool {
 ///
 /// Event kinds that the current build still persists remain historically decodable through this
 /// schema; the current schema itself is classified by [`classify_event_kind_schema`].
-pub const LATEST_HISTORICAL_EVENT_SCHEMA: u16 = 54;
+pub const LATEST_HISTORICAL_EVENT_SCHEMA: u16 = 55;
 
 fn released_event_schema_range(kind: &str) -> (u16, u16) {
     let live = LATEST_HISTORICAL_EVENT_SCHEMA;
@@ -1479,9 +1489,7 @@ fn released_event_schema_range(kind: &str) -> (u16, u16) {
         | "milestone_publication_requested"
         | "milestone_published" => (51, CURRENT_EVENT_SCHEMA),
         // These families remain publication-gated and have no released historical writer.
-        "durable_interaction_committed" | "turn_continuation_committed" => {
-            (CURRENT_EVENT_SCHEMA, CURRENT_EVENT_SCHEMA)
-        }
+        "durable_interaction_committed" | "turn_continuation_committed" => (0, 0),
         "child_session_created" => (49, CURRENT_EVENT_SCHEMA),
         "session_child_linked" | "session_child_published" | "session_children_reconciled" => {
             (50, CURRENT_EVENT_SCHEMA)
@@ -1612,10 +1620,6 @@ pub const RELEASED_EVENT_VARIANTS: &[ReleasedEventVariantDescriptor] = &[
     ReleasedEventVariantDescriptor {
         kind: "context_usage_observed",
         treatment: ReleasedEventTreatment::ExplicitConversion,
-    },
-    ReleasedEventVariantDescriptor {
-        kind: "durable_interaction_committed",
-        treatment: ReleasedEventTreatment::CurrentEquivalent,
     },
     ReleasedEventVariantDescriptor {
         kind: "execution_session_created",
@@ -1907,10 +1911,6 @@ pub const RELEASED_EVENT_VARIANTS: &[ReleasedEventVariantDescriptor] = &[
     },
     ReleasedEventVariantDescriptor {
         kind: "trace_event",
-        treatment: ReleasedEventTreatment::CurrentEquivalent,
-    },
-    ReleasedEventVariantDescriptor {
-        kind: "turn_continuation_committed",
         treatment: ReleasedEventTreatment::CurrentEquivalent,
     },
     ReleasedEventVariantDescriptor {
@@ -2286,7 +2286,12 @@ pub struct MigrationStepDescriptor {
     pub target_writer_epoch: u32,
 }
 
-pub const MIGRATION_STEPS: [MigrationStepDescriptor; 22] = [
+pub const MIGRATION_STEPS: [MigrationStepDescriptor; 23] = [
+    MigrationStepDescriptor {
+        id: "session-writer-epoch-23-to-25",
+        source_writer_epoch: 23,
+        target_writer_epoch: 25,
+    },
     MigrationStepDescriptor {
         id: "session-writer-epoch-22-to-23",
         source_writer_epoch: 22,
@@ -2498,29 +2503,42 @@ pub const RELEASED_WRITER_SCHEMA_COMBINATIONS: &[ReleasedWriterSchemaDescriptor]
         writer_epoch: 20,
         event_schema: 55,
     },
+    ReleasedWriterSchemaDescriptor {
+        writer_epoch: 21,
+        event_schema: 55,
+    },
+    ReleasedWriterSchemaDescriptor {
+        writer_epoch: 22,
+        event_schema: 55,
+    },
+    ReleasedWriterSchemaDescriptor {
+        writer_epoch: 23,
+        event_schema: 55,
+    },
 ];
 
 /// Released historical writer epochs that must migrate to [`CURRENT_WRITER_EPOCH`].
 pub const RELEASED_HISTORICAL_WRITER_EPOCHS: &[u32] = &[
-    1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20,
+    1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23,
 ];
 
 /// Released historical event schemas currently evidenced by Git history.
 ///
 /// Schemas 33, 34, and 36 were never released. Schema 40 was emitted by an epoch-5
 /// development build and is retained as supported historical input. Schemas 43, 44, and 45 were
-/// emitted by epoch-6 builds and migrate forward without a writer-epoch change.
+/// emitted by epoch-6 builds and migrate forward without a writer-epoch change. Schema 55
+/// remains supported for released writers 20 through 23; reserved schema 56 is never input.
 pub const RELEASED_HISTORICAL_EVENT_SCHEMAS: &[u16] = &[
     1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26,
     27, 28, 29, 30, 31, 32, 35, 37, 38, 39, 40, 41, 42, 43, 44, 45, 46, 47, 48, 49, 50, 51, 52, 53,
-    54,
+    54, 55,
 ];
 
 /// Event schemas between the first released schema and the current schema that no writer emitted.
 ///
 /// Every other schema below [`CURRENT_EVENT_SCHEMA`] must remain a supported historical input so a
 /// schema bump cannot orphan sessions written by the previous build.
-pub const NEVER_RELEASED_EVENT_SCHEMAS: &[u16] = &[33, 34, 36];
+pub const NEVER_RELEASED_EVENT_SCHEMAS: &[u16] = &[33, 34, 36, 56];
 
 /// Current event schema emitted by this build.
 pub const CURRENT_EVENT_SCHEMA: u16 = bcode_session_migration_target::CURRENT_EVENT_SCHEMA;
@@ -2669,8 +2687,6 @@ mod tests {
             ("external_observation_recorded", 53),
             ("external_interaction_responded", 53),
             ("child_session_created", 49),
-            ("durable_interaction_committed", CURRENT_EVENT_SCHEMA),
-            ("turn_continuation_committed", CURRENT_EVENT_SCHEMA),
             ("inert_history", 40),
             ("positioned_assistant_reasoning_activity", 42),
             ("positioned_assistant_response_segment", 42),
@@ -2713,6 +2729,10 @@ mod tests {
         let current = bcode_session_models::CURRENT_PERSISTED_SESSION_EVENT_KINDS
             .iter()
             .copied()
+            .filter(|kind| {
+                classify_event_kind_schema(kind, CURRENT_EVENT_SCHEMA)
+                    == ReleasedEventKindClassification::Current
+            })
             .collect::<BTreeSet<_>>();
         let inventoried = RELEASED_EVENT_VARIANTS
             .iter()
@@ -2729,10 +2749,7 @@ mod tests {
             "every released kind must be current or have an explicit historical treatment"
         );
         assert_eq!(
-            bcode_session_models::CURRENT_PERSISTED_SESSION_EVENT_KINDS
-                .iter()
-                .copied()
-                .collect::<BTreeSet<_>>(),
+            current,
             RELEASED_EVENT_VARIANTS
                 .iter()
                 .filter(|variant| {
@@ -3067,99 +3084,61 @@ mod tests {
                 .windows(2)
                 .all(|pair| pair[0] < pair[1])
         );
+        let actual: Vec<_> = RELEASED_WRITER_SCHEMA_COMBINATIONS
+            .iter()
+            .map(|entry| (entry.writer_epoch, entry.event_schema))
+            .collect();
         assert_eq!(
-            RELEASED_WRITER_SCHEMA_COMBINATIONS,
+            actual,
             [
-                ReleasedWriterSchemaDescriptor {
-                    writer_epoch: 1,
-                    event_schema: 32,
-                },
-                ReleasedWriterSchemaDescriptor {
-                    writer_epoch: 2,
-                    event_schema: 32,
-                },
-                ReleasedWriterSchemaDescriptor {
-                    writer_epoch: 2,
-                    event_schema: 35,
-                },
-                ReleasedWriterSchemaDescriptor {
-                    writer_epoch: 3,
-                    event_schema: 37,
-                },
-                ReleasedWriterSchemaDescriptor {
-                    writer_epoch: 3,
-                    event_schema: 38,
-                },
-                ReleasedWriterSchemaDescriptor {
-                    writer_epoch: 4,
-                    event_schema: 38,
-                },
-                ReleasedWriterSchemaDescriptor {
-                    writer_epoch: 4,
-                    event_schema: 39,
-                },
-                ReleasedWriterSchemaDescriptor {
-                    writer_epoch: 5,
-                    event_schema: 40,
-                },
-                ReleasedWriterSchemaDescriptor {
-                    writer_epoch: 5,
-                    event_schema: 41,
-                },
-                ReleasedWriterSchemaDescriptor {
-                    writer_epoch: 6,
-                    event_schema: 46,
-                },
-                ReleasedWriterSchemaDescriptor {
-                    writer_epoch: 7,
-                    event_schema: 47
-                },
-                ReleasedWriterSchemaDescriptor {
-                    writer_epoch: 8,
-                    event_schema: 47
-                },
-                ReleasedWriterSchemaDescriptor {
-                    writer_epoch: 9,
-                    event_schema: 47
-                },
-                ReleasedWriterSchemaDescriptor {
-                    writer_epoch: 12,
-                    event_schema: 48
-                },
-                ReleasedWriterSchemaDescriptor {
-                    writer_epoch: 13,
-                    event_schema: 49
-                },
-                ReleasedWriterSchemaDescriptor {
-                    writer_epoch: 14,
-                    event_schema: 50
-                },
-                ReleasedWriterSchemaDescriptor {
-                    writer_epoch: 15,
-                    event_schema: 51
-                },
-                ReleasedWriterSchemaDescriptor {
-                    writer_epoch: 16,
-                    event_schema: 52
-                },
-                ReleasedWriterSchemaDescriptor {
-                    writer_epoch: 17,
-                    event_schema: 52
-                },
-                ReleasedWriterSchemaDescriptor {
-                    writer_epoch: 18,
-                    event_schema: 53
-                },
-                ReleasedWriterSchemaDescriptor {
-                    writer_epoch: 19,
-                    event_schema: 54
-                },
-                ReleasedWriterSchemaDescriptor {
-                    writer_epoch: 20,
-                    event_schema: 55
-                },
+                (1, 32),
+                (2, 32),
+                (2, 35),
+                (3, 37),
+                (3, 38),
+                (4, 38),
+                (4, 39),
+                (5, 40),
+                (5, 41),
+                (6, 46),
+                (7, 47),
+                (8, 47),
+                (9, 47),
+                (12, 48),
+                (13, 49),
+                (14, 50),
+                (15, 51),
+                (16, 52),
+                (17, 52),
+                (18, 53),
+                (19, 54),
+                (20, 55),
+                (21, 55),
+                (22, 55),
+                (23, 55)
             ]
         );
+    }
+
+    #[test]
+    fn reserved_schema_and_unpublished_families_are_never_classified_as_released() {
+        for kind in bcode_session_models::CURRENT_PERSISTED_SESSION_EVENT_KINDS {
+            assert_eq!(
+                classify_event_kind_schema(kind, 56),
+                ReleasedEventKindClassification::Unknown
+            );
+        }
+        for kind in [
+            "durable_interaction_committed",
+            "turn_continuation_committed",
+        ] {
+            for schema in [55, 56, 57, CURRENT_EVENT_SCHEMA] {
+                assert_eq!(
+                    classify_event_kind_schema(kind, schema),
+                    ReleasedEventKindClassification::Unknown
+                );
+            }
+        }
     }
 
     #[test]
@@ -3196,7 +3175,10 @@ mod tests {
         );
         assert_eq!(
             LATEST_HISTORICAL_EVENT_SCHEMA,
-            CURRENT_EVENT_SCHEMA - 1,
+            (1..CURRENT_EVENT_SCHEMA)
+                .rev()
+                .find(|schema| !NEVER_RELEASED_EVENT_SCHEMAS.contains(schema))
+                .expect("released predecessor"),
             "live event kinds must remain decodable through the schema emitted by the previous \
              build; bumping CURRENT_SESSION_EVENT_SCHEMA_VERSION requires extending the released \
              historical inventory in the same change"

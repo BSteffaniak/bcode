@@ -33,9 +33,7 @@ impl SessionManager {
             + Send
             + 'static,
     {
-        if bcode_session_models::CURRENT_SESSION_EVENT_SCHEMA_VERSION < 56
-            || bcode_session_models::CURRENT_SESSION_STORAGE_WRITER_EPOCH < 24
-        {
+        if !bcode_session_models::external_harness::recovery_storage_available() {
             return Err(mismatch());
         }
         release
@@ -78,9 +76,7 @@ impl SessionManager {
             + Send
             + 'static,
     {
-        if bcode_session_models::CURRENT_SESSION_EVENT_SCHEMA_VERSION < 56
-            || bcode_session_models::CURRENT_SESSION_STORAGE_WRITER_EPOCH < 24
-        {
+        if !bcode_session_models::external_harness::recovery_storage_available() {
             return Err(mismatch());
         }
         recovery
@@ -337,6 +333,60 @@ impl SessionManager {
     ) -> Result<Option<ExternalHarnessClaim>, SessionError> {
         let retained = ExternalHarnessRequest::from_request(request)
             .map_err(SessionError::EventSerialization)?;
+        self.read_external_harness_retained_envelope(session_id, retained)
+            .await
+    }
+
+    /// Read the exact selected-open claim/result without reconstructing legacy Open.
+    /// This is historical evidence, never delivery or ownership authority.
+    /// # Errors
+    /// Rejects conflicting envelopes, unavailable fences, damaged indexes and wrong sessions.
+    pub async fn read_external_harness_retained_selected_request(
+        &self,
+        session_id: bcode_session_models::SessionId,
+        request: &bcode_harness_models::HarnessModelsRequest,
+    ) -> Result<Option<ExternalHarnessClaim>, SessionError> {
+        let retained = ExternalHarnessRequest::from_models_request(request)
+            .map_err(SessionError::EventSerialization)?;
+        self.read_external_harness_retained_envelope(session_id, retained)
+            .await
+    }
+
+    /// Read canonical selected-open receipt locators without adopting native ownership.
+    /// # Errors
+    /// Rejects unavailable storage, conflicting requests and damaged canonical projections.
+    pub async fn read_external_harness_selected_open_receipt(
+        &self,
+        session_id: bcode_session_models::SessionId,
+        request: &bcode_harness_models::HarnessModelsRequest,
+    ) -> Result<Option<bcode_session_models::ManagedSessionSpawnOpenReceipt>, SessionError> {
+        let retained = ExternalHarnessRequest::from_models_request(request)
+            .map_err(SessionError::EventSerialization)?;
+        if retained.target().0 != session_id.to_string() {
+            return Err(mismatch());
+        }
+        let gate = self.session_load_gate(session_id).await;
+        let _guard = gate.lock().await;
+        let Some(store) = &self.store else {
+            return Ok(None);
+        };
+        let root = store.root_path();
+        if !crate::db::session_db_path(&root, session_id).exists() {
+            return Ok(None);
+        }
+        let db = crate::db::SessionDb::open_existing_turso_in_root(session_id, &root).await?;
+        let result = db.external_harness_selected_open_receipt(&retained).await;
+        let close = db.close().await;
+        let result = result?;
+        close?;
+        Ok(result)
+    }
+
+    async fn read_external_harness_retained_envelope(
+        &self,
+        session_id: bcode_session_models::SessionId,
+        retained: ExternalHarnessRequest,
+    ) -> Result<Option<ExternalHarnessClaim>, SessionError> {
         if retained.target().0 != session_id.to_string() {
             return Err(mismatch());
         }
@@ -354,7 +404,11 @@ impl SessionManager {
             return Ok(None);
         }
         let db = crate::db::SessionDb::open_existing_turso_in_root(session_id, &root).await?;
-        Ok(db.external_harness_retained_request(&retained).await?)
+        let result = db.external_harness_retained_request(&retained).await;
+        let close = db.close().await;
+        let result = result?;
+        close?;
+        Ok(result)
     }
     /// Observe the current canonical managed-harness selection without acquiring ownership.
     /// Preserves prepared/confirmed distinction; historical readability proves no live transport.
@@ -513,6 +567,67 @@ impl SessionManager {
             _ => Err(mismatch()),
         }
     }
+    /// Claim an exact selected-open request before native delivery.
+    /// Only `New` grants delivery; retained uncertainty must never be redispatched.
+    /// # Errors
+    /// Rejects conflicting envelopes, unavailable storage fences and stale owners.
+    pub async fn claim_external_harness_selected_open(
+        &self,
+        owner: &ExternalHarnessOwner,
+        request: &bcode_harness_models::HarnessModelsRequest,
+    ) -> Result<ExternalHarnessClaim, SessionError> {
+        let request = ExternalHarnessRequest::from_models_request(request)
+            .map_err(SessionError::EventSerialization)?;
+        match self
+            .session_handle(owner.session_id)
+            .await?
+            .harness_operation(
+                owner.clone(),
+                A::Write(Box::new(ExternalHarnessOperationRecord::DeliveryClaimed {
+                    request,
+                })),
+                self.next_activity_timestamp_ms(),
+            )
+            .await?
+        {
+            R::Claim(claim) => Ok(claim),
+            _ => Err(mismatch()),
+        }
+    }
+
+    /// Complete selected open with exact model evidence or explicit failure/uncertainty.
+    /// # Errors
+    /// Rejects unclaimed, mismatched, conflicting or stale-owner results.
+    pub async fn complete_external_harness_selected_open(
+        &self,
+        owner: &ExternalHarnessOwner,
+        request: &bcode_harness_models::HarnessModelsRequest,
+        response: &bcode_harness_models::HarnessModelsResponse,
+    ) -> Result<(), SessionError> {
+        let result = ExternalHarnessResponse::from_models_response(request, response)
+            .map_err(SessionError::EventSerialization)?;
+        let request = ExternalHarnessRequest::from_models_request(request)
+            .map_err(SessionError::EventSerialization)?;
+        match self
+            .session_handle(owner.session_id)
+            .await?
+            .harness_operation(
+                owner.clone(),
+                A::Write(Box::new(
+                    ExternalHarnessOperationRecord::DeliveryCompleted {
+                        request,
+                        response: result,
+                    },
+                )),
+                self.next_activity_timestamp_ms(),
+            )
+            .await?
+        {
+            R::Committed => Ok(()),
+            _ => Err(mismatch()),
+        }
+    }
+
     /// Persist explicit delivery uncertainty without permitting native mutation replay.
     /// # Errors
     /// Rejects unclaimed requests, mismatched owners and conflicting recorded outcomes.

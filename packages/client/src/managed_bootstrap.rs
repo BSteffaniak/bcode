@@ -5,6 +5,8 @@
 mod auth_flow;
 pub use auth_flow::ManagedSessionAuthFlow;
 mod attachment;
+#[cfg(test)]
+mod execution_tests;
 pub use attachment::{ManagedSessionCommandHandle, ManagedSessionConnection};
 
 use crate::{BcodeClient, ClientError, ClientRuntimeContext, PluginServiceResponse};
@@ -45,6 +47,187 @@ impl ManagedSessionClient {
         Self {
             inner: BcodeClient::default_endpoint_with_context(context),
         }
+    }
+
+    /// Revalidate a selected installation and obtain a plugin-owned configuration proposal.
+    /// This performs no configuration commit, login or session creation.
+    /// # Errors
+    /// Rejects changed candidates, unavailable services and uncorrelated native proposals.
+    pub async fn prepare_candidate(
+        &self,
+        request: bcode_harness_models::HarnessPrepareCandidateRequest,
+    ) -> Result<bcode_harness_models::HarnessPrepareCandidateResponse, ClientError> {
+        request
+            .validate()
+            .map_err(|_| ClientError::Protocol("invalid candidate preparation".into()))?;
+        let response: bcode_harness_models::HarnessPrepareCandidateResponse = self
+            .execution_request(ManagedSessionOperation::PrepareCandidate, &request)
+            .await?;
+        response
+            .validate_for(&request, &request.candidate.plugin_id)
+            .map_err(|_| ClientError::Protocol("invalid candidate preparation response".into()))?;
+        Ok(response)
+    }
+
+    /// Inspect enabled plugins' native installation candidates without instance configuration.
+    /// No executable paths, environment overrides, login or provider credentials are accepted.
+    /// # Errors
+    /// Rejects invalid correlation, excessive fanout and malformed plugin-owned candidates.
+    pub async fn discover_candidates(
+        &self,
+        request: bcode_ipc::harness::ManagedCandidatesRequest,
+    ) -> Result<bcode_ipc::harness::ManagedCandidatesResponse, ClientError> {
+        request
+            .validate()
+            .map_err(|message| ClientError::Protocol(message.into()))?;
+        let response: bcode_ipc::harness::ManagedCandidatesResponse = self
+            .execution_request(ManagedSessionOperation::DiscoverCandidates, &request)
+            .await?;
+        if response.request_id != request.request_id || response.plugins.len() > 16 {
+            return Err(ClientError::Protocol(
+                "invalid candidate discovery response".into(),
+            ));
+        }
+        let native = bcode_harness_models::HarnessCandidatesRequest {
+            schema_version: bcode_harness_models::HARNESS_SCHEMA_VERSION,
+            request_id: request.request_id,
+        };
+        let mut plugins = std::collections::BTreeSet::new();
+        for plugin in &response.plugins {
+            if !plugins.insert(&plugin.plugin_id)
+                || plugin.validate_for(&native, &plugin.plugin_id).is_err()
+            {
+                return Err(ClientError::Protocol(
+                    "invalid candidate producer or correlation".into(),
+                ));
+            }
+        }
+        Ok(response)
+    }
+
+    /// Discover exact execution members without materializing an unrelated provider account.
+    /// Native advertisements retain unknown entitlement/readiness unless independently proven.
+    /// # Errors
+    /// Rejects invalid requests, mismatched responses, transport and application failures.
+    pub async fn discover_execution_catalog(
+        &self,
+        request: bcode_ipc::harness::ManagedExecutionCatalogRequest,
+    ) -> Result<bcode_ipc::harness::ManagedExecutionCatalog, ClientError> {
+        request
+            .validate()
+            .map_err(|message| ClientError::Protocol(message.into()))?;
+        let response: bcode_ipc::harness::ManagedExecutionCatalog = self
+            .execution_request(ManagedSessionOperation::ExecutionCatalog, &request)
+            .await?;
+        if response.request_id != request.request_id
+            || response.models.len() > 16 * bcode_harness_models::MAX_HARNESS_MODELS + 4096
+            || response.issues.len() > 17
+        {
+            return Err(ClientError::Protocol(
+                "invalid execution catalog response".into(),
+            ));
+        }
+        Ok(response)
+    }
+
+    /// Start an exact selected managed session through canonical host admission only.
+    /// No legacy Open, provider fallback or local native invocation is attempted on failure.
+    /// # Errors
+    /// Returns unsupported while selected-launch persistence is unpublished; also rejects
+    /// invalid requests, unavailable readiness and uncorrelated responses.
+    pub async fn start_selected_session(
+        &self,
+        request: bcode_ipc::harness::ManagedSelectedStartRequest,
+    ) -> Result<bcode_ipc::harness::ManagedSelectedStartResponse, ClientError> {
+        request
+            .validate()
+            .map_err(|message| ClientError::Protocol(message.into()))?;
+        let response: bcode_ipc::harness::ManagedSelectedStartResponse = self
+            .execution_request(ManagedSessionOperation::StartSelected, &request)
+            .await?;
+        let native = bcode_harness_models::HarnessModelsRequest {
+            schema_version: bcode_harness_models::HARNESS_SCHEMA_VERSION,
+            request_id: request.open.open_id.clone(),
+            instance: request.instance.clone(),
+            kind: bcode_harness_models::HarnessModelsRequestKind::OpenSelected {
+                open: Box::new(request.open),
+                selection: bcode_harness_models::HarnessModelSelection {
+                    model_id: request.selection.model_id.clone(),
+                },
+            },
+        };
+        response
+            .response
+            .validate_for(&native)
+            .map_err(|_| ClientError::Protocol("invalid selected start response".into()))?;
+        if response.selection.requested.model_id != request.selection.model_id
+            || response.selection.requested.route != request.selection.route
+            || response.selection.requested.account_reference != request.selection.account_reference
+            || response.selection.target.route
+                != request
+                    .selection
+                    .route
+                    .clone()
+                    .ok_or_else(|| ClientError::Protocol("selected route is missing".into()))?
+            || response.selection.target.model.model_id != request.selection.model_id
+            || matches!(
+                &response.response.kind,
+                bcode_harness_models::HarnessModelsResponseKind::Failure(_)
+            )
+        {
+            return Err(ClientError::Protocol(
+                "selected start response changed selection".into(),
+            ));
+        }
+        if let bcode_harness_models::HarnessModelsResponseKind::Selected { evidence, .. } =
+            &response.response.kind
+            && response.selection.target.confirmed_model_id != evidence.effective_model_id
+        {
+            return Err(ClientError::Protocol(
+                "selected response changed effective-model evidence".into(),
+            ));
+        }
+        let kind_matches = matches!(
+            &response.response.kind,
+            bcode_harness_models::HarnessModelsResponseKind::Selected { .. }
+        );
+        if !kind_matches {
+            return Err(ClientError::Protocol(
+                "selected start did not acknowledge selection".into(),
+            ));
+        }
+        Ok(response)
+    }
+
+    async fn execution_request<T: serde::Serialize + Sync, R: serde::de::DeserializeOwned>(
+        &self,
+        operation: ManagedSessionOperation,
+        request: &T,
+    ) -> Result<R, ClientError> {
+        let envelope = ManagedSessionRequest {
+            schema_version: bcode_ipc::harness::MANAGED_SESSION_VERSION,
+            operation,
+            request_json: serde_json::to_string(request)
+                .map_err(|_| ClientError::Protocol("invalid execution request".into()))?,
+        };
+        let payload = serde_json::to_vec(&envelope)
+            .map_err(|_| ClientError::Protocol("invalid execution envelope".into()))?;
+        let response = self
+            .call_plugin_service(
+                MANAGED_SESSION_INTERFACE_ID.into(),
+                operation.as_str().into(),
+                payload,
+            )
+            .await?;
+        if response.error.is_some()
+            || response.payload.len() > bcode_harness_models::MAX_HARNESS_WIRE_BYTES
+        {
+            return Err(ClientError::Protocol(
+                "execution application request failed".into(),
+            ));
+        }
+        serde_json::from_slice(&response.payload)
+            .map_err(|_| ClientError::Protocol("invalid execution application response".into()))
     }
 
     /// Invoke only managed-session operations or configured-instance discovery/preparation.
@@ -165,7 +348,19 @@ fn validate_route(interface: &str, operation: &str, payload: &[u8]) -> Result<()
     if operation != request.operation.as_str() {
         return Err(invalid());
     }
-    if request.operation == ManagedSessionOperation::History {
+    if request.operation == ManagedSessionOperation::PrepareCandidate {
+        let query: bcode_harness_models::HarnessPrepareCandidateRequest =
+            serde_json::from_str(&request.request_json).map_err(|_| invalid())?;
+        query.validate().map_err(|_| invalid())?;
+    } else if request.operation == ManagedSessionOperation::DiscoverCandidates {
+        let query: bcode_ipc::harness::ManagedCandidatesRequest =
+            serde_json::from_str(&request.request_json).map_err(|_| invalid())?;
+        query.validate().map_err(|_| invalid())?;
+    } else if request.operation == ManagedSessionOperation::ExecutionCatalog {
+        request.decode_execution_catalog().map_err(|_| invalid())?;
+    } else if request.operation == ManagedSessionOperation::StartSelected {
+        request.decode_selected_start().map_err(|_| invalid())?;
+    } else if request.operation == ManagedSessionOperation::History {
         request.decode_history().map_err(|_| invalid())?;
     } else if request.operation == ManagedSessionOperation::Recover {
         request.decode_recovery().map_err(|_| invalid())?;

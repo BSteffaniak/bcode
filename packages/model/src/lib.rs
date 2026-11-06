@@ -23,6 +23,8 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 
 pub mod diagnostics;
+/// Portable execution-route catalog contracts; no harness implementation dependency.
+pub mod execution;
 pub mod history;
 pub mod host_operation;
 pub mod image_upload;

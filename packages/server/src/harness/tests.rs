@@ -232,6 +232,58 @@ impl ManagedHarnessStore for Store {
     {
         std::future::poll_fn(move |_| std::task::Poll::Ready(Ok(None)))
     }
+    fn claim_selected(
+        &self,
+        owner: &HarnessOwner,
+        request: &HarnessModelsRequest,
+    ) -> impl std::future::Future<
+        Output = Result<super::store::SelectedDeliveryClaim, ManagedHarnessError>,
+    > + Send {
+        let result = (|| {
+            self.verify(owner)?;
+            let bytes = serde_json::to_vec(request).unwrap();
+            let mut claims = self.claims.lock().unwrap();
+            if let Some(previous) = claims.get(&request.request_id) {
+                if previous != &bytes {
+                    return Err(ManagedHarnessError::Conflict);
+                }
+                return Ok(self
+                    .completed
+                    .lock()
+                    .unwrap()
+                    .get(&request.request_id)
+                    .map_or(super::store::SelectedDeliveryClaim::Uncertain, |response| {
+                        super::store::SelectedDeliveryClaim::Recorded(Box::new(
+                            serde_json::from_slice(response).unwrap(),
+                        ))
+                    }));
+            }
+            claims.insert(request.request_id.clone(), bytes);
+            drop(claims);
+            Ok(super::store::SelectedDeliveryClaim::New)
+        })();
+        async move { result }
+    }
+
+    fn commit_selected(
+        &self,
+        owner: &HarnessOwner,
+        request: &HarnessModelsRequest,
+        response: &HarnessModelsResponse,
+    ) -> impl std::future::Future<Output = Result<(), ManagedHarnessError>> + Send {
+        let result = self.verify(owner).and_then(|()| {
+            response
+                .validate_for(request)
+                .map_err(|_| ManagedHarnessError::Invalid)?;
+            self.completed.lock().unwrap().insert(
+                request.request_id.clone(),
+                serde_json::to_vec(response).unwrap(),
+            );
+            Ok(())
+        });
+        async move { result }
+    }
+
     async fn retention_context(
         &self,
         owner: &HarnessOwner,
@@ -603,6 +655,135 @@ async fn interruption_uncertainty_does_not_become_settlement_or_repeat_signal() 
         ManagedHarnessError::Uncertain
     );
     assert_eq!(native.0.load(Ordering::SeqCst), 1);
+}
+
+#[derive(Clone)]
+struct SelectedAck(Arc<AtomicUsize>);
+impl ManagedHarnessTransport for SelectedAck {
+    async fn invoke(
+        &self,
+        _: &HarnessRequest,
+    ) -> Result<HarnessServiceResponse, ManagedHarnessError> {
+        tokio::task::yield_now().await;
+        panic!("selected Open must never use legacy transport")
+    }
+    async fn invoke_selected(
+        &self,
+        request: &HarnessModelsRequest,
+    ) -> Result<HarnessModelsResponse, ManagedHarnessError> {
+        tokio::task::yield_now().await;
+        self.0.fetch_add(1, Ordering::SeqCst);
+        let HarnessModelsRequestKind::OpenSelected { open, selection } = &request.kind else {
+            return Err(ManagedHarnessError::Invalid);
+        };
+        Ok(HarnessModelsResponse {
+            schema_version: request.schema_version,
+            request_id: request.request_id.clone(),
+            instance_id: request.instance.instance_id.clone(),
+            kind: HarnessModelsResponseKind::Selected {
+                target: HarnessSessionTarget::Prepared(HarnessPreparedSession {
+                    open_id: open.open_id.clone(),
+                    session_id: open.session_id.clone(),
+                    instance_id: request.instance.instance_id.clone(),
+                    generation: open.generation,
+                    native_version: "1".into(),
+                    requested_native_session_id: None,
+                }),
+                evidence: HarnessModelEvidence {
+                    requested_model_id: selection.model_id.clone(),
+                    effective_model_id: None,
+                },
+            },
+        })
+    }
+}
+
+#[tokio::test]
+async fn selected_open_exact_completed_retry_returns_evidence_without_transport() {
+    let store = Store::new();
+    let owner = store.owner.clone();
+    let selected = store.load(&owner).await.unwrap();
+    let calls = Arc::new(AtomicUsize::new(0));
+    let runtime = ManagedHarnessRuntime::new(store.clone(), SelectedAck(Arc::clone(&calls)));
+    let mut request = HarnessModelsRequest {
+        schema_version: HARNESS_SCHEMA_VERSION,
+        request_id: "selected-open".into(),
+        instance: selected.instance,
+        kind: HarnessModelsRequestKind::OpenSelected {
+            open: Box::new(HarnessOpenRequest {
+                open_id: "selected-open".into(),
+                session_id: owner.session_id.to_string(),
+                generation: owner.generation,
+                working_directory: "/workspace".into(),
+                resume: None,
+                parent_assistance: None,
+            }),
+            selection: HarnessModelSelection {
+                model_id: "exact-model".into(),
+            },
+        },
+    };
+    let first = runtime.open_selected(&owner, &request).await.unwrap();
+    let retry = runtime.open_selected(&owner, &request).await.unwrap();
+    assert_eq!(
+        serde_json::to_value(&first).unwrap(),
+        serde_json::to_value(&retry).unwrap()
+    );
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+    if let HarnessModelsRequestKind::OpenSelected { selection, .. } = &mut request.kind {
+        selection.model_id = "replacement".into();
+    }
+    assert!(matches!(
+        runtime.open_selected(&owner, &request).await,
+        Err(ManagedHarnessError::Conflict)
+    ));
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
+async fn selected_open_failed_delivery_is_not_replayed_or_replaced() {
+    let store = Store::new();
+    let owner = store.owner.clone();
+    let selected = store.load(&owner).await.unwrap();
+    let calls = Arc::new(AtomicUsize::new(0));
+    let runtime = ManagedHarnessRuntime::new(store.clone(), LostAck(Arc::clone(&calls)));
+    let request = HarnessModelsRequest {
+        schema_version: HARNESS_SCHEMA_VERSION,
+        request_id: "selected-open".into(),
+        instance: selected.instance,
+        kind: HarnessModelsRequestKind::OpenSelected {
+            open: Box::new(HarnessOpenRequest {
+                open_id: "selected-open".into(),
+                session_id: owner.session_id.to_string(),
+                generation: owner.generation,
+                working_directory: "/workspace".into(),
+                resume: None,
+                parent_assistance: None,
+            }),
+            selection: HarnessModelSelection {
+                model_id: "exact-model".into(),
+            },
+        },
+    };
+    assert!(matches!(
+        runtime.open_selected(&owner, &request).await,
+        Err(ManagedHarnessError::Uncertain)
+    ));
+    assert!(matches!(
+        runtime.open_selected(&owner, &request).await,
+        Err(ManagedHarnessError::Uncertain)
+    ));
+    let mut conflicting = request;
+    if let HarnessModelsRequestKind::OpenSelected { selection, .. } = &mut conflicting.kind {
+        selection.model_id = "different-model".into();
+    }
+    assert!(matches!(
+        runtime.open_selected(&owner, &conflicting).await,
+        Err(ManagedHarnessError::Conflict)
+    ));
+    // Selected failure never invokes the legacy transport entry point.
+    assert_eq!(calls.load(Ordering::SeqCst), 0);
+    assert_eq!(store.claims.lock().unwrap().len(), 1);
 }
 
 #[tokio::test]

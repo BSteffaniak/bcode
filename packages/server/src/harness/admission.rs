@@ -64,9 +64,7 @@ impl CanonicalManagedAdmission {
         F: FnOnce(bcode_harness_models::HarnessRequest) -> Fut + Send,
         Fut: Future<Output = Result<(), ManagedHarnessError>> + Send,
     {
-        if bcode_session_models::CURRENT_SESSION_EVENT_SCHEMA_VERSION < 56
-            || bcode_session_models::CURRENT_SESSION_STORAGE_WRITER_EPOCH < 24
-        {
+        if !crate::harness::recovery_published() {
             return Err(ManagedHarnessError::Unsupported);
         }
         let ManagedCaller::Client(client_id) = caller else {
@@ -116,7 +114,10 @@ impl CanonicalManagedAdmission {
             // receipt/authority owner must implement its own explicit recovery journey.
             return Err(ManagedHarnessError::Unsupported);
         }
-        let resume_request = recovery.resume_request.request();
+        let resume_request = recovery
+            .resume_request
+            .request()
+            .map_err(|_| ManagedHarnessError::Invalid)?;
         let HarnessRequestKind::Open(open) = &resume_request.kind else {
             return Err(ManagedHarnessError::Invalid);
         };
@@ -135,7 +136,13 @@ impl CanonicalManagedAdmission {
             return Err(ManagedHarnessError::Conflict);
         }
         self.store.verify_recovery_lifetime(&recovery.release)?;
-        validate_resume(recovery.resume_request.request()).await?;
+        validate_resume(
+            recovery
+                .resume_request
+                .request()
+                .map_err(|_| ManagedHarnessError::Invalid)?,
+        )
+        .await?;
         // Recheck current caller admission after plugin preflight; authority is not a
         // property of a previously selected session or retained recovery payload.
         if self.authorize(caller, session_id, false).await? != cwd
@@ -728,6 +735,146 @@ impl CanonicalManagedAdmission {
         })
     }
 
+    async fn selected_workspace(
+        &self,
+        caller: &ManagedCaller,
+        request: &bcode_ipc::harness::ManagedSelectedStartRequest,
+        creating: bool,
+    ) -> Result<(PathBuf, Option<crate::workflow_operations::AuthorityGuard>), ManagedHarnessError>
+    {
+        let target = request
+            .open
+            .session_id
+            .parse::<SessionId>()
+            .map_err(|_| ManagedHarnessError::Invalid)?;
+        if let ManagedCaller::Workflow {
+            run_id,
+            dispatch_identity,
+            session_id,
+            plugin_id,
+        } = caller
+        {
+            let state = self.store.state()?;
+            let guard = crate::harness_workflow::authorize_selected_start(
+                &state,
+                run_id,
+                dispatch_identity,
+                *session_id,
+                plugin_id,
+                request,
+            )
+            .await
+            .map_err(|_| ManagedHarnessError::StaleOwner)?;
+            crate::session_operations::require_selected_location(&state, target)
+                .await
+                .map_err(|_| ManagedHarnessError::StaleOwner)?;
+            let summary = state
+                .sessions
+                .session_summary(target)
+                .await
+                .map_err(|_| ManagedHarnessError::Storage)?;
+            drop(state);
+            return Ok((
+                canonical_directory(&summary.working_directory).await?,
+                Some(guard),
+            ));
+        }
+        Ok((self.authorize(caller, target, creating).await?, None))
+    }
+
+    /// Authorize a retained selected result without granting transport or replay authority.
+    pub(super) async fn authorize_selected_history(
+        &self,
+        caller: &ManagedCaller,
+        request: &bcode_ipc::harness::ManagedSelectedStartRequest,
+    ) -> Result<(), ManagedHarnessError> {
+        request
+            .validate()
+            .map_err(|_| ManagedHarnessError::Invalid)?;
+        let session_id = request
+            .open
+            .session_id
+            .parse::<SessionId>()
+            .map_err(|_| ManagedHarnessError::Invalid)?;
+        let (cwd, _workflow_guard) = self.selected_workspace(caller, request, false).await?;
+        let state = self.store.state()?;
+        let summary = state
+            .sessions
+            .session_summary(session_id)
+            .await
+            .map_err(|_| ManagedHarnessError::Storage)?;
+        if summary.parent_id != request.parent_session_id
+            || canonical_directory(&summary.working_directory).await? != cwd
+            || canonical_directory(Path::new(&request.open.working_directory)).await? != cwd
+        {
+            return Err(ManagedHarnessError::Conflict);
+        }
+        let selected = state
+            .sessions
+            .session_external_harness_state(session_id)
+            .await
+            .map_err(|_| ManagedHarnessError::Storage)?;
+        match selected {
+            Some(selected) if selected.instance == request.instance => {}
+            None if matches!(caller, ManagedCaller::Workflow { .. })
+                && summary.execution.is_some() => {}
+            _ => return Err(ManagedHarnessError::Conflict),
+        }
+        Self::enabled(&state, &request.instance)?;
+        drop(state);
+        Ok(())
+    }
+
+    /// Admit the immutable selected intent without performing discovery or native mutation.
+    /// The selected canonical prepare step must follow before any native inspection.
+    pub(super) async fn selected_open_owner(
+        &self,
+        caller: &ManagedCaller,
+        request: &bcode_ipc::harness::ManagedSelectedStartRequest,
+    ) -> Result<HarnessOwner, ManagedHarnessError> {
+        request
+            .validate()
+            .map_err(|_| ManagedHarnessError::Invalid)?;
+        if request.open.parent_assistance.is_some() {
+            return Err(ManagedHarnessError::Unsupported);
+        }
+        let session_id = request
+            .open
+            .session_id
+            .parse::<SessionId>()
+            .map_err(|_| ManagedHarnessError::Invalid)?;
+        let (cwd, _workflow_guard) = self.selected_workspace(caller, request, true).await?;
+        if canonical_directory(Path::new(&request.open.working_directory)).await? != cwd {
+            return Err(ManagedHarnessError::StaleOwner);
+        }
+        match caller {
+            ManagedCaller::Invocation {
+                session_id: source, ..
+            } if request.parent_session_id != Some(*source) => {
+                return Err(ManagedHarnessError::StaleOwner);
+            }
+            ManagedCaller::Client(_) => {
+                if let Some(parent) = request.parent_session_id {
+                    self.authorize(caller, parent, false).await?;
+                }
+            }
+            ManagedCaller::Workflow { .. } | ManagedCaller::Invocation { .. } => {}
+        }
+        let state = self.store.state()?;
+        Self::enabled(&state, &request.instance)?;
+        let owner = Self::daemon_owner(&state, session_id, 1)?;
+        let root = state
+            .sessions
+            .session_store_root()
+            .ok_or(ManagedHarnessError::Storage)?;
+        initialize_primary_sessions_root(&root).await?;
+        crate::session_operations::require_selected_location(&state, session_id)
+            .await
+            .map_err(|_| ManagedHarnessError::StaleOwner)?;
+        drop(state);
+        Ok(owner)
+    }
+
     async fn prepare_open(
         &self,
         caller: &ManagedCaller,
@@ -820,6 +967,26 @@ impl CanonicalManagedAdmission {
         )
         .await?;
         Ok(owner)
+    }
+
+    pub(super) async fn inspect_selected_creation(
+        &self,
+        request: &bcode_ipc::harness::ManagedSelectedStartRequest,
+    ) -> Result<bcode_harness_models::HarnessInspection, ManagedHarnessError> {
+        let call = ManagedSessionCall {
+            session_id: None,
+            harness: HarnessRequest {
+                schema_version: HARNESS_SCHEMA_VERSION,
+                request_id: request.open.open_id.clone(),
+                instance: request.instance.clone(),
+                kind: HarnessRequestKind::Open(request.open.clone()),
+            },
+            parent_session_id: request.parent_session_id.map(|id| id.to_string()),
+            assistance_destination_session_id: None,
+        };
+        // This legacy-shaped object is used only for read-only inspection. It is never
+        // prepared, claimed or delivered as Open; selected persistence owns those steps.
+        self.inspect_creation(&call).await
     }
 
     async fn inspect_creation(

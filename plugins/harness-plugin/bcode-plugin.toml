@@ -18,7 +18,7 @@ name                  = "Managed External Session Commands"
 [[services]]
 class                 = "service"
 interface_id          = "bcode.harness.configuration/v1"
-invocation_operations = ["catalog", "prepare"]
+invocation_operations = ["catalog", "prepare", "prepare_setup"]
 name                  = "Configured Managed Harness Instances"
 
 [[services]]

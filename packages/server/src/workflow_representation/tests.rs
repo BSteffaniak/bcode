@@ -147,23 +147,16 @@ async fn exact_new_status_and_detachment_do_not_acquire_execution_authority() {
         .expect("status does not wait for owner publication")
         .expect("status")
         .expect("new run");
-    // Status is independently readable, but authority routing must still
-    // serialize with the owner queue instead of competing with its writer.
-    {
-        let path = crate::workflow_store_path(&state);
-        let routing = lookup_at(&path, "new");
-        tokio::pin!(routing);
-        assert!(
-            tokio::time::timeout(std::time::Duration::from_millis(20), &mut routing)
-                .await
-                .is_err()
-        );
-        drop(held);
-        assert!(matches!(
-            routing.await.expect("routing after publication"),
-            RunLookup::Available(_)
-        ));
-    }
+    // Classification is also a snapshot, not execution authority. It must not reenter
+    // a publication queue held by cancellation/receipt owners.
+    let path = crate::workflow_store_path(&state);
+    let classified =
+        tokio::time::timeout(std::time::Duration::from_secs(5), lookup_at(&path, "new"))
+            .await
+            .expect("classification does not acquire publication ownership")
+            .expect("classification");
+    assert!(matches!(classified, RunLookup::Available(_)));
+    drop(held);
     assert_eq!(run.parent_session_id.as_deref(), Some("parent"));
     assert_eq!(run.status, bcode_workflow::RunStatus::Paused);
     assert!(require_legacy(&state, "new").await.is_err());
@@ -892,6 +885,21 @@ async fn owner_admission_waits_for_store_writer_and_rechecks_authority() {
             .expect("released writer")
             .is_none()
     );
+    let external_writer = open(&path, true).expect("independent writer connection");
+    let writer_transaction = external_writer
+        .begin_transaction_with_mode(switchy_database::TransactionMode::Immediate)
+        .await
+        .expect("independent writer slot");
+    assert!(
+        owner::check_owner_admission(&state, &dispatch, &guard.authority)
+            .await
+            .expect("read-only admission with independent writer")
+            .is_none()
+    );
+    writer_transaction
+        .rollback()
+        .await
+        .expect("release writer slot");
     let mut obsolete_authority = guard.authority.clone();
     obsolete_authority.fencing_token = "stale-owner".into();
     assert!(
@@ -2588,7 +2596,7 @@ async fn pending_receipt_publication_cancellation_retains_accepted_turn_observer
     let owned_dispatch = dispatch.clone();
     let owned_gate = gate.clone();
     let mut outer = tokio::spawn(async move {
-        crate::dispatch_workflow_prompt_turn_with_publication_hook(
+        Box::pin(crate::dispatch_workflow_prompt_turn_with_publication_hook(
             &owned_state,
             &owned_dispatch,
             || async move {
@@ -2602,7 +2610,7 @@ async fn pending_receipt_publication_cancellation_retains_accepted_turn_observer
                     .expect("transfer fixture-owned write guard");
                 Ok(())
             },
-        )
+        ))
         .await
     });
     let held = acquired.await.expect("write guard acquired");
@@ -2708,7 +2716,7 @@ async fn publication_cancellation_retains_accepted_turn_observer() {
     let owned_state = std::sync::Arc::clone(&state);
     let owned_dispatch = dispatch.clone();
     let mut outer = tokio::spawn(async move {
-        crate::dispatch_workflow_prompt_turn_with_publication_hook(
+        Box::pin(crate::dispatch_workflow_prompt_turn_with_publication_hook(
             &owned_state,
             &owned_dispatch,
             || async move {
@@ -2716,7 +2724,7 @@ async fn publication_cancellation_retains_accepted_turn_observer() {
                 waiting.await.expect("publication release");
                 Ok(())
             },
-        )
+        ))
         .await
     });
     reached.await.expect("hook reached");

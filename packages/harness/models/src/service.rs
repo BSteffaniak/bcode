@@ -608,7 +608,11 @@ impl HarnessServiceResponse {
         Ok(())
     }
 }
-fn validate_open_request(
+/// Validate the bounded Open envelope against its exact native instance.
+///
+/// # Errors
+/// Rejects invalid identities, working directories, generations, or resume bindings.
+pub fn validate_open_request(
     value: &HarnessOpenRequest,
     instance: &HarnessInstance,
 ) -> Result<(), HarnessContractError> {

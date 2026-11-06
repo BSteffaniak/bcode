@@ -19,6 +19,15 @@ pub fn handle_model_picker_key(
     provider_plugin_id: Option<&str>,
     stroke: KeyStroke,
 ) -> ModelPickerAction {
+    if picker.is_execution_picker()
+        && matches!(
+            keymap.action("model_picker_actions", stroke),
+            Some("tui.model.check" | "tui.model.ignore" | "tui.model.unignore")
+        )
+    {
+        picker.set_status("Execution discovery does not authorize provider checks or provider-specific ignore changes");
+        return ModelPickerAction::Continue;
+    }
     match picker.mode() {
         model_picker::ModelPickerMode::ConfirmCheck => {
             match keymap.action("model_picker_actions", stroke) {

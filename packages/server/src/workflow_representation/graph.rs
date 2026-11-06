@@ -199,6 +199,7 @@ impl AuthenticatedExecution {
         &self,
         batch: &bcode_workflow::WorkflowRunGraphEditBatch,
     ) -> Result<bool, ServerError> {
+        crate::workflow_operations::execution_selection::require_edit_dispatch_support(batch)?;
         if self.source.kind == bcode_workflow::NodeKind::Agent {
             let configuration: crate::WorkflowPromptConfiguration =
                 serde_json::from_value(self.source.configuration.clone())
@@ -223,6 +224,7 @@ impl AuthenticatedExecution {
         &self,
         batch: &bcode_workflow::WorkflowRunGraphEditBatch,
     ) -> Result<bcode_workflow::WorkflowRunGraphPublicationStatus, ServerError> {
+        crate::workflow_operations::execution_selection::require_edit_dispatch_support(batch)?;
         self.verify_retained_path()?;
         let db = open(&self.path, true)?;
         super::backpressure::queued(&self.path, || {
@@ -241,6 +243,7 @@ impl AuthenticatedExecution {
         &self,
         batch: &bcode_workflow::WorkflowRunGraphEditBatch,
     ) -> Result<u64, ServerError> {
+        crate::workflow_operations::execution_selection::require_edit_dispatch_support(batch)?;
         self.verify_retained_path()?;
         let db = open(&self.path, true)?;
         representation::execution_graph::publication_from_execution(
