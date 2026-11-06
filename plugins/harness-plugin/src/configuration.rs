@@ -145,14 +145,21 @@ fn catalog(context: &NativeServiceContext) -> Result<InstanceCatalog, ServiceRes
             "invalid managed instance configuration",
         )
     };
-    serde_json::to_writer(Budget(MAX_CONFIG_BYTES), &context.config.config)
-        .map_err(|_| invalid())?;
-    let settings: Settings = context.config().map_err(|_| invalid())?;
-    if !settings.enabled {
-        return Err(ServiceResponse::error(
+    let disabled = || {
+        ServiceResponse::error(
             "configuration_disabled",
             "managed instance configuration is disabled",
-        ));
+        )
+    };
+    // An absent section means the feature is unconfigured, not a malformed configuration.
+    let raw = &context.config.config;
+    if raw.is_null() || raw.as_object().is_some_and(serde_json::Map::is_empty) {
+        return Err(disabled());
+    }
+    serde_json::to_writer(Budget(MAX_CONFIG_BYTES), raw).map_err(|_| invalid())?;
+    let settings: Settings = context.config().map_err(|_| invalid())?;
+    if !settings.enabled {
+        return Err(disabled());
     }
     if settings.instances.len() > MAX_INSTANCES {
         return Err(invalid());

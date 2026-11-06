@@ -155,12 +155,7 @@ fn invalid_disabled_and_mismatched_configuration_fails_closed() {
 fn malformed_and_secret_bearing_settings_never_escape_in_errors() {
     let mut config = settings();
     config["instances"]["primary"]["instance"]["auth"]["api_key"] = json!("private-value");
-    for config in [
-        config,
-        Value::Null,
-        json!({}),
-        json!({"enabled": true, "instances": []}),
-    ] {
+    for config in [config, json!({"enabled": true, "instances": []})] {
         let response = invoke(config, CATALOG_OPERATION, &json!({}));
         assert_eq!(
             response.error.as_ref().unwrap().code,
@@ -168,6 +163,19 @@ fn malformed_and_secret_bearing_settings_never_escape_in_errors() {
         );
         assert_eq!(response.payload, Vec::<u8>::new());
         assert!(!response.error.unwrap().message.contains("private-value"));
+    }
+}
+
+#[test]
+fn absent_configuration_is_unconfigured_rather_than_invalid() {
+    for config in [Value::Null, json!({})] {
+        for (operation, payload) in [
+            (CATALOG_OPERATION, json!({})),
+            (PREPARE_OPERATION, json!({"selection": {"kind": "default"}})),
+        ] {
+            let response = invoke(config.clone(), operation, &payload);
+            assert_eq!(response.error.unwrap().code, "configuration_disabled");
+        }
     }
 }
 
