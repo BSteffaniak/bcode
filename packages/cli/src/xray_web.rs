@@ -18,6 +18,15 @@ pub struct XrayWebArgs {
     /// Open on serving host even through SSH.
     #[arg(long)]
     pub local_browser: bool,
+    /// Interface to bind; wildcard listeners require --advertise-host.
+    #[arg(long, default_value = "127.0.0.1")]
+    pub host: std::net::IpAddr,
+    /// Listening port; zero selects an available port.
+    #[arg(long, default_value_t = 0)]
+    pub port: u16,
+    /// Exact IP address visitors use (required when --host is unspecified).
+    #[arg(long)]
+    pub advertise_host: Option<std::net::IpAddr>,
     /// Require a one-time browser pairing ticket or code.
     #[arg(long, action = clap::ArgAction::SetTrue)]
     pub require_pairing: Option<bool>,
@@ -49,6 +58,9 @@ fn options(args: &XrayWebArgs) -> bcode_xray_inspector::LaunchOptions {
         deep: args.deep,
         lifetime_seconds: args.lifetime_seconds,
         local_browser: args.local_browser,
+        host: args.host,
+        port: args.port,
+        advertise_host: args.advertise_host,
         pairing: if args.require_pairing.unwrap_or(false) {
             bcode_xray_inspector::PairingMode::Required
         } else {

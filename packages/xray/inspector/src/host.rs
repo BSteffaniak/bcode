@@ -49,6 +49,9 @@ pub struct XrayWebArgs {
     /// Endpoint Origin grant lifetime; expiry stops this launcher, not session execution.
     pub lifetime_seconds: u64,
     pub local_browser: bool,
+    pub host: std::net::IpAddr,
+    pub port: u16,
+    pub advertise_host: Option<std::net::IpAddr>,
     pub pairing: crate::PairingMode,
 }
 
@@ -124,7 +127,7 @@ struct HostState {
 /// Serve only after assets and endpoint authorization are ready. Always revoke our endpoint on exit.
 ///
 /// # Errors
-/// Returns an error for unavailable/unconfined assets, unavailable loopback hosting,
+/// Returns an error for unavailable/unconfined assets, unavailable inspector hosting,
 /// rejected session capability provisioning, or unconfirmed endpoint revocation.
 pub async fn run(
     owner: bcode_client::BcodeClient,
@@ -132,25 +135,23 @@ pub async fn run(
     shutdown: tokio::sync::watch::Receiver<bool>,
     ready: tokio::sync::oneshot::Sender<()>,
 ) -> Result<(), CliError> {
+    browser_address(args, args.port)?;
     let assets = launch_assets(args.asset_dir.as_deref())?;
-    let listener = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+    let listener = tokio::net::TcpListener::bind((args.host, args.port))
         .await
-        .map_err(|_| invalid("could not bind loopback inspector listener"))?;
-    let authority = listener
-        .local_addr()
-        .map_err(|_| invalid("inspector listener address unavailable"))?
-        .to_string();
-    let origin = format!("http://{authority}");
+        .map_err(|_| invalid("could not bind inspector listener"))?;
+    browser_address(
+        args,
+        listener
+            .local_addr()
+            .map_err(|_| invalid("inspector address unavailable"))?
+            .port(),
+    )?;
     let mut connection = owner.connect("bcode-xray-web").await?;
     let endpoint = connection
-        .open_xray_endpoint_with_origin(
-            args.session_id,
-            args.deep,
-            Some(bcode_ipc::XrayOriginGrantRequest {
-                origin: origin.clone(),
-                lifetime_seconds: args.lifetime_seconds,
-            }),
-        )
+        // Only this native gateway accesses the daemon endpoint. Browser Origin
+        // authorization is enforced here, never broadened on the daemon host.
+        .open_xray_endpoint_with_origin(args.session_id, args.deep, None)
         .await?;
     // This task also revokes if the launch future is cancelled/dropped mid-flight.
     let endpoint_id = endpoint.endpoint_id.clone();
@@ -205,8 +206,9 @@ pub async fn run_demo(
     shutdown: tokio::sync::watch::Receiver<bool>,
     ready: tokio::sync::oneshot::Sender<()>,
 ) -> Result<(), CliError> {
+    browser_address(args, args.port)?;
     let assets = launch_assets(args.asset_dir.as_deref())?;
-    let listener = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+    let listener = tokio::net::TcpListener::bind((args.host, args.port))
         .await
         .map_err(|_| invalid("could not bind synthetic inspector listener"))?;
     let csp = content_security_policy("http://127.0.0.1:1/")?;
@@ -217,6 +219,9 @@ pub async fn run_demo(
         deep: true,
         lifetime_seconds: args.lifetime_seconds,
         local_browser: args.local_browser,
+        host: args.host,
+        port: args.port,
+        advertise_host: args.advertise_host,
         pairing: args.pairing,
     };
     eprintln!("SYNTHETIC X-ray demo. No session is opened and no model/provider request is made.");
@@ -241,10 +246,10 @@ async fn host(
     mut shutdown_request: tokio::sync::watch::Receiver<bool>,
     ready: tokio::sync::oneshot::Sender<()>,
 ) -> Result<(), CliError> {
-    let authority = listener
+    let address = listener
         .local_addr()
-        .map_err(|_| invalid("inspector listener address unavailable"))?
-        .to_string();
+        .map_err(|_| invalid("inspector address unavailable"))?;
+    let authority = browser_address(args, address.port())?.to_string();
     let origin = format!("http://{authority}");
     let code = pairing_code()?;
     let capability = pairing_code()?;
@@ -259,7 +264,7 @@ async fn host(
             stopped,
             assets,
             pairing: Mutex::new(Pairing {
-                required: true,
+                required: args.pairing == crate::PairingMode::Required,
                 code: code.clone(),
                 expires: Instant::now() + PAIRING_LIFETIME,
                 attempts: PAIRING_ATTEMPTS,
@@ -274,6 +279,9 @@ async fn host(
             }),
         });
         eprintln!("X-ray inspector: {origin}/");
+        if !args.host.is_loopback() {
+            eprintln!("WARNING: network-accessible inspector over unencrypted HTTP. Without --require-pairing, anyone who can reach this port can observe this session.");
+        }
         let browser_url = if args.pairing == crate::PairingMode::Required {
             eprintln!("Enter this one-time pairing code in the inspector (expires in 45 seconds): {code}");
             format!("{origin}/#xray-ticket={code}")
@@ -281,10 +289,10 @@ async fn host(
             format!("{origin}/")
         };
         eprintln!("Observation only. Ctrl-C closes this endpoint, not the session.");
-        let remote = !args.local_browser && (std::env::var_os("SSH_CONNECTION").is_some()
+        let remote = !args.host.is_loopback() || (!args.local_browser && (std::env::var_os("SSH_CONNECTION").is_some()
             || std::env::var_os("SSH_CLIENT").is_some()
-            || std::env::var_os("SSH_TTY").is_some());
-        if remote {
+            || std::env::var_os("SSH_TTY").is_some()));
+        if remote && args.host.is_loopback() {
             let port = listener.local_addr().map_err(|_| invalid("inspector address unavailable"))?.port();
             eprintln!("SSH: forward this single port, preserving the local port: ssh -L {port}:127.0.0.1:{port} <your-ssh-destination>");
             eprintln!("Then open {origin}/ locally. If pairing is enabled, enter the printed code. The SSH destination is not inferred.");
@@ -320,6 +328,21 @@ async fn host(
     }.await;
     stop.send_replace(true);
     result
+}
+
+fn browser_address(args: &XrayWebArgs, port: u16) -> Result<std::net::SocketAddr, CliError> {
+    let host = args.advertise_host.unwrap_or(args.host);
+    if host.is_unspecified() || host.is_multicast() || host == std::net::Ipv4Addr::BROADCAST {
+        return Err(invalid(
+            "provide a concrete --advertise-host IP for wildcard listeners",
+        ));
+    }
+    if host.is_ipv4() != args.host.is_ipv4() {
+        return Err(invalid(
+            "listener and advertised IP must use the same address family",
+        ));
+    }
+    Ok(std::net::SocketAddr::new(host, port))
 }
 
 fn pairing_code() -> Result<String, CliError> {
@@ -389,11 +412,14 @@ fn authorized_request(state: &HostState, request: &Request, bootstrap: bool) -> 
     let site = single_header(headers, "sec-fetch-site");
     if bootstrap {
         origin == Some(state.origin.as_str())
-            && site == Some("same-origin")
-            && single_header(headers, "sec-fetch-dest") == Some("empty")
+            && ((site == Some("same-origin")
+                && single_header(headers, "sec-fetch-dest") == Some("empty"))
+                || (!headers.contains_key("sec-fetch-site")
+                    && !headers.contains_key("sec-fetch-dest")))
     } else {
         (!headers.contains_key("origin") || origin == Some(state.origin.as_str()))
-            && matches!(site, Some("none" | "same-origin"))
+            && (!headers.contains_key("sec-fetch-site")
+                || matches!(site, Some("none" | "same-origin")))
     }
 }
 
@@ -858,6 +884,118 @@ mod tests {
         }
         assert!(pairing.redeem("correct", now).is_none());
         assert!(pairing.bootstrap.is_none());
+    }
+
+    #[test]
+    fn lan_http_omits_fetch_metadata_but_still_requires_exact_origin() {
+        let mut host = state();
+        host.authority = "192.168.1.20:8080".into();
+        host.origin = "http://192.168.1.20:8080".into();
+        let mut request = request();
+        request
+            .headers_mut()
+            .insert("host", "192.168.1.20:8080".parse().unwrap());
+        request
+            .headers_mut()
+            .insert("origin", host.origin.parse().unwrap());
+        request.headers_mut().remove("sec-fetch-site");
+        request.headers_mut().remove("sec-fetch-dest");
+        assert!(authorized_request(&host, &request, true));
+        request
+            .headers_mut()
+            .insert("origin", "http://foreign.example".parse().unwrap());
+        assert!(!authorized_request(&host, &request, true));
+        request.headers_mut().remove("origin");
+        assert!(!authorized_request(&host, &request, true));
+        drop(host);
+    }
+
+    #[tokio::test]
+    async fn launched_host_enforces_selected_pairing_mode() {
+        use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+        for (pairing, expected) in [
+            (crate::PairingMode::Open, "HTTP/1.1 200"),
+            (crate::PairingMode::Required, "HTTP/1.1 403"),
+        ] {
+            let listener = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+                .await
+                .unwrap();
+            let address = listener.local_addr().unwrap();
+            let args = XrayWebArgs {
+                session_id: SessionId::default(),
+                asset_dir: None,
+                no_open: true,
+                deep: true,
+                lifetime_seconds: 60,
+                local_browser: false,
+                host: address.ip(),
+                port: address.port(),
+                advertise_host: None,
+                pairing,
+            };
+            let (shutdown, stopped) = tokio::sync::watch::channel(false);
+            let (ready, started) = tokio::sync::oneshot::channel();
+            let task = tokio::spawn(async move {
+                host(
+                    &args,
+                    BTreeMap::new(),
+                    listener,
+                    backend::Backend::demo(),
+                    content_security_policy("http://127.0.0.1:1/").unwrap(),
+                    stopped,
+                    ready,
+                )
+                .await
+            });
+            started.await.unwrap();
+            let mut connection = tokio::net::TcpStream::connect(address).await.unwrap();
+            // Plain LAN HTTP browsers omit Fetch Metadata; Origin remains mandatory.
+            let request = format!(
+                "POST /__xray/bootstrap HTTP/1.1\r\nHost: {address}\r\nOrigin: http://{address}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+            );
+            connection.write_all(request.as_bytes()).await.unwrap();
+            let mut response = Vec::new();
+            connection.read_to_end(&mut response).await.unwrap();
+            assert!(String::from_utf8(response).unwrap().starts_with(expected));
+            drop(connection);
+            shutdown.send_replace(true);
+            task.await.unwrap().unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn wildcard_listener_requires_explicit_concrete_browser_address() {
+        let mut args = XrayWebArgs {
+            session_id: SessionId::default(),
+            asset_dir: None,
+            no_open: true,
+            deep: false,
+            lifetime_seconds: 60,
+            local_browser: false,
+            host: std::net::Ipv4Addr::UNSPECIFIED.into(),
+            port: 0,
+            advertise_host: None,
+            pairing: crate::PairingMode::Open,
+        };
+        assert!(browser_address(&args, 8080).is_err());
+        args.advertise_host = Some("192.168.1.20".parse().unwrap());
+        assert_eq!(
+            browser_address(&args, 8080).unwrap().to_string(),
+            "192.168.1.20:8080"
+        );
+        let listener = tokio::net::TcpListener::bind((args.host, 0)).await.unwrap();
+        assert!(listener.local_addr().unwrap().ip().is_unspecified());
+        drop(listener);
+        for invalid in ["0.0.0.0", "255.255.255.255", "224.0.0.1", "::1"] {
+            args.advertise_host = Some(invalid.parse().unwrap());
+            assert!(browser_address(&args, 8080).is_err());
+        }
+        args.host = "::1".parse().unwrap();
+        args.advertise_host = None;
+        assert_eq!(
+            browser_address(&args, 8080).unwrap().to_string(),
+            "[::1]:8080"
+        );
     }
 
     #[test]

@@ -1,3 +1,4 @@
+import { Sha256 } from '../recording/sha256';
 import type { InspectorBootstrap, XrayEnvelope } from '../contracts';
 import { declaredReferences, envelope, MAX_FRAME_BYTES, MAX_PAYLOAD_BYTES, object, payloadRef, refKey, SequenceTracker, SseParser, uint, validateFinalization, type PayloadRef } from './protocol';
 export interface TransportHooks { events: (events: XrayEnvelope[]) => Promise<void>; state: (state: 'live' | 'stopped' | 'disconnected' | 'finalizing') => void; issue: (message: string) => void }
@@ -136,8 +137,9 @@ export class ObservationTransport {
         bytes.set(range.bytes, offset); offset = end;
         if (range.eof) break;
       } while (offset < r.byte_len);
-      const digest = new Uint8Array(await crypto.subtle.digest('SHA-256', bytes));
-      if (Array.from(digest, v => v.toString(16).padStart(2, '0')).join('') !== r.sha256) throw new Error('Payload digest mismatch');
+      const digest = new Sha256();
+      digest.update(bytes);
+      if (digest.hex() !== r.sha256) throw new Error('Payload digest mismatch');
       if (!this.canReadPayload()) throw new Error('Payload lease ended during verification');
       return bytes;
     } finally { this.reading = false; }

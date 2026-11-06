@@ -42,7 +42,7 @@ private. Manual fallback uses the credential-free printed URL and the one-time
 code. Codes expire after 45 seconds and allow eight attempts; restart the launcher
 for a fresh code.
 
-The launcher binds only loopback and serves assets, pairing and the typed X-ray
+The launcher defaults to loopback and serves assets, pairing and the typed X-ray
 gateway on one Origin. It grants access for the selected session and lifetime and
 revokes its endpoint on exit. Stopping observation never cancels session execution.
 Existing custom X-ray host/security policy remains authoritative.
@@ -60,6 +60,32 @@ launch. `session xray-web SESSION_ID --asset-dir /absolute/dist` remains an expl
 developer override. Unsafe, symlinked, oversized or unbuilt asset trees fail closed.
 Production hosting uses restrictive CSP and exact Host/Origin/fetch-metadata checks;
 Vite's development server is not a replacement capability host.
+
+## LAN hosting
+
+Loopback remains the default. To expose the inspector deliberately:
+
+```sh
+bcode xray SESSION_ID --host 0.0.0.0 --port 8080 --advertise-host 192.168.1.20
+```
+
+Open `http://192.168.1.20:8080/` from another device. Substitute the server's actual
+LAN IP. `--advertise-host` is required for wildcard binds and accepts a concrete
+IP, not a URL or hostname. Binding directly to a LAN IP does not need a separate
+advertised address. IPv6 addresses are supported; address families must match.
+Port zero (the default) selects a free port, which the launcher prints.
+
+Host/Origin validation accepts only the exact advertised IP and selected port,
+not arbitrary request hosts. The daemon's own diagnostic endpoint stays behind the
+native gateway; this does not expose daemon IPC or broaden daemon browser grants.
+Network listeners do not automatically open a local browser or print SSH forwarding
+instructions. Pairing remains opt-in with `--require-pairing`.
+
+**HTTP is unencrypted.** Anyone who can reach the port can read the selected
+observation without pairing. Pairing restricts initial access but does not encrypt
+traffic. Use a trusted network/firewall or an encrypted tunnel; do not expose this
+port to the public Internet. Some browser features (such as direct disk recording)
+require a secure context and remain unavailable over plain LAN HTTP.
 
 ## Inspect
 

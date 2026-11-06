@@ -30,6 +30,15 @@ pub struct XrayLaunchArgs {
     /// Open on serving host even through SSH.
     #[arg(long)]
     pub local_browser: bool,
+    /// Interface to bind; wildcard listeners require --advertise-host.
+    #[arg(long, default_value = "127.0.0.1")]
+    pub host: std::net::IpAddr,
+    /// Listening port; zero selects an available port.
+    #[arg(long, default_value_t = 0)]
+    pub port: u16,
+    /// Exact IP address visitors use (required when --host is unspecified).
+    #[arg(long)]
+    pub advertise_host: Option<std::net::IpAddr>,
     /// Require a one-time browser pairing ticket or code.
     #[arg(long, action = clap::ArgAction::SetTrue)]
     pub require_pairing: Option<bool>,
@@ -72,6 +81,9 @@ const fn web_args(args: &XrayLaunchArgs, session_id: SessionId) -> xray_web::Xra
         asset_dir: None,
         no_open: args.no_open,
         local_browser: args.local_browser,
+        host: args.host,
+        port: args.port,
+        advertise_host: args.advertise_host,
         require_pairing: args.require_pairing,
         deep: args.deep,
         lifetime_seconds: args.lifetime_seconds,
@@ -222,6 +234,27 @@ mod tests {
     struct Launch {
         #[command(flatten)]
         args: XrayLaunchArgs,
+    }
+
+    #[test]
+    fn network_options_preserve_exact_bind_and_advertised_target() {
+        let args = Launch::try_parse_from([
+            "xray",
+            "--host",
+            "0.0.0.0",
+            "--port",
+            "8080",
+            "--advertise-host",
+            "192.168.1.20",
+        ])
+        .unwrap()
+        .args;
+        let web = web_args(&args, SessionId::default());
+        assert!(web.host.is_unspecified());
+        assert_eq!(web.port, 8080);
+        assert_eq!(web.advertise_host, Some("192.168.1.20".parse().unwrap()));
+        assert!(Launch::try_parse_from(["xray", "--port", "65536"]).is_err());
+        assert!(Launch::try_parse_from(["xray", "--host", "foreign.example"]).is_err());
     }
 
     #[test]

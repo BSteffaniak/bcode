@@ -58,6 +58,12 @@ pub struct LaunchOptions {
     pub lifetime_seconds: u64,
     /// Explicitly open browser on serving host even over SSH.
     pub local_browser: bool,
+    /// Listener interface; defaults to IPv4 loopback.
+    pub host: std::net::IpAddr,
+    /// Listener port; zero selects an available port.
+    pub port: u16,
+    /// Exact browser-facing IP, required for wildcard binding.
+    pub advertise_host: Option<std::net::IpAddr>,
     /// Optional browser pairing; localhost access is open by default.
     pub pairing: PairingMode,
 }
@@ -69,6 +75,9 @@ impl Default for LaunchOptions {
             deep: false,
             lifetime_seconds: 3600,
             local_browser: false,
+            host: std::net::Ipv4Addr::LOCALHOST.into(),
+            port: 0,
+            advertise_host: None,
             pairing: PairingMode::Open,
         }
     }
@@ -149,6 +158,9 @@ async fn launch(
         deep: options.deep,
         lifetime_seconds: options.lifetime_seconds,
         local_browser: options.local_browser,
+        host: options.host,
+        port: options.port,
+        advertise_host: options.advertise_host,
         pairing: options.pairing,
     };
     let (shutdown, stopped) = watch::channel(false);
