@@ -892,7 +892,7 @@ impl ClaudeClient {
             }
             if !state.lifecycle.can_submit() || !state.callbacks.values().all(is_mcp_catalog) {
                 return Err(Error::InvalidConfiguration(
-                    "active turn steering is unsupported; wait for authoritative settlement",
+                    "active turn steering is unsupported; wait for the current foreground result",
                 ));
             }
             if state

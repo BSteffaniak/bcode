@@ -90,7 +90,7 @@ def main():
         return
     root = Path(os.environ["CLAUDE_CONFIG_DIR"])
     scenario = (root / "scenario").read_text(encoding="utf-8").strip()
-    if scenario not in {"question", "lost_ack", "lost_before_confirmation", "sensitive_error", "cancel", "terminal_auth"}:
+    if scenario not in {"question", "lost_ack", "lost_before_confirmation", "sensitive_error", "cancel", "terminal_auth", "multi_turn"}:
         raise ValueError()
     # Count only actual stream processes; version/auth inspection is not creation.
     for sequence in range(32):
@@ -124,9 +124,34 @@ def main():
         if not 15 <= idle_seconds <= 120:
             raise ValueError()
     submission_uuid = None
+    submission_uuid_seen = None
     for _ in range(32):
         frame = receive(idle_seconds)
-        if frame.get("type") == "user":
+        if frame.get("type") == "user" and scenario == "multi_turn":
+            # Sequential foreground turns on one live process; each ends with its own
+            # attributed result. Only the first turn confirms the native identity.
+            content = frame.get("message", {}).get("content")
+            if not isinstance(content, str) or not content.startswith("turn-"):
+                (root / "unexpected-user.rejected").touch()
+                raise ValueError()
+            submission_uuid = str(uuid.UUID(frame["uuid"]))
+            effect(root, content)
+            if submission_uuid_seen is None:
+                emit({"type":"system", "subtype":"init", "session_id":session})
+                (root / "binding-confirmed.emitted").touch()
+            submission_uuid_seen = submission_uuid
+            emit({"type":"system", "subtype":"session_state_changed",
+                  "session_id":session, "state":"running"})
+            emit({"type":"assistant", "session_id":session, "uuid":str(uuid.uuid4()),
+                  "user_message_uuid":submission_uuid,
+                  "message":{"role":"assistant",
+                             "content":[{"type":"text","text":"reply " + content}]}})
+            emit({"type":"result", "subtype":"success", "session_id":session,
+                  "is_error":False, "result":"reply " + content, "uuid":str(uuid.uuid4()),
+                  "user_message_uuid":submission_uuid, "queued_turn_count":0})
+            emit({"type":"system", "subtype":"session_state_changed",
+                  "session_id":session, "state":"idle"})
+        elif frame.get("type") == "user":
             # Only the actual admitted first user input may trigger native init.
             if frame.get("message", {}).get("content") != "fixture-only":
                 (root / "unexpected-user.rejected").touch()

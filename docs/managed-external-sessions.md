@@ -69,6 +69,12 @@ acquire invented lifecycle evidence.
   not a no-future-work certificate, does not erase retained work or notifications,
   and cannot make an unobserved native activity class authoritative.
 
+Foreground turn admission is separate from settlement. An adapter may admit the
+next interactive turn once the previous foreground result arrived with no queued
+native input or pending callback, even when settlement support is unknown. That
+admission never satisfies a completion boundary below and never erases retained
+background work.
+
 Callers choose a completion boundary: foreground, associated work (the default),
 or workspace release. Foreground requires authoritative exact-attempt outcome and
 complete attributed output, not universal quiescence. Associated work additionally

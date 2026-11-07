@@ -126,7 +126,14 @@ currently satisfied with an immediate bounded poll.
   No plugin-config self-grant exists. No shared types were duplicated or edited.
   Source integration is implemented; native/end-to-end behavior is unvalidated.
 * Active steering is unsupported: native stream input has no atomic expected-turn
-  comparison. Unknown session-state modes cannot safely accept a second turn.
+  comparison. A next turn is admitted once the previous foreground result arrived
+  with no queued native input and no pending callback; verified session-state mode
+  additionally waits for the native idle marker. Foreground admission is not
+  settlement: background work stays observed, and workflow completion still
+  requires authoritative settlement evidence.
+* Each observation page cycle pumps staged native records until the page budget is
+  used or execution evidence needs host acknowledgement or hydration. Records
+  without execution evidence do not each cost a host round trip.
 * Mutation caches retain at most 256 recent entries per live process and rotate
   only at a verified settled boundary. Canonical host admission must deduplicate
   lifetime identities **before** dispatch, including after cache eviction/restart.

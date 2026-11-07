@@ -52,6 +52,9 @@ const PLUGIN_ID: &str = "bcode.claude-code";
 const MAX_PROCESSES: usize = 32;
 const MAX_RETAINED_MUTATIONS: usize = 256;
 const MAX_RETAINED_OBSERVATIONS: usize = 256;
+/// Staged native records pumped per durable page cycle; execution evidence still
+/// stops the batch until the host acknowledges it.
+const MAX_PUMPED_RECORDS_PER_PAGE: usize = 256;
 
 struct StreamState {
     normalizer: Normalizer,
@@ -132,7 +135,14 @@ impl StreamState {
                 .map_err(|_| HarnessFailure::Conflict)?;
         }
         if !self.retention.pending() {
-            let staged = self.normalizer.pump();
+            // Leave queue headroom: one native record can expand into several observations.
+            let budget = usize::from(observe.limit)
+                .min(MAX_RETAINED_OBSERVATIONS / 2)
+                .saturating_sub(self.observations.len())
+                .max(1);
+            let staged = self
+                .normalizer
+                .pump_batch(budget, MAX_PUMPED_RECORDS_PER_PAGE);
             if !staged.is_empty() && !self.push(staged) {
                 return Err(HarnessFailure::Uncertain);
             }

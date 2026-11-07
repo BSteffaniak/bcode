@@ -194,8 +194,9 @@ impl Normalizer {
         if !self.staging.enabled {
             return Vec::new();
         }
-        // At most one native record per durable page cycle. Native readers keep
-        // draining into a byte-bounded staging buffer; unacknowledged cache is fixed.
+        // At most one native record per call; `pump_batch` repeats until evidence needs
+        // acknowledgement. Native readers keep draining into a byte-bounded staging
+        // buffer; unacknowledged cache is fixed.
         if self.execution.has_unacknowledged() && self.staging.notices.is_empty() {
             return Vec::new();
         }
@@ -248,6 +249,31 @@ impl Normalizer {
             });
         }
         self.event_ready(event)
+    }
+    /// Pump staged records into one durable page cycle until the observation budget is
+    /// used, the record budget is exhausted, or evidence needs host acknowledgement or
+    /// hydration. Records without execution evidence (text, partial-message frames,
+    /// state markers) do not each require a separate host round trip.
+    pub fn pump_batch(
+        &mut self,
+        max_observations: usize,
+        max_records: usize,
+    ) -> Vec<HarnessObservation> {
+        let mut observations = Vec::new();
+        for _ in 0..max_records {
+            if observations.len() >= max_observations {
+                break;
+            }
+            let records = self.staging.events.len();
+            let notices = !self.staging.notices.is_empty();
+            observations.extend(self.pump());
+            let progressed = notices || self.staging.events.len() != records;
+            if !progressed || self.execution.has_unacknowledged() || self.staging.request.is_some()
+            {
+                break;
+            }
+        }
+        observations
     }
     pub fn event(&mut self, event: Event) -> Vec<HarnessObservation> {
         if !self.staging.enabled {

@@ -383,8 +383,8 @@ async fn installed_native_status_only_session_state_one_input() {
             evidence.record(event, &uuid);
             if evidence.complete() {
                 assert_eq!(session.client().settlement(), Settlement::Unsupported);
-                assert!(!session.client().can_submit_next_turn(),
-                    "Unknown support must not authorize follow-up from a result");
+                assert!(session.client().can_submit_next_turn(),
+                    "a foreground result admits the next turn without settlement");
                 assert!(matches!(session.client().identity_state(),
                     IdentityState::Confirmed { native_session_id } if native_session_id == session_uuid));
                 eprintln!("status_state_probe running=true idle_after_running=true sdk_host_marker=true consumed_exact=true result_exact=true output_exact=true tools_disabled=true authoritative_settlement=false inputs=1");

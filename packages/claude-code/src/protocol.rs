@@ -166,13 +166,21 @@ impl Lifecycle {
             queued_user_sends: None,
         }
     }
+    /// Foreground turn admission, not settlement. The previous foreground result must
+    /// have arrived with nothing queued; background work continues as observations.
+    /// Verified mode additionally waits for the native idle marker.
     pub(crate) fn can_submit(&self) -> bool {
-        !self.submitted
-            || (!self.uncertain
-                && self.support == SettlementSupport::VerifiedSessionState
-                && self.state == Some(SessionState::Idle)
-                && self.result
-                && self.queued_user_sends.is_none_or(|count| count == 0))
+        if !self.submitted {
+            return true;
+        }
+        if self.uncertain
+            || !self.result
+            || self.state == Some(SessionState::RequiresAction)
+            || self.queued_user_sends.is_some_and(|count| count != 0)
+        {
+            return false;
+        }
+        self.support == SettlementSupport::Unknown || self.state == Some(SessionState::Idle)
     }
     pub(crate) const fn submit(&mut self) {
         self.submitted = true;
@@ -552,5 +560,68 @@ mod tests {
         assert_eq!(lifecycle.snapshot(), Settlement::Settled);
         lifecycle.observe(&json!({"type":"system","subtype":"task_started","task_id":"two","task_type":"future_task"})).expect("unknown class");
         assert_eq!(lifecycle.snapshot(), Settlement::Unsupported);
+    }
+
+    #[test]
+    fn unknown_support_admits_next_foreground_turn_after_result_without_settlement() {
+        let mut lifecycle = Lifecycle::new(SettlementSupport::Unknown, 2);
+        assert!(lifecycle.can_submit());
+        lifecycle.submit();
+        assert!(!lifecycle.can_submit(), "running turn blocks new input");
+        lifecycle
+            .observe(&json!({"type":"result","queued_turn_count":1}))
+            .expect("result");
+        assert!(
+            !lifecycle.can_submit(),
+            "queued native input blocks new input"
+        );
+        lifecycle
+            .observe(&json!({"type":"result","queued_turn_count":0}))
+            .expect("result");
+        assert!(lifecycle.can_submit());
+        assert_eq!(lifecycle.snapshot(), Settlement::Unsupported);
+        lifecycle
+            .observe(&json!({"type":"assistant","parent_tool_use_id":null}))
+            .expect("automatic continuation");
+        assert!(
+            !lifecycle.can_submit(),
+            "native continuation blocks until its result"
+        );
+        lifecycle
+            .observe(&json!({"type":"result"}))
+            .expect("result");
+        assert!(lifecycle.can_submit());
+        lifecycle.disconnect();
+        assert!(!lifecycle.can_submit());
+    }
+
+    #[test]
+    fn downgraded_verified_session_still_admits_foreground_turns() {
+        let mut lifecycle = Lifecycle::new(SettlementSupport::VerifiedSessionState, 2);
+        lifecycle.submit();
+        lifecycle.observe(&json!({"type":"system","subtype":"task_started","task_id":"x","task_type":"future_task"})).expect("unknown class");
+        lifecycle
+            .observe(&json!({"type":"result"}))
+            .expect("result");
+        assert_eq!(lifecycle.snapshot(), Settlement::Unsupported);
+        assert!(lifecycle.can_submit());
+    }
+
+    #[test]
+    fn verified_support_still_waits_for_idle_and_attention_blocks() {
+        let mut lifecycle = Lifecycle::new(SettlementSupport::VerifiedSessionState, 2);
+        lifecycle.submit();
+        lifecycle
+            .observe(&json!({"type":"result"}))
+            .expect("result");
+        assert!(!lifecycle.can_submit());
+        lifecycle
+            .observe(&json!({"type":"system","subtype":"session_state_changed","state":"requires_action"}))
+            .expect("attention");
+        assert!(!lifecycle.can_submit());
+        lifecycle
+            .observe(&json!({"type":"system","subtype":"session_state_changed","state":"idle"}))
+            .expect("idle");
+        assert!(lifecycle.can_submit());
     }
 }

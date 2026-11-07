@@ -261,6 +261,13 @@ impl Cli {
         if scenario == "terminal_auth" {
             settings = settings.replace("bcode-offline-claude-fixture 1.0.0", "2.1.308");
         }
+        if scenario == "multi_turn" {
+            // Matches the configuration native setup generates by default.
+            settings = settings.replace(
+                "verified_session_state = true",
+                "verified_session_state = false",
+            );
+        }
         settings.push_str("\n[metrics]\nstartup_reports = true\n");
         std::fs::write(&config, settings).unwrap();
         std::fs::write(
@@ -522,6 +529,57 @@ impl Cli {
                 "session_id":target["session"]["session_id"],"generation":target["session"]["generation"],
                 "text":text,"placement":{"kind":"next_turn"}}}}),
             target["session"]["session_id"].as_str().unwrap(), None)
+    }
+
+    fn send_turn(
+        &self,
+        target: &Value,
+        text: &str,
+        submission_id: &str,
+        attempt_id: &str,
+    ) -> Reply {
+        self.call("send", json!({"operation":"submit","request":{"target":target,
+            "submission":{"submission_id":submission_id,"attempt_id":attempt_id,
+                "session_id":target["session"]["session_id"],"generation":target["session"]["generation"],
+                "text":text,"placement":{"kind":"next_turn"}}}}),
+            target["session"]["session_id"].as_str().unwrap(), None)
+    }
+
+    /// Observe until the exact submission is terminal, promoting a confirmed binding.
+    fn await_terminal(
+        &self,
+        target: &Value,
+        mut after: Option<String>,
+        submission_id: &str,
+    ) -> (Value, Option<String>) {
+        // Each isolated CLI observation is a cold process; allow several cycles.
+        let deadline = Instant::now() + Duration::from_secs(90);
+        let mut target = target.clone();
+        loop {
+            let page = self.observe(&target, after.as_deref());
+            let mut terminal = false;
+            for item in page["observations"].as_array().unwrap() {
+                let kind = &item["kind"];
+                if kind["kind"] == "binding_confirmed" {
+                    target = json!({"state":"confirmed","session":kind["binding"]});
+                }
+                if kind["kind"] == "execution"
+                    && kind["event"]["event"] == "submission_terminal"
+                    && kind["event"]["attempt"]["submission_id"] == submission_id
+                {
+                    terminal = true;
+                }
+            }
+            after = page["next_after"].as_str().map(str::to_owned);
+            if terminal {
+                return (target, after);
+            }
+            assert!(
+                Instant::now() < deadline,
+                "submission {submission_id} must reach a terminal observation; last page={page}"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
     }
 
     fn observe(&self, target: &Value, after: Option<&str>) -> Value {
@@ -822,6 +880,43 @@ fn managed_start_respond_stale_cancel_and_offline_bounded_history() {
         "offline history must retain the committed prefix"
     );
     assert!(history.value["completeness"].is_string());
+}
+
+#[test]
+fn default_setup_configuration_admits_sequential_foreground_turns() {
+    let cli = Cli::new("multi_turn");
+    let prepared = cli.open(SESSION, None);
+    let first = cli.send_turn(
+        &prepared,
+        "turn-1",
+        "submit-1",
+        "55555555-5555-4555-8555-000000000001",
+    );
+    assert_eq!(
+        first.value["kind"]["kind"], "receipt",
+        "first send: {}",
+        first.value
+    );
+    let (confirmed, mut after) = cli.await_terminal(&prepared, None, "submit-1");
+    assert_eq!(confirmed["state"], "confirmed");
+    for turn in 2..=3 {
+        let submission = format!("submit-{turn}");
+        let reply = cli.send_turn(
+            &confirmed,
+            &format!("turn-{turn}"),
+            &submission,
+            &format!("55555555-5555-4555-8555-00000000000{turn}"),
+        );
+        assert_eq!(
+            reply.value["kind"]["kind"], "receipt",
+            "turn {turn} must be admitted after the previous foreground result; value={} output={}",
+            reply.value, reply.output
+        );
+        after = cli.await_terminal(&confirmed, after, &submission).1;
+        assert!(cli.native.join(format!("turn-{turn}.effect")).exists());
+    }
+    assert!(!cli.native.join("unexpected-user.rejected").exists());
+    cli.stop();
 }
 
 #[test]
