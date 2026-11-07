@@ -9,6 +9,7 @@ mod application;
 mod assistance;
 mod auth_inspection;
 mod canonical;
+pub(crate) mod configuration_views;
 pub(crate) mod execution_catalog;
 mod history;
 

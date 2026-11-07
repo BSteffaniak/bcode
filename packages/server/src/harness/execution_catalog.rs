@@ -33,7 +33,10 @@ pub async fn discover_candidates(
     }
     let mut plugins = Vec::new();
     let mut complete = true;
-    let transport = HarnessPluginTransport::new(Arc::clone(state));
+    let transport = HarnessPluginTransport::with_view(
+        Arc::clone(state),
+        super::configuration_views::for_client(state, *client_id).await?,
+    );
     let native = bcode_harness_models::HarnessCandidatesRequest {
         schema_version: HARNESS_SCHEMA_VERSION,
         request_id: query.request_id.clone(),
@@ -137,8 +140,14 @@ pub async fn discover(
             }),
         }
     }
-    let harnesses =
-        discover_harnesses(state, &request.request_id, request.instances, &mut issues).await;
+    let harnesses = discover_harnesses(
+        state,
+        &request.request_id,
+        request.instances,
+        &mut issues,
+        super::configuration_views::for_caller(state, caller).await?,
+    )
+    .await;
     let models = state
         .model_catalog
         .resolve_execution_catalog(providers, harnesses)
@@ -211,10 +220,11 @@ async fn discover_harnesses(
     request_id: &str,
     instances: Vec<bcode_harness_models::HarnessInstance>,
     issues: &mut Vec<ManagedExecutionCatalogIssue>,
+    view: bcode_plugin::PluginServiceConfigView,
 ) -> Vec<ManagedHarnessExecutionCatalog> {
     let mut harnesses = Vec::new();
     for instance in instances {
-        let transport = HarnessPluginTransport::new(Arc::clone(state));
+        let transport = HarnessPluginTransport::with_view(Arc::clone(state), view.clone());
         let native = HarnessModelsRequest {
             schema_version: HARNESS_SCHEMA_VERSION,
             request_id: request_id.to_owned(),
@@ -420,36 +430,24 @@ pub async fn start_selected(
     {
         return Ok(recorded);
     }
-    admission.create_selected(caller, &request).await?;
+    let owner = admission.create_selected(caller, &request).await?;
     drop(admission);
-    let discovery_caller = match caller {
-        ManagedCaller::Workflow {
-            run_id,
-            dispatch_identity,
-            plugin_id,
-            ..
-        } => ManagedCaller::Workflow {
-            run_id: run_id.clone(),
-            dispatch_identity: dispatch_identity.clone(),
-            session_id: request
-                .parent_session_id
-                .ok_or(ManagedHarnessError::StaleOwner)?,
-            plugin_id: plugin_id.clone(),
-        },
-        _ => caller.clone(),
-    };
-    let catalog = discover(
+    // Discovery for an already prepared open uses its pinned view, not a later client reload.
+    let mut issues = Vec::new();
+    let harnesses = discover_harnesses(
         state,
-        &discovery_caller,
-        ManagedExecutionCatalogRequest {
-            request_id: request.open.open_id.clone(),
-            instances: vec![request.instance.clone()],
-            provider_plugin_id: None,
-        },
+        &request.open.open_id,
+        vec![request.instance.clone()],
+        &mut issues,
+        super::configuration_views::for_owner(state, &owner).await?,
     )
-    .await?;
+    .await;
+    let models = state
+        .model_catalog
+        .resolve_execution_catalog(Vec::new(), harnesses)
+        .await;
     let selection = bcode_model_catalog::ModelCatalogResolver::resolve_execution_selection(
-        &catalog.models,
+        &models,
         request.selection.clone(),
     )
     .map_err(|_| ManagedHarnessError::Unavailable)?;

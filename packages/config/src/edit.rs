@@ -307,8 +307,40 @@ pub fn plan_execution_setup_with_policy(
     updates: &[PluginConfigurationUpdate<'_>],
     preference: &crate::ExecutionPreference,
 ) -> Result<PolicyConfigEdit, ConfigError> {
+    plan_execution_setup(
+        effective,
+        reference,
+        allowed_roots,
+        updates,
+        Some(preference),
+    )
+}
+
+/// Plan native instance setup without changing the remembered model or provider selection.
+/// All plugin updates share one provenance-fenced atomic replacement.
+///
+/// # Errors
+/// Rejects stale configuration, unsupported edit policy or conflicting plugin settings.
+pub fn plan_native_setup_with_policy(
+    effective: &BcodeConfig,
+    reference: &crate::recovery::ConfigRecoveryReference,
+    allowed_roots: &[PathBuf],
+    updates: &[PluginConfigurationUpdate<'_>],
+) -> Result<PolicyConfigEdit, ConfigError> {
+    plan_execution_setup(effective, reference, allowed_roots, updates, None)
+}
+
+fn plan_execution_setup(
+    effective: &BcodeConfig,
+    reference: &crate::recovery::ConfigRecoveryReference,
+    allowed_roots: &[PathBuf],
+    updates: &[PluginConfigurationUpdate<'_>],
+    preference: Option<&crate::ExecutionPreference>,
+) -> Result<PolicyConfigEdit, ConfigError> {
     let path = policy_edit_path(effective, reference, allowed_roots)?;
-    preference.validate().map_err(invalid)?;
+    if let Some(preference) = preference {
+        preference.validate().map_err(invalid)?;
+    }
     if updates.is_empty() || updates.len() > 16 {
         return Err(invalid("Invalid execution setup update count"));
     }
@@ -348,13 +380,15 @@ pub fn plan_execution_setup_with_policy(
             update.settings,
         )?;
     }
-    let preference =
-        toml::Value::try_from(preference).map_err(|_| invalid("Invalid execution preference"))?;
-    set_setup_value(
-        &mut document,
-        &["execution", "default_selection"],
-        &preference,
-    )?;
+    if let Some(preference) = preference {
+        let preference = toml::Value::try_from(preference)
+            .map_err(|_| invalid("Invalid execution preference"))?;
+        set_setup_value(
+            &mut document,
+            &["execution", "default_selection"],
+            &preference,
+        )?;
+    }
     let rendered = document.to_string();
     let mut resolved: toml::Value =
         toml::from_str(&rendered).map_err(|_| invalid("Invalid execution setup configuration"))?;
@@ -692,6 +726,54 @@ fn io_error(path: &Path, source: std::io::Error) -> ConfigError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn native_setup_preserves_selection_and_rejects_stale_atomic_proposal() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("config.toml");
+        let original = "# retain comment\n[model]\nmodel_id = 'unchanged'\n";
+        std::fs::write(&path, original).unwrap();
+        let effective = crate::load_config_from_paths(std::slice::from_ref(&path)).unwrap();
+        let sources = crate::recovery::ConfigRecoverySources {
+            cwd: temp.path().to_owned(),
+            exclusive_config_path: Some(path.clone()),
+            ..Default::default()
+        };
+        let roots = vec![temp.path().to_owned()];
+        let reference =
+            crate::recovery::capture_with_sources(&effective, &sources, &roots).unwrap();
+        let adapter: toml::Value =
+            toml::from_str("[instances.primary]\nexecutable = '/native'\n").unwrap();
+        let catalog: toml::Value = toml::from_str("enabled = true\n[instances]\n").unwrap();
+        let updates = [
+            PluginConfigurationUpdate {
+                plugin_id: "example.native",
+                expected: None,
+                settings: &adapter,
+            },
+            PluginConfigurationUpdate {
+                plugin_id: "bcode.harness",
+                expected: None,
+                settings: &catalog,
+            },
+        ];
+        let edit = plan_native_setup_with_policy(&effective, &reference, &roots, &updates).unwrap();
+        let stale =
+            plan_native_setup_with_policy(&effective, &reference, &roots, &updates).unwrap();
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), original);
+        edit.apply().unwrap();
+        assert!(stale.apply().is_err());
+        let reopened = crate::load_config_from_paths(std::slice::from_ref(&path)).unwrap();
+        assert_eq!(reopened.model, effective.model);
+        assert_eq!(reopened.execution, effective.execution);
+        assert_eq!(reopened.plugins.config["example.native"], adapter);
+        assert_eq!(reopened.plugins.config["bcode.harness"], catalog);
+        assert!(
+            std::fs::read_to_string(&path)
+                .unwrap()
+                .starts_with("# retain comment")
+        );
+    }
 
     #[test]
     fn atomic_execution_setup_updates_both_plugins_and_default_in_one_fenced_write() {

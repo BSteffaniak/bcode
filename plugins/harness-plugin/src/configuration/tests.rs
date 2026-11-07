@@ -54,8 +54,7 @@ fn invoke(config: Value, operation: &str, payload: &Value) -> ServiceResponse {
     crate::HarnessPlugin.invoke_service(context(config, operation, payload))
 }
 
-#[test]
-fn native_setup_combines_exact_proposals_and_rejects_changed_preparation() {
+fn native_setup_request() -> PrepareNativeSetupRequest {
     let instance: HarnessInstance =
         serde_json::from_value(settings()["instances"]["primary"]["instance"].clone()).unwrap();
     let candidate = bcode_harness_models::HarnessInstallationCandidate {
@@ -82,24 +81,89 @@ fn native_setup_combines_exact_proposals_and_rejects_changed_preparation() {
         instance,
         adapter_settings: json!({"native_owned": "opaque-setting"}),
     };
-    let mut response = bcode_harness_models::HarnessPrepareCandidateResponse {
+    let response = bcode_harness_models::HarnessPrepareCandidateResponse {
         schema_version: request.schema_version,
         request_id: request.request_id.clone(),
         plugin_id: native.instance.plugin_id.clone(),
-        kind: bcode_harness_models::HarnessPrepareCandidateResponseKind::Prepared(Box::new(
-            native.clone(),
-        )),
+        kind: bcode_harness_models::HarnessPrepareCandidateResponseKind::Prepared(Box::new(native)),
     };
-    let payload = PrepareNativeSetupRequest {
-        request: request.clone(),
-        response: response.clone(),
+    PrepareNativeSetupRequest {
+        request,
+        response,
         adapter_configuration: json!({"instances": {"other": {"keep": true}}, "unrelated": true}),
         make_default: true,
+    }
+}
+
+#[test]
+fn native_setup_rejects_unknown_uncorrelated_disabled_and_oversized_proposals() {
+    let payload = serde_json::to_value(native_setup_request()).unwrap();
+    // Unknown nested native fields must not be silently dropped by portable DTOs.
+    for pointer in [
+        "",
+        "/request",
+        "/request/candidate",
+        "/request/candidate/executable",
+        "/response",
+        "/response/kind",
+        "/response/kind/response",
+        "/response/kind/response/instance",
+        "/response/kind/response/instance/auth",
+    ] {
+        let mut malformed = payload.clone();
+        malformed
+            .pointer_mut(pointer)
+            .unwrap()
+            .as_object_mut()
+            .unwrap()
+            .insert("unknown".into(), json!(true));
+        assert!(
+            invoke(json!({}), PREPARE_SETUP_OPERATION, &malformed)
+                .error
+                .is_some()
+        );
+    }
+    let mut uncorrelated = payload.clone();
+    uncorrelated["response"]["request_id"] = json!("other");
+    assert!(
+        invoke(json!({}), PREPARE_SETUP_OPERATION, &uncorrelated)
+            .error
+            .is_some()
+    );
+    let mut oversized = context(json!({}), PREPARE_SETUP_OPERATION, &payload);
+    oversized.request.payload.resize(MAX_CONFIG_BYTES + 1, b' ');
+    assert!(super::invoke(&oversized).error.is_some());
+    let mut large = payload.clone();
+    large["adapter_configuration"]["preserved"] = json!("x".repeat(MAX_REQUEST_BYTES + 1));
+    assert!(
+        invoke(json!({}), PREPARE_SETUP_OPERATION, &large)
+            .error
+            .is_none()
+    );
+    let mut disabled = payload;
+    disabled["adapter_configuration"]["enabled"] = json!(false);
+    assert!(
+        invoke(json!({}), PREPARE_SETUP_OPERATION, &disabled)
+            .error
+            .is_some()
+    );
+}
+
+#[test]
+fn native_setup_combines_exact_proposals_and_rejects_changed_preparation() {
+    let setup = native_setup_request();
+    let request = setup.request.clone();
+    let mut response = setup.response.clone();
+    let bcode_harness_models::HarnessPrepareCandidateResponseKind::Prepared(native) =
+        &response.kind
+    else {
+        panic!("fixture must contain a prepared proposal");
     };
+    let native = native.as_ref().clone();
     let result = invoke(
         json!({}),
         PREPARE_SETUP_OPERATION,
-        &serde_json::to_value(payload).unwrap(),
+        &serde_json::to_value(setup).unwrap(),
     );
     assert!(result.error.is_none());
     let prepared: PreparedNativeSetup = result.payload_json().unwrap();

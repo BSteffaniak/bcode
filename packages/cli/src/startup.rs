@@ -5,6 +5,8 @@ use bcode_config::BcodeConfig;
 use bcode_provider_auth::startup::{StartupAuthCandidate, discover_candidates};
 use std::io::IsTerminal as _;
 
+mod native_setup;
+
 /// Interactive startup is opt-in for terminal launches, not automation.
 const fn interactive_startup(terminal: bool, ci: bool, opted_out: bool) -> bool {
     terminal && !ci && !opted_out
@@ -265,9 +267,9 @@ async fn route_backend_selection(
     };
     let _ = backend_choices(&catalog)?;
     if catalog.instances.is_empty() && config.execution.default_selection.is_none() {
-        // Installation/account discovery is optional and cannot create a runnable
-        // instance here. Leave provider startup alone, including incomplete probes.
-        return Ok(false);
+        // Reached only without a usable or explicitly selected provider; native setup
+        // offers provider connections explicitly rather than preempting one.
+        return Box::pin(native_setup::run(shell, no_discovery)).await;
     }
     let remembered = config
         .execution
@@ -316,28 +318,20 @@ async fn route_backend_selection(
         ).await?;
         match outcome {
             bcode_tui::ExecutionPickerOutcome::Selected(selection) => {
-                Box::pin(launch_execution_choice(host, shell, &catalog, &entries, selection, true)).await?;
+                Box::pin(launch_execution_choice(
+                    host, shell, &catalog, &entries, selection, true,
+                ))
+                .await?;
                 Ok(true)
             }
             bcode_tui::ExecutionPickerOutcome::Setup => {
-                let outcome = bcode_tui::run_backend_selection_in_shell(shell, bcode_tui::QuickOnboardingInput {
-                    choices: vec![bcode_tui::QuickConnectionChoice {
-                        label: "Provider connections and advanced settings".into(),
-                        detail: "Explicitly open existing provider setup. This is not required for a managed conversation; native subscription credentials remain native-owned.".into(),
-                    }],
-                    recovery: Some("Pre-session native sign-in is unavailable through the current application API. No provider key is required for managed execution. Existing bound managed sessions retain their native Sign in action. Close to leave all selections unchanged.".into()),
-                }).await?;
-                match outcome {
-                    bcode_tui::QuickOnboardingOutcome::Selected(0) | bcode_tui::QuickOnboardingOutcome::Advanced => {
-                        advanced_in_shell(shell, no_discovery).await?;
-                    }
-                    _ => {}
-                }
+                Box::pin(native_setup::run(shell, no_discovery)).await?;
                 Ok(true)
             }
             bcode_tui::ExecutionPickerOutcome::Close => Ok(true),
         }
-    }).await;
+    })
+    .await;
     if result.is_err() {
         // Start may have committed: show one safe recovery screen, never reopen
         // the picker or fall through into model onboarding after managed failure.
@@ -437,7 +431,6 @@ fn managed_start_call(
     Ok(call)
 }
 
-#[cfg(test)]
 fn managed_started_session(
     response: &bcode_harness_models::HarnessServiceResponse,
     session_id: bcode_session_models::SessionId,

@@ -60,8 +60,22 @@ pub fn resolve_plugin_configs_with_overlays(
                 .or_insert(plugin.manifest);
         }
     }
+    resolve_plugin_configs_for_manifests(config, manifests.values(), state_base, overlays)
+}
+
+/// Resolve configuration for exactly the manifests already admitted by a host.
+///
+/// Does not rediscover plugins or expand the host's loaded artifact set. Credential
+/// references remain lazy and scoped to each plugin invocation.
+#[must_use]
+pub fn resolve_plugin_configs_for_manifests<'a>(
+    config: &bcode_config::BcodeConfig,
+    manifests: impl IntoIterator<Item = &'a bcode_plugin::PluginManifest>,
+    state_base: &Path,
+    overlays: &std::collections::BTreeMap<String, serde_json::Value>,
+) -> std::collections::BTreeMap<String, bcode_plugin::ResolvedPluginConfig> {
     manifests
-        .values()
+        .into_iter()
         .map(|manifest| {
             let mut raw = resolved_plugin_config_value(config, manifest);
             if let Some(overlay) = overlays.get(&manifest.id) {

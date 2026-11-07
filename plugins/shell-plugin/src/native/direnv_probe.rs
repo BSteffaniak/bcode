@@ -113,7 +113,8 @@ mod tests {
     #[test]
     fn successful_probe() {
         let (_dir, path) = script("exit 0");
-        assert!(run(&mut Command::new(path), PROBE_TIMEOUT).is_ok());
+        let result = run(&mut Command::new(path), PROBE_TIMEOUT);
+        assert!(result.is_ok(), "successful probe failed: {result:?}");
     }
 
     #[test]

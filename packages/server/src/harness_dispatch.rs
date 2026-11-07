@@ -1410,10 +1410,15 @@ async fn dispatch_execution_catalog_request(
         let query: bcode_harness_models::HarnessPrepareCandidateRequest =
             serde_json::from_str(&request.request_json)
                 .map_err(|_| failure(ManagedHarnessError::Invalid))?;
-        let response = HarnessPluginTransport::new(Arc::clone(state))
-            .prepare_candidate(&query)
-            .await
-            .map_err(failure)?;
+        let response = HarnessPluginTransport::with_view(
+            Arc::clone(state),
+            crate::harness::configuration_views::for_client(state, *client_id)
+                .await
+                .map_err(failure)?,
+        )
+        .prepare_candidate(&query)
+        .await
+        .map_err(failure)?;
         let response_json =
             serde_json::to_string(&response).map_err(|_| failure(ManagedHarnessError::Invalid))?;
         if response_json.len() > bcode_harness_models::MAX_HARNESS_WIRE_BYTES {

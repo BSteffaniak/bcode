@@ -492,6 +492,25 @@ pub struct ManagedSessionHistoryRequest {
     pub limit: u16,
 }
 impl ManagedSessionRequest {
+    /// Decode a selected native installation preparation without granting setup or auth authority.
+    /// # Errors
+    /// Rejects other operations, incompatible envelopes and malformed candidate metadata.
+    pub fn decode_prepare_candidate(
+        &self,
+    ) -> Result<bcode_harness_models::HarnessPrepareCandidateRequest, &'static str> {
+        self.validate_envelope()?;
+        if self.operation != ManagedSessionOperation::PrepareCandidate {
+            return Err("candidate preparation operation mismatch");
+        }
+        let query: bcode_harness_models::HarnessPrepareCandidateRequest =
+            serde_json::from_str(&self.request_json)
+                .map_err(|_| "invalid candidate preparation request")?;
+        query
+            .validate()
+            .map_err(|_| "invalid candidate preparation request")?;
+        Ok(query)
+    }
+
     /// Decode the opt-in execution inventory without accepting native mutation payloads.
     /// # Errors
     /// Rejects other operations, incompatible envelopes and invalid bounded queries.

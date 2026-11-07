@@ -33,6 +33,61 @@ impl<'a> ServicesApplicationHandle<'a> {
         Self { state, client_id }
     }
 
+    async fn call_harness_configuration(
+        &self,
+        operation: &str,
+        payload: Vec<u8>,
+    ) -> Result<PluginServiceResponse, PluginApplicationFailure> {
+        let invalid = || PluginApplicationFailure {
+            code: "managed_configuration_unavailable".into(),
+            message: "managed configuration admission failed".into(),
+        };
+        let budget = match operation {
+            "catalog" | "prepare" => 4096,
+            "prepare_setup" => 256 * 1024,
+            _ => return Err(invalid()),
+        };
+        if payload.len() > budget {
+            return Err(invalid());
+        }
+        let interface = "bcode.harness.configuration/v1";
+        let plugin = self
+            .state
+            .plugins
+            .registry()
+            .service_registry()
+            .unique_provider(interface)
+            .map_err(|_| invalid())?
+            .to_owned();
+        let view = crate::harness::configuration_views::for_client(self.state, self.client_id)
+            .await
+            .map_err(|_| invalid())?;
+        let response = view
+            .invoke_service_with_bridge_scoped(
+                &plugin,
+                interface,
+                operation,
+                payload,
+                bcode_plugin::PluginInvocationScope::Global,
+                None,
+            )
+            .await
+            .map_err(|_| invalid())?;
+        drop(view);
+        if response.payload.len() > 1024 * 1024 {
+            return Err(invalid());
+        }
+        Ok(PluginServiceResponse {
+            payload: response.payload,
+            error: response
+                .error
+                .map(|error| bcode_plugin_sdk::application::PluginServiceError {
+                    code: error.code,
+                    message: error.message,
+                }),
+        })
+    }
+
     fn require_running(&self) -> Result<(), (&'static str, &'static str)> {
         if self
             .state
@@ -359,6 +414,9 @@ impl PluginApplication for ServicesApplicationHandle<'_> {
                     code: "daemon_stopping".into(),
                     message: "daemon is not admitting plugin work".into(),
                 })?;
+        if interface_id == "bcode.harness.configuration/v1" {
+            return self.call_harness_configuration(&operation, payload).await;
+        }
         let result = if interface_id == bcode_session_import::SESSION_IMPORT_INTERFACE_ID {
             crate::session_import::call_import_service(self.state, &operation, &payload).await
         } else {

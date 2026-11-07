@@ -396,8 +396,43 @@ pub(crate) fn invoke(context: &NativeServiceContext) -> ServiceResponse {
     }
 }
 
+// Native portable contracts allow extension fields elsewhere; configuration preparation is a
+// strict reviewed boundary. Opaque adapter objects round-trip unchanged and stay native-owned.
+fn contains_unknown_fields(input: &serde_json::Value, typed: &serde_json::Value) -> bool {
+    match (input, typed) {
+        (serde_json::Value::Object(input), serde_json::Value::Object(typed)) => {
+            input.iter().any(|(key, value)| {
+                typed
+                    .get(key)
+                    .is_none_or(|known| contains_unknown_fields(value, known))
+            })
+        }
+        (serde_json::Value::Array(input), serde_json::Value::Array(typed)) => {
+            input.len() != typed.len()
+                || input
+                    .iter()
+                    .zip(typed)
+                    .any(|(value, known)| contains_unknown_fields(value, known))
+        }
+        _ => false,
+    }
+}
+
 fn prepare_setup(context: &NativeServiceContext) -> ServiceResponse {
-    if let Ok(request) = context.request.payload_json::<PrepareNativeSetupRequest>() {
+    // A native proposal must never fall back to an older setup shape when malformed.
+    let Ok(value) = context.request.payload_json::<serde_json::Value>() else {
+        return ServiceResponse::error("invalid_request", "invalid managed setup request");
+    };
+    if value.get("request").is_some() || value.get("response").is_some() {
+        let Ok(request) = context.request.payload_json::<PrepareNativeSetupRequest>() else {
+            return ServiceResponse::error("invalid_request", "invalid native setup proposal");
+        };
+        let Ok(typed) = serde_json::to_value(&request) else {
+            return ServiceResponse::error("invalid_request", "invalid native setup proposal");
+        };
+        if contains_unknown_fields(&value, &typed) {
+            return ServiceResponse::error("invalid_request", "unknown native setup fields");
+        }
         return prepare_native_setup(context, request);
     }
     let request = if let Ok(request) = context.request.payload_json::<PrepareSetupRequest>() {

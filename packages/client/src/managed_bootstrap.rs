@@ -7,6 +7,8 @@ pub use auth_flow::ManagedSessionAuthFlow;
 mod attachment;
 #[cfg(test)]
 mod execution_tests;
+#[cfg(test)]
+mod setup_tests;
 pub use attachment::{ManagedSessionCommandHandle, ManagedSessionConnection};
 
 use crate::{BcodeClient, ClientError, ClientRuntimeContext, PluginServiceResponse};
@@ -18,6 +20,8 @@ use std::path::PathBuf;
 
 const CONFIGURATION_INTERFACE: &str = "bcode.harness.configuration/v1";
 const MAX_CONFIGURATION_REQUEST: usize = 4096;
+// Matches the generic configuration service's bounded, nonsecret setup proposal budget.
+const MAX_SETUP_REQUEST: usize = 256 * 1024;
 
 /// Managed-only client retaining the normal config, endpoint, state-root and handshake pipeline.
 ///
@@ -47,6 +51,33 @@ impl ManagedSessionClient {
         Self {
             inner: BcodeClient::default_endpoint_with_context(context),
         }
+    }
+
+    /// Discover terminal-auth metadata for one explicitly selected canonical session/instance.
+    ///
+    /// Uses the existing session command binding and exact plugin service declaration selector.
+    /// Metadata is not readiness or permission; this performs no login, attachment or native launch.
+    /// Consumes this client, like `session_auth_flow`; use a separately configured managed client
+    /// when opening the subsequent sealed auth flow.
+    /// # Errors
+    /// Returns canonical binding, explicit instance mismatch, discovery or ambiguous-service errors.
+    pub async fn session_terminal_auth_interface(
+        self,
+        session_id: bcode_session_models::SessionId,
+        instance_id: &str,
+    ) -> Result<Option<String>, ClientError> {
+        let commands = ManagedSessionCommandHandle {
+            client: std::sync::Arc::new(self),
+            session_id,
+            command_connection: std::sync::Arc::default(),
+        };
+        let binding = commands.binding().await?;
+        if binding.instance.instance_id != instance_id {
+            return Err(ClientError::Protocol(
+                "terminal auth metadata requires the exact canonical managed instance".into(),
+            ));
+        }
+        commands.terminal_auth_interface().await
     }
 
     /// Revalidate a selected installation and obtain a plugin-owned configuration proposal.
@@ -310,12 +341,77 @@ enum Selection {
     Instance { instance_id: String },
 }
 
+// Local serialized contract for configuration/v1 prepare_setup. The native contracts remain
+// domain-owned; the client must not depend on the generic plugin implementation crate.
+#[derive(serde::Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct NativeSetupRequest {
+    request: bcode_harness_models::HarnessPrepareCandidateRequest,
+    response: bcode_harness_models::HarnessPrepareCandidateResponse,
+    adapter_configuration: serde_json::Value,
+    make_default: bool,
+}
+
+// Portable native structs are forward-compatible elsewhere. This sealed bootstrap route is
+// deliberately strict: reject fields that deserialization would silently discard. Opaque native
+// adapter settings retain all their fields when serialized and are not interpreted by the client.
+fn contains_unknown_fields(input: &serde_json::Value, typed: &serde_json::Value) -> bool {
+    match (input, typed) {
+        (serde_json::Value::Object(input), serde_json::Value::Object(typed)) => {
+            input.iter().any(|(key, value)| {
+                typed
+                    .get(key)
+                    .is_none_or(|known| contains_unknown_fields(value, known))
+            })
+        }
+        (serde_json::Value::Array(input), serde_json::Value::Array(typed)) => {
+            input.len() != typed.len()
+                || input
+                    .iter()
+                    .zip(typed)
+                    .any(|(value, known)| contains_unknown_fields(value, known))
+        }
+        _ => false,
+    }
+}
+
+fn validate_native_setup(payload: &[u8]) -> Result<(), ClientError> {
+    let invalid = || ClientError::Protocol("invalid native setup proposal".into());
+    let request: NativeSetupRequest = serde_json::from_slice(payload).map_err(|_| invalid())?;
+    let input: serde_json::Value = serde_json::from_slice(payload).map_err(|_| invalid())?;
+    let typed = serde_json::to_value(&request).map_err(|_| invalid())?;
+    request.request.validate().map_err(|_| invalid())?;
+    request
+        .response
+        .validate_for(&request.request, &request.request.candidate.plugin_id)
+        .map_err(|_| invalid())?;
+    if contains_unknown_fields(&input, &typed)
+        || !(request.adapter_configuration.is_null() || request.adapter_configuration.is_object())
+        || !matches!(
+            request.response.kind,
+            bcode_harness_models::HarnessPrepareCandidateResponseKind::Prepared(_)
+        )
+    {
+        return Err(invalid());
+    }
+    Ok(())
+}
+
 fn validate_route(interface: &str, operation: &str, payload: &[u8]) -> Result<(), ClientError> {
     let invalid = || {
         ClientError::Protocol("managed bootstrap only permits validated managed operations".into())
     };
-    if interface == CONFIGURATION_INTERFACE && payload.len() <= MAX_CONFIGURATION_REQUEST {
+    if interface == CONFIGURATION_INTERFACE {
+        let budget = if operation == "prepare_setup" {
+            MAX_SETUP_REQUEST
+        } else {
+            MAX_CONFIGURATION_REQUEST
+        };
+        if payload.len() > budget {
+            return Err(invalid());
+        }
         return match operation {
+            "prepare_setup" => validate_native_setup(payload),
             "catalog" => serde_json::from_slice::<CatalogRequest>(payload)
                 .map(|_| ())
                 .map_err(|_| invalid()),
@@ -349,9 +445,7 @@ fn validate_route(interface: &str, operation: &str, payload: &[u8]) -> Result<()
         return Err(invalid());
     }
     if request.operation == ManagedSessionOperation::PrepareCandidate {
-        let query: bcode_harness_models::HarnessPrepareCandidateRequest =
-            serde_json::from_str(&request.request_json).map_err(|_| invalid())?;
-        query.validate().map_err(|_| invalid())?;
+        request.decode_prepare_candidate().map_err(|_| invalid())?;
     } else if request.operation == ManagedSessionOperation::DiscoverCandidates {
         let query: bcode_ipc::harness::ManagedCandidatesRequest =
             serde_json::from_str(&request.request_json).map_err(|_| invalid())?;

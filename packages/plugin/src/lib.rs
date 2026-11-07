@@ -1712,6 +1712,7 @@ impl LoadedPlugin {
 
     fn resolve_service_secrets(
         &self,
+        config: &ResolvedPluginConfig,
         interface_id: &str,
         operation: &str,
         has_invocation_credentials: bool,
@@ -1726,7 +1727,7 @@ impl LoadedPlugin {
         if sensitive_only || has_invocation_credentials {
             Ok(BTreeMap::new())
         } else {
-            self.config
+            config
                 .resolve_secrets(interface_id, operation)
                 .map_err(|error| match error {
                     PluginLoadError::SecretResolution { message, .. } => {
@@ -1751,6 +1752,31 @@ impl LoadedPlugin {
         interface_id: impl Into<String>,
         operation: impl Into<String>,
         payload: Vec<u8>,
+        on_event: impl FnMut(Vec<u8>),
+        on_bridge: impl FnMut(
+            ServiceBridgeRequest,
+            bcode_plugin_sdk::ServiceCancellation,
+        ) -> Result<ServiceBridgeResponse, String>,
+        cancellation: &bcode_plugin_sdk::ServiceCancellation,
+    ) -> Result<ServiceResponse, PluginLoadError> {
+        self.invoke_service_with_config(
+            &self.config,
+            interface_id,
+            operation,
+            payload,
+            on_event,
+            on_bridge,
+            cancellation,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn invoke_service_with_config(
+        &self,
+        config: &ResolvedPluginConfig,
+        interface_id: impl Into<String>,
+        operation: impl Into<String>,
+        payload: Vec<u8>,
         mut on_event: impl FnMut(Vec<u8>),
         mut on_bridge: impl FnMut(
             ServiceBridgeRequest,
@@ -1771,6 +1797,7 @@ impl LoadedPlugin {
                 .map(|context| Arc::clone(&context.resolver))
         });
         let secrets = self.resolve_service_secrets(
+            config,
             &interface_id,
             &operation,
             invocation_credentials.is_some(),
@@ -1784,10 +1811,10 @@ impl LoadedPlugin {
                 payload,
             },
             config: PluginConfigContext {
-                config: self.config.config.clone(),
-                redacted_config: self.config.redacted_config.clone(),
+                config: config.config.clone(),
+                redacted_config: config.redacted_config.clone(),
                 secrets,
-                state_root: self.config.state_root.clone(),
+                state_root: config.state_root.clone(),
             },
             events: bcode_plugin_sdk::ServiceEventEmitter::default(),
             cancellation: bcode_plugin_sdk::ServiceCancellation::default(),
@@ -2878,6 +2905,7 @@ impl std::fmt::Debug for PluginInvocationBridge {
 
 #[derive(Debug)]
 struct PluginInvocation {
+    config: Option<ResolvedPluginConfig>,
     diagnostics: diagnostics::DiagnosticOrigin,
     id: PluginInvocationId,
     class: PluginInvocationClass,
@@ -3243,6 +3271,7 @@ impl PluginExecutorHandle {
                     "plugin service invocation serialized by host"
                 );
                 let invocation = PluginInvocation {
+                    config: None,
                     diagnostics: diagnostics::DiagnosticOrigin::current(),
                     id: invocation_id,
                     class,
@@ -3275,6 +3304,7 @@ impl PluginExecutorHandle {
                 };
                 let (unused_response, _) = oneshot::channel();
                 let invocation = PluginInvocation {
+                    config: None,
                     diagnostics: diagnostics::DiagnosticOrigin::current(),
                     id: invocation_id,
                     class,
@@ -3322,6 +3352,7 @@ impl PluginExecutorHandle {
         event_sender: Option<mpsc::UnboundedSender<Vec<u8>>>,
         bridge: Option<PluginInvocationBridge>,
         resource_permit: Arc<PluginResourcePermit>,
+        config: Option<ResolvedPluginConfig>,
     ) -> Result<ServiceResponse, PluginLoadError> {
         let invocation_id = next_plugin_invocation_id();
         let cancellation = PluginInvocationCancelHandle {
@@ -3332,6 +3363,7 @@ impl PluginExecutorHandle {
         let result = {
             let (response, receiver) = oneshot::channel();
             let invocation = PluginInvocation {
+                config,
                 diagnostics: diagnostics::DiagnosticOrigin::current(),
                 id: invocation_id,
                 class,
@@ -4182,7 +4214,83 @@ pub struct PluginRuntimeHost {
     metrics: bcode_metrics::MetricsRegistry,
 }
 
+/// Immutable, host-admitted service configuration sharing an existing executor runtime.
+///
+/// Construction is plumbing, not admission authority: callers must validate configuration,
+/// state roots and credential resolvers before supplying them. This view cannot reload plugins,
+/// change selection, publish events, deactivate executors or mutate runtime defaults.
+#[derive(Debug, Clone)]
+pub struct PluginServiceConfigView {
+    runtime: PluginRuntimeHost,
+    identity: Arc<()>,
+    configs: Arc<BTreeMap<String, ResolvedPluginConfig>>,
+}
+
+impl PluginServiceConfigView {
+    /// Whether two handles refer to the same immutable service configuration view.
+    #[must_use]
+    pub fn same_config_view(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.identity, &other.identity)
+    }
+
+    /// Return the shared executor runtime identity, not the configuration view identity.
+    #[must_use]
+    pub fn runtime_generation(&self) -> PluginRuntimeGeneration {
+        self.runtime.runtime_generation()
+    }
+
+    /// Invoke with this view's exact configuration, resolver and state root.
+    /// Configuration is captured before any resource or executor queue wait. Service policy,
+    /// resource limits, bridge validation, cancellation and executor state are unchanged.
+    ///
+    /// # Errors
+    /// Returns an error if the plugin or its view configuration is missing, the bridge is
+    /// incompatible, resource admission fails, or service execution fails. Missing configuration
+    /// never falls back to runtime defaults.
+    pub async fn invoke_service_with_bridge_scoped(
+        &self,
+        plugin_id: &str,
+        interface_id: impl Into<String>,
+        operation: impl Into<String>,
+        payload: Vec<u8>,
+        scope: PluginInvocationScope,
+        bridge: Option<PluginInvocationBridge>,
+    ) -> Result<ServiceResponse, PluginLoadError> {
+        let config = self
+            .configs
+            .get(plugin_id)
+            .cloned()
+            .ok_or_else(|| PluginLoadError::PluginNotLoaded(plugin_id.to_owned()))?;
+        self.runtime
+            .invoke_service_with_config_scoped(
+                plugin_id,
+                interface_id,
+                operation,
+                payload,
+                scope,
+                bridge,
+                Some(config),
+            )
+            .await
+    }
+}
+
 impl PluginRuntimeHost {
+    /// Construct a service-only immutable view from host-admitted resolved configurations.
+    /// No validation of client configuration or permission grant is implied. Each call creates
+    /// a distinct view; clones share view identity and all views share executor ownership.
+    #[must_use]
+    pub fn service_config_view(
+        &self,
+        configs: BTreeMap<String, ResolvedPluginConfig>,
+    ) -> PluginServiceConfigView {
+        PluginServiceConfigView {
+            runtime: self.clone(),
+            identity: Arc::new(()),
+            configs: Arc::new(configs),
+        }
+    }
+
     /// Whether both handles belong to the same loaded runtime generation.
     /// Clones retain identity; reloading configuration, credentials, or plugin
     /// selection creates a distinct runtime even when manifests are identical.
@@ -4619,6 +4727,29 @@ impl PluginRuntimeHost {
         scope: PluginInvocationScope,
         bridge: Option<PluginInvocationBridge>,
     ) -> Result<ServiceResponse, PluginLoadError> {
+        self.invoke_service_with_config_scoped(
+            plugin_id,
+            interface_id,
+            operation,
+            payload,
+            scope,
+            bridge,
+            None,
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn invoke_service_with_config_scoped(
+        &self,
+        plugin_id: &str,
+        interface_id: impl Into<String>,
+        operation: impl Into<String>,
+        payload: Vec<u8>,
+        scope: PluginInvocationScope,
+        bridge: Option<PluginInvocationBridge>,
+        config: Option<ResolvedPluginConfig>,
+    ) -> Result<ServiceResponse, PluginLoadError> {
         if let Some(bridge) = &bridge {
             bridge.require_synchronous(plugin_id)?;
         }
@@ -4667,6 +4798,7 @@ impl PluginRuntimeHost {
             None,
             bridge,
             resource_permit.clone(),
+            config,
         ))
         .await;
         drop(resource_permit);
@@ -5445,7 +5577,8 @@ fn execute_plugin_service_invocation(
     let mut delivered_events = 0_u64;
     let capture = invocation.diagnostics.0.clone();
     let invoke = || {
-        plugin.invoke_service_with_bridge(
+        plugin.invoke_service_with_config(
+            invocation.config.as_ref().unwrap_or(&plugin.config),
             invocation.interface_id,
             invocation.operation,
             invocation.payload,
@@ -6681,6 +6814,9 @@ fn default_register_auth_providers_symbol() -> String {
 fn default_event_symbol() -> String {
     DEFAULT_NATIVE_EVENT_SYMBOL.to_string()
 }
+
+#[cfg(test)]
+mod service_config_view_tests;
 
 #[cfg(test)]
 mod tests {

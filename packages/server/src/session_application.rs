@@ -935,14 +935,18 @@ impl SessionApplication for SessionApplicationHandle<'_> {
         session_id: SessionId,
     ) -> Result<SessionSummary, SessionApplicationFailure> {
         self.selected_location(session_id).await?;
-        session_operations::delete(self.state, session_id)
+        let deleted = session_operations::delete(self.state, session_id)
             .await
             .map_err(|error| match error {
                 session_operations::DeleteSessionError::Session(error) => session_failure(&error),
                 error @ session_operations::DeleteSessionError::Busy(_) => {
                     failure(error.code(), error.message())
                 }
-            })
+            })?;
+        self.state
+            .harness_configuration_views
+            .retire_parent(session_id);
+        Ok(deleted)
     }
 
     async fn session_history_page(
@@ -1124,6 +1128,26 @@ impl SessionApplication for SessionApplicationHandle<'_> {
         request: CreateSessionRequest,
     ) -> Result<SessionSummary, SessionApplicationFailure> {
         self.require_running()?;
+        let mut reservation = Some(
+            self.state
+                .harness_configuration_views
+                .reserve_parent(
+                    crate::harness::configuration_views::for_client(self.state, self.client_id)
+                        .await
+                        .map_err(|_| {
+                            failure(
+                                "managed_configuration_unavailable",
+                                "session configuration admission failed",
+                            )
+                        })?,
+                )
+                .map_err(|_| {
+                    failure(
+                        "managed_configuration_unavailable",
+                        "session configuration capacity unavailable",
+                    )
+                })?,
+        );
         let session = Box::pin(session_operations::create(
             self.state,
             request.name,
@@ -1131,6 +1155,11 @@ impl SessionApplication for SessionApplicationHandle<'_> {
         ))
         .await
         .map_err(|error| failure(error.code(), error.message()))?;
+        reservation
+            .take()
+            .expect("reserved parent capacity")
+            .commit(session.id);
+        drop(reservation);
         let runtime = self.state.client_runtime_context(self.client_id).await;
         self.state
             .set_session_config_from_runtime_context(session.id, runtime.as_ref())

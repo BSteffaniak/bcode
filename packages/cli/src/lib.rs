@@ -16104,8 +16104,20 @@ fn load_cli_plugin_host() -> Result<bcode_plugin::PluginHost, CliError> {
     let config = bcode_config::load_config()?;
     let selection = plugin_selection_for_config(&config);
     let static_plugins = static_bundled_plugins();
-    bcode_plugin::PluginHost::load_defaults_with_static_bundled(&selection, &static_plugins)
-        .map_err(CliError::Plugin)
+    let configs = bcode_plugin_config::resolve_plugin_configs(
+        &config,
+        &static_plugins,
+        &bcode_config::default_state_dir()
+            .join("derived")
+            .join("plugins")
+            .join(bcode_ipc::daemon_namespace()),
+    );
+    bcode_plugin::PluginHost::load_defaults_with_static_bundled_and_config(
+        &selection,
+        &static_plugins,
+        configs,
+    )
+    .map_err(CliError::Plugin)
 }
 
 /// Return caller-provided statically bundled plugin registrations.

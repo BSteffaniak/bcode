@@ -216,6 +216,7 @@ pub(super) const CALL_TIMEOUT: Duration = Duration::from_secs(30);
 #[derive(Clone)]
 pub struct HarnessPluginTransport {
     state: Arc<crate::ServerState>,
+    view: Option<bcode_plugin::PluginServiceConfigView>,
 }
 
 /// Ephemeral auth-only envelope. No serialization/debug implementation is exposed to callers.
@@ -389,7 +390,12 @@ impl HarnessPluginTransport {
             return Err(ManagedHarnessError::StaleOwner);
         }
         drop(store);
-        let payload = self.auth_payload(&request).await?;
+        let payload = Self::with_view(
+            Arc::clone(&self.state),
+            super::configuration_views::for_owner(&self.state, &owner).await?,
+        )
+        .auth_payload(&request)
+        .await?;
         validate_auth_result(admission, &request, &payload)
     }
 
@@ -499,14 +505,16 @@ impl HarnessPluginTransport {
         // route through public plugin-service IPC, tool invocation, or request/event tracing.
         let response = tokio::time::timeout(
             CALL_TIMEOUT,
-            self.state.plugins.invoke_service_with_bridge_scoped(
-                plugin_id,
-                bcode_harness_models::HARNESS_INTERFACE_ID,
-                request.kind.operation().as_str(),
-                bytes,
-                bcode_plugin::PluginInvocationScope::Global,
-                self.credential_bridge(request),
-            ),
+            self.configuration_view()
+                .await?
+                .invoke_service_with_bridge_scoped(
+                    plugin_id,
+                    bcode_harness_models::HARNESS_INTERFACE_ID,
+                    request.kind.operation().as_str(),
+                    bytes,
+                    bcode_plugin::PluginInvocationScope::Global,
+                    self.credential_bridge(request),
+                ),
         )
         .await
         .map_err(|_| ManagedHarnessError::Deadline)?
@@ -520,7 +528,33 @@ impl HarnessPluginTransport {
     /// Bind to the owning daemon. Caller admission is performed by the application layer.
     #[must_use]
     pub const fn new(state: Arc<crate::ServerState>) -> Self {
-        Self { state }
+        Self { state, view: None }
+    }
+
+    pub(crate) const fn with_view(
+        state: Arc<crate::ServerState>,
+        view: bcode_plugin::PluginServiceConfigView,
+    ) -> Self {
+        Self {
+            state,
+            view: Some(view),
+        }
+    }
+
+    async fn configuration_view(
+        &self,
+    ) -> Result<bcode_plugin::PluginServiceConfigView, ManagedHarnessError> {
+        if let Ok(owner) = CREDENTIAL_CALLER.try_with(|(_, owner, _)| owner.clone()) {
+            return super::configuration_views::for_owner(&self.state, &owner).await;
+        }
+        let view = match &self.view {
+            Some(view) => view.clone(),
+            None => super::configuration_views::baseline(&self.state)?,
+        };
+        if view.runtime_generation() != self.state.plugins.runtime_generation() {
+            return Err(ManagedHarnessError::StaleOwner);
+        }
+        Ok(view)
     }
 
     /// Discover native installation candidates with manifest ownership and no credential bridge.
@@ -556,14 +590,16 @@ impl HarnessPluginTransport {
         let bytes = serde_json::to_vec(request).map_err(|_| ManagedHarnessError::Invalid)?;
         let response = tokio::time::timeout(
             CALL_TIMEOUT,
-            self.state.plugins.invoke_service_with_bridge_scoped(
-                plugin_id,
-                HARNESS_CANDIDATES_INTERFACE_ID,
-                HARNESS_DISCOVER_CANDIDATES_OPERATION,
-                bytes,
-                bcode_plugin::PluginInvocationScope::Global,
-                None,
-            ),
+            self.configuration_view()
+                .await?
+                .invoke_service_with_bridge_scoped(
+                    plugin_id,
+                    HARNESS_CANDIDATES_INTERFACE_ID,
+                    HARNESS_DISCOVER_CANDIDATES_OPERATION,
+                    bytes,
+                    bcode_plugin::PluginInvocationScope::Global,
+                    None,
+                ),
         )
         .await
         .map_err(|_| ManagedHarnessError::Deadline)?
@@ -613,14 +649,16 @@ impl HarnessPluginTransport {
         let bytes = serde_json::to_vec(request).map_err(|_| ManagedHarnessError::Invalid)?;
         let response = tokio::time::timeout(
             CALL_TIMEOUT,
-            self.state.plugins.invoke_service_with_bridge_scoped(
-                plugin_id,
-                HARNESS_CANDIDATES_INTERFACE_ID,
-                HARNESS_PREPARE_CANDIDATE_OPERATION,
-                bytes,
-                bcode_plugin::PluginInvocationScope::Global,
-                None,
-            ),
+            self.configuration_view()
+                .await?
+                .invoke_service_with_bridge_scoped(
+                    plugin_id,
+                    HARNESS_CANDIDATES_INTERFACE_ID,
+                    HARNESS_PREPARE_CANDIDATE_OPERATION,
+                    bytes,
+                    bcode_plugin::PluginInvocationScope::Global,
+                    None,
+                ),
         )
         .await
         .map_err(|_| ManagedHarnessError::Deadline)?
@@ -683,14 +721,16 @@ impl HarnessPluginTransport {
         // custody stays native; API-key resolution without an admitted owner fails closed.
         let response = tokio::time::timeout(
             CALL_TIMEOUT,
-            self.state.plugins.invoke_service_with_bridge_scoped(
-                plugin_id,
-                HARNESS_MODELS_INTERFACE_ID,
-                request.kind.operation(),
-                bytes,
-                bcode_plugin::PluginInvocationScope::Global,
-                self.credential_bridge(&inspect),
-            ),
+            self.configuration_view()
+                .await?
+                .invoke_service_with_bridge_scoped(
+                    plugin_id,
+                    HARNESS_MODELS_INTERFACE_ID,
+                    request.kind.operation(),
+                    bytes,
+                    bcode_plugin::PluginInvocationScope::Global,
+                    self.credential_bridge(&inspect),
+                ),
         )
         .await
         .map_err(|_| ManagedHarnessError::Deadline)?
@@ -751,14 +791,16 @@ impl HarnessPluginTransport {
         let bridge = self.credential_bridge(request);
         let response = tokio::time::timeout(
             CALL_TIMEOUT,
-            self.state.plugins.invoke_service_with_bridge_scoped(
-                plugin_id,
-                bcode_harness_models::HARNESS_INTERFACE_ID,
-                operation,
-                bytes,
-                bcode_plugin::PluginInvocationScope::Global,
-                bridge,
-            ),
+            self.configuration_view()
+                .await?
+                .invoke_service_with_bridge_scoped(
+                    plugin_id,
+                    bcode_harness_models::HARNESS_INTERFACE_ID,
+                    operation,
+                    bytes,
+                    bcode_plugin::PluginInvocationScope::Global,
+                    bridge,
+                ),
         )
         .await
         .map_err(|_| ManagedHarnessError::Deadline)?

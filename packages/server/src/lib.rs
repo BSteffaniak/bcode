@@ -448,6 +448,7 @@ pub struct ServerState {
     test_state_root: Option<Arc<tempfile::TempDir>>,
     managed_sessions: std::sync::OnceLock<Arc<dyn harness_dispatch::ManagedSessionBackend>>,
     managed_auth: tokio::sync::OnceCell<harness_auth::HarnessAuthService>,
+    harness_configuration_views: harness::configuration_views::ConfigurationViews,
     // Ephemeral native-login handoff claims, boot-scoped like the auth registry. They are
     // never durable execution/session state and are never cleared by frontend disconnect.
     managed_auth_handoffs: Mutex<BTreeMap<u64, String>>,
@@ -495,6 +496,7 @@ pub struct ServerState {
     account_lifecycle_invalidations: Mutex<BTreeMap<bcode_provider_auth_models::AccountId, String>>,
     account_lifecycle_plans: Mutex<BTreeMap<String, account_lifecycle::RetainedPlan>>,
     startup_config: bcode_config::BcodeConfig,
+    startup_config_authority: Option<bcode_config::recovery::ConfigSourceAuthority>,
     history_auth_gate: Arc<tokio::sync::Semaphore>,
     session_configs: Mutex<BTreeMap<SessionId, bcode_config::BcodeConfig>>,
     session_config_launches: Mutex<BTreeMap<SessionId, bcode_config::ConfigLaunchContext>>,
@@ -1733,6 +1735,7 @@ struct ServerStateInit {
     selected_model_id: Option<String>,
     selected_provider_context: bcode_model::ProviderRequestContext,
     startup_config: bcode_config::BcodeConfig,
+    startup_config_authority: Option<bcode_config::recovery::ConfigSourceAuthority>,
     selected_reasoning: bcode_config::ReasoningConfig,
     selected_reasoning_capabilities: Option<bcode_model::ModelReasoningInfo>,
     provider_state: ProviderStateStore,
@@ -2639,6 +2642,8 @@ impl ServerState {
             bcode_runtime_context: bcode_runtime_context.into_boxed_str(),
             managed_sessions: std::sync::OnceLock::new(),
             managed_auth: tokio::sync::OnceCell::new(),
+            harness_configuration_views: harness::configuration_views::ConfigurationViews::default(
+            ),
             managed_auth_handoffs: Mutex::new(BTreeMap::new()),
             sessions,
             storage_worker: storage_maintenance_worker::StorageMaintenanceWorker::default(),
@@ -2679,6 +2684,7 @@ impl ServerState {
             account_lifecycle_invalidations: Mutex::default(),
             account_lifecycle_plans: Mutex::default(),
             startup_config: init.startup_config,
+            startup_config_authority: init.startup_config_authority,
             history_auth_gate: Arc::new(tokio::sync::Semaphore::new(2)),
             contextual_plugin_invocations: StdMutex::default(),
             session_configs: Mutex::default(),
@@ -4744,6 +4750,7 @@ pub async fn run_embedded_with_config(
         static_plugins,
         false,
         config,
+        None,
         Instant::now(),
     ))
     .await
@@ -4759,7 +4766,11 @@ async fn run_with_static_bundled_inner(
     let config_phase = bcode_metrics::startup::phase("server.config");
     let stage_started_at = startup_started_at;
     tracing::debug!(target: "bcode_server::startup", "loading config");
-    let config = bcode_config::load_config()?;
+    let (config, launch) = bcode_config::recovery::load_current_config_with_recovery_context()?;
+    let authority = launch
+        .recovery_sources
+        .as_ref()
+        .and_then(|sources| bcode_config::recovery::ConfigSourceAuthority::capture(sources).ok());
     config_phase.finish();
     tracing::debug!(
         target: "bcode_server::startup",
@@ -4772,6 +4783,7 @@ async fn run_with_static_bundled_inner(
         static_plugins,
         publish_daemon_record,
         config,
+        authority,
         startup_started_at,
     ))
     .await
@@ -4783,6 +4795,7 @@ async fn run_with_config(
     static_plugins: &[bcode_plugin::StaticBundledPlugin],
     publish_daemon_record: bool,
     config: bcode_config::BcodeConfig,
+    startup_config_authority: Option<bcode_config::recovery::ConfigSourceAuthority>,
     startup_started_at: Instant,
 ) -> Result<(), ServerError> {
     let stage_started_at = Instant::now();
@@ -4823,6 +4836,7 @@ async fn run_with_config(
         config,
         startup_started_at,
         ServerStartupServices {
+            config_authority: startup_config_authority,
             plugins,
             model_catalog,
             plugin_selection,
@@ -4925,6 +4939,7 @@ pub async fn run_embedded_with_locations_and_shutdown(
         config,
         Instant::now(),
         ServerStartupServices {
+            config_authority: None,
             locations,
             plugins,
             model_catalog,
@@ -4981,6 +4996,7 @@ pub async fn run_embedded_with_workflow_application(
         config,
         Instant::now(),
         ServerStartupServices {
+            config_authority: None,
             plugins,
             model_catalog,
             plugin_selection,
@@ -4998,6 +5014,7 @@ pub async fn run_embedded_with_workflow_application(
 /// Keep acquisition outside execution so construction failures use the same
 /// plugin cleanup path regardless of how these services were acquired.
 struct ServerStartupServices {
+    config_authority: Option<bcode_config::recovery::ConfigSourceAuthority>,
     locations: Option<bcode_config::StateLocationSet>,
     plugins: bcode_plugin::PluginRuntimeHost,
     model_catalog: bcode_model_catalog::ModelCatalogResolver,
@@ -5016,6 +5033,7 @@ async fn run_with_services(
     services: ServerStartupServices,
 ) -> Result<(), ServerError> {
     let ServerStartupServices {
+        config_authority,
         plugins,
         model_catalog,
         plugin_selection,
@@ -5222,6 +5240,7 @@ async fn run_with_services(
             selected_model_id: resolved_model.model_id,
             selected_provider_context,
             startup_config: config.clone(),
+            startup_config_authority: config_authority,
             selected_reasoning: resolved_model.reasoning.clone(),
             selected_reasoning_capabilities: reasoning_capabilities_from_config(
                 &resolved_model.reasoning,
@@ -46180,6 +46199,7 @@ fn forward_session_events(
                         sink.metrics.set_gauge("server.live_state.pending_subscriber_keys", 0);
                         sink.metrics.set_gauge("server.live_state.pending_subscriber_bytes", 0);
                     }
+                    let was_empty = pending_live.is_empty();
                     match pending_live.push(event) {
                         BufferLiveEventResult::Buffered { superseded } => {
                             if superseded {
@@ -46200,7 +46220,7 @@ fn forward_session_events(
                                 "server.live_state.pending_subscriber_bytes",
                                 i64::try_from(pending_live.encoded_bytes()).unwrap_or(i64::MAX),
                             );
-                            if pending_live.len() == 1 {
+                            if was_empty {
                                 flush_timer.as_mut().reset(
                                     tokio::time::Instant::now()
                                         + SESSION_LIVE_FAN_OUT_FLUSH_INTERVAL,
@@ -85264,6 +85284,7 @@ event_symbol = "bcode_plugin_handle_event_v1"
                 selected_model_id: None,
                 selected_provider_context: bcode_model::ProviderRequestContext::default(),
                 startup_config,
+                startup_config_authority: None,
                 selected_reasoning: bcode_config::ReasoningConfig::default(),
                 selected_reasoning_capabilities: None,
                 provider_state: ProviderStateStore::load(PathBuf::new()),
@@ -104207,6 +104228,7 @@ event_symbol = "bcode_plugin_handle_event_v1"
                 selected_model_id: None,
                 selected_provider_context: bcode_model::ProviderRequestContext::default(),
                 startup_config: bcode_config::BcodeConfig::default(),
+                startup_config_authority: None,
                 selected_reasoning: bcode_config::ReasoningConfig::default(),
                 selected_reasoning_capabilities: None,
                 provider_state: ProviderStateStore::load(PathBuf::new()),
@@ -105101,6 +105123,7 @@ event_symbol = "bcode_plugin_handle_event_v1"
                 selected_model_id: None,
                 selected_provider_context: bcode_model::ProviderRequestContext::default(),
                 startup_config: bcode_config::BcodeConfig::default(),
+                startup_config_authority: None,
                 selected_reasoning: bcode_config::ReasoningConfig::default(),
                 selected_reasoning_capabilities: None,
                 provider_state: ProviderStateStore::load(PathBuf::new()),

@@ -133,9 +133,9 @@ async fn collect_inner(
         if cancel.is_cancelled() {
             return Err(CompactionError::Cancelled);
         }
-        let (request, mut attempt) = prepare_synthesis_request(
+        let (request, mut attempt) = Box::pin(prepare_synthesis_request(
             state, session_id, selection, transcript, prompt, contract, cancel, policy,
-        )
+        ))
         .await?;
         if let Some((checkpoint, key)) = checkpoint.as_mut()
             && let Some(lifecycle) = checkpoint.request_state.as_mut()

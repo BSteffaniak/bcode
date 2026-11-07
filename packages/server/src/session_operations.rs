@@ -440,14 +440,14 @@ pub async fn submit_turn_with_runtime_context(
     );
     let admission_lock = super::turn_admission_lock(state, session_id).await;
     let admission_guard = admission_lock.lock().await;
-    let (admission, user_event) = super::admit_turn_inner(
+    let (admission, user_event) = Box::pin(super::admit_turn_inner(
         state,
         session_id,
         client_id,
         text,
         admission,
         runtime_context.clone(),
-    )
+    ))
     .await
     .map_err(SubmitTurnError::Admission)?;
     let user_event = match &admission {

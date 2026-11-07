@@ -1605,12 +1605,22 @@ fn reap_terminal_child(
     }
 }
 
+type ShellCaptureObserver = Arc<
+    dyn Fn(
+            recording::ShellRecordingCommit,
+            Option<crate::shell_output::ShellSemanticOutput>,
+        ) -> bool
+        + Send
+        + Sync,
+>;
+
 struct TerminalCaptureUpdates {
-    semantic_started: std::cell::Cell<bool>,
     semantic: Arc<StdMutex<Option<crate::shell_output::ShellSemanticOutput>>>,
     presentation: Option<Arc<StdMutex<PrimaryPresentationPublisher>>>,
     latest: Arc<StdMutex<Option<recording::ShellRecordingCommit>>>,
-    observer: recording::ShellRecordingCommitObserver,
+    recording: std::cell::RefCell<Option<recording::ShellRecordingCommit>>,
+    recording_pending: std::cell::Cell<bool>,
+    observer: ShellCaptureObserver,
 }
 
 impl TerminalCaptureUpdates {
@@ -1622,25 +1632,37 @@ impl TerminalCaptureUpdates {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .take();
-        if let Some(commit) = commit {
-            (self.observer)(commit);
-        }
         let semantic = self
             .semantic
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .take();
-        if let Some(semantic) = semantic
+        if let Some(commit) = &commit {
+            *self.recording.borrow_mut() = Some(commit.clone());
+        }
+        // Once recording starts, semantic-only changes refresh that same artifact-bearing
+        // primary. Separate replacements can otherwise erase the recording during IPC coalescing.
+        // Keep a cadence-deferred latest value pending even when a quiet command produces
+        // no further output. The invocation's polling loop retries without blocking capture.
+        if commit.is_some() || semantic.is_some() {
+            self.recording_pending.set(true);
+        }
+        let commit = commit.or_else(|| {
+            self.recording_pending
+                .get()
+                .then(|| self.recording.borrow().clone())
+                .flatten()
+        });
+        if let Some(commit) = commit {
+            self.recording_pending
+                .set(!(self.observer)(commit, semantic));
+        } else if let Some(semantic) = semantic
             && let Some(presentation) = &self.presentation
         {
-            let accepted = presentation
+            let _ = presentation
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .replace_as("bcode.shell.output", 1, &semantic)
-                .is_ok();
-            if accepted {
-                self.semantic_started.set(true);
-            }
+                .replace_as("bcode.shell.output", 1, &semantic);
         }
     }
 }
@@ -1887,11 +1909,12 @@ fn run_terminal_shell_command_inner(
         ))
     });
     let updates = TerminalCaptureUpdates {
-        semantic_started: std::cell::Cell::new(false),
+        recording: std::cell::RefCell::new(None),
+        recording_pending: std::cell::Cell::new(false),
         semantic: Arc::clone(&semantic),
         presentation: Some(Arc::clone(&semantic_presentation)),
         latest: Arc::clone(&latest_commit),
-        observer: shell_recording_commit_observer(
+        observer: shell_capture_observer(
             Some(semantic_presentation),
             events,
             tool_call_id,
@@ -2759,8 +2782,32 @@ fn shell_recording_commit_observer(
     limits: bcode_plugin_sdk::TransientProgressLimits,
     cancellation: bcode_plugin_sdk::ServiceCancellation,
 ) -> recording::ShellRecordingCommitObserver {
+    let observer = shell_capture_observer(
+        existing_presentation,
+        events,
+        tool_call_id,
+        timeout_ms,
+        arguments,
+        limits,
+        cancellation,
+    );
+    Arc::new(move |commit| {
+        let _ = observer(commit, None);
+    })
+}
+
+fn shell_capture_observer(
+    existing_presentation: Option<Arc<StdMutex<PrimaryPresentationPublisher>>>,
+    events: ServiceEventEmitter,
+    tool_call_id: &str,
+    timeout_ms: u64,
+    arguments: serde_json::Value,
+    limits: bcode_plugin_sdk::TransientProgressLimits,
+    cancellation: bcode_plugin_sdk::ServiceCancellation,
+) -> ShellCaptureObserver {
     let tool_call_id = tool_call_id.to_owned();
     let publication_state = Arc::new(std::sync::atomic::AtomicU8::new(0));
+    let latest_semantic = StdMutex::new(None);
     let presentation = existing_presentation.unwrap_or_else(|| {
         Arc::new(StdMutex::new(
             PrimaryPresentationPublisher::with_limits_and_cancellation(
@@ -2775,7 +2822,24 @@ fn shell_recording_commit_observer(
             ),
         ))
     });
-    Arc::new(move |commit| {
+    Arc::new(move |commit, semantic| {
+        let mut latest_semantic = latest_semantic
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(semantic) = semantic {
+            *latest_semantic = Some(semantic);
+        }
+        let mut payload = json!(ShellLiveRecordingPayload {
+            mode: "terminal",
+            timeout_ms,
+            arguments: arguments.clone(),
+        });
+        if let Some(semantic) = latest_semantic.as_ref() {
+            payload["output"] = json!(semantic.output);
+            payload["output_bytes"] = json!(semantic.output_bytes);
+            payload["output_truncated"] = json!(semantic.output_truncated);
+        }
+        drop(latest_semantic);
         let artifact = ToolContributionArtifact {
             artifact_id: format!("{tool_call_id}-shell-run"),
             reference_key: SHELL_RECORDING_REF_KEY.to_owned(),
@@ -2792,7 +2856,9 @@ fn shell_recording_commit_observer(
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let publish_immediately = if commit.finalized {
             true
-        } else if commit.committed_bytes > recording::RECORDING_HEADER_AND_START_BYTES {
+        } else if commit.committed_bytes > recording::RECORDING_HEADER_AND_START_BYTES
+            && publication_state.load(std::sync::atomic::Ordering::Acquire) != 2
+        {
             publication_state.store(2, std::sync::atomic::Ordering::Release);
             true
         } else if publication_state.load(std::sync::atomic::Ordering::Acquire) == 0 {
@@ -2802,27 +2868,23 @@ fn shell_recording_commit_observer(
             false
         };
         if publish_immediately {
-            let _ = presentation.replace_with_artifact_as(
-                SHELL_RUN_SCHEMA,
-                SHELL_SCHEMA_VERSION,
-                &ShellLiveRecordingPayload {
-                    mode: "terminal",
-                    timeout_ms,
-                    arguments: arguments.clone(),
-                },
-                artifact,
-            );
+            presentation
+                .replace_with_artifact_as(
+                    SHELL_RUN_SCHEMA,
+                    SHELL_SCHEMA_VERSION,
+                    &payload,
+                    artifact,
+                )
+                .is_ok()
         } else {
-            let _ = presentation.replace_with_artifact_as_if_ready(
-                SHELL_RUN_SCHEMA,
-                SHELL_SCHEMA_VERSION,
-                &ShellLiveRecordingPayload {
-                    mode: "terminal",
-                    timeout_ms,
-                    arguments: arguments.clone(),
-                },
-                artifact,
-            );
+            presentation
+                .replace_with_artifact_as_if_ready(
+                    SHELL_RUN_SCHEMA,
+                    SHELL_SCHEMA_VERSION,
+                    &payload,
+                    artifact,
+                )
+                .is_ok_and(|revision| revision.is_some())
         }
     })
 }
@@ -4543,6 +4605,148 @@ mod tests {
         );
     }
 
+    #[test]
+    fn recording_and_semantic_updates_keep_one_artifact_bearing_primary() {
+        for together in [false, true] {
+            let events = Mutex::new(Vec::<Vec<u8>>::new());
+            let emitter = ServiceEventEmitter::new(
+                Some(capture_service_event),
+                std::ptr::from_ref(&events).cast_mut().cast(),
+            );
+            let semantic = Arc::new(StdMutex::new(None));
+            let latest = Arc::new(StdMutex::new(None));
+            let updates = TerminalCaptureUpdates {
+                semantic: Arc::clone(&semantic),
+                presentation: None,
+                latest: Arc::clone(&latest),
+                recording: std::cell::RefCell::new(None),
+                recording_pending: std::cell::Cell::new(false),
+                observer: shell_capture_observer(
+                    None,
+                    emitter,
+                    "combined-capture",
+                    DEFAULT_SHELL_TIMEOUT_MS,
+                    json!({"command": "printf first"}),
+                    bcode_plugin_sdk::TransientProgressLimits {
+                        min_interval_ms: 0,
+                        ..bcode_plugin_sdk::TransientProgressLimits::default()
+                    },
+                    bcode_plugin_sdk::ServiceCancellation::default(),
+                ),
+            };
+            let commit = recording::ShellRecordingCommit {
+                path: PathBuf::from("combined.bcsr.partial"),
+                committed_bytes: recording::RECORDING_HEADER_AND_START_BYTES + 10,
+                finalized: false,
+            };
+            *latest.lock().expect("commit") = Some(commit.clone());
+            if !together {
+                updates.publish();
+            }
+            *semantic.lock().expect("semantic") = Some(crate::shell_output::ShellSemanticOutput {
+                version: 1,
+                command: "printf first".into(),
+                arguments: json!({"command": "printf first"}),
+                output: "first\n".into(),
+                output_bytes: 6,
+                output_truncated: false,
+                complete: false,
+            });
+            updates.publish();
+            let publication_count = events.lock().expect("events").len();
+            updates.publish();
+            assert_eq!(events.lock().expect("events").len(), publication_count);
+            // Commit-only publication must retain the most recent plain semantic snapshot.
+            *latest.lock().expect("commit") = Some(recording::ShellRecordingCommit {
+                path: PathBuf::from("combined.bcsr"),
+                finalized: true,
+                ..commit.clone()
+            });
+            updates.publish();
+            let updates: Vec<bcode_tool::ToolPresentationUpdate> = events
+                .lock()
+                .expect("events")
+                .iter()
+                .map(|payload| serde_json::from_slice(payload).expect("presentation"))
+                .collect();
+            assert_eq!(updates.len(), if together { 2 } else { 3 });
+            for update in &updates {
+                assert_eq!(update.schema, SHELL_RUN_SCHEMA);
+                assert_eq!(
+                    update.identity,
+                    bcode_tool::ToolPresentationIdentity::Primary
+                );
+                assert_eq!(update.generation, 0);
+                let artifact = update.artifact.as_ref().expect("recording retained");
+                assert_eq!(artifact.reference_key, SHELL_RECORDING_REF_KEY);
+                assert_eq!(artifact.committed_bytes, commit.committed_bytes);
+            }
+            for update in &updates[updates.len() - 2..] {
+                assert_eq!(update.payload["output"], "first\n");
+                assert_eq!(update.payload["output_bytes"], 6);
+                assert_eq!(update.payload["output_truncated"], false);
+            }
+            assert!(
+                !updates[updates.len() - 2]
+                    .artifact
+                    .as_ref()
+                    .unwrap()
+                    .finalized
+            );
+            assert!(updates.last().unwrap().artifact.as_ref().unwrap().finalized);
+            assert!(
+                updates
+                    .windows(2)
+                    .all(|pair| pair[1].revision == pair[0].revision + 1)
+            );
+        }
+    }
+
+    #[test]
+    fn recording_output_after_first_commit_obeys_cadence_but_finalization_does_not() {
+        let events = Mutex::new(Vec::<Vec<u8>>::new());
+        let emitter = ServiceEventEmitter::new(
+            Some(capture_service_event),
+            std::ptr::from_ref(&events).cast_mut().cast(),
+        );
+        let observer = shell_recording_commit_observer(
+            None,
+            emitter,
+            "paced-recording",
+            DEFAULT_SHELL_TIMEOUT_MS,
+            json!({"command": "stream"}),
+            bcode_plugin_sdk::TransientProgressLimits {
+                min_interval_ms: 60_000,
+                ..bcode_plugin_sdk::TransientProgressLimits::default()
+            },
+            bcode_plugin_sdk::ServiceCancellation::default(),
+        );
+        for delta in 0..100 {
+            observer(recording::ShellRecordingCommit {
+                path: PathBuf::from("paced.bcsr.partial"),
+                committed_bytes: recording::RECORDING_HEADER_AND_START_BYTES + delta,
+                finalized: false,
+            });
+        }
+        assert_eq!(events.lock().expect("events").len(), 2);
+        observer(recording::ShellRecordingCommit {
+            path: PathBuf::from("paced.bcsr"),
+            committed_bytes: recording::RECORDING_HEADER_AND_START_BYTES + 100,
+            finalized: true,
+        });
+        let events = events.lock().expect("events");
+        assert_eq!(events.len(), 3);
+        let last: bcode_tool::ToolPresentationUpdate =
+            serde_json::from_slice(events.last().unwrap()).expect("final presentation");
+        drop(events);
+        let artifact = last.artifact.expect("final recording");
+        assert!(artifact.finalized);
+        assert_eq!(
+            artifact.committed_bytes,
+            recording::RECORDING_HEADER_AND_START_BYTES + 100
+        );
+    }
+
     struct CapturedServiceEvent {
         payload: Vec<u8>,
         observed_at: Instant,
@@ -5795,11 +5999,15 @@ mod tests {
         let observed = Arc::new(StdMutex::new(Vec::new()));
         let published = Arc::clone(&observed);
         let updates = TerminalCaptureUpdates {
-            semantic_started: std::cell::Cell::new(false),
+            recording: std::cell::RefCell::new(None),
+            recording_pending: std::cell::Cell::new(false),
             semantic: Arc::new(StdMutex::new(None)),
             presentation: None,
             latest: Arc::clone(&latest),
-            observer: Arc::new(move |commit| published.lock().expect("observed").push(commit)),
+            observer: Arc::new(move |commit, _| {
+                published.lock().expect("observed").push(commit);
+                true
+            }),
         };
         for revision in 1..=1_000 {
             *latest.lock().expect("latest") = Some(recording::ShellRecordingCommit {
@@ -5815,6 +6023,33 @@ mod tests {
         assert_eq!(observed[0].committed_bytes, 1_000);
         assert!(observed[0].finalized);
         drop(observed);
+    }
+
+    #[test]
+    fn cadence_deferred_recording_is_retried_without_more_capture() {
+        let commit = recording::ShellRecordingCommit {
+            path: PathBuf::from("quiet.bcsr.partial"),
+            committed_bytes: recording::RECORDING_HEADER_AND_START_BYTES + 10,
+            finalized: false,
+        };
+        let calls = Arc::new(StdMutex::new(Vec::new()));
+        let observed = Arc::clone(&calls);
+        let updates = TerminalCaptureUpdates {
+            semantic: Arc::new(StdMutex::new(None)),
+            presentation: None,
+            latest: Arc::new(StdMutex::new(Some(commit.clone()))),
+            recording: std::cell::RefCell::new(None),
+            recording_pending: std::cell::Cell::new(false),
+            observer: Arc::new(move |commit, _| {
+                let mut calls = observed.lock().expect("calls");
+                calls.push(commit);
+                calls.len() == 2
+            }),
+        };
+        updates.publish();
+        updates.publish();
+        updates.publish();
+        assert_eq!(*calls.lock().expect("calls"), vec![commit.clone(), commit]);
     }
 
     #[test]

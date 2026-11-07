@@ -398,7 +398,13 @@ impl CanonicalManagedAdmission {
         let selected = self
             .auth_read_selection(caller, session_id, instance_id)
             .await?;
-        let transport = super::HarnessPluginTransport::new(self.store.state()?);
+        let transport = {
+            let state = self.store.state()?;
+            super::HarnessPluginTransport::with_view(
+                Arc::clone(&state),
+                super::configuration_views::for_session(&state, session_id).await?,
+            )
+        };
         let inspected = if selected.instance.auth.custody
             == bcode_harness_models::HarnessAuthCustody::VaultManaged
         {
@@ -863,6 +869,8 @@ impl CanonicalManagedAdmission {
         let state = self.store.state()?;
         Self::enabled(&state, &request.instance)?;
         let owner = Self::daemon_owner(&state, session_id, 1)?;
+        super::configuration_views::pin_creation(&state, caller, &owner, &request.open.open_id)
+            .await?;
         let root = state
             .sessions
             .session_store_root()
@@ -937,6 +945,7 @@ impl CanonicalManagedAdmission {
         let state = self.store.state()?;
         Self::enabled(&state, &call.harness.instance)?;
         let owner = Self::daemon_owner(&state, session_id, 1)?;
+        super::configuration_views::pin_creation(&state, caller, &owner, &open.open_id).await?;
         // Bootstrap only the selected primary sessions leaf, never readable locations or
         // missing ancestors. exact_location_claims intentionally rejects unavailable roots;
         // on a new installation the primary leaf has simply never been published yet.
@@ -999,10 +1008,22 @@ impl CanonicalManagedAdmission {
             instance: call.harness.instance.clone(),
             kind: HarnessRequestKind::Inspect,
         };
-        let inspection: HarnessServiceResponse =
-            super::HarnessPluginTransport::new(self.store.state()?)
-                .invoke(&inspection_request)
-                .await?;
+        let state = self.store.state()?;
+        let session_id = match &call.harness.kind {
+            HarnessRequestKind::Open(open) => open
+                .session_id
+                .parse()
+                .map_err(|_| ManagedHarnessError::Invalid)?,
+            _ => return Err(ManagedHarnessError::Invalid),
+        };
+        let owner = Self::daemon_owner(&state, session_id, 1)?;
+        let inspection: HarnessServiceResponse = super::HarnessPluginTransport::with_view(
+            Arc::clone(&state),
+            super::configuration_views::for_owner(&state, &owner).await?,
+        )
+        .invoke(&inspection_request)
+        .await?;
+        drop(state);
         inspection
             .validate_for(&inspection_request)
             .map_err(|_| ManagedHarnessError::Invalid)?;

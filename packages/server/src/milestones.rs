@@ -128,7 +128,7 @@ pub async fn infer_admitted(
         .ok_or_else(|| "invalid milestone prompt response".to_owned())?
         .to_owned();
     let session_id = request.session_id;
-    let result = super::auxiliary_generation::generate(
+    let result = Box::pin(super::auxiliary_generation::generate(
         state,
         AuxiliaryGenerationRequest {
             system_prompt: system,
@@ -136,7 +136,7 @@ pub async fn infer_admitted(
             ..request
         },
         cancellation.clone(),
-    )
+    ))
     .await?;
     let validated = policy(
         state,

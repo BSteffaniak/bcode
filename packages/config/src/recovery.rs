@@ -43,6 +43,191 @@ pub struct ConfigRecoverySources {
     pub inline_overrides: bool,
 }
 
+/// Retained authority for the daemon's exact startup loader sources.
+///
+/// Capture from host-owned load provenance before setup edits, never from a client's
+/// working directory or a refresh request. Failure disables changed-config replay only;
+/// it must not replace or invalidate existing recovery references. This value is neither
+/// serializable nor a permission grant, and contains no configuration contents.
+#[derive(Debug, Clone)]
+pub struct ConfigSourceAuthority {
+    sources: ConfigRecoverySources,
+    cwd: PathBuf,
+    targets: Vec<PathBuf>,
+    roots: Vec<PathBuf>,
+}
+
+impl ConfigSourceAuthority {
+    /// Retain exact startup provenance and canonical parent/exact filename boundaries.
+    /// Missing optional layers retain their target under the nearest existing ancestor;
+    /// no directories or files are created. File contents and inode identity are not pinned.
+    ///
+    /// # Errors
+    /// Rejects inline/unavailable provenance, excessive source bounds, traversal,
+    /// missing required layers, invalid parents, and symlinked file targets.
+    pub fn capture(sources: &ConfigRecoverySources) -> Result<Self, ConfigRecoveryError> {
+        if sources.inline_overrides || !sources.cwd.is_absolute() {
+            return Err(ConfigRecoveryError::Unavailable);
+        }
+        let paths = authority_paths(sources)?;
+        let cwd = sources
+            .cwd
+            .canonicalize()
+            .map_err(|_| ConfigRecoveryError::InvalidSource)?;
+        if !cwd.is_dir() {
+            return Err(ConfigRecoveryError::InvalidSource);
+        }
+        let mut targets = Vec::with_capacity(paths.len());
+        let mut roots = Vec::with_capacity(paths.len());
+        for (path, required) in paths {
+            let (target, root) = authority_target(path, &sources.cwd, required)?;
+            targets.push(target);
+            roots.push(root);
+        }
+        Ok(Self {
+            sources: sources.clone(),
+            cwd,
+            targets,
+            roots,
+        })
+    }
+
+    /// Verify retained provenance and current path confinement, then use existing replay.
+    /// Exact-target atomic replacement and changed contents are allowed, but the supplied
+    /// effective config must match replay. Selection, order, cwd, context and profile cannot
+    /// be substituted. The source root always comes from captured host startup provenance.
+    ///
+    /// # Errors
+    /// Returns `Changed` for substituted sources or a replay/config mismatch; otherwise
+    /// returns the existing recovery error for unavailable, invalid or unconfined sources.
+    pub fn verify(
+        &self,
+        config: &BcodeConfig,
+        sources: &ConfigRecoverySources,
+    ) -> Result<ConfigRecoveryReference, ConfigRecoveryError> {
+        if sources != &self.sources {
+            return Err(ConfigRecoveryError::Changed);
+        }
+        if sources
+            .cwd
+            .canonicalize()
+            .map_err(|_| ConfigRecoveryError::InvalidSource)?
+            != self.cwd
+        {
+            return Err(ConfigRecoveryError::SourceBounds);
+        }
+        for ((path, required), expected) in authority_paths(sources)?.into_iter().zip(&self.targets)
+        {
+            let (target, _) = authority_target(path, &self.sources.cwd, required)?;
+            if &target != expected {
+                return Err(ConfigRecoveryError::SourceBounds);
+            }
+        }
+        capture_with_sources(config, sources, &self.roots)
+    }
+}
+
+fn authority_paths(
+    sources: &ConfigRecoverySources,
+) -> Result<Vec<(&PathBuf, bool)>, ConfigRecoveryError> {
+    // Bound before allocating, including bypassed provenance retained for exact equality.
+    if sources.discovered_paths.len() > MAX_LAYERS
+        || sources.cwd.as_os_str().len() > 4096
+        || sources
+            .discovered_paths
+            .iter()
+            .chain(sources.exclusive_config_path.iter())
+            .chain(sources.base_config_path.iter())
+            .chain(sources.env_config_path.iter())
+            .chain(sources.cli_config_path.iter())
+            .any(|path| path.as_os_str().len() > 4096)
+        || [&sources.active_context, &sources.model_profile]
+            .into_iter()
+            .flatten()
+            .any(|selected| selected.len() > 256)
+    {
+        return Err(ConfigRecoveryError::SourceBounds);
+    }
+    let paths = sources.exclusive_config_path.as_ref().map_or_else(
+        || {
+            sources
+                .base_config_path
+                .iter()
+                .map(|path| (path, true))
+                .chain(sources.discovered_paths.iter().map(|path| (path, false)))
+                .chain(sources.env_config_path.iter().map(|path| (path, true)))
+                .chain(sources.cli_config_path.iter().map(|path| (path, true)))
+                .collect::<Vec<_>>()
+        },
+        |exclusive| vec![(exclusive, true)],
+    );
+    if paths.is_empty() {
+        return Err(ConfigRecoveryError::Unavailable);
+    }
+    if paths.len() > MAX_LAYERS {
+        return Err(ConfigRecoveryError::SourceBounds);
+    }
+    Ok(paths)
+}
+
+fn authority_target(
+    path: &Path,
+    cwd: &Path,
+    required: bool,
+) -> Result<(PathBuf, PathBuf), ConfigRecoveryError> {
+    let path = if path.is_absolute() {
+        path.to_owned()
+    } else {
+        cwd.join(path)
+    };
+    if path
+        .components()
+        .any(|part| matches!(part, std::path::Component::ParentDir))
+    {
+        return Err(ConfigRecoveryError::SourceBounds);
+    }
+    let name = path.file_name().ok_or(ConfigRecoveryError::SourceBounds)?;
+    let parent = path.parent().ok_or(ConfigRecoveryError::SourceBounds)?;
+    let mut ancestor = parent;
+    loop {
+        match std::fs::symlink_metadata(ancestor) {
+            Ok(_) => break,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                ancestor = ancestor.parent().ok_or(ConfigRecoveryError::SourceBounds)?;
+            }
+            Err(_) => return Err(ConfigRecoveryError::InvalidSource),
+        }
+    }
+    let root = ancestor
+        .canonicalize()
+        .map_err(|_| ConfigRecoveryError::InvalidSource)?;
+    if !root.is_dir() {
+        return Err(ConfigRecoveryError::InvalidSource);
+    }
+    let suffix = parent
+        .strip_prefix(ancestor)
+        .map_err(|_| ConfigRecoveryError::SourceBounds)?;
+    let target = root.join(suffix).join(name);
+    match std::fs::symlink_metadata(&path) {
+        Ok(metadata) if metadata.file_type().is_symlink() => {
+            return Err(ConfigRecoveryError::SourceBounds);
+        }
+        Ok(metadata) if !metadata.is_file() => return Err(ConfigRecoveryError::InvalidSource),
+        Ok(_) => {
+            if path
+                .canonicalize()
+                .map_err(|_| ConfigRecoveryError::InvalidSource)?
+                != target
+            {
+                return Err(ConfigRecoveryError::SourceBounds);
+            }
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound && !required => {}
+        Err(_) => return Err(ConfigRecoveryError::InvalidSource),
+    }
+    Ok((target, root))
+}
+
 /// Durable secret-free configuration reference. Session models should own their
 /// portable representation and convert these fields at the application boundary.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -491,6 +676,170 @@ mod tests {
             discovered_paths: names.iter().map(|name| directory.join(name)).collect(),
             ..Default::default()
         }
+    }
+
+    #[test]
+    fn retained_authority_accepts_only_exact_target_replacement_and_matching_config() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("config.toml");
+        std::fs::write(&target, "[model]\nprofile='before'\n").unwrap();
+        let sources = sources(dir.path(), &["config.toml"]);
+        let roots = vec![dir.path().to_owned()];
+        let before = replay(&sources, &roots).unwrap().0;
+        let authority = ConfigSourceAuthority::capture(&sources).unwrap();
+        let original = authority.verify(&before, &sources).unwrap();
+        let replacement = dir.path().join("replacement.toml");
+        std::fs::write(&replacement, "[model]\nprofile='after'\n").unwrap();
+        std::fs::rename(&replacement, &target).unwrap();
+        let after = replay(&sources, &roots).unwrap().0;
+        assert_eq!(
+            authority.verify(&before, &sources),
+            Err(ConfigRecoveryError::Changed)
+        );
+        let reference = authority.verify(&after, &sources).unwrap();
+        assert_ne!(reference.execution_digest, original.execution_digest);
+        assert_eq!(resolve(&reference, &roots).unwrap(), after);
+        assert_eq!(
+            resolve(&original, &roots),
+            Err(ConfigRecoveryError::Changed)
+        );
+    }
+
+    #[test]
+    fn retained_authority_rejects_provenance_substitution() {
+        let dir = tempfile::tempdir().unwrap();
+        for name in ["first.toml", "second.toml", "other.toml"] {
+            std::fs::write(dir.path().join(name), "").unwrap();
+        }
+        let original = sources(dir.path(), &["first.toml", "second.toml"]);
+        let authority = ConfigSourceAuthority::capture(&original).unwrap();
+        let effective = replay(&original, &[dir.path().to_owned()]).unwrap().0;
+        for index in 0..10 {
+            let mut changed = original.clone();
+            match index {
+                0 => changed.discovered_paths[0] = dir.path().join("other.toml"),
+                1 => changed.discovered_paths.reverse(),
+                2 => changed.active_context = Some("other".to_owned()),
+                3 => changed.model_profile = Some("other".to_owned()),
+                4 => changed.cwd = dir.path().join("other"),
+                5 => changed.exclusive_config_path = Some(original.discovered_paths[0].clone()),
+                6 => changed.base_config_path = Some(original.discovered_paths[0].clone()),
+                7 => changed.env_config_path = Some(original.discovered_paths[0].clone()),
+                8 => changed.cli_config_path = Some(original.discovered_paths[0].clone()),
+                _ => changed.inline_overrides = true,
+            }
+            assert_eq!(
+                authority.verify(&effective, &changed),
+                Err(ConfigRecoveryError::Changed)
+            );
+        }
+    }
+
+    #[test]
+    fn retained_authority_resolves_relative_sources_against_host_launch_cwd() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("config.toml"), "").unwrap();
+        let source = ConfigRecoverySources {
+            cwd: dir.path().to_owned(),
+            discovered_paths: vec![PathBuf::from("config.toml")],
+            ..Default::default()
+        };
+        let authority = ConfigSourceAuthority::capture(&source).unwrap();
+        let effective = replay(&source, &[dir.path().to_owned()]).unwrap().0;
+        assert!(authority.verify(&effective, &source).is_ok());
+        let mut substituted = source;
+        substituted.discovered_paths[0] = dir.path().join("config.toml");
+        assert_eq!(
+            authority.verify(&effective, &substituted),
+            Err(ConfigRecoveryError::Changed)
+        );
+    }
+
+    #[test]
+    fn retained_authority_bounds_optional_layers_and_unavailable_provenance() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("config.toml"), "").unwrap();
+        let mut sources = sources(dir.path(), &["config.toml", "missing/nested/optional.toml"]);
+        let authority = ConfigSourceAuthority::capture(&sources).unwrap();
+        let roots = vec![dir.path().to_owned()];
+        let effective = replay(&sources, &roots).unwrap().0;
+        assert_eq!(
+            authority
+                .verify(&effective, &sources)
+                .unwrap()
+                .source_presence,
+            vec![true, false]
+        );
+        std::fs::create_dir_all(dir.path().join("missing/nested")).unwrap();
+        std::fs::write(dir.path().join("missing/nested/optional.toml"), "").unwrap();
+        assert_eq!(
+            authority
+                .verify(&effective, &sources)
+                .unwrap()
+                .source_presence,
+            vec![true, true]
+        );
+        sources.inline_overrides = true;
+        assert!(matches!(
+            ConfigSourceAuthority::capture(&sources),
+            Err(ConfigRecoveryError::Unavailable)
+        ));
+        sources.inline_overrides = false;
+        sources.discovered_paths = vec![dir.path().join("optional.toml"); MAX_LAYERS + 1];
+        assert!(matches!(
+            ConfigSourceAuthority::capture(&sources),
+            Err(ConfigRecoveryError::SourceBounds)
+        ));
+        sources.discovered_paths.clear();
+        sources.exclusive_config_path = Some(dir.path().join("absent.toml"));
+        assert!(matches!(
+            ConfigSourceAuthority::capture(&sources),
+            Err(ConfigRecoveryError::InvalidSource)
+        ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn retained_authority_rejects_file_and_parent_symlink_escapes() {
+        use std::os::unix::fs::symlink;
+
+        let dir = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        std::fs::write(outside.path().join("config.toml"), "").unwrap();
+        let parent = dir.path().join("selected");
+        std::fs::create_dir(&parent).unwrap();
+        let target = parent.join("config.toml");
+        std::fs::write(&target, "").unwrap();
+        let sources = sources(
+            dir.path(),
+            &["selected/config.toml", "optional/config.toml"],
+        );
+        let authority = ConfigSourceAuthority::capture(&sources).unwrap();
+        let effective = replay(&sources, &[dir.path().to_owned()]).unwrap().0;
+        std::fs::remove_file(&target).unwrap();
+        symlink(outside.path().join("config.toml"), &target).unwrap();
+        assert_eq!(
+            authority.verify(&effective, &sources),
+            Err(ConfigRecoveryError::SourceBounds)
+        );
+        assert!(matches!(
+            ConfigSourceAuthority::capture(&sources),
+            Err(ConfigRecoveryError::SourceBounds)
+        ));
+        std::fs::remove_file(&target).unwrap();
+        std::fs::write(&target, "").unwrap();
+        symlink(outside.path(), dir.path().join("optional")).unwrap();
+        assert_eq!(
+            authority.verify(&effective, &sources),
+            Err(ConfigRecoveryError::SourceBounds)
+        );
+        std::fs::remove_file(dir.path().join("optional")).unwrap();
+        std::fs::rename(&parent, dir.path().join("original")).unwrap();
+        symlink(outside.path(), &parent).unwrap();
+        assert_eq!(
+            authority.verify(&effective, &sources),
+            Err(ConfigRecoveryError::SourceBounds)
+        );
     }
 
     #[test]

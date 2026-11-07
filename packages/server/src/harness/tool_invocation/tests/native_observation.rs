@@ -65,7 +65,7 @@ pub(super) async fn observe_native_read(
         }),
     )
     .await;
-    approve_and_observe(state, caller, call, &owner, target).await;
+    Box::pin(approve_and_observe(state, caller, call, &owner, target)).await;
 }
 
 async fn approve_and_observe(

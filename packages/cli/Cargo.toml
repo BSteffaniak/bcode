@@ -29,6 +29,7 @@ bcode_model_provider_runtime = { workspace = true, features = [
     "image-fixtures",
 ] }
 bcode_plugin = { workspace = true }
+bcode_plugin_config = { workspace = true }
 bcode_plugin_sdk = { workspace = true }
 bcode_prompt_cache = { workspace = true }
 bcode_provider_auth = { workspace = true }
