@@ -191,6 +191,40 @@ fn ignored_paths_cost_nothing() {
 }
 
 #[test]
+fn reading_files_is_no_change() {
+    for source in SOURCES {
+        let repo = repository();
+        let path = repo.path();
+        std::fs::write(path.join(".gitignore"), "target/\n").unwrap();
+        std::fs::create_dir_all(path.join("src/nested")).unwrap();
+        std::fs::write(path.join("src/nested/lib.rs"), "fn main() {}\n").unwrap();
+        git(path, &["add", "--all"]);
+        git(path, &["commit", "--quiet", "-m", "tree"]);
+        let mut live = Live::start(path, counting(), source);
+        let checks = live.stats.path_checks;
+        let walks = live.stats.watch_walks;
+        // Reads (by editors, git, or the watcher's own ignore rules) must not turn into work.
+        for _ in 0..200 {
+            let _ = std::fs::read_to_string(path.join(".gitignore")).unwrap();
+            let _ = std::fs::read_dir(path.join("src/nested")).unwrap().count();
+            let _ = std::fs::read_to_string(path.join("src/nested/lib.rs")).unwrap();
+        }
+        git(path, &["status", "--porcelain"]);
+        assert_eq!(live.quiet(Duration::from_millis(400)), 0, "{source:?}");
+        std::fs::write(
+            path.join("src/nested/lib.rs"),
+            "fn main() {}\nfn more() {}\n",
+        )
+        .unwrap();
+        live.wait("the edit", |live| {
+            live.count("src/nested/lib.rs") == Some(LineStats::text(1, 0))
+        });
+        assert_eq!(live.stats.path_checks, checks + 1, "{source:?}");
+        assert_eq!(live.stats.watch_walks, walks, "{source:?}");
+    }
+}
+
+#[test]
 fn staging_and_committing_follow_the_index_and_head() {
     for source in SOURCES {
         let repo = repository();

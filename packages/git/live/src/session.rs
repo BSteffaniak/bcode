@@ -251,6 +251,9 @@ impl Loop {
         applied
             .errors
             .extend(self.errors.drain(..).map(|message| (None, message)));
+        if let Some(source) = &self.source {
+            self.engine.note_watching(source.counters());
+        }
         for client in self.clients.values_mut() {
             let update = client.subscriber.report(&self.engine, &applied);
             if client.new || !update.is_empty() {

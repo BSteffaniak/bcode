@@ -12,6 +12,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc;
 
 use notify::{RecursiveMode, Watcher};
@@ -77,6 +78,34 @@ pub trait ChangeSource: Send {
 
     /// Stop watching a location given to [`Self::watch`].
     fn unwatch(&mut self, path: &Path);
+
+    /// Work done so far.
+    fn counters(&self) -> WatchCounters;
+}
+
+/// Work a change source has done since it started.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct WatchCounters {
+    /// Native events that described changes (reads and opens are not counted).
+    pub events: u64,
+    /// Directory trees walked to start watching them.
+    pub walks: u64,
+}
+
+/// [`WatchCounters`] shared with the threads that do the work.
+#[derive(Debug, Default)]
+struct Counters {
+    events: AtomicU64,
+    walks: AtomicU64,
+}
+
+impl Counters {
+    fn read(&self) -> WatchCounters {
+        WatchCounters {
+            events: self.events.load(Ordering::Relaxed),
+            walks: self.walks.load(Ordering::Relaxed),
+        }
+    }
 }
 
 /// Which [`ChangeSource`] to use.
@@ -109,13 +138,14 @@ pub fn open(kind: SourceKind, sink: EventSink) -> Result<Box<dyn ChangeSource>, 
     })
 }
 
-/// Turn a native event into source events.
-fn forward(result: notify::Result<notify::Event>, sink: &EventSink) {
+/// Turn a native event into source events. Opening, reading or listing is no change.
+fn forward(result: notify::Result<notify::Event>, sink: &EventSink, counters: &Counters) {
     match result {
         Ok(event) => {
             if matches!(event.kind, notify::EventKind::Access(_)) {
                 return;
             }
+            counters.events.fetch_add(1, Ordering::Relaxed);
             if event.need_rescan() {
                 sink(SourceEvent::Rescan(event.paths.into_iter().next()));
             } else if !event.paths.is_empty() {
@@ -134,6 +164,7 @@ pub struct RecursiveSource {
     watcher: notify::RecommendedWatcher,
     /// Locations asked for, and whether each holds its own native watch.
     targets: BTreeMap<PathBuf, bool>,
+    counters: Arc<Counters>,
 }
 
 impl RecursiveSource {
@@ -142,10 +173,13 @@ impl RecursiveSource {
     /// # Errors
     /// * [`SourceError`] when the operating system's watcher cannot start.
     pub fn new(sink: EventSink) -> Result<Self, SourceError> {
-        let watcher = notify::recommended_watcher(move |result| forward(result, &sink))?;
+        let counters = Arc::new(Counters::default());
+        let counting = counters.clone();
+        let watcher = notify::recommended_watcher(move |result| forward(result, &sink, &counting))?;
         Ok(Self {
             watcher,
             targets: BTreeMap::new(),
+            counters,
         })
     }
 
@@ -159,6 +193,10 @@ impl RecursiveSource {
 impl ChangeSource for RecursiveSource {
     fn name(&self) -> &'static str {
         "recursive"
+    }
+
+    fn counters(&self) -> WatchCounters {
+        self.counters.read()
     }
 
     fn watch(&mut self, target: &WatchTarget) -> Result<(), SourceError> {
@@ -212,6 +250,7 @@ enum Command {
 /// directories appear, disappear, or become ignored or not.
 pub struct PrunedSource {
     commands: mpsc::Sender<Command>,
+    counters: Arc<Counters>,
 }
 
 impl PrunedSource {
@@ -225,6 +264,8 @@ impl PrunedSource {
         let watcher = notify::recommended_watcher(move |result| {
             let _ = native.send(Command::Native(result));
         })?;
+        let counters = Arc::new(Counters::default());
+        let counting = counters.clone();
         std::thread::Builder::new()
             .name("bcode-git-watch".into())
             .spawn(move || {
@@ -234,11 +275,12 @@ impl PrunedSource {
                     targets: Vec::new(),
                     watched: BTreeSet::new(),
                     degraded: false,
+                    counters: counting,
                 }
                 .run(&receiver);
             })
             .map_err(|error| SourceError(error.to_string()))?;
-        Ok(Self { commands })
+        Ok(Self { commands, counters })
     }
 }
 
@@ -252,6 +294,10 @@ impl Drop for PrunedSource {
 impl ChangeSource for PrunedSource {
     fn name(&self) -> &'static str {
         "pruned"
+    }
+
+    fn counters(&self) -> WatchCounters {
+        self.counters.read()
     }
 
     fn watch(&mut self, target: &WatchTarget) -> Result<(), SourceError> {
@@ -275,6 +321,7 @@ struct Pruner {
     targets: Vec<(WatchTarget, Option<IgnoreFilter>)>,
     watched: BTreeSet<PathBuf>,
     degraded: bool,
+    counters: Arc<Counters>,
 }
 
 impl Pruner {
@@ -366,6 +413,7 @@ impl Pruner {
 
     /// Watch `directory` and every directory beneath it that target `index` wants.
     fn add_tree(&mut self, index: usize, directory: &Path) {
+        self.counters.walks.fetch_add(1, Ordering::Relaxed);
         let mut stack = vec![directory.to_owned()];
         while let Some(current) = stack.pop() {
             if !self.watched.contains(&current) {
@@ -395,11 +443,15 @@ impl Pruner {
     }
 
     fn native(&mut self, result: notify::Result<notify::Event>) {
-        let paths = result
-            .as_ref()
-            .map(|event| event.paths.clone())
-            .unwrap_or_default();
-        forward(result, &self.sink);
+        // Opening, reading or listing is no change. inotify reports all of them, and acting
+        // on them feeds back on itself: walking directories and loading ignore files (ours,
+        // or git's own reads) read them again.
+        let paths = match &result {
+            Ok(event) if matches!(event.kind, notify::EventKind::Access(_)) => return,
+            Ok(event) => event.paths.clone(),
+            Err(_) => Vec::new(),
+        };
+        forward(result, &self.sink, &self.counters);
         for path in paths {
             if path.file_name().is_some_and(|name| name == ".gitignore") {
                 self.ignore_changed(&path);

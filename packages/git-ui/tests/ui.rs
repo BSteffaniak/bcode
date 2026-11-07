@@ -997,6 +997,8 @@ fn bcode_draft_outranks_lazygit_and_leaves_its_file_alone() {
 fn a_draft_replacing_merge_msg_is_announced_and_can_be_cleared() {
     let mut harness = Harness::new(|path| {
         changed_repo(path);
+        // Comment lines start with `#` here, whatever the user's global git configuration says.
+        git(path, &["config", "core.commentChar", "#"]);
         std::fs::write(
             path.join(".git/MERGE_MSG"),
             "Merge branch 'x'\n# Conflicts:\n",

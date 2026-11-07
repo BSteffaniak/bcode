@@ -130,6 +130,10 @@ pub struct EngineStats {
     pub head_reads: u64,
     /// Readings of the branch header alone.
     pub header_reads: u64,
+    /// Change events the watcher handled.
+    pub watch_events: u64,
+    /// Directory trees the watcher walked to start watching them.
+    pub watch_walks: u64,
 }
 
 /// A change to the set of watched locations.
@@ -270,6 +274,12 @@ impl Engine {
     #[must_use]
     pub const fn stats(&self) -> EngineStats {
         self.stats
+    }
+
+    /// Record the watcher's work, to report with the engine's own.
+    pub const fn note_watching(&mut self, counters: crate::source::WatchCounters) {
+        self.stats.watch_events = counters.events;
+        self.stats.watch_walks = counters.walks;
     }
 
     /// Keep what `interests` ask for (all clients' interests together). Worktrees newly
