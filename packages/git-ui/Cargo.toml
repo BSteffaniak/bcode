@@ -14,6 +14,7 @@ version     = { workspace = true }
 bcode_config_layers = { workspace = true }
 bcode_forge_models = { workspace = true }
 bcode_git = { workspace = true }
+bcode_git_live = { workspace = true }
 bcode_keymap = { workspace = true }
 bcode_syntax_render = { workspace = true }
 bcode_tui_theme = { workspace = true }

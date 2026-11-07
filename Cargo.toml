@@ -77,6 +77,7 @@ members = [
     "packages/forge",
     "packages/forge/models",
     "packages/git",
+    "packages/git/live",
     "packages/git/models",
     "packages/git-ui",
     "packages/git-ui/cli",
@@ -258,6 +259,7 @@ bcode_filesystem_plugin                 = { version = "0.0.1-alpha.0", default-f
 bcode_forge                             = { version = "0.0.1-alpha.0", default-features = false, path = "packages/forge" }
 bcode_forge_models                      = { version = "0.0.1-alpha.0", default-features = false, path = "packages/forge/models" }
 bcode_git                               = { version = "0.0.1-alpha.0", default-features = false, path = "packages/git" }
+bcode_git_live                          = { version = "0.0.1-alpha.0", default-features = false, path = "packages/git/live" }
 bcode_git_models                        = { version = "0.0.1-alpha.0", default-features = false, path = "packages/git/models" }
 bcode_git_plugin                        = { version = "0.0.1-alpha.0", default-features = false, path = "plugins/git-plugin" }
 bcode_git_ui                            = { version = "0.0.1-alpha.0", default-features = false, path = "packages/git-ui" }

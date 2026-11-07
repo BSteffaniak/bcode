@@ -437,9 +437,13 @@ impl Default for HighlightConfig {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct RefreshConfig {
-    /// Watch the worktree and git directory for changes.
+    /// Watch the worktrees and git directory for changes.
     pub watch: bool,
-    /// Poll interval in seconds when watching is unavailable; `0` disables polling.
+    /// How files are watched.
+    pub watcher: WatcherBackend,
+    /// How full status scans run (at startup, on refresh, after lost events).
+    pub scanner: StatusScanner,
+    /// Poll interval in seconds when watching is off or unavailable; `0` disables polling.
     pub poll_seconds: u64,
     /// Background fetch interval in seconds; `0` disables automatic fetching.
     pub auto_fetch_seconds: u64,
@@ -449,8 +453,55 @@ impl Default for RefreshConfig {
     fn default() -> Self {
         Self {
             watch: true,
+            watcher: WatcherBackend::Auto,
+            scanner: StatusScanner::Plain,
             poll_seconds: 10,
             auto_fetch_seconds: 0,
+        }
+    }
+}
+
+/// How files are watched (`refresh.watcher`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WatcherBackend {
+    /// The best backend for the operating system: `recursive` on macOS and Windows,
+    /// `pruned` elsewhere.
+    #[default]
+    Auto,
+    /// One native recursive watch per worktree (`FSEvents`, `ReadDirectoryChangesW`).
+    Recursive,
+    /// One watch per directory git does not ignore (inotify), following new directories.
+    Pruned,
+}
+
+impl From<WatcherBackend> for bcode_git_live::source::SourceKind {
+    fn from(backend: WatcherBackend) -> Self {
+        match backend {
+            WatcherBackend::Auto => Self::Auto,
+            WatcherBackend::Recursive => Self::Recursive,
+            WatcherBackend::Pruned => Self::Pruned,
+        }
+    }
+}
+
+/// How full status scans run (`refresh.scanner`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum StatusScanner {
+    /// Plain `git status`.
+    #[default]
+    Plain,
+    /// git's filesystem monitor and untracked cache, saved in the index (starts git's monitor
+    /// daemon per worktree; plain where git cannot monitor).
+    Fsmonitor,
+}
+
+impl From<StatusScanner> for bcode_git_live::scan::ScannerKind {
+    fn from(scanner: StatusScanner) -> Self {
+        match scanner {
+            StatusScanner::Plain => Self::Plain,
+            StatusScanner::Fsmonitor => Self::Fsmonitor,
         }
     }
 }
@@ -475,11 +526,8 @@ pub struct FlashConfig {
     pub fade: bool,
     /// Flash file and folder rows.
     pub files: bool,
-    /// Flash branch and worktree rows.
+    /// Flash branch and worktree rows, watching the repository's other worktrees for them.
     pub branches: bool,
-    /// How often, in seconds, other worktrees are checked for changes while branches or
-    /// worktrees are shown; `0` never checks them.
-    pub worktree_poll_seconds: u64,
 }
 
 impl Default for FlashConfig {
@@ -491,7 +539,6 @@ impl Default for FlashConfig {
             fade: true,
             files: true,
             branches: true,
-            worktree_poll_seconds: 5,
         }
     }
 }

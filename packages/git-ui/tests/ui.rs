@@ -3098,7 +3098,6 @@ fn branches_flash_and_count_the_changes_in_their_worktrees() {
             r#"
             [plugins.config."bcode.git".ui.flash]
             duration_ms = 600000
-            worktree_poll_seconds = 1
             [plugins.config."bcode.git".ui.branches]
             line_counts = true
             [plugins.config."bcode.git".ui.layout]
@@ -3127,8 +3126,10 @@ fn branches_flash_and_count_the_changes_in_their_worktrees() {
         "none"
     );
 
-    // A change in the other worktree is picked up by polling and flashes its branch red.
+    // A change in the other worktree flashes its branch red. (Inline, nothing watches, so
+    // the harness reports the change itself.)
     std::fs::write(worktree.join("a.txt"), "").unwrap();
+    harness.send(RuntimeEvent::Message(bcode_git_ui::app::Msg::Watch));
     harness.wait_for("topic (worktree)  init -1", 140, 40);
     assert_eq!(
         flash_kind(row_background(&mut harness, "topic (worktree)")),

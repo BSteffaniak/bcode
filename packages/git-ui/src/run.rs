@@ -240,12 +240,21 @@ async fn session(mut app: App) -> Result<(App, Option<String>), RunError> {
     let size = terminal_size().map_err(terminal_error)?;
     let terminal = Terminal::new(std::io::stdout(), Rect::new(0, 0, size.width, size.height));
     let presenter: Presenter = TerminalPresenter::with_commit(terminal, paint, commit);
-    let watcher = if app.config.refresh.watch {
-        watch(app.repo.paths())
-    } else {
-        None
-    };
-    app.set_watching(watcher.is_some());
+    let (live_sender, mut live_updates) = tokio::sync::mpsc::unbounded_channel();
+    let source = app
+        .config
+        .refresh
+        .watch
+        .then(|| app.config.refresh.watcher.into());
+    let live = bcode_git_live::LocalSession::start(
+        bcode_git_live::Engine::new(&app.repo, app.live_config()),
+        source,
+        move |update| {
+            let _ = live_sender.send(update);
+        },
+    );
+    app.set_watching(live.watching());
+    app.set_live_session(live);
     let (animating, frame_ms) = app.animation();
     let (runtime, handle) = Runtime::new(app, presenter, RuntimeConfig::default());
 
@@ -293,30 +302,22 @@ async fn session(mut app: App) -> Result<(App, Option<String>), RunError> {
             }
         }
     });
-    let forward = watcher.map(|(watcher, mut receiver)| {
-        let watch_handle = handle.clone();
-        let task = tokio::spawn(async move {
-            while receiver.recv().await.is_some() {
-                tokio::time::sleep(Duration::from_millis(250)).await;
-                while receiver.try_recv().is_ok() {}
-                if watch_handle.send(Msg::Watch).await.is_err() {
-                    break;
-                }
+    let live_handle = handle.clone();
+    let forward = tokio::spawn(async move {
+        while let Some(update) = live_updates.recv().await {
+            if live_handle.send(Msg::Live(Box::new(update))).await.is_err() {
+                break;
             }
-        });
-        (watcher, task)
+        }
     });
-    let _ = handle.send(Msg::Watch).await;
+    let _ = handle.send(Msg::Metadata).await;
 
     let result = Box::pin(runtime.run()).await;
     input.abort();
     let _ = input.await;
     tick.abort();
     frames.abort();
-    if let Some((watcher, task)) = forward {
-        drop(watcher);
-        task.abort();
-    }
+    forward.abort();
     let (app, error) = match result {
         Ok(output) => (output.program, None),
         Err(bmux_tui_runtime::RuntimeError::Program { error, output, .. }) => {
@@ -328,49 +329,6 @@ async fn session(mut app: App) -> Result<(App, Option<String>), RunError> {
     };
     drop(guard);
     Ok((app, error))
-}
-
-/// Watch the worktree (including the git directory), signalling on relevant changes.
-/// Watch the worktree and, for linked worktrees, the git directories that live outside it.
-fn watch(
-    paths: &bcode_git::models::RepoPaths,
-) -> Option<(
-    notify::RecommendedWatcher,
-    tokio::sync::mpsc::UnboundedReceiver<()>,
-)> {
-    use notify::{RecursiveMode, Watcher};
-    let (sender, receiver) = tokio::sync::mpsc::unbounded_channel::<()>();
-    let mut watcher = notify::recommended_watcher(move |event: notify::Result<notify::Event>| {
-        let Ok(event) = event else {
-            return;
-        };
-        if matches!(event.kind, notify::EventKind::Access(_)) {
-            return;
-        }
-        let relevant = event.paths.iter().any(|path| {
-            let text = path.to_string_lossy();
-            !(text.contains("/.git/objects/")
-                || text.ends_with(".lock")
-                || text.contains("/.git/logs/")
-                || text.contains("/target/")
-                || text.contains("/node_modules/"))
-        });
-        if relevant {
-            let _ = sender.send(());
-        }
-    })
-    .ok()?;
-    watcher.watch(&paths.root, RecursiveMode::Recursive).ok()?;
-    // A linked worktree's index and HEAD live in its own git directory, and branch refs in the
-    // shared one; both sit outside the worktree. Watching them is best-effort.
-    if !paths.git_dir.starts_with(&paths.root) {
-        let _ = watcher.watch(&paths.git_dir, RecursiveMode::NonRecursive);
-    }
-    if !paths.common_dir.starts_with(&paths.root) {
-        let _ = watcher.watch(&paths.common_dir, RecursiveMode::NonRecursive);
-        let _ = watcher.watch(&paths.common_dir.join("refs"), RecursiveMode::Recursive);
-    }
-    Some((watcher, receiver))
 }
 
 fn run_external(command: &str, cwd: &Path, pause: bool) {

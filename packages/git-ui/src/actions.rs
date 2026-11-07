@@ -228,7 +228,7 @@ impl App {
             Action::LayoutMenu => self.layout_menu(),
             Action::Help => self.help(),
             Action::Palette => self.palette(),
-            Action::Refresh => Update::redraw().maybe(self.refresh()),
+            Action::Refresh => Update::redraw().maybe(self.refresh_all()),
             Action::Push => self.push_menu(),
             Action::Pull => self.run_ops(vec![Op::Pull { rebase: None }]),
             Action::Fetch => self.run_ops(vec![Op::Fetch(None)]),

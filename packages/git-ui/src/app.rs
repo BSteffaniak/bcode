@@ -7,8 +7,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use bcode_git::models::{
-    ChangedFile, Commit, CommitMessageSource, DiffLineId, HeadState, LineStats, RepoOperation,
-    StatusEntry,
+    ChangedFile, Commit, CommitMessageSource, DiffLineId, LineStats, RepoOperation, StatusEntry,
 };
 use bcode_git::{DiffTarget, LogQuery, Repository};
 use bmux_keyboard::KeyStroke;
@@ -195,7 +194,8 @@ pub enum Msg {
     MoreCommits(Result<Vec<Commit>, String>),
     /// Operation finished.
     OpDone(Box<OpResult>),
-    /// Repository files changed on disk.
+    /// The repository may have changed in ways nothing reported (polling without a watcher,
+    /// or headless use): scan everything again.
     Watch,
     /// A commit message prefill source may have changed while the commit editor is open.
     CommitSourcesChanged,
@@ -215,8 +215,10 @@ pub enum Msg {
         u64,
         std::collections::BTreeMap<String, crate::pulls::Matched>,
     ),
-    /// Lines changed in other worktrees, with the `HEAD` each was measured against.
-    WorktreeTotals(BTreeMap<PathBuf, (Option<String>, LineStats)>),
+    /// The repository's live state changed.
+    Live(Box<bcode_git_live::LiveUpdate>),
+    /// Reload the side panels' git metadata (refs, stashes, tags, worktrees, …).
+    Metadata,
     /// Terminal input failed.
     InputFailed(String),
 }
@@ -387,8 +389,8 @@ pub struct App {
     pub(crate) flashes: crate::flash::Flashes,
     /// Lines changed in each worktree (this one included), by root.
     pub(crate) worktree_totals: BTreeMap<PathBuf, LineStats>,
-    /// When other worktrees were last measured.
-    pub(crate) last_worktree_poll: Option<Instant>,
+    /// Where the live status and line counts come from.
+    pub(crate) live: Option<Live>,
     pub(crate) command_log: bool,
     pub(crate) screen_mode: ScreenMode,
     pub(crate) cherry: Vec<Commit>,
@@ -406,6 +408,14 @@ pub struct App {
     pub(crate) diagnostics: Vec<String>,
     pub(crate) inline: bool,
     pub(crate) inbox: VecDeque<Msg>,
+}
+
+/// Where live repository state comes from.
+pub(crate) enum Live {
+    /// A background session reacting to filesystem changes.
+    Session(bcode_git_live::LocalSession),
+    /// An engine run synchronously, for inline (test and headless) use.
+    Inline(Box<bcode_git_live::Engine>),
 }
 
 const PENDING_TIMEOUT: Duration = Duration::from_millis(1500);
@@ -519,7 +529,7 @@ impl App {
             frame_ms: Arc::default(),
             flashes: crate::flash::Flashes::default(),
             worktree_totals: BTreeMap::new(),
-            last_worktree_poll: None,
+            live: None,
             command_log,
             screen_mode,
             cherry: Vec::new(),
@@ -894,23 +904,74 @@ impl App {
         Ok(())
     }
 
+    /// Bring everything up to date after git ran: check the index and `HEAD` again and reload
+    /// git metadata.
     pub(crate) fn refresh(&mut self) -> Option<Command<Msg>> {
+        self.live_request(bcode_git_live::Request::Check);
+        self.reload_metadata()
+    }
+
+    /// Scan everything again and reload git metadata.
+    pub(crate) fn refresh_all(&mut self) -> Option<Command<Msg>> {
+        self.live_request(bcode_git_live::Request::Full);
+        self.reload_metadata()
+    }
+
+    /// Reload the side panels' git metadata; status and line counts come from live state.
+    pub(crate) fn reload_metadata(&mut self) -> Option<Command<Msg>> {
         self.snapshot_requested += 1;
         let generation = self.snapshot_requested;
         let repo = self.repo.clone();
         let limit = self.snapshot.commits.len().max(self.config.log_page_size);
         let merged = self.config.branches.dim_merged;
-        let line_counts = match self.config.files.line_counts.show {
-            // Flashes and branch counts measure changes even when files show no counts.
-            LineCountsShow::Off if self.counts_needed() => LineCountsShow::Total,
-            show => show,
-        };
         self.activity.begin(crate::activity::Load::Repository);
         self.spawn(
             Some("snapshot"),
-            move || load_snapshot(&repo, limit, merged, line_counts),
+            move || load_snapshot(&repo, limit, merged),
             move |snapshot| Msg::Snapshot(generation, Box::new(snapshot)),
         )
+    }
+
+    /// What live state keeps for this UI.
+    #[must_use]
+    pub fn live_config(&self) -> bcode_git_live::EngineConfig {
+        use bcode_git_live::CountsMode;
+        let counts = match self.config.files.line_counts.show {
+            // Flashes and branch counts measure changes even when files show no counts.
+            LineCountsShow::Off if self.counts_needed() => CountsMode::Total,
+            LineCountsShow::Off => CountsMode::Off,
+            LineCountsShow::Total => CountsMode::Total,
+            LineCountsShow::Split => CountsMode::Split,
+        };
+        bcode_git_live::EngineConfig {
+            counts,
+            other_worktrees: self.config.flash.branches() || self.config.branches.line_counts,
+            max_other_worktrees: WORKTREES_MEASURED,
+            scanner: self.config.refresh.scanner.into(),
+        }
+    }
+
+    /// Take live state from `session`, which reports through [`Msg::Live`].
+    pub fn set_live_session(&mut self, session: bcode_git_live::LocalSession) {
+        self.live = Some(Live::Session(session));
+    }
+
+    /// Ask live state for work. Inline, it runs now and its result is queued.
+    fn live_request(&mut self, request: bcode_git_live::Request) {
+        if self.live.is_none() && self.inline {
+            let engine = bcode_git_live::Engine::new(&self.repo, self.live_config());
+            self.live = Some(Live::Inline(Box::new(engine)));
+        }
+        match &mut self.live {
+            Some(Live::Session(session)) => session.request(request),
+            Some(Live::Inline(engine)) => {
+                let update = engine.request(request);
+                if !update.is_empty() {
+                    self.inbox.push_back(Msg::Live(Box::new(update)));
+                }
+            }
+            None => {}
+        }
     }
 
     /// Main request for the current selection.
@@ -2303,9 +2364,7 @@ impl App {
             } else {
                 Update::none()
             };
-        update = update
-            .maybe(self.request_pull_requests(false))
-            .maybe(self.poll_worktrees());
+        update = update.maybe(self.request_pull_requests(false));
         let poll = if self.watching {
             0
         } else {
@@ -2317,7 +2376,7 @@ impl App {
         {
             self.last_poll = Instant::now();
             update = update
-                .maybe(self.refresh())
+                .maybe(self.refresh_all())
                 .maybe(self.check_commit_prefill());
         }
         let fetch = self.config.refresh.auto_fetch_seconds;
@@ -2340,18 +2399,10 @@ impl App {
             || self.config.branches.line_counts
     }
 
-    /// Compare the new snapshot's files, this worktree's total, and the listed branches and
-    /// worktrees with the last refresh, flashing what changed.
-    fn observe_changes(&mut self) {
+    /// Note which branches and worktrees are listed, flashing new ones.
+    fn observe_listed(&mut self) {
         let now = Instant::now();
-        let config = self.config.flash;
         let snapshot = &self.snapshot;
-        let head_branch = snapshot.branches.iter().find(|branch| branch.is_head);
-        let head = match &snapshot.head {
-            Some(HeadState::Detached { oid }) => Some(oid.as_str()),
-            _ => head_branch.map(|branch| branch.oid.as_str()),
-        };
-        let root = self.repo.root().to_owned();
         self.flashes.listed(
             snapshot
                 .branches
@@ -2364,20 +2415,29 @@ impl App {
                 .filter(|worktree| !worktree.bare)
                 .map(|worktree| worktree.path.clone())
                 .collect(),
-            &config,
+            &self.config.flash,
             now,
         );
+        let root = self.repo.root();
         self.worktree_totals.retain(|path, _| {
-            *path == root
+            path == root
                 || snapshot
                     .worktrees
                     .iter()
                     .any(|worktree| worktree.path == *path)
         });
-        let Some(counts) = snapshot.line_counts.combined() else {
+    }
+
+    /// Compare this worktree's files and total, measured at `head`, with the last ones,
+    /// flashing what changed.
+    fn observe_files(&mut self, head: Option<&str>) {
+        let Some(counts) = self.snapshot.line_counts.combined() else {
             return;
         };
-        let files: BTreeMap<String, LineStats> = snapshot
+        let now = Instant::now();
+        let config = self.config.flash;
+        let files: BTreeMap<String, LineStats> = self
+            .snapshot
             .status
             .entries
             .iter()
@@ -2387,55 +2447,12 @@ impl App {
             })
             .collect();
         let total: LineStats = files.values().copied().sum();
-        let branch = head_branch.map(|branch| branch.name.clone());
-        let head = head.map(str::to_owned);
-        self.flashes.files(head.as_deref(), files, &config, now);
-        self.flashes.worktree(
-            &root,
-            head.as_deref(),
-            total,
-            branch.as_deref(),
-            &config,
-            now,
-        );
+        let branch = self.snapshot.status.branch.head.clone();
+        let root = self.repo.root().to_owned();
+        self.flashes.files(head, files, &config, now);
+        self.flashes
+            .worktree(&root, head, total, branch.as_deref(), &config, now);
         self.worktree_totals.insert(root, total);
-    }
-
-    /// Measure other worktrees in the background when their rows are shown and the poll
-    /// interval has passed.
-    fn poll_worktrees(&mut self) -> Option<Command<Msg>> {
-        let seconds = self.config.flash.worktree_poll_seconds;
-        let wanted = self.config.flash.branches() || self.config.branches.line_counts;
-        if seconds == 0 || !wanted || !self.loaded_once {
-            return None;
-        }
-        let shown = self
-            .side_windows()
-            .any(|window| matches!(self.view(window), View::Branches | View::Worktrees));
-        let due = self
-            .last_worktree_poll
-            .is_none_or(|last| last.elapsed() >= Duration::from_secs(seconds));
-        if !shown || !due {
-            return None;
-        }
-        let root = self.repo.root();
-        let paths: Vec<PathBuf> = self
-            .snapshot
-            .worktrees
-            .iter()
-            .filter(|worktree| !worktree.bare && !worktree.prunable && worktree.path != root)
-            .take(WORKTREES_MEASURED)
-            .map(|worktree| worktree.path.clone())
-            .collect();
-        if paths.is_empty() {
-            return None;
-        }
-        self.last_worktree_poll = Some(Instant::now());
-        self.spawn(
-            Some("worktree-totals"),
-            move || crate::data::load_worktree_totals(&paths),
-            Msg::WorktreeTotals,
-        )
     }
 
     /// Redraw while something animates, ending finished flashes.
@@ -2450,42 +2467,62 @@ impl App {
         }
     }
 
-    fn install_worktree_totals(
-        &mut self,
-        totals: BTreeMap<PathBuf, (Option<String>, LineStats)>,
-    ) -> Update<Msg> {
+    fn install_live(&mut self, live: bcode_git_live::LiveUpdate) -> Update<Msg> {
+        if let Some(error) = live.errors.first() {
+            self.toast(error.clone(), true);
+        }
+        let mut update = Update::redraw();
+        if let Some(primary) = live.primary {
+            self.snapshot.status = primary.status;
+            self.snapshot.line_counts = primary.counts.into();
+            self.file_nodes = file_rows(&self.snapshot.status, self.file_tree, &self.collapsed);
+            self.observe_files(primary.head.as_deref());
+            self.restore_cursors();
+            update = update.maybe(self.sync_main(true));
+        }
+        for root in live.removed {
+            self.worktree_totals.remove(&root);
+        }
         let now = Instant::now();
-        for (path, (head, total)) in totals {
-            let Some(worktree) = self
+        for (path, (head, measured)) in live.totals {
+            let branch = self
                 .snapshot
                 .worktrees
                 .iter()
                 .find(|worktree| worktree.path == path)
-            else {
-                continue;
-            };
+                .and_then(|worktree| worktree.branch.clone());
             self.flashes.worktree(
                 &path,
                 head.as_deref(),
-                total,
-                worktree.branch.as_deref(),
+                measured.total,
+                branch.as_deref(),
                 &self.config.flash,
                 now,
             );
-            self.worktree_totals.insert(path, total);
+            self.worktree_totals.insert(path, measured.total);
         }
-        Update::redraw()
+        if live.metadata {
+            update = update.maybe(self.reload_metadata());
+        }
+        if live.files || live.metadata {
+            update = update.maybe(self.check_commit_prefill());
+        }
+        update
     }
 
     fn install_snapshot(&mut self, snapshot: Snapshot) {
         self.loaded_once = true;
         self.commit_graph = graph::layout(&snapshot.commits);
-        self.file_nodes = file_rows(&snapshot.status, self.file_tree, &self.collapsed);
         if let Some(error) = snapshot.errors.first() {
             self.toast(error.clone(), true);
         }
+        // Status and line counts stay: they come from live state.
+        let status = std::mem::take(&mut self.snapshot.status);
+        let line_counts = std::mem::take(&mut self.snapshot.line_counts);
         self.snapshot = snapshot;
-        self.observe_changes();
+        self.snapshot.status = status;
+        self.snapshot.line_counts = line_counts;
+        self.observe_listed();
         self.pulls
             .set_remote(&self.snapshot.remotes, &self.config.pull_requests.remote);
         self.refresh_branch_colors();
@@ -2752,7 +2789,8 @@ impl App {
             Msg::PullRequestMatches(generation, matched) => {
                 self.pull_requests_matched(generation, matched)
             }
-            Msg::WorktreeTotals(totals) => self.install_worktree_totals(totals),
+            Msg::Live(live) => self.install_live(*live),
+            Msg::Metadata => Update::none().maybe(self.reload_metadata()),
             Msg::Main(generation, content) => {
                 if generation == self.main_generation {
                     self.install_main(*content);
@@ -2808,12 +2846,11 @@ impl App {
             }
             Msg::OpDone(result) => self.finish_op(&result),
             Msg::Watch => {
-                // The main watcher also sees prefill files that live inside the worktree.
                 let update = Update::none().maybe(self.check_commit_prefill());
                 if self.activity.running() {
                     update
                 } else {
-                    update.maybe(self.refresh())
+                    update.maybe(self.refresh_all())
                 }
             }
             Msg::CommitSourcesChanged => Update::none().maybe(self.check_commit_prefill()),

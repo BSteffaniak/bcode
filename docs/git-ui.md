@@ -17,7 +17,8 @@ bcode-git --print-config-paths
 |---|---|
 | `bcode_git_models` | Portable repository models (status, diffs, commits, refs, stash, worktrees, rebase todo items). |
 | `bcode_git` | Runs the user's `git` CLI with machine-readable output and parses it. Builds and applies partial patches for hunk and line staging. |
-| `bcode_git_ui` | The BMUX program: panels, popups, keymap actions, theme roles, diff presentation and filesystem watching. |
+| `bcode_git_live` | Live status and line counts kept current from filesystem events: change sources per operating system, the engine that narrows git queries to what changed, and full-scan strategies. |
+| `bcode_git_ui` | The BMUX program: panels, popups, keymap actions, theme roles and diff presentation. |
 | `bcode_git_ui_cli` | The `bcode-git` binary. |
 | `bcode_git_plugin` (`git-ui` feature) | Registers the `bcode git` subcommand. |
 | `bcode_keymap`, `bcode_tui_theme` | Keybinding registry and theme definitions shared with the main TUI. |
@@ -32,6 +33,35 @@ credential helper or SSH agent for remotes that require authentication.
 All repository work runs off the input thread. Panel data loads in parallel and repeated
 navigation coalesces to the latest request, so large repositories stay responsive. Mutations run
 one at a time in order and are recorded in the command log (`@`).
+
+### Live updates
+
+Status and line counts follow filesystem events; nothing polls while watching works. Each kind
+of change runs only the git queries it needs:
+
+| Change | Work |
+|---|---|
+| A file in the worktree | `git status` and `git diff --numstat` limited to the changed paths (bursts are widened to their directories); untracked files are recounted only when their size or modification time changed. |
+| A path git ignores | Nothing: the repository's ignore rules filter events before git runs. |
+| The index (`git add`, `git restore --staged`, …) | `git ls-files --stage`, compared with the last reading, then the paths whose entries changed. Rewrites that only refresh stat data cost that one read. |
+| `HEAD` or a branch (commit, checkout, reset) | The paths the old and new commits differ in, then those paths. |
+| Upstream refs (`fetch`) | The branch header alone. |
+| A `.gitignore` | The paths it governs. |
+| Refs, stashes, tags, configuration, worktrees | The side panels' metadata. |
+
+A full scan happens at startup, on refresh (`shift+r`), and when the watcher reports that it lost
+events. Events arriving while work runs are batched into the next round (after 15 ms of quiet, at
+most 100 ms later), so work never overlaps however busy the repository is.
+
+How files are watched is pluggable behind one interface (`refresh.watcher`): one native
+recursive watch per worktree (`FSEvents` on macOS, `ReadDirectoryChangesW` on Windows), or one
+watch per directory git does not ignore (inotify on Linux), following directories as they
+appear. How full scans run is pluggable too (`refresh.scanner`): plain `git status`, or git's
+filesystem monitor and untracked cache, which git saves in the index and serves from its monitor
+daemon (macOS and Windows; plain elsewhere).
+
+The repository's other worktrees are watched the same way when branch flashes or branch line
+counts need them (at most 16).
 
 Git commands shown in the command log run on a pseudo-terminal, so their output looks as it does
 in a terminal: progress counters, colors and hook output (for example pre-commit checks) appear
@@ -131,8 +161,8 @@ configurable; see [Layout settings](#layout-settings).
   whose content shrank turns red (when removal is at least `removed_percent` of the change),
   then fades back. Files, the folders above them (collapsed too), the branch checked out in this
   worktree, and newly appearing files, branches and worktrees flash. Branches checked out in
-  other worktrees flash too: those worktrees are checked every `worktree_poll_seconds` while
-  branches or worktrees are shown (at most 16). Nothing flashes on the first load or for rows
+  other worktrees flash too, as their changes land (see [Live updates](#live-updates)). Nothing
+  flashes on the first load or for rows
   whose `HEAD` moved (commit, checkout, reset, …). See [`[flash]`](#configuration).
 * **Staging view** (`enter` on a file): stage, unstage or discard single lines, ranges (`v`) or
   hunks (`a`); `tab` switches between unstaged and staged changes; `e` opens the file at the line.
@@ -267,7 +297,6 @@ removed_percent = 90            # share of a change that must be removal for red
 fade = true                     # false holds the color, then stops
 files = true                    # files and folders
 branches = true                 # branches and worktrees
-worktree_poll_seconds = 5       # how often other worktrees are checked; 0 never
 
 [highlight]
 enabled = true
@@ -304,7 +333,9 @@ animate = true                  # false shows a still "…"
 
 [refresh]
 watch = true                    # filesystem watching; falls back to polling
-poll_seconds = 10
+watcher = "auto"                # auto | recursive | pruned (see Live updates)
+scanner = "plain"               # plain | fsmonitor: how full scans run
+poll_seconds = 10               # only while watching is off or unavailable
 auto_fetch_seconds = 0          # 0 disables background fetch
 
 [confirm]

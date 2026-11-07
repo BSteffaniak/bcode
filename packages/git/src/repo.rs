@@ -15,6 +15,36 @@ use crate::parse;
 use crate::patch::{PatchDirection, build_patch};
 use crate::{CommandLog, GitError, GitInvocation, GitRunner};
 
+/// Pathspec matching no path, since git never tracks `.git`.
+const HEADER_ONLY: &[&str] = &[".git"];
+
+/// What [`Repository::status_scoped`] covers.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StatusScope<'a> {
+    /// Every path. With `fsmonitor`, git uses its filesystem monitor and untracked cache and
+    /// saves them in the index (which starts git's monitor daemon for the worktree).
+    All {
+        /// Use git's filesystem monitor and untracked cache.
+        fsmonitor: bool,
+    },
+    /// These repository-relative paths; an empty list covers no path.
+    Paths(&'a [String]),
+    /// No path: only the branch header.
+    Header,
+}
+
+/// Which changes [`Repository::numstat_scoped`] counts.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CountTarget {
+    /// `HEAD` to worktree, staged and unstaged together (the empty tree before the first
+    /// commit).
+    Worktree,
+    /// `HEAD` to index.
+    Staged,
+    /// Index to worktree.
+    Unstaged,
+}
+
 /// Which pair of trees a diff compares.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum DiffTarget {
@@ -288,6 +318,156 @@ impl Repository {
             "--find-renames",
         ])?;
         parse::parse_status(&output)
+    }
+
+    /// Working tree status limited to a scope.
+    ///
+    /// Paths are repository-relative and matched literally; a directory covers everything
+    /// beneath it, and paths that no longer exist are fine. The branch header is always
+    /// included.
+    ///
+    /// # Errors
+    /// * [`GitError`] when git fails or output is malformed.
+    pub fn status_scoped(&self, scope: StatusScope<'_>) -> Result<StatusSnapshot, GitError> {
+        let mut args: Vec<&str> = Vec::new();
+        let fsmonitor = matches!(scope, StatusScope::All { fsmonitor: true });
+        if fsmonitor {
+            args.extend([
+                "-c",
+                "core.fsmonitor=true",
+                "-c",
+                "core.untrackedCache=true",
+            ]);
+        }
+        let paths: Option<Vec<&str>> = match scope {
+            StatusScope::All { .. } => None,
+            StatusScope::Paths(paths) if !paths.is_empty() => {
+                Some(paths.iter().map(String::as_str).collect())
+            }
+            StatusScope::Paths(_) | StatusScope::Header => Some(HEADER_ONLY.to_vec()),
+        };
+        if paths.is_some() {
+            args.push("--literal-pathspecs");
+        }
+        args.extend([
+            "status",
+            "--porcelain=v2",
+            "--branch",
+            "-z",
+            "--untracked-files=all",
+            "--find-renames",
+        ]);
+        if let Some(paths) = paths {
+            args.push("--");
+            args.extend(paths);
+        }
+        let mut invocation = GitInvocation::read(args);
+        if fsmonitor {
+            // The monitor's token and the untracked cache only help once saved in the index.
+            invocation = invocation.env("GIT_OPTIONAL_LOCKS", "1");
+        }
+        parse::parse_status(&self.runner.run(&invocation)?.stdout_lossy())
+    }
+
+    /// Lines added and removed per (new) path for `target`, limited to `paths` when given
+    /// (matched literally, directories covering everything beneath them). Untracked files
+    /// are not included; see [`Self::untracked_line_stats`].
+    ///
+    /// # Errors
+    /// * [`GitError`] when git fails.
+    pub fn numstat_scoped(
+        &self,
+        target: CountTarget,
+        paths: Option<&[String]>,
+    ) -> Result<BTreeMap<String, LineStats>, GitError> {
+        let run = |base: Option<&str>| {
+            let mut args = vec![
+                "--literal-pathspecs",
+                "diff",
+                "--no-ext-diff",
+                "--numstat",
+                "-z",
+            ];
+            match target {
+                CountTarget::Unstaged => {}
+                CountTarget::Staged => args.extend(["--cached", "--find-renames"]),
+                CountTarget::Worktree => args.push("--find-renames"),
+            }
+            args.extend(base);
+            if let Some(paths) = paths {
+                args.push("--");
+                args.extend(paths.iter().map(String::as_str));
+            }
+            self.runner.read(args)
+        };
+        let output = match target {
+            CountTarget::Worktree => match run(Some("HEAD")) {
+                Ok(output) => output,
+                Err(error) => {
+                    // No commits yet: compare against the empty tree of this object format.
+                    let Ok(empty) = self.runner.read(["hash-object", "-t", "tree", "/dev/null"])
+                    else {
+                        return Err(error);
+                    };
+                    run(Some(empty.trim())).map_err(|_| error)?
+                }
+            },
+            CountTarget::Staged | CountTarget::Unstaged => run(None)?,
+        };
+        Ok(parse::parse_numstat(&output))
+    }
+
+    /// Index entries by path, each as a fingerprint of its mode, object and stage (all
+    /// stages of a conflicted path together), limited to `paths` when given (matched
+    /// literally, directories covering everything beneath them). Stat data is left out, so
+    /// rewrites of the index that only refresh it change no fingerprint.
+    ///
+    /// # Errors
+    /// * [`GitError`] when git fails.
+    pub fn index_fingerprints(
+        &self,
+        paths: Option<&[String]>,
+    ) -> Result<BTreeMap<String, u64>, GitError> {
+        use std::hash::{Hash, Hasher};
+        let mut args = vec!["--literal-pathspecs", "ls-files", "--stage", "-z"];
+        if let Some(paths) = paths {
+            args.push("--");
+            args.extend(paths.iter().map(String::as_str));
+        }
+        let output = self.runner.read(args)?;
+        let mut entries: BTreeMap<String, u64> = BTreeMap::new();
+        for record in output.split('\0').filter(|record| !record.is_empty()) {
+            let Some((entry, path)) = record.split_once('\t') else {
+                continue;
+            };
+            let mut hasher = std::hash::DefaultHasher::new();
+            entry.hash(&mut hasher);
+            let fingerprint = entries.entry(path.to_owned()).or_default();
+            *fingerprint = fingerprint.rotate_left(17) ^ hasher.finish();
+        }
+        Ok(entries)
+    }
+
+    /// Paths whose content differs between two commits, both sides of renames included.
+    ///
+    /// # Errors
+    /// * [`GitError`] when git fails.
+    pub fn paths_between(&self, from: &str, to: &str) -> Result<Vec<String>, GitError> {
+        let output = self.runner.read([
+            "diff-tree",
+            "-r",
+            "--name-only",
+            "--no-renames",
+            "--no-commit-id",
+            "-z",
+            from,
+            to,
+        ])?;
+        Ok(output
+            .split('\0')
+            .filter(|path| !path.is_empty())
+            .map(str::to_owned)
+            .collect())
     }
 
     /// Diff for a target, optionally limited to paths.

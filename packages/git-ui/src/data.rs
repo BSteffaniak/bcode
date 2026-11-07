@@ -12,7 +12,6 @@ use bcode_syntax_render::SyntaxHighlighter;
 use bmux_tui::style::{Modifier, Style};
 use bmux_tui::text::{Line, Span};
 
-use crate::config::LineCountsShow;
 use crate::diffview::{DiffOptions, DiffRow, SideTexts, present_file};
 use crate::graph;
 use crate::theme::GitTheme;
@@ -56,11 +55,6 @@ pub struct Snapshot {
     pub errors: Vec<String>,
 }
 
-/// Untracked files counted for line counts; the rest show none.
-const UNTRACKED_COUNT_FILES: usize = 2000;
-/// Largest untracked file counted for line counts.
-const UNTRACKED_COUNT_BYTES: u64 = 4 * 1024 * 1024;
-
 /// Lines changed in working tree files, by path.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub enum LineCounts {
@@ -92,42 +86,19 @@ pub enum ShownCounts {
     },
 }
 
+impl From<bcode_git_live::LineCounts> for LineCounts {
+    fn from(counts: bcode_git_live::LineCounts) -> Self {
+        match counts {
+            bcode_git_live::LineCounts::Off => Self::Off,
+            bcode_git_live::LineCounts::Total(total) => Self::Total(total),
+            bcode_git_live::LineCounts::Split { staged, unstaged } => {
+                Self::Split { staged, unstaged }
+            }
+        }
+    }
+}
+
 impl LineCounts {
-    /// Counts of tracked files, measured as `show` asks.
-    fn tracked(repo: &Repository, show: LineCountsShow) -> Result<Self, bcode_git::GitError> {
-        Ok(match show {
-            LineCountsShow::Off => Self::Off,
-            LineCountsShow::Total => Self::Total(repo.worktree_numstat()?),
-            LineCountsShow::Split => Self::Split {
-                staged: repo.numstat(&DiffTarget::Staged)?,
-                unstaged: repo.numstat(&DiffTarget::Unstaged)?,
-            },
-        })
-    }
-
-    /// These counts plus the untracked files of `status`, as unstaged changes.
-    fn with_untracked(mut self, repo: &Repository, status: &StatusSnapshot) -> Self {
-        let (Self::Total(counts)
-        | Self::Split {
-            unstaged: counts, ..
-        }) = &mut self
-        else {
-            return self;
-        };
-        counts.extend(
-            repo.untracked_line_stats(
-                status
-                    .entries
-                    .iter()
-                    .filter(|entry| entry.is_untracked())
-                    .map(|entry| entry.path.as_str()),
-                UNTRACKED_COUNT_FILES,
-                UNTRACKED_COUNT_BYTES,
-            ),
-        );
-        self
-    }
-
     /// Staged and unstaged counts together, by path; `None` when not loaded.
     #[must_use]
     pub fn combined(&self) -> Option<BTreeMap<String, LineStats>> {
@@ -178,58 +149,10 @@ impl ShownCounts {
     }
 }
 
-/// Untracked files counted per other worktree.
-const WORKTREE_UNTRACKED_FILES: usize = 500;
-/// Largest untracked file counted per other worktree.
-const WORKTREE_UNTRACKED_BYTES: u64 = 1024 * 1024;
-
-/// Lines changed in each of `paths` (other worktrees) against its own `HEAD`.
-///
-/// Staged, unstaged and untracked changes count together; each worktree is measured in
-/// parallel and paired with the `HEAD` commit it was measured against (`None` while
-/// unborn). Worktrees that cannot be read are left out.
+/// Load the side panels' git metadata, running independent queries in parallel. Status and
+/// line counts are left empty: live state keeps them.
 #[must_use]
-pub fn load_worktree_totals(
-    paths: &[std::path::PathBuf],
-) -> BTreeMap<std::path::PathBuf, (Option<String>, LineStats)> {
-    std::thread::scope(|scope| {
-        // Start every measurement before waiting on any.
-        let mut handles = Vec::with_capacity(paths.len());
-        for path in paths {
-            handles.push(scope.spawn(move || {
-                let repo = Repository::discover(path, bcode_git::CommandLog::default()).ok()?;
-                let mut counts = repo.worktree_numstat().ok()?;
-                let status = repo.status().ok()?;
-                counts.extend(
-                    repo.untracked_line_stats(
-                        status
-                            .entries
-                            .iter()
-                            .filter(|entry| entry.is_untracked())
-                            .map(|entry| entry.path.as_str()),
-                        WORKTREE_UNTRACKED_FILES,
-                        WORKTREE_UNTRACKED_BYTES,
-                    ),
-                );
-                let head = repo.rev_parse("HEAD").ok();
-                Some((path.clone(), (head, counts.into_values().sum())))
-            }));
-        }
-        handles
-            .into_iter()
-            .filter_map(|handle| handle.join().ok().flatten())
-            .collect()
-    })
-}
-
-/// Load all panel data, running independent queries in parallel.
-#[must_use]
-pub fn load_snapshot(
-    repo: &Repository,
-    commit_limit: usize,
-    merged: bool,
-    line_counts: LineCountsShow,
-) -> Snapshot {
+pub fn load_snapshot(repo: &Repository, commit_limit: usize, merged: bool) -> Snapshot {
     fn join<T>(
         handle: std::thread::ScopedJoinHandle<'_, Result<T, bcode_git::GitError>>,
     ) -> Result<T, bcode_git::GitError> {
@@ -250,7 +173,6 @@ pub fn load_snapshot(
     };
     let (
         head,
-        status,
         branches,
         remotes,
         remote_branches,
@@ -262,10 +184,8 @@ pub fn load_snapshot(
         stashes,
         worktrees,
         submodules,
-        line_counts,
     ) = std::thread::scope(|scope| {
         let head = scope.spawn(|| repo.head());
-        let status = scope.spawn(|| repo.status());
         let branches = scope.spawn(|| repo.branches());
         let remotes = scope.spawn(|| repo.remotes());
         let remote_branches = scope.spawn(|| repo.remote_branches());
@@ -283,10 +203,8 @@ pub fn load_snapshot(
         let stashes = scope.spawn(|| repo.stashes());
         let worktrees = scope.spawn(|| repo.worktrees());
         let submodules = scope.spawn(|| repo.submodules());
-        let line_counts = scope.spawn(move || LineCounts::tracked(repo, line_counts));
         (
             join(head).map(Some),
-            join(status),
             join(branches),
             join(remotes),
             join(remote_branches),
@@ -298,18 +216,15 @@ pub fn load_snapshot(
             join(stashes),
             join(worktrees),
             join(submodules),
-            join(line_counts),
         )
     });
-    let status = take(status, &mut errors);
-    let line_counts = take(line_counts, &mut errors).with_untracked(repo, &status);
     let mut commits: Vec<Commit> = take(commits, &mut errors);
     let more_commits = commits.len() > commit_limit;
     commits.truncate(commit_limit);
     Snapshot {
         head: take(head, &mut errors),
         operation: repo.operation(),
-        status,
+        status: StatusSnapshot::default(),
         branches: take(branches, &mut errors),
         remotes: take(remotes, &mut errors),
         remote_branches: take(remote_branches, &mut errors),
@@ -322,7 +237,7 @@ pub fn load_snapshot(
         stashes: take(stashes, &mut errors),
         worktrees: take(worktrees, &mut errors),
         submodules: take(submodules, &mut errors),
-        line_counts,
+        line_counts: LineCounts::Off,
         errors,
     }
 }

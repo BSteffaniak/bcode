@@ -2296,6 +2296,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "bcode_git_live"
+version = "0.0.1-alpha.0"
+dependencies = [
+ "bcode_git",
+ "ignore",
+ "notify",
+ "tempfile",
+ "thiserror 2.0.21",
+]
+
+[[package]]
 name = "bcode_git_models"
 version = "0.0.1-alpha.0"
 dependencies = [
@@ -2328,6 +2339,7 @@ dependencies = [
  "bcode_config_layers",
  "bcode_forge_models",
  "bcode_git",
+ "bcode_git_live",
  "bcode_keymap",
  "bcode_syntax_render",
  "bcode_tui_theme",

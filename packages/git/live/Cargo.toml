@@ -1,0 +1,24 @@
+[package]
+authors     = { workspace = true }
+categories  = ["development-tools"]
+description = "Live git repository state kept current from filesystem events for bcode"
+edition     = { workspace = true }
+keywords    = ["bcode", "git", "watch"]
+license     = { workspace = true }
+name        = "bcode_git_live"
+readme      = { workspace = true }
+repository  = { workspace = true }
+version     = { workspace = true }
+
+[dependencies]
+bcode_git = { workspace = true }
+ignore    = { workspace = true }
+notify    = { workspace = true, features = ["macos_fsevent"] }
+thiserror = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }
+
+[features]
+default          = []
+fail-on-warnings = []
