@@ -84,6 +84,11 @@ is scanned and checked once.
   be reached at all, clients serve themselves from the start.
 * **Protocol.** Newline-delimited JSON over the socket, versioned by a handshake; a daemon of
   another protocol version refuses the client, which then serves itself.
+* **Stopping it.** `bcode-git --stop-daemon` (or `bcode git --stop-daemon`) stops every daemon of
+  the state directory, of every build, and prints what it stopped. Each is asked to exit; one
+  that does not (an older build, or a stuck one) is terminated by signal, and sockets nobody
+  answers on are removed. Running clients carry on serving themselves; the next client to start
+  launches a fresh daemon.
 * `refresh.daemon = false` (or `refresh.watch = false`) keeps every client to itself. Unix only;
   elsewhere clients always serve themselves.
 

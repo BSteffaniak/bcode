@@ -9,6 +9,7 @@
 //! * [`protocol`]: versioned, newline-delimited JSON messages over a local socket.
 //! * [`paths`]: where the socket lives. Its name derives from the running executable, so a
 //!   client only ever talks to a daemon of its own build, and builds coexist.
+//! * [`control`]: finding and stopping the user's daemons, of every build.
 //!
 //! The daemon needs Unix domain sockets; elsewhere clients serve themselves in-process.
 
@@ -17,6 +18,8 @@
 #![allow(clippy::multiple_crate_versions)]
 
 pub mod client;
+#[cfg(unix)]
+pub mod control;
 pub mod paths;
 pub mod protocol;
 #[cfg(unix)]

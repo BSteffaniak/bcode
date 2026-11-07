@@ -59,6 +59,8 @@ struct Shared {
     state: Mutex<State>,
     changed: Condvar,
     socket: PathBuf,
+    /// Inode of the socket file this daemon created, to remove only that one.
+    inode: u64,
 }
 
 impl Shared {
@@ -82,8 +84,8 @@ impl Shared {
 /// # Errors
 /// * [`std::io::Error`] when the socket cannot be created.
 pub fn serve(options: &ServeOptions) -> std::io::Result<()> {
-    if let Some(listener) = bind(&options.socket)? {
-        run(listener, options, &shared(options));
+    if let Some((listener, inode)) = bind(&options.socket)? {
+        run(listener, options, &shared(options, inode));
     }
     Ok(())
 }
@@ -100,10 +102,10 @@ impl Server {
     /// # Errors
     /// * [`std::io::Error`] when the socket cannot be created or is already served.
     pub fn spawn(options: ServeOptions) -> std::io::Result<Self> {
-        let listener = bind(&options.socket)?.ok_or_else(|| {
+        let (listener, inode) = bind(&options.socket)?.ok_or_else(|| {
             std::io::Error::new(std::io::ErrorKind::AddrInUse, "a daemon already listens")
         })?;
-        let shared = shared(&options);
+        let shared = shared(&options, inode);
         let thread = {
             let shared = shared.clone();
             std::thread::Builder::new()
@@ -148,7 +150,7 @@ impl Drop for Server {
     }
 }
 
-fn shared(options: &ServeOptions) -> Arc<Shared> {
+fn shared(options: &ServeOptions, inode: u64) -> Arc<Shared> {
     Arc::new(Shared {
         state: Mutex::new(State {
             idle_since: Some(Instant::now()),
@@ -156,11 +158,13 @@ fn shared(options: &ServeOptions) -> Arc<Shared> {
         }),
         changed: Condvar::new(),
         socket: options.socket.clone(),
+        inode,
     })
 }
 
-/// Listen on `socket`, replacing a stale one; `None` when a daemon already answers there.
-fn bind(socket: &Path) -> std::io::Result<Option<UnixListener>> {
+/// Listen on `socket`, replacing a stale one: the listener and the socket file's inode;
+/// `None` when a daemon already answers there.
+fn bind(socket: &Path) -> std::io::Result<Option<(UnixListener, u64)>> {
     crate::paths::private_directory(socket)?;
     if UnixStream::connect(socket).is_ok() {
         return Ok(None);
@@ -172,7 +176,8 @@ fn bind(socket: &Path) -> std::io::Result<Option<UnixListener>> {
     }
     let listener = UnixListener::bind(socket)?;
     std::fs::set_permissions(socket, std::fs::Permissions::from_mode(0o600))?;
-    Ok(Some(listener))
+    let inode = std::os::unix::fs::MetadataExt::ino(&std::fs::metadata(socket)?);
+    Ok(Some((listener, inode)))
 }
 
 fn run(listener: UnixListener, options: &ServeOptions, shared: &Arc<Shared>) {
@@ -211,7 +216,6 @@ fn run(listener: UnixListener, options: &ServeOptions, shared: &Arc<Shared>) {
                 shared.changed.notify_all();
             });
     }
-    // Remove the socket only if it is still ours (a newer daemon may have replaced it).
     drop(listener);
     {
         let mut state = shared.lock();
@@ -221,7 +225,12 @@ fn run(listener: UnixListener, options: &ServeOptions, shared: &Arc<Shared>) {
         state.repositories.clear();
     }
     let _ = keeper.join();
-    if UnixStream::connect(&shared.socket).is_err() {
+    // Remove the socket only if it is still the file this daemon created (a newer daemon may
+    // have replaced it). Asking whether anything answers there is no test: a git process
+    // being started holds the listener for a moment.
+    let ours = std::fs::metadata(&shared.socket)
+        .is_ok_and(|metadata| std::os::unix::fs::MetadataExt::ino(&metadata) == shared.inode);
+    if ours {
         let _ = std::fs::remove_file(&shared.socket);
     }
 }
@@ -287,13 +296,19 @@ fn converse(stream: &UnixStream, shared: &Shared) -> std::io::Result<()> {
         }
         _ => return Ok(()),
     }
-    let Some(ClientMessage::Subscribe {
-        path,
-        config,
-        watcher,
-    }) = protocol::read::<ClientMessage>(&mut reader)?
-    else {
-        return Ok(());
+    let (path, config, watcher) = match protocol::read::<ClientMessage>(&mut reader)? {
+        Some(ClientMessage::Subscribe {
+            path,
+            config,
+            watcher,
+        }) => (path, config, watcher),
+        Some(ClientMessage::Stop) => {
+            protocol::write(&mut writer, &ServerMessage::Stopping)?;
+            let mut state = shared.lock();
+            shared.stop(&mut state);
+            return Ok(());
+        }
+        _ => return Ok(()),
     };
     let repo = match Repository::discover(&path, CommandLog::default()) {
         Ok(repo) => repo,

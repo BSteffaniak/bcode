@@ -129,3 +129,82 @@ fn clients_start_one_daemon_share_it_and_it_exits_when_idle() {
         std::thread::sleep(Duration::from_millis(50));
     }
 }
+
+#[test]
+fn stop_daemon_stops_the_shared_daemon_and_clients_carry_on() {
+    let repo_dir = tempfile::tempdir().unwrap();
+    let path = repo_dir.path();
+    git(path, &["init", "--quiet", "--initial-branch", "main"]);
+    git(path, &["config", "user.email", "test@example.com"]);
+    git(path, &["config", "user.name", "Test"]);
+    std::fs::write(path.join("a.txt"), "1\n").unwrap();
+    git(path, &["add", "--all"]);
+    git(
+        path,
+        &[
+            "-c",
+            "commit.gpgsign=false",
+            "commit",
+            "--quiet",
+            "-m",
+            "init",
+        ],
+    );
+
+    // The binary's state directory is `$XDG_STATE_HOME/bcode-git`.
+    let xdg = tempfile::Builder::new().tempdir_in("/tmp").unwrap();
+    let state = xdg.path().join("bcode-git");
+    let binary = PathBuf::from(env!("CARGO_BIN_EXE_bcode-git"));
+    let options = ClientOptions::new(
+        bcode_git_daemon::socket_path(&state),
+        Some(Launch {
+            program: binary.clone(),
+            args: vec![bcode_git_ui::DAEMON_ARGUMENT.into()],
+        }),
+    );
+    let repo = Repository::discover(path, CommandLog::default()).unwrap();
+    let (sender, updates) = mpsc::channel();
+    let session = DaemonSession::connect(
+        &options,
+        &repo,
+        EngineConfig {
+            counts: CountsMode::Total,
+            ..EngineConfig::default()
+        },
+        Some(SourceKind::Auto),
+        Arc::new(move |update| {
+            let _ = sender.send(update);
+        }),
+    )
+    .unwrap();
+    let pid = session.daemon_pid();
+    assert!(alive(pid));
+
+    let output = Command::new(&binary)
+        .arg("--stop-daemon")
+        .env("XDG_STATE_HOME", xdg.path())
+        .output()
+        .unwrap();
+    let text = String::from_utf8_lossy(&output.stdout);
+    assert!(output.status.success(), "{text}");
+    assert!(
+        text.contains(&format!("daemon {pid}")) && text.contains("stopped"),
+        "{text}"
+    );
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while alive(pid) || session.served_by_daemon() {
+        assert!(Instant::now() < deadline, "the daemon did not stop");
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    std::fs::write(path.join("a.txt"), "1\n2\n").unwrap();
+    wait_for("the edit, served in-process", &updates, |update| {
+        counted(update, "a.txt", LineStats::text(1, 0))
+    });
+
+    let output = Command::new(&binary)
+        .arg("--stop-daemon")
+        .env("XDG_STATE_HOME", xdg.path())
+        .output()
+        .unwrap();
+    assert!(String::from_utf8_lossy(&output.stdout).contains("no bcode-git daemon is running"));
+}

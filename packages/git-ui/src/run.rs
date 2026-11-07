@@ -53,6 +53,38 @@ pub fn daemon_launch(prefix: &[&str]) -> Option<bcode_git_daemon::Launch> {
     bcode_git_daemon::Launch::current_exe(prefix.iter().copied().chain([DAEMON_ARGUMENT])).ok()
 }
 
+/// Stop every shared daemon of `state_dir` (else the default state directory), of every build.
+///
+/// Each is asked to exit, and terminated by signal when it does not (an older or stuck
+/// daemon). Clients keep running and serve themselves. Returns one line per daemon found, and
+/// whether every one was stopped.
+#[must_use]
+pub fn stop_daemons(state_dir: Option<PathBuf>) -> (Vec<String>, bool) {
+    #[cfg(unix)]
+    {
+        let Some(state) = state_dir.or_else(bcode_git_daemon::default_state_dir) else {
+            return (vec!["no state directory to look in".into()], false);
+        };
+        let mut all = true;
+        let lines = bcode_git_daemon::control::stop_all(&state)
+            .into_iter()
+            .map(|(found, outcome)| {
+                all &= !matches!(outcome, bcode_git_daemon::control::Outcome::Failed(_));
+                match found.pid {
+                    Some(pid) => format!("daemon {pid} ({}): {outcome}", found.socket.display()),
+                    None => format!("{}: {outcome}", found.socket.display()),
+                }
+            })
+            .collect();
+        (lines, all)
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = state_dir;
+        (Vec::new(), true)
+    }
+}
+
 /// Serve as the shared daemon on `socket` until idle (`idle` overrides how long that takes).
 ///
 /// # Errors

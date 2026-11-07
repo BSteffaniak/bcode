@@ -2301,6 +2301,7 @@ version = "0.0.1-alpha.0"
 dependencies = [
  "bcode_git",
  "bcode_git_live",
+ "rustix 1.1.5",
  "serde",
  "serde_json",
  "tempfile",

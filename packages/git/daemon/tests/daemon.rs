@@ -226,3 +226,78 @@ fn an_idle_daemon_exits_and_removes_its_socket() {
     }
     assert!(!socket(&state).exists());
 }
+
+#[test]
+fn stopping_asks_the_daemon_and_its_clients_carry_on() {
+    let state = tempfile::tempdir().unwrap();
+    let repo = repository();
+    let server = Server::spawn(ServeOptions::new(socket(&state))).unwrap();
+    let mut client = Client::connect(&socket(&state), repo.path());
+
+    let stopped = bcode_git_daemon::control::stop_all(state.path());
+    assert_eq!(stopped.len(), 1, "{stopped:?}");
+    assert_eq!(stopped[0].1, bcode_git_daemon::control::Outcome::Stopped);
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while !server.finished() || client.session.served_by_daemon() {
+        assert!(Instant::now() < deadline, "the daemon did not stop");
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    assert!(!socket(&state).exists());
+    std::fs::write(repo.path().join("a.txt"), "").unwrap();
+    client.wait("the edit, served in-process", |client| {
+        client.count("a.txt") == Some(LineStats::text(0, 1))
+    });
+}
+
+#[test]
+fn a_daemon_that_ignores_being_asked_is_terminated() {
+    use std::os::unix::net::UnixListener;
+    let state = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(socket(&state).parent().unwrap()).unwrap();
+    // An older (or stuck) daemon: it says hello but does not understand being asked to stop.
+    let process = Command::new("sleep").arg("60").spawn().unwrap();
+    let pid = process.id();
+    let (exited, exits) = mpsc::channel();
+    std::thread::spawn(move || {
+        let mut process = process;
+        let _ = exited.send(process.wait());
+    });
+    let listener = UnixListener::bind(socket(&state)).unwrap();
+    std::thread::spawn(move || {
+        for stream in listener.incoming().flatten() {
+            let mut writer = stream.try_clone().unwrap();
+            let mut reader = BufReader::new(stream);
+            if let Ok(Some(ClientMessage::Hello { .. })) = protocol::read(&mut reader) {
+                let _ = protocol::write(
+                    &mut writer,
+                    &ServerMessage::Welcome {
+                        protocol: protocol::PROTOCOL,
+                        pid,
+                    },
+                );
+                let _ = protocol::read::<ClientMessage>(&mut reader);
+            }
+        }
+    });
+
+    let stopped = bcode_git_daemon::control::stop_all(state.path());
+    assert_eq!(stopped.len(), 1, "{stopped:?}");
+    assert_eq!(stopped[0].0.pid, Some(pid));
+    assert_eq!(stopped[0].1, bcode_git_daemon::control::Outcome::Terminated);
+    assert!(exits.recv_timeout(Duration::from_secs(5)).is_ok());
+}
+
+#[test]
+fn sockets_nobody_answers_on_are_removed() {
+    let state = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(socket(&state).parent().unwrap()).unwrap();
+    drop(std::os::unix::net::UnixListener::bind(socket(&state)).unwrap());
+    assert!(socket(&state).exists());
+    let stopped = bcode_git_daemon::control::stop_all(state.path());
+    assert_eq!(stopped.len(), 1, "{stopped:?}");
+    assert_eq!(stopped[0].0.pid, None);
+    assert_eq!(stopped[0].1, bcode_git_daemon::control::Outcome::Stale);
+    assert!(!socket(&state).exists());
+    // Nothing left to stop.
+    assert!(bcode_git_daemon::control::stop_all(state.path()).is_empty());
+}

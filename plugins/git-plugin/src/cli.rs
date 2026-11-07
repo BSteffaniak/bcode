@@ -32,6 +32,10 @@ struct GitCli {
     /// With --print-config or --import-lazygit, emit the bcode.toml form instead.
     #[arg(long)]
     nested: bool,
+    /// Stop the shared bcode-git daemons (of every build) and exit. Running clients keep
+    /// working on their own.
+    #[arg(long)]
+    stop_daemon: bool,
     /// Serve live repository state for every client on this socket (started automatically
     /// by clients).
     #[arg(long = "git-daemon", hide = true, value_name = "SOCKET")]
@@ -56,6 +60,20 @@ fn invoke(matches: clap::ArgMatches) -> StaticCliFuture {
             let idle = cli.git_daemon_idle_ms.map(std::time::Duration::from_millis);
             bcode_git_ui::serve_daemon(socket, idle).map_err(|error| error.to_string())?;
             return Ok(StaticCliOutcome::default());
+        }
+        if cli.stop_daemon {
+            let (lines, all) = bcode_git_ui::stop_daemons(None);
+            if lines.is_empty() {
+                println!("no bcode-git daemon is running");
+            }
+            for line in &lines {
+                println!("{line}");
+            }
+            return if all {
+                Ok(StaticCliOutcome::default())
+            } else {
+                Err("not every bcode-git daemon could be stopped".into())
+            };
         }
         let path = match cli.path {
             Some(path) => std::path::absolute(&path).unwrap_or(path),

@@ -13,6 +13,8 @@ use clap::Parser;
 /// Interactive terminal git client.
 #[derive(Debug, Parser)]
 #[command(name = "bcode-git", version, about)]
+// Each flag is an independent command-line switch.
+#[allow(clippy::struct_excessive_bools)]
 struct Args {
     /// Run as if started in this directory.
     #[arg(short = 'C', long = "path", value_name = "DIR")]
@@ -37,6 +39,10 @@ struct Args {
     /// With --print-config or --import-lazygit, emit the bcode.toml form instead.
     #[arg(long)]
     nested: bool,
+    /// Stop the shared bcode-git daemons (of every build) and exit. Running clients keep
+    /// working on their own.
+    #[arg(long)]
+    stop_daemon: bool,
     /// Serve live repository state for every client on this socket (started automatically
     /// by clients).
     #[arg(long = "git-daemon", hide = true, value_name = "SOCKET")]
@@ -59,6 +65,20 @@ async fn main() -> ExitCode {
                 eprintln!("bcode-git: {error}");
                 ExitCode::FAILURE
             }
+        };
+    }
+    if args.stop_daemon {
+        let (lines, all) = bcode_git_ui::stop_daemons(None);
+        if lines.is_empty() {
+            println!("no bcode-git daemon is running");
+        }
+        for line in lines {
+            println!("{line}");
+        }
+        return if all {
+            ExitCode::SUCCESS
+        } else {
+            ExitCode::FAILURE
         };
     }
     let path = args

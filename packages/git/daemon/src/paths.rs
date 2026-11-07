@@ -26,7 +26,8 @@ pub fn default_state_dir() -> Option<PathBuf> {
 /// The identity covers the running executable (path, size and modification time) and the
 /// protocol version. Each build thus has its own daemon, and a rebuilt binary starts a new
 /// one while clients of the old build keep theirs. Socket paths are short, so when that one
-/// would be too long it lives in `/tmp/bcode-git-<uid>/` instead, named after it.
+/// would be too long it lives in `/tmp/bcode-git-<uid>/` instead, named after the state
+/// directory (see [`short_socket_prefix`]) and the path it would have had.
 #[must_use]
 pub fn socket_path(state_dir: &Path) -> PathBuf {
     let preferred = state_dir
@@ -37,14 +38,31 @@ pub fn socket_path(state_dir: &Path) -> PathBuf {
     }
     let mut hasher = std::hash::DefaultHasher::new();
     preferred.hash(&mut hasher);
-    PathBuf::from("/tmp")
-        .join(format!("bcode-git-{}", owner()))
-        .join(format!("{:016x}.sock", hasher.finish()))
+    short_socket_dir().join(format!(
+        "{}{:016x}.sock",
+        short_socket_prefix(state_dir),
+        hasher.finish()
+    ))
+}
+
+/// How the names of `state_dir`'s sockets in [`short_socket_dir`] begin, so each state
+/// directory finds only its own there.
+#[must_use]
+pub fn short_socket_prefix(state_dir: &Path) -> String {
+    let mut hasher = std::hash::DefaultHasher::new();
+    state_dir.hash(&mut hasher);
+    format!("{:016x}-", hasher.finish())
+}
+
+/// Where sockets go whose preferred path is too long.
+#[must_use]
+pub fn short_socket_dir() -> PathBuf {
+    PathBuf::from("/tmp").join(format!("bcode-git-{}", owner()))
 }
 
 /// The current user's id, as the owner of the home directory.
 #[cfg(unix)]
-fn owner() -> u32 {
+pub(crate) fn owner() -> u32 {
     use std::os::unix::fs::MetadataExt as _;
     std::env::var_os("HOME")
         .and_then(|home| std::fs::metadata(home).ok())
@@ -109,7 +127,10 @@ mod tests {
         let socket = socket_path(&deep);
         assert!(socket.starts_with("/tmp"));
         assert!(socket.as_os_str().len() <= SOCKET_PATH_LIMIT);
-        // Each state directory keeps its own daemon.
+        // Each state directory keeps its own daemon, and finds it by name.
         assert_ne!(socket, socket_path(&deep.join("other")));
+        let name = socket.file_name().unwrap().to_string_lossy().into_owned();
+        assert!(name.starts_with(&short_socket_prefix(&deep)));
+        assert!(!name.starts_with(&short_socket_prefix(&deep.join("other"))));
     }
 }

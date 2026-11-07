@@ -4,7 +4,9 @@
 //! (or [`ServerMessage::Refused`] for another protocol version); client
 //! [`ClientMessage::Subscribe`], daemon [`ServerMessage::Subscribed`] (or
 //! [`ServerMessage::Failed`]); then daemon updates and client requests until either side
-//! closes.
+//! closes. Instead of subscribing, a client may send [`ClientMessage::Stop`]: the daemon
+//! answers [`ServerMessage::Stopping`] and exits. Daemons that predate it close the
+//! connection instead, and are stopped by signal (see [`crate::control`]).
 
 use std::io::{BufRead, Read, Write};
 use std::path::PathBuf;
@@ -44,6 +46,8 @@ pub enum ClientMessage {
         /// The request.
         request: Request,
     },
+    /// Exit, disconnecting every client (they then serve themselves).
+    Stop,
 }
 
 /// From the daemon.
@@ -77,6 +81,8 @@ pub enum ServerMessage {
         /// The change.
         update: Box<LiveUpdate>,
     },
+    /// Exiting, as asked.
+    Stopping,
 }
 
 /// Write one message and flush it.
