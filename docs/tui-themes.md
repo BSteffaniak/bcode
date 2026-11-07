@@ -460,6 +460,8 @@ colorful fallback derived from the theme's state colors and `accent`/`violet` pa
   branch (dim by default)
 * `git.pr.open`, `git.pr.draft`, `git.pr.merged`, `git.pr.closed`: pull request markers
 * `git.activity`: spinners and progress of running work (bold accent by default)
+* `git.flash.added`, `git.flash.removed`: backgrounds of rows flashing after their changes grew
+  or shrank (default: the `diff.added_emphasis` and `diff.removed_emphasis` backgrounds)
 * `git.commit.sha`, `git.commit.author`, `git.commit.date`
 
 Graph lanes and author initials cycle through bright colors, kept apart from the state colors, so

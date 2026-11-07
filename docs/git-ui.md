@@ -125,6 +125,15 @@ configurable; see [Layout settings](#layout-settings).
   bottom border shows the total of the files listed (only those matching a filter). Untracked
   files count as added, up to 2000 files of at most 4 MiB each. Commit and stash file lists show
   the same. See [`[files.line_counts]`](#configuration) for what they measure and where they sit.
+  With `[branches] line_counts = true`, branches and worktrees show the lines changed where each
+  branch is checked out.
+* **Change flashes**: when changes land, a row whose content grew briefly turns green and one
+  whose content shrank turns red (when removal is at least `removed_percent` of the change),
+  then fades back. Files, the folders above them (collapsed too), the branch checked out in this
+  worktree, and newly appearing files, branches and worktrees flash. Branches checked out in
+  other worktrees flash too: those worktrees are checked every `worktree_poll_seconds` while
+  branches or worktrees are shown (at most 16). Nothing flashes on the first load or for rows
+  whose `HEAD` moved (commit, checkout, reset, …). See [`[flash]`](#configuration).
 * **Staging view** (`enter` on a file): stage, unstage or discard single lines, ranges (`v`) or
   hunks (`a`); `tab` switches between unstaged and staged changes; `e` opens the file at the line.
 * **Commits**: commit (stages everything when nothing is staged), commit without hooks, amend,
@@ -251,6 +260,15 @@ show = "total"                  # total: staged and unstaged against HEAD; split
 align = "after-name"            # or "right": against the panel's right edge
 floating = false                # true shortens long names (…) so the counts stay visible
 
+[flash]
+enabled = true                  # rows flash when their changes grow (green) or shrink (red)
+duration_ms = 600               # how long a flash lasts, fade included
+removed_percent = 90            # share of a change that must be removal for red
+fade = true                     # false holds the color, then stops
+files = true                    # files and folders
+branches = true                 # branches and worktrees
+worktree_poll_seconds = 5       # how often other worktrees are checked; 0 never
+
 [highlight]
 enabled = true
 max_file_bytes = 1048576
@@ -271,6 +289,8 @@ enterprise_hosts = []           # GitHub Enterprise hosts to treat as GitHub
 
 [branches]
 dim_merged = true               # dim branches already merged into the base branch
+line_counts = false             # lines changed where each branch is checked out, beside
+                                # branches and worktrees (placed like files.line_counts)
 colors = [                      # checked in order before the state colors; see Branch colors
   { pattern = "^release/", color = "bright-cyan", bold = true },
 ]

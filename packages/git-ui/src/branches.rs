@@ -200,6 +200,9 @@ pub struct BranchesConfig {
     /// Dim branches already merged into the base branch (the remote's default branch, else
     /// `main` or `master`).
     pub dim_merged: bool,
+    /// Lines added and removed in the worktree where each branch is checked out, beside
+    /// branch and worktree rows. Placed like file counts (`files.line_counts`).
+    pub line_counts: bool,
 }
 
 impl Default for BranchesConfig {
@@ -207,6 +210,7 @@ impl Default for BranchesConfig {
         Self {
             colors: Vec::new(),
             dim_merged: true,
+            line_counts: false,
         }
     }
 }

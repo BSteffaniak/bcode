@@ -2,11 +2,13 @@
 
 use std::cell::{Cell, RefCell};
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use bcode_git::models::{
-    ChangedFile, Commit, CommitMessageSource, DiffLineId, LineStats, RepoOperation, StatusEntry,
+    ChangedFile, Commit, CommitMessageSource, DiffLineId, HeadState, LineStats, RepoOperation,
+    StatusEntry,
 };
 use bcode_git::{DiffTarget, LogQuery, Repository};
 use bmux_keyboard::KeyStroke;
@@ -19,8 +21,8 @@ use bmux_tui_components::text_input::{
 };
 use bmux_tui_runtime::{Command, CommandKey, Program, RuntimeEvent, SubscriptionKey, Update};
 
-use crate::config::GitUiConfig;
 pub use crate::config::ScreenMode;
+use crate::config::{GitUiConfig, LineCountsShow};
 use crate::data::{
     FileNode, MainContent, MainRequest, PresentContext, SectionKind, Snapshot, file_rows,
     load_main, load_snapshot,
@@ -213,6 +215,8 @@ pub enum Msg {
         u64,
         std::collections::BTreeMap<String, crate::pulls::Matched>,
     ),
+    /// Lines changed in other worktrees, with the `HEAD` each was measured against.
+    WorktreeTotals(BTreeMap<PathBuf, (Option<String>, LineStats)>),
     /// Terminal input failed.
     InputFailed(String),
 }
@@ -377,6 +381,14 @@ pub struct App {
     pub(crate) activity: crate::activity::Activity,
     /// Set while something animates, so the runtime sends spinner frames.
     pub(crate) animating: Arc<std::sync::atomic::AtomicBool>,
+    /// Milliseconds between frames while animating.
+    pub(crate) frame_ms: Arc<std::sync::atomic::AtomicU64>,
+    /// Rows flashing after changes, and what the next refresh is compared with.
+    pub(crate) flashes: crate::flash::Flashes,
+    /// Lines changed in each worktree (this one included), by root.
+    pub(crate) worktree_totals: BTreeMap<PathBuf, LineStats>,
+    /// When other worktrees were last measured.
+    pub(crate) last_worktree_poll: Option<Instant>,
     pub(crate) command_log: bool,
     pub(crate) screen_mode: ScreenMode,
     pub(crate) cherry: Vec<Commit>,
@@ -397,6 +409,10 @@ pub struct App {
 }
 
 const PENDING_TIMEOUT: Duration = Duration::from_millis(1500);
+/// Longest time between frames while a row flashes, so fades look smooth.
+const FLASH_FRAME: Duration = Duration::from_millis(33);
+/// Most other worktrees measured for branch flashes and counts.
+const WORKTREES_MEASURED: usize = 16;
 
 impl App {
     /// Create application state.
@@ -500,6 +516,10 @@ impl App {
             queue: VecDeque::new(),
             activity,
             animating: Arc::default(),
+            frame_ms: Arc::default(),
+            flashes: crate::flash::Flashes::default(),
+            worktree_totals: BTreeMap::new(),
+            last_worktree_poll: None,
             command_log,
             screen_mode,
             cherry: Vec::new(),
@@ -532,10 +552,38 @@ impl App {
         app
     }
 
-    /// A flag set while something animates, and how often to send [`Msg::Frame`] then.
+    /// A flag set while something animates, and how many milliseconds apart to send
+    /// [`Msg::Frame`] then; both change as the UI runs.
     #[must_use]
-    pub fn animation(&self) -> (Arc<std::sync::atomic::AtomicBool>, Duration) {
-        (self.animating.clone(), self.activity.interval())
+    pub fn animation(
+        &self,
+    ) -> (
+        Arc<std::sync::atomic::AtomicBool>,
+        Arc<std::sync::atomic::AtomicU64>,
+    ) {
+        self.sync_animation();
+        (self.animating.clone(), self.frame_ms.clone())
+    }
+
+    /// Publish whether anything animates and how often frames are needed for it.
+    fn sync_animation(&self) {
+        let flashing = self.flashes.active();
+        self.animating.store(
+            self.activity.animating() || flashing,
+            std::sync::atomic::Ordering::Relaxed,
+        );
+        let spinner = self.activity.interval();
+        let interval = if flashing {
+            spinner.min(FLASH_FRAME)
+        } else {
+            spinner
+        };
+        self.frame_ms.store(
+            u64::try_from(interval.as_millis())
+                .unwrap_or(u64::MAX)
+                .max(1),
+            std::sync::atomic::Ordering::Relaxed,
+        );
     }
 
     /// External program requested before the runtime exited, if any.
@@ -852,7 +900,11 @@ impl App {
         let repo = self.repo.clone();
         let limit = self.snapshot.commits.len().max(self.config.log_page_size);
         let merged = self.config.branches.dim_merged;
-        let line_counts = self.config.files.line_counts.show;
+        let line_counts = match self.config.files.line_counts.show {
+            // Flashes and branch counts measure changes even when files show no counts.
+            LineCountsShow::Off if self.counts_needed() => LineCountsShow::Total,
+            show => show,
+        };
         self.activity.begin(crate::activity::Load::Repository);
         self.spawn(
             Some("snapshot"),
@@ -1025,7 +1077,7 @@ impl App {
         });
         self.cursors.insert(View::CommitFiles, 0);
         let repo = self.repo.clone();
-        let counts = self.config.files.line_counts.show != crate::config::LineCountsShow::Off;
+        let counts = self.config.files.line_counts.show != LineCountsShow::Off;
         self.activity.begin(crate::activity::Load::CommitFiles);
         self.spawn(
             None,
@@ -2242,12 +2294,18 @@ impl App {
             self.pending.clear();
             self.pending_since = None;
         }
-        let mut update = if self.activity.expire() | toast_expired | pending_expired {
-            Update::redraw()
-        } else {
-            Update::none()
-        };
-        update = update.maybe(self.request_pull_requests(false));
+        let flashes_expired = self
+            .flashes
+            .expire(Instant::now(), self.config.flash.duration());
+        let mut update =
+            if self.activity.expire() | toast_expired | pending_expired | flashes_expired {
+                Update::redraw()
+            } else {
+                Update::none()
+            };
+        update = update
+            .maybe(self.request_pull_requests(false))
+            .maybe(self.poll_worktrees());
         let poll = if self.watching {
             0
         } else {
@@ -2275,6 +2333,150 @@ impl App {
         update
     }
 
+    /// Whether line counts are needed beyond showing them on files.
+    const fn counts_needed(&self) -> bool {
+        self.config.flash.files()
+            || self.config.flash.branches()
+            || self.config.branches.line_counts
+    }
+
+    /// Compare the new snapshot's files, this worktree's total, and the listed branches and
+    /// worktrees with the last refresh, flashing what changed.
+    fn observe_changes(&mut self) {
+        let now = Instant::now();
+        let config = self.config.flash;
+        let snapshot = &self.snapshot;
+        let head_branch = snapshot.branches.iter().find(|branch| branch.is_head);
+        let head = match &snapshot.head {
+            Some(HeadState::Detached { oid }) => Some(oid.as_str()),
+            _ => head_branch.map(|branch| branch.oid.as_str()),
+        };
+        let root = self.repo.root().to_owned();
+        self.flashes.listed(
+            snapshot
+                .branches
+                .iter()
+                .map(|branch| branch.name.clone())
+                .collect(),
+            snapshot
+                .worktrees
+                .iter()
+                .filter(|worktree| !worktree.bare)
+                .map(|worktree| worktree.path.clone())
+                .collect(),
+            &config,
+            now,
+        );
+        self.worktree_totals.retain(|path, _| {
+            *path == root
+                || snapshot
+                    .worktrees
+                    .iter()
+                    .any(|worktree| worktree.path == *path)
+        });
+        let Some(counts) = snapshot.line_counts.combined() else {
+            return;
+        };
+        let files: BTreeMap<String, LineStats> = snapshot
+            .status
+            .entries
+            .iter()
+            .map(|entry| {
+                let stats = counts.get(&entry.path).copied().unwrap_or_default();
+                (entry.path.clone(), stats)
+            })
+            .collect();
+        let total: LineStats = files.values().copied().sum();
+        let branch = head_branch.map(|branch| branch.name.clone());
+        let head = head.map(str::to_owned);
+        self.flashes.files(head.as_deref(), files, &config, now);
+        self.flashes.worktree(
+            &root,
+            head.as_deref(),
+            total,
+            branch.as_deref(),
+            &config,
+            now,
+        );
+        self.worktree_totals.insert(root, total);
+    }
+
+    /// Measure other worktrees in the background when their rows are shown and the poll
+    /// interval has passed.
+    fn poll_worktrees(&mut self) -> Option<Command<Msg>> {
+        let seconds = self.config.flash.worktree_poll_seconds;
+        let wanted = self.config.flash.branches() || self.config.branches.line_counts;
+        if seconds == 0 || !wanted || !self.loaded_once {
+            return None;
+        }
+        let shown = self
+            .side_windows()
+            .any(|window| matches!(self.view(window), View::Branches | View::Worktrees));
+        let due = self
+            .last_worktree_poll
+            .is_none_or(|last| last.elapsed() >= Duration::from_secs(seconds));
+        if !shown || !due {
+            return None;
+        }
+        let root = self.repo.root();
+        let paths: Vec<PathBuf> = self
+            .snapshot
+            .worktrees
+            .iter()
+            .filter(|worktree| !worktree.bare && !worktree.prunable && worktree.path != root)
+            .take(WORKTREES_MEASURED)
+            .map(|worktree| worktree.path.clone())
+            .collect();
+        if paths.is_empty() {
+            return None;
+        }
+        self.last_worktree_poll = Some(Instant::now());
+        self.spawn(
+            Some("worktree-totals"),
+            move || crate::data::load_worktree_totals(&paths),
+            Msg::WorktreeTotals,
+        )
+    }
+
+    /// Redraw while something animates, ending finished flashes.
+    fn frame(&mut self) -> Update<Msg> {
+        let expired = self
+            .flashes
+            .expire(Instant::now(), self.config.flash.duration());
+        if expired || self.flashes.active() || self.activity.animating() {
+            Update::redraw()
+        } else {
+            Update::none()
+        }
+    }
+
+    fn install_worktree_totals(
+        &mut self,
+        totals: BTreeMap<PathBuf, (Option<String>, LineStats)>,
+    ) -> Update<Msg> {
+        let now = Instant::now();
+        for (path, (head, total)) in totals {
+            let Some(worktree) = self
+                .snapshot
+                .worktrees
+                .iter()
+                .find(|worktree| worktree.path == path)
+            else {
+                continue;
+            };
+            self.flashes.worktree(
+                &path,
+                head.as_deref(),
+                total,
+                worktree.branch.as_deref(),
+                &self.config.flash,
+                now,
+            );
+            self.worktree_totals.insert(path, total);
+        }
+        Update::redraw()
+    }
+
     fn install_snapshot(&mut self, snapshot: Snapshot) {
         self.loaded_once = true;
         self.commit_graph = graph::layout(&snapshot.commits);
@@ -2283,6 +2485,7 @@ impl App {
             self.toast(error.clone(), true);
         }
         self.snapshot = snapshot;
+        self.observe_changes();
         self.pulls
             .set_remote(&self.snapshot.remotes, &self.config.pull_requests.remote);
         self.refresh_branch_colors();
@@ -2549,6 +2752,7 @@ impl App {
             Msg::PullRequestMatches(generation, matched) => {
                 self.pull_requests_matched(generation, matched)
             }
+            Msg::WorktreeTotals(totals) => self.install_worktree_totals(totals),
             Msg::Main(generation, content) => {
                 if generation == self.main_generation {
                     self.install_main(*content);
@@ -2615,8 +2819,7 @@ impl App {
             Msg::CommitSourcesChanged => Update::none().maybe(self.check_commit_prefill()),
             Msg::CommitPrefill(prefill) => self.apply_commit_prefill(*prefill),
             Msg::Tick => self.tick(),
-            Msg::Frame if self.activity.animating() => Update::redraw(),
-            Msg::Frame => Update::none(),
+            Msg::Frame => self.frame(),
             Msg::InputFailed(error) => {
                 self.diagnostics.push(error);
                 self.quit = true;
@@ -2640,10 +2843,7 @@ impl Program for App {
             update = update.merge(Update::redraw());
         }
         update = update.maybe(command);
-        self.animating.store(
-            self.activity.animating(),
-            std::sync::atomic::Ordering::Relaxed,
-        );
+        self.sync_animation();
         if self.quit {
             self.persist();
         }

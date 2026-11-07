@@ -49,6 +49,8 @@ pub struct GitUiConfig {
     pub highlight: HighlightConfig,
     /// Refresh settings.
     pub refresh: RefreshConfig,
+    /// Brief row highlights when changes land.
+    pub flash: FlashConfig,
     /// How running work is shown.
     pub activity: ActivityConfig,
     /// Confirmation settings.
@@ -82,6 +84,7 @@ impl Default for GitUiConfig {
             show_graph: true,
             highlight: HighlightConfig::default(),
             refresh: RefreshConfig::default(),
+            flash: FlashConfig::default(),
             activity: ActivityConfig::default(),
             confirm: ConfirmConfig::default(),
             editor: None,
@@ -449,6 +452,67 @@ impl Default for RefreshConfig {
             poll_seconds: 10,
             auto_fetch_seconds: 0,
         }
+    }
+}
+
+/// Row highlights when changes land (`[plugins.config."bcode.git".ui.flash]`).
+///
+/// A row whose line counts change between refreshes, or that newly appears, briefly takes a
+/// green background (content added) or a red one (content removed) that fades back.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(default, deny_unknown_fields)]
+// Each flag is an independent user-facing toggle in the configuration file.
+#[allow(clippy::struct_excessive_bools)]
+pub struct FlashConfig {
+    /// Whether rows flash at all.
+    pub enabled: bool,
+    /// How long a flash lasts, in milliseconds, fade included.
+    pub duration_ms: u64,
+    /// Share of a change, in percent, that must be removed lines for a red flash; otherwise
+    /// it is green.
+    pub removed_percent: u8,
+    /// Fade back gradually; `false` shows the color for the whole duration and then stops.
+    pub fade: bool,
+    /// Flash file and folder rows.
+    pub files: bool,
+    /// Flash branch and worktree rows.
+    pub branches: bool,
+    /// How often, in seconds, other worktrees are checked for changes while branches or
+    /// worktrees are shown; `0` never checks them.
+    pub worktree_poll_seconds: u64,
+}
+
+impl Default for FlashConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            duration_ms: 600,
+            removed_percent: 90,
+            fade: true,
+            files: true,
+            branches: true,
+            worktree_poll_seconds: 5,
+        }
+    }
+}
+
+impl FlashConfig {
+    /// Whether file rows flash.
+    #[must_use]
+    pub const fn files(&self) -> bool {
+        self.enabled && self.files
+    }
+
+    /// Whether branch and worktree rows flash.
+    #[must_use]
+    pub const fn branches(&self) -> bool {
+        self.enabled && self.branches
+    }
+
+    /// How long a flash lasts.
+    #[must_use]
+    pub const fn duration(&self) -> std::time::Duration {
+        std::time::Duration::from_millis(self.duration_ms)
     }
 }
 

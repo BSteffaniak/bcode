@@ -128,6 +128,23 @@ impl LineCounts {
         self
     }
 
+    /// Staged and unstaged counts together, by path; `None` when not loaded.
+    #[must_use]
+    pub fn combined(&self) -> Option<BTreeMap<String, LineStats>> {
+        match self {
+            Self::Off => None,
+            Self::Total(total) => Some(total.clone()),
+            Self::Split { staged, unstaged } => {
+                let mut combined = staged.clone();
+                for (path, stats) in unstaged {
+                    let entry = combined.entry(path.clone()).or_default();
+                    *entry = entry.combined(*stats);
+                }
+                Some(combined)
+            }
+        }
+    }
+
     /// Counts of `paths` summed, or `None` when there is nothing to show.
     #[must_use]
     pub fn sum<'p>(&self, paths: impl IntoIterator<Item = &'p str>) -> Option<ShownCounts> {
@@ -159,6 +176,50 @@ impl ShownCounts {
             Self::Split { staged, unstaged } => staged.is_empty() && unstaged.is_empty(),
         }
     }
+}
+
+/// Untracked files counted per other worktree.
+const WORKTREE_UNTRACKED_FILES: usize = 500;
+/// Largest untracked file counted per other worktree.
+const WORKTREE_UNTRACKED_BYTES: u64 = 1024 * 1024;
+
+/// Lines changed in each of `paths` (other worktrees) against its own `HEAD`.
+///
+/// Staged, unstaged and untracked changes count together; each worktree is measured in
+/// parallel and paired with the `HEAD` commit it was measured against (`None` while
+/// unborn). Worktrees that cannot be read are left out.
+#[must_use]
+pub fn load_worktree_totals(
+    paths: &[std::path::PathBuf],
+) -> BTreeMap<std::path::PathBuf, (Option<String>, LineStats)> {
+    std::thread::scope(|scope| {
+        // Start every measurement before waiting on any.
+        let mut handles = Vec::with_capacity(paths.len());
+        for path in paths {
+            handles.push(scope.spawn(move || {
+                let repo = Repository::discover(path, bcode_git::CommandLog::default()).ok()?;
+                let mut counts = repo.worktree_numstat().ok()?;
+                let status = repo.status().ok()?;
+                counts.extend(
+                    repo.untracked_line_stats(
+                        status
+                            .entries
+                            .iter()
+                            .filter(|entry| entry.is_untracked())
+                            .map(|entry| entry.path.as_str()),
+                        WORKTREE_UNTRACKED_FILES,
+                        WORKTREE_UNTRACKED_BYTES,
+                    ),
+                );
+                let head = repo.rev_parse("HEAD").ok();
+                Some((path.clone(), (head, counts.into_values().sum())))
+            }));
+        }
+        handles
+            .into_iter()
+            .filter_map(|handle| handle.join().ok().flatten())
+            .collect()
+    })
 }
 
 /// Load all panel data, running independent queries in parallel.

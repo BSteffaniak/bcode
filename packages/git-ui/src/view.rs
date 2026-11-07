@@ -10,7 +10,7 @@ use bmux_tui::composition::{
     Column, Flex, HitArea, Row as BoxRow, SizeBox, Stack, Surface, TextBlock,
 };
 use bmux_tui::geometry::{Insets, Rect, Size};
-use bmux_tui::style::{Modifier, Style};
+use bmux_tui::style::{Color, Modifier, Style};
 use bmux_tui::text::{Line, Span, Text, TextWrap, TrailingAlign, TrailingPlacement};
 use bmux_tui_components::modal_frame::{
     ModalFrame, ModalFrameComponent, ModalPlacement, ModalSizing, ModalTheme,
@@ -37,8 +37,9 @@ use bmux_tui_components::text_input_box::{
 use crate::actions::head_label;
 use crate::activity::{Load, Subject};
 use crate::app::{App, Row, ScreenMode, View, Window};
-use crate::config::{LineCountsAlign, MainSplit, Portrait};
+use crate::config::{LineCountsAlign, LineCountsShow, MainSplit, Portrait};
 use crate::data::{FileNode, SectionKind, ShownCounts, commit_line, format_time, status_style};
+use crate::flash::{FlashKey, FlashKind};
 use crate::keymap::{Action, Scope, display_key};
 use crate::popup::Popup;
 use crate::theme::GitTheme;
@@ -70,7 +71,7 @@ impl Frame {
             .side_windows()
             .map(|window| {
                 let view = app.view(window);
-                (window, view, side_items(app, view))
+                (window, view, side_items(app, window, view))
             })
             .collect();
         let pane_state = || Cell::new(PaneState::new(Rect::default()));
@@ -118,7 +119,7 @@ impl Frame {
     }
 }
 
-fn side_items(app: &App, view: View) -> Vec<SelectableListItem> {
+fn side_items(app: &App, window: Window, view: View) -> Vec<SelectableListItem> {
     let theme = &app.theme;
     let rows = app.rows(view);
     if rows.is_empty() {
@@ -146,20 +147,70 @@ fn side_items(app: &App, view: View) -> Vec<SelectableListItem> {
         LineCountsAlign::Right => TrailingAlign::Right,
     })
     .keep_visible(counts.floating);
+    let cursor = app.cursor(view).min(rows.len() - 1);
+    let now = std::time::Instant::now();
     rows.iter()
         .enumerate()
         .map(|(index, row)| {
-            let item = SelectableListItem::rich(index.to_string(), row_line(app, *row));
-            match row_counts(app, *row) {
-                Some(counts) => item.trailing(counts_line(counts, theme), placement),
+            let mut item = SelectableListItem::rich(index.to_string(), row_line(app, *row));
+            if let Some(counts) = row_counts(app, *row) {
+                item = item.trailing(counts_line(counts, theme), placement);
+            }
+            match flash_background(app, *row, index == cursor, app.window == window, now) {
+                Some(background) => item.background(background),
                 None => item,
             }
         })
         .collect()
 }
 
+/// What flashes for a row, if anything can.
+fn flash_key(app: &App, row: Row) -> Option<FlashKey> {
+    Some(match row {
+        Row::File(index) => FlashKey::Path(match &app.file_nodes[index] {
+            FileNode::Dir { path, .. } => path.clone(),
+            FileNode::File { entry, .. } => app.snapshot.status.entries[*entry].path.clone(),
+        }),
+        Row::Branch(index) => FlashKey::Branch(app.snapshot.branches[index].name.clone()),
+        Row::Worktree(index) => FlashKey::Worktree(app.snapshot.worktrees[index].path.clone()),
+        _ => return None,
+    })
+}
+
+/// Background of a flashing row at `now`, fading toward the row's own background (the
+/// cursor's on the `selected` row).
+fn flash_background(
+    app: &App,
+    row: Row,
+    selected: bool,
+    focused: bool,
+    now: std::time::Instant,
+) -> Option<Color> {
+    let (kind, started) = app.flashes.get(&flash_key(app, row)?)?;
+    let theme = &app.theme;
+    let base = match (selected, focused) {
+        (true, true) => theme.cursor.bg,
+        (true, false) => theme.cursor_inactive.bg,
+        (false, _) => theme.canvas.bg,
+    };
+    crate::flash::background(
+        match kind {
+            FlashKind::Added => theme.flash_added,
+            FlashKind::Removed => theme.flash_removed,
+        },
+        base.unwrap_or(Color::Default),
+        now.saturating_duration_since(started),
+        app.config.flash.duration(),
+        app.config.flash.fade,
+    )
+}
+
 /// Line counts of working tree status entries summed, leaving out submodules.
 fn entry_counts(app: &App, entries: impl IntoIterator<Item = usize>) -> Option<ShownCounts> {
+    // Counts may be loaded for flashes while files show none.
+    if app.config.files.line_counts.show == LineCountsShow::Off {
+        return None;
+    }
     let status = &app.snapshot.status;
     app.snapshot.line_counts.sum(
         entries
@@ -185,8 +236,28 @@ fn row_counts(app: &App, row: Row) -> Option<ShownCounts> {
     match row {
         Row::File(index) => entry_counts(app, app.file_nodes[index].entries()),
         Row::CommitFile(index) => commit_file_counts(app, [index]),
+        Row::Branch(index) if app.config.branches.line_counts => {
+            let branch = &app.snapshot.branches[index];
+            let root = if branch.is_head {
+                Some(app.repo.root())
+            } else {
+                branch.worktree.as_deref()
+            };
+            worktree_counts(app, root?)
+        }
+        Row::Worktree(index) if app.config.branches.line_counts => {
+            worktree_counts(app, &app.snapshot.worktrees[index].path)
+        }
         _ => None,
     }
+}
+
+/// Lines changed in the worktree at `root`, once measured.
+fn worktree_counts(app: &App, root: &std::path::Path) -> Option<ShownCounts> {
+    app.worktree_totals
+        .get(root)
+        .filter(|stats| !stats.is_empty())
+        .map(|stats| ShownCounts::Total(*stats))
 }
 
 /// Line counts of every row of a view that shows them, as filtered.

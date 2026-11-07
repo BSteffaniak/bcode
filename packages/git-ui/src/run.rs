@@ -246,7 +246,7 @@ async fn session(mut app: App) -> Result<(App, Option<String>), RunError> {
         None
     };
     app.set_watching(watcher.is_some());
-    let (animating, frame_interval) = app.animation();
+    let (animating, frame_ms) = app.animation();
     let (runtime, handle) = Runtime::new(app, presenter, RuntimeConfig::default());
 
     let input_handle = handle.clone();
@@ -280,11 +280,12 @@ async fn session(mut app: App) -> Result<(App, Option<String>), RunError> {
             }
         }
     });
-    // Spinner frames, only while something animates.
+    // Animation frames (spinners, flashing rows), only while something animates.
     let frame_handle = handle.clone();
     let frames = tokio::spawn(async move {
         loop {
-            tokio::time::sleep(frame_interval).await;
+            let interval = frame_ms.load(std::sync::atomic::Ordering::Relaxed);
+            tokio::time::sleep(Duration::from_millis(interval.max(1))).await;
             if animating.load(std::sync::atomic::Ordering::Relaxed)
                 && frame_handle.send(Msg::Frame).await.is_err()
             {
@@ -307,7 +308,7 @@ async fn session(mut app: App) -> Result<(App, Option<String>), RunError> {
     });
     let _ = handle.send(Msg::Watch).await;
 
-    let result = runtime.run().await;
+    let result = Box::pin(runtime.run()).await;
     input.abort();
     let _ = input.await;
     tick.abort();

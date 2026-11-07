@@ -2940,3 +2940,203 @@ fn commit_files_show_line_counts() {
         "{screen}"
     );
 }
+
+/// Backgrounds of the side panel row containing `needle`, between the panel's borders.
+fn side_row_backgrounds(
+    harness: &mut Harness,
+    needle: &str,
+) -> Vec<Option<bmux_tui::style::Color>> {
+    use bmux_tui::geometry::Point;
+
+    let buffer = bcode_git_ui::render_buffer(&mut harness.app, 140, 40);
+    for y in 0..40 {
+        let cells: Vec<_> = (0..140)
+            .map(|x| buffer.get(Point::new(x, y)).unwrap())
+            .collect();
+        let Some(left) = cells.iter().position(|cell| cell.symbol == "│") else {
+            continue;
+        };
+        let Some(width) = cells[left + 1..].iter().position(|cell| cell.symbol == "│") else {
+            continue;
+        };
+        let row = &cells[left + 1..left + 1 + width];
+        let text: String = row.iter().map(|cell| cell.symbol.as_str()).collect();
+        if text.contains(needle) {
+            return row.iter().map(|cell| cell.style.bg).collect();
+        }
+    }
+    panic!(
+        "no side row contains {needle:?}:\n{}",
+        harness.screen(140, 40)
+    );
+}
+
+/// The one background a row is painted with, which must fill it.
+fn row_background(harness: &mut Harness, needle: &str) -> Option<bmux_tui::style::Color> {
+    let row = side_row_backgrounds(harness, needle);
+    assert!(
+        row.iter().all(|background| *background == row[0]),
+        "{needle:?} is not one background across: {row:?}"
+    );
+    row[0]
+}
+
+fn flash_kind(background: Option<bmux_tui::style::Color>) -> &'static str {
+    match background {
+        Some(bmux_tui::style::Color::Rgb(red, green, _)) if green > red => "green",
+        Some(bmux_tui::style::Color::Rgb(red, green, _)) if red > green => "red",
+        _ => "none",
+    }
+}
+
+#[test]
+fn changed_files_and_folders_flash_green_or_red() {
+    let mut harness = Harness::with_config(
+        |path| {
+            std::fs::create_dir_all(path.join("src")).unwrap();
+            std::fs::write(path.join("src/lib.rs"), "1\n2\n3\n").unwrap();
+            commit(path, "other.txt", "a\n", "init");
+            std::fs::write(path.join("src/lib.rs"), "1\n2\n3\n4\n").unwrap();
+            std::fs::write(path.join("other.txt"), "b\n").unwrap();
+        },
+        configured(
+            r#"
+            [plugins.config."bcode.git".ui.flash]
+            duration_ms = 600000
+            "#,
+        ),
+    );
+    // Nothing flashes on the first load.
+    let base = row_background(&mut harness, "other.txt");
+    assert_eq!(row_background(&mut harness, "lib.rs"), base);
+    assert_eq!(flash_kind(base), "none");
+
+    // Added lines flash the file and the folder above it green, across the whole row.
+    std::fs::write(harness.path().join("src/lib.rs"), "1\n2\n3\n4\n5\n6\n").unwrap();
+    harness.send(RuntimeEvent::Message(bcode_git_ui::app::Msg::Watch));
+    assert_eq!(flash_kind(row_background(&mut harness, "lib.rs")), "green");
+    assert_eq!(flash_kind(row_background(&mut harness, "src/")), "green");
+    assert_eq!(row_background(&mut harness, "other.txt"), base);
+
+    // Taking lines away (typed or original) flashes red; a new file flashes green.
+    std::fs::write(harness.path().join("src/lib.rs"), "1\n").unwrap();
+    std::fs::write(harness.path().join("new.txt"), "").unwrap();
+    harness.send(RuntimeEvent::Message(bcode_git_ui::app::Msg::Watch));
+    assert_eq!(flash_kind(row_background(&mut harness, "lib.rs")), "red");
+    assert_eq!(flash_kind(row_background(&mut harness, "new.txt")), "green");
+
+    // Committing moves HEAD: rows that remain start over without flashing.
+    git(harness.path(), &["add", "src"]);
+    git(harness.path(), &["commit", "--quiet", "-m", "lib"]);
+    std::fs::write(harness.path().join("other.txt"), "b\nc\nd\n").unwrap();
+    harness.send(RuntimeEvent::Message(bcode_git_ui::app::Msg::Watch));
+    assert_eq!(row_background(&mut harness, "other.txt"), base);
+}
+
+#[test]
+fn flashes_end_and_can_be_turned_off() {
+    let setup = |path: &Path| {
+        commit(path, "a.txt", "1\n", "init");
+        commit(path, "b.txt", "1\n", "second");
+        std::fs::write(path.join("a.txt"), "1\n2\n").unwrap();
+        std::fs::write(path.join("b.txt"), "1\n2\n").unwrap();
+    };
+    let mut harness = Harness::with_config(
+        setup,
+        configured(
+            r#"
+            [plugins.config."bcode.git".ui.flash]
+            duration_ms = 40
+            "#,
+        ),
+    );
+    let base = row_background(&mut harness, "b.txt");
+    std::fs::write(harness.path().join("b.txt"), "1\n2\n3\n").unwrap();
+    harness.send(RuntimeEvent::Message(bcode_git_ui::app::Msg::Watch));
+    std::thread::sleep(std::time::Duration::from_millis(60));
+    harness.send(RuntimeEvent::Message(bcode_git_ui::app::Msg::Frame));
+    assert_eq!(row_background(&mut harness, "b.txt"), base);
+
+    let mut harness = Harness::with_config(
+        setup,
+        configured(
+            r#"
+            [plugins.config."bcode.git".ui.flash]
+            enabled = false
+            duration_ms = 600000
+            "#,
+        ),
+    );
+    let base = row_background(&mut harness, "b.txt");
+    std::fs::write(harness.path().join("b.txt"), "1\n2\n3\n").unwrap();
+    harness.send(RuntimeEvent::Message(bcode_git_ui::app::Msg::Watch));
+    assert_eq!(row_background(&mut harness, "b.txt"), base);
+}
+
+#[test]
+fn branches_flash_and_count_the_changes_in_their_worktrees() {
+    let other = TempDir::new().unwrap();
+    let worktree = other.path().join("topic");
+    let mut harness = Harness::with_config(
+        |path| {
+            commit(path, "a.txt", "1\n", "init");
+            git(
+                path,
+                &[
+                    "worktree",
+                    "add",
+                    "--quiet",
+                    "-b",
+                    "topic",
+                    worktree.to_str().unwrap(),
+                ],
+            );
+            std::fs::write(worktree.join("a.txt"), "1\n2\n").unwrap();
+            std::fs::write(path.join("a.txt"), "1\n2\n3\n").unwrap();
+        },
+        configured(
+            r#"
+            [plugins.config."bcode.git".ui.flash]
+            duration_ms = 600000
+            worktree_poll_seconds = 1
+            [plugins.config."bcode.git".ui.branches]
+            line_counts = true
+            [plugins.config."bcode.git".ui.layout]
+            windows = [["status"], ["files"], ["branches"], ["worktrees"], ["commits"]]
+            "#,
+        ),
+    );
+    // Each branch counts the changes where it is checked out, once measured.
+    let screen = harness.wait_for("topic (worktree)  init +1", 140, 40);
+    assert!(line_with(&screen, "✱ main").contains("init +2"), "{screen}");
+    assert_eq!(
+        flash_kind(row_background(&mut harness, "topic (worktree)")),
+        "none"
+    );
+
+    // A change here flashes the current branch and its worktree.
+    std::fs::write(harness.path().join("a.txt"), "1\n2\n3\n4\n").unwrap();
+    harness.send(RuntimeEvent::Message(bcode_git_ui::app::Msg::Watch));
+    assert_eq!(
+        flash_kind(row_background(&mut harness, "main  init +3")),
+        "green"
+    );
+    assert_eq!(flash_kind(row_background(&mut harness, "● main")), "green");
+    assert_eq!(
+        flash_kind(row_background(&mut harness, "topic (worktree)")),
+        "none"
+    );
+
+    // A change in the other worktree is picked up by polling and flashes its branch red.
+    std::fs::write(worktree.join("a.txt"), "").unwrap();
+    harness.wait_for("topic (worktree)  init -1", 140, 40);
+    assert_eq!(
+        flash_kind(row_background(&mut harness, "topic (worktree)")),
+        "red"
+    );
+
+    // A new branch flashes green.
+    git(harness.path(), &["branch", "fresh"]);
+    harness.send(RuntimeEvent::Message(bcode_git_ui::app::Msg::Watch));
+    assert_eq!(flash_kind(row_background(&mut harness, "fresh")), "green");
+}

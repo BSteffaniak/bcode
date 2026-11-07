@@ -43,6 +43,10 @@ pub struct GitTheme {
     pub removed_row: Style,
     pub added_emphasis: Style,
     pub removed_emphasis: Style,
+    /// Flash of a row whose content grew (`git.flash.added`, background).
+    pub flash_added: Color,
+    /// Flash of a row whose content shrank (`git.flash.removed`, background).
+    pub flash_removed: Color,
     pub hunk: Style,
     pub gutter: Style,
     pub staged: Style,
@@ -149,6 +153,24 @@ impl GitTheme {
         let overlay = role("surface.overlay", raised);
         let border_focused = role("border.focused", accent.add_modifier(Modifier::BOLD));
         let git = |name: &str, fallback: Style| role(&format!("git.{name}"), fallback);
+        let added_emphasis = role(
+            "diff.added_emphasis",
+            Style::new()
+                .bg(Color::Rgb(30, 100, 58))
+                .add_modifier(Modifier::BOLD),
+        );
+        let removed_emphasis = role(
+            "diff.removed_emphasis",
+            Style::new()
+                .bg(Color::Rgb(122, 34, 52))
+                .add_modifier(Modifier::BOLD),
+        );
+        let flash = |name: &str, fallback: Style| {
+            git(name, Style::new())
+                .bg
+                .or(fallback.bg)
+                .unwrap_or(Color::Default)
+        };
         let syntax_role = |name: &str, fallback: Color| {
             role(&format!("syntax.{name}"), Style::new().fg(fallback))
         };
@@ -198,18 +220,10 @@ impl GitTheme {
                     .color("error_background")
                     .unwrap_or(Color::Rgb(63, 20, 32))),
             ),
-            added_emphasis: role(
-                "diff.added_emphasis",
-                Style::new()
-                    .bg(Color::Rgb(30, 100, 58))
-                    .add_modifier(Modifier::BOLD),
-            ),
-            removed_emphasis: role(
-                "diff.removed_emphasis",
-                Style::new()
-                    .bg(Color::Rgb(122, 34, 52))
-                    .add_modifier(Modifier::BOLD),
-            ),
+            flash_added: flash("flash.added", added_emphasis),
+            flash_removed: flash("flash.removed", removed_emphasis),
+            added_emphasis,
+            removed_emphasis,
             hunk: role(
                 "diff.hunk",
                 Style::new().fg(violet).add_modifier(Modifier::BOLD),

@@ -17,6 +17,7 @@ pub mod commit_message;
 pub mod config;
 pub mod data;
 pub mod diffview;
+pub mod flash;
 pub mod graph;
 pub mod host;
 pub mod keymap;
