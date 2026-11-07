@@ -106,6 +106,17 @@ impl ModelPickerApp {
         app
     }
 
+    /// Replace asynchronously discovered inventory without discarding the user's filter or sort.
+    pub(crate) fn replace_execution_models(
+        &mut self,
+        models: Vec<bcode_model::execution::ExecutionModel>,
+    ) {
+        self.models = models.iter().map(|entry| entry.model.clone()).collect();
+        self.execution_models = Some(models);
+        self.rendered_item_area = None;
+        self.refresh_filter();
+    }
+
     /// Exact highlighted intent; the application must resolve and admit it again.
     pub fn selected_execution(&self) -> Option<bcode_model::execution::ExecutionModelSelection> {
         let index = self.list.selected_source_index()?;
@@ -1196,6 +1207,39 @@ mod tests {
         );
         picker.select_previous();
         assert_ne!(picker.selected_execution().unwrap().route, remembered.route);
+    }
+
+    #[test]
+    fn asynchronous_execution_inventory_retains_filter_and_exact_routes() {
+        use bcode_model::execution::{
+            ExecutionBillingRoute, ExecutionModel, ExecutionModelProvenance,
+            ExecutionModelReadiness, ExecutionRoute,
+        };
+        let entry = |name: &str| ExecutionModel {
+            model: model(name, None, None, None),
+            route: ExecutionRoute::ModelProvider {
+                provider_plugin_id: "example.provider".into(),
+            },
+            native_model_id: name.into(),
+            confirmed_model_id: None,
+            account_reference: Some("selected-account".into()),
+            billing_route: ExecutionBillingRoute::ProviderApi,
+            provenance: ExecutionModelProvenance::HarnessDiscovery,
+            readiness: ExecutionModelReadiness::Unknown,
+        };
+        let mut picker = ModelPickerApp::from_execution_models(Vec::new(), "Checking");
+        picker.filter = super::super::text_input_flow::state_with_text("wanted", false);
+        picker.replace_execution_models(vec![entry("other"), entry("wanted-model")]);
+        assert_eq!(picker.filter.buffer().text(), "wanted");
+        assert_eq!(picker.visible_rows().len(), 1);
+        let selected = picker.selected_execution().unwrap();
+        assert_eq!(selected.model_id, "wanted-model");
+        assert_eq!(
+            selected.account_reference.as_deref(),
+            Some("selected-account")
+        );
+        picker.replace_execution_models(Vec::new());
+        assert!(picker.selected_execution().is_none());
     }
 
     #[test]

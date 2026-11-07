@@ -177,6 +177,21 @@ exact revision is whatever `Cargo.lock` records rather than a value duplicated h
 limits presentation only and never delays semantic updates, authorization, cancellation dispatch, or
 canonical execution.
 
+## Startup discovery and execution selection
+
+Optional native-account discovery does not gate ordinary provider startup. A usable provider
+selection continues directly; a broken explicit provider selection stays on its own recovery path
+instead of being replaced by an installed native account. Missing native instance configuration
+is not evidence of missing provider credentials and does not open a native-observation welcome screen.
+
+When an execution inventory is needed, the picker presents before inspection starts. Inspection
+runs as one runtime-owned, cancellable command with a 15-second UI deadline. Setup, close, and
+filtering remain available during inspection; completion preserves filter/sort state and requires
+a newly presented exact model/account before selection. Failures remain inline and do not launch,
+switch, enroll, or persist anything. Remembered provider choices do not require optional catalog
+discovery; remembered native choices inspect only their selected instance. Existing first-run
+provider enrollment and selected-route recovery remain explicit pre-session journeys.
+
 ## Command completion presentation
 
 Command completion preferences are renderer-neutral and configured separately from terminal

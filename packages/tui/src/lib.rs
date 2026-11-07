@@ -54,7 +54,9 @@ pub mod monitor_presentation;
 pub(crate) mod mouse_flow;
 pub(crate) mod older_history;
 pub mod onboarding;
-pub use execution_picker::{ExecutionPickerOutcome, run_execution_picker_in_shell};
+pub use execution_picker::{
+    ExecutionPickerOutcome, run_execution_picker_in_shell, run_execution_picker_loading_in_shell,
+};
 mod quick_onboarding;
 mod xray_inspectors;
 pub use quick_onboarding::{

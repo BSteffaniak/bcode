@@ -45,8 +45,19 @@ pub async fn route(no_discovery: bool) -> Result<bool, CliError> {
     }
     let config = bcode_config::load_config()?;
     let mut host = load_cli_plugin_host()?;
+    let readiness = if config.execution.default_selection.is_none() {
+        register_enabled(&host)?;
+        local_readiness(&config, &host)
+    } else {
+        // A saved execution route must not inspect an unrelated provider account.
+        Err("Execution preference is handled separately")
+    };
     let mut shell = bcode_tui::TerminalShell::enter()?;
-    let backend = Box::pin(route_backend_selection(&host, &mut shell, no_discovery)).await;
+    let backend = if should_route_backends(&config, readiness.is_ok()) {
+        Box::pin(route_backend_selection(&host, &mut shell, no_discovery)).await
+    } else {
+        Ok(false)
+    };
     host.deactivate_all()?;
     match backend {
         Ok(true) => {
@@ -174,80 +185,10 @@ fn verify_prepared_backend(
     Ok(())
 }
 
-async fn inspect_unconfigured_backends(
-    shell: &mut bcode_tui::TerminalShell,
-    config: &bcode_config::BcodeConfig,
-    no_discovery: bool,
-) -> Result<bool, CliError> {
-    if !config
-        .onboarding
-        .credential_discovery_enabled(no_discovery, &bcode_config::ProcessConfigEnvironment)
-    {
-        return Ok(false);
-    }
-    let client = bcode_client::ManagedSessionClient::default_endpoint();
-    let discovered = Box::pin(shell.wait("Checking installed native accounts", async {
-        client
-            .discover_candidates(bcode_ipc::harness::ManagedCandidatesRequest {
-                request_id: uuid::Uuid::new_v4().to_string(),
-            })
-            .await
-            .map_err(bcode_tui::TuiError::from)
-    }))
-    .await?;
-    let Some(discovered) = discovered else {
-        return Ok(true);
-    };
-    let mut observations = Vec::new();
-    let mut complete = discovered.complete;
-    for plugin in discovered.plugins {
-        match plugin.kind {
-            bcode_harness_models::HarnessCandidatesResponseKind::Candidates {
-                candidates,
-                complete: plugin_complete,
-            } => {
-                complete &= plugin_complete;
-                observations.extend(candidates.into_iter().map(|candidate| {
-                    format!(
-                        "{} · {} · {:?}",
-                        candidate.plugin_id, candidate.native_version, candidate.readiness
-                    )
-                }));
-            }
-            bcode_harness_models::HarnessCandidatesResponseKind::Failure(_) => complete = false,
-        }
-    }
-    if observations.is_empty() && complete {
-        return Ok(false);
-    }
-    let recovery = format!(
-        "Installed native account observations: {}. {} Native instance setup is not yet exposed by this client API; no configuration or credentials were changed. Provider setup is optional, not a prerequisite for native execution.",
-        if observations.is_empty() {
-            "unavailable".into()
-        } else {
-            observations.join("; ")
-        },
-        if complete {
-            "Inspection complete."
-        } else {
-            "Inspection incomplete; absence is not established."
-        },
-    );
-    let outcome = bcode_tui::run_backend_selection_in_shell(shell, bcode_tui::QuickOnboardingInput {
-            choices: vec![bcode_tui::QuickConnectionChoice {
-                label: "Provider connections and advanced settings".into(),
-                detail: "Explicitly open the existing setup experience, or close without changing any selection.".into(),
-            }],
-            recovery: Some(recovery),
-        }).await?;
-    if matches!(
-        outcome,
-        bcode_tui::QuickOnboardingOutcome::Selected(0)
-            | bcode_tui::QuickOnboardingOutcome::Advanced
-    ) {
-        advanced_in_shell(shell, no_discovery).await?;
-    }
-    Ok(true)
+/// Optional native inventory must not preempt a usable or explicitly configured provider.
+fn should_route_backends(config: &BcodeConfig, provider_ready: bool) -> bool {
+    config.execution.default_selection.is_some()
+        || (!provider_ready && !has_explicit_selection(config))
 }
 
 fn configured_backend_catalog(
@@ -297,17 +238,22 @@ async fn route_backend_selection(
     no_discovery: bool,
 ) -> Result<bool, CliError> {
     let config = bcode_config::load_config()?;
-    let remembered_managed =
-        config
-            .execution
-            .default_selection
-            .as_ref()
-            .is_some_and(|preference| {
-                matches!(
-                    preference.route,
-                    bcode_model::execution::ExecutionRoute::ManagedHarness { .. }
-                )
-            });
+    if let Some(preference) = &config.execution.default_selection
+        && let bcode_model::execution::ExecutionRoute::ModelProvider { provider_plugin_id } =
+            &preference.route
+    {
+        // A provider preference does not depend on the optional harness service
+        // or its configuration/catalog being available.
+        launch_provider_model(
+            shell,
+            provider_plugin_id.clone(),
+            preference.model_id.clone(),
+        )
+        .await?;
+        return Ok(true);
+    }
+    let remembered_managed = config.execution.default_selection.is_some();
+    // Provider preferences returned above; any remaining saved route is native.
     if !host.has_service("bcode.harness", HARNESS_CONFIGURATION_INTERFACE) {
         if remembered_managed {
             return Err(CliError::InvalidArguments("Remembered managed route is disabled; enable it in Setup or explicitly change the execution preference. No provider fallback was selected".into()));
@@ -319,7 +265,9 @@ async fn route_backend_selection(
     };
     let _ = backend_choices(&catalog)?;
     if catalog.instances.is_empty() && config.execution.default_selection.is_none() {
-        return inspect_unconfigured_backends(shell, &config, no_discovery).await;
+        // Installation/account discovery is optional and cannot create a runnable
+        // instance here. Leave provider startup alone, including incomplete probes.
+        return Ok(false);
     }
     let remembered = config
         .execution
@@ -333,34 +281,40 @@ async fn route_backend_selection(
         config.resolved_model_selection().provider_plugin_id
     };
     let client = bcode_client::ManagedSessionClient::default_endpoint();
-    let inventory = Box::pin(shell.wait("Discovering available models", async {
-        client
-            .discover_execution_catalog(bcode_ipc::harness::ManagedExecutionCatalogRequest {
-                request_id: uuid::Uuid::new_v4().to_string(),
-                instances: catalog.instances.values().cloned().collect(),
-                provider_plugin_id: provider,
-            })
-            .await
-            .map_err(bcode_tui::TuiError::from)
-    }))
-    .await?;
-    let Some(inventory) = inventory else {
-        return Ok(true);
+    let request = bcode_ipc::harness::ManagedExecutionCatalogRequest {
+        request_id: uuid::Uuid::new_v4().to_string(),
+        instances: catalog.instances.values().cloned().collect(),
+        provider_plugin_id: provider,
     };
-    let status = if inventory.issues.is_empty() {
-        "Choose a model and account"
-    } else {
-        "Some model sources are unavailable; setup/sign in or select an observed model"
-    };
-    let entries = inventory.models.clone();
     let result = Box::pin(async {
         if let Some(selection) = remembered.clone() {
-            Box::pin(launch_execution_choice(host, shell, &catalog, &entries, selection, false)).await?;
+            // Only the selected backend can gate a remembered launch. Optional
+            // sources must not delay it or cause fallback to a different account.
+            let mut selected_request = request;
+            selected_request.instances.retain(|instance| {
+                matches!(&selection.route, Some(bcode_model::execution::ExecutionRoute::ManagedHarness { instance_id, .. }) if instance_id == &instance.instance_id)
+            });
+            let inventory = Box::pin(shell.wait("Checking selected execution route", async {
+                client.discover_execution_catalog(selected_request).await.map_err(bcode_tui::TuiError::from)
+            })).await?;
+            if let Some(inventory) = inventory {
+                Box::pin(launch_execution_choice(host, shell, &catalog, &inventory.models, selection, false)).await?;
+            }
             return Ok(true);
         }
-        match bcode_tui::run_execution_picker_in_shell(
-            shell, inventory.models, remembered.as_ref(), status,
-        ).await? {
+        let (outcome, entries) = bcode_tui::run_execution_picker_loading_in_shell(
+            shell,
+            async move {
+                let inventory = client.discover_execution_catalog(request).await.map_err(bcode_tui::TuiError::from)?;
+                let status = if inventory.issues.is_empty() {
+                    "Choose a model and account"
+                } else {
+                    "Some sources could not be checked. Choose an observed model or open Setup"
+                };
+                Ok((inventory.models, status.to_owned()))
+            },
+        ).await?;
+        match outcome {
             bcode_tui::ExecutionPickerOutcome::Selected(selection) => {
                 Box::pin(launch_execution_choice(host, shell, &catalog, &entries, selection, true)).await?;
                 Ok(true)
@@ -1473,6 +1427,27 @@ fn local_readiness_with_policy(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn optional_backends_cannot_intercept_provider_startup_or_repair() {
+        let mut config = bcode_config::BcodeConfig::default();
+        assert!(!super::should_route_backends(&config, true));
+        config.model.provider_plugin_id = Some("example.provider".into());
+        // A broken explicit provider goes to its own repair path, not native setup.
+        assert!(!super::should_route_backends(&config, false));
+        assert!(!super::should_route_backends(&config, true));
+        config.execution.default_selection = Some(bcode_config::ExecutionPreference {
+            model_id: "selected-model".into(),
+            route: bcode_model::execution::ExecutionRoute::ManagedHarness {
+                instance_id: "selected-account".into(),
+                plugin_id: "example.native".into(),
+            },
+            account_reference: Some("selected-account".into()),
+        });
+        // Explicit native intent never falls back to an otherwise usable provider.
+        assert!(super::should_route_backends(&config, true));
+        assert!(super::should_route_backends(&config, false));
+    }
+
     fn backend_instance() -> bcode_harness_models::HarnessInstance {
         bcode_harness_models::HarnessInstance {
             instance_id: "native-account".into(),
