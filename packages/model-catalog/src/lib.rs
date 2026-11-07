@@ -1898,7 +1898,41 @@ pub fn validate_catalog(catalog: &CatalogDocument) -> Result<()> {
                 }
             }
             validate_prompt_cache_declaration(provider_id, model_id, model)?;
+            validate_reasoning_declaration(provider_id, model_id, model)?;
         }
+    }
+    Ok(())
+}
+
+/// Reject reasoning declarations whose defaults name values the model does not advertise.
+///
+/// The host requests a model's default effort and summary when a session has not selected one.
+/// A default outside the advertised values is silently dropped by request resolution, which for
+/// summaries means the provider returns only opaque reasoning state and no readable reasoning.
+fn validate_reasoning_declaration(
+    provider_id: &str,
+    model_id: &str,
+    model: &ModelCatalogEntry,
+) -> Result<()> {
+    let Some(reasoning) = &model.reasoning else {
+        return Ok(());
+    };
+    if let Some(default_effort) = &reasoning.default_effort
+        && !reasoning.effort_values.is_empty()
+        && !reasoning.effort_values.contains(default_effort)
+    {
+        return Err(Error::Validation(format!(
+            "model '{model_id}' for provider '{provider_id}' declares default reasoning effort \
+             '{default_effort}' outside `effort_values`"
+        )));
+    }
+    if let Some(default_summary) = &reasoning.default_summary
+        && !reasoning.summary_values.contains(default_summary)
+    {
+        return Err(Error::Validation(format!(
+            "model '{model_id}' for provider '{provider_id}' declares default reasoning summary \
+             '{default_summary}' outside `summary_values`"
+        )));
     }
     Ok(())
 }
@@ -4794,6 +4828,65 @@ status = "stable"
             .expect("target model");
         assert_eq!(resolved.context_window, Some(365_000));
         assert_eq!(resolved.max_output_tokens, Some(120_000));
+    }
+
+    #[test]
+    fn catalog_validation_rejects_default_summary_outside_summary_values() {
+        let mut document = load_embedded_catalog().expect("embedded catalog should load");
+        let reasoning = document
+            .providers
+            .get_mut("openai")
+            .and_then(|provider| provider.models.get_mut("gpt-6.1-sol"))
+            .and_then(|model| model.reasoning.as_mut())
+            .expect("GPT-6.1 Sol reasoning");
+        reasoning.summary_values.clear();
+
+        let error = validate_catalog(&document).expect_err("default summary must be advertised");
+        assert!(
+            error.to_string().contains("outside `summary_values`"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn catalog_validation_rejects_default_effort_outside_effort_values() {
+        let mut document = load_embedded_catalog().expect("embedded catalog should load");
+        let reasoning = document
+            .providers
+            .get_mut("openai")
+            .and_then(|provider| provider.models.get_mut("o3"))
+            .and_then(|model| model.reasoning.as_mut())
+            .expect("o3 reasoning");
+        reasoning.default_effort = Some("xhigh".to_owned());
+
+        let error = validate_catalog(&document).expect_err("default effort must be advertised");
+        assert!(
+            error.to_string().contains("outside `effort_values`"),
+            "{error}"
+        );
+    }
+
+    /// `OpenAI` Responses reasoning models only return readable reasoning when a summary is
+    /// requested, so every bundled `OpenAI` reasoning entry must resolve to a default summary.
+    #[test]
+    fn bundled_openai_reasoning_models_request_a_summary_by_default() {
+        let catalog = ModelCatalog::new(load_embedded_catalog().expect("embedded catalog"));
+        let provider = catalog
+            .document()
+            .providers
+            .get("openai")
+            .expect("OpenAI provider");
+        let missing = provider
+            .models
+            .iter()
+            .filter(|(model_id, _)| model_id.starts_with("gpt-") || model_id.starts_with('o'))
+            .filter_map(|(model_id, entry)| {
+                let reasoning = reasoning_from_catalog(entry)?;
+                (!reasoning.effort_values.is_empty() && reasoning.default_summary.is_none())
+                    .then_some(model_id.as_str())
+            })
+            .collect::<Vec<_>>();
+        assert!(missing.is_empty(), "missing default summary: {missing:?}");
     }
 
     #[test]

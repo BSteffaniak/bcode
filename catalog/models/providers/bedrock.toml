@@ -702,7 +702,7 @@ prompt_cache_min_prefix_tokens = 1024
 [models."openai.gpt-6-astra".reasoning]
 effort_values = ["low", "medium", "high", "xhigh", "max"]
 default_effort = "medium"
-summary_values = ["auto", "concise", "detailed"]
+summary_values = ["auto", "detailed"]
 default_summary = "auto"
 
 [models."openai.gpt-6-astra".pricing]
@@ -742,7 +742,7 @@ prompt_cache_min_prefix_tokens = 1024
 [models."us.openai.gpt-6-astra".reasoning]
 effort_values = ["low", "medium", "high", "xhigh", "max"]
 default_effort = "medium"
-summary_values = ["auto", "concise", "detailed"]
+summary_values = ["auto", "detailed"]
 default_summary = "auto"
 
 [models."us.openai.gpt-6-astra".pricing]
@@ -782,7 +782,7 @@ prompt_cache_min_prefix_tokens = 1024
 [models."global.openai.gpt-6-astra".reasoning]
 effort_values = ["low", "medium", "high", "xhigh", "max"]
 default_effort = "medium"
-summary_values = ["auto", "concise", "detailed"]
+summary_values = ["auto", "detailed"]
 default_summary = "auto"
 
 [models."global.openai.gpt-6-astra".pricing]
@@ -821,7 +821,7 @@ prompt_cache_min_prefix_tokens = 1024
 [models."openai.gpt-5.6-sol".reasoning]
 effort_values = ["none", "low", "medium", "high", "xhigh", "max"]
 default_effort = "medium"
-summary_values = ["auto", "concise", "detailed"]
+summary_values = ["auto", "detailed"]
 default_summary = "auto"
 
 [models."openai.gpt-5.6-sol".pricing]
@@ -861,7 +861,7 @@ prompt_cache_min_prefix_tokens = 1024
 [models."us.openai.gpt-5.6-sol".reasoning]
 effort_values = ["none", "low", "medium", "high", "xhigh", "max"]
 default_effort = "medium"
-summary_values = ["auto", "concise", "detailed"]
+summary_values = ["auto", "detailed"]
 default_summary = "auto"
 
 [models."us.openai.gpt-5.6-sol".pricing]
@@ -901,7 +901,7 @@ prompt_cache_min_prefix_tokens = 1024
 [models."global.openai.gpt-5.6-sol".reasoning]
 effort_values = ["none", "low", "medium", "high", "xhigh", "max"]
 default_effort = "medium"
-summary_values = ["auto", "concise", "detailed"]
+summary_values = ["auto", "detailed"]
 default_summary = "auto"
 
 [models."global.openai.gpt-5.6-sol".pricing]
@@ -940,7 +940,7 @@ prompt_cache_min_prefix_tokens = 1024
 [models."openai.gpt-5.6-terra".reasoning]
 effort_values = ["none", "low", "medium", "high", "xhigh", "max"]
 default_effort = "medium"
-summary_values = ["auto", "concise", "detailed"]
+summary_values = ["auto", "detailed"]
 default_summary = "auto"
 
 [models."openai.gpt-5.6-terra".pricing]
@@ -980,7 +980,7 @@ prompt_cache_min_prefix_tokens = 1024
 [models."us.openai.gpt-5.6-terra".reasoning]
 effort_values = ["none", "low", "medium", "high", "xhigh", "max"]
 default_effort = "medium"
-summary_values = ["auto", "concise", "detailed"]
+summary_values = ["auto", "detailed"]
 default_summary = "auto"
 
 [models."us.openai.gpt-5.6-terra".pricing]
@@ -1020,7 +1020,7 @@ prompt_cache_min_prefix_tokens = 1024
 [models."global.openai.gpt-5.6-terra".reasoning]
 effort_values = ["none", "low", "medium", "high", "xhigh", "max"]
 default_effort = "medium"
-summary_values = ["auto", "concise", "detailed"]
+summary_values = ["auto", "detailed"]
 default_summary = "auto"
 
 [models."global.openai.gpt-5.6-terra".pricing]
@@ -1060,7 +1060,7 @@ prompt_cache_min_prefix_tokens = 1024
 [models."openai.gpt-5.6-luna".reasoning]
 effort_values = ["none", "low", "medium", "high", "xhigh", "max"]
 default_effort = "medium"
-summary_values = ["auto", "concise", "detailed"]
+summary_values = ["auto", "detailed"]
 default_summary = "auto"
 
 [models."openai.gpt-5.6-luna".pricing]
@@ -1100,7 +1100,7 @@ prompt_cache_min_prefix_tokens = 1024
 [models."us.openai.gpt-5.6-luna".reasoning]
 effort_values = ["none", "low", "medium", "high", "xhigh", "max"]
 default_effort = "medium"
-summary_values = ["auto", "concise", "detailed"]
+summary_values = ["auto", "detailed"]
 default_summary = "auto"
 
 [models."us.openai.gpt-5.6-luna".pricing]
@@ -1141,7 +1141,7 @@ prompt_cache_min_prefix_tokens = 1024
 [models."global.openai.gpt-5.6-luna".reasoning]
 effort_values = ["none", "low", "medium", "high", "xhigh", "max"]
 default_effort = "medium"
-summary_values = ["auto", "concise", "detailed"]
+summary_values = ["auto", "detailed"]
 default_summary = "auto"
 
 [models."global.openai.gpt-5.6-luna".pricing]
@@ -1177,7 +1177,7 @@ prompt_cache = true
 [models."openai.gpt-5.5".reasoning]
 effort_values = ["none", "minimal", "low", "medium", "high", "xhigh"]
 default_effort = "medium"
-summary_values = ["auto", "concise", "detailed"]
+summary_values = ["auto", "detailed"]
 default_summary = "auto"
 
 [models."openai.gpt-5.5".pricing]
@@ -1213,7 +1213,7 @@ prompt_cache = true
 [models."us.openai.gpt-5.5".reasoning]
 effort_values = ["none", "minimal", "low", "medium", "high", "xhigh"]
 default_effort = "medium"
-summary_values = ["auto", "concise", "detailed"]
+summary_values = ["auto", "detailed"]
 default_summary = "auto"
 
 [models."us.openai.gpt-5.5".pricing]
@@ -1249,7 +1249,7 @@ prompt_cache = true
 [models."global.openai.gpt-5.5".reasoning]
 effort_values = ["none", "minimal", "low", "medium", "high", "xhigh"]
 default_effort = "medium"
-summary_values = ["auto", "concise", "detailed"]
+summary_values = ["auto", "detailed"]
 default_summary = "auto"
 
 [models."global.openai.gpt-5.5".pricing]
@@ -1284,7 +1284,7 @@ prompt_cache = true
 [models."openai.gpt-5.4".reasoning]
 effort_values = ["none", "minimal", "low", "medium", "high", "xhigh"]
 default_effort = "medium"
-summary_values = ["auto", "concise", "detailed"]
+summary_values = ["auto", "detailed"]
 default_summary = "auto"
 
 [models."openai.gpt-5.4".pricing]
@@ -1320,7 +1320,7 @@ prompt_cache = true
 [models."us.openai.gpt-5.4".reasoning]
 effort_values = ["none", "minimal", "low", "medium", "high", "xhigh"]
 default_effort = "medium"
-summary_values = ["auto", "concise", "detailed"]
+summary_values = ["auto", "detailed"]
 default_summary = "auto"
 
 [models."us.openai.gpt-5.4".pricing]
@@ -1356,7 +1356,7 @@ prompt_cache = true
 [models."global.openai.gpt-5.4".reasoning]
 effort_values = ["none", "minimal", "low", "medium", "high", "xhigh"]
 default_effort = "medium"
-summary_values = ["auto", "concise", "detailed"]
+summary_values = ["auto", "detailed"]
 default_summary = "auto"
 
 [models."global.openai.gpt-5.4".pricing]

@@ -2032,9 +2032,12 @@ struct ReasoningRequestShape {
     supports_reasoning_object: bool,
     include_state: &'static [&'static str],
     include_summary: &'static [&'static str],
-    fallback_effort_values: &'static [&'static str],
-    fallback_summary_values: &'static [&'static str],
-    source: ModelReasoningCapabilitySource,
+    /// Summary mode requested when the turn carries no explicit or catalog summary.
+    ///
+    /// Without a `reasoning.summary` request the Responses API returns only opaque reasoning
+    /// state, so a dialect that always reasons supplies a default instead of silently dropping
+    /// readable reasoning for models whose catalog metadata omits summary support.
+    default_summary: Option<&'static str>,
 }
 
 impl OpenAiCompatibleDialect {
@@ -2044,25 +2047,19 @@ impl OpenAiCompatibleDialect {
                 supports_reasoning_object: false,
                 include_state: &[],
                 include_summary: &[],
-                fallback_effort_values: &["low", "medium", "high"],
-                fallback_summary_values: &[],
-                source: ModelReasoningCapabilitySource::GenericFallback,
+                default_summary: None,
             },
             Self::ResponsesApi => ReasoningRequestShape {
                 supports_reasoning_object: true,
                 include_state: &[],
                 include_summary: &["reasoning.summary"],
-                fallback_effort_values: &["none", "minimal", "low", "medium", "high", "xhigh"],
-                fallback_summary_values: &["auto", "concise", "detailed"],
-                source: ModelReasoningCapabilitySource::KnownModelTable,
+                default_summary: None,
             },
             Self::ChatGptCodex => ReasoningRequestShape {
                 supports_reasoning_object: true,
                 include_state: &["reasoning.encrypted_content"],
                 include_summary: &[],
-                fallback_effort_values: &["none", "minimal", "low", "medium", "high", "xhigh"],
-                fallback_summary_values: &["auto", "concise", "detailed"],
-                source: ModelReasoningCapabilitySource::KnownModelTable,
+                default_summary: Some("auto"),
             },
         }
     }
@@ -6477,7 +6474,13 @@ fn responses_reasoning_options(
                 .reasoning_effort
                 .map(reasoning_effort_name)
         });
-    let summary = request.parameters.reasoning_summary.clone();
+    let summary = request.parameters.reasoning_summary.clone().or_else(|| {
+        settings
+            .dialect
+            .reasoning_request_shape()
+            .default_summary
+            .map(ToOwned::to_owned)
+    });
     let context = settings
         .dialect
         .responses_request_capabilities()
@@ -14285,6 +14288,46 @@ mod tests {
                 .any(|value| value == "reasoning.encrypted_content")
         );
         assert!(!include.iter().any(|value| value == "reasoning.summary"));
+    }
+
+    fn requested_summary(body: &serde_json::Value) -> Option<&str> {
+        body.get("reasoning")
+            .and_then(|reasoning| reasoning.get("summary"))
+            .and_then(serde_json::Value::as_str)
+    }
+
+    #[test]
+    fn chatgpt_codex_request_defaults_reasoning_summary_when_unset() {
+        let request = test_request(vec![text_message(MessageRole::User, "hello")]);
+        let settings = test_settings(test_chatgpt_auth(), OpenAiCompatibleDialect::ChatGptCodex);
+
+        let body = build_responses_request(&settings, &request, "gpt-6.1-sol")
+            .expect("request should build");
+
+        assert_eq!(requested_summary(&body), Some("auto"));
+    }
+
+    #[test]
+    fn chatgpt_codex_request_keeps_selected_reasoning_summary() {
+        let mut request = test_request(vec![text_message(MessageRole::User, "hello")]);
+        request.parameters.reasoning_summary = Some("detailed".to_owned());
+        let settings = test_settings(test_chatgpt_auth(), OpenAiCompatibleDialect::ChatGptCodex);
+
+        let body = build_responses_request(&settings, &request, "gpt-6.1-sol")
+            .expect("request should build");
+
+        assert_eq!(requested_summary(&body), Some("detailed"));
+    }
+
+    #[test]
+    fn responses_request_omits_reasoning_summary_when_unset() {
+        let request = test_request(vec![text_message(MessageRole::User, "hello")]);
+        let settings = test_settings(test_chatgpt_auth(), OpenAiCompatibleDialect::ResponsesApi);
+
+        let body =
+            build_responses_request(&settings, &request, "gpt-5").expect("request should build");
+
+        assert_eq!(requested_summary(&body), None);
     }
 
     #[test]
