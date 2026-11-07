@@ -188,6 +188,8 @@ mod child_transition_notification_tests {
 }
 
 mod milestone;
+#[cfg(test)]
+mod read_connection_tests;
 mod turn_continuation;
 
 use super::{
@@ -208,6 +210,24 @@ use bcode_session_models::{
 use std::collections::BTreeMap;
 use std::sync::RwLock;
 use tokio::sync::{broadcast, mpsc, oneshot};
+
+/// Read access never shares ownership of the actor's cached connection. An unowned actor
+/// opens a private connection whose lifetime ends with the read, without checkpointing close.
+enum SessionDatabaseRead<'a> {
+    Borrowed(&'a SessionDb),
+    Scoped(SessionDb),
+}
+
+impl std::ops::Deref for SessionDatabaseRead<'_> {
+    type Target = SessionDb;
+
+    fn deref(&self) -> &Self::Target {
+        match self {
+            Self::Borrowed(db) => db,
+            Self::Scoped(db) => db,
+        }
+    }
+}
 
 const SESSION_DATABASE_IDLE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 
@@ -3579,15 +3599,14 @@ impl SessionActor {
             .await?
             .ok_or(SessionError::NotFound(session_id))?;
         db.validate_read_readiness().await?;
-        let state = crate::SessionManager::read_db_session_state(session_id, db).await?;
+        let state = crate::SessionManager::read_db_session_state(session_id, &db).await?;
         let prefix = db.events_range(0, 1, 2).await?;
         Ok((state.summary(), prefix))
     }
 
-    /// Bounded health through the cached database, opening it once if the file exists.
+    /// Bounded health through a borrowed runtime or operation-local read connection.
     ///
-    /// Unlike write paths this does not require ownership: health is a read-only probe, and the
-    /// actor holding the handle is exactly what makes a second manager-side open redundant.
+    /// Health never acquires ownership or retains a database lock after an unowned read.
     async fn health(
         &mut self,
         root: &std::path::Path,
@@ -3597,7 +3616,7 @@ impl SessionActor {
             .existing_session_db()
             .await?
             .ok_or(SessionError::NotFound(session_id))?;
-        Ok(super::session_health_from_db(db, root, session_id).await)
+        Ok(super::session_health_from_db(&db, root, session_id).await)
     }
 
     /// Replace in-memory state from the durable session-state projection unconditionally.
@@ -3676,27 +3695,32 @@ impl SessionActor {
             .ok_or(SessionError::DbUnavailable(self.state.summary.id))
     }
 
-    /// Return the cached session database when canonical storage already exists.
+    /// Borrow the runtime database while owned, otherwise open an operation-local read handle.
     ///
-    /// Returns a borrow rather than a clone for the same ownership reason as
-    /// [`Self::session_db_for_write`].
-    async fn existing_session_db(&mut self) -> Result<Option<&SessionDb>, SessionError> {
-        if self.db.is_none() {
-            let Some(store) = &self.store else {
-                return Ok(None);
-            };
-            if !crate::db::session_db_path(&store.root_path(), self.state.summary.id).exists() {
-                return Ok(None);
-            }
-            let db = SessionDb::open_existing_turso_in_root_observed(
-                self.state.summary.id,
-                &store.root_path(),
-                store.metrics(),
-            )
-            .await?;
-            self.db = Some(db);
+    /// Unowned reads must neither cache a process-level lock nor checkpoint canonical storage.
+    async fn existing_session_db(
+        &mut self,
+    ) -> Result<Option<SessionDatabaseRead<'_>>, SessionError> {
+        if self.db.is_some() {
+            return Ok(self.db.as_ref().map(SessionDatabaseRead::Borrowed));
         }
-        Ok(self.db.as_ref())
+        let Some(store) = &self.store else {
+            return Ok(None);
+        };
+        if !crate::db::session_db_path(&store.root_path(), self.state.summary.id).exists() {
+            return Ok(None);
+        }
+        let db = SessionDb::open_existing_turso_in_root_observed(
+            self.state.summary.id,
+            &store.root_path(),
+            store.metrics(),
+        )
+        .await?;
+        if self.lease.is_none() {
+            return Ok(Some(SessionDatabaseRead::Scoped(db)));
+        }
+        self.db = Some(db);
+        Ok(self.db.as_ref().map(SessionDatabaseRead::Borrowed))
     }
 
     /// Ensure the write-capable database is open without holding a borrow across the call.
@@ -5425,27 +5449,26 @@ impl SessionActor {
                 return Err(SessionError::UnsupportedProjectionWindow);
             }
         };
-        let events = self
-            .history_page(SessionHistoryQuery {
-                cursor,
-                limit: max_events,
-                direction,
-            })
-            .await?
-            .events;
-        let (first_event_sequence, last_event_sequence) =
+        let query = SessionHistoryQuery {
+            cursor,
+            limit: max_events,
+            direction,
+        };
+        let (events, first_event_sequence, last_event_sequence) =
             if let Some(db) = self.existing_session_db().await? {
                 (
+                    db.history_page(query).await?.events,
                     db.first_event_sequence().await?,
                     db.last_event_sequence().await?,
                 )
             } else if let Some(all_events) = &self.state.events {
                 (
+                    history_page_from_events(self.state.summary.id, all_events, query)?.events,
                     all_events.first().map(|event| event.sequence),
                     all_events.last().map(|event| event.sequence),
                 )
             } else {
-                (None, None)
+                return Err(SessionError::NotFound(self.state.summary.id));
             };
         crate::projection::projection_window_from_events_with_source_bounds(
             &events,

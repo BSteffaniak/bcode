@@ -890,7 +890,14 @@ reporting success. When the connection cannot be proven terminal, release report
 carrying `database_handle_retained` instead of claiming success, so a retained handle is surfaced
 rather than concealed. That condition reaches clients as the typed
 `SessionOwnershipBlocker::DatabaseHandleRetained` release blocker. Actor database accessors return
-borrows rather than clones so the compiler keeps the actor the sole owner of the handle.
+borrows rather than clones so the compiler keeps the actor the sole owner of the runtime handle.
+
+An actor without a runtime lease never caches a database opened for a read. Its accessor returns
+an operation-local handle instead; owned actors borrow their cached runtime connection. Scoped read
+handles are dropped before the reply, including error and abandoned-reply paths, so a health,
+history, search, or observation request cannot re-pin a released session until the idle timeout.
+Compound reads reuse one scoped connection for their database queries. Reads do not acquire writer
+ownership, and active clients or typed ownership guards continue to benefit from connection reuse.
 
 Read-only and diagnostic paths deliberately do not close. Closing checkpoints the WAL and rewrites
 `session.db` and `session.db-wal`, which would make a normal read mutate canonical storage. Those
