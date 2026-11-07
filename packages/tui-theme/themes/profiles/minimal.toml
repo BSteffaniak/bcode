@@ -1,5 +1,5 @@
-# Profile: Whitespace does the work: hairline rules, one accent, quiet tools.
 # Profiles set chrome, structure, and containers only, so they combine with any palette.
+description    = "Whitespace does the work: hairline rules, one accent, quiet tools."
 display_name   = "Minimal (profile)"
 id             = "minimal"
 kind           = "profile"

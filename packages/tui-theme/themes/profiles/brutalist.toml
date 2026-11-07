@@ -1,5 +1,5 @@
-# Profile: Heavy rules and hard edges; no gradients, no softness.
 # Profiles set chrome, structure, and containers only, so they combine with any palette.
+description    = "Heavy rules and hard edges; no gradients, no softness."
 display_name   = "Brutalist (profile)"
 id             = "brutalist"
 kind           = "profile"

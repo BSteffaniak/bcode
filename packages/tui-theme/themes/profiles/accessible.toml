@@ -1,5 +1,5 @@
-# Profile: Never color alone: explicit frames, verbose labels, no motion.
 # Profiles set chrome, structure, and containers only, so they combine with any palette.
+description    = "Never color alone: explicit frames, verbose labels, no motion."
 display_name   = "Accessible (profile)"
 id             = "accessible"
 kind           = "profile"

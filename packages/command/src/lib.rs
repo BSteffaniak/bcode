@@ -505,6 +505,12 @@ pub fn bundled_host_palette_commands() -> Vec<CommandContribution> {
             "theme",
         ),
         CommandContribution::host_palette(
+            "profile.select",
+            "Profile: Select",
+            "Preview interface profiles live: chrome and which tools are collapsed",
+            "theme",
+        ),
+        CommandContribution::host_palette(
             "streaming.configure",
             "Streaming: Configure",
             "Compare raw provider chunks and tune smoothed presentation",

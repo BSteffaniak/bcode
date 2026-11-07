@@ -348,6 +348,7 @@ pub struct ChatLoopState {
     pub(super) permission_dialog: Option<PermissionDialogState>,
     thinking_dialog: Option<super::thinking_dialog::ThinkingDialogState>,
     theme_picker: Option<super::theme_picker::ThemePickerState>,
+    profile_picker: Option<super::profile_picker::ProfilePickerState>,
     streaming_configurator: Option<super::streaming_configurator::StreamingConfiguratorState>,
     timeline_dialog: Option<super::timeline_dialog::TimelineDialogState>,
     milestone_requests: super::timeline_dialog::MilestonePageRequests,
@@ -445,6 +446,7 @@ impl ChatLoopState {
             permission_dialog: None,
             thinking_dialog: None,
             theme_picker: None,
+            profile_picker: None,
             streaming_configurator: None,
             timeline_dialog: None,
             milestone_requests: super::timeline_dialog::MilestonePageRequests::default(),
@@ -524,6 +526,7 @@ impl ChatLoopState {
             .unwrap_or(self.declarative_streaming_policy);
         self.thinking_dialog = None;
         self.theme_picker = None;
+        self.profile_picker = None;
         self.timeline_dialog = None;
         self.milestone_requests.cancel();
         self.provider_picker = None;
@@ -996,6 +999,92 @@ impl ChatLoopState {
                 chat.app.set_status("theme preview cancelled".to_owned());
             }
             super::theme_picker::ThemePickerOutcome::Ignored => {}
+        }
+    }
+
+    pub fn open_profile_picker(&mut self, chat: &mut ActiveChat) {
+        let original = chat.app.tui_config().theme.profile.clone();
+        self.profile_picker = Some(super::profile_picker::ProfilePickerState::new(
+            super::theme::profile_catalog(&mut chat.app),
+            original,
+        ));
+        chat.app.set_status("profile picker opened".to_owned());
+    }
+
+    /// Close the profile picker, restoring the profile it was opened with.
+    pub fn cancel_profile_picker(&mut self, chat: &mut ActiveChat) {
+        if let Some(picker) = self.profile_picker.take() {
+            chat.app.apply_profile(picker.original());
+        }
+    }
+
+    pub fn handle_profile_picker_key(
+        &mut self,
+        chat: &mut ActiveChat,
+        stroke: KeyStroke,
+        keymap: &super::keymap::BmuxKeyMap,
+    ) -> bool {
+        let Some(picker) = self.profile_picker.as_mut() else {
+            return false;
+        };
+        let outcome = picker.handle_key_with_keymap(stroke, keymap);
+        self.apply_profile_picker_outcome(chat, outcome);
+        true
+    }
+
+    pub fn handle_profile_picker_mouse(
+        &mut self,
+        chat: &mut ActiveChat,
+        mouse: bmux_tui::event::MouseEvent,
+        frame_area: Rect,
+    ) -> bool {
+        let Some(picker) = self.profile_picker.as_mut() else {
+            return false;
+        };
+        let theme = super::render::TuiTheme::for_app(&chat.app);
+        let Some((row, activate)) =
+            super::profile_picker_render::profile_picker_row(picker, mouse, frame_area, theme)
+        else {
+            return true;
+        };
+        let outcome = if activate {
+            picker.activate_row(row)
+        } else {
+            picker.select_row(row)
+        };
+        self.apply_profile_picker_outcome(chat, outcome);
+        true
+    }
+
+    fn apply_profile_picker_outcome(
+        &mut self,
+        chat: &mut ActiveChat,
+        outcome: super::profile_picker::ProfilePickerOutcome,
+    ) {
+        use super::profile_picker::ProfilePickerOutcome;
+        let label = |id: Option<&str>| id.unwrap_or("theme default").to_owned();
+        match outcome {
+            ProfilePickerOutcome::Preview(id) => {
+                if chat.app.apply_profile(id.as_deref()) {
+                    chat.app
+                        .set_status(format!("previewing profile {}", label(id.as_deref())));
+                }
+            }
+            ProfilePickerOutcome::Apply(id) => {
+                self.profile_picker = None;
+                if chat.app.apply_profile(id.as_deref()) {
+                    chat.app.set_status(format!(
+                        "saving profile {} to user state…",
+                        label(id.as_deref())
+                    ));
+                    chat.replace_effect(TuiEffect::PersistProfileSelection { name: id });
+                }
+            }
+            ProfilePickerOutcome::Cancel => {
+                self.cancel_profile_picker(chat);
+                chat.app.set_status("profile preview cancelled".to_owned());
+            }
+            ProfilePickerOutcome::Ignored => {}
         }
     }
 
@@ -2242,6 +2331,7 @@ impl ChatLoopState {
             (self.timeline_dialog.is_some(), Foreground::Timeline),
             (self.thinking_dialog.is_some(), Foreground::Thinking),
             (self.theme_picker.is_some(), Foreground::Theme),
+            (self.profile_picker.is_some(), Foreground::Profile),
             (self.palette.is_some(), Foreground::Commands),
             (self.slash_palette.is_some(), Foreground::Slash),
         ]
@@ -2827,7 +2917,7 @@ impl ChatLoopState {
             Some(Foreground::Streaming) => BcodeRuntimeScreen::Streaming,
             Some(Foreground::Timeline) => BcodeRuntimeScreen::Timeline,
             Some(Foreground::Thinking) => BcodeRuntimeScreen::Thinking,
-            Some(Foreground::Theme) => BcodeRuntimeScreen::Theme,
+            Some(Foreground::Theme | Foreground::Profile) => BcodeRuntimeScreen::Theme,
             Some(Foreground::Commands) => BcodeRuntimeScreen::CommandPalette,
             Some(Foreground::Slash) => BcodeRuntimeScreen::SlashPalette,
             None if self.has_interactive_surface() => BcodeRuntimeScreen::InteractiveSurface,
@@ -5078,6 +5168,7 @@ fn apply_root_slash_command_outcome(
             chat.app.set_status("theme preview cancelled".to_owned());
         }
         SlashCommandOutcome::OpenThemePicker => loop_state.open_theme_picker(chat),
+        SlashCommandOutcome::OpenProfilePicker => loop_state.open_profile_picker(chat),
         SlashCommandOutcome::OpenStreamingConfigurator => {
             loop_state.open_streaming_configurator(chat);
         }
@@ -6521,6 +6612,34 @@ fn paint_owner_completion_overlay(
     }
 }
 
+fn paint_foreground_pickers(
+    chat: &ActiveChat,
+    loop_state: &mut ChatLoopState,
+    frame: &mut bmux_tui::paint::PaintCx<'_, '_>,
+    foreground: Option<super::foreground::Foreground>,
+    effective: &super::keymap::BmuxKeyMap,
+) {
+    let theme = render::TuiTheme::for_app(&chat.app);
+    if let Some(picker) = &mut loop_state.theme_picker
+        && foreground == Some(super::foreground::Foreground::Theme)
+    {
+        super::theme_picker_render::render_theme_picker_with_keymap(
+            picker, frame, theme, effective,
+        );
+    }
+    if let Some(picker) = &mut loop_state.profile_picker
+        && foreground == Some(super::foreground::Foreground::Profile)
+    {
+        super::profile_picker_render::render_profile_picker_with_keymap(
+            picker,
+            frame,
+            theme,
+            chat.app.structure_snapshot(),
+            effective,
+        );
+    }
+}
+
 /// Compose every foreground surface in the same order for full and temporal frames.
 /// Preparation may be skipped; composition must never be skipped.
 fn paint_foreground(
@@ -6553,13 +6672,7 @@ fn paint_foreground(
         command_palette_render::render_palette(palette, frame, theme);
     }
     paint_foreground_configurator(chat, loop_state, frame, &effective);
-    if let Some(picker) = &mut loop_state.theme_picker
-        && foreground == Some(super::foreground::Foreground::Theme)
-    {
-        super::theme_picker_render::render_theme_picker_with_keymap(
-            picker, frame, theme, &effective,
-        );
-    }
+    paint_foreground_pickers(chat, loop_state, frame, foreground, &effective);
     if let Some(dialog) = &loop_state.permission_dialog
         && foreground == Some(super::foreground::Foreground::Permission)
     {

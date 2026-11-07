@@ -77,6 +77,8 @@ pub(crate) mod picker_mouse;
 pub(crate) mod picker_render;
 pub(crate) mod plugin_surface_host;
 pub mod plugin_tui;
+mod profile_picker;
+pub(crate) mod profile_picker_render;
 pub(crate) mod provider_picker;
 pub(crate) mod provider_picker_render;
 pub(crate) mod ralph_flow;

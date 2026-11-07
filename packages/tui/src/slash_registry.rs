@@ -178,7 +178,8 @@ const BUILTIN_COMMANDS: &[BuiltinCommandSpec] = &[
         id: BuiltinCommandId::Profile,
         names: &["profile"],
         completions: &[
-            completion!("/profile", "List interface profiles"),
+            completion!("/profile", "Open interactive profile picker"),
+            completion!("/profile list", "List interface profiles"),
             completion!("/profile apply ", "Persist an interface profile"),
             completion!("/profile reset", "Clear the saved profile"),
         ],

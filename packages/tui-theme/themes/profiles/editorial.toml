@@ -1,5 +1,5 @@
-# Profile: Typographic and Markdown-forward: prose first, tools tucked away.
 # Profiles set chrome, structure, and containers only, so they combine with any palette.
+description    = "Typographic and Markdown-forward: prose first, tools tucked away."
 display_name   = "Editorial (profile)"
 id             = "editorial"
 kind           = "profile"

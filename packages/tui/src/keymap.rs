@@ -448,10 +448,10 @@ fn control_defaults<'a>(scope: &str, id: &str, defaults: Vec<&'a str>) -> Option
         defaults = vec!["y", "shift+y"];
     }
 
-    if matches!(scope, "theme_picker" | "timeline") && id == "tui.control.up" {
+    if matches!(scope, "theme_picker" | "profile_picker" | "timeline") && id == "tui.control.up" {
         defaults.push("k");
     }
-    if matches!(scope, "theme_picker" | "timeline") && id == "tui.control.down" {
+    if matches!(scope, "theme_picker" | "profile_picker" | "timeline") && id == "tui.control.down" {
         defaults.push("j");
     }
     Some(defaults)
@@ -470,6 +470,7 @@ fn register_control_actions(
         "auth_pool_picker",
         "worktree_picker",
         "theme_picker",
+        "profile_picker",
         "timeline",
         "slash_palette",
         "command_palette",

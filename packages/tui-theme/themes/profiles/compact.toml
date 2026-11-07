@@ -1,5 +1,5 @@
-# Profile: Built for small terminals: no padding, short previews.
 # Profiles set chrome, structure, and containers only, so they combine with any palette.
+description    = "Built for small terminals: no padding, short previews."
 display_name   = "Compact (profile)"
 id             = "compact"
 kind           = "profile"

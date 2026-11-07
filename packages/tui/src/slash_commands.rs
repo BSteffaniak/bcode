@@ -62,6 +62,8 @@ pub enum SlashCommandOutcome {
     ApplyTheme { theme_id: String },
     /// List interface profiles.
     ShowProfileCatalog,
+    /// Open the interactive profile picker.
+    OpenProfilePicker,
     /// Persist one interface profile to user state.
     ApplyProfile { profile_id: String },
     /// Clear the saved interface profile.
@@ -778,7 +780,8 @@ pub async fn execute_resolved(
 
 fn profile_command(parts: &[&str]) -> SlashCommandOutcome {
     match parts {
-        [_] | [_, "list"] => SlashCommandOutcome::ShowProfileCatalog,
+        [_] => SlashCommandOutcome::OpenProfilePicker,
+        [_, "list"] => SlashCommandOutcome::ShowProfileCatalog,
         [_, "apply", profile_id] => SlashCommandOutcome::ApplyProfile {
             profile_id: (*profile_id).to_owned(),
         },
@@ -791,17 +794,26 @@ fn profile_command(parts: &[&str]) -> SlashCommandOutcome {
 
 /// Markdown listing of interface profiles.
 #[must_use]
-pub fn format_profile_catalog_markdown(profiles: &[(String, String, bool)]) -> String {
+pub fn format_profile_catalog_markdown(profiles: &[super::theme::ProfileCatalogEntry]) -> String {
     if profiles.is_empty() {
         return "# Profiles\n\nNo profiles are currently available.".to_owned();
     }
     let mut output = String::from(
         "# Profiles\n\nProfiles set borders, icons, density, and which tools are collapsed. \
-         Combine any profile with any theme using `/profile apply <profile>`.\n\n",
+         Combine any profile with any theme using `/profile` (interactive) or \
+         `/profile apply <profile>`.\n\n",
     );
-    for (id, name, selected) in profiles {
-        let current = if *selected { " (current)" } else { "" };
-        let _ = writeln!(output, "* **{name}**{current} — `{id}`");
+    for profile in profiles {
+        let current = if profile.selected { " (current)" } else { "" };
+        let description = profile
+            .description
+            .as_deref()
+            .map_or_else(String::new, |description| format!(": {description}"));
+        let _ = writeln!(
+            output,
+            "* **{}**{current} — `{}`{description}",
+            profile.display_name, profile.id
+        );
     }
     output
 }

@@ -64,6 +64,16 @@ Curated combinations select both at once: `rice-mocha`, `neon`, `crt`,
 `amber-terminal`, `zen-paper`, `newsroom`, `night-shift`, `quiet`,
 `brutal-modus`, `forest-floor`, and `blueprint-studio`.
 
+`/profile` (or **Profile: Select** in the command palette) opens a live
+picker. Moving the selection applies the profile immediately: the transcript
+behind the picker re-renders, and the preview pane renders a sample turn (a
+small and a large read, a failed command, a running command, and a pending
+permission) through the same structural pipeline, including your
+`[[presentation.rules]]` and the visibility floor. Enter persists the profile
+to user state, Escape restores the previous one, and **Theme default** clears
+it. `/profile list`, `/profile apply <id>`, and `/profile reset` remain
+available. Profile files may set a one-line `description`, shown in the picker.
+
 ### Seed palettes
 
 `schema_version = 2` files may define seed colors and leave roles unset; Bcode

@@ -1,5 +1,5 @@
-# Profile: Everything on display: gradient focus, Nerd Font icons, powerline separators, framed tool cards.
 # Profiles set chrome, structure, and containers only, so they combine with any palette.
+description    = "Everything on display: gradient focus, Nerd Font icons, powerline separators, framed tool cards."
 display_name   = "Riced (profile)"
 id             = "riced"
 kind           = "profile"

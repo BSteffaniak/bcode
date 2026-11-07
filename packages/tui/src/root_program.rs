@@ -1850,6 +1850,13 @@ impl BcodeRuntimeModel {
                 if self.loop_state.foreground() == Some(super::foreground::Foreground::Theme) {
                     return super::invalidation::UiInvalidation::None;
                 }
+                if self.loop_state.handle_profile_picker_key(
+                    &mut self.chat,
+                    stroke,
+                    self.settings.keymap(),
+                ) {
+                    return super::invalidation::UiInvalidation::Structural;
+                }
                 if self.loop_state.has_command_palette() {
                     if let Some(action) = self
                         .loop_state
@@ -2116,6 +2123,15 @@ impl BcodeRuntimeModel {
                 }
                 if self.loop_state.foreground() == Some(super::foreground::Foreground::Theme)
                     && self.loop_state.handle_theme_picker_mouse(
+                        &mut self.chat,
+                        mouse,
+                        self.committed_area,
+                    )
+                {
+                    return super::invalidation::UiInvalidation::Structural;
+                }
+                if self.loop_state.foreground() == Some(super::foreground::Foreground::Profile)
+                    && self.loop_state.handle_profile_picker_mouse(
                         &mut self.chat,
                         mouse,
                         self.committed_area,
@@ -2761,6 +2777,7 @@ impl BcodeRuntimeModel {
                     }
                 }
                 "theme.select" => self.loop_state.open_theme_picker(&mut self.chat),
+                "profile.select" => self.loop_state.open_profile_picker(&mut self.chat),
                 "streaming.configure" => {
                     self.loop_state.open_streaming_configurator(&mut self.chat);
                 }
@@ -3222,6 +3239,7 @@ impl BcodeRuntimeModel {
                 } else {
                     self.chat.app.cancel_theme_preview();
                     self.loop_state.close_theme_picker();
+                    self.loop_state.cancel_profile_picker(&mut self.chat);
                     self.chat
                         .app
                         .set_status("preview invalidated; restored configured theme".to_owned());

@@ -21,6 +21,7 @@ pub enum Foreground {
     Timeline,
     Thinking,
     Theme,
+    Profile,
     Commands,
     Slash,
 }

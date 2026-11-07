@@ -1,5 +1,5 @@
-# Profile: Terminal nostalgia: double-line frames, ASCII markers, no motion.
 # Profiles set chrome, structure, and containers only, so they combine with any palette.
+description    = "Terminal nostalgia: double-line frames, ASCII markers, no motion."
 display_name   = "Retro (profile)"
 id             = "retro"
 kind           = "profile"

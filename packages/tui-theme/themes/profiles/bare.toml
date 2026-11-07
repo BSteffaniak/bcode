@@ -1,5 +1,5 @@
-# Profile: Stays out of the way: terminal-first, no chrome, tools as one-line summaries.
 # Profiles set chrome, structure, and containers only, so they combine with any palette.
+description    = "Stays out of the way: terminal-first, no chrome, tools as one-line summaries."
 display_name   = "Bare (profile)"
 id             = "bare"
 kind           = "profile"

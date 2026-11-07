@@ -108,24 +108,36 @@ pub fn catalog_view(app: &mut BmuxApp) -> ThemeCatalogView {
     }
 }
 
-/// Return the selectable profiles as `(id, display name, selected)`.
+/// One selectable interface profile.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProfileCatalogEntry {
+    /// Stable profile id.
+    pub id: String,
+    /// Display name without the `(profile)` suffix.
+    pub display_name: String,
+    /// Optional one-line description.
+    pub description: Option<String>,
+    /// Whether this is the configured profile.
+    pub selected: bool,
+}
+
+/// Return the selectable profiles in stable id order.
 #[must_use]
-pub fn profile_catalog(app: &mut BmuxApp) -> Vec<(String, String, bool)> {
+pub fn profile_catalog(app: &mut BmuxApp) -> Vec<ProfileCatalogEntry> {
     let selected = app.tui_config().theme.profile.clone();
     app.theme_catalog().map_or_else(Vec::new, |discovered| {
         discovered
             .catalog
             .definitions()
             .filter(|definition| definition.kind() == definition::ThemeKind::Profile)
-            .map(|definition| {
-                (
-                    definition.id().to_owned(),
-                    definition
-                        .display_name()
-                        .trim_end_matches(" (profile)")
-                        .to_owned(),
-                    selected.as_deref() == Some(definition.id()),
-                )
+            .map(|definition| ProfileCatalogEntry {
+                id: definition.id().to_owned(),
+                display_name: definition
+                    .display_name()
+                    .trim_end_matches(" (profile)")
+                    .to_owned(),
+                description: definition.description().map(str::to_owned),
+                selected: selected.as_deref() == Some(definition.id()),
             })
             .collect()
     })

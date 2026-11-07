@@ -1,5 +1,5 @@
-# Profile: Classic panels: status bars on tools, framed dialogs.
 # Profiles set chrome, structure, and containers only, so they combine with any palette.
+description    = "Classic panels: status bars on tools, framed dialogs."
 display_name   = "Structured (profile)"
 id             = "structured"
 kind           = "profile"

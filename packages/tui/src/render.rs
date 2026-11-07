@@ -19,11 +19,43 @@ thread_local! {
     static CURRENT_PRESENTATION: RefCell<Option<ResolvedPresentation>> = const { RefCell::new(None) };
     /// Row range of the most recent tool header, for disclosure trimming.
     static TOOL_HEADER_ROWS: Cell<Option<(usize, usize)>> = const { Cell::new(None) };
+    /// First non-blank line of the current tool's output or result, for summaries.
+    static TOOL_SUMMARY: RefCell<Option<String>> = const { RefCell::new(None) };
 }
 
 /// Synchronize structural presentation state for row generation.
 pub fn set_structure(snapshot: super::structure::StructureSnapshot) {
     STRUCTURE.with(|state| *state.borrow_mut() = snapshot);
+}
+
+/// Render standalone items (for example a picker preview) under `snapshot`.
+///
+/// The active row-building snapshot is restored afterwards, so transcript
+/// layout caches never observe the preview policy.
+pub fn sample_transcript_rows(
+    items: &[TranscriptItem],
+    width: u16,
+    snapshot: super::structure::StructureSnapshot,
+) -> Vec<Line> {
+    let previous = STRUCTURE.with(|state| std::mem::replace(&mut *state.borrow_mut(), snapshot));
+    let diff_viewer_config = DIFF_VIEWER_CONFIG.with(Cell::get);
+    let registry = bcode_plugin_sdk::tui::keymap::KeymapRegistry::default();
+    let rows = items
+        .iter()
+        .flat_map(|item| {
+            transcript_item_layout_with_keymap(
+                item,
+                width,
+                None,
+                diff_viewer_config,
+                None,
+                &registry,
+            )
+            .0
+        })
+        .collect();
+    STRUCTURE.with(|state| *state.borrow_mut() = previous);
+    rows
 }
 
 /// Effective structural presentation for tool items, or `None` for other items.
@@ -82,8 +114,9 @@ fn current_disclosure_marker() -> Option<&'static str> {
 /// Trim a rendered tool branch to its disclosure.
 ///
 /// Expanded branches are unchanged. Collapsed and hidden branches keep only
-/// the header rows; summaries keep the header plus one bounded summary row
-/// taken from the first non-blank body row. Anchors and selection rows that no
+/// the header rows; summaries keep the header plus one bounded summary row:
+/// the first non-blank line of the tool's output or result, falling back to
+/// the first non-blank body row. Anchors and selection rows that no
 /// longer exist are dropped, and trailing spacing is preserved.
 fn apply_tool_disclosure(
     output: (
@@ -107,12 +140,15 @@ fn apply_tool_disclosure(
     let trailing_blank = rows
         .last()
         .is_some_and(|row| row.spans.iter().all(|span| span.content.trim().is_empty()));
+    let recorded = TOOL_SUMMARY.with(RefCell::take);
     let summary = (presentation.disclosure == Disclosure::Summary)
         .then(|| {
-            rows[header_end..].iter().find_map(|row| {
-                let text: String = row.spans.iter().map(|span| span.content.as_str()).collect();
-                let text = text.trim();
-                (!text.is_empty()).then(|| text.to_owned())
+            recorded.or_else(|| {
+                rows[header_end..].iter().find_map(|row| {
+                    let text: String = row.spans.iter().map(|span| span.content.as_str()).collect();
+                    let text = text.trim();
+                    (!text.is_empty()).then(|| text.to_owned())
+                })
             })
         })
         .flatten();
@@ -2901,6 +2937,7 @@ fn push_transcript_item_rows(
     let branch_start = rows.len();
     CURRENT_PRESENTATION.with(|current| current.replace(structure.clone()));
     TOOL_HEADER_ROWS.with(|header| header.set(None));
+    TOOL_SUMMARY.with(|summary| summary.replace(None));
     match item.kind() {
         TranscriptItemKind::UserMessage => {
             if let Some(markdown) = markdown {
@@ -5493,6 +5530,18 @@ fn push_labeled_text_preview(
     if text.is_empty() || !current_part_visible(part) {
         return;
     }
+    if part != "arguments" {
+        TOOL_SUMMARY.with(|summary| {
+            let mut summary = summary.borrow_mut();
+            if summary.is_none() {
+                *summary = text
+                    .lines()
+                    .map(str::trim)
+                    .find(|line| !line.is_empty())
+                    .map(str::to_owned);
+            }
+        });
+    }
     let preview = current_preview();
     let max_rows = preview.map_or(max_rows, |preview| {
         usize::try_from(preview.lines).unwrap_or(usize::MAX)
@@ -6160,6 +6209,11 @@ mod disclosure_tests {
         let content: Vec<_> = rows.iter().filter(|row| !row.trim().is_empty()).collect();
         assert_eq!(content.len(), 2, "{rows:?}");
         assert!(content[0].starts_with("▸ "));
+        assert_eq!(
+            content[1].trim(),
+            "line 1",
+            "summary shows output, not its label"
+        );
         for row in &rows {
             assert!(bmux_tui::text_width::display_width(row) <= 60, "{row:?}");
         }

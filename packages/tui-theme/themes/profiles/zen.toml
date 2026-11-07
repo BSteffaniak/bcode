@@ -1,5 +1,5 @@
-# Profile: Focus mode: only what is happening now is open.
 # Profiles set chrome, structure, and containers only, so they combine with any palette.
+description    = "Focus mode: only what is happening now is open."
 display_name   = "Zen (profile)"
 id             = "zen"
 kind           = "profile"

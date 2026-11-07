@@ -220,6 +220,12 @@ impl ThemeDefinition {
             .unwrap_or_else(|| self.id())
     }
 
+    /// Return the optional one-line description shown in pickers.
+    #[must_use]
+    pub fn description(&self) -> Option<&str> {
+        self.raw.description.as_deref()
+    }
+
     /// Return the diagnostic source name.
     #[must_use]
     pub fn source_name(&self) -> &str {
@@ -600,6 +606,8 @@ struct RawTheme {
     kind: ThemeKind,
     #[serde(default)]
     display_name: Option<String>,
+    #[serde(default)]
+    description: Option<String>,
     #[serde(default)]
     extends: Vec<String>,
     #[serde(default)]
