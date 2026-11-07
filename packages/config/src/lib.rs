@@ -2303,7 +2303,7 @@ const fn default_worktree_setup_enabled() -> bool {
 }
 
 /// Renderer-neutral presentation configuration.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, ConfigDoc)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, ConfigDoc)]
 #[config_doc(section = "presentation")]
 pub struct PresentationConfig {
     /// Live text stream presentation configuration.
@@ -2314,6 +2314,12 @@ pub struct PresentationConfig {
     #[config_doc(nested)]
     #[serde(default)]
     pub completion: CompletionConfig,
+    /// Structural presentation rules (`[[presentation.rules]]`): disclosure,
+    /// detail, preview budgets, part visibility, and grouping. Applied after
+    /// theme rules. Presentation only; never affects execution.
+    #[config_doc(value_type = "array")]
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub rules: Vec<bcode_presentation_policy_models::PresentationRule>,
 }
 
 /// Command completion matching and ordering preferences.
@@ -2522,6 +2528,29 @@ pub struct TuiConfig {
     #[config_doc(nested)]
     #[serde(default)]
     pub theme: TuiThemeConfig,
+    /// Terminal color depth: `auto` follows terminal detection.
+    #[serde(default)]
+    pub color_depth: TuiColorDepth,
+    /// Disable animated chrome such as focus sweeps and accent pulses.
+    #[serde(default)]
+    pub reduce_motion: bool,
+}
+
+/// Terminal color depth policy.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, ConfigDocEnum)]
+#[serde(rename_all = "snake_case")]
+pub enum TuiColorDepth {
+    /// Follow terminal capability detection (`NO_COLOR`, `COLORTERM`, `TERM`).
+    #[default]
+    Auto,
+    /// Emit 24-bit colors unchanged.
+    Truecolor,
+    /// Reduce RGB colors to the 256-color palette.
+    Ansi256,
+    /// Reduce colors to the 16 ANSI colors.
+    Ansi16,
+    /// Emit no colors; modifiers only.
+    None,
 }
 
 /// Terminal visual-adapter selection configuration.
@@ -2691,6 +2720,10 @@ pub struct TuiThemeConfig {
     /// Ordered theme overlays applied after the selected base theme.
     #[serde(default)]
     pub overlays: Vec<String>,
+    /// Profile (chrome, structure, and containers) applied over the selected
+    /// palette before other overlays, for example `riced` or `bare`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub profile: Option<String>,
     /// Light/dark variant selection behavior.
     #[serde(default)]
     pub variant: TuiThemeVariant,
@@ -2712,6 +2745,17 @@ pub struct TuiThemeConfig {
 }
 
 impl TuiThemeConfig {
+    /// Overlays in application order: the profile first, then explicit overlays.
+    #[must_use]
+    pub fn effective_overlays(&self) -> Vec<String> {
+        self.profile
+            .iter()
+            .filter(|profile| !profile.trim().is_empty())
+            .chain(&self.overlays)
+            .cloned()
+            .collect()
+    }
+
     /// Return the effective accent transition duration in milliseconds.
     #[must_use]
     pub const fn effective_accent_transition_ms(&self) -> u64 {
@@ -2728,6 +2772,7 @@ impl Default for TuiThemeConfig {
         Self {
             name: default_tui_theme_name(),
             overlays: Vec::new(),
+            profile: None,
             variant: TuiThemeVariant::Auto,
             paths: Vec::new(),
             agent_accent: TuiAgentAccentPolicy::AgentWithThemeFallback,
@@ -6797,6 +6842,8 @@ struct TuiState {
 struct TuiThemeState {
     #[serde(default)]
     name: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    profile: Option<String>,
     #[serde(flatten)]
     extra: BTreeMap<String, toml::Value>,
 }
@@ -6805,6 +6852,8 @@ struct TuiThemeState {
 struct TuiPresentationState {
     #[serde(default)]
     streaming: Option<TuiStreamingState>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    rules: Vec<bcode_presentation_policy_models::PresentationRule>,
     #[serde(flatten)]
     extra: BTreeMap<String, toml::Value>,
 }
@@ -6895,6 +6944,52 @@ pub fn set_tui_theme_selection(name: &str) -> Result<PathBuf, ConfigError> {
     write_tui_state(&path, &state)
 }
 
+/// Load the globally selected interactive TUI profile.
+///
+/// # Errors
+///
+/// Returns an error when the state file exists but cannot be read or parsed.
+pub fn load_tui_profile_selection() -> Result<Option<String>, ConfigError> {
+    load_tui_profile_selection_from(&default_tui_state_path())
+}
+
+/// Load the interactive TUI profile from a specific state path.
+///
+/// # Errors
+///
+/// Returns an error when the state file exists but cannot be read or parsed.
+pub fn load_tui_profile_selection_from(path: &Path) -> Result<Option<String>, ConfigError> {
+    Ok(load_tui_state_from(path)?.theme.profile)
+}
+
+/// Persist (or clear, with `None`) the interactive TUI profile in user state.
+///
+/// # Errors
+///
+/// Returns an error when the name is empty or the state cannot be written.
+pub fn set_tui_profile_selection(name: Option<&str>) -> Result<PathBuf, ConfigError> {
+    set_tui_profile_selection_at(&default_tui_state_path(), name)
+}
+
+/// Persist (or clear) the interactive TUI profile at a specific state path.
+///
+/// # Errors
+///
+/// Returns an error when the name is empty or the state cannot be written.
+pub fn set_tui_profile_selection_at(
+    path: &Path,
+    name: Option<&str>,
+) -> Result<PathBuf, ConfigError> {
+    if name.is_some_and(|name| name.trim().is_empty()) {
+        return Err(ConfigError::Composition {
+            message: "profile name must not be empty".to_owned(),
+        });
+    }
+    let mut state = load_tui_state_from(path)?;
+    state.theme.profile = name.map(str::to_owned);
+    write_tui_state(path, &state)
+}
+
 /// Clear the globally selected interactive TUI theme.
 ///
 /// # Errors
@@ -6955,6 +7050,72 @@ pub fn clear_tui_streaming_presentation_override() -> Result<PathBuf, ConfigErro
     let path = default_tui_state_path();
     let mut state = load_tui_state_from(&path)?;
     state.presentation.streaming = None;
+    write_tui_state(&path, &state)
+}
+
+/// Maximum interactive structural rules retained in user state.
+pub const MAX_TUI_PRESENTATION_RULES: usize = 128;
+
+/// Load interactive structural presentation rules from user state.
+///
+/// # Errors
+///
+/// Returns an error when the state file exists but cannot be read or parsed.
+pub fn load_tui_presentation_rules()
+-> Result<Vec<bcode_presentation_policy_models::PresentationRule>, ConfigError> {
+    load_tui_presentation_rules_from(&default_tui_state_path())
+}
+
+/// Load interactive structural presentation rules from a specific state path.
+///
+/// # Errors
+///
+/// Returns an error when the state file exists but cannot be read or parsed.
+pub fn load_tui_presentation_rules_from(
+    path: &Path,
+) -> Result<Vec<bcode_presentation_policy_models::PresentationRule>, ConfigError> {
+    Ok(load_tui_state_from(path)?.presentation.rules)
+}
+
+/// Persist one interactive structural rule to user state, replacing any rule
+/// with an identical matcher. Declarative configuration is never modified.
+///
+/// # Errors
+///
+/// Returns an error when the state cannot be read or written.
+pub fn add_tui_presentation_rule(
+    rule: bcode_presentation_policy_models::PresentationRule,
+) -> Result<PathBuf, ConfigError> {
+    add_tui_presentation_rule_at(&default_tui_state_path(), rule)
+}
+
+/// Persist one interactive structural rule to a specific state path.
+///
+/// # Errors
+///
+/// Returns an error when the state cannot be read or written.
+pub fn add_tui_presentation_rule_at(
+    path: &Path,
+    rule: bcode_presentation_policy_models::PresentationRule,
+) -> Result<PathBuf, ConfigError> {
+    let mut state = load_tui_state_from(path)?;
+    let rules = &mut state.presentation.rules;
+    rules.retain(|existing| existing.matcher != rule.matcher);
+    rules.push(rule);
+    let excess = rules.len().saturating_sub(MAX_TUI_PRESENTATION_RULES);
+    rules.drain(..excess);
+    write_tui_state(path, &state)
+}
+
+/// Clear interactive structural rules from user state.
+///
+/// # Errors
+///
+/// Returns an error when the state cannot be read or written.
+pub fn clear_tui_presentation_rules() -> Result<PathBuf, ConfigError> {
+    let path = default_tui_state_path();
+    let mut state = load_tui_state_from(&path)?;
+    state.presentation.rules.clear();
     write_tui_state(&path, &state)
 }
 
@@ -7339,7 +7500,7 @@ fn config_to_toml(config: &BcodeConfig) -> String {
     write_invariants_toml(&mut output, &config.invariants);
     write_system_prompt_toml(&mut output, &config.system_prompt);
     write_prompt_profile_toml(&mut output, &config.prompt_profile);
-    write_presentation_toml(&mut output, config.presentation);
+    write_presentation_toml(&mut output, &config.presentation);
     write_tui_toml(&mut output, &config.tui);
     write_client_toml(&mut output, &config.client);
     write_state_toml(&mut output, &config.state);
@@ -8124,10 +8285,11 @@ const fn system_prompt_mode_name(mode: SystemPromptMode) -> &'static str {
     }
 }
 
-fn write_presentation_toml(output: &mut String, presentation: PresentationConfig) {
-    if presentation == PresentationConfig::default() {
+fn write_presentation_toml(output: &mut String, presentation: &PresentationConfig) {
+    if *presentation == PresentationConfig::default() {
         return;
     }
+    write_presentation_rules_toml(output, &presentation.rules);
     if presentation.completion != CompletionConfig::default() {
         let completion = presentation.completion;
         writeln!(output, "[presentation.completion]").expect("writing to string should not fail");
@@ -8185,6 +8347,29 @@ const fn streaming_curve_name(curve: StreamingInterpolationCurveConfig) -> &'sta
     }
 }
 
+fn write_presentation_rules_toml(
+    output: &mut String,
+    rules: &[bcode_presentation_policy_models::PresentationRule],
+) {
+    #[derive(Serialize)]
+    struct Rules<'a> {
+        rules: &'a [bcode_presentation_policy_models::PresentationRule],
+    }
+    #[derive(Serialize)]
+    struct Section<'a> {
+        presentation: Rules<'a>,
+    }
+    if rules.is_empty() {
+        return;
+    }
+    let encoded = toml::to_string(&Section {
+        presentation: Rules { rules },
+    })
+    .expect("presentation rules are TOML-representable");
+    output.push_str(&encoded);
+    output.push('\n');
+}
+
 fn write_tui_toml(output: &mut String, tui: &TuiConfig) {
     write_tui_theme_toml(output, &tui.theme);
     if !tui.keybindings.is_empty() {
@@ -8234,6 +8419,10 @@ fn write_tui_theme_toml(output: &mut String, theme: &TuiThemeConfig) {
     writeln!(output, "[tui.theme]").expect("writing to string should not fail");
     writeln!(output, "name = {}", toml_string(&theme.name))
         .expect("writing to string should not fail");
+    if let Some(profile) = &theme.profile {
+        writeln!(output, "profile = {}", toml_string(profile))
+            .expect("writing to string should not fail");
+    }
     if !theme.overlays.is_empty() {
         write!(output, "overlays = [").expect("writing to string should not fail");
         for (index, overlay) in theme.overlays.iter().enumerate() {
@@ -13915,5 +14104,47 @@ extends = ["a"]
             .as_nanos();
         let id = NEXT_TEMP_DIR_ID.fetch_add(1, Ordering::Relaxed);
         std::env::temp_dir().join(format!("bcode-config-test-{nanos}-{id}"))
+    }
+}
+
+#[cfg(test)]
+mod presentation_rule_state_tests {
+    use super::*;
+
+    #[test]
+    fn interactive_rules_replace_matching_rules_and_preserve_other_state() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let path = directory.path().join("tui.toml");
+        fs::write(&path, "[theme]\nname = \"nord\"\n").expect("seed state");
+        let rule = |disclosure: &str| -> bcode_presentation_policy_models::PresentationRule {
+            toml::from_str(&format!(
+                "match = {{ kind = \"tool\", tool = \"read\" }}\nset = {{ disclosure = \"{disclosure}\" }}"
+            ))
+            .expect("rule")
+        };
+        add_tui_presentation_rule_at(&path, rule("collapsed")).expect("add");
+        add_tui_presentation_rule_at(&path, rule("expanded")).expect("replace");
+        let rules = load_tui_presentation_rules_from(&path).expect("load");
+        assert_eq!(rules, [rule("expanded")]);
+        assert_eq!(
+            load_tui_theme_selection_from(&path).expect("theme"),
+            Some("nord".to_owned())
+        );
+        set_tui_profile_selection_at(&path, Some("riced")).expect("profile");
+        assert_eq!(
+            load_tui_profile_selection_from(&path).expect("profile"),
+            Some("riced".to_owned())
+        );
+        assert_eq!(
+            load_tui_presentation_rules_from(&path)
+                .expect("rules")
+                .len(),
+            1
+        );
+        set_tui_profile_selection_at(&path, None).expect("clear profile");
+        assert_eq!(
+            load_tui_profile_selection_from(&path).expect("profile"),
+            None
+        );
     }
 }

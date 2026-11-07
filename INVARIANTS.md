@@ -22,7 +22,7 @@ An invariant is a durable condition of a valid product or architecture. Contribu
 
 ## Rendering and frontend boundaries
 
-* **Shared rendering remains renderer-neutral.** Shared application, session-view, and portable rendering layers must not depend on terminal drawing, input, frame, viewport, key, mouse, or BMUX types. Terminal-specific adaptation belongs at the TUI boundary. Behavior shared by multiple frontends must be modeled generically before being adapted by a renderer.
+* **Shared rendering remains renderer-neutral.** Shared application, session-view, and portable rendering layers must not depend on terminal drawing, input, frame, viewport, key, mouse, or BMUX terminal types. The terminal-independent `bmux_color` value and color-math crate is permitted; it must not itself reach terminal crates. Terminal-specific adaptation belongs at the TUI boundary. Behavior shared by multiple frontends must be modeled generically before being adapted by a renderer.
 * **The TUI owns terminal-specific behavior.** Terminal layout, viewport behavior, scroll anchoring, hit testing, cursor behavior, terminal input mapping, frame drawing, and terminal-native plugin surfaces belong in the TUI.
 * **Interactive presentation choices do not mutate declarative configuration.** Themes and other presentation defaults may be declared in configuration, but changes made through an interactive frontend persist only to user state and must not create or modify declarative configuration files.
 * **Shared semantics precede renderer adaptation.** Renderers consume shared semantic session-view contracts and adapt them into native presentation; they must not independently reinterpret raw event logs when a shared semantic projection exists.

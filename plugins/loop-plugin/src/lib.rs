@@ -6278,7 +6278,9 @@ mod tests {
                 link: bcode_plugin_sdk::tui::PluginTuiSyntaxColor::from_tui(Color::Default),
                 raw: bcode_plugin_sdk::tui::PluginTuiSyntaxColor::from_tui(Color::Default),
             },
-        };
+            component: bcode_plugin_sdk::tui::ComponentTheme::terminal_default(),
+        }
+        .with_legacy_component();
         let area = Rect::new(0, 0, 80, 28);
         let mut buffer = bmux_tui::buffer::Buffer::empty(area);
         surface.render_with_theme(

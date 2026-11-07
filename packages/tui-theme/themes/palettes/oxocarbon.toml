@@ -1,0 +1,18 @@
+# Seed palette adapted from the oxocarbon color scheme; see attribution/palettes.md.
+display_name   = "Oxocarbon"
+extends        = ["seeded-base"]
+id             = "oxocarbon"
+schema_version = 2
+
+[palette]
+accent     = "#be95ff"
+background = "#161616"
+blue       = "#78a9ff"
+cyan       = "#33b1ff"
+green      = "#42be65"
+magenta    = "#ff7eb6"
+orange     = "#3ddbd9"
+red        = "#ee5396"
+text       = "#f2f4f8"
+violet     = "#be95ff"
+yellow     = "#ffe97b"

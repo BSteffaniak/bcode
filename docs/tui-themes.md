@@ -16,6 +16,159 @@ component theme alongside the legacy source/diff fields. Plugins may use the gen
 when `PluginTuiTheme::component_theme()` returns `Some`; older or incompatible contexts continue to
 use the legacy fields without changing rendering semantics.
 
+## Palettes, profiles, and schema version 2
+
+A theme has two independent halves:
+
+* a **palette** — colors, written as a handful of seed colors;
+* a **profile** — chrome (borders, focus effects, icons, density, separators,
+  speaker treatment, surface layering, motion) and structure (which tools are
+  collapsed or summarized, preview budgets, part visibility, grouping).
+
+```toml
+[tui.theme]
+name    = "catppuccin-mocha"  # palette (or any complete theme)
+profile = "riced"             # optional; applied before other overlays
+variant = "auto"
+```
+
+Bundled palettes: `catppuccin-mocha` (Latte as its light variant),
+`catppuccin-macchiato`, `catppuccin-frappe`, `catppuccin-latte`, `tokyonight`
+(Day as light), `tokyonight-storm`, `tokyonight-moon`, `gruvbox`,
+`gruvbox-material`, `dracula`, `rose-pine` (Dawn as light), `rose-pine-moon`,
+`kanagawa` (Lotus as light), `kanagawa-dragon`, `everforest`, `one`,
+`solarized`, `github`, `github-dimmed`, `ayu`, `ayu-mirage`, `nightfox`,
+`oxocarbon`, `modus`, `flexoki`, `poimandres`, `vesper`, `melange`, `zenburn`,
+`monokai-classic`, `night-owl`, and the Bcode originals `neon-noir`,
+`phosphor`, `amber`, `paper`, `blueprint`, `aurora`, `ember`, `glacier`, `moss`,
+and `dusk`. Sources and licenses are listed in
+`packages/tui-theme/themes/attribution/palettes.md`.
+
+Bundled profiles:
+
+| Profile | Character |
+|---|---|
+| `bare` | Stays out of the way: no chrome, tools as one-line summaries |
+| `minimal` | Hairline rules, one accent, quiet tools |
+| `structured` | Status bars on tools, framed dialogs |
+| `soft` | Rounded corners, tinted surfaces, roomy padding |
+| `riced` | Gradient focus, Nerd Font icons, powerline separators, framed tool cards |
+| `brutalist` | Heavy rules, hard edges, no motion |
+| `retro` | Double-line frames, ASCII markers |
+| `editorial` | Prose first, tools tucked away |
+| `zen` | Only what is happening now is open |
+| `compact` | No padding, short previews, for small terminals |
+| `accessible` | Explicit frames, verbose labels, no motion |
+
+Curated combinations select both at once: `rice-mocha`, `neon`, `crt`,
+`amber-terminal`, `zen-paper`, `newsroom`, `night-shift`, `quiet`,
+`brutal-modus`, `forest-floor`, and `blueprint-studio`.
+
+### Seed palettes
+
+`schema_version = 2` files may define seed colors and leave roles unset; Bcode
+derives every registered role from the seeds and keeps text, accents, and
+states readable (4.5:1, muted text 3:1) against the background. Seeds are
+`background`, `text`, `accent`, and the hue slots `red`, `green`, `yellow`,
+`blue`, `magenta`, `cyan`, `orange`, `violet` (`info`, `success`, `warning`,
+`error` may override the state hues). Derivation only fills roles that resolve
+exactly from RGB seeds; terminal-owned seeds keep their inherited roles.
+
+```toml
+schema_version = 2
+id             = "my-palette"
+display_name   = "My Palette"
+extends        = ["seeded-base"]
+
+[palette]
+background = "#1a1b26"
+text       = "#c0caf5"
+accent     = "#7aa2f7"
+red        = "#f7768e"
+green      = "#9ece6a"
+yellow     = "#e0af68"
+blue       = "#7aa2f7"
+magenta    = "#bb9af7"
+cyan       = "#7dcfff"
+```
+
+### Color expressions
+
+Palette and style values in schema-v2 files may derive colors:
+`mix(a, b, t)` (`t` is the share of `a`), `lighten(c, t)`, `darken(c, t)`,
+`saturate(c, t)`, `desaturate(c, t)`, `ensure_contrast(fg, bg, ratio)`, and
+`or(a, b, …)` (first argument whose references exist). Math runs in OKLab/OKLCH.
+Applying math to a terminal-owned color warns and keeps the first color.
+
+```toml
+[palette]
+tint = "mix($accent, $background, 0.2)"
+
+[styles."diff.added_row"]
+bg = "mix($green, $background, 0.14)"
+```
+
+### Chrome
+
+```toml
+[chrome.tui]
+borders    = { panel = "rounded", dialog = "thick", tool = "rounded", composer = "rounded" }
+focus      = { effect = "gradient", colors = ["$accent", "$violet"] }
+icons      = "nerd"          # none | unicode | nerd
+density    = "comfortable"   # compact | cozy | comfortable
+separators = { status = "powerline" }  # plain | bar | slant | powerline
+speaker    = "badge"         # prefix | badge | bar | gutter
+surfaces   = "layered"       # flat | layered
+motion     = "subtle"        # none | subtle | full
+```
+
+Focus gradients need two RGB colors; terminal-owned colors keep the focused
+border style. `[tui] reduce_motion = true` disables animated chrome.
+
+### Structural presentation
+
+Themes, configuration, and user state contribute ordered rules. Each rule
+matches unit facts and sets properties; later rules win per property.
+
+```toml
+[[presentation.rules]]
+match = { kind = "tool", tool = ["read", "glob", "grep"], status = "succeeded" }
+set   = { disclosure = "collapsed", group = "consecutive_same_tool" }
+
+[[presentation.rules]]
+match = { kind = "tool", status = ["running", "failed"] }
+set   = { disclosure = "expanded", preview = { lines = 12, keep = "tail" } }
+```
+
+Facts: `kind`, `tool`, `producer`, `schema` (`name/*` matches any version),
+`status`, `is_error`, `turn`, `min_depth`, `lines`, `items`, and plugin facts.
+Properties: `disclosure` (`expanded`, `summary`, `collapsed`, `hidden`),
+`detail`, `preview`, `parts` (`arguments`, `output`, `result`, `timing`, …),
+`group`, `placement`, `container`, and namespaced plugin properties. Unknown
+plugin properties, facts, and parts produce warnings.
+
+Layers apply in this order: theme and profile rules, then
+`[[presentation.rules]]` in Bcode configuration, then interactive defaults in
+user state. Clicking a tool header toggles it for the session; the
+`tui.tools.expandAll`, `tui.tools.collapseAll`, and `tui.tools.resetDisclosure`
+actions apply to every tool. A visibility floor that no theme can lower keeps
+units awaiting a decision expanded and failures at least summarized.
+
+### Unknown roles
+
+Style roles that are neither registered nor in a known domain namespace
+(`git.*`) produce warnings with suggestions, for example
+`unknown style role "bordr.focussed"; did you mean "border.focused"?`.
+
+### Terminal color depth
+
+`[tui] color_depth` is `auto` (default), `truecolor`, `ansi256`, `ansi16`, or
+`none`. `auto` emits colors unchanged except under `NO_COLOR` or `TERM=dumb`,
+where colors are removed and modifiers remain; reduced depths are explicit
+opt-ins because multiplexers and SSH often hide truecolor support. Reduced
+depths map RGB colors to the perceptually nearest palette entry; ANSI and
+indexed colors pass through unchanged.
+
 ## Configuration layers
 
 Bcode merges configuration in this order, with later files overriding earlier fields:
@@ -52,7 +205,7 @@ paths = []
 agent_accent = "agent_with_theme_fallback"
 ```
 
-`auto` uses BMUX-owned bounded terminal capability detection. A trustworthy `COLORFGBG` background index selects the light or dark branch; missing or malformed hints conservatively select dark. Explicit `dark` and `light` always override detection. BMUX also classifies color depth from `NO_COLOR`, `COLORTERM`, and `TERM`; this capability does not change execution semantics or replace terminal-default colors.
+`auto` uses BMUX-owned terminal capability detection. Bcode asks the terminal for its actual default colors (OSC 10/11/4) once at startup; when the terminal answers, its reported background selects the light or dark branch and the theme re-resolves. Terminals that ignore the query never answer and nothing waits on them. Without a reply, a trustworthy `COLORFGBG` background index selects the branch; missing or malformed hints conservatively select dark. The query is only sent when `variant = "auto"`. Explicit `dark` and `light` always override detection. BMUX also classifies color depth from `NO_COLOR`, `COLORTERM`, and `TERM`; this capability does not change execution semantics or replace terminal-default colors.
 
 `paths` may add explicitly authorized theme files or directories. Bcode canonicalizes discovered paths, confines candidates to authorized roots, and bounds candidate count and bytes.
 

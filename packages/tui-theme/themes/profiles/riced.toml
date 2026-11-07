@@ -1,0 +1,75 @@
+# Profile: Everything on display: gradient focus, Nerd Font icons, powerline separators, framed tool cards.
+# Profiles set chrome, structure, and containers only, so they combine with any palette.
+display_name   = "Riced (profile)"
+id             = "riced"
+kind           = "profile"
+schema_version = 2
+
+[chrome.tui]
+borders = { panel = "rounded", dialog = "thick", tool = "rounded", composer = "rounded" }
+density = "comfortable"
+focus = { effect = "gradient", colors = [
+    "$accent",
+    "or($violet, $magenta, $cyan, $accent)",
+] }
+icons = "nerd"
+motion = "subtle"
+separators = { status = "powerline" }
+speaker = "badge"
+surfaces = "layered"
+
+[[presentation.rules]]
+match = { kind = "tool" }
+set   = { disclosure = "expanded", detail = "verbose" }
+
+[containers."transcript.user"]
+border    = "left"
+layout    = "left_bar"
+padding_x = 1
+width     = "full"
+
+[containers."transcript.assistant"]
+layout    = "plain"
+padding_x = 1
+
+[containers."tool.requested"]
+border    = "all"
+layout    = "panel"
+padding_x = 1
+width     = "full"
+
+[containers."tool.running"]
+border    = "all"
+layout    = "panel"
+padding_x = 1
+width     = "full"
+
+[containers."tool.waiting"]
+border    = "all"
+layout    = "panel"
+padding_x = 1
+width     = "full"
+
+[containers."tool.succeeded"]
+border    = "all"
+layout    = "panel"
+padding_x = 1
+width     = "full"
+
+[containers."tool.failed"]
+border    = "all"
+layout    = "panel"
+padding_x = 1
+width     = "full"
+
+[containers."tool.cancelled"]
+border    = "all"
+layout    = "panel"
+padding_x = 1
+width     = "full"
+
+[containers."tool.timed_out"]
+border    = "all"
+layout    = "panel"
+padding_x = 1
+width     = "full"

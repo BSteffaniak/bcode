@@ -1,0 +1,17 @@
+# Seed palette adapted from the ayu color scheme; see attribution/palettes.md.
+display_name   = "Ayu Mirage"
+extends        = ["seeded-base"]
+id             = "ayu-mirage"
+schema_version = 2
+
+[palette]
+accent     = "#ffcc66"
+background = "#1f2430"
+blue       = "#73d0ff"
+cyan       = "#95e6cb"
+green      = "#d5ff80"
+magenta    = "#dfbfff"
+orange     = "#ffad66"
+red        = "#ff6666"
+text       = "#cccac2"
+yellow     = "#ffd173"

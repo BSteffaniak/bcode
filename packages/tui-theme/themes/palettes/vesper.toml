@@ -1,0 +1,17 @@
+# Seed palette adapted from the vesper color scheme; see attribution/palettes.md.
+display_name   = "Vesper"
+extends        = ["seeded-base"]
+id             = "vesper"
+schema_version = 2
+
+[palette]
+accent     = "#ffc799"
+background = "#101010"
+blue       = "#a0b8d8"
+cyan       = "#99ffe4"
+green      = "#99ffe4"
+magenta    = "#e0a0d0"
+orange     = "#ffc799"
+red        = "#ff8080"
+text       = "#ffffff"
+yellow     = "#ffc799"

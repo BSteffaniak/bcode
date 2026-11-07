@@ -452,6 +452,16 @@ pub struct BmuxApp {
     agent_metadata_hydration: AgentMetadataHydration,
     target_theme: ResolvedTheme,
     presented_theme: PresentedTheme,
+    /// Structural presentation policy and per-item disclosure overrides.
+    structure: super::structure::StructureState,
+    /// Theme-contributed structural rule layers from the last theme resolution.
+    theme_structure_layers: Vec<bcode_presentation_policy::models::RuleLayer>,
+    /// Renderer-neutral configured structural rules.
+    configured_structure_rules: Vec<bcode_presentation_policy::models::PresentationRule>,
+    /// Interactive structural rules loaded from user state.
+    user_structure_rules: Vec<bcode_presentation_policy::models::PresentationRule>,
+    /// Whether the terminal color query has been written.
+    terminal_color_query_sent: bool,
     theme_catalog: Option<DiscoveredThemes>,
     theme_transition: ThemeTransitionState,
     theme_preview_id: Option<String>,
@@ -697,6 +707,11 @@ impl BmuxApp {
             agent_metadata_hydration: AgentMetadataHydration::Pending,
             target_theme: *initial_theme,
             presented_theme: (*initial_theme).into(),
+            structure: super::structure::StructureState::default(),
+            theme_structure_layers: Vec::new(),
+            configured_structure_rules: Vec::new(),
+            user_structure_rules: Vec::new(),
+            terminal_color_query_sent: false,
             theme_catalog: None,
             theme_transition: ThemeTransitionState::new(initial_theme.accent, now),
             theme_preview_id: None,
@@ -2492,7 +2507,7 @@ impl BmuxApp {
         &mut self,
         theme_id: &str,
     ) -> Option<ResolvedThemeDefinition> {
-        let overlays = self.tui_config.theme.overlays.clone();
+        let overlays = self.tui_config.theme.effective_overlays();
         let variant = super::theme::resolve_variant_for_config(self.tui_config.theme.variant);
         self.theme_catalog()?
             .catalog
@@ -2602,9 +2617,186 @@ impl BmuxApp {
         true
     }
 
+    /// Request the terminal color query once, only when the theme variant
+    /// follows the terminal (`auto`); returns true when it should be written.
+    pub fn take_terminal_color_query(&mut self) -> bool {
+        self.tui_config.theme.variant == bcode_config::TuiThemeVariant::Auto
+            && !std::mem::replace(&mut self.terminal_color_query_sent, true)
+    }
+
+    /// Re-resolve the theme after the terminal reported its colors; returns
+    /// whether the presented theme changed.
+    pub fn refresh_terminal_colors(&mut self) -> bool {
+        let before = self.target_theme.fingerprint;
+        self.invalidate_theme_catalog();
+        self.sync_theme_target(Instant::now());
+        self.target_theme.fingerprint != before
+    }
+
+    /// Select (or clear) the profile overlay; returns false for unknown profiles.
+    pub fn apply_profile(&mut self, profile: Option<&str>) -> bool {
+        if let Some(profile) = profile {
+            let known = self.theme_catalog().is_some_and(|discovered| {
+                discovered
+                    .catalog
+                    .definition(profile)
+                    .is_some_and(|definition| {
+                        definition.kind() == super::theme::definition::ThemeKind::Profile
+                    })
+            });
+            if !known {
+                return false;
+            }
+        }
+        self.tui_config.theme.profile = profile.map(str::to_owned);
+        self.sync_theme_target(Instant::now());
+        true
+    }
+
     /// Apply renderer-neutral presentation configuration.
     pub fn apply_presentation_config(&mut self, config: bcode_config::PresentationConfig) -> bool {
-        self.apply_streaming_presentation_policy(config.streaming.policy())
+        let streaming = self.apply_streaming_presentation_policy(config.streaming.policy());
+        self.configured_structure_rules = config.rules;
+        let structure = self.recompile_structure();
+        streaming || structure
+    }
+
+    /// Recompile structural presentation from theme, configuration, and user-state layers.
+    fn recompile_structure(&mut self) -> bool {
+        let mut layers = self.theme_structure_layers.clone();
+        if !self.configured_structure_rules.is_empty() {
+            layers.push(bcode_presentation_policy::models::RuleLayer {
+                source: bcode_presentation_policy::models::LayerSource::Config,
+                rules: self.configured_structure_rules.clone(),
+            });
+        }
+        if !self.user_structure_rules.is_empty() {
+            layers.push(super::structure::user_state_layer(
+                self.user_structure_rules.clone(),
+            ));
+        }
+        self.structure.set_layers(&layers)
+    }
+
+    /// Apply renderer-neutral structural rules from declarative configuration.
+    pub fn apply_configured_structure_rules(
+        &mut self,
+        rules: Vec<bcode_presentation_policy::models::PresentationRule>,
+    ) -> bool {
+        if rules == self.configured_structure_rules {
+            return false;
+        }
+        self.configured_structure_rules = rules;
+        self.recompile_structure()
+    }
+
+    /// Apply interactive structural rules loaded from user state.
+    pub fn apply_user_structure_rules(
+        &mut self,
+        rules: Vec<bcode_presentation_policy::models::PresentationRule>,
+    ) -> bool {
+        if rules == self.user_structure_rules {
+            return false;
+        }
+        self.user_structure_rules = rules;
+        self.recompile_structure()
+    }
+
+    /// Rule that makes the disclosure of `item_id`'s tool the user's default.
+    ///
+    /// Returns `None` for items without a named tool. Persisting the rule is
+    /// the caller's responsibility (user state only, never configuration).
+    #[must_use]
+    pub fn default_disclosure_rule(
+        &self,
+        item_id: u64,
+    ) -> Option<bcode_presentation_policy::models::PresentationRule> {
+        let item = self
+            .transcript()
+            .iter()
+            .find(|item| item.id().get() == item_id)?;
+        let facts = super::structure::unit_facts(item)?;
+        let tool = facts.tool?;
+        let disclosure = self.structure.snapshot().presentation(item)?.disclosure;
+        let mut rule = bcode_presentation_policy::models::PresentationRule::default();
+        rule.matcher
+            .kind
+            .0
+            .push(bcode_presentation_policy::models::UnitKind::Tool);
+        rule.matcher.tool.0.push(tool);
+        rule.set.disclosure = Some(disclosure);
+        Some(rule)
+    }
+
+    /// Snapshot of structural presentation for row generation.
+    #[must_use]
+    pub fn structure_snapshot(&self) -> super::structure::StructureSnapshot {
+        self.structure.snapshot()
+    }
+
+    /// Refresh turn recency from the resident transcript.
+    pub fn refresh_structure_turns(&mut self) {
+        let turns = super::structure::TurnIndex::from_items(self.transcript().iter());
+        self.structure.set_turns(turns);
+    }
+
+    /// Structural presentation state.
+    #[must_use]
+    pub const fn structure(&self) -> &super::structure::StructureState {
+        &self.structure
+    }
+
+    /// Toggle the disclosure of the transcript item with `item_id`.
+    pub fn toggle_item_disclosure(&mut self, item_id: u64) -> bool {
+        let Some(index) = self
+            .transcript()
+            .iter()
+            .position(|item| item.id().get() == item_id)
+        else {
+            return false;
+        };
+        let Some(item) = self.transcript().get(index).cloned() else {
+            return false;
+        };
+        let Some(disclosure) = self.structure.toggle(&item) else {
+            return false;
+        };
+        self.preserve_transcript_anchor_for_disclosure();
+        self.mark_transcript_item_dirty(index);
+        self.set_status(format!("Tool {}", disclosure_label(disclosure)));
+        true
+    }
+
+    /// Drop manual disclosure toggles, returning to theme and configured defaults.
+    pub fn reset_disclosure(&mut self) -> bool {
+        if !self.structure.clear_overrides() {
+            return false;
+        }
+        self.preserve_transcript_anchor_for_disclosure();
+        self.transcript_layout = TranscriptLayoutCache::default();
+        self.set_status("Tool disclosure reset to defaults".to_owned());
+        true
+    }
+
+    /// Expand or collapse every tool in the transcript.
+    pub fn set_all_disclosure(
+        &mut self,
+        disclosure: bcode_presentation_policy::models::Disclosure,
+    ) -> bool {
+        let items: Vec<(usize, TranscriptItem)> =
+            self.transcript().iter().cloned().enumerate().collect();
+        let changed = self
+            .structure
+            .set_all(items.iter().map(|(index, item)| (*index, item)), disclosure);
+        if changed.is_empty() {
+            return false;
+        }
+        self.preserve_transcript_anchor_for_disclosure();
+        for index in changed {
+            self.mark_transcript_item_dirty(index);
+        }
+        self.set_status(format!("All tools {}", disclosure_label(disclosure)));
+        true
     }
 
     /// Apply one normalized renderer-neutral streaming-presentation policy.
@@ -2755,8 +2947,12 @@ impl BmuxApp {
     }
 
     fn sync_theme_target(&mut self, now: Instant) {
-        let target = super::theme::resolve_theme(self);
+        let (target, layers) = super::theme::resolve_theme_with_structure(self);
         self.target_theme = target;
+        if layers != self.theme_structure_layers {
+            self.theme_structure_layers = layers;
+            self.recompile_structure();
+        }
         self.theme_transition
             .set_target(target.accent, &self.tui_config.theme, now);
         self.update_theme_animation(now);
@@ -11872,4 +12068,16 @@ enum ChildPanelPresentation {
     Hidden,
     Composer,
     Monitor,
+}
+
+const fn disclosure_label(
+    disclosure: bcode_presentation_policy::models::Disclosure,
+) -> &'static str {
+    use bcode_presentation_policy::models::Disclosure;
+    match disclosure {
+        Disclosure::Expanded => "expanded",
+        Disclosure::Summary => "summarized",
+        Disclosure::Collapsed => "collapsed",
+        Disclosure::Hidden => "hidden",
+    }
 }

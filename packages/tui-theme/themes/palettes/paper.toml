@@ -1,0 +1,33 @@
+# Original Bcode palette.
+display_name   = "Paper"
+extends        = ["seeded-base"]
+id             = "paper"
+schema_version = 2
+
+[palette]
+accent     = "#8fa6ff"
+background = "#262420"
+blue       = "#8fa6ff"
+cyan       = "#7fc8d0"
+green      = "#8fcf9a"
+magenta    = "#d79ad2"
+orange     = "#e8a06a"
+red        = "#ff8a7a"
+text       = "#ece6da"
+violet     = "#b39dff"
+yellow     = "#e6c26a"
+
+[variants.dark]
+
+[variants.light.palette]
+accent     = "#2f4bd6"
+background = "#f6f1e7"
+blue       = "#2f4bd6"
+cyan       = "#1f6f78"
+green      = "#2e6b3a"
+magenta    = "#8e3b8a"
+orange     = "#b0531c"
+red        = "#b3261e"
+text       = "#2b2a28"
+violet     = "#5b3fb8"
+yellow     = "#8a6100"

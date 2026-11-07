@@ -107,6 +107,9 @@ fn handle_skill_picker_action(
         | BmuxAction::MarkdownFocusPrevious
         | BmuxAction::MarkdownActivate
         | BmuxAction::MarkdownCopyDestination
+        | BmuxAction::ToolsExpandAll
+        | BmuxAction::ToolsCollapseAll
+        | BmuxAction::ToolsResetDisclosure
         | BmuxAction::ThinkingEffortCycle
         | BmuxAction::TranscriptPageUp
         | BmuxAction::TranscriptPageDown

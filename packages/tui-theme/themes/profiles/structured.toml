@@ -1,0 +1,63 @@
+# Profile: Classic panels: status bars on tools, framed dialogs.
+# Profiles set chrome, structure, and containers only, so they combine with any palette.
+display_name   = "Structured (profile)"
+id             = "structured"
+kind           = "profile"
+schema_version = 2
+
+[chrome.tui]
+borders    = { panel = "single", dialog = "single", tool = "left", composer = "single" }
+density    = "cozy"
+icons      = "unicode"
+motion     = "subtle"
+separators = { status = "bar" }
+speaker    = "prefix"
+surfaces   = "layered"
+
+[containers."transcript.user"]
+layout = "plain"
+
+[containers."transcript.assistant"]
+layout = "plain"
+
+[containers."tool.requested"]
+border    = "left"
+layout    = "left_bar"
+padding_x = 1
+width     = "full"
+
+[containers."tool.running"]
+border    = "left"
+layout    = "left_bar"
+padding_x = 1
+width     = "full"
+
+[containers."tool.waiting"]
+border    = "left"
+layout    = "left_bar"
+padding_x = 1
+width     = "full"
+
+[containers."tool.succeeded"]
+border    = "left"
+layout    = "left_bar"
+padding_x = 1
+width     = "full"
+
+[containers."tool.failed"]
+border    = "all"
+layout    = "panel"
+padding_x = 1
+width     = "full"
+
+[containers."tool.cancelled"]
+border    = "left"
+layout    = "left_bar"
+padding_x = 1
+width     = "full"
+
+[containers."tool.timed_out"]
+border    = "left"
+layout    = "left_bar"
+padding_x = 1
+width     = "full"

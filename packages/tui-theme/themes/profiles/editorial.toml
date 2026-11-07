@@ -1,0 +1,59 @@
+# Profile: Typographic and Markdown-forward: prose first, tools tucked away.
+# Profiles set chrome, structure, and containers only, so they combine with any palette.
+display_name   = "Editorial (profile)"
+id             = "editorial"
+kind           = "profile"
+schema_version = 2
+
+[chrome.tui]
+borders    = { panel = "none", dialog = "single", tool = "none", composer = "single" }
+density    = "comfortable"
+icons      = "unicode"
+motion     = "subtle"
+separators = { status = "plain" }
+speaker    = "gutter"
+surfaces   = "flat"
+
+[[presentation.rules]]
+match = { kind = "tool" }
+set   = { disclosure = "collapsed", group = "consecutive_tools" }
+
+[[presentation.rules]]
+match = { kind = "tool", status = ["running", "waiting"] }
+set   = { disclosure = "summary" }
+
+[containers."transcript.user"]
+layout    = "plain"
+padding_x = 2
+
+[containers."transcript.assistant"]
+layout    = "plain"
+padding_x = 2
+
+[containers."tool.requested"]
+layout    = "plain"
+padding_x = 2
+
+[containers."tool.running"]
+layout    = "plain"
+padding_x = 2
+
+[containers."tool.waiting"]
+layout    = "plain"
+padding_x = 2
+
+[containers."tool.succeeded"]
+layout    = "plain"
+padding_x = 2
+
+[containers."tool.failed"]
+layout    = "plain"
+padding_x = 2
+
+[containers."tool.cancelled"]
+layout    = "plain"
+padding_x = 2
+
+[containers."tool.timed_out"]
+layout    = "plain"
+padding_x = 2

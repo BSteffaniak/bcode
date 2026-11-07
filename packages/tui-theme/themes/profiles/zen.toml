@@ -1,0 +1,54 @@
+# Profile: Focus mode: only what is happening now is open.
+# Profiles set chrome, structure, and containers only, so they combine with any palette.
+display_name   = "Zen (profile)"
+id             = "zen"
+kind           = "profile"
+schema_version = 2
+
+[chrome.tui]
+borders    = { panel = "none", dialog = "rounded", tool = "none", composer = "rounded" }
+density    = "comfortable"
+icons      = "unicode"
+motion     = "none"
+separators = { status = "plain" }
+speaker    = "prefix"
+surfaces   = "flat"
+
+[[presentation.rules]]
+match = { kind = "tool" }
+set   = { disclosure = "collapsed", detail = "minimal", parts = { timing = false } }
+
+[[presentation.rules]]
+match = { kind = "tool", status = ["running", "waiting"] }
+set   = { disclosure = "summary" }
+
+[[presentation.rules]]
+match = { turn = ["previous", "older"] }
+set   = { disclosure = "collapsed" }
+
+[containers."transcript.user"]
+layout = "plain"
+
+[containers."transcript.assistant"]
+layout = "plain"
+
+[containers."tool.requested"]
+layout = "plain"
+
+[containers."tool.running"]
+layout = "plain"
+
+[containers."tool.waiting"]
+layout = "plain"
+
+[containers."tool.succeeded"]
+layout = "plain"
+
+[containers."tool.failed"]
+layout = "plain"
+
+[containers."tool.cancelled"]
+layout = "plain"
+
+[containers."tool.timed_out"]
+layout = "plain"

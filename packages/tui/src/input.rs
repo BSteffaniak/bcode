@@ -133,6 +133,19 @@ fn exit_or_clear_composer(app: &mut BmuxApp) -> KeyOutcome {
     }
 }
 
+fn tool_disclosure_action(app: &mut BmuxApp, action: BmuxAction) -> KeyOutcome {
+    use bcode_presentation_policy::models::Disclosure;
+    let redraw = match action {
+        BmuxAction::ToolsExpandAll => app.set_all_disclosure(Disclosure::Expanded),
+        BmuxAction::ToolsCollapseAll => app.set_all_disclosure(Disclosure::Collapsed),
+        _ => app.reset_disclosure(),
+    };
+    KeyOutcome {
+        redraw,
+        request: KeyRequest::None,
+    }
+}
+
 pub fn handle_chat_action(app: &mut BmuxApp, action: Option<BmuxAction>) -> Option<KeyOutcome> {
     use bmux_tui_components::text_input::TextInputHistoryAction;
     let outcome = match action? {
@@ -160,6 +173,9 @@ pub fn handle_chat_action(app: &mut BmuxApp, action: Option<BmuxAction>) -> Opti
         | BmuxAction::MarkdownCopyDestination => markdown_action(app, action?),
         BmuxAction::InputHistoryPrevious => history_previous(app),
         BmuxAction::InputHistoryNext => history_next(app),
+        tools @ (BmuxAction::ToolsExpandAll
+        | BmuxAction::ToolsCollapseAll
+        | BmuxAction::ToolsResetDisclosure) => tool_disclosure_action(app, tools),
         BmuxAction::TranscriptPageUp => KeyOutcome {
             redraw: app.scroll_transcript_up(TRANSCRIPT_PAGE_ROWS),
             request: KeyRequest::None,

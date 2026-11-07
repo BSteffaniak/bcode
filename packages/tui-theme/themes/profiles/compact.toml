@@ -1,0 +1,50 @@
+# Profile: Built for small terminals: no padding, short previews.
+# Profiles set chrome, structure, and containers only, so they combine with any palette.
+display_name   = "Compact (profile)"
+id             = "compact"
+kind           = "profile"
+schema_version = 2
+
+[chrome.tui]
+borders    = { panel = "single", dialog = "single", tool = "none", composer = "single" }
+density    = "compact"
+icons      = "unicode"
+motion     = "none"
+separators = { status = "plain" }
+speaker    = "prefix"
+surfaces   = "flat"
+
+[[presentation.rules]]
+match = { kind = "tool" }
+set   = { disclosure = "summary", preview = { lines = 8 }, parts = { timing = false } }
+
+[[presentation.rules]]
+match = { kind = "tool", status = ["running", "waiting"] }
+set   = { disclosure = "expanded" }
+
+[containers."transcript.user"]
+layout = "plain"
+
+[containers."transcript.assistant"]
+layout = "plain"
+
+[containers."tool.requested"]
+layout = "plain"
+
+[containers."tool.running"]
+layout = "plain"
+
+[containers."tool.waiting"]
+layout = "plain"
+
+[containers."tool.succeeded"]
+layout = "plain"
+
+[containers."tool.failed"]
+layout = "plain"
+
+[containers."tool.cancelled"]
+layout = "plain"
+
+[containers."tool.timed_out"]
+layout = "plain"

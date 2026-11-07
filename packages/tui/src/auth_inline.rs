@@ -94,6 +94,7 @@ fn run<T>(
         theme.focused = theme.selection;
         theme.surfaces.raised = bmux_tui::style::Style::default();
         theme.accent = bmux_tui::style::Color::Default;
+        theme.component = bmux_tui_components::theme::ComponentTheme::terminal_default();
     }
     let mut terminal = InlineTerminal::enter(io::stderr())?;
     let mut previous_size = None;

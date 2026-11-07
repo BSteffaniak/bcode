@@ -3671,6 +3671,7 @@ mod tests {
         let mut theme = terminal_native_theme();
         theme.canvas = Style::new().bg(Color::Blue);
         theme.text = Style::new().fg(Color::BrightWhite);
+        let theme = theme.with_legacy_component();
 
         let area = Rect::new(0, 0, 100, 24);
         let mut buffer = Buffer::empty(area);
@@ -3744,7 +3745,9 @@ mod tests {
                 link: syntax_color,
                 raw: syntax_color,
             },
+            component: bcode_plugin_sdk::tui::ComponentTheme::terminal_default(),
         }
+        .with_legacy_component()
     }
 
     #[test]

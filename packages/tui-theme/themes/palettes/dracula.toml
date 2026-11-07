@@ -1,0 +1,31 @@
+# Seed palette adapted from the dracula color scheme; see attribution/palettes.md.
+display_name   = "Dracula"
+extends        = ["seeded-base"]
+id             = "dracula"
+schema_version = 2
+
+[palette]
+accent     = "#bd93f9"
+background = "#282a36"
+blue       = "#bd93f9"
+cyan       = "#8be9fd"
+green      = "#50fa7b"
+magenta    = "#ff79c6"
+orange     = "#ffb86c"
+red        = "#ff5555"
+text       = "#f8f8f2"
+yellow     = "#f1fa8c"
+
+[variants.dark]
+
+[variants.light.palette]
+accent     = "#644ac9"
+background = "#fffbeb"
+blue       = "#644ac9"
+cyan       = "#036a96"
+green      = "#14710a"
+magenta    = "#a3144d"
+orange     = "#a34d14"
+red        = "#cb3a2a"
+text       = "#1f1f1f"
+yellow     = "#846e15"

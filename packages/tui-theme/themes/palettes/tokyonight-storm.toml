@@ -1,0 +1,18 @@
+# Seed palette adapted from the tokyonight color scheme; see attribution/palettes.md.
+display_name   = "Tokyo Night Storm"
+extends        = ["seeded-base"]
+id             = "tokyonight-storm"
+schema_version = 2
+
+[palette]
+accent     = "#7aa2f7"
+background = "#24283b"
+blue       = "#7aa2f7"
+cyan       = "#7dcfff"
+green      = "#9ece6a"
+magenta    = "#bb9af7"
+orange     = "#ff9e64"
+red        = "#f7768e"
+text       = "#c0caf5"
+violet     = "#9d7cd8"
+yellow     = "#e0af68"

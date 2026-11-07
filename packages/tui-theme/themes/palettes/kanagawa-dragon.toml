@@ -1,0 +1,17 @@
+# Seed palette adapted from the kanagawa color scheme; see attribution/palettes.md.
+display_name   = "Kanagawa Dragon"
+extends        = ["seeded-base"]
+id             = "kanagawa-dragon"
+schema_version = 2
+
+[palette]
+accent     = "#8ba4b0"
+background = "#181616"
+blue       = "#8ba4b0"
+cyan       = "#8ea4a2"
+green      = "#8a9a7b"
+magenta    = "#a292a3"
+orange     = "#b6927b"
+red        = "#c4746e"
+text       = "#c5c9c5"
+yellow     = "#c4b28a"

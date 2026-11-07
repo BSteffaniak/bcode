@@ -17,6 +17,8 @@ dev-only edges, includes build edges, and reports a dependency path for each vio
   implementations, or terminal renderers.
 * The router engine cannot reach concrete router services or Bcode hosts.
 * Portable session-view and HyperChad packages cannot reach terminal renderers.
+  `bmux_color` is not a terminal renderer; portable packages may depend on it, and any path from it
+  to `bmux_tui*` fails this check transitively.
 * Minimal app and CLI profiles exclude heavyweight optional implementations; distribution and
   web-enabled profiles include their intended implementations.
 * The bundled-plugin registry without features excludes search backends.

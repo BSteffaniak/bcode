@@ -27,6 +27,7 @@ pub fn render_dialog_with_keymap(
         ModalSizing::new(Size::new(56, 8), Size::new(80, 10), Insets::all(4)),
         theme.modal_theme(),
     )
+    .chrome(crate::render::dialog_chrome())
     .title(" Change working directory ")
     .padding(Insets::new(1, 1, 1, 1))
     .placement(ModalPlacement::Centered);

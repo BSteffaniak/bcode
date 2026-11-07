@@ -690,7 +690,9 @@ mod tests {
                 link: syntax_color,
                 raw: syntax_color,
             },
-        };
+            component: bcode_plugin_sdk::tui::ComponentTheme::terminal_default(),
+        }
+        .with_legacy_component();
         let surface = ModelCommandSurface {
             close_hint: "Close".into(),
             id: "model.status",

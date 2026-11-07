@@ -1,0 +1,31 @@
+# Seed palette adapted from the one color scheme; see attribution/palettes.md.
+display_name   = "One"
+extends        = ["seeded-base"]
+id             = "one"
+schema_version = 2
+
+[palette]
+accent     = "#61afef"
+background = "#282c34"
+blue       = "#61afef"
+cyan       = "#56b6c2"
+green      = "#98c379"
+magenta    = "#c678dd"
+orange     = "#d19a66"
+red        = "#e06c75"
+text       = "#abb2bf"
+yellow     = "#e5c07b"
+
+[variants.dark]
+
+[variants.light.palette]
+accent     = "#4078f2"
+background = "#fafafa"
+blue       = "#4078f2"
+cyan       = "#0184bc"
+green      = "#50a14f"
+magenta    = "#a626a4"
+orange     = "#986801"
+red        = "#e45649"
+text       = "#383a42"
+yellow     = "#c18401"

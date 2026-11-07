@@ -1,0 +1,31 @@
+# Original Bcode palette.
+display_name   = "Glacier"
+extends        = ["seeded-base"]
+id             = "glacier"
+schema_version = 2
+
+[palette]
+accent     = "#6fd3ff"
+background = "#0e1a22"
+blue       = "#6fb6ff"
+cyan       = "#6fd3ff"
+green      = "#8fe3c0"
+magenta    = "#b9a6ff"
+orange     = "#ffb88a"
+red        = "#ff8fa3"
+text       = "#dceef7"
+yellow     = "#f2e38a"
+
+[variants.dark]
+
+[variants.light.palette]
+accent     = "#0b6fa4"
+background = "#eef6fa"
+blue       = "#1d5fb8"
+cyan       = "#0b6fa4"
+green      = "#1f7a52"
+magenta    = "#6a4fc4"
+orange     = "#a8551c"
+red        = "#b4233c"
+text       = "#14303f"
+yellow     = "#7a6200"

@@ -1,0 +1,80 @@
+# Profile: Rounded corners, tinted raised surfaces, roomy padding.
+# Profiles set chrome, structure, and containers only, so they combine with any palette.
+display_name   = "Soft (profile)"
+id             = "soft"
+kind           = "profile"
+schema_version = 2
+
+[chrome.tui]
+borders    = { panel = "rounded", dialog = "rounded", tool = "rounded", composer = "rounded" }
+density    = "comfortable"
+icons      = "unicode"
+motion     = "subtle"
+separators = { status = "plain" }
+speaker    = "badge"
+surfaces   = "layered"
+
+[[presentation.rules]]
+match = { kind = "tool", status = "succeeded", lines = [
+    "some",
+    "many",
+    "huge",
+] }
+set = { disclosure = "summary" }
+
+[containers."transcript.user"]
+layout    = "plain"
+padding_x = 1
+
+[containers."transcript.assistant"]
+layout    = "plain"
+padding_x = 1
+
+[containers."tool.requested"]
+border    = "none"
+layout    = "panel"
+padding_x = 2
+padding_y = 0
+width     = "full"
+
+[containers."tool.running"]
+border    = "none"
+layout    = "panel"
+padding_x = 2
+padding_y = 0
+width     = "full"
+
+[containers."tool.waiting"]
+border    = "none"
+layout    = "panel"
+padding_x = 2
+padding_y = 0
+width     = "full"
+
+[containers."tool.succeeded"]
+border    = "none"
+layout    = "panel"
+padding_x = 2
+padding_y = 0
+width     = "full"
+
+[containers."tool.failed"]
+border    = "none"
+layout    = "panel"
+padding_x = 2
+padding_y = 0
+width     = "full"
+
+[containers."tool.cancelled"]
+border    = "none"
+layout    = "panel"
+padding_x = 2
+padding_y = 0
+width     = "full"
+
+[containers."tool.timed_out"]
+border    = "none"
+layout    = "panel"
+padding_x = 2
+padding_y = 0
+width     = "full"

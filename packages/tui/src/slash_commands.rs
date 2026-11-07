@@ -60,6 +60,12 @@ pub enum SlashCommandOutcome {
     PreviewTheme { theme_id: String },
     /// Apply a bundled theme as the global interactive selection.
     ApplyTheme { theme_id: String },
+    /// List interface profiles.
+    ShowProfileCatalog,
+    /// Persist one interface profile to user state.
+    ApplyProfile { profile_id: String },
+    /// Clear the saved interface profile.
+    ResetProfile,
     /// Clear the global interactive selection and restore the configured default.
     ResetTheme,
     /// Restore the configured theme after preview.
@@ -770,6 +776,36 @@ pub async fn execute_resolved(
     }
 }
 
+fn profile_command(parts: &[&str]) -> SlashCommandOutcome {
+    match parts {
+        [_] | [_, "list"] => SlashCommandOutcome::ShowProfileCatalog,
+        [_, "apply", profile_id] => SlashCommandOutcome::ApplyProfile {
+            profile_id: (*profile_id).to_owned(),
+        },
+        [_, "reset"] => SlashCommandOutcome::ResetProfile,
+        _ => {
+            SlashCommandOutcome::Handled("usage: /profile [list|apply <profile>|reset]".to_owned())
+        }
+    }
+}
+
+/// Markdown listing of interface profiles.
+#[must_use]
+pub fn format_profile_catalog_markdown(profiles: &[(String, String, bool)]) -> String {
+    if profiles.is_empty() {
+        return "# Profiles\n\nNo profiles are currently available.".to_owned();
+    }
+    let mut output = String::from(
+        "# Profiles\n\nProfiles set borders, icons, density, and which tools are collapsed. \
+         Combine any profile with any theme using `/profile apply <profile>`.\n\n",
+    );
+    for (id, name, selected) in profiles {
+        let current = if *selected { " (current)" } else { "" };
+        let _ = writeln!(output, "* **{name}**{current} — `{id}`");
+    }
+    output
+}
+
 fn theme_command(parts: &[&str]) -> SlashCommandOutcome {
     match parts {
         [_] => SlashCommandOutcome::OpenThemePicker,
@@ -884,6 +920,7 @@ async fn execute_builtin(
             Ok(SlashCommandOutcome::CompactContext { session_id })
         }
         BuiltinCommandId::Theme => Ok(theme_command(parts)),
+        BuiltinCommandId::Profile => Ok(profile_command(parts)),
         BuiltinCommandId::Streaming => Ok(SlashCommandOutcome::OpenStreamingConfigurator),
         BuiltinCommandId::Model if parts.len() == 1 => Ok(SlashCommandOutcome::PickModel),
         BuiltinCommandId::AuthPool if parts.len() == 1 => Ok(SlashCommandOutcome::PickAuthPool),

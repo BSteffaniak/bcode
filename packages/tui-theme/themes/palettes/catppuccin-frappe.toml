@@ -1,0 +1,18 @@
+# Seed palette adapted from the catppuccin color scheme; see attribution/palettes.md.
+display_name   = "Catppuccin Frappé"
+extends        = ["seeded-base"]
+id             = "catppuccin-frappe"
+schema_version = 2
+
+[palette]
+accent     = "#ca9ee6"
+background = "#303446"
+blue       = "#8caaee"
+cyan       = "#81c8be"
+green      = "#a6d189"
+magenta    = "#f4b8e4"
+orange     = "#ef9f76"
+red        = "#e78284"
+text       = "#c6d0f5"
+violet     = "#babbf1"
+yellow     = "#e5c890"

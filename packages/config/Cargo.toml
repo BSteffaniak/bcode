@@ -11,27 +11,28 @@ repository  = { workspace = true }
 version     = { workspace = true }
 
 [dependencies]
-bcode_agent_policy_models    = { workspace = true }
-bcode_config_layers          = { workspace = true }
-bcode_confined_fs            = { workspace = true }
-bcode_model                  = { workspace = true }
-bcode_plugin_models          = { workspace = true }
-bcode_plugin_sdk             = { workspace = true }
-bcode_provider_auth_models   = { workspace = true }
-bcode_session_view_models    = { workspace = true }
-bcode_skill_models           = { workspace = true }
-bcode_tool                   = { workspace = true }
-bmux_config_composition      = { workspace = true }
-hex                          = { workspace = true }
-hyperchad_docs_config        = { workspace = true }
-hyperchad_docs_config_derive = { workspace = true }
-serde                        = { workspace = true, features = ["derive", "std"] }
-serde_json                   = { workspace = true }
-sha2                         = { workspace = true }
-tempfile                     = { workspace = true }
-thiserror                    = { workspace = true }
-toml                         = { workspace = true, features = ["display"] }
-toml_edit                    = { workspace = true, features = ["display"] }
+bcode_agent_policy_models        = { workspace = true }
+bcode_config_layers              = { workspace = true }
+bcode_confined_fs                = { workspace = true }
+bcode_model                      = { workspace = true }
+bcode_plugin_models              = { workspace = true }
+bcode_plugin_sdk                 = { workspace = true }
+bcode_presentation_policy_models = { workspace = true }
+bcode_provider_auth_models       = { workspace = true }
+bcode_session_view_models        = { workspace = true }
+bcode_skill_models               = { workspace = true }
+bcode_tool                       = { workspace = true }
+bmux_config_composition          = { workspace = true }
+hex                              = { workspace = true }
+hyperchad_docs_config            = { workspace = true }
+hyperchad_docs_config_derive     = { workspace = true }
+serde                            = { workspace = true, features = ["derive", "std"] }
+serde_json                       = { workspace = true }
+sha2                             = { workspace = true }
+tempfile                         = { workspace = true }
+thiserror                        = { workspace = true }
+toml                             = { workspace = true, features = ["display"] }
+toml_edit                        = { workspace = true, features = ["display"] }
 
 [features]
 default          = []

@@ -1,0 +1,17 @@
+# Seed palette adapted from the rose-pine color scheme; see attribution/palettes.md.
+display_name   = "Rosé Pine Moon"
+extends        = ["seeded-base"]
+id             = "rose-pine-moon"
+schema_version = 2
+
+[palette]
+accent     = "#c4a7e7"
+background = "#232136"
+blue       = "#3e8fb0"
+cyan       = "#9ccfd8"
+green      = "#9ccfd8"
+magenta    = "#c4a7e7"
+orange     = "#ea9a97"
+red        = "#eb6f92"
+text       = "#e0def4"
+yellow     = "#f6c177"

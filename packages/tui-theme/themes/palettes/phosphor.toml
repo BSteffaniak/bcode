@@ -1,0 +1,17 @@
+# Original Bcode palette.
+display_name   = "Phosphor"
+extends        = ["seeded-base"]
+id             = "phosphor"
+schema_version = 2
+
+[palette]
+accent     = "#39ff7a"
+background = "#050a05"
+blue       = "#5cffc8"
+cyan       = "#6effe8"
+green      = "#39ff7a"
+magenta    = "#8affb0"
+orange     = "#d4ff5c"
+red        = "#ff7a5c"
+text       = "#9dff9d"
+yellow     = "#c8ff5c"

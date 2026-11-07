@@ -888,7 +888,7 @@ impl ChatLoopState {
             .iter()
             .map(|entry| entry.id.clone())
             .collect::<Vec<_>>();
-        let overlays = chat.app.tui_config().theme.overlays.clone();
+        let overlays = chat.app.tui_config().theme.effective_overlays();
         let resolved = chat.app.theme_catalog().map(|discovered| {
             ids.into_iter()
                 .filter_map(|id| {
@@ -3513,6 +3513,7 @@ pub fn apply_effect_result(
         TuiEffectResult::ConfigLoaded {
             config,
             theme_selection,
+            profile_selection,
             streaming_presentation,
         } => {
             apply_config_result(
@@ -3523,7 +3524,36 @@ pub fn apply_effect_result(
                 theme_selection,
                 streaming_presentation,
             );
+            match profile_selection {
+                Ok(Some(profile)) if !chat.app.apply_profile(Some(&profile)) => {
+                    chat.app
+                        .set_status(format!("saved profile {profile} is unavailable"));
+                }
+                Ok(_) => {}
+                Err(error) => chat
+                    .app
+                    .set_status(format!("TUI profile state unavailable: {error}")),
+            }
         }
+        TuiEffectResult::ProfileSelectionPersisted { name, result } => match result {
+            Ok(path) => chat.app.set_status(name.map_or_else(
+                || {
+                    format!(
+                        "profile cleared from {}",
+                        bcode_plugin_sdk::path::display_from_current_dir(&path)
+                    )
+                },
+                |name| {
+                    format!(
+                        "profile {name} saved to user state at {}",
+                        bcode_plugin_sdk::path::display_from_current_dir(&path)
+                    )
+                },
+            )),
+            Err(error) => chat
+                .app
+                .set_status(format!("profile could not be saved: {error}")),
+        },
         TuiEffectResult::ThemeSelectionPersisted { name, result } => match result {
             Ok(path) => {
                 if let Some(name) = name {
@@ -4293,6 +4323,8 @@ pub fn apply_config_result(
                 ));
             }
             chat.app.apply_tui_config(config.tui.clone());
+            chat.app
+                .apply_configured_structure_rules(config.presentation.rules.clone());
             if previous_interactions.placement != config.tui.interactions.placement {
                 loop_state.pinned_interaction_viewport = None;
                 loop_state.interactive_surface_geometry = None;
@@ -5007,6 +5039,34 @@ fn apply_root_slash_command_outcome(
                 chat.app
                     .set_status(format!("unknown bundled theme: {theme_id}"));
             }
+        }
+        SlashCommandOutcome::ShowProfileCatalog => {
+            let markdown = super::slash_commands::format_profile_catalog_markdown(
+                &super::theme::profile_catalog(&mut chat.app),
+            );
+            chat.append_durable_presentation_note(
+                "bcode.host",
+                markdown,
+                bcode_command::CommandTextFormat::Markdown,
+            );
+            chat.app.set_status("profile catalog shown".to_owned());
+        }
+        SlashCommandOutcome::ApplyProfile { profile_id } => {
+            if chat.app.apply_profile(Some(&profile_id)) {
+                chat.replace_effect(TuiEffect::PersistProfileSelection {
+                    name: Some(profile_id.clone()),
+                });
+                chat.app
+                    .set_status(format!("saving profile {profile_id} to user state…"));
+            } else {
+                chat.app
+                    .set_status(format!("unknown profile: {profile_id}"));
+            }
+        }
+        SlashCommandOutcome::ResetProfile => {
+            chat.app.apply_profile(None);
+            chat.replace_effect(TuiEffect::PersistProfileSelection { name: None });
+            chat.app.set_status("clearing saved profile…".to_owned());
         }
         SlashCommandOutcome::ResetTheme => {
             chat.replace_effect(TuiEffect::ClearThemeSelection);

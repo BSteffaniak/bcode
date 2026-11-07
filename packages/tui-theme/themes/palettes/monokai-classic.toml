@@ -1,0 +1,18 @@
+# Seed palette adapted from the monokai color scheme; see attribution/palettes.md.
+display_name   = "Monokai Classic"
+extends        = ["seeded-base"]
+id             = "monokai-classic"
+schema_version = 2
+
+[palette]
+accent     = "#a6e22e"
+background = "#272822"
+blue       = "#66d9ef"
+cyan       = "#66d9ef"
+green      = "#a6e22e"
+magenta    = "#ae81ff"
+orange     = "#fd971f"
+red        = "#f92672"
+text       = "#f8f8f2"
+violet     = "#ae81ff"
+yellow     = "#e6db74"

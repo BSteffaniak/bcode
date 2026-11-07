@@ -1,0 +1,5 @@
+# Curated combination: neon-noir palette with the riced profile.
+display_name   = "Neon"
+extends        = ["neon-noir", "riced"]
+id             = "neon"
+schema_version = 2

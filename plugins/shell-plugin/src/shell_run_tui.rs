@@ -3587,7 +3587,9 @@ mod tests {
                 link: PluginTuiSyntaxColor::from_tui(Color::BrightBlue),
                 raw: PluginTuiSyntaxColor::from_tui(Color::BrightGreen),
             },
-        };
+            component: bcode_plugin_sdk::tui::ComponentTheme::terminal_default(),
+        }
+        .with_legacy_component();
         let context = bcode_plugin_sdk::tui::PluginTuiVisualRenderContext::new(
             64,
             bcode_plugin_sdk::tui::PluginTuiDiffLayout::Unified,

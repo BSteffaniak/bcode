@@ -1,0 +1,5 @@
+# Curated combination: paper palette with the zen profile.
+display_name   = "Zen Paper"
+extends        = ["paper", "zen"]
+id             = "zen-paper"
+schema_version = 2

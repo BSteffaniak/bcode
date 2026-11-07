@@ -45,6 +45,15 @@ pub fn handle_non_permission_mouse(
             let activated = chat.app.activate_markdown_contribution(contribution_id);
             focus_changed || activated
         }
+        MouseEventKind::Down(MouseButton::Left)
+            if hit_id
+                .and_then(crate::render::disclosure_item_from_hit)
+                .is_some() =>
+        {
+            hit_id
+                .and_then(crate::render::disclosure_item_from_hit)
+                .is_some_and(|item_id| chat.app.toggle_item_disclosure(item_id))
+        }
         MouseEventKind::Down(MouseButton::Left) if hit_id == Some("composer") => {
             composer_mouse_changed(chat, mouse)
         }

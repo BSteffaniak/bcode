@@ -1372,8 +1372,14 @@ pub struct PluginTuiDiffTheme {
     pub removed_emphasis: Style,
 }
 
+/// Generic component theme carried by [`PluginTuiTheme`].
+pub use bmux_tui_components::theme::ComponentTheme;
+
 /// Current host component-theme contract version.
-pub const PLUGIN_TUI_COMPONENT_THEME_VERSION: u16 = 1;
+///
+/// Version 2 carries the host's complete [`PluginTuiTheme::component`] theme,
+/// including state colors, surfaces, and chrome.
+pub const PLUGIN_TUI_COMPONENT_THEME_VERSION: u16 = 2;
 
 /// Renderer-owned semantic presentation passed to native TUI plugin adapters.
 ///
@@ -1401,32 +1407,58 @@ pub struct PluginTuiTheme {
     pub diff: PluginTuiDiffTheme,
     /// Syntax presentation.
     pub syntax: PluginTuiSyntaxTheme,
+    /// Complete host component theme: state colors, surfaces, accents, and chrome.
+    ///
+    /// Meaningful only when [`Self::component_theme_version`] matches
+    /// [`PLUGIN_TUI_COMPONENT_THEME_VERSION`]; read it through
+    /// [`Self::component_theme`].
+    pub component: bmux_tui_components::theme::ComponentTheme,
 }
 
 impl PluginTuiTheme {
-    /// Return a compatible generic component theme when one was supplied.
+    /// Replace [`Self::component`] with a theme derived from the legacy
+    /// semantic fields, for fixtures and hosts that only populate those fields.
+    #[must_use]
+    pub const fn with_legacy_component(mut self) -> Self {
+        let selected = self.selection;
+        self.component = bmux_tui_components::theme::ComponentTheme {
+            canvas: self.canvas,
+            surfaces: bmux_tui_components::theme::ComponentSurfaces {
+                normal: self.canvas,
+                raised: self.canvas,
+                overlay: self.canvas,
+                scrim: None,
+            },
+            text: self.text,
+            accent: self.focused,
+            title: self.focused,
+            focused: self.focused,
+            hover: self.focused,
+            selected,
+            selected_inactive: selected,
+            disabled: self.muted.add_modifier(bmux_tui::style::Modifier::DIM),
+            muted: self.muted,
+            link: self.focused,
+            info: self.focused,
+            success: self.focused,
+            warning: self.focused,
+            error: self.focused,
+            state_surfaces: bmux_tui_components::theme::ComponentStateSurfaces::NONE,
+            border: self.border,
+            border_focused: self.focused,
+            chrome: bmux_tui_components::theme::ComponentChrome::DEFAULT,
+        };
+        self
+    }
+
+    /// Return the host component theme when the contract version matches.
+    ///
+    /// Older or incompatible hosts return `None`; adapters then keep using the
+    /// legacy semantic fields without changing rendering semantics.
     #[must_use]
     pub const fn component_theme(&self) -> Option<bmux_tui_components::theme::ComponentTheme> {
         if self.component_theme_version == PLUGIN_TUI_COMPONENT_THEME_VERSION {
-            Some(bmux_tui_components::theme::ComponentTheme {
-                canvas: self.canvas,
-                surfaces: bmux_tui_components::theme::ComponentSurfaces {
-                    normal: self.canvas,
-                    raised: self.canvas,
-                    overlay: self.canvas,
-                    scrim: None,
-                },
-                text: self.text,
-                focused: self.focused,
-                selected: self.selection,
-                disabled: self.muted.add_modifier(bmux_tui::style::Modifier::DIM),
-                muted: self.muted,
-                info: self.focused,
-                success: self.focused,
-                warning: self.focused,
-                error: self.focused,
-                border: self.border,
-            })
+            Some(self.component)
         } else {
             None
         }
@@ -1482,17 +1514,35 @@ mod component_theme_tests {
                 removed_emphasis: style,
             },
             syntax,
+            component: bmux_tui_components::theme::ComponentTheme::opaque_dark(),
         }
     }
 
     #[test]
     fn component_theme_is_available_only_for_matching_contract_version() {
-        assert!(
-            theme(PLUGIN_TUI_COMPONENT_THEME_VERSION)
-                .component_theme()
-                .is_some()
+        assert_eq!(
+            theme(PLUGIN_TUI_COMPONENT_THEME_VERSION).component_theme(),
+            Some(bmux_tui_components::theme::ComponentTheme::opaque_dark())
         );
-        assert!(theme(u16::MAX).component_theme().is_none());
+        assert_eq!(theme(1).component_theme(), None);
+        assert_eq!(theme(u16::MAX).component_theme(), None);
+    }
+
+    #[test]
+    fn host_state_colors_reach_plugins_distinctly() {
+        let component = theme(PLUGIN_TUI_COMPONENT_THEME_VERSION)
+            .component_theme()
+            .expect("current contract");
+        let states = [
+            component.info,
+            component.success,
+            component.warning,
+            component.error,
+        ];
+        for (index, state) in states.iter().enumerate() {
+            assert!(states[index + 1..].iter().all(|other| other != state));
+            assert_ne!(*state, component.focused);
+        }
     }
 }
 

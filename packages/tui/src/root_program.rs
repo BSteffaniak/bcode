@@ -2165,6 +2165,13 @@ impl BcodeRuntimeModel {
                     super::invalidation::UiInvalidation::None
                 }
             }
+            Event::User(tag) if tag == bmux_tui_runtime::TERMINAL_COLORS_EVENT => {
+                if self.chat.app.refresh_terminal_colors() {
+                    super::invalidation::UiInvalidation::Structural
+                } else {
+                    super::invalidation::UiInvalidation::None
+                }
+            }
             Event::User(_) => {
                 self.deferred
                     .push_back(BcodeRuntimeMessage::Terminal(event));
@@ -3285,6 +3292,16 @@ fn present_root_frame<W: std::io::Write>(
         scope: None,
         capture: None,
     });
+    if program.chat.app.take_terminal_color_query() {
+        // Replies arrive asynchronously through terminal input; terminals that
+        // do not support the query never answer and nothing waits on them.
+        let _ = terminal.write_control(bmux_tui::capabilities::TerminalColorReport::QUERY);
+    }
+    let depth = super::theme::terminal_color_depth(program.chat.app.tui_config().color_depth);
+    if terminal.color_depth() != depth {
+        terminal.set_color_depth(depth);
+        terminal.reset();
+    }
     let (frame_interval, damage, fast_temporal_presentation) = program.prepare_root_presentation();
     let (draw_stats, layout) = super::chat_loop::draw_chat_frame(
         terminal,
@@ -4773,9 +4790,10 @@ pub fn run<W: std::io::Write>(
 ) -> impl std::future::Future<Output = Result<BcodeRuntimeModel, TuiError>> {
     let runtime = Box::pin(runtime.run());
     async move {
-        let mut input = bmux_tui_runtime::TerminalInput::start::<BcodeRuntimeModel>(
+        let mut input = bmux_tui_runtime::TerminalInput::start_with_colors::<BcodeRuntimeModel>(
             handle,
             BcodeRuntimeMessage::TerminalInputFailed,
+            super::theme::terminal_colors(),
         );
         let outcome = runtime.await;
         input.shutdown().await;

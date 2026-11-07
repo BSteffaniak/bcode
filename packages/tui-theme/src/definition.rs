@@ -5,9 +5,13 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
+use bcode_presentation_policy_models::{LayerSource, PresentationSection, RuleLayer};
 use bmux_tui::style::{Color, Modifier, Style};
 use serde::Deserialize;
 use thiserror::Error;
+
+use crate::chrome::{RawChrome, TuiBorders, TuiChrome};
+use crate::expr::{self, ColorContext, Evaluated};
 
 /// Semantic style roles every version-1 theme must resolve through definition or inheritance.
 pub const REQUIRED_SEMANTIC_STYLE_ROLES: &[&str] = &[
@@ -73,8 +77,13 @@ pub const REQUIRED_CONTAINER_ROLES: &[&str] = &[
     "tool.timed_out",
 ];
 
-/// Theme definition schema version supported by this build.
-pub const THEME_SCHEMA_VERSION: u32 = 1;
+/// Newest theme definition schema version supported by this build.
+///
+/// Version 2 adds palette expressions, seed derivation, `[chrome]`, and
+/// `[presentation]`. Version-1 files keep their exact version-1 semantics.
+pub const THEME_SCHEMA_VERSION: u32 = 2;
+/// Oldest theme definition schema version supported by this build.
+pub const MIN_THEME_SCHEMA_VERSION: u32 = 1;
 /// Maximum accepted UTF-8 bytes in one theme file.
 pub const MAX_THEME_FILE_BYTES: usize = 256 * 1024;
 /// Maximum palette definitions in one theme.
@@ -133,6 +142,41 @@ pub enum ThemeError {
     /// A color value is malformed or unsupported.
     #[error("theme {theme} has invalid color {value:?}")]
     InvalidColor { theme: String, value: String },
+    /// A color expression is malformed.
+    #[error("theme {theme} has invalid color expression {value:?}: {message}")]
+    InvalidExpression {
+        theme: String,
+        value: String,
+        message: String,
+    },
+    /// A section requires a newer schema version than the file declares.
+    #[error("theme {source_name} uses [{section}], which requires schema_version = 2")]
+    RequiresSchemaV2 {
+        source_name: String,
+        section: &'static str,
+    },
+}
+
+/// What a theme definition is for.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord, Hash, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ThemeKind {
+    /// A complete selectable theme or palette.
+    #[default]
+    Theme,
+    /// An overlay that sets chrome, structure, and containers but no colors.
+    Profile,
+    /// A structural building block for other themes; not selectable alone.
+    Base,
+}
+
+/// Non-fatal problem found while resolving a theme.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ThemeWarning {
+    /// Theme id the warning concerns.
+    pub theme: String,
+    /// Human-readable message.
+    pub message: String,
 }
 
 /// Light/dark branch selected while resolving a theme.
@@ -180,6 +224,18 @@ impl ThemeDefinition {
     #[must_use]
     pub fn source_name(&self) -> &str {
         &self.source_name
+    }
+
+    /// Return what this definition is for.
+    #[must_use]
+    pub const fn kind(&self) -> ThemeKind {
+        self.raw.kind
+    }
+
+    /// Return the declared schema version.
+    #[must_use]
+    pub const fn schema_version(&self) -> u32 {
+        self.raw.schema_version
     }
 
     /// Return whether this definition provides a dark variant patch.
@@ -262,6 +318,7 @@ impl ThemeSelection {
 #[derive(Debug, Clone, Default)]
 pub struct ThemeCatalog {
     definitions: BTreeMap<String, ThemeDefinition>,
+    role_namespaces: Vec<String>,
 }
 
 impl ThemeCatalog {
@@ -270,6 +327,7 @@ impl ThemeCatalog {
     pub const fn new() -> Self {
         Self {
             definitions: BTreeMap::new(),
+            role_namespaces: Vec::new(),
         }
     }
 
@@ -281,38 +339,9 @@ impl ThemeCatalog {
     /// schema. Callers should treat this as a build/release defect.
     pub fn bundled() -> Result<Self, ThemeError> {
         let mut catalog = Self::new();
-        catalog.insert(parse_theme_definition(
-            "builtin:terminal-native",
-            include_str!("../themes/terminal-native.toml"),
-        )?);
-        catalog.insert(parse_theme_definition(
-            "builtin:terminal-native-structured",
-            include_str!("../themes/terminal-native-structured.toml"),
-        )?);
-        catalog.insert(parse_theme_definition(
-            "builtin:bcode-dark",
-            include_str!("../themes/bcode-dark.toml"),
-        )?);
-        catalog.insert(parse_theme_definition(
-            "builtin:bcode",
-            include_str!("../themes/bcode.toml"),
-        )?);
-        catalog.insert(parse_theme_definition(
-            "builtin:bcode-light",
-            include_str!("../themes/bcode-light.toml"),
-        )?);
-        catalog.insert(parse_theme_definition(
-            "builtin:monochrome",
-            include_str!("../themes/monochrome.toml"),
-        )?);
-        catalog.insert(parse_theme_definition(
-            "builtin:high-contrast",
-            include_str!("../themes/high-contrast.toml"),
-        )?);
-        catalog.insert(parse_theme_definition(
-            "builtin:nord",
-            include_str!("../themes/nord.toml"),
-        )?);
+        for (id, source) in crate::bundled::BUNDLED_THEMES {
+            catalog.insert(parse_theme_definition(format!("builtin:{id}"), source)?);
+        }
         Ok(catalog)
     }
 
@@ -330,18 +359,17 @@ impl ThemeCatalog {
     /// Return a bundled definition's original TOML source.
     #[must_use]
     pub fn bundled_source(id: &str) -> Option<&'static str> {
-        match id {
-            "terminal-native" => Some(include_str!("../themes/terminal-native.toml")),
-            "terminal-native-structured" => {
-                Some(include_str!("../themes/terminal-native-structured.toml"))
-            }
-            "bcode" => Some(include_str!("../themes/bcode.toml")),
-            "bcode-dark" => Some(include_str!("../themes/bcode-dark.toml")),
-            "bcode-light" => Some(include_str!("../themes/bcode-light.toml")),
-            "monochrome" => Some(include_str!("../themes/monochrome.toml")),
-            "high-contrast" => Some(include_str!("../themes/high-contrast.toml")),
-            "nord" => Some(include_str!("../themes/nord.toml")),
-            _ => None,
+        crate::bundled::BUNDLED_THEMES
+            .iter()
+            .find(|(bundled, _)| *bundled == id)
+            .map(|(_, source)| *source)
+    }
+
+    /// Register a plugin-owned role namespace so its roles are not reported as unknown.
+    pub fn register_role_namespace(&mut self, namespace: impl Into<String>) {
+        let namespace = namespace.into();
+        if !self.role_namespaces.contains(&namespace) {
+            self.role_namespaces.push(namespace);
         }
     }
 
@@ -389,7 +417,7 @@ impl ThemeCatalog {
                 &mut applied,
             )?;
         }
-        resolve_merged(&selection.base, merged, applied)
+        resolve_merged(&selection.base, merged, applied, &self.role_namespaces)
     }
 
     fn merge_theme(
@@ -428,12 +456,15 @@ impl ThemeCatalog {
         }
         stack.pop();
         merged.apply_raw(&definition.raw);
+        if definition.raw.schema_version >= 2 {
+            merged.derive = true;
+        }
         if let Some(patch) = match variant {
             ResolvedThemeVariant::Unspecified => None,
             ResolvedThemeVariant::Dark => definition.raw.variants.dark.as_ref(),
             ResolvedThemeVariant::Light => definition.raw.variants.light.as_ref(),
         } {
-            merged.apply_patch(patch);
+            merged.apply_patch(id, patch);
         }
         applied.push(id.to_owned());
         completed.insert(id.to_owned());
@@ -456,6 +487,16 @@ pub struct ResolvedThemeDefinition {
     pub containers: BTreeMap<String, ContainerRecipe>,
     /// Plugin-owned extension values, deep-merged by namespace.
     pub extensions: BTreeMap<String, toml::Value>,
+    /// Resolved terminal chrome.
+    pub chrome: TuiChrome,
+    /// Opaque chrome sections for other renderers, keyed by renderer.
+    pub renderer_chrome: BTreeMap<String, toml::Value>,
+    /// Structural presentation rule layers, one per contributing theme, in order.
+    pub presentation: Vec<RuleLayer>,
+    /// Roles filled by seed derivation rather than authored values.
+    pub derived_roles: Vec<String>,
+    /// Non-fatal problems such as unknown roles or approximate color math.
+    pub warnings: Vec<ThemeWarning>,
     /// Theme ids applied in resolution order.
     pub applied_layers: Vec<String>,
     /// Stable fingerprint of all resolved presentation fields.
@@ -463,6 +504,28 @@ pub struct ResolvedThemeDefinition {
 }
 
 impl ResolvedThemeDefinition {
+    /// An empty resolution with no palette, roles, chrome, or rules.
+    ///
+    /// Consumers use it as a deterministic fallback when no theme resolves.
+    #[must_use]
+    pub fn empty(id: impl Into<String>, display_name: impl Into<String>) -> Self {
+        Self {
+            id: id.into(),
+            display_name: display_name.into(),
+            palette: BTreeMap::new(),
+            styles: BTreeMap::new(),
+            containers: BTreeMap::new(),
+            extensions: BTreeMap::new(),
+            chrome: TuiChrome::default(),
+            renderer_chrome: BTreeMap::new(),
+            presentation: Vec::new(),
+            derived_roles: Vec::new(),
+            warnings: Vec::new(),
+            applied_layers: Vec::new(),
+            fingerprint: 0,
+        }
+    }
+
     /// Resolve a palette color by name.
     #[must_use]
     pub fn color(&self, name: &str) -> Option<Color> {
@@ -534,6 +597,8 @@ struct RawTheme {
     schema_version: u32,
     id: String,
     #[serde(default)]
+    kind: ThemeKind,
+    #[serde(default)]
     display_name: Option<String>,
     #[serde(default)]
     extends: Vec<String>,
@@ -547,6 +612,10 @@ struct RawTheme {
     variants: RawVariants,
     #[serde(default)]
     extensions: BTreeMap<String, toml::Value>,
+    #[serde(default)]
+    chrome: Option<RawChrome>,
+    #[serde(default)]
+    presentation: Option<PresentationSection>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Deserialize)]
@@ -569,11 +638,15 @@ struct RawThemePatch {
     containers: BTreeMap<String, RawContainerRecipe>,
     #[serde(default)]
     extensions: BTreeMap<String, toml::Value>,
+    #[serde(default)]
+    chrome: Option<RawChrome>,
+    #[serde(default)]
+    presentation: Option<PresentationSection>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 #[serde(untagged)]
-enum RawColor {
+pub(crate) enum RawColor {
     Text(String),
     Index(i64),
 }
@@ -624,6 +697,10 @@ struct MergedTheme {
     styles: BTreeMap<String, RawStyle>,
     containers: BTreeMap<String, RawContainerRecipe>,
     extensions: BTreeMap<String, toml::Value>,
+    chrome: RawChrome,
+    presentation: Vec<RuleLayer>,
+    /// Whether any applied layer opted into schema-v2 seed derivation.
+    derive: bool,
 }
 
 impl MergedTheme {
@@ -635,22 +712,95 @@ impl MergedTheme {
         self.styles.extend(raw.styles.clone());
         self.containers.extend(raw.containers.clone());
         deep_merge_extensions(&mut self.extensions, &raw.extensions);
+        if let Some(chrome) = &raw.chrome {
+            self.chrome.merge(chrome);
+        }
+        self.push_presentation(&raw.id, raw.presentation.as_ref());
     }
 
-    fn apply_patch(&mut self, patch: &RawThemePatch) {
+    fn apply_patch(&mut self, id: &str, patch: &RawThemePatch) {
         self.palette.extend(patch.palette.clone());
         self.styles.extend(patch.styles.clone());
         self.containers.extend(patch.containers.clone());
         deep_merge_extensions(&mut self.extensions, &patch.extensions);
+        if let Some(chrome) = &patch.chrome {
+            self.chrome.merge(chrome);
+        }
+        self.push_presentation(id, patch.presentation.as_ref());
+    }
+
+    fn push_presentation(&mut self, id: &str, section: Option<&PresentationSection>) {
+        if let Some(section) = section.filter(|section| !section.rules.is_empty()) {
+            self.presentation.push(RuleLayer {
+                source: LayerSource::Theme(id.to_owned()),
+                rules: section.rules.clone(),
+            });
+        }
     }
 }
 
 fn validate_raw_theme(source: &str, raw: &RawTheme) -> Result<(), ThemeError> {
-    if raw.schema_version != THEME_SCHEMA_VERSION {
+    if !(MIN_THEME_SCHEMA_VERSION..=THEME_SCHEMA_VERSION).contains(&raw.schema_version) {
         return Err(ThemeError::UnsupportedVersion {
             source_name: source.to_owned(),
             version: raw.schema_version,
         });
+    }
+    if raw.schema_version < 2 && raw.kind != ThemeKind::Theme {
+        return Err(ThemeError::RequiresSchemaV2 {
+            source_name: source.to_owned(),
+            section: "kind",
+        });
+    }
+    if raw.schema_version < 2 {
+        let patches = [raw.variants.dark.as_ref(), raw.variants.light.as_ref()];
+        let uses = |chrome: bool| {
+            (if chrome {
+                raw.chrome.is_some()
+            } else {
+                raw.presentation.is_some()
+            }) || patches.iter().flatten().any(|patch| {
+                if chrome {
+                    patch.chrome.is_some()
+                } else {
+                    patch.presentation.is_some()
+                }
+            })
+        };
+        for (section, chrome) in [("chrome", true), ("presentation", false)] {
+            if uses(chrome) {
+                return Err(ThemeError::RequiresSchemaV2 {
+                    source_name: source.to_owned(),
+                    section,
+                });
+            }
+        }
+    }
+    let expression_values = raw.palette.values().chain(
+        raw.styles
+            .values()
+            .flat_map(|style| [&style.fg, &style.bg].into_iter().flatten()),
+    );
+    if raw.schema_version < 2
+        && expression_values
+            .into_iter()
+            .any(|value| matches!(value, RawColor::Text(text) if expr::is_expression(text)))
+    {
+        return Err(ThemeError::RequiresSchemaV2 {
+            source_name: source.to_owned(),
+            section: "palette expressions",
+        });
+    }
+    let presentation_rules = raw
+        .presentation
+        .as_ref()
+        .map_or(0, |section| section.rules.len());
+    if presentation_rules > bcode_presentation_policy_models::MAX_RULES_PER_LAYER {
+        return Err(limit_error(
+            source,
+            "presentation rule",
+            bcode_presentation_policy_models::MAX_RULES_PER_LAYER,
+        ));
     }
     if !valid_theme_id(&raw.id) {
         return Err(ThemeError::InvalidId {
@@ -713,17 +863,42 @@ fn resolve_merged(
     id: &str,
     merged: MergedTheme,
     applied_layers: Vec<String>,
+    role_namespaces: &[String],
 ) -> Result<ResolvedThemeDefinition, ThemeError> {
-    let mut palette = BTreeMap::new();
+    let mut resolver = PaletteResolver::new(id, &merged.palette);
     for name in merged.palette.keys() {
-        let color =
-            resolve_palette_color(id, name, &merged.palette, &mut palette, &mut Vec::new())?;
-        palette.insert(name.clone(), color);
+        resolver.get(name)?;
     }
     let mut styles = BTreeMap::new();
     for (role, raw) in &merged.styles {
-        styles.insert(role.clone(), resolve_style(id, raw, &palette)?);
+        styles.insert(role.clone(), resolver.style(raw)?);
     }
+    let mut derived_roles = Vec::new();
+    if merged.derive {
+        for spec in crate::roles::ROLES {
+            if styles.contains_key(spec.key) {
+                continue;
+            }
+            if let Some(derived) = spec.derive.and_then(|derive| resolver.derived(derive)) {
+                styles.insert(spec.key.to_owned(), derived);
+                derived_roles.push(spec.key.to_owned());
+            }
+        }
+    }
+    let mut warnings = std::mem::take(&mut resolver.warnings);
+    for role in merged.styles.keys() {
+        if !crate::roles::is_known_role(role, role_namespaces) {
+            let hint = crate::roles::suggestion(role)
+                .map(|suggestion| format!("; did you mean {suggestion:?}?"))
+                .unwrap_or_default();
+            warnings.push(ThemeWarning {
+                theme: id.to_owned(),
+                message: format!("unknown style role {role:?}{hint}"),
+            });
+        }
+    }
+    let chrome = resolve_chrome(&mut resolver, merged.chrome.tui.as_ref())?;
+    let palette = resolver.resolved;
     let containers = merged
         .containers
         .into_iter()
@@ -741,15 +916,18 @@ fn resolve_merged(
         })
         .collect::<BTreeMap<_, _>>();
     let display_name = merged.display_name.unwrap_or_else(|| id.to_owned());
-    let fingerprint = theme_fingerprint(
+    let fingerprint = theme_fingerprint(&[
         id,
         &display_name,
-        &palette,
-        &styles,
-        &containers,
-        &merged.extensions,
-        &applied_layers,
-    );
+        &format!("{palette:?}"),
+        &format!("{styles:?}"),
+        &format!("{containers:?}"),
+        &format!("{:?}", merged.extensions),
+        &format!("{chrome:?}"),
+        &format!("{:?}", merged.chrome.other),
+        &format!("{:?}", merged.presentation),
+        &format!("{applied_layers:?}"),
+    ]);
     Ok(ResolvedThemeDefinition {
         id: id.to_owned(),
         display_name,
@@ -757,55 +935,218 @@ fn resolve_merged(
         styles,
         containers,
         extensions: merged.extensions,
+        chrome,
+        renderer_chrome: merged.chrome.other,
+        presentation: merged.presentation,
+        derived_roles,
+        warnings,
         applied_layers,
         fingerprint,
     })
 }
 
-fn resolve_palette_color(
-    theme: &str,
-    name: &str,
-    raw_palette: &BTreeMap<String, RawColor>,
-    resolved: &mut BTreeMap<String, Color>,
-    stack: &mut Vec<String>,
-) -> Result<Color, ThemeError> {
-    if let Some(color) = resolved.get(name) {
-        return Ok(*color);
-    }
-    if stack.len() >= MAX_THEME_REFERENCE_DEPTH || stack.iter().any(|entry| entry == name) {
-        let mut chain = stack.clone();
-        chain.push(name.to_owned());
-        return Err(ThemeError::ColorReferenceCycle {
-            theme: theme.to_owned(),
-            chain: chain.join(" -> "),
+fn resolve_chrome(
+    resolver: &mut PaletteResolver<'_>,
+    raw: Option<&crate::chrome::RawTuiChrome>,
+) -> Result<TuiChrome, ThemeError> {
+    let Some(raw) = raw else {
+        return Ok(TuiChrome::default());
+    };
+    let borders = raw.borders.clone().unwrap_or_default();
+    let focus = raw.focus.clone().unwrap_or_default();
+    let colors = focus.colors.unwrap_or_default();
+    if colors.len() > crate::chrome::MAX_FOCUS_COLORS {
+        return Err(ThemeError::LimitExceeded {
+            source_name: resolver.theme.to_owned(),
+            field: "focus color",
+            maximum: crate::chrome::MAX_FOCUS_COLORS,
         });
     }
-    let raw = raw_palette
-        .get(name)
-        .ok_or_else(|| ThemeError::UnknownColorReference {
-            theme: theme.to_owned(),
-            reference: name.to_owned(),
-        })?;
-    stack.push(name.to_owned());
-    let color = resolve_color(theme, raw, raw_palette, resolved, stack)?;
-    stack.pop();
-    resolved.insert(name.to_owned(), color);
-    Ok(color)
+    let focus_colors = colors
+        .iter()
+        .map(|color| resolver.authored(color))
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(TuiChrome {
+        borders: TuiBorders {
+            panel: borders.panel,
+            dialog: borders.dialog,
+            tool: borders.tool,
+            composer: borders.composer,
+        },
+        focus: focus.effect.unwrap_or_default(),
+        focus_colors,
+        icons: raw.icons.unwrap_or_default(),
+        density: raw.density.unwrap_or_default(),
+        separators: raw
+            .separators
+            .as_ref()
+            .and_then(|separators| separators.status)
+            .unwrap_or_default(),
+        speaker: raw.speaker.unwrap_or_default(),
+        surfaces: raw.surfaces.unwrap_or_default(),
+        motion: raw.motion.unwrap_or_default(),
+    })
 }
 
-fn resolve_style(
-    theme: &str,
-    raw: &RawStyle,
-    palette: &BTreeMap<String, Color>,
-) -> Result<Style, ThemeError> {
-    let mut style = Style::new();
-    if let Some(fg) = &raw.fg {
-        style = style.fg(resolve_flat_color(theme, fg, palette)?);
+/// Resolves palette references and color expressions with cycle detection.
+struct PaletteResolver<'a> {
+    theme: &'a str,
+    raw: &'a BTreeMap<String, RawColor>,
+    resolved: BTreeMap<String, Color>,
+    stack: Vec<String>,
+    warnings: Vec<ThemeWarning>,
+    /// First structured error raised inside expression evaluation.
+    failure: Option<ThemeError>,
+}
+
+impl<'a> PaletteResolver<'a> {
+    const fn new(theme: &'a str, raw: &'a BTreeMap<String, RawColor>) -> Self {
+        Self {
+            theme,
+            raw,
+            resolved: BTreeMap::new(),
+            stack: Vec::new(),
+            warnings: Vec::new(),
+            failure: None,
+        }
     }
-    if let Some(bg) = &raw.bg {
-        style = style.bg(resolve_flat_color(theme, bg, palette)?);
+
+    /// Resolve an existing palette entry.
+    fn get(&mut self, name: &str) -> Result<Color, ThemeError> {
+        self.lookup(name)?
+            .ok_or_else(|| ThemeError::UnknownColorReference {
+                theme: self.theme.to_owned(),
+                reference: name.to_owned(),
+            })
     }
-    for modifier in &raw.modifiers {
+
+    /// Resolve a palette entry, or `None` when it is not defined.
+    fn lookup(&mut self, name: &str) -> Result<Option<Color>, ThemeError> {
+        if let Some(color) = self.resolved.get(name) {
+            return Ok(Some(*color));
+        }
+        let Some(raw) = self.raw.get(name) else {
+            return Ok(None);
+        };
+        if self.stack.len() >= MAX_THEME_REFERENCE_DEPTH
+            || self.stack.iter().any(|entry| entry == name)
+        {
+            let mut chain = self.stack.clone();
+            chain.push(name.to_owned());
+            return Err(ThemeError::ColorReferenceCycle {
+                theme: self.theme.to_owned(),
+                chain: chain.join(" -> "),
+            });
+        }
+        self.stack.push(name.to_owned());
+        let color = self.authored(raw);
+        self.stack.pop();
+        let color = color?;
+        self.resolved.insert(name.to_owned(), color);
+        Ok(Some(color))
+    }
+
+    /// Resolve an authored value. Approximate math is accepted with a warning.
+    fn authored(&mut self, raw: &RawColor) -> Result<Color, ThemeError> {
+        match raw {
+            RawColor::Text(value) if expr::is_expression(value) => match self.expression(value)? {
+                Evaluated::Exact(color) => Ok(color),
+                Evaluated::Approximate(color, note) => {
+                    self.warnings.push(ThemeWarning {
+                        theme: self.theme.to_owned(),
+                        message: format!("{value}: {note}"),
+                    });
+                    Ok(color)
+                }
+                Evaluated::Missing(reference) => Err(ThemeError::UnknownColorReference {
+                    theme: self.theme.to_owned(),
+                    reference,
+                }),
+            },
+            RawColor::Text(value) if value.starts_with('$') => {
+                self.get(value.trim_start_matches('$'))
+            }
+            _ => parse_direct_color(self.theme, raw),
+        }
+    }
+
+    fn expression(&mut self, value: &str) -> Result<Evaluated, ThemeError> {
+        let parsed = expr::parse(value).map_err(|message| ThemeError::InvalidExpression {
+            theme: self.theme.to_owned(),
+            value: value.to_owned(),
+            message,
+        })?;
+        let result = expr::evaluate(&parsed, self);
+        if let Some(failure) = self.failure.take() {
+            return Err(failure);
+        }
+        result.map_err(|message| ThemeError::InvalidExpression {
+            theme: self.theme.to_owned(),
+            value: value.to_owned(),
+            message,
+        })
+    }
+
+    fn style(&mut self, raw: &RawStyle) -> Result<Style, ThemeError> {
+        let mut style = Style::new();
+        if let Some(fg) = &raw.fg {
+            style = style.fg(self.authored(fg)?);
+        }
+        if let Some(bg) = &raw.bg {
+            style = style.bg(self.authored(bg)?);
+        }
+        Ok(apply_modifiers(style, &raw.modifiers))
+    }
+
+    /// Derive a role from seeds; `None` unless every input resolves exactly.
+    fn derived(&mut self, derive: crate::roles::DerivedStyle) -> Option<Style> {
+        let mut exact = |value: &str| match self.expression_or_reference(value) {
+            Ok(Evaluated::Exact(color)) => Some(color),
+            _ => None,
+        };
+        let mut style = Style::new();
+        if let Some(fg) = derive.fg {
+            style = style.fg(exact(fg)?);
+        }
+        if let Some(bg) = derive.bg {
+            style = style.bg(exact(bg)?);
+        }
+        let modifiers = derive
+            .modifiers
+            .iter()
+            .filter_map(|name| modifier_by_name(name))
+            .collect::<Vec<_>>();
+        Some(apply_modifiers(style, &modifiers))
+    }
+
+    fn expression_or_reference(&mut self, value: &str) -> Result<Evaluated, ThemeError> {
+        if let Some(reference) = value.strip_prefix('$') {
+            return Ok(self.lookup(reference)?.map_or_else(
+                || Evaluated::Missing(reference.to_owned()),
+                Evaluated::Exact,
+            ));
+        }
+        self.expression(value)
+    }
+}
+
+impl ColorContext for PaletteResolver<'_> {
+    fn reference(&mut self, name: &str) -> Result<Option<Color>, String> {
+        self.lookup(name).map_err(|error| {
+            let message = error.to_string();
+            self.failure.get_or_insert(error);
+            message
+        })
+    }
+
+    fn literal(&mut self, value: &str) -> Result<Color, String> {
+        parse_direct_color(self.theme, &RawColor::Text(value.to_owned()))
+            .map_err(|error| error.to_string())
+    }
+}
+
+fn apply_modifiers(mut style: Style, modifiers: &[RawModifier]) -> Style {
+    for modifier in modifiers {
         style = style.add_modifier(match modifier {
             RawModifier::Bold => Modifier::BOLD,
             RawModifier::Dim => Modifier::DIM,
@@ -817,42 +1158,21 @@ fn resolve_style(
             RawModifier::CrossedOut => Modifier::CROSSED_OUT,
         });
     }
-    Ok(style)
+    style
 }
 
-fn resolve_flat_color(
-    theme: &str,
-    raw: &RawColor,
-    palette: &BTreeMap<String, Color>,
-) -> Result<Color, ThemeError> {
-    match raw {
-        RawColor::Text(value) if value.strip_prefix('$').is_some() => {
-            let reference = value.trim_start_matches('$');
-            palette
-                .get(reference)
-                .copied()
-                .ok_or_else(|| ThemeError::UnknownColorReference {
-                    theme: theme.to_owned(),
-                    reference: reference.to_owned(),
-                })
-        }
-        _ => parse_direct_color(theme, raw),
-    }
-}
-
-fn resolve_color(
-    theme: &str,
-    raw: &RawColor,
-    raw_palette: &BTreeMap<String, RawColor>,
-    resolved: &mut BTreeMap<String, Color>,
-    stack: &mut Vec<String>,
-) -> Result<Color, ThemeError> {
-    if let RawColor::Text(value) = raw
-        && let Some(reference) = value.strip_prefix('$')
-    {
-        return resolve_palette_color(theme, reference, raw_palette, resolved, stack);
-    }
-    parse_direct_color(theme, raw)
+fn modifier_by_name(name: &str) -> Option<RawModifier> {
+    Some(match name {
+        "bold" => RawModifier::Bold,
+        "dim" => RawModifier::Dim,
+        "italic" => RawModifier::Italic,
+        "underline" => RawModifier::Underline,
+        "slow_blink" => RawModifier::SlowBlink,
+        "reversed" => RawModifier::Reversed,
+        "hidden" => RawModifier::Hidden,
+        "crossed_out" => RawModifier::CrossedOut,
+        _ => return None,
+    })
 }
 
 fn parse_direct_color(theme: &str, raw: &RawColor) -> Result<Color, ThemeError> {
@@ -921,7 +1241,7 @@ fn parse_ansi(theme: &str, value: &str) -> Result<Color, ThemeError> {
     Ok(color)
 }
 
-fn deep_merge_extensions(
+pub(crate) fn deep_merge_extensions(
     target: &mut BTreeMap<String, toml::Value>,
     source: &BTreeMap<String, toml::Value>,
 ) {
@@ -950,23 +1270,11 @@ fn deep_merge_table(target: &mut toml::Table, source: &toml::Table) {
     }
 }
 
-fn theme_fingerprint(
-    id: &str,
-    display_name: &str,
-    palette: &BTreeMap<String, Color>,
-    styles: &BTreeMap<String, Style>,
-    containers: &BTreeMap<String, ContainerRecipe>,
-    extensions: &BTreeMap<String, toml::Value>,
-    layers: &[String],
-) -> u64 {
+fn theme_fingerprint(parts: &[&str]) -> u64 {
     let mut hash = Fnv64::new();
-    hash.add(id.as_bytes());
-    hash.add(display_name.as_bytes());
-    hash.add(format!("{palette:?}").as_bytes());
-    hash.add(format!("{styles:?}").as_bytes());
-    hash.add(format!("{containers:?}").as_bytes());
-    hash.add(format!("{extensions:?}").as_bytes());
-    hash.add(format!("{layers:?}").as_bytes());
+    for part in parts {
+        hash.add(part.as_bytes());
+    }
     hash.finish()
 }
 
@@ -996,6 +1304,7 @@ impl Fnv64 {
 
 #[cfg(test)]
 mod tests {
+    use crate::bundled::BUNDLED_THEMES;
     use bmux_tui::style::{Color, Modifier};
 
     use super::{
@@ -1098,8 +1407,8 @@ indicator = "exit-code"
             Err(ThemeError::InvalidToml { .. })
         ));
         assert!(matches!(
-            parse_theme_definition("future.toml", "schema_version = 2\nid = \"x\"\n"),
-            Err(ThemeError::UnsupportedVersion { version: 2, .. })
+            parse_theme_definition("future.toml", "schema_version = 3\nid = \"x\"\n"),
+            Err(ThemeError::UnsupportedVersion { version: 3, .. })
         ));
 
         let invalid = "schema_version = 1\nid = \"bad\"\n[palette]\nx = \"not-a-color\"\n";
@@ -1147,32 +1456,61 @@ indicator = "exit-code"
         ));
     }
 
+    /// Every bundled theme alone and combined with every bundled profile.
+    fn theme_and_profile_selections(catalog: &ThemeCatalog) -> Vec<ThemeSelection> {
+        let profiles: Vec<_> = catalog
+            .definitions()
+            .filter(|definition| definition.kind() == super::ThemeKind::Profile)
+            .map(|definition| definition.id().to_owned())
+            .collect();
+        assert!(profiles.len() >= 10, "{profiles:?}");
+        catalog
+            .definitions()
+            .filter(|definition| definition.kind() == super::ThemeKind::Theme)
+            .flat_map(|definition| {
+                let id = definition.id().to_owned();
+                std::iter::once(ThemeSelection::new(id.clone())).chain(profiles.iter().map(
+                    move |profile| ThemeSelection::new(id.clone()).overlays(vec![profile.clone()]),
+                ))
+            })
+            .collect()
+    }
+
     #[test]
     fn bundled_catalog_resolves_every_required_role_and_recipe() {
         let catalog = ThemeCatalog::bundled().expect("bundled themes parse");
-        for definition in catalog.definitions() {
-            let id = definition.id();
-            let resolved = catalog
-                .resolve(&ThemeSelection::new(id))
-                .unwrap_or_else(|error| panic!("bundled theme {id:?} resolves: {error}"));
-            let missing_styles = REQUIRED_SEMANTIC_STYLE_ROLES
-                .iter()
-                .copied()
-                .filter(|role| !resolved.styles.contains_key(*role))
-                .collect::<Vec<_>>();
-            let missing_containers = REQUIRED_CONTAINER_ROLES
-                .iter()
-                .copied()
-                .filter(|role| !resolved.containers.contains_key(*role))
-                .collect::<Vec<_>>();
-            assert!(
-                missing_styles.is_empty(),
-                "bundled theme {id:?} is missing semantic styles: {missing_styles:?}"
-            );
-            assert!(
-                missing_containers.is_empty(),
-                "bundled theme {id:?} is missing container recipes: {missing_containers:?}"
-            );
+        let selections = theme_and_profile_selections(&catalog);
+        for variant in [ResolvedThemeVariant::Dark, ResolvedThemeVariant::Light] {
+            for selection in &selections {
+                let selection = selection.clone().variant(variant);
+                let id = format!("{} + {:?}", selection.base, selection.overlays);
+                let resolved = catalog
+                    .resolve(&selection)
+                    .unwrap_or_else(|error| panic!("bundled theme {id:?} resolves: {error}"));
+                let missing_styles = REQUIRED_SEMANTIC_STYLE_ROLES
+                    .iter()
+                    .copied()
+                    .filter(|role| !resolved.styles.contains_key(*role))
+                    .collect::<Vec<_>>();
+                let missing_containers = REQUIRED_CONTAINER_ROLES
+                    .iter()
+                    .copied()
+                    .filter(|role| !resolved.containers.contains_key(*role))
+                    .collect::<Vec<_>>();
+                assert!(
+                    missing_styles.is_empty(),
+                    "bundled theme {id:?} is missing semantic styles: {missing_styles:?}"
+                );
+                assert!(
+                    missing_containers.is_empty(),
+                    "bundled theme {id:?} is missing container recipes: {missing_containers:?}"
+                );
+                assert!(
+                    resolved.warnings.is_empty(),
+                    "bundled theme {id:?} has warnings: {:?}",
+                    resolved.warnings
+                );
+            }
         }
     }
 
@@ -1181,6 +1519,7 @@ indicator = "exit-code"
         let catalog = ThemeCatalog::bundled().expect("bundled themes parse");
         let resolved = catalog
             .definitions()
+            .filter(|definition| definition.kind() == super::ThemeKind::Theme)
             .map(|definition| {
                 catalog
                     .resolve(&ThemeSelection::new(definition.id()))
@@ -1227,21 +1566,15 @@ indicator = "exit-code"
     #[test]
     fn bundled_ids_copy_parse_and_future_schemas_fail_closed() {
         let catalog = ThemeCatalog::bundled().expect("bundled themes parse");
-        let expected = [
-            "bcode",
-            "bcode-dark",
-            "bcode-light",
-            "high-contrast",
-            "monochrome",
-            "nord",
-            "terminal-native",
-            "terminal-native-structured",
-        ];
+        let expected = crate::bundled::BUNDLED_THEMES
+            .iter()
+            .map(|(id, _)| *id)
+            .collect::<std::collections::BTreeSet<_>>();
         assert_eq!(
             catalog
                 .definitions()
                 .map(super::ThemeDefinition::id)
-                .collect::<Vec<_>>(),
+                .collect::<std::collections::BTreeSet<_>>(),
             expected
         );
         for id in expected {
@@ -1253,15 +1586,15 @@ indicator = "exit-code"
         }
         assert!(ThemeCatalog::bundled_source("unknown-theme").is_none());
         assert!(matches!(
-            parse_theme_definition("future.toml", "schema_version = 2\nid = \"future\"\n"),
-            Err(ThemeError::UnsupportedVersion { version: 2, .. })
+            parse_theme_definition("future.toml", "schema_version = 3\nid = \"future\"\n"),
+            Err(ThemeError::UnsupportedVersion { version: 3, .. })
         ));
     }
 
     #[test]
     fn bundled_themes_use_the_runtime_loader() {
         let catalog = ThemeCatalog::bundled().expect("bundled themes parse");
-        assert_eq!(catalog.definitions.len(), 8);
+        assert_eq!(catalog.definitions.len(), BUNDLED_THEMES.len());
         let native_definition = catalog
             .definitions
             .get("terminal-native")
@@ -1366,5 +1699,256 @@ indicator = "exit-code"
                 .and_then(|style| style.fg),
             Some(Color::BrightRed)
         );
+    }
+}
+
+#[cfg(test)]
+mod schema_v2_tests {
+    use bmux_tui::style::{Color, Modifier};
+
+    use super::{
+        ResolvedThemeVariant, ThemeCatalog, ThemeError, ThemeSelection, parse_theme_definition,
+    };
+    use crate::chrome::{BorderStyle, FocusEffect, IconSet};
+
+    const SEEDED: &str = r##"
+schema_version = 2
+id = "seeded"
+display_name = "Seeded"
+
+[palette]
+background = "#1a1b26"
+text = "#c0caf5"
+accent = "#7aa2f7"
+red = "#f7768e"
+green = "#9ece6a"
+yellow = "#e0af68"
+blue = "#7aa2f7"
+magenta = "#bb9af7"
+cyan = "#7dcfff"
+tint = "mix($accent, $background, 0.2)"
+
+[styles."state.error"]
+fg = "#ff0000"
+"##;
+
+    fn resolve(sources: &[&str], base: &str) -> super::ResolvedThemeDefinition {
+        let mut catalog = ThemeCatalog::bundled().expect("bundled");
+        for source in sources {
+            catalog.insert(parse_theme_definition("test.toml", source).expect("parses"));
+        }
+        catalog
+            .resolve(&ThemeSelection::new(base))
+            .expect("resolves")
+    }
+
+    fn rgb(color: Option<Color>) -> bmux_color::Rgb {
+        color.and_then(Color::rgb).expect("explicit rgb")
+    }
+
+    #[test]
+    fn seeds_derive_every_required_role_with_readable_contrast() {
+        let resolved = resolve(&[SEEDED], "seeded");
+        for role in super::REQUIRED_SEMANTIC_STYLE_ROLES {
+            assert!(resolved.style(role).is_some(), "{role} missing");
+        }
+        let background = rgb(resolved.color("background"));
+        for role in [
+            "text.primary",
+            "state.info",
+            "state.success",
+            "state.warning",
+            "syntax.keyword",
+            "markdown.link",
+        ] {
+            let fg = rgb(resolved.style(role).and_then(|style| style.fg));
+            assert!(fg.contrast_ratio(background) >= 4.5, "{role}");
+        }
+        let muted = rgb(resolved.style("text.muted").and_then(|style| style.fg));
+        assert!(muted.contrast_ratio(background) >= 3.0);
+        // Authored roles win over derivation.
+        assert_eq!(
+            resolved.style("state.error").and_then(|style| style.fg),
+            Some(Color::Rgb(255, 0, 0))
+        );
+        assert!(
+            !resolved
+                .derived_roles
+                .iter()
+                .any(|role| role == "state.error")
+        );
+        assert!(resolved.derived_roles.iter().any(|role| role == "canvas"));
+        assert!(resolved.warnings.is_empty(), "{:?}", resolved.warnings);
+        assert!(
+            resolved
+                .style("tool.failed.title")
+                .is_some_and(|style| style.modifiers.contains(Modifier::BOLD))
+        );
+    }
+
+    #[test]
+    fn palette_expressions_resolve_through_references() {
+        let resolved = resolve(&[SEEDED], "seeded");
+        let tint = rgb(resolved.color("tint"));
+        let expected = bmux_color::mix(
+            bmux_color::Rgb::new(0x7a, 0xa2, 0xf7),
+            bmux_color::Rgb::new(0x1a, 0x1b, 0x26),
+            0.2,
+        );
+        assert_eq!(tint, expected);
+    }
+
+    #[test]
+    fn terminal_seeds_skip_derivation_instead_of_guessing() {
+        let native_v2 = r#"
+schema_version = 2
+id = "native-v2"
+extends = ["terminal-native"]
+
+[palette]
+soft = "mix($accent, $text, 0.5)"
+"#;
+        let resolved = resolve(&[native_v2], "native-v2");
+        // Inherited v1 roles remain; math over terminal colors warns and keeps the first color.
+        assert_eq!(resolved.color("soft"), Some(Color::Cyan));
+        assert_eq!(resolved.warnings.len(), 1, "{:?}", resolved.warnings);
+        assert!(resolved.warnings[0].message.contains("terminal-owned"));
+        // Roles needing RGB math were not invented.
+        assert!(resolved.style("surface.raised").is_none());
+    }
+
+    #[test]
+    fn unknown_roles_warn_with_suggestions() {
+        let typo = r#"
+schema_version = 2
+id = "typo"
+extends = ["terminal-native"]
+
+[styles."bordr.focussed"]
+fg = "ansi:red"
+
+[styles."git.branch.head"]
+fg = "ansi:green"
+"#;
+        let resolved = resolve(&[typo], "typo");
+        let messages: Vec<_> = resolved
+            .warnings
+            .iter()
+            .map(|warning| warning.message.as_str())
+            .collect();
+        assert_eq!(
+            messages,
+            ["unknown style role \"bordr.focussed\"; did you mean \"border.focused\"?"]
+        );
+    }
+
+    #[test]
+    fn chrome_and_presentation_resolve_through_inheritance_and_variants() {
+        let parent = r##"
+schema_version = 2
+id = "riced"
+extends = ["terminal-native"]
+
+[chrome.tui]
+borders = { panel = "rounded", dialog = "thick" }
+focus = { effect = "gradient", colors = ["#ff00aa", "#00ffff"] }
+icons = "nerd"
+
+[[presentation.rules]]
+match = { kind = "tool" }
+set = { disclosure = "expanded", detail = "verbose" }
+
+[variants.light.chrome.tui]
+icons = "unicode"
+"##;
+        let child = r#"
+schema_version = 2
+id = "riced-ascii"
+extends = ["riced"]
+
+[chrome.tui]
+borders = { panel = "ascii" }
+
+[[presentation.rules]]
+match = { tool = "read" }
+set = { disclosure = "collapsed" }
+"#;
+        let mut catalog = ThemeCatalog::bundled().expect("bundled");
+        for source in [parent, child] {
+            catalog.insert(parse_theme_definition("test.toml", source).expect("parses"));
+        }
+        let resolved = catalog
+            .resolve(&ThemeSelection::new("riced-ascii").variant(ResolvedThemeVariant::Light))
+            .expect("resolves");
+        assert_eq!(resolved.chrome.borders.panel, Some(BorderStyle::Ascii));
+        assert_eq!(resolved.chrome.borders.dialog, Some(BorderStyle::Thick));
+        assert_eq!(resolved.chrome.borders.tool, None);
+        assert_eq!(resolved.chrome.focus, FocusEffect::Gradient);
+        assert_eq!(
+            resolved.chrome.focus_colors,
+            [Color::Rgb(255, 0, 170), Color::Rgb(0, 255, 255)]
+        );
+        assert_eq!(resolved.chrome.icons, IconSet::Unicode);
+        let sources: Vec<_> = resolved
+            .presentation
+            .iter()
+            .map(|layer| layer.source.clone())
+            .collect();
+        assert_eq!(
+            sources,
+            [
+                bcode_presentation_policy_models::LayerSource::Theme("riced".into()),
+                bcode_presentation_policy_models::LayerSource::Theme("riced-ascii".into()),
+            ]
+        );
+    }
+
+    #[test]
+    fn version_one_files_cannot_use_version_two_sections() {
+        for (source, section) in [
+            (
+                "schema_version = 1\nid = \"x\"\n[chrome.tui]\nicons = \"nerd\"\n",
+                "chrome",
+            ),
+            (
+                "schema_version = 1\nid = \"x\"\n[[presentation.rules]]\nset = { detail = \"minimal\" }\n",
+                "presentation",
+            ),
+            (
+                "schema_version = 1\nid = \"x\"\n[palette]\na = \"mix($b, $c, 0.5)\"\n",
+                "palette expressions",
+            ),
+            (
+                "schema_version = 1\nid = \"x\"\n[variants.dark.chrome.tui]\nicons = \"nerd\"\n",
+                "chrome",
+            ),
+        ] {
+            assert!(
+                matches!(
+                    parse_theme_definition("v1.toml", source),
+                    Err(ThemeError::RequiresSchemaV2 { section: found, .. }) if found == section
+                ),
+                "{source}"
+            );
+        }
+    }
+
+    #[test]
+    fn malformed_expressions_and_cycles_fail_closed() {
+        let bad = "schema_version = 2\nid = \"bad\"\n[palette]\na = \"mix($a, $a, 0.5)\"\n";
+        let mut catalog = ThemeCatalog::new();
+        catalog.insert(parse_theme_definition("bad.toml", bad).expect("parses"));
+        assert!(matches!(
+            catalog.resolve(&ThemeSelection::new("bad")),
+            Err(ThemeError::ColorReferenceCycle { .. })
+        ));
+        let syntax =
+            "schema_version = 2\nid = \"syntax\"\n[palette]\na = \"mix(#000000, #ffffff)\"\n";
+        let mut catalog = ThemeCatalog::new();
+        catalog.insert(parse_theme_definition("syntax.toml", syntax).expect("parses"));
+        assert!(matches!(
+            catalog.resolve(&ThemeSelection::new("syntax")),
+            Err(ThemeError::InvalidExpression { .. })
+        ));
     }
 }

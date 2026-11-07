@@ -1,0 +1,33 @@
+# Seed palette adapted from the flexoki color scheme; see attribution/palettes.md.
+display_name   = "Flexoki"
+extends        = ["seeded-base"]
+id             = "flexoki"
+schema_version = 2
+
+[palette]
+accent     = "#4385be"
+background = "#100f0f"
+blue       = "#4385be"
+cyan       = "#3aa99f"
+green      = "#879a39"
+magenta    = "#ce5d97"
+orange     = "#da702c"
+red        = "#d14d41"
+text       = "#cecdc3"
+violet     = "#8b7ec8"
+yellow     = "#d0a215"
+
+[variants.dark]
+
+[variants.light.palette]
+accent     = "#205ea6"
+background = "#fffcf0"
+blue       = "#205ea6"
+cyan       = "#24837b"
+green      = "#66800b"
+magenta    = "#a02f6f"
+orange     = "#bc5215"
+red        = "#af3029"
+text       = "#100f0f"
+violet     = "#5e409d"
+yellow     = "#ad8301"

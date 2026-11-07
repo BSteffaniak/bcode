@@ -1,0 +1,67 @@
+# Profile: Terminal nostalgia: double-line frames, ASCII markers, no motion.
+# Profiles set chrome, structure, and containers only, so they combine with any palette.
+display_name   = "Retro (profile)"
+id             = "retro"
+kind           = "profile"
+schema_version = 2
+
+[chrome.tui]
+borders    = { panel = "double", dialog = "double", tool = "ascii", composer = "double" }
+density    = "cozy"
+icons      = "none"
+motion     = "none"
+separators = { status = "bar" }
+speaker    = "prefix"
+surfaces   = "flat"
+
+[[presentation.rules]]
+match = { kind = "tool", status = "succeeded" }
+set   = { disclosure = "summary" }
+
+[containers."transcript.user"]
+layout = "plain"
+
+[containers."transcript.assistant"]
+layout = "plain"
+
+[containers."tool.requested"]
+border    = "all"
+layout    = "panel"
+padding_x = 1
+width     = "full"
+
+[containers."tool.running"]
+border    = "all"
+layout    = "panel"
+padding_x = 1
+width     = "full"
+
+[containers."tool.waiting"]
+border    = "all"
+layout    = "panel"
+padding_x = 1
+width     = "full"
+
+[containers."tool.succeeded"]
+border    = "all"
+layout    = "panel"
+padding_x = 1
+width     = "full"
+
+[containers."tool.failed"]
+border    = "all"
+layout    = "panel"
+padding_x = 1
+width     = "full"
+
+[containers."tool.cancelled"]
+border    = "all"
+layout    = "panel"
+padding_x = 1
+width     = "full"
+
+[containers."tool.timed_out"]
+border    = "all"
+layout    = "panel"
+padding_x = 1
+width     = "full"

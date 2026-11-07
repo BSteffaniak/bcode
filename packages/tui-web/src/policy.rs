@@ -368,7 +368,16 @@ impl BrowserPolicy {
         }
     }
     pub(crate) fn component_theme(&self) -> bmux_tui_components::theme::ComponentTheme {
-        use bmux_tui_components::theme::{ComponentSurfaces, ComponentTheme};
+        use bmux_tui_components::theme::{
+            ComponentChrome, ComponentStateSurfaces, ComponentSurfaces, ComponentTheme,
+        };
+        let or = |role: &str, fallback: &str| {
+            if self.styles.contains_key(role) {
+                self.style(role)
+            } else {
+                self.style(fallback)
+            }
+        };
         ComponentTheme {
             canvas: self.style("surface"),
             surfaces: ComponentSurfaces {
@@ -381,15 +390,23 @@ impl BrowserPolicy {
                     .then(|| self.style("component.scrim")),
             },
             text: self.style("text"),
+            accent: or("component.accent", "component.info"),
+            title: or("component.title", "component.info"),
             focused: self.style("focused"),
+            hover: or("component.hover", "component.info"),
             selected: self.style("selection"),
+            selected_inactive: or("component.selection_inactive", "selection"),
             disabled: self.style("component.disabled"),
             muted: self.style("muted"),
+            link: or("component.link", "component.info"),
             info: self.style("component.info"),
             success: self.style("component.success"),
             warning: self.style("component.warning"),
             error: self.style("error"),
+            state_surfaces: ComponentStateSurfaces::NONE,
             border: self.style("border"),
+            border_focused: or("component.border_focused", "focused"),
+            chrome: ComponentChrome::DEFAULT,
         }
     }
     pub(crate) fn style(&self, role: &str) -> Style {

@@ -1,0 +1,17 @@
+# Seed palette adapted from the poimandres color scheme; see attribution/palettes.md.
+display_name   = "Poimandres"
+extends        = ["seeded-base"]
+id             = "poimandres"
+schema_version = 2
+
+[palette]
+accent     = "#5de4c7"
+background = "#1b1e28"
+blue       = "#add7ff"
+cyan       = "#89ddff"
+green      = "#5de4c7"
+magenta    = "#fcc5e9"
+orange     = "#91b4d5"
+red        = "#d0679d"
+text       = "#a6accd"
+yellow     = "#fffac2"

@@ -1,0 +1,31 @@
+# Seed palette adapted from the melange color scheme; see attribution/palettes.md.
+display_name   = "Melange"
+extends        = ["seeded-base"]
+id             = "melange"
+schema_version = 2
+
+[palette]
+accent     = "#ebc06d"
+background = "#292522"
+blue       = "#a3a9ce"
+cyan       = "#89b3b6"
+green      = "#85b695"
+magenta    = "#cf9bc2"
+orange     = "#e49b5d"
+red        = "#d47766"
+text       = "#ece1d7"
+yellow     = "#ebc06d"
+
+[variants.dark]
+
+[variants.light.palette]
+accent     = "#a06d00"
+background = "#f1f1f1"
+blue       = "#465aa4"
+cyan       = "#3d6568"
+green      = "#3a684a"
+magenta    = "#904180"
+orange     = "#bc5c00"
+red        = "#bf0021"
+text       = "#54433a"
+yellow     = "#a06d00"

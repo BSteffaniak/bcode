@@ -1,0 +1,18 @@
+# Seed palette adapted from the tokyonight color scheme; see attribution/palettes.md.
+display_name   = "Tokyo Night Moon"
+extends        = ["seeded-base"]
+id             = "tokyonight-moon"
+schema_version = 2
+
+[palette]
+accent     = "#82aaff"
+background = "#222436"
+blue       = "#82aaff"
+cyan       = "#86e1fc"
+green      = "#c3e88d"
+magenta    = "#c099ff"
+orange     = "#ff966c"
+red        = "#ff757f"
+text       = "#c8d3f5"
+violet     = "#fca7ea"
+yellow     = "#ffc777"

@@ -568,7 +568,8 @@ impl SessionSurface {
                     .effective
                     .policy
                     .as_ref()
-                    .map(crate::policy::BrowserPolicy::component_theme),
+                    .map(crate::policy::BrowserPolicy::component_theme)
+                    .as_ref(),
             );
             self.inner.transcript.rows = self.inner.transcript.accepted.layout.total_rows();
             self.inner.question.inline_item = None;

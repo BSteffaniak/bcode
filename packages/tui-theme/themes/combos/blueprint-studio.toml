@@ -1,0 +1,5 @@
+# Curated combination: blueprint palette with the structured profile.
+display_name   = "Blueprint Studio"
+extends        = ["blueprint", "structured"]
+id             = "blueprint-studio"
+schema_version = 2

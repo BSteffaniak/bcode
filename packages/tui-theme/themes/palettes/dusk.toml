@@ -1,0 +1,18 @@
+# Original Bcode palette.
+display_name   = "Dusk"
+extends        = ["seeded-base"]
+id             = "dusk"
+schema_version = 2
+
+[palette]
+accent     = "#f2a7c3"
+background = "#1c1726"
+blue       = "#9bb4f5"
+cyan       = "#92d8e0"
+green      = "#a8d8a0"
+magenta    = "#d7a5f2"
+orange     = "#f5b38a"
+red        = "#f28b9a"
+text       = "#e8def5"
+violet     = "#b79cf5"
+yellow     = "#f5d58a"

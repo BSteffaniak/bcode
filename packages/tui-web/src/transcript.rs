@@ -56,10 +56,9 @@ impl Transcript {
 
     /// Prepare producer-owned implementations outside BMUX paint, with one
     /// atomic accepted geometry for rows, images, selections and narrow actions.
-    pub fn prepare_visuals(&mut self, theme: Option<bmux_tui_components::theme::ComponentTheme>) {
+    pub fn prepare_visuals(&mut self, theme: Option<&bmux_tui_components::theme::ComponentTheme>) {
         if let Some(registry) = &self.registry {
-            self.accepted
-                .prepare_portable_visuals(registry, theme.as_ref());
+            self.accepted.prepare_portable_visuals(registry, theme);
         }
         self.rows = self.accepted.layout.total_rows();
     }

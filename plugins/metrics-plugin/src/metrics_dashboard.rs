@@ -1442,7 +1442,9 @@ mod tests {
                 link: syntax,
                 raw: syntax,
             },
+            component: bcode_plugin_sdk::tui::ComponentTheme::terminal_default(),
         }
+        .with_legacy_component()
     }
 
     #[test]

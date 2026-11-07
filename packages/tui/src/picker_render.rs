@@ -114,6 +114,7 @@ pub fn render_picker_panel(
     theme: TuiTheme,
 ) -> Rect {
     let shell = PickerFrame::new()
+        .chrome(crate::render::component_chrome())
         .title(title)
         .policy(PickerFramePolicy {
             chrome: true,

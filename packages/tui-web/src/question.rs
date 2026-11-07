@@ -89,7 +89,8 @@ impl QuestionSurface {
             bindings
                 .policy
                 .as_ref()
-                .map(crate::policy::BrowserPolicy::component_theme),
+                .map(crate::policy::BrowserPolicy::component_theme)
+                .as_ref(),
         );
         self.presentation.prepare(&EffectiveQuestionPort(bindings));
     }

@@ -1,0 +1,5 @@
+# Curated combination: terminal-native palette with the bare profile.
+display_name   = "Quiet"
+extends        = ["terminal-native", "bare"]
+id             = "quiet"
+schema_version = 2

@@ -1,0 +1,31 @@
+# Seed palette adapted from the nightfox color scheme; see attribution/palettes.md.
+display_name   = "Nightfox"
+extends        = ["seeded-base"]
+id             = "nightfox"
+schema_version = 2
+
+[palette]
+accent     = "#719cd6"
+background = "#192330"
+blue       = "#719cd6"
+cyan       = "#63cdcf"
+green      = "#81b29a"
+magenta    = "#9d79d6"
+orange     = "#f4a261"
+red        = "#c94f6d"
+text       = "#cdcecf"
+yellow     = "#dbc074"
+
+[variants.dark]
+
+[variants.light.palette]
+accent     = "#286983"
+background = "#faf4ed"
+blue       = "#286983"
+cyan       = "#56949f"
+green      = "#618774"
+magenta    = "#907aa9"
+orange     = "#d7827e"
+red        = "#b4637a"
+text       = "#575279"
+yellow     = "#ea9d34"

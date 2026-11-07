@@ -1,0 +1,17 @@
+# Original Bcode palette.
+display_name   = "Moss"
+extends        = ["seeded-base"]
+id             = "moss"
+schema_version = 2
+
+[palette]
+accent     = "#9ccf6e"
+background = "#141a14"
+blue       = "#7fa8b8"
+cyan       = "#7ec2a8"
+green      = "#9ccf6e"
+magenta    = "#c79ac0"
+orange     = "#d99a5e"
+red        = "#e57c6a"
+text       = "#dbe4d0"
+yellow     = "#d9c46a"

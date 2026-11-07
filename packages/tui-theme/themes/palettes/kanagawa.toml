@@ -1,0 +1,31 @@
+# Seed palette adapted from the kanagawa color scheme; see attribution/palettes.md.
+display_name   = "Kanagawa"
+extends        = ["seeded-base"]
+id             = "kanagawa"
+schema_version = 2
+
+[palette]
+accent     = "#7e9cd8"
+background = "#1f1f28"
+blue       = "#7e9cd8"
+cyan       = "#7fb4ca"
+green      = "#98bb6c"
+magenta    = "#957fb8"
+orange     = "#ffa066"
+red        = "#ff5d62"
+text       = "#dcd7ba"
+yellow     = "#e6c384"
+
+[variants.dark]
+
+[variants.light.palette]
+accent     = "#4d699b"
+background = "#f2ecbc"
+blue       = "#4d699b"
+cyan       = "#597b75"
+green      = "#6f894e"
+magenta    = "#624c83"
+orange     = "#cc6d00"
+red        = "#c84053"
+text       = "#545464"
+yellow     = "#77713f"

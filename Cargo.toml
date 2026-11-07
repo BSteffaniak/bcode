@@ -111,6 +111,8 @@ members = [
     "packages/session",
     "packages/session-migration",
     "packages/session-migration-target",
+    "packages/presentation-policy",
+    "packages/presentation-policy/models",
     "packages/session-view",
     "packages/session-view/models",
     "packages/session-import",
@@ -289,6 +291,8 @@ bcode_plugin                            = { version = "0.0.1-alpha.0", default-f
 bcode_plugin_config                     = { version = "0.0.1-alpha.0", default-features = false, path = "packages/plugin-config" }
 bcode_plugin_models                     = { version = "0.0.1-alpha.0", default-features = false, path = "packages/plugin/models" }
 bcode_plugin_sdk                        = { version = "0.0.1-alpha.0", default-features = false, path = "packages/plugin-sdk" }
+bcode_presentation_policy               = { version = "0.0.1-alpha.0", default-features = false, path = "packages/presentation-policy" }
+bcode_presentation_policy_models        = { version = "0.0.1-alpha.0", default-features = false, path = "packages/presentation-policy/models" }
 bcode_project_instructions              = { version = "0.0.1-alpha.0", default-features = false, path = "packages/project-instructions" }
 bcode_prompt_cache                      = { version = "0.0.1-alpha.0", default-features = false, path = "packages/prompt-cache" }
 bcode_prompt_cache_models               = { version = "0.0.1-alpha.0", default-features = false, path = "packages/prompt-cache/models" }
@@ -354,6 +358,7 @@ bmux_codec = { default-features = false, features = [
     "compression-lz4",
     "compression-zstd",
 ], version = "0.0.1-alpha.4" }
+bmux_color = { default-features = false, version = "0.0.1-alpha.4" }
 bmux_config_composition = { version = "0.0.1-alpha.4", default-features = false }
 bmux_image = { default-features = false, version = "0.0.1-alpha.4" }
 bmux_ipc = { default-features = false, version = "0.0.1-alpha.4" }
@@ -373,6 +378,7 @@ bmux_tui = { default-features = false, version = "0.0.1-alpha.4" }
 # isolated consumer builds working until upstream text-input owns this dependency.
 bmux_tui_components = { default-features = false, version = "0.0.1-alpha.4", features = [
     "completion",
+    "disclosure",
     "scroll-view",
 ] }
 bmux_tui_runtime = { default-features = false, version = "0.0.1-alpha.4" }
@@ -641,6 +647,7 @@ opt-level = 0
 [patch.crates-io]
 bmux_attach_image_protocol         = { git = "https://github.com/BSteffaniak/bmux", branch = "master" }
 bmux_codec                         = { git = "https://github.com/BSteffaniak/bmux", branch = "master" }
+bmux_color                         = { git = "https://github.com/BSteffaniak/bmux", branch = "master" }
 bmux_config_composition            = { git = "https://github.com/BSteffaniak/bmux", branch = "master" }
 bmux_fonts                         = { git = "https://github.com/BSteffaniak/bmux", branch = "master" }
 bmux_image                         = { git = "https://github.com/BSteffaniak/bmux", branch = "master" }

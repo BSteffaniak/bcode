@@ -1,0 +1,17 @@
+# Original Bcode palette.
+display_name   = "Ember"
+extends        = ["seeded-base"]
+id             = "ember"
+schema_version = 2
+
+[palette]
+accent     = "#ff7a45"
+background = "#160e0c"
+blue       = "#8fa8c8"
+cyan       = "#7fc4b8"
+green      = "#b8c46a"
+magenta    = "#e07a9b"
+orange     = "#ff7a45"
+red        = "#ff4d4d"
+text       = "#f1e3d8"
+yellow     = "#ffc857"

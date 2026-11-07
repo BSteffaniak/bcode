@@ -1,0 +1,31 @@
+# Seed palette adapted from the gruvbox-material color scheme; see attribution/palettes.md.
+display_name   = "Gruvbox Material"
+extends        = ["seeded-base"]
+id             = "gruvbox-material"
+schema_version = 2
+
+[palette]
+accent     = "#d8a657"
+background = "#292828"
+blue       = "#7daea3"
+cyan       = "#89b482"
+green      = "#a9b665"
+magenta    = "#d3869b"
+orange     = "#e78a4e"
+red        = "#ea6962"
+text       = "#d4be98"
+yellow     = "#d8a657"
+
+[variants.dark]
+
+[variants.light.palette]
+accent     = "#b47109"
+background = "#fbf1c7"
+blue       = "#45707a"
+cyan       = "#4c7a5d"
+green      = "#6c782e"
+magenta    = "#945e80"
+orange     = "#c35e0a"
+red        = "#c14a4a"
+text       = "#654735"
+yellow     = "#b47109"

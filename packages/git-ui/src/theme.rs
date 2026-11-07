@@ -113,16 +113,7 @@ impl GitTheme {
     /// Built-in colors used when no theme can be resolved.
     #[must_use]
     pub fn fallback() -> Self {
-        Self::from_definition(&ResolvedThemeDefinition {
-            id: "fallback".into(),
-            display_name: "Fallback".into(),
-            palette: std::collections::BTreeMap::new(),
-            styles: std::collections::BTreeMap::new(),
-            containers: std::collections::BTreeMap::new(),
-            extensions: std::collections::BTreeMap::new(),
-            applied_layers: Vec::new(),
-            fingerprint: 0,
-        })
+        Self::from_definition(&ResolvedThemeDefinition::empty("fallback", "Fallback"))
     }
 
     /// Derive UI styles from a resolved theme.
@@ -352,7 +343,10 @@ mod tests {
     #[test]
     fn every_bundled_theme_distinguishes_additions_from_removals() {
         let catalog = ThemeCatalog::bundled().unwrap();
-        for definition in catalog.definitions() {
+        for definition in catalog
+            .definitions()
+            .filter(|definition| definition.kind() == bcode_tui_theme::definition::ThemeKind::Theme)
+        {
             let resolved = catalog
                 .resolve(&ThemeSelection::new(definition.id()))
                 .unwrap();

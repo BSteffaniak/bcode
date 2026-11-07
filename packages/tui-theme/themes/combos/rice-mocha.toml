@@ -1,0 +1,5 @@
+# Curated combination: catppuccin-mocha palette with the riced profile.
+display_name   = "Rice · Mocha"
+extends        = ["catppuccin-mocha", "riced"]
+id             = "rice-mocha"
+schema_version = 2

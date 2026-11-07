@@ -1,0 +1,33 @@
+# Seed palette adapted from the modus color scheme; see attribution/palettes.md.
+display_name   = "Modus"
+extends        = ["seeded-base"]
+id             = "modus"
+schema_version = 2
+
+[palette]
+accent     = "#2fafff"
+background = "#000000"
+blue       = "#2fafff"
+cyan       = "#00d3d0"
+green      = "#44bc44"
+magenta    = "#feacd0"
+orange     = "#fec43f"
+red        = "#ff5f59"
+text       = "#ffffff"
+violet     = "#b6a0ff"
+yellow     = "#d0bc00"
+
+[variants.dark]
+
+[variants.light.palette]
+accent     = "#0031a9"
+background = "#ffffff"
+blue       = "#0031a9"
+cyan       = "#005e8b"
+green      = "#006800"
+magenta    = "#721045"
+orange     = "#884900"
+red        = "#a60000"
+text       = "#000000"
+violet     = "#531ab6"
+yellow     = "#6f5500"

@@ -1,0 +1,31 @@
+# Seed palette adapted from the ayu color scheme; see attribution/palettes.md.
+display_name   = "Ayu"
+extends        = ["seeded-base"]
+id             = "ayu"
+schema_version = 2
+
+[palette]
+accent     = "#e6b450"
+background = "#0d1017"
+blue       = "#59c2ff"
+cyan       = "#95e6cb"
+green      = "#aad94c"
+magenta    = "#d2a6ff"
+orange     = "#ff8f40"
+red        = "#f07178"
+text       = "#bfbdb6"
+yellow     = "#ffb454"
+
+[variants.dark]
+
+[variants.light.palette]
+accent     = "#ffaa33"
+background = "#fcfcfc"
+blue       = "#399ee6"
+cyan       = "#4cbf99"
+green      = "#86b300"
+magenta    = "#a37acc"
+orange     = "#fa8d3e"
+red        = "#e65050"
+text       = "#5c6166"
+yellow     = "#f2ae49"

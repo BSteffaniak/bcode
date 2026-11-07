@@ -1,0 +1,17 @@
+# Original Bcode palette.
+display_name   = "Amber"
+extends        = ["seeded-base"]
+id             = "amber"
+schema_version = 2
+
+[palette]
+accent     = "#ffb000"
+background = "#0d0700"
+blue       = "#ffcf80"
+cyan       = "#ffe0a0"
+green      = "#ffd27a"
+magenta    = "#ffa64d"
+orange     = "#ff9a1f"
+red        = "#ff6a3d"
+text       = "#ffc469"
+yellow     = "#ffb000"

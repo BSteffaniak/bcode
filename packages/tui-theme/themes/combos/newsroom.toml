@@ -1,0 +1,5 @@
+# Curated combination: paper palette with the editorial profile.
+display_name   = "Newsroom"
+extends        = ["paper", "editorial"]
+id             = "newsroom"
+schema_version = 2

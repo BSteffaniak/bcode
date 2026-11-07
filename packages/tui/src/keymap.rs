@@ -54,6 +54,12 @@ pub enum BmuxAction {
     MarkdownFocusPrevious,
     MarkdownActivate,
     MarkdownCopyDestination,
+    /// Expand every tool in the transcript.
+    ToolsExpandAll,
+    /// Collapse every tool in the transcript.
+    ToolsCollapseAll,
+    /// Drop manual tool toggles and return to theme/configured defaults.
+    ToolsResetDisclosure,
     TranscriptPageUp,
     TranscriptPageDown,
     TranscriptTop,
@@ -122,6 +128,9 @@ impl BmuxAction {
             Self::MarkdownFocusPrevious => "tui.markdown.focusPrevious",
             Self::MarkdownActivate => "tui.markdown.activate",
             Self::MarkdownCopyDestination => "tui.markdown.copyDestination",
+            Self::ToolsExpandAll => "tui.tools.expandAll",
+            Self::ToolsCollapseAll => "tui.tools.collapseAll",
+            Self::ToolsResetDisclosure => "tui.tools.resetDisclosure",
             Self::TranscriptPageUp => "transcript.pageUp",
             Self::TranscriptPageDown => "transcript.pageDown",
             Self::TranscriptTop => "transcript.top",
@@ -188,6 +197,9 @@ impl BmuxAction {
             Self::MarkdownFocusPrevious => "Markdown Focus Previous",
             Self::MarkdownActivate => "Markdown Activate",
             Self::MarkdownCopyDestination => "Markdown Copy Destination",
+            Self::ToolsExpandAll => "Expand All Tools",
+            Self::ToolsCollapseAll => "Collapse All Tools",
+            Self::ToolsResetDisclosure => "Reset Tool Disclosure",
             Self::TranscriptPageUp => "Transcript Page Up",
             Self::TranscriptPageDown => "Transcript Page Down",
             Self::TranscriptTop => "Transcript Top",
@@ -252,6 +264,9 @@ impl BmuxAction {
             "tui.markdown.focusPrevious" => Self::MarkdownFocusPrevious,
             "tui.markdown.activate" => Self::MarkdownActivate,
             "tui.markdown.copyDestination" => Self::MarkdownCopyDestination,
+            "tui.tools.expandAll" => Self::ToolsExpandAll,
+            "tui.tools.collapseAll" => Self::ToolsCollapseAll,
+            "tui.tools.resetDisclosure" => Self::ToolsResetDisclosure,
             "transcript.pageUp" => Self::TranscriptPageUp,
             "transcript.pageDown" => Self::TranscriptPageDown,
             "transcript.top" => Self::TranscriptTop,
@@ -1098,6 +1113,9 @@ impl BmuxKeyMap {
             | BmuxAction::MarkdownFocusPrevious
             | BmuxAction::MarkdownActivate
             | BmuxAction::MarkdownCopyDestination
+            | BmuxAction::ToolsExpandAll
+            | BmuxAction::ToolsCollapseAll
+            | BmuxAction::ToolsResetDisclosure
             | BmuxAction::TranscriptPageUp
             | BmuxAction::TranscriptPageDown
             | BmuxAction::TranscriptTop
@@ -1160,6 +1178,9 @@ impl BmuxKeyMap {
             | BmuxAction::MarkdownFocusPrevious
             | BmuxAction::MarkdownActivate
             | BmuxAction::MarkdownCopyDestination
+            | BmuxAction::ToolsExpandAll
+            | BmuxAction::ToolsCollapseAll
+            | BmuxAction::ToolsResetDisclosure
             | BmuxAction::TranscriptPageUp
             | BmuxAction::TranscriptPageDown
             | BmuxAction::TranscriptTop

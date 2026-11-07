@@ -1,0 +1,56 @@
+# Profile: Heavy rules and hard edges; no gradients, no softness.
+# Profiles set chrome, structure, and containers only, so they combine with any palette.
+display_name   = "Brutalist (profile)"
+id             = "brutalist"
+kind           = "profile"
+schema_version = 2
+
+[chrome.tui]
+borders    = { panel = "thick", dialog = "thick", tool = "thick", composer = "thick" }
+density    = "compact"
+icons      = "unicode"
+motion     = "none"
+separators = { status = "bar" }
+speaker    = "badge"
+surfaces   = "flat"
+
+[containers."transcript.user"]
+layout = "plain"
+
+[containers."transcript.assistant"]
+layout = "plain"
+
+[containers."tool.requested"]
+border = "all"
+layout = "panel"
+width  = "full"
+
+[containers."tool.running"]
+border = "all"
+layout = "panel"
+width  = "full"
+
+[containers."tool.waiting"]
+border = "all"
+layout = "panel"
+width  = "full"
+
+[containers."tool.succeeded"]
+border = "all"
+layout = "panel"
+width  = "full"
+
+[containers."tool.failed"]
+border = "all"
+layout = "panel"
+width  = "full"
+
+[containers."tool.cancelled"]
+border = "all"
+layout = "panel"
+width  = "full"
+
+[containers."tool.timed_out"]
+border = "all"
+layout = "panel"
+width  = "full"

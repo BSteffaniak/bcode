@@ -1,0 +1,18 @@
+# Seed palette adapted from the catppuccin color scheme; see attribution/palettes.md.
+display_name   = "Catppuccin Macchiato"
+extends        = ["seeded-base"]
+id             = "catppuccin-macchiato"
+schema_version = 2
+
+[palette]
+accent     = "#c6a0f6"
+background = "#24273a"
+blue       = "#8aadf4"
+cyan       = "#8bd5ca"
+green      = "#a6da95"
+magenta    = "#f5bde6"
+orange     = "#f5a97f"
+red        = "#ed8796"
+text       = "#cad3f5"
+violet     = "#b7bdf8"
+yellow     = "#eed49f"

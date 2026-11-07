@@ -1,0 +1,5 @@
+# Curated combination: amber palette with the retro profile.
+display_name   = "Amber Terminal"
+extends        = ["amber", "retro"]
+id             = "amber-terminal"
+schema_version = 2

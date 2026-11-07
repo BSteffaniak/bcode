@@ -127,6 +127,8 @@ fn sync_layout(app: &mut BmuxApp, width: u16) {
     app.capture_stable_transcript_anchor();
     render::set_markdown_details_open(app.markdown_details_open());
     render::set_plugin_visual_theme(&app.presented_theme());
+    app.refresh_structure_turns();
+    render::set_structure(app.structure_snapshot());
     let started = Instant::now();
     let elapsed_dirty_visuals =
         app.drain_elapsed_dirty_visuals_bounded(MAX_DIRTY_VISUALS_PER_LAYOUT_SYNC);
@@ -233,6 +235,9 @@ struct TranscriptLayoutInput<'a> {
     markdown_presentation_revision: u64,
     pending_submissions_projection_revision: u64,
     theme_fingerprint: u64,
+    structure_policy_fingerprint: u64,
+    structure_revision: u64,
+    structure_turns: String,
     has_older_history: bool,
     loading_older_history: bool,
 }
@@ -251,6 +256,9 @@ impl<'a> TranscriptLayoutInput<'a> {
             markdown_presentation_revision: app.markdown_presentation_revision(),
             pending_submissions_projection_revision: app.pending_submissions_projection_revision(),
             theme_fingerprint: app.presented_theme().fingerprint,
+            structure_policy_fingerprint: app.structure().policy_fingerprint(),
+            structure_revision: app.structure().revision(),
+            structure_turns: app.structure().turn_key(),
             has_older_history: app.has_older_history(),
             loading_older_history: app.loading_older_history(),
         }
@@ -269,10 +277,11 @@ impl<'a> TranscriptLayoutInput<'a> {
             },
         );
         TranscriptLayoutFingerprint::new(format!(
-            "{};transcript-rev:{};elapsed-rev:{};visual-generation:{presentation}",
+            "{};transcript-rev:{};elapsed-rev:{};visual-generation:{presentation};structure-rev:{}",
             self.structural_fingerprint().as_str(),
             self.transcript_projection_revision,
-            self.elapsed_layout_revision
+            self.elapsed_layout_revision,
+            self.structure_revision
         ))
     }
 
@@ -282,10 +291,12 @@ impl<'a> TranscriptLayoutInput<'a> {
             |host| format!("{}:{}", std::ptr::from_ref(host).addr(), host.revision()),
         );
         TranscriptLayoutFingerprint::new(format!(
-            "width:{};diff:{:?};theme:{};history:{}:{};presentation:{presentation};markdown-presentation-rev:{};transcript-len:{};pending-rev:{};pending-len:{}",
+            "width:{};diff:{:?};theme:{};structure:{}:{};history:{}:{};presentation:{presentation};markdown-presentation-rev:{};transcript-len:{};pending-rev:{};pending-len:{}",
             self.width,
             self.diff_viewer_config,
             self.theme_fingerprint,
+            self.structure_policy_fingerprint,
+            self.structure_turns,
             self.has_older_history,
             self.loading_older_history,
             self.markdown_presentation_revision,
@@ -318,6 +329,9 @@ pub fn test_layout_signature(
         markdown_presentation_revision: 0,
         pending_submissions_projection_revision: 0,
         theme_fingerprint: 0,
+        structure_policy_fingerprint: 0,
+        structure_revision: 0,
+        structure_turns: String::new(),
         has_older_history: false,
         loading_older_history: false,
     };
@@ -347,6 +361,9 @@ pub fn test_layout_signature_with_interaction_height(
         markdown_presentation_revision: 0,
         pending_submissions_projection_revision: 0,
         theme_fingerprint: 0,
+        structure_policy_fingerprint: 0,
+        structure_revision: 0,
+        structure_turns: String::new(),
         has_older_history: false,
         loading_older_history: false,
     };
@@ -375,6 +392,9 @@ pub fn test_layout_signature_with_theme(
         markdown_presentation_revision: 0,
         pending_submissions_projection_revision: 0,
         theme_fingerprint,
+        structure_policy_fingerprint: 0,
+        structure_revision: 0,
+        structure_turns: String::new(),
         has_older_history: false,
         loading_older_history: false,
     };

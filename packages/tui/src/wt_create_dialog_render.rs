@@ -57,6 +57,7 @@ fn modal_frame(theme: TuiTheme) -> ModalFrame {
         ModalSizing::new(Size::new(56, 10), Size::new(80, 12), Insets::all(4)),
         theme.modal_theme(),
     )
+    .chrome(crate::render::dialog_chrome())
     .title(" Create worktree ")
     .padding(Insets::new(1, 2, 1, 2))
     .placement(ModalPlacement::UpperThird)

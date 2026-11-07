@@ -202,7 +202,7 @@ impl Default for QuestionSurfaceTheme {
 }
 
 impl QuestionSurfaceTheme {
-    fn from_component_theme(theme: Option<bmux_tui_components::theme::ComponentTheme>) -> Self {
+    fn from_component_theme(theme: Option<&bmux_tui_components::theme::ComponentTheme>) -> Self {
         theme.map_or_else(Self::default, |theme| Self {
             text: theme.text,
             muted: theme.muted,
@@ -214,7 +214,7 @@ impl QuestionSurfaceTheme {
     }
     #[cfg(feature = "static-bundled")]
     fn resolve(theme: Option<&PluginTuiTheme>) -> Self {
-        Self::from_component_theme(theme.and_then(PluginTuiTheme::component_theme))
+        Self::from_component_theme(theme.and_then(PluginTuiTheme::component_theme).as_ref())
     }
 }
 
@@ -227,7 +227,7 @@ struct ControlRegion {
 impl QuestionTerminalRenderer {
     pub(crate) fn set_component_theme(
         &mut self,
-        theme: Option<bmux_tui_components::theme::ComponentTheme>,
+        theme: Option<&bmux_tui_components::theme::ComponentTheme>,
     ) {
         self.theme = QuestionSurfaceTheme::from_component_theme(theme);
     }
@@ -2466,7 +2466,9 @@ mod tests {
                 link: syntax_color,
                 raw: syntax_color,
             },
-        };
+            component: bcode_plugin_sdk::tui::ComponentTheme::terminal_default(),
+        }
+        .with_legacy_component();
         let buffer =
             render_snapshot_with_theme(&mut renderer, &snapshot, Rect::new(0, 0, 48, 12), &theme);
         let text = rendered_text(&buffer);

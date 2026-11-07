@@ -1,0 +1,50 @@
+# Profile: Whitespace does the work: hairline rules, one accent, quiet tools.
+# Profiles set chrome, structure, and containers only, so they combine with any palette.
+display_name   = "Minimal (profile)"
+id             = "minimal"
+kind           = "profile"
+schema_version = 2
+
+[chrome.tui]
+borders    = { panel = "single", dialog = "rounded", tool = "none", composer = "single" }
+density    = "cozy"
+icons      = "unicode"
+motion     = "subtle"
+separators = { status = "plain" }
+speaker    = "prefix"
+surfaces   = "flat"
+
+[[presentation.rules]]
+match = { kind = "tool", status = "succeeded" }
+set   = { disclosure = "summary", parts = { timing = false } }
+
+[[presentation.rules]]
+match = { kind = "tool", tool = ["read", "glob", "grep", "list"] }
+set   = { disclosure = "collapsed", group = "consecutive_same_tool" }
+
+[containers."transcript.user"]
+layout = "plain"
+
+[containers."transcript.assistant"]
+layout = "plain"
+
+[containers."tool.requested"]
+layout = "plain"
+
+[containers."tool.running"]
+layout = "plain"
+
+[containers."tool.waiting"]
+layout = "plain"
+
+[containers."tool.succeeded"]
+layout = "plain"
+
+[containers."tool.failed"]
+layout = "plain"
+
+[containers."tool.cancelled"]
+layout = "plain"
+
+[containers."tool.timed_out"]
+layout = "plain"

@@ -1,0 +1,31 @@
+# Seed palette adapted from the rose-pine color scheme; see attribution/palettes.md.
+display_name   = "Rosé Pine"
+extends        = ["seeded-base"]
+id             = "rose-pine"
+schema_version = 2
+
+[palette]
+accent     = "#c4a7e7"
+background = "#191724"
+blue       = "#31748f"
+cyan       = "#9ccfd8"
+green      = "#9ccfd8"
+magenta    = "#c4a7e7"
+orange     = "#ebbcba"
+red        = "#eb6f92"
+text       = "#e0def4"
+yellow     = "#f6c177"
+
+[variants.dark]
+
+[variants.light.palette]
+accent     = "#907aa9"
+background = "#faf4ed"
+blue       = "#286983"
+cyan       = "#56949f"
+green      = "#56949f"
+magenta    = "#907aa9"
+orange     = "#d7827e"
+red        = "#b4637a"
+text       = "#575279"
+yellow     = "#ea9d34"

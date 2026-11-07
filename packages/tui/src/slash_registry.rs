@@ -19,6 +19,7 @@ pub enum BuiltinCommandId {
     Agent,
     Compact,
     Theme,
+    Profile,
     Streaming,
     Model,
     AuthPool,
@@ -171,6 +172,15 @@ const BUILTIN_COMMANDS: &[BuiltinCommandSpec] = &[
             completion!("/theme preview ", "Preview bundled theme"),
             completion!("/theme apply ", "Persist bundled theme"),
             completion!("/theme cancel", "Cancel theme preview"),
+        ],
+    },
+    BuiltinCommandSpec {
+        id: BuiltinCommandId::Profile,
+        names: &["profile"],
+        completions: &[
+            completion!("/profile", "List interface profiles"),
+            completion!("/profile apply ", "Persist an interface profile"),
+            completion!("/profile reset", "Clear the saved profile"),
         ],
     },
     BuiltinCommandSpec {

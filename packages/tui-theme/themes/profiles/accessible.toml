@@ -1,0 +1,67 @@
+# Profile: Never color alone: explicit frames, verbose labels, no motion.
+# Profiles set chrome, structure, and containers only, so they combine with any palette.
+display_name   = "Accessible (profile)"
+id             = "accessible"
+kind           = "profile"
+schema_version = 2
+
+[chrome.tui]
+borders    = { panel = "single", dialog = "double", tool = "left", composer = "single" }
+density    = "comfortable"
+icons      = "unicode"
+motion     = "none"
+separators = { status = "bar" }
+speaker    = "badge"
+surfaces   = "layered"
+
+[[presentation.rules]]
+match = { kind = "tool" }
+set   = { disclosure = "expanded", detail = "verbose" }
+
+[containers."transcript.user"]
+layout = "plain"
+
+[containers."transcript.assistant"]
+layout = "plain"
+
+[containers."tool.requested"]
+border    = "left"
+layout    = "left_bar"
+padding_x = 1
+width     = "full"
+
+[containers."tool.running"]
+border    = "left"
+layout    = "left_bar"
+padding_x = 1
+width     = "full"
+
+[containers."tool.waiting"]
+border    = "left"
+layout    = "left_bar"
+padding_x = 1
+width     = "full"
+
+[containers."tool.succeeded"]
+border    = "left"
+layout    = "left_bar"
+padding_x = 1
+width     = "full"
+
+[containers."tool.failed"]
+border    = "all"
+layout    = "panel"
+padding_x = 1
+width     = "full"
+
+[containers."tool.cancelled"]
+border    = "left"
+layout    = "left_bar"
+padding_x = 1
+width     = "full"
+
+[containers."tool.timed_out"]
+border    = "left"
+layout    = "left_bar"
+padding_x = 1
+width     = "full"

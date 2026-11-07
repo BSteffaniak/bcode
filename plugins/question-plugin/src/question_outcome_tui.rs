@@ -126,7 +126,9 @@ mod tests {
                 link: PluginTuiSyntaxColor::from_tui(Color::Default),
                 raw: PluginTuiSyntaxColor::from_tui(Color::Default),
             },
-        };
+            component: bcode_plugin_sdk::tui::ComponentTheme::terminal_default(),
+        }
+        .with_legacy_component();
         let rows = bcode_plugin_sdk::tui::PluginTuiVisualAdapter::rows(
             &QuestionOutcomeTuiVisualAdapter,
             "bcode.question.outcome",

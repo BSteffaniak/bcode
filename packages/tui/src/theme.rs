@@ -1,14 +1,18 @@
 //! Theme resolution and presentation state.
 
-pub use bcode_tui_theme::{definition, discovery};
+pub use bcode_tui_theme::{definition, discovery, roles};
 
 use std::num::ParseIntError;
 
 use bcode_config::{TuiAgentAccentPolicy, TuiThemeVariant};
 use bmux_tui::style::{Color, Modifier};
-use bmux_tui_components::theme::{ComponentSurfaces, ComponentTheme};
+use bmux_tui_components::theme::{
+    ComponentChrome, ComponentStateSurfaces, ComponentSurfaces, ComponentTheme,
+};
 
 use super::app::BmuxApp;
+
+pub mod chrome;
 
 /// One bounded theme catalog row for selection and diagnostics UI.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -66,6 +70,7 @@ pub fn catalog_view(app: &mut BmuxApp) -> ThemeCatalogView {
     let entries = discovered
         .catalog
         .definitions()
+        .filter(|definition| definition.kind() == definition::ThemeKind::Theme)
         .map(|definition| {
             let source = discovered.sources.get(definition.id()).map_or_else(
                 || "bundled".to_owned(),
@@ -101,6 +106,29 @@ pub fn catalog_view(app: &mut BmuxApp) -> ThemeCatalogView {
         entries,
         diagnostics,
     }
+}
+
+/// Return the selectable profiles as `(id, display name, selected)`.
+#[must_use]
+pub fn profile_catalog(app: &mut BmuxApp) -> Vec<(String, String, bool)> {
+    let selected = app.tui_config().theme.profile.clone();
+    app.theme_catalog().map_or_else(Vec::new, |discovered| {
+        discovered
+            .catalog
+            .definitions()
+            .filter(|definition| definition.kind() == definition::ThemeKind::Profile)
+            .map(|definition| {
+                (
+                    definition.id().to_owned(),
+                    definition
+                        .display_name()
+                        .trim_end_matches(" (profile)")
+                        .to_owned(),
+                    selected.as_deref() == Some(definition.id()),
+                )
+            })
+            .collect()
+    })
 }
 
 /// Return the stable metadata signature of the active theme input roots.
@@ -265,6 +293,10 @@ pub struct ResolvedTheme {
     pub containers: TranscriptContainerTheme,
     /// Resolved semantic transcript and generic tool content styles.
     pub transcript: TranscriptStyleTheme,
+    /// Border glyphs and focus effects for dialogs and modals.
+    pub dialog_chrome: ComponentChrome,
+    /// Complete generic component theme, including v2 roles and chrome.
+    pub component: ComponentTheme,
     /// Stable resolved presentation fingerprint.
     pub fingerprint: u64,
 }
@@ -290,6 +322,8 @@ impl ResolvedTheme {
             diff: self.diff,
             containers: self.containers,
             transcript: self.transcript,
+            dialog_chrome: self.dialog_chrome,
+            component: self.component,
             fingerprint: self.fingerprint,
         }
     }
@@ -334,14 +368,22 @@ pub struct PresentedTheme {
     pub containers: TranscriptContainerTheme,
     /// Resolved semantic transcript and generic tool content styles.
     pub transcript: TranscriptStyleTheme,
+    /// Border glyphs and focus effects for dialogs and modals.
+    pub dialog_chrome: ComponentChrome,
+    /// Complete generic component theme, including v2 roles and chrome.
+    pub component: ComponentTheme,
     /// Stable resolved presentation fingerprint.
     pub fingerprint: u64,
 }
 
 impl PresentedTheme {
     /// Convert Bcode's resolved presentation into the canonical generic component theme.
+    ///
+    /// Core roles come from this presentation's fields, so adjustments made to
+    /// them (for example `NO_COLOR` handling) always reach components; roles
+    /// that exist only in the component theme come from the resolved theme.
     #[must_use]
-    pub const fn component_theme(self) -> ComponentTheme {
+    pub const fn component_theme(&self) -> ComponentTheme {
         ComponentTheme {
             canvas: self.canvas,
             surfaces: ComponentSurfaces {
@@ -360,6 +402,7 @@ impl PresentedTheme {
             warning: self.warning,
             error: self.error,
             border: self.border,
+            ..self.component
         }
     }
 }
@@ -402,7 +445,7 @@ pub fn resolve_configured_theme(
 ) -> PresentedTheme {
     let resolved = resolve_definition(
         &config.theme.name,
-        &config.theme.overlays,
+        &config.theme.effective_overlays(),
         config.theme.variant,
         project_root,
         &config.theme.paths,
@@ -414,6 +457,17 @@ pub fn resolve_configured_theme(
 /// Resolve the target theme from app state.
 #[must_use]
 pub fn resolve_theme(app: &BmuxApp) -> ResolvedTheme {
+    resolve_theme_with_structure(app).0
+}
+
+/// Resolve the target theme and its structural presentation rule layers.
+#[must_use]
+pub fn resolve_theme_with_structure(
+    app: &BmuxApp,
+) -> (
+    ResolvedTheme,
+    Vec<bcode_presentation_policy::models::RuleLayer>,
+) {
     let project_root = app
         .working_directory()
         .map(std::path::Path::to_path_buf)
@@ -421,14 +475,18 @@ pub fn resolve_theme(app: &BmuxApp) -> ResolvedTheme {
         .unwrap_or_else(|| std::path::PathBuf::from("."));
     let resolved = resolve_definition(
         &app.tui_config().theme.name,
-        &app.tui_config().theme.overlays,
+        &app.tui_config().theme.effective_overlays(),
         app.tui_config().theme.variant,
         &project_root,
         &app.tui_config().theme.paths,
     );
     let configured_theme_accent = resolved_accent(resolved.as_ref());
     let accent = resolve_app_accent(app, configured_theme_accent);
-    resolved_definition_theme(resolved.as_ref(), accent)
+    let layers = resolved
+        .as_ref()
+        .map(|resolved| resolved.presentation.clone())
+        .unwrap_or_default();
+    (resolved_definition_theme(resolved.as_ref(), accent), layers)
 }
 
 pub(crate) fn resolve_app_accent(app: &BmuxApp, configured_theme_accent: Color) -> Color {
@@ -475,10 +533,7 @@ fn resolve_definition(
             discovered.catalog
         })
         .or_else(|_| definition::ThemeCatalog::bundled());
-    let variant = resolve_variant(
-        variant,
-        bmux_tui::capabilities::TerminalCapabilities::detect(),
-    );
+    let variant = resolve_variant(variant, terminal_capabilities());
     catalog
         .and_then(|catalog| {
             catalog.resolve(
@@ -490,13 +545,53 @@ fn resolve_definition(
         .ok()
 }
 
+/// Process-wide terminal color replies; a Bcode process drives one terminal.
+#[must_use]
+pub fn terminal_colors() -> bmux_tui_runtime::TerminalColorsHandle {
+    static COLORS: std::sync::LazyLock<bmux_tui_runtime::TerminalColorsHandle> =
+        std::sync::LazyLock::new(bmux_tui_runtime::TerminalColorsHandle::default);
+    COLORS.clone()
+}
+
+/// BMUX color depth for a configured policy; `auto` follows terminal detection.
+#[must_use]
+pub fn terminal_color_depth(
+    configured: bcode_config::TuiColorDepth,
+) -> bmux_tui::capabilities::TerminalColorDepth {
+    use bcode_config::TuiColorDepth;
+    use bmux_tui::capabilities::{TerminalCapabilities, TerminalColorDepth};
+    match configured {
+        // Only NO_COLOR/dumb terminals are honored automatically: COLORTERM
+        // is often dropped by multiplexers and SSH on truecolor-capable
+        // terminals, so reduced depths are explicit opt-ins.
+        TuiColorDepth::Auto => match TerminalCapabilities::detect().color_depth {
+            TerminalColorDepth::Monochrome => TerminalColorDepth::Monochrome,
+            TerminalColorDepth::Ansi16
+            | TerminalColorDepth::Ansi256
+            | TerminalColorDepth::TrueColor => TerminalColorDepth::TrueColor,
+        },
+        TuiColorDepth::Truecolor => TerminalColorDepth::TrueColor,
+        TuiColorDepth::Ansi256 => TerminalColorDepth::Ansi256,
+        TuiColorDepth::Ansi16 => TerminalColorDepth::Ansi16,
+        TuiColorDepth::None => TerminalColorDepth::Monochrome,
+    }
+}
+
 pub(crate) fn resolve_variant_for_config(
     variant: TuiThemeVariant,
 ) -> definition::ResolvedThemeVariant {
-    resolve_variant(
-        variant,
-        bmux_tui::capabilities::TerminalCapabilities::detect(),
-    )
+    resolve_variant(variant, terminal_capabilities())
+}
+
+/// Environment capabilities, with the background replaced by the terminal's
+/// reported background color when it has answered the color query.
+fn terminal_capabilities() -> bmux_tui::capabilities::TerminalCapabilities {
+    let mut capabilities = bmux_tui::capabilities::TerminalCapabilities::detect();
+    let reported = terminal_colors().get().background_appearance();
+    if reported != bmux_tui::capabilities::TerminalBackground::Unknown {
+        capabilities.background = reported;
+    }
+    capabilities
 }
 
 const fn resolve_variant(
@@ -563,6 +658,10 @@ pub(crate) fn resolved_definition_theme(
     let error = style("state.error").unwrap_or(text);
     let markdown = markdown_theme(theme, text, muted);
     let syntax = syntax_palette(theme, text, muted, info, success, warning);
+    let title = style("title").unwrap_or_else(|| info.add_modifier(Modifier::BOLD));
+    let link = style("link")
+        .or_else(|| style("markdown.link"))
+        .unwrap_or_else(|| info.add_modifier(Modifier::UNDERLINE));
     let component_theme = ComponentTheme {
         canvas,
         surfaces: ComponentSurfaces {
@@ -572,15 +671,28 @@ pub(crate) fn resolved_definition_theme(
             scrim: surfaces.scrim,
         },
         text,
+        accent: style("accent").unwrap_or(info),
+        title,
         focused,
+        hover: style("control.hover").unwrap_or(info),
         selected: selection,
+        selected_inactive: style("selection.inactive").unwrap_or(selection),
         disabled: muted.add_modifier(Modifier::DIM),
         muted,
+        link,
         info,
         success,
         warning,
         error,
+        state_surfaces: ComponentStateSurfaces {
+            info: style("state.info.surface").unwrap_or_default(),
+            success: style("state.success.surface").unwrap_or_default(),
+            warning: style("state.warning.surface").unwrap_or_default(),
+            error: style("state.error.surface").unwrap_or_default(),
+        },
         border,
+        border_focused: style("border.focused.panel").unwrap_or(focused),
+        chrome: theme.map_or(ComponentChrome::DEFAULT, chrome::component_chrome),
     };
     let mut source = bcode_tui_components::source_viewer::source_viewer_style(component_theme);
     source.source = style("source.text").unwrap_or(source.source);
@@ -675,6 +787,8 @@ pub(crate) fn resolved_definition_theme(
         diff,
         containers,
         transcript,
+        dialog_chrome: theme.map_or(ComponentChrome::DEFAULT, chrome::dialog_chrome),
+        component: component_theme,
         fingerprint: theme.map_or(0, |theme| theme.fingerprint),
     }
 }

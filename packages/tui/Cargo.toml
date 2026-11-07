@@ -26,6 +26,7 @@ bcode_metrics = { workspace = true }
 bcode_model = { workspace = true }
 bcode_plugin = { workspace = true }
 bcode_plugin_sdk = { workspace = true, features = ["tui"] }
+bcode_presentation_policy = { workspace = true }
 bcode_provider_auth = { workspace = true }
 bcode_provider_auth_models = { workspace = true }
 bcode_ralph = { workspace = true }
@@ -61,6 +62,7 @@ bcode_workflow_store = { workspace = true }
 bcode_workflow_view_models = { workspace = true }
 bcode_worktree_models = { workspace = true }
 bcode_xray_inspector = { workspace = true }
+bmux_color = { workspace = true }
 bmux_image = { workspace = true, features = ["iterm2", "kitty", "sixel"] }
 bmux_keyboard = { workspace = true }
 bmux_mermaid_render = { workspace = true }

@@ -86,12 +86,15 @@ pub fn palette_list_area(area: Rect) -> Rect {
     )
 }
 
-const fn command_palette_frame() -> PickerFrame<'static> {
-    PickerFrame::new().title(" Commands ").policy(
-        PickerFramePolicy::palette()
-            .placement(bmux_tui_components::picker_frame::PickerFramePlacement::UpperThird)
-            .max_size(Size::new(72, 12)),
-    )
+fn command_palette_frame() -> PickerFrame<'static> {
+    PickerFrame::new()
+        .chrome(crate::render::component_chrome())
+        .title(" Commands ")
+        .policy(
+            PickerFramePolicy::palette()
+                .placement(bmux_tui_components::picker_frame::PickerFramePlacement::UpperThird)
+                .max_size(Size::new(72, 12)),
+        )
 }
 
 const fn command_palette_styles(theme: TuiTheme) -> PickerFrameStyles {

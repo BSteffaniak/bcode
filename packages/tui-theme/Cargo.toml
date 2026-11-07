@@ -11,14 +11,19 @@ repository  = { workspace = true }
 version     = { workspace = true }
 
 [dependencies]
-bmux_tui  = { workspace = true }
-serde     = { workspace = true, features = ["derive", "std"] }
-thiserror = { workspace = true }
-toml      = { workspace = true }
+bcode_presentation_policy_models = { workspace = true }
+bmux_color                       = { workspace = true }
+bmux_tui                         = { workspace = true }
+serde                            = { workspace = true, features = ["derive", "std"] }
+thiserror                        = { workspace = true }
+toml                             = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }
 
 [features]
-default          = []
-fail-on-warnings = []
+default = []
+fail-on-warnings = [
+    "bcode_presentation_policy_models/fail-on-warnings",
+    "bmux_color/fail-on-warnings",
+]

@@ -216,6 +216,8 @@ pub struct PreparedPresentation {
         bcode_config::ConfigError,
     >,
     presentation: Result<super::plugin_tui::PluginTuiPresentation, bcode_plugin::PluginLoadError>,
+    structure_rules:
+        Result<Vec<bcode_presentation_policy::models::PresentationRule>, bcode_config::ConfigError>,
 }
 
 /// Prepare synchronous native-plugin/configuration loading on a blocking worker.
@@ -232,6 +234,7 @@ pub async fn prepare_presentation(
 fn load_presentation(static_plugins: &[bcode_plugin::StaticBundledPlugin]) -> PreparedPresentation {
     let config = bcode_config::load_config();
     let streaming_override = bcode_config::load_tui_streaming_presentation_override();
+    let structure_rules = bcode_config::load_tui_presentation_rules();
     let presentation_config = config.as_ref().ok();
     let selection =
         presentation_config.map_or_else(bcode_plugin::PluginSelection::all_enabled, |config| {
@@ -252,6 +255,7 @@ fn load_presentation(static_plugins: &[bcode_plugin::StaticBundledPlugin]) -> Pr
         config,
         streaming_override,
         presentation,
+        structure_rules,
     }
 }
 
@@ -320,6 +324,7 @@ fn initialize_tui_with_presentation(
         config,
         streaming_override: streaming_presentation_override,
         presentation,
+        structure_rules,
     } = presentation;
     let client = config
         .as_ref()
@@ -375,6 +380,14 @@ fn initialize_tui_with_presentation(
         &mut settings,
         &mut chat,
     );
+    match structure_rules {
+        Ok(rules) => {
+            chat.app.apply_user_structure_rules(rules);
+        }
+        Err(error) => chat
+            .app
+            .set_status(format!("TUI presentation rules unavailable: {error}")),
+    }
     chat.start_effect(TuiEffect::LoadAgentCatalog);
     if let Some(session_id) = session_id {
         let initial_window_request = session_flow::initial_transcript_window_request(
@@ -427,6 +440,8 @@ fn apply_initial_config(
         .set_effective_keymap(settings.keymap().registry().clone());
     settings.set_completion_settings(config.presentation.completion);
     chat.app.apply_tui_config(config.tui.clone());
+    chat.app
+        .apply_configured_structure_rules(config.presentation.rules.clone());
     let declarative = config.presentation.streaming.policy();
     let effective_override = match streaming_override {
         Ok(streaming_override) => {
@@ -648,6 +663,7 @@ async fn run_managed_chat_bound<W: Write + Send>(
         config,
         streaming_override,
         presentation,
+        structure_rules,
     } = prepare_presentation(static_plugins).await?;
     let (event_sender, event_receiver) = history_flow::session_stream_channel();
     let agents = session_flow::AgentCatalog::default();
@@ -659,6 +675,9 @@ async fn run_managed_chat_bound<W: Write + Send>(
             app: {
                 let mut app = BmuxApp::new_with_history(Some(session_id), &[], &[], false);
                 app.set_managed_execution(session_id);
+                if let Ok(rules) = structure_rules {
+                    app.apply_user_structure_rules(rules);
+                }
                 if let Ok(presentation) = presentation {
                     app.set_plugin_presentation(Arc::new(presentation));
                 }

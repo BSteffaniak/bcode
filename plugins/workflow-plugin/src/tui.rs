@@ -1033,7 +1033,7 @@ impl WorkflowStatusSurface {
     fn render_focused_pane(
         area: Rect,
         frame: &mut PaintCx<'_, '_>,
-        theme: WorkflowSurfaceTheme,
+        theme: &WorkflowSurfaceTheme,
         title: &'static str,
         focused: bool,
     ) -> Rect {
@@ -1054,7 +1054,7 @@ impl WorkflowStatusSurface {
         &self,
         area: Rect,
         frame: &mut PaintCx<'_, '_>,
-        theme: WorkflowSurfaceTheme,
+        theme: &WorkflowSurfaceTheme,
         catalog: &bcode_workflow_view_models::WorkflowCatalogView,
         focused: bool,
     ) {
@@ -1066,7 +1066,7 @@ impl WorkflowStatusSurface {
         &self,
         area: Rect,
         frame: &mut PaintCx<'_, '_>,
-        theme: WorkflowSurfaceTheme,
+        theme: &WorkflowSurfaceTheme,
         focused: bool,
     ) {
         let inner = Self::render_focused_pane(area, frame, theme, "Execution graph", focused);
@@ -1077,7 +1077,7 @@ impl WorkflowStatusSurface {
         &self,
         area: Rect,
         frame: &mut PaintCx<'_, '_>,
-        theme: WorkflowSurfaceTheme,
+        theme: &WorkflowSurfaceTheme,
         tabbed: bool,
         focused: bool,
     ) {
@@ -1089,7 +1089,7 @@ impl WorkflowStatusSurface {
         &self,
         area: Rect,
         frame: &mut PaintCx<'_, '_>,
-        theme: WorkflowSurfaceTheme,
+        theme: &WorkflowSurfaceTheme,
         focused: bool,
     ) {
         let inner = Self::render_focused_pane(area, frame, theme, "Actions", focused);
@@ -1099,7 +1099,7 @@ impl WorkflowStatusSurface {
     fn calculate_workspace_areas(
         &self,
         area: Rect,
-        theme: WorkflowSurfaceTheme,
+        theme: &WorkflowSurfaceTheme,
     ) -> WorkflowWorkspaceAreas {
         const GUTTER: u16 = 1;
         let mut areas = WorkflowWorkspaceAreas {
@@ -1232,7 +1232,7 @@ impl WorkflowStatusSurface {
         &self,
         area: Rect,
         frame: &mut PaintCx<'_, '_>,
-        theme: WorkflowSurfaceTheme,
+        theme: &WorkflowSurfaceTheme,
     ) {
         let modes = [
             TabItem::new("discover", "Discover"),
@@ -1256,7 +1256,7 @@ impl WorkflowStatusSurface {
         &self,
         area: Rect,
         frame: &mut PaintCx<'_, '_>,
-        theme: WorkflowSurfaceTheme,
+        theme: &WorkflowSurfaceTheme,
     ) {
         self.render_workspace_modes(self.discover_areas.tabs, frame, theme);
         if let Some(search) = &self.launch_search_buffer {
@@ -1323,7 +1323,7 @@ impl WorkflowStatusSurface {
         &self,
         area: Rect,
         frame: &mut PaintCx<'_, '_>,
-        theme: WorkflowSurfaceTheme,
+        theme: &WorkflowSurfaceTheme,
     ) {
         let query_area = Rect::new(area.x, area.y, area.width, 1.min(area.height));
         let table_area = Rect::new(
@@ -1424,7 +1424,7 @@ impl WorkflowStatusSurface {
         &self,
         area: Rect,
         frame: &mut PaintCx<'_, '_>,
-        theme: WorkflowSurfaceTheme,
+        theme: &WorkflowSurfaceTheme,
     ) {
         let lines = if self.launch_start_pending {
             vec![Line::from_spans(vec![Span::styled(
@@ -1522,7 +1522,7 @@ impl WorkflowStatusSurface {
         &self,
         area: Rect,
         frame: &mut PaintCx<'_, '_>,
-        theme: WorkflowSurfaceTheme,
+        theme: &WorkflowSurfaceTheme,
     ) {
         const GUTTER: u16 = 1;
         if area.height < 4 || area.width < 24 {
@@ -1697,7 +1697,7 @@ impl WorkflowStatusSurface {
         &self,
         area: Rect,
         frame: &mut PaintCx<'_, '_>,
-        theme: WorkflowSurfaceTheme,
+        theme: &WorkflowSurfaceTheme,
         catalog: &bcode_workflow_view_models::WorkflowCatalogView,
     ) {
         let active = catalog
@@ -1818,7 +1818,7 @@ impl WorkflowStatusSurface {
         &self,
         area: Rect,
         frame: &mut PaintCx<'_, '_>,
-        theme: WorkflowSurfaceTheme,
+        theme: &WorkflowSurfaceTheme,
         catalog: &bcode_workflow_view_models::WorkflowCatalogView,
     ) {
         if area.is_empty() {
@@ -1903,7 +1903,7 @@ impl WorkflowStatusSurface {
             .paint(area, &self.catalog_table_state, frame);
     }
 
-    fn render_graph(&self, area: Rect, frame: &mut PaintCx<'_, '_>, theme: WorkflowSurfaceTheme) {
+    fn render_graph(&self, area: Rect, frame: &mut PaintCx<'_, '_>, theme: &WorkflowSurfaceTheme) {
         if let Some(run_id) = self.selected_run_id.as_deref()
             && let Some(error) = self.detail_errors.get(run_id)
         {
@@ -1982,7 +1982,7 @@ impl WorkflowStatusSurface {
         &self,
         area: Rect,
         frame: &mut PaintCx<'_, '_>,
-        theme: WorkflowSurfaceTheme,
+        theme: &WorkflowSurfaceTheme,
         tabbed: bool,
     ) {
         if area.is_empty() {
@@ -2073,7 +2073,7 @@ impl WorkflowStatusSurface {
         &self,
         area: Rect,
         frame: &mut PaintCx<'_, '_>,
-        theme: WorkflowSurfaceTheme,
+        theme: &WorkflowSurfaceTheme,
     ) {
         let tabs = [
             TabItem::new("activity", "Activity"),
@@ -2137,7 +2137,7 @@ impl WorkflowStatusSurface {
         &self,
         area: Rect,
         frame: &mut PaintCx<'_, '_>,
-        theme: WorkflowSurfaceTheme,
+        theme: &WorkflowSurfaceTheme,
     ) {
         let Some(run) = self.selected_run_view() else {
             frame.write_line(
@@ -2210,7 +2210,7 @@ impl WorkflowStatusSurface {
         &self,
         area: Rect,
         frame: &mut PaintCx<'_, '_>,
-        theme: WorkflowSurfaceTheme,
+        theme: &WorkflowSurfaceTheme,
         catalog: &bcode_workflow_view_models::WorkflowCatalogView,
     ) {
         if area.is_empty() {
@@ -4048,7 +4048,7 @@ impl WorkflowStatusSurface {
         &self,
         area: Rect,
         frame: &mut PaintCx<'_, '_>,
-        theme: WorkflowSurfaceTheme,
+        theme: &WorkflowSurfaceTheme,
         confirmation: &PendingWorkflowConfirmation,
     ) {
         let pane = Pane::new()
@@ -4105,7 +4105,7 @@ impl WorkflowStatusSurface {
         &self,
         area: Rect,
         frame: &mut PaintCx<'_, '_>,
-        theme: WorkflowSurfaceTheme,
+        theme: &WorkflowSurfaceTheme,
         form: &WorkflowLaunchForm,
     ) {
         let pane = Pane::new()
@@ -4256,7 +4256,7 @@ impl WorkflowStatusSurface {
         &self,
         area: Rect,
         frame: &mut PaintCx<'_, '_>,
-        theme: WorkflowSurfaceTheme,
+        theme: &WorkflowSurfaceTheme,
         form: &mut WorkflowInputForm,
     ) {
         for field in &form.fields {
@@ -4497,7 +4497,7 @@ impl WorkflowStatusSurface {
         content: Rect,
         mode_tabs: Rect,
         mode_content: Rect,
-        theme: WorkflowSurfaceTheme,
+        theme: &WorkflowSurfaceTheme,
     ) {
         self.workspace_mode_state
             .set_selected(Some(self.workspace_mode.index()));
@@ -4566,28 +4566,28 @@ impl WorkflowStatusSurface {
             content.width,
             content.height.saturating_sub(1),
         );
-        self.prepare_workspace_presentation(content, mode_tabs, mode_content, theme);
+        self.prepare_workspace_presentation(content, mode_tabs, mode_content, &theme);
         if let Some(form) = &self.launch_form {
-            self.render_launch_form(content, frame, theme, form);
+            self.render_launch_form(content, frame, &theme, form);
             return;
         }
         if let Some(confirmation) = &self.pending_confirmation {
-            self.render_confirmation(content, frame, theme, confirmation);
+            self.render_confirmation(content, frame, &theme, confirmation);
             return;
         }
         if let Some(mut form) = self.input_form.take() {
-            self.render_input_form(content, frame, theme, &mut form);
+            self.render_input_form(content, frame, &theme, &mut form);
             self.input_form = Some(form);
             return;
         }
         if self.subscription_requested || self.catalog.is_some() {
             match self.workspace_mode {
                 WorkflowWorkspaceMode::Discover => {
-                    self.render_discover_workspace(content, frame, theme);
+                    self.render_discover_workspace(content, frame, &theme);
                 }
                 WorkflowWorkspaceMode::Runs => {
-                    self.render_workspace_modes(mode_tabs, frame, theme);
-                    self.render_workspace(mode_content, frame, theme);
+                    self.render_workspace_modes(mode_tabs, frame, &theme);
+                    self.render_workspace(mode_content, frame, &theme);
                 }
             }
             return;
@@ -5308,7 +5308,7 @@ fn shell_quote_path(path: &std::path::Path) -> String {
     format!("'{}'", workflow_path_identity(path).replace('\'', "'\\''"))
 }
 
-fn workflow_breadcrumb_line(surface: &WorkflowStatusSurface, theme: WorkflowSurfaceTheme) -> Line {
+fn workflow_breadcrumb_line(surface: &WorkflowStatusSurface, theme: &WorkflowSurfaceTheme) -> Line {
     let run = surface.selected_run_view();
     let run_label = run.map_or("select run", |run| run.run.display_title.as_str());
     let node = surface.selected_node_id.as_deref().unwrap_or("select node");
@@ -5334,7 +5334,7 @@ fn workflow_breadcrumb_line(surface: &WorkflowStatusSurface, theme: WorkflowSurf
 #[allow(clippy::too_many_lines)]
 fn launch_item_lines(
     item: &bcode_workflow::WorkflowLaunchCatalogItem,
-    theme: WorkflowSurfaceTheme,
+    theme: &WorkflowSurfaceTheme,
 ) -> Vec<Line> {
     let readiness_style = match item.readiness {
         bcode_workflow::WorkflowLaunchReadiness::Ready => theme.success,
@@ -5452,7 +5452,7 @@ fn launch_item_lines(
 
 fn launch_detail_lines(
     detail: &bcode_workflow::WorkflowLaunchDetail,
-    theme: WorkflowSurfaceTheme,
+    theme: &WorkflowSurfaceTheme,
 ) -> Vec<Line> {
     let mut lines = launch_item_lines(&detail.item, theme);
     lines.extend([
@@ -5520,7 +5520,7 @@ const fn workflow_session_projection_request() -> bcode_session_models::Projecti
 
 fn session_activity_lines(
     snapshot: &bcode_session_view_models::SessionViewSnapshot,
-    theme: WorkflowSurfaceTheme,
+    theme: &WorkflowSurfaceTheme,
 ) -> Vec<Line> {
     use bcode_session_view_models::TranscriptViewItemKind as Kind;
     let mut lines = vec![Line::from(format!(
@@ -5575,7 +5575,7 @@ fn session_activity_tab_lines(
     tab: usize,
     snapshot: Option<&bcode_session_view_models::SessionViewSnapshot>,
     run: Option<&bcode_workflow_view_models::WorkflowRunView>,
-    theme: WorkflowSurfaceTheme,
+    theme: &WorkflowSurfaceTheme,
 ) -> Vec<Line> {
     let Some(snapshot) = snapshot else {
         return vec![Line::from(
@@ -5600,7 +5600,7 @@ fn session_activity_tab_lines(
 
 fn session_transcript_lines(
     snapshot: &bcode_session_view_models::SessionViewSnapshot,
-    theme: WorkflowSurfaceTheme,
+    theme: &WorkflowSurfaceTheme,
 ) -> Vec<Line> {
     use bcode_session_view_models::TranscriptViewItemKind as Kind;
     snapshot
@@ -5646,7 +5646,7 @@ fn bounded_preview(value: &str, limit: usize) -> String {
 
 fn session_tool_lines(
     snapshot: &bcode_session_view_models::SessionViewSnapshot,
-    theme: WorkflowSurfaceTheme,
+    theme: &WorkflowSurfaceTheme,
 ) -> Vec<Line> {
     if snapshot.tools.is_empty() {
         return vec![Line::from(
@@ -5717,7 +5717,7 @@ fn session_tool_lines(
 
 fn session_permission_lines(
     snapshot: &bcode_session_view_models::SessionViewSnapshot,
-    theme: WorkflowSurfaceTheme,
+    theme: &WorkflowSurfaceTheme,
 ) -> Vec<Line> {
     if snapshot.permissions.is_empty() {
         return vec![Line::from(
@@ -5780,7 +5780,7 @@ fn workflow_input_pane(title: &'static str) -> Pane<'static> {
     })
 }
 
-fn workflow_pane(title: &'static str, theme: WorkflowSurfaceTheme) -> Pane<'static> {
+fn workflow_pane(title: &'static str, theme: &WorkflowSurfaceTheme) -> Pane<'static> {
     workflow_input_pane(title)
         .padding(Insets::new(1, 1, 1, 1))
         .styles(PaneStyles {
@@ -6130,7 +6130,7 @@ fn render_workflow_tree_fallback(
     selected_node_id: Option<&str>,
     area: Rect,
     frame: &mut PaintCx<'_, '_>,
-    theme: WorkflowSurfaceTheme,
+    theme: &WorkflowSurfaceTheme,
     state: &TreeViewState,
 ) {
     let items = workflow_tree_items(run);
@@ -6187,7 +6187,7 @@ fn render_nested_workflows(
     expanded: bool,
     area: Rect,
     frame: &mut PaintCx<'_, '_>,
-    theme: WorkflowSurfaceTheme,
+    theme: &WorkflowSurfaceTheme,
 ) {
     if area.is_empty() {
         return;
@@ -6246,7 +6246,7 @@ fn render_workflow_pipeline(
     selected_node_id: Option<&str>,
     area: Rect,
     frame: &mut PaintCx<'_, '_>,
-    theme: WorkflowSurfaceTheme,
+    theme: &WorkflowSurfaceTheme,
 ) -> WorkflowGraphLayout {
     let layout = workflow_graph_layout(run, area, selected_node_id);
     if layout.linear_fallback {
@@ -6407,7 +6407,7 @@ fn workflow_graph_lines(
     width: u16,
     height: u16,
     descendants_expanded: bool,
-    theme: WorkflowSurfaceTheme,
+    theme: &WorkflowSurfaceTheme,
 ) -> Vec<Line> {
     let selected_index = selected_node_id
         .and_then(|node_id| run.nodes.iter().position(|node| node.node_id == node_id));
@@ -6529,7 +6529,7 @@ fn workflow_graph_lines(
 
 const fn workflow_run_style(
     status: bcode_workflow_view_models::WorkflowRunStatus,
-    theme: WorkflowSurfaceTheme,
+    theme: &WorkflowSurfaceTheme,
 ) -> Style {
     match status {
         bcode_workflow_view_models::WorkflowRunStatus::Running => theme.info,
@@ -6543,7 +6543,7 @@ const fn workflow_run_style(
 
 const fn workflow_node_style(
     status: &bcode_workflow_view_models::WorkflowNodeStatus,
-    theme: WorkflowSurfaceTheme,
+    theme: &WorkflowSurfaceTheme,
 ) -> Style {
     match status {
         bcode_workflow_view_models::WorkflowNodeStatus::Running
@@ -6600,7 +6600,7 @@ fn inspector_lines(
     run: Option<&bcode_workflow_view_models::WorkflowRunView>,
     tab: usize,
     selection: InspectorSelection<'_>,
-    theme: WorkflowSurfaceTheme,
+    theme: &WorkflowSurfaceTheme,
 ) -> Vec<Line> {
     let Some(run) = run else {
         return vec![Line::from("Loading selected run…")];
@@ -6630,7 +6630,7 @@ fn selected_node_detail_lines(
     run: &bcode_workflow_view_models::WorkflowRunView,
     selected_node_id: Option<&str>,
     selected_attempt: Option<&(String, String, u32)>,
-    theme: WorkflowSurfaceTheme,
+    theme: &WorkflowSurfaceTheme,
 ) -> Vec<Line> {
     let Some(node_id) = selected_node_id else {
         return vec![Line::from("Select a graph node")];
@@ -6801,7 +6801,7 @@ fn inspector_overview_lines(run: &bcode_workflow_view_models::WorkflowRunView) -
 fn inspector_input_lines(
     run: &bcode_workflow_view_models::WorkflowRunView,
     selected: Option<&(String, String)>,
-    theme: WorkflowSurfaceTheme,
+    theme: &WorkflowSurfaceTheme,
 ) -> Vec<Line> {
     let inputs = run
         .waits
@@ -6850,7 +6850,7 @@ fn inspector_input_lines(
 fn inspector_output_lines(
     run: &bcode_workflow_view_models::WorkflowRunView,
     selected: Option<&str>,
-    theme: WorkflowSurfaceTheme,
+    theme: &WorkflowSurfaceTheme,
 ) -> Vec<Line> {
     if run.outputs.is_empty() {
         return vec![Line::from("No outputs")];
@@ -6937,7 +6937,7 @@ fn inspector_output_lines(
 fn inspector_attempt_lines(
     run: &bcode_workflow_view_models::WorkflowRunView,
     selected: Option<&(String, String, u32)>,
-    theme: WorkflowSurfaceTheme,
+    theme: &WorkflowSurfaceTheme,
 ) -> Vec<Line> {
     if run.attempts.is_empty() {
         return vec![Line::from("No dispatch attempts")];
@@ -6996,7 +6996,7 @@ fn inspector_approval_lines(
     run: &bcode_workflow_view_models::WorkflowRunView,
     selected_wait: Option<&(String, String)>,
     selected_mutation: Option<&str>,
-    theme: WorkflowSurfaceTheme,
+    theme: &WorkflowSurfaceTheme,
 ) -> Vec<Line> {
     let mut lines = run
         .waits
@@ -7080,7 +7080,7 @@ fn inspector_approval_lines(
 fn inspector_session_lines(
     run: &bcode_workflow_view_models::WorkflowRunView,
     selected: Option<&str>,
-    theme: WorkflowSurfaceTheme,
+    theme: &WorkflowSurfaceTheme,
 ) -> Vec<Line> {
     if run.child_sessions.is_empty() {
         return vec![Line::from("No child sessions")];
@@ -7873,7 +7873,9 @@ mod tests {
                 link: syntax_color,
                 raw: syntax_color,
             },
+            component: bcode_plugin_sdk::tui::ComponentTheme::terminal_default(),
         }
+        .with_legacy_component()
     }
 
     #[test]
@@ -9382,7 +9384,7 @@ mod tests {
                     selected_node: Some("reviewer"),
                     ..InspectorSelection::default()
                 },
-                WorkflowSurfaceTheme::resolve(None),
+                &WorkflowSurfaceTheme::resolve(None),
             )
             .into_iter()
             .flat_map(|line| {
@@ -9425,7 +9427,7 @@ mod tests {
             80,
             30,
             false,
-            WorkflowSurfaceTheme::resolve(None),
+            &WorkflowSurfaceTheme::resolve(None),
         );
         let expanded = workflow_graph_lines(
             run,
@@ -9433,7 +9435,7 @@ mod tests {
             80,
             30,
             true,
-            WorkflowSurfaceTheme::resolve(None),
+            &WorkflowSurfaceTheme::resolve(None),
         );
         let text = |lines: Vec<Line>| {
             lines
@@ -9455,7 +9457,7 @@ mod tests {
             true,
             area,
             &mut PaintCx::new(&mut Frame::new(&mut buffer)),
-            WorkflowSurfaceTheme::resolve(None),
+            &WorkflowSurfaceTheme::resolve(None),
         );
         let rendered_nested = buffer
             .cells()
@@ -9521,7 +9523,7 @@ mod tests {
             80,
             30,
             false,
-            WorkflowSurfaceTheme::resolve(None),
+            &WorkflowSurfaceTheme::resolve(None),
         )
         .into_iter()
         .flat_map(|line| {
@@ -9606,7 +9608,7 @@ mod tests {
             100,
             40,
             true,
-            WorkflowSurfaceTheme::resolve(None),
+            &WorkflowSurfaceTheme::resolve(None),
         )
         .into_iter()
         .flat_map(|line| line.spans.into_iter().map(|span| span.content))
@@ -9646,7 +9648,7 @@ mod tests {
             32,
             5,
             false,
-            WorkflowSurfaceTheme::resolve(None),
+            &WorkflowSurfaceTheme::resolve(None),
         );
         let rendered = lines
             .iter()
@@ -9779,7 +9781,7 @@ mod tests {
                 theme.error,
             ),
         ] {
-            assert_eq!(workflow_run_style(status, theme), expected);
+            assert_eq!(workflow_run_style(status, &theme), expected);
         }
 
         for (status, expected_style, expected_glyph) in [
@@ -9844,7 +9846,7 @@ mod tests {
                 "?",
             ),
         ] {
-            assert_eq!(workflow_node_style(&status, theme), expected_style);
+            assert_eq!(workflow_node_style(&status, &theme), expected_style);
             assert_eq!(workflow_node_glyph(&status), expected_glyph);
         }
     }
@@ -9856,32 +9858,35 @@ mod tests {
         assert_eq!(
             workflow_run_style(
                 bcode_workflow_view_models::WorkflowRunStatus::Running,
-                theme
+                &theme
             ),
             theme.info
         );
         assert_eq!(
             workflow_run_style(
                 bcode_workflow_view_models::WorkflowRunStatus::Completed,
-                theme
+                &theme
             ),
             theme.success
         );
         assert_eq!(
-            workflow_run_style(bcode_workflow_view_models::WorkflowRunStatus::Failed, theme),
+            workflow_run_style(
+                bcode_workflow_view_models::WorkflowRunStatus::Failed,
+                &theme
+            ),
             theme.error
         );
         assert_eq!(
             workflow_node_style(
                 &bcode_workflow_view_models::WorkflowNodeStatus::WaitingApproval,
-                theme
+                &theme
             ),
             theme.warning
         );
         assert_eq!(
             workflow_node_style(
                 &bcode_workflow_view_models::WorkflowNodeStatus::Cancelled,
-                theme
+                &theme
             ),
             theme.muted
         );
@@ -10095,7 +10100,7 @@ mod tests {
         let attempts = inspector_attempt_lines(
             run,
             surface.selected_attempt_id.as_ref(),
-            WorkflowSurfaceTheme::resolve(None),
+            &WorkflowSurfaceTheme::resolve(None),
         )
         .into_iter()
         .map(|line| line.plain_text())
@@ -10427,7 +10432,7 @@ mod tests {
             surface.selected_run_view().expect("selected run"),
             surface.selected_node_id.as_deref(),
             surface.selected_attempt_id.as_ref(),
-            WorkflowSurfaceTheme::resolve(None),
+            &WorkflowSurfaceTheme::resolve(None),
         )
         .into_iter()
         .map(|line| line.plain_text())
@@ -10437,7 +10442,7 @@ mod tests {
         let outputs = inspector_output_lines(
             surface.selected_run_view().expect("selected run"),
             surface.selected_output_id.as_deref(),
-            WorkflowSurfaceTheme::resolve(None),
+            &WorkflowSurfaceTheme::resolve(None),
         )
         .into_iter()
         .map(|line| line.plain_text())
@@ -10680,7 +10685,7 @@ mod tests {
             0,
             surface.session_snapshot.as_ref(),
             surface.selected_run_view(),
-            WorkflowSurfaceTheme::resolve(None),
+            &WorkflowSurfaceTheme::resolve(None),
         )
         .into_iter()
         .map(|line| line.plain_text())
@@ -10692,7 +10697,7 @@ mod tests {
             3,
             surface.session_snapshot.as_ref(),
             surface.selected_run_view(),
-            WorkflowSurfaceTheme::resolve(None),
+            &WorkflowSurfaceTheme::resolve(None),
         )
         .into_iter()
         .map(|line| line.plain_text())
@@ -10721,7 +10726,7 @@ mod tests {
             2,
             surface.session_snapshot.as_ref(),
             surface.selected_run_view(),
-            WorkflowSurfaceTheme::resolve(None),
+            &WorkflowSurfaceTheme::resolve(None),
         )
         .into_iter()
         .map(|line| line.plain_text())
@@ -10733,7 +10738,7 @@ mod tests {
             3,
             surface.session_snapshot.as_ref(),
             surface.selected_run_view(),
-            WorkflowSurfaceTheme::resolve(None),
+            &WorkflowSurfaceTheme::resolve(None),
         )
         .into_iter()
         .map(|line| line.plain_text())

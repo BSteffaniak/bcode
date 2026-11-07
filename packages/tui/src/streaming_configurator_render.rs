@@ -183,6 +183,7 @@ fn configurator_modal(theme: TuiTheme) -> ModalFrame {
         ModalSizing::new(Size::new(54, 29), Size::new(140, 52), Insets::all(1)),
         theme.modal_theme(),
     )
+    .chrome(crate::render::dialog_chrome())
     .title(" Streaming presentation configurator ")
     .padding(Insets::new(1, 1, 1, 1))
     .placement(ModalPlacement::Centered)

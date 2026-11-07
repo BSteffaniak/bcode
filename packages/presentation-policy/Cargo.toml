@@ -1,0 +1,21 @@
+[package]
+authors     = { workspace = true }
+categories  = ["development-tools"]
+description = "Renderer-neutral structural presentation policy resolution for bcode"
+edition     = { workspace = true }
+keywords    = ["bcode", "presentation", "theme", "policy"]
+license     = { workspace = true }
+name        = "bcode_presentation_policy"
+readme      = { workspace = true }
+repository  = { workspace = true }
+version     = { workspace = true }
+
+[dependencies]
+bcode_presentation_policy_models = { workspace = true }
+
+[dev-dependencies]
+toml = { workspace = true }
+
+[features]
+default          = []
+fail-on-warnings = ["bcode_presentation_policy_models/fail-on-warnings"]

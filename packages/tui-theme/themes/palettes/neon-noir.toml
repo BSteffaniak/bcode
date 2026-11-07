@@ -1,0 +1,18 @@
+# Original Bcode palette.
+display_name   = "Neon Noir"
+extends        = ["seeded-base"]
+id             = "neon-noir"
+schema_version = 2
+
+[palette]
+accent     = "#ff2fd6"
+background = "#0a0614"
+blue       = "#4d9dff"
+cyan       = "#00f0ff"
+green      = "#39ffb6"
+magenta    = "#ff2fd6"
+orange     = "#ff8a3d"
+red        = "#ff3864"
+text       = "#e9e4ff"
+violet     = "#9d4dff"
+yellow     = "#ffe14d"

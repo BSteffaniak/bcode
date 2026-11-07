@@ -1,0 +1,17 @@
+# Seed palette adapted from the github color scheme; see attribution/palettes.md.
+display_name   = "GitHub Dimmed"
+extends        = ["seeded-base"]
+id             = "github-dimmed"
+schema_version = 2
+
+[palette]
+accent     = "#539bf5"
+background = "#22272e"
+blue       = "#539bf5"
+cyan       = "#39c5cf"
+green      = "#57ab5a"
+magenta    = "#b083f0"
+orange     = "#f69d50"
+red        = "#f47067"
+text       = "#adbac7"
+yellow     = "#c69026"

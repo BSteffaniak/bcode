@@ -50,6 +50,7 @@ pub fn paint(
     let hint = state.hint().to_owned();
     let has_hint = !hint.is_empty();
     let shell = PickerFrame::new()
+        .chrome(crate::render::component_chrome())
         .title(&title)
         .header(state.status())
         .footer(hint)

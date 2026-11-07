@@ -1,0 +1,5 @@
+# Curated combination: phosphor palette with the retro profile.
+display_name   = "CRT"
+extends        = ["phosphor", "retro"]
+id             = "crt"
+schema_version = 2

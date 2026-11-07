@@ -1,0 +1,17 @@
+# Seed palette adapted from the night-owl color scheme; see attribution/palettes.md.
+display_name   = "Night Owl"
+extends        = ["seeded-base"]
+id             = "night-owl"
+schema_version = 2
+
+[palette]
+accent     = "#82aaff"
+background = "#011627"
+blue       = "#82aaff"
+cyan       = "#7fdbca"
+green      = "#addb67"
+magenta    = "#c792ea"
+orange     = "#f78c6c"
+red        = "#ef5350"
+text       = "#d6deeb"
+yellow     = "#ecc48d"

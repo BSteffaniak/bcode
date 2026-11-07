@@ -222,7 +222,7 @@ impl QuestionPresentation {
     }
 
     /// Apply renderer-owned semantic styles without changing canonical state or geometry.
-    pub fn set_theme(&mut self, theme: Option<bmux_tui_components::theme::ComponentTheme>) {
+    pub fn set_theme(&mut self, theme: Option<&bmux_tui_components::theme::ComponentTheme>) {
         self.renderer.set_component_theme(theme);
     }
     /// Refresh labels and layout from the host's current bindings before measurement.

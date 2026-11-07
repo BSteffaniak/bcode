@@ -1,0 +1,21 @@
+[package]
+authors     = { workspace = true }
+categories  = ["development-tools"]
+description = "Renderer-neutral structural presentation facts, properties, and rules for bcode"
+edition     = { workspace = true }
+keywords    = ["bcode", "presentation", "theme", "models"]
+license     = { workspace = true }
+name        = "bcode_presentation_policy_models"
+readme      = { workspace = true }
+repository  = { workspace = true }
+version     = { workspace = true }
+
+[dependencies]
+serde = { workspace = true, features = ["derive", "std"] }
+
+[dev-dependencies]
+toml = { workspace = true }
+
+[features]
+default          = []
+fail-on-warnings = []

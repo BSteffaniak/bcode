@@ -1,0 +1,50 @@
+# Profile: Stays out of the way: terminal-first, no chrome, tools as one-line summaries.
+# Profiles set chrome, structure, and containers only, so they combine with any palette.
+display_name   = "Bare (profile)"
+id             = "bare"
+kind           = "profile"
+schema_version = 2
+
+[chrome.tui]
+borders    = { panel = "none", dialog = "single", tool = "none", composer = "none" }
+density    = "compact"
+icons      = "none"
+motion     = "none"
+separators = { status = "plain" }
+speaker    = "prefix"
+surfaces   = "flat"
+
+[[presentation.rules]]
+match = { kind = "tool" }
+set   = { disclosure = "summary", detail = "minimal", parts = { timing = false } }
+
+[[presentation.rules]]
+match = { kind = "tool", status = ["running", "waiting"] }
+set   = { disclosure = "expanded", preview = { lines = 6 } }
+
+[containers."transcript.user"]
+layout = "plain"
+
+[containers."transcript.assistant"]
+layout = "plain"
+
+[containers."tool.requested"]
+layout = "plain"
+
+[containers."tool.running"]
+layout = "plain"
+
+[containers."tool.waiting"]
+layout = "plain"
+
+[containers."tool.succeeded"]
+layout = "plain"
+
+[containers."tool.failed"]
+layout = "plain"
+
+[containers."tool.cancelled"]
+layout = "plain"
+
+[containers."tool.timed_out"]
+layout = "plain"

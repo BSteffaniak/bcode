@@ -1,0 +1,17 @@
+# Original Bcode palette.
+display_name   = "Blueprint"
+extends        = ["seeded-base"]
+id             = "blueprint"
+schema_version = 2
+
+[palette]
+accent     = "#7fd4ff"
+background = "#0d2a4a"
+blue       = "#7fd4ff"
+cyan       = "#8ff0ff"
+green      = "#9ef0c3"
+magenta    = "#d7a8ff"
+orange     = "#ffb47a"
+red        = "#ff8a80"
+text       = "#e6f1ff"
+yellow     = "#ffe08a"

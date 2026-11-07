@@ -1,0 +1,5 @@
+# Curated combination: everforest palette with the minimal profile.
+display_name   = "Forest Floor"
+extends        = ["everforest", "minimal"]
+id             = "forest-floor"
+schema_version = 2

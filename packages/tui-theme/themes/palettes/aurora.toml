@@ -1,0 +1,18 @@
+# Original Bcode palette.
+display_name   = "Aurora"
+extends        = ["seeded-base"]
+id             = "aurora"
+schema_version = 2
+
+[palette]
+accent     = "#7cf4c6"
+background = "#0b1021"
+blue       = "#6fa8ff"
+cyan       = "#5ee7ff"
+green      = "#7cf4c6"
+magenta    = "#c77dff"
+orange     = "#ffb16f"
+red        = "#ff6f91"
+text       = "#dfe7ff"
+violet     = "#a78bfa"
+yellow     = "#f9f871"

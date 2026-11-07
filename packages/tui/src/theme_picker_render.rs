@@ -240,6 +240,7 @@ fn theme_picker_modal(theme: TuiTheme) -> ModalFrame {
         ModalSizing::new(Size::new(48, 8), Size::new(112, 20), Insets::all(2)),
         theme.modal_theme(),
     )
+    .chrome(crate::render::dialog_chrome())
     .title(" Themes ")
     .padding(Insets::new(1, 1, 1, 1))
     .placement(ModalPlacement::UpperThird)

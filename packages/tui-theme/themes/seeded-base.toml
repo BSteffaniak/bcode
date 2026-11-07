@@ -1,0 +1,33 @@
+# Structural base for seed palettes: container recipes only, so every color
+# role derives from the extending palette's seeds.
+display_name   = "Seeded Base"
+id             = "seeded-base"
+kind           = "base"
+schema_version = 2
+
+[containers."transcript.user"]
+layout = "plain"
+
+[containers."transcript.assistant"]
+layout = "plain"
+
+[containers."tool.requested"]
+layout = "plain"
+
+[containers."tool.running"]
+layout = "plain"
+
+[containers."tool.waiting"]
+layout = "plain"
+
+[containers."tool.succeeded"]
+layout = "plain"
+
+[containers."tool.failed"]
+layout = "plain"
+
+[containers."tool.cancelled"]
+layout = "plain"
+
+[containers."tool.timed_out"]
+layout = "plain"

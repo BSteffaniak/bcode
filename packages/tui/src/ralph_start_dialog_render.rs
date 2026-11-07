@@ -91,6 +91,7 @@ fn modal_frame(theme: TuiTheme) -> ModalFrame {
         ModalSizing::new(Size::new(76, 12), Size::new(112, 14), Insets::all(4)),
         theme.modal_theme(),
     )
+    .chrome(crate::render::dialog_chrome())
     .title(" Start Ralph loop ")
     .padding(Insets::new(1, 2, 1, 2))
     .placement(ModalPlacement::UpperThird)

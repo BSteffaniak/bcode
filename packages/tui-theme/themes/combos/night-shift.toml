@@ -1,0 +1,5 @@
+# Curated combination: tokyonight-storm palette with the soft profile.
+display_name   = "Night Shift"
+extends        = ["tokyonight-storm", "soft"]
+id             = "night-shift"
+schema_version = 2

@@ -991,11 +991,79 @@ fn handle_theme_command(command: ThemeCommand) -> Result<(), CliError> {
     write_theme_command(command, &mut std::io::stdout().lock())
 }
 
+/// Validate one theme file, reporting warnings; `strict` turns warnings into errors.
+fn write_theme_validation(
+    path: &std::path::Path,
+    json: bool,
+    strict: bool,
+    writer: &mut impl std::io::Write,
+) -> Result<(), CliError> {
+    use bcode_tui::theme::definition::{ThemeCatalog, ThemeSelection, parse_theme_definition};
+
+    let bytes = read_bytes_with_limit(
+        std::fs::File::open(path).map_err(CliError::ThemeIo)?,
+        MAX_CLI_THEME_BYTES,
+        "theme definition",
+    )?;
+    let source = String::from_utf8(bytes).map_err(|_| {
+        CliError::InvalidArguments("theme definition must be valid UTF-8".to_owned())
+    })?;
+    let definition = parse_theme_definition(path.display().to_string(), &source)
+        .map_err(|error| CliError::Theme(error.to_string()))?;
+    let id = definition.id().to_owned();
+    let kind = definition.kind();
+    let mut catalog =
+        ThemeCatalog::bundled().map_err(|error| CliError::Theme(error.to_string()))?;
+    catalog.insert(definition);
+    // Profiles and bases are overlays; validate them over the default theme.
+    let selection = match kind {
+        bcode_tui::theme::definition::ThemeKind::Theme => ThemeSelection::new(&id),
+        bcode_tui::theme::definition::ThemeKind::Profile
+        | bcode_tui::theme::definition::ThemeKind::Base => {
+            ThemeSelection::new("terminal-native").overlays(vec![id.clone()])
+        }
+    };
+    let resolved = catalog
+        .resolve(&selection)
+        .map_err(|error| CliError::Theme(error.to_string()))?;
+    let warnings = resolved
+        .warnings
+        .iter()
+        .map(|warning| warning.message.clone())
+        .collect::<Vec<_>>();
+    if strict && !warnings.is_empty() {
+        return Err(CliError::Theme(format!(
+            "theme {id} has {} warning(s): {}",
+            warnings.len(),
+            warnings.join("; ")
+        )));
+    }
+    if json {
+        return write_json_result(
+            writer,
+            &serde_json::json!({
+                "schema_version": 1,
+                "valid": true,
+                "id": id,
+                "fingerprint": resolved.fingerprint,
+                "warnings": warnings,
+                "derived_roles": resolved.derived_roles.len(),
+            }),
+        );
+    }
+    writeln!(writer, "valid\t{id}\t{}", resolved.fingerprint)?;
+    for warning in &warnings {
+        writeln!(writer, "warning\t{warning}")?;
+    }
+
+    Ok(())
+}
+
 fn write_theme_command(
     command: ThemeCommand,
     writer: &mut impl std::io::Write,
 ) -> Result<(), CliError> {
-    use bcode_tui::theme::definition::{ThemeCatalog, ThemeSelection, parse_theme_definition};
+    use bcode_tui::theme::definition::ThemeCatalog;
 
     match command {
         ThemeCommand::List { json } => {
@@ -1018,36 +1086,27 @@ fn write_theme_command(
                 )?;
             }
         }
-        ThemeCommand::Validate { path, json } => {
-            let bytes = read_bytes_with_limit(
-                std::fs::File::open(&path).map_err(CliError::ThemeIo)?,
-                MAX_CLI_THEME_BYTES,
-                "theme definition",
-            )?;
-            let source = String::from_utf8(bytes).map_err(|_| {
-                CliError::InvalidArguments("theme definition must be valid UTF-8".to_owned())
-            })?;
-            let definition = parse_theme_definition(path.display().to_string(), &source)
-                .map_err(|error| CliError::Theme(error.to_string()))?;
-            let id = definition.id().to_owned();
-            let mut catalog =
-                ThemeCatalog::bundled().map_err(|error| CliError::Theme(error.to_string()))?;
-            catalog.insert(definition);
-            let resolved = catalog
-                .resolve(&ThemeSelection::new(&id))
-                .map_err(|error| CliError::Theme(error.to_string()))?;
-            if json {
-                return write_json_result(
+        ThemeCommand::Roles => {
+            for spec in bcode_tui::theme::roles::ROLES {
+                writeln!(
                     writer,
-                    &serde_json::json!({
-                        "schema_version": 1,
-                        "valid": true,
-                        "id": id,
-                        "fingerprint": resolved.fingerprint,
-                    }),
-                );
+                    "{}\t{}\t{}{}",
+                    spec.key,
+                    spec.category.name(),
+                    spec.description,
+                    if spec.derive.is_some() {
+                        ""
+                    } else {
+                        "\t(no seed derivation)"
+                    }
+                )?;
             }
-            writeln!(writer, "valid\t{id}\t{}", resolved.fingerprint)?;
+            for (seed, description) in bcode_tui::theme::roles::SEED_PALETTE {
+                writeln!(writer, "${seed}\tseed\t{description}")?;
+            }
+        }
+        ThemeCommand::Validate { path, json, strict } => {
+            write_theme_validation(&path, json, strict, writer)?;
         }
         ThemeCommand::Copy {
             builtin,
@@ -5355,7 +5414,12 @@ enum ThemeCommand {
         /// Emit the successful validation result as JSON.
         #[arg(long)]
         json: bool,
+        /// Treat warnings (unknown roles, approximate color math) as errors.
+        #[arg(long)]
+        strict: bool,
     },
+    /// List every registered semantic style role and the seed palette names.
+    Roles,
     /// Copy one bundled theme definition to an editable file.
     Copy {
         #[arg(value_name = "BUILTIN")]
@@ -25210,6 +25274,43 @@ mod theme_command_tests {
     use super::*;
 
     #[test]
+    fn validate_reports_unknown_roles_and_strict_rejects_them() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let path = directory.path().join("typo.toml");
+        std::fs::write(
+            &path,
+            "schema_version = 2\nid = \"typo\"\nextends = [\"terminal-native\"]\n\n[styles.\"bordr.focussed\"]\nfg = \"ansi:red\"\n",
+        )
+        .expect("write theme");
+        let mut output = Vec::new();
+        write_theme_command(
+            ThemeCommand::Validate {
+                path: path.clone(),
+                json: false,
+                strict: false,
+            },
+            &mut output,
+        )
+        .expect("non-strict validation succeeds");
+        let output = String::from_utf8(output).expect("utf8");
+        assert!(
+            output.contains("did you mean \"border.focused\""),
+            "{output}"
+        );
+        assert!(
+            write_theme_command(
+                ThemeCommand::Validate {
+                    path,
+                    json: false,
+                    strict: true,
+                },
+                &mut Vec::new(),
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
     fn theme_subcommands_parse() {
         assert!(matches!(
             Cli::try_parse_from(["bcode", "theme", "list"])
@@ -25225,6 +25326,22 @@ mod theme_command_tests {
                 .command,
             Some(Commands::Theme {
                 command: ThemeCommand::Validate { .. }
+            })
+        ));
+        assert!(matches!(
+            Cli::try_parse_from(["bcode", "theme", "validate", "theme.toml", "--strict"])
+                .expect("strict theme validate parses")
+                .command,
+            Some(Commands::Theme {
+                command: ThemeCommand::Validate { strict: true, .. }
+            })
+        ));
+        assert!(matches!(
+            Cli::try_parse_from(["bcode", "theme", "roles"])
+                .expect("theme roles parses")
+                .command,
+            Some(Commands::Theme {
+                command: ThemeCommand::Roles
             })
         ));
         assert!(matches!(
@@ -25353,6 +25470,7 @@ mod theme_command_tests {
                 ThemeCommand::Validate {
                     path: path.clone(),
                     json,
+                    strict: false,
                 },
             ] {
                 let mut writer = FlushFailure::default();
@@ -25406,7 +25524,15 @@ mod theme_command_tests {
         )
         .unwrap();
         output.clear();
-        write_theme_command(ThemeCommand::Validate { path, json: true }, &mut output).unwrap();
+        write_theme_command(
+            ThemeCommand::Validate {
+                path,
+                json: true,
+                strict: false,
+            },
+            &mut output,
+        )
+        .unwrap();
         let value: serde_json::Value = serde_json::from_slice(&output).unwrap();
         assert_eq!(value["schema_version"], 1);
         assert_eq!(value["valid"], true);
@@ -25456,6 +25582,7 @@ mod theme_command_tests {
             handle_theme_command(ThemeCommand::Validate {
                 path: path.clone(),
                 json: true,
+                strict: false,
             })
         };
         assert!(
@@ -25526,6 +25653,7 @@ mod theme_command_tests {
             handle_theme_command(ThemeCommand::Validate {
                 path: copied.clone(),
                 json,
+                strict: false,
             })
             .expect("validate copied theme");
         }

@@ -1,0 +1,33 @@
+# Seed palette adapted from the catppuccin color scheme; see attribution/palettes.md.
+display_name   = "Catppuccin Mocha"
+extends        = ["seeded-base"]
+id             = "catppuccin-mocha"
+schema_version = 2
+
+[palette]
+accent     = "#cba6f7"
+background = "#1e1e2e"
+blue       = "#89b4fa"
+cyan       = "#94e2d5"
+green      = "#a6e3a1"
+magenta    = "#f5c2e7"
+orange     = "#fab387"
+red        = "#f38ba8"
+text       = "#cdd6f4"
+violet     = "#b4befe"
+yellow     = "#f9e2af"
+
+[variants.dark]
+
+[variants.light.palette]
+accent     = "#8839ef"
+background = "#eff1f5"
+blue       = "#1e66f5"
+cyan       = "#179299"
+green      = "#40a02b"
+magenta    = "#ea76cb"
+orange     = "#fe640b"
+red        = "#d20f39"
+text       = "#4c4f69"
+violet     = "#7287fd"
+yellow     = "#df8e1d"

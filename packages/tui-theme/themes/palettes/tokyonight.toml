@@ -1,0 +1,33 @@
+# Seed palette adapted from the tokyonight color scheme; see attribution/palettes.md.
+display_name   = "Tokyo Night"
+extends        = ["seeded-base"]
+id             = "tokyonight"
+schema_version = 2
+
+[palette]
+accent     = "#7aa2f7"
+background = "#1a1b26"
+blue       = "#7aa2f7"
+cyan       = "#7dcfff"
+green      = "#9ece6a"
+magenta    = "#bb9af7"
+orange     = "#ff9e64"
+red        = "#f7768e"
+text       = "#c0caf5"
+violet     = "#9d7cd8"
+yellow     = "#e0af68"
+
+[variants.dark]
+
+[variants.light.palette]
+accent     = "#2e7de9"
+background = "#e1e2e7"
+blue       = "#2e7de9"
+cyan       = "#007197"
+green      = "#587539"
+magenta    = "#9854f1"
+orange     = "#b15c00"
+red        = "#f52a65"
+text       = "#3760bf"
+violet     = "#7847bd"
+yellow     = "#8c6c3e"

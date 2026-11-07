@@ -1,0 +1,18 @@
+# Seed palette adapted from the catppuccin color scheme; see attribution/palettes.md.
+display_name   = "Catppuccin Latte"
+extends        = ["seeded-base"]
+id             = "catppuccin-latte"
+schema_version = 2
+
+[palette]
+accent     = "#8839ef"
+background = "#eff1f5"
+blue       = "#1e66f5"
+cyan       = "#179299"
+green      = "#40a02b"
+magenta    = "#ea76cb"
+orange     = "#fe640b"
+red        = "#d20f39"
+text       = "#4c4f69"
+violet     = "#7287fd"
+yellow     = "#df8e1d"

@@ -1,0 +1,17 @@
+# Seed palette adapted from the zenburn color scheme; see attribution/palettes.md.
+display_name   = "Zenburn"
+extends        = ["seeded-base"]
+id             = "zenburn"
+schema_version = 2
+
+[palette]
+accent     = "#f0dfaf"
+background = "#3f3f3f"
+blue       = "#8cd0d3"
+cyan       = "#93e0e3"
+green      = "#7f9f7f"
+magenta    = "#dc8cc3"
+orange     = "#dfaf8f"
+red        = "#cc9393"
+text       = "#dcdccc"
+yellow     = "#f0dfaf"

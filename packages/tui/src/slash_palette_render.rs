@@ -19,6 +19,7 @@ const POPUP_SIDE_MARGIN: u16 = 2;
 
 fn palette_component(area: Rect, styles: PickerFrameStyles) -> PickerFrameComponent<'static> {
     let shell = PickerFrame::new()
+        .chrome(crate::render::component_chrome())
         .title(" Commands ")
         .policy(PickerFramePolicy {
             chrome: true,

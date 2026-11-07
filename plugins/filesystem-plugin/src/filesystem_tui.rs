@@ -1180,7 +1180,9 @@ mod tests {
                 link: PluginTuiSyntaxColor::from_tui(Color::BrightBlue),
                 raw: PluginTuiSyntaxColor::from_tui(Color::BrightGreen),
             },
+            component: bcode_plugin_sdk::tui::ComponentTheme::terminal_default(),
         }
+        .with_legacy_component()
     }
 
     fn line_text(line: &Line) -> String {
@@ -1672,6 +1674,7 @@ mod tests {
         theme.focused = Style::new().fg(Color::Magenta);
         theme.text = Style::new().fg(Color::Green);
         theme.muted = Style::new().fg(Color::Yellow);
+        let theme = theme.with_legacy_component();
         let context = bcode_plugin_sdk::tui::PluginTuiVisualRenderContext::new(
             80,
             bcode_plugin_sdk::tui::PluginTuiDiffLayout::Auto { breakpoint: 120 },

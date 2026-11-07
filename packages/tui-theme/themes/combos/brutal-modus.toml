@@ -1,0 +1,5 @@
+# Curated combination: modus palette with the brutalist profile.
+display_name   = "Brutal Modus"
+extends        = ["modus", "brutalist"]
+id             = "brutal-modus"
+schema_version = 2
