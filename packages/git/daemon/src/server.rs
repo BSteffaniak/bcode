@@ -9,6 +9,8 @@ use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError, mpsc};
 use std::time::{Duration, Instant};
 
 use bcode_git::{CommandLog, Repository};
+use bcode_git_live::scan::ScannerKind;
+use bcode_git_live::source::SourceKind;
 use bcode_git_live::{Hub, UpdateSink};
 
 use crate::protocol::{self, ClientMessage, PROTOCOL, ServerMessage};
@@ -20,20 +22,20 @@ pub struct ServeOptions {
     pub socket: PathBuf,
     /// Exit after this long without clients.
     pub idle: Duration,
-    /// Stop serving a repository this long after its last client left (so a client that
-    /// restarts finds it warm).
+    /// Keep a worktree up to date this long after its last client left, so a client
+    /// opening it again is served at once, without scanning.
     pub linger: Duration,
 }
 
 impl ServeOptions {
-    /// Listen on `socket`, exiting after a minute without clients and keeping a repository
-    /// for half a minute after its last client.
+    /// Listen on `socket`, keeping a worktree for ten minutes after its last client and
+    /// exiting once that long without clients.
     #[must_use]
     pub const fn new(socket: PathBuf) -> Self {
         Self {
             socket,
-            idle: Duration::from_secs(60),
-            linger: Duration::from_secs(30),
+            idle: Duration::from_secs(600),
+            linger: Duration::from_secs(600),
         }
     }
 }
@@ -61,6 +63,8 @@ struct Shared {
     socket: PathBuf,
     /// Inode of the socket file this daemon created, to remove only that one.
     inode: u64,
+    /// [`ServeOptions::linger`].
+    linger: Duration,
 }
 
 impl Shared {
@@ -159,6 +163,7 @@ fn shared(options: &ServeOptions, inode: u64) -> Arc<Shared> {
         changed: Condvar::new(),
         socket: options.socket.clone(),
         inode,
+        linger: options.linger,
     })
 }
 
@@ -233,6 +238,30 @@ fn run(listener: UnixListener, options: &ServeOptions, shared: &Arc<Shared>) {
     if ours {
         let _ = std::fs::remove_file(&shared.socket);
     }
+}
+
+/// The hub serving the repository at `key`, started when none does, with one more client.
+fn join(
+    shared: &Shared,
+    key: &Path,
+    repo: &Repository,
+    scanner: ScannerKind,
+    watcher: Option<SourceKind>,
+) -> Arc<Hub> {
+    let mut state = shared.lock();
+    let served = state
+        .repositories
+        .entry(key.to_owned())
+        .or_insert_with(|| Served {
+            hub: Arc::new(Hub::start_retaining(repo, scanner, watcher, shared.linger)),
+            clients: 0,
+            vacant_since: None,
+        });
+    served.clients += 1;
+    served.vacant_since = None;
+    let hub = served.hub.clone();
+    drop(state);
+    hub
 }
 
 /// Drop repositories nobody shows any more and stop when idle.
@@ -323,19 +352,7 @@ fn converse(stream: &UnixStream, shared: &Shared) -> std::io::Result<()> {
     };
     let key = std::fs::canonicalize(&repo.paths().common_dir)
         .unwrap_or_else(|_| repo.paths().common_dir.clone());
-    let mut state = shared.lock();
-    let served = state
-        .repositories
-        .entry(key.clone())
-        .or_insert_with(|| Served {
-            hub: Arc::new(Hub::start(&repo, config.scanner, watcher)),
-            clients: 0,
-            vacant_since: None,
-        });
-    served.clients += 1;
-    served.vacant_since = None;
-    let hub = served.hub.clone();
-    drop(state);
+    let hub = join(shared, &key, &repo, config.scanner, watcher);
     // Updates go out from a thread of their own, in order, after the acknowledgement.
     let (outgoing, queued) = mpsc::channel::<ServerMessage>();
     let _ = outgoing.send(ServerMessage::Subscribed {

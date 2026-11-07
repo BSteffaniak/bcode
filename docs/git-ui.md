@@ -78,8 +78,10 @@ is scanned and checked once.
   rebuilt binary starts its own daemon; clients of the old build keep theirs. When that path is
   too long for a socket, it lives in `/tmp/bcode-git-<uid>/` instead. Either directory must
   belong to the user and be private, or the client serves itself.
-* **Disposable.** A repository is dropped 30 seconds after its last client leaves, and the daemon
-  exits after a minute without clients. If it goes away while clients run, each client serves
+* **Warm.** A client gets its own worktree first; the other worktrees' totals follow once they
+  are scanned (several at once). A worktree stays watched and up to date for ten minutes after
+  its last client leaves, so opening it again shows it at once, without scanning.
+* **Disposable.** The daemon exits after ten minutes without clients. If it goes away while clients run, each client serves
   itself in-process from then on, starting with a full scan, without interruption. If it cannot
   be reached at all, clients serve themselves from the start.
 * **Protocol.** Newline-delimited JSON over the socket, versioned by a handshake; a daemon of

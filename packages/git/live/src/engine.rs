@@ -23,6 +23,8 @@ const OTHER_UNTRACKED: UntrackedLimits = UntrackedLimits {
     files: 500,
     bytes: 1024 * 1024,
 };
+/// Most other worktrees scanned at once.
+const PARALLEL_SCANS: usize = 4;
 
 /// What one client wants kept.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -221,6 +223,7 @@ impl Pending {
 /// totals. Worktrees are keyed by their root as change events name it.
 pub struct Engine {
     scanner: Box<dyn StatusScanner>,
+    scanner_kind: ScannerKind,
     log: CommandLog,
     /// A worktree of the repository, to list the others.
     repo: Repository,
@@ -234,6 +237,11 @@ pub struct Engine {
     stats: EngineStats,
     /// Results of working out the kept set, for the next round's report.
     carried: Applied,
+    /// Worktrees measured only for their totals whose full scans wait for
+    /// [`Self::scan_owed`], so clients see their own worktrees first.
+    owed: BTreeSet<PathBuf>,
+    /// Listing the other worktrees waits for [`Self::prepare_owed`].
+    list_owed: bool,
 }
 
 impl Engine {
@@ -244,6 +252,7 @@ impl Engine {
         let common_dir = canonical(&repo.paths().common_dir);
         Self {
             scanner: scanner(scanner_kind),
+            scanner_kind,
             log: CommandLog::default(),
             repo: repo.clone(),
             watch_changes: vec![WatchChange::Watch(WatchTarget {
@@ -256,6 +265,8 @@ impl Engine {
             unsynced: true,
             stats: EngineStats::default(),
             carried: Applied::default(),
+            owed: BTreeSet::new(),
+            list_owed: false,
         }
     }
 
@@ -267,7 +278,10 @@ impl Engine {
 
     /// Use this full-scan strategy from now on.
     pub fn set_scanner(&mut self, kind: ScannerKind) {
-        self.scanner = scanner(kind);
+        if kind != self.scanner_kind {
+            self.scanner = scanner(kind);
+            self.scanner_kind = kind;
+        }
     }
 
     /// Work done so far.
@@ -482,19 +496,57 @@ impl Engine {
     /// needed.
     pub fn prepare(&mut self, pending: &mut Pending) {
         if pending.worktree_list || self.unsynced {
-            self.sync_worktrees();
+            // A shown worktree not scanned yet comes first: listing the others waits for
+            // [`Self::prepare_owed`].
+            let unscanned = self.interests.iter().any(|interest| {
+                self.worktrees
+                    .get(&Self::root_of(&interest.repo))
+                    .is_none_or(|worktree| !worktree.loaded)
+            });
+            self.list_owed = unscanned && self.others_wanted().is_some();
+            self.sync_worktrees(!self.list_owed);
         }
         pending.worktree_list = false;
     }
 
-    /// Carry out `pending`.
+    /// Bring the set of kept worktrees fully up to date before [`Self::scan_owed`], so
+    /// the watches of other worktrees start before they are scanned.
+    pub fn prepare_owed(&mut self) {
+        if std::mem::take(&mut self.list_owed) {
+            self.sync_worktrees(true);
+        }
+        let shown: BTreeSet<PathBuf> = self
+            .interests
+            .iter()
+            .map(|interest| Self::root_of(&interest.repo))
+            .collect();
+        self.owed.extend(
+            self.worktrees
+                .iter()
+                .filter(|(root, worktree)| !worktree.loaded && !shown.contains(*root))
+                .map(|(root, _)| root.clone()),
+        );
+    }
+
+    /// Carry out `pending` for the worktrees clients show. Full scans of the others are
+    /// owed instead (see [`Self::scan_owed`]), so a client's own worktree never waits for
+    /// them.
     pub fn apply(&mut self, mut pending: Pending) -> Applied {
         self.prepare(&mut pending);
         let mut applied = std::mem::take(&mut self.carried);
         applied.metadata |= pending.metadata;
         applied.files = pending.paths.keys().cloned().collect();
+        let shown: BTreeSet<PathBuf> = self
+            .interests
+            .iter()
+            .map(|interest| Self::root_of(&interest.repo))
+            .collect();
         let roots: Vec<PathBuf> = self.worktrees.keys().cloned().collect();
         for root in roots {
+            if !shown.contains(&root) && self.needs_full(&root, &pending) {
+                self.owed.insert(root);
+                continue;
+            }
             if let Err(error) = self.apply_to(&root, &mut pending) {
                 applied.errors.push((Some(root), error.message()));
             }
@@ -502,16 +554,78 @@ impl Engine {
         applied
     }
 
+    /// Whether [`Self::apply`] left full scans owed.
+    #[must_use]
+    pub fn owes_scans(&self) -> bool {
+        self.list_owed || !self.owed.is_empty()
+    }
+
+    /// Carry out the work [`Self::apply`] left owed, scanning several worktrees at once.
+    pub fn scan_owed(&mut self) -> Applied {
+        self.prepare_owed();
+        let owed = std::mem::take(&mut self.owed);
+        let mut groups: Vec<Vec<(&PathBuf, &mut WorktreeState)>> = Vec::new();
+        for (index, entry) in self
+            .worktrees
+            .iter_mut()
+            .filter(|(root, _)| owed.contains(*root))
+            .enumerate()
+        {
+            match groups.get_mut(index % PARALLEL_SCANS) {
+                Some(group) => group.push(entry),
+                None => groups.push(vec![entry]),
+            }
+        }
+        let kind = self.scanner_kind;
+        let mut applied = std::mem::take(&mut self.carried);
+        std::thread::scope(|scope| {
+            let handles: Vec<_> = groups
+                .into_iter()
+                .map(|group| {
+                    scope.spawn(move || {
+                        let mut scanner = scanner(kind);
+                        group
+                            .into_iter()
+                            .filter_map(|(root, worktree)| {
+                                worktree
+                                    .full(scanner.as_mut())
+                                    .err()
+                                    .map(|error| (Some(root.clone()), error.message()))
+                            })
+                            .collect::<Vec<_>>()
+                    })
+                })
+                .collect();
+            for handle in handles {
+                if let Ok(errors) = handle.join() {
+                    applied.errors.extend(errors);
+                }
+            }
+        });
+        self.stats.full_scans += owed.len() as u64;
+        applied
+    }
+
+    /// Whether `root` needs a full scan for `pending`, before trying to narrow it.
+    fn needs_full(&self, root: &PathBuf, pending: &Pending) -> bool {
+        pending.full
+            || pending.full_roots.contains(root)
+            || self
+                .worktrees
+                .get(root)
+                .is_some_and(|worktree| !worktree.loaded)
+    }
+
     fn apply_to(
         &mut self,
         root: &PathBuf,
         pending: &mut Pending,
     ) -> Result<(), bcode_git::GitError> {
+        let needs_full = self.needs_full(root, pending);
         let Some(worktree) = self.worktrees.get_mut(root) else {
             return Ok(());
         };
-        let narrowed = !(pending.full || pending.full_roots.contains(root) || !worktree.loaded)
-            && narrowed(worktree, root, pending, &mut self.stats)?;
+        let narrowed = !needs_full && narrowed(worktree, root, pending, &mut self.stats)?;
         if !narrowed {
             self.stats.full_scans += 1;
             worktree.full(self.scanner.as_mut())?;
@@ -519,8 +633,18 @@ impl Engine {
         Ok(())
     }
 
-    /// Keep the worktrees interests ask for, and watch them.
-    fn sync_worktrees(&mut self) {
+    /// Largest number of other worktrees any interest wants measured; `None` when none do.
+    fn others_wanted(&self) -> Option<usize> {
+        self.interests
+            .iter()
+            .filter(|interest| interest.config.other_worktrees)
+            .map(|interest| interest.config.max_other_worktrees)
+            .max()
+    }
+
+    /// Keep the worktrees interests ask for, and watch them. Without `with_others`, other
+    /// worktrees are neither listed nor dropped.
+    fn sync_worktrees(&mut self, with_others: bool) {
         self.unsynced = false;
         // Worktrees shown in detail, with how their lines are counted.
         let mut wanted: BTreeMap<PathBuf, (Repository, Modes, UntrackedLimits)> = BTreeMap::new();
@@ -532,14 +656,9 @@ impl Engine {
             entry.1.add(interest.config.counts);
         }
         // The rest of the repository's worktrees, measured for their totals.
-        let others = self
-            .interests
-            .iter()
-            .filter(|interest| interest.config.other_worktrees)
-            .map(|interest| interest.config.max_other_worktrees)
-            .max();
+        let others = self.others_wanted();
         let mut listed: BTreeMap<PathBuf, PathBuf> = BTreeMap::new();
-        if let Some(max) = others {
+        if let Some(max) = others.filter(|_| with_others) {
             match self.repo.worktrees() {
                 Ok(list) => {
                     let mut added = 0;
@@ -575,7 +694,7 @@ impl Engine {
         let stale: Vec<PathBuf> = self
             .worktrees
             .keys()
-            .filter(|root| !wanted.contains_key(*root))
+            .filter(|root| with_others && !wanted.contains_key(*root))
             .cloned()
             .collect();
         for root in stale {
@@ -597,7 +716,9 @@ impl Engine {
                 WorktreeState::new(repo, &self.common_dir, modes, limits)
             });
             worktree.set_counting(modes, limits);
-            worktree.listed = listed.get(&root).cloned();
+            if with_others {
+                worktree.listed = listed.get(&root).cloned();
+            }
         }
     }
 }

@@ -96,11 +96,43 @@ impl WorktreeState {
 
     /// Scan everything again.
     pub fn full(&mut self, scanner: &mut dyn StatusScanner) -> Result<(), GitError> {
+        let repo = &self.repo;
+        let modes = self.modes;
         // Readings that tell what changed later are taken before the status they stand for,
         // so they are never newer than it: a change between the two is seen again, not lost.
-        let index = self.repo.index_fingerprints(None).ok();
-        let head = self.repo.rev_parse("HEAD").ok();
-        let status = scanner.full_status(&self.repo)?;
+        // Each step's independent queries run at once.
+        let (index, head) = std::thread::scope(|scope| {
+            let head = scope.spawn(|| repo.rev_parse("HEAD").ok());
+            let index = repo.index_fingerprints(None).ok();
+            (index, head.join().ok().flatten())
+        });
+        let (status, total, staged, unstaged) = std::thread::scope(|scope| {
+            let count = |wanted: bool, target| {
+                wanted.then(|| scope.spawn(move || repo.numstat_scoped(target, None)))
+            };
+            let total = count(modes.total, CountTarget::Worktree);
+            let staged = count(modes.split, CountTarget::Staged);
+            let unstaged = count(modes.split, CountTarget::Unstaged);
+            let joined = |handle: Option<std::thread::ScopedJoinHandle<'_, _>>| {
+                handle.map_or_else(
+                    || Ok(BTreeMap::new()),
+                    |handle| {
+                        handle.join().unwrap_or_else(|_| {
+                            Err(GitError::Io(std::io::Error::other(
+                                "line counting panicked",
+                            )))
+                        })
+                    },
+                )
+            };
+            (
+                scanner.full_status(repo),
+                joined(total),
+                joined(staged),
+                joined(unstaged),
+            )
+        });
+        let status = status?;
         self.loaded = true;
         self.index = index;
         self.head = head;
@@ -110,19 +142,9 @@ impl WorktreeState {
             .into_iter()
             .map(|entry| (entry.path.clone(), entry))
             .collect();
-        self.total = if self.modes.total {
-            self.repo.numstat_scoped(CountTarget::Worktree, None)?
-        } else {
-            BTreeMap::new()
-        };
-        (self.staged, self.unstaged) = if self.modes.split {
-            (
-                self.repo.numstat_scoped(CountTarget::Staged, None)?,
-                self.repo.numstat_scoped(CountTarget::Unstaged, None)?,
-            )
-        } else {
-            (BTreeMap::new(), BTreeMap::new())
-        };
+        self.total = total?;
+        self.staged = staged?;
+        self.unstaged = unstaged?;
         self.recount_untracked(None);
         Ok(())
     }

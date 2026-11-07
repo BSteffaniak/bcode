@@ -10,7 +10,9 @@ use std::time::{Duration, Instant};
 use bcode_git::Repository;
 
 use crate::counts::CountsMode;
-use crate::engine::{Engine, EngineConfig, Interest, LiveUpdate, Pending, Request, WatchChange};
+use crate::engine::{
+    Applied, Engine, EngineConfig, Interest, LiveUpdate, Pending, Request, WatchChange,
+};
 use crate::scan::ScannerKind;
 use crate::source::{ChangeSource, SourceEvent, SourceKind, open};
 use crate::subscriber::Subscriber;
@@ -58,6 +60,19 @@ impl Hub {
     /// Failures to watch reach subscribers as [`LiveUpdate::errors`].
     #[must_use]
     pub fn start(repo: &Repository, scanner: ScannerKind, source: Option<SourceKind>) -> Self {
+        Self::start_retaining(repo, scanner, source, Duration::ZERO)
+    }
+
+    /// [`Self::start`], keeping what a departed subscriber's worktree needs (its state,
+    /// watches and the other worktrees it measured) up to date for `retain` after it leaves,
+    /// so a subscriber coming back is served at once, without scanning.
+    #[must_use]
+    pub fn start_retaining(
+        repo: &Repository,
+        scanner: ScannerKind,
+        source: Option<SourceKind>,
+        retain: Duration,
+    ) -> Self {
         let (inputs, receiver) = mpsc::channel();
         let events = inputs.clone();
         let mut errors = Vec::new();
@@ -75,7 +90,7 @@ impl Hub {
         let engine = Engine::new(repo, scanner);
         let spawned = std::thread::Builder::new()
             .name("bcode-git-live".into())
-            .spawn(move || Loop::new(engine, source, errors).run(&receiver));
+            .spawn(move || Loop::new(engine, source, errors, retain).run(&receiver));
         drop(spawned);
         Self {
             inputs,
@@ -133,6 +148,10 @@ struct Loop {
     source: Option<Box<dyn ChangeSource>>,
     clients: BTreeMap<u64, Client>,
     errors: Vec<String>,
+    /// How long departed subscribers' interests are kept.
+    retain: Duration,
+    /// Interests of departed subscribers, by worktree root, until they expire.
+    retained: BTreeMap<std::path::PathBuf, (Interest, Instant)>,
 }
 
 #[derive(Default)]
@@ -142,23 +161,51 @@ struct Round {
 }
 
 impl Loop {
-    fn new(engine: Engine, source: Option<Box<dyn ChangeSource>>, errors: Vec<String>) -> Self {
+    fn new(
+        engine: Engine,
+        source: Option<Box<dyn ChangeSource>>,
+        errors: Vec<String>,
+        retain: Duration,
+    ) -> Self {
         Self {
             engine,
             source,
             clients: BTreeMap::new(),
             errors,
+            retain,
+            retained: BTreeMap::new(),
         }
     }
 
     fn run(mut self, inputs: &mpsc::Receiver<Input>) {
         loop {
-            let Ok(first) = inputs.recv() else {
-                return;
+            let expiry = self.retained.values().map(|(_, until)| *until).min();
+            let first = match expiry {
+                Some(until) => {
+                    match inputs.recv_timeout(until.saturating_duration_since(Instant::now())) {
+                        Ok(input) => Some(input),
+                        Err(RecvTimeoutError::Timeout) => None,
+                        Err(RecvTimeoutError::Disconnected) => return,
+                    }
+                }
+                None => match inputs.recv() {
+                    Ok(input) => Some(input),
+                    Err(_) => return,
+                },
             };
             let mut round = Round::default();
-            if !self.take(&mut round, first) {
+            let woken = first.is_some();
+            if let Some(first) = first
+                && !self.take(&mut round, first)
+            {
                 return;
+            }
+            let now = Instant::now();
+            let before = self.retained.len();
+            self.retained.retain(|_, (_, until)| *until > now);
+            round.interests |= self.retained.len() != before;
+            if !woken && !round.interests {
+                continue;
             }
             let started = Instant::now();
             loop {
@@ -195,7 +242,9 @@ impl Loop {
             }
             Input::Source(SourceEvent::Degraded(message)) => self.errors.push(message),
             Input::Subscribe(id, repo, config, sink) => {
-                let subscriber = Subscriber::new(Engine::root_of(&repo), config);
+                let root = Engine::root_of(&repo);
+                self.retained.remove(&root);
+                let subscriber = Subscriber::new(root, config);
                 self.clients.insert(
                     id,
                     Client {
@@ -216,7 +265,21 @@ impl Loop {
                 }
             }
             Input::Unsubscribe(id) => {
-                round.interests |= self.clients.remove(&id).is_some();
+                if let Some(client) = self.clients.remove(&id) {
+                    if !self.retain.is_zero() {
+                        self.retained.insert(
+                            Engine::root_of(&client.repo),
+                            (
+                                Interest {
+                                    repo: client.repo,
+                                    config: client.subscriber.config(),
+                                },
+                                Instant::now() + self.retain,
+                            ),
+                        );
+                    }
+                    round.interests = true;
+                }
             }
         }
         true
@@ -224,7 +287,7 @@ impl Loop {
 
     fn work(&mut self, mut round: Round) {
         if round.interests {
-            let interests = self
+            let mut interests: Vec<Interest> = self
                 .clients
                 .values()
                 .map(|client| Interest {
@@ -232,11 +295,21 @@ impl Loop {
                     config: client.subscriber.config(),
                 })
                 .collect();
+            // Departed subscribers' worktrees stay kept, unless a subscriber shows them.
+            let shown: std::collections::BTreeSet<_> = interests
+                .iter()
+                .map(|interest| Engine::root_of(&interest.repo))
+                .collect();
+            interests.extend(
+                self.retained
+                    .iter()
+                    .filter(|(root, _)| !shown.contains(*root))
+                    .map(|(_, (interest, _))| interest.clone()),
+            );
+            let fsmonitor = interests
+                .iter()
+                .any(|interest| interest.config.scanner == ScannerKind::Fsmonitor);
             self.engine.set_interests(interests);
-            let fsmonitor = self
-                .clients
-                .values()
-                .any(|client| client.subscriber.config().scanner == ScannerKind::Fsmonitor);
             self.engine.set_scanner(if fsmonitor {
                 ScannerKind::Fsmonitor
             } else {
@@ -251,11 +324,23 @@ impl Loop {
         applied
             .errors
             .extend(self.errors.drain(..).map(|message| (None, message)));
+        self.report(&applied);
+        // Clients have their own worktrees; the others' totals follow.
+        if self.engine.owes_scans() {
+            self.engine.prepare_owed();
+            self.register();
+            let applied = self.engine.scan_owed();
+            self.report(&applied);
+        }
+    }
+
+    /// Tell each client what changed for it in the round that produced `applied`.
+    fn report(&mut self, applied: &Applied) {
         if let Some(source) = &self.source {
             self.engine.note_watching(source.counters());
         }
         for client in self.clients.values_mut() {
-            let update = client.subscriber.report(&self.engine, &applied);
+            let update = client.subscriber.report(&self.engine, applied);
             if client.new || !update.is_empty() {
                 client.new = false;
                 (client.sink)(update);
@@ -355,7 +440,10 @@ impl InlineSession {
             }
             other => pending.request(other),
         }
-        let applied = self.engine.apply(pending);
+        let mut applied = self.engine.apply(pending);
+        if self.engine.owes_scans() {
+            applied.errors.extend(self.engine.scan_owed().errors);
+        }
         self.subscriber.report(&self.engine, &applied)
     }
 }

@@ -148,6 +148,20 @@ fn clients_of_a_repository_share_one_scan_and_each_check() {
 }
 
 #[test]
+fn a_client_coming_back_is_served_without_scanning() {
+    let state = tempfile::tempdir().unwrap();
+    let server = Server::spawn(ServeOptions::new(socket(&state))).unwrap();
+    let repo = repository();
+    drop(Client::connect(&socket(&state), repo.path()));
+    std::fs::write(repo.path().join("a.txt"), "1\n2\n").unwrap();
+    std::thread::sleep(Duration::from_millis(300));
+    let client = Client::connect(&socket(&state), repo.path());
+    assert_eq!(client.count("a.txt"), Some(LineStats::text(1, 0)));
+    assert_eq!(client.stats.full_scans, 1);
+    server.shutdown();
+}
+
+#[test]
 fn clients_serve_themselves_once_the_daemon_is_gone() {
     let state = tempfile::tempdir().unwrap();
     let server = Server::spawn(ServeOptions::new(socket(&state))).unwrap();

@@ -362,6 +362,81 @@ fn other_worktrees_report_their_totals() {
 }
 
 #[test]
+fn a_clients_own_worktree_comes_before_the_others_are_scanned() {
+    let repo = repository();
+    let others = tempfile::tempdir().unwrap();
+    let topics: Vec<PathBuf> = (0..3)
+        .map(|index| {
+            let topic = others.path().join(format!("topic-{index}"));
+            git(
+                repo.path(),
+                &[
+                    "worktree",
+                    "add",
+                    "--quiet",
+                    "-b",
+                    &format!("topic-{index}"),
+                    topic.to_str().unwrap(),
+                ],
+            );
+            topic
+        })
+        .collect();
+    let config = EngineConfig {
+        other_worktrees: true,
+        ..counting()
+    };
+    let mut live = Live::start(repo.path(), config, SourceKind::Auto);
+    // The first update carries the client's own worktree, scanned alone.
+    assert_eq!(live.stats.full_scans, 1);
+    assert!(live.totals.is_empty(), "{:?}", live.totals);
+    live.wait("the other worktrees", |live| {
+        topics.iter().all(|topic| live.total(topic).is_some())
+    });
+    assert_eq!(live.stats.full_scans, 4);
+}
+
+#[test]
+fn a_departed_clients_worktree_is_kept_while_retained() {
+    let repo = repository();
+    let main_repo = Repository::discover(repo.path(), CommandLog::default()).unwrap();
+    let hub = bcode_git_live::Hub::start_retaining(
+        &main_repo,
+        counting().scanner,
+        Some(SourceKind::Auto),
+        Duration::from_millis(1500),
+    );
+    let subscribe = || {
+        let (sender, updates) = mpsc::channel();
+        let id = hub.subscribe(
+            &main_repo,
+            counting(),
+            std::sync::Arc::new(move |update| {
+                let _ = sender.send(update);
+            }),
+        );
+        (id, Observer::new(updates))
+    };
+    let (id, mut first) = subscribe();
+    first.wait("the first scan", |seen| seen.primary.is_some());
+    hub.unsubscribe(id);
+    // Changes while nobody is subscribed are still followed.
+    std::fs::write(repo.path().join("a.txt"), "1\n2\n").unwrap();
+    std::thread::sleep(Duration::from_millis(300));
+    let (id, mut again) = subscribe();
+    again.wait("everything known", |seen| seen.primary.is_some());
+    assert_eq!(again.count("a.txt"), Some(LineStats::text(1, 0)));
+    assert_eq!(again.stats.full_scans, 1, "served without scanning again");
+    hub.unsubscribe(id);
+
+    // Once retention runs out, the worktree is let go and scanned again when shown.
+    std::thread::sleep(Duration::from_millis(2000));
+    let (_, mut late) = subscribe();
+    late.wait("everything known", |seen| seen.primary.is_some());
+    assert_eq!(late.stats.full_scans, 2);
+}
+
+#[test]
 fn clients_of_one_repository_share_its_work() {
     let repo = repository();
     let others = tempfile::tempdir().unwrap();
