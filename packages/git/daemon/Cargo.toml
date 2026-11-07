@@ -1,0 +1,25 @@
+[package]
+authors     = { workspace = true }
+categories  = ["development-tools"]
+description = "Shared bcode-git daemon serving live repository state to every client"
+edition     = { workspace = true }
+keywords    = ["bcode", "daemon", "git"]
+license     = { workspace = true }
+name        = "bcode_git_daemon"
+readme      = { workspace = true }
+repository  = { workspace = true }
+version     = { workspace = true }
+
+[dependencies]
+bcode_git      = { workspace = true }
+bcode_git_live = { workspace = true }
+serde          = { workspace = true, features = ["derive", "std"] }
+serde_json     = { workspace = true }
+thiserror      = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }
+
+[features]
+default          = []
+fail-on-warnings = []

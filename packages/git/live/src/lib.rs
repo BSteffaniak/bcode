@@ -7,8 +7,10 @@
 //! * [`Engine`]: turns change events into the narrowest git queries (only the changed paths,
 //!   only the index entries that changed, only the files two commits differ in) and keeps
 //!   each worktree's status and line counts.
-//! * [`LocalSession`]: runs an engine and a change source on their own thread, coalescing
-//!   bursts of events so work never overlaps.
+//! * [`Hub`]: runs an engine and a change source on their own thread for any number of
+//!   [`Subscriber`]s, coalescing bursts of events so work never overlaps. A daemon runs one
+//!   hub per repository for every client; [`LocalSession`] is a hub with one client, and
+//!   [`InlineSession`] runs synchronously without watching.
 
 #![cfg_attr(feature = "fail-on-warnings", deny(warnings))]
 #![warn(clippy::all, clippy::pedantic, clippy::nursery, clippy::cargo)]
@@ -20,10 +22,13 @@ mod filter;
 pub mod scan;
 mod session;
 pub mod source;
+mod subscriber;
 mod worktree;
 
 pub use counts::{CountsMode, LineCounts};
 pub use engine::{
-    Engine, EngineConfig, EngineStats, LiveUpdate, Request, WorktreeSnapshot, WorktreeTotal,
+    Applied, Engine, EngineConfig, EngineStats, Interest, LiveUpdate, Request, WorktreeSnapshot,
+    WorktreeTotal, WorktreeTotalAt,
 };
-pub use session::LocalSession;
+pub use session::{Hub, InlineSession, LiveSession, LocalSession, UpdateSink};
+pub use subscriber::Subscriber;

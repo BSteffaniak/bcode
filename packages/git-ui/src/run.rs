@@ -35,6 +35,46 @@ pub struct RunOptions {
     /// Where pull requests come from (for example `bcode_forge::GitHub`); `None` turns them
     /// off. Ignored when `pull_requests.enabled` is false.
     pub pull_requests: Option<Arc<dyn bcode_forge_models::PullRequestSource>>,
+    /// How to start the shared daemon (see [`daemon_launch`]); `None` never uses one. Its
+    /// socket lives in `state_dir` (or the default state directory).
+    pub daemon: Option<bcode_git_daemon::Launch>,
+}
+
+/// Hidden argument of the binaries that makes them serve as the shared daemon on the
+/// socket path that follows it.
+pub const DAEMON_ARGUMENT: &str = "--git-daemon";
+
+/// How to start the shared daemon, or `None` when the running executable cannot be found.
+///
+/// It is the running executable with `prefix` (the arguments that reach the git client, such
+/// as the `git` subcommand of `bcode`) and [`DAEMON_ARGUMENT`].
+#[must_use]
+pub fn daemon_launch(prefix: &[&str]) -> Option<bcode_git_daemon::Launch> {
+    bcode_git_daemon::Launch::current_exe(prefix.iter().copied().chain([DAEMON_ARGUMENT])).ok()
+}
+
+/// Serve as the shared daemon on `socket` until idle (`idle` overrides how long that takes).
+///
+/// # Errors
+/// * [`RunError::Terminal`] when the socket cannot be served, or on platforms without Unix
+///   domain sockets.
+pub fn serve_daemon(socket: PathBuf, idle: Option<Duration>) -> Result<(), RunError> {
+    #[cfg(unix)]
+    {
+        let mut options = bcode_git_daemon::server::ServeOptions::new(socket);
+        if let Some(idle) = idle {
+            options.idle = idle;
+        }
+        bcode_git_daemon::server::serve(&options)
+            .map_err(|error| RunError::Terminal(error.to_string()))
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (socket, idle);
+        Err(RunError::Terminal(
+            "the bcode-git daemon needs Unix domain sockets".into(),
+        ))
+    }
 }
 
 /// Environment variable holding a commit message to prefill.
@@ -147,6 +187,16 @@ pub fn build_app(options: RunOptions) -> Result<App, RunError> {
         .map_or_else(crate::pulls::default_cache_dir, |dir| {
             Some(dir.join("pull-requests"))
         });
+    app.daemon = options.daemon.and_then(|launch| {
+        let state = options
+            .state_dir
+            .clone()
+            .or_else(bcode_git_daemon::default_state_dir)?;
+        Some(bcode_git_daemon::ClientOptions::new(
+            bcode_git_daemon::socket_path(&state),
+            Some(launch),
+        ))
+    });
     let source = options
         .pull_requests
         .filter(|_| app.config.pull_requests.enabled);
@@ -241,18 +291,14 @@ async fn session(mut app: App) -> Result<(App, Option<String>), RunError> {
     let terminal = Terminal::new(std::io::stdout(), Rect::new(0, 0, size.width, size.height));
     let presenter: Presenter = TerminalPresenter::with_commit(terminal, paint, commit);
     let (live_sender, mut live_updates) = tokio::sync::mpsc::unbounded_channel();
-    let source = app
-        .config
-        .refresh
-        .watch
-        .then(|| app.config.refresh.watcher.into());
-    let live = bcode_git_live::LocalSession::start(
-        bcode_git_live::Engine::new(&app.repo, app.live_config()),
-        source,
-        move |update| {
+    let (live, unshared) = start_live(
+        &app,
+        Arc::new(move |update| {
             let _ = live_sender.send(update);
-        },
+        }),
     );
+    // Serving itself works just as well, so why sharing failed is kept, not shown.
+    app.diagnostics.extend(unshared);
     app.set_watching(live.watching());
     app.set_live_session(live);
     let (animating, frame_ms) = app.animation();
@@ -329,6 +375,42 @@ async fn session(mut app: App) -> Result<(App, Option<String>), RunError> {
     };
     drop(guard);
     Ok((app, error))
+}
+
+/// Live state for this session: from the shared daemon when configured and reachable, else
+/// served in this process (with why the daemon could not serve it).
+fn start_live(
+    app: &App,
+    sink: bcode_git_live::UpdateSink,
+) -> (Box<dyn bcode_git_live::LiveSession>, Option<String>) {
+    let refresh = &app.config.refresh;
+    let source = refresh.watch.then(|| refresh.watcher.into());
+    let config = app.live_config();
+    // Without watching there is nothing to share.
+    if refresh.watch
+        && refresh.daemon
+        && let Some(options) = &app.daemon
+    {
+        match bcode_git_daemon::DaemonSession::connect(
+            options,
+            &app.repo,
+            config,
+            source,
+            sink.clone(),
+        ) {
+            Ok(session) => return (Box::new(session), None),
+            Err(error) => {
+                let session = bcode_git_live::LocalSession::start(&app.repo, config, source, sink);
+                return (Box::new(session), Some(error.to_string()));
+            }
+        }
+    }
+    (
+        Box::new(bcode_git_live::LocalSession::start(
+            &app.repo, config, source, sink,
+        )),
+        None,
+    )
 }
 
 fn run_external(command: &str, cwd: &Path, pause: bool) {

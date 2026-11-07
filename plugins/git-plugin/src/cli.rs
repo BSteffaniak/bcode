@@ -32,6 +32,13 @@ struct GitCli {
     /// With --print-config or --import-lazygit, emit the bcode.toml form instead.
     #[arg(long)]
     nested: bool,
+    /// Serve live repository state for every client on this socket (started automatically
+    /// by clients).
+    #[arg(long = "git-daemon", hide = true, value_name = "SOCKET")]
+    git_daemon: Option<PathBuf>,
+    /// With --git-daemon, exit after this many milliseconds without clients.
+    #[arg(long, hide = true, value_name = "MS")]
+    git_daemon_idle_ms: Option<u64>,
 }
 
 pub fn registration() -> StaticCliRegistration {
@@ -45,6 +52,11 @@ pub fn registration() -> StaticCliRegistration {
 fn invoke(matches: clap::ArgMatches) -> StaticCliFuture {
     Box::pin(async move {
         let cli = GitCli::from_arg_matches(&matches).map_err(|error| error.to_string())?;
+        if let Some(socket) = cli.git_daemon {
+            let idle = cli.git_daemon_idle_ms.map(std::time::Duration::from_millis);
+            bcode_git_ui::serve_daemon(socket, idle).map_err(|error| error.to_string())?;
+            return Ok(StaticCliOutcome::default());
+        }
         let path = match cli.path {
             Some(path) => std::path::absolute(&path).unwrap_or(path),
             None => std::env::current_dir().map_err(|error| error.to_string())?,
@@ -88,6 +100,7 @@ fn invoke(matches: clap::ArgMatches) -> StaticCliFuture {
             commit_message: bcode_git_ui::commit_message_from_env(),
             state_dir: None,
             pull_requests,
+            daemon: bcode_git_ui::daemon_launch(&["git"]),
         })
         .await
         .map_err(|error| error.to_string())?;

@@ -287,6 +287,7 @@ fn launch_with(
         commit_message,
         state_dir: Some(state.to_owned()),
         pull_requests,
+        daemon: None,
     })
     .unwrap();
     app.set_inline(true);
@@ -2490,7 +2491,21 @@ fn pull_requests_are_cached_and_failures_are_explained() {
         Some(forge.clone()),
         Arc::new(bcode_git_ui::host::StandaloneHost),
     );
-    // The next session cannot reach GitHub, but shows what was cached and why it is stale.
+    // A session started while the cached answer is fresh (as any client's would be) takes
+    // it instead of asking again.
+    let calls = forge.calls();
+    harness.relaunch();
+    assert_eq!(forge.calls(), calls);
+    // Once it is stale, the next session asks. It cannot reach GitHub, but shows what was
+    // cached and why it is stale.
+    let stale = std::time::SystemTime::now() - std::time::Duration::from_secs(3600);
+    for entry in std::fs::read_dir(harness.state.path().join("pull-requests")).unwrap() {
+        let file = std::fs::File::options()
+            .write(true)
+            .open(entry.unwrap().path())
+            .unwrap();
+        file.set_modified(stale).unwrap();
+    }
     harness.pulls = Some(FakeForge::new(Err(
         bcode_forge_models::ForgeError::Unauthenticated("no GitHub token for github.com".into()),
     )));
@@ -2674,6 +2689,34 @@ fn automatic_fetches_show_only_in_the_status_bar() {
     let screen = harness.screen(160, 40);
     assert!(!main_row(&screen).contains("fetched"), "{screen}");
     assert!(!status_bar(&screen).contains("Fetching"), "{screen}");
+}
+
+#[test]
+fn automatic_fetches_count_fetches_made_elsewhere() {
+    let remote = tempfile::tempdir().unwrap();
+    let mut harness = Harness::with_config(
+        |path| ahead_of_origin(path, remote.path()),
+        configured(
+            "[plugins.config.\"bcode.git\".ui.refresh]\nauto_fetch_seconds = 1\n\
+             [plugins.config.\"bcode.git\".ui.activity]\nanimate = false\n",
+        ),
+    );
+    let tick = |harness: &mut Harness| {
+        harness
+            .app
+            .update(RuntimeEvent::Message(bcode_git_ui::app::Msg::Tick))
+            .unwrap();
+        status_bar(&harness.screen(160, 40)).contains("… Fetching")
+    };
+    // Another client (or a terminal) fetched just now: this one's fetch waits its turn.
+    std::thread::sleep(std::time::Duration::from_millis(1100));
+    git(harness.path(), &["fetch", "--quiet"]);
+    assert!(!tick(&mut harness));
+    harness.drain();
+    // A full interval after that fetch, this client fetches.
+    std::thread::sleep(std::time::Duration::from_millis(1100));
+    assert!(tick(&mut harness));
+    harness.drain();
 }
 
 #[test]

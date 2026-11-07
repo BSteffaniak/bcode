@@ -10,8 +10,7 @@ use bcode_git::models::{ChangeKind, LineStats, StatusEntry};
 use bcode_git::{CommandLog, Repository};
 use bcode_git_live::source::SourceKind;
 use bcode_git_live::{
-    CountsMode, Engine, EngineConfig, EngineStats, LineCounts, LiveUpdate, LocalSession,
-    WorktreeSnapshot,
+    CountsMode, EngineConfig, EngineStats, LineCounts, LiveUpdate, LocalSession, WorktreeSnapshot,
 };
 use tempfile::TempDir;
 
@@ -57,10 +56,14 @@ impl Live {
     fn start(path: &Path, config: EngineConfig, source: SourceKind) -> Self {
         let repo = Repository::discover(path, CommandLog::default()).unwrap();
         let (sender, updates) = mpsc::channel();
-        let session =
-            LocalSession::start(Engine::new(&repo, config), Some(source), move |update| {
+        let session = LocalSession::start(
+            &repo,
+            config,
+            Some(source),
+            std::sync::Arc::new(move |update| {
                 let _ = sender.send(update);
-            });
+            }),
+        );
         let mut live = Self {
             _session: session,
             updates,
@@ -321,5 +324,117 @@ fn other_worktrees_report_their_totals() {
             live.total(&topic) == Some(LineStats::default())
         });
         assert_eq!(live.stats.full_scans, 2, "{source:?}");
+    }
+}
+
+#[test]
+fn clients_of_one_repository_share_its_work() {
+    let repo = repository();
+    let others = tempfile::tempdir().unwrap();
+    let topic = others.path().join("topic");
+    git(
+        repo.path(),
+        &[
+            "worktree",
+            "add",
+            "--quiet",
+            "-b",
+            "topic",
+            topic.to_str().unwrap(),
+        ],
+    );
+    let config = EngineConfig {
+        other_worktrees: true,
+        ..counting()
+    };
+    let main_repo = Repository::discover(repo.path(), CommandLog::default()).unwrap();
+    let topic_repo = Repository::discover(&topic, CommandLog::default()).unwrap();
+    let hub = bcode_git_live::Hub::start(&main_repo, config.scanner, Some(SourceKind::Auto));
+    let subscribe = |repo: &Repository| {
+        let (sender, updates) = mpsc::channel();
+        hub.subscribe(
+            repo,
+            config,
+            std::sync::Arc::new(move |update| {
+                let _ = sender.send(update);
+            }),
+        );
+        updates
+    };
+    let mut main = Observer::new(subscribe(&main_repo));
+    let mut other = Observer::new(subscribe(&topic_repo));
+    main.wait("main's scan", |seen| {
+        seen.primary.is_some() && seen.total(&topic).is_some()
+    });
+    other.wait("topic's scan", |seen| {
+        seen.primary.is_some() && seen.total(repo.path()).is_some()
+    });
+    // Each worktree is scanned once, however many clients show it.
+    assert_eq!(main.stats.full_scans, 2);
+
+    std::fs::write(repo.path().join("a.txt"), "1\n2\n").unwrap();
+    main.wait("its own edit", |seen| {
+        seen.count("a.txt") == Some(LineStats::text(1, 0))
+    });
+    other.wait("main's total", |seen| {
+        seen.total(repo.path()) == Some(LineStats::text(1, 0))
+    });
+    std::fs::write(topic.join("a.txt"), "").unwrap();
+    other.wait("its own edit", |seen| {
+        seen.count("a.txt") == Some(LineStats::text(0, 1))
+    });
+    main.wait("topic's total", |seen| {
+        seen.total(&topic) == Some(LineStats::text(0, 1))
+    });
+    // One check per edit, for both clients together.
+    assert_eq!(other.stats.full_scans, 2);
+    assert_eq!(other.stats.path_checks, 2);
+}
+
+/// Updates one subscriber received.
+struct Observer {
+    updates: mpsc::Receiver<LiveUpdate>,
+    primary: Option<WorktreeSnapshot>,
+    totals: BTreeMap<PathBuf, LineStats>,
+    stats: EngineStats,
+}
+
+impl Observer {
+    fn new(updates: mpsc::Receiver<LiveUpdate>) -> Self {
+        Self {
+            updates,
+            primary: None,
+            totals: BTreeMap::new(),
+            stats: EngineStats::default(),
+        }
+    }
+
+    fn wait(&mut self, what: &str, done: impl Fn(&Self) -> bool) {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while !done(self) {
+            let left = deadline.saturating_duration_since(Instant::now());
+            assert!(!left.is_zero(), "timed out waiting for {what}");
+            if let Ok(update) = self.updates.recv_timeout(left) {
+                assert!(update.errors.is_empty(), "{:?}", update.errors);
+                self.stats = update.stats;
+                if update.primary.is_some() {
+                    self.primary = update.primary;
+                }
+                for (root, (_, total)) in update.totals {
+                    self.totals.insert(canonical(&root), total.total);
+                }
+            }
+        }
+    }
+
+    fn count(&self, path: &str) -> Option<LineStats> {
+        match &self.primary.as_ref()?.counts {
+            LineCounts::Total(total) => total.get(path).copied(),
+            _ => None,
+        }
+    }
+
+    fn total(&self, root: &Path) -> Option<LineStats> {
+        self.totals.get(&canonical(root)).copied()
     }
 }

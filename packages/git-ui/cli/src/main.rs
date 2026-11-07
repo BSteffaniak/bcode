@@ -37,11 +37,30 @@ struct Args {
     /// With --print-config or --import-lazygit, emit the bcode.toml form instead.
     #[arg(long)]
     nested: bool,
+    /// Serve live repository state for every client on this socket (started automatically
+    /// by clients).
+    #[arg(long = "git-daemon", hide = true, value_name = "SOCKET")]
+    git_daemon: Option<PathBuf>,
+    /// With --git-daemon, exit after this many milliseconds without clients.
+    #[arg(long, hide = true, value_name = "MS")]
+    git_daemon_idle_ms: Option<u64>,
 }
 
 #[tokio::main]
 async fn main() -> ExitCode {
     let args = Args::parse();
+    if let Some(socket) = args.git_daemon {
+        let idle = args
+            .git_daemon_idle_ms
+            .map(std::time::Duration::from_millis);
+        return match bcode_git_ui::serve_daemon(socket, idle) {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(error) => {
+                eprintln!("bcode-git: {error}");
+                ExitCode::FAILURE
+            }
+        };
+    }
     let path = args
         .path
         .unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")));
@@ -85,6 +104,7 @@ async fn main() -> ExitCode {
         commit_message: bcode_git_ui::commit_message_from_env(),
         state_dir: None,
         pull_requests,
+        daemon: bcode_git_ui::daemon_launch(&[]),
     };
     match bcode_git_ui::run(options).await {
         Ok(()) => ExitCode::SUCCESS,

@@ -2296,12 +2296,25 @@ dependencies = [
 ]
 
 [[package]]
+name = "bcode_git_daemon"
+version = "0.0.1-alpha.0"
+dependencies = [
+ "bcode_git",
+ "bcode_git_live",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror 2.0.21",
+]
+
+[[package]]
 name = "bcode_git_live"
 version = "0.0.1-alpha.0"
 dependencies = [
  "bcode_git",
  "ignore",
  "notify",
+ "serde",
  "tempfile",
  "thiserror 2.0.21",
 ]
@@ -2339,6 +2352,7 @@ dependencies = [
  "bcode_config_layers",
  "bcode_forge_models",
  "bcode_git",
+ "bcode_git_daemon",
  "bcode_git_live",
  "bcode_keymap",
  "bcode_syntax_render",
@@ -2365,8 +2379,12 @@ name = "bcode_git_ui_cli"
 version = "0.0.1-alpha.0"
 dependencies = [
  "bcode_forge",
+ "bcode_git",
+ "bcode_git_daemon",
+ "bcode_git_live",
  "bcode_git_ui",
  "clap",
+ "tempfile",
  "tokio",
 ]
 

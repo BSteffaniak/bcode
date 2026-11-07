@@ -80,7 +80,8 @@ pub trait ChangeSource: Send {
 }
 
 /// Which [`ChangeSource`] to use.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum SourceKind {
     /// The best backend for this operating system.
     #[default]

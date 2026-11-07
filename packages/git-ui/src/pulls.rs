@@ -160,6 +160,29 @@ impl PullRequests {
         true
     }
 
+    /// When this client's request is due but another client of the repository asked within
+    /// `refresh` (its cached answer is that fresh), take that answer instead of asking again,
+    /// so every client together asks once per interval. Returns whether the list changed;
+    /// `None` when nothing was adopted.
+    pub fn adopt_shared(&mut self, refresh: Duration) -> Option<bool> {
+        if self.loading || self.requested.is_some_and(|at| at.elapsed() < refresh) {
+            return None;
+        }
+        let file = self.cache_file(self.repository.as_ref()?)?;
+        let age = file.metadata().ok()?.modified().ok()?.elapsed().ok()?;
+        if age >= refresh {
+            return None;
+        }
+        let list = read_cache(&file)?;
+        self.requested = Some(Instant::now().checked_sub(age).unwrap_or_else(Instant::now));
+        if self.status == PullStatus::Loading {
+            self.status = PullStatus::Cached;
+        }
+        let changed = self.list != list;
+        self.list = list;
+        Some(changed)
+    }
+
     /// A request to make now, when one is due (or `force`d) and possible: the source,
     /// repository and generation to answer with.
     pub fn due(
@@ -226,6 +249,14 @@ impl crate::app::App {
         force: bool,
     ) -> Option<bmux_tui_runtime::Command<crate::app::Msg>> {
         let refresh = Duration::from_secs(self.config.pull_requests.refresh_seconds.max(30));
+        if !force && let Some(changed) = self.pulls.adopt_shared(refresh) {
+            return if changed {
+                self.sync_pull_status();
+                self.match_pull_requests()
+            } else {
+                None
+            };
+        }
         let (source, repository, generation) = self.pulls.due(refresh, force)?;
         self.sync_pull_status();
         self.activity.begin(crate::activity::Load::PullRequests);

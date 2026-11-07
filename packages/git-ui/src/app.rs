@@ -391,6 +391,8 @@ pub struct App {
     pub(crate) worktree_totals: BTreeMap<PathBuf, LineStats>,
     /// Where the live status and line counts come from.
     pub(crate) live: Option<Live>,
+    /// How to reach the shared daemon, when it may be used.
+    pub(crate) daemon: Option<bcode_git_daemon::ClientOptions>,
     pub(crate) command_log: bool,
     pub(crate) screen_mode: ScreenMode,
     pub(crate) cherry: Vec<Commit>,
@@ -412,10 +414,10 @@ pub struct App {
 
 /// Where live repository state comes from.
 pub(crate) enum Live {
-    /// A background session reacting to filesystem changes.
-    Session(bcode_git_live::LocalSession),
-    /// An engine run synchronously, for inline (test and headless) use.
-    Inline(Box<bcode_git_live::Engine>),
+    /// A session reacting to filesystem changes (served by the daemon or in-process).
+    Session(Box<dyn bcode_git_live::LiveSession>),
+    /// Served synchronously, for inline (test and headless) use.
+    Inline(Box<bcode_git_live::InlineSession>),
 }
 
 const PENDING_TIMEOUT: Duration = Duration::from_millis(1500);
@@ -530,6 +532,7 @@ impl App {
             flashes: crate::flash::Flashes::default(),
             worktree_totals: BTreeMap::new(),
             live: None,
+            daemon: None,
             command_log,
             screen_mode,
             cherry: Vec::new(),
@@ -952,20 +955,20 @@ impl App {
     }
 
     /// Take live state from `session`, which reports through [`Msg::Live`].
-    pub fn set_live_session(&mut self, session: bcode_git_live::LocalSession) {
+    pub fn set_live_session(&mut self, session: Box<dyn bcode_git_live::LiveSession>) {
         self.live = Some(Live::Session(session));
     }
 
     /// Ask live state for work. Inline, it runs now and its result is queued.
     fn live_request(&mut self, request: bcode_git_live::Request) {
         if self.live.is_none() && self.inline {
-            let engine = bcode_git_live::Engine::new(&self.repo, self.live_config());
-            self.live = Some(Live::Inline(Box::new(engine)));
+            let session = bcode_git_live::InlineSession::new(&self.repo, self.live_config());
+            self.live = Some(Live::Inline(Box::new(session)));
         }
         match &mut self.live {
             Some(Live::Session(session)) => session.request(request),
-            Some(Live::Inline(engine)) => {
-                let update = engine.request(request);
+            Some(Live::Inline(session)) => {
+                let update = session.request(request);
                 if !update.is_empty() {
                     self.inbox.push_back(Msg::Live(Box::new(update)));
                 }
@@ -2386,10 +2389,33 @@ impl App {
             && self.last_fetch.elapsed() >= Duration::from_secs(fetch)
             && !self.snapshot.remotes.is_empty()
         {
-            self.last_fetch = Instant::now();
-            update = update.merge(self.queue_ops(vec![Op::Fetch(None)], false, true));
+            // Any fetch of the repository counts (another client's, a terminal's), so its
+            // clients together fetch once per interval.
+            match self.fetched_ago() {
+                Some(ago) if ago < Duration::from_secs(fetch) => {
+                    self.last_fetch = Instant::now().checked_sub(ago).unwrap_or_else(Instant::now);
+                }
+                _ => {
+                    self.last_fetch = Instant::now();
+                    update = update.merge(self.queue_ops(vec![Op::Fetch(None)], false, true));
+                }
+            }
         }
         update
+    }
+
+    /// How long ago the repository was last fetched (by anything), from `FETCH_HEAD`.
+    fn fetched_ago(&self) -> Option<Duration> {
+        self.repo
+            .paths()
+            .common_dir
+            .join("FETCH_HEAD")
+            .metadata()
+            .ok()?
+            .modified()
+            .ok()?
+            .elapsed()
+            .ok()
     }
 
     /// Whether line counts are needed beyond showing them on files.

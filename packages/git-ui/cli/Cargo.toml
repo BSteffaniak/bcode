@@ -26,6 +26,12 @@ clap = { workspace = true, features = [
 ] }
 tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
 
+[dev-dependencies]
+bcode_git        = { workspace = true }
+bcode_git_daemon = { workspace = true }
+bcode_git_live   = { workspace = true }
+tempfile         = { workspace = true }
+
 [features]
 default          = []
 fail-on-warnings = []

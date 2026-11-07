@@ -35,6 +35,6 @@ pub mod theme;
 mod view;
 
 pub use run::{
-    COMMIT_MESSAGE_ENV, RunError, RunOptions, build_app, commit_message_from_env, find_repo_root,
-    render_buffer, render_text, run,
+    COMMIT_MESSAGE_ENV, DAEMON_ARGUMENT, RunError, RunOptions, build_app, commit_message_from_env,
+    daemon_launch, find_repo_root, render_buffer, render_text, run, serve_daemon,
 };

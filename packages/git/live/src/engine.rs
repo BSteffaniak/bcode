@@ -1,31 +1,34 @@
-//! Turns change events into the narrowest git queries and reports what changed.
+//! Turns change events into the narrowest git queries, for every worktree some client cares
+//! about.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 
 use bcode_git::models::{LineStats, StatusSnapshot};
 use bcode_git::{CommandLog, Repository};
+use serde::{Deserialize, Serialize};
 
-use crate::counts::{CountsMode, LineCounts};
+use crate::counts::{CountsMode, LineCounts, Modes};
 use crate::scan::{ScannerKind, StatusScanner, scanner};
 use crate::source::{WatchKind, WatchTarget};
 use crate::worktree::{HeadMove, UntrackedLimits, WorktreeState, canonical};
 
-/// Untracked files counted in the worktree being shown.
-const PRIMARY_UNTRACKED: UntrackedLimits = UntrackedLimits {
+/// Untracked files counted in a worktree a client shows.
+const SHOWN_UNTRACKED: UntrackedLimits = UntrackedLimits {
     files: 2000,
     bytes: 4 * 1024 * 1024,
 };
-/// Untracked files counted in each other worktree.
+/// Untracked files counted in a worktree measured only for its total.
 const OTHER_UNTRACKED: UntrackedLimits = UntrackedLimits {
     files: 500,
     bytes: 1024 * 1024,
 };
 
-/// What an [`Engine`] keeps.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// What one client wants kept.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
 pub struct EngineConfig {
-    /// How the primary worktree's lines are counted.
+    /// How the client's own worktree's lines are counted.
     pub counts: CountsMode,
     /// Also keep the line totals of the repository's other worktrees.
     pub other_worktrees: bool,
@@ -46,58 +49,72 @@ impl Default for EngineConfig {
     }
 }
 
-/// Work asked of an engine besides reacting to change events.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// Work asked of live state besides reacting to change events.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum Request {
     /// Scan every worktree fully.
     Full,
     /// Check the index and `HEAD` of every worktree, as after running a git command.
     Check,
-    /// Count the primary worktree's lines this way from now on.
+    /// Count the client's own worktree's lines this way from now on.
     Counts(CountsMode),
 }
 
-/// Status and line counts of the primary worktree.
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// Status and line counts of a client's own worktree.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct WorktreeSnapshot {
     /// Status, entries sorted by path.
     pub status: StatusSnapshot,
     /// Line counts.
     pub counts: LineCounts,
-    /// `HEAD` commit, `None` while unborn.
+    /// `HEAD` commit the counts were measured against, `None` while unborn.
     pub head: Option<String>,
 }
 
 /// Lines changed in another worktree.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct WorktreeTotal {
     /// Staged, unstaged and untracked changes together.
     pub total: LineStats,
 }
 
-/// What changed since the last update.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+/// What changed for one client since its last update.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct LiveUpdate {
-    /// The primary worktree, when its status or counts changed.
+    /// The client's own worktree, when its status or counts changed.
     pub primary: Option<WorktreeSnapshot>,
-    /// Other worktrees whose totals or `HEAD` changed, by root, with the `HEAD` they were
-    /// measured against.
+    /// Other worktrees whose totals or `HEAD` changed, by the path git lists them under,
+    /// with the `HEAD` they were measured against.
     pub totals: BTreeMap<PathBuf, (Option<String>, WorktreeTotal)>,
     /// Other worktrees no longer kept.
     pub removed: Vec<PathBuf>,
     /// Refs, stashes, tags, configuration, operations in progress or the worktree list
     /// changed; reload what shows them.
     pub metadata: bool,
-    /// Files changed in the primary worktree.
+    /// Files changed in the client's own worktree.
     pub files: bool,
     /// Failures, as messages.
     pub errors: Vec<String>,
-    /// Work done so far.
+    /// Work done so far by the engine serving the client.
     pub stats: EngineStats,
 }
 
+impl LiveUpdate {
+    /// Whether nothing changed.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.primary.is_none()
+            && self.totals.is_empty()
+            && self.removed.is_empty()
+            && !self.metadata
+            && !self.files
+            && self.errors.is_empty()
+    }
+}
+
 /// Work an engine has done since it started.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct EngineStats {
     /// Change event paths received.
     pub events: u64,
@@ -115,19 +132,6 @@ pub struct EngineStats {
     pub header_reads: u64,
 }
 
-impl LiveUpdate {
-    /// Whether nothing changed.
-    #[must_use]
-    pub fn is_empty(&self) -> bool {
-        self.primary.is_none()
-            && self.totals.is_empty()
-            && self.removed.is_empty()
-            && !self.metadata
-            && !self.files
-            && self.errors.is_empty()
-    }
-}
-
 /// A change to the set of watched locations.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum WatchChange {
@@ -135,6 +139,28 @@ pub enum WatchChange {
     Watch(WatchTarget),
     /// Stop watching this path.
     Unwatch(PathBuf),
+}
+
+/// One client's interest in a repository.
+#[derive(Debug, Clone)]
+pub struct Interest {
+    /// The client's own worktree.
+    pub repo: Repository,
+    /// What it wants kept.
+    pub config: EngineConfig,
+}
+
+/// What one round of work changed, for [`crate::Subscriber`]s to report.
+#[derive(Debug, Clone, Default)]
+pub struct Applied {
+    /// Worktrees (as change events name their roots) with changed files.
+    pub files: BTreeSet<PathBuf>,
+    /// Git metadata changed.
+    pub metadata: bool,
+    /// Failures, with the worktree they concern (`None`: the whole repository).
+    pub errors: Vec<(Option<PathBuf>, String)>,
+    /// Worktrees no longer kept, by the path git lists them under.
+    pub removed: Vec<PathBuf>,
 }
 
 /// Work gathered from change events and requests, applied together.
@@ -155,7 +181,6 @@ pub struct Pending {
     metadata: bool,
     worktree_list: bool,
     check: bool,
-    counts: Option<CountsMode>,
 }
 
 impl Pending {
@@ -172,9 +197,10 @@ impl Pending {
             && !self.metadata
             && !self.worktree_list
             && !self.check
-            && self.counts.is_none()
     }
 
+    /// Add a request that concerns every worktree. Per-client requests
+    /// ([`Request::Counts`]) change interests instead and are ignored here.
     pub const fn request(&mut self, request: Request) {
         match request {
             Request::Full => {
@@ -182,62 +208,50 @@ impl Pending {
                 self.worktree_list = true;
             }
             Request::Check => self.check = true,
-            Request::Counts(mode) => self.counts = Some(mode),
+            Request::Counts(_) => {}
         }
     }
 }
 
-/// Live state of a repository's worktrees: the primary one in detail, others as totals.
+/// Live state of one repository's worktrees: those clients show in detail, others as
+/// totals. Worktrees are keyed by their root as change events name it.
 pub struct Engine {
-    config: EngineConfig,
     scanner: Box<dyn StatusScanner>,
     log: CommandLog,
+    /// A worktree of the repository, to list the others.
+    repo: Repository,
     /// Common git directory, as change events name it.
     common_dir: PathBuf,
-    primary: PathBuf,
     worktrees: BTreeMap<PathBuf, WorktreeState>,
+    interests: Vec<Interest>,
     watch_changes: Vec<WatchChange>,
-    synced: bool,
+    /// The kept set needs working out again before the next round.
+    unsynced: bool,
     stats: EngineStats,
-    /// Removals and failures from keeping other worktrees, for the next update.
-    carried: LiveUpdate,
-    last_primary: Option<WorktreeSnapshot>,
-    last_totals: BTreeMap<PathBuf, (Option<String>, WorktreeTotal)>,
+    /// Results of working out the kept set, for the next round's report.
+    carried: Applied,
 }
 
 impl Engine {
-    /// An engine for the worktree of `repo`. Nothing runs until the first update.
+    /// An engine for the repository `repo` belongs to, keeping nothing until interests are
+    /// set.
     #[must_use]
-    pub fn new(repo: &Repository, config: EngineConfig) -> Self {
+    pub fn new(repo: &Repository, scanner_kind: ScannerKind) -> Self {
         let common_dir = canonical(&repo.paths().common_dir);
-        let primary =
-            WorktreeState::new(repo.clone(), &common_dir, config.counts, PRIMARY_UNTRACKED);
-        let root = primary.root.clone();
-        let watch_changes = vec![
-            WatchChange::Watch(WatchTarget {
-                path: primary.watch_root.clone(),
-                kind: WatchKind::Worktree {
-                    common_dir: common_dir.clone(),
-                },
-            }),
-            WatchChange::Watch(WatchTarget {
+        Self {
+            scanner: scanner(scanner_kind),
+            log: CommandLog::default(),
+            repo: repo.clone(),
+            watch_changes: vec![WatchChange::Watch(WatchTarget {
                 path: common_dir.clone(),
                 kind: WatchKind::GitDir,
-            }),
-        ];
-        Self {
-            config,
-            scanner: scanner(config.scanner),
-            log: CommandLog::default(),
+            })],
             common_dir,
-            primary: root.clone(),
-            worktrees: BTreeMap::from([(root, primary)]),
-            watch_changes,
-            synced: false,
+            worktrees: BTreeMap::new(),
+            interests: Vec::new(),
+            unsynced: true,
             stats: EngineStats::default(),
-            carried: LiveUpdate::default(),
-            last_primary: None,
-            last_totals: BTreeMap::new(),
+            carried: Applied::default(),
         }
     }
 
@@ -247,16 +261,68 @@ impl Engine {
         self.scanner.name()
     }
 
+    /// Use this full-scan strategy from now on.
+    pub fn set_scanner(&mut self, kind: ScannerKind) {
+        self.scanner = scanner(kind);
+    }
+
+    /// Work done so far.
+    #[must_use]
+    pub const fn stats(&self) -> EngineStats {
+        self.stats
+    }
+
+    /// Keep what `interests` ask for (all clients' interests together). Worktrees newly
+    /// kept, or counted differently, are scanned in the next round.
+    pub fn set_interests(&mut self, interests: Vec<Interest>) {
+        self.interests = interests;
+        self.unsynced = true;
+    }
+
     /// Locations to start or stop watching since last asked.
     pub fn take_watch_changes(&mut self) -> Vec<WatchChange> {
         std::mem::take(&mut self.watch_changes)
     }
 
-    /// Carry out `request` now.
-    pub fn request(&mut self, request: Request) -> LiveUpdate {
-        let mut pending = Pending::default();
-        pending.request(request);
-        self.apply(pending)
+    /// The root (as change events name it) of the worktree containing `repo`.
+    #[must_use]
+    pub fn root_of(repo: &Repository) -> PathBuf {
+        canonical(repo.root())
+    }
+
+    /// Status and counts of the worktree at `root`, counted as `counts`; `None` until
+    /// scanned.
+    #[must_use]
+    pub fn snapshot(&self, root: &Path, counts: CountsMode) -> Option<WorktreeSnapshot> {
+        let worktree = self
+            .worktrees
+            .get(root)
+            .filter(|worktree| worktree.loaded)?;
+        Some(WorktreeSnapshot {
+            status: worktree.status(),
+            counts: worktree.counts(counts),
+            head: worktree.head().map(str::to_owned),
+        })
+    }
+
+    /// Totals of every scanned worktree: the path git lists it under, its root, its `HEAD`
+    /// and its total.
+    pub fn totals(&self) -> impl Iterator<Item = (&Path, &Path, WorktreeTotalAt)> {
+        self.worktrees
+            .iter()
+            .filter(|(_, worktree)| worktree.loaded)
+            .map(|(root, worktree)| {
+                (
+                    worktree.listed.as_deref().unwrap_or(&worktree.root),
+                    root.as_path(),
+                    (
+                        worktree.head().map(str::to_owned),
+                        WorktreeTotal {
+                            total: worktree.total(),
+                        },
+                    ),
+                )
+            })
     }
 
     /// Record what a change at `path` (as change events name it) needs.
@@ -277,15 +343,15 @@ impl Engine {
             self.route_git(&parts, pending);
             return;
         }
-        let Some(worktree) = self
+        let Some((root, worktree)) = self
             .worktrees
-            .values_mut()
-            .filter(|worktree| path.starts_with(&worktree.watch_root))
-            .max_by_key(|worktree| worktree.watch_root.components().count())
+            .iter_mut()
+            .filter(|(root, _)| path.starts_with(root))
+            .max_by_key(|(root, _)| root.components().count())
         else {
             return;
         };
-        let Ok(relative) = path.strip_prefix(&worktree.watch_root) else {
+        let Ok(relative) = path.strip_prefix(root) else {
             return;
         };
         let Some(first) = relative.components().next() else {
@@ -307,7 +373,7 @@ impl Engine {
                 .unwrap_or_default();
             pending
                 .ignore_dirs
-                .entry(worktree.root.clone())
+                .entry(root.clone())
                 .or_default()
                 .insert(parent);
         } else if name == ".gitmodules" {
@@ -315,11 +381,7 @@ impl Engine {
         } else if worktree.filter.is_ignored(relative, path.is_dir()) {
             return;
         }
-        pending
-            .paths
-            .entry(worktree.root.clone())
-            .or_default()
-            .insert(text);
+        pending.paths.entry(root.clone()).or_default().insert(text);
     }
 
     fn route_git(&self, parts: &[String], pending: &mut Pending) {
@@ -372,9 +434,9 @@ impl Engine {
 
     fn root_of_git_dir(&self, git_dir: &Path) -> Option<PathBuf> {
         self.worktrees
-            .values()
-            .find(|worktree| worktree.git_dir == git_dir)
-            .map(|worktree| worktree.root.clone())
+            .iter()
+            .find(|(_, worktree)| worktree.git_dir == git_dir)
+            .map(|(root, _)| root.clone())
     }
 
     /// Record that events under `path` (everywhere when `None`) were lost.
@@ -394,12 +456,12 @@ impl Engine {
         }
         match self
             .worktrees
-            .values()
-            .filter(|worktree| path.starts_with(&worktree.watch_root))
-            .max_by_key(|worktree| worktree.watch_root.components().count())
+            .keys()
+            .filter(|root| path.starts_with(root))
+            .max_by_key(|root| root.components().count())
         {
-            Some(worktree) => {
-                pending.full_roots.insert(worktree.root.clone());
+            Some(root) => {
+                pending.full_roots.insert(root.clone());
             }
             None => pending.full = true,
         }
@@ -409,36 +471,25 @@ impl Engine {
     /// watches can start before they are scanned. [`Self::apply`] does this itself when
     /// needed.
     pub fn prepare(&mut self, pending: &mut Pending) {
-        if pending.worktree_list || !self.synced {
+        if pending.worktree_list || self.unsynced {
             self.sync_worktrees();
         }
         pending.worktree_list = false;
     }
 
     /// Carry out `pending`.
-    pub fn apply(&mut self, mut pending: Pending) -> LiveUpdate {
+    pub fn apply(&mut self, mut pending: Pending) -> Applied {
         self.prepare(&mut pending);
-        let mut update = std::mem::take(&mut self.carried);
-        update.metadata |= pending.metadata;
-        update.files = pending.paths.contains_key(&self.primary);
-        if let Some(mode) = pending.counts
-            && let Some(primary) = self.worktrees.get_mut(&self.primary)
-            && primary.counts_mode != mode
-        {
-            primary.counts_mode = mode;
-            pending.full_roots.insert(self.primary.clone());
-        }
+        let mut applied = std::mem::take(&mut self.carried);
+        applied.metadata |= pending.metadata;
+        applied.files = pending.paths.keys().cloned().collect();
         let roots: Vec<PathBuf> = self.worktrees.keys().cloned().collect();
         for root in roots {
             if let Err(error) = self.apply_to(&root, &mut pending) {
-                let message = error.message();
-                if root == self.primary {
-                    update.errors.push(message);
-                }
+                applied.errors.push((Some(root), error.message()));
             }
         }
-        self.report(&mut update);
-        update
+        applied
     }
 
     fn apply_to(
@@ -458,104 +509,91 @@ impl Engine {
         Ok(())
     }
 
-    /// Keep the repository's other worktrees (as configured) and watch them.
+    /// Keep the worktrees interests ask for, and watch them.
     fn sync_worktrees(&mut self) {
-        self.synced = true;
-        let update = &mut self.carried;
-        let wanted: Vec<PathBuf> = if self.config.other_worktrees {
-            let Some(primary) = self.worktrees.get(&self.primary) else {
-                return;
-            };
-            match primary.repo.worktrees() {
-                Ok(list) => list
-                    .into_iter()
-                    .filter(|worktree| !worktree.bare && !worktree.prunable)
-                    .map(|worktree| worktree.path)
-                    .collect(),
-                Err(error) => {
-                    update.errors.push(error.message());
-                    return;
+        self.unsynced = false;
+        // Worktrees shown in detail, with how their lines are counted.
+        let mut wanted: BTreeMap<PathBuf, (Repository, Modes, UntrackedLimits)> = BTreeMap::new();
+        for interest in &self.interests {
+            let root = Self::root_of(&interest.repo);
+            let entry = wanted
+                .entry(root)
+                .or_insert_with(|| (interest.repo.clone(), Modes::default(), SHOWN_UNTRACKED));
+            entry.1.add(interest.config.counts);
+        }
+        // The rest of the repository's worktrees, measured for their totals.
+        let others = self
+            .interests
+            .iter()
+            .filter(|interest| interest.config.other_worktrees)
+            .map(|interest| interest.config.max_other_worktrees)
+            .max();
+        let mut listed: BTreeMap<PathBuf, PathBuf> = BTreeMap::new();
+        if let Some(max) = others {
+            match self.repo.worktrees() {
+                Ok(list) => {
+                    let mut added = 0;
+                    for worktree in list {
+                        if worktree.bare || worktree.prunable {
+                            continue;
+                        }
+                        let root = canonical(&worktree.path);
+                        listed.insert(root.clone(), worktree.path.clone());
+                        if wanted.contains_key(&root) || added >= max {
+                            continue;
+                        }
+                        let repo = match self.worktrees.get(&root) {
+                            Some(existing) => existing.repo.clone(),
+                            None => match Repository::discover(&worktree.path, self.log.clone()) {
+                                Ok(repo) => repo,
+                                Err(_) => continue,
+                            },
+                        };
+                        added += 1;
+                        wanted.insert(root, (repo, Modes::total(), OTHER_UNTRACKED));
+                    }
                 }
+                Err(error) => self.carried.errors.push((None, error.message())),
             }
-        } else {
-            Vec::new()
-        };
-        let primary_root = self
-            .worktrees
-            .get(&self.primary)
-            .map(|primary| primary.watch_root.clone())
-            .unwrap_or_default();
-        let wanted: Vec<PathBuf> = wanted
-            .into_iter()
-            .filter(|path| *path != self.primary && canonical(path) != primary_root)
-            .take(self.config.max_other_worktrees)
-            .collect();
+        }
+        if others.is_some() {
+            // Every kept worktree may be another client's "other": measure its total.
+            for (_, modes, _) in wanted.values_mut() {
+                modes.total = true;
+            }
+        }
         let stale: Vec<PathBuf> = self
             .worktrees
             .keys()
-            .filter(|root| **root != self.primary && !wanted.contains(root))
+            .filter(|root| !wanted.contains_key(*root))
             .cloned()
             .collect();
         for root in stale {
             if let Some(worktree) = self.worktrees.remove(&root) {
-                self.watch_changes
-                    .push(WatchChange::Unwatch(worktree.watch_root));
+                self.watch_changes.push(WatchChange::Unwatch(root));
+                self.carried
+                    .removed
+                    .push(worktree.listed.unwrap_or(worktree.root));
             }
-            self.last_totals.remove(&root);
-            update.removed.push(root);
         }
-        for path in wanted {
-            if self.worktrees.contains_key(&path) {
-                continue;
-            }
-            let Ok(repo) = Repository::discover(&path, self.log.clone()) else {
-                continue;
-            };
-            let worktree =
-                WorktreeState::new(repo, &self.common_dir, CountsMode::Total, OTHER_UNTRACKED);
-            self.watch_changes.push(WatchChange::Watch(WatchTarget {
-                path: worktree.watch_root.clone(),
-                kind: WatchKind::Worktree {
-                    common_dir: self.common_dir.clone(),
-                },
-            }));
-            // Keyed by the path git lists, which is how callers name worktrees.
-            self.worktrees.insert(path, worktree);
-        }
-    }
-
-    /// Fill `update` with what differs from the last report.
-    fn report(&mut self, update: &mut LiveUpdate) {
-        update.stats = self.stats;
-        for (root, worktree) in &self.worktrees {
-            if !worktree.loaded {
-                continue;
-            }
-            if *root == self.primary {
-                let snapshot = WorktreeSnapshot {
-                    status: worktree.status(),
-                    counts: worktree.counts(),
-                    head: worktree.head().map(str::to_owned),
-                };
-                if self.last_primary.as_ref() != Some(&snapshot) {
-                    self.last_primary = Some(snapshot.clone());
-                    update.primary = Some(snapshot);
-                }
-            } else {
-                let measured = (
-                    worktree.head().map(str::to_owned),
-                    WorktreeTotal {
-                        total: worktree.counts().total(),
+        for (root, (repo, modes, limits)) in wanted {
+            let worktree = self.worktrees.entry(root.clone()).or_insert_with(|| {
+                self.watch_changes.push(WatchChange::Watch(WatchTarget {
+                    path: root.clone(),
+                    kind: WatchKind::Worktree {
+                        common_dir: self.common_dir.clone(),
                     },
-                );
-                if self.last_totals.get(root) != Some(&measured) {
-                    self.last_totals.insert(root.clone(), measured.clone());
-                    update.totals.insert(root.clone(), measured);
-                }
-            }
+                }));
+                WorktreeState::new(repo, &self.common_dir, modes, limits)
+            });
+            worktree.set_counting(modes, limits);
+            worktree.listed = listed.get(&root).cloned();
         }
     }
 }
+
+/// A worktree's `HEAD` and total.
+pub type WorktreeTotalAt = (Option<String>, WorktreeTotal);
 
 /// Bring `worktree` up to date with narrowed queries; `false` when it needs a full scan.
 fn narrowed(

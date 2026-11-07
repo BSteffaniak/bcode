@@ -17,7 +17,8 @@ bcode-git --print-config-paths
 |---|---|
 | `bcode_git_models` | Portable repository models (status, diffs, commits, refs, stash, worktrees, rebase todo items). |
 | `bcode_git` | Runs the user's `git` CLI with machine-readable output and parses it. Builds and applies partial patches for hunk and line staging. |
-| `bcode_git_live` | Live status and line counts kept current from filesystem events: change sources per operating system, the engine that narrows git queries to what changed, and full-scan strategies. |
+| `bcode_git_live` | Live status and line counts kept current from filesystem events: change sources per operating system, the engine that narrows git queries to what changed, full-scan strategies, and the hub that serves a repository's clients together. |
+| `bcode_git_daemon` | The shared `bcode-git` daemon: its socket protocol, server and client. |
 | `bcode_git_ui` | The BMUX program: panels, popups, keymap actions, theme roles and diff presentation. |
 | `bcode_git_ui_cli` | The `bcode-git` binary. |
 | `bcode_git_plugin` (`git-ui` feature) | Registers the `bcode git` subcommand. |
@@ -62,6 +63,35 @@ daemon (macOS and Windows; plain elsewhere).
 
 The repository's other worktrees are watched the same way when branch flashes or branch line
 counts need them (at most 16).
+
+### Shared daemon
+
+Every client of a repository shares one set of watches and one round of git work per change,
+through the `bcode-git` daemon. The first client starts it (`bcode-git --git-daemon <socket>`, or
+`bcode git --git-daemon <socket>`, run detached in its own process group; clients starting at once
+queue on a lock so only one daemon starts). It serves each repository from one hub: every client
+gets its own worktree in detail and the others as totals, and a worktree shown by several clients
+is scanned and checked once.
+
+* **One per build.** The socket is `$XDG_STATE_HOME/bcode-git/daemon/<identity>.sock`, where the
+  identity covers the executable (path, size, modification time) and the protocol version. A
+  rebuilt binary starts its own daemon; clients of the old build keep theirs. When that path is
+  too long for a socket, it lives in `/tmp/bcode-git-<uid>/` instead. Either directory must
+  belong to the user and be private, or the client serves itself.
+* **Disposable.** A repository is dropped 30 seconds after its last client leaves, and the daemon
+  exits after a minute without clients. If it goes away while clients run, each client serves
+  itself in-process from then on, starting with a full scan, without interruption. If it cannot
+  be reached at all, clients serve themselves from the start.
+* **Protocol.** Newline-delimited JSON over the socket, versioned by a handshake; a daemon of
+  another protocol version refuses the client, which then serves itself.
+* `refresh.daemon = false` (or `refresh.watch = false`) keeps every client to itself. Unix only;
+  elsewhere clients always serve themselves.
+
+Work that reaches the network is shared through the repository too, with or without the daemon,
+and with other tools: automatic fetches count any fetch of the repository (by age of
+`FETCH_HEAD`), and a client whose pull request lookup is due takes another client's cached answer
+when it is fresher than `pull_requests.refresh_seconds`. So clients of a repository together fetch
+once per `auto_fetch_seconds` and ask GitHub once per refresh interval.
 
 Git commands shown in the command log run on a pseudo-terminal, so their output looks as it does
 in a terminal: progress counters, colors and hook output (for example pre-commit checks) appear
@@ -333,6 +363,7 @@ animate = true                  # false shows a still "…"
 
 [refresh]
 watch = true                    # filesystem watching; falls back to polling
+daemon = true                   # share watching and git work through the bcode-git daemon
 watcher = "auto"                # auto | recursive | pruned (see Live updates)
 scanner = "plain"               # plain | fsmonitor: how full scans run
 poll_seconds = 10               # only while watching is off or unavailable

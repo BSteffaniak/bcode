@@ -439,6 +439,9 @@ impl Default for HighlightConfig {
 pub struct RefreshConfig {
     /// Watch the worktrees and git directory for changes.
     pub watch: bool,
+    /// Share watching and git work with every other client through the `bcode-git` daemon
+    /// (started on demand); otherwise each client does its own.
+    pub daemon: bool,
     /// How files are watched.
     pub watcher: WatcherBackend,
     /// How full status scans run (at startup, on refresh, after lost events).
@@ -453,6 +456,7 @@ impl Default for RefreshConfig {
     fn default() -> Self {
         Self {
             watch: true,
+            daemon: true,
             watcher: WatcherBackend::Auto,
             scanner: StatusScanner::Plain,
             poll_seconds: 10,

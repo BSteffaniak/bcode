@@ -7,7 +7,7 @@ use std::time::SystemTime;
 use bcode_git::models::{BranchStatus, LineStats, StatusEntry, StatusSnapshot};
 use bcode_git::{CountTarget, GitError, Repository, StatusScope};
 
-use crate::counts::{CountsMode, LineCounts};
+use crate::counts::{CountsMode, LineCounts, Modes};
 use crate::filter::IgnoreFilter;
 use crate::scan::StatusScanner;
 
@@ -47,18 +47,20 @@ pub struct WorktreeState {
     pub repo: Repository,
     /// Root as git reports it.
     pub root: PathBuf,
-    /// Root as change events name it (symbolic links resolved).
-    pub watch_root: PathBuf,
     /// Own git directory, as change events name it.
     pub git_dir: PathBuf,
-    pub counts_mode: CountsMode,
+    /// Path `git worktree list` gives, when listed.
+    pub listed: Option<PathBuf>,
+    modes: Modes,
     limits: UntrackedLimits,
     pub filter: IgnoreFilter,
     pub loaded: bool,
     branch: BranchStatus,
     entries: BTreeMap<String, StatusEntry>,
-    /// Tracked counts: `HEAD` to worktree for [`CountsMode::Total`], else `HEAD` to index.
-    tracked: BTreeMap<String, LineStats>,
+    /// `HEAD` to worktree, for [`CountsMode::Total`].
+    total: BTreeMap<String, LineStats>,
+    /// `HEAD` to index, for [`CountsMode::Split`].
+    staged: BTreeMap<String, LineStats>,
     /// Index to worktree, for [`CountsMode::Split`].
     unstaged: BTreeMap<String, LineStats>,
     untracked: BTreeMap<String, CachedCount>,
@@ -68,12 +70,7 @@ pub struct WorktreeState {
 }
 
 impl WorktreeState {
-    pub fn new(
-        repo: Repository,
-        common_dir: &Path,
-        counts_mode: CountsMode,
-        limits: UntrackedLimits,
-    ) -> Self {
+    pub fn new(repo: Repository, common_dir: &Path, modes: Modes, limits: UntrackedLimits) -> Self {
         let root = repo.root().to_owned();
         let watch_root = canonical(&root);
         let git_dir = canonical(&repo.paths().git_dir);
@@ -81,14 +78,15 @@ impl WorktreeState {
             filter: IgnoreFilter::new(&watch_root, common_dir),
             repo,
             root,
-            watch_root,
             git_dir,
-            counts_mode,
+            listed: None,
+            modes,
             limits,
             loaded: false,
             branch: BranchStatus::default(),
             entries: BTreeMap::new(),
-            tracked: BTreeMap::new(),
+            total: BTreeMap::new(),
+            staged: BTreeMap::new(),
             unstaged: BTreeMap::new(),
             untracked: BTreeMap::new(),
             index: None,
@@ -112,20 +110,19 @@ impl WorktreeState {
             .into_iter()
             .map(|entry| (entry.path.clone(), entry))
             .collect();
-        match self.counts_mode {
-            CountsMode::Off => {
-                self.tracked.clear();
-                self.unstaged.clear();
-            }
-            CountsMode::Total => {
-                self.tracked = self.repo.numstat_scoped(CountTarget::Worktree, None)?;
-                self.unstaged.clear();
-            }
-            CountsMode::Split => {
-                self.tracked = self.repo.numstat_scoped(CountTarget::Staged, None)?;
-                self.unstaged = self.repo.numstat_scoped(CountTarget::Unstaged, None)?;
-            }
-        }
+        self.total = if self.modes.total {
+            self.repo.numstat_scoped(CountTarget::Worktree, None)?
+        } else {
+            BTreeMap::new()
+        };
+        (self.staged, self.unstaged) = if self.modes.split {
+            (
+                self.repo.numstat_scoped(CountTarget::Staged, None)?,
+                self.repo.numstat_scoped(CountTarget::Unstaged, None)?,
+            )
+        } else {
+            (BTreeMap::new(), BTreeMap::new())
+        };
         self.recount_untracked(None);
         Ok(())
     }
@@ -179,13 +176,12 @@ impl WorktreeState {
             map.extend(counts);
             Ok(())
         };
-        match self.counts_mode {
-            CountsMode::Off => {}
-            CountsMode::Total => recount(CountTarget::Worktree, &mut self.tracked)?,
-            CountsMode::Split => {
-                recount(CountTarget::Staged, &mut self.tracked)?;
-                recount(CountTarget::Unstaged, &mut self.unstaged)?;
-            }
+        if self.modes.total {
+            recount(CountTarget::Worktree, &mut self.total)?;
+        }
+        if self.modes.split {
+            recount(CountTarget::Staged, &mut self.staged)?;
+            recount(CountTarget::Unstaged, &mut self.unstaged)?;
         }
         self.recount_untracked(Some(&paths));
         Ok(true)
@@ -253,33 +249,60 @@ impl WorktreeState {
         }
     }
 
-    pub fn counts(&self) -> LineCounts {
+    /// Count lines as `modes` say (for every client showing this worktree) and untracked
+    /// files within `limits`; a change takes a full scan to apply.
+    pub fn set_counting(&mut self, modes: Modes, limits: UntrackedLimits) {
+        if self.modes != modes || self.limits != limits {
+            self.modes = modes;
+            self.limits = limits;
+            self.loaded = false;
+        }
+    }
+
+    /// Line counts as `mode` measures them; [`LineCounts::Off`] when not counted that way.
+    pub fn counts(&self, mode: CountsMode) -> LineCounts {
         let untracked = self
             .untracked
             .iter()
             .map(|(path, cached)| (path.clone(), cached.stats));
-        match self.counts_mode {
-            CountsMode::Off => LineCounts::Off,
-            CountsMode::Total => {
-                let mut total = self.tracked.clone();
+        match mode {
+            CountsMode::Total if self.modes.total => {
+                let mut total = self.total.clone();
                 total.extend(untracked);
                 LineCounts::Total(total)
             }
-            CountsMode::Split => {
+            CountsMode::Split if self.modes.split => {
                 let mut unstaged = self.unstaged.clone();
                 unstaged.extend(untracked);
                 LineCounts::Split {
-                    staged: self.tracked.clone(),
+                    staged: self.staged.clone(),
                     unstaged,
                 }
             }
+            _ => LineCounts::Off,
         }
+    }
+
+    /// Every changed line, staged, unstaged and untracked together.
+    pub fn total(&self) -> LineStats {
+        let tracked: LineStats = if self.modes.total {
+            self.total.values().copied().sum()
+        } else {
+            self.staged
+                .values()
+                .chain(self.unstaged.values())
+                .copied()
+                .sum()
+        };
+        std::iter::once(tracked)
+            .chain(self.untracked.values().map(|cached| cached.stats))
+            .sum()
     }
 
     /// Count untracked files again, within `paths` or everywhere, reusing counts of files
     /// whose size and modification time are unchanged.
     fn recount_untracked(&mut self, paths: Option<&BTreeSet<String>>) {
-        if self.counts_mode == CountsMode::Off {
+        if !self.modes.any() {
             self.untracked.clear();
             return;
         }

@@ -7,7 +7,8 @@ use bcode_git::models::StatusSnapshot;
 use bcode_git::{GitError, Repository, StatusScope};
 
 /// Which [`StatusScanner`] to use.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum ScannerKind {
     /// Plain `git status`.
     #[default]
