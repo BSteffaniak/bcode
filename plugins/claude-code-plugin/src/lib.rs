@@ -11,6 +11,7 @@ mod diagnostics;
 mod execution;
 mod model_selection;
 mod normalize;
+mod observation_wake;
 mod parent_bridge;
 mod recovery;
 mod retention;
@@ -55,8 +56,12 @@ const MAX_RETAINED_OBSERVATIONS: usize = 256;
 /// Staged native records pumped per durable page cycle; execution evidence still
 /// stops the batch until the host acknowledges it.
 const MAX_PUMPED_RECORDS_PER_PAGE: usize = 256;
+/// Upper bound on one blocking wait slice, so cancellation is observed promptly.
+const OBSERVE_WAIT_SLICE: std::time::Duration = std::time::Duration::from_millis(100);
 
 struct StreamState {
+    /// Signalled whenever native evidence arrives, so a waiting `observe` can return.
+    wake: Arc<observation_wake::ObservationWake>,
     normalizer: Normalizer,
     observations: VecDeque<HarnessObservation>,
     gap: bool,
@@ -82,6 +87,9 @@ impl StreamState {
     }
 
     fn push(&mut self, observations: Vec<HarnessObservation>) -> bool {
+        // Native evidence may be staged without producing observations yet; either way
+        // the next page can differ, so wake any waiting observer.
+        self.wake.notify();
         if self.observations.len().saturating_add(observations.len()) > MAX_RETAINED_OBSERVATIONS {
             self.gap = true;
             return false;
@@ -103,12 +111,13 @@ impl StreamState {
         let _ = self.push(evidence);
     }
 
-    fn observation_page(
+    /// Apply the request's acknowledgement and hydration, then pump staged native records into
+    /// the unoffered queue. Repeating the same request is idempotent and offers nothing.
+    fn advance(
         &mut self,
         prepared: &HarnessPreparedSession,
         observe: &HarnessObserveRequest,
-        settlement: &Settlement,
-    ) -> Result<HarnessServiceResponseKind, HarnessFailure> {
+    ) -> Result<(), HarnessFailure> {
         if !retained_target_matches(&self.normalizer.target, prepared, &observe.target) {
             return Err(HarnessFailure::StaleGeneration);
         }
@@ -147,6 +156,24 @@ impl StreamState {
                 return Err(HarnessFailure::Uncertain);
             }
         }
+        Ok(())
+    }
+
+    /// Whether the next page carries evidence or a request the host must receive now.
+    fn ready_to_offer(&self) -> bool {
+        self.gap
+            || self.retention.pending()
+            || !self.observations.is_empty()
+            || !self.normalizer.hydration_requests().is_empty()
+    }
+
+    fn observation_page(
+        &mut self,
+        prepared: &HarnessPreparedSession,
+        observe: &HarnessObserveRequest,
+        settlement: &Settlement,
+    ) -> Result<HarnessServiceResponseKind, HarnessFailure> {
+        self.advance(prepared, observe)?;
         let mut observations = Vec::new();
         let mut bytes = 0_usize;
         for observation in self.observations.iter().take(usize::from(observe.limit)) {
@@ -213,8 +240,16 @@ struct Process {
     closed: bool,
 }
 /// Native plugin with a persistent I/O runtime. No plugin-owned persistence or recovery journal.
+///
+/// Operations serialize on the retained state exactly as an exclusive plugin would; only an
+/// `observe` with `wait_millis` waits for native output outside that lock.
 #[derive(Default)]
 pub struct ClaudeCodePlugin {
+    state: Mutex<PluginState>,
+}
+
+#[derive(Default)]
+pub(crate) struct PluginState {
     runtime: Option<tokio::runtime::Runtime>,
     processes: BTreeMap<String, Process>,
     /// Failed opens are uncertain and cannot be silently repeated during this runtime.
@@ -223,7 +258,7 @@ pub struct ClaudeCodePlugin {
     auth: auth::AuthFlows,
     tool_queues: BTreeMap<String, Arc<Mutex<tool_bridge::Queue>>>,
 }
-impl ClaudeCodePlugin {
+impl PluginState {
     fn record_host_tools_status(&self, process: &Process, identity: String) -> Option<()> {
         let client = process.client.clone();
         let stream = Arc::clone(&process.stream);
@@ -414,6 +449,89 @@ impl ClaudeCodePlugin {
 
 impl RustPlugin for ClaudeCodePlugin {
     fn register_auth_providers(&mut self, registrar: AuthRegistrar) -> Result<(), PluginError> {
+        self.register_auth_providers_concurrent(registrar)
+    }
+
+    fn invoke_service(&mut self, context: NativeServiceContext) -> ServiceResponse {
+        self.invoke_service_concurrent(context)
+    }
+}
+
+impl ConcurrentRustPlugin for ClaudeCodePlugin {
+    fn register_auth_providers_concurrent(
+        &self,
+        registrar: AuthRegistrar,
+    ) -> Result<(), PluginError> {
+        PluginState::register_auth_providers(registrar)
+    }
+
+    fn invoke_service_concurrent(&self, context: NativeServiceContext) -> ServiceResponse {
+        if let Some((request, wait)) = observe_wait(&context) {
+            self.wait_for_observations(&request, wait, &context.cancellation);
+        }
+        self.state.lock().map_or_else(
+            |_| ServiceResponse::error("unavailable", "Claude harness state unavailable"),
+            |mut state| state.invoke_service(&context),
+        )
+    }
+}
+
+impl ClaudeCodePlugin {
+    /// Wait outside the state lock until the observed session has something to offer, the
+    /// bounded wait elapses, or the invocation is cancelled. Native records that produce no
+    /// observations are absorbed while waiting, so the page is not released early by them.
+    fn wait_for_observations(
+        &self,
+        request: &HarnessRequest,
+        wait: std::time::Duration,
+        cancellation: &bcode_plugin_sdk::ServiceCancellation,
+    ) {
+        let HarnessRequestKind::Observe(observe) = &request.kind else {
+            return;
+        };
+        let deadline = std::time::Instant::now() + wait;
+        loop {
+            let Some((wake, seen)) = self
+                .state
+                .lock()
+                .ok()
+                .and_then(|state| state.advance_observation(&request.instance, observe))
+            else {
+                return;
+            };
+            loop {
+                let now = std::time::Instant::now();
+                if now >= deadline || cancellation.is_cancelled() {
+                    return;
+                }
+                if wake.wait_changed(seen, (deadline - now).min(OBSERVE_WAIT_SLICE)) {
+                    break;
+                }
+            }
+        }
+    }
+}
+
+/// Bounded wait requested by a valid harness `observe`; other requests never wait.
+fn observe_wait(context: &NativeServiceContext) -> Option<(HarnessRequest, std::time::Duration)> {
+    if context.plugin_id != PLUGIN_ID
+        || context.request.interface_id != HARNESS_INTERFACE_ID
+        || context.request.operation != "observe"
+        || context.request.payload.len() > MAX_HARNESS_WIRE_BYTES
+    {
+        return None;
+    }
+    let request: HarnessRequest = serde_json::from_slice(&context.request.payload).ok()?;
+    request.validate().ok()?;
+    let HarnessRequestKind::Observe(observe) = &request.kind else {
+        return None;
+    };
+    let wait = std::time::Duration::from_millis(u64::from(observe.wait_millis));
+    (!wait.is_zero()).then_some((request, wait))
+}
+
+impl PluginState {
+    fn register_auth_providers(registrar: AuthRegistrar) -> Result<(), PluginError> {
         use bcode_provider_auth_models::{
             AUTH_PROVIDER_CONTRIBUTION_SCHEMA_VERSION, AuthMethodContribution,
             AuthProviderContribution, AuthSecretField,
@@ -442,26 +560,26 @@ impl RustPlugin for ClaudeCodePlugin {
             .map_err(|_| PluginError::failed("Claude auth registration failed"))
     }
 
-    fn invoke_service(&mut self, context: NativeServiceContext) -> ServiceResponse {
+    pub(crate) fn invoke_service(&mut self, context: &NativeServiceContext) -> ServiceResponse {
         if context.plugin_id == PLUGIN_ID
             && context.request.interface_id == bcode_harness_models::HARNESS_CANDIDATES_INTERFACE_ID
         {
-            return self.candidates_service(&context);
+            return self.candidates_service(context);
         }
         if context.plugin_id == PLUGIN_ID
             && context.request.interface_id == bcode_harness_models::HARNESS_MODELS_INTERFACE_ID
         {
-            return self.invoke_models_service(&context);
+            return self.invoke_models_service(context);
         }
         if context.plugin_id == PLUGIN_ID
             && context.request.interface_id == bcode_harness_models::HARNESS_RECOVERY_INTERFACE_ID
         {
-            return self.recovery_service(&context);
+            return self.recovery_service(context);
         }
         if context.plugin_id == PLUGIN_ID
             && context.request.interface_id == bcode_harness_models::MANAGED_TOOL_QUEUE_INTERFACE_ID
         {
-            return self.tool_queue_service(&context);
+            return self.tool_queue_service(context);
         }
         if context.plugin_id == PLUGIN_ID
             && matches!(
@@ -469,7 +587,7 @@ impl RustPlugin for ClaudeCodePlugin {
                 NATIVE_HANDOFF_INTERFACE_ID | bcode_harness_models::TERMINAL_AUTH_INTERFACE_ID
             )
         {
-            return prepare_handoff(&context);
+            return prepare_handoff(context);
         }
         if context.plugin_id != PLUGIN_ID || context.request.interface_id != HARNESS_INTERFACE_ID {
             return ServiceResponse::error(
@@ -532,7 +650,7 @@ impl RustPlugin for ClaudeCodePlugin {
                 HarnessServiceResponseKind::Failure(HarnessFailure::Unavailable),
             );
         };
-        let result = runtime.block_on(self.invoke(&request, selected, &context));
+        let result = runtime.block_on(self.invoke(&request, selected, context));
         self.runtime = Some(runtime);
         reply(
             &request,
@@ -549,6 +667,18 @@ impl ClaudeCodePlugin {
     /// # Errors
     /// Unknown transport, instance mismatch, stale generation, or poisoned state.
     pub fn retained_attribution(
+        &self,
+        instance: &HarnessInstance,
+        target: &HarnessSessionTarget,
+    ) -> Result<Vec<RetainedAttribution>, HarnessFailure> {
+        self.state
+            .lock()
+            .map_err(|_| HarnessFailure::Unavailable)?
+            .retained_attribution(instance, target)
+    }
+}
+impl PluginState {
+    fn retained_attribution(
         &mut self,
         instance: &HarnessInstance,
         target: &HarnessSessionTarget,
@@ -909,6 +1039,26 @@ impl ClaudeCodePlugin {
             },
         ))
     }
+    /// Advance a retained session's observation state for a waiting `observe`. Returns the
+    /// wake handle and current sequence while nothing is ready to offer; `None` means the
+    /// ordinary operation should run now (ready, or a failure it will report).
+    fn advance_observation(
+        &self,
+        instance: &HarnessInstance,
+        observe: &HarnessObserveRequest,
+    ) -> Option<(Arc<observation_wake::ObservationWake>, u64)> {
+        let process = self.processes.get(observe.target.session_id())?;
+        if process.instance != *instance || process.closed {
+            return None;
+        }
+        let mut stream = process.stream.lock().ok()?;
+        stream.advance(&process.prepared, observe).ok()?;
+        if stream.ready_to_offer() {
+            return None;
+        }
+        Some((Arc::clone(&stream.wake), stream.wake.sequence()))
+    }
+
     fn retained_process(
         &mut self,
         instance: &HarnessInstance,
@@ -1223,6 +1373,7 @@ async fn prepare_stream(
     normalizer.enable_retention();
     normalizer.assistance_grant = admitted_assistance_grant;
     let stream = Arc::new(Mutex::new(StreamState {
+        wake: Arc::default(),
         retention: retention::PageRetention::new(format!(
             "claude:{}:{}:{}",
             std::process::id(),
@@ -1288,6 +1439,7 @@ mod host_tools_diagnostic_tests {
             requested_native_session_id: None,
         };
         let mut stream = StreamState {
+            wake: Arc::default(),
             normalizer: Normalizer::with_target(
                 HarnessSessionTarget::Prepared(prepared),
                 "open".into(),
@@ -1564,8 +1716,11 @@ fn reply(request: &HarnessRequest, kind: HarnessServiceResponseKind) -> ServiceR
 #[cfg(feature = "static-bundled")]
 #[must_use]
 pub fn static_plugin() -> bcode_plugin_sdk::StaticPluginVtable {
-    bcode_plugin_sdk::static_plugin_vtable!(ClaudeCodePlugin, include_str!("../bcode-plugin.toml"))
+    bcode_plugin_sdk::static_concurrent_plugin_vtable!(
+        ClaudeCodePlugin,
+        include_str!("../bcode-plugin.toml")
+    )
 }
 
 #[cfg(not(feature = "static-bundled"))]
-bcode_plugin_sdk::export_plugin!(ClaudeCodePlugin, include_str!("../bcode-plugin.toml"));
+bcode_plugin_sdk::export_concurrent_plugin!(ClaudeCodePlugin, include_str!("../bcode-plugin.toml"));

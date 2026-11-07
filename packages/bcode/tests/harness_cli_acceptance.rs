@@ -431,7 +431,10 @@ impl Cli {
             "assistance_destination_session_id":null,
             "harness":{"schema_version":1,"request_id":request_id,
                 "instance":self.instance,"kind":kind}});
-        let path = self.root.path().join("request.json");
+        // Distinct request files let concurrent CLI calls run against one daemon.
+        static REQUESTS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+        let sequence = REQUESTS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let path = self.root.path().join(format!("request-{sequence}.json"));
         std::fs::write(&path, serde_json::to_vec(&call).unwrap()).unwrap();
         self.run(
             &self.config,
@@ -583,10 +586,14 @@ impl Cli {
     }
 
     fn observe(&self, target: &Value, after: Option<&str>) -> Value {
+        self.observe_waiting(target, after, 0)
+    }
+
+    fn observe_waiting(&self, target: &Value, after: Option<&str>, wait_millis: u32) -> Value {
         let reply = self.call(
             "observe",
             json!({"operation":"observe","request":{
-            "target":target,"after":after,"limit":16,"wait_millis":0}}),
+            "target":target,"after":after,"limit":16,"wait_millis":wait_millis}}),
             target["session"]["session_id"].as_str().unwrap(),
             None,
         );
@@ -899,7 +906,7 @@ fn default_setup_configuration_admits_sequential_foreground_turns() {
     );
     let (confirmed, mut after) = cli.await_terminal(&prepared, None, "submit-1");
     assert_eq!(confirmed["state"], "confirmed");
-    for turn in 2..=3 {
+    for turn in 2..=2 {
         let submission = format!("submit-{turn}");
         let reply = cli.send_turn(
             &confirmed,
@@ -915,6 +922,51 @@ fn default_setup_configuration_admits_sequential_foreground_turns() {
         after = cli.await_terminal(&confirmed, after, &submission).1;
         assert!(cli.native.join(format!("turn-{turn}.effect")).exists());
     }
+    // A held observation waits for native output without blocking submission: the next
+    // turn is admitted while it is held, and its output releases the page before the wait ends.
+    const HOLD_MILLIS: u32 = 25_000;
+    let (held, elapsed) = std::thread::scope(|scope| {
+        let observer = scope.spawn(|| {
+            let started = Instant::now();
+            let page = cli.observe_waiting(&confirmed, after.as_deref(), HOLD_MILLIS);
+            (page, started.elapsed())
+        });
+        std::thread::sleep(Duration::from_secs(8));
+        let reply = cli.send_turn(
+            &confirmed,
+            "turn-3",
+            "submit-3",
+            "55555555-5555-4555-8555-000000000003",
+        );
+        assert_eq!(
+            reply.value["kind"]["kind"], "receipt",
+            "submission must not queue behind a held observation; value={} output={}",
+            reply.value, reply.output
+        );
+        observer.join().unwrap()
+    });
+    assert!(
+        held["observations"]
+            .as_array()
+            .is_some_and(|items| !items.is_empty()),
+        "native output must release the held page; page={held}"
+    );
+    assert!(
+        elapsed < Duration::from_millis(u64::from(HOLD_MILLIS)),
+        "held page returned only at its deadline ({elapsed:?})"
+    );
+    let held_terminal = held["observations"].as_array().unwrap().iter().any(|item| {
+        item["kind"]["event"]["event"] == "submission_terminal"
+            && item["kind"]["event"]["attempt"]["submission_id"] == "submit-3"
+    });
+    if !held_terminal {
+        let _ = cli.await_terminal(
+            &confirmed,
+            held["next_after"].as_str().map(str::to_owned),
+            "submit-3",
+        );
+    }
+    assert!(cli.native.join("turn-3.effect").exists());
     assert!(!cli.native.join("unexpected-user.rejected").exists());
     cli.stop();
 }

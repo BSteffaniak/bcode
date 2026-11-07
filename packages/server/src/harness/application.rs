@@ -108,12 +108,16 @@ impl<'a, S: ManagedHarnessStore, T: ManagedHarnessTransport> ManagedHarnessAppli
 
     /// Drive one bounded native page using actor-owned cursor evidence. Concurrent attachment
     /// pollers serialize by full owner; controls never acquire this observer-only guard.
+    ///
+    /// `wait_millis` lets an adapter hold the page until native output arrives. Returns the
+    /// committed page's progress: observations plus hydration requests the host must answer.
     /// # Errors
     /// Rejects stale caller/instance/generation, unavailable state and failed canonical commits.
     pub async fn poll_observations(
         &self,
         query: &bcode_ipc::harness::ManagedSessionPollRequest,
-    ) -> Result<(), ManagedHarnessError> {
+        wait_millis: u32,
+    ) -> Result<usize, ManagedHarnessError> {
         query.validate().map_err(|_| ManagedHarnessError::Invalid)?;
         let initial = self.owner(query.session_id).await?;
         if initial.generation != query.generation {
@@ -142,18 +146,18 @@ impl<'a, S: ManagedHarnessStore, T: ManagedHarnessTransport> ManagedHarnessAppli
         }
         // Native ack uses exactly the atomically committed actor cursor, including empty pages.
         // The runtime selects the latest target, obtains retention and commits before returning.
-        Box::pin(self.runtime.observe(
+        let page = Box::pin(self.runtime.observe(
             &owner,
             format!("attachment-poll:{}", uuid::Uuid::new_v4()),
             current.observation_after,
             query.limit,
-            0,
+            wait_millis,
         ))
         .await?;
         drop(ownership);
         drop(canonical);
         drop(observer);
-        Ok(())
+        Ok(page.observations.len() + page.hydration_requests.len())
     }
 
     /// Resolve the full durable managed owner, whether pre-open, prepared or confirmed.

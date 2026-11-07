@@ -12,6 +12,7 @@ mod canonical;
 pub(crate) mod configuration_views;
 pub(crate) mod execution_catalog;
 mod history;
+mod observation_watch;
 
 /// Recovery remains independently unpublished, regardless of selected-launch writer versions.
 pub(crate) const fn recovery_published() -> bool {
@@ -23,6 +24,7 @@ mod store;
 mod tool_invocation;
 mod tool_queue;
 mod transport;
+pub(crate) use observation_watch::ObservationWatches;
 pub use tool_invocation::{ManagedToolBridge, ManagedToolEndpoint};
 pub(crate) use tool_queue::ToolQueueHost;
 pub(crate) use transport::with_credential_admission;

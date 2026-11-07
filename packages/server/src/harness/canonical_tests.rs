@@ -243,7 +243,7 @@ async fn attachment_poll_commits_empty_cursor_before_next_native_observe() {
         generation: 1,
         limit: 16,
     };
-    app.poll_observations(&query).await.unwrap();
+    app.poll_observations(&query, 0).await.unwrap();
     assert_eq!(
         sessions
             .external_harness_state(&durable)
@@ -254,7 +254,10 @@ async fn attachment_poll_commits_empty_cursor_before_next_native_observe() {
         Some("poll-1")
     );
     // Two overlapping attachment polls must select the cursor only after the observer guard.
-    let (left, right) = tokio::join!(app.poll_observations(&query), app.poll_observations(&query));
+    let (left, right) = tokio::join!(
+        app.poll_observations(&query, 0),
+        app.poll_observations(&query, 0)
+    );
     left.unwrap();
     right.unwrap();
     assert_eq!(calls.lock().await.len(), 3);
@@ -272,12 +275,12 @@ async fn attachment_poll_commits_empty_cursor_before_next_native_observe() {
         generation: 2,
         ..query.clone()
     };
-    assert!(app.poll_observations(&wrong).await.is_err());
+    assert!(app.poll_observations(&wrong, 0).await.is_err());
     let wrong = bcode_ipc::harness::ManagedSessionPollRequest {
         instance_id: "foreign".into(),
         ..query
     };
-    assert!(app.poll_observations(&wrong).await.is_err());
+    assert!(app.poll_observations(&wrong, 0).await.is_err());
     assert_eq!(calls.lock().await.len(), 3);
     drop(app);
     runtime.verify_owner(&owner).await.unwrap();

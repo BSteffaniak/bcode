@@ -51,7 +51,9 @@ interface_id = "bcode.harness.recovery/v1"
 name         = "Exact constrained resume and physical transport release evidence"
 
 [concurrency]
-type = "exclusive"
+# Operations still serialize on retained plugin state; only a waiting observe
+# releases that lock while it waits for native output.
+type = "concurrent"
 
 [runtime]
 abi_version  = 5

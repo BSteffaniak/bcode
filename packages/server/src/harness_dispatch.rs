@@ -143,8 +143,21 @@ pub trait ManagedSessionBackend: Send + Sync {
         let _ = (caller, owner, call);
         Box::pin(async { Err(ManagedHarnessError::Unsupported) })
     }
-    /// Poll canonical native observations for an admitted interactive attachment.
+    /// Poll canonical native observations for an admitted interactive attachment, letting the
+    /// adapter hold the page for up to `wait_millis`. Returns the committed page's progress.
     fn poll_observations<'a>(
+        &'a self,
+        caller: &'a ManagedCaller,
+        query: &'a bcode_ipc::harness::ManagedSessionPollRequest,
+        wait_millis: u32,
+    ) -> Task<'a, usize> {
+        let _ = (caller, query, wait_millis);
+        Box::pin(async { Err(ManagedHarnessError::Unsupported) })
+    }
+    /// Admit an interactive attachment, drain once, then keep ingesting native observations in
+    /// the daemon for as long as that client stays admitted. Committed pages reach the client
+    /// through its ordinary session event subscription.
+    fn watch_observations<'a>(
         &'a self,
         caller: &'a ManagedCaller,
         query: &'a bcode_ipc::harness::ManagedSessionPollRequest,
@@ -385,6 +398,7 @@ struct CanonicalBackend<S, A> {
     admission: A,
     owners: tokio::sync::Mutex<std::collections::BTreeMap<SessionId, HarnessOwner>>,
     tool_queues: crate::harness::ToolQueueHost,
+    watches: crate::harness::ObservationWatches,
 }
 impl<S: ManagedHarnessStore, A: ManagedSessionAdmission> ManagedSessionBackend
     for CanonicalBackend<S, A>
@@ -523,11 +537,29 @@ impl<S: ManagedHarnessStore, A: ManagedSessionAdmission> ManagedSessionBackend
         })
     }
 
-    fn poll_observations<'a>(
+    fn watch_observations<'a>(
         &'a self,
         caller: &'a ManagedCaller,
         query: &'a bcode_ipc::harness::ManagedSessionPollRequest,
     ) -> Task<'a, ()> {
+        Box::pin(async move {
+            let ManagedCaller::Client(client) = caller else {
+                return Err(ManagedHarnessError::Unsupported);
+            };
+            // Admission and the first drain run on the caller's request so failures surface.
+            self.poll_observations(caller, query, 0).await?;
+            self.watches
+                .start(self.state.clone(), *client, query.clone());
+            Ok(())
+        })
+    }
+
+    fn poll_observations<'a>(
+        &'a self,
+        caller: &'a ManagedCaller,
+        query: &'a bcode_ipc::harness::ManagedSessionPollRequest,
+        wait_millis: u32,
+    ) -> Task<'a, usize> {
         Box::pin(async move {
             let ManagedCaller::Client(client) = caller else {
                 return Err(ManagedHarnessError::Unsupported);
@@ -577,7 +609,7 @@ impl<S: ManagedHarnessStore, A: ManagedSessionAdmission> ManagedSessionBackend
                     &self.runtime,
                     owner,
                 )
-                .poll_observations(query),
+                .poll_observations(query, wait_millis),
             )
             .await;
             drop(state);
@@ -587,6 +619,7 @@ impl<S: ManagedHarnessStore, A: ManagedSessionAdmission> ManagedSessionBackend
 
     fn shutdown(&self) -> Task<'_, ()> {
         Box::pin(async move {
+            self.watches.shutdown();
             self.tool_queues.shutdown().await;
             let owners = std::mem::take(&mut *self.owners.lock().await);
             let closes = owners.into_values().map(|owner| async move {
@@ -970,6 +1003,7 @@ impl crate::ServerState {
             admission,
             owners: tokio::sync::Mutex::new(std::collections::BTreeMap::new()),
             tool_queues: crate::harness::ToolQueueHost::default(),
+            watches: crate::harness::ObservationWatches::default(),
         };
         self.managed_sessions
             .set(Arc::new(backend))
@@ -1063,12 +1097,33 @@ async fn dispatch_attachment_poll(
         .managed_sessions
         .get()
         .ok_or_else(|| failure(ManagedHarnessError::Unavailable))?
-        .poll_observations(caller, query)
+        .poll_observations(caller, query, 0)
         .await
         .map_err(failure)?;
     Ok(ManagedSessionResponse {
         schema_version: MANAGED_SESSION_VERSION,
         response_json: "{\"committed\":true}".into(),
+    })
+}
+
+async fn dispatch_attachment_watch(
+    state: &Arc<crate::ServerState>,
+    caller: &ManagedCaller,
+    query: &bcode_ipc::harness::ManagedSessionPollRequest,
+) -> Result<ManagedSessionResponse, ErrorResponse> {
+    query
+        .validate()
+        .map_err(|_| failure(ManagedHarnessError::Invalid))?;
+    state
+        .managed_sessions
+        .get()
+        .ok_or_else(|| failure(ManagedHarnessError::Unavailable))?
+        .watch_observations(caller, query)
+        .await
+        .map_err(failure)?;
+    Ok(ManagedSessionResponse {
+        schema_version: MANAGED_SESSION_VERSION,
+        response_json: "{\"committed\":true,\"watching\":true}".into(),
     })
 }
 
@@ -1550,6 +1605,16 @@ pub(crate) async fn dispatch(
         )
     {
         return dispatch_attachment_poll(state, &caller, &query).await;
+    }
+    if request.operation == ManagedSessionOperation::Watch {
+        request
+            .validate_envelope()
+            .map_err(|message| ErrorResponse::new("managed_session_invalid", message))?;
+        let query = serde_json::from_str::<bcode_ipc::harness::ManagedSessionPollRequest>(
+            &request.request_json,
+        )
+        .map_err(|_| failure(ManagedHarnessError::Invalid))?;
+        return dispatch_attachment_watch(state, &caller, &query).await;
     }
     if request.operation == ManagedSessionOperation::Binding {
         return dispatch_binding(state, caller, &request).await;

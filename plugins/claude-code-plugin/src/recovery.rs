@@ -3,16 +3,16 @@
 #[path = "recovery_tests.rs"]
 mod tests;
 use super::{
-    ClaudeCodePlugin, Config, HARNESS_SCHEMA_VERSION, HarnessControlRequest, HarnessFailure,
-    HarnessInstance, HarnessOpenRequest, HarnessRequest, HarnessRequestKind, InstanceConfig,
-    MAX_HARNESS_ID_BYTES, MAX_HARNESS_WIRE_BYTES, NativeServiceContext, PLUGIN_ID, ServiceResponse,
+    Config, HARNESS_SCHEMA_VERSION, HarnessControlRequest, HarnessFailure, HarnessInstance,
+    HarnessOpenRequest, HarnessRequest, HarnessRequestKind, InstanceConfig, MAX_HARNESS_ID_BYTES,
+    MAX_HARNESS_WIRE_BYTES, NativeServiceContext, PLUGIN_ID, PluginState, ServiceResponse,
 };
 use bcode_harness_models::{
     HARNESS_RECOVERY_SCHEMA_VERSION, HarnessRecoveryRequest, HarnessRecoveryRequestKind,
     HarnessRecoveryResponse, HarnessRecoveryResponseKind,
 };
 
-impl ClaudeCodePlugin {
+impl PluginState {
     pub(super) fn recovery_service(&mut self, context: &NativeServiceContext) -> ServiceResponse {
         let result = self.recovery_evidence(context);
         result.map_or_else(

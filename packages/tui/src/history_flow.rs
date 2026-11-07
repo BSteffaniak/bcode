@@ -375,11 +375,10 @@ async fn drive_managed_native_observations(
     instance_id: String,
     generation: u64,
 ) -> Result<(), bcode_client::ClientError> {
-    loop {
-        Box::pin(commands.poll_native_observations(&instance_id, generation)).await?;
-        // Empty pages advance only host-owned state and never imply settlement or end draining.
-        tokio::time::sleep(std::time::Duration::from_millis(250)).await;
-    }
+    // The daemon ingests native output for this attachment and pushes committed pages
+    // through the session subscription; this future only holds the attachment open.
+    Box::pin(commands.watch_native_observations(&instance_id, generation)).await?;
+    std::future::pending().await
 }
 
 async fn receive_managed_session_events(

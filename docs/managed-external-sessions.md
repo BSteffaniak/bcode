@@ -161,6 +161,19 @@ on an explicitly connected client terminal, never daemon-inherited standard inpu
 Codex uses app-server and expected-turn steering. API-key delivery requires verified
 ephemeral native credential storage; persistent fallback is not equivalent.
 
+## Live ingestion
+
+Interactive clients never poll for native output. An attached client issues one `watch`
+request; the daemon then drives the attachment poll for that client, asking the adapter to
+hold each page (`wait_millis`) until native output arrives. Each committed page reaches
+clients through the ordinary session event subscription. Every page re-admits the client and
+owner, so a disconnected client, changed generation or shutdown ends the watch. Adapters that
+ignore `wait_millis` remain correct: empty pages that were not held back off.
+
+Long holds occupy a shared plugin invocation slot, so only a bounded number of sessions hold
+at once; others use short pages with backoff. Explicit `observe` callers that pass their own
+cursor are unaffected; a watch is attachment-scoped, not an always-on ingester.
+
 ## Presentation
 
 SessionView owns renderer-neutral external-session semantics. Clients render

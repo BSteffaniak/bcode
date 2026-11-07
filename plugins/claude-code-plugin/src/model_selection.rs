@@ -1,8 +1,8 @@
 //! Optional model discovery/selection service; no model-provider or native agent loop.
 use super::{
-    ClaudeCodePlugin, ClaudeSession, Config, HARNESS_SCHEMA_VERSION, HarnessFailure,
-    HarnessServiceResponseKind, HarnessSessionTarget, InstanceConfig, MAX_HARNESS_WIRE_BYTES,
-    NativeServiceContext, PLUGIN_ID, ServiceResponse,
+    ClaudeSession, Config, HARNESS_SCHEMA_VERSION, HarnessFailure, HarnessServiceResponseKind,
+    HarnessSessionTarget, InstanceConfig, MAX_HARNESS_WIRE_BYTES, NativeServiceContext, PLUGIN_ID,
+    PluginState, ServiceResponse,
 };
 use bcode_harness_models::{
     HarnessModel, HarnessModelEvidence, HarnessModelSelection, HarnessModelsRequest,
@@ -25,7 +25,7 @@ pub fn same_selection(
     }
 }
 
-impl ClaudeCodePlugin {
+impl PluginState {
     pub(super) fn invoke_models_service(
         &mut self,
         context: &NativeServiceContext,

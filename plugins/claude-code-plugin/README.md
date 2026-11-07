@@ -56,8 +56,14 @@ invalidates live callbacks but does not erase queued confirmation or interaction
 evidence. Post-EOF pages report disconnected/unknown status and a gap; they do not
 authorize responding, submitting, replaying, or reviving the transport. Native pipes are drained on a persistent
 Tokio runtime independently of service polling. Queue overflow stops the process
-and exposes a gap; unread history is never silently dropped. `wait_millis` is
-currently satisfied with an immediate bounded poll.
+and exposes a gap; unread history is never silently dropped.
+
+`observe` honors `wait_millis`: when nothing is ready to offer, the plugin applies the
+request's acknowledgement, absorbs native records that produce no observations, and holds
+the page until evidence or a host request is ready, the wait elapses, or the invocation is
+cancelled. The plugin is a concurrent native plugin: every operation still serializes on
+retained state, but a held `observe` waits outside that lock, so submissions, responses,
+interrupts and tool-queue drains are never queued behind it.
 
 ## Implemented semantics
 

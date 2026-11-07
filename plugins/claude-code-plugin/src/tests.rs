@@ -174,6 +174,7 @@ fn observation_ack_boundary_retires_1100_attempts_without_losing_pending_work() 
         requested_native_session_id: Some("native".into()),
     };
     let mut stream = StreamState {
+        wake: std::sync::Arc::default(),
         normalizer: normalized,
         retention: retention::PageRetention::new("test-connection".into()),
         observations: VecDeque::new(),
@@ -468,6 +469,7 @@ fn eof_stream_fixture() -> (HarnessPreparedSession, HarnessSessionTarget, Stream
     };
     let prepared_target = HarnessSessionTarget::Prepared(prepared.clone());
     let stream = StreamState {
+        wake: std::sync::Arc::default(),
         normalizer: Normalizer::with_target(prepared_target.clone(), prepared.open_id.clone()),
         retention: retention::PageRetention::new("test-connection".into()),
         observations: VecDeque::new(),
@@ -904,6 +906,7 @@ fn native_cancellation_invalidates_assistance_without_stopping_observations() {
 #[test]
 fn bounded_queue_never_silently_evicts_unacknowledged_history() {
     let mut stream = StreamState {
+        wake: std::sync::Arc::default(),
         normalizer: normalizer(),
         retention: retention::PageRetention::new("test-connection".into()),
         observations: VecDeque::new(),
@@ -1033,7 +1036,7 @@ fn native_settlement_does_not_invent_a_turn_id() {
 #[test]
 fn oversized_or_malformed_requests_do_not_start_a_runtime() {
     for payload in [vec![b'x'; MAX_HARNESS_WIRE_BYTES + 1], b"not-json".to_vec()] {
-        let mut plugin = ClaudeCodePlugin::default();
+        let mut plugin = PluginState::default();
         let context = NativeServiceContext {
             plugin_id: PLUGIN_ID.into(),
             request: bcode_plugin_sdk::ServiceRequest {
@@ -1048,7 +1051,7 @@ fn oversized_or_malformed_requests_do_not_start_a_runtime() {
             bridge: bcode_plugin_sdk::ServiceBridge::default(),
             transient_progress_limits: bcode_plugin_sdk::TransientProgressLimits::default(),
         };
-        assert!(plugin.invoke_service(context).error.is_some());
+        assert!(plugin.invoke_service(&context).error.is_some());
         assert!(plugin.runtime.is_none());
         assert!(plugin.processes.is_empty());
     }
@@ -1067,7 +1070,7 @@ fn terminal_auth_alias_preserves_legacy_preparation_validation_without_starting_
             ),
             ("launch", b"{}".to_vec()),
         ] {
-            let mut plugin = ClaudeCodePlugin::default();
+            let mut plugin = PluginState::default();
             let context = NativeServiceContext {
                 plugin_id: PLUGIN_ID.into(),
                 request: bcode_plugin_sdk::ServiceRequest {
@@ -1082,7 +1085,7 @@ fn terminal_auth_alias_preserves_legacy_preparation_validation_without_starting_
                 bridge: bcode_plugin_sdk::ServiceBridge::default(),
                 transient_progress_limits: bcode_plugin_sdk::TransientProgressLimits::default(),
             };
-            let response = plugin.invoke_service(context);
+            let response = plugin.invoke_service(&context);
             assert_eq!(response.error.unwrap().code, "invalid_request");
             assert!(plugin.runtime.is_none());
             assert!(plugin.processes.is_empty());

@@ -135,6 +135,9 @@ pub enum ManagedSessionOperation {
     DiscoverCandidates,
     /// Revalidate one selected installation without committing configuration.
     PrepareCandidate,
+    /// Attachment-owned daemon ingestion: drain once, then keep committing native pages
+    /// while the attached client stays admitted. Uses the attachment poll request shape.
+    Watch,
 }
 impl ManagedSessionOperation {
     /// Stable interface operation.
@@ -153,6 +156,7 @@ impl ManagedSessionOperation {
             Self::Respond => "respond",
             Self::Interrupt => "interrupt",
             Self::Observe => "observe",
+            Self::Watch => "watch",
             Self::Close => "close",
             Self::Reconcile => "reconcile",
             Self::History => "history",

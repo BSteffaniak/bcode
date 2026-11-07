@@ -992,11 +992,8 @@ env = "BCODE_MANAGED_REATTACH_UNSET_KEY_71E9"
             if matches!(*event, bcode_ipc::Event::Session(ref event)
                 if matches!(&event.kind, bcode_session_models::SessionEventKind::AssistantMessage { text } if text == "native output after empty page")))
         );
-        assert!(probe.polls.load(std::sync::atomic::Ordering::SeqCst) >= 2);
-        tokio::time::timeout(Duration::from_secs(5), probe.held.notified())
-            .await
-            .unwrap();
-        // Dropping UI observation cancels its held read and poll futures promptly.
+        assert_eq!(probe.polls.load(std::sync::atomic::Ordering::SeqCst), 1);
+        // Dropping UI observation cancels its attachment futures promptly.
         drop(receiver);
         tokio::time::timeout(Duration::from_secs(1), forwarding)
             .await
@@ -1065,7 +1062,7 @@ env = "BCODE_MANAGED_REATTACH_UNSET_KEY_71E9"
                     interface_id,
                     bcode_ipc::harness::MANAGED_SESSION_INTERFACE_ID
                 );
-                assert_eq!(operation, "observe");
+                assert_eq!(operation, "watch");
                 let envelope: bcode_ipc::harness::ManagedSessionRequest =
                     serde_json::from_slice(&payload).unwrap();
                 let query: bcode_ipc::harness::ManagedSessionPollRequest =
@@ -1073,18 +1070,14 @@ env = "BCODE_MANAGED_REATTACH_UNSET_KEY_71E9"
                 assert_eq!(query.session_id, owner);
                 assert_eq!(query.instance_id, "primary");
                 assert_eq!(query.generation, 1);
+                // One watch per attachment: the daemon ingests and pushes committed pages.
                 let poll = probe
                     .polls
                     .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-                if poll == 0 {
-                    probe.held.notify_one();
-                    probe.release.notified().await;
-                } else if poll == 1 {
-                    probe.committed.notify_one();
-                } else {
-                    probe.held.notify_one();
-                    std::future::pending::<()>().await;
-                }
+                assert_eq!(poll, 0, "attachments must not poll for native output");
+                probe.held.notify_one();
+                probe.release.notified().await;
+                probe.committed.notify_one();
                 ResponsePayload::PluginServiceResult {
                     response: bcode_ipc::PluginServiceResponse {
                         payload: br#"{"committed":true}"#.to_vec(),

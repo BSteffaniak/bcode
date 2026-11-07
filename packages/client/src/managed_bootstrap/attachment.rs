@@ -383,6 +383,31 @@ impl ManagedSessionCommandHandle {
         instance_id: &str,
         generation: u64,
     ) -> Result<(), ClientError> {
+        self.attachment_ingest(ManagedSessionOperation::Observe, instance_id, generation)
+            .await
+    }
+
+    /// Ask the daemon to ingest native observations for this attachment until this client
+    /// disconnects or ownership changes. Committed pages arrive through the ordinary session
+    /// event subscription; no client polling is needed. Repeating the request is idempotent.
+    /// # Errors
+    /// Returns ownership, transport, native availability or canonical commit errors from the
+    /// admission and first drain; later failures end the daemon watch silently.
+    pub async fn watch_native_observations(
+        &self,
+        instance_id: &str,
+        generation: u64,
+    ) -> Result<(), ClientError> {
+        self.attachment_ingest(ManagedSessionOperation::Watch, instance_id, generation)
+            .await
+    }
+
+    async fn attachment_ingest(
+        &self,
+        operation: ManagedSessionOperation,
+        instance_id: &str,
+        generation: u64,
+    ) -> Result<(), ClientError> {
         let request = bcode_ipc::harness::ManagedSessionPollRequest {
             session_id: self.session_id,
             instance_id: instance_id.to_owned(),
@@ -392,7 +417,7 @@ impl ManagedSessionCommandHandle {
         request.validate().map_err(|_| invalid())?;
         let envelope = bcode_ipc::harness::ManagedSessionRequest {
             schema_version: bcode_ipc::harness::MANAGED_SESSION_VERSION,
-            operation: ManagedSessionOperation::Observe,
+            operation,
             request_json: serde_json::to_string(&request).map_err(|_| invalid())?,
         };
         // The sealed handle alone owns this route; no arbitrary native call is exposed.
@@ -401,7 +426,7 @@ impl ManagedSessionCommandHandle {
             .inner
             .call_plugin_service(
                 bcode_ipc::harness::MANAGED_SESSION_INTERFACE_ID.to_owned(),
-                ManagedSessionOperation::Observe.as_str().to_owned(),
+                operation.as_str().to_owned(),
                 serde_json::to_vec(&envelope).map_err(|_| invalid())?,
             )
             .await?;

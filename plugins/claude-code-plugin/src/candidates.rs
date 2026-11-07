@@ -1,7 +1,7 @@
 //! Plugin-owned installation discovery using the trusted host launch environment.
 use super::{
-    ClaudeCodePlugin, HARNESS_SCHEMA_VERSION, HarnessFailure, HarnessInstance, InstanceConfig,
-    MAX_HARNESS_WIRE_BYTES, NativeServiceContext, PLUGIN_ID, PathBuf, ServiceResponse,
+    HARNESS_SCHEMA_VERSION, HarnessFailure, HarnessInstance, InstanceConfig,
+    MAX_HARNESS_WIRE_BYTES, NativeServiceContext, PLUGIN_ID, PathBuf, PluginState, ServiceResponse,
 };
 use bcode_claude_code::{
     BillingRoute, LaunchOptions, Limits, NativeAuthSupport, NativeEnvironment, SettingsInheritance,
@@ -310,7 +310,7 @@ fn prepare_from_discovery(
     })
 }
 
-impl ClaudeCodePlugin {
+impl PluginState {
     fn fresh_candidates(&mut self) -> Result<HarnessCandidatesResponseKind, HarnessFailure> {
         let input = SearchEnvironment::trusted_host()?;
         if self.runtime.is_none() {
