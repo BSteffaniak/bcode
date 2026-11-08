@@ -24,7 +24,10 @@ use bcode_presentation_policy::PropertyOrigin;
 use bcode_presentation_policy::models::{
     Disclosure, LayerSource, PresentationRule, ResolvedPresentation, UnitFacts, UnitKind,
 };
-use bmux_tui_components::scroll_view::ScrollViewState;
+use bmux_tui::component::LayoutNode;
+use bmux_tui::event::{Event, MouseEvent};
+use bmux_tui::geometry::Rect;
+use bmux_tui_components::scroll_view::{ScrollViewOutcome, ScrollViewState};
 
 use crate::app::BmuxApp;
 use crate::structure::DisclosureTarget;
@@ -82,13 +85,31 @@ impl TranscriptTools {
     }
 }
 
-/// Open-inspector state. Interior mutability lets painting clamp the scroll
-/// offset against the measured layout and reset it when focus moves.
+/// Open-inspector state.
+///
+/// Interior mutability lets painting clamp the scroll offset against the
+/// measured layout, reset it when focus moves, and record the painted body
+/// geometry pointer events route through.
 #[derive(Debug, Clone, Default)]
 pub struct InspectorState {
     scroll: Cell<ScrollViewState>,
     /// Target the scroll offset belongs to.
     scrolled: RefCell<Option<DisclosureTarget>>,
+    /// Body as last painted; `None` until painted or while it does not fit.
+    painted: RefCell<Option<PaintedInspectorBody>>,
+}
+
+/// The inspector body as last painted.
+///
+/// Holds the terminal rectangle its text view occupied and the view's
+/// resolved layout. Scrollbar clicks and drags route through exactly this
+/// geometry, so they agree with what is on screen.
+#[derive(Debug, Clone)]
+pub struct PaintedInspectorBody {
+    /// Terminal rectangle the body text view painted into.
+    pub area: Rect,
+    /// The body text view's resolved layout.
+    pub layout: LayoutNode,
 }
 
 impl InspectorState {
@@ -117,6 +138,63 @@ impl InspectorState {
         state.set_vertical_offset(next);
         self.scroll.set(state);
         next != old
+    }
+
+    /// Record the body geometry painted this frame, or `None` when the
+    /// inspector did not fit; a scrollbar drag cannot outlive its geometry.
+    pub fn record_painted(&self, painted: Option<PaintedInspectorBody>) {
+        if painted.is_none() {
+            self.stop_scrollbar_drag();
+        }
+        *self.painted.borrow_mut() = painted;
+    }
+
+    /// Body geometry recorded by the last paint.
+    #[cfg(test)]
+    pub fn painted_body_for_test(&self) -> Option<PaintedInspectorBody> {
+        self.painted.borrow().clone()
+    }
+
+    /// Whether a scrollbar drag that started on the painted body is active.
+    #[must_use]
+    pub const fn scrollbar_dragging(&self) -> bool {
+        self.scroll.get().dragging_scrollbar()
+    }
+
+    /// Route one left-button pointer event to the painted body's scrollbar:
+    /// a press on the track jumps there and starts a drag, dragging moves
+    /// the offset, and release ends the drag. Returns whether the event
+    /// belonged to the scrollbar (it scrolled, or a drag started, continued,
+    /// or ended).
+    pub fn handle_scrollbar_mouse(&self, mouse: MouseEvent) -> bool {
+        let painted = self.painted.borrow();
+        let Some(painted) = painted.as_ref() else {
+            let dragging = self.scrollbar_dragging();
+            self.stop_scrollbar_drag();
+            return dragging;
+        };
+        let was_dragging = self.scrollbar_dragging();
+        let outcome = crate::inspector_render::body_view(&[], &self.scroll).handle_event(
+            painted.area,
+            &painted.layout,
+            &Event::Mouse(mouse),
+        );
+        outcome != ScrollViewOutcome::Ignored || was_dragging || self.scrollbar_dragging()
+    }
+
+    /// End a scrollbar drag, keeping the offsets; BMUX exposes no drag
+    /// setter, so the state is rebuilt from its public parts.
+    fn stop_scrollbar_drag(&self) {
+        let old = self.scroll.get();
+        if !old.dragging_scrollbar() {
+            return;
+        }
+        let mut state = ScrollViewState::new();
+        state.interaction = old.interaction;
+        state.set_vertical_offset(old.vertical_offset());
+        state.set_horizontal_offset(old.horizontal_offset());
+        state.set_follow_bottom(old.follows_bottom());
+        self.scroll.set(state);
     }
 }
 
@@ -501,15 +579,46 @@ impl BmuxApp {
             .is_some_and(|inspector| inspector.scroll_by(delta))
     }
 
-    /// Run a transcript tooling command-palette route
-    /// (`transcript.inspect`, `transcript.cycleDetail`,
-    /// `transcript.makeDefault`); returns `None` for other routes, else
-    /// whether the UI changed.
+    /// Whether a drag on the open inspector's scrollbar is active.
+    #[must_use]
+    pub fn inspector_scrollbar_dragging(&self) -> bool {
+        self.transcript_tools
+            .inspector
+            .as_ref()
+            .is_some_and(InspectorState::scrollbar_dragging)
+    }
+
+    /// Route a pointer event to the open inspector's painted scrollbar;
+    /// returns whether the scrollbar took it (see
+    /// [`InspectorState::handle_scrollbar_mouse`]).
+    pub fn inspector_scrollbar_mouse(&self, mouse: MouseEvent) -> bool {
+        self.transcript_tools
+            .inspector
+            .as_ref()
+            .is_some_and(|inspector| inspector.handle_scrollbar_mouse(mouse))
+    }
+
+    /// Run a transcript tooling command-palette route (`transcript.inspect`,
+    /// `transcript.cycleDetail`, `transcript.makeDefault`,
+    /// `transcript.focusUnits`, `tools.expandAll`, `tools.collapseAll`,
+    /// `tools.resetDisclosure`). Each runs the same handler as its keymap
+    /// action, so bulk actions in focus mode apply to the focused subtree.
+    /// Returns `None` for other routes, else whether the UI changed.
     pub fn run_transcript_tool_route(&mut self, route: &str) -> Option<bool> {
         Some(match route {
             "transcript.inspect" => self.open_inspector_from_palette(),
             "transcript.cycleDetail" => self.cycle_detail(),
             "transcript.makeDefault" => self.make_focused_default(),
+            "transcript.focusUnits" => {
+                if self.transcript_focus_active() {
+                    self.exit_transcript_focus()
+                } else {
+                    self.enter_transcript_focus()
+                }
+            }
+            "tools.expandAll" => self.set_all_disclosure(Disclosure::Expanded),
+            "tools.collapseAll" => self.set_all_disclosure(Disclosure::Collapsed),
+            "tools.resetDisclosure" => self.reset_disclosure(),
             _ => return None,
         })
     }

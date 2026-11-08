@@ -1050,8 +1050,10 @@ impl BmuxApp {
     }
 
     /// Adopt the loaded plugins' manifest `[presentation]` declarations: their
-    /// default rules become plugin layers and their declared target fields
-    /// feed the `target` fact. Returns whether the structure changed.
+    /// default rules and property defaults become plugin layers, their
+    /// declared target fields feed the `target` fact, and their declared
+    /// facts and property schemas are registered with the structure. Returns
+    /// whether the structure changed.
     ///
     /// Runs whenever the plugin catalog changes: every catalog (re)load, from
     /// startup or a configuration reload, installs a new presentation through
@@ -1070,7 +1072,7 @@ impl BmuxApp {
         }
         let fields_changed = self.apply_tool_target_fields(
             bcode_plugin::presentation::presentation_target_fields(&declarations),
-        );
+        ) | self.structure.set_plugin_presentation(&declarations);
         let layers = bcode_plugin::presentation::presentation_rule_layers(&declarations);
         self.plugin_presentation_declarations = declarations;
         if layers == self.plugin_structure_layers {
@@ -3548,6 +3550,57 @@ impl BmuxApp {
         }
         self.retarget_theme_transition(target.accent, now);
         self.update_theme_animation(now);
+        self.settle_motion_if_instant(now);
+    }
+
+    /// Settle running transcript animations once the effective motion turns
+    /// instant (motion `none` or `reduce_motion`, from a theme change, a
+    /// config apply, or a runtime toggle): a scroll animation lands at its
+    /// target and the latest-bar glow shows the still bar, and neither
+    /// schedules further frames. Accent transitions settle in
+    /// [`Self::retarget_theme_transition`].
+    ///
+    /// The hidden-activity time is kept: it also records that unseen content
+    /// arrived below the viewport, which the latest bar and its jump target
+    /// depend on regardless of motion. When motion returns while that
+    /// activity is still inside the glow window, the glow resumes with fresh
+    /// frames rather than painting one frozen frame.
+    fn settle_motion_if_instant(&mut self, now: Instant) {
+        let policy = self.motion_policy();
+        if policy.transcript_scroll().is_zero()
+            && let Some(animation) = self.transcript_scroll_animation.take()
+        {
+            let row = match animation.target {
+                TranscriptAnimationTarget::LatestBottom => None,
+                TranscriptAnimationTarget::ItemTop(id) => Some(
+                    self.transcript
+                        .presentation_index(id)
+                        .and_then(|index| {
+                            self.transcript_layout
+                                .entry_start_row(VisibleTranscriptSource::Transcript, index)
+                        })
+                        .unwrap_or(animation.target_top_row),
+                ),
+                TranscriptAnimationTarget::Row => Some(animation.target_top_row),
+            };
+            if let Some(row) = row {
+                self.session_ui.viewport.materialize_top_row(row);
+            } else {
+                self.session_ui
+                    .viewport
+                    .scroll_to_bottom(&mut self.older_history);
+            }
+        }
+        if policy.latest_bar_window().is_zero() {
+            self.latest_hidden_activity_burst = 0;
+            self.latest_bar_next_frame_at = None;
+        } else if self.latest_bar_next_frame_at.is_none() && self.latest_bar_active(now) {
+            self.latest_bar_next_frame_at = Some(next_latest_bar_frame_at(
+                self.latest_bar_animation_started_at,
+                now,
+                latest_bar_active_frame_duration(self.latest_hidden_activity_burst),
+            ));
+        }
     }
 
     /// Move the accent toward `target` over the duration the target theme's
@@ -9919,6 +9972,98 @@ mod tests {
         assert!(windows[2] > windows[1], "full glows longer than subtle");
     }
 
+    fn reduce_motion_now(app: &mut BmuxApp) {
+        let mut config = app.tui_config().clone();
+        config.reduce_motion = true;
+        app.apply_tui_config(config);
+    }
+
+    #[test]
+    fn reduce_motion_settles_a_running_scroll_animation_at_its_target() {
+        use crate::frame_sequence_harness::{
+            TranscriptFrameInput, TranscriptFrameSequence, TranscriptFrameStep,
+        };
+        let session_id = bcode_session_models::SessionId::new();
+        let events = (1..31)
+            .map(|sequence| bcode_session_models::SessionEvent {
+                schema_version: bcode_session_models::CURRENT_SESSION_EVENT_SCHEMA_VERSION,
+                sequence,
+                timestamp_ms: sequence,
+                session_id,
+                provenance: None,
+                kind: bcode_session_models::SessionEventKind::AssistantMessage {
+                    text: format!("message {sequence}"),
+                },
+            })
+            .collect::<Vec<_>>();
+        let mut app = BmuxApp::new_with_history(Some(session_id), &events, &[], false);
+        app.set_motion_for_test(bcode_tui_theme::chrome::Motion::Subtle, false);
+        TranscriptFrameSequence::new(&mut app, 80, 12).run([TranscriptFrameStep {
+            label: "reader at top",
+            input: TranscriptFrameInput::ScrollUp(usize::MAX / 4),
+        }]);
+        assert!(app.transition_transcript_to_bottom());
+        assert!(app.transcript_scroll_frame_requested_for_test());
+
+        reduce_motion_now(&mut app);
+        let running = app.transcript_scroll_animation_duration_for_test();
+        let requested = app.transcript_scroll_frame_requested_for_test();
+        let frames = TranscriptFrameSequence::new(&mut app, 80, 12).run([TranscriptFrameStep {
+            label: "settled",
+            input: TranscriptFrameInput::Observe,
+        }]);
+        let offset = app.scroll_offset();
+        drop(app);
+        assert_eq!(running, None);
+        assert!(!requested);
+        assert_eq!(frames[0].observation.scroll_mode, "bottom_follow");
+        assert_eq!(offset, 0);
+    }
+
+    #[test]
+    fn reduce_motion_settles_a_running_latest_bar_glow() {
+        let mut app = BmuxApp::new_with_history(None, &[], &[], false);
+        app.set_motion_for_test(bcode_tui_theme::chrome::Motion::Full, false);
+        let now = Instant::now();
+        app.record_latest_hidden_activity(now, 4);
+        assert!(app.latest_bar_next_frame_at.is_some());
+        assert!(app.latest_bar_active(now));
+
+        reduce_motion_now(&mut app);
+        let deadline = app.latest_bar_next_frame_at;
+        let burst = app.latest_hidden_activity_burst;
+        let still = !app.latest_bar_active(now);
+        // Settling keeps the record of unseen activity below the viewport.
+        let activity = app.latest_hidden_activity_at;
+        // Motion returning inside the glow window resumes the glow with
+        // scheduled frames instead of one frozen frame.
+        let mut config = app.tui_config().clone();
+        config.reduce_motion = false;
+        app.apply_tui_config(config);
+        let resumed = app.latest_bar_active(now);
+        let resumed_deadline = app.latest_bar_next_frame_at;
+        drop(app);
+        assert_eq!(deadline, None);
+        assert_eq!(burst, 0);
+        assert!(still);
+        assert_eq!(activity, Some(now));
+        assert!(resumed);
+        assert!(resumed_deadline.is_some_and(|at| at > now));
+    }
+
+    #[test]
+    fn subtle_motion_keeps_running_animations_on_config_apply() {
+        let mut app = BmuxApp::new_with_history(None, &[], &[], false);
+        app.set_motion_for_test(bcode_tui_theme::chrome::Motion::Full, false);
+        let now = Instant::now();
+        app.record_latest_hidden_activity(now, 4);
+        let config = app.tui_config().clone();
+        app.apply_tui_config(config);
+        let deadline = app.latest_bar_next_frame_at;
+        drop(app);
+        assert!(deadline.is_some());
+    }
+
     #[test]
     fn animation_deadlines_catch_up_from_monotonic_origin() {
         let started_at = Instant::now();
@@ -13413,7 +13558,7 @@ mod structure_layer_tests {
                         ..PropertyPatch::default()
                     },
                 )],
-                diagnostics: Vec::new(),
+                ..bcode_plugin::PluginPresentationDeclaration::default()
             }
             .rule_layer("p"),
         ];

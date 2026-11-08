@@ -1,8 +1,10 @@
 //! Structural presentation for transcript units.
 //!
 //! The compiled policy comes from theme, configuration, and user-state rule
-//! layers; this module adapts terminal transcript items into renderer-neutral
-//! [`UnitFacts`] and keeps per-target disclosure overrides (see
+//! layers, with plugin-declared facts and properties registered; this module
+//! adapts terminal transcript items into renderer-neutral [`UnitFacts`]
+//! (including the facts a unit's producing plugin declared) and keeps
+//! per-target disclosure overrides (see
 //! [`DisclosureTarget`]) as ephemeral renderer state. The visibility floor
 //! applies after overrides, exactly as after rule layers: units awaiting a
 //! decision stay expanded and failed units never drop below summary.
@@ -12,8 +14,10 @@ use std::fmt;
 use std::str::FromStr;
 use std::sync::Arc;
 
+use bcode_plugin::presentation::{PluginFactDeclaration, PluginPresentationDeclaration};
 use bcode_presentation_policy::models::{
-    Disclosure, DurationBucket, LayerSource, ResolvedPresentation, ResolvedSection, RuleLayer,
+    Disclosure, DurationBucket, FactType, FactValue, LayerSource, MAX_PLUGIN_FACT_TEXT_BYTES,
+    MAX_PLUGIN_FACTS, PluginPresentationSchemas, ResolvedPresentation, ResolvedSection, RuleLayer,
     SizeBucket, TurnRecency, UnitFacts, UnitKind, UnitStatus,
 };
 use bcode_presentation_policy::{CompiledPolicy, PolicyDiagnostic, PolicyRegistry};
@@ -45,6 +49,21 @@ pub const DISCLOSURE_HIT_PREFIX: &str = "disclosure:";
 /// tool's declaration only when exactly one plugin declares that tool, so an
 /// ambiguous tool name never borrows another plugin's fields.
 pub type DeclaredTargetFields = BTreeMap<String, BTreeMap<String, Vec<String>>>;
+
+/// Plugin-declared fact sources: declaring plugin id, then its effective fact
+/// declarations.
+///
+/// A plugin's facts are derived only for units that plugin produced (units
+/// with a known producer); no other unit ever carries them.
+pub type DeclaredFacts = BTreeMap<String, Vec<PluginFactDeclaration>>;
+
+/// Declared facts with a process-unique generation, so per-item fact memos
+/// can tell declarations apart without comparing them.
+#[derive(Debug, Clone, Default)]
+struct FactSources {
+    generation: u64,
+    by_plugin: DeclaredFacts,
+}
 
 /// Something whose disclosure the user can toggle.
 ///
@@ -139,6 +158,8 @@ pub struct StructureSnapshot {
     groups: Arc<GroupSnapshot>,
     /// Producer-declared target argument fields.
     target_fields: Arc<DeclaredTargetFields>,
+    /// Plugin-declared fact sources.
+    plugin_facts: Arc<FactSources>,
     /// Whether any rule conditions on `last_in_turn`.
     uses_last_in_turn: bool,
     /// Whether the legacy reasoning visibility setting (`tui.thinking.show`
@@ -284,7 +305,8 @@ impl StructureSnapshot {
     }
 
     /// Facts of `item` as rules see them: [`unit_facts`] plus the turn
-    /// facts (`turn`, `last_in_turn`) and producer-declared targets.
+    /// facts (`turn`, `last_in_turn`), producer-declared targets, and the
+    /// facts the item's producing plugin declared.
     #[must_use]
     pub fn facts(&self, item: &TranscriptItem) -> Option<UnitFacts> {
         let mut facts = unit_facts(item)?;
@@ -303,6 +325,18 @@ impl StructureSnapshot {
                 .and_then(|arguments| extract_target(arguments, fields.iter().map(String::as_str)))
         {
             facts.target = Some(target);
+        }
+        if let Some(declared) = facts
+            .producer
+            .as_ref()
+            .and_then(|producer| self.plugin_facts.by_plugin.get(producer))
+        {
+            facts.plugin = declared_facts(
+                item,
+                facts.tool.as_deref(),
+                declared,
+                self.plugin_facts.generation,
+            );
         }
         Some(facts)
     }
@@ -395,6 +429,10 @@ impl StructureSnapshot {
 #[derive(Debug, Clone, Default)]
 pub struct StructureState {
     snapshot: StructureSnapshot,
+    /// Layers of the last compilation, recompiled when plugin schemas change.
+    layers: Vec<RuleLayer>,
+    /// Plugin-declared fact and property schemas the policy is compiled with.
+    schemas: PluginPresentationSchemas,
     diagnostics: Vec<PolicyDiagnostic>,
     revision: u64,
     override_sequence: u64,
@@ -404,9 +442,47 @@ pub struct StructureState {
 impl StructureState {
     /// Recompile from `layers`; returns whether the effective policy changed.
     pub fn set_layers(&mut self, layers: &[RuleLayer]) -> bool {
-        let (policy, diagnostics) =
-            CompiledPolicy::compile(layers, &PolicyRegistry::with_host_parts());
+        layers.clone_into(&mut self.layers);
+        self.recompile()
+    }
+
+    /// Adopt the loaded plugins' effective `[presentation]` declarations:
+    /// their facts are derived for their own units and their fact and
+    /// property schemas are registered with the policy (property defaults
+    /// arrive as plugin layers through [`Self::set_layers`]). Returns whether
+    /// the structure changed.
+    pub fn set_plugin_presentation(
+        &mut self,
+        declarations: &BTreeMap<String, PluginPresentationDeclaration>,
+    ) -> bool {
+        let facts: DeclaredFacts = declarations
+            .iter()
+            .filter(|(_, declaration)| !declaration.facts.is_empty())
+            .map(|(plugin, declaration)| (plugin.clone(), declaration.facts.clone()))
+            .collect();
+        let facts_changed = facts != self.snapshot.plugin_facts.by_plugin;
+        if facts_changed {
+            self.snapshot.plugin_facts = Arc::new(FactSources {
+                generation: next_fact_generation(),
+                by_plugin: facts,
+            });
+            self.revision = self.revision.wrapping_add(1);
+        }
+        let schemas = bcode_plugin::presentation::presentation_schemas(declarations);
+        if schemas == self.schemas {
+            return facts_changed;
+        }
+        self.schemas = schemas;
+        self.recompile() || facts_changed
+    }
+
+    /// Compile the current layers against the host sections and plugin
+    /// schemas; returns whether the effective policy changed.
+    fn recompile(&mut self) -> bool {
+        let registry = PolicyRegistry::with_host_parts().with_plugin_schemas(&self.schemas);
+        let (policy, diagnostics) = CompiledPolicy::compile(&self.layers, &registry);
         if policy.fingerprint() == self.snapshot.policy.fingerprint() {
+            self.diagnostics = diagnostics;
             return false;
         }
         for diagnostic in &diagnostics {
@@ -419,7 +495,8 @@ impl StructureState {
             );
         }
         self.snapshot.policy = Arc::new(policy);
-        self.snapshot.uses_last_in_turn = layers
+        self.snapshot.uses_last_in_turn = self
+            .layers
             .iter()
             .flat_map(|layer| &layer.rules)
             .any(|rule| rule.matcher.last_in_turn.is_some());
@@ -1054,6 +1131,197 @@ fn content_facts(item: &TranscriptItem) -> (SizeBucket, Option<String>) {
     (lines, target)
 }
 
+/// Items whose plugin facts are memoized per thread.
+const MAX_PLUGIN_FACT_MEMO: usize = 4096;
+
+/// Memoized plugin facts of one item revision under one set of declarations.
+#[derive(Debug, Clone)]
+struct PluginFactsMemo {
+    revision: u64,
+    generation: u64,
+    text_len: usize,
+    facts: BTreeMap<String, FactValue>,
+}
+
+thread_local! {
+    static PLUGIN_FACTS: std::cell::RefCell<BTreeMap<u64, PluginFactsMemo>> =
+        const { std::cell::RefCell::new(BTreeMap::new()) };
+}
+
+/// Process-unique generation for a new set of fact declarations.
+fn next_fact_generation() -> u64 {
+    static GENERATION: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+    GENERATION.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Facts `declared` by `item`'s producer, derived from the item's tool
+/// arguments or contribution payload; at most [`MAX_PLUGIN_FACTS`].
+///
+/// Memoized by item identity, revision, and declaration `generation`, so
+/// arguments are parsed at most once per item revision.
+fn declared_facts(
+    item: &TranscriptItem,
+    tool: Option<&str>,
+    declared: &[PluginFactDeclaration],
+    generation: u64,
+) -> BTreeMap<String, FactValue> {
+    let id = item.id().get();
+    let text_len = item.text().len();
+    let cached = PLUGIN_FACTS.with(|memo| {
+        memo.borrow().get(&id).and_then(|entry| {
+            (entry.revision == item.revision()
+                && entry.generation == generation
+                && entry.text_len == text_len)
+                .then(|| entry.facts.clone())
+        })
+    });
+    if let Some(cached) = cached {
+        return cached;
+    }
+    let facts = derive_declared_facts(item, tool, declared);
+    PLUGIN_FACTS.with(|memo| {
+        let mut memo = memo.borrow_mut();
+        memo.insert(
+            id,
+            PluginFactsMemo {
+                revision: item.revision(),
+                generation,
+                text_len,
+                facts: facts.clone(),
+            },
+        );
+        while memo.len() > MAX_PLUGIN_FACT_MEMO {
+            memo.pop_first();
+        }
+    });
+    facts
+}
+
+fn derive_declared_facts(
+    item: &TranscriptItem,
+    tool: Option<&str>,
+    declared: &[PluginFactDeclaration],
+) -> BTreeMap<String, FactValue> {
+    let (schema, payload) = match item.kind() {
+        TranscriptItemKind::ToolContribution { contribution, .. } => (
+            Some(contribution.schema.as_str()),
+            Some(&contribution.payload),
+        ),
+        _ => (None, None),
+    };
+    let applicable: Vec<&PluginFactDeclaration> = declared
+        .iter()
+        .filter(|fact| {
+            fact.tool
+                .as_deref()
+                .is_none_or(|expected| Some(expected) == tool)
+                && fact
+                    .schema
+                    .as_deref()
+                    .is_none_or(|expected| Some(expected) == schema)
+        })
+        .take(MAX_PLUGIN_FACTS)
+        .collect();
+    let argument_fields: Vec<&str> = applicable
+        .iter()
+        .filter_map(|fact| fact.argument.as_deref())
+        .collect();
+    let arguments = if argument_fields.is_empty() {
+        BTreeMap::new()
+    } else {
+        tool_arguments(item)
+            .map(|arguments| extract_argument_values(arguments, &argument_fields))
+            .unwrap_or_default()
+    };
+    applicable
+        .into_iter()
+        .filter_map(|fact| {
+            let value = match (&fact.argument, &fact.payload) {
+                (Some(field), _) => arguments.get(field.as_str()),
+                (None, Some(field)) => payload.and_then(|payload| payload.get(field)),
+                (None, None) => None,
+            }?;
+            Some((fact.name.clone(), fact_value(value, fact.value_type)?))
+        })
+        .collect()
+}
+
+/// A JSON `value` as a fact of `value_type`: booleans as `bool`; integers,
+/// and array or object lengths, as `int`; strings as one bounded line.
+fn fact_value(value: &serde_json::Value, value_type: FactType) -> Option<FactValue> {
+    use serde_json::Value;
+    let length = |len: usize| i64::try_from(len).ok().map(FactValue::Int);
+    match (value_type, value) {
+        (FactType::Bool, Value::Bool(value)) => Some(FactValue::Bool(*value)),
+        (FactType::Int, Value::Number(number)) => number.as_i64().map(FactValue::Int),
+        (FactType::Int, Value::Array(values)) => length(values.len()),
+        (FactType::Int, Value::Object(values)) => length(values.len()),
+        (FactType::String, Value::String(text)) => {
+            bcode_plugin_sdk::tui_visual::bounded_optional_line(
+                Some(text),
+                MAX_PLUGIN_FACT_TEXT_BYTES,
+            )
+            .map(FactValue::Text)
+        }
+        _ => None,
+    }
+}
+
+/// Values of the top-level `fields` of the JSON object `arguments`.
+///
+/// Other values are skipped without being materialized. Documents over
+/// [`MAX_TARGET_ARGUMENT_BYTES`], non-objects, and invalid JSON yield none.
+fn extract_argument_values<'f>(
+    arguments: &str,
+    fields: &[&'f str],
+) -> BTreeMap<&'f str, serde_json::Value> {
+    use serde::de::{DeserializeSeed, IgnoredAny, MapAccess, Visitor};
+
+    struct Fields<'a, 'f>(&'a [&'f str]);
+
+    impl<'de, 'f> DeserializeSeed<'de> for &Fields<'_, 'f> {
+        type Value = BTreeMap<&'f str, serde_json::Value>;
+
+        fn deserialize<D: serde::Deserializer<'de>>(
+            self,
+            deserializer: D,
+        ) -> Result<Self::Value, D::Error> {
+            deserializer.deserialize_map(self)
+        }
+    }
+
+    impl<'de, 'f> Visitor<'de> for &Fields<'_, 'f> {
+        type Value = BTreeMap<&'f str, serde_json::Value>;
+
+        fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+            formatter.write_str("a tool arguments object")
+        }
+
+        fn visit_map<A: MapAccess<'de>>(self, mut map: A) -> Result<Self::Value, A::Error> {
+            let mut found = BTreeMap::new();
+            while let Some(key) = map.next_key::<std::borrow::Cow<'de, str>>()? {
+                match self.0.iter().find(|field| **field == key) {
+                    Some(field) => {
+                        found.insert(*field, map.next_value::<serde_json::Value>()?);
+                    }
+                    None => {
+                        map.next_value::<IgnoredAny>()?;
+                    }
+                }
+            }
+            Ok(found)
+        }
+    }
+
+    if arguments.len() > MAX_TARGET_ARGUMENT_BYTES {
+        return BTreeMap::new();
+    }
+    let mut deserializer = serde_json::Deserializer::from_str(arguments);
+    (&Fields(fields))
+        .deserialize(&mut deserializer)
+        .unwrap_or_default()
+}
+
 /// Raw tool arguments of `item`, when it carries them.
 fn tool_arguments(item: &TranscriptItem) -> Option<&str> {
     match item.kind() {
@@ -1169,6 +1437,139 @@ mod tests {
         let mut state = StructureState::default();
         state.set_layers(&[theme_layer(rules)]);
         state
+    }
+
+    fn git_contribution(producer: &str, payload: serde_json::Value) -> TranscriptItem {
+        TranscriptItem::with_kind(
+            "Tool presentation",
+            "visual".to_owned(),
+            false,
+            TranscriptItemKind::ToolContribution {
+                contribution: Box::new(bcode_session_models::ToolContributionEvent {
+                    invocation_id: "call-1".to_owned(),
+                    contribution_id: "result".to_owned(),
+                    sequence: 1,
+                    producer_id: producer.to_owned(),
+                    schema: "bcode.git.clone_result".to_owned(),
+                    schema_version: 1,
+                    operation: bcode_session_models::ToolContributionOperation::Upsert,
+                    persistence: bcode_session_models::ToolContributionPersistence::Durable,
+                    artifact: None,
+                    payload,
+                }),
+                placement: bcode_session_models::ToolContributionPlacement::Result,
+                invocation: None,
+            },
+        )
+    }
+
+    fn git_declarations() -> BTreeMap<String, PluginPresentationDeclaration> {
+        let declaration: PluginPresentationDeclaration = toml::from_str(
+            r#"
+            [[facts]]
+            name = "bcode.git.already_exists"
+            type = "bool"
+            schema = "bcode.git.clone_result"
+            payload = "already_exists"
+
+            [[facts]]
+            name = "bcode.git.files"
+            type = "int"
+            payload = "files"
+
+            [[facts]]
+            name = "bcode.git.repo"
+            type = "string"
+            payload = "repo"
+
+            [[properties]]
+            name = "bcode.git.show_destination"
+            type = "bool"
+            default = true
+            "#,
+        )
+        .unwrap();
+        BTreeMap::from([(
+            "bcode.git".to_owned(),
+            declaration.effective("bcode.git", true),
+        )])
+    }
+
+    #[test]
+    fn plugin_facts_and_properties_apply_only_to_their_producers_units() {
+        let declarations = git_declarations();
+        let mut layers = bcode_plugin::presentation::presentation_rule_layers(&declarations);
+        layers.push(theme_layer(
+            r#"
+            [[rules]]
+            match = { plugin = { "bcode.git.files" = { gt = 2 } } }
+            set = { disclosure = "collapsed", plugin = { "bcode.git.show_destination" = false } }
+            "#,
+        ));
+        let mut state = StructureState::default();
+        state.set_layers(&layers);
+        assert!(state.set_plugin_presentation(&declarations));
+        assert!(!state.set_plugin_presentation(&declarations), "unchanged");
+        assert!(state.diagnostics().is_empty(), "{:?}", state.diagnostics());
+
+        let payload = serde_json::json!({
+            "already_exists": true,
+            "files": ["a", "b", "c"],
+            "repo": "bcode\nsecond line",
+        });
+        let git = git_contribution("bcode.git", payload.clone());
+        let foreign = git_contribution("bcode.other", payload);
+        let snapshot = state.snapshot();
+        let facts = snapshot.facts(&git).unwrap();
+        assert_eq!(
+            facts.plugin,
+            BTreeMap::from([
+                ("bcode.git.already_exists".to_owned(), FactValue::Bool(true)),
+                ("bcode.git.files".to_owned(), FactValue::Int(3)),
+                (
+                    "bcode.git.repo".to_owned(),
+                    FactValue::Text("bcode".to_owned())
+                ),
+            ])
+        );
+        assert_eq!(snapshot.facts(&foreign).unwrap().plugin, BTreeMap::new());
+
+        let presentation = snapshot.presentation(&git).unwrap();
+        assert_eq!(presentation.disclosure, Disclosure::Collapsed);
+        assert_eq!(
+            presentation.plugin,
+            BTreeMap::from([(
+                "bcode.git.show_destination".to_owned(),
+                FactValue::Bool(false)
+            )])
+        );
+        let foreign = snapshot.presentation(&foreign).unwrap();
+        assert_eq!(foreign.disclosure, Disclosure::Expanded);
+        assert_eq!(foreign.plugin, BTreeMap::new());
+
+        // Below the threshold the manifest default applies, and explain
+        // attributes it to the plugin's defaults layer.
+        let few = git_contribution("bcode.git", serde_json::json!({ "files": [] }));
+        let explained = state.explain(&few).unwrap();
+        assert_eq!(
+            explained.presentation.plugin["bcode.git.show_destination"],
+            FactValue::Bool(true)
+        );
+        assert!(explained.origins.iter().any(|origin| {
+            origin.property == "bcode.git.show_destination"
+                && origin.source == LayerSource::Plugin("bcode.git".to_owned())
+        }));
+
+        // Values that violate a declaration are ignored with a warning.
+        layers.push(theme_layer(
+            "[[rules]]\nset = { plugin = { \"bcode.git.show_destination\" = 3 } }",
+        ));
+        state.set_layers(&layers);
+        assert_eq!(state.diagnostics().len(), 1, "{:?}", state.diagnostics());
+        assert_eq!(
+            state.snapshot().presentation(&few).unwrap().plugin["bcode.git.show_destination"],
+            FactValue::Bool(true)
+        );
     }
 
     #[test]

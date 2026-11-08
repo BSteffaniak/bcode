@@ -3,15 +3,22 @@
 //! Explain resolves structural presentation for one described unit exactly as
 //! the TUI does: host defaults, plugin manifest default rules, the configured
 //! theme and profile layers, then declarative `[[presentation.rules]]`, then
-//! interactive user-state rules, compiled with the host section registry.
+//! interactive user-state rules, compiled with the host section registry and
+//! the facts and properties the plugins declare. Plugin facts given on the
+//! command line (`bcode.git.files=12`) are kept only on units their declaring
+//! plugin produced, as the TUI derives them.
 //!
 //! Plugin layers come from the manifests of the enabled bundled and installed
-//! plugins, read without loading any plugin library.
+//! plugins, read without loading any plugin library. Plugins the host's
+//! pre-load checks reject ([`bcode_plugin::selected_plugin_manifests`]) are
+//! reported as skipped instead; a library that passes those checks but fails
+//! when opened still shows its layer, since only loading detects that.
 
 use std::path::{Path, PathBuf};
 
 use bcode_presentation_policy::models::{
-    DurationBucket, LayerSource, PresentationRule, ResolvedPresentation, RuleLayer, SizeBucket,
+    DurationBucket, FactType, FactValue, LayerSource, MAX_PLUGIN_FACT_TEXT_BYTES,
+    PluginPresentationSchemas, PresentationRule, ResolvedPresentation, RuleLayer, SizeBucket,
     TurnRecency, UnitFacts, UnitKind, UnitStatus,
 };
 use bcode_presentation_policy::{
@@ -60,6 +67,8 @@ pub enum FactArg {
     Target(String),
     Duration(DurationBucket),
     LastInTurn(bool),
+    /// A plugin-declared fact, `<plugin id>.<key>=<value>`.
+    Plugin(String, FactValue),
 }
 
 /// Parse one `key=value` fact; used as the clap value parser.
@@ -68,6 +77,10 @@ pub enum FactArg {
 ///
 /// Returns a message for a missing `=`, an unknown key, or a value that is
 /// not valid for its key.
+///
+/// A namespaced key (`bcode.git.files=12`) is a plugin-declared fact; its
+/// value is `true`/`false`, an integer, or one line of text, and is
+/// interpreted by the fact's declared type when explaining.
 pub fn parse_fact_arg(argument: &str) -> Result<FactArg, String> {
     let (key, value) = argument
         .split_once('=')
@@ -96,13 +109,77 @@ pub fn parse_fact_arg(argument: &str) -> Result<FactArg, String> {
             Err(_) => parse_named(key, value)?,
         }),
         "last_in_turn" => FactArg::LastInTurn(parse_bool(key, value)?),
+        _ if key.contains('.') => FactArg::Plugin(key.to_owned(), parse_plugin_fact(key, value)?),
         _ => {
             return Err(format!(
-                "unknown fact {key:?}; expected one of: {}",
+                "unknown fact {key:?}; expected one of: {}, or a plugin fact \
+                 <plugin id>.<key>",
                 FACT_KEYS.join(", ")
             ));
         }
     })
+}
+
+/// A plugin fact value: a bool, an integer, or else one line of text.
+fn parse_plugin_fact(key: &str, value: &str) -> Result<FactValue, String> {
+    if value.is_empty() || value.contains(['\n', '\r']) || value.len() > MAX_PLUGIN_FACT_TEXT_BYTES
+    {
+        return Err(format!(
+            "{key} must be one non-empty line of at most {MAX_PLUGIN_FACT_TEXT_BYTES} bytes"
+        ));
+    }
+    Ok(match value {
+        "true" => FactValue::Bool(true),
+        "false" => FactValue::Bool(false),
+        _ => value
+            .parse()
+            .map_or_else(|_| FactValue::Text(value.to_owned()), FactValue::Int),
+    })
+}
+
+/// `facts` with their plugin facts as the TUI would derive them under
+/// `schemas`, plus a warning for each one dropped or unknown.
+///
+/// A declared fact is kept only when the unit's producer is its declaring
+/// plugin, and only with a value of its declared type (a `string` fact also
+/// takes values that parsed as bool or integer). Undeclared facts are kept so
+/// rules can still be tried against them.
+fn plugin_facts_for(
+    mut facts: UnitFacts,
+    schemas: &PluginPresentationSchemas,
+) -> (UnitFacts, Vec<String>) {
+    let mut warnings = Vec::new();
+    let producer = facts.producer.clone();
+    facts.plugin = std::mem::take(&mut facts.plugin)
+        .into_iter()
+        .filter_map(|(name, value)| {
+            let Some(schema) = schemas.facts.get(&name) else {
+                warnings.push(format!("unknown plugin fact {name:?}"));
+                return Some((name, value));
+            };
+            if producer.as_deref() != Some(schema.plugin.as_str()) {
+                warnings.push(format!(
+                    "plugin fact {name:?} ignored: only units produced by {} carry it",
+                    schema.plugin
+                ));
+                return None;
+            }
+            let value = match (schema.value_type, value) {
+                (FactType::String, FactValue::Bool(value)) => FactValue::Text(value.to_string()),
+                (FactType::String, FactValue::Int(value)) => FactValue::Text(value.to_string()),
+                (_, value) => value,
+            };
+            if schema.value_type.admits(&value) {
+                Some((name, value))
+            } else {
+                warnings.push(format!(
+                    "plugin fact {name:?} ignored: {value:?} does not have its declared type"
+                ));
+                None
+            }
+        })
+        .collect();
+    (facts, warnings)
 }
 
 fn non_empty(key: &str, value: &str) -> Result<String, String> {
@@ -159,6 +236,9 @@ pub fn unit_facts(arguments: &[FactArg]) -> UnitFacts {
             FactArg::Target(target) => facts.target = Some(target),
             FactArg::Duration(duration) => facts.duration = Some(duration),
             FactArg::LastInTurn(last) => facts.last_in_turn = Some(last),
+            FactArg::Plugin(name, value) => {
+                facts.plugin.insert(name, value);
+            }
         }
     }
     facts
@@ -180,6 +260,11 @@ pub struct ExplainInputs {
     pub roots: Vec<ThemeDiscoveryRoot>,
     /// Plugin manifest default rule layers (see [`plugin_rule_layers`]).
     pub plugin_layers: Vec<RuleLayer>,
+    /// Facts and properties those plugins declare, registered with the
+    /// policy as the TUI registers them.
+    pub plugin_schemas: PluginPresentationSchemas,
+    /// Selected plugins the host's pre-load checks exclude.
+    pub skipped_plugins: Vec<ExplainSkippedPlugin>,
     /// Why plugin manifests or declarations were skipped.
     pub plugin_warnings: Vec<String>,
     /// Declarative `[[presentation.rules]]`.
@@ -217,26 +302,50 @@ pub fn theme_selection(
 /// flood the output.
 const MAX_PLUGIN_WARNINGS: usize = 32;
 
+/// A selected plugin whose layer explain omits because the host's pre-load
+/// checks reject it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct ExplainSkippedPlugin {
+    /// Plugin id.
+    pub plugin: String,
+    /// Why the host would not load it.
+    pub reason: String,
+}
+
+/// Plugin rule layers explain stacks, with what was left out.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct PluginRuleLayers {
+    /// Manifest default rule layers of the plugins that pass pre-load checks.
+    pub layers: Vec<RuleLayer>,
+    /// Facts and properties those plugins declare.
+    pub schemas: PluginPresentationSchemas,
+    /// Selected plugins the pre-load checks exclude (bounded).
+    pub skipped: Vec<ExplainSkippedPlugin>,
+    /// Warnings for manifests or declaration entries that were skipped
+    /// (bounded).
+    pub warnings: Vec<String>,
+}
+
 /// Plugin manifest default rule layers for the plugins `selection` enables,
 /// as the TUI stacks them, read from manifests only.
 ///
 /// Static registrations take precedence over `discovered` plugins with the
-/// same id. No plugin library is loaded, so a discovered plugin whose library
-/// would fail to load still contributes its layer. Returns the layers and the
-/// (bounded) warnings for manifests or declaration entries that were skipped.
+/// same id. No plugin library is loaded: plugins the host's pre-load checks
+/// reject are reported as skipped, but a library that passes them and still
+/// fails when opened keeps its layer.
 #[must_use]
 pub fn plugin_rule_layers(
     selection: &bcode_plugin::PluginSelection,
     discovered: Vec<bcode_plugin::RegisteredPlugin>,
     static_plugins: &[bcode_plugin::StaticBundledPlugin],
-) -> (Vec<RuleLayer>, Vec<String>) {
+) -> PluginRuleLayers {
     let mut warnings = Vec::new();
-    let manifests = bcode_plugin::selected_plugin_manifests(selection, discovered, static_plugins)
+    let selected = bcode_plugin::selected_plugin_manifests(selection, discovered, static_plugins)
         .unwrap_or_else(|error| {
             warnings.push(format!("plugin manifests ignored: {error}"));
-            Vec::new()
+            bcode_plugin::SelectedPluginManifests::default()
         });
-    let declarations = bcode_plugin::presentation_declarations(&manifests);
+    let declarations = bcode_plugin::presentation_declarations(&selected.manifests);
     warnings.extend(declarations.iter().flat_map(|(plugin_id, declaration)| {
         declaration
             .diagnostics
@@ -244,15 +353,25 @@ pub fn plugin_rule_layers(
             .map(move |diagnostic| format!("plugin {plugin_id}: {diagnostic}"))
     }));
     warnings.truncate(MAX_PLUGIN_WARNINGS);
-    (
-        bcode_plugin::presentation::presentation_rule_layers(&declarations),
+    PluginRuleLayers {
+        layers: bcode_plugin::presentation::presentation_rule_layers(&declarations),
+        schemas: bcode_plugin::presentation::presentation_schemas(&declarations),
+        skipped: selected
+            .skipped
+            .into_iter()
+            .take(MAX_PLUGIN_WARNINGS)
+            .map(|skipped| ExplainSkippedPlugin {
+                plugin: skipped.plugin_id,
+                reason: skipped.reason,
+            })
+            .collect(),
         warnings,
-    )
+    }
 }
 
 /// Plugin layers for the configured plugin selection: bundled registrations
 /// plus manifests discovered in the default plugin roots.
-fn configured_plugin_layers(config: &bcode_config::BcodeConfig) -> (Vec<RuleLayer>, Vec<String>) {
+fn configured_plugin_layers(config: &bcode_config::BcodeConfig) -> PluginRuleLayers {
     let (discovered, discovery_warning) = match bcode_plugin::discover_plugins() {
         Ok(discovered) => (discovered, None),
         Err(error) => (
@@ -260,16 +379,16 @@ fn configured_plugin_layers(config: &bcode_config::BcodeConfig) -> (Vec<RuleLaye
             Some(format!("installed plugin discovery failed: {error}")),
         ),
     };
-    let (layers, mut warnings) = plugin_rule_layers(
+    let mut layers = plugin_rule_layers(
         &crate::plugin_selection_for_config(config),
         discovered,
         &crate::static_bundled_plugins(),
     );
     if let Some(warning) = discovery_warning {
-        warnings.insert(0, warning);
-        warnings.truncate(MAX_PLUGIN_WARNINGS);
+        layers.warnings.insert(0, warning);
+        layers.warnings.truncate(MAX_PLUGIN_WARNINGS);
     }
-    (layers, warnings)
+    layers
 }
 
 fn project_root() -> PathBuf {
@@ -303,15 +422,17 @@ pub fn load_explain_inputs(
         Ok(rules) => (rules, None),
         Err(error) => (Vec::new(), Some(error.to_string())),
     };
-    let (plugin_layers, plugin_warnings) = configured_plugin_layers(&config);
+    let plugins = configured_plugin_layers(&config);
     Ok(ExplainInputs {
         theme,
         profile,
         overlays,
         variant: bcode_tui::theme::resolve_variant_for_config(config.tui.theme.variant),
         roots: configured_roots(&config, &project_root()),
-        plugin_layers,
-        plugin_warnings,
+        plugin_layers: plugins.layers,
+        plugin_schemas: plugins.schemas,
+        skipped_plugins: plugins.skipped,
+        plugin_warnings: plugins.warnings,
         // Same Config layer as the TUI: the legacy `tui.thinking` mapping
         // first, then declarative `[[presentation.rules]]`.
         config_rules: config
@@ -337,6 +458,9 @@ pub struct ExplainReport {
     pub facts: UnitFacts,
     /// Rule layers, lowest precedence first.
     pub layers: Vec<ExplainLayer>,
+    /// Selected plugins whose layers are omitted because the host's pre-load
+    /// checks reject them.
+    pub skipped_plugins: Vec<ExplainSkippedPlugin>,
     /// Every resolved property and the rule that set it.
     pub properties: Vec<ExplainProperty>,
     /// The final presentation, after the visibility floor.
@@ -452,8 +576,10 @@ pub fn explain(inputs: &ExplainInputs, facts: UnitFacts) -> Result<ExplainReport
         &inputs.config_rules,
         &inputs.user_rules,
     );
-    let (policy, diagnostics) =
-        CompiledPolicy::compile(&layers, &PolicyRegistry::with_host_parts());
+    let registry = PolicyRegistry::with_host_parts().with_plugin_schemas(&inputs.plugin_schemas);
+    let (policy, diagnostics) = CompiledPolicy::compile(&layers, &registry);
+    let (facts, fact_warnings) = plugin_facts_for(facts, &inputs.plugin_schemas);
+    warnings.extend(fact_warnings);
     let explained = policy.explain(&facts);
     let properties = property_rows(&explained.presentation, &explained.origins);
     Ok(ExplainReport {
@@ -472,6 +598,7 @@ pub fn explain(inputs: &ExplainInputs, facts: UnitFacts) -> Result<ExplainReport
                 rules: layer.rules.len(),
             })
             .collect(),
+        skipped_plugins: inputs.skipped_plugins.clone(),
         properties,
         presentation: explained.presentation,
         floor: explained.floor,
@@ -533,6 +660,13 @@ pub fn write_explain_report(
             "layer\t{}\t{} rule(s)",
             layer_label(&layer.source),
             layer.rules
+        )?;
+    }
+    for skipped in &report.skipped_plugins {
+        writeln!(
+            writer,
+            "skipped\tplugin:{}\t{}",
+            skipped.plugin, skipped.reason
         )?;
     }
     for property in &report.properties {
@@ -675,6 +809,8 @@ mod tests {
             variant: ResolvedThemeVariant::Dark,
             roots,
             plugin_layers: Vec::new(),
+            plugin_schemas: PluginPresentationSchemas::default(),
+            skipped_plugins: Vec::new(),
             plugin_warnings: Vec::new(),
             config_rules: Vec::new(),
             user_rules: Vec::new(),
@@ -746,8 +882,9 @@ mod tests {
         );
     }
 
-    #[test]
-    fn plugin_manifest_rules_are_explained_as_plugin_layers() {
+    /// Explain inputs with plugin layers from a bundled plugin, an installed
+    /// plugin, and an installed plugin whose library file is missing.
+    fn plugin_inputs() -> (tempfile::TempDir, ExplainInputs) {
         /// Never activated: explain reads manifests only.
         #[derive(Default)]
         struct ManifestOnly;
@@ -766,14 +903,21 @@ type = "native"
 abi_version = 1
 library = "libbundled.dylib"
 "#;
+        let abi = format!(
+            "abi_version = {}",
+            bcode_plugin_sdk::CURRENT_PLUGIN_ABI_VERSION
+        );
+        // Only the registration's manifest is read; the vtable is never used.
+        let bundled_manifest: &'static str =
+            Box::leak(BUNDLED.replace("abi_version = 1", &abi).into_boxed_str());
         let bundled = [bcode_plugin::StaticBundledPlugin::new(
-            BUNDLED,
+            bundled_manifest,
             bcode_plugin_sdk::static_plugin_vtable!(ManifestOnly, BUNDLED),
         )];
-        let installed = bcode_plugin::RegisteredPlugin {
-            manifest_path: PathBuf::from("plugins/installed/bcode-plugin.toml"),
-            manifest: toml::from_str(
-                r#"
+        // An existing file stands in for the installed library; nothing is
+        // opened.
+        let present_library = Path::new(env!("CARGO_MANIFEST_DIR")).join("Cargo.toml");
+        let installed_manifest = r#"
 id = "test.installed"
 name = "Installed"
 version = "0.0.1"
@@ -789,19 +933,82 @@ set = { spacing = { before = 2, after = 2 } }
 [runtime]
 type = "native"
 abi_version = 1
-library = "libmissing.dylib"
-"#,
+library = "LIBRARY"
+"#
+        .replace("abi_version = 1", &abi);
+        let registered = |id: &str, library: &str| bcode_plugin::RegisteredPlugin {
+            manifest_path: PathBuf::from(format!("plugins/{id}/bcode-plugin.toml")),
+            manifest: toml::from_str(
+                &installed_manifest
+                    .replace("test.installed", id)
+                    .replace("LIBRARY", library),
             )
             .expect("installed manifest"),
         };
-        let (plugin_layers, plugin_warnings) = plugin_rule_layers(
+        let plugins = plugin_rule_layers(
             &bcode_plugin::PluginSelection::all_enabled(),
-            vec![installed],
+            vec![
+                registered(
+                    "test.installed",
+                    present_library.to_str().expect("utf-8 path"),
+                ),
+                // Rejected before load: its library file does not exist.
+                registered("test.broken", "libmissing.dylib"),
+            ],
             &bundled,
         );
-        let (_directory, mut inputs) = inputs(None);
-        inputs.plugin_layers = plugin_layers;
-        inputs.plugin_warnings = plugin_warnings;
+        let (directory, mut inputs) = inputs(None);
+        inputs.plugin_layers = plugins.layers;
+        inputs.plugin_schemas = plugins.schemas;
+        inputs.skipped_plugins = plugins.skipped;
+        inputs.plugin_warnings = plugins.warnings;
+        (directory, inputs)
+    }
+
+    #[test]
+    fn plugins_failing_preload_checks_are_listed_as_skipped() {
+        let (_directory, inputs) = plugin_inputs();
+        assert_eq!(
+            inputs
+                .skipped_plugins
+                .iter()
+                .map(|skipped| skipped.plugin.as_str())
+                .collect::<Vec<_>>(),
+            ["test.broken"]
+        );
+        assert!(
+            inputs.skipped_plugins[0].reason.contains("does not exist"),
+            "{:?}",
+            inputs.skipped_plugins
+        );
+        let report = explain(&inputs, UnitFacts::default()).expect("explain");
+        assert!(
+            !report
+                .layers
+                .iter()
+                .any(|layer| layer.source == LayerSource::Plugin("test.broken".to_owned())),
+            "{:?}",
+            report.layers
+        );
+        assert_eq!(report.skipped_plugins, inputs.skipped_plugins);
+        let mut text = Vec::new();
+        write_explain_report(&report, false, &mut text).expect("text");
+        let text = String::from_utf8(text).expect("utf8");
+        assert!(
+            text.lines()
+                .any(|line| line.starts_with("skipped\tplugin:test.broken\t")
+                    && line.contains("does not exist")),
+            "{text}"
+        );
+        let mut json = Vec::new();
+        write_explain_report(&report, true, &mut json).expect("json");
+        let value: serde_json::Value = serde_json::from_slice(&json).expect("valid json");
+        assert_eq!(value["skipped_plugins"][0]["plugin"], "test.broken");
+    }
+
+    #[test]
+    fn plugin_manifest_rules_are_explained_as_plugin_layers() {
+        let (_directory, inputs) = plugin_inputs();
         let own = |producer: &str| UnitFacts {
             kind: Some(UnitKind::Tool),
             producer: Some(producer.to_owned()),
@@ -858,6 +1065,195 @@ library = "libmissing.dylib"
                 .map(|origin| &origin.source),
             Some(&plugin("test.installed"))
         );
+    }
+
+    /// Explain inputs with a manifest-only bundled plugin `test.git` that
+    /// declares an int fact, a string fact, and a bool property.
+    fn declared_plugin_inputs() -> (tempfile::TempDir, ExplainInputs) {
+        /// Never activated: explain reads manifests only.
+        #[derive(Default)]
+        struct ManifestOnly;
+        impl bcode_plugin_sdk::RustPlugin for ManifestOnly {}
+        const MANIFEST: &str = r#"
+id = "test.git"
+name = "Git"
+version = "0.0.1"
+
+[[presentation.facts]]
+name = "test.git.files"
+type = "int"
+payload = "files"
+
+[[presentation.facts]]
+name = "test.git.branch"
+type = "string"
+argument = "branch"
+
+[[presentation.properties]]
+name = "test.git.show_destination"
+type = "bool"
+default = true
+
+[runtime]
+type = "native"
+abi_version = 1
+library = "libgit.dylib"
+"#;
+        let manifest: &'static str = Box::leak(
+            MANIFEST
+                .replace(
+                    "abi_version = 1",
+                    &format!(
+                        "abi_version = {}",
+                        bcode_plugin_sdk::CURRENT_PLUGIN_ABI_VERSION
+                    ),
+                )
+                .into_boxed_str(),
+        );
+        let bundled = [bcode_plugin::StaticBundledPlugin::new(
+            manifest,
+            bcode_plugin_sdk::static_plugin_vtable!(ManifestOnly, MANIFEST),
+        )];
+        let plugins = plugin_rule_layers(
+            &bcode_plugin::PluginSelection::all_enabled(),
+            Vec::new(),
+            &bundled,
+        );
+        let (directory, mut inputs) = inputs(None);
+        inputs.plugin_layers = plugins.layers;
+        inputs.plugin_schemas = plugins.schemas;
+        inputs.config_rules = rules(
+            r#"
+            [[rules]]
+            match = { plugin = { "test.git.files" = { gt = 10 } } }
+            set = { disclosure = "collapsed", plugin = { "test.git.show_destination" = false } }
+
+            [[rules]]
+            match = { plugin = { "test.git.branch" = "123" } }
+            set = { detail = "minimal" }
+            "#,
+        );
+        (directory, inputs)
+    }
+
+    #[test]
+    fn plugin_facts_and_properties_are_explained_with_their_declarations() {
+        let (_directory, inputs) = declared_plugin_inputs();
+        let facts = |arguments: &[&str]| {
+            unit_facts(
+                &arguments
+                    .iter()
+                    .map(|argument| parse_fact_arg(argument).expect("fact"))
+                    .collect::<Vec<_>>(),
+            )
+        };
+        let show_destination = |report: &ExplainReport| {
+            let row = property(report, "test.git.show_destination");
+            (
+                row.value.clone(),
+                row.origin.as_ref().map(|origin| origin.source.clone()),
+            )
+        };
+
+        // The declared property is registered: no unknown-property
+        // diagnostic, and its manifest default applies to the plugin's units.
+        let report = explain(&inputs, facts(&["producer=test.git"])).expect("explain");
+        assert!(report.diagnostics.is_empty(), "{:?}", report.diagnostics);
+        assert_eq!(
+            show_destination(&report),
+            (
+                serde_json::json!(true),
+                Some(LayerSource::Plugin("test.git".to_owned()))
+            )
+        );
+
+        // A declared fact on the plugin's own unit matches the range rule,
+        // and a string fact takes a value that looks like an integer.
+        let report = explain(
+            &inputs,
+            facts(&[
+                "producer=test.git",
+                "test.git.files=11",
+                "test.git.branch=123",
+            ]),
+        )
+        .expect("explain");
+        assert_eq!(
+            show_destination(&report),
+            (serde_json::json!(false), Some(LayerSource::Config))
+        );
+        assert_eq!(report.presentation.disclosure, Disclosure::Collapsed);
+        assert_eq!(
+            property(&report, "detail").value,
+            serde_json::json!("minimal")
+        );
+        assert!(report.warnings.is_empty(), "{:?}", report.warnings);
+
+        // Another producer's unit never carries the fact or the property.
+        let report = explain(
+            &inputs,
+            facts(&["producer=test.other", "test.git.files=11"]),
+        )
+        .expect("explain");
+        assert_eq!(report.presentation.disclosure, Disclosure::Expanded);
+        assert!(report.presentation.plugin.is_empty());
+        assert!(report.facts.plugin.is_empty());
+        assert!(
+            report
+                .warnings
+                .iter()
+                .any(|warning| warning.contains("only units produced by test.git")),
+            "{:?}",
+            report.warnings
+        );
+
+        // A value of the wrong type is dropped with a warning; unknown facts
+        // are kept and reported.
+        let report = explain(
+            &inputs,
+            facts(&[
+                "producer=test.git",
+                "test.git.files=many",
+                "test.git.extra=1",
+            ]),
+        )
+        .expect("explain");
+        assert_eq!(
+            report.facts.plugin,
+            std::collections::BTreeMap::from([("test.git.extra".to_owned(), FactValue::Int(1))])
+        );
+        assert_eq!(report.warnings.len(), 2, "{:?}", report.warnings);
+    }
+
+    #[test]
+    fn plugin_fact_arguments_parse_typed_values() {
+        assert_eq!(
+            parse_fact_arg("bcode.git.files=12"),
+            Ok(FactArg::Plugin(
+                "bcode.git.files".to_owned(),
+                FactValue::Int(12)
+            ))
+        );
+        assert_eq!(
+            parse_fact_arg("bcode.git.dirty=true"),
+            Ok(FactArg::Plugin(
+                "bcode.git.dirty".to_owned(),
+                FactValue::Bool(true)
+            ))
+        );
+        assert_eq!(
+            parse_fact_arg("bcode.git.repo=a=b"),
+            Ok(FactArg::Plugin(
+                "bcode.git.repo".to_owned(),
+                FactValue::Text("a=b".to_owned())
+            ))
+        );
+        assert!(parse_fact_arg("bcode.git.repo=").is_err());
+        let long = format!(
+            "bcode.git.repo={}",
+            "x".repeat(MAX_PLUGIN_FACT_TEXT_BYTES + 1)
+        );
+        assert!(parse_fact_arg(&long).is_err());
     }
 
     #[test]

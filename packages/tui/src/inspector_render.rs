@@ -6,26 +6,28 @@
 //! wrapping, scrollable [`TextViewComponent`]), so wrapping, clipping, and
 //! measurement stay in BMUX. The panel's hit region is the painted panel
 //! rectangle, registered above transcript regions so clicks on the panel never
-//! reach units underneath.
+//! reach units underneath. Painting records the body's terminal rectangle and
+//! resolved layout, and scrollbar clicks and drags route through BMUX's text
+//! view against exactly that geometry.
 
 use std::cell::Cell;
 
 use bmux_tui::chrome::BorderSet;
-use bmux_tui::component::{Component, Constraints, LayoutCx};
+use bmux_tui::component::{Component, Constraints, LayoutCx, LayoutId};
 use bmux_tui::composition::Surface;
 use bmux_tui::geometry::{Insets, Rect};
 use bmux_tui::hit::{HitRegion, HitRole};
 use bmux_tui::paint::{LocalRect, PaintCx};
 use bmux_tui::prelude::{Line, Span};
 use bmux_tui::style::Modifier;
-use bmux_tui_components::scroll_view::ScrollView;
+use bmux_tui_components::scroll_view::{ScrollView, ScrollViewState};
 use bmux_tui_components::scrollbar_layout::ScrollbarAxisLayoutMode;
 use bmux_tui_components::text_view::{TextViewComponent, TextViewPolicy, TextViewStyles};
 
 use crate::app::BmuxApp;
 use crate::inspector::{
-    INSPECTOR_HIT_ID, InspectorReport, bounded_text, disclosure_name, fact_rows, origin_label,
-    value_text,
+    INSPECTOR_HIT_ID, InspectorReport, PaintedInspectorBody, bounded_text, disclosure_name,
+    fact_rows, origin_label, value_text,
 };
 use crate::render::TuiTheme;
 
@@ -199,34 +201,50 @@ pub fn paint_inspector(
     theme: TuiTheme,
 ) -> Option<Rect> {
     let state = app.inspector_state()?;
-    let area = inspector_panel(app, body)?;
+    let Some(area) = inspector_panel(app, body) else {
+        state.record_painted(None);
+        return None;
+    };
     let report = app.inspector_report();
     let lines = report_lines(report.as_ref(), theme);
     let scroll = state.scroll_for(app.focused_disclosure_target());
     let component_theme = app.presented_theme().component_theme();
-    paint_panel(area, &lines, scroll, frame, theme, &component_theme);
+    let painted = paint_panel(area, &lines, scroll, frame, theme, &component_theme);
+    state.record_painted(painted);
     Some(area)
 }
 
+/// Stable identity of the inspector body text view.
+const BODY_ID: &str = "transcript.inspector.body";
+
+/// The inspector body text view: identity and scroll policy only. Painting
+/// adds styles; pointer routing uses it as-is against the painted layout, so
+/// both see the same scrollbar geometry.
+pub fn body_view<'a, 'state>(
+    lines: &'a [Line],
+    scroll: &'state Cell<ScrollViewState>,
+) -> TextViewComponent<'a, 'state> {
+    TextViewComponent::new(BODY_ID, lines, scroll).policy(
+        TextViewPolicy::scrollable().vertical_scrollbar(ScrollbarAxisLayoutMode::OverlayOnOverflow),
+    )
+}
+
+/// Paint the panel into `area`; returns the body text view's painted
+/// terminal rectangle and layout.
 fn paint_panel(
     area: Rect,
     lines: &[Line],
-    scroll: &Cell<bmux_tui_components::scroll_view::ScrollViewState>,
+    scroll: &Cell<ScrollViewState>,
     frame: &mut PaintCx<'_, '_>,
     theme: TuiTheme,
     component_theme: &bmux_tui_components::theme::ComponentTheme,
-) {
-    let view = TextViewComponent::new("transcript.inspector.body", lines, scroll)
-        .policy(
-            TextViewPolicy::scrollable()
-                .vertical_scrollbar(ScrollbarAxisLayoutMode::OverlayOnOverflow),
-        )
-        .styles(TextViewStyles {
-            text: theme.text,
-            empty: theme.muted,
-            background: theme.overlay,
-            scrollbar: TextViewStyles::default().scrollbar,
-        });
+) -> Option<PaintedInspectorBody> {
+    let view = body_view(lines, scroll).styles(TextViewStyles {
+        text: theme.text,
+        empty: theme.muted,
+        background: theme.overlay,
+        scrollbar: TextViewStyles::default().scrollbar,
+    });
     let viewport_id = view.viewport_id();
     let border =
         component_theme
@@ -254,13 +272,27 @@ fn paint_panel(
             .layer(INSPECTOR_HIT_LAYER)
             .role(HitRole::Scroll),
     );
+    let body_id = LayoutId::from(BODY_ID);
+    let body = layout.find_rect(&body_id)?;
+    let body_area = Rect::new(
+        area.x.saturating_add(body.x),
+        area.y.saturating_add(body.y),
+        body.width,
+        body.height,
+    );
+    Some(PaintedInspectorBody {
+        area: body_area,
+        layout: layout.find(&body_id)?.clone(),
+    })
 }
 
 #[cfg(test)]
 mod tests {
     use bcode_presentation_policy::models::{Disclosure, UnitFacts, UnitKind};
     use bmux_tui::buffer::Buffer;
+    use bmux_tui::event::{MouseButton, MouseEvent, MouseEventKind};
     use bmux_tui::frame::Frame;
+    use bmux_tui::geometry::Point;
 
     use super::*;
     use crate::inspector::InspectorState;
@@ -298,14 +330,16 @@ mod tests {
             let theme = TuiTheme::for_theme_id("terminal-native");
             let component_theme = bmux_tui_components::theme::ComponentTheme::default();
             let scroll = state.scroll_for(Some(&DisclosureTarget::Unit(7)));
-            paint_panel(
+            state.record_painted(paint_panel(
                 placement.area(),
                 lines,
                 scroll,
                 &mut cx,
                 theme,
                 &component_theme,
-            );
+            ));
+        } else {
+            state.record_painted(None);
         }
         let hits = frame.hits().regions().to_vec();
         (buffer, hits)
@@ -418,6 +452,222 @@ mod tests {
             .collect::<Vec<_>>()
             .join("\n");
         assert!(text.contains("in group:3"), "{text}");
+    }
+
+    fn press(kind: MouseEventKind, x: u16, y: u16) -> MouseEvent {
+        MouseEvent::new(kind, Point::new(x, y))
+    }
+
+    fn offset(state: &InspectorState) -> u64 {
+        state
+            .scroll_for(Some(&DisclosureTarget::Unit(7)))
+            .get()
+            .vertical_offset()
+    }
+
+    /// The painted body's scrollbar column, from BMUX's own resolution of
+    /// the painted body area.
+    fn scrollbar(state: &InspectorState) -> Option<Rect> {
+        let painted = state.painted_body_for_test()?;
+        let scroll = Cell::new(ScrollViewState::new());
+        body_view(&[], &scroll)
+            .scroll_view()
+            .scrollbar_area(painted.area)
+    }
+
+    fn long_lines(theme: TuiTheme) -> Vec<Line> {
+        let mut lines = report_lines(Some(&report("src/lib.rs")), theme);
+        lines.extend((0..60).map(|row| Line::from(format!("row {row}"))));
+        lines
+    }
+
+    #[test]
+    fn scrollbar_track_press_jumps_and_thumb_drag_scrolls() {
+        let theme = TuiTheme::for_theme_id("terminal-native");
+        let lines = long_lines(theme);
+        let state = InspectorState::default();
+        let area = Rect::new(4, 2, 40, 12);
+        let (_, hits) = paint(area, area, &lines, &state);
+        let track = scrollbar(&state).expect("overflowing body paints a scrollbar");
+        // The scrollbar lies under the inspector's painted hit region.
+        let map = hits
+            .iter()
+            .cloned()
+            .fold(bmux_tui::hit::HitMap::default(), |map, region| {
+                map.with_region(region)
+            });
+        for y in track.y..track.bottom() {
+            assert_eq!(
+                map.hit_test(Point::new(track.x, y))
+                    .map(|hit| hit.id().as_str().to_owned()),
+                Some(INSPECTOR_HIT_ID.to_owned())
+            );
+        }
+        let bottom = track.bottom() - 1;
+        // A press at the bottom of the track jumps to the end and drags.
+        assert!(state.handle_scrollbar_mouse(press(
+            MouseEventKind::Down(MouseButton::Left),
+            track.x,
+            bottom
+        )));
+        assert!(state.scrollbar_dragging());
+        let end = offset(&state);
+        assert!(end > 0);
+        // Dragging back to the top scrolls to the start, even outside the
+        // panel's columns.
+        assert!(state.handle_scrollbar_mouse(press(
+            MouseEventKind::Drag(MouseButton::Left),
+            0,
+            track.y
+        )));
+        assert_eq!(offset(&state), 0);
+        assert!(state.handle_scrollbar_mouse(press(
+            MouseEventKind::Up(MouseButton::Left),
+            0,
+            track.y
+        )));
+        assert!(!state.scrollbar_dragging());
+        // Without a drag, a drag event is not the scrollbar's.
+        assert!(!state.handle_scrollbar_mouse(press(
+            MouseEventKind::Drag(MouseButton::Left),
+            track.x,
+            bottom
+        )));
+        // A press on the text, not the track, is not taken.
+        assert!(!state.handle_scrollbar_mouse(press(
+            MouseEventKind::Down(MouseButton::Left),
+            track.x - 2,
+            bottom
+        )));
+        assert_eq!(offset(&state), 0);
+        // The jump target agrees with what painting then clamps to.
+        assert!(state.handle_scrollbar_mouse(press(
+            MouseEventKind::Down(MouseButton::Left),
+            track.x,
+            bottom
+        )));
+        let _ = paint(area, area, &lines, &state);
+        assert_eq!(offset(&state), end);
+    }
+
+    #[test]
+    fn tiny_panels_paint_no_draggable_scrollbar_and_never_panic() {
+        let theme = TuiTheme::for_theme_id("terminal-native");
+        let lines = long_lines(theme);
+        for height in 0..6 {
+            for width in [0, 1, 3, 5, 12] {
+                let state = InspectorState::default();
+                let area = Rect::new(1, 1, width, height);
+                let _ = paint(area, area, &lines, &state);
+                if inspector_placement(area).is_none() {
+                    assert!(state.painted_body_for_test().is_none());
+                }
+                for y in 0..=area.bottom() {
+                    for x in 0..=area.right() {
+                        let _ = state.handle_scrollbar_mouse(press(
+                            MouseEventKind::Down(MouseButton::Left),
+                            x,
+                            y,
+                        ));
+                        let _ = state.handle_scrollbar_mouse(press(
+                            MouseEventKind::Up(MouseButton::Left),
+                            x,
+                            y,
+                        ));
+                    }
+                }
+                // Whatever moved, painting clamps it to the content.
+                let _ = paint(area, area, &lines, &state);
+                assert!(!state.scrollbar_dragging(), "{width}x{height}");
+            }
+        }
+    }
+
+    #[test]
+    fn a_panel_that_stops_fitting_ends_the_drag_and_routes_nothing() {
+        let theme = TuiTheme::for_theme_id("terminal-native");
+        let lines = long_lines(theme);
+        let state = InspectorState::default();
+        let area = Rect::new(0, 0, 40, 12);
+        let _ = paint(area, area, &lines, &state);
+        let track = scrollbar(&state).expect("scrollbar");
+        assert!(state.handle_scrollbar_mouse(press(
+            MouseEventKind::Down(MouseButton::Left),
+            track.x,
+            track.y + 3
+        )));
+        assert!(state.scrollbar_dragging());
+        // The terminal shrinks below the minimum panel.
+        let tiny = Rect::new(0, 0, 2, 2);
+        let _ = paint(tiny, tiny, &lines, &state);
+        assert!(!state.scrollbar_dragging());
+        let before = offset(&state);
+        assert!(!state.handle_scrollbar_mouse(press(
+            MouseEventKind::Down(MouseButton::Left),
+            track.x,
+            track.y
+        )));
+        assert_eq!(offset(&state), before);
+    }
+
+    #[test]
+    fn closing_the_inspector_leaves_no_scrollbar_hits_or_drag() {
+        let (mut app, _) = crate::app::disclosure_focus_tests::focus_app(3);
+        assert!(app.enter_transcript_focus());
+        assert!(app.toggle_inspector());
+        let body = Rect::new(0, 0, 40, 6);
+        let theme = TuiTheme::for_theme_id("terminal-native");
+        let mut buffer = Buffer::empty(body);
+        let mut frame = Frame::new(&mut buffer);
+        let painted = paint_inspector(&app, body, &mut PaintCx::new(&mut frame), theme);
+        assert_eq!(
+            painted,
+            inspector_placement(body).map(InspectorPlacement::area)
+        );
+        let track = app
+            .inspector_state()
+            .and_then(|state| {
+                let painted = state.painted_body_for_test()?;
+                let scroll = Cell::new(ScrollViewState::new());
+                body_view(&[], &scroll)
+                    .scroll_view()
+                    .scrollbar_area(painted.area)
+            })
+            .expect("the report overflows a six-row panel");
+        assert!(app.inspector_scrollbar_mouse(press(
+            MouseEventKind::Down(MouseButton::Left),
+            track.x,
+            track.bottom() - 1
+        )));
+        assert!(app.inspector_scrollbar_dragging());
+        assert!(app.close_inspector());
+        assert!(!app.inspector_scrollbar_dragging());
+        assert!(!app.inspector_scrollbar_mouse(press(
+            MouseEventKind::Drag(MouseButton::Left),
+            track.x,
+            track.y
+        )));
+        // Painting while closed registers no inspector region.
+        let mut buffer = Buffer::empty(body);
+        let mut frame = Frame::new(&mut buffer);
+        assert_eq!(
+            paint_inspector(&app, body, &mut PaintCx::new(&mut frame), theme),
+            None
+        );
+        assert!(
+            frame
+                .hits()
+                .regions()
+                .iter()
+                .all(|region| region.id.as_str() != INSPECTOR_HIT_ID)
+        );
+        // Reopening starts without a drag or stale geometry.
+        assert!(app.toggle_inspector());
+        assert!(!app.inspector_scrollbar_mouse(press(
+            MouseEventKind::Down(MouseButton::Left),
+            track.x,
+            track.y
+        )));
     }
 
     #[test]

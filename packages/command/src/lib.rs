@@ -565,6 +565,30 @@ pub fn bundled_host_palette_commands() -> Vec<CommandContribution> {
             "Save the focused tool unit's disclosure as that tool's default in user state",
             "transcript",
         ),
+        CommandContribution::host_palette(
+            "transcript.focusUnits",
+            "Transcript: Focus Units",
+            "Enter or leave keyboard focus mode on transcript disclosure targets",
+            "transcript",
+        ),
+        CommandContribution::host_palette(
+            "tools.expandAll",
+            "Tools: Expand All",
+            "Expand every unit and group (the focused target in focus mode)",
+            "transcript",
+        ),
+        CommandContribution::host_palette(
+            "tools.collapseAll",
+            "Tools: Collapse All",
+            "Collapse every unit and group (the focused target in focus mode)",
+            "transcript",
+        ),
+        CommandContribution::host_palette(
+            "tools.resetDisclosure",
+            "Tools: Reset Disclosure",
+            "Drop manual disclosure toggles (under the focused target in focus mode)",
+            "transcript",
+        ),
     ]
 }
 
@@ -647,6 +671,10 @@ mod tests {
             "transcript.inspect",
             "transcript.cycleDetail",
             "transcript.makeDefault",
+            "transcript.focusUnits",
+            "tools.expandAll",
+            "tools.collapseAll",
+            "tools.resetDisclosure",
         ] {
             assert!(bundled_host_palette_commands().iter().any(|contribution| {
                 contribution.id == route

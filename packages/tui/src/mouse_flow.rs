@@ -12,6 +12,27 @@ pub fn mouse_hit_id(hits: &bmux_tui::hit::HitMap, mouse: MouseEvent) -> Option<S
         .map(|hit| hit.id().as_str().to_owned())
 }
 
+/// Route a left-button press on the painted inspector panel, or the drag and
+/// release of a scrollbar drag that started there, to the inspector's
+/// scrollbar. Returns whether the scrollbar took the event; other events
+/// continue to selection and ordinary handling.
+pub fn handle_inspector_scrollbar_mouse(
+    hit_id: Option<&str>,
+    chat: &ActiveChat,
+    mouse: MouseEvent,
+) -> bool {
+    let routed = match mouse.kind {
+        MouseEventKind::Down(MouseButton::Left) => {
+            hit_id == Some(crate::inspector::INSPECTOR_HIT_ID)
+        }
+        MouseEventKind::Drag(MouseButton::Left) | MouseEventKind::Up(MouseButton::Left) => {
+            chat.app.inspector_scrollbar_dragging()
+        }
+        _ => false,
+    };
+    routed && chat.app.inspector_scrollbar_mouse(mouse)
+}
+
 /// Handle one non-modal mouse event that does not require daemon work.
 pub fn handle_non_permission_mouse(
     hit_id: Option<&str>,

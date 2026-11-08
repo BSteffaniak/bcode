@@ -26,7 +26,7 @@ impl bcode_plugin_sdk::tui::PluginTuiVisualAdapter for GitTuiVisualAdapter {
         payload: &Value,
         context: &bcode_plugin_sdk::tui::PluginTuiVisualRenderContext,
     ) -> bcode_plugin_sdk::tui::PluginTuiToolPresentation {
-        clone_presentation(kind, payload, &|path| {
+        clone_presentation(kind, payload, show_destination(context), &|path| {
             context.display_path(path).to_string()
         })
     }
@@ -60,6 +60,7 @@ fn clone_request_rows(
             .or_else(|| text(arguments, "branch"))
             .map(|value| Span::styled(value.to_owned(), style.value)),
         text(arguments, "destination")
+            .filter(|_| show_destination(context))
             .map(|value| Span::styled(format!("→ {}", context.display_path(value)), style.value)),
     ]
     .into_iter()
@@ -83,6 +84,7 @@ fn clone_result_rows(
     let metadata = [
         repo_name(payload).map(|value| Span::styled(value, style.value)),
         text(payload, "path")
+            .filter(|_| show_destination(context))
             .map(|value| Span::styled(format!("→ {}", context.display_path(value)), style.value)),
         text(payload, "git_ref").map(|value| Span::styled(value.to_owned(), style.value)),
         text(payload, "artifact_scope").map(|value| Span::styled(value.to_owned(), style.value)),
@@ -111,14 +113,18 @@ fn clone_result_rows(
 fn clone_presentation(
     kind: &str,
     payload: &Value,
+    show_destination: bool,
     display_path: &dyn Fn(&str) -> String,
 ) -> bcode_plugin_sdk::tui::PluginTuiToolPresentation {
+    let display_path = |path| show_destination.then(|| display_path(path));
     let (target, detail) = match kind {
         "bcode.git.clone_request" => {
             let arguments = payload.get("arguments").unwrap_or(payload);
             (
                 text(arguments, "url").map(str::to_owned),
-                text(arguments, "destination").map(|path| format!("→ {}", display_path(path))),
+                text(arguments, "destination")
+                    .and_then(display_path)
+                    .map(|path| format!("→ {path}")),
             )
         }
         "bcode.git.clone_result" => {
@@ -126,10 +132,11 @@ fn clone_presentation(
             let outcome = if existed { "already exists" } else { "cloned" };
             (
                 repo_name(payload).or_else(|| text(payload, "clone_url").map(str::to_owned)),
-                Some(text(payload, "path").map_or_else(
-                    || outcome.to_owned(),
-                    |path| format!("{outcome} → {}", display_path(path)),
-                )),
+                Some(
+                    text(payload, "path")
+                        .and_then(display_path)
+                        .map_or_else(|| outcome.to_owned(), |path| format!("{outcome} → {path}")),
+                ),
             )
         }
         _ => (None, None),
@@ -144,6 +151,18 @@ fn clone_presentation(
         target,
         sections: Vec::new(),
     }
+}
+
+/// Property name of the destination toggle declared in the plugin manifest.
+const SHOW_DESTINATION: &str = "bcode.git.show_destination";
+
+/// The resolved `bcode.git.show_destination` presentation property; `true`
+/// (its declared default) when the host supplies no presentation.
+fn show_destination(context: &bcode_plugin_sdk::tui::PluginTuiVisualRenderContext) -> bool {
+    context
+        .presentation()
+        .and_then(|presentation| presentation.property(SHOW_DESTINATION))
+        .is_none_or(|value| *value != bcode_plugin_sdk::tui_visual::FactValue::Bool(false))
 }
 
 fn repo_name(payload: &Value) -> Option<String> {
@@ -202,6 +221,7 @@ mod tests {
         let request = clone_presentation(
             "bcode.git.clone_request",
             &serde_json::json!({ "url": "https://github.com/o/r", "destination": "/tmp/r" }),
+            true,
             &display,
         );
         assert_eq!(request.target.as_deref(), Some("https://github.com/o/r"));
@@ -214,11 +234,61 @@ mod tests {
             &serde_json::json!({
                 "owner": "o", "repo": "r", "path": "/tmp/r", "already_exists": true
             }),
+            true,
             &display,
         );
         assert_eq!(result.target.as_deref(), Some("o/r"));
         assert_eq!(result.summary.as_deref(), Some("o/r · already exists → r"));
-        assert!(clone_presentation("other", &serde_json::json!({}), &display).is_empty());
+        assert!(clone_presentation("other", &serde_json::json!({}), true, &display).is_empty());
+    }
+
+    #[test]
+    fn show_destination_property_hides_destinations() {
+        let payload = serde_json::json!({
+            "url": "https://github.com/o/r",
+            "destination": "/tmp/clone-target"
+        });
+        let context = |presentation: serde_json::Value| {
+            bcode_plugin_sdk::tui::PluginTuiVisualRenderContext::new(
+                80,
+                bcode_plugin_sdk::tui::PluginTuiDiffLayout::Auto { breakpoint: 120 },
+                None,
+            )
+            .with_presentation(serde_json::from_value(presentation).expect("presentation"))
+        };
+        let render = |context: &bcode_plugin_sdk::tui::PluginTuiVisualRenderContext| {
+            let adapter = &GitTuiVisualAdapter;
+            let rows = bcode_plugin_sdk::tui::PluginTuiVisualAdapter::rows(
+                adapter,
+                "bcode.git.clone_request",
+                &payload,
+                context,
+            );
+            let summary = bcode_plugin_sdk::tui::PluginTuiVisualAdapter::tool_presentation(
+                adapter,
+                "bcode.git.clone_request",
+                &payload,
+                context,
+            )
+            .summary
+            .unwrap_or_default();
+            format!(
+                "{}\n{summary}",
+                rows.iter().map(line_text).collect::<Vec<_>>().join("\n")
+            )
+        };
+        let preview = serde_json::json!({ "lines": 8, "keep": "tail" });
+        let shown = render(&context(serde_json::json!({
+            "disclosure": "expanded", "preview": preview,
+        })));
+        assert!(shown.contains("clone-target"), "{shown}");
+        let hidden = render(&context(serde_json::json!({
+            "disclosure": "expanded",
+            "preview": preview,
+            "properties": { "bcode.git.show_destination": false },
+        })));
+        assert!(!hidden.contains("clone-target"), "{hidden}");
+        assert!(hidden.contains("github.com/o/r"), "{hidden}");
     }
 
     #[test]

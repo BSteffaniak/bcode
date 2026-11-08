@@ -32,6 +32,21 @@ surfaces           = ["tui"]
 target_fields = ["url"]
 tool_name     = "git.clone"
 
+# Whether a clone result found the repository already present, for rules such
+# as `match = { plugin = { "bcode.git.already_exists" = true } }`.
+[[presentation.facts]]
+name    = "bcode.git.already_exists"
+payload = "already_exists"
+schema  = "bcode.git.clone_result"
+type    = "bool"
+
+# Whether clone cards show the destination path; themes and configuration may
+# set it for git units with `set = { plugin = { "bcode.git.show_destination" = false } }`.
+[[presentation.properties]]
+default = true
+name    = "bcode.git.show_destination"
+type    = "bool"
+
 [concurrency]
 max  = 2
 type = "limited"

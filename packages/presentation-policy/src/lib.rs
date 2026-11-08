@@ -23,10 +23,11 @@ use std::sync::Mutex;
 
 pub use bcode_presentation_policy_models as models;
 use models::{
-    DEFAULT_REVEAL, Detail, Disclosure, FactMatcher, GROUP_HEADER_FIELDS, GroupSpec, HEADER_FIELDS,
-    HOST_SECTIONS, LayerSource, MAX_INDENT, MAX_PATCH_ENTRIES, MAX_PREVIEW_LINES,
-    MAX_RULES_PER_LAYER, MAX_SUMMARY_TEMPLATE_BYTES, Placement, PresentationRule, Preview,
-    PreviewKeep, PropertyPatch, ResolvedPresentation, ResolvedSection, RuleLayer, Spacing,
+    DEFAULT_REVEAL, Detail, Disclosure, FactCondition, FactMatcher, FactType, FactValue,
+    GROUP_HEADER_FIELDS, GroupSpec, HEADER_FIELDS, HOST_SECTIONS, LayerSource, MAX_INDENT,
+    MAX_PATCH_ENTRIES, MAX_PREVIEW_LINES, MAX_RULES_PER_LAYER, MAX_SUMMARY_TEMPLATE_BYTES,
+    Placement, PluginFactSchema, PluginPresentationSchemas, PluginPropertySchema, PresentationRule,
+    Preview, PreviewKeep, PropertyPatch, ResolvedPresentation, ResolvedSection, RuleLayer, Spacing,
     SummarySpec, TEMPLATE_FIELDS, UNIT_HEADER_FIELDS, UnitFacts, UnitKind, UnitStatus,
 };
 
@@ -105,13 +106,15 @@ pub struct PolicyDiagnostic {
 
 /// Plugin-declared properties and facts that rules may reference.
 ///
-/// Namespaced keys that are not registered produce warnings.
+/// Namespaced keys that are not registered produce warnings. Values of
+/// registered properties that violate their schema are dropped with a
+/// warning, and registered properties apply only to their plugin's units.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct PolicyRegistry {
-    /// Registered plugin properties.
-    pub properties: BTreeSet<String>,
-    /// Registered plugin facts.
-    pub facts: BTreeSet<String>,
+    /// Registered plugin properties, by namespaced name.
+    pub properties: BTreeMap<String, PluginPropertySchema>,
+    /// Registered plugin facts, by namespaced name.
+    pub facts: BTreeMap<String, PluginFactSchema>,
     /// Known part and section names; when empty, names are not checked.
     /// Namespaced names (containing a `.`) are never checked.
     pub parts: BTreeSet<String>,
@@ -130,6 +133,24 @@ impl PolicyRegistry {
                 .collect(),
             ..Self::default()
         }
+    }
+
+    /// This registry with the plugin-declared `schemas` registered.
+    #[must_use]
+    pub fn with_plugin_schemas(mut self, schemas: &PluginPresentationSchemas) -> Self {
+        self.facts.extend(
+            schemas
+                .facts
+                .iter()
+                .map(|(name, schema)| (name.clone(), schema.clone())),
+        );
+        self.properties.extend(
+            schemas
+                .properties
+                .iter()
+                .map(|(name, schema)| (name.clone(), schema.clone())),
+        );
+        self
     }
 }
 
@@ -199,6 +220,8 @@ impl ToolIndex {
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 struct ResolutionKey {
     rules: Vec<usize>,
+    /// The unit's producer, when plugin properties are scoped by it.
+    producer: Option<String>,
     group: bool,
     awaiting_decision: bool,
     failed: bool,
@@ -219,6 +242,11 @@ pub struct CompiledPolicy {
     by_kind: BTreeMap<UnitKind, ToolIndex>,
     /// Rules without a kind condition, by tool.
     unkinded: ToolIndex,
+    /// Registered plugin properties, for scoping values to their plugin.
+    properties: BTreeMap<String, PluginPropertySchema>,
+    /// Whether any rule sets a plugin property, so resolution depends on the
+    /// unit's producer.
+    scopes_properties: bool,
     fingerprint: u64,
     memo: Mutex<BTreeMap<ResolutionKey, ResolvedPresentation>>,
 }
@@ -229,7 +257,9 @@ impl Default for CompiledPolicy {
             rules: Vec::new(),
             by_kind: BTreeMap::new(),
             unkinded: ToolIndex::default(),
-            fingerprint: fingerprint(&[]),
+            properties: BTreeMap::new(),
+            scopes_properties: false,
+            fingerprint: fingerprint(&[], &BTreeMap::new()),
             memo: Mutex::default(),
         }
     }
@@ -241,6 +271,8 @@ impl Clone for CompiledPolicy {
             rules: self.rules.clone(),
             by_kind: self.by_kind.clone(),
             unkinded: self.unkinded.clone(),
+            properties: self.properties.clone(),
+            scopes_properties: self.scopes_properties,
             fingerprint: self.fingerprint,
             memo: Mutex::default(),
         }
@@ -258,8 +290,10 @@ impl CompiledPolicy {
         registry: &PolicyRegistry,
     ) -> (Self, Vec<PolicyDiagnostic>) {
         let mut diagnostics = Vec::new();
-        let mut compiled = Self::default();
-        debug_assert_eq!(compiled.fingerprint, fingerprint(&[]));
+        let mut compiled = Self {
+            properties: registry.properties.clone(),
+            ..Self::default()
+        };
         for layer in layers {
             if layer.rules.len() > MAX_RULES_PER_LAYER {
                 diagnostics.push(PolicyDiagnostic {
@@ -289,6 +323,20 @@ impl CompiledPolicy {
                     report(DiagnosticSeverity::Warning, warning);
                 }
                 let mut rule = rule.clone();
+                rule.set.plugin.retain(|key, value| {
+                    let rejection = registry
+                        .properties
+                        .get(key)
+                        .and_then(|schema| schema.value_type.reject(value));
+                    if let Some(why) = &rejection {
+                        report(
+                            DiagnosticSeverity::Warning,
+                            format!("plugin property {key:?} ignored: {why}"),
+                        );
+                    }
+                    rejection.is_none()
+                });
+                compiled.scopes_properties |= !rule.set.plugin.is_empty();
                 if let LayerSource::Plugin(plugin) = &layer.source
                     && rule.matcher.producer.is_unset()
                 {
@@ -315,7 +363,7 @@ impl CompiledPolicy {
                 });
             }
         }
-        compiled.fingerprint = fingerprint(&compiled.rules);
+        compiled.fingerprint = fingerprint(&compiled.rules, &compiled.properties);
         (compiled, diagnostics)
     }
 
@@ -374,6 +422,10 @@ impl CompiledPolicy {
     pub fn resolve(&self, facts: &UnitFacts) -> ResolvedPresentation {
         let key = ResolutionKey {
             rules: self.matching_positions(facts).collect(),
+            producer: self
+                .scopes_properties
+                .then(|| facts.producer.clone())
+                .flatten(),
             group: facts.kind == Some(UnitKind::Group),
             awaiting_decision: facts.awaiting_decision,
             failed: unit_failed(facts),
@@ -391,6 +443,7 @@ impl CompiledPolicy {
             patch.merge(&self.rules[position].rule.set);
         }
         let mut presentation = apply_patch(host_defaults(), patch);
+        self.scope_plugin_properties(&mut presentation.plugin, facts.producer.as_deref());
         apply_visibility_floor(&mut presentation, facts);
         if let Ok(mut memo) = self.memo.lock() {
             if memo.len() >= MAX_RESOLUTION_MEMO {
@@ -419,7 +472,14 @@ impl CompiledPolicy {
             }
             patch.merge(&compiled.rule.set);
         }
+        let set_plugin: Vec<String> = patch.plugin.keys().cloned().collect();
         let mut presentation = apply_patch(host_defaults(), patch);
+        self.scope_plugin_properties(&mut presentation.plugin, facts.producer.as_deref());
+        for key in set_plugin {
+            if !presentation.plugin.contains_key(&key) {
+                origins.remove(&key);
+            }
+        }
         let floor = floor_adjustments(&mut presentation, facts)
             .into_iter()
             .map(|adjustment| match origins.get(&adjustment.property) {
@@ -435,6 +495,34 @@ impl CompiledPolicy {
             origins: origins.into_values().collect(),
             floor,
         }
+    }
+}
+
+impl CompiledPolicy {
+    /// Keep only the plugin properties that apply to a unit produced by
+    /// `producer`.
+    ///
+    /// A registered property applies only to its declaring plugin's units.
+    /// Unregistered properties (already reported as unknown) apply to no unit,
+    /// so a rule can never hand one plugin's adapter a property its name
+    /// merely resembles, including under nested plugin ids.
+    fn scope_plugin_properties(
+        &self,
+        properties: &mut BTreeMap<String, FactValue>,
+        producer: Option<&str>,
+    ) {
+        if properties.is_empty() {
+            return;
+        }
+        let Some(producer) = producer else {
+            properties.clear();
+            return;
+        };
+        properties.retain(|key, _| {
+            self.properties
+                .get(key)
+                .is_some_and(|schema| schema.plugin == producer)
+        });
     }
 }
 
@@ -689,13 +777,14 @@ fn invalid_rule(rule: &PresentationRule, source: &LayerSource) -> Option<String>
 fn suspicious_rule(rule: &PresentationRule, registry: &PolicyRegistry) -> Vec<String> {
     let mut warnings = Vec::new();
     for key in rule.set.plugin.keys() {
-        if !registry.properties.contains(key) {
+        if !registry.properties.contains_key(key) {
             warnings.push(format!("unknown plugin property {key:?}"));
         }
     }
-    for key in rule.matcher.plugin.keys() {
-        if !registry.facts.contains(key) {
-            warnings.push(format!("unknown plugin fact {key:?}"));
+    for (key, condition) in &rule.matcher.plugin {
+        match registry.facts.get(key) {
+            None => warnings.push(format!("unknown plugin fact {key:?}")),
+            Some(schema) => warnings.extend(fact_condition_warning(key, schema, condition)),
         }
     }
     if !registry.parts.is_empty() {
@@ -763,6 +852,32 @@ fn suspicious_rule(rule: &PresentationRule, registry: &PolicyRegistry) -> Vec<St
         warnings.push("rule sets no properties".to_owned());
     }
     warnings
+}
+
+/// Warning for a condition that can never match fact `key` of `schema`'s type.
+fn fact_condition_warning(
+    key: &str,
+    schema: &PluginFactSchema,
+    condition: &FactCondition,
+) -> Option<String> {
+    let type_name = match schema.value_type {
+        FactType::Bool => "bool",
+        FactType::Int => "int",
+        FactType::String => "string",
+    };
+    match condition {
+        FactCondition::Range(_) if schema.value_type != FactType::Int => Some(format!(
+            "plugin fact {key:?} has type {type_name}; a range never matches it"
+        )),
+        FactCondition::Values(values) => values
+            .0
+            .iter()
+            .find(|value| !schema.value_type.admits(value))
+            .map(|value| {
+                format!("plugin fact {key:?} has type {type_name}; {value:?} never matches it")
+            }),
+        FactCondition::Range(_) => None,
+    }
 }
 
 /// Warnings for patches the visibility floor will partly undo.
@@ -953,14 +1068,20 @@ fn merge_sorted(
     })
 }
 
-fn fingerprint(rules: &[CompiledRule]) -> u64 {
+fn fingerprint(rules: &[CompiledRule], properties: &BTreeMap<String, PluginPropertySchema>) -> u64 {
     // FNV-1a over a canonical debug encoding: stable across runs and platforms.
     let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
-    for compiled in rules {
-        for byte in format!("{:?}|{:?}", compiled.source, compiled.rule).bytes() {
+    let mut feed = |text: String| {
+        for byte in text.bytes() {
             hash ^= u64::from(byte);
             hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
         }
+    };
+    for compiled in rules {
+        feed(format!("{:?}|{:?}", compiled.source, compiled.rule));
+    }
+    if !properties.is_empty() {
+        feed(format!("{properties:?}"));
     }
     hash
 }
@@ -1104,7 +1225,14 @@ mod tests {
     #[test]
     fn diagnostics_warn_on_unknown_keys_and_drop_invalid_rules() {
         let registry = PolicyRegistry {
-            properties: ["bcode.shell.show_exit_code".to_owned()].into(),
+            properties: BTreeMap::from([(
+                "bcode.shell.show_exit_code".to_owned(),
+                PluginPropertySchema {
+                    plugin: "bcode.shell".to_owned(),
+                    value_type: models::PropertyType::Bool,
+                    default: FactValue::Bool(true),
+                },
+            )]),
             ..PolicyRegistry::with_host_parts()
         };
         let (policy, diagnostics) = CompiledPolicy::compile(
@@ -1145,6 +1273,193 @@ mod tests {
             .count();
         assert_eq!(errors, 2);
         assert_eq!(policy.len(), 2);
+    }
+
+    fn git_registry() -> PolicyRegistry {
+        PolicyRegistry::with_host_parts().with_plugin_schemas(&PluginPresentationSchemas {
+            facts: BTreeMap::from([(
+                "bcode.git.files".to_owned(),
+                PluginFactSchema {
+                    plugin: "bcode.git".to_owned(),
+                    value_type: FactType::Int,
+                },
+            )]),
+            properties: BTreeMap::from([
+                (
+                    "bcode.git.show_stats".to_owned(),
+                    PluginPropertySchema {
+                        plugin: "bcode.git".to_owned(),
+                        value_type: models::PropertyType::Bool,
+                        default: FactValue::Bool(true),
+                    },
+                ),
+                (
+                    "bcode.git.max_files".to_owned(),
+                    PluginPropertySchema {
+                        plugin: "bcode.git".to_owned(),
+                        value_type: models::PropertyType::Int { min: 1, max: 20 },
+                        default: FactValue::Int(5),
+                    },
+                ),
+            ]),
+        })
+    }
+
+    fn produced(name: &str, producer: &str) -> UnitFacts {
+        UnitFacts {
+            producer: Some(producer.to_owned()),
+            ..tool(name, UnitStatus::Succeeded)
+        }
+    }
+
+    #[test]
+    fn plugin_properties_apply_only_to_their_plugins_units() {
+        let (policy, diagnostics) = CompiledPolicy::compile(
+            &[
+                layer(
+                    LayerSource::Plugin("bcode.git".into()),
+                    "[[rules]]\nset = { plugin = { \"bcode.git.show_stats\" = true, \"bcode.git.max_files\" = 5 } }",
+                ),
+                layer(
+                    LayerSource::Theme("compact".into()),
+                    r#"
+                    [[rules]]
+                    set = { plugin = { "bcode.git.show_stats" = false, "bcode.shell.wrap" = true } }
+                    "#,
+                ),
+            ],
+            &git_registry(),
+        );
+        assert_eq!(
+            diagnostics
+                .iter()
+                .map(|diagnostic| diagnostic.message.as_str())
+                .collect::<Vec<_>>(),
+            ["unknown plugin property \"bcode.shell.wrap\""]
+        );
+        let git = policy.resolve(&produced("git.clone", "bcode.git"));
+        assert_eq!(
+            git.plugin,
+            BTreeMap::from([
+                ("bcode.git.max_files".to_owned(), FactValue::Int(5)),
+                ("bcode.git.show_stats".to_owned(), FactValue::Bool(false)),
+            ])
+        );
+        // Neither another plugin's units nor units without a producer get
+        // git properties, and the undeclared shell property reaches no unit.
+        let shell = policy.resolve(&produced("bash", "bcode.shell"));
+        assert_eq!(shell.plugin, BTreeMap::new());
+        assert_eq!(
+            policy.resolve(&tool("read", UnitStatus::Succeeded)).plugin,
+            BTreeMap::new()
+        );
+        // The memo never hands one producer's properties to another.
+        assert_eq!(policy.resolve(&produced("git.clone", "bcode.git")), git);
+
+        let explained = policy.explain(&produced("git.clone", "bcode.git"));
+        let origin = |property: &str| {
+            explained
+                .origins
+                .iter()
+                .find(|origin| origin.property == property)
+                .map(|origin| origin.source.clone())
+        };
+        assert_eq!(
+            origin("bcode.git.show_stats"),
+            Some(LayerSource::Theme("compact".into()))
+        );
+        assert_eq!(
+            origin("bcode.git.max_files"),
+            Some(LayerSource::Plugin("bcode.git".into()))
+        );
+        assert_eq!(
+            origin("bcode.shell.wrap"),
+            None,
+            "dropped values have no origin"
+        );
+    }
+
+    #[test]
+    fn invalid_plugin_property_values_warn_and_are_ignored() {
+        let (policy, diagnostics) = CompiledPolicy::compile(
+            &[
+                layer(
+                    LayerSource::Plugin("bcode.git".into()),
+                    "[[rules]]\nset = { plugin = { \"bcode.git.max_files\" = 5 } }",
+                ),
+                layer(
+                    LayerSource::Config,
+                    r#"
+                    [[rules]]
+                    set = { plugin = { "bcode.git.max_files" = 99, "bcode.git.show_stats" = "yes" } }
+                    "#,
+                ),
+            ],
+            &git_registry(),
+        );
+        let warnings: Vec<_> = diagnostics
+            .iter()
+            .map(|diagnostic| (diagnostic.source.clone(), diagnostic.message.as_str()))
+            .collect();
+        assert_eq!(
+            warnings,
+            [
+                (
+                    LayerSource::Config,
+                    "plugin property \"bcode.git.max_files\" ignored: 99 is outside 1..=20"
+                ),
+                (
+                    LayerSource::Config,
+                    "plugin property \"bcode.git.show_stats\" ignored: expected a bool"
+                ),
+            ]
+        );
+        let git = policy.resolve(&produced("git.clone", "bcode.git"));
+        assert_eq!(
+            git.plugin.get("bcode.git.max_files"),
+            Some(&FactValue::Int(5))
+        );
+        assert_eq!(git.plugin.get("bcode.git.show_stats"), None);
+    }
+
+    #[test]
+    fn plugin_fact_conditions_are_checked_against_declared_types() {
+        let (policy, diagnostics) = CompiledPolicy::compile(
+            &[layer(
+                LayerSource::Theme("t".into()),
+                r#"
+                [[rules]]
+                match = { plugin = { "bcode.git.files" = { gt = 10 } } }
+                set = { disclosure = "collapsed" }
+
+                [[rules]]
+                match = { plugin = { "bcode.git.files" = "many" } }
+                set = { detail = "minimal" }
+
+                [[rules]]
+                match = { plugin = { "bcode.git.lines" = 1 } }
+                set = { detail = "verbose" }
+                "#,
+            )],
+            &git_registry(),
+        );
+        let messages: Vec<_> = diagnostics
+            .iter()
+            .map(|diagnostic| diagnostic.message.as_str())
+            .collect();
+        assert_eq!(
+            messages,
+            [
+                "plugin fact \"bcode.git.files\" has type int; Text(\"many\") never matches it",
+                "unknown plugin fact \"bcode.git.lines\"",
+            ]
+        );
+        let mut facts = produced("git.status", "bcode.git");
+        assert_eq!(policy.resolve(&facts).disclosure, Disclosure::Expanded);
+        facts
+            .plugin
+            .insert("bcode.git.files".to_owned(), FactValue::Int(11));
+        assert_eq!(policy.resolve(&facts).disclosure, Disclosure::Collapsed);
     }
 
     #[test]

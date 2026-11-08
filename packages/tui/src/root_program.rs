@@ -2100,6 +2100,17 @@ impl BcodeRuntimeModel {
                         });
                     return super::invalidation::UiInvalidation::Structural;
                 }
+                // The inspector scrollbar owns presses on it and its drags
+                // ahead of transcript selection.
+                if !self.loop_state.modal_foreground()
+                    && super::mouse_flow::handle_inspector_scrollbar_mouse(
+                        super::mouse_flow::mouse_hit_id(&self.committed_hits, mouse).as_deref(),
+                        &self.chat,
+                        mouse,
+                    )
+                {
+                    return super::invalidation::UiInvalidation::Structural;
+                }
                 if let Some(selection_damage) = self.handle_transcript_selection_mouse(mouse) {
                     return selection_damage;
                 }
@@ -2772,7 +2783,13 @@ impl BcodeRuntimeModel {
                     let axis = super::appearance_picker::AppearanceAxis::for_route(route);
                     self.loop_state.open_appearance_picker(&mut self.chat, axis);
                 }
-                "transcript.inspect" | "transcript.cycleDetail" | "transcript.makeDefault" => {
+                "transcript.inspect"
+                | "transcript.cycleDetail"
+                | "transcript.makeDefault"
+                | "transcript.focusUnits"
+                | "tools.expandAll"
+                | "tools.collapseAll"
+                | "tools.resetDisclosure" => {
                     self.chat.app.run_transcript_tool_route(&route);
                 }
                 "streaming.configure" => {
@@ -10600,6 +10617,76 @@ mod tests {
             assert!(!model.chat.app.managed_input_ready());
             drop(model);
         }
+    }
+
+    #[test]
+    fn palette_lists_and_dispatches_transcript_disclosure_actions() {
+        use bcode_presentation_policy::models::Disclosure;
+        let palette = crate::command_palette::BmuxCommandPalette::new();
+        let contribution = |id: &str| {
+            (0..)
+                .map_while(|index| palette.contribution_at(index))
+                .find(|contribution| contribution.id == id)
+                .unwrap_or_else(|| panic!("palette lists {id}"))
+        };
+        let mut model = root_test_model();
+        let (app, ids) = crate::app::disclosure_focus_tests::focus_app(2);
+        model.chat.app = app;
+        let dispatch = |model: &mut super::BcodeRuntimeModel, id: &str| {
+            model.apply_root_command_action(
+                super::super::chat_loop::CommandDispatchRequest::from_contribution(contribution(
+                    id,
+                )),
+            );
+        };
+        let unit = |index: usize| crate::structure::DisclosureTarget::Unit(ids[index]);
+        let disclosures = |model: &super::BcodeRuntimeModel| {
+            (0..2)
+                .map(|index| {
+                    model
+                        .chat
+                        .app
+                        .target_disclosure(&unit(index))
+                        .map(|(disclosure, _)| disclosure)
+                })
+                .collect::<Vec<_>>()
+        };
+
+        // Focus mode toggles through the palette; bulk actions then act on
+        // the focused subtree only.
+        let initial = disclosures(&model);
+        dispatch(&mut model, "transcript.focusUnits");
+        assert!(model.chat.app.transcript_focus_active());
+        // Focus starts on the last unit's `output` section; climb to the unit.
+        assert!(
+            model
+                .chat
+                .app
+                .handle_transcript_focus_action(crate::transcript_focus::FocusAction::Previous)
+        );
+        dispatch(&mut model, "tools.collapseAll");
+        assert_eq!(
+            disclosures(&model),
+            [initial[0], Some(Disclosure::Collapsed)]
+        );
+        dispatch(&mut model, "transcript.focusUnits");
+        assert!(!model.chat.app.transcript_focus_active());
+
+        // Outside focus mode they act on every unit.
+        dispatch(&mut model, "tools.expandAll");
+        assert_eq!(disclosures(&model), [Some(Disclosure::Expanded); 2]);
+        dispatch(&mut model, "tools.collapseAll");
+        assert_eq!(disclosures(&model), [Some(Disclosure::Collapsed); 2]);
+        dispatch(&mut model, "transcript.cycleDetail");
+        let cycled = disclosures(&model);
+        assert_ne!(cycled, [Some(Disclosure::Collapsed); 2]);
+        assert_eq!(cycled[0], cycled[1]);
+        dispatch(&mut model, "tools.resetDisclosure");
+        let reset = model.chat.app.status().contains("reset to defaults");
+        let after_reset = disclosures(&model);
+        drop(model);
+        assert!(reset);
+        assert_eq!(after_reset, initial);
     }
 
     fn root_test_model() -> super::BcodeRuntimeModel {

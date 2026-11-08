@@ -7,7 +7,9 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
 
 /// Presentation value types carried by [`TuiVisualPresentation`].
-pub use bcode_presentation_policy_models::{Disclosure, Preview, PreviewKeep, ResolvedSection};
+pub use bcode_presentation_policy_models::{
+    Disclosure, FactValue, Preview, PreviewKeep, ResolvedSection,
+};
 use bcode_presentation_policy_models::{MAX_PATCH_ENTRIES, ResolvedPresentation};
 use serde::{Deserialize, Serialize};
 
@@ -27,7 +29,10 @@ pub const TUI_VISUAL_TOOL_PRESENTATION_VERSION: u32 = 5;
 ///
 /// * Version 1 carries width, diff layout, and working directory.
 /// * Version 2 adds the theme fingerprint.
-/// * Version 3 adds the resolved structural presentation ([`TuiVisualPresentation`]).
+/// * Version 3 adds the resolved structural presentation ([`TuiVisualPresentation`]). Its
+///   optional `properties` map (the unit producer's resolved plugin properties) was added
+///   within version 3: older adapters ignore it, and contexts without it decode with an empty
+///   map.
 ///
 /// Contexts that omit the version decode as version 2.
 pub const PLUGIN_TUI_VISUAL_CONTEXT_VERSION: u32 = 3;
@@ -45,7 +50,8 @@ pub const MAX_TUI_VISUAL_SECTION_NAME_BYTES: usize = 64;
 pub const MAX_TUI_VISUAL_SECTION_LABEL_BYTES: usize = 64;
 /// Maximum rows across all sections of one tool presentation.
 pub const MAX_TUI_VISUAL_SECTION_ROWS: usize = MAX_SERIALIZED_TUI_VISUAL_ROWS;
-/// Maximum resolved sections and header fields delivered in one render context.
+/// Maximum resolved sections, header fields, and plugin properties delivered in one render
+/// context.
 pub const MAX_TUI_VISUAL_PRESENTATION_ENTRIES: usize = MAX_PATCH_ENTRIES;
 /// Maximum rows accepted from one serialized visual response.
 pub const MAX_SERIALIZED_TUI_VISUAL_ROWS: usize = 256;
@@ -194,13 +200,19 @@ pub struct TuiVisualPresentation {
     /// Ordered header fields; empty selects the renderer's default header.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub header_fields: Vec<String>,
+    /// Resolved plugin presentation properties of the unit, by namespaced name.
+    ///
+    /// Only properties declared by the unit's producing plugin, each resolved from its manifest
+    /// default and any theme or configuration rule. Display data only.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub properties: BTreeMap<String, FactValue>,
 }
 
 impl TuiVisualPresentation {
     /// Bounded adapter view of a resolved presentation.
     ///
-    /// At most [`MAX_TUI_VISUAL_PRESENTATION_ENTRIES`] sections (in name order) and
-    /// header fields are kept.
+    /// At most [`MAX_TUI_VISUAL_PRESENTATION_ENTRIES`] sections (in name order), header
+    /// fields, and plugin properties (in name order) are kept.
     #[must_use]
     pub fn from_resolved(resolved: &ResolvedPresentation) -> Self {
         Self {
@@ -224,7 +236,19 @@ impl TuiVisualPresentation {
                         .collect()
                 })
                 .unwrap_or_default(),
+            properties: resolved
+                .plugin
+                .iter()
+                .take(MAX_TUI_VISUAL_PRESENTATION_ENTRIES)
+                .map(|(name, value)| (name.clone(), value.clone()))
+                .collect(),
         }
+    }
+
+    /// Resolved plugin property `name`, when the producer declared it.
+    #[must_use]
+    pub fn property(&self, name: &str) -> Option<&FactValue> {
+        self.properties.get(name)
     }
 
     /// Presentation of section `name`, defaulting to visible, expanded, and the unit preview.
@@ -959,6 +983,7 @@ mod presentation_tests {
                 },
             )]),
             header_fields: vec!["marker".to_owned(), "tool".to_owned()],
+            properties: BTreeMap::from([("test.plugin.compact".to_owned(), FactValue::Bool(true))]),
         };
         let mut current = SerializedTuiVisualContext {
             presentation: Some(presentation.clone()),
@@ -985,6 +1010,35 @@ mod presentation_tests {
     }
 
     #[test]
+    fn plugin_properties_are_optional_within_context_version_three() {
+        /// A presentation shape from before properties existed.
+        #[derive(Deserialize)]
+        struct OlderPresentation {
+            disclosure: Disclosure,
+        }
+
+        // A version 3 presentation from a host that predates properties.
+        let older = serde_json::json!({
+            "disclosure": "summary",
+            "preview": { "lines": 8, "keep": "tail" },
+        });
+        let decoded: TuiVisualPresentation =
+            serde_json::from_value(older).expect("older presentation decodes");
+        assert_eq!(decoded.property("test.plugin.compact"), None);
+        assert!(decoded.properties.is_empty());
+
+        // An adapter built before properties existed ignores them.
+        let mut current = decoded;
+        current
+            .properties
+            .insert("test.plugin.compact".to_owned(), FactValue::Bool(true));
+        let encoded = serde_json::to_value(&current).expect("encode");
+        assert_eq!(encoded["properties"]["test.plugin.compact"], true);
+        let older: OlderPresentation = serde_json::from_value(encoded).expect("ignored");
+        assert_eq!(older.disclosure, Disclosure::Summary);
+    }
+
+    #[test]
     fn newer_presentation_vocabulary_degrades_to_no_presentation() {
         let mut encoded = serde_json::to_value(SerializedTuiVisualContext {
             presentation: Some(TuiVisualPresentation {
@@ -992,6 +1046,7 @@ mod presentation_tests {
                 preview: preview(),
                 sections: BTreeMap::new(),
                 header_fields: Vec::new(),
+                properties: BTreeMap::new(),
             }),
             context_version: PLUGIN_TUI_VISUAL_CONTEXT_VERSION,
             width: 80,
@@ -1041,6 +1096,18 @@ mod presentation_tests {
             MAX_TUI_VISUAL_PRESENTATION_ENTRIES
         );
         assert_eq!(presentation.header_fields, Vec::<String>::new());
+        resolved.plugin = (0..=MAX_TUI_VISUAL_PRESENTATION_ENTRIES)
+            .map(|index| (format!("test.plugin.p{index:03}"), FactValue::Int(1)))
+            .collect();
+        let bounded = TuiVisualPresentation::from(&resolved);
+        assert_eq!(
+            bounded.properties.len(),
+            MAX_TUI_VISUAL_PRESENTATION_ENTRIES
+        );
+        assert_eq!(
+            bounded.property("test.plugin.p000"),
+            Some(&FactValue::Int(1))
+        );
         resolved.header = Some(HeaderSpec {
             fields: vec!["marker".to_owned(); MAX_TUI_VISUAL_PRESENTATION_ENTRIES + 1],
         });

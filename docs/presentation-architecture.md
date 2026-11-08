@@ -173,9 +173,12 @@ Each unit exposes typed **facts** derived from the session-view document:
 | `depth` | child-session nesting depth |
 | `lines`, `items` | size buckets: `0`, `1`, `2..=10`, `11..=50`, `51..=200`, `>200` |
 
-Plugins declare additional typed facts for their own tools in their manifests (for example,
-`bcode.shell.exit_code: int`). Facts are presentation inputs only; they are never derived from raw
-event logs and never feed authorization.
+Plugins declare additional typed facts for their own units in their manifests (for example,
+`bcode.git.files: int`), named under their plugin id. Facts are presentation inputs only; they are
+never derived from raw event logs and never feed authorization. Rules match them under `plugin`:
+by value, by one of a list, or, for integers, by a `{ gt, gte, lt, lte }` range
+(`match = { plugin = { "bcode.git.files" = { gt = 10 } } }`). Only units the declaring plugin
+produced carry its facts.
 
 Size facts are bucketed so streaming content changes a fact only when it crosses a bucket boundary.
 
@@ -198,8 +201,11 @@ built-in default.
 restricted by the visibility floor. Preview budgets are source lines; renderers may clamp further to
 their viewport.
 
-Plugins register namespaced properties with typed schemas (`bcode.shell.show_exit_code: bool`).
-Unknown properties produce warnings.
+Plugins register namespaced properties with typed schemas and defaults
+(`bcode.git.show_destination: bool = true`), set by rules as
+`set = { plugin = { "bcode.git.show_destination" = false } }`. A plugin property applies only to
+its plugin's units; values that violate the schema are ignored with a warning, and unknown
+properties produce warnings.
 
 ### Rules
 
@@ -386,6 +392,13 @@ All properties merge per property (later rules win). `sections` merge per sectio
   member's header row stands for the whole invocation). Request, progress, and result
   contributions occupy the invocation's primary slot (they are how a plugin-presented call
   renders), so they remain members.
+* An invocation counts once. When a historical tool request (`tool-request:<call>`) and a later
+  item of the same invocation (its result or primary contribution) are both in the window, the
+  projection marks the request *superseded*: the later item is the member, and the request is an
+  attached unit of it. Superseded units sit inside a group between members whatever their kind or
+  status, and a contiguous span of them directly before the first member, in its turn, is claimed
+  too; the group header is then presented before the first of them. Superseded units after the
+  last member are left for the group of the call they belong to.
 * The group unit's id is `group:<first member item id>`; it stays stable as members stream in.
 * Group facts: `kind = "group"`, `tool` (when all members share it), `producer` (likewise), `status`
   (aggregate: running > waiting > requested > failed > timed_out > cancelled > succeeded),
@@ -437,7 +450,12 @@ All properties merge per property (later rules win). `sections` merge per sectio
   follows focus. It paints over the transcript body, docked right as a side panel when the
   body is at least 96 columns wide and inset as a modal otherwise; its hit region is the
   painted panel, layered above transcript regions, and the mouse wheel over it scrolls it
-  (`shift+Down`/`shift+Up` from the keyboard). Escape closes it before leaving focus mode, and
+  (`shift+Down`/`shift+Up` from the keyboard). Its scrollbar, shown when the report overflows,
+  is clickable and draggable: a press on the inspector panel routes, ahead of transcript
+  selection, to BMUX's text view against the body rectangle and layout recorded by the last
+  paint, so a track press jumps there and starts a drag that continues outside the panel until
+  release. Closing the inspector or a panel that no longer fits ends the drag and leaves no
+  geometry to route through. Escape closes it before leaving focus mode, and
   leaving focus mode any other way closes it too. Transcript selection is registered before the
   panel paints, so its occlusion removes the selectable fragments it covers; beside a side panel
   selection still starts, while an inset panel disables starting a transcript selection until it
@@ -448,7 +466,10 @@ All properties merge per property (later rules win). `sections` merge per sectio
   then recompiles from the stored user-state rules. Every user-state read-modify-write (theme,
   profile, streaming, and structural rules) is serialized in-process and replaces the file
   atomically, so concurrent saves never drop each other's fields. The three actions are also command-palette
-  entries (`transcript.inspect`, `transcript.cycleDetail`, `transcript.makeDefault`).
+  entries (`transcript.inspect`, `transcript.cycleDetail`, `transcript.makeDefault`), as are
+  focus mode (`transcript.focusUnits`) and the bulk actions (`tools.expandAll`,
+  `tools.collapseAll`, `tools.resetDisclosure`); each palette route runs the same handler as its
+  keymap action.
 
 ### Every unit kind is structural
 
@@ -468,6 +489,40 @@ and named `sections` (ordered `{ name, label, rows }`). Visual adapters receive 
 presentation (unit disclosure, per-section disclosure and preview, header fields) in their render
 context behind `PLUGIN_TUI_VISUAL_CONTEXT_VERSION = 3`. Older adapters render one `visual`
 section and continue to work unchanged.
+
+Manifests declare facts and properties for the plugin's own units:
+
+```toml
+[[presentation.facts]]
+name    = "bcode.git.already_exists"   # <plugin id>.<key>
+type    = "bool"                       # bool | int | string
+payload = "already_exists"             # or: argument = "<top-level argument field>"
+schema  = "bcode.git.clone_result"     # optional contribution schema filter; also `tool`
+
+[[presentation.properties]]
+name    = "bcode.git.show_destination"
+type    = "bool"                       # bool | int (optional min, max) | enum (values)
+default = true
+```
+
+* A fact's value is read by the host from one top-level field of the unit's tool arguments or
+  contribution payload: `bool` from a JSON boolean, `int` from an integer or the length of an
+  array or object, `string` from a string bounded to one line of 256 bytes. Facts are derived
+  only for units whose known producer is the declaring plugin, at most 32 per unit, memoized per
+  item revision. They are not taken from adapter render responses: an adapter's output depends on
+  the resolved presentation, so facts derived from it could feed back into resolution.
+* Property defaults become a plugin layer (one rule scoped to the plugin's units) stacked just
+  below the plugin's own rules, so explain attributes a default to that layer. Schemas are
+  registered with the policy registry, which drops schema-violating values with a warning and
+  scopes every registered property to its plugin's units; an unregistered property is reported
+  as unknown and applies to no unit. When plugin ids nest (`bcode` and `bcode.git`), a fact or
+  property name belongs to the plugin with the longest id it is namespaced under.
+* Names are `<plugin id>.<key>`, at most 64 bytes; each plugin declares at most 32 facts and 32
+  properties; enums have at most 16 values. Invalid declarations are dropped with manifest
+  diagnostics and never block loading.
+* Adapters receive the unit's resolved plugin properties as `properties` in the context
+  presentation (at most 64 entries). The field was added within context version 3: older
+  adapters ignore it and older contexts decode it as empty, so no version bump is needed.
 
 ## Terminal capabilities
 
@@ -490,10 +545,13 @@ section and continue to work unchanged.
   selection role pairs (4.5:1 for text and states; 3:1 for secondary text, focus borders, diff
   signs, tool titles, and inactive selection); unknown style roles and container keys; roles
   resolved only through seed derivation or unset (host fallbacks); registry coverage; resolver
-  warnings; and the theme's structural rule diagnostics, including floor crossings. Colors whose
+  warnings; and the theme's structural rule diagnostics, including floor crossings, compiled with
+  the enabled plugins' fact and property schemas (read from manifests, as explain does). Colors whose
   displayed value the terminal owns (the default colors and the 16 ANSI colors) are reported as
-  unmeasured, not failed. Warnings exit 0 unless `--strict`; `--json` emits a versioned
-  structure. The analysis is `bcode_tui_theme::check`; the command compiles rule layers.
+  unmeasured, not failed. Each contrast adjustment resolution made (role, pair background, fg or
+  bg, before and after color, pair ratio before and after) is an informational `adjusted`
+  finding and an `adjustments` entry in `--json`; adjustments never count as warnings. Warnings
+  exit 0 unless `--strict`; `--json` emits a versioned structure. The analysis is `bcode_tui_theme::check`; the command compiles rule layers.
 * Global actions: expand all, collapse all, cycle detail, and "make this the default for this
   tool" (see Interaction).
 * `cargo run -p xtask -- theme-gallery [--check | --dry-run]` writes the generated gallery,
@@ -587,7 +645,10 @@ the design above, and what remains.
     and otherwise repaints just the status line.
     `motion` also sets the durations of accent transitions (`subtle`: 220ms; `full`: 330ms),
     the transcript scroll animation (180ms; 270ms), and the latest-bar glow (420ms; 630ms);
-    under `none` all three are instant and schedule no frames. Precedence, highest first:
+    under `none` all three are instant and schedule no frames. When the effective motion turns
+    instant (a theme change, a config apply, or a runtime `reduce_motion` toggle) while one is
+    running, it settles at once: the scroll lands at its target, the latest bar shows the still
+    bar, and the accent shows its target, with no further frames. Precedence, highest first:
     `tui.reduce_motion` (always instant), then an explicit user setting for that animation
     (`[tui.theme] accent_transition = "immediate"` or `accent_transition_ms`; the scroll and
     latest-bar animations have none), then the theme's `motion`. Accent transitions use the
@@ -637,6 +698,17 @@ the design above, and what remains.
   re-derived whenever the plugin catalog is reloaded, keyed by the effective declarations, so an
   unchanged catalog recompiles nothing. Bundled shell, filesystem, and git adapters supply
   summaries and targets.
+* Plugin facts and properties (see Plugin contract v3): manifest declarations, the registry
+  with typed schemas, integer range matchers, property defaults as plugin layers, scoping to the
+  producer's units, and delivery to adapters in the context presentation. The inspector lists a
+  unit's plugin facts and its plugin properties with their origins; `bcode theme explain`
+  registers the same schemas, accepts plugin facts as namespaced `KEY=VALUE` arguments (kept only
+  when `producer` is the declaring plugin, interpreted by the declared type), and lists plugin
+  properties with their origins for a given `producer`. The bundled
+  git plugin declares `bcode.git.already_exists` and `bcode.git.show_destination`, which its clone
+  cards honor.
+* Grouping counts an invocation once when its historical request and a later item are both in
+  the window (superseded requests).
 
 ### Catalog and tooling
 
@@ -654,8 +726,13 @@ the design above, and what remains.
   are accepted as aliases of it when `appearance_picker` itself is not configured.
 * `bcode theme explain`, `bcode theme check`, `bcode theme profiles`, the in-TUI inspector, and
   the generated gallery, as described under Tooling. Explain reads plugin layers from the
-  manifests of the enabled bundled and installed plugins without loading any library, so a
-  plugin whose library would fail to load still shows its layer there.
+  manifests of the enabled bundled and installed plugins without loading any library. It applies
+  the host's pre-load checks (`bcode_plugin::check_manifest_before_load` and
+  `check_registered_plugin_before_load`: tool presentation declarations, the declared ABI
+  version, and the resolved library file's existence), the same functions the native loader
+  runs before opening a library, and lists plugins they reject as skipped with the reason. A
+  library that passes those checks but fails when opened (an unloadable file, a missing symbol,
+  or an exported manifest that disagrees with the file) still shows its layer in explain.
 
 ### Deviations
 
@@ -681,7 +758,4 @@ resolution is under 0.1% of it; the remaining cost is row building and Markdown 
 
 ### Not yet done
 
-* Plugin-declared facts and properties.
 * A CI step for `cargo run -p xtask -- theme-gallery --check`; xtask has no check aggregate yet.
-* An invocation present in the window as both a historical tool request and a tool result may
-  count twice toward a group.

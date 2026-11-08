@@ -9,6 +9,7 @@ mod diagnostics;
 pub mod harness;
 pub mod interaction_controller;
 mod invocation_callbacks;
+mod preload;
 pub mod presentation;
 
 use bcode_plugin_sdk::path::display_from_current_dir;
@@ -29,6 +30,7 @@ pub use bcode_plugin_sdk::{ServiceError, ServiceResponse};
 pub use bcode_provider_auth_models::{
     AuthContractError, AuthMethodContribution, AuthProviderContribution,
 };
+pub use preload::{check_manifest_before_load, check_registered_plugin_before_load};
 pub use presentation::{PluginPresentationDeclaration, PluginToolPresentationMetadata};
 
 /// Authentication provider contribution with canonical host-attached plugin ownership.
@@ -877,11 +879,32 @@ pub fn presentation_declarations<'a>(
         .collect()
 }
 
+/// A selected plugin excluded by the host's pre-load checks.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SkippedPlugin {
+    /// Plugin id from its manifest.
+    pub plugin_id: String,
+    /// Why the host would not load it.
+    pub reason: String,
+}
+
+/// Manifests of the selected plugins that pass the host's pre-load checks.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct SelectedPluginManifests {
+    /// Manifests the host would go on to load: static registrations first,
+    /// then discovered plugins.
+    pub manifests: Vec<PluginManifest>,
+    /// Selected plugins the pre-load checks exclude, in the same order.
+    pub skipped: Vec<SkippedPlugin>,
+}
+
 /// Manifests of the plugins `selection` enables, without loading any plugin.
 ///
 /// Uses the same precedence as native startup: static registrations win over discovered
-/// plugins with the same id. No dynamic library is opened and no plugin is activated, so a
-/// discovered plugin whose library would fail to load is still listed.
+/// plugins with the same id. Each manifest goes through the checks the host applies before
+/// loading ([`check_manifest_before_load`] and [`check_registered_plugin_before_load`]);
+/// plugins that fail them are reported as skipped. No dynamic library is opened and no plugin
+/// is activated, so a library that passes those checks but fails when opened is still listed.
 ///
 /// # Errors
 ///
@@ -890,22 +913,34 @@ pub fn selected_plugin_manifests(
     selection: &PluginSelection,
     discovered_plugins: Vec<RegisteredPlugin>,
     static_plugins: &[StaticBundledPlugin],
-) -> Result<Vec<PluginManifest>, PluginLoadError> {
-    let mut manifests = filter_selected_static_plugins(static_plugins, selection)?
+) -> Result<SelectedPluginManifests, PluginLoadError> {
+    let mut selected = SelectedPluginManifests::default();
+    let mut skip = |plugin_id: &str, error: &PluginLoadError| {
+        selected.skipped.push(SkippedPlugin {
+            plugin_id: plugin_id.to_owned(),
+            reason: error.to_string(),
+        });
+    };
+    let mut manifests = Vec::new();
+    let mut static_ids = BTreeSet::new();
+    for (manifest, _) in filter_selected_static_plugins(static_plugins, selection)? {
+        static_ids.insert(manifest.id.clone());
+        match check_manifest_before_load(&manifest) {
+            Ok(()) => manifests.push(manifest),
+            Err(error) => skip(&manifest.id, &error),
+        }
+    }
+    for plugin in filter_selected_plugins(discovered_plugins, selection)
         .into_iter()
-        .map(|(manifest, _)| manifest)
-        .collect::<Vec<_>>();
-    let static_ids = manifests
-        .iter()
-        .map(|manifest| manifest.id.clone())
-        .collect::<BTreeSet<_>>();
-    manifests.extend(
-        filter_selected_plugins(discovered_plugins, selection)
-            .into_iter()
-            .map(|plugin| plugin.manifest)
-            .filter(|manifest| !static_ids.contains(&manifest.id)),
-    );
-    Ok(manifests)
+        .filter(|plugin| !static_ids.contains(&plugin.manifest.id))
+    {
+        match check_registered_plugin_before_load(&plugin) {
+            Ok(_) => manifests.push(plugin.manifest),
+            Err(error) => skip(&plugin.manifest.id, &error),
+        }
+    }
+    selected.manifests = manifests;
+    Ok(selected)
 }
 
 fn validate_tool_presentation_declarations<'a>(
@@ -2122,6 +2157,16 @@ pub enum PluginLoadError {
     },
     #[error("plugin '{plugin_id}' secret resolution failed: {message}")]
     SecretResolution { plugin_id: String, message: String },
+    /// The resolved native library file does not exist.
+    #[error(
+        "failed to load native library {path}: plugin '{plugin_id}' library file does not exist"
+    )]
+    LibraryNotFound {
+        /// Plugin whose library is missing.
+        plugin_id: String,
+        /// Resolved library path.
+        path: PathBuf,
+    },
     #[error("failed to load native library {path}: {source}")]
     LibraryLoad {
         path: PathBuf,
@@ -6511,23 +6556,14 @@ impl Drop for PluginHost {
 ///
 /// Returns an error if the plugin cannot be loaded or exports invalid metadata.
 pub fn load_registered_plugin(plugin: &RegisteredPlugin) -> Result<LoadedPlugin, PluginLoadError> {
-    validate_tool_presentation_declarations(std::iter::once(&plugin.manifest))?;
     let PluginRuntime::Native(runtime) = &plugin.manifest.runtime;
     tracing::debug!(
         target: "bcode_plugin::startup",
         plugin_id = %plugin.manifest.id,
         abi_version = runtime.abi_version,
-        "validating plugin ABI"
+        "validating plugin before load"
     );
-    if !runtime.is_current_abi() {
-        return Err(PluginLoadError::UnsupportedAbi {
-            plugin_id: plugin.manifest.id.clone(),
-            actual: runtime.abi_version,
-            expected: CURRENT_PLUGIN_ABI_VERSION,
-        });
-    }
-
-    let library_path = resolve_library_path(&plugin.manifest_path, &runtime.library);
+    let library_path = check_registered_plugin_before_load(plugin)?;
     tracing::debug!(
         target: "bcode_plugin::startup",
         plugin_id = %plugin.manifest.id,
@@ -6590,21 +6626,13 @@ pub fn load_static_plugin(
     manifest: PluginManifest,
     vtable: StaticPluginVtable,
 ) -> Result<LoadedPlugin, PluginLoadError> {
-    validate_tool_presentation_declarations(std::iter::once(&manifest))?;
-    let PluginRuntime::Native(runtime) = &manifest.runtime;
-    if !runtime.is_current_abi() {
-        return Err(PluginLoadError::UnsupportedAbi {
-            plugin_id: manifest.id.clone(),
-            actual: runtime.abi_version,
-            expected: CURRENT_PLUGIN_ABI_VERSION,
-        });
-    }
+    check_manifest_before_load(&manifest)?;
 
     let manifest_cache = Box::leak(Box::new(std::sync::OnceLock::new()));
     let exported_manifest = load_static_exported_manifest(vtable, manifest_cache)?;
     if exported_manifest.id != manifest.id {
         return Err(PluginLoadError::ManifestIdMismatch {
-            file_id: manifest.id.clone(),
+            file_id: manifest.id,
             library_id: exported_manifest.id,
         });
     }
@@ -7102,10 +7130,96 @@ library = "libdisabled.dylib"
         }
     }
 
+    /// An existing file that stands in for a plugin library; selection never
+    /// opens it.
+    fn present_test_library() -> PathBuf {
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("Cargo.toml")
+    }
+
+    fn discovered_test_plugin(
+        id: &str,
+        rules: &str,
+        library: &Path,
+        abi_version: u16,
+    ) -> RegisteredPlugin {
+        RegisteredPlugin {
+            manifest_path: PathBuf::from(format!("plugins/{id}/bcode-plugin.toml")),
+            manifest: toml::from_str(&format!(
+                r#"
+id = "{id}"
+name = "Discovered"
+version = "0.0.1"
+{rules}
+[runtime]
+type = "native"
+abi_version = {abi_version}
+library = '{}'
+"#,
+                library.display()
+            ))
+            .expect("manifest should parse"),
+        }
+    }
+
+    #[test]
+    fn selected_manifests_skip_plugins_failing_preload_checks() {
+        let rule = "[[presentation.rules]]\nmatch = { kind = \"tool\" }\nset = { indent = 2 }\n";
+        let present = present_test_library();
+        let selected = selected_plugin_manifests(
+            &PluginSelection::all_enabled(),
+            vec![
+                discovered_test_plugin("test.ok", rule, &present, CURRENT_PLUGIN_ABI_VERSION),
+                discovered_test_plugin(
+                    "test.missing",
+                    rule,
+                    Path::new("lib-missing-on-purpose.dylib"),
+                    CURRENT_PLUGIN_ABI_VERSION,
+                ),
+                discovered_test_plugin(
+                    "test.future-abi",
+                    rule,
+                    &present,
+                    CURRENT_PLUGIN_ABI_VERSION + 1,
+                ),
+            ],
+            &[],
+        )
+        .expect("manifests are read");
+        assert_eq!(
+            selected
+                .manifests
+                .iter()
+                .map(|manifest| manifest.id.as_str())
+                .collect::<Vec<_>>(),
+            ["test.ok"]
+        );
+        let skipped = selected
+            .skipped
+            .iter()
+            .map(|skipped| skipped.plugin_id.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(skipped, ["test.missing", "test.future-abi"]);
+        assert!(selected.skipped[0].reason.contains("does not exist"));
+        assert!(selected.skipped[1].reason.contains("ABI"));
+        // Skipped plugins contribute no presentation layer.
+        let layers =
+            presentation::presentation_rule_layers(&presentation_declarations(&selected.manifests));
+        assert_eq!(
+            layers
+                .iter()
+                .map(|layer| layer.source.clone())
+                .collect::<Vec<_>>(),
+            [bcode_presentation_policy_models::LayerSource::Plugin(
+                "test.ok".to_owned()
+            )]
+        );
+    }
+
     #[test]
     fn selected_manifests_feed_presentation_layers_without_loading_plugins() {
-        let static_plugins = [StaticBundledPlugin::new(
-            r#"
+        let static_manifest: &'static str = Box::leak(
+            format!(
+                r#"
 id = "test.static"
 name = "Static"
 version = "0.0.1"
@@ -7118,31 +7232,24 @@ tool_name = "static.read"
 target_fields = ["path"]
 
 [[presentation.rules]]
-match = { kind = "tool" }
-set = { disclosure = "collapsed" }
+match = {{ kind = "tool" }}
+set = {{ disclosure = "collapsed" }}
 
 [runtime]
 type = "native"
-abi_version = 1
+abi_version = {CURRENT_PLUGIN_ABI_VERSION}
 library = "libstatic.dylib"
-"#,
+"#
+            )
+            .into_boxed_str(),
+        );
+        let static_plugins = [StaticBundledPlugin::new(
+            static_manifest,
             manifest_only_vtable(),
         )];
-        let discovered = |id: &str, rules: &str| RegisteredPlugin {
-            manifest_path: PathBuf::from(format!("plugins/{id}/bcode-plugin.toml")),
-            manifest: toml::from_str(&format!(
-                r#"
-id = "{id}"
-name = "Discovered"
-version = "0.0.1"
-{rules}
-[runtime]
-type = "native"
-abi_version = 1
-library = "lib-missing-on-purpose.dylib"
-"#
-            ))
-            .expect("manifest should parse"),
+        let present_library = present_test_library();
+        let discovered = |id: &str, rules: &str| {
+            discovered_test_plugin(id, rules, &present_library, CURRENT_PLUGIN_ABI_VERSION)
         };
         let rule = "[[presentation.rules]]\nmatch = { kind = \"tool\" }\nset = { indent = 2 }\n";
         let manifests = selected_plugin_manifests(
@@ -7161,6 +7268,8 @@ library = "lib-missing-on-purpose.dylib"
             &static_plugins,
         )
         .expect("manifests are read");
+        assert_eq!(manifests.skipped, Vec::new());
+        let manifests = manifests.manifests;
         let ids = manifests
             .iter()
             .map(|manifest| manifest.id.as_str())

@@ -6,6 +6,7 @@
 
 use std::path::Path;
 
+use bcode_presentation_policy::models::PluginPresentationSchemas;
 use bcode_presentation_policy::{CompiledPolicy, DiagnosticSeverity, PolicyRegistry};
 use bcode_tui_theme::check::{
     CheckFinding, ContrastOutcome, FindingCategory, ThemeCheck, VariantCheck, check_theme,
@@ -65,16 +66,21 @@ impl CheckTarget {
 
 /// Presentation diagnostics for one resolution: the theme's structural layers
 /// (including the chrome density host layer) compiled with the host section
-/// registry, exactly as the TUI stacks them. Configuration and user-state
-/// rules are not part of a theme and are not checked.
-fn presentation_findings(resolved: &ResolvedThemeDefinition) -> Vec<CheckFinding> {
+/// registry and the enabled plugins' declared fact and property `schemas`,
+/// exactly as the TUI stacks them. Configuration and user-state rules are not
+/// part of a theme and are not checked.
+fn presentation_findings(
+    resolved: &ResolvedThemeDefinition,
+    schemas: &PluginPresentationSchemas,
+) -> Vec<CheckFinding> {
     let layers = structure_layers(
         &bcode_tui::theme::structure_layers_for(Some(resolved)),
         &[],
         &[],
         &[],
     );
-    let (_, diagnostics) = CompiledPolicy::compile(&layers, &PolicyRegistry::with_host_parts());
+    let registry = PolicyRegistry::with_host_parts().with_plugin_schemas(schemas);
+    let (_, diagnostics) = CompiledPolicy::compile(&layers, &registry);
     diagnostics
         .into_iter()
         .map(|diagnostic| {
@@ -93,7 +99,10 @@ fn presentation_findings(resolved: &ResolvedThemeDefinition) -> Vec<CheckFinding
 
 /// Check `target` against the themes discovered under `roots`.
 ///
-/// Profiles and bases are checked as overlays over the default theme.
+/// Profiles and bases are checked as overlays over the default theme. The
+/// fact and property `schemas` of the enabled plugins are registered, so theme
+/// rules that set a declared plugin property are type-checked instead of
+/// reported as unknown.
 ///
 /// # Errors
 ///
@@ -102,6 +111,7 @@ fn presentation_findings(resolved: &ResolvedThemeDefinition) -> Vec<CheckFinding
 pub fn check_target(
     target: &CheckTarget,
     roots: &[ThemeDiscoveryRoot],
+    schemas: &PluginPresentationSchemas,
 ) -> Result<ThemeCheck, CliError> {
     let (mut catalog, discovery) = match discover_themes(roots) {
         Ok(discovered) => (discovered.catalog, discovered.diagnostics),
@@ -120,8 +130,10 @@ pub fn check_target(
             selection_for(&catalog, &id)
         }
     };
-    let mut report = check_theme(&catalog, &base, &overlays, &[], presentation_findings)
-        .map_err(|error| CliError::Theme(error.to_string()))?;
+    let mut report = check_theme(&catalog, &base, &overlays, &[], |resolved| {
+        presentation_findings(resolved, schemas)
+    })
+    .map_err(|error| CliError::Theme(error.to_string()))?;
     report
         .findings
         .extend(discovery.into_iter().map(|diagnostic| {
@@ -294,7 +306,7 @@ pub fn run_check(
 ) -> Result<(), CliError> {
     let inputs = crate::theme_explain::load_explain_inputs(None, None)?;
     let target = CheckTarget::from_argument(theme, (inputs.theme, inputs.overlays));
-    let report = check_target(&target, &inputs.roots)?;
+    let report = check_target(&target, &inputs.roots, &inputs.plugin_schemas)?;
     write_check_report(&report, json, writer)?;
     strict_result(&report, strict)
 }
@@ -377,7 +389,7 @@ fg = "$accent"
         let mut strict_failures = Vec::new();
         for definition in catalog.definitions() {
             let target = CheckTarget::Id(definition.id().to_owned());
-            let report = check_target(&target, &roots)
+            let report = check_target(&target, &roots, &PluginPresentationSchemas::default())
                 .unwrap_or_else(|error| panic!("{}: {error}", definition.id()));
             assert!(strict_result(&report, false).is_ok());
             let mut output = Vec::new();
@@ -391,10 +403,86 @@ fg = "$accent"
     }
 
     #[test]
+    fn declared_plugin_properties_are_type_checked_instead_of_unknown() {
+        use bcode_presentation_policy::models::{FactValue, PluginPropertySchema, PropertyType};
+        const PLUGIN_PROFILE: &str = r#"
+schema_version = 2
+id = "git-profile"
+kind = "profile"
+
+[[presentation.rules]]
+match = { kind = "tool" }
+set = { plugin = { "test.git.show_destination" = false } }
+
+[[presentation.rules]]
+match = { kind = "tool" }
+set = { plugin = { "test.git.max_files" = 99 } }
+"#;
+        let (directory, roots) = roots();
+        let target = CheckTarget::File(write_fixture(
+            &directory,
+            "git-profile.toml",
+            PLUGIN_PROFILE,
+        ));
+        let presentation = |report: &ThemeCheck| {
+            let mut messages = report
+                .all_findings()
+                .filter(|finding| finding.category == FindingCategory::Presentation)
+                .map(|finding| finding.message.clone())
+                .collect::<Vec<_>>();
+            messages.sort();
+            messages.dedup();
+            messages
+        };
+
+        // Without plugin schemas both properties are unknown.
+        let unregistered =
+            check_target(&target, &roots, &PluginPresentationSchemas::default()).expect("check");
+        assert_eq!(
+            presentation(&unregistered),
+            [
+                "unknown plugin property \"test.git.max_files\"",
+                "unknown plugin property \"test.git.show_destination\"",
+            ]
+        );
+
+        // With them, the valid value passes and the out-of-range one is
+        // reported against its declaration.
+        let schema = |value_type, default| PluginPropertySchema {
+            plugin: "test.git".to_owned(),
+            value_type,
+            default,
+        };
+        let schemas = PluginPresentationSchemas {
+            facts: std::collections::BTreeMap::new(),
+            properties: std::collections::BTreeMap::from([
+                (
+                    "test.git.show_destination".to_owned(),
+                    schema(PropertyType::Bool, FactValue::Bool(true)),
+                ),
+                (
+                    "test.git.max_files".to_owned(),
+                    schema(PropertyType::Int { min: 1, max: 20 }, FactValue::Int(5)),
+                ),
+            ]),
+        };
+        let registered = check_target(&target, &roots, &schemas).expect("check");
+        assert_eq!(
+            presentation(&registered),
+            ["plugin property \"test.git.max_files\" ignored: 99 is outside 1..=20"]
+        );
+    }
+
+    #[test]
     fn bad_theme_file_fails_strict_and_reports_each_category() {
         let (directory, roots) = roots();
         let path = write_fixture(&directory, "bad-colors.toml", BAD_THEME);
-        let report = check_target(&CheckTarget::File(path), &roots).expect("check");
+        let report = check_target(
+            &CheckTarget::File(path),
+            &roots,
+            &PluginPresentationSchemas::default(),
+        )
+        .expect("check");
         assert!(strict_result(&report, false).is_ok());
         let Err(CliError::Theme(message)) = strict_result(&report, true) else {
             panic!("strict must fail");
@@ -419,7 +507,12 @@ fg = "$accent"
     fn bad_profile_reports_presentation_and_floor_crossing_warnings() {
         let (directory, roots) = roots();
         let path = write_fixture(&directory, "bad-profile.toml", BAD_PROFILE);
-        let report = check_target(&CheckTarget::File(path), &roots).expect("check");
+        let report = check_target(
+            &CheckTarget::File(path),
+            &roots,
+            &PluginPresentationSchemas::default(),
+        )
+        .expect("check");
         assert_eq!(report.theme, DEFAULT_BASE_THEME);
         assert_eq!(report.overlays, ["bad-profile"]);
         let presentation: Vec<_> = report
@@ -445,7 +538,12 @@ fg = "$accent"
     fn json_report_has_a_stable_shape() {
         let (directory, roots) = roots();
         let path = write_fixture(&directory, "bad-colors.toml", BAD_THEME);
-        let report = check_target(&CheckTarget::File(path), &roots).expect("check");
+        let report = check_target(
+            &CheckTarget::File(path),
+            &roots,
+            &PluginPresentationSchemas::default(),
+        )
+        .expect("check");
         let mut output = Vec::new();
         write_check_report(&report, true, &mut output).expect("json");
         let value: serde_json::Value = serde_json::from_slice(&output).expect("valid json");
@@ -482,6 +580,49 @@ fg = "$accent"
             value["summary"]["warnings"],
             serde_json::json!(report.warning_count())
         );
+    }
+
+    #[test]
+    fn contrast_adjustments_are_informational_in_text_and_json() {
+        let (_directory, roots) = roots();
+        let report = check_target(
+            &CheckTarget::Id("nord".to_owned()),
+            &roots,
+            &PluginPresentationSchemas::default(),
+        )
+        .expect("check");
+        assert!(
+            strict_result(&report, true).is_ok(),
+            "adjustments never fail --strict"
+        );
+
+        let mut text = Vec::new();
+        write_check_report(&report, false, &mut text).expect("text");
+        let text = String::from_utf8(text).expect("utf8");
+        let line = text
+            .lines()
+            .find(|line| line.contains("state.error/canvas") && line.contains("adjusted"))
+            .unwrap_or_else(|| panic!("no adjustment line in {text}"));
+        assert!(line.trim_start().starts_with("info"), "{line}");
+        assert!(line.contains("fg #bf616a \u{2192} #e17f87"), "{line}");
+
+        let mut json = Vec::new();
+        write_check_report(&report, true, &mut json).expect("json");
+        let value: serde_json::Value = serde_json::from_slice(&json).expect("valid json");
+        let adjustment = value["variants"]
+            .as_array()
+            .expect("variants")
+            .iter()
+            .flat_map(|variant| variant["adjustments"].as_array().expect("adjustments"))
+            .find(|row| row["role"] == "state.error" && row["background"] == "canvas")
+            .expect("state.error adjustment");
+        assert_eq!(adjustment["channel"], "fg");
+        assert_eq!(adjustment["before"], "#bf616a");
+        assert_eq!(adjustment["after"], "#e17f87");
+        for key in ["ratio_before", "ratio_after", "minimum"] {
+            assert!(adjustment[key].is_f64(), "{key}: {adjustment}");
+        }
+        assert_eq!(value["summary"]["warnings"], 0);
     }
 
     #[test]
@@ -545,7 +686,11 @@ fg = "$accent"
     fn unknown_theme_is_an_error() {
         let (_directory, roots) = roots();
         assert!(matches!(
-            check_target(&CheckTarget::Id("no-such-theme".to_owned()), &roots),
+            check_target(
+                &CheckTarget::Id("no-such-theme".to_owned()),
+                &roots,
+                &PluginPresentationSchemas::default(),
+            ),
             Err(CliError::Theme(_))
         ));
     }

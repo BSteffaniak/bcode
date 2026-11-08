@@ -3051,7 +3051,8 @@ struct TranscriptVisualHost<'a> {
 
 /// Push `item`'s rows, placing it in its group when it has one.
 ///
-/// A group's first member renders the group header before its own rows.
+/// The item that heads a group (its first member, or a superseded request
+/// leading into it) renders the group header before its own rows.
 /// Members and bridges render fully, as one header row, or not at all,
 /// according to the group's disclosure; zero-row entries keep the one entry
 /// per transcript item the layout expects.
@@ -3069,7 +3070,8 @@ fn push_transcript_item_rows(
     let grouped = STRUCTURE.with(|state| {
         let state = state.borrow();
         let placement = *state.group_placement(id)?;
-        let header = (placement.role == bcode_presentation_policy::GroupRole::Leader)
+        let header = placement
+            .heads
             .then(|| {
                 Some((
                     state.group_view(placement.group)?.clone(),

@@ -227,16 +227,38 @@ pub enum AdjustedChannel {
 }
 
 /// One color raised to meet its contrast pair during resolution.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub struct ContrastAdjustment {
     /// Adjusted role.
     pub role: &'static str,
     /// Adjusted color.
     pub channel: AdjustedChannel,
+    /// Background role of the pair that required the adjustment: the surface
+    /// the role is painted on, or the role itself when it paints its own
+    /// background.
+    pub pair_background: &'static str,
     /// Color before adjustment.
     pub before: Rgb,
     /// Color after adjustment.
     pub after: Rgb,
+    /// The pair's other, unchanged color the adjustment was measured against.
+    pub against: Rgb,
+    /// Minimum ratio of the pair.
+    pub minimum: f64,
+}
+
+impl ContrastAdjustment {
+    /// Contrast ratio of the pair before the adjustment.
+    #[must_use]
+    pub fn ratio_before(&self) -> f64 {
+        self.before.contrast_ratio(self.against)
+    }
+
+    /// Contrast ratio of the pair after the adjustment.
+    #[must_use]
+    pub fn ratio_after(&self) -> f64 {
+        self.after.contrast_ratio(self.against)
+    }
 }
 
 /// Raise `adjustable` roles in `styles` to their [`PAIRS`] thresholds.
@@ -266,21 +288,31 @@ pub(crate) fn enforce(
         if fg.contrast_ratio(bg) + RATIO_TOLERANCE >= pair.minimum {
             continue;
         }
+        let pair_background = match pair.background {
+            PairBackground::Surface(surface) => surface,
+            PairBackground::OwnWithText(_) => pair.role,
+        };
         let adjustment = if style.fg.is_some() {
             let after = bmux_color::ensure_contrast(fg, bg, pair.minimum);
             ContrastAdjustment {
                 role: pair.role,
                 channel: AdjustedChannel::Foreground,
+                pair_background,
                 before: fg,
                 after,
+                against: bg,
+                minimum: pair.minimum,
             }
         } else if matches!(pair.background, PairBackground::OwnWithText(_)) && style.bg.is_some() {
             let after = bmux_color::ensure_contrast(bg, fg, pair.minimum);
             ContrastAdjustment {
                 role: pair.role,
                 channel: AdjustedChannel::Background,
+                pair_background,
                 before: bg,
                 after,
+                against: fg,
+                minimum: pair.minimum,
             }
         } else {
             continue;

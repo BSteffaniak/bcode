@@ -1634,6 +1634,7 @@ mod tool_presentation_tests {
             },
             sections: std::collections::BTreeMap::new(),
             header_fields: Vec::new(),
+            properties: std::collections::BTreeMap::new(),
         };
         let with_presentation = context().with_presentation(resolved.clone());
         assert_eq!(with_presentation.presentation(), Some(&resolved));

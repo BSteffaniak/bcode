@@ -7,6 +7,7 @@
 //!   on surfaces, accents, status colors, diffs, selection) against fixed
 //!   thresholds;
 //! * unknown style roles and container keys;
+//! * colors resolution raised to meet their contrast pair (informational);
 //! * roles resolved only through fallbacks (seed derivation or host defaults);
 //! * role registry coverage;
 //! * resolver warnings and caller-supplied structural presentation diagnostics.
@@ -20,7 +21,8 @@ use std::collections::BTreeSet;
 use serde::Serialize;
 
 use crate::contrast::{
-    CanvasColors, PAIRS, PairBackground, PairSpec, RATIO_TOLERANCE, measurable, pair_colors,
+    AdjustedChannel, CanvasColors, ContrastAdjustment, PAIRS, PairBackground, PairSpec,
+    RATIO_TOLERANCE, measurable, pair_colors,
 };
 use crate::definition::{
     REQUIRED_CONTAINER_ROLES, REQUIRED_SEMANTIC_STYLE_ROLES, ResolvedThemeDefinition,
@@ -62,6 +64,8 @@ impl Severity {
 pub enum FindingCategory {
     /// A contrast pair below its threshold.
     Contrast,
+    /// A color resolution raised to meet its contrast pair; informational.
+    Adjusted,
     /// A style role or container key Bcode does not recognize.
     UnknownKey,
     /// Roles that resolve only through seed derivation or host fallbacks.
@@ -82,6 +86,7 @@ impl FindingCategory {
     pub const fn name(self) -> &'static str {
         match self {
             Self::Contrast => "contrast",
+            Self::Adjusted => "adjusted",
             Self::UnknownKey => "unknown_key",
             Self::Fallback => "fallback",
             Self::Coverage => "coverage",
@@ -216,6 +221,74 @@ pub struct ContrastRow {
     pub note: Option<String>,
 }
 
+/// Which color of a role a contrast adjustment changed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AdjustmentChannel {
+    /// The role's foreground.
+    Fg,
+    /// The role's own background.
+    Bg,
+}
+
+impl AdjustmentChannel {
+    /// Stable lowercase name.
+    #[must_use]
+    pub const fn name(self) -> &'static str {
+        match self {
+            Self::Fg => "fg",
+            Self::Bg => "bg",
+        }
+    }
+}
+
+impl From<AdjustedChannel> for AdjustmentChannel {
+    fn from(channel: AdjustedChannel) -> Self {
+        match channel {
+            AdjustedChannel::Foreground => Self::Fg,
+            AdjustedChannel::Background => Self::Bg,
+        }
+    }
+}
+
+/// One color theme resolution raised to meet its contrast pair. The
+/// [`VariantCheck::contrast`] rows measure the adjusted colors.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct AdjustmentRow {
+    /// Adjusted role.
+    pub role: &'static str,
+    /// Background role of the pair that required the adjustment; equal to
+    /// `role` when the role paints its own background.
+    pub background: &'static str,
+    /// Which color of `role` changed.
+    pub channel: AdjustmentChannel,
+    /// Color before adjustment, as `#rrggbb`.
+    pub before: String,
+    /// Color after adjustment, as `#rrggbb`.
+    pub after: String,
+    /// Pair contrast before adjustment, truncated to two decimals.
+    pub ratio_before: f64,
+    /// Pair contrast after adjustment, truncated to two decimals.
+    pub ratio_after: f64,
+    /// Threshold of the pair.
+    pub minimum: f64,
+}
+
+impl From<&ContrastAdjustment> for AdjustmentRow {
+    fn from(adjustment: &ContrastAdjustment) -> Self {
+        Self {
+            role: adjustment.role,
+            background: adjustment.pair_background,
+            channel: adjustment.channel.into(),
+            before: adjustment.before.to_hex(),
+            after: adjustment.after.to_hex(),
+            ratio_before: truncate_ratio(adjustment.ratio_before()),
+            ratio_after: truncate_ratio(adjustment.ratio_after()),
+            minimum: adjustment.minimum,
+        }
+    }
+}
+
 /// Light/dark branch a variant check covers.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -280,6 +353,9 @@ pub struct VariantCheck {
     pub applied_layers: Vec<String>,
     /// Contrast measurements, in pair-table order.
     pub contrast: Vec<ContrastRow>,
+    /// Colors resolution raised to meet their contrast pair, in pair-table
+    /// order. Informational: adjustments never count as warnings.
+    pub adjustments: Vec<AdjustmentRow>,
     /// Role registry coverage.
     pub coverage: RoleCoverage,
     /// Findings for this variant.
@@ -419,6 +495,32 @@ pub fn check_resolved(
         ));
     }
 
+    let adjustments: Vec<AdjustmentRow> = resolved
+        .contrast_adjustments
+        .iter()
+        .map(AdjustmentRow::from)
+        .collect();
+    findings.extend(adjustments.iter().map(|row| {
+        let subject = if row.role == row.background {
+            row.role.to_owned()
+        } else {
+            format!("{}/{}", row.role, row.background)
+        };
+        CheckFinding::info(
+            FindingCategory::Adjusted,
+            subject,
+            format!(
+                "{} {} \u{2192} {} (contrast {:.2} \u{2192} {:.2}, minimum {:.1})",
+                row.channel.name(),
+                row.before,
+                row.after,
+                row.ratio_before,
+                row.ratio_after,
+                row.minimum
+            ),
+        )
+    }));
+
     let unknown_messages = unknown_key_findings(resolved, role_namespaces, &mut findings);
     findings.extend(
         resolved
@@ -441,6 +543,7 @@ pub fn check_resolved(
         variants: Vec::new(),
         applied_layers: resolved.applied_layers.clone(),
         contrast,
+        adjustments,
         coverage,
         findings,
     }
@@ -616,7 +719,7 @@ fn measure_pair(
     match measured {
         (Ok(fg), Ok(bg)) => {
             let ratio = fg.contrast_ratio(bg);
-            row.ratio = Some((ratio * 100.0).floor() / 100.0);
+            row.ratio = Some(truncate_ratio(ratio));
             row.outcome = if ratio + RATIO_TOLERANCE >= pair.minimum {
                 ContrastOutcome::Pass
             } else {
@@ -630,6 +733,11 @@ fn measure_pair(
         row.note = Some(notes.join("; "));
     }
     row
+}
+
+/// A contrast ratio truncated to two decimals, as reported.
+fn truncate_ratio(ratio: f64) -> f64 {
+    (ratio * 100.0).floor() / 100.0
 }
 
 #[cfg(test)]
@@ -846,6 +954,114 @@ modifiers = ["reversed"]
         assert_eq!(calls, report.variants.len());
         assert_eq!(report.summary.warnings, report.warning_count());
         assert!(report.warning_count() >= calls);
+    }
+
+    /// Seeds whose derived roles fall below their pairs before enforcement.
+    const LOW_CONTRAST_SEEDS: &str = r##"
+schema_version = 2
+id = "low-contrast"
+extends = ["seeded-base"]
+
+[palette]
+accent = "#3760bf"
+background = "#e1e2e7"
+blue = "#2e7de9"
+green = "#587539"
+orange = "#b15c00"
+red = "#f52a65"
+text = "#3760bf"
+yellow = "#8c6c3e"
+"##;
+
+    fn adjustment_findings(variant: &VariantCheck) -> Vec<&CheckFinding> {
+        variant
+            .findings
+            .iter()
+            .filter(|finding| finding.category == FindingCategory::Adjusted)
+            .collect()
+    }
+
+    #[test]
+    fn seed_adjustments_are_reported_as_info_findings() {
+        let catalog = catalog_with(LOW_CONTRAST_SEEDS);
+        let report =
+            check_theme(&catalog, "low-contrast", &[], &[], |_| Vec::new()).expect("check");
+        let mut adjusted = 0;
+        for variant in &report.variants {
+            let findings = adjustment_findings(variant);
+            assert_eq!(findings.len(), variant.adjustments.len());
+            for (index, (adjustment, finding)) in
+                variant.adjustments.iter().zip(findings).enumerate()
+            {
+                adjusted += 1;
+                assert_eq!(finding.severity, Severity::Info);
+                assert!(
+                    adjustment.ratio_before < adjustment.minimum,
+                    "{adjustment:?}"
+                );
+                assert!(
+                    adjustment.ratio_after + RATIO_TOLERANCE >= adjustment.minimum,
+                    "{adjustment:?}"
+                );
+                assert_ne!(adjustment.before, adjustment.after);
+                assert!(finding.message.contains(&adjustment.before), "{finding:?}");
+                assert!(finding.message.contains(&adjustment.after), "{finding:?}");
+                assert!(
+                    finding.message.starts_with(adjustment.channel.name()),
+                    "{finding:?}"
+                );
+                // The measured row reports the adjusted color, unless a later
+                // pair moved the same color again.
+                let superseded = variant.adjustments[index + 1..].iter().any(|later| {
+                    later.role == adjustment.role && later.channel == adjustment.channel
+                });
+                if superseded {
+                    continue;
+                }
+                let measured = row(variant, adjustment.role, adjustment.background);
+                let adjusted_hex = match adjustment.channel {
+                    AdjustmentChannel::Fg => measured.fg.as_deref(),
+                    AdjustmentChannel::Bg => measured.bg.as_deref(),
+                };
+                assert_eq!(adjusted_hex, Some(adjustment.after.as_str()));
+            }
+        }
+        assert!(adjusted > 0, "fixture must exercise enforcement");
+        let warnings_without_adjustments = report
+            .all_findings()
+            .filter(|finding| finding.category != FindingCategory::Adjusted)
+            .filter(|finding| finding.severity == Severity::Warning)
+            .count();
+        assert_eq!(report.warning_count(), warnings_without_adjustments);
+        assert!(report.summary.infos >= adjusted);
+    }
+
+    #[test]
+    fn enforced_authored_adjustments_do_not_fail_strict() {
+        let report = check_theme(
+            &ThemeCatalog::bundled().expect("bundled"),
+            "nord",
+            &[],
+            &[],
+            |_| Vec::new(),
+        )
+        .expect("check");
+        let error = report
+            .variants
+            .iter()
+            .flat_map(|variant| &variant.adjustments)
+            .find(|row| row.role == "state.error" && row.background == "canvas")
+            .expect("nord's authored error red is adjusted");
+        assert_eq!(error.channel, AdjustmentChannel::Fg);
+        assert_eq!(error.before, "#bf616a");
+        assert_eq!(error.after, "#e17f87");
+        assert!(error.ratio_before < error.minimum);
+        assert!(report.all_findings().any(|finding| {
+            finding.category == FindingCategory::Adjusted
+                && finding.subject == "state.error/canvas"
+                && finding.severity == Severity::Info
+        }));
+        assert_eq!(report.warning_count(), 0, "adjustments are not warnings");
     }
 
     #[test]

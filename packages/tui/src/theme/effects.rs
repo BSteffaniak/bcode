@@ -16,7 +16,8 @@
 //!   frames. `[tui] reduce_motion = true` forces `none`.
 //! * Motion also sets the durations of accent transitions, transcript scroll
 //!   animations, and the latest-bar glow. `none` makes all three instant, so
-//!   they schedule no frames. An explicit accent transition setting wins over
+//!   they schedule no frames, and one already running when motion turns
+//!   instant settles at once. An explicit accent transition setting wins over
 //!   the theme's level; `reduce_motion` wins over everything.
 
 use std::time::Duration;

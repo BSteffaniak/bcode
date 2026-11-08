@@ -219,7 +219,8 @@ border style. `[tui] reduce_motion = true` disables animated chrome.
   An explicit `[tui.theme] accent_transition = "immediate"` or
   `accent_transition_ms` takes precedence over the theme for accent changes.
   `[tui] reduce_motion = true` overrides both and makes every animation
-  instant.
+  instant. Switching to `none` or turning `reduce_motion` on while an
+  animation runs finishes it immediately.
 
 ### Structural presentation
 
@@ -260,8 +261,19 @@ empty `match` matches every unit.
 | `duration` | `<1s`, `1s..10s`, `10s..60s`, `>60s` |
 | `last_in_turn` | bool; units without the fact never match |
 
-Plugins may declare further facts for their own tools. Unknown facts and
-plugin properties produce warnings.
+Plugins may declare further facts for their own units, named under their
+plugin id (`bcode.git.already_exists`). Match them under `plugin`, by value, by
+any of a list, or, for integer facts, by range (`gt`, `gte`, `lt`, `lte`):
+
+```toml
+[[presentation.rules]]
+match = { plugin = { "bcode.git.files" = { gt = 10 } } }
+set   = { disclosure = "collapsed" }
+```
+
+Only units produced by the declaring plugin carry its facts; other units never
+match. Unknown facts, and values that can never match a declared fact's type,
+produce warnings.
 
 #### Properties
 
@@ -279,6 +291,7 @@ plugin properties produce warnings.
 | `spacing` | `{ before, after }` blank rows, each 0–2; default `{ before = 0, after = 1 }` |
 | `indent` | extra columns, 0–8; default 0 |
 | `placement`, `container` | interaction placement and container recipe id |
+| `plugin.<name>` | a plugin-declared property, for example `plugin = { "bcode.git.show_destination" = false }` |
 
 A tool unit's disclosure decides how much of it is drawn:
 
@@ -294,6 +307,13 @@ another sets disclosure. `sections` merge per section and per field. `summary`
 and `spacing` are replaced as a whole; omitted fields take their defaults.
 Out-of-range `spacing`, `indent`, and over-long templates are clamped and
 reported as warnings.
+
+Plugin properties are declared in a plugin's manifest with a type (`bool`,
+`int` with optional bounds, or `enum`) and a default. They apply only to that
+plugin's units: a rule may set one for every unit, and the other units ignore
+it. Values of the wrong type or out of bounds are ignored with a warning;
+unknown plugin properties produce warnings. The plugin's visual adapters receive
+the resolved values when they render.
 
 #### Groups
 
@@ -320,7 +340,10 @@ set   = { disclosure = "collapsed", reveal = ["running", "waiting", "failed", "t
   they stay inside the group of the call they belong to, never split it, and
   appear whenever that call is shown in full. A contribution of a call outside
   the group is treated like any other unit between members: it must be a bridge
-  kind, and a failed one ends the group.
+  kind, and a failed one ends the group. A call counts once: when its earlier
+  request and its later result are both in view, the result is the member and
+  the request is shown with it, and requests directly before a group's first
+  member open the group.
 * `min`: the smallest run that forms a group; default and minimum 2.
 
 Groups never reorder units and never cross turns. A group's `bridge` and `min`
@@ -458,7 +481,7 @@ in view.
 | `e` | expand everything under the focused target |
 | `d` | cycle the focused target collapsed → summary → expanded |
 | `i` | open or close the inspector for the focused target |
-| `shift+Down`, `shift+Up` | scroll the inspector (the mouse wheel over it also scrolls) |
+| `shift+Down`, `shift+Up` | scroll the inspector (the mouse wheel over it also scrolls, and its scrollbar can be clicked and dragged) |
 | `m` | make the focused tool unit's disclosure the default for that tool |
 | Escape | close the inspector, then leave focus mode (`alt+u` also leaves, closing the inspector) |
 
@@ -476,7 +499,7 @@ saves a rule such as `match = { kind = "tool", tool = "read" }`,
 for the same tool, and applies it immediately (user-state writes are
 serialized, so a concurrent theme or profile save is never lost); the inspector and
 `bcode theme explain` then report it under the `user_state` layer. The command
-palette offers the same three actions.
+palette offers the same three actions, plus entering or leaving focus mode.
 
 #### Explaining a unit
 
@@ -485,7 +508,11 @@ and prints every property with the rule and layer that set it, floor
 adjustments, and diagnostics. Plugin default rules appear as `plugin` layers,
 read from the manifests of the enabled bundled and installed plugins (no plugin
 is started); pass `producer=<plugin id>` to see a plugin's rules apply to its
-own units:
+own units. Plugins Bcode would refuse to load before opening their library (an
+unsupported ABI version, a missing library file, or an invalid tool
+presentation declaration) are listed as `skipped` with the reason and add no
+layer. A library that passes those checks but fails when it is opened still
+shows its layer here:
 
 ```console
 bcode theme explain tool=read status=succeeded lines=40
@@ -493,7 +520,11 @@ bcode theme explain --profile focus kind=group turn=older
 bcode theme explain --theme rice-mocha tool=bash status=failed --json
 ```
 
-Facts are `KEY=VALUE` arguments (`kind` defaults to `tool`). `--theme` and
+Facts are `KEY=VALUE` arguments (`kind` defaults to `tool`). A namespaced key
+is a plugin fact (`producer=bcode.git bcode.git.files=12`); it is interpreted by
+its declared type and, as in the TUI, kept only when `producer` is the declaring
+plugin. Declared plugin properties are type-checked and their manifest defaults
+are attributed to the plugin's layer. `--theme` and
 `--profile` replace the configured selection, and `--profile ""` clears the
 profile. `bcode theme profiles` lists the available profiles and marks the
 configured one.
@@ -522,9 +553,14 @@ theme file. The report lists, per variant:
   unset (renderers use their own fallback);
 * registry coverage;
 * structural rule warnings from the theme's `[[presentation.rules]]`,
-  including rules that try to cross the visibility floor.
+  including rules that try to cross the visibility floor; properties and facts
+  declared by the enabled plugins are checked against their declared types
+  rather than reported as unknown;
+* contrast adjustments resolution made (see Seed palettes), as `adjusted`
+  notes naming the role, whether its foreground or background moved, the
+  color before and after, and the pair's contrast before and after.
 
-Warnings do not fail the command unless `--strict` is given. `--json` prints a
+Adjustments are informational and never count as warnings. Warnings do not fail the command unless `--strict` is given. `--json` prints a
 stable, versioned structure. Every bundled theme passes `--strict` in both
 variants.
 

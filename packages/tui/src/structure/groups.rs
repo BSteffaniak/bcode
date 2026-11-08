@@ -6,7 +6,10 @@
 //! keeps one layout entry per transcript item. Only tool calls are members:
 //! supplemental and hidden tool contribution items are offered as attached
 //! units, so they never count toward a group and render with the member whose
-//! invocation they belong to. The projection is updated
+//! invocation they belong to. An invocation counts once: a historical tool
+//! request followed in the window by a later item of the same invocation (its
+//! result or primary presentation) is offered as superseded, so the later item
+//! represents the call and the request is attached to it. The projection is updated
 //! incrementally: unchanged items are recognized by identity and revision, so
 //! a streaming update re-examines only the changed item's neighborhood.
 
@@ -55,6 +58,9 @@ pub struct GroupPlacement {
     /// For an attached unit, the member item whose invocation it belongs
     /// to, when that member is in the group; it renders with that member.
     pub attached_to: Option<u64>,
+    /// Whether this item's entry presents the group header: the group's first
+    /// item, which is the leader unless superseded requests lead into it.
+    pub heads: bool,
     /// Whether this is the last item of the group that renders rows, so it
     /// carries the group's trailing spacing.
     pub closes: bool,
@@ -74,8 +80,9 @@ pub struct GroupView {
     pub members: Vec<u64>,
     /// Bridged item ids in transcript order.
     pub bridged: Vec<u64>,
-    /// Attached item ids (supplemental and hidden tool contributions) in
-    /// transcript order; never counted as members.
+    /// Attached item ids (supplemental and hidden tool contributions, and
+    /// superseded tool requests) in transcript order; never counted as
+    /// members.
     pub attached: Vec<u64>,
     /// Member tool names with their counts, in first-appearance order.
     pub tools: Vec<(String, usize)>,
@@ -300,12 +307,13 @@ impl StructureSnapshot {
         };
         let rendering = self.member_rendering(item_id);
         let mut signature = format!(
-            "{}:{:?}:{:?}:{}:{}:{}",
+            "{}:{:?}:{:?}:{}:{}:{}:{}",
             placement.group,
             placement.role,
             rendering,
             placement.revealed,
             placement.closes,
+            placement.heads,
             self.member_indent(placement.group),
         );
         if placement.closes {
@@ -315,7 +323,7 @@ impl StructureSnapshot {
                 self.group_closing_spacing(placement.group)
             );
         }
-        if placement.role == GroupRole::Leader
+        if placement.heads
             && let (Some(view), Some(presentation)) = (
                 self.group_view(placement.group),
                 self.group_presentation(placement.group),
@@ -387,6 +395,11 @@ struct CachedUnit {
     /// Whether the item is a tool contribution attached to an invocation
     /// rather than a tool call (see [`is_attached_contribution`]).
     attached: bool,
+    /// Whether the item is a historical tool request.
+    request: bool,
+    /// Whether a later resident item represents this request's invocation
+    /// (see [`mark_superseded`]).
+    superseded: bool,
 }
 
 impl CachedUnit {
@@ -424,7 +437,17 @@ impl CachedUnit {
             duration_ms,
             invocation: item.visual_invocation_id().map(str::to_owned),
             attached: is_attached_contribution(item),
+            request: matches!(item.kind(), TranscriptItemKind::ToolRequest { .. }),
+            superseded: false,
         }
+    }
+
+    /// Whether this item can represent its invocation: a tool unit that is
+    /// neither an attached contribution nor a historical request.
+    fn represents_invocation(&self) -> bool {
+        !self.attached
+            && !self.request
+            && self.facts.kind == Some(bcode_presentation_policy::models::UnitKind::Tool)
     }
 
     const fn same_item(&self, source: GroupSource<'_>) -> bool {
@@ -440,6 +463,7 @@ impl CachedUnit {
             && self.duration_ms == other.duration_ms
             && self.invocation == other.invocation
             && self.attached == other.attached
+            && self.superseded == other.superseded
     }
 }
 
@@ -457,6 +481,8 @@ pub(super) struct GroupCache {
     last_in_turn: Option<String>,
     /// Producer-declared target fields the units were resolved under.
     target_fields: Arc<super::DeclaredTargetFields>,
+    /// Plugin fact sources the units were resolved under.
+    plugin_facts: Arc<super::FactSources>,
     /// Structure revision the views were built under.
     revision: Option<u64>,
     /// Layout fragment of every grouped item, for change detection.
@@ -489,16 +515,19 @@ impl GroupCache {
             || self.turns != turns
             || self.last_in_turn != last_in_turn
             || self.target_fields != snapshot.target_fields
+            || !Arc::ptr_eq(&self.plugin_facts, &snapshot.plugin_facts)
         {
             self.units = sources
                 .iter()
                 .map(|source| CachedUnit::new(snapshot, *source))
                 .collect();
+            mark_superseded(&mut self.units);
             self.grouping = Grouping::compute(&inputs(&self.units));
             self.policy = Some(policy);
             self.turns = turns;
             self.last_in_turn = last_in_turn;
             self.target_fields = Arc::clone(&snapshot.target_fields);
+            self.plugin_facts = Arc::clone(&snapshot.plugin_facts);
             true
         } else {
             self.splice(snapshot, sources)
@@ -528,21 +557,33 @@ impl GroupCache {
             return false;
         }
         let dirty = prefix..new_len - suffix;
-        let fresh: Vec<CachedUnit> = sources[dirty.clone()]
+        let mut fresh: Vec<CachedUnit> = sources[dirty.clone()]
             .iter()
             .map(|source| CachedUnit::new(snapshot, *source))
             .collect();
         let replaced = prefix..old_len - suffix;
+        // Fresh units keep the superseded state their predecessors had until
+        // it is recomputed below, so an unchanged splice stays unchanged.
+        for (new, old) in fresh.iter_mut().zip(&self.units[replaced.clone()]) {
+            if new.item_id == old.item_id {
+                new.superseded = old.superseded;
+            }
+        }
         let unchanged = old_len == new_len
             && self.units[replaced.clone()]
                 .iter()
                 .zip(&fresh)
                 .all(|(old, new)| old.same_inputs(new));
         self.units.splice(replaced, fresh);
-        if unchanged {
+        // A changed item can supersede, or stop superseding, an earlier
+        // request; those requests join the regrouped span.
+        let reclassified = mark_superseded(&mut self.units);
+        if unchanged && reclassified.is_none() {
             return false;
         }
-        self.grouping.update(&inputs(&self.units), dirty);
+        let start = reclassified.map_or(dirty.start, |first| first.min(dirty.start));
+        let end = dirty.end.max(reclassified.map_or(0, |first| first + 1));
+        self.grouping.update(&inputs(&self.units), start..end);
         true
     }
 
@@ -563,6 +604,7 @@ impl GroupCache {
                     Some((unit.invocation.as_deref()?, unit.item_id))
                 })
                 .collect();
+            let start = group.start();
             for (position, role) in group
                 .members
                 .iter()
@@ -593,6 +635,7 @@ impl GroupCache {
                         attached_to: (role == GroupRole::Attached)
                             .then(|| owners.get(unit.invocation.as_deref()?).copied())
                             .flatten(),
+                        heads: position == start,
                         closes: false,
                     },
                 );
@@ -669,8 +712,9 @@ impl GroupCache {
     }
 }
 
-/// Mark the last row-rendering item of every group; the leader always
-/// renders the group header, so it closes when nothing after it renders.
+/// Mark the last row-rendering item of every group; the item that heads the
+/// group always renders the group header, so it closes when nothing after it
+/// renders.
 fn mark_closers(snapshot: &StructureSnapshot, built: &mut GroupSnapshot) {
     let mut probe = snapshot.clone();
     probe.groups = Arc::new(std::mem::take(built));
@@ -692,6 +736,7 @@ fn mark_closers(snapshot: &StructureSnapshot, built: &mut GroupSnapshot) {
                     .member_rendering(id)
                     .is_some_and(|rendering| rendering != MemberRendering::Nothing)
             })
+            .or_else(|| items.first())
             .copied()
             .unwrap_or(view.id);
         closers.push(closer);
@@ -732,8 +777,37 @@ fn inputs(units: &[CachedUnit]) -> Vec<GroupingInput<'_>> {
             group: &unit.group,
             invocation: unit.invocation.as_deref(),
             attached: unit.attached,
+            superseded: unit.superseded,
         })
         .collect()
+}
+
+/// Mark every historical request whose invocation a later unit represents
+/// (see [`CachedUnit::represents_invocation`]) as superseded; returns the
+/// first position whose mark changed.
+///
+/// One backward pass over the resident window.
+fn mark_superseded(units: &mut [CachedUnit]) -> Option<usize> {
+    let mut represented: BTreeSet<&str> = BTreeSet::new();
+    let mut marks = vec![false; units.len()];
+    for (position, unit) in units.iter().enumerate().rev() {
+        let Some(invocation) = unit.invocation.as_deref() else {
+            continue;
+        };
+        if unit.request {
+            marks[position] = represented.contains(invocation);
+        } else if unit.represents_invocation() {
+            represented.insert(invocation);
+        }
+    }
+    let mut first_changed = None;
+    for (position, (unit, mark)) in units.iter_mut().zip(marks).enumerate() {
+        if unit.superseded != mark {
+            unit.superseded = mark;
+            first_changed.get_or_insert(position);
+        }
+    }
+    first_changed
 }
 
 #[cfg(test)]
@@ -941,6 +1015,72 @@ mod tests {
         sync(&mut state, &items);
         assert_eq!(renderings(&state, &items)[..5], [Some(Full); 5]);
         assert!(state.snapshot().group_placement(id(4)).unwrap().closes);
+    }
+
+    #[test]
+    fn historical_requests_count_once_and_head_the_group() {
+        use MemberRendering::{HeaderRow, Nothing};
+        let mut state = state(
+            "[[rules]]\nmatch = { kind = \"tool\" }\nset = { group = { by = \"consecutive\" } }\n\
+             [[rules]]\nmatch = { kind = \"group\" }\nset = { disclosure = \"summary\" }",
+        );
+        let mut items = vec![
+            request("a", "read", "{}"),
+            tool("a", "read", false),
+            request("b", "read", "{}"),
+        ];
+        // Before `b`'s result arrives, its request is a call of its own.
+        sync(&mut state, &items);
+        let id = |items: &[TranscriptItem], index: usize| items[index].id().get();
+        let leader = id(&items, 1);
+        let view = state.snapshot().group_view(leader).cloned().expect("group");
+        assert_eq!(view.members, [id(&items, 1), id(&items, 2)]);
+        assert_eq!(view.attached, [id(&items, 0)]);
+
+        // The result supersedes the request: two invocations, not three.
+        items.push(tool("b", "read", false));
+        let changed = sync(&mut state, &items);
+        assert!(changed.contains(&2), "{changed:?}");
+        let snapshot = state.snapshot();
+        let view = snapshot.group_view(leader).expect("group");
+        assert_eq!(view.members, [id(&items, 1), id(&items, 3)]);
+        assert_eq!(view.attached, [id(&items, 0), id(&items, 2)]);
+        assert_eq!(view.tools, [("read".to_owned(), 2)]);
+        assert_eq!(
+            view.facts.items,
+            bcode_presentation_policy::models::SizeBucket::of(2)
+        );
+        // The leading request heads the group; requests render with their
+        // results (one header row per invocation).
+        let placement = |index: usize| *snapshot.group_placement(id(&items, index)).unwrap();
+        assert!(placement(0).heads);
+        assert!(!placement(1).heads);
+        assert_eq!(placement(2).attached_to, Some(id(&items, 3)));
+        assert_eq!(
+            renderings(&state, &items),
+            [
+                Some(Nothing),
+                Some(HeaderRow),
+                Some(Nothing),
+                Some(HeaderRow)
+            ]
+        );
+        // Incremental grouping equals a fresh computation.
+        let fresh = state
+            .snapshot()
+            .with_groups_for(&items.iter().collect::<Vec<_>>());
+        assert_eq!(*fresh.groups, *snapshot.groups);
+
+        // Removing the result restores the request as the call.
+        items.pop();
+        sync(&mut state, &items);
+        let snapshot = state.snapshot();
+        let view = snapshot.group_view(leader).expect("group");
+        assert_eq!(view.members, [id(&items, 1), id(&items, 2)]);
+        let fresh = state
+            .snapshot()
+            .with_groups_for(&items.iter().collect::<Vec<_>>());
+        assert_eq!(*fresh.groups, *snapshot.groups);
     }
 
     #[test]

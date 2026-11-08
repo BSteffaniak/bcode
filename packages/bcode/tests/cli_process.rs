@@ -3954,6 +3954,7 @@ fn session_spawn_prints_live_preparation_failure_receipt() {
         input: "must not execute".to_owned(),
         admission: bcode_session_models::TurnAdmissionMetadata::default(),
         auth_profile: None,
+        managed: None,
     };
     std::fs::write(
         root.path().join("spawn.json"),
@@ -4134,6 +4135,7 @@ fn session_spawn_live_child_retry_and_changed_request_conflict() {
         input: "offline spawn parity 🦀".to_owned(),
         admission: bcode_session_models::TurnAdmissionMetadata::default(),
         auth_profile: None,
+        managed: None,
     };
     let args = ["session", "spawn", "--request", "spawn.json"];
     std::fs::write(

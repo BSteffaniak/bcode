@@ -23,8 +23,18 @@ use serde::{Deserialize, Deserializer, Serialize};
 
 /// Maximum rules accepted in one layer.
 pub const MAX_RULES_PER_LAYER: usize = 256;
-/// Maximum plugin-declared facts on one unit.
+/// Maximum plugin-declared facts on one unit, and fact conditions in one matcher.
 pub const MAX_PLUGIN_FACTS: usize = 32;
+/// Maximum facts, and maximum properties, one plugin may declare.
+pub const MAX_PLUGIN_DECLARATIONS: usize = 32;
+/// Maximum UTF-8 bytes of a plugin fact or property name.
+pub const MAX_PLUGIN_KEY_BYTES: usize = 64;
+/// Maximum UTF-8 bytes of a text fact value.
+pub const MAX_PLUGIN_FACT_TEXT_BYTES: usize = 256;
+/// Maximum values of an enum property.
+pub const MAX_PLUGIN_ENUM_VALUES: usize = 16;
+/// Maximum UTF-8 bytes of one enum property value.
+pub const MAX_PLUGIN_ENUM_VALUE_BYTES: usize = 64;
 /// Maximum part-visibility or plugin-property entries in one patch.
 pub const MAX_PATCH_ENTRIES: usize = 64;
 /// Largest accepted preview budget, in source lines.
@@ -247,6 +257,134 @@ pub enum FactValue {
     Text(String),
 }
 
+/// Type of a plugin-declared fact.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FactType {
+    /// Boolean.
+    Bool,
+    /// Signed integer.
+    Int,
+    /// One line of text, at most [`MAX_PLUGIN_FACT_TEXT_BYTES`].
+    String,
+}
+
+impl FactType {
+    /// Whether `value` has this type.
+    #[must_use]
+    pub const fn admits(self, value: &FactValue) -> bool {
+        matches!(
+            (self, value),
+            (Self::Bool, FactValue::Bool(_))
+                | (Self::Int, FactValue::Int(_))
+                | (Self::String, FactValue::Text(_))
+        )
+    }
+}
+
+/// A fact a plugin declared for its own units.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct PluginFactSchema {
+    /// Declaring plugin id; the fact exists only on that plugin's units.
+    pub plugin: String,
+    /// Value type.
+    #[serde(rename = "type")]
+    pub value_type: FactType,
+}
+
+/// Value constraints of a plugin-declared property.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case", tag = "type")]
+pub enum PropertyType {
+    /// Boolean.
+    Bool,
+    /// Integer within `min..=max`.
+    Int {
+        /// Smallest accepted value.
+        min: i64,
+        /// Largest accepted value.
+        max: i64,
+    },
+    /// One of the listed strings.
+    Enum {
+        /// Accepted values, at most [`MAX_PLUGIN_ENUM_VALUES`].
+        values: Vec<String>,
+    },
+}
+
+impl PropertyType {
+    /// Why `value` is not acceptable for this type, if it is not.
+    #[must_use]
+    pub fn reject(&self, value: &FactValue) -> Option<String> {
+        match (self, value) {
+            (Self::Bool, FactValue::Bool(_)) => None,
+            (Self::Int { min, max }, FactValue::Int(value)) => {
+                (!(min..=max).contains(&value)).then(|| format!("{value} is outside {min}..={max}"))
+            }
+            (Self::Enum { values }, FactValue::Text(value)) => {
+                (!values.contains(value)).then(|| format!("{value:?} is not one of {values:?}"))
+            }
+            (Self::Bool, _) => Some("expected a bool".to_owned()),
+            (Self::Int { .. }, _) => Some("expected an integer".to_owned()),
+            (Self::Enum { .. }, _) => Some("expected a string".to_owned()),
+        }
+    }
+}
+
+/// A presentation property a plugin declared for its own units.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct PluginPropertySchema {
+    /// Declaring plugin id; the property applies only to that plugin's units.
+    pub plugin: String,
+    /// Value constraints.
+    #[serde(flatten)]
+    pub value_type: PropertyType,
+    /// Value used when no rule sets the property; satisfies `value_type`.
+    pub default: FactValue,
+}
+
+/// Facts and properties declared by plugins, by namespaced name.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct PluginPresentationSchemas {
+    /// Declared facts.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub facts: BTreeMap<String, PluginFactSchema>,
+    /// Declared properties.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub properties: BTreeMap<String, PluginPropertySchema>,
+}
+
+impl PluginPresentationSchemas {
+    /// Whether nothing is declared.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.facts.is_empty() && self.properties.is_empty()
+    }
+}
+
+/// Whether `name` is a valid fact or property name for plugin `plugin`.
+///
+/// Names are `<plugin id>.<key>`, at most [`MAX_PLUGIN_KEY_BYTES`] bytes, where
+/// the key is one or more dot-separated non-empty segments of lowercase ASCII
+/// letters, digits, `_`, and `-` (`bcode.git.files`).
+#[must_use]
+pub fn valid_plugin_key(name: &str, plugin: &str) -> bool {
+    name.len() <= MAX_PLUGIN_KEY_BYTES
+        && name
+            .strip_prefix(plugin)
+            .and_then(|rest| rest.strip_prefix('.'))
+            .is_some_and(|key| {
+                key.split('.').all(|segment| {
+                    !segment.is_empty()
+                        && segment.bytes().all(|byte| {
+                            byte.is_ascii_lowercase()
+                                || byte.is_ascii_digit()
+                                || matches!(byte, b'_' | b'-')
+                        })
+                })
+            })
+}
+
 /// Facts describing one presentable unit.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct UnitFacts {
@@ -281,7 +419,9 @@ pub struct UnitFacts {
     /// Whether the unit is the last unit of its turn, when known.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_in_turn: Option<bool>,
-    /// Plugin-declared facts keyed by namespaced name.
+    /// Plugin-declared facts keyed by namespaced name; only facts declared by
+    /// the unit's producer.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub plugin: BTreeMap<String, FactValue>,
 }
 
@@ -862,6 +1002,90 @@ impl<T> OneOrMany<T> {
     }
 }
 
+/// Bounded integer comparison on a plugin fact; every present bound must hold.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct FactRange {
+    /// Greater than.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub gt: Option<i64>,
+    /// Greater than or equal.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub gte: Option<i64>,
+    /// Less than.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lt: Option<i64>,
+    /// Less than or equal.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lte: Option<i64>,
+}
+
+impl FactRange {
+    /// Whether `value` satisfies every bound.
+    #[must_use]
+    pub fn contains(&self, value: i64) -> bool {
+        self.gt.is_none_or(|bound| value > bound)
+            && self.gte.is_none_or(|bound| value >= bound)
+            && self.lt.is_none_or(|bound| value < bound)
+            && self.lte.is_none_or(|bound| value <= bound)
+    }
+}
+
+/// Condition on one plugin-declared fact.
+///
+/// Deserializes from a value or list of values (equality, or one of) or from
+/// a `{ gt, gte, lt, lte }` table with at least one bound (an integer range).
+/// Units without the fact never match.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(untagged)]
+pub enum FactCondition {
+    /// Equal to one of the values; an empty list matches every unit.
+    Values(OneOrMany<FactValue>),
+    /// An integer within the range.
+    Range(FactRange),
+}
+
+impl<'de> Deserialize<'de> for FactCondition {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        #[derive(Deserialize)]
+        #[serde(untagged)]
+        enum Shape {
+            Values(OneOrMany<FactValue>),
+            Range(FactRange),
+        }
+        match Shape::deserialize(deserializer).map_err(|_| {
+            serde::de::Error::custom(
+                "expected a bool, integer, or string, a list of them, or { gt, gte, lt, lte }",
+            )
+        })? {
+            Shape::Values(values) => Ok(Self::Values(values)),
+            Shape::Range(range) if range == FactRange::default() => Err(serde::de::Error::custom(
+                "a fact range needs at least one of gt, gte, lt, lte",
+            )),
+            Shape::Range(range) => Ok(Self::Range(range)),
+        }
+    }
+}
+
+impl From<OneOrMany<FactValue>> for FactCondition {
+    fn from(values: OneOrMany<FactValue>) -> Self {
+        Self::Values(values)
+    }
+}
+
+impl FactCondition {
+    /// Whether a unit whose fact is `value` matches.
+    #[must_use]
+    pub fn matches(&self, value: Option<&FactValue>) -> bool {
+        match self {
+            Self::Values(values) => values.admits(|expected| value == Some(expected)),
+            Self::Range(range) => {
+                matches!(value, Some(FactValue::Int(value)) if range.contains(*value))
+            }
+        }
+    }
+}
+
 /// Conjunction of fact conditions. Absent conditions always match; a list
 /// matches when any listed value matches.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -906,9 +1130,9 @@ pub struct FactMatcher {
     /// Last-in-turn flag; units without the fact never match.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_in_turn: Option<bool>,
-    /// Plugin-declared facts.
+    /// Plugin-declared facts, by namespaced name.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
-    pub plugin: BTreeMap<String, OneOrMany<FactValue>>,
+    pub plugin: BTreeMap<String, FactCondition>,
 }
 
 impl FactMatcher {
@@ -945,9 +1169,10 @@ impl FactMatcher {
             && self
                 .last_in_turn
                 .is_none_or(|expected| facts.last_in_turn == Some(expected))
-            && self.plugin.iter().all(|(name, condition)| {
-                condition.admits(|expected| facts.plugin.get(name) == Some(expected))
-            })
+            && self
+                .plugin
+                .iter()
+                .all(|(name, condition)| condition.matches(facts.plugin.get(name)))
     }
 }
 
@@ -1105,6 +1330,81 @@ mod tests {
         assert!(matcher.matches(&facts));
         facts.depth = 0;
         assert!(!matcher.matches(&facts));
+    }
+
+    #[test]
+    fn plugin_fact_ranges_compare_integers_only() {
+        let matcher: FactMatcher = toml::from_str(
+            "plugin = { \"bcode.git.files\" = { gt = 10, lte = 50 }, \"bcode.git.dirty\" = true }",
+        )
+        .unwrap();
+        let mut facts = tool("git.status", UnitStatus::Succeeded);
+        assert!(
+            !matcher.matches(&facts),
+            "units without the facts never match"
+        );
+        facts.plugin = BTreeMap::from([
+            ("bcode.git.files".to_owned(), FactValue::Int(11)),
+            ("bcode.git.dirty".to_owned(), FactValue::Bool(true)),
+        ]);
+        assert!(matcher.matches(&facts));
+        for (value, expected) in [
+            (FactValue::Int(10), false),
+            (FactValue::Int(50), true),
+            (FactValue::Int(51), false),
+            (FactValue::Text("20".to_owned()), false),
+        ] {
+            facts
+                .plugin
+                .insert("bcode.git.files".to_owned(), value.clone());
+            assert_eq!(matcher.matches(&facts), expected, "{value:?}");
+        }
+        for invalid in [
+            "plugin = { \"a.b\" = {} }",
+            "plugin = { \"a.b\" = { above = 1 } }",
+            "plugin = { \"a.b\" = { gt = \"x\" } }",
+        ] {
+            assert!(toml::from_str::<FactMatcher>(invalid).is_err(), "{invalid}");
+        }
+        let round_trip: FactMatcher =
+            serde_json::from_value(serde_json::to_value(&matcher).unwrap()).unwrap();
+        assert_eq!(round_trip, matcher);
+    }
+
+    #[test]
+    fn plugin_keys_are_namespaced_by_their_plugin() {
+        assert!(valid_plugin_key("bcode.git.files", "bcode.git"));
+        assert!(valid_plugin_key("bcode.git.stats.show-all_2", "bcode.git"));
+        for invalid in [
+            "bcode.git",
+            "bcode.git.",
+            "bcode.gitx.files",
+            "bcode.shell.files",
+            "bcode.git.Files",
+            "bcode.git..files",
+            "bcode.git.fi les",
+        ] {
+            assert!(!valid_plugin_key(invalid, "bcode.git"), "{invalid}");
+        }
+        let long = format!("bcode.git.{}", "a".repeat(MAX_PLUGIN_KEY_BYTES));
+        assert!(!valid_plugin_key(&long, "bcode.git"));
+    }
+
+    #[test]
+    fn property_types_reject_wrong_types_and_out_of_bound_values() {
+        let int = PropertyType::Int { min: 0, max: 5 };
+        assert_eq!(int.reject(&FactValue::Int(5)), None);
+        assert!(int.reject(&FactValue::Int(6)).is_some());
+        assert!(int.reject(&FactValue::Bool(true)).is_some());
+        let choice = PropertyType::Enum {
+            values: vec!["short".to_owned(), "long".to_owned()],
+        };
+        assert_eq!(choice.reject(&FactValue::Text("long".to_owned())), None);
+        assert!(choice.reject(&FactValue::Text("wide".to_owned())).is_some());
+        assert_eq!(PropertyType::Bool.reject(&FactValue::Bool(false)), None);
+        assert!(PropertyType::Bool.reject(&FactValue::Int(1)).is_some());
+        assert!(FactType::Int.admits(&FactValue::Int(1)));
+        assert!(!FactType::String.admits(&FactValue::Int(1)));
     }
 
     #[test]

@@ -10,6 +10,12 @@
 //! lead, join, or count toward a group; they sit inside the group of the call
 //! they belong to as attachments, so they never split it.
 //!
+//! An invocation counts once. When the same invocation appears more than once
+//! (a historical tool request followed by its result), the projection marks
+//! the earlier units [`superseded`](GroupingInput::superseded): the later unit
+//! represents the invocation and the superseded ones are attached to the
+//! group, including directly before its first member.
+//!
 //! [`Grouping::compute`] is linear in the number of units supplied (each run
 //! looks at most [`MAX_BRIDGED_GAP`] bridge or attached units past its last
 //! member).
@@ -52,6 +58,16 @@ pub struct GroupingInput<'a> {
     /// right after the last member they are kept inside it when they belong
     /// to one of its members' invocations.
     pub attached: bool,
+    /// Whether a later unit of the same invocation represents it (for
+    /// example a historical tool request whose result follows).
+    ///
+    /// Superseded units are attached units whose owner comes later: they
+    /// never lead, join, or count toward a group. Between two members of a
+    /// group in the same turn they are always kept inside it as attached
+    /// units, and a contiguous span of them directly before a run's first
+    /// member, in that member's turn, is claimed by the run as attached units
+    /// too, so the invocation renders with its representative.
+    pub superseded: bool,
 }
 
 /// How a position relates to the group containing it.
@@ -77,9 +93,9 @@ pub struct UnitGroup {
     pub members: Vec<usize>,
     /// Positions of bridge units between members, ascending.
     pub bridged: Vec<usize>,
-    /// Positions of attached units inside the group (between members, or
-    /// right after the last member when they belong to a member's
-    /// invocation), ascending.
+    /// Positions of attached units inside the group (between members, right
+    /// after the last member when they belong to a member's invocation, or
+    /// superseded units directly before the first member), ascending.
     pub attached: Vec<usize>,
     /// Facts describing the group itself, for resolving its presentation.
     pub facts: UnitFacts,
@@ -96,6 +112,18 @@ impl UnitGroup {
     #[must_use]
     pub fn span(&self) -> Range<usize> {
         self.leader()..self.members[self.members.len() - 1] + 1
+    }
+
+    /// First position the group contains: the first superseded unit claimed
+    /// before the first member, else the first member.
+    ///
+    /// Renderers present the group header before this position.
+    #[must_use]
+    pub fn start(&self) -> usize {
+        let leader = self.leader();
+        self.attached
+            .first()
+            .map_or(leader, |&first| first.min(leader))
     }
 
     /// Role of `position` in this group, if it belongs to the group.
@@ -147,7 +175,8 @@ pub fn is_revealed(facts: &UnitFacts, reveal: &[UnitStatus]) -> bool {
 /// changed position.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct Run {
-    /// First member.
+    /// First claimed position: the first superseded unit claimed before the
+    /// first member, else the first member.
     first: usize,
     /// Last member.
     last: usize,
@@ -215,10 +244,19 @@ impl Grouping {
         }
         // Earlier runs examined only positions before `dirty`; keep them.
         let first_affected = self.runs.partition_point(|run| run.reach <= dirty.start);
+        // An unclaimed superseded span right before `dirty` looked ahead into
+        // it when deciding whether a run starts there, so rescan it too.
+        let floor = first_affected
+            .checked_sub(1)
+            .map_or(0, |kept| self.runs[kept].last + 1);
+        let mut back = dirty.start;
+        while back > floor && dirty.start - back <= MAX_BRIDGED_GAP && inputs[back - 1].superseded {
+            back -= 1;
+        }
         let start = self
             .runs
             .get(first_affected)
-            .map_or(dirty.start, |run| run.first.min(dirty.start));
+            .map_or(back, |run| run.first.min(back));
         let old_runs = self.runs.split_off(first_affected);
         let old_groups = self
             .groups
@@ -326,16 +364,20 @@ fn scan(
 ) -> usize {
     let mut position = from;
     while position < inputs.len() && !stop(position) {
-        if !groupable(&inputs[position]) {
+        let Some(leader) = run_leader(inputs, position) else {
             position += 1;
             continue;
-        }
+        };
         let RunScan {
             members,
             bridged,
-            attached,
+            mut attached,
             scanned_end,
-        } = scan_run(inputs, position);
+        } = scan_run(inputs, leader);
+        if leader > position {
+            // Superseded units directly before the first member.
+            attached.splice(0..0, position..leader);
+        }
         let last = members[members.len() - 1];
         runs.push(Run {
             first: position,
@@ -343,13 +385,43 @@ fn scan(
             scanned_end,
             reach: 0,
         });
-        let min = usize::try_from(inputs[position].group.min).unwrap_or(usize::MAX);
+        let min = usize::try_from(inputs[leader].group.min).unwrap_or(usize::MAX);
         if members.len() >= min.max(2) {
             groups.push(build_group(inputs, members, bridged, attached));
         }
         position = last + 1;
     }
     position
+}
+
+/// First member of a run claiming `position`, if one starts there.
+///
+/// A groupable unit leads its own run. A superseded unit starts a run when it
+/// begins a contiguous span (at most [`MAX_BRIDGED_GAP`] long) of superseded
+/// units in one turn that ends at a groupable unit of the same turn; the run
+/// then claims the span as attached units. Looks only at positions from
+/// `position` on, so a fresh scan from any unclaimed position agrees with a
+/// full one.
+fn run_leader(inputs: &[GroupingInput<'_>], position: usize) -> Option<usize> {
+    let unit = &inputs[position];
+    if groupable(unit) {
+        return Some(position);
+    }
+    if !unit.superseded {
+        return None;
+    }
+    let mut next = position + 1;
+    while next < inputs.len() && next - position <= MAX_BRIDGED_GAP {
+        let candidate = &inputs[next];
+        if candidate.turn != unit.turn {
+            return None;
+        }
+        if !candidate.superseded {
+            return groupable(candidate).then_some(next);
+        }
+        next += 1;
+    }
+    None
 }
 
 /// Positions one run claims, and how far it looked.
@@ -364,11 +436,11 @@ struct RunScan {
 /// Scan the run starting at `first`.
 ///
 /// Positions between members are split into bridged units and attached
-/// units owned by a member's invocation; an attached unit of an invocation
-/// with no member yet in the run must qualify as an ordinary bridge to be
-/// spanned at all. When the run ends, the owned attached units directly
-/// after its last member are claimed too (they were examined, so
-/// `scanned_end` already covers them).
+/// units owned by a member's invocation or superseded by a later unit; an
+/// attached unit of an invocation with no member yet in the run must qualify
+/// as an ordinary bridge to be spanned at all, unless it is superseded. When
+/// the run ends, the owned attached units directly after its last member are
+/// claimed too (they were examined, so `scanned_end` already covers them).
 fn scan_run(inputs: &[GroupingInput<'_>], first: usize) -> RunScan {
     let leader = &inputs[first];
     let mut run = RunScan {
@@ -384,7 +456,7 @@ fn scan_run(inputs: &[GroupingInput<'_>], first: usize) -> RunScan {
         if joins(leader, unit) {
             run.members.push(position);
             for between in std::mem::take(&mut pending) {
-                if owned(inputs, &run.members, &inputs[between]) {
+                if inputs[between].superseded || owned(inputs, &run.members, &inputs[between]) {
                     run.attached.push(between);
                 } else {
                     run.bridged.push(between);
@@ -400,9 +472,12 @@ fn scan_run(inputs: &[GroupingInput<'_>], first: usize) -> RunScan {
         }
         position += 1;
     }
+    // Superseded units are left for the run of the invocation they belong to.
     let trailing = pending
         .iter()
-        .take_while(|&&after| owned(inputs, &run.members, &inputs[after]))
+        .take_while(|&&after| {
+            !inputs[after].superseded && owned(inputs, &run.members, &inputs[after])
+        })
         .count();
     run.attached.extend_from_slice(&pending[..trailing]);
     run
@@ -429,7 +504,10 @@ fn fill_reach(runs: &mut [Run], from: usize) {
 }
 
 fn groupable(input: &GroupingInput<'_>) -> bool {
-    !input.attached && input.group.is_grouping() && input.facts.kind == Some(UnitKind::Tool)
+    !input.attached
+        && !input.superseded
+        && input.group.is_grouping()
+        && input.facts.kind == Some(UnitKind::Tool)
 }
 
 fn joins(leader: &GroupingInput<'_>, next: &GroupingInput<'_>) -> bool {
@@ -453,12 +531,14 @@ fn joins(leader: &GroupingInput<'_>, next: &GroupingInput<'_>) -> bool {
 /// Units awaiting a decision and failed units never bridge, so they are never
 /// hidden inside a collapsed group they do not belong to. A unit attached to
 /// the invocation of a member already in the run (`owned`) sits with that
-/// call whatever its kind or status; an attached unit of any other
+/// call whatever its kind or status, and so does a superseded unit, whose
+/// invocation is represented by a later unit; an attached unit of any other
 /// invocation follows the ordinary bridge rules, so a foreign failure still
 /// ends the group.
 fn bridges(leader: &GroupingInput<'_>, unit: &GroupingInput<'_>, owned: bool) -> bool {
     unit.turn == leader.turn
         && (owned
+            || unit.superseded
             || unit
                 .facts
                 .kind
@@ -556,6 +636,7 @@ mod tests {
         group: GroupSpec,
         invocation: Option<String>,
         attached: bool,
+        superseded: bool,
     }
 
     /// Units with ids `u<index + first_id>`.
@@ -576,6 +657,7 @@ mod tests {
                 group: group.clone(),
                 invocation: None,
                 attached: false,
+                superseded: false,
             })
             .collect()
     }
@@ -594,6 +676,7 @@ mod tests {
                 group: &unit.group,
                 invocation: unit.invocation.as_deref(),
                 attached: unit.attached,
+                superseded: unit.superseded,
             })
             .collect()
     }
@@ -1039,6 +1122,105 @@ mod tests {
         assert!(Grouping::compute(&[]).is_empty());
     }
 
+    /// A historical request for `call`, superseded by a later unit.
+    fn superseded_request(call: &str) -> Unit {
+        let mut unit = units(
+            vec![tool("read", UnitStatus::Succeeded)],
+            &[1],
+            &GroupSpec::new(GroupBy::SameTool),
+        )
+        .remove(0);
+        unit.invocation = Some(call.to_owned());
+        unit.superseded = true;
+        unit
+    }
+
+    #[test]
+    fn superseded_requests_count_once_and_attach_to_the_group() {
+        // req a, result a, req b, result b: two invocations, not four.
+        let owned = calls_with(
+            2,
+            &[
+                (0, superseded_request("call0")),
+                (2, superseded_request("call1")),
+            ],
+        );
+        let offered = inputs(&owned);
+        let grouping = Grouping::compute(&offered);
+        assert_eq!(members(grouping.groups()), [vec![1, 3]]);
+        let group = &grouping.groups()[0];
+        assert_eq!(group.attached, [0, 2]);
+        assert_eq!(group.start(), 0, "the leading request opens the group");
+        assert_eq!(group.facts.items, SizeBucket::Few);
+        assert_eq!(group.id, "group:u0", "identity follows the first member");
+        let role = |position| grouping.group_at(position).map(|(_, role)| role);
+        assert_eq!(role(2), Some(GroupRole::Attached));
+
+        // req a, req b, result a, result b: both requests lead in.
+        let owned = calls_with(
+            2,
+            &[
+                (0, superseded_request("call0")),
+                (1, superseded_request("call1")),
+            ],
+        );
+        let groups = group_units(&inputs(&owned));
+        assert_eq!(members(&groups), [vec![2, 3]]);
+        assert_eq!(groups[0].attached, [0, 1]);
+
+        // Status aggregation ignores the superseded request.
+        let mut owned = calls_with(2, &[(0, superseded_request("call0"))]);
+        owned[0].facts.status = Some(UnitStatus::Running);
+        let groups = group_units(&inputs(&owned));
+        assert_eq!(groups[0].facts.status, Some(UnitStatus::Succeeded));
+    }
+
+    #[test]
+    fn superseded_units_alone_never_group_or_cross_turns() {
+        let mut lone = vec![superseded_request("x"), superseded_request("y")];
+        lone[1].id = "b".into();
+        assert_eq!(group_units(&inputs(&lone)), []);
+
+        // A request in another turn than the following call stays outside.
+        let mut owned = calls_with(2, &[(0, superseded_request("call0"))]);
+        owned[0].turn = 0;
+        let groups = group_units(&inputs(&owned));
+        assert_eq!(members(&groups), [vec![1, 2]]);
+        assert_eq!(groups[0].attached, [] as [usize; 0]);
+
+        // A trailing request whose result is elsewhere is not claimed.
+        let owned = calls_with(2, &[(2, superseded_request("later"))]);
+        let groups = group_units(&inputs(&owned));
+        assert_eq!(groups[0].attached, [] as [usize; 0]);
+    }
+
+    #[test]
+    fn editing_a_superseded_lead_in_updates_like_a_full_computation() {
+        let mut owned = calls_with(2, &[(0, superseded_request("call0"))]);
+        let mut grouping = Grouping::compute(&inputs(&owned));
+        assert_eq!(grouping.groups()[0].attached, [0]);
+        // Its call is replaced by an unrelated message: the request no longer
+        // leads into a group and the remaining call stands alone.
+        owned[1] = units(
+            vec![kind(UnitKind::AssistantMessage)],
+            &[1],
+            &GroupSpec::new(GroupBy::SameTool),
+        )
+        .remove(0);
+        let offered = inputs(&owned);
+        grouping.update(&offered, 1..2);
+        assert_eq!(grouping, Grouping::compute(&offered));
+        assert_eq!(grouping.groups(), []);
+        // Restoring a call right after the request regroups from the request.
+        owned[1] = calls_with(1, &[]).remove(0);
+        owned[1].id = "fresh".into();
+        owned[1].invocation = Some("call0".into());
+        let offered = inputs(&owned);
+        grouping.update(&offered, 1..2);
+        assert_eq!(grouping, Grouping::compute(&offered));
+        assert_eq!(grouping.groups()[0].attached, [0]);
+    }
+
     /// Small deterministic generator so the comparison tests need no
     /// dependency and reproduce exactly.
     struct Lcg(u64);
@@ -1104,6 +1286,7 @@ mod tests {
             },
             invocation: Some(format!("call{}", rng.below(4))),
             attached: rng.below(5) == 0,
+            superseded: rng.below(5) == 0,
         }
     }
 
