@@ -2536,15 +2536,15 @@ pub trait ConcurrentRustPlugin: RustPlugin + Sync {
         Ok(())
     }
 
-    /// Handle a host event with shared plugin state.
+    /// Handle a subscribed host event with shared plugin state.
+    ///
+    /// Like [`RustPlugin::handle_event`], the default acknowledges the event
+    /// without plugin-side processing.
     ///
     /// # Errors
-    /// Returns an error when unsupported or event processing fails. Implementations
-    /// subscribing to host events must override this with the concurrent adapter.
+    /// Returns an error when event processing fails.
     fn handle_event_concurrent(&self, _context: NativeEventContext) -> Result<(), PluginError> {
-        Err(PluginError::failed(
-            "concurrent event handler is not implemented",
-        ))
+        Ok(())
     }
 
     /// Invoke a plugin-provided service operation with shared plugin state.
