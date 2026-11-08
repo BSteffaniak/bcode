@@ -585,7 +585,8 @@
           20,
           21,
           22,
-          23
+          23,
+          25
         ],
         "owns_writer_schema": false,
         "owns_writer_schema_event": true,
@@ -821,7 +822,8 @@
           20,
           21,
           22,
-          23
+          23,
+          25
         ],
         "owns_writer_schema": false,
         "owns_writer_schema_event": true,
@@ -1059,7 +1061,8 @@
           20,
           21,
           22,
-          23
+          23,
+          25
         ],
         "owns_writer_schema": true,
         "owns_writer_schema_event": false,
@@ -5536,7 +5539,8 @@
           20,
           21,
           22,
-          23
+          23,
+          25
         ],
         "owns_writer_schema": false,
         "owns_writer_schema_event": true,
@@ -5833,7 +5837,8 @@
           20,
           21,
           22,
-          23
+          23,
+          25
         ],
         "owns_writer_schema": true,
         "owns_writer_schema_event": true,
@@ -6135,7 +6140,8 @@
           20,
           21,
           22,
-          23
+          23,
+          25
         ],
         "owns_writer_schema": true,
         "owns_writer_schema_event": true,
@@ -6452,7 +6458,8 @@
           20,
           21,
           22,
-          23
+          23,
+          25
         ],
         "owns_writer_schema": true,
         "owns_writer_schema_event": true,
@@ -6769,7 +6776,8 @@
           20,
           21,
           22,
-          23
+          23,
+          25
         ],
         "owns_writer_schema": true,
         "owns_writer_schema_event": true,
@@ -7086,7 +7094,8 @@
           20,
           21,
           22,
-          23
+          23,
+          25
         ],
         "owns_writer_schema": true,
         "owns_writer_schema_event": true,
@@ -7408,7 +7417,8 @@
           20,
           21,
           22,
-          23
+          23,
+          25
         ],
         "owns_writer_schema": true,
         "owns_writer_schema_event": true,
@@ -7735,7 +7745,8 @@
           20,
           21,
           22,
-          23
+          23,
+          25
         ],
         "owns_writer_schema": true,
         "owns_writer_schema_event": true,
@@ -8062,7 +8073,8 @@
           20,
           21,
           22,
-          23
+          23,
+          25
         ],
         "owns_writer_schema": true,
         "owns_writer_schema_event": true,
@@ -8409,7 +8421,8 @@
           20,
           21,
           22,
-          23
+          23,
+          25
         ],
         "owns_writer_schema": true,
         "owns_writer_schema_event": true,
@@ -8761,7 +8774,8 @@
           20,
           21,
           22,
-          23
+          23,
+          25
         ],
         "owns_writer_schema": true,
         "owns_writer_schema_event": true,
@@ -9180,7 +9194,8 @@
           20,
           21,
           22,
-          23
+          23,
+          25
         ],
         "owns_writer_schema": true,
         "owns_writer_schema_event": true,
@@ -9572,7 +9587,8 @@
           20,
           21,
           22,
-          23
+          23,
+          25
         ],
         "owns_writer_schema": true,
         "owns_writer_schema_event": true,
@@ -9974,7 +9990,8 @@
           20,
           21,
           22,
-          23
+          23,
+          25
         ],
         "owns_writer_schema": true,
         "owns_writer_schema_event": true,
@@ -10376,7 +10393,8 @@
           20,
           21,
           22,
-          23
+          23,
+          25
         ],
         "owns_writer_schema": false,
         "owns_writer_schema_event": false,
@@ -10803,7 +10821,8 @@
           20,
           21,
           22,
-          23
+          23,
+          25
         ],
         "owns_writer_schema": true,
         "owns_writer_schema_event": true,
@@ -11275,7 +11294,8 @@
           20,
           21,
           22,
-          23
+          23,
+          25
         ],
         "owns_writer_schema": true,
         "owns_writer_schema_event": true,
@@ -11382,7 +11402,8 @@
           20,
           21,
           22,
-          23
+          23,
+          25
         ],
         "owns_writer_schema": false,
         "owns_writer_schema_event": true,
@@ -11809,7 +11830,436 @@
           20,
           21,
           22,
-          23
+          23,
+          25
+        ],
+        "owns_writer_schema": true,
+        "owns_writer_schema_event": true,
+        "schema_event_exclusions": []
+      }
+    },
+    {
+      "path": "stores/epoch-25-schema-57-events.jsonl",
+      "source_writer_epochs": [],
+      "covered_writer_schema_pairs": [],
+      "migration_ledger_endpoints": [],
+      "covered_migration_ledger_prefixes": [],
+      "event_schemas": [
+        57
+      ],
+      "migratable_store": false,
+      "historical_payloads": false,
+      "expected_event_count": 75,
+      "expected_classifications": {
+        "converted": 75,
+        "retired_known": 0,
+        "current_passthrough": 0
+      },
+      "covered_schema_event_pairs": [
+        {
+          "event_schema": 57,
+          "event_kind": "agent_changed"
+        },
+        {
+          "event_schema": 57,
+          "event_kind": "assistant_delta"
+        },
+        {
+          "event_schema": 57,
+          "event_kind": "assistant_message"
+        },
+        {
+          "event_schema": 57,
+          "event_kind": "assistant_reasoning_activity"
+        },
+        {
+          "event_schema": 57,
+          "event_kind": "assistant_reasoning_delta"
+        },
+        {
+          "event_schema": 57,
+          "event_kind": "assistant_reasoning_message"
+        },
+        {
+          "event_schema": 57,
+          "event_kind": "assistant_response_segment"
+        },
+        {
+          "event_schema": 57,
+          "event_kind": "automatic_title_updated"
+        },
+        {
+          "event_schema": 57,
+          "event_kind": "child_session_created"
+        },
+        {
+          "event_schema": 57,
+          "event_kind": "client_attached"
+        },
+        {
+          "event_schema": 57,
+          "event_kind": "client_detached"
+        },
+        {
+          "event_schema": 57,
+          "event_kind": "context_compacted"
+        },
+        {
+          "event_schema": 57,
+          "event_kind": "execution_session_created"
+        },
+        {
+          "event_schema": 57,
+          "event_kind": "external_backend_bound"
+        },
+        {
+          "event_schema": 57,
+          "event_kind": "external_delivery_observed"
+        },
+        {
+          "event_schema": 57,
+          "event_kind": "external_harness_operation"
+        },
+        {
+          "event_schema": 57,
+          "event_kind": "external_interaction_responded"
+        },
+        {
+          "event_schema": 57,
+          "event_kind": "external_observation_recorded"
+        },
+        {
+          "event_schema": 57,
+          "event_kind": "external_submission_accepted"
+        },
+        {
+          "event_schema": 57,
+          "event_kind": "inert_history"
+        },
+        {
+          "event_schema": 57,
+          "event_kind": "milestone_evaluation_completed"
+        },
+        {
+          "event_schema": 57,
+          "event_kind": "milestone_evaluation_requested"
+        },
+        {
+          "event_schema": 57,
+          "event_kind": "milestone_publication_requested"
+        },
+        {
+          "event_schema": 57,
+          "event_kind": "milestone_published"
+        },
+        {
+          "event_schema": 57,
+          "event_kind": "model_changed"
+        },
+        {
+          "event_schema": 57,
+          "event_kind": "model_feature_fidelity_negotiated"
+        },
+        {
+          "event_schema": 57,
+          "event_kind": "model_turn_cancel_requested"
+        },
+        {
+          "event_schema": 57,
+          "event_kind": "model_turn_finished"
+        },
+        {
+          "event_schema": 57,
+          "event_kind": "model_turn_started"
+        },
+        {
+          "event_schema": 57,
+          "event_kind": "model_usage"
+        },
+        {
+          "event_schema": 57,
+          "event_kind": "permission_requested"
+        },
+        {
+          "event_schema": 57,
+          "event_kind": "permission_resolved"
+        },
+        {
+          "event_schema": 57,
+          "event_kind": "plugin_status_note"
+        },
+        {
+          "event_schema": 57,
+          "event_kind": "positioned_assistant_reasoning_activity"
+        },
+        {
+          "event_schema": 57,
+          "event_kind": "positioned_assistant_response_segment"
+        },
+        {
+          "event_schema": 57,
+          "event_kind": "positioned_tool_call_requested"
+        },
+        {
+          "event_schema": 57,
+          "event_kind": "provider_context_compacted"
+        },
+        {
+          "event_schema": 57,
+          "event_kind": "ralph_lifecycle"
+        },
+        {
+          "event_schema": 57,
+          "event_kind": "reasoning_changed"
+        },
+        {
+          "event_schema": 57,
+          "event_kind": "request_context_observed"
+        },
+        {
+          "event_schema": 57,
+          "event_kind": "runtime_work_cancel_requested"
+        },
+        {
+          "event_schema": 57,
+          "event_kind": "runtime_work_finished"
+        },
+        {
+          "event_schema": 57,
+          "event_kind": "runtime_work_progress"
+        },
+        {
+          "event_schema": 57,
+          "event_kind": "runtime_work_started"
+        },
+        {
+          "event_schema": 57,
+          "event_kind": "session_child_linked"
+        },
+        {
+          "event_schema": 57,
+          "event_kind": "session_child_published"
+        },
+        {
+          "event_schema": 57,
+          "event_kind": "session_children_reconciled"
+        },
+        {
+          "event_schema": 57,
+          "event_kind": "session_created"
+        },
+        {
+          "event_schema": 57,
+          "event_kind": "session_derived"
+        },
+        {
+          "event_schema": 57,
+          "event_kind": "session_imported"
+        },
+        {
+          "event_schema": 57,
+          "event_kind": "session_renamed"
+        },
+        {
+          "event_schema": 57,
+          "event_kind": "skill_activated"
+        },
+        {
+          "event_schema": 57,
+          "event_kind": "skill_context_loaded"
+        },
+        {
+          "event_schema": 57,
+          "event_kind": "skill_deactivated"
+        },
+        {
+          "event_schema": 57,
+          "event_kind": "skill_invocation_failed"
+        },
+        {
+          "event_schema": 57,
+          "event_kind": "skill_invoked"
+        },
+        {
+          "event_schema": 57,
+          "event_kind": "skill_suggested"
+        },
+        {
+          "event_schema": 57,
+          "event_kind": "submission_accepted"
+        },
+        {
+          "event_schema": 57,
+          "event_kind": "submission_activated"
+        },
+        {
+          "event_schema": 57,
+          "event_kind": "submission_cancelled"
+        },
+        {
+          "event_schema": 57,
+          "event_kind": "submission_context_observed"
+        },
+        {
+          "event_schema": 57,
+          "event_kind": "submission_pending_cancelled"
+        },
+        {
+          "event_schema": 57,
+          "event_kind": "submission_recovery_authorized"
+        },
+        {
+          "event_schema": 57,
+          "event_kind": "system_message"
+        },
+        {
+          "event_schema": 57,
+          "event_kind": "tool_call_requested"
+        },
+        {
+          "event_schema": 57,
+          "event_kind": "tool_contribution"
+        },
+        {
+          "event_schema": 57,
+          "event_kind": "tool_contribution_placed"
+        },
+        {
+          "event_schema": 57,
+          "event_kind": "tool_exchange_requested"
+        },
+        {
+          "event_schema": 57,
+          "event_kind": "tool_exchange_resolved"
+        },
+        {
+          "event_schema": 57,
+          "event_kind": "tool_invocation_lifecycle"
+        },
+        {
+          "event_schema": 57,
+          "event_kind": "tool_invocation_result_recorded"
+        },
+        {
+          "event_schema": 57,
+          "event_kind": "trace_event"
+        },
+        {
+          "event_schema": 57,
+          "event_kind": "user_message"
+        },
+        {
+          "event_schema": 57,
+          "event_kind": "working_directory_changed"
+        }
+      ],
+      "covered_authoritative_records": [],
+      "covered_roots": [],
+      "covered_root_writer_pairs": [],
+      "covered_tables": [],
+      "covered_table_treatments": [],
+      "covered_event_kinds": [
+        "agent_changed",
+        "assistant_delta",
+        "assistant_message",
+        "assistant_reasoning_activity",
+        "assistant_reasoning_delta",
+        "assistant_reasoning_message",
+        "assistant_response_segment",
+        "automatic_title_updated",
+        "child_session_created",
+        "client_attached",
+        "client_detached",
+        "context_compacted",
+        "execution_session_created",
+        "external_backend_bound",
+        "external_delivery_observed",
+        "external_harness_operation",
+        "external_interaction_responded",
+        "external_observation_recorded",
+        "external_submission_accepted",
+        "inert_history",
+        "milestone_evaluation_completed",
+        "milestone_evaluation_requested",
+        "milestone_publication_requested",
+        "milestone_published",
+        "model_changed",
+        "model_feature_fidelity_negotiated",
+        "model_turn_cancel_requested",
+        "model_turn_finished",
+        "model_turn_started",
+        "model_usage",
+        "permission_requested",
+        "permission_resolved",
+        "plugin_status_note",
+        "positioned_assistant_reasoning_activity",
+        "positioned_assistant_response_segment",
+        "positioned_tool_call_requested",
+        "provider_context_compacted",
+        "ralph_lifecycle",
+        "reasoning_changed",
+        "request_context_observed",
+        "runtime_work_cancel_requested",
+        "runtime_work_finished",
+        "runtime_work_progress",
+        "runtime_work_started",
+        "session_child_linked",
+        "session_child_published",
+        "session_children_reconciled",
+        "session_created",
+        "session_derived",
+        "session_imported",
+        "session_renamed",
+        "skill_activated",
+        "skill_context_loaded",
+        "skill_deactivated",
+        "skill_invocation_failed",
+        "skill_invoked",
+        "skill_suggested",
+        "submission_accepted",
+        "submission_activated",
+        "submission_cancelled",
+        "submission_context_observed",
+        "submission_pending_cancelled",
+        "submission_recovery_authorized",
+        "system_message",
+        "tool_call_requested",
+        "tool_contribution",
+        "tool_contribution_placed",
+        "tool_exchange_requested",
+        "tool_exchange_resolved",
+        "tool_invocation_lifecycle",
+        "tool_invocation_result_recorded",
+        "trace_event",
+        "user_message",
+        "working_directory_changed"
+      ],
+      "lifecycle_matrix": {
+        "source_writer_epochs": [
+          1,
+          2,
+          3,
+          4,
+          5,
+          6,
+          7,
+          8,
+          9,
+          10,
+          11,
+          12,
+          13,
+          14,
+          15,
+          16,
+          17,
+          18,
+          19,
+          20,
+          21,
+          22,
+          23,
+          25
         ],
         "owns_writer_schema": true,
         "owns_writer_schema_event": true,

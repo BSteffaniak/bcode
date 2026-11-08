@@ -3163,8 +3163,16 @@ fn push_item_body_rows(
             active: _,
             status,
         } => {
+            // A plugin visual applies only to tools that plugin owns. Tools produced by another
+            // plugin, such as native tools observed by a managed external harness, share names
+            // with Bcode tools but must keep the generic presentation.
             let canonical_request_visual = plugin_host
                 .and_then(|presentation| presentation.tool_presentation(tool_name))
+                .filter(|(declaring_plugin, _)| {
+                    producer_plugin_id
+                        .as_deref()
+                        .is_none_or(|producer| producer == *declaring_plugin)
+                })
                 .and_then(|(_, declaration)| {
                     CanonicalToolVisual::from_request(
                         tool_call_id,
@@ -3362,12 +3370,16 @@ fn push_item_body_rows(
 /// example `Bcode`, `Reasoning …`, or `Permission required · bash`.
 fn default_unit_title(item: &TranscriptItem) -> String {
     match item.kind() {
-        TranscriptItemKind::AssistantMessage => if item.streaming() {
-            "Bcode …"
-        } else {
-            "Bcode"
+        TranscriptItemKind::AssistantMessage => {
+            // Shared semantics name the author (for example a managed external harness);
+            // native Bcode output carries no author label.
+            let author = item.display_label().unwrap_or("Bcode");
+            if item.streaming() {
+                format!("{author} …")
+            } else {
+                author.to_owned()
+            }
         }
-        .to_owned(),
         TranscriptItemKind::ReasoningMessage => if item.streaming() {
             "Reasoning …"
         } else {
@@ -4768,6 +4780,46 @@ fn terminal_elapsed_signature_uses_typed_activity_not_streaming_flag() {
 
     assert!(!terminal.tool_is_active());
     assert_eq!(terminal_elapsed_signature_fragment(&terminal), None);
+}
+
+#[cfg(test)]
+#[test]
+fn assistant_heading_names_the_shared_author_label() {
+    let item = |label: Option<&str>, streaming: bool| {
+        let mut message = bcode_session_view_models::ChatMessageView::markdown("Hello there");
+        message.display_label = label.map(str::to_owned);
+        super::transcript::terminal_item_from_shared(
+            &bcode_session_view_models::TranscriptViewItem {
+                output_location: None,
+                id: bcode_session_view_models::TranscriptViewItemId::new(
+                    "assistant-turn:t:segment:s",
+                ),
+                revision: 1,
+                sequence: Some(1),
+                timestamp_ms: Some(1),
+                streaming,
+                kind: bcode_session_view_models::TranscriptViewItemKind::AssistantMessage {
+                    message,
+                },
+            },
+        )
+    };
+    let heading = |item: TranscriptItem| {
+        let rows = transcript_item_rows(&[item], 0, 60, None, TuiDiffViewerConfig::default());
+        rows.iter()
+            .map(|line| {
+                line.spans
+                    .iter()
+                    .map(|span| span.content.as_str())
+                    .collect::<String>()
+            })
+            .find(|line| !line.trim().is_empty())
+            .unwrap_or_default()
+    };
+    assert!(heading(item(Some("Claude Code"), false)).contains("Claude Code"));
+    assert!(!heading(item(Some("Claude Code"), false)).contains("Bcode"));
+    assert!(heading(item(Some("Claude Code"), true)).contains("Claude Code …"));
+    assert!(heading(item(None, false)).contains("Bcode"));
 }
 
 #[cfg(test)]

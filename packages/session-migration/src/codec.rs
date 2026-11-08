@@ -152,7 +152,7 @@ impl HistoricalEnvelope {
         })
     }
 
-    /// Reject unpublished recovery/interaction families and observations newer than their schema.
+    /// Reject recovery/interaction families and observations newer than their schema.
     /// This is historical decoding policy, not native protocol interpretation.
     ///
     /// # Errors
@@ -175,6 +175,8 @@ impl HistoricalEnvelope {
             });
         }
         if event_kind == "external_harness_operation"
+            && self.schema_version
+                < bcode_session_models::external_harness::NATIVE_PARITY_EVENT_SCHEMA_VERSION
             && matches!(
                 payload
                     .pointer("/operation/record/kind")
@@ -185,7 +187,7 @@ impl HistoricalEnvelope {
             return Err(HistoricalSessionEventError::InvalidEvent {
                 schema_version: self.schema_version,
                 event_kind: event_kind.to_owned(),
-                reason: "recovery operations are unpublished and unsupported".into(),
+                reason: "recovery operations require event schema 58".into(),
             });
         }
         if self.schema_version <= 55 && event_kind == "external_harness_operation" {
@@ -210,6 +212,23 @@ impl HistoricalEnvelope {
                 });
             }
         }
+        if self.schema_version <= 57
+            && event_kind == "external_harness_operation"
+            && [
+                "/operation/record/open_request/kind/operation",
+                "/operation/record/request/kind/operation",
+            ]
+            .iter()
+            .any(|pointer| {
+                payload.pointer(pointer).and_then(serde_json::Value::as_str) == Some("configure")
+            })
+        {
+            return Err(HistoricalSessionEventError::InvalidEvent {
+                schema_version: self.schema_version,
+                event_kind: event_kind.to_owned(),
+                reason: "configuration requests require event schema 58".into(),
+            });
+        }
         if self.schema_version <= 55
             && event_kind == "external_harness_operation"
             && payload
@@ -231,7 +250,7 @@ impl HistoricalEnvelope {
         event_kind: &str,
         payload: &serde_json::Value,
     ) -> Result<(), HistoricalSessionEventError> {
-        if self.schema_version >= 55 {
+        if self.schema_version >= 58 {
             return Ok(());
         }
         let observations: Vec<&serde_json::Value> = match event_kind {
@@ -248,10 +267,28 @@ impl HistoricalEnvelope {
         let required_schema = observations
             .iter()
             .filter_map(|observation| {
+                let parity_detail = [
+                    "/kind/segment_id",
+                    "/kind/input_json",
+                    "/kind/interaction/tool_name",
+                    "/kind/interaction/input_preview",
+                ]
+                .iter()
+                .any(|pointer| {
+                    observation
+                        .pointer(pointer)
+                        .is_some_and(|value| !value.is_null())
+                });
+                if parity_detail {
+                    return Some(58);
+                }
                 match observation
                     .pointer("/kind/kind")
                     .and_then(serde_json::Value::as_str)
                 {
+                    Some("reasoning" | "tool_result" | "usage" | "interaction_withdrawn") => {
+                        Some(58)
+                    }
                     Some("execution") => Some(55),
                     Some(
                         "submission_consumed"

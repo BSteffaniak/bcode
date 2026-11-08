@@ -431,6 +431,7 @@ impl CodexHarnessPlugin {
         let hydration_requests = session.hydration_requests();
         let inventory_page = session.take_inventory_page();
         let page = HarnessObservationPage {
+            live: Vec::new(),
             retention,
             hydration_requests,
             inventory_page,
@@ -529,6 +530,8 @@ fn capabilities() -> HarnessCapabilities {
         constraints: Vec::new(),
     };
     HarnessCapabilities {
+        model_switch: bcode_harness_models::HarnessCapability::unsupported(),
+        permission_mode: bcode_harness_models::HarnessCapability::unsupported(),
         resume: constrained("Exact binding and top-level version probe; metadata-only resume"),
         steering: constrained(
             "Expected native turn ID required; NextTurn only once on a fresh local-only non-resumed thread; later conditional start unsupported",

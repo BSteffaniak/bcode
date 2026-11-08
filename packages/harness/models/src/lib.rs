@@ -8,6 +8,8 @@
 
 mod execution;
 mod lifecycle;
+mod live;
+pub use live::*;
 mod recovery;
 pub use execution::*;
 pub use recovery::*;
@@ -54,6 +56,12 @@ pub const MAX_HARNESS_OBSERVATIONS: usize = 128;
 pub const MAX_HARNESS_ITEMS: usize = 32;
 /// Maximum serialized vendor detail bytes.
 pub const MAX_HARNESS_VENDOR_BYTES: usize = 16 * 1024;
+/// Maximum UTF-8 bytes of compact native tool input JSON carried by a tool observation.
+pub const MAX_HARNESS_TOOL_INPUT_BYTES: usize = 16 * 1024;
+/// Maximum UTF-8 bytes of an interaction's display-only native input preview.
+pub const MAX_HARNESS_PREVIEW_BYTES: usize = 8 * 1024;
+/// Maximum transient live updates carried beside one observation page.
+pub const MAX_HARNESS_LIVE_UPDATES: usize = 128;
 
 /// Secret-safe protocol failure. Never contains raw native payloads or input values.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -86,6 +94,12 @@ pub(crate) fn id(value: &str) -> Result<(), HarnessContractError> {
 }
 pub(crate) const fn text(value: &str) -> Result<(), HarnessContractError> {
     if value.len() > MAX_HARNESS_TEXT_BYTES {
+        return Err(HarnessContractError::BoundsExceeded);
+    }
+    Ok(())
+}
+pub(crate) const fn bounded(value: &str, maximum: usize) -> Result<(), HarnessContractError> {
+    if value.len() > maximum {
         return Err(HarnessContractError::BoundsExceeded);
     }
     Ok(())

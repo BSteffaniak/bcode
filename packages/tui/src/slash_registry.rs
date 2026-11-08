@@ -346,6 +346,16 @@ pub fn static_completions() -> impl Iterator<Item = SlashCompletion> {
         .flat_map(|command| command.completions.iter().copied())
 }
 
+/// Return builtin completions paired with the command identity that executes them.
+pub fn builtin_completions() -> impl Iterator<Item = (BuiltinCommandId, SlashCompletion)> {
+    BUILTIN_COMMANDS.iter().flat_map(|command| {
+        command
+            .completions
+            .iter()
+            .map(move |completion| (command.id, *completion))
+    })
+}
+
 /// Return the builtin command matching a command name without a leading slash.
 #[must_use]
 pub fn builtin_command(command: &str) -> Option<BuiltinSlashCommand> {

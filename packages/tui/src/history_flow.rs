@@ -45,6 +45,10 @@ pub enum SessionStreamUpdate {
     /// Event continuity was lost. Ordinary views reconnect; managed views remain fenced
     /// until an explicit session/instance/generation-bound reattachment.
     ResyncStarted { session_id: SessionId },
+    /// The daemon no longer recognizes the attached managed owner generation (for example
+    /// after a daemon restart). The managed root stops so its journey can recover a new
+    /// generation and reattach; no input or Start is replayed.
+    ManagedOwnershipLost { session_id: SessionId },
     /// Fresh bounded state installed by a replacement attachment.
     Resynchronized {
         session_id: SessionId,
@@ -340,16 +344,15 @@ pub async fn forward_managed_session_events(
     let binding = {
         let binding_request = Box::pin(commands.binding());
         tokio::pin!(binding_request);
-        if let Ok(binding) = tokio::select! {
+        match tokio::select! {
             result = &mut binding_request => result,
             () = sender.closed() => return,
         } {
-            binding
-        } else {
-            let _ = sender
-                .send(SessionStreamUpdate::ResyncStarted { session_id: owner })
-                .await;
-            return;
+            Ok(binding) => binding,
+            Err(error) => {
+                let _ = sender.send(managed_continuity_lost(owner, &error)).await;
+                return;
+            }
         }
     };
     let receive = Box::pin(receive_managed_session_events(connection, sender.clone()));
@@ -362,12 +365,29 @@ pub async fn forward_managed_session_events(
     tokio::select! {
         () = &mut receive => {},
         () = sender.closed() => {},
-        _ = &mut poll => {
-            let _ = sender.send(SessionStreamUpdate::ResyncStarted { session_id: owner }).await;
+        result = &mut poll => {
+            let update = match result {
+                Err(error) => managed_continuity_lost(owner, &error),
+                Ok(()) => SessionStreamUpdate::ResyncStarted { session_id: owner },
+            };
+            let _ = sender.send(update).await;
         }
     }
     // Both futures are attachment-owned. Dropping this task cancels them together; no detached
     // observer survives reentry, a cancelled receive, closed UI, or canonical resync.
+}
+
+/// Classify lost managed continuity: stale ownership needs recovery, anything else a
+/// bounded reattachment of the same owner.
+fn managed_continuity_lost(
+    session_id: SessionId,
+    error: &bcode_client::ClientError,
+) -> SessionStreamUpdate {
+    if super::managed_controls::is_stale_owner(error) {
+        SessionStreamUpdate::ManagedOwnershipLost { session_id }
+    } else {
+        SessionStreamUpdate::ResyncStarted { session_id }
+    }
 }
 
 async fn drive_managed_native_observations(

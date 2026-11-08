@@ -8,7 +8,7 @@ enabled = ["bcode.claude-code"]
 [plugins.config."bcode.claude-code".instances.offline-claude]
 executable = @EXECUTABLE@
 config_directory = @NAMESPACE@
-exact_version = "bcode-offline-claude-fixture 1.0.0"
+exact_version = "2.1.308 (Claude Code)"
 verified_session_state = true
 verified_native_auth = true
 setting_sources = []

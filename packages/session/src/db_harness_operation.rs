@@ -1436,7 +1436,16 @@ impl SessionDb {
         };
         let op = operation(&previous)?;
         if op.owner != *owner {
-            return Err(invalid());
+            // After graceful-restart recovery the current page still belongs to the released
+            // previous owner. The recovered generation starts a new native connection with no
+            // retained predecessor, exactly as the page commit validator treats it.
+            if after.is_some() || !recovered_from_page_owner(db, owner, op, &previous).await? {
+                return Err(invalid());
+            }
+            if last_sequence(db).await? != before {
+                return Err(invalid());
+            }
+            return Ok(None);
         }
         let R::ObservationPage { instance, page, .. } = &op.record else {
             return Err(invalid());
@@ -2079,11 +2088,62 @@ async fn verify_operation_writer(
 ) -> SessionDbResult<()> {
     if op.is_selected_open()
         && super::storage_writer_epoch_for(db).await?
-            != u64::from(bcode_session_models::external_harness::SELECTED_OPEN_STORAGE_WRITER_EPOCH)
+            < u64::from(bcode_session_models::external_harness::SELECTED_OPEN_STORAGE_WRITER_EPOCH)
+    {
+        return Err(invalid());
+    }
+    if op.requires_native_parity()
+        && super::storage_writer_epoch_for(db).await?
+            < u64::from(bcode_session_models::external_harness::NATIVE_PARITY_STORAGE_WRITER_EPOCH)
     {
         return Err(invalid());
     }
     Ok(())
+}
+
+/// Whether `owner` is a recovered generation whose configuration is the exact
+/// `RecoveryPrepared` transfer from the owner of the earlier `page` event.
+async fn recovered_from_page_owner(
+    db: &dyn Database,
+    owner: &ExternalHarnessOwner,
+    page_operation: &ExternalHarnessOperation,
+    page: &SessionEvent,
+) -> SessionDbResult<bool> {
+    let configured = latest(db, owner.session_id, "config", "current")
+        .await?
+        .ok_or_else(invalid)?;
+    let config = operation(&configured)?;
+    let R::RecoveryPrepared { recovery } = &config.record else {
+        return Ok(false);
+    };
+    Ok(config.owner == *owner
+        && released_predecessor_row(
+            owner,
+            recovery,
+            &page_operation.owner,
+            page.sequence,
+            configured.sequence,
+        ))
+}
+
+/// Whether a current locator row owned by `row_owner` and committed at `row_sequence` is
+/// history from a released predecessor of the recovered `owner`.
+///
+/// Only observation pages move `page/current` (and only deliveries move `binding/current`), so
+/// a recovered generation that is released again before it commits a page leaves the locator
+/// owned by an older generation than `recovery.previous_owner`. Any earlier generation of the
+/// same session committed before the `RecoveryPrepared` transfer is therefore history.
+fn released_predecessor_row(
+    owner: &ExternalHarnessOwner,
+    recovery: &bcode_session_models::external_harness::ExternalHarnessRecovery,
+    row_owner: &ExternalHarnessOwner,
+    row_sequence: u64,
+    config_sequence: u64,
+) -> bool {
+    row_sequence < config_sequence
+        && row_owner.session_id == owner.session_id
+        && (*row_owner == recovery.previous_owner
+            || row_owner.generation < recovery.previous_owner.generation)
 }
 
 async fn latest(
@@ -2153,6 +2213,7 @@ fn mutation_key(request: &ExternalHarnessRequest) -> String {
         R::Submit { submission, .. } => format!("submit:{}", submission.submission_id),
         R::Respond { response, .. } => format!("respond:{}", response.request_id),
         R::Interrupt(v) => format!("interrupt:{}", v.mutation_id),
+        R::Configure(v) => format!("configure:{}", v.mutation_id),
         R::Close(v) => format!("close:{}", v.mutation_id),
         R::Reconcile(_) => format!("reconcile:{}", request.request_id),
     }
@@ -2642,8 +2703,16 @@ fn observation_page_keys(
             keys.push(("submission_native_frame_v2".into(), key));
         }
         keys.push(("observation".into(), observation.observation_id.clone()));
-        if let HarnessObservationKind::Interaction { interaction } = &observation.kind {
-            keys.push(("interaction".into(), interaction.request_id.clone()));
+        match &observation.kind {
+            HarnessObservationKind::Interaction { interaction } => {
+                keys.push(("interaction".into(), interaction.request_id.clone()));
+            }
+            // The latest interaction locator then names the withdrawal, so a late response
+            // is refused before it reaches the native harness.
+            HarnessObservationKind::InteractionWithdrawn { request_id } => {
+                keys.push(("interaction".into(), request_id.clone()));
+            }
+            _ => {}
         }
     }
     if let Some(retention) = &page.retention {
@@ -3012,7 +3081,11 @@ async fn state_in_prefix(
             instance,
             capabilities,
             open_request,
-        } => (instance.clone(), capabilities.clone(), open_request.clone()),
+        } => (
+            instance.clone(),
+            capabilities.as_ref().clone(),
+            open_request.clone(),
+        ),
         R::RecoveryPrepared { recovery } => (
             recovery.release.instance.clone(),
             recovery.capabilities.clone(),
@@ -3043,7 +3116,13 @@ async fn state_in_prefix(
             let R::RecoveryPrepared { recovery } = &config.record else {
                 return Err(invalid());
             };
-            if op.owner != recovery.previous_owner || event.sequence >= config_sequence {
+            if !released_predecessor_row(
+                owner,
+                recovery,
+                &op.owner,
+                event.sequence,
+                config_sequence,
+            ) {
                 return Err(invalid());
             }
             // The old binding is history only. Continue checking page ownership below,
@@ -3056,8 +3135,13 @@ async fn state_in_prefix(
             let R::RecoveryPrepared { recovery } = &config.record else {
                 return Err(invalid());
             };
-            if page_operation.owner != recovery.previous_owner || event.sequence >= config_sequence
-            {
+            if !released_predecessor_row(
+                owner,
+                recovery,
+                &page_operation.owner,
+                event.sequence,
+                config_sequence,
+            ) {
                 return Err(invalid());
             }
             return Ok(Some(result));
@@ -3150,8 +3234,13 @@ async fn validate_operation(db: &dyn Database, event: &SessionEvent) -> SessionD
     if matches!(
         op.record,
         R::TransportReleased { .. } | R::RecoveryPrepared { .. }
-    ) {
+    ) && !bcode_session_models::external_harness::recovery_storage_available()
+    {
         return Err(invalid());
+    }
+    if let R::RecoveryPrepared { recovery } = &op.record {
+        // The new owner's generation is not yet canonical; validate against the released tail.
+        return validate_recovery_prepared(db, op, recovery, event.sequence).await;
     }
     if let Some(tail) =
         canonical_harness_tail(db, op.owner.session_id, Some(event.sequence)).await?
@@ -3182,7 +3271,7 @@ async fn validate_operation(db: &dyn Database, event: &SessionEvent) -> SessionD
         if op.owner.generation != 1
             || current.as_ref().is_some_and(|v| {
                 &v.instance != instance
-                    || &v.capabilities != capabilities
+                    || v.capabilities != **capabilities
                     || v.prepared_open.as_ref() != open_request.as_ref()
             })
         {
@@ -3205,7 +3294,116 @@ async fn validate_operation(db: &dyn Database, event: &SessionEvent) -> SessionD
         } => {
             validate_page(db, op, &current, after.as_deref(), page, instance).await?;
         }
-        R::Configured { .. } | R::TransportReleased { .. } | R::RecoveryPrepared { .. } => {}
+        R::TransportReleased { release } => {
+            validate_transport_released(db, op, &current, release).await?;
+        }
+        R::Configured { .. } | R::RecoveryPrepared { .. } => {}
+    }
+    Ok(())
+}
+
+/// A transport release must follow the same owner's exact acknowledged Close of the current
+/// confirmed binding. Release evidence never substitutes for Close acknowledgement.
+async fn validate_transport_released(
+    db: &dyn Database,
+    op: &ExternalHarnessOperation,
+    current: &ExternalHarnessState,
+    release: &bcode_session_models::external_harness::ExternalHarnessTransportRelease,
+) -> SessionDbResult<()> {
+    release.validate_for(&op.owner).map_err(|_| invalid())?;
+    let target = bcode_harness_models::HarnessSessionTarget::Confirmed(release.binding.clone());
+    if current.instance != release.instance
+        || current.binding.as_ref() != Some(&release.binding)
+        || current.target.as_ref() != Some(&target)
+    {
+        return Err(invalid());
+    }
+    let completion = latest(
+        db,
+        op.owner.session_id,
+        "completion",
+        &release.close_request_id,
+    )
+    .await?
+    .ok_or_else(invalid)?;
+    let completed = operation(&completion)?;
+    let R::DeliveryCompleted { request, response } = &completed.record else {
+        return Err(invalid());
+    };
+    let ExternalHarnessRequestKind::Close(control) = &request.kind else {
+        return Err(invalid());
+    };
+    let close_id = release.close_request_id.as_str();
+    if completed.owner != op.owner
+        || request.instance != release.instance
+        || request.request_id != close_id
+        || control.mutation_id != close_id
+        || control.target != target
+        || !matches!(&response.kind, ExternalHarnessResponseKind::Acknowledged { mutation_id }
+            if mutation_id == close_id)
+    {
+        return Err(invalid());
+    }
+    Ok(())
+}
+
+/// Recovery transfers ownership exactly once from a released previous generation. The tail
+/// must be that owner's transport release, and the retained intent must match its evidence.
+async fn validate_recovery_prepared(
+    db: &dyn Database,
+    op: &ExternalHarnessOperation,
+    recovery: &bcode_session_models::external_harness::ExternalHarnessRecovery,
+    sequence: u64,
+) -> SessionDbResult<()> {
+    recovery.validate_for(&op.owner).map_err(|_| invalid())?;
+    let tail = canonical_harness_tail(db, op.owner.session_id, Some(sequence))
+        .await?
+        .ok_or_else(invalid)?;
+    let tail_op = operation(&tail)?;
+    let R::TransportReleased { release } = &tail_op.record else {
+        return Err(invalid());
+    };
+    if tail_op.owner != recovery.previous_owner
+        || tail.sequence != recovery.release_event_sequence
+        || release != &recovery.release
+    {
+        return Err(invalid());
+    }
+    let released = latest(
+        db,
+        op.owner.session_id,
+        "transport_release",
+        &format!("generation:{}", recovery.previous_owner.generation),
+    )
+    .await?
+    .ok_or_else(invalid)?;
+    if released.sequence != tail.sequence {
+        return Err(invalid());
+    }
+    let previous = state_in_prefix(db, &recovery.previous_owner, Some(sequence))
+        .await?
+        .ok_or_else(invalid)?;
+    if previous.instance != recovery.release.instance
+        || previous.capabilities != recovery.capabilities
+        || previous.binding.as_ref() != Some(&recovery.release.binding)
+        || latest(
+            db,
+            op.owner.session_id,
+            "recovery",
+            &recovery.resume_request.request_id,
+        )
+        .await?
+        .is_some()
+        || latest(
+            db,
+            op.owner.session_id,
+            "transport_release",
+            &format!("generation:{}", op.owner.generation),
+        )
+        .await?
+        .is_some()
+    {
+        return Err(invalid());
     }
     Ok(())
 }
@@ -3227,6 +3425,13 @@ async fn interaction(
     let ExternalHarnessOperationRecord::ObservationPage { page, .. } = &observed.record else {
         return Err(invalid());
     };
+    if page.observations.iter().any(|v| {
+        matches!(&v.kind, HarnessObservationKind::InteractionWithdrawn { request_id }
+            if request_id == id)
+    }) {
+        // Withdrawn by the native harness: no longer answerable.
+        return Ok(None);
+    }
     Ok(page.observations.iter().find_map(|v| match &v.kind {
         HarnessObservationKind::Interaction { interaction } if interaction.request_id == id => {
             Some(interaction.clone())
@@ -3925,6 +4130,7 @@ impl SessionDb {
         let owner = operation(&config)?.owner.clone();
         state(db, &owner).await?.ok_or_else(invalid)?;
         let mut page = HarnessObservationPage {
+            live: Vec::new(),
             retention: None,
             hydration_requests: Vec::new(),
             inventory_page: None,
@@ -4265,6 +4471,7 @@ impl SessionDb {
         };
         let Some(row) = rows.first() else {
             return Ok(HarnessObservationPage {
+                live: Vec::new(),
                 retention: None,
                 hydration_requests: Vec::new(),
                 inventory_page: None,
@@ -4319,6 +4526,7 @@ impl SessionDb {
             format!("h1:{}:0", seq.checked_add(1).ok_or_else(invalid)?)
         });
         Ok(HarnessObservationPage {
+            live: Vec::new(),
             retention: None,
             hydration_requests: Vec::new(),
             inventory_page: None,
@@ -4371,11 +4579,21 @@ async fn validate_claim(
         || latest(db, op.owner.session_id, "claim", &request.request_id)
             .await?
             .is_some()
-        || latest(db, op.owner.session_id, "mutation", &mutation_key(request))
-            .await?
-            .is_some()
     {
         return Err(invalid());
+    }
+    if let Some(previous) =
+        latest(db, op.owner.session_id, "mutation", &mutation_key(request)).await?
+    {
+        // The session-wide native-creation key of a released earlier generation does not
+        // fence the exact retained recovery resume, which only `RecoveryPrepared` can retain.
+        let recovered_resume = matches!(&request.kind,
+            ExternalHarnessRequestKind::Open(open) if open.resume.is_some())
+            && current.prepared_open.as_ref() == Some(request)
+            && operation(&previous)?.owner.generation < op.owner.generation;
+        if !recovered_resume {
+            return Err(invalid());
+        }
     }
     match &request.kind {
         ExternalHarnessRequestKind::Open(open) => {
@@ -4392,6 +4610,11 @@ async fn validate_claim(
         ExternalHarnessRequestKind::Interrupt(control)
         | ExternalHarnessRequestKind::Close(control) => {
             if current.target.as_ref() != Some(&control.target) {
+                return Err(invalid());
+            }
+        }
+        ExternalHarnessRequestKind::Configure(configure) => {
+            if current.target.as_ref() != Some(&configure.target) {
                 return Err(invalid());
             }
         }
@@ -4525,17 +4748,7 @@ async fn validate_page(
     let previous = match previous {
         Some(event) if operation(&event)?.owner == op.owner => Some(event),
         Some(event) => {
-            let configured = latest(db, op.owner.session_id, "config", "current")
-                .await?
-                .ok_or_else(invalid)?;
-            let config = operation(&configured)?;
-            let R::RecoveryPrepared { recovery } = &config.record else {
-                return Err(invalid());
-            };
-            if config.owner != op.owner
-                || operation(&event)?.owner != recovery.previous_owner
-                || event.sequence >= configured.sequence
-            {
+            if !recovered_from_page_owner(db, &op.owner, operation(&event)?, &event).await? {
                 return Err(invalid());
             }
             None
@@ -5248,7 +5461,7 @@ mod migration_key_tests {
     use std::collections::BTreeMap;
 
     #[tokio::test]
-    async fn unpublished_recovery_rejects_before_host_verification_or_session_creation() {
+    async fn recovery_storage_is_fenced_and_never_creates_sessions_or_verifies_absent_owners() {
         let root = tempfile::tempdir().unwrap();
         let sessions = crate::SessionManager::persistent(root.path()).unwrap();
         let owner = ExternalHarnessOwner {
@@ -5286,9 +5499,16 @@ mod migration_key_tests {
         for schema in [55, 56, 57, 58] {
             assert!(
                 gated.validate_storage(schema, 25).is_err(),
-                "later schemas must not activate recovery"
+                "writers before the native-parity epoch must not write recovery"
             );
         }
+        for schema in [55, 56, 57] {
+            assert!(
+                gated.validate_storage(schema, 26).is_err(),
+                "released schemas cannot represent recovery"
+            );
+        }
+        gated.validate_storage(58, 26).unwrap();
         let verified = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         let called = std::sync::Arc::clone(&verified);
         assert!(
@@ -5400,6 +5620,8 @@ mod migration_key_tests {
             constraints: vec!["exact provenance".into()],
         };
         bcode_harness_models::HarnessCapabilities {
+            model_switch: bcode_harness_models::HarnessCapability::unsupported(),
+            permission_mode: bcode_harness_models::HarnessCapability::unsupported(),
             resume: capability.clone(),
             steering: capability.clone(),
             approval: capability.clone(),
@@ -5413,7 +5635,7 @@ mod migration_key_tests {
     }
     fn selected_test_event(owner: &ExternalHarnessOwner, sequence: u64, record: R) -> SessionEvent {
         SessionEvent {
-            schema_version: 57,
+            schema_version: bcode_session_models::CURRENT_SESSION_EVENT_SCHEMA_VERSION,
             sequence,
             timestamp_ms: sequence,
             session_id: owner.session_id,
@@ -5530,13 +5752,14 @@ mod migration_key_tests {
             inventory_commitments: Vec::new(),
             record: R::Configured {
                 instance: request.instance,
-                capabilities: recovery_test_capabilities(),
+                capabilities: Box::new(recovery_test_capabilities()),
                 open_request: Some(retained),
             },
         };
         assert!(configured.validate_storage(55, 23).is_err());
         assert!(configured.validate_storage(56, 24).is_err());
         configured.validate_storage(57, 25).unwrap();
+        configured.validate_storage(58, 26).unwrap();
         assert!(configured.validate_storage(57, 24).is_err());
     }
 
@@ -5669,9 +5892,12 @@ mod migration_key_tests {
             state(db.database(), owner).await.is_err(),
             "schema57 cannot substitute for a writer25 fence"
         );
-        super::super::set_storage_writer_contract(db.database(), 25)
-            .await
-            .unwrap();
+        super::super::set_storage_writer_contract(
+            db.database(),
+            bcode_session_models::CURRENT_SESSION_STORAGE_WRITER_EPOCH,
+        )
+        .await
+        .unwrap();
         db.database()
             .delete("turn_evidence")
             .where_eq("evidence_kind", KIND)
@@ -5708,7 +5934,7 @@ mod migration_key_tests {
     #[tokio::test]
     async fn selected_database_claims_are_exact_exclusive_and_uncertain_without_replay() {
         // Canonical decoding remains current-format only; publication belongs to the coordinator.
-        if bcode_session_models::CURRENT_SESSION_EVENT_SCHEMA_VERSION != 57 {
+        if bcode_session_models::CURRENT_SESSION_EVENT_SCHEMA_VERSION < 57 {
             return;
         }
         let root = tempfile::tempdir().unwrap();
@@ -5722,9 +5948,12 @@ mod migration_key_tests {
             .await
             .unwrap();
         // Candidate-fence test only; production CURRENT constants remain coordinator-owned.
-        super::super::set_storage_writer_contract(db.database(), 25)
-            .await
-            .unwrap();
+        super::super::set_storage_writer_contract(
+            db.database(),
+            bcode_session_models::CURRENT_SESSION_STORAGE_WRITER_EPOCH,
+        )
+        .await
+        .unwrap();
         append_selected_session_created(&db, &owner, root.path()).await;
         let request = selected_request(&owner, "discovered-model");
         let retained = ExternalHarnessRequest::from_models_request(&request).unwrap();
@@ -5735,7 +5964,7 @@ mod migration_key_tests {
                 1,
                 R::Configured {
                     instance: request.instance.clone(),
-                    capabilities: recovery_test_capabilities(),
+                    capabilities: Box::new(recovery_test_capabilities()),
                     open_request: Some(retained.clone()),
                 },
             ),
@@ -5885,8 +6114,8 @@ mod migration_key_tests {
 
     #[tokio::test]
     async fn selected_actor_retry_is_uncertain_and_rejects_changed_model_and_owner() {
-        if bcode_session_models::CURRENT_SESSION_EVENT_SCHEMA_VERSION != 57
-            || bcode_session_models::CURRENT_SESSION_STORAGE_WRITER_EPOCH != 25
+        if bcode_session_models::CURRENT_SESSION_EVENT_SCHEMA_VERSION < 57
+            || bcode_session_models::CURRENT_SESSION_STORAGE_WRITER_EPOCH < 25
         {
             return;
         }

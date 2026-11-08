@@ -13,14 +13,14 @@ use bcode_session_models::SessionId;
 use bmux_tui::geometry::Rect;
 use bmux_tui::terminal::Terminal;
 
-use super::app::BmuxApp;
+use super::app::{BmuxApp, ManagedExitRequest};
 use super::effects::{TuiEffect, TuiEffectQueue};
 use super::startup_action::StartupTuiAction;
 use super::{TuiError, chat_loop, history_flow, root_program, session_flow};
 
 /// Attach to a session and run the active chat loop.
 #[allow(clippy::future_not_send, dead_code)]
-pub async fn run_event_loop<W: Write>(
+pub async fn run_event_loop<W: Write + Send>(
     terminal: &mut Terminal<&mut W>,
     session_id: Option<SessionId>,
 ) -> Result<(), TuiError> {
@@ -34,7 +34,7 @@ pub async fn run_event_loop<W: Write>(
 
 /// Attach to a session and run the active chat loop with caller-provided static bundled plugins.
 #[allow(clippy::future_not_send)]
-pub async fn run_event_loop_with_static_bundled<W: Write>(
+pub async fn run_event_loop_with_static_bundled<W: Write + Send>(
     terminal: &mut Terminal<&mut W>,
     session_id: Option<SessionId>,
     static_plugins: &[bcode_plugin::StaticBundledPlugin],
@@ -52,7 +52,7 @@ pub async fn run_event_loop_with_static_bundled<W: Write>(
 
 /// Attach to a session, run an optional startup action, and run the active chat loop.
 #[allow(clippy::future_not_send)]
-pub async fn run_event_loop_with_startup<W: Write>(
+pub async fn run_event_loop_with_startup<W: Write + Send>(
     terminal: &mut Terminal<&mut W>,
     session_id: Option<SessionId>,
     startup_action: StartupTuiAction,
@@ -146,7 +146,7 @@ fn prepare_plugin_surface_model<W: Write>(
 
 /// Attach to a session, run an optional startup action, and run the active chat loop with caller-provided static bundled plugins.
 #[allow(clippy::future_not_send)]
-pub async fn run_event_loop_with_startup_and_static_bundled<W: Write>(
+pub async fn run_event_loop_with_startup_and_static_bundled<W: Write + Send>(
     terminal: &mut Terminal<&mut W>,
     session_id: Option<SessionId>,
     startup_action: StartupTuiAction,
@@ -188,7 +188,7 @@ pub async fn prepare_connection(
 }
 
 #[allow(clippy::future_not_send)]
-pub async fn run_prepared_chat<W: Write>(
+pub async fn run_prepared_chat<W: Write + Send>(
     terminal: &mut Terminal<&mut W>,
     connection: PreparedConnection,
     startup_action: StartupTuiAction,
@@ -264,7 +264,7 @@ fn load_presentation(static_plugins: &[bcode_plugin::StaticBundledPlugin]) -> Pr
 /// # Errors
 /// Returns root runtime errors.
 #[allow(clippy::future_not_send)]
-pub async fn run_prepared_chat_with_presentation<W: Write>(
+pub async fn run_prepared_chat_with_presentation<W: Write + Send>(
     terminal: &mut Terminal<&mut W>,
     connection: PreparedConnection,
     presentation: PreparedPresentation,
@@ -471,7 +471,10 @@ fn apply_initial_config(
 
 impl super::TerminalShell {
     /// Explicitly reattach bounded canonical state for one retained managed owner.
-    /// Never starts/recreates a native process or replays an accepted mutation.
+    ///
+    /// Never starts/recreates a native process or replays an accepted mutation. When the
+    /// daemon restarted and no longer recognizes the owner generation, the journey recovers a
+    /// new generation through the managed recovery operation and reattaches it.
     /// # Errors
     /// Rejects missing/foreign binding, changed instance/generation/configuration and attach errors.
     // Like the other TerminalShell journeys, this future owns the calling terminal thread.
@@ -486,6 +489,9 @@ impl super::TerminalShell {
     ) -> Result<(), TuiError> {
         let config = bcode_config::encode_effective_config(&bcode_config::load_config()?)?;
         let mut retained_instance = None;
+        let mut generation = generation;
+        let mut budget = ManagedReentryBudget::default();
+        let mut status = None;
         loop {
             if bcode_config::encode_effective_config(&bcode_config::load_config()?)? != config {
                 return Err(std::io::Error::other(
@@ -518,38 +524,284 @@ impl super::TerminalShell {
                 .into());
             }
             retained_instance = Some(binding.instance.clone());
-            let Some(commands) = Box::pin(run_managed_chat_bound(
+            let exit = Box::pin(run_managed_chat_bound(
                 &mut self.terminal()?,
                 connection,
                 attached,
                 plugins,
                 options,
                 Some(&binding),
+                status.take(),
             ))
-            .await?
-            else {
-                return Ok(());
+            .await?;
+            let target = ManagedJourneyTarget {
+                session_id,
+                instance_id,
+                generation,
             };
-            // Root and its input reader have stopped. /auth login was explicit consent; the
-            // only subsequent reentry is bounded observation, never Start or input replay.
-            #[cfg(unix)]
-            {
-                let interface = commands.terminal_auth_interface().await?.ok_or_else(|| {
-                    std::io::Error::other("No native terminal auth service declared")
-                })?;
-                let mut flow = commands.auth_flow().await?;
-                let result = self.run_managed_auth_handoff(&mut flow, interface).await;
-                if result.is_err() {
-                    return Err(std::io::Error::other("Native login outcome unavailable; reattach and inspect /auth status without replay").into());
+            match Box::pin(next_managed_step(exit, &target, &mut budget)).await {
+                ManagedJourneyStep::Continue {
+                    generation: next,
+                    status: next_status,
+                } => {
+                    generation = next;
+                    status = Some(next_status);
+                }
+                ManagedJourneyStep::End(ManagedJourneyEnd::Closed) => return Ok(()),
+                ManagedJourneyStep::End(ManagedJourneyEnd::Failed(message)) => {
+                    self.show_error_without_retry(&message).await?;
+                    return Ok(());
+                }
+                ManagedJourneyStep::End(ManagedJourneyEnd::Navigate(target)) => {
+                    return Box::pin(self.run_chat(target, plugins, options)).await;
+                }
+                ManagedJourneyStep::End(ManagedJourneyEnd::Auth(commands)) => {
+                    // Root and its input reader have stopped. /auth login was explicit consent;
+                    // the only subsequent reentry is bounded observation, never Start or replay.
+                    #[cfg(unix)]
+                    {
+                        let interface =
+                            commands.terminal_auth_interface().await?.ok_or_else(|| {
+                                std::io::Error::other("No native terminal auth service declared")
+                            })?;
+                        let mut flow = commands.auth_flow().await?;
+                        let result = self.run_managed_auth_handoff(&mut flow, interface).await;
+                        if result.is_err() {
+                            return Err(std::io::Error::other("Native login outcome unavailable; reattach and inspect /auth status without replay").into());
+                        }
+                    }
+                    #[cfg(not(unix))]
+                    {
+                        drop(commands);
+                        return Err(std::io::Error::other(
+                            "Native terminal authentication unsupported",
+                        )
+                        .into());
+                    }
                 }
             }
-            #[cfg(not(unix))]
-            {
-                drop(commands);
-                return Err(
-                    std::io::Error::other("Native terminal authentication unsupported").into(),
-                );
+        }
+    }
+}
+
+/// Why a managed root returned control to its journey.
+pub enum ManagedChatExit {
+    /// The user closed the conversation.
+    Closed,
+    /// Explicit `/auth login`: the journey hands the terminal to the native login flow.
+    AuthRequested(bcode_client::ManagedSessionCommandHandle),
+    /// Event continuity was lost; reattach the same owner (observation only).
+    Reattach,
+    /// The daemon no longer recognizes this owner generation; recover, then reattach.
+    Recover {
+        /// Command handle retained for the recovery operation.
+        commands: bcode_client::ManagedSessionCommandHandle,
+        /// Generation the root was attached to.
+        generation: u64,
+    },
+    /// Open another session, or a new draft for `None`, outside the managed root.
+    Navigate(Option<SessionId>),
+}
+
+/// Identity of the managed owner a journey is attached to.
+pub struct ManagedJourneyTarget<'a> {
+    /// Canonical managed session.
+    pub session_id: SessionId,
+    /// Configured harness instance.
+    pub instance_id: &'a str,
+    /// Generation of the attachment that just ended.
+    pub generation: u64,
+}
+
+/// Next action of a managed journey after its root stopped.
+pub enum ManagedJourneyStep {
+    /// Reattach at `generation`, showing `status` in the new root.
+    Continue { generation: u64, status: String },
+    /// Leave the managed journey.
+    End(ManagedJourneyEnd),
+}
+
+/// How a managed journey ends.
+pub enum ManagedJourneyEnd {
+    /// The user closed the conversation.
+    Closed,
+    /// Explicit native login handoff requested.
+    Auth(bcode_client::ManagedSessionCommandHandle),
+    /// Open another session, or a new draft for `None`.
+    Navigate(Option<SessionId>),
+    /// Automatic continuation failed; show this actionable message.
+    Failed(String),
+}
+
+const MANAGED_REENTRY_WINDOW: Duration = Duration::from_secs(60);
+const MANAGED_REENTRY_LIMIT: u8 = 3;
+
+/// Bounds automatic reattachment/recovery so a persistently failing daemon cannot loop.
+#[derive(Debug)]
+pub struct ManagedReentryBudget {
+    window_started: std::time::Instant,
+    attempts: u8,
+}
+
+impl Default for ManagedReentryBudget {
+    fn default() -> Self {
+        Self {
+            window_started: std::time::Instant::now(),
+            attempts: 0,
+        }
+    }
+}
+
+impl ManagedReentryBudget {
+    /// Whether another automatic continuation may start at `now`.
+    pub fn allow(&mut self, now: std::time::Instant) -> bool {
+        if now.duration_since(self.window_started) >= MANAGED_REENTRY_WINDOW {
+            self.window_started = now;
+            self.attempts = 0;
+        }
+        if self.attempts >= MANAGED_REENTRY_LIMIT {
+            return false;
+        }
+        self.attempts += 1;
+        true
+    }
+}
+
+fn reopen_hint(target: &ManagedJourneyTarget<'_>) -> String {
+    format!(
+        "Reopen it from Sessions or run `bcode tui {} --managed-instance {} --managed-generation {}`. No prior input was replayed.",
+        target.session_id, target.instance_id, target.generation
+    )
+}
+
+/// Decide what follows a managed root exit, recovering a stale owner when required.
+///
+/// Recovery uses a fresh retained recovery identity and never replays submissions.
+pub async fn next_managed_step(
+    exit: ManagedChatExit,
+    target: &ManagedJourneyTarget<'_>,
+    budget: &mut ManagedReentryBudget,
+) -> ManagedJourneyStep {
+    match exit {
+        ManagedChatExit::Closed => ManagedJourneyStep::End(ManagedJourneyEnd::Closed),
+        ManagedChatExit::AuthRequested(commands) => {
+            ManagedJourneyStep::End(ManagedJourneyEnd::Auth(commands))
+        }
+        ManagedChatExit::Navigate(destination) => {
+            ManagedJourneyStep::End(ManagedJourneyEnd::Navigate(destination))
+        }
+        ManagedChatExit::Reattach => {
+            if budget.allow(std::time::Instant::now()) {
+                ManagedJourneyStep::Continue {
+                    generation: target.generation,
+                    status: "Reconnected to the managed conversation; no input was replayed"
+                        .to_owned(),
+                }
+            } else {
+                ManagedJourneyStep::End(ManagedJourneyEnd::Failed(format!(
+                    "The managed conversation keeps losing its connection to the daemon. {}",
+                    reopen_hint(target)
+                )))
             }
+        }
+        ManagedChatExit::Recover {
+            commands,
+            generation,
+        } => {
+            if !budget.allow(std::time::Instant::now()) {
+                commands.detach_commands().await;
+                return ManagedJourneyStep::End(ManagedJourneyEnd::Failed(format!(
+                    "The managed conversation could not be recovered after repeated daemon restarts. {}",
+                    reopen_hint(target)
+                )));
+            }
+            let recovered = commands
+                .recover(generation, uuid::Uuid::new_v4().to_string())
+                .await;
+            commands.detach_commands().await;
+            match recovered {
+                Ok(next) => ManagedJourneyStep::Continue {
+                    generation: next,
+                    status: format!(
+                        "Recovered the managed conversation after a daemon restart (generation {next}); no input was replayed"
+                    ),
+                },
+                Err(error) => ManagedJourneyStep::End(ManagedJourneyEnd::Failed(format!(
+                    "The managed conversation could not be recovered after the daemon restarted ({error}). {}",
+                    reopen_hint(target)
+                ))),
+            }
+        }
+    }
+}
+
+/// Run a managed journey inside an existing root terminal: reattach, recover after daemon
+/// restart, and return how it ended. Native login handoff is not available here; the
+/// conversation is reattached with guidance instead.
+#[allow(clippy::future_not_send)]
+async fn run_managed_reopen<W: Write + Send>(
+    terminal: &mut Terminal<&mut W>,
+    request: chat_loop::ManagedOpenRequest,
+    plugins: &[bcode_plugin::StaticBundledPlugin],
+    options: super::TuiLaunchOptions,
+) -> Result<ManagedJourneyEnd, TuiError> {
+    let mut generation = request.generation;
+    let mut budget = ManagedReentryBudget::default();
+    let mut status = None;
+    loop {
+        let window = history_flow::initial_transcript_window_request(terminal.area());
+        let (connection, attached, binding) = match prepare_managed_reattachment(
+            bcode_client::ManagedSessionClient::default_endpoint(),
+            request.session_id,
+            &request.instance_id,
+            generation,
+            window,
+        )
+        .await
+        {
+            Ok(prepared) => prepared,
+            Err(error) => {
+                return Ok(ManagedJourneyEnd::Failed(format!(
+                    "The managed conversation could not be attached ({error}). {}",
+                    reopen_hint(&ManagedJourneyTarget {
+                        session_id: request.session_id,
+                        instance_id: &request.instance_id,
+                        generation,
+                    })
+                )));
+            }
+        };
+        let exit = Box::pin(run_managed_chat_bound(
+            terminal,
+            connection,
+            attached,
+            plugins,
+            options,
+            Some(&binding),
+            status.take(),
+        ))
+        .await?;
+        let target = ManagedJourneyTarget {
+            session_id: request.session_id,
+            instance_id: &request.instance_id,
+            generation,
+        };
+        match Box::pin(next_managed_step(exit, &target, &mut budget)).await {
+            ManagedJourneyStep::Continue {
+                generation: next,
+                status: next_status,
+            } => {
+                generation = next;
+                status = Some(next_status);
+            }
+            ManagedJourneyStep::End(ManagedJourneyEnd::Auth(commands)) => {
+                commands.detach_commands().await;
+                status = Some(format!(
+                    "Native login needs the terminal; exit and run `bcode tui {} --managed-instance {} --managed-generation {generation}`, then /auth login",
+                    request.session_id, request.instance_id
+                ));
+            }
+            ManagedJourneyStep::End(end) => return Ok(end),
         }
     }
 }
@@ -605,7 +857,8 @@ fn validate_reattach_binding(
 }
 
 /// Run an explicit managed conversation using the same root, reducer and transcript.
-/// No ordinary client, model catalog, model status or provider credentials are constructed.
+/// No ordinary model client, model catalog, model status or provider credentials are
+/// constructed for execution; allow-listed host operations use host-only access lazily.
 /// # Errors
 /// Returns managed binding, canonical attach, configuration or terminal errors.
 #[allow(clippy::future_not_send)]
@@ -615,7 +868,8 @@ pub async fn run_managed_chat<W: Write + Send>(
     attached: bcode_client::AttachedSessionHistory,
     static_plugins: &[bcode_plugin::StaticBundledPlugin],
     launch_options: super::TuiLaunchOptions,
-) -> Result<Option<bcode_client::ManagedSessionCommandHandle>, TuiError> {
+    status: Option<String>,
+) -> Result<ManagedChatExit, TuiError> {
     Box::pin(run_managed_chat_bound(
         terminal,
         connection,
@@ -623,10 +877,12 @@ pub async fn run_managed_chat<W: Write + Send>(
         static_plugins,
         launch_options,
         None,
+        status,
     ))
     .await
 }
 
+#[allow(clippy::too_many_lines)]
 async fn run_managed_chat_bound<W: Write + Send>(
     terminal: &mut Terminal<&mut W>,
     connection: bcode_client::ManagedSessionConnection,
@@ -634,7 +890,8 @@ async fn run_managed_chat_bound<W: Write + Send>(
     static_plugins: &[bcode_plugin::StaticBundledPlugin],
     launch_options: super::TuiLaunchOptions,
     expected_binding: Option<&bcode_ipc::ManagedSessionTargetSnapshot>,
-) -> Result<Option<bcode_client::ManagedSessionCommandHandle>, TuiError> {
+    status: Option<String>,
+) -> Result<ManagedChatExit, TuiError> {
     let session_id = connection.session_id();
     if attached.session.id != session_id {
         return Err(TuiError::Client(bcode_client::ClientError::Protocol(
@@ -718,22 +975,52 @@ async fn run_managed_chat_bound<W: Write + Send>(
         },
         Err(_) => chat.app.set_status("Managed conversation attached; native authentication channel is unavailable".into()),
     }
+        if let Some(status) = status {
+            chat.app.set_status(status);
+        }
         let mut loop_state = chat_loop::ChatLoopState::new_managed(commands.clone(), generation);
         loop_state.declarative_streaming_policy = declarative;
         loop_state.streaming_presentation_override = streaming;
         run_managed_root_runtime(terminal, chat, settings, loop_state)
     };
-    let auth_requested = finish_managed_attachment(run.await, commands.detach_commands()).await?;
-    Ok(auth_requested.then_some(commands))
+    let outcome = finish_managed_attachment(run.await, commands.detach_commands()).await?;
+    Ok(match outcome {
+        ManagedRootOutcome::Closed => ManagedChatExit::Closed,
+        ManagedRootOutcome::Auth => ManagedChatExit::AuthRequested(commands),
+        ManagedRootOutcome::Exit(ManagedExitRequest::Reattach) => ManagedChatExit::Reattach,
+        ManagedRootOutcome::Exit(ManagedExitRequest::Recover) => ManagedChatExit::Recover {
+            commands,
+            generation,
+        },
+        ManagedRootOutcome::Exit(ManagedExitRequest::Navigate(target)) => {
+            ManagedChatExit::Navigate(target)
+        }
+    })
+}
+
+/// How a managed root runtime stopped.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ManagedRootOutcome {
+    Closed,
+    Auth,
+    Exit(ManagedExitRequest),
+}
+
+impl ManagedRootOutcome {
+    /// Outcomes that need the command handle after the root stopped.
+    const fn retains_commands(self) -> bool {
+        matches!(self, Self::Auth | Self::Exit(ManagedExitRequest::Recover))
+    }
 }
 
 // Ordinary exit/error must await command-channel revocation, even if event-task abort
-// has not yet been polled. Explicit auth handoff retains commands until login finishes.
+// has not yet been polled. Explicit auth handoff and stale-owner recovery retain commands
+// until their operation finishes; both detach afterwards.
 async fn finish_managed_attachment(
-    result: Result<bool, TuiError>,
+    result: Result<ManagedRootOutcome, TuiError>,
     detach: impl std::future::Future<Output = ()>,
-) -> Result<bool, TuiError> {
-    if !matches!(result, Ok(true)) {
+) -> Result<ManagedRootOutcome, TuiError> {
+    if !matches!(&result, Ok(outcome) if outcome.retains_commands()) {
         detach.await;
     }
     result
@@ -746,7 +1033,9 @@ fn run_managed_root_runtime<'a, 'b, W: Write + Send + 'b>(
     chat: session_flow::ActiveChat,
     settings: chat_loop::TuiRuntimeSettings,
     loop_state: chat_loop::ChatLoopState,
-) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<bool, TuiError>> + Send + 'a>>
+) -> std::pin::Pin<
+    Box<dyn std::future::Future<Output = Result<ManagedRootOutcome, TuiError>> + Send + 'a>,
+>
 where
     'b: 'a,
 {
@@ -760,18 +1049,78 @@ where
     Box::pin(async move {
         // run owns the model and drains input/accepted operations before reentry.
         let model = run.await?;
-        let auth_requested = model.chat.app.managed_auth_requested();
+        let outcome = if model.chat.app.managed_auth_requested() {
+            ManagedRootOutcome::Auth
+        } else {
+            model
+                .chat
+                .app
+                .managed_exit_request()
+                .map_or(ManagedRootOutcome::Closed, ManagedRootOutcome::Exit)
+        };
         drop(model);
-        Ok(auth_requested)
+        Ok(outcome)
     })
 }
 
-async fn run_root<W: Write>(
+#[allow(clippy::future_not_send)]
+async fn run_root<W: Write + Send>(
     terminal: &mut Terminal<&mut W>,
     initialized: InitializedTui,
     startup_action: StartupTuiAction,
     publisher: Option<super::resurrection::Publisher>,
 ) -> Result<(), TuiError> {
+    let static_plugins = initialized.settings.static_plugins().to_vec();
+    let launch_options = initialized.settings.launch_options();
+    let mut initialized = initialized;
+    let mut startup_action = startup_action;
+    let mut publisher = publisher;
+    loop {
+        let Some(request) = run_root_runtime(
+            terminal,
+            Box::pin(build_root_model(
+                initialized,
+                publisher.take(),
+                std::mem::replace(&mut startup_action, StartupTuiAction::None),
+            ))
+            .await?,
+        )
+        .await?
+        else {
+            return Ok(());
+        };
+        // The ordinary root found a managed binding: continue in the sealed managed route.
+        let end = Box::pin(run_managed_reopen(
+            terminal,
+            request,
+            &static_plugins,
+            launch_options,
+        ))
+        .await?;
+        let next_session = match end {
+            ManagedJourneyEnd::Closed | ManagedJourneyEnd::Auth(_) => return Ok(()),
+            ManagedJourneyEnd::Navigate(target) => target,
+            ManagedJourneyEnd::Failed(message) => {
+                initialized =
+                    initialize_tui(terminal.area(), None, &static_plugins, launch_options);
+                initialized.chat.app.set_status(message);
+                continue;
+            }
+        };
+        initialized = initialize_tui(
+            terminal.area(),
+            next_session,
+            &static_plugins,
+            launch_options,
+        );
+    }
+}
+
+async fn build_root_model(
+    initialized: InitializedTui,
+    publisher: Option<super::resurrection::Publisher>,
+    startup_action: StartupTuiAction,
+) -> Result<root_program::BcodeRuntimeModel, TuiError> {
     let passive_client = initialized
         .client
         .clone()
@@ -783,21 +1132,14 @@ async fn run_root<W: Write>(
     );
     loop_state.declarative_streaming_policy = initialized.declarative_streaming_policy;
     loop_state.streaming_presentation_override = initialized.streaming_presentation_override;
-    let model = {
-        let mut model = root_program::BcodeRuntimeModel::new(
-            initialized.chat,
-            initialized.settings,
-            loop_state,
-        );
-        model.resurrection = publisher;
-        if let StartupTuiAction::OpenRalphHome { repo_path } = startup_action {
-            let surface =
-                super::ralph_launcher::open_root_ralph_home_surface(repo_path, None).await?;
-            model.queue_plugin_surface("bcode.ralph", surface);
-        }
-        model
-    };
-    run_root_runtime(terminal, model).await
+    let mut model =
+        root_program::BcodeRuntimeModel::new(initialized.chat, initialized.settings, loop_state);
+    model.resurrection = publisher;
+    if let StartupTuiAction::OpenRalphHome { repo_path } = startup_action {
+        let surface = super::ralph_launcher::open_root_ralph_home_surface(repo_path, None).await?;
+        model.queue_plugin_surface("bcode.ralph", surface);
+    }
+    Ok(model)
 }
 
 // Construct the runtime and its run future outside the startup coroutine. Merely
@@ -805,12 +1147,12 @@ async fn run_root<W: Write>(
 fn run_root_runtime<W: Write>(
     terminal: &mut Terminal<&mut W>,
     model: root_program::BcodeRuntimeModel,
-) -> impl std::future::Future<Output = Result<(), TuiError>> {
+) -> impl std::future::Future<Output = Result<Option<chat_loop::ManagedOpenRequest>, TuiError>> {
     let (runtime, handle) = root_program::runtime(terminal, model);
     let run = Box::pin(root_program::run(runtime, handle));
     async move {
-        let _model = run.await?;
-        Ok(())
+        let mut model = run.await?;
+        Ok(model.loop_state.take_managed_open())
     }
 }
 
@@ -820,13 +1162,24 @@ mod managed_reattach_tests {
 
     #[tokio::test]
     async fn managed_exit_and_error_await_attachment_teardown() {
-        for failed in [false, true] {
+        for (failed, outcome) in [
+            (false, ManagedRootOutcome::Closed),
+            (
+                false,
+                ManagedRootOutcome::Exit(ManagedExitRequest::Reattach),
+            ),
+            (
+                false,
+                ManagedRootOutcome::Exit(ManagedExitRequest::Navigate(None)),
+            ),
+            (true, ManagedRootOutcome::Closed),
+        ] {
             let (entered, entered_rx) = tokio::sync::oneshot::channel();
             let (release, released) = tokio::sync::oneshot::channel();
             let result = if failed {
                 Err(TuiError::Io(std::io::Error::other("fixture exit")))
             } else {
-                Ok(false)
+                Ok(outcome)
             };
             let exit = finish_managed_attachment(result, async {
                 entered.send(()).unwrap();
@@ -845,30 +1198,37 @@ mod managed_reattach_tests {
 
     #[tokio::test]
     async fn explicit_auth_handoff_does_not_detach_commands_before_login() {
-        let result = finish_managed_attachment(Ok(true), async {
-            panic!("auth handoff must retain its command channel");
-        })
-        .await;
-        assert!(result.unwrap());
+        for outcome in [
+            ManagedRootOutcome::Auth,
+            ManagedRootOutcome::Exit(ManagedExitRequest::Recover),
+        ] {
+            let result = finish_managed_attachment(Ok(outcome), async {
+                panic!("auth handoff and recovery must retain their command channel");
+            })
+            .await;
+            assert_eq!(result.unwrap(), outcome);
+        }
     }
 
     fn binding(owner: SessionId) -> bcode_ipc::ManagedSessionTargetSnapshot {
+        binding_at(owner, 1)
+    }
+
+    fn binding_at(owner: SessionId, generation: u64) -> bcode_ipc::ManagedSessionTargetSnapshot {
         serde_json::from_value(serde_json::json!({
             "session_id": owner,
             "instance": {"instance_id":"primary","plugin_id":"example.native","executable":"/native",
                 "config_namespace":"/native/config","auth":{"provider_id":"example.native","profile":"native",
                 "credential_namespace":"/native/config","custody":"native_managed"}},
             "target":{"state":"prepared","session":{"open_id":"open","session_id":owner,
-                "instance_id":"primary","generation":1,"native_version":"fixture","requested_native_session_id":null}}
+                "instance_id":"primary","generation":generation,"native_version":"fixture","requested_native_session_id":null}}
         })).unwrap()
     }
 
+    /// Run one probe test in an isolated child process with private state and no model
+    /// credentials, so the probe can bind the default daemon endpoint.
     #[cfg(unix)]
-    #[test]
-    fn explicit_managed_reattach_works_without_unrelated_model_credentials() {
-        if std::env::var_os("BCODE_MANAGED_REATTACH_PROBE").is_some() {
-            return;
-        }
+    fn run_isolated_probe(probe: &str) {
         let root = tempfile::tempdir().unwrap();
         let sockets = root.path().join("ipc");
         std::os::unix::fs::DirBuilderExt::mode(&mut std::fs::DirBuilder::new(), 0o700)
@@ -891,11 +1251,7 @@ env = "BCODE_MANAGED_REATTACH_UNSET_KEY_71E9"
         )
         .unwrap();
         let status = std::process::Command::new(std::env::current_exe().unwrap())
-            .args([
-                "--exact",
-                "runtime::managed_reattach_tests::managed_reattach_probe",
-                "--nocapture",
-            ])
+            .args(["--exact", probe, "--nocapture"])
             .env("BCODE_MANAGED_REATTACH_PROBE", "1")
             .env("BCODE_CONFIG", config)
             .env("BCODE_STATE_DIR", root.path().join("state"))
@@ -925,6 +1281,272 @@ env = "BCODE_MANAGED_REATTACH_UNSET_KEY_71E9"
         assert!(status.success());
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn explicit_managed_reattach_works_without_unrelated_model_credentials() {
+        if std::env::var_os("BCODE_MANAGED_REATTACH_PROBE").is_some() {
+            return;
+        }
+        run_isolated_probe("runtime::managed_reattach_tests::managed_reattach_probe");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn stale_owner_after_daemon_restart_recovers_then_reattaches_new_generation() {
+        if std::env::var_os("BCODE_MANAGED_REATTACH_PROBE").is_some() {
+            return;
+        }
+        run_isolated_probe("runtime::managed_reattach_tests::managed_recovery_probe");
+    }
+
+    /// Fake restarted daemon: the watch reports a stale owner until recovery advances the
+    /// canonical generation; recovery records exactly one identity and replays nothing.
+    #[cfg(unix)]
+    #[derive(Default)]
+    struct RecoveryProbe {
+        generation: std::sync::atomic::AtomicU64,
+        recoveries: std::sync::atomic::AtomicUsize,
+        watches: std::sync::atomic::AtomicUsize,
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn managed_recovery_probe() {
+        if std::env::var_os("BCODE_MANAGED_REATTACH_PROBE").is_none() {
+            return;
+        }
+        let owner = SessionId::new();
+        let listener = bcode_ipc::LocalIpcListener::bind(&bcode_ipc::default_endpoint()).unwrap();
+        let probe = Arc::new(RecoveryProbe::default());
+        probe
+            .generation
+            .store(1, std::sync::atomic::Ordering::SeqCst);
+        let server_probe = Arc::clone(&probe);
+        let (stop_peer, mut stop) = tokio::sync::oneshot::channel();
+        let server = tokio::spawn(async move {
+            let mut tasks = Vec::new();
+            loop {
+                tokio::select! {
+                    accepted = listener.accept() => {
+                        tasks.push(tokio::spawn(serve_recovery(accepted.unwrap(), owner, Arc::clone(&server_probe))));
+                    }
+                    _ = &mut stop => break,
+                }
+            }
+            for task in tasks {
+                task.abort();
+                let _ = task.await;
+            }
+        });
+        let request = history_flow::initial_transcript_window_request(Rect::new(0, 0, 80, 24));
+        let (connection, _attached, _binding) = tokio::time::timeout(
+            Duration::from_secs(5),
+            prepare_managed_reattachment(
+                bcode_client::ManagedSessionClient::default_endpoint(),
+                owner,
+                "primary",
+                1,
+                request.clone(),
+            ),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        let commands = connection.command_handle();
+        let (sender, mut receiver) = history_flow::session_stream_channel();
+        let forwarding = tokio::spawn(history_flow::forward_managed_session_events(
+            connection, sender,
+        ));
+        let update = tokio::time::timeout(Duration::from_secs(5), receiver.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(matches!(
+            update,
+            history_flow::SessionStreamUpdate::ManagedOwnershipLost { session_id } if session_id == owner
+        ));
+        tokio::time::timeout(Duration::from_secs(1), forwarding)
+            .await
+            .unwrap()
+            .unwrap();
+        let mut budget = ManagedReentryBudget::default();
+        let recovery_step = next_managed_step(
+            ManagedChatExit::Recover {
+                commands,
+                generation: 1,
+            },
+            &ManagedJourneyTarget {
+                session_id: owner,
+                instance_id: "primary",
+                generation: 1,
+            },
+            &mut budget,
+        )
+        .await;
+        let ManagedJourneyStep::Continue { generation, status } = recovery_step else {
+            panic!("stale ownership must recover to a new generation");
+        };
+        assert_eq!(generation, 2);
+        assert!(status.contains("no input was replayed"));
+        let (_connection, _attached, rebound) = tokio::time::timeout(
+            Duration::from_secs(5),
+            prepare_managed_reattachment(
+                bcode_client::ManagedSessionClient::default_endpoint(),
+                owner,
+                "primary",
+                generation,
+                request,
+            ),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(rebound.target.generation(), 2);
+        assert_eq!(
+            probe.recoveries.load(std::sync::atomic::Ordering::SeqCst),
+            1
+        );
+        assert_eq!(probe.watches.load(std::sync::atomic::Ordering::SeqCst), 1);
+        stop_peer.send(()).unwrap();
+        server.await.unwrap();
+    }
+
+    #[cfg(unix)]
+    async fn serve_recovery(
+        mut stream: bcode_ipc::LocalIpcStream,
+        owner: SessionId,
+        probe: Arc<RecoveryProbe>,
+    ) {
+        use bcode_ipc::{Request, Response, ResponsePayload};
+        reattach_handshake(&mut stream).await;
+        let envelope = bcode_ipc::recv_envelope(&mut stream).await.unwrap();
+        let request = bcode_ipc::decode_request(&envelope.payload).unwrap();
+        let attached_stream = matches!(&request, Request::AttachSessionProjectionWindow { .. });
+        let response = match request {
+            Request::ManagedSession { request }
+                if request.operation == bcode_ipc::harness::ManagedSessionOperation::Binding =>
+            {
+                let generation = probe.generation.load(std::sync::atomic::Ordering::SeqCst);
+                Response::Ok(ResponsePayload::ManagedSession {
+                    response: bcode_ipc::ManagedSessionResponse {
+                        schema_version: bcode_ipc::harness::MANAGED_SESSION_VERSION,
+                        response_json: serde_json::to_string(&Some(binding_at(owner, generation)))
+                            .unwrap(),
+                    },
+                })
+            }
+            Request::ManagedSession { request }
+                if request.operation == bcode_ipc::harness::ManagedSessionOperation::Recover =>
+            {
+                let recovery = request.decode_recovery().unwrap();
+                assert_eq!(recovery.session_id, owner);
+                assert_eq!(recovery.instance_id, "primary");
+                assert_eq!(recovery.expected_generation, 1);
+                probe
+                    .recoveries
+                    .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                probe
+                    .generation
+                    .store(2, std::sync::atomic::Ordering::SeqCst);
+                let response = bcode_harness_models::HarnessServiceResponse {
+                    schema_version: bcode_harness_models::HARNESS_SCHEMA_VERSION,
+                    request_id: recovery.recovery_id,
+                    operation: bcode_harness_models::HarnessOperation::Open,
+                    kind: bcode_harness_models::HarnessServiceResponseKind::Opened(
+                        bcode_harness_models::HarnessSessionBinding {
+                            schema_version: bcode_harness_models::HARNESS_SCHEMA_VERSION,
+                            session_id: owner.to_string(),
+                            instance_id: "primary".into(),
+                            native_session_id: "native".into(),
+                            native_version: "fixture".into(),
+                            generation: 2,
+                        },
+                    ),
+                };
+                Response::Ok(ResponsePayload::ManagedSession {
+                    response: bcode_ipc::ManagedSessionResponse {
+                        schema_version: bcode_ipc::harness::MANAGED_SESSION_VERSION,
+                        response_json: serde_json::to_string(&response).unwrap(),
+                    },
+                })
+            }
+            Request::CallPluginService { operation, .. } => {
+                assert_eq!(operation, "watch");
+                probe
+                    .watches
+                    .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                Response::Err(bcode_ipc::ErrorResponse::new(
+                    "managed_session_stale_owner",
+                    "owner generation is not live after daemon restart",
+                ))
+            }
+            Request::AttachSessionProjectionWindow { session_id, .. } => {
+                assert_eq!(session_id, owner);
+                Response::Ok(ResponsePayload::Attached {
+                    session_id: owner,
+                    session: serde_json::from_value(serde_json::json!({"id":owner,"name":null,"client_count":1,"created_at_ms":0,"updated_at_ms":0,"working_directory":"/workspace"})).unwrap(),
+                    history: Vec::new(), input_history: Vec::new(), usage_summary: None, import_warnings: Vec::new(),
+                    draft: None, runtime_selection: bcode_session_models::SessionRuntimeSelection::default(), projection_window: None,
+                })
+            }
+            _ => panic!("recovery must not submit, start, or replay native work"),
+        };
+        let envelope = bcode_ipc::response_envelope(envelope.request_id, &response).unwrap();
+        bcode_ipc::send_envelope(&mut stream, &envelope)
+            .await
+            .unwrap();
+        if attached_stream {
+            std::future::pending::<()>().await;
+        }
+    }
+
+    #[test]
+    fn reentry_budget_bounds_automatic_continuation_per_window() {
+        let start = std::time::Instant::now();
+        let mut budget = ManagedReentryBudget {
+            window_started: start,
+            attempts: 0,
+        };
+        assert!(budget.allow(start));
+        assert!(budget.allow(start));
+        assert!(budget.allow(start));
+        assert!(!budget.allow(start));
+        assert!(budget.allow(start + MANAGED_REENTRY_WINDOW));
+    }
+
+    #[tokio::test]
+    async fn managed_exits_map_to_journey_steps_without_recovery_for_plain_reattach() {
+        let owner = SessionId::new();
+        let target = ManagedJourneyTarget {
+            session_id: owner,
+            instance_id: "primary",
+            generation: 4,
+        };
+        let mut budget = ManagedReentryBudget::default();
+        assert!(matches!(
+            next_managed_step(ManagedChatExit::Closed, &target, &mut budget).await,
+            ManagedJourneyStep::End(ManagedJourneyEnd::Closed)
+        ));
+        let navigate = SessionId::new();
+        assert!(matches!(
+            next_managed_step(ManagedChatExit::Navigate(Some(navigate)), &target, &mut budget).await,
+            ManagedJourneyStep::End(ManagedJourneyEnd::Navigate(Some(id))) if id == navigate
+        ));
+        for _ in 0..MANAGED_REENTRY_LIMIT {
+            assert!(matches!(
+                next_managed_step(ManagedChatExit::Reattach, &target, &mut budget).await,
+                ManagedJourneyStep::Continue { generation: 4, .. }
+            ));
+        }
+        let ManagedJourneyStep::End(ManagedJourneyEnd::Failed(message)) =
+            next_managed_step(ManagedChatExit::Reattach, &target, &mut budget).await
+        else {
+            panic!("repeated loss must stop with an actionable message");
+        };
+        assert!(message.contains(&format!(
+            "bcode tui {owner} --managed-instance primary --managed-generation 4"
+        )));
+    }
     #[cfg(unix)]
     #[derive(Default)]
     struct PollProbe {

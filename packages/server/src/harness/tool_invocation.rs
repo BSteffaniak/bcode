@@ -67,7 +67,7 @@ struct Grant {
 }
 
 fn bridge_stage(stage: &'static str) {
-    tracing::warn!(target: "bcode_server::harness", stage, "managed tool bridge progress");
+    tracing::trace!(target: "bcode_server::harness", stage, "managed tool bridge progress");
 }
 
 fn grant_rejected(category: &'static str) {

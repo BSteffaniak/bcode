@@ -114,6 +114,7 @@ fn native_result_does_not_imply_settlement_and_page_is_bounded() {
         request_id: "request".into(),
         operation: HarnessOperation::Observe,
         kind: HarnessServiceResponseKind::Observations(HarnessObservationPage {
+            live: Vec::new(),
             retention: None,
             hydration_requests: Vec::new(),
             inventory_page: None,
@@ -147,6 +148,7 @@ fn stale_observation_and_duplicate_identity_are_rejected() {
         request_id: "request".into(),
         operation: HarnessOperation::Observe,
         kind: HarnessServiceResponseKind::Observations(HarnessObservationPage {
+            live: Vec::new(),
             retention: None,
             hydration_requests: Vec::new(),
             inventory_page: None,
@@ -199,6 +201,8 @@ fn uncertain_reconciliation_and_control_ack_are_not_settlement() {
 #[test]
 fn interaction_kind_choice_and_generation_are_checked() {
     let mut interaction = HarnessInteraction {
+        input_preview: None,
+        tool_name: None,
         request_id: "question".into(),
         session_id: "session".into(),
         generation: 7,
@@ -255,6 +259,7 @@ fn vendor_detail_and_native_correlations_are_bounded() {
     };
     assert_eq!(value.validate(), Err(HarnessContractError::BoundsExceeded));
     value.kind = HarnessObservationKind::Tool {
+        input_json: None,
         native_tool_id: "tool".into(),
         name: "read".into(),
         status: "observed".into(),
@@ -412,5 +417,61 @@ fn parent_assistance_must_match_exact_child_open_identity_and_generation() {
     assert_eq!(
         request(HarnessRequestKind::Open(open)).validate(),
         Err(HarnessContractError::StaleGeneration)
+    );
+}
+#[test]
+fn page_transferring_nothing_may_omit_retention_after_an_acknowledged_predecessor() {
+    let digest = harness_observations_digest(&[observation("one")]).unwrap();
+    let request = request(HarnessRequestKind::Observe(HarnessObserveRequest {
+        retention: Some(HarnessRetentionContext {
+            connection_id: "connection".into(),
+            acknowledgment: Some(HarnessCanonicalAck {
+                page_id: "connection:1".into(),
+                canonical_revision: 9,
+                observations_digest: digest,
+            }),
+            hydration: Vec::new(),
+        }),
+        target: HarnessSessionTarget::Confirmed(binding()),
+        after: Some("one".into()),
+        limit: 4,
+        wait_millis: 0,
+    }));
+    let page = |observations: Vec<HarnessObservation>, retention| HarnessServiceResponse {
+        schema_version: 1,
+        request_id: "request".into(),
+        operation: HarnessOperation::Observe,
+        kind: HarnessServiceResponseKind::Observations(HarnessObservationPage {
+            live: Vec::new(),
+            retention,
+            hydration_requests: Vec::new(),
+            inventory_page: None,
+            next_after: observations.last().map(|item| item.observation_id.clone()),
+            observations,
+            completeness: HarnessCompleteness::Complete,
+            status: status(),
+        }),
+    };
+    // An idle or live-only window transfers nothing and needs no acknowledgment.
+    assert!(page(Vec::new(), None).validate_for(&request).is_ok());
+    // Evidence after an acknowledged page must remain retained for exact post-commit ack.
+    assert_eq!(
+        page(vec![observation("two")], None).validate_for(&request),
+        Err(HarnessContractError::InvalidShape)
+    );
+    let retained = |connection: &str, observations: &[HarnessObservation]| HarnessRetentionPage {
+        connection_id: connection.into(),
+        page_id: format!("{connection}:2"),
+        observations_digest: harness_observations_digest(observations).unwrap(),
+    };
+    let two = vec![observation("two")];
+    assert!(
+        page(two.clone(), Some(retained("connection", &two)))
+            .validate_for(&request)
+            .is_ok()
+    );
+    assert_eq!(
+        page(Vec::new(), Some(retained("other", &[]))).validate_for(&request),
+        Err(HarnessContractError::WrongOwner)
     );
 }

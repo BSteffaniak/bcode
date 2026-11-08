@@ -10,8 +10,9 @@ use bcode_harness_models::{
 };
 use bcode_session_view_models::external::{
     ExternalActionKind, ExternalActionView, ExternalActivityView, ExternalChoiceView,
-    ExternalInteractionView, ExternalProvenanceView, ExternalSessionMetadataView,
-    ExternalSessionView, ExternalTranscriptCategory, ExternalTranscriptItemView,
+    ExternalInteractionKind, ExternalInteractionView, ExternalProvenanceView,
+    ExternalSessionMetadataView, ExternalSessionView, ExternalTranscriptCategory,
+    ExternalTranscriptItemView,
 };
 
 /// Absolute page ceiling; lifetime history remains incrementally accessible.
@@ -239,18 +240,21 @@ pub fn external_interaction(
     {
         return Err(HarnessContractError::WrongOwner);
     }
-    let (kind, action, capability) = match interaction.kind {
+    let (interaction_kind, kind, action, capability) = match interaction.kind {
         HarnessInteractionKind::Approval => (
+            ExternalInteractionKind::Approval,
             "Native approval",
             ExternalActionKind::Approve,
             &capabilities.approval,
         ),
         HarnessInteractionKind::Question => (
+            ExternalInteractionKind::Question,
             "Question",
             ExternalActionKind::Respond,
             &capabilities.questions,
         ),
         HarnessInteractionKind::Assistance => (
+            ExternalInteractionKind::Assistance,
             "Assistance",
             ExternalActionKind::Respond,
             &capabilities.assistance,
@@ -259,6 +263,7 @@ pub fn external_interaction(
     Ok(ExternalInteractionView {
         request_id: interaction.request_id.clone(),
         provenance: provenance.clone(),
+        interaction_kind,
         kind: kind.into(),
         prompt: interaction.prompt.clone(),
         scope: interaction.scope.clone(),
@@ -270,6 +275,8 @@ pub fn external_interaction(
                 label: choice.label.clone(),
             })
             .collect(),
+        tool_name: interaction.tool_name.clone(),
+        input_preview: interaction.input_preview.clone(),
         response: external_action(action, capability, availability),
     })
 }
@@ -360,20 +367,16 @@ fn external_observation_content(
                 binding.native_version
             ),
         ),
-        HarnessObservationKind::Text { text } => {
+        HarnessObservationKind::Text { text, .. } => {
             (ExternalTranscriptCategory::Assistant, text.clone())
         }
+        HarnessObservationKind::Tool { .. }
+        | HarnessObservationKind::Reasoning { .. }
+        | HarnessObservationKind::ToolResult { .. }
+        | HarnessObservationKind::Usage { .. } => native_display_content(kind),
         HarnessObservationKind::Result { text } => (
             ExternalTranscriptCategory::Status,
             format!("Native result (not assignment completion): {text}"),
-        ),
-        HarnessObservationKind::Tool {
-            native_tool_id,
-            name,
-            status,
-        } => (
-            ExternalTranscriptCategory::NativeTool,
-            format!("{name} · native tool {native_tool_id} · {status}"),
         ),
         HarnessObservationKind::Subagent {
             native_agent_id,
@@ -389,6 +392,10 @@ fn external_observation_content(
                 interaction.request_id, interaction.prompt, interaction.scope
             ),
         ),
+        HarnessObservationKind::InteractionWithdrawn { request_id } => (
+            ExternalTranscriptCategory::Status,
+            format!("Native interaction {request_id} withdrawn; it can no longer be answered"),
+        ),
         HarnessObservationKind::Status { status } => external_status_content(status),
         HarnessObservationKind::Diagnostic { code, message } => (
             ExternalTranscriptCategory::Status,
@@ -401,6 +408,54 @@ fn external_observation_content(
         HarnessObservationKind::Vendor { namespace, .. } => (
             ExternalTranscriptCategory::Status,
             format!("Native extension observation: {namespace} (detail omitted)"),
+        ),
+    }
+}
+
+/// Generic fallback text for native tool/reasoning/usage observations.
+fn native_display_content(kind: &HarnessObservationKind) -> (ExternalTranscriptCategory, String) {
+    match kind {
+        HarnessObservationKind::Tool {
+            native_tool_id,
+            name,
+            status,
+            ..
+        } => (
+            ExternalTranscriptCategory::NativeTool,
+            format!("{name} · native tool {native_tool_id} · {status}"),
+        ),
+        HarnessObservationKind::Reasoning { text, opaque, .. } => (
+            ExternalTranscriptCategory::Reasoning,
+            if *opaque {
+                "Reasoning (redacted)".to_owned()
+            } else {
+                format!("Reasoning: {text}")
+            },
+        ),
+        HarnessObservationKind::ToolResult {
+            native_tool_id,
+            is_error,
+            truncated,
+            ..
+        } => (
+            ExternalTranscriptCategory::NativeTool,
+            format!(
+                "Tool result · native tool {native_tool_id}{}{}",
+                if *is_error { " · error" } else { "" },
+                if *truncated { " · truncated" } else { "" }
+            ),
+        ),
+        HarnessObservationKind::Usage {
+            input_tokens,
+            output_tokens,
+            ..
+        } => (
+            ExternalTranscriptCategory::Status,
+            format!("Usage · {input_tokens} input · {output_tokens} output tokens"),
+        ),
+        _ => (
+            ExternalTranscriptCategory::Status,
+            "Native activity observation".to_owned(),
         ),
     }
 }
@@ -604,7 +659,7 @@ pub fn prepared_session_text(
 ) -> Result<String, String> {
     prepared.validate().map_err(|e| e.to_string())?;
     Ok(format!(
-        "Native transport prepared · Bcode {} · instance {} · generation {} · open {} · version {}\nRequested native selection: {} (unconfirmed)\nNo native conversation identity confirmed. Use /native status for the exact offline target, then /native send <generation> <submission-id> <attempt-id> <text> for first input. Prepared is not resumed, created, settled, or assignment completion. Existing live transport only; process loss requires reconciliation, never automatic recreation/replay.",
+        "Native session prepared · Bcode {} · instance {} · generation {} · open {} · version {}\nRequested conversation: {} (unconfirmed)\nNo native conversation identity confirmed yet; it is confirmed by the first native reply. Send a message from the session composer to start. Preparation does not mean the conversation was resumed, created, or settled. If the native process is lost, Bcode reconciles instead of recreating it or replaying input.",
         prepared.session_id,
         prepared.instance_id,
         prepared.generation,
@@ -613,7 +668,7 @@ pub fn prepared_session_text(
         prepared
             .requested_native_session_id
             .as_deref()
-            .unwrap_or("new conversation requested")
+            .unwrap_or("new conversation")
     ))
 }
 
@@ -689,7 +744,7 @@ pub fn canonical_external_text(
             let (source, metadata) =
                 external_metadata(instance, binding).map_err(|e| e.to_string())?;
             format!(
-                "Native identity confirmed · {}\nExecutable: {} · native version: {} · config namespace: {}\nHistory remains readable when plugin is disabled; native resume is independent.\nUse /native history [cursor] for bounded offline observations.\nSend: /native send <generation> <submission-id> <attempt-id> <text>\nSteer: /native steer <generation> <submission-id> <attempt-id> <expected-native-turn> <text>",
+                "Native identity confirmed · {}\nExecutable: {} · native version: {} · config namespace: {}\nHistory remains readable when the plugin is disabled; native resume is independent.\nSend messages from the session composer. Native approvals and questions open as dialogs.",
                 provenance_label(&source),
                 metadata.executable,
                 metadata.native_version,
@@ -726,7 +781,10 @@ pub fn canonical_external_text(
                 for choice in &interaction.choices {
                     let _ = writeln!(text, "{}: {}", choice.choice_id, choice.label);
                 }
-                text.push_str(&native_response_usage());
+                text.push_str(&native_response_usage(
+                    interaction.generation,
+                    &interaction.request_id,
+                ));
             }
             text
         }
@@ -912,7 +970,7 @@ pub fn external_fallback_blocks(
     Ok(blocks)
 }
 
-fn native_response_usage() -> String {
+fn native_response_usage(generation: u64, request_id: &str) -> String {
     let examples = [
         HarnessResponseValue::Approval { approved: true },
         HarnessResponseValue::Approval { approved: false },
@@ -929,15 +987,15 @@ fn native_response_usage() -> String {
         },
         HarnessResponseValue::Cancel,
     ];
-    let mut text = String::from(
-        "Use /native respond <generation> <request-id> <retained-response-id> <JSON>. JSON examples (choose only the matching request kind):",
+    let mut text = format!(
+        "Answer in the dialog. If no dialog is shown, reply with /native respond {generation} {request_id} <new-response-id> <JSON>, using the example that matches the request kind:",
     );
     for example in examples {
         if let Ok(json) = serde_json::to_string(&example) {
             let _ = write!(text, "\n{json}");
         }
     }
-    text.push_str("\nCurrent capability and ownership are rechecked; historical requests may be unavailable. Retain the response identity after an uncertain result; do not replay automatically.");
+    text.push_str("\nCapability and ownership are rechecked when you respond; historical requests may no longer accept answers. After an uncertain result, reuse the same response id instead of sending a new one.");
     text
 }
 
@@ -945,7 +1003,8 @@ fn native_response_usage() -> String {
 mod native_response_usage_tests {
     #[test]
     fn rendered_native_response_examples_decode_as_typed_values() {
-        let usage = super::native_response_usage();
+        let usage = super::native_response_usage(7, "request");
+        assert!(usage.contains("/native respond 7 request <new-response-id> <JSON>"));
         let values: Vec<bcode_harness_models::HarnessResponseValue> = usage
             .lines()
             .filter(|line| line.starts_with('{'))

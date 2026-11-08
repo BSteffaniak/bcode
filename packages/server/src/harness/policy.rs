@@ -3,7 +3,7 @@
 use bcode_harness_models::{
     HarnessCapabilities, HarnessDeliveryState, HarnessInteraction, HarnessObservation,
     HarnessObservationKind, HarnessPlacement, HarnessReceipt, HarnessResponse,
-    HarnessSessionTarget, HarnessSubmission, HarnessSupportLevel,
+    HarnessSessionSetting, HarnessSessionTarget, HarnessSubmission, HarnessSupportLevel,
 };
 
 use super::ManagedHarnessError;
@@ -96,6 +96,36 @@ pub(super) fn observation(
     Ok(())
 }
 
+/// Mid-session configuration requires the selected backend's declared capability for that
+/// setting. `Unknown` and `Unsupported` never authorize a native mutation.
+pub(super) fn configuration(
+    binding: &HarnessSessionTarget,
+    capabilities: &HarnessCapabilities,
+    setting: &HarnessSessionSetting,
+) -> Result<(), ManagedHarnessError> {
+    binding
+        .validate()
+        .map_err(|_| ManagedHarnessError::Invalid)?;
+    capabilities
+        .validate()
+        .map_err(|_| ManagedHarnessError::Invalid)?;
+    setting
+        .validate()
+        .map_err(|_| ManagedHarnessError::Invalid)?;
+    let capability = match setting {
+        HarnessSessionSetting::Model { .. } => &capabilities.model_switch,
+        HarnessSessionSetting::PermissionMode { .. } => &capabilities.permission_mode,
+    };
+    if matches!(
+        capability.support,
+        HarnessSupportLevel::Supported | HarnessSupportLevel::Constrained
+    ) {
+        Ok(())
+    } else {
+        Err(ManagedHarnessError::Unsupported)
+    }
+}
+
 /// Native acknowledgments and idle/results cannot reopen a settled mutation.
 pub(super) fn transition(
     previous: HarnessDeliveryState,
@@ -178,6 +208,8 @@ mod tests {
             constraints: vec![],
         };
         HarnessCapabilities {
+            model_switch: bcode_harness_models::HarnessCapability::unsupported(),
+            permission_mode: bcode_harness_models::HarnessCapability::unsupported(),
             resume: supported.clone(),
             steering: supported.clone(),
             approval: supported.clone(),
@@ -224,6 +256,46 @@ mod tests {
     }
 
     #[test]
+    fn configuration_requires_the_declared_setting_capability() {
+        let mut capabilities = capabilities();
+        let model = HarnessSessionSetting::Model {
+            model_id: "claude-fixture".into(),
+        };
+        let mode = HarnessSessionSetting::PermissionMode {
+            mode: bcode_harness_models::HarnessPermissionMode::Plan,
+        };
+        for setting in [&model, &mode] {
+            assert_eq!(
+                configuration(&binding(), &capabilities, setting),
+                Err(ManagedHarnessError::Unsupported),
+                "unsupported by default"
+            );
+        }
+        capabilities.model_switch.support = HarnessSupportLevel::Supported;
+        assert!(configuration(&binding(), &capabilities, &model).is_ok());
+        assert_eq!(
+            configuration(&binding(), &capabilities, &mode),
+            Err(ManagedHarnessError::Unsupported),
+            "model support does not imply permission-mode support"
+        );
+        capabilities.permission_mode.support = HarnessSupportLevel::Unknown;
+        assert_eq!(
+            configuration(&binding(), &capabilities, &mode),
+            Err(ManagedHarnessError::Unsupported)
+        );
+        capabilities.permission_mode.support = HarnessSupportLevel::Constrained;
+        capabilities.permission_mode.constraints = vec!["next turn".into()];
+        assert!(configuration(&binding(), &capabilities, &mode).is_ok());
+        let malformed = HarnessSessionSetting::Model {
+            model_id: String::new(),
+        };
+        assert_eq!(
+            configuration(&binding(), &capabilities, &malformed),
+            Err(ManagedHarnessError::Invalid)
+        );
+    }
+
+    #[test]
     fn lost_ack_receipt_identity_and_delivery_phase_are_checked() {
         let input = input();
         let mut accepted = HarnessReceipt {
@@ -263,6 +335,8 @@ mod tests {
             completeness: HarnessCompleteness::Complete,
             kind: HarnessObservationKind::Interaction {
                 interaction: HarnessInteraction {
+                    input_preview: None,
+                    tool_name: None,
                     request_id: "question".into(),
                     session_id: "session".into(),
                     generation: 7,
@@ -310,6 +384,7 @@ mod tests {
         };
         assert!(observation(&binding(), &capabilities, &event).is_ok());
         event.kind = HarnessObservationKind::Tool {
+            input_json: None,
             native_tool_id: "tool".into(),
             name: "shell".into(),
             status: "observed".into(),
@@ -352,6 +427,8 @@ mod tests {
             ),
         ] {
             let interaction = HarnessInteraction {
+                input_preview: None,
+                tool_name: None,
                 request_id: "request".into(),
                 session_id: "session".into(),
                 generation: 7,

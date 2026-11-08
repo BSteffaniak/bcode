@@ -112,6 +112,7 @@ fn empty_page_gap_or_status_loss_invalidates_prior_complete_tracking() {
                     },
                     after: None,
                     page: HarnessObservationPage {
+                        live: Vec::new(),
                         retention: None,
                         hydration_requests: Vec::new(),
                         inventory_page: None,

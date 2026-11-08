@@ -21,6 +21,8 @@ pub enum HarnessOperation {
     Observe,
     Respond,
     Interrupt,
+    /// Mid-session native setting change; acknowledgement is not proof of effect.
+    Configure,
     Close,
     Reconcile,
     AuthStatus,
@@ -39,6 +41,7 @@ impl HarnessOperation {
             Self::Observe => "observe",
             Self::Respond => "respond",
             Self::Interrupt => "interrupt",
+            Self::Configure => "configure",
             Self::Close => "close",
             Self::Reconcile => "reconcile",
             Self::AuthStatus => "auth_status",
@@ -142,6 +145,50 @@ pub struct HarnessControlRequest {
     pub target: HarnessSessionTarget,
     pub mutation_id: String,
 }
+/// Native permission posture selectable mid-session.
+///
+/// Host policy still governs every Bcode-side decision; this selects only native behavior.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum HarnessPermissionMode {
+    /// Native default: ask before mutating tools.
+    Default,
+    /// Native plan mode: read-only planning without mutation.
+    Plan,
+    /// Native accept-edits mode: file edits proceed without per-edit approval.
+    AcceptEdits,
+}
+
+/// One explicit mid-session native setting.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum HarnessSessionSetting {
+    /// Switch the native model for subsequent turns. The identity is plugin-advertised.
+    Model { model_id: String },
+    /// Switch the native permission mode for subsequent tool use.
+    PermissionMode { mode: HarnessPermissionMode },
+}
+impl HarnessSessionSetting {
+    /// Validate bounded setting shape, not native availability.
+    /// # Errors
+    /// Rejects malformed model identities.
+    pub fn validate(&self) -> Result<(), HarnessContractError> {
+        match self {
+            Self::Model { model_id } => id(model_id),
+            Self::PermissionMode { .. } => Ok(()),
+        }
+    }
+}
+
+/// Retained configuration mutation identity. Acknowledgement is not proof of native effect;
+/// an ambiguous outcome is never replayed automatically.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HarnessConfigureRequest {
+    pub target: HarnessSessionTarget,
+    pub mutation_id: String,
+    pub setting: HarnessSessionSetting,
+}
+
 /// Read-only reconciliation of retained identities, never implicit mutation replay.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct HarnessReconcileRequest {
@@ -176,6 +223,8 @@ pub enum HarnessRequestKind {
         response: HarnessResponse,
     },
     Interrupt(HarnessControlRequest),
+    /// Mid-session native setting change, answered by `Acknowledged` or `Failure`.
+    Configure(HarnessConfigureRequest),
     Close(HarnessControlRequest),
     Reconcile(HarnessReconcileRequest),
     AuthStatus {
@@ -186,6 +235,18 @@ pub enum HarnessRequestKind {
     AuthCancel(HarnessAuthRequest),
 }
 impl HarnessRequestKind {
+    /// Retained mutation identity of a control request answered by `Acknowledged`.
+    ///
+    /// `None` for operations that are not interrupt, close or configure.
+    #[must_use]
+    pub fn control_mutation_id(&self) -> Option<&str> {
+        match self {
+            Self::Interrupt(value) | Self::Close(value) => Some(&value.mutation_id),
+            Self::Configure(value) => Some(&value.mutation_id),
+            _ => None,
+        }
+    }
+
     /// Exact operation corresponding to the typed request variant.
     #[must_use]
     pub const fn operation(&self) -> HarnessOperation {
@@ -196,6 +257,7 @@ impl HarnessRequestKind {
             Self::Observe(_) => HarnessOperation::Observe,
             Self::Respond { .. } => HarnessOperation::Respond,
             Self::Interrupt(_) => HarnessOperation::Interrupt,
+            Self::Configure(_) => HarnessOperation::Configure,
             Self::Close(_) => HarnessOperation::Close,
             Self::Reconcile(_) => HarnessOperation::Reconcile,
             Self::AuthStatus { .. } => HarnessOperation::AuthStatus,
@@ -274,6 +336,11 @@ impl HarnessRequest {
                 id(&value.mutation_id)?;
                 validate_target_instance(&value.target, &self.instance)?;
             }
+            HarnessRequestKind::Configure(value) => {
+                id(&value.mutation_id)?;
+                validate_target_instance(&value.target, &self.instance)?;
+                value.setting.validate()?;
+            }
             HarnessRequestKind::Reconcile(value) => {
                 id(&value.session_id)?;
                 if value.generation == 0
@@ -336,6 +403,12 @@ pub struct HarnessObservationPage {
     pub next_after: Option<String>,
     pub completeness: HarnessCompleteness,
     pub status: HarnessExecutionStatus,
+    /// Transient live text appends for in-progress native segments.
+    ///
+    /// Never persisted and not covered by the retention observations digest: the host strips
+    /// this sidecar before canonical commit and publishes it only as live session events.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub live: Vec<crate::HarnessLiveUpdate>,
 }
 impl HarnessObservationPage {
     /// Validate optional retention, hydration requests and non-atomic inventory progress.
@@ -363,6 +436,7 @@ impl HarnessObservationPage {
         if let Some(inventory) = &self.inventory_page {
             inventory.validate()?;
         }
+        crate::validate_live_updates(&self.live)?;
         wire(self, MAX_HARNESS_WIRE_BYTES)
     }
 }
@@ -576,11 +650,10 @@ impl HarnessServiceResponse {
                     return Err(HarnessContractError::WrongOwner);
                 }
             }
-            (
-                HarnessRequestKind::Interrupt(value) | HarnessRequestKind::Close(value),
-                HarnessServiceResponseKind::Acknowledged { mutation_id },
-            ) => {
-                if *mutation_id != value.mutation_id {
+            (kind, HarnessServiceResponseKind::Acknowledged { mutation_id })
+                if kind.control_mutation_id().is_some() =>
+            {
+                if kind.control_mutation_id() != Some(mutation_id.as_str()) {
                     return Err(HarnessContractError::WrongOwner);
                 }
             }
@@ -639,12 +712,18 @@ fn validate_observation_page_for(
     observe: &HarnessObserveRequest,
 ) -> Result<(), HarnessContractError> {
     if let Some(context) = &observe.retention {
-        let retention = page
-            .retention
-            .as_ref()
-            .ok_or(HarnessContractError::InvalidShape)?;
-        if retention.connection_id != context.connection_id {
-            return Err(HarnessContractError::WrongOwner);
+        // A page that transfers nothing (an idle wait or a live-only streaming window) needs
+        // no post-commit acknowledgment, so it may omit retention even after an acknowledged
+        // predecessor. Any page carrying evidence, requests or a gap must stay retained.
+        let transfers = !page.observations.is_empty()
+            || !page.hydration_requests.is_empty()
+            || page.completeness == HarnessCompleteness::Gap;
+        match &page.retention {
+            Some(retention) if retention.connection_id != context.connection_id => {
+                return Err(HarnessContractError::WrongOwner);
+            }
+            None if transfers => return Err(HarnessContractError::InvalidShape),
+            _ => {}
         }
     }
     if page.observations.len() > usize::from(observe.limit) {

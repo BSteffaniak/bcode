@@ -48,7 +48,10 @@ pub fn stage_root_submission(
         return RootSubmission::MessageStaged(false);
     }
     let message = chat.app.take_pending_submission();
-    if slash_registry::slash_command_name(&message).is_some() {
+    // Allow-listed native slash commands (for example /compact) are ordinary managed input.
+    let native_passthrough = chat.app.managed_execution_session().is_some()
+        && super::managed_controls::is_native_passthrough(&message);
+    if !native_passthrough && slash_registry::slash_command_name(&message).is_some() {
         chat.app.clear_pending_submission(&message);
         return RootSubmission::SlashCommand(message);
     }
@@ -116,7 +119,9 @@ pub fn stage_session_message(
         chat.app.clear_pending_submission(&message);
         return false;
     }
-    if slash_registry::slash_command_name(&message).is_some() {
+    let native_passthrough = chat.app.managed_execution_session().is_some()
+        && super::managed_controls::is_native_passthrough(&message);
+    if !native_passthrough && slash_registry::slash_command_name(&message).is_some() {
         chat.app.clear_pending_submission(&message);
         chat.app
             .set_status("slash command pending root navigation migration".to_owned());

@@ -67,6 +67,8 @@ pub use quick_onboarding::{
 pub mod browser_presentation;
 pub(crate) mod composer_interaction;
 pub(crate) mod composer_interaction_render;
+pub(crate) mod managed_controls;
+pub(crate) mod managed_flow;
 mod onboarding_program;
 pub(crate) mod onboarding_render;
 pub(crate) mod palette_flow;

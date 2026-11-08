@@ -118,6 +118,12 @@ ownership generation. Stale, mismatched or already-consumed responses fail close
 A native request is not itself permission to execute a Bcode operation. Parent
 assistance requires separately admitted authority rather than inherited parentage.
 
+When the native harness withdraws an outstanding request (for example Claude Code cancels a
+pending `can_use_tool` callback after an interrupt, or the native connection is lost or closed),
+the plugin records an `InteractionWithdrawn { request_id }` observation. The canonical
+interaction locator then names the withdrawal, so a late response is refused before dispatch,
+and frontends close the prompt. A withdrawal is neither an answer nor a Bcode decision.
+
 Cancellation retains its canonical intent and dispatch receipt. Native interruption
 is an attempt whose acknowledgment is not authoritative settlement. Unconfirmed
 effects remain visible as uncertain; workflow completion requires authoritative
@@ -168,7 +174,11 @@ request; the daemon then drives the attachment poll for that client, asking the 
 hold each page (`wait_millis`) until native output arrives. Each committed page reaches
 clients through the ordinary session event subscription. Every page re-admits the client and
 owner, so a disconnected client, changed generation or shutdown ends the watch. Adapters that
-ignore `wait_millis` remain correct: empty pages that were not held back off.
+ignore `wait_millis` remain correct: empty pages that were not held back off. A page that
+carries live updates counts as progress, so streaming text asks for the next page immediately;
+the adapter's own coalescing window bounds the page rate. The Claude Code plugin holds a
+live-only page for its whole coalescing window (40 ms from the first ready delta), returning
+early only for durable evidence or when the live buffer reaches half of its bounds.
 
 Long holds occupy a shared plugin invocation slot, so only a bounded number of sessions hold
 at once; others use short pages with backoff. Explicit `observe` callers that pass their own
@@ -182,6 +192,45 @@ is untrusted display content, not browser markup, terminal authority or tool cal
 Frontend response controls require current capabilities and exact interaction
 correlation. Sensitive auth surfaces remain separate from the ordinary chat composer.
 BMUX remains the terminal layout authority.
+
+### Native-like transcript projection
+
+Both SessionView reducers (`apply_event` and `apply_event_bounded`) project each canonical
+external event into ordinary transcript items instead of one literal status message per event
+(`bcode_session_view::external_projection`):
+
+| Canonical evidence | SessionView item |
+| --- | --- |
+| `DeliveryClaimed` with a `Submit` request, or a legacy submission record | User message (`external-submission:{generation}:{submission}`) |
+| `Text` | Assistant markdown labelled with the harness name; segmented text uses `harness_stream_identity(..).assistant_item_id()` so it replaces the live stream in place |
+| `Reasoning` | Completed reasoning activity at `reasoning_item_id()`, honoring thinking visibility; opaque reasoning shows as withheld |
+| `Tool` / `ToolResult` | Tool invocation `external:{generation}:{native_tool_id}` with the observing plugin as producer, input JSON as arguments, then finished/failed with literal output |
+| `Usage` | Display-only usage (`runtime.latest_usage`, cost, cumulative tokens) keyed `external:{generation}:{observation}`; `total_cost_micros` is the increment for that result (the Claude Code plugin converts Claude's running process total), so entries add |
+| `Result` | Nothing when it repeats the latest assistant text, otherwise an assistant message |
+| `Interaction` | Compact notice plus `SessionViewSnapshot.pending_external_interactions` |
+| `InteractionWithdrawn` | No item; removes the matching pending interaction |
+| `Diagnostic`, failures, preparation, reconciliation, release, recovery | Compact friendly notice |
+| Execution, submission, binding, status, settlement, terminal, vendor, receipts, acknowledgements | No item; execution lifecycle only |
+
+`Diagnostic` is reserved for conditions a user should see. Routine operational telemetry, such as
+the Claude Code plugin's closed-vocabulary host-tool bridge status, is retained as `Vendor`
+evidence (namespace `claude_code.host_tools`) so canonical history keeps it without adding
+transcript notices to every native turn.
+
+The harness label is derived generically from the instance plugin id (`bcode.claude-code`
+becomes `Claude Code`) and also labels live assistant stream items once known. Pending
+interactions are removed by a successful `Respond` completion, a response record or an
+`InteractionWithdrawn` observation, kept after a failed response, and cleared when a newer
+ownership generation is observed. Observed native
+tools never enter Bcode tool, permission or dispatch state, and terminal plugin visuals apply only
+to tools owned by the declaring plugin. The bounded reducer journals every touched owner and
+charges their exact before/after usage, restoring the view and ledger when the budget rejects
+an event. The literal fallback (`canonical_external_text`, `external_history_page`,
+`external_fallback_blocks`) is unchanged.
+
+Live publishers must use `harness_stream_identity` for both streams. Reasoning live updates use
+`ReasoningContentKind::Legacy` and `ReasoningContentRole::Unknown`, matching the durable
+projection so display filtering is identical.
 
 ### Explicit Claude API-key custody
 
@@ -291,3 +340,110 @@ an empty page, and adopt confirmed session bindings. Canonical history has a
 separate cursor: an empty page with an unchanged cursor is its current tail, not
 proof that future events cannot arrive. Diagnostics emitted on recurring bridge
 operations have distinct observation identities; bridge identity is not an event ID.
+
+## Native-parity daemon behavior
+
+### Live text publication
+
+An observation page may carry a transient `live` sidecar of contiguous appends to native
+assistant text or reasoning segments. `ManagedHarnessRuntime::observe` strips it before the
+canonical commit and, only after that commit succeeds, the canonical store republishes it as
+`SessionLiveEventKind::AssistantTextStreamUpdated` / `AssistantReasoningTextStreamUpdated`
+keyed by `harness_stream_identity(generation, segment_id)`. Stream revisions are byte
+positions (`offset + 1 ..= offset + len`), so contiguous appends from successive pages have
+contiguous revisions and any gap or overlap is detected by consumers instead of guessed.
+Live updates for a segment that the same page finalizes durably are dropped, and a durable
+`Text`/`Reasoning` observation with a segment identity retires the actor's live checkpoint for
+that stream (with a tombstone), so late attachers never see finalized text twice. Streams that
+never receive a durable segment (an interrupted or aborted block, or a lost connection) are
+retired, with tombstones, for the whole generation once a committed page shows the foreground
+native turn ended (`Result`, `NativeTurnTerminal`, `Settlement`), a gap or a disconnected status,
+or the transport is gone (`Close` completion, `TransportReleased`, `RecoveryPrepared`). The
+Claude Code plugin truncates oversized assistant text instead of dropping the message, so its
+segment still finalizes.
+
+### Mid-session configuration
+
+`ManagedSessionOperation::Configure` (CLI: `bcode harness configure --request`) is an
+interactive client control. Workflow and tool invocations are refused before admission. The
+daemon admits the current client and owner, requires the selected backend's declared
+`model_switch` or `permission_mode` capability (`Supported` or `Constrained`), retains a
+`DeliveryClaimed` record, delivers once and records `DeliveryCompleted`, exactly like
+interruption. An identical retry returns retained evidence; an ambiguous delivery remains
+uncertain and is never replayed. Configuration neither issues nor revokes managed tool grants.
+
+### Graceful-restart recovery
+
+Recovery is published behind the native-parity storage fence (schema 58, writer epoch 26).
+A clean daemon stop closes each owned transport and, when the selected plugin proves the
+exact physical reap, appends `TransportReleased`. The canonical validator requires the same
+owner's acknowledged `Close` of the current confirmed binding; afterwards that owner can write
+nothing further. `harness recover` on a new daemon appends `RecoveryPrepared` only when the
+canonical tail is that release (exact sequence and evidence), the generation advances by one,
+the daemon differs, the old execution lifetime is released, the caller is an interactive
+client, the session is not workflow-owned, the workspace, instance and capabilities are
+unchanged, the plugin is enabled and its exact resume preflight passes. The retained resume
+`Open` is then the only native creation the new generation may claim. Prior input is never
+replayed.
+
+Only observation pages move the current page locator and only binding deliveries move the
+current binding locator, so a recovered generation that is released again before it commits a
+page leaves those locators owned by an older generation. Any earlier generation of the same
+session whose locator row precedes the current `RecoveryPrepared` transfer is released history:
+the recovered generation starts with no retained predecessor, and consecutive recoveries remain
+usable.
+
+### Idle shutdown
+
+The idle-only stop and idle timer are blocked while any managed session's committed evidence
+shows live native work: a submitted foreground turn without a terminal result, unsettled
+authoritative settlement, or nonterminal background work or continuations. Idle managed
+sessions may still stop; they remain recoverable.
+
+## TUI managed chat parity
+
+The TUI presents a managed conversation in the same root UI as a native Bcode chat. The
+policy lives in `packages/tui/src/managed_controls.rs`; transitions in
+`packages/tui/src/managed_flow.rs`.
+
+* **Native dialogs.** Pending interactions come from
+  `SessionViewSnapshot::pending_external_interactions` for the attached generation only.
+  Approvals use the existing permission dialog (approve/deny, never remember or batch) with
+  the native `tool_name` and `input_preview` as untrusted display arguments. Questions and
+  assistance requests use the question-plugin inline surface opened without canonical
+  tool-exchange semantics (single radio question whose option values are native choice ids,
+  free text allowed; assistance is free text only). A decision emits
+  `TuiEffect::RespondManagedInteraction`, executed only through the sealed
+  `ManagedSessionCommandHandle::managed_session_respond`. One response identity is minted
+  per decision and reused while an outcome is uncertain; nothing is re-sent automatically.
+  Dismissing a question sends no response; `/permissions` presents held requests again and
+  `/native respond <generation> <request> <response> approve|deny|answer <choice> [text]|assist <text>|<JSON>`
+  remains the text fallback.
+* **Host operations.** Purely local presentation state (theme, profile, streaming policy,
+  configuration reload) runs without any client. Allow-listed host operations (session
+  picker/catalog, search and indexing, rename/delete, monitor/children, timeline,
+  X-ray, command palette loading, plugin status notes) use a lazily constructed host-only
+  client. Submission, interruption, responses, configuration and model execution never use
+  it. Opening another session or starting a new one ends the managed root and continues in
+  the ordinary route, which reroutes managed sessions back to managed reattachment.
+* **Native settings.** `/model`, `/models` and the model picker list the attached
+  instance's advertised execution models and switch through `managed_session_configure`
+  with `HarnessSessionSetting::Model` (the native selector). `/plan` selects
+  `PermissionMode::Plan`, `/build` selects `Default`, `/agent plan|build|accept-edits`
+  selects explicitly, and the agent-cycle key cycles Default → AcceptEdits → Plan. Each
+  change uses a fresh mutation identity; at most one is in flight and ambiguous outcomes
+  are reported, never replayed. Acknowledged settings appear in the status indicator.
+* **Native slash passthrough.** Only `MANAGED_NATIVE_PASSTHROUGH_COMMANDS` (currently
+  `/compact`) is submitted to the native agent as ordinary managed input. Other unknown
+  slash commands are never forwarded; `/clear` is intentionally excluded. Slash
+  completions in a managed chat are derived from the same allow-list.
+* **Seamless reopen.** When the attachment watch reports `managed_session_stale_owner`
+  (for example after a daemon restart), the root stops and the journey calls
+  `ManagedSessionCommandHandle::recover` with a fresh recovery identity, then reattaches
+  at the returned generation with a status message. Other continuity loss reattaches the
+  same owner. Automatic continuation is bounded (three attempts per minute); on failure the
+  TUI shows an actionable message naming `bcode tui <id> --managed-instance <instance>
+  --managed-generation <generation>`. No submission, Start or native process is replayed.
+* **Routing.** An ordinary open (`bcode tui <id>`, the session picker, search navigation)
+  first reads the managed binding; a managed session is handed to the managed reattach
+  route instead of an ordinary model attachment.

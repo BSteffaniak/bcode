@@ -34,6 +34,8 @@ pub enum SlashCommandOutcome {
         expected_native_turn_id: Option<String>,
         retry_submission_id: Option<String>,
     },
+    /// Change one native setting of the attached managed conversation.
+    ManagedConfigure(bcode_harness_models::HarnessSessionSetting),
     /// Open timeline message browser.
     OpenTimeline,
     /// Refresh pending permissions and open the existing review dialog.

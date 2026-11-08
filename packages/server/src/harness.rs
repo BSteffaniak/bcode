@@ -4,6 +4,7 @@
 //! Mutating native calls are preceded by a canonical, ownership-fenced delivery marker.
 //! A dropped future or lost reply therefore leaves reconciliation evidence, not replay authority.
 
+mod activity;
 mod admission;
 mod application;
 mod assistance;
@@ -12,11 +13,13 @@ mod canonical;
 pub(crate) mod configuration_views;
 pub(crate) mod execution_catalog;
 mod history;
+mod live;
 mod observation_watch;
 
-/// Recovery remains independently unpublished, regardless of selected-launch writer versions.
+/// Explicit graceful-restart recovery is published. It still requires canonical recovery
+/// storage, exact physical release evidence and every admission fence in the recovery route.
 pub(crate) const fn recovery_published() -> bool {
-    false
+    bcode_session_models::external_harness::recovery_storage_available()
 }
 mod policy;
 mod runtime;

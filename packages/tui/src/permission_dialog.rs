@@ -8,29 +8,68 @@ pub use bcode_tui_components::permission::decision::{
     PermissionDialogOutcome, PermissionDialogResolution,
 };
 
+/// Who receives the decision made in a permission dialog.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PermissionOrigin {
+    /// A Bcode permission checkpoint, resolved through the session view application.
+    Native,
+    /// A managed native-harness approval, answered through the sealed managed handle.
+    /// The decision never runs the native tool in Bcode.
+    Managed {
+        /// Ownership generation the answer must target.
+        generation: u64,
+        /// Native request correlation.
+        request_id: String,
+    },
+}
+
 /// Native wrapper retaining the established dialog API.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct PermissionDialogState(SharedState);
+pub struct PermissionDialogState {
+    state: SharedState,
+    origin: PermissionOrigin,
+}
 impl std::ops::Deref for PermissionDialogState {
     type Target = SharedState;
     fn deref(&self) -> &Self::Target {
-        &self.0
+        &self.state
     }
 }
 impl std::ops::DerefMut for PermissionDialogState {
     fn deref_mut(&mut self) -> &mut Self::Target {
-        &mut self.0
+        &mut self.state
     }
 }
 impl PermissionDialogState {
     /// Bind the shared policy to one pending checkpoint.
     #[must_use]
     pub const fn new(permission: PermissionView) -> Self {
-        Self(SharedState::new(permission))
+        Self {
+            state: SharedState::new(permission),
+            origin: PermissionOrigin::Native,
+        }
+    }
+    /// Present one managed native approval; it offers approve/deny only.
+    #[must_use]
+    pub fn managed(mut permission: PermissionView, generation: u64, request_id: String) -> Self {
+        permission.can_remember = false;
+        permission.batch = None;
+        Self {
+            state: SharedState::new(permission),
+            origin: PermissionOrigin::Managed {
+                generation,
+                request_id,
+            },
+        }
+    }
+    /// Recipient of this dialog's decision.
+    #[must_use]
+    pub const fn origin(&self) -> &PermissionOrigin {
+        &self.origin
     }
     /// Resolve an already-configured native action through shared policy.
     pub const fn handle_action(&mut self, action: BmuxAction) -> PermissionDialogOutcome {
-        self.0.handle_action(match action {
+        self.state.handle_action(match action {
             BmuxAction::SelectUp => PermissionAction::SelectUp,
             BmuxAction::SelectDown => PermissionAction::SelectDown,
             BmuxAction::SelectConfirm => PermissionAction::SelectConfirm,
@@ -176,6 +215,28 @@ mod tests {
         assert_eq!(
             dialog.handle_action(BmuxAction::AppExit),
             PermissionDialogOutcome::Ignored
+        );
+    }
+
+    #[test]
+    fn managed_origin_offers_only_single_approve_and_deny() {
+        let mut dialog =
+            PermissionDialogState::managed(permission_with_batch(true, true), 4, "req".into());
+        assert_eq!(
+            dialog.origin(),
+            &PermissionOrigin::Managed {
+                generation: 4,
+                request_id: "req".into()
+            }
+        );
+        assert_eq!(dialog.focused_label(), "approve");
+        dialog.focus_next();
+        assert_eq!(dialog.focused_label(), "deny");
+        dialog.focus_next();
+        assert_eq!(dialog.focused_label(), "approve");
+        assert_eq!(
+            PermissionDialogState::new(permission(false)).origin(),
+            &PermissionOrigin::Native
         );
     }
 

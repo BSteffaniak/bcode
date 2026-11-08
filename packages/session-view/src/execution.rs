@@ -440,23 +440,6 @@ pub fn apply(view: &mut ExecutionLifecycleView, event: &SessionEvent) -> bool {
     true
 }
 
-/// Render current typed lifecycle alongside canonical text, not as raw vendor interpretation.
-pub(crate) fn text(
-    view: &mut ExecutionLifecycleView,
-    event: &SessionEvent,
-) -> Result<Option<String>, String> {
-    let content = crate::external::canonical_external_text(event)?;
-    if apply(view, event) {
-        Ok(Some(format!(
-            "{}\n{}",
-            content.unwrap_or_default(),
-            view.details()
-        )))
-    } else {
-        Ok(content)
-    }
-}
-
 pub(crate) fn event_label(event: &HarnessExecutionEvent) -> String {
     match event {
         HarnessExecutionEvent::SubmissionTerminal {

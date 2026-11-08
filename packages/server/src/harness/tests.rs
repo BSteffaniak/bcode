@@ -115,6 +115,8 @@ impl Store {
                 HarnessSessionTarget::Confirmed(self.binding())
             }),
             capabilities: HarnessCapabilities {
+                model_switch: bcode_harness_models::HarnessCapability::unsupported(),
+                permission_mode: bcode_harness_models::HarnessCapability::unsupported(),
                 resume: cap.clone(),
                 steering: cap.clone(),
                 approval: cap.clone(),
@@ -312,6 +314,7 @@ impl ManagedHarnessStore for Store {
     {
         std::future::poll_fn(move |_| {
             std::task::Poll::Ready(Ok(HarnessObservationPage {
+                live: Vec::new(),
                 retention: None,
                 hydration_requests: vec![],
                 inventory_page: None,

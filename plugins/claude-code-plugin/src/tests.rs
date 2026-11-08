@@ -1,3 +1,5 @@
+#[path = "native_parity_tests.rs"]
+mod native_parity_tests;
 #[path = "observation_cycle_tests.rs"]
 mod observation_cycle_tests;
 
@@ -183,7 +185,6 @@ fn observation_ack_boundary_retires_1100_attempts_without_losing_pending_work() 
         retired_attempts: Vec::new(),
     };
     let mut after = None;
-    let mut pending_empty_ack = None;
     for serial in 0..1100 {
         let submission = HarnessSubmission {
             submission_id: format!("submission-{serial}"),
@@ -218,7 +219,8 @@ fn observation_ack_boundary_retires_1100_attempts_without_losing_pending_work() 
             assert!(stream.push(observations));
         }
         let request = HarnessObserveRequest {
-            retention: pending_empty_ack.take(),
+            // The previous cycle ended on an unretained idle page: no acknowledgment.
+            retention: None,
             target: HarnessSessionTarget::Confirmed(binding()),
             after: after.clone(),
             limit: 32,
@@ -245,10 +247,8 @@ fn observation_ack_boundary_retires_1100_attempts_without_losing_pending_work() 
             panic!("empty retained page");
         };
         assert_eq!(empty.observations, Vec::new());
-        pending_empty_ack = Some(retained_page_ack(
-            empty.retention.expect("empty poll retention"),
-            serial + 1,
-        ));
+        // Nothing remains to transfer, so the idle poll is not retained.
+        assert_eq!(empty.retention, None);
         assert_eq!(
             std::mem::take(&mut stream.retired_attempts).len(),
             1,
@@ -499,7 +499,7 @@ fn eof_after_confirmation_and_interaction_keeps_retained_evidence_readable() {
     else {
         panic!("expected retained page")
     };
-    assert_eq!(page.observations.len(), 2);
+    assert_eq!(page.observations.len(), 3);
     assert!(matches!(
         &page.observations[0].kind,
         HarnessObservationKind::BindingConfirmed { .. }
@@ -508,6 +508,8 @@ fn eof_after_confirmation_and_interaction_keeps_retained_evidence_readable() {
         &page.observations[1].kind,
         HarnessObservationKind::Interaction { .. }
     ));
+    assert!(matches!(&page.observations[2].kind,
+        HarnessObservationKind::InteractionWithdrawn { request_id } if request_id == "callback"));
     assert_eq!(page.completeness, HarnessCompleteness::Gap);
     assert_eq!(
         page.status.connectivity,
@@ -555,7 +557,7 @@ fn eof_after_confirmation_and_interaction_keeps_retained_evidence_readable() {
     };
     assert_eq!(
         replayed.observations.len(),
-        2,
+        3,
         "after alone cannot retire evidence"
     );
     let metadata = page.retention.unwrap();
@@ -660,17 +662,24 @@ fn result_does_not_settle_background_work() {
     );
 }
 #[test]
-fn observed_tools_are_data_not_dispatch_and_arguments_stay_private() {
+fn observed_tools_are_bounded_display_data_not_dispatch() {
     let mut normalizer = normalizer();
-    let observations = normalizer.event(Event::Message(NativeMessage::Assistant(json!({"message":{"content":[{"type":"tool_use","id":"native-tool","name":"Bash","input":{"secret":"DO_NOT_PERSIST"}}]}}))));
-    assert!(
-        matches!(&observations[0].kind, HarnessObservationKind::Tool { native_tool_id, .. } if native_tool_id == "native-tool")
-    );
-    assert!(
-        !serde_json::to_string(&observations)
-            .unwrap()
-            .contains("DO_NOT_PERSIST")
-    );
+    let observations = normalizer.event(Event::Message(NativeMessage::Assistant(json!({"message":{"content":[{"type":"tool_use","id":"native-tool","name":"Bash","input":{"command":"ls -la"}}]}}))));
+    assert_eq!(observations.len(), 1);
+    let HarnessObservationKind::Tool {
+        native_tool_id,
+        input_json,
+        status,
+        ..
+    } = &observations[0].kind
+    else {
+        panic!("expected observed native tool");
+    };
+    assert_eq!(native_tool_id, "native-tool");
+    assert_eq!(status, "observed");
+    // Untrusted display input only; no pending callback or host action is created.
+    assert_eq!(input_json.as_deref(), Some(r#"{"command":"ls -la"}"#));
+    assert!(normalizer.pending.is_empty());
 }
 #[test]
 fn stale_generation_never_gets_a_callback_response() {
@@ -865,7 +874,7 @@ fn assistance_answer_and_cancel_require_exact_immutable_parent_grant() {
     };
     assert_eq!(native["id"], 42);
     assert!(native.get("error").is_some());
-    normalizer.invalidate_callbacks();
+    let _ = normalizer.invalidate_callbacks();
     assert!(normalizer.response(&response).is_err());
 }
 #[test]
@@ -883,9 +892,26 @@ fn native_cancellation_invalidates_assistance_without_stopping_observations() {
     let mut normalizer = normalizer();
     normalizer.assistance_grant = Some(assistance_grant("host-admitted text only"));
     normalizer.event(admitted_assistance_event());
-    normalizer.event(Event::CallbackCancelled {
+    let withdrawn = normalizer.event(Event::CallbackCancelled {
         request_id: "parent-call".into(),
     });
+    assert_eq!(
+        withdrawn
+            .iter()
+            .map(|observation| &observation.kind)
+            .collect::<Vec<_>>(),
+        vec![&HarnessObservationKind::InteractionWithdrawn {
+            request_id: "parent-call".into()
+        }],
+        "the host is told the shown prompt is gone"
+    );
+    // A repeated or unknown cancellation withdraws nothing further.
+    assert_eq!(
+        normalizer.event(Event::CallbackCancelled {
+            request_id: "parent-call".into(),
+        }),
+        Vec::new()
+    );
     let response = HarnessResponse {
         response_id: "cancelled-answer".into(),
         request_id: "parent-call".into(),
@@ -1176,4 +1202,18 @@ fn unrelated_native_subagents_are_not_bcode_children() {
     assert!(
         matches!(&observations[0].kind, HarnessObservationKind::Subagent { native_agent_id, .. } if native_agent_id == "native-child")
     );
+}
+#[test]
+fn lost_connection_and_close_withdraw_every_shown_prompt() {
+    let mut normalizer = normalizer();
+    normalizer.event(callback("Bash", json!({"command":"true"})));
+    assert_eq!(normalizer.pending.len(), 1);
+    let evidence = normalizer.connection_lost();
+    assert!(evidence.iter().any(|observation| observation.kind
+        == HarnessObservationKind::InteractionWithdrawn {
+            request_id: "callback".into()
+        }));
+    assert!(normalizer.pending.is_empty());
+    // Nothing is left to withdraw on a later close.
+    assert_eq!(normalizer.invalidate_callbacks(), Vec::new());
 }

@@ -3,8 +3,6 @@
 use bmux_tui::event::{MouseButton, MouseEvent, MouseEventKind};
 use bmux_tui_components::text_input::TextInputOutcome;
 
-use super::effects::TuiEffect;
-use super::permission_dialog::PermissionDialogState;
 use super::session_flow::ActiveChat;
 
 /// Return the hit-region id under a mouse event.
@@ -75,7 +73,7 @@ pub fn handle_non_permission_mouse(
 pub fn handle_permission_action_mouse(
     hit_id: Option<&str>,
     chat: &mut ActiveChat,
-    permission_dialog: &mut Option<PermissionDialogState>,
+    loop_state: &mut super::chat_loop::ChatLoopState,
     mouse: MouseEvent,
 ) -> bool {
     let MouseEventKind::Down(MouseButton::Left) = mouse.kind else {
@@ -84,28 +82,13 @@ pub fn handle_permission_action_mouse(
     let Some(index) = hit_id.and_then(permission_action_index) else {
         return false;
     };
-    let Some(dialog) = permission_dialog.as_mut() else {
+    let Some(dialog) = loop_state.permission_dialog.as_mut() else {
         return false;
     };
     let Some(resolution) = dialog.activate_action(index) else {
         return false;
     };
-    let permission_id = dialog.permission().permission_id.clone();
-    let batch_id = dialog
-        .permission()
-        .batch
-        .as_ref()
-        .map(|batch| batch.batch_id.clone());
-    chat.start_effect(TuiEffect::ResolvePermission {
-        permission_id,
-        approved: resolution.approved,
-        remember: resolution.remember,
-        apply_to_batch: resolution.apply_to_batch,
-        batch_id,
-    });
-    *permission_dialog = None;
-    chat.app
-        .set_status(format!("resolving permission: {}", resolution.label));
+    super::managed_flow::dispatch_permission_resolution(chat, loop_state, &resolution);
     true
 }
 

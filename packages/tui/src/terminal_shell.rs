@@ -272,6 +272,9 @@ impl TerminalShell {
         let expected_config = bcode_config::encode_effective_config(&bcode_config::load_config()?)?;
         let mut expected_binding = None;
         let mut client = client;
+        let mut selected_target = selected_target;
+        let mut budget = crate::runtime::ManagedReentryBudget::default();
+        let mut status = None;
         loop {
             if bcode_config::encode_effective_config(&bcode_config::load_config()?)?
                 != expected_config
@@ -305,21 +308,67 @@ impl TerminalShell {
                 )
                 .into());
             }
+            let instance_id = claim.0.instance_id.clone();
+            let generation = claim.1;
             expected_binding = Some(claim);
-            let commands = Box::pin(crate::runtime::run_managed_chat(
+            let exit = Box::pin(crate::runtime::run_managed_chat(
                 &mut self.terminal()?,
                 connection,
                 attached,
                 plugins,
                 options,
+                status.take(),
             ))
             .await?;
-            let Some(commands) = commands else {
-                return Ok(());
+            let target = crate::runtime::ManagedJourneyTarget {
+                session_id,
+                instance_id: &instance_id,
+                generation,
             };
-            self.recover_managed_auth(&commands).await?;
-            // This is explicit auth recovery, not execution replay: only the same
-            // canonical session is attached again, never Start or a prompt.
+            match Box::pin(crate::runtime::next_managed_step(
+                exit,
+                &target,
+                &mut budget,
+            ))
+            .await
+            {
+                crate::runtime::ManagedJourneyStep::Continue {
+                    generation: next,
+                    status: next_status,
+                } => {
+                    // Recovery advances ownership: the selected-creation target no longer
+                    // applies, and the next attachment must present exactly the new claim.
+                    if next != generation {
+                        selected_target = None;
+                        expected_binding = expected_binding.map(|(instance, _)| (instance, next));
+                    }
+                    status = Some(next_status);
+                }
+                crate::runtime::ManagedJourneyStep::End(
+                    crate::runtime::ManagedJourneyEnd::Closed,
+                ) => {
+                    return Ok(());
+                }
+                crate::runtime::ManagedJourneyStep::End(
+                    crate::runtime::ManagedJourneyEnd::Failed(message),
+                ) => {
+                    self.show_error_without_retry(&message).await?;
+                    return Ok(());
+                }
+                crate::runtime::ManagedJourneyStep::End(
+                    crate::runtime::ManagedJourneyEnd::Navigate(target),
+                ) => {
+                    return Box::pin(self.run_chat(target, plugins, options)).await;
+                }
+                crate::runtime::ManagedJourneyStep::End(
+                    crate::runtime::ManagedJourneyEnd::Auth(commands),
+                ) => {
+                    self.recover_managed_auth(&commands).await?;
+                    commands.detach_commands().await;
+                }
+            }
+            // This is explicit auth or ownership recovery, not execution replay: only the
+            // same canonical session is attached again, never Start or a prompt.
             client = bcode_client::ManagedSessionClient::default_endpoint();
         }
     }

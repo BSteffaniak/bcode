@@ -269,12 +269,14 @@ fn prepare_from_discovery(
         .into_iter()
         .find(|candidate| candidate == &request.candidate)
         .ok_or(HarnessFailure::Conflict)?;
-    // Unknown status cannot confer native-auth support. Preparation is still reviewable,
-    // but no capability attestation is guessed from the version string.
+    // Unknown status cannot confer native-auth support. Preparation is still reviewable.
+    // A successfully parsed native status in this exact namespace verifies status and the
+    // CLI login handoff; session-state settlement is attested only for tested versions.
     let verified_status = matches!(
         candidate.readiness,
         HarnessCandidateReadiness::ExistingNativeLogin | HarnessCandidateReadiness::LoginRequired
     );
+    let verified_session_state = bcode_claude_code::is_tested_version(&candidate.native_version);
     let instance = HarnessInstance {
         instance_id: request.instance_id.clone(),
         plugin_id: PLUGIN_ID.into(),
@@ -296,8 +298,8 @@ fn prepare_from_discovery(
         "config_directory": instance.config_namespace,
         "exact_version": candidate.native_version,
         "verified_native_auth_status": verified_status,
-        "verified_native_auth": false,
-        "verified_session_state": false,
+        "verified_native_auth": verified_status,
+        "verified_session_state": verified_session_state,
     });
     // Keep generated settings compatible with the actual native adapter decoder.
     let settings: InstanceConfig = serde_json::from_value(adapter_settings.clone())
@@ -479,8 +481,8 @@ mod tests {
             prepared.adapter_settings["verified_native_auth_status"],
             true
         );
-        assert_eq!(prepared.adapter_settings["verified_native_auth"], false);
-        assert_eq!(prepared.adapter_settings["verified_session_state"], false);
+        assert_eq!(prepared.adapter_settings["verified_native_auth"], true);
+        assert_eq!(prepared.adapter_settings["verified_session_state"], true);
         assert!(prepared.adapter_settings.get("setting_sources").is_none());
         let settings: InstanceConfig =
             serde_json::from_value(prepared.adapter_settings.clone()).unwrap();
@@ -534,6 +536,56 @@ mod tests {
             .unwrap_err(),
             HarnessFailure::Conflict
         );
+    }
+
+    #[test]
+    fn preparation_attests_only_verified_status_and_tested_versions() {
+        let candidate = HarnessInstallationCandidate {
+            plugin_id: PLUGIN_ID.into(),
+            executable: identity("/installed/claude"),
+            native_version: "2.1.308 (Claude Code)".into(),
+            config_namespace: "/native/account".into(),
+            custody: HarnessAuthCustody::NativeManaged,
+            readiness: HarnessCandidateReadiness::ExistingNativeLogin,
+        };
+        // Untested drift and unknown status prepare reviewable settings without attestations.
+        for (version, readiness) in [
+            (
+                "2.9.0 (Claude Code)",
+                HarnessCandidateReadiness::ExistingNativeLogin,
+            ),
+            (
+                "2.1.308 (Claude Code)",
+                HarnessCandidateReadiness::LoginRequired,
+            ),
+            ("2.1.308 (Claude Code)", HarnessCandidateReadiness::Unknown),
+        ] {
+            let mut drifted = candidate.clone();
+            drifted.native_version = version.into();
+            drifted.readiness = readiness;
+            let request = bcode_harness_models::HarnessPrepareCandidateRequest {
+                schema_version: HARNESS_SCHEMA_VERSION,
+                request_id: "prepare-drift".into(),
+                instance_id: "chosen-native".into(),
+                candidate: drifted.clone(),
+            };
+            let settings = prepare_from_discovery(
+                &request,
+                HarnessCandidatesResponseKind::Candidates {
+                    candidates: vec![drifted],
+                    complete: true,
+                },
+            )
+            .unwrap()
+            .adapter_settings;
+            let known = readiness != HarnessCandidateReadiness::Unknown;
+            assert_eq!(settings["verified_native_auth_status"], known);
+            assert_eq!(settings["verified_native_auth"], known);
+            assert_eq!(
+                settings["verified_session_state"],
+                bcode_claude_code::is_tested_version(version)
+            );
+        }
     }
 
     #[test]

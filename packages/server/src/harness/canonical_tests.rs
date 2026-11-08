@@ -173,6 +173,7 @@ impl super::ManagedHarnessTransport for AttachmentPollTransport {
             request_id: request.request_id.clone(),
             operation: HarnessOperation::Observe,
             kind: HarnessServiceResponseKind::Observations(HarnessObservationPage {
+                live: Vec::new(),
                 retention: None,
                 hydration_requests: Vec::new(),
                 inventory_page: None,
@@ -369,6 +370,8 @@ async fn prepared_observation_fixture() -> (
         constraints: vec![],
     };
     let capabilities = HarnessCapabilities {
+        model_switch: bcode_harness_models::HarnessCapability::unsupported(),
+        permission_mode: bcode_harness_models::HarnessCapability::unsupported(),
         resume: capability.clone(),
         steering: capability.clone(),
         approval: capability.clone(),
@@ -472,6 +475,7 @@ fn confirmation_question_page(
         kind,
     };
     HarnessObservationPage {
+        live: Vec::new(),
         retention: None,
         hydration_requests: vec![],
         inventory_page: None,
@@ -487,6 +491,8 @@ fn confirmation_question_page(
                 "question",
                 HarnessObservationKind::Interaction {
                     interaction: HarnessInteraction {
+                        input_preview: None,
+                        tool_name: None,
                         request_id: "native-question".into(),
                         session_id: owner.session_id.to_string(),
                         generation: 1,
@@ -594,6 +600,7 @@ async fn assert_settlement_cursor(
             .is_err()
     );
     let next = HarnessObservationPage {
+        live: Vec::new(),
         retention: None,
         hydration_requests: vec![],
         inventory_page: None,

@@ -95,6 +95,8 @@ pub fn handle(
                 return Some(error(id, -32602, "Invalid bounded assistance question"));
             }
             let interaction = HarnessInteraction {
+                input_preview: None,
+                tool_name: None,
                 request_id: request_id.into(),
                 session_id: binding.session_id().to_owned(),
                 generation: binding.generation(),

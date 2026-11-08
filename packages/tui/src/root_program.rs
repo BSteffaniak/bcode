@@ -1056,27 +1056,11 @@ impl BcodeRuntimeModel {
         &mut self,
         resolution: super::permission_dialog::PermissionDialogResolution,
     ) {
-        let Some(dialog) = self.loop_state.permission_dialog.as_ref() else {
-            return;
-        };
-        let permission_id = dialog.permission().permission_id.clone();
-        let batch_id = dialog
-            .permission()
-            .batch
-            .as_ref()
-            .map(|batch| batch.batch_id.clone());
-        self.chat
-            .start_effect(super::effects::TuiEffect::ResolvePermission {
-                permission_id,
-                approved: resolution.approved,
-                remember: resolution.remember,
-                apply_to_batch: resolution.apply_to_batch,
-                batch_id,
-            });
-        self.loop_state.permission_dialog = None;
-        self.chat
-            .app
-            .set_status(format!("resolving permission: {}", resolution.label));
+        super::managed_flow::dispatch_permission_resolution(
+            &mut self.chat,
+            &mut self.loop_state,
+            &resolution,
+        );
     }
 
     fn apply_plugin_surface_close(
@@ -1258,22 +1242,15 @@ impl BcodeRuntimeModel {
                     super::chat_loop::start_cancel_turn(&mut self.chat, &mut self.loop_state);
                     return super::invalidation::UiInvalidation::Structural;
                 }
-                if matches!(
-                    action,
-                    Some(
-                        "app.command_palette"
-                            | "tui.session.search"
-                            | "tui.agent.cycle"
-                            | "tui.thinking.effort.cycle"
-                            | "tui.session.new"
-                            | "tui.session.rename"
-                            | "tui.session.delete"
-                            | "tui.skill.invoke"
-                            | "tui.skill.activate"
-                            | "tui.skill.deactivate"
-                            | "tui.monitor.toggle"
-                    )
-                ) {
+                if action == Some("tui.agent.cycle") {
+                    // The agent cycle selects native permission modes in a managed chat.
+                    super::managed_flow::cycle_permission_mode(
+                        &mut self.chat,
+                        &mut self.loop_state,
+                    );
+                    return super::invalidation::UiInvalidation::Structural;
+                }
+                if action.is_some_and(managed_blocked_chat_action) {
                     self.chat.app.set_status(
                         "Model/provider controls are unavailable in this managed conversation"
                             .into(),
@@ -1421,6 +1398,19 @@ impl BcodeRuntimeModel {
                                     generation,
                                 });
                         }
+                    }
+                    super::model_flow::ModelPickerAction::Select(model_id)
+                        if self.chat.app.managed_execution_session().is_some() =>
+                    {
+                        let model_id = self
+                            .loop_state
+                            .managed_model_selector(&model_id)
+                            .unwrap_or(model_id);
+                        super::managed_flow::start_configure(
+                            &mut self.chat,
+                            &mut self.loop_state,
+                            bcode_harness_models::HarnessSessionSetting::Model { model_id },
+                        );
                     }
                     super::model_flow::ModelPickerAction::Select(model_id) => {
                         if let Some(session_id) = self.chat.attached_session_id() {
@@ -2077,7 +2067,7 @@ impl BcodeRuntimeModel {
                     let changed = super::mouse_flow::handle_permission_action_mouse(
                         hit_id.as_deref(),
                         &mut self.chat,
-                        &mut self.loop_state.permission_dialog,
+                        &mut self.loop_state,
                         mouse,
                     );
                     return if changed {
@@ -2175,7 +2165,7 @@ impl BcodeRuntimeModel {
                     super::mouse_flow::handle_permission_action_mouse(
                         hit_id.as_deref(),
                         &mut self.chat,
-                        &mut self.loop_state.permission_dialog,
+                        &mut self.loop_state,
                         mouse,
                     )
                 } else {
@@ -2751,8 +2741,15 @@ impl BcodeRuntimeModel {
             });
     }
 
+    #[allow(clippy::too_many_lines)]
     fn apply_root_command_action(&mut self, request: super::chat_loop::CommandDispatchRequest) {
-        if self.chat.app.managed_execution_session().is_some() {
+        let managed = self.chat.app.managed_execution_session().is_some();
+        if managed
+            && !matches!(
+                &request.action,
+                bcode_command::CommandAction::Host { route } if managed_host_route(route)
+            )
+        {
             self.chat.app.set_status(
                 "Model and plugin commands are disabled in this managed conversation".into(),
             );
@@ -2763,6 +2760,9 @@ impl BcodeRuntimeModel {
             bcode_command::CommandAction::Host { route } => match route.as_str() {
                 "session.new" => {
                     super::session_flow::switch_to_draft_session(&mut self.chat);
+                    if managed {
+                        return;
+                    }
                     self.chat
                         .replace_effect(super::effects::TuiEffect::LoadDraftStatus {
                             launch_working_directory: self
@@ -2875,10 +2875,23 @@ impl BcodeRuntimeModel {
     }
 
     fn interactive_surface_resolution_command(
-        &self,
+        &mut self,
         interaction_id: String,
         resolution: bcode_session_models::ToolExchangeResolution,
     ) -> bmux_tui_runtime::Command<BcodeRuntimeMessage> {
+        if super::managed_flow::resolve_surface(
+            &mut self.chat,
+            &mut self.loop_state,
+            &interaction_id,
+            &resolution,
+        ) {
+            // The managed response (if any) is a separate effect; the surface closes now and
+            // reopens only through explicit review, never by automatic replay.
+            return bmux_tui_runtime::Command::start_if_idle(
+                bmux_tui_runtime::CommandKey::new("bcode.managed_surface_detach"),
+                async { Some(BcodeRuntimeMessage::InteractiveSurfaceResolved(Ok(true))) },
+            );
+        }
         if self
             .canonical_interaction
             .as_ref()
@@ -2957,6 +2970,20 @@ impl BcodeRuntimeModel {
                     let result = match super::plugin_tui::load_default_runtime_with_static_bundled(
                         &super::static_bundled_plugins(),
                     ) {
+                        Ok(runtime)
+                            if super::managed_controls::parse_surface_interaction_id(
+                                request.interaction_id(),
+                            )
+                            .is_some() =>
+                        {
+                            // Managed native questions use the presentation-only surface; the
+                            // answer is delivered through the sealed managed handle.
+                            super::interactive_surface::InteractiveSurfaceState::open_request(
+                                &runtime, &request, &keymap,
+                            )
+                            .await
+                            .map_err(|error| error.to_string())
+                        }
                         Ok(runtime) => {
                             if let (Some(session_id), Some(client)) = (session_id, client) {
                                 let exchange_id = request.interaction_id().to_owned();
@@ -4168,18 +4195,22 @@ impl bmux_tui_runtime::Program for BcodeRuntimeModel {
             | bmux_tui_runtime::RuntimeEvent::Message(BcodeRuntimeMessage::Terminal(event)) => {
                 if self.chat.app.managed_execution_session().is_some()
                     && let Event::Key(stroke) = &event
-                    && matches!(
-                        self.settings.keymap().action("chat", *stroke),
-                        Some(
-                            "app.command_palette"
-                                | "tui.session.search"
-                                | "tui.agent.cycle"
-                                | "tui.thinking.effort.cycle"
-                                | "tui.session.new"
-                                | "tui.skill.invoke"
-                                | "tui.monitor.toggle"
-                        )
-                    )
+                    && self.settings.keymap().action("chat", *stroke) == Some("tui.agent.cycle")
+                    && !self.loop_state.modal_foreground()
+                {
+                    super::managed_flow::cycle_permission_mode(
+                        &mut self.chat,
+                        &mut self.loop_state,
+                    );
+                    return Ok(bmux_tui_runtime::Update::redraw());
+                }
+                if self.chat.app.managed_execution_session().is_some()
+                    && let Event::Key(stroke) = &event
+                    && self
+                        .settings
+                        .keymap()
+                        .action("chat", *stroke)
+                        .is_some_and(managed_blocked_chat_action)
                 {
                     self.chat.app.set_status(
                         "Model and unrelated plugin controls are disabled in managed mode".into(),
@@ -4424,15 +4455,29 @@ impl bmux_tui_runtime::Program for BcodeRuntimeModel {
                                 )
                         )
                 );
-                if matches!(
-                    update.as_ref(),
-                    super::history_flow::SessionStreamUpdate::ResyncStarted { .. }
-                ) {
-                    self.chat.app.suspend_managed_input();
+                match update.as_ref() {
+                    super::history_flow::SessionStreamUpdate::ResyncStarted { .. } => {
+                        self.chat.app.suspend_managed_input();
+                        // Bounded reattachment is observation only: no input or Start replay.
+                        self.chat
+                            .app
+                            .request_managed_exit(super::app::ManagedExitRequest::Reattach);
+                    }
+                    super::history_flow::SessionStreamUpdate::ManagedOwnershipLost { .. } => {
+                        self.chat.app.suspend_managed_input();
+                        self.chat
+                            .app
+                            .request_managed_exit(super::app::ManagedExitRequest::Recover);
+                    }
+                    _ => {}
                 }
                 let changed = self
                     .loop_state
                     .apply_session_stream_update(&mut self.chat, *update);
+                let changed = super::managed_flow::reconcile_interactions(
+                    &mut self.chat,
+                    &mut self.loop_state,
+                ) || changed;
                 if refresh_permissions {
                     self.chat
                         .replace_effect(super::effects::TuiEffect::ListPermissions);
@@ -4639,6 +4684,10 @@ impl bmux_tui_runtime::Program for BcodeRuntimeModel {
                     &mut self.loop_state,
                     *result,
                 );
+                let _presented = super::managed_flow::reconcile_interactions(
+                    &mut self.chat,
+                    &mut self.loop_state,
+                );
                 if previous_session_id != self.chat.viewing_session_id() {
                     self.handle_session_changed();
                 }
@@ -4791,7 +4840,11 @@ impl bmux_tui_runtime::Program for BcodeRuntimeModel {
             | super::invalidation::UiInvalidation::Items
             | super::invalidation::UiInvalidation::Structural => bmux_tui_runtime::Update::redraw(),
         };
-        if self.exit_requested || self.chat.app.should_exit() {
+        if self.exit_requested
+            || self.chat.app.should_exit()
+            || self.chat.app.managed_exit_request().is_some()
+            || self.loop_state.managed_open_requested()
+        {
             update = update.merge(bmux_tui_runtime::Update::exit());
         }
         self.schedule_deadlines();
@@ -4802,6 +4855,36 @@ impl bmux_tui_runtime::Program for BcodeRuntimeModel {
         }
         Ok(update)
     }
+}
+
+/// Chat actions that require model/provider/plugin execution and stay disabled in managed
+/// conversations. Host navigation (palette, sessions, search, monitor) remains available,
+/// and the agent cycle selects native permission modes instead.
+fn managed_blocked_chat_action(action: &str) -> bool {
+    matches!(
+        action,
+        "tui.thinking.effort.cycle"
+            | "tui.skill.invoke"
+            | "tui.skill.activate"
+            | "tui.skill.deactivate"
+    )
+}
+
+/// Host command routes that a managed conversation may run without model execution.
+fn managed_host_route(route: &str) -> bool {
+    matches!(
+        route,
+        "session.new"
+            | "session.switch"
+            | "session.rename"
+            | "session.delete"
+            | "session.search"
+            | "turn.cancel"
+            | "theme.select"
+            | "profile.select"
+            | "streaming.configure"
+            | "help"
+    )
 }
 
 /// Record one live root-runtime statistics snapshot into Bcode telemetry.
@@ -10336,7 +10419,8 @@ mod tests {
         let mut settings =
             crate::chat_loop::TuiRuntimeSettings::bootstrap(std::path::PathBuf::from("."), &[]);
         settings.apply_tui_config(&config);
-        let loop_state = crate::chat_loop::ChatLoopState::new_access(None, None, None, false);
+        let mut loop_state = crate::chat_loop::ChatLoopState::new_access(None, None, None, false);
+        loop_state.set_managed_generation_for_test(1);
         let mut model = super::BcodeRuntimeModel::new(
             {
                 let mut chat = root_test_chat_with_history(owner, &[]);
@@ -10356,10 +10440,34 @@ mod tests {
             model.handle_basic_terminal_event(bmux_tui::event::Event::Key(
                 bmux_keyboard::KeyStroke::simple(key),
             ));
-            assert!(model.chat.pending_effects.drain_runtime().0.is_empty());
+            let effects = model.chat.pending_effects.drain_runtime().0;
+            match key {
+                // The agent cycle selects the next native permission mode only.
+                bmux_keyboard::KeyCode::F(6) => assert!(matches!(
+                    &effects[..],
+                    [(
+                        _,
+                        crate::effects::TuiEffect::ConfigureManagedSession {
+                            generation: 1,
+                            setting: bcode_harness_models::HarnessSessionSetting::PermissionMode {
+                                mode: bcode_harness_models::HarnessPermissionMode::AcceptEdits
+                            },
+                            ..
+                        }
+                    )]
+                )),
+                // Host navigation may load host data, never model or plugin execution.
+                bmux_keyboard::KeyCode::F(8) => assert!(
+                    effects
+                        .iter()
+                        .all(|(_, effect)| effect.is_managed_host_operation())
+                ),
+                _ => assert!(effects.is_empty()),
+            }
             assert_eq!(model.chat.app.current_agent_id(), agent);
             assert_eq!(model.chat.app.reasoning_effort(), reasoning.as_deref());
             assert!(model.loop_state.foreground_client().is_none());
+            model.loop_state.close_command_palette_for_test();
         }
         model.chat.app.suspend_managed_input();
         model
@@ -10380,6 +10488,133 @@ mod tests {
         );
         assert_eq!(model.chat.app.managed_execution_session(), Some(owner));
         drop(model);
+    }
+
+    fn managed_root_test_model(owner: bcode_session_models::SessionId) -> super::BcodeRuntimeModel {
+        let settings =
+            crate::chat_loop::TuiRuntimeSettings::bootstrap(std::path::PathBuf::from("."), &[]);
+        let mut loop_state = crate::chat_loop::ChatLoopState::new_access(None, None, None, false);
+        loop_state.set_managed_generation_for_test(1);
+        super::BcodeRuntimeModel::new(
+            {
+                let mut chat = root_test_chat_with_history(owner, &[]);
+                chat.app.set_managed_execution(owner);
+                chat
+            },
+            settings,
+            loop_state,
+        )
+    }
+
+    #[tokio::test]
+    async fn managed_composer_forwards_only_allow_listed_native_slash_commands() {
+        let owner = bcode_session_models::SessionId::new();
+        let mut model = managed_root_test_model(owner);
+        model
+            .chat
+            .app
+            .replace_composer_with("/compact keep the decisions");
+        model.chat.app.stage_submission();
+        model.stage_root_submission(bcode_ipc::PromptPlacement::FollowUp);
+        let effects = model.chat.pending_effects.drain_runtime().0;
+        assert!(
+            matches!(
+                &effects[..],
+                [(_, crate::effects::TuiEffect::SubmitMessage { request })]
+                    if request.message == "/compact keep the decisions"
+                        && request.session_id == Some(owner)
+            ),
+            "/compact is ordinary managed input: {} effects, status {:?}",
+            effects.len(),
+            model.chat.app.status()
+        );
+        for command in ["/clear", "/skills"] {
+            model.chat.app.replace_composer_with(command);
+            model.chat.app.stage_submission();
+            model.stage_root_submission(bcode_ipc::PromptPlacement::FollowUp);
+            let effects = model.chat.pending_effects.drain_runtime().0;
+            assert!(
+                matches!(
+                    &effects[..],
+                    [(_, crate::effects::TuiEffect::ExecuteSlashCommand { message, .. })]
+                        if message == command
+                ),
+                "{command} must stay a host slash command, never native input"
+            );
+        }
+        drop(model);
+    }
+
+    #[test]
+    fn managed_slash_completions_offer_only_managed_commands() {
+        let owner = bcode_session_models::SessionId::new();
+        let mut model = managed_root_test_model(owner);
+        model.chat.app.replace_composer_with("/");
+        let _changed = model.loop_state.refresh_slash_palette(&mut model.chat);
+        let palette = model
+            .loop_state
+            .slash_palette_for_test()
+            .expect("managed completions");
+        let commands = palette.candidate_commands_for_test();
+        assert!(commands.contains(&"/model"));
+        assert!(commands.contains(&"/compact"));
+        assert!(!commands.contains(&"/skills"));
+        assert!(!commands.contains(&"/worktree"));
+        // No discovery effect is needed (or allowed) for managed completions.
+        assert!(model.chat.pending_effects.drain_runtime().0.is_empty());
+        drop(model);
+    }
+
+    #[test]
+    fn managed_root_navigation_exits_instead_of_opening_sessions_inline() {
+        let owner = bcode_session_models::SessionId::new();
+        let mut model = managed_root_test_model(owner);
+        let other = bcode_session_models::SessionId::new();
+        super::super::session_flow::start_switch_session(
+            &mut model.chat,
+            other,
+            super::super::history_flow::initial_transcript_window_request(
+                bmux_tui::geometry::Rect::new(0, 0, 80, 24),
+            ),
+        );
+        assert!(model.chat.pending_effects.drain_runtime().0.is_empty());
+        assert_eq!(model.chat.attached_session_id(), Some(owner));
+        assert_eq!(
+            model.chat.app.managed_exit_request(),
+            Some(super::super::app::ManagedExitRequest::Navigate(Some(other)))
+        );
+        assert!(!model.chat.app.managed_input_ready());
+    }
+
+    #[test]
+    fn managed_stream_loss_requests_reattach_or_recovery() {
+        let owner = bcode_session_models::SessionId::new();
+        for (update, expected) in [
+            (
+                super::super::history_flow::SessionStreamUpdate::ManagedOwnershipLost {
+                    session_id: owner,
+                },
+                super::super::app::ManagedExitRequest::Recover,
+            ),
+            (
+                super::super::history_flow::SessionStreamUpdate::ResyncStarted {
+                    session_id: owner,
+                },
+                super::super::app::ManagedExitRequest::Reattach,
+            ),
+        ] {
+            let mut model = managed_root_test_model(owner);
+            let _update = bmux_tui_runtime::Program::update(
+                &mut model,
+                bmux_tui_runtime::RuntimeEvent::Message(BcodeRuntimeMessage::SessionStream(
+                    Box::new(update),
+                )),
+            )
+            .unwrap();
+            assert_eq!(model.chat.app.managed_exit_request(), Some(expected));
+            assert!(!model.chat.app.managed_input_ready());
+            drop(model);
+        }
     }
 
     fn root_test_model() -> super::BcodeRuntimeModel {

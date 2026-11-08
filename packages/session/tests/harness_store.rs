@@ -867,6 +867,8 @@ fn capabilities() -> HarnessCapabilities {
         constraints: vec![],
     };
     HarnessCapabilities {
+        model_switch: bcode_harness_models::HarnessCapability::unsupported(),
+        permission_mode: bcode_harness_models::HarnessCapability::unsupported(),
         resume: c.clone(),
         steering: c.clone(),
         approval: c.clone(),
@@ -925,6 +927,7 @@ fn prepared(owner: &ExternalHarnessOwner) -> HarnessPreparedSession {
 }
 fn page(owner: &ExternalHarnessOwner) -> HarnessObservationPage {
     HarnessObservationPage {
+        live: Vec::new(),
         retention: None,
         hydration_requests: Vec::new(),
         inventory_page: None,
@@ -935,6 +938,7 @@ fn page(owner: &ExternalHarnessOwner) -> HarnessObservationPage {
             native_correlations: vec!["turn".into()],
             completeness: HarnessCompleteness::Complete,
             kind: HarnessObservationKind::Text {
+                segment_id: None,
                 text: "retained offline".into(),
             },
         }],
@@ -1113,6 +1117,7 @@ async fn page_cursor_and_observations_commit_atomically_and_survive_without_plug
     assert!(empty.observations.is_empty());
     let mut conflict = native.clone();
     conflict.observations[0].kind = HarnessObservationKind::Text {
+        segment_id: None,
         text: "different".into(),
     };
     assert!(
@@ -1882,6 +1887,72 @@ async fn retained_pages_allow_null_cursor_reuse_without_losing_exact_retry_fence
             .await
             .is_err()
     );
+}
+
+#[tokio::test]
+async fn unretained_empty_pages_extend_a_recurring_null_cursor_without_losing_retry_fences() {
+    use bcode_harness_models::HarnessRetentionPage;
+    let root = tempfile::tempdir().unwrap();
+    let (sessions, owner) = execution_fixture(root.path()).await;
+    let mut first = execution_page(
+        &owner,
+        "cursor-a",
+        execution_work(None, HarnessWorkState::Running),
+    );
+    first.retention = Some(HarnessRetentionPage {
+        connection_id: "null-cursor-connection".into(),
+        page_id: "null-cursor-page".into(),
+        observations_digest: bcode_harness_models::harness_observations_digest(&first.observations)
+            .unwrap(),
+    });
+    sessions
+        .commit_external_harness_page(&owner, None, &first)
+        .await
+        .unwrap();
+    // An idle wait transfers nothing: no retention and no successor cursor.
+    let mut empty = first.clone();
+    empty.observations.clear();
+    empty.next_after = None;
+    empty.retention = None;
+    sessions
+        .commit_external_harness_page(&owner, Some("cursor-a"), &empty)
+        .await
+        .unwrap();
+    // The next idle or live-only window reuses the null input cursor of the first page; it
+    // extends the current committed predecessor and is not a conflicting retry of that page.
+    let mut idle = empty.clone();
+    idle.status.activity = bcode_harness_models::HarnessActivity::Unknown;
+    sessions
+        .commit_external_harness_page(&owner, None, &idle)
+        .await
+        .unwrap();
+    sessions
+        .commit_external_harness_page(&owner, None, &idle)
+        .await
+        .unwrap();
+    // Evidence still follows the current predecessor; a stale predecessor stays refused.
+    let mut later = execution_page(
+        &owner,
+        "cursor-b",
+        execution_work(None, HarnessWorkState::Running),
+    );
+    later.observations[0].observation_id = "cursor-b".into();
+    assert!(
+        sessions
+            .commit_external_harness_page(&owner, Some("cursor-a"), &later)
+            .await
+            .is_err()
+    );
+    sessions
+        .commit_external_harness_page(&owner, None, &later)
+        .await
+        .unwrap();
+    let state = sessions
+        .session_external_harness_state(owner.session_id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(state.observation_after.as_deref(), Some("cursor-b"));
 }
 
 #[tokio::test]
@@ -3909,6 +3980,8 @@ async fn execution_attention_tracks_pending_and_acknowledged_interaction() {
     question.observations[0].native_correlations.clear();
     question.observations[0].kind = HarnessObservationKind::Interaction {
         interaction: HarnessInteraction {
+            input_preview: None,
+            tool_name: None,
             request_id: "question".into(),
             session_id: owner.session_id.to_string(),
             generation: owner.generation,
@@ -4215,4 +4288,141 @@ async fn execution_inventory_is_bounded_and_continuation_is_not_notification() {
             .iter()
             .any(|entry| entry.key == next.entries[0].key)
     );
+}
+
+#[tokio::test]
+async fn withdrawn_interaction_is_no_longer_answerable() {
+    let root = tempfile::tempdir().unwrap();
+    let (sessions, owner) = execution_fixture(root.path()).await;
+    let mut question = page(&owner);
+    question.next_after = Some("question".into());
+    question.observations[0].observation_id = "question".into();
+    question.observations[0].native_correlations.clear();
+    question.observations[0].kind = HarnessObservationKind::Interaction {
+        interaction: HarnessInteraction {
+            input_preview: None,
+            tool_name: None,
+            request_id: "question".into(),
+            session_id: owner.session_id.to_string(),
+            generation: owner.generation,
+            kind: HarnessInteractionKind::Approval,
+            prompt: "Proceed?".into(),
+            scope: "fixture".into(),
+            choices: vec![],
+        },
+    };
+    sessions
+        .commit_external_harness_page(&owner, None, &question)
+        .await
+        .unwrap();
+    assert!(
+        sessions
+            .external_harness_interaction(&owner, "question")
+            .await
+            .unwrap()
+            .is_some()
+    );
+    let mut withdrawn = page(&owner);
+    withdrawn.next_after = Some("withdrawn".into());
+    withdrawn.observations[0].observation_id = "withdrawn".into();
+    withdrawn.observations[0].native_correlations.clear();
+    withdrawn.observations[0].kind = HarnessObservationKind::InteractionWithdrawn {
+        request_id: "question".into(),
+    };
+    sessions
+        .commit_external_harness_page(&owner, Some("question"), &withdrawn)
+        .await
+        .unwrap();
+    assert_eq!(
+        sessions
+            .external_harness_interaction(&owner, "question")
+            .await
+            .unwrap(),
+        None,
+        "a withdrawn prompt is not pending"
+    );
+    let request = HarnessRequest {
+        schema_version: HARNESS_SCHEMA_VERSION,
+        request_id: "late-answer".into(),
+        instance: instance(),
+        kind: HarnessRequestKind::Respond {
+            target: HarnessSessionTarget::Prepared(prepared(&owner)),
+            response: HarnessResponse {
+                response_id: "late-answer".into(),
+                request_id: "question".into(),
+                session_id: owner.session_id.to_string(),
+                generation: owner.generation,
+                value: HarnessResponseValue::Approval { approved: true },
+            },
+        },
+    };
+    assert!(
+        sessions
+            .claim_external_harness_request(&owner, &request)
+            .await
+            .is_err(),
+        "a late answer never reaches the native harness"
+    );
+}
+
+#[tokio::test]
+async fn native_live_text_without_a_durable_segment_retires_when_the_turn_ends() {
+    use bcode_session_models::{
+        ClientId, SessionLiveEventKind, TextStreamOperation, TextStreamUpdate,
+    };
+    let root = tempfile::tempdir().unwrap();
+    let (sessions, owner) = execution_fixture(root.path()).await;
+    // A partial block the native turn abandons before its assistant frame is emitted.
+    let identity = harness_stream_identity(owner.generation, "msg_partial:0");
+    let publish =
+        |revision, expected_offset, text: &str| SessionLiveEventKind::AssistantTextStreamUpdated {
+            output_position: None,
+            turn_id: identity.turn_id.clone(),
+            segment_id: identity.segment_id.clone(),
+            segment_order: identity.segment_order,
+            update: TextStreamUpdate {
+                generation: 0,
+                first_revision: revision,
+                revision,
+                operation: TextStreamOperation::Append {
+                    expected_offset,
+                    text: text.to_owned(),
+                },
+            },
+        };
+    let _ = sessions
+        .publish_live_event(owner.session_id, publish(1, 0, "partial "))
+        .await;
+    let attached = sessions
+        .attach_session(owner.session_id, ClientId::new())
+        .await
+        .unwrap();
+    assert_eq!(attached.live_checkpoints.len(), 1);
+    let mut ended = page(&owner);
+    ended.observations[0].native_correlations.clear();
+    ended.observations[0].kind = HarnessObservationKind::Result {
+        text: "interrupted".into(),
+    };
+    sessions
+        .commit_external_harness_page(&owner, None, &ended)
+        .await
+        .unwrap();
+    let attached = sessions
+        .attach_session(owner.session_id, ClientId::new())
+        .await
+        .unwrap();
+    assert_eq!(
+        attached.live_checkpoints,
+        Vec::new(),
+        "a reattach never replays abandoned partial text"
+    );
+    // A late delta for the ended stream cannot revive it.
+    let _ = sessions
+        .publish_live_event(owner.session_id, publish(2, 8, "late"))
+        .await;
+    let attached = sessions
+        .attach_session(owner.session_id, ClientId::new())
+        .await
+        .unwrap();
+    assert_eq!(attached.live_checkpoints, Vec::new());
 }

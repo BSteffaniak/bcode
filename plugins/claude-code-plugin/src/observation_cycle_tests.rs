@@ -15,17 +15,25 @@ impl CommittedPages {
     fn commit(
         &mut self,
         page: &HarnessObservationPage,
-    ) -> bcode_harness_models::HarnessRetentionContext {
+    ) -> Option<bcode_harness_models::HarnessRetentionContext> {
         page.validate_retention().unwrap();
         assert_eq!(page.hydration_requests, Vec::new());
-        let metadata = page.retention.clone().expect("retained page");
+        self.pages.push(page.clone());
+        // A page with nothing to transfer is not retained; the host then has no
+        // acknowledgment to return for it.
+        let Some(metadata) = page.retention.clone() else {
+            assert_eq!(page.observations, Vec::new());
+            return None;
+        };
         assert_eq!(
             metadata.observations_digest,
             harness_observations_digest(&page.observations).unwrap()
         );
-        // Preserve the exact returned page before issuing its acknowledgment.
-        self.pages.push(page.clone());
-        retained_page_ack(metadata, u64::try_from(self.pages.len()).unwrap())
+        // The exact returned page is preserved above before issuing its acknowledgment.
+        Some(retained_page_ack(
+            metadata,
+            u64::try_from(self.pages.len()).unwrap(),
+        ))
     }
 }
 
@@ -133,7 +141,7 @@ fn missing_result_subtype_fails_closed_after_committed_cycles() {
         match stream.observation_page(&prepared, &request, &Settlement::Unsupported) {
             Ok(HarnessServiceResponseKind::Observations(page)) => {
                 assert!(!page.observations.iter().any(is_foreground_outcome));
-                request.retention = Some(committed.commit(&page));
+                request.retention = committed.commit(&page);
                 request.after = page.next_after;
             }
             Err(HarnessFailure::Uncertain) => {
@@ -176,17 +184,19 @@ fn staged_pages_need_exact_committed_ack_and_batch_records_between_evidence() {
             serde_json::to_value(&page).unwrap()
         );
         let acknowledgment = committed.commit(&page);
-        let mut wrong = acknowledgment.clone();
-        wrong.acknowledgment.as_mut().unwrap().observations_digest = "0".repeat(64);
-        let invalid = HarnessObserveRequest {
-            retention: Some(wrong),
-            ..request.clone()
-        };
-        assert!(matches!(
-            stream.observation_page(&prepared, &invalid, &Settlement::Unsupported),
-            Err(HarnessFailure::Conflict)
-        ));
-        request.retention = Some(acknowledgment);
+        if let Some(acknowledgment) = &acknowledgment {
+            let mut wrong = acknowledgment.clone();
+            wrong.acknowledgment.as_mut().unwrap().observations_digest = "0".repeat(64);
+            let invalid = HarnessObserveRequest {
+                retention: Some(wrong),
+                ..request.clone()
+            };
+            assert!(matches!(
+                stream.observation_page(&prepared, &invalid, &Settlement::Unsupported),
+                Err(HarnessFailure::Conflict)
+            ));
+        }
+        request.retention = acknowledgment;
         // Match the immediately preceding committed page, including null after an
         // empty page. Do not carry forward the last nonempty observation ID.
         request.after = page.next_after.clone();
@@ -200,7 +210,7 @@ fn staged_pages_need_exact_committed_ack_and_batch_records_between_evidence() {
     };
     let text = position(&|item| {
         matches!(&item.kind,
-        HarnessObservationKind::Text { text } if text == "offline sentinel")
+        HarnessObservationKind::Text { text, .. } if text == "offline sentinel")
     });
     let result = position(&|item| {
         matches!(&item.kind,
@@ -236,6 +246,7 @@ fn staged_pages_need_exact_committed_ack_and_batch_records_between_evidence() {
     // The next successful cycle acknowledges the foreground result's exact page.
     let final_page = poll(&mut stream, &prepared, &request, cycles + 1);
     assert_eq!(final_page.observations, Vec::new());
-    committed.commit(&final_page);
+    // Nothing remains to transfer, so the idle page is not retained.
+    assert_eq!(committed.commit(&final_page), None);
     assert_eq!(committed.pages.len(), cycles + 1);
 }

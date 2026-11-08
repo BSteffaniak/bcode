@@ -71,6 +71,7 @@ mod tests {
                         native_correlations: vec![],
                         completeness: HarnessCompleteness::Partial,
                         kind: HarnessObservationKind::Tool {
+                            input_json: None,
                             native_tool_id: "native-tool".into(),
                             name: "native-shell-visible-marker".into(),
                             status: "running".into(),
@@ -84,10 +85,17 @@ mod tests {
         let mut app = BmuxApp::new_with_history(Some(session_id), &[], &[], false);
         app.absorb_session_event(&event);
         assert_eq!(app.transcript().len(), 1);
-        assert!(app.transcript().iter().any(|item| {
-            item.text().contains("native-shell-visible-marker")
-                && item.text().contains("not executed by Bcode")
-        }));
+        // An observed native tool is an ordinary generic tool card owned by the observing
+        // harness, never a Bcode tool invocation.
+        assert!(app.transcript().iter().any(|item| matches!(
+            item.kind(),
+            crate::transcript::TranscriptItemKind::ToolRequest {
+                tool_name,
+                tool_call_id,
+                ..
+            } if tool_name == "native-shell-visible-marker"
+                && tool_call_id.starts_with("external:3:")
+        )));
         assert!(app.session_view_snapshot().tools.is_empty());
         drop(app);
     }
@@ -165,11 +173,8 @@ mod tests {
                 .summary()
                 .contains("Reply complete + 2 background")
         );
-        assert!(
-            app.transcript()
-                .iter()
-                .any(|item| item.text().contains("1 continuation pending"))
-        );
+        // Lifecycle evidence adds no transcript rows; the status line keeps it visible.
+        assert!(app.status().contains("1 continuation pending"));
         app.absorb_session_event(&coverage_loss_event(session_id));
         assert!(
             app.session_view_snapshot()
@@ -220,6 +225,7 @@ mod tests {
                     native_correlations: vec![],
                     completeness: HarnessCompleteness::Gap,
                     kind: HarnessObservationKind::Text {
+                        segment_id: None,
                         text: "coverage lost".into(),
                     },
                 }),

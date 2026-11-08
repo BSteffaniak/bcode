@@ -28,7 +28,7 @@ pub enum HarnessAction {
     Write(Box<ExternalHarnessOperationRecord>),
     Page {
         after: Option<String>,
-        page: HarnessObservationPage,
+        page: Box<HarnessObservationPage>,
     },
     Receipt {
         submission_id: String,
@@ -124,35 +124,20 @@ impl SessionActor {
         {
             return Err(failure());
         }
+        // Recovery records are admitted only through their host-verified actions, behind the
+        // published recovery storage contract and the native-parity storage fence.
         let action = verify_recovery_action(action, &owner)?;
-        // Recovery storage remains independently unpublished, including under schema57.
-        let recovery = matches!(&action, HarnessAction::Write(record)
-            if matches!(record.as_ref(), ExternalHarnessOperationRecord::RecoveryPrepared { .. }
-                | ExternalHarnessOperationRecord::TransportReleased { .. }));
-        if recovery {
-            return Err(failure());
-        }
-        if matches!(&action, HarnessAction::State | HarnessAction::Page { .. }) {
-            tracing::warn!(target: "bcode_session::harness", stage = "operation_db_enter", "managed actor progress");
-        }
         self.ensure_session_db_for_write().await?;
         let db = self.db.as_ref().ok_or_else(failure)?;
-        if matches!(&action, HarnessAction::State | HarnessAction::Page { .. }) {
-            tracing::warn!(target: "bcode_session::harness", stage = "operation_db_exit", "managed actor progress");
-            tracing::warn!(target: "bcode_session::harness", stage = "operation_state_enter", "managed actor progress");
-        }
         let state = db
             .harness_state(operation_state_owner(&owner, &action))
             .await?;
-        if matches!(&action, HarnessAction::State | HarnessAction::Page { .. }) {
-            tracing::warn!(target: "bcode_session::harness", stage = "operation_state_exit", "managed actor progress");
-        }
         let action = if let HarnessAction::Page { after, page } = action {
             let instance = state.as_ref().ok_or_else(failure)?.instance.clone();
             HarnessAction::Write(Box::new(ExternalHarnessOperationRecord::ObservationPage {
                 instance,
                 after,
-                page,
+                page: *page,
             }))
         } else {
             action
@@ -229,21 +214,8 @@ impl SessionActor {
                 bcode_session_models::CURRENT_SESSION_STORAGE_WRITER_EPOCH,
             )
             .map_err(SessionError::EventSerialization)?;
-        let page_diagnostic = matches!(
-            &operation.record,
-            ExternalHarnessOperationRecord::ObservationPage { .. }
-        );
-        if page_diagnostic {
-            tracing::warn!(target: "bcode_session::harness", stage = "page_retry_enter", "managed actor progress");
-        }
         if let Some(result) = retained_retry(db, &owner, state.as_ref(), &operation).await? {
-            if page_diagnostic {
-                tracing::warn!(target: "bcode_session::harness", stage = "page_retry_retained", "managed actor progress");
-            }
             return Ok(result);
-        }
-        if page_diagnostic {
-            tracing::warn!(target: "bcode_session::harness", stage = "page_retry_exit", "managed actor progress");
         }
         let claim = matches!(
             operation.record,
@@ -251,9 +223,6 @@ impl SessionActor {
         );
         // Reuses canonical actor append: write lock, refreshed generation, transactional
         // preconditions + canonical event + locators + post-commit fanout.
-        if page_diagnostic {
-            tracing::warn!(target: "bcode_session::harness", stage = "page_append_enter", "managed actor progress");
-        }
         self.append_event(
             SessionEventKind::ExternalHarnessOperation {
                 operation: Box::new(operation),
@@ -262,9 +231,6 @@ impl SessionActor {
             timestamp,
         )
         .await?;
-        if page_diagnostic {
-            tracing::warn!(target: "bcode_session::harness", stage = "page_append_exit", "managed actor progress");
-        }
         Ok(if claim {
             HarnessResult::Claim(ExternalHarnessClaim::New)
         } else {
@@ -305,7 +271,7 @@ async fn retained_retry(
         } => {
             if let Some(state) = state {
                 if state.instance != *instance
-                    || state.capabilities != *capabilities
+                    || state.capabilities != **capabilities
                     || state.prepared_open != *open_request
                 {
                     return Err(failure());
@@ -416,6 +382,12 @@ async fn retained_page_retry(
             && retained.record == operation.record
         {
             return Ok(Some(HarnessResult::Committed));
+        }
+        // A cursor recurs after an empty page (whose successor cursor is its predecessor), so
+        // an older page indexed under the same input is not a retry when this page extends
+        // the current committed predecessor. Transactional append validates it again.
+        if current.observation_after.as_deref() == after {
+            return Ok(None);
         }
         // Preserve legacy non-retained page conflict behavior.
         if !matches!(&retained.record, ExternalHarnessOperationRecord::ObservationPage { page, .. }

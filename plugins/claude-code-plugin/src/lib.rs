@@ -9,6 +9,7 @@ mod capabilities;
 mod config;
 mod diagnostics;
 mod execution;
+mod live;
 mod model_selection;
 mod normalize;
 mod observation_wake;
@@ -58,6 +59,10 @@ const MAX_RETAINED_OBSERVATIONS: usize = 256;
 const MAX_PUMPED_RECORDS_PER_PAGE: usize = 256;
 /// Upper bound on one blocking wait slice, so cancellation is observed promptly.
 const OBSERVE_WAIT_SLICE: std::time::Duration = std::time::Duration::from_millis(100);
+/// When only transient live text is ready, wait this long so nearby deltas share a page.
+const LIVE_COALESCE: std::time::Duration = std::time::Duration::from_millis(40);
+/// Vendor namespace for closed-vocabulary host-tool bridge telemetry observations.
+const HOST_TOOLS_VENDOR_NAMESPACE: &str = "claude_code.host_tools";
 
 struct StreamState {
     /// Signalled whenever native evidence arrives, so a waiting `observe` can return.
@@ -73,13 +78,15 @@ impl StreamState {
     fn tool_diagnostic(&mut self, _identity: &str, diagnostic: diagnostics::Diagnostic) -> bool {
         // A bridge/request identity can recur across turns (bind, revoke, refresh).
         // Each emitted diagnostic is a distinct observation, not a mutation replay.
-        let Some(observation) = self
-            .normalizer
-            .observation(HarnessObservationKind::Diagnostic {
-                code: diagnostic.code().into(),
-                message: diagnostic.message(),
-            })
-        else {
+        // Host-tool bridge telemetry is operational evidence, not conversation content: it is
+        // retained as closed-vocabulary vendor detail so it never becomes a transcript notice.
+        let Some(observation) = self.normalizer.observation(HarnessObservationKind::Vendor {
+            namespace: HOST_TOOLS_VENDOR_NAMESPACE.into(),
+            detail: serde_json::json!({
+                "code": diagnostic.code(),
+                "message": diagnostic.message(),
+            }),
+        }) else {
             self.gap = true;
             return false;
         };
@@ -161,6 +168,11 @@ impl StreamState {
 
     /// Whether the next page carries evidence or a request the host must receive now.
     fn ready_to_offer(&self) -> bool {
+        self.durable_ready() || self.normalizer.live_pending()
+    }
+
+    /// Ready for reasons other than transient live text.
+    fn durable_ready(&self) -> bool {
         self.gap
             || self.retention.pending()
             || !self.observations.is_empty()
@@ -186,7 +198,22 @@ impl StreamState {
             bytes += size;
             observations.push(observation.clone());
         }
-        let (retention, observations) = self.retention.offer(observations)?;
+        let hydration_requests = self.normalizer.hydration_requests();
+        // A page with nothing to transfer (idle waits and live-only streaming pages) carries
+        // no retention page. Retaining it would force one canonical page commit per
+        // coalesced live window; without retention identical empty pages commit as exact
+        // retries. Any observation, pending page, gap or hydration request keeps the
+        // exact post-commit retention protocol.
+        let retain = !observations.is_empty()
+            || self.retention.pending()
+            || self.gap
+            || !hydration_requests.is_empty();
+        let (retention, observations) = if retain {
+            let (retention, observations) = self.retention.offer(observations)?;
+            (Some(retention), observations)
+        } else {
+            (None, observations)
+        };
         let mut execution_status = normalize::status(settlement);
         if *settlement != Settlement::Uncertain
             && self
@@ -199,8 +226,10 @@ impl StreamState {
         }
         Ok(HarnessServiceResponseKind::Observations(
             HarnessObservationPage {
-                retention: Some(retention),
-                hydration_requests: self.normalizer.hydration_requests(),
+                // Transient: offered once, never retained and not covered by the digest.
+                live: self.normalizer.take_live(),
+                retention,
+                hydration_requests,
                 inventory_page: self.normalizer.inventory_page(),
                 next_after: observations.last().map(|item| item.observation_id.clone()),
                 observations,
@@ -231,6 +260,11 @@ struct Process {
     instance: HarnessInstance,
     open: HarnessOpenRequest,
     prepared: HarnessPreparedSession,
+    /// Configured expected version at launch; a later configuration change conflicts.
+    /// The prepared target carries the actual probed native version.
+    configured_version: String,
+    /// Init-advertised native models; the only keys accepted by mid-session switching.
+    models: Vec<bcode_claude_code::NativeModel>,
     client: ClaudeClient,
     stream: Arc<Mutex<StreamState>>,
     submissions: BTreeMap<String, (HarnessSubmission, HarnessReceipt)>,
@@ -490,14 +524,30 @@ impl ClaudeCodePlugin {
             return;
         };
         let deadline = std::time::Instant::now() + wait;
+        // End of the live coalescing window, fixed when live text first becomes ready.
+        let mut coalesce_until: Option<std::time::Instant> = None;
         loop {
-            let Some((wake, seen)) = self
+            let readiness = self
                 .state
                 .lock()
                 .ok()
-                .and_then(|state| state.advance_observation(&request.instance, observe))
-            else {
-                return;
+                .map(|state| state.advance_observation(&request.instance, observe));
+            let (wake, seen) = match readiness {
+                Some(ObservationReadiness::Waiting(wake, seen)) => (wake, seen),
+                Some(ObservationReadiness::LiveOnly(wake, seen)) => {
+                    // Let nearby deltas share one page for the whole window. Every native
+                    // frame wakes this wait; the readiness check above returns early once
+                    // durable evidence is ready or the live buffer nears its bounds.
+                    let now = std::time::Instant::now();
+                    let until =
+                        *coalesce_until.get_or_insert_with(|| (now + LIVE_COALESCE).min(deadline));
+                    if now >= until || cancellation.is_cancelled() {
+                        return;
+                    }
+                    wake.wait_changed(seen, until - now);
+                    continue;
+                }
+                _ => return,
             };
             loop {
                 let now = std::time::Instant::now();
@@ -510,6 +560,16 @@ impl ClaudeCodePlugin {
             }
         }
     }
+}
+
+/// What a waiting `observe` should do next.
+enum ObservationReadiness {
+    /// Run the operation now: durable evidence is ready or a failure must be reported.
+    Run,
+    /// Only transient live text is ready; a short coalescing wait is allowed.
+    LiveOnly(Arc<observation_wake::ObservationWake>, u64),
+    /// Nothing is ready; wait for the native reader.
+    Waiting(Arc<observation_wake::ObservationWake>, u64),
 }
 
 /// Bounded wait requested by a valid harness `observe`; other requests never wait.
@@ -702,24 +762,15 @@ impl PluginState {
         {
             return Err(HarnessFailure::Policy);
         }
-        if let Some(process) = self
+        // A running process launched under a different configured version conflicts.
+        let configured = selected.exact_version.as_str();
+        if self
             .processes
             .values()
-            .find(|process| process.instance.instance_id == request.instance.instance_id)
+            .filter(|process| process.instance.instance_id == request.instance.instance_id)
+            .any(|process| process.configured_version != configured)
         {
-            let version = match &process
-                .stream
-                .lock()
-                .map_err(|_| HarnessFailure::Unavailable)?
-                .normalizer
-                .target
-            {
-                HarnessSessionTarget::Prepared(value) => value.native_version.clone(),
-                HarnessSessionTarget::Confirmed(value) => value.native_version.clone(),
-            };
-            if version != selected.exact_version {
-                return Err(HarnessFailure::Conflict);
-            }
+            return Err(HarnessFailure::Conflict);
         }
         match &request.kind {
             HarnessRequestKind::Inspect => {
@@ -758,6 +809,9 @@ impl PluginState {
             }
             HarnessRequestKind::Reconcile(reconcile) => {
                 self.reconcile(&request.instance, reconcile)
+            }
+            HarnessRequestKind::Configure(configure) => {
+                self.configure(&request.instance, configure).await
             }
             HarnessRequestKind::AuthStatus { .. }
             | HarnessRequestKind::AuthBegin(_)
@@ -953,12 +1007,15 @@ impl PluginState {
             .controls
             .insert(control.mutation_id.clone(), operation);
         if operation == "close" {
-            process
-                .stream
-                .lock()
-                .map_err(|_| HarnessFailure::Unavailable)?
-                .normalizer
-                .invalidate_callbacks();
+            {
+                let mut stream = process
+                    .stream
+                    .lock()
+                    .map_err(|_| HarnessFailure::Unavailable)?;
+                let withdrawn = stream.normalizer.invalidate_callbacks();
+                // Offered on a later page if one is drained; overflow already marks a gap.
+                let _ = stream.push(withdrawn);
+            }
             process.client.terminate();
             // Signal/acknowledgement is not release. Only a successful supervisor OS
             // wait allows this process to become eligible for local capacity release.
@@ -978,6 +1035,62 @@ impl PluginState {
         }
         Ok(HarnessServiceResponseKind::Acknowledged {
             mutation_id: control.mutation_id.clone(),
+        })
+    }
+    /// Apply one mid-session native setting. Acknowledged only after the correlated native
+    /// control response; a retained mutation identity is never re-sent.
+    async fn configure(
+        &mut self,
+        instance: &HarnessInstance,
+        configure: &bcode_harness_models::HarnessConfigureRequest,
+    ) -> Result<HarnessServiceResponseKind, HarnessFailure> {
+        use bcode_harness_models::{HarnessPermissionMode, HarnessSessionSetting};
+        let process = self.process(instance, &configure.target)?;
+        if process.controls.contains_key(&configure.mutation_id) {
+            return Err(HarnessFailure::Uncertain);
+        }
+        if process.controls.len() >= MAX_RETAINED_MUTATIONS {
+            return Err(HarnessFailure::Unavailable);
+        }
+        let result = match &configure.setting {
+            HarnessSessionSetting::Model { model_id } => {
+                if !process.models.iter().any(|model| &model.value == model_id) {
+                    return Err(HarnessFailure::InvalidRequest);
+                }
+                if !process.client.can_submit_next_turn() {
+                    // Never queue a switch behind an active foreground turn.
+                    return Err(HarnessFailure::Conflict);
+                }
+                process
+                    .controls
+                    .insert(configure.mutation_id.clone(), "configure");
+                process
+                    .client
+                    .select_model(&process.models, model_id)
+                    .await
+                    .map(|_| ())
+            }
+            HarnessSessionSetting::PermissionMode { mode } => {
+                process
+                    .controls
+                    .insert(configure.mutation_id.clone(), "configure");
+                process
+                    .client
+                    .set_permission_mode(match mode {
+                        HarnessPermissionMode::Default => {
+                            bcode_claude_code::PermissionMode::Default
+                        }
+                        HarnessPermissionMode::Plan => bcode_claude_code::PermissionMode::Plan,
+                        HarnessPermissionMode::AcceptEdits => {
+                            bcode_claude_code::PermissionMode::AcceptEdits
+                        }
+                    })
+                    .await
+            }
+        };
+        result.map_err(|error| configure_failure(&error))?;
+        Ok(HarnessServiceResponseKind::Acknowledged {
+            mutation_id: configure.mutation_id.clone(),
         })
     }
     fn reconcile(
@@ -1040,23 +1153,35 @@ impl PluginState {
         ))
     }
     /// Advance a retained session's observation state for a waiting `observe`. Returns the
-    /// wake handle and current sequence while nothing is ready to offer; `None` means the
-    /// ordinary operation should run now (ready, or a failure it will report).
+    /// wake handle and current sequence while nothing durable is ready to offer; `Run`
+    /// means the ordinary operation should run now (ready, or a failure it will report).
     fn advance_observation(
         &self,
         instance: &HarnessInstance,
         observe: &HarnessObserveRequest,
-    ) -> Option<(Arc<observation_wake::ObservationWake>, u64)> {
-        let process = self.processes.get(observe.target.session_id())?;
+    ) -> ObservationReadiness {
+        let Some(process) = self.processes.get(observe.target.session_id()) else {
+            return ObservationReadiness::Run;
+        };
         if process.instance != *instance || process.closed {
-            return None;
+            return ObservationReadiness::Run;
         }
-        let mut stream = process.stream.lock().ok()?;
-        stream.advance(&process.prepared, observe).ok()?;
+        let Ok(mut stream) = process.stream.lock() else {
+            return ObservationReadiness::Run;
+        };
+        if stream.advance(&process.prepared, observe).is_err()
+            || stream.durable_ready()
+            || stream.normalizer.live_near_capacity()
+        {
+            return ObservationReadiness::Run;
+        }
+        let wake = Arc::clone(&stream.wake);
+        let seen = wake.sequence();
         if stream.ready_to_offer() {
-            return None;
+            ObservationReadiness::LiveOnly(wake, seen)
+        } else {
+            ObservationReadiness::Waiting(wake, seen)
         }
-        Some((Arc::clone(&stream.wake), stream.wake.sequence()))
     }
 
     fn retained_process(
@@ -1224,6 +1349,7 @@ impl PluginState {
             opened,
             stream,
             model_evidence,
+            models,
         } = prepare_stream(
             &session,
             instance,
@@ -1243,6 +1369,8 @@ impl PluginState {
                 instance: instance.clone(),
                 open: open.clone(),
                 prepared,
+                configured_version: selected.exact_version.clone(),
+                models,
                 client,
                 stream,
                 submissions: BTreeMap::new(),
@@ -1262,9 +1390,9 @@ fn validate_open_selection(
 ) -> Result<(), HarnessFailure> {
     if let Some(binding) = &open.resume {
         recovery::validate_resume(instance, open, selected)?;
-        let version_matches = binding.native_version == selected.exact_version;
-        let instance_matches = binding.instance_id == instance.instance_id;
-        if !version_matches || !instance_matches {
+        if !recovery::resumable_version(&binding.native_version, selected)
+            || binding.instance_id != instance.instance_id
+        {
             return Err(HarnessFailure::Conflict);
         }
     } else {
@@ -1301,6 +1429,7 @@ fn native_auth_capability(support: bcode_claude_code::NativeAuthSupport) -> Harn
 
 struct PreparedStream {
     model_evidence: Option<bcode_harness_models::HarnessModelEvidence>,
+    models: Vec<bcode_claude_code::NativeModel>,
     client: ClaudeClient,
     prepared: HarnessPreparedSession,
     opened: HarnessServiceResponseKind,
@@ -1335,12 +1464,17 @@ async fn prepare_stream(
     if !client.is_control_ready() {
         return Err(HarnessFailure::Uncertain);
     }
+    // An unusable model snapshot only disables mid-session switching; it never blocks open.
+    let models = bcode_claude_code::available_models(&initialize).unwrap_or_default();
+    // Bindings carry the actual probed executable version, which may drift from the
+    // configured expected version. Tested-version membership gates verified features.
+    let native_version = client.native_version().to_owned();
     let prepared = HarnessPreparedSession {
         open_id: open.open_id.clone(),
         session_id: open.session_id.clone(),
         instance_id: instance.instance_id.clone(),
         generation: open.generation,
-        native_version: selected.exact_version.clone(),
+        native_version: native_version.clone(),
         requested_native_session_id: Some(open.resume.as_ref().map_or_else(
             || open.session_id.clone(),
             |value| value.native_session_id.clone(),
@@ -1349,10 +1483,16 @@ async fn prepare_stream(
     prepared
         .validate()
         .map_err(|_| HarnessFailure::InvalidRequest)?;
-    let mut normalizer = Normalizer::with_target(
-        HarnessSessionTarget::Prepared(prepared.clone()),
-        open.open_id.clone(),
+    // An exact resume reopens the host-verified binding: `--resume=<id>` pins the native
+    // session, so the open answers with that binding (at the new generation) instead of a
+    // prepared target. Later native init must then name the same session or fail closed.
+    // The binding keeps its recorded native version; the probed version only gates
+    // verified features below.
+    let initial_target = open.resume.as_ref().map_or_else(
+        || HarnessSessionTarget::Prepared(prepared.clone()),
+        |binding| HarnessSessionTarget::Confirmed(binding.clone()),
     );
+    let mut normalizer = Normalizer::with_target(initial_target, open.open_id.clone());
     match client.identity_state() {
         bcode_claude_code::IdentityState::Confirmed { native_session_id } => {
             // Open itself carries confirmed evidence; no duplicate promotion event.
@@ -1367,7 +1507,7 @@ async fn prepare_stream(
     }
     let opened = open_response(&normalizer.target);
     normalizer.configure_execution(
-        selected.verified_session_state && selected.exact_version == "2.1.308 (Claude Code)",
+        selected.verified_session_state && bcode_claude_code::is_tested_version(&native_version),
         open.resume.is_none(),
     );
     normalizer.enable_retention();
@@ -1391,6 +1531,7 @@ async fn prepare_stream(
     }));
     Ok(PreparedStream {
         model_evidence,
+        models,
         client,
         prepared,
         opened,
@@ -1458,6 +1599,12 @@ mod host_tools_diagnostic_tests {
             stream.observations[1].observation_id
         );
         assert_eq!(stream.observations[0].kind, stream.observations[1].kind);
+        // Bridge telemetry is retained evidence, never a user-facing diagnostic notice.
+        assert!(matches!(
+            &stream.observations[0].kind,
+            HarnessObservationKind::Vendor { detail, .. }
+                if detail["code"] == "host_tools_queue_revoked"
+        ));
     }
 
     #[test]
@@ -1641,6 +1788,16 @@ async fn drain_session(
         stream.disconnected();
     }
     session.close().await;
+}
+
+/// Map a native control failure. Admission refusals happen before any native write; a
+/// native error or mismatched acknowledgment is reported as uncertain and never retried.
+const fn configure_failure(error: &bcode_claude_code::Error) -> HarnessFailure {
+    match error {
+        bcode_claude_code::Error::InvalidConfiguration(_) => HarnessFailure::Conflict,
+        bcode_claude_code::Error::Capacity => HarnessFailure::Unavailable,
+        _ => HarnessFailure::Uncertain,
+    }
 }
 
 fn open_response(target: &HarnessSessionTarget) -> HarnessServiceResponseKind {

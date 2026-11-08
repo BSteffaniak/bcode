@@ -1,4 +1,5 @@
-//! Optional exact-intent recovery evidence; never reconstruct release from Close Ack.
+//! Exact-intent recovery evidence and resume selection; never reconstruct release from
+//! Close Ack and never adopt a most-recent native session.
 #[cfg(test)]
 #[path = "recovery_tests.rs"]
 mod tests;
@@ -71,7 +72,7 @@ impl PluginState {
                 // Host independently proves canonical Close; this adapter proves its retained reap.
                 selected.inspection_options(&request.instance)?;
                 let process = self.retained_process(&request.instance, &control.target)?;
-                if process.prepared.native_version != selected.exact_version {
+                if process.configured_version != selected.exact_version {
                     return Err(HarnessFailure::Conflict);
                 }
                 validate_release(process.closed, process.released_close.as_ref(), &control)?;
@@ -102,19 +103,32 @@ fn validate_release(
     }
 }
 
-/// Validate exact resume selection, then fail closed until inert startup is supported.
+/// Validate exact resume selection for a host-published recovery intent.
+///
+/// The resumed process is launched with `--resume=<native id>` (never `--continue` or
+/// most-recent selection) and with stdin input only: the native CLI sends nothing until
+/// the host submits a new turn. The resumed normalizer starts with `fresh = false`, so
+/// execution coverage is unknown until native evidence re-establishes it; unresolved
+/// prior work is never replayed or certified from identity alone.
 /// # Errors
-/// Rejects invalid selection and returns `Unsupported` for otherwise matching intent.
+/// Rejects invalid selection, mismatched instance/generation or an unusable native version.
 pub fn validate_resume(
     instance: &HarnessInstance,
     open: &HarnessOpenRequest,
     selected: &InstanceConfig,
 ) -> Result<(), HarnessFailure> {
-    validate_resume_selection(instance, open, selected)?;
-    // Exact --resume selection is not proof of inert startup. The current native
-    // transport keeps stdin piped and has no verified no-autocontinuation contract
-    // for unresolved tools/background work. Never certify recovery from identity alone.
-    Err(HarnessFailure::Unsupported)
+    validate_resume_selection(instance, open, selected)
+}
+
+/// Whether a retained binding's native version can be resumed by this configuration.
+///
+/// Bindings record the probed executable version, which may differ from the configured
+/// expected version after an upgrade. Any well-formed native version (or the exact
+/// configured value) is resumable; the relaunch binds the newly probed version.
+pub fn resumable_version(version: &str, selected: &InstanceConfig) -> bool {
+    version == selected.exact_version
+        || bcode_claude_code::parse_version(version.as_bytes())
+            .is_ok_and(|parsed| parsed == version)
 }
 
 fn validate_resume_selection(
@@ -134,7 +148,7 @@ fn validate_resume_selection(
     let binding = open.resume.as_ref().ok_or(HarnessFailure::InvalidRequest)?;
     // Host constructs the prospective N+1 binding before preflight and CAS. Never increment or
     // normalize here: the entire binding must already match the requested generation.
-    if binding.native_version != selected.exact_version {
+    if !resumable_version(&binding.native_version, selected) {
         return Err(HarnessFailure::Conflict);
     }
     if binding.generation != open.generation || binding.instance_id != instance.instance_id {

@@ -49,6 +49,8 @@ async fn setup(root: &std::path::Path) -> (SessionManager, ManagedToolIdentity) 
                 },
             },
             HarnessCapabilities {
+                model_switch: bcode_harness_models::HarnessCapability::unsupported(),
+                permission_mode: bcode_harness_models::HarnessCapability::unsupported(),
                 resume: c.clone(),
                 steering: c.clone(),
                 approval: c.clone(),

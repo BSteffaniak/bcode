@@ -2326,9 +2326,11 @@ mod tests {
         let receipt = receipt();
         let progress = [
             HarnessObservationKind::Text {
+                segment_id: None,
                 text: "streaming".into(),
             },
             HarnessObservationKind::Tool {
+                input_json: None,
                 native_tool_id: "tool".into(),
                 name: "read".into(),
                 status: "running".into(),
@@ -2401,6 +2403,7 @@ mod tests {
         let mut progress = observation(
             &receipt,
             HarnessObservationKind::Text {
+                segment_id: None,
                 text: "unknown coverage".into(),
             },
         );
@@ -2433,6 +2436,7 @@ mod tests {
         let mut gap = observation(
             &receipt,
             HarnessObservationKind::Text {
+                segment_id: None,
                 text: "lost progress".into(),
             },
         );

@@ -418,6 +418,18 @@ pub struct ManagedComposerState {
     pub requests: std::collections::BTreeMap<String, bcode_session_models::ExternalHarnessRequest>,
     pub placement: Option<bcode_harness_models::HarnessPlacement>,
     execution: ManagedExecutionPolicy,
+    settings: ManagedSessionSettings,
+}
+
+/// Why a managed root asked to stop so its outer journey can continue without replay.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ManagedExitRequest {
+    /// Reattach the same canonical owner after event continuity was lost.
+    Reattach,
+    /// The daemon no longer recognizes this owner's generation; recover, then reattach.
+    Recover,
+    /// Leave the managed conversation and open another session, or a new draft for `None`.
+    Navigate(Option<SessionId>),
 }
 
 #[derive(Debug, Clone, Copy, Default)]
@@ -425,6 +437,16 @@ struct ManagedExecutionPolicy {
     session_id: Option<SessionId>,
     input_ready: bool,
     auth_requested: bool,
+    exit_request: Option<ManagedExitRequest>,
+}
+
+/// Native settings acknowledged in this managed conversation (display only).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ManagedSessionSettings {
+    /// Last acknowledged native permission mode, if changed in this attachment.
+    pub permission_mode: Option<bcode_harness_models::HarnessPermissionMode>,
+    /// Last acknowledged native model selector, if changed in this attachment.
+    pub model_id: Option<String>,
 }
 
 /// State owned by the terminal user interface.
@@ -526,6 +548,9 @@ pub struct BmuxApp {
     activity_started_at: Instant,
     daemon_connection: DaemonConnectionState,
     execution_mode_indicator: Option<String>,
+    #[cfg(test)]
+    pending_external_override:
+        Option<Vec<bcode_session_view_models::external::ExternalInteractionView>>,
     status: String,
     key_hints: String,
     jump_to_latest_key_label: String,
@@ -778,6 +803,8 @@ impl BmuxApp {
             activity_started_at: now,
             daemon_connection: DaemonConnectionState::Connecting,
             execution_mode_indicator: None,
+            #[cfg(test)]
+            pending_external_override: None,
             status: String::from("Connecting to daemon…"),
             key_hints: String::new(),
             jump_to_latest_key_label: "ctrl+end".to_owned(),
@@ -816,6 +843,9 @@ impl BmuxApp {
         // Explicit managed entry is sticky across reconstruction; only a new
         // ordinary root may materialize model application access.
         self.managed_composer.execution = source.managed_composer.execution;
+        self.managed_composer
+            .settings
+            .clone_from(&source.managed_composer.settings);
         self.managed_composer
             .requests
             .clone_from(&source.managed_composer.requests);
@@ -6525,11 +6555,81 @@ impl BmuxApp {
             session_id: Some(session_id),
             input_ready: true,
             auth_requested: false,
+            exit_request: None,
         };
         self.managed_composer.placement = Some(bcode_harness_models::HarnessPlacement::NextTurn);
-        self.set_execution_mode_indicator(Some(
-            "Managed conversation; native permissions and billing".into(),
-        ));
+        self.refresh_managed_indicator();
+    }
+
+    fn refresh_managed_indicator(&mut self) {
+        let mut indicator = String::from("Managed conversation; native permissions and billing");
+        if let Some(mode) = self.managed_composer.settings.permission_mode {
+            indicator.push_str(" · ");
+            indicator.push_str(super::managed_controls::permission_mode_label(mode));
+        }
+        if let Some(model) = &self.managed_composer.settings.model_id {
+            indicator.push_str(" · model ");
+            indicator.push_str(model);
+        }
+        self.set_execution_mode_indicator(Some(indicator));
+    }
+
+    /// Record an acknowledged native setting and show it in the status indicator.
+    pub fn apply_managed_setting(&mut self, setting: &bcode_harness_models::HarnessSessionSetting) {
+        match setting {
+            bcode_harness_models::HarnessSessionSetting::Model { model_id } => {
+                self.managed_composer.settings.model_id = Some(model_id.clone());
+            }
+            bcode_harness_models::HarnessSessionSetting::PermissionMode { mode } => {
+                self.managed_composer.settings.permission_mode = Some(*mode);
+            }
+        }
+        if self.managed_composer.execution.session_id.is_some() {
+            self.refresh_managed_indicator();
+        }
+    }
+
+    /// Native settings acknowledged in this managed conversation.
+    #[must_use]
+    pub const fn managed_settings(&self) -> &ManagedSessionSettings {
+        &self.managed_composer.settings
+    }
+
+    /// Ask the managed root to stop so the outer journey can reattach, recover or navigate.
+    /// The first request wins; input is fenced until the outer journey continues.
+    pub const fn request_managed_exit(&mut self, request: ManagedExitRequest) {
+        if self.managed_composer.execution.session_id.is_some()
+            && self.managed_composer.execution.exit_request.is_none()
+        {
+            self.managed_composer.execution.exit_request = Some(request);
+            self.managed_composer.execution.input_ready = false;
+        }
+    }
+
+    /// Pending managed exit request, if any.
+    #[must_use]
+    pub const fn managed_exit_request(&self) -> Option<ManagedExitRequest> {
+        self.managed_composer.execution.exit_request
+    }
+
+    /// Unresolved managed native interactions projected by the shared session view.
+    #[must_use]
+    pub fn pending_external_interactions(
+        &self,
+    ) -> &[bcode_session_view_models::external::ExternalInteractionView] {
+        #[cfg(test)]
+        if let Some(pending) = &self.pending_external_override {
+            return pending;
+        }
+        &self.session_view.snapshot().pending_external_interactions
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_pending_external_interactions_for_test(
+        &mut self,
+        pending: Vec<bcode_session_view_models::external::ExternalInteractionView>,
+    ) {
+        self.pending_external_override = Some(pending);
     }
 
     /// Explicit managed entry remains managed even when transport/binding is unavailable.
@@ -10320,6 +10420,7 @@ mod tests {
                     native_correlations: vec![],
                     completeness: HarnessCompleteness::Partial,
                     kind: HarnessObservationKind::Tool {
+                        input_json: None,
                         native_tool_id: "tool".into(),
                         name: "native tool marker".into(),
                         status: "observed".into(),
@@ -10336,6 +10437,8 @@ mod tests {
                     completeness: HarnessCompleteness::Partial,
                     kind: HarnessObservationKind::Interaction {
                         interaction: HarnessInteraction {
+                            input_preview: None,
+                            tool_name: None,
                             request_id: "question".into(),
                             session_id: session_id.to_string(),
                             generation: 1,
@@ -10363,17 +10466,19 @@ mod tests {
             app.absorb_session_event(&event);
         }
         assert_eq!(app.session_view_snapshot().transcript.items.len(), 3);
-        for marker in [
-            "native submitted instructions",
-            "native tool marker",
-            "native question marker",
-        ] {
+        for marker in ["native submitted instructions", "native question marker"] {
             assert!(
                 app.transcript()
                     .iter()
                     .any(|item| item.text().contains(marker))
             );
         }
+        // The observed native tool is a generic tool card named by the native tool.
+        assert!(app.transcript().iter().any(|item| matches!(
+            item.kind(),
+            crate::transcript::TranscriptItemKind::ToolRequest { tool_name, .. }
+                if tool_name == "native tool marker"
+        )));
         assert!(app.session_view_snapshot().tools.is_empty());
         assert_eq!(app.session_view_snapshot().permissions, Vec::new());
         drop(app);

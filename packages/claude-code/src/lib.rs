@@ -6,7 +6,9 @@
 mod attribution;
 mod auth;
 mod discovery;
-pub use discovery::{inspect_installed_account, installed_version};
+pub use discovery::{
+    TESTED_VERSIONS, inspect_installed_account, installed_version, is_tested_version, parse_version,
+};
 mod launch;
 mod models;
 pub use models::{NativeModel, NativeModelSelection, available_models};

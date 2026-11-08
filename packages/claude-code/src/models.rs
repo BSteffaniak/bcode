@@ -1,5 +1,6 @@
-//! Bounded native initialize metadata and exact pre-prompt model selection.
-use crate::{ClaudeClient, ControlRequest, Error};
+//! Bounded native initialize metadata, exact pre-prompt model selection, and mid-session
+//! model/permission-mode control between foreground turns.
+use crate::{ClaudeClient, ControlRequest, Error, PermissionMode};
 use serde_json::Value;
 use std::collections::BTreeSet;
 
@@ -28,7 +29,7 @@ impl ModelSelectionContract {
     pub(crate) fn for_version(version: &str) -> Self {
         // This native stream-json contract reports the resolved next-turn model in
         // the correlated set_model success payload. It is not inference evidence.
-        if version == "2.1.308 (Claude Code)" {
+        if crate::is_tested_version(version) {
             Self::AdvertisedAliasResolution
         } else {
             Self::ExactIdentity
@@ -162,30 +163,80 @@ impl ClaudeClient {
                 ));
             }
             let models = available_models(initialize)?;
-            if !valid_id(model) || !models.iter().any(|entry| entry.value == model) {
-                return Err(Error::InvalidConfiguration(
-                    "model is not native-advertised",
-                ));
-            }
-            let response = self
-                .request(ControlRequest::SetModel {
-                    model: model.into(),
-                })
-                .await?
-                .wait()
-                .await?;
-            selection_response_with_contract(
-                model,
-                &response,
-                self.model_selection_contract(),
-                true,
-            )
+            self.set_advertised_model(&models, model).await
         }
         .await;
         if result.is_err() {
             self.terminate();
         }
         result
+    }
+
+    /// Switch the native model for subsequent turns on a live session.
+    ///
+    /// Admitted only before the first prompt or while the next foreground turn is
+    /// admissible (no active turn, unanswered callback or queued send), and only for a key
+    /// in the init-advertised `models` snapshot. The acknowledgment is the correlated native
+    /// control response; it is not proof that a later turn used the model. A rejected or
+    /// ambiguous switch is reported, never retried, and does not terminate the session.
+    /// # Errors
+    /// `InvalidConfiguration` while a turn is active or for an unadvertised key; native
+    /// rejection or a mismatched effective model as `Protocol`; uncertain transport outcome.
+    pub async fn select_model(
+        &self,
+        models: &[NativeModel],
+        model: &str,
+    ) -> Result<NativeModelSelection, Error> {
+        if !self.is_control_ready() {
+            return Err(Error::InvalidConfiguration(
+                "transport is not control-ready",
+            ));
+        }
+        if !self.is_before_first_prompt() && !self.can_submit_next_turn() {
+            return Err(Error::InvalidConfiguration(
+                "model switching requires no active foreground turn",
+            ));
+        }
+        self.set_advertised_model(models, model).await
+    }
+
+    async fn set_advertised_model(
+        &self,
+        models: &[NativeModel],
+        model: &str,
+    ) -> Result<NativeModelSelection, Error> {
+        if !valid_id(model) || !models.iter().any(|entry| entry.value == model) {
+            return Err(Error::InvalidConfiguration(
+                "model is not native-advertised",
+            ));
+        }
+        let response = self
+            .request(ControlRequest::SetModel {
+                model: model.into(),
+            })
+            .await?
+            .wait()
+            .await?;
+        selection_response_with_contract(model, &response, self.model_selection_contract(), true)
+    }
+
+    /// Change the native permission mode for subsequent native tool use.
+    ///
+    /// Returns only after the correlated native control response. Host approval policy is
+    /// unchanged: native callbacks still surface as Bcode interactions.
+    /// # Errors
+    /// Uninitialized transport, native rejection (`Protocol`) or uncertain delivery.
+    pub async fn set_permission_mode(&self, mode: PermissionMode) -> Result<(), Error> {
+        if !self.is_control_ready() {
+            return Err(Error::InvalidConfiguration(
+                "transport is not control-ready",
+            ));
+        }
+        self.request(ControlRequest::SetPermissionMode { mode })
+            .await?
+            .wait()
+            .await
+            .map(|_| ())
     }
 }
 
@@ -262,6 +313,17 @@ mod tests {
             ModelSelectionContract::for_version("unknown"),
             ModelSelectionContract::ExactIdentity
         );
+        // Untested drift keeps strict identity; only tested versions resolve aliases.
+        assert_eq!(
+            ModelSelectionContract::for_version("9.9.9 (Claude Code)"),
+            ModelSelectionContract::ExactIdentity
+        );
+        for version in crate::TESTED_VERSIONS {
+            assert_eq!(
+                ModelSelectionContract::for_version(version),
+                ModelSelectionContract::AdvertisedAliasResolution
+            );
+        }
     }
 
     #[test]

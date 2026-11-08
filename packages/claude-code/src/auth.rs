@@ -82,22 +82,31 @@ impl NativeLoginHandoff {
 /// Unsupported auth mode, version mismatch, malformed/mismatched namespace or billing route,
 /// process failure, timeout or bounded output overflow. Native payloads are not included in errors.
 pub async fn auth_status(options: &LaunchOptions) -> Result<AuthStatus, Error> {
+    probed_auth_status(options).await.map(|(status, _)| status)
+}
+
+/// Same as [`auth_status`], also returning the probed native version from the single
+/// `--version` check so launch can bind the actual executable version.
+pub async fn probed_auth_status(options: &LaunchOptions) -> Result<(AuthStatus, String), Error> {
     if options.billing_route == BillingRoute::ApiKey {
         // Explicit credential presence is local readiness only, never remote verification.
         // Do not ask native account status to reinterpret an admitted API billing route.
-        options.verify().await?;
-        return Ok(AuthStatus {
-            logged_in: true,
-            method: AuthMethod::ApiKey,
-            config_directory: options.config_directory.clone(),
-        });
+        let version = options.verify().await?;
+        return Ok((
+            AuthStatus {
+                logged_in: true,
+                method: AuthMethod::ApiKey,
+                config_directory: options.config_directory.clone(),
+            },
+            version,
+        ));
     }
     if options.auth_support == NativeAuthSupport::Unknown {
         return Err(Error::InvalidConfiguration(
             "native auth status support unverified",
         ));
     }
-    options.verify().await?;
+    let version = options.verify().await?;
     let mut command = options.command();
     command.args(["auth", "status"]);
     let (status, output) = bounded_output(
@@ -109,7 +118,7 @@ pub async fn auth_status(options: &LaunchOptions) -> Result<AuthStatus, Error> {
     if !matches!(status.code(), Some(0 | 1)) {
         return Err(Error::Protocol);
     }
-    validated_status(options, status.success(), &output)
+    validated_status(options, status.success(), &output).map(|status| (status, version))
 }
 
 pub fn validated_status(

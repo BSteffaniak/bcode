@@ -117,6 +117,7 @@ async fn approve_and_observe(
     let mut observed = page.clone();
     observed.observations[0].observation_id = "fixture-tool-observed".into();
     observed.observations[0].kind = HarnessObservationKind::Tool {
+        input_json: None,
         native_tool_id: "native-shaped-file-read".into(),
         name: "mcp__bcode-tools__filesystem_read".into(),
         status: "observed".into(),
@@ -186,6 +187,7 @@ fn approval_page(owner: &ExternalHarnessOwner) -> HarnessObservationPage {
         completeness: HarnessCompleteness::Complete,
     };
     HarnessObservationPage {
+        live: Vec::new(),
         retention: None,
         hydration_requests: vec![],
         inventory_page: None,
@@ -197,6 +199,8 @@ fn approval_page(owner: &ExternalHarnessOwner) -> HarnessObservationPage {
             completeness: HarnessCompleteness::Complete,
             kind: HarnessObservationKind::Interaction {
                 interaction: HarnessInteraction {
+                    input_preview: None,
+                    tool_name: None,
                     request_id: "native-approval".into(),
                     session_id: session.to_string(),
                     generation: owner.generation,

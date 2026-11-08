@@ -62,7 +62,9 @@ fn native_acceptance_is_visible_but_never_completion_or_tool_execution() {
             observation: observed,
         },
     ));
-    assert_eq!(view.snapshot().transcript.items.len(), 1);
+    // Acceptance is lifecycle evidence, not conversation content.
+    assert_eq!(view.snapshot().transcript.items.len(), 0);
+    assert_eq!(view.snapshot().latest_sequence, Some(1));
     assert!(view.snapshot().tools.is_empty());
     assert_eq!(view.snapshot().permissions, Vec::new());
 }
@@ -73,6 +75,8 @@ fn capabilities() -> HarnessCapabilities {
         constraints: vec![],
     };
     HarnessCapabilities {
+        model_switch: bcode_harness_models::HarnessCapability::unsupported(),
+        permission_mode: bcode_harness_models::HarnessCapability::unsupported(),
         resume: capability.clone(),
         steering: capability.clone(),
         approval: capability.clone(),
@@ -127,6 +131,7 @@ fn disabled_plugin_history_needs_no_native_resume_and_tools_are_only_observation
                 observation: observation(
                     &binding,
                     HarnessObservationKind::Tool {
+                        input_json: None,
                         native_tool_id: "tool".into(),
                         name: "shell".into(),
                         status: "observed".into(),
@@ -195,6 +200,8 @@ fn question_approval_and_assistance_require_current_application_admission() {
         HarnessInteractionKind::Assistance,
     ] {
         let interaction = HarnessInteraction {
+            input_preview: None,
+            tool_name: None,
             request_id: "request".into(),
             session_id: binding.session_id.clone(),
             generation: binding.generation,
@@ -262,7 +269,13 @@ fn unknown_capability_and_stale_provenance_fail_closed() {
     provenance.generation += 1;
     assert!(
         external_transcript_item(
-            &observation(&binding, HarnessObservationKind::Text { text: "x".into() }),
+            &observation(
+                &binding,
+                HarnessObservationKind::Text {
+                    segment_id: None,
+                    text: "x".into()
+                }
+            ),
             1,
             &provenance
         )
@@ -310,6 +323,7 @@ fn malformed_or_oversized_history_is_rejected_without_hiding_missing_entries() {
             observation: observation(
                 &binding,
                 HarnessObservationKind::Text {
+                    segment_id: None,
                     text: "hello".into(),
                 },
             ),
@@ -388,6 +402,7 @@ fn shared_fallback_preserves_source_and_removes_terminal_controls() {
                     observation: observation(
                         &binding,
                         HarnessObservationKind::Text {
+                            segment_id: None,
                             text: "hello\u{1b}[31m界👩‍💻e\u{301}".into(),
                         },
                     ),
@@ -427,8 +442,9 @@ fn prepared_selection_is_not_a_confirmed_native_conversation() {
     let text = prepared_session_text(&prepared).unwrap();
     assert!(text.contains("requested-only (unconfirmed)"));
     assert!(text.contains("No native conversation identity confirmed"));
-    assert!(text.contains("not resumed, created, settled"));
-    assert!(text.contains("never automatic recreation/replay"));
+    assert!(text.contains("does not mean the conversation was resumed, created, or settled"));
+    assert!(text.contains("instead of recreating it or replaying input"));
+    assert!(!text.contains("/native send"));
     let (instance, _) = source();
     let (provenance, _) = external_metadata(&instance, &binding).unwrap();
     let observation = observation(
@@ -504,18 +520,18 @@ fn prepared_service_outcome_is_visible_in_real_session_view_without_claiming_ide
     };
     let mut view = crate::SessionView::new();
     view.apply_event(&event);
+    assert_eq!(view.snapshot().transcript.items.len(), 1);
     let bcode_session_view_models::TranscriptViewItemKind::SystemMessage { message } =
         &view.snapshot().transcript.items[0].kind
     else {
         panic!("prepared state must remain visible");
     };
-    assert!(message.text.contains("requested-only (unconfirmed)"));
-    assert!(
-        message
-            .text
-            .contains("No native conversation identity confirmed")
-    );
+    assert_eq!(message.text, "Disabled is ready. Send a message to start.");
     assert!(view.snapshot().tools.is_empty());
+    // The generic fallback keeps the exact unconfirmed-selection evidence.
+    let fallback = canonical_external_text(&event).unwrap().unwrap();
+    assert!(fallback.contains("requested-only (unconfirmed)"));
+    assert!(fallback.contains("No native conversation identity confirmed"));
 }
 
 #[test]
@@ -539,6 +555,8 @@ fn canonical_external_events_enter_the_real_shared_transcript_once_without_plugi
                     &binding,
                     HarnessObservationKind::Interaction {
                         interaction: HarnessInteraction {
+                            input_preview: None,
+                            tool_name: None,
                             request_id: "approval".into(),
                             session_id: binding.session_id.clone(),
                             generation: binding.generation,
@@ -561,14 +579,27 @@ fn canonical_external_events_enter_the_real_shared_transcript_once_without_plugi
     let TranscriptViewItemKind::SystemMessage { message } =
         &view.snapshot().transcript.items[1].kind
     else {
-        panic!("native fallback must be ordinary transcript text");
+        panic!("native interaction must be a compact transcript notice");
     };
     assert_eq!(message.format, TextFormat::PlainText);
-    assert!(message.text.contains("approval"));
-    assert!(message.text.contains("workspace only"));
-    assert!(message.text.contains("/native respond"));
+    assert_eq!(
+        message.text,
+        "Disabled is asking for approval: Run native shell?"
+    );
+    // The dialog-facing projection carries the full request exactly once.
+    let pending = &view.snapshot().pending_external_interactions;
+    assert_eq!(pending.len(), 1);
+    assert_eq!(pending[0].request_id, "approval");
+    assert_eq!(pending[0].scope, "workspace only");
     assert!(view.snapshot().tools.is_empty());
     assert_eq!(view.snapshot().permissions, Vec::new());
+    // The generic fallback still documents the manual response path for this exact request.
+    let fallback = canonical_external_text(&events[1]).unwrap().unwrap();
+    assert!(fallback.contains("workspace only"));
+    assert!(fallback.contains(&format!(
+        "/native respond {} approval <new-response-id> <JSON>",
+        binding.generation
+    )));
 }
 
 #[test]
@@ -582,6 +613,7 @@ fn bounded_external_event_reducer_matches_ordinary_and_rolls_back_on_budget_fail
             observation: observation(
                 &binding,
                 HarnessObservationKind::Tool {
+                    input_json: None,
                     native_tool_id: "native-tool".into(),
                     name: "shell".into(),
                     status: "observed".into(),

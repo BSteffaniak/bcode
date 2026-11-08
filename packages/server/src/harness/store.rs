@@ -210,6 +210,20 @@ pub trait ManagedHarnessStore: Send + Sync {
         self.observations(owner, page)
     }
 
+    /// Publish a committed page's transient live sidecar as session live events.
+    ///
+    /// Called only after the same page's canonical commit. Live text is presentation only:
+    /// it is never persisted and failures never affect the committed page. Stores without a
+    /// live event channel ignore it.
+    fn publish_live(
+        &self,
+        owner: &HarnessOwner,
+        page: &HarnessObservationPage,
+    ) -> impl Future<Output = ()> + Send {
+        let _ = (owner, page);
+        async {}
+    }
+
     /// Indexed bounded canonical history remains available when plugins are disabled/offline.
     fn history(
         &self,

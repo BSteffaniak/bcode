@@ -161,15 +161,15 @@ fn startup_diagnostics_keep_phase_timing_without_native_or_path_material() {
     let directory = root.path().join("state/startup-reports");
     std::fs::create_dir_all(&directory).unwrap();
     std::fs::write(directory.join("0.json"), serde_json::to_vec(&json!({
-        "pid":1,"ready":false,"elapsed_us":35000000,"unattributed_us":10,
+        "pid":1,"ready":false,"elapsed_us":35_000_000,"unattributed_us":10,
         "private":SECRET,"phases":[
-            {"name":"launcher.artifact_prepare","start_us":10,"end_us":30000000,"subject":SECRET},
-            {"name":"/private/native/path","start_us":0,"end_us":35000000}
+            {"name":"launcher.artifact_prepare","start_us":10,"end_us":30_000_000,"subject":SECRET},
+            {"name":"/private/native/path","start_us":0,"end_us":35_000_000}
         ]
     })).unwrap()).unwrap();
     let summary = startup_phase_summary(root.path());
     assert_eq!(summary[0]["phases"][0]["name"], "launcher.artifact_prepare");
-    assert_eq!(summary[0]["phases"][0]["duration_us"], 29999990);
+    assert_eq!(summary[0]["phases"][0]["duration_us"], 29_999_990);
     let encoded = serde_json::to_string(&summary).unwrap();
     assert!(!encoded.contains(SECRET));
     assert!(!encoded.contains("/private/native/path"));
@@ -230,7 +230,7 @@ impl Cli {
         let mut source = source.to_owned();
         if scenario == "terminal_auth" {
             source = source.replace(
-                "VERSION = \"bcode-offline-claude-fixture 1.0.0\"",
+                "VERSION = \"2.1.308 (Claude Code)\"",
                 "VERSION = \"2.1.308\"",
             );
             // Controls exist only in this generated offline executable. They neither alter
@@ -259,7 +259,7 @@ impl Cli {
             .replace("@EXECUTABLE@", &quoted(&executable))
             .replace("@NAMESPACE@", &quoted(&native));
         if scenario == "terminal_auth" {
-            settings = settings.replace("bcode-offline-claude-fixture 1.0.0", "2.1.308");
+            settings = settings.replace("2.1.308 (Claude Code)", "2.1.308");
         }
         if scenario == "multi_turn" {
             // Matches the configuration native setup generates by default.
@@ -293,6 +293,7 @@ impl Cli {
         self.run_program(config, args, None)
     }
 
+    #[allow(clippy::too_many_lines)] // One bounded process lifecycle with its timing probes.
     fn run_program(&self, config: &Path, args: &[&str], wrapper: Option<&Path>) -> Reply {
         let mut out = tempfile::tempfile().unwrap();
         let mut err = tempfile::tempfile().unwrap();
@@ -336,8 +337,7 @@ impl Cli {
             if measures_prepare
                 && initialized_at.is_none()
                 && std::fs::read_to_string(&phase_path)
-                    .ok()
-                    .is_some_and(|phase| Some(phase) != initial_phase)
+                    .is_ok_and(|phase| Some(phase) != initial_phase)
             {
                 initialized_at = Some(Instant::now());
             }
@@ -391,7 +391,8 @@ impl Cli {
         let mut stderr = String::new();
         out.take(BUDGET + 1).read_to_string(&mut stdout).unwrap();
         err.take(BUDGET + 1).read_to_string(&mut stderr).unwrap();
-        assert!(stdout.len() <= BUDGET as usize && stderr.len() <= BUDGET as usize);
+        let budget = usize::try_from(BUDGET).unwrap();
+        assert!(stdout.len() <= budget && stderr.len() <= budget);
         if args.starts_with(&["server", "start"]) {
             eprintln!(
                 "isolated server startup phases={}",
@@ -415,7 +416,7 @@ impl Cli {
             "open" => Some("/request/open_id"),
             "submit" => Some("/request/submission/submission_id"),
             "respond" => Some("/request/response/response_id"),
-            "interrupt" | "close" => Some("/request/mutation_id"),
+            "interrupt" | "close" | "configure" => Some("/request/mutation_id"),
             _ => None,
         };
         let request_id = mutation_pointer.map_or_else(
@@ -427,13 +428,13 @@ impl Cli {
                     .to_owned()
             },
         );
-        let call = json!({"session_id":target,"parent_session_id":parent,
+        let mut call = json!({"session_id":target,"parent_session_id":parent,
             "assistance_destination_session_id":null,
             "harness":{"schema_version":1,"request_id":request_id,
-                "instance":self.instance,"kind":kind}});
+                "instance":self.instance,"kind":null}});
+        call["harness"]["kind"] = kind;
         // Distinct request files let concurrent CLI calls run against one daemon.
-        static REQUESTS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
-        let sequence = REQUESTS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let sequence = REQUEST_FILES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let path = self.root.path().join(format!("request-{sequence}.json"));
         std::fs::write(&path, serde_json::to_vec(&call).unwrap()).unwrap();
         self.run(
@@ -452,10 +453,9 @@ impl Cli {
         ] {
             if let Ok(raw) =
                 std::fs::read_to_string(self.native.join(format!("{label}.monotonic_ns")))
+                && let Ok(timestamp) = raw.parse::<u64>()
             {
-                if let Ok(timestamp) = raw.parse::<u64>() {
-                    values.insert(label.into(), json!(timestamp));
-                }
+                values.insert(label.into(), json!(timestamp));
             }
         }
         Value::Object(values)
@@ -624,7 +624,11 @@ impl Cli {
                         for field in ["session_id", "instance_id", "generation", "native_version"] {
                             assert_eq!(binding[field], prepared["session"][field]);
                         }
-                        assert!(!binding["native_session_id"].as_str().unwrap().is_empty());
+                        assert!(
+                            binding["native_session_id"]
+                                .as_str()
+                                .is_some_and(|id| !id.is_empty())
+                        );
                         if let Some(requested) =
                             prepared["session"]["requested_native_session_id"].as_str()
                         {
@@ -647,10 +651,10 @@ impl Cli {
             // Retain this page's successor even when returning immediately:
             // future live observations must not replay an earlier predecessor.
             after = page["next_after"].as_str().map(str::to_owned);
-            if target["state"] == "confirmed" {
-                if let Some(question) = question.take() {
-                    return (target, question, after);
-                }
+            if target["state"] == "confirmed"
+                && let Some(question) = question.take()
+            {
+                return (target, question, after);
             }
             assert!(
                 Instant::now() < deadline,
@@ -702,6 +706,60 @@ impl Cli {
         );
     }
 
+    fn configure(&self, target: &Value, mutation_id: &str, setting: &Value) -> Reply {
+        self.call(
+            "configure",
+            json!({"operation":"configure","request":{
+                "target":target,"mutation_id":mutation_id,"setting":setting}}),
+            target["session"]["session_id"].as_str().unwrap(),
+            None,
+        )
+    }
+
+    /// First turn on a fresh multi-turn session, returning the confirmed target and cursor.
+    fn confirmed_first_turn(&self) -> (Value, Option<String>) {
+        let prepared = self.open(SESSION, None);
+        let first = self.send_turn(
+            &prepared,
+            "turn-1",
+            "submit-1",
+            "55555555-5555-4555-8555-000000000001",
+        );
+        assert_eq!(
+            first.value["kind"]["kind"], "receipt",
+            "first send: {}",
+            first.value
+        );
+        let (confirmed, after) = self.await_terminal(&prepared, None, "submit-1");
+        assert_eq!(confirmed["state"], "confirmed");
+        (confirmed, after)
+    }
+
+    /// Request an ordinary (non-forced) daemon stop and wait until the exact daemon exited,
+    /// so its shutdown cleanup and execution lifetime release are complete.
+    fn graceful_stop(&self) {
+        let records = bcode_daemon_lifecycle::read_records(&self.root.path().join("state"));
+        assert!(!records.is_empty(), "a running daemon must be registered");
+        let reply = self.run(&self.config, &["server", "stop"]);
+        assert!(reply.ok, "graceful daemon stop failed: {}", reply.output);
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(60);
+        for (_, record) in records {
+            while runtime.block_on(bcode_daemon_lifecycle::classify_daemon_record(&record))
+                != bcode_daemon_lifecycle::DaemonRecordClassification::UnreachableStale
+            {
+                assert!(
+                    Instant::now() < deadline,
+                    "daemon did not exit after graceful stop"
+                );
+                std::thread::sleep(Duration::from_millis(50));
+            }
+        }
+    }
+
     fn reconcile(&self, target: &Value) -> Reply {
         let binding = if target["state"] == "confirmed" {
             target["session"].clone()
@@ -737,7 +795,7 @@ impl Drop for Cli {
             match child.try_wait() {
                 Ok(Some(_)) => return,
                 Ok(None) if Instant::now() < deadline => {
-                    std::thread::sleep(Duration::from_millis(10))
+                    std::thread::sleep(Duration::from_millis(10));
                 }
                 _ => {
                     let _ = child.kill();
@@ -749,11 +807,13 @@ impl Drop for Cli {
     }
 }
 
+static REQUEST_FILES: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
 fn record_test_artifact(root: &Path) {
     use sha2::Digest as _;
     let mut source = std::fs::File::open(env!("CARGO_BIN_EXE_bcode")).unwrap();
     let mut hash = sha2::Sha256::new();
-    let mut buffer = [0_u8; 65_536];
+    let mut buffer = vec![0_u8; 65_536];
     loop {
         let n = source.read(&mut buffer).unwrap();
         if n == 0 {
@@ -769,6 +829,7 @@ fn record_test_artifact(root: &Path) {
 }
 
 #[test]
+#[allow(clippy::too_many_lines)] // One ordered journey; splitting it would hide the sequence.
 fn managed_start_respond_stale_cancel_and_offline_bounded_history() {
     let cli = Cli::new("question");
     let binding = cli.open(SESSION, None);
@@ -891,6 +952,7 @@ fn managed_start_respond_stale_cancel_and_offline_bounded_history() {
 
 #[test]
 fn default_setup_configuration_admits_sequential_foreground_turns() {
+    const HOLD_MILLIS: u32 = 25_000;
     let cli = Cli::new("multi_turn");
     let prepared = cli.open(SESSION, None);
     let first = cli.send_turn(
@@ -924,7 +986,6 @@ fn default_setup_configuration_admits_sequential_foreground_turns() {
     }
     // A held observation waits for native output without blocking submission: the next
     // turn is admitted while it is held, and its output releases the page before the wait ends.
-    const HOLD_MILLIS: u32 = 25_000;
     let (held, elapsed) = std::thread::scope(|scope| {
         let observer = scope.spawn(|| {
             let started = Instant::now();
@@ -968,6 +1029,235 @@ fn default_setup_configuration_admits_sequential_foreground_turns() {
     }
     assert!(cli.native.join("turn-3.effect").exists());
     assert!(!cli.native.join("unexpected-user.rejected").exists());
+    cli.stop();
+}
+
+#[test]
+fn clean_daemon_restart_recovers_released_session_and_admits_next_turn() {
+    let cli = Cli::new("multi_turn");
+    let (confirmed, _) = cli.confirmed_first_turn();
+    // A clean stop closes the native transport and retains exact release evidence.
+    cli.graceful_stop();
+    let restarted = cli.run(&cli.config, &["server", "start"]);
+    assert!(restarted.ok, "daemon restart failed: {}", restarted.output);
+    let recovered = cli.run(
+        &cli.config,
+        &[
+            "harness",
+            "recover",
+            SESSION,
+            "--instance",
+            "offline-claude",
+            "--generation",
+            "1",
+            "--recovery-id",
+            "recover-after-restart",
+        ],
+    );
+    assert!(
+        recovered.ok,
+        "explicit recovery must resume the released native session; value={} output={}",
+        recovered.value, recovered.output
+    );
+    assert_eq!(
+        recovered.value["kind"]["kind"], "opened",
+        "{}",
+        recovered.value
+    );
+    let binding = recovered.value["kind"]["response"].clone();
+    assert_eq!(binding["generation"], 2, "recovery fences a new generation");
+    assert_eq!(
+        binding["native_session_id"], confirmed["session"]["native_session_id"],
+        "recovery resumes the exact native conversation, never a new one"
+    );
+    assert!(
+        cli.native.join("launch-1").exists(),
+        "resume starts exactly one new native process"
+    );
+    assert!(
+        !cli.native.join("turn-1.duplicate").exists(),
+        "recovery never replays prior input"
+    );
+    let resumed = json!({"state":"confirmed","session":binding});
+    let reply = cli.send_turn(
+        &resumed,
+        "turn-2",
+        "submit-2",
+        "55555555-5555-4555-8555-000000000002",
+    );
+    assert_eq!(
+        reply.value["kind"]["kind"], "receipt",
+        "recovered session must admit the next turn; value={} output={}",
+        reply.value, reply.output
+    );
+    let _ = cli.await_terminal(&resumed, None, "submit-2");
+    assert!(cli.native.join("turn-2.effect").exists());
+    // The released generation can no longer deliver anything.
+    let stale = cli.send_turn(
+        &confirmed,
+        "turn-3",
+        "submit-3",
+        "55555555-5555-4555-8555-000000000003",
+    );
+    assert!(
+        !stale.ok,
+        "stale generation must be refused: {}",
+        stale.value
+    );
+    assert!(!cli.native.join("turn-3.effect").exists());
+    cli.stop();
+}
+
+#[test]
+fn mid_session_model_and_permission_mode_changes_are_acknowledged() {
+    let cli = Cli::new("multi_turn");
+    let (confirmed, after) = cli.confirmed_first_turn();
+    let model = cli.configure(
+        &confirmed,
+        "configure-model-1",
+        &json!({"kind":"model","model_id":"claude-fixture"}),
+    );
+    assert!(model.ok, "model switch failed: {}", model.output);
+    assert_eq!(
+        model.value["kind"],
+        json!({"kind":"acknowledged","response":{"mutation_id":"configure-model-1"}}),
+        "{}",
+        model.value
+    );
+    assert!(cli.native.join("set-model-claude-fixture.effect").exists());
+    let mode = cli.configure(
+        &confirmed,
+        "configure-mode-1",
+        &json!({"kind":"permission_mode","mode":"plan"}),
+    );
+    assert!(mode.ok, "permission mode change failed: {}", mode.output);
+    assert_eq!(
+        mode.value["kind"],
+        json!({"kind":"acknowledged","response":{"mutation_id":"configure-mode-1"}}),
+        "{}",
+        mode.value
+    );
+    assert!(cli.native.join("set-permission-mode-plan.effect").exists());
+    // An identical retry returns retained evidence without a second native effect.
+    let retry = cli.configure(
+        &confirmed,
+        "configure-model-1",
+        &json!({"kind":"model","model_id":"claude-fixture"}),
+    );
+    assert!(
+        retry.ok,
+        "retained configure retry failed: {}",
+        retry.output
+    );
+    assert_eq!(retry.value["kind"], model.value["kind"]);
+    assert!(
+        !cli.native
+            .join("set-model-claude-fixture.duplicate")
+            .exists()
+    );
+    // The session keeps working under the new settings.
+    let reply = cli.send_turn(
+        &confirmed,
+        "turn-2",
+        "submit-2",
+        "55555555-5555-4555-8555-000000000002",
+    );
+    assert_eq!(reply.value["kind"]["kind"], "receipt", "{}", reply.value);
+    let _ = cli.await_terminal(&confirmed, after, "submit-2");
+    cli.stop();
+}
+
+#[test]
+fn held_observation_returns_live_stream_before_durable_rich_turn() {
+    let cli = Cli::new("multi_turn");
+    std::fs::write(cli.native.join("rich-output"), "enabled").unwrap();
+    std::fs::write(cli.native.join("hold-stream"), "enabled").unwrap();
+    let prepared = cli.open(SESSION, None);
+    let first = cli.send_turn(
+        &prepared,
+        "turn-1",
+        "submit-1",
+        "55555555-5555-4555-8555-000000000001",
+    );
+    assert_eq!(first.value["kind"]["kind"], "receipt", "{}", first.value);
+    // The fixture holds after streaming deltas: only live text can describe the segment now.
+    let deadline = Instant::now() + Duration::from_secs(60);
+    let mut target = prepared;
+    let mut after: Option<String> = None;
+    let live = loop {
+        let page = cli.observe_waiting(&target, after.as_deref(), 5_000);
+        for item in page["observations"].as_array().unwrap() {
+            if item["kind"]["kind"] == "binding_confirmed" {
+                target = json!({"state":"confirmed","session":item["kind"]["binding"]});
+            }
+        }
+        after = page["next_after"].as_str().map(str::to_owned);
+        let updates = page["live"].as_array().cloned().unwrap_or_default();
+        if updates.iter().any(|update| update["stream"] == "text") {
+            break updates;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "a held page must carry the live text sidecar while the segment streams; last page={page}"
+        );
+    };
+    let text: String = live
+        .iter()
+        .filter(|update| update["stream"] == "text")
+        .map(|update| update["text"].as_str().unwrap())
+        .collect();
+    assert!(
+        !text.is_empty() && "Streaming reply turn-1".starts_with(&text),
+        "live text must be a contiguous prefix of the streamed segment: {text:?}"
+    );
+    assert!(
+        live.iter()
+            .filter(|update| update["stream"] == "text")
+            .all(|update| update["segment_id"]
+                .as_str()
+                .is_some_and(|id| !id.is_empty()))
+    );
+    std::fs::write(cli.native.join("release-stream"), "released").unwrap();
+    // Durable observations then finalize reasoning, the native tool, its result and usage.
+    let deadline = Instant::now() + Duration::from_secs(60);
+    let mut kinds = std::collections::BTreeSet::new();
+    let mut terminal = false;
+    while !terminal {
+        let page = cli.observe(&target, after.as_deref());
+        for item in page["observations"].as_array().unwrap() {
+            let kind = &item["kind"];
+            if kind["kind"] == "binding_confirmed" {
+                target = json!({"state":"confirmed","session":kind["binding"]});
+            }
+            kinds.insert(kind["kind"].as_str().unwrap_or_default().to_owned());
+            if kind["kind"] == "tool" {
+                assert!(
+                    kind["input_json"]
+                        .as_str()
+                        .is_some_and(|input| input.contains("/fixture/notes.txt")),
+                    "native tool input is retained for display: {kind}"
+                );
+            }
+            if kind["kind"] == "usage" {
+                assert_eq!(kind["input_tokens"], 12);
+                assert_eq!(kind["output_tokens"], 34);
+            }
+            terminal |= kind["kind"] == "execution"
+                && kind["event"]["event"] == "submission_terminal"
+                && kind["event"]["attempt"]["submission_id"] == "submit-1";
+        }
+        after = page["next_after"].as_str().map(str::to_owned);
+        assert!(
+            Instant::now() < deadline,
+            "rich turn must reach a terminal observation; kinds={kinds:?}"
+        );
+    }
+    for expected in ["reasoning", "tool", "tool_result", "usage", "text"] {
+        assert!(
+            kinds.contains(expected),
+            "durable {expected} observation missing; observed {kinds:?}"
+        );
+    }
     cli.stop();
 }
 
@@ -2124,4 +2414,364 @@ fn malformed_secret_bearing_auth_and_oversized_requests_fail_without_echo() {
         )
         .ok
     );
+}
+
+/// Observed durable kinds and live sidecar streams for one drained turn.
+#[derive(Default)]
+struct TurnEvidence {
+    kinds: std::collections::BTreeSet<String>,
+    live_streams: std::collections::BTreeSet<String>,
+    observations: Vec<Value>,
+    approvals: usize,
+}
+
+impl Cli {
+    /// Drain one turn to its terminal observation, approving native tool permission requests
+    /// through the canonical respond operation and collecting durable and live evidence.
+    fn drive_turn(
+        &self,
+        target: &mut Value,
+        after: &mut Option<String>,
+        submission_id: &str,
+        evidence: &mut TurnEvidence,
+    ) {
+        let deadline = Instant::now() + Duration::from_secs(90);
+        let mut answered = std::collections::BTreeSet::new();
+        loop {
+            let page = self.observe_waiting(target, after.as_deref(), 5_000);
+            for update in page["live"].as_array().into_iter().flatten() {
+                if let Some(stream) = update["stream"].as_str() {
+                    evidence.live_streams.insert(stream.to_owned());
+                }
+            }
+            let mut terminal = false;
+            for item in page["observations"].as_array().unwrap() {
+                let kind = &item["kind"];
+                evidence
+                    .kinds
+                    .insert(kind["kind"].as_str().unwrap_or_default().to_owned());
+                evidence.observations.push(item.clone());
+                match kind["kind"].as_str() {
+                    Some("binding_confirmed") => {
+                        *target = json!({"state":"confirmed","session":kind["binding"]});
+                    }
+                    Some("interaction")
+                        if kind["interaction"]["kind"] == "approval"
+                            && answered.insert(
+                                kind["interaction"]["request_id"]
+                                    .as_str()
+                                    .unwrap_or_default()
+                                    .to_owned(),
+                            ) =>
+                    {
+                        let interaction = &kind["interaction"];
+                        assert_eq!(interaction["tool_name"], "Read", "{interaction}");
+                        assert!(
+                            interaction["input_preview"]
+                                .as_str()
+                                .is_some_and(|preview| preview.contains("/fixture/notes.txt")),
+                            "approval carries the untrusted native input preview: {interaction}"
+                        );
+                        let response_id = format!("approve-{submission_id}");
+                        let approval = self.call(
+                            "respond",
+                            json!({"operation":"respond","request":{"target":target,
+                            "response":{"response_id":response_id,
+                                "request_id":interaction["request_id"],
+                                "session_id":interaction["session_id"],
+                                "generation":interaction["generation"],
+                                "value":{"kind":"approval","approved":true}}}}),
+                            target["session"]["session_id"].as_str().unwrap(),
+                            None,
+                        );
+                        assert_eq!(
+                            approval.value["kind"]["kind"], "acknowledged",
+                            "approval must be acknowledged; value={} output={}",
+                            approval.value, approval.output
+                        );
+                        evidence.approvals += 1;
+                    }
+                    Some("execution")
+                        if kind["event"]["event"] == "submission_terminal"
+                            && kind["event"]["attempt"]["submission_id"] == submission_id =>
+                    {
+                        terminal = true;
+                    }
+                    _ => {}
+                }
+            }
+            *after = page["next_after"].as_str().map(str::to_owned);
+            if terminal {
+                return;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "{submission_id} must reach a terminal observation; kinds={:?} last page={page}",
+                evidence.kinds
+            );
+        }
+    }
+}
+
+/// North star: a native Claude Code conversation behaves like a Bcode session end to end.
+///
+/// Uses the default setup-generated configuration (unverified session state) against the
+/// real CLI, daemon and bundled plugin with the offline fake `claude`.
+#[test]
+#[allow(clippy::too_many_lines)] // One ordered journey; splitting it would hide the sequence.
+fn native_claude_conversation_streams_approves_configures_and_resumes_after_restart() {
+    const HOLD_MILLIS: u32 = 25_000;
+    let cli = Cli::new("multi_turn");
+    for oracle in [
+        "rich-output",
+        "gate-stream",
+        "hold-stream",
+        "approve-turn-1",
+    ] {
+        std::fs::write(cli.native.join(oracle), "enabled").unwrap();
+    }
+    let prepared = cli.open(SESSION, None);
+    let first = cli.send_turn(
+        &prepared,
+        "turn-1",
+        "submit-1",
+        "55555555-5555-4555-8555-000000000001",
+    );
+    assert_eq!(first.value["kind"]["kind"], "receipt", "{}", first.value);
+
+    // Turn 1, streaming phase. Drain durable lifecycle evidence while the fixture gates all
+    // turn output, so the next held observation is genuinely waiting for native output.
+    let mut target = prepared;
+    let mut after: Option<String> = None;
+    let mut turn1 = TurnEvidence::default();
+    let record = |page: &Value, target: &mut Value, evidence: &mut TurnEvidence| {
+        for item in page["observations"].as_array().unwrap() {
+            let kind = &item["kind"];
+            evidence
+                .kinds
+                .insert(kind["kind"].as_str().unwrap_or_default().to_owned());
+            evidence.observations.push(item.clone());
+            if kind["kind"] == "binding_confirmed" {
+                *target = json!({"state":"confirmed","session":kind["binding"]});
+            }
+        }
+    };
+    let deadline = Instant::now() + Duration::from_secs(60);
+    loop {
+        let page = cli.observe(&target, after.as_deref());
+        record(&page, &mut target, &mut turn1);
+        after = page["next_after"].as_str().map(str::to_owned);
+        if target["state"] == "confirmed"
+            && cli.native.join("stream-gated.monotonic_ns").exists()
+            && page["observations"].as_array().is_some_and(Vec::is_empty)
+        {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "first turn must confirm identity and reach the stream gate; last page={page}"
+        );
+    }
+    // A held observation is released by the first live native delta, before its deadline,
+    // and carries the transient live text sidecar while nothing durable describes it yet.
+    let mut gate_opened = false;
+    let live_text = loop {
+        let (page, elapsed) = std::thread::scope(|scope| {
+            let observer = scope.spawn(|| {
+                let started = Instant::now();
+                let page = cli.observe_waiting(&target, after.as_deref(), HOLD_MILLIS);
+                (page, started.elapsed())
+            });
+            if !gate_opened {
+                std::thread::sleep(Duration::from_secs(8));
+                std::fs::write(cli.native.join("open-stream"), "opened").unwrap();
+                gate_opened = true;
+            }
+            observer.join().unwrap()
+        });
+        record(&page, &mut target, &mut turn1);
+        after = page["next_after"].as_str().map(str::to_owned);
+        let text: String = page["live"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter(|update| update["stream"] == "text")
+            .filter_map(|update| update["text"].as_str())
+            .collect();
+        if !text.is_empty() {
+            assert!(
+                elapsed < Duration::from_millis(u64::from(HOLD_MILLIS)),
+                "live output must release the held page before its deadline ({elapsed:?})"
+            );
+            break text;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "held page must carry live text while the segment streams; last page={page}"
+        );
+    };
+    assert!(
+        "Streaming reply turn-1".starts_with(&live_text),
+        "live text is a contiguous prefix of the streamed segment: {live_text:?}"
+    );
+    assert!(
+        !turn1.kinds.contains("text"),
+        "no durable text exists while the segment is held"
+    );
+    std::fs::write(cli.native.join("release-stream"), "released").unwrap();
+
+    // Turn 1, durable phase: native tool permission is answered through the canonical
+    // respond path; the tool then produces its result and the turn reports usage.
+    cli.drive_turn(&mut target, &mut after, "submit-1", &mut turn1);
+    assert_eq!(target["state"], "confirmed", "first turn confirms identity");
+    assert_eq!(turn1.approvals, 1, "exactly one native permission request");
+    assert!(cli.native.join("approved-turn-1.effect").exists());
+    assert!(!cli.native.join("approved-turn-1.duplicate").exists());
+    for expected in [
+        "interaction",
+        "reasoning",
+        "text",
+        "tool",
+        "tool_result",
+        "usage",
+    ] {
+        assert!(
+            turn1.kinds.contains(expected),
+            "durable {expected} observation missing; observed {:?}",
+            turn1.kinds
+        );
+    }
+    let observations = &turn1.observations;
+    let durable = |kind: &'static str| {
+        observations
+            .iter()
+            .map(|item| &item["kind"])
+            .filter(move |item| item["kind"] == kind)
+    };
+    assert!(
+        durable("text").any(|item| item["text"] == "Streaming reply turn-1"),
+        "durable text finalizes the streamed segment"
+    );
+    assert!(durable("reasoning").any(|item| item["text"] == "Considering turn-1"));
+    assert!(durable("tool").any(|item| {
+        item["native_tool_id"] == "toolu_fixture_turn-1"
+            && item["name"] == "Read"
+            && item["input_json"]
+                .as_str()
+                .is_some_and(|input| input.contains("/fixture/notes.txt"))
+    }));
+    assert!(
+        durable("tool_result").any(|item| item["native_tool_id"] == "toolu_fixture_turn-1"
+            && item["output"] == "fixture notes"
+            && item["is_error"] == false)
+    );
+    assert!(durable("usage").any(|item| item["input_tokens"] == 12
+        && item["output_tokens"] == 34
+        && item["cache_read_input_tokens"] == 5
+        && item["cache_creation_input_tokens"] == 6));
+
+    // Turn 2 on the same live native process, without approval.
+    let second = cli.send_turn(
+        &target,
+        "turn-2",
+        "submit-2",
+        "55555555-5555-4555-8555-000000000002",
+    );
+    assert_eq!(second.value["kind"]["kind"], "receipt", "{}", second.value);
+    let mut turn2 = TurnEvidence::default();
+    cli.drive_turn(&mut target, &mut after, "submit-2", &mut turn2);
+    assert_eq!(turn2.approvals, 0);
+    assert!(turn2.kinds.contains("text") && turn2.kinds.contains("tool_result"));
+
+    // Model switch and plan mode are acknowledged native effects.
+    for (mutation, setting, oracle) in [
+        (
+            "configure-model-1",
+            json!({"kind":"model","model_id":"claude-fixture"}),
+            "set-model-claude-fixture.effect",
+        ),
+        (
+            "configure-mode-1",
+            json!({"kind":"permission_mode","mode":"plan"}),
+            "set-permission-mode-plan.effect",
+        ),
+    ] {
+        let reply = cli.configure(&target, mutation, &setting);
+        assert_eq!(
+            reply.value["kind"],
+            json!({"kind":"acknowledged","response":{"mutation_id":mutation}}),
+            "value={} output={}",
+            reply.value,
+            reply.output
+        );
+        assert!(cli.native.join(oracle).exists());
+    }
+
+    // Quit and reopen: the daemon stops, recovery resumes the exact native conversation.
+    cli.graceful_stop();
+    let restarted = cli.run(&cli.config, &["server", "start"]);
+    assert!(restarted.ok, "daemon restart failed: {}", restarted.output);
+    let recovered = cli.run(
+        &cli.config,
+        &[
+            "harness",
+            "recover",
+            SESSION,
+            "--instance",
+            "offline-claude",
+            "--generation",
+            "1",
+            "--recovery-id",
+            "recover-north-star",
+        ],
+    );
+    assert_eq!(
+        recovered.value["kind"]["kind"], "opened",
+        "value={} output={}",
+        recovered.value, recovered.output
+    );
+    let binding = recovered.value["kind"]["response"].clone();
+    assert_eq!(binding["generation"], 2);
+    assert_eq!(
+        binding["native_session_id"], target["session"]["native_session_id"],
+        "recovery resumes the exact native conversation"
+    );
+    assert!(cli.native.join("launch-1").exists());
+    assert!(!cli.native.join("launch-2").exists());
+    let mut resumed = json!({"state":"confirmed","session":binding});
+    let third = cli.send_turn(
+        &resumed,
+        "turn-3",
+        "submit-3",
+        "55555555-5555-4555-8555-000000000003",
+    );
+    assert_eq!(
+        third.value["kind"]["kind"], "receipt",
+        "value={} output={}",
+        third.value, third.output
+    );
+    let mut resumed_after = None;
+    let mut turn3 = TurnEvidence::default();
+    cli.drive_turn(&mut resumed, &mut resumed_after, "submit-3", &mut turn3);
+    assert!(turn3.kinds.contains("text"), "{:?}", turn3.kinds);
+    assert!(
+        turn3
+            .observations
+            .iter()
+            .any(|item| item["kind"]["kind"] == "text" && item["kind"]["text"] == "reply turn-3")
+    );
+    // Host-tool bridge telemetry is retained vendor evidence, never a user-facing diagnostic.
+    for evidence in [&turn1, &turn2, &turn3] {
+        assert!(
+            !evidence.kinds.contains("diagnostic"),
+            "routine native turns emit no diagnostic notices: {:?}",
+            evidence.kinds
+        );
+    }
+    for turn in 1..=3 {
+        assert!(cli.native.join(format!("turn-{turn}.effect")).exists());
+        assert!(!cli.native.join(format!("turn-{turn}.duplicate")).exists());
+    }
+    assert!(!cli.native.join("unexpected-user.rejected").exists());
+    cli.stop();
 }

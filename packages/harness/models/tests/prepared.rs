@@ -284,6 +284,7 @@ fn confirmation_is_fenced_to_exact_prepared_selection_and_native_evidence() {
     let response = reply(
         HarnessOperation::Observe,
         HarnessServiceResponseKind::Observations(HarnessObservationPage {
+            live: Vec::new(),
             retention: None,
             hydration_requests: Vec::new(),
             inventory_page: None,

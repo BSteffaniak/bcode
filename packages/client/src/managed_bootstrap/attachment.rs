@@ -1,8 +1,9 @@
 //! Session-bound managed attachment. All reads and mutations delegate to existing application paths.
 use crate::{AttachedSessionHistory, ClientConnection, ClientError, ClientSessionObservation};
 use bcode_harness_models::{
-    HARNESS_SCHEMA_VERSION, HarnessControlRequest, HarnessRequest, HarnessRequestKind,
-    HarnessResponseValue, HarnessServiceResponse,
+    HARNESS_SCHEMA_VERSION, HarnessConfigureRequest, HarnessControlRequest, HarnessRequest,
+    HarnessRequestKind, HarnessResponseValue, HarnessServiceResponse, HarnessServiceResponseKind,
+    HarnessSessionSetting,
 };
 use bcode_ipc::harness::{
     ManagedSessionCall, ManagedSessionHistoryRequest, ManagedSessionOperation,
@@ -210,6 +211,21 @@ impl ManagedSessionCommandHandle {
             .ok_or_else(invalid)?;
         verify_binding(self.session_id, &snapshot)?;
         Ok(snapshot)
+    }
+
+    /// Host client for allow-listed host operations of a managed conversation (catalog,
+    /// search, rename, timeline and similar daemon reads), sharing this handle's configuration
+    /// with model credential materialization deferred. It requires an already running daemon.
+    ///
+    /// Managed submission, interruption, responses and configuration must still go through
+    /// this handle, whose methods carry managed admission; the host client grants no native
+    /// authority.
+    #[must_use]
+    pub fn host_client(&self) -> crate::BcodeClient {
+        self.client
+            .inner
+            .clone()
+            .with_daemon_availability(crate::DaemonAvailability::RequireRunning)
     }
 }
 
@@ -597,6 +613,80 @@ impl ManagedSessionCommandHandle {
                 },
             )
             .await
+    }
+
+    /// Change one native session setting (model or permission mode) mid-session.
+    ///
+    /// Uses an explicit retained mutation identity under the expected generation. An
+    /// acknowledgement is not proof the native setting took effect, and an ambiguous outcome
+    /// must not be replayed automatically.
+    /// # Errors
+    /// Rejects stale canonical targets; delegates capability, authorization and effects to
+    /// managed admission (which reports `Failure(Unsupported)` when the plugin lacks support).
+    pub async fn managed_session_configure(
+        &self,
+        generation: u64,
+        mutation_id: String,
+        setting: HarnessSessionSetting,
+    ) -> Result<HarnessServiceResponse, ClientError> {
+        let snapshot = self.binding().await?;
+        snapshot
+            .target
+            .validate_owner(&self.session_id.to_string(), generation)
+            .map_err(|_| invalid())?;
+        self.client
+            .inner
+            .managed_session_call(
+                ManagedSessionOperation::Configure,
+                ManagedSessionCall {
+                    session_id: Some(self.session_id),
+                    harness: HarnessRequest {
+                        schema_version: HARNESS_SCHEMA_VERSION,
+                        request_id: mutation_id.clone(),
+                        instance: snapshot.instance,
+                        kind: HarnessRequestKind::Configure(HarnessConfigureRequest {
+                            target: snapshot.target,
+                            mutation_id,
+                            setting,
+                        }),
+                    },
+                    parent_session_id: None,
+                    assistance_destination_session_id: None,
+                },
+            )
+            .await
+    }
+
+    /// Recover this managed session after daemon loss and return the new ownership generation.
+    ///
+    /// `expected_generation` is the generation the caller last observed; `recovery_id` is a
+    /// fresh retained identity. Prior submissions are never replayed.
+    /// # Errors
+    /// Returns binding/transport failures, daemon refusal (including unpublished recovery or
+    /// a native `Failure`), and responses lacking a confirmed newer binding.
+    pub async fn recover(
+        &self,
+        expected_generation: u64,
+        recovery_id: String,
+    ) -> Result<u64, ClientError> {
+        let snapshot = self.binding().await?;
+        let response = self
+            .client
+            .inner
+            .managed_session_recover(bcode_ipc::harness::ManagedSessionRecoveryRequest {
+                session_id: self.session_id,
+                instance_id: snapshot.instance.instance_id,
+                expected_generation,
+                recovery_id,
+            })
+            .await?;
+        match response.kind {
+            HarnessServiceResponseKind::Opened(binding) => Ok(binding.generation),
+            HarnessServiceResponseKind::Failure(failure) => Err(ClientError::Protocol(format!(
+                "managed recovery failed: {failure:?}"
+            ))),
+            _ => Err(invalid()),
+        }
     }
 }
 

@@ -96,13 +96,28 @@ pub enum ExternalActionKind {
     Reconcile,
 }
 
+/// Semantic interaction family, independent of renderer-specific dialogs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ExternalInteractionKind {
+    /// Native approval decision; never runs the tool in Bcode.
+    Approval,
+    /// Native question with optional choices.
+    Question,
+    /// Native request for parent assistance.
+    Assistance,
+}
+
 /// Generic question/approval/assistance presentation.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ExternalInteractionView {
     /// Native request correlation scoped by provenance and generation.
     pub request_id: String,
     /// Canonical source; parentage or display routing grants no response authority.
+    /// `provenance.generation` is the ownership generation a response must target.
     pub provenance: ExternalProvenanceView,
+    /// Semantic interaction family used to choose a native dialog.
+    pub interaction_kind: ExternalInteractionKind,
     /// Normalized interaction kind label.
     pub kind: String,
     /// Secret-safe prompt; authentication secrets never belong here.
@@ -111,6 +126,12 @@ pub struct ExternalInteractionView {
     pub scope: String,
     /// Stable choice identities and labels, in producer order.
     pub choices: Vec<ExternalChoiceView>,
+    /// Native tool named by the request, for display only.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool_name: Option<String>,
+    /// Bounded untrusted preview of the native tool input, for display only.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub input_preview: Option<String>,
     /// Response capability and freshness presentation.
     pub response: ExternalActionView,
 }

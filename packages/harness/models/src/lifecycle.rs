@@ -1,7 +1,7 @@
 //! Portable harness identities, capabilities and semantic observations.
 use crate::{
-    HARNESS_SCHEMA_VERSION, HarnessContractError, MAX_HARNESS_ITEMS, MAX_HARNESS_VENDOR_BYTES, id,
-    text, wire,
+    HARNESS_SCHEMA_VERSION, HarnessContractError, MAX_HARNESS_ITEMS, MAX_HARNESS_PREVIEW_BYTES,
+    MAX_HARNESS_TOOL_INPUT_BYTES, MAX_HARNESS_VENDOR_BYTES, bounded, id, text, wire,
 };
 use serde::{Deserialize, Serialize};
 
@@ -252,6 +252,27 @@ pub struct HarnessCapability {
     pub constraints: Vec<String>,
 }
 impl HarnessCapability {
+    /// Explicitly unsupported capability with no constraints.
+    ///
+    /// Used as the serde default for capabilities added after a plugin was built, so an
+    /// older inspection never advertises a newer control surface.
+    #[must_use]
+    pub const fn unsupported() -> Self {
+        Self {
+            support: HarnessSupportLevel::Unsupported,
+            constraints: Vec::new(),
+        }
+    }
+
+    /// Whether this is exactly the [`Self::unsupported`] default.
+    ///
+    /// Later-added capabilities skip serialization in this state so previously retained
+    /// capability payloads round-trip byte-for-byte.
+    #[must_use]
+    pub fn is_unsupported_default(&self) -> bool {
+        self.support == HarnessSupportLevel::Unsupported && self.constraints.is_empty()
+    }
+
     fn validate(&self) -> Result<(), HarnessContractError> {
         if self.constraints.len() > MAX_HARNESS_ITEMS {
             return Err(HarnessContractError::BoundsExceeded);
@@ -277,6 +298,18 @@ pub struct HarnessCapabilities {
     pub authoritative_settlement: HarnessCapability,
     pub background_continuation: HarnessCapability,
     pub authentication: HarnessCapability,
+    /// Mid-session native model switching through `HarnessRequestKind::Configure`.
+    #[serde(
+        default = "HarnessCapability::unsupported",
+        skip_serializing_if = "HarnessCapability::is_unsupported_default"
+    )]
+    pub model_switch: HarnessCapability,
+    /// Mid-session native permission-mode changes through `HarnessRequestKind::Configure`.
+    #[serde(
+        default = "HarnessCapability::unsupported",
+        skip_serializing_if = "HarnessCapability::is_unsupported_default"
+    )]
+    pub permission_mode: HarnessCapability,
 }
 impl HarnessCapabilities {
     /// Validate bounded capability descriptions.
@@ -293,6 +326,8 @@ impl HarnessCapabilities {
             &self.authoritative_settlement,
             &self.background_continuation,
             &self.authentication,
+            &self.model_switch,
+            &self.permission_mode,
         ] {
             value.validate()?;
         }
@@ -436,6 +471,14 @@ pub struct HarnessInteraction {
     /// Human-readable requested scope; grants no authority.
     pub scope: String,
     pub choices: Vec<HarnessChoice>,
+    /// Native tool the request concerns, when the native protocol names one.
+    ///
+    /// Display-only correlation; it never dispatches or authorizes a Bcode tool.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool_name: Option<String>,
+    /// Bounded, untrusted preview of the native tool input for presentation only.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub input_preview: Option<String>,
 }
 impl HarnessInteraction {
     /// Validate bounded interaction shape, including unique choices.
@@ -448,6 +491,12 @@ impl HarnessInteraction {
         text(&self.scope)?;
         if self.generation == 0 {
             return Err(HarnessContractError::InvalidShape);
+        }
+        if let Some(name) = &self.tool_name {
+            id(name)?;
+        }
+        if let Some(preview) = &self.input_preview {
+            bounded(preview, MAX_HARNESS_PREVIEW_BYTES)?;
         }
         if self.choices.len() > MAX_HARNESS_ITEMS {
             return Err(HarnessContractError::BoundsExceeded);
@@ -584,13 +633,62 @@ pub enum HarnessObservationKind {
         open_id: String,
         binding: HarnessSessionBinding,
     },
+    /// Untrusted assistant display text.
+    ///
+    /// `segment_id` names the native assistant segment; when present, durable text and the
+    /// transient live sidecar map to the same item through [`crate::harness_stream_identity`].
     Text {
         text: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        segment_id: Option<String>,
     },
+    /// Observed native tool activity; never dispatched as a Bcode tool.
     Tool {
         native_tool_id: String,
         name: String,
         status: String,
+        /// Bounded compact JSON of the native tool input, for display only.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        input_json: Option<String>,
+    },
+    /// Untrusted native reasoning display text.
+    ///
+    /// `opaque` marks redacted/encrypted reasoning whose text is a placeholder rather than
+    /// readable content.
+    Reasoning {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        segment_id: Option<String>,
+        text: String,
+        opaque: bool,
+    },
+    /// Bounded, untrusted output reported by the native harness for an observed native tool.
+    ///
+    /// This is display evidence for the native tool identified by `native_tool_id`; it is
+    /// never a Bcode tool result and never enters Bcode tool dispatch.
+    ToolResult {
+        native_tool_id: String,
+        output: String,
+        is_error: bool,
+        /// The producer omitted part of the native output to respect bounds.
+        truncated: bool,
+    },
+    /// Native-reported usage for one native result, normalized to portable counters.
+    Usage {
+        input_tokens: u64,
+        output_tokens: u64,
+        cache_read_input_tokens: u64,
+        cache_creation_input_tokens: u64,
+        /// Native-reported cost attributable to this result, in millionths of a US dollar,
+        /// when reported. Producers whose native harness reports a running total convert it
+        /// to the increment, so consumers may add usage observations together.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        total_cost_micros: Option<u64>,
+        /// Native-reported wall duration, when reported.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        duration_ms: Option<u64>,
+        /// Native model identity the usage is attributed to, when reported.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        model: Option<String>,
     },
     Subagent {
         native_agent_id: String,
@@ -598,6 +696,13 @@ pub enum HarnessObservationKind {
     },
     Interaction {
         interaction: HarnessInteraction,
+    },
+    /// The native harness withdrew the outstanding interaction `request_id` (cancelled,
+    /// aborted with its turn, or lost with its connection). It can no longer be answered.
+    ///
+    /// This is neither an answer nor a Bcode decision; it only ends the pending prompt.
+    InteractionWithdrawn {
+        request_id: String,
     },
     Status {
         status: HarnessExecutionStatus,
@@ -680,17 +785,12 @@ impl HarnessObservation {
                 id(open_id)?;
                 binding.validate_owner(&self.session_id, self.generation)
             }
-            HarnessObservationKind::Text { text: value }
-            | HarnessObservationKind::Result { text: value } => text(value),
-            HarnessObservationKind::Tool {
-                native_tool_id,
-                name,
-                status,
-            } => {
-                id(native_tool_id)?;
-                text(name)?;
-                text(status)
-            }
+            HarnessObservationKind::Text { .. }
+            | HarnessObservationKind::Reasoning { .. }
+            | HarnessObservationKind::Tool { .. }
+            | HarnessObservationKind::ToolResult { .. }
+            | HarnessObservationKind::Usage { .. } => validate_display_kind(&self.kind),
+            HarnessObservationKind::Result { text: value } => text(value),
             HarnessObservationKind::Subagent {
                 native_agent_id,
                 status,
@@ -707,6 +807,7 @@ impl HarnessObservation {
                 }
                 Ok(())
             }
+            HarnessObservationKind::InteractionWithdrawn { request_id } => id(request_id),
             HarnessObservationKind::Status { .. } => Ok(()),
             HarnessObservationKind::Diagnostic { code, message } => {
                 id(code)?;
@@ -721,5 +822,51 @@ impl HarnessObservation {
                 wire(detail, MAX_HARNESS_VENDOR_BYTES)
             }
         }
+    }
+}
+
+/// Bounds for untrusted native display observations (text, reasoning, tools, usage).
+fn validate_display_kind(kind: &HarnessObservationKind) -> Result<(), HarnessContractError> {
+    match kind {
+        HarnessObservationKind::Text {
+            text: value,
+            segment_id,
+        }
+        | HarnessObservationKind::Reasoning {
+            text: value,
+            segment_id,
+            ..
+        } => {
+            if let Some(segment) = segment_id {
+                id(segment)?;
+            }
+            text(value)
+        }
+        HarnessObservationKind::Tool {
+            native_tool_id,
+            name,
+            status,
+            input_json,
+        } => {
+            id(native_tool_id)?;
+            text(name)?;
+            text(status)?;
+            if let Some(input) = input_json {
+                bounded(input, MAX_HARNESS_TOOL_INPUT_BYTES)?;
+                serde_json::from_str::<serde::de::IgnoredAny>(input)
+                    .map_err(|_| HarnessContractError::InvalidShape)?;
+            }
+            Ok(())
+        }
+        HarnessObservationKind::ToolResult {
+            native_tool_id,
+            output,
+            ..
+        } => {
+            id(native_tool_id)?;
+            text(output)
+        }
+        HarnessObservationKind::Usage { model, .. } => model.as_deref().map_or(Ok(()), id),
+        _ => Ok(()),
     }
 }

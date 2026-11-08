@@ -358,9 +358,9 @@ async fn recorded_selected_start(
 
 const fn require_selected_storage_contract() -> Result<(), ManagedHarnessError> {
     if bcode_session_models::CURRENT_SESSION_EVENT_SCHEMA_VERSION
-        != bcode_session_models::external_harness::SELECTED_OPEN_EVENT_SCHEMA_VERSION
+        < bcode_session_models::external_harness::SELECTED_OPEN_EVENT_SCHEMA_VERSION
         || bcode_session_models::CURRENT_SESSION_STORAGE_WRITER_EPOCH
-            != bcode_session_models::external_harness::SELECTED_OPEN_STORAGE_WRITER_EPOCH
+            < bcode_session_models::external_harness::SELECTED_OPEN_STORAGE_WRITER_EPOCH
     {
         return Err(ManagedHarnessError::Unsupported);
     }
@@ -459,8 +459,11 @@ mod tests {
     use super::*;
 
     #[test]
-    fn selected_launch_publication_cannot_enable_unpublished_recovery() {
-        assert!(!super::super::recovery_published());
+    fn recovery_publication_follows_canonical_recovery_storage() {
+        assert_eq!(
+            super::super::recovery_published(),
+            bcode_session_models::external_harness::recovery_storage_available()
+        );
     }
 
     #[tokio::test]
@@ -514,9 +517,9 @@ mod tests {
     #[tokio::test]
     async fn selected_start_cannot_fall_through_to_unselected_creation() {
         if bcode_session_models::CURRENT_SESSION_EVENT_SCHEMA_VERSION
-            == bcode_session_models::external_harness::SELECTED_OPEN_EVENT_SCHEMA_VERSION
+            >= bcode_session_models::external_harness::SELECTED_OPEN_EVENT_SCHEMA_VERSION
             && bcode_session_models::CURRENT_SESSION_STORAGE_WRITER_EPOCH
-                == bcode_session_models::external_harness::SELECTED_OPEN_STORAGE_WRITER_EPOCH
+                >= bcode_session_models::external_harness::SELECTED_OPEN_STORAGE_WRITER_EPOCH
         {
             return;
         }

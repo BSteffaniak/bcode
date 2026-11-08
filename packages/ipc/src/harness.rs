@@ -103,6 +103,89 @@ mod recovery_tests {
     }
 }
 
+#[cfg(test)]
+mod configure_tests {
+    use super::*;
+
+    fn call(mutation_id: &str, request_id: &str) -> ManagedSessionCall {
+        let session = bcode_session_models::SessionId::new();
+        let instance = bcode_harness_models::HarnessInstance {
+            instance_id: "configured".into(),
+            plugin_id: "native".into(),
+            executable: "/native".into(),
+            config_namespace: "/account".into(),
+            auth: bcode_harness_models::HarnessAuthBinding {
+                provider_id: "native-auth".into(),
+                profile: "account".into(),
+                credential_namespace: "/account".into(),
+                custody: bcode_harness_models::HarnessAuthCustody::NativeManaged,
+            },
+        };
+        ManagedSessionCall {
+            session_id: Some(session),
+            harness: HarnessRequest {
+                schema_version: bcode_harness_models::HARNESS_SCHEMA_VERSION,
+                request_id: request_id.into(),
+                instance,
+                kind: HarnessRequestKind::Configure(
+                    bcode_harness_models::HarnessConfigureRequest {
+                        target: bcode_harness_models::HarnessSessionTarget::Confirmed(
+                            bcode_harness_models::HarnessSessionBinding {
+                                schema_version: bcode_harness_models::HARNESS_SCHEMA_VERSION,
+                                session_id: session.to_string(),
+                                instance_id: "configured".into(),
+                                native_session_id: "native".into(),
+                                native_version: "1".into(),
+                                generation: 2,
+                            },
+                        ),
+                        mutation_id: mutation_id.into(),
+                        setting: bcode_harness_models::HarnessSessionSetting::Model {
+                            model_id: "model".into(),
+                        },
+                    },
+                ),
+            },
+            parent_session_id: None,
+            assistance_destination_session_id: None,
+        }
+    }
+
+    fn envelope(
+        operation: ManagedSessionOperation,
+        call: &ManagedSessionCall,
+    ) -> ManagedSessionRequest {
+        ManagedSessionRequest {
+            schema_version: MANAGED_SESSION_VERSION,
+            operation,
+            request_json: serde_json::to_string(call).unwrap(),
+        }
+    }
+
+    #[test]
+    fn configure_operation_requires_matching_family_and_mutation_correlation() {
+        assert_eq!(ManagedSessionOperation::Configure.as_str(), "configure");
+        assert!(!ManagedSessionOperation::Configure.is_auth());
+        let valid = call("configure-1", "configure-1");
+        assert!(
+            envelope(ManagedSessionOperation::Configure, &valid)
+                .decode_call()
+                .is_ok()
+        );
+        assert!(
+            envelope(ManagedSessionOperation::Interrupt, &valid)
+                .decode_call()
+                .is_err()
+        );
+        let mismatched = call("configure-1", "other");
+        assert!(
+            envelope(ManagedSessionOperation::Configure, &mismatched)
+                .decode_call()
+                .is_err()
+        );
+    }
+}
+
 /// Semantic application operations; correlation never conveys authority.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -138,6 +221,9 @@ pub enum ManagedSessionOperation {
     /// Attachment-owned daemon ingestion: drain once, then keep committing native pages
     /// while the attached client stays admitted. Uses the attachment poll request shape.
     Watch,
+    /// Mid-session native setting change (model or permission mode). Carries a
+    /// `HarnessRequestKind::Configure` call; the response is `Acknowledged` or `Failure`.
+    Configure,
 }
 impl ManagedSessionOperation {
     /// Stable interface operation.
@@ -157,6 +243,7 @@ impl ManagedSessionOperation {
             Self::Interrupt => "interrupt",
             Self::Observe => "observe",
             Self::Watch => "watch",
+            Self::Configure => "configure",
             Self::Close => "close",
             Self::Reconcile => "reconcile",
             Self::History => "history",
@@ -575,6 +662,10 @@ impl ManagedSessionRequest {
                     HarnessRequestKind::Interrupt(_)
                 )
                 | (
+                    ManagedSessionOperation::Configure,
+                    HarnessRequestKind::Configure(_)
+                )
+                | (
                     ManagedSessionOperation::Observe,
                     HarnessRequestKind::Observe(_)
                 )
@@ -596,6 +687,7 @@ impl ManagedSessionRequest {
             HarnessRequestKind::Interrupt(value) | HarnessRequestKind::Close(value) => {
                 Some(value.mutation_id.as_str())
             }
+            HarnessRequestKind::Configure(value) => Some(value.mutation_id.as_str()),
             _ => None,
         };
         if mutation_id.is_some_and(|id| id != call.harness.request_id) {

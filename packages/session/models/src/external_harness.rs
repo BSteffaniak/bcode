@@ -1,12 +1,13 @@
 //! Actor-owned managed harness operation records. Auth transport is deliberately unrepresentable.
 use crate::SessionId;
 use bcode_harness_models::{
-    HARNESS_SCHEMA_VERSION, HarnessCapabilities, HarnessControlRequest, HarnessFailure,
-    HarnessInstance, HarnessObservationPage, HarnessOpenRequest, HarnessOperation,
-    HarnessPreparedSession, HarnessReceipt, HarnessReconcileRequest, HarnessReconciliation,
-    HarnessRequest, HarnessRequestKind, HarnessResponse, HarnessServiceResponse,
-    HarnessServiceResponseKind, HarnessSessionBinding, HarnessSessionTarget, HarnessSubmission,
-    MAX_HARNESS_ID_BYTES, MAX_HARNESS_OBSERVATIONS, MAX_HARNESS_WIRE_BYTES,
+    HARNESS_SCHEMA_VERSION, HarnessCapabilities, HarnessConfigureRequest, HarnessControlRequest,
+    HarnessFailure, HarnessInstance, HarnessObservationKind, HarnessObservationPage,
+    HarnessOpenRequest, HarnessOperation, HarnessPreparedSession, HarnessReceipt,
+    HarnessReconcileRequest, HarnessReconciliation, HarnessRequest, HarnessRequestKind,
+    HarnessResponse, HarnessServiceResponse, HarnessServiceResponseKind, HarnessSessionBinding,
+    HarnessSessionTarget, HarnessSubmission, MAX_HARNESS_ID_BYTES, MAX_HARNESS_OBSERVATIONS,
+    MAX_HARNESS_WIRE_BYTES,
 };
 use serde::{Deserialize, Serialize};
 
@@ -34,16 +35,44 @@ impl ExternalHarnessOwner {
     }
 }
 
-/// Recovery storage is independently unpublished; later event schemas never enable it.
+/// Recovery storage (transport release and recovery intent records) is published.
+///
+/// Recovery records require the native-parity fence
+/// ([`NATIVE_PARITY_EVENT_SCHEMA_VERSION`] / [`NATIVE_PARITY_STORAGE_WRITER_EPOCH`]), so older
+/// writers can never observe or extend a released or recovered generation.
 #[must_use]
 pub const fn recovery_storage_available() -> bool {
-    false
+    true
 }
 
-/// Selected-open storage allocation, independent of unpublished recovery storage.
+/// First event schema that may carry selected-open operations.
 pub const SELECTED_OPEN_EVENT_SCHEMA_VERSION: u16 = 57;
-/// Old-writer fence required before selected-open operations may be written.
+/// First writer epoch that may write selected-open operations (old-writer fence).
 pub const SELECTED_OPEN_STORAGE_WRITER_EPOCH: u32 = 25;
+/// First event schema that may carry native-parity records.
+///
+/// These are reasoning, native tool-result and usage observations, text/tool/interaction display
+/// metadata, configuration requests, and (once published) recovery records.
+pub const NATIVE_PARITY_EVENT_SCHEMA_VERSION: u16 = 58;
+/// First writer epoch that may write native-parity records (old-writer fence).
+pub const NATIVE_PARITY_STORAGE_WRITER_EPOCH: u32 = 26;
+
+/// Whether one observation uses a representation introduced by the native-parity schema.
+#[must_use]
+pub const fn observation_requires_native_parity(kind: &HarnessObservationKind) -> bool {
+    match kind {
+        HarnessObservationKind::Reasoning { .. }
+        | HarnessObservationKind::ToolResult { .. }
+        | HarnessObservationKind::Usage { .. }
+        | HarnessObservationKind::InteractionWithdrawn { .. } => true,
+        HarnessObservationKind::Text { segment_id, .. } => segment_id.is_some(),
+        HarnessObservationKind::Tool { input_json, .. } => input_json.is_some(),
+        HarnessObservationKind::Interaction { interaction } => {
+            interaction.tool_name.is_some() || interaction.input_preview.is_some()
+        }
+        _ => false,
+    }
+}
 
 /// Exact extension envelope retained in configuration, claim and completion.
 #[derive(Debug, Serialize, Deserialize)]
@@ -118,6 +147,8 @@ pub enum ExternalHarnessRequestKind {
         response: HarnessResponse,
     },
     Interrupt(HarnessControlRequest),
+    /// Native-parity mid-session setting change (schema 58 / writer 26).
+    Configure(HarnessConfigureRequest),
     Close(HarnessControlRequest),
     Reconcile(HarnessReconcileRequest),
 }
@@ -194,6 +225,12 @@ impl ExternalHarnessRequest {
         matches!(self.kind, ExternalHarnessRequestKind::OpenSelected(_))
     }
 
+    /// Whether this request uses a family introduced by the native-parity schema.
+    #[must_use]
+    pub const fn requires_native_parity(&self) -> bool {
+        matches!(self.kind, ExternalHarnessRequestKind::Configure(_))
+    }
+
     /// Retain only supported non-auth operation families.
     /// # Errors
     /// Rejects malformed, read-only and authentication requests before persistence.
@@ -216,6 +253,7 @@ impl ExternalHarnessRequest {
                 }
             }
             HarnessRequestKind::Interrupt(v) => ExternalHarnessRequestKind::Interrupt(v.clone()),
+            HarnessRequestKind::Configure(v) => ExternalHarnessRequestKind::Configure(v.clone()),
             HarnessRequestKind::Close(v) => ExternalHarnessRequestKind::Close(v.clone()),
             HarnessRequestKind::Reconcile(v) => ExternalHarnessRequestKind::Reconcile(v.clone()),
             _ => return Err("operation cannot enter canonical mutation store".into()),
@@ -249,6 +287,7 @@ impl ExternalHarnessRequest {
                 }
             }
             ExternalHarnessRequestKind::Interrupt(v) => HarnessRequestKind::Interrupt(v.clone()),
+            ExternalHarnessRequestKind::Configure(v) => HarnessRequestKind::Configure(v.clone()),
             ExternalHarnessRequestKind::Close(v) => HarnessRequestKind::Close(v.clone()),
             ExternalHarnessRequestKind::Reconcile(v) => HarnessRequestKind::Reconcile(v.clone()),
         };
@@ -274,6 +313,9 @@ impl ExternalHarnessRequest {
                 (&response.session_id, response.generation)
             }
             ExternalHarnessRequestKind::Interrupt(v) | ExternalHarnessRequestKind::Close(v) => {
+                (v.target.session_id(), v.target.generation())
+            }
+            ExternalHarnessRequestKind::Configure(v) => {
                 (v.target.session_id(), v.target.generation())
             }
             ExternalHarnessRequestKind::Reconcile(v) => (&v.session_id, v.generation),
@@ -727,7 +769,8 @@ pub enum ExternalHarnessOperationRecord {
     },
     Configured {
         instance: HarnessInstance,
-        capabilities: HarnessCapabilities,
+        /// Boxed to keep the record enum compact; serialized transparently.
+        capabilities: Box<HarnessCapabilities>,
         open_request: Option<ExternalHarnessRequest>,
     },
     DeliveryClaimed {
@@ -782,36 +825,74 @@ impl ExternalHarnessOperation {
         }
     }
 
+    /// Whether this operation carries a representation introduced by the native-parity schema.
+    ///
+    /// Recovery records are included so that, once published, they inherit this fence.
+    #[must_use]
+    pub fn requires_native_parity(&self) -> bool {
+        match &self.record {
+            ExternalHarnessOperationRecord::TransportReleased { .. }
+            | ExternalHarnessOperationRecord::RecoveryPrepared { .. } => true,
+            ExternalHarnessOperationRecord::DeliveryClaimed { request }
+            | ExternalHarnessOperationRecord::DeliveryCompleted { request, .. } => {
+                request.requires_native_parity()
+            }
+            ExternalHarnessOperationRecord::Configured { .. } => false,
+            ExternalHarnessOperationRecord::ObservationPage { page, .. } => page
+                .observations
+                .iter()
+                .any(|observation| observation_requires_native_parity(&observation.kind)),
+        }
+    }
+
     /// Validate the event representation without inferring writer authority.
     /// # Errors
-    /// Rejects selected-open records outside their allocated event schema.
+    /// Rejects selected-open records before schema 57 and native-parity records before 58.
     pub fn validate_event_schema(&self, schema_version: u16) -> Result<(), String> {
         self.validate()?;
-        if self.is_selected_open() && schema_version != SELECTED_OPEN_EVENT_SCHEMA_VERSION {
+        if self.is_selected_open() && schema_version < SELECTED_OPEN_EVENT_SCHEMA_VERSION {
             return Err("selected-open event schema is unavailable".into());
+        }
+        if self.requires_native_parity() && schema_version < NATIVE_PARITY_EVENT_SCHEMA_VERSION {
+            return Err("native-parity event schema is unavailable".into());
         }
         Ok(())
     }
 
     /// Validate the independently allocated event and writer fence.
     /// # Errors
-    /// Rejects selected-open records outside schema57/writer25 and all recovery records.
+    /// Rejects selected-open records before schema57/writer25, native-parity records before
+    /// schema58/writer26, and all recovery records while recovery storage is unpublished.
     pub fn validate_storage(&self, schema_version: u16, writer_epoch: u32) -> Result<(), String> {
         self.validate()?;
         if self.is_selected_open()
-            && (schema_version != SELECTED_OPEN_EVENT_SCHEMA_VERSION
-                || writer_epoch != SELECTED_OPEN_STORAGE_WRITER_EPOCH)
+            && (schema_version < SELECTED_OPEN_EVENT_SCHEMA_VERSION
+                || writer_epoch < SELECTED_OPEN_STORAGE_WRITER_EPOCH)
         {
             return Err("selected-open storage fence is unavailable".into());
+        }
+        if self.requires_native_parity()
+            && (schema_version < NATIVE_PARITY_EVENT_SCHEMA_VERSION
+                || writer_epoch < NATIVE_PARITY_STORAGE_WRITER_EPOCH)
+        {
+            return Err("native-parity storage fence is unavailable".into());
         }
         Ok(())
     }
 
     fn validate_record(&self) -> Result<(), String> {
         match &self.record {
-            ExternalHarnessOperationRecord::TransportReleased { .. }
-            | ExternalHarnessOperationRecord::RecoveryPrepared { .. } => {
-                return Err("managed harness recovery storage is unpublished".into());
+            ExternalHarnessOperationRecord::TransportReleased { release } => {
+                if !recovery_storage_available() {
+                    return Err("managed harness recovery storage is unpublished".into());
+                }
+                release.validate_for(&self.owner)?;
+            }
+            ExternalHarnessOperationRecord::RecoveryPrepared { recovery } => {
+                if !recovery_storage_available() {
+                    return Err("managed harness recovery storage is unpublished".into());
+                }
+                recovery.validate_for(&self.owner)?;
             }
             ExternalHarnessOperationRecord::Configured {
                 instance,
@@ -861,6 +942,9 @@ impl ExternalHarnessOperation {
                 instance
                     .validate()
                     .map_err(|_| "invalid page instance".to_owned())?;
+                if !page.live.is_empty() {
+                    return Err("transient live sidecar must be stripped before commit".into());
+                }
                 HarnessServiceResponse {
                     schema_version: HARNESS_SCHEMA_VERSION,
                     request_id: "canonical-page".into(),
@@ -915,5 +999,190 @@ impl std::io::Write for Counter {
     }
     fn flush(&mut self) -> std::io::Result<()> {
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod native_parity_tests {
+    use super::*;
+    use bcode_harness_models::{
+        HarnessActivity, HarnessAttention, HarnessAuthBinding, HarnessAuthCustody,
+        HarnessCompleteness, HarnessConnectivity, HarnessContinuation, HarnessExecutionStatus,
+        HarnessLiveStream, HarnessLiveUpdate, HarnessObservation, HarnessPermissionMode,
+        HarnessSessionSetting,
+    };
+
+    fn owner() -> ExternalHarnessOwner {
+        ExternalHarnessOwner {
+            session_id: SessionId::new(),
+            generation: 3,
+            artifact_id: "artifact".into(),
+            daemon_id: "daemon".into(),
+        }
+    }
+
+    fn instance() -> HarnessInstance {
+        HarnessInstance {
+            instance_id: "instance".into(),
+            plugin_id: "plugin".into(),
+            executable: "/bin/native".into(),
+            config_namespace: "/config".into(),
+            auth: HarnessAuthBinding {
+                provider_id: "provider".into(),
+                profile: "profile".into(),
+                credential_namespace: "/config".into(),
+                custody: HarnessAuthCustody::NativeManaged,
+            },
+        }
+    }
+
+    fn target(owner: &ExternalHarnessOwner) -> HarnessSessionTarget {
+        HarnessSessionTarget::Confirmed(HarnessSessionBinding {
+            schema_version: HARNESS_SCHEMA_VERSION,
+            session_id: owner.session_id.to_string(),
+            instance_id: "instance".into(),
+            native_session_id: "native".into(),
+            native_version: "1".into(),
+            generation: owner.generation,
+        })
+    }
+
+    fn operation(
+        owner: &ExternalHarnessOwner,
+        record: ExternalHarnessOperationRecord,
+    ) -> ExternalHarnessOperation {
+        ExternalHarnessOperation {
+            version: 1,
+            owner: owner.clone(),
+            record,
+            inventory_commitments: Vec::new(),
+        }
+    }
+
+    fn page(owner: &ExternalHarnessOwner, kind: HarnessObservationKind) -> HarnessObservationPage {
+        HarnessObservationPage {
+            retention: None,
+            hydration_requests: Vec::new(),
+            inventory_page: None,
+            observations: vec![HarnessObservation {
+                observation_id: "observation".into(),
+                session_id: owner.session_id.to_string(),
+                generation: owner.generation,
+                native_correlations: Vec::new(),
+                completeness: HarnessCompleteness::Complete,
+                kind,
+            }],
+            next_after: Some("next".into()),
+            completeness: HarnessCompleteness::Partial,
+            status: HarnessExecutionStatus {
+                connectivity: HarnessConnectivity::Connected,
+                activity: HarnessActivity::Running,
+                attention: HarnessAttention::None,
+                continuation: HarnessContinuation::Unknown,
+                completeness: HarnessCompleteness::Partial,
+            },
+            live: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn configure_round_trips_and_requires_the_native_parity_fence() {
+        let owner = owner();
+        let request = HarnessRequest {
+            schema_version: HARNESS_SCHEMA_VERSION,
+            request_id: "configure".into(),
+            instance: instance(),
+            kind: HarnessRequestKind::Configure(HarnessConfigureRequest {
+                target: target(&owner),
+                mutation_id: "configure".into(),
+                setting: HarnessSessionSetting::PermissionMode {
+                    mode: HarnessPermissionMode::Plan,
+                },
+            }),
+        };
+        let retained = ExternalHarnessRequest::from_request(&request).unwrap();
+        assert!(retained.requires_native_parity());
+        assert_eq!(
+            retained.target(),
+            (owner.session_id.to_string().as_str(), owner.generation)
+        );
+        assert!(matches!(
+            retained.request().unwrap().kind,
+            HarnessRequestKind::Configure(_)
+        ));
+        let claimed = operation(
+            &owner,
+            ExternalHarnessOperationRecord::DeliveryClaimed { request: retained },
+        );
+        claimed.validate().unwrap();
+        claimed.validate_storage(58, 26).unwrap();
+        claimed.validate_event_schema(58).unwrap();
+        assert!(claimed.validate_storage(57, 26).is_err());
+        assert!(claimed.validate_storage(58, 25).is_err());
+        assert!(claimed.validate_event_schema(57).is_err());
+    }
+
+    #[test]
+    fn native_parity_observations_are_fenced_and_live_is_never_persisted() {
+        let owner = owner();
+        let reasoning = operation(
+            &owner,
+            ExternalHarnessOperationRecord::ObservationPage {
+                instance: instance(),
+                after: None,
+                page: page(
+                    &owner,
+                    HarnessObservationKind::Reasoning {
+                        segment_id: None,
+                        text: "thinking".into(),
+                        opaque: false,
+                    },
+                ),
+            },
+        );
+        assert!(reasoning.requires_native_parity());
+        reasoning.validate_storage(58, 26).unwrap();
+        assert!(reasoning.validate_storage(57, 25).is_err());
+        let legacy_text = operation(
+            &owner,
+            ExternalHarnessOperationRecord::ObservationPage {
+                instance: instance(),
+                after: None,
+                page: page(
+                    &owner,
+                    HarnessObservationKind::Text {
+                        text: "plain".into(),
+                        segment_id: None,
+                    },
+                ),
+            },
+        );
+        assert!(!legacy_text.requires_native_parity());
+        legacy_text.validate_storage(57, 25).unwrap();
+        let mut with_live = page(
+            &owner,
+            HarnessObservationKind::Text {
+                text: "plain".into(),
+                segment_id: None,
+            },
+        );
+        with_live.live.push(HarnessLiveUpdate {
+            stream: HarnessLiveStream::Text,
+            segment_id: "segment".into(),
+            offset: 0,
+            text: "pla".into(),
+        });
+        assert!(
+            operation(
+                &owner,
+                ExternalHarnessOperationRecord::ObservationPage {
+                    instance: instance(),
+                    after: None,
+                    page: with_live,
+                },
+            )
+            .validate()
+            .is_err()
+        );
     }
 }

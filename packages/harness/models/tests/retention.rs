@@ -52,6 +52,7 @@ fn native_reference_join_preserves_namespace_and_rejects_display_correlations() 
     };
     assert!(!process.matches_observation(&value));
     value.kind = HarnessObservationKind::Text {
+        segment_id: None,
         text: "turn".into(),
     };
     assert!(!turn.matches_observation(&value));
@@ -144,6 +145,7 @@ fn globally_scoped_item_hydration_needs_no_fabricated_turn() {
         .matches_observation(&value)
     );
     value.kind = HarnessObservationKind::Text {
+        segment_id: None,
         text: "global-tool-item".into(),
     };
     assert!(!reference.matches_observation(&value));
@@ -202,6 +204,7 @@ fn hydration_is_bounded_target_scoped_and_revision_checked() {
 fn page_digest_and_duplicate_lookup_requests_are_checked() {
     let observations = vec![observation("a")];
     let mut page = HarnessObservationPage {
+        live: Vec::new(),
         retention: Some(HarnessRetentionPage {
             connection_id: "connection".into(),
             page_id: "page".into(),
@@ -222,6 +225,7 @@ fn page_digest_and_duplicate_lookup_requests_are_checked() {
     };
     page.validate_retention().unwrap();
     page.observations[0].kind = HarnessObservationKind::Text {
+        segment_id: None,
         text: "different".into(),
     };
     assert!(page.validate_retention().is_err());

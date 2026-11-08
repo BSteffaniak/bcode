@@ -1402,6 +1402,8 @@ impl CodexSession {
                 .join("\n")
         });
         let interaction = HarnessInteraction {
+            input_preview: None,
+            tool_name: None,
             request_id: request_id.to_owned(),
             session_id: self.binding.session_id.clone(),
             generation: self.binding.generation,
@@ -1488,6 +1490,7 @@ impl CodexSession {
             // Item completion is not turn completion. Commentary, partial answers
             // and legacy/unknown phases remain display content, never final output.
             Ok(Some(HarnessObservationKind::Text {
+                segment_id: None,
                 text: text.to_owned(),
             }))
         }
@@ -1500,6 +1503,7 @@ impl CodexSession {
     ) -> Result<Option<HarnessObservationKind>, CodexError> {
         let kind = match method {
             "item/agentMessage/delta" => HarnessObservationKind::Text {
+                segment_id: None,
                 text: params["delta"]
                     .as_str()
                     .ok_or(CodexError::Protocol)?
@@ -1513,6 +1517,7 @@ impl CodexSession {
                     }
                     Some("commandExecution" | "fileChange" | "mcpToolCall" | "dynamicToolCall") => {
                         HarnessObservationKind::Tool {
+                            input_json: None,
                             native_tool_id: item["id"]
                                 .as_str()
                                 .ok_or(CodexError::Protocol)?

@@ -16,6 +16,8 @@ pub mod child_attention;
 pub mod compaction_activity;
 pub mod execution;
 pub mod external;
+pub mod external_projection;
+mod external_reducer;
 pub mod navigation;
 pub mod presentation;
 
@@ -1855,6 +1857,7 @@ pub struct SessionView {
     unattributed_cost: bcode_session_view_models::SessionCostSummary,
     usage_cost_revision: u64,
     usage_checkpoint: Option<u64>,
+    external: external_reducer::ExternalSessionState,
 }
 
 // Called only after the complete selected entry graph is admitted. Originals
@@ -3362,7 +3365,7 @@ mod text_update_retention_tests {
         assert_eq!(execution.value_nodes, 9);
         assert_eq!(execution.scalar_capacity_bytes, 0);
         assert_eq!(execution.collection_entries, 0);
-        assert_eq!(usage.value_nodes, 77 + execution.value_nodes);
+        assert_eq!(usage.value_nodes, 78 + execution.value_nodes);
         let mut ledger = usage;
         let before = ledger;
         assert!(view.try_clone_bounded(&mut ledger, limits()).is_err());
@@ -4396,6 +4399,7 @@ impl SessionView {
             unattributed_cost: bcode_session_view_models::SessionCostSummary::default(),
             usage_cost_revision: 0,
             usage_checkpoint: None,
+            external: external_reducer::ExternalSessionState::default(),
         }
     }
 
@@ -4522,9 +4526,11 @@ impl SessionView {
             unattributed_cost: _,
             usage_cost_revision: _,
             usage_checkpoint: _,
+            external,
         } = self;
         let mut usage = bcode_session_view_models::retention::inspect_snapshot(snapshot, limits)?;
         for mut nested in [
+            external.retention_usage(limits)?,
             self.correlation_retention_usage(limits)?,
             self.reasoning_retention_usage(limits)?,
             self.pending_text_retention_usage(limits)?,
@@ -4984,7 +4990,9 @@ impl SessionView {
         }
         self.usage_cost_revision = summary.cost_revision;
         self.usage_checkpoint = summary.through_sequence;
-        self.usage_by_request.clear();
+        // Display-only native harness usage is not part of the daemon summary; keep it.
+        self.usage_by_request
+            .retain(|key, _| key.starts_with(external_projection::EXTERNAL_USAGE_KEY_PREFIX));
         self.unattributed_metered_tokens = summary.cumulative_metered_tokens;
         self.snapshot.runtime.cumulative_metered_tokens = summary.cumulative_metered_tokens;
         self.snapshot.runtime.cost = bcode_session_view_models::SessionCostSummary {
@@ -4996,6 +5004,16 @@ impl SessionView {
             observed_usage_count: summary.observed_usage_count,
         };
         self.unattributed_cost = self.snapshot.runtime.cost.clone();
+        for retained in self.usage_by_request.values() {
+            if let Some(tokens) = retained.metered_total_tokens() {
+                self.snapshot.runtime.cumulative_metered_tokens = self
+                    .snapshot
+                    .runtime
+                    .cumulative_metered_tokens
+                    .saturating_add(u64::from(tokens));
+            }
+            self.snapshot.runtime.cost.observe(retained);
+        }
         self.snapshot.runtime.latest_usage = summary.latest_usage;
         self.bump_revision();
     }
@@ -5612,6 +5630,8 @@ impl SessionView {
         replacement.unattributed_cost = self.unattributed_cost.clone();
         replacement.usage_cost_revision = self.usage_cost_revision;
         replacement.usage_checkpoint = self.usage_checkpoint;
+        replacement.external = self.external.clone();
+        replacement.snapshot.pending_external_interactions = previous.pending_external_interactions;
         replacement.snapshot.transcript.source_start_sequence =
             previous.transcript.source_start_sequence;
         replacement.snapshot.transcript.source_end_sequence =
@@ -6072,37 +6092,33 @@ impl SessionView {
             depth: source.depth,
             copies: 2,
         };
-        let old_lifecycle = bcode_session_view_models::retention::inspect_execution_lifecycle(
-            &self.snapshot.execution_lifecycle,
-            limits,
-        )?;
         let mut peak = *retained;
         peak.try_add(temporary, limits)?;
-        peak.try_add(old_lifecycle, limits)?;
-        let mut lifecycle = self.snapshot.execution_lifecycle.clone();
-        if let Some(text) =
-            execution::text(&mut lifecycle, event).map_err(|_| ObservationRetentionExceeded)?
-        {
-            let (mut item, replacement, mut next) =
-                self.stage_system_message_bounded(event, &text, peak, limits)?;
-            next.try_release(temporary)?;
-            next.depth = retained.depth.max(7);
-            if let TranscriptViewItemKind::SystemMessage { message } = &mut item.kind {
-                message.format = TextFormat::PlainText;
+        // Every touched owner is journaled; the ledger is adjusted by their exact before/after
+        // usage and a rejected budget restores both the view and the ledger.
+        let journal = self
+            .reduce_external_event(event)
+            .map_err(|_| ObservationRetentionExceeded)?;
+        let charged = self
+            .external_journal_usage(&journal, limits)
+            .and_then(|(before, after)| {
+                let mut next = *retained;
+                next.try_release(before)?;
+                next.try_add(after, limits)?;
+                Ok(next)
+            });
+        match charged {
+            Ok(next) => {
+                drop(journal);
+                self.finish_admitted_event(event);
+                *retained = next;
+                Ok(())
             }
-            let new_lifecycle = bcode_session_view_models::retention::inspect_execution_lifecycle(
-                &lifecycle, limits,
-            )?;
-            next.try_release(old_lifecycle)?;
-            next.try_release(old_lifecycle)?;
-            next.try_add(new_lifecycle, limits)?;
-            self.snapshot.execution_lifecycle = lifecycle;
-            self.commit_system_message(item, replacement);
-            self.finish_admitted_event(event);
-            *retained = next;
-            return Ok(());
+            Err(error) => {
+                self.rollback_external(journal);
+                Err(error)
+            }
         }
-        Ok(())
     }
 
     fn apply_observed_event_bounded(
@@ -10035,6 +10051,52 @@ impl SessionView {
         Ok(())
     }
 
+    /// Observe one usage record through the ordinary unrestricted accounting path.
+    fn observe_model_usage(&mut self, usage: &bcode_session_models::SessionTokenUsage) {
+        let mut accepted = true;
+        if let Some(request_id) = &usage.request_id {
+            accepted = self.usage_by_request.get(request_id).is_none_or(|current| {
+                !current.terminal
+                    && (usage.observation_ordinal > current.observation_ordinal
+                        || (usage.observation_ordinal == current.observation_ordinal
+                            && usage == current))
+            });
+            if accepted {
+                self.usage_by_request
+                    .insert(request_id.clone(), usage.clone());
+            }
+            self.snapshot.runtime.cumulative_metered_tokens =
+                self.unattributed_metered_tokens.saturating_add(
+                    self.usage_by_request
+                        .values()
+                        .filter_map(bcode_session_models::SessionTokenUsage::metered_total_tokens)
+                        .map(u64::from)
+                        .fold(0_u64, u64::saturating_add),
+                );
+            self.snapshot.runtime.cost = self.unattributed_cost.clone();
+            for observed in self.usage_by_request.values() {
+                self.snapshot.runtime.cost.observe(observed);
+            }
+        } else {
+            if let Some(tokens) = usage.metered_total_tokens() {
+                self.unattributed_metered_tokens = self
+                    .unattributed_metered_tokens
+                    .saturating_add(u64::from(tokens));
+                self.snapshot.runtime.cumulative_metered_tokens = self
+                    .snapshot
+                    .runtime
+                    .cumulative_metered_tokens
+                    .saturating_add(u64::from(tokens));
+            }
+            self.unattributed_cost.observe(usage);
+            self.snapshot.runtime.cost.observe(usage);
+        }
+        if accepted {
+            self.snapshot.runtime.latest_usage = Some(usage.clone());
+        }
+        self.bump_revision();
+    }
+
     const fn finish_admitted_event(&mut self, event: &SessionEvent) {
         self.snapshot.session_id = Some(event.session_id);
         if event.sequence != 0 {
@@ -10058,32 +10120,20 @@ impl SessionView {
             self.snapshot.latest_sequence = Some(event.sequence);
         }
         if external::is_external_event(&event.kind) {
-            match execution::text(&mut self.snapshot.execution_lifecycle, event) {
-                Ok(Some(text)) => {
-                    self.push_item(
-                        TranscriptViewItemId::event(event.sequence),
-                        event.sequence,
-                        Some(event.timestamp_ms),
-                        false,
-                        TranscriptViewItemKind::SystemMessage {
-                            message: ChatMessageView::plain(text),
-                        },
-                    );
-                }
-                Err(_) => {
-                    self.push_item(
-                        TranscriptViewItemId::event(event.sequence),
-                        event.sequence,
-                        Some(event.timestamp_ms),
-                        false,
-                        TranscriptViewItemKind::SystemMessage {
-                            message: ChatMessageView::plain(
-                                "External history unavailable: invalid canonical evidence",
-                            ),
-                        },
-                    );
-                }
-                Ok(None) => {}
+            if self.reduce_external_event(event).is_ok() {
+                self.bump_revision();
+            } else {
+                self.push_item(
+                    TranscriptViewItemId::event(event.sequence),
+                    event.sequence,
+                    Some(event.timestamp_ms),
+                    false,
+                    TranscriptViewItemKind::SystemMessage {
+                        message: ChatMessageView::plain(
+                            "External history unavailable: invalid canonical evidence",
+                        ),
+                    },
+                );
             }
             return;
         }
@@ -10828,50 +10878,7 @@ impl SessionView {
                 if self.usage_checkpoint.is_some() {
                     return;
                 }
-                let mut accepted = true;
-                if let Some(request_id) = &usage.request_id {
-                    accepted = self.usage_by_request.get(request_id).is_none_or(|current| {
-                        !current.terminal
-                            && (usage.observation_ordinal > current.observation_ordinal
-                                || (usage.observation_ordinal == current.observation_ordinal
-                                    && usage == current))
-                    });
-                    if accepted {
-                        self.usage_by_request
-                            .insert(request_id.clone(), usage.clone());
-                    }
-                    self.snapshot.runtime.cumulative_metered_tokens =
-                        self.unattributed_metered_tokens.saturating_add(
-                            self.usage_by_request
-                                .values()
-                                .filter_map(
-                                    bcode_session_models::SessionTokenUsage::metered_total_tokens,
-                                )
-                                .map(u64::from)
-                                .fold(0_u64, u64::saturating_add),
-                        );
-                    self.snapshot.runtime.cost = self.unattributed_cost.clone();
-                    for observed in self.usage_by_request.values() {
-                        self.snapshot.runtime.cost.observe(observed);
-                    }
-                } else {
-                    if let Some(tokens) = usage.metered_total_tokens() {
-                        self.unattributed_metered_tokens = self
-                            .unattributed_metered_tokens
-                            .saturating_add(u64::from(tokens));
-                        self.snapshot.runtime.cumulative_metered_tokens = self
-                            .snapshot
-                            .runtime
-                            .cumulative_metered_tokens
-                            .saturating_add(u64::from(tokens));
-                    }
-                    self.unattributed_cost.observe(usage);
-                    self.snapshot.runtime.cost.observe(usage);
-                }
-                if accepted {
-                    self.snapshot.runtime.latest_usage = Some(usage.clone());
-                }
-                self.bump_revision();
+                self.observe_model_usage(usage);
             }
             SessionEventKind::ContextCompacted { summary, .. } => {
                 self.set_context_occupancy(None);
@@ -14511,8 +14518,20 @@ impl SessionView {
                 limits,
             );
         }
-        if let SessionLiveEventKind::AssistantTextStreamUpdated { .. } = &event.kind {
-            return self.apply_ordered_stream_bounded(event, retained, limits);
+        if let SessionLiveEventKind::AssistantTextStreamUpdated {
+            turn_id,
+            segment_id,
+            ..
+        } = &event.kind
+        {
+            self.apply_ordered_stream_bounded(event, retained, limits)?;
+            if self.external.label.is_some() {
+                let id = TranscriptViewItemId::new(format!(
+                    "assistant-turn:{turn_id}:segment:{segment_id}"
+                ));
+                self.label_external_live_item_bounded(&id, retained, limits);
+            }
+            return Ok(());
         }
         if let SessionLiveEventKind::RequestContextOccupancyChanged { occupancy } = &event.kind {
             return self.apply_context_occupancy_bounded(
@@ -15046,6 +15065,7 @@ impl SessionView {
                 ));
                 self.apply_ordered_assistant_update(id.clone(), turn_id, update, received_at);
                 self.assign_output_location(&id, turn_id, *output_position);
+                self.label_external_live_item(&id);
             }
             SessionLiveEventKind::AssistantTextDelta {
                 turn_id,

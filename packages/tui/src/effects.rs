@@ -2,7 +2,7 @@
 
 use std::collections::{BTreeMap, VecDeque};
 
-use bcode_client::{BcodeClient, ClientError, MessageAcceptance};
+use bcode_client::{BcodeClient, ClientError, DaemonAvailability, MessageAcceptance};
 use bcode_ipc::{ComposerDraftScope, PermissionSummary, PromptPlacement};
 use bcode_session_models::{
     ProjectionWindowAnchor, ProjectionWindowDirection, ProjectionWindowLimits,
@@ -461,50 +461,106 @@ async fn managed_submit_message(
     }
 }
 
-fn parse_native_response_json(
-    text: &str,
-) -> Result<bcode_harness_models::HarnessResponseValue, ClientError> {
-    serde_json::from_str(text).map_err(|_| ClientError::Protocol(
-        "Expected typed native response JSON, for example {\"kind\":\"approval\",\"approved\":true}; no native response sent".into(),
-    ))
+/// Lazily constructed host-only application access for a managed conversation.
+///
+/// It serves only allow-listed host operations (catalog, search, picker, rename/delete,
+/// monitor, timeline, X-ray, palettes). Submission, interruption, native responses and
+/// configuration stay on the sealed managed command handle, so this access can never become
+/// a model or native execution fallback. It is constructed on first use only.
+#[derive(Clone, Default)]
+pub struct ManagedHostAccess {
+    /// Managed command handle whose credential-deferred configuration the host client reuses.
+    commands: Option<bcode_client::ManagedSessionCommandHandle>,
+    client: std::sync::Arc<std::sync::OnceLock<BcodeClient>>,
 }
 
-#[cfg(test)]
-mod native_response_json_tests {
-    #[test]
-    fn typed_permission_examples_parse_without_shell_or_verb_interpretation() {
-        use bcode_harness_models::HarnessResponseValue;
-        for (json, expected) in [
-            (
-                r#"{"kind":"approval","approved":true}"#,
-                HarnessResponseValue::Approval { approved: true },
-            ),
-            (
-                r#"{"kind":"approval","approved":false}"#,
-                HarnessResponseValue::Approval { approved: false },
-            ),
-            (
-                r#"{"kind":"answer","choice_id":null,"text":"two words"}"#,
-                HarnessResponseValue::Answer {
-                    choice_id: None,
-                    text: "two words".into(),
-                },
-            ),
-            (r#"{"kind":"cancel"}"#, HarnessResponseValue::Cancel),
-        ] {
-            assert_eq!(super::parse_native_response_json(json).unwrap(), expected);
+impl ManagedHostAccess {
+    /// Host access sharing the managed conversation's credential-deferred configuration.
+    #[must_use]
+    pub fn for_commands(commands: bcode_client::ManagedSessionCommandHandle) -> Self {
+        Self {
+            commands: Some(commands),
+            client: std::sync::Arc::default(),
         }
-        for invalid in ["approve", "deny", "true", r#"{"kind":"approval"}"#] {
-            assert!(super::parse_native_response_json(invalid).is_err());
-        }
+    }
+
+    /// Host client, constructed on first use against the running daemon.
+    pub(super) fn client(&self) -> BcodeClient {
+        self.client
+            .get_or_init(|| {
+                self.commands.as_ref().map_or_else(
+                    || {
+                        BcodeClient::default_endpoint()
+                            .with_daemon_availability(DaemonAvailability::RequireRunning)
+                    },
+                    bcode_client::ManagedSessionCommandHandle::host_client,
+                )
+            })
+            .clone()
     }
 }
 
+/// Managed execution access threaded into effect commands.
+#[derive(Clone, Default)]
+pub struct ManagedEffectAccess {
+    /// Sealed managed command handle; present only in a managed conversation.
+    pub commands: Option<bcode_client::ManagedSessionCommandHandle>,
+    /// Ownership generation every managed mutation must target.
+    pub generation: Option<u64>,
+    /// Host-only access for allow-listed host operations.
+    pub host: Option<ManagedHostAccess>,
+}
+
+/// Composer context retained for managed host slash commands.
+pub struct ManagedSlashContext {
+    working_directory: std::path::PathBuf,
+    current_agent_id: String,
+    reasoning_display_mode: bcode_config::TuiThinkingMode,
+    reasoning_visible: bool,
+}
+
+async fn load_managed_models(
+    commands: &bcode_client::ManagedSessionCommandHandle,
+) -> Result<Vec<bcode_model::execution::ExecutionModel>, ClientError> {
+    let binding = commands.binding().await?;
+    let instance_id = binding.instance.instance_id.clone();
+    let catalog = bcode_client::ManagedSessionClient::default_endpoint()
+        .discover_execution_catalog(bcode_ipc::harness::ManagedExecutionCatalogRequest {
+            request_id: uuid::Uuid::new_v4().to_string(),
+            instances: vec![binding.instance],
+            provider_plugin_id: None,
+        })
+        .await?;
+    Ok(managed_instance_models(catalog.models, &instance_id))
+}
+
+/// Keep only execution entries routed to the attached managed instance.
+fn managed_instance_models(
+    models: Vec<bcode_model::execution::ExecutionModel>,
+    instance_id: &str,
+) -> Vec<bcode_model::execution::ExecutionModel> {
+    models
+        .into_iter()
+        .filter(|entry| {
+            matches!(
+                &entry.route,
+                bcode_model::execution::ExecutionRoute::ManagedHarness { instance_id: routed, .. }
+                    if routed == instance_id
+            )
+        })
+        .collect()
+}
+
+#[allow(clippy::too_many_lines)]
 async fn managed_slash_command(
     commands: &bcode_client::ManagedSessionCommandHandle,
     message: String,
     generation: Option<u64>,
+    host: Option<&ManagedHostAccess>,
+    context: ManagedSlashContext,
 ) -> TuiEffectResult {
+    use super::managed_controls::{ManagedCommandSupport, command_support};
+    use super::slash_commands::SlashCommandOutcome;
     let result = async {
         let args: Vec<_> = message.split_whitespace().collect();
         match args.as_slice() {
@@ -518,30 +574,193 @@ async fn managed_slash_command(
                     bcode_provider_auth_models::managed::AuthReadiness::Unknown => "Selected managed instance authentication readiness is unknown; no login or billing change was attempted",
                     bcode_provider_auth_models::managed::AuthReadiness::Blocked(_) => "Selected managed instance authentication is blocked; no account or billing fallback was selected",
                 };
-                Ok(super::slash_commands::SlashCommandOutcome::Handled(message.into()))
+                return Ok(SlashCommandOutcome::Handled(message.into()));
             }
-            ["/auth", ..] => Err(ClientError::Protocol("Managed /auth is bound to the attached configured instance. Only /auth status is currently available; provider/account selectors and credential input are not accepted in chat".into())),
-            ["/native", "interrupt"] => {
+            ["/auth", ..] => return Err(ClientError::Protocol("Managed /auth is bound to the attached configured instance. Only /auth status is currently available; provider/account selectors and credential input are not accepted in chat".into())),
+            ["/native", "interrupt"] | ["/stop"] => {
                 let expected = generation.ok_or_else(|| ClientError::Protocol("Managed generation is missing".into()))?;
                 commands.interrupt(expected, uuid::Uuid::new_v4().to_string()).await?;
-                Ok(super::slash_commands::SlashCommandOutcome::Handled("Native interrupt acknowledged; settlement remains independent".into()))
+                return Ok(SlashCommandOutcome::Handled("Native interrupt acknowledged; settlement remains independent".into()));
             }
             ["/native", "respond", supplied_generation, request_id, response_id, rest @ ..] => {
                 let supplied = supplied_generation.parse::<u64>().map_err(|_| ClientError::Protocol("Invalid native generation".into()))?;
                 if Some(supplied) != generation {
                     return Err(ClientError::Protocol("Native response generation differs from attached session".into()));
                 }
-                let value = parse_native_response_json(&rest.join(" "))?;
+                let value = super::managed_controls::parse_native_response(&rest.join(" "))
+                    .map_err(ClientError::Protocol)?;
                 commands.managed_session_respond(supplied, (*request_id).into(), (*response_id).into(), value).await?;
-                Ok(super::slash_commands::SlashCommandOutcome::Handled("Native response recorded".into()))
+                return Ok(SlashCommandOutcome::Handled("Native response recorded".into()));
             }
-            ["/native", "composer", "next"] => Ok(super::slash_commands::SlashCommandOutcome::ManagedComposer { expected_native_turn_id: None, retry_submission_id: None }),
-            ["/native", "composer", "steer", turn] => Ok(super::slash_commands::SlashCommandOutcome::ManagedComposer { expected_native_turn_id: Some((*turn).into()), retry_submission_id: None }),
-            ["/native", "retry", submission] => Ok(super::slash_commands::SlashCommandOutcome::ManagedComposer { expected_native_turn_id: None, retry_submission_id: Some((*submission).into()) }),
-            _ => Err(ClientError::Protocol("Managed commands: /native composer next|steer <turn>, /native interrupt, /native respond <generation> <request> <response> <JSON>, /native retry <submission>".into())),
+            ["/native", "composer", "next"] => return Ok(SlashCommandOutcome::ManagedComposer { expected_native_turn_id: None, retry_submission_id: None }),
+            ["/native", "composer", "steer", turn] => return Ok(SlashCommandOutcome::ManagedComposer { expected_native_turn_id: Some((*turn).into()), retry_submission_id: None }),
+            ["/native", "retry", submission] => return Ok(SlashCommandOutcome::ManagedComposer { expected_native_turn_id: None, retry_submission_id: Some((*submission).into()) }),
+            ["/native", ..] => return Err(ClientError::Protocol("Managed commands: /native composer next|steer <turn>, /native interrupt, /native respond <generation> <request> <response> approve|deny|answer <choice> [text]|assist <text>|<JSON>, /native retry <submission>".into())),
+            ["/model" | "/models"] => return Ok(SlashCommandOutcome::PickModel),
+            ["/model" | "/set-model", model_id] => {
+                return Ok(SlashCommandOutcome::ManagedConfigure(
+                    bcode_harness_models::HarnessSessionSetting::Model { model_id: (*model_id).to_owned() },
+                ));
+            }
+            ["/plan" | "/build" | "/agent", ..] => {
+                let mode = super::managed_controls::permission_mode_command(&args)
+                    .map_err(ClientError::Protocol)?;
+                return Ok(SlashCommandOutcome::ManagedConfigure(
+                    bcode_harness_models::HarnessSessionSetting::PermissionMode { mode },
+                ));
+            }
+            ["/permissions"] => return Ok(SlashCommandOutcome::ReviewPermissions),
+            _ => {}
+        }
+        match command_support(&message) {
+            Some(ManagedCommandSupport::Host) => {
+                let Some(command) = super::slash_registry::slash_command_name(&message)
+                    .and_then(super::slash_registry::builtin_command)
+                else {
+                    return Ok(SlashCommandOutcome::Unknown(message.clone()));
+                };
+                let host = host.ok_or_else(|| {
+                    ClientError::Protocol("Host commands are unavailable in this managed conversation".into())
+                })?;
+                super::slash_commands::execute_resolved(
+                    &host.client(),
+                    Some(commands.session_id()),
+                    super::slash_commands::SlashExecutionContext {
+                        working_directory: &context.working_directory,
+                        current_agent_id: &context.current_agent_id,
+                        reasoning_display_mode: context.reasoning_display_mode,
+                        reasoning_visible: context.reasoning_visible,
+                    },
+                    &message,
+                    super::slash_registry::SlashResolution::Builtin(command),
+                )
+                .await
+            }
+            Some(ManagedCommandSupport::NativePassthrough) => Ok(SlashCommandOutcome::Handled(
+                "Native slash commands are sent as managed input; submit it from the composer".into(),
+            )),
+            Some(ManagedCommandSupport::Control | ManagedCommandSupport::Unavailable) | None => {
+                Ok(SlashCommandOutcome::Handled(format!(
+                    "{} is unavailable in this managed conversation; no model or plugin fallback was used. Type / to see managed commands",
+                    args.first().copied().unwrap_or("This command")
+                )))
+            }
         }
     }.await;
     TuiEffectResult::SlashCommandExecuted { message, result }
+}
+
+#[cfg(test)]
+mod managed_model_filter_tests {
+    fn entry(
+        route: bcode_model::execution::ExecutionRoute,
+        id: &str,
+    ) -> bcode_model::execution::ExecutionModel {
+        bcode_model::execution::ExecutionModel {
+            model: bcode_model::ModelInfo {
+                model_id: id.into(),
+                display_name: id.into(),
+                is_default: false,
+                context_window: None,
+                max_output_tokens: None,
+                max_image_input_base64_bytes: None,
+                capabilities: std::collections::BTreeSet::new(),
+                feature_support: bcode_model::ModelFeatureSupport::default(),
+                reasoning: None,
+                cache: bcode_model::ModelCacheInfo::default(),
+                metadata_source: None,
+                pricing: None,
+                api_surface: None,
+                visibility: bcode_model::ModelVisibility::Visible,
+            },
+            route,
+            account_reference: None,
+            billing_route: bcode_model::execution::ExecutionBillingRoute::ProviderApi,
+            native_model_id: id.into(),
+            confirmed_model_id: None,
+            provenance: bcode_model::execution::ExecutionModelProvenance::HarnessDiscovery,
+            readiness: bcode_model::execution::ExecutionModelReadiness::Unknown,
+        }
+    }
+
+    #[test]
+    fn managed_models_keep_only_the_attached_instance_route() {
+        let models = vec![
+            entry(
+                bcode_model::execution::ExecutionRoute::ManagedHarness {
+                    instance_id: "primary".into(),
+                    plugin_id: "claude".into(),
+                },
+                "opus",
+            ),
+            entry(
+                bcode_model::execution::ExecutionRoute::ManagedHarness {
+                    instance_id: "other".into(),
+                    plugin_id: "claude".into(),
+                },
+                "foreign",
+            ),
+            entry(
+                bcode_model::execution::ExecutionRoute::ModelProvider {
+                    provider_plugin_id: "openai".into(),
+                },
+                "provider",
+            ),
+        ];
+        let kept = super::managed_instance_models(models, "primary");
+        assert_eq!(kept.len(), 1);
+        assert_eq!(kept[0].native_model_id, "opus");
+    }
+
+    #[test]
+    fn managed_host_allow_list_excludes_execution_and_model_effects() {
+        use super::TuiEffect;
+        let session_id = bcode_session_models::SessionId::new();
+        for host in [
+            TuiEffect::LoadCommandPalette,
+            TuiEffect::DeleteSession { session_id },
+            TuiEffect::RenameSession {
+                session_id,
+                name: Some("renamed".into()),
+            },
+            TuiEffect::LoadSessionPicker {
+                generation: 1,
+                scope: bcode_session_models::SessionDiscoveryScope::AllWorkingDirectories,
+                query: bcode_session_models::SessionCatalogQuery::default(),
+                cursor: None,
+            },
+        ] {
+            assert!(host.is_managed_host_operation());
+        }
+        for denied in [
+            TuiEffect::CancelTurn { session_id },
+            TuiEffect::CompactContext { session_id },
+            TuiEffect::ListPermissions,
+            TuiEffect::LoadModelProviders,
+            TuiEffect::LoadModelPicker {
+                provider_plugin_id: None,
+            },
+            TuiEffect::ResolvePermission {
+                permission_id: "p".into(),
+                approved: true,
+                remember: false,
+                apply_to_batch: false,
+                batch_id: None,
+            },
+            TuiEffect::RespondManagedInteraction {
+                generation: 1,
+                request_id: "r".into(),
+                response_id: "id".into(),
+                value: bcode_harness_models::HarnessResponseValue::Approval { approved: true },
+            },
+            TuiEffect::LoadManagedModels,
+        ] {
+            assert!(!denied.is_managed_host_operation());
+        }
+        // Local presentation state needs no daemon or host access at all.
+        assert!(TuiEffect::ClearThemeSelection.run_local_state().is_ok());
+        assert!(TuiEffect::LoadManagedModels.run_local_state().is_err());
+    }
 }
 
 async fn managed_transcript_page(
@@ -1078,6 +1297,31 @@ pub enum TuiEffect {
         /// Authorization batch id when `apply_to_batch` is true.
         batch_id: Option<String>,
     },
+    /// Answer one managed native interaction with a retained response identity.
+    ///
+    /// Executed only through the sealed managed command handle; ordinary model access never
+    /// answers native requests.
+    RespondManagedInteraction {
+        /// Ownership generation the response must target.
+        generation: u64,
+        /// Native request correlation.
+        request_id: String,
+        /// Retained response identity, reused when an earlier outcome was uncertain.
+        response_id: String,
+        /// Typed response value.
+        value: bcode_harness_models::HarnessResponseValue,
+    },
+    /// Change one managed native session setting using a retained mutation identity.
+    ConfigureManagedSession {
+        /// Ownership generation the mutation must target.
+        generation: u64,
+        /// Retained mutation identity; ambiguous outcomes are never replayed.
+        mutation_id: String,
+        /// Requested setting.
+        setting: bcode_harness_models::HarnessSessionSetting,
+    },
+    /// Discover the models advertised for the attached managed instance.
+    LoadManagedModels,
 }
 
 /// Daemon connectivity observation reported by completed effects.
@@ -1559,9 +1803,41 @@ pub enum TuiEffectResult {
         /// Daemon response indicating whether any request was resolved.
         result: Result<bool, ClientError>,
     },
+    /// Result for one managed native interaction response.
+    ManagedInteractionResponded {
+        /// Ownership generation the response targeted.
+        generation: u64,
+        /// Native request correlation.
+        request_id: String,
+        /// Retained response identity.
+        response_id: String,
+        /// Managed application response.
+        result: Result<bcode_harness_models::HarnessServiceResponse, ClientError>,
+    },
+    /// Result for one managed native setting change.
+    ManagedSessionConfigured {
+        /// Retained mutation identity.
+        mutation_id: String,
+        /// Requested setting.
+        setting: bcode_harness_models::HarnessSessionSetting,
+        /// Managed application response.
+        result: Result<bcode_harness_models::HarnessServiceResponse, ClientError>,
+    },
+    /// Models advertised for the attached managed instance.
+    ManagedModelsLoaded {
+        /// Execution entries routed to the attached instance.
+        result: Result<Vec<bcode_model::execution::ExecutionModel>, ClientError>,
+    },
+    /// An ordinary open found a managed binding; the root must hand off to managed reattach.
+    ManagedSessionDetected {
+        /// Session that was being opened.
+        session_id: SessionId,
+        /// Canonical managed binding evidence.
+        binding: Box<bcode_ipc::ManagedSessionTargetSnapshot>,
+    },
 }
 
-#[allow(clippy::match_same_arms)]
+#[allow(clippy::match_same_arms, clippy::too_many_lines)]
 impl TuiEffectResult {
     /// Return the daemon connectivity observation implied by this effect result.
     #[must_use]
@@ -1661,6 +1937,12 @@ impl TuiEffectResult {
             Self::ModelPickerLoaded { result, .. } => DaemonObservation::from_client_result(result),
             Self::SkillPickerLoaded { result } => DaemonObservation::from_client_result(result),
             Self::SkillDescribed { result, .. } => DaemonObservation::from_client_result(result),
+            Self::ManagedInteractionResponded { result, .. }
+            | Self::ManagedSessionConfigured { result, .. } => {
+                DaemonObservation::from_client_result(result)
+            }
+            Self::ManagedModelsLoaded { result } => DaemonObservation::from_client_result(result),
+            Self::ManagedSessionDetected { .. } => DaemonObservation::Success,
         }
     }
 }
@@ -1800,6 +2082,9 @@ enum EffectKey {
     CreateWorktree,
     CancelTurn(SessionId),
     ResolvePermission(String),
+    ManagedRespond(u64, String),
+    ManagedConfigure,
+    ManagedModels,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -2149,6 +2434,29 @@ impl TuiEffect {
                 plugin_id,
                 result: Err(client_error.into()),
             },
+            Self::RespondManagedInteraction {
+                generation,
+                request_id,
+                response_id,
+                ..
+            } => TuiEffectResult::ManagedInteractionResponded {
+                generation,
+                request_id,
+                response_id,
+                result: Err(client_error),
+            },
+            Self::ConfigureManagedSession {
+                mutation_id,
+                setting,
+                ..
+            } => TuiEffectResult::ManagedSessionConfigured {
+                mutation_id,
+                setting,
+                result: Err(client_error),
+            },
+            Self::LoadManagedModels => TuiEffectResult::ManagedModelsLoaded {
+                result: Err(client_error),
+            },
         }
     }
 
@@ -2175,7 +2483,9 @@ impl TuiEffect {
             | Self::CancelTurn { .. }
             | Self::ResolvePermission { .. }
             | Self::OpenXray { .. }
-            | Self::InvokePluginCommand { .. } => EffectDaemonIntent::Foreground,
+            | Self::InvokePluginCommand { .. }
+            | Self::RespondManagedInteraction { .. }
+            | Self::ConfigureManagedSession { .. } => EffectDaemonIntent::Foreground,
             Self::OpenSession {
                 allow_daemon_start: false,
                 ..
@@ -2221,7 +2531,8 @@ impl TuiEffect {
             | Self::DescribeSkill { .. }
             | Self::LoadThinkingDialog { .. }
             | Self::LoadMilestones { .. }
-            | Self::LoadTimelineJump { .. } => EffectDaemonIntent::Background,
+            | Self::LoadTimelineJump { .. }
+            | Self::LoadManagedModels => EffectDaemonIntent::Background,
         }
     }
 }
@@ -2375,8 +2686,7 @@ impl TuiEffect {
         schedule: EffectSchedule,
         foreground_client: Option<&BcodeClient>,
         passive_client: Option<&BcodeClient>,
-        managed_commands: Option<bcode_client::ManagedSessionCommandHandle>,
-        managed_generation: Option<u64>,
+        managed: ManagedEffectAccess,
         handle: bmux_tui_runtime::RuntimeHandle<super::root_program::BcodeRuntimeMessage>,
     ) -> bmux_tui_runtime::Command<super::root_program::BcodeRuntimeMessage> {
         let key = self.command_key();
@@ -2391,8 +2701,14 @@ impl TuiEffect {
             let (streaming_sender, mut streaming_receiver) =
                 mpsc::channel(TUI_EFFECT_STREAM_CAPACITY);
             let effect = Box::pin(async move {
-                if let Some(managed) = managed_commands {
-                    Box::pin(self.run_managed(managed, managed_generation)).await
+                if let Some(commands) = managed.commands {
+                    Box::pin(self.run_managed(
+                        commands,
+                        managed.generation,
+                        managed.host,
+                        streaming_sender,
+                    ))
+                    .await
                 } else if let Some(client) = client {
                     Box::pin(self.run(client, streaming_sender)).await
                 } else {
@@ -2513,6 +2829,13 @@ impl TuiEffect {
             Self::ResolvePermission { permission_id, .. } => {
                 EffectKey::ResolvePermission(permission_id.clone())
             }
+            Self::RespondManagedInteraction {
+                generation,
+                request_id,
+                ..
+            } => EffectKey::ManagedRespond(*generation, request_id.clone()),
+            Self::ConfigureManagedSession { .. } => EffectKey::ManagedConfigure,
+            Self::LoadManagedModels => EffectKey::ManagedModels,
         }
     }
 
@@ -2523,10 +2846,121 @@ impl TuiEffect {
         Box::pin(load_session_status(client, session_id)).await
     }
 
+    /// Host operations a managed conversation may run through host-only application access.
+    ///
+    /// None of these submit input, answer native requests, or construct model work; the
+    /// managed executor remains reachable only through the sealed command handle.
+    pub(crate) const fn is_managed_host_operation(&self) -> bool {
+        matches!(
+            self,
+            Self::LoadSessionChildren { .. }
+                | Self::LoadChildActivity { .. }
+                | Self::LoadPluginStatus { .. }
+                | Self::LoadCommandPalette
+                | Self::LoadSessionPicker { .. }
+                | Self::RenameSession { .. }
+                | Self::DeleteSession { .. }
+                | Self::SearchSessions { .. }
+                | Self::StartBulkMigration { .. }
+                | Self::CancelBulkMigration { .. }
+                | Self::WaitBulkMigration { .. }
+                | Self::StartSearchIndexing { .. }
+                | Self::CancelSearchIndexing { .. }
+                | Self::WaitSearchIndexing { .. }
+                | Self::LoadMilestones { .. }
+                | Self::LoadTimelineJump { .. }
+                | Self::OpenXray { .. }
+        )
+    }
+
+    /// Run purely local configuration/state effects that never contact the daemon.
+    fn run_local_state(self) -> Result<TuiEffectResult, Box<Self>> {
+        Ok(match self {
+            Self::LoadConfig => TuiEffectResult::ConfigLoaded {
+                config: Box::new(bcode_config::load_config().map_err(|error| error.to_string())),
+                theme_selection: bcode_config::load_tui_theme_selection()
+                    .map_err(|error| error.to_string()),
+                profile_selection: bcode_config::load_tui_profile_selection()
+                    .map_err(|error| error.to_string()),
+                streaming_presentation: bcode_config::load_tui_streaming_presentation_override()
+                    .map_err(|error| error.to_string()),
+            },
+            Self::PersistThemeSelection { name } => TuiEffectResult::ThemeSelectionPersisted {
+                result: bcode_config::set_tui_theme_selection(&name)
+                    .map_err(|error| error.to_string()),
+                name: Some(name),
+            },
+            Self::ClearThemeSelection => TuiEffectResult::ThemeSelectionPersisted {
+                result: bcode_config::clear_tui_theme_selection()
+                    .map_err(|error| error.to_string()),
+                name: None,
+            },
+            Self::PersistProfileSelection { name } => TuiEffectResult::ProfileSelectionPersisted {
+                result: bcode_config::set_tui_profile_selection(name.as_deref())
+                    .map_err(|error| error.to_string()),
+                name,
+            },
+            Self::PersistStreamingPresentation { policy } => {
+                TuiEffectResult::StreamingPresentationPersisted {
+                    result: bcode_config::set_tui_streaming_presentation_override(policy)
+                        .map_err(|error| error.to_string()),
+                    policy: Some(policy.normalized()),
+                }
+            }
+            Self::ClearStreamingPresentation => TuiEffectResult::StreamingPresentationPersisted {
+                result: bcode_config::clear_tui_streaming_presentation_override()
+                    .map_err(|error| error.to_string()),
+                policy: None,
+            },
+            Self::ReconcileAuthSecurity { config } => TuiEffectResult::AuthSecurityReconciled {
+                status: session_flow::auth_security_status(&config),
+            },
+            other => return Err(Box::new(other)),
+        })
+    }
+
     pub(super) async fn run_managed(
         self,
         commands: bcode_client::ManagedSessionCommandHandle,
         generation: Option<u64>,
+        host: Option<ManagedHostAccess>,
+        streaming_sender: mpsc::Sender<TuiEffectResult>,
+    ) -> TuiEffectResult {
+        let this = match self.run_local_state() {
+            Ok(result) => return result,
+            Err(this) => *this,
+        };
+        if let Self::LoadSlashPalette {
+            query, generation, ..
+        } = this
+        {
+            let palette = slash_palette::SlashPalette::managed(
+                &query,
+                bcode_config::CompletionConfig::default(),
+            );
+            return TuiEffectResult::SlashPaletteLoaded {
+                query,
+                palette,
+                generation,
+            };
+        }
+        if this.is_managed_host_operation() {
+            return match host {
+                Some(host) => Box::pin(this.run(host.client(), streaming_sender)).await,
+                None => this.application_access_failed(ClientError::Protocol(
+                    "Host operations are unavailable in this managed conversation".into(),
+                )),
+            };
+        }
+        Box::pin(this.run_managed_session(commands, generation, host)).await
+    }
+
+    #[allow(clippy::too_many_lines)]
+    async fn run_managed_session(
+        self,
+        commands: bcode_client::ManagedSessionCommandHandle,
+        generation: Option<u64>,
+        host: Option<ManagedHostAccess>,
     ) -> TuiEffectResult {
         let session_id = commands.session_id();
         match commands.binding().await {
@@ -2586,10 +3020,77 @@ impl TuiEffect {
             Self::ExecuteSlashCommand {
                 message,
                 session_id: owner,
-                ..
+                working_directory,
+                current_agent_id,
+                reasoning_display_mode,
+                reasoning_visible,
             } if owner == Some(session_id) => {
-                managed_slash_command(&commands, message, generation).await
+                Box::pin(managed_slash_command(
+                    &commands,
+                    message,
+                    generation,
+                    host.as_ref(),
+                    ManagedSlashContext {
+                        working_directory,
+                        current_agent_id,
+                        reasoning_display_mode,
+                        reasoning_visible,
+                    },
+                ))
+                .await
             }
+            Self::RespondManagedInteraction {
+                generation: target,
+                request_id,
+                response_id,
+                value,
+            } => {
+                let result = if Some(target) == generation {
+                    commands
+                        .managed_session_respond(
+                            target,
+                            request_id.clone(),
+                            response_id.clone(),
+                            value,
+                        )
+                        .await
+                } else {
+                    Err(ClientError::Protocol(
+                        "Native response generation differs from the attached session; no response sent"
+                            .into(),
+                    ))
+                };
+                TuiEffectResult::ManagedInteractionResponded {
+                    generation: target,
+                    request_id,
+                    response_id,
+                    result,
+                }
+            }
+            Self::ConfigureManagedSession {
+                generation: target,
+                mutation_id,
+                setting,
+            } => {
+                let result = if Some(target) == generation {
+                    commands
+                        .managed_session_configure(target, mutation_id.clone(), setting.clone())
+                        .await
+                } else {
+                    Err(ClientError::Protocol(
+                        "Native setting generation differs from the attached session; nothing changed"
+                            .into(),
+                    ))
+                };
+                TuiEffectResult::ManagedSessionConfigured {
+                    mutation_id,
+                    setting,
+                    result,
+                }
+            }
+            Self::LoadManagedModels => TuiEffectResult::ManagedModelsLoaded {
+                result: load_managed_models(&commands).await,
+            },
             Self::SaveDraft {
                 scope: ComposerDraftScope::Session { session_id: owner },
                 text,
@@ -2699,64 +3200,57 @@ impl TuiEffect {
                 initial_window_request,
                 event_sender,
                 allow_daemon_start: _,
-            } => TuiEffectResult::SessionOpened {
-                session_id,
-                has_older_history: true,
-                result: Box::new(
-                    history_flow::attach_session_event_stream_with_window_request(
-                        &client,
+            } => {
+                // A managed session must reattach through the sealed managed route, never as
+                // an ordinary model attachment. Binding lookup failures keep the ordinary path.
+                if let Ok(Some(binding)) = client.managed_session_binding(session_id).await
+                    && binding.validate().is_ok()
+                    && binding.session_id == session_id
+                {
+                    return TuiEffectResult::ManagedSessionDetected {
                         session_id,
-                        event_sender,
-                        initial_window_request,
-                        |snapshot| {
-                            let _result =
-                                streaming_sender.try_send(TuiEffectResult::SessionOpenProgress {
-                                    snapshot: snapshot.clone(),
-                                });
-                        },
-                    )
-                    .await,
-                ),
-            },
-            Self::LoadConfig => TuiEffectResult::ConfigLoaded {
-                config: Box::new(bcode_config::load_config().map_err(|error| error.to_string())),
-                theme_selection: bcode_config::load_tui_theme_selection()
-                    .map_err(|error| error.to_string()),
-                profile_selection: bcode_config::load_tui_profile_selection()
-                    .map_err(|error| error.to_string()),
-                streaming_presentation: bcode_config::load_tui_streaming_presentation_override()
-                    .map_err(|error| error.to_string()),
-            },
-            Self::PersistThemeSelection { name } => TuiEffectResult::ThemeSelectionPersisted {
-                result: bcode_config::set_tui_theme_selection(&name)
-                    .map_err(|error| error.to_string()),
-                name: Some(name),
-            },
-            Self::ClearThemeSelection => TuiEffectResult::ThemeSelectionPersisted {
-                result: bcode_config::clear_tui_theme_selection()
-                    .map_err(|error| error.to_string()),
-                name: None,
-            },
-            Self::PersistProfileSelection { name } => TuiEffectResult::ProfileSelectionPersisted {
-                result: bcode_config::set_tui_profile_selection(name.as_deref())
-                    .map_err(|error| error.to_string()),
-                name,
-            },
-            Self::PersistStreamingPresentation { policy } => {
-                TuiEffectResult::StreamingPresentationPersisted {
-                    result: bcode_config::set_tui_streaming_presentation_override(policy)
-                        .map_err(|error| error.to_string()),
-                    policy: Some(policy.normalized()),
+                        binding: Box::new(binding),
+                    };
+                }
+                TuiEffectResult::SessionOpened {
+                    session_id,
+                    has_older_history: true,
+                    result: Box::new(
+                        history_flow::attach_session_event_stream_with_window_request(
+                            &client,
+                            session_id,
+                            event_sender,
+                            initial_window_request,
+                            |snapshot| {
+                                let _result = streaming_sender.try_send(
+                                    TuiEffectResult::SessionOpenProgress {
+                                        snapshot: snapshot.clone(),
+                                    },
+                                );
+                            },
+                        )
+                        .await,
+                    ),
                 }
             }
-            Self::ClearStreamingPresentation => TuiEffectResult::StreamingPresentationPersisted {
-                result: bcode_config::clear_tui_streaming_presentation_override()
-                    .map_err(|error| error.to_string()),
-                policy: None,
-            },
-            Self::ReconcileAuthSecurity { config } => TuiEffectResult::AuthSecurityReconciled {
-                status: session_flow::auth_security_status(&config),
-            },
+            local @ (Self::LoadConfig
+            | Self::PersistThemeSelection { .. }
+            | Self::ClearThemeSelection
+            | Self::PersistProfileSelection { .. }
+            | Self::PersistStreamingPresentation { .. }
+            | Self::ClearStreamingPresentation
+            | Self::ReconcileAuthSecurity { .. }) => {
+                local.run_local_state().unwrap_or_else(|other| {
+                    other.application_access_failed(ClientError::Protocol(
+                        "local state effect unavailable".into(),
+                    ))
+                })
+            }
+            managed @ (Self::RespondManagedInteraction { .. }
+            | Self::ConfigureManagedSession { .. }
+            | Self::LoadManagedModels) => managed.application_access_failed(ClientError::Protocol(
+                "Native controls require a managed conversation".into(),
+            )),
             Self::LoadDraftStatus {
                 launch_working_directory,
             } => Box::pin(load_draft_status(&client, launch_working_directory)).await,
@@ -4182,8 +4676,7 @@ mod projection_paging_tests {
                             EffectSchedule::Cancel,
                             Some(&client),
                             Some(&client),
-                            None,
-                            None,
+                            ManagedEffectAccess::default(),
                             handle,
                         ))
                         .with_command(Command::concurrent(async move {

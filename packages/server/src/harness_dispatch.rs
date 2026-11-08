@@ -144,7 +144,8 @@ pub trait ManagedSessionBackend: Send + Sync {
         Box::pin(async { Err(ManagedHarnessError::Unsupported) })
     }
     /// Poll canonical native observations for an admitted interactive attachment, letting the
-    /// adapter hold the page for up to `wait_millis`. Returns the committed page's progress.
+    /// adapter hold the page for up to `wait_millis`. Returns the committed page's progress,
+    /// counting durable observations, hydration requests and transient live updates.
     fn poll_observations<'a>(
         &'a self,
         caller: &'a ManagedCaller,
@@ -164,6 +165,11 @@ pub trait ManagedSessionBackend: Send + Sync {
     ) -> Task<'a, ()> {
         let _ = (caller, query);
         Box::pin(async { Err(ManagedHarnessError::Unsupported) })
+    }
+    /// Managed sessions whose committed evidence shows live native foreground work or
+    /// unsettled background work. Idle shutdown is blocked while this is nonzero.
+    fn busy_native_sessions(&self) -> usize {
+        0
     }
     /// Resolve auth from the same admitted canonical runtime.
     fn auth_scope<'a>(
@@ -625,13 +631,16 @@ impl<S: ManagedHarnessStore, A: ManagedSessionAdmission> ManagedSessionBackend
             let closes = owners.into_values().map(|owner| async move {
                 let mutation_id = format!("shutdown:{}", uuid::Uuid::new_v4());
                 let response = self.runtime.close(&owner, mutation_id.clone()).await?;
-                if crate::harness::recovery_published() {
-                    let state = self
-                        .state
-                        .upgrade()
-                        .ok_or(ManagedHarnessError::Unavailable)?;
-                    record_shutdown_transport_release(&state, &owner, mutation_id, &response)
-                        .await?;
+                // Release evidence makes the session recoverable after restart. Its absence
+                // (unsupported plugin, prepared-only target, unproven reap) never turns an
+                // acknowledged Close into a shutdown failure.
+                if crate::harness::recovery_published()
+                    && let Some(state) = self.state.upgrade()
+                    && let Err(error) =
+                        record_shutdown_transport_release(&state, &owner, mutation_id, &response)
+                            .await
+                {
+                    tracing::info!(target: "bcode_server::harness", category = %error, "managed transport release evidence unavailable; session is not recoverable");
                 }
                 Ok::<_, ManagedHarnessError>(response)
             });
@@ -694,6 +703,7 @@ impl<S: ManagedHarnessStore, A: ManagedSessionAdmission> ManagedSessionBackend
                     | HarnessRequestKind::Respond { .. }
                     | HarnessRequestKind::Interrupt(_)
                     | HarnessRequestKind::Close(_)
+                    | HarnessRequestKind::Configure(_)
                     | HarnessRequestKind::Reconcile(_)
             ) && let Some(response) = self.admission.retained_result(caller, &call).await?
             {
@@ -741,7 +751,7 @@ impl<S: ManagedHarnessStore, A: ManagedSessionAdmission> ManagedSessionBackend
             )
             .await;
             self.record_explicit_release(&state, &owner, release_mutation, &result)
-                .await?;
+                .await;
             if let Err(error) = &result {
                 log_admitted_failure(operation, *error, failed_submit_scope.is_some());
                 if let Some(scope) = failed_submit_scope {
@@ -752,6 +762,9 @@ impl<S: ManagedHarnessStore, A: ManagedSessionAdmission> ManagedSessionBackend
             drop(state);
             result
         })
+    }
+    fn busy_native_sessions(&self) -> usize {
+        self.runtime.busy_native_sessions()
     }
     fn auth_scope<'a>(
         &'a self,
@@ -774,6 +787,7 @@ const fn call_target(
         HarnessRequestKind::Interrupt(value) | HarnessRequestKind::Close(value) => {
             Some(&value.target)
         }
+        HarnessRequestKind::Configure(value) => Some(&value.target),
         _ => None,
     }
 }
@@ -817,20 +831,32 @@ impl<S: ManagedHarnessStore, A: ManagedSessionAdmission> CanonicalBackend<S, A> 
         })
     }
 
+    /// Best-effort release evidence after an explicit Close. The Close outcome itself is
+    /// already canonical; missing release evidence only means the session is not recoverable.
     async fn record_explicit_release(
         &self,
         state: &Arc<crate::ServerState>,
         owner: &HarnessOwner,
         mutation: Option<String>,
         result: &Result<HarnessServiceResponse, ManagedHarnessError>,
-    ) -> Result<(), ManagedHarnessError> {
-        if crate::harness::recovery_published()
-            && let (Some(mutation), Ok(response)) = (mutation, result)
-        {
-            record_shutdown_transport_release(state, owner, mutation, response).await?;
-            self.owners.lock().await.remove(&owner.session_id);
+    ) {
+        let (Some(mutation), Ok(response)) = (mutation, result) else {
+            return;
+        };
+        if !matches!(
+            &response.kind,
+            bcode_harness_models::HarnessServiceResponseKind::Acknowledged { .. }
+        ) {
+            return;
         }
-        Ok(())
+        if crate::harness::recovery_published()
+            && let Err(error) =
+                record_shutdown_transport_release(state, owner, mutation, response).await
+        {
+            tracing::info!(target: "bcode_server::harness", category = %error, "managed transport release evidence unavailable; session is not recoverable");
+        }
+        // An acknowledged Close leaves no transport for shutdown cleanup to close again.
+        self.owners.lock().await.remove(&owner.session_id);
     }
 
     async fn observe_admitted(
@@ -881,6 +907,9 @@ impl<S: ManagedHarnessStore, A: ManagedSessionAdmission> CanonicalBackend<S, A> 
             HarnessRequestKind::Interrupt(_) | HarnessRequestKind::Close(_)
         ) {
             self.tool_queues.revoke(state, owner.session_id).await;
+            Ok(None)
+        } else if matches!(call.harness.kind, HarnessRequestKind::Configure(_)) {
+            // Configuration neither issues nor revokes native tool grants.
             Ok(None)
         } else {
             self.tool_queues.install(state, caller, call).await
@@ -966,6 +995,15 @@ impl<S: ManagedHarnessStore, A: ManagedSessionAdmission> CanonicalBackend<S, A> 
                 } else {
                     self.runtime.reconcile(owner, request_id, value).await
                 }
+            }
+            HarnessRequestKind::Configure(value) => {
+                check(value.target.session_id(), value.target.generation())?;
+                // Mid-session configuration is an interactive client control only.
+                let Some(app) = &application else {
+                    return Err(ManagedHarnessError::Unsupported);
+                };
+                app.configure(owner.session_id, value.mutation_id, value.setting)
+                    .await
             }
             // Native auth envelopes are never accepted from ordinary/model callers.
             HarnessRequestKind::AuthStatus { .. }
@@ -1422,10 +1460,7 @@ mod recovery_route_tests {
     }
 
     #[tokio::test]
-    async fn unpublished_recovery_route_has_no_effects() {
-        if crate::harness::recovery_published() {
-            return;
-        }
+    async fn unauthorized_recovery_route_has_no_effects() {
         let state = Arc::new(crate::tests::test_server_state(
             crate::SessionManager::default(),
         ));
@@ -1607,9 +1642,6 @@ pub(crate) async fn dispatch(
         return dispatch_attachment_poll(state, &caller, &query).await;
     }
     if request.operation == ManagedSessionOperation::Watch {
-        request
-            .validate_envelope()
-            .map_err(|message| ErrorResponse::new("managed_session_invalid", message))?;
         let query = serde_json::from_str::<bcode_ipc::harness::ManagedSessionPollRequest>(
             &request.request_json,
         )
@@ -1650,6 +1682,12 @@ pub(crate) async fn dispatch(
         let call = request
             .decode_call()
             .map_err(|message| ErrorResponse::new("managed_session_invalid", message))?;
+        // Configuration is an interactive client control; others never reach a claim.
+        if matches!(call.harness.kind, HarnessRequestKind::Configure(_))
+            && !matches!(caller, ManagedCaller::Client(_))
+        {
+            return Err(failure(ManagedHarnessError::Unsupported));
+        }
         let backend = state.managed_sessions.get().ok_or_else(|| {
             ErrorResponse::new(
                 "managed_session_storage_unavailable",

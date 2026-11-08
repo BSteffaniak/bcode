@@ -99,9 +99,9 @@ impl crate::SessionManager {
             .map_err(crate::SessionError::EventSerialization)?;
         if retained.is_selected_open()
             && (bcode_session_models::CURRENT_SESSION_EVENT_SCHEMA_VERSION
-                != bcode_session_models::external_harness::SELECTED_OPEN_EVENT_SCHEMA_VERSION
+                < bcode_session_models::external_harness::SELECTED_OPEN_EVENT_SCHEMA_VERSION
                 || bcode_session_models::CURRENT_SESSION_STORAGE_WRITER_EPOCH
-                    != bcode_session_models::external_harness::SELECTED_OPEN_STORAGE_WRITER_EPOCH)
+                    < bcode_session_models::external_harness::SELECTED_OPEN_STORAGE_WRITER_EPOCH)
         {
             return Err(invalid());
         }
@@ -132,7 +132,7 @@ impl crate::SessionManager {
             inventory_commitments: Vec::new(),
             record: ExternalHarnessOperationRecord::Configured {
                 instance: retained.instance.clone(),
-                capabilities,
+                capabilities: Box::new(capabilities),
                 open_request: Some(retained.clone()),
             },
         };

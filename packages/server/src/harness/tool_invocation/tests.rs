@@ -90,6 +90,8 @@ fn configured_fixture(with_open: bool) -> std::pin::Pin<Box<dyn Future<Output = 
             constraints: vec![],
         };
         let capabilities = HarnessCapabilities {
+            model_switch: bcode_harness_models::HarnessCapability::unsupported(),
+            permission_mode: bcode_harness_models::HarnessCapability::unsupported(),
             resume: capability.clone(),
             steering: capability.clone(),
             approval: capability.clone(),

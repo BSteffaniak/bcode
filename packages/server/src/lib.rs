@@ -3306,6 +3306,17 @@ impl ServerState {
                 "daemon has {active_runtime_work} active runtime work item(s); refusing idle-only stop"
             ));
         }
+        // Idle managed sessions remain recoverable after a clean stop; live native turns and
+        // unsettled background work are never killed by an idle-only stop.
+        let busy_managed_sessions = self
+            .managed_sessions
+            .get()
+            .map_or(0, |backend| backend.busy_native_sessions());
+        if busy_managed_sessions > 0 {
+            return Some(format!(
+                "daemon has {busy_managed_sessions} managed session(s) with live native work; refusing idle-only stop"
+            ));
+        }
         let plugin_running = self
             .plugins
             .executor_statuses()
@@ -34401,16 +34412,13 @@ async fn prepare_registered_server_tool_with_provenance(
     cancel_state: &TurnCancelState,
     provenance: Option<PluginInvocationScope>,
 ) -> Result<ToolPreparationResponse, String> {
-    tracing::warn!(target: "bcode_server::harness", stage = "tool_directory_start", "managed preparation progress");
     let working_directory = state
         .sessions
         .session_working_directory(session_id)
         .await
         .map_err(|error| error.to_string())?;
-    tracing::warn!(target: "bcode_server::harness", stage = "tool_directory_done", "managed preparation progress");
     let host_context =
         invocation_service_host_context(state, session_id, &working_directory).await?;
-    tracing::warn!(target: "bcode_server::harness", stage = "tool_context_done", "managed preparation progress");
     let request = ToolPreparationRequest {
         invocation: ToolInvocationDescriptor {
             invocation_id: call.id.clone(),

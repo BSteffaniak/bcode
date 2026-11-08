@@ -12,7 +12,7 @@ import sys
 import time
 import uuid
 
-VERSION = "bcode-offline-claude-fixture 1.0.0"
+VERSION = "2.1.308 (Claude Code)"
 LIMIT = 65536
 
 
@@ -53,6 +53,125 @@ def effect(root, label):
 def mark(root, label):
     # Fixed-label timing only: no frames, credentials or account data.
     (root / (label + ".monotonic_ns")).write_text(str(time.monotonic_ns()), encoding="ascii")
+
+
+def wait_for(root, label, seconds=60):
+    # Bounded test-controlled pause; never consults native state or credentials.
+    deadline = time.monotonic() + seconds
+    while not (root / label).exists():
+        if time.monotonic() >= deadline:
+            (root / (label + ".wait-expired")).touch()
+            raise ValueError()
+        time.sleep(0.01)
+
+
+def stream_event(session, event):
+    emit({"type":"stream_event", "session_id":session, "uuid":str(uuid.uuid4()),
+          "parent_tool_use_id":None, "event":event})
+
+
+def rich_turn(root, session, submission_uuid, content):
+    """Partial-message streaming, thinking, one native tool and its result.
+
+    Enabled only by the explicit `rich-output` oracle so ordinary scenarios keep
+    their exact frame sequence. All text is fixture display content.
+    """
+    message_id = "msg_fixture_" + content
+    if (root / "gate-stream").exists():
+        # Lets a held observation be waiting before any native output for this turn exists.
+        mark(root, "stream-gated")
+        wait_for(root, "open-stream")
+    stream_event(session, {"type":"message_start", "message":{"id":message_id,
+                 "type":"message", "role":"assistant", "content":[],
+                 "model":"claude-fixture", "usage":{"input_tokens":12, "output_tokens":0}}})
+    stream_event(session, {"type":"content_block_start", "index":0,
+                 "content_block":{"type":"thinking", "thinking":"", "signature":""}})
+    stream_event(session, {"type":"content_block_delta", "index":0,
+                 "delta":{"type":"thinking_delta", "thinking":"Considering " + content}})
+    stream_event(session, {"type":"content_block_stop", "index":0})
+    stream_event(session, {"type":"content_block_start", "index":1,
+                 "content_block":{"type":"text", "text":""}})
+    stream_event(session, {"type":"content_block_delta", "index":1,
+                 "delta":{"type":"text_delta", "text":"Streaming "}})
+    stream_event(session, {"type":"content_block_delta", "index":1,
+                 "delta":{"type":"text_delta", "text":"reply " + content}})
+    mark(root, "stream-deltas-emitted")
+    if (root / "hold-stream").exists():
+        # Lets a held observation return the live sidecar before durable text exists.
+        wait_for(root, "release-stream")
+    stream_event(session, {"type":"content_block_stop", "index":1})
+    stream_event(session, {"type":"content_block_start", "index":2,
+                 "content_block":{"type":"tool_use", "id":"toolu_fixture_" + content,
+                                  "name":"Read", "input":{}}})
+    stream_event(session, {"type":"content_block_delta", "index":2,
+                 "delta":{"type":"input_json_delta",
+                          "partial_json":"{\"file_path\":\"/fixture/notes.txt\"}"}})
+    stream_event(session, {"type":"content_block_stop", "index":2})
+    stream_event(session, {"type":"message_delta", "delta":{"stop_reason":"tool_use"},
+                 "usage":{"output_tokens":34}})
+    stream_event(session, {"type":"message_stop"})
+    emit({"type":"assistant", "session_id":session, "uuid":str(uuid.uuid4()),
+          "user_message_uuid":submission_uuid,
+          "message":{"id":message_id, "role":"assistant", "model":"claude-fixture",
+                     "content":[
+                         {"type":"thinking", "thinking":"Considering " + content,
+                          "signature":"fixture-signature"},
+                         {"type":"text", "text":"Streaming reply " + content},
+                         {"type":"tool_use", "id":"toolu_fixture_" + content, "name":"Read",
+                          "input":{"file_path":"/fixture/notes.txt"}}]}})
+    if (root / ("approve-" + content)).exists():
+        # Like the real CLI in default permission mode: the native tool waits for an
+        # explicit host decision before it runs and produces a result.
+        await_tool_approval(root, session, content)
+    emit({"type":"user", "session_id":session, "uuid":str(uuid.uuid4()),
+          "parent_tool_use_id":None,
+          "message":{"role":"user", "content":[
+              {"type":"tool_result", "tool_use_id":"toolu_fixture_" + content,
+               "content":"fixture notes", "is_error":False}]}})
+
+
+def answer_mcp_control(frame):
+    """Reply to host MCP status/notification control requests; False if not one."""
+    request = frame.get("request", {}) if frame.get("type") == "control_request" else {}
+    if request.get("subtype") == "mcp_status":
+        emit({"type":"control_response", "response":{"subtype":"success",
+              "request_id":frame["request_id"], "response":{"mcpServers":[
+                  {"name":"bcode-tools", "status":"connected"}]}}})
+        return True
+    if (request.get("subtype") == "mcp_message"
+            and request.get("server_name") == "bcode-tools"
+            and request.get("message", {}).get("method")
+                == "notifications/tools/list_changed"):
+        # Acknowledge notification receipt only, never invent catalog completion.
+        emit({"type":"control_response", "response":{"subtype":"success",
+              "request_id":frame["request_id"], "response":{}}})
+        return True
+    return False
+
+
+def await_tool_approval(root, session, content):
+    """Request native tool permission and require an explicit allow for this exact tool."""
+    request_id = "native-permission-" + content
+    emit({"type":"control_request", "request_id":request_id,
+          "request":{"subtype":"can_use_tool", "tool_name":"Read",
+                     "input":{"file_path":"/fixture/notes.txt"},
+                     "tool_use_id":"toolu_fixture_" + content}})
+    mark(root, "permission-requested")
+    for _ in range(32):
+        frame = receive(120)
+        if answer_mcp_control(frame):
+            continue
+        response = frame.get("response", {}) if frame.get("type") == "control_response" else {}
+        if response.get("request_id") != request_id or response.get("subtype") != "success":
+            raise ValueError()
+        decision = response.get("response", {})
+        if (decision.get("behavior") != "allow"
+                or decision.get("updatedInput") != {"file_path":"/fixture/notes.txt"}):
+            (root / ("approve-" + content + ".denied")).touch()
+            raise ValueError()
+        effect(root, "approved-" + content)
+        return
+    raise ValueError()
 
 
 def main():
@@ -113,8 +232,10 @@ def main():
     # Real initialize negotiation does not confirm a native session identity.
     # A pre-turn identity waiter deadlocks here and must fail the application
     # acceptance deadline instead of receiving fabricated fixture confirmation.
+    # Like the real CLI, initialize advertises the model keys mid-session switching accepts.
     emit({"type":"control_response", "response":{"subtype":"success",
-          "request_id":frame["request_id"], "response":{}}})
+          "request_id":frame["request_id"], "response":{"models":[
+              {"value":"claude-fixture", "displayName":"Claude Fixture"}]}}})
     mark(root, "initialize-replied")
     (root / "initialized.waiting").touch()
     idle_seconds = 15
@@ -142,13 +263,22 @@ def main():
             submission_uuid_seen = submission_uuid
             emit({"type":"system", "subtype":"session_state_changed",
                   "session_id":session, "state":"running"})
+            rich = (root / "rich-output").exists()
+            if rich:
+                rich_turn(root, session, submission_uuid, content)
             emit({"type":"assistant", "session_id":session, "uuid":str(uuid.uuid4()),
                   "user_message_uuid":submission_uuid,
                   "message":{"role":"assistant",
                              "content":[{"type":"text","text":"reply " + content}]}})
-            emit({"type":"result", "subtype":"success", "session_id":session,
-                  "is_error":False, "result":"reply " + content, "uuid":str(uuid.uuid4()),
-                  "user_message_uuid":submission_uuid, "queued_turn_count":0})
+            result = {"type":"result", "subtype":"success", "session_id":session,
+                      "is_error":False, "result":"reply " + content, "uuid":str(uuid.uuid4()),
+                      "user_message_uuid":submission_uuid, "queued_turn_count":0}
+            if rich:
+                result.update({"duration_ms":1500, "total_cost_usd":0.0012,
+                               "usage":{"input_tokens":12, "output_tokens":34,
+                                        "cache_read_input_tokens":5,
+                                        "cache_creation_input_tokens":6}})
+            emit(result)
             emit({"type":"system", "subtype":"session_state_changed",
                   "session_id":session, "state":"idle"})
         elif frame.get("type") == "user":
@@ -205,17 +335,16 @@ def main():
                   "user_message_uuid":submission_uuid, "queued_turn_count":0})
             emit({"type":"system", "subtype":"session_state_changed",
                   "session_id":session, "state":"idle"})
+        elif answer_mcp_control(frame):
+            pass
         elif (frame.get("type") == "control_request"
-              and frame.get("request", {}).get("subtype") == "mcp_status"):
-            emit({"type":"control_response", "response":{"subtype":"success",
-                  "request_id":frame["request_id"], "response":{"mcpServers":[
-                      {"name":"bcode-tools", "status":"connected"}]}}})
-        elif (frame.get("type") == "control_request"
-              and frame.get("request", {}).get("subtype") == "mcp_message"
-              and frame["request"].get("server_name") == "bcode-tools"
-              and frame["request"].get("message", {}).get("method")
-                  == "notifications/tools/list_changed"):
-            # Acknowledge notification receipt only, never invent catalog completion.
+              and frame.get("request", {}).get("subtype") in {"set_model", "set_permission_mode"}):
+            # Mid-session configuration: acknowledge and record a bounded fixed-label oracle.
+            request = frame["request"]
+            value = request.get("model") if request["subtype"] == "set_model" else request.get("mode")
+            if not isinstance(value, str) or not value or len(value) > 64 or not value.replace("-", "").replace("_", "").replace(".", "").isalnum():
+                raise ValueError()
+            effect(root, request["subtype"].replace("_", "-") + "-" + value)
             emit({"type":"control_response", "response":{"subtype":"success",
                   "request_id":frame["request_id"], "response":{}}})
         elif frame.get("request", {}).get("subtype") == "interrupt":

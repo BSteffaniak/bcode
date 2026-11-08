@@ -137,7 +137,12 @@ impl ActiveChat {
         format: bcode_command::CommandTextFormat,
     ) {
         let source_id = source_id.into();
-        if let Some(session_id) = self.attached_session_id() {
+        // A managed conversation's canonical log belongs to the native harness; host notes
+        // stay ephemeral rather than being appended to it.
+        if let Some(session_id) = self
+            .attached_session_id()
+            .filter(|_| self.app.managed_execution_session().is_none())
+        {
             self.pending_effects
                 .start_ordered(super::effects::TuiEffect::AppendPresentationNote {
                     session_id,
@@ -325,6 +330,9 @@ fn start_switch_session_at_sequence(
     initial_window_request: bcode_session_models::ProjectionWindowRequest,
     anchor_sequence: Option<u64>,
 ) {
+    if managed_navigation_intercepted(chat, Some(next_session_id)) {
+        return;
+    }
     if let Some(event_task) = chat.event_task.take() {
         event_task.abort();
     }
@@ -477,7 +485,32 @@ pub fn auth_security_status(config: &bcode_config::BcodeConfig) -> Option<String
         .map(|diagnostic| format!("⚠ {} Run `bcode auth status`.", diagnostic.message))
 }
 /// Reset the active chat to an unpersisted draft session.
+/// A managed root owns exactly one canonical session and has no model application access.
+/// Navigation elsewhere ends the managed root and lets the outer journey open the target
+/// through its own route (managed reattach or ordinary chat). Returns whether it intercepted.
+fn managed_navigation_intercepted(chat: &mut ActiveChat, target: Option<SessionId>) -> bool {
+    let Some(owner) = chat.app.managed_execution_session() else {
+        return false;
+    };
+    if target == Some(owner) {
+        chat.app
+            .set_status("Already viewing this managed conversation".to_owned());
+    } else {
+        chat.app
+            .request_managed_exit(super::app::ManagedExitRequest::Navigate(target));
+        chat.app.set_status(if target.is_some() {
+            "Leaving the managed conversation to open the selected session…".to_owned()
+        } else {
+            "Leaving the managed conversation to start a new session…".to_owned()
+        });
+    }
+    true
+}
+
 pub fn switch_to_draft_session(chat: &mut ActiveChat) {
+    if managed_navigation_intercepted(chat, None) {
+        return;
+    }
     if let Some(event_task) = chat.event_task.take() {
         event_task.abort();
     }

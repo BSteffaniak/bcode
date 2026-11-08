@@ -1139,6 +1139,7 @@ pub(super) fn target(call: &ManagedSessionCall) -> Result<SessionId, ManagedHarn
         HarnessRequestKind::Interrupt(value) | HarnessRequestKind::Close(value) => {
             value.target.session_id()
         }
+        HarnessRequestKind::Configure(value) => value.target.session_id(),
         HarnessRequestKind::Reconcile(value) => &value.session_id,
         HarnessRequestKind::Inspect => return call.session_id.ok_or(ManagedHarnessError::Invalid),
         _ => return Err(ManagedHarnessError::Unsupported),
@@ -1295,6 +1296,8 @@ mod tests {
             constraints: vec![],
         };
         let capabilities = bcode_harness_models::HarnessCapabilities {
+            model_switch: bcode_harness_models::HarnessCapability::unsupported(),
+            permission_mode: bcode_harness_models::HarnessCapability::unsupported(),
             resume: cap.clone(),
             steering: cap.clone(),
             approval: cap.clone(),

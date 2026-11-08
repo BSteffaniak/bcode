@@ -253,14 +253,27 @@ pub fn normalize_canonical_row_for_writer_epoch(
     if let SessionEventKind::ExternalHarnessOperation { operation } = &normalized.event.kind
         && (operation.version == 2 || operation.is_selected_open())
         && (source_writer_epoch
-            != bcode_session_models::external_harness::SELECTED_OPEN_STORAGE_WRITER_EPOCH
+            < bcode_session_models::external_harness::SELECTED_OPEN_STORAGE_WRITER_EPOCH
             || row.schema_version
-                != bcode_session_models::external_harness::SELECTED_OPEN_EVENT_SCHEMA_VERSION)
+                < bcode_session_models::external_harness::SELECTED_OPEN_EVENT_SCHEMA_VERSION)
     {
         return Err(HistoricalSessionEventError::InvalidEvent {
             schema_version: row.schema_version,
             event_kind: row.event_kind.clone(),
             reason: "selected-model operations require writer epoch 25 and event schema 57".into(),
+        });
+    }
+    if let SessionEventKind::ExternalHarnessOperation { operation } = &normalized.event.kind
+        && operation.requires_native_parity()
+        && (source_writer_epoch
+            < bcode_session_models::external_harness::NATIVE_PARITY_STORAGE_WRITER_EPOCH
+            || row.schema_version
+                < bcode_session_models::external_harness::NATIVE_PARITY_EVENT_SCHEMA_VERSION)
+    {
+        return Err(HistoricalSessionEventError::InvalidEvent {
+            schema_version: row.schema_version,
+            event_kind: row.event_kind.clone(),
+            reason: "native-parity operations require writer epoch 26 and event schema 58".into(),
         });
     }
     validate_recovery_writer(&normalized.event, source_writer_epoch)?;
@@ -294,20 +307,27 @@ pub fn normalize_canonical_row_for_writer_epoch(
 
 fn validate_recovery_writer(
     event: &SessionEvent,
-    _source_writer_epoch: u32,
+    source_writer_epoch: u32,
 ) -> Result<(), HistoricalSessionEventError> {
     use bcode_session_models::ExternalHarnessOperationRecord;
+    use bcode_session_models::external_harness::{
+        NATIVE_PARITY_EVENT_SCHEMA_VERSION, NATIVE_PARITY_STORAGE_WRITER_EPOCH,
+        recovery_storage_available,
+    };
     if let SessionEventKind::ExternalHarnessOperation { operation } = &event.kind
         && matches!(
             operation.record,
             ExternalHarnessOperationRecord::TransportReleased { .. }
                 | ExternalHarnessOperationRecord::RecoveryPrepared { .. }
         )
+        && (!recovery_storage_available()
+            || source_writer_epoch < NATIVE_PARITY_STORAGE_WRITER_EPOCH
+            || event.schema_version < NATIVE_PARITY_EVENT_SCHEMA_VERSION)
     {
         return Err(HistoricalSessionEventError::InvalidEvent {
             schema_version: event.schema_version,
             event_kind: "external_harness_operation".into(),
-            reason: "recovery operations are unpublished and unsupported".into(),
+            reason: "recovery operations require writer epoch 26 and event schema 58".into(),
         });
     }
     Ok(())
@@ -431,16 +451,17 @@ fn decode_for_migration(
     {
         return envelope.decode_child_session_created();
     }
-    // Schemas 51 through 55 are representation-compatible except for child creation above.
+    // Schemas 51 through 57 are representation-compatible except for child creation above
+    // (schema 56 is reserved and rejected as unreleased before this point).
     // Schema 53 external observations retain their original evidence class: replay must never
     // promote a result, acceptance or settlement into a newly introduced terminal disposition.
     // Preserve recorded usage and all admission identities rather than applying older policy.
-    if matches!(envelope.schema_version(), 51..=55)
+    if matches!(envelope.schema_version(), 51..=57)
         && crate::is_released_event_kind_schema(source_kind, envelope.schema_version())
         && crate::RELEASED_EVENT_VARIANTS.iter().any(|variant| {
             variant.kind == source_kind
                 && (variant.treatment == crate::ReleasedEventTreatment::CurrentEquivalent
-                    || (matches!(envelope.schema_version(), 53..=55)
+                    || (matches!(envelope.schema_version(), 53..=57)
                         && variant.treatment == crate::ReleasedEventTreatment::ExplicitConversion))
         })
     {
@@ -613,6 +634,59 @@ mod tests {
     }
 
     #[test]
+    fn native_parity_records_cannot_be_smuggled_into_released_schemas() {
+        let observation = |kind: serde_json::Value| serde_json::json!({"kind": "observation_page", "page": {"observations": [{"kind": kind}]}});
+        let records = [
+            observation(serde_json::json!({"kind": "reasoning", "text": "", "opaque": false})),
+            observation(serde_json::json!({"kind": "tool_result", "native_tool_id": "t"})),
+            observation(serde_json::json!({"kind": "usage", "input_tokens": 1})),
+            observation(serde_json::json!({"kind": "text", "text": "", "segment_id": "s"})),
+            observation(serde_json::json!({"kind": "tool", "input_json": "{}"})),
+            serde_json::json!({"kind": "delivery_claimed", "request": {
+                "kind": {"operation": "configure", "request": {}}
+            }}),
+        ];
+        for schema in [53_u16, 54, 55, 57] {
+            for record in &records {
+                let payload = serde_json::json!({
+                    "schema_version": schema,
+                    "sequence": 1,
+                    "timestamp_ms": 2,
+                    "session_id": SESSION_ID,
+                    "kind": {"external_harness_operation": {"operation": {
+                        "version": 1,
+                        "record": record
+                    }}}
+                })
+                .to_string();
+                assert!(
+                    decode_for_migration(&payload, |_| {
+                        panic!("native-parity historical payload must fail before decoding")
+                    })
+                    .is_err(),
+                    "schema {schema} must reject {record}"
+                );
+            }
+        }
+        let observation_event = serde_json::json!({
+            "schema_version": 57,
+            "sequence": 1,
+            "timestamp_ms": 2,
+            "session_id": SESSION_ID,
+            "kind": {"external_observation_recorded": {"version": 1, "observation": {
+                "kind": {"kind": "usage", "input_tokens": 1}
+            }}}
+        })
+        .to_string();
+        assert!(
+            decode_for_migration(&observation_event, |_| {
+                panic!("native-parity observation must fail before decoding")
+            })
+            .is_err()
+        );
+    }
+
+    #[test]
     fn selected_open_cannot_be_smuggled_into_released_harness_payloads() {
         for record in [
             serde_json::json!({"kind": "configured", "open_request": {
@@ -698,7 +772,7 @@ mod tests {
     fn schema_52_fixture_migrates_losslessly_without_creating_checkpoints() {
         let plan = crate::plan_writer_epoch_migration(16).expect("known lossless upgrade");
         assert_eq!(plan.target_writer_epoch, crate::CURRENT_WRITER_EPOCH);
-        assert_eq!(plan.steps.len(), 8);
+        assert_eq!(plan.steps.len(), 9);
         assert_eq!(plan.steps[0].id, "session-writer-epoch-16-to-17");
         assert_eq!(plan.steps[1].id, "session-writer-epoch-17-to-18");
         assert_eq!(plan.steps[2].id, "session-writer-epoch-18-to-19");
@@ -707,6 +781,7 @@ mod tests {
         assert_eq!(plan.steps[5].id, "session-writer-epoch-21-to-22");
         assert_eq!(plan.steps[6].id, "session-writer-epoch-22-to-23");
         assert_eq!(plan.steps[7].id, "session-writer-epoch-23-to-25");
+        assert_eq!(plan.steps[8].id, "session-writer-epoch-25-to-26");
         let fixture = include_str!("../fixtures/stores/epoch-16-schema-52-events.jsonl");
         let mut seen = BTreeSet::new();
         for payload in fixture.lines() {
@@ -1016,8 +1091,8 @@ mod tests {
         let HistoricalDecode::Converted { event, metadata } = decoded else {
             panic!("historical usage should be migration-owned conversion");
         };
-        assert_eq!(crate::CURRENT_EVENT_SCHEMA, 57);
-        assert_eq!(crate::LATEST_HISTORICAL_EVENT_SCHEMA, 55);
+        assert_eq!(crate::CURRENT_EVENT_SCHEMA, 58);
+        assert_eq!(crate::LATEST_HISTORICAL_EVENT_SCHEMA, 57);
         // Classification preserves the source envelope; canonical normalization alone
         // advances its schema after historical semantics have been interpreted.
         assert_eq!(event.schema_version, metadata.source_schema);
@@ -1979,7 +2054,7 @@ mod tests {
         assert!(normalized.metric_counter.is_none());
         let plan = crate::plan_writer_epoch_migration(17).unwrap();
         assert_eq!(plan.target_writer_epoch, crate::CURRENT_WRITER_EPOCH);
-        assert_eq!(plan.steps.len(), 7);
+        assert_eq!(plan.steps.len(), 8);
     }
 
     #[test]
@@ -2885,7 +2960,7 @@ mod tests {
                 });
                 assert!(matches!(result,
                     Err(HistoricalSessionEventError::InvalidEvent { reason, .. })
-                        if reason == "recovery operations are unpublished and unsupported"
+                        if reason == "recovery operations require event schema 58"
                 ));
             }
         }
@@ -2998,7 +3073,15 @@ mod tests {
         let before = event.clone();
         assert!(validate_recovery_writer(&event, 24).is_err());
         assert!(validate_recovery_writer(&event, 25).is_err());
+        assert!(
+            validate_recovery_writer(&event, 26).is_err(),
+            "released schema rows cannot carry recovery"
+        );
         assert_eq!(event, before);
+        let mut fenced = event.clone();
+        fenced.schema_version = 58;
+        validate_recovery_writer(&fenced, 26).unwrap();
+        assert!(validate_recovery_writer(&fenced, 25).is_err());
         let configured = serde_json::from_value::<SessionEvent>(payload).unwrap();
         for writer in [21, 22, 23, 24] {
             validate_recovery_writer(&configured, writer).unwrap();
@@ -3031,12 +3114,17 @@ mod tests {
                     id: "session-writer-epoch-23-to-25",
                     source_writer_epoch: 23,
                     target_writer_epoch: 25,
+                },
+                crate::MigrationStepDescriptor {
+                    id: "session-writer-epoch-25-to-26",
+                    source_writer_epoch: 25,
+                    target_writer_epoch: 26,
                 }
             ]
         );
         let plan = crate::plan_writer_epoch_migration(19).unwrap();
         assert_eq!(plan.target_writer_epoch, crate::CURRENT_WRITER_EPOCH);
-        assert_eq!(plan.steps.len(), 5);
+        assert_eq!(plan.steps.len(), 6);
         assert_eq!(
             plan.steps[0],
             crate::MigrationStepDescriptor {
@@ -3047,10 +3135,10 @@ mod tests {
         );
         assert_eq!(plan.steps[1..], latest.steps);
         let old = crate::plan_writer_epoch_migration(18).unwrap();
-        assert_eq!(old.steps.len(), 6);
+        assert_eq!(old.steps.len(), 7);
         assert_eq!(old.steps[0].id, "session-writer-epoch-18-to-19");
         assert_eq!(old.steps[1..], plan.steps);
-        assert_eq!(crate::CURRENT_EVENT_SCHEMA, 57);
+        assert_eq!(crate::CURRENT_EVENT_SCHEMA, 58);
         assert!(matches!(
             crate::plan_writer_epoch_migration_with_registry(21, 20, &crate::MIGRATION_STEPS),
             Err(crate::MigrationPlanError::FutureWriter { .. })

@@ -103,6 +103,8 @@ async fn retained_status_fixture(
         ],
     };
     let capabilities = HarnessCapabilities {
+        model_switch: bcode_harness_models::HarnessCapability::unsupported(),
+        permission_mode: bcode_harness_models::HarnessCapability::unsupported(),
         resume: capability.clone(),
         steering: capability.clone(),
         approval: capability.clone(),

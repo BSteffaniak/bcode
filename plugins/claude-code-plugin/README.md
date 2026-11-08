@@ -18,7 +18,9 @@ Resolved plugin configuration is a typed `instances` map. Each instance has:
 * `executable`: explicit absolute executable path.
 * `config_directory`: explicit absolute `CLAUDE_CONFIG_DIR`; the incoming config
   namespace and auth credential namespace must both equal this selected path.
-* `exact_version`: exact expected native `--version` output.
+* `exact_version`: configured expected native `--version` output. Launch accepts any
+  well-formed `X.Y.Z (Claude Code)` executable version (drift); bindings and model
+  discovery report the actual probed version. See "Native parity" below.
 * `verified_session_state`: defaults false; only enable after testing this exact
   executable's native session-state/background-task behavior. This mode declares
   authoritative settlement `Supported`: the SDK itself requires idle plus a
@@ -82,9 +84,11 @@ interrupts and tool-queue drains are never queued behind it.
   Missing state after restart reconciles as uncertain, never not-applied.
 * Results remain nonterminal. Only verified native settlement is classified as
   settled. No quiet timeout becomes a successful execution result.
-* Assistant text, native tool/subagent observations, single-question single-select
-  clarification, native approval, callback cancellation and scoped MCP assistance
-  normalization. Raw protocol/tool inputs remain transient and are not emitted.
+* Assistant text, reasoning, native tool/subagent observations with bounded inputs,
+  native tool results, usage, single-question single-select clarification, native
+  approval with a bounded input preview, callback cancellation and scoped MCP
+  assistance normalization. Raw protocol frames remain transient; tool inputs and
+  outputs leave only bounded, as untrusted display text (see "Native parity").
 * Native MCP callbacks are never promoted into parent assistance from observed
   names alone. Until a verified host parent scope is available, discovery exposes
   no tools and requests receive explicit unsupported protocol responses.
@@ -97,8 +101,9 @@ interrupts and tool-queue drains are never queued behind it.
 
 * Uses library control `initialize()` without waiting for identity. New sessions
   select the retained Bcode UUID via `spawn_new_with_sdk_servers`; exact resume
-  selects only the host-provided native ID. Open returns `Prepared` while the
-  selection is merely requested, and `Opened` only for library-confirmed identity.
+  selects only the host-provided native ID. A new-session Open returns `Prepared` while
+  the selection is merely requested, and `Opened` only for library-confirmed identity;
+  an exact resume Open answers `Opened` with the host-verified `open.resume` binding.
   The exact retained `HarnessSessionTarget::Prepared` permits one first submission
   on the same live transport. Native confirmation produces typed `BindingConfirmed`
   before normalized activity. Contradictory IDs terminate; process loss remains
@@ -210,3 +215,69 @@ this plugin cannot relax admission or silently substitute that contract.
 Behavioral tests are written in `src/tests.rs` and `src/capabilities.rs`. They have
 not been compiled or executed. Runtime/package/plugin/architecture validation and
 end-to-end acceptance remain pending.
+
+## Native parity
+
+This section describes how the plugin presents a managed Claude Code session like a
+native Bcode session (shared contract: `docs/claude-code-native-parity-contract.md`).
+Everything below is untrusted display content: observed native tools never dispatch Bcode
+tools, and nothing here authorizes a native action.
+
+* **Segment identities.** Native stream-json emits one `assistant` frame per API content
+  block, all sharing `message.id`. The normalizer numbers blocks per message in arrival
+  order, so `Text`/`Reasoning` carry `segment_id = "<message.id>:<block index>"`, the same
+  index partial `stream_event` frames use. Frames without a usable message ID stay
+  unsegmented.
+* **Reasoning.** `thinking` blocks become `Reasoning { opaque: false }` (truncated to the
+  text bound; the native `signature` is never copied). `redacted_thinking` becomes
+  `Reasoning { opaque: true, text: "" }`.
+* **Tools.** `tool_use` blocks carry `input_json`, the compact JSON input within
+  `MAX_HARNESS_TOOL_INPUT_BYTES`. Oversized inputs become the valid JSON summary
+  `{"truncated":true,"original_bytes":N,"preview":"<compact prefix>"}`.
+* **Tool results.** `tool_result` blocks in `user` frames become `ToolResult` with text
+  blocks joined by newlines, images summarized as `[image]`, other block types as
+  `[unsupported content]`, the native `is_error`, and `truncated` when the output was cut
+  to the text bound.
+* **Usage.** Result frames with `usage` add `Usage` (input/output/cache token counters,
+  `total_cost_usd` converted to micros when finite and plausible, `duration_ms`, and the
+  latest native model from `system/init` or `assistant.message.model`).
+* **Live sidecar.** Partial `stream_event` frames (`message_start`,
+  `content_block_start`, `text_delta`, `thinking_delta`) produce `HarnessLiveUpdate`
+  entries with the same segment IDs and running UTF-8 byte offsets. Updates are coalesced,
+  bounded (128 updates, 256 KiB per page, 16 KiB per update), offered once in the next
+  observe page's `live` field (including a repeated unacknowledged page), and never
+  retained or digested. A page with nothing to transfer (no observations, pending page,
+  gap or hydration request), such as a live-only or idle page, carries no retention page,
+  so streaming does not force one canonical commit per coalesced window. Under pressure a segment's updates are dropped and later appends
+  for that segment are suppressed instead of leaving an offset hole; durable text stays
+  authoritative. Subagent streams, signatures and tool-input deltas are not presented. A
+  waiting `observe` returns when live text is pending, after a 40 ms coalescing window.
+* **Approvals.** `can_use_tool` approvals carry `tool_name` and a pretty-printed,
+  8 KiB-bounded `input_preview`. Questions keep their shape and no tool metadata.
+  `AskUserQuestion` with `multiSelect` (and multi-question forms) stay fail-closed: the
+  portable `Answer { choice_id, text }` response names a single choice, so a selection set
+  cannot be represented without lossy free-text guessing.
+* **Configure.** `HarnessRequestKind::Configure` is implemented and advertised as
+  `Supported` (with constraints) for both `model_switch` and `permission_mode`.
+  `Model` sends native `set_model` only between foreground turns (before the first prompt
+  or while the next turn is admissible) and only for an init-advertised model key.
+  `PermissionMode` sends native `set_permission_mode` (`default`, `plan`, `acceptEdits`).
+  `Acknowledged` is returned only after the correlated native control response. Each
+  mutation identity is retained; a repeat reports `Uncertain` and is never re-sent.
+  Admission refusals map to `Conflict`/`InvalidRequest`; native errors or mismatched
+  acknowledgements map to `Uncertain`.
+* **Recovery.** `prepare_resume` validates the exact host-constructed N+1 resume
+  selection (instance, generation, native session UUID, resumable native version, launch
+  provenance) and no longer answers `Unsupported`. The resumed process uses
+  `--resume=<native id>`, answers the Open with `Opened(open.resume)` (the recorded
+  binding, including its native version; the probed version only gates verified features),
+  sends nothing until the host submits, and starts execution tracking with `fresh = false`.
+  A later native init naming another session fails closed. Prior unresolved work is never replayed or certified.
+* **Versions.** `bcode_claude_code::TESTED_VERSIONS` is the single tested-version list.
+  Exact execution tracking requires `verified_session_state` *and* a tested probed
+  version; advertised alias resolution for model selection also requires a tested
+  version. Setup preparation sets `verified_native_auth` from verified native status and
+  `verified_session_state` from tested-version membership. Output exactly equal to the
+  configured `exact_version` is accepted (untested unless listed); other unparseable
+  versions and wrappers still fail closed. A running process conflicts only if the configured
+  `exact_version` changes under it.

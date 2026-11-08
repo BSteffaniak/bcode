@@ -3,6 +3,20 @@ use crate::{AuthStatus, Error, LaunchOptions, NativeEnvironment};
 use std::{path::Path, time::Duration};
 use tokio::process::Command;
 
+/// Native `--version` outputs whose stream-json, settlement and model-selection contracts
+/// were behaviorally tested against this driver.
+///
+/// Membership gates verified features (exact execution tracking, advertised alias
+/// resolution, setup attestations). Other parseable versions still launch, but only with
+/// the conservative unverified contracts.
+pub const TESTED_VERSIONS: &[&str] = &["2.1.308 (Claude Code)"];
+
+/// Whether an exact native `--version` output is in [`TESTED_VERSIONS`].
+#[must_use]
+pub fn is_tested_version(version: &str) -> bool {
+    TESTED_VERSIONS.contains(&version)
+}
+
 /// Inspect one explicitly resolved executable using only the caller's trusted environment.
 /// This observation is not an exact-version capability attestation.
 /// # Errors
@@ -27,10 +41,14 @@ pub async fn installed_version(
     if !status.success() {
         return Err(Error::Protocol);
     }
-    parse_installed_version(&output)
+    parse_version(&output)
 }
 
-fn parse_installed_version(output: &[u8]) -> Result<String, Error> {
+/// Parse one trimmed native `--version` output of the exact form `X.Y.Z (Claude Code)`.
+/// Wrappers, extra lines and other vendors are rejected rather than guessed.
+/// # Errors
+/// Returns `Protocol` for non-UTF-8, oversized, multi-line or differently shaped output.
+pub fn parse_version(output: &[u8]) -> Result<String, Error> {
     let value = std::str::from_utf8(output)
         .map_err(|_| Error::Protocol)?
         .trim();
@@ -78,16 +96,29 @@ mod tests {
     #[test]
     fn installation_version_is_exact_and_vendor_scoped() {
         assert_eq!(
-            parse_installed_version(b"2.1.308 (Claude Code)\n").unwrap(),
+            parse_version(b"2.1.308 (Claude Code)\n").unwrap(),
             "2.1.308 (Claude Code)"
         );
+        // Untested but well-formed versions parse; tested membership is separate.
+        assert_eq!(
+            parse_version(b"2.2.0 (Claude Code)").unwrap(),
+            "2.2.0 (Claude Code)"
+        );
+        assert!(!is_tested_version("2.2.0 (Claude Code)"));
+        assert!(TESTED_VERSIONS.iter().all(|version| {
+            is_tested_version(version) && parse_version(version.as_bytes()).is_ok()
+        }));
         for output in [
             b"2.1.308".as_slice(),
             b"other tool",
             b"2.1.308 (Claude Code)\nsecret",
             b"x.y.z (Claude Code)",
+            b"fake-claude 1",
+            b"2.1 (Claude Code)",
+            b"2.1.308.1 (Claude Code)",
+            b"wrapper 2.1.308 (Claude Code)",
         ] {
-            assert!(parse_installed_version(output).is_err());
+            assert!(parse_version(output).is_err());
         }
     }
 }

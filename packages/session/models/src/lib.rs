@@ -84,8 +84,10 @@ pub trait SessionCompactionRecoveryDiscoveryApplication: Sync {
 /// Durable session-storage writer epoch shared by runtime and daemon compatibility handshakes.
 ///
 /// Epoch 23 indexes managed claim identity directly on canonical event rows, fencing the
-/// incomplete epoch-22 projection. Event payload schema remains 55.
-pub const CURRENT_SESSION_STORAGE_WRITER_EPOCH: u32 = 25;
+/// incomplete epoch-22 projection. Epoch 25 fences selected-model managed operations (schema 57).
+/// Epoch 26 fences managed native-parity records (schema 58): reasoning, native tool results,
+/// native usage, mid-session configuration requests, and later published recovery records.
+pub const CURRENT_SESSION_STORAGE_WRITER_EPOCH: u32 = 26;
 
 /// Identifies retained turn observations in the existing system-message text contract.
 ///
@@ -1509,7 +1511,10 @@ mod checked_tool_projection_tests {
 }
 
 /// Current persisted session event schema version.
-pub const CURRENT_SESSION_EVENT_SCHEMA_VERSION: u16 = 57;
+///
+/// Schema 58 admits managed native-parity observation variants (reasoning, native tool results,
+/// native usage, segment/input display metadata) and the mid-session configuration request kind.
+pub const CURRENT_SESSION_EVENT_SCHEMA_VERSION: u16 = 58;
 
 /// Stable persisted event kinds emitted by the current session schema.
 ///

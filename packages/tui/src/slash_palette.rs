@@ -203,6 +203,36 @@ impl SlashPalette {
         palette
     }
 
+    /// Complete managed-conversation candidates, derived from the managed allow-list.
+    ///
+    /// Managed chats never discover plugin commands or skills: those would execute through
+    /// model application access that a managed conversation does not have.
+    pub(super) fn managed(query: &str, settings: CompletionConfig) -> Self {
+        let candidates = super::managed_controls::managed_slash_completions()
+            .into_iter()
+            .map(|(command, description)| item(command, description))
+            .collect();
+        let mut palette = Self {
+            discovery_complete: true,
+            candidates,
+            items: Vec::new(),
+            explicitly_selected: false,
+            selected: 0,
+            query: String::new(),
+        };
+        palette.refilter(query, settings);
+        palette
+    }
+
+    /// Return candidate commands in presentation order.
+    #[cfg(test)]
+    pub(crate) fn candidate_commands_for_test(&self) -> Vec<&str> {
+        self.candidates
+            .iter()
+            .map(|item| item.command.as_str())
+            .collect()
+    }
+
     /// Refilter cached discovery synchronously, retaining only intentional navigation.
     pub fn refilter(&mut self, query: &str, settings: CompletionConfig) {
         let previous = self.explicit_selection().map(str::to_owned);

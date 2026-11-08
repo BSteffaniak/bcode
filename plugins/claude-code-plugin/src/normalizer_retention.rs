@@ -276,6 +276,8 @@ impl Normalizer {
         observations
     }
     pub fn event(&mut self, event: Event) -> Vec<HarnessObservation> {
+        // Live text is transient and offered on the next page regardless of staging.
+        self.observe_live(&event);
         if !self.staging.enabled {
             return self.event_ready(event);
         }

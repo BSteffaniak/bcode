@@ -476,6 +476,7 @@ impl OfflineHarness {
                     .collect();
                 self.polls += 1;
                 HarnessServiceResponseKind::Observations(HarnessObservationPage {
+                    live: Vec::new(),
                     retention: None,
                     hydration_requests: Vec::new(),
                     inventory_page: None,
@@ -701,6 +702,7 @@ impl OfflineHarness {
             })
             .collect();
         HarnessServiceResponseKind::Observations(HarnessObservationPage {
+            live: Vec::new(),
             retention: None,
             hydration_requests: vec![],
             inventory_page: None,
@@ -727,6 +729,8 @@ fn capabilities() -> HarnessCapabilities {
         constraints: vec![],
     };
     HarnessCapabilities {
+        model_switch: bcode_harness_models::HarnessCapability::unsupported(),
+        permission_mode: bcode_harness_models::HarnessCapability::unsupported(),
         resume: supported.clone(),
         steering: supported.clone(),
         approval: supported.clone(),

@@ -31,6 +31,18 @@ pub fn api_auth_capability() -> HarnessCapability {
 pub fn capabilities(settlement: SettlementSupport) -> HarnessCapabilities {
     let authoritative = settlement == SettlementSupport::VerifiedSessionState;
     HarnessCapabilities {
+        model_switch: HarnessCapability {
+            support: HarnessSupportLevel::Supported,
+            constraints: vec![
+                "Between foreground turns only; init-advertised native model keys only; acknowledgement is the native control response, not proof a later turn used it".into(),
+            ],
+        },
+        permission_mode: HarnessCapability {
+            support: HarnessSupportLevel::Supported,
+            constraints: vec![
+                "Native default, plan and acceptEdits modes; host approval policy still governs every surfaced callback".into(),
+            ],
+        },
         resume: constrained(
             "Exact native session identity and matching executable/config provenance required; no most-recent-session adoption",
         ),

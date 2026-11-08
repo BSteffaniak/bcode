@@ -3,7 +3,7 @@
 //! No provider, native process, raw SQL, or alternate projector is used. The historical
 //! fixture reconstructs released writer-23/schema-55 canonical rows in current physical
 //! tables; it does not claim that a current writer emitted a historical database.
-//! These tests require the selected-family publication (writer25/schema57).
+//! These tests require the selected-family publication (writer25/schema57) or later.
 //! The coordinator-owned manifest must expose these workspace dev-dependencies:
 //! `bcode_session`, `bcode_session_migration`, `bcode_harness_models`, `bcode_metrics`,
 //! `serde_json`, `tempfile`, `tokio` (macros/rt), and `switchy` (database).
@@ -92,7 +92,7 @@ fn renamed(session: SessionId, sequence: u64) -> SessionEvent {
 
 /// Seed released event representations directly, never relabel current selected evidence.
 async fn released_store(root: &Path, session: SessionId) -> Vec<CanonicalRow> {
-    assert_eq!((CURRENT_WRITER_EPOCH, CURRENT_EVENT_SCHEMA), (25, 57));
+    assert_eq!((CURRENT_WRITER_EPOCH, CURRENT_EVENT_SCHEMA), (26, 58));
     let db = SessionDb::open_turso_in_root(session, root).await.unwrap();
     let kinds = [
         serde_json::json!({"session_created": {
@@ -207,20 +207,26 @@ async fn transaction_state(db: &SessionDb) -> Vec<Vec<Vec<DatabaseValue>>> {
 }
 
 #[tokio::test]
-async fn released_55_migrates_to_57_losslessly_and_remains_writable_after_reopen() {
+async fn released_55_migrates_to_current_losslessly_and_remains_writable_after_reopen() {
     let root = tempfile::tempdir().unwrap();
     let session = SessionId::new();
     let source = released_store(root.path(), session).await;
     let db = migrate(root.path(), session, 23, false).await.unwrap();
-    assert_eq!(db.storage_writer_epoch().await.unwrap(), 25);
+    assert_eq!(
+        db.storage_writer_epoch().await.unwrap(),
+        u64::from(CURRENT_WRITER_EPOCH)
+    );
     let converted = db.canonical_rows_page(0, 32).await.unwrap();
     assert_eq!(source.len(), converted.len());
     for (before, after) in source.iter().zip(&converted) {
         assert_eq!(before.sequence, after.sequence);
         assert_eq!(before.event_kind, after.event_kind);
-        assert_eq!((before.schema_version, after.schema_version), (55, 57));
+        assert_eq!(
+            (before.schema_version, after.schema_version),
+            (55, CURRENT_EVENT_SCHEMA)
+        );
         let mut expected: SessionEvent = serde_json::from_str(&before.payload).unwrap();
-        expected.schema_version = 57;
+        expected.schema_version = CURRENT_EVENT_SCHEMA;
         let actual: SessionEvent = serde_json::from_str(&after.payload).unwrap();
         assert_eq!(actual, expected);
     }
@@ -239,11 +245,14 @@ async fn released_55_migrates_to_57_losslessly_and_remains_writable_after_reopen
         serde_json::from_str(&receipt).unwrap();
     assert_eq!(
         (receipt.source_writer_epoch, receipt.target_writer_epoch),
-        (23, 25)
+        (23, CURRENT_WRITER_EPOCH)
     );
     assert_eq!(
         receipt.migration_step_ids,
-        ["session-writer-epoch-23-to-25"]
+        [
+            "session-writer-epoch-23-to-25",
+            "session-writer-epoch-25-to-26"
+        ]
     );
     assert_eq!(
         (receipt.source_event_count, receipt.target_event_count),
@@ -399,6 +408,8 @@ fn capabilities() -> HarnessCapabilities {
         constraints: vec![],
     };
     HarnessCapabilities {
+        model_switch: bcode_harness_models::HarnessCapability::unsupported(),
+        permission_mode: bcode_harness_models::HarnessCapability::unsupported(),
         resume: c.clone(),
         steering: c.clone(),
         approval: c.clone(),
@@ -452,12 +463,19 @@ async fn verify_selected_corruption_rollback(
     );
     let corrupt_before = transaction_state(&db).await;
     drop(db);
-    assert!(migrate(root, session, 25, false).await.is_err());
+    assert!(
+        migrate(root, session, CURRENT_WRITER_EPOCH, false)
+            .await
+            .is_err()
+    );
     let db = SessionDb::open_existing_turso_in_root(session, root)
         .await
         .unwrap();
     assert_eq!(transaction_state(&db).await, corrupt_before);
-    assert_eq!(db.storage_writer_epoch().await.unwrap(), 25);
+    assert_eq!(
+        db.storage_writer_epoch().await.unwrap(),
+        u64::from(CURRENT_WRITER_EPOCH)
+    );
 }
 
 async fn verify_selected_index_rebuild(
@@ -495,7 +513,9 @@ async fn verify_selected_index_rebuild(
             .is_err()
     );
     drop(db);
-    let db = migrate(root, session, 25, false).await.unwrap();
+    let db = migrate(root, session, CURRENT_WRITER_EPOCH, false)
+        .await
+        .unwrap();
     rebuild_selected_index(&db, root, session).await;
     assert_eq!(db.canonical_rows_page(0, 32).await.unwrap(), before);
     assert_eq!(

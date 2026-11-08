@@ -276,7 +276,7 @@ fn result_fixture_events(session: &mut CodexSession, limit: usize) -> Vec<Harnes
         assert!(page.len() <= limit);
         let ended = page.iter().any(|event| {
             matches!(&event.kind,
-            HarnessObservationKind::Text { text } if text == "result-fixture-end")
+            HarnessObservationKind::Text { text, .. } if text == "result-fixture-end")
         });
         events.extend(page);
         if ended {
@@ -313,7 +313,7 @@ fn completed_final_agent_item_is_complete_correlated_output_before_separate_term
             events[..result_index]
                 .iter()
                 .any(|event| matches!(&event.kind,
-            HarnessObservationKind::Text { text } if text == "partial streamed text"))
+            HarnessObservationKind::Text { text, .. } if text == "partial streamed text"))
         );
         let terminal_index = events.iter().position(|event| matches!(&event.kind,
             HarnessObservationKind::NativeTurnTerminal { native_turn_id, disposition: HarnessTerminalDisposition::Completed } if native_turn_id == "turn-1")).unwrap();

@@ -1,5 +1,5 @@
 #!/bin/sh
-if [ "$1" = "--version" ]; then printf 'fake-claude 1\n'; exit 0; fi
+if [ "$1" = "--version" ]; then printf '%s\n' "${FAKE_VERSION:-2.1.308 (Claude Code)}"; exit 0; fi
 if [ "$1" = "auth" ]; then
   printf '{"loggedIn":true,"authMethod":"claude.ai","configDirectory":"%s"}\n' "$CLAUDE_CONFIG_DIR"
   exit 0
@@ -15,16 +15,43 @@ if [ "$FAKE_CASE" = "resume" ]; then
   case "$*" in *--resume=native-123*) ;; *) exit 3 ;; esac
 fi
 while IFS= read -r frame; do
+  # The child environment has no PATH: use shell expansion only, never external tools.
+  request_id=${frame#*\"request_id\":\"}
+  request_id=${request_id%%\"*}
   case "$frame" in
     *'"subtype":"initialize"'*)
       case "$FAKE_CASE" in
         identity_mismatch) native_id="other-native" ;;
         identity_missing) native_id="" ;;
       esac
-      printf '{"type":"control_response","response":{"subtype":"success","request_id":"rust_1","response":{"commands":[],"models":[],"session_state":"idle"}}}\n'
+      models='[]'
+      if [ "$FAKE_CASE" = "configure" ]; then
+        models='[{"value":"sonnet","displayName":"Sonnet"},{"value":"claude-opus-4-1","displayName":"Opus"}]'
+      fi
+      printf '{"type":"control_response","response":{"subtype":"success","request_id":"%s","response":{"commands":[],"models":%s,"session_state":"idle"}}}\n' "$request_id" "$models"
       ;;
     *'"subtype":"interrupt"'*)
-      printf '{"type":"control_response","response":{"subtype":"success","request_id":"rust_2","response":{"interrupted":true}}}\n'
+      printf '{"type":"control_response","response":{"subtype":"success","request_id":"%s","response":{"interrupted":true}}}\n' "$request_id"
+      ;;
+    *'"subtype":"set_model"'*)
+      case "$frame" in
+        *'"model":"sonnet"'*)
+          printf '{"type":"control_response","response":{"subtype":"success","request_id":"%s","response":{"model":"claude-sonnet-4-6"}}}\n' "$request_id"
+          ;;
+        *)
+          printf '{"type":"control_response","response":{"subtype":"error","request_id":"%s","error":"unknown model"}}\n' "$request_id"
+          ;;
+      esac
+      ;;
+    *'"subtype":"set_permission_mode"'*)
+      case "$frame" in
+        *'"mode":"default"'*|*'"mode":"plan"'*|*'"mode":"acceptEdits"'*)
+          printf '{"type":"control_response","response":{"subtype":"success","request_id":"%s","response":{}}}\n' "$request_id"
+          ;;
+        *)
+          printf '{"type":"control_response","response":{"subtype":"error","request_id":"%s","error":"bad mode"}}\n' "$request_id"
+          ;;
+      esac
       ;;
     *'"type":"user"'*)
       case "$FAKE_CASE" in

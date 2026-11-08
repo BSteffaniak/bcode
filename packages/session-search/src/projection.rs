@@ -255,6 +255,9 @@ const fn classify_external_observation(
         HarnessObservationKind::Result { .. } => PersistedEventClassification::Searchable,
         HarnessObservationKind::Text { .. } => PersistedEventClassification::NonFinal,
         HarnessObservationKind::Execution { .. }
+        | HarnessObservationKind::Reasoning { .. }
+        | HarnessObservationKind::ToolResult { .. }
+        | HarnessObservationKind::Usage { .. }
         | HarnessObservationKind::SubmissionAccepted { .. }
         | HarnessObservationKind::SubmissionConsumed { .. }
         | HarnessObservationKind::SubmissionResultObserved { .. }
@@ -262,6 +265,7 @@ const fn classify_external_observation(
         | HarnessObservationKind::Tool { .. }
         | HarnessObservationKind::Subagent { .. }
         | HarnessObservationKind::Interaction { .. }
+        | HarnessObservationKind::InteractionWithdrawn { .. }
         | HarnessObservationKind::Status { .. }
         | HarnessObservationKind::Diagnostic { .. }
         | HarnessObservationKind::NativeTurnTerminal { .. }
@@ -1040,6 +1044,9 @@ fn project_external_transcript_event(
                     ));
                 }
                 HarnessObservationKind::Execution { .. }
+                | HarnessObservationKind::Reasoning { .. }
+                | HarnessObservationKind::ToolResult { .. }
+                | HarnessObservationKind::Usage { .. }
                 | HarnessObservationKind::SubmissionAccepted { .. }
                 | HarnessObservationKind::SubmissionConsumed { .. }
                 | HarnessObservationKind::SubmissionResultObserved { .. }
@@ -1047,6 +1054,7 @@ fn project_external_transcript_event(
                 | HarnessObservationKind::Tool { .. }
                 | HarnessObservationKind::Subagent { .. }
                 | HarnessObservationKind::Interaction { .. }
+                | HarnessObservationKind::InteractionWithdrawn { .. }
                 | HarnessObservationKind::Status { .. }
                 | HarnessObservationKind::Diagnostic { .. }
                 | HarnessObservationKind::NativeTurnTerminal { .. }
@@ -2136,9 +2144,11 @@ mod tests {
         use bcode_harness_models::HarnessObservationKind;
         for kind in [
             HarnessObservationKind::Text {
+                segment_id: None,
                 text: "incremental".into(),
             },
             HarnessObservationKind::Tool {
+                input_json: None,
                 native_tool_id: "native-tool".into(),
                 name: "shell.run".into(),
                 status: "secret command".into(),

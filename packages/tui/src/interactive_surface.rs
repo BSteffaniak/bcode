@@ -105,6 +105,18 @@ impl InteractiveSurfaceRequest {
         &self.interaction_id
     }
 
+    /// Return the serialized surface request payload.
+    #[cfg(test)]
+    pub(crate) fn request_json_for_test(&self) -> &str {
+        &self.request_json
+    }
+
+    /// Return the requested surface kind.
+    #[cfg(test)]
+    pub(crate) fn surface_kind_for_test(&self) -> &str {
+        &self.surface_kind
+    }
+
     /// Return whether another open attempt may start now.
     #[must_use]
     pub fn ready(&self, now: Instant) -> bool {
@@ -164,6 +176,14 @@ impl InteractiveSurfaceQueue {
         if let Some(request) = self.pending.front_mut() {
             request.defer_retry(now);
         }
+    }
+
+    /// Whether a request for `interaction_id` is queued.
+    #[must_use]
+    pub fn contains(&self, interaction_id: &str) -> bool {
+        self.pending
+            .iter()
+            .any(|request| request.interaction_id() == interaction_id)
     }
 
     /// Remove a resolved request from the queue.

@@ -4,8 +4,9 @@ use bcode_harness_models::{
     HARNESS_SCHEMA_VERSION, HarnessControlRequest, HarnessFailure, HarnessInspection,
     HarnessObservationPage, HarnessObserveRequest, HarnessOpenRequest, HarnessOperation,
     HarnessReconcileRequest, HarnessReconciliation, HarnessRequest, HarnessRequestKind,
-    HarnessResponse, HarnessServiceResponse, HarnessServiceResponseKind, HarnessSessionTarget,
-    HarnessSubmission, HarnessSupportLevel, MAX_HARNESS_ID_BYTES, MAX_HARNESS_OBSERVATIONS,
+    HarnessResponse, HarnessServiceResponse, HarnessServiceResponseKind, HarnessSessionSetting,
+    HarnessSessionTarget, HarnessSubmission, HarnessSupportLevel, MAX_HARNESS_ID_BYTES,
+    MAX_HARNESS_OBSERVATIONS,
 };
 use bcode_session_models::SessionId;
 
@@ -38,13 +39,25 @@ const fn observation_failure(failure: HarnessFailure) -> ManagedHarnessError {
 pub struct ManagedHarnessRuntime<S, T = HarnessPluginTransport> {
     store: S,
     transport: T,
+    activity: super::activity::NativeActivity,
 }
 
 impl<S: ManagedHarnessStore, T: ManagedHarnessTransport> ManagedHarnessRuntime<S, T> {
     /// Bind canonical persistence and selected-plugin transport. No native process is started.
     #[must_use]
     pub const fn new(store: S, transport: T) -> Self {
-        Self { store, transport }
+        Self {
+            store,
+            transport,
+            activity: super::activity::NativeActivity::new(),
+        }
+    }
+
+    /// Managed sessions with live native foreground or unsettled background work, derived
+    /// from committed canonical evidence. Idle shutdown must not stop such a session.
+    #[must_use]
+    pub fn busy_native_sessions(&self) -> usize {
+        self.activity.busy_sessions()
     }
 
     /// Verify an admitted full owner while retaining a real canonical lease for the check.
@@ -93,6 +106,7 @@ impl<S: ManagedHarnessStore, T: ManagedHarnessTransport> ManagedHarnessRuntime<S
             HarnessRequestKind::Interrupt(value) | HarnessRequestKind::Close(value) => {
                 Some(&value.target)
             }
+            HarnessRequestKind::Configure(value) => Some(&value.target),
             _ => None,
         };
         if supplied_target.is_some_and(|target| session.target.as_ref() != Some(target)) {
@@ -166,6 +180,15 @@ impl<S: ManagedHarnessStore, T: ManagedHarnessTransport> ManagedHarnessRuntime<S
         if self.store.commit(owner, request, &response).await.is_err() {
             let _ = self.store.uncertain(owner, request).await;
             return Err(ManagedHarnessError::Uncertain);
+        }
+        match (&request.kind, &response.kind) {
+            (HarnessRequestKind::Submit { .. }, HarnessServiceResponseKind::Receipt(_)) => {
+                self.activity.submitted(owner.session_id);
+            }
+            (HarnessRequestKind::Close(_), HarnessServiceResponseKind::Acknowledged { .. }) => {
+                self.activity.closed(owner.session_id);
+            }
+            _ => {}
         }
         Ok(response)
     }
@@ -434,7 +457,7 @@ impl<S: ManagedHarnessStore, T: ManagedHarnessTransport> ManagedHarnessRuntime<S
             tracing::warn!(target: "bcode_server::harness", stage = "observe_native_failure", category = ?failure, "managed observation stage failed");
             return Err(observation_failure(*failure));
         }
-        let HarnessServiceResponseKind::Observations(page) = response.kind else {
+        let HarnessServiceResponseKind::Observations(mut page) = response.kind else {
             tracing::warn!(target: "bcode_server::harness", stage = "observe_response_family", "managed observation stage failed");
             return Err(ManagedHarnessError::Unavailable);
         };
@@ -443,9 +466,19 @@ impl<S: ManagedHarnessStore, T: ManagedHarnessTransport> ManagedHarnessRuntime<S
                 tracing::warn!(target: "bcode_server::harness", stage = "observe_policy", category = %error, "managed observation stage failed");
             })?;
         }
+        // The live sidecar is transient presentation: it is never persisted and is not part of
+        // the retention digest, so strip it before canonical commit. It is reattached only to
+        // the in-memory result, where daemon ingestion publishes it as session live events.
+        let live = std::mem::take(&mut page.live);
         self.store
             .observation_page(owner, previous_after.as_deref(), &page)
             .await?;
+        page.live = live;
+        self.activity
+            .observed(owner.session_id, &session.capabilities, &page.observations);
+        if !page.live.is_empty() {
+            self.store.publish_live(owner, &page).await;
+        }
         Ok(page)
     }
 
@@ -484,6 +517,37 @@ impl<S: ManagedHarnessStore, T: ManagedHarnessTransport> ManagedHarnessRuntime<S
             return Err(ManagedHarnessError::Unsupported);
         }
         self.mutate_guarded(owner, &request, assistance).await
+    }
+
+    /// Durably request one mid-session setting change for subsequent native turns.
+    ///
+    /// The canonical claim precedes native delivery exactly like interruption. Acknowledgement
+    /// is not proof of native effect, and an ambiguous outcome is never replayed.
+    /// # Errors
+    /// Rejects stale ownership, undeclared capabilities, conflicting identities and ambiguous
+    /// delivery.
+    pub async fn configure(
+        &self,
+        owner: &HarnessOwner,
+        mutation_id: String,
+        setting: HarnessSessionSetting,
+    ) -> Result<HarnessServiceResponse, ManagedHarnessError> {
+        let _ownership = self.store.acquire(owner).await?;
+        let session = self.store.load(owner).await?;
+        let target = session.target.ok_or(ManagedHarnessError::Conflict)?;
+        policy::configuration(&target, &session.capabilities, &setting)?;
+        let (_, request) = self
+            .request(
+                owner,
+                mutation_id.clone(),
+                HarnessRequestKind::Configure(bcode_harness_models::HarnessConfigureRequest {
+                    target,
+                    mutation_id,
+                    setting,
+                }),
+            )
+            .await?;
+        self.mutate(owner, &request).await
     }
 
     /// Close native transport explicitly. It is not assignment completion or descendant cancellation.

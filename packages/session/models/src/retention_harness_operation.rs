@@ -169,6 +169,14 @@ fn request(i: &mut Inspector, v: &ExternalHarnessRequest) -> Result {
             target(i, &v.target)?;
             i.text(&v.mutation_id, 6)?;
         }
+        ExternalHarnessRequestKind::Configure(v) => {
+            target(i, &v.target)?;
+            i.text(&v.mutation_id, 6)?;
+            i.nodes(1, 6)?;
+            if let bcode_harness_models::HarnessSessionSetting::Model { model_id } = &v.setting {
+                i.text(model_id, 7)?;
+            }
+        }
         ExternalHarnessRequestKind::Reconcile(v) => {
             i.text(&v.session_id, 6)?;
             i.nodes(1, 5)?;

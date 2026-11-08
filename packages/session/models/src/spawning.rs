@@ -56,12 +56,12 @@ pub enum ManagedSessionSpawnSource {
 impl SessionSpawnRequest {
     /// Validate canonical publication under the selected-open allocation.
     /// # Errors
-    /// Rejects malformed execution intent or managed intent outside schema57/writer25.
+    /// Rejects malformed execution intent or managed intent before schema57/writer25.
     pub fn validate_storage(&self, schema_version: u16, writer_epoch: u32) -> Result<(), String> {
         self.validate_execution()?;
         if self.managed.is_some()
-            && (schema_version != crate::external_harness::SELECTED_OPEN_EVENT_SCHEMA_VERSION
-                || writer_epoch != crate::external_harness::SELECTED_OPEN_STORAGE_WRITER_EPOCH)
+            && (schema_version < crate::external_harness::SELECTED_OPEN_EVENT_SCHEMA_VERSION
+                || writer_epoch < crate::external_harness::SELECTED_OPEN_STORAGE_WRITER_EPOCH)
         {
             return Err("managed spawn storage fence is unavailable".into());
         }
@@ -370,6 +370,7 @@ mod tests {
     fn managed_spawn_fences_versions_and_rejects_provider_fallback() {
         let request = managed_request();
         request.validate_storage(57, 25).unwrap();
+        request.validate_storage(58, 26).unwrap();
         assert!(request.validate_storage(55, 23).is_err());
         assert!(request.validate_storage(57, 24).is_err());
         let mut changed = request.clone();

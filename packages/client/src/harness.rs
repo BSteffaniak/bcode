@@ -266,6 +266,49 @@ impl BcodeClient {
         Ok(response.response_json.clone())
     }
 
+    /// Recover an existing managed session after its previous daemon owner was lost.
+    ///
+    /// Wraps `ManagedSessionOperation::Recover`: the daemon selects the next owner/generation,
+    /// resumes only the exact retained native binding, and never replays prior input. A dropped
+    /// acknowledgement is uncertain and must not be retried with a different recovery identity
+    /// without first re-reading the canonical binding.
+    /// # Errors
+    /// Rejects invalid identities, daemon refusal (including unpublished recovery), malformed
+    /// responses, and responses that do not belong to the requested session.
+    pub async fn managed_session_recover(
+        &self,
+        request: bcode_ipc::harness::ManagedSessionRecoveryRequest,
+    ) -> Result<HarnessServiceResponse, ClientError> {
+        request
+            .validate()
+            .map_err(|e| ClientError::Protocol(e.into()))?;
+        let envelope = ManagedSessionRequest {
+            schema_version: MANAGED_SESSION_VERSION,
+            operation: ManagedSessionOperation::Recover,
+            request_json: serde_json::to_string(&request)
+                .map_err(|_| ClientError::Protocol("invalid managed recovery request".into()))?,
+        };
+        envelope
+            .decode_recovery()
+            .map_err(|e| ClientError::Protocol(e.into()))?;
+        let json = self.managed_session_request(envelope).await?;
+        let response: HarnessServiceResponse = serde_json::from_str(&json)
+            .map_err(|_| ClientError::Protocol("invalid managed recovery response".into()))?;
+        response
+            .validate()
+            .map_err(|_| ClientError::Protocol("invalid managed recovery response".into()))?;
+        if let HarnessServiceResponseKind::Opened(binding) = &response.kind
+            && (binding.session_id != request.session_id.to_string()
+                || binding.instance_id != request.instance_id
+                || binding.generation <= request.expected_generation)
+        {
+            return Err(ClientError::Protocol(
+                "managed recovery owner mismatch".into(),
+            ));
+        }
+        Ok(response)
+    }
+
     /// Read the exact canonical prepared/confirmed target without invoking a native plugin.
     /// # Errors
     /// Rejects incompatible, malformed, or foreign target snapshots; never fabricates a binding.
@@ -626,7 +669,7 @@ impl BcodeClient {
                         "Native submission accepted: {submission_id} · attempt {attempt_id} · native turn {native_turn_id} (not settlement, assignment completion, or replay authority)"
                     );
                 }
-                bcode_harness_models::HarnessObservationKind::Text { text: value }
+                bcode_harness_models::HarnessObservationKind::Text { text: value, .. }
                 | bcode_harness_models::HarnessObservationKind::Result { text: value } => {
                     text.push_str(&value);
                 }

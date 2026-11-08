@@ -21,6 +21,8 @@ fn interaction(i: &mut Inspector, value: &HarnessInteraction, depth: usize) -> R
         i.text(&choice.choice_id, depth + 2)?;
         i.text(&choice.label, depth + 2)?;
     }
+    i.optional_text(value.tool_name.as_ref(), depth + 1)?;
+    i.optional_text(value.input_preview.as_ref(), depth + 1)?;
     Ok(())
 }
 
@@ -158,18 +160,12 @@ pub(super) fn observation(
                 i.text(text, 7)?;
             }
         }
-        HarnessObservationKind::Text { text } | HarnessObservationKind::Result { text } => {
-            i.text(text, 6)?;
-        }
-        HarnessObservationKind::Tool {
-            native_tool_id,
-            name,
-            status,
-        } => {
-            for text in [native_tool_id, name, status] {
-                i.text(text, 6)?;
-            }
-        }
+        HarnessObservationKind::Text { .. }
+        | HarnessObservationKind::Reasoning { .. }
+        | HarnessObservationKind::Result { .. }
+        | HarnessObservationKind::Tool { .. }
+        | HarnessObservationKind::ToolResult { .. }
+        | HarnessObservationKind::Usage { .. } => display_observation(i, &observation.kind)?,
         HarnessObservationKind::Subagent {
             native_agent_id,
             status,
@@ -178,6 +174,7 @@ pub(super) fn observation(
             i.text(status, 6)?;
         }
         HarnessObservationKind::Interaction { interaction: value } => interaction(i, value, 6)?,
+        HarnessObservationKind::InteractionWithdrawn { request_id } => i.text(request_id, 6)?,
         HarnessObservationKind::Status { .. } => i.nodes(5, 6)?,
         HarnessObservationKind::Diagnostic { code, message } => {
             i.text(code, 6)?;
@@ -192,6 +189,47 @@ pub(super) fn observation(
             i.text(namespace, 6)?;
             i.json(detail, 6)?;
         }
+    }
+    Ok(())
+}
+
+fn display_observation(i: &mut Inspector, kind: &HarnessObservationKind) -> Result {
+    match kind {
+        HarnessObservationKind::Text { text, segment_id }
+        | HarnessObservationKind::Reasoning {
+            text, segment_id, ..
+        } => {
+            i.text(text, 6)?;
+            i.optional_text(segment_id.as_ref(), 6)?;
+        }
+        HarnessObservationKind::Result { text } => {
+            i.text(text, 6)?;
+        }
+        HarnessObservationKind::Tool {
+            native_tool_id,
+            name,
+            status,
+            input_json,
+        } => {
+            for text in [native_tool_id, name, status] {
+                i.text(text, 6)?;
+            }
+            i.optional_text(input_json.as_ref(), 6)?;
+        }
+        HarnessObservationKind::ToolResult {
+            native_tool_id,
+            output,
+            ..
+        } => {
+            i.text(native_tool_id, 6)?;
+            i.text(output, 6)?;
+            i.nodes(2, 6)?;
+        }
+        HarnessObservationKind::Usage { model, .. } => {
+            i.nodes(6, 6)?;
+            i.optional_text(model.as_ref(), 6)?;
+        }
+        _ => {}
     }
     Ok(())
 }

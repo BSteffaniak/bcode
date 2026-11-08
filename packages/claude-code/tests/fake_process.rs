@@ -26,7 +26,7 @@ impl Fake {
         env.insert("FAKE_CASE".to_owned(), case.to_owned());
         let options = LaunchOptions {
             executable: path,
-            expected_version: "fake-claude 1".to_owned(),
+            expected_version: "2.1.308 (Claude Code)".to_owned(),
             cwd: directory.path().to_owned(),
             config_directory: directory.path().join("auth"),
             environment: NativeEnvironment(env),
@@ -442,4 +442,115 @@ async fn creation_uuid_and_resume_are_mutually_exclusive() {
         ClaudeSession::spawn_new(fake.options, "550e8400-e29b-41d4-a716-446655440000").await,
         Err(Error::InvalidConfiguration(_))
     ));
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn version_drift_launches_with_probed_version_but_unparseable_output_fails_closed() {
+    let mut fake = Fake::new("normal");
+    fake.options
+        .environment
+        .0
+        .insert("FAKE_VERSION".into(), "2.9.0 (Claude Code)".into());
+    let session = fake.start().await;
+    assert_eq!(session.client().native_version(), "2.9.0 (Claude Code)");
+    assert!(!bcode_claude_code::is_tested_version(
+        session.client().native_version()
+    ));
+    session.close().await;
+    for output in [
+        "fake-claude 1",
+        "wrapper 2.1.308 (Claude Code)",
+        "2.1 (Claude Code)",
+    ] {
+        let mut fake = Fake::new("normal");
+        fake.options
+            .environment
+            .0
+            .insert("FAKE_VERSION".into(), output.into());
+        assert!(matches!(
+            ClaudeSession::spawn(fake.options).await,
+            Err(Error::VersionMismatch)
+        ));
+    }
+    // Output exactly equal to the configured expected value still launches, untested.
+    let mut fake = Fake::new("normal");
+    fake.options.expected_version = "fake-claude 1".into();
+    fake.options
+        .environment
+        .0
+        .insert("FAKE_VERSION".into(), "fake-claude 1".into());
+    let session = fake.start().await;
+    assert_eq!(session.client().native_version(), "fake-claude 1");
+    assert!(!bcode_claude_code::is_tested_version(
+        session.client().native_version()
+    ));
+    session.close().await;
+    let fake = Fake::new("normal");
+    let session = fake.start().await;
+    assert!(bcode_claude_code::is_tested_version(
+        session.client().native_version()
+    ));
+    session.close().await;
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn model_and_permission_mode_switch_between_turns_after_native_acknowledgment() {
+    use bcode_claude_code::{PermissionMode, available_models};
+    let fake = Fake::new("configure");
+    let mut session = ClaudeSession::spawn(fake.options.clone())
+        .await
+        .expect("spawn");
+    let client = session.client();
+    let initialize = client.initialize().await.expect("initialize");
+    let models = available_models(&initialize).expect("advertised models");
+    assert_eq!(models.len(), 2);
+    client.submit("first turn", None).await.expect("submit");
+    // An unadvertised key never reaches the native process.
+    assert!(matches!(
+        client.select_model(&models, "unadvertised").await,
+        Err(Error::InvalidConfiguration(_))
+    ));
+    settled(&mut session).await;
+    assert!(client.can_submit_next_turn());
+    let selected = client
+        .select_model(&models, "sonnet")
+        .await
+        .expect("switch");
+    assert_eq!(selected.requested, "sonnet");
+    assert_eq!(selected.effective.as_deref(), Some("claude-sonnet-4-6"));
+    // Native rejection is reported without terminating the session.
+    assert!(matches!(
+        client.select_model(&models, "claude-opus-4-1").await,
+        Err(Error::Protocol)
+    ));
+    assert!(client.is_control_ready());
+    for mode in [
+        PermissionMode::Plan,
+        PermissionMode::AcceptEdits,
+        PermissionMode::Default,
+    ] {
+        client.set_permission_mode(mode).await.expect("mode");
+    }
+    client.submit("second turn", None).await.expect("submit");
+    settled(&mut session).await;
+    session.close().await;
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn model_switch_is_rejected_while_a_foreground_turn_is_active() {
+    use bcode_claude_code::available_models;
+    let fake = Fake::new("background");
+    let session = ClaudeSession::spawn(fake.options.clone())
+        .await
+        .expect("spawn");
+    let client = session.client();
+    let initialize = client.initialize().await.expect("initialize");
+    let models = available_models(&initialize).expect("advertised models");
+    client.submit("start", None).await.expect("submit");
+    assert!(!client.can_submit_next_turn());
+    assert!(matches!(
+        client.select_model(&models, "sonnet").await,
+        Err(Error::InvalidConfiguration(_))
+    ));
+    session.close().await;
 }

@@ -4840,6 +4840,8 @@ mod tests {
                         completeness: HarnessCompleteness::Partial,
                         kind: HarnessObservationKind::Interaction {
                             interaction: HarnessInteraction {
+                                input_preview: None,
+                                tool_name: None,
                                 request_id: "question-4".into(),
                                 session_id: session_id.to_string(),
                                 generation: 4,

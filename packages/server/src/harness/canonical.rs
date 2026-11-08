@@ -107,11 +107,7 @@ mod recovery_lifetime_tests {
 
     #[tokio::test]
     async fn release_provenance_requires_published_runtime_lifetime() {
-        if crate::harness::recovery_published() {
-            return;
-        }
-        // Shape construction is deliberately isolated in the session projector tests;
-        // production admission remains disabled before any plugin inspection or dispatch.
+        // A daemon without a published execution lifetime cannot record release provenance.
         let state = Arc::new(crate::tests::test_server_state(
             crate::SessionManager::default(),
         ));
@@ -475,19 +471,15 @@ impl CanonicalHarnessStore {
         session_id: SessionId,
     ) -> Result<HarnessOwner, ManagedHarnessError> {
         let state = self.state()?;
-        tracing::warn!(target: "bcode_server::harness", stage = "owner_location_start", "managed owner progress");
         crate::session_operations::require_selected_location(&state, session_id)
             .await
             .map_err(|_| ManagedHarnessError::StaleOwner)?;
-        tracing::warn!(target: "bcode_server::harness", stage = "owner_location_done", "managed owner progress");
-        tracing::warn!(target: "bcode_server::harness", stage = "owner_snapshot_start", "managed owner progress");
         let snapshot = state
             .sessions
             .session_external_harness_state(session_id)
             .await
             .map_err(|error| storage_failure("current_owner_snapshot", &error))?
             .ok_or(ManagedHarnessError::Conflict)?;
-        tracing::warn!(target: "bcode_server::harness", stage = "owner_snapshot_done", "managed owner progress");
         if snapshot.owner.daemon_id != state.daemon_status.instance_id
             || snapshot.owner.artifact_id != state.daemon_status.build_fingerprint
         {
@@ -502,12 +494,8 @@ impl CanonicalHarnessStore {
             .to_string();
         Self::local_owner(&state, &owner)?;
         drop(state);
-        tracing::warn!(target: "bcode_server::harness", stage = "owner_acquire_start", "managed owner progress");
         let _hold = self.acquire(&owner).await?;
-        tracing::warn!(target: "bcode_server::harness", stage = "owner_acquire_done", "managed owner progress");
-        tracing::warn!(target: "bcode_server::harness", stage = "owner_selected_start", "managed owner progress");
         let selected = self.selected(&owner).await?;
-        tracing::warn!(target: "bcode_server::harness", stage = "owner_selected_done", "managed owner progress");
         Self::validate_owner_observation(&snapshot, &selected)?;
         Ok(owner)
     }
@@ -781,14 +769,12 @@ impl ManagedHarnessStore for CanonicalHarnessStore {
     ) -> Result<DeliveryClaim, ManagedHarnessError> {
         let state = self.state()?;
         Self::local_owner(&state, owner)?;
-        tracing::warn!(target: "bcode_server::harness", stage = "claim_start", "managed canonical progress");
         let claim = state
             .sessions
             .claim_external_harness_request(&self.durable(owner)?, request)
             .await
             .map_err(|_| ManagedHarnessError::Conflict)?;
         drop(state);
-        tracing::warn!(target: "bcode_server::harness", stage = "claim_done", "managed canonical progress");
         match claim {
             ExternalHarnessClaim::New => Ok(DeliveryClaim::New),
             ExternalHarnessClaim::Recorded(response) => Ok(DeliveryClaim::Recorded(Box::new(
@@ -807,14 +793,12 @@ impl ManagedHarnessStore for CanonicalHarnessStore {
     ) -> Result<(), ManagedHarnessError> {
         let state = self.state()?;
         Self::local_owner(&state, owner)?;
-        tracing::warn!(target: "bcode_server::harness", stage = "commit_start", "managed canonical progress");
         let result = state
             .sessions
             .complete_external_harness_request(&self.durable(owner)?, request, response)
             .await
             .map_err(|_| ManagedHarnessError::Storage);
         drop(state);
-        tracing::warn!(target: "bcode_server::harness", stage = "commit_done", success = result.is_ok(), "managed canonical progress");
         result
     }
     async fn uncertain(
@@ -886,6 +870,20 @@ impl ManagedHarnessStore for CanonicalHarnessStore {
                 tracing::warn!(target: "bcode_server::harness", stage = "observe_commit_shape", has_predecessor = after.is_some(), observations = page.observations.len(), confirmations, interactions, settlements, "managed canonical observation commit rejected");
                 storage_failure("observe_canonical_commit", &error)
             })
+    }
+    async fn publish_live(&self, owner: &HarnessOwner, page: &HarnessObservationPage) {
+        let Ok(state) = self.state() else {
+            return;
+        };
+        if Self::local_owner(&state, owner).is_err() {
+            return;
+        }
+        for event in super::live::live_events(owner.generation, &page.observations, &page.live) {
+            state
+                .sessions
+                .publish_live_event(owner.session_id, event)
+                .await;
+        }
     }
     async fn history(
         &self,

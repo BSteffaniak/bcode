@@ -420,20 +420,11 @@ impl SessionManager {
         &self,
         session_id: bcode_session_models::SessionId,
     ) -> Result<Option<ExternalHarnessState>, SessionError> {
-        tracing::warn!(target: "bcode_session::harness", operation = "snapshot", stage = "enter", "managed manager progress");
-        tracing::warn!(target: "bcode_session::harness", operation = "snapshot", stage = "gate_lookup_start", "managed manager progress");
         let gate = self.session_load_gate(session_id).await;
-        tracing::warn!(target: "bcode_session::harness", operation = "snapshot", stage = "gate_lookup_done", "managed manager progress");
-        tracing::warn!(target: "bcode_session::harness", operation = "snapshot", stage = "gate_lock_start", "managed manager progress");
         let _guard = gate.lock().await;
-        tracing::warn!(target: "bcode_session::harness", operation = "snapshot", stage = "gate_lock_done", "managed manager progress");
-        tracing::warn!(target: "bcode_session::harness", operation = "snapshot", stage = "cache_lock_start", "managed manager progress");
         let cached = self.inner.lock().await.sessions.get(&session_id).cloned();
-        tracing::warn!(target: "bcode_session::harness", operation = "snapshot", stage = "cache_lock_done", "managed manager progress");
         if let Some(handle) = cached {
-            tracing::warn!(target: "bcode_session::harness", operation = "snapshot", stage = "actor_start", "managed manager progress");
             let result = handle.harness_snapshot().await;
-            tracing::warn!(target: "bcode_session::harness", operation = "snapshot", stage = "actor_done", "managed manager progress");
             return result;
         }
         let Some(store) = self.store.as_ref() else {
@@ -458,20 +449,11 @@ impl SessionManager {
         if limit == 0 || usize::from(limit) > MAX_HARNESS_OBSERVATIONS {
             return Err(mismatch());
         }
-        tracing::warn!(target: "bcode_session::harness", operation = "history", stage = "enter", "managed manager progress");
-        tracing::warn!(target: "bcode_session::harness", operation = "history", stage = "gate_lookup_start", "managed manager progress");
         let gate = self.session_load_gate(session_id).await;
-        tracing::warn!(target: "bcode_session::harness", operation = "history", stage = "gate_lookup_done", "managed manager progress");
-        tracing::warn!(target: "bcode_session::harness", operation = "history", stage = "gate_lock_start", "managed manager progress");
         let _guard = gate.lock().await;
-        tracing::warn!(target: "bcode_session::harness", operation = "history", stage = "gate_lock_done", "managed manager progress");
-        tracing::warn!(target: "bcode_session::harness", operation = "history", stage = "cache_lock_start", "managed manager progress");
         let cached = self.inner.lock().await.sessions.get(&session_id).cloned();
-        tracing::warn!(target: "bcode_session::harness", operation = "history", stage = "cache_lock_done", "managed manager progress");
         if let Some(handle) = cached {
-            tracing::warn!(target: "bcode_session::harness", operation = "history", stage = "actor_start", "managed manager progress");
             let result = handle.harness_history(after, limit).await;
-            tracing::warn!(target: "bcode_session::harness", operation = "history", stage = "actor_done", "managed manager progress");
             return result;
         }
         let store = self.store.as_ref().ok_or_else(mismatch)?;
@@ -512,7 +494,7 @@ impl SessionManager {
                 owner.clone(),
                 A::Write(Box::new(ExternalHarnessOperationRecord::Configured {
                     instance,
-                    capabilities,
+                    capabilities: Box::new(capabilities),
                     open_request: None,
                 })),
                 self.next_activity_timestamp_ms(),
@@ -693,7 +675,7 @@ impl SessionManager {
                 owner.clone(),
                 A::Page {
                     after: after.map(str::to_owned),
-                    page: page.clone(),
+                    page: Box::new(page.clone()),
                 },
                 self.next_activity_timestamp_ms(),
             )

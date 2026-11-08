@@ -6,8 +6,8 @@ installation, or automatic mutation retry.
 
 ## Integration API
 
-* `LaunchOptions`: explicit absolute executable/cwd/config-directory, exact trimmed
-  `--version`, complete environment (child uses `env_clear`), billing route,
+* `LaunchOptions`: explicit absolute executable/cwd/config-directory, configured
+  expected `--version`, complete environment (child uses `env_clear`), billing route,
   settings inheritance, exact resume identity, capability attestations and bounds.
 * `ClaudeSession::spawn` verifies version and native local auth status before
   starting continuous stdout/stderr drainers. `spawn_with_sdk_servers` additionally
@@ -105,3 +105,27 @@ Dependencies use existing workspace entries: serde, serde_json, thiserror, tokio
 behavior after the wave. Production exact-version compatibility, managed-policy
 behavior, platform-specific login UI, real SDK MCP interoperability and native
 background settlement remain unverified without authorized isolated testing.
+
+## Versions and mid-session control
+
+* `TESTED_VERSIONS` is the single list of behaviorally tested `--version` outputs;
+  `is_tested_version` checks membership and `parse_version` accepts exactly
+  `X.Y.Z (Claude Code)`.
+* Launch verification (`ClaudeSession::spawn*`, `auth_status`, `login_handoff`,
+  `inspect_installed_account`) accepts any well-formed native version, including drift
+  from `LaunchOptions::expected_version`. Launch also accepts output exactly equal to
+  `expected_version`; any other unparseable output, wrapper or extra line fails closed
+  (`VersionMismatch`). `ClaudeClient::native_version()` reports
+  the probed version of the running process. Only tested versions use the advertised
+  alias-resolution model-selection contract; other versions keep exact identity.
+* `ClaudeClient::select_model(models, key)` switches the native model mid-session: only
+  before the first prompt or while the next foreground turn is admissible, and only for
+  a key in the init-advertised snapshot (`available_models`). It waits for the correlated
+  native control response; a native rejection or mismatched effective model is an error
+  that does not terminate the session and is never retried.
+  `select_model_before_prompt` keeps its pre-prompt-only, terminate-on-failure contract.
+* `ClaudeClient::set_permission_mode(mode)` sends native `set_permission_mode`
+  (`default`, `plan`, `acceptEdits`) and returns after the native control response.
+* The fake CLI fixture (`tests/fixtures/fake-claude.sh`) echoes control request IDs,
+  reports `FAKE_VERSION` (default the tested version) and has a `configure` case that
+  advertises models and answers `set_model`/`set_permission_mode`.

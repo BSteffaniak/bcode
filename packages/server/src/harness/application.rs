@@ -110,7 +110,9 @@ impl<'a, S: ManagedHarnessStore, T: ManagedHarnessTransport> ManagedHarnessAppli
     /// pollers serialize by full owner; controls never acquire this observer-only guard.
     ///
     /// `wait_millis` lets an adapter hold the page until native output arrives. Returns the
-    /// committed page's progress: observations plus hydration requests the host must answer.
+    /// committed page's progress: observations, hydration requests the host must answer and
+    /// transient live updates. Live-only streaming pages are progress, so the daemon watch
+    /// asks for the next page immediately instead of backing off mid-stream.
     /// # Errors
     /// Rejects stale caller/instance/generation, unavailable state and failed canonical commits.
     pub async fn poll_observations(
@@ -157,7 +159,7 @@ impl<'a, S: ManagedHarnessStore, T: ManagedHarnessTransport> ManagedHarnessAppli
         drop(ownership);
         drop(canonical);
         drop(observer);
-        Ok(page.observations.len() + page.hydration_requests.len())
+        Ok(page.observations.len() + page.hydration_requests.len() + page.live.len())
     }
 
     /// Resolve the full durable managed owner, whether pre-open, prepared or confirmed.
@@ -252,6 +254,20 @@ impl<'a, S: ManagedHarnessStore, T: ManagedHarnessTransport> ManagedHarnessAppli
     ) -> Result<HarnessServiceResponse, ManagedHarnessError> {
         self.runtime
             .cancel(&self.owner(session_id).await?, mutation_id)
+            .await
+    }
+
+    /// Request a mid-session native setting change under canonical current ownership.
+    /// # Errors
+    /// Rejects scope conflicts, undeclared capabilities or ambiguous previous delivery.
+    pub async fn configure(
+        &self,
+        session_id: SessionId,
+        mutation_id: String,
+        setting: bcode_harness_models::HarnessSessionSetting,
+    ) -> Result<HarnessServiceResponse, ManagedHarnessError> {
+        self.runtime
+            .configure(&self.owner(session_id).await?, mutation_id, setting)
             .await
     }
 

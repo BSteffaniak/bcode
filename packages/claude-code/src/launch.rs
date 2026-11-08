@@ -46,7 +46,8 @@ impl Default for Limits {
 #[derive(Clone)]
 pub struct LaunchOptions {
     pub executable: PathBuf,
-    /// Exact trimmed `--version` output, checked before launch.
+    /// Configured expected `--version` output. A different well-formed native version is
+    /// accepted at launch (version drift); the probed version is what sessions report.
     pub expected_version: String,
     pub cwd: PathBuf,
     pub config_directory: PathBuf,
@@ -162,7 +163,14 @@ impl LaunchOptions {
             .kill_on_drop(true);
         command
     }
-    pub(crate) async fn verify(&self) -> Result<(), Error> {
+    /// Probe the executable and return its actual native version.
+    ///
+    /// Output exactly equal to the configured `expected_version` is accepted as before.
+    /// Otherwise any well-formed `X.Y.Z (Claude Code)` output is accepted, including drift
+    /// from `expected_version`; callers bind the returned probed version and gate verified
+    /// behavior on [`crate::is_tested_version`]. Other unparseable output (wrappers, other
+    /// vendors, extra lines) still fails closed.
+    pub(crate) async fn verify(&self) -> Result<String, Error> {
         self.validate()?;
         let mut command = self.command();
         command.arg("--version");
@@ -171,10 +179,12 @@ impl LaunchOptions {
         if !status.success() {
             return Err(Error::VersionMismatch);
         }
-        if String::from_utf8_lossy(&output).trim() != self.expected_version {
-            return Err(Error::VersionMismatch);
+        let trimmed = String::from_utf8_lossy(&output);
+        let trimmed = trimmed.trim();
+        if trimmed == self.expected_version {
+            return Ok(trimmed.to_owned());
         }
-        Ok(())
+        crate::parse_version(&output).map_err(|_| Error::VersionMismatch)
     }
     pub(crate) fn stream_command(&self) -> Command {
         let mut command = self.command();

@@ -230,6 +230,12 @@ impl TranscriptItem {
         self
     }
 
+    /// Return the generic origin label, when present.
+    #[must_use]
+    pub fn display_label(&self) -> Option<&str> {
+        self.display_label.as_deref()
+    }
+
     /// Return the rendered role, including a generic origin label when present.
     #[must_use]
     pub fn display_role(&self) -> String {

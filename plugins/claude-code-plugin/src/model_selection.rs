@@ -113,7 +113,8 @@ impl PluginState {
                     let models = bcode_claude_code::available_models(&initialize)
                         .map_err(|_| HarnessFailure::Unsupported)?;
                     Ok(HarnessModelsResponseKind::Models {
-                        native_version: selected.exact_version.clone(),
+                        // The probed executable version that advertised this snapshot.
+                        native_version: client.native_version().to_owned(),
                         models: models
                             .into_iter()
                             .map(|model| HarnessModel {

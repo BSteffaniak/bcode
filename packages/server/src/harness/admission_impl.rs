@@ -16,6 +16,7 @@ impl ManagedSessionAdmission for CanonicalManagedAdmission {
                     | HarnessRequestKind::Respond { .. }
                     | HarnessRequestKind::Interrupt(_)
                     | HarnessRequestKind::Close(_)
+                    | HarnessRequestKind::Configure(_)
             ) {
                 return Ok(None);
             }
@@ -55,6 +56,7 @@ impl ManagedSessionAdmission for CanonicalManagedAdmission {
                 HarnessRequestKind::Interrupt(control) | HarnessRequestKind::Close(control) => {
                     &control.target
                 }
+                HarnessRequestKind::Configure(configure) => &configure.target,
                 _ => return Err(ManagedHarnessError::Invalid),
             };
             supplied
@@ -207,6 +209,7 @@ impl CanonicalManagedAdmission {
                 HarnessRequestKind::Interrupt(value) | HarnessRequestKind::Close(value) => {
                     value.target.generation()
                 }
+                HarnessRequestKind::Configure(value) => value.target.generation(),
                 HarnessRequestKind::Reconcile(value) => value.generation,
                 HarnessRequestKind::Inspect => {
                     self.store.current_owner(session_id).await?.generation
@@ -226,6 +229,7 @@ impl CanonicalManagedAdmission {
                 HarnessRequestKind::Interrupt(value) | HarnessRequestKind::Close(value) => {
                     Some(&value.target)
                 }
+                HarnessRequestKind::Configure(value) => Some(&value.target),
                 _ => None,
             };
             let supplied_binding = match &call.harness.kind {

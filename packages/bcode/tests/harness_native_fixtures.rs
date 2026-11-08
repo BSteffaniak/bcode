@@ -156,6 +156,10 @@ fn release(oracle: &Path, gate: &str) {
     std::fs::write(oracle.join(format!("{gate}.release")), b"release").unwrap();
 }
 
+fn initialize_reply() -> serde_json::Value {
+    json!({"models":[{"value":"claude-fixture","displayName":"Claude Fixture"}]})
+}
+
 #[test]
 fn claude_initialize_has_no_identity_and_first_user_causes_native_confirmation() {
     let root = tempfile::tempdir().unwrap();
@@ -165,12 +169,17 @@ fn claude_initialize_has_no_identity_and_first_user_causes_native_confirmation()
     let initialized = native.event();
     assert_eq!(initialized["type"], "control_response");
     assert_eq!(initialized["response"]["request_id"], "init-1");
-    assert_eq!(initialized["response"]["response"], json!({}));
+    // Initialize advertises model keys only; it carries no native session identity.
+    assert_eq!(initialized["response"]["response"], initialize_reply());
     wait_for_gate(root.path(), "initialized");
     assert!(native.frames.try_recv().is_err());
     assert!(!root.path().join("submit.effect").exists());
     assert!(!root.path().join("binding-confirmed.emitted").exists());
-    native.send(&json!({"type":"user","message":{"role":"user","content":"fixture-only"}}));
+    // The driver always stamps a user frame with its submission UUID.
+    native.send(
+        &json!({"type":"user","uuid":"44444444-4444-4444-8444-444444444444",
+        "message":{"role":"user","content":"fixture-only"}}),
+    );
     let confirmed = native.event();
     assert_eq!(confirmed["type"], "system");
     assert_eq!(confirmed["subtype"], "init");
@@ -187,7 +196,7 @@ fn claude_dummy_prompt_cannot_manufacture_confirmation() {
     let mut native = NativeFake::claude("question", root.path());
     native.send(&json!({"type":"control_request","request_id":"init-1",
         "request":{"subtype":"initialize"}}));
-    assert_eq!(native.event()["response"]["response"], json!({}));
+    assert_eq!(native.event()["response"]["response"], initialize_reply());
     native.send(&json!({"type":"user","message":{"role":"user","content":""}}));
     assert_eq!(native.exit().0, 65);
     assert!(root.path().join("unexpected-user.rejected").exists());

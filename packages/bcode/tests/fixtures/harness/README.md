@@ -105,6 +105,26 @@ when a retry changes request ID. No input body or secret enters those files.
   offline canonical history; malformed secret-bearing auth input is rejected
   without echo. Oversized request files fail before dispatch.
 
+* Native-parity journeys (`multi_turn` scenario):
+  * Clean `server stop`, restart and explicit `harness recover` resume the exact native
+    conversation under generation 2 (`launch-1`, `--resume`), admit the next turn and
+    refuse the released generation; prior input is never replayed.
+  * `harness configure` model and permission-mode changes are acknowledged once
+    (`set-model-<id>.effect`, `set-permission-mode-<mode>.effect`); an identical retry
+    returns retained evidence without a `.duplicate` oracle.
+  * With the `rich-output` oracle the fixture streams partial `stream_event` deltas,
+    thinking, one native `tool_use` with its `tool_result` user frame and result usage.
+    With `hold-stream` it pauses after the text deltas until `release-stream` exists, so
+    a held observation must return the transient `live` sidecar before durable text.
+    With `gate-stream` it emits no turn output until `open-stream` exists, so a held
+    observation can already be waiting when the first native delta arrives.
+    With `approve-<turn>` the native tool waits for a `can_use_tool` permission request
+    to be answered with an exact allow (`approved-<turn>.effect`) before its result.
+  * The north-star journey combines these: live streaming into a held observation,
+    native approval through `harness respond`, durable reasoning/text/tool/result/usage,
+    a second turn, model and plan-mode configuration, a clean daemon stop, explicit
+    recovery and a third turn on the resumed native conversation.
+
 `harness_security_contracts.rs` additionally exercises actual public
 `ManagedAuthCoordinator` and IPC decode APIs: shared waiters issue one begin,
 one cancellation does not abort the remaining waiter, generation fencing,

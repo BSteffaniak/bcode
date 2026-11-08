@@ -345,6 +345,11 @@ pub struct SessionViewSnapshot {
     pub runtime: SessionRuntimeViewState,
     /// Known interactive requests.
     pub interactions: Vec<InteractionViewSummary>,
+    /// Unresolved managed external (native harness) interactions awaiting a user response.
+    ///
+    /// Derived presentation only; responding remains subject to managed-session admission.
+    #[serde(default)]
+    pub pending_external_interactions: Vec<external::ExternalInteractionView>,
     /// Session summary metadata, when supplied by the daemon/catalog.
     pub session_summary: Option<SessionSummary>,
 }
@@ -381,6 +386,7 @@ impl SessionViewSnapshot {
             thinking: ThinkingViewState::default(),
             runtime: SessionRuntimeViewState::default(),
             interactions: Vec::new(),
+            pending_external_interactions: Vec::new(),
             session_summary: None,
         }
     }
@@ -857,6 +863,7 @@ fn snapshot_requires_reset(base: &SessionViewSnapshot, next: &SessionViewSnapsho
         || base.composer != next.composer
         || base.thinking != next.thinking
         || base.interactions != next.interactions
+        || base.pending_external_interactions != next.pending_external_interactions
         || base.session_summary != next.session_summary
 }
 

@@ -53,15 +53,36 @@ fn release_requires_exact_retained_close_after_reap() {
 }
 
 #[test]
-fn exact_next_generation_selection_does_not_certify_inert_resume() {
+fn exact_next_generation_selection_validates_resume_without_renormalizing() {
     let (instance, open, selected) = fixture();
     assert!(validate_resume_selection(&instance, &open, &selected).is_ok());
-    assert_eq!(
-        validate_resume(&instance, &open, &selected),
-        Err(HarnessFailure::Unsupported)
-    );
+    assert_eq!(validate_resume(&instance, &open, &selected), Ok(()));
+    // Validation never increments or rewrites the host-constructed binding.
     assert_eq!(open.generation, 2);
     assert_eq!(open.resume.as_ref().unwrap().generation, 2);
+    let mut nonresume = open;
+    nonresume.resume = None;
+    assert_eq!(
+        validate_resume(&instance, &nonresume, &selected),
+        Err(HarnessFailure::InvalidRequest)
+    );
+}
+
+#[test]
+fn resume_accepts_probed_version_drift_but_not_malformed_versions() {
+    let (instance, mut open, selected) = fixture();
+    // A binding recorded with an actual probed version resumes after configuration drift.
+    for version in ["2.1.308 (Claude Code)", "2.4.0 (Claude Code)"] {
+        open.resume.as_mut().unwrap().native_version = version.into();
+        assert_eq!(validate_resume(&instance, &open, &selected), Ok(()));
+    }
+    for version in ["2.4.0", "wrapper 2.4.0 (Claude Code)", "other"] {
+        open.resume.as_mut().unwrap().native_version = version.into();
+        assert_eq!(
+            validate_resume(&instance, &open, &selected),
+            Err(HarnessFailure::Conflict)
+        );
+    }
 }
 
 #[test]

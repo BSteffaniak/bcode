@@ -44,6 +44,8 @@ fn capabilities() -> HarnessCapabilities {
         constraints: vec![],
     };
     HarnessCapabilities {
+        model_switch: bcode_harness_models::HarnessCapability::unsupported(),
+        permission_mode: bcode_harness_models::HarnessCapability::unsupported(),
         resume: capability.clone(),
         steering: capability.clone(),
         approval: capability.clone(),
@@ -433,6 +435,7 @@ fn confirmation_page(
         native_session_id: prepared.requested_native_session_id.unwrap(),
     };
     HarnessObservationPage {
+        live: Vec::new(),
         retention: None,
         hydration_requests: vec![],
         inventory_page: None,
@@ -489,6 +492,7 @@ fn confirmation_and_tool_page(
         native_correlations: vec![],
         completeness: HarnessCompleteness::Complete,
         kind: HarnessObservationKind::Tool {
+            input_json: None,
             native_tool_id: "native-file-tool".into(),
             name: "mcp__bcode-tools__filesystem_read".into(),
             status: "observed".into(),

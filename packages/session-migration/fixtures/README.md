@@ -18,6 +18,20 @@ is the explicit writer 23 to 25 edge, targeting schema 57 only after version pub
 The earlier monotonic edges remain intact. Disabled recovery and interaction families
 remain unsupported even when the target schema is 57.
 
+## Reconstructed released writer-25/schema-57 compatibility inputs
+
+`stores/epoch-25-schema-57-events.jsonl` reconstructs the released schema-57 event
+representation from the sanitized schema-55 family matrix by changing only the outer schema.
+Like the schema-55 matrix it synthesizes no selected-model evidence; selected-open operations
+remain covered by the session-domain selected-model migration tests. Writer 25 migrates to
+writer 26 through the explicit `session-writer-epoch-25-to-26` edge, which preserves canonical
+payloads and advances only the event schema (57 to 58) and writer contract.
+
+Schema 58 / writer 26 fences managed native-parity records: reasoning, native tool-result and
+native usage observations, text segment and tool input display metadata, interaction tool
+metadata, and configuration requests. Historical inputs at schema 57 or earlier that carry any
+of these are rejected rather than guessed. Recovery records remain unpublished at schema 58.
+
 ## Confirmed schema-28 incident family
 
 Read-only inspection of the retained epoch-2 backup for incident session

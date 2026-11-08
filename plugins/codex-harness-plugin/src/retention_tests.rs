@@ -10,6 +10,7 @@ fn event() -> HarnessObservation {
         native_correlations: Vec::new(),
         completeness: HarnessCompleteness::Complete,
         kind: HarnessObservationKind::Text {
+            segment_id: None,
             text: "recorded".into(),
         },
     }

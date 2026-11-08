@@ -257,10 +257,21 @@ impl RootPluginSurface {
     }
 }
 
-struct RootModelPicker {
-    generation: u64,
-    provider_plugin_id: Option<String>,
-    picker: super::model_picker::ModelPickerApp,
+/// Ordinary-root request to reopen a session through the managed reattach route.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ManagedOpenRequest {
+    /// Canonical managed session.
+    pub session_id: bcode_session_models::SessionId,
+    /// Configured harness instance bound to the session.
+    pub instance_id: String,
+    /// Ownership generation observed by the binding lookup.
+    pub generation: u64,
+}
+
+pub struct RootModelPicker {
+    pub(super) generation: u64,
+    pub(super) provider_plugin_id: Option<String>,
+    pub(super) picker: super::model_picker::ModelPickerApp,
 }
 
 pub enum AuthPoolPickerRootOutcome {
@@ -340,6 +351,11 @@ pub struct ChatLoopState {
     passive_client: Option<BcodeClient>,
     managed_commands: Option<bcode_client::ManagedSessionCommandHandle>,
     managed_generation: Option<u64>,
+    managed_host: Option<super::effects::ManagedHostAccess>,
+    pub(super) managed_interactions: super::managed_controls::ManagedInteractionTracker,
+    pub(super) managed_model_selectors: std::collections::BTreeMap<String, String>,
+    pub(super) managed_configure_in_flight: Option<String>,
+    managed_open: Option<ManagedOpenRequest>,
     viewport_input_task: Option<tokio::task::JoinHandle<()>>,
     viewport_input_connection:
         std::sync::Arc<tokio::sync::Mutex<Option<bcode_client::ClientConnection>>>,
@@ -355,21 +371,21 @@ pub struct ChatLoopState {
     plugin_surface: Option<RootPluginSurface>,
     parent_plugin_surfaces: Vec<RootPluginSurface>,
     provider_picker: Option<super::provider_picker::ProviderPickerApp>,
-    model_picker: Option<RootModelPicker>,
-    model_picker_generation: u64,
+    pub(super) model_picker: Option<RootModelPicker>,
+    pub(super) model_picker_generation: u64,
     model_check_in_flight: bool,
     auth_pool_picker: Option<super::auth_pool_picker::AuthPoolPickerApp>,
     skill_picker: Option<super::skill_picker::SkillPickerApp>,
     working_directory_dialog: Option<super::working_directory_dialog::WorkingDirectoryDialog>,
     worktree_create_dialog: Option<super::wt_create_dialog::WorktreeCreateDialog>,
     ralph_start_dialog: Option<super::ralph_start_dialog::RalphStartDialog>,
-    interactive_surface: Option<InteractiveSurfaceState>,
+    pub(super) interactive_surface: Option<InteractiveSurfaceState>,
     interactive_surface_geometry: Option<InteractiveSurfaceGeometry>,
     pinned_interaction_viewport: Option<(String, u16)>,
     session_picker: Option<super::session_picker::SessionPickerApp>,
     session_picker_generation: u64,
     session_picker_launch_directory: std::path::PathBuf,
-    interactive_surface_queue: InteractiveSurfaceQueue,
+    pub(super) interactive_surface_queue: InteractiveSurfaceQueue,
     artifact_stream: Option<ArtifactStreamCoordinator>,
     markdown_projection: super::markdown_projection_coordinator::MarkdownProjectionCoordinator,
     markdown_presentation: Option<super::markdown_image::MarkdownPresentationRuntime>,
@@ -417,8 +433,10 @@ impl ChatLoopState {
         commands: bcode_client::ManagedSessionCommandHandle,
         generation: u64,
     ) -> Self {
+        let host = super::effects::ManagedHostAccess::for_commands(commands.clone());
         let mut state = Self::new_access(None, None, Some(commands), false);
         state.managed_generation = Some(generation);
+        state.managed_host = Some(host);
         state
     }
 
@@ -437,6 +455,11 @@ impl ChatLoopState {
             slash_completion: slash_palette::SlashCompletionState::default(),
             managed_commands,
             managed_generation: None,
+            managed_host: None,
+            managed_interactions: super::managed_controls::ManagedInteractionTracker::default(),
+            managed_model_selectors: std::collections::BTreeMap::new(),
+            managed_configure_in_flight: None,
+            managed_open: None,
             foreground_client,
             passive_client: passive_client.cloned(),
             viewport_input_task: None,
@@ -727,8 +750,7 @@ impl ChatLoopState {
                     schedule,
                     self.foreground_client.as_ref(),
                     self.passive_client.as_ref(),
-                    self.managed_commands.clone(),
-                    self.managed_generation,
+                    self.managed_effect_access(),
                     handle.clone(),
                 )
             })
@@ -745,8 +767,7 @@ impl ChatLoopState {
             super::effects::EffectSchedule::StartIfIdle,
             self.foreground_client.as_ref(),
             self.passive_client.as_ref(),
-            self.managed_commands.clone(),
-            self.managed_generation,
+            self.managed_effect_access(),
             handle.clone(),
         )
     }
@@ -825,6 +846,42 @@ impl ChatLoopState {
         self.foreground_client.clone()
     }
 
+    fn managed_effect_access(&self) -> super::effects::ManagedEffectAccess {
+        super::effects::ManagedEffectAccess {
+            commands: self.managed_commands.clone(),
+            generation: self.managed_generation,
+            host: self.managed_host.clone(),
+        }
+    }
+
+    /// Ownership generation of the attached managed conversation.
+    #[must_use]
+    pub const fn managed_generation(&self) -> Option<u64> {
+        self.managed_generation
+    }
+
+    #[cfg(test)]
+    pub(crate) const fn set_managed_generation_for_test(&mut self, generation: u64) {
+        self.managed_generation = Some(generation);
+    }
+
+    /// Native model selector for a model picked from the managed model picker.
+    #[must_use]
+    pub fn managed_model_selector(&self, model_id: &str) -> Option<String> {
+        self.managed_model_selectors.get(model_id).cloned()
+    }
+
+    /// Request from an ordinary root to hand off a session to the managed reattach route.
+    #[must_use]
+    pub const fn managed_open_requested(&self) -> bool {
+        self.managed_open.is_some()
+    }
+
+    /// Take the managed hand-off request after the root runtime stopped.
+    pub const fn take_managed_open(&mut self) -> Option<ManagedOpenRequest> {
+        self.managed_open.take()
+    }
+
     pub fn flush_telemetry_if_due(&mut self, now: Instant) {
         if let Some(telemetry) = &mut self.telemetry {
             telemetry.flush_if_due(now);
@@ -861,6 +918,11 @@ impl ChatLoopState {
     /// Invalidate discovery after configuration, plugin, skill or catalog changes.
     pub fn invalidate_slash_palette_discovery(&mut self) {
         self.slash_completion.invalidate();
+    }
+
+    #[cfg(test)]
+    pub(crate) const fn slash_palette_for_test(&self) -> Option<&slash_palette::SlashPalette> {
+        self.slash_palette.as_ref()
     }
 
     pub fn refresh_slash_palette(&mut self, chat: &mut ActiveChat) -> bool {
@@ -1090,6 +1152,11 @@ impl ChatLoopState {
 
     pub const fn has_command_palette(&self) -> bool {
         self.palette.is_some()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn close_command_palette_for_test(&mut self) {
+        self.palette = None;
     }
 
     pub fn open_command_palette(&mut self, chat: &mut ActiveChat) {
@@ -4344,6 +4411,44 @@ pub fn apply_effect_result(
                 result,
             );
         }
+        TuiEffectResult::ManagedInteractionResponded {
+            generation,
+            request_id,
+            response_id,
+            result,
+        } => super::managed_flow::apply_response_result(
+            chat,
+            loop_state,
+            &(generation, request_id),
+            &response_id,
+            &result,
+        ),
+        TuiEffectResult::ManagedSessionConfigured {
+            mutation_id,
+            setting,
+            result,
+        } => super::managed_flow::apply_configure_result(
+            chat,
+            loop_state,
+            &mutation_id,
+            &setting,
+            &result,
+        ),
+        TuiEffectResult::ManagedModelsLoaded { result } => {
+            super::managed_flow::apply_models_result(chat, loop_state, result);
+        }
+        TuiEffectResult::ManagedSessionDetected {
+            session_id,
+            binding,
+        } => {
+            loop_state.managed_open = Some(ManagedOpenRequest {
+                session_id,
+                instance_id: binding.instance.instance_id.clone(),
+                generation: binding.target.generation(),
+            });
+            chat.app
+                .set_status("Opening the managed conversation…".to_owned());
+        }
     }
 }
 
@@ -4834,7 +4939,14 @@ fn apply_root_slash_command_outcome(
     outcome: super::slash_commands::SlashCommandOutcome,
 ) {
     use super::slash_commands::SlashCommandOutcome;
+    let Some(outcome) = super::managed_flow::intercept_slash_outcome(chat, loop_state, outcome)
+    else {
+        return;
+    };
     match outcome {
+        SlashCommandOutcome::ManagedConfigure(_) => chat
+            .app
+            .set_status("Native settings require a managed conversation".to_owned()),
         SlashCommandOutcome::ManagedComposer {
             expected_native_turn_id,
             retry_submission_id,
@@ -5840,6 +5952,21 @@ fn update_slash_palette_async(chat: &mut ActiveChat, loop_state: &mut ChatLoopSt
     }
     if loop_state.slash_completion.is_dismissed(&query) {
         return false;
+    }
+    if chat.app.managed_execution_session().is_some() {
+        // Managed completions come only from the managed allow-list; no discovery effect.
+        let previous = loop_state
+            .slash_palette
+            .as_ref()
+            .and_then(slash_palette::SlashPalette::explicit_selection)
+            .map(str::to_owned);
+        let mut palette =
+            slash_palette::SlashPalette::managed(&query, loop_state.slash_completion.settings);
+        if let Some(previous) = previous {
+            palette.select_command(&previous);
+        }
+        loop_state.slash_palette = (!palette.is_empty()).then_some(palette);
+        return true;
     }
     if let Some(mut palette) = loop_state.slash_completion.cached(&query) {
         if let Some(previous) = loop_state
@@ -7163,7 +7290,18 @@ fn absorb_session_stream_update(
             apply_session_stream_resynchronization(chat, loop_state, &attached);
             true
         }
+        history_flow::SessionStreamUpdate::ManagedOwnershipLost { session_id }
+            if chat.viewing_session_id() == Some(session_id) =>
+        {
+            chat.mark_stream_detached(session_id);
+            chat.app.set_status(
+                "The daemon restarted; recovering the managed conversation without replay…"
+                    .to_owned(),
+            );
+            true
+        }
         history_flow::SessionStreamUpdate::ResyncStarted { .. }
+        | history_flow::SessionStreamUpdate::ManagedOwnershipLost { .. }
         | history_flow::SessionStreamUpdate::Resynchronized { .. } => false,
     }
 }

@@ -796,7 +796,12 @@ owner blocks migration. Unknown, future, dirty, ambiguous, or corrupt storage st
 
 `session_storage_contract` contains a singleton versioned writer epoch. Mutation-capable processes
 advertise their epoch in session leases and validate the durable row before mutation. The current
-writer contract is epoch `23`, retaining event payload schema `55`. Epoch `22` introduced
+writer contract is epoch `26` with event payload schema `58`. Epoch `25` (schema `57`) fenced
+selected-model managed operations; epoch `24` and schema `56` are reserved and never input.
+Epoch `26` (schema `58`) fences managed native-parity records (reasoning, native tool results,
+native usage, display metadata and mid-session configuration requests); the `25`→`26` edge
+preserves canonical payloads and advances only the schema and writer contract. Epoch `23`
+retained event payload schema `55`. Epoch `22` introduced
 canonical managed-tool claim/start metadata and its disposable claim projection. Epoch `23` adds
 `events.managed_tool_key` and `idx_events_managed_tool_key`: independently indexed reserved
 claim/result identities on the canonical event rows, populated atomically with each append.

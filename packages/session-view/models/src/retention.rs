@@ -1088,6 +1088,7 @@ pub fn inspect_snapshot(
         thinking: _,
         runtime: _,
         interactions: _,
+        pending_external_interactions: _,
         session_summary: _,
     } = value;
     let mut walker = Walker::new(limits, 8)?;
@@ -1230,6 +1231,71 @@ fn inspect_snapshot_tools(
     Ok(())
 }
 
+/// Inspect a pending external interaction list exactly as [`inspect_snapshot`] accounts it.
+///
+/// Reducers use this to adjust an exact ledger when replacing the list without walking the
+/// complete snapshot.
+///
+/// # Errors
+/// Returns an error on a structural limit or accounting overflow.
+pub fn inspect_pending_external_interaction_list(
+    interactions: &[crate::external::ExternalInteractionView],
+    limits: ObservationRetentionLimits,
+) -> Result<ObservationRetentionUsage, ObservationRetentionExceeded> {
+    let mut walker = Walker::new(limits, 0)?;
+    inspect_pending_external_interactions(interactions, &mut walker)?;
+    Ok(walker.usage)
+}
+
+fn inspect_pending_external_interactions(
+    interactions: &[crate::external::ExternalInteractionView],
+    walker: &mut Walker,
+) -> Result<(), ObservationRetentionExceeded> {
+    let limits = walker.limits;
+    walker.usage.try_add(
+        ObservationRetentionUsage::collection(interactions.len(), 2),
+        limits,
+    )?;
+    for interaction in interactions {
+        let crate::external::ExternalInteractionView {
+            request_id,
+            provenance,
+            interaction_kind: _,
+            kind,
+            prompt,
+            scope,
+            choices,
+            tool_name,
+            input_preview,
+            response,
+        } = interaction;
+        for text in [
+            request_id,
+            &provenance.session_id,
+            &provenance.instance_id,
+            &provenance.plugin_id,
+            &provenance.native_session_id,
+            kind,
+            prompt,
+            scope,
+            &response.reason,
+        ] {
+            walker.text(text, 4)?;
+        }
+        walker.optional_text(tool_name.as_ref(), 4)?;
+        walker.optional_text(input_preview.as_ref(), 4)?;
+        walker.usage.try_add(
+            ObservationRetentionUsage::collection(choices.capacity(), 4),
+            limits,
+        )?;
+        for choice in choices {
+            walker.text(&choice.id, 5)?;
+            walker.text(&choice.label, 5)?;
+        }
+    }
+    Ok(())
+}
+
 fn inspect_snapshot_application(
     value: &crate::SessionViewSnapshot,
     walker: &mut Walker,
@@ -1283,6 +1349,7 @@ fn inspect_snapshot_application(
     for value in interactions {
         walker.nested(inspect_interaction(value, limits)?, 2)?;
     }
+    inspect_pending_external_interactions(&value.pending_external_interactions, walker)?;
     if let Some(summary) = session_summary {
         walker.nested(
             bcode_session_models::retention_events::inspect_session_summary(summary, &limits)?,

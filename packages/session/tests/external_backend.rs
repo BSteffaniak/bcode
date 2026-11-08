@@ -47,7 +47,10 @@ fn observation(session: SessionId, id: &str, generation: u64) -> Record {
             generation,
             native_correlations: vec!["native-turn".into()],
             completeness: HarnessCompleteness::Complete,
-            kind: HarnessObservationKind::Text { text: id.into() },
+            kind: HarnessObservationKind::Text {
+                segment_id: None,
+                text: id.into(),
+            },
         },
     }
 }
@@ -302,6 +305,7 @@ async fn observation_tools_never_become_canonical_tool_invocations() {
     let mut record = observation(session.id, "native-tool", 1);
     if let Record::Observation { observation } = &mut record {
         observation.kind = HarnessObservationKind::Tool {
+            input_json: None,
             native_tool_id: "tool".into(),
             name: "shell".into(),
             status: "observed".into(),
@@ -346,6 +350,8 @@ async fn only_observed_outstanding_interactions_can_be_answered_once() {
     ] {
         let id = format!("request-{kind:?}");
         let interaction = HarnessInteraction {
+            input_preview: None,
+            tool_name: None,
             request_id: id.clone(),
             session_id: session.id.to_string(),
             generation: 1,
@@ -590,6 +596,8 @@ fn typed_external_variants_round_trip_canonical_codec_without_trace() {
     };
     let session = SessionId::new();
     let interaction = HarnessInteraction {
+        input_preview: None,
+        tool_name: None,
         request_id: "request".into(),
         session_id: session.to_string(),
         generation: 1,
@@ -694,7 +702,10 @@ fn external_observation_capacity_is_admitted_before_source_clone() {
     text.push('x');
     let mut record = observation(session, "capacity", 1);
     if let Record::Observation { observation } = &mut record {
-        observation.kind = HarnessObservationKind::Text { text };
+        observation.kind = HarnessObservationKind::Text {
+            segment_id: None,
+            text,
+        };
     }
     let kind = ExternalBackendEnvelope { version: 1, record }
         .into_event_kind()

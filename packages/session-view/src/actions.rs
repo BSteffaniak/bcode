@@ -380,7 +380,7 @@ async fn execute_submit_message(
     };
     if client.managed_session_binding(session_id).await?.is_some() {
         return Err(ClientError::Protocol(
-            "Managed external sessions use /native status to inspect the exact prepared/confirmed target, then /native send <generation> <submission-id> <attempt-id> <text>, or /native steer with an exact expected native turn; Bcode model execution is not a fallback".into(),
+            "This session is managed by an external harness. Send messages from its session composer, which delivers them to the native harness; Bcode model execution is never used as a fallback".into(),
         ));
     }
     let receipt = client

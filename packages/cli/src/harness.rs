@@ -71,6 +71,12 @@ pub enum HarnessCommand {
         #[arg(long)]
         request: PathBuf,
     },
+    /// Change one mid-session native setting (model or permission mode). Acknowledgement does
+    /// not prove native effect; an ambiguous outcome is never replayed.
+    Configure {
+        #[arg(long)]
+        request: PathBuf,
+    },
     /// Read a bounded live observation page.
     Observe {
         #[arg(long)]
@@ -193,6 +199,7 @@ pub async fn execute(command: HarnessCommand) -> Result<(), CliError> {
         HarnessCommand::Send { request } => (Op::Followup, read_request(&request)?),
         HarnessCommand::Respond { request } => (Op::Respond, read_request(&request)?),
         HarnessCommand::Cancel { request } => (Op::Interrupt, read_request(&request)?),
+        HarnessCommand::Configure { request } => (Op::Configure, read_request(&request)?),
         HarnessCommand::Observe { request } => (Op::Observe, read_request(&request)?),
         HarnessCommand::Reconcile { request } => (Op::Reconcile, read_request(&request)?),
         HarnessCommand::Close { request } => (Op::Close, read_request(&request)?),

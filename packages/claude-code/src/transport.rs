@@ -73,6 +73,8 @@ pub struct PhysicalReap {
 
 struct Shared {
     model_selection_contract: crate::models::ModelSelectionContract,
+    /// Probed native `--version` output of this exact process launch.
+    native_version: String,
     reaped: watch::Sender<ReapState>,
     state: Mutex<State>,
     stop: watch::Sender<bool>,
@@ -376,7 +378,7 @@ impl ClaudeSession {
     ) -> Result<Self, Error> {
         let native_servers = sdk_server_configuration(servers)?;
         let sdk_servers = native_servers.keys().cloned().collect();
-        let auth = crate::auth_status(&options).await?;
+        let (auth, native_version) = crate::auth::probed_auth_status(&options).await?;
         if !auth.logged_in {
             return Err(Error::InvalidConfiguration(
                 "native authentication required",
@@ -407,8 +409,9 @@ impl ClaudeSession {
         let (stop, stopped) = watch::channel(false);
         let shared = Arc::new(Shared {
             model_selection_contract: crate::models::ModelSelectionContract::for_version(
-                &options.expected_version,
+                &native_version,
             ),
+            native_version,
             reaped: watch::channel(ReapState::Pending).0,
             state: Mutex::new(State {
                 pending: BTreeMap::new(),
@@ -547,6 +550,14 @@ impl Drop for ClaudeSession {
 impl ClaudeClient {
     pub(crate) fn model_selection_contract(&self) -> crate::models::ModelSelectionContract {
         self.shared.model_selection_contract
+    }
+
+    /// Probed native `--version` output of this process launch, which may differ from the
+    /// configured expected version. Use [`crate::is_tested_version`] before relying on
+    /// version-specific verified behavior.
+    #[must_use]
+    pub fn native_version(&self) -> &str {
+        &self.shared.native_version
     }
 
     pub(crate) fn is_before_first_prompt(&self) -> bool {
@@ -1398,6 +1409,7 @@ mod sdk_handshake_tests {
         let (stop, _stopped) = watch::channel(false);
         let shared = Shared {
             model_selection_contract: crate::models::ModelSelectionContract::ExactIdentity,
+            native_version: "test-only".into(),
             reaped: watch::channel(ReapState::Pending).0,
             state: Mutex::new(State {
                 pending: BTreeMap::new(),
@@ -1809,6 +1821,7 @@ mod retired_delivery_tests {
             let (stop, _stopped) = watch::channel(false);
             let shared = Shared {
                 model_selection_contract: crate::models::ModelSelectionContract::ExactIdentity,
+                native_version: "test-only".into(),
                 reaped: watch::channel(ReapState::Pending).0,
                 state: Mutex::new(State {
                     pending: BTreeMap::new(),

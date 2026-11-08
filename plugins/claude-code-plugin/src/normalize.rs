@@ -1,4 +1,10 @@
-//! Native protocol normalization. Raw messages and tool inputs never leave this module.
+//! Native protocol normalization.
+//!
+//! Raw native frames never leave this module. Assistant text, reasoning, tool inputs and
+//! tool outputs leave only through the bounded projections in `normalize_display.rs`, as
+//! untrusted display content that never dispatches or authorizes a Bcode tool.
+#[path = "normalize_display.rs"]
+mod display;
 #[path = "normalizer_retention.rs"]
 mod retention;
 
@@ -30,6 +36,14 @@ pub struct Normalizer {
     attribution: crate::attribution::Producer,
     staging: retention::Staging,
     execution: crate::execution::Tracker,
+    /// Transient partial-message text; never retained or digested.
+    live: crate::live::LiveBuffer,
+    blocks: display::BlockNumbering,
+    /// Latest native model identity (system init or assistant message) for usage.
+    model: Option<String>,
+    /// Last cumulative `total_cost_usd` (in micros) this process reported. Claude reports a
+    /// running process total on every result; usage observations carry only the increment.
+    reported_cost_micros: Option<u64>,
 }
 impl Normalizer {
     #[cfg(test)]
@@ -52,6 +66,29 @@ impl Normalizer {
             attribution: crate::attribution::Producer::new(),
             staging: retention::Staging::new(),
             execution: crate::execution::Tracker::new(),
+            live: crate::live::LiveBuffer::new(),
+            blocks: display::BlockNumbering::new(),
+            model: None,
+            reported_cost_micros: None,
+        }
+    }
+    /// Whether transient live updates wait for the next observe page.
+    pub fn live_pending(&self) -> bool {
+        self.live.is_pending()
+    }
+    /// Whether pending live text is close enough to its bounds that coalescing longer would
+    /// risk dropping deltas.
+    pub fn live_near_capacity(&self) -> bool {
+        self.live.near_capacity()
+    }
+    /// Take pending live updates for one page; they are never offered twice.
+    pub fn take_live(&mut self) -> Vec<bcode_harness_models::HarnessLiveUpdate> {
+        self.live.take()
+    }
+    /// Record transient live text from a partial-message frame before staging.
+    fn observe_live(&mut self, event: &Event) {
+        if let Event::Message(NativeMessage::Stream(value)) = event {
+            self.live.stream_event(value);
         }
     }
     pub fn confirmation(
@@ -171,20 +208,26 @@ impl Normalizer {
                 }
             }
             Event::Message(NativeMessage::Assistant(value)) => {
-                let Some(normalized) = Self::assistant(&value) else {
+                let Some(normalized) = self.assistant(&value) else {
                     return self.gap();
                 };
                 kinds.extend(normalized);
             }
+            Event::Message(NativeMessage::User(value)) => {
+                kinds.extend(display::tool_results(&value));
+            }
             Event::Message(NativeMessage::Result(value)) => {
-                if let Some(text) = bounded_text(value.get("result")) {
-                    kinds.push(HarnessObservationKind::Result { text });
-                } else if value.get("result").is_some() {
+                let Some(normalized) = self.result(&value) else {
                     return self.gap();
-                }
-                // A result can precede background continuation; never synthesize settlement.
+                };
+                kinds.extend(normalized);
             }
             Event::Message(NativeMessage::System(value)) => {
+                if value.get("subtype").and_then(Value::as_str) == Some("init")
+                    && let Some(model) = display::model_identity(value.get("model"))
+                {
+                    self.model = Some(model);
+                }
                 if let Some("task_started" | "task_notification") =
                     value.get("subtype").and_then(Value::as_str)
                     && let Some(id) = bounded_id(value.get("task_id"))
@@ -199,34 +242,18 @@ impl Normalizer {
                 request_id,
                 request,
             } => {
-                if self.pending.len() >= MAX_HARNESS_ITEMS || self.pending.contains_key(&request_id)
-                {
+                let Some(normalized) = self.callback(request_id, request) else {
                     return self.gap();
-                }
-                if let Some(interaction) = self.interaction(&request_id, &request) {
-                    if interaction.kind == HarnessInteractionKind::Assistance {
-                        let Some(grant) = self.assistance_grant.clone() else {
-                            return self.gap();
-                        };
-                        self.pending_grants.insert(request_id.clone(), grant);
-                    }
-                    self.pending
-                        .insert(request_id, (interaction.clone(), request));
-                    kinds.push(HarnessObservationKind::Interaction { interaction });
-                } else {
-                    self.execution.lose_coverage();
-                    kinds.extend(
-                        self.execution
-                            .coverage()
-                            .into_iter()
-                            .map(|event| HarnessObservationKind::Execution { event }),
-                    );
-                    kinds.push(HarnessObservationKind::Diagnostic { code: "unsupported_callback".into(), message: "Native callback requires unsupported or unscoped behavior; no action authorized".into() });
-                }
+                };
+                kinds.extend(normalized);
             }
             Event::CallbackCancelled { request_id } => {
-                self.pending.remove(&request_id);
                 self.pending_grants.remove(&request_id);
+                // The host already showed this prompt; tell it the prompt is gone so it is
+                // never left waiting for an answer the native harness will refuse.
+                if self.pending.remove(&request_id).is_some() {
+                    kinds.push(HarnessObservationKind::InteractionWithdrawn { request_id });
+                }
             }
             Event::Settlement(Settlement::Settled) => {
                 kinds.extend(self.settled_kinds());
@@ -236,11 +263,70 @@ impl Normalizer {
                     status: status(&state),
                 });
             }
-            Event::Message(
-                NativeMessage::User(_) | NativeMessage::Stream(_) | NativeMessage::Notice(_),
-            ) => {}
+            Event::Message(NativeMessage::Stream(_) | NativeMessage::Notice(_)) => {}
         }
         self.observations_from_kinds(kinds)
+    }
+    /// Record one native callback as a pending interaction, or report it as unsupported;
+    /// `None` when the callback exceeds bounds or lacks host-admitted scope.
+    fn callback(
+        &mut self,
+        request_id: String,
+        request: CallbackRequest,
+    ) -> Option<Vec<HarnessObservationKind>> {
+        if self.pending.len() >= MAX_HARNESS_ITEMS || self.pending.contains_key(&request_id) {
+            return None;
+        }
+        let Some(interaction) = self.interaction(&request_id, &request) else {
+            self.execution.lose_coverage();
+            let mut kinds: Vec<_> = self
+                .execution
+                .coverage()
+                .into_iter()
+                .map(|event| HarnessObservationKind::Execution { event })
+                .collect();
+            kinds.push(HarnessObservationKind::Diagnostic {
+                code: "unsupported_callback".into(),
+                message: "Native callback requires unsupported or unscoped behavior; no action authorized".into(),
+            });
+            return Some(kinds);
+        };
+        if interaction.kind == HarnessInteractionKind::Assistance {
+            let grant = self.assistance_grant.clone()?;
+            self.pending_grants.insert(request_id.clone(), grant);
+        }
+        self.pending
+            .insert(request_id, (interaction.clone(), request));
+        Some(vec![HarnessObservationKind::Interaction { interaction }])
+    }
+    /// Result text and usage of one native result frame; `None` when the result is malformed.
+    /// A result can precede background continuation, so it never synthesizes settlement.
+    fn result(&mut self, value: &Value) -> Option<Vec<HarnessObservationKind>> {
+        let mut kinds = Vec::new();
+        if let Some(text) = bounded_text(value.get("result")) {
+            kinds.push(HarnessObservationKind::Result { text });
+        } else if value.get("result").is_some() {
+            return None;
+        }
+        kinds.extend(
+            display::usage(value, self.model.clone()).map(|kind| self.cost_increment(kind)),
+        );
+        Some(kinds)
+    }
+    /// Replace a result's cumulative native cost with the increment since the previous
+    /// result of this process. A total below the previous one means the native total was
+    /// reset, so the whole new total is the increment.
+    fn cost_increment(&mut self, mut kind: HarnessObservationKind) -> HarnessObservationKind {
+        if let HarnessObservationKind::Usage {
+            total_cost_micros: Some(cost),
+            ..
+        } = &mut kind
+        {
+            let total = *cost;
+            let previous = self.reported_cost_micros.replace(total).unwrap_or(0);
+            *cost = total.checked_sub(previous).unwrap_or(total);
+        }
+        kind
     }
     fn observations_from_kinds(
         &mut self,
@@ -270,26 +356,62 @@ impl Normalizer {
             }],
         )
     }
-    fn assistant(value: &Value) -> Option<Vec<HarnessObservationKind>> {
+    fn assistant(&mut self, value: &Value) -> Option<Vec<HarnessObservationKind>> {
         let mut kinds = Vec::new();
         // Raw assistant IDs (including an unverified turn_id field) do not prove
         // acceptance of the exact host submission/attempt. Only a verified SDK
-        // acceptance contract may populate turn correlation in the future.
+        // acceptance contract may populate turn correlation in the future. The native
+        // message ID is used solely as a display segment identity.
+        if let Some(model) = display::model_identity(value.pointer("/message/model")) {
+            self.model = Some(model);
+        }
+        let message_id = value
+            .pointer("/message/id")
+            .and_then(Value::as_str)
+            .filter(|id| crate::live::valid_message_id(id));
         if let Some(content) = value.pointer("/message/content").and_then(Value::as_array) {
             if content.len() > MAX_HARNESS_ITEMS {
                 return None;
             }
-            for block in content.iter().take(MAX_HARNESS_ITEMS) {
+            let first = message_id.map(|id| self.blocks.reserve(id, content.len()));
+            for (position, block) in content.iter().enumerate() {
+                let segment_id = message_id
+                    .zip(first)
+                    .map(|(id, first)| format!("{id}:{}", first + position));
                 match block.get("type").and_then(Value::as_str) {
                     Some("text") => {
-                        let text = bounded_text(block.get("text"))?;
-                        kinds.push(HarnessObservationKind::Text { text });
+                        // Oversized text is truncated rather than dropped, so the segment is
+                        // still finalized and supersedes its live stream.
+                        let text = block.get("text").and_then(Value::as_str)?;
+                        kinds.push(HarnessObservationKind::Text {
+                            segment_id,
+                            text: display::truncate_display(text, MAX_HARNESS_TEXT_BYTES).0,
+                        });
+                    }
+                    Some("thinking") => {
+                        // The native signature is opaque verification material, never shown.
+                        let thinking = block.get("thinking").and_then(Value::as_str)?;
+                        kinds.push(HarnessObservationKind::Reasoning {
+                            segment_id,
+                            text: display::truncate_display(thinking, MAX_HARNESS_TEXT_BYTES).0,
+                            opaque: false,
+                        });
+                    }
+                    Some("redacted_thinking") => {
+                        kinds.push(HarnessObservationKind::Reasoning {
+                            segment_id,
+                            text: String::new(),
+                            opaque: true,
+                        });
                     }
                     Some("tool_use") => {
                         if let (Some(id), Some(name)) =
                             (bounded_id(block.get("id")), bounded_text(block.get("name")))
                         {
                             kinds.push(HarnessObservationKind::Tool {
+                                input_json: block
+                                    .get("input")
+                                    .and_then(display::bounded_input_json),
                                 native_tool_id: id,
                                 name,
                                 status: "observed".into(),
@@ -342,18 +464,29 @@ impl Normalizer {
                     choices,
                 )
             }
-            CallbackRequest::CanUseTool { tool_name, .. } => {
+            CallbackRequest::CanUseTool {
+                tool_name, input, ..
+            } => {
                 if tool_name.len() > MAX_HARNESS_ID_BYTES {
                     return None;
                 }
-                (
-                    HarnessInteractionKind::Approval,
-                    format!("Allow native Claude tool {tool_name}?"),
-                    format!(
-                        "Native tool {tool_name}; input is withheld, not dispatched as a Bcode tool"
+                let interaction = HarnessInteraction {
+                    tool_name: (!tool_name.is_empty()
+                        && tool_name.trim() == tool_name
+                        && !tool_name.chars().any(char::is_control))
+                    .then(|| tool_name.clone()),
+                    input_preview: display::input_preview(input),
+                    request_id: request_id.into(),
+                    session_id: self.target.session_id().to_owned(),
+                    generation: self.target.generation(),
+                    kind: HarnessInteractionKind::Approval,
+                    prompt: format!("Allow native Claude tool {tool_name}?"),
+                    scope: format!(
+                        "Native tool {tool_name}; the input preview is untrusted display only and is not dispatched as a Bcode tool"
                     ),
-                    Vec::new(),
-                )
+                    choices: Vec::new(),
+                };
+                return interaction.validate().ok().map(|()| interaction);
             }
             CallbackRequest::McpMessage { .. } => {
                 let grant = self.assistance_grant.as_ref().filter(|grant| {
@@ -376,6 +509,8 @@ impl Normalizer {
             CallbackRequest::HookCallback { .. } => return None,
         };
         let interaction = HarnessInteraction {
+            input_preview: None,
+            tool_name: None,
             request_id: request_id.into(),
             session_id: self.target.session_id().to_owned(),
             generation: self.target.generation(),
@@ -463,18 +598,28 @@ impl Normalizer {
         self.pending_grants.remove(request_id);
     }
     pub fn connection_lost(&mut self) -> Vec<HarnessObservation> {
-        self.invalidate_callbacks();
+        let mut observations = self.invalidate_callbacks();
+        self.live.clear();
         let events = self.execution.disconnected();
-        events
-            .into_iter()
-            .filter_map(|event| self.observation(HarnessObservationKind::Execution { event }))
-            .collect()
+        observations.extend(
+            events
+                .into_iter()
+                .filter_map(|event| self.observation(HarnessObservationKind::Execution { event })),
+        );
+        observations
     }
-    pub fn invalidate_callbacks(&mut self) {
+    /// Drop every outstanding native callback and return one withdrawal observation for each
+    /// prompt the host was shown, so no dialog waits on a callback that can never be answered.
+    pub fn invalidate_callbacks(&mut self) -> Vec<HarnessObservation> {
         self.execution.lose_coverage();
-        self.pending.clear();
         self.pending_grants.clear();
         self.assistance_grant = None;
+        std::mem::take(&mut self.pending)
+            .into_keys()
+            .filter_map(|request_id| {
+                self.observation(HarnessObservationKind::InteractionWithdrawn { request_id })
+            })
+            .collect()
     }
     pub fn gap(&mut self) -> Vec<HarnessObservation> {
         self.execution.lose_coverage();

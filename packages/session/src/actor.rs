@@ -2974,7 +2974,6 @@ impl SessionActor {
                 false
             }),
             SessionCommand::HarnessSnapshot(reply) => Box::pin(async move {
-                tracing::warn!(target: "bcode_session::harness", stage = "snapshot_enter", "managed actor progress");
                 // Observation does not reacquire a runtime lease. Reuse a live actor DB,
                 // otherwise make a short-lived non-migrating open and retain no handle.
                 let result = if let Some(db) = self.db.as_ref() {
@@ -2994,7 +2993,6 @@ impl SessionActor {
                 } else {
                     Ok(None)
                 };
-                tracing::warn!(target: "bcode_session::harness", stage = "snapshot_exit", success = result.is_ok(), "managed actor progress");
                 let _ = reply.send(result);
                 false
             }),
@@ -3027,18 +3025,7 @@ impl SessionActor {
                 timestamp,
                 reply,
             } => Box::pin(async move {
-                let diagnostic = match &action {
-                    harness::HarnessAction::State => Some("state"),
-                    harness::HarnessAction::Page { .. } => Some("page"),
-                    _ => None,
-                };
-                if let Some(operation) = diagnostic {
-                    tracing::warn!(target: "bcode_session::harness", stage = "operation_enter", operation, "managed actor progress");
-                }
                 let result = Box::pin(self.harness_operation(owner, action, timestamp)).await;
-                if let Some(operation) = diagnostic {
-                    tracing::warn!(target: "bcode_session::harness", stage = "operation_exit", operation, success = result.is_ok(), "managed actor progress");
-                }
                 let _ = reply.send(result);
                 false
             }),
@@ -5824,6 +5811,18 @@ impl SessionActor {
                     self.retire_live_text_checkpoint_with_tombstone(key);
                 }
             }
+            SessionEventKind::ExternalHarnessOperation { operation } => {
+                // A durable native segment supersedes its transient live stream. Keys come from
+                // the shared harness stream identity, exactly as the daemon published them.
+                for key in external_harness_durable_stream_keys(operation) {
+                    self.retire_live_text_checkpoint_with_tombstone(key);
+                }
+                // Streams that never receive a durable segment (interrupted, aborted, lost
+                // with the connection) end with the native turn or transport.
+                if let Some(generation) = external_harness_live_streams_ended(operation) {
+                    self.retire_harness_generation_live_text(generation);
+                }
+            }
             SessionEventKind::ModelTurnFinished { turn_id, .. } => {
                 self.state
                     .live_text_checkpoints
@@ -5839,6 +5838,21 @@ impl SessionActor {
                     .retain(|key| key.turn_id() != turn_id);
             }
             _ => {}
+        }
+    }
+
+    /// Retire, with tombstones, every live checkpoint published for one harness generation.
+    fn retire_harness_generation_live_text(&mut self, generation: u64) {
+        let prefix = bcode_harness_models::harness_stream_turn_prefix(generation);
+        let keys: Vec<_> = self
+            .state
+            .live_text_checkpoints
+            .keys()
+            .filter(|key| key.turn_id().starts_with(&prefix))
+            .cloned()
+            .collect();
+        for key in keys {
+            self.retire_live_text_checkpoint_with_tombstone(key);
         }
     }
 
@@ -6254,4 +6268,80 @@ impl SessionSnapshot {
             owned,
         }
     }
+}
+
+/// Live text stream keys finalized by a durable native observation page.
+/// The harness generation whose transient live streams can receive no further durable segment
+/// once `operation` commits: its foreground native turn ended, or its transport is gone.
+fn external_harness_live_streams_ended(
+    operation: &bcode_session_models::external_harness::ExternalHarnessOperation,
+) -> Option<u64> {
+    use bcode_harness_models::{HarnessCompleteness, HarnessConnectivity, HarnessObservationKind};
+    use bcode_session_models::external_harness::{
+        ExternalHarnessOperationRecord as Record, ExternalHarnessRequestKind,
+    };
+    let generation = operation.owner.generation;
+    match &operation.record {
+        Record::ObservationPage { page, .. } => {
+            let ended = page.completeness == HarnessCompleteness::Gap
+                || page.status.connectivity == HarnessConnectivity::Disconnected
+                || page.observations.iter().any(|observation| {
+                    matches!(
+                        observation.kind,
+                        HarnessObservationKind::Result { .. }
+                            | HarnessObservationKind::NativeTurnTerminal { .. }
+                            | HarnessObservationKind::Settlement { .. }
+                    )
+                });
+            ended.then_some(generation)
+        }
+        Record::DeliveryCompleted { request, .. }
+            if matches!(request.kind, ExternalHarnessRequestKind::Close(_)) =>
+        {
+            Some(generation)
+        }
+        Record::TransportReleased { .. } => Some(generation),
+        Record::RecoveryPrepared { recovery } => Some(recovery.previous_owner.generation),
+        _ => None,
+    }
+}
+
+fn external_harness_durable_stream_keys(
+    operation: &bcode_session_models::external_harness::ExternalHarnessOperation,
+) -> Vec<LiveTextStreamKey> {
+    use bcode_harness_models::{HarnessObservationKind, harness_stream_identity};
+    let bcode_session_models::external_harness::ExternalHarnessOperationRecord::ObservationPage {
+        page,
+        ..
+    } = &operation.record
+    else {
+        return Vec::new();
+    };
+    page.observations
+        .iter()
+        .filter_map(|observation| match &observation.kind {
+            HarnessObservationKind::Text {
+                segment_id: Some(segment),
+                ..
+            } => {
+                let identity = harness_stream_identity(observation.generation, segment);
+                Some(LiveTextStreamKey::Assistant {
+                    turn_id: identity.turn_id,
+                    segment_id: identity.segment_id,
+                })
+            }
+            HarnessObservationKind::Reasoning {
+                segment_id: Some(segment),
+                ..
+            } => {
+                let identity = harness_stream_identity(observation.generation, segment);
+                Some(LiveTextStreamKey::Reasoning {
+                    activity_id: identity.reasoning_activity_id().to_owned(),
+                    part_id: identity.reasoning_part_id().to_owned(),
+                    turn_id: identity.turn_id,
+                })
+            }
+            _ => None,
+        })
+        .collect()
 }
