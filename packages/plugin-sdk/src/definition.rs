@@ -221,15 +221,42 @@ trait ProductImplementation: BcodePluginService + 'static {
     ) -> Result<bcode_plugin_models::activation::ActivationContributions, PluginError>;
 }
 
+std::thread_local! {
+    /// Exclusive implementations whose lock the current thread already holds.
+    static HELD_EXCLUSIVE: std::cell::RefCell<Vec<usize>> = const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// Releases one thread-held exclusive marker, including on unwind.
+struct HeldExclusive(usize);
+impl Drop for HeldExclusive {
+    fn drop(&mut self) {
+        HELD_EXCLUSIVE.with(|held| {
+            let mut held = held.borrow_mut();
+            if let Some(position) = held.iter().rposition(|key| *key == self.0) {
+                held.remove(position);
+            }
+        });
+    }
+}
+
 struct Serial<P>(Mutex<P>);
 impl<P: RustPlugin> Serial<P> {
     fn with<T>(&self, operation: impl FnOnce(&mut P) -> T) -> Result<T, PluginError> {
-        // Never wait while holding a parent callback's implementation lock.
-        // Legacy exclusive implementations reject reentry instead of deadlocking.
+        // Independent callers queue on the implementation lock, as exclusive
+        // plugins always have. A nested entry from a call that already holds
+        // this lock would wait on its own parent, so it is rejected instead.
+        let key = std::ptr::from_ref(self).cast::<()>() as usize;
+        if HELD_EXCLUSIVE.with(|held| held.borrow().contains(&key)) {
+            return Err(PluginError::failed(
+                "exclusive plugin is busy or unavailable",
+            ));
+        }
         let mut plugin = self
             .0
-            .try_lock()
+            .lock()
             .map_err(|_| PluginError::failed("exclusive plugin is busy or unavailable"))?;
+        HELD_EXCLUSIVE.with(|held| held.borrow_mut().push(key));
+        let _held = HeldExclusive(key);
         Ok(operation(&mut plugin))
     }
 }

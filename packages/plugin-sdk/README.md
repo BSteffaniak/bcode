@@ -38,8 +38,9 @@ still carry their original interface ID; this registry identity is only the
 migration adapter's native provider identity, not authorization for arbitrary
 services. Host authorization and admission must precede native dispatch too.
 
-Exclusive implementations use a nonblocking implementation lock. Reentrant or
-concurrent entry reports `plugin_busy`, never waits on a parent callback lock.
+Exclusive implementations serialize independent callers on the implementation
+lock. A nested entry from a call that already holds that lock reports
+`plugin_busy` instead of waiting on its own parent.
 Use the concurrent adapter for nested service behavior; do not treat this temporary
 legacy adaptation as a new runtime concurrency policy.
 

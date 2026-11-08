@@ -78,10 +78,41 @@ fn shared_factory_creates_independent_product_state() {
 #[test]
 fn exclusive_reentry_fails_instead_of_waiting_on_parent_mutex() {
     let serial = Serial(Mutex::new(Counter::default()));
-    let guard = serial.0.lock().unwrap();
-    let response = serial.invoke(context());
+    let response = serial.with(|_| serial.invoke(context())).unwrap();
     assert_eq!(response.error.unwrap().code, "plugin_busy");
-    drop(guard);
+    // The rejected nested entry leaves the implementation reachable afterwards.
+    assert_eq!(
+        serial.invoke(context()).error.unwrap().code,
+        "unsupported_service"
+    );
+}
+
+#[test]
+fn exclusive_independent_callers_wait_for_the_running_call() {
+    let serial = Arc::new(Serial(Mutex::new(Counter::default())));
+    let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+    let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+    let running = {
+        let serial = Arc::clone(&serial);
+        std::thread::spawn(move || {
+            serial
+                .with(|_| {
+                    entered_tx.send(()).unwrap();
+                    release_rx.recv().unwrap();
+                })
+                .unwrap();
+        })
+    };
+    entered_rx.recv().unwrap();
+    let waiting = {
+        let serial = Arc::clone(&serial);
+        std::thread::spawn(move || serial.invoke(context()))
+    };
+    release_tx.send(()).unwrap();
+    running.join().unwrap();
+    // The queued caller reaches the implementation instead of reporting busy.
+    let response = waiting.join().unwrap();
+    assert_eq!(response.error.unwrap().code, "unsupported_service");
 }
 
 #[test]
