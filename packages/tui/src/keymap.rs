@@ -394,7 +394,8 @@ fn register_transcript_focus_actions(
     registry: &mut bcode_plugin_sdk::tui::keymap::KeymapRegistry,
 ) -> Result<(), bcode_plugin_sdk::tui::keymap::KeymapError> {
     use super::transcript_focus::{
-        FOCUS_SCOPE, FOCUS_UNITS_ACTION, FOCUS_UNITS_DEFAULT_KEY, FocusAction,
+        CYCLE_DETAIL_ACTION, CYCLE_DETAIL_DEFAULT_KEY, FOCUS_SCOPE, FOCUS_UNITS_ACTION,
+        FOCUS_UNITS_DEFAULT_KEY, FocusAction,
     };
     use bcode_plugin_sdk::tui::keymap::KeymapAction;
     registry.register(KeymapAction {
@@ -402,6 +403,14 @@ fn register_transcript_focus_actions(
         scope: BmuxScope::Chat.id().into(),
         description: "Focus transcript units".into(),
         defaults: vec![FOCUS_UNITS_DEFAULT_KEY.into()],
+    })?;
+    // Outside focus mode detail cycling applies to every unit and group; in
+    // focus mode the `transcript_focus` binding cycles the focused target.
+    registry.register(KeymapAction {
+        id: CYCLE_DETAIL_ACTION.into(),
+        scope: BmuxScope::Chat.id().into(),
+        description: "Cycle every transcript unit collapsed, summary, expanded".into(),
+        defaults: vec![CYCLE_DETAIL_DEFAULT_KEY.into()],
     })?;
     for action in FocusAction::ALL {
         registry.register(KeymapAction {
@@ -478,13 +487,76 @@ fn control_defaults<'a>(scope: &str, id: &str, defaults: Vec<&'a str>) -> Option
         defaults = vec!["y", "shift+y"];
     }
 
-    if matches!(scope, "theme_picker" | "profile_picker" | "timeline") && id == "tui.control.up" {
+    if matches!(scope, "appearance_picker" | "timeline") && id == "tui.control.up" {
         defaults.push("k");
     }
-    if matches!(scope, "theme_picker" | "profile_picker" | "timeline") && id == "tui.control.down" {
+    if matches!(scope, "appearance_picker" | "timeline") && id == "tui.control.down" {
         defaults.push("j");
     }
+    if scope == "appearance_picker" && id == "tui.control.left" {
+        defaults.push("h");
+    }
+    if scope == "appearance_picker" && id == "tui.control.right" {
+        defaults.push("l");
+    }
     Some(defaults)
+}
+
+/// Fold overrides configured for the former single-axis theme and profile
+/// picker scopes into the appearance picker scope that replaced them.
+///
+/// An explicitly configured appearance scope wins outright, so a migrated
+/// configuration is never mixed with stale entries; otherwise the legacy
+/// scopes are merged in [`LEGACY_PICKER_SCOPES`] order. Keys are compared as
+/// parsed stroke sequences, so an earlier scope's binding wins over a later
+/// one for the same keys however they are spelled (`ctrl+n`, `Control+N`),
+/// and over a later binding that would be a prefix conflict (`g` against
+/// `g g`). Each legacy scope was valid alone, so merging them never
+/// introduces a configuration error.
+///
+/// [`LEGACY_PICKER_SCOPES`]: super::appearance_picker::LEGACY_PICKER_SCOPES
+fn fold_legacy_picker_scopes(
+    mut overrides: BTreeMap<String, BTreeMap<String, String>>,
+) -> BTreeMap<String, BTreeMap<String, String>> {
+    use super::appearance_picker::{APPEARANCE_PICKER_SCOPE, LEGACY_PICKER_SCOPES};
+    let legacy = LEGACY_PICKER_SCOPES
+        .iter()
+        .filter_map(|scope| overrides.remove(*scope))
+        .collect::<Vec<_>>();
+    if legacy.is_empty() || overrides.contains_key(APPEARANCE_PICKER_SCOPE) {
+        return overrides;
+    }
+    let mut merged = BTreeMap::new();
+    let mut claimed: Vec<Vec<KeyStroke>> = Vec::new();
+    for bindings in legacy {
+        let mut scope_claims = Vec::new();
+        for (key, action) in bindings {
+            // Unparseable keys pass through so the registry reports them.
+            let Some(strokes) = parse_key_sequence(&key) else {
+                merged.entry(key).or_insert(action);
+                continue;
+            };
+            let shadowed = claimed
+                .iter()
+                .any(|owned| owned.starts_with(&strokes) || strokes.starts_with(owned));
+            if !shadowed {
+                merged.insert(key, action);
+                scope_claims.push(strokes);
+            }
+        }
+        claimed.extend(scope_claims);
+    }
+    overrides.insert(APPEARANCE_PICKER_SCOPE.to_owned(), merged);
+    overrides
+}
+
+/// Parse a whitespace-separated key sequence as the keymap registry does.
+fn parse_key_sequence(key: &str) -> Option<Vec<KeyStroke>> {
+    let strokes = key
+        .split_whitespace()
+        .map(parse_key)
+        .collect::<Option<Vec<_>>>()?;
+    (!strokes.is_empty()).then_some(strokes)
 }
 
 fn register_control_actions(
@@ -499,8 +571,7 @@ fn register_control_actions(
         "model_picker",
         "auth_pool_picker",
         "worktree_picker",
-        "theme_picker",
-        "profile_picker",
+        "appearance_picker",
         "timeline",
         "slash_palette",
         "command_palette",
@@ -946,9 +1017,9 @@ impl BmuxKeyMap {
                 })?;
             }
         }
-        let overrides = config.keybindings.scoped_overrides_with(|id| {
+        let overrides = fold_legacy_picker_scopes(config.keybindings.scoped_overrides_with(|id| {
             BmuxAction::from_id(id).map_or_else(|| id.to_owned(), |action| action.id().into())
-        });
+        }));
         for (scope, entries) in &overrides {
             for id in entries.values() {
                 if let Some(action) = BmuxAction::from_id(id) {
@@ -1469,7 +1540,7 @@ mod tests {
     fn host_remap_and_unbind_dispatch_and_hint_agree() {
         let mut config = TuiConfig::default();
         config.keybindings.scopes.insert(
-            "theme_picker".into(),
+            "appearance_picker".into(),
             BTreeMap::from([
                 ("ctrl+n".into(), "tui.control.down".into()),
                 ("escape".into(), String::new()),
@@ -1477,23 +1548,114 @@ mod tests {
         );
         let keymap = BmuxKeyMap::try_from_config(&config).expect("valid effective registry");
         assert_eq!(
-            keymap.action("theme_picker", parse_key_stroke("down").unwrap()),
+            keymap.action("appearance_picker", parse_key_stroke("down").unwrap()),
             None
         );
         assert_eq!(
-            keymap.action("theme_picker", parse_key_stroke("j").unwrap()),
+            keymap.action("appearance_picker", parse_key_stroke("j").unwrap()),
             None
         );
         assert_eq!(
-            keymap.action("theme_picker", parse_key_stroke("ctrl+n").unwrap()),
+            keymap.action("appearance_picker", parse_key_stroke("ctrl+n").unwrap()),
             Some("tui.control.down")
         );
         assert_eq!(
-            keymap.action("theme_picker", parse_key_stroke("escape").unwrap()),
+            keymap.action("appearance_picker", parse_key_stroke("escape").unwrap()),
             None
         );
-        assert_eq!(keymap.hint("theme_picker", "tui.control.down"), "ctrl+n");
-        assert_eq!(keymap.hint("theme_picker", "tui.control.cancel"), "unbound");
+        assert_eq!(
+            keymap.hint("appearance_picker", "tui.control.down"),
+            "ctrl+n"
+        );
+        assert_eq!(
+            keymap.hint("appearance_picker", "tui.control.cancel"),
+            "unbound"
+        );
+    }
+
+    #[test]
+    fn legacy_picker_scopes_merge_by_stroke_not_spelling() {
+        let mut config = TuiConfig::default();
+        config.keybindings.scopes.insert(
+            "theme_picker".into(),
+            BTreeMap::from([
+                ("ctrl+n".into(), "tui.control.down".into()),
+                ("g g".into(), "tui.control.submit".into()),
+            ]),
+        );
+        // Each scope was valid alone: the same stroke spelled differently,
+        // and a prefix of the other scope's sequence.
+        config.keybindings.scopes.insert(
+            "profile_picker".into(),
+            BTreeMap::from([
+                ("Control+N".into(), "tui.control.up".into()),
+                ("g".into(), "tui.control.cancel".into()),
+                ("ctrl+p".into(), "tui.control.up".into()),
+            ]),
+        );
+        let keymap = BmuxKeyMap::try_from_config(&config).expect("legacy scopes merge cleanly");
+        assert_eq!(
+            keymap.action("appearance_picker", parse_key_stroke("ctrl+n").unwrap()),
+            Some("tui.control.down")
+        );
+        assert_eq!(
+            keymap.action("appearance_picker", parse_key_stroke("ctrl+p").unwrap()),
+            Some("tui.control.up")
+        );
+        assert!(matches!(
+            keymap.registry().resolve_sequence(
+                "appearance_picker",
+                &[
+                    parse_key_stroke("g").unwrap(),
+                    parse_key_stroke("g").unwrap()
+                ]
+            ),
+            bcode_plugin_sdk::tui::keymap::SequenceMatch::Complete("tui.control.submit")
+        ));
+    }
+
+    #[test]
+    fn explicit_appearance_scope_supersedes_legacy_picker_scopes() {
+        let mut config = TuiConfig::default();
+        config.keybindings.scopes.insert(
+            "theme_picker".into(),
+            BTreeMap::from([("ctrl+n".into(), "tui.control.down".into())]),
+        );
+        config.keybindings.scopes.insert(
+            "profile_picker".into(),
+            BTreeMap::from([
+                ("ctrl+n".into(), "tui.control.up".into()),
+                ("ctrl+p".into(), "tui.control.up".into()),
+            ]),
+        );
+        let keymap = BmuxKeyMap::try_from_config(&config).expect("valid effective registry");
+        // Legacy scopes merge in order; the theme scope's spelling wins.
+        assert_eq!(
+            keymap.action("appearance_picker", parse_key_stroke("ctrl+n").unwrap()),
+            Some("tui.control.down")
+        );
+        assert_eq!(
+            keymap.action("appearance_picker", parse_key_stroke("ctrl+p").unwrap()),
+            Some("tui.control.up")
+        );
+
+        config.keybindings.scopes.insert(
+            "appearance_picker".into(),
+            BTreeMap::from([("ctrl+j".into(), "tui.control.down".into())]),
+        );
+        let keymap = BmuxKeyMap::try_from_config(&config).expect("valid effective registry");
+        assert_eq!(
+            keymap.action("appearance_picker", parse_key_stroke("ctrl+j").unwrap()),
+            Some("tui.control.down")
+        );
+        assert_eq!(
+            keymap.action("appearance_picker", parse_key_stroke("ctrl+n").unwrap()),
+            None
+        );
+        assert_eq!(
+            keymap.action("appearance_picker", parse_key_stroke("ctrl+p").unwrap()),
+            None
+        );
     }
 
     fn default_keymap() -> BmuxKeyMap {
@@ -1684,6 +1846,42 @@ mod tests {
         ] {
             assert_eq!(keymap.action_for_key(BmuxScope::Chat, stroke), Some(action));
         }
+    }
+
+    #[test]
+    fn cycle_detail_binds_in_chat_and_focus_scopes_independently() {
+        use crate::transcript_focus::{CYCLE_DETAIL_ACTION, FOCUS_SCOPE, FocusAction};
+        let keymap = default_keymap();
+        assert_eq!(
+            keymap.action("chat", parse_key_stroke("alt+d").unwrap()),
+            Some(CYCLE_DETAIL_ACTION)
+        );
+        assert_eq!(
+            keymap.action(FOCUS_SCOPE, parse_key_stroke("d").unwrap()),
+            Some(FocusAction::CycleDetail.id())
+        );
+        // Remapping the chat binding leaves the focus-mode binding alone.
+        let mut config = TuiConfig::default();
+        config.keybindings.scopes.insert(
+            "chat".into(),
+            BTreeMap::from([
+                ("alt+o".into(), CYCLE_DETAIL_ACTION.into()),
+                ("alt+d".into(), String::new()),
+            ]),
+        );
+        let keymap = BmuxKeyMap::try_from_config(&config).expect("valid effective registry");
+        assert_eq!(
+            keymap.action("chat", parse_key_stroke("alt+o").unwrap()),
+            Some(CYCLE_DETAIL_ACTION)
+        );
+        assert_eq!(
+            keymap.action("chat", parse_key_stroke("alt+d").unwrap()),
+            None
+        );
+        assert_eq!(
+            keymap.action(FOCUS_SCOPE, parse_key_stroke("d").unwrap()),
+            Some(CYCLE_DETAIL_ACTION)
+        );
     }
 
     #[test]

@@ -19,6 +19,7 @@
 pub mod grouping;
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::sync::Mutex;
 
 pub use bcode_presentation_policy_models as models;
 use models::{
@@ -46,6 +47,13 @@ pub const FAILURE_SECTIONS: [&str; 2] = ["error", "output"];
 
 /// Default inline preview budget, in source lines.
 pub const DEFAULT_PREVIEW_LINES: u32 = 28;
+
+/// Most distinct resolutions a [`CompiledPolicy`] memoizes; the memo is
+/// cleared when it would grow past this.
+///
+/// Entries are keyed by the set of matching rules, not by unit, so a
+/// transcript of any length typically needs only a handful.
+pub const MAX_RESOLUTION_MEMO: usize = 256;
 
 /// Host built-in property values applied before any layer.
 #[must_use]
@@ -185,10 +193,26 @@ impl ToolIndex {
     }
 }
 
+/// What a resolution depends on besides the unit's facts matching rules:
+/// the matching rule positions, in application order, and the facts the
+/// visibility floor reads.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+struct ResolutionKey {
+    rules: Vec<usize>,
+    group: bool,
+    awaiting_decision: bool,
+    failed: bool,
+}
+
 /// Layers compiled for fast, deterministic resolution.
 ///
 /// The default value is identical to compiling no layers.
-#[derive(Debug, Clone)]
+///
+/// [`resolve`](Self::resolve) memoizes its results by matching rule set and
+/// floor facts (at most [`MAX_RESOLUTION_MEMO`] entries), so units that match
+/// the same rules share one patch application. The memo belongs to this
+/// compilation: recompiling yields a new, empty one, and clones start empty.
+#[derive(Debug)]
 pub struct CompiledPolicy {
     rules: Vec<CompiledRule>,
     /// Rules that can match each kind, by tool.
@@ -196,6 +220,7 @@ pub struct CompiledPolicy {
     /// Rules without a kind condition, by tool.
     unkinded: ToolIndex,
     fingerprint: u64,
+    memo: Mutex<BTreeMap<ResolutionKey, ResolvedPresentation>>,
 }
 
 impl Default for CompiledPolicy {
@@ -205,6 +230,19 @@ impl Default for CompiledPolicy {
             by_kind: BTreeMap::new(),
             unkinded: ToolIndex::default(),
             fingerprint: fingerprint(&[]),
+            memo: Mutex::default(),
+        }
+    }
+}
+
+impl Clone for CompiledPolicy {
+    fn clone(&self) -> Self {
+        Self {
+            rules: self.rules.clone(),
+            by_kind: self.by_kind.clone(),
+            unkinded: self.unkinded.clone(),
+            fingerprint: self.fingerprint,
+            memo: Mutex::default(),
         }
     }
 }
@@ -310,8 +348,8 @@ impl CompiledPolicy {
         self.rules.is_empty()
     }
 
-    /// Matching rules for `facts`, in application order.
-    fn matching<'a>(&'a self, facts: &'a UnitFacts) -> impl Iterator<Item = &'a CompiledRule> {
+    /// Positions of the rules matching `facts`, in application order.
+    fn matching_positions<'a>(&'a self, facts: &'a UnitFacts) -> impl Iterator<Item = usize> + 'a {
         let tool = facts.tool.as_deref();
         let kinded = facts
             .kind
@@ -319,19 +357,47 @@ impl CompiledPolicy {
             .into_iter()
             .flat_map(move |index| index.candidates(tool));
         merge_sorted(kinded, self.unkinded.candidates(tool))
+            .filter(|&position| self.rules[position].rule.matcher.matches(facts))
+    }
+
+    /// Matching rules for `facts`, in application order.
+    fn matching<'a>(&'a self, facts: &'a UnitFacts) -> impl Iterator<Item = &'a CompiledRule> {
+        self.matching_positions(facts)
             .map(|position| &self.rules[position])
-            .filter(|compiled| compiled.rule.matcher.matches(facts))
     }
 
     /// Resolve `facts` to a presentation, including the visibility floor.
+    ///
+    /// Results are memoized per compilation (see [`CompiledPolicy`]); a
+    /// memoized result is identical to resolving afresh.
     #[must_use]
     pub fn resolve(&self, facts: &UnitFacts) -> ResolvedPresentation {
+        let key = ResolutionKey {
+            rules: self.matching_positions(facts).collect(),
+            group: facts.kind == Some(UnitKind::Group),
+            awaiting_decision: facts.awaiting_decision,
+            failed: unit_failed(facts),
+        };
+        if let Some(hit) = self
+            .memo
+            .lock()
+            .ok()
+            .and_then(|memo| memo.get(&key).cloned())
+        {
+            return hit;
+        }
         let mut patch = PropertyPatch::default();
-        for compiled in self.matching(facts) {
-            patch.merge(&compiled.rule.set);
+        for &position in &key.rules {
+            patch.merge(&self.rules[position].rule.set);
         }
         let mut presentation = apply_patch(host_defaults(), patch);
         apply_visibility_floor(&mut presentation, facts);
+        if let Ok(mut memo) = self.memo.lock() {
+            if memo.len() >= MAX_RESOLUTION_MEMO {
+                memo.clear();
+            }
+            memo.insert(key, presentation.clone());
+        }
         presentation
     }
 
@@ -1319,6 +1385,82 @@ mod tests {
                 ("summary", LayerSource::Config),
             ])
         );
+    }
+
+    #[test]
+    fn memoized_resolution_matches_fresh_resolution_and_stays_bounded() {
+        let (policy, _) = CompiledPolicy::compile(
+            &[layer(
+                LayerSource::Theme("memo".into()),
+                r#"
+                [[rules]]
+                match = { kind = "tool" }
+                set = { disclosure = "hidden", sections = { error = { visible = false }, arguments = { disclosure = "collapsed" } } }
+
+                [[rules]]
+                match = { tool = "read" }
+                set = { detail = "minimal" }
+                "#,
+            )],
+            &PolicyRegistry::with_host_parts(),
+        );
+        let mut cases = Vec::new();
+        for name in ["read", "bash"] {
+            for status in [
+                UnitStatus::Succeeded,
+                UnitStatus::Failed,
+                UnitStatus::Waiting,
+            ] {
+                for awaiting_decision in [false, true] {
+                    cases.push(UnitFacts {
+                        awaiting_decision,
+                        ..tool(name, status)
+                    });
+                }
+            }
+        }
+        cases.push(group(Some("read")));
+        // Resolve every case twice, interleaved, so later calls hit the memo
+        // populated by units that share a rule set but differ in floor facts.
+        for _ in 0..2 {
+            for facts in &cases {
+                assert_eq!(
+                    policy.resolve(facts),
+                    policy.explain(facts).presentation,
+                    "{facts:?}"
+                );
+            }
+        }
+        // Distinct (rule set, floor facts) combinations, not units, fill the memo.
+        let distinct = policy.memo.lock().unwrap().len();
+        assert!(distinct < cases.len());
+        // Many distinct rule sets never grow the memo past its bound.
+        let layers: Vec<RuleLayer> = (0..3)
+            .map(|chunk| {
+                let mut rules = String::new();
+                for index in 0..MAX_RULES_PER_LAYER / 2 {
+                    use std::fmt::Write as _;
+                    let indent = index % 4;
+                    let _ = writeln!(
+                        rules,
+                        "[[rules]]\nmatch = {{ tool = \"tool-{chunk}-{index}\" }}\nset = {{ indent = {indent} }}"
+                    );
+                }
+                layer(LayerSource::Config, &rules)
+            })
+            .collect();
+        let (wide, _) = CompiledPolicy::compile(&layers, &PolicyRegistry::with_host_parts());
+        for chunk in 0..3 {
+            for index in 0..MAX_RULES_PER_LAYER / 2 {
+                let facts = tool(&format!("tool-{chunk}-{index}"), UnitStatus::Succeeded);
+                assert_eq!(wide.resolve(&facts), wide.explain(&facts).presentation);
+                assert!(wide.memo.lock().unwrap().len() <= MAX_RESOLUTION_MEMO);
+            }
+        }
+        // A clone starts with an empty memo and resolves identically.
+        let clone = policy.clone();
+        assert!(clone.memo.lock().unwrap().is_empty());
+        assert_eq!(clone.resolve(&cases[0]), policy.resolve(&cases[0]));
     }
 
     #[test]

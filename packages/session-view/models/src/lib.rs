@@ -1529,6 +1529,12 @@ pub struct PermissionView {
     /// Tool name.
     #[serde(default)]
     pub tool_name: String,
+    /// Plugin that provides the requested tool, when known.
+    ///
+    /// Projected from the owning tool invocation; `None` when the invocation was not observed
+    /// before the permission request or its producer is unknown.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub producer_plugin_id: Option<String>,
     /// Raw tool argument JSON.
     #[serde(default)]
     pub arguments_json: String,

@@ -246,6 +246,25 @@ pub async fn run_activity_watches(
     None
 }
 
+/// Store interactive structural rules in user state, then read back every
+/// stored rule so the caller recompiles from what was written.
+fn persist_presentation_rules(
+    rules: &[bcode_presentation_policy::models::PresentationRule],
+) -> Result<
+    (
+        std::path::PathBuf,
+        Vec<bcode_presentation_policy::models::PresentationRule>,
+    ),
+    String,
+> {
+    // One serialized read-modify-write: the config crate locks user state
+    // across the update, so concurrent theme or profile saves are kept.
+    let path = bcode_config::add_tui_presentation_rules(rules.iter().cloned())
+        .map_err(|error| error.to_string())?;
+    let stored = bcode_config::load_tui_presentation_rules().map_err(|error| error.to_string())?;
+    Ok((path, stored))
+}
+
 #[cfg(test)]
 mod activity_watch_lifetime_tests {
     use super::*;
@@ -974,6 +993,12 @@ pub enum TuiEffect {
     },
     /// Clear the interactive streaming-presentation override.
     ClearStreamingPresentation,
+    /// Persist interactive per-tool structural defaults to user state, each
+    /// replacing any stored rule with the same matcher.
+    PersistPresentationRules {
+        /// Rules to store, in order.
+        rules: Vec<bcode_presentation_policy::models::PresentationRule>,
+    },
     /// Reconcile auth security status for a loaded config.
     ReconcileAuthSecurity {
         /// Loaded configuration.
@@ -1442,6 +1467,19 @@ pub enum TuiEffectResult {
         /// State write result.
         result: Result<std::path::PathBuf, String>,
     },
+    /// Interactive structural defaults were persisted (or failed to be).
+    PresentationRulesPersisted {
+        /// Rules requested for storage.
+        rules: Vec<bcode_presentation_policy::models::PresentationRule>,
+        /// State path and every stored user-state rule after the write.
+        result: Result<
+            (
+                std::path::PathBuf,
+                Vec<bcode_presentation_policy::models::PresentationRule>,
+            ),
+            String,
+        >,
+    },
     /// Durable streaming-presentation state update completed.
     StreamingPresentationPersisted {
         /// Policy requested by the user, or none when cleared.
@@ -1903,6 +1941,7 @@ impl TuiEffectResult {
             | Self::ThemeSelectionPersisted { .. }
             | Self::ProfileSelectionPersisted { .. }
             | Self::StreamingPresentationPersisted { .. }
+            | Self::PresentationRulesPersisted { .. }
             | Self::AuthSecurityReconciled { .. }
             | Self::SlashPaletteLoaded { .. }
             | Self::CommandPaletteLoaded { .. }
@@ -2036,6 +2075,7 @@ enum EffectKey {
     ThemeSelection,
     ProfileSelection,
     StreamingPresentation,
+    PresentationRules,
     AuthSecurity,
     DraftStatus,
     SessionStatus,
@@ -2320,6 +2360,12 @@ impl TuiEffect {
                 policy: None,
                 result: Err(client_error.to_string()),
             },
+            Self::PersistPresentationRules { rules } => {
+                TuiEffectResult::PresentationRulesPersisted {
+                    rules,
+                    result: Err(client_error.to_string()),
+                }
+            }
             Self::ReconcileAuthSecurity { .. } => TuiEffectResult::AuthSecurityReconciled {
                 status: Some(client_error.to_string()),
             },
@@ -2498,6 +2544,7 @@ impl TuiEffect {
             | Self::PersistProfileSelection { .. }
             | Self::PersistStreamingPresentation { .. }
             | Self::ClearStreamingPresentation
+            | Self::PersistPresentationRules { .. }
             | Self::ReconcileAuthSecurity { .. }
             | Self::LoadSessionModelStatus { .. }
             | Self::LoadPluginStatus { .. }
@@ -2763,6 +2810,7 @@ impl TuiEffect {
             Self::PersistStreamingPresentation { .. } | Self::ClearStreamingPresentation => {
                 EffectKey::StreamingPresentation
             }
+            Self::PersistPresentationRules { .. } => EffectKey::PresentationRules,
             Self::ReconcileAuthSecurity { .. } => EffectKey::AuthSecurity,
             Self::LoadDraftStatus { .. } => EffectKey::DraftStatus,
             Self::LoadSessionStatus { .. } => EffectKey::SessionStatus,
@@ -2912,6 +2960,12 @@ impl TuiEffect {
                     .map_err(|error| error.to_string()),
                 policy: None,
             },
+            Self::PersistPresentationRules { rules } => {
+                TuiEffectResult::PresentationRulesPersisted {
+                    result: persist_presentation_rules(&rules),
+                    rules,
+                }
+            }
             Self::ReconcileAuthSecurity { config } => TuiEffectResult::AuthSecurityReconciled {
                 status: session_flow::auth_security_status(&config),
             },
@@ -3239,6 +3293,7 @@ impl TuiEffect {
             | Self::PersistProfileSelection { .. }
             | Self::PersistStreamingPresentation { .. }
             | Self::ClearStreamingPresentation
+            | Self::PersistPresentationRules { .. }
             | Self::ReconcileAuthSecurity { .. }) => {
                 local.run_local_state().unwrap_or_else(|other| {
                     other.application_access_failed(ClientError::Protocol(

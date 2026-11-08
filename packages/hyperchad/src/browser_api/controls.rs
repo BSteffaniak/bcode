@@ -556,6 +556,7 @@ mod tests {
             session_id: Some(session_id),
             tool_call_id: "call".to_owned(),
             tool_name: "tool".to_owned(),
+            producer_plugin_id: None,
             arguments_json: "{}".to_owned(),
             batch: Some(bcode_session_view_models::PermissionBatchView {
                 batch_id: "batch".to_owned(),

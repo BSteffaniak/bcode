@@ -20,6 +20,8 @@ use bcode_presentation_policy::{CompiledPolicy, PolicyDiagnostic, PolicyRegistry
 use bcode_session_view_models::ToolInvocationViewStatus;
 use bcode_tui_components::transcript::item::{TranscriptItem, TranscriptItemKind};
 
+#[cfg(test)]
+mod bench;
 mod groups;
 
 pub use groups::{GroupPlacement, GroupSnapshot, GroupView, MEMBER_INDENT, MemberRendering};
@@ -34,9 +36,14 @@ pub const DISCLOSURE_HIT_PREFIX: &str = "disclosure:";
 /// Producer-declared target argument fields: tool name, then declaring
 /// plugin id, then ordered argument field names.
 ///
-/// A declaration applies only to units its plugin produced. Units without a
-/// known producer use a tool's declaration only when exactly one plugin
-/// declares that tool.
+/// A declaration applies only to units its plugin produced. Tool requests,
+/// results, drafts, contributions, and permission requests carry their
+/// producer whenever the session knows it, so a unit with a known producer
+/// uses only that producer's declaration. Units whose producer is genuinely
+/// unknown (locally built items, or a permission requested before its
+/// invocation was observed and without its own producer) fall back to a
+/// tool's declaration only when exactly one plugin declares that tool, so an
+/// ambiguous tool name never borrows another plugin's fields.
 pub type DeclaredTargetFields = BTreeMap<String, BTreeMap<String, Vec<String>>>;
 
 /// Something whose disclosure the user can toggle.
@@ -253,6 +260,8 @@ impl StructureSnapshot {
         item: &TranscriptItem,
     ) -> Option<(ResolvedPresentation, UnitFacts)> {
         let facts = self.facts(item)?;
+        #[cfg(test)]
+        bench::count_resolution();
         let mut presentation = self.policy.resolve(&facts);
         if let Some(disclosure) = self.target_override(&DisclosureTarget::Unit(item.id().get())) {
             presentation.disclosure = disclosure;
@@ -329,6 +338,24 @@ impl StructureSnapshot {
     /// Targets that currently carry a manual override, in target order.
     pub fn override_targets(&self) -> impl Iterator<Item = &DisclosureTarget> {
         self.overrides.keys()
+    }
+
+    /// Section overrides recorded for transcript item `item_id`, host and
+    /// plugin-namespaced alike, as `(section name, disclosure)` in name order.
+    ///
+    /// Reads one ordered range of the override map, so the work is bounded
+    /// by that item's overrides (at most [`MAX_OVERRIDES`]) rather than by
+    /// every override or a fixed list of section names.
+    pub fn section_overrides(&self, item_id: u64) -> impl Iterator<Item = (&str, Disclosure)> {
+        let start = DisclosureTarget::Section(item_id, String::new());
+        self.overrides
+            .range(start..)
+            .map_while(move |(target, entry)| match target {
+                DisclosureTarget::Section(id, name) if *id == item_id => {
+                    Some((name.as_str(), entry.disclosure))
+                }
+                _ => None,
+            })
     }
 
     /// This snapshot with turn facts from `turns`, for rendering items
@@ -487,6 +514,16 @@ impl StructureState {
     #[must_use]
     pub const fn revision(&self) -> u64 {
         self.revision
+    }
+
+    /// Explain how synthesized `facts` (for example a group's) resolve
+    /// against the compiled policy, without overrides.
+    #[must_use]
+    pub fn explain_facts(
+        &self,
+        facts: &UnitFacts,
+    ) -> bcode_presentation_policy::ExplainedPresentation {
+        self.snapshot.policy.explain(facts)
     }
 
     /// Explain how `item` resolved, when it is a structural unit.
@@ -807,6 +844,7 @@ fn tool_facts(item: &TranscriptItem, base: UnitFacts) -> UnitFacts {
         } => UnitFacts {
             kind: Some(UnitKind::Tool),
             tool: tool_name.clone(),
+            producer: item.producer_plugin_id().map(ToOwned::to_owned),
             status: Some(if *is_error {
                 UnitStatus::Failed
             } else if timing.timed_out == Some(true) {
@@ -851,6 +889,7 @@ fn tool_facts(item: &TranscriptItem, base: UnitFacts) -> UnitFacts {
         TranscriptItemKind::PermissionRequest { tool_name, .. } => UnitFacts {
             kind: Some(UnitKind::Permission),
             tool: Some(tool_name.clone()),
+            producer: item.producer_plugin_id().map(ToOwned::to_owned),
             awaiting_decision: true,
             status: Some(UnitStatus::Waiting),
             ..base
@@ -1353,6 +1392,32 @@ mod tests {
     }
 
     #[test]
+    fn section_overrides_list_only_that_items_sections_including_namespaced_ones() {
+        let mut state = StructureState::default();
+        let facts = UnitFacts::default();
+        for target in [
+            DisclosureTarget::Unit(2),
+            DisclosureTarget::Group(2),
+            DisclosureTarget::Section(1, "output".to_owned()),
+            DisclosureTarget::Section(2, "output".to_owned()),
+            DisclosureTarget::Section(2, "bcode.git.files".to_owned()),
+            DisclosureTarget::Section(3, "arguments".to_owned()),
+        ] {
+            state.toggle_target(&target, Disclosure::Expanded, &facts);
+        }
+        let snapshot = state.snapshot();
+        assert_eq!(
+            snapshot.section_overrides(2).collect::<Vec<_>>(),
+            [
+                ("bcode.git.files", Disclosure::Collapsed),
+                ("output", Disclosure::Collapsed)
+            ]
+        );
+        assert_eq!(snapshot.section_overrides(4).count(), 0);
+        assert_eq!(snapshot.section_overrides(u64::MAX).count(), 0);
+    }
+
+    #[test]
     fn overrides_stay_bounded_and_drop_the_oldest_choices_first() {
         let mut state = StructureState::default();
         let facts = UnitFacts::default();
@@ -1724,6 +1789,50 @@ mod tests {
             target_of(&state, &request).as_deref(),
             Some("https://example.com")
         );
+    }
+
+    #[test]
+    fn results_and_permissions_use_only_their_producers_target_fields() {
+        let arguments = r#"{"url":"https://example.com","file":"notes.md"}"#;
+        let result = |producer: Option<&str>| {
+            tool_result_item("call", Some("fetch"), Some(arguments), "x", false)
+                .with_producer_plugin_id(producer)
+        };
+        let permission = |producer: Option<&str>| {
+            bcode_tui_components::transcript::item::permission_request_item(
+                "permission",
+                "call",
+                "fetch",
+                arguments,
+                None,
+                None,
+            )
+            .with_producer_plugin_id(producer)
+        };
+        let mut state = StructureState::default();
+        state.set_layers(&[]);
+        // Exactly one plugin declares `fetch`.
+        state.set_target_fields(BTreeMap::from([(
+            "fetch".to_owned(),
+            BTreeMap::from([("test.fetch".to_owned(), vec!["file".to_owned()])]),
+        )]));
+        let facts = |item: &TranscriptItem| state.snapshot().facts(item).unwrap();
+        for item in [result(Some("test.fetch")), permission(Some("test.fetch"))] {
+            let facts = facts(&item);
+            assert_eq!(facts.producer.as_deref(), Some("test.fetch"));
+            assert_eq!(facts.target.as_deref(), Some("notes.md"));
+        }
+        // A known producer that declares nothing never borrows the single
+        // declaration; host fields apply instead.
+        for item in [result(Some("test.other")), permission(Some("test.other"))] {
+            let facts = facts(&item);
+            assert_eq!(facts.producer.as_deref(), Some("test.other"));
+            assert_eq!(facts.target.as_deref(), Some("https://example.com"));
+        }
+        // Genuinely unknown producers keep the unambiguous fallback.
+        for item in [result(None), permission(None)] {
+            assert_eq!(facts(&item).target.as_deref(), Some("notes.md"));
+        }
     }
 
     #[test]

@@ -20,6 +20,7 @@ pub enum BuiltinCommandId {
     Compact,
     Theme,
     Profile,
+    Appearance,
     Streaming,
     Model,
     AuthPool,
@@ -168,7 +169,7 @@ const BUILTIN_COMMANDS: &[BuiltinCommandSpec] = &[
         id: BuiltinCommandId::Theme,
         names: &["theme"],
         completions: &[
-            completion!("/theme", "Open interactive theme picker"),
+            completion!("/theme", "Pick a palette in the appearance picker"),
             completion!("/theme preview ", "Preview bundled theme"),
             completion!("/theme apply ", "Persist bundled theme"),
             completion!("/theme cancel", "Cancel theme preview"),
@@ -178,11 +179,19 @@ const BUILTIN_COMMANDS: &[BuiltinCommandSpec] = &[
         id: BuiltinCommandId::Profile,
         names: &["profile"],
         completions: &[
-            completion!("/profile", "Open interactive profile picker"),
+            completion!("/profile", "Pick a profile in the appearance picker"),
             completion!("/profile list", "List interface profiles"),
             completion!("/profile apply ", "Persist an interface profile"),
             completion!("/profile reset", "Clear the saved profile"),
         ],
+    },
+    BuiltinCommandSpec {
+        id: BuiltinCommandId::Appearance,
+        names: &["appearance"],
+        completions: &[completion!(
+            "/appearance",
+            "Pick palette and profile together with a live preview"
+        )],
     },
     BuiltinCommandSpec {
         id: BuiltinCommandId::Streaming,

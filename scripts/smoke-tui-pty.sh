@@ -750,19 +750,19 @@ while time.monotonic() < deadline:
                     manual_surface_step = "theme_picker_open"
                     manual_surface_next_action = time.monotonic() + 0.5
             elif manual_surface_step == "theme_picker_open":
-                if b"Themes " in screen and b"preview" in screen.lower():
+                if b"Appearance " in screen and b"axis" in screen.lower():
                     theme_picker_opened = True
                     os.write(fd, b"\x1b[B")
                     manual_surface_step = "theme_preview_change"
                     manual_surface_next_action = time.monotonic() + 0.25
             elif manual_surface_step == "theme_preview_change":
-                if b"Themes " in screen:
+                if b"Appearance " in screen:
                     theme_preview_changed = True
                     os.write(fd, b"\x1b")
                     manual_surface_step = "theme_picker_close"
                     manual_surface_next_action = time.monotonic() + 0.25
             elif manual_surface_step == "theme_picker_close":
-                if b"Themes " not in screen:
+                if b"Appearance " not in screen:
                     os.write(fd, b"/thinking\r")
                     manual_surface_step = "thinking_dialog_open"
                     manual_surface_next_action = time.monotonic() + 0.75

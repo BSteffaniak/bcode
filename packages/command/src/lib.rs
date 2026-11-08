@@ -501,13 +501,19 @@ pub fn bundled_host_palette_commands() -> Vec<CommandContribution> {
         CommandContribution::host_palette(
             "theme.select",
             "Theme: Select",
-            "List themes and show preview/apply commands",
+            "Pick a palette in the appearance picker with a live preview",
             "theme",
         ),
         CommandContribution::host_palette(
             "profile.select",
             "Profile: Select",
-            "Preview interface profiles live: chrome and which tools are collapsed",
+            "Pick an interface profile in the appearance picker with a live preview",
+            "theme",
+        ),
+        CommandContribution::host_palette(
+            "appearance.select",
+            "Appearance: Palette and Profile",
+            "Pick a palette and a profile together with a live preview",
             "theme",
         ),
         CommandContribution::host_palette(
@@ -540,6 +546,24 @@ pub fn bundled_host_palette_commands() -> Vec<CommandContribution> {
             "Context: Compact",
             "Compact the current conversation context",
             "context",
+        ),
+        CommandContribution::host_palette(
+            "transcript.inspect",
+            "Transcript: Inspect Unit",
+            "Show how the focused unit's presentation resolved: facts, rules, layers, floor",
+            "transcript",
+        ),
+        CommandContribution::host_palette(
+            "transcript.cycleDetail",
+            "Transcript: Cycle Detail",
+            "Cycle units collapsed, summary, expanded (the focused target in focus mode)",
+            "transcript",
+        ),
+        CommandContribution::host_palette(
+            "transcript.makeDefault",
+            "Transcript: Make Default for Tool",
+            "Save the focused tool unit's disclosure as that tool's default in user state",
+            "transcript",
         ),
     ]
 }
@@ -615,6 +639,23 @@ mod tests {
                         route: "theme.select".to_owned(),
                     }
         }));
+    }
+
+    #[test]
+    fn bundled_palette_exposes_transcript_tooling_routes() {
+        for route in [
+            "transcript.inspect",
+            "transcript.cycleDetail",
+            "transcript.makeDefault",
+        ] {
+            assert!(bundled_host_palette_commands().iter().any(|contribution| {
+                contribution.id == route
+                    && contribution.action
+                        == CommandAction::Host {
+                            route: route.to_owned(),
+                        }
+            }));
+        }
     }
 
     #[test]

@@ -5,8 +5,14 @@
 //! its first member, so it stays stable while later members stream in and
 //! across resizes. Grouping never reorders units and never crosses turns.
 //!
+//! Only tool calls are members. Units attached to an invocation (producer
+//! contributions such as plugin visuals, including hidden placements) never
+//! lead, join, or count toward a group; they sit inside the group of the call
+//! they belong to as attachments, so they never split it.
+//!
 //! [`Grouping::compute`] is linear in the number of units supplied (each run
-//! looks at most [`MAX_BRIDGED_GAP`] bridge units past its last member).
+//! looks at most [`MAX_BRIDGED_GAP`] bridge or attached units past its last
+//! member).
 //! [`Grouping::update`] re-examines only the neighborhood of a changed range
 //! and reuses every run that cannot observe the change. Renderers pass their
 //! bounded resident window, so work stays bounded by that window.
@@ -18,7 +24,8 @@ use crate::models::{
 };
 use crate::unit_failed;
 
-/// Most consecutive bridge units a group may span between two members.
+/// Most consecutive bridge or attached units a group may span between two
+/// members, or claim after its last member.
 ///
 /// A longer gap ends the group, which keeps each run's look-ahead bounded.
 pub const MAX_BRIDGED_GAP: usize = 64;
@@ -34,6 +41,17 @@ pub struct GroupingInput<'a> {
     pub facts: &'a UnitFacts,
     /// The unit's resolved `group` property.
     pub group: &'a GroupSpec,
+    /// Tool invocation the unit is or belongs to, when known.
+    pub invocation: Option<&'a str>,
+    /// Whether the unit is attached to an invocation rather than being a
+    /// tool call itself (for example a producer contribution).
+    ///
+    /// Attached units never lead, join, or count toward a group. Between two
+    /// members of a group in the same turn they are always kept inside it
+    /// (whatever the group's bridge kinds, status, or decision state), and
+    /// right after the last member they are kept inside it when they belong
+    /// to one of its members' invocations.
+    pub attached: bool,
 }
 
 /// How a position relates to the group containing it.
@@ -45,6 +63,9 @@ pub enum GroupRole {
     Member,
     /// A bridge unit between members; not a member and not counted.
     Bridged,
+    /// A unit attached to an invocation (see [`GroupingInput::attached`]);
+    /// not a member and not counted.
+    Attached,
 }
 
 /// A run of members presented as one group unit.
@@ -56,6 +77,10 @@ pub struct UnitGroup {
     pub members: Vec<usize>,
     /// Positions of bridge units between members, ascending.
     pub bridged: Vec<usize>,
+    /// Positions of attached units inside the group (between members, or
+    /// right after the last member when they belong to a member's
+    /// invocation), ascending.
+    pub attached: Vec<usize>,
     /// Facts describing the group itself, for resolving its presentation.
     pub facts: UnitFacts,
 }
@@ -82,6 +107,8 @@ impl UnitGroup {
             Some(GroupRole::Member)
         } else if self.bridged.binary_search(&position).is_ok() {
             Some(GroupRole::Bridged)
+        } else if self.attached.binary_search(&position).is_ok() {
+            Some(GroupRole::Attached)
         } else {
             None
         }
@@ -222,7 +249,12 @@ impl Grouping {
         self.groups
             .extend(old_groups.into_iter().skip(tail_groups).map(|mut group| {
                 if new_len != old_len {
-                    for position in group.members.iter_mut().chain(&mut group.bridged) {
+                    for position in group
+                        .members
+                        .iter_mut()
+                        .chain(&mut group.bridged)
+                        .chain(&mut group.attached)
+                    {
                         *position = shift(*position);
                     }
                 }
@@ -256,7 +288,8 @@ impl Grouping {
         self.len == 0
     }
 
-    /// The group containing `position` (as a member or bridge) and its role.
+    /// The group containing `position` (as a member, bridge, or attached
+    /// unit) and its role.
     #[must_use]
     pub fn group_at(&self, position: usize) -> Option<(&UnitGroup, GroupRole)> {
         let index = self
@@ -297,7 +330,12 @@ fn scan(
             position += 1;
             continue;
         }
-        let (members, bridged, scanned_end) = scan_run(inputs, position);
+        let RunScan {
+            members,
+            bridged,
+            attached,
+            scanned_end,
+        } = scan_run(inputs, position);
         let last = members[members.len() - 1];
         runs.push(Run {
             first: position,
@@ -307,33 +345,77 @@ fn scan(
         });
         let min = usize::try_from(inputs[position].group.min).unwrap_or(usize::MAX);
         if members.len() >= min.max(2) {
-            groups.push(build_group(inputs, members, bridged));
+            groups.push(build_group(inputs, members, bridged, attached));
         }
         position = last + 1;
     }
     position
 }
 
-/// Members, bridged positions, and scanned end of the run starting at `first`.
-fn scan_run(inputs: &[GroupingInput<'_>], first: usize) -> (Vec<usize>, Vec<usize>, usize) {
+/// Positions one run claims, and how far it looked.
+struct RunScan {
+    members: Vec<usize>,
+    bridged: Vec<usize>,
+    attached: Vec<usize>,
+    /// One past the last examined position; `len + 1` at the end.
+    scanned_end: usize,
+}
+
+/// Scan the run starting at `first`.
+///
+/// Positions between members are split into bridged units and attached
+/// units owned by a member's invocation; an attached unit of an invocation
+/// with no member yet in the run must qualify as an ordinary bridge to be
+/// spanned at all. When the run ends, the owned attached units directly
+/// after its last member are claimed too (they were examined, so
+/// `scanned_end` already covers them).
+fn scan_run(inputs: &[GroupingInput<'_>], first: usize) -> RunScan {
     let leader = &inputs[first];
-    let mut members = vec![first];
-    let mut bridged = Vec::new();
-    let mut pending = Vec::new();
+    let mut run = RunScan {
+        members: vec![first],
+        bridged: Vec::new(),
+        attached: Vec::new(),
+        scanned_end: inputs.len() + 1,
+    };
+    let mut pending: Vec<usize> = Vec::new();
     let mut position = first + 1;
     while position < inputs.len() {
         let unit = &inputs[position];
         if joins(leader, unit) {
-            bridged.append(&mut pending);
-            members.push(position);
-        } else if bridges(leader, unit) && pending.len() < MAX_BRIDGED_GAP {
+            run.members.push(position);
+            for between in std::mem::take(&mut pending) {
+                if owned(inputs, &run.members, &inputs[between]) {
+                    run.attached.push(between);
+                } else {
+                    run.bridged.push(between);
+                }
+            }
+        } else if pending.len() < MAX_BRIDGED_GAP
+            && bridges(leader, unit, owned(inputs, &run.members, unit))
+        {
             pending.push(position);
         } else {
-            return (members, bridged, position + 1);
+            run.scanned_end = position + 1;
+            break;
         }
         position += 1;
     }
-    (members, bridged, inputs.len() + 1)
+    let trailing = pending
+        .iter()
+        .take_while(|&&after| owned(inputs, &run.members, &inputs[after]))
+        .count();
+    run.attached.extend_from_slice(&pending[..trailing]);
+    run
+}
+
+/// Whether `unit` is attached to the invocation of one of `members`.
+fn owned(inputs: &[GroupingInput<'_>], members: &[usize], unit: &GroupingInput<'_>) -> bool {
+    unit.attached
+        && unit.invocation.is_some_and(|invocation| {
+            members
+                .iter()
+                .any(|&member| inputs[member].invocation == Some(invocation))
+        })
 }
 
 fn fill_reach(runs: &mut [Run], from: usize) {
@@ -347,7 +429,7 @@ fn fill_reach(runs: &mut [Run], from: usize) {
 }
 
 fn groupable(input: &GroupingInput<'_>) -> bool {
-    input.group.is_grouping() && input.facts.kind == Some(UnitKind::Tool)
+    !input.attached && input.group.is_grouping() && input.facts.kind == Some(UnitKind::Tool)
 }
 
 fn joins(leader: &GroupingInput<'_>, next: &GroupingInput<'_>) -> bool {
@@ -369,21 +451,27 @@ fn joins(leader: &GroupingInput<'_>, next: &GroupingInput<'_>) -> bool {
 /// Whether `unit` may sit between members of the group led by `leader`.
 ///
 /// Units awaiting a decision and failed units never bridge, so they are never
-/// hidden inside a collapsed group they do not belong to.
-fn bridges(leader: &GroupingInput<'_>, unit: &GroupingInput<'_>) -> bool {
+/// hidden inside a collapsed group they do not belong to. A unit attached to
+/// the invocation of a member already in the run (`owned`) sits with that
+/// call whatever its kind or status; an attached unit of any other
+/// invocation follows the ordinary bridge rules, so a foreign failure still
+/// ends the group.
+fn bridges(leader: &GroupingInput<'_>, unit: &GroupingInput<'_>, owned: bool) -> bool {
     unit.turn == leader.turn
-        && unit
-            .facts
-            .kind
-            .is_some_and(|kind| leader.group.bridge.contains(&kind))
-        && !unit.facts.awaiting_decision
-        && !unit_failed(unit.facts)
+        && (owned
+            || unit
+                .facts
+                .kind
+                .is_some_and(|kind| leader.group.bridge.contains(&kind))
+                && !unit.facts.awaiting_decision
+                && !unit_failed(unit.facts))
 }
 
 fn build_group(
     inputs: &[GroupingInput<'_>],
     members: Vec<usize>,
     bridged: Vec<usize>,
+    attached: Vec<usize>,
 ) -> UnitGroup {
     let first = inputs[members[0]];
     let shared = |value: fn(&UnitFacts) -> &Option<String>| {
@@ -418,6 +506,7 @@ fn build_group(
         id: format!("group:{}", first.id),
         members,
         bridged,
+        attached,
         facts,
     }
 }
@@ -465,6 +554,8 @@ mod tests {
         turn: u64,
         facts: UnitFacts,
         group: GroupSpec,
+        invocation: Option<String>,
+        attached: bool,
     }
 
     /// Units with ids `u<index + first_id>`.
@@ -483,6 +574,8 @@ mod tests {
                 turn: *turn,
                 facts,
                 group: group.clone(),
+                invocation: None,
+                attached: false,
             })
             .collect()
     }
@@ -499,6 +592,8 @@ mod tests {
                 turn: unit.turn,
                 facts: &unit.facts,
                 group: &unit.group,
+                invocation: unit.invocation.as_deref(),
+                attached: unit.attached,
             })
             .collect()
     }
@@ -684,6 +779,138 @@ mod tests {
         assert_eq!(role(3), Some(GroupRole::Bridged));
         assert_eq!(role(5), Some(GroupRole::Member));
         assert_eq!(role(6), None);
+    }
+
+    /// A contribution attached to invocation `call`.
+    fn contribution(call: &str, status: UnitStatus) -> Unit {
+        let mut unit = units(
+            vec![tool("read", status)],
+            &[1],
+            &GroupSpec::new(GroupBy::SameTool),
+        )
+        .remove(0);
+        unit.invocation = Some(call.to_owned());
+        unit.attached = true;
+        unit
+    }
+
+    /// Same-tool reads with invocations `call<index>`, interleaved with
+    /// `attached` contributions inserted at the given positions.
+    fn calls_with(count: usize, attached: &[(usize, Unit)]) -> Vec<Unit> {
+        let mut owned = same_tool_reads(count);
+        for (index, unit) in owned.iter_mut().enumerate() {
+            unit.invocation = Some(format!("call{index}"));
+        }
+        for (offset, (position, unit)) in attached.iter().enumerate() {
+            let mut unit = unit.clone();
+            unit.id = format!("a{offset}");
+            owned.insert(*position, unit);
+        }
+        owned
+    }
+
+    #[test]
+    fn attached_units_never_count_lead_or_split_groups() {
+        // read, contribution(call0), read, failed contribution(call1),
+        // read, contribution(call2).
+        let owned = calls_with(
+            3,
+            &[
+                (1, contribution("call0", UnitStatus::Succeeded)),
+                (3, contribution("call1", UnitStatus::Failed)),
+                (5, contribution("call2", UnitStatus::Succeeded)),
+            ],
+        );
+        let offered = inputs(&owned);
+        let grouping = Grouping::compute(&offered);
+        assert_eq!(members(grouping.groups()), [vec![0, 2, 4]]);
+        let group = &grouping.groups()[0];
+        assert_eq!(group.bridged, [] as [usize; 0]);
+        assert_eq!(
+            group.attached,
+            [1, 3, 5],
+            "trailing contribution of call2 stays inside"
+        );
+        assert_eq!(group.facts.items, SizeBucket::Few);
+        assert!(
+            !group.facts.is_error,
+            "an attached failure is not a member failure"
+        );
+        assert_eq!(group.facts.status, Some(UnitStatus::Succeeded));
+        let role = |position| grouping.group_at(position).map(|(_, role)| role);
+        assert_eq!(role(3), Some(GroupRole::Attached));
+        assert_eq!(role(5), Some(GroupRole::Attached));
+    }
+
+    #[test]
+    fn attached_units_alone_form_no_group_and_foreign_trailers_stay_outside() {
+        let mut lone = vec![
+            contribution("x", UnitStatus::Succeeded),
+            contribution("y", UnitStatus::Succeeded),
+            contribution("z", UnitStatus::Succeeded),
+        ];
+        lone[1].id = "b".into();
+        lone[2].id = "c".into();
+        assert_eq!(group_units(&inputs(&lone)), []);
+
+        // One real call between contributions is not a group either.
+        let single = calls_with(1, &[(0, contribution("call0", UnitStatus::Succeeded))]);
+        assert_eq!(group_units(&inputs(&single)), []);
+
+        // A trailing contribution of another invocation is not claimed, and
+        // neither is anything after a foreign one.
+        let owned = calls_with(
+            2,
+            &[
+                (2, contribution("other", UnitStatus::Succeeded)),
+                (3, contribution("call1", UnitStatus::Succeeded)),
+            ],
+        );
+        let groups = group_units(&inputs(&owned));
+        assert_eq!(members(&groups), [vec![0, 1]]);
+        assert_eq!(groups[0].attached, [] as [usize; 0]);
+    }
+
+    #[test]
+    fn foreign_attached_units_follow_bridge_rules_between_members() {
+        // [write z (failed), read a, failed contribution of z, read b]: the
+        // contribution belongs to no member, so it is not hidden inside the
+        // reads' group; as a failure it cannot bridge and ends the run.
+        let mut write = units(
+            vec![tool("write", UnitStatus::Failed)],
+            &[1],
+            &GroupSpec::new(GroupBy::SameTool),
+        )
+        .remove(0);
+        write.id = "w".into();
+        write.invocation = Some("z".into());
+        let owned = calls_with(2, &[(0, write), (2, contribution("z", UnitStatus::Failed))]);
+        let grouping = Grouping::compute(&inputs(&owned));
+        assert_eq!(grouping.groups(), []);
+        assert_eq!(grouping.group_at(2), None);
+
+        // A succeeded foreign contribution is still not a bridge kind here
+        // (tool units do not bridge by default), so it also ends the run.
+        let owned = calls_with(2, &[(1, contribution("elsewhere", UnitStatus::Succeeded))]);
+        assert_eq!(group_units(&inputs(&owned)), []);
+
+        // Where its kind bridges and it is healthy, it is spanned as an
+        // ordinary bridge, not as an attachment.
+        let mut owned = calls_with(2, &[(1, contribution("elsewhere", UnitStatus::Succeeded))]);
+        for unit in &mut owned {
+            unit.group.bridge = vec![UnitKind::Tool];
+        }
+        let groups = group_units(&inputs(&owned));
+        assert_eq!(members(&groups), [vec![0, 2]]);
+        assert_eq!(groups[0].bridged, [1]);
+        assert_eq!(groups[0].attached, [] as [usize; 0]);
+    }
+
+    #[test]
+    fn attached_units_never_cross_turns() {
+        let mut owned = calls_with(2, &[(1, contribution("call0", UnitStatus::Succeeded))]);
+        owned[1].turn = 2;
+        assert_eq!(group_units(&inputs(&owned)), []);
     }
 
     #[test]
@@ -875,6 +1102,8 @@ mod tests {
                 bridge,
                 min: u32::try_from(2 + rng.below(3)).unwrap(),
             },
+            invocation: Some(format!("call{}", rng.below(4))),
+            attached: rng.below(5) == 0,
         }
     }
 

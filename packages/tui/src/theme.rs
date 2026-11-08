@@ -13,6 +13,7 @@ use bmux_tui_components::theme::{
 use super::app::BmuxApp;
 
 pub mod chrome;
+pub mod effects;
 
 /// One bounded theme catalog row for selection and diagnostics UI.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -175,6 +176,7 @@ impl ContainerPresentation {
         bcode_tui_components::transcript::TranscriptContainerStyle {
             recipe: transcript_recipe(self.recipe),
             style: self.style,
+            border_set: bmux_tui::chrome::BorderSet::SINGLE,
         }
     }
 }
@@ -309,6 +311,8 @@ pub struct ResolvedTheme {
     pub dialog_chrome: ComponentChrome,
     /// Icons, disclosure markers, density, and tool borders for transcript units.
     pub unit_chrome: chrome::UnitChrome,
+    /// Status separators, surface layering, and motion.
+    pub effects: effects::ChromeEffects,
     /// Complete generic component theme, including v2 roles and chrome.
     pub component: ComponentTheme,
     /// Stable resolved presentation fingerprint.
@@ -338,6 +342,7 @@ impl ResolvedTheme {
             transcript: self.transcript,
             dialog_chrome: self.dialog_chrome,
             unit_chrome: self.unit_chrome,
+            effects: self.effects,
             component: self.component,
             fingerprint: self.fingerprint,
         }
@@ -387,6 +392,8 @@ pub struct PresentedTheme {
     pub dialog_chrome: ComponentChrome,
     /// Icons, disclosure markers, density, and tool borders for transcript units.
     pub unit_chrome: chrome::UnitChrome,
+    /// Status separators, surface layering, and motion.
+    pub effects: effects::ChromeEffects,
     /// Complete generic component theme, including v2 roles and chrome.
     pub component: ComponentTheme,
     /// Stable resolved presentation fingerprint.
@@ -750,11 +757,18 @@ pub(crate) fn resolved_definition_theme(
             recipe
         }
     };
-    let presentation =
-        |role: &str, style_role: &str, fallback: bmux_tui::style::Style| ContainerPresentation {
-            recipe: container(role),
-            style: style(style_role).unwrap_or(fallback),
+    let effects = effects::ChromeEffects::from_theme(theme);
+    let raised = effects.raised_background(surfaces.raised, canvas);
+    let presentation = |role: &str, style_role: &str, fallback: bmux_tui::style::Style| {
+        let recipe = container(role);
+        let style = style(style_role).unwrap_or(fallback);
+        let (recipe, style) = if role.starts_with("tool.") {
+            effects::ChromeEffects::tool_surface(recipe, style, raised)
+        } else {
+            (recipe, style)
         };
+        ContainerPresentation { recipe, style }
+    };
     let containers = TranscriptContainerTheme {
         user: presentation("transcript.user", "transcript.user.container", text),
         assistant: presentation(
@@ -816,6 +830,7 @@ pub(crate) fn resolved_definition_theme(
         transcript,
         dialog_chrome: theme.map_or(ComponentChrome::DEFAULT, chrome::dialog_chrome),
         unit_chrome,
+        effects,
         component: component_theme,
         fingerprint: theme.map_or(0, |theme| theme.fingerprint),
     }

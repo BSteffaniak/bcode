@@ -363,8 +363,9 @@ pub struct ChatLoopState {
     daemon_connection: DaemonConnectionMonitor,
     pub(super) permission_dialog: Option<PermissionDialogState>,
     thinking_dialog: Option<super::thinking_dialog::ThinkingDialogState>,
-    theme_picker: Option<super::theme_picker::ThemePickerState>,
-    profile_picker: Option<super::profile_picker::ProfilePickerState>,
+    appearance_picker: Option<super::appearance_picker::AppearancePickerState>,
+    /// Profile to persist once a combined appearance apply has saved its theme.
+    pending_profile_persist: Option<super::appearance_picker::PendingProfilePersist>,
     streaming_configurator: Option<super::streaming_configurator::StreamingConfiguratorState>,
     timeline_dialog: Option<super::timeline_dialog::TimelineDialogState>,
     milestone_requests: super::timeline_dialog::MilestonePageRequests,
@@ -468,8 +469,8 @@ impl ChatLoopState {
             daemon_connection: DaemonConnectionMonitor::default(),
             permission_dialog: None,
             thinking_dialog: None,
-            theme_picker: None,
-            profile_picker: None,
+            appearance_picker: None,
+            pending_profile_persist: None,
             streaming_configurator: None,
             timeline_dialog: None,
             milestone_requests: super::timeline_dialog::MilestonePageRequests::default(),
@@ -548,8 +549,8 @@ impl ChatLoopState {
             .streaming_presentation_override
             .unwrap_or(self.declarative_streaming_policy);
         self.thinking_dialog = None;
-        self.theme_picker = None;
-        self.profile_picker = None;
+        // Closing the picker must not leave its live preview applied.
+        self.cancel_appearance_picker(chat);
         self.timeline_dialog = None;
         self.milestone_requests.cancel();
         self.provider_picker = None;
@@ -742,6 +743,9 @@ impl ChatLoopState {
                 cursor: None,
             });
         }
+        if let Some(rules) = chat.app.take_pending_default_rules() {
+            chat.queue_latest_effect(TuiEffect::PersistPresentationRules { rules });
+        }
         let (effects, notes) = chat.pending_effects.drain_runtime();
         let commands = effects
             .into_iter()
@@ -929,224 +933,197 @@ impl ChatLoopState {
         update_slash_palette_async(chat, self)
     }
 
-    pub fn open_theme_picker(&mut self, chat: &mut ActiveChat) {
-        let variant = super::theme::resolve_variant_for_config(chat.app.tui_config().theme.variant);
+    /// Open the combined palette × profile picker focused on `axis`
+    /// (`/theme` and `/profile` open it on their own axis).
+    pub fn open_appearance_picker(
+        &mut self,
+        chat: &mut ActiveChat,
+        axis: super::appearance_picker::AppearanceAxis,
+    ) {
         let catalog = super::theme::catalog_view(&mut chat.app);
-        self.theme_picker = Some(super::theme_picker::ThemePickerState::new(
+        let original = chat.app.tui_config().theme.profile.clone();
+        self.appearance_picker = Some(super::appearance_picker::AppearancePickerState::new(
             catalog.entries,
             catalog.diagnostics,
-        ));
-        self.prepare_theme_picker_previews(chat, variant);
-        chat.app.set_status("theme picker opened".to_owned());
-    }
-
-    fn prepare_theme_picker_previews(
-        &mut self,
-        chat: &mut ActiveChat,
-        variant: super::theme::definition::ResolvedThemeVariant,
-    ) {
-        let Some(picker) = self.theme_picker.as_ref() else {
-            return;
-        };
-        let ids = picker
-            .entries()
-            .iter()
-            .map(|entry| entry.id.clone())
-            .collect::<Vec<_>>();
-        let overlays = chat.app.tui_config().theme.effective_overlays();
-        let resolved = chat.app.theme_catalog().map(|discovered| {
-            ids.into_iter()
-                .filter_map(|id| {
-                    discovered
-                        .catalog
-                        .resolve(
-                            &super::theme::definition::ThemeSelection::new(&id)
-                                .overlays(overlays.clone())
-                                .variant(variant),
-                        )
-                        .ok()
-                        .map(|theme| {
-                            let accent = theme
-                                .style("border.focused")
-                                .and_then(|style| style.fg)
-                                .or_else(|| theme.color("accent"))
-                                .unwrap_or(super::theme::PENDING_AGENT_METADATA_ACCENT);
-                            (
-                                id,
-                                super::theme::resolved_definition_theme(Some(&theme), accent),
-                            )
-                        })
-                })
-                .collect::<std::collections::BTreeMap<_, _>>()
-        });
-        if let (Some(picker), Some(resolved)) = (self.theme_picker.as_mut(), resolved) {
-            picker.set_resolved_previews(resolved);
-        }
-    }
-
-    pub fn close_theme_picker(&mut self) {
-        self.theme_picker = None;
-    }
-
-    pub fn handle_theme_picker_key(
-        &mut self,
-        chat: &mut ActiveChat,
-        stroke: KeyStroke,
-        keymap: &super::keymap::BmuxKeyMap,
-    ) -> bool {
-        let Some(picker) = self.theme_picker.as_mut() else {
-            return false;
-        };
-        let outcome = picker.handle_key_with_keymap(stroke, keymap);
-        self.apply_theme_picker_outcome(chat, outcome);
-        true
-    }
-
-    pub fn handle_theme_picker_mouse(
-        &mut self,
-        chat: &mut ActiveChat,
-        mouse: bmux_tui::event::MouseEvent,
-        frame_area: Rect,
-    ) -> bool {
-        let Some(picker) = self.theme_picker.as_mut() else {
-            return false;
-        };
-        let theme = super::render::TuiTheme::for_app(&chat.app);
-        let Some((row, activate)) =
-            super::theme_picker_render::theme_picker_row(picker, mouse, frame_area, theme)
-        else {
-            return true;
-        };
-        let outcome = if activate {
-            picker.activate_row(row)
-        } else {
-            picker.select_row(row)
-        };
-        self.apply_theme_picker_outcome(chat, outcome);
-        true
-    }
-
-    fn apply_theme_picker_outcome(
-        &mut self,
-        chat: &mut ActiveChat,
-        outcome: super::theme_picker::ThemePickerOutcome,
-    ) {
-        match outcome {
-            super::theme_picker::ThemePickerOutcome::Preview(id) => {
-                let resolved = self
-                    .theme_picker
-                    .as_ref()
-                    .and_then(|picker| picker.resolved_preview(&id));
-                if let Some(resolved) = resolved {
-                    chat.app.preview_resolved_theme(&id, &resolved);
-                    chat.app.set_status(format!("previewing theme {id}"));
-                }
-            }
-            super::theme_picker::ThemePickerOutcome::Apply(id) => {
-                let resolved = self
-                    .theme_picker
-                    .as_ref()
-                    .and_then(|picker| picker.resolved_preview(&id));
-                self.theme_picker = None;
-                if let Some(resolved) = resolved {
-                    chat.app.preview_resolved_theme(&id, &resolved);
-                    chat.replace_effect(TuiEffect::PersistThemeSelection { name: id.clone() });
-                    chat.app
-                        .set_status(format!("saving theme {id} to user state…"));
-                }
-            }
-            super::theme_picker::ThemePickerOutcome::Cancel => {
-                self.theme_picker = None;
-                chat.app.cancel_theme_preview();
-                chat.app.set_status("theme preview cancelled".to_owned());
-            }
-            super::theme_picker::ThemePickerOutcome::Ignored => {}
-        }
-    }
-
-    pub fn open_profile_picker(&mut self, chat: &mut ActiveChat) {
-        let original = chat.app.tui_config().theme.profile.clone();
-        self.profile_picker = Some(super::profile_picker::ProfilePickerState::new(
             super::theme::profile_catalog(&mut chat.app),
             original,
+            axis,
         ));
-        chat.app.set_status("profile picker opened".to_owned());
+        chat.app.set_status("appearance picker opened".to_owned());
     }
 
-    /// Close the profile picker, restoring the profile it was opened with.
-    pub fn cancel_profile_picker(&mut self, chat: &mut ActiveChat) {
-        if let Some(picker) = self.profile_picker.take() {
-            chat.app.apply_profile(picker.original());
+    /// Close the appearance picker, restoring the palette and profile it was
+    /// opened with.
+    pub fn cancel_appearance_picker(&mut self, chat: &mut ActiveChat) {
+        if let Some(picker) = self.appearance_picker.take() {
+            chat.app.restore_profile(picker.original_profile());
+            chat.app.cancel_theme_preview();
         }
     }
 
-    pub fn handle_profile_picker_key(
+    pub fn handle_appearance_picker_key(
         &mut self,
         chat: &mut ActiveChat,
         stroke: KeyStroke,
         keymap: &super::keymap::BmuxKeyMap,
     ) -> bool {
-        let Some(picker) = self.profile_picker.as_mut() else {
+        let Some(picker) = self.appearance_picker.as_mut() else {
             return false;
         };
         let outcome = picker.handle_key_with_keymap(stroke, keymap);
-        self.apply_profile_picker_outcome(chat, outcome);
+        self.apply_appearance_picker_outcome(chat, outcome);
         true
     }
 
-    pub fn handle_profile_picker_mouse(
+    pub fn handle_appearance_picker_mouse(
         &mut self,
         chat: &mut ActiveChat,
         mouse: bmux_tui::event::MouseEvent,
         frame_area: Rect,
     ) -> bool {
-        let Some(picker) = self.profile_picker.as_mut() else {
+        use super::appearance_picker::AppearancePickerOutcome;
+        use super::appearance_picker_render::AppearanceHit;
+        let Some(picker) = self.appearance_picker.as_mut() else {
             return false;
         };
         let theme = super::render::TuiTheme::for_app(&chat.app);
-        let Some((row, activate)) =
-            super::profile_picker_render::profile_picker_row(picker, mouse, frame_area, theme)
-        else {
+        if let Some((axis, forward)) = super::appearance_picker_render::appearance_picker_wheel(
+            picker, mouse, frame_area, theme,
+        ) {
+            let outcome = picker.scroll(axis, forward);
+            self.apply_appearance_picker_outcome(chat, outcome);
             return true;
+        }
+        let outcome = match super::appearance_picker_render::appearance_picker_hit(
+            picker, mouse, frame_area, theme,
+        ) {
+            Some(AppearanceHit::Row(axis, row)) => picker.select_row(axis, row),
+            Some(AppearanceHit::Axis(axis)) => {
+                if picker.set_axis(axis) {
+                    AppearancePickerOutcome::AxisChanged(axis)
+                } else {
+                    AppearancePickerOutcome::Ignored
+                }
+            }
+            None => AppearancePickerOutcome::Ignored,
         };
-        let outcome = if activate {
-            picker.activate_row(row)
-        } else {
-            picker.select_row(row)
-        };
-        self.apply_profile_picker_outcome(chat, outcome);
+        self.apply_appearance_picker_outcome(chat, outcome);
         true
     }
 
-    fn apply_profile_picker_outcome(
+    /// Preview the picker's selected palette under the live profile overlay,
+    /// resolving it at most once per profile.
+    fn preview_appearance_palette(&mut self, chat: &mut ActiveChat) {
+        let Some(picker) = self.appearance_picker.as_mut() else {
+            return;
+        };
+        let Some(id) = picker.selected_palette().map(str::to_owned) else {
+            return;
+        };
+        if !picker.palette_changed() {
+            // The configured theme already resolves with the live profile.
+            chat.app.cancel_theme_preview();
+            return;
+        }
+        let cached = picker.palettes().resolved_preview(&id);
+        let resolved = cached.or_else(|| {
+            let definition = chat.app.resolve_theme_selection_cached(&id)?;
+            let resolved = super::theme::resolved_definition_theme(
+                Some(&definition),
+                super::theme::resolved_accent(Some(&definition)),
+            );
+            picker
+                .palettes_mut()
+                .insert_resolved_preview(id.clone(), &resolved);
+            Some(resolved)
+        });
+        if let Some(resolved) = resolved {
+            chat.app.preview_resolved_theme(&id, &resolved);
+        }
+    }
+
+    fn apply_appearance_picker_outcome(
         &mut self,
         chat: &mut ActiveChat,
-        outcome: super::profile_picker::ProfilePickerOutcome,
+        outcome: super::appearance_picker::AppearancePickerOutcome,
     ) {
-        use super::profile_picker::ProfilePickerOutcome;
+        use super::appearance_picker::AppearancePickerOutcome;
         let label = |id: Option<&str>| id.unwrap_or("theme default").to_owned();
         match outcome {
-            ProfilePickerOutcome::Preview(id) => {
+            AppearancePickerOutcome::PreviewPalette(id) => {
+                self.preview_appearance_palette(chat);
+                chat.app.set_status(format!("previewing palette {id}"));
+            }
+            AppearancePickerOutcome::PreviewProfile(id) => {
                 if chat.app.apply_profile(id.as_deref()) {
+                    // Profiles change the resolved chrome, so cached palette
+                    // previews no longer apply; re-preview the selection.
+                    if let Some(picker) = self.appearance_picker.as_mut() {
+                        picker.palettes_mut().clear_resolved_previews();
+                    }
+                    self.preview_appearance_palette(chat);
                     chat.app
                         .set_status(format!("previewing profile {}", label(id.as_deref())));
                 }
             }
-            ProfilePickerOutcome::Apply(id) => {
-                self.profile_picker = None;
-                if chat.app.apply_profile(id.as_deref()) {
+            AppearancePickerOutcome::AxisChanged(axis) => {
+                chat.app
+                    .set_status(format!("choosing {}", axis.label().to_lowercase()));
+            }
+            AppearancePickerOutcome::Apply { palette, profile } => {
+                let Some(picker) = self.appearance_picker.take() else {
+                    return;
+                };
+                let palette_changed = picker.palette_changed();
+                let profile_changed = picker.profile_changed();
+                if profile_changed && !chat.app.apply_profile(profile.as_deref()) {
+                    chat.app.restore_profile(picker.original_profile());
+                    chat.app.cancel_theme_preview();
                     chat.app.set_status(format!(
-                        "saving profile {} to user state…",
-                        label(id.as_deref())
+                        "profile {} is unavailable",
+                        label(profile.as_deref())
                     ));
-                    chat.replace_effect(TuiEffect::PersistProfileSelection { name: id });
+                    return;
+                }
+                match (palette_changed, profile_changed) {
+                    (true, _) => {
+                        // Persist the theme first; the profile follows once
+                        // the theme write finished (see the persisted result).
+                        self.pending_profile_persist = profile_changed.then(|| {
+                            super::appearance_picker::PendingProfilePersist {
+                                profile: profile.clone(),
+                            }
+                        });
+                        chat.replace_effect(TuiEffect::PersistThemeSelection {
+                            name: palette.clone(),
+                        });
+                        chat.app.set_status(format!(
+                            "saving palette {palette} and profile {} to user state…",
+                            label(profile.as_deref())
+                        ));
+                    }
+                    (false, true) => {
+                        chat.app.cancel_theme_preview();
+                        chat.replace_effect(TuiEffect::PersistProfileSelection {
+                            name: profile.clone(),
+                        });
+                        chat.app.set_status(format!(
+                            "saving profile {} to user state…",
+                            label(profile.as_deref())
+                        ));
+                    }
+                    (false, false) => {
+                        chat.app.cancel_theme_preview();
+                        chat.app.set_status("appearance unchanged".to_owned());
+                    }
                 }
             }
-            ProfilePickerOutcome::Cancel => {
-                self.cancel_profile_picker(chat);
-                chat.app.set_status("profile preview cancelled".to_owned());
+            AppearancePickerOutcome::Cancel => {
+                self.cancel_appearance_picker(chat);
+                chat.app
+                    .set_status("appearance preview cancelled".to_owned());
             }
-            ProfilePickerOutcome::Ignored => {}
+            AppearancePickerOutcome::Ignored => {}
         }
     }
 
@@ -2397,8 +2374,7 @@ impl ChatLoopState {
             (self.streaming_configurator.is_some(), Foreground::Streaming),
             (self.timeline_dialog.is_some(), Foreground::Timeline),
             (self.thinking_dialog.is_some(), Foreground::Thinking),
-            (self.theme_picker.is_some(), Foreground::Theme),
-            (self.profile_picker.is_some(), Foreground::Profile),
+            (self.appearance_picker.is_some(), Foreground::Appearance),
             (self.palette.is_some(), Foreground::Commands),
             (self.slash_palette.is_some(), Foreground::Slash),
         ]
@@ -2984,7 +2960,7 @@ impl ChatLoopState {
             Some(Foreground::Streaming) => BcodeRuntimeScreen::Streaming,
             Some(Foreground::Timeline) => BcodeRuntimeScreen::Timeline,
             Some(Foreground::Thinking) => BcodeRuntimeScreen::Thinking,
-            Some(Foreground::Theme | Foreground::Profile) => BcodeRuntimeScreen::Theme,
+            Some(Foreground::Appearance) => BcodeRuntimeScreen::Theme,
             Some(Foreground::Commands) => BcodeRuntimeScreen::CommandPalette,
             Some(Foreground::Slash) => BcodeRuntimeScreen::SlashPalette,
             None if self.has_interactive_surface() => BcodeRuntimeScreen::InteractiveSurface,
@@ -3711,35 +3687,47 @@ pub fn apply_effect_result(
                 .app
                 .set_status(format!("profile could not be saved: {error}")),
         },
-        TuiEffectResult::ThemeSelectionPersisted { name, result } => match result {
-            Ok(path) => {
-                if let Some(name) = name {
-                    if chat.app.apply_theme(&name) {
+        TuiEffectResult::ThemeSelectionPersisted { name, result } => {
+            match result {
+                Ok(path) => {
+                    if let Some(name) = name {
+                        if chat.app.apply_theme(&name) {
+                            chat.app.set_status(format!(
+                                "theme {name} saved to user state at {}",
+                                bcode_plugin_sdk::path::display_from_current_dir(&path)
+                            ));
+                        } else {
+                            chat.app.cancel_theme_preview();
+                            chat.app.set_status(format!(
+                                "theme {name} saved, but is not available in this repository"
+                            ));
+                        }
+                    } else {
                         chat.app.set_status(format!(
-                            "theme {name} saved to user state at {}",
+                            "theme override cleared from {}; reloading configuration…",
                             bcode_plugin_sdk::path::display_from_current_dir(&path)
                         ));
-                    } else {
-                        chat.app.cancel_theme_preview();
-                        chat.app.set_status(format!(
-                            "theme {name} saved, but is not available in this repository"
-                        ));
+                        chat.replace_effect(TuiEffect::LoadConfig);
                     }
-                } else {
-                    chat.app.set_status(format!(
-                        "theme override cleared from {}; reloading configuration…",
-                        bcode_plugin_sdk::path::display_from_current_dir(&path)
-                    ));
-                    chat.replace_effect(TuiEffect::LoadConfig);
+                }
+                Err(error) => {
+                    chat.app.cancel_theme_preview();
+                    let action = name.as_deref().unwrap_or("configured default");
+                    chat.app
+                        .set_status(format!("could not save theme {action}: {error}"));
                 }
             }
-            Err(error) => {
-                chat.app.cancel_theme_preview();
-                let action = name.as_deref().unwrap_or("configured default");
-                chat.app
-                    .set_status(format!("could not save theme {action}: {error}"));
+            // A combined appearance apply saves the profile only after the
+            // theme write finished, so both land in user state.
+            if let Some(pending) = loop_state.pending_profile_persist.take() {
+                chat.replace_effect(TuiEffect::PersistProfileSelection {
+                    name: pending.profile,
+                });
             }
-        },
+        }
+        TuiEffectResult::PresentationRulesPersisted { rules, result } => {
+            chat.app.finish_default_rules(&rules, result);
+        }
         TuiEffectResult::StreamingPresentationPersisted { policy, result } => match result {
             Ok(path) => {
                 loop_state.streaming_presentation_override = policy;
@@ -4791,6 +4779,7 @@ fn permission_summary_view(
         session_id: Some(permission.session_id),
         tool_call_id: permission.tool_call_id,
         tool_name: permission.tool_name,
+        producer_plugin_id: None,
         arguments_json: permission.arguments_json,
         batch: permission
             .batch
@@ -5279,8 +5268,9 @@ fn apply_root_slash_command_outcome(
             chat.app.cancel_theme_preview();
             chat.app.set_status("theme preview cancelled".to_owned());
         }
-        SlashCommandOutcome::OpenThemePicker => loop_state.open_theme_picker(chat),
-        SlashCommandOutcome::OpenProfilePicker => loop_state.open_profile_picker(chat),
+        SlashCommandOutcome::OpenAppearancePicker(axis) => {
+            loop_state.open_appearance_picker(chat, axis);
+        }
         SlashCommandOutcome::OpenStreamingConfigurator => {
             loop_state.open_streaming_configurator(chat);
         }
@@ -6244,6 +6234,9 @@ pub fn draw_chat_frame<W: Write>(
     } else {
         damage
     };
+    // Every painter this frame, including canvas-owning foregrounds that skip
+    // the transcript renderer, uses the same focus phase.
+    render::begin_focus_frame(chat.app.focus_phase(), damage.is_full());
     let frame_started = loop_state
         .telemetry
         .as_ref()
@@ -6526,17 +6519,16 @@ pub fn draw_chat_frame<W: Write>(
             let mut paint_background = |frame: &mut bmux_tui::paint::PaintCx<'_, '_>| {
                 if let Some(layout) = layout.filter(|_| !foreground_owns_canvas) {
                     render::render_prepared_damage(&mut chat.app, frame, layout, intersects);
-                    if intersects(layout.body) {
-                        paint_transcript_focus(&chat.app, layout.body, frame, theme.selection);
-                    }
                     let selection_scene =
                         super::root_program::transcript_selection_scene(&chat.app, layout.body());
-                    for scope in selection_scene.scopes() {
-                        frame.push_selection_scope(scope.clone());
-                    }
-                    for fragment in selection_scene.fragments() {
-                        frame.push_selection_fragment(fragment.clone());
-                    }
+                    paint_transcript_overlays(
+                        &chat.app,
+                        layout.body,
+                        frame,
+                        theme,
+                        &selection_scene,
+                        intersects(layout.body),
+                    );
                 }
                 for contribution_id in &rich_presentation.image_removed {
                     super::markdown_image::MarkdownImagePresentationStore::remove_from_frame(
@@ -6659,6 +6651,60 @@ pub fn draw_chat_frame<W: Write>(
 /// The row comes from the retained layout anchor and the top row the
 /// transcript was painted with, clipped to the transcript `area`; nothing is
 /// painted while the row is scrolled out of view or the body is hidden.
+/// Register the transcript's selection metadata, then paint the focus row
+/// and the inspector over it when `paint_overlays`.
+///
+/// Selection is registered first so the inspector's occlusion removes the
+/// transcript fragments it covers: selection highlights, gesture initiation
+/// and copy then agree with the painted panel and its hit region.
+fn paint_transcript_overlays(
+    app: &super::app::BmuxApp,
+    body: Rect,
+    frame: &mut bmux_tui::paint::PaintCx<'_, '_>,
+    theme: render::TuiTheme,
+    selection: &bmux_tui::selection::SelectionScene,
+    paint_overlays: bool,
+) {
+    let panel = paint_overlays
+        .then(|| super::inspector_render::inspector_panel(app, body))
+        .flatten();
+    for scope in selection.scopes() {
+        let mut scope = scope.clone();
+        if let Some(panel) = panel {
+            scope.initiation_area = initiation_beside(scope.initiation_area, panel);
+        }
+        frame.push_selection_scope(scope);
+    }
+    for fragment in selection.fragments() {
+        frame.push_selection_fragment(fragment.clone());
+    }
+    if paint_overlays {
+        paint_transcript_focus(app, body, frame, theme.selection);
+        super::inspector_render::paint_inspector(app, body, frame, theme);
+    }
+}
+
+/// Narrow a selection initiation `area` to the part left of a right-docked
+/// `panel` that spans its rows, so transcript selection can still start
+/// beside the panel. Any other overlap is left for the panel's occlusion,
+/// which disables initiation because a cut-out is not one rectangle.
+const fn initiation_beside(area: Rect, panel: Rect) -> Rect {
+    let overlaps = panel.x < area.x.saturating_add(area.width)
+        && area.x < panel.x.saturating_add(panel.width)
+        && panel.y < area.y.saturating_add(area.height)
+        && area.y < panel.y.saturating_add(panel.height);
+    if overlaps
+        && panel.x > area.x
+        && panel.y <= area.y
+        && panel.y.saturating_add(panel.height) >= area.y.saturating_add(area.height)
+        && panel.x.saturating_add(panel.width) >= area.x.saturating_add(area.width)
+    {
+        Rect::new(area.x, area.y, panel.x - area.x, area.height)
+    } else {
+        area
+    }
+}
+
 fn paint_transcript_focus(
     app: &super::app::BmuxApp,
     area: Rect,
@@ -6776,17 +6822,10 @@ fn paint_foreground_pickers(
     effective: &super::keymap::BmuxKeyMap,
 ) {
     let theme = render::TuiTheme::for_app(&chat.app);
-    if let Some(picker) = &mut loop_state.theme_picker
-        && foreground == Some(super::foreground::Foreground::Theme)
+    if let Some(picker) = &mut loop_state.appearance_picker
+        && foreground == Some(super::foreground::Foreground::Appearance)
     {
-        super::theme_picker_render::render_theme_picker_with_keymap(
-            picker, frame, theme, effective,
-        );
-    }
-    if let Some(picker) = &mut loop_state.profile_picker
-        && foreground == Some(super::foreground::Foreground::Profile)
-    {
-        super::profile_picker_render::render_profile_picker_with_keymap(
+        super::appearance_picker_render::render_appearance_picker_with_keymap(
             picker,
             frame,
             theme,
@@ -6985,12 +7024,9 @@ fn draw_temporal_frame<W: Write>(
             } else {
                 render::render_prepared_damage(&mut chat.app, frame, layout, intersects);
                 if intersects(layout.body) {
-                    paint_transcript_focus(
-                        &chat.app,
-                        layout.body,
-                        frame,
-                        render::TuiTheme::for_app(&chat.app).selection,
-                    );
+                    let theme = render::TuiTheme::for_app(&chat.app);
+                    paint_transcript_focus(&chat.app, layout.body, frame, theme.selection);
+                    super::inspector_render::paint_inspector(&chat.app, layout.body, frame, theme);
                 }
                 paint_interactive_surface(
                     loop_state,
@@ -8602,6 +8638,7 @@ mod scheduler_tests {
             session_id: Some(bcode_session_models::SessionId::new()),
             tool_call_id: id.to_owned(),
             tool_name: "shell.run".to_owned(),
+            producer_plugin_id: None,
             arguments_json: "{}".to_owned(),
             batch: None,
             agent_id: "build".to_owned(),
@@ -8840,6 +8877,118 @@ mod scheduler_tests {
         assert_eq!(
             state.interactive_surface_queue.interaction_ids(),
             ["second"]
+        );
+    }
+}
+
+#[cfg(test)]
+#[path = "appearance_picker_flow_tests.rs"]
+mod appearance_picker_flow_tests;
+
+#[cfg(test)]
+mod transcript_overlay_tests {
+    use bmux_tui::buffer::Buffer;
+    use bmux_tui::frame::Frame;
+    use bmux_tui::geometry::Point;
+    use bmux_tui::paint::PaintCx;
+    use bmux_tui::selection::{
+        SelectionFragment, SelectionScene, SelectionScope, SelectionScopeId,
+    };
+
+    use super::*;
+    use crate::app::disclosure_focus_tests::focus_app;
+    use crate::inspector_render::{InspectorPlacement, inspector_placement};
+    use crate::transcript_focus::FocusAction;
+
+    /// One selectable fragment per body cell, as transcript text registers
+    /// one per grapheme.
+    fn row_scene(body: Rect) -> SelectionScene {
+        let mut scene = SelectionScene::new();
+        scene.push_scope(SelectionScope::new("bcode.transcript", body));
+        let width = usize::from(body.width);
+        for row in 0..body.height {
+            for column in 0..body.width {
+                let start = usize::from(row) * width + usize::from(column);
+                scene.push_fragment(SelectionFragment::new(
+                    SelectionScopeId::new("bcode.transcript"),
+                    "bcode.test",
+                    Rect::new(body.x + column, body.y + row, 1, 1),
+                    u64::try_from(start).unwrap_or(u64::MAX),
+                    start..start + 1,
+                ));
+            }
+        }
+        scene
+    }
+
+    #[test]
+    fn inspector_removes_the_selection_it_covers_and_keeps_the_rest() {
+        let (mut app, _) = focus_app(3);
+        assert!(app.enter_transcript_focus());
+        assert!(app.handle_transcript_focus_action(FocusAction::Inspect));
+        assert!(app.inspector_open());
+        let theme = render::TuiTheme::for_theme_id("terminal-native");
+        for (width, height) in [(120, 20), (60, 12), (3, 3), (2, 2)] {
+            let body = Rect::new(0, 1, width, height);
+            let mut buffer = Buffer::empty(Rect::new(0, 0, width, height + 2));
+            let mut frame = Frame::new(&mut buffer);
+            let scene = row_scene(body);
+            {
+                let mut cx = PaintCx::new(&mut frame);
+                paint_transcript_overlays(&app, body, &mut cx, theme, &scene, true);
+            }
+            let selection = frame.selection();
+            match inspector_placement(body).map(InspectorPlacement::area) {
+                Some(panel) => {
+                    assert!(
+                        selection
+                            .fragments()
+                            .iter()
+                            .all(|fragment| fragment.area.intersection(panel).is_empty()),
+                        "{width}x{height}"
+                    );
+                    let inside = Point::new(panel.x, panel.y);
+                    assert!(selection.initiation_scope(inside).is_none());
+                    // Beside a right-docked panel, selection still starts.
+                    if matches!(inspector_placement(body), Some(InspectorPlacement::Side(_))) {
+                        let beside = Point::new(body.x, panel.y);
+                        assert!(
+                            selection.initiation_scope(beside).is_some(),
+                            "{width}x{height}"
+                        );
+                    }
+                    let hit = frame
+                        .hits()
+                        .hit_test(inside)
+                        .map(|hit| hit.id().as_str().to_owned());
+                    assert_eq!(
+                        hit.as_deref(),
+                        Some(crate::inspector::INSPECTOR_HIT_ID),
+                        "{width}x{height}"
+                    );
+                }
+                None => assert_eq!(
+                    selection.fragments().len(),
+                    usize::from(width) * usize::from(height),
+                    "{width}x{height}"
+                ),
+            }
+        }
+        // With the inspector closed every row stays selectable.
+        assert!(app.handle_transcript_focus_action(FocusAction::Exit));
+        let body = Rect::new(0, 0, 120, 20);
+        let mut buffer = Buffer::empty(body);
+        let mut frame = Frame::new(&mut buffer);
+        {
+            let mut cx = PaintCx::new(&mut frame);
+            paint_transcript_overlays(&app, body, &mut cx, theme, &row_scene(body), true);
+        }
+        assert_eq!(frame.selection().fragments().len(), 120 * 20);
+        assert!(
+            frame
+                .selection()
+                .initiation_scope(Point::new(119, 5))
+                .is_some()
         );
     }
 }

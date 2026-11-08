@@ -3,7 +3,10 @@
 //! Grouping itself is renderer-neutral ([`bcode_presentation_policy::Grouping`]);
 //! this module feeds it the resident window, resolves each group's own
 //! presentation, and records how every grouped item renders so the terminal
-//! keeps one layout entry per transcript item. The projection is updated
+//! keeps one layout entry per transcript item. Only tool calls are members:
+//! supplemental and hidden tool contribution items are offered as attached
+//! units, so they never count toward a group and render with the member whose
+//! invocation they belong to. The projection is updated
 //! incrementally: unchanged items are recognized by identity and revision, so
 //! a streaming update re-examines only the changed item's neighborhood.
 
@@ -16,7 +19,7 @@ use bcode_presentation_policy::models::{
     Disclosure, GroupSpec, ResolvedPresentation, Spacing, UnitFacts,
 };
 use bcode_presentation_policy::{GroupRole, Grouping, GroupingInput, UnitGroup, is_revealed};
-use bcode_tui_components::transcript::item::TranscriptItem;
+use bcode_tui_components::transcript::item::{TranscriptItem, TranscriptItemKind};
 
 use super::{DisclosureTarget, StructureSnapshot, TurnIndex};
 
@@ -42,12 +45,16 @@ pub enum MemberRendering {
 pub struct GroupPlacement {
     /// The group, by its first member's item id.
     pub group: u64,
-    /// Leader, member, or bridge.
+    /// Leader, member, bridge, or attached unit.
     pub role: GroupRole,
     /// Whether the member is shown in place while the group is collapsed or
     /// summarized (its status is in the group's `reveal` list, or the
-    /// visibility floor reveals it). Always `false` for bridges.
+    /// visibility floor reveals it). Always `false` for bridges and attached
+    /// units.
     pub revealed: bool,
+    /// For an attached unit, the member item whose invocation it belongs
+    /// to, when that member is in the group; it renders with that member.
+    pub attached_to: Option<u64>,
     /// Whether this is the last item of the group that renders rows, so it
     /// carries the group's trailing spacing.
     pub closes: bool,
@@ -67,6 +74,9 @@ pub struct GroupView {
     pub members: Vec<u64>,
     /// Bridged item ids in transcript order.
     pub bridged: Vec<u64>,
+    /// Attached item ids (supplemental and hidden tool contributions) in
+    /// transcript order; never counted as members.
+    pub attached: Vec<u64>,
     /// Member tool names with their counts, in first-appearance order.
     pub tools: Vec<(String, usize)>,
     /// Sum of the finished members' durations, when any is known.
@@ -102,6 +112,9 @@ impl GroupSnapshot {
 /// * Summarized groups render one header row per member; revealed members,
 ///   and members the user opened, render fully; bridges render nothing.
 /// * Collapsed groups render only revealed members.
+///
+/// Attached units are resolved by [`StructureSnapshot::member_rendering`]
+/// from the member they belong to; this rule treats them as bridges.
 const fn rendering_for(
     role: GroupRole,
     disclosure: Disclosure,
@@ -110,7 +123,7 @@ const fn rendering_for(
 ) -> MemberRendering {
     match (role, disclosure) {
         (_, Disclosure::Expanded) => MemberRendering::Full,
-        (GroupRole::Bridged, _) => MemberRendering::Nothing,
+        (GroupRole::Bridged | GroupRole::Attached, _) => MemberRendering::Nothing,
         (_, Disclosure::Summary) if revealed || overridden => MemberRendering::Full,
         (_, Disclosure::Summary) => MemberRendering::HeaderRow,
         (_, Disclosure::Collapsed | Disclosure::Hidden) if revealed => MemberRendering::Full,
@@ -139,8 +152,8 @@ impl StructureSnapshot {
         self.groups.views.get(&group).map(AsRef::as_ref)
     }
 
-    /// First member id of the group containing `item_id` (as a member or a
-    /// bridge).
+    /// First member id of the group containing `item_id` (as a member, a
+    /// bridge, or an attached unit).
     #[must_use]
     pub fn group_of(&self, item_id: u64) -> Option<u64> {
         self.group_placement(item_id)
@@ -181,10 +194,29 @@ impl StructureSnapshot {
 
     /// How the item with `item_id` renders under its group, or `None` when
     /// it is not grouped.
+    ///
+    /// An attached unit renders fully when the group is expanded or when the
+    /// member it belongs to renders fully, and renders nothing otherwise (a
+    /// member's header row stands for its whole invocation).
     #[must_use]
     pub fn member_rendering(&self, item_id: u64) -> Option<MemberRendering> {
         let placement = self.group_placement(item_id)?;
         let disclosure = self.group_disclosure(placement.group)?;
+        if placement.role == GroupRole::Attached {
+            let owner_full = placement
+                .attached_to
+                .filter(|owner| {
+                    self.group_placement(*owner)
+                        .is_some_and(|owner| owner.role != GroupRole::Attached)
+                })
+                .and_then(|owner| self.member_rendering(owner))
+                == Some(MemberRendering::Full);
+            return Some(if disclosure == Disclosure::Expanded || owner_full {
+                MemberRendering::Full
+            } else {
+                MemberRendering::Nothing
+            });
+        }
         // A member the user opened from its header row renders in full; a
         // collapsed choice keeps the compact row.
         let overridden = matches!(
@@ -199,14 +231,21 @@ impl StructureSnapshot {
         ))
     }
 
-    /// Resident items of `group` (members and bridges) in transcript order,
+    /// Resident items of `group` (members, bridges, and attached units) in
+    /// transcript order,
     /// with the resident index each had when groups were last synchronized.
     #[must_use]
     pub fn group_items(&self, group: u64) -> Vec<(u64, Option<usize>)> {
         let Some(view) = self.group_view(group) else {
             return Vec::new();
         };
-        let mut ids: Vec<u64> = view.members.iter().chain(&view.bridged).copied().collect();
+        let mut ids: Vec<u64> = view
+            .members
+            .iter()
+            .chain(&view.bridged)
+            .chain(&view.attached)
+            .copied()
+            .collect();
         ids.sort_by_key(|id| self.groups.positions.get(id).copied());
         ids.into_iter()
             .map(|id| (id, self.groups.positions.get(&id).copied()))
@@ -343,6 +382,11 @@ struct CachedUnit {
     facts: UnitFacts,
     group: GroupSpec,
     duration_ms: Option<u64>,
+    /// Invocation the item is or belongs to.
+    invocation: Option<String>,
+    /// Whether the item is a tool contribution attached to an invocation
+    /// rather than a tool call (see [`is_attached_contribution`]).
+    attached: bool,
 }
 
 impl CachedUnit {
@@ -378,6 +422,8 @@ impl CachedUnit {
             facts,
             group,
             duration_ms,
+            invocation: item.visual_invocation_id().map(str::to_owned),
+            attached: is_attached_contribution(item),
         }
     }
 
@@ -392,6 +438,8 @@ impl CachedUnit {
             && self.facts == other.facts
             && self.group == other.group
             && self.duration_ms == other.duration_ms
+            && self.invocation == other.invocation
+            && self.attached == other.attached
     }
 }
 
@@ -505,6 +553,16 @@ impl GroupCache {
         for group in self.grouping.groups() {
             let view = self.view(snapshot, group);
             let id = view.id;
+            // Member item id by invocation, so attached units find the
+            // call they belong to.
+            let owners: BTreeMap<&str, u64> = group
+                .members
+                .iter()
+                .filter_map(|&position| {
+                    let unit = &self.units[position];
+                    Some((unit.invocation.as_deref()?, unit.item_id))
+                })
+                .collect();
             for (position, role) in group
                 .members
                 .iter()
@@ -515,17 +573,26 @@ impl GroupCache {
                         .iter()
                         .map(|&position| (position, Some(GroupRole::Bridged))),
                 )
+                .chain(
+                    group
+                        .attached
+                        .iter()
+                        .map(|&position| (position, Some(GroupRole::Attached))),
+                )
             {
                 let Some(role) = role else { continue };
                 let unit = &self.units[position];
+                let member = matches!(role, GroupRole::Leader | GroupRole::Member);
                 built.positions.insert(unit.item_id, position);
                 built.placements.insert(
                     unit.item_id,
                     GroupPlacement {
                         group: id,
                         role,
-                        revealed: role != GroupRole::Bridged
-                            && is_revealed(&unit.facts, &view.presentation.reveal),
+                        revealed: member && is_revealed(&unit.facts, &view.presentation.reveal),
+                        attached_to: (role == GroupRole::Attached)
+                            .then(|| owners.get(unit.invocation.as_deref()?).copied())
+                            .flatten(),
                         closes: false,
                     },
                 );
@@ -591,6 +658,11 @@ impl GroupCache {
                 .iter()
                 .map(|&position| self.units[position].item_id)
                 .collect(),
+            attached: group
+                .attached
+                .iter()
+                .map(|&position| self.units[position].item_id)
+                .collect(),
             tools,
             duration_ms,
         }
@@ -604,7 +676,13 @@ fn mark_closers(snapshot: &StructureSnapshot, built: &mut GroupSnapshot) {
     probe.groups = Arc::new(std::mem::take(built));
     let mut closers = Vec::new();
     for view in probe.groups.views.values() {
-        let mut items: Vec<u64> = view.members.iter().chain(&view.bridged).copied().collect();
+        let mut items: Vec<u64> = view
+            .members
+            .iter()
+            .chain(&view.bridged)
+            .chain(&view.attached)
+            .copied()
+            .collect();
         items.sort_by_key(|id| probe.groups.positions.get(id).copied());
         let closer = items
             .iter()
@@ -626,6 +704,24 @@ fn mark_closers(snapshot: &StructureSnapshot, built: &mut GroupSnapshot) {
     }
 }
 
+/// Whether `item` is a tool contribution attached to an invocation rather
+/// than the presentation of a tool call itself.
+///
+/// Supplemental and hidden placements are extra contributions and never
+/// count as calls. Request, progress, and result placements occupy the
+/// invocation's primary slot (they are how a plugin-presented call renders,
+/// with the call's own item identity), so they stay group members.
+const fn is_attached_contribution(item: &TranscriptItem) -> bool {
+    matches!(
+        item.kind(),
+        TranscriptItemKind::ToolContribution {
+            placement: bcode_session_models::ToolContributionPlacement::Supplemental
+                | bcode_session_models::ToolContributionPlacement::Hidden,
+            ..
+        }
+    )
+}
+
 fn inputs(units: &[CachedUnit]) -> Vec<GroupingInput<'_>> {
     units
         .iter()
@@ -634,6 +730,8 @@ fn inputs(units: &[CachedUnit]) -> Vec<GroupingInput<'_>> {
             turn: unit.turn,
             facts: &unit.facts,
             group: &unit.group,
+            invocation: unit.invocation.as_deref(),
+            attached: unit.attached,
         })
         .collect()
 }
@@ -722,6 +820,149 @@ mod tests {
                 timing: ToolTiming::default(),
             },
         )
+    }
+
+    fn contribution(
+        call: &str,
+        placement: bcode_session_models::ToolContributionPlacement,
+    ) -> TranscriptItem {
+        TranscriptItem::with_kind(
+            "Tool presentation",
+            "visual".to_owned(),
+            false,
+            TranscriptItemKind::ToolContribution {
+                contribution: Box::new(bcode_session_models::ToolContributionEvent {
+                    invocation_id: call.to_owned(),
+                    contribution_id: format!("{placement:?}"),
+                    sequence: 1,
+                    producer_id: "test.plugin".to_owned(),
+                    schema: "test.visual".to_owned(),
+                    schema_version: 1,
+                    operation: bcode_session_models::ToolContributionOperation::Upsert,
+                    persistence: bcode_session_models::ToolContributionPersistence::Durable,
+                    artifact: None,
+                    payload: serde_json::Value::Null,
+                }),
+                placement,
+                invocation: None,
+            },
+        )
+    }
+
+    #[test]
+    fn contributions_attach_to_their_calls_without_counting_or_splitting_groups() {
+        use MemberRendering::{Full, HeaderRow, Nothing};
+        use bcode_session_models::ToolContributionPlacement::{Hidden, Supplemental};
+        let mut state = state(
+            "[[rules]]\nmatch = { kind = \"tool\" }\nset = { group = { by = \"consecutive\" } }\n\
+             [[rules]]\nmatch = { kind = \"group\" }\nset = { disclosure = \"summary\" }",
+        );
+        let items = vec![
+            tool("a", "read", false),
+            contribution("a", Supplemental),
+            contribution("a", Hidden),
+            tool("b", "read", false),
+            contribution("b", Supplemental),
+            TranscriptItem::new("Assistant", "done".to_owned()),
+        ];
+        sync(&mut state, &items);
+        let snapshot = state.snapshot();
+        let leader = items[0].id().get();
+        let view = snapshot.group_view(leader).expect("one group");
+        let id = |index: usize| items[index].id().get();
+        assert_eq!(view.members, [id(0), id(3)]);
+        assert_eq!(view.tools, [("read".to_owned(), 2)]);
+        assert_eq!(view.attached, [id(1), id(2), id(4)]);
+        assert_eq!(
+            view.facts.items,
+            bcode_presentation_policy::models::SizeBucket::of(2)
+        );
+        assert_eq!(snapshot.group_of(id(5)), None);
+        for index in [1, 2, 4] {
+            assert_eq!(
+                snapshot
+                    .group_placement(id(index))
+                    .map(|placement| placement.role),
+                Some(GroupRole::Attached)
+            );
+        }
+        assert_eq!(
+            snapshot
+                .group_placement(id(4))
+                .and_then(|placement| placement.attached_to),
+            Some(id(3))
+        );
+        assert_eq!(
+            snapshot
+                .group_items(leader)
+                .into_iter()
+                .map(|(id, _)| id)
+                .collect::<Vec<_>>(),
+            [id(0), id(1), id(2), id(3), id(4)]
+        );
+
+        // Summarized: one header row per call; contributions render with it.
+        assert_eq!(
+            renderings(&state, &items),
+            [
+                Some(HeaderRow),
+                Some(Nothing),
+                Some(Nothing),
+                Some(HeaderRow),
+                Some(Nothing),
+                None
+            ]
+        );
+        // Opening call `a` shows its contributions; `b`'s stay folded.
+        let member = DisclosureTarget::Unit(id(0));
+        assert!(state.set_target(
+            &member,
+            Disclosure::Expanded,
+            &unit_facts(&items[0]).unwrap()
+        ));
+        sync(&mut state, &items);
+        assert_eq!(
+            renderings(&state, &items),
+            [
+                Some(Full),
+                Some(Full),
+                Some(Full),
+                Some(HeaderRow),
+                Some(Nothing),
+                None
+            ]
+        );
+        // The last row-rendering item closes the group: `b`'s header row.
+        assert!(state.snapshot().group_placement(id(3)).unwrap().closes);
+        // Expanding the group shows everything.
+        let group = DisclosureTarget::Group(leader);
+        let facts = state.snapshot().group_view(leader).unwrap().facts.clone();
+        assert!(state.set_target(&group, Disclosure::Expanded, &facts));
+        sync(&mut state, &items);
+        assert_eq!(renderings(&state, &items)[..5], [Some(Full); 5]);
+        assert!(state.snapshot().group_placement(id(4)).unwrap().closes);
+    }
+
+    #[test]
+    fn contributions_alone_never_form_groups_but_primary_presentations_are_calls() {
+        use bcode_session_models::ToolContributionPlacement::{Result, Supplemental};
+        let mut state = state(GROUP_READS);
+        let lone = vec![
+            tool("a", "read", false),
+            contribution("a", Supplemental),
+            contribution("x", Supplemental),
+        ];
+        sync(&mut state, &lone);
+        assert!(state.snapshot().groups.is_empty());
+
+        // A primary-slot presentation is how a plugin-presented call renders,
+        // so it is a member.
+        let items = vec![tool("a", "read", false), contribution("b", Result)];
+        sync(&mut state, &items);
+        let snapshot = state.snapshot();
+        let view = snapshot.group_view(items[0].id().get()).expect("group");
+        assert_eq!(view.members.len(), 2);
+        assert_eq!(view.attached, [] as [u64; 0]);
     }
 
     #[test]

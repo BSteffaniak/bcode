@@ -18,6 +18,16 @@ pub const FOCUS_SCOPE: &str = "transcript_focus";
 pub const FOCUS_UNITS_ACTION: &str = "tui.transcript.focusUnits";
 /// Default binding of [`FOCUS_UNITS_ACTION`].
 pub const FOCUS_UNITS_DEFAULT_KEY: &str = "alt+u";
+/// Action that cycles disclosure collapsed → summary → expanded: the focused
+/// target in focus mode, every unit and group otherwise.
+pub const CYCLE_DETAIL_ACTION: &str = "tui.transcript.cycleDetail";
+/// Chat-scope default binding of [`CYCLE_DETAIL_ACTION`] (outside focus mode).
+pub const CYCLE_DETAIL_DEFAULT_KEY: &str = "alt+d";
+/// Action that makes the focused tool unit's disclosure the default for its
+/// tool.
+pub const MAKE_DEFAULT_ACTION: &str = "tui.transcript.makeDefault";
+/// Action that toggles the structure inspector for the focused target.
+pub const INSPECT_ACTION: &str = "tui.transcript.inspect";
 /// Maximum transcript entries visited by one traversal step.
 const MAX_SCAN_ENTRIES: usize = 4096;
 /// Maximum anchors of one entry inspected when enumerating its targets.
@@ -38,19 +48,34 @@ pub enum FocusAction {
     Collapse,
     /// Expand everything under the focused target.
     ExpandAll,
-    /// Leave focus mode.
+    /// Cycle the focused target collapsed → summary → expanded.
+    CycleDetail,
+    /// Toggle the structure inspector for the focused target.
+    Inspect,
+    /// Scroll the open inspector down.
+    InspectorScrollDown,
+    /// Scroll the open inspector up.
+    InspectorScrollUp,
+    /// Make the focused tool unit's disclosure the default for its tool.
+    MakeDefault,
+    /// Leave focus mode (closing an open inspector first).
     Exit,
 }
 
 impl FocusAction {
     /// Every focus action, in help order.
-    pub const ALL: [Self; 7] = [
+    pub const ALL: [Self; 12] = [
         Self::Next,
         Self::Previous,
         Self::Toggle,
         Self::Expand,
         Self::Collapse,
         Self::ExpandAll,
+        Self::CycleDetail,
+        Self::Inspect,
+        Self::InspectorScrollDown,
+        Self::InspectorScrollUp,
+        Self::MakeDefault,
         Self::Exit,
     ];
 
@@ -64,6 +89,11 @@ impl FocusAction {
             Self::Expand => "tui.transcriptFocus.expand",
             Self::Collapse => "tui.transcriptFocus.collapse",
             Self::ExpandAll => "tui.transcriptFocus.expandAll",
+            Self::CycleDetail => CYCLE_DETAIL_ACTION,
+            Self::Inspect => INSPECT_ACTION,
+            Self::InspectorScrollDown => "tui.transcriptFocus.inspectorScrollDown",
+            Self::InspectorScrollUp => "tui.transcriptFocus.inspectorScrollUp",
+            Self::MakeDefault => MAKE_DEFAULT_ACTION,
             Self::Exit => "tui.transcriptFocus.exit",
         }
     }
@@ -78,7 +108,12 @@ impl FocusAction {
             Self::Expand => "Expand focused target one level",
             Self::Collapse => "Collapse focused target one level or focus its parent",
             Self::ExpandAll => "Expand everything under the focused target",
-            Self::Exit => "Leave transcript focus",
+            Self::CycleDetail => "Cycle focused target collapsed, summary, expanded",
+            Self::Inspect => "Inspect how the focused target's presentation resolved",
+            Self::InspectorScrollDown => "Scroll the inspector down",
+            Self::InspectorScrollUp => "Scroll the inspector up",
+            Self::MakeDefault => "Make the focused tool's disclosure its default",
+            Self::Exit => "Close the inspector, or leave transcript focus",
         }
     }
 
@@ -92,6 +127,11 @@ impl FocusAction {
             Self::Expand => &["l", "right"],
             Self::Collapse => &["h", "left"],
             Self::ExpandAll => &["e"],
+            Self::CycleDetail => &["d"],
+            Self::Inspect => &["i"],
+            Self::InspectorScrollDown => &["shift+down", "ctrl+e"],
+            Self::InspectorScrollUp => &["shift+up", "ctrl+y"],
+            Self::MakeDefault => &["m"],
             Self::Exit => &["escape"],
         }
     }
@@ -307,6 +347,18 @@ pub const fn collapse_level(target: &DisclosureTarget, current: Disclosure) -> O
         (_, Disclosure::Collapsed | Disclosure::Hidden) => None,
         (DisclosureTarget::Group(_), Disclosure::Expanded) => Some(Disclosure::Summary),
         _ => Some(Disclosure::Collapsed),
+    }
+}
+
+/// Next disclosure in the detail cycle collapsed → summary → expanded →
+/// collapsed. Hidden targets enter the cycle at summary, so cycling always
+/// reveals something first.
+#[must_use]
+pub const fn next_detail(current: Disclosure) -> Disclosure {
+    match current {
+        Disclosure::Collapsed | Disclosure::Hidden => Disclosure::Summary,
+        Disclosure::Summary => Disclosure::Expanded,
+        Disclosure::Expanded => Disclosure::Collapsed,
     }
 }
 
@@ -636,6 +688,14 @@ pub mod tests {
             assert_eq!(collapse_level(&target, Disclosure::Collapsed), None);
             assert_eq!(collapse_level(&target, Disclosure::Hidden), None);
         }
+    }
+
+    #[test]
+    fn detail_cycles_collapsed_summary_expanded_and_reveals_hidden_first() {
+        assert_eq!(next_detail(Disclosure::Collapsed), Disclosure::Summary);
+        assert_eq!(next_detail(Disclosure::Summary), Disclosure::Expanded);
+        assert_eq!(next_detail(Disclosure::Expanded), Disclosure::Collapsed);
+        assert_eq!(next_detail(Disclosure::Hidden), Disclosure::Summary);
     }
 
     #[test]

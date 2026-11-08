@@ -158,6 +158,7 @@ pub struct TranscriptItem {
     display_label: Option<String>,
     event_sequence: Option<u64>,
     timestamp_ms: Option<u64>,
+    producer_plugin_id: Option<String>,
     kind: TranscriptItemKind,
 }
 
@@ -211,6 +212,7 @@ impl TranscriptItem {
             display_label: None,
             event_sequence: None,
             timestamp_ms: None,
+            producer_plugin_id: None,
             kind,
         }
     }
@@ -234,6 +236,31 @@ impl TranscriptItem {
     #[must_use]
     pub fn display_label(&self) -> Option<&str> {
         self.display_label.as_deref()
+    }
+
+    /// Return a copy attributed to the plugin that produced it (see
+    /// [`Self::producer_plugin_id`]).
+    #[must_use]
+    pub fn with_producer_plugin_id(mut self, producer_plugin_id: Option<&str>) -> Self {
+        self.producer_plugin_id = producer_plugin_id.map(ToOwned::to_owned);
+        self
+    }
+
+    /// Plugin that produced this item, when known.
+    ///
+    /// Tool requests and request drafts carry their producer in their kind; tool results and
+    /// permission requests adapted from shared session state are attributed from the owning
+    /// invocation or permission request. Items built locally without that context return
+    /// `None`.
+    #[must_use]
+    pub fn producer_plugin_id(&self) -> Option<&str> {
+        match &self.kind {
+            TranscriptItemKind::ToolRequest {
+                producer_plugin_id, ..
+            } => producer_plugin_id.as_deref(),
+            TranscriptItemKind::ToolRequestDraft { draft } => draft.producer_plugin_id.as_deref(),
+            _ => self.producer_plugin_id.as_deref(),
+        }
     }
 
     /// Return the rendered role, including a generic origin label when present.
@@ -335,6 +362,7 @@ impl TranscriptItem {
         self.display_label = replacement.display_label;
         self.event_sequence = replacement.event_sequence;
         self.timestamp_ms = replacement.timestamp_ms;
+        self.producer_plugin_id = replacement.producer_plugin_id;
         self.kind = replacement.kind;
         self.bump_revision();
         true
@@ -1024,7 +1052,8 @@ fn terminal_tool_item_from_shared(tool: &ToolInvocationView) -> TranscriptItem {
                 tool.arguments_json.as_deref(),
                 &artifact.artifact,
                 tool.is_error.unwrap_or(false),
-            ),
+            )
+            .with_producer_plugin_id(tool.producer_plugin_id.as_deref()),
             tool,
         );
     }
@@ -1036,7 +1065,8 @@ fn terminal_tool_item_from_shared(tool: &ToolInvocationView) -> TranscriptItem {
                 tool.arguments_json.as_deref(),
                 &result,
                 tool.is_error.unwrap_or(false),
-            ),
+            )
+            .with_producer_plugin_id(tool.producer_plugin_id.as_deref()),
             tool,
         );
     }
@@ -1110,6 +1140,7 @@ fn terminal_permission_item_from_shared(
         permission.policy_source.as_deref(),
         permission.detail.as_deref(),
     )
+    .with_producer_plugin_id(permission.producer_plugin_id.as_deref())
 }
 
 #[must_use]
@@ -1338,6 +1369,65 @@ mod tests {
         assert!(fallback.contains("request · 18 bytes · truncated"));
         assert!(!fallback.contains(preview));
         assert!(!fallback.contains("secret"));
+    }
+
+    #[test]
+    fn shared_tool_results_and_permissions_carry_their_producer() {
+        let tool = |producer: Option<&str>| ToolInvocationView {
+            tool_call_id: "call-1".to_owned(),
+            producer_plugin_id: producer.map(ToOwned::to_owned),
+            tool_name: Some("filesystem.read".to_owned()),
+            arguments_json: Some("{}".to_owned()),
+            working_directory: None,
+            request_draft: None,
+            status: ToolInvocationViewStatus::Finished,
+            result_text: Some("contents".to_owned()),
+            is_error: Some(false),
+            result: None,
+            presentation: None,
+            timing: bcode_session_view_models::ToolTimingView::default(),
+        };
+        let result = terminal_tool_item_from_shared(&tool(Some("bcode.filesystem")));
+        assert!(matches!(
+            result.kind(),
+            TranscriptItemKind::ToolResult { .. }
+        ));
+        assert_eq!(result.producer_plugin_id(), Some("bcode.filesystem"));
+        assert_eq!(
+            terminal_tool_item_from_shared(&tool(None)).producer_plugin_id(),
+            None
+        );
+
+        let permission = bcode_session_view_models::PermissionView {
+            permission_id: "permission-1".to_owned(),
+            session_id: None,
+            tool_call_id: "call-1".to_owned(),
+            tool_name: "filesystem.write".to_owned(),
+            producer_plugin_id: Some("bcode.filesystem".to_owned()),
+            arguments_json: "{}".to_owned(),
+            batch: None,
+            agent_id: String::new(),
+            title: None,
+            policy_source: None,
+            detail: None,
+            resolved: false,
+            approved: None,
+            can_remember: false,
+        };
+        let request = terminal_permission_item_from_shared(&permission);
+        assert!(matches!(
+            request.kind(),
+            TranscriptItemKind::PermissionRequest { .. }
+        ));
+        assert_eq!(request.producer_plugin_id(), Some("bcode.filesystem"));
+
+        // Replacing from shared state keeps attribution current.
+        let mut replaced = terminal_tool_item_from_shared(&tool(None));
+        replaced.source_view_revision = Some(0);
+        let mut replacement = terminal_tool_item_from_shared(&tool(Some("bcode.filesystem")));
+        replacement.source_view_revision = Some(1);
+        assert!(replaced.replace_from_shared(replacement));
+        assert_eq!(replaced.producer_plugin_id(), Some("bcode.filesystem"));
     }
 
     #[test]

@@ -363,6 +363,7 @@ mod tests {
             session_id: Some(SessionId(Uuid::nil())),
             tool_call_id: "call-actions".to_owned(),
             tool_name: "shell.run".to_owned(),
+            producer_plugin_id: None,
             arguments_json: r#"{"command":"cargo check"}"#.to_owned(),
             batch: Some(PermissionBatchView {
                 batch_id: "batch-actions".to_owned(),
@@ -416,6 +417,7 @@ mod tests {
             session_id: Some(SessionId(Uuid::nil())),
             tool_call_id: "call-1".to_owned(),
             tool_name: "shell.run".to_owned(),
+            producer_plugin_id: None,
             arguments_json: r#"{"command":"cargo check --workspace","cwd":"/repo"}"#.to_owned(),
             batch: None,
             agent_id: "build".to_owned(),
@@ -450,6 +452,7 @@ mod tests {
             session_id: Some(SessionId(Uuid::nil())),
             tool_call_id: "call-2".to_owned(),
             tool_name: "shell.run".to_owned(),
+            producer_plugin_id: None,
             arguments_json: r#"{"command":"cargo check"}"#.to_owned(),
             batch: Some(PermissionBatchView {
                 batch_id: "batch-1".to_owned(),

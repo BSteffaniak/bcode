@@ -219,7 +219,7 @@ Set the environment variable to the actual Cargo artifact for other target direc
 
 | Stable ID | Source | Classification | Required handling |
 | --- | --- | --- | --- |
-| `tui.theme.selection` | theme picker, `/theme` | Frontend user state | Persist only through TUI state APIs in `tui.toml`; never mutate `bcode.toml`; no application/CLI parity requirement. |
+| `tui.theme.selection` | appearance picker, `/theme` | Frontend user state | Persist only through TUI state APIs in `tui.toml`; never mutate `bcode.toml`; no application/CLI parity requirement. |
 | `tui.streaming.presentation` | streaming configurator, `/streaming` | Frontend user state | Persist only the TUI presentation override; no canonical session or cross-frontend meaning. |
 | `frontend.draft.edit` | composer editing and `UpdateDraft` | Frontend local unless using the existing explicit draft persistence path | Renderer owns edit mechanics; explicit draft persistence remains a narrowly scoped session-view action. |
 | `frontend.session.switch` | `SwitchSession`, picker/navigation | Frontend local navigation plus shared attach/open | The renderer chooses a session; canonical hydration uses shared attach/projection APIs. |

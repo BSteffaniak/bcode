@@ -1,7 +1,9 @@
 //! Reusable Bcode transcript container composition.
 
-use bmux_tui::prelude::{Line, Span, Style};
-use bmux_tui::text_width::display_width;
+use bmux_tui::chrome::{Border, BorderSet, BorderSides};
+use bmux_tui::geometry::Insets;
+use bmux_tui::line_frame::{LineFrame, LineFrameGeometry, LineFrameOverflow, LineFrameWidth};
+use bmux_tui::prelude::{Line, Style};
 
 /// Supported Bcode transcript container layout families.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash)]
@@ -59,6 +61,45 @@ pub struct TranscriptContainerStyle {
     pub recipe: TranscriptContainerRecipe,
     /// Container background and border style.
     pub style: Style,
+    /// Border glyphs for bordered recipes.
+    pub border_set: BorderSet,
+}
+
+impl TranscriptContainerStyle {
+    /// Return the BMUX line frame for this style, or `None` for plain recipes.
+    #[must_use]
+    pub const fn line_frame(self) -> Option<LineFrame> {
+        if matches!(self.recipe.layout, TranscriptContainerLayout::Plain) {
+            return None;
+        }
+        let padding_x = self.recipe.padding_x;
+        let padding_y = self.recipe.padding_y;
+        let frame = LineFrame::new()
+            .padding(Insets::new(padding_y, padding_x, padding_y, padding_x))
+            .fill(self.style)
+            .width(match self.recipe.width {
+                TranscriptContainerWidth::Content => LineFrameWidth::Content,
+                TranscriptContainerWidth::Full => LineFrameWidth::Full,
+            })
+            .overflow(LineFrameOverflow::Ellipsis);
+        let sides = match self.recipe.border {
+            TranscriptContainerBorder::None => return Some(frame),
+            TranscriptContainerBorder::Left => BorderSides::LEFT,
+            TranscriptContainerBorder::All => BorderSides::ALL,
+        };
+        Some(frame.border(Border::new(self.border_set, self.style).sides(sides)))
+    }
+
+    /// Resolve the full-width geometry producers lay out against.
+    ///
+    /// Content width, content column, and border/padding rows all come from
+    /// the same frame that [`apply_transcript_container`] paints with.
+    #[must_use]
+    pub fn geometry(self, width: u16) -> Option<LineFrameGeometry> {
+        let available = usize::from(width.max(1));
+        self.line_frame()
+            .map(|frame| frame.geometry(available, available))
+    }
 }
 
 /// Compose one transcript entry through its bounded Bcode container recipe.
@@ -66,153 +107,30 @@ pub struct TranscriptContainerStyle {
 /// The caller retains ownership of transcript semantics and supplies only the
 /// already-rendered entry rows plus resolved presentation.
 ///
-/// Decoration preserves the producer's row count. Residual overflow is clipped,
-/// never reflowed: producers must lay out text at the resolved content width.
+/// Decoration preserves the producer's row count. Residual overflow is
+/// truncated, never reflowed: producers must lay out text at the resolved
+/// content width.
 pub fn apply_transcript_container(
     rows: &mut Vec<Line>,
     start: usize,
     presentation: TranscriptContainerStyle,
     width: u16,
 ) {
-    if matches!(presentation.recipe.layout, TranscriptContainerLayout::Plain) || start >= rows.len()
-    {
+    let Some(frame) = presentation.line_frame() else {
+        return;
+    };
+    if start >= rows.len() {
         return;
     }
-
-    let available_width = usize::from(width.max(1));
-    let left_border_width = usize::from(!matches!(
-        presentation.recipe.border,
-        TranscriptContainerBorder::None
-    ));
-    let right_border_width = usize::from(matches!(
-        presentation.recipe.border,
-        TranscriptContainerBorder::All
-    ));
-    let horizontal_padding = usize::from(presentation.recipe.padding_x);
-    let natural_width = rows[start..]
-        .iter()
-        .map(line_width)
-        .max()
-        .unwrap_or_default()
-        .saturating_add(horizontal_padding.saturating_mul(2))
-        .saturating_add(left_border_width)
-        .saturating_add(right_border_width)
-        .max(1);
-    let container_width = match presentation.recipe.width {
-        TranscriptContainerWidth::Full => available_width,
-        TranscriptContainerWidth::Content => natural_width.min(available_width),
-    };
-    let interior_width = container_width
-        .saturating_sub(left_border_width)
-        .saturating_sub(right_border_width);
-    let left_padding_width = horizontal_padding.min(interior_width);
-    let content_width = interior_width
-        .saturating_sub(left_padding_width)
-        .saturating_sub(horizontal_padding.min(interior_width - left_padding_width));
-
-    let mut container_rows = Vec::new();
-    if matches!(presentation.recipe.border, TranscriptContainerBorder::All) {
-        container_rows.push(container_border_line(
-            container_width,
-            '┌',
-            '─',
-            '┐',
-            presentation.style,
-        ));
-    }
-    let vertical_padding = usize::from(presentation.recipe.padding_y);
-    for _ in 0..vertical_padding {
-        container_rows.push(container_content_line(
-            &Line::new(),
-            content_width,
-            left_padding_width,
-            interior_width,
-            presentation,
-        ));
-    }
-    for line in rows.drain(start..) {
-        container_rows.push(container_content_line(
-            &line,
-            content_width,
-            left_padding_width,
-            interior_width,
-            presentation,
-        ));
-    }
-    for _ in 0..vertical_padding {
-        container_rows.push(container_content_line(
-            &Line::new(),
-            content_width,
-            left_padding_width,
-            interior_width,
-            presentation,
-        ));
-    }
-    if matches!(presentation.recipe.border, TranscriptContainerBorder::All) {
-        container_rows.push(container_border_line(
-            container_width,
-            '└',
-            '─',
-            '┘',
-            presentation.style,
-        ));
-    }
-    rows.extend(container_rows);
-}
-
-fn container_content_line(
-    line: &Line,
-    content_width: usize,
-    left_padding_width: usize,
-    interior_width: usize,
-    presentation: TranscriptContainerStyle,
-) -> Line {
-    let mut spans = Vec::new();
-    if !matches!(presentation.recipe.border, TranscriptContainerBorder::None) {
-        spans.push(Span::styled("│", presentation.style));
-    }
-    spans.push(Span::styled(
-        " ".repeat(left_padding_width),
-        presentation.style,
-    ));
-    let line = line
-        .with_fallback_style(presentation.style)
-        .truncate(content_width);
-    let used_width = line_width(&line);
-    spans.extend(line.spans);
-    spans.push(Span::styled(
-        " ".repeat(
-            interior_width
-                .saturating_sub(left_padding_width)
-                .saturating_sub(used_width),
-        ),
-        presentation.style,
-    ));
-    if matches!(presentation.recipe.border, TranscriptContainerBorder::All) {
-        spans.push(Span::styled("│", presentation.style));
-    }
-    Line::from_spans(spans)
-}
-
-fn container_border_line(width: usize, left: char, fill: char, right: char, style: Style) -> Line {
-    let text = match width {
-        0 => String::new(),
-        1 => left.to_string(),
-        _ => format!("{left}{}{right}", fill.to_string().repeat(width - 2)),
-    };
-    Line::from_spans(vec![Span::styled(text, style)])
-}
-
-fn line_width(line: &Line) -> usize {
-    line.spans
-        .iter()
-        .map(|span| display_width(&span.content))
-        .sum()
+    let framed = frame.frame(&rows[start..], usize::from(width.max(1)));
+    rows.truncate(start);
+    rows.extend(framed.lines);
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use bmux_tui::prelude::Span;
     use bmux_tui::style::Color;
 
     #[test]
@@ -230,12 +148,13 @@ mod tests {
                     padding_y: 0,
                 },
                 style: Style::new().bg(Color::Blue),
+                border_set: BorderSet::SINGLE,
             },
             8,
         );
 
         assert_eq!(rows.len(), 3);
-        assert!(rows.iter().all(|line| line_width(line) <= 8));
+        assert!(rows.iter().all(|line| line.width() <= 8));
         assert_eq!(
             rows.first().map(Line::plain_text).as_deref(),
             Some("┌──────┐")
@@ -263,6 +182,7 @@ mod tests {
                     padding_y: 0,
                 },
                 style: container_style,
+                border_set: BorderSet::SINGLE,
             },
             20,
         );
@@ -288,6 +208,7 @@ mod tests {
                     padding_y: 0,
                 },
                 style: Style::new(),
+                border_set: BorderSet::SINGLE,
             },
             20,
         );

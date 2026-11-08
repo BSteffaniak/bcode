@@ -6,6 +6,8 @@ use bcode_presentation_policy::models::ResolvedPresentation;
 use std::cell::{Cell, RefCell};
 use std::collections::BTreeMap;
 
+#[cfg(test)]
+mod chrome_effects_tests;
 mod group_header;
 mod unit_frame;
 
@@ -17,6 +19,8 @@ thread_local! {
     static MARKDOWN_DETAILS_OPEN: RefCell<BTreeMap<String, bool>> = const { RefCell::new(BTreeMap::new()) };
     static PLUGIN_VISUAL_THEME: Cell<Option<bcode_plugin_sdk::tui::PluginTuiTheme>> = const { Cell::new(None) };
     static TRANSCRIPT_THEME: Cell<Option<super::theme::PresentedTheme>> = const { Cell::new(None) };
+    static FOCUS_PHASE: Cell<u16> = const { Cell::new(0) };
+    static FOCUS_GRADIENT_PAINTED: Cell<bool> = const { Cell::new(false) };
     static STRUCTURE: RefCell<super::structure::StructureSnapshot> = RefCell::new(super::structure::StructureSnapshot::default());
 }
 
@@ -130,14 +134,11 @@ pub fn structure_signature(item: &TranscriptItem) -> String {
         presentation.spacing.after,
         presentation.indent,
     );
+    // Every section override of the item, host or plugin-namespaced, so a
+    // toggle of any section the composer anchors re-lays out this item.
     STRUCTURE.with(|state| {
-        let state = state.borrow();
-        for name in bcode_presentation_policy::models::HOST_SECTIONS {
-            let target =
-                super::structure::DisclosureTarget::Section(item.id().get(), name.to_owned());
-            if let Some(disclosure) = state.target_override(&target) {
-                let _ = write!(signature, ":{name}={disclosure:?}");
-            }
+        for (name, disclosure) in state.borrow().section_overrides(item.id().get()) {
+            let _ = write!(signature, ":{name}={disclosure:?}");
         }
     });
     signature
@@ -246,13 +247,53 @@ fn semantic_theme() -> bcode_plugin_sdk::tui::PluginTuiTheme {
 /// Border glyphs and focus effects from the active theme, for bordered BMUX components.
 #[must_use]
 pub fn component_chrome() -> bmux_tui_components::theme::ComponentChrome {
-    semantic_state_theme().component_theme().chrome
+    with_focus_phase(semantic_state_theme().component_theme().chrome)
 }
 
 /// Border glyphs and focus effects from the active theme, for dialogs and modals.
 #[must_use]
 pub fn dialog_chrome() -> bmux_tui_components::theme::ComponentChrome {
-    semantic_state_theme().dialog_chrome
+    with_focus_phase(semantic_state_theme().dialog_chrome)
+}
+
+/// Synchronize the focus gradient phase that bordered components paint with.
+pub fn set_focus_phase(phase: u16) {
+    FOCUS_PHASE.with(|state| state.set(phase));
+}
+
+/// Start a frame: synchronize the focus `phase` for every painter (including
+/// foregrounds that own the whole canvas) and, on a `full` repaint, forget
+/// whether a focus gradient was painted, since everything visible repaints.
+/// Partial frames keep the previous answer because their overlays stay on
+/// screen unrepainted.
+pub fn begin_focus_frame(phase: u16, full: bool) {
+    set_focus_phase(phase);
+    if full {
+        FOCUS_GRADIENT_PAINTED.with(|state| state.set(false));
+    }
+}
+
+/// Whether chrome carrying a focus gradient was requested since the last
+/// full frame, i.e. whether a sweeping focus border can be on screen.
+#[must_use]
+pub fn focus_gradient_painted() -> bool {
+    FOCUS_GRADIENT_PAINTED.with(Cell::get)
+}
+
+/// `chrome` with its focus gradient shifted to the synchronized sweep phase.
+fn with_focus_phase(
+    mut chrome: bmux_tui_components::theme::ComponentChrome,
+) -> bmux_tui_components::theme::ComponentChrome {
+    if chrome.focus_gradient.is_some() {
+        FOCUS_GRADIENT_PAINTED.with(|state| state.set(true));
+    }
+    let phase = FOCUS_PHASE.with(Cell::get);
+    if phase != 0 {
+        chrome.focus_gradient = chrome
+            .focus_gradient
+            .map(|gradient| gradient.with_phase(phase));
+    }
+    chrome
 }
 
 pub fn semantic_state_theme() -> super::theme::PresentedTheme {
@@ -280,6 +321,8 @@ pub struct TranscriptItemLayout {
     container: Option<super::theme::ContainerPresentation>,
     /// Frame glyphs for a fully bordered tool container (chrome tool border).
     frame: Option<bmux_tui::chrome::BorderSet>,
+    /// Columns the message speaker (bar or gutter) occupies left of the body.
+    speaker_x: u16,
 }
 
 impl TranscriptItemLayout {
@@ -309,71 +352,46 @@ impl TranscriptItemLayout {
                 bottom_rows: 0,
                 container: None,
                 frame: None,
+                speaker_x: unit_frame::speaker_layout(theme.unit_chrome, item, outer_width).prefix,
             };
         };
-        let metrics = container_metrics(presentation.recipe, usize::from(outer_width));
-        let border_rows = usize::from(matches!(
+        let frame = (matches!(
             presentation.recipe.border,
             super::theme::definition::ContainerBorder::All
-        ));
-        let padding_rows = usize::from(presentation.recipe.padding_y);
-        let frame = (border_rows == 1 && is_tool_kind(item))
-            .then(|| theme.unit_chrome.tool_border_set())
-            .flatten();
+        ) && is_tool_kind(item))
+        .then(|| theme.unit_chrome.tool_border_set())
+        .flatten();
+        let geometry = presentation
+            .transcript_style()
+            .geometry(outer_width)
+            .unwrap_or_default();
+        let content_width = u16::try_from(geometry.content_width.max(1)).unwrap_or(u16::MAX);
         Self {
             outer_width,
-            content_width: u16::try_from(metrics.content.max(1)).unwrap_or(u16::MAX),
-            content_x: u16::try_from(metrics.left_border.saturating_add(metrics.left_padding))
-                .unwrap_or(u16::MAX),
-            bottom_rows: border_rows.saturating_add(padding_rows),
+            content_width,
+            content_x: u16::try_from(geometry.content_column()).unwrap_or(u16::MAX),
+            bottom_rows: geometry.bottom_rows,
             container: Some(presentation),
             frame,
+            speaker_x: unit_frame::speaker_layout(theme.unit_chrome, item, content_width).prefix,
         }
     }
 
     fn markdown_width(self) -> u16 {
         self.content_width
+            .saturating_sub(self.speaker_x)
             .saturating_sub(MARKDOWN_BODY_INDENT)
             .max(1)
     }
 
     pub(super) const fn markdown_x(self) -> u16 {
-        self.content_x.saturating_add(MARKDOWN_BODY_INDENT)
+        self.content_x
+            .saturating_add(self.speaker_x)
+            .saturating_add(MARKDOWN_BODY_INDENT)
     }
 
     pub(super) const fn bottom_rows(self) -> usize {
         self.bottom_rows
-    }
-}
-
-#[derive(Debug, Clone, Copy)]
-struct ContainerMetrics {
-    left_border: usize,
-    left_padding: usize,
-    content: usize,
-}
-
-fn container_metrics(
-    recipe: super::theme::definition::ContainerRecipe,
-    container_width: usize,
-) -> ContainerMetrics {
-    use super::theme::definition::ContainerBorder;
-
-    let left_border = usize::from(!matches!(recipe.border, ContainerBorder::None));
-    let right_border = usize::from(matches!(recipe.border, ContainerBorder::All));
-    let interior = container_width
-        .saturating_sub(left_border)
-        .saturating_sub(right_border);
-    let horizontal_padding = usize::from(recipe.padding_x);
-    let left_padding = horizontal_padding.min(interior);
-    let right_padding = horizontal_padding.min(interior.saturating_sub(left_padding));
-    let content = interior
-        .saturating_sub(left_padding)
-        .saturating_sub(right_padding);
-    ContainerMetrics {
-        left_border,
-        left_padding,
-        content,
     }
 }
 
@@ -383,17 +401,16 @@ fn apply_container_recipe(rows: &mut Vec<Line>, start: usize, layout: Transcript
     };
     // Entry producers already wrap to the resolved content width, so the
     // container only clamps residual overflow and must not reflow their rows.
+    let mut style = presentation.transcript_style();
+    if let Some(set) = layout.frame {
+        style.border_set = set;
+    }
     bcode_tui_components::transcript::apply_transcript_container(
         rows,
         start,
-        presentation.transcript_style(),
+        style,
         layout.outer_width,
     );
-    if let Some(set) = layout.frame
-        && let Some(container_rows) = rows.get_mut(start..)
-    {
-        super::theme::chrome::redraw_frame(container_rows, set);
-    }
 }
 
 fn transcript_item_container(
@@ -586,7 +603,6 @@ use bmux_tui::text_width::{display_width as text_display_width, truncate_to_disp
 static SPINNER: std::sync::LazyLock<bmux_tui_components::spinner::Spinner> =
     std::sync::LazyLock::new(bmux_tui_components::spinner::Spinner::braille);
 const MAX_COMPOSER_ROWS: u16 = 6;
-const LATEST_BAR_ACTIVE_WINDOW: Duration = Duration::from_millis(420);
 #[derive(Debug, Clone, Copy)]
 pub struct TuiTheme {
     pub text: Style,
@@ -868,6 +884,7 @@ pub fn render_prepared_damage(
         return;
     }
 
+    set_focus_phase(app.focus_phase());
     let theme = TuiTheme::for_app(app);
     paint_child_monitor(app, frame, layout, &intersects);
     if intersects(layout.header) {
@@ -1718,6 +1735,7 @@ fn render_latest_bar(app: &BmuxApp, area: Rect, frame: &mut PaintCx<'_, '_>, now
         app.latest_hidden_activity_at(),
         app.latest_hidden_activity_burst(),
         app.latest_bar_animation_started_at(),
+        app.motion_policy().latest_bar_window(),
         now,
     );
     frame.fill(
@@ -1738,11 +1756,12 @@ fn latest_bar_line(
     latest_hidden_activity_at: Option<Instant>,
     latest_hidden_activity_burst: u8,
     animation_started_at: Instant,
+    active_window: Duration,
     now: Instant,
 ) -> Line {
     let active_age = latest_hidden_activity_at.and_then(|at| {
         let age = now.saturating_duration_since(at);
-        (age < LATEST_BAR_ACTIVE_WINDOW).then_some(age)
+        (age < active_window).then_some(age)
     });
     active_age.map_or_else(
         || stale_latest_bar_line(width, key_label),
@@ -1750,7 +1769,7 @@ fn latest_bar_line(
             active_latest_bar_line(
                 width,
                 key_label,
-                latest_bar_effective_burst(latest_hidden_activity_burst, active_age),
+                latest_bar_effective_burst(latest_hidden_activity_burst, active_age, active_window),
                 animation_started_at,
                 now,
             )
@@ -1758,9 +1777,9 @@ fn latest_bar_line(
     )
 }
 
-fn latest_bar_effective_burst(burst: u8, active_age: Duration) -> u8 {
+fn latest_bar_effective_burst(burst: u8, active_age: Duration, active_window: Duration) -> u8 {
     let age_ms = active_age.as_millis();
-    let window_ms = LATEST_BAR_ACTIVE_WINDOW.as_millis().max(1);
+    let window_ms = active_window.as_millis().max(1);
     let remaining = window_ms.saturating_sub(age_ms);
     let scaled = (u128::from(burst) * remaining).div_ceil(window_ms);
     u8::try_from(scaled.clamp(1, 8)).unwrap_or(1)
@@ -2269,10 +2288,13 @@ pub struct MarkdownRichRegion {
 /// Register hit regions for the disclosure anchors of visible tool items.
 ///
 /// Regions come from the `disclosure:` anchors retained with each entry's
-/// layout rows (the header's first row and each collapsible section label),
-/// cover the item's content width, and are clipped to the transcript area,
-/// so collapsed, scrolled, or resized items never leave stale targets.
+/// layout rows (the group header, the unit header's first row, and each
+/// collapsible section label, host or plugin-namespaced) — the same anchors
+/// keyboard focus walks — cover the item's content width, and are clipped to
+/// the transcript area, so collapsed, scrolled, or resized items never leave
+/// stale targets.
 fn render_transcript_disclosure_hits(app: &BmuxApp, area: Rect, frame: &mut PaintCx<'_, '_>) {
+    use super::transcript_layout::VisibleTranscriptSource;
     let layout = app.transcript_layout();
     let theme = app.presented_theme();
     let regions = disclosure_hit_regions(
@@ -2280,12 +2302,12 @@ fn render_transcript_disclosure_hits(app: &BmuxApp, area: Rect, frame: &mut Pain
             .into_iter()
             .filter_map(|index| Some((index, app.transcript().get(index)?))),
         |index| {
-            layout.entry_start_row(
-                super::transcript_layout::VisibleTranscriptSource::Transcript,
-                index,
-            )
+            Some((
+                layout.entry_start_row(VisibleTranscriptSource::Transcript, index)?,
+                layout.entry_row_count(VisibleTranscriptSource::Transcript, index)?,
+            ))
         },
-        |index, key| layout.content_anchor_row(index, key),
+        |index| layout.content_anchors(index),
         &theme,
         area,
         app.transcript_top_row(area.height),
@@ -2295,58 +2317,68 @@ fn render_transcript_disclosure_hits(app: &BmuxApp, area: Rect, frame: &mut Pain
     }
 }
 
+/// Maximum anchors read per entry when registering disclosure hit regions.
+const MAX_DISCLOSURE_ANCHORS_PER_ENTRY: usize = 16_384;
+
 /// Disclosure hit regions for `entries` (transcript index and item).
 ///
-/// `entry_start` maps an index to its first global row and `anchor_row`
-/// finds a retained anchor's item-relative row by key. Only the targets the
-/// tool composer can emit are looked up: the unit and each host section.
-fn disclosure_hit_regions<'a>(
+/// `entry_span` maps an index to its first global row and row count, and
+/// `anchors` yields the entry's retained `(item-relative row, key)` anchors.
+/// Every anchor that parses as a disclosure target of that item and lies on
+/// one of its painted rows inside the viewport registers a region, so plugin
+/// sections are covered without knowing their names.
+fn disclosure_hit_regions<'a, I, K>(
     entries: impl IntoIterator<Item = (usize, &'a TranscriptItem)>,
-    entry_start: impl Fn(usize) -> Option<usize>,
-    anchor_row: impl Fn(usize, &str) -> Option<usize>,
+    entry_span: impl Fn(usize) -> Option<(usize, usize)>,
+    anchors: impl Fn(usize) -> I,
     theme: &super::theme::PresentedTheme,
     area: Rect,
     top_row: usize,
-) -> Vec<HitRegion> {
+) -> Vec<HitRegion>
+where
+    I: IntoIterator<Item = (usize, K)>,
+    K: AsRef<str>,
+{
     use super::structure::DisclosureTarget;
     let mut regions = Vec::new();
     for (index, item) in entries {
-        let Some(start) = entry_start(index) else {
+        let Some((start, rows)) = entry_span(index) else {
             continue;
         };
         let layout = TranscriptItemLayout::resolve(theme, item, area.width);
         let id = item.id().get();
-        // The group header is painted outside the leader's container, so its
-        // region spans the transcript area rather than the item's content.
-        let group = DisclosureTarget::Group(id).to_hit_id();
-        if let Some(rect) = anchor_row(index, &group)
-            .and_then(|row| viewport_row(start, row, top_row, area))
-            .map(|row| Rect::new(area.x, row, area.width, 1).intersection(area))
-            .filter(|rect| !rect.is_empty())
+        for (row, key) in anchors(index)
+            .into_iter()
+            .take(MAX_DISCLOSURE_ANCHORS_PER_ENTRY)
         {
-            regions.push(HitRegion::new(group, rect).role(HitRole::Action).layer(1));
-        }
-        let targets = std::iter::once(DisclosureTarget::Unit(id)).chain(
-            bcode_presentation_policy::models::HOST_SECTIONS
-                .iter()
-                .map(|name| DisclosureTarget::Section(id, (*name).to_owned())),
-        );
-        for target in targets {
-            let key = target.to_hit_id();
-            let Some(row) =
-                anchor_row(index, &key).and_then(|row| viewport_row(start, row, top_row, area))
-            else {
+            let key = key.as_ref();
+            let Some(target) = DisclosureTarget::from_hit_id(key) else {
                 continue;
             };
-            let rect = Rect::new(
-                area.x.saturating_add(layout.content_x),
-                row,
-                layout.content_width,
-                1,
-            )
+            if target.item_id() != id || row >= rows {
+                continue;
+            }
+            let Some(y) = viewport_row(start, row, top_row, area) else {
+                continue;
+            };
+            // The group header is painted outside the leader's container, so
+            // its region spans the transcript area rather than the content.
+            let rect = match target {
+                DisclosureTarget::Group(_) => Rect::new(area.x, y, area.width, 1),
+                DisclosureTarget::Unit(_) | DisclosureTarget::Section(..) => Rect::new(
+                    area.x.saturating_add(layout.content_x),
+                    y,
+                    layout.content_width,
+                    1,
+                ),
+            }
             .intersection(area);
             if !rect.is_empty() {
-                regions.push(HitRegion::new(key, rect).role(HitRole::Action).layer(1));
+                regions.push(
+                    HitRegion::new(target.to_hit_id(), rect)
+                        .role(HitRole::Action)
+                        .layer(1),
+                );
             }
         }
     }
@@ -5360,14 +5392,10 @@ fn adapter_presentation(item: &TranscriptItem) -> Option<ResolvedPresentation> {
     let mut presentation = item_structure(item)?;
     STRUCTURE.with(|state| {
         let state = state.borrow();
-        for name in bcode_presentation_policy::models::HOST_SECTIONS {
-            let target =
-                super::structure::DisclosureTarget::Section(item.id().get(), name.to_owned());
-            if state.target_override(&target).is_some() {
-                presentation
-                    .sections
-                    .insert(name.to_owned(), state.section(item, name));
-            }
+        for (name, _) in state.section_overrides(item.id().get()) {
+            presentation
+                .sections
+                .insert(name.to_owned(), state.section(item, name));
         }
     });
     Some(presentation)
@@ -5943,6 +5971,7 @@ use bcode_tui_components::chrome::ChromeLine;
 
 fn statusline_spans(app: &BmuxApp, width: usize, theme: TuiTheme) -> Vec<Span> {
     let muted = theme.muted;
+    let separator = app.presented_theme().effects.status_separator();
     if let Some(recovery) = app.session_view_snapshot().runtime.queue_recovery() {
         let controls = if recovery.interrupted_turn_id.is_some() {
             " /queue-end-interrupted"
@@ -5953,7 +5982,7 @@ fn statusline_spans(app: &BmuxApp, width: usize, theme: TuiTheme) -> Vec<Span> {
         } else {
             ""
         };
-        return ChromeLine::new(" · ", muted)
+        return ChromeLine::new(separator, muted)
             .required(
                 format!("{}{}", recovery.reason, controls),
                 theme.error,
@@ -5961,12 +5990,12 @@ fn statusline_spans(app: &BmuxApp, width: usize, theme: TuiTheme) -> Vec<Span> {
             )
             .spans(width);
     }
-    let mut line = ChromeLine::new(" · ", muted).required(
+    let mut line = ChromeLine::new(separator, muted).required(
         activity_label(
             app.activity(),
             app.activity_elapsed(),
             app.daemon_connection(),
-            app.activity_frame(),
+            app.spinner_step(),
         ),
         theme.info,
         true,
@@ -6446,13 +6475,12 @@ mod disclosure_tests {
         let regions = |area: Rect, top_row: usize| {
             disclosure_hit_regions(
                 items.iter().enumerate(),
-                |index| starts.get(index).copied(),
-                |index, key| {
+                |index| Some((*starts.get(index)?, layouts[index].0.len())),
+                |index| {
                     layouts[index]
                         .1
                         .iter()
-                        .find(|anchor| anchor.key == key)
-                        .map(|anchor| anchor.row)
+                        .map(|anchor| (anchor.row, anchor.key.as_str()))
                 },
                 &theme,
                 area,
@@ -6791,6 +6819,223 @@ mod group_tests {
         cache
     }
 
+    const GIT_FILES: &str = "bcode.git.files";
+
+    /// Layout of `item` composed with a plugin-namespaced section of `count`
+    /// rows (wide CJK and emoji text) under the active structure.
+    fn namespaced_layout(item: &TranscriptItem, width: u16, count: usize) -> Layout {
+        let anatomy = super::super::tool_anatomy::ToolAnatomy {
+            header: super::super::tool_anatomy::HeaderData {
+                label: Some("Tool result".to_owned()),
+                tool: Some("git".to_owned()),
+                status: Some("ok".to_owned()),
+                ..super::super::tool_anatomy::HeaderData::default()
+            },
+            summary: None,
+            sections: vec![super::super::tool_anatomy::Section {
+                name: GIT_FILES.to_owned(),
+                label: Some("ファイル 📁 files".to_owned()),
+                body: super::super::tool_anatomy::SectionBody::Lines {
+                    rows: (1..=count)
+                        .map(|row| Line::from(format!("変更 {row} e\u{301}")))
+                        .collect(),
+                },
+            }],
+        };
+        let mut layout: Layout = (Vec::new(), Vec::new(), Vec::new());
+        compose_tool_rows(
+            (&mut layout.0, &mut layout.1, &mut layout.2),
+            item,
+            anatomy,
+            width,
+        );
+        layout
+    }
+
+    /// Disclosure hit regions over `layouts` laid out in `cache`.
+    fn regions_for(
+        items: &[TranscriptItem],
+        cache: &TranscriptLayoutCache,
+        area: Rect,
+        top: usize,
+    ) -> Vec<HitRegion> {
+        disclosure_hit_regions(
+            items.iter().enumerate(),
+            |index| {
+                Some((
+                    cache.entry_start_row(VisibleTranscriptSource::Transcript, index)?,
+                    cache.entry_row_count(VisibleTranscriptSource::Transcript, index)?,
+                ))
+            },
+            |index| cache.content_anchors(index),
+            &semantic_state_theme(),
+            area,
+            top,
+        )
+    }
+
+    /// Every region sits inside `area`, on the painted row holding its
+    /// anchor, in the entry of the item it targets.
+    fn assert_regions_on_painted_anchors(
+        items: &[TranscriptItem],
+        layouts: &[Layout],
+        cache: &TranscriptLayoutCache,
+        regions: &[HitRegion],
+        area: Rect,
+        top: usize,
+    ) {
+        for region in regions {
+            assert!(!region.area.is_empty());
+            assert!(region.area.x >= area.x && region.area.right() <= area.right());
+            assert!(region.area.y >= area.y && region.area.bottom() <= area.bottom());
+            let row = top + usize::from(region.area.y - area.y);
+            let line = cache.line_at_row(row).expect("region on a laid-out row");
+            let target = DisclosureTarget::from_hit_id(region.id.as_str()).unwrap();
+            assert_eq!(items[line.entry_index].id().get(), target.item_id());
+            assert!(
+                layouts[line.entry_index]
+                    .1
+                    .iter()
+                    .any(|anchor| anchor.key == region.id.as_str()
+                        && anchor.row == line.row_in_entry),
+                "region {:?} matches its painted anchor row",
+                region.id
+            );
+        }
+    }
+
+    #[test]
+    fn namespaced_sections_toggle_by_mouse_and_relayout_with_matching_hit_regions() {
+        let items: Vec<TranscriptItem> = ["a", "b"]
+            .iter()
+            .map(|call| tool_result_item(call, Some("git"), None, "", false))
+            .collect();
+        let mut state = grouped("", &items);
+        let width = 40;
+        let build = |count: usize| -> Vec<Layout> {
+            items
+                .iter()
+                .map(|item| namespaced_layout(item, width, count))
+                .collect()
+        };
+        let layouts = build(4);
+        let cache = cache_for(&layouts, width);
+        let area = Rect::new(2, 1, width, u16::try_from(cache.total_rows()).unwrap());
+        let regions = regions_for(&items, &cache, area, 0);
+        assert_regions_on_painted_anchors(&items, &layouts, &cache, &regions, area, 0);
+        let section = DisclosureTarget::Section(items[1].id().get(), GIT_FILES.to_owned());
+        let hit = regions
+            .iter()
+            .find(|region| region.id.as_str() == section.to_hit_id())
+            .expect("namespaced section registers a hit region");
+
+        // Clicking the region toggles the section it names.
+        let before = structure_signature(&items[1]);
+        let untouched = structure_signature(&items[0]);
+        let target = DisclosureTarget::from_hit_id(hit.id.as_str()).unwrap();
+        assert_eq!(target, section);
+        let current = state.snapshot().section(&items[1], GIT_FILES).disclosure;
+        let facts = crate::structure::unit_facts(&items[1]).unwrap();
+        assert_eq!(
+            state.toggle_target(&target, current, &facts),
+            Some(Disclosure::Collapsed)
+        );
+        set_structure(state.snapshot());
+        assert_ne!(
+            structure_signature(&items[1]),
+            before,
+            "toggled item re-lays out"
+        );
+        assert_eq!(
+            structure_signature(&items[0]),
+            untouched,
+            "others keep their layout"
+        );
+
+        let toggled = build(4);
+        assert_eq!(toggled[0].0.len(), layouts[0].0.len());
+        assert!(toggled[1].0.len() < layouts[1].0.len());
+        assert!(
+            text(&toggled[1].0)
+                .iter()
+                .any(|row| row.contains("▸ ファイル 📁 files · 4 rows")),
+            "{:?}",
+            text(&toggled[1].0)
+        );
+        let cache = cache_for(&toggled, width);
+        let regions = regions_for(&items, &cache, area, 0);
+        assert_regions_on_painted_anchors(&items, &toggled, &cache, &regions, area, 0);
+        assert!(
+            regions
+                .iter()
+                .any(|region| region.id.as_str() == section.to_hit_id())
+        );
+        // No region outlives the rows it was registered for.
+        assert!(
+            regions
+                .iter()
+                .all(|region| { usize::from(region.area.y - area.y) < cache.total_rows() })
+        );
+    }
+
+    #[test]
+    fn namespaced_section_hit_regions_follow_clipping_and_resize() {
+        let items: Vec<TranscriptItem> = ["a", "b", "c"]
+            .iter()
+            .map(|call| tool_result_item(call, Some("git"), None, "", false))
+            .collect();
+        let _state = grouped("", &items);
+        for width in [0_u16, 1, 2, 3, 7, 40] {
+            let layouts: Vec<Layout> = items
+                .iter()
+                .map(|item| namespaced_layout(item, width, 3))
+                .collect();
+            // The composer's own zero-width containment is its concern; hit
+            // regions are clipped to the area whatever it paints.
+            for (rows, _, _) in layouts.iter().filter(|_| width > 0) {
+                for row in rows {
+                    assert!(
+                        bmux_tui::text_width::display_width(&row.plain_text())
+                            <= usize::from(width),
+                        "{row:?} exceeds {width}"
+                    );
+                }
+            }
+            let cache = cache_for(&layouts, width);
+            let total = cache.total_rows();
+            for height in [0_u16, 1, 3] {
+                for top in 0..=total {
+                    let area = Rect::new(1, 2, width, height);
+                    let regions = regions_for(&items, &cache, area, top);
+                    assert_regions_on_painted_anchors(
+                        &items, &layouts, &cache, &regions, area, top,
+                    );
+                    if width == 0 || height == 0 {
+                        assert_eq!(regions, [], "empty areas register nothing");
+                    }
+                }
+            }
+            // Every anchored section row registers exactly once when fully
+            // in view and the width leaves room for content.
+            if width >= 7 {
+                let area = Rect::new(0, 0, width, u16::try_from(total).unwrap());
+                let regions = regions_for(&items, &cache, area, 0);
+                for item in &items {
+                    let key = DisclosureTarget::Section(item.id().get(), GIT_FILES.to_owned())
+                        .to_hit_id();
+                    assert_eq!(
+                        regions
+                            .iter()
+                            .filter(|region| region.id.as_str() == key)
+                            .count(),
+                        1,
+                        "{key} at width {width}"
+                    );
+                }
+            }
+        }
+    }
+
     #[test]
     fn zero_row_members_agree_across_scrolling_rows_and_hit_regions() {
         let mut items = tools();
@@ -6836,8 +7081,13 @@ mod group_tests {
             let area = Rect::new(1, 2, width, 2);
             let regions = disclosure_hit_regions(
                 items.iter().enumerate(),
-                start,
-                |index, key| cache.content_anchor_row(index, key),
+                |index| {
+                    Some((
+                        start(index)?,
+                        cache.entry_row_count(VisibleTranscriptSource::Transcript, index)?,
+                    ))
+                },
+                |index| cache.content_anchors(index),
                 &theme,
                 area,
                 top,

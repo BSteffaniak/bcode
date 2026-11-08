@@ -47,10 +47,14 @@ pub fn push_group_header(
         spans.push(Span::styled(format!("{marker} "), meta));
     }
     spans.push(Span::styled(text, status_style(&theme, view)));
-    rows.push(truncate_line_to_display_width(
-        &Line::from_spans(spans),
-        usize::from(width),
-    ));
+    let row = truncate_line_to_display_width(&Line::from_spans(spans), usize::from(width));
+    let raised = theme
+        .effects
+        .raised_background(theme.surfaces.raised, theme.canvas);
+    rows.push(match raised {
+        Some(raised) => crate::theme::effects::raised_row(&row, usize::from(width), raised),
+        None => row,
+    });
 }
 
 /// Leading marker (painted as a prefix) and the joined header text.

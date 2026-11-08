@@ -1,6 +1,9 @@
-display_name   = "Nord"
-extends        = ["terminal-native-structured"]
-id             = "nord"
+display_name = "Nord"
+extends      = ["terminal-native-structured"]
+id           = "nord"
+# Nord's aurora red (#bf616a) reads below 4.5:1 as error text on nord0; let
+# resolution raise failing authored roles by lightness only.
+contrast       = "enforce"
 schema_version = 1
 
 # Adapted from the Nord palette by Sven Greb, licensed under MIT.

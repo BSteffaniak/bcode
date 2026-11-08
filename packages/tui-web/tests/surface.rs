@@ -498,6 +498,7 @@ fn permission_uses_shared_decisions_and_never_activates_uncommitted_identity() {
         session_id: snapshot.session_id,
         tool_call_id: "call".into(),
         tool_name: "tool".into(),
+        producer_plugin_id: None,
         arguments_json: "{}".into(),
         batch: Some(bcode_session_view_models::PermissionBatchView {
             batch_id: "batch".into(),

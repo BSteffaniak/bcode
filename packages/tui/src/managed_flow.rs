@@ -726,7 +726,9 @@ mod tests {
             intercept_slash_outcome(
                 &mut chat,
                 &mut loop_state,
-                SlashCommandOutcome::OpenThemePicker
+                SlashCommandOutcome::OpenAppearancePicker(
+                    crate::appearance_picker::AppearanceAxis::Palette
+                )
             )
             .is_some()
         );

@@ -11,6 +11,7 @@ use serde::Deserialize;
 use thiserror::Error;
 
 use crate::chrome::{RawChrome, TuiBorders, TuiChrome};
+use crate::contrast::ContrastAdjustment;
 use crate::expr::{self, ColorContext, Evaluated};
 
 /// Semantic style roles every version-1 theme must resolve through definition or inheritance.
@@ -168,6 +169,22 @@ pub enum ThemeKind {
     Profile,
     /// A structural building block for other themes; not selectable alone.
     Base,
+}
+
+/// Which resolved roles are raised to their contrast pairings.
+///
+/// Resolution measures every pair in [`crate::contrast::PAIRS`] and, for an
+/// adjustable role that fails, changes only the OKLCH lightness of the failing
+/// color by the minimum needed (see [`crate::contrast`]).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord, Hash, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ContrastPolicy {
+    /// Raise only roles filled by seed derivation; authored colors are kept
+    /// exactly as written.
+    #[default]
+    Derived,
+    /// Also raise authored roles that fail their pair.
+    Enforce,
 }
 
 /// Non-fatal problem found while resolving a theme.
@@ -501,6 +518,8 @@ pub struct ResolvedThemeDefinition {
     pub presentation: Vec<RuleLayer>,
     /// Roles filled by seed derivation rather than authored values.
     pub derived_roles: Vec<String>,
+    /// Colors raised to meet their contrast pair, in pair-table order.
+    pub contrast_adjustments: Vec<ContrastAdjustment>,
     /// Non-fatal problems such as unknown roles or approximate color math.
     pub warnings: Vec<ThemeWarning>,
     /// Theme ids applied in resolution order.
@@ -526,6 +545,7 @@ impl ResolvedThemeDefinition {
             renderer_chrome: BTreeMap::new(),
             presentation: Vec::new(),
             derived_roles: Vec::new(),
+            contrast_adjustments: Vec::new(),
             warnings: Vec::new(),
             applied_layers: Vec::new(),
             fingerprint: 0,
@@ -610,6 +630,8 @@ struct RawTheme {
     description: Option<String>,
     #[serde(default)]
     extends: Vec<String>,
+    #[serde(default)]
+    contrast: Option<ContrastPolicy>,
     #[serde(default)]
     palette: BTreeMap<String, RawColor>,
     #[serde(default)]
@@ -709,12 +731,17 @@ struct MergedTheme {
     presentation: Vec<RuleLayer>,
     /// Whether any applied layer opted into schema-v2 seed derivation.
     derive: bool,
+    /// Contrast policy of the last layer that set one.
+    contrast: ContrastPolicy,
 }
 
 impl MergedTheme {
     fn apply_raw(&mut self, raw: &RawTheme) {
         if raw.display_name.is_some() {
             self.display_name.clone_from(&raw.display_name);
+        }
+        if let Some(contrast) = raw.contrast {
+            self.contrast = contrast;
         }
         self.palette.extend(raw.palette.clone());
         self.styles.extend(raw.styles.clone());
@@ -893,6 +920,12 @@ fn resolve_merged(
             }
         }
     }
+    let contrast_adjustments = match merged.contrast {
+        ContrastPolicy::Enforce => crate::contrast::enforce(&mut styles, |_| true),
+        ContrastPolicy::Derived => crate::contrast::enforce(&mut styles, |role| {
+            derived_roles.iter().any(|derived| derived == role)
+        }),
+    };
     let mut warnings = std::mem::take(&mut resolver.warnings);
     for role in merged.styles.keys() {
         if !crate::roles::is_known_role(role, role_namespaces) {
@@ -947,6 +980,7 @@ fn resolve_merged(
         renderer_chrome: merged.chrome.other,
         presentation: merged.presentation,
         derived_roles,
+        contrast_adjustments,
         warnings,
         applied_layers,
         fingerprint,

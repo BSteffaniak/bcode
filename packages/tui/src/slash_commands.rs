@@ -1,5 +1,6 @@
 //! Backend-agnostic slash commands for the TUI.
 
+use super::appearance_picker::AppearanceAxis;
 use super::{daemon_issue, slash_registry};
 use bcode_client::BcodeClient;
 use bcode_plugin_sdk::path::display_from_current_dir;
@@ -64,8 +65,9 @@ pub enum SlashCommandOutcome {
     ApplyTheme { theme_id: String },
     /// List interface profiles.
     ShowProfileCatalog,
-    /// Open the interactive profile picker.
-    OpenProfilePicker,
+    /// Open the combined palette × profile picker focused on one axis
+    /// (`/appearance` and `/theme` focus palettes, `/profile` profiles).
+    OpenAppearancePicker(super::appearance_picker::AppearanceAxis),
     /// Persist one interface profile to user state.
     ApplyProfile { profile_id: String },
     /// Clear the saved interface profile.
@@ -74,8 +76,6 @@ pub enum SlashCommandOutcome {
     ResetTheme,
     /// Restore the configured theme after preview.
     CancelThemePreview,
-    /// Open the interactive theme picker.
-    OpenThemePicker,
     /// Open the interactive streaming presentation configurator.
     OpenStreamingConfigurator,
     /// Show the theme catalog as durable transcript content.
@@ -780,9 +780,16 @@ pub async fn execute_resolved(
     }
 }
 
+fn appearance_command(parts: &[&str]) -> SlashCommandOutcome {
+    match parts {
+        [_] => SlashCommandOutcome::OpenAppearancePicker(AppearanceAxis::Palette),
+        _ => SlashCommandOutcome::Handled("usage: /appearance".to_owned()),
+    }
+}
+
 fn profile_command(parts: &[&str]) -> SlashCommandOutcome {
     match parts {
-        [_] => SlashCommandOutcome::OpenProfilePicker,
+        [_] => SlashCommandOutcome::OpenAppearancePicker(AppearanceAxis::Profile),
         [_, "list"] => SlashCommandOutcome::ShowProfileCatalog,
         [_, "apply", profile_id] => SlashCommandOutcome::ApplyProfile {
             profile_id: (*profile_id).to_owned(),
@@ -802,8 +809,8 @@ pub fn format_profile_catalog_markdown(profiles: &[super::theme::ProfileCatalogE
     }
     let mut output = String::from(
         "# Profiles\n\nProfiles set borders, icons, density, and which tools are collapsed. \
-         Combine any profile with any theme using `/profile` (interactive) or \
-         `/profile apply <profile>`.\n\n",
+         Combine any profile with any theme using `/appearance` or `/profile` \
+         (interactive) or `/profile apply <profile>`.\n\n",
     );
     for profile in profiles {
         let current = if profile.selected { " (current)" } else { "" };
@@ -822,7 +829,7 @@ pub fn format_profile_catalog_markdown(profiles: &[super::theme::ProfileCatalogE
 
 fn theme_command(parts: &[&str]) -> SlashCommandOutcome {
     match parts {
-        [_] => SlashCommandOutcome::OpenThemePicker,
+        [_] => SlashCommandOutcome::OpenAppearancePicker(AppearanceAxis::Palette),
         [_, "list"] => SlashCommandOutcome::ShowThemeCatalog,
         [_, "preview", theme_id] => SlashCommandOutcome::PreviewTheme {
             theme_id: (*theme_id).to_owned(),
@@ -935,6 +942,7 @@ async fn execute_builtin(
         }
         BuiltinCommandId::Theme => Ok(theme_command(parts)),
         BuiltinCommandId::Profile => Ok(profile_command(parts)),
+        BuiltinCommandId::Appearance => Ok(appearance_command(parts)),
         BuiltinCommandId::Streaming => Ok(SlashCommandOutcome::OpenStreamingConfigurator),
         BuiltinCommandId::Model if parts.len() == 1 => Ok(SlashCommandOutcome::PickModel),
         BuiltinCommandId::AuthPool if parts.len() == 1 => Ok(SlashCommandOutcome::PickAuthPool),
@@ -1283,7 +1291,15 @@ mod tests {
     fn bare_theme_opens_picker_and_list_uses_durable_catalog() {
         assert_eq!(
             theme_command(&["/theme"]),
-            SlashCommandOutcome::OpenThemePicker
+            SlashCommandOutcome::OpenAppearancePicker(AppearanceAxis::Palette)
+        );
+        assert_eq!(
+            profile_command(&["/profile"]),
+            SlashCommandOutcome::OpenAppearancePicker(AppearanceAxis::Profile)
+        );
+        assert_eq!(
+            appearance_command(&["/appearance"]),
+            SlashCommandOutcome::OpenAppearancePicker(AppearanceAxis::Palette)
         );
         assert_eq!(
             theme_command(&["/theme", "list"]),

@@ -4,13 +4,14 @@ use bcode_presentation_policy::models::{
     FactMatcher, LayerSource, OneOrMany, PresentationRule, PropertyPatch, RuleLayer, Spacing,
     UnitKind,
 };
-use bcode_tui_theme::chrome::{BorderStyle, Density, FocusEffect, IconSet, TuiChrome};
+use bcode_tui_theme::chrome::{
+    BorderStyle, Density, FocusEffect, IconSet, SpeakerStyle, TuiChrome,
+};
 use bcode_tui_theme::definition::{
     ContainerBorder, ContainerLayout, ContainerRecipe, ContainerWidth, ResolvedThemeDefinition,
 };
 use bmux_tui::chrome::BorderSet;
 use bmux_tui::gradient::ColorGradient;
-use bmux_tui::prelude::{Line, Span};
 use bmux_tui::text_width::display_width;
 use bmux_tui_components::theme::ComponentChrome;
 
@@ -63,8 +64,9 @@ pub fn dialog_chrome(theme: &ResolvedThemeDefinition) -> ComponentChrome {
     surface_chrome(theme.chrome.borders.dialog, &theme.chrome)
 }
 
-/// Terminal chrome consumed by transcript units: icons, disclosure markers,
-/// density, and the tool border style.
+/// Terminal chrome consumed by transcript units and the composer: icons,
+/// disclosure markers, density, the tool and composer border styles, and the
+/// speaker treatment of messages.
 ///
 /// The default reproduces the transcript of a theme without `[chrome.tui]`.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash)]
@@ -75,6 +77,10 @@ pub struct UnitChrome {
     pub density: Density,
     /// Border style around tool units; `None` keeps the theme's container recipes.
     pub tool_border: Option<BorderStyle>,
+    /// Border style of the input composer; `None` keeps its single-line frame.
+    pub composer_border: Option<BorderStyle>,
+    /// Speaker treatment of user and assistant message headers.
+    pub speaker: SpeakerStyle,
 }
 
 /// Header icon candidates for one tool category, most specific first.
@@ -111,6 +117,8 @@ impl UnitChrome {
             icons: theme.chrome.icons,
             density: theme.chrome.density,
             tool_border: theme.chrome.borders.tool,
+            composer_border: theme.chrome.borders.composer,
+            speaker: theme.chrome.speaker,
         })
     }
 
@@ -272,52 +280,10 @@ fn tool_icon_candidates(tool: &str) -> IconCandidates {
     }
 }
 
-/// Redraw the frame of a full-border transcript container with `set`.
-///
-/// `rows` are one container's rows as produced by the transcript container
-/// recipe with a border on all sides: a top border row, content rows whose
-/// first and last spans are the vertical edges, and a bottom border row.
-/// Only those border spans are rewritten; content is never touched, and each
-/// glyph is replaced by one of the same cell width.
-pub fn redraw_frame(rows: &mut [Line], set: BorderSet) {
-    if set == BorderSet::SINGLE || rows.len() < 2 {
-        return;
-    }
-    let single = BorderSet::SINGLE;
-    let map = |glyph: char| match glyph {
-        glyph if glyph == single.top_left => set.top_left,
-        glyph if glyph == single.top_right => set.top_right,
-        glyph if glyph == single.bottom_left => set.bottom_left,
-        glyph if glyph == single.bottom_right => set.bottom_right,
-        glyph if glyph == single.horizontal => set.horizontal,
-        glyph if glyph == single.vertical => set.vertical,
-        glyph => glyph,
-    };
-    let redraw = |span: &mut Span| {
-        let text: String = span.content.chars().map(map).collect();
-        span.content = text;
-    };
-    let last = rows.len() - 1;
-    for (index, row) in rows.iter_mut().enumerate() {
-        if index == 0 || index == last {
-            row.spans.iter_mut().for_each(redraw);
-            continue;
-        }
-        let edge = single.vertical.to_string();
-        let count = row.spans.len();
-        for position in [0, count.saturating_sub(1)] {
-            if let Some(span) = row.spans.get_mut(position)
-                && span.content == edge.as_str()
-            {
-                redraw(span);
-            }
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use bcode_tui_theme::chrome::TuiChrome;
+    use bmux_tui::prelude::Line;
     use bmux_tui::style::Color;
 
     use super::*;
@@ -503,7 +469,7 @@ mod tests {
         assert_eq!(with(Density::Cozy).density_layer(), None);
     }
 
-    fn framed_rows(content: &str) -> Vec<Line> {
+    fn framed_rows(content: &str, set: BorderSet, width: u16, padding_x: u16) -> Vec<Line> {
         let mut rows = vec![Line::from(content)];
         bcode_tui_components::transcript::apply_transcript_container(
             &mut rows,
@@ -513,74 +479,46 @@ mod tests {
                     layout: bcode_tui_components::transcript::TranscriptContainerLayout::Panel,
                     width: bcode_tui_components::transcript::TranscriptContainerWidth::Full,
                     border: bcode_tui_components::transcript::TranscriptContainerBorder::All,
-                    padding_x: 1,
+                    padding_x,
                     padding_y: 0,
                 },
                 style: bmux_tui::style::Style::default(),
+                border_set: set,
             },
-            12,
+            width,
         );
         rows
     }
 
     #[test]
-    fn frames_are_redrawn_without_touching_content_or_widths() {
-        let mut rows = framed_rows("a│─┌b");
-        let widths = rows
+    fn tool_frames_paint_the_chrome_border_set_without_touching_content() {
+        let text = framed_rows("a│─┌b", BorderSet::ROUNDED, 12, 1)
             .iter()
-            .map(|row| display_width(&row.plain_text()))
+            .map(Line::plain_text)
             .collect::<Vec<_>>();
-        redraw_frame(&mut rows, BorderSet::ROUNDED);
-        let text = rows.iter().map(Line::plain_text).collect::<Vec<_>>();
         assert_eq!(text[0], "╭──────────╮");
         assert_eq!(text[1], "│ a│─┌b    │");
         assert_eq!(text[2], "╰──────────╯");
-        assert_eq!(
-            rows.iter()
-                .map(|row| display_width(&row.plain_text()))
-                .collect::<Vec<_>>(),
-            widths
-        );
-        let mut thick = framed_rows("x");
-        redraw_frame(&mut thick, BorderSet::THICK);
+        let thick = framed_rows("x", BorderSet::THICK, 12, 1);
         assert!(thick[1].plain_text().starts_with(BorderSet::THICK.vertical));
-        let mut single = framed_rows("x");
-        let before = single.clone();
-        redraw_frame(&mut single, BorderSet::SINGLE);
-        assert_eq!(single, before);
     }
 
     #[test]
-    fn redrawn_frames_keep_the_container_geometry_at_tiny_widths() {
+    fn framed_rows_stay_within_the_available_width_at_tiny_widths() {
         for width in [0_u16, 1, 2, 3, 6] {
-            let mut rows = vec![Line::from("漢字👍e\u{301}")];
-            bcode_tui_components::transcript::apply_transcript_container(
-                &mut rows,
-                0,
-                bcode_tui_components::transcript::TranscriptContainerStyle {
-                    recipe: bcode_tui_components::transcript::TranscriptContainerRecipe {
-                        layout: bcode_tui_components::transcript::TranscriptContainerLayout::Panel,
-                        width: bcode_tui_components::transcript::TranscriptContainerWidth::Full,
-                        border: bcode_tui_components::transcript::TranscriptContainerBorder::All,
-                        padding_x: 0,
-                        padding_y: 0,
-                    },
-                    style: bmux_tui::style::Style::default(),
-                },
-                width,
-            );
-            let widths = rows
-                .iter()
-                .map(|row| display_width(&row.plain_text()))
-                .collect::<Vec<_>>();
-            redraw_frame(&mut rows, BorderSet::DOUBLE);
-            assert_eq!(
-                rows.iter()
+            for set in [BorderSet::SINGLE, BorderSet::DOUBLE, BorderSet::ROUNDED] {
+                let rows = framed_rows("漢字👍e\u{301}", set, width, 0);
+                assert_eq!(rows.len(), 3, "width {width}");
+                let widths = rows
+                    .iter()
                     .map(|row| display_width(&row.plain_text()))
-                    .collect::<Vec<_>>(),
-                widths,
-                "width {width}"
-            );
+                    .collect::<Vec<_>>();
+                let expected = usize::from(width.max(1));
+                assert!(
+                    widths.iter().all(|row| *row == expected),
+                    "width {width}: {widths:?}"
+                );
+            }
         }
     }
 }

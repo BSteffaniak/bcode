@@ -97,6 +97,14 @@ muted        = "ensure_contrast(mix($fg, $bg, 0.45), $bg, 3.0)"
   `desaturate` scale chroma by `1 ± t`.
 * `ensure_contrast` changes only lightness, by the minimum needed, moving toward whichever extreme
   contrasts more with `bg`; when the ratio is unreachable it yields that extreme.
+* Derivation is contrast-aware. One pairing table (`bcode_tui_theme::contrast::PAIRS`) names, for
+  each text- or state-carrying role, the background it is painted on and its threshold;
+  `bcode theme check` measures it and resolution enforces it. After seed derivation, each failing
+  pair whose role was derived is raised with `ensure_contrast`: the role's own foreground when it
+  sets one, otherwise (a tint painted under another role's text, such as state surfaces and diff
+  rows) its background. Authored colors are preserved unless the theme sets
+  `contrast = "enforce"`, which applies the same adjustment to failing authored roles. Resolved
+  themes record each adjustment (`contrast_adjustments`).
 * Arguments are palette references, literals, or nested calls; nesting depth is at most 4.
 * References form a DAG; cycles are rejected with the full cycle path.
 * Applying math to an ANSI, indexed, or `terminal` value emits a warning and yields the first color
@@ -249,6 +257,12 @@ Resolution is a pure function from compiled rules and unit facts to a resolved p
 * Rules compile once per policy fingerprint into an index keyed by `kind`, then `tool`, so resolving
   a unit evaluates only rules that can match it.
 * Results are memoized by item identity, item revision, policy fingerprint, and override revision.
+  Layout signatures cache each item's rows on those inputs, and the compiled policy memoizes
+  resolutions by the set of matching rules plus the facts the visibility floor reads (unit is a
+  group, awaiting a decision, failed). That memo belongs to one compilation, so recompiling
+  invalidates it; it holds at most `MAX_RESOLUTION_MEMO` (256) entries and is cleared when full.
+  Overrides apply after the memo, so toggles never invalidate it. Units that match the same rules
+  share one patch application, so the memo stays small no matter how long the transcript is.
 * A streaming update re-resolves only the streaming unit.
 * A turn boundary re-resolves only units whose `turn` fact changed.
 * Rule count, fact count, set entries, and plugin-declared schemas are bounded, consistent with
@@ -358,7 +372,20 @@ All properties merge per property (later rules win). `sections` merge per sectio
 * Grouping runs over the renderer's resident window in transcript order and never reorders units
   or crosses turns. A unit joins the open group when its resolved `group.by` equals the group's,
   the key matches (`same_tool`: tool; `same_producer`: producer; `consecutive`/`turn`: any tool
-  unit), and every unit between it and the previous member is a bridge kind.
+  unit), and every unit between it and the previous member is a bridge kind or a unit attached to
+  a member's invocation.
+* Only tool calls are members. Supplemental and hidden tool contributions (plugin visuals and
+  retained contributions attached to an invocation) are *attached units*: they never lead, join, or
+  count toward a group (`count`, `tools`, `items`, `status`, and `is_error` ignore them). An
+  attached unit that belongs to the invocation of a member already in the run stays inside the
+  group, whatever its `bridge` kinds or its own status, between members and directly after the
+  last member. An attached unit of any other invocation follows the ordinary bridge rules (a
+  bridge kind, not failed, not awaiting a decision), so a foreign failure still ends the group
+  rather than hiding inside it. An attached unit renders with the member whose invocation it belongs
+  to: fully when that member renders fully or the group is expanded, otherwise not at all (the
+  member's header row stands for the whole invocation). Request, progress, and result
+  contributions occupy the invocation's primary slot (they are how a plugin-presented call
+  renders), so they remain members.
 * The group unit's id is `group:<first member item id>`; it stays stable as members stream in.
 * Group facts: `kind = "group"`, `tool` (when all members share it), `producer` (likewise), `status`
   (aggregate: running > waiting > requested > failed > timed_out > cancelled > succeeded),
@@ -383,8 +410,11 @@ All properties merge per property (later rules win). `sections` merge per sectio
   `section:<item id>:<section name>`. Terminal hit-region ids are `disclosure:<target>`. The
   legacy form `disclosure:<item id>` remains accepted as `unit:<item id>`.
 * The composer emits one disclosure anchor (`TuiVisualAnchor` with key `disclosure:<target>` and
-  the header or label row) per target. Hit regions are registered only for visible anchor rows,
-  clipped to the transcript area.
+  the header or label row) per target. Hit regions are derived from the same retained anchors
+  keyboard focus walks (every `disclosure:` anchor of an entry, host or plugin-namespaced section
+  alike), registered only for visible anchor rows inside their entry, and clipped to the
+  transcript area. An item's layout signature includes every section override recorded for it
+  (one ordered range of the override map), so toggling any section re-lays out only that item.
 * Manual overrides are ephemeral, keyed by target, bounded (oldest dropped first), and reconciled
   when items leave the resident window. The visibility floor applies after overrides: a unit
   awaiting a decision cannot be collapsed.
@@ -399,6 +429,26 @@ All properties merge per property (later rules win). `sections` merge per sectio
   selection style and kept in view. All keys are remappable in the `transcript_focus` scope.
 * Bulk actions (`tui.tools.expandAll`, `collapseAll`, `resetDisclosure`) act on every unit and
   group; in focus mode they act on the focused target's subtree.
+* Detail cycling (`tui.transcript.cycleDetail`; `alt+d` in the chat scope, `d` in focus mode)
+  moves disclosure collapsed → summary → expanded → collapsed (hidden enters at summary): every
+  unit and group together outside focus mode, continuing from the last level applied to all,
+  and only the focused target in focus mode. Levels the visibility floor refuses are skipped.
+* Inspector (`tui.transcript.inspect`, `i` in focus mode): explains the focused target and
+  follows focus. It paints over the transcript body, docked right as a side panel when the
+  body is at least 96 columns wide and inset as a modal otherwise; its hit region is the
+  painted panel, layered above transcript regions, and the mouse wheel over it scrolls it
+  (`shift+Down`/`shift+Up` from the keyboard). Escape closes it before leaving focus mode, and
+  leaving focus mode any other way closes it too. Transcript selection is registered before the
+  panel paints, so its occlusion removes the selectable fragments it covers; beside a side panel
+  selection still starts, while an inset panel disables starting a transcript selection until it
+  closes.
+* Make default (`tui.transcript.makeDefault`, `m` in focus mode) on a focused tool unit saves
+  `{ match = { kind = "tool", tool = "<name>" }, set = { disclosure = "<shown>" } }` to user
+  state through the effect queue in one write, replacing a stored rule with the same matcher,
+  then recompiles from the stored user-state rules. Every user-state read-modify-write (theme,
+  profile, streaming, and structural rules) is serialized in-process and replaces the file
+  atomically, so concurrent saves never drop each other's fields. The three actions are also command-palette
+  entries (`transcript.inspect`, `transcript.cycleDetail`, `transcript.makeDefault`).
 
 ### Every unit kind is structural
 
@@ -430,12 +480,33 @@ section and continue to work unchanged.
 
 ## Tooling
 
-* `bcode theme explain` and an in-TUI inspector report, for a selected unit, its facts and each
-  rule and layer that set each property, including floor adjustments.
-* `bcode theme check` reports contrast, unknown keys, roles resolved only through fallbacks, and
-  registry coverage.
+* `bcode theme explain` and the in-TUI inspector report, for a selected unit, its facts and each
+  rule and layer that set each property, including floor adjustments. Both use the policy's own
+  `explain` and one shared property flattening (`bcode_tui::inspector::property_rows`); the
+  inspector also reports the target's manual override, its shown disclosure (group-adjusted for
+  members), and grouping context, and explains groups from their synthesized group facts.
+* `bcode theme check [THEME] [--strict] [--json]` resolves a theme in both variants (once when
+  they resolve identically) and reports WCAG contrast for text, accent, status, diff, and
+  selection role pairs (4.5:1 for text and states; 3:1 for secondary text, focus borders, diff
+  signs, tool titles, and inactive selection); unknown style roles and container keys; roles
+  resolved only through seed derivation or unset (host fallbacks); registry coverage; resolver
+  warnings; and the theme's structural rule diagnostics, including floor crossings. Colors whose
+  displayed value the terminal owns (the default colors and the 16 ANSI colors) are reported as
+  unmeasured, not failed. Warnings exit 0 unless `--strict`; `--json` emits a versioned
+  structure. The analysis is `bcode_tui_theme::check`; the command compiles rule layers.
 * Global actions: expand all, collapse all, cycle detail, and "make this the default for this
-  tool".
+  tool" (see Interaction).
+* `cargo run -p xtask -- theme-gallery [--check | --dry-run]` writes the generated gallery,
+  [`theme-gallery.md`](theme-gallery.md). It renders the appearance picker's sample transcript
+  through the real row pipeline into a headless 80×96 BMUX buffer under each selected
+  combination: every selectable bundled theme alone (dark variant), plus every bundled profile
+  over the default theme and `bcode`. Renders are ANSI-free text, so identical renders are
+  printed once with every combination that produces them (at most 64), and swatch tables give
+  each theme's core role colors per variant, naming terminal-owned colors instead of guessing
+  them. `--check` fails when the committed page is stale. The renderer is the `bcode_tui`
+  `theme_gallery` example (`bcode_tui::theme_gallery`), run as a separate Cargo invocation so
+  xtask's own graph never includes the TUI; rendering takes well under a second, and the cost
+  of `--check` is compiling `bcode_tui` (shared with a workspace build).
 
 ## Compatibility
 
@@ -451,6 +522,8 @@ section and continue to work unchanged.
 * Structural defaults are declarative configuration; interactive changes persist to user state.
 * Portable crates depend on `bmux_color` only, never on `bmux_tui*`.
 * Rich renderer adapters keep the generic structured fallback.
+* Plugin presentation (manifest rules, summaries, targets, sections) is display data scoped to
+  the plugin's own units; manifest rules naming another producer are dropped.
 
 ## Delivery phases
 
@@ -465,71 +538,150 @@ section and continue to work unchanged.
 
 ## Implementation status
 
-* Implemented: `bmux_color`; BMUX color-depth quantization, OSC color reports (delivered through
-  managed and runtime terminal input), `ComponentTheme` v2 with `derive`, `ComponentChrome`,
-  gradient borders and text, and the `Disclosure` component; schema v2 (seeds, expressions, role
-  registry with warnings, `[chrome.tui]`, `[presentation]`, `kind`); `bcode_presentation_policy`
-  with layering, floor, explain, and grouping; tool disclosure in the TUI with click toggles, bulk
-  actions, preview budgets, part visibility, and turn recency; plugin component-theme contract v2;
-  palette, profile, and combination catalog; `/profile` and `profile` configuration.
-* Structure v2, implemented:
-  * policy: the v2 properties (`group` tables, `reveal`, `sections`, `header`, `summary`,
-    `spacing`, `indent`) with per-section merging, clamping, and registry warnings for section,
-    header (checked per unit kind), and template names; the `target`, `duration`, and
-    `last_in_turn` matchers; a rule index keyed by kind, then tool; the extended floor (decision
-    sections, failure sections, groups never hidden) with diagnostics for rules that cross it;
-    bounded single-line summary-template rendering;
-  * grouping projection: `by`, `bridge`, and `min`; failed and awaiting members stay members and
-    are revealed; group facts; incremental updates from transcript splices;
-  * terminal tool units: built as an anatomy and laid out by a composer that implements the
-    disclosure table, per-section disclosure and preview, header fields (including `target` and
-    `icon`), summary sources, spacing, and indent, with unit and section disclosure anchors on
-    painted rows;
-  * terminal groups: each leader paints a one-row group header with a group anchor; members and
-    bridged units render in full, as one header row, or not at all, following the group
-    disclosure and `reveal`; the projection updates incrementally as the transcript changes;
-  * every transcript kind is a structural unit with facts (messages, reasoning, permissions,
-    interactions, notes, and system items), drawn through a structural frame; the `target`,
-    `duration`, and `last_in_turn` facts are filled; hidden units of every kind leave a
-    one-row count marker that is their disclosure target; `tui.thinking.show = false` is a
-    configuration-layer rule, and reasoning it hides renders no marker (the user's explicit
-    choice to omit reasoning, applied before the floor);
-  * interaction: unit, group, and section disclosure targets and hit ids (the legacy form still
-    parses); target-keyed overrides with oldest-first eviction, reconciled when items leave the
-    resident window; the visibility floor applied after overrides (a failed unit collapsed by
-    hand still shows its summary line); a group choice replaces its members' unit choices;
-    mouse toggles for units, groups, and sections; keyboard focus mode with remappable keys;
-    bulk actions on every shown unit kind and every group (hidden units and units awaiting a
-    decision are left alone), scoped to the focused subtree in focus mode;
-  * plugin contract v3: adapter response version 5 with bounded `summary`, `target`, and
-    `sections`, rendered as the summary source, header target, and named anatomy sections;
-    render context version 3 carrying the resolved presentation, decoded tolerantly (a
-    presentation an older adapter cannot decode arrives as none); manifest `[presentation]`
-    declarations, decoded and checked best-effort (invalid entries are dropped with
-    diagnostics and never block plugin loading), whose rules become producer-scoped plugin
-    layers and whose target fields feed the `target` fact only for units the declaring plugin
-    produced (units without a known producer use a tool's declaration only when a single
-    plugin declares it); bundled shell, filesystem, and git adapters supply summaries and
-    targets;
-  * chrome in the terminal: `icons` (header icon field and marker glyph set), `density` (a
-    lowest-precedence host layer for tool and group spacing), and `borders.tool`;
-  * layer order, lowest first: host defaults, plugins, theme, configuration, user state,
-    stacked by one shared helper (`bcode_tui_theme::selection::structure_layers`);
-  * tooling: `bcode theme explain` (text and JSON, stacking the same host, theme,
-    configuration, and user-state layers as the TUI through the shared helper) and
-    `bcode theme profiles`;
-  * catalog: bundled profiles use groups, reveal, sections, header fields, summary templates, and
-    spacing, including the `timeline` and `focus` profiles.
-* Deviations: structural configuration lives in the renderer-neutral `[[presentation.rules]]`
-  section rather than under `[tui]`. The definition crate keeps its `bcode_tui_theme` name and
-  `bmux_tui` color type; splitting a renderer-neutral `bcode_theme` crate is deferred until a
-  non-terminal renderer consumes theme files. `color_depth = "auto"` only honors `NO_COLOR`;
-  reduced depths are explicit. Groups never contain a `group_size` fact; `items` buckets the
-  member count. Only tool units can be group members.
-* Not yet done: chrome `separators`, `speaker`, `surfaces`, `motion`, and the `composer` border
-  style in the terminal renderer (they resolve and are validated, and BMUX bordered components
-  honor the panel border set and focus gradient); per-item resolution memoization; plugin
-  declared facts and properties; plugin rule layers in `bcode theme explain` (it does not load
-  plugins, so it passes no plugin layers); mouse hit regions and layout signatures for
-  namespaced plugin sections (keyboard focus reads every disclosure anchor, but hit regions
-  and signatures probe only host section names); the in-TUI inspector; `bcode theme check`; the two-axis picker UI.
+All five delivery phases have landed. This section records what exists, where it departs from
+the design above, and what remains.
+
+### Paint and chrome
+
+* BMUX: `bmux_color`; color-depth quantization; OSC 10/11/4 color reports (delivered through
+  managed and runtime terminal input); `ComponentTheme` v2 with `derive`; `ComponentChrome`;
+  gradient borders and text; the `Disclosure` component.
+* Theme schema v2: seeds, palette expressions, the role registry with warnings, `[chrome.tui]`,
+  `[presentation]`, and `kind`. Schema-v1 files resolve unchanged. Plugin component-theme
+  contract v2.
+* Contrast-aware derivation against the shared pairing table; every bundled theme passes
+  `bcode theme check --strict` in both variants. Nord opts in with `contrast = "enforce"`, which
+  lightens its authored error red (`#bf616a` to `#e17f87`) to reach 4.5:1 on its canvas.
+* Every `[chrome.tui]` key is honored by the terminal renderer:
+  * `borders.panel` and `borders.dialog` select surface border glyphs, and `focus` (`gradient`,
+    `sweep`) paints focused borders with a gradient;
+  * `borders.tool` selects the tool unit container (`none`, `left`, or a framed panel). Every
+    transcript container is painted by BMUX's `LineFrame` with the selected glyph set; its
+    geometry also gives producers their content width and column, so painting, wrapping and hit
+    regions share one layout definition. Layered surfaces become the frame's fill;
+  * `borders.composer` frames the input composer: framed styles change the glyphs, `left` paints
+    a leading bar, and `none` paints nothing. Only full frames carry the `Message` title. Every
+    style keeps the editor geometry, so composer height, editor hit regions, and cursor placement
+    do not depend on it;
+  * `icons` selects the header icon field and marker glyph set, with measured Unicode and ASCII
+    fallbacks;
+  * `density` is a lowest-precedence host layer for tool and group spacing;
+  * `speaker` applies to user and assistant messages in every disclosure: `prefix` keeps the
+    heading row; `badge` paints a reversed badge, degrading to the heading row when it does not
+    fit; `bar` paints a one-cell bar and gap on every row; `gutter` moves the heading into a fixed
+    8-cell gutter truncated by display width. One speaker layout
+    (`render::unit_frame::speaker_layout`) feeds both painting and the transcript item layout,
+    so Markdown width, hit regions, and selection origins follow the body. `bar` degrades to
+    `prefix` below 6 columns and `gutter` below 20;
+  * `separators.status` joins status line segments with a glyph measured at a constant three
+    cells, so switching styles never changes which segments fit. `plain` keeps the middle dot;
+    Nerd Font slant and powerline glyphs fall back to Unicode, then ASCII, by the icon set's rules;
+  * `surfaces = "layered"` gives tool units and group headers the `surface.raised` background
+    when it differs from the canvas, without changing geometry. Dialogs already use
+    `surface.overlay`; `flat` keeps the existing look;
+  * `motion` sets the activity tick (`none`: 1s with a still spinner; `subtle`: 100ms, the
+    default; `full`: 80ms) and advances a `sweep` focus gradient on those ticks. Ticks are
+    scheduled only while activity is shown, so an idle UI schedules no frames. Every frame,
+    including canvas-owning foregrounds, paints with the same phase; a sweep tick repaints the
+    whole screen only while chrome with a focus gradient was painted since the last full frame,
+    and otherwise repaints just the status line.
+    `motion` also sets the durations of accent transitions (`subtle`: 220ms; `full`: 330ms),
+    the transcript scroll animation (180ms; 270ms), and the latest-bar glow (420ms; 630ms);
+    under `none` all three are instant and schedule no frames. Precedence, highest first:
+    `tui.reduce_motion` (always instant), then an explicit user setting for that animation
+    (`[tui.theme] accent_transition = "immediate"` or `accent_transition_ms`; the scroll and
+    latest-bar animations have none), then the theme's `motion`. Accent transitions use the
+    target theme's level. `tui.reduce_motion` forces `none`. Separators, surfaces, and motion
+    live in `theme::effects`.
+
+### Structure
+
+* `bcode_presentation_policy`: layering, the visibility floor, explain, and the grouping
+  projection; the v2 properties (`group` tables, `reveal`, `sections`, `header`, `summary`,
+  `spacing`, `indent`) with per-section merging, clamping, and registry warnings for section,
+  header (per unit kind), and template names; the `target`, `duration`, and `last_in_turn`
+  matchers; a rule index keyed by kind, then tool; the extended floor (decision sections,
+  failure sections, groups never hidden) with diagnostics for rules that cross it; bounded
+  single-line summary templates; a bounded resolution memo (see "Resolution cost").
+* Layer order, lowest first: host defaults, plugins, theme, configuration, user state, stacked
+  by one helper (`bcode_tui_theme::selection::structure_layers`) shared by the TUI, `bcode theme
+  explain`, and `bcode theme check`.
+* Grouping: `by`, `bridge`, and `min`; failed and awaiting members stay members and are
+  revealed; group facts; incremental updates from transcript splices that match full
+  recomputation. Only real tool calls are members. Supplemental and hidden tool contributions
+  are attached units: they never lead, join, or count, stay inside the group when they belong to
+  a member's invocation (others must qualify as ordinary bridges), and render with their owning
+  member.
+* Terminal units: every transcript kind (tools, messages, reasoning, permissions,
+  interactions, notes, system items) is a structural unit with facts, drawn through the unit
+  anatomy. Tool units are laid out by a composer that implements the disclosure table,
+  per-section disclosure and preview, header fields (including `target` and `icon`), summary
+  sources, spacing, and indent. Hidden units leave a one-row count marker that is their
+  disclosure target, except reasoning hidden by `tui.thinking.show = false` (a
+  configuration-layer rule).
+* Terminal groups: each leader paints a one-row group header with a group anchor; members and
+  bridged units render in full, as one header row, or not at all, following the group
+  disclosure and `reveal`.
+* Interaction: unit, group, and section targets (the legacy hit id still parses);
+  target-keyed, bounded overrides reconciled when items leave the resident window; the floor
+  applied after overrides; mouse toggles; keyboard focus mode; bulk actions; detail cycling;
+  the inspector; and "make this the default for this tool" (see Interaction). Hit regions,
+  host and plugin-namespaced sections alike, come from the same retained anchors focus walks.
+* Plugin contract v3: adapter response version 5 (`summary`, `target`, `sections`); render
+  context version 3 carrying the resolved presentation, decoded tolerantly; manifest
+  `[presentation]` declarations decoded best-effort, whose rules become producer-scoped plugin
+  layers and whose target fields feed the `target` fact only for the declaring plugin's units.
+  Tool requests, drafts, contributions, results, and permission requests carry their producing
+  plugin when the session knows it; only units with a genuinely unknown producer fall back to a
+  tool's declaration when exactly one plugin declares it. Plugin layers and target fields are
+  re-derived whenever the plugin catalog is reloaded, keyed by the effective declarations, so an
+  unchanged catalog recompiles nothing. Bundled shell, filesystem, and git adapters supply
+  summaries and targets.
+
+### Catalog and tooling
+
+* Palettes, profiles, and combinations ship in the bundled catalog; bundled profiles (including
+  `timeline` and `focus`) use groups, reveal, sections, header fields, summary templates, and
+  spacing.
+* Picker: one two-axis appearance picker. `/appearance` and `/theme` (palette routes
+  `appearance.select` and `theme.select`) open it on the palette axis, `/profile`
+  (`profile.select`) on the profile axis. It composes a palette and a profile axis state with a
+  live preview (palette catalog details, then the sample transcript), a diagnostic row for skipped
+  themes, and wheel scrolling of the column under the pointer; persists only the changed axes
+  (the profile after the theme write completes); restores both on Escape; and degrades at narrow
+  sizes by dropping the preview, then stacking the columns, then showing only the active column.
+  Its keymap scope is `appearance_picker`; the former `theme_picker` and `profile_picker` scopes
+  are accepted as aliases of it when `appearance_picker` itself is not configured.
+* `bcode theme explain`, `bcode theme check`, `bcode theme profiles`, the in-TUI inspector, and
+  the generated gallery, as described under Tooling. Explain reads plugin layers from the
+  manifests of the enabled bundled and installed plugins without loading any library, so a
+  plugin whose library would fail to load still shows its layer there.
+
+### Deviations
+
+* Structural configuration lives in the renderer-neutral `[[presentation.rules]]` section
+  rather than under `[tui]`.
+* The definition crate keeps its `bcode_tui_theme` name and `bmux_tui` color type; a
+  renderer-neutral `bcode_theme` crate is deferred until a non-terminal renderer consumes theme
+  files.
+* `color_depth = "auto"` only honors `NO_COLOR`; reduced depths are explicit.
+* Groups never carry a `group_size` fact; `items` buckets the member count.
+* "Make this the default for this tool" persists to user state, not to the declarative
+  settings file, as the invariant on interactive presentation choices requires; explain
+  reports such rules under `user_state`.
+
+### Resolution cost
+
+Measured by the ignored release harness `structure::bench` (a synthetic 5,000-item transcript,
+`focus` + `compact` profiles, 11 rules). Every incremental layout sync, including a disclosure
+toggle frame, scans all item signatures. Before the memo that scan took about 11.7 ms, 5.2 ms
+of it resolving presentations; with the memo it takes about 6.2 ms, 2.0 ms of it resolving.
+Fact extraction stays around 0.4 to 0.5 ms. A full 5,000-item relayout takes seconds, and
+resolution is under 0.1% of it; the remaining cost is row building and Markdown rendering.
+
+### Not yet done
+
+* Plugin-declared facts and properties.
+* A CI step for `cargo run -p xtask -- theme-gallery --check`; xtask has no check aggregate yet.
+* An invocation present in the window as both a historical tool request and a tool result may
+  count twice toward a group.

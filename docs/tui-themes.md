@@ -67,15 +67,39 @@ Curated combinations select both at once: `rice-mocha`, `neon`, `crt`,
 `amber-terminal`, `zen-paper`, `newsroom`, `night-shift`, `quiet`,
 `brutal-modus`, `forest-floor`, and `blueprint-studio`.
 
-`/profile` (or **Profile: Select** in the command palette) opens a live
-picker. Moving the selection applies the profile immediately: the transcript
-behind the picker re-renders, and the preview pane renders a sample turn (a
-small and a large read, a failed command, a running command, and a pending
-permission) through the same structural pipeline, including your
-`[[presentation.rules]]` and the visibility floor. Enter persists the profile
-to user state, Escape restores the previous one, and **Theme default** clears
-it. `/profile list`, `/profile apply <id>`, and `/profile reset` remain
-available. Profile files may set a one-line `description`, shown in the picker.
+`/appearance` (or **Appearance: Palette and Profile** in the command palette)
+opens the appearance picker, which picks a palette and a profile together.
+`/theme` (**Theme: Select**) opens the same picker on the palette column and
+`/profile` (**Profile: Select**) on the profile column. The two columns sit
+side by side; left and right (or `h`/`l`, `tab`) switch the active column, and
+up and down (or `k`/`j`) change its value, applying it immediately: the
+transcript behind the picker re-renders, and the preview pane shows the
+palette's catalog details (id, origin, and dark/light variant availability),
+its color swatch, the profile's description, and a sample turn (an earlier
+exchange, small and large reads, a failed command, a running command, and a
+pending permission) rendered through the same structural pipeline, including
+your `[[presentation.rules]]` and the visibility floor. Palette rows mark the
+current selection and tag user, project, and explicit themes with their
+origin; **Theme default** in the profile column clears the profile overlay.
+Clicking a row selects it and focuses its column, and the mouse wheel moves
+the selection of the column under the pointer; releasing the mouse never
+applies. When candidate themes were skipped, the bottom row names the first
+one and how many more there are. Enter saves whichever of the two changed to
+user state, and Escape restores both. On narrow terminals the preview is
+dropped first, then the columns stack, and on the smallest sizes only the
+active column is shown.
+
+The picker's keys are remappable in the `appearance_picker` keybinding scope.
+Configuration written for the former `theme_picker` and `profile_picker`
+scopes is still honored as `appearance_picker` bindings (the `theme_picker`
+entry wins when both bind the same keys, however they are spelled, or when one
+binding is a prefix of the other's sequence) until an `appearance_picker` scope is
+configured, which then replaces them; rename those sections to
+`appearance_picker` to migrate.
+
+`/theme list`, `/theme preview <id>`, `/theme apply <id>`, `/theme reset`,
+`/profile list`, `/profile apply <id>`, and `/profile reset` remain available.
+Profile files may set a one-line `description`, shown in the picker.
 
 ### Seed palettes
 
@@ -86,6 +110,24 @@ states readable (4.5:1, muted text 3:1) against the background. Seeds are
 `blue`, `magenta`, `cyan`, `orange`, `violet` (`info`, `success`, `warning`,
 `error` may override the state hues). Derivation only fills roles that resolve
 exactly from RGB seeds; terminal-owned seeds keep their inherited roles.
+
+Derived roles are contrast-aware. After derivation, each derived role is
+measured against the background it is painted on, using the same pairs
+`bcode theme check` measures (text on the raised and overlay surfaces, inline
+code on its tinted fill, state text on its state surface, diff text on diff
+rows, selection text on the selection). A role that falls short has its own
+foreground raised, or, when it paints a tint under another role's text (state
+surfaces, diff rows and emphasis), its background moved instead so the shared
+text color stays consistent. Only OKLCH lightness changes, by the minimum
+needed, so hue is preserved.
+
+Authored colors are kept exactly as written. A theme that wants failing
+authored roles raised the same way opts in at the top level, in any schema
+version:
+
+```toml
+contrast = "enforce"   # default "derived": adjust derived roles only
+```
 
 ```toml
 schema_version = 2
@@ -137,6 +179,47 @@ motion     = "subtle"        # none | subtle | full
 
 Focus gradients need two RGB colors; terminal-owned colors keep the focused
 border style. `[tui] reduce_motion = true` disables animated chrome.
+
+* `borders.panel` and `borders.dialog` pick the border glyphs (`ascii`,
+  `single`, `rounded`, `thick`, `double`) for panels and dialogs.
+  `borders.tool` picks how tool units are framed: `none` drops the container,
+  `left` draws a leading bar, and the framed styles draw a full-width panel.
+* `icons` picks the glyph set for header icons and disclosure markers. Glyphs
+  that do not measure as expected fall back to Unicode, then ASCII.
+* `density` sets the default spacing around tool units and groups (`cozy` is
+  the built-in default). Any `spacing` rule, from a profile or your own
+  configuration, takes precedence.
+* `separators.status` joins status line segments. `powerline` and `slant` use
+  Nerd Font glyphs only with `icons = "nerd"`, otherwise Unicode (`❯`, `╱`)
+  or, with `icons = "none"`, ASCII (`>`, `/`); `bar` is `│` or `|`. Every
+  separator is three cells wide, so switching styles never changes which
+  segments fit.
+* `speaker` sets how user and assistant messages show who is speaking:
+  `prefix` (the default) puts the name on its own heading row; `badge` paints
+  the name as a filled badge; `bar` draws a colored bar beside every row of
+  the message; `gutter` puts the name in an 8-column left gutter beside the
+  message, so every message's text starts in the same column. Narrow
+  transcripts fall back to `prefix` (below 6 columns for `bar`, 20 for
+  `gutter`), and long or wide names are truncated in the gutter.
+* `borders.composer` frames the message composer: `single` (the default),
+  `rounded`, `thick`, `double`, and `ascii` change the frame glyphs, `left`
+  draws a leading bar, and `none` draws no border. Only full frames show the
+  `Message` title; the composer's size never changes.
+* `surfaces = "layered"` paints tool units and group headers on the
+  `surface.raised` background without moving any cell. It has no effect when
+  the raised surface matches the canvas.
+* `motion` sets the activity spinner cadence: `none` holds the spinner still
+  (the elapsed time still updates each second), `subtle` is the default
+  100ms cadence, and `full` is faster. With `focus.effect = "sweep"`, the
+  focus gradient advances while the spinner runs (slowly under `subtle`,
+  faster under `full`). Nothing animates while Bcode is idle. `motion` also
+  times accent color transitions, the transcript's animated scroll to new
+  content, and the glow on the "new messages below" bar: `none` makes them
+  instant, `subtle` keeps the established timing, and `full` lengthens them.
+  An explicit `[tui.theme] accent_transition = "immediate"` or
+  `accent_transition_ms` takes precedence over the theme for accent changes.
+  `[tui] reduce_motion = true` overrides both and makes every animation
+  instant.
 
 ### Structural presentation
 
@@ -233,7 +316,11 @@ set   = { disclosure = "collapsed", reveal = ["running", "waiting", "failed", "t
 * `bridge`: unit kinds that may sit between members without ending the group.
   It defaults to `["reasoning"]` when `by` is not `none`. Bridged units stay in
   place and appear when the group is expanded; they are not members and are not
-  counted.
+  counted. Supplemental and hidden tool contributions are never members either:
+  they stay inside the group of the call they belong to, never split it, and
+  appear whenever that call is shown in full. A contribution of a call outside
+  the group is treated like any other unit between members: it must be a bridge
+  kind, and a failed one ends the group.
 * `min`: the smallest run that forms a group; default and minimum 2.
 
 Groups never reorder units and never cross turns. A group's `bridge` and `min`
@@ -369,17 +456,36 @@ in view.
 | `l`, Right | expand one level (group: collapsed → summary → expanded) |
 | `h`, Left | collapse one level, or move to the parent (section → unit → group) |
 | `e` | expand everything under the focused target |
-| Escape | leave focus mode (`alt+u` also leaves) |
+| `d` | cycle the focused target collapsed → summary → expanded |
+| `i` | open or close the inspector for the focused target |
+| `shift+Down`, `shift+Up` | scroll the inspector (the mouse wheel over it also scrolls) |
+| `m` | make the focused tool unit's disclosure the default for that tool |
+| Escape | close the inspector, then leave focus mode (`alt+u` also leaves, closing the inspector) |
 
 In focus mode the expand-all, collapse-all, and reset actions affect only the
 focused target and what is under it. All keys can be remapped in the
 `transcript_focus` keymap scope; other keys reach the composer as usual.
 
+Outside focus mode `alt+d` (`tui.transcript.cycleDetail`, remappable in the
+`chat` scope) cycles every unit and group together, continuing from the last
+level applied to all of them. The inspector follows focus and shows the target's facts, each
+resolved property with the rule and layer that set it (`default` for host
+defaults), floor adjustments, any manual toggle, and grouping context. `m`
+saves a rule such as `match = { kind = "tool", tool = "read" }`,
+`set = { disclosure = "collapsed" }` to user state, replacing an earlier rule
+for the same tool, and applies it immediately (user-state writes are
+serialized, so a concurrent theme or profile save is never lost); the inspector and
+`bcode theme explain` then report it under the `user_state` layer. The command
+palette offers the same three actions.
+
 #### Explaining a unit
 
 `bcode theme explain` resolves the same layers as the TUI for a described unit
 and prints every property with the rule and layer that set it, floor
-adjustments, and diagnostics:
+adjustments, and diagnostics. Plugin default rules appear as `plugin` layers,
+read from the manifests of the enabled bundled and installed plugins (no plugin
+is started); pass `producer=<plugin id>` to see a plugin's rules apply to its
+own units:
 
 ```console
 bcode theme explain tool=read status=succeeded lines=40
@@ -391,6 +497,36 @@ Facts are `KEY=VALUE` arguments (`kind` defaults to `tool`). `--theme` and
 `--profile` replace the configured selection, and `--profile ""` clears the
 profile. `bcode theme profiles` lists the available profiles and marks the
 configured one.
+
+### Checking a theme
+
+`bcode theme check` audits a theme in both its dark and light variants:
+
+```console
+bcode theme check                 # the configured theme, profile, and overlays
+bcode theme check nord --strict   # fail on any warning
+bcode theme check ./my-theme.toml --json
+```
+
+`THEME` is a theme id, a profile id (checked over `terminal-native`), or a
+theme file. The report lists, per variant:
+
+* contrast ratios (WCAG) for text on the canvas and raised/overlay surfaces,
+  accents and links, state colors and state surfaces, tool titles, diff signs,
+  rows, and emphasis, and selection, against 4.5:1 for text and states and 3:1
+  for muted text, focus borders, diff signs, tool titles, and inactive
+  selection; colors the terminal owns (`terminal` and the 16 ANSI colors) are
+  shown as unmeasured;
+* unknown style roles and container keys;
+* registered roles that resolve only through seed derivation, and roles left
+  unset (renderers use their own fallback);
+* registry coverage;
+* structural rule warnings from the theme's `[[presentation.rules]]`,
+  including rules that try to cross the visibility floor.
+
+Warnings do not fail the command unless `--strict` is given. `--json` prints a
+stable, versioned structure. Every bundled theme passes `--strict` in both
+variants.
 
 ### Unknown roles
 
@@ -415,7 +551,7 @@ Bcode merges configuration in this order, with later files overriding earlier fi
 2. `<repository>/bcode.toml`;
 3. `<repository>/.bcode/bcode.toml`.
 
-Use the user file to define a global default. Use either repository file to define a project default without changing global configuration. Interactive selection is separate: the theme picker and `/theme apply` persist only the selected theme name to global user state (`$BCODE_TUI_STATE` or the Bcode state directory's `tui.toml`). They never create or rewrite `bcode.toml`. `/theme reset` clears that state override and returns to the merged configured default.
+Use the user file to define a global default. Use either repository file to define a project default without changing global configuration. Interactive selection is separate: the appearance picker and `/theme apply` persist only the selected theme name to global user state (`$BCODE_TUI_STATE` or the Bcode state directory's `tui.toml`). They never create or rewrite `bcode.toml`. `/theme reset` clears that state override and returns to the merged configured default.
 
 A complete selection looks like:
 
@@ -459,6 +595,11 @@ Definitions are considered in this order, with later valid definitions taking pr
 Invalid files are diagnosed and are never partially applied. Theme files are data, not executable plugins.
 
 ## Bundled themes
+
+The generated [theme gallery](theme-gallery.md) shows every bundled theme and profile rendered
+through the TUI sample transcript, with per-variant swatch tables. Regenerate it with
+`cargo run -p xtask -- theme-gallery` after changing a bundled theme, profile, or the sample
+render path; `--check` fails when it is stale.
 
 * `terminal-native` is the default. It uses terminal-default foreground/background behavior and minimal decoration.
 * `terminal-native-structured` keeps terminal-native colors while adding structured tool containers.
@@ -521,15 +662,15 @@ a scrim is an opaque presentation choice and should be used sparingly. Missing `
 `border.focused`; missing scrims remain disabled. These optional fallbacks preserve existing
 schema-v1 external themes and keep `terminal-native` transparent.
 
-## Theme picker preview
+## Appearance picker preview
 
-On wide terminals, `/theme` presents a responsive comparison pane beside the catalog list. The
-preview uses bounded renderer-owned semantic fixture rows for user/assistant labels, tool lifecycle,
-code-like content, selection, and focus; it never reads or mutates the live session event stream.
-Narrow or short terminals retain the single-column catalog. Catalog rows and the preview expose the
-canonical source, validation state, selected state, and dark/light variant availability. Moving the
-selection still previews the complete live app, Enter persists through the existing user-state
-effect, and Escape restores the configured presentation.
+On wide terminals, the appearance picker (`/appearance`, `/theme`, `/profile`) presents a preview
+pane beside its palette and profile columns. The preview renders a bounded, renderer-owned sample
+transcript; it never reads or mutates the live session event stream. Narrow or short terminals drop
+the preview and keep the columns. The preview exposes the selected palette's id, source, any
+validation state other than `valid`, and dark/light variant availability. Moving the selection
+previews the complete live app, Enter persists through the existing user-state effect, and Escape
+restores the configured presentation.
 
 ## Authoring examples
 
@@ -708,7 +849,7 @@ when a theme defines them, color `ahead` and `diverged` branches.
 
 ## Reload and errors
 
-External theme roots are polled through a bounded, confined content signature. Valid revisions replace the complete resolved presentation atomically. Invalid or transient revisions retain the last valid configured theme; invalid/disappearing previews close and restore the configured selection. Interactive preview, cancel, and state-backed apply are available from the theme picker and `/theme` commands. A globally selected custom theme must remain discoverable through globally available configured paths; when it is unavailable in a repository, Bcode retains the configured default and reports a diagnostic.
+External theme roots are polled through a bounded, confined content signature. Valid revisions replace the complete resolved presentation atomically. Invalid or transient revisions retain the last valid configured theme; invalid/disappearing previews close and restore the configured selection. Interactive preview, cancel, and state-backed apply are available from the appearance picker and `/theme` commands. A globally selected custom theme must remain discoverable through globally available configured paths; when it is unavailable in a repository, Bcode retains the configured default and reports a diagnostic.
 
 Typical authoring workflow:
 
@@ -719,7 +860,7 @@ $EDITOR ~/.config/bcode/themes/my-theme.toml
 bcode theme validate ~/.config/bcode/themes/my-theme.toml
 ```
 
-Then define `my-theme` as the default in `[tui.theme]`, or select it globally with `/theme apply my-theme` or the theme picker. Interactive selection writes user state, never `bcode.toml`; `/theme reset` restores the configured default. Saving a valid edit hot-reloads the full presentation without recompiling Rust. A parse error leaves the last valid presentation active and emits a bounded source-specific diagnostic; fixing the file permits the next poll to apply it atomically.
+Then define `my-theme` as the default in `[tui.theme]`, or select it globally with `/theme apply my-theme` or the appearance picker. Interactive selection writes user state, never `bcode.toml`; `/theme reset` restores the configured default. Saving a valid edit hot-reloads the full presentation without recompiling Rust. A parse error leaves the last valid presentation active and emits a bounded source-specific diagnostic; fixing the file permits the next poll to apply it atomically.
 
 Syntax grammars classify source tokens into semantic roles; the resolved Bcode theme exclusively selects their final colors. The semantic roles are `syntax.text`, `syntax.comment`, `syntax.keyword`, `syntax.function`, `syntax.variable`, `syntax.string`, `syntax.number`, `syntax.type`, `syntax.operator`, and `syntax.punctuation`. Omitted roles derive from the resolved text, muted, info/accent, success, and warning presentation rather than from a bundled syntax theme.
 

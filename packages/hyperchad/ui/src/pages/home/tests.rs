@@ -243,6 +243,7 @@ fn non_tool_permission_fixture_items(
         session_id: Some(session_id),
         tool_call_id: format!("call-{id}"),
         tool_name: "fixture.tool".to_owned(),
+        producer_plugin_id: None,
         arguments_json: "{}".to_owned(),
         batch: None,
         agent_id: "build".to_owned(),
@@ -529,6 +530,7 @@ fn repeated_domain_components_use_stable_semantic_identities() {
         session_id: Some(session_id),
         tool_call_id: "call-permission".to_owned(),
         tool_name: "fixture.tool".to_owned(),
+        producer_plugin_id: None,
         arguments_json: "{}".to_owned(),
         batch: None,
         agent_id: "build".to_owned(),
@@ -1106,6 +1108,7 @@ fn permission_controls_distinguish_single_batch_and_resolved_history() {
         session_id: Some(session_id),
         tool_call_id: "call-1".to_owned(),
         tool_name: "shell.run".to_owned(),
+        producer_plugin_id: None,
         arguments_json: r#"{"command":"pwd"}"#.to_owned(),
         batch: Some(PermissionBatchView {
             batch_id: "batch-1".to_owned(),
@@ -1172,6 +1175,7 @@ fn grouped_permission_renders_per_call_and_apply_to_all_actions() {
         session_id: snapshot.session_id,
         tool_call_id: "call-1".to_owned(),
         tool_name: "shell.run".to_owned(),
+        producer_plugin_id: None,
         arguments_json: r#"{"command":"pwd"}"#.to_owned(),
         batch: Some(PermissionBatchView {
             batch_id: "batch-1".to_owned(),

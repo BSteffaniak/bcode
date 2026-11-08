@@ -860,6 +860,54 @@ impl PluginManifest {
     }
 }
 
+/// Usable `[presentation]` declarations of `manifests`, by plugin id.
+///
+/// Each value is [`PluginManifest::presentation_declaration`]; manifests that declare nothing
+/// usable are skipped. This only reads manifests: it is the shared source of plugin rule layers
+/// and target fields for renderers and for tooling that does not load plugins.
+#[must_use]
+pub fn presentation_declarations<'a>(
+    manifests: impl IntoIterator<Item = &'a PluginManifest>,
+) -> BTreeMap<String, PluginPresentationDeclaration> {
+    manifests
+        .into_iter()
+        .filter(|manifest| !manifest.presentation.is_empty())
+        .map(|manifest| (manifest.id.clone(), manifest.presentation_declaration()))
+        .filter(|(_, declaration)| !declaration.is_empty())
+        .collect()
+}
+
+/// Manifests of the plugins `selection` enables, without loading any plugin.
+///
+/// Uses the same precedence as native startup: static registrations win over discovered
+/// plugins with the same id. No dynamic library is opened and no plugin is activated, so a
+/// discovered plugin whose library would fail to load is still listed.
+///
+/// # Errors
+///
+/// Returns an error when a static registration's manifest cannot be parsed.
+pub fn selected_plugin_manifests(
+    selection: &PluginSelection,
+    discovered_plugins: Vec<RegisteredPlugin>,
+    static_plugins: &[StaticBundledPlugin],
+) -> Result<Vec<PluginManifest>, PluginLoadError> {
+    let mut manifests = filter_selected_static_plugins(static_plugins, selection)?
+        .into_iter()
+        .map(|(manifest, _)| manifest)
+        .collect::<Vec<_>>();
+    let static_ids = manifests
+        .iter()
+        .map(|manifest| manifest.id.clone())
+        .collect::<BTreeSet<_>>();
+    manifests.extend(
+        filter_selected_plugins(discovered_plugins, selection)
+            .into_iter()
+            .map(|plugin| plugin.manifest)
+            .filter(|manifest| !static_ids.contains(&manifest.id)),
+    );
+    Ok(manifests)
+}
+
 fn validate_tool_presentation_declarations<'a>(
     manifests: impl IntoIterator<Item = &'a PluginManifest>,
 ) -> Result<(), PluginLoadError> {
@@ -7026,6 +7074,128 @@ library = "libdisabled.dylib"
             .expect("static manifest should parse");
 
         assert!(selected.is_empty());
+    }
+
+    /// Vtable for registrations whose manifests are only read.
+    fn manifest_only_vtable() -> StaticPluginVtable {
+        fn manifest(
+            _storage: &'static OnceLock<Option<std::ffi::CString>>,
+        ) -> *const std::ffi::c_char {
+            std::ptr::null()
+        }
+        fn lifecycle(_instance: *const std::ffi::c_void) -> i32 {
+            SERVICE_STATUS_OK
+        }
+        fn event(_instance: *const std::ffi::c_void, _input: *const u8, _input_len: usize) -> i32 {
+            SERVICE_STATUS_OK
+        }
+        StaticPluginVtable {
+            instance: std::ptr::null(),
+            manifest,
+            activate: lifecycle,
+            register_commands: None,
+            register_auth_providers: None,
+            deactivate: lifecycle,
+            invoke_service_streaming: test_streaming_service,
+            cli_registration: None,
+            handle_event: event,
+        }
+    }
+
+    #[test]
+    fn selected_manifests_feed_presentation_layers_without_loading_plugins() {
+        let static_plugins = [StaticBundledPlugin::new(
+            r#"
+id = "test.static"
+name = "Static"
+version = "0.0.1"
+
+[[services]]
+interface_id = "bcode.tool/v1"
+
+[[presentation.tools]]
+tool_name = "static.read"
+target_fields = ["path"]
+
+[[presentation.rules]]
+match = { kind = "tool" }
+set = { disclosure = "collapsed" }
+
+[runtime]
+type = "native"
+abi_version = 1
+library = "libstatic.dylib"
+"#,
+            manifest_only_vtable(),
+        )];
+        let discovered = |id: &str, rules: &str| RegisteredPlugin {
+            manifest_path: PathBuf::from(format!("plugins/{id}/bcode-plugin.toml")),
+            manifest: toml::from_str(&format!(
+                r#"
+id = "{id}"
+name = "Discovered"
+version = "0.0.1"
+{rules}
+[runtime]
+type = "native"
+abi_version = 1
+library = "lib-missing-on-purpose.dylib"
+"#
+            ))
+            .expect("manifest should parse"),
+        };
+        let rule = "[[presentation.rules]]\nmatch = { kind = \"tool\" }\nset = { indent = 2 }\n";
+        let manifests = selected_plugin_manifests(
+            &PluginSelection {
+                mode: PluginSelectionMode::All,
+                enabled: BTreeSet::new(),
+                disabled: BTreeSet::from(["test.disabled".to_owned()]),
+            },
+            vec![
+                // Shadowed by the static registration with the same id.
+                discovered("test.static", ""),
+                discovered("test.installed", rule),
+                discovered("test.disabled", rule),
+                discovered("test.plain", ""),
+            ],
+            &static_plugins,
+        )
+        .expect("manifests are read");
+        let ids = manifests
+            .iter()
+            .map(|manifest| manifest.id.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(ids, ["test.static", "test.installed", "test.plain"]);
+
+        let declarations = presentation_declarations(&manifests);
+        // Manifests that declare nothing usable are skipped.
+        assert_eq!(
+            declarations.keys().map(String::as_str).collect::<Vec<_>>(),
+            ["test.installed", "test.static"]
+        );
+        let layers = presentation::presentation_rule_layers(&declarations);
+        assert_eq!(
+            layers
+                .iter()
+                .map(|layer| layer.source.clone())
+                .collect::<Vec<_>>(),
+            [
+                bcode_presentation_policy_models::LayerSource::Plugin("test.installed".to_owned()),
+                bcode_presentation_policy_models::LayerSource::Plugin("test.static".to_owned()),
+            ]
+        );
+        assert_eq!(
+            layers[1].rules[0].matcher.producer.0,
+            ["test.static".to_owned()]
+        );
+        let fields = presentation::presentation_target_fields(&declarations);
+        assert_eq!(
+            fields,
+            BTreeMap::from([(
+                "static.read".to_owned(),
+                BTreeMap::from([("test.static".to_owned(), vec!["path".to_owned()])]),
+            )])
+        );
     }
 
     #[test]

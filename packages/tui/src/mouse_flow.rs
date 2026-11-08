@@ -22,10 +22,16 @@ pub fn handle_non_permission_mouse(
     match mouse.kind {
         MouseEventKind::ScrollUp => match hit_id {
             Some("composer") => chat.app.previous_input_history(),
+            Some(crate::inspector::INSPECTOR_HIT_ID) => chat
+                .app
+                .scroll_inspector(-crate::inspector::INSPECTOR_SCROLL_ROWS),
             _ => chat.app.scroll_transcript_up(scroll_rows),
         },
         MouseEventKind::ScrollDown => match hit_id {
             Some("composer") => chat.app.next_input_history(),
+            Some(crate::inspector::INSPECTOR_HIT_ID) => chat
+                .app
+                .scroll_inspector(crate::inspector::INSPECTOR_SCROLL_ROWS),
             _ => chat.app.scroll_transcript_down(scroll_rows),
         },
         MouseEventKind::Down(MouseButton::Left) if hit_id == Some("latest-bar") => {

@@ -1830,17 +1830,7 @@ impl BcodeRuntimeModel {
                 if self.loop_state.foreground() == Some(super::foreground::Foreground::Thinking) {
                     return super::invalidation::UiInvalidation::None;
                 }
-                if self.loop_state.handle_theme_picker_key(
-                    &mut self.chat,
-                    stroke,
-                    self.settings.keymap(),
-                ) {
-                    return super::invalidation::UiInvalidation::Structural;
-                }
-                if self.loop_state.foreground() == Some(super::foreground::Foreground::Theme) {
-                    return super::invalidation::UiInvalidation::None;
-                }
-                if self.loop_state.handle_profile_picker_key(
+                if self.loop_state.handle_appearance_picker_key(
                     &mut self.chat,
                     stroke,
                     self.settings.keymap(),
@@ -2122,17 +2112,8 @@ impl BcodeRuntimeModel {
                 {
                     return super::invalidation::UiInvalidation::Structural;
                 }
-                if self.loop_state.foreground() == Some(super::foreground::Foreground::Theme)
-                    && self.loop_state.handle_theme_picker_mouse(
-                        &mut self.chat,
-                        mouse,
-                        self.committed_area,
-                    )
-                {
-                    return super::invalidation::UiInvalidation::Structural;
-                }
-                if self.loop_state.foreground() == Some(super::foreground::Foreground::Profile)
-                    && self.loop_state.handle_profile_picker_mouse(
+                if self.loop_state.foreground() == Some(super::foreground::Foreground::Appearance)
+                    && self.loop_state.handle_appearance_picker_mouse(
                         &mut self.chat,
                         mouse,
                         self.committed_area,
@@ -2787,8 +2768,13 @@ impl BcodeRuntimeModel {
                         self.chat.app.set_status("No active session".to_owned());
                     }
                 }
-                "theme.select" => self.loop_state.open_theme_picker(&mut self.chat),
-                "profile.select" => self.loop_state.open_profile_picker(&mut self.chat),
+                route @ ("theme.select" | "profile.select" | "appearance.select") => {
+                    let axis = super::appearance_picker::AppearanceAxis::for_route(route);
+                    self.loop_state.open_appearance_picker(&mut self.chat, axis);
+                }
+                "transcript.inspect" | "transcript.cycleDetail" | "transcript.makeDefault" => {
+                    self.chat.app.run_transcript_tool_route(&route);
+                }
                 "streaming.configure" => {
                     self.loop_state.open_streaming_configurator(&mut self.chat);
                 }
@@ -3276,8 +3262,7 @@ impl BcodeRuntimeModel {
                     self.chat.app.set_status(format!("theme {id} reloaded"));
                 } else {
                     self.chat.app.cancel_theme_preview();
-                    self.loop_state.close_theme_picker();
-                    self.loop_state.cancel_profile_picker(&mut self.chat);
+                    self.loop_state.cancel_appearance_picker(&mut self.chat);
                     self.chat
                         .app
                         .set_status("preview invalidated; restored configured theme".to_owned());

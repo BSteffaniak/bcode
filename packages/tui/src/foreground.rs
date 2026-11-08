@@ -20,8 +20,7 @@ pub enum Foreground {
     Streaming,
     Timeline,
     Thinking,
-    Theme,
-    Profile,
+    Appearance,
     Commands,
     Slash,
 }

@@ -16,6 +16,7 @@ pub use clierror::CliDiagnosticError;
 mod plugin_cli;
 pub mod retired_catalogs;
 mod session_migration_adapter;
+mod theme_check;
 mod theme_explain;
 pub use xray::xray_export_process_entry;
 
@@ -1110,6 +1111,11 @@ fn write_theme_command(
             write_theme_validation(&path, json, strict, writer)?;
         }
         ThemeCommand::Profiles { json } => theme_explain::run_profiles(json, writer)?,
+        ThemeCommand::Check {
+            theme,
+            strict,
+            json,
+        } => theme_check::run_check(theme.as_deref(), strict, json, writer)?,
         ThemeCommand::Explain {
             theme,
             profile,
@@ -5430,6 +5436,28 @@ enum ThemeCommand {
     },
     /// List every registered semantic style role and the seed palette names.
     Roles,
+    /// Check a theme's contrast, keys, role coverage, and presentation rules.
+    ///
+    /// Resolves the theme in both dark and light variants and reports WCAG
+    /// contrast ratios for text, accent, status, diff, and selection role
+    /// pairs; unknown style roles and container keys; roles that resolve only
+    /// through seed derivation or host fallbacks; role registry coverage; and
+    /// structural presentation rule diagnostics, including rules that cross
+    /// the visibility floor. Warnings do not fail the command unless
+    /// `--strict` is given.
+    Check {
+        /// Theme id, profile id, or theme file path; defaults to the
+        /// configured theme with its profile and overlays. Profiles are
+        /// checked over the default theme.
+        #[arg(value_name = "THEME")]
+        theme: Option<String>,
+        /// Exit with an error when the report has any warning.
+        #[arg(long)]
+        strict: bool,
+        /// Emit the report as JSON.
+        #[arg(long)]
+        json: bool,
+    },
     /// List theme profiles (bundled and discovered) with descriptions.
     Profiles {
         /// Emit the profile list as JSON.

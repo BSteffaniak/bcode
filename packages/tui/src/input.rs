@@ -135,8 +135,10 @@ fn exit_or_clear_composer(app: &mut BmuxApp) -> KeyOutcome {
 
 /// Route `stroke` to transcript focus mode.
 ///
-/// The focus-units chat action enters or leaves focus mode. While focus mode
-/// is active, keys bound in the transcript focus scope run their action.
+/// The focus-units chat action enters or leaves focus mode, and the
+/// detail-cycle chat action cycles disclosure (every unit, or the focused
+/// target in focus mode). While focus mode is active, keys bound in the
+/// transcript focus scope run their action.
 /// Returns `Some(redraw)` when focus mode consumed the key and `None` when the
 /// key belongs to ordinary handling; inactive focus mode consumes nothing but
 /// its entry action.
@@ -154,12 +156,20 @@ pub fn handle_transcript_focus_key(
             app.enter_transcript_focus()
         });
     }
-    if !app.transcript_focus_active() {
-        return None;
+    let focus_action = app
+        .transcript_focus_active()
+        .then(|| keymap.action(FOCUS_SCOPE, stroke))
+        .flatten();
+    // The chat-scope detail cycle works in and out of focus mode, unless a
+    // focus-scope binding claims the same key.
+    if focus_action.is_none()
+        && keymap.action(BmuxScope::Chat.id(), stroke)
+            == Some(super::transcript_focus::CYCLE_DETAIL_ACTION)
+    {
+        app.clear_pending_key_activation();
+        return Some(app.cycle_detail());
     }
-    let action = keymap
-        .action(FOCUS_SCOPE, stroke)
-        .and_then(FocusAction::from_id)?;
+    let action = focus_action.and_then(FocusAction::from_id)?;
     app.clear_pending_key_activation();
     Some(app.handle_transcript_focus_action(action))
 }
@@ -395,6 +405,58 @@ mod tests {
         );
         assert!(!app.transcript_focus_active());
         assert!(app.composer().is_empty());
+    }
+
+    #[test]
+    fn cycle_detail_key_cycles_everything_outside_focus_and_the_target_inside() {
+        use bcode_presentation_policy::models::Disclosure;
+        let (mut app, ids) = focus_app(3);
+        let keymap = BmuxKeyMap::from_config(&TuiConfig::default());
+        let shown = |app: &super::BmuxApp, index: usize| {
+            app.target_disclosure(&DisclosureTarget::Unit(ids[index]))
+                .map(|(disclosure, _)| disclosure)
+        };
+        assert_eq!(
+            handle_transcript_focus_key(&mut app, &keymap, key("alt+d")),
+            Some(true)
+        );
+        assert!((0..3).all(|index| shown(&app, index) == Some(Disclosure::Collapsed)));
+        assert_eq!(
+            handle_transcript_focus_key(&mut app, &keymap, key("alt+u")),
+            Some(true)
+        );
+        assert_eq!(
+            handle_transcript_focus_key(&mut app, &keymap, key("d")),
+            Some(true)
+        );
+        assert_eq!(shown(&app, 2), Some(Disclosure::Summary));
+        assert_eq!(shown(&app, 0), Some(Disclosure::Collapsed));
+        // `i` opens the inspector; Escape closes it before leaving focus.
+        assert_eq!(
+            handle_transcript_focus_key(&mut app, &keymap, key("i")),
+            Some(true)
+        );
+        assert!(app.inspector_open());
+        assert_eq!(
+            handle_transcript_focus_key(&mut app, &keymap, key("escape")),
+            Some(true)
+        );
+        assert!(!app.inspector_open());
+        assert!(app.transcript_focus_active());
+        // Leaving focus with the entry toggle also closes an open inspector,
+        // so no panel outlives the focus scope that routes its keys.
+        assert_eq!(
+            handle_transcript_focus_key(&mut app, &keymap, key("i")),
+            Some(true)
+        );
+        assert!(app.inspector_open());
+        assert_eq!(
+            handle_transcript_focus_key(&mut app, &keymap, key("alt+u")),
+            Some(true)
+        );
+        assert!(!app.transcript_focus_active());
+        assert!(!app.inspector_open());
+        assert!(app.inspector_state().is_none());
     }
 
     #[test]

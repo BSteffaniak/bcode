@@ -2560,6 +2560,95 @@ mod text_update_retention_tests {
         assert_eq!(ledger.value_nodes, actual.value_nodes);
     }
 
+    #[test]
+    fn permission_requests_carry_the_producing_plugin() {
+        let session_id = SessionId::new();
+        let event = |sequence, kind| SessionEvent {
+            schema_version: bcode_session_models::CURRENT_SESSION_EVENT_SCHEMA_VERSION,
+            session_id,
+            sequence,
+            timestamp_ms: sequence,
+            provenance: None,
+            kind,
+        };
+        let permission = |sequence, call: &str, producer: Option<&str>| {
+            event(
+                sequence,
+                SessionEventKind::PermissionRequested {
+                    permission_id: format!("permission-{call}"),
+                    tool_call_id: call.to_owned(),
+                    producer_plugin_id: producer.map(ToOwned::to_owned),
+                    tool_name: "filesystem.write".to_owned(),
+                    arguments_json: "{}".to_owned(),
+                    batch: None,
+                    policy_source: None,
+                    policy_reason: None,
+                },
+            )
+        };
+        let mut view = SessionView::new();
+        view.apply_event(&event(
+            1,
+            SessionEventKind::ToolCallRequested {
+                tool_call_id: "known".to_owned(),
+                producer_plugin_id: Some("bcode.filesystem".to_owned()),
+                tool_name: "filesystem.write".to_owned(),
+                arguments_json: "{}".to_owned(),
+                working_directory: None,
+            },
+        ));
+        let mut bounded = view.clone();
+        // The request's own producer wins; otherwise the owning invocation's
+        // producer is used; an unobserved invocation leaves it unknown.
+        let requests = [
+            permission(2, "known", None),
+            permission(3, "explicit", Some("test.plugin")),
+            permission(4, "unobserved", None),
+        ];
+        for request in &requests {
+            view.apply_event(request);
+            let limits = measured_peak_limits(&bounded, |view, usage, policy| {
+                view.apply_event_bounded(request, usage, policy)
+            });
+            let mut ledger = bounded.observation_retention_usage(limits).unwrap();
+            bounded
+                .apply_event_bounded(request, &mut ledger, limits)
+                .unwrap();
+            let actual = bounded.observation_retention_usage(limits).unwrap();
+            assert_eq!(ledger.scalar_capacity_bytes, actual.scalar_capacity_bytes);
+            assert_eq!(ledger.value_nodes, actual.value_nodes);
+        }
+        assert_eq!(view.snapshot(), bounded.snapshot());
+        let producers = view
+            .snapshot()
+            .transcript
+            .items
+            .iter()
+            .filter_map(|item| match &item.kind {
+                TranscriptViewItemKind::Permission { permission } => Some((
+                    permission.tool_call_id.as_str(),
+                    permission.producer_plugin_id.as_deref(),
+                )),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            producers,
+            [
+                ("known", Some("bcode.filesystem")),
+                ("explicit", Some("test.plugin")),
+                ("unobserved", None),
+            ]
+        );
+        assert!(
+            view.snapshot()
+                .permissions
+                .iter()
+                .any(|permission| permission.producer_plugin_id.as_deref()
+                    == Some("bcode.filesystem"))
+        );
+    }
+
     pub fn measured_peak_limits(
         view: &SessionView,
         apply: impl Fn(
@@ -8783,8 +8872,36 @@ impl SessionView {
         Ok(())
     }
 
+    /// Plugin that provides the tool a permission request is for: the request's own producer,
+    /// else the owning invocation's when it was observed first.
+    fn permission_producer<'a>(
+        &'a self,
+        tool_call_id: &str,
+        requested: Option<&'a str>,
+    ) -> Option<&'a str> {
+        requested.or_else(|| {
+            self.tool_invocations
+                .get(tool_call_id)
+                .and_then(|aggregate| aggregate.projection.producer_plugin_id.as_deref())
+        })
+    }
+
+    /// [`Self::permission_producer`] for a `PermissionRequested` event.
+    fn tool_producer<'a>(&'a self, event: &'a SessionEvent) -> Option<&'a str> {
+        let SessionEventKind::PermissionRequested {
+            tool_call_id,
+            producer_plugin_id,
+            ..
+        } = &event.kind
+        else {
+            return None;
+        };
+        self.permission_producer(tool_call_id, producer_plugin_id.as_deref())
+    }
+
     fn stage_permission_bounded(
         event: &SessionEvent,
+        producer_plugin_id: Option<&str>,
         retained: &mut bcode_session_view_models::retention::ObservationRetentionUsage,
         limits: bcode_session_view_models::retention::ObservationRetentionLimits,
     ) -> Result<
@@ -8809,7 +8926,7 @@ impl SessionView {
         };
         retained.try_add(
             ObservationRetentionUsage {
-                value_nodes: 10,
+                value_nodes: 11,
                 depth: 4,
                 ..ObservationRetentionUsage::default()
             },
@@ -8827,6 +8944,9 @@ impl SessionView {
         let arguments_json = retained.try_clone_string(arguments_json, 4, limits)?;
         let policy_source = policy_source
             .as_ref()
+            .map(|text| retained.try_clone_string(text, 5, limits))
+            .transpose()?;
+        let producer_plugin_id = producer_plugin_id
             .map(|text| retained.try_clone_string(text, 5, limits))
             .transpose()?;
         let detail = policy_reason
@@ -8855,6 +8975,7 @@ impl SessionView {
             session_id: Some(event.session_id),
             tool_call_id,
             tool_name,
+            producer_plugin_id,
             arguments_json,
             batch,
             agent_id: String::new(),
@@ -8885,8 +9006,9 @@ impl SessionView {
             .iter()
             .position(|value| value.permission_id == *permission_id);
         let mut next = *retained;
-        let pending = Self::stage_permission_bounded(event, &mut next, limits)?;
-        let transcript = Self::stage_permission_bounded(event, &mut next, limits)?;
+        let producer = self.tool_producer(event);
+        let pending = Self::stage_permission_bounded(event, producer, &mut next, limits)?;
+        let transcript = Self::stage_permission_bounded(event, producer, &mut next, limits)?;
         let id = format_observation_text(
             format_args!("permission:{permission_id}"),
             &mut next,
@@ -11164,6 +11286,7 @@ impl SessionView {
             SessionEventKind::PermissionRequested {
                 permission_id,
                 tool_call_id,
+                producer_plugin_id,
                 tool_name,
                 arguments_json,
                 policy_source,
@@ -11176,6 +11299,9 @@ impl SessionView {
                     session_id: Some(event.session_id),
                     tool_call_id: tool_call_id.clone(),
                     tool_name: tool_name.clone(),
+                    producer_plugin_id: self
+                        .permission_producer(tool_call_id, producer_plugin_id.as_deref())
+                        .map(ToOwned::to_owned),
                     arguments_json: arguments_json.clone(),
                     batch: batch.clone().map(|batch| {
                         bcode_session_view_models::PermissionBatchView {
@@ -24425,6 +24551,7 @@ mod tests {
             session_id: Some(session_id),
             tool_call_id: "call-1".to_owned(),
             tool_name: "shell.run".to_owned(),
+            producer_plugin_id: None,
             arguments_json: "{}".to_owned(),
             batch: None,
             agent_id: "build".to_owned(),

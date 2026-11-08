@@ -4,8 +4,10 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime};
 
+#[cfg(test)]
+use bcode_config::TuiThemeConfig;
 use bcode_config::{
-    TuiAccentTransitionCurve, TuiConfig, TuiDiffViewerConfig, TuiDiffViewerLayout, TuiThemeConfig,
+    TuiAccentTransitionCurve, TuiConfig, TuiDiffViewerConfig, TuiDiffViewerLayout,
     TuiThinkingConfig,
 };
 use bcode_plugin_sdk::path::display;
@@ -50,15 +52,12 @@ use super::transcript_resident_window::{TranscriptResidentWindow, TranscriptWind
 use super::transcript_viewport::TranscriptViewport;
 
 const MANUAL_TRANSCRIPT_SCROLL_GRACE: Duration = Duration::from_millis(450);
-const TRANSCRIPT_SCROLL_ANIMATION_DURATION: Duration = Duration::from_millis(180);
 const TRANSCRIPT_SCROLL_ANIMATION_FRAME: Duration = Duration::from_millis(16);
 const TRANSCRIPT_SCROLL_ANIMATION_INVALIDATION_KEY: &str = "transcript-scroll-animation";
 const LATEST_BAR_ANIMATION_INVALIDATION_KEY: &str = "latest-bar-animation";
 const THEME_TRANSITION_INVALIDATION_KEY: &str = "theme-transition";
 const ACTIVITY_ANIMATION_INVALIDATION_KEY: &str = "activity-animation";
-const ACTIVITY_ANIMATION_FRAME: Duration = Duration::from_millis(100);
 const THEME_TRANSITION_FRAME: Duration = Duration::from_millis(16);
-const LATEST_BAR_ACTIVE_WINDOW: Duration = Duration::from_millis(420);
 const TOOL_ELAPSED_INVALIDATION_PREFIX: &str = "tool-elapsed";
 const TOOL_ELAPSED_INVALIDATION_MAX_INTERVAL: Duration = Duration::from_secs(1);
 const RESIDENT_TRANSCRIPT_MAX_EVENTS: usize = 1_024;
@@ -135,13 +134,18 @@ struct TranscriptScrollAnimation {
 }
 
 impl TranscriptScrollAnimation {
-    fn new(start_top_row: usize, target_top_row: usize, started_at: Instant) -> Self {
+    fn new(
+        start_top_row: usize,
+        target_top_row: usize,
+        started_at: Instant,
+        duration: Duration,
+    ) -> Self {
         Self {
             start_top_row,
             target_top_row,
             target: TranscriptAnimationTarget::Row,
             started_at,
-            duration: TRANSCRIPT_SCROLL_ANIMATION_DURATION,
+            duration,
             next_frame_at: started_at + TRANSCRIPT_SCROLL_ANIMATION_FRAME,
         }
     }
@@ -202,19 +206,31 @@ impl ThemeTransitionState {
         }
     }
 
-    fn set_target(&mut self, target: Color, config: &TuiThemeConfig, now: Instant) {
+    /// Retarget the accent; a zero `duration` (motion `none`, `reduce_motion`,
+    /// or `accent_transition = "immediate"`) applies it without scheduling
+    /// frames and settles any transition already running.
+    fn set_target(
+        &mut self,
+        target: Color,
+        duration: Duration,
+        curve: TuiAccentTransitionCurve,
+        now: Instant,
+    ) {
         if self.target_accent == target {
-            self.displayed_accent = self.accent_at(now);
+            if duration.is_zero() {
+                self.finish();
+            } else {
+                self.displayed_accent = self.accent_at(now);
+            }
             return;
         }
-        let duration_ms = config.effective_accent_transition_ms();
-        if duration_ms == 0 {
+        if duration.is_zero() {
             self.displayed_accent = target;
             self.source_accent = target;
             self.target_accent = target;
             self.started_at = now;
             self.duration = Duration::ZERO;
-            self.curve = config.accent_transition_curve;
+            self.curve = curve;
             self.next_frame_at = None;
             return;
         }
@@ -222,8 +238,8 @@ impl ThemeTransitionState {
         self.displayed_accent = self.source_accent;
         self.target_accent = target;
         self.started_at = now;
-        self.duration = Duration::from_millis(duration_ms);
-        self.curve = config.accent_transition_curve;
+        self.duration = duration;
+        self.curve = curve;
         self.next_frame_at = Some(now + THEME_TRANSITION_FRAME);
     }
 
@@ -480,12 +496,18 @@ pub struct BmuxApp {
     theme_structure_layers: Vec<bcode_presentation_policy::models::RuleLayer>,
     /// Plugin manifest default rule layers, each scoped to its plugin's units.
     plugin_structure_layers: Vec<bcode_presentation_policy::models::RuleLayer>,
+    /// Effective manifest `[presentation]` declarations the plugin layers and
+    /// target fields were last derived from; an unchanged catalog skips
+    /// re-deriving and recompiling.
+    plugin_presentation_declarations: BTreeMap<String, bcode_plugin::PluginPresentationDeclaration>,
     /// Renderer-neutral configured structural rules.
     configured_structure_rules: Vec<bcode_presentation_policy::models::PresentationRule>,
     /// Interactive structural rules loaded from user state.
     user_structure_rules: Vec<bcode_presentation_policy::models::PresentationRule>,
     /// Keyboard focus over transcript disclosure targets.
     transcript_focus: super::transcript_focus::TranscriptFocus,
+    /// Structure inspector, detail cycling, and pending per-tool defaults.
+    pub(crate) transcript_tools: super::inspector::TranscriptTools,
     /// Transcript residency (length and boundary ids) last reconciled with
     /// disclosure overrides and focus.
     reconciled_residency: Option<(usize, Option<u64>, Option<u64>)>,
@@ -742,9 +764,11 @@ impl BmuxApp {
             structure: super::structure::StructureState::default(),
             theme_structure_layers: Vec::new(),
             plugin_structure_layers: Vec::new(),
+            plugin_presentation_declarations: BTreeMap::new(),
             configured_structure_rules: Vec::new(),
             user_structure_rules: Vec::new(),
             transcript_focus: super::transcript_focus::TranscriptFocus::default(),
+            transcript_tools: super::inspector::TranscriptTools::default(),
             reconciled_residency: None,
             terminal_color_query_sent: false,
             theme_catalog: None,
@@ -1028,18 +1052,27 @@ impl BmuxApp {
     /// Adopt the loaded plugins' manifest `[presentation]` declarations: their
     /// default rules become plugin layers and their declared target fields
     /// feed the `target` fact. Returns whether the structure changed.
+    ///
+    /// Runs whenever the plugin catalog changes: every catalog (re)load, from
+    /// startup or a configuration reload, installs a new presentation through
+    /// [`Self::set_plugin_presentation`]. The effective declarations are the
+    /// fingerprint: when they are unchanged nothing is re-derived or
+    /// recompiled, and changed declarations that yield the same layers only
+    /// update target fields.
     pub fn sync_plugin_structure(&mut self) -> bool {
-        let (layers, fields) = self
+        let declarations = self
             .plugin_presentation
             .as_deref()
-            .map(|presentation| {
-                (
-                    presentation.structure_rule_layers(),
-                    presentation.tool_target_fields(),
-                )
-            })
+            .map(crate::plugin_tui::PluginTuiPresentation::presentation_declarations)
             .unwrap_or_default();
-        let fields_changed = self.apply_tool_target_fields(fields);
+        if declarations == self.plugin_presentation_declarations {
+            return false;
+        }
+        let fields_changed = self.apply_tool_target_fields(
+            bcode_plugin::presentation::presentation_target_fields(&declarations),
+        );
+        let layers = bcode_plugin::presentation::presentation_rule_layers(&declarations);
+        self.plugin_presentation_declarations = declarations;
         if layers == self.plugin_structure_layers {
             return fields_changed;
         }
@@ -2603,8 +2636,7 @@ impl BmuxApp {
         let target = super::theme::resolved_definition_theme(Some(resolved), accent);
         self.theme_preview_id = Some(theme_id.to_owned());
         self.target_theme = target;
-        self.theme_transition
-            .set_target(target.accent, &self.tui_config.theme, Instant::now());
+        self.retarget_theme_transition(target.accent, Instant::now());
         self.update_theme_animation(Instant::now());
     }
 
@@ -2612,8 +2644,7 @@ impl BmuxApp {
     pub(crate) fn preview_resolved_theme(&mut self, theme_id: &str, target: &ResolvedTheme) {
         self.theme_preview_id = Some(theme_id.to_owned());
         self.target_theme = *target;
-        self.theme_transition
-            .set_target(target.accent, &self.tui_config.theme, Instant::now());
+        self.retarget_theme_transition(target.accent, Instant::now());
         self.update_theme_animation(Instant::now());
     }
 
@@ -2641,8 +2672,7 @@ impl BmuxApp {
             );
         }
         self.target_theme = target;
-        self.theme_transition
-            .set_target(target.accent, &self.tui_config.theme, Instant::now());
+        self.retarget_theme_transition(target.accent, Instant::now());
         self.update_theme_animation(Instant::now());
         Some(
             self.theme_preview_id
@@ -2696,6 +2726,17 @@ impl BmuxApp {
         self.invalidate_theme_catalog();
         self.sync_theme_target(Instant::now());
         self.target_theme.fingerprint != before
+    }
+
+    /// Restore the profile selection a picker opened with, even when the
+    /// catalog does not list it (the configured value was live before the
+    /// preview, so it is restored verbatim rather than validated).
+    pub fn restore_profile(&mut self, profile: Option<&str>) {
+        if self.tui_config.theme.profile.as_deref() == profile {
+            return;
+        }
+        self.tui_config.theme.profile = profile.map(str::to_owned);
+        self.sync_theme_target(Instant::now());
     }
 
     /// Select (or clear) the profile overlay; returns false for unknown profiles.
@@ -2784,7 +2825,8 @@ impl BmuxApp {
     /// Rule that makes the disclosure of `item_id`'s tool the user's default.
     ///
     /// Returns `None` for items without a named tool. Persisting the rule is
-    /// the caller's responsibility (user state only, never configuration).
+    /// the caller's responsibility (user state only, never configuration;
+    /// see [`Self::make_focused_default`]).
     #[must_use]
     pub fn default_disclosure_rule(
         &self,
@@ -3057,6 +3099,7 @@ impl BmuxApp {
         for index in changed {
             self.mark_transcript_item_dirty(index);
         }
+        self.transcript_tools.note_global_detail(disclosure);
         self.set_status(format!("All units {}", disclosure_label(disclosure)));
         true
     }
@@ -3226,11 +3269,15 @@ impl BmuxApp {
         true
     }
 
-    /// Leave focus mode; returns whether it was active.
+    /// Leave focus mode, closing the inspector that follows focus; returns
+    /// whether it was active.
     pub fn exit_transcript_focus(&mut self) -> bool {
         if !self.transcript_focus.exit() {
             return false;
         }
+        // The inspector explains the focused target and its keys live in the
+        // focus scope, so it cannot outlive focus mode.
+        let _closed = self.close_inspector();
         self.set_status("Transcript focus closed".to_owned());
         true
     }
@@ -3280,7 +3327,10 @@ impl BmuxApp {
             return false;
         }
         if action == FocusAction::Exit {
-            return self.exit_transcript_focus();
+            return self.close_inspector() || self.exit_transcript_focus();
+        }
+        if let Some(changed) = self.handle_transcript_tool_action(action) {
+            return changed;
         }
         let Some(target) = self.transcript_focus.focused().cloned() else {
             // The focused item left the resident window: refocus from the viewport.
@@ -3334,7 +3384,12 @@ impl BmuxApp {
                 &target,
                 bcode_presentation_policy::models::Disclosure::Expanded,
             ),
-            FocusAction::Exit => unreachable!("handled above"),
+            FocusAction::Exit
+            | FocusAction::CycleDetail
+            | FocusAction::Inspect
+            | FocusAction::InspectorScrollDown
+            | FocusAction::InspectorScrollUp
+            | FocusAction::MakeDefault => unreachable!("handled above"),
         }
     }
 
@@ -3465,8 +3520,7 @@ impl BmuxApp {
     /// Return the current animated accent color for rendering.
     #[cfg(test)]
     pub fn animated_accent(&mut self, target_accent: Color, now: Instant) -> Color {
-        self.theme_transition
-            .set_target(target_accent, &self.tui_config.theme, now);
+        self.retarget_theme_transition(target_accent, now);
         self.update_theme_animation(now);
         self.presented_theme.accent
     }
@@ -3492,9 +3546,26 @@ impl BmuxApp {
             self.theme_structure_layers = layers;
             self.recompile_structure();
         }
-        self.theme_transition
-            .set_target(target.accent, &self.tui_config.theme, now);
+        self.retarget_theme_transition(target.accent, now);
         self.update_theme_animation(now);
+    }
+
+    /// Move the accent toward `target` over the duration the target theme's
+    /// motion, the explicit accent settings, and `reduce_motion` select.
+    fn retarget_theme_transition(&mut self, target: Color, now: Instant) {
+        let explicit = self
+            .tui_config
+            .theme
+            .explicit_accent_transition_ms()
+            .map(Duration::from_millis);
+        let duration = super::theme::effects::MotionPolicy::new(
+            self.target_theme.effects,
+            self.tui_config.reduce_motion,
+        )
+        .accent_transition(explicit);
+        let curve = self.tui_config.theme.accent_transition_curve;
+        self.theme_transition
+            .set_target(target, duration, curve, now);
     }
 
     /// Return the agent id that should be presented in the UI.
@@ -4210,6 +4281,56 @@ impl BmuxApp {
     #[must_use]
     pub const fn activity_frame(&self) -> usize {
         self.activity_frame
+    }
+
+    /// Effective motion: the presented theme's level, forced to `none` by
+    /// `[tui] reduce_motion`.
+    #[must_use]
+    pub const fn motion_policy(&self) -> super::theme::effects::MotionPolicy {
+        super::theme::effects::MotionPolicy::new(
+            self.presented_theme.effects,
+            self.tui_config.reduce_motion,
+        )
+    }
+
+    /// Override the presented and target theme's motion and `reduce_motion`.
+    #[cfg(test)]
+    pub(crate) const fn set_motion_for_test(
+        &mut self,
+        motion: bcode_tui_theme::chrome::Motion,
+        reduce_motion: bool,
+    ) {
+        self.presented_theme.effects.motion = motion;
+        self.target_theme.effects.motion = motion;
+        self.tui_config.reduce_motion = reduce_motion;
+    }
+
+    /// Duration of the running transcript scroll animation, if any.
+    #[cfg(test)]
+    pub(crate) fn transcript_scroll_animation_duration_for_test(&self) -> Option<Duration> {
+        self.transcript_scroll_animation
+            .map(|animation| animation.duration)
+    }
+
+    /// Whether a transcript scroll animation frame is currently requested.
+    #[cfg(test)]
+    pub(crate) fn transcript_scroll_frame_requested_for_test(&self) -> bool {
+        self.invalidation_requests(Instant::now(), SystemTime::now())
+            .iter()
+            .any(|request| is_transcript_scroll_animation_invalidation(&request.key))
+    }
+
+    /// Spinner step for the current activity tick under the effective motion.
+    #[must_use]
+    pub const fn spinner_step(&self) -> usize {
+        self.motion_policy().spinner_step(self.activity_frame)
+    }
+
+    /// Focus gradient phase for the current activity tick; `0` unless the
+    /// theme's `sweep` focus effect animates under the effective motion.
+    #[must_use]
+    pub fn focus_phase(&self) -> u16 {
+        self.motion_policy().focus_phase(self.activity_frame)
     }
 
     /// Elapsed activity time accepted on the animation invalidation boundary.
@@ -5227,10 +5348,17 @@ impl BmuxApp {
         if start_top_row == target_top_row {
             return self.scroll_transcript_to_bottom();
         }
+        let duration = self.motion_policy().transcript_scroll();
+        if duration.is_zero() {
+            // Instant motion jumps; the top row did move.
+            self.scroll_transcript_to_bottom();
+            return true;
+        }
         let mut animation = TranscriptScrollAnimation::new(
             start_top_row,
             target_top_row,
             self.transcript_scroll_animation_now(),
+            duration,
         );
         animation.target = TranscriptAnimationTarget::LatestBottom;
         self.transcript_scroll_animation = Some(animation);
@@ -5417,23 +5545,25 @@ impl BmuxApp {
     }
 
     fn record_latest_hidden_activity(&mut self, now: Instant, changed_rows: usize) {
+        let window = self.motion_policy().latest_bar_window();
         let previous_activity_at = self.latest_hidden_activity_at;
-        if previous_activity_at
-            .is_none_or(|at| now.saturating_duration_since(at) >= LATEST_BAR_ACTIVE_WINDOW)
-        {
+        if previous_activity_at.is_none_or(|at| now.saturating_duration_since(at) >= window) {
             self.latest_hidden_activity_burst = 0;
         }
         let elapsed_ms = previous_activity_at
             .map_or_else(
-                || LATEST_BAR_ACTIVE_WINDOW.as_millis(),
+                || window.as_millis(),
                 |at| now.saturating_duration_since(at).as_millis(),
             )
             .max(1);
         self.latest_hidden_activity_at = Some(now);
         self.latest_bar_animation_started_at = now;
-        let frame_duration = latest_bar_active_frame_duration(self.latest_hidden_activity_burst);
-        let next_frame = next_latest_bar_frame_at(now, now, frame_duration);
-        self.latest_bar_next_frame_at = Some(next_frame);
+        // Instant motion shows the still bar: no glow frames are scheduled.
+        self.latest_bar_next_frame_at = (!window.is_zero()).then(|| {
+            let frame_duration =
+                latest_bar_active_frame_duration(self.latest_hidden_activity_burst);
+            next_latest_bar_frame_at(now, now, frame_duration)
+        });
         let velocity_rows_per_second = u128::try_from(changed_rows)
             .unwrap_or(u128::MAX)
             .saturating_mul(1_000)
@@ -5662,10 +5792,17 @@ impl BmuxApp {
             .viewport
             .start_follow_anchor_animation(top_row)
         {
+            let duration = self.motion_policy().transcript_scroll();
+            if duration.is_zero() {
+                // Instant motion lands where a finished animation would.
+                self.session_ui.viewport.materialize_top_row(target_top_row);
+                return;
+            }
             let mut animation = TranscriptScrollAnimation::new(
                 start_top_row,
                 target_top_row,
                 self.transcript_scroll_animation_now(),
+                duration,
             );
             animation.target = self
                 .transcript_layout
@@ -6262,7 +6399,11 @@ impl BmuxApp {
         if self.activity_animation_active() {
             requests.push(InvalidationRequest::new(
                 InvalidationKey::new(ACTIVITY_ANIMATION_INVALIDATION_KEY),
-                next_periodic_deadline(self.activity_started_at, now, ACTIVITY_ANIMATION_FRAME),
+                next_periodic_deadline(
+                    self.activity_started_at,
+                    now,
+                    self.motion_policy().activity_frame_interval(),
+                ),
             ));
         }
         requests.extend(self.tool_elapsed_invalidation_requests(now, now_system));
@@ -6320,6 +6461,13 @@ impl BmuxApp {
                 self.activity_elapsed = now.saturating_duration_since(self.activity_started_at);
                 if self.activity_animation_active() {
                     damage.insert(TemporalDamage::Status);
+                    if self.motion_policy().focus_sweeps()
+                        && super::render::focus_gradient_painted()
+                    {
+                        // Focused gradient borders live in overlays anywhere
+                        // on screen; repaint only while one is painted.
+                        damage.insert(TemporalDamage::Full);
+                    }
                     invalidation.merge(UiInvalidation::Paint)
                 } else {
                     invalidation
@@ -6345,8 +6493,9 @@ impl BmuxApp {
     }
 
     fn latest_bar_active(&self, now: Instant) -> bool {
+        let window = self.motion_policy().latest_bar_window();
         self.latest_hidden_activity_at
-            .is_some_and(|at| now.saturating_duration_since(at) < LATEST_BAR_ACTIVE_WINDOW)
+            .is_some_and(|at| now.saturating_duration_since(at) < window)
     }
 
     fn handle_transcript_scroll_animation(&mut self, now: Instant) -> bool {
@@ -7947,7 +8096,8 @@ mod tests {
             .sync_max(20, 9, 30, 10, false, &mut app.older_history);
         app.session_ui.viewport.reveal(true);
         let now = std::time::Instant::now();
-        let mut animation = super::TranscriptScrollAnimation::new(0, 12, now);
+        let mut animation =
+            super::TranscriptScrollAnimation::new(0, 12, now, Duration::from_millis(180));
         // Missing correspondence remains a row target, not a tail command.
         animation.started_at = now
             .checked_sub(std::time::Duration::from_secs(1))
@@ -8913,7 +9063,7 @@ mod tests {
         app.apply_tui_config(TuiConfig {
             theme: TuiThemeConfig {
                 accent_transition: bcode_config::TuiAccentTransitionMode::Transition,
-                accent_transition_ms: 100,
+                accent_transition_ms: Some(100),
                 ..TuiThemeConfig::default()
             },
             ..TuiConfig::default()
@@ -9125,6 +9275,15 @@ mod tests {
     #[test]
     fn theme_preview_apply_and_cancel_are_in_memory_transitions() {
         let mut app = BmuxApp::new_with_history(None, &[], &[], false);
+        // Immediate accents keep the comparison independent of how much wall
+        // time passes between steps.
+        app.apply_tui_config(TuiConfig {
+            theme: TuiThemeConfig {
+                accent_transition: bcode_config::TuiAccentTransitionMode::Immediate,
+                ..TuiThemeConfig::default()
+            },
+            ..TuiConfig::default()
+        });
         let configured = app.tui_config().theme.name.clone();
         let initial = app.presented_theme();
 
@@ -9646,10 +9805,125 @@ mod tests {
         assert_eq!(focused, None);
     }
 
+    const MOTION_CASES: [(bcode_tui_theme::chrome::Motion, bool); 4] = [
+        (bcode_tui_theme::chrome::Motion::None, false),
+        (bcode_tui_theme::chrome::Motion::Subtle, false),
+        (bcode_tui_theme::chrome::Motion::Full, false),
+        (bcode_tui_theme::chrome::Motion::Full, true),
+    ];
+
+    fn accent_transition_under(
+        motion: bcode_tui_theme::chrome::Motion,
+        reduce_motion: bool,
+        explicit_ms: Option<u64>,
+    ) -> (Duration, Option<Instant>) {
+        let mut app = BmuxApp::new_with_history(None, &[], &[], false);
+        app.apply_tui_config(TuiConfig {
+            theme: TuiThemeConfig {
+                accent_transition_ms: explicit_ms,
+                ..TuiThemeConfig::default()
+            },
+            reduce_motion,
+            ..TuiConfig::default()
+        });
+        app.set_motion_for_test(motion, reduce_motion);
+        let now = Instant::now();
+        let target = Color::Rgb(1, 2, 3);
+        let accent = app.animated_accent(target, now);
+        let duration = app.theme_transition.duration;
+        let deadline = invalidation_deadline(&app, THEME_TRANSITION_INVALIDATION_KEY, now);
+        drop(app);
+        assert_eq!(
+            accent == target,
+            duration.is_zero(),
+            "an instant transition presents its target at once"
+        );
+        (duration, deadline)
+    }
+
+    #[test]
+    fn accent_transitions_follow_motion_and_schedule_no_frames_when_instant() {
+        use bcode_tui_theme::chrome::Motion;
+        let mut durations = Vec::new();
+        for (motion, reduce_motion) in MOTION_CASES {
+            let (duration, deadline) = accent_transition_under(motion, reduce_motion, None);
+            let instant = motion == Motion::None || reduce_motion;
+            assert_eq!(duration.is_zero(), instant, "{motion:?}/{reduce_motion}");
+            assert_eq!(deadline.is_none(), instant, "{motion:?}/{reduce_motion}");
+            durations.push(duration);
+        }
+        assert!(durations[2] > durations[1], "full outlasts subtle");
+    }
+
+    #[test]
+    fn explicit_accent_duration_beats_theme_motion_but_not_reduce_motion() {
+        use bcode_tui_theme::chrome::Motion;
+        for (motion, reduce_motion) in MOTION_CASES {
+            let (duration, deadline) = accent_transition_under(motion, reduce_motion, Some(500));
+            if reduce_motion {
+                assert_eq!(duration, Duration::ZERO, "{motion:?}");
+                assert_eq!(deadline, None, "{motion:?}");
+            } else {
+                assert_eq!(duration, Duration::from_millis(500), "{motion:?}");
+                assert!(deadline.is_some(), "{motion:?}");
+            }
+        }
+        let (duration, deadline) = accent_transition_under(Motion::Full, false, Some(0));
+        assert_eq!((duration, deadline), (Duration::ZERO, None));
+    }
+
+    #[test]
+    fn reduce_motion_settles_a_running_accent_transition() {
+        let mut app = BmuxApp::new_with_history(None, &[], &[], false);
+        let now = Instant::now();
+        let target = Color::Rgb(1, 2, 3);
+        assert_ne!(app.animated_accent(target, now), target);
+        let mut config = app.tui_config().clone();
+        config.reduce_motion = true;
+        app.apply_tui_config(config);
+        let later = now + Duration::from_millis(1);
+        app.animated_accent(target, later);
+        let deadline = invalidation_deadline(&app, THEME_TRANSITION_INVALIDATION_KEY, later);
+        let active = app.theme_transition_active(later);
+        drop(app);
+        assert_eq!(deadline, None);
+        assert!(!active);
+    }
+
+    #[test]
+    fn latest_bar_glow_follows_motion_and_schedules_no_frames_when_instant() {
+        use bcode_tui_theme::chrome::Motion;
+        let mut windows = Vec::new();
+        for (motion, reduce_motion) in MOTION_CASES {
+            let mut app = BmuxApp::new_with_history(None, &[], &[], false);
+            app.set_motion_for_test(motion, reduce_motion);
+            let now = Instant::now();
+            app.record_latest_hidden_activity(now, 4);
+            let window = app.motion_policy().latest_bar_window();
+            let scheduled = app.latest_bar_next_frame_at.is_some();
+            let active_now = app.latest_bar_active(now);
+            let instant = motion == Motion::None || reduce_motion;
+            if !instant {
+                assert!(
+                    app.latest_bar_active(now + window.saturating_sub(Duration::from_millis(1)))
+                );
+                assert!(!app.latest_bar_active(now + window));
+            }
+            drop(app);
+            assert_eq!(window.is_zero(), instant, "{motion:?}/{reduce_motion}");
+            assert_eq!(scheduled, !instant, "{motion:?}/{reduce_motion}");
+            assert_eq!(active_now, !instant, "{motion:?}/{reduce_motion}");
+            windows.push(window);
+        }
+        assert_eq!(windows[1], Duration::from_millis(420));
+        assert!(windows[2] > windows[1], "full glows longer than subtle");
+    }
+
     #[test]
     fn animation_deadlines_catch_up_from_monotonic_origin() {
         let started_at = Instant::now();
-        let mut scroll = TranscriptScrollAnimation::new(0, 10, started_at);
+        let mut scroll =
+            TranscriptScrollAnimation::new(0, 10, started_at, Duration::from_millis(180));
         let delayed = started_at + Duration::from_millis(73);
         scroll.advance_frame(delayed);
         assert_eq!(scroll.next_frame_at, started_at + Duration::from_millis(80));
@@ -9707,7 +9981,7 @@ mod tests {
 
         let (finished, damage) = app.handle_invalidations_with_damage(
             &[InvalidationKey::new(LATEST_BAR_ANIMATION_INVALIDATION_KEY)],
-            now + LATEST_BAR_ACTIVE_WINDOW,
+            now + app.motion_policy().latest_bar_window(),
         );
         let deadline_cleared = app.latest_bar_next_frame_at.is_none();
         drop(app);
@@ -13167,6 +13441,101 @@ mod structure_layer_tests {
         let mut app = BmuxApp::new_with_history(None, &[], &[], false);
         assert!(!app.sync_plugin_structure());
         assert_eq!(app.plugin_structure_layers, Vec::new());
+        drop(app);
+    }
+
+    /// Manifest with a plugin default rule appended to the bundled shell
+    /// manifest (`[[presentation.rules]]` may follow any table).
+    const SHELL_WITH_RULES: &str = concat!(
+        include_str!("../../../plugins/shell-plugin/bcode-plugin.toml"),
+        "\n[[presentation.rules]]\nmatch = { kind = \"tool\" }\nset = { disclosure = \"collapsed\" }\n",
+    );
+
+    /// A production (runtime-backed) presentation over `plugins`.
+    fn runtime_presentation(
+        plugins: &[bcode_plugin::StaticBundledPlugin],
+    ) -> std::sync::Arc<crate::plugin_tui::PluginTuiPresentation> {
+        let selected = bcode_plugin::filter_selected_static_plugins(
+            plugins,
+            &bcode_plugin::PluginSelection::all_enabled(),
+        )
+        .expect("bundled manifests parse");
+        let host = bcode_plugin::PluginHost::load_static_plugins_best_effort(&selected);
+        std::sync::Arc::new(
+            crate::plugin_tui::PluginTuiPresentation::with_runtime_config_and_extensions(
+                host.into(),
+                bcode_config::TuiVisualAdapterConfig::default(),
+                &[],
+            ),
+        )
+    }
+
+    #[test]
+    fn plugin_catalog_changes_recompile_plugin_layers_and_target_fields() {
+        let catalog = [
+            bcode_plugin::StaticBundledPlugin::new(
+                include_str!("../../../plugins/filesystem-plugin/bcode-plugin.toml"),
+                bcode_filesystem_plugin::static_plugin(),
+            ),
+            bcode_plugin::StaticBundledPlugin::new(
+                SHELL_WITH_RULES,
+                bcode_shell_plugin::static_plugin(),
+            ),
+        ];
+        let mut app = BmuxApp::new_with_history(None, &[], &[], false);
+        let shell_unit = tool("shell.run", "bcode.shell");
+        // `filesystem.grep` declares `pattern` before `path`; host fields try
+        // `path` first, so the target shows which fields applied.
+        let grep_target = |app: &BmuxApp| {
+            app.structure
+                .snapshot()
+                .facts(&bcode_tui_components::transcript::item::tool_request_item(
+                    "call",
+                    Some("bcode.filesystem"),
+                    "filesystem.grep",
+                    r#"{"pattern":"todo","path":"src"}"#,
+                    None,
+                ))
+                .and_then(|facts| facts.target)
+        };
+
+        app.set_plugin_presentation(runtime_presentation(&[]));
+        assert_eq!(app.plugin_structure_layers, Vec::new());
+        let before = app.structure_snapshot().resolve(&shell_unit).disclosure;
+        assert_ne!(before, Disclosure::Collapsed);
+        assert_eq!(grep_target(&app).as_deref(), Some("src"));
+
+        // A later catalog brings plugins with rules and target fields.
+        let revision = app.structure.revision();
+        app.set_plugin_presentation(runtime_presentation(&catalog));
+        assert_eq!(
+            app.plugin_structure_layers
+                .iter()
+                .map(|layer| layer.source.clone())
+                .collect::<Vec<_>>(),
+            [LayerSource::Plugin("bcode.shell".to_owned())]
+        );
+        assert!(app.structure.revision() > revision);
+        assert_eq!(
+            app.structure_snapshot().resolve(&shell_unit).disclosure,
+            Disclosure::Collapsed
+        );
+        assert_eq!(grep_target(&app).as_deref(), Some("todo"));
+
+        // Reloading an identical catalog re-derives and recompiles nothing.
+        let revision = app.structure.revision();
+        app.plugin_presentation = Some(runtime_presentation(&catalog));
+        assert!(!app.sync_plugin_structure());
+        assert_eq!(app.structure.revision(), revision);
+
+        // Dropping the plugins removes their layer and fields again.
+        app.set_plugin_presentation(runtime_presentation(&[]));
+        assert_eq!(app.plugin_structure_layers, Vec::new());
+        assert_eq!(
+            app.structure_snapshot().resolve(&shell_unit).disclosure,
+            before
+        );
+        assert_eq!(grep_target(&app).as_deref(), Some("src"));
         drop(app);
     }
 }

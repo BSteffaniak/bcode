@@ -474,6 +474,7 @@ pub fn inspect_permission(
         session_id: _,
         tool_call_id,
         tool_name,
+        producer_plugin_id,
         arguments_json,
         batch,
         agent_id,
@@ -494,7 +495,12 @@ pub fn inspect_permission(
     ] {
         walker.text(text, 2)?;
     }
-    for text in [title.as_ref(), policy_source.as_ref(), detail.as_ref()] {
+    for text in [
+        title.as_ref(),
+        policy_source.as_ref(),
+        detail.as_ref(),
+        producer_plugin_id.as_ref(),
+    ] {
         walker.optional_text(text, 2)?;
     }
     walker.usage.try_add(
@@ -1628,6 +1634,7 @@ mod tests {
             session_id: None,
             tool_call_id: String::new(),
             tool_name: String::new(),
+            producer_plugin_id: None,
             arguments_json: String::new(),
             agent_id: String::new(),
             batch: Some(crate::PermissionBatchView {

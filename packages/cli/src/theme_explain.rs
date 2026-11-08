@@ -1,15 +1,18 @@
 //! `bcode theme explain` and `bcode theme profiles`.
 //!
 //! Explain resolves structural presentation for one described unit exactly as
-//! the TUI does: the configured theme and profile layers, then declarative
-//! `[[presentation.rules]]`, then interactive user-state rules, compiled with
-//! the host section registry.
+//! the TUI does: host defaults, plugin manifest default rules, the configured
+//! theme and profile layers, then declarative `[[presentation.rules]]`, then
+//! interactive user-state rules, compiled with the host section registry.
+//!
+//! Plugin layers come from the manifests of the enabled bundled and installed
+//! plugins, read without loading any plugin library.
 
 use std::path::{Path, PathBuf};
 
 use bcode_presentation_policy::models::{
-    DurationBucket, LayerSource, PresentationRule, ResolvedPresentation, SizeBucket, TurnRecency,
-    UnitFacts, UnitKind, UnitStatus,
+    DurationBucket, LayerSource, PresentationRule, ResolvedPresentation, RuleLayer, SizeBucket,
+    TurnRecency, UnitFacts, UnitKind, UnitStatus,
 };
 use bcode_presentation_policy::{
     CompiledPolicy, DiagnosticSeverity, PolicyDiagnostic, PolicyRegistry, PropertyOrigin,
@@ -175,6 +178,10 @@ pub struct ExplainInputs {
     pub variant: ResolvedThemeVariant,
     /// Theme discovery roots.
     pub roots: Vec<ThemeDiscoveryRoot>,
+    /// Plugin manifest default rule layers (see [`plugin_rule_layers`]).
+    pub plugin_layers: Vec<RuleLayer>,
+    /// Why plugin manifests or declarations were skipped.
+    pub plugin_warnings: Vec<String>,
     /// Declarative `[[presentation.rules]]`.
     pub config_rules: Vec<PresentationRule>,
     /// Interactive rules persisted to user state.
@@ -204,6 +211,65 @@ pub fn theme_selection(
         .profile
         .filter(|profile| !profile.trim().is_empty());
     (selected.name, profile, overlays)
+}
+
+/// Maximum plugin warnings reported, so a damaged plugin directory cannot
+/// flood the output.
+const MAX_PLUGIN_WARNINGS: usize = 32;
+
+/// Plugin manifest default rule layers for the plugins `selection` enables,
+/// as the TUI stacks them, read from manifests only.
+///
+/// Static registrations take precedence over `discovered` plugins with the
+/// same id. No plugin library is loaded, so a discovered plugin whose library
+/// would fail to load still contributes its layer. Returns the layers and the
+/// (bounded) warnings for manifests or declaration entries that were skipped.
+#[must_use]
+pub fn plugin_rule_layers(
+    selection: &bcode_plugin::PluginSelection,
+    discovered: Vec<bcode_plugin::RegisteredPlugin>,
+    static_plugins: &[bcode_plugin::StaticBundledPlugin],
+) -> (Vec<RuleLayer>, Vec<String>) {
+    let mut warnings = Vec::new();
+    let manifests = bcode_plugin::selected_plugin_manifests(selection, discovered, static_plugins)
+        .unwrap_or_else(|error| {
+            warnings.push(format!("plugin manifests ignored: {error}"));
+            Vec::new()
+        });
+    let declarations = bcode_plugin::presentation_declarations(&manifests);
+    warnings.extend(declarations.iter().flat_map(|(plugin_id, declaration)| {
+        declaration
+            .diagnostics
+            .iter()
+            .map(move |diagnostic| format!("plugin {plugin_id}: {diagnostic}"))
+    }));
+    warnings.truncate(MAX_PLUGIN_WARNINGS);
+    (
+        bcode_plugin::presentation::presentation_rule_layers(&declarations),
+        warnings,
+    )
+}
+
+/// Plugin layers for the configured plugin selection: bundled registrations
+/// plus manifests discovered in the default plugin roots.
+fn configured_plugin_layers(config: &bcode_config::BcodeConfig) -> (Vec<RuleLayer>, Vec<String>) {
+    let (discovered, discovery_warning) = match bcode_plugin::discover_plugins() {
+        Ok(discovered) => (discovered, None),
+        Err(error) => (
+            Vec::new(),
+            Some(format!("installed plugin discovery failed: {error}")),
+        ),
+    };
+    let (layers, mut warnings) = plugin_rule_layers(
+        &crate::plugin_selection_for_config(config),
+        discovered,
+        &crate::static_bundled_plugins(),
+    );
+    if let Some(warning) = discovery_warning {
+        warnings.insert(0, warning);
+        warnings.truncate(MAX_PLUGIN_WARNINGS);
+    }
+    (layers, warnings)
 }
 
 fn project_root() -> PathBuf {
@@ -237,12 +303,15 @@ pub fn load_explain_inputs(
         Ok(rules) => (rules, None),
         Err(error) => (Vec::new(), Some(error.to_string())),
     };
+    let (plugin_layers, plugin_warnings) = configured_plugin_layers(&config);
     Ok(ExplainInputs {
         theme,
         profile,
         overlays,
         variant: bcode_tui::theme::resolve_variant_for_config(config.tui.theme.variant),
         roots: configured_roots(&config, &project_root()),
+        plugin_layers,
+        plugin_warnings,
         // Same Config layer as the TUI: the legacy `tui.thinking` mapping
         // first, then declarative `[[presentation.rules]]`.
         config_rules: config
@@ -375,19 +444,18 @@ pub fn explain(inputs: &ExplainInputs, facts: UnitFacts) -> Result<ExplainReport
     if let Some(error) = &inputs.user_state_error {
         warnings.push(format!("user-state rules ignored: {error}"));
     }
-    // Stacked by the same helper as the TUI. Plugin manifest layers are not
-    // loaded here (explain does not start plugins), so the plugin slot is
-    // empty; see "Not yet done" in docs/presentation-architecture.md.
+    warnings.extend(inputs.plugin_warnings.iter().cloned());
+    // Stacked by the same helper as the TUI.
     let layers = structure_layers(
         &bcode_tui::theme::structure_layers_for(Some(&resolved)),
-        &[],
+        &inputs.plugin_layers,
         &inputs.config_rules,
         &inputs.user_rules,
     );
     let (policy, diagnostics) =
         CompiledPolicy::compile(&layers, &PolicyRegistry::with_host_parts());
     let explained = policy.explain(&facts);
-    let properties = property_rows(&explained.presentation, &explained.origins)?;
+    let properties = property_rows(&explained.presentation, &explained.origins);
     Ok(ExplainReport {
         schema_version: 1,
         theme: ExplainTheme {
@@ -412,59 +480,30 @@ pub fn explain(inputs: &ExplainInputs, facts: UnitFacts) -> Result<ExplainReport
     })
 }
 
-/// Flatten a resolved presentation into property rows, attaching origins.
-///
-/// Sections expand to `sections.<name>.<field>` and plugin properties use
-/// their namespaced key, matching [`PropertyOrigin::property`] names.
+/// Flatten a resolved presentation into property rows, attaching origins,
+/// with the same flattening the in-TUI inspector shows
+/// ([`bcode_tui::inspector::property_rows`]).
 fn property_rows(
     presentation: &ResolvedPresentation,
     origins: &[PropertyOrigin],
-) -> Result<Vec<ExplainProperty>, CliError> {
-    let serde_json::Value::Object(fields) = serde_json::to_value(presentation)? else {
-        return Ok(Vec::new());
-    };
-    let mut values = Vec::new();
-    for (name, value) in fields {
-        match (name.as_str(), value) {
-            ("sections", serde_json::Value::Object(sections)) => {
-                for (section, value) in sections {
-                    if let serde_json::Value::Object(section_fields) = value {
-                        for (field, value) in section_fields {
-                            values.push((format!("sections.{section}.{field}"), value));
-                        }
-                    }
-                }
-            }
-            ("plugin", serde_json::Value::Object(plugin)) => values.extend(plugin),
-            (_, value) => values.push((name, value)),
-        }
-    }
-    Ok(values
+) -> Vec<ExplainProperty> {
+    bcode_tui::inspector::property_rows(presentation, origins)
         .into_iter()
-        .map(|(property, value)| ExplainProperty {
-            origin: origins
-                .iter()
-                .find(|origin| origin.property == property)
-                .map(|origin| ExplainOrigin {
-                    source: origin.source.clone(),
-                    rule: origin.rule,
-                }),
-            property,
-            value,
+        .map(|row| ExplainProperty {
+            property: row.property,
+            value: row.value,
+            origin: row.origin.map(|origin| ExplainOrigin {
+                source: origin.source,
+                rule: origin.rule,
+            }),
         })
-        .collect())
+        .collect()
 }
 
 /// Short human label for a layer source (`theme:compact`, `config`, …).
 #[must_use]
 pub fn layer_label(source: &LayerSource) -> String {
-    match source {
-        LayerSource::Host => "host".to_owned(),
-        LayerSource::Plugin(id) => format!("plugin:{id}"),
-        LayerSource::Theme(id) => format!("theme:{id}"),
-        LayerSource::Config => "config".to_owned(),
-        LayerSource::UserState => "user_state".to_owned(),
-    }
+    bcode_tui::inspector::layer_label(source)
 }
 
 /// Write `report` as JSON or tab-separated text.
@@ -635,6 +674,8 @@ mod tests {
             overlays,
             variant: ResolvedThemeVariant::Dark,
             roots,
+            plugin_layers: Vec::new(),
+            plugin_warnings: Vec::new(),
             config_rules: Vec::new(),
             user_rules: Vec::new(),
             user_state_error: None,
@@ -702,6 +743,120 @@ mod tests {
         assert_eq!(
             spacing.origin.as_ref().map(|origin| &origin.source),
             Some(&LayerSource::Host)
+        );
+    }
+
+    #[test]
+    fn plugin_manifest_rules_are_explained_as_plugin_layers() {
+        /// Never activated: explain reads manifests only.
+        #[derive(Default)]
+        struct ManifestOnly;
+        impl bcode_plugin_sdk::RustPlugin for ManifestOnly {}
+        const BUNDLED: &str = r#"
+id = "test.bundled"
+name = "Bundled"
+version = "0.0.1"
+
+[[presentation.rules]]
+match = { kind = "tool" }
+set = { disclosure = "collapsed" }
+
+[runtime]
+type = "native"
+abi_version = 1
+library = "libbundled.dylib"
+"#;
+        let bundled = [bcode_plugin::StaticBundledPlugin::new(
+            BUNDLED,
+            bcode_plugin_sdk::static_plugin_vtable!(ManifestOnly, BUNDLED),
+        )];
+        let installed = bcode_plugin::RegisteredPlugin {
+            manifest_path: PathBuf::from("plugins/installed/bcode-plugin.toml"),
+            manifest: toml::from_str(
+                r#"
+id = "test.installed"
+name = "Installed"
+version = "0.0.1"
+
+[[presentation.rules]]
+match = { kind = "tool", producer = "someone.else" }
+set = { indent = 4 }
+
+[[presentation.rules]]
+match = { kind = "tool" }
+set = { spacing = { before = 2, after = 2 } }
+
+[runtime]
+type = "native"
+abi_version = 1
+library = "libmissing.dylib"
+"#,
+            )
+            .expect("installed manifest"),
+        };
+        let (plugin_layers, plugin_warnings) = plugin_rule_layers(
+            &bcode_plugin::PluginSelection::all_enabled(),
+            vec![installed],
+            &bundled,
+        );
+        let (_directory, mut inputs) = inputs(None);
+        inputs.plugin_layers = plugin_layers;
+        inputs.plugin_warnings = plugin_warnings;
+        let own = |producer: &str| UnitFacts {
+            kind: Some(UnitKind::Tool),
+            producer: Some(producer.to_owned()),
+            ..UnitFacts::default()
+        };
+
+        let report = explain(&inputs, own("test.bundled")).expect("explain");
+        let sources = report
+            .layers
+            .iter()
+            .map(|layer| layer.source.clone())
+            .collect::<Vec<_>>();
+        // Plugin layers, in plugin-id order, sit after host defaults and
+        // before every theme, configuration, and user-state layer.
+        let plugin = |id: &str| LayerSource::Plugin(id.to_owned());
+        let stacked = sources
+            .iter()
+            .filter(|source| **source != LayerSource::Host)
+            .take(2)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            stacked,
+            [&plugin("test.bundled"), &plugin("test.installed")],
+            "{sources:?}"
+        );
+        let disclosure = property(&report, "disclosure");
+        assert_eq!(disclosure.value, serde_json::json!("collapsed"));
+        assert_eq!(
+            disclosure.origin.as_ref().map(|origin| &origin.source),
+            Some(&plugin("test.bundled"))
+        );
+        // The installed plugin's rule naming another producer was dropped
+        // with a warning; its own rule applies only to its own units.
+        assert!(
+            report
+                .warnings
+                .iter()
+                .any(|warning| warning.starts_with("plugin test.installed:")),
+            "{:?}",
+            report.warnings
+        );
+        let spacing = property(
+            &explain(&inputs, own("test.installed")).expect("explain"),
+            "spacing",
+        )
+        .origin
+        .as_ref()
+        .map(|origin| origin.source.clone());
+        assert_eq!(spacing, Some(plugin("test.installed")));
+        assert_ne!(
+            property(&report, "spacing")
+                .origin
+                .as_ref()
+                .map(|origin| &origin.source),
+            Some(&plugin("test.installed"))
         );
     }
 

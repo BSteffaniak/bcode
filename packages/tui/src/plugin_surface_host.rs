@@ -1024,6 +1024,7 @@ fn client_permission_views(
             session_id: Some(permission.session_id),
             tool_call_id: permission.tool_call_id,
             tool_name: permission.tool_name,
+            producer_plugin_id: None,
             arguments_json: permission.arguments_json,
             batch: permission
                 .batch

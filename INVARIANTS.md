@@ -38,6 +38,7 @@ An invariant is a durable condition of a valid product or architecture. Contribu
 * **Plugin interfaces are typed and compatibility-defined.** Cross-boundary plugin requests, responses, manifests, and contributed schemas are typed and serializable, with explicit compatibility semantics at independently evolving interface boundaries; separate versions are not required on every nested type or operation.
 * **Bundled plugins remain disableable.** Bundled plugins may be enabled by default, but disabling one must not break unrelated Bcode capabilities.
 * **Renderers do not take ownership of plugin behavior.** A renderer may adapt a plugin-owned schema but must not become the owner of the plugin's workflow or business rules.
+* **Plugin presentation contributions are display data only.** Plugin-declared presentation, including manifest rules, summaries, targets, and sections, affects only how that plugin's own units are displayed; it never affects authorization, dispatch, execution, or the presentation of units produced by others.
 
 ## Session persistence
 
@@ -65,7 +66,7 @@ An invariant is a durable condition of a valid product or architecture. Contribu
 * **Authorization precedes side effects.** Tools and commands must not perform side effects before applicable policy and user-permission decisions complete.
 * **Permission decisions use canonical operation facts.** Policy evaluates normalized operation facts rather than presentation text or untrusted tool descriptions.
 * **Tool results are untrusted input.** Tool output is bounded and treated as potentially partial, malformed, secret-bearing, adversarial, or misleading before entering model or UI context.
-* **Presentation does not determine execution semantics.** Display metadata and renderer-specific presentation must not affect authorization, dispatch, or persisted execution outcomes.
+* **Presentation does not determine execution semantics.** Display metadata and renderer-specific presentation, including structural presentation, must not affect authorization, dispatch, execution outcomes, or persisted session state.
 
 ## Models and providers
 

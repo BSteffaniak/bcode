@@ -291,6 +291,36 @@ pub fn panel<'a>(
                 exclusion > 0,
             )),
     )
+    .frame(composer_frame(
+        super::render::semantic_state_theme()
+            .unit_chrome
+            .composer_border,
+    ))
+}
+
+/// Composer shell for the theme's `borders.composer` chrome.
+///
+/// * unset: the single-line frame;
+/// * `none`: no painted border;
+/// * `left`: a leading bar;
+/// * framed styles: a frame with that style's glyphs.
+///
+/// Every frame keeps the editor geometry, so the composer height and the
+/// editor's hit and cursor areas do not depend on the border style.
+const fn composer_frame(
+    style: Option<bcode_tui_theme::chrome::BorderStyle>,
+) -> bcode_tui_components::composer::ComposerFrame {
+    use bcode_tui_components::composer::ComposerFrame;
+    use bcode_tui_theme::chrome::BorderStyle;
+    match style {
+        Some(BorderStyle::None) => ComposerFrame::None,
+        Some(BorderStyle::Left) => ComposerFrame::LeftBar(bmux_tui::chrome::BorderSet::SINGLE),
+        Some(style) => match super::theme::chrome::border_set(style) {
+            Some(set) => ComposerFrame::Framed(set),
+            None => ComposerFrame::None,
+        },
+        None => ComposerFrame::Framed(bmux_tui::chrome::BorderSet::SINGLE),
+    }
 }
 
 /// Paint last, with BMUX occlusion removing underlying selection and pointer regions.
@@ -738,5 +768,85 @@ mod tests {
                 }
             }
         }
+    }
+
+    fn paint_with_border(
+        style: Option<bcode_tui_theme::chrome::BorderStyle>,
+        width: u16,
+    ) -> (Vec<String>, Option<Rect>) {
+        let initial = crate::theme::resolve_initial_theme();
+        let mut presented = initial.presented(initial.accent);
+        presented.unit_chrome.composer_border = style;
+        crate::render::set_plugin_visual_theme(&presented);
+        let state = RefCell::new(TextInputState::default());
+        let policy = super::super::app::composer_policy();
+        let submit = ComposerSubmit::default();
+        let area = Rect::new(0, 0, width, 3);
+        let panel = panel(
+            &state,
+            &policy,
+            &submit,
+            ComposerPresentation {
+                theme: TuiTheme::for_theme_id("terminal-native"),
+                focused: false,
+                enabled: false,
+                size: area.size(),
+            },
+        );
+        let layout = panel.layout(Constraints::tight(area.size()), &mut LayoutCx::new());
+        let editor = layout
+            .find_logical_rect(&bmux_tui::component::LayoutId::new("composer.editor"))
+            .map(|rect| {
+                Rect::new(
+                    u16::try_from(rect.x).unwrap_or(u16::MAX),
+                    u16::try_from(rect.y).unwrap_or(u16::MAX),
+                    u16::try_from(rect.width).unwrap_or(u16::MAX),
+                    u16::try_from(rect.height).unwrap_or(u16::MAX),
+                )
+            });
+        let mut buffer = Buffer::empty(area);
+        panel.paint(&layout, &mut PaintCx::new(&mut Frame::new(&mut buffer)));
+        let rows = (0..area.height)
+            .map(|y| buffer.row_symbols(y).expect("row"))
+            .collect();
+        (rows, editor)
+    }
+
+    #[test]
+    fn composer_border_chrome_changes_glyphs_but_not_the_editor_area() {
+        use bcode_tui_theme::chrome::BorderStyle;
+        for width in [1, 3, 8, 24] {
+            let (default_rows, default_editor) = paint_with_border(None, width);
+            for style in [
+                BorderStyle::None,
+                BorderStyle::Left,
+                BorderStyle::Ascii,
+                BorderStyle::Single,
+                BorderStyle::Rounded,
+                BorderStyle::Thick,
+                BorderStyle::Double,
+            ] {
+                let (rows, editor) = paint_with_border(Some(style), width);
+                assert_eq!(editor, default_editor, "{style:?} at {width}");
+                if width < 8 {
+                    continue;
+                }
+                let first = rows[0].chars().next();
+                match style {
+                    BorderStyle::None => assert_eq!(first, Some(' '), "{rows:?}"),
+                    BorderStyle::Left => {
+                        assert!(rows.iter().all(|row| row.starts_with('│')), "{rows:?}");
+                        assert!(!rows[0].contains("Message"));
+                    }
+                    BorderStyle::Single => assert_eq!(rows, default_rows),
+                    BorderStyle::Rounded => assert_eq!(first, Some('╭'), "{rows:?}"),
+                    BorderStyle::Thick => assert_eq!(first, Some('┏'), "{rows:?}"),
+                    BorderStyle::Double => assert_eq!(first, Some('╔'), "{rows:?}"),
+                    BorderStyle::Ascii => assert_eq!(first, Some('+'), "{rows:?}"),
+                }
+            }
+        }
+        let initial = crate::theme::resolve_initial_theme();
+        crate::render::set_plugin_visual_theme(&initial.presented(initial.accent));
     }
 }

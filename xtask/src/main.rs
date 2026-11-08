@@ -5,6 +5,7 @@
 //! Bcode release and repository validation tasks.
 
 mod architecture;
+mod theme_gallery;
 mod xray_dev;
 
 use std::collections::{BTreeMap, BTreeSet};
@@ -68,6 +69,7 @@ enum CommandName {
     UpdateTesseractPolicy,
     PackageTesseractRuntimes,
     SmokeTestTesseract,
+    ThemeGallery,
     Help,
 }
 
@@ -108,6 +110,7 @@ impl Options {
             Some("update-tesseract-policy") => CommandName::UpdateTesseractPolicy,
             Some("package-tesseract-runtimes") => CommandName::PackageTesseractRuntimes,
             Some("smoke-test-tesseract" | "tesseract-smoke") => CommandName::SmokeTestTesseract,
+            Some("theme-gallery") => CommandName::ThemeGallery,
             Some("help" | "--help" | "-h") | None => CommandName::Help,
             Some(command) => {
                 return Err(format_error(format!("unknown xtask command `{command}`")));
@@ -284,6 +287,7 @@ fn run() -> Result<()> {
         CommandName::UpdateTesseractPolicy => update_tesseract_policy(&options),
         CommandName::PackageTesseractRuntimes => package_tesseract_runtimes(&options),
         CommandName::SmokeTestTesseract => smoke_test_tesseract(&options),
+        CommandName::ThemeGallery => theme_gallery::run(&options),
         CommandName::Help => {
             print_help();
             Ok(())
@@ -4018,7 +4022,8 @@ fn print_help() {
            cargo xtask dev-sign --target <triple> [--binary <path>] [--identity <name>]\n\
            cargo xtask update-tesseract-catalog\n\
            cargo xtask discover-tesseract-upstream\n\
-           cargo xtask update-tesseract-policy [--prune]\n\n\
+           cargo xtask update-tesseract-policy [--prune]\n\
+           cargo xtask theme-gallery [--check | --dry-run]\n\n\
          Supported release targets:\n\
            * aarch64-apple-darwin\n\
            * x86_64-apple-darwin\n\

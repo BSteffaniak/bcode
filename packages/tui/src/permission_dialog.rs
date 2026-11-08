@@ -98,6 +98,7 @@ mod tests {
             session_id: Some(SessionId(Uuid::nil())),
             tool_call_id: "call".to_string(),
             tool_name: "tool".to_string(),
+            producer_plugin_id: None,
             arguments_json: "{}".to_string(),
             batch: batched.then(|| PermissionBatchView {
                 batch_id: "batch".to_string(),

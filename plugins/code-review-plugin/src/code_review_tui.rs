@@ -16934,6 +16934,7 @@ pub(crate) mod tests {
                 session_id: Some(session_id),
                 tool_call_id: "tool-1".to_string(),
                 tool_name: "filesystem.write".to_string(),
+                producer_plugin_id: None,
                 arguments_json: "{\"path\":\"src/lib.rs\"}".to_string(),
                 batch: None,
                 agent_id: "agent".to_string(),

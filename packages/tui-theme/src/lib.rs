@@ -8,7 +8,9 @@
 //! standalone terminal tools can share bcode themes without depending on the full TUI.
 
 pub mod bundled;
+pub mod check;
 pub mod chrome;
+pub mod contrast;
 pub mod definition;
 pub mod discovery;
 pub mod expr;

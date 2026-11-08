@@ -713,6 +713,59 @@ mod tests {
     }
 
     #[test]
+    fn scroll_animation_follows_motion_and_schedules_no_frames_when_instant() {
+        use bcode_tui_theme::chrome::Motion;
+        let session_id = SessionId::new();
+        let events = (1..31)
+            .map(|sequence| {
+                durable(
+                    session_id,
+                    sequence,
+                    SessionEventKind::AssistantMessage {
+                        text: format!("message {sequence}"),
+                    },
+                )
+            })
+            .collect::<Vec<_>>();
+        let mut durations = Vec::new();
+        for (motion, reduce_motion) in [
+            (Motion::None, false),
+            (Motion::Subtle, false),
+            (Motion::Full, false),
+            (Motion::Full, true),
+        ] {
+            let mut app = BmuxApp::new_with_history(Some(session_id), &events, &[], false);
+            app.set_motion_for_test(motion, reduce_motion);
+            TranscriptFrameSequence::new(&mut app, 80, 12).run([TranscriptFrameStep {
+                label: "reader at top",
+                input: TranscriptFrameInput::ScrollUp(usize::MAX / 4),
+            }]);
+            assert!(app.transition_transcript_to_bottom());
+            let duration = app.transcript_scroll_animation_duration_for_test();
+            let requested = app.transcript_scroll_frame_requested_for_test();
+            let frames =
+                TranscriptFrameSequence::new(&mut app, 80, 12).run([TranscriptFrameStep {
+                    label: "transition requested",
+                    input: TranscriptFrameInput::Observe,
+                }]);
+            let instant = motion == Motion::None || reduce_motion;
+            if instant {
+                assert_eq!(frames[0].observation.scroll_mode, "bottom_follow");
+                assert_eq!(app.scroll_offset(), 0);
+            }
+            drop(app);
+            assert_eq!(duration.is_none(), instant, "{motion:?}/{reduce_motion}");
+            assert_eq!(requested, !instant, "{motion:?}/{reduce_motion}");
+            durations.push(duration);
+        }
+        assert_eq!(durations[1], Some(std::time::Duration::from_millis(180)));
+        assert!(
+            durations[2] > durations[1],
+            "full scrolls longer than subtle"
+        );
+    }
+
+    #[test]
     fn non_presenting_older_page_does_not_spend_boundary_movement() {
         let session_id = SessionId::new();
         let message = |sequence| {

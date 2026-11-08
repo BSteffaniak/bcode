@@ -2531,7 +2531,9 @@ pub struct TuiConfig {
     /// Terminal color depth: `auto` follows terminal detection.
     #[serde(default)]
     pub color_depth: TuiColorDepth,
-    /// Disable animated chrome such as focus sweeps and accent pulses.
+    /// Make every animation instant or still: activity spinners, focus sweeps,
+    /// accent transitions, transcript scroll animations, and the latest-bar
+    /// glow. Overrides the theme's motion level and explicit accent settings.
     #[serde(default)]
     pub reduce_motion: bool,
 }
@@ -2736,9 +2738,12 @@ pub struct TuiThemeConfig {
     /// How accent color changes should be applied.
     #[serde(default)]
     pub accent_transition: TuiAccentTransitionMode,
-    /// Duration of accent color transitions in milliseconds.
-    #[serde(default = "default_tui_accent_transition_ms")]
-    pub accent_transition_ms: u64,
+    /// Duration of accent color transitions in milliseconds. Unset follows
+    /// the theme's `motion` level (`none` instant, `subtle` 220, `full` 330);
+    /// a value here wins over it. `tui.reduce_motion` always makes accent
+    /// changes instant.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub accent_transition_ms: Option<u64>,
     /// Easing curve used for accent color transitions.
     #[serde(default)]
     pub accent_transition_curve: TuiAccentTransitionCurve,
@@ -2756,11 +2761,15 @@ impl TuiThemeConfig {
             .collect()
     }
 
-    /// Return the effective accent transition duration in milliseconds.
+    /// Return the user's explicit accent transition duration in milliseconds.
+    ///
+    /// `immediate` is an explicit `0`; `transition` yields
+    /// `accent_transition_ms`, and `None` when it is unset, in which case the
+    /// theme's motion level decides.
     #[must_use]
-    pub const fn effective_accent_transition_ms(&self) -> u64 {
+    pub const fn explicit_accent_transition_ms(&self) -> Option<u64> {
         if matches!(self.accent_transition, TuiAccentTransitionMode::Immediate) {
-            0
+            Some(0)
         } else {
             self.accent_transition_ms
         }
@@ -2777,7 +2786,7 @@ impl Default for TuiThemeConfig {
             paths: Vec::new(),
             agent_accent: TuiAgentAccentPolicy::AgentWithThemeFallback,
             accent_transition: TuiAccentTransitionMode::Transition,
-            accent_transition_ms: default_tui_accent_transition_ms(),
+            accent_transition_ms: None,
             accent_transition_curve: TuiAccentTransitionCurve::EaseOut,
         }
     }
@@ -2785,10 +2794,6 @@ impl Default for TuiThemeConfig {
 
 fn default_tui_theme_name() -> String {
     "terminal-native".to_owned()
-}
-
-const fn default_tui_accent_transition_ms() -> u64 {
-    220
 }
 
 /// Terminal theme variant selection.
@@ -2821,7 +2826,8 @@ pub enum TuiAgentAccentPolicy {
 pub enum TuiAccentTransitionMode {
     /// Apply accent color changes immediately.
     Immediate,
-    /// Animate accent color changes over the configured duration.
+    /// Animate accent color changes over `accent_transition_ms`, or the
+    /// theme's motion level when that is unset.
     #[default]
     Transition,
 }
@@ -6973,10 +6979,9 @@ pub fn set_tui_theme_selection(name: &str) -> Result<PathBuf, ConfigError> {
             message: "theme name must not be empty".to_owned(),
         });
     }
-    let path = default_tui_state_path();
-    let mut state = load_tui_state_from(&path)?;
-    state.theme.name = Some(name.to_owned());
-    write_tui_state(&path, &state)
+    update_tui_state(&default_tui_state_path(), |state| {
+        state.theme.name = Some(name.to_owned());
+    })
 }
 
 /// Load the globally selected interactive TUI profile.
@@ -7020,9 +7025,7 @@ pub fn set_tui_profile_selection_at(
             message: "profile name must not be empty".to_owned(),
         });
     }
-    let mut state = load_tui_state_from(path)?;
-    state.theme.profile = name.map(str::to_owned);
-    write_tui_state(path, &state)
+    update_tui_state(path, |state| state.theme.profile = name.map(str::to_owned))
 }
 
 /// Clear the globally selected interactive TUI theme.
@@ -7031,10 +7034,7 @@ pub fn set_tui_profile_selection_at(
 ///
 /// Returns an error when the state cannot be written.
 pub fn clear_tui_theme_selection() -> Result<PathBuf, ConfigError> {
-    let path = default_tui_state_path();
-    let mut state = load_tui_state_from(&path)?;
-    state.theme.name = None;
-    write_tui_state(&path, &state)
+    update_tui_state(&default_tui_state_path(), |state| state.theme.name = None)
 }
 
 /// Load the interactive TUI streaming-presentation override.
@@ -7070,10 +7070,9 @@ pub fn load_tui_streaming_presentation_override_from(
 pub fn set_tui_streaming_presentation_override(
     policy: bcode_session_view_models::StreamingPresentationPolicy,
 ) -> Result<PathBuf, ConfigError> {
-    let path = default_tui_state_path();
-    let mut state = load_tui_state_from(&path)?;
-    state.presentation.streaming = Some(policy.into());
-    write_tui_state(&path, &state)
+    update_tui_state(&default_tui_state_path(), |state| {
+        state.presentation.streaming = Some(policy.into());
+    })
 }
 
 /// Clear the interactive TUI streaming-presentation override.
@@ -7082,10 +7081,9 @@ pub fn set_tui_streaming_presentation_override(
 ///
 /// Returns an error when the state cannot be read or written.
 pub fn clear_tui_streaming_presentation_override() -> Result<PathBuf, ConfigError> {
-    let path = default_tui_state_path();
-    let mut state = load_tui_state_from(&path)?;
-    state.presentation.streaming = None;
-    write_tui_state(&path, &state)
+    update_tui_state(&default_tui_state_path(), |state| {
+        state.presentation.streaming = None;
+    })
 }
 
 /// Maximum interactive structural rules retained in user state.
@@ -7133,13 +7131,41 @@ pub fn add_tui_presentation_rule_at(
     path: &Path,
     rule: bcode_presentation_policy_models::PresentationRule,
 ) -> Result<PathBuf, ConfigError> {
-    let mut state = load_tui_state_from(path)?;
-    let rules = &mut state.presentation.rules;
-    rules.retain(|existing| existing.matcher != rule.matcher);
-    rules.push(rule);
-    let excess = rules.len().saturating_sub(MAX_TUI_PRESENTATION_RULES);
-    rules.drain(..excess);
-    write_tui_state(path, &state)
+    add_tui_presentation_rules_at(path, std::iter::once(rule))
+}
+
+/// Persist several interactive structural rules to user state in one write,
+/// each replacing any stored rule with an identical matcher (later rules win).
+/// Declarative configuration is never modified.
+///
+/// # Errors
+///
+/// Returns an error when the state cannot be read or written.
+pub fn add_tui_presentation_rules(
+    rules: impl IntoIterator<Item = bcode_presentation_policy_models::PresentationRule>,
+) -> Result<PathBuf, ConfigError> {
+    add_tui_presentation_rules_at(&default_tui_state_path(), rules)
+}
+
+/// Persist several interactive structural rules to a specific state path in
+/// one write.
+///
+/// # Errors
+///
+/// Returns an error when the state cannot be read or written.
+pub fn add_tui_presentation_rules_at(
+    path: &Path,
+    rules: impl IntoIterator<Item = bcode_presentation_policy_models::PresentationRule>,
+) -> Result<PathBuf, ConfigError> {
+    update_tui_state(path, |state| {
+        let stored = &mut state.presentation.rules;
+        for rule in rules {
+            stored.retain(|existing| existing.matcher != rule.matcher);
+            stored.push(rule);
+        }
+        let excess = stored.len().saturating_sub(MAX_TUI_PRESENTATION_RULES);
+        stored.drain(..excess);
+    })
 }
 
 /// Clear interactive structural rules from user state.
@@ -7148,10 +7174,30 @@ pub fn add_tui_presentation_rule_at(
 ///
 /// Returns an error when the state cannot be read or written.
 pub fn clear_tui_presentation_rules() -> Result<PathBuf, ConfigError> {
-    let path = default_tui_state_path();
-    let mut state = load_tui_state_from(&path)?;
-    state.presentation.rules.clear();
-    write_tui_state(&path, &state)
+    update_tui_state(&default_tui_state_path(), |state| {
+        state.presentation.rules.clear();
+    })
+}
+
+/// Serializes every read-modify-write of interactive user state in this
+/// process, so concurrent frontend effects (theme, profile, streaming and
+/// structural-rule saves) never overwrite each other's fields.
+static TUI_STATE_UPDATE: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// Read the user state at `path`, apply `update`, and atomically replace the
+/// file, holding [`TUI_STATE_UPDATE`] across the whole read-modify-write.
+fn update_tui_state(
+    path: &Path,
+    update: impl FnOnce(&mut TuiState),
+) -> Result<PathBuf, ConfigError> {
+    // A panic while holding the lock cannot leave a half-written file
+    // (writes are atomic replacements), so a poisoned lock is still usable.
+    let _guard = TUI_STATE_UPDATE
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let mut state = load_tui_state_from(path)?;
+    update(&mut state);
+    write_tui_state(path, &state)
 }
 
 fn write_tui_state(path: &Path, state: &TuiState) -> Result<PathBuf, ConfigError> {
@@ -7164,7 +7210,7 @@ fn write_tui_state(path: &Path, state: &TuiState) -> Result<PathBuf, ConfigError
     let contents = toml::to_string(state).map_err(|source| ConfigError::Composition {
         message: format!("failed to serialize TUI state: {source}"),
     })?;
-    fs::write(path, contents).map_err(|source| ConfigError::Io {
+    edit::atomic_replace(path, contents.as_bytes()).map_err(|source| ConfigError::Io {
         path: path.to_path_buf(),
         source,
     })?;
@@ -8506,12 +8552,10 @@ fn write_tui_theme_toml(output: &mut String, theme: &TuiThemeConfig) {
         })
     )
     .expect("writing to string should not fail");
-    writeln!(
-        output,
-        "accent_transition_ms = {}",
-        theme.accent_transition_ms
-    )
-    .expect("writing to string should not fail");
+    if let Some(accent_transition_ms) = theme.accent_transition_ms {
+        writeln!(output, "accent_transition_ms = {accent_transition_ms}")
+            .expect("writing to string should not fail");
+    }
     writeln!(
         output,
         "accent_transition_curve = {}",
@@ -11595,7 +11639,7 @@ accent_transition_curve = "ease_in_out"
             config.tui.theme.agent_accent,
             TuiAgentAccentPolicy::ThemeOnly
         );
-        assert_eq!(config.tui.theme.accent_transition_ms, 180);
+        assert_eq!(config.tui.theme.accent_transition_ms, Some(180));
         assert_eq!(
             config.tui.theme.accent_transition_curve,
             TuiAccentTransitionCurve::EaseInOut
@@ -11611,6 +11655,27 @@ accent_transition_curve = "ease_in_out"
             BcodeConfig::default().tui.theme.accent_transition_curve,
             TuiAccentTransitionCurve::EaseOut
         );
+    }
+
+    #[test]
+    fn unset_accent_transition_duration_defers_to_theme_motion() {
+        let defaults = BcodeConfig::default();
+        assert_eq!(defaults.tui.theme.explicit_accent_transition_ms(), None);
+        let rendered = super::config_to_toml(&defaults);
+        let round_trip: BcodeConfig = toml::from_str(&rendered).expect("rendered config parses");
+        assert_eq!(round_trip.tui.theme.explicit_accent_transition_ms(), None);
+
+        let immediate = super::TuiThemeConfig {
+            accent_transition: super::TuiAccentTransitionMode::Immediate,
+            accent_transition_ms: Some(500),
+            ..super::TuiThemeConfig::default()
+        };
+        assert_eq!(immediate.explicit_accent_transition_ms(), Some(0));
+        let timed = super::TuiThemeConfig {
+            accent_transition_ms: Some(500),
+            ..super::TuiThemeConfig::default()
+        };
+        assert_eq!(timed.explicit_accent_transition_ms(), Some(500));
     }
 
     #[test]
@@ -14180,6 +14245,70 @@ mod presentation_rule_state_tests {
         assert_eq!(
             load_tui_profile_selection_from(&path).expect("profile"),
             None
+        );
+    }
+
+    #[test]
+    fn concurrent_state_writers_never_lose_each_others_fields() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let path = directory.path().join("tui.toml");
+        let rule = |tool: &str| -> bcode_presentation_policy_models::PresentationRule {
+            toml::from_str(&format!(
+                "match = {{ kind = \"tool\", tool = \"{tool}\" }}\nset = {{ disclosure = \"collapsed\" }}"
+            ))
+            .expect("rule")
+        };
+        let tools: Vec<String> = (0..16).map(|index| format!("tool{index}")).collect();
+        std::thread::scope(|scope| {
+            for tool in &tools {
+                let path = path.clone();
+                let rule = rule(tool);
+                scope.spawn(move || add_tui_presentation_rule_at(&path, rule).expect("rule"));
+            }
+            for round in 0..16 {
+                let path = path.clone();
+                scope.spawn(move || {
+                    let profile = if round % 2 == 0 { "zen" } else { "riced" };
+                    set_tui_profile_selection_at(&path, Some(profile)).expect("profile")
+                });
+            }
+        });
+        let stored = load_tui_presentation_rules_from(&path).expect("rules");
+        assert_eq!(stored.len(), tools.len(), "every rule survives");
+        for tool in &tools {
+            assert!(stored.contains(&rule(tool)), "{tool}");
+        }
+        assert!(
+            load_tui_profile_selection_from(&path)
+                .expect("profile")
+                .is_some()
+        );
+    }
+
+    #[test]
+    fn batch_rules_write_once_with_later_matchers_winning() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let path = directory.path().join("tui.toml");
+        let rule = |tool: &str,
+                    disclosure: &str|
+         -> bcode_presentation_policy_models::PresentationRule {
+            toml::from_str(&format!(
+                "match = {{ kind = \"tool\", tool = \"{tool}\" }}\nset = {{ disclosure = \"{disclosure}\" }}"
+            ))
+            .expect("rule")
+        };
+        add_tui_presentation_rules_at(
+            &path,
+            [
+                rule("read", "collapsed"),
+                rule("grep", "summary"),
+                rule("read", "expanded"),
+            ],
+        )
+        .expect("batch");
+        assert_eq!(
+            load_tui_presentation_rules_from(&path).expect("rules"),
+            [rule("grep", "summary"), rule("read", "expanded")]
         );
     }
 }

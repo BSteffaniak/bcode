@@ -10636,6 +10636,7 @@ mod tests {
             session_id: Some(session_id.parse().expect("session id")),
             tool_call_id: "call-1".to_string(),
             tool_name: "shell.run".to_string(),
+            producer_plugin_id: None,
             arguments_json: "{\"command\":\"cargo check\"}".to_string(),
             batch: None,
             agent_id: "build".to_string(),

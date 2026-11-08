@@ -1,6 +1,6 @@
 //! Bcode composer presentation recipe.
 
-use bmux_tui::chrome::Border;
+use bmux_tui::chrome::{Border, BorderSet, BorderSides};
 use bmux_tui::component::{
     Component, ComponentRevision, Constraints, EventCx, LayoutCx, LayoutNode,
 };
@@ -19,10 +19,32 @@ pub struct ComposerStyle {
     pub surface: Style,
 }
 
+/// Border treatment of the composer shell.
+///
+/// Every variant keeps the same child geometry (one row above and below the
+/// editor, two cells on each side), so switching frames never changes the
+/// editor's size or the composer's height; only the painted chrome differs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ComposerFrame {
+    /// A border on all sides with these glyphs, titled `Message`.
+    Framed(BorderSet),
+    /// A single leading bar drawn with this set's vertical glyph; untitled.
+    LeftBar(BorderSet),
+    /// No painted border; untitled.
+    None,
+}
+
+impl Default for ComposerFrame {
+    fn default() -> Self {
+        Self::Framed(BorderSet::SINGLE)
+    }
+}
+
 /// Child-owning composer shell. Geometry and event routing are owned by its surface.
 pub struct ComposerPanel<'a> {
     surface: Surface<'a>,
-    title_style: Style,
+    style: ComposerStyle,
+    titled: bool,
 }
 
 /// Compose the message editor inside Bcode's bordered shell.
@@ -31,15 +53,48 @@ pub fn composer_panel<'a>(style: ComposerStyle, child: impl Component + 'a) -> C
     ComposerPanel {
         surface: Surface::new(child)
             .id("bcode.composer")
-            .border(Border::single().style(style.border))
-            .padding(Insets::new(0, 1, 0, 1))
             .background(style.surface)
             .content_style(style.surface),
-        title_style: style.surface.patch(style.border),
+        style,
+        titled: false,
     }
+    .frame(ComposerFrame::default())
 }
 
 impl ComposerPanel<'_> {
+    /// Select the border treatment; the default is a single-line frame.
+    #[must_use]
+    pub fn frame(mut self, frame: ComposerFrame) -> Self {
+        let (border, padding, paint, titled) = match frame {
+            ComposerFrame::Framed(set) => (
+                Border::new(set, self.style.border),
+                Insets::new(0, 1, 0, 1),
+                true,
+                true,
+            ),
+            ComposerFrame::LeftBar(set) => (
+                Border::new(set, self.style.border).sides(BorderSides::LEFT),
+                Insets::new(1, 2, 1, 1),
+                true,
+                false,
+            ),
+            // The border keeps its layout insets but is not painted.
+            ComposerFrame::None => (
+                Border::new(BorderSet::SINGLE, self.style.border),
+                Insets::new(0, 1, 0, 1),
+                false,
+                false,
+            ),
+        };
+        self.surface = self
+            .surface
+            .border(border)
+            .paint_border(paint)
+            .padding(padding);
+        self.titled = titled;
+        self
+    }
+
     /// Set caller-owned identity, allowing multiple composers in one retained tree.
     #[must_use]
     pub fn id(mut self, id: impl Into<bmux_tui::component::LayoutId>) -> Self {
@@ -59,6 +114,9 @@ impl Component for ComposerPanel<'_> {
 
     fn paint(&self, layout: &LayoutNode, cx: &mut PaintCx<'_, '_>) {
         self.surface.paint(layout, cx);
+        if !self.titled {
+            return;
+        }
         let title = Line::raw(" Message ");
         let title_width = u16::try_from(title.width()).unwrap_or(u16::MAX);
         cx.write_line_with_fallback_style(
@@ -70,7 +128,7 @@ impl Component for ComposerPanel<'_> {
                 1,
             ),
             &title,
-            self.title_style,
+            self.style.surface.patch(self.style.border),
         );
     }
 
@@ -158,5 +216,90 @@ mod tests {
         assert_eq!(layout.children[0].y, 1);
         assert_eq!(layout.children[0].node.size.width, 16);
         assert_eq!(layout.children[0].node.size.height, 3);
+    }
+
+    fn painted(frame: ComposerFrame, width: u16, height: u16) -> Vec<String> {
+        use bmux_tui::buffer::Buffer;
+        use bmux_tui::frame::Frame;
+        use bmux_tui::geometry::Rect;
+        let panel = composer_panel(
+            ComposerStyle {
+                border: Style::new(),
+                surface: Style::new(),
+            },
+            TextBlock::new(""),
+        )
+        .frame(frame);
+        let layout = panel.layout(
+            Constraints::tight(Size::new(width, height)),
+            &mut LayoutCx::new(),
+        );
+        let mut buffer = Buffer::empty(Rect::new(0, 0, width, height));
+        panel.paint(&layout, &mut PaintCx::new(&mut Frame::new(&mut buffer)));
+        (0..height)
+            .map(|y| buffer.row_symbols(y).expect("row"))
+            .collect()
+    }
+
+    #[test]
+    fn every_composer_frame_keeps_the_editor_geometry() {
+        let frames = [
+            ComposerFrame::Framed(BorderSet::SINGLE),
+            ComposerFrame::Framed(BorderSet::ROUNDED),
+            ComposerFrame::LeftBar(BorderSet::SINGLE),
+            ComposerFrame::None,
+        ];
+        for width in [0, 1, 3, 4, 5, 20] {
+            let geometry = |frame| {
+                let panel = composer_panel(
+                    ComposerStyle {
+                        border: Style::new(),
+                        surface: Style::new(),
+                    },
+                    TextBlock::new("editor"),
+                )
+                .frame(frame);
+                let layout = panel.layout(
+                    Constraints::tight(Size::new(width, 5)),
+                    &mut LayoutCx::new(),
+                );
+                let child = &layout.children[0];
+                (child.x, child.y, child.node.size)
+            };
+            let expected = geometry(ComposerFrame::default());
+            for frame in frames {
+                assert_eq!(geometry(frame), expected, "{frame:?} at width {width}");
+            }
+        }
+    }
+
+    #[test]
+    fn rounded_composer_frame_paints_rounded_corners_and_title() {
+        let rows = painted(ComposerFrame::Framed(BorderSet::ROUNDED), 14, 3);
+        assert_eq!(rows[0], "╭ Message ───╮");
+        assert_eq!(rows[2], "╰────────────╯");
+    }
+
+    #[test]
+    fn left_bar_composer_frame_paints_only_the_leading_bar() {
+        for width in [1, 3, 12] {
+            let rows = painted(ComposerFrame::LeftBar(BorderSet::SINGLE), width, 3);
+            for row in &rows {
+                let mut cells = row.chars();
+                assert_eq!(cells.next(), Some('│'), "width {width}: {rows:?}");
+                assert!(cells.all(|cell| cell == ' '), "width {width}: {rows:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn borderless_composer_frame_paints_no_border_or_title() {
+        for width in [1, 3, 12] {
+            let rows = painted(ComposerFrame::None, width, 3);
+            assert!(
+                rows.iter().all(|row| row.chars().all(|cell| cell == ' ')),
+                "width {width}: {rows:?}"
+            );
+        }
     }
 }

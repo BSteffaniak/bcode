@@ -8,7 +8,7 @@
 //!
 //! [`Self::effective`]: PluginPresentationDeclaration::effective
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 
 use bcode_presentation_policy_models::{
     LayerSource, MAX_RULES_PER_LAYER, PresentationRule, RuleLayer,
@@ -240,6 +240,43 @@ impl PluginPresentationDeclaration {
         }
         effective
     }
+}
+
+/// Default rules of `declarations` (plugin id to declaration) as presentation-policy layers.
+///
+/// There is one [`LayerSource::Plugin`] layer per plugin with rules, in plugin-id order, each
+/// scoped to that plugin's own units (see [`PluginPresentationDeclaration::rule_layer`]).
+#[must_use]
+pub fn presentation_rule_layers(
+    declarations: &BTreeMap<String, PluginPresentationDeclaration>,
+) -> Vec<RuleLayer> {
+    declarations
+        .iter()
+        .filter(|(_, declaration)| !declaration.rules.is_empty())
+        .map(|(plugin_id, declaration)| declaration.rule_layer(plugin_id))
+        .collect()
+}
+
+/// Declared target argument fields of `declarations`.
+///
+/// Keyed by tool name, then declaring plugin id, with ordered field names. Tools without
+/// target fields are skipped.
+#[must_use]
+pub fn presentation_target_fields(
+    declarations: &BTreeMap<String, PluginPresentationDeclaration>,
+) -> BTreeMap<String, BTreeMap<String, Vec<String>>> {
+    let mut fields = BTreeMap::<String, BTreeMap<String, Vec<String>>>::new();
+    for (plugin_id, declaration) in declarations {
+        for tool in &declaration.tools {
+            if !tool.target_fields.is_empty() {
+                fields
+                    .entry(tool.tool_name.clone())
+                    .or_default()
+                    .insert(plugin_id.clone(), tool.target_fields.clone());
+            }
+        }
+    }
+    fields
 }
 
 /// Whether `fields` are all valid target field names with no repeats.

@@ -20,6 +20,7 @@ fn view(permission: &PermissionSummary) -> PermissionView {
         session_id: Some(permission.session_id),
         tool_call_id: permission.tool_call_id.clone(),
         tool_name: permission.tool_name.clone(),
+        producer_plugin_id: None,
         arguments_json: permission.arguments_json.clone(),
         batch: permission.batch.as_ref().map(|batch| {
             bcode_session_view_models::PermissionBatchView {

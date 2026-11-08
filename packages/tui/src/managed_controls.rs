@@ -62,6 +62,7 @@ pub const fn builtin_support(id: BuiltinCommandId) -> ManagedCommandSupport {
         | BuiltinCommandId::New
         | BuiltinCommandId::Theme
         | BuiltinCommandId::Profile
+        | BuiltinCommandId::Appearance
         | BuiltinCommandId::Streaming
         | BuiltinCommandId::Timeline => ManagedCommandSupport::Host,
         BuiltinCommandId::Native
@@ -294,6 +295,8 @@ pub fn approval_permission_view(
         resolved: false,
         approved: None,
         can_remember: false,
+        // Native harness approvals are not produced by a Bcode plugin.
+        producer_plugin_id: None,
     }
 }
 
