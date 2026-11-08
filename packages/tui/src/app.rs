@@ -3357,7 +3357,11 @@ impl BmuxApp {
             },
         );
         if let Some(top_row) = next_top {
-            self.transcript_scroll_animation = None;
+            // Focus scrolling is manual navigation: drop the anchors and
+            // follow modes carried over from earlier frames so the next layout
+            // sync keeps this top row instead of restoring the previous one.
+            self.cancel_transcript_scroll_animation_for_manual_scroll();
+            self.mark_manual_transcript_scroll();
             self.session_ui.viewport.detach();
             self.session_ui.viewport.follow_anchor(top_row);
         }
@@ -4557,6 +4561,13 @@ impl BmuxApp {
     #[must_use]
     pub const fn transcript_viewport_height_for_test(&self) -> u16 {
         self.session_ui.viewport.height()
+    }
+
+    /// Return the focused transcript disclosure target for frame-level tests.
+    #[cfg(test)]
+    #[must_use]
+    pub fn focused_target_for_test(&self) -> Option<super::structure::DisclosureTarget> {
+        self.transcript_focus.focused().cloned()
     }
 
     fn transcript_scroll_animation_now(&self) -> Instant {

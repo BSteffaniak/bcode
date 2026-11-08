@@ -8742,6 +8742,148 @@ mod tests {
         drop(model);
     }
 
+    /// History of `calls` finished `bash` calls with three output lines each.
+    fn finished_bash_history(
+        session_id: bcode_session_models::SessionId,
+        calls: u64,
+    ) -> Vec<bcode_session_models::SessionEvent> {
+        let event = |sequence, kind| bcode_session_models::SessionEvent {
+            schema_version: bcode_session_models::CURRENT_SESSION_EVENT_SCHEMA_VERSION,
+            sequence,
+            timestamp_ms: sequence,
+            session_id,
+            provenance: None,
+            kind,
+        };
+        (0..calls)
+            .flat_map(|call| {
+                let id = format!("call-{call}");
+                [
+                    event(
+                        call * 2 + 1,
+                        bcode_session_models::SessionEventKind::ToolCallRequested {
+                            tool_call_id: id.clone(),
+                            producer_plugin_id: None,
+                            tool_name: "bash".to_owned(),
+                            arguments_json: r#"{"command":"ls"}"#.to_owned(),
+                            working_directory: None,
+                        },
+                    ),
+                    event(
+                        call * 2 + 2,
+                        bcode_session_models::SessionEventKind::ToolInvocationResultRecorded {
+                            record: bcode_session_models::ToolInvocationResultRecord {
+                                invocation_id: id,
+                                model_output: "one\ntwo\nthree".to_owned(),
+                                is_error: false,
+                                presentation: None,
+                                result: None,
+                                content: Vec::new(),
+                            },
+                        },
+                    ),
+                ]
+            })
+            .collect()
+    }
+
+    /// Focused row, viewport top row, and viewport height.
+    fn focus_view(model: &super::BcodeRuntimeModel) -> (usize, usize, u16) {
+        let height = model.chat.app.transcript_viewport_height_for_test();
+        let top = model.chat.app.transcript_top_row(height);
+        let target = model
+            .chat
+            .app
+            .focused_target_for_test()
+            .expect("focused target");
+        let row = model
+            .chat
+            .app
+            .disclosure_target_row(&target)
+            .expect("focused row");
+        (row, top, height)
+    }
+
+    /// Rows the focused target occupies.
+    fn focused_extent(model: &super::BcodeRuntimeModel) -> std::ops::Range<usize> {
+        let target = model
+            .chat
+            .app
+            .focused_target_for_test()
+            .expect("focused target");
+        crate::transcript_focus::target_extent(&model.chat.app.disclosure_anchors(), &target, None)
+            .expect("focused extent")
+    }
+
+    #[tokio::test]
+    async fn focus_navigation_scrolls_the_presented_transcript_to_the_focused_target() {
+        use bmux_tui::event::Event;
+        use bmux_tui_runtime::Presenter;
+
+        let session_id = bcode_session_models::SessionId::new();
+        let history = finished_bash_history(session_id, 12);
+        let mut model = root_test_model_with_history(session_id, &history);
+        let area = bmux_tui::geometry::Rect::new(0, 0, 60, 14);
+        let mut bytes = Vec::new();
+        let mut terminal = bmux_tui::terminal::Terminal::new(&mut bytes, area);
+        let mut present = |model: &mut super::BcodeRuntimeModel| {
+            super::bcode_runtime_presenter(&mut terminal)
+                .present(model)
+                .expect("frame presents");
+        };
+        present(&mut model);
+        let key = |name: &str| Event::Key(bmux_keyboard::parse_key_stroke(name).unwrap());
+        let _ = model.handle_basic_terminal_event(key("alt+u"));
+        assert!(model.chat.app.transcript_focus_active());
+        present(&mut model);
+
+        // Walking up, every drawn frame shows the focused row.
+        let mut moved_view = false;
+        for step in 0..40 {
+            let (_, top_before, _) = focus_view(&model);
+            let _ = model.handle_basic_terminal_event(key("k"));
+            present(&mut model);
+            let (row, top, height) = focus_view(&model);
+            assert!(
+                row >= top && row < top + usize::from(height),
+                "step {step}: focused row {row} outside {top}..{}",
+                top + usize::from(height)
+            );
+            moved_view |= top != top_before;
+        }
+        assert!(moved_view, "walking up the transcript scrolled it");
+        assert_eq!(focus_view(&model).1, 0, "the walk reached the top");
+
+        // Walking back down, a scroll puts the focused unit's last row on the
+        // bottom edge, or its first row on top when it is taller than the view.
+        let mut moved_view = false;
+        for step in 0..40 {
+            let (_, top_before, _) = focus_view(&model);
+            let _ = model.handle_basic_terminal_event(key("j"));
+            // The jump-to-latest bar can appear or disappear on the next
+            // frame and change the transcript height by a row, so the hug is
+            // checked against the height the scroll was computed for.
+            let (_, top, height) = focus_view(&model);
+            present(&mut model);
+            let extent = focused_extent(&model);
+            let (row, drawn_top, drawn_height) = focus_view(&model);
+            assert!(
+                row >= drawn_top && row < drawn_top + usize::from(drawn_height),
+                "step {step}: focused row {row} not drawn"
+            );
+            if top != top_before {
+                moved_view = true;
+                let bottom = top + usize::from(height);
+                assert!(
+                    extent.end == bottom || extent.start == top,
+                    "step {step}: {extent:?} does not hug {top}..{bottom}"
+                );
+            }
+        }
+        assert!(moved_view, "walking down the transcript scrolled it");
+        drop(model);
+    }
+
     #[tokio::test]
     async fn scrolling_reprojects_selection_highlights_for_still_visible_content() {
         use bmux_tui_runtime::Presenter;
