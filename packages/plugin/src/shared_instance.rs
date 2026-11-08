@@ -116,7 +116,7 @@ impl SharedInstance {
             .ok_or_else(|| error(&manifest.id, "embedded_manifest"))?;
         let embedded: PluginManifest =
             toml::from_str(embedded).map_err(|_| error(&manifest.id, "embedded_manifest"))?;
-        if &embedded != manifest {
+        if !crate::embedded_manifest_matches(embedded, manifest) {
             return Err(error(&manifest.id, "embedded_manifest_mismatch"));
         }
         let scope = InstanceScope::new(host.runtime);

@@ -7440,6 +7440,44 @@ pub fn resolve_external_workflow_templates(
     Ok(())
 }
 
+/// Check that a plugin's embedded manifest is exactly the shipped manifest declaration.
+///
+/// Embedded manifests are never host-resolved, while the shipped manifest has had its external
+/// workflow templates resolved against the trusted package root. Resolution is a pure function
+/// of the declared `document_source`, whose digest pins the loaded document, so applying the
+/// shipped resolution outputs to each matching embedded declaration is identical to resolving
+/// the embedded declaration against the same package. Every declared field, including the
+/// source path and digest, is still compared exactly.
+pub(crate) fn embedded_manifest_matches(
+    mut embedded: PluginManifest,
+    resolved: &PluginManifest,
+) -> bool {
+    if embedded.workflow_templates.len() != resolved.workflow_templates.len() {
+        return false;
+    }
+    for (declared, shipped) in embedded
+        .workflow_templates
+        .iter_mut()
+        .zip(&resolved.workflow_templates)
+    {
+        if shipped.authoring_document.is_some()
+            && shipped.document_source.is_some()
+            && declared.document_source == shipped.document_source
+        {
+            declared
+                .configuration_schema
+                .clone_from(&shipped.configuration_schema);
+            declared
+                .required_plugins
+                .clone_from(&shipped.required_plugins);
+            declared
+                .authoring_document
+                .clone_from(&shipped.authoring_document);
+        }
+    }
+    embedded == *resolved
+}
+
 fn read_registered_plugin(path: &Path) -> Result<RegisteredPlugin, PluginLoadError> {
     let mut manifest = read_manifest(path)?;
     resolve_external_workflow_templates(
@@ -14393,10 +14431,22 @@ library = "libexample_plugin.dylib"
             path: PathBuf::from("templates/example.json"),
             sha256: hex::encode(Sha256::digest(&bytes)),
         });
-        let mut manifest = test_manifest("bcode.example");
-        manifest.workflow_templates.push(template);
+        let mut declared = test_manifest("bcode.example");
+        declared.workflow_templates.push(template);
+        let mut manifest = declared.clone();
 
         resolve_external_workflow_templates(&mut manifest, &root).expect("external template");
+        assert!(embedded_manifest_matches(declared.clone(), &manifest));
+        let mut tampered = declared.clone();
+        tampered.workflow_templates[0]
+            .document_source
+            .as_mut()
+            .expect("external source")
+            .sha256 = "0".repeat(64);
+        assert!(!embedded_manifest_matches(tampered, &manifest));
+        let mut retitled = declared;
+        retitled.workflow_templates[0].title.push_str(" changed");
+        assert!(!embedded_manifest_matches(retitled, &manifest));
         let normalized = &manifest.workflow_templates[0];
         assert_eq!(normalized.authoring_document(), Some(&document));
         normalized.validate().expect("normalized contribution");
