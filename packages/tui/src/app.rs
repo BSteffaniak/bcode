@@ -2946,6 +2946,26 @@ impl BmuxApp {
         self.structure.snapshot().group_of(item_id)
     }
 
+    /// Last item of `group` in transcript order: its last member, bridged, or
+    /// attached item.
+    fn group_last_item(&self, group: u64) -> Option<u64> {
+        let snapshot = self.structure.snapshot();
+        let view = snapshot.group_view(group)?;
+        let items = self.transcript();
+        view.members
+            .iter()
+            .chain(&view.bridged)
+            .chain(&view.attached)
+            .filter_map(|id| {
+                items
+                    .iter()
+                    .position(|item| item.id().get() == *id)
+                    .map(|index| (index, *id))
+            })
+            .max_by_key(|(index, _)| *index)
+            .map(|(_, id)| id)
+    }
+
     /// Facts of the group whose first member is `first_member`, when that
     /// group exists in the resident window.
     fn group_facts(
@@ -3302,17 +3322,41 @@ impl BmuxApp {
 
     /// Scroll so the focused target's anchor row is visible.
     fn reveal_focused_target(&mut self) {
+        self.reveal_focused_target_from(None);
+    }
+
+    /// Scroll the focused target into view. After a move the viewport edge
+    /// the focus approached follows the whole target; otherwise its anchor row
+    /// is revealed at the nearest edge.
+    fn reveal_focused_target_from(&mut self, motion: Option<super::transcript_focus::FocusMotion>) {
+        use super::structure::DisclosureTarget;
         self.refresh_focus_entry_hint();
-        let Some(row) = self
-            .transcript_focus
-            .focused()
-            .and_then(|target| self.disclosure_target_row(target))
-        else {
+        let Some(target) = self.transcript_focus.focused().cloned() else {
             return;
         };
         let height = self.session_ui.viewport.height();
         let top_row = self.transcript_top_row(height);
-        if let Some(top_row) = super::transcript_focus::reveal_top_row(row, top_row, height) {
+        let next_top = motion.map_or_else(
+            || {
+                self.disclosure_target_row(&target)
+                    .and_then(|row| super::transcript_focus::reveal_top_row(row, top_row, height))
+            },
+            |motion| {
+                let last_item = match &target {
+                    DisclosureTarget::Group(group) => self.group_last_item(*group),
+                    DisclosureTarget::Unit(_) | DisclosureTarget::Section(..) => None,
+                };
+                super::transcript_focus::target_extent(
+                    &self.disclosure_anchors(),
+                    &target,
+                    last_item,
+                )
+                .and_then(|extent| {
+                    super::transcript_focus::follow_top_row(&extent, top_row, height, motion)
+                })
+            },
+        );
+        if let Some(top_row) = next_top {
             self.transcript_scroll_animation = None;
             self.session_ui.viewport.detach();
             self.session_ui.viewport.follow_anchor(top_row);
@@ -3356,7 +3400,11 @@ impl BmuxApp {
                     return false;
                 };
                 self.transcript_focus.focus(next);
-                self.reveal_focused_target();
+                self.reveal_focused_target_from(Some(if action == FocusAction::Next {
+                    focus::FocusMotion::Down
+                } else {
+                    focus::FocusMotion::Up
+                }));
                 true
             }
             FocusAction::Toggle => self.toggle_target(&target),
@@ -13388,6 +13436,64 @@ pub mod disclosure_focus_tests {
             .map(|item| item.id().get())
             .collect();
         (app, ids)
+    }
+
+    #[test]
+    fn focus_moves_scroll_the_viewport_from_the_edge_they_approach() {
+        use crate::transcript_focus::FocusAction;
+        let (mut app, _) = grouped_app(0, 12, "");
+        let total = app.transcript_layout().total_rows();
+        let height = 6_u16;
+        assert!(total > usize::from(height) * 2, "{total} rows");
+        app.set_transcript_viewport_for_details_test(total, height, 0);
+        assert!(app.enter_transcript_focus());
+        let extent = |app: &BmuxApp| {
+            let target = app.transcript_focus.focused().cloned().expect("focused");
+            crate::transcript_focus::target_extent(&app.disclosure_anchors(), &target, None)
+                .expect("focused extent")
+        };
+
+        // Walk up to the first target: every scroll lands the focused
+        // target's first row on the top edge.
+        let mut scrolled_up = false;
+        for _ in 0..64 {
+            let top_before = app.transcript_top_row(height);
+            if !app.handle_transcript_focus_action(FocusAction::Previous) {
+                break;
+            }
+            let top = app.transcript_top_row(height);
+            let extent = extent(&app);
+            assert!(extent.start >= top && extent.start < top + usize::from(height));
+            if top != top_before {
+                scrolled_up = true;
+                assert_eq!(extent.start, top, "moving up hugs the top edge");
+            }
+        }
+        assert!(scrolled_up, "moving up scrolled the viewport");
+        assert_eq!(app.transcript_top_row(height), 0);
+
+        // Walk back down: a scroll puts the focused target's last row on the
+        // bottom edge (or its first row on top when it is taller than the
+        // viewport).
+        let mut scrolled_down = false;
+        for _ in 0..64 {
+            let top_before = app.transcript_top_row(height);
+            if !app.handle_transcript_focus_action(FocusAction::Next) {
+                break;
+            }
+            let top = app.transcript_top_row(height);
+            let extent = extent(&app);
+            if top != top_before {
+                scrolled_down = true;
+                let bottom = top + usize::from(height);
+                assert!(
+                    extent.end == bottom || extent.start == top,
+                    "extent {extent:?} in {top}..{bottom}"
+                );
+            }
+            assert!(extent.start >= top);
+        }
+        assert!(scrolled_down, "moving down scrolled the viewport");
     }
 
     #[test]

@@ -468,8 +468,12 @@ disclosure replaces the toggles of its members.
 #### Focus mode
 
 `alt+u` (`tui.transcript.focusUnits`) enters keyboard focus mode on the last
-visible disclosure target. The focused row uses the selection style and stays
-in view.
+visible disclosure target. The focused row uses the selection style. Moving
+focus scrolls the transcript from the edge it approaches: moving up puts the
+target's first row on the top edge, and moving down puts its last row on the
+bottom edge (a target taller than the view keeps its first row on top instead).
+A unit spans its whole entry, a section runs to the next section, and a group
+runs through its last item.
 
 | Key | Action |
 |---|---|

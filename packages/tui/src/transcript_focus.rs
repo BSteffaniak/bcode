@@ -8,6 +8,7 @@
 
 use bcode_presentation_policy::models::Disclosure;
 use bmux_tui::geometry::Rect;
+use std::ops::Range;
 
 use crate::structure::DisclosureTarget;
 use crate::transcript_layout::{TranscriptLayoutCache, VisibleTranscriptSource};
@@ -241,6 +242,9 @@ pub trait DisclosureAnchors {
 
     /// Row of `target` inside `entry`, when its anchor is present.
     fn target_row_in_entry(&self, entry: usize, target: &DisclosureTarget) -> Option<usize>;
+
+    /// Number of rows `entry` occupies.
+    fn entry_row_count(&self, entry: usize) -> Option<usize>;
 }
 
 /// Global row of `target`'s anchor, when it is laid out.
@@ -376,6 +380,84 @@ pub fn parent(
     }
 }
 
+/// Global rows `target` occupies: its anchor row through the end of what it
+/// discloses.
+///
+/// * A unit spans its entry.
+/// * A section runs to the next disclosure anchor of its entry, or the entry
+///   end.
+/// * A group runs through the entry of `last_item`, its last item in
+///   transcript order (members, bridged and attached items alike).
+#[must_use]
+pub fn target_extent(
+    anchors: &impl DisclosureAnchors,
+    target: &DisclosureTarget,
+    last_item: Option<u64>,
+) -> Option<Range<usize>> {
+    let entry = anchors.entry_of_item(target.item_id())?;
+    let entry_start = anchors.entry_start_row(entry)?;
+    let entry_end = |entry: usize| {
+        anchors
+            .entry_row_count(entry)
+            .map(|rows| anchors.entry_start_row(entry).unwrap_or(entry_start) + rows)
+    };
+    let row_in_entry = anchors.target_row_in_entry(entry, target)?;
+    let start = entry_start.saturating_add(row_in_entry);
+    let end = match target {
+        DisclosureTarget::Unit(_) => entry_end(entry)?,
+        DisclosureTarget::Section(..) => anchors
+            .entry_targets(entry)
+            .into_iter()
+            .map(|(row, _)| row)
+            .find(|row| *row > row_in_entry)
+            .map_or_else(|| entry_end(entry), |row| Some(entry_start + row))?,
+        DisclosureTarget::Group(_) => last_item
+            .and_then(|item| anchors.entry_of_item(item))
+            .filter(|last| *last >= entry)
+            .map_or_else(|| entry_end(entry), entry_end)?,
+    };
+    Some(start..end.max(start.saturating_add(1)))
+}
+
+/// Direction focus moved in, which decides the viewport edge that follows it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FocusMotion {
+    /// Focus moved toward the top: the target's first row meets the top edge.
+    Up,
+    /// Focus moved toward the bottom: the target's last row meets the bottom
+    /// edge, without scrolling its first row out of view.
+    Down,
+}
+
+/// New viewport top row that brings `extent` into a viewport of `height` rows
+/// starting at `top_row` from the edge `motion` approaches, or `None` when no
+/// scroll is needed.
+///
+/// Moving up scrolls only when the target's first row is above the viewport
+/// and puts it on the top row. Moving down scrolls only when the target ends
+/// below the viewport and puts its last row on the bottom row; a target taller
+/// than the viewport keeps its first row on the top row instead.
+#[must_use]
+pub fn follow_top_row(
+    extent: &Range<usize>,
+    top_row: usize,
+    height: u16,
+    motion: FocusMotion,
+) -> Option<usize> {
+    let height = usize::from(height).max(1);
+    let bottom_hug = extent.end.saturating_sub(height).min(extent.start);
+    if extent.start < top_row {
+        return Some(extent.start);
+    }
+    match motion {
+        FocusMotion::Up if extent.start >= top_row.saturating_add(height) => Some(bottom_hug),
+        FocusMotion::Down if extent.end > top_row.saturating_add(height) => {
+            Some(bottom_hug.max(top_row))
+        }
+        FocusMotion::Up | FocusMotion::Down => None,
+    }
+}
+
 /// New viewport top row that brings global `row` into a viewport of `height`
 /// rows starting at `top_row`, or `None` when it is already visible.
 #[must_use]
@@ -472,6 +554,11 @@ impl<F: Fn(u64) -> Option<usize>> DisclosureAnchors for LayoutAnchors<'_, F> {
 
     fn target_row_in_entry(&self, entry: usize, target: &DisclosureTarget) -> Option<usize> {
         self.layout.content_anchor_row(entry, &target.to_hit_id())
+    }
+
+    fn entry_row_count(&self, entry: usize) -> Option<usize> {
+        self.layout
+            .entry_row_count(VisibleTranscriptSource::Transcript, entry)
     }
 }
 
@@ -593,6 +680,54 @@ pub mod tests {
         assert_eq!(step(&anchors, &section(11, "diff"), true), Some(unit(11)));
         // Targets of items outside the resident window cannot step.
         assert_eq!(step(&anchors, &unit(99), true), None);
+    }
+
+    #[test]
+    fn target_extents_cover_what_each_target_discloses() {
+        let layout = sample();
+        let anchors = anchors(&layout, &ITEMS);
+        // Entries start at rows 0, 3, 9 and 11 and hold 3, 6, 2 and 2 rows.
+        assert_eq!(target_extent(&anchors, &unit(10), None), Some(1..3));
+        assert_eq!(target_extent(&anchors, &unit(11), None), Some(3..9));
+        assert_eq!(
+            target_extent(&anchors, &section(11, "arguments"), None),
+            Some(4..6)
+        );
+        assert_eq!(
+            target_extent(&anchors, &section(11, "output"), None),
+            Some(6..9)
+        );
+        // A group runs through its last item's entry.
+        assert_eq!(
+            target_extent(&anchors, &DisclosureTarget::Group(10), Some(11)),
+            Some(0..9)
+        );
+        assert_eq!(
+            target_extent(&anchors, &DisclosureTarget::Group(10), None),
+            Some(0..3)
+        );
+        assert_eq!(target_extent(&anchors, &unit(99), None), None);
+    }
+
+    #[test]
+    fn focus_motion_follows_from_the_edge_it_approaches() {
+        use FocusMotion::{Down, Up};
+        // Moving down, the target's last row meets the bottom edge.
+        assert_eq!(follow_top_row(&(11..13), 3, 4, Down), Some(9));
+        // A target taller than the viewport keeps its first row on top.
+        assert_eq!(follow_top_row(&(3..9), 0, 4, Down), Some(3));
+        // Moving up, the target's first row meets the top edge.
+        assert_eq!(follow_top_row(&(4..6), 6, 4, Up), Some(4));
+        assert_eq!(follow_top_row(&(3..9), 5, 4, Up), Some(3));
+        // Fully visible targets, or ones whose start is visible when moving
+        // up, need no scroll.
+        assert_eq!(follow_top_row(&(11..13), 9, 4, Down), None);
+        assert_eq!(follow_top_row(&(3..9), 3, 4, Up), None);
+        // A target off the other edge is brought in from the nearest edge.
+        assert_eq!(follow_top_row(&(11..13), 0, 4, Up), Some(9));
+        assert_eq!(follow_top_row(&(1..3), 5, 4, Down), Some(1));
+        // A zero-height viewport still yields a valid row.
+        assert_eq!(follow_top_row(&(11..13), 0, 0, Down), Some(11));
     }
 
     #[test]
