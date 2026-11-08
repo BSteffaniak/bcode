@@ -533,7 +533,7 @@ A new commit editor starts with the first message found in these sources:
 |---|---|---|
 | `env` | `$BCODE_GIT_COMMIT_MSG` environment variable | The message itself; used by the first commit editor of the session only. |
 | `bcode-draft` | `BCODE_GIT_COMMIT_MSG` in the git directory | bcode's draft; anything may write it. |
-| `lazygit-draft` | `LAZYGIT_PENDING_COMMIT` in the git directory | lazygit's unsent message; read, never written. |
+| `lazygit-draft` | `LAZYGIT_PENDING_COMMIT` in the git directory | lazygit's unsent message; read, and removed once a commit uses it. |
 | `merge` | `MERGE_MSG` | Left by a merge, cherry-pick or revert that stopped. |
 | `squash` | `SQUASH_MSG` | Left by `git merge --squash`. |
 | `edit-msg` | `COMMIT_EDITMSG` | Only when it differs from `HEAD`'s message, that is, a commit that did not land. |
@@ -555,7 +555,11 @@ Drafts follow the message:
 * Cancelling an edited editor saves the text as the bcode draft; cancelling an emptied editor
   removes it. Untouched text from git's own files is not copied into a draft.
 * Submitting saves the draft first, so a commit that fails (for example a rejecting hook) keeps it.
-  Once the commit lands, the bcode draft is removed, and so is lazygit's if its message was used.
+  Once the commit lands, every file it consumed is removed, so its message is never offered again:
+  the bcode draft, the file the editor was prefilled from (whichever tool wrote it: lazygit's
+  draft, `MERGE_MSG`, `SQUASH_MSG`), and `COMMIT_EDITMSG`, which would otherwise come back as "a
+  commit that did not land" once `HEAD` moves. Files ranked below the prefill, which the editor
+  never showed, stay. A `commit.template` is never removed: it is meant to be reused.
 * Amending leaves drafts alone.
 
 When committing, description lines longer than `wrap_width` are wrapped at word boundaries

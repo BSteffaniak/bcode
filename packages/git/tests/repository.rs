@@ -525,11 +525,25 @@ fn commit_message_sources_and_drafts() {
     assert_eq!(message(&repo, CommitMessageSource::BcodeDraft), None);
 
     repo.repo.save_commit_draft("again").unwrap();
-    repo.repo.clear_commit_drafts(true, false).unwrap();
+    repo.repo
+        .consume_commit_messages(&[CommitMessageSource::BcodeDraft])
+        .unwrap();
     assert_eq!(message(&repo, CommitMessageSource::BcodeDraft), None);
     assert!(message(&repo, CommitMessageSource::LazygitDraft).is_some());
-    repo.repo.clear_commit_drafts(false, true).unwrap();
+    repo.repo
+        .consume_commit_messages(&[CommitMessageSource::LazygitDraft])
+        .unwrap();
     assert_eq!(message(&repo, CommitMessageSource::LazygitDraft), None);
+    // Templates are reusable and stay; git's own files go.
+    std::fs::write(git_dir.join("MERGE_MSG"), "Merge\n").unwrap();
+    repo.repo
+        .consume_commit_messages(&[CommitMessageSource::Template, CommitMessageSource::Merge])
+        .unwrap();
+    assert_eq!(message(&repo, CommitMessageSource::Merge), None);
+    assert_eq!(
+        message(&repo, CommitMessageSource::Template).as_deref(),
+        Some("feat:")
+    );
     assert_eq!(message(&repo, CommitMessageSource::Env), None);
 }
 

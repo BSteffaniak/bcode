@@ -1340,16 +1340,21 @@ impl Repository {
         Ok(())
     }
 
-    /// Remove bcode's draft and, when its message was used, lazygit's.
+    /// Remove the files of commit message sources a commit consumed, so their text is not
+    /// offered again. [`CommitMessageSource::Env`] has no file, and
+    /// [`CommitMessageSource::Template`] is never removed: a template is meant to be reused,
+    /// and is often shared by every repository.
     ///
     /// # Errors
     /// * [`GitError`] when a file exists but cannot be removed.
-    pub fn clear_commit_drafts(&self, bcode: bool, lazygit: bool) -> Result<(), GitError> {
-        if bcode {
-            remove_if_present(&self.paths.git_dir.join(BCODE_COMMIT_DRAFT))?;
-        }
-        if lazygit {
-            remove_if_present(&self.paths.git_dir.join(LAZYGIT_COMMIT_DRAFT))?;
+    pub fn consume_commit_messages(&self, sources: &[CommitMessageSource]) -> Result<(), GitError> {
+        for source in sources {
+            if *source == CommitMessageSource::Template {
+                continue;
+            }
+            if let Some(path) = self.commit_message_path(*source)? {
+                remove_if_present(&path)?;
+            }
         }
         Ok(())
     }

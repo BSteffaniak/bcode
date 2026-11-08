@@ -4,19 +4,22 @@ use std::collections::BTreeSet;
 use std::path::PathBuf;
 
 use bcode_git::models::{
-    Branch, DiffFile, DiffLineId, HeadState, RebaseTodoItem, RemoteBranch, ResetMode, StashEntry,
+    Branch, CommitMessageSource, DiffFile, DiffLineId, HeadState, RebaseTodoItem, RemoteBranch,
+    ResetMode, StashEntry,
 };
 use bcode_git::{
     ApplyTarget, CommitOptions, ConflictSide, GitError, PushOptions, Repository, StashOptions,
 };
 
-/// Commit-message drafts to remove after a successful commit.
+/// Commit message files to remove after a successful commit, besides `COMMIT_EDITMSG`
+/// (which then holds the commit's own message, and would be offered again once `HEAD`
+/// moves).
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct DraftCleanup {
     /// bcode's `BCODE_GIT_COMMIT_MSG` file.
     pub bcode: bool,
-    /// lazygit's `LAZYGIT_PENDING_COMMIT` file.
-    pub lazygit: bool,
+    /// The source the editor was prefilled from, whatever wrote it.
+    pub used: Option<CommitMessageSource>,
 }
 
 /// A repository mutation.
@@ -415,8 +418,15 @@ fn run_worktree_op(repo: &Repository, op: &Op) -> Option<Result<(), GitError>> {
             reverse,
         } => repo.apply_patch(patch, *target, *reverse),
         Op::Commit(options, drafts) => repo.commit(options).and_then(|()| {
-            // Only a commit that landed consumes its drafts; a failed one keeps them.
-            repo.clear_commit_drafts(drafts.bcode, drafts.lazygit)
+            // Only a commit that landed consumes its messages; a failed one keeps them.
+            let consumed: Vec<CommitMessageSource> = drafts
+                .bcode
+                .then_some(CommitMessageSource::BcodeDraft)
+                .into_iter()
+                .chain(drafts.used)
+                .chain([CommitMessageSource::EditMsg])
+                .collect();
+            repo.consume_commit_messages(&consumed)
         }),
         _ => return None,
     })

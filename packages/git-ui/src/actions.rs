@@ -2393,7 +2393,7 @@ pub fn submit_prompt(app: &mut App, prompt: Prompt) -> Update<Msg> {
                 let source = prefill.as_ref().map(|(source, _)| *source);
                 DraftCleanup {
                     bcode: save_draft || source == Some(CommitMessageSource::BcodeDraft),
-                    lazygit: source == Some(CommitMessageSource::LazygitDraft),
+                    used: source,
                 }
             };
             // A configured prefix such as "WIP" skips hooks, as in lazygit.

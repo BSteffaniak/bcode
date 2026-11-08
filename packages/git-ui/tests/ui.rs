@@ -979,6 +979,36 @@ fn lazygit_draft_is_used_and_cleared_only_by_a_commit_that_used_it() {
 }
 
 #[test]
+fn a_commit_consumes_the_message_file_it_was_prefilled_from() {
+    let mut harness = Harness::new(|path| {
+        changed_repo(path);
+        std::fs::write(path.join(".git/SQUASH_MSG"), "Squashed work").unwrap();
+    });
+    harness.keys(&["c"]);
+    let screen = harness.screen(140, 40);
+    assert!(screen.contains("from SQUASH_MSG"), "{screen}");
+    harness.keys(&["enter"]);
+    assert_eq!(harness.log(), ["Squashed work", "init"]);
+    assert_eq!(git_file(&harness, "SQUASH_MSG"), None);
+}
+
+#[test]
+fn a_landed_commits_message_is_not_offered_again_after_head_moves() {
+    let mut harness = Harness::new(changed_repo);
+    harness.keys(&["c"]);
+    harness.paste("Landed");
+    harness.keys(&["enter"]);
+    assert_eq!(harness.log(), ["Landed", "init"]);
+    // `HEAD` moving away would make a leftover COMMIT_EDITMSG look like a failed commit.
+    git(harness.path(), &["reset", "--quiet", "--soft", "HEAD~1"]);
+    assert_eq!(git_file(&harness, "COMMIT_EDITMSG"), None);
+    harness.keys(&["c"]);
+    let screen = harness.screen(140, 40);
+    assert!(screen.contains("Commit"), "{screen}");
+    assert!(!screen.contains("from COMMIT_EDITMSG"), "{screen}");
+}
+
+#[test]
 fn bcode_draft_outranks_lazygit_and_leaves_its_file_alone() {
     let mut harness = Harness::new(|path| {
         changed_repo(path);
