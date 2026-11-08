@@ -2218,7 +2218,15 @@ impl BcodeRuntimeModel {
             bmux_tui::selection::SelectionOutcome::Click => {
                 self.cancel_selection_clear();
                 self.refresh_selected_plain_text();
-                None
+                // Selection armed on the press, so a click on a disclosure
+                // header or Markdown contribution activates on release.
+                let hit_id = super::mouse_flow::mouse_hit_id(&self.committed_hits, mouse);
+                (super::mouse_flow::is_transcript_click_target(hit_id.as_deref())
+                    && super::mouse_flow::activate_transcript_click(
+                        hit_id.as_deref(),
+                        &mut self.chat,
+                    ))
+                .then_some(super::invalidation::UiInvalidation::Structural)
             }
             bmux_tui::selection::SelectionOutcome::Armed => {
                 self.cancel_selection_clear();
@@ -8636,6 +8644,100 @@ mod tests {
                 .transcript_selection
                 .snapshot(&model.committed_selection)
                 .is_some()
+        );
+        drop(model);
+    }
+
+    #[tokio::test]
+    async fn clicking_a_tool_header_over_selectable_transcript_toggles_it_once() {
+        use bmux_tui::event::{Event, MouseButton, MouseEvent, MouseEventKind};
+        use bmux_tui_runtime::Presenter;
+
+        let session_id = bcode_session_models::SessionId::new();
+        let event = |sequence, kind| bcode_session_models::SessionEvent {
+            schema_version: bcode_session_models::CURRENT_SESSION_EVENT_SCHEMA_VERSION,
+            sequence,
+            timestamp_ms: sequence,
+            session_id,
+            provenance: None,
+            kind,
+        };
+        let history = [
+            event(
+                1,
+                bcode_session_models::SessionEventKind::ToolCallRequested {
+                    tool_call_id: "call-read".to_owned(),
+                    producer_plugin_id: None,
+                    tool_name: "read".to_owned(),
+                    arguments_json: r#"{"path":"src/lib.rs"}"#.to_owned(),
+                    working_directory: None,
+                },
+            ),
+            event(
+                2,
+                bcode_session_models::SessionEventKind::ToolInvocationResultRecorded {
+                    record: bcode_session_models::ToolInvocationResultRecord {
+                        invocation_id: "call-read".to_owned(),
+                        model_output: "line one\nline two".to_owned(),
+                        is_error: false,
+                        presentation: None,
+                        result: None,
+                        content: Vec::new(),
+                    },
+                },
+            ),
+        ];
+        let mut model = root_test_model_with_history(session_id, &history);
+        let area = bmux_tui::geometry::Rect::new(0, 0, 60, 16);
+        let mut bytes = Vec::new();
+        let mut terminal = bmux_tui::terminal::Terminal::new(&mut bytes, area);
+        super::bcode_runtime_presenter(&mut terminal)
+            .present(&mut model)
+            .expect("startup frame presents");
+        let region = model
+            .committed_hits
+            .regions()
+            .iter()
+            .find(|region| region.visible && region.id.as_str().starts_with("disclosure:unit:"))
+            .cloned()
+            .expect("tool header disclosure hit region");
+        let target = crate::structure::DisclosureTarget::from_hit_id(region.id.as_str())
+            .expect("disclosure target");
+        let point = bmux_tui::geometry::Point::new(region.area.x, region.area.y);
+        let click = |model: &mut super::BcodeRuntimeModel| {
+            let _press = model.handle_basic_terminal_event(Event::Mouse(MouseEvent::new(
+                MouseEventKind::Down(MouseButton::Left),
+                point,
+            )));
+            model.handle_basic_terminal_event(Event::Mouse(MouseEvent::new(
+                MouseEventKind::Up(MouseButton::Left),
+                point,
+            )))
+        };
+
+        assert_eq!(
+            model.chat.app.structure_snapshot().target_override(&target),
+            None
+        );
+        assert_eq!(
+            click(&mut model),
+            super::super::invalidation::UiInvalidation::Structural
+        );
+        let first = model.chat.app.structure_snapshot().target_override(&target);
+        assert!(first.is_some(), "one click toggles the header");
+        assert!(
+            model
+                .selected_plain_text
+                .as_deref()
+                .is_none_or(str::is_empty)
+        );
+
+        let _ = super::bcode_runtime_presenter(&mut terminal).present(&mut model);
+        let _ = click(&mut model);
+        assert_ne!(
+            model.chat.app.structure_snapshot().target_override(&target),
+            first,
+            "a second click toggles back rather than being swallowed"
         );
         drop(model);
     }

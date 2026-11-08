@@ -33,6 +33,36 @@ pub fn handle_inspector_scrollbar_mouse(
     routed && chat.app.inspector_scrollbar_mouse(mouse)
 }
 
+/// Whether `hit_id` names a transcript element activated by a left click: a
+/// Markdown contribution or a disclosure target.
+#[must_use]
+pub fn is_transcript_click_target(hit_id: Option<&str>) -> bool {
+    hit_id.is_some_and(|hit| {
+        crate::markdown_interaction::contribution_id_from_hit(hit).is_some()
+            || crate::structure::DisclosureTarget::from_hit_id(hit).is_some()
+    })
+}
+
+/// Activate the transcript click target under a left click; returns whether
+/// anything changed.
+///
+/// Transcript text selection arms on press, so a press over transcript content
+/// reaches this only as a completed click (press and release without a drag);
+/// a press outside selectable content activates on press instead. Each click
+/// therefore activates exactly once.
+pub fn activate_transcript_click(hit_id: Option<&str>, chat: &mut ActiveChat) -> bool {
+    let Some(hit) = hit_id else {
+        return false;
+    };
+    if let Some(contribution_id) = crate::markdown_interaction::contribution_id_from_hit(hit) {
+        let focus_changed = chat.app.focus_markdown_contribution(contribution_id);
+        let activated = chat.app.activate_markdown_contribution(contribution_id);
+        return focus_changed || activated;
+    }
+    crate::structure::DisclosureTarget::from_hit_id(hit)
+        .is_some_and(|target| chat.app.toggle_target(&target))
+}
+
 /// Handle one non-modal mouse event that does not require daemon work.
 pub fn handle_non_permission_mouse(
     hit_id: Option<&str>,
@@ -58,26 +88,8 @@ pub fn handle_non_permission_mouse(
         MouseEventKind::Down(MouseButton::Left) if hit_id == Some("latest-bar") => {
             chat.app.transition_transcript_to_bottom()
         }
-        MouseEventKind::Down(MouseButton::Left)
-            if hit_id
-                .and_then(crate::markdown_interaction::contribution_id_from_hit)
-                .is_some() =>
-        {
-            let contribution_id = hit_id
-                .and_then(crate::markdown_interaction::contribution_id_from_hit)
-                .expect("guarded Markdown contribution hit");
-            let focus_changed = chat.app.focus_markdown_contribution(contribution_id);
-            let activated = chat.app.activate_markdown_contribution(contribution_id);
-            focus_changed || activated
-        }
-        MouseEventKind::Down(MouseButton::Left)
-            if hit_id
-                .and_then(crate::structure::DisclosureTarget::from_hit_id)
-                .is_some() =>
-        {
-            hit_id
-                .and_then(crate::structure::DisclosureTarget::from_hit_id)
-                .is_some_and(|target| chat.app.toggle_target(&target))
+        MouseEventKind::Down(MouseButton::Left) if is_transcript_click_target(hit_id) => {
+            activate_transcript_click(hit_id, chat)
         }
         MouseEventKind::Down(MouseButton::Left) if hit_id == Some("composer") => {
             composer_mouse_changed(chat, mouse)
