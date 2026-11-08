@@ -225,6 +225,15 @@ impl bcode_plugin_sdk::tui::PluginTuiVisualAdapter for ShellRunTuiVisualAdapter 
         }
     }
 
+    fn tool_presentation(
+        &self,
+        kind: &str,
+        payload: &serde_json::Value,
+        _context: &bcode_plugin_sdk::tui::PluginTuiVisualRenderContext,
+    ) -> bcode_plugin_sdk::tui::PluginTuiToolPresentation {
+        crate::shell_summary::shell_tool_presentation(kind, payload)
+    }
+
     fn accepts_artifact_reference(
         &self,
         kind: &str,

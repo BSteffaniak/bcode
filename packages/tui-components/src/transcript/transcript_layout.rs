@@ -271,6 +271,12 @@ impl TranscriptLayoutCache {
         self.entries.resolve_content_anchor(index, key, offset)
     }
 
+    /// Every content anchor of transcript entry `index` as `(row, key)`, in
+    /// recorded order, including anchors that share a row.
+    pub fn content_anchors(&self, index: usize) -> impl Iterator<Item = (usize, &str)> {
+        self.entries.content_anchors(index)
+    }
+
     /// Resolve an accepted content key in the current item layout.
     #[must_use]
     pub fn content_anchor_row(&self, index: usize, key: &str) -> Option<usize> {

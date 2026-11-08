@@ -31,6 +31,7 @@ bcode_model_provider_runtime = { workspace = true, features = [
 bcode_plugin = { workspace = true }
 bcode_plugin_config = { workspace = true }
 bcode_plugin_sdk = { workspace = true }
+bcode_presentation_policy = { workspace = true }
 bcode_prompt_cache = { workspace = true }
 bcode_provider_auth = { workspace = true }
 bcode_provider_auth_models = { workspace = true }
@@ -46,6 +47,7 @@ bcode_settings = { workspace = true }
 bcode_skill_models = { workspace = true }
 bcode_tool_models = { workspace = true }
 bcode_tui = { workspace = true }
+bcode_tui_theme = { workspace = true }
 bcode_workflow = { workspace = true }
 bcode_workflow_discovery = { workspace = true }
 bcode_workflow_store = { workspace = true }

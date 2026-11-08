@@ -14,13 +14,33 @@ separators = { status = "plain" }
 speaker    = "prefix"
 surfaces   = "flat"
 
+# Dense rows: no blank line after tools, short previews, folded groups.
 [[presentation.rules]]
 match = { kind = "tool" }
 set   = { disclosure = "summary", preview = { lines = 8 }, parts = { timing = false } }
 
 [[presentation.rules]]
+match = { kind = "tool" }
+set   = { group = { by = "consecutive" }, spacing = { before = 0, after = 0 } }
+
+[[presentation.rules]]
+match = { kind = "tool" }
+set   = { header = { fields = ["marker", "tool", "target", "status"] } }
+
+[[presentation.rules]]
+match = { kind = "tool" }
+
+[presentation.rules.set.sections]
+arguments = { preview = { lines = 3, keep = "head" } }
+metadata  = { visible = false }
+
+[[presentation.rules]]
 match = { kind = "tool", status = ["running", "waiting"] }
 set   = { disclosure = "expanded" }
+
+[[presentation.rules]]
+match = { kind = "group" }
+set   = { disclosure = "collapsed", spacing = { before = 0, after = 0 } }
 
 [containers."transcript.user"]
 layout = "plain"

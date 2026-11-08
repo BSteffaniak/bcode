@@ -14,13 +14,23 @@ separators = { status = "plain" }
 speaker    = "prefix"
 surfaces   = "flat"
 
+# Quiet headers without the label; lookups fold into collapsed same-tool groups.
+[[presentation.rules]]
+match = { kind = "tool" }
+set   = { header = { fields = ["marker", "tool", "target", "status", "timing"] } }
+
 [[presentation.rules]]
 match = { kind = "tool", status = "succeeded" }
 set   = { disclosure = "summary", parts = { timing = false } }
 
 [[presentation.rules]]
 match = { kind = "tool", tool = ["read", "glob", "grep", "list"] }
-set   = { disclosure = "collapsed", group = "consecutive_same_tool" }
+set   = { disclosure = "collapsed", group = { by = "same_tool" } }
+
+# Collapsed groups still reveal running, waiting, and failed members.
+[[presentation.rules]]
+match = { kind = "group" }
+set   = { disclosure = "collapsed" }
 
 [containers."transcript.user"]
 layout = "plain"

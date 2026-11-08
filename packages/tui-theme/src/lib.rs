@@ -13,3 +13,4 @@ pub mod definition;
 pub mod discovery;
 pub mod expr;
 pub mod roles;
+pub mod selection;

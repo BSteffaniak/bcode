@@ -16,6 +16,7 @@ pub use clierror::CliDiagnosticError;
 mod plugin_cli;
 pub mod retired_catalogs;
 mod session_migration_adapter;
+mod theme_explain;
 pub use xray::xray_export_process_entry;
 
 mod xray;
@@ -1107,6 +1108,15 @@ fn write_theme_command(
         }
         ThemeCommand::Validate { path, json, strict } => {
             write_theme_validation(&path, json, strict, writer)?;
+        }
+        ThemeCommand::Profiles { json } => theme_explain::run_profiles(json, writer)?,
+        ThemeCommand::Explain {
+            theme,
+            profile,
+            facts,
+            json,
+        } => {
+            theme_explain::run_explain(theme.as_deref(), profile.as_deref(), &facts, json, writer)?;
         }
         ThemeCommand::Copy {
             builtin,
@@ -5420,6 +5430,34 @@ enum ThemeCommand {
     },
     /// List every registered semantic style role and the seed palette names.
     Roles,
+    /// List theme profiles (bundled and discovered) with descriptions.
+    Profiles {
+        /// Emit the profile list as JSON.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Explain how structural presentation resolves for one described unit.
+    ///
+    /// Resolves the configured (or given) theme and profile, configured
+    /// `[[presentation.rules]]`, and interactive user-state rules the same way
+    /// the TUI does, then reports every property, the rule that set it, floor
+    /// adjustments, and warnings.
+    Explain {
+        /// Theme id; defaults to the configured theme.
+        #[arg(long)]
+        theme: Option<String>,
+        /// Profile id; defaults to the configured profile. An empty value clears it.
+        #[arg(long)]
+        profile: Option<String>,
+        /// Unit facts as `key=value`: kind, tool, producer, schema, status,
+        /// `is_error`, `awaiting_decision`, turn, depth, lines, items, target,
+        /// duration, `last_in_turn`. The unit is a tool unless `kind` is given.
+        #[arg(value_name = "KEY=VALUE", value_parser = theme_explain::parse_fact_arg)]
+        facts: Vec<theme_explain::FactArg>,
+        /// Emit the explanation as JSON.
+        #[arg(long)]
+        json: bool,
+    },
     /// Copy one bundled theme definition to an editable file.
     Copy {
         #[arg(value_name = "BUILTIN")]

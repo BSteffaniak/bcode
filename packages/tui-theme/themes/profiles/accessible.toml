@@ -14,9 +14,40 @@ separators = { status = "bar" }
 speaker    = "badge"
 surfaces   = "layered"
 
+# Nothing is folded or grouped; headers spell out every field.
 [[presentation.rules]]
 match = { kind = "tool" }
-set   = { disclosure = "expanded", detail = "verbose" }
+set   = { disclosure = "expanded", detail = "verbose", group = "none" }
+
+[[presentation.rules]]
+match = { kind = "tool" }
+set = { header = { fields = [
+    "marker",
+    "label",
+    "tool",
+    "target",
+    "status",
+    "timing",
+] } }
+
+[[presentation.rules]]
+match = { kind = "tool" }
+
+[presentation.rules.set.sections]
+arguments    = { visible = true, disclosure = "expanded" }
+artifact     = { visible = true, disclosure = "expanded" }
+confirmation = { visible = true, disclosure = "expanded" }
+diff         = { visible = true, disclosure = "expanded" }
+error        = { visible = true, disclosure = "expanded" }
+metadata     = { visible = true, disclosure = "expanded" }
+output       = { visible = true, disclosure = "expanded" }
+result       = { visible = true, disclosure = "expanded" }
+visual       = { visible = true, disclosure = "expanded" }
+
+# Groups formed by configuration rules still open fully.
+[[presentation.rules]]
+match = { kind = "group" }
+set   = { disclosure = "expanded" }
 
 [containers."transcript.user"]
 layout = "plain"

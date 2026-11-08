@@ -165,6 +165,10 @@ producer_default   = true
 render_mode        = "transcript_block"
 surfaces           = ["tui"]
 
+[[presentation.tools]]
+target_fields = ["command"]
+tool_name     = "shell.run"
+
 [concurrency]
 type = "concurrent"
 

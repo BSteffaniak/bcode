@@ -120,6 +120,8 @@ struct DynamicVisualKey {
     diff_layout: String,
     working_directory: Option<std::path::PathBuf>,
     theme_fingerprint: u64,
+    // Exact serialized resolved presentation; empty when the renderer supplied none.
+    presentation: String,
 }
 
 #[derive(Debug)]
@@ -143,7 +145,7 @@ struct DynamicVisualCompletion {
     key: Option<DynamicVisualKey>,
     invocation_id: String,
     invalidate_invocation_cache: bool,
-    result: Result<bcode_plugin_sdk::tui_visual::RenderTuiVisualResponse, String>,
+    result: Result<bcode_plugin_sdk::tui_visual::RenderTuiVisualPresentedResponse, String>,
 }
 
 #[derive(Debug)]
@@ -154,7 +156,7 @@ struct DynamicVisualCoordinator {
     requested: BTreeSet<DynamicVisualKey>,
     cache: BTreeMap<
         DynamicVisualKey,
-        Result<bcode_plugin_sdk::tui_visual::RenderTuiVisualResponse, String>,
+        Result<bcode_plugin_sdk::tui_visual::RenderTuiVisualPresentedResponse, String>,
     >,
 }
 
@@ -173,15 +175,15 @@ impl DynamicVisualCoordinator {
                         DynamicVisualJob::Render(job) => {
                             let result = invoke_dynamic_visual_service::<
                                 _,
-                                bcode_plugin_sdk::tui_visual::RenderTuiVisualResponse,
+                                bcode_plugin_sdk::tui_visual::RenderTuiVisualPresentedResponse,
                             >(
                                 &backend,
                                 &job.key.plugin_id,
                                 bcode_plugin_sdk::tui_visual::OP_RENDER_TUI_VISUAL,
                                 &job.request,
                             )
-                            .and_then(|response| {
-                                response.validate()?;
+                            .and_then(|mut response| {
+                                response.normalize_and_validate()?;
                                 Ok(response)
                             });
                             DynamicVisualCompletion {
@@ -212,6 +214,7 @@ impl DynamicVisualCoordinator {
                                     timeout_ms: None,
                                     rows: Vec::new(),
                                 }
+                                .into()
                             });
                             DynamicVisualCompletion {
                                 key: None,
@@ -239,7 +242,7 @@ impl DynamicVisualCoordinator {
     fn response(
         &self,
         key: &DynamicVisualKey,
-    ) -> Option<&bcode_plugin_sdk::tui_visual::RenderTuiVisualResponse> {
+    ) -> Option<&bcode_plugin_sdk::tui_visual::RenderTuiVisualPresentedResponse> {
         self.cache.get(key)?.as_ref().ok()
     }
 
@@ -409,6 +412,10 @@ pub struct PluginTuiPresentation {
 }
 
 /// One renderer-local visual route ready for native row conversion.
+///
+/// `summary`, `target`, and `sections` carry the adapter's structural presentation (plugin
+/// contract v3). Adapters that supply none leave them empty; the renderer then treats `rows`
+/// as the unit's single `visual` section.
 #[derive(Debug, Clone)]
 pub struct RoutedTuiVisual {
     pub route: bcode_plugin::PluginVisualAdapterRoute,
@@ -417,6 +424,58 @@ pub struct RoutedTuiVisual {
     pub header: bcode_plugin_sdk::tui::PluginTuiTranscriptHeader,
     pub anchors: Vec<bcode_plugin_sdk::tui_visual::TuiVisualAnchor>,
     pub selection: Vec<(usize, bcode_plugin_sdk::tui::PluginTuiSelectionRow)>,
+    /// Bounded one-line producer summary.
+    pub summary: Option<String>,
+    /// Bounded producer-supplied operation target.
+    pub target: Option<String>,
+    /// Ordered, validated named sections.
+    pub sections: Vec<RoutedTuiSection>,
+}
+
+/// One named adapter-rendered section converted to native rows.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RoutedTuiSection {
+    /// Host or namespaced section name.
+    pub name: String,
+    /// Display label; `None` lets the renderer derive one from the name.
+    pub label: Option<String>,
+    /// Section body rows.
+    pub rows: Vec<bmux_tui::prelude::Line>,
+}
+
+impl From<bcode_plugin_sdk::tui::PluginTuiToolSection> for RoutedTuiSection {
+    fn from(section: bcode_plugin_sdk::tui::PluginTuiToolSection) -> Self {
+        Self {
+            name: section.name,
+            label: section.label,
+            rows: section.rows,
+        }
+    }
+}
+
+impl RoutedTuiVisual {
+    fn with_tool_presentation(
+        mut self,
+        presentation: bcode_plugin_sdk::tui::PluginTuiToolPresentation,
+    ) -> Self {
+        self.summary = presentation.summary;
+        self.target = presentation.target;
+        self.sections = presentation
+            .sections
+            .into_iter()
+            .map(RoutedTuiSection::from)
+            .collect();
+        self
+    }
+}
+
+/// Bounded adapter view of a resolved unit presentation, for
+/// [`bcode_plugin_sdk::tui::PluginTuiVisualRenderContext::with_presentation`].
+#[must_use]
+pub fn visual_presentation(
+    resolved: &bcode_presentation_policy::models::ResolvedPresentation,
+) -> bcode_plugin_sdk::tui_visual::TuiVisualPresentation {
+    bcode_plugin_sdk::tui_visual::TuiVisualPresentation::from_resolved(resolved)
 }
 
 impl PluginTuiPresentation {
@@ -877,6 +936,69 @@ impl PluginTuiPresentation {
         }
     }
 
+    /// Usable manifest `[presentation]` declarations of the loaded plugins, by
+    /// plugin id.
+    ///
+    /// Each is [`bcode_plugin::PluginManifest::presentation_declaration`]:
+    /// bounded, with rules scoped to the plugin and invalid entries dropped
+    /// (they never block loading). Empty declarations are skipped.
+    #[must_use]
+    pub fn presentation_declarations(
+        &self,
+    ) -> BTreeMap<String, bcode_plugin::PluginPresentationDeclaration> {
+        let declared = |manifest: &bcode_plugin::PluginManifest| {
+            (!manifest.presentation.is_empty())
+                .then(|| (manifest.id.clone(), manifest.presentation_declaration()))
+                .filter(|(_, declaration)| !declaration.is_empty())
+        };
+        match &self.backend {
+            PresentationPluginBackend::Synchronous(host) => host
+                .loaded_plugins()
+                .iter()
+                .filter_map(|plugin| declared(plugin.manifest()))
+                .collect(),
+            PresentationPluginBackend::Runtime(runtime) => runtime
+                .registry()
+                .manifests()
+                .values()
+                .filter_map(declared)
+                .collect(),
+        }
+    }
+
+    /// Plugin manifest default rules as presentation-policy layers, one per
+    /// declaring plugin in plugin-id order, each scoped to that plugin's units.
+    #[must_use]
+    pub fn structure_rule_layers(&self) -> Vec<bcode_presentation_policy::models::RuleLayer> {
+        self.presentation_declarations()
+            .iter()
+            .filter(|(_, declaration)| !declaration.rules.is_empty())
+            .map(|(plugin_id, declaration)| declaration.rule_layer(plugin_id))
+            .collect()
+    }
+
+    /// Producer-declared target argument fields, by tool name, then by
+    /// declaring plugin id.
+    ///
+    /// Every declaration is kept; the structure layer applies one only to
+    /// units its plugin produced (see
+    /// [`crate::structure::DeclaredTargetFields`]).
+    #[must_use]
+    pub fn tool_target_fields(&self) -> crate::structure::DeclaredTargetFields {
+        let mut fields = crate::structure::DeclaredTargetFields::new();
+        for (plugin_id, declaration) in self.presentation_declarations() {
+            for tool in declaration.tools {
+                if !tool.target_fields.is_empty() {
+                    fields
+                        .entry(tool.tool_name)
+                        .or_default()
+                        .insert(plugin_id.clone(), tool.target_fields);
+                }
+            }
+        }
+        fields
+    }
+
     /// Return compatible routes in configured order whose native implementations are available.
     #[must_use]
     pub fn visual_routes(
@@ -1029,15 +1151,21 @@ impl PluginTuiPresentation {
                 let header = registry
                     .visual_transcript_header(&route.adapter_id, &route.schema, payload)
                     .unwrap_or_default();
-                return Some(self.native_routed_visual(
-                    invocation_id,
-                    route,
-                    render_mode,
-                    header,
-                    rows,
-                    anchors,
-                    selection,
-                ));
+                let presentation = registry
+                    .visual_tool_presentation(&route.adapter_id, &route.schema, payload, context)
+                    .unwrap_or_default();
+                return Some(
+                    self.native_routed_visual(
+                        invocation_id,
+                        route,
+                        render_mode,
+                        header,
+                        rows,
+                        anchors,
+                        selection,
+                    )
+                    .with_tool_presentation(presentation),
+                );
             }
             if !self.backend.has_service(
                 &route.plugin_id,
@@ -1057,23 +1185,21 @@ impl PluginTuiPresentation {
                 diff_layout: format!("{:?}", context.diff_layout()),
                 working_directory: context.working_directory().map(ToOwned::to_owned),
                 theme_fingerprint: context.theme().as_ref().map_or(0, theme_fingerprint),
+                presentation: context
+                    .presentation()
+                    .and_then(|presentation| serde_json::to_string(presentation).ok())
+                    .unwrap_or_default(),
             };
             let response = {
                 let dynamic = self.dynamic_visuals.lock().ok()?;
                 dynamic.response(&key).cloned()
             };
             if let Some(response) = response {
-                return Some(RoutedTuiVisual {
-                    render_mode: serialized_render_mode(&response, route.render_mode),
+                return Some(serialized_routed_visual(
                     route,
-                    rows: serialized_visual_rows(&response, context.theme().as_ref()),
-                    anchors: response.anchors.clone(),
-                    selection: Vec::new(),
-                    header: bcode_plugin_sdk::tui::PluginTuiTranscriptHeader {
-                        title: response.title,
-                        timeout_ms: response.timeout_ms,
-                    },
-                });
+                    response,
+                    context.theme().as_ref(),
+                ));
             }
             let Some(mut dynamic) = self.dynamic_visuals.lock().ok() else {
                 continue;
@@ -1087,12 +1213,7 @@ impl PluginTuiPresentation {
                     schema: schema.to_owned(),
                     schema_version,
                     payload: payload.clone(),
-                    context: bcode_plugin_sdk::tui_visual::SerializedTuiVisualContext {
-                        width: context.width(),
-                        diff_layout: format!("{:?}", context.diff_layout()),
-                        working_directory: context.working_directory().map(ToOwned::to_owned),
-                        theme_fingerprint: context.theme().as_ref().map_or(0, theme_fingerprint),
-                    },
+                    context: serialized_visual_context(context),
                 },
             });
         }
@@ -1126,6 +1247,9 @@ impl PluginTuiPresentation {
             header,
             anchors,
             selection,
+            summary: None,
+            target: None,
+            sections: Vec::new(),
         }
     }
 
@@ -1417,6 +1541,53 @@ fn serialized_render_mode(
     }
 }
 
+/// Portable renderer context at the current context version, including any resolved presentation.
+fn serialized_visual_context(
+    context: &bcode_plugin_sdk::tui::PluginTuiVisualRenderContext,
+) -> bcode_plugin_sdk::tui_visual::SerializedTuiVisualContext {
+    bcode_plugin_sdk::tui_visual::SerializedTuiVisualContext {
+        width: context.width(),
+        diff_layout: format!("{:?}", context.diff_layout()),
+        working_directory: context.working_directory().map(ToOwned::to_owned),
+        theme_fingerprint: context.theme().as_ref().map_or(0, theme_fingerprint),
+        context_version: bcode_plugin_sdk::tui_visual::PLUGIN_TUI_VISUAL_CONTEXT_VERSION,
+        presentation: context.presentation().cloned(),
+    }
+}
+
+fn serialized_routed_visual(
+    route: bcode_plugin::PluginVisualAdapterRoute,
+    presented: bcode_plugin_sdk::tui_visual::RenderTuiVisualPresentedResponse,
+    theme: Option<&bcode_plugin_sdk::tui::PluginTuiTheme>,
+) -> RoutedTuiVisual {
+    let bcode_plugin_sdk::tui_visual::RenderTuiVisualPresentedResponse {
+        response,
+        presentation,
+    } = presented;
+    RoutedTuiVisual {
+        render_mode: serialized_render_mode(&response, route.render_mode),
+        route,
+        rows: serialized_visual_rows(&response.rows, theme),
+        anchors: response.anchors,
+        selection: Vec::new(),
+        header: bcode_plugin_sdk::tui::PluginTuiTranscriptHeader {
+            title: response.title,
+            timeout_ms: response.timeout_ms,
+        },
+        summary: presentation.summary,
+        target: presentation.target,
+        sections: presentation
+            .sections
+            .into_iter()
+            .map(|section| RoutedTuiSection {
+                rows: serialized_visual_rows(&section.rows, theme),
+                name: section.name,
+                label: section.label,
+            })
+            .collect(),
+    }
+}
+
 fn theme_fingerprint(theme: &bcode_plugin_sdk::tui::PluginTuiTheme) -> u64 {
     use std::hash::{Hash, Hasher};
 
@@ -1426,16 +1597,14 @@ fn theme_fingerprint(theme: &bcode_plugin_sdk::tui::PluginTuiTheme) -> u64 {
 }
 
 fn serialized_visual_rows(
-    response: &bcode_plugin_sdk::tui_visual::RenderTuiVisualResponse,
+    rows: &[bcode_plugin_sdk::tui_visual::SerializedTuiRow],
     theme: Option<&bcode_plugin_sdk::tui::PluginTuiTheme>,
 ) -> Vec<bmux_tui::prelude::Line> {
     use bcode_plugin_sdk::tui_visual::{
         SerializedTuiColor, SerializedTuiModifier, SerializedTuiStyleRole,
     };
     use bmux_tui::prelude::{Color, Line, Modifier, Span, Style};
-    response
-        .rows
-        .iter()
+    rows.iter()
         .map(|row| {
             Line::from_spans(
                 row.spans
@@ -1716,6 +1885,28 @@ priority = 97
 producer_default = false
 render_mode = "transcript_block"
 
+[[visual_adapters]]
+id = "presented"
+schema = "test.presented"
+min_schema_version = 1
+max_schema_version = 1
+service_interface_id = "bcode.tui-visual-adapter/v1"
+surfaces = ["tui"]
+priority = 96
+producer_default = false
+render_mode = "inline"
+
+[[visual_adapters]]
+id = "legacy-presented"
+schema = "test.legacy-presented"
+min_schema_version = 1
+max_schema_version = 1
+service_interface_id = "bcode.tui-visual-adapter/v1"
+surfaces = ["tui"]
+priority = 95
+producer_default = false
+render_mode = "inline"
+
 [concurrency]
 type = "concurrent"
 
@@ -1775,6 +1966,7 @@ library = "libdynamic_visual_test.dylib"
                             },
                         )
                         .expect("encode malformed response"),
+                        "presented" | "legacy-presented" => presented_test_response(&request),
                         "timeout" => {
                             while !context.cancellation.is_cancelled() {
                                 std::thread::sleep(std::time::Duration::from_millis(10));
@@ -1846,6 +2038,61 @@ library = "libdynamic_visual_test.dylib"
                 ),
             }
         }
+    }
+
+    fn presented_test_response(
+        request: &bcode_plugin_sdk::tui_visual::RenderTuiVisualRequest,
+    ) -> bcode_plugin_sdk::ServiceResponse {
+        let row = |text: &str| bcode_plugin_sdk::tui_visual::SerializedTuiRow {
+            spans: vec![bcode_plugin_sdk::tui_visual::SerializedTuiSpan {
+                text: text.to_owned(),
+                ..Default::default()
+            }],
+        };
+        let echoed = request.context.presentation().map_or_else(
+            || "none".to_owned(),
+            |presentation| {
+                format!(
+                    "{:?}:{:?}:{}",
+                    presentation.disclosure,
+                    presentation.section("output").disclosure,
+                    presentation.header_fields.join(",")
+                )
+            },
+        );
+        bcode_plugin_sdk::ServiceResponse::json(
+            &bcode_plugin_sdk::tui_visual::RenderTuiVisualPresentedResponse {
+                response: bcode_plugin_sdk::tui_visual::RenderTuiVisualResponse {
+                    version: if request.adapter_id == "presented" {
+                        bcode_plugin_sdk::tui_visual::TUI_VISUAL_TOOL_PRESENTATION_VERSION
+                    } else {
+                        4
+                    },
+                    anchors: Vec::new(),
+                    render_mode: "inline".to_owned(),
+                    title: None,
+                    timeout_ms: None,
+                    rows: vec![row("body")],
+                },
+                presentation: bcode_plugin_sdk::tui_visual::SerializedTuiToolPresentation {
+                    summary: Some(format!("\n  {echoed}\nsecond line")),
+                    target: Some("界".repeat(100)),
+                    sections: vec![
+                        bcode_plugin_sdk::tui_visual::SerializedTuiSection {
+                            name: "output".to_owned(),
+                            label: Some("Output".to_owned()),
+                            rows: vec![row("out 1"), row("out 2")],
+                        },
+                        bcode_plugin_sdk::tui_visual::SerializedTuiSection {
+                            name: "test.files".to_owned(),
+                            label: None,
+                            rows: Vec::new(),
+                        },
+                    ],
+                },
+            },
+        )
+        .expect("encode presented response")
     }
 
     fn dynamic_visual_test_plugin() -> StaticBundledPlugin {
@@ -2162,10 +2409,10 @@ library = "libcomposer_fixture.dylib"
                 }],
             }],
         };
-        let themed = serialized_visual_rows(&response, Some(&test_plugin_theme(7)));
+        let themed = serialized_visual_rows(&response.rows, Some(&test_plugin_theme(7)));
         assert_eq!(themed[0].spans[0].style.fg, Some(Color::Green));
 
-        let fallback = serialized_visual_rows(&response, None);
+        let fallback = serialized_visual_rows(&response.rows, None);
         assert_eq!(fallback[0].spans[0].style, Style::new().fg(Color::Red));
     }
 
@@ -2184,6 +2431,7 @@ library = "libcomposer_fixture.dylib"
             diff_layout: "Unified".to_owned(),
             working_directory: None,
             theme_fingerprint,
+            presentation: String::new(),
         };
         assert_ne!(key(1), key(2));
         let context = |fingerprint| {
@@ -2545,6 +2793,113 @@ library = "libcomposer_fixture.dylib"
         assert_eq!(routed.header.title.as_deref(), Some("Dynamic shell"));
         assert_eq!(routed.header.timeout_ms, Some(321));
         assert_eq!(routed_text(&routed), "dynamic:success:artifact-0");
+    }
+
+    fn route_presented(
+        presentation: &PluginTuiPresentation,
+        schema: &str,
+        context: &bcode_plugin_sdk::tui::PluginTuiVisualRenderContext,
+    ) -> Option<RoutedTuiVisual> {
+        presentation.routed_visual(
+            "call-presented",
+            0,
+            schema,
+            1,
+            None,
+            &serde_json::json!({}),
+            context,
+        )
+    }
+
+    #[test]
+    fn dynamic_tool_presentation_is_bounded_and_receives_resolved_context() {
+        use bcode_presentation_policy::models::{Disclosure, HeaderSpec, ResolvedSection};
+        let presentation = dynamic_test_presentation("test.dynamic-visual/presented", &[]);
+        let mut resolved = bcode_presentation_policy::host_defaults();
+        resolved.disclosure = Disclosure::Summary;
+        resolved.sections.insert(
+            "output".to_owned(),
+            ResolvedSection {
+                disclosure: Disclosure::Collapsed,
+                ..ResolvedSection::defaults(resolved.preview)
+            },
+        );
+        resolved.header = Some(HeaderSpec {
+            fields: vec!["marker".to_owned(), "tool".to_owned()],
+        });
+        let plain = bcode_plugin_sdk::tui::PluginTuiVisualRenderContext::new(
+            80,
+            bcode_plugin_sdk::tui::PluginTuiDiffLayout::Unified,
+            None,
+        );
+        let resolved_context = plain
+            .clone()
+            .with_presentation(visual_presentation(&resolved));
+
+        let mut routed = route_presented(&presentation, "test.presented", &resolved_context);
+        if routed.is_none() {
+            wait_for_dynamic_completion(&presentation);
+            routed = route_presented(&presentation, "test.presented", &resolved_context);
+        }
+        let routed = routed.expect("presented visual");
+        assert_eq!(
+            routed.summary.as_deref(),
+            Some("Summary:Collapsed:marker,tool")
+        );
+        // 100 three-byte graphemes truncate on a character boundary within 256 bytes.
+        assert_eq!(routed.target, Some("界".repeat(85)));
+        assert_eq!(routed_text(&routed), "body");
+        let sections = routed
+            .sections
+            .iter()
+            .map(|section| {
+                (
+                    section.name.as_str(),
+                    section.label.as_deref(),
+                    section
+                        .rows
+                        .iter()
+                        .flat_map(|line| &line.spans)
+                        .map(|span| span.content.as_str())
+                        .collect::<Vec<_>>(),
+                )
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            sections,
+            vec![
+                ("output", Some("Output"), vec!["out 1", "out 2"]),
+                ("test.files", None, Vec::new()),
+            ]
+        );
+
+        // The resolved presentation is part of the cache identity: a context without it is a
+        // distinct request, and the adapter observes no presentation.
+        let mut legacy = route_presented(&presentation, "test.presented", &plain);
+        if legacy.is_none() {
+            wait_for_dynamic_completion(&presentation);
+            legacy = route_presented(&presentation, "test.presented", &plain);
+        }
+        drop(presentation);
+        assert_eq!(
+            legacy.expect("presented visual").summary.as_deref(),
+            Some("none")
+        );
+    }
+
+    #[test]
+    fn tool_presentation_from_pre_v5_response_is_rejected() {
+        let presentation = dynamic_test_presentation("test.dynamic-visual/legacy-presented", &[]);
+        let context = bcode_plugin_sdk::tui::PluginTuiVisualRenderContext::new(
+            80,
+            bcode_plugin_sdk::tui::PluginTuiDiffLayout::Unified,
+            None,
+        );
+        assert!(route_presented(&presentation, "test.legacy-presented", &context).is_none());
+        wait_for_dynamic_completion(&presentation);
+        let rejected = route_presented(&presentation, "test.legacy-presented", &context);
+        drop(presentation);
+        assert!(rejected.is_none());
     }
 
     #[test]
@@ -3464,5 +3819,93 @@ library = "libcomposer_fixture.dylib"
             )
             .expect("stateful adapter rows");
         assert_eq!(rows[0].spans[0].content, "abc");
+    }
+
+    const PRESENTATION_RULES_MANIFEST: &str = r#"
+id = "test.presentation-rules"
+name = "Presentation rules fixture"
+version = "0.0.1"
+[[services]]
+class = "service"
+name = "Suggestions"
+interface_id = "bcode.composer/v1"
+[[composer_contributions]]
+id = "generic"
+activation_kind = "test.generic"
+service_interface_id = "bcode.composer/v1"
+priority = 1
+[[presentation.rules]]
+match = { kind = "tool" }
+set = { disclosure = "collapsed" }
+[runtime]
+type = "native"
+abi_version = 5
+library = "libpresentation_fixture.dylib"
+"#;
+
+    #[test]
+    fn manifest_presentation_feeds_target_fields_and_scoped_plugin_layers() {
+        let bundled = [
+            StaticBundledPlugin::new(
+                include_str!("../../../plugins/shell-plugin/bcode-plugin.toml"),
+                bcode_shell_plugin::static_plugin(),
+            ),
+            StaticBundledPlugin::new(
+                include_str!("../../../plugins/filesystem-plugin/bcode-plugin.toml"),
+                bcode_filesystem_plugin::static_plugin(),
+            ),
+            StaticBundledPlugin::new(
+                PRESENTATION_RULES_MANIFEST,
+                bcode_plugin_sdk::static_plugin_vtable!(
+                    DynamicVisualTestPlugin,
+                    PRESENTATION_RULES_MANIFEST
+                ),
+            ),
+        ];
+        let mut extensions = test_tui_extensions().to_vec();
+        extensions.push(bcode_plugin_sdk::tui::StaticPluginTuiExtension::new(
+            "test.presentation-rules",
+            composer_fallback_registry,
+        ));
+        let host = load_presentation_fallback(
+            &bcode_plugin::PluginSelection::all_enabled(),
+            &bundled,
+            &extensions,
+        )
+        .unwrap();
+        let presentation = PluginTuiPresentation::from_shared(Arc::new(host));
+        let fields = presentation.tool_target_fields();
+        let declared = |tool: &str, plugin: &str| {
+            fields
+                .get(tool)
+                .and_then(|plugins| plugins.get(plugin))
+                .map(Vec::as_slice)
+        };
+        assert_eq!(
+            declared("filesystem.grep", "bcode.filesystem"),
+            Some(["pattern".to_owned(), "path".to_owned()].as_slice())
+        );
+        assert_eq!(
+            declared("shell.run", "bcode.shell"),
+            Some(["command".to_owned()].as_slice())
+        );
+        let layers = presentation.structure_rule_layers();
+        assert_eq!(
+            layers.len(),
+            1,
+            "only declared rules form layers: {layers:?}"
+        );
+        assert_eq!(
+            layers[0].source,
+            bcode_presentation_policy::models::LayerSource::Plugin(
+                "test.presentation-rules".to_owned()
+            )
+        );
+        // Rules are scoped to the declaring plugin's own units.
+        assert_eq!(
+            layers[0].rules[0].matcher.producer.0,
+            vec!["test.presentation-rules".to_owned()]
+        );
+        drop(presentation);
     }
 }

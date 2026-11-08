@@ -80,6 +80,17 @@ impl bcode_plugin_sdk::tui::PluginTuiVisualAdapter for FilesystemTuiVisualAdapte
             .cloned()
     }
 
+    fn tool_presentation(
+        &self,
+        kind: &str,
+        payload: &Value,
+        context: &bcode_plugin_sdk::tui::PluginTuiVisualRenderContext,
+    ) -> bcode_plugin_sdk::tui::PluginTuiToolPresentation {
+        crate::filesystem_summary::filesystem_tool_presentation(kind, payload, &|path| {
+            context.display_path(path).to_string()
+        })
+    }
+
     fn supports(&self, kind: &str) -> bool {
         matches!(
             kind,

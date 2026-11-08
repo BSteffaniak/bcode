@@ -357,7 +357,9 @@ impl IndexedTranscriptLayout {
                     };
                 entries.changed_entries.iter().any(|&index| {
                     let entry = &entries.entries[index];
-                    entry.changed_end > 0
+                    // An entry that now renders no rows shows no new content.
+                    entry.row_count > 0
+                        && entry.changed_end > 0
                         && base + entries.rows.prefix(index) + entry.changed_end > bottom
                 })
             })
@@ -484,6 +486,17 @@ impl IndexedTranscriptLayout {
             .min()
             .unwrap_or(entry.row_count);
         Some(start.saturating_add(offset).min(end.saturating_sub(1)))
+    }
+
+    /// Every content anchor of transcript entry `index` as `(row, key)`, in
+    /// recorded order; empty when the entry does not exist.
+    pub fn content_anchors(&self, index: usize) -> impl Iterator<Item = (usize, &str)> {
+        self.transcript
+            .entries
+            .get(index)
+            .into_iter()
+            .flat_map(|entry| &entry.anchors)
+            .map(|anchor| (anchor.row, anchor.key.as_str()))
     }
 
     #[must_use]
@@ -728,6 +741,89 @@ impl IndexedTranscriptLayout {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn numbered(entry: usize, count: usize) -> TranscriptLayoutRows {
+        TranscriptLayoutRows::Anchored {
+            rows: (0..count)
+                .map(|row| Line::from(format!("{entry}.{row}")))
+                .collect(),
+            anchors: (count > 0)
+                .then(|| bcode_plugin_models::tui_visual::TuiVisualAnchor {
+                    key: format!("entry:{entry}"),
+                    row: 0,
+                    source: None,
+                })
+                .into_iter()
+                .collect(),
+        }
+    }
+
+    #[test]
+    fn zero_row_entries_occupy_no_rows_and_never_resolve_as_visible() {
+        let counts = std::cell::RefCell::new(vec![2_usize, 0, 0, 1, 0]);
+        let mut layout = IndexedTranscriptLayout::default();
+        let signature = |index: usize| {
+            TranscriptLayoutSignature::new(format!("{index}:{}", counts.borrow()[index]))
+        };
+        let rows = |index: usize| numbered(index, counts.borrow()[index]);
+        layout.sync_transcript(5, signature, rows, |_| None);
+        layout.sync_pending(
+            1,
+            |_| TranscriptLayoutSignature::new("p".into()),
+            |_| vec![Line::from("pending")].into(),
+        );
+        layout.clear_content_changes();
+        let start = |layout: &IndexedTranscriptLayout, index| {
+            layout.entry_start_row(VisibleTranscriptSource::Transcript, index)
+        };
+        assert_eq!(layout.total_rows(), 4);
+        assert_eq!(
+            (1..5)
+                .map(|index| start(&layout, index))
+                .collect::<Vec<_>>(),
+            [Some(2), Some(2), Some(2), Some(3)]
+        );
+        assert_eq!(start(&layout, 5), None);
+        let line = layout.line_at_row(2).unwrap();
+        assert_eq!((line.entry_index, line.row_in_entry), (3, 0));
+        let pending = layout.line_at_row(3).unwrap();
+        assert_eq!(pending.source, VisibleTranscriptSource::Pending);
+        let visible: Vec<_> = layout
+            .visible_lines_from_top(0, 10)
+            .into_iter()
+            .map(|line| (line.source, line.entry_index, line.row_in_entry))
+            .collect();
+        assert_eq!(
+            visible,
+            [
+                (VisibleTranscriptSource::Transcript, 0, 0),
+                (VisibleTranscriptSource::Transcript, 0, 1),
+                (VisibleTranscriptSource::Transcript, 3, 0),
+                (VisibleTranscriptSource::Pending, 0, 0),
+            ]
+        );
+        assert_eq!(layout.first_entry_start_at_or_after_row(1), Some(2));
+        assert_eq!(layout.content_anchor_row(1, "entry:1"), None);
+        assert_eq!(layout.content_anchor(1, 0), None);
+        assert_eq!(layout.content_anchor_row(3, "entry:3"), Some(0));
+
+        // An empty entry gains rows and empties again in place.
+        counts.borrow_mut()[2] = 3;
+        layout.sync_transcript_entries(&BTreeSet::from([2]), signature, rows);
+        assert_eq!(layout.total_rows(), 7);
+        assert_eq!(start(&layout, 3), Some(5));
+        let line = layout.line_at_row(2).unwrap();
+        assert_eq!((line.entry_index, line.row_in_entry), (2, 0));
+        layout.clear_content_changes();
+        counts.borrow_mut()[2] = 0;
+        layout.sync_transcript_entries(&BTreeSet::from([2]), signature, rows);
+        assert_eq!(layout.total_rows(), 4);
+        assert_eq!(start(&layout, 3), Some(2));
+        assert!(
+            !layout.changed_content_below(0),
+            "an entry that emptied is not new content"
+        );
+    }
 
     #[test]
     fn content_changes_compare_rows_and_survive_timer_only_replacement() {

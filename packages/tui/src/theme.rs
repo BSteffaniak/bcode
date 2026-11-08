@@ -307,6 +307,8 @@ pub struct ResolvedTheme {
     pub transcript: TranscriptStyleTheme,
     /// Border glyphs and focus effects for dialogs and modals.
     pub dialog_chrome: ComponentChrome,
+    /// Icons, disclosure markers, density, and tool borders for transcript units.
+    pub unit_chrome: chrome::UnitChrome,
     /// Complete generic component theme, including v2 roles and chrome.
     pub component: ComponentTheme,
     /// Stable resolved presentation fingerprint.
@@ -335,6 +337,7 @@ impl ResolvedTheme {
             containers: self.containers,
             transcript: self.transcript,
             dialog_chrome: self.dialog_chrome,
+            unit_chrome: self.unit_chrome,
             component: self.component,
             fingerprint: self.fingerprint,
         }
@@ -382,6 +385,8 @@ pub struct PresentedTheme {
     pub transcript: TranscriptStyleTheme,
     /// Border glyphs and focus effects for dialogs and modals.
     pub dialog_chrome: ComponentChrome,
+    /// Icons, disclosure markers, density, and tool borders for transcript units.
+    pub unit_chrome: chrome::UnitChrome,
     /// Complete generic component theme, including v2 roles and chrome.
     pub component: ComponentTheme,
     /// Stable resolved presentation fingerprint.
@@ -494,11 +499,22 @@ pub fn resolve_theme_with_structure(
     );
     let configured_theme_accent = resolved_accent(resolved.as_ref());
     let accent = resolve_app_accent(app, configured_theme_accent);
-    let layers = resolved
-        .as_ref()
-        .map(|resolved| resolved.presentation.clone())
-        .unwrap_or_default();
+    let layers = structure_layers_for(resolved.as_ref());
     (resolved_definition_theme(resolved.as_ref(), accent), layers)
+}
+
+/// Structural rule layers a resolved theme contributes: the chrome density as
+/// a host-default layer, then the theme and profile `[presentation]` layers.
+#[must_use]
+pub fn structure_layers_for(
+    resolved: Option<&definition::ResolvedThemeDefinition>,
+) -> Vec<bcode_presentation_policy::models::RuleLayer> {
+    let mut layers = Vec::new();
+    layers.extend(chrome::UnitChrome::from_theme(resolved).density_layer());
+    if let Some(resolved) = resolved {
+        layers.extend(resolved.presentation.iter().cloned());
+    }
+    layers
 }
 
 pub(crate) fn resolve_app_accent(app: &BmuxApp, configured_theme_accent: Color) -> Color {
@@ -529,32 +545,25 @@ fn resolve_definition(
         project_root,
         explicit_paths,
     );
-    let catalog = discovery::discover_themes(&roots)
-        .map(|discovered| {
-            for diagnostic in &discovered.diagnostics {
-                tracing::warn!(
-                    path = %diagnostic.path.display(),
-                    message = %diagnostic.message,
-                    "theme definition skipped"
-                );
-            }
-            tracing::debug!(
-                external_theme_count = discovered.sources.len(),
-                "theme catalog discovered"
-            );
-            discovered.catalog
-        })
-        .or_else(|_| definition::ThemeCatalog::bundled());
     let variant = resolve_variant(variant, terminal_capabilities());
-    catalog
-        .and_then(|catalog| {
-            catalog.resolve(
-                &definition::ThemeSelection::new(theme_name)
-                    .overlays(overlays.to_vec())
-                    .variant(variant),
-            )
-        })
-        .ok()
+    let resolution = bcode_tui_theme::selection::resolve_discovered(
+        &roots,
+        &definition::ThemeSelection::new(theme_name)
+            .overlays(overlays.to_vec())
+            .variant(variant),
+    );
+    for diagnostic in &resolution.diagnostics {
+        tracing::warn!(
+            path = %diagnostic.path.display(),
+            message = %diagnostic.message,
+            "theme definition skipped"
+        );
+    }
+    tracing::debug!(
+        external_theme_count = resolution.external_sources,
+        "theme catalog discovered"
+    );
+    resolution.resolved.ok()
 }
 
 /// Process-wide terminal color replies; a Bcode process drives one terminal.
@@ -589,9 +598,9 @@ pub fn terminal_color_depth(
     }
 }
 
-pub(crate) fn resolve_variant_for_config(
-    variant: TuiThemeVariant,
-) -> definition::ResolvedThemeVariant {
+/// Resolve a configured light/dark variant, detecting the terminal for `auto`.
+#[must_use]
+pub fn resolve_variant_for_config(variant: TuiThemeVariant) -> definition::ResolvedThemeVariant {
     resolve_variant(variant, terminal_capabilities())
 }
 
@@ -730,10 +739,16 @@ pub(crate) fn resolved_definition_theme(
         padding_x: 0,
         padding_y: 0,
     };
+    let unit_chrome = chrome::UnitChrome::from_theme(theme);
     let container = |role: &str| {
-        theme
+        let recipe = theme
             .and_then(|theme| theme.containers.get(role).copied())
-            .unwrap_or(default_container)
+            .unwrap_or(default_container);
+        if role.starts_with("tool.") {
+            unit_chrome.tool_container(recipe)
+        } else {
+            recipe
+        }
     };
     let presentation =
         |role: &str, style_role: &str, fallback: bmux_tui::style::Style| ContainerPresentation {
@@ -800,6 +815,7 @@ pub(crate) fn resolved_definition_theme(
         containers,
         transcript,
         dialog_chrome: theme.map_or(ComponentChrome::DEFAULT, chrome::dialog_chrome),
+        unit_chrome,
         component: component_theme,
         fingerprint: theme.map_or(0, |theme| theme.fingerprint),
     }
@@ -1291,6 +1307,53 @@ mod capability_tests {
                 .canvas
                 .bg
                 .is_none_or(|color| color == Color::Default)
+        );
+    }
+
+    #[test]
+    fn theme_structure_layers_put_density_below_theme_rules() {
+        use bcode_presentation_policy::models::{LayerSource, RuleLayer};
+        assert_eq!(super::structure_layers_for(None), Vec::new());
+        let mut theme = definition::ResolvedThemeDefinition::empty("plain", "Plain");
+        theme.presentation.push(RuleLayer {
+            source: LayerSource::Theme("plain".to_owned()),
+            rules: Vec::new(),
+        });
+        let sources = |theme: &definition::ResolvedThemeDefinition| {
+            super::structure_layers_for(Some(theme))
+                .into_iter()
+                .map(|layer| layer.source)
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(sources(&theme), [LayerSource::Theme("plain".to_owned())]);
+        theme.chrome.density = bcode_tui_theme::chrome::Density::Comfortable;
+        assert_eq!(
+            sources(&theme),
+            [LayerSource::Host, LayerSource::Theme("plain".to_owned())]
+        );
+    }
+
+    #[test]
+    fn tool_border_chrome_reshapes_only_tool_containers() {
+        let mut theme = definition::ResolvedThemeDefinition::empty("plain", "Plain");
+        let plain = super::resolved_definition_theme(Some(&theme), Color::Cyan);
+        theme.chrome.borders.tool = Some(bcode_tui_theme::chrome::BorderStyle::Left);
+        let left = super::resolved_definition_theme(Some(&theme), Color::Cyan);
+        assert_eq!(left.containers.user, plain.containers.user);
+        assert_eq!(left.containers.assistant, plain.containers.assistant);
+        for recipe in [
+            left.containers.tool_requested,
+            left.containers.tool_running,
+            left.containers.tool_succeeded,
+            left.containers.tool_failed,
+            left.containers.tool_timed_out,
+        ] {
+            assert_eq!(recipe.recipe.layout, definition::ContainerLayout::LeftBar);
+            assert_eq!(recipe.recipe.border, definition::ContainerBorder::Left);
+        }
+        assert_eq!(
+            left.unit_chrome.tool_border,
+            Some(bcode_tui_theme::chrome::BorderStyle::Left)
         );
     }
 }

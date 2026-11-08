@@ -28,6 +28,10 @@ producer_default   = true
 render_mode        = "transcript_block"
 surfaces           = ["tui"]
 
+[[presentation.tools]]
+target_fields = ["url"]
+tool_name     = "git.clone"
+
 [concurrency]
 max  = 2
 type = "limited"

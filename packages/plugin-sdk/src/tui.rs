@@ -1546,6 +1546,143 @@ mod component_theme_tests {
     }
 }
 
+#[cfg(test)]
+mod tool_presentation_tests {
+    use super::*;
+
+    struct SectionedAdapter {
+        presentation: PluginTuiToolPresentation,
+    }
+
+    impl PluginTuiVisualAdapter for SectionedAdapter {
+        fn supports(&self, kind: &str) -> bool {
+            kind == "test.sectioned"
+        }
+
+        fn tool_presentation(
+            &self,
+            _kind: &str,
+            _payload: &serde_json::Value,
+            context: &PluginTuiVisualRenderContext,
+        ) -> PluginTuiToolPresentation {
+            let mut presentation = self.presentation.clone();
+            if let Some(resolved) = context.presentation() {
+                presentation.summary = Some(format!("{:?}", resolved.disclosure));
+            }
+            presentation
+        }
+
+        fn rows(
+            &self,
+            _kind: &str,
+            _payload: &serde_json::Value,
+            _context: &PluginTuiVisualRenderContext,
+        ) -> Vec<Line> {
+            vec![Line::from("body")]
+        }
+    }
+
+    fn section(name: &str, rows: usize) -> PluginTuiToolSection {
+        PluginTuiToolSection {
+            name: name.to_owned(),
+            label: None,
+            rows: (0..rows)
+                .map(|index| Line::from(index.to_string()))
+                .collect(),
+        }
+    }
+
+    fn registry(presentation: PluginTuiToolPresentation) -> PluginTuiRegistry {
+        let mut registry = PluginTuiRegistry::default();
+        registry
+            .register_visual_adapter(["sectioned"], Box::new(SectionedAdapter { presentation }));
+        registry
+    }
+
+    fn context() -> PluginTuiVisualRenderContext {
+        PluginTuiVisualRenderContext::new(40, PluginTuiDiffLayout::Unified, None)
+    }
+
+    #[test]
+    fn native_tool_presentation_is_bounded_and_sees_resolved_presentation() {
+        use crate::tui_visual::TuiVisualPresentation;
+        let registry = registry(PluginTuiToolPresentation {
+            summary: None,
+            target: Some(format!("{}\nignored", "界".repeat(100))),
+            sections: vec![
+                PluginTuiToolSection {
+                    label: Some("  Output  ".to_owned()),
+                    ..section("output", 2)
+                },
+                section("bcode.git.files", 0),
+            ],
+        });
+        let payload = serde_json::json!({});
+        let plain = registry
+            .visual_tool_presentation("sectioned", "test.sectioned", &payload, &context())
+            .expect("valid presentation");
+        assert_eq!(plain.summary, None);
+        assert_eq!(plain.target, Some("界".repeat(85)));
+        assert_eq!(plain.sections[0].label.as_deref(), Some("Output"));
+        assert_eq!(plain.sections[1].name, "bcode.git.files");
+
+        let resolved = TuiVisualPresentation {
+            disclosure: crate::tui_visual::Disclosure::Collapsed,
+            preview: crate::tui_visual::Preview {
+                lines: 4,
+                keep: crate::tui_visual::PreviewKeep::Head,
+            },
+            sections: std::collections::BTreeMap::new(),
+            header_fields: Vec::new(),
+        };
+        let with_presentation = context().with_presentation(resolved.clone());
+        assert_eq!(with_presentation.presentation(), Some(&resolved));
+        let summarized = registry
+            .visual_tool_presentation("sectioned", "test.sectioned", &payload, &with_presentation)
+            .expect("valid presentation");
+        assert_eq!(summarized.summary.as_deref(), Some("Collapsed"));
+        assert_eq!(
+            registry.visual_tool_presentation("sectioned", "other", &payload, &context()),
+            None
+        );
+    }
+
+    #[test]
+    fn invalid_native_tool_presentations_are_ignored() {
+        let payload = serde_json::json!({});
+        let invalid = [
+            vec![section("output", 1), section("output", 1)],
+            vec![section("Not Valid", 0)],
+            vec![section(
+                "output",
+                crate::tui_visual::MAX_TUI_VISUAL_SECTION_ROWS + 1,
+            )],
+            (0..=crate::tui_visual::MAX_TUI_VISUAL_SECTIONS)
+                .map(|index| section(&format!("s{index}"), 0))
+                .collect(),
+        ];
+        for sections in invalid {
+            let registry = registry(PluginTuiToolPresentation {
+                sections,
+                ..PluginTuiToolPresentation::default()
+            });
+            assert_eq!(
+                registry.visual_tool_presentation(
+                    "sectioned",
+                    "test.sectioned",
+                    &payload,
+                    &context()
+                ),
+                None
+            );
+        }
+        let empty = registry(PluginTuiToolPresentation::default())
+            .visual_tool_presentation("sectioned", "test.sectioned", &payload, &context())
+            .expect("empty presentation is valid");
+        assert!(empty.is_empty());
+    }
+}
+
 /// Host-owned presentation context for visual adapters.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PluginTuiVisualRenderContext {
@@ -1553,6 +1690,7 @@ pub struct PluginTuiVisualRenderContext {
     diff_layout: PluginTuiDiffLayout,
     working_directory: Option<PathBuf>,
     theme: Option<PluginTuiTheme>,
+    presentation: Option<crate::tui_visual::TuiVisualPresentation>,
 }
 
 impl PluginTuiVisualRenderContext {
@@ -1568,7 +1706,26 @@ impl PluginTuiVisualRenderContext {
             diff_layout,
             working_directory,
             theme: None,
+            presentation: None,
         }
+    }
+
+    /// Attach the host-resolved structural presentation for the unit being rendered.
+    #[must_use]
+    pub fn with_presentation(
+        mut self,
+        presentation: crate::tui_visual::TuiVisualPresentation,
+    ) -> Self {
+        self.presentation = Some(presentation);
+        self
+    }
+
+    /// Return the host-resolved structural presentation, when supplied.
+    ///
+    /// Adapters render what the host resolved and never evaluate presentation rules.
+    #[must_use]
+    pub const fn presentation(&self) -> Option<&crate::tui_visual::TuiVisualPresentation> {
+        self.presentation.as_ref()
     }
 
     /// Attach renderer-owned semantic presentation to the context.
@@ -1676,6 +1833,78 @@ pub struct PluginTuiVisualProjection {
     pub rows: Vec<Line>,
     pub anchors: Vec<crate::tui_visual::TuiVisualAnchor>,
     pub selection: Vec<(usize, PluginTuiSelectionRow)>,
+}
+
+/// One named, adapter-rendered body of a tool unit.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct PluginTuiToolSection {
+    /// Host section name (`output`, `diff`, ...) or a namespaced plugin name.
+    pub name: String,
+    /// Display label; `None` lets the renderer derive one from the name.
+    pub label: Option<String>,
+    /// Section body rows.
+    pub rows: Vec<Line>,
+}
+
+/// Adapter-supplied structural presentation of one tool unit.
+///
+/// Adapters that supply nothing render their projection as one `visual` section.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct PluginTuiToolPresentation {
+    /// One-line summary, at most [`crate::tui_visual::MAX_TUI_VISUAL_SUMMARY_BYTES`].
+    pub summary: Option<String>,
+    /// Operation target, at most [`crate::tui_visual::MAX_TUI_VISUAL_TARGET_BYTES`].
+    pub target: Option<String>,
+    /// Ordered named sections.
+    pub sections: Vec<PluginTuiToolSection>,
+}
+
+impl PluginTuiToolPresentation {
+    /// Whether no presentation field is supplied.
+    #[must_use]
+    pub const fn is_empty(&self) -> bool {
+        self.summary.is_none() && self.target.is_none() && self.sections.is_empty()
+    }
+
+    /// Bound text fields and validate structure.
+    ///
+    /// Summary, target, and labels become single lines truncated on UTF-8 boundaries.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when:
+    /// * sections violate [`crate::tui_visual::validate_tool_sections`];
+    /// * section rows exceed the serialized span or text limits.
+    pub fn into_bounded(mut self) -> Result<Self, String> {
+        use crate::tui_visual::{
+            MAX_SERIALIZED_TUI_VISUAL_SPANS, MAX_SERIALIZED_TUI_VISUAL_TEXT_BYTES,
+            MAX_TUI_VISUAL_SECTION_LABEL_BYTES, MAX_TUI_VISUAL_SUMMARY_BYTES,
+            MAX_TUI_VISUAL_TARGET_BYTES, bounded_optional_line,
+        };
+        self.summary = bounded_optional_line(self.summary.as_deref(), MAX_TUI_VISUAL_SUMMARY_BYTES);
+        self.target = bounded_optional_line(self.target.as_deref(), MAX_TUI_VISUAL_TARGET_BYTES);
+        crate::tui_visual::validate_tool_sections(
+            self.sections
+                .iter()
+                .map(|section| (section.name.as_str(), section.rows.len())),
+        )?;
+        let (spans, bytes) = self
+            .sections
+            .iter()
+            .flat_map(|section| &section.rows)
+            .flat_map(|row| &row.spans)
+            .fold((0_usize, 0_usize), |(spans, bytes), span| {
+                (spans + 1, bytes.saturating_add(span.content.len()))
+            });
+        if spans > MAX_SERIALIZED_TUI_VISUAL_SPANS || bytes > MAX_SERIALIZED_TUI_VISUAL_TEXT_BYTES {
+            return Err("tool presentation content limit exceeded".to_owned());
+        }
+        for section in &mut self.sections {
+            section.label =
+                bounded_optional_line(section.label.as_deref(), MAX_TUI_VISUAL_SECTION_LABEL_BYTES);
+        }
+        Ok(self)
+    }
 }
 
 /// Versioned generic presentation configuration delivered by the host.
@@ -1902,6 +2131,19 @@ pub trait PluginTuiVisualAdapter: Send + Sync {
         _host: &dyn PluginTuiHost,
     ) -> PluginTuiVisualProjection {
         self.projection(kind, payload, context)
+    }
+
+    /// Return a structural presentation (summary, target, named sections) for this payload.
+    ///
+    /// The default supplies none, so the host renders the projection as one `visual` section.
+    /// The host bounds and validates the result; invalid presentations are ignored.
+    fn tool_presentation(
+        &self,
+        _kind: &str,
+        _payload: &serde_json::Value,
+        _context: &PluginTuiVisualRenderContext,
+    ) -> PluginTuiToolPresentation {
+        PluginTuiToolPresentation::default()
     }
 
     /// Build transcript rows for the artifact/view payload at the given width.
@@ -3762,6 +4004,26 @@ impl PluginTuiRegistry {
     ) -> Option<PluginTuiTranscriptHeader> {
         self.visual_adapter(adapter_id, kind)
             .map(|adapter| adapter.transcript_header(kind, payload))
+    }
+
+    /// Return the bounded structural presentation from a matching visual adapter.
+    ///
+    /// Returns `None` when no adapter matches or the adapter's presentation is invalid.
+    #[expect(
+        clippy::must_use_candidate,
+        reason = "Option already carries must-use semantics"
+    )]
+    pub fn visual_tool_presentation(
+        &self,
+        adapter_id: &str,
+        kind: &str,
+        payload: &serde_json::Value,
+        context: &PluginTuiVisualRenderContext,
+    ) -> Option<PluginTuiToolPresentation> {
+        self.visual_adapter(adapter_id, kind)?
+            .tool_presentation(kind, payload, context)
+            .into_bounded()
+            .ok()
     }
 
     /// Propose input for an allocated viewport without executing it.

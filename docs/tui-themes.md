@@ -23,7 +23,8 @@ A theme has two independent halves:
 * a **palette** — colors, written as a handful of seed colors;
 * a **profile** — chrome (borders, focus effects, icons, density, separators,
   speaker treatment, surface layering, motion) and structure (which tools are
-  collapsed or summarized, preview budgets, part visibility, grouping).
+  collapsed or summarized, grouping, sections, header fields, summaries,
+  spacing; see [Structural presentation](#structural-presentation)).
 
 ```toml
 [tui.theme]
@@ -46,19 +47,21 @@ and `dusk`. Sources and licenses are listed in
 
 Bundled profiles:
 
-| Profile | Character |
-|---|---|
-| `bare` | Stays out of the way: no chrome, tools as one-line summaries |
-| `minimal` | Hairline rules, one accent, quiet tools |
-| `structured` | Status bars on tools, framed dialogs |
-| `soft` | Rounded corners, tinted surfaces, roomy padding |
-| `riced` | Gradient focus, Nerd Font icons, powerline separators, framed tool cards |
-| `brutalist` | Heavy rules, hard edges, no motion |
-| `retro` | Double-line frames, ASCII markers |
-| `editorial` | Prose first, tools tucked away |
-| `zen` | Only what is happening now is open |
-| `compact` | No padding, short previews, for small terminals |
-| `accessible` | Explicit frames, verbose labels, no motion |
+| Profile | Character | Structure |
+|---|---|---|
+| `bare` | Stays out of the way: no chrome | Tools as one-line summaries; runs of tools fold into summary groups |
+| `minimal` | Hairline rules, one accent | Finished tools summarized; lookups (`read`, `glob`, `grep`, `list`) fold into collapsed same-tool groups |
+| `structured` | Status bars on tools, framed dialogs | Same-tool runs as summary groups; `arguments` sections collapsed |
+| `soft` | Rounded corners, tinted surfaces, roomy padding | Long `output`/`result` sections collapse to their label row |
+| `riced` | Gradient focus, Nerd Font icons, powerline separators, framed tool cards | Everything expanded, including groups; icon headers |
+| `brutalist` | Heavy rules, hard edges, no motion | Host defaults |
+| `retro` | Double-line frames, ASCII markers | Finished tools print a templated `[status] tool target` line |
+| `editorial` | Prose first | Tools fold into collapsed groups that reasoning does not interrupt |
+| `zen` | Only what is happening now is open | Everything collapsed; groups reveal only running and waiting members |
+| `compact` | No padding, short previews, for small terminals | Summaries, no blank row after tools, collapsed groups |
+| `accessible` | Explicit frames, verbose labels, no motion | Nothing grouped or folded; every section shown; full headers |
+| `timeline` | Each turn reads as a log | Tools grouped per turn as summary groups, timing-first headers |
+| `focus` | Only the latest turn is open | Earlier turns fold; sections start collapsed; output opens to a 6-line tail |
 
 Curated combinations select both at once: `rice-mocha`, `neon`, `crt`,
 `amber-terminal`, `zen-paper`, `newsroom`, `night-shift`, `quiet`,
@@ -150,19 +153,244 @@ match = { kind = "tool", status = ["running", "failed"] }
 set   = { disclosure = "expanded", preview = { lines = 12, keep = "tail" } }
 ```
 
-Facts: `kind`, `tool`, `producer`, `schema` (`name/*` matches any version),
-`status`, `is_error`, `turn`, `min_depth`, `lines`, `items`, and plugin facts.
-Properties: `disclosure` (`expanded`, `summary`, `collapsed`, `hidden`),
-`detail`, `preview`, `parts` (`arguments`, `output`, `result`, `timing`, …),
-`group`, `placement`, `container`, and namespaced plugin properties. Unknown
-plugin properties, facts, and parts produce warnings.
-
 Layers apply in this order: theme and profile rules, then
 `[[presentation.rules]]` in Bcode configuration, then interactive defaults in
-user state. Clicking a tool header toggles it for the session; the
+user state. Click toggles and focus-mode changes apply on top for the current
+session only.
+
+#### Facts
+
+A `match` table is a conjunction; a list value matches any listed value, and an
+empty `match` matches every unit.
+
+| Fact | Values |
+|---|---|
+| `kind` | `user_message`, `assistant_message`, `reasoning`, `tool`, `permission`, `interaction`, `compaction`, `skill`, `activity`, `plugin_status`, `system`, `group` |
+| `tool`, `producer` | strings, matched exactly |
+| `schema` | string; `name/*` matches any version |
+| `status` | `requested`, `running`, `waiting`, `succeeded`, `failed`, `cancelled`, `timed_out` |
+| `is_error` | bool |
+| `turn` | `latest`, `previous`, `older` |
+| `min_depth` | child-session depth, inclusive |
+| `lines`, `items` | `empty`, `one`, `few` (2–10), `some` (11–50), `many` (51–200), `huge` (over 200) |
+| `target` | the operation target (path, command, pattern), matched exactly |
+| `duration` | `<1s`, `1s..10s`, `10s..60s`, `>60s` |
+| `last_in_turn` | bool; units without the fact never match |
+
+Plugins may declare further facts for their own tools. Unknown facts and
+plugin properties produce warnings.
+
+#### Properties
+
+| Property | Values |
+|---|---|
+| `disclosure` | `expanded`, `summary`, `collapsed`, `hidden` |
+| `detail` | `minimal`, `normal`, `verbose` |
+| `preview` | `{ lines, keep = "head" \| "tail" \| "both" }` in source lines |
+| `group` | see [Groups](#groups) |
+| `reveal` | member statuses shown inside a folded group |
+| `sections.<name>` | `{ visible, disclosure, preview }`; see [Sections](#sections) |
+| `parts.<name>` | bool; alias for `sections.<name>.visible` (`timing` is a part only) |
+| `header` | `{ fields = [...] }`; see [Header fields](#header-fields) |
+| `summary` | `{ source = [...], template = "..." }`; see [Summaries](#summaries) |
+| `spacing` | `{ before, after }` blank rows, each 0–2; default `{ before = 0, after = 1 }` |
+| `indent` | extra columns, 0–8; default 0 |
+| `placement`, `container` | interaction placement and container recipe id |
+
+A tool unit's disclosure decides how much of it is drawn:
+
+| Disclosure | Rows |
+|---|---|
+| `expanded` | header, then each visible section with its own disclosure |
+| `summary` | header, then a one-line summary |
+| `collapsed` | header only |
+| `hidden` | a count marker (`▸ 1 tool call hidden`) |
+
+Every property merges independently, so one rule can set the header while
+another sets disclosure. `sections` merge per section and per field. `summary`
+and `spacing` are replaced as a whole; omitted fields take their defaults.
+Out-of-range `spacing`, `indent`, and over-long templates are clamped and
+reported as warnings.
+
+#### Groups
+
+`group` folds runs of tool units into one group unit. It takes a shorthand
+(`none`, `consecutive_tools`, `consecutive_same_tool`) or a table:
+
+```toml
+[[presentation.rules]]
+match = { kind = "tool" }
+set   = { group = { by = "consecutive", bridge = ["reasoning"], min = 2 } }
+
+[[presentation.rules]]
+match = { kind = "group" }
+set   = { disclosure = "collapsed", reveal = ["running", "waiting", "failed", "timed_out"] }
+```
+
+* `by`: `none`, `consecutive` (any tool), `same_tool`, `same_producer`, or
+  `turn`. `consecutive_tools` means `{ by = "consecutive" }`, and
+  `consecutive_same_tool` means `{ by = "same_tool" }`.
+* `bridge`: unit kinds that may sit between members without ending the group.
+  It defaults to `["reasoning"]` when `by` is not `none`. Bridged units stay in
+  place and appear when the group is expanded; they are not members and are not
+  counted.
+* `min`: the smallest run that forms a group; default and minimum 2.
+
+Groups never reorder units and never cross turns. A group's `bridge` and `min`
+come from its first member. Group units have their own facts (`kind = "group"`;
+`tool` and `producer` when every member shares them; an aggregate `status`;
+`is_error` when any member failed; `items`; `turn`; `depth`), so rules matching
+`kind = "group"` style them. A group's disclosure means:
+
+* `collapsed`: the group header, then revealed members only;
+* `summary`: the group header, then one row per member;
+* `expanded`: the group header, then every member and bridged unit, indented.
+
+`reveal` lists the member statuses that stay visible while a group is collapsed
+or summarized; the default is `["running", "waiting", "failed", "timed_out"]`.
+Members awaiting a decision and failed members are always revealed, whatever
+`reveal` says. Groups are never hidden.
+
+#### Sections
+
+A tool unit's body is a list of named sections: `arguments`, `output`,
+`result`, `diff`, `artifact`, `metadata`, `visual` (a plugin-rendered body),
+`confirmation`, and `error`. Plugins may add namespaced sections such as
+`bcode.git.files`; unknown host section names without a dot produce warnings.
+
+```toml
+[[presentation.rules]]
+match = { kind = "tool", tool = "bash" }
+
+[presentation.rules.set.sections]
+arguments = { visible = false }
+output    = { disclosure = "collapsed", preview = { lines = 6, keep = "tail" } }
+```
+
+A section's preview defaults to the unit's `preview`, and its disclosure to
+`expanded`. An expanded section draws its label row (`  output`) and its body.
+A collapsed section draws one row with a marker and row count
+(`  ▸ output · 14 rows`); `summary` adds the first line of the body; `hidden`
+or `visible = false` omits it. Fields of the same section (for example one
+`arguments` section per argument) share one disclosure target.
+
+#### Header fields
+
+`header.fields` chooses and orders the header. Tool and other unit headers may
+use `marker` (the disclosure glyph), `icon`, `label` (for example
+`Tool result`), `tool`, `target`, `status`, `timing`, `count`, and `title` (the
+producer's title). Group headers may use `marker`, `count` (`5 tool calls`),
+`tools` (`read ×3, grep ×2`), `status`, and `timing` (total duration).
+
+| Unit | Default header |
+|---|---|
+| tool | `["marker", "label", "tool", "status", "timing"]` |
+| group | `["marker", "count", "tools", "status", "timing"]` |
+
+A leading `marker` is drawn as a prefix; other fields are joined with ` · `.
+`timing` also needs the `timing` part to be visible. A field that has no value
+for a unit is skipped. Unknown fields, and fields used on a kind they do not
+apply to (for example `tools` in a rule that matches only `tool`), produce
+warnings.
+
+#### Summaries
+
+The `summary` disclosure shows one line under the header. `summary.source`
+lists where it comes from, tried in order:
+
+* `plugin`: the producer's summary;
+* `first_line`: the first non-blank line of the first visible `output`,
+  `result`, or `visual` section, else of any visible section;
+* `template`: `summary.template`.
+
+The default is `["plugin", "first_line", "template"]`, so a rule that sets only
+`summary.template` uses it when there is no producer summary and no body text.
+
+```toml
+[[presentation.rules]]
+match = { kind = "tool" }
+set   = { summary = { source = ["plugin", "template"], template = "[{status}] {tool} {target}" } }
+```
+
+Templates substitute only these names in braces: `{tool}`, `{target}`,
+`{status}`, `{timing}`, `{count}`, `{title}`, `{first_line}`. There are no
+conditionals or formatting directives. Unknown names produce warnings and
+render empty; other braces are literal text. Templates are limited to 256 bytes,
+and the result is a single trimmed line.
+
+#### Visibility floor
+
+A floor that no theme, configuration, or toggle can lower:
+
+* units awaiting a decision stay expanded, with their `arguments`, `metadata`,
+  and `confirmation` sections visible and expanded;
+* failed units stay at least summarized, and their `error` and `output`
+  sections are never hidden;
+* groups are never hidden, and their failed and awaiting members are always
+  revealed;
+* hidden units of every kind leave a one-row count marker (`▸ 1 message
+  hidden`) that can be clicked or focused to reveal them. Reasoning hidden by
+  `tui.thinking.show = false` (or its toggle) is the one exception and renders
+  nothing.
+
+The floor also applies after toggles: collapsing a failed unit by hand keeps
+its summary line. Rules that explicitly target these units and try to cross the floor produce
+warnings naming the rule and layer.
+
+#### Disclosure targets and mouse
+
+Each header and section label is a disclosure target:
+
+| Target | Meaning |
+|---|---|
+| `unit:<item id>` | one transcript unit |
+| `group:<first member item id>` | a group |
+| `section:<item id>:<name>` | one section of a unit |
+
+Clicking a header or section label toggles that target: expanded becomes
+collapsed, and anything else becomes expanded. Toggles last for the session and
+are dropped when their item leaves the resident transcript window. The
 `tui.tools.expandAll`, `tui.tools.collapseAll`, and `tui.tools.resetDisclosure`
-actions apply to every tool. A visibility floor that no theme can lower keeps
-units awaiting a decision expanded and failures at least summarized.
+command-palette actions apply to every unit and group; expand and collapse
+leave hidden units and units awaiting a decision alone. Changing a group's
+disclosure replaces the toggles of its members.
+
+#### Focus mode
+
+`alt+u` (`tui.transcript.focusUnits`) enters keyboard focus mode on the last
+visible disclosure target. The focused row uses the selection style and stays
+in view.
+
+| Key | Action |
+|---|---|
+| `j`, Down | next target |
+| `k`, Up | previous target |
+| Enter, Space | toggle |
+| `l`, Right | expand one level (group: collapsed → summary → expanded) |
+| `h`, Left | collapse one level, or move to the parent (section → unit → group) |
+| `e` | expand everything under the focused target |
+| Escape | leave focus mode (`alt+u` also leaves) |
+
+In focus mode the expand-all, collapse-all, and reset actions affect only the
+focused target and what is under it. All keys can be remapped in the
+`transcript_focus` keymap scope; other keys reach the composer as usual.
+
+#### Explaining a unit
+
+`bcode theme explain` resolves the same layers as the TUI for a described unit
+and prints every property with the rule and layer that set it, floor
+adjustments, and diagnostics:
+
+```console
+bcode theme explain tool=read status=succeeded lines=40
+bcode theme explain --profile focus kind=group turn=older
+bcode theme explain --theme rice-mocha tool=bash status=failed --json
+```
+
+Facts are `KEY=VALUE` arguments (`kind` defaults to `tool`). `--theme` and
+`--profile` replace the configured selection, and `--profile ""` clears the
+profile. `bcode theme profiles` lists the available profiles and marks the
+configured one.
 
 ### Unknown roles
 

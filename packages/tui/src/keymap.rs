@@ -385,6 +385,36 @@ fn register_host_actions(
     register_streaming_actions(registry)?;
     register_form_editor_actions(registry)?;
     register_onboarding_actions(registry)?;
+    register_transcript_focus_actions(registry)?;
+    Ok(())
+}
+
+/// Register the focus-mode entry action and the remappable focus-mode scope.
+fn register_transcript_focus_actions(
+    registry: &mut bcode_plugin_sdk::tui::keymap::KeymapRegistry,
+) -> Result<(), bcode_plugin_sdk::tui::keymap::KeymapError> {
+    use super::transcript_focus::{
+        FOCUS_SCOPE, FOCUS_UNITS_ACTION, FOCUS_UNITS_DEFAULT_KEY, FocusAction,
+    };
+    use bcode_plugin_sdk::tui::keymap::KeymapAction;
+    registry.register(KeymapAction {
+        id: FOCUS_UNITS_ACTION.into(),
+        scope: BmuxScope::Chat.id().into(),
+        description: "Focus transcript units".into(),
+        defaults: vec![FOCUS_UNITS_DEFAULT_KEY.into()],
+    })?;
+    for action in FocusAction::ALL {
+        registry.register(KeymapAction {
+            id: action.id().into(),
+            scope: FOCUS_SCOPE.into(),
+            description: action.description().into(),
+            defaults: action
+                .default_keys()
+                .iter()
+                .map(|key| (*key).to_owned())
+                .collect(),
+        })?;
+    }
     Ok(())
 }
 fn control_defaults<'a>(scope: &str, id: &str, defaults: Vec<&'a str>) -> Option<Vec<&'a str>> {
@@ -1654,6 +1684,47 @@ mod tests {
         ] {
             assert_eq!(keymap.action_for_key(BmuxScope::Chat, stroke), Some(action));
         }
+    }
+
+    #[test]
+    fn transcript_focus_bindings_have_defaults_and_remap_in_their_scope() {
+        use crate::transcript_focus::{FOCUS_SCOPE, FOCUS_UNITS_ACTION, FocusAction};
+        let keymap = default_keymap();
+        assert_eq!(
+            keymap.action("chat", parse_key_stroke("alt+u").unwrap()),
+            Some(FOCUS_UNITS_ACTION)
+        );
+        for action in FocusAction::ALL {
+            for key in action.default_keys() {
+                assert_eq!(
+                    keymap.action(FOCUS_SCOPE, parse_key_stroke(key).unwrap()),
+                    Some(action.id()),
+                    "{key}"
+                );
+            }
+        }
+        // Focus keys stay out of the chat scope, so the composer keeps them.
+        assert_eq!(keymap.action("chat", parse_key_stroke("j").unwrap()), None);
+        assert!(keymap.help_markdown().contains(FocusAction::ExpandAll.id()));
+
+        let mut config = TuiConfig::default();
+        config.keybindings.scopes.insert(
+            FOCUS_SCOPE.into(),
+            BTreeMap::from([
+                ("n".into(), FocusAction::Next.id().into()),
+                ("j".into(), String::new()),
+            ]),
+        );
+        let keymap = BmuxKeyMap::try_from_config(&config).expect("valid effective registry");
+        assert_eq!(
+            keymap.action(FOCUS_SCOPE, parse_key_stroke("j").unwrap()),
+            None
+        );
+        assert_eq!(
+            keymap.action(FOCUS_SCOPE, parse_key_stroke("n").unwrap()),
+            Some(FocusAction::Next.id())
+        );
+        assert_eq!(keymap.hint(FOCUS_SCOPE, FocusAction::Next.id()), "n");
     }
 
     #[test]

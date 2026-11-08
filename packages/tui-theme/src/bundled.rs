@@ -138,6 +138,7 @@ pub const BUNDLED_THEMES: &[(&str, &str)] = &[
         "editorial",
         include_str!("../themes/profiles/editorial.toml"),
     ),
+    ("focus", include_str!("../themes/profiles/focus.toml")),
     ("minimal", include_str!("../themes/profiles/minimal.toml")),
     ("retro", include_str!("../themes/profiles/retro.toml")),
     ("riced", include_str!("../themes/profiles/riced.toml")),
@@ -146,6 +147,7 @@ pub const BUNDLED_THEMES: &[(&str, &str)] = &[
         "structured",
         include_str!("../themes/profiles/structured.toml"),
     ),
+    ("timeline", include_str!("../themes/profiles/timeline.toml")),
     ("zen", include_str!("../themes/profiles/zen.toml")),
     (
         "amber-terminal",

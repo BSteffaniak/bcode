@@ -29,6 +29,51 @@ pub const MAX_PLUGIN_FACTS: usize = 32;
 pub const MAX_PATCH_ENTRIES: usize = 64;
 /// Largest accepted preview budget, in source lines.
 pub const MAX_PREVIEW_LINES: u32 = 10_000;
+/// Largest accepted summary template, in bytes.
+pub const MAX_SUMMARY_TEMPLATE_BYTES: usize = 256;
+/// Largest accepted blank-row spacing before or after a unit.
+pub const MAX_SPACING: u8 = 2;
+/// Largest accepted extra indent, in columns.
+pub const MAX_INDENT: u8 = 8;
+/// Smallest run of units that forms a group.
+pub const MIN_GROUP_SIZE: u32 = 2;
+
+/// Registered unit and group header field names.
+pub const HEADER_FIELDS: [&str; 10] = [
+    "marker", "icon", "label", "tool", "target", "status", "timing", "count", "title", "tools",
+];
+/// Header fields that apply to non-group units.
+pub const UNIT_HEADER_FIELDS: [&str; 9] = [
+    "marker", "icon", "label", "tool", "target", "status", "timing", "count", "title",
+];
+/// Header fields that apply to group units.
+pub const GROUP_HEADER_FIELDS: [&str; 5] = ["marker", "count", "tools", "status", "timing"];
+/// Header used for non-group units when no rule sets `header`.
+pub const DEFAULT_UNIT_HEADER: [&str; 5] = ["marker", "label", "tool", "status", "timing"];
+/// Header used for group units when no rule sets `header`.
+pub const DEFAULT_GROUP_HEADER: [&str; 5] = ["marker", "count", "tools", "status", "timing"];
+/// Field names that summary templates may substitute.
+pub const TEMPLATE_FIELDS: [&str; 7] = [
+    "tool",
+    "target",
+    "status",
+    "timing",
+    "count",
+    "title",
+    "first_line",
+];
+/// Host section names.
+pub const HOST_SECTIONS: [&str; 9] = [
+    "arguments",
+    "output",
+    "result",
+    "diff",
+    "artifact",
+    "metadata",
+    "visual",
+    "confirmation",
+    "error",
+];
 
 /// Kind of presentable unit.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
@@ -160,6 +205,36 @@ impl SizeBucket {
     }
 }
 
+/// Bucketed wall-clock duration, so running units change facts only at boundaries.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+pub enum DurationBucket {
+    /// Under one second.
+    #[serde(rename = "<1s", alias = "lt1s")]
+    UnderOneSecond,
+    /// One second up to (excluding) ten seconds.
+    #[serde(rename = "1s..10s", alias = "s1_10")]
+    OneToTenSeconds,
+    /// Ten seconds up to (excluding) sixty seconds.
+    #[serde(rename = "10s..60s", alias = "s10_60")]
+    TenToSixtySeconds,
+    /// Sixty seconds or more.
+    #[serde(rename = ">60s", alias = "gt60")]
+    OverSixtySeconds,
+}
+
+impl DurationBucket {
+    /// Bucket an exact duration in milliseconds.
+    #[must_use]
+    pub const fn of_millis(millis: u64) -> Self {
+        match millis {
+            0..1_000 => Self::UnderOneSecond,
+            1_000..10_000 => Self::OneToTenSeconds,
+            10_000..60_000 => Self::TenToSixtySeconds,
+            _ => Self::OverSixtySeconds,
+        }
+    }
+}
+
 /// Typed value of a plugin-declared fact or property.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(untagged)]
@@ -197,6 +272,15 @@ pub struct UnitFacts {
     pub lines: SizeBucket,
     /// Bucketed item count (for example, members of a group).
     pub items: SizeBucket,
+    /// Operation target (path, command, pattern, query, or URL), when known.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub target: Option<String>,
+    /// Bucketed duration, when known.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub duration: Option<DurationBucket>,
+    /// Whether the unit is the last unit of its turn, when known.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_in_turn: Option<bool>,
     /// Plugin-declared facts keyed by namespaced name.
     pub plugin: BTreeMap<String, FactValue>,
 }
@@ -259,20 +343,291 @@ pub struct Preview {
     pub keep: PreviewKeep,
 }
 
-/// How consecutive units group.
+/// Key that decides which consecutive units share a group.
 #[derive(
     Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize,
 )]
 #[serde(rename_all = "snake_case")]
-pub enum Grouping {
+pub enum GroupBy {
     /// No grouping.
     #[default]
     None,
-    /// Group consecutive invocations of the same tool.
-    ConsecutiveSameTool,
-    /// Group consecutive tool invocations of any tool.
-    ConsecutiveTools,
+    /// Consecutive tool units of any tool.
+    Consecutive,
+    /// Consecutive invocations of the same tool.
+    SameTool,
+    /// Consecutive units from the same producer.
+    SameProducer,
+    /// Every tool unit of a turn.
+    Turn,
 }
+
+/// How consecutive units group.
+///
+/// Deserializes from a legacy string (`none`, `consecutive_tools`,
+/// `consecutive_same_tool`) or a `{ by, bridge, min }` table; serializes as a
+/// table. Omitted table fields take the defaults of [`GroupSpec::new`], and
+/// `min` is raised to [`MIN_GROUP_SIZE`].
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize)]
+pub struct GroupSpec {
+    /// Grouping key.
+    pub by: GroupBy,
+    /// Unit kinds that may sit between members without ending the group.
+    pub bridge: Vec<UnitKind>,
+    /// Smallest run that forms a group; at least [`MIN_GROUP_SIZE`].
+    pub min: u32,
+}
+
+impl GroupSpec {
+    /// Spec for `by` with default bridge (`reasoning` unless `by` is `none`)
+    /// and minimum size.
+    #[must_use]
+    pub fn new(by: GroupBy) -> Self {
+        Self {
+            by,
+            bridge: Self::default_bridge(by),
+            min: MIN_GROUP_SIZE,
+        }
+    }
+
+    /// No grouping.
+    #[must_use]
+    pub const fn none() -> Self {
+        Self {
+            by: GroupBy::None,
+            bridge: Vec::new(),
+            min: MIN_GROUP_SIZE,
+        }
+    }
+
+    /// Whether this spec groups at all.
+    #[must_use]
+    pub fn is_grouping(&self) -> bool {
+        self.by != GroupBy::None
+    }
+
+    fn default_bridge(by: GroupBy) -> Vec<UnitKind> {
+        if by == GroupBy::None {
+            Vec::new()
+        } else {
+            vec![UnitKind::Reasoning]
+        }
+    }
+}
+
+impl Default for GroupSpec {
+    fn default() -> Self {
+        Self::none()
+    }
+}
+
+impl From<GroupBy> for GroupSpec {
+    fn from(by: GroupBy) -> Self {
+        Self::new(by)
+    }
+}
+
+impl<'de> Deserialize<'de> for GroupSpec {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        #[derive(Deserialize)]
+        #[serde(rename_all = "snake_case")]
+        enum Legacy {
+            None,
+            ConsecutiveTools,
+            ConsecutiveSameTool,
+        }
+        #[derive(Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct Table {
+            #[serde(default)]
+            by: GroupBy,
+            #[serde(default)]
+            bridge: Option<Vec<UnitKind>>,
+            #[serde(default)]
+            min: Option<u32>,
+        }
+        #[derive(Deserialize)]
+        #[serde(untagged)]
+        enum Shape {
+            Legacy(Legacy),
+            Table(Table),
+        }
+        let shape = Shape::deserialize(deserializer).map_err(|_| {
+            serde::de::Error::custom(
+                "expected none, consecutive_tools, consecutive_same_tool, or { by, bridge, min }",
+            )
+        })?;
+        Ok(match shape {
+            Shape::Legacy(Legacy::None) => Self::none(),
+            Shape::Legacy(Legacy::ConsecutiveTools) => Self::new(GroupBy::Consecutive),
+            Shape::Legacy(Legacy::ConsecutiveSameTool) => Self::new(GroupBy::SameTool),
+            Shape::Table(table) => Self {
+                bridge: table
+                    .bridge
+                    .unwrap_or_else(|| Self::default_bridge(table.by)),
+                min: table.min.unwrap_or(MIN_GROUP_SIZE).max(MIN_GROUP_SIZE),
+                by: table.by,
+            },
+        })
+    }
+}
+
+/// Visibility, disclosure, and preview of one named unit section.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SectionPatch {
+    /// Whether the section is shown.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub visible: Option<bool>,
+    /// Section disclosure.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub disclosure: Option<Disclosure>,
+    /// Section preview budget.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub preview: Option<Preview>,
+}
+
+impl SectionPatch {
+    /// Overlay `other` on this patch per field; set values in `other` win.
+    pub const fn merge(&mut self, other: &Self) {
+        if other.visible.is_some() {
+            self.visible = other.visible;
+        }
+        if other.disclosure.is_some() {
+            self.disclosure = other.disclosure;
+        }
+        if other.preview.is_some() {
+            self.preview = other.preview;
+        }
+    }
+}
+
+/// Resolved presentation of one named unit section.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct ResolvedSection {
+    /// Whether the section is shown.
+    pub visible: bool,
+    /// Section disclosure.
+    pub disclosure: Disclosure,
+    /// Section preview budget.
+    pub preview: Preview,
+}
+
+impl ResolvedSection {
+    /// Default section presentation for a unit whose preview is `preview`.
+    #[must_use]
+    pub const fn defaults(preview: Preview) -> Self {
+        Self {
+            visible: true,
+            disclosure: Disclosure::Expanded,
+            preview,
+        }
+    }
+
+    /// Apply `patch` to this section.
+    pub const fn apply(&mut self, patch: &SectionPatch) {
+        if let Some(visible) = patch.visible {
+            self.visible = visible;
+        }
+        if let Some(disclosure) = patch.disclosure {
+            self.disclosure = disclosure;
+        }
+        if let Some(preview) = patch.preview {
+            self.preview = preview;
+        }
+    }
+}
+
+/// Ordered header fields; names come from [`HEADER_FIELDS`].
+#[derive(Debug, Clone, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct HeaderSpec {
+    /// Field names, in display order.
+    pub fields: Vec<String>,
+}
+
+/// Source of a unit's one-line summary.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SummarySource {
+    /// Producer-supplied summary.
+    Plugin,
+    /// First non-blank line of the first visible body section.
+    FirstLine,
+    /// The summary template.
+    Template,
+}
+
+/// How a unit's one-line summary is produced.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SummarySpec {
+    /// Sources tried in order.
+    #[serde(default = "SummarySpec::default_source")]
+    pub source: Vec<SummarySource>,
+    /// Template substituting [`TEMPLATE_FIELDS`] in braces; at most
+    /// [`MAX_SUMMARY_TEMPLATE_BYTES`] after resolution.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub template: Option<String>,
+}
+
+impl SummarySpec {
+    /// Default source order: plugin, first line, then template.
+    fn default_source() -> Vec<SummarySource> {
+        vec![
+            SummarySource::Plugin,
+            SummarySource::FirstLine,
+            SummarySource::Template,
+        ]
+    }
+}
+
+impl Default for SummarySpec {
+    fn default() -> Self {
+        Self {
+            source: Self::default_source(),
+            template: None,
+        }
+    }
+}
+
+/// Blank rows around a unit; each side is clamped to [`MAX_SPACING`] on resolution.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(deny_unknown_fields, default)]
+pub struct Spacing {
+    /// Blank rows before the unit.
+    pub before: u8,
+    /// Blank rows after the unit.
+    pub after: u8,
+}
+
+impl Spacing {
+    /// Copy with both sides clamped to [`MAX_SPACING`].
+    #[must_use]
+    pub fn clamped(self) -> Self {
+        Self {
+            before: self.before.min(MAX_SPACING),
+            after: self.after.min(MAX_SPACING),
+        }
+    }
+}
+
+impl Default for Spacing {
+    fn default() -> Self {
+        Self {
+            before: 0,
+            after: 1,
+        }
+    }
+}
+
+/// Group member statuses revealed by default when a group is not expanded.
+pub const DEFAULT_REVEAL: [UnitStatus; 4] = [
+    UnitStatus::Running,
+    UnitStatus::Waiting,
+    UnitStatus::Failed,
+    UnitStatus::TimedOut,
+];
 
 /// Where a unit is placed.
 #[derive(
@@ -302,16 +657,37 @@ pub struct PropertyPatch {
     pub preview: Option<Preview>,
     /// Grouping of consecutive units.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub group: Option<Grouping>,
+    pub group: Option<GroupSpec>,
+    /// Group member statuses revealed when a group is not expanded.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reveal: Option<Vec<UnitStatus>>,
     /// Placement.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub placement: Option<Placement>,
     /// Chrome container recipe id.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub container: Option<String>,
-    /// Part visibility keyed by part name (for example `timing`, `arguments`).
+    /// Legacy part visibility keyed by part name; an alias for
+    /// `sections.<name>.visible`. [`merge`](Self::merge) folds overlaid parts
+    /// into [`sections`](Self::sections), and an explicit section value in the
+    /// same patch wins over the alias.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub parts: BTreeMap<String, bool>,
+    /// Section presentation keyed by section name.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub sections: BTreeMap<String, SectionPatch>,
+    /// Header fields.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub header: Option<HeaderSpec>,
+    /// Summary sources and template.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub summary: Option<SummarySpec>,
+    /// Blank rows around the unit.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub spacing: Option<Spacing>,
+    /// Extra indent, in columns.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub indent: Option<u8>,
     /// Plugin-namespaced properties (keys contain a `.`).
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub plugin: BTreeMap<String, FactValue>,
@@ -330,7 +706,10 @@ impl PropertyPatch {
             self.preview = other.preview;
         }
         if other.group.is_some() {
-            self.group = other.group;
+            self.group.clone_from(&other.group);
+        }
+        if other.reveal.is_some() {
+            self.reveal.clone_from(&other.reveal);
         }
         if other.placement.is_some() {
             self.placement = other.placement;
@@ -338,8 +717,24 @@ impl PropertyPatch {
         if other.container.is_some() {
             self.container.clone_from(&other.container);
         }
-        self.parts
-            .extend(other.parts.iter().map(|(key, value)| (key.clone(), *value)));
+        for (name, section) in other.section_patches() {
+            self.sections
+                .entry(name.to_owned())
+                .or_default()
+                .merge(&section);
+        }
+        if other.header.is_some() {
+            self.header.clone_from(&other.header);
+        }
+        if other.summary.is_some() {
+            self.summary.clone_from(&other.summary);
+        }
+        if other.spacing.is_some() {
+            self.spacing = other.spacing;
+        }
+        if other.indent.is_some() {
+            self.indent = other.indent;
+        }
         self.plugin.extend(
             other
                 .plugin
@@ -353,6 +748,29 @@ impl PropertyPatch {
     pub fn is_empty(&self) -> bool {
         *self == Self::default()
     }
+
+    /// Effective section patches, with legacy `parts` folded into
+    /// `visible` and explicit `sections` values taking precedence.
+    #[must_use]
+    pub fn section_patches(&self) -> BTreeMap<&str, SectionPatch> {
+        let mut sections: BTreeMap<&str, SectionPatch> = self
+            .parts
+            .iter()
+            .map(|(name, visible)| {
+                (
+                    name.as_str(),
+                    SectionPatch {
+                        visible: Some(*visible),
+                        ..SectionPatch::default()
+                    },
+                )
+            })
+            .collect();
+        for (name, section) in &self.sections {
+            sections.entry(name.as_str()).or_default().merge(section);
+        }
+        sections
+    }
 }
 
 /// Fully resolved structural presentation for one unit.
@@ -365,22 +783,43 @@ pub struct ResolvedPresentation {
     /// Preview budget.
     pub preview: Preview,
     /// Grouping of consecutive units.
-    pub group: Grouping,
+    pub group: GroupSpec,
+    /// Group member statuses revealed when a group is not expanded.
+    pub reveal: Vec<UnitStatus>,
     /// Placement.
     pub placement: Placement,
     /// Chrome container recipe id, when one was selected.
     pub container: Option<String>,
-    /// Part visibility; parts absent here are visible.
-    pub parts: BTreeMap<String, bool>,
+    /// Explicitly set sections; absent sections take
+    /// [`ResolvedSection::defaults`] (see [`section`](Self::section)).
+    pub sections: BTreeMap<String, ResolvedSection>,
+    /// Header fields, or `None` for the renderer's default header.
+    pub header: Option<HeaderSpec>,
+    /// Summary sources and template.
+    pub summary: SummarySpec,
+    /// Blank rows around the unit, each at most [`MAX_SPACING`].
+    pub spacing: Spacing,
+    /// Extra indent in columns, at most [`MAX_INDENT`].
+    pub indent: u8,
     /// Plugin-namespaced properties.
     pub plugin: BTreeMap<String, FactValue>,
 }
 
 impl ResolvedPresentation {
-    /// Whether `part` should be shown.
+    /// Presentation of section `name`, defaulting to visible, expanded, and
+    /// the unit's preview.
+    #[must_use]
+    pub fn section(&self, name: &str) -> ResolvedSection {
+        self.sections
+            .get(name)
+            .copied()
+            .unwrap_or_else(|| ResolvedSection::defaults(self.preview))
+    }
+
+    /// Whether `part` (a section name) should be shown.
     #[must_use]
     pub fn part_visible(&self, part: &str) -> bool {
-        self.parts.get(part).copied().unwrap_or(true)
+        self.section(part).visible
     }
 }
 
@@ -458,6 +897,15 @@ pub struct FactMatcher {
     /// Item-count buckets.
     #[serde(default, skip_serializing_if = "OneOrMany::is_unset")]
     pub items: OneOrMany<SizeBucket>,
+    /// Operation targets, matched exactly.
+    #[serde(default, skip_serializing_if = "OneOrMany::is_unset")]
+    pub target: OneOrMany<String>,
+    /// Duration buckets.
+    #[serde(default, skip_serializing_if = "OneOrMany::is_unset")]
+    pub duration: OneOrMany<DurationBucket>,
+    /// Last-in-turn flag; units without the fact never match.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_in_turn: Option<bool>,
     /// Plugin-declared facts.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub plugin: BTreeMap<String, OneOrMany<FactValue>>,
@@ -490,6 +938,13 @@ impl FactMatcher {
             && self.min_depth.is_none_or(|depth| facts.depth >= depth)
             && self.lines.admits(|bucket| *bucket == facts.lines)
             && self.items.admits(|bucket| *bucket == facts.items)
+            && optional(&self.target, facts.target.as_ref())
+            && self
+                .duration
+                .admits(|bucket| facts.duration.is_some_and(|actual| actual == *bucket))
+            && self
+                .last_in_turn
+                .is_none_or(|expected| facts.last_in_turn == Some(expected))
             && self.plugin.iter().all(|(name, condition)| {
                 condition.admits(|expected| facts.plugin.get(name) == Some(expected))
             })
@@ -663,7 +1118,235 @@ mod tests {
         base.merge(&overlay);
         assert_eq!(base.disclosure, Some(Disclosure::Expanded));
         assert_eq!(base.detail, Some(Detail::Minimal));
-        assert_eq!(base.parts.len(), 2);
+        assert_eq!(
+            base.section_patches()
+                .iter()
+                .map(|(name, section)| (*name, section.visible))
+                .collect::<Vec<_>>(),
+            [("arguments", Some(false)), ("timing", Some(false))]
+        );
+    }
+
+    #[test]
+    fn group_accepts_legacy_strings_and_tables_with_defaults() {
+        let parse = |value: &str| toml::from_str::<PropertyPatch>(&format!("group = {value}"));
+        assert_eq!(parse("\"none\"").unwrap().group, Some(GroupSpec::none()));
+        assert_eq!(
+            parse("\"consecutive_tools\"").unwrap().group,
+            Some(GroupSpec {
+                by: GroupBy::Consecutive,
+                bridge: vec![UnitKind::Reasoning],
+                min: 2
+            })
+        );
+        assert_eq!(
+            parse("\"consecutive_same_tool\"").unwrap().group,
+            Some(GroupSpec::new(GroupBy::SameTool))
+        );
+        assert_eq!(
+            parse("{ by = \"same_producer\", bridge = [], min = 0 }")
+                .unwrap()
+                .group,
+            Some(GroupSpec {
+                by: GroupBy::SameProducer,
+                bridge: Vec::new(),
+                min: 2
+            })
+        );
+        assert_eq!(
+            parse("{ by = \"turn\", min = 4 }").unwrap().group,
+            Some(GroupSpec {
+                by: GroupBy::Turn,
+                bridge: vec![UnitKind::Reasoning],
+                min: 4
+            })
+        );
+        assert_eq!(parse("{}").unwrap().group, Some(GroupSpec::none()));
+        for invalid in [
+            "\"same_tool\"",
+            "{ by = \"tool\" }",
+            "{ by = \"turn\", size = 2 }",
+        ] {
+            assert!(parse(invalid).is_err(), "{invalid}");
+        }
+    }
+
+    #[test]
+    fn group_serializes_as_a_table_that_round_trips() {
+        let patch = PropertyPatch {
+            group: Some(GroupSpec::new(GroupBy::SameTool)),
+            ..PropertyPatch::default()
+        };
+        let value = serde_json::to_value(&patch).unwrap();
+        assert!(value["group"].is_object());
+        assert_eq!(
+            serde_json::from_value::<PropertyPatch>(value).unwrap(),
+            patch
+        );
+    }
+
+    #[test]
+    fn v2_properties_parse_from_the_documented_example() {
+        let patch: PropertyPatch = toml::from_str(
+            r#"
+            group = { by = "consecutive", bridge = ["reasoning"], min = 2 }
+            sections = { arguments = { visible = false }, output = { disclosure = "collapsed", preview = { lines = 4 } } }
+            header = { fields = ["marker", "tool", "target", "status", "timing"] }
+            summary = { source = ["plugin", "template", "first_line"], template = "{tool} {target}" }
+            spacing = { before = 0, after = 1 }
+            indent = 2
+            reveal = ["running", "failed"]
+            "#,
+        )
+        .unwrap();
+        assert_eq!(patch.sections["arguments"].visible, Some(false));
+        assert_eq!(
+            patch.sections["output"].disclosure,
+            Some(Disclosure::Collapsed)
+        );
+        assert_eq!(patch.header.unwrap().fields.len(), 5);
+        assert_eq!(
+            patch.summary.unwrap().source,
+            [
+                SummarySource::Plugin,
+                SummarySource::Template,
+                SummarySource::FirstLine
+            ]
+        );
+        assert_eq!(patch.indent, Some(2));
+        assert_eq!(
+            patch.reveal,
+            Some(vec![UnitStatus::Running, UnitStatus::Failed])
+        );
+        let partial: PropertyPatch =
+            toml::from_str("summary = { template = \"{tool}\" }\nspacing = { before = 2 }")
+                .unwrap();
+        // A template-only summary keeps the template reachable as the last source.
+        assert_eq!(
+            partial.summary.unwrap().source,
+            [
+                SummarySource::Plugin,
+                SummarySource::FirstLine,
+                SummarySource::Template
+            ]
+        );
+        assert_eq!(
+            partial.spacing,
+            Some(Spacing {
+                before: 2,
+                after: 1
+            })
+        );
+        for invalid in [
+            "sections = { output = { shown = true } }",
+            "header = { field = [] }",
+            "summary = { source = [\"magic\"] }",
+            "spacing = { left = 1 }",
+        ] {
+            assert!(
+                toml::from_str::<PropertyPatch>(invalid).is_err(),
+                "{invalid}"
+            );
+        }
+    }
+
+    #[test]
+    fn sections_merge_per_section_and_field_and_absorb_parts() {
+        let mut base: PropertyPatch = toml::from_str(
+            "sections = { output = { disclosure = \"collapsed\", visible = false } }",
+        )
+        .unwrap();
+        base.merge(&toml::from_str("parts = { output = true, timing = false }").unwrap());
+        base.merge(&toml::from_str("sections = { output = { preview = { lines = 3 } } }").unwrap());
+        let sections = base.section_patches();
+        assert_eq!(
+            sections["output"],
+            SectionPatch {
+                visible: Some(true),
+                disclosure: Some(Disclosure::Collapsed),
+                preview: Some(Preview {
+                    lines: 3,
+                    keep: PreviewKeep::Tail
+                }),
+            }
+        );
+        assert_eq!(sections["timing"].visible, Some(false));
+
+        let same_patch: PropertyPatch = toml::from_str(
+            "parts = { output = false }\nsections = { output = { visible = true } }",
+        )
+        .unwrap();
+        assert_eq!(same_patch.section_patches()["output"].visible, Some(true));
+    }
+
+    #[test]
+    fn resolved_sections_default_to_the_unit_preview() {
+        let preview = Preview {
+            lines: 9,
+            keep: PreviewKeep::Head,
+        };
+        let presentation = ResolvedPresentation {
+            disclosure: Disclosure::Expanded,
+            detail: Detail::Normal,
+            preview,
+            group: GroupSpec::none(),
+            reveal: DEFAULT_REVEAL.to_vec(),
+            placement: Placement::Inline,
+            container: None,
+            sections: BTreeMap::from([(
+                "arguments".to_owned(),
+                ResolvedSection {
+                    visible: false,
+                    ..ResolvedSection::defaults(preview)
+                },
+            )]),
+            header: None,
+            summary: SummarySpec::default(),
+            spacing: Spacing::default(),
+            indent: 0,
+            plugin: BTreeMap::new(),
+        };
+        assert_eq!(
+            presentation.section("output"),
+            ResolvedSection::defaults(preview)
+        );
+        assert!(presentation.part_visible("output"));
+        assert!(!presentation.part_visible("arguments"));
+    }
+
+    #[test]
+    fn duration_buckets_use_spec_names_and_boundaries() {
+        for (millis, bucket, name) in [
+            (0, DurationBucket::UnderOneSecond, "<1s"),
+            (999, DurationBucket::UnderOneSecond, "<1s"),
+            (1_000, DurationBucket::OneToTenSeconds, "1s..10s"),
+            (9_999, DurationBucket::OneToTenSeconds, "1s..10s"),
+            (10_000, DurationBucket::TenToSixtySeconds, "10s..60s"),
+            (60_000, DurationBucket::OverSixtySeconds, ">60s"),
+        ] {
+            assert_eq!(DurationBucket::of_millis(millis), bucket, "{millis}");
+            let matcher: FactMatcher = toml::from_str(&format!("duration = {name:?}")).unwrap();
+            assert_eq!(matcher.duration.0, [bucket]);
+        }
+    }
+
+    #[test]
+    fn target_duration_and_last_in_turn_facts_match() {
+        let mut facts = tool("read", UnitStatus::Succeeded);
+        let matcher: FactMatcher = toml::from_str(
+            "target = [\"src/lib.rs\", \"Cargo.toml\"]\nduration = \">60s\"\nlast_in_turn = true",
+        )
+        .unwrap();
+        assert!(!matcher.matches(&facts));
+        facts.target = Some("src/lib.rs".to_owned());
+        facts.duration = Some(DurationBucket::OverSixtySeconds);
+        facts.last_in_turn = Some(true);
+        assert!(matcher.matches(&facts));
+        facts.target = Some("src/lib".to_owned());
+        assert!(!matcher.matches(&facts));
+        facts.target = Some("Cargo.toml".to_owned());
+        facts.last_in_turn = Some(false);
+        assert!(!matcher.matches(&facts));
     }
 
     #[test]

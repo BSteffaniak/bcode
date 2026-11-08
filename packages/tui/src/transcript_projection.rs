@@ -80,7 +80,11 @@ fn transcript_item_rows(
     {
         return TranscriptLayoutRows::BlankSpan(usize::from(height.max(1)));
     }
-    let markdown = render::transcript_markdown_projection_for_layout(app, item, input.width);
+    let markdown = render::transcript_markdown_projection_for_layout(
+        app,
+        item,
+        render::transcript_item_body_width(item, input.width),
+    );
     let (rows, anchors, selection) = render::transcript_item_layout_with_keymap(
         item,
         input.width,
@@ -89,7 +93,8 @@ fn transcript_item_rows(
         markdown.as_deref(),
         app.effective_keymap(),
     );
-    if let Some(projection) = markdown
+    // A grouped item may render no rows; it then has no Markdown body.
+    if let Some(projection) = markdown.filter(|_| !rows.is_empty())
         && matches!(
             item.kind(),
             super::transcript::TranscriptItemKind::AssistantMessage
@@ -128,23 +133,23 @@ fn sync_layout(app: &mut BmuxApp, width: u16) {
     render::set_markdown_details_open(app.markdown_details_open());
     render::set_plugin_visual_theme(&app.presented_theme());
     app.refresh_structure_turns();
-    render::set_structure(app.structure_snapshot());
     let started = Instant::now();
     let elapsed_dirty_visuals =
         app.drain_elapsed_dirty_visuals_bounded(MAX_DIRTY_VISUALS_PER_LAYOUT_SYNC);
-    let transcript_dirty_items = app.drain_transcript_dirty_items();
+    let mut transcript_dirty_items = app.drain_transcript_dirty_items();
+    if record_cache_hit(app, width, started) {
+        return;
+    }
+    // Groups change only when the layout inputs do; items whose group role
+    // changed are laid out again alongside the source damage.
+    transcript_dirty_items.extend(app.sync_structure_groups());
+    render::set_structure(app.structure_snapshot());
     let mut transcript_layout = std::mem::take(app.transcript_layout_mut());
     let elapsed_only;
     {
         let input = TranscriptLayoutInput::from_app(app, width);
         let fingerprint = input.fingerprint();
         let structural_fingerprint = input.structural_fingerprint();
-        if transcript_layout.is_current(&fingerprint) {
-            transcript_layout
-                .record_cache_hit(u64::try_from(started.elapsed().as_micros()).unwrap_or(u64::MAX));
-            *app.transcript_layout_mut() = transcript_layout;
-            return;
-        }
         let mut dirty_visuals =
             input
                 .plugin_host
@@ -221,6 +226,21 @@ fn sync_layout(app: &mut BmuxApp, width: u16) {
     }
     transcript_layout.suppress_visual_content_changes(&elapsed_only);
     *app.transcript_layout_mut() = transcript_layout;
+}
+
+/// Record a cache hit and return `true` when the retained layout already
+/// represents the current inputs; groups and rows are then left untouched.
+fn record_cache_hit(app: &mut BmuxApp, width: u16, started: Instant) -> bool {
+    if !app
+        .transcript_layout()
+        .is_current(&TranscriptLayoutInput::from_app(app, width).fingerprint())
+    {
+        return false;
+    }
+    render::set_structure(app.structure_snapshot());
+    app.transcript_layout_mut()
+        .record_cache_hit(u64::try_from(started.elapsed().as_micros()).unwrap_or(u64::MAX));
+    true
 }
 
 struct TranscriptLayoutInput<'a> {

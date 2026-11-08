@@ -6399,6 +6399,9 @@ pub fn draw_chat_frame<W: Write>(
             let mut paint_background = |frame: &mut bmux_tui::paint::PaintCx<'_, '_>| {
                 if let Some(layout) = layout.filter(|_| !foreground_owns_canvas) {
                     render::render_prepared_damage(&mut chat.app, frame, layout, intersects);
+                    if intersects(layout.body) {
+                        paint_transcript_focus(&chat.app, layout.body, frame, theme.selection);
+                    }
                     let selection_scene =
                         super::root_program::transcript_selection_scene(&chat.app, layout.body());
                     for scope in selection_scene.scopes() {
@@ -6522,6 +6525,32 @@ pub fn draw_chat_frame<W: Write>(
         prepare_ms,
     );
     Ok((draw_stats, layout))
+}
+
+/// Paint the focused disclosure target's anchor row with the selection style.
+///
+/// The row comes from the retained layout anchor and the top row the
+/// transcript was painted with, clipped to the transcript `area`; nothing is
+/// painted while the row is scrolled out of view or the body is hidden.
+fn paint_transcript_focus(
+    app: &super::app::BmuxApp,
+    area: Rect,
+    frame: &mut bmux_tui::paint::PaintCx<'_, '_>,
+    style: bmux_tui::style::Style,
+) {
+    if app.queue_recovery.confirmation.is_some() {
+        return;
+    }
+    let Some(row) = app
+        .focused_disclosure_target()
+        .and_then(|target| app.disclosure_target_row(target))
+    else {
+        return;
+    };
+    let top_row = app.transcript_top_row(area.height);
+    if let Some(rect) = super::transcript_focus::row_rect(area, top_row, row) {
+        frame.restyle(bmux_tui::paint::LocalRect::terminal(rect), style);
+    }
 }
 
 fn paint_launch_dialogs(
@@ -6828,6 +6857,14 @@ fn draw_temporal_frame<W: Write>(
                 }
             } else {
                 render::render_prepared_damage(&mut chat.app, frame, layout, intersects);
+                if intersects(layout.body) {
+                    paint_transcript_focus(
+                        &chat.app,
+                        layout.body,
+                        frame,
+                        render::TuiTheme::for_app(&chat.app).selection,
+                    );
+                }
                 paint_interactive_surface(
                     loop_state,
                     loop_state.interactive_surface_geometry,

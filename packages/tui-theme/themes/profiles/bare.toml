@@ -14,13 +14,32 @@ separators = { status = "plain" }
 speaker    = "prefix"
 surfaces   = "flat"
 
+# Tools read as one line each; runs of tools fold into a summary group.
 [[presentation.rules]]
 match = { kind = "tool" }
 set   = { disclosure = "summary", detail = "minimal", parts = { timing = false } }
 
 [[presentation.rules]]
+match = { kind = "tool" }
+set = { group = { by = "consecutive" }, header = { fields = [
+    "marker",
+    "tool",
+    "target",
+    "status",
+] } }
+
+[[presentation.rules]]
 match = { kind = "tool", status = ["running", "waiting"] }
 set   = { disclosure = "expanded", preview = { lines = 6 } }
+
+[[presentation.rules]]
+match = { kind = "group" }
+set = { disclosure = "summary", header = { fields = [
+    "marker",
+    "count",
+    "tools",
+    "status",
+] } }
 
 [containers."transcript.user"]
 layout = "plain"

@@ -47,12 +47,12 @@ pub fn handle_non_permission_mouse(
         }
         MouseEventKind::Down(MouseButton::Left)
             if hit_id
-                .and_then(crate::render::disclosure_item_from_hit)
+                .and_then(crate::structure::DisclosureTarget::from_hit_id)
                 .is_some() =>
         {
             hit_id
-                .and_then(crate::render::disclosure_item_from_hit)
-                .is_some_and(|item_id| chat.app.toggle_item_disclosure(item_id))
+                .and_then(crate::structure::DisclosureTarget::from_hit_id)
+                .is_some_and(|target| chat.app.toggle_target(&target))
         }
         MouseEventKind::Down(MouseButton::Left) if hit_id == Some("composer") => {
             composer_mouse_changed(chat, mouse)

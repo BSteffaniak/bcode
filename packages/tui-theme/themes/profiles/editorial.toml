@@ -14,13 +14,29 @@ separators = { status = "plain" }
 speaker    = "gutter"
 surfaces   = "flat"
 
+# Prose first: tools fold into collapsed groups that reasoning does not interrupt.
 [[presentation.rules]]
 match = { kind = "tool" }
-set   = { disclosure = "collapsed", group = "consecutive_tools" }
+set = { disclosure = "collapsed", group = { by = "consecutive", bridge = [
+    "reasoning",
+] } }
+
+[[presentation.rules]]
+match = { kind = "tool" }
+set   = { header = { fields = ["marker", "tool", "target", "status"] } }
 
 [[presentation.rules]]
 match = { kind = "tool", status = ["running", "waiting"] }
 set   = { disclosure = "summary" }
+
+[[presentation.rules]]
+match = { kind = "group" }
+set = { disclosure = "collapsed", header = { fields = [
+    "marker",
+    "count",
+    "tools",
+    "status",
+] } }
 
 [containers."transcript.user"]
 layout    = "plain"

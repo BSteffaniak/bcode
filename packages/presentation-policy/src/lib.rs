@@ -8,11 +8,13 @@
 //! compile into a [`CompiledPolicy`]. Resolving a unit's [`UnitFacts`] yields a
 //! [`ResolvedPresentation`]; the [visibility floor](apply_visibility_floor)
 //! then guarantees that units awaiting a decision and failures stay visible no
-//! matter what untrusted theme layers request. [`group_units`] computes stable
-//! groups of consecutive units for every renderer alike.
+//! matter what untrusted theme layers request. [`Grouping`] computes stable
+//! groups of consecutive units for every renderer alike, and
+//! [`render_summary_template`] renders summary templates the same way
+//! everywhere.
 //!
-//! Resolution is pure and bounded: compilation indexes rules by unit kind so a
-//! unit evaluates only rules that can match it.
+//! Resolution is pure and bounded: compilation indexes rules by unit kind, then
+//! tool, so a unit evaluates only rules that can match it.
 
 pub mod grouping;
 
@@ -20,19 +22,34 @@ use std::collections::{BTreeMap, BTreeSet};
 
 pub use bcode_presentation_policy_models as models;
 use models::{
-    Detail, Disclosure, Grouping, LayerSource, MAX_PATCH_ENTRIES, MAX_PREVIEW_LINES,
-    MAX_RULES_PER_LAYER, Placement, PresentationRule, Preview, PreviewKeep, PropertyPatch,
-    ResolvedPresentation, RuleLayer, UnitFacts, UnitKind,
+    DEFAULT_REVEAL, Detail, Disclosure, FactMatcher, GROUP_HEADER_FIELDS, GroupSpec, HEADER_FIELDS,
+    HOST_SECTIONS, LayerSource, MAX_INDENT, MAX_PATCH_ENTRIES, MAX_PREVIEW_LINES,
+    MAX_RULES_PER_LAYER, MAX_SUMMARY_TEMPLATE_BYTES, Placement, PresentationRule, Preview,
+    PreviewKeep, PropertyPatch, ResolvedPresentation, ResolvedSection, RuleLayer, Spacing,
+    SummarySpec, TEMPLATE_FIELDS, UNIT_HEADER_FIELDS, UnitFacts, UnitKind, UnitStatus,
 };
 
-pub use grouping::{GroupingInput, UnitGroup, group_units};
+pub use grouping::{
+    GroupRole, Grouping, GroupingInput, MAX_BRIDGED_GAP, UnitGroup, group_units, is_revealed,
+};
+
+/// Largest rendered summary, in bytes; longer output is cut on a character
+/// boundary.
+pub const MAX_RENDERED_SUMMARY_BYTES: usize = 1024;
+
+/// Sections that describe the operation a pending decision is about; the
+/// floor keeps them visible and expanded on units awaiting a decision.
+pub const DECISION_SECTIONS: [&str; 3] = ["arguments", "metadata", "confirmation"];
+
+/// Sections the floor never hides on failed units.
+pub const FAILURE_SECTIONS: [&str; 2] = ["error", "output"];
 
 /// Default inline preview budget, in source lines.
 pub const DEFAULT_PREVIEW_LINES: u32 = 28;
 
 /// Host built-in property values applied before any layer.
 #[must_use]
-pub const fn host_defaults() -> ResolvedPresentation {
+pub fn host_defaults() -> ResolvedPresentation {
     ResolvedPresentation {
         disclosure: Disclosure::Expanded,
         detail: Detail::Normal,
@@ -40,10 +57,18 @@ pub const fn host_defaults() -> ResolvedPresentation {
             lines: DEFAULT_PREVIEW_LINES,
             keep: PreviewKeep::Tail,
         },
-        group: Grouping::None,
+        group: GroupSpec::none(),
+        reveal: DEFAULT_REVEAL.to_vec(),
         placement: Placement::Inline,
         container: None,
-        parts: BTreeMap::new(),
+        sections: BTreeMap::new(),
+        header: None,
+        summary: SummarySpec::default(),
+        spacing: Spacing {
+            before: 0,
+            after: 1,
+        },
+        indent: 0,
         plugin: BTreeMap::new(),
     }
 }
@@ -79,27 +104,22 @@ pub struct PolicyRegistry {
     pub properties: BTreeSet<String>,
     /// Registered plugin facts.
     pub facts: BTreeSet<String>,
-    /// Known part names; when empty, part names are not checked.
+    /// Known part and section names; when empty, names are not checked.
+    /// Namespaced names (containing a `.`) are never checked.
     pub parts: BTreeSet<String>,
 }
 
 impl PolicyRegistry {
-    /// Registry with the host's built-in part names.
+    /// Registry with the host's built-in section names, plus the legacy
+    /// `timing` part.
     #[must_use]
     pub fn with_host_parts() -> Self {
         Self {
-            parts: [
-                "arguments",
-                "output",
-                "result",
-                "timing",
-                "metadata",
-                "diff",
-                "artifact",
-            ]
-            .into_iter()
-            .map(str::to_owned)
-            .collect(),
+            parts: HOST_SECTIONS
+                .into_iter()
+                .chain(["timing"])
+                .map(str::to_owned)
+                .collect(),
             ..Self::default()
         }
     }
@@ -108,7 +128,8 @@ impl PolicyRegistry {
 /// Where a resolved property value came from.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PropertyOrigin {
-    /// Property name (`disclosure`, `parts.timing`, `bcode.shell.show_exit_code`, …).
+    /// Property name (`disclosure`, `sections.output.visible`,
+    /// `bcode.shell.show_exit_code`, …).
     pub property: String,
     /// Layer that set the final value.
     pub source: LayerSource,
@@ -134,16 +155,46 @@ struct CompiledRule {
     rule: PresentationRule,
 }
 
+/// Rule positions (into `CompiledPolicy::rules`) bucketed by tool condition.
+#[derive(Debug, Clone, Default)]
+struct ToolIndex {
+    /// Rules naming each tool, ascending.
+    by_tool: BTreeMap<String, Vec<usize>>,
+    /// Rules without a tool condition, ascending.
+    untooled: Vec<usize>,
+}
+
+impl ToolIndex {
+    fn insert(&mut self, position: usize, matcher: &FactMatcher) {
+        if matcher.tool.is_unset() {
+            self.untooled.push(position);
+        } else {
+            let tools: BTreeSet<&String> = matcher.tool.0.iter().collect();
+            for tool in tools {
+                self.by_tool.entry(tool.clone()).or_default().push(position);
+            }
+        }
+    }
+
+    /// Positions that can match a unit with `tool`, ascending.
+    fn candidates<'a>(&'a self, tool: Option<&str>) -> impl Iterator<Item = usize> + 'a {
+        let tooled = tool
+            .and_then(|tool| self.by_tool.get(tool))
+            .map_or(&[][..], Vec::as_slice);
+        merge_sorted(tooled.iter().copied(), self.untooled.iter().copied())
+    }
+}
+
 /// Layers compiled for fast, deterministic resolution.
 ///
 /// The default value is identical to compiling no layers.
 #[derive(Debug, Clone)]
 pub struct CompiledPolicy {
     rules: Vec<CompiledRule>,
-    /// Rule positions (into `rules`) that can match each kind, ascending.
-    by_kind: BTreeMap<UnitKind, Vec<usize>>,
-    /// Positions of rules without a kind condition, ascending.
-    unkinded: Vec<usize>,
+    /// Rules that can match each kind, by tool.
+    by_kind: BTreeMap<UnitKind, ToolIndex>,
+    /// Rules without a kind condition, by tool.
+    unkinded: ToolIndex,
     fingerprint: u64,
 }
 
@@ -152,7 +203,7 @@ impl Default for CompiledPolicy {
         Self {
             rules: Vec::new(),
             by_kind: BTreeMap::new(),
-            unkinded: Vec::new(),
+            unkinded: ToolIndex::default(),
             fingerprint: fingerprint(&[]),
         }
     }
@@ -208,11 +259,15 @@ impl CompiledPolicy {
                 }
                 let position = compiled.rules.len();
                 if rule.matcher.kind.is_unset() {
-                    compiled.unkinded.push(position);
+                    compiled.unkinded.insert(position, &rule.matcher);
                 } else {
                     let kinds: BTreeSet<UnitKind> = rule.matcher.kind.0.iter().copied().collect();
                     for kind in kinds {
-                        compiled.by_kind.entry(kind).or_default().push(position);
+                        compiled
+                            .by_kind
+                            .entry(kind)
+                            .or_default()
+                            .insert(position, &rule.matcher);
                     }
                 }
                 compiled.rules.push(CompiledRule {
@@ -257,11 +312,13 @@ impl CompiledPolicy {
 
     /// Matching rules for `facts`, in application order.
     fn matching<'a>(&'a self, facts: &'a UnitFacts) -> impl Iterator<Item = &'a CompiledRule> {
+        let tool = facts.tool.as_deref();
         let kinded = facts
             .kind
             .and_then(|kind| self.by_kind.get(&kind))
-            .map_or(&[][..], Vec::as_slice);
-        merge_sorted(kinded, &self.unkinded)
+            .into_iter()
+            .flat_map(move |index| index.candidates(tool));
+        merge_sorted(kinded, self.unkinded.candidates(tool))
             .map(|position| &self.rules[position])
             .filter(|compiled| compiled.rule.matcher.matches(facts))
     }
@@ -297,7 +354,16 @@ impl CompiledPolicy {
             patch.merge(&compiled.rule.set);
         }
         let mut presentation = apply_patch(host_defaults(), patch);
-        let floor = apply_visibility_floor(&mut presentation, facts);
+        let floor = floor_adjustments(&mut presentation, facts)
+            .into_iter()
+            .map(|adjustment| match origins.get(&adjustment.property) {
+                Some(origin) => format!(
+                    "{} (overrides rule {} in layer {:?})",
+                    adjustment.note, origin.rule, origin.source
+                ),
+                None => adjustment.note,
+            })
+            .collect();
         ExplainedPresentation {
             presentation,
             origins: origins.into_values().collect(),
@@ -306,11 +372,25 @@ impl CompiledPolicy {
     }
 }
 
+/// Whether `facts` describe a failed, timed-out, or errored unit.
+#[must_use]
+pub const fn unit_failed(facts: &UnitFacts) -> bool {
+    facts.is_error
+        || matches!(
+            facts.status,
+            Some(UnitStatus::Failed | UnitStatus::TimedOut)
+        )
+}
+
 /// Raise `presentation` to the host visibility floor; returns a note for each adjustment.
 ///
 /// * Units awaiting a user decision are always expanded, with at least normal
-///   detail and their arguments and metadata visible.
-/// * Failed or errored units are never shown below summary.
+///   detail and their [`DECISION_SECTIONS`] visible and expanded.
+/// * Failed or errored units are never shown below summary, and their
+///   [`FAILURE_SECTIONS`] are never hidden.
+/// * Group units are never hidden; their failed and awaiting members are
+///   revealed instead (see [`UnitGroup::revealed_members`]), so a failed member
+///   does not raise the group itself.
 ///
 /// Count markers for hidden units are the renderer's responsibility, driven by
 /// [`Disclosure::Hidden`].
@@ -318,43 +398,110 @@ pub fn apply_visibility_floor(
     presentation: &mut ResolvedPresentation,
     facts: &UnitFacts,
 ) -> Vec<String> {
-    let mut notes = Vec::new();
+    floor_adjustments(presentation, facts)
+        .into_iter()
+        .map(|adjustment| adjustment.note)
+        .collect()
+}
+
+/// One visibility-floor adjustment and the property it overrode.
+struct FloorAdjustment {
+    /// Property name as reported by `explain` origins.
+    property: String,
+    note: String,
+}
+
+fn floor_adjustments(
+    presentation: &mut ResolvedPresentation,
+    facts: &UnitFacts,
+) -> Vec<FloorAdjustment> {
+    let mut adjustments = Vec::new();
+    let mut adjust = |property: String, note: String| {
+        adjustments.push(FloorAdjustment { property, note });
+    };
+    if facts.kind == Some(UnitKind::Group) {
+        if presentation.disclosure == Disclosure::Hidden {
+            adjust(
+                "disclosure".to_owned(),
+                "group: disclosure raised from Hidden to Collapsed".to_owned(),
+            );
+            presentation.disclosure = Disclosure::Collapsed;
+        }
+        return adjustments;
+    }
     if facts.awaiting_decision {
         if presentation.disclosure != Disclosure::Expanded {
-            notes.push(format!(
-                "awaiting a decision: disclosure raised from {:?} to Expanded",
-                presentation.disclosure
-            ));
+            adjust(
+                "disclosure".to_owned(),
+                format!(
+                    "awaiting a decision: disclosure raised from {:?} to Expanded",
+                    presentation.disclosure
+                ),
+            );
             presentation.disclosure = Disclosure::Expanded;
         }
         if presentation.detail == Detail::Minimal {
-            notes.push("awaiting a decision: detail raised from Minimal to Normal".to_owned());
+            adjust(
+                "detail".to_owned(),
+                "awaiting a decision: detail raised from Minimal to Normal".to_owned(),
+            );
             presentation.detail = Detail::Normal;
         }
-        for part in ["arguments", "metadata"] {
-            if presentation.parts.remove(part) == Some(false) {
-                notes.push(format!("awaiting a decision: part {part} kept visible"));
+        for name in DECISION_SECTIONS {
+            let Some(section) = presentation.sections.get_mut(name) else {
+                continue;
+            };
+            if !section.visible || section.disclosure != Disclosure::Expanded {
+                let field = if section.visible {
+                    "disclosure"
+                } else {
+                    "visible"
+                };
+                adjust(
+                    format!("sections.{name}.{field}"),
+                    format!("awaiting a decision: section {name} kept visible and expanded"),
+                );
+                section.visible = true;
+                section.disclosure = Disclosure::Expanded;
             }
         }
     }
-    let failed = facts.is_error
-        || matches!(
-            facts.status,
-            Some(models::UnitStatus::Failed | models::UnitStatus::TimedOut)
-        );
-    if failed
-        && matches!(
+    if unit_failed(facts) {
+        if matches!(
             presentation.disclosure,
             Disclosure::Collapsed | Disclosure::Hidden
-        )
-    {
-        notes.push(format!(
-            "failed: disclosure raised from {:?} to Summary",
-            presentation.disclosure
-        ));
-        presentation.disclosure = Disclosure::Summary;
+        ) {
+            adjust(
+                "disclosure".to_owned(),
+                format!(
+                    "failed: disclosure raised from {:?} to Summary",
+                    presentation.disclosure
+                ),
+            );
+            presentation.disclosure = Disclosure::Summary;
+        }
+        for name in FAILURE_SECTIONS {
+            let Some(section) = presentation.sections.get_mut(name) else {
+                continue;
+            };
+            if !section.visible || section.disclosure == Disclosure::Hidden {
+                let field = if section.visible {
+                    "disclosure"
+                } else {
+                    "visible"
+                };
+                adjust(
+                    format!("sections.{name}.{field}"),
+                    format!("failed: section {name} kept visible"),
+                );
+                section.visible = true;
+                if section.disclosure == Disclosure::Hidden {
+                    section.disclosure = Disclosure::Collapsed;
+                }
+            }
+        }
     }
-    notes
+    adjustments
 }
 
 fn apply_patch(
@@ -370,8 +517,18 @@ fn apply_patch(
     if let Some(preview) = patch.preview {
         presentation.preview = preview;
     }
+    for (name, section) in patch.section_patches() {
+        presentation
+            .sections
+            .entry(name.to_owned())
+            .or_insert_with(|| ResolvedSection::defaults(presentation.preview))
+            .apply(&section);
+    }
     if let Some(group) = patch.group {
         presentation.group = group;
+    }
+    if let Some(reveal) = patch.reveal {
+        presentation.reveal = reveal;
     }
     if let Some(placement) = patch.placement {
         presentation.placement = placement;
@@ -379,9 +536,34 @@ fn apply_patch(
     if patch.container.is_some() {
         presentation.container = patch.container;
     }
-    presentation.parts.extend(patch.parts);
+    if patch.header.is_some() {
+        presentation.header = patch.header;
+    }
+    if let Some(mut summary) = patch.summary {
+        if let Some(template) = &mut summary.template {
+            truncate_to_boundary(template, MAX_SUMMARY_TEMPLATE_BYTES);
+        }
+        presentation.summary = summary;
+    }
+    if let Some(spacing) = patch.spacing {
+        presentation.spacing = spacing.clamped();
+    }
+    if let Some(indent) = patch.indent {
+        presentation.indent = indent.min(MAX_INDENT);
+    }
     presentation.plugin.extend(patch.plugin);
     presentation
+}
+
+/// Truncate `text` to at most `max` bytes on a character boundary.
+fn truncate_to_boundary(text: &mut String, max: usize) {
+    if text.len() > max {
+        let mut end = max;
+        while !text.is_char_boundary(end) {
+            end -= 1;
+        }
+        text.truncate(end);
+    }
 }
 
 fn invalid_rule(rule: &PresentationRule, source: &LayerSource) -> Option<String> {
@@ -404,7 +586,26 @@ fn invalid_rule(rule: &PresentationRule, source: &LayerSource) -> Option<String>
     {
         return Some(format!("preview exceeds {MAX_PREVIEW_LINES} lines"));
     }
-    if set.parts.len() > MAX_PATCH_ENTRIES || set.plugin.len() > MAX_PATCH_ENTRIES {
+    if set
+        .sections
+        .values()
+        .filter_map(|section| section.preview)
+        .any(|preview| preview.lines > MAX_PREVIEW_LINES)
+    {
+        return Some(format!("section preview exceeds {MAX_PREVIEW_LINES} lines"));
+    }
+    let lists = [
+        set.parts.len(),
+        set.sections.len(),
+        set.plugin.len(),
+        set.header.as_ref().map_or(0, |header| header.fields.len()),
+        set.summary
+            .as_ref()
+            .map_or(0, |summary| summary.source.len()),
+        set.group.as_ref().map_or(0, |group| group.bridge.len()),
+        set.reveal.as_ref().map_or(0, Vec::len),
+    ];
+    if lists.into_iter().any(|len| len > MAX_PATCH_ENTRIES) {
         return Some(format!("set has more than {MAX_PATCH_ENTRIES} entries"));
     }
     if rule.matcher.plugin.len() > models::MAX_PLUGIN_FACTS {
@@ -433,15 +634,208 @@ fn suspicious_rule(rule: &PresentationRule, registry: &PolicyRegistry) -> Vec<St
     }
     if !registry.parts.is_empty() {
         for key in rule.set.parts.keys() {
-            if !registry.parts.contains(key) {
+            if !key.contains('.') && !registry.parts.contains(key) {
                 warnings.push(format!("unknown part {key:?}"));
             }
         }
+        for key in rule.set.sections.keys() {
+            if !key.contains('.') && !registry.parts.contains(key) {
+                warnings.push(format!("unknown section {key:?}"));
+            }
+        }
+    }
+    if let Some(header) = &rule.set.header {
+        let kinds = &rule.matcher.kind.0;
+        let groups_only = !kinds.is_empty() && kinds.iter().all(|kind| *kind == UnitKind::Group);
+        let units_only = !kinds.is_empty() && !kinds.contains(&UnitKind::Group);
+        for field in &header.fields {
+            let field = field.as_str();
+            if !HEADER_FIELDS.contains(&field) {
+                warnings.push(format!("unknown header field {field:?}"));
+            } else if groups_only && !GROUP_HEADER_FIELDS.contains(&field) {
+                warnings.push(format!(
+                    "header field {field:?} does not apply to group units"
+                ));
+            } else if units_only && !UNIT_HEADER_FIELDS.contains(&field) {
+                warnings.push(format!(
+                    "header field {field:?} applies only to group units"
+                ));
+            }
+        }
+    }
+    if let Some(template) = rule
+        .set
+        .summary
+        .as_ref()
+        .and_then(|summary| summary.template.as_deref())
+    {
+        if template.len() > MAX_SUMMARY_TEMPLATE_BYTES {
+            warnings.push(format!(
+                "summary template exceeds {MAX_SUMMARY_TEMPLATE_BYTES} bytes and is truncated"
+            ));
+        }
+        for token in template_tokens(template) {
+            if let TemplateToken::Field(name) = token
+                && !TEMPLATE_FIELDS.contains(&name)
+            {
+                warnings.push(format!("unknown summary template field {name:?}"));
+            }
+        }
+    }
+    warnings.extend(floor_crossings(rule));
+    if rule
+        .set
+        .spacing
+        .is_some_and(|spacing| spacing != spacing.clamped())
+    {
+        warnings.push(format!("spacing is clamped to {}", models::MAX_SPACING));
+    }
+    if rule.set.indent.is_some_and(|indent| indent > MAX_INDENT) {
+        warnings.push(format!("indent is clamped to {MAX_INDENT}"));
     }
     if rule.set.is_empty() {
         warnings.push("rule sets no properties".to_owned());
     }
     warnings
+}
+
+/// Warnings for patches the visibility floor will partly undo.
+///
+/// Only rules that explicitly target the protected units are reported; a rule
+/// that matches every unit is not, since the floor affects only some of them.
+fn floor_crossings(rule: &PresentationRule) -> Vec<String> {
+    let mut warnings = Vec::new();
+    let matcher = &rule.matcher;
+    let set = &rule.set;
+    if matcher.kind.0.contains(&UnitKind::Group) && set.disclosure == Some(Disclosure::Hidden) {
+        warnings
+            .push("rule hides group units; the visibility floor keeps groups collapsed".to_owned());
+    }
+    let targets_failures = matcher.is_error == Some(true)
+        || (!matcher.status.is_unset()
+            && matcher
+                .status
+                .0
+                .iter()
+                .all(|status| matches!(status, UnitStatus::Failed | UnitStatus::TimedOut)));
+    if !targets_failures {
+        return warnings;
+    }
+    if matches!(
+        set.disclosure,
+        Some(Disclosure::Collapsed | Disclosure::Hidden)
+    ) {
+        warnings.push(
+            "rule collapses failed units; the visibility floor keeps them at summary".to_owned(),
+        );
+    }
+    for (name, section) in set.section_patches() {
+        if FAILURE_SECTIONS.contains(&name)
+            && (section.visible == Some(false) || section.disclosure == Some(Disclosure::Hidden))
+        {
+            warnings.push(format!(
+                "rule hides section {name} of failed units; the visibility floor keeps it visible"
+            ));
+        }
+    }
+    warnings
+}
+
+/// Longest placeholder name recognized in a summary template.
+const MAX_TEMPLATE_FIELD_NAME: usize = 32;
+
+/// One piece of a summary template.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TemplateToken<'a> {
+    /// Text copied as is.
+    Literal(&'a str),
+    /// A `{name}` placeholder.
+    Field(&'a str),
+}
+
+/// Split a summary template into literals and `{name}` placeholders.
+///
+/// A placeholder name is 1 to 32 ASCII letters, digits, or underscores; any
+/// other brace is literal text.
+fn template_tokens(template: &str) -> impl Iterator<Item = TemplateToken<'_>> {
+    let mut rest = template;
+    std::iter::from_fn(move || {
+        if rest.is_empty() {
+            return None;
+        }
+        if let Some(after) = rest.strip_prefix('{') {
+            if let Some(end) = after.find('}') {
+                let name = &after[..end];
+                let valid = (1..=MAX_TEMPLATE_FIELD_NAME).contains(&name.len())
+                    && name
+                        .bytes()
+                        .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_');
+                if valid {
+                    rest = &after[end + 1..];
+                    return Some(TemplateToken::Field(name));
+                }
+            }
+            let (brace, after) = rest.split_at(1);
+            rest = after;
+            return Some(TemplateToken::Literal(brace));
+        }
+        let end = rest.find('{').unwrap_or(rest.len());
+        let (literal, after) = rest.split_at(end);
+        rest = after;
+        Some(TemplateToken::Literal(literal))
+    })
+}
+
+/// Append `text` to `out` with control characters as spaces; returns `false`
+/// once `out` reached [`MAX_RENDERED_SUMMARY_BYTES`].
+fn push_single_line(out: &mut String, text: &str) -> bool {
+    for character in text.chars() {
+        let character = if character.is_control() {
+            ' '
+        } else {
+            character
+        };
+        if out.len() + character.len_utf8() > MAX_RENDERED_SUMMARY_BYTES {
+            return false;
+        }
+        out.push(character);
+    }
+    true
+}
+
+/// Render a summary `template`, substituting `{name}` placeholders.
+///
+/// Only registered names ([`TEMPLATE_FIELDS`]) substitute; unregistered names
+/// and names for which `lookup` returns `None` render empty. The result is a
+/// single line: line breaks and other control characters become spaces, and
+/// surrounding whitespace is trimmed. Work is bounded: at most
+/// [`MAX_SUMMARY_TEMPLATE_BYTES`] of the template are read and the output is
+/// cut to [`MAX_RENDERED_SUMMARY_BYTES`] on a character boundary.
+#[must_use]
+pub fn render_summary_template(template: &str, lookup: &dyn Fn(&str) -> Option<String>) -> String {
+    let mut end = template.len().min(MAX_SUMMARY_TEMPLATE_BYTES);
+    while !template.is_char_boundary(end) {
+        end -= 1;
+    }
+    let mut out = String::new();
+    for token in template_tokens(&template[..end]) {
+        let complete = match token {
+            TemplateToken::Literal(text) => push_single_line(&mut out, text),
+            TemplateToken::Field(name) => {
+                !TEMPLATE_FIELDS.contains(&name)
+                    || lookup(name).is_none_or(|value| push_single_line(&mut out, &value))
+            }
+        };
+        if !complete {
+            break;
+        }
+    }
+    let trimmed = out.trim();
+    if trimmed.len() == out.len() {
+        out
+    } else {
+        trimmed.to_owned()
+    }
 }
 
 fn set_properties(patch: &PropertyPatch) -> Vec<String> {
@@ -451,22 +845,40 @@ fn set_properties(patch: &PropertyPatch) -> Vec<String> {
         (patch.detail.is_some(), "detail"),
         (patch.preview.is_some(), "preview"),
         (patch.group.is_some(), "group"),
+        (patch.reveal.is_some(), "reveal"),
         (patch.placement.is_some(), "placement"),
         (patch.container.is_some(), "container"),
+        (patch.header.is_some(), "header"),
+        (patch.summary.is_some(), "summary"),
+        (patch.spacing.is_some(), "spacing"),
+        (patch.indent.is_some(), "indent"),
     ] {
         if set {
             properties.push(name.to_owned());
         }
     }
-    properties.extend(patch.parts.keys().map(|part| format!("parts.{part}")));
+    for (name, section) in patch.section_patches() {
+        for (set, field) in [
+            (section.visible.is_some(), "visible"),
+            (section.disclosure.is_some(), "disclosure"),
+            (section.preview.is_some(), "preview"),
+        ] {
+            if set {
+                properties.push(format!("sections.{name}.{field}"));
+            }
+        }
+    }
     properties.extend(patch.plugin.keys().cloned());
     properties
 }
 
-/// Merge two ascending position lists into one ascending sequence.
-fn merge_sorted<'a>(left: &'a [usize], right: &'a [usize]) -> impl Iterator<Item = usize> + 'a {
-    let mut left = left.iter().copied().peekable();
-    let mut right = right.iter().copied().peekable();
+/// Merge two ascending, disjoint position sequences into one ascending sequence.
+fn merge_sorted(
+    left: impl Iterator<Item = usize>,
+    right: impl Iterator<Item = usize>,
+) -> impl Iterator<Item = usize> {
+    let mut left = left.peekable();
+    let mut right = right.peekable();
     std::iter::from_fn(move || match (left.peek(), right.peek()) {
         (Some(a), Some(b)) if a <= b => left.next(),
         (_, Some(_)) => right.next(),
@@ -728,6 +1140,188 @@ mod tests {
     }
 
     #[test]
+    fn v2_properties_resolve_with_defaults_clamps_and_per_field_sections() {
+        let (policy, diagnostics) = CompiledPolicy::compile(
+            &[layer(
+                LayerSource::Theme("v2".into()),
+                r#"
+                    [[rules]]
+                    match = { kind = "tool" }
+                    set = { preview = { lines = 5 }, sections = { output = { disclosure = "collapsed" }, arguments = { visible = false } }, spacing = { before = 9, after = 0 }, indent = 30, summary = { template = "{tool}" } }
+
+                    [[rules]]
+                    match = { tool = "read" }
+                    set = { parts = { arguments = true }, sections = { output = { preview = { lines = 2 } } }, header = { fields = ["marker", "tool"] }, group = "consecutive_same_tool", reveal = ["failed"] }
+                    "#,
+            )],
+            &PolicyRegistry::with_host_parts(),
+        );
+        let warnings: Vec<_> = diagnostics
+            .iter()
+            .map(|diagnostic| diagnostic.message.as_str())
+            .collect();
+        assert_eq!(
+            warnings,
+            ["spacing is clamped to 2", "indent is clamped to 8"]
+        );
+
+        let defaults = policy.resolve(&UnitFacts {
+            kind: Some(UnitKind::Reasoning),
+            ..UnitFacts::default()
+        });
+        assert_eq!(defaults, host_defaults());
+        assert_eq!(defaults.spacing, Spacing::default());
+        assert_eq!(defaults.reveal, models::DEFAULT_REVEAL);
+        assert_eq!(
+            defaults.section("output"),
+            ResolvedSection::defaults(defaults.preview)
+        );
+
+        let read = policy.resolve(&tool("read", UnitStatus::Succeeded));
+        let output = read.section("output");
+        assert_eq!(output.disclosure, Disclosure::Collapsed);
+        assert_eq!(output.preview.lines, 2);
+        assert!(output.visible);
+        assert!(read.part_visible("arguments"));
+        assert_eq!(read.section("result").preview.lines, 5);
+        assert_eq!(
+            read.spacing,
+            Spacing {
+                before: 2,
+                after: 0
+            }
+        );
+        assert_eq!(read.indent, 8);
+        assert_eq!(read.header.as_ref().map(|h| h.fields.len()), Some(2));
+        assert_eq!(read.group, GroupSpec::new(models::GroupBy::SameTool));
+        assert_eq!(read.reveal, [UnitStatus::Failed]);
+
+        let bash = policy.resolve(&tool("bash", UnitStatus::Succeeded));
+        assert!(!bash.part_visible("arguments"));
+        assert_eq!(bash.section("output").preview.lines, 5);
+        assert_eq!(bash.header, None);
+        assert_eq!(bash.summary.template.as_deref(), Some("{tool}"));
+    }
+
+    #[test]
+    fn summary_templates_are_truncated_on_character_boundaries() {
+        let template = "é".repeat(200);
+        let (policy, diagnostics) = CompiledPolicy::compile(
+            &[layer(
+                LayerSource::Config,
+                &format!("[[rules]]\nset = {{ summary = {{ template = {template:?} }} }}"),
+            )],
+            &PolicyRegistry::default(),
+        );
+        assert_eq!(diagnostics.len(), 1, "{diagnostics:?}");
+        let resolved = policy.resolve(&tool("x", UnitStatus::Running));
+        let truncated = resolved.summary.template.unwrap();
+        assert_eq!(truncated.len(), MAX_SUMMARY_TEMPLATE_BYTES);
+        assert!(template.starts_with(&truncated));
+    }
+
+    #[test]
+    fn v2_diagnostics_warn_on_unknown_names_and_drop_oversized_sections() {
+        let (policy, diagnostics) = CompiledPolicy::compile(
+            &[layer(
+                LayerSource::Config,
+                r#"
+                [[rules]]
+                set = { sections = { ouptut = { visible = false }, "bcode.git.files" = { visible = false } }, header = { fields = ["marker", "colour"] }, summary = { template = "{tool} {nope}" } }
+
+                [[rules]]
+                set = { sections = { output = { preview = { lines = 999999 } } } }
+                "#,
+            )],
+            &PolicyRegistry::with_host_parts(),
+        );
+        let messages: Vec<_> = diagnostics
+            .iter()
+            .map(|diagnostic| (diagnostic.severity, diagnostic.message.as_str()))
+            .collect();
+        assert_eq!(
+            messages,
+            [
+                (DiagnosticSeverity::Warning, "unknown section \"ouptut\""),
+                (
+                    DiagnosticSeverity::Warning,
+                    "unknown header field \"colour\""
+                ),
+                (
+                    DiagnosticSeverity::Warning,
+                    "unknown summary template field \"nope\""
+                ),
+                (
+                    DiagnosticSeverity::Error,
+                    "section preview exceeds 10000 lines"
+                ),
+            ]
+        );
+        assert_eq!(policy.len(), 1);
+    }
+
+    #[test]
+    fn floor_keeps_decision_sections_visible_and_expanded() {
+        let (policy, _) = CompiledPolicy::compile(
+            &[layer(
+                LayerSource::Theme("repo".into()),
+                "[[rules]]\nset = { sections = { arguments = { disclosure = \"collapsed\" }, metadata = { visible = false }, output = { visible = false } } }",
+            )],
+            &PolicyRegistry::with_host_parts(),
+        );
+        let permission = UnitFacts {
+            kind: Some(UnitKind::Permission),
+            awaiting_decision: true,
+            ..UnitFacts::default()
+        };
+        let explained = policy.explain(&permission);
+        for name in ["arguments", "metadata"] {
+            let section = explained.presentation.section(name);
+            assert!(section.visible, "{name}");
+            assert_eq!(section.disclosure, Disclosure::Expanded, "{name}");
+        }
+        assert!(!explained.presentation.part_visible("output"));
+        assert_eq!(explained.floor.len(), 2, "{:?}", explained.floor);
+    }
+
+    #[test]
+    fn explain_reports_v2_properties_per_section_field() {
+        let (policy, _) = CompiledPolicy::compile(
+            &[
+                layer(
+                    LayerSource::Theme("t".into()),
+                    "[[rules]]\nset = { parts = { output = false }, indent = 2, reveal = [\"running\"] }",
+                ),
+                layer(
+                    LayerSource::Config,
+                    "[[rules]]\nset = { sections = { output = { disclosure = \"summary\" } }, header = { fields = [] }, summary = {}, spacing = {}, group = \"consecutive_tools\" }",
+                ),
+            ],
+            &PolicyRegistry::default(),
+        );
+        let explained = policy.explain(&tool("read", UnitStatus::Succeeded));
+        let sources: BTreeMap<_, _> = explained
+            .origins
+            .iter()
+            .map(|origin| (origin.property.as_str(), origin.source.clone()))
+            .collect();
+        let theme = LayerSource::Theme("t".into());
+        assert_eq!(
+            sources,
+            BTreeMap::from([
+                ("group", LayerSource::Config),
+                ("header", LayerSource::Config),
+                ("indent", theme.clone()),
+                ("reveal", theme.clone()),
+                ("sections.output.disclosure", LayerSource::Config),
+                ("sections.output.visible", theme),
+                ("spacing", LayerSource::Config),
+                ("summary", LayerSource::Config),
+            ])
+        );
+    }
+
+    #[test]
     fn default_policy_equals_compiling_no_layers() {
         let (empty, diagnostics) = CompiledPolicy::compile(&[], &PolicyRegistry::default());
         assert_eq!(diagnostics, Vec::new());
@@ -747,5 +1341,298 @@ mod tests {
         let a = compile("[[rules]]\nset = { detail = \"minimal\" }");
         assert_eq!(a, compile("[[rules]]\nset = { detail = \"minimal\" }"));
         assert_ne!(a, compile("[[rules]]\nset = { detail = \"verbose\" }"));
+        let variants = [
+            "set = { group = { by = \"turn\" } }",
+            "set = { group = { by = \"turn\", min = 3 } }",
+            "set = { group = { by = \"turn\", bridge = [] } }",
+            "set = { reveal = [\"failed\"] }",
+            "set = { sections = { output = { visible = false } } }",
+            "set = { sections = { output = { disclosure = \"collapsed\" } } }",
+            "set = { header = { fields = [\"tool\"] } }",
+            "set = { summary = { template = \"{tool}\" } }",
+            "set = { spacing = { before = 1 } }",
+            "set = { indent = 1 }",
+            "match = { target = \"a\" }\nset = { indent = 1 }",
+            "match = { duration = \"<1s\" }\nset = { indent = 1 }",
+            "match = { last_in_turn = true }\nset = { indent = 1 }",
+        ];
+        let fingerprints: BTreeSet<u64> = variants
+            .iter()
+            .map(|rule| compile(&format!("[[rules]]\n{rule}")))
+            .chain([a])
+            .collect();
+        assert_eq!(fingerprints.len(), variants.len() + 1);
+    }
+
+    fn group(tool: Option<&str>) -> UnitFacts {
+        UnitFacts {
+            kind: Some(UnitKind::Group),
+            tool: tool.map(str::to_owned),
+            ..UnitFacts::default()
+        }
+    }
+
+    #[test]
+    fn kind_and_tool_index_matches_only_applicable_rules_in_order() {
+        let (policy, _) = CompiledPolicy::compile(
+            &[layer(
+                LayerSource::Config,
+                r#"
+                [[rules]]
+                match = { kind = "group" }
+                set = { disclosure = "collapsed", indent = 1 }
+
+                [[rules]]
+                match = { kind = "group", tool = ["read", "read"] }
+                set = { disclosure = "summary" }
+
+                [[rules]]
+                match = { tool = "read" }
+                set = { indent = 3 }
+
+                [[rules]]
+                match = { kind = ["tool", "group"], tool = "grep" }
+                set = { detail = "verbose" }
+
+                [[rules]]
+                match = { kind = "tool" }
+                set = { indent = 4 }
+                "#,
+            )],
+            &PolicyRegistry::default(),
+        );
+        let read_group = policy.resolve(&group(Some("read")));
+        assert_eq!(read_group.disclosure, Disclosure::Summary);
+        assert_eq!(read_group.indent, 3);
+        let mixed_group = policy.resolve(&group(None));
+        assert_eq!(mixed_group.disclosure, Disclosure::Collapsed);
+        assert_eq!(mixed_group.indent, 1);
+        assert_eq!(policy.resolve(&group(Some("grep"))).detail, Detail::Verbose);
+        let read_tool = policy.resolve(&tool("read", UnitStatus::Succeeded));
+        assert_eq!(read_tool.disclosure, Disclosure::Expanded);
+        assert_eq!(read_tool.indent, 4);
+        assert_eq!(
+            policy.resolve(&tool("grep", UnitStatus::Succeeded)).detail,
+            Detail::Verbose
+        );
+        let explained = policy.explain(&group(Some("read")));
+        let rules: Vec<_> = explained.origins.iter().map(|origin| origin.rule).collect();
+        assert_eq!(rules, [1, 2], "disclosure from rule 1, indent from rule 2");
+    }
+
+    #[test]
+    fn groups_are_never_hidden_and_failed_members_do_not_raise_them() {
+        let (policy, diagnostics) = CompiledPolicy::compile(
+            &[layer(
+                LayerSource::Theme("repo".into()),
+                "[[rules]]\nmatch = { kind = \"group\" }\nset = { disclosure = \"hidden\" }",
+            )],
+            &PolicyRegistry::default(),
+        );
+        assert_eq!(
+            diagnostics
+                .iter()
+                .map(|diagnostic| diagnostic.message.as_str())
+                .collect::<Vec<_>>(),
+            ["rule hides group units; the visibility floor keeps groups collapsed"]
+        );
+        let mut failed_group = group(None);
+        failed_group.is_error = true;
+        failed_group.status = Some(UnitStatus::Failed);
+        let explained = policy.explain(&failed_group);
+        assert_eq!(explained.presentation.disclosure, Disclosure::Collapsed);
+        assert_eq!(
+            explained.floor,
+            [
+                "group: disclosure raised from Hidden to Collapsed (overrides rule 0 in layer Theme(\"repo\"))"
+            ]
+        );
+    }
+
+    #[test]
+    fn floor_keeps_failure_sections_visible_and_names_the_rule() {
+        let (policy, diagnostics) = CompiledPolicy::compile(
+            &[
+                layer(
+                    LayerSource::Theme("repo".into()),
+                    "[[rules]]\nset = { sections = { error = { visible = false }, output = { disclosure = \"hidden\" }, diff = { visible = false } } }",
+                ),
+                layer(
+                    LayerSource::Config,
+                    "[[rules]]\nmatch = { status = [\"failed\", \"timed_out\"] }\nset = { disclosure = \"collapsed\", parts = { output = false } }",
+                ),
+            ],
+            &PolicyRegistry::with_host_parts(),
+        );
+        let warnings: Vec<_> = diagnostics
+            .iter()
+            .map(|diagnostic| (diagnostic.source.clone(), diagnostic.message.as_str()))
+            .collect();
+        assert_eq!(
+            warnings,
+            [
+                (
+                    LayerSource::Config,
+                    "rule collapses failed units; the visibility floor keeps them at summary"
+                ),
+                (
+                    LayerSource::Config,
+                    "rule hides section output of failed units; the visibility floor keeps it visible"
+                ),
+            ]
+        );
+        let explained = policy.explain(&tool("bash", UnitStatus::TimedOut));
+        let presentation = &explained.presentation;
+        assert_eq!(presentation.disclosure, Disclosure::Summary);
+        assert!(presentation.section("error").visible);
+        let output = presentation.section("output");
+        assert!(output.visible);
+        assert_eq!(output.disclosure, Disclosure::Collapsed);
+        assert!(
+            !presentation.part_visible("diff"),
+            "other sections may hide"
+        );
+        assert_eq!(
+            explained.floor,
+            [
+                "failed: disclosure raised from Collapsed to Summary (overrides rule 0 in layer Config)",
+                "failed: section error kept visible (overrides rule 0 in layer Theme(\"repo\"))",
+                "failed: section output kept visible (overrides rule 0 in layer Config)",
+            ]
+        );
+
+        let succeeded = policy.resolve(&tool("bash", UnitStatus::Succeeded));
+        assert!(!succeeded.part_visible("error"));
+        assert_eq!(succeeded.section("output").disclosure, Disclosure::Hidden);
+    }
+
+    #[test]
+    fn floor_keeps_confirmation_expanded_while_awaiting() {
+        let (policy, _) = CompiledPolicy::compile(
+            &[layer(
+                LayerSource::Theme("repo".into()),
+                "[[rules]]\nset = { sections = { confirmation = { disclosure = \"collapsed\" } } }",
+            )],
+            &PolicyRegistry::with_host_parts(),
+        );
+        let interaction = UnitFacts {
+            kind: Some(UnitKind::Interaction),
+            awaiting_decision: true,
+            ..UnitFacts::default()
+        };
+        let explained = policy.explain(&interaction);
+        assert_eq!(
+            explained.presentation.section("confirmation").disclosure,
+            Disclosure::Expanded
+        );
+        assert_eq!(
+            explained.floor,
+            [
+                "awaiting a decision: section confirmation kept visible and expanded (overrides rule 0 in layer Theme(\"repo\"))"
+            ]
+        );
+    }
+
+    #[test]
+    fn header_fields_are_checked_against_the_targeted_kinds() {
+        let (_, diagnostics) = CompiledPolicy::compile(
+            &[layer(
+                LayerSource::Config,
+                r#"
+                [[rules]]
+                match = { kind = "group" }
+                set = { header = { fields = ["marker", "count", "tools", "status", "timing", "icon"] } }
+
+                [[rules]]
+                match = { kind = "tool" }
+                set = { header = { fields = ["marker", "icon", "label", "tool", "target", "status", "timing", "count", "title", "tools"] } }
+
+                [[rules]]
+                match = { kind = ["tool", "group"] }
+                set = { header = { fields = ["icon", "tools", "bogus"] } }
+
+                [[rules]]
+                set = { header = { fields = ["tools", "title"] } }
+                "#,
+            )],
+            &PolicyRegistry::default(),
+        );
+        let warnings: Vec<_> = diagnostics
+            .iter()
+            .map(|diagnostic| (diagnostic.rule, diagnostic.message.as_str()))
+            .collect();
+        assert_eq!(
+            warnings,
+            [
+                (
+                    Some(0),
+                    "header field \"icon\" does not apply to group units"
+                ),
+                (
+                    Some(1),
+                    "header field \"tools\" applies only to group units"
+                ),
+                (Some(2), "unknown header field \"bogus\""),
+            ]
+        );
+    }
+
+    #[test]
+    fn summary_templates_substitute_only_registered_fields() {
+        let lookup = |name: &str| match name {
+            "tool" => Some("read".to_owned()),
+            "target" => Some("src/lib.rs".to_owned()),
+            "first_line" => Some("line one\nline two\ttabbed".to_owned()),
+            "nope" => Some("leaked".to_owned()),
+            _ => None,
+        };
+        let render = |template: &str| render_summary_template(template, &lookup);
+        assert_eq!(render("{tool} {target}"), "read src/lib.rs");
+        assert_eq!(
+            render("{tool} {status}"),
+            "read",
+            "missing values render empty"
+        );
+        assert_eq!(
+            render("{nope}|{tool}"),
+            "|read",
+            "unregistered names render empty"
+        );
+        assert_eq!(render("{first_line}"), "line one line two tabbed");
+        assert_eq!(render("{ tool } {tool"), "{ tool } {tool");
+        assert_eq!(render("{{tool}}"), "{read}");
+        assert_eq!(render("é{tool}✓"), "éread✓");
+        assert_eq!(render(""), "");
+
+        let wide = |_: &str| Some("界".repeat(1000));
+        let long = render_summary_template("{first_line}", &wide);
+        assert!(long.len() <= MAX_RENDERED_SUMMARY_BYTES);
+        assert!(long.len() > MAX_RENDERED_SUMMARY_BYTES - 3);
+        assert!(long.chars().all(|character| character == '界'));
+
+        let template = format!("{}{{tool}}", "x".repeat(MAX_SUMMARY_TEMPLATE_BYTES));
+        assert_eq!(
+            render(&template),
+            "x".repeat(MAX_SUMMARY_TEMPLATE_BYTES),
+            "template bytes past the bound are ignored"
+        );
+    }
+
+    #[test]
+    fn template_warnings_agree_with_rendering() {
+        let (_, diagnostics) = CompiledPolicy::compile(
+            &[layer(
+                LayerSource::Config,
+                "[[rules]]\nset = { summary = { template = \"{tool} { spaced } {first_line} {colour}\" } }",
+            )],
+            &PolicyRegistry::default(),
+        );
+        assert_eq!(
+            diagnostics
+                .iter()
+                .map(|diagnostic| diagnostic.message.as_str())
+                .collect::<Vec<_>>(),
+            ["unknown summary template field \"colour\""]
+        );
     }
 }

@@ -14,16 +14,30 @@ separators = { status = "plain" }
 speaker    = "prefix"
 surfaces   = "flat"
 
+# Everything folds; only running work and pending decisions open up.
 [[presentation.rules]]
 match = { kind = "tool" }
 set   = { disclosure = "collapsed", detail = "minimal", parts = { timing = false } }
 
 [[presentation.rules]]
+match = { kind = "tool" }
+set = { group = { by = "consecutive" }, header = { fields = [
+    "marker",
+    "tool",
+    "status",
+] } }
+
+[[presentation.rules]]
 match = { kind = "tool", status = ["running", "waiting"] }
 set   = { disclosure = "summary" }
 
+# Failed and awaiting members are revealed whatever `reveal` says (visibility floor).
 [[presentation.rules]]
-match = { turn = ["previous", "older"] }
+match = { kind = "group" }
+set   = { disclosure = "collapsed", reveal = ["running", "waiting"] }
+
+[[presentation.rules]]
+match = { kind = ["tool", "group"], turn = ["previous", "older"] }
 set   = { disclosure = "collapsed" }
 
 [containers."transcript.user"]

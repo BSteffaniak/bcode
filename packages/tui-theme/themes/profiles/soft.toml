@@ -14,13 +14,14 @@ separators = { status = "plain" }
 speaker    = "badge"
 surfaces   = "layered"
 
+# Long output folds into its section row; the header and short sections stay open.
 [[presentation.rules]]
 match = { kind = "tool", status = "succeeded", lines = [
     "some",
     "many",
     "huge",
 ] }
-set = { disclosure = "summary" }
+set = { sections = { output = { disclosure = "collapsed" }, result = { disclosure = "collapsed" } } }
 
 [containers."transcript.user"]
 layout    = "plain"

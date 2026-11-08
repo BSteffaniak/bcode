@@ -195,6 +195,38 @@ producer_default   = true
 render_mode        = "transcript_block"
 surfaces           = ["tui"]
 
+[[presentation.tools]]
+target_fields = ["path"]
+tool_name     = "filesystem.read"
+
+[[presentation.tools]]
+target_fields = ["path"]
+tool_name     = "filesystem.write"
+
+[[presentation.tools]]
+target_fields = ["path"]
+tool_name     = "filesystem.edit"
+
+[[presentation.tools]]
+target_fields = ["path"]
+tool_name     = "filesystem.exists"
+
+[[presentation.tools]]
+target_fields = ["path"]
+tool_name     = "filesystem.list"
+
+[[presentation.tools]]
+target_fields = ["pattern", "path"]
+tool_name     = "filesystem.find"
+
+[[presentation.tools]]
+target_fields = ["pattern", "path"]
+tool_name     = "filesystem.grep"
+
+[[presentation.tools]]
+target_fields = ["path"]
+tool_name     = "filesystem.stat"
+
 [concurrency]
 max  = 4
 type = "limited"

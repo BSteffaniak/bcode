@@ -1,0 +1,69 @@
+# Profiles set chrome, structure, and containers only, so they combine with any palette.
+description    = "Each turn reads as a log: tools grouped per turn, one row per call, timing first."
+display_name   = "Timeline (profile)"
+id             = "timeline"
+kind           = "profile"
+schema_version = 2
+
+[chrome.tui]
+borders    = { panel = "single", dialog = "single", tool = "none", composer = "single" }
+density    = "cozy"
+icons      = "unicode"
+motion     = "subtle"
+separators = { status = "slant" }
+speaker    = "gutter"
+surfaces   = "flat"
+
+# Every tool in a turn joins one group; reasoning and activity sit inside it.
+[[presentation.rules]]
+match = { kind = "tool" }
+set = { disclosure = "summary", group = { by = "turn", bridge = [
+    "reasoning",
+    "activity",
+] } }
+
+[[presentation.rules]]
+match = { kind = "tool" }
+set   = { header = { fields = ["marker", "timing", "tool", "target", "status"] } }
+
+[[presentation.rules]]
+match = { kind = "tool", status = ["running", "waiting"] }
+set   = { disclosure = "expanded", preview = { lines = 8, keep = "tail" } }
+
+# Groups list one row per member under a header that leads with total time.
+[[presentation.rules]]
+match = { kind = "group" }
+set = { disclosure = "summary", header = { fields = [
+    "marker",
+    "timing",
+    "count",
+    "tools",
+    "status",
+] } }
+
+[containers."transcript.user"]
+layout = "plain"
+
+[containers."transcript.assistant"]
+layout = "plain"
+
+[containers."tool.requested"]
+layout = "plain"
+
+[containers."tool.running"]
+layout = "plain"
+
+[containers."tool.waiting"]
+layout = "plain"
+
+[containers."tool.succeeded"]
+layout = "plain"
+
+[containers."tool.failed"]
+layout = "plain"
+
+[containers."tool.cancelled"]
+layout = "plain"
+
+[containers."tool.timed_out"]
+layout = "plain"

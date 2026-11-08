@@ -14,9 +14,17 @@ separators = { status = "bar" }
 speaker    = "prefix"
 surfaces   = "flat"
 
+# Finished tools print a templated status line when the plugin has no summary.
 [[presentation.rules]]
 match = { kind = "tool", status = "succeeded" }
 set   = { disclosure = "summary" }
+
+[[presentation.rules]]
+match = { kind = "tool" }
+set = { summary = { source = [
+    "plugin",
+    "template",
+], template = "[{status}] {tool} {target}" } }
 
 [containers."transcript.user"]
 layout = "plain"

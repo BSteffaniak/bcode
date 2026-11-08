@@ -2848,6 +2848,41 @@ impl Default for TuiThinkingConfig {
     }
 }
 
+impl TuiThinkingConfig {
+    /// Configuration-layer presentation rules equivalent to this setting.
+    ///
+    /// Reasoning visibility is part of structural presentation: `show =
+    /// false` is the rule `match = { kind = "reasoning" }, set = {
+    /// disclosure = "hidden" }`, placed before `[[presentation.rules]]` so
+    /// explicit rules can refine reasoning disclosure.
+    #[must_use]
+    pub fn presentation_rules(&self) -> Vec<bcode_presentation_policy_models::PresentationRule> {
+        Self::visibility_rules(self.show)
+    }
+
+    /// Presentation rules for an effective reasoning visibility `show`
+    /// (configured or toggled at runtime); empty when reasoning is shown.
+    #[must_use]
+    pub fn visibility_rules(show: bool) -> Vec<bcode_presentation_policy_models::PresentationRule> {
+        use bcode_presentation_policy_models::{
+            Disclosure, FactMatcher, OneOrMany, PresentationRule, PropertyPatch, UnitKind,
+        };
+        if show {
+            return Vec::new();
+        }
+        vec![PresentationRule {
+            matcher: FactMatcher {
+                kind: OneOrMany(vec![UnitKind::Reasoning]),
+                ..FactMatcher::default()
+            },
+            set: PropertyPatch {
+                disclosure: Some(Disclosure::Hidden),
+                ..PropertyPatch::default()
+            },
+        }]
+    }
+}
+
 /// Tool default exposure mode.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, ConfigDocEnum)]
 #[serde(rename_all = "kebab-case")]

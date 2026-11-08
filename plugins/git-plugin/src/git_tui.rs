@@ -20,6 +20,17 @@ impl bcode_plugin_sdk::tui::PluginTuiVisualAdapter for GitTuiVisualAdapter {
         bcode_plugin_sdk::tui::PluginTuiVisualRenderMode::TranscriptBlock
     }
 
+    fn tool_presentation(
+        &self,
+        kind: &str,
+        payload: &Value,
+        context: &bcode_plugin_sdk::tui::PluginTuiVisualRenderContext,
+    ) -> bcode_plugin_sdk::tui::PluginTuiToolPresentation {
+        clone_presentation(kind, payload, &|path| {
+            context.display_path(path).to_string()
+        })
+    }
+
     fn rows(
         &self,
         kind: &str,
@@ -94,6 +105,47 @@ fn clone_result_rows(
     )
 }
 
+/// Summary and target of a clone visual (plugin contract v3): the repository
+/// as target, with the destination or outcome as detail, for example
+/// `bmorphism/bcode · cloned → bcode`.
+fn clone_presentation(
+    kind: &str,
+    payload: &Value,
+    display_path: &dyn Fn(&str) -> String,
+) -> bcode_plugin_sdk::tui::PluginTuiToolPresentation {
+    let (target, detail) = match kind {
+        "bcode.git.clone_request" => {
+            let arguments = payload.get("arguments").unwrap_or(payload);
+            (
+                text(arguments, "url").map(str::to_owned),
+                text(arguments, "destination").map(|path| format!("→ {}", display_path(path))),
+            )
+        }
+        "bcode.git.clone_result" => {
+            let existed = payload.get("already_exists").and_then(Value::as_bool) == Some(true);
+            let outcome = if existed { "already exists" } else { "cloned" };
+            (
+                repo_name(payload).or_else(|| text(payload, "clone_url").map(str::to_owned)),
+                Some(text(payload, "path").map_or_else(
+                    || outcome.to_owned(),
+                    |path| format!("{outcome} → {}", display_path(path)),
+                )),
+            )
+        }
+        _ => (None, None),
+    };
+    let summary = match (&target, detail) {
+        (Some(target), Some(detail)) => Some(format!("{target} · {detail}")),
+        (Some(target), None) => Some(target.clone()),
+        (None, detail) => detail,
+    };
+    bcode_plugin_sdk::tui::PluginTuiToolPresentation {
+        summary,
+        target,
+        sections: Vec::new(),
+    }
+}
+
 fn repo_name(payload: &Value) -> Option<String> {
     let repo = text(payload, "repo")?;
     Some(text(payload, "owner").map_or_else(|| repo.to_owned(), |owner| format!("{owner}/{repo}")))
@@ -142,6 +194,31 @@ mod tests {
             "{rendered}"
         );
         assert!(rendered.contains("main"), "{rendered}");
+    }
+
+    #[test]
+    fn clone_presentations_name_repository_and_outcome() {
+        let display = |path: &str| path.strip_prefix("/tmp/").unwrap_or(path).to_owned();
+        let request = clone_presentation(
+            "bcode.git.clone_request",
+            &serde_json::json!({ "url": "https://github.com/o/r", "destination": "/tmp/r" }),
+            &display,
+        );
+        assert_eq!(request.target.as_deref(), Some("https://github.com/o/r"));
+        assert_eq!(
+            request.summary.as_deref(),
+            Some("https://github.com/o/r · → r")
+        );
+        let result = clone_presentation(
+            "bcode.git.clone_result",
+            &serde_json::json!({
+                "owner": "o", "repo": "r", "path": "/tmp/r", "already_exists": true
+            }),
+            &display,
+        );
+        assert_eq!(result.target.as_deref(), Some("o/r"));
+        assert_eq!(result.summary.as_deref(), Some("o/r · already exists → r"));
+        assert!(clone_presentation("other", &serde_json::json!({}), &display).is_empty());
     }
 
     #[test]

@@ -275,6 +275,150 @@ Grouping is computed once in `bcode_presentation_policy` over the session-view t
   contract version bumps. Plugins render what the host resolved; they do not evaluate rules.
 * Older plugins receive the existing fields and continue to render with current semantics.
 
+## Structure v2
+
+Structure v2 replaces post-render row trimming with a unit anatomy, renders groups as nested
+units, adds section-level disclosure, extends structure to every unit kind, and adds header,
+summary, and spacing properties. Everything below is renderer-neutral unless it names the terminal.
+
+### Unit anatomy
+
+Every unit is produced as an anatomy, never as finished rows that are trimmed afterwards:
+
+* **header** — ordered fields from a registry: `marker` (disclosure glyph), `icon`, `label`
+  (for example `Tool result`), `tool`, `target`, `status`, `timing`, `count`, `title` (producer
+  title). Renderers format fields; themes choose and order them.
+* **summary** — one line. Sources, tried in order: `plugin` (producer-supplied summary),
+  `first_line` (first non-blank line of the first visible `output`/`result`/`visual` section, else
+  of any section), `template`.
+* **sections** — named, ordered bodies. Host section names: `arguments`, `output`, `result`,
+  `diff`, `artifact`, `metadata`, `visual` (a plugin-rendered body), `confirmation`, `error`.
+  Plugins may add namespaced section names (`bcode.git.files`).
+
+The terminal composer (`bcode_tui`) lays out an anatomy from the resolved presentation:
+
+| Disclosure | Output |
+|---|---|
+| `expanded` | header, then each visible section with its own section disclosure |
+| `summary` | header, then the summary line |
+| `collapsed` | header only |
+| `hidden` | nothing individually; a count marker belongs to the enclosing group or turn |
+
+A section renders as: a section label row (`  output`, carrying a section marker when the section
+is collapsible), then its body bounded by the section's preview. A collapsed section renders only
+its label row with a `▸` marker and a row count (`  ▸ output · 14 rows`). The composer records a
+disclosure anchor for each header and each collapsible section label (see interaction), so hit
+regions derive from the same rows that are painted.
+
+### Properties added in v2
+
+```toml
+[[presentation.rules]]
+match = { kind = "tool", tool = ["read", "grep", "glob"] }
+set   = { group = { by = "consecutive", bridge = ["reasoning"], min = 2 },
+          sections = { arguments = { visible = false }, output = { disclosure = "collapsed" } },
+          header = { fields = ["marker", "tool", "target", "status", "timing"] },
+          summary = { source = ["plugin", "template", "first_line"], template = "{tool} {target}" },
+          spacing = { before = 0, after = 1 }, indent = 2 }
+
+[[presentation.rules]]
+match = { kind = "group" }
+set   = { disclosure = "collapsed", reveal = ["running", "waiting", "failed", "timed_out"] }
+```
+
+* `group` — a string shorthand (`none`, `consecutive_same_tool`, `consecutive_tools`) or a table:
+  * `by`: `none` | `consecutive` (any tool) | `same_tool` | `same_producer` | `turn`.
+    `consecutive_tools` = `{ by = "consecutive" }`; `consecutive_same_tool` = `{ by = "same_tool" }`.
+  * `bridge`: unit kinds that may sit between members without ending the group (default
+    `["reasoning"]` when `by` is not `none`). Bridged units stay in place and render inside the
+    group when it is expanded; they are not members and do not count.
+  * `min`: smallest run that forms a group (default 2, minimum 2).
+* `reveal` (group units) — member statuses shown in place even when the group is collapsed or
+  summarized (default `["running", "waiting", "failed", "timed_out"]`). Members that are awaiting a
+  decision or failed are always revealed, whatever `reveal` says (visibility floor). Failed and
+  awaiting members **stay members**: groups never split around them.
+* `sections.<name>` — `{ visible, disclosure, preview }`. `parts.<name> = bool` remains accepted as
+  an alias for `sections.<name>.visible`. A section's preview defaults to the unit's `preview`; its
+  disclosure defaults to `expanded`. Unknown host section names without a namespace produce
+  warnings, as unknown parts do today.
+* `header.fields` — ordered field list; unknown field names produce warnings. Default:
+  `["marker", "label", "tool", "status", "timing"]`, which reproduces today's tool header.
+* `summary` — `{ source = [...], template = "..." }`. Templates substitute only registered field
+  names in braces (`{tool}`, `{target}`, `{status}`, `{timing}`, `{count}`, `{title}`,
+  `{first_line}`); unknown names produce warnings and render empty. No logic, conditionals, or
+  formatting directives. Templates are bounded to 256 bytes; output is one line.
+* `spacing` — `{ before, after }` blank rows, each 0..=2. Default `{ before = 0, after = 1 }`.
+* `indent` — extra columns, 0..=8; members inside an expanded group get the group's indent plus
+  two columns.
+
+All properties merge per property (later rules win). `sections` merge per section and per field.
+
+### Groups
+
+* Grouping runs over the renderer's resident window in transcript order and never reorders units
+  or crosses turns. A unit joins the open group when its resolved `group.by` equals the group's,
+  the key matches (`same_tool`: tool; `same_producer`: producer; `consecutive`/`turn`: any tool
+  unit), and every unit between it and the previous member is a bridge kind.
+* The group unit's id is `group:<first member item id>`; it stays stable as members stream in.
+* Group facts: `kind = "group"`, `tool` (when all members share it), `producer` (likewise), `status`
+  (aggregate: running > waiting > requested > failed > timed_out > cancelled > succeeded),
+  `is_error` (any member failed), `items` (member count bucket), `turn`, `depth`.
+* Group header fields: `marker`, `count` (`5 tool calls`), `tools` (`read ×3, grep ×2`), `status`,
+  `timing` (sum of member durations). Default header: `["marker", "count", "tools", "status",
+  "timing"]`.
+* Group disclosure:
+  * `collapsed`: group header, then revealed members rendered with their own presentation;
+  * `summary`: group header, then one row per member (each member's header fields, indented,
+    each row a disclosure target for that member), revealed members rendered fully;
+  * `expanded`: group header, then every member and bridged unit rendered with its own
+    presentation, indented.
+* Terminal rendering keeps one layout entry per transcript item: the first member's entry renders
+  the group header plus its own member rendering; other members render their member rendering or
+  zero rows. Each item's layout signature includes its group role (leader with group signature,
+  member with group disclosure, or none), so a group change re-lays out only that group's items.
+
+### Interaction
+
+* Disclosure targets: `unit:<item id>`, `group:<first member item id>`, and
+  `section:<item id>:<section name>`. Terminal hit-region ids are `disclosure:<target>`. The
+  legacy form `disclosure:<item id>` remains accepted as `unit:<item id>`.
+* The composer emits one disclosure anchor (`TuiVisualAnchor` with key `disclosure:<target>` and
+  the header or label row) per target. Hit regions are registered only for visible anchor rows,
+  clipped to the transcript area.
+* Manual overrides are ephemeral, keyed by target, bounded (oldest dropped first), and reconciled
+  when items leave the resident window. The visibility floor applies after overrides: a unit
+  awaiting a decision cannot be collapsed.
+* Mouse: clicking a header or section label toggles that target (expanded ↔ collapsed; summary
+  and hidden expand first).
+* Keyboard focus mode (`tui.transcript.focusUnits`, default `alt+u`): focuses the last visible
+  structural target; `j`/`k` (and Up/Down) move between visible targets in transcript order,
+  including group headers and section labels of expanded units; Enter/Space toggle; `l`/Right
+  expands one level (group → summary → expanded; unit → expanded; section → expanded); `h`/Left
+  collapses one level or moves focus to the parent target; `e` expands everything under the
+  focused target; Escape leaves focus mode. The focused target's header row is painted with the
+  selection style and kept in view. All keys are remappable in the `transcript_focus` scope.
+* Bulk actions (`tui.tools.expandAll`, `collapseAll`, `resetDisclosure`) act on every unit and
+  group; in focus mode they act on the focused target's subtree.
+
+### Every unit kind is structural
+
+`unit_facts` covers user messages, assistant messages, reasoning, tools, permissions,
+interactions, compaction, skills, system and plugin status items. Messages support `disclosure`
+(collapsed shows the speaker header plus nothing; summary shows the first line), `spacing`,
+`indent`, and `header`. Reasoning disclosure absorbs the legacy `tui.thinking` visibility setting,
+which feeds the configuration layer. New facts: `target` (tool path, command, or pattern from
+producer-declared argument fields; host tools use `path`, `command`, `pattern`, `query`, `url`),
+`duration` (bucket: `<1s`, `1s..10s`, `10s..60s`, `>60s`), `group_size` (members, on group units),
+and `last_in_turn` (bool).
+
+### Plugin contract v3
+
+Tool presentation payloads may carry `summary` (one line, ≤ 256 bytes), `target` (≤ 256 bytes),
+and named `sections` (ordered `{ name, label, rows }`). Visual adapters receive the resolved
+presentation (unit disclosure, per-section disclosure and preview, header fields) in their render
+context behind `PLUGIN_TUI_VISUAL_CONTEXT_VERSION = 3`. Older adapters render one `visual`
+section and continue to work unchanged.
+
 ## Terminal capabilities
 
 * BMUX queries the terminal's default foreground, background (OSC 10/11), and palette (OSC 4) with
@@ -328,14 +472,64 @@ Grouping is computed once in `bcode_presentation_policy` over the session-view t
   with layering, floor, explain, and grouping; tool disclosure in the TUI with click toggles, bulk
   actions, preview budgets, part visibility, and turn recency; plugin component-theme contract v2;
   palette, profile, and combination catalog; `/profile` and `profile` configuration.
+* Structure v2, implemented:
+  * policy: the v2 properties (`group` tables, `reveal`, `sections`, `header`, `summary`,
+    `spacing`, `indent`) with per-section merging, clamping, and registry warnings for section,
+    header (checked per unit kind), and template names; the `target`, `duration`, and
+    `last_in_turn` matchers; a rule index keyed by kind, then tool; the extended floor (decision
+    sections, failure sections, groups never hidden) with diagnostics for rules that cross it;
+    bounded single-line summary-template rendering;
+  * grouping projection: `by`, `bridge`, and `min`; failed and awaiting members stay members and
+    are revealed; group facts; incremental updates from transcript splices;
+  * terminal tool units: built as an anatomy and laid out by a composer that implements the
+    disclosure table, per-section disclosure and preview, header fields (including `target` and
+    `icon`), summary sources, spacing, and indent, with unit and section disclosure anchors on
+    painted rows;
+  * terminal groups: each leader paints a one-row group header with a group anchor; members and
+    bridged units render in full, as one header row, or not at all, following the group
+    disclosure and `reveal`; the projection updates incrementally as the transcript changes;
+  * every transcript kind is a structural unit with facts (messages, reasoning, permissions,
+    interactions, notes, and system items), drawn through a structural frame; the `target`,
+    `duration`, and `last_in_turn` facts are filled; hidden units of every kind leave a
+    one-row count marker that is their disclosure target; `tui.thinking.show = false` is a
+    configuration-layer rule, and reasoning it hides renders no marker (the user's explicit
+    choice to omit reasoning, applied before the floor);
+  * interaction: unit, group, and section disclosure targets and hit ids (the legacy form still
+    parses); target-keyed overrides with oldest-first eviction, reconciled when items leave the
+    resident window; the visibility floor applied after overrides (a failed unit collapsed by
+    hand still shows its summary line); a group choice replaces its members' unit choices;
+    mouse toggles for units, groups, and sections; keyboard focus mode with remappable keys;
+    bulk actions on every shown unit kind and every group (hidden units and units awaiting a
+    decision are left alone), scoped to the focused subtree in focus mode;
+  * plugin contract v3: adapter response version 5 with bounded `summary`, `target`, and
+    `sections`, rendered as the summary source, header target, and named anatomy sections;
+    render context version 3 carrying the resolved presentation, decoded tolerantly (a
+    presentation an older adapter cannot decode arrives as none); manifest `[presentation]`
+    declarations, decoded and checked best-effort (invalid entries are dropped with
+    diagnostics and never block plugin loading), whose rules become producer-scoped plugin
+    layers and whose target fields feed the `target` fact only for units the declaring plugin
+    produced (units without a known producer use a tool's declaration only when a single
+    plugin declares it); bundled shell, filesystem, and git adapters supply summaries and
+    targets;
+  * chrome in the terminal: `icons` (header icon field and marker glyph set), `density` (a
+    lowest-precedence host layer for tool and group spacing), and `borders.tool`;
+  * layer order, lowest first: host defaults, plugins, theme, configuration, user state,
+    stacked by one shared helper (`bcode_tui_theme::selection::structure_layers`);
+  * tooling: `bcode theme explain` (text and JSON, stacking the same host, theme,
+    configuration, and user-state layers as the TUI through the shared helper) and
+    `bcode theme profiles`;
+  * catalog: bundled profiles use groups, reveal, sections, header fields, summary templates, and
+    spacing, including the `timeline` and `focus` profiles.
 * Deviations: structural configuration lives in the renderer-neutral `[[presentation.rules]]`
   section rather than under `[tui]`. The definition crate keeps its `bcode_tui_theme` name and
   `bmux_tui` color type; splitting a renderer-neutral `bcode_theme` crate is deferred until a
   non-terminal renderer consumes theme files. `color_depth = "auto"` only honors `NO_COLOR`;
-  reduced depths are explicit.
-* Not yet consumed by the terminal renderer: chrome `icons`, `density`, `separators`, `speaker`,
-  `surfaces`, `motion`, and per-surface `tool`/`composer` border styles (they resolve and are
-  validated, and BMUX bordered components honor the panel border set and focus gradient);
-  grouping projection rendering; plugin-declared facts, properties, and collapsed summaries in
-  plugin manifests; `bcode theme explain`/`check` commands; the two-axis picker UI.
-
+  reduced depths are explicit. Groups never contain a `group_size` fact; `items` buckets the
+  member count. Only tool units can be group members.
+* Not yet done: chrome `separators`, `speaker`, `surfaces`, `motion`, and the `composer` border
+  style in the terminal renderer (they resolve and are validated, and BMUX bordered components
+  honor the panel border set and focus gradient); per-item resolution memoization; plugin
+  declared facts and properties; plugin rule layers in `bcode theme explain` (it does not load
+  plugins, so it passes no plugin layers); mouse hit regions and layout signatures for
+  namespaced plugin sections (keyboard focus reads every disclosure anchor, but hit regions
+  and signatures probe only host section names); the in-TUI inspector; `bcode theme check`; the two-axis picker UI.

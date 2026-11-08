@@ -14,6 +14,26 @@ separators = { status = "bar" }
 speaker    = "prefix"
 surfaces   = "layered"
 
+# Same-tool runs list one row per call; arguments fold behind their label.
+[[presentation.rules]]
+match = { kind = "tool" }
+set   = { group = { by = "same_tool" }, sections = { arguments = { disclosure = "collapsed" } } }
+
+[[presentation.rules]]
+match = { kind = "tool" }
+set = { header = { fields = [
+    "marker",
+    "label",
+    "tool",
+    "target",
+    "status",
+    "timing",
+] } }
+
+[[presentation.rules]]
+match = { kind = "group" }
+set   = { disclosure = "summary" }
+
 [containers."transcript.user"]
 layout = "plain"
 

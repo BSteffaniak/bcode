@@ -129,11 +129,13 @@ pub(crate) mod thinking_flow;
 pub(crate) mod time_format;
 pub(crate) mod timeline_dialog;
 pub(crate) mod timeline_dialog_render;
+pub(crate) mod tool_anatomy;
 pub(crate) mod tool_render_projection;
 #[cfg(test)]
 mod tool_render_projection_tests;
 pub(crate) mod transcript;
 pub(crate) mod transcript_document;
+pub(crate) mod transcript_focus;
 pub(crate) mod transcript_layout;
 pub(crate) mod transcript_markdown_cache;
 pub(crate) mod transcript_projection;

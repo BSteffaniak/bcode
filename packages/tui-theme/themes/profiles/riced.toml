@@ -18,9 +18,31 @@ separators = { status = "powerline" }
 speaker = "badge"
 surfaces = "layered"
 
+# Everything on display: icon headers and expanded groups with indented members.
 [[presentation.rules]]
 match = { kind = "tool" }
-set   = { disclosure = "expanded", detail = "verbose" }
+set   = { disclosure = "expanded", detail = "verbose", group = { by = "consecutive" } }
+
+[[presentation.rules]]
+match = { kind = "tool" }
+set = { header = { fields = [
+    "marker",
+    "icon",
+    "tool",
+    "target",
+    "status",
+    "timing",
+] } }
+
+[[presentation.rules]]
+match = { kind = "group" }
+set = { disclosure = "expanded", header = { fields = [
+    "marker",
+    "count",
+    "tools",
+    "status",
+    "timing",
+] } }
 
 [containers."transcript.user"]
 border    = "left"

@@ -6,6 +6,9 @@ use bcode_presentation_policy::models::ResolvedPresentation;
 use std::cell::{Cell, RefCell};
 use std::collections::BTreeMap;
 
+mod group_header;
+mod unit_frame;
+
 thread_local! {
     static DIFF_VIEWER_CONFIG: Cell<TuiDiffViewerConfig> = const { Cell::new(TuiDiffViewerConfig {
         layout: TuiDiffViewerLayout::Auto,
@@ -15,12 +18,6 @@ thread_local! {
     static PLUGIN_VISUAL_THEME: Cell<Option<bcode_plugin_sdk::tui::PluginTuiTheme>> = const { Cell::new(None) };
     static TRANSCRIPT_THEME: Cell<Option<super::theme::PresentedTheme>> = const { Cell::new(None) };
     static STRUCTURE: RefCell<super::structure::StructureSnapshot> = RefCell::new(super::structure::StructureSnapshot::default());
-    /// Structural presentation of the tool item currently being laid out.
-    static CURRENT_PRESENTATION: RefCell<Option<ResolvedPresentation>> = const { RefCell::new(None) };
-    /// Row range of the most recent tool header, for disclosure trimming.
-    static TOOL_HEADER_ROWS: Cell<Option<(usize, usize)>> = const { Cell::new(None) };
-    /// First non-blank line of the current tool's output or result, for summaries.
-    static TOOL_SUMMARY: RefCell<Option<String>> = const { RefCell::new(None) };
 }
 
 /// Synchronize structural presentation state for row generation.
@@ -28,7 +25,8 @@ pub fn set_structure(snapshot: super::structure::StructureSnapshot) {
     STRUCTURE.with(|state| *state.borrow_mut() = snapshot);
 }
 
-/// Render standalone items (for example a picker preview) under `snapshot`.
+/// Render standalone items (for example a picker preview) under `snapshot`,
+/// with turn facts and groups computed over `items` themselves.
 ///
 /// The active row-building snapshot is restored afterwards, so transcript
 /// layout caches never observe the preview policy.
@@ -37,6 +35,9 @@ pub fn sample_transcript_rows(
     width: u16,
     snapshot: super::structure::StructureSnapshot,
 ) -> Vec<Line> {
+    let snapshot = snapshot
+        .with_turns(super::structure::TurnIndex::from_items(items.iter()))
+        .with_groups_for(&items.iter().collect::<Vec<_>>());
     let previous = STRUCTURE.with(|state| std::mem::replace(&mut *state.borrow_mut(), snapshot));
     let diff_viewer_config = DIFF_VIEWER_CONFIG.with(Cell::get);
     let registry = bcode_plugin_sdk::tui::keymap::KeymapRegistry::default();
@@ -58,117 +59,168 @@ pub fn sample_transcript_rows(
     rows
 }
 
-/// Effective structural presentation for tool items, or `None` for other items.
-fn tool_structure(item: &TranscriptItem) -> Option<ResolvedPresentation> {
-    let facts = super::structure::unit_facts(item)?;
-    if facts.kind != Some(bcode_presentation_policy::models::UnitKind::Tool) {
-        return None;
-    }
+/// Effective structural presentation of `item` under the active snapshot.
+///
+/// Every unit kind is structural; `None` only for items without facts.
+fn item_structure(item: &TranscriptItem) -> Option<ResolvedPresentation> {
     STRUCTURE.with(|state| state.borrow().presentation(item))
 }
 
-/// Layout-signature fragment for an item's structural presentation.
-pub fn structure_signature(item: &TranscriptItem) -> String {
-    tool_structure(item).map_or_else(String::new, |_| {
-        STRUCTURE.with(|state| state.borrow().signature(item))
-    })
+/// Whether `item` is laid out by the tool composer.
+const fn is_tool_kind(item: &TranscriptItem) -> bool {
+    matches!(
+        item.kind(),
+        TranscriptItemKind::ToolRequest { .. }
+            | TranscriptItemKind::ToolResult { .. }
+            | TranscriptItemKind::ToolContribution { .. }
+            | TranscriptItemKind::ToolRequestDraft { .. }
+    )
 }
 
-fn current_part_visible(part: &str) -> bool {
-    CURRENT_PRESENTATION.with(|current| {
-        current
-            .borrow()
-            .as_ref()
-            .is_none_or(|presentation| presentation.part_visible(part))
-    })
-}
-
-fn current_preview() -> Option<bcode_presentation_policy::models::Preview> {
-    CURRENT_PRESENTATION.with(|current| {
-        current
-            .borrow()
-            .as_ref()
-            .map(|presentation| presentation.preview)
-    })
-}
-
-fn current_disclosure_marker() -> Option<&'static str> {
-    use bcode_presentation_policy::models::Disclosure;
-    use bmux_tui_components::disclosure::DisclosureGlyphs;
-    CURRENT_PRESENTATION.with(|current| {
-        current.borrow().as_ref().map(|presentation| {
-            let glyphs = DisclosureGlyphs::UNICODE;
-            let marker = if presentation.disclosure == Disclosure::Expanded {
-                glyphs.expanded
-            } else {
-                glyphs.collapsed
-            };
-            match marker {
-                std::borrow::Cow::Borrowed(marker) => marker,
-                std::borrow::Cow::Owned(_) => "",
-            }
-        })
-    })
-}
-
-/// Trim a rendered tool branch to its disclosure.
+/// Whether the shared Markdown projection lays out `item`'s body.
 ///
-/// Expanded branches are unchanged. Collapsed and hidden branches keep only
-/// the header rows; summaries keep the header plus one bounded summary row:
-/// the first non-blank line of the tool's output or result, falling back to
-/// the first non-blank body row. Anchors and selection rows that no
-/// longer exist are dropped, and trailing spacing is preserved.
-fn apply_tool_disclosure(
+/// The projection's geometry (hit regions, selection, rich regions) is
+/// measured from the entry's bottom with exactly one trailing blank row and
+/// no indentation, so only expanded units with that frame use it; other
+/// frames render their Markdown without the projection.
+fn markdown_projection_active(item: &TranscriptItem) -> bool {
+    // An item its group hides paints no rows, so it needs no projection.
+    let hidden_by_group = STRUCTURE.with(|state| {
+        state.borrow().member_rendering(item.id().get())
+            == Some(super::structure::MemberRendering::Nothing)
+    });
+    !hidden_by_group
+        && item_structure(item).is_none_or(|presentation| {
+            presentation.disclosure == bcode_presentation_policy::models::Disclosure::Expanded
+                && presentation.indent == 0
+                && presentation.spacing.clamped().after == 1
+        })
+}
+
+/// Whether `item` is a Markdown entry laid out from the shared projection.
+fn markdown_projected(item: &TranscriptItem) -> bool {
+    item.text_format() == TextFormat::Markdown && markdown_projection_active(item)
+}
+
+/// Layout-signature fragment for an item's structural presentation.
+///
+/// Covers every resolved property the tool composer reads plus the item's
+/// section overrides, so a section toggle re-lays out only that item.
+pub fn structure_signature(item: &TranscriptItem) -> String {
+    use std::fmt::Write as _;
+    let Some(presentation) = item_structure(item) else {
+        return String::new();
+    };
+    // Variable-size properties are hashed so the key stays short.
+    let shape = {
+        use std::hash::{Hash as _, Hasher as _};
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        presentation.sections.hash(&mut hasher);
+        presentation.header.hash(&mut hasher);
+        presentation.summary.hash(&mut hasher);
+        hasher.finish()
+    };
+    let mut signature = format!(
+        "{:?}:{:?}:{}:{:?}:{}.{}:{}:{shape:x}",
+        presentation.disclosure,
+        presentation.detail,
+        presentation.preview.lines,
+        presentation.preview.keep,
+        presentation.spacing.before,
+        presentation.spacing.after,
+        presentation.indent,
+    );
+    STRUCTURE.with(|state| {
+        let state = state.borrow();
+        for name in bcode_presentation_policy::models::HOST_SECTIONS {
+            let target =
+                super::structure::DisclosureTarget::Section(item.id().get(), name.to_owned());
+            if let Some(disclosure) = state.target_override(&target) {
+                let _ = write!(signature, ":{name}={disclosure:?}");
+            }
+        }
+    });
+    signature
+}
+
+/// Layout-signature fragment for an item's group role (leader with the
+/// group's header state, member or bridge with the group disclosure), so a
+/// group change re-lays out only that group's items.
+pub fn group_signature(item: &TranscriptItem) -> String {
+    STRUCTURE.with(|state| state.borrow().group_signature(item.id().get()))
+}
+
+/// Columns of group indentation painted as padding around `item`'s rows.
+///
+/// Tool units indent through their presentation and Markdown-projected
+/// message entries keep their source geometry, so neither is padded; other
+/// items rendered inside a group (for example bridged reasoning) are.
+fn group_padding(item: &TranscriptItem, width: u16) -> u16 {
+    if item_structure(item).is_some()
+        || matches!(
+            item.kind(),
+            TranscriptItemKind::AssistantMessage
+                | TranscriptItemKind::UserMessage
+                | TranscriptItemKind::System
+        )
+    {
+        return 0;
+    }
+    STRUCTURE.with(|state| {
+        let state = state.borrow();
+        state
+            .group_placement(item.id().get())
+            .map_or(0, |placement| {
+                u16::from(state.member_indent(placement.group)).min(width / 2)
+            })
+    })
+}
+
+/// Width `item`'s own rows are rendered at after group padding; Markdown
+/// projections for the item must be prepared at this width.
+pub fn transcript_item_body_width(item: &TranscriptItem, width: u16) -> u16 {
+    width.saturating_sub(group_padding(item, width))
+}
+
+/// Lay out a tool `anatomy` for `item` under the active structural snapshot.
+fn compose_tool_rows(
     output: (
         &mut Vec<Line>,
         &mut Vec<bcode_plugin_sdk::tui_visual::TuiVisualAnchor>,
         &mut Vec<(usize, bcode_plugin_sdk::tui::PluginTuiSelectionRow)>,
     ),
-    branch_start: usize,
-    presentation: &ResolvedPresentation,
+    item: &TranscriptItem,
+    anatomy: super::tool_anatomy::ToolAnatomy,
     width: u16,
 ) {
-    use bcode_presentation_policy::models::Disclosure;
-    let (rows, anchors, selection) = output;
-    let header_end = TOOL_HEADER_ROWS
-        .with(Cell::take)
-        .filter(|(start, end)| *start >= branch_start && *end <= rows.len())
-        .map_or_else(|| (branch_start + 1).min(rows.len()), |(_, end)| end);
-    if presentation.disclosure == Disclosure::Expanded || header_end >= rows.len() {
-        return;
+    let structure = item_structure(item);
+    let structural = structure.is_some();
+    let mut anatomy = anatomy;
+    if anatomy.header.target.is_none() {
+        anatomy.header.target =
+            STRUCTURE.with(|state| state.borrow().facts(item).and_then(|facts| facts.target));
     }
-    let trailing_blank = rows
-        .last()
-        .is_some_and(|row| row.spans.iter().all(|span| span.content.trim().is_empty()));
-    let recorded = TOOL_SUMMARY.with(RefCell::take);
-    let summary = (presentation.disclosure == Disclosure::Summary)
-        .then(|| {
-            recorded.or_else(|| {
-                rows[header_end..].iter().find_map(|row| {
-                    let text: String = row.spans.iter().map(|span| span.content.as_str()).collect();
-                    let text = text.trim();
-                    (!text.is_empty()).then(|| text.to_owned())
-                })
-            })
-        })
-        .flatten();
-    rows.truncate(header_end);
-    anchors.retain(|anchor| anchor.row < header_end);
-    selection.retain(|(row, _)| *row < header_end);
-    if let Some(summary) = summary {
-        let theme = semantic_state_theme();
-        let line = Line::from_spans(vec![
-            Span::styled("  ", theme.transcript.tool_metadata),
-            Span::styled(summary, theme.transcript.tool_metadata),
-        ]);
-        rows.push(bmux_tui::text::truncate_line_to_display_width(
-            &line,
-            usize::from(width),
-        ));
-    }
-    if trailing_blank {
-        rows.push(Line::default());
-    }
+    let presentation = structure.unwrap_or_else(bcode_presentation_policy::host_defaults);
+    STRUCTURE.with(|state| {
+        let state = state.borrow();
+        let section = |name: &str| state.section(item, name);
+        let (rows, anchors, selection) = output;
+        super::tool_anatomy::compose_tool(
+            anatomy,
+            &super::tool_anatomy::ComposeContext {
+                presentation: &presentation,
+                structural,
+                item_id: item.id().get(),
+                width,
+                section: &section,
+            },
+            super::tool_anatomy::ComposeOutput {
+                rows,
+                anchors,
+                selection,
+            },
+        );
+    });
 }
 
 /// Synchronize layout-affecting Markdown presentation state for row generation.
@@ -214,6 +266,11 @@ pub fn semantic_state_theme() -> super::theme::PresentedTheme {
 
 const MARKDOWN_BODY_INDENT: u16 = 2;
 
+/// Narrowest width at which a tool unit keeps a full frame: two border cells
+/// plus one content cell. Narrower tool units degrade to no container rather
+/// than painting frame glyphs past the available width.
+const MIN_FRAMED_TOOL_WIDTH: u16 = 3;
+
 #[derive(Debug, Clone, Copy)]
 pub struct TranscriptItemLayout {
     outer_width: u16,
@@ -221,6 +278,8 @@ pub struct TranscriptItemLayout {
     content_x: u16,
     bottom_rows: usize,
     container: Option<super::theme::ContainerPresentation>,
+    /// Frame glyphs for a fully bordered tool container (chrome tool border).
+    frame: Option<bmux_tui::chrome::BorderSet>,
 }
 
 impl TranscriptItemLayout {
@@ -229,13 +288,19 @@ impl TranscriptItemLayout {
         item: &TranscriptItem,
         width: u16,
     ) -> Self {
+        let outer_width = width.max(1);
         let container = transcript_item_container(theme, item).filter(|presentation| {
-            !matches!(
+            let plain = matches!(
                 presentation.recipe.layout,
                 super::theme::definition::ContainerLayout::Plain
-            )
+            );
+            let framed = matches!(
+                presentation.recipe.border,
+                super::theme::definition::ContainerBorder::All
+            );
+            let too_narrow = is_tool_kind(item) && framed && outer_width < MIN_FRAMED_TOOL_WIDTH;
+            !plain && !too_narrow
         });
-        let outer_width = width.max(1);
         let Some(presentation) = container else {
             return Self {
                 outer_width,
@@ -243,6 +308,7 @@ impl TranscriptItemLayout {
                 content_x: 0,
                 bottom_rows: 0,
                 container: None,
+                frame: None,
             };
         };
         let metrics = container_metrics(presentation.recipe, usize::from(outer_width));
@@ -251,6 +317,9 @@ impl TranscriptItemLayout {
             super::theme::definition::ContainerBorder::All
         ));
         let padding_rows = usize::from(presentation.recipe.padding_y);
+        let frame = (border_rows == 1 && is_tool_kind(item))
+            .then(|| theme.unit_chrome.tool_border_set())
+            .flatten();
         Self {
             outer_width,
             content_width: u16::try_from(metrics.content.max(1)).unwrap_or(u16::MAX),
@@ -258,6 +327,7 @@ impl TranscriptItemLayout {
                 .unwrap_or(u16::MAX),
             bottom_rows: border_rows.saturating_add(padding_rows),
             container: Some(presentation),
+            frame,
         }
     }
 
@@ -319,6 +389,11 @@ fn apply_container_recipe(rows: &mut Vec<Line>, start: usize, layout: Transcript
         presentation.transcript_style(),
         layout.outer_width,
     );
+    if let Some(set) = layout.frame
+        && let Some(container_rows) = rows.get_mut(start..)
+    {
+        super::theme::chrome::redraw_frame(container_rows, set);
+    }
 }
 
 fn transcript_item_container(
@@ -400,6 +475,22 @@ fn plugin_visual_context(
             }
         })
     })
+}
+
+/// Visual context for `item`'s adapter, carrying its resolved presentation
+/// for structural units (context version 3).
+fn adapter_context(
+    item: &TranscriptItem,
+    width: u16,
+    working_directory: Option<&std::path::Path>,
+) -> PluginTuiVisualRenderContext {
+    let context = plugin_visual_context(width, working_directory);
+    match adapter_presentation(item) {
+        Some(presentation) => {
+            context.with_presentation(crate::plugin_tui::visual_presentation(&presentation))
+        }
+        None => context,
+    }
 }
 
 /// Build renderer-owned plugin presentation from the active app theme.
@@ -486,16 +577,15 @@ use super::app::{BmuxApp, DaemonConnectionState, composer_policy};
 use super::pending_submission::{PendingSubmission, PendingSubmissionState};
 use super::time_format::{format_millis, unix_time_millis};
 use super::tool_render_projection::{CanonicalPluginVisual, CanonicalToolVisual};
-use super::transcript::{
-    ToolTiming, TranscriptItem, TranscriptItemKind, TranscriptStreamIntegrity,
-};
+#[cfg(test)]
+use super::transcript::ToolTiming;
+use super::transcript::{TranscriptItem, TranscriptItemKind, TranscriptStreamIntegrity};
 use super::transcript_layout::TranscriptLayoutSignature;
 use bmux_tui::text_width::{display_width as text_display_width, truncate_to_display_width};
 
 static SPINNER: std::sync::LazyLock<bmux_tui_components::spinner::Spinner> =
     std::sync::LazyLock::new(bmux_tui_components::spinner::Spinner::braille);
 const MAX_COMPOSER_ROWS: u16 = 6;
-const MAX_INLINE_TOOL_TEXT_ROWS: usize = 28;
 const LATEST_BAR_ACTIVE_WINDOW: Duration = Duration::from_millis(420);
 #[derive(Debug, Clone, Copy)]
 pub struct TuiTheme {
@@ -2176,64 +2266,98 @@ pub struct MarkdownRichRegion {
     pub visible_rect: Option<Rect>,
 }
 
-/// Hit-region prefix for tool disclosure headers.
-pub const DISCLOSURE_HIT_PREFIX: &str = "disclosure:";
-
-/// Extract the transcript item id from a disclosure hit-region id.
-#[must_use]
-pub fn disclosure_item_from_hit(hit_id: &str) -> Option<u64> {
-    hit_id.strip_prefix(DISCLOSURE_HIT_PREFIX)?.parse().ok()
+/// Register hit regions for the disclosure anchors of visible tool items.
+///
+/// Regions come from the `disclosure:` anchors retained with each entry's
+/// layout rows (the header's first row and each collapsible section label),
+/// cover the item's content width, and are clipped to the transcript area,
+/// so collapsed, scrolled, or resized items never leave stale targets.
+fn render_transcript_disclosure_hits(app: &BmuxApp, area: Rect, frame: &mut PaintCx<'_, '_>) {
+    let layout = app.transcript_layout();
+    let theme = app.presented_theme();
+    let regions = disclosure_hit_regions(
+        visible_markdown_entry_indexes(app, area)
+            .into_iter()
+            .filter_map(|index| Some((index, app.transcript().get(index)?))),
+        |index| {
+            layout.entry_start_row(
+                super::transcript_layout::VisibleTranscriptSource::Transcript,
+                index,
+            )
+        },
+        |index, key| layout.content_anchor_row(index, key),
+        &theme,
+        area,
+        app.transcript_top_row(area.height),
+    );
+    for region in regions {
+        frame.push_hit(region);
+    }
 }
 
-/// Register one header hit region per visible structural tool item.
+/// Disclosure hit regions for `entries` (transcript index and item).
 ///
-/// Regions cover only the header's first row inside the item's container and
-/// are clipped to the transcript area, so collapsed, scrolled, or resized
-/// items never leave stale targets.
-fn render_transcript_disclosure_hits(app: &BmuxApp, area: Rect, frame: &mut PaintCx<'_, '_>) {
-    let top_row = app.transcript_top_row(area.height);
-    let snapshot = app.structure_snapshot();
-    for index in visible_markdown_entry_indexes(app, area) {
-        let Some(item) = app.transcript().get(index) else {
+/// `entry_start` maps an index to its first global row and `anchor_row`
+/// finds a retained anchor's item-relative row by key. Only the targets the
+/// tool composer can emit are looked up: the unit and each host section.
+fn disclosure_hit_regions<'a>(
+    entries: impl IntoIterator<Item = (usize, &'a TranscriptItem)>,
+    entry_start: impl Fn(usize) -> Option<usize>,
+    anchor_row: impl Fn(usize, &str) -> Option<usize>,
+    theme: &super::theme::PresentedTheme,
+    area: Rect,
+    top_row: usize,
+) -> Vec<HitRegion> {
+    use super::structure::DisclosureTarget;
+    let mut regions = Vec::new();
+    for (index, item) in entries {
+        let Some(start) = entry_start(index) else {
             continue;
         };
-        if super::structure::unit_facts(item).is_none_or(|facts| {
-            facts.kind != Some(bcode_presentation_policy::models::UnitKind::Tool)
-        }) || snapshot.presentation(item).is_none()
+        let layout = TranscriptItemLayout::resolve(theme, item, area.width);
+        let id = item.id().get();
+        // The group header is painted outside the leader's container, so its
+        // region spans the transcript area rather than the item's content.
+        let group = DisclosureTarget::Group(id).to_hit_id();
+        if let Some(rect) = anchor_row(index, &group)
+            .and_then(|row| viewport_row(start, row, top_row, area))
+            .map(|row| Rect::new(area.x, row, area.width, 1).intersection(area))
+            .filter(|rect| !rect.is_empty())
         {
-            continue;
+            regions.push(HitRegion::new(group, rect).role(HitRole::Action).layer(1));
         }
-        let Some(entry_start) = app.transcript_layout().entry_start_row(
-            super::transcript_layout::VisibleTranscriptSource::Transcript,
-            index,
-        ) else {
-            continue;
-        };
-        let layout = TranscriptItemLayout::resolve(&app.presented_theme(), item, area.width);
-        let Some(viewport_row) = entry_start
-            .saturating_add(layout.bottom_rows())
-            .checked_sub(top_row)
-        else {
-            continue;
-        };
-        let Ok(viewport_row) = u16::try_from(viewport_row) else {
-            continue;
-        };
-        let rect = Rect::new(
-            area.x.saturating_add(layout.content_x),
-            area.y.saturating_add(viewport_row),
-            layout.content_width,
-            1,
-        )
-        .intersection(area);
-        if !rect.is_empty() {
-            frame.push_hit(
-                HitRegion::new(format!("{DISCLOSURE_HIT_PREFIX}{}", item.id().get()), rect)
-                    .role(HitRole::Action)
-                    .layer(1),
-            );
+        let targets = std::iter::once(DisclosureTarget::Unit(id)).chain(
+            bcode_presentation_policy::models::HOST_SECTIONS
+                .iter()
+                .map(|name| DisclosureTarget::Section(id, (*name).to_owned())),
+        );
+        for target in targets {
+            let key = target.to_hit_id();
+            let Some(row) =
+                anchor_row(index, &key).and_then(|row| viewport_row(start, row, top_row, area))
+            else {
+                continue;
+            };
+            let rect = Rect::new(
+                area.x.saturating_add(layout.content_x),
+                row,
+                layout.content_width,
+                1,
+            )
+            .intersection(area);
+            if !rect.is_empty() {
+                regions.push(HitRegion::new(key, rect).role(HitRole::Action).layer(1));
+            }
         }
     }
+    regions
+}
+
+/// Screen row of entry-relative `row` of an entry starting at global row
+/// `start`, when it lies inside `area` scrolled to `top_row`.
+fn viewport_row(start: usize, row: usize, top_row: usize, area: Rect) -> Option<u16> {
+    let offset = u16::try_from(start.saturating_add(row).checked_sub(top_row)?).ok()?;
+    (offset < area.height).then(|| area.y.saturating_add(offset))
 }
 
 fn render_transcript_markdown_hits(
@@ -2260,7 +2384,7 @@ fn transcript_markdown_footnote_rows(
 ) -> std::collections::BTreeMap<String, usize> {
     let mut rows = std::collections::BTreeMap::new();
     for (index, item) in app.transcript().iter().enumerate() {
-        if item.text_format() != TextFormat::Markdown {
+        if !markdown_projected(item) {
             continue;
         }
         let Some(entry_start) = app.transcript_layout().entry_start_row(
@@ -2299,7 +2423,7 @@ fn transcript_markdown_fragment_rows(
 ) -> std::collections::BTreeMap<String, usize> {
     let mut fragments = std::collections::BTreeMap::new();
     for (index, item) in app.transcript().iter().enumerate() {
-        if item.text_format() != TextFormat::Markdown {
+        if !markdown_projected(item) {
             continue;
         }
         let Some(entry_start) = app.transcript_layout().entry_start_row(
@@ -2334,7 +2458,7 @@ fn transcript_markdown_details_ids_for_items<'a>(
     width: u16,
 ) -> std::collections::BTreeSet<String> {
     items
-        .filter(|item| item.text_format() == TextFormat::Markdown)
+        .filter(|item| markdown_projected(item))
         .flat_map(|item| {
             transcript_markdown_projection(app, item, width)
                 .contributions
@@ -2363,7 +2487,7 @@ pub fn transcript_markdown_rich_regions(app: &BmuxApp, area: Rect) -> Vec<Markdo
         let Some(item) = app.transcript().get(index) else {
             continue;
         };
-        if item.text_format() != TextFormat::Markdown {
+        if !markdown_projected(item) {
             continue;
         }
         let Some(entry_start) = app.transcript_layout().entry_start_row(
@@ -2432,7 +2556,7 @@ fn transcript_markdown_regions(app: &BmuxApp, area: Rect) -> Vec<MarkdownTranscr
         let Some(item) = app.transcript().get(index) else {
             continue;
         };
-        if item.text_format() != TextFormat::Markdown {
+        if !markdown_projected(item) {
             continue;
         }
         let Some(entry_start) = app.transcript_layout().entry_start_row(
@@ -2484,7 +2608,7 @@ pub fn transcript_markdown_projection_for_layout(
     item: &TranscriptItem,
     width: u16,
 ) -> Option<std::sync::Arc<bcode_markdown_render::MarkdownRenderResult>> {
-    (item.text_format() == TextFormat::Markdown).then(|| {
+    markdown_projected(item).then(|| {
         let options = markdown_render_options(app, item, width);
         app.transcript_markdown_cache()
             .get(item.id().get(), item.revision(), &options)
@@ -2503,6 +2627,9 @@ pub fn transcript_markdown_selection_projection(
     item: &TranscriptItem,
     width: u16,
 ) -> Option<std::sync::Arc<bcode_markdown_render::MarkdownRenderResult>> {
+    if !markdown_projected(item) {
+        return None;
+    }
     let options = markdown_render_options(app, item, width);
     app.transcript_markdown_cache()
         .get(item.id().get(), item.revision(), &options)
@@ -2845,10 +2972,11 @@ pub fn transcript_item_signature(
     _inline_view_config: (),
 ) -> TranscriptLayoutSignature {
     TranscriptLayoutSignature::new(format!(
-        "item:{}:{}:{width}:{}:{}:{}",
+        "item:{}:{}:{width}:{}:group({}):{}:{}",
         item.id().get(),
         item.revision(),
         structure_signature(item),
+        group_signature(item),
         match item.stream_integrity() {
             Some(TranscriptStreamIntegrity::Incomplete) => "incomplete",
             Some(TranscriptStreamIntegrity::Degraded) => "degraded",
@@ -2889,8 +3017,89 @@ struct TranscriptVisualHost<'a> {
     keymap: &'a dyn bcode_plugin_sdk::tui::PluginTuiHost,
 }
 
-#[allow(clippy::too_many_lines)]
+/// Push `item`'s rows, placing it in its group when it has one.
+///
+/// A group's first member renders the group header before its own rows.
+/// Members and bridges render fully, as one header row, or not at all,
+/// according to the group's disclosure; zero-row entries keep the one entry
+/// per transcript item the layout expects.
 fn push_transcript_item_rows(
+    rows: &mut Vec<Line>,
+    anchors: &mut Vec<bcode_plugin_sdk::tui_visual::TuiVisualAnchor>,
+    selection: &mut Vec<(usize, bcode_plugin_sdk::tui::PluginTuiSelectionRow)>,
+    item: &TranscriptItem,
+    width: u16,
+    visual_host: TranscriptVisualHost<'_>,
+    markdown: Option<&bcode_markdown_render::MarkdownRenderResult>,
+) {
+    use super::structure::MemberRendering;
+    let id = item.id().get();
+    let grouped = STRUCTURE.with(|state| {
+        let state = state.borrow();
+        let placement = *state.group_placement(id)?;
+        let header = (placement.role == bcode_presentation_policy::GroupRole::Leader)
+            .then(|| {
+                Some((
+                    state.group_view(placement.group)?.clone(),
+                    state.group_presentation(placement.group)?,
+                ))
+            })
+            .flatten();
+        Some((
+            placement,
+            state.member_rendering(id)?,
+            header,
+            state.group_closing_spacing(placement.group),
+        ))
+    });
+    let Some((placement, rendering, header, closing)) = grouped else {
+        push_item_body_rows(rows, anchors, selection, item, width, visual_host, markdown);
+        return;
+    };
+    if let Some((view, presentation)) = &header {
+        group_header::push_group_header(rows, anchors, view, presentation, width);
+    }
+    if rendering == MemberRendering::Nothing {
+        if placement.closes {
+            rows.extend((0..closing).map(|_| Line::default()));
+        }
+        return;
+    }
+    let pad = group_padding(item, width);
+    let base = rows.len();
+    let (mut body, mut body_anchors, mut body_selection) = (Vec::new(), Vec::new(), Vec::new());
+    push_item_body_rows(
+        &mut body,
+        &mut body_anchors,
+        &mut body_selection,
+        item,
+        width.saturating_sub(pad),
+        visual_host,
+        markdown,
+    );
+    let padding = usize::from(pad);
+    rows.extend(body.into_iter().map(|mut row| {
+        if padding == 0 || row.spans.is_empty() {
+            row
+        } else {
+            row.spans.insert(0, Span::raw(" ".repeat(padding)));
+            bmux_tui::text::truncate_line_to_display_width(&row, usize::from(width))
+        }
+    }));
+    anchors.extend(body_anchors.into_iter().map(|mut anchor| {
+        anchor.row = anchor.row.saturating_add(base);
+        anchor
+    }));
+    selection.extend(body_selection.into_iter().map(|(row, mut source)| {
+        for cell in &mut source.cells {
+            cell.column = cell.column.saturating_add(pad);
+        }
+        (row.saturating_add(base), source)
+    }));
+}
+
+#[allow(clippy::too_many_lines)]
+fn push_item_body_rows(
     rows: &mut Vec<Line>,
     anchors: &mut Vec<bcode_plugin_sdk::tui_visual::TuiVisualAnchor>,
     selection: &mut Vec<(usize, bcode_plugin_sdk::tui::PluginTuiSelectionRow)>,
@@ -2903,6 +3112,9 @@ fn push_transcript_item_rows(
         presentation: plugin_host,
         keymap: keymap_host,
     } = visual_host;
+    // Collapsed or reframed units never paint the shared Markdown projection
+    // (see `markdown_projection_active`), whoever supplied it.
+    let markdown = markdown.filter(|_| markdown_projection_active(item));
     let item_start = rows.len();
     let layout = TranscriptItemLayout::resolve(&semantic_state_theme(), item, width);
     let width = layout.content_width;
@@ -2933,40 +3145,15 @@ fn push_transcript_item_rows(
             theme.transcript.meta,
         );
     }
-    let structure = tool_structure(item);
-    let branch_start = rows.len();
-    CURRENT_PRESENTATION.with(|current| current.replace(structure.clone()));
-    TOOL_HEADER_ROWS.with(|header| header.set(None));
-    TOOL_SUMMARY.with(|summary| summary.replace(None));
+    // Plugin visuals render at the width left after the unit's indent.
+    let tool_width = if is_tool_kind(item) {
+        item_structure(item).map_or(width, |presentation| {
+            super::tool_anatomy::inner_width(&presentation, width)
+        })
+    } else {
+        width
+    };
     match item.kind() {
-        TranscriptItemKind::UserMessage => {
-            if let Some(markdown) = markdown {
-                push_markdown_projection_block(
-                    rows,
-                    &item.display_role(),
-                    markdown,
-                    semantic_state_theme().transcript.user_label,
-                    width,
-                    true,
-                );
-            } else {
-                push_formatted_block(
-                    rows,
-                    &item.display_role(),
-                    item.text(),
-                    item.text_format(),
-                    semantic_state_theme().transcript.user_label,
-                    true,
-                    width,
-                );
-            }
-        }
-        TranscriptItemKind::AssistantMessage => {
-            push_assistant_rows(rows, item, width, markdown);
-        }
-        TranscriptItemKind::ReasoningMessage => {
-            push_reasoning_rows(rows, item, width, markdown);
-        }
         TranscriptItemKind::ToolRequest {
             tool_call_id,
             producer_plugin_id,
@@ -2991,9 +3178,10 @@ fn push_transcript_item_rows(
             if let Some(routed) = canonical_request_visual.as_ref().and_then(|visual| {
                 let CanonicalToolVisual::Plugin(visual) = visual;
                 resolve_canonical_plugin_visual(
+                    item,
                     visual,
                     working_directory.as_deref(),
-                    width,
+                    tool_width,
                     plugin_host,
                     keymap_host,
                 )
@@ -3002,7 +3190,12 @@ fn push_transcript_item_rows(
                     (rows, anchors, selection),
                     routed,
                     item,
-                    tool_name,
+                    RoutedHeader {
+                        label: None,
+                        tool: Some(tool_name),
+                        status: None,
+                        fallback_title: tool_name,
+                    },
                     (*status, false),
                     width,
                 );
@@ -3011,7 +3204,7 @@ fn push_transcript_item_rows(
                     tool_name,
                     status: *status,
                 };
-                push_tool_request_rows(rows, item, &context, width);
+                push_tool_request_rows((rows, anchors, selection), item, &context, width);
             }
         }
         TranscriptItemKind::ToolResult {
@@ -3025,9 +3218,7 @@ fn push_transcript_item_rows(
             ..
         } => {
             push_tool_result_rows(
-                rows,
-                anchors,
-                selection,
+                (rows, anchors, selection),
                 item,
                 &ToolResultRenderContext {
                     tool_name: tool_name.as_deref(),
@@ -3042,79 +3233,17 @@ fn push_transcript_item_rows(
                     presentation: plugin_host,
                     keymap: keymap_host,
                 },
-            );
-        }
-        TranscriptItemKind::PermissionRequest {
-            permission_id,
-            tool_call_id,
-            tool_name,
-            ..
-        } => {
-            push_permission_request_rows(rows, item, permission_id, tool_call_id, tool_name, width);
-        }
-        TranscriptItemKind::PermissionResult { approved } => {
-            push_detail_block(
-                rows,
-                "Permission",
-                item.text(),
-                if *approved {
-                    semantic_state_theme().success
-                } else {
-                    semantic_state_theme().error
-                },
-                width,
-            );
-        }
-        TranscriptItemKind::System => {
-            if let Some(markdown) = markdown {
-                push_markdown_projection_block(
-                    rows,
-                    &item.display_role(),
-                    markdown,
-                    semantic_state_theme().transcript.system_label,
-                    width,
-                    false,
-                );
-            } else {
-                push_formatted_block(
-                    rows,
-                    &item.display_role(),
-                    item.text(),
-                    item.text_format(),
-                    semantic_state_theme().transcript.system_label,
-                    false,
-                    width,
-                );
-            }
-        }
-        TranscriptItemKind::Meta => {
-            push_meta_block(rows, item.text(), width);
-        }
-        TranscriptItemKind::Skill => {
-            push_detail_block(
-                rows,
-                "Skill",
-                item.text(),
-                semantic_state_theme().transcript.skill_label,
-                width,
-            );
-        }
-        TranscriptItemKind::SkillError => {
-            push_detail_block(
-                rows,
-                "Skill error",
-                item.text(),
-                semantic_state_theme().transcript.skill_error_label,
-                width,
+                tool_width,
             );
         }
         TranscriptItemKind::ToolRequestDraft { draft } => {
             let visual = tool_request_draft_visual(item, draft);
             let CanonicalToolVisual::Plugin(plugin_visual) = &visual;
             if let Some(routed) = resolve_canonical_plugin_visual(
+                item,
                 plugin_visual,
                 None,
-                width,
+                tool_width,
                 plugin_host,
                 keymap_host,
             ) {
@@ -3122,7 +3251,7 @@ fn push_transcript_item_rows(
                     (rows, anchors, selection),
                     routed,
                     item,
-                    "Tool request draft",
+                    RoutedHeader::labeled("Tool request draft"),
                     (
                         Some(bcode_session_view_models::ToolInvocationViewStatus::Requested),
                         false,
@@ -3144,9 +3273,10 @@ fn push_transcript_item_rows(
                 .as_deref()
                 .and_then(|invocation| invocation.working_directory.as_deref());
             if let Some(routed) = resolve_canonical_plugin_visual(
+                item,
                 plugin_visual,
                 working_directory,
-                width,
+                tool_width,
                 plugin_host,
                 keymap_host,
             ) {
@@ -3154,7 +3284,7 @@ fn push_transcript_item_rows(
                     (rows, anchors, selection),
                     routed,
                     item,
-                    "Tool contribution",
+                    RoutedHeader::labeled("Tool contribution"),
                     (
                         invocation.as_deref().map(|invocation| invocation.status),
                         invocation
@@ -3170,36 +3300,27 @@ fn push_transcript_item_rows(
                     | bcode_session_models::ToolContributionPlacement::Progress
                     | bcode_session_models::ToolContributionPlacement::Result
             ) {
-                push_tool_invocation_fallback_rows(rows, invocation.as_deref(), item, width);
+                push_tool_invocation_fallback_rows(
+                    (rows, anchors, selection),
+                    invocation.as_deref(),
+                    item,
+                    width,
+                );
             }
         }
-        TranscriptItemKind::Interaction { interaction: _ } => {
-            push_detail_block(
-                rows,
-                &item.display_role(),
-                item.text(),
-                semantic_state_theme().info,
-                width,
-            );
+        TranscriptItemKind::UserMessage
+        | TranscriptItemKind::AssistantMessage
+        | TranscriptItemKind::ReasoningMessage
+        | TranscriptItemKind::PermissionRequest { .. }
+        | TranscriptItemKind::PermissionResult { .. }
+        | TranscriptItemKind::System
+        | TranscriptItemKind::Meta
+        | TranscriptItemKind::Skill
+        | TranscriptItemKind::SkillError
+        | TranscriptItemKind::Interaction { .. }
+        | TranscriptItemKind::Generic => {
+            unit_frame::push_unit(rows, anchors, item, width, markdown);
         }
-        TranscriptItemKind::Generic => {
-            push_detail_block(
-                rows,
-                &item.display_role(),
-                item.text(),
-                semantic_state_theme().transcript.detail_label,
-                width,
-            );
-        }
-    }
-    CURRENT_PRESENTATION.with(|current| current.replace(None));
-    if let Some(presentation) = &structure {
-        apply_tool_disclosure(
-            (rows, anchors, selection),
-            branch_start,
-            presentation,
-            width,
-        );
     }
     if let Some(markdown) = markdown
         && matches!(
@@ -3237,17 +3358,117 @@ fn push_transcript_item_rows(
     apply_container_recipe(rows, item_start, layout);
 }
 
-fn push_assistant_rows(
+/// Speaker or heading text a non-tool unit is rendered under today, for
+/// example `Bcode`, `Reasoning …`, or `Permission required · bash`.
+fn default_unit_title(item: &TranscriptItem) -> String {
+    match item.kind() {
+        TranscriptItemKind::AssistantMessage => if item.streaming() {
+            "Bcode …"
+        } else {
+            "Bcode"
+        }
+        .to_owned(),
+        TranscriptItemKind::ReasoningMessage => if item.streaming() {
+            "Reasoning …"
+        } else {
+            "Reasoning"
+        }
+        .to_owned(),
+        TranscriptItemKind::PermissionRequest { tool_name, .. } => {
+            format!("Permission required · {tool_name}")
+        }
+        TranscriptItemKind::PermissionResult { .. } => "Permission".to_owned(),
+        TranscriptItemKind::Skill => "Skill".to_owned(),
+        TranscriptItemKind::SkillError => "Skill error".to_owned(),
+        _ => item.display_role(),
+    }
+}
+
+/// Heading style of a non-tool unit.
+fn unit_title_style(item: &TranscriptItem) -> Style {
+    let theme = semantic_state_theme();
+    match item.kind() {
+        TranscriptItemKind::UserMessage => theme.transcript.user_label.add_modifier(Modifier::BOLD),
+        TranscriptItemKind::AssistantMessage => if item.streaming() {
+            theme.transcript.tool_running_title
+        } else {
+            theme.transcript.assistant_label
+        }
+        .add_modifier(Modifier::BOLD),
+        TranscriptItemKind::ReasoningMessage => theme.transcript.reasoning_label,
+        TranscriptItemKind::PermissionRequest { .. } => theme.error,
+        TranscriptItemKind::PermissionResult { approved } => {
+            if *approved {
+                theme.success
+            } else {
+                theme.error
+            }
+        }
+        TranscriptItemKind::System => theme.transcript.system_label,
+        TranscriptItemKind::Skill => theme.transcript.skill_label,
+        TranscriptItemKind::SkillError => theme.transcript.skill_error_label,
+        TranscriptItemKind::Interaction { .. } => theme.info,
+        TranscriptItemKind::Meta => theme.transcript.meta,
+        _ => theme.transcript.detail_label,
+    }
+}
+
+/// Today's full rendering of a non-tool unit under heading `title`: the
+/// heading, the body, and (except for metadata notes) one trailing blank row.
+fn push_unit_body(
     rows: &mut Vec<Line>,
     item: &TranscriptItem,
+    title: &str,
     width: u16,
     markdown: Option<&bcode_markdown_render::MarkdownRenderResult>,
 ) {
-    let title = if item.streaming() {
-        "Bcode …"
-    } else {
-        "Bcode"
-    };
+    let theme = semantic_state_theme();
+    match item.kind() {
+        TranscriptItemKind::UserMessage | TranscriptItemKind::System => {
+            let (style, prominent) = if matches!(item.kind(), TranscriptItemKind::UserMessage) {
+                (theme.transcript.user_label, true)
+            } else {
+                (theme.transcript.system_label, false)
+            };
+            if let Some(markdown) = markdown {
+                push_markdown_projection_block(rows, title, markdown, style, width, prominent);
+            } else {
+                push_formatted_block(
+                    rows,
+                    title,
+                    item.text(),
+                    item.text_format(),
+                    style,
+                    prominent,
+                    width,
+                );
+            }
+        }
+        TranscriptItemKind::AssistantMessage => {
+            push_assistant_rows(rows, item, title, width, markdown);
+        }
+        TranscriptItemKind::ReasoningMessage => {
+            push_reasoning_rows(rows, item, title, width, markdown);
+        }
+        TranscriptItemKind::PermissionRequest {
+            permission_id,
+            tool_call_id,
+            ..
+        } => {
+            push_permission_request_rows(rows, item, (permission_id, tool_call_id), title, width);
+        }
+        TranscriptItemKind::Meta => push_meta_block(rows, item.text(), width),
+        _ => push_detail_block(rows, title, item.text(), unit_title_style(item), width),
+    }
+}
+
+fn push_assistant_rows(
+    rows: &mut Vec<Line>,
+    item: &TranscriptItem,
+    title: &str,
+    width: u16,
+    markdown: Option<&bcode_markdown_render::MarkdownRenderResult>,
+) {
     let heading_style = if item.streaming() {
         semantic_state_theme().transcript.tool_running_title
     } else {
@@ -4941,14 +5162,10 @@ fn format_aware_json_pretty_prints_valid_values() {
 fn push_reasoning_rows(
     rows: &mut Vec<Line>,
     item: &TranscriptItem,
+    title: &str,
     width: u16,
     markdown: Option<&bcode_markdown_render::MarkdownRenderResult>,
 ) {
-    let title = if item.streaming() {
-        "Reasoning …"
-    } else {
-        "Reasoning"
-    };
     let style = semantic_state_theme().transcript.reasoning_label;
     if let Some(markdown) = markdown {
         push_markdown_projection_block(rows, title, markdown, style, width, false);
@@ -4982,27 +5199,33 @@ struct ToolRequestRenderContext<'a> {
 }
 
 fn push_tool_request_rows(
-    rows: &mut Vec<Line>,
+    output: (
+        &mut Vec<Line>,
+        &mut Vec<bcode_plugin_sdk::tui_visual::TuiVisualAnchor>,
+        &mut Vec<(usize, bcode_plugin_sdk::tui::PluginTuiSelectionRow)>,
+    ),
     item: &TranscriptItem,
     context: &ToolRequestRenderContext<'_>,
     width: u16,
 ) {
-    let title = context.status.map_or_else(
-        || format!("Tool · {}", context.tool_name),
-        |status| {
-            format!(
-                "Tool · {} · {}",
-                context.tool_name,
-                tool_status_label(status)
-            )
-        },
-    );
-    let status = context.status.or_else(|| {
+    let state = context.status.or_else(|| {
         item.tool_is_active()
             .then_some(bcode_session_view_models::ToolInvocationViewStatus::Running)
     });
-    push_tool_block_header(rows, &title, item.tool_timing(), status, false, width);
-    rows.push(Line::default());
+    let anatomy = super::tool_anatomy::ToolAnatomy {
+        header: super::tool_anatomy::HeaderData {
+            label: Some("Tool".to_owned()),
+            tool: Some(context.tool_name.to_owned()),
+            status: context
+                .status
+                .map(|status| tool_status_label(status).to_owned()),
+            state,
+            timing: item.tool_timing(),
+            ..super::tool_anatomy::HeaderData::default()
+        },
+        ..super::tool_anatomy::ToolAnatomy::default()
+    };
+    compose_tool_rows(output, item, anatomy, width);
 }
 
 struct RegistryVisualHost<'a>(&'a bcode_plugin_sdk::tui::keymap::KeymapRegistry);
@@ -5078,7 +5301,28 @@ fn draft_visual_revision_advances_across_provider_revision_and_generation_change
     assert!(revisions[1] < revisions[2]);
 }
 
+/// Presentation handed to a visual adapter (plugin contract v3): the item's
+/// effective structure with its section overrides folded into `sections`, so
+/// adapters see the same section disclosure the composer applies.
+fn adapter_presentation(item: &TranscriptItem) -> Option<ResolvedPresentation> {
+    let mut presentation = item_structure(item)?;
+    STRUCTURE.with(|state| {
+        let state = state.borrow();
+        for name in bcode_presentation_policy::models::HOST_SECTIONS {
+            let target =
+                super::structure::DisclosureTarget::Section(item.id().get(), name.to_owned());
+            if state.target_override(&target).is_some() {
+                presentation
+                    .sections
+                    .insert(name.to_owned(), state.section(item, name));
+            }
+        }
+    });
+    Some(presentation)
+}
+
 fn resolve_canonical_plugin_visual(
+    item: &TranscriptItem,
     visual: &CanonicalPluginVisual,
     working_directory: Option<&std::path::Path>,
     width: u16,
@@ -5096,12 +5340,33 @@ fn resolve_canonical_plugin_visual(
         visual.schema_version,
         visual.producer_plugin_id.as_deref(),
         &visual.payload,
-        &plugin_visual_context(width, working_directory),
+        &adapter_context(item, width, working_directory),
         keymap_host,
     )
 }
 
-/// Compose every tool lifecycle surface through the same chrome boundary.
+/// Header facts of a routed plugin tool surface.
+#[derive(Clone, Copy)]
+struct RoutedHeader<'a> {
+    label: Option<&'a str>,
+    tool: Option<&'a str>,
+    status: Option<&'a str>,
+    /// Title used by transcript-block surfaces when the plugin supplies none.
+    fallback_title: &'a str,
+}
+
+impl<'a> RoutedHeader<'a> {
+    const fn labeled(label: &'a str) -> Self {
+        Self {
+            label: Some(label),
+            tool: None,
+            status: None,
+            fallback_title: label,
+        }
+    }
+}
+
+/// Compose every routed tool lifecycle surface through the tool anatomy.
 fn push_routed_tool_surface(
     output: (
         &mut Vec<Line>,
@@ -5110,239 +5375,118 @@ fn push_routed_tool_surface(
     ),
     routed: crate::plugin_tui::RoutedTuiVisual,
     item: &TranscriptItem,
-    title: &str,
+    header: RoutedHeader<'_>,
     state: (
         Option<bcode_session_view_models::ToolInvocationViewStatus>,
         bool,
     ),
     width: u16,
 ) {
-    let (rows, anchors, selection) = output;
     let (status, is_error) = state;
-    if routed.render_mode != PluginTuiVisualRenderMode::FullBlock {
-        let mut timing = item.tool_timing();
-        if let Some(timeout_ms) = routed.header.timeout_ms {
-            timing.get_or_insert_default().timeout_ms = Some(timeout_ms);
-        }
-        let title = if routed.render_mode == PluginTuiVisualRenderMode::TranscriptBlock {
-            routed.header.title.as_deref().unwrap_or(title)
-        } else {
-            title
-        };
-        push_tool_block_header(rows, title, timing, status, is_error, width);
+    let mut timing = item.tool_timing();
+    if let Some(timeout_ms) = routed.header.timeout_ms {
+        timing.get_or_insert_default().timeout_ms = Some(timeout_ms);
     }
-    let body_start = rows.len();
-    anchors.extend(routed.anchors.into_iter().map(|mut anchor| {
-        anchor.key = format!("{}:{}", routed.route.plugin_id, anchor.key);
-        if let Some(source) = &mut anchor.source {
-            source.identity = format!("{}:{}", routed.route.plugin_id, source.identity);
-        }
-        anchor.row = anchor.row.saturating_add(body_start);
-        anchor
-    }));
-    selection.extend(routed.selection.into_iter().map(|(row, mut source)| {
-        source.identity = format!("{}:{}", routed.route.plugin_id, source.identity);
-        (row.saturating_add(body_start), source)
-    }));
-    rows.extend(routed.rows);
-    rows.push(Line::default());
-}
-
-fn push_canonical_tool_visual_rows(
-    rows: &mut Vec<Line>,
-    visual: &CanonicalToolVisual,
-    working_directory: Option<&std::path::Path>,
-    width: u16,
-    plugin_host: Option<&crate::plugin_tui::PluginTuiPresentation>,
-    keymap_host: &dyn bcode_plugin_sdk::tui::PluginTuiHost,
-) -> bool {
-    let CanonicalToolVisual::Plugin(plugin_visual) = visual;
-    push_canonical_plugin_visual_rows(
-        rows,
-        plugin_visual,
-        working_directory,
-        width,
-        plugin_host,
-        keymap_host,
-    )
-}
-
-fn push_canonical_plugin_visual_rows(
-    rows: &mut Vec<Line>,
-    visual: &CanonicalPluginVisual,
-    working_directory: Option<&std::path::Path>,
-    width: u16,
-    plugin_host: Option<&crate::plugin_tui::PluginTuiPresentation>,
-    keymap_host: &dyn bcode_plugin_sdk::tui::PluginTuiHost,
-) -> bool {
-    let Some(presentation) = plugin_host else {
-        return false;
-    };
-    let visual_started = Instant::now();
-    let routed =
-        resolve_canonical_plugin_visual(visual, working_directory, width, plugin_host, keymap_host);
-    if let Some(routed) = &routed {
-        presentation.record_visual_timing(
-            "render_rows",
-            &routed.route.plugin_id,
-            &routed.route.schema,
-            visual_started,
-        );
-        rows.extend(routed.rows.clone());
-        return true;
-    }
-    false
-}
-
-fn tool_title_style(
-    status: Option<bcode_session_view_models::ToolInvocationViewStatus>,
-    timing: Option<ToolTiming>,
-    is_error: bool,
-) -> Style {
-    use bcode_session_view_models::ToolInvocationViewStatus;
-
-    let theme = semantic_state_theme();
-    if timing.is_some_and(|timing| timing.timed_out == Some(true)) {
-        theme.transcript.tool_timed_out_title
-    } else if is_error || matches!(status, Some(ToolInvocationViewStatus::Failed)) {
-        theme.transcript.tool_failed_title
-    } else {
-        match status {
-            Some(ToolInvocationViewStatus::Running) => theme.transcript.tool_running_title,
-            Some(ToolInvocationViewStatus::Waiting) => theme.transcript.tool_waiting_title,
-            Some(ToolInvocationViewStatus::Finished) => theme.transcript.tool_succeeded_title,
-            Some(ToolInvocationViewStatus::Cancelled) => theme.transcript.tool_cancelled_title,
-            Some(ToolInvocationViewStatus::Requested | ToolInvocationViewStatus::Failed) | None => {
-                theme.transcript.tool_requested_title
+    let title_override =
+        (routed.render_mode == PluginTuiVisualRenderMode::TranscriptBlock).then(|| {
+            routed
+                .header
+                .title
+                .clone()
+                .unwrap_or_else(|| header.fallback_title.to_owned())
+        });
+    let plugin_id = &routed.route.plugin_id;
+    let anchors = routed
+        .anchors
+        .into_iter()
+        .map(|mut anchor| {
+            anchor.key = format!("{plugin_id}:{}", anchor.key);
+            if let Some(source) = &mut anchor.source {
+                source.identity = format!("{plugin_id}:{}", source.identity);
             }
-        }
-    }
-}
-
-fn push_tool_block_header(
-    rows: &mut Vec<Line>,
-    title: &str,
-    timing: Option<ToolTiming>,
-    status: Option<bcode_session_view_models::ToolInvocationViewStatus>,
-    is_error: bool,
-    width: u16,
-) {
-    let theme = semantic_state_theme();
-    let title_style = tool_title_style(status, timing, is_error);
-    let timing = timing.filter(|_| current_part_visible("timing"));
-    let prefix = current_disclosure_marker()
-        .filter(|marker| !marker.is_empty())
-        .map(|marker| {
-            vec![Span::styled(
-                format!("{marker} "),
-                theme.transcript.tool_metadata,
-            )]
+            anchor
         })
-        .unwrap_or_default();
-    let header_start = rows.len();
-    let title = tool_block_title_with_timing(
-        title,
-        timing,
-        matches!(
-            status,
-            Some(
-                bcode_session_view_models::ToolInvocationViewStatus::Running
-                    | bcode_session_view_models::ToolInvocationViewStatus::Waiting
-            )
-        ),
-    );
-    push_wrapped_styled_text(
-        rows,
-        prefix,
-        &title,
-        width,
-        title_style,
-        theme.transcript.tool_metadata,
-    );
-    TOOL_HEADER_ROWS.with(|header| header.set(Some((header_start, rows.len()))));
+        .collect();
+    let selection = routed
+        .selection
+        .into_iter()
+        .map(|(row, mut source)| {
+            source.identity = format!("{plugin_id}:{}", source.identity);
+            (row, source)
+        })
+        .collect();
+    let anatomy = super::tool_anatomy::ToolAnatomy {
+        header: super::tool_anatomy::HeaderData {
+            self_drawn: routed.render_mode == PluginTuiVisualRenderMode::FullBlock,
+            label: header.label.map(str::to_owned),
+            tool: header.tool.map(str::to_owned),
+            target: routed.target,
+            status: header.status.map(str::to_owned),
+            state: status,
+            timing,
+            is_error,
+            title: routed.header.title.clone(),
+            title_override,
+        },
+        summary: routed.summary,
+        sections: routed_sections(routed.rows, anchors, selection, routed.sections),
+    };
+    compose_tool_rows(output, item, anatomy, width);
 }
 
-fn tool_block_title_with_timing(
-    title: &str,
-    timing: Option<ToolTiming>,
-    streaming: bool,
-) -> String {
-    let Some(timing) = timing else {
-        return title.to_owned();
-    };
-    let now_ms = unix_time_millis(std::time::SystemTime::now());
-    let mut parts = Vec::new();
-    if timing.timed_out == Some(true) {
-        parts.push("timed out".to_owned());
+/// Anatomy sections of a routed visual.
+///
+/// The adapter's rows (with their anchors and selection) are the `visual`
+/// section, omitted when empty; adapters without named sections (plugin
+/// contract before v3) therefore render exactly one `visual` section. Named
+/// sections follow in adapter order, each bounded by its own preview.
+fn routed_sections(
+    rows: Vec<Line>,
+    anchors: Vec<bcode_plugin_sdk::tui_visual::TuiVisualAnchor>,
+    selection: Vec<(usize, bcode_plugin_sdk::tui::PluginTuiSelectionRow)>,
+    named: Vec<crate::plugin_tui::RoutedTuiSection>,
+) -> Vec<super::tool_anatomy::Section> {
+    use super::tool_anatomy::{Section, SectionBody};
+    let mut sections = Vec::with_capacity(named.len().saturating_add(1));
+    if named.is_empty() || !rows.is_empty() {
+        sections.push(Section {
+            name: "visual".to_owned(),
+            label: None,
+            body: SectionBody::Rows {
+                rows,
+                anchors,
+                selection,
+            },
+        });
     }
-    if streaming && let Some(started_at_ms) = timing.started_at_ms {
-        parts.push(format!(
-            "elapsed {}",
-            format_millis(now_ms.saturating_sub(started_at_ms))
-        ));
-    }
-    if let Some(timeout_ms) = timing.timeout_ms
-        && (streaming || timing.duration_ms.is_none() && timing.finished_at_ms.is_none())
-    {
-        parts.push(format!("timeout {}", format_millis(timeout_ms)));
-    }
-    if !streaming {
-        if let Some(duration_ms) = timing.duration_ms {
-            parts.push(format!("duration {}", format_millis(duration_ms)));
-        } else if let (Some(started_at_ms), Some(finished_at_ms)) =
-            (timing.started_at_ms, timing.finished_at_ms)
-        {
-            parts.push(format!(
-                "duration {}",
-                format_millis(finished_at_ms.saturating_sub(started_at_ms))
-            ));
-        }
-    }
-    if parts.is_empty() {
-        title.to_owned()
-    } else {
-        format!("{title} · {}", parts.join(" · "))
-    }
+    sections.extend(named.into_iter().map(|section| Section {
+        // Unlabelled namespaced sections (`bcode.git.files`) show their leaf name.
+        label: Some(section.label.unwrap_or_else(|| {
+            section
+                .name
+                .rsplit('.')
+                .next()
+                .unwrap_or(&section.name)
+                .to_owned()
+        })),
+        name: section.name,
+        body: SectionBody::Lines { rows: section.rows },
+    }));
+    sections
 }
 
-fn push_tool_invocation_fallback_rows(
-    rows: &mut Vec<Line>,
-    invocation: Option<&bcode_session_view_models::ToolInvocationView>,
-    item: &TranscriptItem,
-    width: u16,
-) {
-    let Some(invocation) = invocation else {
-        push_meta_block(rows, item.text(), width);
-        return;
-    };
-    let is_error = invocation.is_error == Some(true)
-        || matches!(
-            invocation.status,
-            bcode_session_view_models::ToolInvocationViewStatus::Failed
-        );
-    let title = invocation.tool_name.as_deref().map_or_else(
-        || format!("Tool · {}", tool_status_label(invocation.status)),
-        |name| format!("Tool · {name} · {}", tool_status_label(invocation.status)),
-    );
-    push_tool_block_header(
-        rows,
-        &title,
-        item.tool_timing(),
-        Some(invocation.status),
-        is_error,
-        width,
-    );
-    if let Some(arguments) = invocation.arguments_json.as_deref() {
-        for (label, value) in bounded_tool_argument_fields(arguments) {
-            push_labeled_text_preview(rows, &label, &value, width, 2);
-        }
-    }
-    match invocation.result.as_ref() {
+/// Text sections for a tool result value.
+fn tool_result_sections(
+    result: Option<&bcode_session_view_models::ToolResultView>,
+    result_text: Option<&str>,
+) -> Vec<super::tool_anatomy::Section> {
+    use super::tool_anatomy::{BodyRole, Section};
+    match result {
         Some(bcode_session_view_models::ToolResultView::Text { text }) => {
-            push_labeled_text_preview(rows, "output", text, width, MAX_INLINE_TOOL_TEXT_ROWS);
+            vec![Section::text("output", "output", text, BodyRole::Output)]
         }
         Some(bcode_session_view_models::ToolResultView::Json { value }) => {
-            push_labeled_text_preview(rows, "result", value, width, MAX_INLINE_TOOL_TEXT_ROWS);
+            vec![Section::text("result", "result", value, BodyRole::Output)]
         }
         Some(bcode_session_view_models::ToolResultView::Artifact { artifact }) => {
             let title = artifact
@@ -5350,32 +5494,71 @@ fn push_tool_invocation_fallback_rows(
                 .title
                 .as_deref()
                 .unwrap_or("artifact result");
-            push_labeled_text_preview(rows, "result", title, width, MAX_INLINE_TOOL_TEXT_ROWS);
-            if let Some(result_text) = invocation.result_text.as_deref()
+            let mut sections = vec![Section::text("result", "result", title, BodyRole::Output)];
+            if let Some(result_text) = result_text
                 && result_text != title
             {
-                push_labeled_text_preview(
-                    rows,
+                sections.push(Section::text(
+                    "output",
                     "output",
                     result_text,
-                    width,
-                    MAX_INLINE_TOOL_TEXT_ROWS,
-                );
+                    BodyRole::Output,
+                ));
             }
+            sections
         }
-        None => {
-            if let Some(result_text) = invocation.result_text.as_deref() {
-                push_labeled_text_preview(
-                    rows,
-                    "output",
-                    result_text,
-                    width,
-                    MAX_INLINE_TOOL_TEXT_ROWS,
-                );
-            }
-        }
+        None => result_text
+            .map(|text| vec![Section::text("output", "output", text, BodyRole::Output)])
+            .unwrap_or_default(),
     }
-    rows.push(Line::default());
+}
+
+fn push_tool_invocation_fallback_rows(
+    output: (
+        &mut Vec<Line>,
+        &mut Vec<bcode_plugin_sdk::tui_visual::TuiVisualAnchor>,
+        &mut Vec<(usize, bcode_plugin_sdk::tui::PluginTuiSelectionRow)>,
+    ),
+    invocation: Option<&bcode_session_view_models::ToolInvocationView>,
+    item: &TranscriptItem,
+    width: u16,
+) {
+    use super::tool_anatomy::{BodyRole, Section};
+    let Some(invocation) = invocation else {
+        push_meta_block(output.0, item.text(), width);
+        return;
+    };
+    let is_error = invocation.is_error == Some(true)
+        || matches!(
+            invocation.status,
+            bcode_session_view_models::ToolInvocationViewStatus::Failed
+        );
+    let mut sections = invocation
+        .arguments_json
+        .as_deref()
+        .map(bounded_tool_argument_fields)
+        .unwrap_or_default()
+        .into_iter()
+        .map(|(label, value)| Section::text("arguments", &label, &value, BodyRole::Argument))
+        .collect::<Vec<_>>();
+    sections.extend(tool_result_sections(
+        invocation.result.as_ref(),
+        invocation.result_text.as_deref(),
+    ));
+    let anatomy = super::tool_anatomy::ToolAnatomy {
+        header: super::tool_anatomy::HeaderData {
+            label: Some("Tool".to_owned()),
+            tool: invocation.tool_name.clone(),
+            status: Some(tool_status_label(invocation.status).to_owned()),
+            state: Some(invocation.status),
+            timing: item.tool_timing(),
+            is_error,
+            ..super::tool_anatomy::HeaderData::default()
+        },
+        summary: None,
+        sections,
+    };
+    compose_tool_rows(output, item, anatomy, width);
 }
 
 use bcode_tui_components::transcript::tool_fallback::tool_status_label;
@@ -5389,241 +5572,110 @@ struct ToolResultRenderContext<'a> {
     has_file_preview: bool,
 }
 
-#[allow(clippy::too_many_lines)] // Composition branches preserve distinct host-owned tool chrome.
 fn push_tool_result_rows(
-    rows: &mut Vec<Line>,
-    anchors: &mut Vec<bcode_plugin_sdk::tui_visual::TuiVisualAnchor>,
-    selection: &mut Vec<(usize, bcode_plugin_sdk::tui::PluginTuiSelectionRow)>,
+    output: (
+        &mut Vec<Line>,
+        &mut Vec<bcode_plugin_sdk::tui_visual::TuiVisualAnchor>,
+        &mut Vec<(usize, bcode_plugin_sdk::tui::PluginTuiSelectionRow)>,
+    ),
     item: &TranscriptItem,
     context: &ToolResultRenderContext<'_>,
     width: u16,
     visual_host: TranscriptVisualHost<'_>,
+    visual_width: u16,
 ) {
+    use super::tool_anatomy::{BodyRole, Section};
     let TranscriptVisualHost {
         presentation: plugin_host,
         keymap: keymap_host,
     } = visual_host;
+    let status = if context.is_error { "failed" } else { "ok" };
+    let state = if context.is_error {
+        bcode_session_view_models::ToolInvocationViewStatus::Failed
+    } else {
+        bcode_session_view_models::ToolInvocationViewStatus::Finished
+    };
     if let Some(artifact) = context.artifact {
         let visual = CanonicalToolVisual::from_artifact(artifact);
         let CanonicalToolVisual::Plugin(plugin_visual) = &visual;
         if let Some(routed) = resolve_canonical_plugin_visual(
+            item,
             plugin_visual,
             context.working_directory,
-            width,
+            visual_width,
             plugin_host,
             keymap_host,
         ) {
-            let status = if context.is_error { "failed" } else { "ok" };
-            let title = context.tool_name.map_or_else(
-                || format!("Tool result · {status}"),
-                |name| format!("Tool result · {name} · {status}"),
-            );
-            let title = if routed.render_mode == PluginTuiVisualRenderMode::TranscriptBlock {
-                artifact.title.as_deref().unwrap_or("Tool result")
-            } else {
-                &title
-            };
             push_routed_tool_surface(
-                (rows, anchors, selection),
+                output,
                 routed,
                 item,
-                title,
-                (
-                    Some(if context.is_error {
-                        bcode_session_view_models::ToolInvocationViewStatus::Failed
-                    } else {
-                        bcode_session_view_models::ToolInvocationViewStatus::Finished
-                    }),
-                    context.is_error,
-                ),
+                RoutedHeader {
+                    label: Some("Tool result"),
+                    tool: context.tool_name,
+                    status: Some(status),
+                    fallback_title: artifact.title.as_deref().unwrap_or("Tool result"),
+                },
+                (Some(state), context.is_error),
                 width,
             );
             return;
         }
     }
-    let status = if context.is_error { "failed" } else { "ok" };
-    let title = context.tool_name.map_or_else(
-        || format!("Tool result · {status}"),
-        |name| format!("Tool result · {name} · {status}"),
-    );
-    push_tool_block_header(
-        rows,
-        &title,
-        item.tool_timing(),
-        Some(if context.is_error {
-            bcode_session_view_models::ToolInvocationViewStatus::Failed
-        } else {
-            bcode_session_view_models::ToolInvocationViewStatus::Finished
-        }),
-        context.is_error,
-        width,
-    );
+    let mut sections = Vec::new();
     if let Some(artifact) = context.artifact {
-        let visual = CanonicalToolVisual::from_artifact(artifact);
-        if push_canonical_tool_visual_rows(
-            rows,
-            &visual,
-            context.working_directory,
-            width,
-            plugin_host,
-            keymap_host,
-        ) {
-            rows.push(Line::default());
-            return;
-        }
         let title = artifact.title.as_deref().unwrap_or("artifact result");
-        push_labeled_text_preview(rows, "result", title, width, MAX_INLINE_TOOL_TEXT_ROWS);
+        sections.push(Section::text("result", "result", title, BodyRole::Output));
         let result = context.result.trim();
         if !result.is_empty() && result != title && !result.contains(&artifact.schema) {
-            push_labeled_text_preview(rows, "output", result, width, MAX_INLINE_TOOL_TEXT_ROWS);
+            sections.push(Section::text("output", "output", result, BodyRole::Output));
         }
-        rows.push(Line::default());
-        return;
-    }
-    if context.has_file_preview && !context.result.trim().is_empty() {
-        let theme = semantic_state_theme();
-        push_wrapped_styled_text(
-            rows,
-            vec![Span::styled("  ", theme.transcript.tool_metadata)],
-            &format!("confirmation: {}", context.result.trim()),
-            width,
-            theme.transcript.tool_output,
-            theme.transcript.tool_metadata,
-        );
     } else {
-        push_labeled_text_preview(
-            rows,
-            "output",
-            item.text(),
-            width,
-            MAX_INLINE_TOOL_TEXT_ROWS,
-        );
+        if context.has_file_preview && !context.result.trim().is_empty() {
+            sections.push(Section::line(
+                "confirmation",
+                format!("confirmation: {}", context.result.trim()),
+                BodyRole::Output,
+            ));
+        } else {
+            sections.push(Section::text(
+                "output",
+                "output",
+                item.text(),
+                BodyRole::Output,
+            ));
+        }
+        if context.is_error {
+            sections.push(Section::line(
+                "error",
+                "tool failed".to_owned(),
+                BodyRole::Failure,
+            ));
+        }
     }
-    if context.is_error {
-        let theme = semantic_state_theme();
-        push_wrapped_styled_text(
-            rows,
-            vec![Span::styled("  ", theme.transcript.tool_metadata)],
-            "tool failed",
-            width,
-            theme.transcript.tool_failed_title,
-            theme.transcript.tool_metadata,
-        );
-    }
-    rows.push(Line::default());
+    let anatomy = super::tool_anatomy::ToolAnatomy {
+        header: super::tool_anatomy::HeaderData {
+            label: Some("Tool result".to_owned()),
+            tool: context.tool_name.map(str::to_owned),
+            status: Some(status.to_owned()),
+            state: Some(state),
+            timing: item.tool_timing(),
+            is_error: context.is_error,
+            ..super::tool_anatomy::HeaderData::default()
+        },
+        summary: None,
+        sections,
+    };
+    compose_tool_rows(output, item, anatomy, width);
 }
 
 use bcode_tui_components::transcript::tool_fallback::bounded_tool_argument_fields;
 
-fn push_labeled_text_preview(
-    rows: &mut Vec<Line>,
-    label: &str,
-    text: &str,
-    width: u16,
-    max_rows: usize,
-) {
-    let part = match label {
-        "arguments" | "input" | "request" => "arguments",
-        "output" => "output",
-        _ => "result",
-    };
-    if text.is_empty() || !current_part_visible(part) {
-        return;
-    }
-    if part != "arguments" {
-        TOOL_SUMMARY.with(|summary| {
-            let mut summary = summary.borrow_mut();
-            if summary.is_none() {
-                *summary = text
-                    .lines()
-                    .map(str::trim)
-                    .find(|line| !line.is_empty())
-                    .map(str::to_owned);
-            }
-        });
-    }
-    let preview = current_preview();
-    let max_rows = preview.map_or(max_rows, |preview| {
-        usize::try_from(preview.lines).unwrap_or(usize::MAX)
-    });
-    let keep = preview.map_or(
-        bcode_presentation_policy::models::PreviewKeep::Tail,
-        |preview| preview.keep,
-    );
-    let theme = semantic_state_theme();
-    push_wrapped_styled_text(
-        rows,
-        vec![Span::styled("  ", theme.transcript.tool_metadata)],
-        label,
-        width,
-        theme.transcript.tool_label,
-        theme.transcript.tool_metadata,
-    );
-    let body_style = if matches!(label, "output" | "result") {
-        theme.transcript.tool_output
-    } else {
-        theme.transcript.tool_argument
-    };
-    let lines = text
-        .lines()
-        .map(|line| Line::from_spans(vec![Span::styled(line, body_style)]))
-        .collect::<Vec<_>>();
-    let total = lines.len();
-    for line in preview_lines(&lines, max_rows, keep) {
-        rows.push(prefix_line(
-            line.clone(),
-            "    ",
-            theme.transcript.tool_metadata,
-        ));
-    }
-    if total > max_rows {
-        push_wrapped_styled_text(
-            rows,
-            vec![Span::styled("    ", theme.transcript.tool_metadata)],
-            &format!("… {} {label} rows hidden …", total - max_rows),
-            width,
-            theme.transcript.tool_truncation,
-            theme.transcript.tool_truncation,
-        );
-    }
-}
-
-fn preview_lines(
-    lines: &[Line],
-    max_rows: usize,
-    keep: bcode_presentation_policy::models::PreviewKeep,
-) -> Vec<&Line> {
-    use bcode_presentation_policy::models::PreviewKeep;
-    if lines.len() <= max_rows {
-        return lines.iter().collect();
-    }
-    match keep {
-        PreviewKeep::Head => lines.iter().take(max_rows).collect(),
-        PreviewKeep::Tail => lines.iter().skip(lines.len() - max_rows).collect(),
-        PreviewKeep::Both => {
-            let head = max_rows.div_ceil(2);
-            let tail = max_rows - head;
-            lines
-                .iter()
-                .take(head)
-                .chain(lines.iter().skip(lines.len() - tail))
-                .collect()
-        }
-    }
-}
-
-fn prefix_line(mut line: Line, prefix: &str, prefix_style: Style) -> Line {
-    let mut spans = vec![Span::styled(prefix.to_owned(), prefix_style)];
-    spans.append(&mut line.spans);
-    Line::from_spans(spans)
-}
-
 fn push_permission_request_rows(
     rows: &mut Vec<Line>,
     item: &TranscriptItem,
-    permission_id: &str,
-    tool_call_id: &str,
-    tool_name: &str,
+    (permission_id, tool_call_id): (&str, &str),
+    title: &str,
     width: u16,
 ) {
     let body = format!(
@@ -5632,13 +5684,7 @@ fn push_permission_request_rows(
         tool_call_id,
         item.text()
     );
-    push_detail_block(
-        rows,
-        &format!("Permission required · {tool_name}"),
-        &body,
-        semantic_state_theme().error,
-        width,
-    );
+    push_detail_block(rows, title, &body, semantic_state_theme().error, width);
 }
 
 fn push_pending_submission_rows(rows: &mut Vec<Line>, pending: &PendingSubmission, width: u16) {
@@ -6287,9 +6333,970 @@ mod disclosure_tests {
     }
 
     #[test]
-    fn disclosure_hit_ids_round_trip() {
-        assert_eq!(disclosure_item_from_hit("disclosure:42"), Some(42));
-        assert_eq!(disclosure_item_from_hit("markdown:42"), None);
-        assert_eq!(disclosure_item_from_hit("disclosure:x"), None);
+    fn signatures_change_with_section_overrides() {
+        let mut state = with_rules("");
+        let item =
+            super::super::transcript::tool_result_item("c1", Some("read"), None, &output(3), false);
+        let before = transcript_item_signature(&item, 60, ());
+        let facts = crate::structure::unit_facts(&item).unwrap();
+        let target = crate::structure::DisclosureTarget::Section(item.id().get(), "output".into());
+        state.toggle_target(
+            &target,
+            bcode_presentation_policy::models::Disclosure::Expanded,
+            &facts,
+        );
+        set_structure(state.snapshot());
+        assert_ne!(transcript_item_signature(&item, 60, ()), before);
+        let rows = rows_for(&item);
+        assert!(
+            rows.iter().any(|row| row.contains("▸ output · 3 rows")),
+            "{rows:?}"
+        );
+        assert!(!rows.iter().any(|row| row.contains("line 1")), "{rows:?}");
+    }
+
+    #[test]
+    fn hit_regions_cover_only_visible_disclosure_anchor_rows() {
+        let state = with_rules("");
+        let items = (0..3)
+            .map(|index| {
+                super::super::transcript::tool_result_item(
+                    &format!("c{index}"),
+                    Some("read"),
+                    None,
+                    &output(4),
+                    false,
+                )
+            })
+            .collect::<Vec<_>>();
+        let width = 40;
+        let layouts = items
+            .iter()
+            .map(|item| {
+                transcript_item_layout_from_item(
+                    item,
+                    width,
+                    None,
+                    TuiDiffViewerConfig::default(),
+                    None,
+                )
+            })
+            .collect::<Vec<_>>();
+        let starts = layouts
+            .iter()
+            .scan(0, |start, (rows, _, _)| {
+                let current = *start;
+                *start += rows.len();
+                Some(current)
+            })
+            .collect::<Vec<_>>();
+        let theme = semantic_state_theme();
+        let regions = |area: Rect, top_row: usize| {
+            disclosure_hit_regions(
+                items.iter().enumerate(),
+                |index| starts.get(index).copied(),
+                |index, key| {
+                    layouts[index]
+                        .1
+                        .iter()
+                        .find(|anchor| anchor.key == key)
+                        .map(|anchor| anchor.row)
+                },
+                &theme,
+                area,
+                top_row,
+            )
+        };
+        let painted_row = |index: usize, key: &str| {
+            let (rows, anchors, _) = &layouts[index];
+            let row = anchors.iter().find(|anchor| anchor.key == key).unwrap().row;
+            (starts[index] + row, rows[row].plain_text())
+        };
+
+        let area = Rect::new(2, 3, width, 5);
+        let top = starts[1] + 1;
+        let visible = regions(area, top);
+        assert_ne!(visible, []);
+        for region in &visible {
+            assert!(region.area.y >= area.y && region.area.bottom() <= area.bottom());
+            assert!(region.area.x >= area.x && region.area.right() <= area.right());
+            let target = crate::structure::DisclosureTarget::from_hit_id(region.id.as_str())
+                .expect("disclosure hit id");
+            let index = items
+                .iter()
+                .position(|item| item.id().get() == target.item_id())
+                .unwrap();
+            let (global, text) = painted_row(index, region.id.as_str());
+            assert_eq!(usize::from(region.area.y - area.y) + top, global);
+            assert!(!text.trim().is_empty(), "region on a painted row");
+        }
+        // The first item's header scrolled out; the second's header is just above the viewport.
+        let unit = |index: usize| {
+            crate::structure::DisclosureTarget::Unit(items[index].id().get()).to_hit_id()
+        };
+        assert!(!visible.iter().any(|region| region.id.as_str() == unit(0)));
+        assert!(!visible.iter().any(|region| region.id.as_str() == unit(1)));
+        assert!(visible.iter().any(|region| {
+            region.id.as_str()
+                == crate::structure::DisclosureTarget::Section(items[1].id().get(), "output".into())
+                    .to_hit_id()
+        }));
+
+        // Clipped horizontally and vertically to a tiny area.
+        let tiny = Rect::new(0, 0, 3, 1);
+        let clipped = regions(tiny, 0);
+        assert_eq!(clipped.len(), 1, "{clipped:?}");
+        assert_eq!(clipped[0].id.as_str(), unit(0));
+        assert!(clipped[0].area.right() <= tiny.right());
+        assert_eq!(regions(Rect::new(0, 0, width, 0), 0), []);
+        drop(state);
+    }
+}
+
+#[cfg(test)]
+mod group_tests {
+    use bcode_config::TuiDiffViewerConfig;
+    use bcode_plugin_sdk::tui_visual::TuiVisualAnchor;
+    use bcode_presentation_policy::models::{
+        Disclosure, LayerSource, PresentationSection, RuleLayer,
+    };
+    use bcode_session_view_models::ToolInvocationViewStatus;
+
+    use super::super::transcript::tool_result_item;
+    use super::super::transcript_layout::{
+        TranscriptLayoutCache, TranscriptLayoutFingerprint, TranscriptLayoutRows,
+        TranscriptLayoutSignature, TranscriptLayoutSpec, VisibleTranscriptSource,
+    };
+    use super::*;
+    use crate::structure::{DisclosureTarget, StructureState};
+
+    type Layout = (
+        Vec<Line>,
+        Vec<TuiVisualAnchor>,
+        Vec<(usize, bcode_plugin_sdk::tui::PluginTuiSelectionRow)>,
+    );
+
+    fn rules(group_disclosure: &str) -> String {
+        format!(
+            "[[rules]]\nmatch = {{ kind = \"tool\" }}\nset = {{ group = {{ by = \"consecutive\" }} }}\n[[rules]]\nmatch = {{ kind = \"group\" }}\nset = {{ disclosure = \"{group_disclosure}\" }}"
+        )
+    }
+
+    fn grouped(rules: &str, items: &[TranscriptItem]) -> StructureState {
+        let mut state = StructureState::default();
+        state.set_layers(&[RuleLayer {
+            source: LayerSource::Theme("test".into()),
+            rules: toml::from_str::<PresentationSection>(rules).unwrap().rules,
+        }]);
+        state.sync_groups(&items.iter().collect::<Vec<_>>());
+        set_structure(state.snapshot());
+        state
+    }
+
+    fn tools() -> Vec<TranscriptItem> {
+        vec![
+            tool_result_item("a", Some("read"), None, "alpha 1\nalpha 2", false),
+            tool_result_item("b", Some("read"), None, "beta 1", false),
+            tool_result_item("c", Some("grep"), None, "gamma 1", false),
+        ]
+    }
+
+    fn running(call: &str, name: &str) -> TranscriptItem {
+        TranscriptItem::with_kind(
+            "Tool",
+            "{}".to_owned(),
+            false,
+            TranscriptItemKind::ToolRequest {
+                tool_call_id: call.to_owned(),
+                producer_plugin_id: None,
+                tool_name: name.to_owned(),
+                working_directory: None,
+                active: true,
+                status: Some(ToolInvocationViewStatus::Running),
+                timing: ToolTiming::default(),
+            },
+        )
+    }
+
+    fn layouts(items: &[TranscriptItem], width: u16) -> Vec<Layout> {
+        items
+            .iter()
+            .map(|item| {
+                transcript_item_layout_from_item(
+                    item,
+                    width,
+                    None,
+                    TuiDiffViewerConfig::default(),
+                    None,
+                )
+            })
+            .collect()
+    }
+
+    fn text(rows: &[Line]) -> Vec<String> {
+        rows.iter().map(Line::plain_text).collect()
+    }
+
+    fn anchor(layout: &Layout, target: &DisclosureTarget) -> Option<usize> {
+        let key = target.to_hit_id();
+        layout
+            .1
+            .iter()
+            .find(|anchor| anchor.key == key)
+            .map(|anchor| anchor.row)
+    }
+
+    fn assert_bounded(layouts: &[Layout], width: u16) {
+        for (rows, _, _) in layouts {
+            for row in rows {
+                assert!(
+                    bmux_tui::text_width::display_width(&row.plain_text()) <= usize::from(width),
+                    "{row:?} exceeds {width}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn collapsed_groups_render_one_header_and_no_member_rows() {
+        let items = tools();
+        let _state = grouped(&rules("collapsed"), &items);
+        let layouts = layouts(&items, 60);
+        let leader = text(&layouts[0].0);
+        assert_eq!(leader.len(), 2, "header plus group spacing: {leader:?}");
+        assert_eq!(leader[0], "▸ 3 tool calls · read ×2, grep · ok");
+        assert_eq!(leader[1], "");
+        assert_eq!(
+            anchor(&layouts[0], &DisclosureTarget::Group(items[0].id().get())),
+            Some(0)
+        );
+        assert_eq!(
+            anchor(&layouts[0], &DisclosureTarget::Unit(items[0].id().get())),
+            None
+        );
+        assert!(layouts[1].0.is_empty() && layouts[2].0.is_empty());
+        assert!(layouts[1].1.is_empty() && layouts[2].1.is_empty());
+    }
+
+    #[test]
+    fn summarized_groups_render_one_member_row_each_as_unit_targets() {
+        let items = tools();
+        let _state = grouped(&rules("summary"), &items);
+        let layouts = layouts(&items, 60);
+        let leader = text(&layouts[0].0);
+        assert_eq!(leader.len(), 2, "{leader:?}");
+        assert!(leader[0].starts_with("▸ 3 tool calls"), "{leader:?}");
+        assert!(
+            leader[1].starts_with("  ▸ "),
+            "member row indented: {leader:?}"
+        );
+        assert!(leader[1].contains("read"));
+        assert_eq!(
+            anchor(&layouts[0], &DisclosureTarget::Unit(items[0].id().get())),
+            Some(1)
+        );
+        let middle = text(&layouts[1].0);
+        assert_eq!(middle.len(), 1, "{middle:?}");
+        assert_eq!(
+            anchor(&layouts[1], &DisclosureTarget::Unit(items[1].id().get())),
+            Some(0)
+        );
+        let last = text(&layouts[2].0);
+        assert_eq!(last.len(), 2, "the closer carries group spacing: {last:?}");
+        assert!(last[0].contains("grep") && last[1].is_empty());
+        assert!(
+            !leader
+                .iter()
+                .chain(&middle)
+                .any(|row| row.contains("alpha"))
+        );
+    }
+
+    #[test]
+    fn expanded_groups_render_every_member_indented() {
+        let items = tools();
+        let _state = grouped(&rules("expanded"), &items);
+        let layouts = layouts(&items, 60);
+        let leader = text(&layouts[0].0);
+        assert!(leader[0].starts_with("▾ 3 tool calls"), "{leader:?}");
+        assert!(leader[1].starts_with("  ▾ "), "{leader:?}");
+        assert!(
+            leader.iter().any(|row| row.starts_with("      alpha 1")),
+            "member body indented past the group: {leader:?}"
+        );
+        assert!(text(&layouts[1].0).iter().any(|row| row.contains("beta 1")));
+        assert!(
+            text(&layouts[2].0)
+                .iter()
+                .any(|row| row.contains("gamma 1"))
+        );
+        assert_bounded(&layouts, 60);
+    }
+
+    #[test]
+    fn collapsed_groups_reveal_running_and_failed_members_in_place() {
+        let items = vec![
+            tool_result_item("a", Some("read"), None, "alpha", false),
+            running("b", "read"),
+            tool_result_item("c", Some("read"), None, "boom", true),
+            tool_result_item("d", Some("read"), None, "delta", false),
+        ];
+        let _state = grouped(&rules("collapsed"), &items);
+        let layouts = layouts(&items, 60);
+        let leader = text(&layouts[0].0);
+        assert_eq!(
+            leader.len(),
+            1,
+            "no spacing before revealed members: {leader:?}"
+        );
+        assert!(leader[0].starts_with("▸ 4 tool calls · read ×4 · running"));
+        let revealed = text(&layouts[1].0);
+        assert!(revealed[0].starts_with("  "), "{revealed:?}");
+        assert!(!layouts[2].0.is_empty(), "failed member revealed");
+        assert_eq!(layouts[3].0, [] as [Line; 0]);
+    }
+
+    #[test]
+    fn bridged_reasoning_is_padded_only_when_the_group_is_expanded() {
+        let reasoning = TranscriptItem::with_kind(
+            "Reasoning",
+            "thinking it over".to_owned(),
+            false,
+            TranscriptItemKind::ReasoningMessage,
+        );
+        let items = vec![
+            tool_result_item("a", Some("read"), None, "alpha", false),
+            reasoning,
+            tool_result_item("b", Some("read"), None, "beta", false),
+        ];
+        let mut state = grouped(&rules("collapsed"), &items);
+        assert_eq!(layouts(&items, 60)[1].0, [] as [Line; 0]);
+        // A bridge the group hides needs no Markdown projection.
+        assert!(!markdown_projection_active(&items[1]));
+        let leader = items[0].id().get();
+        let facts = state.snapshot().group_view(leader).unwrap().facts.clone();
+        assert!(state.set_target(
+            &DisclosureTarget::Group(leader),
+            Disclosure::Expanded,
+            &facts
+        ));
+        state.sync_groups(&items.iter().collect::<Vec<_>>());
+        set_structure(state.snapshot());
+        let bridged = text(&layouts(&items, 60)[1].0);
+        assert!(
+            bridged
+                .iter()
+                .filter(|row| !row.is_empty())
+                .all(|row| row.starts_with("  ")),
+            "{bridged:?}"
+        );
+        assert!(bridged.iter().any(|row| row.contains("thinking it over")));
+    }
+
+    #[test]
+    fn group_headers_stay_on_one_bounded_row_at_tiny_widths_and_wide_text() {
+        let items = vec![
+            tool_result_item("a", Some("読み込み"), None, "x", false),
+            tool_result_item("b", Some("🔍e\u{301}"), None, "y", false),
+        ];
+        for width in [0_u16, 1, 2, 5, 12] {
+            let _state = grouped(&rules("collapsed"), &items);
+            let layouts = layouts(&items, width);
+            let header = DisclosureTarget::Group(items[0].id().get());
+            assert_eq!(anchor(&layouts[0], &header), Some(0), "width {width}");
+            assert_eq!(layouts[1].0, [] as [Line; 0]);
+            assert_bounded(&layouts, width.max(1));
+            if width == 0 {
+                assert_eq!(layouts[0].0[0].plain_text(), "");
+            }
+        }
+    }
+
+    fn cache_for(layouts: &[Layout], width: u16) -> TranscriptLayoutCache {
+        let mut cache = TranscriptLayoutCache::default();
+        cache.sync(TranscriptLayoutSpec {
+            width,
+            fingerprint: TranscriptLayoutFingerprint::new("groups".to_owned()),
+            structural_fingerprint: TranscriptLayoutFingerprint::new("groups".to_owned()),
+            transcript_len: layouts.len(),
+            pending_len: 0,
+            transcript_signature: |index| TranscriptLayoutSignature::new(format!("{index}")),
+            transcript_rows: |index: usize| {
+                let (rows, anchors, selection) = layouts[index].clone();
+                TranscriptLayoutRows::Selected {
+                    rows,
+                    anchors,
+                    selection: selection.into_iter().collect(),
+                }
+            },
+            transcript_invocation_id: |_| None,
+            pending_signature: |_| unreachable!("no pending"),
+            pending_rows: |_| unreachable!("no pending"),
+            history_banner_signature: || None,
+            history_banner_rows: || Vec::new().into(),
+            reset: || false,
+        });
+        cache
+    }
+
+    #[test]
+    fn zero_row_members_agree_across_scrolling_rows_and_hit_regions() {
+        let mut items = tools();
+        items.push(tool_result_item("z", Some("bash"), None, "after", false));
+        let state = grouped(&rules("summary"), &items);
+        // Collapse one member back to nothing by collapsing the group.
+        let width = 40;
+        let leader = items[0].id().get();
+        let mut state = state;
+        let facts = state.snapshot().group_view(leader).unwrap().facts.clone();
+        state.set_target(
+            &DisclosureTarget::Group(leader),
+            Disclosure::Collapsed,
+            &facts,
+        );
+        state.sync_groups(&items.iter().collect::<Vec<_>>());
+        set_structure(state.snapshot());
+        let layouts = layouts(&items, width);
+        let cache = cache_for(&layouts, width);
+        let total: usize = layouts.iter().map(|layout| layout.0.len()).sum();
+        assert_eq!(cache.total_rows(), total);
+        let start = |index| cache.entry_start_row(VisibleTranscriptSource::Transcript, index);
+        // Empty member entries start where the next painted entry starts.
+        assert_eq!(start(1), start(3));
+        assert_eq!(start(2), start(3));
+        for row in 0..total {
+            let line = cache.line_at_row(row).expect("every row maps to an entry");
+            assert_ne!(layouts[line.entry_index].0, [] as [Line; 0]);
+            assert_eq!(
+                cache.line(line).map(Line::plain_text),
+                Some(layouts[line.entry_index].0[line.row_in_entry].plain_text())
+            );
+        }
+        let visible = cache.visible_lines_from_top(0, u16::try_from(total).unwrap());
+        assert!(
+            visible
+                .iter()
+                .all(|line| line.entry_index != 1 && line.entry_index != 2)
+        );
+
+        let theme = semantic_state_theme();
+        for top in 0..total {
+            let area = Rect::new(1, 2, width, 2);
+            let regions = disclosure_hit_regions(
+                items.iter().enumerate(),
+                start,
+                |index, key| cache.content_anchor_row(index, key),
+                &theme,
+                area,
+                top,
+            );
+            for region in &regions {
+                let row = top + usize::from(region.area.y - area.y);
+                let line = cache.line_at_row(row).unwrap();
+                let target = DisclosureTarget::from_hit_id(region.id.as_str()).unwrap();
+                assert_eq!(
+                    items[line.entry_index].id().get(),
+                    target.item_id(),
+                    "region {:?} at top {top} sits on its own painted row",
+                    region.id
+                );
+                assert!(region.area.right() <= area.right());
+            }
+            let group = DisclosureTarget::Group(leader).to_hit_id();
+            assert_eq!(
+                regions.iter().any(|region| region.id.as_str() == group),
+                top == 0,
+                "group region only while its header row is in view (top {top})"
+            );
+        }
+    }
+
+    #[test]
+    fn group_signatures_change_for_every_member_when_the_group_toggles() {
+        let items = tools();
+        let mut state = grouped(&rules("collapsed"), &items);
+        let before: Vec<_> = items
+            .iter()
+            .map(|item| transcript_item_signature(item, 60, ()))
+            .collect();
+        let leader = items[0].id().get();
+        let facts = state.snapshot().group_view(leader).unwrap().facts.clone();
+        state.toggle_target(
+            &DisclosureTarget::Group(leader),
+            Disclosure::Collapsed,
+            &facts,
+        );
+        let changed = state.sync_groups(&items.iter().collect::<Vec<_>>());
+        assert_eq!(changed, std::collections::BTreeSet::from([0, 1, 2]));
+        set_structure(state.snapshot());
+        for (item, before) in items.iter().zip(before) {
+            assert_ne!(transcript_item_signature(item, 60, ()), before);
+        }
+    }
+
+    #[test]
+    fn sample_rows_compute_groups_for_standalone_items() {
+        let items = tools();
+        let mut state = StructureState::default();
+        state.set_layers(&[RuleLayer {
+            source: LayerSource::Theme("test".into()),
+            rules: toml::from_str::<PresentationSection>(&rules("collapsed"))
+                .unwrap()
+                .rules,
+        }]);
+        let rows = text(&sample_transcript_rows(&items, 60, state.snapshot()));
+        assert_eq!(rows, ["▸ 3 tool calls · read ×2, grep · ok", ""]);
+    }
+}
+
+#[cfg(test)]
+mod unit_frame_tests {
+    use bcode_config::TuiDiffViewerConfig;
+    use bcode_presentation_policy::models::{LayerSource, PresentationSection, RuleLayer};
+
+    use super::*;
+
+    fn with_rules(rules: &str) -> crate::structure::StructureState {
+        let mut state = crate::structure::StructureState::default();
+        state.set_layers(&[RuleLayer {
+            source: LayerSource::Theme("test".into()),
+            rules: toml::from_str::<PresentationSection>(rules).unwrap().rules,
+        }]);
+        set_structure(state.snapshot());
+        state
+    }
+
+    fn layout(
+        item: &TranscriptItem,
+        width: u16,
+    ) -> (
+        Vec<Line>,
+        Vec<bcode_plugin_sdk::tui_visual::TuiVisualAnchor>,
+    ) {
+        let (rows, anchors, _) = transcript_item_layout_with_keymap(
+            item,
+            width,
+            None,
+            TuiDiffViewerConfig::default(),
+            None,
+            &bcode_plugin_sdk::tui::keymap::KeymapRegistry::default(),
+        );
+        (rows, anchors)
+    }
+
+    fn text(rows: &[Line]) -> Vec<String> {
+        rows.iter()
+            .map(|line| {
+                line.spans
+                    .iter()
+                    .map(|span| span.content.as_str())
+                    .collect()
+            })
+            .collect()
+    }
+
+    fn unit_anchor(
+        item: &TranscriptItem,
+        anchors: &[bcode_plugin_sdk::tui_visual::TuiVisualAnchor],
+    ) -> Option<usize> {
+        let key = crate::structure::DisclosureTarget::Unit(item.id().get()).to_hit_id();
+        anchors
+            .iter()
+            .find(|anchor| anchor.key == key)
+            .map(|anchor| anchor.row)
+    }
+
+    fn sample_items() -> Vec<TranscriptItem> {
+        let mut streaming = TranscriptItem::new("Assistant", "partial **bold**".to_owned());
+        streaming.streaming = true;
+        vec![
+            TranscriptItem::new("You", "Why?\n\nBecause.".to_owned()),
+            TranscriptItem::with_format(
+                "You",
+                "# Title\n\n* one\n* two".to_owned(),
+                TextFormat::Markdown,
+            ),
+            TranscriptItem::with_format(
+                "Assistant",
+                "Answer with `code`.".to_owned(),
+                TextFormat::Markdown,
+            ),
+            streaming,
+            TranscriptItem::new("Reasoning summary", "Consider the layout.".to_owned()),
+            TranscriptItem::new("System", "Model changed.".to_owned()),
+            TranscriptItem::new("Compaction", "Context compacted.".to_owned()),
+            TranscriptItem::new("Skill", "rust loaded".to_owned()),
+            TranscriptItem::new("Skill error", "missing skill".to_owned()),
+            TranscriptItem::new("Other", String::new()),
+            super::super::transcript::permission_result_item("perm-1", false),
+            super::super::transcript::permission_request_item(
+                "perm-2", "call-2", "bash", "{}", None, None,
+            ),
+        ]
+    }
+
+    #[test]
+    fn default_presentation_keeps_every_unit_kind_byte_identical() {
+        let _state = with_rules("");
+        for width in [0, 1, 7, 40, 80] {
+            for item in sample_items() {
+                let (rows, anchors) = layout(&item, width);
+                let mut expected = Vec::new();
+                push_unit_body(
+                    &mut expected,
+                    &item,
+                    &default_unit_title(&item),
+                    TranscriptItemLayout::resolve(&semantic_state_theme(), &item, width)
+                        .content_width,
+                    None,
+                );
+                let mut layout_expected = expected.clone();
+                apply_container_recipe(
+                    &mut layout_expected,
+                    0,
+                    TranscriptItemLayout::resolve(&semantic_state_theme(), &item, width),
+                );
+                assert_eq!(rows, layout_expected, "{} at {width}", item.role());
+                // The heading row is the unit's disclosure anchor.
+                let layout = TranscriptItemLayout::resolve(&semantic_state_theme(), &item, width);
+                assert_eq!(unit_anchor(&item, &anchors), Some(layout.bottom_rows));
+                assert!(markdown_projection_active(&item));
+            }
+        }
+    }
+
+    #[test]
+    fn collapsed_and_summarized_messages_show_the_speaker_header() {
+        let _state = with_rules(
+            "[[rules]]\nmatch = { kind = \"assistant_message\" }\nset = { disclosure = \"collapsed\" }\n\
+             [[rules]]\nmatch = { kind = \"user_message\" }\nset = { disclosure = \"summary\" }",
+        );
+        let reply = TranscriptItem::new("Assistant", "First.\nSecond.".to_owned());
+        let (rows, anchors) = layout(&reply, 40);
+        assert_eq!(text(&rows), ["▸ Bcode", ""]);
+        assert_eq!(unit_anchor(&reply, &anchors), Some(0));
+        assert!(!markdown_projection_active(&reply));
+
+        let question = TranscriptItem::new("You", "\n\n   What changed?  \nMore".to_owned());
+        let (rows, anchors) = layout(&question, 40);
+        assert_eq!(text(&rows), ["▸ You", "  What changed?", ""]);
+        assert_eq!(unit_anchor(&question, &anchors), Some(0));
+    }
+
+    #[test]
+    fn hidden_units_leave_a_bounded_clickable_count_marker() {
+        let _state = with_rules(
+            "[[rules]]\nmatch = { kind = [\"reasoning\", \"assistant_message\", \"user_message\"] }\nset = { disclosure = \"hidden\" }",
+        );
+        let reasoning = TranscriptItem::new("Reasoning summary", "thinking".to_owned());
+        let reply = TranscriptItem::new("Assistant", "答え 😀 e\u{301}".to_owned());
+        for (item, marker) in [
+            (&reasoning, "▸ 1 reasoning block hidden"),
+            (&reply, "▸ 1 message hidden"),
+        ] {
+            let (rows, anchors) = layout(item, 40);
+            assert_eq!(text(&rows), [marker, ""]);
+            // The marker row is the unit's disclosure target.
+            assert_eq!(unit_anchor(item, &anchors), Some(0));
+            assert!(!markdown_projection_active(item));
+        }
+        for width in [0_u16, 1, 3] {
+            let (rows, anchors) = layout(&reply, width);
+            for row in text(&rows) {
+                assert!(
+                    // BMUX truncation keeps a one-cell ellipsis at width 0,
+                    // which the painter clips.
+                    bmux_tui::text_width::display_width(&row) <= usize::from(width.max(1)),
+                    "{row:?} at {width}"
+                );
+            }
+            assert_eq!(unit_anchor(&reply, &anchors), Some(0));
+        }
+    }
+
+    #[test]
+    fn reasoning_hidden_by_the_legacy_setting_renders_nothing() {
+        let mut state = crate::structure::StructureState::default();
+        state.set_layers(&[RuleLayer {
+            source: LayerSource::Config,
+            rules: bcode_config::TuiThinkingConfig::visibility_rules(false),
+        }]);
+        assert!(state.set_reasoning_suppressed(true));
+        set_structure(state.snapshot());
+        let reasoning = TranscriptItem::new("Reasoning summary", "thinking".to_owned());
+        let (rows, anchors) = layout(&reasoning, 40);
+        assert!(rows.is_empty(), "{:?}", text(&rows));
+        assert_eq!(anchors.len(), 0);
+        // Other hidden units still leave their marker.
+        let _state = with_rules(
+            "[[rules]]\nmatch = { kind = \"assistant_message\" }\nset = { disclosure = \"hidden\" }",
+        );
+        let reply = TranscriptItem::new("Assistant", "done".to_owned());
+        assert_eq!(text(&layout(&reply, 40).0), ["▸ 1 message hidden", ""]);
+    }
+
+    #[test]
+    fn template_only_summaries_fall_back_to_the_template() {
+        let _state = with_rules(
+            "[[rules]]\nmatch = { kind = \"assistant_message\" }\n\
+             set = { disclosure = \"summary\", summary = { template = \"{title} replied\" } }",
+        );
+        // No producer summary and no body text: the template is the summary.
+        let empty = TranscriptItem::new("Assistant", "  \n".to_owned());
+        assert_eq!(
+            text(&layout(&empty, 40).0),
+            ["▸ Bcode", "  Bcode replied", ""]
+        );
+        // A first line still comes before the template.
+        let reply = TranscriptItem::new("Assistant", "Done.".to_owned());
+        assert_eq!(text(&layout(&reply, 40).0), ["▸ Bcode", "  Done.", ""]);
+    }
+
+    #[test]
+    fn summary_templates_render_registered_fields_on_one_line() {
+        let _state = with_rules(
+            "[[rules]]\nmatch = { kind = \"assistant_message\" }\n\
+             set = { disclosure = \"summary\", summary = { source = [\"template\"], template = \"{title}: {first_line} {tool}{bogus}!\" } }",
+        );
+        let reply = TranscriptItem::new("Assistant", "Done.\nDetails".to_owned());
+        let (rows, _) = layout(&reply, 40);
+        assert_eq!(text(&rows), ["▸ Bcode", "  Bcode: Done. !", ""]);
+    }
+
+    #[test]
+    fn header_fields_reframe_the_heading() {
+        let _state = with_rules(
+            "[[rules]]\nmatch = { kind = \"assistant_message\" }\nset = { header = { fields = [\"marker\", \"label\", \"status\"] } }",
+        );
+        let mut reply = TranscriptItem::new("Assistant", "partial".to_owned());
+        reply.streaming = true;
+        let (rows, anchors) = layout(&reply, 40);
+        assert_eq!(text(&rows)[0], "▾ Bcode … · running");
+        assert_eq!(unit_anchor(&reply, &anchors), Some(0));
+        // A heading change leaves the bottom-measured Markdown geometry intact.
+        assert!(markdown_projection_active(&reply));
+    }
+
+    #[test]
+    fn spacing_and_indent_stay_within_tiny_widths_and_wide_graphemes() {
+        let _state = with_rules(
+            "[[rules]]\nmatch = { kind = \"user_message\" }\nset = { spacing = { before = 1, after = 2 }, indent = 3 }\n\
+             [[rules]]\nmatch = { kind = \"assistant_message\" }\nset = { disclosure = \"summary\", indent = 8 }",
+        );
+        let question = TranscriptItem::new("You", "界👩‍💻e\u{301} wide body".to_owned());
+        let reply = TranscriptItem::new("Assistant", "界界界界界界界界👩‍💻".to_owned());
+        for width in [0_u16, 1, 2, 5, 12, 40] {
+            for item in [&question, &reply] {
+                let (rows, anchors) = layout(item, width);
+                for row in text(&rows) {
+                    assert!(
+                        bmux_tui::text_width::display_width(&row) <= usize::from(width.max(1)),
+                        "{row:?} at {width}"
+                    );
+                }
+                let anchor = unit_anchor(item, &anchors).unwrap();
+                assert!(anchor < rows.len());
+            }
+            let (rows, anchors) = layout(&question, width);
+            assert!(rows[0].spans.is_empty(), "spacing before");
+            assert_eq!(unit_anchor(&question, &anchors), Some(1));
+            assert!(
+                rows[rows.len() - 2..]
+                    .iter()
+                    .all(|row| row.spans.is_empty())
+            );
+            assert!(!markdown_projection_active(&question));
+        }
+        let (rows, _) = layout(&question, 40);
+        assert_eq!(text(&rows)[1], "   You");
+        assert!(text(&rows)[2].starts_with("     "), "{:?}", text(&rows));
+        let (rows, _) = layout(&reply, 40);
+        assert!(
+            text(&rows)[0].starts_with("        ▸ Bcode"),
+            "{:?}",
+            text(&rows)
+        );
+    }
+
+    #[test]
+    fn tool_headers_render_the_target_field() {
+        let _state = with_rules(
+            "[[rules]]\nmatch = { kind = \"tool\" }\nset = { header = { fields = [\"marker\", \"tool\", \"target\"] } }",
+        );
+        let read = super::super::transcript::tool_result_item(
+            "c1",
+            Some("read"),
+            Some(r#"{"path":"src/界.rs"}"#),
+            "x",
+            false,
+        );
+        let (rows, _) = layout(&read, 60);
+        assert_eq!(text(&rows)[0], "▾ read · src/界.rs");
+    }
+}
+
+#[cfg(test)]
+mod plugin_v3_chrome_tests {
+    use bcode_config::TuiDiffViewerConfig;
+    use bcode_presentation_policy::models::Disclosure;
+    use bcode_tui_theme::chrome::BorderStyle;
+    use bmux_tui::text_width::display_width;
+
+    use super::super::transcript::tool_result_item;
+    use super::*;
+    use crate::plugin_tui::RoutedTuiSection;
+    use crate::structure::{DisclosureTarget, StructureState};
+    use crate::tool_anatomy::SectionBody;
+
+    fn named(name: &str, label: Option<&str>) -> RoutedTuiSection {
+        RoutedTuiSection {
+            name: name.to_owned(),
+            label: label.map(str::to_owned),
+            rows: vec![Line::from("body")],
+        }
+    }
+
+    #[test]
+    fn adapters_without_sections_render_one_visual_section() {
+        let sections =
+            routed_sections(vec![Line::from("card")], Vec::new(), Vec::new(), Vec::new());
+        assert_eq!(sections.len(), 1);
+        assert_eq!(sections[0].name, "visual");
+        assert!(sections[0].label.is_none());
+        assert!(matches!(&sections[0].body, SectionBody::Rows { rows, .. } if rows.len() == 1));
+        // Even an empty legacy body stays the unit's visual section.
+        let empty = routed_sections(Vec::new(), Vec::new(), Vec::new(), Vec::new());
+        assert_eq!(empty.len(), 1);
+    }
+
+    #[test]
+    fn named_sections_follow_the_visual_body_in_adapter_order() {
+        let sections = routed_sections(
+            vec![Line::from("card")],
+            Vec::new(),
+            Vec::new(),
+            vec![
+                named("bcode.git.files", None),
+                named("metadata", Some("meta")),
+            ],
+        );
+        let names = sections
+            .iter()
+            .map(|section| (section.name.as_str(), section.label.as_deref()))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            names,
+            [
+                ("visual", None),
+                ("bcode.git.files", Some("files")),
+                ("metadata", Some("meta"))
+            ]
+        );
+        assert!(matches!(sections[1].body, SectionBody::Lines { .. }));
+        let without_rows = routed_sections(
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            vec![named("output", None)],
+        );
+        assert_eq!(without_rows.len(), 1);
+        assert_eq!(without_rows[0].name, "output");
+    }
+
+    #[test]
+    fn adapter_context_carries_the_effective_presentation() {
+        let item = tool_result_item("call", Some("read"), None, "one\ntwo", false);
+        let mut state = StructureState::default();
+        set_structure(state.snapshot());
+        let presentation = adapter_context(&item, 40, None)
+            .presentation()
+            .cloned()
+            .expect("structural tools carry a presentation");
+        assert_eq!(
+            presentation.section("output").disclosure,
+            Disclosure::Expanded
+        );
+
+        let facts = crate::structure::unit_facts(&item).expect("tool facts");
+        let output = DisclosureTarget::Section(item.id().get(), "output".to_owned());
+        assert_eq!(
+            state.toggle_target(&output, Disclosure::Expanded, &facts),
+            Some(Disclosure::Collapsed)
+        );
+        set_structure(state.snapshot());
+        let presentation = adapter_context(&item, 40, None)
+            .presentation()
+            .cloned()
+            .expect("presentation");
+        assert_eq!(
+            presentation.section("output").disclosure,
+            Disclosure::Collapsed,
+            "section overrides reach adapters"
+        );
+        set_structure(crate::structure::StructureSnapshot::default());
+    }
+
+    fn framed_theme(style: BorderStyle) -> super::super::theme::PresentedTheme {
+        let initial = super::super::theme::resolve_initial_theme();
+        let mut theme = initial.presented(initial.accent);
+        theme.unit_chrome.tool_border = Some(style);
+        let recipe = theme
+            .unit_chrome
+            .tool_container(theme.containers.tool_succeeded.recipe);
+        theme.containers.tool_succeeded.recipe = recipe;
+        theme
+    }
+
+    #[test]
+    fn tool_border_frames_tool_units_and_keeps_anchors_on_painted_rows() {
+        let previous = semantic_state_theme();
+        let item = tool_result_item("call", Some("read"), None, "alpha\n漢字👍e\u{301}", false);
+        let unit = DisclosureTarget::Unit(item.id().get()).to_hit_id();
+        for width in [0_u16, 1, 4, 12, 40] {
+            set_plugin_visual_theme(&framed_theme(BorderStyle::Rounded));
+            let (rows, anchors, _) = transcript_item_layout_from_item(
+                &item,
+                width,
+                None,
+                TuiDiffViewerConfig::default(),
+                None,
+            );
+            let text = rows.iter().map(Line::plain_text).collect::<Vec<_>>();
+            for row in &text {
+                assert!(
+                    display_width(row) <= usize::from(width.max(1)),
+                    "{row:?} at {width}"
+                );
+            }
+            let anchor = anchors
+                .iter()
+                .find(|anchor| anchor.key == unit)
+                .map(|anchor| anchor.row)
+                .expect("unit anchor");
+            if width < MIN_FRAMED_TOOL_WIDTH {
+                // Too narrow for a frame: the unit degrades to no container.
+                assert_eq!(anchor, 0, "{text:?}");
+                assert!(!text[0].starts_with('╭'), "{text:?}");
+                continue;
+            }
+            assert!(text[0].starts_with('╭'), "{text:?}");
+            assert_eq!(anchor, 1, "the header sits below the top border");
+            if width >= 12 {
+                assert!(text[0].ends_with('╮'));
+                assert!(
+                    text[1].starts_with('│') && text[1].contains("Tool"),
+                    "{text:?}"
+                );
+                assert!(text.iter().any(|row| row.starts_with('╰')), "{text:?}");
+            }
+        }
+        set_plugin_visual_theme(&framed_theme(BorderStyle::None));
+        let (rows, _, _) =
+            transcript_item_layout_from_item(&item, 40, None, TuiDiffViewerConfig::default(), None);
+        assert!(
+            rows[0].plain_text().starts_with("▾ Tool result"),
+            "{rows:?}"
+        );
+        set_plugin_visual_theme(&previous);
     }
 }

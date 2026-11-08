@@ -9,6 +9,7 @@ mod diagnostics;
 pub mod harness;
 pub mod interaction_controller;
 mod invocation_callbacks;
+pub mod presentation;
 
 use bcode_plugin_sdk::path::display_from_current_dir;
 use bcode_plugin_sdk::{
@@ -28,6 +29,7 @@ pub use bcode_plugin_sdk::{ServiceError, ServiceResponse};
 pub use bcode_provider_auth_models::{
     AuthContractError, AuthMethodContribution, AuthProviderContribution,
 };
+pub use presentation::{PluginPresentationDeclaration, PluginToolPresentationMetadata};
 
 /// Authentication provider contribution with canonical host-attached plugin ownership.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -755,6 +757,13 @@ pub struct PluginManifest {
     pub visual_adapters: Vec<PluginVisualAdapterDeclaration>,
     #[serde(default)]
     pub tool_presentations: Vec<PluginToolPresentationDeclaration>,
+    /// Structural presentation defaults (`[presentation]`) for the plugin's own tools.
+    /// A missing table decodes empty.
+    #[serde(
+        default,
+        skip_serializing_if = "PluginPresentationDeclaration::is_empty"
+    )]
+    pub presentation: PluginPresentationDeclaration,
     /// Portable action declarations contributed by either native or static plugin manifests.
     /// Missing collections decode empty; declarations use strings, never terminal input types.
     #[serde(default)]
@@ -838,6 +847,19 @@ impl PluginToolPresentationDeclaration {
     }
 }
 
+impl PluginManifest {
+    /// The usable part of this manifest's `[presentation]` declaration, with diagnostics for
+    /// everything dropped (see [`PluginPresentationDeclaration::effective`]).
+    #[must_use]
+    pub fn presentation_declaration(&self) -> PluginPresentationDeclaration {
+        let provides_tools = self
+            .services
+            .iter()
+            .any(|service| service.interface_id == bcode_tool::TOOL_SERVICE_INTERFACE_ID);
+        self.presentation.effective(&self.id, provides_tools)
+    }
+}
+
 fn validate_tool_presentation_declarations<'a>(
     manifests: impl IntoIterator<Item = &'a PluginManifest>,
 ) -> Result<(), PluginLoadError> {
@@ -847,6 +869,14 @@ fn validate_tool_presentation_declarations<'a>(
             .services
             .iter()
             .any(|service| service.interface_id == bcode_tool::TOOL_SERVICE_INTERFACE_ID);
+        // `[presentation]` is display-only: problems are reported, never load failures.
+        for diagnostic in manifest.presentation_declaration().diagnostics {
+            tracing::warn!(
+                plugin_id = %manifest.id,
+                %diagnostic,
+                "plugin presentation declaration"
+            );
+        }
         let mut plugin_tools = BTreeSet::new();
         for presentation in &manifest.tool_presentations {
             let tool_name = presentation.tool_name.trim();
@@ -7455,6 +7485,7 @@ library = "libauth_test.dylib"
             tui_surfaces: Vec::new(),
             visual_adapters: Vec::new(),
             tool_presentations: Vec::new(),
+            presentation: PluginPresentationDeclaration::default(),
             keymap_actions: Vec::new(),
             command_contributions: Vec::new(),
             workflow_templates: Vec::new(),
@@ -7505,6 +7536,7 @@ library = "libauth_test.dylib"
             tui_surfaces: Vec::new(),
             visual_adapters: Vec::new(),
             tool_presentations: Vec::new(),
+            presentation: PluginPresentationDeclaration::default(),
             keymap_actions: Vec::new(),
             command_contributions: Vec::new(),
             workflow_templates: Vec::new(),
@@ -7798,6 +7830,59 @@ library = "libexample_plugin.dylib"
             "bcode.filesystem.request-draft.write"
         );
         assert_eq!(write.request_draft_schema_version, 1);
+    }
+
+    #[test]
+    fn manifest_presentation_declarations_never_block_loading() {
+        let legacy = test_manifest("bcode.legacy");
+        assert!(legacy.presentation.is_empty());
+
+        // The bundled filesystem manifest declares target fields for its tools.
+        let source = include_str!("../../../plugins/filesystem-plugin/bcode-plugin.toml");
+        let mut manifest: PluginManifest = toml::from_str(source).expect("bundled manifest");
+        let declaration = manifest.presentation_declaration();
+        assert_eq!(declaration.diagnostics, Vec::<String>::new());
+        assert_eq!(
+            declaration.target_fields("filesystem.read"),
+            Some(&["path".to_owned()][..])
+        );
+        assert_eq!(
+            declaration.target_fields("filesystem.grep"),
+            Some(&["pattern".to_owned(), "path".to_owned()][..])
+        );
+
+        // A rule for another producer is dropped; the plugin still validates and loads.
+        let rules: PluginPresentationDeclaration = toml::from_str(
+            "[[rules]]\nmatch = { tool = \"filesystem.read\", producer = \"bcode.shell\" }\nset = { disclosure = \"collapsed\" }\n",
+        )
+        .expect("declared rules");
+        manifest.presentation.rules = rules.rules;
+        assert!(validate_tool_presentation_declarations([&manifest]).is_ok());
+        let declaration = manifest.presentation_declaration();
+        assert_eq!(declaration.rules, Vec::new());
+        assert_eq!(declaration.diagnostics.len(), 1);
+
+        // Presentation vocabulary from a newer host does not fail the manifest.
+        let future = source.replacen(
+            "[[presentation.tools]]",
+            "[[presentation.rules]]\nset = { motion = \"slide\" }\n\n[[presentation.tools]]",
+            1,
+        );
+        let manifest: PluginManifest = toml::from_str(&future).expect("tolerant manifest");
+        assert!(validate_tool_presentation_declarations([&manifest]).is_ok());
+        assert_eq!(manifest.presentation.diagnostics.len(), 1);
+        assert!(
+            manifest
+                .presentation
+                .target_fields("filesystem.read")
+                .is_some()
+        );
+
+        // Presentation tools from a plugin without tools are ignored, not fatal.
+        let mut without_tools = test_manifest("bcode.no-tools");
+        without_tools.presentation.tools = manifest.presentation.tools;
+        assert!(validate_tool_presentation_declarations([&without_tools]).is_ok());
+        assert_eq!(without_tools.presentation_declaration().tools, Vec::new());
     }
 
     #[test]
@@ -12078,6 +12163,7 @@ library = "libexample_plugin.dylib"
                 composer_contributions: Vec::new(),
                 visual_adapters: Vec::new(),
                 tool_presentations: Vec::new(),
+                presentation: PluginPresentationDeclaration::default(),
                 keymap_actions: Vec::new(),
                 command_contributions: Vec::new(),
                 workflow_templates: Vec::new(),
@@ -13110,6 +13196,7 @@ library = "libexample_plugin.dylib"
             composer_contributions: Vec::new(),
             visual_adapters: Vec::new(),
             tool_presentations: Vec::new(),
+            presentation: PluginPresentationDeclaration::default(),
             keymap_actions: Vec::new(),
             command_contributions: Vec::new(),
             workflow_templates: Vec::new(),

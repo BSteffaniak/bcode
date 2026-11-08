@@ -1885,6 +1885,17 @@ impl BcodeRuntimeModel {
                 if self.loop_state.modal_foreground() {
                     return super::invalidation::UiInvalidation::None;
                 }
+                if let Some(redraw) = super::input::handle_transcript_focus_key(
+                    &mut self.chat.app,
+                    self.settings.keymap(),
+                    stroke,
+                ) {
+                    return if redraw {
+                        super::invalidation::UiInvalidation::Structural
+                    } else {
+                        super::invalidation::UiInvalidation::None
+                    };
+                }
                 if self
                     .settings
                     .keymap()
@@ -4178,7 +4189,13 @@ impl bmux_tui_runtime::Program for BcodeRuntimeModel {
                 if self.return_from_borrowed_chat(&event) {
                     return Ok(bmux_tui_runtime::Update::redraw());
                 }
-                if self.loop_state.has_interactive_surface() && !self.loop_state.modal_foreground()
+                // Transcript focus mode owns keys ahead of inline interactions and completion.
+                let transcript_focus_owns = matches!(event, Event::Key(_))
+                    && self.chat.app.transcript_focus_active()
+                    && !self.loop_state.modal_foreground();
+                if self.loop_state.has_interactive_surface()
+                    && !self.loop_state.modal_foreground()
+                    && !transcript_focus_owns
                 {
                     if let Event::Key(stroke) = event
                         && !(stroke.key == bmux_keyboard::KeyCode::Escape
@@ -4243,7 +4260,11 @@ impl bmux_tui_runtime::Program for BcodeRuntimeModel {
                         return Ok(bmux_tui_runtime::Update::redraw());
                     }
                 }
-                let outcome = self.compose_focused_input_event(&event);
+                let outcome = if transcript_focus_owns {
+                    bmux_tui::event::EventOutcome::Ignored
+                } else {
+                    self.compose_focused_input_event(&event)
+                };
                 if outcome != bmux_tui::event::EventOutcome::Ignored {
                     if outcome == bmux_tui::event::EventOutcome::Handled {
                         return Ok(bmux_tui_runtime::Update::none());
@@ -4260,6 +4281,7 @@ impl bmux_tui_runtime::Program for BcodeRuntimeModel {
                     }));
                 }
                 let route_to_surface = !self.loop_state.modal_foreground()
+                    && !transcript_focus_owns
                     && match event {
                         Event::Mouse(mouse) if self.loop_state.has_interactive_surface() => self
                             .loop_state

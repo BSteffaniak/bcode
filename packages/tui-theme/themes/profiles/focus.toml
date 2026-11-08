@@ -1,0 +1,91 @@
+# Profiles set chrome, structure, and containers only, so they combine with any palette.
+description    = "Only the latest turn is open: earlier groups fold away, sections open on demand."
+display_name   = "Focus (profile)"
+id             = "focus"
+kind           = "profile"
+schema_version = 2
+
+[chrome.tui]
+borders    = { panel = "none", dialog = "rounded", tool = "left", composer = "rounded" }
+density    = "cozy"
+icons      = "unicode"
+motion     = "subtle"
+separators = { status = "plain" }
+speaker    = "prefix"
+surfaces   = "flat"
+
+# Tools in the latest turn show their header and one folded row per section.
+[[presentation.rules]]
+match = { kind = "tool" }
+set   = { disclosure = "expanded", group = { by = "consecutive" } }
+
+# Every section starts folded; opening output shows its last six lines.
+[[presentation.rules]]
+match = { kind = "tool" }
+
+[presentation.rules.set.sections]
+arguments = { disclosure = "collapsed" }
+artifact  = { disclosure = "collapsed" }
+diff      = { disclosure = "collapsed" }
+metadata  = { disclosure = "collapsed" }
+output    = { disclosure = "collapsed", preview = { lines = 6, keep = "tail" } }
+result    = { disclosure = "collapsed" }
+visual    = { disclosure = "collapsed" }
+
+# Live output and failures stay open.
+[[presentation.rules]]
+match = { kind = "tool", status = [
+    "running",
+    "waiting",
+    "failed",
+    "timed_out",
+] }
+
+[presentation.rules.set.sections]
+error  = { disclosure = "expanded" }
+output = { disclosure = "expanded" }
+
+# The latest turn's groups are open; earlier turns fold to one header each.
+[[presentation.rules]]
+match = { kind = "group" }
+set   = { disclosure = "expanded" }
+
+[[presentation.rules]]
+match = { kind = ["tool", "group"], turn = ["previous", "older"] }
+set   = { disclosure = "collapsed" }
+
+[containers."transcript.user"]
+layout = "plain"
+
+[containers."transcript.assistant"]
+layout = "plain"
+
+[containers."tool.requested"]
+layout = "plain"
+
+[containers."tool.running"]
+border    = "left"
+layout    = "left_bar"
+padding_x = 1
+width     = "full"
+
+[containers."tool.waiting"]
+border    = "left"
+layout    = "left_bar"
+padding_x = 1
+width     = "full"
+
+[containers."tool.succeeded"]
+layout = "plain"
+
+[containers."tool.failed"]
+border    = "left"
+layout    = "left_bar"
+padding_x = 1
+width     = "full"
+
+[containers."tool.cancelled"]
+layout = "plain"
+
+[containers."tool.timed_out"]
+layout = "plain"

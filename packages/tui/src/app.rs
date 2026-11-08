@@ -456,10 +456,17 @@ pub struct BmuxApp {
     structure: super::structure::StructureState,
     /// Theme-contributed structural rule layers from the last theme resolution.
     theme_structure_layers: Vec<bcode_presentation_policy::models::RuleLayer>,
+    /// Plugin manifest default rule layers, each scoped to its plugin's units.
+    plugin_structure_layers: Vec<bcode_presentation_policy::models::RuleLayer>,
     /// Renderer-neutral configured structural rules.
     configured_structure_rules: Vec<bcode_presentation_policy::models::PresentationRule>,
     /// Interactive structural rules loaded from user state.
     user_structure_rules: Vec<bcode_presentation_policy::models::PresentationRule>,
+    /// Keyboard focus over transcript disclosure targets.
+    transcript_focus: super::transcript_focus::TranscriptFocus,
+    /// Transcript residency (length and boundary ids) last reconciled with
+    /// disclosure overrides and focus.
+    reconciled_residency: Option<(usize, Option<u64>, Option<u64>)>,
     /// Whether the terminal color query has been written.
     terminal_color_query_sent: bool,
     theme_catalog: Option<DiscoveredThemes>,
@@ -709,8 +716,11 @@ impl BmuxApp {
             presented_theme: (*initial_theme).into(),
             structure: super::structure::StructureState::default(),
             theme_structure_layers: Vec::new(),
+            plugin_structure_layers: Vec::new(),
             configured_structure_rules: Vec::new(),
             user_structure_rules: Vec::new(),
+            transcript_focus: super::transcript_focus::TranscriptFocus::default(),
+            reconciled_residency: None,
             terminal_color_query_sent: false,
             theme_catalog: None,
             theme_transition: ThemeTransitionState::new(initial_theme.accent, now),
@@ -852,6 +862,7 @@ impl BmuxApp {
         self.set_agent_metadata_hydrated(source.is_agent_metadata_hydrated());
         self.plugin_presentation
             .clone_from(&source.plugin_presentation);
+        self.sync_plugin_structure();
         self.theme_catalog.clone_from(&source.theme_catalog);
         #[cfg(test)]
         {
@@ -935,6 +946,7 @@ impl BmuxApp {
         self.plugin_presentation = Some(Arc::new(
             crate::plugin_tui::PluginTuiPresentation::from_shared(host),
         ));
+        self.sync_plugin_structure();
     }
 
     /// Shortcut label from the effective terminal registry.
@@ -980,6 +992,29 @@ impl BmuxApp {
         presentation: Arc<crate::plugin_tui::PluginTuiPresentation>,
     ) {
         self.plugin_presentation = Some(presentation);
+        self.sync_plugin_structure();
+    }
+
+    /// Adopt the loaded plugins' manifest `[presentation]` declarations: their
+    /// default rules become plugin layers and their declared target fields
+    /// feed the `target` fact. Returns whether the structure changed.
+    pub fn sync_plugin_structure(&mut self) -> bool {
+        let (layers, fields) = self
+            .plugin_presentation
+            .as_deref()
+            .map(|presentation| {
+                (
+                    presentation.structure_rule_layers(),
+                    presentation.tool_target_fields(),
+                )
+            })
+            .unwrap_or_default();
+        let fields_changed = self.apply_tool_target_fields(fields);
+        if layers == self.plugin_structure_layers {
+            return fields_changed;
+        }
+        self.plugin_structure_layers = layers;
+        self.recompile_structure() || fields_changed
     }
 
     /// Return the local plugin runtime used for client-side presentation projection.
@@ -2661,21 +2696,26 @@ impl BmuxApp {
         streaming || structure
     }
 
-    /// Recompile structural presentation from theme, configuration, and user-state layers.
+    /// Recompile structure from every layer, lowest precedence first: host
+    /// defaults (chrome density), plugin manifest defaults, theme and profile
+    /// sections, configuration, then user state, stacked by the same
+    /// [`bcode_tui_theme::selection::structure_layers`] as `bcode theme explain`.
+    ///
+    /// The configuration layer starts with the legacy reasoning visibility
+    /// (`tui.thinking.show`, or its runtime toggle) mapped onto reasoning
+    /// disclosure, followed by `[[presentation.rules]]`.
     fn recompile_structure(&mut self) -> bool {
-        let mut layers = self.theme_structure_layers.clone();
-        if !self.configured_structure_rules.is_empty() {
-            layers.push(bcode_presentation_policy::models::RuleLayer {
-                source: bcode_presentation_policy::models::LayerSource::Config,
-                rules: self.configured_structure_rules.clone(),
-            });
-        }
-        if !self.user_structure_rules.is_empty() {
-            layers.push(super::structure::user_state_layer(
-                self.user_structure_rules.clone(),
-            ));
-        }
-        self.structure.set_layers(&layers)
+        let reasoning_visible = self.reasoning_visible();
+        let mut config_rules = TuiThinkingConfig::visibility_rules(reasoning_visible);
+        config_rules.extend(self.configured_structure_rules.iter().cloned());
+        let layers = bcode_tui_theme::selection::structure_layers(
+            &self.theme_structure_layers,
+            &self.plugin_structure_layers,
+            &config_rules,
+            &self.user_structure_rules,
+        );
+        let suppressed = self.structure.set_reasoning_suppressed(!reasoning_visible);
+        self.structure.set_layers(&layers) || suppressed
     }
 
     /// Apply renderer-neutral structural rules from declarative configuration.
@@ -2688,6 +2728,15 @@ impl BmuxApp {
         }
         self.configured_structure_rules = rules;
         self.recompile_structure()
+    }
+
+    /// Apply producer-declared target argument fields (from plugin manifests)
+    /// for the `target` fact; returns whether they changed.
+    pub fn apply_tool_target_fields(
+        &mut self,
+        fields: super::structure::DeclaredTargetFields,
+    ) -> bool {
+        self.structure.set_target_fields(fields)
     }
 
     /// Apply interactive structural rules loaded from user state.
@@ -2734,10 +2783,40 @@ impl BmuxApp {
         self.structure.snapshot()
     }
 
-    /// Refresh turn recency from the resident transcript.
+    /// Refresh turn recency from the resident transcript and forget disclosure
+    /// state for items that left it.
     pub fn refresh_structure_turns(&mut self) {
         let turns = super::structure::TurnIndex::from_items(self.transcript().iter());
         self.structure.set_turns(turns);
+        self.reconcile_disclosure_state();
+    }
+
+    /// Drop overrides and focus whose items are no longer resident.
+    ///
+    /// Residency is keyed by length and boundary ids, so unchanged windows
+    /// cost nothing per layout sync.
+    fn reconcile_disclosure_state(&mut self) {
+        let items = self.transcript();
+        let residency = (
+            items.len(),
+            items.iter().next().map(|item| item.id().get()),
+            items.iter().next_back().map(|item| item.id().get()),
+        );
+        if self.reconciled_residency == Some(residency) {
+            return;
+        }
+        self.reconciled_residency = Some(residency);
+        if !self.structure.has_overrides() && self.transcript_focus.focused().is_none() {
+            return;
+        }
+        let resident: BTreeSet<u64> = self
+            .transcript()
+            .iter()
+            .map(|item| item.id().get())
+            .collect();
+        self.structure.reconcile(&resident);
+        self.transcript_focus.retain(|id| resident.contains(&id));
+        self.refresh_focus_entry_hint();
     }
 
     /// Structural presentation state.
@@ -2746,29 +2825,178 @@ impl BmuxApp {
         &self.structure
     }
 
-    /// Toggle the disclosure of the transcript item with `item_id`.
-    pub fn toggle_item_disclosure(&mut self, item_id: u64) -> bool {
-        let Some(index) = self
-            .transcript()
+    fn transcript_index_of_item(&self, item_id: u64) -> Option<usize> {
+        self.transcript()
             .iter()
             .position(|item| item.id().get() == item_id)
-        else {
-            return false;
+    }
+
+    /// Recompute groups over the resident transcript; returns the indexes of
+    /// items whose group role changed and must be laid out again.
+    pub fn sync_structure_groups(&mut self) -> BTreeSet<usize> {
+        let items: Vec<&TranscriptItem> = self.transcript.items().iter().collect();
+        self.structure.sync_groups(&items)
+    }
+
+    /// Transcript item indexes whose rendering depends on `target`'s disclosure.
+    ///
+    /// Units and sections map to their own item. Groups map to every member
+    /// and bridged item, in transcript order.
+    #[must_use]
+    pub fn items_for_target(&self, target: &super::structure::DisclosureTarget) -> Vec<usize> {
+        use super::structure::DisclosureTarget;
+        let DisclosureTarget::Group(group) = target else {
+            return self
+                .transcript_index_of_item(target.item_id())
+                .into_iter()
+                .collect();
         };
-        let Some(item) = self.transcript().get(index).cloned() else {
-            return false;
-        };
-        let Some(disclosure) = self.structure.toggle(&item) else {
-            return false;
-        };
+        let items = self.transcript();
+        self.structure
+            .snapshot()
+            .group_items(*group)
+            .into_iter()
+            .filter_map(|(id, position)| {
+                // Positions come from the last group sync; verify them and fall
+                // back to a scan if the window moved since.
+                position
+                    .filter(|&index| items.get(index).is_some_and(|item| item.id().get() == id))
+                    .or_else(|| self.transcript_index_of_item(id))
+            })
+            .collect()
+    }
+
+    /// First member item id of the group containing unit `item_id`, if any.
+    #[must_use]
+    pub fn group_of_item(&self, item_id: u64) -> Option<u64> {
+        self.structure.snapshot().group_of(item_id)
+    }
+
+    /// Facts of the group whose first member is `first_member`, when that
+    /// group exists in the resident window.
+    fn group_facts(
+        &self,
+        first_member: u64,
+    ) -> Option<bcode_presentation_policy::models::UnitFacts> {
+        self.structure
+            .snapshot()
+            .group_view(first_member)
+            .map(|view| view.facts.clone())
+    }
+
+    /// Effective disclosure of `target` with the facts of the unit owning it,
+    /// or `None` when the target is not a resident structural unit.
+    #[must_use]
+    pub fn target_disclosure(
+        &self,
+        target: &super::structure::DisclosureTarget,
+    ) -> Option<(
+        bcode_presentation_policy::models::Disclosure,
+        bcode_presentation_policy::models::UnitFacts,
+    )> {
+        use super::structure::DisclosureTarget;
+        let snapshot = self.structure.snapshot();
+        match target {
+            DisclosureTarget::Unit(id) => {
+                let item = self.transcript().get(self.transcript_index_of_item(*id)?)?;
+                let facts = super::structure::unit_facts(item)?;
+                Some((snapshot.presentation(item)?.disclosure, facts))
+            }
+            DisclosureTarget::Section(id, name) => {
+                let item = self.transcript().get(self.transcript_index_of_item(*id)?)?;
+                let facts = super::structure::unit_facts(item)?;
+                Some((snapshot.section(item, name).disclosure, facts))
+            }
+            DisclosureTarget::Group(first) => {
+                let facts = self.group_facts(*first)?;
+                Some((snapshot.group_disclosure(*first)?, facts))
+            }
+        }
+    }
+
+    fn mark_targets_dirty<'a>(
+        &mut self,
+        targets: impl IntoIterator<Item = &'a super::structure::DisclosureTarget>,
+    ) {
+        let indexes: BTreeSet<usize> = targets
+            .into_iter()
+            .flat_map(|target| self.items_for_target(target))
+            .collect();
+        for index in indexes {
+            self.mark_transcript_item_dirty(index);
+        }
+    }
+
+    fn disclosure_changed(
+        &mut self,
+        target: &super::structure::DisclosureTarget,
+        disclosure: bcode_presentation_policy::models::Disclosure,
+    ) {
+        use super::structure::DisclosureTarget;
         self.preserve_transcript_anchor_for_disclosure();
-        self.mark_transcript_item_dirty(index);
-        self.set_status(format!("Tool {}", disclosure_label(disclosure)));
+        self.mark_targets_dirty([target]);
+        let label = disclosure_label(disclosure);
+        self.set_status(match target {
+            DisclosureTarget::Unit(_) => format!("Tool {label}"),
+            DisclosureTarget::Group(_) => format!("Group {label}"),
+            DisclosureTarget::Section(_, name) => format!("Section {name} {label}"),
+        });
+    }
+
+    /// Toggle `target` between expanded and collapsed (summarized or hidden
+    /// targets expand first); returns whether anything changed.
+    ///
+    /// Targets of units awaiting a decision never collapse.
+    pub fn toggle_target(&mut self, target: &super::structure::DisclosureTarget) -> bool {
+        let Some((current, facts)) = self.target_disclosure(target) else {
+            return false;
+        };
+        let Some(disclosure) = self.structure.toggle_target(target, current, &facts) else {
+            return false;
+        };
+        self.disclosure_changed(target, disclosure);
         true
     }
 
+    /// Set `target` to `disclosure`; returns whether anything changed.
+    ///
+    /// Targets of units awaiting a decision never collapse.
+    pub fn set_target_disclosure(
+        &mut self,
+        target: &super::structure::DisclosureTarget,
+        disclosure: bcode_presentation_policy::models::Disclosure,
+    ) -> bool {
+        let Some((current, facts)) = self.target_disclosure(target) else {
+            return false;
+        };
+        if current == disclosure || !self.structure.set_target(target, disclosure, &facts) {
+            return false;
+        }
+        self.disclosure_changed(target, disclosure);
+        true
+    }
+
+    /// Toggle the disclosure of the transcript item with `item_id`.
+    pub fn toggle_item_disclosure(&mut self, item_id: u64) -> bool {
+        self.toggle_target(&super::structure::DisclosureTarget::Unit(item_id))
+    }
+
     /// Drop manual disclosure toggles, returning to theme and configured defaults.
+    ///
+    /// In focus mode only the focused target's subtree is reset.
     pub fn reset_disclosure(&mut self) -> bool {
+        if let Some(target) = self.transcript_focus.focused().cloned() {
+            let subtree = self.target_subtree(&target);
+            if !self.structure.clear_targets(|candidate| {
+                subtree.iter().any(|root| target_contains(root, candidate))
+            }) {
+                return false;
+            }
+            self.preserve_transcript_anchor_for_disclosure();
+            self.mark_targets_dirty(&subtree);
+            self.set_status("Focused disclosure reset to defaults".to_owned());
+            return true;
+        }
         if !self.structure.clear_overrides() {
             return false;
         }
@@ -2778,11 +3006,15 @@ impl BmuxApp {
         true
     }
 
-    /// Expand or collapse every tool in the transcript.
+    /// Expand or collapse every unit and group in the transcript, or only
+    /// the focused target's subtree in focus mode.
     pub fn set_all_disclosure(
         &mut self,
         disclosure: bcode_presentation_policy::models::Disclosure,
     ) -> bool {
+        if let Some(target) = self.transcript_focus.focused().cloned() {
+            return self.set_subtree_disclosure(&target, disclosure);
+        }
         let items: Vec<(usize, TranscriptItem)> =
             self.transcript().iter().cloned().enumerate().collect();
         let changed = self
@@ -2795,8 +3027,285 @@ impl BmuxApp {
         for index in changed {
             self.mark_transcript_item_dirty(index);
         }
-        self.set_status(format!("All tools {}", disclosure_label(disclosure)));
+        self.set_status(format!("All units {}", disclosure_label(disclosure)));
         true
+    }
+
+    /// Unit-level roots under `target`: the target itself plus, for groups,
+    /// each member unit (bridged items are not members).
+    fn target_subtree(
+        &self,
+        target: &super::structure::DisclosureTarget,
+    ) -> Vec<super::structure::DisclosureTarget> {
+        use super::structure::DisclosureTarget;
+        let mut subtree = vec![target.clone()];
+        if let DisclosureTarget::Group(group) = target
+            && let Some(view) = self.structure.snapshot().group_view(*group)
+        {
+            subtree.extend(view.members.iter().copied().map(DisclosureTarget::Unit));
+        }
+        subtree
+    }
+
+    /// Set `target` and everything under it to `disclosure`.
+    ///
+    /// Sections follow only when expanding: a collapsed unit already hides
+    /// them, and collapsing should not discard which sections were open.
+    fn set_subtree_disclosure(
+        &mut self,
+        target: &super::structure::DisclosureTarget,
+        disclosure: bcode_presentation_policy::models::Disclosure,
+    ) -> bool {
+        use super::structure::DisclosureTarget;
+        use bcode_presentation_policy::models::Disclosure;
+        let mut targets = Vec::new();
+        for root in self.target_subtree(target) {
+            if disclosure == Disclosure::Expanded
+                && let DisclosureTarget::Unit(id) = root
+            {
+                targets.extend(self.unit_sections(id));
+            }
+            targets.push(root);
+        }
+        let mut changed = Vec::new();
+        for candidate in targets {
+            let Some((current, facts)) = self.target_disclosure(&candidate) else {
+                continue;
+            };
+            if current != disclosure && self.structure.set_target(&candidate, disclosure, &facts) {
+                changed.push(candidate);
+            }
+        }
+        if changed.is_empty() {
+            return false;
+        }
+        self.preserve_transcript_anchor_for_disclosure();
+        self.mark_targets_dirty(&changed);
+        self.set_status(format!(
+            "Focused target {} with its contents",
+            disclosure_label(disclosure)
+        ));
+        true
+    }
+
+    /// Section targets of unit `id` known to the policy or to overrides.
+    fn unit_sections(&self, id: u64) -> Vec<super::structure::DisclosureTarget> {
+        use super::structure::DisclosureTarget;
+        let snapshot = self.structure.snapshot();
+        let mut names: BTreeSet<String> = snapshot
+            .override_targets()
+            .filter_map(|target| match target {
+                DisclosureTarget::Section(item, name) if *item == id => Some(name.clone()),
+                _ => None,
+            })
+            .collect();
+        if let Some(item) = self
+            .transcript_index_of_item(id)
+            .and_then(|index| self.transcript().get(index))
+            && let Some(presentation) = snapshot.presentation(item)
+        {
+            names.extend(presentation.sections.into_keys());
+        }
+        names
+            .into_iter()
+            .map(|name| DisclosureTarget::Section(id, name))
+            .collect()
+    }
+
+    /// Whether keyboard focus mode owns the keyboard.
+    #[must_use]
+    pub const fn transcript_focus_active(&self) -> bool {
+        self.transcript_focus.is_active()
+    }
+
+    /// Disclosure target painted with the selection style in focus mode.
+    #[must_use]
+    pub const fn focused_disclosure_target(&self) -> Option<&super::structure::DisclosureTarget> {
+        self.transcript_focus.focused()
+    }
+
+    /// Disclosure anchors of the retained transcript layout.
+    #[must_use]
+    ///
+    /// Items are located by id through the focused target's verified entry
+    /// hint first, so painting the focused target each frame does not scan
+    /// the resident window; other ids fall back to a scan.
+    pub fn disclosure_anchors(
+        &self,
+    ) -> super::transcript_focus::LayoutAnchors<'_, impl Fn(u64) -> Option<usize> + '_> {
+        let items = self.transcript();
+        let hint = self.transcript_focus.entry_hint();
+        super::transcript_focus::LayoutAnchors::new(
+            &self.transcript_layout,
+            items.len(),
+            move |id| {
+                hint.filter(|&index| items.get(index).is_some_and(|item| item.id().get() == id))
+                    .or_else(|| items.iter().position(|item| item.id().get() == id))
+            },
+        )
+    }
+
+    /// Re-locate the focused target's item when the recorded hint no longer
+    /// points at it (focus moved or the resident window changed).
+    fn refresh_focus_entry_hint(&mut self) {
+        let Some(id) = self
+            .transcript_focus
+            .focused()
+            .map(super::structure::DisclosureTarget::item_id)
+        else {
+            self.transcript_focus.set_entry_hint(None);
+            return;
+        };
+        let items = self.transcript();
+        if self
+            .transcript_focus
+            .entry_hint()
+            .and_then(|index| items.get(index))
+            .is_some_and(|item| item.id().get() == id)
+        {
+            return;
+        }
+        let index = self.transcript_index_of_item(id);
+        self.transcript_focus.set_entry_hint(index);
+    }
+
+    /// Global transcript row of `target`'s anchor, when it is laid out.
+    #[must_use]
+    pub fn disclosure_target_row(
+        &self,
+        target: &super::structure::DisclosureTarget,
+    ) -> Option<usize> {
+        super::transcript_focus::target_row(&self.disclosure_anchors(), target)
+    }
+
+    /// Enter focus mode on the last visible disclosure target; returns
+    /// whether the UI changed.
+    pub fn enter_transcript_focus(&mut self) -> bool {
+        let height = self.session_ui.viewport.height();
+        let top_row = self.transcript_top_row(height);
+        let Some(target) =
+            super::transcript_focus::initial_target(&self.disclosure_anchors(), top_row, height)
+        else {
+            self.set_status("No expandable transcript items to focus".to_owned());
+            return true;
+        };
+        self.release_child_panel_focus();
+        self.transcript_focus.enter(target);
+        self.reveal_focused_target();
+        self.set_status(self.transcript_focus_hint());
+        true
+    }
+
+    /// Leave focus mode; returns whether it was active.
+    pub fn exit_transcript_focus(&mut self) -> bool {
+        if !self.transcript_focus.exit() {
+            return false;
+        }
+        self.set_status("Transcript focus closed".to_owned());
+        true
+    }
+
+    /// Footer hint listing the effective focus-mode bindings.
+    #[must_use]
+    pub fn transcript_focus_hint(&self) -> String {
+        use super::transcript_focus::{FOCUS_SCOPE, FocusAction};
+        format!(
+            "UNIT FOCUS · {} next {} previous {} toggle {} expand {} collapse {} expand all · {} leave",
+            self.shortcut_hint(FOCUS_SCOPE, FocusAction::Next.id()),
+            self.shortcut_hint(FOCUS_SCOPE, FocusAction::Previous.id()),
+            self.shortcut_hint(FOCUS_SCOPE, FocusAction::Toggle.id()),
+            self.shortcut_hint(FOCUS_SCOPE, FocusAction::Expand.id()),
+            self.shortcut_hint(FOCUS_SCOPE, FocusAction::Collapse.id()),
+            self.shortcut_hint(FOCUS_SCOPE, FocusAction::ExpandAll.id()),
+            self.shortcut_hint(FOCUS_SCOPE, FocusAction::Exit.id()),
+        )
+    }
+
+    /// Scroll so the focused target's anchor row is visible.
+    fn reveal_focused_target(&mut self) {
+        self.refresh_focus_entry_hint();
+        let Some(row) = self
+            .transcript_focus
+            .focused()
+            .and_then(|target| self.disclosure_target_row(target))
+        else {
+            return;
+        };
+        let height = self.session_ui.viewport.height();
+        let top_row = self.transcript_top_row(height);
+        if let Some(top_row) = super::transcript_focus::reveal_top_row(row, top_row, height) {
+            self.transcript_scroll_animation = None;
+            self.session_ui.viewport.detach();
+            self.session_ui.viewport.follow_anchor(top_row);
+        }
+    }
+
+    /// Run one focus-mode action; returns whether the UI changed.
+    pub fn handle_transcript_focus_action(
+        &mut self,
+        action: super::transcript_focus::FocusAction,
+    ) -> bool {
+        use super::transcript_focus::{self as focus, FocusAction};
+        if !self.transcript_focus.is_active() {
+            return false;
+        }
+        if action == FocusAction::Exit {
+            return self.exit_transcript_focus();
+        }
+        let Some(target) = self.transcript_focus.focused().cloned() else {
+            // The focused item left the resident window: refocus from the viewport.
+            let height = self.session_ui.viewport.height();
+            let top_row = self.transcript_top_row(height);
+            let Some(target) = focus::initial_target(&self.disclosure_anchors(), top_row, height)
+            else {
+                return false;
+            };
+            self.transcript_focus.focus(target);
+            self.reveal_focused_target();
+            return true;
+        };
+        match action {
+            FocusAction::Next | FocusAction::Previous => {
+                let Some(next) = focus::step(
+                    &self.disclosure_anchors(),
+                    &target,
+                    action == FocusAction::Next,
+                ) else {
+                    return false;
+                };
+                self.transcript_focus.focus(next);
+                self.reveal_focused_target();
+                true
+            }
+            FocusAction::Toggle => self.toggle_target(&target),
+            FocusAction::Expand => self
+                .target_disclosure(&target)
+                .and_then(|(current, _)| focus::expand_level(&target, current))
+                .is_some_and(|next| self.set_target_disclosure(&target, next)),
+            FocusAction::Collapse => {
+                let Some((current, _)) = self.target_disclosure(&target) else {
+                    return false;
+                };
+                // A target the floor keeps open (a failed unit stays at
+                // summary) moves focus to its parent instead.
+                if let Some(next) = focus::collapse_level(&target, current)
+                    && self.set_target_disclosure(&target, next)
+                {
+                    return true;
+                }
+                let Some(parent) = focus::parent(&target, |id| self.group_of_item(id)) else {
+                    return false;
+                };
+                self.transcript_focus.focus(parent);
+                self.reveal_focused_target();
+                true
+            }
+            FocusAction::ExpandAll => self.set_subtree_disclosure(
+                &target,
+                bcode_presentation_policy::models::Disclosure::Expanded,
+            ),
+            FocusAction::Exit => unreachable!("handled above"),
+        }
     }
 
     /// Apply one normalized renderer-neutral streaming-presentation policy.
@@ -4333,6 +4842,7 @@ impl BmuxApp {
         }
         self.session_view.set_reasoning_visible(visible);
         self.refresh_thinking_label();
+        self.recompile_structure();
         self.apply_session_view_terminal_adapter();
     }
 
@@ -9337,6 +9847,48 @@ mod tests {
     }
 
     #[test]
+    fn legacy_thinking_visibility_feeds_reasoning_disclosure_in_the_config_layer() {
+        use bcode_presentation_policy::models::{Disclosure, UnitFacts, UnitKind};
+        let mut app = BmuxApp::new_with_history(Some(SessionId::new()), &[], &[], false);
+        let reasoning = UnitFacts {
+            kind: Some(UnitKind::Reasoning),
+            ..UnitFacts::default()
+        };
+        let disclosure = |app: &BmuxApp| app.structure.snapshot().resolve(&reasoning).disclosure;
+        assert_eq!(disclosure(&app), Disclosure::Expanded);
+        app.apply_thinking_config(TuiThinkingConfig {
+            show: false,
+            ..TuiThinkingConfig::default()
+        });
+        assert!(!app.reasoning_visible());
+        assert_eq!(disclosure(&app), Disclosure::Hidden);
+        let item = TranscriptItem::new("Reasoning summary", "thinking".to_owned());
+        let explained = app.structure.explain(&item).unwrap();
+        assert!(
+            explained
+                .origins
+                .iter()
+                .any(|origin| origin.property == "disclosure"
+                    && origin.source == bcode_presentation_policy::models::LayerSource::Config),
+            "{explained:?}"
+        );
+        // Explicit configuration rules refine reasoning once it is shown again.
+        app.apply_configured_structure_rules(
+            toml::from_str::<bcode_presentation_policy::models::PresentationSection>(
+                "[[rules]]\nmatch = { kind = \"reasoning\" }\nset = { disclosure = \"collapsed\" }",
+            )
+            .unwrap()
+            .rules,
+        );
+        assert_eq!(disclosure(&app), Disclosure::Collapsed);
+        app.set_reasoning_visible(true);
+        assert_eq!(disclosure(&app), Disclosure::Collapsed);
+        app.apply_configured_structure_rules(Vec::new());
+        assert_eq!(disclosure(&app), Disclosure::Expanded);
+        drop(app);
+    }
+
+    #[test]
     fn tui_stream_presentation_advances_only_shared_adapter_item_and_preserves_viewport() {
         let session_id = SessionId::new();
         let mut app = BmuxApp::new_with_history(Some(session_id), &[], &[], false);
@@ -12070,6 +12622,20 @@ enum ChildPanelPresentation {
     Monitor,
 }
 
+/// Whether `candidate`'s override belongs to the subtree rooted at `root`:
+/// the root itself, or a section of a unit root.
+fn target_contains(
+    root: &super::structure::DisclosureTarget,
+    candidate: &super::structure::DisclosureTarget,
+) -> bool {
+    use super::structure::DisclosureTarget;
+    root == candidate
+        || matches!(
+            (root, candidate),
+            (DisclosureTarget::Unit(unit), DisclosureTarget::Section(item, _)) if unit == item
+        )
+}
+
 const fn disclosure_label(
     disclosure: bcode_presentation_policy::models::Disclosure,
 ) -> &'static str {
@@ -12079,5 +12645,423 @@ const fn disclosure_label(
         Disclosure::Summary => "summarized",
         Disclosure::Collapsed => "collapsed",
         Disclosure::Hidden => "hidden",
+    }
+}
+
+#[cfg(test)]
+pub mod disclosure_focus_tests {
+    use bcode_presentation_policy::models::Disclosure;
+    use bcode_session_models::{SessionEvent, SessionEventKind, SessionId};
+
+    use super::BmuxApp;
+    use crate::structure::DisclosureTarget;
+    use crate::transcript_focus::FocusAction;
+
+    fn tool_event(session_id: SessionId, sequence: u64) -> SessionEvent {
+        SessionEvent {
+            schema_version: bcode_session_models::CURRENT_SESSION_EVENT_SCHEMA_VERSION,
+            sequence,
+            timestamp_ms: sequence,
+            session_id,
+            provenance: None,
+            kind: SessionEventKind::ToolCallRequested {
+                tool_call_id: format!("call-{sequence}"),
+                producer_plugin_id: None,
+                tool_name: "read".to_owned(),
+                arguments_json: r#"{"path":"src/lib.rs"}"#.to_owned(),
+                working_directory: None,
+            },
+        }
+    }
+
+    /// Three tool units whose retained layout anchors their headers, plus an
+    /// `output` section label on the middle unit.
+    pub fn focus_app(tools: u64) -> (BmuxApp, Vec<u64>) {
+        let session_id = SessionId::new();
+        let history: Vec<_> = (1..=tools)
+            .map(|sequence| tool_event(session_id, sequence))
+            .collect();
+        let mut app = BmuxApp::new_with_history(Some(session_id), &history, &[], false);
+        let ids: Vec<u64> = app
+            .transcript()
+            .iter()
+            .map(|item| item.id().get())
+            .collect();
+        let entries: Vec<_> = ids
+            .iter()
+            .enumerate()
+            .map(|(index, id)| {
+                let mut anchors = vec![(0, DisclosureTarget::Unit(*id).to_hit_id())];
+                if index == 1 {
+                    anchors.push((
+                        2,
+                        DisclosureTarget::Section(*id, "output".to_owned()).to_hit_id(),
+                    ));
+                }
+                (4, anchors)
+            })
+            .collect();
+        *app.transcript_layout_mut() = crate::transcript_focus::tests::layout(&entries);
+        app.set_transcript_viewport_for_details_test(entries.len() * 4, 40, 0);
+        (app, ids)
+    }
+
+    fn disclosure(app: &BmuxApp, target: &DisclosureTarget) -> Option<Disclosure> {
+        app.target_disclosure(target)
+            .map(|(disclosure, _)| disclosure)
+    }
+
+    #[test]
+    fn focus_mode_walks_targets_and_moves_disclosure_one_level_at_a_time() {
+        let (mut app, ids) = focus_app(3);
+        assert_eq!(ids.len(), 3);
+        let unit = |index: usize| DisclosureTarget::Unit(ids[index]);
+        let output = DisclosureTarget::Section(ids[1], "output".to_owned());
+        assert!(!app.transcript_focus_active());
+        assert!(!app.handle_transcript_focus_action(FocusAction::Next));
+
+        assert!(app.enter_transcript_focus());
+        assert!(app.transcript_focus_active());
+        assert_eq!(app.focused_disclosure_target(), Some(&unit(2)));
+        assert!(app.status().contains("UNIT FOCUS"));
+
+        assert!(app.handle_transcript_focus_action(FocusAction::Previous));
+        assert_eq!(app.focused_disclosure_target(), Some(&output));
+        // The focused item's index is recorded, so painting the focus row
+        // locates it without scanning; a stale hint still resolves correctly.
+        assert_eq!(app.transcript_focus.entry_hint(), Some(1));
+        assert_eq!(app.disclosure_target_row(&output), Some(4 + 2));
+        app.transcript_focus.set_entry_hint(Some(0));
+        assert_eq!(app.disclosure_target_row(&output), Some(4 + 2));
+        app.transcript_focus.set_entry_hint(Some(99));
+        assert_eq!(app.disclosure_target_row(&output), Some(4 + 2));
+        // `h` collapses the section, then climbs to its unit.
+        assert!(app.handle_transcript_focus_action(FocusAction::Collapse));
+        assert_eq!(disclosure(&app, &output), Some(Disclosure::Collapsed));
+        assert!(app.handle_transcript_focus_action(FocusAction::Collapse));
+        assert_eq!(app.focused_disclosure_target(), Some(&unit(1)));
+
+        assert!(app.handle_transcript_focus_action(FocusAction::Toggle));
+        assert_eq!(disclosure(&app, &unit(1)), Some(Disclosure::Collapsed));
+        // No group holds the unit, so there is no parent to climb to.
+        assert!(!app.handle_transcript_focus_action(FocusAction::Collapse));
+        assert_eq!(app.focused_disclosure_target(), Some(&unit(1)));
+
+        assert!(app.handle_transcript_focus_action(FocusAction::Expand));
+        assert_eq!(disclosure(&app, &unit(1)), Some(Disclosure::Expanded));
+        assert!(!app.handle_transcript_focus_action(FocusAction::Expand));
+
+        // `e` reopens the unit together with its collapsed section.
+        assert!(app.handle_transcript_focus_action(FocusAction::Collapse));
+        assert!(app.handle_transcript_focus_action(FocusAction::ExpandAll));
+        assert_eq!(disclosure(&app, &unit(1)), Some(Disclosure::Expanded));
+        assert_eq!(disclosure(&app, &output), Some(Disclosure::Expanded));
+        assert!(!app.handle_transcript_focus_action(FocusAction::ExpandAll));
+
+        assert!(app.handle_transcript_focus_action(FocusAction::Previous));
+        assert_eq!(app.focused_disclosure_target(), Some(&unit(0)));
+        assert!(!app.handle_transcript_focus_action(FocusAction::Previous));
+
+        assert!(app.handle_transcript_focus_action(FocusAction::Exit));
+        assert!(!app.transcript_focus_active());
+        assert_eq!(app.focused_disclosure_target(), None);
+    }
+
+    #[test]
+    fn bulk_actions_act_on_the_focused_subtree_only_in_focus_mode() {
+        let (mut app, ids) = focus_app(3);
+        let unit = |index: usize| DisclosureTarget::Unit(ids[index]);
+        let output = DisclosureTarget::Section(ids[1], "output".to_owned());
+        assert!(app.enter_transcript_focus());
+        app.handle_transcript_focus_action(FocusAction::Previous);
+        app.handle_transcript_focus_action(FocusAction::Collapse);
+        app.handle_transcript_focus_action(FocusAction::Collapse);
+        assert_eq!(app.focused_disclosure_target(), Some(&unit(1)));
+
+        assert!(app.set_all_disclosure(Disclosure::Collapsed));
+        assert_eq!(disclosure(&app, &unit(1)), Some(Disclosure::Collapsed));
+        for other in [0, 2] {
+            assert_eq!(disclosure(&app, &unit(other)), Some(Disclosure::Expanded));
+        }
+        // Reset in focus mode clears the unit and its section only.
+        assert!(app.toggle_target(&unit(2)));
+        assert!(app.reset_disclosure());
+        assert_eq!(disclosure(&app, &unit(1)), Some(Disclosure::Expanded));
+        assert_eq!(disclosure(&app, &output), Some(Disclosure::Expanded));
+        assert_eq!(disclosure(&app, &unit(2)), Some(Disclosure::Collapsed));
+        assert!(!app.reset_disclosure());
+
+        assert!(app.exit_transcript_focus());
+        assert!(app.set_all_disclosure(Disclosure::Collapsed));
+        for index in 0..3 {
+            assert_eq!(disclosure(&app, &unit(index)), Some(Disclosure::Collapsed));
+        }
+        assert!(app.reset_disclosure());
+        for index in 0..3 {
+            assert_eq!(disclosure(&app, &unit(index)), Some(Disclosure::Expanded));
+        }
+    }
+
+    #[test]
+    fn targets_toggle_from_legacy_hit_ids_and_ungrouped_units_have_no_group() {
+        let (mut app, ids) = focus_app(2);
+        let legacy = DisclosureTarget::from_hit_id(&format!("disclosure:{}", ids[0]))
+            .expect("legacy hit id parses");
+        assert!(app.toggle_target(&legacy));
+        assert_eq!(
+            disclosure(&app, &DisclosureTarget::Unit(ids[0])),
+            Some(Disclosure::Collapsed)
+        );
+        // The default policy groups nothing, so no group target exists.
+        let group = DisclosureTarget::Group(ids[0]);
+        assert_eq!(
+            app.sync_structure_groups(),
+            std::collections::BTreeSet::new()
+        );
+        assert_eq!(disclosure(&app, &group), None);
+        assert!(!app.toggle_target(&group));
+        assert_eq!(app.items_for_target(&group), Vec::<usize>::new());
+        assert_eq!(app.group_of_item(ids[1]), None);
+
+        assert!(!app.toggle_target(&DisclosureTarget::Unit(u64::MAX)));
+        assert!(!app.toggle_target(&DisclosureTarget::Group(u64::MAX)));
+    }
+
+    fn named_tool_event(session_id: SessionId, sequence: u64, tool: &str) -> SessionEvent {
+        let mut event = tool_event(session_id, sequence);
+        if let SessionEventKind::ToolCallRequested { tool_name, .. } = &mut event.kind {
+            tool.clone_into(tool_name);
+        }
+        event
+    }
+
+    /// An app whose `read` tools group (`same_tool`) under `group_rule`,
+    /// followed by `bash` tools that do not group, laid out at width 80.
+    fn grouped_app(reads: u64, bashes: u64, group_rule: &str) -> (BmuxApp, Vec<u64>) {
+        let session_id = SessionId::new();
+        let history: Vec<_> = (1..=reads + bashes)
+            .map(|sequence| {
+                named_tool_event(
+                    session_id,
+                    sequence,
+                    if sequence <= reads { "read" } else { "bash" },
+                )
+            })
+            .collect();
+        let mut app = BmuxApp::new_with_history(Some(session_id), &history, &[], false);
+        let rules = format!(
+            "[[rules]]\nmatch = {{ kind = \"tool\", tool = \"read\" }}\nset = {{ group = \"consecutive_same_tool\" }}\n{group_rule}"
+        );
+        app.apply_configured_structure_rules(
+            toml::from_str::<bcode_presentation_policy::models::PresentationSection>(&rules)
+                .unwrap()
+                .rules,
+        );
+        crate::transcript_projection::sync_layout_for_test(&mut app, 80);
+        let ids = app
+            .transcript()
+            .iter()
+            .map(|item| item.id().get())
+            .collect();
+        (app, ids)
+    }
+
+    #[test]
+    fn group_headers_toggle_from_their_hit_ids_and_expose_their_members() {
+        let collapsed =
+            "[[rules]]\nmatch = { kind = \"group\" }\nset = { disclosure = \"collapsed\" }";
+        let (mut app, ids) = grouped_app(3, 1, collapsed);
+        let group = DisclosureTarget::Group(ids[0]);
+        let source = crate::transcript_layout::VisibleTranscriptSource::Transcript;
+        assert_eq!(
+            app.transcript_layout()
+                .content_anchor_row(0, &group.to_hit_id()),
+            Some(0)
+        );
+        assert_eq!(app.transcript_layout().entry_row_count(source, 1), Some(0));
+        assert_eq!(app.items_for_target(&group), [0, 1, 2]);
+        assert_eq!(app.group_of_item(ids[2]), Some(ids[0]));
+        assert_eq!(app.group_of_item(ids[3]), None);
+        assert_eq!(disclosure(&app, &group), Some(Disclosure::Collapsed));
+
+        let clicked = DisclosureTarget::from_hit_id(&group.to_hit_id()).expect("group hit id");
+        assert!(app.toggle_target(&clicked));
+        assert_eq!(disclosure(&app, &group), Some(Disclosure::Expanded));
+        crate::transcript_projection::sync_layout_for_test(&mut app, 80);
+        assert!(
+            app.transcript_layout()
+                .entry_row_count(source, 1)
+                .is_some_and(|rows| rows > 0)
+        );
+        assert_eq!(
+            app.transcript_layout()
+                .content_anchor_row(1, &DisclosureTarget::Unit(ids[1]).to_hit_id()),
+            Some(0)
+        );
+    }
+
+    #[test]
+    fn focus_climbs_from_a_member_to_its_group() {
+        let (mut app, ids) = grouped_app(2, 0, "");
+        let group = DisclosureTarget::Group(ids[0]);
+        app.transcript_focus.enter(DisclosureTarget::Unit(ids[1]));
+        assert!(app.handle_transcript_focus_action(FocusAction::Collapse));
+        assert_eq!(
+            disclosure(&app, &DisclosureTarget::Unit(ids[1])),
+            Some(Disclosure::Collapsed)
+        );
+        assert!(app.handle_transcript_focus_action(FocusAction::Collapse));
+        assert_eq!(app.focused_disclosure_target(), Some(&group));
+        // Groups collapse one level at a time: expanded, summary, collapsed.
+        assert!(app.handle_transcript_focus_action(FocusAction::Collapse));
+        assert_eq!(disclosure(&app, &group), Some(Disclosure::Summary));
+        assert!(app.handle_transcript_focus_action(FocusAction::Collapse));
+        assert_eq!(disclosure(&app, &group), Some(Disclosure::Collapsed));
+        // `e` on the group opens it and every member under it.
+        assert!(app.handle_transcript_focus_action(FocusAction::ExpandAll));
+        assert_eq!(disclosure(&app, &group), Some(Disclosure::Expanded));
+        assert_eq!(
+            disclosure(&app, &DisclosureTarget::Unit(ids[1])),
+            Some(Disclosure::Expanded)
+        );
+    }
+
+    #[test]
+    fn collapsing_a_group_above_the_viewport_keeps_the_reading_position() {
+        let (mut app, ids) = grouped_app(6, 8, "");
+        let body = bmux_tui::geometry::Rect::new(0, 0, 80, 12);
+        crate::transcript_projection::prepare_for_body(&mut app, body);
+        let height = crate::render::transcript_area_for_body(&app, body).height;
+        let source = crate::transcript_layout::VisibleTranscriptSource::Transcript;
+        let target_start = app
+            .transcript_layout()
+            .entry_start_row(source, 10)
+            .expect("laid out");
+        let total = app.transcript_layout().total_rows();
+        let scroll_up = total
+            .saturating_sub(usize::from(height))
+            .saturating_sub(target_start);
+        app.set_transcript_viewport_for_details_test(total, height, scroll_up);
+        crate::transcript_projection::prepare_for_body(&mut app, body);
+        let top_line = |app: &BmuxApp| {
+            let top = app.transcript_top_row(height);
+            app.transcript_layout()
+                .visible_lines_from_top(top, height)
+                .first()
+                .map(|line| (ids[line.entry_index], line.row_in_entry))
+        };
+        let before = top_line(&app);
+        let below_group = before
+            .and_then(|(id, _)| ids.iter().position(|candidate| *candidate == id))
+            .is_some_and(|index| index >= 6);
+        assert!(below_group, "reading below the group: {before:?}");
+
+        assert!(app.set_target_disclosure(&DisclosureTarget::Group(ids[0]), Disclosure::Collapsed));
+        crate::transcript_projection::prepare_for_body(&mut app, body);
+        assert!(
+            app.transcript_layout().total_rows() < total,
+            "the group folded"
+        );
+        assert_eq!(top_line(&app), before);
+    }
+
+    #[test]
+    fn focus_mode_stays_closed_without_disclosure_targets() {
+        let mut app = BmuxApp::new_with_history(None, &[], &[], false);
+        assert!(app.enter_transcript_focus());
+        assert!(!app.transcript_focus_active());
+        assert!(!app.handle_transcript_focus_action(FocusAction::Toggle));
+        assert!(!app.exit_transcript_focus());
+        drop(app);
+    }
+}
+
+#[cfg(test)]
+mod structure_layer_tests {
+    use bcode_presentation_policy::models::{
+        Disclosure, FactMatcher, LayerSource, OneOrMany, PresentationRule, PropertyPatch,
+        RuleLayer, Spacing, UnitFacts, UnitKind,
+    };
+
+    use super::BmuxApp;
+
+    fn rule(matcher: FactMatcher, set: PropertyPatch) -> PresentationRule {
+        PresentationRule { matcher, set }
+    }
+
+    fn tool(tool: &str, producer: &str) -> UnitFacts {
+        UnitFacts {
+            kind: Some(UnitKind::Tool),
+            tool: Some(tool.to_owned()),
+            producer: Some(producer.to_owned()),
+            ..UnitFacts::default()
+        }
+    }
+
+    #[test]
+    fn layers_stack_host_density_then_plugin_then_theme() {
+        let mut app = BmuxApp::new_with_history(None, &[], &[], false);
+        let spacing = |before, after| Spacing { before, after };
+        let density = crate::theme::chrome::UnitChrome {
+            density: bcode_tui_theme::chrome::Density::Compact,
+            ..crate::theme::chrome::UnitChrome::default()
+        }
+        .density_layer()
+        .expect("compact density layer");
+        let theme = RuleLayer {
+            source: LayerSource::Theme("test".to_owned()),
+            rules: vec![rule(
+                FactMatcher {
+                    tool: OneOrMany(vec!["x".to_owned()]),
+                    ..FactMatcher::default()
+                },
+                PropertyPatch {
+                    disclosure: Some(Disclosure::Expanded),
+                    ..PropertyPatch::default()
+                },
+            )],
+        };
+        // The theme resolution supplies the density layer ahead of theme layers.
+        app.theme_structure_layers = vec![density, theme];
+        app.plugin_structure_layers = vec![
+            bcode_plugin::PluginPresentationDeclaration {
+                tools: Vec::new(),
+                rules: vec![rule(
+                    FactMatcher::default(),
+                    PropertyPatch {
+                        disclosure: Some(Disclosure::Collapsed),
+                        spacing: Some(spacing(1, 1)),
+                        ..PropertyPatch::default()
+                    },
+                )],
+                diagnostics: Vec::new(),
+            }
+            .rule_layer("p"),
+        ];
+        app.recompile_structure();
+        let snapshot = app.structure_snapshot();
+
+        // Plugin defaults override host density for the plugin's own units...
+        let own = snapshot.resolve(&tool("y", "p"));
+        assert_eq!(own.disclosure, Disclosure::Collapsed);
+        assert_eq!(own.spacing, spacing(1, 1));
+        // ...and theme rules override plugin defaults.
+        assert_eq!(
+            snapshot.resolve(&tool("x", "p")).disclosure,
+            Disclosure::Expanded
+        );
+        // Other producers' units see only host density.
+        let other = snapshot.resolve(&tool("y", "q"));
+        assert_eq!(other.spacing, spacing(0, 0));
+        assert_ne!(other.disclosure, Disclosure::Collapsed);
+        drop(app);
+    }
+
+    #[test]
+    fn apps_without_plugins_add_no_plugin_layers() {
+        let mut app = BmuxApp::new_with_history(None, &[], &[], false);
+        assert!(!app.sync_plugin_structure());
+        assert_eq!(app.plugin_structure_layers, Vec::new());
+        drop(app);
     }
 }
