@@ -146,7 +146,6 @@ impl TranscriptV2Host {
             self.render.motion = Some(motion);
             let update = self
                 .engine
-                .get_mut()
                 .set_motion(MotionConfig::for_motion(motion.0, motion.1), at);
             self.absorb(update);
             changed = true;
@@ -172,7 +171,7 @@ impl TranscriptV2Host {
         }
         if std::mem::take(&mut self.render.render_dirty) {
             let config = self.render_config(theme);
-            let update = self.engine.get_mut().set_render_config(config, at);
+            let update = self.engine.set_render_config(config, at);
             self.absorb(update);
             changed = true;
         }
@@ -256,7 +255,7 @@ impl TranscriptV2Host {
         };
         let config = structure_config(&inputs, theme);
         self.render.structure = Some(inputs);
-        let update = self.engine.get_mut().set_structure_config(config, at);
+        let update = self.engine.set_structure_config(config, at);
         self.absorb(update);
         self.render.visual_gate = None;
         true
@@ -269,7 +268,7 @@ impl TranscriptV2Host {
         let Some(presentation) = app.plugin_presentation() else {
             return self.clear_plugin_visuals();
         };
-        let engine = self.engine.get();
+        let engine = &self.engine;
         let width = engine.geometry().width;
         let gate = VisualGate {
             content: self.data.content_generation(),

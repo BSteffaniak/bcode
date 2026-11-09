@@ -153,6 +153,13 @@ pub struct TranscriptEngine {
     committed: Option<FrameId>,
 }
 
+// The engine is `Send` by construction: its retained items are Send-capable BMUX elements
+// and its producers are `Send` (no thread confinement is needed to own it in a `Send` model).
+const _: () = {
+    const fn assert_send<T: Send>() {}
+    assert_send::<TranscriptEngine>();
+};
+
 impl std::fmt::Debug for TranscriptEngine {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("TranscriptEngine")

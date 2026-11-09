@@ -137,13 +137,7 @@ No `_models` crate is created for V2: no other package needs V2 types without th
 implementation. `ReadingPosition` (saved per-session reading positions, restored on session
 resurrection) lives in `bcode_tui_transcript::navigation`.
 
-The engine is driven from one thread (X10) and is not `Send`: its retained item layouts hold
-BMUX components (`Element` erases `Box<dyn Component>`) and producer parts shared through `Rc`.
-The root runtime model must stay `Send`, because the CLI drives it through a boxed `Send`
-future (polled on the terminal thread). `transcript_v2_host` therefore keeps the engine in a
-thread-confined cell (`transcript_v2_host::thread_bound::ThreadBound`): the model can be moved,
-but the engine is reachable and dropped only on the thread that created it (access elsewhere
-panics; a drop elsewhere leaks).
+The engine is `Send`; retained items use Send-capable BMUX elements (`SyncElement` and containers over `dyn Component + Send + Sync`, so producer parts can be shared through `Arc`).
 
 `bcode_tui_transcript` dependencies: `bcode_session_view`, `bcode_session_view_models`,
 `bcode_presentation_policy`, `bcode_tui_theme`, `bcode_tui_components` (pure recipes only),

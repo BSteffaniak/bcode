@@ -44,7 +44,6 @@ pub mod ingest;
 pub mod input;
 pub mod paint;
 pub mod render_config;
-pub mod thread_bound;
 
 #[cfg(test)]
 pub mod test_fixtures;
@@ -60,8 +59,6 @@ use bcode_tui_transcript::frame::FrameSnapshot;
 use bcode_tui_transcript::latest_bar::LatestBarState;
 use bcode_tui_transcript::navigation::MotionConfig;
 use bcode_tui_transcript::viewport::ViewportGeometry;
-
-use self::thread_bound::ThreadBound;
 
 /// Which engine handles transcript ingest, input and painting (EN5). Fixed for the process
 /// lifetime (EN3).
@@ -106,9 +103,8 @@ impl TranscriptEngineChoice {
 /// engine deliberately does not own (I/O, session attachment, effect bookkeeping, frames).
 #[derive(Debug)]
 pub struct TranscriptV2Host {
-    /// The V2 engine (window, units, layout, viewport, navigation, focus), confined to the
-    /// thread that created the host.
-    engine: ThreadBound<TranscriptEngine>,
+    /// The V2 engine (window, units, layout, viewport, navigation, focus).
+    engine: TranscriptEngine,
     /// Session the engine is attached to; `None` for a draft or before the first attach.
     session: Option<SessionId>,
     /// History requests issued by the engine and not yet started as host effects.
@@ -136,6 +132,14 @@ pub struct TranscriptV2Host {
     scripted_now: Option<std::time::Instant>,
 }
 
+// The host owns the engine directly and stays `Send`, so the root runtime model that holds it
+// is `Send` without thread confinement.
+const _: () = {
+    const fn assert_send<T: Send>() {}
+    assert_send::<TranscriptEngine>();
+    assert_send::<TranscriptV2Host>();
+};
+
 impl Default for TranscriptV2Host {
     fn default() -> Self {
         Self::new()
@@ -143,17 +147,12 @@ impl Default for TranscriptV2Host {
 }
 
 impl TranscriptV2Host {
-    /// Create a detached host with an empty engine, confined to the current thread. Geometry
-    /// arrives with the first painted frame ([`Self::sync_geometry`]).
-    ///
-    /// Every engine access panics off that thread ([`ThreadBound`]).
+    /// Create a detached host with an empty engine. Geometry arrives with the first painted
+    /// frame ([`Self::sync_geometry`]).
     #[must_use]
     pub fn new() -> Self {
         Self {
-            engine: ThreadBound::new(TranscriptEngine::new(
-                ViewportGeometry::new(0, 0),
-                MotionConfig::default(),
-            )),
+            engine: TranscriptEngine::new(ViewportGeometry::new(0, 0), MotionConfig::default()),
             session: None,
             pending_requests: Vec::new(),
             invalidated: true,
@@ -199,14 +198,14 @@ impl TranscriptV2Host {
 
     /// Item layout work since the previous call, then reset (spec 9.2, scenario observation).
     #[cfg(test)]
-    pub fn take_layout_work(&mut self) -> bcode_tui_transcript::layout::LayoutWorkCounters {
-        self.engine.get_mut().take_layout_work()
+    pub const fn take_layout_work(&mut self) -> bcode_tui_transcript::layout::LayoutWorkCounters {
+        self.engine.take_layout_work()
     }
 
     /// The V2 engine (read-only).
     #[must_use]
-    pub fn engine(&self) -> &TranscriptEngine {
-        self.engine.get()
+    pub const fn engine(&self) -> &TranscriptEngine {
+        &self.engine
     }
 
     /// Session the engine is attached to.
@@ -217,8 +216,8 @@ impl TranscriptV2Host {
 
     /// Composer/transcript keyboard focus (FO1).
     #[must_use]
-    pub fn focus(&self) -> &ChatFocus {
-        self.engine.get().focus()
+    pub const fn focus(&self) -> &ChatFocus {
+        self.engine.focus()
     }
 
     /// Latest-bar decision of the last prepared frame (F6, C18–C21); hidden before the first

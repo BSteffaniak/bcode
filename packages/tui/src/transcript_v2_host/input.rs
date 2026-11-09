@@ -87,8 +87,8 @@ impl TranscriptV2Host {
     /// Whether the transcript holds keyboard focus (FO1). While it does, transcript focus keys
     /// are routed here ahead of inline interactions and completion.
     #[must_use]
-    pub fn transcript_focus_active(&self) -> bool {
-        self.engine.get().focus().transcript_target().is_some()
+    pub const fn transcript_focus_active(&self) -> bool {
+        self.engine.focus().transcript_target().is_some()
     }
 
     /// Before shell routing: with transcript focus, a paste or a key that is not a transcript
@@ -286,7 +286,7 @@ impl TranscriptV2Host {
             mouse.position.x.saturating_sub(viewport.x),
             mouse.position.y.saturating_sub(viewport.y),
         );
-        let (update, handled) = self.engine.get_mut().list_event(&Event::Mouse(local), at);
+        let (update, handled) = self.engine.list_event(&Event::Mouse(local), at);
         let changed = update.invalidated || !update.requests.is_empty();
         self.absorb(update);
         if pressed {
@@ -326,7 +326,7 @@ impl TranscriptV2Host {
         }
         let column = u64::from(position.x - viewport.x);
         let row = u64::from(position.y - viewport.y);
-        let (update, _hit) = self.engine.get_mut().click(frame, column, row, at);
+        let (update, _hit) = self.engine.click(frame, column, row, at);
         let changed = update.invalidated;
         self.absorb(update);
         changed
@@ -352,7 +352,7 @@ impl TranscriptV2Host {
             FocusKeyAction::Next => self.step_focus(FocusStep::Next, at),
             FocusKeyAction::Previous => self.step_focus(FocusStep::Previous, at),
             FocusKeyAction::Toggle => self.with_focused_disclosure(|host, target| {
-                let (update, disclosure) = host.engine.get_mut().toggle_disclosure(&target, at);
+                let (update, disclosure) = host.engine.toggle_disclosure(&target, at);
                 host.absorb(update);
                 disclosure.is_some()
             }),
@@ -362,7 +362,6 @@ impl TranscriptV2Host {
             FocusKeyAction::CycleDetail => {
                 let next = self.focused_disclosure().and_then(|target| {
                     self.engine
-                        .get()
                         .structure()
                         .effective_disclosure(&target)
                         .map(next_detail)
@@ -383,20 +382,20 @@ impl TranscriptV2Host {
 
     /// Enter transcript focus (FO2, C33). Returns whether focus entered.
     fn enter_focus(&mut self, at: Instant) -> bool {
-        let (update, entered) = self.engine.get_mut().enter_focus(at);
+        let (update, entered) = self.engine.enter_focus(at);
         self.absorb(update);
         entered
     }
 
     /// Return keyboard focus to the composer (FO3). Returns whether the transcript had focus.
     pub fn release_focus(&mut self) -> bool {
-        let released = self.engine.get_mut().release_focus();
+        let released = self.engine.release_focus();
         self.invalidated |= released;
         released
     }
 
     fn step_focus(&mut self, step: FocusStep, at: Instant) -> bool {
-        let update = self.engine.get_mut().focus_step(step, at);
+        let update = self.engine.focus_step(step, at);
         let changed = update.invalidated;
         self.absorb(update);
         changed
@@ -409,11 +408,7 @@ impl TranscriptV2Host {
         step: impl FnOnce(&DisclosureTarget, Disclosure) -> Option<Disclosure>,
     ) -> Option<Disclosure> {
         let target = self.focused_disclosure()?;
-        let current = self
-            .engine
-            .get()
-            .structure()
-            .effective_disclosure(&target)?;
+        let current = self.engine.structure().effective_disclosure(&target)?;
         step(&target, current)
     }
 
@@ -432,7 +427,7 @@ impl TranscriptV2Host {
         {
             return true;
         }
-        let update = self.engine.get_mut().focus_parent(at);
+        let update = self.engine.focus_parent(at);
         let changed = update.invalidated;
         self.absorb(update);
         changed
@@ -440,16 +435,15 @@ impl TranscriptV2Host {
 
     /// Expand the focused target and every disclosure nested under it.
     fn expand_focused_subtree(&mut self, at: Instant) -> bool {
-        let Some(target) = self.engine.get().focus().transcript_target().cloned() else {
+        let Some(target) = self.engine.focus().transcript_target().cloned() else {
             return false;
         };
-        let disclosures = self.engine.get().focus_view().subtree_disclosures(&target);
+        let disclosures = self.engine.focus_view().subtree_disclosures(&target);
         let mut changed = false;
         for disclosure in disclosures {
-            let (update, set) =
-                self.engine
-                    .get_mut()
-                    .set_disclosure(&disclosure, Disclosure::Expanded, at);
+            let (update, set) = self
+                .engine
+                .set_disclosure(&disclosure, Disclosure::Expanded, at);
             self.absorb(update);
             changed |= set;
         }
@@ -459,14 +453,14 @@ impl TranscriptV2Host {
     /// `JumpToSessionStart` / `JumpToLatest` with direct loads; with transcript focus, focus
     /// follows to the first / last target (FO4, FO5).
     fn jump_to_edge(&mut self, edge: FocusEdge, at: Instant) -> bool {
-        let update = self.engine.get_mut().jump_to_edge(edge, at);
+        let update = self.engine.jump_to_edge(edge, at);
         let changed = update.invalidated || !update.requests.is_empty();
         self.absorb(update);
         changed
     }
 
     fn focused_disclosure(&self) -> Option<DisclosureTarget> {
-        self.engine.get().focus_state().disclosure().cloned()
+        self.engine.focus_state().disclosure().cloned()
     }
 
     fn with_focused_disclosure(
@@ -479,10 +473,7 @@ impl TranscriptV2Host {
 
     fn set_focused(&mut self, disclosure: Disclosure, at: Instant) -> bool {
         self.with_focused_disclosure(|host, target| {
-            let (update, changed) = host
-                .engine
-                .get_mut()
-                .set_disclosure(&target, disclosure, at);
+            let (update, changed) = host.engine.set_disclosure(&target, disclosure, at);
             host.absorb(update);
             changed
         })

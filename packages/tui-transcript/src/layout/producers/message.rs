@@ -39,7 +39,6 @@
 //! here except the BMUX cell width of the badge heading, which decides whether the badge fits.
 
 use std::borrow::Cow;
-use std::rc::Rc;
 
 use bcode_presentation_policy::models::{
     Disclosure, ResolvedPresentation, Spacing, SummarySource, UnitFacts, UnitStatus,
@@ -54,6 +53,7 @@ use bcode_tui_theme::definition::ResolvedThemeDefinition;
 use bmux_tui::chrome::{Border, BorderSet, BorderSides};
 use bmux_tui::component::{
     Component, ComponentRevision, Constraints, EventCx, LayoutCx, LayoutNode, LogicalInsets,
+    SyncElement,
 };
 use bmux_tui::composition::{Column, Row, SizeBox, Surface, TextBlock};
 use bmux_tui::event::{Event, EventOutcome};
@@ -62,10 +62,13 @@ use bmux_tui::style::{Modifier, Style};
 use bmux_tui::text::{Line, Span, Text, TextWrap};
 use bmux_tui::text_width::display_width;
 
-use super::common::{self, SourceText, TextSource};
+use super::common::{self, SharedContent, SourceText, TextSource};
 use super::group::DisclosureRow;
 use super::markdown::{self, MarkdownRequest};
-use super::{ItemContent, ItemRenderContext, ProducedItem, ProducerWork, UnitProducer, UnitView};
+use super::{
+    ItemContent, ItemRenderContext, ProducedItem, ProducerWork, RetainedObject, UnitProducer,
+    UnitView,
+};
 use crate::layout::geometry::{ItemFocusTarget, ItemGeometry, SourceRows};
 use crate::units::structure::{DisclosureTarget, ResolvedUnitPresentation};
 
@@ -238,43 +241,23 @@ const fn is_plain(style: &TranscriptContainerStyle) -> bool {
 
 // ---- composition ---------------------------------------------------------------------------
 
-/// A component shared between a BMUX composition (which lays it out and paints it) and the
-/// geometry pass (which reads it from the child node the composition produced).
-struct Part(Rc<dyn ItemContent>);
-
-impl Component for Part {
-    fn layout(&self, constraints: Constraints, cx: &mut LayoutCx) -> LayoutNode {
-        self.0.layout(constraints, cx)
-    }
-
-    fn paint(&self, layout: &LayoutNode, cx: &mut PaintCx<'_, '_>) {
-        self.0.paint(layout, cx);
-    }
-
-    fn event(&self, event: &Event, layout: &LayoutNode, cx: &mut EventCx<'_>) -> EventOutcome {
-        self.0.event(event, layout, cx)
-    }
-
-    fn revision(&self) -> ComponentRevision {
-        self.0.revision()
-    }
-}
+/// A retained, thread-safe column of parts.
+type RetainedColumn = Column<'static, RetainedObject>;
 
 /// A BMUX composition (`Column`, `Row`, `Surface`, `SizeBox`) whose `i`-th layout child is
 /// `parts[i]`; geometry is the parts' geometry translated by their child placement.
 struct Composite {
-    element: Box<dyn Component>,
-    parts: Vec<Rc<dyn ItemContent>>,
+    element: Box<RetainedObject>,
+    parts: Vec<SharedContent>,
 }
 
 impl Composite {
     fn column(parts: Vec<Box<dyn ItemContent>>) -> Box<dyn ItemContent> {
-        let parts: Vec<Rc<dyn ItemContent>> = parts.into_iter().map(Rc::from).collect();
-        let column = parts
-            .iter()
-            .fold(Column::new().id("message-column"), |column, part| {
-                column.child(Part(Rc::clone(part)))
-            });
+        let parts: Vec<SharedContent> = parts.into_iter().map(SharedContent::new).collect();
+        let column = parts.iter().fold(
+            RetainedColumn::empty().id("message-column"),
+            |column, part| column.child(part.clone()),
+        );
         Box::new(Self {
             element: Box::new(column),
             parts,
@@ -283,22 +266,22 @@ impl Composite {
 
     fn single(
         part: Box<dyn ItemContent>,
-        build: impl FnOnce(Part) -> Box<dyn Component>,
+        build: impl FnOnce(SyncElement<'static>) -> Box<RetainedObject>,
     ) -> Box<dyn ItemContent> {
-        let part: Rc<dyn ItemContent> = Rc::from(part);
+        let part = SharedContent::new(part);
         Box::new(Self {
-            element: build(Part(Rc::clone(&part))),
+            element: build(SyncElement::erase(part.clone())),
             parts: vec![part],
         })
     }
 
     fn row(fixed: Box<dyn ItemContent>, flex: Box<dyn ItemContent>) -> Box<dyn ItemContent> {
-        let fixed: Rc<dyn ItemContent> = Rc::from(fixed);
-        let flex: Rc<dyn ItemContent> = Rc::from(flex);
-        let row = Row::new()
+        let fixed = SharedContent::new(fixed);
+        let flex = SharedContent::new(flex);
+        let row = Row::<'static, RetainedObject>::empty()
             .id("message-gutter")
-            .child(Part(Rc::clone(&fixed)))
-            .flex_child(1, Part(Rc::clone(&flex)));
+            .child(fixed.clone())
+            .flex_child(1, flex.clone());
         Box::new(Self {
             element: Box::new(row),
             parts: vec![fixed, flex],
@@ -880,7 +863,7 @@ fn bar(content: Box<dyn ItemContent>, style: Style, icons: IconSet) -> Box<dyn I
     };
     Composite::single(content, |part| {
         Box::new(
-            Surface::new(part)
+            Surface::from_element(part)
                 .id("speaker-bar")
                 .border(Border::new(set, style).sides(BorderSides::LEFT))
                 .padding(LogicalInsets::new(0, 0, 0, BAR_GAP)),
@@ -982,7 +965,7 @@ fn message_column(
         Some(label) => {
             let label = Composite::single(label, |part| {
                 Box::new(
-                    SizeBox::new(part)
+                    SizeBox::from_element(part)
                         .id("speaker-gutter")
                         .width(layout.speaker.prefix)
                         .min_height(1),

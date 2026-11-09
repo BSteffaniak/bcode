@@ -32,8 +32,9 @@ pub type DeclaredTargetFields = BTreeMap<String, BTreeMap<String, Vec<String>>>;
 
 /// Plugin-declared facts for the units a plugin produced (supplied by the host).
 ///
-/// Implementations are pure: the same item revision and generation yield the same facts.
-pub trait PluginFactSource {
+/// Implementations are pure: the same item revision and generation yield the same facts. They
+/// are shared (`Send + Sync`) so the engine that holds them is `Send`.
+pub trait PluginFactSource: Send + Sync {
     /// Revision of the declarations; a change re-resolves every item.
     fn generation(&self) -> u64;
 

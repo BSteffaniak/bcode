@@ -261,7 +261,7 @@ impl TranscriptV2Host {
         own_submission: bool,
         at: Instant,
     ) -> bool {
-        if self.engine.get().window().in_flight.replace.is_some() {
+        if self.engine.window().in_flight.replace.is_some() {
             if self.data.held.len() < LIVE_BUFFER_EVENTS {
                 self.data.held.push(HeldInput {
                     input,
@@ -273,7 +273,7 @@ impl TranscriptV2Host {
             return false;
         }
         let accepted = accepted_submission(&input).filter(|_| own_submission);
-        let engine = self.engine.get_mut();
+        let engine = &mut self.engine;
         let mut update = engine.apply_live(input, at);
         if let Some(sequence) = accepted {
             let item = submission_unit(engine, sequence);
@@ -293,7 +293,7 @@ impl TranscriptV2Host {
     /// overflowed hold re-attaches the tail of a live window (W10). Returns whether the
     /// transcript changed.
     pub(super) fn release_held_inputs(&mut self, at: Instant) -> bool {
-        if self.engine.get().window().in_flight.replace.is_some() {
+        if self.engine.window().in_flight.replace.is_some() {
             return false;
         }
         let held = std::mem::take(&mut self.data.held);
@@ -302,8 +302,8 @@ impl TranscriptV2Host {
         for held in held {
             changed |= self.apply_live_input(held.input, held.own_submission, at);
         }
-        if overflowed && self.engine.get().window().mode == WindowMode::Live {
-            let update = self.engine.get_mut().attach(at);
+        if overflowed && self.engine.window().mode == WindowMode::Live {
+            let update = self.engine.attach(at);
             self.absorb(update);
             changed = true;
         }
@@ -314,12 +314,12 @@ impl TranscriptV2Host {
     /// the tail (W10), which also rehydrates in-flight live state; a detached window loads
     /// newer history on demand and needs nothing. Returns whether a request was issued.
     pub(super) fn resynchronize(&mut self, at: Instant) -> bool {
-        if self.engine.get().window().mode != WindowMode::Live {
+        if self.engine.window().mode != WindowMode::Live {
             return false;
         }
         self.data.held.clear();
         self.data.held_overflowed = false;
-        let update = self.engine.get_mut().attach(at);
+        let update = self.engine.attach(at);
         self.absorb(update);
         true
     }
@@ -327,7 +327,7 @@ impl TranscriptV2Host {
     /// Reduce one navigation intent (keys, timeline, focus traversal). Window requests it
     /// issues are executed by the host. Returns whether the transcript changed.
     pub fn navigate(&mut self, intent: NavIntent, at: Instant) -> bool {
-        let update = self.engine.get_mut().intent(intent, at);
+        let update = self.engine.intent(intent, at);
         let changed = update.invalidated || !update.requests.is_empty();
         self.absorb(update);
         changed
@@ -337,7 +337,7 @@ impl TranscriptV2Host {
     /// the latest content or before anything is shown.
     #[must_use]
     pub fn reading_position(&self) -> Option<ReadingPosition> {
-        let engine = self.engine.get();
+        let engine = &self.engine;
         let anchor = match &engine.nav().mode {
             NavMode::Following => return None,
             NavMode::Holding { item, .. } => ReadingAnchor::top(item.clone()),
@@ -379,7 +379,7 @@ impl TranscriptV2Host {
         let Some(session_id) = self.session else {
             return Vec::new();
         };
-        let engine = self.engine.get();
+        let engine = &self.engine;
         let resident_last = engine.window().last_sequence;
         let epoch = self.data.epoch();
         requests

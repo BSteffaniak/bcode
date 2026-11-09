@@ -86,11 +86,11 @@ impl TranscriptV2Host {
     /// latest-bar row; the engine reserves it while the bar is shown (F6). A changed size is a
     /// navigation geometry input (keyed anchors keep the reading position, P1).
     pub fn sync_geometry(&mut self, region: Rect, at: Instant) {
-        let update = self.engine.get_mut().set_latest_bar_enabled(true, at);
+        let update = self.engine.set_latest_bar_enabled(true, at);
         self.absorb(update);
         let geometry = ViewportGeometry::new(u64::from(region.width), u64::from(region.height));
-        if geometry != self.engine.get().region() {
-            let update = self.engine.get_mut().resize(geometry, at);
+        if geometry != self.engine.region() {
+            let update = self.engine.resize(geometry, at);
             self.absorb(update);
         }
     }
@@ -99,10 +99,10 @@ impl TranscriptV2Host {
     /// column, or a reserved gutter column (the engine then lays units out one column
     /// narrower). Returns whether it changed.
     pub fn set_scrollbar(&mut self, mode: ScrollbarMode, at: Instant) -> bool {
-        if self.engine.get().scrollbar() == mode {
+        if self.engine.scrollbar() == mode {
             return false;
         }
-        let update = self.engine.get_mut().set_scrollbar(mode, at);
+        let update = self.engine.set_scrollbar(mode, at);
         self.absorb(update);
         true
     }
@@ -145,18 +145,18 @@ impl TranscriptV2Host {
         }
         let clock = self.frame_clock(cx, fallback_now);
         // Scrollbar track and thumb take the latest bar's muted and info styles.
-        let _ = self.engine.get_mut().set_scrollbar_styles(ScrollbarStyles {
+        let _ = self.engine.set_scrollbar_styles(ScrollbarStyles {
             begin: style.muted,
             track: style.muted,
             thumb: style.info,
             end: style.muted,
         });
-        let snapshot = self.engine.get_mut().prepare_frame(clock);
+        let snapshot = self.engine.prepare_frame(clock);
         let viewport_height = u16::try_from(snapshot.geometry.height)
             .unwrap_or(u16::MAX)
             .min(region.height);
         let viewport = Rect::new(region.x, region.y, region.width, viewport_height);
-        let engine = self.engine.get();
+        let engine = &self.engine;
         let track = engine.scrollbar_track(&snapshot);
         cx.with_child(
             i32::from(viewport.x),
@@ -223,7 +223,7 @@ impl TranscriptV2Host {
     /// Record that the last painted frame was presented (CK3).
     pub fn commit(&mut self) {
         if let Some(frame) = self.last_frame.as_ref().map(|frame| frame.id) {
-            let update = self.engine.get_mut().commit(frame);
+            let update = self.engine.commit(frame);
             self.absorb(update);
         }
     }

@@ -7,7 +7,7 @@
 //! Narrow layouts degrade explicitly (B4): framing and indentation are dropped when they would
 //! leave no content column, and single rows clip.
 
-use std::rc::Rc;
+use std::sync::Arc;
 
 use bcode_presentation_policy::models::{Disclosure, Spacing, UnitStatus};
 use bcode_session_view_models::{TranscriptViewItem, TranscriptViewItemKind};
@@ -23,7 +23,7 @@ use bcode_tui_theme::definition::{
 use bmux_tui::chrome::{Border, BorderSet, BorderSides};
 use bmux_tui::component::{
     Component, ComponentRevision, Constraints, EventCx, LayoutCx, LayoutId, LayoutNode,
-    LogicalInsets, LogicalRect, LogicalSize,
+    LogicalInsets, LogicalRect, LogicalSize, SyncElement,
 };
 use bmux_tui::composition::{Surface, TextBlock};
 use bmux_tui::event::{Event, EventOutcome};
@@ -31,7 +31,7 @@ use bmux_tui::paint::{LocalRect, PaintCx};
 use bmux_tui::style::Style;
 use bmux_tui::text::{Line, Span, Text, TextWrap};
 
-use super::{ItemContent, ProducedItem, UnitProducer, UnitView};
+use super::{ItemContent, ProducedItem, RetainedObject, UnitProducer, UnitView};
 use crate::layout::SourcePosition;
 use crate::layout::context::ItemRenderContext;
 use crate::layout::geometry::{ItemGeometry, ItemSelectionFragment, SourceRow, SourceRows};
@@ -416,9 +416,22 @@ pub fn container_style(
 
 // ---- geometry-forwarding wrappers ----------------------------------------------------------
 
-/// Shares one content between a BMUX wrapper (which paints it) and the geometry pass (which
-/// reads it), so wrappers keep geometry derivation on the inner content's own node.
-struct SharedContent(Rc<dyn ItemContent>);
+/// One item content shared between a retained BMUX composition (which lays it out, paints it
+/// and routes events to it) and the geometry pass (which reads it from the child node the
+/// composition produced), so wrappers keep geometry derivation on the inner content's own node.
+#[derive(Clone)]
+pub(super) struct SharedContent(Arc<dyn ItemContent>);
+
+impl SharedContent {
+    pub(super) fn new(content: Box<dyn ItemContent>) -> Self {
+        Self(Arc::from(content))
+    }
+
+    /// The content's geometry read from `layout`, the node it produced.
+    pub(super) fn geometry(&self, layout: &LayoutNode) -> ItemGeometry {
+        self.0.geometry(layout)
+    }
+}
 
 impl Component for SharedContent {
     fn layout(&self, constraints: Constraints, cx: &mut LayoutCx) -> LayoutNode {
@@ -441,8 +454,8 @@ impl Component for SharedContent {
 /// A BMUX `Surface` (insets, border, background) around one content, forwarding the inner
 /// content's geometry translated by the child placement.
 pub struct Wrapped {
-    surface: Surface<'static>,
-    inner: Rc<dyn ItemContent>,
+    surface: Surface<'static, RetainedObject>,
+    inner: SharedContent,
 }
 
 impl std::fmt::Debug for Wrapped {
@@ -454,10 +467,10 @@ impl std::fmt::Debug for Wrapped {
 impl Wrapped {
     fn new(
         inner: Box<dyn ItemContent>,
-        build: impl FnOnce(Surface<'static>) -> Surface<'static>,
+        build: impl FnOnce(Surface<'static, RetainedObject>) -> Surface<'static, RetainedObject>,
     ) -> Self {
-        let inner: Rc<dyn ItemContent> = Rc::from(inner);
-        let surface = build(Surface::new(SharedContent(Rc::clone(&inner))));
+        let inner = SharedContent::new(inner);
+        let surface = build(Surface::from_element(SyncElement::erase(inner.clone())));
         Self { surface, inner }
     }
 }
@@ -626,7 +639,7 @@ pub struct SourceText {
     source: TextSource,
     /// Byte offset of each source line in the block's newline-separated source text, recorded
     /// when the lines are known ([`Self::from_lines`]); diff rows map to lines through it.
-    line_starts: Option<Rc<[usize]>>,
+    line_starts: Option<Arc<[usize]>>,
 }
 
 impl SourceText {
@@ -660,7 +673,7 @@ impl SourceText {
                     .saturating_add(1);
                 start
             })
-            .collect::<Rc<[usize]>>();
+            .collect::<Arc<[usize]>>();
         Self {
             block: TextBlock::new(Text::from_lines(lines)).wrap(wrap),
             source,

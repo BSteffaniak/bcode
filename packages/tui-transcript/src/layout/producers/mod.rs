@@ -42,7 +42,7 @@ pub mod testing;
 use std::collections::BTreeMap;
 
 use bcode_session_view_models::{TranscriptViewItem, TranscriptViewItemKind};
-use bmux_tui::component::{Component, Element, LayoutNode};
+use bmux_tui::component::{Component, LayoutNode, SyncElement};
 use bmux_tui::composition::TextBlock;
 
 use super::context::ItemRenderContext;
@@ -61,7 +61,11 @@ pub struct UnitView<'a> {
 
 /// A retained item component: a BMUX [`Component`] that also derives the item's geometry from
 /// its own retained layout.
-pub trait ItemContent: Component {
+///
+/// Item content is `Send + Sync`, so the engine that retains it is `Send` and parts can be
+/// shared through `Arc` between a composition and the geometry pass: compose retained trees from
+/// thread-safe BMUX elements ([`SyncElement`] and containers over [`RetainedObject`]).
+pub trait ItemContent: Component + Send + Sync {
     /// Per-item geometry read from `layout`, the node this component produced. Default: no
     /// mapped geometry (rows fall back to item-row anchors).
     fn geometry(&self, _layout: &LayoutNode) -> ItemGeometry {
@@ -71,7 +75,10 @@ pub trait ItemContent: Component {
 
 impl ItemContent for TextBlock {}
 
-impl ItemContent for Element<'static> {}
+impl ItemContent for SyncElement<'static> {}
+
+/// The BMUX element object retained item trees erase their children into.
+pub type RetainedObject = dyn Component + Send + Sync;
 
 /// Work a producer performed, folded into the layout work counters (9.2).
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash)]
@@ -128,14 +135,16 @@ impl ProducedItem {
 }
 
 /// Builds the retained component of one unit (L4).
-pub trait UnitProducer {
+///
+/// Producers are `Send` so the registry, and the engine that owns it, are `Send`.
+pub trait UnitProducer: Send {
     /// Component and geometry source for one unit. Pure in `unit` and `cx`.
     fn produce(&self, unit: UnitView<'_>, cx: &ItemRenderContext<'_>) -> ProducedItem;
 }
 
 impl<F> UnitProducer for F
 where
-    F: Fn(UnitView<'_>, &ItemRenderContext<'_>) -> ProducedItem,
+    F: Fn(UnitView<'_>, &ItemRenderContext<'_>) -> ProducedItem + Send,
 {
     fn produce(&self, unit: UnitView<'_>, cx: &ItemRenderContext<'_>) -> ProducedItem {
         self(unit, cx)

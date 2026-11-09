@@ -48,7 +48,7 @@ impl TranscriptV2Host {
         self.last_frame = None;
         self.data.reset();
         self.render.engine_reset();
-        let engine = self.engine.get_mut();
+        let engine = &mut self.engine;
         // The new engine starts at the full region width; a gutter scrollbar narrows it again.
         let geometry = ViewportGeometry::new(engine.region().width, engine.geometry().height);
         *engine = TranscriptEngine::new(geometry, engine.motion())
@@ -59,7 +59,7 @@ impl TranscriptV2Host {
         let Some(session) = session else {
             return;
         };
-        let update = self.engine.get_mut().attach(at);
+        let update = self.engine.attach(at);
         self.absorb(update);
         if let Some(sequence) = self.data.take_opening_anchor(session) {
             let _ = self.jump_to_sequence(sequence, at);
@@ -145,7 +145,7 @@ impl TranscriptV2Host {
                 // The engine keeps the request in flight (it has no failure input): re-issue
                 // it with backoff while the engine still awaits it, so one failed read never
                 // leaves the window stuck or holds live input forever.
-                let awaited = self.engine.get().is_awaiting(&load.request);
+                let awaited = self.engine.is_awaiting(&load.request);
                 tracing::warn!(
                     session_id = %load.session_id,
                     request = ?load.request,
@@ -160,7 +160,7 @@ impl TranscriptV2Host {
             }
         };
         self.data.clear_failures(load.lane());
-        let engine = self.engine.get_mut();
+        let engine = &mut self.engine;
         let applied = match &loaded {
             HistoryLoaded::Page(page) => engine.apply_page(page, at),
             HistoryLoaded::Window(window) => engine.apply_window(window, at),
@@ -197,7 +197,7 @@ impl TranscriptV2Host {
     /// wake for.
     #[must_use]
     pub fn next_deadline(&self) -> Option<Instant> {
-        match (self.engine.get().next_deadline(), self.data.next_retry()) {
+        match (self.engine.next_deadline(), self.data.next_retry()) {
             (Some(engine), Some(retry)) => Some(engine.min(retry)),
             (engine, retry) => engine.or(retry),
         }
@@ -206,10 +206,10 @@ impl TranscriptV2Host {
     /// Fire due engine timers at `now` and re-issue due history retries the engine still
     /// awaits (a superseded request is dropped).
     pub fn advance(&mut self, now: Instant) {
-        let update = self.engine.get_mut().advance(now);
+        let update = self.engine.advance(now);
         self.absorb(update);
         for request in self.data.take_due_retries(now) {
-            if self.engine.get().is_awaiting(&request) {
+            if self.engine.is_awaiting(&request) {
                 self.pending_requests.push(request);
             }
         }

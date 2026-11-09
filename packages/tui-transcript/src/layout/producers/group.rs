@@ -15,7 +15,6 @@
 //! * [`HiddenMarkerProducer`] renders `▸ N hidden` (A16).
 
 use std::collections::BTreeMap;
-use std::rc::Rc;
 
 use bcode_presentation_policy::models::{DEFAULT_GROUP_HEADER, Spacing, UnitStatus};
 use bcode_tui_components::transcript::{
@@ -34,8 +33,8 @@ use bmux_tui::paint::PaintCx;
 use bmux_tui::style::Style;
 use bmux_tui::text::{Line, Span};
 
-use super::common::{self, HeaderSegment};
-use super::{ItemContent, ItemRenderContext, ProducedItem, UnitProducer, UnitView};
+use super::common::{self, HeaderSegment, SharedContent};
+use super::{ItemContent, ItemRenderContext, ProducedItem, RetainedObject, UnitProducer, UnitView};
 use crate::layout::geometry::{
     ItemAction, ItemFocusTarget, ItemGeometry, ItemHitRegion, PaintSlot, PaintSlotKind, SourceRow,
     SourceRows,
@@ -290,36 +289,14 @@ impl ItemContent for DisclosureRow {
 
 // ---- item stack --------------------------------------------------------------------------
 
-/// Shares one content between the BMUX column (which lays it out and paints it) and the
-/// geometry pass (which reads it from the child's own node).
-struct SharedItem(Rc<dyn ItemContent>);
-
-impl Component for SharedItem {
-    fn layout(&self, constraints: Constraints, cx: &mut LayoutCx) -> LayoutNode {
-        self.0.layout(constraints, cx)
-    }
-
-    fn paint(&self, layout: &LayoutNode, cx: &mut PaintCx<'_, '_>) {
-        self.0.paint(layout, cx);
-    }
-
-    fn event(&self, event: &Event, layout: &LayoutNode, cx: &mut EventCx<'_>) -> EventOutcome {
-        self.0.event(event, layout, cx)
-    }
-
-    fn revision(&self) -> ComponentRevision {
-        self.0.revision()
-    }
-}
-
 /// Item contents stacked vertically in one BMUX `Column`, each stretched to the full width.
 ///
 /// Geometry merges the children's geometry translated by their placement. Focus targets are
 /// renumbered in layout order; in a [`nested`](Self::nested) stack every parentless target
 /// after the first becomes a child of the first (a unit header owns its section labels, B12).
 pub struct ItemStack {
-    column: Column<'static>,
-    children: Vec<Rc<dyn ItemContent>>,
+    column: Column<'static, RetainedObject>,
+    children: Vec<SharedContent>,
     nested: bool,
 }
 
@@ -343,7 +320,7 @@ impl ItemStack {
     #[must_use]
     pub fn new() -> Self {
         Self {
-            column: Column::new().id("item-stack"),
+            column: Column::empty().id("item-stack"),
             children: Vec::new(),
             nested: false,
         }
@@ -358,9 +335,9 @@ impl ItemStack {
 
     /// Append a child.
     pub fn push(&mut self, child: Box<dyn ItemContent>) {
-        let child: Rc<dyn ItemContent> = Rc::from(child);
-        let column = std::mem::take(&mut self.column);
-        self.column = column.child(SharedItem(Rc::clone(&child)));
+        let child = SharedContent::new(child);
+        let column = std::mem::replace(&mut self.column, Column::empty());
+        self.column = column.child(child.clone());
         self.children.push(child);
     }
 
