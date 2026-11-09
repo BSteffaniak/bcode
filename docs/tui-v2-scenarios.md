@@ -122,7 +122,7 @@ Notes:
 | `c33_initial_focus_is_last_visible_target` | C33, FO7 | pass | pending | — |
 | `c33_initial_focus_falls_back_to_nearest_target_above` | C33, FO7 | pass | pending | V1 scrolls the tall target's top into view when focus is entered; the scenario allows that (T19). |
 | `fo4_composer_home_end_do_not_move_transcript` | FO4, X5 | pass | pending | — |
-| `fo4_transcript_home_loads_session_start_directly` | FO4, T16, X5 | fail-ignored | pending | A click in the transcript does not give it keyboard focus in V1, and Home always edits the composer (the FO4 decision is new in V2). |
+| `fo4_transcript_home_loads_session_start_directly` | FO4, T16, X5 | fail-ignored | pending | V1 transcript focus (`alt+u`) does not load the session start on Home (the FO4 decision is new in V2). |
 | `fo4_transcript_end_returns_to_latest` | FO4, T13, X5 | fail-ignored | pending | As above, for End. |
 | `fo5_page_up_scrolls_from_composer_focus` | FO5 | pass | pending | — |
 

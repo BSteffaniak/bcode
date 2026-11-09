@@ -124,18 +124,18 @@ Paths are relative to `packages/tui/src` unless noted. Rule identifiers refer to
 | Item | Placement | Justification |
 |---|---|---|
 | V2 engine | **New crate** `packages/tui-transcript/` → `bcode_tui_transcript` | A crate boundary mechanically enforces S1 (V2 cannot reach V1 internals of `bcode_tui`), lets the engine be tested headlessly without the host, and survives V1 deletion as the transcript engine. Created in phase 2 when its first code lands. Domain-named. |
-| V2 modules | `window`, `units`, `layout` (with `layout::producers`, `layout::context`), `viewport`, `navigation` (with `navigation::auto`), `focus`, `latest_bar`, `selection`, `frame`, `handoff`, `engine` | One module per layer; `engine` is the façade the host calls. |
+| V2 modules | `window`, `units`, `layout` (with `layout::producers`, `layout::context`), `viewport`, `navigation` (with `navigation::auto`), `focus`, `latest_bar`, `selection`, `frame`, `engine` | One module per layer; `engine` is the façade the host calls. |
 | V2 scenario support | `bcode_tui_transcript` feature `test-support` (module `scenario`): deterministic engine fixture (fixture producers, scripted history source, BMUX `ProgramHarness` glue, `LayoutWorkCounters`). The V2 driver itself is `bcode_tui::transcript_scenarios::v2` (`cfg(test)`); it drives the engine façade directly in phases 2–3 and through `transcript_v2_host` from phase 4. | Keeps one scenario definition set for both engines; the engine crate never depends on `bcode_tui`. |
 | Incremental window operations | `bcode_session_view` module `window_ops`; change types in `bcode_session_view_models` (`TranscriptChanges`, `TranscriptChange`) | Semantic, renderer-neutral (A1, A4). No terminal data. |
 | Engine enum and config key | `bcode_config`: `TuiEngine` enum, `TuiConfig::engine` | Config crate owns the schema. |
-| Engine resolution, runtime switch, V2 host wiring | `bcode_tui` modules `engine_selection` and `transcript_v2_host` | Host owns I/O (client calls for pages), effects and startup. |
+| Engine resolution, V2 host wiring | `bcode_tui` modules `engine_selection` and `transcript_v2_host` | Host owns I/O (client calls for pages), effects and startup. |
 | CLI flag | `bcode_cli` root `Cli` struct | Existing global flags live there. |
 | Engine-neutral scenario suite | `bcode_tui` `cfg(test)` module `transcript_scenarios` (definitions, runner, V1 driver; V2 driver from phase 2). Status manifest: [`tui-v2-scenarios.md`](tui-v2-scenarios.md). | The V1 driver needs crate-internal access, and host-owned scenarios (composer typing, clipboard, configuration reload) need the host. Until phase 4 wires V2 into the host, such scenarios are ignored for V2 with `#[ignore = "V2 pending phase 4: <capability>"]`. |
 | BMUX patch and Cargo.lock guard | `xtask/src/bmux_lock.rs`, run by `cargo xtask bmux-lock-check` and first by `cargo run -p xtask -- architecture` | Existing repository validation home. |
 
 No `_models` crate is created for V2: no other package needs V2 types without the
-implementation. `ReadingPosition` (section 7) lives in `bcode_tui_transcript::handoff`; the V1
-seam in `bcode_tui` converts to it.
+implementation. `ReadingPosition` (saved per-session reading positions, restored on session
+resurrection) lives in `bcode_tui_transcript::navigation`.
 
 `bcode_tui_transcript` dependencies: `bcode_session_view`, `bcode_session_view_models`,
 `bcode_presentation_policy`, `bcode_tui_theme`, `bcode_tui_components` (pure recipes only),
@@ -360,7 +360,7 @@ pub enum NavIntent {
     JumpToLatest,
     FocusTarget { target: FocusTargetId, edge: ApproachEdge },
     ReleaseHold,                                   // stop following/holding at the current visual position
-    RestorePosition { position: ReadingPosition }, // engine switch, session resurrection
+    RestorePosition { position: ReadingPosition }, // session resurrection
 }
 pub enum InputSource { Wheel, Key, SelectionAutoScroll, Programmatic }
 pub enum Placement { ItemTopAtTop, ItemBottomAtBottom, Center, EnsureVisible }
@@ -495,23 +495,24 @@ pub enum ScrollTarget { ItemTop(UnitKey), ItemBottom(UnitKey), LatestBottom, Anc
 ## 6. Focus model
 
 ```rust
-pub enum ChatFocus { Composer, Transcript { mode: TranscriptFocusMode } }
-pub enum TranscriptFocusMode { Free, Units { target: FocusTargetId, return_to: ReturnFocus } }
+pub enum ChatFocus { Composer, Transcript { target: FocusTargetId, return_to: ReturnFocus } }
 ```
+
+Transcript keyboard focus is unit focus: there is one transcript focus mode, entered with
+`alt+u` (user decision; no separate "free" transcript focus and no extra focus key).
 
 | Rule | Statement |
 |---|---|
 | FO1 | Exactly one of composer or transcript has keyboard focus. Default is `Composer`. Focus is ephemeral presentation state. |
-| FO2 | Composer → Transcript: pointer press inside the transcript region (activation still applies, rule FO7); `alt+u` (enters `Units`); bindable `tui.chat.focusTranscript` (proposed default `alt+t`, pending confirmation). |
-| FO3 | Transcript → Composer: pointer press in the composer; `Escape` in `Free` with no selection; any key or paste that the active transcript scope does not bind (new keymap scope `transcript_free` in `Free`, `transcript_focus` in `Units`), in which case a printable key or paste is delivered to the composer; bindable `tui.chat.focusComposer`. Keys bound in the active transcript scope (for example `j`/`k` in `Free`, FO6, or `e`/`d` in `Units`, FO7) are consumed by the transcript and never reach the composer. |
-| FO4 | **Home/End (user decision):** composer focused → start/end of the text input, never the transcript. Transcript focused → `JumpToSessionStart` / `JumpToLatest` (window loaded directly, W10). |
-| FO5 | Page Up/Page Down scroll the transcript from either focus without changing focus. `ctrl+home` / `ctrl+end` are existing V1 defaults (`TranscriptTop` / `TranscriptBottom`, next to `ctrl+up` / `ctrl+down` line scrolling) and keep their keys from either focus, but in V2 they mean `JumpToSessionStart` / `JumpToLatest` with direct `Head` / `Tail` loads (W10) instead of paging through the resident window. This change of meaning is pending confirmation (11-P3). |
-| FO6 | Transcript `Free` (scope `transcript_free`, remappable): Up/Down and `k`/`j` scroll one row; Page Up/Down page; Home/End per FO4; `alt+u` enters `Units`; Escape per FO3. |
-| FO7 | `Units` mode (alt+u focus mode) is unit focus inside the transcript: keys `j`/`k`/Up/Down, Enter/Space, `l`/`h`, `e`, `d`, `i`, shift+Up/Down, `m`, Escape as in [`tui-themes.md`](tui-themes.md#focus-mode), remappable in the `transcript_focus` scope. Moving focus emits `FocusTarget{target, edge}` (C32). Initial target = last visible target, else nearest above (C33). Escape/alt+u leave `Units` and return to the focus held before entry. |
-| FO8 | Focus targets are BMUX item focus targets (BMUX 12) derived from the retained item layout (B12); focus highlight is a paint-only overlay (L5). |
-| FO9 | A focus target leaving the resident window moves focus to the nearest surviving target; focus never forces paging. |
-| FO10 | Clicking a disclosure header or section label (press and release without drag, BMUX 14) toggles it; dragging selects. Both set transcript focus without entering `Units`. |
-| FO11 | The chat scope's double-Escape `AppInterrupt` (`multi_tap_bind("escape", …)` in `keymap.rs`) counts only taps delivered while the composer has focus. An Escape consumed by transcript focus (closing the inspector, leaving `Units`, or returning to the composer from `Free`) is not a tap of that sequence; a second Escape after returning to the composer starts a new sequence. |
+| FO2 | Composer → Transcript: `alt+u` (`tui.transcript.focusUnits`, remappable in the `chat` scope) or the command-palette action. Initial target = last visible target, else nearest above (C33). Pointer input never moves keyboard focus. |
+| FO3 | Transcript → Composer: `Escape` (after closing the inspector, if open), `alt+u` again, a pointer press in the composer, or the command-palette action. Keys bound in the `transcript_focus` scope are consumed by the transcript; any other key or paste returns focus to the composer and is delivered to it. |
+| FO4 | **Home/End (user decision):** composer focused → start/end of the text input, never the transcript. Transcript focused → `JumpToSessionStart` / `JumpToLatest` (window loaded directly, W10); focus moves to the first / last target of the loaded window. |
+| FO5 | Page Up/Page Down scroll the transcript from either focus without changing focus. `ctrl+home` / `ctrl+end` (existing V1 defaults `TranscriptTop` / `TranscriptBottom`, next to `ctrl+up` / `ctrl+down` line scrolling) keep their keys from either focus; in V2 they mean `JumpToSessionStart` / `JumpToLatest` with direct `Head` / `Tail` loads (W10) instead of paging through the resident window. |
+| FO6 | Transcript focus keys (scope `transcript_focus`, remappable): `j`/`k`/Up/Down, Enter/Space, `l`/`h`, `e`, `d`, `i`, shift+Up/Down, `m`, Home/End (FO4), Escape, as in [`tui-themes.md`](tui-themes.md#focus-mode). Moving focus emits `FocusTarget{target, edge}` (C32). |
+| FO7 | Focus targets are BMUX item focus targets (BMUX 12) derived from the retained item layout (B12); focus highlight is a paint-only overlay (L5). |
+| FO8 | A focus target leaving the resident window moves focus to the nearest surviving target; focus never forces paging. |
+| FO9 | Clicking a disclosure header or section label (press and release without drag, BMUX 14) toggles it; dragging selects. Neither changes keyboard focus. |
+| FO10 | The chat scope's double-Escape `AppInterrupt` (`multi_tap_bind("escape", …)` in `keymap.rs`) counts only taps delivered while the composer has focus. An Escape consumed by transcript focus (closing the inspector or returning to the composer) is not a tap of that sequence; a second Escape after returning to the composer starts a new sequence. |
 
 ---
 
@@ -524,15 +525,13 @@ pub enum TranscriptFocusMode { Free, Units { target: FocusTargetId, return_to: R
 | Config key | `[tui] engine = "v1" \| "v2"` (`bcode_config::TuiConfig::engine: Option<TuiEngine>`) |
 | Rust enum | `bcode_config::TuiEngine { V1, V2 }` (serde `"v1"`, `"v2"`) |
 | Resolution | `bcode_tui::engine_selection::resolve_tui_engine(cli: Option<TuiEngine>, env: Option<&str>, config: Option<TuiEngine>) -> Result<TuiEngine, EngineSelectionError>` |
-| Runtime switch action | keymap/command-palette action `tui.engine.switch` (no default key) and slash command `/tui-engine v1\|v2` |
-| Handoff payload | `bcode_tui_transcript::handoff::ReadingPosition { session_id, sequence: Option<u64>, item: Option<TranscriptViewItemId>, source: Option<SourcePosition>, following: bool }` |
 
 | Rule | Statement |
 |---|---|
 | EN1 | Precedence: CLI flag > environment variable > config > default. Default is `v1` until phase 7, then `v2`. |
 | EN2 | Invalid CLI values are rejected by argument parsing. An invalid environment value is a startup error naming the valid values; there is no silent fallback. Config values are schema-validated. |
-| EN3 | Runtime switching is ephemeral (not persisted; A3). The active engine exports a `ReadingPosition`; the host tears it down and constructs the other engine, which performs the normal bounded attach around `sequence` (or tail when `following`) and applies `RestorePosition`. Row-in-item is not transferred (layouts differ); the target item top (or source position) is placed at the viewport top. |
-| EN4 | Both engines own their own `SessionView` instance and consume the same daemon data through the same bounded attach paths (departs from user decision 1; pending confirmation as 11-P5). Host shell state (composer contents, overlays, permissions, plugin surfaces, configuration) is shared and survives switching. |
+| EN3 | The engine is chosen once at startup and fixed for the process lifetime. There is no runtime switching (user decision: not worth the complexity); switching engines means restarting with another flag, environment value or config. |
+| EN4 | Each engine owns its own `SessionView` instance and consumes daemon data through the same bounded attach and history paths. Host shell state (composer, overlays, permissions, plugin surfaces, configuration) is engine-independent. |
 | EN5 | Shared code between engines is only the section 1.3 layers and the host shell. The seam in `bcode_tui` is a single dispatch point choosing which engine handles transcript ingest, transcript input and transcript painting. |
 
 ---
@@ -739,7 +738,7 @@ check), **M** manual. Every ID must be checked before phase 7.
 | X5 | Home/End per FO4 (composer: input start/end; transcript: true session start/latest loaded directly). | S |
 | X6 | Optional scrollbar, off by default, chrome-themeable, positioned within the whole session (W12). | S |
 | X7 | Engine selection by env, CLI and config with EN1 precedence and EN2 errors. | U |
-| X8 | Runtime engine switching rebuilds the other engine at the current reading position (EN3). | S, M |
+| X8 | The engine is fixed at startup; no runtime switch path exists (EN3). | U |
 | X9 | Composer/transcript focus transitions per FO2/FO3/FO10. | S |
 | X10 | V2 declares no thread-locals or mutable statics; no pointer/wall-clock values in cache keys (L2, L3). | G |
 | X11 | `JumpToLatest` from a detached window returns to live with one request (W10). | S |
@@ -756,7 +755,7 @@ Run once per engine with a real daemon and a session of at least 5,000 events:
 5. Submit while following, while reading and while detached: the message is revealed only on acceptance; the answer is held at its top.
 6. Resize narrower and back while reading: the reading position is kept.
 7. Theme and profile switch, reduce-motion toggle, `alt+u` focus mode walk, disclosure clicks, drag selection and copy.
-8. Runtime engine switch (`/tui-engine`): the other engine opens at the same item.
+8. Start once with `--tui-engine v1` and once with `BCODE_TUI_ENGINE=v2`: each engine attaches to the same session.
 
 ### BUG. Regression scenarios
 
@@ -778,26 +777,26 @@ Run once per engine with a real daemon and a session of at least 5,000 events:
 
 | # | Ambiguity | Resolution | Status |
 |---|---|---|---|
-| 1 | Markdown projection cache: one per item vs current + up to 8 variants. | One accepted projection per resident item is the sole authority for rows, anchors, focus, hits and images (L7). A separate global bounded cache of up to 8 recent width variants may exist only to make resize-back cheap; a variant is used only on exact id/revision/options/width match and then becomes the accepted projection. | Proposed — pending user confirmation |
-| 2 | Latest bar vs hidden continuation of the visible entry. | Follow the tested behavior: hidden continuation of the visible entry does not activate the bar; only a distinct newer entry fully below or hidden activity does (C18). `tui-rendering.md` is corrected in phase 7. | Proposed — pending user confirmation |
-| 3 | Scope of the 450 ms grace window. | Grace follows every manual movement intent and suppresses automatic movement only (assistant segment reveal T3, overflow handoff T4). It does not stop content filling tail space (T11), explicit intents, or the reveal of a newly accepted submission (N5). | Proposed — pending user confirmation |
-| 4 | Theme crate split (renderer-neutral `bcode_theme` described vs `bcode_tui_theme` with BMUX color types in reality). | Keep `bcode_tui_theme` as the TUI theme crate (it may depend on `bmux_tui`); renderer-neutral structure lives in `bcode_presentation_policy_models`. No new theme crate. Documentation is corrected to match. | Proposed — pending user confirmation |
-| 5 | Navigation hidden in activity code. | Automatic navigation is decided only in `navigation::auto` and enters the reducer as intents (N9); activity code computes latest-bar activity only. | Proposed — pending user confirmation |
-| 6 | Latest bar measured on a cloned viewport. | Visibility is a pure function evaluated once per frame against the full transcript-region height (F6); no cloned viewport or second sync. | Proposed — pending user confirmation |
+| 1 | Markdown projection cache: one per item vs current + up to 8 variants. | One accepted projection per resident item is the sole authority for rows, anchors, focus, hits and images (L7). A separate global bounded cache of up to 8 recent width variants may exist only to make resize-back cheap; a variant is used only on exact id/revision/options/width match and then becomes the accepted projection. | Confirmed by user |
+| 2 | Latest bar vs hidden continuation of the visible entry. | Follow the tested behavior: hidden continuation of the visible entry does not activate the bar; only a distinct newer entry fully below or hidden activity does (C18). `tui-rendering.md` is corrected in phase 7. | Confirmed by user |
+| 3 | Scope of the 450 ms grace window. | Grace follows every manual movement intent and suppresses automatic movement only (assistant segment reveal T3, overflow handoff T4). It does not stop content filling tail space (T11), explicit intents, or the reveal of a newly accepted submission (N5). | Confirmed by user |
+| 4 | Theme crate split (renderer-neutral `bcode_theme` described vs `bcode_tui_theme` with BMUX color types in reality). | Keep `bcode_tui_theme` as the TUI theme crate (it may depend on `bmux_tui`); renderer-neutral structure lives in `bcode_presentation_policy_models`. No new theme crate. Documentation is corrected to match. | Confirmed by user |
+| 5 | Navigation hidden in activity code. | Automatic navigation is decided only in `navigation::auto` and enters the reducer as intents (N9); activity code computes latest-bar activity only. | Confirmed by user |
+| 6 | Latest bar measured on a cloned viewport. | Visibility is a pure function evaluated once per frame against the full transcript-region height (F6); no cloned viewport or second sync. | Confirmed by user |
 | 7 | Home/End vs resident window. | Composer focused → text input start/end; transcript focused → true session start/latest, loaded directly (FO4, W10). | **Resolved by user** |
-| 8 | Tail-space size hard-coded `viewport_height − 1`. | Keep `viewport_height − 1` (at least one content row stays visible), expressed as the BMUX overscroll policy `ViewportMinus(1)` and documented (VP2). | Proposed — pending user confirmation |
-| 9 | TailSpace exhaustion → following re-enables automatic reveal. | Yes: when content fills the virtual space the reader is at latest, so the state becomes `Following` and automatic reveal applies (T11). | Proposed — pending user confirmation |
-| 10 | Selection fallback: rendered-text fallback vs reject stale mappings. | Source-backed content rejects stale or unavailable mappings (copy fails, selection kept). Rendered-text fallback applies only to fragments explicitly declared without source mapping (transformed visuals: diagrams, images, plugin rows), marked as rendered fragments in the selection scene. | Proposed — pending user confirmation |
+| 8 | Tail-space size hard-coded `viewport_height − 1`. | Keep `viewport_height − 1` (at least one content row stays visible), expressed as the BMUX overscroll policy `ViewportMinus(1)` and documented (VP2). | Confirmed by user |
+| 9 | TailSpace exhaustion → following re-enables automatic reveal. | Yes: when content fills the virtual space the reader is at latest, so the state becomes `Following` and automatic reveal applies (T11). | Confirmed by user |
+| 10 | Selection fallback: rendered-text fallback vs reject stale mappings. | Source-backed content rejects stale or unavailable mappings (copy fails, selection kept). Rendered-text fallback applies only to fragments explicitly declared without source mapping (transformed visuals: diagrams, images, plugin rows), marked as rendered fragments in the selection scene. | Confirmed by user |
 
 Additional proposals raised by this specification:
 
 | # | Topic | Proposal | Status |
 |---|---|---|---|
-| 11-P1 | Page target size | Replace the V1 target of 4 items / 24 rows with "fill to the per-request caps and continue until `prefetch_rows` is satisfied" (W5, W6). Caps are unchanged. | Proposed — pending user confirmation |
-| 11-P2 | Page Up/Down step | Keep 10 rows (D1) for parity. | Proposed — pending user confirmation |
-| 11-P3 | Focus bindings | `tui.chat.focusTranscript` = `alt+t` (new), `tui.chat.focusComposer` unbound (Escape and unbound typing return, FO3). The existing `ctrl+home`/`ctrl+end` defaults keep their keys from either focus but change meaning in V2 to direct session-start/latest loads (FO5); `ctrl+up`/`ctrl+down` are unchanged. Escape in transcript focus is not an `AppInterrupt` tap (FO11). | Proposed — pending user confirmation |
-| 11-P4 | Detached live handling | Live transcript events are not applied while detached. Return to live uses the bounded tail window (W9, W10), or the buffered catch-up when paging down reaches the tail (W11). Submitting while detached loads the tail window on acceptance (T27). | Proposed — pending user confirmation |
-| 11-P5 | Engine switching data (departs from user decision 1) | Decision 1 says both engines consume the same `SessionView` data and a switch rebuilds the other engine at the current reading position. Proposed instead: each engine owns its `SessionView`, because V2 needs `window_ops` and its own window modes and sharing V1's instance would need V1 changes beyond S2; a switch re-attaches through the bounded attach path at the exported `ReadingPosition` (EN3, EN4). Cost: one bounded attach request per switch, and row-in-item is not transferred. Alternative if rejected: V1 exports its resident events read-only (an S2 seam) and V2 rebuilds its `SessionView` from them without a daemon request. | Proposed — pending user confirmation |
+| 11-P1 | Page target size | Replace the V1 target of 4 items / 24 rows with "fill to the per-request caps and continue until `prefetch_rows` is satisfied" (W5, W6). Caps are unchanged. | Confirmed by user |
+| 11-P2 | Page Up/Down step | Keep 10 rows (D1) for parity. | Confirmed by user |
+| 11-P3 | Focus bindings | `alt+u` is the single key that moves keyboard focus into the transcript (unit focus); Escape, `alt+u` again, or an unbound key returns to the composer (FO2, FO3). No `alt+t`. `ctrl+home`/`ctrl+end` keep their keys and mean direct session-start/latest loads in V2 (FO5). | Resolved by user |
+| 11-P4 | Detached live handling | Live transcript events are not applied while detached. Return to live uses the bounded tail window (W9, W10), or the buffered catch-up when paging down reaches the tail (W11). Submitting while detached loads the tail window on acceptance (T27). | Confirmed by user |
+| 11-P5 | Runtime engine switching | Dropped (user decision): the engine is chosen at startup only (EN3); each engine owns its `SessionView` (EN4). | Resolved by user |
 
 ---
 
@@ -807,7 +806,7 @@ Additional proposals raised by this specification:
 |---|---|---|
 | 0 | This specification; development loop (`scripts/bmux-dev.sh`, which temporarily rewrites the root manifest's `bmux_*` patch lines, and the BMUX patch/Cargo.lock guard; section 13); BMUX 15 test harness; engine-neutral scenario suite with a V1 driver covering section 10 `S` items that V1 can express. `BUG-*` scenarios that reproduce on V1 are recorded as expected V1 failures; BUG-A3 and BUG-B4 did not reproduce and stay active as guards. | Spec merged; `bmux-dev.sh on`/`off` round-trips leaving `Cargo.toml` and `Cargo.lock` byte-identical to `HEAD`; the guard fails on a non-git `bmux_*` patch or a path/local BMUX lock source; harness tests pass in BMUX; scenario suite runs in `cargo test -p bcode_tui`. |
 | 1 | BMUX 1–7 with BMUX tests; Bcode enables `virtual-list`. | BMUX tests pass; generic API review (no product names); Bcode builds against the new BMUX through the dev loop; V1 unchanged. |
-| 2 | `bcode_tui_transcript` crate: `window`, `units` (minimal producers), `viewport`, `navigation` (intents, reducer, state machine, pending movement, motion), `handoff`; V2 scenario driver. Not wired into the host. | Navigation/window `S` and `U` items that need no phase-4/5 deliverable pass headlessly through the V2 driver with fixture producers, including BUG-A1–A4 and BUG-B4; clippy/tests clean. BUG-B1–B3 and BUG-B5 need aligned timeline windows, direct `Head`/`Tail` windows and fast return to live, so they are phase-5 exit criteria. |
+| 2 | `bcode_tui_transcript` crate: `window`, `units` (minimal producers), `viewport`, `navigation` (intents, reducer, state machine, pending movement, motion); V2 scenario driver. Not wired into the host. | Navigation/window `S` and `U` items that need no phase-4/5 deliverable pass headlessly through the V2 driver with fixture producers, including BUG-A1–A4 and BUG-B4; clippy/tests clean. BUG-B1–B3 and BUG-B5 need aligned timeline windows, direct `Head`/`Tail` windows and fast return to live, so they are phase-5 exit criteria. |
 | 3 | Identity-keyed item layout, `ItemRenderContext`, full producers (structure v2, themes, chrome, plugin visuals, Markdown, tools, diff, shell); BMUX 8–10. | B1–B12, C23–C25, C38, X3, X4, X10 pass; no thread-locals; `LayoutWorkCounters` (9.2) show no re-measure on scroll and only new units measured on prepend. |
 | 4 | V2 wired: engine seam, `engine_selection`, `transcript_v2_host` effects, focus model, latest bar, selection, CLI flag, env var, config key, runtime switch. | X5–X9 pass; both engines selectable side by side; V1 test suite unchanged and passing with `v1`; the section 10 manual smoke checklist passes on both engines; host-owned scenarios are enabled for V2. |
 | 5 | Incremental `SessionView` window operations, prefetch, aligned timeline windows, direct head/tail windows, fast return to live, scrollbar estimates. | SD1–SD7, W1–W13 (with W7a), X11, X12, BUG-B1–B5 pass (BUG-B3 through both `End` in transcript focus and jump-to-latest); no full rebuild on paging (counter). |

@@ -355,14 +355,13 @@ fn at_latest_bottom(frame: &ScenarioFrame, last: Marker) -> bool {
 fn transcript_focused_latest_window<D: TranscriptScenarioDriver>() -> Scenario<D> {
     let session = ScenarioSession::with_turns(400, 1);
     let mut scenario = Scenario::<D>::attach_latest(session, 40, WIDTH, HEIGHT);
-    let frame = settle(&mut scenario);
-    scenario.input(ScenarioInput::Click {
-        at: frame.transcript.center(),
-    });
+    settle(&mut scenario);
+    // FO2: alt+u is the single key that moves keyboard focus into the transcript.
+    scenario.key("alt+u");
     let focused = settle(&mut scenario);
     scenario.check(
         matches!(focused.focus, FocusObservation::Transcript { .. }),
-        || "a click in the transcript did not focus it".to_owned(),
+        || "alt+u did not focus the transcript".to_owned(),
     );
     scenario
 }

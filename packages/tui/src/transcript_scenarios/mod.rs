@@ -353,9 +353,9 @@ mod v1_navigation {
         c33_initial_focus_is_last_visible_target,
         c33_initial_focus_falls_back_to_nearest_target_above,
         fo4_composer_home_end_do_not_move_transcript,
-        #[ignore = "V1 deviation FO4: a click does not focus the transcript and Home always edits the composer"]
+        #[ignore = "V1 deviation FO4: Home in transcript focus does not load the session start directly"]
         fo4_transcript_home_loads_session_start_directly,
-        #[ignore = "V1 deviation FO4: a click does not focus the transcript and End always edits the composer"]
+        #[ignore = "V1 deviation FO4: End in transcript focus does not return to the latest bottom"]
         fo4_transcript_end_returns_to_latest,
         fo5_page_up_scrolls_from_composer_focus,
     }
