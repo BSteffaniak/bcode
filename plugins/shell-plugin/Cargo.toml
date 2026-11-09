@@ -13,6 +13,14 @@ version     = { workspace = true }
 [lib]
 crate-type = ["rlib"]
 
+# Features that make up each packaged component. Wrappers disable default
+# features, and the plugin definition lives behind `native`.
+[package.metadata.bmux-plugin.components.backend]
+features = ["native"]
+
+[package.metadata.bmux-plugin.components.frontend]
+features = ["native", "presentation"]
+
 [dependencies]
 bcode_agent_profile                 = { workspace = true, optional = true }
 bcode_config                        = { workspace = true, optional = true }
