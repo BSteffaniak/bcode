@@ -30,3 +30,5 @@ model-live/
 __pycache__/
 
 .recap/
+
+.claude/
