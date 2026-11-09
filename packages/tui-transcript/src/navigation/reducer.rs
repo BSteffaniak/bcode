@@ -100,10 +100,17 @@ impl Reducer<'_, '_, '_> {
             } => self.jump_to_sequence(sequence, placement),
             NavIntent::JumpToFraction { fraction } => self.jump_to_fraction(fraction),
             NavIntent::JumpToSessionStart => self.jump_to_session_start(at),
-            NavIntent::FocusTarget { target, edge } => {
+            NavIntent::FocusTarget { target, edge, rows } => {
                 // T19: no movement when the target is fully visible.
                 if self.view.contains(&target.unit) {
-                    self.place(&target.unit, Placement::EnsureVisible, edge, Some(at));
+                    match rows {
+                        Some(rows) => {
+                            self.place_rows(&target.unit, &rows, edge, at);
+                        }
+                        None => {
+                            self.place(&target.unit, Placement::EnsureVisible, edge, Some(at));
+                        }
+                    }
                 }
             }
             NavIntent::ReleaseHold => self.release_hold(at),
@@ -338,6 +345,48 @@ impl Reducer<'_, '_, '_> {
             self.state.motion = None;
             self.invalidate();
         }
+        true
+    }
+
+    /// C32/T19: bring the unit-local `rows` of `unit` into view from the approach edge: moving
+    /// up puts their first row on the top edge, moving down their last row on the bottom edge
+    /// (taller ranges keep their first row on top). Fully visible rows do not move.
+    fn place_rows(
+        &mut self,
+        unit: &UnitKey,
+        rows: &std::ops::Range<u64>,
+        edge: ApproachEdge,
+        at: Instant,
+    ) -> bool {
+        let view = self.view;
+        let Some(offset) = view.unit_offset(unit) else {
+            return false;
+        };
+        let height = view.viewport.height.max(1);
+        let start = offset.saturating_add(rows.start);
+        let end = offset.saturating_add(rows.end.max(rows.start.saturating_add(1)));
+        let current = visual_top(self.state, view, Some(at));
+        if start >= current && end <= current.saturating_add(height) {
+            return false;
+        }
+        let destination = match edge {
+            ApproachEdge::Top => start,
+            ApproachEdge::Bottom if end - start > height => start,
+            ApproachEdge::Bottom => end - height,
+        }
+        .min(view.max_top());
+        if destination == current {
+            return false;
+        }
+        let Some(anchor) = view.anchor_at(destination) else {
+            return false;
+        };
+        let target = ScrollTarget::Anchor(anchor);
+        self.state.pending_movement = None;
+        self.state.pending_jump = None;
+        self.state.pending_reveals.clear();
+        self.state.mode = mode_for(self.final_position(&target, current));
+        self.begin_motion(current, target, at);
         true
     }
 

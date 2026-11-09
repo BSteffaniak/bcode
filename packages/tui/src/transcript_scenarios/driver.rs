@@ -18,9 +18,11 @@ use super::session::ScenarioSession;
 pub enum ScenarioEngine {
     /// The current transcript engine in `bcode_tui`.
     V1,
-    /// The rewritten transcript engine (`bcode_tui_transcript`).
-    #[allow(dead_code)]
+    /// The rewritten transcript engine (`bcode_tui_transcript`) in the application: the root
+    /// model with the V2 host selected.
     V2,
+    /// The V2 engine façade driven headlessly, without the host (engine-level checks).
+    V2Headless,
 }
 
 /// Initial state for one scenario run.

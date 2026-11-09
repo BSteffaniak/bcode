@@ -378,6 +378,7 @@ impl BmuxKeyBinding {
 /// Register host-owned dialog actions. Defaults are declarations, never dispatch fallbacks.
 fn register_host_actions(
     registry: &mut bcode_plugin_sdk::tui::keymap::KeymapRegistry,
+    engine: bcode_config::TuiEngine,
 ) -> Result<(), bcode_plugin_sdk::tui::keymap::KeymapError> {
     register_control_actions(registry)?;
     register_model_actions(registry)?;
@@ -386,6 +387,9 @@ fn register_host_actions(
     register_form_editor_actions(registry)?;
     register_onboarding_actions(registry)?;
     register_transcript_focus_actions(registry)?;
+    if engine == bcode_config::TuiEngine::V2 {
+        super::transcript_v2_host::focus::register_actions(registry)?;
+    }
     Ok(())
 }
 
@@ -979,10 +983,17 @@ impl BmuxKeyMap {
         }
     }
 
-    /// Build a keymap from TUI config.
+    /// Build a keymap from TUI config for the default (V1) transcript engine.
     #[must_use]
     pub fn from_config(config: &TuiConfig) -> Self {
-        Self::try_from_config(config).unwrap_or_else(|error| Self {
+        Self::from_config_for_engine(config, bcode_config::TuiEngine::V1)
+    }
+
+    /// Build a keymap from TUI config for the transcript `engine` selected at startup: the
+    /// V2 engine adds its own `transcript_focus` actions (TUI V2 FO4).
+    #[must_use]
+    pub fn from_config_for_engine(config: &TuiConfig, engine: bcode_config::TuiEngine) -> Self {
+        Self::try_from_config_for_engine(config, engine).unwrap_or_else(|error| Self {
             registry: bcode_plugin_sdk::tui::keymap::KeymapRegistry::default(),
             activations: BTreeMap::new(),
             error: Some(error.to_string()),
@@ -995,6 +1006,18 @@ impl BmuxKeyMap {
     /// Returns invalid key configuration or conflicting action registration.
     pub fn try_from_config(
         config: &TuiConfig,
+    ) -> Result<Self, bcode_plugin_sdk::tui::keymap::KeymapError> {
+        Self::try_from_config_for_engine(config, bcode_config::TuiEngine::V1)
+    }
+
+    /// Compile contributor defaults and configuration for the transcript `engine`, without
+    /// silently ignoring invalid keys.
+    ///
+    /// # Errors
+    /// Returns invalid key configuration or conflicting action registration.
+    pub fn try_from_config_for_engine(
+        config: &TuiConfig,
+        engine: bcode_config::TuiEngine,
     ) -> Result<Self, bcode_plugin_sdk::tui::keymap::KeymapError> {
         use bcode_plugin_sdk::tui::keymap::{KeymapAction, KeymapRegistry};
         let mut registry = KeymapRegistry::default();
@@ -1043,7 +1066,7 @@ impl BmuxKeyMap {
             description: BmuxAction::TranscriptClearSelection.description().into(),
             defaults: Vec::new(),
         })?;
-        register_host_actions(&mut registry)?;
+        register_host_actions(&mut registry, engine)?;
         registry.configure(overrides)?;
         Ok(Self {
             error: None,

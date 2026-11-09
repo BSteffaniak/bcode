@@ -2927,6 +2927,29 @@ impl BmuxApp {
         &self.structure
     }
 
+    /// Declarative `[presentation]` configuration rules (the V2 transcript host compiles
+    /// its own structure configuration from the same layers).
+    #[must_use]
+    pub fn configured_structure_rules(
+        &self,
+    ) -> &[bcode_presentation_policy::models::PresentationRule] {
+        &self.configured_structure_rules
+    }
+
+    /// Interactive structural rules loaded from user state.
+    #[must_use]
+    pub fn user_structure_rules(&self) -> &[bcode_presentation_policy::models::PresentationRule] {
+        &self.user_structure_rules
+    }
+
+    /// The loaded plugins' effective `[presentation]` declarations, by plugin id.
+    #[must_use]
+    pub const fn plugin_presentation_declarations(
+        &self,
+    ) -> &BTreeMap<String, bcode_plugin::PluginPresentationDeclaration> {
+        &self.plugin_presentation_declarations
+    }
+
     fn transcript_index_of_item(&self, item_id: u64) -> Option<usize> {
         self.transcript()
             .iter()
@@ -6862,6 +6885,21 @@ impl BmuxApp {
         self.pending_submissions.remove(text);
     }
 
+    /// Displayed text of the committed user message at `sequence`.
+    fn committed_user_message_text(&self, sequence: u64, text: &str) -> String {
+        self.shared_terminal_text_for_sequence(sequence, "You")
+            .unwrap_or_else(|| text.to_owned())
+    }
+
+    /// Whether the committed user message at `sequence` accepts one of this client's pending
+    /// submissions that still owns its acceptance reveal. Asked before the message is applied,
+    /// because applying it forgets the pending submission.
+    #[must_use]
+    pub fn accepts_own_pending_submission(&self, sequence: u64, text: &str) -> bool {
+        self.pending_submissions
+            .reveals_on_acceptance(&self.committed_user_message_text(sequence, text))
+    }
+
     fn apply_committed_user_message(
         &mut self,
         sequence: u64,
@@ -6869,9 +6907,7 @@ impl BmuxApp {
         timestamp_ms: u64,
         application: SessionEventApplication,
     ) {
-        let text = self
-            .shared_terminal_text_for_sequence(sequence, "You")
-            .unwrap_or_else(|| text.to_owned());
+        let text = self.committed_user_message_text(sequence, text);
         self.input_history
             .push_committed(sequence, timestamp_ms, &text);
         let accepted_pending_submission = self.pending_submissions.reveals_on_acceptance(&text);

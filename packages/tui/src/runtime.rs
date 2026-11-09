@@ -344,7 +344,8 @@ fn initialize_tui_with_presentation(
     let launch_working_directory = std::env::current_dir().unwrap_or_else(|_| ".".into());
     let mut settings =
         chat_loop::TuiRuntimeSettings::bootstrap(launch_working_directory.clone(), static_plugins)
-            .with_launch_options(launch_options);
+            .with_launch_options(launch_options)
+            .with_transcript_engine(configured_transcript_engine(config.as_ref().ok()));
     if let Ok(config) = &config {
         settings.set_metrics_enabled(config.metrics.enabled);
     }
@@ -390,6 +391,14 @@ fn initialize_tui_with_presentation(
         declarative_streaming_policy,
         streaming_presentation_override: effective_streaming_override,
     }
+}
+
+/// The process transcript engine (EN1, EN3): resolved once from the launch selection and the
+/// configured `[tui] engine`, then fixed.
+fn configured_transcript_engine(
+    config: Option<&bcode_config::BcodeConfig>,
+) -> bcode_config::TuiEngine {
+    super::engine_selection::process_engine(config.and_then(|config| config.tui.engine))
 }
 
 fn apply_initial_config(
@@ -925,7 +934,8 @@ async fn run_managed_chat_bound<W: Write + Send>(
     let agents = session_flow::AgentCatalog::default();
     let cwd = attached.session.working_directory.clone();
     let mut settings = chat_loop::TuiRuntimeSettings::bootstrap(cwd.clone(), static_plugins)
-        .with_launch_options(launch_options);
+        .with_launch_options(launch_options)
+        .with_transcript_engine(configured_transcript_engine(config.as_ref().ok()));
     let run = {
         let mut chat = session_flow::ActiveChat {
             app: {

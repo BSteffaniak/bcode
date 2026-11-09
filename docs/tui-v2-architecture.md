@@ -137,6 +137,14 @@ No `_models` crate is created for V2: no other package needs V2 types without th
 implementation. `ReadingPosition` (saved per-session reading positions, restored on session
 resurrection) lives in `bcode_tui_transcript::navigation`.
 
+The engine is driven from one thread (X10) and is not `Send`: its retained item layouts hold
+BMUX components (`Element` erases `Box<dyn Component>`) and producer parts shared through `Rc`.
+The root runtime model must stay `Send`, because the CLI drives it through a boxed `Send`
+future (polled on the terminal thread). `transcript_v2_host` therefore keeps the engine in a
+thread-confined cell (`transcript_v2_host::thread_bound::ThreadBound`): the model can be moved,
+but the engine is reachable and dropped only on the thread that created it (access elsewhere
+panics; a drop elsewhere leaks).
+
 `bcode_tui_transcript` dependencies: `bcode_session_view`, `bcode_session_view_models`,
 `bcode_presentation_policy`, `bcode_tui_theme`, `bcode_tui_components` (pure recipes only),
 `bmux_tui`, `bmux_tui_components` (features `virtual-list`, `scroll-view`, `disclosure`, and
@@ -538,6 +546,26 @@ Transcript keyboard focus is unit focus: there is one transcript focus mode, ent
 | EN3 | The engine is chosen once at startup and fixed for the process lifetime. There is no runtime switching (user decision: not worth the complexity); switching engines means restarting with another flag, environment value or config. |
 | EN4 | Each engine owns its own `SessionView` instance and consumes daemon data through the same bounded attach and history paths. Host shell state (composer, overlays, permissions, plugin surfaces, configuration) is engine-independent. |
 | EN5 | Shared code between engines is only the section 1.3 layers and the host shell. The seam in `bcode_tui` is a single dispatch point choosing which engine handles transcript ingest, transcript input and transcript painting. |
+
+Host behavior with the V2 engine selected (phase 4):
+
+* The keymap is built for the selected engine: the V2-only `transcript_focus` actions
+  (`tui.transcriptFocus.sessionStart` on Home, `tui.transcriptFocus.latest` on End, FO4) are
+  registered only for V2, so the V1 keymap, help and keymap export are unchanged.
+* Command-palette transcript routes reach the V2 host: "Focus transcript units" toggles V2
+  transcript focus like `alt+u`, and routes V2 does not implement yet (inspector, make-default,
+  bulk disclosure) report that they are unavailable instead of changing the hidden V1
+  transcript.
+* Only this client's accepted submissions move the reader (T2, T27): the host shell decides,
+  before it applies a durable user message, whether it accepts one of its own pending
+  submissions.
+* A failed V2 history read is re-issued with a doubling backoff (250 ms up to 8 s) while the
+  engine still awaits it, and feeds daemon connectivity like V1 history reads.
+* Leaving a session saves its V2 reading position; attaching it again restores it (T21), and
+  a session opened at a search hit shows that sequence.
+* The interactive surface is docked below the transcript until V2 reserves inline
+  interaction rows; plugin visual pointer targets, Markdown images, Mermaid diagrams and the
+  fast temporal repaint path are V1-only, and the V1 transcript body is not rendered.
 
 ---
 

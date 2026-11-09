@@ -488,9 +488,7 @@ impl TerminalShell {
         repo_path: Option<std::path::PathBuf>,
         options: std::collections::BTreeMap<String, String>,
     ) -> Result<(), TuiError> {
-        let result = self
-            .dispatch_plugin_surface(surface_kind, repo_path, options)
-            .await;
+        let result = Box::pin(self.dispatch_plugin_surface(surface_kind, repo_path, options)).await;
         complete_runtime_screen(&mut self.handoff_blocked, result)
     }
 

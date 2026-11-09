@@ -232,6 +232,9 @@ pub enum NavIntent {
         target: crate::focus::FocusTargetId,
         /// Traversal direction.
         edge: ApproachEdge,
+        /// Unit-local rows the target governs ([`crate::focus::FocusView::extent`]); `None`
+        /// keeps the whole unit in view.
+        rows: Option<std::ops::Range<u64>>,
     },
     /// Stop following/holding at the current visual position.
     ReleaseHold,

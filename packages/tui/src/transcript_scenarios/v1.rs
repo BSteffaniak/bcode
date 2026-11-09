@@ -98,6 +98,68 @@ fn scenario_clipboard(text: &str) -> Result<(), String> {
     Ok(())
 }
 
+/// Reset the scenario clipboard of this test thread and make `model` copy into it.
+pub(super) fn install_scenario_clipboard(model: &mut BcodeRuntimeModel) {
+    CLIPBOARD_WRITES.with(|writes| writes.borrow_mut().clear());
+    CLIPBOARD_FAILS.with(|fails| fails.set(false));
+    model.set_transcript_clipboard_for_test(scenario_clipboard);
+}
+
+/// Script the scenario clipboard of this test thread to fail (`true`) or succeed.
+pub(super) fn set_scenario_clipboard_fails(fails: bool) {
+    CLIPBOARD_FAILS.with(|cell| cell.set(fails));
+}
+
+/// Clipboard writes recorded on this test thread, oldest first.
+pub(super) fn scenario_clipboard_writes() -> Vec<String> {
+    CLIPBOARD_WRITES.with(|writes| writes.borrow().clone())
+}
+
+/// The real root model for `setup` with `engine` selected: the session attached with the
+/// setup's resident window installed in the host shell, the production keymap contributors and
+/// no daemon (effects are collected by the driver).
+pub(super) fn scenario_model(
+    setup: &ScenarioSetup,
+    engine: bcode_config::TuiEngine,
+) -> BcodeRuntimeModel {
+    let session_id = setup.session.id();
+    let events = setup.session.events();
+    let resident = match setup.resident {
+        ResidentSeed::Latest { events: count } => setup.session.latest(count),
+        ResidentSeed::Everything => events,
+    };
+    let has_older = resident.len() < events.len();
+    let (event_sender, event_receiver) = crate::history_flow::session_stream_channel();
+    let mut app = crate::app::BmuxApp::new_with_history(Some(session_id), resident, &[], has_older);
+    // Same bounded latest-window install session attach performs.
+    app.replace_latest_transcript_window(resident, has_older);
+    app.freeze_transcript_scroll_animation_for_test();
+    let chat = crate::session_flow::ActiveChat {
+        app,
+        agents: crate::session_flow::AgentCatalog::default(),
+        attachment: crate::session_flow::ChatSessionAttachment::Attached { session_id },
+        event_sender,
+        event_receiver,
+        event_task: None,
+        opening_session_progress: None,
+        pending_effects: crate::effects::TuiEffectQueue::default(),
+    };
+    let mut settings =
+        crate::chat_loop::TuiRuntimeSettings::bootstrap(std::path::PathBuf::from("."), &[])
+            .with_transcript_engine(engine);
+    let mut actions = bcode_question_plugin::question_tui_registry()
+        .keymap_actions()
+        .to_vec();
+    actions.extend_from_slice(bcode_shell_plugin::shell_tui_registry().keymap_actions());
+    settings.integrate_keymap_contributors(Ok(actions));
+    let client = bcode_client::BcodeClient::default_endpoint();
+    let passive_client = client
+        .clone()
+        .with_daemon_availability(bcode_client::DaemonAvailability::RequireRunning);
+    let loop_state = crate::chat_loop::ChatLoopState::new(&client, &passive_client, false);
+    BcodeRuntimeModel::new(chat, settings, loop_state)
+}
+
 /// V1 engine under scenario control.
 pub struct V1Driver {
     model: BcodeRuntimeModel,
@@ -232,42 +294,7 @@ impl TranscriptScenarioDriver for V1Driver {
     const ENGINE: ScenarioEngine = ScenarioEngine::V1;
 
     fn start(setup: &ScenarioSetup) -> Self {
-        let session_id = setup.session.id();
-        let events = setup.session.events();
-        let resident = match setup.resident {
-            ResidentSeed::Latest { events: count } => setup.session.latest(count),
-            ResidentSeed::Everything => events,
-        };
-        let has_older = resident.len() < events.len();
-        let (event_sender, event_receiver) = crate::history_flow::session_stream_channel();
-        let mut app =
-            crate::app::BmuxApp::new_with_history(Some(session_id), resident, &[], has_older);
-        // Same bounded latest-window install session attach performs.
-        app.replace_latest_transcript_window(resident, has_older);
-        app.freeze_transcript_scroll_animation_for_test();
-        let chat = crate::session_flow::ActiveChat {
-            app,
-            agents: crate::session_flow::AgentCatalog::default(),
-            attachment: crate::session_flow::ChatSessionAttachment::Attached { session_id },
-            event_sender,
-            event_receiver,
-            event_task: None,
-            opening_session_progress: None,
-            pending_effects: crate::effects::TuiEffectQueue::default(),
-        };
-        let mut settings =
-            crate::chat_loop::TuiRuntimeSettings::bootstrap(std::path::PathBuf::from("."), &[]);
-        let mut actions = bcode_question_plugin::question_tui_registry()
-            .keymap_actions()
-            .to_vec();
-        actions.extend_from_slice(bcode_shell_plugin::shell_tui_registry().keymap_actions());
-        settings.integrate_keymap_contributors(Ok(actions));
-        let client = bcode_client::BcodeClient::default_endpoint();
-        let passive_client = client
-            .clone()
-            .with_daemon_availability(bcode_client::DaemonAvailability::RequireRunning);
-        let loop_state = crate::chat_loop::ChatLoopState::new(&client, &passive_client, false);
-        let model = BcodeRuntimeModel::new(chat, settings, loop_state);
+        let model = scenario_model(setup, bcode_config::TuiEngine::V1);
         let terminal = bmux_tui::terminal::Terminal::new(
             std::io::sink(),
             Rect::new(0, 0, setup.width, setup.height),
@@ -284,11 +311,7 @@ impl TranscriptScenarioDriver for V1Driver {
             elapsed: Duration::ZERO,
             last_repaint: None,
         };
-        CLIPBOARD_WRITES.with(|writes| writes.borrow_mut().clear());
-        CLIPBOARD_FAILS.with(|fails| fails.set(false));
-        driver
-            .model
-            .set_transcript_clipboard_for_test(scenario_clipboard);
+        install_scenario_clipboard(&mut driver.model);
         driver.collect_effects();
         driver
     }
@@ -561,7 +584,7 @@ impl TranscriptScenarioDriver for V1Driver {
                 return;
             }
             ScenarioSetting::ClipboardFails(fails) => {
-                CLIPBOARD_FAILS.with(|cell| cell.set(*fails));
+                set_scenario_clipboard_fails(*fails);
                 return;
             }
             ScenarioSetting::Selection {
@@ -582,7 +605,7 @@ impl TranscriptScenarioDriver for V1Driver {
     }
 
     fn clipboard_writes(&self) -> Vec<String> {
-        CLIPBOARD_WRITES.with(|writes| writes.borrow().clone())
+        scenario_clipboard_writes()
     }
 
     fn last_repaint(&self) -> Option<RepaintObservation> {

@@ -475,6 +475,7 @@ fn t19_focus_target_moves_only_when_not_fully_visible() {
         NavIntent::FocusTarget {
             target: FocusTargetId::unit(unit("u9")),
             edge: ApproachEdge::Bottom,
+            rows: None,
         },
         0,
     );
@@ -484,6 +485,7 @@ fn t19_focus_target_moves_only_when_not_fully_visible() {
         NavIntent::FocusTarget {
             target: FocusTargetId::unit(unit("u0")),
             edge: ApproachEdge::Top,
+            rows: None,
         },
         10,
     );
@@ -492,6 +494,7 @@ fn t19_focus_target_moves_only_when_not_fully_visible() {
         NavIntent::FocusTarget {
             target: FocusTargetId::unit(unit("u2")),
             edge: ApproachEdge::Bottom,
+            rows: None,
         },
         20,
     );

@@ -3325,6 +3325,8 @@ pub struct TuiRuntimeSettings {
     tui_extensions: Vec<bcode_plugin_sdk::tui::StaticPluginTuiExtension>,
     launch_working_directory: std::path::PathBuf,
     launch_options: super::TuiLaunchOptions,
+    /// Transcript engine fixed at startup (EN3); never changed by configuration reloads.
+    transcript_engine: bcode_config::TuiEngine,
 }
 
 impl TuiRuntimeSettings {
@@ -3346,6 +3348,7 @@ impl TuiRuntimeSettings {
             tui_extensions: super::bundled_tui_extensions(),
             launch_working_directory,
             launch_options: super::TuiLaunchOptions::default(),
+            transcript_engine: super::engine_selection::DEFAULT_ENGINE,
         }
     }
 
@@ -3353,6 +3356,24 @@ impl TuiRuntimeSettings {
     pub const fn with_launch_options(mut self, launch_options: super::TuiLaunchOptions) -> Self {
         self.launch_options = launch_options;
         self
+    }
+
+    /// Return the settings with the startup-selected transcript engine (EN3). The keymap is
+    /// rebuilt for that engine, so call this before applying configuration or integrating
+    /// keymap contributors.
+    #[must_use]
+    pub fn with_transcript_engine(mut self, engine: bcode_config::TuiEngine) -> Self {
+        if engine != self.transcript_engine {
+            self.keymap = BmuxKeyMap::from_config_for_engine(&TuiConfig::default(), engine);
+        }
+        self.transcript_engine = engine;
+        self
+    }
+
+    /// Transcript engine selected at startup.
+    #[must_use]
+    pub const fn transcript_engine(&self) -> bcode_config::TuiEngine {
+        self.transcript_engine
     }
 
     /// Return renderer-neutral command completion preferences.
@@ -3377,7 +3398,7 @@ impl TuiRuntimeSettings {
     }
 
     pub fn apply_tui_config(&mut self, tui_config: &TuiConfig) {
-        self.keymap = BmuxKeyMap::from_config(tui_config);
+        self.keymap = BmuxKeyMap::from_config_for_engine(tui_config, self.transcript_engine);
         self.mouse_scroll_rows = tui_config.mouse.effective_scroll_rows();
         self.selection_autoscroll = tui_config.mouse.selection_autoscroll;
         self.selection = tui_config.selection;
@@ -3572,6 +3593,8 @@ pub fn apply_effect_result(
     result: TuiEffectResult,
 ) {
     match result {
+        // Owned by the V2 transcript host; never produced while the V1 engine is selected.
+        TuiEffectResult::TranscriptV2HistoryLoaded { .. } => {}
         TuiEffectResult::XrayOpened {
             session_id,
             message,
@@ -6266,6 +6289,7 @@ pub fn draw_chat_frame<W: Write>(
     fast_temporal_presentation: bool,
     committed_layout: Option<render::FrameLayout>,
     transcript_selection: &bmux_tui::selection::SelectionController,
+    mut transcript_v2: Option<&mut super::transcript_v2_host::TranscriptV2Host>,
 ) -> Result<(bmux_tui::terminal::DrawStats, Option<render::FrameLayout>), TuiError> {
     // Modal scenes replace all interaction metadata, not just damaged cells.
     // The temporal path still reuses committed geometry and avoids transcript preparation.
@@ -6283,7 +6307,10 @@ pub fn draw_chat_frame<W: Write>(
         .is_some_and(super::telemetry::TuiTelemetry::is_enabled)
         .then(Instant::now);
     let prepare_started = frame_started;
+    // The fast temporal path repaints damaged regions from V1 state; with V2 every frame goes
+    // through the engine dispatch below.
     if fast_temporal_presentation
+        && transcript_v2.is_none()
         && terminal.retained_buffer().is_some()
         && (!loop_state.modal_foreground()
             || loop_state
@@ -6307,8 +6334,12 @@ pub fn draw_chat_frame<W: Write>(
         .interactive_surface
         .as_mut()
         .map(|surface| surface.preferred_height(full_transcript_area.width).max(1));
-    let pinned = chat.app.tui_config().interactions.placement
-        == bcode_config::TuiInteractionPlacement::Pinned;
+    // The V2 transcript does not reserve inline interaction rows yet (phase 6): with V2 the
+    // interactive surface is docked below the transcript instead of being placed from the
+    // hidden V1 layout.
+    let pinned = transcript_v2.is_some()
+        || chat.app.tui_config().interactions.placement
+            == bcode_config::TuiInteractionPlacement::Pinned;
     let pinned_offset = if pinned {
         let previous = loop_state.pinned_interaction_viewport.clone();
         let result = loop_state.interactive_surface.as_mut().map(|surface| {
@@ -6367,7 +6398,24 @@ pub fn draw_chat_frame<W: Write>(
     let prepared =
         render::prepare_frame_with_bottom_dock(&mut chat.app, terminal.area(), dock_height);
     let layout = prepared.map(|(layout, _dock)| layout);
-    let rich_presentation = layout.map_or_else(
+    if let (Some(host), Some(layout)) = (transcript_v2.as_deref_mut(), layout) {
+        let now = host.now();
+        host.sync_geometry(
+            super::transcript_v2_host::paint::transcript_region(layout),
+            now,
+        );
+        host.set_composer_area(layout.composer());
+    }
+    let transcript_v2_chrome = transcript_v2.is_some().then(|| {
+        (
+            super::transcript_v2_host::focus::jump_to_latest_label(chat.app.effective_keymap()),
+            chat.app.motion_policy().latest_bar_window(),
+            chat.app.presented_theme().canvas,
+        )
+    });
+    // V1 Markdown images and Mermaid diagrams are placed from the V1 transcript layout, which
+    // the V2 engine replaces in the body (V2 placeholders until phase 6).
+    let rich_presentation = layout.filter(|_| transcript_v2.is_none()).map_or_else(
         || MarkdownFramePresentation {
             rich: Vec::new(),
             image_removed: Vec::new(),
@@ -6558,17 +6606,46 @@ pub fn draw_chat_frame<W: Write>(
             let area = Rect::new(0, 0, frame.area().width, frame.area().height);
             let mut paint_background = |frame: &mut bmux_tui::paint::PaintCx<'_, '_>| {
                 if let Some(layout) = layout.filter(|_| !foreground_owns_canvas) {
-                    render::render_prepared_damage(&mut chat.app, frame, layout, intersects);
-                    let selection_scene =
-                        super::root_program::transcript_selection_scene(&chat.app, layout.body());
-                    paint_transcript_overlays(
-                        &chat.app,
-                        layout.body,
-                        frame,
-                        theme,
-                        &selection_scene,
-                        intersects(layout.body),
-                    );
+                    // With V2 the transcript body and latest bar are the V2 host's: the V1
+                    // transcript is neither rendered nor reconciled there (EN5).
+                    let v2 = transcript_v2.is_some();
+                    render::render_prepared_damage(&mut chat.app, frame, layout, |area| {
+                        intersects(area)
+                            && !(v2 && (area == layout.body() || Some(area) == layout.latest_bar()))
+                    });
+                    if let (Some(host), Some((jump_key, glow_window, canvas))) =
+                        (transcript_v2.as_deref_mut(), transcript_v2_chrome.as_ref())
+                    {
+                        let region = super::transcript_v2_host::paint::transcript_region(layout);
+                        if intersects(region) {
+                            // The canvas, as the V1 body and latest bar use.
+                            let style = super::transcript_v2_host::paint::TranscriptPaintStyle {
+                                background: *canvas,
+                                text: theme.text,
+                                muted: theme.muted,
+                                info: theme.info,
+                                accent: theme.focused,
+                                focus: theme.selection,
+                                jump_key,
+                                glow_window: *glow_window,
+                            };
+                            let now = host.now();
+                            host.paint(region, frame, &style, now);
+                        }
+                    } else {
+                        let selection_scene = super::root_program::transcript_selection_scene(
+                            &chat.app,
+                            layout.body(),
+                        );
+                        paint_transcript_overlays(
+                            &chat.app,
+                            layout.body,
+                            frame,
+                            theme,
+                            &selection_scene,
+                            intersects(layout.body),
+                        );
+                    }
                 }
                 for contribution_id in &rich_presentation.image_removed {
                     super::markdown_image::MarkdownImagePresentationStore::remove_from_frame(
@@ -6582,7 +6659,10 @@ pub fn draw_chat_frame<W: Write>(
                         frame,
                     );
                 }
-                if !foreground_owns_canvas && layout.is_some_and(|layout| intersects(layout.body)) {
+                if !foreground_owns_canvas
+                    && transcript_v2.is_none()
+                    && layout.is_some_and(|layout| intersects(layout.body))
+                {
                     for region in &rich_presentation.rich {
                         let Some(visible_rect) = region.visible_rect else {
                             continue;

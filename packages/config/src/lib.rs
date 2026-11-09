@@ -2536,6 +2536,65 @@ pub struct TuiConfig {
     /// glow. Overrides the theme's motion level and explicit accent settings.
     #[serde(default)]
     pub reduce_motion: bool,
+    /// Transcript engine used by the terminal UI. Omitted selects the default engine (`v1`).
+    /// The `--tui-engine` flag and the `BCODE_TUI_ENGINE` environment variable take
+    /// precedence. The engine is chosen once at startup; changing it requires a restart.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub engine: Option<TuiEngine>,
+}
+
+/// Terminal UI transcript engine.
+#[derive(
+    Debug,
+    Clone,
+    Copy,
+    Default,
+    PartialEq,
+    Eq,
+    PartialOrd,
+    Ord,
+    Hash,
+    Serialize,
+    Deserialize,
+    ConfigDocEnum,
+)]
+#[serde(rename_all = "snake_case")]
+pub enum TuiEngine {
+    /// The original transcript engine.
+    #[default]
+    V1,
+    /// The rewritten transcript engine (`bcode_tui_transcript`).
+    V2,
+}
+
+impl TuiEngine {
+    /// Every engine in declaration order.
+    pub const ALL: [Self; 2] = [Self::V1, Self::V2];
+
+    /// Stable configuration, flag and environment spelling (`v1` or `v2`).
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::V1 => "v1",
+            Self::V2 => "v2",
+        }
+    }
+
+    /// Parse the stable spelling (`v1` or `v2`); surrounding whitespace is ignored and
+    /// matching is ASCII case-insensitive.
+    #[must_use]
+    pub fn parse(value: &str) -> Option<Self> {
+        let value = value.trim();
+        Self::ALL
+            .into_iter()
+            .find(|engine| engine.as_str().eq_ignore_ascii_case(value))
+    }
+}
+
+impl std::fmt::Display for TuiEngine {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(self.as_str())
+    }
 }
 
 /// Terminal color depth policy.
@@ -11199,6 +11258,33 @@ enabled = false
                 "unexpected default for {key}"
             );
         }
+    }
+
+    #[test]
+    fn tui_engine_config_key_parses_and_defaults_to_unset() {
+        for input in ["", "[tui]"] {
+            let config: BcodeConfig = toml::from_str(input).expect("config parses");
+            assert_eq!(config.tui.engine, None);
+        }
+        for (value, expected) in [("v1", super::TuiEngine::V1), ("v2", super::TuiEngine::V2)] {
+            let config: BcodeConfig =
+                toml::from_str(&format!("[tui]\nengine = \"{value}\"")).expect("config parses");
+            assert_eq!(config.tui.engine, Some(expected));
+            let rendered = toml::to_string(&config.tui).expect("tui config serializes");
+            assert!(
+                rendered.contains(&format!("engine = \"{value}\"")),
+                "{rendered}"
+            );
+        }
+        assert!(toml::from_str::<BcodeConfig>("[tui]\nengine = \"v3\"").is_err());
+        let unset = toml::to_string(&super::TuiConfig::default()).expect("serializes");
+        assert!(!unset.contains("engine"), "{unset}");
+        assert_eq!(super::TuiEngine::config_doc_values(), &["v1", "v2"]);
+        assert_eq!(super::TuiEngine::default(), super::TuiEngine::V1);
+        assert_eq!(super::TuiEngine::parse(" V2 "), Some(super::TuiEngine::V2));
+        assert_eq!(super::TuiEngine::parse("v3"), None);
+        let fields = BcodeConfig::field_docs();
+        assert!(find_field_path(section_fields(&fields, "tui"), "engine").is_some());
     }
 
     #[test]

@@ -23,9 +23,9 @@ use bmux_tui::event::{Event, EventOutcome};
 use bmux_tui::geometry::Size;
 use bmux_tui::paint::PaintCx;
 
-use crate::focus::ChatFocus;
+use crate::focus::{ChatFocus, FocusState};
 use crate::frame::{FrameClock, FrameId, FrameSnapshot};
-use crate::latest_bar::LatestBarState;
+use crate::latest_bar::LatestBar;
 use crate::layout::geometry::ItemAction;
 use crate::layout::producers::{ProducerRegistry, UnitProducer};
 use crate::layout::{ActivityPhase, ItemLayoutCache, LayoutInputs, RenderConfig};
@@ -103,7 +103,10 @@ pub struct TranscriptEngine {
     units: Units,
     viewport: TranscriptViewport,
     nav: NavState,
-    focus: ChatFocus,
+    /// Composer/transcript keyboard focus (section 6).
+    focus: FocusState,
+    /// Latest-bar decision, activity and the full region geometry (F6).
+    latest: LatestBar,
     geometry: ViewportGeometry,
     motion: MotionConfig,
     producer: Box<dyn UnitProducer>,
@@ -161,7 +164,8 @@ impl TranscriptEngine {
             units: Units::new(),
             viewport: TranscriptViewport::new(),
             nav: NavState::new(),
-            focus: ChatFocus::Composer,
+            focus: FocusState::default(),
+            latest: LatestBar::new(false, geometry),
             geometry,
             motion,
             producer,
@@ -256,7 +260,7 @@ impl TranscriptEngine {
     /// Keyboard focus.
     #[must_use]
     pub const fn focus(&self) -> &ChatFocus {
-        &self.focus
+        self.focus.chat()
     }
 
     /// Transcript viewport geometry.
@@ -380,7 +384,9 @@ impl TranscriptEngine {
     pub fn apply_live(&mut self, input: LiveInput, at: Instant) -> EngineUpdate {
         self.observe_time(at);
         let LiveOutcome::Applied(changes) = self.window.apply_live(input, &mut self.session) else {
-            return EngineUpdate::default();
+            // A buffered or dropped live event may still advance the newest known sequence of a
+            // detached window (W2): the latest bar observes it.
+            return self.settle_interaction(at);
         };
         self.content(changes, at)
     }
@@ -465,6 +471,10 @@ impl TranscriptEngine {
     /// anchors keep the reading position (P1).
     pub fn resize(&mut self, geometry: ViewportGeometry, at: Instant) -> EngineUpdate {
         self.observe_time(at);
+        // `geometry` is the full transcript region; the effective viewport excludes the
+        // latest-bar row while the bar is shown (F6).
+        self.latest.set_region(geometry);
+        let geometry = self.latest.effective();
         let width_changed = geometry.width != self.geometry.width;
         self.geometry = geometry;
         if width_changed {
@@ -612,10 +622,7 @@ impl TranscriptEngine {
             motion_running,
             position,
             viewport,
-            latest_bar: LatestBarState {
-                visible: false,
-                rows_below_latest: 0,
-            },
+            latest_bar: self.latest.state(),
         }
     }
 
@@ -674,13 +681,7 @@ impl TranscriptEngine {
                         .top
                         .saturating_add(i64::try_from(unit.height).unwrap_or(i64::MAX))
         })?;
-        let width = snapshot.geometry.width;
-        let layout = self.layouts.current(&unit.key).filter(|layout| {
-            unit.layout.as_ref() == Some(&layout.key)
-                && layout.key.width == width
-                && layout.height == unit.height
-                && Some(layout.key.revision) == self.units.revision(&unit.key)
-        })?;
+        let layout = self.painted_layout(snapshot, unit)?;
         let local_row = u64::try_from(row - unit.top).ok()?;
         layout
             .geometry
@@ -732,7 +733,11 @@ impl TranscriptEngine {
             NavInput::PresentationCommitted { frame },
             &RemovedUnits::new(),
         );
-        self.run_effects(effects)
+        let mut update = self.run_effects(effects);
+        if let Some(now) = self.now {
+            update.merge(self.settle_interaction(now));
+        }
+        update
     }
 
     // ---- internals ------------------------------------------------------------------------
@@ -821,6 +826,7 @@ impl TranscriptEngine {
         );
         let mut update = self.run_effects(effects);
         update.invalidated = true;
+        self.record_hidden_activity(&unit_changes, at);
         update.merge(self.settle(at));
         update
     }
@@ -861,6 +867,7 @@ impl TranscriptEngine {
         for issued in self.window.poll_prefetch(rows, self.geometry.height) {
             update.requests.push(HostRequest::Page(issued));
         }
+        update.merge(self.settle_interaction(at));
         update
     }
 
@@ -1010,6 +1017,11 @@ impl TranscriptEngine {
 fn transcript_items(session: &SessionView) -> &[TranscriptViewItem] {
     &session.snapshot().transcript.items
 }
+
+mod interaction;
+
+pub use interaction::VisibleHitRegion;
+mod submission;
 
 #[cfg(test)]
 mod tests;

@@ -903,6 +903,9 @@ pub fn x2_focus_walk_scrolls_targets_into_view<D: TranscriptScenarioDriver>() {
     let mut saw_first = false;
     for _ in 0..40 {
         scenario.key("k");
+        // Time passes between key presses, so the scroll toward each focused target (an
+        // animated motion unless motion is reduced) completes before the next press.
+        scenario.advance(SETTLE);
         let frame = scenario.present();
         scenario.check(frame.focused_target.is_some(), || {
             "focus mode lost its target while walking".to_owned()

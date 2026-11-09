@@ -1347,6 +1347,11 @@ pub enum TuiEffect {
     },
     /// Discover the models advertised for the attached managed instance.
     LoadManagedModels,
+    /// Execute one V2 transcript engine history request (TUI V2 W5, W10, W11).
+    LoadTranscriptV2History {
+        /// The request, its session and the resident tail it was issued against.
+        load: super::transcript_v2_host::effects::HistoryLoad,
+    },
 }
 
 /// Daemon connectivity observation reported by completed effects.
@@ -1399,6 +1404,13 @@ impl DaemonObservation {
 
 /// Completed TUI background work.
 pub enum TuiEffectResult {
+    /// A V2 transcript engine history request completed (TUI V2 W3, W5, W10, W11).
+    TranscriptV2HistoryLoaded {
+        /// The executed request.
+        load: super::transcript_v2_host::effects::HistoryLoad,
+        /// Loaded canonical events, ready for the engine.
+        result: Result<super::transcript_v2_host::effects::HistoryLoaded, ClientError>,
+    },
     /// Secret-safe result of a shallow observation launch.
     XrayOpened {
         session_id: SessionId,
@@ -1882,6 +1894,9 @@ impl TuiEffectResult {
     pub fn daemon_observation(&self) -> DaemonObservation {
         match self {
             Self::XrayOpened { .. } => DaemonObservation::None,
+            Self::TranscriptV2HistoryLoaded { result, .. } => {
+                DaemonObservation::from_client_result(result)
+            }
             Self::QueueRecovery { result, .. } => DaemonObservation::from_client_result(result),
             Self::SessionChildrenLoaded { result, .. } => {
                 DaemonObservation::from_client_result(result)
@@ -2068,6 +2083,7 @@ impl SubmitMessageResult {
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 enum EffectKey {
+    TranscriptV2History(super::transcript_v2_host::effects::HistoryLane),
     Xray,
     QueueRecovery,
     SessionOpen,
@@ -2150,6 +2166,10 @@ impl TuiEffect {
     #[allow(clippy::too_many_lines, dead_code)]
     fn application_access_failed(self, client_error: ClientError) -> TuiEffectResult {
         match self {
+            Self::LoadTranscriptV2History { load } => TuiEffectResult::TranscriptV2HistoryLoaded {
+                load,
+                result: Err(client_error),
+            },
             Self::OpenXray { request } => TuiEffectResult::XrayOpened {
                 session_id: request.session_id,
                 message: "X-ray requires existing application access",
@@ -2579,6 +2599,7 @@ impl TuiEffect {
             | Self::LoadThinkingDialog { .. }
             | Self::LoadMilestones { .. }
             | Self::LoadTimelineJump { .. }
+            | Self::LoadTranscriptV2History { .. }
             | Self::LoadManagedModels => EffectDaemonIntent::Background,
         }
     }
@@ -2666,6 +2687,20 @@ impl TuiEffectQueue {
             TuiEffect::SkillAction { request } => Some(&request.execution),
             _ => None,
         })
+    }
+
+    /// Return the queued V2 transcript history requests, in lane order.
+    #[cfg(test)]
+    pub fn queued_transcript_v2_history(
+        &self,
+    ) -> Vec<super::transcript_v2_host::effects::HistoryLoad> {
+        self.effects
+            .values()
+            .filter_map(|(_, effect)| match effect {
+                TuiEffect::LoadTranscriptV2History { load } => Some(*load),
+                _ => None,
+            })
+            .collect()
     }
 
     /// Return whether a plugin surface-open effect is queued for the given plugin and kind.
@@ -2799,6 +2834,7 @@ impl TuiEffect {
 
     fn key(&self) -> EffectKey {
         match self {
+            Self::LoadTranscriptV2History { load } => EffectKey::TranscriptV2History(load.lane()),
             Self::OpenXray { .. } => EffectKey::Xray,
             Self::QueueRecovery { .. } => EffectKey::QueueRecovery,
             Self::OpenSession { .. } => EffectKey::SessionOpen,
@@ -3145,6 +3181,16 @@ impl TuiEffect {
             Self::LoadManagedModels => TuiEffectResult::ManagedModelsLoaded {
                 result: load_managed_models(&commands).await,
             },
+            Self::LoadTranscriptV2History { load } if load.session_id == session_id => {
+                TuiEffectResult::TranscriptV2HistoryLoaded {
+                    load,
+                    result: super::transcript_v2_host::effects::load_history(load, {
+                        let commands = &commands;
+                        move |query| commands.session_history_page(query)
+                    })
+                    .await,
+                }
+            }
             Self::SaveDraft {
                 scope: ComposerDraftScope::Session { session_id: owner },
                 text,
@@ -3180,6 +3226,16 @@ impl TuiEffect {
         streaming_sender: mpsc::Sender<TuiEffectResult>,
     ) -> TuiEffectResult {
         match self {
+            Self::LoadTranscriptV2History { load } => {
+                let client = &client;
+                TuiEffectResult::TranscriptV2HistoryLoaded {
+                    load,
+                    result: super::transcript_v2_host::effects::load_history(load, move |query| {
+                        client.session_history_page(load.session_id, query)
+                    })
+                    .await,
+                }
+            }
             Self::OpenXray { request } => {
                 let session_id = request.session_id;
                 let message = request.run(client).await;

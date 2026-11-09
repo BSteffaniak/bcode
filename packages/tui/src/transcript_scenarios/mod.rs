@@ -15,8 +15,10 @@ pub mod interaction;
 pub mod navigation;
 pub mod scenarios;
 pub mod session;
+pub mod startup;
 pub mod v1;
 pub mod v2;
+pub mod v2_headless;
 
 use std::time::Duration;
 
@@ -415,10 +417,10 @@ mod v1_interaction {
     }
 }
 
-/// Scenario instantiation for the V2 engine (phases 2–3: the engine façade driven headlessly
-/// with the standard producers).
-/// Ignored entries need a later phase's deliverable and fail when run (confirmed with
-/// `--ignored`); `docs/tui-v2-scenarios.md` records each status.
+/// Scenario instantiation for the V2 engine in the application (phase 4): the root model with the
+/// V2 host selected, driven through `update` and the root presenter ([`v2::V2Driver`]).
+/// Ignored entries need a later phase's deliverable or a driver capability and fail when run
+/// (confirmed with `--ignored`); `docs/tui-v2-scenarios.md` records each status.
 mod v2_engine {
     super::transcript_scenarios! { super::v2::V2Driver;
         t1_live_append_while_following_shows_latest,
@@ -434,10 +436,31 @@ mod v2_engine {
         bug_b4_resident_jump_while_detached_lands_and_stays,
         c11_streaming_response_reveals_top_and_holds,
         c17_reflow_during_reveal_motion_keeps_target,
-        #[ignore = "V2 pending phase 4: latest bar (F6); the scenario starts its motion from a latest-bar click"]
         c17_height_change_during_latest_motion_lands_on_latest,
-        #[ignore = "V2 pending phase 4: latest bar (F6); the scenario starts its motion from a latest-bar click"]
         c17_live_item_during_latest_motion_settles,
+    }
+}
+
+/// Engine-level instantiation of the [`scenarios`] list against the V2 engine façade without
+/// the host ([`v2_headless::V2HeadlessDriver`]). These scenarios need no composer, focus mode or
+/// latest bar, so a failure here isolates the engine from the host. The two `c17_…_latest_motion_…`
+/// scenarios start their motion from a latest-bar click, which only the host paints, so they run
+/// in [`v2_engine`] only.
+mod v2_headless_engine {
+    super::transcript_scenarios! { super::v2_headless::V2HeadlessDriver;
+        t1_live_append_while_following_shows_latest,
+        t23_live_append_while_reading_keeps_position,
+        c29_older_page_then_frame_preserves_reader,
+        bug_a1_wheel_between_older_page_and_frame,
+        bug_a2_continuous_wheel_moves_without_stall_or_leap,
+        bug_a3_eviction_after_prepend_keeps_visible_content,
+        bug_a4_session_start_does_not_shift_content,
+        bug_b1_timeline_window_first_newer_page_keeps_window,
+        bug_b2_wheel_between_newer_page_with_eviction_and_frame,
+        bug_b3_jump_to_latest_after_deep_jump_returns_live,
+        bug_b4_resident_jump_while_detached_lands_and_stays,
+        c11_streaming_response_reveals_top_and_holds,
+        c17_reflow_during_reveal_motion_keeps_target,
     }
 }
 
@@ -453,37 +476,28 @@ mod v2_navigation {
         c5_reflow_round_trip_does_not_drift,
         c6_rows_inserted_above_do_not_consume_tail_space,
         c7_wheel_up_inside_tail_space_keeps_tail_space,
-        #[ignore = "V2 pending phase 4: composer input and submission acceptance (host)"]
         c8_staged_submission_does_not_move_view,
-        #[ignore = "V2 pending phase 4: composer input and submission acceptance (host)"]
         c8_accepted_submission_reveals_message_at_top,
-        #[ignore = "V2 pending phase 4: composer input and local commands (host)"]
         c8_cleared_local_command_submission_does_not_anchor,
-        #[ignore = "V2 pending phase 4: composer input and submission acceptance (host)"]
         c9_tool_activity_after_submission_resumes_following,
         c10_later_stream_updates_do_not_move_revealed_response,
         c11_assistant_hold_survives_completion,
         c11_non_assistant_item_releases_hold_into_overflow_follow,
         c12_revealed_item_is_not_readmitted,
         c13_sticky_reveal_hands_off_after_segment_end,
-        #[ignore = "V2 pending phase 4: latest bar (F6); the scenario starts its motion from a latest-bar click"]
         c14_manual_scroll_materializes_running_motion,
         c14_manual_scroll_cancels_pending_jump,
         c15_grace_suppresses_stream_top_anchor,
         c16_stream_does_not_anchor_when_scrolled_up,
-        #[ignore = "V2 pending phase 4: latest bar (F6); the scenario starts its motion from a latest-bar click"]
         c17_latest_bar_motion_lands_on_latest_bottom,
         c17_pending_jump_never_falls_back_to_tail,
-        #[ignore = "V2 pending phase 4: latest bar (F6); the scenario starts its motion from a latest-bar click"]
         c22_reduced_motion_jump_is_instant,
-        #[ignore = "V2 pending phase 4: latest bar (F6); the scenario starts its motion from a latest-bar click"]
         c22_enabling_reduced_motion_mid_motion_settles_at_target,
         c23_reader_survives_page_and_live_append_before_frame,
         c24_width_change_keeps_source_line_at_top,
         c25_structural_insertion_keeps_reading_position,
         c25_collapse_above_keeps_reading_position,
         c26_runtime_work_events_do_not_move_final_response,
-        #[ignore = "V2 pending phase 4: latest bar (F6); the scenario starts its motion from a latest-bar click"]
         c27_repeated_presentation_is_idempotent,
         #[ignore = "driver: needs presentation failure injection"]
         c27_failed_presentation_does_not_commit_navigation,
@@ -491,21 +505,13 @@ mod v2_navigation {
         c29_direction_reversal_cancels_pending_movement,
         c30_growth_while_following_is_not_a_prepend,
         c31_window_bottom_is_not_session_tail,
-        #[ignore = "V2 pending phase 4: transcript focus mode (alt+u, FO2)"]
         c32_focus_up_puts_target_top_on_top_edge,
-        #[ignore = "V2 pending phase 4: transcript focus mode (alt+u, FO2)"]
         c32_focus_down_puts_target_bottom_on_bottom_edge,
-        #[ignore = "V2 pending phase 4: transcript focus mode (alt+u, FO2)"]
         c32_focus_on_visible_target_does_not_scroll,
-        #[ignore = "V2 pending phase 4: transcript focus mode (alt+u, FO2)"]
         c33_initial_focus_is_last_visible_target,
-        #[ignore = "V2 pending phase 4: transcript focus mode (alt+u, FO2)"]
         c33_initial_focus_falls_back_to_nearest_target_above,
-        #[ignore = "V2 pending phase 4: composer input (host)"]
         fo4_composer_home_end_do_not_move_transcript,
-        #[ignore = "V2 pending phase 4: transcript focus mode (alt+u, FO4)"]
         fo4_transcript_home_loads_session_start_directly,
-        #[ignore = "V2 pending phase 4: transcript focus mode (alt+u, FO4)"]
         fo4_transcript_end_returns_to_latest,
         fo5_page_up_scrolls_from_composer_focus,
     }
@@ -515,18 +521,12 @@ mod v2_navigation {
 mod v2_interaction {
     super::transcript_scenarios! { super::v2::V2Driver; in interaction;
         c18_latest_bar_ignores_hidden_continuation_of_visible_entry,
-        #[ignore = "V2 pending phase 4: latest bar (F6)"]
         c18_latest_bar_shows_for_distinct_entry_fully_below,
-        #[ignore = "V2 pending phase 4: latest bar (F6)"]
         c18_live_entry_below_reader_shows_bar,
         c18_jump_to_latest_after_live_entry_follows_and_clears_bar,
-        #[ignore = "V2 pending phase 4: latest bar (F6)"]
         c19_latest_bar_never_causes_its_own_visibility,
-        #[ignore = "V2 pending phase 4: latest bar (F6)"]
         c20_scroll_timer_and_reflow_generate_no_activity,
-        #[ignore = "V2 pending phase 4: latest bar (F6) and glow"]
         c21_latest_bar_glow_settles_still_after_window,
-        #[ignore = "V2 pending phase 4: latest bar (F6) and glow"]
         c21_reduced_motion_latest_bar_is_still_immediately,
         #[ignore = "V2 pending phase 6: transcript selection (BMUX 13)"]
         c34_drag_inside_response_stays_within_it,
@@ -554,9 +554,8 @@ mod v2_interaction {
         x1_click_toggles_group_header,
         #[ignore = "V2 pending phase 6: transcript selection (BMUX 13) and gesture routing (BMUX 14)"]
         x1_drag_from_header_selects_without_toggling,
-        #[ignore = "V2 pending phase 4: transcript focus mode (alt+u, FO6)"]
+        #[ignore = "V2 pending phase 6: structure inspector on the V2 path (FO6 `i`, host-side split); walking and disclosure keys pass"]
         x2_focus_mode_keys_walk_and_toggle_targets,
-        #[ignore = "V2 pending phase 4: transcript focus mode (alt+u, FO6)"]
         x2_focus_walk_scrolls_targets_into_view,
         x3_collapsed_group_reveals_failed_member,
         a16_hidden_units_leave_marker_and_failed_stays_visible,
@@ -565,7 +564,7 @@ mod v2_interaction {
         c38_streaming_markdown_converges_to_final,
         #[ignore = "V2 pending phase 6: regional damage observation (BMUX 15b)"]
         d6_wheel_scroll_repaints_regionally,
-        #[ignore = "V2 pending phase 4: composer input (host); damage observation in phase 6"]
+        #[ignore = "V2 pending phase 6: regional damage (D6, F5); the shared host shell's composer path marks full damage (D-16, as on V1)"]
         d6_composer_typing_repaints_regionally,
         d4_scrolling_does_no_layout_work,
         d4_prepend_measures_only_new_units,

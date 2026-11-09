@@ -30,6 +30,7 @@ pub(crate) mod composer_submit;
 pub(crate) mod cursor_blink;
 pub(crate) mod daemon_issue;
 pub(crate) mod effects;
+pub mod engine_selection;
 pub mod eval_launcher;
 mod execution_flow;
 mod execution_picker;
@@ -150,6 +151,7 @@ pub(crate) mod transcript_projection;
 pub(crate) mod transcript_resident_window;
 #[cfg(test)]
 mod transcript_scenarios;
+pub(crate) mod transcript_v2_host;
 pub(crate) mod transcript_viewport;
 pub(crate) mod working_directory_dialog;
 pub(crate) mod working_directory_dialog_render;

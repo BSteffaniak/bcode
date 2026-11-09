@@ -1,52 +1,52 @@
-//! Scenario driver for the V2 transcript engine (`bcode_tui_transcript`).
+//! Scenario driver for the V2 transcript engine in the application (TUI V2 phase 4).
 //!
-//! Phases 2–3 drive the engine façade headlessly: no host wiring exists yet (spec section 12).
-//! History requests the engine issues become pending scenario requests; inputs reach the
-//! engine as BMUX terminal events routed to the transcript list (wheel), as the navigation
-//! intents the host keymap will produce for the default transcript keys, or as clicks hit-tested
-//! against the committed frame's retained item geometry; frames are prepared, painted through
-//! BMUX into a buffer and committed, and observations are read from the painted rows exactly as
-//! for V1 (marker tokens per row).
+//! Drives the real [`BcodeRuntimeModel`] with the V2 engine selected
+//! ([`bcode_config::TuiEngine::V2`]) through `Program::update` (terminal input, session stream
+//! messages, effect completions, timers) and presents through the production root presenter,
+//! then commits through `Program::presentation_committed`. Keys and pointer input therefore
+//! take the application's routing: the keymap, the composer, the transcript focus model and the
+//! V2 host seams in the root model, exactly as in the application.
 //!
-//! Units are rendered by the engine's standard producers (structure v2, chrome, Markdown, tools,
-//! groups) with the bundled default theme, the theme's structural layers and its motion level,
-//! as the host will configure them; the fake session embeds marker tokens in message and tool
-//! text, so markers stay observable through item chrome.
+//! No BMUX runtime loop runs. Effects queued by an update or a commit are collected afterwards:
+//! the V2 host's history effects (`LoadTranscriptV2History`) become pending scenario requests,
+//! answered from the scripted session through the host's production history executor (against
+//! a daemon double over the scripted response) and delivered as their effect results; every other
+//! effect, V1 history loads of the hidden host-shell transcript included, is dropped (there is
+//! no daemon). The attach `Tail` window is answered with the setup's resident seed.
 //!
-//! The transcript region is the whole terminal: there is no composer, status row or latest bar
-//! before phase 4. Inputs that need the host (composer typing, focus mode, drag gestures,
-//! selection) panic with the missing capability, so scenarios that need them fail loudly
-//! instead of passing vacuously.
+//! Time is scenario time: the host clock is scripted ([`TranscriptV2Host::set_scripted_now`]),
+//! so every input, timer and frame the V2 host reduces uses it, and `advance_clock` delivers the
+//! production V2 timer (`bcode.transcript_v2`) through `update`.
+//!
+//! Observations come from the committed frame: the rows of the presented terminal buffer, the
+//! regions the V2 host painted (viewport and latest bar) and the prepared snapshot that frame
+//! painted (following, motion, focus).
 
-use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use bcode_presentation_policy::models::PresentationRule;
-use bcode_session_models::SessionEvent;
-use bcode_tui_theme::definition::{ResolvedThemeDefinition, ThemeCatalog, ThemeSelection};
-use bcode_tui_transcript::engine::{EngineUpdate, HostRequest, TranscriptEngine};
-use bcode_tui_transcript::frame::{FrameClock, FrameSnapshot};
-use bcode_tui_transcript::layout::RenderConfig;
-use bcode_tui_transcript::navigation::{InputSource, MotionConfig, NavIntent, Placement};
-use bcode_tui_transcript::scenario::LayoutWorkCounters;
-use bcode_tui_transcript::units::structure::PolicyLayers;
-use bcode_tui_transcript::viewport::ViewportGeometry;
-use bcode_tui_transcript::window::{
-    HistoryPageResult, HistoryWindowResult, LiveInput, PageCaps, PageDirection, PageRequest,
-    WindowRequest,
+use std::future::Future as _;
+
+use bcode_session_models::{
+    SessionEvent, SessionHistoryDirection, SessionHistoryPage, SessionHistoryQuery,
 };
-use bmux_tui::buffer::Buffer;
-use bmux_tui::event::{Event, MouseEvent, MouseEventKind};
-use bmux_tui::frame::Frame;
-use bmux_tui::geometry::{Point, Rect};
-use bmux_tui::paint::PaintCx;
+use bcode_tui_transcript::engine::HostRequest;
+use bcode_tui_transcript::layout::LayoutWorkCounters;
+use bcode_tui_transcript::window::{PageCaps, PageRequest, WindowRequest};
+use bmux_tui::event::{Event, MouseButton, MouseEvent, MouseEventKind};
+use bmux_tui::geometry::{Point, Rect, Size};
+use bmux_tui_runtime::{Presenter as _, Program as _, RuntimeEvent, TimerId};
 
 use super::driver::{
-    HistoryRequest, HistoryResponse, LayoutWork, PageLimits, PendingHistoryRequest, RequestId,
-    ResidentSeed, ScenarioEngine, ScenarioInput, ScenarioIntent, ScenarioSetting, ScenarioSetup,
-    TranscriptScenarioDriver, WheelDirection,
+    HistoryRequest, HistoryResponse, LayoutWork, PageLimits, PendingHistoryRequest,
+    RepaintObservation, RequestId, ResidentSeed, ScenarioEngine, ScenarioInput, ScenarioIntent,
+    ScenarioSetting, ScenarioSetup, TranscriptScenarioDriver, WheelDirection,
 };
 use super::frame::{CellRect, FocusObservation, ScenarioFrame};
+use crate::effects::{TuiEffect, TuiEffectResult};
+use crate::history_flow::SessionStreamUpdate;
+use crate::root_program::{BcodeRuntimeMessage, BcodeRuntimeModel};
+use crate::transcript_v2_host::TranscriptV2Host;
+use crate::transcript_v2_host::effects::{HistoryLoad, HistoryLoaded};
 
 /// Page sizing V2 asks for: filled to the per-request caps (W6, 11-P1).
 const V2_PAGE_LIMITS: PageLimits = PageLimits {
@@ -56,136 +56,110 @@ const V2_PAGE_LIMITS: PageLimits = PageLimits {
     max_events: PageCaps::PAGE.max_events_scanned,
 };
 
-/// Events on each side of a timeline target before alignment (W8).
-const V2_AROUND_HALF_WINDOW: usize = 256;
+/// Events the host reads on each side of a timeline target before alignment (W8): half the
+/// window cap at or before the target, the rest after it.
+const V2_AROUND_HALF_WINDOW: usize = PageCaps::WINDOW.max_events_scanned / 2;
 
-/// Theme the host selects by default (`[tui.theme] name`).
-const DEFAULT_THEME: &str = "terminal-native";
+/// The root model's V2 transcript timer (motion frames, grace expiry, glow frames).
+const TRANSCRIPT_V2_TIMER: &str = "bcode.transcript_v2";
 
-/// The bundled default theme, resolved as the host resolves it without overlays.
-fn default_theme() -> Arc<ResolvedThemeDefinition> {
-    let resolved = ThemeCatalog::bundled()
-        .and_then(|catalog| catalog.resolve(&ThemeSelection::new(DEFAULT_THEME)))
-        .expect("the bundled default theme resolves");
-    Arc::new(resolved)
-}
-
-/// V2 engine under scenario control.
+/// V2 engine in the application under scenario control.
 pub struct V2Driver {
-    engine: TranscriptEngine,
-    width: u16,
-    height: u16,
-    pending: Vec<(RequestId, HostRequest)>,
+    model: BcodeRuntimeModel,
+    terminal: bmux_tui::terminal::Terminal<std::io::Sink>,
+    /// V2 history effects not yet completed, in issue order.
+    pending: Vec<(RequestId, HistoryLoad)>,
     next_request: u64,
     /// Origin of scenario time; only differences from it matter.
     origin: Instant,
     /// Scenario time advanced so far.
     elapsed: Duration,
-    /// First canonical sequence of the session (session starts never change).
-    first_sequence: Option<u64>,
-    /// Newest canonical sequence known to exist (setup plus live deliveries).
-    last_sequence: Option<u64>,
-    /// Theme items render with; its structural layers and motion level apply too (X4).
-    theme: Arc<ResolvedThemeDefinition>,
-    /// Configured `[presentation]` rules (scenario settings).
-    config_rules: Vec<PresentationRule>,
-    /// `tui.reduce_motion`.
-    reduce_motion: bool,
-    /// Last committed frame; clicks are hit-tested against it.
-    committed: Option<FrameSnapshot>,
+    /// Repaint scope reported by the last presentation.
+    last_repaint: Option<RepaintObservation>,
 }
 
 impl V2Driver {
-    fn now(&self) -> Instant {
-        self.origin + self.elapsed
+    fn host(&self) -> &TranscriptV2Host {
+        self.model
+            .transcript_v2_for_test()
+            .expect("the V2 scenario driver selects the V2 engine")
     }
 
-    fn record(&mut self, update: EngineUpdate) {
-        for request in update.requests {
-            self.next_request += 1;
-            self.pending.push((RequestId(self.next_request), request));
+    fn host_mut(&mut self) -> &mut TranscriptV2Host {
+        self.model
+            .transcript_v2_mut_for_test()
+            .expect("the V2 scenario driver selects the V2 engine")
+    }
+
+    fn update(&mut self, event: RuntimeEvent<BcodeRuntimeMessage>) {
+        let _update = self
+            .model
+            .update(event)
+            .expect("V2 scenario update must succeed");
+        self.collect_effects();
+    }
+
+    fn terminal_event(&mut self, event: Event) {
+        self.update(RuntimeEvent::Terminal(event));
+    }
+
+    /// Deliver the V2 timer: due engine timers fire at the current scenario time, and the
+    /// end-of-update flush follows the session, applies configuration and starts effects.
+    fn sync(&mut self) {
+        self.update(RuntimeEvent::Timer(TimerId::new(TRANSCRIPT_V2_TIMER)));
+    }
+
+    /// Keep V2 history loads as pending requests; drop work that needs a daemon. A new load
+    /// replaces the pending load of its lane, as the effect queue does.
+    fn collect_effects(&mut self) {
+        let (scheduled, _notes) = self.model.chat.pending_effects.drain_runtime();
+        for (_schedule, effect) in scheduled {
+            if let TuiEffect::LoadTranscriptV2History { load } = effect {
+                self.pending
+                    .retain(|(_, pending)| pending.lane() != load.lane());
+                self.next_request += 1;
+                self.pending.push((RequestId(self.next_request), load));
+            }
         }
     }
 
-    /// Recompile the structure policy from the theme layers and configured rules and apply it
-    /// as a configuration reload would.
-    fn apply_structure(&mut self) {
-        let (config, diagnostics) = PolicyLayers {
-            theme: Some(&self.theme),
-            config_rules: &self.config_rules,
-            ..PolicyLayers::default()
-        }
-        .compile_with_host_parts();
-        assert!(
-            diagnostics.is_empty(),
-            "scenario rules must compile cleanly: {diagnostics:?}"
-        );
-        let at = self.now();
-        let update = self.engine.set_structure_config(config, at);
-        self.record(update);
-    }
-
-    fn intent(&mut self, intent: NavIntent) {
-        let at = self.now();
-        let update = self.engine.intent(intent, at);
-        self.record(update);
-    }
-
-    fn list_event(&mut self, event: &Event) {
-        let at = self.now();
-        let (update, _handled) = self.engine.list_event(event, at);
-        self.record(update);
-    }
-
-    /// Translate a key the host keymap binds to transcript navigation in every focus (FO5).
-    /// Keys that need the host (composer, focus mode) are not expressible before phase 4.
-    fn key(&mut self, name: &str) {
-        let intent = match name {
-            "pageup" => NavIntent::PageBy { pages: -1 },
-            "pagedown" => NavIntent::PageBy { pages: 1 },
-            "ctrl+up" => NavIntent::ScrollBy {
-                rows: -1,
-                source: InputSource::Key,
-            },
-            "ctrl+down" => NavIntent::ScrollBy {
-                rows: 1,
-                source: InputSource::Key,
-            },
-            "ctrl+home" => NavIntent::JumpToSessionStart,
-            "ctrl+end" => NavIntent::JumpToLatest,
-            _ => panic!(
-                "V2 driver: key {name:?} needs the phase-4 host (composer, focus mode and keymap)"
-            ),
+    /// Deliver the result of `load` through the root model's effect-completion path.
+    fn deliver(&mut self, load: HistoryLoad, loaded: HistoryLoaded) {
+        let result = TuiEffectResult::TranscriptV2HistoryLoaded {
+            load,
+            result: Ok(loaded),
         };
-        self.intent(intent);
+        self.update(RuntimeEvent::Message(BcodeRuntimeMessage::EffectCompleted(
+            Box::new(result),
+        )));
     }
 
-    /// Answer the attach request with the setup's resident window.
+    /// Answer the attach `Tail` window with the setup's resident window.
     fn seed(&mut self, setup: &ScenarioSetup) {
-        let at = self.now();
-        let update = self.engine.attach(at);
-        let Some(HostRequest::Window(issued)) = update.requests.first().copied() else {
-            panic!("V2 attach must request the tail window");
-        };
+        self.sync();
+        let position = self
+            .pending
+            .iter()
+            .position(|(_, load)| {
+                matches!(load.request, HostRequest::Window(issued)
+                    if issued.request == WindowRequest::Tail)
+            })
+            .expect("V2 attach must request the tail window");
+        let (_, load) = self.pending.remove(position);
         let events = setup.session.events();
         let resident = match setup.resident {
             ResidentSeed::Latest { events: count } => setup.session.latest(count),
             ResidentSeed::Everything => events,
         };
-        let result = HistoryWindowResult {
-            generation: issued.generation,
-            target: issued.request,
-            events: resident.to_vec(),
-            has_older: resident.len() < events.len(),
-            has_newer: false,
-            first_available_sequence: self.first_sequence,
-            last_available_sequence: self.last_sequence,
-        };
-        let update = self
-            .engine
-            .apply_window(&result, at)
-            .expect("V2 attach window applies");
-        self.record(update);
+        let loaded = execute(
+            load,
+            &HistoryResponse {
+                events: resident.to_vec(),
+                has_older: resident.len() < events.len(),
+                has_newer: false,
+            },
+        );
+        self.deliver(load, loaded);
     }
 
     fn history_request(request: &HostRequest) -> HistoryRequest {
@@ -204,7 +178,7 @@ impl V2Driver {
                 WindowRequest::Around { sequence } => HistoryRequest::Around {
                     sequence,
                     before_events: V2_AROUND_HALF_WINDOW,
-                    after_events: V2_AROUND_HALF_WINDOW,
+                    after_events: PageCaps::WINDOW.max_events_scanned - V2_AROUND_HALF_WINDOW,
                 },
                 WindowRequest::Head => HistoryRequest::Head {
                     max_events: PageCaps::WINDOW.max_events_scanned,
@@ -213,10 +187,87 @@ impl V2Driver {
                     max_events: PageCaps::WINDOW.max_events_scanned,
                 },
                 WindowRequest::LiveState => {
-                    panic!("V2 driver: live-state rehydration needs the phase-5 host")
+                    panic!("V2 driver: live-state rehydration needs the phase-5 window manager")
                 }
             },
         }
+    }
+
+    fn mouse(&mut self, kind: MouseEventKind, at: super::driver::CellPoint) {
+        self.terminal_event(Event::Mouse(MouseEvent::new(kind, Point::new(at.x, at.y))));
+    }
+}
+
+/// Execute `load` with the host's production history executor
+/// ([`crate::transcript_v2_host::effects::load_history`]: bounded reads, the `Around` split,
+/// page validation, session bounds) against a daemon double holding exactly the scripted
+/// `response`: its events, with more history beyond them where the response says so.
+fn execute(load: HistoryLoad, response: &HistoryResponse) -> HistoryLoaded {
+    let read = |query: SessionHistoryQuery| {
+        std::future::ready(Ok::<_, bcode_client::ClientError>(daemon_page(
+            load, response, query,
+        )))
+    };
+    let future = std::pin::pin!(crate::transcript_v2_host::effects::load_history(load, read));
+    let mut context = std::task::Context::from_waker(std::task::Waker::noop());
+    match future.poll(&mut context) {
+        std::task::Poll::Ready(result) => {
+            result.expect("scripted history responses are consistent daemon pages")
+        }
+        std::task::Poll::Pending => unreachable!("the daemon double answers immediately"),
+    }
+}
+
+/// One daemon read over the scripted `response`: the events at or past the cursor in the
+/// query direction, bounded by its limit, ascending; more remains past the limit or past the
+/// response's own edge in that direction.
+fn daemon_page(
+    load: HistoryLoad,
+    response: &HistoryResponse,
+    query: SessionHistoryQuery,
+) -> SessionHistoryPage {
+    let cursor = query.cursor.map(|cursor| cursor.sequence);
+    let (mut events, beyond_edge): (Vec<SessionEvent>, bool) = match query.direction {
+        SessionHistoryDirection::Forward => (
+            response
+                .events
+                .iter()
+                .filter(|event| cursor.is_none_or(|cursor| event.sequence >= cursor))
+                .cloned()
+                .collect(),
+            response.has_newer,
+        ),
+        SessionHistoryDirection::Backward => (
+            response
+                .events
+                .iter()
+                .rev()
+                .filter(|event| cursor.is_none_or(|cursor| event.sequence <= cursor))
+                .cloned()
+                .collect(),
+            response.has_older,
+        ),
+    };
+    let has_more = events.len() > query.limit || (beyond_edge && !events.is_empty());
+    events.truncate(query.limit);
+    if query.direction == SessionHistoryDirection::Backward {
+        events.reverse();
+    }
+    SessionHistoryPage {
+        session_id: load.session_id,
+        events,
+        compatibility_issues: Vec::new(),
+        next_cursor: None,
+        has_more,
+    }
+}
+
+const fn cell_rect(rect: Rect) -> CellRect {
+    CellRect {
+        x: rect.x,
+        y: rect.y,
+        width: rect.width,
+        height: rect.height,
     }
 }
 
@@ -224,64 +275,50 @@ impl TranscriptScenarioDriver for V2Driver {
     const ENGINE: ScenarioEngine = ScenarioEngine::V2;
 
     fn start(setup: &ScenarioSetup) -> Self {
-        let theme = default_theme();
-        let (structure, diagnostics) = PolicyLayers {
-            theme: Some(&theme),
-            ..PolicyLayers::default()
-        }
-        .compile_with_host_parts();
-        assert!(
-            diagnostics.is_empty(),
-            "theme layers compile: {diagnostics:?}"
+        let mut model = super::v1::scenario_model(setup, bcode_config::TuiEngine::V2);
+        let origin = Instant::now();
+        model
+            .transcript_v2_mut_for_test()
+            .expect("V2 engine selected at startup")
+            .set_scripted_now(origin);
+        super::v1::install_scenario_clipboard(&mut model);
+        let terminal = bmux_tui::terminal::Terminal::new(
+            std::io::sink(),
+            Rect::new(0, 0, setup.width, setup.height),
         );
-        let engine = TranscriptEngine::new(
-            ViewportGeometry::new(u64::from(setup.width), u64::from(setup.height)),
-            MotionConfig::for_motion(theme.chrome.motion, false),
-        )
-        .with_structure_config(structure)
-        .with_render_config(RenderConfig::for_theme(Arc::clone(&theme)));
         let mut driver = Self {
-            engine,
-            width: setup.width,
-            height: setup.height,
+            model,
+            terminal,
             pending: Vec::new(),
             next_request: 0,
-            origin: Instant::now(),
+            origin,
             elapsed: Duration::ZERO,
-            first_sequence: setup.session.events().first().map(|event| event.sequence),
-            last_sequence: setup.session.last_sequence(),
-            theme,
-            config_rules: Vec::new(),
-            reduce_motion: false,
-            committed: None,
+            last_repaint: None,
         };
         driver.seed(setup);
         driver
     }
 
     fn wheel_rows(&self) -> u16 {
-        self.engine.wheel_rows()
+        u16::try_from(self.model.settings.mouse_scroll_rows()).unwrap_or(u16::MAX)
     }
 
     fn deliver_live(&mut self, event: SessionEvent) {
-        self.last_sequence = Some(
-            self.last_sequence
-                .map_or(event.sequence, |last| last.max(event.sequence)),
-        );
-        let at = self.now();
-        let update = self
-            .engine
-            .apply_live(LiveInput::Durable(Box::new(event)), at);
-        self.record(update);
+        self.update(RuntimeEvent::Message(BcodeRuntimeMessage::SessionStream(
+            Box::new(SessionStreamUpdate::Event(Box::new(
+                bcode_ipc::Event::Session(event),
+            ))),
+        )));
     }
 
     fn pending_requests(&self) -> Vec<PendingHistoryRequest> {
+        let engine = self.host().engine();
         self.pending
             .iter()
-            .filter(|(_, request)| self.engine.is_awaiting(request))
-            .map(|(id, request)| PendingHistoryRequest {
+            .filter(|(_, load)| engine.is_awaiting(&load.request))
+            .map(|(id, load)| PendingHistoryRequest {
                 id: *id,
-                request: Self::history_request(request),
+                request: Self::history_request(&load.request),
             })
             .collect()
     }
@@ -292,151 +329,160 @@ impl TranscriptScenarioDriver for V2Driver {
             .iter()
             .position(|(pending, _)| *pending == id)
             .expect("completed request must be pending");
-        let (_, request) = self.pending.remove(position);
-        let at = self.now();
-        let update = match request {
-            HostRequest::Page(issued) => {
-                let direction = issued.request.direction();
-                let has_more = match direction {
-                    PageDirection::Older => response.has_older,
-                    PageDirection::Newer => response.has_newer,
-                };
-                let result = HistoryPageResult {
-                    generation: issued.generation,
-                    direction,
-                    events: response.events,
-                    has_more,
-                    unaligned: false,
-                };
-                self.engine.apply_page(&result, at)
-            }
-            HostRequest::Window(issued) => {
-                let result = HistoryWindowResult {
-                    generation: issued.generation,
-                    target: issued.request,
-                    events: response.events,
-                    has_older: response.has_older,
-                    has_newer: response.has_newer,
-                    first_available_sequence: self.first_sequence,
-                    last_available_sequence: self.last_sequence,
-                };
-                self.engine.apply_window(&result, at)
-            }
-        };
-        // A stale result (superseded generation) is dropped by the engine, as in the host.
-        if let Ok(update) = update {
-            self.record(update);
-        }
+        let (_, load) = self.pending.remove(position);
+        let loaded = execute(load, &response);
+        self.deliver(load, loaded);
     }
 
     fn input(&mut self, input: ScenarioInput) {
         match input {
-            ScenarioInput::Key(name) => self.key(&name),
+            ScenarioInput::Key(name) => {
+                let stroke = bmux_keyboard::parse_key_stroke(&name)
+                    .unwrap_or_else(|_| panic!("invalid scenario key {name:?}"));
+                self.terminal_event(Event::Key(stroke));
+            }
             ScenarioInput::Wheel { direction, at } => {
                 let kind = match direction {
                     WheelDirection::Up => MouseEventKind::ScrollUp,
                     WheelDirection::Down => MouseEventKind::ScrollDown,
                 };
-                self.list_event(&Event::Mouse(MouseEvent::new(kind, Point::new(at.x, at.y))));
-            }
-            ScenarioInput::Resize { width, height } => {
-                self.width = width;
-                self.height = height;
-                let at = self.now();
-                let update = self.engine.resize(
-                    ViewportGeometry::new(u64::from(width), u64::from(height)),
-                    at,
-                );
-                self.record(update);
+                self.mouse(kind, at);
             }
             ScenarioInput::Click { at } => {
-                // Press and release without movement activate the region under the pointer in
-                // the committed frame (X1). Gesture routing through selection is phase 6.
-                let snapshot = self
-                    .committed
-                    .clone()
-                    .expect("V2 driver: a click needs a committed frame");
-                let now = self.now();
-                let (update, _hit) =
-                    self.engine
-                        .click(&snapshot, u64::from(at.x), u64::from(at.y), now);
-                self.record(update);
+                self.mouse(MouseEventKind::Down(MouseButton::Left), at);
+                self.mouse(MouseEventKind::Up(MouseButton::Left), at);
             }
-            ScenarioInput::Press { .. }
-            | ScenarioInput::DragTo { .. }
-            | ScenarioInput::Release { .. } => panic!(
-                "V2 driver: drag gestures need phase-6 selection and click routing (BMUX 13, 14)"
-            ),
+            ScenarioInput::Press { at } => self.mouse(MouseEventKind::Down(MouseButton::Left), at),
+            ScenarioInput::DragTo { at } => {
+                self.mouse(MouseEventKind::Drag(MouseButton::Left), at);
+            }
+            ScenarioInput::Release { at } => self.mouse(MouseEventKind::Up(MouseButton::Left), at),
+            ScenarioInput::Resize { width, height } => {
+                self.terminal.resize(Rect::new(0, 0, width, height));
+                self.terminal_event(Event::Resize(Size { width, height }));
+            }
         }
     }
 
     fn navigate(&mut self, intent: ScenarioIntent) {
-        let intent = match intent {
-            ScenarioIntent::JumpToSequence(sequence) => NavIntent::JumpToSequence {
-                sequence,
-                placement: Placement::ItemTopAtTop,
-            },
-            ScenarioIntent::JumpToLatest => NavIntent::JumpToLatest,
-        };
-        self.intent(intent);
+        match intent {
+            ScenarioIntent::JumpToSequence(sequence) => {
+                // The timeline dialog's jump path, which the root model routes to the V2 host.
+                self.model.timeline_jump_for_test(sequence);
+                self.sync();
+            }
+            // The jump-to-latest binding the latest bar names.
+            ScenarioIntent::JumpToLatest => self.input(ScenarioInput::Key("ctrl+end".to_owned())),
+        }
     }
 
     fn advance_clock(&mut self, by: Duration) {
         self.elapsed = self.elapsed.saturating_add(by);
-        let now = self.now();
-        let update = self.engine.advance(now);
-        self.record(update);
+        let now = self.origin + self.elapsed;
+        self.host_mut().set_scripted_now(now);
+        self.sync();
     }
 
     fn present(&mut self) -> ScenarioFrame {
-        let clock = FrameClock { now: self.now() };
-        let snapshot = self.engine.prepare_frame(clock);
-        let area = Rect::new(0, 0, self.width, self.height);
-        let mut buffer = Buffer::empty(area);
-        let rows = {
-            let mut frame = Frame::new(&mut buffer);
-            // One presentation clock per frame (BMUX 8), as the runtime presenter supplies it.
-            frame.set_clock(Some(clock.presentation()));
-            self.engine
-                .paint_frame(&snapshot, &mut PaintCx::new(&mut frame));
-            (0..self.height)
-                .map(|row| frame.buffer().row_symbols(row).unwrap_or_default())
-                .collect()
-        };
-        let update = self.engine.commit(snapshot.id);
-        self.record(update);
-        let following_bottom = snapshot.following;
-        let motion_running = snapshot.motion_running;
-        self.committed = Some(snapshot);
+        let mut output = Vec::new();
+        let mut staged = self.terminal.fork(&mut output);
+        let full_damage = self.model.presentation_damage_is_full_for_test()
+            || self.terminal.retained_buffer().is_none();
+        let report = crate::root_program::bcode_runtime_presenter(&mut staged)
+            .present(&mut self.model)
+            .expect("V2 scenario presentation must succeed");
+        self.terminal.acknowledge(staged);
+        self.last_repaint = Some(RepaintObservation {
+            full: full_damage || report.full_repaint,
+            changed_cells: report.changed_cells,
+        });
+        let _update = self.model.presentation_committed(report);
+        self.collect_effects();
+        let buffer = self
+            .terminal
+            .retained_buffer()
+            .expect("committed frame retains its buffer");
+        let rows = (0..buffer.area().height)
+            .map(|row| buffer.row_symbols(row).unwrap_or_default())
+            .collect();
+        let host = self.host();
+        let regions = host.regions();
+        let transcript = regions
+            .viewport
+            .or(regions.transcript)
+            .map_or_else(CellRect::default, cell_rect);
+        let frame = host.last_frame();
+        let target = host.focus().transcript_target();
         ScenarioFrame {
             index: 0,
             rows,
-            transcript: CellRect {
-                x: 0,
-                y: 0,
-                width: self.width,
-                height: self.height,
+            transcript,
+            latest_bar: regions.latest_bar.map(cell_rect),
+            following_bottom: frame.is_some_and(|frame| frame.following),
+            motion_running: frame.is_some_and(|frame| frame.motion_running),
+            focus: if target.is_some() {
+                FocusObservation::Transcript { units: true }
+            } else {
+                FocusObservation::Composer
             },
-            latest_bar: None,
-            following_bottom,
-            motion_running,
-            focus: FocusObservation::Composer,
-            focused_target: None,
+            focused_target: target.map(|target| format!("{target:?}")),
         }
     }
 
     fn resident_sequences(&self) -> Option<(u64, u64)> {
-        let window = self.engine.window();
+        let window = self.host().engine().window();
         Some((window.first_sequence?, window.last_sequence?))
     }
 
+    /// Transcript selection is phase 6 in V2; the host keeps none.
     fn selection_text(&self) -> Option<String> {
         None
     }
 
-    /// V2 has no clipboard path before phase 6 (selection and copy), so nothing is ever written.
+    fn configure(&mut self, setting: &ScenarioSetting) {
+        let mut config = self.model.chat.app.tui_config().clone();
+        match setting {
+            ScenarioSetting::PresentationRules(rules) => {
+                let presentation = toml::from_str::<bcode_config::PresentationConfig>(rules)
+                    .unwrap_or_else(|error| panic!("invalid scenario rules: {error}"));
+                self.model
+                    .chat
+                    .app
+                    .apply_configured_structure_rules(presentation.rules);
+            }
+            ScenarioSetting::ClipboardFails(fails) => {
+                super::v1::set_scenario_clipboard_fails(*fails);
+                return;
+            }
+            ScenarioSetting::Selection {
+                auto_copy_on_release,
+                clear_after_copy,
+                clear_delay_ms,
+            } => {
+                config.selection.auto_copy_on_mouse_release = *auto_copy_on_release;
+                config.selection.clear_after_copy = *clear_after_copy;
+                config.selection.clear_delay_ms = *clear_delay_ms;
+                self.model.settings.apply_tui_config(&config);
+                self.model.chat.app.apply_tui_config(config);
+            }
+            ScenarioSetting::ReducedMotion(reduce) => {
+                config.reduce_motion = *reduce;
+                // The configuration reload path applies TUI settings to both owners.
+                self.model.settings.apply_tui_config(&config);
+                self.model.chat.app.apply_tui_config(config);
+            }
+        }
+        self.model.request_full_redraw_for_test();
+        // The V2 host picks configuration up at the end of the next update.
+        self.sync();
+    }
+
     fn clipboard_writes(&self) -> Vec<String> {
-        Vec::new()
+        super::v1::scenario_clipboard_writes()
+    }
+
+    fn last_repaint(&self) -> Option<RepaintObservation> {
+        self.last_repaint
     }
 
     fn layout_work(&mut self) -> Option<LayoutWork> {
@@ -446,7 +492,7 @@ impl TranscriptScenarioDriver for V2Driver {
             projections,
             measurements,
             producer_builds,
-        } = self.engine.take_layout_work();
+        } = self.host_mut().take_layout_work();
         Some(LayoutWork {
             markdown_parses,
             highlights,
@@ -456,24 +502,23 @@ impl TranscriptScenarioDriver for V2Driver {
         })
     }
 
-    fn configure(&mut self, setting: &ScenarioSetting) {
-        match setting {
-            ScenarioSetting::ReducedMotion(reduce) => {
-                self.reduce_motion = *reduce;
-                let motion = MotionConfig::for_motion(self.theme.chrome.motion, self.reduce_motion);
-                let at = self.now();
-                let update = self.engine.set_motion(motion, at);
-                self.record(update);
-            }
-            ScenarioSetting::PresentationRules(rules) => {
-                let presentation = toml::from_str::<bcode_config::PresentationConfig>(rules)
-                    .unwrap_or_else(|error| panic!("invalid scenario rules: {error}"));
-                self.config_rules = presentation.rules;
-                self.apply_structure();
-            }
-            ScenarioSetting::Selection { .. } | ScenarioSetting::ClipboardFails(_) => {
-                panic!("V2 driver: selection and clipboard need phase 6")
-            }
-        }
+    fn focused_extent(&self) -> Option<std::ops::Range<i64>> {
+        let host = self.host();
+        let engine = host.engine();
+        let target = engine.focus().transcript_target()?;
+        let unit = host
+            .last_frame()?
+            .viewport
+            .as_ref()?
+            .units
+            .iter()
+            .find(|unit| unit.key == target.unit)?;
+        // The rows the target governs, which focus traversal reveals (C32).
+        let rows = engine.focus_view().extent(target)?;
+        let offset = |row: u64| {
+            unit.top
+                .saturating_add(i64::try_from(row).unwrap_or(i64::MAX))
+        };
+        Some(offset(rows.start)..offset(rows.end))
     }
 }
