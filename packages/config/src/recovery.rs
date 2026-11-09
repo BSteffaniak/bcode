@@ -158,6 +158,75 @@ impl ConfigSourceAuthority {
             capture_with_sources(config, sources, &self.roots)
         }
     }
+    /// Verify the same retained sources from another client workspace.
+    /// Only absent workspace-discovery layers may differ; this grants no authority to read
+    /// new files or follow new targets. Explicit sources, selectors and existing layers stay pinned.
+    ///
+    /// # Errors
+    /// Rejects substituted sources, newly present workspace layers, changed targets or contents
+    /// inconsistent with the supplied configuration.
+    pub fn verify_workspace(
+        &self,
+        config: &BcodeConfig,
+        sources: &ConfigRecoverySources,
+    ) -> Result<(), ConfigRecoveryError> {
+        if sources == &self.sources {
+            return self.verify(config, sources).map(|_| ());
+        }
+        if !self.read_only || !sources.cwd.is_absolute() || !sources.cwd.is_dir() {
+            return Err(ConfigRecoveryError::SourceBounds);
+        }
+        authority_paths(sources)?;
+        let mut normalized = sources.clone();
+        normalized.cwd.clone_from(&self.sources.cwd);
+        // Exclusive-file loads do not consume discovered paths at all.
+        if sources.exclusive_config_path.is_some() {
+            normalized
+                .discovered_paths
+                .clone_from(&self.sources.discovered_paths);
+        } else if sources.discovered_paths != self.sources.discovered_paths {
+            self.verify_absent_workspace_layers(sources)?;
+            normalized
+                .discovered_paths
+                .clone_from(&self.sources.discovered_paths);
+        }
+        self.verify(config, &normalized).map(|_| ())
+    }
+
+    fn verify_absent_workspace_layers(
+        &self,
+        sources: &ConfigRecoverySources,
+    ) -> Result<(), ConfigRecoveryError> {
+        let environment = crate::ConfigEnvironmentSnapshot::new(
+            std::collections::BTreeMap::new(),
+            sources.cwd.clone(),
+        );
+        let workspace =
+            crate::default_config_paths_from_with_environment(&sources.cwd, &environment);
+        if sources.discovered_paths.len() != self.sources.discovered_paths.len() {
+            return Err(ConfigRecoveryError::Changed);
+        }
+        for (previous, current) in self
+            .sources
+            .discovered_paths
+            .iter()
+            .zip(&sources.discovered_paths)
+        {
+            if previous == current {
+                continue;
+            }
+            if !workspace.contains(current) {
+                return Err(ConfigRecoveryError::Changed);
+            }
+            for path in [previous, current] {
+                match std::fs::symlink_metadata(path) {
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                    _ => return Err(ConfigRecoveryError::Changed),
+                }
+            }
+        }
+        Ok(())
+    }
 }
 
 fn authority_paths(
@@ -839,6 +908,48 @@ mod tests {
                 Err(ConfigRecoveryError::Changed)
             );
         }
+    }
+
+    #[test]
+    fn read_authority_allows_workspace_change_without_new_source_authority() {
+        let dir = tempfile::tempdir().unwrap();
+        let first = dir.path().join("first");
+        let second = dir.path().join("second");
+        std::fs::create_dir(&first).unwrap();
+        std::fs::create_dir(&second).unwrap();
+        let config_path = dir.path().join("config.toml");
+        std::fs::write(&config_path, "").unwrap();
+        let source = ConfigRecoverySources {
+            cwd: first.clone(),
+            discovered_paths: vec![first.join("bcode.toml"), first.join(".bcode/bcode.toml")],
+            env_config_path: Some(config_path.clone()),
+            ..Default::default()
+        };
+        let authority = ConfigSourceAuthority::capture_read_only(&source).unwrap();
+        let effective = replay(&source, &[dir.path().to_owned()]).unwrap().0;
+        let mut changed = source.clone();
+        changed.cwd = second.clone();
+        changed.discovered_paths =
+            vec![second.join("bcode.toml"), second.join(".bcode/bcode.toml")];
+        assert!(authority.verify_workspace(&effective, &changed).is_ok());
+        assert!(authority.verify(&effective, &changed).is_err());
+        std::fs::write(second.join("bcode.toml"), "").unwrap();
+        assert!(authority.verify_workspace(&effective, &changed).is_err());
+        changed
+            .discovered_paths
+            .clone_from(&source.discovered_paths);
+        changed.env_config_path = Some(second.join("other.toml"));
+        assert!(authority.verify_workspace(&effective, &changed).is_err());
+        changed.env_config_path = Some(config_path);
+        changed.model_profile = Some("substituted".into());
+        assert!(authority.verify_workspace(&effective, &changed).is_err());
+        let edit_authority = ConfigSourceAuthority::capture(&source).unwrap();
+        changed.model_profile = None;
+        assert!(
+            edit_authority
+                .verify_workspace(&effective, &changed)
+                .is_err()
+        );
     }
 
     #[test]

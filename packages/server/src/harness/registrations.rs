@@ -97,7 +97,7 @@ pub async fn commit(
         .as_ref()
         .ok_or(ManagedHarnessError::Invalid)?;
     authority
-        .verify(&config, sources)
+        .verify_workspace(&config, sources)
         .map_err(|_| ManagedHarnessError::Conflict)?;
     let view = super::configuration_views::declarative_for_client(state, client).await?;
     let native =
@@ -121,7 +121,7 @@ pub async fn commit(
     // Re-check the authenticated source immediately before commit. Neither UI payload nor
     // preparation grants authority to substitute a different configuration or installation.
     authority
-        .verify(&config, sources)
+        .verify_workspace(&config, sources)
         .map_err(|_| ManagedHarnessError::Conflict)?;
     let current = super::configuration_views::declarative_for_client(state, client).await?;
     if current.configuration_values() != previous {

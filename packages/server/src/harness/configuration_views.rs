@@ -248,7 +248,7 @@ fn verify_startup_sources(
             .and_then(|launch| launch.recovery_sources.as_ref())
             .ok_or(ManagedHarnessError::Invalid)?;
         authority
-            .verify(supplied, sources)
+            .verify_workspace(supplied, sources)
             .map_err(|_| ManagedHarnessError::Conflict)?;
     }
     Ok(())
@@ -320,7 +320,7 @@ pub async fn declarative_for_client(
                     authority
                         .as_ref()
                         .ok_or(ManagedHarnessError::Invalid)?
-                        .verify(&config, sources)
+                        .verify_workspace(&config, sources)
                         .map_err(|_| ManagedHarnessError::Conflict)?;
                 }
                 config

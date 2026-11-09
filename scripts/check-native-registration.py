@@ -2,6 +2,8 @@
 """Offline PTY acceptance: native first-use with immutable symlink configuration.
 Build with cargo build -p bcode --bin bcode --features app,distribution first.
 Optional argument selects an explicit test executable; state and HOME are isolated.
+BCODE_TEST_DIFFERENT_CWD=1 starts the daemon in another workspace.
+BCODE_TEST_NATIVE_LOGIN=1 exercises signed-out native terminal login.
 """
 import os, pathlib, tempfile, subprocess, sys, json, pty, fcntl, termios, struct, select, time, signal, hashlib
 repo=pathlib.Path(__file__).resolve().parents[1]
@@ -12,7 +14,7 @@ exe=root/'claude';source=(repo/'packages/bcode/tests/fixtures/harness/claude_nat
 login_test=os.environ.get('BCODE_TEST_NATIVE_LOGIN')=='1'
 if login_test: (native/'auth-login-required').touch()
 q=lambda x:json.dumps(str(x))
-config=root/'bcode.toml'; config.write_text(f'''[plugins]
+config=root/'selected.toml'; config.write_text(f'''[plugins]
 default = "none"
 enabled = ["bcode.claude-code", "bcode.harness", "bcode.fake-provider", "bcode.default-agents"]
 [model]
@@ -29,6 +31,9 @@ args=[str(binary),'--state-root',str(root/'state')]
 print('isolated state',root,flush=True);print('test artifact sha256',hashlib.sha256(binary.read_bytes()).hexdigest(),flush=True)
 proc=None
 try:
+ if os.environ.get('BCODE_TEST_DIFFERENT_CWD') == '1':
+  bootstrap=subprocess.run(args+['server','start'],env=env,cwd=root/'home',capture_output=True,text=True,timeout=45)
+  assert bootstrap.returncode == 0, 'daemon bootstrap failed: '+bootstrap.stderr
  master,slave=pty.openpty();fcntl.ioctl(slave,termios.TIOCSWINSZ,struct.pack('HHHH',38,140,0,0))
  proc=subprocess.Popen(args+['--new'],env=env,cwd=root,stdin=slave,stdout=slave,stderr=slave,start_new_session=True);os.close(slave)
  data=bytearray()
@@ -39,6 +44,10 @@ try:
     try:data.extend(os.read(master,65536))
     except OSError:break
  drain(45)
+ if os.environ.get('BCODE_TEST_DIFFERENT_CWD') == '1':
+  probe=subprocess.run(args+['plugin','call','--daemon','bcode.managed-session/v1','registration_snapshot',json.dumps({'schema_version':1,'operation':'registration_snapshot','request_json':'{}'}),'--json'],env=env,cwd=root/'home',capture_output=True,text=True,timeout=30)
+  assert probe.returncode == 0, 'cross-workspace registration read failed: '+probe.stderr
+  print('PASS: registration snapshot from another workspace',flush=True)
  os.write(master,b'\x1b[200~/model\x1b[201~');drain(1);os.write(master,b'\x1b');drain(.5);os.write(master,b'\r');drain(22)
  (root/'terminal.raw').write_bytes(data)
  text=data.decode(errors='replace')
