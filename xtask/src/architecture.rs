@@ -112,6 +112,16 @@ impl From<Metadata> for Graph {
 
 impl Graph {
     fn path(&self, root: &str, forbidden: impl Fn(&str) -> bool) -> Option<Vec<String>> {
+        self.path_through(root, forbidden, |_| true)
+    }
+
+    /// Like [`Self::path`], but does not search below packages for which `transit` is false.
+    fn path_through(
+        &self,
+        root: &str,
+        forbidden: impl Fn(&str) -> bool,
+        transit: impl Fn(&str) -> bool,
+    ) -> Option<Vec<String>> {
         let mut queue = VecDeque::from([(root.to_owned(), vec![self.names[root].clone()])]);
         let mut seen = BTreeSet::new();
         while let Some((id, path)) = queue.pop_front() {
@@ -120,6 +130,9 @@ impl Graph {
             }
             if id != root && forbidden(&self.names[&id]) {
                 return Some(path);
+            }
+            if id != root && !transit(&self.names[&id]) {
+                continue;
             }
             for dep in self.edges.get(&id).into_iter().flatten() {
                 let mut next = path.clone();
@@ -223,6 +236,36 @@ fn forbidden_dependency(owner: &str, dependency: &str) -> bool {
         )
 }
 
+/// The terminal transcript engine embedded by the `bcode_tui` host.
+const TRANSCRIPT_ENGINE: &str = "bcode_tui_transcript";
+
+/// Host, daemon-client and persistence crates the transcript engine must not reach: it holds
+/// ephemeral presentation state only and the host owns I/O.
+fn transcript_engine_forbidden(dependency: &str) -> bool {
+    matches!(
+        dependency,
+        "bcode_tui" | "bcode_client" | "bcode_ipc" | "bcode_session" | "bcode_server"
+    )
+}
+
+/// Packages whose own dependencies the transcript engine boundary does not inspect.
+///
+/// `bcode_session_view` is the shared semantic transcript reducer; its client-backed actions use
+/// `bcode_client`, and its renderer neutrality is checked by the portable presentation profile.
+fn transcript_engine_transit(dependency: &str) -> bool {
+    dependency != "bcode_session_view"
+}
+
+fn check_transcript_engine(graph: &Graph, failures: &mut Vec<String>) -> Result<()> {
+    let root = graph.root(TRANSCRIPT_ENGINE)?;
+    if let Some(path) =
+        graph.path_through(root, transcript_engine_forbidden, transcript_engine_transit)
+    {
+        failures.push(format!("transcript engine boundary: {}", path.join(" -> ")));
+    }
+    Ok(())
+}
+
 /// Check resolved production/build dependencies for the selected target.
 ///
 /// # Errors
@@ -241,6 +284,7 @@ pub fn check(target: &str) -> Result<()> {
         }
     };
     check_sql_profiles(&graph, target, &mut failures)?;
+    check_transcript_engine(&graph, &mut failures)?;
     for root in &graph.members {
         let name = &graph.names[root];
         let forbidden = |dep: &str| forbidden_dependency(name, dep);
@@ -561,6 +605,57 @@ mod tests {
         assert!(graph.path("a", |name| name == "dev_only").is_none());
         assert!(graph.path("a", |name| name == "absent").is_none());
         assert!(graph.root("absent").is_err());
+    }
+
+    #[test]
+    fn transcript_engine_rejects_host_and_client_crates_but_allows_session_view() {
+        let metadata = serde_json::json!({
+            "packages": [
+                {"id":"t","name":"bcode_tui_transcript"},
+                {"id":"v","name":"bcode_session_view"},
+                {"id":"c","name":"bcode_client"},
+                {"id":"i","name":"bcode_ipc"},
+                {"id":"b","name":"bridge"},
+                {"id":"h","name":"bcode_tui"}
+            ],
+            "workspace_members":["t"],
+            "resolve":{"nodes":[
+                {"id":"t","deps":[{"pkg":"v","dep_kinds":[{"kind":null}]}]},
+                {"id":"v","deps":[{"pkg":"c","dep_kinds":[{"kind":null}]}]},
+                {"id":"c","deps":[{"pkg":"i","dep_kinds":[{"kind":null}]}]},
+                {"id":"i","deps":[]},{"id":"b","deps":[]},{"id":"h","deps":[]}
+            ]}
+        });
+        let allowed = Graph::from(serde_json::from_value::<Metadata>(metadata.clone()).unwrap());
+        let mut failures = Vec::new();
+        check_transcript_engine(&allowed, &mut failures).unwrap();
+        assert!(failures.is_empty(), "{failures:?}");
+
+        let mut through_bridge = metadata.clone();
+        through_bridge["resolve"]["nodes"][0]["deps"] = serde_json::json!([
+            {"pkg":"v","dep_kinds":[{"kind":null}]},
+            {"pkg":"b","dep_kinds":[{"kind":null}]}
+        ]);
+        through_bridge["resolve"]["nodes"][4]["deps"] =
+            serde_json::json!([{"pkg":"h","dep_kinds":[{"kind":null}]}]);
+        let graph = Graph::from(serde_json::from_value::<Metadata>(through_bridge).unwrap());
+        let mut failures = Vec::new();
+        check_transcript_engine(&graph, &mut failures).unwrap();
+        assert_eq!(
+            failures,
+            ["transcript engine boundary: bcode_tui_transcript -> bridge -> bcode_tui"]
+        );
+
+        let mut direct_client = metadata;
+        direct_client["resolve"]["nodes"][0]["deps"] =
+            serde_json::json!([{"pkg":"c","dep_kinds":[{"kind":"build"}]}]);
+        let graph = Graph::from(serde_json::from_value::<Metadata>(direct_client).unwrap());
+        let mut failures = Vec::new();
+        check_transcript_engine(&graph, &mut failures).unwrap();
+        assert_eq!(
+            failures,
+            ["transcript engine boundary: bcode_tui_transcript -> bcode_client"]
+        );
     }
 
     #[test]

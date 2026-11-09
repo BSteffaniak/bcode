@@ -11,6 +11,9 @@
 pub mod execution;
 pub mod external;
 pub mod presentation;
+mod transcript_changes;
+
+pub use transcript_changes::{TranscriptChange, TranscriptChanges};
 
 use bcode_session_models::{
     ClientId, ModelTurnOutcome, RequestContextOccupancy, RuntimeWorkKind, RuntimeWorkStatus,

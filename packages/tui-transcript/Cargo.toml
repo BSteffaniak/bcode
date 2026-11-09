@@ -1,0 +1,35 @@
+[package]
+authors     = { workspace = true }
+categories  = ["command-line-interface"]
+description = "Terminal transcript engine (resident window, units, viewport, navigation) for bcode"
+edition     = { workspace = true }
+keywords    = ["bcode", "transcript", "tui"]
+license     = { workspace = true }
+name        = "bcode_tui_transcript"
+readme      = { workspace = true }
+repository  = { workspace = true }
+version     = { workspace = true }
+
+[dependencies]
+bcode_session_models      = { workspace = true }
+bcode_session_view        = { workspace = true }
+bcode_session_view_models = { workspace = true }
+bmux_tui                  = { workspace = true }
+bmux_tui_components       = { workspace = true, features = ["resident-window", "virtual-list"] }
+serde_json                = { workspace = true }
+
+[dev-dependencies]
+proptest = { workspace = true }
+
+[features]
+default = []
+fail-on-warnings = [
+    "bcode_session_models/fail-on-warnings",
+    "bcode_session_view/fail-on-warnings",
+    "bcode_session_view_models/fail-on-warnings",
+    "bmux_tui/fail-on-warnings",
+    "bmux_tui_components/fail-on-warnings",
+]
+# Deterministic fixtures for scenario drivers in downstream tests: module `scenario` (layout
+# work counters) and `units::producers::FixtureProducer`.
+testing = []

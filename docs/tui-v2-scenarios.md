@@ -19,8 +19,11 @@ required by [`tui-v2-architecture.md`](tui-v2-architecture.md), not what V1 curr
   * `scenarios.rs` holds the scenario definitions, each a generic `fn name<D: TranscriptScenarioDriver>()`.
   * `v1.rs` drives the real `BcodeRuntimeModel` through `Program::update` and the production
     root presenter.
+  * `v2.rs` drives the `bcode_tui_transcript` engine façade headlessly (phase 2; see "V2 driver"
+    below).
 * Commands:
   * Run the active suite: `cargo test -p bcode_tui --lib transcript_scenarios`
+  * Run one engine: `cargo test -p bcode_tui --lib transcript_scenarios::v2` (or `::v1`)
   * Check known failures: `cargo test -p bcode_tui --lib transcript_scenarios -- --ignored`
 
 ## Status values
@@ -29,7 +32,8 @@ required by [`tui-v2-architecture.md`](tui-v2-architecture.md), not what V1 curr
 |---|---|
 | pass | Runs as an active test and passes. |
 | fail-ignored | Instantiated with `#[ignore = "<engine> bug <ID>: …"]`. It fails when run with `--ignored`; the observed failure is recorded below. |
-| pending | No driver exists for the engine yet. |
+| pending-ignored | Instantiated with `#[ignore = "V2 pending phase <N>: <capability>"]`: the scenario needs a later phase's deliverable. It fails when run with `--ignored`; the V2 column names the phase and capability. |
+| stub-ignored | Instantiated with `#[ignore = "driver: needs <capability>"]`: no driver can express the scenario yet. |
 
 When a fix lands, remove the engine's `#[ignore]` and change the status in the same change.
 
@@ -37,25 +41,30 @@ When a fix lands, remove the engine's `#[ignore]` and change the status in the s
 
 | Scenario | Covers | V1 | V2 | V1 observation |
 |---|---|---|---|---|
-| `t1_live_append_while_following_shows_latest` | T1, C10 | pass | pending | — |
-| `t23_live_append_while_reading_keeps_position` | T23, C16 | pass | pending | — |
-| `c29_older_page_then_frame_preserves_reader` | C29, C28 | pass | pending | When the page lands before the next frame with no input in between, the reader is preserved. |
-| `bug_a1_wheel_between_older_page_and_frame` | BUG-A1, C23 | fail-ignored | pending | A wheel tick between the page arriving and the frame makes content leap by about the page height (the reference markers leave the viewport). |
-| `bug_a2_continuous_wheel_moves_without_stall_or_leap` | BUG-A2, X12, C28 | fail-ignored | pending | Stalls at step 12: the frame does not move while the boundary page loads (V1 does not prefetch). |
-| `bug_a3_eviction_after_prepend_keeps_visible_content` | BUG-A3, W7 | pass | pending | The latent stale-index trim was not reproduced. Visible content is preserved and the window returns under the cap. |
-| `bug_a4_session_start_does_not_shift_content` | BUG-A4, W13 | fail-ignored | pending | An exhausting page with no rows removes the history banner, and content shifts up by 1 row. |
-| `bug_b1_timeline_window_first_newer_page_keeps_window` | BUG-B1, W8 | fail-ignored | pending | The first newer page after a timeline jump evicts older content: the first resident sequence goes from 489 to 1013. |
-| `bug_b2_wheel_between_newer_page_with_eviction_and_frame` | BUG-B2, C23 | fail-ignored | pending | A newer page with eviction, then a wheel tick before the frame, commits a blank transcript viewport. |
-| `bug_b3_jump_to_latest_after_deep_jump_returns_live` | BUG-B3, X11, W10 | fail-ignored | pending | Fails at the request check: jump-to-latest issues no request (the scenario requires exactly one tail-window request and no further non-prefetch requests). It stops at the bottom of the historical window (sequence 1012 of 2000). |
-| `bug_b4_resident_jump_while_detached_lands_and_stays` | BUG-B4, T17 | pass | pending | Not reproduced. Variants tried: detached reader, detached timeline window, a live event before the next frame, and a live event after landing. |
-| `c11_streaming_response_reveals_top_and_holds` | C11, C13, T3, T5 | fail-ignored | pending | V1 deviation, root cause not diagnosed: a streaming response that grows past the viewport follows the bottom instead of holding its top. |
-| `c17_reflow_during_reveal_motion_keeps_target` | C17, C23, N7 | fail-ignored | pending | Depends on C11: V1 starts no reveal motion for this input. |
-| `c17_height_change_during_latest_motion_lands_on_latest` | C17, C5, T13 | pass | pending | Reflow during the latest-bar motion settles following the latest bottom. |
-| `c17_live_item_during_latest_motion_settles` | C17, N7, C12 | fail-ignored | pending | V1 deviation, root cause not diagnosed: a live assistant item that arrives during the jump-to-latest motion keeps a motion running through 6 s of scenario time. The content is correct. |
+| `t1_live_append_while_following_shows_latest` | T1, C10 | pass | pass | — |
+| `t23_live_append_while_reading_keeps_position` | T23, C16 | pass | pass | — |
+| `c29_older_page_then_frame_preserves_reader` | C29, C28 | pass | pass | When the page lands before the next frame with no input in between, the reader is preserved. |
+| `bug_a1_wheel_between_older_page_and_frame` | BUG-A1, C23 | fail-ignored | pass | A wheel tick between the page arriving and the frame makes content leap by about the page height (the reference markers leave the viewport). |
+| `bug_a2_continuous_wheel_moves_without_stall_or_leap` | BUG-A2, X12, C28 | fail-ignored | pass | Stalls at step 49: the frame does not move while the boundary page loads (V1 does not prefetch). |
+| `bug_a3_eviction_after_prepend_keeps_visible_content` | BUG-A3, W7 | pass | pass | The latent stale-index trim was not reproduced. Visible content is preserved and the window returns under the cap. |
+| `bug_a4_session_start_does_not_shift_content` | BUG-A4, W13 | fail-ignored | pass | An exhausting page with no rows removes the history banner, and content shifts up by 1 row. |
+| `bug_b1_timeline_window_first_newer_page_keeps_window` | BUG-B1, W8 | fail-ignored | pass | The first newer page after a timeline jump evicts older content: the first resident sequence goes from 489 to 1013. |
+| `bug_b2_wheel_between_newer_page_with_eviction_and_frame` | BUG-B2, C23 | fail-ignored | pass | A newer page with eviction, then a wheel tick before the frame, commits a blank transcript viewport. |
+| `bug_b3_jump_to_latest_after_deep_jump_returns_live` | BUG-B3, X11, W10 | fail-ignored | pass | Fails at the request check: jump-to-latest issues no request (the scenario requires exactly one tail-window request and no further non-prefetch requests). It stops at the bottom of the historical window (sequence 1012 of 2000). |
+| `bug_b4_resident_jump_while_detached_lands_and_stays` | BUG-B4, T17 | pass | pass | Not reproduced. Variants tried: detached reader, detached timeline window, a live event before the next frame, and a live event after landing. |
+| `c11_streaming_response_reveals_top_and_holds` | C11, C13, T3, T5 | fail-ignored | pass | V1 deviation, root cause not diagnosed: a streaming response that grows past the viewport follows the bottom instead of holding its top. |
+| `c17_reflow_during_reveal_motion_keeps_target` | C17, C23, N7 | fail-ignored | pass | Depends on C11: V1 starts no reveal motion for this input. |
+| `c17_height_change_during_latest_motion_lands_on_latest` | C17, C5, T13 | pass | pending-ignored (phase 4: latest bar (F6)) | Reflow during the latest-bar motion settles following the latest bottom. |
+| `c17_live_item_during_latest_motion_settles` | C17, N7, C12 | fail-ignored | pending-ignored (phase 4: latest bar (F6)) | V1 deviation, root cause not diagnosed: a live assistant item that arrives during the jump-to-latest motion keeps a motion running through 6 s of scenario time. The content is correct. |
 
 Height changes during a motion are produced by reflow (a narrower terminal), not by an
 asynchronous visual, because the fake session has no asynchronous visual producer. Add a
 true async-visual variant once an engine exposes an injectable visual producer.
+
+BUG-B1, BUG-B2 and BUG-B3 are phase-5 exit criteria but already pass on V2: the window manager
+aligns timeline windows to turns (W4, W8), loads `Head`/`Tail` windows directly (W10) and returns
+to live from a tail window. Phase 5 replaces the document rebuild behind them with incremental
+window operations.
 
 ## Navigation scenarios (kept behavior)
 
@@ -79,52 +88,52 @@ Notes:
 
 | Scenario | Covers | V1 | V2 | V1 observation |
 |---|---|---|---|---|
-| `c1_attach_follows_latest_bottom` | C1 | pass | pending | — |
-| `c1_wheel_up_reads_and_wheel_down_resumes_following` | C1, T8, T9 | fail-ignored | pending | Wheeling back down to the content bottom leaves V1 anchored. A live item delivered afterwards is not followed, and the latest bar appears. |
-| `c2_wheel_down_at_bottom_enters_tail_space` | C2, T10 | pass | pending | — |
-| `c2_tail_space_is_bounded_by_the_viewport` | C2 | pass | pending | V1 measures the bound from the content bottom, which includes the trailing separator row, so the newest line sits just above the viewport at the bound. |
-| `c3_tail_space_position_is_stable_across_frames` | C3 | pass | pending | — |
-| `c4_new_content_fills_tail_space_then_follows` | C4, T11 | fail-ignored | pending | Content fills the tail space without moving and ends at the latest bottom, but a motion is still running and following is not reported after 4 s of scenario time. |
-| `c5_reflow_round_trip_does_not_drift` | C5 | pass | pending | — |
-| `c6_rows_inserted_above_do_not_consume_tail_space` | C6 | pass | pending | — |
-| `c7_wheel_up_inside_tail_space_keeps_tail_space` | C7, T12 | pass | pending | — |
-| `c8_staged_submission_does_not_move_view` | C8, N9 | fail-ignored | pending | Pressing Enter while following moves the view to the transcript top ("69 rows from bottom") before acceptance. Root cause not diagnosed. |
-| `c8_accepted_submission_reveals_message_at_top` | C8, T2 | fail-ignored | pending | Follows from the staged jump: after acceptance, the view stays at the transcript top with a motion running, and the accepted message is not visible. |
-| `c8_cleared_local_command_submission_does_not_anchor` | C8, N9 | pass | pending | — |
-| `c9_tool_activity_after_submission_resumes_following` | C9, T4 | fail-ignored | pending | Depends on the accepted-submission reveal (see `c8_accepted_…`). |
-| `c10_later_stream_updates_do_not_move_revealed_response` | C10, T3 | fail-ignored | pending | With history above, a new assistant segment follows the bottom instead of being revealed at the top, and later deltas push it up (row 13 to row 10). Same deviation as `c11_streaming_response_reveals_top_and_holds`. |
-| `c11_assistant_hold_survives_completion` | C11, T7 | fail-ignored | pending | Same C11 deviation: the response is never held at the top. |
-| `c11_non_assistant_item_releases_hold_into_overflow_follow` | C11, T6 | fail-ignored | pending | Same C11 deviation: a fitting tool item moves content up by 2 rows because V1 is following, not holding. |
-| `c12_revealed_item_is_not_readmitted` | C12, N10 | pass | pending | Passes on V1, but V1 never reveals the item in the first place (C11 deviation), so this mainly guards V2. |
-| `c13_sticky_reveal_hands_off_after_segment_end` | C13, T5, T6 | fail-ignored | pending | Same C11 deviation: an overflowing response follows the bottom instead of holding its top. |
-| `c14_manual_scroll_materializes_running_motion` | C14, N6, T8 | pass | pending | — |
-| `c14_manual_scroll_cancels_pending_jump` | C14, T22 | fail-ignored | pending | After manual scrolling, the pending non-resident timeline jump result still replaces the window and moves the reader. |
-| `c15_grace_suppresses_stream_top_anchor` | C15, N5 | pass | pending | — |
-| `c16_stream_does_not_anchor_when_scrolled_up` | C16, T23 | pass | pending | — |
-| `c17_latest_bar_motion_lands_on_latest_bottom` | C17, T13 | pass | pending | — |
-| `c17_pending_jump_never_falls_back_to_tail` | C17, T18 | pass | pending | — |
-| `c22_reduced_motion_jump_is_instant` | C22, N7 | pass | pending | — |
-| `c22_enabling_reduced_motion_mid_motion_settles_at_target` | C22, N7 | fail-ignored | pending | Enabling `reduce_motion` through the configuration reload path while a motion runs lets the motion continue; the next frame is still mid-motion. |
-| `c23_reader_survives_page_and_live_append_before_frame` | C23, N11, C28 | pass | pending | — |
-| `c24_width_change_keeps_source_line_at_top` | C24 | pass | pending | — |
-| `c25_structural_insertion_keeps_reading_position` | C25 | pass | pending | — |
-| `c25_collapse_above_keeps_reading_position` | C25 | pass | pending | Collapse is applied through structural rules (`kind = "tool"` collapsed). The `alt+d` cycle would collapse the reading item too. |
-| `c26_runtime_work_events_do_not_move_final_response` | C26, T23 | pass | pending | — |
-| `c27_repeated_presentation_is_idempotent` | C27, CK1 | pass | pending | — |
-| `c27_failed_presentation_does_not_commit_navigation` | C27, CK2, CK3 | fail-ignored | pending | Stub. The driver cannot inject a presentation failure (`driver: needs presentation failure injection`). |
-| `c28_movement_kept_while_page_loads_is_spent_once` | C28, N8 | pass | pending | — |
-| `c29_direction_reversal_cancels_pending_movement` | C29, N8 | pass | pending | Checks that the reversal moves by its own tick only, that the older page is still incorporated (first resident sequence decreases), and that neither the page nor later frames spend the cancelled movement. V1 passes because it keeps no movement while a page loads. |
-| `c30_growth_while_following_is_not_a_prepend` | C30, N12 | pass | pending | — |
-| `c31_window_bottom_is_not_session_tail` | C31, W10 | pass | pending | — |
-| `c32_focus_up_puts_target_top_on_top_edge` | C32, T19 | pass | pending | — |
-| `c32_focus_down_puts_target_bottom_on_bottom_edge` | C32, T19 | pass | pending | — |
-| `c32_focus_on_visible_target_does_not_scroll` | C32, T19 | pass | pending | — |
-| `c33_initial_focus_is_last_visible_target` | C33, FO7 | pass | pending | — |
-| `c33_initial_focus_falls_back_to_nearest_target_above` | C33, FO7 | pass | pending | V1 scrolls the tall target's top into view when focus is entered; the scenario allows that (T19). |
-| `fo4_composer_home_end_do_not_move_transcript` | FO4, X5 | pass | pending | — |
-| `fo4_transcript_home_loads_session_start_directly` | FO4, T16, X5 | fail-ignored | pending | V1 transcript focus (`alt+u`) does not load the session start on Home (the FO4 decision is new in V2). |
-| `fo4_transcript_end_returns_to_latest` | FO4, T13, X5 | fail-ignored | pending | As above, for End. |
-| `fo5_page_up_scrolls_from_composer_focus` | FO5 | pass | pending | — |
+| `c1_attach_follows_latest_bottom` | C1 | pass | pass | — |
+| `c1_wheel_up_reads_and_wheel_down_resumes_following` | C1, T8, T9 | fail-ignored | pass | Wheeling back down to the content bottom leaves V1 anchored. A live item delivered afterwards is not followed, and the latest bar appears. |
+| `c2_wheel_down_at_bottom_enters_tail_space` | C2, T10 | pass | pass | — |
+| `c2_tail_space_is_bounded_by_the_viewport` | C2 | pass | pass | V1 measures the bound from the content bottom, which includes the trailing separator row, so the newest line sits just above the viewport at the bound. |
+| `c3_tail_space_position_is_stable_across_frames` | C3 | pass | pass | — |
+| `c4_new_content_fills_tail_space_then_follows` | C4, T11 | fail-ignored | pass | Content fills the tail space without moving and ends at the latest bottom, but a motion is still running and following is not reported after 4 s of scenario time. |
+| `c5_reflow_round_trip_does_not_drift` | C5 | pass | pass | — |
+| `c6_rows_inserted_above_do_not_consume_tail_space` | C6 | pass | pass | — |
+| `c7_wheel_up_inside_tail_space_keeps_tail_space` | C7, T12 | pass | pass | — |
+| `c8_staged_submission_does_not_move_view` | C8, N9 | fail-ignored | pending-ignored (phase 4: composer input and submission acceptance (host)) | Pressing Enter while following moves the view to the transcript top ("69 rows from bottom") before acceptance. Root cause not diagnosed. |
+| `c8_accepted_submission_reveals_message_at_top` | C8, T2 | fail-ignored | pending-ignored (phase 4: composer input and submission acceptance (host)) | Follows from the staged jump: after acceptance, the view stays at the transcript top with a motion running, and the accepted message is not visible. |
+| `c8_cleared_local_command_submission_does_not_anchor` | C8, N9 | pass | pending-ignored (phase 4: composer input and local commands (host)) | — |
+| `c9_tool_activity_after_submission_resumes_following` | C9, T4 | fail-ignored | pending-ignored (phase 4: composer input and submission acceptance (host)) | Depends on the accepted-submission reveal (see `c8_accepted_…`). |
+| `c10_later_stream_updates_do_not_move_revealed_response` | C10, T3 | fail-ignored | pass | With history above, a new assistant segment follows the bottom instead of being revealed at the top, and later deltas push it up (row 13 to row 10). Same deviation as `c11_streaming_response_reveals_top_and_holds`. |
+| `c11_assistant_hold_survives_completion` | C11, T7 | fail-ignored | pass | Same C11 deviation: the response is never held at the top. |
+| `c11_non_assistant_item_releases_hold_into_overflow_follow` | C11, T6 | fail-ignored | pass | Same C11 deviation: a fitting tool item moves content up by 2 rows because V1 is following, not holding. |
+| `c12_revealed_item_is_not_readmitted` | C12, N10 | pass | pass | Passes on V1, but V1 never reveals the item in the first place (C11 deviation), so this mainly guards V2. |
+| `c13_sticky_reveal_hands_off_after_segment_end` | C13, T5, T6 | fail-ignored | pass | Same C11 deviation: an overflowing response follows the bottom instead of holding its top. |
+| `c14_manual_scroll_materializes_running_motion` | C14, N6, T8 | pass | pending-ignored (phase 4: latest bar (F6)) | — |
+| `c14_manual_scroll_cancels_pending_jump` | C14, T22 | fail-ignored | pass | After manual scrolling, the pending non-resident timeline jump result still replaces the window and moves the reader. |
+| `c15_grace_suppresses_stream_top_anchor` | C15, N5 | pass | pass | — |
+| `c16_stream_does_not_anchor_when_scrolled_up` | C16, T23 | pass | pass | — |
+| `c17_latest_bar_motion_lands_on_latest_bottom` | C17, T13 | pass | pending-ignored (phase 4: latest bar (F6)) | — |
+| `c17_pending_jump_never_falls_back_to_tail` | C17, T18 | pass | pass | — |
+| `c22_reduced_motion_jump_is_instant` | C22, N7 | pass | pending-ignored (phase 4: latest bar (F6)) | — |
+| `c22_enabling_reduced_motion_mid_motion_settles_at_target` | C22, N7 | fail-ignored | pending-ignored (phase 4: latest bar (F6)) | Enabling `reduce_motion` through the configuration reload path while a motion runs lets the motion continue; the next frame is still mid-motion. |
+| `c23_reader_survives_page_and_live_append_before_frame` | C23, N11, C28 | pass | pass | — |
+| `c24_width_change_keeps_source_line_at_top` | C24 | pass | pass (see note) | — |
+| `c25_structural_insertion_keeps_reading_position` | C25 | pass | pass | — |
+| `c25_collapse_above_keeps_reading_position` | C25 | pass | pending-ignored (phase 3: presentation rules (structure resolution, U5)) | Collapse is applied through structural rules (`kind = "tool"` collapsed). The `alt+d` cycle would collapse the reading item too. |
+| `c26_runtime_work_events_do_not_move_final_response` | C26, T23 | pass | pass | — |
+| `c27_repeated_presentation_is_idempotent` | C27, CK1 | pass | pending-ignored (phase 4: latest bar (F6)) | — |
+| `c27_failed_presentation_does_not_commit_navigation` | C27, CK2, CK3 | fail-ignored | stub-ignored | Stub. The driver cannot inject a presentation failure (`driver: needs presentation failure injection`). |
+| `c28_movement_kept_while_page_loads_is_spent_once` | C28, N8 | pass | pass | — |
+| `c29_direction_reversal_cancels_pending_movement` | C29, N8 | pass | pass | Checks that the reversal moves by its own tick only, that the older page is still incorporated (first resident sequence decreases), and that neither the page nor later frames spend the cancelled movement. V1 passes because it keeps no movement while a page loads. |
+| `c30_growth_while_following_is_not_a_prepend` | C30, N12 | pass | pass | — |
+| `c31_window_bottom_is_not_session_tail` | C31, W10 | pass | pass | — |
+| `c32_focus_up_puts_target_top_on_top_edge` | C32, T19 | pass | pending-ignored (phase 4: transcript focus mode (alt+u, FO2)) | — |
+| `c32_focus_down_puts_target_bottom_on_bottom_edge` | C32, T19 | pass | pending-ignored (phase 4: transcript focus mode (alt+u, FO2)) | — |
+| `c32_focus_on_visible_target_does_not_scroll` | C32, T19 | pass | pending-ignored (phase 4: transcript focus mode (alt+u, FO2)) | — |
+| `c33_initial_focus_is_last_visible_target` | C33, FO7 | pass | pending-ignored (phase 4: transcript focus mode (alt+u, FO2)) | — |
+| `c33_initial_focus_falls_back_to_nearest_target_above` | C33, FO7 | pass | pending-ignored (phase 4: transcript focus mode (alt+u, FO2)) | V1 scrolls the tall target's top into view when focus is entered; the scenario allows that (T19). |
+| `fo4_composer_home_end_do_not_move_transcript` | FO4, X5 | pass | pending-ignored (phase 4: composer input (host)) | — |
+| `fo4_transcript_home_loads_session_start_directly` | FO4, T16, X5 | fail-ignored | pending-ignored (phase 4: transcript focus mode (alt+u, FO4)) | V1 transcript focus (`alt+u`) does not load the session start on Home (the FO4 decision is new in V2). |
+| `fo4_transcript_end_returns_to_latest` | FO4, T13, X5 | fail-ignored | pending-ignored (phase 4: transcript focus mode (alt+u, FO4)) | As above, for End. |
+| `fo5_page_up_scrolls_from_composer_focus` | FO5 | pass | pass (see note) | — |
 
 ## Interaction scenarios (kept behavior)
 
@@ -150,41 +159,75 @@ Status values also include `stub-ignored`: the scenario is ignored with
 
 | Scenario | Covers | V1 | V2 | V1 observation |
 |---|---|---|---|---|
-| `c18_latest_bar_ignores_hidden_continuation_of_visible_entry` | C18 (ambiguity 2) | pass | pending | — |
-| `c18_latest_bar_shows_for_distinct_entry_fully_below` | C18 | pass | pending | — |
-| `c18_live_entry_below_reader_shows_bar` | C18, T23 | pass | pending | — |
-| `c18_jump_to_latest_after_live_entry_follows_and_clears_bar` | C18, X11, C17 | fail-ignored | pending | V1 deviation C17. After the jump, the live entry is visible and the bar is gone, but a motion is still running after 2 s and following never resumes. This matches `c17_live_item_during_latest_motion_settles`. |
-| `c19_latest_bar_never_causes_its_own_visibility` | C19, F6 | pass | pending | — |
-| `c20_scroll_timer_and_reflow_generate_no_activity` | C20 | pass | pending | — |
-| `c21_latest_bar_glow_settles_still_after_window` | C21, C20 | fail-ignored | pending | V1 deviation C20/C21, root cause not diagnosed. The glow still shows after the glow window. It reproduces with or without the driver's Markdown projection step, and also when clock advances reach V1 through the production timed-invalidation timer (paint-level, temporal path) instead of a forced structural redraw, so it is not explained by full preparation alone. Confirm in the real app. |
-| `c21_reduced_motion_latest_bar_is_still_immediately` | C21, C22 | pass | pending | — |
-| `c34_drag_inside_response_stays_within_it` | C34 | fail-ignored | pending | V1 deviation C34. A drag that starts inside a response keeps selecting into the next user item and the next response. The response-local clamp tested at unit level does not apply in the presented transcript. |
-| `c34_drag_from_surrounding_space_spans_items` | C34 | pass | pending | — |
-| `c34_soft_wrapped_line_selects_without_newlines` | C34, C36 | pass | pending | — |
-| `c36_code_selection_preserves_indentation_and_blank_lines` | C36 | pass | pending | — |
-| `c34_selection_survives_scroll` | C34 | pass | pending | — |
-| `c34_selection_survives_scrolling_out_of_view` | C34, BMUX 13 | fail-ignored | pending | V1 deviation C34. The selection is cleared as soon as its rows scroll out of view, so it is gone when they scroll back. |
-| `c34_hard_line_break_copies_as_line_break` | C34 | fail-ignored | pending | V1 deviation C34. Copying across a Markdown hard line break (`\` at the end of a line) joins the two lines with no separator (`…line 0S00004L001…`). |
-| `c35_release_copies_and_clears_after_delay` | C35 | pass | pending | — |
-| `c35_failed_copy_keeps_selection` | C35 | pass | pending | — |
-| `c35_new_gesture_cancels_pending_clear` | C35 | pass | pending | — |
-| `c35_click_without_drag_does_not_copy` | C35, X1 | pass | pending | — |
-| `x1_click_toggles_tool_header_once_per_click` | X1 | pass | pending | — |
-| `x1_click_toggles_section_label` | X1 | pass | pending | — |
-| `x1_click_toggles_group_header` | X1, X3 | pass | pending | — |
-| `x1_drag_from_header_selects_without_toggling` | X1, C35 | pass | pending | — |
-| `x2_focus_mode_keys_walk_and_toggle_targets` | X2, FO7 | pass | pending | Covers `alt+u`, `j`, `k`, `h`, `l`, Enter, Space, `d`, `e`, `i` and Escape. `m` is not covered because its user-state write is an effect the driver drops. |
-| `x2_focus_walk_scrolls_targets_into_view` | X2, C32 | pass | pending | — |
-| `x3_collapsed_group_reveals_failed_member` | X3, A16 | pass | pending | — |
-| `a16_hidden_units_leave_marker_and_failed_stays_visible` | A16, X3 | pass | pending | — |
-| `a16_floor_applies_after_manual_toggles` | A16 | pass | pending | — |
-| `a16_awaiting_decision_stays_expanded_under_rules` | A16 | pass | pending | — |
-| `c38_streaming_markdown_converges_to_final` | C38 | pass | pending | — |
-| `d6_wheel_scroll_repaints_regionally` | D6, F5 | fail-ignored | pending | V1 bug D-16. A wheel tick marks full damage. |
-| `d6_composer_typing_repaints_regionally` | D6, F5 | fail-ignored | pending | V1 bug D-16. A printable key in the composer marks full damage. |
-| `d4_scrolling_does_no_layout_work` | D4 | stub-ignored | pending | The driver has no per-frame layout-work observation. V1 drains its layout sync statistics inside `draw_chat_frame`. |
-| `c37_interaction_placement_and_focus_restore` | C37 | stub-ignored | pending | The driver cannot open plugin interaction surfaces. V1 builds them from tool exchanges only with the bundled-plugin features enabled. |
-| `c39_inline_shell_expansion` | C39 | stub-ignored | pending | The driver cannot produce positioned shell captures. |
+| `c18_latest_bar_ignores_hidden_continuation_of_visible_entry` | C18 (ambiguity 2) | pass | pass (bar half vacuous until phase 4) | — |
+| `c18_latest_bar_shows_for_distinct_entry_fully_below` | C18 | pass | pending-ignored (phase 4: latest bar (F6)) | — |
+| `c18_live_entry_below_reader_shows_bar` | C18, T23 | pass | pending-ignored (phase 4: latest bar (F6)) | — |
+| `c18_jump_to_latest_after_live_entry_follows_and_clears_bar` | C18, X11, C17 | fail-ignored | pass (bar half vacuous until phase 4) | V1 deviation C17. After the jump, the live entry is visible and the bar is gone, but a motion is still running after 2 s and following never resumes. This matches `c17_live_item_during_latest_motion_settles`. |
+| `c19_latest_bar_never_causes_its_own_visibility` | C19, F6 | pass | pending-ignored (phase 4: latest bar (F6)) | — |
+| `c20_scroll_timer_and_reflow_generate_no_activity` | C20 | pass | pending-ignored (phase 4: latest bar (F6)) | — |
+| `c21_latest_bar_glow_settles_still_after_window` | C21, C20 | fail-ignored | pending-ignored (phase 4: latest bar (F6) and glow) | V1 deviation C20/C21, root cause not diagnosed. The glow still shows after the glow window. It reproduces with or without the driver's Markdown projection step, and also when clock advances reach V1 through the production timed-invalidation timer (paint-level, temporal path) instead of a forced structural redraw, so it is not explained by full preparation alone. Confirm in the real app. |
+| `c21_reduced_motion_latest_bar_is_still_immediately` | C21, C22 | pass | pending-ignored (phase 4: latest bar (F6) and glow) | — |
+| `c34_drag_inside_response_stays_within_it` | C34 | fail-ignored | pending-ignored (phase 6: transcript selection (BMUX 13)) | V1 deviation C34. A drag that starts inside a response keeps selecting into the next user item and the next response. The response-local clamp tested at unit level does not apply in the presented transcript. |
+| `c34_drag_from_surrounding_space_spans_items` | C34 | pass | pending-ignored (phase 6: transcript selection (BMUX 13)) | — |
+| `c34_soft_wrapped_line_selects_without_newlines` | C34, C36 | pass | pending-ignored (phase 6: transcript selection (BMUX 13)) | — |
+| `c36_code_selection_preserves_indentation_and_blank_lines` | C36 | pass | pending-ignored (phase 6: transcript selection (BMUX 13)) | — |
+| `c34_selection_survives_scroll` | C34 | pass | pending-ignored (phase 6: transcript selection and copy policy) | — |
+| `c34_selection_survives_scrolling_out_of_view` | C34, BMUX 13 | fail-ignored | pending-ignored (phase 6: transcript selection and copy policy) | V1 deviation C34. The selection is cleared as soon as its rows scroll out of view, so it is gone when they scroll back. |
+| `c34_hard_line_break_copies_as_line_break` | C34 | fail-ignored | pending-ignored (phase 6: transcript selection (BMUX 13)) | V1 deviation C34. Copying across a Markdown hard line break (`\` at the end of a line) joins the two lines with no separator (`…line 0S00004L001…`). |
+| `c35_release_copies_and_clears_after_delay` | C35 | pass | pending-ignored (phase 6: transcript selection and copy) | — |
+| `c35_failed_copy_keeps_selection` | C35 | pass | pending-ignored (phase 6: transcript selection and copy policy) | — |
+| `c35_new_gesture_cancels_pending_clear` | C35 | pass | pending-ignored (phase 6: transcript selection and copy) | — |
+| `c35_click_without_drag_does_not_copy` | C35, X1 | pass | pending-ignored (phase 6: click routing through selection (BMUX 14)) | — |
+| `x1_click_toggles_tool_header_once_per_click` | X1 | pass | pending-ignored (phase 3: tool producers and disclosure) | — |
+| `x1_click_toggles_section_label` | X1 | pass | pending-ignored (phase 3: tool producers and disclosure) | — |
+| `x1_click_toggles_group_header` | X1, X3 | pass | pending-ignored (phase 3: presentation rules and group headers) | — |
+| `x1_drag_from_header_selects_without_toggling` | X1, C35 | pass | pending-ignored (phase 3: tool producers and disclosure) | — |
+| `x2_focus_mode_keys_walk_and_toggle_targets` | X2, FO7 | pass | pending-ignored (phase 4: transcript focus mode (alt+u, FO6)) | Covers `alt+u`, `j`, `k`, `h`, `l`, Enter, Space, `d`, `e`, `i` and Escape. `m` is not covered because its user-state write is an effect the driver drops. |
+| `x2_focus_walk_scrolls_targets_into_view` | X2, C32 | pass | pending-ignored (phase 4: transcript focus mode (alt+u, FO6)) | — |
+| `x3_collapsed_group_reveals_failed_member` | X3, A16 | pass | pending-ignored (phase 3: presentation rules and visibility floor (U5)) | — |
+| `a16_hidden_units_leave_marker_and_failed_stays_visible` | A16, X3 | pass | pending-ignored (phase 3: presentation rules and visibility floor (U5)) | — |
+| `a16_floor_applies_after_manual_toggles` | A16 | pass | pending-ignored (phase 3: tool producers and visibility floor (U5)) | — |
+| `a16_awaiting_decision_stays_expanded_under_rules` | A16 | pass | pending-ignored (phase 3: presentation rules and visibility floor (U5)) | — |
+| `c38_streaming_markdown_converges_to_final` | C38 | pass | pending-ignored (phase 3: Markdown producer (L7)) | — |
+| `d6_wheel_scroll_repaints_regionally` | D6, F5 | fail-ignored | pending-ignored (phase 6: regional damage observation (BMUX 15b)) | V1 bug D-16. A wheel tick marks full damage. |
+| `d6_composer_typing_repaints_regionally` | D6, F5 | fail-ignored | pending-ignored (phase 4: composer input (host)) | V1 bug D-16. A printable key in the composer marks full damage. |
+| `d4_scrolling_does_no_layout_work` | D4 | stub-ignored | pending-ignored (phase 3: per-frame layout work counters (9.2)) | The driver has no per-frame layout-work observation. V1 drains its layout sync statistics inside `draw_chat_frame`. |
+| `c37_interaction_placement_and_focus_restore` | C37 | stub-ignored | stub-ignored | The driver cannot open plugin interaction surfaces. V1 builds them from tool exchanges only with the bundled-plugin features enabled. |
+| `c39_inline_shell_expansion` | C39 | stub-ignored | stub-ignored | The driver cannot produce positioned shell captures. |
+
+## V2 driver
+
+`v2.rs` drives the engine façade (`bcode_tui_transcript::engine::TranscriptEngine`) without a
+host, as phase 2 specifies:
+
+* The transcript region is the whole terminal. Before phase 4 there is no composer, status row,
+  latest bar or focus mode, so `latest_bar` is always `None` and focus is always the composer.
+* The resident seed is answered as the engine's attach `Tail` window. History requests the engine
+  issues become pending requests: pages ask for the per-request caps (16 items, 512 events, W6),
+  `Around` asks for 256 events on each side (W8), and `Head`/`Tail` ask for 512 events (W10).
+  Requests the engine no longer awaits (superseded generation, cancelled jump) are not reported.
+* Wheel ticks are BMUX mouse events routed through the transcript list component, which reports
+  them as actions that become navigation intents (VP5). `pageup`/`pagedown`, `ctrl+up`/
+  `ctrl+down` and `ctrl+home`/`ctrl+end` are translated into the intents the host keymap binds in
+  every focus (FO5); any other key panics, because composer and focus keys need the phase-4 host.
+* Pointer gestures, presentation rules, selection settings and clipboard scripting panic with the
+  missing capability; `tui.reduce_motion` maps to the engine's motion configuration.
+* Frames are prepared, painted through BMUX into a buffer and committed; observations come from
+  the painted rows, exactly as for V1. Time moves only through `advance_clock`, which fires the
+  engine's navigation timers (grace, motion frames) in deadline order.
+* Units are rendered by the phase-2 plain-text producer (one row per source line, BMUX word
+  wrap, no item chrome).
+
+Notes on V2 passes:
+
+* `c18_latest_bar_ignores_hidden_continuation_of_visible_entry` and
+  `c18_jump_to_latest_after_live_entry_follows_and_clears_bar` pass on their navigation half; the
+  latest-bar half is vacuous until phase 4 adds the bar.
+* `c24_width_change_keeps_source_line_at_top` passes with `Row` anchors because the plain-text
+  producer's marker lines (24 cells) do not wrap at the narrow width. Source anchors (P3,
+  BMUX 10) are a phase-3 deliverable; the scenario does not prove them yet.
+* `fo5_page_up_scrolls_from_composer_focus` passes through the driver's key translation; the host
+  keymap wiring that delivers Page Up from either focus is phase 4.
 
 ## V1 driver and time
 

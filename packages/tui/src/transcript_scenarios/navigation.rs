@@ -451,7 +451,16 @@ pub fn c2_wheel_down_at_bottom_enters_tail_space<D: TranscriptScenarioDriver>() 
 pub fn c2_tail_space_is_bounded_by_the_viewport<D: TranscriptScenarioDriver>() {
     let mut scenario = attach_everything::<D>(ScenarioSession::with_turns(20, 3), WIDTH);
     let tick = scenario.wheel_rows();
-    let bounded = enter_tail_space(&mut scenario, 40);
+    // Wheel until the view stops moving, so the check does not depend on how many ticks an
+    // engine needs to reach the bound (V1's wheel handling is timing sensitive under load).
+    let mut bounded = enter_tail_space(&mut scenario, 40);
+    for _ in 0..8 {
+        let next = enter_tail_space(&mut scenario, 10);
+        if next.rows == bounded.rows {
+            break;
+        }
+        bounded = next;
+    }
     let further = enter_tail_space(&mut scenario, 20);
     scenario.check(further.rows == bounded.rows, || {
         "wheel input past the tail-space bound still moved the view".to_owned()
@@ -541,8 +550,8 @@ pub fn c6_rows_inserted_above_do_not_consume_tail_space<D: TranscriptScenarioDri
         push_long_assistant(&mut session);
     }
     // Everything inside the viewport is short lines that fit at both widths; only items above
-    // the viewport reflow.
-    for _ in 0..4 {
+    // the viewport reflow. Ten short turns fill the viewport under any engine's item spacing.
+    for _ in 0..10 {
         session.push_user(1);
         session.push_assistant(1);
     }

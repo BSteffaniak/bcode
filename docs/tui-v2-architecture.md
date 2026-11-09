@@ -125,7 +125,7 @@ Paths are relative to `packages/tui/src` unless noted. Rule identifiers refer to
 |---|---|---|
 | V2 engine | **New crate** `packages/tui-transcript/` → `bcode_tui_transcript` | A crate boundary mechanically enforces S1 (V2 cannot reach V1 internals of `bcode_tui`), lets the engine be tested headlessly without the host, and survives V1 deletion as the transcript engine. Created in phase 2 when its first code lands. Domain-named. |
 | V2 modules | `window`, `units`, `layout` (with `layout::producers`, `layout::context`), `viewport`, `navigation` (with `navigation::auto`), `focus`, `latest_bar`, `selection`, `frame`, `engine` | One module per layer; `engine` is the façade the host calls. |
-| V2 scenario support | `bcode_tui_transcript` feature `test-support` (module `scenario`): deterministic engine fixture (fixture producers, scripted history source, BMUX `ProgramHarness` glue, `LayoutWorkCounters`). The V2 driver itself is `bcode_tui::transcript_scenarios::v2` (`cfg(test)`); it drives the engine façade directly in phases 2–3 and through `transcript_v2_host` from phase 4. | Keeps one scenario definition set for both engines; the engine crate never depends on `bcode_tui`. |
+| V2 scenario support | `bcode_tui_transcript` feature `testing` (module `scenario`): deterministic engine fixtures (fixture producers, `LayoutWorkCounters` with a counting producer; a scripted history source and BMUX `ProgramHarness` glue are added, together with the `bmux_tui_runtime/testing` dependency, only when a phase needs them). The V2 driver itself is `bcode_tui::transcript_scenarios::v2` (`cfg(test)`); it drives the engine façade directly in phases 2–3 and through `transcript_v2_host` from phase 4. | Keeps one scenario definition set for both engines; the engine crate never depends on `bcode_tui`. |
 | Incremental window operations | `bcode_session_view` module `window_ops`; change types in `bcode_session_view_models` (`TranscriptChanges`, `TranscriptChange`) | Semantic, renderer-neutral (A1, A4). No terminal data. |
 | Engine enum and config key | `bcode_config`: `TuiEngine` enum, `TuiConfig::engine` | Config crate owns the schema. |
 | Engine resolution, V2 host wiring | `bcode_tui` modules `engine_selection` and `transcript_v2_host` | Host owns I/O (client calls for pages), effects and startup. |
@@ -141,7 +141,7 @@ resurrection) lives in `bcode_tui_transcript::navigation`.
 `bcode_presentation_policy`, `bcode_tui_theme`, `bcode_tui_components` (pure recipes only),
 `bmux_tui`, `bmux_tui_components` (features `virtual-list`, `scroll-view`, `disclosure`, and
 others as used), `bmux_tui_runtime` (types only), `bmux_markdown`. It must not depend on
-`bcode_tui`, `bcode_client` or `bcode_ipc`.
+`bcode_tui`, `bcode_client` or `bcode_ipc` other than through `bcode_session_view` (A5).
 
 ### 3.1 Session data
 
@@ -208,7 +208,10 @@ pub struct PageCaps { pub max_items: usize, pub max_events_scanned: usize, pub m
 pub struct PositionEstimate { pub rows_before_window: u64, pub resident_rows: u64, pub rows_after_window: u64 }
 ```
 
-Every request carries the window `generation`; results for an older generation are dropped.
+Every request carries the window `generation`; results for an older generation are dropped. The
+generation is bumped by every window replacement and by an eviction that cancels an in-flight
+page on the trimmed side, so a cancelled page's late result can never match a later request in
+the same direction.
 
 ### 3.3 Units and item layout (`units`, `layout`)
 
@@ -381,7 +384,9 @@ pub enum NavEffect { Page(PageRequest), Window(WindowRequest), ScheduleTimer { k
 pub fn reduce(state: &mut NavState, input: NavInput, view: &NavView<'_>) -> Vec<NavEffect>;
 ```
 
-`NavView` gives the reducer read access to the window, units and measured index, and can
+`NavView` gives the reducer read access to the window, units and measured index (plus
+`UnitFacts`: unit roles for `navigation::auto`, sequence lookup for timeline jumps, and the P4
+correspondence of units removed by the change being reduced, supplied by the units layer), and can
 measure units lazily (exact, bounded, rule L9).
 
 | Rule | Statement |
@@ -422,7 +427,7 @@ pub enum ScrollTarget { ItemTop(UnitKey), ItemBottom(UnitKey), LatestBottom, Anc
 |---|---|---|---|---|---|
 | T1 | Following | Content (growth) | — | Following | — |
 | T2 | any, window Live | SubmissionAccepted(item) | reveal pending for item | Holding{item, sticky:false} via motion ItemTop | clears earlier submission reveals; detached windows use T27 |
-| T3 | Following / Holding{k, _} | first visible content of a new assistant segment `a` (`a` ≠ `k`, not yet admitted) | not Reading/TailSpace; not grace | Holding{a, sticky:true} via motion ItemTop | supersedes any earlier hold, sticky or not, exactly once per segment (C12, N10) |
+| T3 | Following / Holding{k, _} | first visible content of a new assistant segment `a` (`a` ≠ `k`, not yet admitted, still streaming; an assistant message that arrives complete is ordinary growth, T1) | not Reading/TailSpace; not grace | Holding{a, sticky:true} via motion ItemTop | supersedes any earlier hold, sticky or not, exactly once per segment (C12, N10) |
 | T4 | Holding{k, false} | Content extends past viewport bottom | not grace | Following | bottom-align only the overflow (C11, C13) |
 | T5 | Holding{k, true} | Content extends past bottom | — | Holding{k, true} | latest bar may show |
 | T6 | Holding{k, true} | new non-assistant unit admitted | — | Holding{k, false} | no movement if content fits (C11) |
@@ -436,8 +441,8 @@ pub enum ScrollTarget { ItemTop(UnitKey), ItemBottom(UnitKey), LatestBottom, Anc
 | T14 | any | JumpToLatest / Follow | window Detached | Following after `WindowResult(Tail)` | emits `Window(Tail)`; pending_jump set |
 | T15 | any | JumpToSessionStart | head resident | Reading{Boundary(Older) row 0} via motion | — |
 | T16 | any | JumpToSessionStart | head not resident | Reading after `WindowResult(Head)` | emits `Window(Head)` |
-| T17 | any | JumpToItem / JumpToSequence (resident) | — | Reading via motion to placement | cancels pending movement/reveals |
-| T18 | any | JumpToSequence (not resident) / JumpToFraction | — | Reading after `WindowResult(Around)` | emits `Window(Around)` |
+| T17 | any | JumpToItem / JumpToSequence (resident) | — | Reading at placement: `JumpToItem` via motion; `JumpToSequence` (timeline) at once, so the next committed frame shows the target (BUG-B4) | cancels pending movement/reveals |
+| T18 | any | JumpToSequence (not resident) / JumpToFraction | fraction outside the resident rows | Reading after `WindowResult(Around)` | emits `Window(Around)`; a fraction that lands inside the resident rows (W12 estimate) becomes `Reading` at that row directly |
 | T19 | any | FocusTarget{target, edge} | target not fully visible | Reading via motion (C32) | none if visible |
 | T20 | Following / Holding | ReleaseHold | — | Reading at current visual position | — |
 | T21 | any | RestorePosition | — | Reading/Following per payload | may emit `Window(Around)` |
@@ -445,7 +450,7 @@ pub enum ScrollTarget { ItemTop(UnitKey), ItemBottom(UnitKey), LatestBottom, Anc
 | T23 | Reading | Content (any) | — | Reading | anchor unchanged; no automatic movement (C10, C16, C26) |
 | T24 | any | Timer(GraceExpired) | `grace_until ≤ at` | same mode; `grace_until` cleared | re-evaluates once against current content: T3 for the newest assistant segment whose first visible content arrived during grace (if not yet admitted), then T4; intermediate content is not replayed (N5) |
 | T25 | any | Timer(MotionFrame) | motion running | same mode; `motion` cleared when `at ≥ started + duration`, otherwise unchanged | completion resolves the keyed target against current geometry (N7); earlier ticks only emit `Invalidate` |
-| T26 | Reading / TailSpace | PageResult(direction) | `pending_movement` in that direction with the result's generation | Reading or TailSpace per the resulting position | spends the movement once against rows of newly inserted units (N8); zero rows: keeps it and requests the next page (subject to W7a); exhausted: drops the remainder |
+| T26 | Reading / TailSpace | PageResult(direction) | `pending_movement` in that direction (any page the window manager accepted; stale generations never reach the reducer) | Reading or TailSpace per the resulting position | spends the movement once against rows of newly inserted units (N8); zero rows: keeps it and requests the next page (subject to W7a); exhausted: drops the remainder |
 | T27 | any, window Detached | SubmissionAccepted(item) | reveal pending for item | unchanged until `WindowResult(Tail)`, then T2 | emits `Window(Tail)` (W10) and sets `pending_jump`; T2 applies once the tail window is incorporated. A manual intent before the result cancels both (T22); the reader stays detached and the latest bar shows newer activity |
 
 | Rule | Statement |
@@ -454,7 +459,7 @@ pub enum ScrollTarget { ItemTop(UnitKey), ItemBottom(UnitKey), LatestBottom, Anc
 | N5 | During grace, T3 and T4 are suppressed (deferred until grace expires and re-evaluated once by T24, not replayed); content still fills tail space (T11). Explicit user intents and T2 for a new submission are never suppressed (ambiguity 3). Grace is 450 ms. |
 | N6 | Manual input during motion materializes the motion's visual position (sampled at the input's `at`) as a keyed anchor before applying the delta. |
 | N7 | Motion targets are keys (`ScrollTarget`), re-resolved against current geometry at every sample. Completion applies the target after correspondence; timers only request frames (C17). Duration 0 under `reduce_motion` / motion `none`; toggling mid-motion settles at the target (C22). |
-| N8 | Pending movement (C28/C29): input at a resident boundary first traverses available rows; the remainder is stored with the window generation and a page is requested if none is in flight. On `PageResult`, it is spent once, only against rows of newly inserted units in that direction; reflow, rows on the other side and non-presenting content never consume it. Reversal cancels it. A zero-row page does not consume it and immediately requests the next page while `has_older`, subject to the W7a ceiling (T26). |
+| N8 | Pending movement (C28/C29): input at a resident boundary first traverses available rows; the remainder is stored and a page is requested if none is in flight. It is not tied to a window generation: an eviction that cancels the page or an abandoned replacement bumps the generation, and the page requested afterwards still satisfies it, because the window manager drops stale results before reduction. A window replacement drops it. On `PageResult`, it is spent once, only against rows of newly inserted units in that direction; reflow, rows on the other side and non-presenting content never consume it. Reversal cancels it. A zero-row page does not consume it and immediately requests the next page while `has_older`, subject to the W7a ceiling (T26). The `Older` boundary row stays at row 0 while a page is inserted below it, so a reader anchored on it is re-keyed by the page's inserted rows before spending (the content it was reading stays in place); every `Older` page is therefore reduced with its measured `inserted_rows`. |
 | N9 | Automatic navigation is decided only in `navigation::auto` from `Content`/`SubmissionAccepted` inputs. Latest-bar activity code never emits navigation (ambiguity 5). Staged "sending" submissions never move the view; a cleared submission never anchors (C8). |
 | N10 | Admission is by stable identity, once, among resident units; reorder, revision or tail removal never re-admits (C12). |
 | N11 | Content input is reduced only after the window, units and measured index already reflect the change (W3). Therefore any later manual input in the same or a later update is computed against the keyed anchor and current geometry; there is no deferred resynchronization. |
@@ -466,7 +471,7 @@ pub enum ScrollTarget { ItemTop(UnitKey), ItemBottom(UnitKey), LatestBottom, Anc
 |---|---|
 | CK1 | Frame preparation and painting never mutate `NavState`, the window or units. They may fill derived caches only (layout cache, measured heights); derived caches cannot change the keyed position. |
 | CK2 | Consequently navigation needs no checkpoint/restore: a repeated or abandoned (prepared but not presented) preparation has no navigation side effects (C27 holds by construction). A presenter failure terminates the BMUX runtime (`docs/tui-runtime.md`), so it needs no recovery rule. |
-| CK3 | `PresentationCommitted` records the committed frame id, publishes BMUX interaction scenes for input routing, acknowledges latest-bar activity for units shown in that frame, and schedules the next motion frame if a motion is running. Nothing else depends on commit. |
+| CK3 | `PresentationCommitted` records the committed frame id, publishes BMUX interaction scenes for input routing, acknowledges latest-bar activity for units shown in that frame, and does not touch `NavState`: motion frames are scheduled by the reducer when a motion starts and on every `Timer(MotionFrame)` (T25), so commit needs no clock. Nothing else depends on commit. |
 | CK4 | Input routing (hits, selection, focus geometry) uses only the last committed frame's scenes (BMUX contract). |
 
 ---
@@ -587,7 +592,7 @@ policy. Names are sketches; BMUX review may rename them without changing the con
 | Budget | Value | Verification |
 |---|---|---|
 | Steady scrolling | No parse, highlight, projection or measurement; paints and registers only visible units (D4). | BMUX render stats + `LayoutWorkCounters` |
-| Layout work counters | `bcode_tui_transcript` (feature `test-support`) exposes per-frame `LayoutWorkCounters { markdown_parses, highlights, projections, measurements, producer_builds }`. Scroll-only frames keep every counter at zero; a prepend counts only the new units. | Scenario (D4, phase-3 exit) |
+| Layout work counters | `bcode_tui_transcript` (feature `testing`) exposes per-frame `LayoutWorkCounters { markdown_parses, highlights, projections, measurements, producer_builds }`. Scroll-only frames keep every counter at zero; a prepend counts only the new units. | Scenario (D4, phase-3 exit) |
 | Per-frame complexity | No O(resident units) work in prepare/paint; visible-range lookup sublinear. | Structural counters |
 | Page incorporation | O(k log n) index splice + exact measurement of the k new units only. | Unit + counters |
 | Prepend correctness | Zero anchor drift (row offset within anchor unit unchanged). | Scenario |
@@ -621,7 +626,7 @@ check), **M** manual. Every ID must be checked before phase 7.
 | A2 | The TUI owns terminal layout, viewport, scroll anchoring, hit testing, cursor, input mapping, frame drawing and native plugin surfaces. | M (review); the dependency half is the A1/A6 guard |
 | A3 | Interactive presentation choices persist only to user state; engine switching and focus are not persisted. | U |
 | A4 | Renderers consume `SessionView` semantics; `SessionView` is the only transcript reducer; events applied once (SD1). | U, S |
-| A5 | V2 holds ephemeral presentation state only; no second event-derived authority. | U; G: `cargo xtask architecture` rejects `bcode_tui_transcript` dependencies on `bcode_tui`, `bcode_client`, `bcode_ipc`, `bcode_session` and `bcode_server` (boundary added with the crate in phase 2) |
+| A5 | V2 holds ephemeral presentation state only; no second event-derived authority. | U; G: `cargo xtask architecture` rejects `bcode_tui_transcript` dependencies on `bcode_tui`, `bcode_client`, `bcode_ipc`, `bcode_session` and `bcode_server`, direct or transitive, except through `bcode_session_view`, whose client-backed actions use `bcode_client` and whose renderer neutrality has its own portable-presentation check (boundary added with the crate in phase 2) |
 | A6 | Portable APIs get no terminal branches or data. | G |
 | A7 | Native presentation may differ; parity means shared semantics. | M |
 | A8 | Plugin presentation keeps a renderer-neutral fallback. | U |

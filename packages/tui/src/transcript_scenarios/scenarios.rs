@@ -205,7 +205,9 @@ pub fn bug_a2_continuous_wheel_moves_without_stall_or_leap<D: TranscriptScenario
         .iter()
         .find_map(|event| session.item_lines(event.sequence).map(|_| event.sequence))
         .expect("item");
-    let mut scenario = Scenario::<D>::attach_latest(session, 12, WIDTH, HEIGHT);
+    // The attach window covers the viewport plus the prefetch distance (W10), so the latency
+    // precondition holds from the first tick.
+    let mut scenario = Scenario::<D>::attach_latest(session, 40, WIDTH, HEIGHT);
     let tick = scenario.wheel_rows();
     let mut previous = scenario.present();
     let mut requested_at = BTreeMap::<RequestId, usize>::new();

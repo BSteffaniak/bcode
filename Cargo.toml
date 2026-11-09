@@ -129,6 +129,7 @@ members = [
     "packages/tui",
     "packages/tui-components",
     "packages/tui-theme",
+    "packages/tui-transcript",
     "packages/tui-web",
     "packages/hyperchad",
     "packages/hyperchad/ui",
@@ -337,6 +338,7 @@ bcode_tool_runtime                      = { version = "0.0.1-alpha.0", default-f
 bcode_tui                               = { version = "0.0.1-alpha.0", default-features = false, path = "packages/tui" }
 bcode_tui_components                    = { version = "0.0.1-alpha.0", default-features = false, path = "packages/tui-components" }
 bcode_tui_theme                         = { version = "0.0.1-alpha.0", default-features = false, path = "packages/tui-theme" }
+bcode_tui_transcript                    = { version = "0.0.1-alpha.0", default-features = false, path = "packages/tui-transcript" }
 bcode_tui_web                           = { version = "0.0.1-alpha.0", default-features = false, path = "packages/tui-web" }
 bcode_usage                             = { version = "0.0.1-alpha.0", default-features = false, path = "packages/usage" }
 bcode_usage_models                      = { version = "0.0.1-alpha.0", default-features = false, path = "packages/usage/models" }
