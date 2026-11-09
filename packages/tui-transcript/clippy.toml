@@ -1,0 +1,30 @@
+# Mechanical guard for X10 / L2 (docs/tui-v2-architecture.md): the V2 transcript engine keeps
+# no thread-local or global mutable state. Every render input reaches producers through
+# `ItemRenderContext`/`PaintInputs`, and the engine is driven from one thread.
+#
+# `static mut` is unusable because the crate forbids `unsafe_code` (src/lib.rs). Interior-mutable
+# statics need a `Sync` cell, so the synchronized cells and lazy globals below are disallowed;
+# a future, justified use must allow the lint locally with its reason.
+
+disallowed-macros = [
+    { path = "std::thread_local", reason = "X10/L2: no thread-local state in the V2 engine; pass inputs through ItemRenderContext or PaintInputs" },
+]
+
+disallowed-types = [
+    { path = "std::sync::Mutex", reason = "X10: no global or shared mutable state in the single-threaded V2 engine" },
+    { path = "std::sync::RwLock", reason = "X10: no global or shared mutable state in the single-threaded V2 engine" },
+    { path = "std::sync::OnceLock", reason = "X10: no lazily initialized globals in the V2 engine" },
+    { path = "std::sync::LazyLock", reason = "X10: no lazily initialized globals in the V2 engine" },
+    { path = "std::sync::atomic::AtomicBool", reason = "X10: no global or shared mutable state in the V2 engine" },
+    { path = "std::sync::atomic::AtomicU8", reason = "X10: no global or shared mutable state in the V2 engine" },
+    { path = "std::sync::atomic::AtomicU16", reason = "X10: no global or shared mutable state in the V2 engine" },
+    { path = "std::sync::atomic::AtomicU32", reason = "X10: no global or shared mutable state in the V2 engine" },
+    { path = "std::sync::atomic::AtomicU64", reason = "X10: no global or shared mutable state in the V2 engine" },
+    { path = "std::sync::atomic::AtomicUsize", reason = "X10: no global or shared mutable state in the V2 engine" },
+    { path = "std::sync::atomic::AtomicI8", reason = "X10: no global or shared mutable state in the V2 engine" },
+    { path = "std::sync::atomic::AtomicI16", reason = "X10: no global or shared mutable state in the V2 engine" },
+    { path = "std::sync::atomic::AtomicI32", reason = "X10: no global or shared mutable state in the V2 engine" },
+    { path = "std::sync::atomic::AtomicI64", reason = "X10: no global or shared mutable state in the V2 engine" },
+    { path = "std::sync::atomic::AtomicIsize", reason = "X10: no global or shared mutable state in the V2 engine" },
+    { path = "std::sync::atomic::AtomicPtr", reason = "X10: no global or shared mutable state in the V2 engine" },
+]

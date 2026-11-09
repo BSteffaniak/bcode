@@ -112,20 +112,14 @@ mod tests {
         let mut units = Units::new();
         let expanded = |item: &TranscriptViewItem| {
             if item.id.get().starts_with('g') {
-                ItemPlacement::Grouped {
-                    group: 1,
-                    expanded: true,
-                }
+                ItemPlacement::grouped(1, true)
             } else {
                 ItemPlacement::Visible
             }
         };
         let collapsed = |item: &TranscriptViewItem| {
             if item.id.get().starts_with('g') {
-                ItemPlacement::Grouped {
-                    group: 1,
-                    expanded: false,
-                }
+                ItemPlacement::grouped(1, false)
             } else {
                 ItemPlacement::Visible
             }

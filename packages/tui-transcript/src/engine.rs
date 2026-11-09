@@ -22,18 +22,19 @@ use bmux_tui::component::{Component, Constraints, EventCx, LayoutCx};
 use bmux_tui::event::{Event, EventOutcome};
 use bmux_tui::geometry::Size;
 use bmux_tui::paint::PaintCx;
-use bmux_tui_components::virtual_list::NoSourceMap;
 
 use crate::focus::ChatFocus;
 use crate::frame::{FrameClock, FrameId, FrameSnapshot};
 use crate::latest_bar::LatestBarState;
+use crate::layout::geometry::ItemAction;
+use crate::layout::producers::{ProducerRegistry, UnitProducer};
+use crate::layout::{ActivityPhase, ItemLayoutCache, LayoutInputs, RenderConfig};
 use crate::navigation::{
     ListPosition, MotionConfig, NavEffect, NavInput, NavIntent, NavMode, NavState, NavTimer,
     RemovedUnits, ScrollTarget, presented_position, reduce,
 };
 use crate::units::facts::UnitFactsView;
-use crate::units::producers::{PlainTextProducer, UnitProducer};
-use crate::units::structure::{FlatStructure, UnitStructure};
+use crate::units::structure::{DisclosureTarget, StructureConfig, StructureResolver};
 use crate::units::{UnitChanges, UnitKey, Units};
 use crate::viewport::source::TranscriptItemSource;
 use crate::viewport::{
@@ -44,9 +45,19 @@ use crate::window::{
     EvictionContext, HistoryPageResult, HistoryWindowResult, IssuedRequest, LiveInput, LiveOutcome,
     PageDirection, PageRequest, ResidentWindow, StaleResult, WindowManager, WindowRequest,
 };
+use bcode_presentation_policy::models::Disclosure;
 
 /// Layout id of the transcript list component.
 const LIST_ID: &str = "transcript";
+
+/// The interactive region under a point of a prepared frame ([`TranscriptEngine::hit_test`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ItemHit {
+    /// Unit the region belongs to.
+    pub unit: UnitKey,
+    /// What activating the region does.
+    pub action: ItemAction,
+}
 
 /// A request the host must execute (W5, W10, W11). Results come back through
 /// [`TranscriptEngine::apply_page`] and [`TranscriptEngine::apply_window`].
@@ -96,8 +107,14 @@ pub struct TranscriptEngine {
     geometry: ViewportGeometry,
     motion: MotionConfig,
     producer: Box<dyn UnitProducer>,
-    /// Item placement policy units are derived with (U5).
-    structure: Box<dyn UnitStructure>,
+    /// Presentation-policy structure units are derived with (U2, U5).
+    structure: StructureResolver,
+    /// Render configuration item contexts are built from (L2).
+    render: RenderConfig,
+    /// Identity-keyed retained layouts; the only source of unit heights (L1, VP6).
+    layouts: ItemLayoutCache,
+    /// Spinner and elapsed phase, advanced on accepted invalidations (F7).
+    activity: ActivityPhase,
     /// Navigation timers scheduled by the reducer, keyed by timer (one deadline each).
     timers: BTreeMap<NavTimer, Instant>,
     /// Latest input time seen.
@@ -125,10 +142,10 @@ impl std::fmt::Debug for TranscriptEngine {
 }
 
 impl TranscriptEngine {
-    /// Create an engine with the phase 2 plain-text producer.
+    /// Create an engine with the standard producers ([`ProducerRegistry::standard`]).
     #[must_use]
     pub fn new(geometry: ViewportGeometry, motion: MotionConfig) -> Self {
-        Self::with_producer(geometry, motion, Box::new(PlainTextProducer))
+        Self::with_producer(geometry, motion, Box::new(ProducerRegistry::standard()))
     }
 
     /// Create an engine whose units are built and measured by `producer`.
@@ -148,7 +165,10 @@ impl TranscriptEngine {
             geometry,
             motion,
             producer,
-            structure: Box::new(FlatStructure),
+            structure: StructureResolver::default(),
+            render: RenderConfig::default(),
+            layouts: ItemLayoutCache::new(),
+            activity: ActivityPhase::default(),
             timers: BTreeMap::new(),
             now: None,
             attach: None,
@@ -157,11 +177,17 @@ impl TranscriptEngine {
         }
     }
 
-    /// Return the engine with units derived by `structure` instead of the flat default (U5).
-    /// Takes effect from the next document change.
+    /// Return the engine with `config` for structure resolution (U5).
     #[must_use]
-    pub fn with_structure(mut self, structure: Box<dyn UnitStructure>) -> Self {
-        self.structure = structure;
+    pub fn with_structure_config(mut self, config: StructureConfig) -> Self {
+        self.structure.set_config(config);
+        self
+    }
+
+    /// Return the engine with `config` for item rendering (L2).
+    #[must_use]
+    pub fn with_render_config(mut self, config: RenderConfig) -> Self {
+        self.render = config;
         self
     }
 
@@ -189,6 +215,30 @@ impl TranscriptEngine {
     #[must_use]
     pub const fn units(&self) -> &Units {
         &self.units
+    }
+
+    /// Resolved structure (placements, per-unit presentations, disclosure overrides).
+    #[must_use]
+    pub const fn structure(&self) -> &StructureResolver {
+        &self.structure
+    }
+
+    /// Render configuration.
+    #[must_use]
+    pub const fn render_config(&self) -> &RenderConfig {
+        &self.render
+    }
+
+    /// Retained item layouts (heights, nodes, geometry).
+    #[must_use]
+    pub const fn layouts(&self) -> &ItemLayoutCache {
+        &self.layouts
+    }
+
+    /// Layout work since the last call, then reset (spec 9.2, D4).
+    #[cfg(any(test, feature = "testing"))]
+    pub const fn take_layout_work(&mut self) -> crate::layout::LayoutWorkCounters {
+        self.layouts.take_counters()
     }
 
     /// The viewport projection.
@@ -302,19 +352,18 @@ impl TranscriptEngine {
         let position = self.presented(at);
         self.viewport.apply_position(&position);
         let outcome = {
-            let items = transcript_items(&self.session);
             let source = TranscriptItemSource::new(
                 &self.units,
-                items,
                 self.window.summary(),
-                self.producer.as_ref(),
+                &self.layouts,
+                self.activity,
             );
             let component =
                 self.viewport
-                    .component(LIST_ID, &source, &NoSourceMap, ScrollbarMode::Off);
+                    .component(LIST_ID, &source, &self.layouts, ScrollbarMode::Off);
             let layout = component.layout(
                 Constraints::tight(self.terminal_size()),
-                &mut LayoutCx::new(),
+                &mut LayoutCx::with_clock(FrameClock { now: at }.presentation()),
             );
             component.event(event, &layout, &mut EventCx::new(&layout))
         };
@@ -465,6 +514,76 @@ impl TranscriptEngine {
         update
     }
 
+    /// Replace the render configuration (theme, Markdown and diff options, plugin visuals).
+    /// Units whose fingerprint changed are re-measured in this update; keyed anchors keep the
+    /// reading position (P1). A theme change re-measures every unit (L3).
+    pub fn set_render_config(&mut self, config: RenderConfig, at: Instant) -> EngineUpdate {
+        self.observe_time(at);
+        self.render = config;
+        self.remeasure();
+        let effects = self.reduce_input(
+            NavInput::Geometry {
+                viewport: self.geometry,
+            },
+            &RemovedUnits::new(),
+        );
+        let mut update = self.run_effects(effects);
+        update.invalidated = true;
+        update.merge(self.settle(at));
+        update
+    }
+
+    /// Replace the structure configuration (policy, plugin facts, declared targets). Every
+    /// resident item is re-resolved; units whose structure changed are re-derived and
+    /// re-measured in this update, and anchors on units that fold into a group follow the
+    /// group header (U2).
+    pub fn set_structure_config(&mut self, config: StructureConfig, at: Instant) -> EngineUpdate {
+        self.observe_time(at);
+        self.structure.set_config(config);
+        self.content(TranscriptChanges::default(), at)
+    }
+
+    /// Toggle a disclosure target between expanded and collapsed (X1, U2). Returns the update
+    /// and the new disclosure; `None` when the target is unknown or may not collapse (A16).
+    pub fn toggle_disclosure(
+        &mut self,
+        target: &DisclosureTarget,
+        at: Instant,
+    ) -> (EngineUpdate, Option<Disclosure>) {
+        self.observe_time(at);
+        let Some(disclosure) = self.structure.toggle(target) else {
+            return (EngineUpdate::default(), None);
+        };
+        (
+            self.content(TranscriptChanges::default(), at),
+            Some(disclosure),
+        )
+    }
+
+    /// Set a disclosure target (A16 floor applies). Returns the update and whether the
+    /// override changed.
+    pub fn set_disclosure(
+        &mut self,
+        target: &DisclosureTarget,
+        disclosure: Disclosure,
+        at: Instant,
+    ) -> (EngineUpdate, bool) {
+        self.observe_time(at);
+        if !self.structure.set_disclosure(target, disclosure) {
+            return (EngineUpdate::default(), false);
+        }
+        (self.content(TranscriptChanges::default(), at), true)
+    }
+
+    /// Accept a new spinner/elapsed phase (F7, D7): a paint-only change.
+    pub const fn set_activity(&mut self, activity: ActivityPhase) -> EngineUpdate {
+        self.activity = activity;
+        EngineUpdate {
+            requests: Vec::new(),
+            invalidated: true,
+        }
+    }
+
     // ---- frames ---------------------------------------------------------------------------
 
     /// Prepare one frame at `clock` (spec 9.1 step 2). Writes only the derived list position
@@ -473,9 +592,17 @@ impl TranscriptEngine {
         let position = self.presented(clock.now);
         self.viewport.apply_position(&position);
         self.last_frame = self.last_frame.next();
-        let viewport = self
+        let mut viewport = self
             .viewport
-            .frame(&position, self.geometry.height, &NoSourceMap);
+            .frame(&position, self.geometry.height, &self.layouts);
+        if let Some(frame) = viewport.as_mut() {
+            for unit in &mut frame.units {
+                unit.layout = self
+                    .layouts
+                    .current(&unit.key)
+                    .map(|layout| layout.key.clone());
+            }
+        }
         let motion_running = self.nav.motion.is_some();
         FrameSnapshot {
             id: self.last_frame,
@@ -494,23 +621,108 @@ impl TranscriptEngine {
 
     /// Paint a prepared frame into `cx` at the transcript region's origin (spec 9.1 step 3).
     /// Only visible, correctly positioned units are built and painted (VP3).
+    ///
+    /// The list is laid out with the snapshot's clock as the BMUX presentation clock (BMUX 8),
+    /// which is the instant the host prepared the frame with; when `cx` carries a presentation
+    /// clock it is the same sample (F2).
     pub fn paint_frame(&self, snapshot: &FrameSnapshot, cx: &mut PaintCx<'_, '_>) {
-        let items = transcript_items(&self.session);
+        debug_assert!(
+            cx.clock()
+                .is_none_or(|clock| FrameClock::from(clock) == snapshot.clock),
+            "a frame is painted with the clock it was prepared with (F2)"
+        );
         let source = TranscriptItemSource::new(
             &self.units,
-            items,
             self.window.summary(),
-            self.producer.as_ref(),
+            &self.layouts,
+            self.activity,
         );
-        let component = self
-            .viewport
-            .component(LIST_ID, &source, &NoSourceMap, ScrollbarMode::Off);
+        let component =
+            self.viewport
+                .component(LIST_ID, &source, &self.layouts, ScrollbarMode::Off);
         let size = Size::new(
             u16::try_from(snapshot.geometry.width).unwrap_or(u16::MAX),
             u16::try_from(snapshot.geometry.height).unwrap_or(u16::MAX),
         );
-        let layout = component.layout(Constraints::tight(size), &mut LayoutCx::new());
+        let layout = component.layout(
+            Constraints::tight(size),
+            &mut LayoutCx::with_clock(snapshot.clock.presentation()),
+        );
         component.paint(&layout, cx);
+    }
+
+    /// The interactive region of a prepared frame at transcript-region cell (`column`, `row`)
+    /// (B3, B7, X1).
+    ///
+    /// Regions come from the retained geometry of the unit painted at that row, so hits use
+    /// the same layout definition as the painted cells. Only units visible in `snapshot` are
+    /// hit, only inside the viewport, and only while their retained layout is still the one
+    /// the snapshot painted (the layout key recorded by [`Self::prepare_frame`]: unit,
+    /// revision, fingerprint and width, plus the painted height); otherwise there is no hit.
+    /// When regions nest (a section label inside its unit), the smallest one wins.
+    #[must_use]
+    pub fn hit_test(&self, snapshot: &FrameSnapshot, column: u64, row: u64) -> Option<ItemHit> {
+        if column >= snapshot.geometry.width || row >= snapshot.geometry.height {
+            return None;
+        }
+        let viewport = snapshot.viewport.as_ref()?;
+        let row = i64::try_from(row).ok()?;
+        let unit = viewport.units.iter().find(|unit| {
+            unit.top <= row
+                && row
+                    < unit
+                        .top
+                        .saturating_add(i64::try_from(unit.height).unwrap_or(i64::MAX))
+        })?;
+        let width = snapshot.geometry.width;
+        let layout = self.layouts.current(&unit.key).filter(|layout| {
+            unit.layout.as_ref() == Some(&layout.key)
+                && layout.key.width == width
+                && layout.height == unit.height
+                && Some(layout.key.revision) == self.units.revision(&unit.key)
+        })?;
+        let local_row = u64::try_from(row - unit.top).ok()?;
+        layout
+            .geometry
+            .hit_regions
+            .iter()
+            .filter(|region| {
+                let rect = region.rect;
+                column >= rect.x
+                    && column - rect.x < rect.width
+                    && local_row >= rect.y
+                    && local_row - rect.y < rect.height
+            })
+            .min_by_key(|region| region.rect.width.saturating_mul(region.rect.height))
+            .map(|region| ItemHit {
+                unit: unit.key.clone(),
+                action: region.action.clone(),
+            })
+    }
+
+    /// Activate the region a click at (`column`, `row`) of `snapshot` hits (X1): a disclosure
+    /// region toggles its target (the visibility floor still applies, A16). Returns the update
+    /// and the hit; producer activations ([`ItemAction::Activate`]) are returned for the host
+    /// to handle and change nothing here.
+    ///
+    /// Phase 6 routes pointer gestures through BMUX click activation (BMUX 14); this entry point
+    /// is the activation that routing ends in.
+    pub fn click(
+        &mut self,
+        snapshot: &FrameSnapshot,
+        column: u64,
+        row: u64,
+        at: Instant,
+    ) -> (EngineUpdate, Option<ItemHit>) {
+        self.observe_time(at);
+        let Some(hit) = self.hit_test(snapshot, column, row) else {
+            return (EngineUpdate::default(), None);
+        };
+        let update = match &hit.action {
+            ItemAction::ToggleDisclosure(target) => self.toggle_disclosure(target, at).0,
+            ItemAction::Activate(_) => EngineUpdate::default(),
+        };
+        (update, Some(hit))
     }
 
     /// Record a presented frame (CK3). Navigation is unchanged.
@@ -549,7 +761,7 @@ impl TranscriptEngine {
 
     fn nav_context<'a>(&'a self, facts: &'a UnitFactsView<'a>) -> NavViewContext<'a> {
         NavViewContext {
-            sources: &NoSourceMap,
+            sources: &self.layouts,
             facts,
             geometry: self.geometry,
             window: self.window.summary(),
@@ -562,7 +774,7 @@ impl TranscriptEngine {
     fn reduce_input(&mut self, input: NavInput, removed: &RemovedUnits) -> Vec<NavEffect> {
         let facts = UnitFactsView::new(&self.units, removed);
         let context = NavViewContext {
-            sources: &NoSourceMap,
+            sources: &self.layouts,
             facts: &facts,
             geometry: self.geometry,
             window: self.window.summary(),
@@ -645,7 +857,7 @@ impl TranscriptEngine {
         let position = self.presented(at);
         let rows = self
             .viewport
-            .edge_rows(&position, self.geometry.height, &NoSourceMap);
+            .edge_rows(&position, self.geometry.height, &self.layouts);
         for issued in self.window.poll_prefetch(rows, self.geometry.height) {
             update.requests.push(HostRequest::Page(issued));
         }
@@ -657,7 +869,7 @@ impl TranscriptEngine {
         let position = self.presented(at);
         let viewport_top = self
             .viewport
-            .resolve(&position, self.geometry.height, &NoSourceMap)
+            .resolve(&position, self.geometry.height, &self.layouts)
             .map_or(0, |resolved| resolved.top_offset);
         let anchor = match &self.nav.mode {
             NavMode::Reading { anchor } | NavMode::TailSpace { anchor } => {
@@ -696,23 +908,35 @@ impl TranscriptEngine {
             .map(|outcome| outcome.changes)
     }
 
-    /// Derive units for a document change and splice the measured index (U4, L1, W3).
+    /// Resolve structure for a document change, derive units and splice the measured index
+    /// with exact heights from the layout cache (U4, U5, L1, W3).
     fn apply_changes(&mut self, changes: &TranscriptChanges) -> UnitChanges {
         let items = transcript_items(&self.session);
+        let structure_update = self.structure.update(changes, items);
+        let units = &self.units;
+        let augmented = structure_update.augment(changes, &|id| {
+            units.item(items, id).map(|item| item.revision)
+        });
         let unit_changes = self.units.apply(
-            changes,
+            &augmented,
             items,
             self.window.summary().mode,
-            self.structure.as_ref(),
+            &self.structure,
         );
+        if unit_changes.is_structural() {
+            let units = &self.units;
+            self.layouts.retain(|key| units.contains(key));
+        }
         let width = self.geometry.width;
-        let source = TranscriptItemSource::new(
-            &self.units,
+        let inputs = LayoutInputs {
+            units: &self.units,
             items,
-            self.window.summary(),
-            self.producer.as_ref(),
-        );
-        let mut measure = |key: &UnitKey| source.measure(key, width);
+            structure: &self.structure,
+            render: &self.render,
+            producer: self.producer.as_ref(),
+        };
+        let layouts = &mut self.layouts;
+        let mut measure = |key: &UnitKey| inputs.measure(layouts, key, width);
         if self
             .viewport
             .apply_unit_changes(&unit_changes, &self.units, width, &mut measure)
@@ -725,17 +949,20 @@ impl TranscriptEngine {
         unit_changes
     }
 
-    /// Re-measure every resident unit at the current width (L9).
+    /// Re-measure every resident unit at the current width and render configuration (L9).
+    /// Units whose retained layout still matches exactly are not laid out again (L1).
     fn remeasure(&mut self) {
         let items = transcript_items(&self.session);
         let width = self.geometry.width;
-        let source = TranscriptItemSource::new(
-            &self.units,
+        let inputs = LayoutInputs {
+            units: &self.units,
             items,
-            self.window.summary(),
-            self.producer.as_ref(),
-        );
-        let mut measure = |key: &UnitKey| source.measure(key, width);
+            structure: &self.structure,
+            render: &self.render,
+            producer: self.producer.as_ref(),
+        };
+        let layouts = &mut self.layouts;
+        let mut measure = |key: &UnitKey| inputs.measure(layouts, key, width);
         let remeasured = self.viewport.remeasure(&self.units, width, &mut measure);
         debug_assert!(remeasured.is_ok(), "derived units never repeat a key");
     }

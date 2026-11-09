@@ -24,6 +24,7 @@ use bmux_tui_components::virtual_list::{
 };
 
 use crate::layout::SourcePosition;
+use crate::layout::cache::ItemLayoutKey;
 use crate::navigation::{
     AnchorOffset, ApproachEdge, InputSource, ListPosition, MotionConfig, NavIntent, NavView,
     PAGE_STEP_ROWS, Placement, ReadingAnchor, ScrollMotion, ScrollTarget, UnitFacts,
@@ -189,6 +190,9 @@ pub struct VisibleUnit {
     pub top: i64,
     /// Exact height in rows.
     pub height: u64,
+    /// Key of the retained layout the frame paints for this unit, recorded when the frame is
+    /// prepared; hit testing against the frame uses only that layout (B3, B7).
+    pub layout: Option<ItemLayoutKey>,
 }
 
 /// Rows of one frame derived from a keyed position and the current geometry (P1).
@@ -414,6 +418,7 @@ impl TranscriptViewport {
                     index: position,
                     top: i64::try_from(i128::from(offset) - top).unwrap_or(i64::MIN),
                     height: item.height,
+                    layout: None,
                 })
             })
             .collect();

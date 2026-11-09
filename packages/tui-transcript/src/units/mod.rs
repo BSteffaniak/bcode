@@ -11,7 +11,6 @@
 //! change.
 
 pub mod facts;
-pub mod producers;
 pub mod structure;
 
 use std::collections::{BTreeMap, BTreeSet};
@@ -388,12 +387,18 @@ impl Units {
             if self.placements.get(id) != Some(&placement) {
                 return None;
             }
-            targets.push((id.clone(), item.revision, item.streaming, placement));
+            targets.push((
+                id.clone(),
+                item_signature(item, structure),
+                item.streaming,
+                placement,
+            ));
         }
         let mut revised = Vec::new();
-        for (id, item_revision, streaming, placement) in targets {
-            if placement == ItemPlacement::Hidden {
-                // A hidden item's content does not change its marker's layout.
+        for (id, signature, streaming, placement) in targets {
+            if matches!(placement, ItemPlacement::Hidden | ItemPlacement::Suppressed) {
+                // A hidden item's content does not change its marker's layout; a suppressed
+                // item has no unit.
                 continue;
             }
             let owner = self.owners.get(&id)?.clone();
@@ -404,8 +409,8 @@ impl Units {
             // Items keep the signature the full derivation computes; a header's signature
             // diverges, so the next full derivation re-revises it once (harmless).
             entry.signature = match owner {
-                UnitKey::Item(_) => mix(0x51, item_revision),
-                _ => mix(entry.signature, item_revision),
+                UnitKey::Item(_) => signature,
+                _ => mix(entry.signature, signature),
             };
             if !revised.contains(&owner) {
                 revised.push(owner);
@@ -555,17 +560,15 @@ fn derive(items: &[TranscriptViewItem], mode: WindowMode, structure: &dyn UnitSt
     for (index, item) in items.iter().enumerate() {
         let placement = structure.placement(item);
         plan.placements.insert(item.id.clone(), placement);
+        if placement == ItemPlacement::Suppressed {
+            // No unit and no marker; the run around it continues.
+            continue;
+        }
         let continues = match (&run, placement) {
             (Some(Run::Hidden(_)), ItemPlacement::Hidden) => !starts_turn(item),
-            (
-                Some(Run::Group {
-                    group, expanded, ..
-                }),
-                ItemPlacement::Grouped {
-                    group: next,
-                    expanded: next_expanded,
-                },
-            ) => *group == next && *expanded == next_expanded && !starts_turn(item),
+            (Some(Run::Group { group, .. }), ItemPlacement::Grouped { group: next, .. }) => {
+                *group == next && !starts_turn(item)
+            }
             _ => false,
         };
         if continues {
@@ -575,12 +578,15 @@ fn derive(items: &[TranscriptViewItem], mode: WindowMode, structure: &dyn UnitSt
             continue;
         }
         if let Some(finished) = run.take() {
-            flush_run(&mut plan, items, finished);
+            flush_run(&mut plan, items, finished, structure);
         }
         match placement {
-            ItemPlacement::Visible => push_item(&mut plan, item),
+            ItemPlacement::Visible => push_item(&mut plan, item, structure),
+            ItemPlacement::Suppressed => {}
             ItemPlacement::Hidden => run = Some(Run::Hidden(vec![index])),
-            ItemPlacement::Grouped { group, expanded } => {
+            ItemPlacement::Grouped {
+                group, expanded, ..
+            } => {
                 run = Some(Run::Group {
                     group,
                     expanded,
@@ -590,7 +596,7 @@ fn derive(items: &[TranscriptViewItem], mode: WindowMode, structure: &dyn UnitSt
         }
     }
     if let Some(finished) = run.take() {
-        flush_run(&mut plan, items, finished);
+        flush_run(&mut plan, items, finished, structure);
     }
     if mode == WindowMode::Detached {
         plan.units.push(boundary_unit(BoundaryEdge::Newer));
@@ -598,7 +604,12 @@ fn derive(items: &[TranscriptViewItem], mode: WindowMode, structure: &dyn UnitSt
     plan
 }
 
-fn push_item(plan: &mut Plan, item: &TranscriptViewItem) {
+/// Layout signature of an item unit: its revision and its structural signature.
+fn item_signature(item: &TranscriptViewItem, structure: &dyn UnitStructure) -> u64 {
+    mix(mix(0x51, item.revision), structure.signature(item))
+}
+
+fn push_item(plan: &mut Plan, item: &TranscriptViewItem, structure: &dyn UnitStructure) {
     let key = UnitKey::Item(item.id.clone());
     plan.owners.insert(item.id.clone(), key.clone());
     plan.units.push(PlannedUnit {
@@ -607,12 +618,17 @@ fn push_item(plan: &mut Plan, item: &TranscriptViewItem) {
         sequence: item.sequence,
         streaming: item.streaming,
         role: facts::item_role(item),
-        signature: mix(0x51, item.revision),
+        signature: item_signature(item, structure),
         members: vec![item.id.clone()],
     });
 }
 
-fn flush_run(plan: &mut Plan, items: &[TranscriptViewItem], run: Run) {
+fn flush_run(
+    plan: &mut Plan,
+    items: &[TranscriptViewItem],
+    run: Run,
+    structure: &dyn UnitStructure,
+) {
     match run {
         Run::Hidden(members) => {
             let first = &items[members[0]];
@@ -636,8 +652,19 @@ fn flush_run(plan: &mut Plan, items: &[TranscriptViewItem], run: Run) {
         } => {
             let first = &items[members[0]];
             let header = UnitKey::GroupHeader(first.id.clone());
-            let count = members.len() as u64;
-            let mut signature = mix(mix(0x47, count), u64::from(expanded));
+            let count = members
+                .iter()
+                .filter(|&&member| {
+                    matches!(
+                        structure.placement(&items[member]),
+                        ItemPlacement::Grouped { member: true, .. }
+                    )
+                })
+                .count() as u64;
+            let mut signature = mix(
+                mix(mix(0x47, count), u64::from(expanded)),
+                structure.group_signature(first),
+            );
             for &member in &members {
                 signature = mix(signature, items[member].revision);
             }
@@ -658,8 +685,12 @@ fn flush_run(plan: &mut Plan, items: &[TranscriptViewItem], run: Run) {
             });
             for &member in &members {
                 let item = &items[member];
-                if expanded {
-                    push_item(plan, item);
+                let renders = match structure.placement(item) {
+                    ItemPlacement::Grouped { rendering, .. } => rendering.has_unit(),
+                    _ => expanded,
+                };
+                if renders {
+                    push_item(plan, item, structure);
                 } else {
                     plan.owners.insert(item.id.clone(), header.clone());
                 }
@@ -895,7 +926,7 @@ mod tests {
     fn grouped(group_ids: &'static [&'static str], expanded: bool) -> impl UnitStructure {
         move |item: &TranscriptViewItem| {
             if group_ids.contains(&item.id.get()) {
-                ItemPlacement::Grouped { group: 7, expanded }
+                ItemPlacement::grouped(7, expanded)
             } else if item.id.get().starts_with('h') {
                 ItemPlacement::Hidden
             } else {
@@ -974,10 +1005,7 @@ mod tests {
             item("g2", 2, 1, true),
             item("g3", 3, 1, false),
         ];
-        let structure = |_: &TranscriptViewItem| ItemPlacement::Grouped {
-            group: 1,
-            expanded: false,
-        };
+        let structure = |_: &TranscriptViewItem| ItemPlacement::grouped(1, false);
         let mut units = Units::new();
         let _ = units.apply(
             &TranscriptChanges::default(),

@@ -472,12 +472,36 @@ impl MotionConfig {
         easing: Easing::Linear,
         frame_interval: Duration::from_millis(16),
     };
+
+    /// Scroll duration of the theme's `subtle` motion level (the default).
+    pub const SUBTLE_SCROLL: Duration = Duration::from_millis(180);
+
+    /// Scroll duration of the theme's `full` motion level.
+    pub const FULL_SCROLL: Duration = Duration::from_millis(270);
+
+    /// Motion for a theme chrome motion level (X4): `none` and `reduce_motion` are instant
+    /// (C22), `subtle` and `full` animate for [`Self::SUBTLE_SCROLL`] and
+    /// [`Self::FULL_SCROLL`].
+    #[must_use]
+    pub fn for_motion(motion: bcode_tui_theme::chrome::Motion, reduce_motion: bool) -> Self {
+        use bcode_tui_theme::chrome::Motion;
+        let duration = match motion {
+            _ if reduce_motion => return Self::INSTANT,
+            Motion::None => return Self::INSTANT,
+            Motion::Subtle => Self::SUBTLE_SCROLL,
+            Motion::Full => Self::FULL_SCROLL,
+        };
+        Self {
+            duration,
+            ..Self::default()
+        }
+    }
 }
 
 impl Default for MotionConfig {
     fn default() -> Self {
         Self {
-            duration: Duration::from_millis(180),
+            duration: Self::SUBTLE_SCROLL,
             easing: Easing::EaseOut,
             frame_interval: Duration::from_millis(16),
         }

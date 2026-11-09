@@ -1,8 +1,6 @@
 //! Viewport tests over real units and the measured index: splice correspondence (W3, L1,
 //! VP6), tail-space overscroll (VP2), controlled mode (VP5) and visible rows (P1, VP3).
 
-use std::cell::Cell;
-
 use bcode_session_view_models::{
     ChatMessageView, TranscriptChanges, TranscriptViewItem, TranscriptViewItemId,
     TranscriptViewItemKind,
@@ -13,9 +11,11 @@ use bmux_tui_components::virtual_list::{ActionDispatch, NoSourceMap};
 
 use super::source::TranscriptItemSource;
 use super::*;
+use crate::layout::producers::UnitProducer;
+use crate::layout::producers::testing::{FixtureProducer, PlainTextProducer};
+use crate::layout::{ActivityPhase, ItemLayoutCache, LayoutInputs, RenderConfig};
 use crate::navigation::NoUnitFacts;
-use crate::units::producers::{FixtureProducer, PlainTextProducer};
-use crate::units::structure::FlatStructure;
+use crate::units::structure::{FlatStructure, StructureResolver};
 use crate::units::{BoundaryEdge, UnitKey, Units};
 use crate::window::{ResidentWindow, WindowMode};
 
@@ -42,7 +42,35 @@ struct Fixture {
     viewport: TranscriptViewport,
     window: ResidentWindow,
     producer: FixtureProducer,
-    measured: Cell<u64>,
+    layouts: ItemLayoutCache,
+    structure: StructureResolver,
+    render: RenderConfig,
+}
+
+/// Measure `changes` into `viewport` through `layouts` (the engine's VP6 path).
+#[allow(clippy::too_many_arguments)]
+fn apply(
+    viewport: &mut TranscriptViewport,
+    layouts: &mut ItemLayoutCache,
+    changes: &crate::units::UnitChanges,
+    units: &Units,
+    items: &[TranscriptViewItem],
+    structure: &StructureResolver,
+    render: &RenderConfig,
+    producer: &dyn UnitProducer,
+) {
+    let inputs = LayoutInputs {
+        units,
+        items,
+        structure,
+        render,
+        producer,
+    };
+    viewport
+        .apply_unit_changes(changes, units, 40, &mut |unit| {
+            inputs.measure(layouts, unit, 40)
+        })
+        .expect("splices match the index");
 }
 
 impl Fixture {
@@ -54,7 +82,9 @@ impl Fixture {
             viewport: TranscriptViewport::new(),
             window: ResidentWindow::new(),
             producer: FixtureProducer::uniform(3),
-            measured: Cell::new(0),
+            layouts: ItemLayoutCache::new(),
+            structure: StructureResolver::default(),
+            render: RenderConfig::default(),
         };
         fixture.set_items(range.map(item).collect());
         fixture
@@ -69,16 +99,22 @@ impl Fixture {
             self.window.mode,
             &FlatStructure,
         );
-        let source =
-            TranscriptItemSource::new(&self.units, &self.items, &self.window, &self.producer);
-        let measured = &self.measured;
-        self.viewport
-            .apply_unit_changes(&changes, &self.units, 40, &mut |unit| {
-                measured.set(measured.get() + 1);
-                source.measure(unit, 40)
-            })
-            .expect("splices match the index");
+        apply(
+            &mut self.viewport,
+            &mut self.layouts,
+            &changes,
+            &self.units,
+            &self.items,
+            &self.structure,
+            &self.render,
+            &self.producer,
+        );
         changes
+    }
+
+    /// Measurements since the last call.
+    fn measured(&mut self) -> u64 {
+        self.layouts.take_counters().measurements
     }
 
     fn index_keys(&self) -> Vec<UnitKey> {
@@ -102,16 +138,16 @@ fn anchored(unit: UnitKey, row: u64) -> ListPosition {
 fn w3_vp6_index_follows_unit_splices_and_measures_only_new_units() {
     let mut fixture = Fixture::new(10..20);
     assert_eq!(fixture.index_keys(), fixture.units.keys());
-    assert_eq!(fixture.measured.get(), 11, "boundary plus ten items");
+    assert_eq!(fixture.measured(), 11, "boundary plus ten items");
 
     // Prepend five items and drop the last two in one update.
-    fixture.measured.set(0);
+    let _ = fixture.measured();
     let next = (5..18).map(item).collect();
     let changes = fixture.set_items(next);
     assert_eq!(changes.splices.len(), 2);
     assert_eq!(fixture.index_keys(), fixture.units.keys());
     assert_eq!(
-        fixture.measured.get(),
+        fixture.measured(),
         5,
         "only inserted units are measured (L1)"
     );
@@ -124,12 +160,12 @@ fn w3_vp6_index_follows_unit_splices_and_measures_only_new_units() {
 fn d3_revised_unit_is_remeasured_in_place() {
     let mut fixture = Fixture::new(0..5);
     fixture.producer = FixtureProducer::uniform(3).with_height(key(2), 7);
-    fixture.measured.set(0);
+    let _ = fixture.measured();
     let mut items = fixture.items.clone();
     items[2].revision = 2;
     let changes = fixture.set_items(items);
     assert_eq!(changes.revised, vec![key(2)]);
-    assert_eq!(fixture.measured.get(), 1);
+    assert_eq!(fixture.measured(), 1);
     let index = fixture.viewport.index();
     assert_eq!(index.item_by_key(&key(2)).map(|item| item.height), Some(7));
     assert_eq!(index.key_offset(&key(3)), Some(1 + 3 + 3 + 7));
@@ -271,23 +307,29 @@ fn u3_boundary_state_change_is_paint_only() {
     let boundary = UnitKey::Boundary(BoundaryEdge::Older);
     let source = TranscriptItemSource::new(
         &fixture.units,
-        &fixture.items,
         &fixture.window,
-        &fixture.producer,
+        &fixture.layouts,
+        ActivityPhase::default(),
     );
     let layout_before = source.layout_revision(0);
     let paint_before = source.paint_revision(0);
     fixture.window.in_flight.older = true;
     let source = TranscriptItemSource::new(
         &fixture.units,
-        &fixture.items,
         &fixture.window,
-        &fixture.producer,
+        &fixture.layouts,
+        ActivityPhase::default(),
     );
     assert_eq!(source.key(0), boundary);
     assert_eq!(source.layout_revision(0), layout_before);
     assert_ne!(source.paint_revision(0), paint_before);
-    assert_eq!(source.measure(&boundary, 40), 1);
+    assert_eq!(
+        fixture
+            .layouts
+            .current(&boundary)
+            .map(|layout| layout.height),
+        Some(1)
+    );
 }
 
 #[test]
@@ -305,17 +347,24 @@ fn component_layout_resolves_the_written_position_without_moving_it() {
         &FlatStructure,
     );
     let mut viewport = TranscriptViewport::new();
-    let producer = PlainTextProducer;
-    let source = TranscriptItemSource::new(&units, &items, &window, &producer);
-    viewport
-        .apply_unit_changes(&changes, &units, 40, &mut |unit| source.measure(unit, 40))
-        .expect("splices");
+    let mut layouts = ItemLayoutCache::new();
+    apply(
+        &mut viewport,
+        &mut layouts,
+        &changes,
+        &units,
+        &items,
+        &StructureResolver::default(),
+        &RenderConfig::default(),
+        &PlainTextProducer,
+    );
+    let source = TranscriptItemSource::new(&units, &window, &layouts, ActivityPhase::default());
     let position = anchored(key(12), 0);
     viewport.apply_position(&position);
     let expected = viewport
         .resolve(&position, 10, &NoSourceMap)
         .expect("resolves");
-    let component = viewport.component("transcript", &source, &NoSourceMap, ScrollbarMode::Off);
+    let component = viewport.component("transcript", &source, &layouts, ScrollbarMode::Off);
     let _layout = component.layout(Constraints::tight(Size::new(40, 10)), &mut LayoutCx::new());
     let state = viewport.state().borrow();
     assert_eq!(
@@ -345,23 +394,25 @@ fn source_resolves_unit_content_to_its_item_after_prepends_and_revisions() {
         .units
         .apply(&changes, &fixture.items, WindowMode::Live, &FlatStructure);
     assert_eq!(revised.revised, vec![key(12)]);
-    let source = TranscriptItemSource::new(
-        &fixture.units,
-        &fixture.items,
-        &fixture.window,
-        &fixture.producer,
-    );
     for n in [0, 9, 10, 12, 19] {
-        let content = source.content(&key(n)).expect("resident unit");
-        let item = content.item.expect("item unit has its item");
+        let id = TranscriptViewItemId::new(format!("i{n}"));
+        let item = fixture
+            .units
+            .item(&fixture.items, &id)
+            .expect("resident unit has its item");
         assert_eq!(item.sequence, Some(n));
     }
     assert_eq!(
-        source
-            .content(&key(12))
-            .and_then(|content| content.item)
+        fixture
+            .units
+            .item(&fixture.items, &TranscriptViewItemId::new("i12"))
             .map(|item| item.revision),
         Some(2)
     );
-    assert!(source.content(&key(40)).is_none());
+    assert!(
+        fixture
+            .units
+            .item(&fixture.items, &TranscriptViewItemId::new("i40"))
+            .is_none()
+    );
 }

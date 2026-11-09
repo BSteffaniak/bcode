@@ -1,6 +1,9 @@
 #![cfg_attr(feature = "fail-on-warnings", deny(warnings))]
 #![warn(clippy::all, clippy::pedantic, clippy::nursery, clippy::cargo)]
 #![allow(clippy::multiple_crate_versions)]
+// X10/L2: no `static mut` (unusable without unsafe) and, through `clippy.toml`, no thread-locals
+// or synchronized globals.
+#![forbid(unsafe_code)]
 
 //! Terminal transcript engine ("TUI V2").
 //!

@@ -406,6 +406,8 @@ mod v1_interaction {
         d6_composer_typing_repaints_regionally,
         #[ignore = "driver: needs per-frame layout work counters"]
         d4_scrolling_does_no_layout_work,
+        #[ignore = "driver: needs per-frame layout work counters"]
+        d4_prepend_measures_only_new_units,
         #[ignore = "driver: needs plugin interaction surfaces"]
         c37_interaction_placement_and_focus_restore,
         #[ignore = "driver: needs positioned shell captures"]
@@ -413,7 +415,8 @@ mod v1_interaction {
     }
 }
 
-/// Scenario instantiation for the V2 engine (phase 2: the engine façade driven headlessly).
+/// Scenario instantiation for the V2 engine (phases 2–3: the engine façade driven headlessly
+/// with the standard producers).
 /// Ignored entries need a later phase's deliverable and fail when run (confirmed with
 /// `--ignored`); `docs/tui-v2-scenarios.md` records each status.
 mod v2_engine {
@@ -478,7 +481,6 @@ mod v2_navigation {
         c23_reader_survives_page_and_live_append_before_frame,
         c24_width_change_keeps_source_line_at_top,
         c25_structural_insertion_keeps_reading_position,
-        #[ignore = "V2 pending phase 3: presentation rules (structure resolution, U5)"]
         c25_collapse_above_keeps_reading_position,
         c26_runtime_work_events_do_not_move_final_response,
         #[ignore = "V2 pending phase 4: latest bar (F6); the scenario starts its motion from a latest-bar click"]
@@ -546,36 +548,27 @@ mod v2_interaction {
         c35_failed_copy_keeps_selection,
         #[ignore = "V2 pending phase 6: transcript selection and copy"]
         c35_new_gesture_cancels_pending_clear,
-        #[ignore = "V2 pending phase 6: click routing through selection (BMUX 14)"]
         c35_click_without_drag_does_not_copy,
-        #[ignore = "V2 pending phase 3: tool producers and disclosure (then phase 6 click routing)"]
         x1_click_toggles_tool_header_once_per_click,
-        #[ignore = "V2 pending phase 3: tool producers and disclosure (then phase 6 click routing)"]
         x1_click_toggles_section_label,
-        #[ignore = "V2 pending phase 3: presentation rules and group headers (then phase 6 click routing)"]
         x1_click_toggles_group_header,
-        #[ignore = "V2 pending phase 3: tool producers and disclosure (then phase 6 selection)"]
+        #[ignore = "V2 pending phase 6: transcript selection (BMUX 13) and gesture routing (BMUX 14)"]
         x1_drag_from_header_selects_without_toggling,
         #[ignore = "V2 pending phase 4: transcript focus mode (alt+u, FO6)"]
         x2_focus_mode_keys_walk_and_toggle_targets,
         #[ignore = "V2 pending phase 4: transcript focus mode (alt+u, FO6)"]
         x2_focus_walk_scrolls_targets_into_view,
-        #[ignore = "V2 pending phase 3: presentation rules and visibility floor (U5)"]
         x3_collapsed_group_reveals_failed_member,
-        #[ignore = "V2 pending phase 3: presentation rules and visibility floor (U5)"]
         a16_hidden_units_leave_marker_and_failed_stays_visible,
-        #[ignore = "V2 pending phase 3: tool producers and visibility floor (U5)"]
         a16_floor_applies_after_manual_toggles,
-        #[ignore = "V2 pending phase 3: presentation rules and visibility floor (U5)"]
         a16_awaiting_decision_stays_expanded_under_rules,
-        #[ignore = "V2 pending phase 3: Markdown producer (L7)"]
         c38_streaming_markdown_converges_to_final,
         #[ignore = "V2 pending phase 6: regional damage observation (BMUX 15b)"]
         d6_wheel_scroll_repaints_regionally,
         #[ignore = "V2 pending phase 4: composer input (host); damage observation in phase 6"]
         d6_composer_typing_repaints_regionally,
-        #[ignore = "V2 pending phase 3: per-frame layout work counters (9.2)"]
         d4_scrolling_does_no_layout_work,
+        d4_prepend_measures_only_new_units,
         #[ignore = "driver: needs plugin interaction surfaces"]
         c37_interaction_placement_and_focus_restore,
         #[ignore = "driver: needs positioned shell captures"]

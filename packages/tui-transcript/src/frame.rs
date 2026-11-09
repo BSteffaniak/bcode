@@ -1,8 +1,12 @@
 //! Frame composition (spec sections 3.6 and 9, rules F1–F7).
 //!
-//! Phase 2 stub: identifiers and the per-frame clock only.
+//! Identifiers, the per-frame clock and the frame snapshot. The clock is the BMUX presentation
+//! clock (BMUX 8): one instant sampled per presentation and handed to every layout and paint
+//! context of the frame.
 
 use std::time::Instant;
+
+use bmux_tui::clock::PresentationClock;
 
 /// Identity of one prepared frame; recorded on commit (CK3).
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -17,10 +21,28 @@ impl FrameId {
 }
 
 /// The single clock sample of one frame (F2).
+///
+/// It converts to and from the BMUX [`PresentationClock`] (BMUX 8): the host samples the
+/// runtime's presentation clock once per presentation, prepares the frame with it, and the
+/// engine passes the same instant to BMUX layout and paint contexts.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct FrameClock {
     /// Frame time.
     pub now: Instant,
+}
+
+impl FrameClock {
+    /// The BMUX presentation clock carrying this frame's instant.
+    #[must_use]
+    pub const fn presentation(self) -> PresentationClock {
+        PresentationClock::new(self.now)
+    }
+}
+
+impl From<PresentationClock> for FrameClock {
+    fn from(clock: PresentationClock) -> Self {
+        Self { now: clock.now() }
+    }
 }
 
 /// Everything one frame presents, prepared once from engine state (F1).

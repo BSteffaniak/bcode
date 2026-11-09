@@ -1,75 +1,59 @@
-//! Lazy BMUX item source over transcript units (VP6, BMUX 6).
+//! Lazy BMUX item source over transcript units and their retained layouts (VP6, BMUX 6).
 //!
-//! The source exposes units in document order with their layout revisions; it builds a unit's
-//! component only when BMUX asks (measurement of a new or stale unit, or painting a visible
-//! one). Boundary state is a paint revision, never a layout revision (U3, L5).
+//! The source never lays anything out: [`VirtualItemSource::retained_layout`] hands BMUX the
+//! node the [`ItemLayoutCache`] measured, and [`VirtualItemSource::build`] wraps the retained
+//! component for painting and event routing. Boundary state and paint slots are paint
+//! revisions, never layout revisions (U3, L5).
 
-use bcode_session_view_models::TranscriptViewItem;
-use bmux_tui::component::Element;
+use bmux_tui::component::{Element, LayoutEnvironment, LayoutNode};
 use bmux_tui_components::virtual_list::VirtualItemSource;
 
-use crate::units::producers::{UnitContent, UnitProducer};
+use crate::layout::producers::common::{StatusRow, boundary_row};
+use crate::layout::{ActivityPhase, ItemLayout, ItemLayoutCache, RetainedItem};
 use crate::units::{UnitKey, UnitKind, Units};
 use crate::window::{BoundaryStatus, ResidentWindow};
 
-/// `VirtualItemSource` over the current units.
+/// `VirtualItemSource` over the current units and the layout cache.
 pub struct TranscriptItemSource<'a> {
     units: &'a Units,
-    items: &'a [TranscriptViewItem],
     window: &'a ResidentWindow,
-    producer: &'a dyn UnitProducer,
+    layouts: &'a ItemLayoutCache,
+    activity: ActivityPhase,
 }
 
 impl std::fmt::Debug for TranscriptItemSource<'_> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("TranscriptItemSource")
             .field("units", &self.units.len())
-            .field("items", &self.items.len())
+            .field("layouts", &self.layouts.len())
             .finish_non_exhaustive()
     }
 }
 
 impl<'a> TranscriptItemSource<'a> {
-    /// Create a source over units derived from `items`.
+    /// Create a source over `units` painted from `layouts`.
     #[must_use]
     pub const fn new(
         units: &'a Units,
-        items: &'a [TranscriptViewItem],
         window: &'a ResidentWindow,
-        producer: &'a dyn UnitProducer,
+        layouts: &'a ItemLayoutCache,
+        activity: ActivityPhase,
     ) -> Self {
         Self {
             units,
-            items,
             window,
-            producer,
+            layouts,
+            activity,
         }
     }
 
-    /// Everything the producer reads for one unit, if the unit exists.
+    /// The retained layout of a unit if it is current for the unit's revision and `width`.
     #[must_use]
-    pub fn content(&self, key: &UnitKey) -> Option<UnitContent<'a>> {
-        let units: &'a Units = self.units;
-        let unit = units.entry(key)?;
-        // Logarithmic per unit: building a visible unit never touches every resident item
-        // (spec 9.2, no O(resident units) work in prepare or paint).
-        let item = key.item_id().and_then(|id| units.item(self.items, id));
-        let boundary = match unit.kind {
-            UnitKind::Boundary(edge) => Some(self.window.boundary_status(edge)),
-            _ => None,
-        };
-        Some(UnitContent {
-            unit,
-            item,
-            boundary,
+    pub fn layout(&self, key: &UnitKey, width: u64) -> Option<&'a ItemLayout> {
+        let layouts: &'a ItemLayoutCache = self.layouts;
+        layouts.current(key).filter(|layout| {
+            layout.key.width == width && Some(layout.key.revision) == self.units.revision(key)
         })
-    }
-
-    /// Exact height of a unit at `width` (0 for an unknown unit).
-    #[must_use]
-    pub fn measure(&self, key: &UnitKey, width: u64) -> u64 {
-        self.content(key)
-            .map_or(0, |content| self.producer.measure(content, width))
     }
 }
 
@@ -95,21 +79,42 @@ impl VirtualItemSource<UnitKey> for TranscriptItemSource<'_> {
     }
 
     fn paint_revision(&self, index: usize) -> u64 {
-        match self
-            .units
-            .entry(&self.units.keys()[index])
-            .map(|unit| unit.kind)
-        {
+        let key = &self.units.keys()[index];
+        match self.units.entry(key).map(|unit| unit.kind) {
             Some(UnitKind::Boundary(edge)) => status_revision(self.window.boundary_status(edge)),
-            _ => 0,
+            _ => self
+                .layouts
+                .current(key)
+                .filter(|layout| !layout.geometry.paint_slots.is_empty())
+                .map_or(0, |_| {
+                    self.activity
+                        .spinner_frame
+                        .wrapping_add(self.activity.now_ms.unwrap_or(0))
+                }),
         }
     }
 
     fn build(&self, index: usize) -> Element<'_> {
         let key = &self.units.keys()[index];
-        let content = self
-            .content(key)
-            .expect("source index names a current unit");
-        self.producer.component(content)
+        if let Some(UnitKind::Boundary(edge)) = self.units.entry(key).map(|unit| unit.kind) {
+            // Paint-only status over the retained one-row layout (U3).
+            return Element::new(boundary_row(edge, self.window.boundary_status(edge)));
+        }
+        self.layouts.current(key).map_or_else(
+            // Never reached for resident units: every unit is measured in the update that made
+            // it resident (L9). An empty row keeps an inconsistent frame paintable.
+            || Element::new(StatusRow::new(bmux_tui::text::Line::raw(""))),
+            |layout| Element::new(RetainedItem::new(layout, self.activity)),
+        )
+    }
+
+    fn retained_layout(
+        &self,
+        index: usize,
+        width: u64,
+        _environment: LayoutEnvironment,
+    ) -> Option<&LayoutNode> {
+        self.layout(&self.units.keys()[index], width)
+            .map(|layout| &layout.node)
     }
 }

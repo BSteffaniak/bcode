@@ -1,23 +1,35 @@
 //! Scenario driver for the V2 transcript engine (`bcode_tui_transcript`).
 //!
-//! Phase 2 drives the engine façade headlessly: no host wiring exists yet (spec section 12).
+//! Phases 2–3 drive the engine façade headlessly: no host wiring exists yet (spec section 12).
 //! History requests the engine issues become pending scenario requests; inputs reach the
-//! engine as BMUX terminal events routed to the transcript list (wheel) or as the navigation
-//! intents the host keymap will produce for the default transcript keys; frames are prepared,
-//! painted through BMUX into a buffer and committed, and observations are read from the painted
-//! rows exactly as for V1 (marker tokens per row).
+//! engine as BMUX terminal events routed to the transcript list (wheel), as the navigation
+//! intents the host keymap will produce for the default transcript keys, or as clicks hit-tested
+//! against the committed frame's retained item geometry; frames are prepared, painted through
+//! BMUX into a buffer and committed, and observations are read from the painted rows exactly as
+//! for V1 (marker tokens per row).
+//!
+//! Units are rendered by the engine's standard producers (structure v2, chrome, Markdown, tools,
+//! groups) with the bundled default theme, the theme's structural layers and its motion level,
+//! as the host will configure them; the fake session embeds marker tokens in message and tool
+//! text, so markers stay observable through item chrome.
 //!
 //! The transcript region is the whole terminal: there is no composer, status row or latest bar
-//! before phase 4. Inputs that need the host (composer typing, focus mode, pointer gestures,
-//! presentation rules, clipboard) panic with the missing capability, so scenarios that need
-//! them fail loudly instead of passing vacuously.
+//! before phase 4. Inputs that need the host (composer typing, focus mode, drag gestures,
+//! selection) panic with the missing capability, so scenarios that need them fail loudly
+//! instead of passing vacuously.
 
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use bcode_presentation_policy::models::PresentationRule;
 use bcode_session_models::SessionEvent;
+use bcode_tui_theme::definition::{ResolvedThemeDefinition, ThemeCatalog, ThemeSelection};
 use bcode_tui_transcript::engine::{EngineUpdate, HostRequest, TranscriptEngine};
-use bcode_tui_transcript::frame::FrameClock;
+use bcode_tui_transcript::frame::{FrameClock, FrameSnapshot};
+use bcode_tui_transcript::layout::RenderConfig;
 use bcode_tui_transcript::navigation::{InputSource, MotionConfig, NavIntent, Placement};
+use bcode_tui_transcript::scenario::LayoutWorkCounters;
+use bcode_tui_transcript::units::structure::PolicyLayers;
 use bcode_tui_transcript::viewport::ViewportGeometry;
 use bcode_tui_transcript::window::{
     HistoryPageResult, HistoryWindowResult, LiveInput, PageCaps, PageDirection, PageRequest,
@@ -30,8 +42,8 @@ use bmux_tui::geometry::{Point, Rect};
 use bmux_tui::paint::PaintCx;
 
 use super::driver::{
-    HistoryRequest, HistoryResponse, PageLimits, PendingHistoryRequest, RequestId, ResidentSeed,
-    ScenarioEngine, ScenarioInput, ScenarioIntent, ScenarioSetting, ScenarioSetup,
+    HistoryRequest, HistoryResponse, LayoutWork, PageLimits, PendingHistoryRequest, RequestId,
+    ResidentSeed, ScenarioEngine, ScenarioInput, ScenarioIntent, ScenarioSetting, ScenarioSetup,
     TranscriptScenarioDriver, WheelDirection,
 };
 use super::frame::{CellRect, FocusObservation, ScenarioFrame};
@@ -46,6 +58,17 @@ const V2_PAGE_LIMITS: PageLimits = PageLimits {
 
 /// Events on each side of a timeline target before alignment (W8).
 const V2_AROUND_HALF_WINDOW: usize = 256;
+
+/// Theme the host selects by default (`[tui.theme] name`).
+const DEFAULT_THEME: &str = "terminal-native";
+
+/// The bundled default theme, resolved as the host resolves it without overlays.
+fn default_theme() -> Arc<ResolvedThemeDefinition> {
+    let resolved = ThemeCatalog::bundled()
+        .and_then(|catalog| catalog.resolve(&ThemeSelection::new(DEFAULT_THEME)))
+        .expect("the bundled default theme resolves");
+    Arc::new(resolved)
+}
 
 /// V2 engine under scenario control.
 pub struct V2Driver {
@@ -62,6 +85,14 @@ pub struct V2Driver {
     first_sequence: Option<u64>,
     /// Newest canonical sequence known to exist (setup plus live deliveries).
     last_sequence: Option<u64>,
+    /// Theme items render with; its structural layers and motion level apply too (X4).
+    theme: Arc<ResolvedThemeDefinition>,
+    /// Configured `[presentation]` rules (scenario settings).
+    config_rules: Vec<PresentationRule>,
+    /// `tui.reduce_motion`.
+    reduce_motion: bool,
+    /// Last committed frame; clicks are hit-tested against it.
+    committed: Option<FrameSnapshot>,
 }
 
 impl V2Driver {
@@ -74,6 +105,24 @@ impl V2Driver {
             self.next_request += 1;
             self.pending.push((RequestId(self.next_request), request));
         }
+    }
+
+    /// Recompile the structure policy from the theme layers and configured rules and apply it
+    /// as a configuration reload would.
+    fn apply_structure(&mut self) {
+        let (config, diagnostics) = PolicyLayers {
+            theme: Some(&self.theme),
+            config_rules: &self.config_rules,
+            ..PolicyLayers::default()
+        }
+        .compile_with_host_parts();
+        assert!(
+            diagnostics.is_empty(),
+            "scenario rules must compile cleanly: {diagnostics:?}"
+        );
+        let at = self.now();
+        let update = self.engine.set_structure_config(config, at);
+        self.record(update);
     }
 
     fn intent(&mut self, intent: NavIntent) {
@@ -175,10 +224,22 @@ impl TranscriptScenarioDriver for V2Driver {
     const ENGINE: ScenarioEngine = ScenarioEngine::V2;
 
     fn start(setup: &ScenarioSetup) -> Self {
+        let theme = default_theme();
+        let (structure, diagnostics) = PolicyLayers {
+            theme: Some(&theme),
+            ..PolicyLayers::default()
+        }
+        .compile_with_host_parts();
+        assert!(
+            diagnostics.is_empty(),
+            "theme layers compile: {diagnostics:?}"
+        );
         let engine = TranscriptEngine::new(
             ViewportGeometry::new(u64::from(setup.width), u64::from(setup.height)),
-            MotionConfig::default(),
-        );
+            MotionConfig::for_motion(theme.chrome.motion, false),
+        )
+        .with_structure_config(structure)
+        .with_render_config(RenderConfig::for_theme(Arc::clone(&theme)));
         let mut driver = Self {
             engine,
             width: setup.width,
@@ -189,6 +250,10 @@ impl TranscriptScenarioDriver for V2Driver {
             elapsed: Duration::ZERO,
             first_sequence: setup.session.events().first().map(|event| event.sequence),
             last_sequence: setup.session.last_sequence(),
+            theme,
+            config_rules: Vec::new(),
+            reduce_motion: false,
+            committed: None,
         };
         driver.seed(setup);
         driver
@@ -284,12 +349,23 @@ impl TranscriptScenarioDriver for V2Driver {
                 );
                 self.record(update);
             }
-            ScenarioInput::Click { .. }
-            | ScenarioInput::Press { .. }
+            ScenarioInput::Click { at } => {
+                // Press and release without movement activate the region under the pointer in
+                // the committed frame (X1). Gesture routing through selection is phase 6.
+                let snapshot = self
+                    .committed
+                    .clone()
+                    .expect("V2 driver: a click needs a committed frame");
+                let now = self.now();
+                let (update, _hit) =
+                    self.engine
+                        .click(&snapshot, u64::from(at.x), u64::from(at.y), now);
+                self.record(update);
+            }
+            ScenarioInput::Press { .. }
             | ScenarioInput::DragTo { .. }
             | ScenarioInput::Release { .. } => panic!(
-                "V2 driver: pointer gestures need the phase-4 host (latest bar) and phase-6 \
-                 selection and click routing"
+                "V2 driver: drag gestures need phase-6 selection and click routing (BMUX 13, 14)"
             ),
         }
     }
@@ -313,11 +389,14 @@ impl TranscriptScenarioDriver for V2Driver {
     }
 
     fn present(&mut self) -> ScenarioFrame {
-        let snapshot = self.engine.prepare_frame(FrameClock { now: self.now() });
+        let clock = FrameClock { now: self.now() };
+        let snapshot = self.engine.prepare_frame(clock);
         let area = Rect::new(0, 0, self.width, self.height);
         let mut buffer = Buffer::empty(area);
         let rows = {
             let mut frame = Frame::new(&mut buffer);
+            // One presentation clock per frame (BMUX 8), as the runtime presenter supplies it.
+            frame.set_clock(Some(clock.presentation()));
             self.engine
                 .paint_frame(&snapshot, &mut PaintCx::new(&mut frame));
             (0..self.height)
@@ -326,6 +405,9 @@ impl TranscriptScenarioDriver for V2Driver {
         };
         let update = self.engine.commit(snapshot.id);
         self.record(update);
+        let following_bottom = snapshot.following;
+        let motion_running = snapshot.motion_running;
+        self.committed = Some(snapshot);
         ScenarioFrame {
             index: 0,
             rows,
@@ -336,8 +418,8 @@ impl TranscriptScenarioDriver for V2Driver {
                 height: self.height,
             },
             latest_bar: None,
-            following_bottom: snapshot.following,
-            motion_running: snapshot.motion_running,
+            following_bottom,
+            motion_running,
             focus: FocusObservation::Composer,
             focused_target: None,
         }
@@ -352,20 +434,42 @@ impl TranscriptScenarioDriver for V2Driver {
         None
     }
 
+    /// V2 has no clipboard path before phase 6 (selection and copy), so nothing is ever written.
+    fn clipboard_writes(&self) -> Vec<String> {
+        Vec::new()
+    }
+
+    fn layout_work(&mut self) -> Option<LayoutWork> {
+        let LayoutWorkCounters {
+            markdown_parses,
+            highlights,
+            projections,
+            measurements,
+            producer_builds,
+        } = self.engine.take_layout_work();
+        Some(LayoutWork {
+            markdown_parses,
+            highlights,
+            projections,
+            measurements,
+            producer_builds,
+        })
+    }
+
     fn configure(&mut self, setting: &ScenarioSetting) {
         match setting {
             ScenarioSetting::ReducedMotion(reduce) => {
-                let motion = if *reduce {
-                    MotionConfig::INSTANT
-                } else {
-                    MotionConfig::default()
-                };
+                self.reduce_motion = *reduce;
+                let motion = MotionConfig::for_motion(self.theme.chrome.motion, self.reduce_motion);
                 let at = self.now();
                 let update = self.engine.set_motion(motion, at);
                 self.record(update);
             }
-            ScenarioSetting::PresentationRules(_) => {
-                panic!("V2 driver: presentation rules need phase-3 structure resolution")
+            ScenarioSetting::PresentationRules(rules) => {
+                let presentation = toml::from_str::<bcode_config::PresentationConfig>(rules)
+                    .unwrap_or_else(|error| panic!("invalid scenario rules: {error}"));
+                self.config_rules = presentation.rules;
+                self.apply_structure();
             }
             ScenarioSetting::Selection { .. } | ScenarioSetting::ClipboardFails(_) => {
                 panic!("V2 driver: selection and clipboard need phase 6")

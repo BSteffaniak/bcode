@@ -12,8 +12,8 @@ use bcode_session_models::SessionEventKind;
 
 use super::Scenario;
 use super::driver::{
-    CellPoint, RepaintObservation, ScenarioInput, ScenarioIntent, ScenarioSetting,
-    TranscriptScenarioDriver, WheelDirection,
+    CellPoint, HistoryRequestKind, LayoutWork, RepaintObservation, ScenarioInput, ScenarioIntent,
+    ScenarioSetting, TranscriptScenarioDriver, WheelDirection,
 };
 use super::frame::{FocusObservation, ScenarioFrame};
 use super::session::{Marker, ScenarioSession};
@@ -1070,12 +1070,71 @@ pub fn d6_composer_typing_repaints_regionally<D: TranscriptScenarioDriver>() {
     });
 }
 
-/// D4: steady scrolling does no parse, highlight or layout work for unchanged items.
-///
-/// Stub: the driver contract has no per-frame layout work observation yet.
+/// Layout work since the previous observation; fails when the driver cannot observe it.
+#[track_caller]
+fn layout_work<D: TranscriptScenarioDriver>(scenario: &mut Scenario<D>) -> LayoutWork {
+    scenario
+        .driver
+        .layout_work()
+        .unwrap_or_else(|| scenario.fail("driver: needs per-frame layout work counters"))
+}
+
+/// D4 (spec 9.2): steady scrolling over resident content does no parse, highlight,
+/// projection, build or measurement work, in updates or frames.
 pub fn d4_scrolling_does_no_layout_work<D: TranscriptScenarioDriver>() {
-    let scenario = attach_all::<D>(ScenarioSession::with_turns(20, 2), WIDTH, HEIGHT);
-    scenario.fail("driver: needs per-frame layout work counters");
+    let mut scenario = attach_all::<D>(ScenarioSession::with_turns(20, 2), WIDTH, HEIGHT);
+    let attached = layout_work(&mut scenario);
+    scenario.check(attached.measurements > 0, || {
+        format!("attaching measured nothing: {attached:?}")
+    });
+    for direction in [WheelDirection::Up, WheelDirection::Down] {
+        for _ in 0..4 {
+            scenario.wheel(direction, 1);
+            scenario.present();
+            scenario.advance(SETTLE);
+            scenario.present();
+            let work = layout_work(&mut scenario);
+            scenario.check(work.is_zero(), || {
+                format!("a scroll-only update or frame did layout work: {work:?}")
+            });
+        }
+    }
+}
+
+/// D4 (spec 9.2): incorporating an older page measures only the page's new units, and the
+/// frames around it do no work.
+pub fn d4_prepend_measures_only_new_units<D: TranscriptScenarioDriver>() {
+    let session = ScenarioSession::with_turns(60, 2);
+    let mut scenario = Scenario::<D>::attach_latest(session, 20, WIDTH, HEIGHT);
+    scenario.present();
+    let _attached = layout_work(&mut scenario);
+    if scenario.pending_of(HistoryRequestKind::Older).is_none()
+        && scenario
+            .wheel_until_request(WheelDirection::Up, HistoryRequestKind::Older, 200)
+            .is_none()
+    {
+        scenario.fail("scrolling up never requested an older page");
+    }
+    let scrolled = layout_work(&mut scenario);
+    scenario.check(scrolled.is_zero(), || {
+        format!("scrolling up to the boundary did layout work: {scrolled:?}")
+    });
+    let response = scenario
+        .complete_kind(HistoryRequestKind::Older)
+        .unwrap_or_else(|| scenario.fail("no older page pending"));
+    let new_items = u64::try_from(response.events.len()).unwrap_or(u64::MAX);
+    let page = layout_work(&mut scenario);
+    scenario.check(
+        page.measurements > 0
+            && page.measurements <= new_items
+            && page.producer_builds == page.measurements,
+        || format!("the page of {new_items} items did not measure only new units: {page:?}"),
+    );
+    scenario.present();
+    let frame = layout_work(&mut scenario);
+    scenario.check(frame.is_zero(), || {
+        format!("the frame after the page did layout work: {frame:?}")
+    });
 }
 
 // ---------------------------------------------------------------------------------------------

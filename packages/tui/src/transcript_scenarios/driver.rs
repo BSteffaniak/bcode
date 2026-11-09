@@ -291,6 +291,12 @@ pub trait TranscriptScenarioDriver: Sized {
         None
     }
 
+    /// Item layout work performed since the previous call (updates and frames alike), then
+    /// reset; `None` when the engine does not count it (spec 9.2, D4).
+    fn layout_work(&mut self) -> Option<LayoutWork> {
+        None
+    }
+
     /// Rows the focused transcript unit-focus target occupies in the last presented frame,
     /// relative to the transcript viewport's top row (`0`). The range is half-open and may
     /// extend above (`start < 0`) or below the viewport. `None` when no target is focused.
@@ -321,6 +327,33 @@ pub enum ScenarioSetting {
     /// Make subsequent clipboard writes fail (`true`) or succeed (`false`). Not a configuration
     /// key: it scripts the environment's clipboard.
     ClipboardFails(bool),
+}
+
+/// Item layout work an engine performed (spec 9.2 `LayoutWorkCounters`, D4).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct LayoutWork {
+    /// Markdown source parses.
+    pub markdown_parses: u64,
+    /// Syntax highlighting runs.
+    pub highlights: u64,
+    /// Markdown projections built.
+    pub projections: u64,
+    /// Unit measurements.
+    pub measurements: u64,
+    /// Item component builds.
+    pub producer_builds: u64,
+}
+
+impl LayoutWork {
+    /// Whether no work of any kind was performed.
+    #[must_use]
+    pub const fn is_zero(&self) -> bool {
+        self.markdown_parses == 0
+            && self.highlights == 0
+            && self.projections == 0
+            && self.measurements == 0
+            && self.producer_builds == 0
+    }
 }
 
 /// How much of the terminal the last presented frame repainted.

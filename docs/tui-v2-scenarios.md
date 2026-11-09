@@ -19,8 +19,8 @@ required by [`tui-v2-architecture.md`](tui-v2-architecture.md), not what V1 curr
   * `scenarios.rs` holds the scenario definitions, each a generic `fn name<D: TranscriptScenarioDriver>()`.
   * `v1.rs` drives the real `BcodeRuntimeModel` through `Program::update` and the production
     root presenter.
-  * `v2.rs` drives the `bcode_tui_transcript` engine façade headlessly (phase 2; see "V2 driver"
-    below).
+  * `v2.rs` drives the `bcode_tui_transcript` engine façade headlessly with its standard
+    producers (phases 2–3; see "V2 driver" below).
 * Commands:
   * Run the active suite: `cargo test -p bcode_tui --lib transcript_scenarios`
   * Run one engine: `cargo test -p bcode_tui --lib transcript_scenarios::v2` (or `::v1`)
@@ -117,7 +117,7 @@ Notes:
 | `c23_reader_survives_page_and_live_append_before_frame` | C23, N11, C28 | pass | pass | — |
 | `c24_width_change_keeps_source_line_at_top` | C24 | pass | pass (see note) | — |
 | `c25_structural_insertion_keeps_reading_position` | C25 | pass | pass | — |
-| `c25_collapse_above_keeps_reading_position` | C25 | pass | pending-ignored (phase 3: presentation rules (structure resolution, U5)) | Collapse is applied through structural rules (`kind = "tool"` collapsed). The `alt+d` cycle would collapse the reading item too. |
+| `c25_collapse_above_keeps_reading_position` | C25 | pass | pass | Collapse is applied through structural rules (`kind = "tool"` collapsed). The `alt+d` cycle would collapse the reading item too. |
 | `c26_runtime_work_events_do_not_move_final_response` | C26, T23 | pass | pass | — |
 | `c27_repeated_presentation_is_idempotent` | C27, CK1 | pass | pending-ignored (phase 4: latest bar (F6)) | — |
 | `c27_failed_presentation_does_not_commit_navigation` | C27, CK2, CK3 | fail-ignored | stub-ignored | Stub. The driver cannot inject a presentation failure (`driver: needs presentation failure injection`). |
@@ -143,13 +143,15 @@ focus mode, the visibility floor, streaming Markdown and repaint scope. Targets 
 unique text in the committed frame (tool output tokens such as `ALPHAOUT1`, header text such as
 `Tool result`), so no scenario reads hit regions.
 
-These scenarios use four additive driver capabilities from `driver.rs`:
+These scenarios use five additive driver capabilities from `driver.rs`:
 
 * Press, drag and release inputs: `ScenarioInput::Press`, `DragTo` and `Release`.
 * `configure(&ScenarioSetting)`: presentation rules, the `[tui.selection]` copy policy,
   `tui.reduce_motion`, and a scripted clipboard failure.
 * `clipboard_writes()`: the text written to the clipboard so far.
 * `last_repaint()`: whether the last frame painted the whole surface or only damaged regions.
+* `layout_work()`: item layout work since the previous call (spec 9.2 `LayoutWorkCounters`);
+  `None` when the engine does not count it.
 
 See "V1 driver and time" below for how the V1 driver keeps wall-clock V1 state on scenario
 time.
@@ -177,31 +179,39 @@ Status values also include `stub-ignored`: the scenario is ignored with
 | `c35_release_copies_and_clears_after_delay` | C35 | pass | pending-ignored (phase 6: transcript selection and copy) | — |
 | `c35_failed_copy_keeps_selection` | C35 | pass | pending-ignored (phase 6: transcript selection and copy policy) | — |
 | `c35_new_gesture_cancels_pending_clear` | C35 | pass | pending-ignored (phase 6: transcript selection and copy) | — |
-| `c35_click_without_drag_does_not_copy` | C35, X1 | pass | pending-ignored (phase 6: click routing through selection (BMUX 14)) | — |
-| `x1_click_toggles_tool_header_once_per_click` | X1 | pass | pending-ignored (phase 3: tool producers and disclosure) | — |
-| `x1_click_toggles_section_label` | X1 | pass | pending-ignored (phase 3: tool producers and disclosure) | — |
-| `x1_click_toggles_group_header` | X1, X3 | pass | pending-ignored (phase 3: presentation rules and group headers) | — |
-| `x1_drag_from_header_selects_without_toggling` | X1, C35 | pass | pending-ignored (phase 3: tool producers and disclosure) | — |
+| `c35_click_without_drag_does_not_copy` | C35, X1 | pass | pass (see note) | — |
+| `x1_click_toggles_tool_header_once_per_click` | X1 | pass | pass (see note) | — |
+| `x1_click_toggles_section_label` | X1 | pass | pass (see note) | — |
+| `x1_click_toggles_group_header` | X1, X3 | pass | pass (see note) | — |
+| `x1_drag_from_header_selects_without_toggling` | X1, C35 | pass | pending-ignored (phase 6: transcript selection (BMUX 13) and gesture routing (BMUX 14)) | — |
 | `x2_focus_mode_keys_walk_and_toggle_targets` | X2, FO7 | pass | pending-ignored (phase 4: transcript focus mode (alt+u, FO6)) | Covers `alt+u`, `j`, `k`, `h`, `l`, Enter, Space, `d`, `e`, `i` and Escape. `m` is not covered because its user-state write is an effect the driver drops. |
 | `x2_focus_walk_scrolls_targets_into_view` | X2, C32 | pass | pending-ignored (phase 4: transcript focus mode (alt+u, FO6)) | — |
-| `x3_collapsed_group_reveals_failed_member` | X3, A16 | pass | pending-ignored (phase 3: presentation rules and visibility floor (U5)) | — |
-| `a16_hidden_units_leave_marker_and_failed_stays_visible` | A16, X3 | pass | pending-ignored (phase 3: presentation rules and visibility floor (U5)) | — |
-| `a16_floor_applies_after_manual_toggles` | A16 | pass | pending-ignored (phase 3: tool producers and visibility floor (U5)) | — |
-| `a16_awaiting_decision_stays_expanded_under_rules` | A16 | pass | pending-ignored (phase 3: presentation rules and visibility floor (U5)) | — |
-| `c38_streaming_markdown_converges_to_final` | C38 | pass | pending-ignored (phase 3: Markdown producer (L7)) | — |
+| `x3_collapsed_group_reveals_failed_member` | X3, A16 | pass | pass | — |
+| `a16_hidden_units_leave_marker_and_failed_stays_visible` | A16, X3 | pass | pass | — |
+| `a16_floor_applies_after_manual_toggles` | A16 | pass | pass (see note) | — |
+| `a16_awaiting_decision_stays_expanded_under_rules` | A16 | pass | pass | — |
+| `c38_streaming_markdown_converges_to_final` | C38 | pass | pass | — |
 | `d6_wheel_scroll_repaints_regionally` | D6, F5 | fail-ignored | pending-ignored (phase 6: regional damage observation (BMUX 15b)) | V1 bug D-16. A wheel tick marks full damage. |
 | `d6_composer_typing_repaints_regionally` | D6, F5 | fail-ignored | pending-ignored (phase 4: composer input (host)) | V1 bug D-16. A printable key in the composer marks full damage. |
-| `d4_scrolling_does_no_layout_work` | D4 | stub-ignored | pending-ignored (phase 3: per-frame layout work counters (9.2)) | The driver has no per-frame layout-work observation. V1 drains its layout sync statistics inside `draw_chat_frame`. |
+| `d4_scrolling_does_no_layout_work` | D4, 9.2 | stub-ignored | pass | The V1 driver has no layout-work observation (`driver: needs per-frame layout work counters`). V1 drains its layout sync statistics inside `draw_chat_frame`. |
+| `d4_prepend_measures_only_new_units` | D4, 9.2 | stub-ignored | pass | As above. |
 | `c37_interaction_placement_and_focus_restore` | C37 | stub-ignored | stub-ignored | The driver cannot open plugin interaction surfaces. V1 builds them from tool exchanges only with the bundled-plugin features enabled. |
 | `c39_inline_shell_expansion` | C39 | stub-ignored | stub-ignored | The driver cannot produce positioned shell captures. |
 
 ## V2 driver
 
 `v2.rs` drives the engine façade (`bcode_tui_transcript::engine::TranscriptEngine`) without a
-host, as phase 2 specifies:
+host, as phases 2 and 3 specify:
 
 * The transcript region is the whole terminal. Before phase 4 there is no composer, status row,
   latest bar or focus mode, so `latest_bar` is always `None` and focus is always the composer.
+* Units are rendered by the engine's standard producers (`ProducerRegistry::standard`: message,
+  Markdown, tool, group, hidden-marker and plugin-visual producers) with the bundled default
+  theme (`terminal-native`). The structure policy is compiled with
+  `units::structure::PolicyLayers` from the theme's density and `[presentation]` layers plus the
+  configured rules, and scroll motion follows the theme's motion level
+  (`MotionConfig::for_motion`), as the host will configure them. The fake session embeds marker
+  tokens in message and tool text, so markers stay observable through item chrome.
 * The resident seed is answered as the engine's attach `Tail` window. History requests the engine
   issues become pending requests: pages ask for the per-request caps (16 items, 512 events, W6),
   `Around` asks for 256 events on each side (W8), and `Head`/`Tail` ask for 512 events (W10).
@@ -210,24 +220,40 @@ host, as phase 2 specifies:
   them as actions that become navigation intents (VP5). `pageup`/`pagedown`, `ctrl+up`/
   `ctrl+down` and `ctrl+home`/`ctrl+end` are translated into the intents the host keymap binds in
   every focus (FO5); any other key panics, because composer and focus keys need the phase-4 host.
-* Pointer gestures, presentation rules, selection settings and clipboard scripting panic with the
-  missing capability; `tui.reduce_motion` maps to the engine's motion configuration.
-* Frames are prepared, painted through BMUX into a buffer and committed; observations come from
-  the painted rows, exactly as for V1. Time moves only through `advance_clock`, which fires the
-  engine's navigation timers (grace, motion frames) in deadline order.
-* Units are rendered by the phase-2 plain-text producer (one row per source line, BMUX word
-  wrap, no item chrome).
+* A click is hit-tested against the committed frame (`TranscriptEngine::click`): the region
+  comes from the retained geometry of the unit painted at that row, so hits and painted cells
+  share one layout (B3, B7), and a disclosure region toggles its target with the visibility floor
+  applied (X1, A16). Press, drag and release panic: selection and gesture routing are phase 6
+  (BMUX 13, 14).
+* Presentation rules (`[[rules]]` in `[presentation]` syntax) recompile the structure policy and
+  apply it as a configuration reload would; `tui.reduce_motion` maps to the motion
+  configuration. Selection settings and clipboard scripting panic (phase 6). V2 has no clipboard
+  path before phase 6, so `clipboard_writes()` is always empty.
+* `layout_work()` reads and resets the engine's `LayoutWorkCounters`.
+* Frames are prepared, painted through BMUX into a buffer and committed; each frame carries one
+  BMUX presentation clock (BMUX 8) equal to the frame clock. Observations come from the painted
+  rows, exactly as for V1. Time moves only through `advance_clock`, which fires the engine's
+  navigation timers (grace, motion frames) in deadline order.
 
 Notes on V2 passes:
 
 * `c18_latest_bar_ignores_hidden_continuation_of_visible_entry` and
   `c18_jump_to_latest_after_live_entry_follows_and_clears_bar` pass on their navigation half; the
   latest-bar half is vacuous until phase 4 adds the bar.
-* `c24_width_change_keeps_source_line_at_top` passes with `Row` anchors because the plain-text
-  producer's marker lines (24 cells) do not wrap at the narrow width. Source anchors (P3,
-  BMUX 10) are a phase-3 deliverable; the scenario does not prove them yet.
+* `c24_width_change_keeps_source_line_at_top`: at the narrow width the Markdown marker lines wrap
+  (two rows each), so the reading line is kept through the source-backed anchors the Markdown
+  producer's source map provides (P3, C24), not through row offsets.
 * `fo5_page_up_scrolls_from_composer_focus` passes through the driver's key translation; the host
   keymap wiring that delivers Page Up from either focus is phase 4.
+* The X1 click scenarios and `a16_floor_applies_after_manual_toggles` pass through the engine's
+  click activation on retained hit regions. Their "a click neither selects nor copies" halves,
+  and `c35_click_without_drag_does_not_copy` as a whole, are vacuous until phase 6 adds
+  selection and copy; phase 6 also replaces the driver's direct click with BMUX click activation
+  through selection (BMUX 14).
+* `d4_scrolling_does_no_layout_work` and `d4_prepend_measures_only_new_units` are the phase-3
+  `LayoutWorkCounters` exit criteria (9.2): scroll-only updates and frames do no parse,
+  highlight, projection, build or measurement work, and an older page measures at most its new
+  units.
 
 ## V1 driver and time
 

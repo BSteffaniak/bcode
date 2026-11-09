@@ -11,25 +11,36 @@ repository  = { workspace = true }
 version     = { workspace = true }
 
 [dependencies]
+bcode_markdown_render     = { workspace = true }
+bcode_presentation_policy = { workspace = true }
 bcode_session_models      = { workspace = true }
 bcode_session_view        = { workspace = true }
 bcode_session_view_models = { workspace = true }
+bcode_syntax_render       = { workspace = true }
+bcode_tui_components      = { workspace = true, features = ["chrome", "transcript"] }
+bcode_tui_theme           = { workspace = true }
 bmux_tui                  = { workspace = true }
 bmux_tui_components       = { workspace = true, features = ["resident-window", "virtual-list"] }
 serde_json                = { workspace = true }
 
 [dev-dependencies]
 proptest = { workspace = true }
+toml     = { workspace = true }
 
 [features]
 default = []
 fail-on-warnings = [
+    "bcode_markdown_render/fail-on-warnings",
+    "bcode_presentation_policy/fail-on-warnings",
     "bcode_session_models/fail-on-warnings",
     "bcode_session_view/fail-on-warnings",
     "bcode_session_view_models/fail-on-warnings",
+    "bcode_syntax_render/fail-on-warnings",
+    "bcode_tui_components/fail-on-warnings",
+    "bcode_tui_theme/fail-on-warnings",
     "bmux_tui/fail-on-warnings",
     "bmux_tui_components/fail-on-warnings",
 ]
 # Deterministic fixtures for scenario drivers in downstream tests: module `scenario` (layout
-# work counters) and `units::producers::FixtureProducer`.
+# work counters) and `layout::producers::testing` (fixture and plain-text producers).
 testing = []
