@@ -87,6 +87,7 @@ Start with the [plugin guide](docs/plugins.md) and the [dynamic plugin example](
 ### Start here
 
 * [Getting started](docs/getting-started.md)
+* [OpenCode Go: API-key setup and billing](docs/opencode-go.md)
 * CLI and configuration references are generated from Bcode's command tree and Rust schema; [Getting started](docs/getting-started.md#configuration) shows how to build them locally.
 * [TUI keybindings](docs/tui-keybindings.md)
 

@@ -25,13 +25,27 @@ pub fn is_xai_provider(base_url: Option<&str>, dialect: Option<&str>) -> bool {
         .is_some_and(|url| url.host_str() == Some("api.x.ai"))
 }
 
+#[cfg(test)]
 pub fn recommended_xai_model(
     catalog: &ModelCatalog,
     dialect: super::OpenAiCompatibleDialect,
 ) -> Option<String> {
-    let provider = catalog.provider("xai")?;
-    let target = ModelSupportTarget::new("xai", "api_key", dialect.metadata_value(), Some("bcode"));
-    let models = catalog.provider_models_for_support_target("xai", &target, false);
+    recommended_model(catalog, "xai", dialect)
+}
+
+fn recommended_model(
+    catalog: &ModelCatalog,
+    provider_id: &str,
+    dialect: super::OpenAiCompatibleDialect,
+) -> Option<String> {
+    let provider = catalog.provider(provider_id)?;
+    let target = ModelSupportTarget::new(
+        provider_id,
+        "api_key",
+        dialect.metadata_value(),
+        Some("bcode"),
+    );
+    let models = catalog.provider_models_for_support_target(provider_id, &target, false);
     provider
         .default_model_id
         .iter()
@@ -54,21 +68,24 @@ pub fn offline_models_with_catalog(
     let ids = model_ids_with_selected(&settings.model_ids, selected);
     let preferred = selected.or(settings.default_model.as_deref());
     let mut configured = model_infos_from_ids_without_catalog(&ids, preferred);
-    if catalog_provider_id(settings) != Some("xai") {
+    let Some(provider_id @ ("xai" | "opencode-go")) = catalog_provider_id(settings) else {
         return configured;
-    }
+    };
     for model in &mut configured {
         model.capabilities.clear();
+        if provider_id == "opencode-go" {
+            model.cache = bcode_model::ModelCacheInfo::default();
+        }
     }
     let mut models = if let Some(catalog) = catalog {
         let target = ModelSupportTarget::new(
-            "xai",
+            provider_id,
             "api_key",
             settings.dialect.metadata_value(),
             Some("bcode"),
         );
         catalog.merge_provider_models_for_target(
-            "xai",
+            provider_id,
             configured,
             !settings.model_ids_are_explicit,
             Some(&target),
@@ -76,7 +93,8 @@ pub fn offline_models_with_catalog(
     } else {
         configured
     };
-    let recommended = catalog.and_then(|catalog| recommended_xai_model(catalog, settings.dialect));
+    let recommended =
+        catalog.and_then(|catalog| recommended_model(catalog, provider_id, settings.dialect));
     let default = preferred.or(recommended.as_deref());
     for model in &mut models {
         model.is_default = default == Some(model.model_id.as_str());
@@ -90,15 +108,29 @@ pub fn merge_live(
     items: Vec<ModelResponseItem>,
     catalog: Option<&ModelCatalog>,
 ) -> Vec<ModelInfo> {
+    let provider_id = catalog_provider_id(settings).unwrap_or("xai");
+    // Free promotional models are not offered to third-party agents. Preserve
+    // explicit selections already present in the baseline, but do not advertise them.
+    let items = if provider_id == "opencode-go" {
+        items
+            .into_iter()
+            .filter(|item| !item.id.ends_with("-free"))
+            .collect()
+    } else {
+        items
+    };
     // An ID-only response cannot establish price, context, or tool support.
     let mut live = model_infos_from_items_without_catalog(items, None);
     for model in &mut live {
         model.is_default = false;
         model.capabilities.clear();
+        if provider_id == "opencode-go" {
+            model.cache = bcode_model::ModelCacheInfo::default();
+        }
         model.metadata_source = Some(ModelMetadataSource::ProviderLive);
     }
     let target = ModelSupportTarget::new(
-        "xai",
+        provider_id,
         "api_key",
         settings.dialect.metadata_value(),
         Some("bcode"),
@@ -106,7 +138,7 @@ pub fn merge_live(
     for model in live {
         let model = catalog.map_or_else(
             || model.clone(),
-            |catalog| catalog.enrich_model_for_target("xai", model.clone(), &target),
+            |catalog| catalog.enrich_model_for_target(provider_id, model.clone(), &target),
         );
         if let Some(existing) = baseline
             .iter_mut()
@@ -143,6 +175,107 @@ mod tests {
         settings.model_ids.clear();
         settings.model_ids_are_explicit = false;
         settings
+    }
+
+    #[test]
+    fn go_offline_baseline_preserves_selection_and_explicit_models() {
+        let catalog = ModelCatalog::new(bcode_model_catalog::load_embedded_catalog().unwrap());
+        let mut settings = xai_settings();
+        settings.catalog_provider_id = Some("opencode-go".into());
+        let models = offline_models_with_catalog(&settings, None, Some(&catalog));
+        assert_eq!(models.len(), 5);
+        assert_eq!(
+            models
+                .iter()
+                .find(|model| model.is_default)
+                .unwrap()
+                .model_id,
+            "glm-5.3-flash"
+        );
+        let selected =
+            offline_models_with_catalog(&settings, Some("fixture-unknown"), Some(&catalog));
+        let unknown = selected
+            .iter()
+            .find(|model| model.model_id == "fixture-unknown")
+            .unwrap();
+        assert!(unknown.is_default);
+        assert!(unknown.capabilities.is_empty());
+        assert!(unknown.context_window.is_none());
+        assert!(unknown.cache.capabilities.is_empty());
+        settings.model_ids_are_explicit = true;
+        settings.model_ids = vec!["kimi-k2.7-code".into()];
+        let explicit =
+            offline_models_with_catalog(&settings, Some("kimi-k2.7-code"), Some(&catalog));
+        assert_eq!(explicit.len(), 1);
+        assert!(explicit[0].is_default);
+    }
+
+    #[tokio::test]
+    async fn go_failed_live_discovery_keeps_offline_baseline_without_retry() {
+        let catalog = ModelCatalog::new(bcode_model_catalog::load_embedded_catalog().unwrap());
+        for (status, body) in [
+            (503, "unavailable"),
+            (200, "malformed"),
+            (200, r#"{"data":[]}"#),
+        ] {
+            let (url, worker) = fixture(status, body, Duration::ZERO);
+            let mut settings = xai_settings();
+            settings.catalog_provider_id = Some("opencode-go".into());
+            settings.base_url = url;
+            let baseline = offline_models_with_catalog(&settings, None, Some(&catalog));
+            let models = crate::resolve_model_candidates_with_catalog(
+                &settings,
+                "fixture",
+                None,
+                Some(&catalog),
+            )
+            .await
+            .unwrap();
+            assert_eq!(models, baseline);
+            assert_eq!(worker.join().unwrap(), 1);
+        }
+    }
+
+    #[test]
+    fn go_live_enrichment_is_supplementary_and_does_not_advertise_free_models() {
+        let catalog = ModelCatalog::new(bcode_model_catalog::load_embedded_catalog().unwrap());
+        let mut settings = xai_settings();
+        settings.catalog_provider_id = Some("opencode-go".into());
+        let baseline = offline_models_with_catalog(&settings, Some("glm-5.3"), Some(&catalog));
+        assert_eq!(
+            merge_live(&settings, baseline.clone(), vec![], Some(&catalog)),
+            baseline
+        );
+        let items = ["glm-5.3", "fixture-new-model", "beam-free"]
+            .into_iter()
+            .map(|id| ModelResponseItem {
+                id: id.into(),
+                created: None,
+                metadata: std::collections::BTreeMap::new(),
+            })
+            .collect();
+        let models = merge_live(&settings, baseline, items, Some(&catalog));
+        assert_eq!(models.len(), 6);
+        assert!(!models.iter().any(|model| model.model_id == "beam-free"));
+        let unknown = models
+            .iter()
+            .find(|model| model.model_id == "fixture-new-model")
+            .unwrap();
+        assert!(unknown.capabilities.is_empty());
+        assert!(unknown.context_window.is_none());
+        assert!(unknown.cache.capabilities.is_empty());
+        assert!(!unknown.is_default);
+        let known = models
+            .iter()
+            .find(|model| model.model_id == "glm-5.3")
+            .unwrap();
+        assert!(known.is_default);
+        assert_eq!(known.context_window, Some(1_000_000));
+        assert!(
+            known
+                .capabilities
+                .contains(&bcode_model::ModelCapability::ToolCalls)
+        );
     }
 
     fn read_fixture_headers(reader: &mut impl std::io::Read) -> std::io::Result<bool> {

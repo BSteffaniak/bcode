@@ -1,0 +1,133 @@
+# Small offline baseline from the public Go model list, verified 2026-11-09.
+# Listing and documented adapter support do not establish entitlement or inference success.
+provider_id = "opencode-go"
+display_name = "OpenCode Go"
+kind = "open_ai_compatible"
+website_url = "https://opencode.ai/docs/console/go/"
+default_model_id = "glm-5.3-flash"
+fallback_model_ids = ["gemini-4-argon", "kimi-k3.1-pro", "glm-5.3", "kimi-k2.7-code"]
+
+[models."glm-5.3-flash"]
+model_id = "glm-5.3-flash"
+display_name = "GLM-5.3-Flash"
+status = "stable"
+bcode_support = "supported"
+context_window = 1000000
+max_output_tokens = 131072
+documentation_url = "https://opencode.ai/docs/console/go/"
+notes = "Public Go listing documents tools and the chat-completions route. Account entitlement, workspace privacy settings and inference success are not verified. Cache behavior is not established by this entry."
+
+[models."glm-5.3-flash".capabilities]
+text_input = true
+text_output = true
+tool_use = true
+
+[[models."glm-5.3-flash".deployments]]
+provider = "opencode-go"
+auth_mode = "api_key"
+api_surface = "chat_completions"
+integration = "bcode"
+
+[models."glm-5.3-flash".source]
+metadata = "https://opencode.ai/inference/go/v1/models"
+last_verified_at = "2026-11-09T00:00:00Z"
+
+[models."glm-5.3"]
+model_id = "glm-5.3"
+display_name = "GLM-5.3"
+status = "stable"
+bcode_support = "supported"
+context_window = 1000000
+max_output_tokens = 131072
+documentation_url = "https://opencode.ai/docs/console/go/"
+notes = "Public Go listing documents tools and the chat-completions route. Account entitlement, workspace privacy settings and inference success are not verified. Cache behavior is not established by this entry."
+
+[models."glm-5.3".capabilities]
+text_input = true
+text_output = true
+tool_use = true
+
+[[models."glm-5.3".deployments]]
+provider = "opencode-go"
+auth_mode = "api_key"
+api_surface = "chat_completions"
+integration = "bcode"
+
+[models."glm-5.3".source]
+metadata = "https://opencode.ai/inference/go/v1/models"
+last_verified_at = "2026-11-09T00:00:00Z"
+
+[models."kimi-k2.7-code"]
+model_id = "kimi-k2.7-code"
+display_name = "Kimi K2.7 Code"
+status = "stable"
+bcode_support = "supported"
+context_window = 262144
+max_output_tokens = 262144
+documentation_url = "https://opencode.ai/docs/console/go/"
+notes = "Public Go listing documents tools and the chat-completions route. Account entitlement, workspace privacy settings and inference success are not verified. Cache behavior is not established by this entry."
+
+[models."kimi-k2.7-code".capabilities]
+text_input = true
+text_output = true
+tool_use = true
+
+[[models."kimi-k2.7-code".deployments]]
+provider = "opencode-go"
+auth_mode = "api_key"
+api_surface = "chat_completions"
+integration = "bcode"
+
+[models."kimi-k2.7-code".source]
+metadata = "https://opencode.ai/inference/go/v1/models"
+last_verified_at = "2026-11-09T00:00:00Z"
+
+[models."gemini-4-argon"]
+model_id = "gemini-4-argon"
+display_name = "Gemini 4 Argon"
+status = "stable"
+bcode_support = "supported"
+context_window = 1048576
+max_output_tokens = 65536
+documentation_url = "https://opencode.ai/docs/console/harnesses/"
+notes = "The public listing documents tools and limits on the native generate-content route. Harness documentation (https://opencode.ai/docs/console/harnesses/) states every API serves every paid and Go text model through translation. This chat-completions deployment uses that documented translation, not a verified inference. Account entitlement and cache behavior are not established."
+
+[models."gemini-4-argon".capabilities]
+text_input = true
+text_output = true
+tool_use = true
+
+[[models."gemini-4-argon".deployments]]
+provider = "opencode-go"
+auth_mode = "api_key"
+api_surface = "chat_completions"
+integration = "bcode"
+
+[models."gemini-4-argon".source]
+metadata = "https://opencode.ai/inference/go/v1/models"
+last_verified_at = "2026-11-09T00:00:00Z"
+
+[models."kimi-k3.1-pro"]
+model_id = "kimi-k3.1-pro"
+display_name = "Kimi K3.1 Pro"
+status = "stable"
+bcode_support = "supported"
+context_window = 1048576
+max_output_tokens = 131072
+documentation_url = "https://opencode.ai/docs/console/harnesses/"
+notes = "Public Go listing documents tools, limits and the chat-completions route. Account entitlement, workspace privacy settings and inference success are not verified. Cache behavior is not established by this entry."
+
+[models."kimi-k3.1-pro".capabilities]
+text_input = true
+text_output = true
+tool_use = true
+
+[[models."kimi-k3.1-pro".deployments]]
+provider = "opencode-go"
+auth_mode = "api_key"
+api_surface = "chat_completions"
+integration = "bcode"
+
+[models."kimi-k3.1-pro".source]
+metadata = "https://opencode.ai/inference/go/v1/models"
+last_verified_at = "2026-11-09T00:00:00Z"

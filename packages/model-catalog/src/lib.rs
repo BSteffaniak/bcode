@@ -34,6 +34,10 @@ const EMBEDDED_PROVIDER_CATALOGS: &[(&str, &str)] = &[
         include_str!("../../../catalog/models/providers/bedrock.toml"),
     ),
     (
+        "opencode-go.toml",
+        include_str!("../../../catalog/models/providers/opencode-go.toml"),
+    ),
+    (
         "xai.toml",
         include_str!("../../../catalog/models/providers/xai.toml"),
     ),

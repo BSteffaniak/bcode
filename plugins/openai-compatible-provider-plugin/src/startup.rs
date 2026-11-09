@@ -42,6 +42,12 @@ fn routing(request: &StartupRecommendationRequest) -> Option<Routing> {
             auth_mode: "api_key",
             support_auth_mode: "api_key",
         }),
+        ("opencode-go", "api_key") => Some(Routing {
+            base_url: super::opencode_go::BASE_URL,
+            dialect: "chat_completions",
+            auth_mode: "api_key",
+            support_auth_mode: "api_key",
+        }),
         ("xai", "api_key") => Some(Routing {
             base_url: DEFAULT_XAI_BASE_URL,
             dialect: "responses_api",
@@ -135,6 +141,7 @@ fn readiness(catalog: &ModelCatalog, request: &StartupReadinessRequest) -> Start
         "openai" => DEFAULT_BASE_URL,
         "openrouter" => "https://openrouter.ai/api/v1",
         "xai" => DEFAULT_XAI_BASE_URL,
+        "opencode-go" => super::opencode_go::BASE_URL,
         _ => return Unknown,
     };
     if endpoint.trim_end_matches('/') != known_endpoint {
@@ -164,7 +171,12 @@ fn readiness(catalog: &ModelCatalog, request: &StartupReadinessRequest) -> Start
         .values()
         .find(|entry| entry.model_id == request.model_id)
     else {
-        return Unavailable;
+        // Go's bundled catalog is a small offline baseline, not an exhaustive service list.
+        return if provider_id == "opencode-go" {
+            Unknown
+        } else {
+            Unavailable
+        };
     };
     if entry.status == CatalogModelStatus::Unavailable
         || entry.bcode_support == BcodeSupportStatus::Unsupported
@@ -239,6 +251,29 @@ fn recommend(
 mod tests {
     use super::*;
 
+    #[test]
+    fn go_unlisted_model_is_unknown_not_unavailable() {
+        let catalog = ModelCatalog::new(bcode_model_catalog::load_embedded_catalog().unwrap());
+        let model = readiness(
+            &catalog,
+            &StartupReadinessRequest {
+                model_id: "new-go-model".to_owned(),
+                settings: BTreeMap::from([
+                    (
+                        "base_url".to_owned(),
+                        super::super::opencode_go::BASE_URL.to_owned(),
+                    ),
+                    (
+                        bcode_model::CATALOG_PROVIDER_ID_SETTING.to_owned(),
+                        "opencode-go".to_owned(),
+                    ),
+                    ("dialect".to_owned(), "chat_completions".to_owned()),
+                ]),
+            },
+        );
+        assert_eq!(model, StartupModelReadiness::Unknown);
+    }
+
     fn request(provider: &str, method: &str) -> StartupRecommendationRequest {
         StartupRecommendationRequest {
             auth_provider_id: provider.to_owned(),
@@ -247,9 +282,32 @@ mod tests {
     }
 
     #[test]
+    fn go_startup_uses_catalog_identity_and_api_key_route_only() {
+        let catalog = ModelCatalog::new(bcode_model_catalog::load_embedded_catalog().unwrap());
+        let recommendation_request = request("opencode-go", "api_key");
+        let route = routing(&recommendation_request).unwrap();
+        let choice = recommend(&catalog, &recommendation_request, &route).unwrap();
+        assert_eq!(choice.provider_plugin_id, PROVIDER_ID);
+        assert_eq!(choice.model_id, "glm-5.3-flash");
+        assert_eq!(
+            choice.settings["base_url"],
+            super::super::opencode_go::BASE_URL
+        );
+        assert_eq!(choice.settings["dialect"], "chat_completions");
+        assert_eq!(choice.settings["auth_mode"], "api_key");
+        assert_eq!(
+            choice.settings[bcode_model::CATALOG_PROVIDER_ID_SETTING],
+            "opencode-go"
+        );
+        assert!(routing(&request("opencode-go", "device")).is_none());
+        assert!(routing(&request("opencode-go", "chatgpt")).is_none());
+    }
+
+    #[test]
     fn startup_choices_are_recommendation_first_and_ready() {
         for (provider, method) in [
             ("xai", "api_key"),
+            ("opencode-go", "api_key"),
             ("openai", "api_key"),
             ("openai", "device"),
         ] {

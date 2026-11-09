@@ -15,6 +15,7 @@ mod discovery;
 pub mod history;
 mod model_availability;
 mod model_observation;
+mod opencode_go;
 mod refresh;
 mod startup;
 
@@ -473,6 +474,15 @@ fn register_auth_providers(registrar: AuthRegistrar) -> Result<(), PluginError> 
     for contribution in [
         AuthProviderContribution {
             schema_version: AUTH_PROVIDER_CONTRIBUTION_SCHEMA_VERSION,
+            provider_id: "opencode-go".to_owned(),
+            display_name: "OpenCode Go".to_owned(),
+            methods: vec![api_key_auth_method(
+                "BCODE_OPENCODE_GO_API_KEY",
+                "OpenCode Console API key",
+            )],
+        },
+        AuthProviderContribution {
+            schema_version: AUTH_PROVIDER_CONTRIBUTION_SCHEMA_VERSION,
             provider_id: "openai".to_owned(),
             display_name: "OpenAI".to_owned(),
             methods: vec![
@@ -512,6 +522,7 @@ fn api_key_discovery_sources(
 ) -> Vec<bcode_provider_auth_models::AuthCredentialSource> {
     use bcode_provider_auth_models::AuthCredentialSource;
     let (name, provider) = match storage_key {
+        "BCODE_OPENCODE_GO_API_KEY" => ("OPENCODE_GO_API_KEY", "opencode-go"),
         "BCODE_OPENAI_API_KEY" => ("OPENAI_API_KEY", "openai"),
         "BCODE_OPENROUTER_API_KEY" => ("OPENROUTER_API_KEY", "openrouter"),
         "BCODE_XAI_API_KEY" => ("XAI_API_KEY", "xai"),
@@ -541,6 +552,7 @@ fn api_key_discovery_sources(
 
 fn api_key_invocation_env(storage_key: &str) -> Vec<String> {
     let conventional = match storage_key {
+        "BCODE_OPENCODE_GO_API_KEY" => "OPENCODE_GO_API_KEY",
         "BCODE_OPENAI_API_KEY" => "OPENAI_API_KEY",
         "BCODE_OPENROUTER_API_KEY" => "OPENROUTER_API_KEY",
         "BCODE_XAI_API_KEY" => "XAI_API_KEY",
@@ -5067,7 +5079,7 @@ async fn send_chat_completion_request(
     );
     projection.context_representation = request_body.context_representation;
     let builder = prepare_http_body(
-        client.post(url).bearer_auth(api_key),
+        opencode_go::identify_request(client.post(url).bearer_auth(api_key), settings, request),
         bytes,
         request,
         projection,
@@ -5175,6 +5187,7 @@ async fn send_responses_request_to(
             .map_or(0, Vec::len),
     );
     projection.context_representation = context_representation;
+    let builder = opencode_go::identify_request(builder, settings, request);
     let mut builder = prepare_http_body(builder, bytes, request, projection, turn)?;
     if let AuthSettings::ChatGpt {
         account_id: Some(account_id),
@@ -7530,7 +7543,7 @@ impl OpenAiCompatibleProviderPlugin {
 fn catalog_hints(settings: &Settings) -> ModelCatalogHints {
     let provider_id = catalog_provider_id(settings).map(str::to_string);
     let support = provider_id.as_deref().and_then(|provider_id| {
-        matches!(provider_id, "openai" | "xai").then(|| ModelCatalogSupportHint {
+        matches!(provider_id, "openai" | "xai" | "opencode-go").then(|| ModelCatalogSupportHint {
             provider: provider_id.to_string(),
             auth_mode: if matches!(settings.auth, AuthSettings::ChatGpt { .. }) {
                 "chatgpt_subscription"
@@ -7588,7 +7601,7 @@ fn apply_provider_static_metadata(settings: &Settings, models: Vec<ModelInfo>) -
     models
         .into_iter()
         .map(|mut model| {
-            if provider_id != Some("xai") {
+            if !matches!(provider_id, Some("xai" | "opencode-go")) {
                 model.cache = openai_model_cache_info(settings.dialect);
             }
             if provider_id == Some("openai") {
@@ -7694,6 +7707,8 @@ fn catalog_provider_id(settings: &Settings) -> Option<&str> {
         Some(settings.dialect.metadata_value()),
     ) {
         Some("xai")
+    } else if opencode_go::is_go_endpoint(&settings.base_url) {
+        Some("opencode-go")
     } else if matches!(settings.auth, AuthSettings::ChatGpt { .. })
         || settings.base_url.contains("api.openai.com")
         || settings.base_url.contains("chatgpt.com")
@@ -8044,7 +8059,7 @@ async fn resolve_model_candidates_with_catalog(
     }
     // One bounded enrichment attempt; errors and empty lists retain the offline baseline.
     let live_items = fetch_provider_model_items(settings, api_key).await;
-    if catalog_provider_id(settings) == Some("xai") {
+    if matches!(catalog_provider_id(settings), Some("xai" | "opencode-go")) {
         return Ok(discovery::merge_live(
             settings,
             baseline,
@@ -8085,9 +8100,10 @@ async fn fetch_provider_model_items(
                 error.to_string(),
             )
         })?;
-    let url = format!("{}/models", settings.base_url.trim_end_matches('/'));
+    let url = opencode_go::models_url(settings);
     let response = client
         .get(url)
+        .header("User-Agent", concat!("bcode/", env!("CARGO_PKG_VERSION")))
         .bearer_auth(api_key)
         .send()
         .await
@@ -8378,29 +8394,18 @@ fn settings_for_context(context: &ProviderRequestContext) -> Settings {
     // This prevents Codex/ChatGPT subscription auth from being used for xAI models,
     // which would otherwise produce a 400 from the Codex backend.
     let has_xai_model = model_ids.iter().any(|m| is_xai_model_id(m));
-    let force_xai = has_xai_model;
+    let explicit_base_url = configured_base_url(context, &saved);
+    let go_endpoint = explicit_base_url
+        .as_deref()
+        .is_some_and(opencode_go::is_go_endpoint);
+    let force_xai = has_xai_model && !go_endpoint;
 
     let (mut auth, auth_diagnostics) = openai_auth_settings(&saved, context);
     if force_xai && matches!(auth, AuthSettings::ChatGpt { .. }) {
         // xAI models cannot use ChatGPT subscription auth; force Missing so we get a clear error.
         auth = AuthSettings::Missing;
     }
-    let base_url = first_context_or_env(
-        context,
-        "base_url",
-        "openai.base_url",
-        [
-            "BCODE_XAI_BASE_URL",
-            "XAI_BASE_URL",
-            "BCODE_OPENAI_BASE_URL",
-            "OPENAI_BASE_URL",
-        ],
-    )
-    .or_else(|| saved.values.get("BCODE_XAI_BASE_URL").cloned())
-    .or_else(|| saved.values.get("XAI_BASE_URL").cloned())
-    .or_else(|| saved.values.get("BCODE_OPENAI_BASE_URL").cloned())
-    .or_else(|| saved.values.get("OPENAI_BASE_URL").cloned())
-    .unwrap_or_else(|| {
+    let base_url = explicit_base_url.unwrap_or_else(|| {
         if xai_mode || force_xai {
             DEFAULT_XAI_BASE_URL.to_string()
         } else {
@@ -8487,11 +8492,80 @@ fn context_has_chatgpt_auth(context: &ProviderRequestContext) -> bool {
             .is_some_and(|mode| mode == "chatgpt")
 }
 
+fn configured_base_url(
+    context: &ProviderRequestContext,
+    saved: &SavedOpenAiAuth,
+) -> Option<String> {
+    first_context_or_env(
+        context,
+        "base_url",
+        "openai.base_url",
+        [
+            "BCODE_XAI_BASE_URL",
+            "XAI_BASE_URL",
+            "BCODE_OPENAI_BASE_URL",
+            "OPENAI_BASE_URL",
+        ],
+    )
+    .or_else(|| saved.values.get("BCODE_XAI_BASE_URL").cloned())
+    .or_else(|| saved.values.get("XAI_BASE_URL").cloned())
+    .or_else(|| saved.values.get("BCODE_OPENAI_BASE_URL").cloned())
+    .or_else(|| saved.values.get("OPENAI_BASE_URL").cloned())
+}
+
 #[allow(clippy::too_many_lines)]
 fn openai_auth_settings(
     saved: &SavedOpenAiAuth,
     context: &ProviderRequestContext,
 ) -> (AuthSettings, AuthDiagnostics) {
+    let go_endpoint = configured_base_url(context, saved)
+        .as_deref()
+        .is_some_and(opencode_go::is_go_endpoint);
+    let go_selected = context
+        .settings
+        .get(bcode_model::CATALOG_PROVIDER_ID_SETTING)
+        .is_some_and(|provider| provider == "opencode-go");
+    if go_endpoint || go_selected {
+        if !go_endpoint {
+            return (AuthSettings::Missing, AuthDiagnostics {
+                source: "missing".to_owned(), mode: "api_key".to_owned(),
+                detail: "OpenCode Go requires its dedicated HTTPS Go endpoint; refusing credentials for another route".to_owned(),
+            });
+        }
+        if let Some(auth) = &context.auth {
+            if let Some(key) = auth.credentials.get("api_key") {
+                return (
+                    AuthSettings::ApiKey(key.value.clone()),
+                    AuthDiagnostics {
+                        source: "runtime_auth".to_owned(),
+                        mode: "api_key".to_owned(),
+                        detail: "selected OpenCode Go API key".to_owned(),
+                    },
+                );
+            }
+        } else if let Some((source, key)) =
+            declared_api_key_env_value(context, "BCODE_OPENCODE_GO_API_KEY")
+        {
+            return (
+                AuthSettings::ApiKey(key),
+                AuthDiagnostics {
+                    source,
+                    mode: "api_key".to_owned(),
+                    detail: "OpenCode Go API key environment".to_owned(),
+                },
+            );
+        }
+        return (
+            AuthSettings::Missing,
+            AuthDiagnostics {
+                source: "missing".to_owned(),
+                mode: "api_key".to_owned(),
+                detail:
+                    "run `bcode auth login opencode-go` to configure an OpenCode Console API key"
+                        .to_owned(),
+            },
+        );
+    }
     let allow_saved_auth = context.auth.is_none();
     if let Some(auth) = &context.auth {
         if let Some(api_key) = auth.credentials.get("api_key") {
@@ -11837,25 +11911,44 @@ mod tests {
             })
             .collect::<Vec<_>>();
         drop(registrations);
-        assert_eq!(contributions.len(), 3);
-        assert_eq!(contributions[0].methods.len(), 3);
+        assert_eq!(contributions.len(), 4);
+        let go = contributions
+            .iter()
+            .find(|provider| provider.provider_id == "opencode-go")
+            .expect("OpenCode Go auth provider");
+        assert_eq!(go.display_name, "OpenCode Go");
         assert!(
-            contributions[0]
+            matches!(&go.methods[..], [AuthMethodContribution::SecretFields { method_id, fields, .. }]
+            if method_id == "api_key" && fields.len() == 1
+                && fields[0].storage_key == "BCODE_OPENCODE_GO_API_KEY")
+        );
+        let openai = contributions
+            .iter()
+            .find(|provider| provider.provider_id == "openai")
+            .expect("OpenAI auth provider");
+        assert_eq!(openai.methods.len(), 3);
+        assert!(
+            openai
                 .methods
                 .iter()
                 .any(|method| method.method_id() == "chatgpt")
         );
         assert!(
-            contributions[0]
+            openai
                 .methods
                 .iter()
                 .any(|method| method.method_id() == "device")
         );
-        for (contribution, provider_id, storage_key) in [
-            (&contributions[0], "openai", "BCODE_OPENAI_API_KEY"),
-            (&contributions[1], "openrouter", "BCODE_OPENROUTER_API_KEY"),
-            (&contributions[2], "xai", "BCODE_XAI_API_KEY"),
+        for (provider_id, storage_key) in [
+            ("openai", "BCODE_OPENAI_API_KEY"),
+            ("openrouter", "BCODE_OPENROUTER_API_KEY"),
+            ("xai", "BCODE_XAI_API_KEY"),
+            ("opencode-go", "BCODE_OPENCODE_GO_API_KEY"),
         ] {
+            let contribution = contributions
+                .iter()
+                .find(|provider| provider.provider_id == provider_id)
+                .expect("registered auth provider");
             contribution.validate().expect("valid contribution");
             assert_eq!(contribution.provider_id, provider_id);
             let AuthMethodContribution::SecretFields {
@@ -13961,7 +14054,7 @@ mod tests {
         assert!(build_chat_completion_request(&settings, &request, "model").is_err());
     }
 
-    fn test_request(messages: Vec<ModelMessage>) -> ModelTurnRequest {
+    pub fn test_request(messages: Vec<ModelMessage>) -> ModelTurnRequest {
         ModelTurnRequest {
             context_lineage: None,
             session_id: "00000000-0000-0000-0000-000000000000"
