@@ -10,6 +10,7 @@
 //!   accepted plugin visual rows.
 //! * Motion ([`MotionConfig`]): the theme's chrome motion level, instant under
 //!   `[tui] reduce_motion` (C22).
+//! * Scrollbar ([`ScrollbarMode`]): `[tui] transcript_scrollbar` (VP4, X6).
 //! * Structure configuration ([`StructureConfig`]): the presentation-policy layers (chrome
 //!   density, plugin manifest defaults, theme and profile sections, configuration, user state,
 //!   reasoning visibility) compiled against the host parts and the plugins' declared schemas,
@@ -25,7 +26,9 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::time::Instant;
 
-use bcode_config::{TuiDiffViewerConfig, TuiDiffViewerLayout, TuiThemeConfig};
+use bcode_config::{
+    TuiDiffViewerConfig, TuiDiffViewerLayout, TuiThemeConfig, TuiTranscriptScrollbar,
+};
 use bcode_plugin::PluginPresentationDeclaration;
 use bcode_plugin::presentation::PluginFactDeclaration;
 use bcode_presentation_policy::PolicyRegistry;
@@ -48,9 +51,20 @@ use bcode_tui_transcript::units::structure::item_facts::tool_arguments;
 use bcode_tui_transcript::units::structure::{
     PluginFactSource, PolicyLayers, ResolvedUnitPresentation, StructureConfig,
 };
+use bcode_tui_transcript::viewport::ScrollbarMode;
 
 use super::TranscriptV2Host;
 use crate::app::BmuxApp;
+
+/// The engine scrollbar of the `[tui] transcript_scrollbar` setting (VP4, X6).
+#[must_use]
+pub const fn scrollbar_mode(setting: TuiTranscriptScrollbar) -> ScrollbarMode {
+    match setting {
+        TuiTranscriptScrollbar::Off => ScrollbarMode::Off,
+        TuiTranscriptScrollbar::Overlay => ScrollbarMode::Overlay,
+        TuiTranscriptScrollbar::Gutter => ScrollbarMode::Gutter,
+    }
+}
 
 /// Largest arguments document scanned for declared facts; larger ones yield none.
 const MAX_FACT_ARGUMENT_BYTES: usize = 1024 * 1024;
@@ -137,6 +151,8 @@ impl TranscriptV2Host {
             self.absorb(update);
             changed = true;
         }
+
+        changed |= self.set_scrollbar(scrollbar_mode(app.tui_config().transcript_scrollbar), at);
 
         changed |= self.sync_structure(app, &theme, at);
 

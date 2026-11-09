@@ -13,6 +13,7 @@ pub mod driver;
 pub mod frame;
 pub mod interaction;
 pub mod navigation;
+pub mod paging;
 pub mod scenarios;
 pub mod session;
 pub mod startup;
@@ -170,6 +171,12 @@ impl<D: TranscriptScenarioDriver> Scenario<D> {
         response
     }
 
+    /// Deliver `response`, answered earlier from the canonical session, as the result of
+    /// `pending` without presenting: the daemon read it before later live events existed.
+    pub fn complete_with(&mut self, pending: &PendingHistoryRequest, response: HistoryResponse) {
+        self.driver.complete_request(pending.id, response);
+    }
+
     /// Answer the first pending request of `kind`, if any.
     pub fn complete_kind(&mut self, kind: HistoryRequestKind) -> Option<HistoryResponse> {
         let pending = self.pending_of(kind)?;
@@ -199,6 +206,23 @@ impl<D: TranscriptScenarioDriver> Scenario<D> {
     #[must_use]
     pub fn resident(&self) -> Option<(u64, u64)> {
         self.driver.resident_sequences()
+    }
+
+    /// Canonical events resident, when the driver reports it.
+    #[must_use]
+    pub fn resident_event_count(&self) -> Option<u64> {
+        self.driver.resident_event_count()
+    }
+
+    /// Resident-window operation work so far, when the driver counts it.
+    #[must_use]
+    pub fn window_work(&self) -> Option<driver::WindowWork> {
+        self.driver.window_work()
+    }
+
+    /// Apply one engine-neutral setting without presenting.
+    pub fn configure(&mut self, setting: &driver::ScenarioSetting) {
+        self.driver.configure(setting);
     }
 
     /// Fail with `message` and the last two committed frames.
@@ -461,6 +485,41 @@ mod v2_headless_engine {
         bug_b4_resident_jump_while_detached_lands_and_stays,
         c11_streaming_response_reveals_top_and_holds,
         c17_reflow_during_reveal_motion_keeps_target,
+    }
+}
+
+/// Resident window and paging scenarios in [`paging`] (phase 5) for the V2 engine in the
+/// application. V1 is not instantiated: the scenarios check V2's window-operation counters and
+/// resident ceiling, which V1 does not report (`docs/tui-v2-scenarios.md`).
+mod v2_paging {
+    super::transcript_scenarios! { super::v2::V2Driver; in paging;
+        x12_wheel_up_through_long_history_is_continuous,
+        x12_wheel_bursts_with_live_events_stay_continuous,
+        x12_wheel_down_from_session_start_returns_live,
+        phase5_paging_performs_no_full_rebuild,
+        phase5_tool_heavy_paging_after_a_jump_is_incremental,
+        w5_prefetch_requests_one_page_before_the_boundary,
+        bug_b5_timeline_window_is_bounded_and_turn_aligned,
+        w11_newer_page_reaching_tail_applies_buffered_live_events,
+        w11_live_buffer_overflow_rehydrates_live_state,
+        bug_b3_end_in_transcript_focus_after_deep_jump_returns_live,
+        x6_scrollbar_thumb_is_placed_within_the_whole_session,
+    }
+}
+
+/// Engine-level instantiation of the [`paging`] scenarios that need no host (no focus mode and
+/// no scrollbar, which the host paints and hit-tests).
+mod v2_headless_paging {
+    super::transcript_scenarios! { super::v2_headless::V2HeadlessDriver; in paging;
+        x12_wheel_up_through_long_history_is_continuous,
+        x12_wheel_bursts_with_live_events_stay_continuous,
+        x12_wheel_down_from_session_start_returns_live,
+        phase5_paging_performs_no_full_rebuild,
+        phase5_tool_heavy_paging_after_a_jump_is_incremental,
+        w5_prefetch_requests_one_page_before_the_boundary,
+        bug_b5_timeline_window_is_bounded_and_turn_aligned,
+        w11_newer_page_reaching_tail_applies_buffered_live_events,
+        w11_live_buffer_overflow_rehydrates_live_state,
     }
 }
 

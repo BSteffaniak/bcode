@@ -551,6 +551,7 @@ impl TranscriptScenarioDriver for V1Driver {
             focused_target: app
                 .focused_target_for_test()
                 .map(|target| format!("{target:?}")),
+            scrollbar: None,
         }
     }
 
@@ -597,6 +598,9 @@ impl TranscriptScenarioDriver for V1Driver {
                 config.selection.clear_delay_ms = *clear_delay_ms;
             }
             ScenarioSetting::ReducedMotion(reduce) => config.reduce_motion = *reduce,
+            ScenarioSetting::TranscriptScrollbar(_) => {
+                panic!("V1 driver: the transcript scrollbar setting is V2-only (X6)")
+            }
         }
         // The configuration reload path applies TUI settings to both owners.
         self.model.settings.apply_tui_config(&config);

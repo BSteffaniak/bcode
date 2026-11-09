@@ -46,9 +46,30 @@ use bmux_tui::paint::PaintCx;
 use super::driver::{
     HistoryRequest, HistoryResponse, LayoutWork, PageLimits, PendingHistoryRequest, RequestId,
     ResidentSeed, ScenarioEngine, ScenarioInput, ScenarioIntent, ScenarioSetting, ScenarioSetup,
-    TranscriptScenarioDriver, WheelDirection,
+    TranscriptScenarioDriver, WheelDirection, WindowWork,
 };
 use super::frame::{CellRect, FocusObservation, ScenarioFrame};
+
+/// The engine's window-operation counters as the engine-neutral observation.
+pub(super) const fn window_work(work: bcode_tui_transcript::window::WindowWork) -> WindowWork {
+    let bcode_tui_transcript::window::WindowWork {
+        replacements,
+        fallbacks,
+        prepends,
+        appends,
+        evictions,
+        events_reduced,
+        eviction_plans: _,
+    } = work;
+    WindowWork {
+        replacements,
+        fallbacks,
+        prepends,
+        appends,
+        evictions,
+        events_reduced,
+    }
+}
 
 /// Page sizing V2 asks for: filled to the per-request caps (W6, 11-P1).
 const V2_PAGE_LIMITS: PageLimits = PageLimits {
@@ -77,7 +98,9 @@ pub struct V2HeadlessDriver {
     engine: TranscriptEngine,
     width: u16,
     height: u16,
-    pending: Vec<(RequestId, HostRequest)>,
+    /// Requests not yet completed, with the newest resident sequence at issue (`LiveState`
+    /// reads after it, as the host's executor does).
+    pending: Vec<(RequestId, HostRequest, Option<u64>)>,
     next_request: u64,
     /// Origin of scenario time; only differences from it matter.
     origin: Instant,
@@ -103,9 +126,11 @@ impl V2HeadlessDriver {
     }
 
     fn record(&mut self, update: EngineUpdate) {
+        let resident_last = self.engine.window().last_sequence;
         for request in update.requests {
             self.next_request += 1;
-            self.pending.push((RequestId(self.next_request), request));
+            self.pending
+                .push((RequestId(self.next_request), request, resident_last));
         }
     }
 
@@ -190,7 +215,7 @@ impl V2HeadlessDriver {
         self.record(update);
     }
 
-    fn history_request(request: &HostRequest) -> HistoryRequest {
+    fn history_request(request: &HostRequest, resident_last: Option<u64>) -> HistoryRequest {
         match *request {
             HostRequest::Page(issued) => match issued.request {
                 PageRequest::Older { before_sequence } => HistoryRequest::Older {
@@ -214,9 +239,10 @@ impl V2HeadlessDriver {
                 WindowRequest::Tail => HistoryRequest::Tail {
                     max_events: PageCaps::WINDOW.max_events_scanned,
                 },
-                WindowRequest::LiveState => {
-                    panic!("V2 driver: live-state rehydration needs the phase-5 host")
-                }
+                WindowRequest::LiveState => HistoryRequest::LiveState {
+                    after_sequence: resident_last,
+                    max_events: PageCaps::PAGE.max_events_scanned,
+                },
             },
         }
     }
@@ -280,10 +306,10 @@ impl TranscriptScenarioDriver for V2HeadlessDriver {
     fn pending_requests(&self) -> Vec<PendingHistoryRequest> {
         self.pending
             .iter()
-            .filter(|(_, request)| self.engine.is_awaiting(request))
-            .map(|(id, request)| PendingHistoryRequest {
+            .filter(|(_, request, _)| self.engine.is_awaiting(request))
+            .map(|(id, request, resident_last)| PendingHistoryRequest {
                 id: *id,
-                request: Self::history_request(request),
+                request: Self::history_request(request, *resident_last),
             })
             .collect()
     }
@@ -292,9 +318,9 @@ impl TranscriptScenarioDriver for V2HeadlessDriver {
         let position = self
             .pending
             .iter()
-            .position(|(pending, _)| *pending == id)
+            .position(|(pending, _, _)| *pending == id)
             .expect("completed request must be pending");
-        let (_, request) = self.pending.remove(position);
+        let (_, request, _) = self.pending.remove(position);
         let at = self.now();
         let update = match request {
             HostRequest::Page(issued) => {
@@ -311,6 +337,21 @@ impl TranscriptScenarioDriver for V2HeadlessDriver {
                     unaligned: false,
                 };
                 self.engine.apply_page(&result, at)
+            }
+            HostRequest::Window(issued) if issued.request == WindowRequest::LiveState => {
+                // As the host's executor: the events after the resident tail only.
+                let result = HistoryWindowResult {
+                    generation: issued.generation,
+                    target: issued.request,
+                    last_available_sequence: (!response.has_newer)
+                        .then(|| response.events.last().map(|event| event.sequence))
+                        .flatten(),
+                    events: response.events,
+                    has_older: false,
+                    has_newer: response.has_newer,
+                    first_available_sequence: None,
+                };
+                self.engine.apply_window(&result, at)
             }
             HostRequest::Window(issued) => {
                 let result = HistoryWindowResult {
@@ -424,7 +465,16 @@ impl TranscriptScenarioDriver for V2HeadlessDriver {
             motion_running,
             focus: FocusObservation::Composer,
             focused_target: None,
+            scrollbar: None,
         }
+    }
+
+    fn window_work(&self) -> Option<WindowWork> {
+        Some(window_work(self.engine.window_work()))
+    }
+
+    fn resident_event_count(&self) -> Option<u64> {
+        Some(self.engine.window().event_count)
     }
 
     fn resident_sequences(&self) -> Option<(u64, u64)> {
@@ -475,6 +525,9 @@ impl TranscriptScenarioDriver for V2HeadlessDriver {
             }
             ScenarioSetting::Selection { .. } | ScenarioSetting::ClipboardFails(_) => {
                 panic!("V2 driver: selection and clipboard need phase 6")
+            }
+            ScenarioSetting::TranscriptScrollbar(_) => {
+                panic!("V2 headless driver: the scrollbar is painted and hit-tested by the host")
             }
         }
     }

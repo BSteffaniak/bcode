@@ -20,8 +20,13 @@ use bcode_session_view::SessionView;
 use bcode_session_view_models::{TranscriptChanges, TranscriptViewItem};
 use bmux_tui::component::{Component, Constraints, EventCx, LayoutCx};
 use bmux_tui::event::{Event, EventOutcome};
-use bmux_tui::geometry::Size;
+use bmux_tui::geometry::{Rect, Size};
 use bmux_tui::paint::PaintCx;
+use bmux_tui_components::scrollbar::ScrollbarStyles;
+use bmux_tui_components::scrollbar_layout::{
+    ScrollbarAxisLayoutMode, ScrollbarLayoutPolicy, scrollbar_layout,
+};
+use bmux_tui_components::virtual_list::{PositionEstimate as ListEstimate, VirtualListComponent};
 
 use crate::focus::{ChatFocus, FocusState};
 use crate::frame::{FrameClock, FrameId, FrameSnapshot};
@@ -47,8 +52,13 @@ use crate::window::{
 };
 use bcode_presentation_policy::models::Disclosure;
 
-/// Layout id of the transcript list component.
-const LIST_ID: &str = "transcript";
+/// Layout id of the transcript list component; also the id of the scroll hit region the
+/// list registers over its content.
+pub const LIST_ID: &str = "transcript";
+
+/// Narrowest transcript region that presents a scrollbar. A narrower region presents none,
+/// so the scrollbar never takes the only content column (VP4, X6).
+pub const MIN_SCROLLBAR_REGION_WIDTH: u64 = 2;
 
 /// The interactive region under a point of a prepared frame ([`TranscriptEngine::hit_test`]).
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -96,6 +106,15 @@ impl EngineUpdate {
     }
 }
 
+/// Scrollbar layout policy of the transcript list for `mode` (vertical only), as the list
+/// chrome lays it out.
+const fn list_scrollbar_policy(mode: ScrollbarMode) -> ScrollbarLayoutPolicy {
+    ScrollbarLayoutPolicy::new(
+        transcript_chrome(mode).scrollbar,
+        ScrollbarAxisLayoutMode::Hidden,
+    )
+}
+
 /// The V2 transcript engine.
 pub struct TranscriptEngine {
     session: SessionView,
@@ -109,6 +128,10 @@ pub struct TranscriptEngine {
     latest: LatestBar,
     geometry: ViewportGeometry,
     motion: MotionConfig,
+    /// Configured scrollbar of the transcript list (VP4, X6).
+    scrollbar: ScrollbarMode,
+    /// Scrollbar styles (paint only).
+    scrollbar_styles: ScrollbarStyles,
     producer: Box<dyn UnitProducer>,
     /// Presentation-policy structure units are derived with (U2, U5).
     structure: StructureResolver,
@@ -168,6 +191,8 @@ impl TranscriptEngine {
             latest: LatestBar::new(false, geometry),
             geometry,
             motion,
+            scrollbar: ScrollbarMode::Off,
+            scrollbar_styles: ScrollbarStyles::new(),
             producer,
             structure: StructureResolver::default(),
             render: RenderConfig::default(),
@@ -185,6 +210,15 @@ impl TranscriptEngine {
     #[must_use]
     pub fn with_structure_config(mut self, config: StructureConfig) -> Self {
         self.structure.set_config(config);
+        self
+    }
+
+    /// Return the engine with the transcript scrollbar `mode` (VP4, X6); a gutter narrows the
+    /// content geometry by its column.
+    #[must_use]
+    pub fn with_scrollbar(mut self, mode: ScrollbarMode) -> Self {
+        self.scrollbar = mode;
+        self.geometry = self.content_geometry();
         self
     }
 
@@ -245,6 +279,14 @@ impl TranscriptEngine {
         self.layouts.take_counters()
     }
 
+    /// Window-operation work since the engine was created: whole-window replacements, SD2
+    /// fallbacks, prepends, appends, evictions and reduced events (phase 5: paging performs no
+    /// full rebuild).
+    #[must_use]
+    pub const fn window_work(&self) -> crate::window::WindowWork {
+        self.window.work()
+    }
+
     /// The viewport projection.
     #[must_use]
     pub const fn viewport(&self) -> &TranscriptViewport {
@@ -279,6 +321,58 @@ impl TranscriptEngine {
     #[must_use]
     pub const fn now(&self) -> Option<Instant> {
         self.now
+    }
+
+    /// Configured transcript scrollbar (VP4, X6).
+    #[must_use]
+    pub const fn scrollbar(&self) -> ScrollbarMode {
+        self.scrollbar
+    }
+
+    /// Scrollbar presented at the current region width: the configured one, or
+    /// [`ScrollbarMode::Off`] while the region is narrower than [`MIN_SCROLLBAR_REGION_WIDTH`].
+    #[must_use]
+    pub const fn presented_scrollbar(&self) -> ScrollbarMode {
+        if self.latest.region().width < MIN_SCROLLBAR_REGION_WIDTH {
+            ScrollbarMode::Off
+        } else {
+            self.scrollbar
+        }
+    }
+
+    /// Presentation-only position of the resident rows within the whole session (W12): exact
+    /// resident rows, with rows before and after the window extrapolated from the session
+    /// bounds and the rows-per-event estimate. The scrollbar is drawn from it and scrollbar
+    /// fractions are mapped through it (the same estimate `JumpToFraction` inverts).
+    #[must_use]
+    pub fn position_estimate(&self) -> ListEstimate {
+        let estimate = self
+            .window
+            .summary()
+            .position_estimate(self.viewport.index().total_height());
+        ListEstimate {
+            before: estimate.rows_before_window,
+            resident: estimate.resident_rows,
+            after: estimate.rows_after_window,
+        }
+    }
+
+    /// Scrollbar track of a prepared frame in viewport cells, from the same BMUX scrollbar
+    /// layout the list is laid out with; `None` without a presented scrollbar. An overlay
+    /// track lies over the last content column.
+    #[must_use]
+    pub fn scrollbar_track(&self, snapshot: &FrameSnapshot) -> Option<Rect> {
+        let mode = self.presented_scrollbar();
+        if mode == ScrollbarMode::Off {
+            return None;
+        }
+        let size = self.list_size(snapshot.geometry.height);
+        scrollbar_layout(
+            Rect::new(0, 0, size.width, size.height),
+            list_scrollbar_policy(mode),
+        )
+        .vertical_scrollbar
+        .filter(|track| !track.is_empty())
     }
 
     /// Rows one mouse-wheel tick scrolls (list chrome, BMUX 1).
@@ -362,11 +456,9 @@ impl TranscriptEngine {
                 &self.layouts,
                 self.activity,
             );
-            let component =
-                self.viewport
-                    .component(LIST_ID, &source, &self.layouts, ScrollbarMode::Off);
+            let component = self.list_component(&source);
             let layout = component.layout(
-                Constraints::tight(self.terminal_size()),
+                Constraints::tight(self.list_size(self.geometry.height)),
                 &mut LayoutCx::with_clock(FrameClock { now: at }.presentation()),
             );
             component.event(event, &layout, &mut EventCx::new(&layout))
@@ -472,9 +564,9 @@ impl TranscriptEngine {
     pub fn resize(&mut self, geometry: ViewportGeometry, at: Instant) -> EngineUpdate {
         self.observe_time(at);
         // `geometry` is the full transcript region; the effective viewport excludes the
-        // latest-bar row while the bar is shown (F6).
+        // latest-bar row while the bar is shown (F6) and a scrollbar gutter (VP4).
         self.latest.set_region(geometry);
-        let geometry = self.latest.effective();
+        let geometry = self.content_geometry();
         let width_changed = geometry.width != self.geometry.width;
         self.geometry = geometry;
         if width_changed {
@@ -487,6 +579,30 @@ impl TranscriptEngine {
         let mut update = self.run_effects(effects);
         update.merge(self.settle(at));
         update
+    }
+
+    /// Set the transcript scrollbar (VP4, X6). A gutter scrollbar reserves a content column,
+    /// so switching to or from one re-measures resident units at the new content width (L9);
+    /// keyed anchors keep the reading position (P1).
+    pub fn set_scrollbar(&mut self, mode: ScrollbarMode, at: Instant) -> EngineUpdate {
+        self.observe_time(at);
+        if self.scrollbar == mode {
+            return EngineUpdate::default();
+        }
+        self.scrollbar = mode;
+        let mut update = self.apply_effective_geometry();
+        update.invalidated = true;
+        update.merge(self.settle(at));
+        update
+    }
+
+    /// Set the scrollbar styles (paint only). Returns whether they changed.
+    pub fn set_scrollbar_styles(&mut self, styles: ScrollbarStyles) -> bool {
+        if self.scrollbar_styles == styles {
+            return false;
+        }
+        self.scrollbar_styles = styles;
+        true
     }
 
     /// Change the motion configuration (reduced motion, C22). Under reduced motion a running
@@ -644,13 +760,8 @@ impl TranscriptEngine {
             &self.layouts,
             self.activity,
         );
-        let component =
-            self.viewport
-                .component(LIST_ID, &source, &self.layouts, ScrollbarMode::Off);
-        let size = Size::new(
-            u16::try_from(snapshot.geometry.width).unwrap_or(u16::MAX),
-            u16::try_from(snapshot.geometry.height).unwrap_or(u16::MAX),
-        );
+        let component = self.list_component(&source);
+        let size = self.list_size(snapshot.geometry.height);
         let layout = component.layout(
             Constraints::tight(size),
             &mut LayoutCx::with_clock(snapshot.clock.presentation()),
@@ -746,11 +857,46 @@ impl TranscriptEngine {
         self.now = Some(self.now.map_or(at, |now| now.max(at)));
     }
 
-    fn terminal_size(&self) -> Size {
+    /// Size the transcript list is laid out at: the full region width (content plus any
+    /// scrollbar gutter) by `height` rows.
+    fn list_size(&self, height: u64) -> Size {
         Size::new(
-            u16::try_from(self.geometry.width).unwrap_or(u16::MAX),
-            u16::try_from(self.geometry.height).unwrap_or(u16::MAX),
+            u16::try_from(self.latest.region().width).unwrap_or(u16::MAX),
+            u16::try_from(height).unwrap_or(u16::MAX),
         )
+    }
+
+    /// The effective viewport (F6) minus the columns the presented scrollbar reserves (VP4).
+    /// Units are measured at this width, which is the width the list lays its items out at.
+    pub(super) fn content_geometry(&self) -> ViewportGeometry {
+        let effective = self.latest.effective();
+        let width = u16::try_from(self.latest.region().width).unwrap_or(u16::MAX);
+        let reserved = width.saturating_sub(
+            scrollbar_layout(
+                Rect::new(0, 0, width, 1),
+                list_scrollbar_policy(self.presented_scrollbar()),
+            )
+            .content
+            .width,
+        );
+        ViewportGeometry::new(
+            effective.width.saturating_sub(u64::from(reserved)),
+            effective.height,
+        )
+    }
+
+    /// The transcript list over `source` with the presented scrollbar, its styles and the
+    /// position estimate (VP4, W12).
+    fn list_component<'a>(
+        &'a self,
+        source: &'a TranscriptItemSource<'a>,
+    ) -> VirtualListComponent<'a, UnitKey, TranscriptItemSource<'a>, crate::layout::SourcePosition>
+    {
+        let mode = self.presented_scrollbar();
+        self.viewport
+            .component(LIST_ID, source, &self.layouts, mode)
+            .chrome(transcript_chrome(mode).scrollbar_styles(self.scrollbar_styles))
+            .position_estimate(self.position_estimate())
     }
 
     /// Keyed position presented at `now` (a running motion is sampled, N7).
@@ -902,6 +1048,7 @@ impl TranscriptEngine {
             anchor: anchor.as_ref(),
             pinned: &pinned,
             deferred: self.nav.motion.is_some(),
+            resident_rows: self.viewport.index().total_height(),
         };
         let viewport = &self.viewport;
         let height = |key: &UnitKey| {
@@ -1025,3 +1172,5 @@ mod submission;
 
 #[cfg(test)]
 mod tests;
+#[cfg(test)]
+mod window_tests;

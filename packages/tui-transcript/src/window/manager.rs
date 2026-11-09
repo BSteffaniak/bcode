@@ -7,14 +7,17 @@
 //! page is in flight (W11), and evicts whole turns outside the protected band (W7). It performs
 //! no I/O and reads no clock.
 //!
-//! Before phase 5's `SessionView` window operations, results are incorporated by rebuilding the
-//! bounded history projection from the resident events and deriving [`TranscriptChanges`] with
-//! a keyed diff (SD5).
+//! Results are incorporated with the `SessionView` window operations (spec 3.1, SD1–SD7): an
+//! `Older` page is prepended from an isolated sub-projection, a `Newer` page is appended, eviction
+//! removes whole turns, and only window replacements (and the SD2 fallback for a page that cannot
+//! be spliced) reduce a whole window. Every operation reports its own [`TranscriptChanges`];
+//! [`WindowWork`] counts the work so tests can prove paging never rebuilds.
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
 use bcode_session_models::{SessionEvent, SessionLiveEvent};
 use bcode_session_view::SessionView;
+use bcode_session_view::window_ops::WindowOpError;
 use bcode_session_view_models::{TranscriptChanges, TranscriptViewItem};
 use bmux_tui_components::resident_window::{
     self as rw, EdgeAvailability, EdgeRows, EvictionBudget, EvictionInput, EvictionSides, ItemRows,
@@ -22,14 +25,38 @@ use bmux_tui_components::resident_window::{
     ResidentItem, RowDensity, SideDemand, ViewportPlacement, WeightCeiling, WindowSide,
 };
 
-use super::diff::DocumentMirror;
-use super::turns::{align_newer_page, align_older_page, align_window, is_safe_window_start};
+use super::turns::{align_newer_page, align_older_page, align_window_result, is_safe_window_start};
 use super::{
     HistoryPageResult, HistoryWindowResult, IssuedRequest, LIVE_BUFFER_BYTES, LIVE_BUFFER_EVENTS,
     PAGE_EVENTS, PageDirection, PageRequest, RESIDENT_CEILING_EVENTS, RESIDENT_MAX_EVENTS,
     RESIDENT_TARGET_EVENTS, ResidentWindow, WindowMode, WindowRequest, prefetch_rows,
 };
 use crate::units::{BoundaryEdge, UnitKey, Units};
+
+/// Window-operation work since the manager was created (spec 9.2; phase 5 exit: no full rebuild
+/// on paging).
+///
+/// `replacements` counts every whole-window reduction: `Head`/`Tail`/`Around` results and SD2
+/// fallbacks. Paging and eviction add to their own counters only, and `events_reduced` grows by
+/// the page's events alone (no resident replay).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash)]
+pub struct WindowWork {
+    /// Whole-window reductions (window results and SD2 fallbacks).
+    pub replacements: u64,
+    /// Pages that could not be spliced and fell back to a replacement (SD2, W4).
+    pub fallbacks: u64,
+    /// `Older` pages prepended without replay.
+    pub prepends: u64,
+    /// `Newer` pages appended without replay.
+    pub appends: u64,
+    /// Evictions applied to the projection.
+    pub evictions: u64,
+    /// Durable events handed to the reducer (pages, windows, live and buffered events).
+    pub events_reduced: u64,
+    /// Eviction plans computed (W7). An update whose eviction inputs equal those of the last
+    /// plan that found nothing to evict reuses that result instead of planning again.
+    pub eviction_plans: u64,
+}
 
 /// A live input for the attached session.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -105,8 +132,26 @@ pub struct EvictionContext<'a> {
     pub anchor: Option<&'a UnitKey>,
     /// Further units that must stay resident: motion target, selection endpoints.
     pub pinned: &'a [UnitKey],
-    /// Eviction is deferred (selection gesture or selection active, motion running).
+    /// Eviction is deferred (selection gesture or selection active, motion running). The W7a
+    /// ceiling still applies: a window above 1,536 events is trimmed back to the ceiling.
     pub deferred: bool,
+    /// Exact measured rows of the resident units. With the other inputs it identifies an
+    /// unchanged layout, so an eviction already found impossible is not planned again.
+    pub resident_rows: u64,
+}
+
+/// The inputs of the last eviction plan that found nothing to evict (W7).
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct EvictionProbe {
+    keys_revision: u64,
+    transcript_revision: u64,
+    last_extended: Option<PageDirection>,
+    viewport_top: u64,
+    viewport_height: u64,
+    resident_rows: u64,
+    anchor: Option<UnitKey>,
+    pinned: Vec<UnitKey>,
+    target: u64,
 }
 
 /// An eviction after application (W7, W9).
@@ -197,7 +242,7 @@ pub struct WindowManager {
     summary: ResidentWindow,
     keys: rw::ResidentWindow<u64>,
     events: BTreeMap<u64, SessionEvent>,
-    mirror: DocumentMirror,
+    work: WindowWork,
     replace: Option<(rw::RequestToken, WindowRequest)>,
     live_state: Option<u64>,
     buffer: Option<LiveBuffer>,
@@ -206,6 +251,8 @@ pub struct WindowManager {
     density: RowDensity,
     /// A window result has been incorporated (before that, availability is unknown).
     attached: bool,
+    /// Inputs of the last eviction plan that found nothing to evict.
+    no_eviction: Option<EvictionProbe>,
 }
 
 impl Default for WindowManager {
@@ -225,7 +272,7 @@ impl WindowManager {
             summary: ResidentWindow::new(),
             keys,
             events: BTreeMap::new(),
-            mirror: DocumentMirror::new(),
+            work: WindowWork::default(),
             replace: None,
             live_state: None,
             buffer: None,
@@ -233,6 +280,7 @@ impl WindowManager {
             last_extended: None,
             density: RowDensity::new(1.0),
             attached: false,
+            no_eviction: None,
         };
         manager.refresh();
         manager
@@ -274,10 +322,16 @@ impl WindowManager {
         self.summary.rows_per_event_estimate = self.density.value();
     }
 
-    /// Re-diff the document after a host-driven `SessionView` change outside the window
-    /// (for example a reasoning visibility toggle).
-    pub fn sync_document(&mut self, session: &SessionView) -> TranscriptChanges {
-        self.mirror.diff(&session.snapshot().transcript, None)
+    /// Window-operation work since the manager was created.
+    #[must_use]
+    pub const fn work(&self) -> WindowWork {
+        self.work
+    }
+
+    /// Drain the item changes of a host-driven `SessionView` change outside the window
+    /// operations (for example a reasoning visibility toggle).
+    pub fn sync_document(&mut self, session: &mut SessionView) -> TranscriptChanges {
+        session.drain_transcript_changes()
     }
 
     // ---- requests ----
@@ -350,7 +404,7 @@ impl WindowManager {
             ..PrefetchPolicy::default()
         }
         .ceiling(Self::ceiling());
-        self.poll(rows, &policy)
+        self.poll(rows, &policy, &[PageDirection::Older, PageDirection::Newer])
     }
 
     /// Request one page in a direction now, for pending movement at a boundary (N8), subject
@@ -369,7 +423,9 @@ impl WindowManager {
             ..PrefetchPolicy::default()
         }
         .ceiling(Self::ceiling());
-        self.poll(EdgeRows::default(), &policy).into_iter().next()
+        self.poll(EdgeRows::default(), &policy, &[direction])
+            .into_iter()
+            .next()
     }
 
     const fn ceiling() -> WeightCeiling {
@@ -379,8 +435,24 @@ impl WindowManager {
         }
     }
 
-    fn poll(&mut self, rows: EdgeRows, policy: &PrefetchPolicy) -> Vec<IssuedRequest<PageRequest>> {
+    fn poll(
+        &mut self,
+        rows: EdgeRows,
+        policy: &PrefetchPolicy,
+        sides: &[PageDirection],
+    ) -> Vec<IssuedRequest<PageRequest>> {
         let demands = self.keys.poll_demands(rows, policy);
+        // W7a: a side that needs rows but has no room under the ceiling shows `loading` until
+        // eviction frees room and the page is requested.
+        let blocked = |demand: &SideDemand<u64>| {
+            matches!(demand, SideDemand::Blocked(rw::DemandBlock::Ceiling))
+        };
+        if sides.contains(&PageDirection::Older) {
+            self.summary.ceiling_blocked.older = blocked(&demands.before);
+        }
+        if sides.contains(&PageDirection::Newer) {
+            self.summary.ceiling_blocked.newer = blocked(&demands.after);
+        }
         let mut issued = Vec::new();
         for demand in [demands.before, demands.after] {
             let SideDemand::Requested(request) = demand else {
@@ -469,42 +541,41 @@ impl WindowManager {
                 rw::StaleReason::EdgeChanged => StaleResult::EdgeChanged,
             });
         }
-        for event in kept {
-            self.events.insert(event.sequence, event);
+        for event in &kept {
+            self.events.insert(event.sequence, event.clone());
         }
         self.last_extended = Some(result.direction);
 
-        let previous = session.snapshot().transcript.items.clone();
         let mut mode_changed = false;
         let mut follow_up = None;
-        match result.direction {
+        let mut changes = match result.direction {
             PageDirection::Older => {
                 if !more {
                     self.summary.first_available_sequence = self.first_sequence();
                 }
-                self.rebuild(session);
+                let prepended =
+                    self.measured(session, |session| session.prepend_history_page(&kept));
+                self.page_or_fallback(prepended, PageDirection::Older, session)
             }
             PageDirection::Newer => {
-                let buffer = self.buffer.take();
-                if more {
-                    self.rebuild(session);
+                let appended = self.measured(session, |session| session.append_history_page(&kept));
+                self.page_or_fallback(appended, PageDirection::Newer, session)
+            }
+        };
+        if result.direction == PageDirection::Newer {
+            let buffer = self.buffer.take();
+            if !more {
+                let buffer = buffer.unwrap_or_default();
+                if buffer.overflowed || buffer.stream_active_at_issue {
+                    follow_up = Some(self.request_window(WindowRequest::LiveState));
                 } else {
-                    let buffer = buffer.unwrap_or_default();
-                    if buffer.overflowed || buffer.stream_active_at_issue {
-                        self.rebuild(session);
-                        follow_up = Some(self.request_window(WindowRequest::LiveState));
-                    } else {
-                        self.set_mode(WindowMode::Live);
-                        mode_changed = true;
-                        self.rebuild(session);
-                        self.apply_buffered(buffer, session);
-                    }
+                    self.set_mode(WindowMode::Live);
+                    mode_changed = true;
+                    self.apply_buffered(buffer, session);
+                    append_changes(&mut changes, session.drain_transcript_changes());
                 }
             }
         }
-        let changes = self
-            .mirror
-            .diff(&session.snapshot().transcript, Some(&previous));
         self.refresh();
         Ok(PageIncorporated {
             generation: result.generation,
@@ -539,7 +610,10 @@ impl WindowManager {
         if target != result.target {
             return Err(StaleResult::NotInFlight);
         }
-        let aligned = align_window(&result.events, result.has_older, result.has_newer);
+        // W8, W10: bounded to one window's events and aligned to whole turns, keeping the
+        // target's turn of an `Around` window.
+        let aligned =
+            align_window_result(&result.events, target, result.has_older, result.has_newer);
         let kept = &result.events[aligned.start..aligned.end];
         let mode = if aligned.has_newer {
             WindowMode::Detached
@@ -579,16 +653,28 @@ impl WindowManager {
         }
         self.replace = None;
         self.attached = true;
+        self.summary.ceiling_blocked = super::CeilingBlocked::default();
         self.events = kept
             .iter()
             .map(|event| (event.sequence, event.clone()))
             .collect();
-        self.summary.first_available_sequence = result.first_available_sequence.or_else(|| {
-            (!aligned.has_older)
-                .then(|| self.first_sequence())
-                .flatten()
-        });
-        self.summary.last_available_sequence = result.last_available_sequence;
+        // W12: session bounds the result does not report keep what is already known.
+        let known_last = self
+            .summary
+            .last_available_sequence
+            .max(self.summary.latest_known_sequence);
+        self.summary.first_available_sequence = result
+            .first_available_sequence
+            .or_else(|| {
+                (!aligned.has_older)
+                    .then(|| self.first_sequence())
+                    .flatten()
+            })
+            .or(self.summary.first_available_sequence);
+        self.summary.last_available_sequence = result
+            .last_available_sequence
+            .or(known_last)
+            .max(self.events.keys().next_back().copied());
         self.last_extended = None;
         self.buffer = None;
         self.live_state = None;
@@ -596,11 +682,7 @@ impl WindowManager {
         let mode_changed = self.summary.mode != mode;
         self.set_mode(mode);
 
-        let previous = session.snapshot().transcript.items.clone();
-        self.rebuild(session);
-        let changes = self
-            .mirror
-            .diff(&session.snapshot().transcript, Some(&previous));
+        let changes = self.replace(session);
         self.refresh();
         Ok(WindowIncorporated {
             generation: result.generation,
@@ -619,18 +701,36 @@ impl WindowManager {
             return Err(StaleResult::NotInFlight);
         }
         self.live_state = None;
-        let previous = session.snapshot().transcript.items.clone();
+        if result.has_newer {
+            // W11: more events arrived than one bounded read returns, so this read does not
+            // reach the session tail. Going live here would leave a gap between the read and
+            // later live events; the read is incorporated like a newer page instead, the window
+            // stays detached with newer history available, and newer paging continues (the next
+            // `Newer` request buffers live events again).
+            for event in &result.events {
+                self.append_durable(event.clone(), session);
+            }
+            self.buffer = None;
+            self.keys
+                .set_availability(WindowSide::After, EdgeAvailability::MoreAvailable);
+            let changes = session.drain_transcript_changes();
+            self.refresh();
+            return Ok(WindowIncorporated {
+                generation: result.generation,
+                target: WindowRequest::LiveState,
+                changes,
+                mode_changed: false,
+            });
+        }
         let mode_changed = self.summary.mode != WindowMode::Live;
+        // The durable window stays; only the live state is applied on top (W11).
         self.set_mode(WindowMode::Live);
-        self.rebuild(session);
         for event in &result.events {
             self.append_durable(event.clone(), session);
         }
         let buffer = self.buffer.take().unwrap_or_default();
         self.apply_buffered(buffer, session);
-        let changes = self
-            .mirror
-            .diff(&session.snapshot().transcript, Some(&previous));
+        let changes = session.drain_transcript_changes();
         self.refresh();
         Ok(WindowIncorporated {
             generation: result.generation,
@@ -648,11 +748,11 @@ impl WindowManager {
             return LiveOutcome::Duplicate;
         }
         if self.summary.mode == WindowMode::Detached || self.live_state.is_some() {
-            if let Some(buffer) = self.buffer.as_mut() {
-                buffer.push(input);
-                return LiveOutcome::Buffered;
-            }
-            match input {
+            // W2: newer activity is recorded whether or not the input is buffered, because a
+            // buffer is discarded when its page reports more history (W11). A stream seen
+            // while a page is in flight is therefore still in flight when the next `Newer`
+            // request is issued, and that request rehydrates live state.
+            match &input {
                 LiveInput::Durable(event) => {
                     self.summary.latest_known_sequence = Some(
                         self.summary
@@ -661,6 +761,10 @@ impl WindowManager {
                     );
                 }
                 LiveInput::Stream(_) => self.stream_activity = true,
+            }
+            if let Some(buffer) = self.buffer.as_mut() {
+                buffer.push(input);
+                return LiveOutcome::Buffered;
             }
             return LiveOutcome::Detached;
         }
@@ -677,7 +781,7 @@ impl WindowManager {
             }
             LiveInput::Stream(event) => session.apply_live_event(&event),
         }
-        let changes = self.mirror.diff(&session.snapshot().transcript, None);
+        let changes = session.drain_transcript_changes();
         self.refresh();
         LiveOutcome::Applied(changes)
     }
@@ -690,7 +794,9 @@ impl WindowManager {
         {
             return;
         }
-        session.apply_event(&event);
+        let reduced = session.window_op_counters().events_reduced;
+        session.apply_window_event(&event);
+        self.count_reduced(reduced, session);
         let _ = self.keys.push_back([ResidentItem::new(event.sequence)]);
         self.summary.last_sequence = Some(event.sequence);
         self.summary.last_available_sequence = Some(
@@ -728,17 +834,41 @@ impl WindowManager {
         height: &dyn Fn(&UnitKey) -> u64,
         session: &mut SessionView,
     ) -> Option<EvictionOutcome> {
-        if context.deferred || self.event_count() <= RESIDENT_MAX_EVENTS || self.events.is_empty() {
+        let over_ceiling = self.event_count() > RESIDENT_CEILING_EVENTS;
+        if (context.deferred && !over_ceiling)
+            || self.event_count() <= RESIDENT_MAX_EVENTS
+            || self.events.is_empty()
+        {
             return None;
         }
-        let (plan, side, unaligned) = self.plan_eviction(context, units, height, session)?;
+        // W7a: while eviction is deferred, durable events applied without a page request
+        // (buffered catch-up, live-state reads, live events) can still pass the ceiling; trim
+        // only back to it so as little as possible changes during the motion or selection.
+        let target = if context.deferred {
+            RESIDENT_CEILING_EVENTS
+        } else {
+            RESIDENT_TARGET_EVENTS
+        };
+        let probe = self.eviction_probe(context, session, target);
+        if self.no_eviction.as_ref() == Some(&probe) {
+            return None;
+        }
+        self.work.eviction_plans += 1;
+        let Some((plan, side, unaligned)) =
+            self.plan_eviction(context, units, height, session, target)
+        else {
+            self.no_eviction = Some(probe);
+            return None;
+        };
         let had_in_flight = self.keys.in_flight(side).is_some();
         let splices = self.keys.apply_eviction(&plan).ok()?;
         let mut removed_events = 0;
+        let mut first_removed: Option<u64> = None;
         for splice in &splices {
             for sequence in &splice.removed {
                 self.events.remove(sequence);
                 removed_events += 1;
+                first_removed = Some(first_removed.map_or(*sequence, |first| first.min(*sequence)));
             }
         }
         if had_in_flight {
@@ -747,6 +877,12 @@ impl WindowManager {
             if side == WindowSide::After {
                 self.buffer = None;
             }
+        }
+        if side == WindowSide::After && self.live_state.take().is_some() {
+            // W11: a live-state read continues after the old tail. Its result would leave a gap
+            // after the trimmed tail, so it is cancelled (its result is dropped as not in
+            // flight) and newer paging resumes from the new tail.
+            self.buffer = None;
         }
         let direction = match side {
             WindowSide::Before => PageDirection::Older,
@@ -758,11 +894,14 @@ impl WindowManager {
             self.keys
                 .set_availability(WindowSide::After, EdgeAvailability::MoreAvailable);
         }
-        let previous = session.snapshot().transcript.items.clone();
-        self.rebuild(session);
-        let changes = self
-            .mirror
-            .diff(&session.snapshot().transcript, Some(&previous));
+        // Whole turns leave the projection by key; no resident event is replayed (SD3).
+        let changes = match side {
+            WindowSide::Before => {
+                session.evict_before_sequence(self.first_sequence().unwrap_or(u64::MAX))
+            }
+            WindowSide::After => session.evict_from_sequence(first_removed.unwrap_or(u64::MAX)),
+        };
+        self.work.evictions += 1;
         self.refresh();
         Some(EvictionOutcome {
             side: direction,
@@ -782,6 +921,7 @@ impl WindowManager {
         units: &Units,
         height: &dyn Fn(&UnitKey) -> u64,
         session: &SessionView,
+        target: u64,
     ) -> Option<(rw::EvictionPlan, WindowSide, bool)> {
         let rows = units.rows_by_sequence(height);
         let starts = self
@@ -811,15 +951,12 @@ impl WindowManager {
             .collect::<Vec<_>>();
         pinned.extend(streaming_sequences(&session.snapshot().transcript.items));
 
-        let side = match self.last_extended {
-            Some(PageDirection::Older) => WindowSide::After,
-            Some(PageDirection::Newer) | None => WindowSide::Before,
-        };
+        let side = self.eviction_side();
         let band = ProtectedBand::symmetric(prefetch_rows(context.viewport_height), usize::MAX)
             .max_weight(RESIDENT_TARGET_EVENTS);
         let budget = EvictionBudget {
             trigger_weight: RESIDENT_MAX_EVENTS,
-            target_weight: RESIDENT_TARGET_EVENTS,
+            target_weight: target,
             sides: EvictionSides::Only(side),
         };
         let placement = ViewportPlacement {
@@ -852,6 +989,33 @@ impl WindowManager {
         Some((plan, side, unaligned))
     }
 
+    /// The side eviction trims: opposite to the side last extended (W7).
+    const fn eviction_side(&self) -> WindowSide {
+        match self.last_extended {
+            Some(PageDirection::Older) => WindowSide::After,
+            Some(PageDirection::Newer) | None => WindowSide::Before,
+        }
+    }
+
+    fn eviction_probe(
+        &self,
+        context: &EvictionContext<'_>,
+        session: &SessionView,
+        target: u64,
+    ) -> EvictionProbe {
+        EvictionProbe {
+            keys_revision: self.keys.revision(),
+            transcript_revision: session.snapshot().transcript.revision,
+            last_extended: self.last_extended,
+            viewport_top: context.viewport_top,
+            viewport_height: context.viewport_height,
+            resident_rows: context.resident_rows,
+            anchor: context.anchor.cloned(),
+            pinned: context.pinned.to_vec(),
+            target,
+        }
+    }
+
     fn sequence_at_row(&self, rows: &BTreeMap<u64, u64>, row: i128) -> u64 {
         let mut top = 0_i128;
         let mut last = 0;
@@ -882,17 +1046,55 @@ impl WindowManager {
         }
     }
 
-    /// Rebuild the bounded projection from the resident events (SD5 fallback before phase 5).
+    /// Replace the projection with the resident events (window results and the SD2 fallback).
     /// Live windows keep live-only items; detached windows drop them (W2, SD3).
-    fn rebuild(&self, session: &mut SessionView) {
+    fn replace(&mut self, session: &mut SessionView) -> TranscriptChanges {
         let events = self.events.values().cloned().collect::<Vec<_>>();
-        match self.summary.mode {
-            WindowMode::Live => session.rebuild_history_window(&events),
-            WindowMode::Detached => {
-                session.clear_history_window();
-                session.apply_history(&events);
-            }
+        let mode = self.summary.mode;
+        self.work.replacements += 1;
+        self.measured(session, |session| match mode {
+            WindowMode::Live => session.replace_history_window(&events),
+            WindowMode::Detached => session.replace_history_window_detached(&events),
+        })
+    }
+
+    /// Incorporate a page operation's result, falling back to a replacement of the resident
+    /// events when the page cannot be spliced (SD2: unaligned boundary, W4; any other rejection
+    /// is answered the same way so the projection always matches the resident events).
+    fn page_or_fallback(
+        &mut self,
+        result: Result<TranscriptChanges, WindowOpError>,
+        direction: PageDirection,
+        session: &mut SessionView,
+    ) -> TranscriptChanges {
+        let Ok(changes) = result else {
+            self.work.fallbacks += 1;
+            return self.replace(session);
+        };
+        match direction {
+            PageDirection::Older => self.work.prepends += 1,
+            PageDirection::Newer => self.work.appends += 1,
         }
+        changes
+    }
+
+    /// Run a `SessionView` operation and add the events it reduced to [`WindowWork`].
+    fn measured<T>(
+        &mut self,
+        session: &mut SessionView,
+        operation: impl FnOnce(&mut SessionView) -> T,
+    ) -> T {
+        let reduced = session.window_op_counters().events_reduced;
+        let output = operation(session);
+        self.count_reduced(reduced, session);
+        output
+    }
+
+    const fn count_reduced(&mut self, before: u64, session: &SessionView) {
+        self.work.events_reduced += session
+            .window_op_counters()
+            .events_reduced
+            .saturating_sub(before);
     }
 
     fn refresh(&mut self) {
@@ -909,6 +1111,15 @@ impl WindowManager {
             self.keys.in_flight(WindowSide::After).is_some() || self.live_state.is_some();
         summary.in_flight.replace = self.replace.map(|(_, request)| request);
     }
+}
+
+/// Append `later` to `changes`, keeping the combined revision range.
+fn append_changes(changes: &mut TranscriptChanges, later: TranscriptChanges) {
+    if later.is_empty() && later.revision == changes.revision {
+        return;
+    }
+    changes.changes.extend(later.changes);
+    changes.revision = later.revision;
 }
 
 fn streaming_sequences(items: &[TranscriptViewItem]) -> impl Iterator<Item = u64> + '_ {

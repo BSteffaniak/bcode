@@ -12,10 +12,14 @@
 //! * The wheel scrolls (`ScrollBy`); a press and release without drag on a disclosure header
 //!   or section label toggles it, and on the latest bar jumps to the latest content. Pointer
 //!   input never moves keyboard focus (FO2, FO9).
+//! * A press on the optional scrollbar track and the drag that follows go to the BMUX list,
+//!   whose scrollbar reports a fraction of the whole session that navigation maps to a
+//!   resident row or an `Around` window (`JumpToFraction`, VP4, W12, X6).
 
 use std::time::Instant;
 
 use bcode_presentation_policy::models::Disclosure;
+use bcode_tui_transcript::engine::LIST_ID;
 use bcode_tui_transcript::focus::{FocusEdge, FocusStep};
 use bcode_tui_transcript::navigation::{InputSource, NavIntent};
 use bcode_tui_transcript::units::structure::DisclosureTarget;
@@ -192,6 +196,9 @@ impl TranscriptV2Host {
             .is_some_and(|region| region.contains(mouse.position));
         let presented =
             top_hit.is_none_or(|id| id == LATEST_BAR_HIT || id.starts_with(ITEM_HIT_PREFIX));
+        if let Some(outcome) = self.scrollbar_mouse(mouse, top_hit, at) {
+            return outcome;
+        }
         match mouse.kind {
             MouseEventKind::ScrollUp | MouseEventKind::ScrollDown if in_region => {
                 let rows = i64::try_from(wheel_rows.max(1)).unwrap_or(i64::MAX);
@@ -245,8 +252,58 @@ impl TranscriptV2Host {
         }
     }
 
+    /// Route scrollbar pointer input to the list (VP4): a primary press on the presented track,
+    /// then every drag and the release of that gesture. Returns `None` for other input. A press
+    /// under an overlay another painter put above the transcript is not the scrollbar's (B7),
+    /// and a press the list does not take (an overlay scrollbar with nothing to scroll) is left
+    /// to the transcript click path.
+    fn scrollbar_mouse(
+        &mut self,
+        mouse: MouseEvent,
+        top_hit: Option<&str>,
+        at: Instant,
+    ) -> Option<TranscriptInputOutcome> {
+        let pressed = matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left));
+        let continues = matches!(
+            mouse.kind,
+            MouseEventKind::Drag(MouseButton::Left) | MouseEventKind::Up(MouseButton::Left)
+        );
+        if pressed {
+            let on_track = self
+                .regions
+                .scrollbar
+                .is_some_and(|track| track.contains(mouse.position));
+            let uncovered = top_hit.is_none_or(is_transcript_hit);
+            if !on_track || !uncovered {
+                return None;
+            }
+        } else if !(continues && self.scrollbar_drag) {
+            return None;
+        }
+        let viewport = self.regions.viewport?;
+        let mut local = mouse;
+        local.position = Point::new(
+            mouse.position.x.saturating_sub(viewport.x),
+            mouse.position.y.saturating_sub(viewport.y),
+        );
+        let (update, handled) = self.engine.get_mut().list_event(&Event::Mouse(local), at);
+        let changed = update.invalidated || !update.requests.is_empty();
+        self.absorb(update);
+        if pressed {
+            if !handled {
+                return None;
+            }
+            self.scrollbar_drag = true;
+            self.pending_click = None;
+        } else if matches!(mouse.kind, MouseEventKind::Up(_)) {
+            self.scrollbar_drag = false;
+        }
+        Some(TranscriptInputOutcome::from_changed(changed))
+    }
+
     /// Activate what a click at `position` hits: the latest bar jumps to the latest content,
-    /// a disclosure region toggles (X1). Returns whether the transcript changed.
+    /// a disclosure region toggles (X1). Returns whether the transcript changed. The scrollbar
+    /// track is never an item click.
     fn click(&mut self, position: Point, at: Instant) -> bool {
         if self
             .regions
@@ -259,7 +316,12 @@ impl TranscriptV2Host {
         else {
             return false;
         };
-        if !viewport.contains(position) {
+        if !viewport.contains(position)
+            || self
+                .regions
+                .scrollbar
+                .is_some_and(|track| track.contains(position))
+        {
             return false;
         }
         let column = u64::from(position.x - viewport.x);
@@ -429,3 +491,14 @@ impl TranscriptV2Host {
 
 #[cfg(test)]
 mod tests;
+
+/// Whether hit region `id` belongs to the transcript itself rather than to a painter above it:
+/// the list's scroll region ([`LIST_ID`]), the list's own per-item regions (`<LIST_ID>.item.…`,
+/// which span the full list width, the overlay scrollbar column included) and the host's item
+/// regions ([`ITEM_HIT_PREFIX`]).
+fn is_transcript_hit(id: &str) -> bool {
+    id.starts_with(ITEM_HIT_PREFIX)
+        || id
+            .strip_prefix(LIST_ID)
+            .is_some_and(|rest| rest.is_empty() || rest.starts_with('.'))
+}

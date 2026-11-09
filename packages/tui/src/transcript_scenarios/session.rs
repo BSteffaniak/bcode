@@ -132,6 +132,19 @@ impl ScenarioSession {
         self.item_lines.get(&sequence).copied()
     }
 
+    /// Whether the event at `sequence` starts a turn (a user message: a safe window start, W4).
+    #[must_use]
+    pub fn is_turn_start(&self, sequence: u64) -> bool {
+        self.events
+            .binary_search_by_key(&sequence, |event| event.sequence)
+            .is_ok_and(|index| {
+                matches!(
+                    self.events[index].kind,
+                    SessionEventKind::UserMessage { .. }
+                )
+            })
+    }
+
     /// Last marker of the item at `sequence`.
     #[must_use]
     pub fn last_marker(&self, sequence: u64) -> Option<Marker> {
@@ -257,6 +270,18 @@ impl ScenarioSession {
                 self.events.len().saturating_sub(max_events),
                 self.events.len(),
             ),
+            HistoryRequest::LiveState {
+                after_sequence,
+                max_events,
+            } => {
+                let start = after_sequence.map_or(self.events.len(), |after| {
+                    self.events.partition_point(|event| event.sequence <= after)
+                });
+                self.window(
+                    start,
+                    start.saturating_add(max_events).min(self.events.len()),
+                )
+            }
         }
     }
 

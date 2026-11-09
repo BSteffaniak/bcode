@@ -24,7 +24,8 @@
 //! * [`focus`]: key resolution (focus entry, `transcript_focus` keys, scroll keys).
 //! * [`input`]: transcript keys, wheel and mouse input and the composer/transcript focus model
 //!   (spec section 6).
-//! * [`paint`]: viewport geometry, frame preparation, painting, commit and the latest bar.
+//! * [`paint`]: viewport geometry, frame preparation, painting, commit, the latest bar and the
+//!   optional scrollbar (phase 5, X6).
 
 // Skeleton accessors and outcomes that the follow-up phase 4 work wires into the host; the
 // expectation fails once every item is used, so it is removed together with the last stub.
@@ -47,6 +48,9 @@ pub mod thread_bound;
 
 #[cfg(test)]
 pub mod test_fixtures;
+
+#[cfg(test)]
+mod scrollbar_tests;
 
 use bcode_config::TuiEngine;
 use bcode_session_models::SessionId;
@@ -121,6 +125,9 @@ pub struct TranscriptV2Host {
     regions: paint::Regions,
     /// Primary-button press awaiting its release ([`input`], FO9).
     pending_click: Option<input::PendingClick>,
+    /// A press on the scrollbar track is being dragged; pointer input goes to the list until
+    /// the release ([`input`], VP4).
+    scrollbar_drag: bool,
     /// Next latest-bar glow frame ([`paint`], C21).
     glow_frame_at: Option<std::time::Instant>,
     /// Scenario time replacing the wall clock for every host and frame clock read, so
@@ -155,6 +162,7 @@ impl TranscriptV2Host {
             render: render_config::RenderInputs::default(),
             regions: paint::Regions::default(),
             pending_click: None,
+            scrollbar_drag: false,
             glow_frame_at: None,
             #[cfg(test)]
             scripted_now: None,

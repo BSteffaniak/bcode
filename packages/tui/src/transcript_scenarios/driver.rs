@@ -86,6 +86,14 @@ pub enum HistoryRequest {
         /// Maximum events in the window.
         max_events: usize,
     },
+    /// Live state after the resident tail (W11 rehydration): events with
+    /// `sequence > after_sequence`, oldest first, without replacing the resident window.
+    LiveState {
+        /// Exclusive lower sequence bound (the newest resident sequence at issue), when known.
+        after_sequence: Option<u64>,
+        /// Maximum events read.
+        max_events: usize,
+    },
 }
 
 impl HistoryRequest {
@@ -98,6 +106,7 @@ impl HistoryRequest {
             Self::Around { .. } => HistoryRequestKind::Around,
             Self::Head { .. } => HistoryRequestKind::Head,
             Self::Tail { .. } => HistoryRequestKind::Tail,
+            Self::LiveState { .. } => HistoryRequestKind::LiveState,
         }
     }
 }
@@ -115,6 +124,8 @@ pub enum HistoryRequestKind {
     Head,
     /// Session-tail window.
     Tail,
+    /// Live-state rehydration after the resident tail.
+    LiveState,
 }
 
 /// Page sizing an engine asks the daemon to satisfy.
@@ -299,6 +310,17 @@ pub trait TranscriptScenarioDriver: Sized {
         None
     }
 
+    /// Resident-window operation work since the engine started (spec 9.2; phase 5: paging
+    /// performs no full rebuild); `None` when the engine does not count it.
+    fn window_work(&self) -> Option<WindowWork> {
+        None
+    }
+
+    /// Canonical events currently resident (W7, W7a); `None` when the engine does not report it.
+    fn resident_event_count(&self) -> Option<u64> {
+        None
+    }
+
     /// Rows the focused transcript unit-focus target occupies in the last presented frame,
     /// relative to the transcript viewport's top row (`0`). The range is half-open and may
     /// extend above (`start < 0`) or below the viewport. `None` when no target is focused.
@@ -326,9 +348,40 @@ pub enum ScenarioSetting {
     },
     /// `tui.reduce_motion`: make scrolls, glows and accent transitions instant.
     ReducedMotion(bool),
+    /// `[tui] transcript_scrollbar`: the optional transcript scrollbar (X6).
+    TranscriptScrollbar(ScenarioScrollbar),
     /// Make subsequent clipboard writes fail (`true`) or succeed (`false`). Not a configuration
     /// key: it scripts the environment's clipboard.
     ClipboardFails(bool),
+}
+
+/// `[tui] transcript_scrollbar` modes (X6).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ScenarioScrollbar {
+    /// No scrollbar (the default).
+    Off,
+    /// Drawn over the transcript's last column.
+    Overlay,
+    /// Drawn in a reserved column beside the transcript.
+    Gutter,
+}
+
+/// Resident-window operation work an engine performed (phase 5 exit: no full rebuild on paging).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct WindowWork {
+    /// Whole-window replacements (attach, jumps, `Head`/`Tail`/`Around` windows).
+    pub replacements: u64,
+    /// Pages that could not be applied incrementally and replaced the resident window instead
+    /// (SD2 fallback).
+    pub fallbacks: u64,
+    /// Older pages prepended incrementally.
+    pub prepends: u64,
+    /// Newer pages appended incrementally.
+    pub appends: u64,
+    /// Evictions.
+    pub evictions: u64,
+    /// Canonical events reduced by the session view in total.
+    pub events_reduced: u64,
 }
 
 /// Item layout work an engine performed (spec 9.2 `LayoutWorkCounters`, D4).

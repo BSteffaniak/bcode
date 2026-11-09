@@ -2541,6 +2541,39 @@ pub struct TuiConfig {
     /// precedence. The engine is chosen once at startup; changing it requires a restart.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub engine: Option<TuiEngine>,
+    /// Scrollbar of the V2 transcript engine: `off` (default), `overlay` (drawn over the last
+    /// transcript column while the session does not fit the view) or `gutter` (a reserved
+    /// column). The thumb shows the position within the whole session, estimated for history
+    /// that is not loaded; pressing or dragging the track jumps there. The V1 transcript and
+    /// transcript regions narrower than two columns show no scrollbar.
+    #[serde(default)]
+    pub transcript_scrollbar: TuiTranscriptScrollbar,
+}
+
+/// Scrollbar of the V2 transcript.
+#[derive(
+    Debug,
+    Clone,
+    Copy,
+    Default,
+    PartialEq,
+    Eq,
+    PartialOrd,
+    Ord,
+    Hash,
+    Serialize,
+    Deserialize,
+    ConfigDocEnum,
+)]
+#[serde(rename_all = "snake_case")]
+pub enum TuiTranscriptScrollbar {
+    /// No scrollbar.
+    #[default]
+    Off,
+    /// Drawn over the last transcript column while the session does not fit the view.
+    Overlay,
+    /// Drawn in a reserved column, always shown.
+    Gutter,
 }
 
 /// Terminal UI transcript engine.
@@ -11285,6 +11318,39 @@ enabled = false
         assert_eq!(super::TuiEngine::parse("v3"), None);
         let fields = BcodeConfig::field_docs();
         assert!(find_field_path(section_fields(&fields, "tui"), "engine").is_some());
+    }
+
+    #[test]
+    fn tui_transcript_scrollbar_key_parses_and_defaults_to_off() {
+        for input in ["", "[tui]"] {
+            let config: BcodeConfig = toml::from_str(input).expect("config parses");
+            assert_eq!(
+                config.tui.transcript_scrollbar,
+                super::TuiTranscriptScrollbar::Off
+            );
+        }
+        for (value, expected) in [
+            ("off", super::TuiTranscriptScrollbar::Off),
+            ("overlay", super::TuiTranscriptScrollbar::Overlay),
+            ("gutter", super::TuiTranscriptScrollbar::Gutter),
+        ] {
+            let config: BcodeConfig =
+                toml::from_str(&format!("[tui]\ntranscript_scrollbar = \"{value}\""))
+                    .expect("config parses");
+            assert_eq!(config.tui.transcript_scrollbar, expected);
+            let rendered = toml::to_string(&config.tui).expect("tui config serializes");
+            assert!(
+                rendered.contains(&format!("transcript_scrollbar = \"{value}\"")),
+                "{rendered}"
+            );
+        }
+        assert!(toml::from_str::<BcodeConfig>("[tui]\ntranscript_scrollbar = \"left\"").is_err());
+        assert_eq!(
+            super::TuiTranscriptScrollbar::config_doc_values(),
+            &["off", "overlay", "gutter"]
+        );
+        let fields = BcodeConfig::field_docs();
+        assert!(find_field_path(section_fields(&fields, "tui"), "transcript_scrollbar").is_some());
     }
 
     #[test]

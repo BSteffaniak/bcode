@@ -23,6 +23,9 @@ required by [`tui-v2-architecture.md`](tui-v2-architecture.md), not what V1 curr
     `Program::update` and the production root presenter (phase 4; see "V2 driver" below).
   * `v2_headless.rs` drives the `bcode_tui_transcript` engine façade without the host, for
     engine-level checks (`v2_headless_engine` in `mod.rs`).
+  * `paging.rs` holds the resident window and paging scenarios (phase 5): prefetch, eviction,
+    the resident ceiling, aligned timeline windows, direct head and tail windows, return to live,
+    deep history paging and the optional scrollbar. See "Paging scenarios (phase 5)" below.
   * `startup.rs` checks engine selection at startup through the root model (X7, X8) and that
     both engines attach to the same scripted session.
 * Commands:
@@ -66,10 +69,87 @@ Height changes during a motion are produced by reflow (a narrower terminal), not
 asynchronous visual, because the fake session has no asynchronous visual producer. Add a
 true async-visual variant once an engine exposes an injectable visual producer.
 
-BUG-B1, BUG-B2 and BUG-B3 are phase-5 exit criteria but already pass on V2: the window manager
-aligns timeline windows to turns (W4, W8), loads `Head`/`Tail` windows directly (W10) and returns
-to live from a tail window. Phase 5 replaces the document rebuild behind them with incremental
-window operations.
+BUG-B1, BUG-B2 and BUG-B3 are phase-5 exit criteria and pass on V2: the window manager aligns
+timeline windows to turns (W4, W8), loads `Head`/`Tail` windows directly (W10) and returns to
+live from a tail window. Since phase 5 the window is maintained by the incremental
+`bcode_session_view::window_ops` operations instead of a document rebuild plus keyed diff; the
+paging scenarios below check that through the window-work counters. BUG-B3 through `End` in
+transcript focus and BUG-B5 are in the paging table.
+
+## Paging scenarios (phase 5)
+
+Defined in `packages/tui/src/transcript_scenarios/paging.rs` and instantiated for the V2 engine
+in the application (`v2_paging`) and, where no host is needed, for the engine façade
+(`v2_headless_paging`). Run them with
+`cargo test -p bcode_tui --lib transcript_scenarios::v2_paging` (or `::v2_headless_paging`).
+V1 is not instantiated: the scenarios check V2's window-work counters and resident event count,
+which V1 does not report, and V1's paging deviations are already recorded by the BUG-A and BUG-B
+rows above.
+
+They use three driver capabilities from `driver.rs`:
+
+* `window_work()`: the resident window's operation counters (whole-window replacements, SD2
+  fallbacks, incremental prepends and appends, evictions, events reduced by the session view).
+  "No full rebuild on paging" is checked as: no replacement beyond the requested windows, no
+  fallback, and no more events reduced than the page results, requested windows and live events
+  delivered (each event is reduced once per residency, SD1).
+* `resident_event_count()`: checked against the 1,536-event ceiling (W7a) after every page result
+  and every frame.
+* `ScenarioSetting::TranscriptScrollbar` (`[tui] transcript_scrollbar`) and the frame's
+  `scrollbar` track, whose thumb rows are read from the committed buffer.
+
+The long session has 850 turns of six events each (5,100 events): a one-line user message, four
+item-less events and a one-line answer. Page latency is scripted in input steps: a request is
+answered after 8 wheel ticks, less than scrolling the prefetch distance (16 ticks of 3 rows for
+48 rows), which is X12's latency condition. Pages that read up to the session tail are read from
+the daemon before later live events are delivered (`Scenario::complete_with`), as a real daemon
+read would.
+
+| Scenario | Covers | V2 | V2 headless |
+|---|---|---|---|
+| `x12_wheel_up_through_long_history_is_continuous` | X12, W5–W7a, W9, X11, BUG-A2 | pass | pass |
+| `x12_wheel_bursts_with_live_events_stay_continuous` | X12, W9, T23, C23 | pass | pass |
+| `x12_wheel_down_from_session_start_returns_live` | X12, W10, W11, T16, T13 | pass | pass |
+| `phase5_paging_performs_no_full_rebuild` | phase 5 exit (counter), W7, W7a, SD1 | pass | pass |
+| `phase5_tool_heavy_paging_after_a_jump_is_incremental` | phase 5 exit (counter) over tool calls and resolved interactions, SD2, SD3, W10 | pass | pass |
+| `w5_prefetch_requests_one_page_before_the_boundary` | W5 | pass | pass |
+| `bug_b5_timeline_window_is_bounded_and_turn_aligned` | BUG-B5, BUG-B1, W4, W8 | pass | pass |
+| `w11_newer_page_reaching_tail_applies_buffered_live_events` | W11, C23, multi-event frames | pass | pass |
+| `w11_live_buffer_overflow_rehydrates_live_state` | W11, W7a | pass | pass |
+| `bug_b3_end_in_transcript_focus_after_deep_jump_returns_live` | BUG-B3, X5, X11, FO4 | pass | not instantiated (needs the host keymap and focus mode) |
+| `x6_scrollbar_thumb_is_placed_within_the_whole_session` | X6, W12, T18 | pass | not instantiated (the host paints and hit-tests the scrollbar) |
+
+Notes:
+
+* `phase5_tool_heavy_…` uses a session of 320 turns, each a user message, two tool calls that
+  each resolve an interaction and record a result, and an answer. It loads the `Head` window,
+  jumps back to the tail, then pages up to the session start: pages back into the region the
+  head window held must stay incremental (no fallback, no rebuild).
+* `x12_wheel_up_…` scrolls one tick per frame from a 512-event tail window to the session start.
+  Every frame moves by 1 to 3 rows and keeps markers in common with the previous frame (no stall,
+  leap or blank frame). The tail is evicted on the way (W9), so a live event is then not shown,
+  and jump-to-latest returns to live with exactly one `Tail` request (X11).
+* `x12_wheel_bursts_…` delivers three ticks per frame, a live event every ten frames and page
+  results in the same update as the next ticks.
+* `x12_wheel_down_…` loads the session start with `ctrl+home` (one `Head` request, W10) and
+  scrolls down two ticks per frame to the tail. The newer page that reaches the tail returns the
+  window to live (W11), so jump-to-latest needs no request and live events apply.
+* `phase5_paging_…` pages up to the session start and back down with Page Up/Down, answering
+  every request before the next frame.
+* `bug_b5_…` checks that a timeline window holds at most 512 events and starts and ends on turn
+  starts, and that the first older and newer pages evict nothing and shift every visible marker
+  by the same row count (no edge unit changes height in place).
+* `w11_live_buffer_overflow_…` delivers 600 live events while the page that reaches the tail is
+  in flight. The engine issues one `LiveState` request; its bounded read does not reach the tail,
+  so it is incorporated like a newer page and paging continues to the tail (the W11 correction in
+  the specification). It guards against going live with a gap after the read, which never shows
+  the newest events.
+* `x6_scrollbar_…` checks that the scrollbar is off by default; that with `overlay` a tail window
+  puts a small thumb at the track bottom and the session start puts it at the top; that a click
+  in the middle of the track requests one `Around` window near the middle of the session and the
+  thumb then sits in the middle; and that switching to `gutter` keeps the reading position and
+  `off` removes the track. In overlay mode the topmost hit region at the track is the BMUX list's
+  own item region, which the host treats as part of the transcript, not as an overlay.
 
 ## Navigation scenarios (kept behavior)
 
@@ -238,6 +318,14 @@ production keymap contributors, no daemon) with `TuiEngine::V2` selected at star
   (marker tokens per row) and from the regions the host painted (viewport and latest bar).
   Following, motion and focus come from the snapshot that frame painted.
 * `selection_text()` is always `None`: transcript selection is phase 6.
+* `LiveState` rehydration requests (W11) become `HistoryRequest::LiveState` requests for the events
+  after the newest resident sequence at issue. The daemon double answers the host's single-event
+  session-bound probes (`limit = 1`, no cursor, at a session end the scripted response does not
+  reach) with the canonical session's first and newest sequences, so window results carry the
+  whole-session bounds the scrollbar estimate needs (W12).
+* `window_work()` and `resident_event_count()` read the engine's window counters and resident
+  event count; `TranscriptScrollbar` applies `[tui] transcript_scrollbar` to both configuration
+  owners, and the frame's `scrollbar` is the track the host painted.
 
 `v2_headless.rs` (`V2HeadlessDriver`) keeps the phase 2–3 driver for engine-level checks. It
 drives the engine façade without the host, with the standard producers and the bundled default

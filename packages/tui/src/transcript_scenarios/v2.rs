@@ -39,7 +39,8 @@ use bmux_tui_runtime::{Presenter as _, Program as _, RuntimeEvent, TimerId};
 use super::driver::{
     HistoryRequest, HistoryResponse, LayoutWork, PageLimits, PendingHistoryRequest,
     RepaintObservation, RequestId, ResidentSeed, ScenarioEngine, ScenarioInput, ScenarioIntent,
-    ScenarioSetting, ScenarioSetup, TranscriptScenarioDriver, WheelDirection,
+    ScenarioScrollbar, ScenarioSetting, ScenarioSetup, TranscriptScenarioDriver, WheelDirection,
+    WindowWork,
 };
 use super::frame::{CellRect, FocusObservation, ScenarioFrame};
 use crate::effects::{TuiEffect, TuiEffectResult};
@@ -76,6 +77,9 @@ pub struct V2Driver {
     elapsed: Duration,
     /// Repaint scope reported by the last presentation.
     last_repaint: Option<RepaintObservation>,
+    /// First and newest canonical sequences of the session (setup plus live deliveries): the
+    /// daemon double answers the host's single-event session-bound probes from them.
+    session_bounds: Option<(u64, u64)>,
 }
 
 impl V2Driver {
@@ -158,12 +162,13 @@ impl V2Driver {
                 has_older: resident.len() < events.len(),
                 has_newer: false,
             },
+            self.session_bounds,
         );
         self.deliver(load, loaded);
     }
 
-    fn history_request(request: &HostRequest) -> HistoryRequest {
-        match *request {
+    fn history_request(load: &HistoryLoad) -> HistoryRequest {
+        match load.request {
             HostRequest::Page(issued) => match issued.request {
                 PageRequest::Older { before_sequence } => HistoryRequest::Older {
                     before_sequence,
@@ -186,9 +191,10 @@ impl V2Driver {
                 WindowRequest::Tail => HistoryRequest::Tail {
                     max_events: PageCaps::WINDOW.max_events_scanned,
                 },
-                WindowRequest::LiveState => {
-                    panic!("V2 driver: live-state rehydration needs the phase-5 window manager")
-                }
+                WindowRequest::LiveState => HistoryRequest::LiveState {
+                    after_sequence: load.resident_last,
+                    max_events: PageCaps::PAGE.max_events_scanned,
+                },
             },
         }
     }
@@ -201,12 +207,19 @@ impl V2Driver {
 /// Execute `load` with the host's production history executor
 /// ([`crate::transcript_v2_host::effects::load_history`]: bounded reads, the `Around` split,
 /// page validation, session bounds) against a daemon double holding exactly the scripted
-/// `response`: its events, with more history beyond them where the response says so.
-fn execute(load: HistoryLoad, response: &HistoryResponse) -> HistoryLoaded {
+/// `response`: its events, with more history beyond them where the response says so. The
+/// host's single-event session-bound probes are answered from `bounds` (the canonical session's
+/// first and newest sequences), so window results place the reader within the whole session.
+fn execute(
+    load: HistoryLoad,
+    response: &HistoryResponse,
+    bounds: Option<(u64, u64)>,
+) -> HistoryLoaded {
     let read = |query: SessionHistoryQuery| {
-        std::future::ready(Ok::<_, bcode_client::ClientError>(daemon_page(
-            load, response, query,
-        )))
+        std::future::ready(Ok::<_, bcode_client::ClientError>(
+            bound_probe(load, response, &query, bounds)
+                .unwrap_or_else(|| daemon_page(load, response, query)),
+        ))
     };
     let future = std::pin::pin!(crate::transcript_v2_host::effects::load_history(load, read));
     let mut context = std::task::Context::from_waker(std::task::Waker::noop());
@@ -216,6 +229,37 @@ fn execute(load: HistoryLoad, response: &HistoryResponse) -> HistoryLoaded {
         }
         std::task::Poll::Pending => unreachable!("the daemon double answers immediately"),
     }
+}
+
+/// Answer a single-event cursorless read (the host's session-bound probe) at a session end the
+/// scripted `response` does not reach, with that end's canonical event sequence.
+fn bound_probe(
+    load: HistoryLoad,
+    response: &HistoryResponse,
+    query: &SessionHistoryQuery,
+    bounds: Option<(u64, u64)>,
+) -> Option<SessionHistoryPage> {
+    let (first, last) = bounds?;
+    if query.cursor.is_some() || query.limit != 1 {
+        return None;
+    }
+    let (beyond_edge, sequence, template) = match query.direction {
+        SessionHistoryDirection::Forward => (response.has_older, first, response.events.first()?),
+        SessionHistoryDirection::Backward => (response.has_newer, last, response.events.last()?),
+    };
+    if !beyond_edge {
+        return None;
+    }
+    // Only the sequence of a bound probe is read; the event body is the response's edge event.
+    let mut event = template.clone();
+    event.sequence = sequence;
+    Some(SessionHistoryPage {
+        session_id: load.session_id,
+        events: vec![event],
+        compatibility_issues: Vec::new(),
+        next_cursor: None,
+        has_more: first != last,
+    })
 }
 
 /// One daemon read over the scripted `response`: the events at or past the cursor in the
@@ -294,6 +338,12 @@ impl TranscriptScenarioDriver for V2Driver {
             origin,
             elapsed: Duration::ZERO,
             last_repaint: None,
+            session_bounds: setup
+                .session
+                .events()
+                .first()
+                .zip(setup.session.events().last())
+                .map(|(first, last)| (first.sequence, last.sequence)),
         };
         driver.seed(setup);
         driver
@@ -304,6 +354,13 @@ impl TranscriptScenarioDriver for V2Driver {
     }
 
     fn deliver_live(&mut self, event: SessionEvent) {
+        let sequence = event.sequence;
+        self.session_bounds = Some(
+            self.session_bounds
+                .map_or((sequence, sequence), |(first, last)| {
+                    (first.min(sequence), last.max(sequence))
+                }),
+        );
         self.update(RuntimeEvent::Message(BcodeRuntimeMessage::SessionStream(
             Box::new(SessionStreamUpdate::Event(Box::new(
                 bcode_ipc::Event::Session(event),
@@ -318,7 +375,7 @@ impl TranscriptScenarioDriver for V2Driver {
             .filter(|(_, load)| engine.is_awaiting(&load.request))
             .map(|(id, load)| PendingHistoryRequest {
                 id: *id,
-                request: Self::history_request(&load.request),
+                request: Self::history_request(load),
             })
             .collect()
     }
@@ -330,7 +387,7 @@ impl TranscriptScenarioDriver for V2Driver {
             .position(|(pending, _)| *pending == id)
             .expect("completed request must be pending");
         let (_, load) = self.pending.remove(position);
-        let loaded = execute(load, &response);
+        let loaded = execute(load, &response, self.session_bounds);
         self.deliver(load, loaded);
     }
 
@@ -426,7 +483,18 @@ impl TranscriptScenarioDriver for V2Driver {
                 FocusObservation::Composer
             },
             focused_target: target.map(|target| format!("{target:?}")),
+            scrollbar: regions.scrollbar.map(cell_rect),
         }
+    }
+
+    fn window_work(&self) -> Option<WindowWork> {
+        Some(super::v2_headless::window_work(
+            self.host().engine().window_work(),
+        ))
+    }
+
+    fn resident_event_count(&self) -> Option<u64> {
+        Some(self.host().engine().window().event_count)
     }
 
     fn resident_sequences(&self) -> Option<(u64, u64)> {
@@ -462,6 +530,15 @@ impl TranscriptScenarioDriver for V2Driver {
                 config.selection.auto_copy_on_mouse_release = *auto_copy_on_release;
                 config.selection.clear_after_copy = *clear_after_copy;
                 config.selection.clear_delay_ms = *clear_delay_ms;
+                self.model.settings.apply_tui_config(&config);
+                self.model.chat.app.apply_tui_config(config);
+            }
+            ScenarioSetting::TranscriptScrollbar(mode) => {
+                config.transcript_scrollbar = match mode {
+                    ScenarioScrollbar::Off => bcode_config::TuiTranscriptScrollbar::Off,
+                    ScenarioScrollbar::Overlay => bcode_config::TuiTranscriptScrollbar::Overlay,
+                    ScenarioScrollbar::Gutter => bcode_config::TuiTranscriptScrollbar::Gutter,
+                };
                 self.model.settings.apply_tui_config(&config);
                 self.model.chat.app.apply_tui_config(config);
             }

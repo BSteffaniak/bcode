@@ -10,6 +10,7 @@ use std::time::Instant;
 use bcode_session_models::SessionId;
 use bcode_tui_transcript::engine::{HostRequest, TranscriptEngine};
 use bcode_tui_transcript::navigation::NavIntent;
+use bcode_tui_transcript::viewport::ViewportGeometry;
 
 use super::TranscriptV2Host;
 use super::data::live_input;
@@ -48,9 +49,12 @@ impl TranscriptV2Host {
         self.data.reset();
         self.render.engine_reset();
         let engine = self.engine.get_mut();
-        *engine = TranscriptEngine::new(engine.geometry(), engine.motion())
+        // The new engine starts at the full region width; a gutter scrollbar narrows it again.
+        let geometry = ViewportGeometry::new(engine.region().width, engine.geometry().height);
+        *engine = TranscriptEngine::new(geometry, engine.motion())
             .with_render_config(engine.render_config().clone())
-            .with_structure_config(engine.structure().config().clone());
+            .with_structure_config(engine.structure().config().clone())
+            .with_scrollbar(engine.scrollbar());
         self.invalidated = true;
         let Some(session) = session else {
             return;

@@ -5,9 +5,10 @@
 //!
 //! * [`manager`]: the [`WindowManager`] (requests, incorporation, live events, eviction).
 //! * [`turns`]: turn alignment of event ranges (W4).
-//! * [`diff`]: the keyed document diff that derives `TranscriptChanges` (SD5).
+//!
+//! `TranscriptChanges` come from the `SessionView` window operations themselves (spec 3.1); the
+//! phase-4 keyed document diff (SD5) is gone.
 
-pub mod diff;
 pub mod manager;
 #[cfg(test)]
 mod manager_tests;
@@ -18,7 +19,7 @@ pub use bmux_tui_components::resident_window::BoundaryStatus;
 pub use bmux_tui_components::resident_window::EdgeRows;
 pub use manager::{
     EvictionContext, EvictionOutcome, LiveInput, LiveOutcome, PageIncorporated, StaleResult,
-    WindowIncorporated, WindowManager,
+    WindowIncorporated, WindowManager, WindowWork,
 };
 
 use crate::units::BoundaryEdge;
@@ -183,6 +184,19 @@ pub struct InFlight {
     pub replace: Option<WindowRequest>,
 }
 
+/// Sides whose page demand is refused by the resident ceiling (W7a).
+///
+/// A blocked side needs rows (prefetch distance or pending movement at the boundary) but
+/// `event_count + 512 > 1,536` and eviction could not make room (for example while eviction is
+/// deferred). Its boundary unit shows `loading` until eviction frees room (W13).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash)]
+pub struct CeilingBlocked {
+    /// The older side is waiting for room.
+    pub older: bool,
+    /// The newer side is waiting for room.
+    pub newer: bool,
+}
+
 /// Result of one page request, delivered by the host.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct HistoryPageResult {
@@ -234,6 +248,8 @@ pub struct ResidentWindow {
     pub has_newer: bool,
     /// Requests in flight.
     pub in_flight: InFlight,
+    /// Sides waiting for room under the resident ceiling (W7a).
+    pub ceiling_blocked: CeilingBlocked,
     /// Generation; bumped by every window replacement. Stale results are dropped.
     pub generation: u64,
     /// First canonical sequence available in the session, when known.
@@ -268,6 +284,10 @@ impl ResidentWindow {
                 newer: false,
                 replace: None,
             },
+            ceiling_blocked: CeilingBlocked {
+                older: false,
+                newer: false,
+            },
             generation: 0,
             first_available_sequence: None,
             last_available_sequence: None,
@@ -276,12 +296,19 @@ impl ResidentWindow {
         }
     }
 
-    /// Display state of a boundary unit (U3, W13).
+    /// Display state of a boundary unit (U3, W13). A side waiting for room under the ceiling
+    /// shows `loading` like a side with a page in flight (W7a).
     #[must_use]
     pub const fn boundary_status(&self, edge: BoundaryEdge) -> BoundaryStatus {
         let (in_flight, more) = match edge {
-            BoundaryEdge::Older => (self.in_flight.older, self.has_older),
-            BoundaryEdge::Newer => (self.in_flight.newer, self.has_newer),
+            BoundaryEdge::Older => (
+                self.in_flight.older || self.ceiling_blocked.older,
+                self.has_older,
+            ),
+            BoundaryEdge::Newer => (
+                self.in_flight.newer || self.ceiling_blocked.newer,
+                self.has_newer,
+            ),
         };
         if in_flight || self.in_flight.replace.is_some() {
             BoundaryStatus::Loading
@@ -314,7 +341,18 @@ impl ResidentWindow {
         }
     }
 
+    /// Newest canonical sequence known to exist in the session: the last available sequence,
+    /// or a newer one a detached window observed live (W2).
+    #[must_use]
+    pub fn newest_known_sequence(&self) -> Option<u64> {
+        self.last_available_sequence.max(self.latest_known_sequence)
+    }
+
     /// Presentation-only position estimate for `resident_rows` measured rows (W12).
+    ///
+    /// Rows before and after the window are the non-resident events on each side times the
+    /// smoothed rows-per-event average; a detached window counts the newest sequence it
+    /// observed live. Never used for navigation correctness.
     #[must_use]
     pub fn position_estimate(&self, resident_rows: u64) -> PositionEstimate {
         let rate = self.rows_per_event_estimate.max(0.0);
@@ -331,7 +369,7 @@ impl ResidentWindow {
             (Some(available), Some(first)) => first.saturating_sub(available),
             _ => 0,
         };
-        let after = match (self.last_available_sequence, self.last_sequence) {
+        let after = match (self.newest_known_sequence(), self.last_sequence) {
             (Some(available), Some(last)) => available.saturating_sub(last),
             _ => 0,
         };

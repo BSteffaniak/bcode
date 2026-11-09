@@ -12,12 +12,13 @@ use std::time::{Duration, Instant};
 use bcode_tui_components::activity;
 use bcode_tui_transcript::frame::{FrameClock, FrameSnapshot};
 use bcode_tui_transcript::latest_bar::LatestBarState;
-use bcode_tui_transcript::viewport::ViewportGeometry;
+use bcode_tui_transcript::viewport::{ScrollbarMode, ViewportGeometry};
 use bmux_tui::geometry::Rect;
 use bmux_tui::hit::{HitRegion, HitRole};
 use bmux_tui::paint::{LocalRect, PaintCx};
 use bmux_tui::prelude::Line;
 use bmux_tui::style::Style;
+use bmux_tui_components::scrollbar::ScrollbarStyles;
 
 use super::TranscriptV2Host;
 use crate::render::FrameLayout;
@@ -37,6 +38,9 @@ pub struct Regions {
     pub viewport: Option<Rect>,
     /// The latest bar, while shown.
     pub latest_bar: Option<Rect>,
+    /// The transcript scrollbar track, while a scrollbar is presented (VP4, X6). An overlay
+    /// track lies over the viewport's last column; item hit regions exclude it.
+    pub scrollbar: Option<Rect>,
     /// The composer panel (a press there returns focus to the composer, FO3).
     pub composer: Option<Rect>,
 }
@@ -91,6 +95,18 @@ impl TranscriptV2Host {
         }
     }
 
+    /// Apply the transcript scrollbar setting (VP4, X6): `Off`, an overlay over the last
+    /// column, or a reserved gutter column (the engine then lays units out one column
+    /// narrower). Returns whether it changed.
+    pub fn set_scrollbar(&mut self, mode: ScrollbarMode, at: Instant) -> bool {
+        if self.engine.get().scrollbar() == mode {
+            return false;
+        }
+        let update = self.engine.get_mut().set_scrollbar(mode, at);
+        self.absorb(update);
+        true
+    }
+
     /// Record the composer panel (FO3: a press there returns focus to the composer).
     pub const fn set_composer_area(&mut self, composer: Rect) {
         self.regions.composer = Some(composer);
@@ -121,28 +137,47 @@ impl TranscriptV2Host {
         self.regions.transcript = Some(region);
         self.regions.viewport = None;
         self.regions.latest_bar = None;
+        self.regions.scrollbar = None;
         self.glow_frame_at = None;
         if region.is_empty() {
             self.last_frame = None;
             return;
         }
         let clock = self.frame_clock(cx, fallback_now);
+        // Scrollbar track and thumb take the latest bar's muted and info styles.
+        let _ = self.engine.get_mut().set_scrollbar_styles(ScrollbarStyles {
+            begin: style.muted,
+            track: style.muted,
+            thumb: style.info,
+            end: style.muted,
+        });
         let snapshot = self.engine.get_mut().prepare_frame(clock);
         let viewport_height = u16::try_from(snapshot.geometry.height)
             .unwrap_or(u16::MAX)
             .min(region.height);
         let viewport = Rect::new(region.x, region.y, region.width, viewport_height);
         let engine = self.engine.get();
+        let track = engine.scrollbar_track(&snapshot);
         cx.with_child(
             i32::from(viewport.x),
             i64::from(viewport.y),
             LocalRect::new(0, 0, viewport.width, viewport.height),
             |child| {
                 engine.paint_frame(&snapshot, child);
-                paint_interaction(engine, &snapshot, child, style.focus);
+                paint_interaction(engine, &snapshot, child, style.focus, track);
             },
         );
         self.regions.viewport = Some(viewport);
+        self.regions.scrollbar = track
+            .map(|track| {
+                Rect::new(
+                    viewport.x.saturating_add(track.x),
+                    viewport.y.saturating_add(track.y),
+                    track.width,
+                    track.height.min(viewport.height),
+                )
+            })
+            .filter(|track| !track.is_empty());
         let bar_row = viewport.bottom();
         if snapshot.latest_bar.visible && bar_row < region.bottom() {
             let bar = Rect::new(region.x, bar_row, region.width, 1);
@@ -195,12 +230,15 @@ impl TranscriptV2Host {
 }
 
 /// Hit regions and the focus highlight of a prepared frame, from the retained geometry the
-/// frame painted (B3, B7, B12). `cx` is the viewport's context.
+/// frame painted (B3, B7, B12). `cx` is the viewport's context. Item hit regions stop short of
+/// the scrollbar `track` (viewport cells), which overlays the last column in overlay mode, so a
+/// press there is the scrollbar's.
 fn paint_interaction(
     engine: &bcode_tui_transcript::engine::TranscriptEngine,
     snapshot: &FrameSnapshot,
     cx: &mut PaintCx<'_, '_>,
     focus: Style,
+    track: Option<Rect>,
 ) {
     if let Some(rows) = engine.focus_rows(snapshot) {
         let height = u16::try_from(rows.end - rows.start).unwrap_or(u16::MAX);
@@ -209,10 +247,18 @@ fn paint_interaction(
         cx.restyle(LocalRect::new(0, i64::from(top), width, height), focus);
     }
     for (index, region) in engine.visible_hit_regions(snapshot).into_iter().enumerate() {
+        let x = u16::try_from(region.rect.x).unwrap_or(u16::MAX);
+        let mut width = u16::try_from(region.rect.width).unwrap_or(u16::MAX);
+        if let Some(track) = track {
+            width = width.min(track.x.saturating_sub(x));
+        }
+        if width == 0 {
+            continue;
+        }
         let rect = Rect::new(
-            u16::try_from(region.rect.x).unwrap_or(u16::MAX),
+            x,
             u16::try_from(region.rect.y).unwrap_or(u16::MAX),
-            u16::try_from(region.rect.width).unwrap_or(u16::MAX),
+            width,
             u16::try_from(region.rect.height).unwrap_or(u16::MAX),
         );
         cx.push_hit(

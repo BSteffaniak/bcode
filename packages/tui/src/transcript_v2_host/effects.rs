@@ -11,6 +11,23 @@
 //! Every request reads at most [`PageCaps::max_events_scanned`] canonical events
 //! ([`PageCaps::PAGE`] for pages, [`PageCaps::WINDOW`] for windows). The daemon bounds the
 //! payload of one read; item caps are applied by turn alignment in the engine.
+//!
+//! Reads map to the daemon's indexed, non-replaying history reads (session persistence
+//! architecture: normal history paths read bounded pages and never replay the event log):
+//!
+//! * `Tail`: one backward read from the newest event.
+//! * `Head`: one forward read from the session start.
+//! * `Around(sequence)`: one backward read ending at `sequence` and one forward read after it
+//!   (W8: half the window on each side before turn alignment).
+//! * `Older` / `Newer` pages: one read strictly before the first / after the last resident
+//!   sequence (the cursor).
+//! * `LiveState`: one forward read after the resident tail (W11).
+//!
+//! Window results always carry both session bounds (first and last available sequence) for the
+//! presentation-only position estimate (W12, X6). A bound the window read does not reach is
+//! read with one single-event probe at that end of the session (`limit = 1`, still an indexed
+//! bounded read), so a window in the middle of a long session places the scrollbar within the
+//! whole session instead of within the resident rows.
 
 use std::future::Future;
 
@@ -81,8 +98,9 @@ pub enum HistoryLoaded {
     Window(HistoryWindowResult),
 }
 
-/// Execute `load` with `read`, one bounded canonical history read per call (two for
-/// `Around`, one on each side of the target).
+/// Execute `load` with `read`: one bounded canonical history read per page (two for
+/// `Around`, one on each side of the target), plus one single-event probe for each session
+/// bound a window read does not reach (module documentation).
 ///
 /// `read` performs `session_history_page` for `load.session_id` (a daemon client or a managed
 /// session command handle).
@@ -160,15 +178,35 @@ where
                         }
                         None => EventRange::default(),
                     };
-                    (page.events, false, page.has_more)
+                    return Ok(HistoryLoaded::Window(HistoryWindowResult {
+                        generation: issued.generation,
+                        target: issued.request,
+                        last_available_sequence: (!page.has_more)
+                            .then(|| page.events.last().map(|event| event.sequence))
+                            .flatten(),
+                        events: page.events,
+                        has_older: false,
+                        has_newer: page.has_more,
+                        first_available_sequence: None,
+                    }));
                 }
+            };
+            let first_available_sequence = if has_older {
+                read.edge(Forward).await?
+            } else {
+                events.first().map(|event| event.sequence)
+            };
+            let last_available_sequence = if has_newer {
+                read.edge(Backward).await?
+            } else {
+                events.last().map(|event| event.sequence)
             };
             Ok(HistoryLoaded::Window(window_result(
                 issued.generation,
                 issued.request,
                 events,
-                has_older,
-                has_newer,
+                (has_older, has_newer),
+                (first_available_sequence, last_available_sequence),
             )))
         }
     }
@@ -235,23 +273,38 @@ where
             has_more: page.has_more,
         })
     }
+
+    /// The sequence at one end of the session (`Forward`: first, `Backward`: last), read with
+    /// a single-event probe; `None` for an empty session.
+    async fn edge(
+        &mut self,
+        direction: SessionHistoryDirection,
+    ) -> Result<Option<u64>, ClientError> {
+        let probe = self.range(None, 1, direction).await?;
+        Ok(probe.events.first().map(|event| event.sequence))
+    }
 }
 
-/// A window result with session bounds known from the read: the first available sequence when
-/// nothing older exists, the last available sequence when nothing newer exists (W12 hints).
+/// A window result with its session bounds (W12 hints). A bound is never inside the returned
+/// events: a probe that raced a concurrent append or disagrees with the window is widened to
+/// the window's own edge, since the estimate is presentation only.
 fn window_result(
     generation: u64,
     target: WindowRequest,
     events: Vec<SessionEvent>,
-    has_older: bool,
-    has_newer: bool,
+    (has_older, has_newer): (bool, bool),
+    (first, last): (Option<u64>, Option<u64>),
 ) -> HistoryWindowResult {
-    let first_available_sequence = (!has_older)
-        .then(|| events.first().map(|event| event.sequence))
-        .flatten();
-    let last_available_sequence = (!has_newer)
-        .then(|| events.last().map(|event| event.sequence))
-        .flatten();
+    let window_first = events.first().map(|event| event.sequence);
+    let window_last = events.last().map(|event| event.sequence);
+    let first_available_sequence = match (first, window_first) {
+        (Some(first), Some(window)) => Some(first.min(window)),
+        (first, window) => first.or(window),
+    };
+    let last_available_sequence = match (last, window_last) {
+        (Some(last), Some(window)) => Some(last.max(window)),
+        (last, window) => last.or(window),
+    };
     HistoryWindowResult {
         generation,
         target,
@@ -273,7 +326,9 @@ mod tests {
         SessionHistoryQuery, SessionId,
     };
     use bcode_tui_transcript::engine::HostRequest;
-    use bcode_tui_transcript::window::{IssuedRequest, PageDirection, PageRequest, WindowRequest};
+    use bcode_tui_transcript::window::{
+        IssuedRequest, PageCaps, PageDirection, PageRequest, WindowRequest,
+    };
 
     use super::{HistoryLane, HistoryLoad, HistoryLoaded, load_history};
 
@@ -290,25 +345,43 @@ mod tests {
         }
     }
 
-    /// A daemon double over sequences `1..=last`, recording every query.
+    /// A daemon double over sequences `first..=last`, recording every query.
     struct Daemon {
         session_id: SessionId,
+        first: u64,
         last: u64,
         queries: RefCell<Vec<SessionHistoryQuery>>,
     }
 
     impl Daemon {
         fn new(last: u64) -> Self {
+            Self::spanning(1, last)
+        }
+
+        fn spanning(first: u64, last: u64) -> Self {
             Self {
                 session_id: SessionId::new(),
+                first,
                 last,
                 queries: RefCell::new(Vec::new()),
             }
         }
 
+        /// Every query was bounded by the window caps; returns the number of reads.
+        fn bounded_reads(&self) -> usize {
+            let queries = self.queries.borrow();
+            assert!(
+                queries
+                    .iter()
+                    .all(|query| query.limit <= PageCaps::WINDOW.max_events_scanned),
+                "{queries:?}"
+            );
+            queries.len()
+        }
+
         fn read(&self, query: SessionHistoryQuery) -> SessionHistoryPage {
             self.queries.borrow_mut().push(query);
-            let all = (1..=self.last).collect::<Vec<_>>();
+            let all = (self.first..=self.last).collect::<Vec<_>>();
             let selected: Vec<u64> = match query.direction {
                 SessionHistoryDirection::Forward => all
                     .into_iter()
@@ -402,8 +475,72 @@ mod tests {
         assert!(result.has_older);
         assert!(!result.has_newer);
         assert_eq!(result.last_available_sequence, Some(2_000));
-        assert_eq!(result.first_available_sequence, None);
-        assert_eq!(daemon.queries.borrow().len(), 1, "one read (W10)");
+        assert_eq!(
+            result.first_available_sequence,
+            Some(1),
+            "session start probed"
+        );
+        assert_eq!(
+            daemon.bounded_reads(),
+            2,
+            "one window read and one bound probe"
+        );
+        let probe = daemon.queries.borrow()[1];
+        assert_eq!(
+            (probe.cursor, probe.limit, probe.direction),
+            (None, 1, SessionHistoryDirection::Forward)
+        );
+    }
+
+    #[test]
+    fn window_bounds_are_the_session_bounds_not_the_resident_edges() {
+        let daemon = Daemon::spanning(101, 5_000);
+        let HistoryLoaded::Window(tail) = daemon.load(window(WindowRequest::Tail), None) else {
+            panic!("window result");
+        };
+        assert_eq!(
+            (tail.first_available_sequence, tail.last_available_sequence),
+            (Some(101), Some(5_000))
+        );
+        let HistoryLoaded::Window(head) = daemon.load(window(WindowRequest::Head), None) else {
+            panic!("window result");
+        };
+        assert_eq!(sequences(&head.events), (101, 612, 512));
+        assert_eq!(
+            (head.first_available_sequence, head.last_available_sequence),
+            (Some(101), Some(5_000))
+        );
+        let HistoryLoaded::Window(around) =
+            daemon.load(window(WindowRequest::Around { sequence: 2_500 }), None)
+        else {
+            panic!("window result");
+        };
+        assert_eq!(
+            (
+                around.first_available_sequence,
+                around.last_available_sequence
+            ),
+            (Some(101), Some(5_000))
+        );
+        // Tail: window + start probe; Head: window + end probe; Around: two halves + two
+        // probes. No read scans more than one window.
+        assert_eq!(daemon.bounded_reads(), 2 + 2 + 4);
+    }
+
+    #[test]
+    fn a_window_reaching_both_session_ends_needs_no_probe() {
+        let daemon = Daemon::new(40);
+        let HistoryLoaded::Window(result) = daemon.load(window(WindowRequest::Tail), None) else {
+            panic!("window result");
+        };
+        assert_eq!(
+            (
+                result.first_available_sequence,
+                result.last_available_sequence
+            ),
+            (Some(1), Some(40))
+        );
+        assert_eq!(daemon.bounded_reads(), 1);
     }
 
     #[test]
@@ -416,6 +553,11 @@ mod tests {
         assert!(!result.has_older);
         assert!(result.has_newer);
         assert_eq!(result.first_available_sequence, Some(1));
+        assert_eq!(
+            result.last_available_sequence,
+            Some(2_000),
+            "session end probed"
+        );
     }
 
     #[test]

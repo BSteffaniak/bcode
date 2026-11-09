@@ -233,14 +233,19 @@ impl TranscriptEngine {
         update
     }
 
-    /// Reduce a `Geometry` input with the effective viewport (F6). The width is unchanged, so
-    /// nothing is re-measured.
-    fn apply_effective_geometry(&mut self) -> EngineUpdate {
-        let effective = self.latest.effective();
+    /// Reduce a `Geometry` input with the effective viewport (F6, VP4). A latest-bar change
+    /// keeps the width, so nothing is re-measured; a scrollbar gutter change re-measures
+    /// resident units at the new content width (L9).
+    pub(super) fn apply_effective_geometry(&mut self) -> EngineUpdate {
+        let effective = self.content_geometry();
         if effective == self.geometry {
             return EngineUpdate::default();
         }
+        let width_changed = effective.width != self.geometry.width;
         self.geometry = effective;
+        if width_changed {
+            self.remeasure();
+        }
         let effects = self.reduce_input(
             NavInput::Geometry {
                 viewport: effective,

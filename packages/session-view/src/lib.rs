@@ -20,6 +20,7 @@ pub mod external_projection;
 mod external_reducer;
 pub mod navigation;
 pub mod presentation;
+pub mod window_ops;
 
 pub use actions::{
     execute_session_view_action, hydrate_submission_queue, submission_queue_needs_refresh,
@@ -1858,6 +1859,8 @@ pub struct SessionView {
     usage_cost_revision: u64,
     usage_checkpoint: Option<u64>,
     external: external_reducer::ExternalSessionState,
+    /// Resident-window bookkeeping for [`window_ops`]; untouched by the other reducers.
+    window: window_ops::WindowTracking,
 }
 
 // Called only after the complete selected entry graph is admitted. Originals
@@ -4489,6 +4492,7 @@ impl SessionView {
             usage_cost_revision: 0,
             usage_checkpoint: None,
             external: external_reducer::ExternalSessionState::default(),
+            window: window_ops::WindowTracking::default(),
         }
     }
 
@@ -4616,6 +4620,8 @@ impl SessionView {
             usage_cost_revision: _,
             usage_checkpoint: _,
             external,
+            // Id/revision ledger of window operations; bounded by the resident items.
+            window: _,
         } = self;
         let mut usage = bcode_session_view_models::retention::inspect_snapshot(snapshot, limits)?;
         for mut nested in [
@@ -5526,6 +5532,15 @@ impl SessionView {
     /// pending checkpoints, runtime work, plugin status, skills, and composer state remain
     /// available until newer authoritative data replaces them.
     pub fn rebuild_history_window(&mut self, events: &[SessionEvent]) {
+        self.rebuild_history_window_with(events, Self::apply_event);
+    }
+
+    /// [`Self::rebuild_history_window`] applying each window event with `apply`.
+    fn rebuild_history_window_with(
+        &mut self,
+        events: &[SessionEvent],
+        mut apply: impl FnMut(&mut Self, &SessionEvent),
+    ) {
         // Live-only stream items (including terminal tombstones awaiting a durable event)
         // are not part of the resident history window. Reapply them after replay so an older
         // durable message cannot finish a newer stream, while a matching canonical item wins.
@@ -5551,7 +5566,9 @@ impl SessionView {
         let last_updates = std::mem::take(&mut self.last_text_stream_updates);
         let live_reasoning = std::mem::take(&mut self.live_reasoning);
         self.clear_history_window();
-        self.apply_history(events);
+        for event in events {
+            apply(self, event);
+        }
         let finished_turns = events
             .iter()
             .filter_map(|event| match &event.kind {

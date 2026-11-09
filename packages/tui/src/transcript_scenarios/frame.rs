@@ -81,6 +81,8 @@ pub struct ScenarioFrame {
     pub focus: FocusObservation,
     /// Focused transcript unit, rendered as an engine-neutral label, in unit focus mode.
     pub focused_target: Option<String>,
+    /// Terminal area of the transcript scrollbar track, when one is presented (X6).
+    pub scrollbar: Option<CellRect>,
 }
 
 impl ScenarioFrame {
@@ -192,6 +194,23 @@ impl ScenarioFrame {
             .find_map(|at| shifts.get(&at.marker).copied())
     }
 
+    /// Rows of the scrollbar track (relative to the track top) that paint the thumb symbol
+    /// `thumb`; empty when no scrollbar is presented.
+    #[must_use]
+    pub fn scrollbar_thumb_rows(&self, thumb: &str) -> Vec<u16> {
+        let Some(track) = self.scrollbar else {
+            return Vec::new();
+        };
+        (0..track.height)
+            .filter(|offset| {
+                self.rows
+                    .get(usize::from(track.y.saturating_add(*offset)))
+                    .and_then(|row| row.chars().nth(usize::from(track.x)))
+                    .is_some_and(|cell| thumb.chars().eq(std::iter::once(cell)))
+            })
+            .collect()
+    }
+
     /// Whole frame as text with a transcript-area gutter, for failure messages.
     #[must_use]
     pub fn text(&self) -> String {
@@ -240,6 +259,7 @@ mod tests {
             motion_running: false,
             focus: FocusObservation::Composer,
             focused_target: None,
+            scrollbar: None,
         }
     }
 
