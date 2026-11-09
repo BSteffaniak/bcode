@@ -127,3 +127,6 @@ pub(crate) fn wire<T: Serialize>(value: &T, maximum: usize) -> Result<(), Harnes
     serde_json::to_writer(Counter { bytes: 0, maximum }, value)
         .map_err(|_| HarnessContractError::BoundsExceeded)
 }
+
+mod registrations;
+pub use registrations::*;

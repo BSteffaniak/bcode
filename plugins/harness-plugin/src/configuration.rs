@@ -8,6 +8,8 @@
 //! The host must register this service only for the enabled generic plugin and must re-admit the
 //! returned instance through the managed application boundary before any execution or auth effect.
 
+mod registrations;
+
 use std::collections::BTreeMap;
 
 use bcode_harness_models::{HarnessAuthBinding, HarnessAuthCustody, HarnessInstance};
@@ -356,6 +358,9 @@ pub(crate) fn invoke(context: &NativeServiceContext) -> ServiceResponse {
     };
     if context.request.payload.len() > request_budget {
         return ServiceResponse::error("invalid_request", "invalid managed configuration request");
+    }
+    if context.request.operation.starts_with("registrations_") {
+        return registrations::invoke(context);
     }
     match context.request.operation.as_str() {
         CATALOG_OPERATION => {

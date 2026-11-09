@@ -1297,6 +1297,8 @@ pub struct ResolvedPluginConfig {
     pub config: serde_json::Value,
     pub redacted_config: serde_json::Value,
     pub state_root: Option<PathBuf>,
+    /// Host-authorized durable plugin-owned state, independent of artifact caches.
+    pub durable_state_root: Option<PathBuf>,
     secret_resolver: Option<PluginSecretResolver>,
 }
 
@@ -1307,6 +1309,7 @@ impl std::fmt::Debug for ResolvedPluginConfig {
             .field("config", &self.config)
             .field("redacted_config", &self.redacted_config)
             .field("state_root", &self.state_root)
+            .field("durable_state_root", &self.durable_state_root)
             .field("has_secret_resolver", &self.secret_resolver.is_some())
             .finish()
     }
@@ -1318,6 +1321,7 @@ impl Default for ResolvedPluginConfig {
             config: serde_json::Value::Null,
             redacted_config: serde_json::Value::Null,
             state_root: None,
+            durable_state_root: None,
             secret_resolver: None,
         }
     }
@@ -1331,6 +1335,7 @@ impl ResolvedPluginConfig {
             config,
             redacted_config,
             state_root: None,
+            durable_state_root: None,
             secret_resolver: None,
         }
     }
@@ -1339,6 +1344,13 @@ impl ResolvedPluginConfig {
     #[must_use]
     pub fn with_state_root(mut self, state_root: PathBuf) -> Self {
         self.state_root = Some(state_root);
+        self
+    }
+
+    /// Attach durable plugin storage separately from disposable artifact-local caches.
+    #[must_use]
+    pub fn with_durable_state_root(mut self, root: PathBuf) -> Self {
+        self.durable_state_root = Some(root);
         self
     }
 
@@ -1928,6 +1940,7 @@ impl LoadedPlugin {
                 redacted_config: config.redacted_config.clone(),
                 secrets,
                 state_root: config.state_root.clone(),
+                durable_state_root: config.durable_state_root.clone(),
             },
             events: bcode_plugin_sdk::ServiceEventEmitter::default(),
             cancellation: bcode_plugin_sdk::ServiceCancellation::default(),
@@ -4350,6 +4363,34 @@ pub struct PluginServiceConfigView {
 }
 
 impl PluginServiceConfigView {
+    /// Copy the host-admitted, non-secret configuration values for service composition.
+    #[must_use]
+    pub fn configuration_values(&self) -> BTreeMap<String, serde_json::Value> {
+        self.configs
+            .iter()
+            .map(|(id, config)| (id.clone(), config.config.clone()))
+            .collect()
+    }
+
+    /// Derive an immutable service view without changing enabled plugins, roots or resolvers.
+    /// # Errors
+    /// Rejects replacement entries outside this admitted view.
+    pub fn with_configuration_values(
+        &self,
+        values: BTreeMap<String, serde_json::Value>,
+    ) -> Result<Self, PluginLoadError> {
+        let mut configs = (*self.configs).clone();
+        for (id, value) in values {
+            let config = configs
+                .get_mut(&id)
+                .ok_or_else(|| PluginLoadError::PluginNotLoaded(id.clone()))?;
+            config.config = value.clone();
+            // Derived values are not a diagnostic disclosure grant.
+            config.redacted_config = serde_json::Value::Null;
+        }
+        Ok(self.runtime.service_config_view(configs))
+    }
+
     /// Whether two handles refer to the same immutable service configuration view.
     #[must_use]
     pub fn same_config_view(&self, other: &Self) -> bool {

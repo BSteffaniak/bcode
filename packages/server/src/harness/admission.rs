@@ -586,9 +586,13 @@ impl CanonicalManagedAdmission {
             ownership_hold: Box::new(hold),
             fresh_begin_authorized: false,
         };
-        let inspected = super::HarnessPluginTransport::new(self.store.state()?)
-            .inspect_auth(&admission)
-            .await?;
+        let inspected = {
+            let state = self.store.state()?;
+            let view = super::configuration_views::for_session(&state, session_id).await?;
+            super::HarnessPluginTransport::with_view(state, view)
+                .inspect_auth(&admission)
+                .await?
+        };
         // Inspection performs native I/O. Recheck the retained caller after that await as
         // well as keeping the canonical guard, so revoked client scope cannot enable begin.
         self.authorize(caller, session_id, false).await?;

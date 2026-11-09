@@ -16,10 +16,17 @@ invocation_operations = ["invoke"]
 name                  = "Managed External Session Commands"
 
 [[services]]
-class                 = "service"
-interface_id          = "bcode.harness.configuration/v1"
-invocation_operations = ["catalog", "prepare", "prepare_setup"]
-name                  = "Configured Managed Harness Instances"
+class = "service"
+interface_id = "bcode.harness.configuration/v1"
+invocation_operations = [
+    "catalog",
+    "prepare",
+    "prepare_setup",
+    "registrations_snapshot",
+    "registrations_resolve",
+    "registrations_commit",
+]
+name = "Configured Managed Harness Instances"
 
 [[services]]
 class        = "service"

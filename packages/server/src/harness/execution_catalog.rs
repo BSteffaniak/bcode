@@ -140,14 +140,20 @@ pub async fn discover(
             }),
         }
     }
-    let harnesses = discover_harnesses(
-        state,
-        &request.request_id,
-        request.instances,
-        &mut issues,
-        super::configuration_views::for_caller(state, caller).await?,
-    )
-    .await;
+    // An empty native inventory must not make provider discovery depend on optional
+    // registration storage health.
+    let harnesses = if request.instances.is_empty() {
+        Vec::new()
+    } else {
+        discover_harnesses(
+            state,
+            &request.request_id,
+            request.instances,
+            &mut issues,
+            super::configuration_views::for_caller(state, caller).await?,
+        )
+        .await
+    };
     let models = state
         .model_catalog
         .resolve_execution_catalog(providers, harnesses)

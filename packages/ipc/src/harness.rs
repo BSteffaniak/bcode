@@ -218,6 +218,12 @@ pub enum ManagedSessionOperation {
     DiscoverCandidates,
     /// Revalidate one selected installation without committing configuration.
     PrepareCandidate,
+    /// Revalidate and commit a reviewed native registration to user state.
+    CommitRegistration,
+    /// Read the bounded local registration snapshot.
+    RegistrationSnapshot,
+    /// Resolve declarations and local registrations without execution.
+    RegistrationResolution,
     /// Attachment-owned daemon ingestion: drain once, then keep committing native pages
     /// while the attached client stays admitted. Uses the attachment poll request shape.
     Watch,
@@ -234,6 +240,9 @@ impl ManagedSessionOperation {
             Self::ExecutionCatalog => "execution_catalog",
             Self::StartSelected => "start_selected",
             Self::DiscoverCandidates => "discover_candidates",
+            Self::CommitRegistration => "commit_registration",
+            Self::RegistrationSnapshot => "registration_snapshot",
+            Self::RegistrationResolution => "registration_resolution",
             Self::PrepareCandidate => "prepare_candidate",
             Self::Recover => "recover",
             Self::Binding => "binding",
@@ -302,6 +311,15 @@ pub struct ManagedCandidatesResponse {
     pub plugins: Vec<bcode_harness_models::HarnessCandidatesResponse>,
     /// False if enabled service fanout exceeded the bounded inspection budget.
     pub complete: bool,
+}
+
+/// Reviewed native registration commit. The server re-prepares the exact candidate before saving.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ManagedRegistrationCommitRequest {
+    pub prepare: bcode_harness_models::HarnessPrepareCandidateRequest,
+    pub expected_revision: String,
+    pub expected_registration: bcode_harness_models::Registration,
 }
 
 /// Bounded discovery inputs. Instances are references revalidated by their owning plugin.

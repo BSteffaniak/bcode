@@ -148,6 +148,43 @@ impl ManagedSessionClient {
         Ok(response)
     }
 
+    /// Read local registrations without modifying declarative configuration.
+    /// # Errors
+    /// Returns transport, unsupported-state and registration-store failures.
+    pub async fn native_registration_snapshot(
+        &self,
+    ) -> Result<bcode_harness_models::RegistrationSnapshot, ClientError> {
+        self.execution_request(
+            ManagedSessionOperation::RegistrationSnapshot,
+            &serde_json::json!({}),
+        )
+        .await
+    }
+
+    /// Resolve declared and locally added registrations using the authenticated launch selection.
+    /// # Errors
+    /// Returns source-verification, transport and registration-store failures.
+    pub async fn native_registration_resolution(
+        &self,
+    ) -> Result<bcode_harness_models::RegistrationResolution, ClientError> {
+        self.execution_request(
+            ManagedSessionOperation::RegistrationResolution,
+            &serde_json::json!({}),
+        )
+        .await
+    }
+
+    /// Revalidate and save one reviewed native installation without changing configuration.
+    /// # Errors
+    /// Rejects changed candidates, stale revisions, policy conflicts and transport failures.
+    pub async fn commit_native_registration(
+        &self,
+        request: bcode_ipc::harness::ManagedRegistrationCommitRequest,
+    ) -> Result<bcode_harness_models::RegistrationSnapshot, ClientError> {
+        self.execution_request(ManagedSessionOperation::CommitRegistration, &request)
+            .await
+    }
+
     /// List enabled provider identities for execution discovery without materializing model credentials.
     /// # Errors
     /// Returns application or transport failures; never performs provider requests.
@@ -470,7 +507,31 @@ fn validate_route(interface: &str, operation: &str, payload: &[u8]) -> Result<()
     if operation != request.operation.as_str() {
         return Err(invalid());
     }
-    if request.operation == ManagedSessionOperation::PrepareCandidate {
+    if matches!(
+        request.operation,
+        ManagedSessionOperation::RegistrationSnapshot
+            | ManagedSessionOperation::RegistrationResolution
+    ) {
+        serde_json::from_str::<CatalogRequest>(&request.request_json).map_err(|_| invalid())?;
+    } else if request.operation == ManagedSessionOperation::CommitRegistration {
+        let query: bcode_ipc::harness::ManagedRegistrationCommitRequest =
+            serde_json::from_str(&request.request_json).map_err(|_| invalid())?;
+        query.prepare.validate().map_err(|_| invalid())?;
+        query
+            .expected_registration
+            .instance
+            .validate()
+            .map_err(|_| invalid())?;
+        if query.expected_revision.len() != 64
+            || !query
+                .expected_revision
+                .bytes()
+                .all(|byte| byte.is_ascii_hexdigit())
+            || !query.expected_registration.adapter_settings.is_object()
+        {
+            return Err(invalid());
+        }
+    } else if request.operation == ManagedSessionOperation::PrepareCandidate {
         request.decode_prepare_candidate().map_err(|_| invalid())?;
     } else if request.operation == ManagedSessionOperation::DiscoverCandidates {
         let query: bcode_ipc::harness::ManagedCandidatesRequest =

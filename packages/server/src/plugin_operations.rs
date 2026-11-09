@@ -314,6 +314,16 @@ fn command_callback_owner(
         })
 }
 
+fn require_public_operation(interface_id: &str, operation: &str) -> Result<(), PublicPluginError> {
+    if interface_id == "bcode.harness.configuration/v1" && operation.starts_with("registrations_") {
+        return Err(PublicPluginError {
+            code: "host_only_service",
+            message: "native registration operations require application admission",
+        });
+    }
+    Ok(())
+}
+
 fn require_public_service(interface_id: &str) -> Result<(), PublicPluginError> {
     if interface_id == bcode_harness_models::MANAGED_TOOL_QUEUE_INTERFACE_ID {
         return Err(PublicPluginError {
@@ -331,6 +341,7 @@ pub async fn invoke_service(
     operation: String,
     payload: Vec<u8>,
 ) -> Result<PluginServiceOperationResult, PublicPluginError> {
+    require_public_operation(interface_id, &operation)?;
     require_public_service(interface_id)?;
     let plugin_id = plugin_id.to_owned();
     let interface_id = interface_id.to_owned();

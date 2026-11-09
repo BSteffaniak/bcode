@@ -467,6 +467,35 @@ Selection is unavailable until the current turn and pending native interactions 
 Cancellation and errors return to the originating conversation without provider fallback;
 uncertain starts must be inspected in Sessions before another creation attempt.
 
+## Declarative configuration and local native registrations
+
+Native installations can be declared in `bcode.toml` or added interactively through
+Setup. Interactive setup never rewrites declarative configuration, including Nix-managed
+symlinks. Its version-one registration document lives at
+`<state-root>/plugins/bcode.harness/native-registrations.json`, independently of daemon
+artifact caches. Credentials and login sessions remain owned by the native agent.
+
+The generic harness plugin resolves declarations and local registrations together. A declared
+instance ID wins as a whole, including disabled declarations; adapter settings are not merged
+field-by-field across different installations. Differing local registrations are reported as
+shadowed. Explicit plugin disables cannot be overridden by local registrations. A local entry
+may be promoted into declarative configuration using the same ID without creating duplicate
+execution choices. Adding an installation does not change the startup model default.
+
+Registration uses a reviewed, freshly re-prepared native candidate and an optimistic state
+revision. Atomic replacement under a filesystem lock prevents lost updates; unsupported or
+corrupt documents are preserved and fail closed within native discovery/setup. Normal provider
+operation does not depend on native registration health. Source verification can retain exact
+loader-selected symlink targets for reading without granting authority to edit those targets;
+a changed target requires a new launch/review. Active native sessions retain their exact admitted
+configuration rather than switching account or executable after a configuration change.
+
+Setup reuses a matching effective installation. Existing native login is inspected rather than
+persisted as readiness; sign-in uses the agent's own authentication flow. Cancelling before
+registration confirmation writes nothing. Cancelling login after registration leaves a registered
+installation whose authentication can be completed later. F2 remains available while model
+discovery is pending or fails; discovered unregistered tools are identified in picker status.
+
 ## TUI managed chat parity
 
 The TUI presents a managed conversation in the same root UI as a native Bcode chat. The

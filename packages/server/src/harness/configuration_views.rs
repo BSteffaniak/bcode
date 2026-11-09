@@ -3,6 +3,7 @@ use std::{collections::BTreeMap, sync::Arc};
 
 use bcode_plugin::PluginServiceConfigView;
 use bcode_session_models::{ClientId, SessionId};
+use sha2::Digest as _;
 
 use super::{HarnessOwner, ManagedHarnessError};
 use crate::harness_dispatch::ManagedCaller;
@@ -198,6 +199,12 @@ pub fn baseline(
         for id in state.plugins.registry().manifests().keys() {
             configs.entry(id.clone()).or_default();
         }
+        for (id, config) in &mut configs {
+            config.durable_state_root = Some(bcode_plugin_config::plugin_state_root(
+                &state.state_root.join("plugins"),
+                id,
+            ));
+        }
         state.plugins.service_config_view(configs)
     });
     if view.runtime_generation() != state.plugins.runtime_generation() {
@@ -215,11 +222,49 @@ pub async fn for_client(
     state: &Arc<crate::ServerState>,
     client_id: ClientId,
 ) -> Result<PluginServiceConfigView, ManagedHarnessError> {
+    let view =
+        super::registrations::effective(declarative_for_client(state, client_id).await?).await?;
+    let encoded = serde_json::to_vec(&view.configuration_values())
+        .map_err(|_| ManagedHarnessError::Invalid)?;
+    let digest = sha2::Sha256::digest(encoded)
+        .iter()
+        .fold(String::new(), |mut text, byte| {
+            use std::fmt::Write as _;
+            let _ = write!(text, "{byte:02x}");
+            text
+        });
+    state.harness_configuration_views.retain(digest, view).await
+}
+
+fn verify_startup_sources(
+    state: &crate::ServerState,
+    context: &bcode_ipc::ClientRuntimeContext,
+    supplied: &bcode_config::BcodeConfig,
+) -> Result<(), ManagedHarnessError> {
+    if let Some(authority) = &state.startup_config_authority {
+        let sources = context
+            .config_launch
+            .as_ref()
+            .and_then(|launch| launch.recovery_sources.as_ref())
+            .ok_or(ManagedHarnessError::Invalid)?;
+        authority
+            .verify(supplied, sources)
+            .map_err(|_| ManagedHarnessError::Conflict)?;
+    }
+    Ok(())
+}
+
+/// Verify declarative launch inputs without incorporating mutable registration state.
+pub async fn declarative_for_client(
+    state: &Arc<crate::ServerState>,
+    client_id: ClientId,
+) -> Result<PluginServiceConfigView, ManagedHarnessError> {
     let context = state
         .client_runtime_context(client_id)
         .await
         .ok_or(ManagedHarnessError::StaleOwner)?;
     let startup = state.startup_config.clone();
+    let durable_root = state.state_root.join("plugins");
     tracing::trace!(target: "bcode_server::harness",
         supplied_config = context.effective_config_toml.is_some(),
         launch = context.config_launch.is_some(), "managed client configuration view");
@@ -231,6 +276,7 @@ pub async fn for_client(
             if serde_json::to_value(&supplied).map_err(|_| ManagedHarnessError::Invalid)?
                 == serde_json::to_value(&startup).map_err(|_| ManagedHarnessError::Invalid)?
             {
+                verify_startup_sources(state, &context, &supplied)?;
                 return baseline(state);
             }
         }
@@ -290,12 +336,16 @@ pub async fn for_client(
         }
         let digest = bcode_config::recovery::execution_fingerprint(&config)
             .map_err(|_| ManagedHarnessError::Invalid)?;
-        let configs = bcode_plugin_config::resolve_plugin_configs_for_manifests(
+        let mut configs = bcode_plugin_config::resolve_plugin_configs_for_manifests(
             &config,
             manifests.values(),
             &crate::managed_plugin_state_base(),
             &BTreeMap::new(),
         );
+        for (id, configuration) in &mut configs {
+            configuration.durable_state_root =
+                Some(bcode_plugin_config::plugin_state_root(&durable_root, id));
+        }
         Ok((digest, configs))
     })
     .await
@@ -368,7 +418,7 @@ pub(super) async fn for_owner(
     Ok(view)
 }
 
-pub(super) async fn for_session(
+pub async fn for_session(
     state: &Arc<crate::ServerState>,
     session: SessionId,
 ) -> Result<PluginServiceConfigView, ManagedHarnessError> {
@@ -402,7 +452,9 @@ pub(super) async fn for_session(
     match state.harness_configuration_views.get(&owner).await {
         Ok(view) if view.runtime_generation() == state.plugins.runtime_generation() => Ok(view),
         Ok(_) => Err(ManagedHarnessError::StaleOwner),
-        Err(ManagedHarnessError::Unavailable) => baseline(state),
+        Err(ManagedHarnessError::Unavailable) => {
+            super::registrations::effective(baseline(state)?).await
+        }
         Err(error) => Err(error),
     }
 }

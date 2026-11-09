@@ -55,6 +55,7 @@ pub struct ConfigSourceAuthority {
     cwd: PathBuf,
     targets: Vec<PathBuf>,
     roots: Vec<PathBuf>,
+    read_only: bool,
 }
 
 impl ConfigSourceAuthority {
@@ -66,6 +67,21 @@ impl ConfigSourceAuthority {
     /// Rejects inline/unavailable provenance, excessive source bounds, traversal,
     /// missing required layers, invalid parents, and symlinked file targets.
     pub fn capture(sources: &ConfigRecoverySources) -> Result<Self, ConfigRecoveryError> {
+        Self::capture_kind(sources, false)
+    }
+
+    /// Retain exact loader-selected read sources, including immutable symlink targets.
+    /// This conveys no permission to edit those sources or replay arbitrary persisted paths.
+    /// # Errors
+    /// Rejects invalid, excessive or unavailable launch provenance.
+    pub fn capture_read_only(sources: &ConfigRecoverySources) -> Result<Self, ConfigRecoveryError> {
+        Self::capture_kind(sources, true)
+    }
+
+    fn capture_kind(
+        sources: &ConfigRecoverySources,
+        read_only: bool,
+    ) -> Result<Self, ConfigRecoveryError> {
         if sources.inline_overrides || !sources.cwd.is_absolute() {
             return Err(ConfigRecoveryError::Unavailable);
         }
@@ -80,7 +96,7 @@ impl ConfigSourceAuthority {
         let mut targets = Vec::with_capacity(paths.len());
         let mut roots = Vec::with_capacity(paths.len());
         for (path, required) in paths {
-            let (target, root) = authority_target(path, &sources.cwd, required)?;
+            let (target, root) = authority_target_kind(path, &sources.cwd, required, read_only)?;
             targets.push(target);
             roots.push(root);
         }
@@ -89,6 +105,7 @@ impl ConfigSourceAuthority {
             cwd,
             targets,
             roots,
+            read_only,
         })
     }
 
@@ -118,12 +135,28 @@ impl ConfigSourceAuthority {
         }
         for ((path, required), expected) in authority_paths(sources)?.into_iter().zip(&self.targets)
         {
-            let (target, _) = authority_target(path, &self.sources.cwd, required)?;
+            let (target, _) =
+                authority_target_kind(path, &self.sources.cwd, required, self.read_only)?;
             if &target != expected {
                 return Err(ConfigRecoveryError::SourceBounds);
             }
         }
-        capture_with_sources(config, sources, &self.roots)
+        if self.read_only {
+            let (replayed, source_presence) =
+                replay_inner(sources, &self.roots, Some(&self.targets))?;
+            let execution_digest = execution_fingerprint(config)?;
+            if execution_digest != execution_fingerprint(&replayed)? {
+                return Err(ConfigRecoveryError::Changed);
+            }
+            Ok(ConfigRecoveryReference {
+                schema_version: CONFIG_RECOVERY_VERSION,
+                sources: sources.clone(),
+                execution_digest,
+                source_presence,
+            })
+        } else {
+            capture_with_sources(config, sources, &self.roots)
+        }
     }
 }
 
@@ -168,6 +201,40 @@ fn authority_paths(
         return Err(ConfigRecoveryError::SourceBounds);
     }
     Ok(paths)
+}
+
+fn authority_target_kind(
+    path: &Path,
+    cwd: &Path,
+    required: bool,
+    read_only: bool,
+) -> Result<(PathBuf, PathBuf), ConfigRecoveryError> {
+    let selected = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        cwd.join(path)
+    };
+    if read_only && selected.exists() {
+        if selected
+            .components()
+            .any(|part| matches!(part, std::path::Component::ParentDir))
+        {
+            return Err(ConfigRecoveryError::SourceBounds);
+        }
+        let target = selected
+            .canonicalize()
+            .map_err(|_| ConfigRecoveryError::InvalidSource)?;
+        if !target.is_file() {
+            return Err(ConfigRecoveryError::InvalidSource);
+        }
+        let parent = target
+            .parent()
+            .ok_or(ConfigRecoveryError::SourceBounds)?
+            .to_path_buf();
+        Ok((target, parent))
+    } else {
+        authority_target(path, cwd, required)
+    }
 }
 
 fn authority_target(
@@ -374,6 +441,14 @@ fn replay(
     sources: &ConfigRecoverySources,
     allowed_roots: &[PathBuf],
 ) -> Result<(BcodeConfig, Vec<bool>), ConfigRecoveryError> {
+    replay_inner(sources, allowed_roots, None)
+}
+
+fn replay_inner(
+    sources: &ConfigRecoverySources,
+    allowed_roots: &[PathBuf],
+    exact_targets: Option<&[PathBuf]>,
+) -> Result<(BcodeConfig, Vec<bool>), ConfigRecoveryError> {
     if sources.inline_overrides || !sources.cwd.is_absolute() {
         return Err(ConfigRecoveryError::Unavailable);
     }
@@ -418,8 +493,16 @@ fn replay(
     let mut merged = toml::Value::Table(toml::Table::new());
     let mut presence = Vec::with_capacity(paths.len());
     let mut remaining = MAX_BYTES;
-    for (path, required) in paths {
-        let path = confined(path, &sources.cwd, &roots)?;
+    for (index, (path, required)) in paths.into_iter().enumerate() {
+        let path = if let Some(targets) = exact_targets {
+            let (target, _) = authority_target_kind(path, &sources.cwd, required, true)?;
+            if targets.get(index) != Some(&target) {
+                return Err(ConfigRecoveryError::Changed);
+            }
+            target
+        } else {
+            confined(path, &sources.cwd, &roots)?
+        };
         let mut file = match File::open(&path) {
             Ok(file) => file,
             Err(error) if error.kind() == std::io::ErrorKind::NotFound && !required => {
@@ -675,6 +758,30 @@ mod tests {
             discovered_paths: names.iter().map(|name| directory.join(name)).collect(),
             ..Default::default()
         }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn selected_read_only_symlink_is_verified_without_edit_authority() {
+        let dir = tempfile::tempdir().unwrap();
+        let immutable = tempfile::tempdir().unwrap();
+        let first = immutable.path().join("first.toml");
+        let second = immutable.path().join("second.toml");
+        std::fs::write(&first, "[model]\nprofile='native'\n").unwrap();
+        std::fs::write(&second, "[model]\nprofile='native'\n").unwrap();
+        let link = dir.path().join("config.toml");
+        std::os::unix::fs::symlink(&first, &link).unwrap();
+        let sources = sources(dir.path(), &["config.toml"]);
+        let effective = replay(&sources, &[immutable.path().to_path_buf()])
+            .unwrap()
+            .0;
+        let authority = ConfigSourceAuthority::capture_read_only(&sources).unwrap();
+        assert!(authority.verify(&effective, &sources).is_ok());
+        assert!(ConfigSourceAuthority::capture(&sources).is_err());
+        assert!(capture(&effective, &sources, &[dir.path().to_path_buf()]).is_err());
+        std::fs::remove_file(&link).unwrap();
+        std::os::unix::fs::symlink(&second, &link).unwrap();
+        assert!(authority.verify(&effective, &sources).is_err());
     }
 
     #[test]

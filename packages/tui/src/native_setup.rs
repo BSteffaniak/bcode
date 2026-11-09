@@ -1,10 +1,7 @@
 //! Reviewed native-instance setup at the CLI boundary; native protocols stay plugin-owned.
 
 use crate::TuiError as CliError;
-use bcode_config::{
-    BcodeConfig,
-    edit::{PluginConfigurationUpdate, PolicyConfigEdit},
-};
+use bcode_config::BcodeConfig;
 use bcode_harness_models::{
     HarnessCandidateReadiness, HarnessInstallationCandidate, HarnessPrepareCandidateRequest,
     HarnessPrepareCandidateResponse, HarnessPrepareCandidateResponseKind, HarnessPreparedCandidate,
@@ -199,51 +196,6 @@ fn verify(
     Ok(())
 }
 
-fn plan(config: &BcodeConfig, prepared: &NativeSetup) -> Result<PolicyConfigEdit, CliError> {
-    let (current, launch) = bcode_config::recovery::load_current_config_with_recovery_context()?;
-    if bcode_config::recovery::execution_fingerprint(&current)
-        .map_err(|_| unavailable("configuration unreadable"))?
-        != bcode_config::recovery::execution_fingerprint(config)
-            .map_err(|_| unavailable("configuration unreadable"))?
-    {
-        return Err(unavailable("configuration changed"));
-    }
-    let sources = launch
-        .recovery_sources
-        .as_ref()
-        .ok_or_else(|| unavailable("configuration sources unknown"))?;
-    // A first run has no configuration directory yet; it must exist to be an authorized
-    // root for the configuration file this setup is about to create.
-    std::fs::create_dir_all(bcode_config::default_config_dir())
-        .map_err(|_| unavailable("configuration location unavailable"))?;
-    let roots = bcode_config::recovery::default_allowed_recovery_roots(&sources.cwd)
-        .map_err(|_| unavailable("configuration location unavailable"))?;
-    let reference = bcode_config::recovery::capture_with_sources(&current, sources, &roots)
-        .map_err(|_| unavailable("configuration snapshot failed"))?;
-    let adapter: toml::Value = toml::Value::try_from(&prepared.adapter_configuration)
-        .map_err(|_| unavailable("settings encoding"))?;
-    let generic: toml::Value = toml::Value::try_from(&prepared.harness.configuration)
-        .map_err(|_| unavailable("settings encoding"))?;
-    let updates = [
-        PluginConfigurationUpdate {
-            plugin_id: &prepared.native.instance.plugin_id,
-            expected: current
-                .plugins
-                .config
-                .get(&prepared.native.instance.plugin_id),
-            settings: &adapter,
-        },
-        PluginConfigurationUpdate {
-            plugin_id: "bcode.harness",
-            expected: current.plugins.config.get("bcode.harness"),
-            settings: &generic,
-        },
-    ];
-    Ok(bcode_config::edit::plan_native_setup_with_policy(
-        &current, &reference, &roots, &updates,
-    )?)
-}
-
 /// A readable instance identity derived from the plugin (`bcode.claude-code` becomes
 /// `claude-code`), suffixed only when that name is already configured.
 fn friendly_instance_id(config: &BcodeConfig, plugin_id: &str) -> String {
@@ -290,7 +242,50 @@ async fn configure(
     shell: &mut crate::TerminalShell,
     candidate: HarnessInstallationCandidate,
 ) -> Result<bool, CliError> {
-    let config = bcode_config::load_config()?;
+    let mut config = bcode_config::load_config()?;
+    let client = bcode_client::ManagedSessionClient::default_endpoint();
+    let snapshot = client.native_registration_snapshot().await?;
+    let resolution = client.native_registration_resolution().await?;
+    // Use the effective identity catalog for reuse and collision-free local IDs.
+    if resolution
+        .configurations
+        .get("bcode.harness")
+        .and_then(|value| value.get("enabled"))
+        == Some(&serde_json::json!(false))
+    {
+        return Err(unavailable(
+            "native registrations are disabled by configuration",
+        ));
+    }
+    if let Some(generic) = resolution.configurations.get("bcode.harness") {
+        if let Some(entries) = generic
+            .get("instances")
+            .and_then(serde_json::Value::as_object)
+        {
+            for entry in entries.values() {
+                if entry.get("enabled") == Some(&serde_json::json!(false)) {
+                    continue;
+                }
+                if let Some(value) = entry.get("instance") {
+                    let instance: bcode_harness_models::HarnessInstance =
+                        serde_json::from_value(value.clone())?;
+                    if instance.plugin_id == candidate.plugin_id
+                        && instance.executable == candidate.executable.invocation()
+                        && instance.config_namespace == candidate.config_namespace
+                    {
+                        if candidate.readiness != HarnessCandidateReadiness::ExistingNativeLogin {
+                            sign_in(shell, instance).await?;
+                        }
+                        return Ok(true);
+                    }
+                }
+            }
+        }
+        config.plugins.config.insert(
+            "bcode.harness".into(),
+            toml::Value::try_from(generic).map_err(|_| unavailable("invalid native catalog"))?,
+        );
+    }
     let request = HarnessPrepareCandidateRequest {
         schema_version: bcode_harness_models::HARNESS_SCHEMA_VERSION,
         request_id: uuid::Uuid::new_v4().to_string(),
@@ -298,11 +293,14 @@ async fn configure(
         candidate,
     };
     let (prepared, _) = prepare(&config, &request).await?;
-    let edit = plan(&config, &prepared)?;
+    let registration = bcode_harness_models::Registration {
+        instance: prepared.native.instance.clone(),
+        adapter_settings: prepared.native.adapter_settings.clone(),
+    };
     let outcome = crate::run_execution_confirmation_in_shell(shell, crate::QuickOnboardingInput {
         choices: vec![crate::QuickConnectionChoice {
             label: "Save and continue".into(),
-            detail: format!("{} · {} · saved to {}", bcode_session_view::external_projection::harness_display_label(&prepared.native.instance.plugin_id), home_relative(&prepared.native.instance.config_namespace), home_relative(&edit.path().display().to_string())),
+            detail: format!("{} · {} · saved to {}", bcode_session_view::external_projection::harness_display_label(&prepared.native.instance.plugin_id), home_relative(&prepared.native.instance.config_namespace), "Bcode local registration state"),
         }],
         recovery: Some("Bcode will remember this installation. Your other providers, models and credentials stay as they are, and nothing is sent yet.".into()),
     }).await?;
@@ -314,7 +312,13 @@ async fn configure(
     if fresh != prepared {
         return Err(unavailable("installation changed"));
     }
-    edit.apply()?;
+    client
+        .commit_native_registration(bcode_ipc::harness::ManagedRegistrationCommitRequest {
+            prepare: request,
+            expected_revision: snapshot.revision,
+            expected_registration: registration,
+        })
+        .await?;
     let instance = prepared.native.instance;
     let outcome = crate::run_backend_selection_in_shell(shell, crate::QuickOnboardingInput {
         choices: vec![

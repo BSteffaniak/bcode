@@ -292,6 +292,8 @@ pub(crate) struct PluginState {
     processes: BTreeMap<String, Process>,
     /// Failed opens are uncertain and cannot be silently repeated during this runtime.
     opens: BTreeMap<String, HarnessOpenRequest>,
+    /// Native-auth-required opens reserve identity without launching a conversation.
+    auth_prepared: BTreeMap<String, (HarnessInstance, HarnessPreparedSession)>,
     model_selections: BTreeMap<String, model_selection::RetainedSelection>,
     auth: auth::AuthFlows,
     tool_queues: BTreeMap<String, Arc<Mutex<tool_bridge::Queue>>>,
@@ -1271,7 +1273,69 @@ impl PluginState {
                     .target,
             )));
         }
+        if let Some((retained_instance, prepared)) = self.auth_prepared.get(&open.session_id) {
+            if retained_instance != instance || self.opens.get(&open.session_id) != Some(open) {
+                return Err(HarnessFailure::Conflict);
+            }
+            return Ok(Some(HarnessServiceResponseKind::Prepared(prepared.clone())));
+        }
         Ok(None)
+    }
+
+    // Reserve a host identity for managed auth without claiming a native conversation exists.
+    async fn prepare_auth_only(
+        &mut self,
+        instance: &HarnessInstance,
+        open: &HarnessOpenRequest,
+        options: &bcode_claude_code::LaunchOptions,
+    ) -> Result<Option<HarnessPreparedSession>, HarnessFailure> {
+        let status = bcode_claude_code::auth_status(options)
+            .await
+            .map_err(|_| HarnessFailure::Unavailable)?;
+        if status.logged_in {
+            return Ok(None);
+        }
+        let native_version = bcode_claude_code::installed_version(
+            &options.executable,
+            &options.cwd,
+            &options.environment,
+        )
+        .await
+        .map_err(|_| HarnessFailure::Unavailable)?;
+        let prepared = HarnessPreparedSession {
+            open_id: open.open_id.clone(),
+            session_id: open.session_id.clone(),
+            instance_id: instance.instance_id.clone(),
+            generation: open.generation,
+            native_version,
+            requested_native_session_id: Some(open.session_id.clone()),
+        };
+        prepared
+            .validate()
+            .map_err(|_| HarnessFailure::InvalidRequest)?;
+        self.opens.insert(open.session_id.clone(), open.clone());
+        self.auth_prepared.insert(
+            open.session_id.clone(),
+            (instance.clone(), prepared.clone()),
+        );
+        Ok(Some(prepared))
+    }
+
+    fn retain_open_selection(
+        &mut self,
+        open: &HarnessOpenRequest,
+        model: Option<&bcode_harness_models::HarnessModelSelection>,
+    ) {
+        self.opens.insert(open.session_id.clone(), open.clone());
+        if let Some(model) = model {
+            self.model_selections.insert(
+                open.session_id.clone(),
+                model_selection::RetainedSelection {
+                    selection: model.clone(),
+                    evidence: None,
+                },
+            );
+        }
     }
 
     async fn open_with_model(
@@ -1309,6 +1373,12 @@ impl PluginState {
                 .map(|binding| binding.native_session_id.clone()),
             context,
         )?;
+        if model.is_none()
+            && open.resume.is_none()
+            && let Some(prepared) = self.prepare_auth_only(instance, open, &options).await?
+        {
+            return Ok(HarnessServiceResponseKind::Prepared(prepared));
+        }
         // This DTO is correlation, not proof of authorization: host admission must
         // replace/verify client input against both current owner scopes before dispatch.
         let admitted_assistance_grant = open.parent_assistance.clone();
@@ -1331,16 +1401,7 @@ impl PluginState {
         if tool_queue.is_some() {
             sdk_servers.push(tool_bridge::SERVER.to_owned());
         }
-        self.opens.insert(open.session_id.clone(), open.clone());
-        if let Some(model) = model {
-            self.model_selections.insert(
-                open.session_id.clone(),
-                model_selection::RetainedSelection {
-                    selection: model.clone(),
-                    evidence: None,
-                },
-            );
-        }
+        self.retain_open_selection(open, model);
         let session = if open.resume.is_some() {
             ClaudeSession::spawn_with_sdk_servers(options, sdk_servers).await
         } else {

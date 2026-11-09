@@ -20,11 +20,6 @@ pub struct ExecutionPickerRequest {
     pub working_directory: PathBuf,
 }
 
-#[derive(serde::Deserialize)]
-struct Catalog {
-    instances: BTreeMap<String, HarnessInstance>,
-}
-
 fn unavailable(message: &str) -> TuiError {
     std::io::Error::other(message).into()
 }
@@ -279,42 +274,79 @@ async fn start_managed(
 }
 
 async fn configured_instances() -> Result<BTreeMap<String, HarnessInstance>, TuiError> {
-    let config = bcode_config::load_config()?;
-    if !config.plugins.config.contains_key("bcode.harness") {
-        return Ok(BTreeMap::new());
-    }
-    let response = bcode_client::ManagedSessionClient::default_endpoint()
-        .call_plugin_service(
-            "bcode.harness.configuration/v1".into(),
-            "catalog".into(),
-            b"{}".to_vec(),
-        )
+    let resolution = bcode_client::ManagedSessionClient::default_endpoint()
+        .native_registration_resolution()
         .await?;
-    if response.error.is_some() {
-        return Err(unavailable(
-            "Native instance configuration unavailable; open Setup",
-        ));
+    let value = resolution
+        .configurations
+        .get("bcode.harness")
+        .ok_or_else(|| unavailable("Native registration catalog unavailable"))?;
+    let mut instances = BTreeMap::new();
+    if value.get("enabled") == Some(&serde_json::json!(false)) {
+        return Ok(instances);
     }
-    Ok(serde_json::from_slice::<Catalog>(&response.payload)?.instances)
+    if let Some(entries) = value
+        .get("instances")
+        .and_then(serde_json::Value::as_object)
+    {
+        for (id, entry) in entries {
+            if entry.get("enabled") == Some(&serde_json::json!(false)) {
+                continue;
+            }
+            let instance = serde_json::from_value(entry["instance"].clone())?;
+            instances.insert(id.clone(), instance);
+        }
+    }
+    Ok(instances)
 }
 
 async fn discover_models() -> Result<(Vec<bcode_model::execution::ExecutionModel>, String), TuiError>
 {
     let config = bcode_config::load_config()?;
-    let instances = configured_instances().await?;
+    let local_instances = configured_instances().await;
+    let registrations_incomplete = local_instances.is_err();
+    let instances = local_instances.unwrap_or_default();
     let client = bcode_client::ManagedSessionClient::default_endpoint();
+    let discovered = client
+        .discover_candidates(bcode_ipc::harness::ManagedCandidatesRequest {
+            request_id: uuid::Uuid::new_v4().to_string(),
+        })
+        .await;
+    let mut setup_labels = std::collections::BTreeSet::new();
+    if let Ok(found) = discovered {
+        for plugin in found.plugins {
+            if let bcode_harness_models::HarnessCandidatesResponseKind::Candidates {
+                candidates,
+                ..
+            } = plugin.kind
+            {
+                for candidate in candidates {
+                    if !instances.values().any(|instance| {
+                        instance.plugin_id == candidate.plugin_id
+                            && instance.executable == candidate.executable.invocation()
+                            && instance.config_namespace == candidate.config_namespace
+                    }) {
+                        setup_labels.insert(format!(
+                            "Set up {}",
+                            bcode_session_view::external_projection::harness_display_label(
+                                &candidate.plugin_id
+                            )
+                        ));
+                    }
+                }
+            }
+        }
+    }
     let selected_provider = config.resolved_model_selection().provider_plugin_id;
     // Query each enabled provider through the same application catalog, once per provider.
     // Native discovery is independent of provider failure and runs only on the first page.
-    let mut providers: std::collections::BTreeSet<_> = client
-        .model_provider_ids()
-        .await
-        .unwrap_or_default()
-        .into_iter()
-        .collect();
+    let provider_ids = client.model_provider_ids().await;
+    let provider_incomplete = provider_ids.is_err();
+    let mut providers: std::collections::BTreeSet<_> =
+        provider_ids.unwrap_or_default().into_iter().collect();
     providers.extend(selected_provider);
     let mut models = Vec::new();
-    let mut incomplete = false;
+    let mut incomplete = provider_incomplete || registrations_incomplete;
     let mut instances = instances.into_values().collect();
     for provider in std::iter::once(None).chain(providers.into_iter().map(Some)) {
         let inventory = client
@@ -332,8 +364,11 @@ async fn discover_models() -> Result<(Vec<bcode_model::execution::ExecutionModel
     } else {
         "Choose model/backend"
     };
+    let setup = setup_labels.into_iter().collect::<Vec<_>>().join(" · ");
     Ok((
         models,
-        format!("{status} · Changing backend opens a new conversation; history stays here"),
+        format!(
+            "{status} · {setup} · Changing backend opens a new conversation; history stays here"
+        ),
     ))
 }

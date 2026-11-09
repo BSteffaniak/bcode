@@ -1764,11 +1764,69 @@ mod recovery_route_tests {
     }
 }
 
+async fn dispatch_registration_request(
+    state: &Arc<crate::ServerState>,
+    caller: &ManagedCaller,
+    request: &ManagedSessionRequest,
+) -> Result<ManagedSessionResponse, ErrorResponse> {
+    let ManagedCaller::Client(client_id) = caller else {
+        return Err(failure(ManagedHarnessError::Unsupported));
+    };
+    let value = match request.operation {
+        ManagedSessionOperation::CommitRegistration => {
+            let query: bcode_ipc::harness::ManagedRegistrationCommitRequest =
+                serde_json::from_str(&request.request_json)
+                    .map_err(|_| failure(ManagedHarnessError::Invalid))?;
+            serde_json::to_string(
+                &crate::harness::commit_registration(state, *client_id, query)
+                    .await
+                    .map_err(failure)?,
+            )
+        }
+        ManagedSessionOperation::RegistrationSnapshot => {
+            let view =
+                crate::harness::configuration_views::declarative_for_client(state, *client_id)
+                    .await
+                    .map_err(failure)?;
+            serde_json::to_string(
+                &crate::harness::registration_snapshot(&view)
+                    .await
+                    .map_err(failure)?,
+            )
+        }
+        ManagedSessionOperation::RegistrationResolution => {
+            let view =
+                crate::harness::configuration_views::declarative_for_client(state, *client_id)
+                    .await
+                    .map_err(failure)?;
+            serde_json::to_string(
+                &crate::harness::registration_resolution(&view)
+                    .await
+                    .map_err(failure)?,
+            )
+        }
+        _ => return Err(failure(ManagedHarnessError::Invalid)),
+    }
+    .map_err(|_| failure(ManagedHarnessError::Invalid))?;
+    Ok(ManagedSessionResponse {
+        schema_version: MANAGED_SESSION_VERSION,
+        response_json: value,
+    })
+}
+
 async fn dispatch_execution_catalog_request(
     state: &Arc<crate::ServerState>,
     caller: &ManagedCaller,
     request: &ManagedSessionRequest,
 ) -> Result<ManagedSessionResponse, ErrorResponse> {
+    if matches!(
+        request.operation,
+        ManagedSessionOperation::CommitRegistration
+            | ManagedSessionOperation::RegistrationSnapshot
+            | ManagedSessionOperation::RegistrationResolution
+    ) {
+        return dispatch_registration_request(state, caller, request).await;
+    }
     if request.operation == ManagedSessionOperation::PrepareCandidate {
         let ManagedCaller::Client(client_id) = caller else {
             return Err(failure(ManagedHarnessError::Unsupported));
@@ -1894,6 +1952,19 @@ pub(crate) async fn dispatch(
     result
 }
 
+const fn execution_catalog_operation(operation: ManagedSessionOperation) -> bool {
+    matches!(
+        operation,
+        ManagedSessionOperation::CommitRegistration
+            | ManagedSessionOperation::RegistrationSnapshot
+            | ManagedSessionOperation::RegistrationResolution
+            | ManagedSessionOperation::PrepareCandidate
+            | ManagedSessionOperation::DiscoverCandidates
+            | ManagedSessionOperation::ExecutionCatalog
+            | ManagedSessionOperation::StartSelected
+    )
+}
+
 async fn dispatch_request(
     state: &Arc<crate::ServerState>,
     caller: ManagedCaller,
@@ -1908,13 +1979,7 @@ async fn dispatch_request(
     {
         return Err(failure(ManagedHarnessError::Unavailable));
     }
-    if matches!(
-        request.operation,
-        ManagedSessionOperation::PrepareCandidate
-            | ManagedSessionOperation::DiscoverCandidates
-            | ManagedSessionOperation::ExecutionCatalog
-            | ManagedSessionOperation::StartSelected
-    ) {
+    if execution_catalog_operation(request.operation) {
         return dispatch_execution_catalog_request(state, &caller, &request).await;
     }
     if request.operation == ManagedSessionOperation::Recover {
@@ -2288,6 +2353,7 @@ struct NativeHandoffReply {
 
 async fn selected_handoff_plan(
     state: &Arc<crate::ServerState>,
+    session_id: SessionId,
     instance: &bcode_harness_models::HarnessInstance,
     interface_id: &str,
     namespace: &bcode_provider_auth_models::managed::AuthNamespace,
@@ -2313,18 +2379,24 @@ async fn selected_handoff_plan(
         &serde_json::json!({"schema_version":1,"request_id":request_id,"instance":instance}),
     )
     .map_err(|_| failure(ManagedHarnessError::Invalid))?;
-    let response = state
-        .plugins
-        .invoke_service_scoped_with_timeout(
+    let view = crate::harness::configuration_views::for_session(state, session_id)
+        .await
+        .map_err(failure)?;
+    let response = tokio::time::timeout(
+        std::time::Duration::from_secs(30),
+        view.invoke_service_with_bridge_scoped(
             &instance.plugin_id,
             interface_id,
             "prepare_login",
             payload,
             bcode_plugin::PluginInvocationScope::Global,
-            std::time::Duration::from_secs(30),
-        )
-        .await
-        .map_err(|_| failure(ManagedHarnessError::Unavailable))?;
+            None,
+        ),
+    )
+    .await
+    .map_err(|_| failure(ManagedHarnessError::Deadline))?
+    .map_err(|_| failure(ManagedHarnessError::Unavailable))?;
+    drop(view);
     if response.error.is_some()
         || response.payload.len() > bcode_harness_models::MAX_HARNESS_WIRE_BYTES
     {
@@ -2446,6 +2518,7 @@ async fn terminal_admission(
         .map_err(failure)?;
     let plan = selected_handoff_plan(
         state,
+        session_id,
         &initial.instance,
         interface_id,
         &initial.scope.namespace,
@@ -2653,7 +2726,7 @@ async fn continue_terminal_auth(
                 "The retained auth flow cannot issue this continuation; reconcile without replay.",
             )
         })?;
-    let snapshot = deliver_auth(state, auth, instance, command).await.map_err(|error| {
+    let snapshot = deliver_auth(state, input.session_id, auth, instance, command).await.map_err(|error| {
         if error.code == "managed_session_uncertain" {
             ErrorResponse::new("managed_session_continue_delivery_uncertain",
                 "Auth continuation delivery or response acceptance is uncertain; do not replay.")
@@ -2818,7 +2891,7 @@ async fn dispatch_auth_status(
             instance: instance.clone(),
             kind: HarnessRequestKind::AuthStatus { verify: false },
         };
-        let response = invoke_sensitive_auth(state, &outgoing)
+        let response = invoke_sensitive_auth(state, input.session_id, &outgoing)
             .await
             .map_err(failure)?;
         response
@@ -2904,7 +2977,7 @@ async fn begin_auth(
         .await
         .map_err(rejected)?;
     if let Some(command) = joined.command {
-        deliver_auth(state, auth, instance, command).await
+        deliver_auth(state, input.session_id, auth, instance, command).await
     } else {
         Ok(joined.snapshot)
     }
@@ -3063,7 +3136,7 @@ async fn dispatch_auth(
                 )
                 .await
                 .map_err(rejected)?;
-            deliver_auth(state, auth, instance, command).await?
+            deliver_auth(state, input.session_id, auth, instance, command).await?
         }
         ManagedSessionOperation::AuthCancel => {
             if input.input.is_some() {
@@ -3078,7 +3151,7 @@ async fn dispatch_auth(
                 .await
                 .map_err(rejected)?
             {
-                deliver_auth(state, auth, instance, command).await?
+                deliver_auth(state, input.session_id, auth, instance, command).await?
             } else {
                 return auth_response(&serde_json::json!({"detached": true}));
             }
@@ -3104,6 +3177,7 @@ fn auth_response(value: &impl serde::Serialize) -> Result<ManagedSessionResponse
 /// runtime store, observation broadcast, raw plugin errors, or model callback sees them.
 async fn invoke_sensitive_auth(
     state: &Arc<crate::ServerState>,
+    session_id: SessionId,
     request: &bcode_harness_models::HarnessRequest,
 ) -> Result<HarnessServiceResponse, ManagedHarnessError> {
     if !matches!(
@@ -3130,18 +3204,22 @@ async fn invoke_sensitive_auth(
     if bytes.len() > bcode_harness_models::MAX_HARNESS_WIRE_BYTES {
         return Err(ManagedHarnessError::Invalid);
     }
-    let response = state
-        .plugins
-        .invoke_service_scoped_with_timeout(
+    let view = crate::harness::configuration_views::for_session(state, session_id).await?;
+    let response = tokio::time::timeout(
+        std::time::Duration::from_secs(30),
+        view.invoke_service_with_bridge_scoped(
             &request.instance.plugin_id,
             bcode_harness_models::HARNESS_INTERFACE_ID,
             request.kind.operation().as_str(),
             bytes,
             bcode_plugin::PluginInvocationScope::Global,
-            std::time::Duration::from_secs(30),
-        )
-        .await
-        .map_err(|_| ManagedHarnessError::Unavailable)?;
+            None,
+        ),
+    )
+    .await
+    .map_err(|_| ManagedHarnessError::Deadline)?
+    .map_err(|_| ManagedHarnessError::Unavailable)?;
+    drop(view);
     if response.error.is_some()
         || response.payload.len() > bcode_harness_models::MAX_HARNESS_WIRE_BYTES
     {
@@ -3157,6 +3235,7 @@ async fn invoke_sensitive_auth(
 
 async fn deliver_auth(
     state: &Arc<crate::ServerState>,
+    session_id: SessionId,
     auth: &crate::harness_auth::HarnessAuthService,
     instance: bcode_harness_models::HarnessInstance,
     command: bcode_provider_auth::managed::ManagedAuthCommand,
@@ -3172,7 +3251,7 @@ async fn deliver_auth(
     let outgoing = invocation
         .take_request()
         .ok_or_else(|| failure(ManagedHarnessError::Conflict))?;
-    let Ok(response) = invoke_sensitive_auth(state, &outgoing).await else {
+    let Ok(response) = invoke_sensitive_auth(state, session_id, &outgoing).await else {
         let _ = auth.delivery_uncertain(&ticket).await;
         return Err(failure(ManagedHarnessError::Uncertain));
     };
@@ -3191,7 +3270,7 @@ async fn deliver_auth(
         let outgoing = cancel
             .take_request()
             .ok_or_else(|| failure(ManagedHarnessError::Conflict))?;
-        let Ok(response) = invoke_sensitive_auth(state, &outgoing).await else {
+        let Ok(response) = invoke_sensitive_auth(state, session_id, &outgoing).await else {
             let _ = auth.delivery_uncertain(&next_ticket).await;
             return Err(failure(ManagedHarnessError::Uncertain));
         };
@@ -3376,7 +3455,7 @@ mod tests {
         let request = request(ManagedSessionOperation::Inspect)
             .decode_call()
             .unwrap();
-        let error = invoke_sensitive_auth(&state, &request.harness)
+        let error = invoke_sensitive_auth(&state, SessionId::new(), &request.harness)
             .await
             .unwrap_err();
         drop(state);

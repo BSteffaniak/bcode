@@ -1772,6 +1772,9 @@ pub struct PluginConfigContext {
     /// confinement checks before opening or deleting state beneath it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub state_root: Option<std::path::PathBuf>,
+    /// Optional host-authorized durable plugin storage; absent hosts cannot persist registrations.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub durable_state_root: Option<std::path::PathBuf>,
 }
 
 impl PluginConfigContext {
@@ -3474,6 +3477,7 @@ mod tests {
             redacted_config: serde_json::json!({"enabled": true}),
             secrets: BTreeMap::new(),
             state_root: Some(std::path::PathBuf::from("/state/plugins/example")),
+            durable_state_root: None,
         };
         let encoded = serde_json::to_value(&context).expect("config context encodes");
         let decoded: super::PluginConfigContext =

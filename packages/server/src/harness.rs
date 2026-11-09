@@ -21,6 +21,11 @@ mod observation_watch;
 pub(crate) const fn recovery_published() -> bool {
     bcode_session_models::external_harness::recovery_storage_available()
 }
+mod registrations;
+pub(crate) use registrations::{
+    commit as commit_registration, resolution as registration_resolution,
+    snapshot as registration_snapshot,
+};
 mod policy;
 mod runtime;
 mod store;

@@ -26,7 +26,7 @@ fn settings() -> Value {
     })
 }
 
-fn context(config: Value, operation: &str, payload: &Value) -> NativeServiceContext {
+pub(super) fn context(config: Value, operation: &str, payload: &Value) -> NativeServiceContext {
     NativeServiceContext {
         plugin_id: crate::PLUGIN_ID.into(),
         request: ServiceRequest {

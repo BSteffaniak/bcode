@@ -193,45 +193,29 @@ fn should_route_backends(config: &BcodeConfig, provider_ready: bool) -> bool {
         || (!provider_ready && !has_explicit_selection(config))
 }
 
-fn configured_backend_catalog(
-    host: &bcode_plugin::PluginHost,
-    config: &bcode_config::BcodeConfig,
+async fn configured_backend_catalog(
+    _host: &bcode_plugin::PluginHost,
+    _config: &bcode_config::BcodeConfig,
     remembered_managed: bool,
 ) -> Result<Option<BackendCatalog>, CliError> {
-    let catalog: BackendCatalog = if config.plugins.config.contains_key("bcode.harness") {
-        match host.invoke_service_json(
-            "bcode.harness",
-            HARNESS_CONFIGURATION_INTERFACE,
-            "catalog",
-            &serde_json::json!({}),
-        ) {
-            Ok(catalog) => catalog,
-            Err(bcode_plugin::PluginServiceCallError::Service { code, .. })
-                if code == "configuration_disabled" =>
-            {
-                if remembered_managed {
-                    return Err(CliError::InvalidArguments(
-                        "Remembered managed route is disabled; no provider fallback was selected"
-                            .into(),
-                    ));
-                }
-                return Ok(None);
-            }
-            Err(error) => {
-                return Err(CliError::InvalidArguments(format!(
-                    "Configured execution backends could not be read ({error}); no selection was changed"
-                )));
-            }
+    let response = bcode_client::ManagedSessionClient::default_endpoint()
+        .call_plugin_service(
+            HARNESS_CONFIGURATION_INTERFACE.into(),
+            "catalog".into(),
+            b"{}".to_vec(),
+        )
+        .await?;
+    if let Some(error) = response.error {
+        if error.code == "configuration_disabled" && !remembered_managed {
+            return Ok(None);
         }
-    } else {
-        // No generic instance settings exist yet. Candidate discovery remains native-owned;
-        // absence is not a configured default or permission to create an instance.
-        BackendCatalog {
-            default_instance: None,
-            instances: std::collections::BTreeMap::new(),
-        }
-    };
-    Ok(Some(catalog))
+        return Err(CliError::InvalidArguments(
+            "Native registration catalog unavailable; no fallback selected".into(),
+        ));
+    }
+    Ok(Some(serde_json::from_slice(&response.payload).map_err(
+        |_| CliError::InvalidArguments("Invalid native registration catalog".into()),
+    )?))
 }
 
 async fn route_backend_selection(
@@ -262,7 +246,7 @@ async fn route_backend_selection(
         }
         return Ok(false);
     }
-    let Some(catalog) = configured_backend_catalog(host, &config, remembered_managed)? else {
+    let Some(catalog) = configured_backend_catalog(host, &config, remembered_managed).await? else {
         return Ok(false);
     };
     let _ = backend_choices(&catalog)?;
@@ -341,7 +325,7 @@ async fn route_backend_selection(
 }
 
 async fn launch_execution_choice(
-    host: &bcode_plugin::PluginHost,
+    _host: &bcode_plugin::PluginHost,
     shell: &mut bcode_tui::TerminalShell,
     catalog: &BackendCatalog,
     entries: &[bcode_model::execution::ExecutionModel],
@@ -356,17 +340,23 @@ async fn launch_execution_choice(
                 entries, selection.clone(),
             ).map_err(|_| CliError::InvalidArguments("The exact model/account is unavailable, ambiguous, or not ready. Use Setup/sign in or explicitly change the execution preference. No fallback was selected".into()))?;
             let backend = BackendSelection::Instance { instance_id };
-            let prepared: PreparedBackend = host
-                .invoke_service_json(
-                    "bcode.harness",
-                    HARNESS_CONFIGURATION_INTERFACE,
-                    "prepare",
-                    &serde_json::json!({"selection":backend}),
+            let response = bcode_client::ManagedSessionClient::default_endpoint()
+                .call_plugin_service(
+                    HARNESS_CONFIGURATION_INTERFACE.into(),
+                    "prepare".into(),
+                    serde_json::to_vec(&serde_json::json!({"selection": backend})).map_err(
+                        |_| CliError::InvalidArguments("Invalid backend selection".into()),
+                    )?,
                 )
-                .map_err(|error| {
-                    CliError::InvalidArguments(format!(
-                        "Selected execution backend could not be prepared ({error}); no fallback was selected"
-                    ))
+                .await?;
+            if response.error.is_some() {
+                return Err(CliError::InvalidArguments(
+                    "Native backend preparation unavailable".into(),
+                ));
+            }
+            let prepared: PreparedBackend =
+                serde_json::from_slice(&response.payload).map_err(|_| {
+                    CliError::InvalidArguments("Invalid native preparation response".into())
                 })?;
             verify_prepared_backend(catalog, &backend, &prepared)?;
             if review_preference

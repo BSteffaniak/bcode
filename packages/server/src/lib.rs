@@ -4835,10 +4835,9 @@ async fn run_with_static_bundled_inner(
     let stage_started_at = startup_started_at;
     tracing::debug!(target: "bcode_server::startup", "loading config");
     let (config, launch) = bcode_config::recovery::load_current_config_with_recovery_context()?;
-    let authority = launch
-        .recovery_sources
-        .as_ref()
-        .and_then(|sources| bcode_config::recovery::ConfigSourceAuthority::capture(sources).ok());
+    let authority = launch.recovery_sources.as_ref().and_then(|sources| {
+        bcode_config::recovery::ConfigSourceAuthority::capture_read_only(sources).ok()
+    });
     config_phase.finish();
     tracing::debug!(
         target: "bcode_server::startup",
