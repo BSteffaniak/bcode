@@ -118,6 +118,22 @@ ownership generation. Stale, mismatched or already-consumed responses fail close
 A native request is not itself permission to execute a Bcode operation. Parent
 assistance requires separately admitted authority rather than inherited parentage.
 
+### Delegated control from a parent session
+
+The only parent-relative control is *delegated control*: the active, host-registered tool
+invocation of a child's immutable canonical parent session may address that existing managed
+child. Naming a parent in a request is still not authority; the authenticated invocation's own
+session must be the child's recorded parent, the child must already be a managed session in the
+same canonical workspace, and every operation still passes tool permission policy and canonical
+ownership, generation and retained-target admission. Creation remains limited to the calling
+session as parent. Clients and workflow callers keep their own admission routes.
+
+Two invocation-only reads support delegation (`bcode_harness_models::delegation`):
+`binding` returns the child's exact retained instance and prepared/confirmed target (or none
+when no session with that identity exists yet), and `history` drains at most one bounded native
+observation page with the committed acknowledgement cursor before returning one bounded
+canonical history page. Neither grants mutation, replay, resume or transport authority.
+
 When the native harness withdraws an outstanding request (for example Claude Code cancels a
 pending `can_use_tool` callback after an interrupt, or the native connection is lost or closed),
 the plugin records an `InteractionWithdrawn { request_id }` observation. The canonical
@@ -170,10 +186,15 @@ ephemeral native credential storage; persistent fallback is not equivalent.
 ## Live ingestion
 
 Interactive clients never poll for native output. An attached client issues one `watch`
-request; the daemon then drives the attachment poll for that client, asking the adapter to
+request; the daemon then drives the attachment poll for that session, asking the adapter to
 hold each page (`wait_millis`) until native output arrives. Each committed page reaches
-clients through the ordinary session event subscription. Every page re-admits the client and
-owner, so a disconnected client, changed generation or shutdown ends the watch. Adapters that
+clients through the ordinary session event subscription. There is one watch per session,
+shared by every attached client. Requests may arrive on short-lived connections, so every
+page is re-admitted as an interactive client attached to the session (falling back to the
+requesting client while it is connected); the watch ends when no such client remains, the
+owner generation changes or the daemon shuts down. Each page runs under the configuration
+view pinned for its owner, exactly like admitted execute calls, never the daemon's startup
+baseline (which may predate the instance's setup). Adapters that
 ignore `wait_millis` remain correct: empty pages that were not held back off. A page that
 carries live updates counts as progress, so streaming text asks for the next page immediately;
 the adapter's own coalescing window bounds the page rate. The Claude Code plugin holds a
@@ -205,17 +226,20 @@ external event into ordinary transcript items instead of one literal status mess
 | `Text` | Assistant markdown labelled with the harness name; segmented text uses `harness_stream_identity(..).assistant_item_id()` so it replaces the live stream in place |
 | `Reasoning` | Completed reasoning activity at `reasoning_item_id()`, honoring thinking visibility; opaque reasoning shows as withheld |
 | `Tool` / `ToolResult` | Tool invocation `external:{generation}:{native_tool_id}` with the observing plugin as producer, input JSON as arguments, then finished/failed with literal output |
-| `Usage` | Display-only usage (`runtime.latest_usage`, cost, cumulative tokens) keyed `external:{generation}:{observation}`; `total_cost_micros` is the increment for that result (the Claude Code plugin converts Claude's running process total), so entries add |
+| `Usage` | Session usage (`runtime.latest_usage`, cost, cumulative tokens) keyed `external:{generation}:{observation}`, folded into the daemon usage projection with its page; `total_cost_micros` is the increment for that result (the Claude Code plugin converts Claude's running process total), so entries add. A reported cost is the vendor amount and is never repriced; an unreported cost (subscription) counts tokens with no estimate |
 | `Result` | Nothing when it repeats the latest assistant text, otherwise an assistant message |
 | `Interaction` | Compact notice plus `SessionViewSnapshot.pending_external_interactions` |
 | `InteractionWithdrawn` | No item; removes the matching pending interaction |
-| `Diagnostic`, failures, preparation, reconciliation, release, recovery | Compact friendly notice |
-| Execution, submission, binding, status, settlement, terminal, vendor, receipts, acknowledgements | No item; execution lifecycle only |
+| `Diagnostic`, failures, uncertain or not-applied reconciliation | Compact friendly notice |
+| Execution, submission, binding, status, settlement, terminal, vendor, receipts, acknowledgements, preparation, process release, recovery | No item; execution lifecycle only |
 
 `Diagnostic` is reserved for conditions a user should see. Routine operational telemetry, such as
-the Claude Code plugin's closed-vocabulary host-tool bridge status, is retained as `Vendor`
-evidence (namespace `claude_code.host_tools`) so canonical history keeps it without adding
-transcript notices to every native turn.
+the Claude Code plugin's closed-vocabulary host-tool bridge status (namespace
+`claude_code.host_tools`) and uncorrelated settlement evidence (namespace
+`claude_code.settlement`), is retained as `Vendor` evidence so canonical history keeps it without
+adding transcript notices to every native turn. Process preparation, release and recovery are
+likewise plumbing: a released conversation resumes transparently when reopened, so the
+transcript reads like a native Bcode conversation.
 
 The harness label is derived generically from the instance plugin id (`bcode.claude-code`
 becomes `Claude Code`) and also labels live assistant stream items once known. Pending
@@ -335,6 +359,19 @@ not establish native login handoff, safe recovery, managed-tool execution, or
 background-continuation settlement. `BCODE_NATIVE_CLAUDE_CONFIG_DIR` may select an
 existing native credential namespace; credentials must not be copied into test state.
 
+For Codex (installed `codex` on `PATH`, existing native login in `BCODE_NATIVE_CODEX_HOME`,
+`$CODEX_HOME` or `~/.codex`):
+
+```sh
+cargo test -p bcode --features app,static-bundled-codex-harness-plugin \
+  --test harness_codex_acceptance -- --ignored --nocapture
+```
+
+It walks a selected-model open, a turn with a native approval, a later `NextTurn` after observed
+completion, a mid-session model switch, a graceful daemon restart, recovery of the exact native
+thread and resumed native context. Codex never reports authoritative settlement, so turns end at
+the exact attempt's `SubmissionTerminal`. See `plugins/codex-harness-plugin/README.md`.
+
 Observation clients must use the exact returned `next_after`, including `None` on
 an empty page, and adopt confirmed session bindings. Canonical history has a
 separate cursor: an empty page with an unchanged cursor is its current tail, not
@@ -372,7 +409,7 @@ daemon admits the current client and owner, requires the selected backend's decl
 interruption. An identical retry returns retained evidence; an ambiguous delivery remains
 uncertain and is never replayed. Configuration neither issues nor revokes managed tool grants.
 
-### Graceful-restart recovery
+### Restart and crash recovery
 
 Recovery is published behind the native-parity storage fence (schema 58, writer epoch 26).
 A clean daemon stop closes each owned transport and, when the selected plugin proves the
@@ -385,6 +422,21 @@ client, the session is not workflow-owned, the workspace, instance and capabilit
 unchanged, the plugin is enabled and its exact resume preflight passes. The retained resume
 `Open` is then the only native creation the new generation may claim. Prior input is never
 replayed.
+
+A termination or hangup signal (for example system shutdown or logout) is handled like an
+explicit stop, so the release above is recorded.
+
+A daemon that ends without releasing (killed, crashed, power loss) leaves no
+`TransportReleased`. Its native children are stdio processes that end with it. Recovery is then
+admitted as an *abandoned* transport: `RecoveryPrepared` carries `abandoned = true` and
+reconstructed end evidence (the dead daemon's execution lifetime, with
+`ABANDONED_TRANSPORT_EVIDENCE` markers in place of a Close and reap identity). The recovering
+daemon must find the previous daemon's published execution lifetime released for the same state
+location (by instance identity; identities are never reused) and no live or unverifiable
+session-owner lease for it; the canonical validator requires that no release exists for the
+previous generation and that the recovery follows the exact canonical tail written by that
+owner. Everything else is as above. Deliveries that were claimed but never completed remain
+uncertain and are never replayed; the resumed native conversation keeps its own history.
 
 Only observation pages move the current page locator and only binding deliveries move the
 current binding locator, so a recovered generation that is released again before it commits a

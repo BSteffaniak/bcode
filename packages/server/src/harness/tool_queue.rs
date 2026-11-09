@@ -138,7 +138,7 @@ impl ToolQueueHost {
             {
                 return Ok(Some(existing.scope.clone())); // Exact retained grant remains authorized.
             }
-            tracing::warn!(target: "bcode_server::harness", category = "grant_replacement", "managed tool queue revocation requested");
+            tracing::debug!(target: "bcode_server::harness", category = "grant_replacement", "managed tool queue revocation requested");
             existing.cancellation.close();
             // Exact revoke is bounded and never executes tool effects. Native SDK server stays
             // installed but unavailable until the new authenticated principal is bound.
@@ -185,7 +185,7 @@ impl ToolQueueHost {
             endpoint: endpoint.clone(),
         });
         live.insert(session, Arc::clone(&entry));
-        tracing::warn!(target: "bcode_server::harness", category = "bind_adopted", "managed tool queue binding lifecycle");
+        tracing::debug!(target: "bcode_server::harness", category = "bind_adopted", "managed tool queue binding lifecycle");
         binding.scope = None;
         drop(binding);
         drop(live);
@@ -256,7 +256,7 @@ impl ToolQueueHost {
     pub async fn shutdown(&self) {
         let retired = std::mem::take(&mut *self.live.lock().await);
         for live in retired.into_values() {
-            tracing::warn!(target: "bcode_server::harness", category = "host_shutdown", "managed tool queue revocation requested");
+            tracing::debug!(target: "bcode_server::harness", category = "host_shutdown", "managed tool queue revocation requested");
             live.cancellation.close();
         }
     }
@@ -380,7 +380,7 @@ async fn endpoint_live(endpoint: &ManagedToolEndpoint) -> bool {
         Ok(Err(_)) => "endpoint_unavailable",
         Err(_) => "timeout",
     };
-    tracing::warn!(target: "bcode_server::harness", category, "managed tool queue liveness failed");
+    tracing::debug!(target: "bcode_server::harness", category, "managed tool queue liveness failed");
     false
 }
 
@@ -423,7 +423,7 @@ async fn pump(
             }
         }
     };
-    tracing::warn!(target: "bcode_server::harness", category = stopped, "managed tool queue pump stopped");
+    tracing::debug!(target: "bcode_server::harness", category = stopped, "managed tool queue pump stopped");
     live.cancellation.close();
     // Dropping receivers is not settlement or replay authority; canonical started claims remain.
     drop(pending);

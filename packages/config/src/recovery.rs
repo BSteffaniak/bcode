@@ -447,9 +447,8 @@ fn replay(
         crate::merge_toml_value(&mut merged, layer);
         presence.push(true);
     }
-    if !presence.iter().any(|present| *present) {
-        return Err(ConfigRecoveryError::Unavailable);
-    }
+    // With every optional layer absent the durable source is the built-in defaults; any
+    // non-file input that changed the effective configuration still fails the fingerprint.
     let config = resolve_replayed_config(merged, sources)?;
     Ok((config, presence))
 }

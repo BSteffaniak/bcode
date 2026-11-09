@@ -400,6 +400,13 @@ pub struct HarnessObservationPage {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub inventory_page: Option<crate::HarnessInventoryPage>,
     pub observations: Vec<HarnessObservation>,
+    /// Opaque cursor for the next page.
+    ///
+    /// For canonical history reads it is always present and resumes exactly, possibly in the
+    /// middle of a stored native page. A page may contain zero observations while still
+    /// advancing this cursor (for example over stored pages without observations), so an empty
+    /// page is not end-of-history: a reader has caught up only when the returned cursor equals
+    /// the cursor it sent.
     pub next_after: Option<String>,
     pub completeness: HarnessCompleteness,
     pub status: HarnessExecutionStatus,

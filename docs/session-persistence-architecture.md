@@ -800,7 +800,10 @@ writer contract is epoch `26` with event payload schema `58`. Epoch `25` (schema
 selected-model managed operations; epoch `24` and schema `56` are reserved and never input.
 Epoch `26` (schema `58`) fences managed native-parity records (reasoning, native tool results,
 native usage, display metadata and mid-session configuration requests); the `25`→`26` edge
-preserves canonical payloads and advances only the schema and writer contract. Epoch `23`
+preserves canonical payloads and advances only the schema and writer contract. Epoch `27`
+(schema `58`) folds native harness usage into the required session usage projection; an epoch-26
+writer would append native usage without maintaining it. The `26`→`27` edge preserves canonical
+payloads and rebuilds every current projection, which is how epoch-26 sessions catch up. Epoch `23`
 retained event payload schema `55`. Epoch `22` introduced
 canonical managed-tool claim/start metadata and its disposable claim projection. Epoch `23` adds
 `events.managed_tool_key` and `idx_events_managed_tool_key`: independently indexed reserved
@@ -1059,6 +1062,15 @@ snapshot and unchanged usage yields the same amounts. Requests outside the range
 are unchanged. Missing or ambiguous pricing produces unavailable cost, not a fallback to earlier
 prices. The report identifies the snapshot revision and SHA-256 and reports the new totals. No
 historical-tariff archive, automatic repricing, or canonical history mutation is involved.
+
+Native harness usage observations (managed observation pages and managed external-backend
+observations) are request contributions in the same projection, keyed
+`external:{generation}:{observation_id}` and committed in the observation's append transaction.
+Each is one immutable terminal observation: an identical redelivery is idempotent and a conflicting
+one rejects the append. A vendor-reported cost is recorded as that request's cost and is never
+valued by a supplied catalog; repricing and renormalization skip these requests. A harness that
+reports no cost (for example a subscription) contributes tokens with no cost estimate, so it is
+neither priced nor counted as unavailable. The live summary is published after these appends too.
 
 Attach and live `UsageSummaryChanged` transfers include a canonical through-sequence and a derived
 cost revision. Normal appends advance the former; explicit repricing advances the latter even when

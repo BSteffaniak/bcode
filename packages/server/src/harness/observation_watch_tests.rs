@@ -124,6 +124,27 @@ mod drive {
         (state, backend, query)
     }
 
+    /// Connect `client` with a runtime context, optionally attached to `session`.
+    async fn connect(state: &crate::ServerState, client: ClientId, session: Option<SessionId>) {
+        state
+            .client_runtime_contexts
+            .lock()
+            .await
+            .insert(client, bcode_ipc::ClientRuntimeContext::default());
+        if let Some(session) = session {
+            state
+                .attached_client_sessions
+                .lock()
+                .await
+                .insert(client, session);
+        }
+    }
+
+    async fn disconnect(state: &crate::ServerState, client: ClientId) {
+        state.client_runtime_contexts.lock().await.remove(&client);
+        state.attached_client_sessions.lock().await.remove(&client);
+    }
+
     async fn until(condition: impl Fn() -> bool + Send + Sync) {
         tokio::time::timeout(Duration::from_secs(10), async {
             while !condition() {
@@ -148,7 +169,9 @@ mod drive {
             Err(ManagedHarnessError::StaleOwner),
         ]);
         let watches = ObservationWatches::default();
-        watches.start(Arc::downgrade(&state), ClientId::new(), query);
+        let client = ClientId::new();
+        connect(&state, client, None).await;
+        watches.start(Arc::downgrade(&state), client, query);
         until(|| backend.waits.lock().unwrap().len() == 5 && live(&watches) == 0).await;
         // Transient failures retry; every page asks the adapter to hold for native output.
         assert!(
@@ -166,8 +189,10 @@ mod drive {
         let (state, backend, query) = fixture(Vec::new());
         let watches = ObservationWatches::default();
         let client = ClientId::new();
+        connect(&state, client, None).await;
         watches.start(Arc::downgrade(&state), client, query.clone());
-        watches.start(Arc::downgrade(&state), client, query.clone());
+        // Another attached client asking for the same generation shares the session's watch.
+        watches.start(Arc::downgrade(&state), ClientId::new(), query.clone());
         until(|| backend.waits.lock().unwrap().len() == 1).await;
         tokio::time::sleep(Duration::from_millis(20)).await;
         assert_eq!(backend.waits.lock().unwrap().len(), 1);
@@ -185,5 +210,24 @@ mod drive {
         assert_eq!(live(&watches), 1);
         watches.shutdown();
         assert_eq!(live(&watches), 0);
+    }
+
+    #[tokio::test]
+    async fn a_short_lived_requester_hands_ingestion_to_the_attached_client() {
+        // Held pages return (here: empty) so each next page re-checks the attached clients.
+        let mut script = vec![Ok(1); 3];
+        script.extend(std::iter::repeat_n(Ok(0), 1000));
+        let (state, backend, query) = fixture(script);
+        let watches = ObservationWatches::default();
+        let requester = ClientId::new();
+        let attached = ClientId::new();
+        connect(&state, attached, Some(query.session_id)).await;
+        // The request's connection closes as soon as it is answered.
+        watches.start(Arc::downgrade(&state), requester, query);
+        until(|| backend.waits.lock().unwrap().len() >= 4).await;
+        assert_eq!(live(&watches), 1);
+        // Once no interactive client remains attached, ingestion stops.
+        disconnect(&state, attached).await;
+        until(|| live(&watches) == 0).await;
     }
 }

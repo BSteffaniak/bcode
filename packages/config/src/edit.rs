@@ -452,30 +452,60 @@ fn policy_edit_path(
         ));
     }
     let sources = &reference.sources;
-    let paths: Vec<&PathBuf> = sources.exclusive_config_path.as_ref().map_or_else(
-        || {
-            sources
-                .base_config_path
-                .iter()
-                .chain(sources.discovered_paths.iter())
-                .chain(sources.env_config_path.iter())
-                .chain(sources.cli_config_path.iter())
-                .collect()
-        },
-        |path| vec![path],
-    );
-    // Even absent layers are retained policy: do not pick a guessed writable winner.
-    if paths.len() != 1 {
-        return Err(invalid(
-            "Remembering this selection requires one explicit configuration file",
-        ));
-    }
-    let path = paths[0];
+    let path = edit_destination(sources, &reference.source_presence).ok_or_else(|| {
+        invalid("Several configuration files are active; edit the intended file explicitly")
+    })?;
     Ok(if path.is_absolute() {
         path.clone()
     } else {
         sources.cwd.join(path)
     })
+}
+
+/// The one file a reviewed edit may change, chosen without guessing between active layers.
+///
+/// * An exclusive file is the only layer.
+/// * Otherwise the single present layer is edited; nothing it could be shadowed by exists.
+/// * With no layer present, an explicit (base, environment or command-line) file is created
+///   when exactly one was named; with none named, the first discovered (user) file is.
+/// * Several present layers, or several named-but-absent explicit files, are refused.
+fn edit_destination<'a>(
+    sources: &'a crate::recovery::ConfigRecoverySources,
+    presence: &[bool],
+) -> Option<&'a PathBuf> {
+    if let Some(path) = &sources.exclusive_config_path {
+        return Some(path);
+    }
+    let explicit: Vec<&PathBuf> = sources
+        .base_config_path
+        .iter()
+        .chain(sources.env_config_path.iter())
+        .chain(sources.cli_config_path.iter())
+        .collect();
+    // Presence follows replay order: base, discovered, environment, command line.
+    let layers: Vec<&PathBuf> = sources
+        .base_config_path
+        .iter()
+        .chain(sources.discovered_paths.iter())
+        .chain(sources.env_config_path.iter())
+        .chain(sources.cli_config_path.iter())
+        .collect();
+    if layers.len() != presence.len() {
+        return None;
+    }
+    let mut present = layers
+        .iter()
+        .zip(presence)
+        .filter_map(|(path, present)| present.then_some(*path));
+    match (present.next(), present.next()) {
+        (Some(path), None) => Some(path),
+        (Some(_), Some(_)) => None,
+        (None, _) => match explicit.as_slice() {
+            [path] => Some(path),
+            [] => sources.discovered_paths.first(),
+            _ => None,
+        },
+    }
 }
 
 fn plan_validated_field_edit(
@@ -863,6 +893,38 @@ mod tests {
         layered.sources.exclusive_config_path = None;
         layered.sources.discovered_paths = vec![path, temp.path().join("optional.toml")];
         assert!(plan_execution_preference_with_policy(&effective, &layered, &roots, None).is_err());
+    }
+
+    #[test]
+    fn discovered_layers_edit_the_single_present_file_or_create_the_user_file() {
+        let temp = tempfile::tempdir().unwrap();
+        let user = temp.path().join("user/bcode.toml");
+        let project = temp.path().join("project/bcode.toml");
+        let hidden = temp.path().join("project/.bcode/bcode.toml");
+        std::fs::create_dir_all(temp.path().join("user")).unwrap();
+        std::fs::create_dir_all(temp.path().join("project/.bcode")).unwrap();
+        let discovered = vec![user.clone(), project.clone(), hidden];
+        let sources = crate::recovery::ConfigRecoverySources {
+            cwd: temp.path().join("project"),
+            discovered_paths: discovered.clone(),
+            ..Default::default()
+        };
+        let roots = vec![temp.path().to_owned()];
+        let plan = || {
+            let effective = crate::load_config_from_paths(&discovered).unwrap();
+            let reference =
+                crate::recovery::capture_with_sources(&effective, &sources, &roots).unwrap();
+            plan_execution_preference_with_policy(&effective, &reference, &roots, None)
+        };
+
+        // First run: no file exists yet, so the user file is created.
+        assert_eq!(plan().unwrap().path(), user);
+        // One present layer is edited wherever it lives.
+        std::fs::write(&project, "[model]\nmodel_id = 'project'\n").unwrap();
+        assert_eq!(plan().unwrap().path(), project);
+        // Two present layers are ambiguous.
+        std::fs::write(&user, "[model]\nmodel_id = 'user'\n").unwrap();
+        assert!(plan().is_err());
     }
 
     #[test]

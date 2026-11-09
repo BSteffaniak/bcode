@@ -42,6 +42,11 @@ impl HarnessCandidatesRequest {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct HarnessCandidateExecutableIdentity {
     pub canonical_path: String,
+    /// The path the user's search path resolves (for example a stable profile symlink), when
+    /// it differs from `canonical_path`. Configured instances invoke it so a package-manager
+    /// update that replaces the canonical target does not break them.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub invocation_path: Option<String>,
     pub byte_len: u64,
     pub modified_unix_nanos: Option<u128>,
     /// Platform file identity when available (for example device and inode).
@@ -69,6 +74,17 @@ pub struct HarnessInstallationCandidate {
     pub custody: HarnessAuthCustody,
     pub readiness: HarnessCandidateReadiness,
 }
+impl HarnessCandidateExecutableIdentity {
+    /// The path a configured instance invokes: the search-path entry when known, otherwise the
+    /// canonical file.
+    #[must_use]
+    pub fn invocation(&self) -> &str {
+        self.invocation_path
+            .as_deref()
+            .unwrap_or(&self.canonical_path)
+    }
+}
+
 impl HarnessInstallationCandidate {
     /// Validate bounded nonsecret metadata; not filesystem or execution authority.
     /// # Errors
@@ -86,6 +102,12 @@ impl HarnessInstallationCandidate {
         }
         if let Some(key) = &self.executable.file_key {
             id(key)?;
+        }
+        if let Some(path) = &self.executable.invocation_path {
+            text(path)?;
+            if !std::path::Path::new(path).is_absolute() {
+                return Err(HarnessContractError::InvalidShape);
+            }
         }
         Ok(())
     }
@@ -219,7 +241,7 @@ impl HarnessPrepareCandidateResponse {
             if prepared.candidate != request.candidate
                 || prepared.instance.instance_id != request.instance_id
                 || prepared.instance.plugin_id != plugin_id
-                || prepared.instance.executable != request.candidate.executable.canonical_path
+                || prepared.instance.executable != request.candidate.executable.invocation()
                 || prepared.instance.config_namespace != request.candidate.config_namespace
                 || prepared.instance.auth.custody != HarnessAuthCustody::NativeManaged
                 || !prepared.adapter_settings.is_object()

@@ -224,10 +224,13 @@ Everything below is untrusted display content: observed native tools never dispa
 tools, and nothing here authorizes a native action.
 
 * **Segment identities.** Native stream-json emits one `assistant` frame per API content
-  block, all sharing `message.id`. The normalizer numbers blocks per message in arrival
-  order, so `Text`/`Reasoning` carry `segment_id = "<message.id>:<block index>"`, the same
-  index partial `stream_event` frames use. Frames without a usable message ID stay
-  unsegmented.
+  block, all sharing `message.id`, but not every streamed block yields a durable frame (an
+  empty thinking block may stream without one). Text and reasoning blocks are therefore
+  numbered separately per message: `segment_id = "<message.id>:t<n>"` for the nth text block
+  and `"<message.id>:r<n>"` for the nth reasoning block. Partial `stream_event` frames are
+  numbered the same way, so a live stream is always finalized by its durable segment. Empty,
+  non-redacted thinking blocks produce no observation. Frames without a usable message ID
+  stay unsegmented.
 * **Reasoning.** `thinking` blocks become `Reasoning { opaque: false }` (truncated to the
   text bound; the native `signature` is never copied). `redacted_thinking` becomes
   `Reasoning { opaque: true, text: "" }`.
@@ -281,3 +284,11 @@ tools, and nothing here authorizes a native action.
   configured `exact_version` is accepted (untested unless listed); other unparseable
   versions and wrappers still fail closed. A running process conflicts only if the configured
   `exact_version` changes under it.
+* **Executable path.** Discovery keeps the canonical file as the inspected identity but
+  configures the search-path entry the user's shell resolves (for example a profile
+  symlink) as the instance executable, so a package-manager update that replaces the
+  canonical target keeps the instance working.
+* **Display normalization.** Tool output tabs become a fixed indent (terminals have no
+  portable tab rendering) and tool-search `tool_reference` blocks show the referenced tool.
+  Uncorrelated settlement evidence is retained as `Vendor` (namespace
+  `claude_code.settlement`), not a user-facing diagnostic.

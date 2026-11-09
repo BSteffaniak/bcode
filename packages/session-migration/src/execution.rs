@@ -772,7 +772,7 @@ mod tests {
     fn schema_52_fixture_migrates_losslessly_without_creating_checkpoints() {
         let plan = crate::plan_writer_epoch_migration(16).expect("known lossless upgrade");
         assert_eq!(plan.target_writer_epoch, crate::CURRENT_WRITER_EPOCH);
-        assert_eq!(plan.steps.len(), 9);
+        assert_eq!(plan.steps.len(), 10);
         assert_eq!(plan.steps[0].id, "session-writer-epoch-16-to-17");
         assert_eq!(plan.steps[1].id, "session-writer-epoch-17-to-18");
         assert_eq!(plan.steps[2].id, "session-writer-epoch-18-to-19");
@@ -782,6 +782,7 @@ mod tests {
         assert_eq!(plan.steps[6].id, "session-writer-epoch-22-to-23");
         assert_eq!(plan.steps[7].id, "session-writer-epoch-23-to-25");
         assert_eq!(plan.steps[8].id, "session-writer-epoch-25-to-26");
+        assert_eq!(plan.steps[9].id, "session-writer-epoch-26-to-27");
         let fixture = include_str!("../fixtures/stores/epoch-16-schema-52-events.jsonl");
         let mut seen = BTreeSet::new();
         for payload in fixture.lines() {
@@ -2054,7 +2055,7 @@ mod tests {
         assert!(normalized.metric_counter.is_none());
         let plan = crate::plan_writer_epoch_migration(17).unwrap();
         assert_eq!(plan.target_writer_epoch, crate::CURRENT_WRITER_EPOCH);
-        assert_eq!(plan.steps.len(), 8);
+        assert_eq!(plan.steps.len(), 9);
     }
 
     #[test]
@@ -3119,12 +3120,17 @@ mod tests {
                     id: "session-writer-epoch-25-to-26",
                     source_writer_epoch: 25,
                     target_writer_epoch: 26,
+                },
+                crate::MigrationStepDescriptor {
+                    id: "session-writer-epoch-26-to-27",
+                    source_writer_epoch: 26,
+                    target_writer_epoch: 27,
                 }
             ]
         );
         let plan = crate::plan_writer_epoch_migration(19).unwrap();
         assert_eq!(plan.target_writer_epoch, crate::CURRENT_WRITER_EPOCH);
-        assert_eq!(plan.steps.len(), 6);
+        assert_eq!(plan.steps.len(), 7);
         assert_eq!(
             plan.steps[0],
             crate::MigrationStepDescriptor {
@@ -3135,7 +3141,7 @@ mod tests {
         );
         assert_eq!(plan.steps[1..], latest.steps);
         let old = crate::plan_writer_epoch_migration(18).unwrap();
-        assert_eq!(old.steps.len(), 7);
+        assert_eq!(old.steps.len(), 8);
         assert_eq!(old.steps[0].id, "session-writer-epoch-18-to-19");
         assert_eq!(old.steps[1..], plan.steps);
         assert_eq!(crate::CURRENT_EVENT_SCHEMA, 58);

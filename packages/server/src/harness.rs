@@ -41,6 +41,7 @@ mod tests;
 
 pub use admission::{CanonicalManagedAdmission, install_canonical_backend};
 pub use application::ManagedHarnessApplication;
+pub(crate) use application::drain_delegated_observations;
 pub use assistance::ParentAssistanceAuthorization;
 pub use auth_inspection::{
     HarnessAuthAdmissionEvidence, HarnessAuthExecution, HarnessAuthMethodEvidence,

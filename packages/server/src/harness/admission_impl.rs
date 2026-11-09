@@ -163,6 +163,10 @@ impl ManagedSessionAdmission for CanonicalManagedAdmission {
     ) -> Task<'a, crate::harness_dispatch::ManagedAuthAdmission> {
         Box::pin(async move { self.authorize_auth(caller, session_id, instance_id).await })
     }
+
+    fn delegated_read<'a>(&'a self, caller: &'a ManagedCaller, child: SessionId) -> Task<'a, ()> {
+        Box::pin(self.authorize_delegated_read(caller, child))
+    }
 }
 
 impl CanonicalManagedAdmission {

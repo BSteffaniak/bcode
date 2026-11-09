@@ -19,6 +19,8 @@ struct Turn {
     steered_attempts: Vec<HarnessAttemptIdentity>,
     continuation: String,
     output: Option<String>,
+    /// Last unphased (legacy) assistant message; output only if no final answer arrives.
+    unphased_output: Option<String>,
     terminal: bool,
     foreground: bool,
 }
@@ -163,6 +165,7 @@ impl Execution {
                                 steered_attempts: Vec::new(),
                                 continuation: uuid::Uuid::new_v4().to_string(),
                                 output: None,
+                                unphased_output: None,
                                 terminal: false,
                                 foreground: true,
                             },
@@ -244,6 +247,7 @@ impl Execution {
                         steered_attempts: Vec::new(),
                         continuation: continuation_id.clone(),
                         output: output.clone(),
+                        unphased_output: None,
                         terminal: state.is_terminal(),
                         foreground: false,
                     },
@@ -328,6 +332,7 @@ impl Execution {
                 steered_attempts: Vec::new(),
                 continuation: uuid::Uuid::new_v4().to_string(),
                 output: None,
+                unphased_output: None,
                 terminal: false,
                 foreground: true,
             },
@@ -464,6 +469,7 @@ impl Execution {
                 steered_attempts: Vec::new(),
                 continuation: uuid::Uuid::new_v4().to_string(),
                 output: None,
+                unphased_output: None,
                 terminal: false,
                 foreground: false,
             });
@@ -498,6 +504,9 @@ impl Execution {
             _ => return Err(CodexError::Protocol),
         };
         turn.terminal = true;
+        if disposition == HarnessTerminalDisposition::Completed && turn.output.is_none() {
+            turn.output = turn.unphased_output.take();
+        }
         if let Some(attempt) = &turn.attempt {
             // Successful foreground output must be a complete final-answer item.
             // Failed/interrupted outcomes remain reportable without such output.
@@ -602,8 +611,9 @@ impl Execution {
         let item = &params["item"];
         let turn_id = params["turnId"].as_str();
         if item["type"] == "agentMessage" {
+            let phase = item["phase"].as_str();
             if method == "item/completed"
-                && item["phase"] == "final_answer"
+                && matches!(phase, Some("final_answer") | None)
                 && let Some(turn) = turn_id.and_then(|id| self.turns.get_mut(id))
                 && !turn.terminal
             {
@@ -611,7 +621,14 @@ impl Execution {
                 if output.len() > MAX_HARNESS_TEXT_BYTES {
                     return Err(CodexError::Bounds);
                 }
-                turn.output = Some(output.to_owned());
+                if phase.is_some() {
+                    turn.output = Some(output.to_owned());
+                } else {
+                    // Models/providers without message phases never label a final answer;
+                    // the last unphased message is the answer only if no final answer
+                    // arrives before successful native completion. Commentary never is.
+                    turn.unphased_output = Some(output.to_owned());
+                }
             }
             return Ok(());
         }
@@ -628,10 +645,12 @@ impl Execution {
             .work
             .iter()
             .find_map(|(key, work)| {
-                let native = item["processId"].as_str().unwrap_or(id);
-                (work.kind == kind && work.native_task == native).then(|| key.clone())
+                let process = item["processId"].as_str();
+                (work.kind == kind
+                    && (work.native_task == id || process.is_some_and(|p| work.native_task == p)))
+                .then(|| key.clone())
             })
-            .unwrap_or_else(|| format!("{}:{id}", turn_id.unwrap_or("unknown")));
+            .unwrap_or_else(|| format!("codex-work:{}:{id}", turn_id.unwrap_or("unknown")));
         let work_count = self.retained_count();
         if let Entry::Vacant(entry) = self.work.entry(key.clone()) {
             capacity(work_count)?;
@@ -642,10 +661,19 @@ impl Execution {
                     None
                 }
             });
+            // Deterministic work identity: acknowledged work is evicted from this bounded
+            // tracker, and a later item update must continue the same canonical work rather
+            // than open a second, never-terminated record.
             entry.insert(Work {
-                id: uuid::Uuid::new_v4().to_string(),
+                id: if key.len() <= bcode_harness_models::MAX_HARNESS_ID_BYTES {
+                    key.clone()
+                } else {
+                    uuid::Uuid::new_v4().to_string()
+                },
                 origin,
-                native_task: item["processId"].as_str().unwrap_or(id).to_owned(),
+                // The native item id is stable for the item's whole lifecycle; the PTY
+                // process id appears only once the command runs.
+                native_task: id.to_owned(),
                 kind,
                 state: HarnessWorkState::Pending,
                 notification: None,

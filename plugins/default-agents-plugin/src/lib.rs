@@ -25,6 +25,9 @@ use std::path::PathBuf;
 use toml::{Table, Value};
 
 const MANIFEST: &str = include_str!("../bcode-plugin.toml");
+/// Delegation tool advertised by the harness plugin only when an external agent is configured.
+const DELEGATE_TOOL: &str = "harness.delegate";
+const DELEGATION_GUIDANCE: &str = "\n\nConfigured external coding agents are available. For a self-contained coding task, call `harness.delegate` with a complete standalone prompt; it returns a child session_id immediately while the agent works. Poll `harness.result` with that session_id (pass its cursor as `after`) until activity is settled; answer pending approvals or questions with `harness.respond`, send follow-ups with `harness.continue`, and review the result before reporting it.";
 
 #[derive(Debug, Deserialize)]
 struct DefaultAgentsManifestExtension {
@@ -188,15 +191,18 @@ fn agent_context(request: &ServiceRequest) -> ServiceResponse {
     .unwrap_or_else(|| (load_config().0, load_tools_config()));
     let mut agent = agent_config(&config, &request.agent_id);
     apply_tool_selection(&mut agent, &tools_config, &request.available_tools);
-    let enabled_tools = Some(enabled_tools_from_available_metadata(
-        active_tools_for(&agent),
-        &request.available_tools,
-    ));
-    let system_prompt_suffix = Some(match request.agent_id.as_str() {
+    let enabled_tools =
+        enabled_tools_from_available_metadata(active_tools_for(&agent), &request.available_tools);
+    let mut system_prompt_suffix = match request.agent_id.as_str() {
         PLAN_AGENT => "[PLAN AGENT ACTIVE]\n\nInspect, analyze, and plan only. Do not edit source files or intentionally modify project state. You may run shell commands allowed by the active permission policy, including validation commands such as `cargo check` or `cargo test`, even if they create normal build/cache artifacts. If implementation changes are needed, ask the user to switch to the build agent. When the user asks what text an image or screenshot says, use `ocr.extract` instead of `filesystem.read`.".to_string(),
         BUILD_AGENT => "[BUILD AGENT ACTIVE]\n\nImplementation is allowed subject to Bcode permissions, active agent policy, and project instructions. Use tools normally, keep changes focused, and report validation. When the user asks what text an image or screenshot says, use `ocr.extract` instead of `filesystem.read`.".to_string(),
         other => format!("[AGENT ACTIVE: {other}]\n\nFollow this agent's configured tool and permission policy."),
-    });
+    };
+    if request.agent_id == BUILD_AGENT && enabled_tools.iter().any(|tool| tool == DELEGATE_TOOL) {
+        system_prompt_suffix.push_str(DELEGATION_GUIDANCE);
+    }
+    let system_prompt_suffix = Some(system_prompt_suffix);
+    let enabled_tools = Some(enabled_tools);
     let operating_mode = Some(
         match request.agent_id.as_str() {
             PLAN_AGENT => "read_only",
@@ -1166,6 +1172,68 @@ command = { "python3 *" = "allow" }
             &available,
         );
         assert!(explicit.iter().any(|tool| tool == "filesystem.multi_edit"));
+    }
+
+    #[test]
+    fn build_guidance_mentions_delegation_only_when_the_tool_is_offered() {
+        let _guard = ENV_LOCK.lock().expect("env lock should not be poisoned");
+        let root = unique_temp_dir();
+        let _state = StateGuard::set(&root.join("missing-permissions.toml"));
+        let context = |agent: &str, names: &[&str]| {
+            let request = AgentContextRequest {
+                session_id: SessionId::new(),
+                agent_id: agent.to_owned(),
+                available_tools: names
+                    .iter()
+                    .map(|name| bcode_tool::ToolDefinition {
+                        name: (*name).to_owned(),
+                        description: String::new(),
+                        input_schema: json!({}),
+                    })
+                    .collect(),
+                effective_config_toml: Some(Box::default()),
+            };
+            let response = agent_context(&ServiceRequest {
+                interface_id: AGENT_PROFILE_INTERFACE_ID.to_owned(),
+                operation: OP_AGENT_CONTEXT.to_owned(),
+                payload: serde_json::to_vec(&request).unwrap(),
+            });
+            serde_json::from_slice::<AgentContextResponse>(&response.payload).unwrap()
+        };
+        let delegation = [
+            "harness.delegate",
+            "harness.continue",
+            "harness.result",
+            "question",
+        ];
+        let build = context(BUILD_AGENT, &delegation);
+        assert!(
+            build
+                .system_prompt_suffix
+                .unwrap()
+                .contains("harness.delegate")
+        );
+        let enabled = build.enabled_tools.unwrap();
+        for tool in ["harness.delegate", "harness.continue", "harness.result"] {
+            assert!(enabled.iter().any(|name| name == tool), "{tool}");
+        }
+        let unconfigured = context(BUILD_AGENT, &["question"]);
+        assert!(
+            !unconfigured
+                .system_prompt_suffix
+                .unwrap()
+                .contains("harness.delegate")
+        );
+        let plan = context(PLAN_AGENT, &delegation);
+        assert!(
+            !plan
+                .system_prompt_suffix
+                .unwrap()
+                .contains("harness.delegate")
+        );
+        let plan_tools = plan.enabled_tools.unwrap();
+        assert!(!plan_tools.iter().any(|name| name == "harness.delegate"));
+        assert!(plan_tools.iter().any(|name| name == "harness.result"));
     }
 
     #[test]

@@ -6,8 +6,8 @@ use bcode_config::{
     edit::{PluginConfigurationUpdate, PolicyConfigEdit},
 };
 use bcode_harness_models::{
-    HarnessInstallationCandidate, HarnessPrepareCandidateRequest, HarnessPrepareCandidateResponse,
-    HarnessPrepareCandidateResponseKind, HarnessPreparedCandidate,
+    HarnessCandidateReadiness, HarnessInstallationCandidate, HarnessPrepareCandidateRequest,
+    HarnessPrepareCandidateResponse, HarnessPrepareCandidateResponseKind, HarnessPreparedCandidate,
 };
 use serde::{Deserialize, Serialize};
 
@@ -33,11 +33,11 @@ struct NativeSetup {
     harness: InstanceSetup,
 }
 
-fn unavailable() -> CliError {
-    CliError::InvalidArguments(
-        "Native setup changed or is unavailable; no fallback or configuration change was selected"
-            .into(),
-    )
+/// Setup refusal naming the failed step; reasons are fixed text, never native output.
+fn unavailable(reason: &'static str) -> CliError {
+    CliError::InvalidArguments(format!(
+        "Native setup changed or is unavailable ({reason}); no fallback or configuration change was selected"
+    ))
 }
 
 /// Discover native-owned installation/account observations, not provider credentials.
@@ -86,13 +86,18 @@ pub(super) async fn run(
     let mut choices: Vec<_> = observed
         .iter()
         .map(|candidate| bcode_tui::QuickConnectionChoice {
-            label: format!("Set up {}", candidate.plugin_id),
+            label: format!(
+                "Use {}",
+                bcode_session_view::external_projection::harness_display_label(
+                    &candidate.plugin_id
+                )
+            ),
             detail: format!(
-                "{} · {} · {:?} · {}",
+                "{} · {} · {} · {}",
                 candidate.native_version,
-                candidate.executable.canonical_path,
-                candidate.readiness,
-                candidate.config_namespace
+                readiness_label(candidate.readiness),
+                home_relative(candidate.executable.invocation()),
+                home_relative(&candidate.config_namespace)
             ),
         })
         .collect();
@@ -103,7 +108,7 @@ pub(super) async fn run(
     });
     let outcome = bcode_tui::run_backend_selection_in_shell(shell, bcode_tui::QuickOnboardingInput {
         choices,
-        recovery: Some(format!("Native credentials remain owned by the selected harness. {} No installation, login or configuration change occurs until explicitly reviewed.", if complete { "Inspection complete." } else { "Inspection incomplete; unavailable sources are not evidence of absence." })),
+        recovery: Some(format!("{} Each tool keeps its own sign-in; nothing is installed or changed until you confirm.", if complete { "Found these coding agents on this machine." } else { "Found these coding agents; some locations could not be checked." })),
     }).await?;
     match outcome {
         bcode_tui::QuickOnboardingOutcome::Selected(index) if index < observed.len() => {
@@ -119,6 +124,28 @@ pub(super) async fn run(
             Ok(true)
         }
         _ => Ok(true),
+    }
+}
+
+/// A path for display, abbreviating the user's home directory as `~`.
+fn home_relative(path: &str) -> String {
+    std::env::var("HOME")
+        .ok()
+        .filter(|home| !home.is_empty() && home != "/")
+        .and_then(|home| {
+            path.strip_prefix(&home)
+                .filter(|rest| rest.is_empty() || rest.starts_with('/'))
+                .map(|rest| format!("~{rest}"))
+        })
+        .unwrap_or_else(|| path.to_owned())
+}
+
+const fn readiness_label(readiness: HarnessCandidateReadiness) -> &'static str {
+    match readiness {
+        HarnessCandidateReadiness::ExistingNativeLogin => "signed in",
+        HarnessCandidateReadiness::LoginRequired => "sign-in required",
+        HarnessCandidateReadiness::Unsupported => "unsupported version",
+        HarnessCandidateReadiness::Unknown => "sign-in status unknown",
     }
 }
 
@@ -139,16 +166,16 @@ async fn prepare(
         .get(&native.instance.plugin_id)
         .map(serde_json::to_value)
         .transpose()
-        .map_err(|_| unavailable())?
+        .map_err(|_| unavailable("adapter settings unreadable"))?
         .unwrap_or_else(|| serde_json::json!({}));
     let result = client.call_plugin_service(super::HARNESS_CONFIGURATION_INTERFACE.into(), "prepare_setup".into(), serde_json::to_vec(&serde_json::json!({
         "request": request, "response": response, "adapter_configuration": adapter, "make_default": false,
-    })).map_err(|_| unavailable())?).await?;
+    })).map_err(|_| unavailable("request encoding"))?).await?;
     if result.error.is_some() {
-        return Err(unavailable());
+        return Err(unavailable("instance settings refused"));
     }
-    let prepared: NativeSetup =
-        serde_json::from_slice(&result.payload).map_err(|_| unavailable())?;
+    let prepared: NativeSetup = serde_json::from_slice(&result.payload)
+        .map_err(|_| unavailable("instance settings unreadable"))?;
     verify(&prepared, request, &response)?;
     Ok((prepared, response))
 }
@@ -160,42 +187,52 @@ fn verify(
 ) -> Result<(), CliError> {
     response
         .validate_for(request, &request.candidate.plugin_id)
-        .map_err(|_| unavailable())?;
+        .map_err(|_| unavailable("preparation mismatch"))?;
     if !matches!(&response.kind, HarnessPrepareCandidateResponseKind::Prepared(native) if native.as_ref() == &prepared.native)
         || prepared.harness.prepared.instance != prepared.native.instance
         || prepared.harness.prepared.selection
             != serde_json::json!({"kind":"instance","instance_id":request.instance_id})
     {
-        return Err(unavailable());
+        return Err(unavailable("preparation mismatch"));
     }
     if prepared.harness.configuration["enabled"] != true
         || prepared.harness.configuration["instances"][&request.instance_id]["enabled"] != true
         || prepared.harness.configuration["instances"][&request.instance_id]["instance"]
-            != serde_json::to_value(&prepared.native.instance).map_err(|_| unavailable())?
+            != serde_json::to_value(&prepared.native.instance)
+                .map_err(|_| unavailable("instance encoding"))?
         || prepared.adapter_configuration["instances"][&request.instance_id]
             != prepared.native.adapter_settings
     {
-        return Err(unavailable());
+        return Err(unavailable("instance settings mismatch"));
     }
     Ok(())
 }
 
 fn plan(config: &BcodeConfig, prepared: &NativeSetup) -> Result<PolicyConfigEdit, CliError> {
     let (current, launch) = bcode_config::recovery::load_current_config_with_recovery_context()?;
-    if bcode_config::recovery::execution_fingerprint(&current).map_err(|_| unavailable())?
-        != bcode_config::recovery::execution_fingerprint(config).map_err(|_| unavailable())?
+    if bcode_config::recovery::execution_fingerprint(&current)
+        .map_err(|_| unavailable("configuration unreadable"))?
+        != bcode_config::recovery::execution_fingerprint(config)
+            .map_err(|_| unavailable("configuration unreadable"))?
     {
-        return Err(unavailable());
+        return Err(unavailable("configuration changed"));
     }
-    let sources = launch.recovery_sources.as_ref().ok_or_else(unavailable)?;
+    let sources = launch
+        .recovery_sources
+        .as_ref()
+        .ok_or_else(|| unavailable("configuration sources unknown"))?;
+    // A first run has no configuration directory yet; it must exist to be an authorized
+    // root for the configuration file this setup is about to create.
+    std::fs::create_dir_all(bcode_config::default_config_dir())
+        .map_err(|_| unavailable("configuration location unavailable"))?;
     let roots = bcode_config::recovery::default_allowed_recovery_roots(&sources.cwd)
-        .map_err(|_| unavailable())?;
+        .map_err(|_| unavailable("configuration location unavailable"))?;
     let reference = bcode_config::recovery::capture_with_sources(&current, sources, &roots)
-        .map_err(|_| unavailable())?;
-    let adapter: toml::Value =
-        toml::Value::try_from(&prepared.adapter_configuration).map_err(|_| unavailable())?;
-    let generic: toml::Value =
-        toml::Value::try_from(&prepared.harness.configuration).map_err(|_| unavailable())?;
+        .map_err(|_| unavailable("configuration snapshot failed"))?;
+    let adapter: toml::Value = toml::Value::try_from(&prepared.adapter_configuration)
+        .map_err(|_| unavailable("settings encoding"))?;
+    let generic: toml::Value = toml::Value::try_from(&prepared.harness.configuration)
+        .map_err(|_| unavailable("settings encoding"))?;
     let updates = [
         PluginConfigurationUpdate {
             plugin_id: &prepared.native.instance.plugin_id,
@@ -216,6 +253,48 @@ fn plan(config: &BcodeConfig, prepared: &NativeSetup) -> Result<PolicyConfigEdit
     )?)
 }
 
+/// A readable instance identity derived from the plugin (`bcode.claude-code` becomes
+/// `claude-code`), suffixed only when that name is already configured.
+fn friendly_instance_id(config: &BcodeConfig, plugin_id: &str) -> String {
+    let base: String = plugin_id
+        .rsplit(['.', '/', ':'])
+        .next()
+        .unwrap_or_default()
+        .chars()
+        .map(|character| {
+            if character.is_ascii_alphanumeric() {
+                character.to_ascii_lowercase()
+            } else {
+                '-'
+            }
+        })
+        .collect();
+    let base = if base.trim_matches('-').is_empty() {
+        "native".to_owned()
+    } else {
+        base.trim_matches('-').to_owned()
+    };
+    let taken = |id: &str| {
+        [plugin_id, "bcode.harness"].iter().any(|owner| {
+            config
+                .plugins
+                .config
+                .get(*owner)
+                .and_then(|settings| settings.get("instances"))
+                .and_then(toml::Value::as_table)
+                .is_some_and(|instances| instances.contains_key(id))
+        })
+    };
+    if !taken(&base) {
+        return base;
+    }
+    // Configured instances are bounded, so a free suffix exists well within this range.
+    (2_u32..=1024)
+        .map(|suffix| format!("{base}-{suffix}"))
+        .find(|candidate| !taken(candidate))
+        .unwrap_or_else(|| format!("{base}-{}", uuid::Uuid::new_v4()))
+}
+
 async fn configure(
     shell: &mut bcode_tui::TerminalShell,
     candidate: HarnessInstallationCandidate,
@@ -224,17 +303,17 @@ async fn configure(
     let request = HarnessPrepareCandidateRequest {
         schema_version: bcode_harness_models::HARNESS_SCHEMA_VERSION,
         request_id: uuid::Uuid::new_v4().to_string(),
-        instance_id: format!("native-{}", uuid::Uuid::new_v4()),
+        instance_id: friendly_instance_id(&config, &candidate.plugin_id),
         candidate,
     };
     let (prepared, _) = prepare(&config, &request).await?;
     let edit = plan(&config, &prepared)?;
     let outcome = bcode_tui::run_execution_confirmation_in_shell(shell, bcode_tui::QuickOnboardingInput {
         choices: vec![bcode_tui::QuickConnectionChoice {
-            label: "Configure this native instance".into(),
-            detail: format!("{} · {} · write {}. Existing provider/model preferences and credentials remain unchanged.", prepared.native.instance.plugin_id, prepared.native.instance.config_namespace, edit.path().display()),
+            label: "Save and continue".into(),
+            detail: format!("{} · {} · saved to {}", bcode_session_view::external_projection::harness_display_label(&prepared.native.instance.plugin_id), home_relative(&prepared.native.instance.config_namespace), home_relative(&edit.path().display().to_string())),
         }],
-        recovery: Some("Both native-adapter and generic instance settings are committed together after fresh preparation. No model is chosen and no user prompt is sent. You can sign in next using the native terminal flow.".into()),
+        recovery: Some("Bcode will remember this installation. Your other providers, models and credentials stay as they are, and nothing is sent yet.".into()),
     }).await?;
     if !matches!(outcome, bcode_tui::QuickOnboardingOutcome::Selected(0)) {
         return Ok(());
@@ -242,16 +321,16 @@ async fn configure(
     let (fresh, response) = prepare(&config, &request).await?;
     verify(&prepared, &request, &response)?;
     if fresh != prepared {
-        return Err(unavailable());
+        return Err(unavailable("installation changed"));
     }
     edit.apply()?;
     let instance = prepared.native.instance;
     let outcome = bcode_tui::run_backend_selection_in_shell(shell, bcode_tui::QuickOnboardingInput {
         choices: vec![
-            bcode_tui::QuickConnectionChoice { label: "Choose a model".into(), detail: "Use freshly discovered models and this native account".into() },
-            bcode_tui::QuickConnectionChoice { label: "Sign in with the native harness".into(), detail: "Explicitly yield the terminal for native login; credentials do not enter Bcode's vault".into() },
+            bcode_tui::QuickConnectionChoice { label: "Choose a model".into(), detail: "Pick a model and start chatting".into() },
+            bcode_tui::QuickConnectionChoice { label: "Sign in".into(), detail: "Run the tool's own sign-in in this terminal; your credentials never pass through Bcode".into() },
         ],
-        recovery: Some("Instance configured. Closing does not launch work. Native login creates a visible empty Bcode session for authenticated ownership; no prompt or default-model execution is used.".into()),
+        recovery: Some("All set. Choose a model to start, or sign in first if you haven't yet.".into()),
     }).await?;
     if matches!(outcome, bcode_tui::QuickOnboardingOutcome::Selected(1)) {
         sign_in(shell, instance).await?;
@@ -283,21 +362,22 @@ async fn sign_in(
     let request = ManagedSessionRequest {
         schema_version: MANAGED_SESSION_VERSION,
         operation: ManagedSessionOperation::Start,
-        request_json: serde_json::to_string(&call).map_err(|_| unavailable())?,
+        request_json: serde_json::to_string(&call).map_err(|_| unavailable("request encoding"))?,
     };
     let client = bcode_client::ManagedSessionClient::default_endpoint();
     let response = client
         .call_plugin_service(
             MANAGED_SESSION_INTERFACE_ID.into(),
             "start".into(),
-            serde_json::to_vec(&request).map_err(|_| unavailable())?,
+            serde_json::to_vec(&request).map_err(|_| unavailable("request encoding"))?,
         )
         .await?;
     if response.error.is_some() {
-        return Err(unavailable());
+        return Err(unavailable("session start refused"));
     }
     let response: bcode_harness_models::HarnessServiceResponse =
-        serde_json::from_slice(&response.payload).map_err(|_| unavailable())?;
+        serde_json::from_slice(&response.payload)
+            .map_err(|_| unavailable("session start unreadable"))?;
     super::managed_started_session(
         &response,
         session_id,
@@ -307,7 +387,7 @@ async fn sign_in(
     let interface = client
         .session_terminal_auth_interface(session_id, &instance.instance_id)
         .await?
-        .ok_or_else(unavailable)?;
+        .ok_or_else(|| unavailable("terminal login unavailable"))?;
     #[cfg(unix)]
     {
         let mut flow = bcode_client::ManagedSessionClient::default_endpoint()
@@ -372,6 +452,27 @@ mod tests {
         }))
         .unwrap();
         (request, response, prepared)
+    }
+
+    #[test]
+    fn instance_ids_are_readable_and_never_reuse_a_configured_name() {
+        let mut config = BcodeConfig::default();
+        assert_eq!(
+            friendly_instance_id(&config, "bcode.claude-code"),
+            "claude-code"
+        );
+        config.plugins.config.insert(
+            "bcode.harness".into(),
+            toml::from_str("[instances.claude-code]\nenabled = true\n").unwrap(),
+        );
+        assert_eq!(
+            friendly_instance_id(&config, "bcode.claude-code"),
+            "claude-code-2"
+        );
+        assert_eq!(
+            friendly_instance_id(&config, "bcode.codex-harness"),
+            "codex-harness"
+        );
     }
 
     #[test]

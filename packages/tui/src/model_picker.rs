@@ -195,11 +195,15 @@ impl ModelPickerApp {
                 bcode_model::execution::ExecutionRoute::ModelProvider { provider_plugin_id } => {
                     format!("Provider {provider_plugin_id}")
                 }
+                // The instance identity distinguishes several configured installations.
                 bcode_model::execution::ExecutionRoute::ManagedHarness {
                     instance_id,
                     plugin_id,
                 } => {
-                    format!("Managed {instance_id} ({plugin_id})")
+                    return format!(
+                        "{} ({instance_id}) · runs on its own signed-in account",
+                        bcode_session_view::external_projection::harness_display_label(plugin_id)
+                    );
                 }
             };
             return format!(
@@ -238,11 +242,20 @@ impl ModelPickerApp {
             .as_ref()
             .and_then(|entries| entries.get(index))
         {
+            if matches!(
+                entry.route,
+                bcode_model::execution::ExecutionRoute::ManagedHarness { .. }
+            ) {
+                return format!(
+                    "{} · {}",
+                    managed_readiness_label(entry.readiness),
+                    billing_label(entry.billing_route)
+                );
+            }
             return format!(
-                "{} · {:?} · billing {:?}; selection is not native acceptance",
+                "{} · {}",
                 execution_readiness_label(entry.readiness),
-                entry.provenance,
-                entry.billing_route
+                billing_label(entry.billing_route)
             );
         }
         let model_id = &self.models[index].model_id;
@@ -574,22 +587,34 @@ impl ModelPickerApp {
                     .as_ref()
                     .and_then(|entries| entries.get(*index))
                 {
-                    let route = match &entry.route {
+                    match &entry.route {
                         bcode_model::execution::ExecutionRoute::ModelProvider {
                             provider_plugin_id,
-                        } => provider_plugin_id.as_str(),
+                        } => {
+                            row.model_id = format!(
+                                "{} · {} / {}",
+                                row.model_id,
+                                provider_plugin_id,
+                                entry.account_reference.as_deref().unwrap_or("unspecified")
+                            );
+                            row.state = execution_readiness_label(entry.readiness).into();
+                        }
+                        // A native executor runs under its own signed-in account; name the
+                        // executor rather than internal instance and account identifiers.
                         bcode_model::execution::ExecutionRoute::ManagedHarness {
-                            instance_id,
+                            plugin_id,
                             ..
-                        } => instance_id.as_str(),
-                    };
-                    row.model_id = format!(
-                        "{} · {} / {}",
-                        row.model_id,
-                        route,
-                        entry.account_reference.as_deref().unwrap_or("unspecified")
-                    );
-                    row.state = execution_readiness_label(entry.readiness).into();
+                        } => {
+                            row.model_id = format!(
+                                "{} · {}",
+                                row.model_id,
+                                bcode_session_view::external_projection::harness_display_label(
+                                    plugin_id
+                                )
+                            );
+                            row.state = managed_readiness_label(entry.readiness).into();
+                        }
+                    }
                     return row;
                 }
                 let status = self
@@ -613,6 +638,35 @@ impl ModelPickerApp {
         let rows = self.visible_rows();
         let widths = ModelPickerColumnWidths::from_rows(&rows, usable_list_width(width));
         rows.iter().map(|row| format_row(row, &widths)).collect()
+    }
+}
+
+/// Readiness of a native executor's model: an authenticated route is usable even though
+/// the native executor, not Bcode, decides model access at the first turn.
+const fn managed_readiness_label(
+    readiness: bcode_model::execution::ExecutionModelReadiness,
+) -> &'static str {
+    use bcode_model::execution::{ExecutionModelAccess, ExecutionModelReadiness};
+    match readiness {
+        ExecutionModelReadiness::Ready
+        | ExecutionModelReadiness::RouteReady {
+            model_access: ExecutionModelAccess::Unknown | ExecutionModelAccess::Confirmed,
+        } => "Ready",
+        ExecutionModelReadiness::RouteReady {
+            model_access: ExecutionModelAccess::Unavailable,
+        } => "Not available on this account",
+        ExecutionModelReadiness::Unavailable => "Unavailable",
+        ExecutionModelReadiness::Unknown => "Sign-in status unknown",
+    }
+}
+
+const fn billing_label(route: bcode_model::execution::ExecutionBillingRoute) -> &'static str {
+    use bcode_model::execution::ExecutionBillingRoute;
+    match route {
+        ExecutionBillingRoute::NativeSubscription => "billed to your subscription",
+        ExecutionBillingRoute::ProviderApi => "billed to your provider API account",
+        ExecutionBillingRoute::Unknown => "billing not reported",
+        ExecutionBillingRoute::Api => "API billing",
     }
 }
 
@@ -1197,13 +1251,18 @@ mod tests {
         assert_eq!(selection.route, remembered.route);
         assert_eq!(selection.account_reference, remembered.account_reference);
         assert_eq!(picker.visible_rows().len(), 2);
-        assert!(picker.selected_availability_summary().contains("Unknown"));
-        assert!(picker.selected_scope_summary().contains("second"));
         assert!(
             picker
-                .visible_rows()
-                .iter()
-                .all(|row| row.state == "Unknown readiness")
+                .selected_availability_summary()
+                .contains("Sign-in status unknown")
+        );
+        assert!(picker.selected_scope_summary().contains("second"));
+        let rows = picker.visible_rows();
+        assert!(
+            rows.iter().all(|row| {
+                row.state == "Sign-in status unknown" && row.model_id == "same-model · Native"
+            }),
+            "{rows:?}"
         );
         picker.select_previous();
         assert_ne!(picker.selected_execution().unwrap().route, remembered.route);

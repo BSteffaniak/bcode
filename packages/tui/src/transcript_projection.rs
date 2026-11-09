@@ -244,6 +244,7 @@ fn record_cache_hit(app: &mut BmuxApp, width: u16, started: Instant) -> bool {
 }
 
 struct TranscriptLayoutInput<'a> {
+    app: &'a BmuxApp,
     width: u16,
     transcript: TranscriptItems<'a>,
     plugin_host: Option<&'a crate::plugin_tui::PluginTuiPresentation>,
@@ -265,6 +266,7 @@ struct TranscriptLayoutInput<'a> {
 impl<'a> TranscriptLayoutInput<'a> {
     fn from_app(app: &'a BmuxApp, width: u16) -> Self {
         Self {
+            app,
             width,
             transcript: app.transcript(),
             plugin_host: app.plugin_presentation(),
@@ -337,7 +339,9 @@ pub fn test_layout_signature(
     let mut transcript = TranscriptDocument::default();
     transcript.push_ephemeral("test".to_owned(), item.clone());
     let pending = [];
+    let app = BmuxApp::new_with_history(None, &[], &[], false);
     let input = TranscriptLayoutInput {
+        app: &app,
         width,
         transcript: transcript.items(),
         plugin_host,
@@ -369,7 +373,9 @@ pub fn test_layout_signature_with_interaction_height(
     let mut transcript = TranscriptDocument::default();
     transcript.push_ephemeral("test".to_owned(), item.clone());
     let pending = [];
+    let app = BmuxApp::new_with_history(None, &[], &[], false);
     let input = TranscriptLayoutInput {
+        app: &app,
         width,
         transcript: transcript.items(),
         plugin_host: None,
@@ -400,7 +406,9 @@ pub fn test_layout_signature_with_theme(
     let mut transcript = TranscriptDocument::default();
     transcript.push_ephemeral("test".to_owned(), item.clone());
     let pending = [];
+    let app = BmuxApp::new_with_history(None, &[], &[], false);
     let input = TranscriptLayoutInput {
+        app: &app,
         width,
         transcript: transcript.items(),
         plugin_host: None,
@@ -439,11 +447,46 @@ fn theme_fingerprint_changes_versioned_transcript_layout_signature_exactly() {
     assert!(changed.as_str().contains("theme:12"));
 }
 
+#[cfg(test)]
+#[test]
+fn accepted_exact_markdown_projection_changes_the_layout_signature() {
+    let mut app = BmuxApp::new_with_history(None, &[], &[], false);
+    app.push_ephemeral_system_markdown("A finalized **reply**".to_owned());
+    let width = 80;
+    let signature = |app: &BmuxApp| {
+        let input = TranscriptLayoutInput::from_app(app, width);
+        let signature = transcript_item_signature(&input.transcript[0], &input);
+        drop(input);
+        signature
+    };
+    let before = signature(&app);
+    // Accepting the exact projection must re-lay out rows painted from a previous one.
+    let item = app.transcript()[0].clone();
+    let options = render::markdown_render_options(
+        &app,
+        &item,
+        render::transcript_item_body_width(&item, width),
+    );
+    let _ = app.transcript_markdown_cache().project(&item, options);
+    let after = signature(&app);
+    assert_ne!(before, after);
+    assert_eq!(after, signature(&app));
+    drop(app);
+}
+
 fn transcript_item_signature(
     item: &TranscriptItem,
     input: &TranscriptLayoutInput<'_>,
 ) -> TranscriptLayoutSignature {
     let base = render::transcript_item_signature(item, input.width, ());
+    // Rows painted from a superseded (previous-revision) Markdown projection must be laid out
+    // again once the exact projection is accepted; the source revision alone does not change.
+    let markdown_exact = render::transcript_markdown_selection_projection(
+        input.app,
+        item,
+        render::transcript_item_body_width(item, input.width),
+    )
+    .is_some();
     let presentation_generation = input.plugin_host.map_or_else(
         || "none".to_owned(),
         |host| format!("{}:{}", std::ptr::from_ref(host).addr(), host.revision()),
@@ -460,7 +503,7 @@ fn transcript_item_signature(
             .map(|(id, height)| format!("{id}:{height}"))
     });
     TranscriptLayoutSignature::new(format!(
-        "{};theme:{};presentation-generation:{presentation_generation};visual-rev:{visual_revision};interaction-layout:{}",
+        "{};theme:{};presentation-generation:{presentation_generation};visual-rev:{visual_revision};interaction-layout:{};markdown-exact:{markdown_exact}",
         base.as_str(),
         input.theme_fingerprint,
         interaction_layout.as_deref().unwrap_or("none")

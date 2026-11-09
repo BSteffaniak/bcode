@@ -327,6 +327,7 @@ fn recovery_with(
         previous_owner: previous.clone(),
         release_event_sequence: sequence,
         release: release(previous, close_id),
+        abandoned: false,
         capabilities: capabilities(),
         resume_request: ExternalHarnessRequest::from_request(&request(
             recover_id,
@@ -668,4 +669,145 @@ async fn consecutive_recoveries_without_an_intervening_page_keep_the_session_usa
         .await
         .unwrap();
     assert!(sessions.external_harness_state(&third).await.is_ok());
+}
+
+/// Abandoned-transport recovery of `previous` (never released) into `next` at `sequence`.
+fn abandoned_recovery(
+    previous: &ExternalHarnessOwner,
+    next: &ExternalHarnessOwner,
+    sequence: u64,
+    directory: &str,
+) -> ExternalHarnessRecovery {
+    use bcode_session_models::external_harness::ABANDONED_TRANSPORT_EVIDENCE;
+    let mut recovery = recovery_with(
+        previous,
+        next,
+        sequence,
+        directory,
+        ABANDONED_TRANSPORT_EVIDENCE,
+        "recover-abandoned",
+    );
+    recovery.release.reap_id = ABANDONED_TRANSPORT_EVIDENCE.into();
+    recovery.abandoned = true;
+    recovery
+}
+
+#[tokio::test]
+async fn a_daemon_that_died_without_releasing_is_recovered_from_its_exact_tail() {
+    let root = tempfile::tempdir().unwrap();
+    let directory = root.path().to_str().unwrap().to_owned();
+    // Generation 1 commits a page and its daemon dies: no Close, no release.
+    let first = {
+        let sessions = manager(root.path(), "daemon-1");
+        let owner = confirmed(root.path(), &sessions).await;
+        let guard = sessions
+            .acquire_external_harness_ownership(&owner)
+            .await
+            .unwrap();
+        sessions
+            .commit_external_harness_page(&owner, None, &empty_page(Some("gen-1-page")))
+            .await
+            .unwrap();
+        drop(guard);
+        release_session(&sessions, owner.session_id).await;
+        owner
+    };
+    let next = owner(first.session_id, 2, "daemon-2");
+    let sessions = manager(root.path(), "daemon-2");
+    // Without a release, only abandonment can recover, and only from the exact tail.
+    assert!(
+        sessions
+            .session_external_harness_transport_release(&first)
+            .await
+            .unwrap()
+            .is_none()
+    );
+    let tail = sessions
+        .session_external_harness_abandonment_point(&first)
+        .await
+        .unwrap()
+        .expect("abandonment point");
+    let ordinary = recovery(&first, &next, tail, &directory);
+    assert!(
+        sessions
+            .prepare_external_harness_recovery(&next, ordinary, |_| Ok(()))
+            .await
+            .is_err(),
+        "a release-backed recovery needs an actual release"
+    );
+    let stale = abandoned_recovery(&first, &next, tail - 1, &directory);
+    assert!(
+        sessions
+            .prepare_external_harness_recovery(&next, stale, |_| Ok(()))
+            .await
+            .is_err(),
+        "abandonment must follow the exact canonical tail"
+    );
+    let prepared = abandoned_recovery(&first, &next, tail, &directory);
+    sessions
+        .prepare_external_harness_recovery(&next, prepared.clone(), |_| Ok(()))
+        .await
+        .unwrap();
+    let resume = prepared.resume_request.request().unwrap();
+    let mut resumed = binding(&first);
+    resumed.generation = next.generation;
+    deliver(
+        &sessions,
+        &next,
+        &resume,
+        HarnessServiceResponseKind::Opened(resumed.clone()),
+    )
+    .await;
+    let _guard = sessions
+        .acquire_external_harness_ownership(&next)
+        .await
+        .unwrap();
+    let state = sessions.external_harness_state(&next).await.unwrap();
+    assert_eq!(state.target, Some(HarnessSessionTarget::Confirmed(resumed)));
+    sessions
+        .commit_external_harness_page(&next, None, &empty_page(None))
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
+async fn a_released_generation_cannot_be_recovered_as_abandoned() {
+    let root = tempfile::tempdir().unwrap();
+    let directory = root.path().to_str().unwrap().to_owned();
+    let first = {
+        let sessions = manager(root.path(), "daemon-1");
+        let owner = confirmed(root.path(), &sessions).await;
+        let guard = sessions
+            .acquire_external_harness_ownership(&owner)
+            .await
+            .unwrap();
+        close_and_release(&sessions, &owner, "close-1").await;
+        drop(guard);
+        release_session(&sessions, owner.session_id).await;
+        owner
+    };
+    let next = owner(first.session_id, 2, "daemon-2");
+    let sessions = manager(root.path(), "daemon-2");
+    assert_eq!(
+        sessions
+            .session_external_harness_abandonment_point(&first)
+            .await
+            .unwrap(),
+        None
+    );
+    let (sequence, _) = sessions
+        .session_external_harness_transport_release(&first)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(
+        sessions
+            .prepare_external_harness_recovery(
+                &next,
+                abandoned_recovery(&first, &next, sequence, &directory),
+                |_| Ok(())
+            )
+            .await
+            .is_err()
+    );
 }

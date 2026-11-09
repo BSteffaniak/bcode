@@ -1229,32 +1229,62 @@ fn bounded_accounting_matches_full_inspection_across_many_turns() {
 }
 
 #[test]
-fn native_usage_survives_daemon_usage_summary_refreshes() {
+fn daemon_usage_summary_supersedes_native_usage_without_double_counting() {
     let mut fixture = Fixture::new();
     let mut pair = Pair::new();
     pair.durable(&fixture.configured());
     let page = full_turn_page(&mut fixture);
     pair.durable(&page);
-    // The daemon summary never includes native harness usage, even through a later
-    // checkpoint, so a refresh adds Bcode-metered totals on top of the native ones.
+    // Before any daemon summary, native usage is observed from canonical events.
+    assert!(pair.ordinary.snapshot().runtime.cumulative_metered_tokens > 0);
+    // The daemon summary is authoritative and already includes native harness usage, so a
+    // refresh replaces locally observed totals rather than adding to them.
     let summary = bcode_session_models::SessionUsageSummary {
-        through_sequence: Some(page.sequence + 10),
-        cumulative_metered_tokens: 30,
-        totals_micros: std::iter::once(("USD".to_owned(), 5)).collect(),
+        through_sequence: Some(page.sequence),
+        cumulative_metered_tokens: 1_200,
+        totals_micros: std::iter::once(("USD".to_owned(), 12_345)).collect(),
+        estimated_usage_count: 1,
+        observed_usage_count: 1,
         ..bcode_session_models::SessionUsageSummary::default()
     };
     for view in [&mut pair.ordinary, &mut pair.bounded] {
         view.set_usage_summary(summary.clone());
         let runtime = &view.snapshot().runtime;
         assert_eq!(runtime.cumulative_metered_tokens, 1_200);
-        assert_eq!(runtime.cost.totals_micros.get("USD"), Some(&12_350));
+        assert_eq!(runtime.cost.totals_micros.get("USD"), Some(&12_345));
+        assert_eq!(runtime.cost.observed_usage_count, 1);
     }
-    // Replaying the same native evidence after the checkpoint stays idempotent.
+    // Replaying covered native evidence after the checkpoint does not count it again.
     pair.ordinary.apply_event(&page);
-    assert_eq!(
-        pair.ordinary.snapshot().runtime.cumulative_metered_tokens,
-        1_200
-    );
+    let runtime = &pair.ordinary.snapshot().runtime;
+    assert_eq!(runtime.cumulative_metered_tokens, 1_200);
+    assert_eq!(runtime.cost.totals_micros.get("USD"), Some(&12_345));
+}
+
+#[test]
+fn reopened_view_uses_daemon_summary_for_native_usage_outside_loaded_history() {
+    let mut fixture = Fixture::new();
+    let configured = fixture.configured();
+    let earlier = full_turn_page(&mut fixture);
+    let loaded = full_turn_page(&mut fixture);
+    // Reopen: the daemon summary covers both turns although only the last is loaded.
+    let summary = bcode_session_models::SessionUsageSummary {
+        through_sequence: Some(loaded.sequence),
+        cumulative_metered_tokens: 2_400,
+        totals_micros: std::iter::once(("USD".to_owned(), 24_690)).collect(),
+        estimated_usage_count: 2,
+        observed_usage_count: 2,
+        ..bcode_session_models::SessionUsageSummary::default()
+    };
+    let mut view = SessionView::new();
+    view.set_usage_summary(summary);
+    view.apply_event(&configured);
+    view.apply_event(&loaded);
+    let runtime = &view.snapshot().runtime;
+    assert_eq!(runtime.cumulative_metered_tokens, 2_400);
+    assert_eq!(runtime.cost.totals_micros.get("USD"), Some(&24_690));
+    assert_eq!(runtime.cost.observed_usage_count, 2);
+    assert!(earlier.sequence < loaded.sequence);
 }
 
 /// Canonical evidence shaped exactly like a decoded native page entry.
@@ -1749,6 +1779,7 @@ fn native_conversation_stream_projects_native_items_without_lifecycle_noise() {
                     release,
                     capabilities: capabilities(),
                     resume_request: resume.clone(),
+                    abandoned: false,
                 },
             ),
         },
@@ -1820,10 +1851,7 @@ fn native_conversation_stream_projects_native_items_without_lifecycle_noise() {
             format!("assistant:reply turn-{n}"),
         ]
     };
-    let mut expected = vec![
-        "notice:Claude Code is ready. Send a message to start.".to_owned(),
-        "user:turn-1".to_owned(),
-    ];
+    let mut expected = vec!["user:turn-1".to_owned()];
     // Live-streamed items keep their place; the approval notice follows the streamed text.
     let mut first_turn = turn(1);
     first_turn.insert(
@@ -1833,12 +1861,8 @@ fn native_conversation_stream_projects_native_items_without_lifecycle_noise() {
     expected.extend(first_turn);
     expected.push("user:turn-2".to_owned());
     expected.extend(turn(2));
-    expected.extend([
-        "notice:Claude Code process released. History stays readable; nothing was resent."
-            .to_owned(),
-        "notice:Reconnecting to Claude Code. Earlier messages are not resent.".to_owned(),
-        "user:turn-3".to_owned(),
-    ]);
+    // Releasing and resuming the native process is invisible, like a native conversation.
+    expected.push("user:turn-3".to_owned());
     expected.extend(turn(3));
     assert_eq!(shape, expected);
 

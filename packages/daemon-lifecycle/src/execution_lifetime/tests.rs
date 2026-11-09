@@ -403,3 +403,30 @@ fn image_removal_requires_offline_fence_and_preserves_canonical_state() {
     assert!(ExecutionLifetime::begin(root.path(), &record).is_err());
     drop(maintenance);
 }
+
+#[test]
+fn released_lifetime_artifact_is_reported_only_after_release_for_the_exact_location() {
+    let root = tempfile::tempdir().unwrap();
+    let record = record(root.path());
+    let location = record.state_location_id.clone().unwrap();
+    let artifact = record.artifact_id.as_ref().unwrap().to_string();
+    assert_eq!(
+        released_execution_lifetime_artifact(root.path(), &record.instance_id, &location),
+        None
+    );
+    let guard = ExecutionLifetime::begin(root.path(), &record).unwrap();
+    // A live daemon is never reported as ended.
+    assert_eq!(
+        released_execution_lifetime_artifact(root.path(), &record.instance_id, &location),
+        None
+    );
+    drop(guard);
+    assert_eq!(
+        released_execution_lifetime_artifact(root.path(), &record.instance_id, &location),
+        Some(artifact)
+    );
+    assert_eq!(
+        released_execution_lifetime_artifact(root.path(), &record.instance_id, "other-location"),
+        None
+    );
+}

@@ -1,13 +1,54 @@
 # Managed harness integration
 
 The disableable `bcode_harness_plugin` (`bcode.harness`) exports `static_plugin()` and
-five tools/palette commands: `harness.start`, `inspect`, `followup`, `respond`, `interrupt`.
+five advanced tools/palette commands: `harness.start`, `inspect`, `followup`, `respond`, `interrupt`.
 Each accepts `request_json`, a bounded `ManagedSessionRequest` containing the shared
 `HarnessRequest`, optional `session_id` (instance inspection), optional creation-only
 `parent_session_id`, and optional explicit `assistance_destination_session_id`.
-Parentage and destination hints never grant response/approval/control authority.
+Parentage and destination hints never grant response/approval/control authority; only the
+active authenticated invocation of a child's canonical parent has delegated control.
 Mutation correlation must equal the retained open/submission/response/control ID.
 No auth secrets or native login inputs are accepted by these model-facing operations.
+
+## Model-facing delegation shapes
+
+When the plugin configuration has at least one enabled instance, three more tools are offered
+(`harness.delegate`, `harness.continue`, `harness.result`), and `harness.respond` /
+`harness.interrupt` additionally accept a simple form. These map onto the same managed-session
+application operations; workflow blocks and commands keep the `request_json` form only.
+
+* `harness.delegate { instance_id?, prompt }` resolves the instance from this plugin's catalog
+  (the configured default when omitted), opens an ordinary child of the calling session in its
+  workspace and submits `prompt` as the first turn, then returns `{session_id, instance_id,
+  status, submission_id}` without waiting for the native turn. Session titles are not part of
+  the open contract.
+* `harness.continue { session_id, prompt }` reads the child's retained target through the
+  `binding` operation and submits the next turn.
+* `harness.result { session_id, after? }` reads bounded canonical history (`history`
+  operation, which first drains one bounded native page) and returns activity
+  (`running`, `settled`, `needs_attention`, `interrupted`, `failed`, `idle`, `unknown`), the
+  latest result text preview, pending interactions (request ID, kind, prompt, tool and input
+  previews, choices) and a cursor. Pending detection is advisory; responses are host-validated.
+* `harness.respond { session_id, request_id, approve | answer [, choice_id] }` and
+  `harness.interrupt { session_id }` read the retained target and send a typed response or
+  interruption.
+
+Identities are derived (SHA-256, domain-separated) from the calling session, the host tool
+invocation ID and the normalized input: child session (UUID v8), open, submission, attempt
+(UUID v8), response and interrupt mutation IDs. Re-running the same invocation reuses the same
+retained identities, so the host returns recorded evidence or reports uncertainty instead of
+repeating a native mutation. A delegate retry first reads the derived child's binding: a
+confirmed target means the first turn was delivered and is reported as `already_submitted`;
+a prepared target resubmits the byte-identical retained submission. A different invocation never
+re-sends an uncertain mutation; uncertain outcomes are reported with the child `session_id` and a
+hint to poll `harness.result`. Preparation binds the normalized input, host workspace scope,
+resolved instance and route in the descriptor; invocation rejects any change.
+
+Delegated control (see `docs/managed-external-sessions.md`) is what allows the parent's
+invocation to address the child: the host admits only the active invocation of the child's
+immutable canonical parent. The default build agent enables these tools and receives short
+guidance only when `harness.delegate` is offered; the plan agent cannot delegate, continue,
+respond or interrupt.
 
 Submission retains `HarnessSessionTarget::Prepared` when native identity is not yet known.
 The first user submission uses this durable prepared target without inventing a native session.

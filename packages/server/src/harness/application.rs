@@ -44,6 +44,54 @@ fn observation_guard(
     Ok(guard)
 }
 
+/// Drain one bounded native observation page for a delegated child under its full owner.
+///
+/// The caller must already have been admitted for `owner` (delegated invocation control).
+/// Uses exactly the atomically committed actor cursor, serializes with attachment pollers
+/// through the same observer guard, and commits before returning. This is observation only:
+/// it never submits, responds, interrupts or replays a native mutation.
+/// # Errors
+/// Rejects stale owners, missing targets, unavailable native transports and failed commits.
+pub async fn drain_delegated_observations<S: ManagedHarnessStore, T: ManagedHarnessTransport>(
+    state: &Arc<crate::ServerState>,
+    runtime: &ManagedHarnessRuntime<S, T>,
+    owner: &HarnessOwner,
+    limit: u16,
+) -> Result<usize, ManagedHarnessError> {
+    if state.shutdown_requested.load(Ordering::SeqCst) {
+        return Err(ManagedHarnessError::Unavailable);
+    }
+    let guard = observation_guard(owner)?;
+    let observer = guard.lock().await;
+    runtime.verify_owner(owner).await?;
+    let canonical = super::CanonicalHarnessStore::new(state);
+    let durable = canonical.durable(owner)?;
+    let ownership = canonical.acquire(owner).await?;
+    let current = state
+        .sessions
+        .external_harness_state(&durable)
+        .await
+        .map_err(|_| ManagedHarnessError::Storage)?;
+    if current.owner.generation != owner.generation || current.target.is_none() {
+        return Err(ManagedHarnessError::StaleOwner);
+    }
+    let page = Box::pin(runtime.observe(
+        owner,
+        format!("delegated-poll:{}", uuid::Uuid::new_v4()),
+        current.observation_after,
+        limit,
+        0,
+    ))
+    .await?;
+    tracing::debug!(target: "bcode_server::harness", observations = page.observations.len(),
+        hydration = page.hydration_requests.len(), retained = page.retention.is_some(),
+        cursor_present = page.next_after.is_some(), "delegated observation page committed");
+    drop(ownership);
+    drop(canonical);
+    drop(observer);
+    Ok(page.observations.len() + page.hydration_requests.len() + page.live.len())
+}
+
 /// Application access bound to a caller already authenticated by the daemon.
 ///
 /// Construction is not portable authorization. The daemon request dispatcher must supply its

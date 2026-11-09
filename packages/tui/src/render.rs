@@ -1957,6 +1957,7 @@ fn composer_content_area(area: Rect, theme: TuiTheme) -> Rect {
             enabled: false,
             size: area.size(),
         },
+        super::composer_submit::DEFAULT_PLACEHOLDER,
     );
     let layout = component.layout(Constraints::tight(area.size()), &mut LayoutCx::new());
     let child = layout
@@ -1985,18 +1986,26 @@ fn header_spans(app: &BmuxApp, width: usize, theme: TuiTheme) -> Vec<Span> {
     let muted = theme.muted;
     let accent = theme.focused;
     let session_title = app
-        .session_title()
-        .map_or_else(|| "Untitled session".to_owned(), ToOwned::to_owned);
+        .display_session_title()
+        .unwrap_or_else(|| "Untitled session".to_owned());
     let mut line = ChromeLine::new(" · ", muted)
         .required(
             "bcode".to_owned(),
             theme.focused.add_modifier(Modifier::BOLD),
             false,
         )
-        .required(app.display_agent_id().to_owned(), accent, false)
+        .required(
+            app.managed_label()
+                .unwrap_or_else(|| app.display_agent_id())
+                .to_owned(),
+            accent,
+            false,
+        )
         .required(app.model_header_label(), Style::new(), false)
-        .required(session_title, Style::new(), true)
-        .optional(
+        .required(session_title, Style::new(), true);
+    // A managed conversation runs on its native executor; Bcode provider routing is unused.
+    if app.managed_label().is_none() {
+        line = line.optional(
             format!(
                 "provider {}",
                 app.selected_provider_plugin_id().unwrap_or("auto")
@@ -2005,6 +2014,7 @@ fn header_spans(app: &BmuxApp, width: usize, theme: TuiTheme) -> Vec<Span> {
             50,
             false,
         );
+    }
 
     line = line.optional(
         super::build_info().display_version().to_owned(),
@@ -6219,6 +6229,10 @@ fn render_composer(app: &mut BmuxApp, area: Rect, frame: &mut PaintCx<'_, '_>, t
     }
     let state = RefCell::new(app.composer_state().clone());
     let policy = composer_policy();
+    let placeholder = app.managed_label().map_or_else(
+        || super::composer_submit::DEFAULT_PLACEHOLDER.to_owned(),
+        |label| format!("Ask {label}…"),
+    );
     let panel = super::composer_submit::panel(
         &state,
         &policy,
@@ -6229,6 +6243,7 @@ fn render_composer(app: &mut BmuxApp, area: Rect, frame: &mut PaintCx<'_, '_>, t
             enabled: !app.composer().text().trim().is_empty(),
             size: area.size(),
         },
+        &placeholder,
     );
     let layout = panel.layout(Constraints::tight(area.size()), &mut LayoutCx::new());
     app.composer_submit.record_layout(&layout, area);

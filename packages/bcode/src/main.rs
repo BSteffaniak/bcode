@@ -55,6 +55,9 @@ fn build_info() -> bcode_build_info::BuildInfo {
     .expect("build script must embed valid Bcode build information")
 }
 
+/// Stack size for runtime worker and blocking threads.
+const RUNTIME_THREAD_STACK_BYTES: usize = 8 * 1024 * 1024;
+
 fn main() {
     if let Some(code) = bcode_cli::xray_export_process_entry(&build_info()) {
         std::process::exit(code);
@@ -68,7 +71,10 @@ fn main() {
             std::process::exit(1);
         }
     }
+    // Delegated tool calls nest the tool plugin, managed-session dispatch and the native harness
+    // plugin call on one blocking thread; the 2 MiB default overflows in unoptimized builds.
     let runtime = tokio::runtime::Builder::new_multi_thread()
+        .thread_stack_size(RUNTIME_THREAD_STACK_BYTES)
         .enable_all()
         .build()
         .expect("failed to build async runtime");

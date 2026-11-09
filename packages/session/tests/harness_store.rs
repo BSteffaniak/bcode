@@ -769,7 +769,7 @@ async fn check_typed_submission_acceptance(
         Some(accepted.observations[0].clone())
     );
     let reopened_frames = observer
-        .external_harness_history(session.id, None, 128)
+        .external_harness_history(session.id, None, 2)
         .await
         .unwrap();
     assert_eq!(reopened_frames.observations.len(), 2);
@@ -1177,13 +1177,16 @@ async fn page_cursor_and_observations_commit_atomically_and_survive_without_plug
         .await
         .unwrap();
     let reopened = manager(root.path());
+    // One bounded page aggregates every committed canonical page.
+    let mut committed = native.observations.clone();
+    committed.extend(confirmation.observations.iter().cloned());
     assert_eq!(
         reopened
             .external_harness_history(session.id, None, 128)
             .await
             .unwrap()
             .observations,
-        native.observations
+        committed
     );
 }
 #[tokio::test]
@@ -4425,4 +4428,494 @@ async fn native_live_text_without_a_durable_segment_retires_when_the_turn_ends()
         .await
         .unwrap();
     assert_eq!(attached.live_checkpoints, Vec::new());
+}
+
+#[tokio::test]
+async fn managed_input_names_the_session_and_survives_reopening() {
+    let root = tempfile::tempdir().unwrap();
+    let sessions = manager(root.path());
+    let session = sessions
+        .create_session(None, root.path().into())
+        .await
+        .unwrap();
+    let owner = owner(session.id);
+    sessions
+        .configure_external_harness(&owner, instance(), capabilities())
+        .await
+        .unwrap();
+    let request = open(&owner);
+    sessions
+        .claim_external_harness_request(&owner, &request)
+        .await
+        .unwrap();
+    sessions
+        .complete_external_harness_request(
+            &owner,
+            &request,
+            &HarnessServiceResponse {
+                schema_version: HARNESS_SCHEMA_VERSION,
+                request_id: request.request_id.clone(),
+                operation: HarnessOperation::Open,
+                kind: HarnessServiceResponseKind::Prepared(prepared(&owner)),
+            },
+        )
+        .await
+        .unwrap();
+    let submit = HarnessRequest {
+        schema_version: HARNESS_SCHEMA_VERSION,
+        request_id: "submit-1".into(),
+        instance: instance(),
+        kind: HarnessRequestKind::Submit {
+            target: HarnessSessionTarget::Prepared(prepared(&owner)),
+            submission: HarnessSubmission {
+                submission_id: "input-1".into(),
+                attempt_id: "attempt".into(),
+                session_id: owner.session_id.to_string(),
+                generation: 1,
+                text: "Fix the failing parser test".into(),
+                placement: HarnessPlacement::NextTurn,
+            },
+        },
+    };
+    sessions
+        .claim_external_harness_request(&owner, &submit)
+        .await
+        .unwrap();
+    let title = |summary: bcode_session_models::SessionSummary| summary.title().map(str::to_owned);
+    assert_eq!(
+        title(sessions.session_summary(session.id).await.unwrap()).as_deref(),
+        Some("Fix the failing parser test")
+    );
+    drop(sessions);
+    // The stored projection carries the title for a fresh reader.
+    let reopened = manager(root.path());
+    assert_eq!(
+        title(reopened.session_summary(session.id).await.unwrap()).as_deref(),
+        Some("Fix the failing parser test")
+    );
+}
+
+/// One native usage observation as normalized by a managed harness producer.
+fn native_usage(
+    session_id: SessionId,
+    observation_id: &str,
+    total_cost_micros: Option<u64>,
+) -> HarnessObservation {
+    HarnessObservation {
+        observation_id: observation_id.into(),
+        session_id: session_id.to_string(),
+        generation: 1,
+        native_correlations: vec!["turn".into()],
+        completeness: HarnessCompleteness::Complete,
+        kind: HarnessObservationKind::Usage {
+            input_tokens: 100,
+            output_tokens: 20,
+            cache_read_input_tokens: 1_000,
+            cache_creation_input_tokens: 10,
+            total_cost_micros,
+            duration_ms: Some(5),
+            model: Some("native-model".into()),
+        },
+    }
+}
+
+async fn prepared_harness(root: &std::path::Path) -> (SessionManager, ExternalHarnessOwner) {
+    let sessions = manager(root);
+    let session = sessions.create_session(None, root.into()).await.unwrap();
+    let owner = owner(session.id);
+    sessions
+        .configure_external_harness(&owner, instance(), capabilities())
+        .await
+        .unwrap();
+    let request = open(&owner);
+    sessions
+        .claim_external_harness_request(&owner, &request)
+        .await
+        .unwrap();
+    sessions
+        .complete_external_harness_request(
+            &owner,
+            &request,
+            &HarnessServiceResponse {
+                schema_version: HARNESS_SCHEMA_VERSION,
+                request_id: request.request_id.clone(),
+                operation: HarnessOperation::Open,
+                kind: HarnessServiceResponseKind::Prepared(prepared(&owner)),
+            },
+        )
+        .await
+        .unwrap();
+    (sessions, owner)
+}
+
+fn catalog_estimate(total_micros: u64) -> bcode_session_models::SessionCostEstimate {
+    bcode_session_models::SessionCostEstimate::Estimated {
+        currency: "USD".into(),
+        total_micros,
+        components: vec![bcode_session_models::SessionCostComponent {
+            bucket: "input".into(),
+            modality: None,
+            tokens: 10,
+            price_micros: total_micros * 100_000,
+            cost_micros: total_micros,
+        }],
+        source: "catalog".into(),
+        revision: None,
+    }
+}
+
+#[tokio::test]
+async fn native_usage_is_authoritative_session_usage_across_reopen() {
+    use bcode_session_models::{ClientId, SessionCostRange, SessionTokenUsage};
+    let root = tempfile::tempdir().unwrap();
+    let (sessions, owner) = prepared_harness(root.path()).await;
+    let session_id = owner.session_id;
+    let guard = sessions
+        .acquire_external_harness_ownership(&owner)
+        .await
+        .unwrap();
+    let mut native = page(&owner);
+    native.observations.extend([
+        native_usage(session_id, "result-priced", Some(1_234)),
+        // A subscription reports tokens without any monetary cost.
+        native_usage(session_id, "result-subscription", None),
+    ]);
+    let mut subscription = sessions.subscribe_session_events(session_id).await.unwrap();
+    sessions
+        .commit_external_harness_page(&owner, None, &native)
+        .await
+        .unwrap();
+    // Attached clients receive the refreshed authoritative totals with the native page.
+    let live_totals = std::iter::from_fn(|| subscription.live_events.try_recv().ok())
+        .find_map(|event| match event.kind {
+            bcode_session_models::SessionLiveEventKind::UsageSummaryChanged { summary } => {
+                Some(summary)
+            }
+            _ => None,
+        })
+        .expect("native usage publishes an accounting update");
+    assert_eq!(live_totals.totals_micros.get("USD"), Some(&1_234));
+    // An identical redelivery of the committed page is not counted again.
+    sessions
+        .commit_external_harness_page(&owner, None, &native)
+        .await
+        .unwrap();
+    let native_tokens = 2 * (100 + 1_000 + 10 + 20);
+    let summary = sessions
+        .attach_session_recent(session_id, ClientId::new(), 1)
+        .await
+        .unwrap()
+        .usage_summary;
+    assert_eq!(summary.cumulative_metered_tokens, native_tokens);
+    assert_eq!(summary.totals_micros.get("USD"), Some(&1_234));
+    assert_eq!(summary.observed_usage_count, 2);
+    assert_eq!(summary.estimated_usage_count, 1);
+    // Unpriced subscription usage is not reported as unavailable pricing.
+    assert_eq!(summary.unavailable_usage_count, 0);
+
+    // Bcode-metered usage joins the same projection and remains repriceable.
+    let model_usage = SessionTokenUsage {
+        request_id: Some("model-request".into()),
+        observation_id: Some("model-request:0".into()),
+        terminal: true,
+        input_tokens: Some(7),
+        output_tokens: Some(3),
+        ..SessionTokenUsage::default()
+    };
+    sessions
+        .append_priced_model_usage(session_id, "turn".into(), model_usage, catalog_estimate(10))
+        .await
+        .unwrap();
+    let (repriced, summary) = sessions
+        .reprice_usage(
+            session_id,
+            SessionCostRange {
+                from_timestamp_ms: 0,
+                to_timestamp_ms: i64::MAX.cast_unsigned(),
+            },
+            std::sync::Arc::new(|_| catalog_estimate(77)),
+        )
+        .await
+        .unwrap();
+    // Only the Bcode-metered request is valued; native costs are vendor facts.
+    assert_eq!(repriced, 1);
+    assert_eq!(summary.totals_micros.get("USD"), Some(&(1_234 + 77)));
+    assert_eq!(summary.cumulative_metered_tokens, native_tokens + 10);
+    assert_eq!(summary.observed_usage_count, 3);
+    drop(guard);
+    sessions
+        .release_idle_session_resources(session_id)
+        .await
+        .unwrap();
+    drop(sessions);
+
+    // A fresh reader gets the same totals without loading the native page into history.
+    let reopened = manager(root.path());
+    let attachment = reopened
+        .attach_session_recent(session_id, ClientId::new(), 1)
+        .await
+        .unwrap();
+    assert!(attachment.history.iter().all(|event| {
+        bcode_session_models::native_harness_usage_in_event(&event.kind).is_empty()
+    }));
+    let reopened_summary = attachment.usage_summary;
+    assert_eq!(reopened_summary.totals_micros, summary.totals_micros);
+    assert_eq!(
+        reopened_summary.cumulative_metered_tokens,
+        summary.cumulative_metered_tokens
+    );
+    assert_eq!(reopened_summary.observed_usage_count, 3);
+    assert_eq!(reopened_summary.cost_revision, summary.cost_revision);
+}
+
+#[tokio::test]
+async fn conflicting_native_usage_for_one_observation_is_rejected() {
+    let root = tempfile::tempdir().unwrap();
+    let (sessions, owner) = prepared_harness(root.path()).await;
+    let session_id = owner.session_id;
+    let _guard = sessions
+        .acquire_external_harness_ownership(&owner)
+        .await
+        .unwrap();
+    let mut first = page(&owner);
+    first.observations = vec![native_usage(session_id, "result", Some(5))];
+    sessions
+        .commit_external_harness_page(&owner, None, &first)
+        .await
+        .unwrap();
+    let mut conflicting = first.clone();
+    conflicting.next_after = Some("native-cursor-2".into());
+    conflicting.observations[0].kind = HarnessObservationKind::Usage {
+        input_tokens: 1,
+        output_tokens: 1,
+        cache_read_input_tokens: 0,
+        cache_creation_input_tokens: 0,
+        total_cost_micros: Some(6),
+        duration_ms: None,
+        model: None,
+    };
+    assert!(
+        sessions
+            .commit_external_harness_page(&owner, Some("native-cursor"), &conflicting)
+            .await
+            .is_err()
+    );
+    let summary = sessions
+        .attach_session_recent(session_id, bcode_session_models::ClientId::new(), 1)
+        .await
+        .unwrap()
+        .usage_summary;
+    assert_eq!(summary.totals_micros.get("USD"), Some(&5));
+    assert_eq!(summary.observed_usage_count, 1);
+}
+
+async fn prepared_history_fixture(
+    root: &std::path::Path,
+) -> (SessionManager, ExternalHarnessOwner) {
+    let sessions = manager(root);
+    let session = sessions.create_session(None, root.into()).await.unwrap();
+    let owner = owner(session.id);
+    sessions
+        .configure_external_harness(&owner, instance(), capabilities())
+        .await
+        .unwrap();
+    let request = open(&owner);
+    sessions
+        .claim_external_harness_request(&owner, &request)
+        .await
+        .unwrap();
+    sessions
+        .complete_external_harness_request(
+            &owner,
+            &request,
+            &HarnessServiceResponse {
+                schema_version: HARNESS_SCHEMA_VERSION,
+                request_id: request.request_id.clone(),
+                operation: HarnessOperation::Open,
+                kind: HarnessServiceResponseKind::Prepared(prepared(&owner)),
+            },
+        )
+        .await
+        .unwrap();
+    (sessions, owner)
+}
+
+fn history_page(
+    owner: &ExternalHarnessOwner,
+    cursor: &str,
+    ids: &[&str],
+) -> HarnessObservationPage {
+    let mut page = page(owner);
+    let template = page.observations.remove(0);
+    page.observations = ids
+        .iter()
+        .map(|id| HarnessObservation {
+            observation_id: (*id).into(),
+            kind: HarnessObservationKind::Text {
+                segment_id: None,
+                text: format!("text {id}"),
+            },
+            ..template.clone()
+        })
+        .collect();
+    page.next_after = Some(cursor.into());
+    page
+}
+
+async fn read_all_history(
+    sessions: &SessionManager,
+    session_id: SessionId,
+    limit: u16,
+) -> (Vec<String>, usize) {
+    let mut cursor = None;
+    let mut ids = Vec::new();
+    let mut pages = 0;
+    loop {
+        let page = sessions
+            .external_harness_history(session_id, cursor.clone(), limit)
+            .await
+            .unwrap();
+        assert!(page.observations.len() <= usize::from(limit));
+        let next = page
+            .next_after
+            .clone()
+            .expect("canonical history always has a cursor");
+        ids.extend(
+            page.observations
+                .into_iter()
+                .map(|item| item.observation_id),
+        );
+        if cursor.as_ref() == Some(&next) {
+            return (ids, pages);
+        }
+        pages += 1;
+        assert!(pages < 64, "history pagination must make progress");
+        cursor = Some(next);
+    }
+}
+
+fn observation_ids(page: &HarnessObservationPage) -> Vec<&str> {
+    page.observations
+        .iter()
+        .map(|item| item.observation_id.as_str())
+        .collect()
+}
+
+#[tokio::test]
+async fn history_pages_aggregate_events_resume_mid_event_and_skip_empty_events() {
+    let root = tempfile::tempdir().unwrap();
+    let (sessions, owner) = prepared_history_fixture(root.path()).await;
+    let session_id = owner.session_id;
+    let guard = sessions
+        .acquire_external_harness_ownership(&owner)
+        .await
+        .unwrap();
+    let events: [(&str, &[&str]); 6] = [
+        ("c1", &["a1", "a2", "a3"]),
+        ("c2", &[]),
+        ("c3", &["b1", "b2"]),
+        ("c4", &[]),
+        ("c5", &["d1"]),
+        ("c6", &[]),
+    ];
+    let mut after: Option<&str> = None;
+    for (cursor, ids) in events {
+        sessions
+            .commit_external_harness_page(&owner, after, &history_page(&owner, cursor, ids))
+            .await
+            .unwrap();
+        after = Some(cursor);
+    }
+    drop(guard);
+    let expected = ["a1", "a2", "a3", "b1", "b2", "d1"];
+
+    // One page holds every observation across consecutive events, skipping empty events.
+    let all = sessions
+        .external_harness_history(session_id, None, 128)
+        .await
+        .unwrap();
+    assert_eq!(observation_ids(&all), expected);
+    assert_eq!(all.completeness, HarnessCompleteness::Complete);
+    let tail = all.next_after.clone().unwrap();
+    let caught_up = sessions
+        .external_harness_history(session_id, Some(tail.clone()), 128)
+        .await
+        .unwrap();
+    assert!(caught_up.observations.is_empty());
+    assert_eq!(caught_up.next_after.as_deref(), Some(tail.as_str()));
+
+    // Limits split mid-event and resume exactly, never duplicating or skipping.
+    let first = sessions
+        .external_harness_history(session_id, None, 2)
+        .await
+        .unwrap();
+    assert_eq!(observation_ids(&first), ["a1", "a2"]);
+    assert_eq!(first.completeness, HarnessCompleteness::Partial);
+    let second = sessions
+        .external_harness_history(session_id, first.next_after.clone(), 2)
+        .await
+        .unwrap();
+    assert_eq!(
+        observation_ids(&second),
+        ["a3", "b1"],
+        "mid-event resume crosses an empty event"
+    );
+    assert_eq!(second.completeness, HarnessCompleteness::Partial);
+    let third = sessions
+        .external_harness_history(session_id, second.next_after.clone(), 2)
+        .await
+        .unwrap();
+    assert_eq!(observation_ids(&third), ["b2", "d1"]);
+    assert_eq!(third.completeness, HarnessCompleteness::Partial);
+    // Only the trailing empty event remains: zero observations but an advanced cursor.
+    let fourth = sessions
+        .external_harness_history(session_id, third.next_after.clone(), 2)
+        .await
+        .unwrap();
+    assert!(fourth.observations.is_empty());
+    assert_ne!(fourth.next_after, third.next_after);
+    assert_eq!(fourth.next_after.as_deref(), Some(tail.as_str()));
+
+    for limit in [1, 2, 3, 4, 5, 128] {
+        let (ids, pages) = read_all_history(&sessions, session_id, limit).await;
+        assert_eq!(ids, expected, "limit {limit}");
+        assert!(
+            pages <= expected.len().div_ceil(usize::from(limit)) + 1,
+            "limit {limit}"
+        );
+    }
+
+    // Single-event cursors keep their format; malformed or out-of-range cursors are rejected.
+    let legacy = sessions
+        .external_harness_history(session_id, Some("h1:0:0".into()), 128)
+        .await
+        .unwrap();
+    assert_eq!(legacy.observations, all.observations);
+    for cursor in ["h2:1:0", "h1:x:0", "h1:1:129", "h1:1:0:0", "h1:1"] {
+        assert!(
+            sessions
+                .external_harness_history(session_id, Some(cursor.into()), 16)
+                .await
+                .is_err(),
+            "{cursor}"
+        );
+    }
+    let mid = first.next_after.clone().unwrap();
+    let (prefix, _) = mid.rsplit_once(':').unwrap();
+    assert!(
+        sessions
+            .external_harness_history(session_id, Some(format!("{prefix}:4")), 16)
+            .await
+            .is_err(),
+        "an offset past the event's observations is rejected"
+    );
+
+    // History stays readable offline from the reopened store.
+    sessions
+        .release_idle_session_resources(session_id)
+        .await
+        .unwrap();
+    let reopened = manager(root.path());
+    let (ids, _) = read_all_history(&reopened, session_id, 4).await;
+    assert_eq!(ids, expected);
 }

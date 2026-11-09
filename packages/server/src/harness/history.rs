@@ -6,6 +6,11 @@ use std::sync::Arc;
 
 /// Read bounded indexed normalized history without loading or invoking a native plugin.
 /// The owning application must admit the selected-location read before calling this method.
+///
+/// A page aggregates up to `limit` observations across consecutive stored canonical pages,
+/// within fixed byte and scan bounds. `next_after` is always present and resumes exactly; a
+/// page may hold zero observations yet advance it. The reader has caught up only when the
+/// returned cursor equals the cursor it sent.
 /// # Errors
 /// Rejects excessive bounds, malformed versioned cursors and degraded canonical projections.
 pub async fn canonical_history(

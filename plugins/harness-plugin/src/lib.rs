@@ -6,9 +6,11 @@
 //! The invocation-scoped application bridge owns admission and canonical receipts.
 
 pub mod configuration;
+mod delegation;
 mod protocol;
 mod tools;
 mod workflow;
+pub use delegation::{CONTINUE_TOOL, DELEGATE_TOOL, RESULT_TOOL, SIMPLE_TOOLS};
 pub use workflow::{EXECUTE_OPERATION, ManagedWorkflowExecution};
 
 pub use protocol::{

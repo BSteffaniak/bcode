@@ -44,6 +44,12 @@ build_tools = [
     "ocr.status",
     "question",
     "ask",
+    # Offered by the harness plugin only when an external agent instance is configured.
+    "harness.delegate",
+    "harness.continue",
+    "harness.result",
+    "harness.respond",
+    "harness.interrupt",
 ]
 # These tools mutate only the authenticated active run. Application policy, ownership,
 # exact-candidate publication, execution ceilings and downstream tool permissions still apply.
@@ -67,6 +73,10 @@ plan_disabled_tools = [
     "filesystem.write",
     "filesystem.edit",
     "filesystem.multi_edit",
+    "harness.delegate",
+    "harness.continue",
+    "harness.respond",
+    "harness.interrupt",
 ]
 
 [runtime]

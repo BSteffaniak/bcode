@@ -180,8 +180,16 @@ fn permission_rows(input: &PermissionRowsInput<'_>) -> Vec<Line> {
     rows.push(Line::default());
     rows.push(Line::from_spans(vec![Span::styled(
         format!(
-            "tab/←/→ choose · enter {} · esc deny",
-            input.state.focused_label()
+            "tab/←/→ choose · enter {} · esc deny{}",
+            input.state.focused_label(),
+            if matches!(
+                input.state.origin(),
+                super::permission_dialog::PermissionOrigin::Managed { .. }
+            ) {
+                " · ctrl+c deny and stop"
+            } else {
+                ""
+            }
         ),
         input.theme.muted,
     )]));

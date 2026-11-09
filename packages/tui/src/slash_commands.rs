@@ -39,6 +39,8 @@ pub enum SlashCommandOutcome {
     ManagedConfigure(bcode_harness_models::HarnessSessionSetting),
     /// Open timeline message browser.
     OpenTimeline,
+    /// Leave the application, exactly like the exit key on an empty composer.
+    Exit,
     /// Refresh pending permissions and open the existing review dialog.
     ReviewPermissions,
     /// Switch to a new unpersisted draft session.
@@ -918,6 +920,7 @@ async fn execute_builtin(
             format_build_info_markdown(&super::build_info()),
         )),
         BuiltinCommandId::Sessions => Ok(SlashCommandOutcome::PickSession),
+        BuiltinCommandId::Exit => Ok(SlashCommandOutcome::Exit),
         BuiltinCommandId::Monitor => Ok(SlashCommandOutcome::OpenChildMonitor),
         BuiltinCommandId::Search => Ok(SlashCommandOutcome::SearchSessions),
         BuiltinCommandId::Permissions => Ok(SlashCommandOutcome::ReviewPermissions),

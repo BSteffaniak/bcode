@@ -1,147 +1,182 @@
 # Codex managed harness plugin
 
-Native `codex app-server --listen stdio://` backend for shared `bcode.harness/v2`,
-not a model provider. Protocol source is explicitly pinned to Codex
-`8553558345de65dddf41ca4f6200e5b7b84d9cf9`; the sibling checkout HEAD is different.
+Native `codex app-server --listen stdio://` backend for the shared `bcode.harness/v3`
+contract, not a model provider. Verified against the installed Codex CLI `0.164.0`
+(app-server experimental API surface).
 
 ## Integration and API
 
 * Plugin ID `bcode.codex-harness`; auth provider `bcode.codex`, vault method and
   credential `api_key`, storage key `CODEX_API_KEY`. No ambient credential discovery.
-* `static_plugin()` under `static-bundled` returns the SDK static vtable and excludes
-  dynamic exports. Distribution enablement is host-owned (`StaticBundledPlugin::new`
-  defaults enabled); no manifest `enabled_by_default` field exists.
-* Shared requests consume only `HarnessSessionTarget::Confirmed`. Prepared targets
-  fail closed. Thread start returns a genuinely native-confirmed `Opened` binding;
-  no fabricated Prepared state or BindingConfirmed observation is needed.
-* Explicit absolute executable, cwd and `CODEX_HOME` are required. Config namespace
-  must equal credential namespace. Initialize must report the admitted CODEX_HOME.
-  Inspect/auth requires host config `auth_working_directory`.
-* Public implementation API: `CodexSession::{open, open_with_key, open_admitted,
-  binding, submit, observe, status, respond, interrupt, interrupt_active, reconcile}`;
-  `CodexAuth::{open, status, begin, poll, cancel, vault_key}`; `Launch`, `CodexError`.
-* Dependencies are existing workspace `bcode_harness_models`,
-  `bcode_provider_auth_models`, `bcode_plugin_sdk`, `serde`, `serde_json`, `thiserror`,
-  `zeroize`, `uuid` (`v4`), and test-only `tempfile`. No new external version.
+* `static_plugin()` under `static-bundled` returns the SDK static (concurrent) vtable and
+  excludes dynamic exports. Distribution enablement is host-owned.
+* Services declared in `bcode-plugin.toml`:
+  * `bcode.harness/v3` — managed sessions;
+  * `bcode.harness.candidates/v1` — setup discovery (`discover_candidates`,
+    `prepare_candidate`);
+  * `bcode.harness.models/v1` — native `model/list` discovery and exact selected open;
+  * `bcode.harness.recovery/v1` — exact resume preflight and physical release evidence;
+  * `bcode.harness.terminal-auth/v1` — client-terminal `codex login` preparation.
+* The plugin is `concurrent`: operations serialize on retained state, and only an
+  `observe` with `wait_millis` waits for native output outside that lock (woken by the
+  transport reader, never polled).
+* Shared requests consume only `HarnessSessionTarget::Confirmed`. Thread start returns a
+  genuinely native-confirmed `Opened` binding.
+* Explicit absolute executable, cwd and `CODEX_HOME` are required. Config namespace must
+  equal credential namespace. Initialize must report the admitted `CODEX_HOME`.
 
-## Placement and lifecycle limits
+### Configuration
 
-**A fresh, non-resumed local-only thread supports exactly one first `NextTurn`.**
-Before creation the adapter calls `remoteControl/disable` with `ephemeral:true`,
-verifies `remoteControl/status/read` reports `disabled`, and arms continuous reader
-fencing against any later activation (including notifications already queued).
-Native delegation is disabled/verified and `daybreakEnabled:false` is explicit.
-The newly returned thread must be idle with empty turns. Private stdio and the
-new process-local thread—not a local idle snapshot—provide the construction proof.
-Any observed unexpected native start revokes it. The single first-input permit is
-consumed before one `turn/start`; an identical immediate retry returns its retained
-receipt and ambiguity permanently fences further mutations.
+`plugins.config."bcode.codex-harness"` decodes into `config::Config`:
 
-**Later NextTurn and all resumed-thread NextTurn remain unsupported.** Pinned
-`turn/start` invokes `start_or_steer_turn` (`request_processors/turn_processor.rs:661`)
-without an atomic idle precondition. Core emits completion before clearing active
-state (`core/src/tasks/mod.rs:860–875`), so even observed completion cannot safely
-release another start. Genuine conditional app-server start is still needed;
-Core's `start_turn_if_idle` is not exposed by this pinned RPC. Expected-turn steering
-continues to use `turn/steer`. No upstream or dependency changes were made.
+```toml
+# Optional; defaults to the instance's CODEX_HOME.
+auth_working_directory = "/absolute/dir"
 
-Top-level `--version` (not `app-server --version`) is probed with bounded output,
-deadline and cleanup. Initialize userAgent is not used as executable version identity.
-Resume requires the same verified version and exact native binding; native history
-is excluded. Read is metadata-only. No unrelated-session adoption or ambiguous replay.
+[instances.codex]            # written by setup discovery
+executable    = "/etc/profiles/per-user/me/bin/codex"   # PATH spelling, not the store path
+codex_home    = "/home/me/.codex"
+exact_version = "0.164.0"
+```
 
-Pinned notifications are interpreted as actually defined:
+A present instance entry must match the generic instance exactly (executable, namespace,
+`bcode.codex` provider, native or vault custody); otherwise every operation fails closed.
+Absent entries keep the legacy behavior of using the generic instance alone.
 
-* `thread/started` carries `{thread}`, not `{threadId}`.
-* `turn/started` and `turn/completed` carry `{threadId, turn}` with status/error.
-* Started/completed produce normalized status and turn correlation. Failure produces
-  a sanitized `native_turn_failed` diagnostic, not native error text. Interrupted
-  and failed turns never produce successful settlement. Delayed duplicate completion
-  cannot reopen a terminal turn.
-* Complete exact accepted-turn completion produces `NativeTurnTerminal`, not
-  background-work settlement. Completed final agent items produce bounded,
-  correlated `Result` observations. Native background processes can survive a
-  completed turn, so this producer does not fabricate `Settlement`. Native
-  multi-agent operation is disabled and effective
-  `features.multi_agent=false` verified before opening. Observed collab activity,
-  pending controls, error evidence or any observation gap prevents settlement.
-  Background continuation remains unsupported. One-entry deferred settlement makes
-  this evidence independent of caller page size.
+### Setup discovery
 
-Host owns canonical retained mutation identities, durable deduplication, permission,
-parent-route reauthorization and generation fencing. Exact `turn/start` response
-`turn.id` or `turn/steer` response `turnId` now produces one retained
-`SubmissionAccepted { submission_id, attempt_id, native_turn_id }` observation,
-with enclosing owner/session/generation. It is emitted before lifecycle evidence;
-an identical submit retry does not enqueue another mapping. One pending mapping
-backpressures subsequent submissions until observed. Rejected, uncertain, malformed
-or cross-shaped acknowledgments never manufacture this association. Receipt
-`native_request_id` is the actual JSON-RPC request identity, not the turn identity.
-The plugin caches only last
-submission/page/control replies, not a recovery journal. Lost native open acknowledgment
-is tombstoned for this live owner; restart reconciliation never guesses no effects.
+`discover_candidates` searches absolute `PATH` entries for `codex` (relative and duplicate
+entries skipped, bounded to `MAX_HARNESS_CANDIDATES`), records the canonical file identity
+and the PATH invocation spelling (`HarnessCandidateExecutableIdentity::invocation_path`),
+probes the top-level `codex --version`, and inspects readiness in `$CODEX_HOME` (default
+`~/.codex`) with `account/read {refreshToken:false}`: a signed-in account or a configuration
+that needs no OpenAI login is `existing_native_login`; an absent account that requires login
+is `login_required`. No thread, prompt or token refresh happens. An ambient `OPENAI_API_KEY`
+or `CODEX_API_KEY` refuses discovery rather than selecting another billing route.
+`prepare_candidate` re-runs discovery, requires exact equality with the selected candidate,
+and returns native-custody instance settings that the adapter's own decoder accepts.
+
+## Turn admission
+
+* The first `NextTurn` of a fresh thread uses the single-use construction permit (private
+  stdio, remote control disabled and fenced, delegation disabled, idle empty thread).
+* **Later `NextTurn` is admitted once the previous accepted native turn's completion
+  (`turn/completed`) has been observed, no callback is pending and no acceptance is
+  undelivered.** A resumed thread admits its first `NextTurn` when `thread/resume` reports
+  it idle. This is foreground admission only, exactly like the Claude Code adapter: it never
+  satisfies a completion boundary, and retained background work keeps its own evidence.
+  Pinned `turn/start` still has no atomic idle precondition, so a native start racing an
+  unobserved automatic follow-up is reported as native evidence rather than prevented.
+* Expected-turn steering continues to use `turn/steer`. An identical submit retry returns the
+  retained receipt; ambiguity permanently fences further mutations.
+* Exact `turn/start` `turn.id` / `turn/steer` `turnId` produces one retained
+  `SubmissionAccepted` before lifecycle evidence; one pending mapping backpressures later
+  submissions until observed.
+
+## Transcript (native parity)
+
+Normalization follows `docs/claude-code-native-parity-contract.md`:
+
+* Agent messages become `Text { segment_id: Some(<native item id>) }`; a `final_answer`
+  message in the accepted turn additionally yields an authoritative `Result`.
+* Reasoning items become `Reasoning { segment_id: Some(<item id>) }` with summary parts joined
+  by a blank line (raw content when no summary); encrypted reasoning without text is omitted.
+* `commandExecution`, `fileChange`, `mcpToolCall`, `dynamicToolCall`, `webSearch` and
+  `imageView` items become `Tool` (bounded `input_json`, oversized inputs summarized) on start
+  and `ToolResult` (bounded output, tabs expanded, error from status/exit code) on completion.
+  Observed native tools never dispatch Bcode tools.
+* `thread/tokenUsage/updated` per-request counters are summed per turn and emitted as one
+  `Usage` before turn completion (cache reads separated from input; model is the thread's
+  current native model).
+* `item/agentMessage/delta` and `item/reasoning/summaryTextDelta` become the transient `live`
+  sidecar keyed by the same item id (bounded, coalesced; dropped rather than queued under
+  pressure). The transport reader merges adjacent deltas and drops notifications the adapter
+  does not interpret (output deltas, diffs, rate limits, warnings), so streaming cannot
+  exhaust the bounded queue. A waiting observe holds a live-only page for 40 ms.
+* Pages with nothing to transfer carry no retention page and no successor cursor.
+* Approvals carry `tool_name` (`shell` / `apply_patch`) and a bounded `input_preview` (command,
+  cwd and reason, or the retained diff).
+* Failed turns produce a closed-vocabulary `Diagnostic` (`native_unauthorized`,
+  `native_usage_limit`, `native_rate_limited`, `native_context_window`,
+  `native_connection_failed`, `native_turn_failed`); native error text is never retained.
+  Status, execution and acceptance evidence produce no transcript item.
+* A successful turn whose last message has no phase (providers without message phases) uses
+  that message as foreground output only when no `final_answer` arrived; commentary never is.
+
+## Mid-session configuration
+
+`Configure` uses native `thread/settings/update` (applies to subsequent turns):
+
+* `Model { model_id }` passes the native model key unchanged (keys come from `model/list`);
+  native rejection is `Failure(Policy)`.
+* `PermissionMode::Default` restores `untrusted` approval and the opening sandbox;
+  `AcceptEdits` selects `on-request` approval with a workspace-write sandbox; `Plan` selects
+  native plan collaboration mode (requires a known thread model).
+
+Identical retries return the retained outcome; an uncertain call fences the session and is
+never replayed.
+
+## Resume and recovery
+
+`prepare_resume` validates an exact host recovery intent without spawning: same generation and
+instance, the configured exact version, a well-formed native thread id and an absolute
+workspace. The resumed open re-probes the executable (the version must match), disables and
+fences remote control, and calls `thread/resume {threadId, excludeTurns:true}`; native history
+is never replayed into Bcode and prior input is never resent. `release_transport` answers only
+for the exact retained Close whose app-server the supervisor physically reaped.
 
 ## Bounded transport and control
 
-Independent stdout/stderr readers drain continuously. Frames, event bytes, owners,
-callbacks and page caches are bounded. Queue overflow fences the entire transport,
-wakes pending RPCs as uncertain, withdraws queued writes and asks the supervisor to
-kill/disconnect the process. It never silently drops a callback while leaving the
-native process alive waiting for its response.
+Independent stdout/stderr readers drain continuously. Frames, event bytes, owners, callbacks
+and page caches are bounded. Queue overflow fences the entire transport, wakes pending RPCs as
+uncertain and asks the supervisor to kill the process; it never silently drops a callback.
+Every queued frame has a deadline; RPC timeout fences the connection. Child ownership/reaping
+is in a supervisor thread. Native loss is never settlement.
 
-Every queued frame has a deadline; RPC timeout fences the entire connection. Writer
-checks deadline/fence before delivery; a blocked write is monitored and terminated
-by process disconnect. Bytes already in flight remain explicitly uncertain (cannot
-be retracted). Later mutation replay is forbidden. Child ownership/reaping is in a
-supervisor thread; invocation/drop does not synchronously wait on process exit.
-Probe cleanup is likewise bounded for the caller. Native loss is never settlement.
-Host cancellation during a synchronous RPC remains bounded by that RPC's deadline;
-immediate per-invocation cancellation plumbing is not yet integrated.
-
-Approvals/questions use exact native request IDs and generation. File approval needs
-a retained bounded diff and no root grant; absent/evicted diff is declined. Additional
-permissions/network grants are declined. Secret generic questions are not exposed.
-Multi-question batches are exposed sequentially with exact per-question response
-identities and one final native answer map; cancellation discards partial answers.
-Unknown callbacks are rejected; wrong
-thread callbacks cannot acquire authority. Arbitrary dynamic tools are refused,
-never dispatched into Bcode. `bcode_parent_assistance` is registered/interpreted only
-with an explicit validated host assistance grant; host must reauthorize responses.
+Approvals/questions use exact native request IDs and generation. File approval needs a
+retained bounded diff and no root grant; absent/evicted diff is declined. Additional
+permissions/network grants are declined. Secret questions are not exposed. Multi-question
+batches are exposed sequentially. Unknown callbacks are rejected; wrong-thread callbacks cannot
+acquire authority. Arbitrary dynamic tools are refused. `bcode_parent_assistance` is
+registered only with an explicit validated host assistance grant.
 
 ## Authentication
 
-Browser/device login uses supported public native RPC. URL/code are returned only
-through sensitive auth effects. Host must suppress sensitive request/response tracing,
-history and telemetry. Native login owns storage/refresh; no empty vault enrollment,
-credential scraping, or internal token-login route exists.
+Browser/device login uses supported public native RPC; URL/code are returned only through
+sensitive auth effects. Readiness is `Ready` for a signed-in account or a configuration that
+needs no OpenAI login. Scoped vault-key delivery requires effective
+`cli_auth_credentials_store=ephemeral` and explicit uncustomized OpenAI provider selection.
+Local readiness never means remote verification.
 
-Scoped vault-key delivery requires effective `cli_auth_credentials_store=ephemeral`
-and explicit uncustomized OpenAI provider selection before any key is sent. Each
-native session receives its own scoped key: upstream ephemeral storage is process-local.
-Encoded transport buffers are wiped and stderr/error payloads are not retained.
+The plugin declares `bcode.harness.terminal-auth/v1`: `prepare_login` returns a client-terminal
+plan running `<executable> login` with `CODEX_HOME` set to the instance namespace and only
+non-secret environment (`HOME`, `USER`, `PATH`, `TMPDIR`, `LANG`, `LC_ALL`, `TERM`). The
+matching `native-login` auth method only reinspects readiness on begin/continue (a fresh
+inspection app-server each time) and cancels the local flow only. Nothing is launched in the
+daemon. Note that native `codex login` replaces the namespace's existing `auth.json` as soon as
+it starts, even if the browser flow is later abandoned.
 
-Correlated login completion is retained before fallible readiness reinspection;
-failed reinspection returns terminal flow evidence with unknown readiness instead
-of waiting forever for a consumed notification. Last terminal reply is retryable.
-Cancel sends once: native `canceled` becomes login-required; `notFound` becomes
-blocked/uncertain, not proof of cancellation. Lost cancel acknowledgment is fenced.
-Local readiness never means remote verification. One live flow per auth process;
-namespace-sharing/waiter cancellation belongs to the host. Flow data is ephemeral
-and never replayed after daemon restart.
+## Unsupported
 
-## Source-only tests / remaining acceptance
+* Background continuation and authoritative settlement after native background processes:
+  native turn completion does not close background terminals, so no `Settlement` is
+  fabricated.
+* Native multi-agent delegation (disabled and verified before opening).
+* Atomic conditional start: app-server `turn/start` has no idle precondition.
+* Resume across a native version change (the binding records the probed version).
 
-Offline fake-process fixture models pinned started/completed/failed/interrupted
-shapes, top-level version args, callbacks, config, auth completion and cancellation.
-Twenty integration tests and transport/target unit tests cover provenance, resume,
-steering, NextTurn refusal, uncertain delivery, blocked writes/bounded teardown,
-overflow disconnect, status/settlement, stale callbacks, tool isolation, vault gates,
-cancellation result distinction and completion surviving status failure.
+## Tests
 
-first-start construction, one-shot/retry semantics, lost first acknowledgment,
-remote-control refusal/activation fencing, and resumed/later-start refusal.
+* `cargo test -p bcode_codex_harness_plugin` — unit tests and an offline fake app-server
+  (`tests/fixtures/app_server.py`) covering admission, steering, retries, callbacks,
+  lifecycle, live/segmented transcript, overflow and auth.
+* `tests/native_subscription.rs` (`#[ignore]`) — one real first turn through the session API.
+* `packages/bcode/tests/harness_codex_acceptance.rs` (`#[ignore]`) — daemon journey: selected
+  model, approval, later turn, model switch, restart, recovery and resumed context:
 
-**Not executed:** fmt, compile, tests, clippy, architecture checks, plugin builds,
-native version/app-server/login or provider requests. This is source implementation,
-not acceptance. Real installed-version/managed-policy compatibility, host integration,
-later conditional-start execution, remote verification and immediate cancellation remain gaps.
+  ```sh
+  cargo test -p bcode --features app,static-bundled-codex-harness-plugin \
+    --test harness_codex_acceptance -- --ignored --nocapture
+  ```
+
+  `BCODE_NATIVE_CODEX_HOME` selects the native namespace (default `$CODEX_HOME`, `~/.codex`).

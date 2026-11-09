@@ -21642,6 +21642,18 @@ async fn run_selected_tui(
     managed_generation: Option<u64>,
     launch_options: bcode_tui::TuiLaunchOptions,
 ) -> Result<(), CliError> {
+    // A session driven by a native executor reopens through its managed route, so plain
+    // `bcode tui <session>` works without the explicit reattachment flags.
+    let (managed_instance, managed_generation) = match (session_id, managed_instance) {
+        (Some(session_id), None) => match managed_binding(session_id).await {
+            Some(binding) => (
+                Some(binding.instance.instance_id.clone()),
+                Some(binding.target.generation()),
+            ),
+            None => (None, managed_generation),
+        },
+        (_, instance) => (instance, managed_generation),
+    };
     if let Some(instance) = managed_instance {
         let session_id = session_id.ok_or_else(|| {
             CliError::InvalidArguments("managed reattachment requires a session ID".into())
@@ -21671,6 +21683,18 @@ async fn run_selected_tui(
         .await?;
     }
     Ok(())
+}
+
+/// The managed binding of an existing session; any failure means "open it ordinarily".
+async fn managed_binding(session_id: SessionId) -> Option<bcode_ipc::ManagedSessionTargetSnapshot> {
+    if ensure_server_running().await.is_err() {
+        return None;
+    }
+    bcode_client::ManagedSessionClient::default_endpoint()
+        .session_binding(session_id)
+        .await
+        .ok()
+        .flatten()
 }
 
 async fn attach_session(session_id: SessionId) -> Result<(), CliError> {

@@ -3911,10 +3911,11 @@ impl SessionActor {
                 .as_ref()
                 .and_then(|usage| usage.request_id.clone());
             for (key, usage) in &mut contributions {
-                if !self
-                    .memory_usage_timestamps
-                    .get(key)
-                    .is_some_and(|time| range.contains(*time))
+                if bcode_session_models::is_native_harness_usage_key(key)
+                    || !self
+                        .memory_usage_timestamps
+                        .get(key)
+                        .is_some_and(|time| range.contains(*time))
                 {
                     continue;
                 }
@@ -3984,10 +3985,12 @@ impl SessionActor {
             let mut contributions = self.memory_usage_requests.clone();
             let mut count = 0;
             for (key, usage) in &mut contributions {
-                if !self
-                    .memory_usage_timestamps
-                    .get(key)
-                    .is_some_and(|timestamp| range.contains(*timestamp))
+                // Vendor-reported native harness costs are authoritative facts, not valuations.
+                if bcode_session_models::is_native_harness_usage_key(key)
+                    || !self
+                        .memory_usage_timestamps
+                        .get(key)
+                        .is_some_and(|timestamp| range.contains(*timestamp))
                 {
                     continue;
                 }
@@ -4017,11 +4020,43 @@ impl SessionActor {
         Ok(result)
     }
 
+    /// Memory-only counterpart of the durable native harness usage projection.
+    fn project_memory_native_harness_usage(
+        &mut self,
+        kind: &SessionEventKind,
+        timestamp_ms: u64,
+    ) -> Result<(), SessionError> {
+        for usage in bcode_session_models::native_harness_usage_in_event(kind) {
+            usage.validate().map_err(SessionError::EventSerialization)?;
+            let Some(key) = usage.request_id.clone() else {
+                continue;
+            };
+            if let Some(previous) = self.memory_usage_requests.get(&key) {
+                if *previous == usage {
+                    continue;
+                }
+                return Err(SessionError::EventSerialization(
+                    "conflicting native harness usage observation".into(),
+                ));
+            }
+            crate::usage::replace(&mut self.memory_usage, None, &usage)
+                .map_err(SessionError::EventSerialization)?;
+            self.memory_usage_timestamps
+                .entry(key.clone())
+                .or_insert(timestamp_ms);
+            self.memory_usage_requests.insert(key, usage);
+        }
+        Ok(())
+    }
+
     fn project_memory_usage(
         &mut self,
         kind: &SessionEventKind,
         timestamp_ms: u64,
     ) -> Result<(), SessionError> {
+        if self.store.is_none() {
+            self.project_memory_native_harness_usage(kind, timestamp_ms)?;
+        }
         if self.store.is_none()
             && let SessionEventKind::ModelUsage { usage, .. } = kind
         {
@@ -4636,7 +4671,9 @@ impl SessionActor {
         self.state
             .apply_persisted_event(event.clone(), activity_timestamp_ms);
         self.retire_live_text_checkpoint_for_durable_event(&event.kind);
-        if matches!(event.kind, SessionEventKind::ModelUsage { .. }) {
+        if matches!(event.kind, SessionEventKind::ModelUsage { .. })
+            || !bcode_session_models::native_harness_usage_in_event(&event.kind).is_empty()
+        {
             let summary = self.session_usage_summary().await?;
             self.state.total_metered_tokens = summary.cumulative_metered_tokens;
             self.publish_live_event(SessionLiveEventKind::UsageSummaryChanged {

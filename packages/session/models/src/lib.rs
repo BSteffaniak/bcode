@@ -22,6 +22,9 @@ pub use external_backend::{
     ExternalBackendEnvelope, ExternalBackendPage, ExternalBackendQuery, ExternalBackendRecord,
 };
 pub use external_harness::*;
+/// Canonical accounting facts for usage reported by managed native harnesses.
+pub mod native_harness_usage;
+pub use native_harness_usage::*;
 
 /// Bounded, secret-safe compaction diagnostics and host observation contracts.
 pub mod compaction_inspection;
@@ -87,7 +90,9 @@ pub trait SessionCompactionRecoveryDiscoveryApplication: Sync {
 /// incomplete epoch-22 projection. Epoch 25 fences selected-model managed operations (schema 57).
 /// Epoch 26 fences managed native-parity records (schema 58): reasoning, native tool results,
 /// native usage, mid-session configuration requests, and later published recovery records.
-pub const CURRENT_SESSION_STORAGE_WRITER_EPOCH: u32 = 26;
+/// Epoch 27 (schema 58) folds native harness usage into the required session usage projection;
+/// an epoch-26 writer would append native usage without maintaining that projection.
+pub const CURRENT_SESSION_STORAGE_WRITER_EPOCH: u32 = 27;
 
 /// Identifies retained turn observations in the existing system-message text contract.
 ///

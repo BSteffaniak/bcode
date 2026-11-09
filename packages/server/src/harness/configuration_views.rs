@@ -173,6 +173,11 @@ impl ConfigurationViews {
             .get(&owner.session_id)
             .ok_or(ManagedHarnessError::Unavailable)?;
         if binding.owner != *owner {
+            tracing::debug!(target: "bcode_server::harness",
+                generation = binding.owner.generation == owner.generation,
+                artifact = binding.owner.artifact_id == owner.artifact_id,
+                daemon = binding.owner.daemon_id == owner.daemon_id,
+                "managed configuration binding belongs to another owner");
             return Err(ManagedHarnessError::StaleOwner);
         }
         Ok(binding.view.clone())
@@ -215,6 +220,9 @@ pub async fn for_client(
         .await
         .ok_or(ManagedHarnessError::StaleOwner)?;
     let startup = state.startup_config.clone();
+    tracing::trace!(target: "bcode_server::harness",
+        supplied_config = context.effective_config_toml.is_some(),
+        launch = context.config_launch.is_some(), "managed client configuration view");
     match context.effective_config_toml.as_deref() {
         None if context.config_launch.is_none() => return baseline(state),
         Some(encoded) => {
@@ -312,6 +320,7 @@ pub(super) async fn pin_creation(
     if let Some(view) = existing {
         return Ok(view);
     }
+    tracing::debug!(target: "bcode_server::harness", "managed configuration view pinned for creation");
     // A canonical session predating this reservation cannot be adopted by supplying new config.
     match state
         .sessions
@@ -337,6 +346,7 @@ pub(super) async fn for_owner(
     let view = match state.harness_configuration_views.get(owner).await {
         Ok(view) => view,
         Err(ManagedHarnessError::Unavailable) => {
+            tracing::debug!(target: "bcode_server::harness", "managed configuration binding absent; using daemon baseline");
             // Compatibility is only for an exact canonical owner in this daemon. This
             // does not adopt client configuration, change generation, or authorize resume.
             let store = super::CanonicalHarnessStore::new(state);
@@ -375,13 +385,17 @@ pub(super) async fn for_session(
         }
         return Ok(view);
     }
-    let selected = state
+    let Some(selected) = state
         .sessions
         .session_external_harness_state(session)
         .await
         .map_err(|_| ManagedHarnessError::Storage)?
-        .ok_or(ManagedHarnessError::Unavailable)?;
-    let owner = super::CanonicalHarnessStore::owner_from_snapshot(session, &selected)?;
+    else {
+        // An ordinary Bcode session (for example a workflow's parent) without a retained
+        // parent view runs under the daemon's loaded configuration.
+        return baseline(state);
+    };
+    let owner = super::CanonicalHarnessStore::live_owner_from_snapshot(state, session, &selected)?;
     // Session-scoped discovery/status is descriptive, not a live-owner transfer. A
     // retained binding still wins; historical snapshots without one use only the
     // actual daemon baseline. Live delivery independently uses for_owner.

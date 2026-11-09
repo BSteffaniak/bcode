@@ -881,8 +881,12 @@ impl SessionView {
     }
 
     fn apply_external_usage(&mut self, journal: &mut ExternalJournal, usage: &SessionTokenUsage) {
-        // The daemon's usage summary never folds in native harness usage, so its accounting
-        // checkpoint does not cover these events. Keyed entries make replays idempotent.
+        // The daemon's checkpointed usage summary includes native harness usage, exactly like
+        // model usage; replayed events must not count it a second time.
+        if self.usage_checkpoint.is_some() {
+            return;
+        }
+        // Without a daemon summary, keyed entries make replays idempotent.
         if journal.runtime.is_none() {
             journal.runtime = Some(Box::new(retain_original(&mut self.snapshot.runtime)));
         }

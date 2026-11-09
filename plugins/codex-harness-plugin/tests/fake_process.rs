@@ -111,6 +111,50 @@ fn start_resume_and_metadata_only_read_preserve_namespace() {
 }
 
 #[test]
+fn resume_across_native_cli_upgrade_keeps_recorded_binding_version() {
+    let (temp, launch) = fixture();
+    let session = CodexSession::open(&launch, binding(), false).unwrap();
+    let mut retained = session.binding().clone();
+    drop(session);
+    // The thread was bound by an older CLI; the installed fixture now reports another version.
+    retained.native_version = "0.163.0".into();
+    let mut resumed = CodexSession::open(&launch, retained.clone(), true).unwrap();
+    // The opened binding is exactly the host's resume binding: no conflicting confirmation.
+    assert_eq!(resumed.binding(), &retained);
+    assert_eq!(resumed.binding().native_version, "0.163.0");
+    let mut input = submission("upgraded-next");
+    input.placement = HarnessPlacement::NextTurn;
+    assert_eq!(
+        resumed.submit(&input).unwrap().state,
+        HarnessDeliveryState::NativeAccepted
+    );
+    let resumes: Vec<_> = calls(&temp)
+        .into_iter()
+        .filter(|call| call["method"] == "thread/resume")
+        .collect();
+    assert_eq!(resumes.len(), 1);
+    assert_eq!(resumes[0]["threadId"], "native-thread");
+}
+
+#[test]
+fn resume_rejects_malformed_recorded_version_before_thread_resume() {
+    let (temp, launch) = fixture();
+    let session = CodexSession::open(&launch, binding(), false).unwrap();
+    let mut retained = session.binding().clone();
+    drop(session);
+    retained.native_version = "not a version!".into();
+    assert!(matches!(
+        CodexSession::open(&launch, retained, true),
+        Err(CodexError::Stale | CodexError::Unsupported)
+    ));
+    assert!(
+        !calls(&temp)
+            .iter()
+            .any(|call| call["method"] == "thread/resume")
+    );
+}
+
+#[test]
 fn namespace_mismatch_fails_before_thread_mutation() {
     let (temp, launch) = fixture();
     std::fs::write(temp.path().join("wrong-home"), "").unwrap();
@@ -309,12 +353,21 @@ fn completed_final_agent_item_is_complete_correlated_output_before_separate_term
                 text: "Complete answer: 界 👋".into(),
             }
         );
+        // Streaming deltas are transient live text; the durable segment carries the full
+        // message under the same native item identity, before the authoritative result.
+        assert!(!events.iter().any(|event| matches!(&event.kind,
+            HarnessObservationKind::Text { text, .. } if text == "partial streamed text")));
         assert!(
             events[..result_index]
                 .iter()
                 .any(|event| matches!(&event.kind,
-            HarnessObservationKind::Text { text, .. } if text == "partial streamed text"))
+            HarnessObservationKind::Text { text, segment_id: Some(segment) }
+                if text == "Complete answer: 界 👋" && segment == "message-1"))
         );
+        let live = session.take_live();
+        assert!(live.iter().any(|update| update.segment_id == "message-1"
+            && update.offset == 0
+            && update.text == "partial streamed text"));
         let terminal_index = events.iter().position(|event| matches!(&event.kind,
             HarnessObservationKind::NativeTurnTerminal { native_turn_id, disposition: HarnessTerminalDisposition::Completed } if native_turn_id == "turn-1")).unwrap();
         assert!(result_index < terminal_index);
@@ -914,7 +967,7 @@ fn native_device_login_returns_sensitive_auth_effect_and_correlated_completion()
 }
 
 #[test]
-fn fresh_first_turn_consumes_construction_permit_and_later_next_turn_is_not_sent() {
+fn next_turn_is_admitted_only_after_the_previous_completion_is_observed() {
     let (temp, launch) = fixture();
     let mut session = CodexSession::open(&launch, binding(), false).unwrap();
     let mut input = submission("first");
@@ -934,20 +987,34 @@ fn fresh_first_turn_consumes_construction_permit_and_later_next_turn_is_not_sent
     );
     let mut second = submission("second");
     second.placement = HarnessPlacement::NextTurn;
+    // The first turn's native completion has not been observed yet.
     assert_eq!(session.submit(&second), Err(CodexError::Unsupported));
     let remaining = observations(&mut session, false);
     assert!(!remaining.iter().any(|event| matches!(
         event.kind,
         HarnessObservationKind::SubmissionAccepted { .. }
     )));
-    assert_eq!(session.submit(&second), Err(CodexError::Unsupported)); // terminal is NOT an idle barrier
+    // Observed completion with no pending callback admits exactly one later turn.
+    let receipt = session.submit(&second).unwrap();
+    assert_eq!(receipt.state, HarnessDeliveryState::NativeAccepted);
+    let (accepted, _) = session.observe(1).unwrap();
+    assert!(
+        matches!(&accepted[..], [HarnessObservation { kind: HarnessObservationKind::SubmissionAccepted {
+        submission_id, native_turn_id, .. }, .. }] if submission_id == &second.submission_id && native_turn_id == "turn-2")
+    );
+    let mut third = submission("third");
+    third.placement = HarnessPlacement::NextTurn;
+    assert_eq!(session.submit(&third), Err(CodexError::Unsupported));
+    let second_turn = observations(&mut session, false);
+    assert!(second_turn.iter().any(|event| matches!(&event.kind,
+        HarnessObservationKind::NativeTurnTerminal { native_turn_id, .. } if native_turn_id == "turn-2")));
     let calls = calls(&temp);
     assert_eq!(
         calls
             .iter()
             .filter(|call| call["method"] == "turn/start")
             .count(),
-        1
+        2
     );
     let disable = calls
         .iter()
@@ -965,7 +1032,7 @@ fn fresh_first_turn_consumes_construction_permit_and_later_next_turn_is_not_sent
 }
 
 #[test]
-fn resumed_thread_has_no_fresh_first_input_permit() {
+fn idle_resumed_thread_admits_one_next_turn_without_replaying_history() {
     let (temp, launch) = fixture();
     let session = CodexSession::open(&launch, binding(), false).unwrap();
     let retained = session.binding().clone();
@@ -973,12 +1040,23 @@ fn resumed_thread_has_no_fresh_first_input_permit() {
     let mut resumed = CodexSession::open(&launch, retained, true).unwrap();
     let mut input = submission("resumed-next");
     input.placement = HarnessPlacement::NextTurn;
-    assert_eq!(resumed.submit(&input), Err(CodexError::Unsupported));
-    assert!(
-        !calls(&temp)
-            .iter()
-            .any(|call| call["method"] == "turn/start")
+    assert_eq!(
+        resumed.submit(&input).unwrap().state,
+        HarnessDeliveryState::NativeAccepted
     );
+    // Still running: another NextTurn waits for observed completion.
+    let mut second = submission("resumed-second");
+    second.placement = HarnessPlacement::NextTurn;
+    assert_eq!(resumed.submit(&second), Err(CodexError::Unsupported));
+    let calls = calls(&temp);
+    assert_eq!(
+        calls
+            .iter()
+            .filter(|call| call["method"] == "turn/start")
+            .count(),
+        1
+    );
+    assert!(calls.iter().any(|call| call["method"] == "thread/resume"));
 }
 
 #[test]
@@ -1198,7 +1276,7 @@ fn execution_foreground_survives_background_and_empty_inventory() {
         .position(|event| {
             matches!(event, E::BackgroundWork {
         native_task_id: Some(id), state: HarnessWorkState::Completed, ..
-    } if id == "42")
+    } if id == "command-live")
         })
         .unwrap();
     assert!(terminal < completed);
@@ -1218,7 +1296,7 @@ fn execution_foreground_survives_background_and_empty_inventory() {
     );
     assert!(events.iter().any(|event| matches!(event, E::BackgroundWork {
         native_task_id: Some(id), notification: bcode_harness_models::HarnessNotificationState::Pending, ..
-    } if id == "42")));
+    } if id == "command-live")));
     assert!(!events.iter().any(|event| matches!(
         event,
         E::Coverage {
@@ -1231,13 +1309,22 @@ fn execution_foreground_survives_background_and_empty_inventory() {
             .iter()
             .any(|call| call["method"] == "thread/backgroundTerminals/list")
     );
-    assert!(matches!(
-        session.submit(&HarnessSubmission {
-            placement: HarnessPlacement::NextTurn,
-            ..submission("not-delivered")
-        }),
-        Err(CodexError::Unsupported)
-    ));
+    // Foreground admission is not settlement: the next turn may start while retained
+    // background work keeps its own unresolved evidence.
+    let next = session.submit(&HarnessSubmission {
+        placement: HarnessPlacement::NextTurn,
+        ..submission("next-foreground")
+    });
+    assert!(
+        matches!(
+            next,
+            Ok(HarnessReceipt {
+                state: HarnessDeliveryState::NativeAccepted,
+                ..
+            })
+        ),
+        "{next:?}"
+    );
 }
 
 #[test]
@@ -1285,7 +1372,7 @@ fn execution_notification_race_keeps_terminal_and_links_root_continuation() {
                 native_task_id: Some(id),
                 state,
                 ..
-            } if id == "42" => Some(*state),
+            } if id == "command-live" => Some(*state),
             _ => None,
         })
         .collect::<Vec<_>>();
@@ -1307,7 +1394,7 @@ fn execution_foreign_completion_cannot_terminalize_owned_work() {
             .iter()
             .any(|event| matches!(event, E::BackgroundWork {
         native_task_id: Some(id), state: HarnessWorkState::Completed, ..
-    } if id == "42"))
+    } if id == "command-live"))
     );
 }
 

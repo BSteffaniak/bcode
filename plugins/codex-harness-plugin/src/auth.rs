@@ -70,10 +70,13 @@ impl CodexAuth {
         let mut result = self
             .server
             .call("account/read", json!({"refreshToken":false}))?;
+        // A native configuration that needs no OpenAI login (a configured custom provider)
+        // is locally ready even without an account.
         let ready = result
             .get("account")
             .ok_or(CodexError::Protocol)?
-            .is_object();
+            .is_object()
+            || result["requiresOpenaiAuth"] == false;
         crate::transport::wipe_value(&mut result);
         Ok(self.status_value(if ready {
             AuthReadiness::Ready

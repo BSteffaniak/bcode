@@ -1046,7 +1046,9 @@ fn raw_ids_results_and_settlement_do_not_establish_submission_acceptance() {
             | HarnessObservationKind::Settlement { .. }
     )));
     assert!(observations.iter().any(|value| matches!(&value.kind,
-        HarnessObservationKind::Diagnostic { code, .. } if code == "settlement_turn_unavailable")));
+        HarnessObservationKind::Vendor { namespace, detail }
+            if namespace == "claude_code.settlement"
+                && detail["code"] == "settlement_turn_unavailable")));
 }
 
 #[test]

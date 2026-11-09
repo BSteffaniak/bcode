@@ -460,7 +460,7 @@ fn prepared_selection_is_not_a_confirmed_native_conversation() {
 }
 
 #[test]
-fn prepared_service_outcome_is_visible_in_real_session_view_without_claiming_identity() {
+fn prepared_service_outcome_adds_no_transcript_noise_or_identity() {
     use bcode_session_models::external_harness::{
         ExternalHarnessOperation, ExternalHarnessOperationRecord, ExternalHarnessOwner,
         ExternalHarnessRequest, ExternalHarnessRequestKind, ExternalHarnessResponse,
@@ -520,13 +520,8 @@ fn prepared_service_outcome_is_visible_in_real_session_view_without_claiming_ide
     };
     let mut view = crate::SessionView::new();
     view.apply_event(&event);
-    assert_eq!(view.snapshot().transcript.items.len(), 1);
-    let bcode_session_view_models::TranscriptViewItemKind::SystemMessage { message } =
-        &view.snapshot().transcript.items[0].kind
-    else {
-        panic!("prepared state must remain visible");
-    };
-    assert_eq!(message.text, "Disabled is ready. Send a message to start.");
+    // Preparing the native process is plumbing: it adds no transcript item or identity.
+    assert_eq!(view.snapshot().transcript.items.len(), 0);
     assert!(view.snapshot().tools.is_empty());
     // The generic fallback keeps the exact unconfirmed-selection evidence.
     let fallback = canonical_external_text(&event).unwrap().unwrap();

@@ -61,7 +61,10 @@ pub struct ManagedAuthAdmission {
 /// Implementations must verify active authorization, workspace and exact plugin/config
 /// selection on every call. Live delivery additionally requires the current durable lease;
 /// reading exact retained outcomes never transfers that lease.
-/// Parent or assistance hints are never execution/response/interrupt authority.
+/// Parent or assistance hints are never execution/response/interrupt authority. The only
+/// parent-relative control is delegated control: the active authenticated tool invocation of
+/// a child's immutable canonical parent session may address that existing managed child,
+/// subject to the same per-operation policy, ownership, generation and retained-target checks.
 pub trait ManagedSessionAdmission: Send + Sync {
     /// Read exact retained mutation evidence after current caller, workspace, plugin/config,
     /// parent and target-association authorization, but without acquiring a live owner.
@@ -104,6 +107,13 @@ pub trait ManagedSessionAdmission: Send + Sync {
         session_id: SessionId,
         instance_id: &'a str,
     ) -> Task<'a, ManagedAuthAdmission>;
+
+    /// Authorize an invocation-scoped read of a delegated child's retained routing evidence
+    /// and canonical history. Grants no mutation, replay or transport authority.
+    fn delegated_read<'a>(&'a self, caller: &'a ManagedCaller, child: SessionId) -> Task<'a, ()> {
+        let _ = (caller, child);
+        Box::pin(async { Err(ManagedHarnessError::Unsupported) })
+    }
 }
 
 /// Object-safe application adapter. Only typed managed operations cross this boundary.
@@ -141,6 +151,26 @@ pub trait ManagedSessionBackend: Send + Sync {
         call: ManagedSessionCall,
     ) -> Task<'a, HarnessServiceResponse> {
         let _ = (caller, owner, call);
+        Box::pin(async { Err(ManagedHarnessError::Unsupported) })
+    }
+    /// Read a delegated child's exact retained routing target for its parent's invocation.
+    /// Returns `None` only when no canonical session with that identity exists yet.
+    fn delegated_binding<'a>(
+        &'a self,
+        caller: &'a ManagedCaller,
+        request: &'a bcode_harness_models::ManagedDelegationBindingRequest,
+    ) -> Task<'a, bcode_harness_models::ManagedDelegationBindingResponse> {
+        let _ = (caller, request);
+        Box::pin(async { Err(ManagedHarnessError::Unsupported) })
+    }
+    /// Read one bounded canonical history page of a delegated child for its parent's
+    /// invocation, after a best-effort bounded native observation drain.
+    fn delegated_history<'a>(
+        &'a self,
+        caller: &'a ManagedCaller,
+        request: &'a bcode_harness_models::ManagedDelegationHistoryRequest,
+    ) -> Task<'a, bcode_harness_models::HarnessObservationPage> {
+        let _ = (caller, request);
         Box::pin(async { Err(ManagedHarnessError::Unsupported) })
     }
     /// Poll canonical native observations for an admitted interactive attachment, letting the
@@ -608,18 +638,135 @@ impl<S: ManagedHarnessStore, A: ManagedSessionAdmission> ManagedSessionBackend
                 assistance_destination_session_id: None,
             };
             let owner = self.admission.existing(caller, &call).await?;
-            let result = Box::pin(
-                crate::harness::ManagedHarnessApplication::with_owner(
-                    &state,
-                    *client,
-                    &self.runtime,
-                    owner,
-                )
-                .poll_observations(query, wait_millis),
-            )
+            // Native observe must use the configuration view pinned for this owner, exactly as
+            // the admitted execute path does; without it the transport would fall back to the
+            // daemon's startup baseline, which may predate the instance's setup.
+            let application = crate::harness::ManagedHarnessApplication::with_owner(
+                &state,
+                *client,
+                &self.runtime,
+                owner.clone(),
+            );
+            let result = Box::pin(crate::harness::with_credential_admission(
+                caller.clone(),
+                owner,
+                call,
+                application.poll_observations(query, wait_millis),
+            ))
             .await;
+            drop(application);
             drop(state);
             result
+        })
+    }
+
+    fn delegated_binding<'a>(
+        &'a self,
+        caller: &'a ManagedCaller,
+        request: &'a bcode_harness_models::ManagedDelegationBindingRequest,
+    ) -> Task<'a, bcode_harness_models::ManagedDelegationBindingResponse> {
+        Box::pin(async move {
+            request
+                .validate()
+                .map_err(|_| ManagedHarnessError::Invalid)?;
+            let child = request
+                .session_id
+                .parse::<SessionId>()
+                .map_err(|_| ManagedHarnessError::Invalid)?;
+            if !matches!(caller, ManagedCaller::Invocation { .. }) {
+                return Err(ManagedHarnessError::Unsupported);
+            }
+            let state = self
+                .state
+                .upgrade()
+                .ok_or(ManagedHarnessError::Unavailable)?;
+            // An exact creation retry derives the same identity before the session exists.
+            // Absence reveals nothing about other sessions and grants no authority.
+            match state.sessions.session_summary(child).await {
+                Err(bcode_session::SessionError::NotFound(_)) => {
+                    return Ok(bcode_harness_models::ManagedDelegationBindingResponse {
+                        binding: None,
+                    });
+                }
+                Err(_) => return Err(ManagedHarnessError::Storage),
+                Ok(_) => {}
+            }
+            self.admission.delegated_read(caller, child).await?;
+            let snapshot = state
+                .sessions
+                .session_external_harness_state(child)
+                .await
+                .map_err(|_| ManagedHarnessError::Storage)?
+                .ok_or(ManagedHarnessError::Conflict)?;
+            drop(state);
+            if snapshot.owner.session_id != child {
+                return Err(ManagedHarnessError::StaleOwner);
+            }
+            let generation = snapshot.owner.generation;
+            let binding =
+                snapshot
+                    .target
+                    .map(|target| bcode_harness_models::ManagedDelegationBinding {
+                        session_id: child.to_string(),
+                        instance: snapshot.instance,
+                        target,
+                    });
+            let response = bcode_harness_models::ManagedDelegationBindingResponse { binding };
+            response
+                .validate_for(request)
+                .map_err(|_| ManagedHarnessError::Storage)?;
+            if response
+                .binding
+                .as_ref()
+                .is_some_and(|binding| binding.target.generation() != generation)
+            {
+                return Err(ManagedHarnessError::StaleOwner);
+            }
+            Ok(response)
+        })
+    }
+
+    fn delegated_history<'a>(
+        &'a self,
+        caller: &'a ManagedCaller,
+        request: &'a bcode_harness_models::ManagedDelegationHistoryRequest,
+    ) -> Task<'a, bcode_harness_models::HarnessObservationPage> {
+        Box::pin(async move {
+            request
+                .validate()
+                .map_err(|_| ManagedHarnessError::Invalid)?;
+            let child = request
+                .session_id
+                .parse::<SessionId>()
+                .map_err(|_| ManagedHarnessError::Invalid)?;
+            if !matches!(caller, ManagedCaller::Invocation { .. }) {
+                return Err(ManagedHarnessError::Unsupported);
+            }
+            let state = self
+                .state
+                .upgrade()
+                .ok_or(ManagedHarnessError::Unavailable)?;
+            self.admission.delegated_read(caller, child).await?;
+            // Best-effort observation drain: a released or unavailable native transport
+            // still leaves bounded canonical history readable. Never a mutation replay.
+            if let Err(error) = self
+                .drain_delegated(&state, caller, child, request.limit)
+                .await
+            {
+                tracing::debug!(target: "bcode_server::harness", category = %error, "delegated observation drain unavailable");
+            }
+            let page = crate::harness::canonical_history(
+                &state,
+                child,
+                request.after.clone(),
+                request.limit,
+            )
+            .await?;
+            drop(state);
+            request
+                .validate_page(&page)
+                .map_err(|_| ManagedHarnessError::Storage)?;
+            Ok(page)
         })
     }
 
@@ -705,23 +852,23 @@ impl<S: ManagedHarnessStore, A: ManagedSessionAdmission> ManagedSessionBackend
                     | HarnessRequestKind::Close(_)
                     | HarnessRequestKind::Configure(_)
                     | HarnessRequestKind::Reconcile(_)
-            ) && let Some(response) = self.admission.retained_result(caller, &call).await?
+            ) && let Some(response) = self
+                .admission
+                .retained_result(caller, &call)
+                .await
+                .inspect_err(|error| reject_stage("retained_result", *error))?
             {
                 response
                     .validate_for(&call.harness)
                     .map_err(|_| ManagedHarnessError::Storage)?;
                 return Ok(response);
             }
-            let owner = if matches!(&call.harness.kind, HarnessRequestKind::Open(value) if value.resume.is_none())
-            {
-                self.admission.create(caller, &call).await?
-            } else {
-                self.admission.existing(caller, &call).await?
-            };
+            let owner = self.admit_owner(caller, &call).await?;
             if let Some(target) = supplied_target {
                 target
                     .validate_owner(&owner.session_id.to_string(), owner.generation)
-                    .map_err(|_| ManagedHarnessError::StaleOwner)?;
+                    .map_err(|_| ManagedHarnessError::StaleOwner)
+                    .inspect_err(|error| reject_stage("target_owner", *error))?;
             }
             {
                 let mut owners = self.owners.lock().await;
@@ -792,6 +939,11 @@ const fn call_target(
     }
 }
 
+/// Debug-level trace of the pre-admission stage that refused a managed call.
+fn reject_stage(stage: &'static str, error: ManagedHarnessError) {
+    tracing::debug!(target: "bcode_server::harness", stage, category = %error, "managed call refused before admission");
+}
+
 fn log_admitted_failure(
     operation: bcode_harness_models::HarnessOperation,
     error: ManagedHarnessError,
@@ -812,6 +964,68 @@ fn log_admitted_failure(
 }
 
 impl<S: ManagedHarnessStore, A: ManagedSessionAdmission> CanonicalBackend<S, A> {
+    /// Admit the delegated child's current owner exactly as an Observe call, then drain one
+    /// bounded native page through the observer guard under credential admission.
+    async fn drain_delegated(
+        &self,
+        state: &Arc<crate::ServerState>,
+        caller: &ManagedCaller,
+        child: SessionId,
+        limit: u16,
+    ) -> Result<usize, ManagedHarnessError> {
+        let snapshot = state
+            .sessions
+            .session_external_harness_state(child)
+            .await
+            .map_err(|_| ManagedHarnessError::Storage)?
+            .ok_or(ManagedHarnessError::Conflict)?;
+        let call = ManagedSessionCall {
+            session_id: Some(child),
+            harness: bcode_harness_models::HarnessRequest {
+                schema_version: bcode_harness_models::HARNESS_SCHEMA_VERSION,
+                request_id: format!("delegated-admission:{}", uuid::Uuid::new_v4()),
+                instance: snapshot.instance,
+                kind: HarnessRequestKind::Observe(bcode_harness_models::HarnessObserveRequest {
+                    target: snapshot.target.ok_or(ManagedHarnessError::Conflict)?,
+                    // Admission shape only: the drain reads the real committed actor cursor.
+                    retention: None,
+                    after: None,
+                    limit,
+                    wait_millis: 0,
+                }),
+            },
+            parent_session_id: None,
+            assistance_destination_session_id: None,
+        };
+        let owner = self.admission.existing(caller, &call).await?;
+        Box::pin(crate::harness::with_credential_admission(
+            caller.clone(),
+            owner.clone(),
+            call,
+            crate::harness::drain_delegated_observations(state, &self.runtime, &owner, limit),
+        ))
+        .await
+    }
+
+    /// Admit the owner a call creates (fresh open) or addresses (every other operation).
+    async fn admit_owner(
+        &self,
+        caller: &ManagedCaller,
+        call: &ManagedSessionCall,
+    ) -> Result<HarnessOwner, ManagedHarnessError> {
+        if matches!(&call.harness.kind, HarnessRequestKind::Open(value) if value.resume.is_none()) {
+            self.admission
+                .create(caller, call)
+                .await
+                .inspect_err(|error| reject_stage("create", *error))
+        } else {
+            self.admission
+                .existing(caller, call)
+                .await
+                .inspect_err(|error| reject_stage("existing_owner", *error))
+        }
+    }
+
     async fn inspect_admitted(
         &self,
         application: Option<&crate::harness::ManagedHarnessApplication<'_, S, DaemonTransport>>,
@@ -1165,11 +1379,67 @@ async fn dispatch_attachment_watch(
     })
 }
 
+/// Reconstructed end evidence for a transport whose daemon ended without releasing it (for
+/// example it was killed). Requires the exact previous owner to be another daemon whose
+/// published execution lifetime is released; the lifetime is re-verified at preparation.
+async fn abandoned_transport(
+    state: &Arc<crate::ServerState>,
+    snapshot: &bcode_session_models::external_harness::ExternalHarnessState,
+) -> Result<
+    (
+        u64,
+        bcode_session_models::external_harness::ExternalHarnessTransportRelease,
+    ),
+    ManagedHarnessError,
+> {
+    use bcode_session_models::external_harness::ABANDONED_TRANSPORT_EVIDENCE;
+    let previous = &snapshot.owner;
+    let location = state
+        .daemon_status
+        .state_location_id
+        .clone()
+        .ok_or(ManagedHarnessError::Conflict)?;
+    if previous.daemon_id == state.daemon_status.instance_id {
+        return Err(ManagedHarnessError::Conflict);
+    }
+    let binding = snapshot
+        .binding
+        .clone()
+        .ok_or(ManagedHarnessError::Conflict)?;
+    let artifact = bcode_daemon_lifecycle::released_execution_lifetime_artifact(
+        &state.state_root,
+        &previous.daemon_id,
+        &location,
+    )
+    .ok_or(ManagedHarnessError::Conflict)?;
+    let sequence = state
+        .sessions
+        .session_external_harness_abandonment_point(previous)
+        .await
+        .map_err(|_| ManagedHarnessError::Storage)?
+        .ok_or(ManagedHarnessError::Conflict)?;
+    Ok((
+        sequence,
+        bcode_session_models::external_harness::ExternalHarnessTransportRelease {
+            close_request_id: ABANDONED_TRANSPORT_EVIDENCE.into(),
+            instance: snapshot.instance.clone(),
+            binding,
+            lifetime: bcode_session_models::external_harness::ExternalHarnessLifetime {
+                daemon_instance_id: previous.daemon_id.clone(),
+                artifact_id: artifact,
+                state_location_id: location,
+            },
+            reap_id: ABANDONED_TRANSPORT_EVIDENCE.into(),
+        },
+    ))
+}
+
 fn recovery_intent(
     query: &bcode_ipc::harness::ManagedSessionRecoveryRequest,
     snapshot: bcode_session_models::external_harness::ExternalHarnessState,
     sequence: u64,
     release: bcode_session_models::external_harness::ExternalHarnessTransportRelease,
+    abandoned: bool,
     directory: &std::path::Path,
 ) -> Result<
     (
@@ -1205,6 +1475,7 @@ fn recovery_intent(
         previous_owner: snapshot.owner,
         release_event_sequence: sequence,
         release,
+        abandoned,
         capabilities: snapshot.capabilities,
         resume_request:
             bcode_session_models::external_harness::ExternalHarnessRequest::from_request(&request)
@@ -1261,12 +1532,19 @@ async fn dispatch_recovery(
     {
         return Err(failure(ManagedHarnessError::StaleOwner));
     }
-    let (sequence, release) = state
+    let released = state
         .sessions
         .session_external_harness_transport_release(&snapshot.owner)
         .await
-        .map_err(|_| failure(ManagedHarnessError::Storage))?
-        .ok_or_else(|| failure(ManagedHarnessError::Conflict))?;
+        .map_err(|_| failure(ManagedHarnessError::Storage))?;
+    let (sequence, release, abandoned) = if let Some((sequence, release)) = released {
+        (sequence, release, false)
+    } else {
+        let (sequence, release) = abandoned_transport(state, &snapshot)
+            .await
+            .map_err(failure)?;
+        (sequence, release, true)
+    };
     let summary = state
         .sessions
         .session_summary(query.session_id)
@@ -1277,6 +1555,7 @@ async fn dispatch_recovery(
         snapshot,
         sequence,
         release,
+        abandoned,
         &summary.working_directory,
     )
     .map_err(failure)?;
@@ -1599,10 +1878,23 @@ async fn dispatch_auth_operation(
     {
         return prepare_handoff(state, caller, request).await;
     }
-    return dispatch_auth(state, caller, request).await;
+    return Box::pin(dispatch_auth(state, caller, request)).await;
 }
 
 pub(crate) async fn dispatch(
+    state: &Arc<crate::ServerState>,
+    caller: ManagedCaller,
+    request: ManagedSessionRequest,
+) -> Result<ManagedSessionResponse, ErrorResponse> {
+    let operation = request.operation;
+    let result = Box::pin(dispatch_request(state, caller, request)).await;
+    if let Err(error) = &result {
+        tracing::debug!(target: "bcode_server::harness", operation = operation.as_str(), code = %error.code, "managed session request refused");
+    }
+    result
+}
+
+async fn dispatch_request(
     state: &Arc<crate::ServerState>,
     caller: ManagedCaller,
     request: ManagedSessionRequest,
@@ -1632,7 +1924,7 @@ pub(crate) async fn dispatch(
         return dispatch_recovery(state, &caller, query).await;
     }
     if request.operation.is_auth() {
-        return dispatch_auth_operation(state, caller, request).await;
+        return Box::pin(dispatch_auth_operation(state, caller, request)).await;
     }
     if request.operation == ManagedSessionOperation::Observe
         && let Ok(query) = serde_json::from_str::<bcode_ipc::harness::ManagedSessionPollRequest>(
@@ -1867,6 +2159,15 @@ pub(crate) async fn invocation(
                 .into(),
         };
     }
+    if matches!(&caller, ManagedCaller::Invocation { .. })
+        && matches!(
+            request.operation.as_str(),
+            bcode_harness_models::MANAGED_DELEGATION_BINDING_OPERATION
+                | bcode_harness_models::MANAGED_DELEGATION_HISTORY_OPERATION
+        )
+    {
+        return delegated_read_invocation(state, &caller, request).await;
+    }
     let Some(operation) = invocation_operation(
         &request.operation,
         matches!(&caller, ManagedCaller::Workflow { .. }),
@@ -1906,6 +2207,66 @@ pub(crate) async fn invocation(
                 code: "managed_session_invalid".into(),
                 message: "invalid managed session response".into(),
             },
+        },
+        Err(error) => {
+            let error = failure(error);
+            R::Failed {
+                code: error.code,
+                message: error.message,
+            }
+        }
+    }
+}
+
+/// Invocation-scoped delegated reads. Responses are typed, bounded and carry no authority.
+async fn delegated_read_invocation(
+    state: &crate::ServerState,
+    caller: &ManagedCaller,
+    request: bcode_tool::ToolInvocationServiceRequest,
+) -> bcode_tool::ToolInvocationServiceResolution {
+    use bcode_tool::ToolInvocationServiceResolution as R;
+    let Some(backend) = state.managed_sessions.get() else {
+        return R::Failed {
+            code: "managed_session_storage_unavailable".into(),
+            message: "canonical managed-session admission/store bridge is not installed".into(),
+        };
+    };
+    let result = if request.operation == bcode_harness_models::MANAGED_DELEGATION_BINDING_OPERATION
+    {
+        match serde_json::from_value::<bcode_harness_models::ManagedDelegationBindingRequest>(
+            request.payload,
+        ) {
+            Ok(query) => backend
+                .delegated_binding(caller, &query)
+                .await
+                .and_then(|value| {
+                    serde_json::to_value(value).map_err(|_| ManagedHarnessError::Invalid)
+                }),
+            Err(_) => Err(ManagedHarnessError::Invalid),
+        }
+    } else {
+        match serde_json::from_value::<bcode_harness_models::ManagedDelegationHistoryRequest>(
+            request.payload,
+        ) {
+            Ok(query) => backend
+                .delegated_history(caller, &query)
+                .await
+                .and_then(|value| {
+                    serde_json::to_value(value).map_err(|_| ManagedHarnessError::Invalid)
+                }),
+            Err(_) => Err(ManagedHarnessError::Invalid),
+        }
+    };
+    match result {
+        Ok(payload)
+            if serde_json::to_vec(&payload)
+                .is_ok_and(|bytes| bytes.len() <= bcode_harness_models::MAX_HARNESS_WIRE_BYTES) =>
+        {
+            R::Responded { payload }
+        }
+        Ok(_) => R::Failed {
+            code: "managed_session_invalid".into(),
+            message: "invalid managed session response".into(),
         },
         Err(error) => {
             let error = failure(error);
@@ -2582,10 +2943,11 @@ async fn dispatch_readonly_auth_status(
     let admission = crate::harness::CanonicalManagedAdmission::new(
         crate::harness::CanonicalHarnessStore::new(state),
     );
-    let inspected = admission
-        .authorize_auth_status(caller, input.session_id, &input.instance_id)
-        .await
-        .map_err(failure)?;
+    let inspected =
+        Box::pin(admission.authorize_auth_status(caller, input.session_id, &input.instance_id))
+            .await
+            .inspect_err(|error| reject_stage("readonly_auth_status", *error))
+            .map_err(failure)?;
     drop(admission);
     auth_response(&inspected.status)
 }
@@ -2639,7 +3001,7 @@ async fn dispatch_auth(
     let caller_id = client_id.to_string();
     let input = decode_auth_input(&request)?;
     if request.operation == ManagedSessionOperation::AuthStatus && input.handle.is_none() {
-        return dispatch_readonly_auth_status(state, &caller, &input).await;
+        return Box::pin(dispatch_readonly_auth_status(state, &caller, &input)).await;
     }
     let backend = state
         .managed_sessions
@@ -2653,6 +3015,7 @@ async fn dispatch_auth(
     } = backend
         .auth_scope(&caller, input.session_id, &input.instance_id)
         .await
+        .inspect_err(|error| reject_stage("auth_scope", *error))
         .map_err(failure)?;
     validate_auth_admission(&scope, &instance, &input)?;
     let authority = AuthAuthority {

@@ -254,6 +254,16 @@ impl Normalizer {
     /// used, the record budget is exhausted, or evidence needs host acknowledgement or
     /// hydration. Records without execution evidence (text, partial-message frames,
     /// state markers) do not each require a separate host round trip.
+    /// Secret-free pump state for diagnostics: staged records, unacknowledged execution
+    /// evidence, and a pending hydration request.
+    pub fn pump_state(&self) -> (usize, bool, bool) {
+        (
+            self.staging.events.len(),
+            self.execution.has_unacknowledged(),
+            self.staging.request.is_some(),
+        )
+    }
+
     pub fn pump_batch(
         &mut self,
         max_observations: usize,

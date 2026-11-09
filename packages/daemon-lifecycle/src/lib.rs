@@ -14,6 +14,7 @@ pub use target::{DaemonTarget, DaemonTargetError};
 mod execution_lifetime;
 pub use execution_lifetime::{
     ExecutionLifetime, ExecutionLifetimeStatus, ExecutionMaintenance, execution_lifetime_status,
+    released_execution_lifetime_artifact,
 };
 
 use bcode_ipc::{BUILD_FINGERPRINT, CURRENT_PROTOCOL_VERSION, IpcEndpoint, daemon_namespace};

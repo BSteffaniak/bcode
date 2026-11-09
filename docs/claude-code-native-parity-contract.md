@@ -30,16 +30,22 @@ Behavior at producers and consumers:
 
 * `plugins/claude-code-plugin` emits every variant and optional field; see the "Native parity"
   section of `plugins/claude-code-plugin/README.md`. Durable `Text`/`Reasoning` segment ids
-  are `<message.id>:<n>` (per-message block counter matching stream-event block indices),
+  are `<message.id>:t<n>` for text and `<message.id>:r<n>` for reasoning (per-kind ordinal
+  within the message, numbered identically for partial stream events),
   `ToolResult.output` may end with a truncation marker, `Tool.input_json` may be a bounded
   `{"truncated":true,"original_bytes":N,"preview":"…"}` summary, and `Usage.model` may be absent.
+* `plugins/codex-harness-plugin` emits `Text`/`Reasoning` segmented by the native item id,
+  `Tool` (bounded `input_json`) and `ToolResult` for command/file/MCP/dynamic/web-search items,
+  per-turn `Usage` (no cost), approval `tool_name`/`input_preview`, and the `live` sidecar from
+  agent-message and reasoning-summary deltas; see the "Transcript" section of its README.
 * SessionView projects the variants onto ordinary transcript items (assistant messages,
   reasoning activities, generic tool cards, runtime usage); see "Native-like transcript
   projection" in `docs/managed-external-sessions.md`. `bcode_session_view::external` keeps the
   generic fallback text (`native_display_content` in `packages/session-view/src/external.rs`).
-* Native `Usage` is display-only runtime usage keyed `external:{generation}:{observation_id}`.
-  The daemon usage summary does not fold it in, so SessionView keeps these entries across
-  summary refreshes.
+* Native `Usage` is a request contribution keyed `external:{generation}:{observation_id}` in the
+  daemon's session usage projection (writer epoch 27), committed with its observation page.
+  `bcode_session_models::native_harness_usage` defines the shared conversion. SessionView uses the
+  daemon summary once it has one and counts native usage from events only before that.
 * Session search excludes the new variants (`packages/session-search/src/projection.rs`).
 * Retention inspectors account the new strings (`packages/session/models/src/retention_external.rs`).
 

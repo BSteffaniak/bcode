@@ -435,6 +435,8 @@ pub struct ManagedComposerState {
     pub placement: Option<bcode_harness_models::HarnessPlacement>,
     execution: ManagedExecutionPolicy,
     settings: ManagedSessionSettings,
+    /// Display name of the native executor, for example `Claude Code`.
+    label: Option<String>,
 }
 
 /// Why a managed root asked to stop so its outer journey can continue without replay.
@@ -463,6 +465,8 @@ pub struct ManagedSessionSettings {
     pub permission_mode: Option<bcode_harness_models::HarnessPermissionMode>,
     /// Last acknowledged native model selector, if changed in this attachment.
     pub model_id: Option<String>,
+    /// Model the native executor last reported in its usage evidence.
+    pub observed_model: Option<String>,
 }
 
 /// State owned by the terminal user interface.
@@ -873,6 +877,9 @@ impl BmuxApp {
         self.managed_composer
             .requests
             .clone_from(&source.managed_composer.requests);
+        self.managed_composer
+            .label
+            .clone_from(&source.managed_composer.label);
         if self.session_id == source.session_id {
             self.managed_composer
                 .placement
@@ -1627,6 +1634,27 @@ impl BmuxApp {
     #[must_use]
     pub fn session_title(&self) -> Option<&str> {
         self.session_view.snapshot().title.as_deref()
+    }
+
+    /// Header title: the session title, or, for a managed conversation whose input is not
+    /// a Bcode user message, the title its first prompt gives it.
+    #[must_use]
+    pub fn display_session_title(&self) -> Option<String> {
+        if let Some(title) = self.session_title() {
+            return Some(title.to_owned());
+        }
+        self.managed_label()?;
+        self.session_view
+            .snapshot()
+            .transcript
+            .items
+            .iter()
+            .find_map(|item| match &item.kind {
+                bcode_session_view_models::TranscriptViewItemKind::UserMessage { message } => Some(
+                    bcode_session_view::derive_session_title_from_prompt(&message.text),
+                ),
+                _ => None,
+            })
     }
 
     /// Return the current working directory, if known.
@@ -3753,11 +3781,15 @@ impl BmuxApp {
     #[must_use]
     pub fn model_header_label(&self) -> String {
         let model = self
-            .session_view
-            .snapshot()
-            .runtime
-            .display_name
-            .as_deref()
+            .managed_label()
+            .and_then(|_| {
+                let settings = &self.managed_composer.settings;
+                settings
+                    .model_id
+                    .as_deref()
+                    .or(settings.observed_model.as_deref())
+            })
+            .or_else(|| self.session_view.snapshot().runtime.display_name.as_deref())
             .or_else(|| self.selected_model_id())
             .unwrap_or("default");
         self.reasoning_header_label().map_or_else(
@@ -3788,6 +3820,7 @@ impl BmuxApp {
                 .runtime
                 .cumulative_metered_tokens,
             &self.session_view.snapshot().runtime.cost,
+            self.managed_execution_session().is_some(),
         )
     }
 
@@ -6180,9 +6213,13 @@ impl BmuxApp {
                 .latest_history_sequence
                 .is_some_and(|sequence| event.sequence <= sequence)
         {
+            tracing::debug!(target: "bcode_tui::session_stream", sequence = event.sequence,
+                latest = ?self.latest_history_sequence, "live event already covered by history");
             return;
         }
         if event_affects_transcript_rows(event) && self.older_history.has_newer_history() {
+            tracing::debug!(target: "bcode_tui::session_stream", sequence = event.sequence,
+                "live event deferred: newer history pending");
             self.older_history
                 .mark_newer_available_after(self.transcript_window.newest_sequence());
             self.latest_history_sequence = Some(event.sequence);
@@ -6250,15 +6287,25 @@ impl BmuxApp {
             | SessionEventKind::ExternalSubmissionAccepted { .. }
             | SessionEventKind::ExternalDeliveryObserved { .. }
             | SessionEventKind::ExternalObservationRecorded { .. } => {
+                if let Some(model) = reported_native_model(event) {
+                    self.managed_composer.settings.observed_model = Some(model);
+                }
                 // Native history identifies the backend, not execution authority. Default Send
                 // explicitly queues a follow-up; steering requires a user-selected native turn.
-                if self
-                    .session_view_snapshot()
-                    .execution_lifecycle
-                    .session_id
-                    .is_some()
+                // Only live background work is worth a status line; the lifecycle's evidence
+                // detail stays available through the session's execution view.
+                let lifecycle = &self.session_view_snapshot().execution_lifecycle;
+                let running = lifecycle.live_background_work();
+                if lifecycle.session_id.is_some() && running > 0 {
+                    self.set_status(format!(
+                        "{running} background task{} running",
+                        if running == 1 { "" } else { "s" }
+                    ));
+                } else if self.status.ends_with(" running")
+                    && self.status.contains(" background task")
                 {
-                    self.set_status(self.session_view_snapshot().execution_lifecycle.summary());
+                    // The work it reported has finished.
+                    self.status.clear();
                 }
                 if self.managed_composer.placement.is_none() {
                     self.managed_composer.placement =
@@ -6322,8 +6369,10 @@ impl BmuxApp {
                 self.apply_tool_request_side_effects(tool_call_id, tool_name, arguments_json);
             }
             SessionEventKind::ToolInvocationResultRecorded { record } => {
-                if application.live_activity() {
-                    self.set_activity(ActivityState::PreparingFollowUpRequest);
+                // A replayed managed conversation has no later Bcode turn event to end the
+                // tool's activity, so its recorded result ends it.
+                if application.live_activity() || self.managed_execution_session().is_some() {
+                    self.set_follow_up_activity();
                 }
                 self.push_tool_result(
                     &record.invocation_id,
@@ -6358,7 +6407,7 @@ impl BmuxApp {
                 approved: _,
             } => {
                 if application.live_activity() {
-                    self.set_activity(ActivityState::PreparingFollowUpRequest);
+                    self.set_follow_up_activity();
                 }
                 self.set_permission_status(permission_id);
             }
@@ -6823,16 +6872,15 @@ impl BmuxApp {
     }
 
     fn refresh_managed_indicator(&mut self) {
-        let mut indicator = String::from("Managed conversation; native permissions and billing");
-        if let Some(mode) = self.managed_composer.settings.permission_mode {
-            indicator.push_str(" · ");
-            indicator.push_str(super::managed_controls::permission_mode_label(mode));
-        }
-        if let Some(model) = &self.managed_composer.settings.model_id {
-            indicator.push_str(" · model ");
-            indicator.push_str(model);
-        }
-        self.set_execution_mode_indicator(Some(indicator));
+        // The header already names the executor and model; the status line only flags a
+        // non-default permission mode, so token and cost segments keep their room.
+        let indicator = self
+            .managed_composer
+            .settings
+            .permission_mode
+            .filter(|mode| *mode != bcode_harness_models::HarnessPermissionMode::Default)
+            .map(|mode| super::managed_controls::permission_mode_label(mode).to_owned());
+        self.set_execution_mode_indicator(indicator);
     }
 
     /// Record an acknowledged native setting and show it in the status indicator.
@@ -6891,6 +6939,31 @@ impl BmuxApp {
         pending: Vec<bcode_session_view_models::external::ExternalInteractionView>,
     ) {
         self.pending_external_override = Some(pending);
+    }
+
+    /// Activity after a tool finishes or a permission resolves: an ordinary turn prepares its
+    /// follow-up model request, while a managed executor continues natively, so the attached
+    /// view returns to idle and native output reports any further activity.
+    fn set_follow_up_activity(&mut self) {
+        if self.managed_execution_session().is_some() {
+            self.set_activity(ActivityState::Idle);
+        } else {
+            self.set_activity(ActivityState::PreparingFollowUpRequest);
+        }
+    }
+
+    /// Name the native executor in chrome (header, composer prompt).
+    pub fn set_managed_label(&mut self, label: String) {
+        self.managed_composer.label = Some(label);
+    }
+
+    /// Display name of the attached native executor, if this is a managed conversation.
+    #[must_use]
+    pub fn managed_label(&self) -> Option<&str> {
+        self.managed_composer
+            .execution
+            .session_id
+            .and(self.managed_composer.label.as_deref())
     }
 
     /// Explicit managed entry remains managed even when transport/binding is unavailable.
@@ -7481,14 +7554,14 @@ impl BmuxApp {
                     .get(tool_call_id)
                     .and_then(|tool| tool.tool_name.clone())
                     .unwrap_or_else(|| "unknown tool".to_owned());
-                self.set_activity(if approved.is_none() {
-                    ActivityState::WaitingPermission { name: tool_name }
+                if approved.is_none() {
+                    self.set_activity(ActivityState::WaitingPermission { name: tool_name });
                 } else {
-                    ActivityState::PreparingFollowUpRequest
-                });
+                    self.set_follow_up_activity();
+                }
             }
             SessionTracePayload::ToolInvocationFinished { .. } => {
-                self.set_activity(ActivityState::PreparingFollowUpRequest);
+                self.set_follow_up_activity();
             }
             SessionTracePayload::ToolPolicyEvaluated { .. } => {}
         }
@@ -7810,6 +7883,7 @@ impl TokenUsageMeter {
         occupancy: Option<&bcode_session_models::RequestContextOccupancy>,
         cumulative_metered_tokens: u64,
         cost: &bcode_session_view_models::SessionCostSummary,
+        managed: bool,
     ) -> String {
         let mut parts = vec![self.context_summary(occupancy)];
         if self.provider_reuse_active {
@@ -7863,8 +7937,13 @@ impl TokenUsageMeter {
                 ));
             }
         }
-        if cost.unavailable_usage_count > 0
-            || cost.observed_usage_count > cost.estimated_usage_count
+        // A native executor that reports tokens but never prices them (a subscription) is not
+        // a partial estimate; only warn when some pricing was expected.
+        let unpriced_native =
+            managed && cost.estimated_usage_count == 0 && cost.unavailable_usage_count == 0;
+        if !unpriced_native
+            && (cost.unavailable_usage_count > 0
+                || cost.observed_usage_count > cost.estimated_usage_count)
         {
             parts.push(if cost.estimated_usage_count > 0 {
                 format!(
@@ -8015,6 +8094,26 @@ fn context_window_percentage(input_tokens: u64, context_window: u64) -> u32 {
 
 const fn event_breaks_sticky_entry_anchor(event: &SessionEvent) -> bool {
     matches!(&event.kind, SessionEventKind::PermissionRequested { .. })
+}
+
+/// The model a native executor reported in the newest usage of a committed page.
+fn reported_native_model(event: &SessionEvent) -> Option<String> {
+    use bcode_session_models::external_harness::ExternalHarnessOperationRecord;
+    let SessionEventKind::ExternalHarnessOperation { operation } = &event.kind else {
+        return None;
+    };
+    let ExternalHarnessOperationRecord::ObservationPage { page, .. } = &operation.record else {
+        return None;
+    };
+    page.observations
+        .iter()
+        .rev()
+        .find_map(|observation| match &observation.kind {
+            bcode_harness_models::HarnessObservationKind::Usage {
+                model: Some(model), ..
+            } => Some(model.clone()),
+            _ => None,
+        })
 }
 
 const fn event_affects_transcript_rows(event: &SessionEvent) -> bool {
@@ -11476,7 +11575,7 @@ mod tests {
         assert_eq!(cost, before);
         assert!(
             TokenUsageMeter::default()
-                .footer_summary(None, 0, &cost)
+                .footer_summary(None, 0, &cost, false)
                 .ends_with("spent 0 tok · estimated $0.02 (not billed)")
         );
     }
@@ -11663,14 +11762,14 @@ mod tests {
             assert!(cost.has_complete_coverage());
             assert!(
                 meter
-                    .footer_summary(None, 0, &cost)
+                    .footer_summary(None, 0, &cost, false)
                     .contains("estimated $1115.98 (not billed)")
             );
         }
         let mixed = bcode_session_view_models::SessionCostSummary::rebuild(usages.iter());
         assert!(
             meter
-                .footer_summary(None, 0, &mixed)
+                .footer_summary(None, 0, &mixed, false)
                 .contains("estimated $2231.96 (not billed)")
         );
     }
@@ -11697,19 +11796,35 @@ mod tests {
             ..bcode_session_view_models::SessionCostSummary::default()
         };
 
-        let complete_text = meter.footer_summary(None, 0, &complete);
+        let complete_text = meter.footer_summary(None, 0, &complete, false);
         assert!(complete_text.contains("estimated $0.00 (not billed)"));
         assert!(complete_text.contains("estimated EUR 2.000000 (not billed)"));
         assert!(!complete_text.contains('~'));
         assert!(
             meter
-                .footer_summary(None, 0, &partial)
+                .footer_summary(None, 0, &partial, false)
                 .contains("cost partial: 2/3 requests priced")
         );
         assert!(
             meter
-                .footer_summary(None, 0, &unavailable)
+                .footer_summary(None, 0, &unavailable, false)
                 .contains("cost unavailable: 1 requests unpriced")
+        );
+        // A managed executor that never prices its usage is not reported as missing cost,
+        // while an explicitly unavailable estimate still is.
+        let unpriced = bcode_session_view_models::SessionCostSummary {
+            observed_usage_count: 2,
+            ..bcode_session_view_models::SessionCostSummary::default()
+        };
+        assert!(
+            !meter
+                .footer_summary(None, 0, &unpriced, true)
+                .contains("cost")
+        );
+        assert!(
+            meter
+                .footer_summary(None, 0, &unavailable, true)
+                .contains("cost unavailable")
         );
     }
 

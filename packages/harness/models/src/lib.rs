@@ -17,6 +17,8 @@ mod retention;
 pub use retention::*;
 mod candidates;
 pub use candidates::*;
+mod delegation;
+pub use delegation::*;
 mod model_selection;
 pub use model_selection::*;
 mod service;

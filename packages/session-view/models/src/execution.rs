@@ -141,6 +141,17 @@ impl ExecutionLifecycleView {
             })
     }
 
+    /// Native work still running outside the foreground reply: background tasks plus
+    /// continuations that have not reached a terminal state.
+    #[must_use]
+    pub fn live_background_work(&self) -> usize {
+        self.background
+            .iter()
+            .chain(&self.continuations)
+            .filter(|item| !item.state.terminal())
+            .count()
+    }
+
     /// Shared summary used unchanged by all renderers. Never claims workflow success.
     #[must_use]
     pub fn summary(&self) -> String {

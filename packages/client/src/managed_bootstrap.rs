@@ -53,6 +53,18 @@ impl ManagedSessionClient {
         }
     }
 
+    /// The canonical managed binding of `session_id`, or `None` for an ordinary session.
+    ///
+    /// Reads retained canonical state only; it neither attaches nor invokes a native plugin.
+    /// # Errors
+    /// Returns transport, admission or malformed-binding failures.
+    pub async fn session_binding(
+        &self,
+        session_id: bcode_session_models::SessionId,
+    ) -> Result<Option<bcode_ipc::ManagedSessionTargetSnapshot>, ClientError> {
+        self.inner.managed_session_binding(session_id).await
+    }
+
     /// Discover terminal-auth metadata for one explicitly selected canonical session/instance.
     ///
     /// Uses the existing session command binding and exact plugin service declaration selector.

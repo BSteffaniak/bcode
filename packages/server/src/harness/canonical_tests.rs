@@ -293,33 +293,41 @@ async fn assert_attachment_poll_history(
     sessions: &bcode_session::SessionManager,
     session_id: SessionId,
 ) {
+    // Indexed history aggregates committed native pages up to `limit`; the first empty
+    // committed page is skipped but still advances the cursor.
+    let page = sessions
+        .external_harness_history(session_id, None, 16)
+        .await
+        .unwrap();
+    let observations = page.observations;
+    let next = page
+        .next_after
+        .expect("canonical history always has a continuation");
+    let caught_up = sessions
+        .external_harness_history(session_id, Some(next.clone()), 16)
+        .await
+        .unwrap();
+    assert_eq!(
+        caught_up.observations,
+        [] as [bcode_harness_models::HarnessObservation; 0]
+    );
+    assert_eq!(caught_up.next_after.as_ref(), Some(&next));
+    // One observation per read still resumes exactly across the committed pages.
     let mut after = None;
-    let mut observations = Vec::new();
-    // Indexed history returns one committed native page per read, not up to `limit`
-    // pages. The first empty committed page must remain visible as cursor progress.
-    for index in 0..3 {
+    let mut single = Vec::new();
+    loop {
         let page = sessions
-            .external_harness_history(session_id, after.clone(), 16)
+            .external_harness_history(session_id, after.clone(), 1)
             .await
             .unwrap();
-        if index == 0 {
-            assert_eq!(
-                page.observations,
-                [] as [bcode_harness_models::HarnessObservation; 0]
-            );
-            assert_eq!(page.completeness, HarnessCompleteness::Partial);
+        let next = page.next_after.expect("canonical history continuation");
+        single.extend(page.observations);
+        if after.as_ref() == Some(&next) {
+            break;
         }
-        let next = page
-            .next_after
-            .expect("each committed page has a history continuation");
-        assert_ne!(
-            Some(&next),
-            after.as_ref(),
-            "empty pages must advance history too"
-        );
-        observations.extend(page.observations);
         after = Some(next);
     }
+    assert_eq!(single, observations);
     assert_eq!(observations.len(), 2);
     for (event, expected_id) in observations.iter().zip(["poll-output-1", "poll-output-2"]) {
         assert_eq!(event.observation_id, expected_id);
@@ -618,4 +626,39 @@ async fn assert_settlement_cursor(
         .commit_external_harness_page(owner, first.next_after.as_deref(), &next)
         .await
         .unwrap();
+}
+
+#[tokio::test]
+async fn session_configuration_view_resolves_the_live_owner_of_a_local_snapshot() {
+    let (_root, sessions, durable, _opening, _) = Box::pin(prepared_observation_fixture()).await;
+    let mut state = std::sync::Arc::new(crate::tests::test_server_state(sessions.clone()));
+    {
+        let state = std::sync::Arc::get_mut(&mut state).unwrap();
+        state
+            .daemon_status
+            .instance_id
+            .clone_from(&durable.daemon_id);
+        state
+            .daemon_status
+            .build_fingerprint
+            .clone_from(&durable.artifact_id);
+        state.daemon_status.artifact_id = Some(bcode_ipc::ArtifactId::current());
+    }
+    let store = super::CanonicalHarnessStore::new(&state);
+    // Live owners carry the executable artifact while the snapshot records the build fingerprint.
+    let owner = store.current_owner(durable.session_id).await.unwrap();
+    drop(store);
+    assert_ne!(owner.artifact_id, durable.artifact_id);
+    let view = super::configuration_views::baseline(&state).unwrap();
+    state
+        .harness_configuration_views
+        .pin(&owner, "open", view.clone())
+        .await
+        .unwrap();
+    assert!(
+        super::configuration_views::for_session(&state, durable.session_id)
+            .await
+            .unwrap()
+            .same_config_view(&view)
+    );
 }

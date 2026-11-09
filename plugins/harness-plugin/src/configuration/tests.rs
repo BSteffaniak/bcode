@@ -60,6 +60,7 @@ fn native_setup_request() -> PrepareNativeSetupRequest {
     let candidate = bcode_harness_models::HarnessInstallationCandidate {
         plugin_id: instance.plugin_id.clone(),
         executable: bcode_harness_models::HarnessCandidateExecutableIdentity {
+            invocation_path: None,
             canonical_path: instance.executable.clone(),
             byte_len: 12,
             modified_unix_nanos: Some(10),
@@ -197,6 +198,7 @@ fn candidate_setup_requires_exact_binding_and_fresh_correlated_membership() {
     let candidate = bcode_harness_models::HarnessInstallationCandidate {
         plugin_id: instance.plugin_id.clone(),
         executable: bcode_harness_models::HarnessCandidateExecutableIdentity {
+            invocation_path: None,
             canonical_path: instance.executable.clone(),
             byte_len: 12,
             modified_unix_nanos: Some(10),

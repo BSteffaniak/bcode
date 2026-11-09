@@ -92,7 +92,7 @@ fn renamed(session: SessionId, sequence: u64) -> SessionEvent {
 
 /// Seed released event representations directly, never relabel current selected evidence.
 async fn released_store(root: &Path, session: SessionId) -> Vec<CanonicalRow> {
-    assert_eq!((CURRENT_WRITER_EPOCH, CURRENT_EVENT_SCHEMA), (26, 58));
+    assert_eq!((CURRENT_WRITER_EPOCH, CURRENT_EVENT_SCHEMA), (27, 58));
     let db = SessionDb::open_turso_in_root(session, root).await.unwrap();
     let kinds = [
         serde_json::json!({"session_created": {
@@ -251,7 +251,8 @@ async fn released_55_migrates_to_current_losslessly_and_remains_writable_after_r
         receipt.migration_step_ids,
         [
             "session-writer-epoch-23-to-25",
-            "session-writer-epoch-25-to-26"
+            "session-writer-epoch-25-to-26",
+            "session-writer-epoch-26-to-27"
         ]
     );
     assert_eq!(

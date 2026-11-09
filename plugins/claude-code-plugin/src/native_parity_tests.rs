@@ -36,23 +36,24 @@ fn per_block_assistant_frames_share_message_segment_numbering() {
         kinds,
         vec![
             HarnessObservationKind::Reasoning {
-                segment_id: Some("msg_01:0".into()),
+                segment_id: Some("msg_01:r0".into()),
                 text: "Plan the change".into(),
                 opaque: false,
             },
             HarnessObservationKind::Reasoning {
-                segment_id: Some("msg_01:1".into()),
+                segment_id: Some("msg_01:r1".into()),
                 text: String::new(),
                 opaque: true,
             },
             HarnessObservationKind::Text {
-                segment_id: Some("msg_01:2".into()),
+                segment_id: Some("msg_01:t0".into()),
                 text: "Done.".into(),
             },
         ]
     );
     assert!(!serde_json::to_string(&kinds).unwrap().contains("SECRET"));
-    // A new native message restarts numbering; a multi-block frame numbers each block.
+    // Text and reasoning are numbered separately, so a streamed block without a durable
+    // frame cannot shift the next segment. A new message restarts numbering.
     let next = normalizer.event(assistant(json!({"message":{"id":"msg_02","content":[
         {"type":"text","text":"a"},{"type":"text","text":"b"}]}})));
     let segments: Vec<_> = next
@@ -62,7 +63,7 @@ fn per_block_assistant_frames_share_message_segment_numbering() {
             _ => None,
         })
         .collect();
-    assert_eq!(segments, ["msg_02:0", "msg_02:1"]);
+    assert_eq!(segments, ["msg_02:t0", "msg_02:t1"]);
     // Without a usable native message identity, text stays unsegmented.
     let anonymous = normalizer.event(assistant(json!({"message":{"content":[
         {"type":"text","text":"plain"}]}})));
@@ -110,7 +111,7 @@ fn oversized_tool_input_reasoning_and_text_are_truncated_to_valid_bounded_displa
     else {
         panic!("expected segmented assistant text");
     };
-    assert_eq!(segment, "msg_big:2");
+    assert_eq!(segment, "msg_big:t0");
     assert!(text.len() <= MAX_HARNESS_TEXT_BYTES);
     assert!(text.ends_with("[truncated]"));
     for observation in &observations {
@@ -123,9 +124,10 @@ fn user_tool_results_become_bounded_untrusted_output() {
     let mut normalizer = normalizer();
     let observations = normalizer.event(Event::Message(NativeMessage::User(json!({
         "type":"user","message":{"role":"user","content":[
-            {"type":"tool_result","tool_use_id":"toolu_1","content":"file list"},
+            {"type":"tool_result","tool_use_id":"toolu_1","content":"     1\tfile list"},
             {"type":"tool_result","tool_use_id":"toolu_2","is_error":true,"content":[
-                {"type":"text","text":"failed"},{"type":"image","source":{"data":"SECRET_IMAGE"}}]},
+                {"type":"text","text":"failed"},{"type":"image","source":{"data":"SECRET_IMAGE"}},
+                {"type":"tool_reference","tool_name":"WebSearch"}]},
             {"type":"tool_result","tool_use_id":"toolu_3","content":"x".repeat(MAX_HARNESS_TEXT_BYTES + 10)},
             {"type":"text","text":"prompt echo is not a tool result"},
         ]}}))));
@@ -135,7 +137,8 @@ fn user_tool_results_become_bounded_untrusted_output() {
         kinds[0],
         &HarnessObservationKind::ToolResult {
             native_tool_id: "toolu_1".into(),
-            output: "file list".into(),
+            // Numbered native reads display without raw tabs.
+            output: "     1    file list".into(),
             is_error: false,
             truncated: false,
         }
@@ -144,7 +147,7 @@ fn user_tool_results_become_bounded_untrusted_output() {
         kinds[1],
         &HarnessObservationKind::ToolResult {
             native_tool_id: "toolu_2".into(),
-            output: "failed\n[image]".into(),
+            output: "failed\n[image]\n[tool: WebSearch]".into(),
             is_error: true,
             truncated: false,
         }

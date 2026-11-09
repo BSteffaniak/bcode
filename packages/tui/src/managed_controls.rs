@@ -64,7 +64,8 @@ pub const fn builtin_support(id: BuiltinCommandId) -> ManagedCommandSupport {
         | BuiltinCommandId::Profile
         | BuiltinCommandId::Appearance
         | BuiltinCommandId::Streaming
-        | BuiltinCommandId::Timeline => ManagedCommandSupport::Host,
+        | BuiltinCommandId::Timeline
+        | BuiltinCommandId::Exit => ManagedCommandSupport::Host,
         BuiltinCommandId::Native
         | BuiltinCommandId::Agent
         | BuiltinCommandId::Model
@@ -284,7 +285,9 @@ pub fn approval_permission_view(
         tool_name,
         arguments_json: view.input_preview.clone().unwrap_or_default(),
         batch: None,
-        agent_id: view.provenance.instance_id.clone(),
+        agent_id: bcode_session_view::external_projection::harness_display_label(
+            &view.provenance.plugin_id,
+        ),
         title: Some(if view.prompt.trim().is_empty() {
             "Native permission requested".to_owned()
         } else {
@@ -662,6 +665,15 @@ mod tests {
     #[test]
     fn allow_list_classifies_host_control_passthrough_and_unavailable() {
         assert_eq!(command_support("/theme"), Some(ManagedCommandSupport::Host));
+        // Leaving works the same in a managed conversation, under either name.
+        for exit in ["/exit", "/quit"] {
+            assert_eq!(command_support(exit), Some(ManagedCommandSupport::Host));
+            assert_eq!(
+                slash_registry::builtin_command(&exit[1..])
+                    .map(slash_registry::BuiltinSlashCommand::id),
+                Some(BuiltinCommandId::Exit)
+            );
+        }
         assert_eq!(
             command_support("/sessions"),
             Some(ManagedCommandSupport::Host)

@@ -270,7 +270,7 @@ fn empty_inventory_preserves_running_work_and_pending_notification() {
             .unwrap(),
         [] as [bcode_harness_models::HarnessExecutionEvent; 0]
     );
-    let work = &execution.work["turn:command"];
+    let work = &execution.work["codex-work:turn:command"];
     assert_eq!(work.state, HarnessWorkState::Running);
     assert!(matches!(
         work_event(work),

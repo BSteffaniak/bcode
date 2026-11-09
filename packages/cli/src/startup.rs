@@ -565,26 +565,25 @@ async fn confirm_execution_preference(
     shell: &mut bcode_tui::TerminalShell,
     selection: &bcode_model::execution::ExecutionModelSelection,
 ) -> Result<bool, CliError> {
-    let route_label = match &selection.route {
-        Some(bcode_model::execution::ExecutionRoute::ManagedHarness {
-            instance_id,
-            plugin_id,
-        }) => {
-            format!("Managed {instance_id} ({plugin_id})")
-        }
+    let detail = match &selection.route {
+        // A native executor runs under its own signed-in account.
+        Some(bcode_model::execution::ExecutionRoute::ManagedHarness { plugin_id, .. }) => format!(
+            "{} · {}",
+            selection.model_id,
+            bcode_session_view::external_projection::harness_display_label(plugin_id)
+        ),
         Some(bcode_model::execution::ExecutionRoute::ModelProvider { provider_plugin_id }) => {
-            format!("Provider {provider_plugin_id}")
+            format!(
+                "{} · Provider {provider_plugin_id} · account {}",
+                selection.model_id,
+                selection
+                    .account_reference
+                    .as_deref()
+                    .unwrap_or("unspecified")
+            )
         }
         None => return Err(CliError::InvalidArguments("Exact route required".into())),
     };
-    let detail = format!(
-        "{} · {route_label} · account {}",
-        selection.model_id,
-        selection
-            .account_reference
-            .as_deref()
-            .unwrap_or("unspecified")
-    );
     let (config, launch) = bcode_config::recovery::load_current_config_with_recovery_context()?;
     let preference = bcode_config::ExecutionPreference {
         model_id: selection.model_id.clone(),
@@ -608,21 +607,18 @@ async fn confirm_execution_preference(
     });
     let destination = edit.as_ref().map(|edit| edit.path().to_path_buf());
     let mut choices = vec![bcode_tui::QuickConnectionChoice {
-        label: "Use for this conversation".into(),
+        label: "Use it for this conversation".into(),
         detail: detail.clone(),
     }];
     if let Some(path) = &destination {
         choices.push(bcode_tui::QuickConnectionChoice {
-            label: "Remember this choice and continue".into(),
-            detail: format!(
-                "{detail} · Write execution preference to {}",
-                path.display()
-            ),
+            label: "Use it and remember it for next time".into(),
+            detail: format!("{detail} · saved to {}", path.display()),
         });
     }
     let outcome = bcode_tui::run_execution_confirmation_in_shell(shell, bcode_tui::QuickOnboardingInput {
         choices,
-        recovery: Some("No access verification or native execution has occurred. Remembering changes only the execution preference; layered/inline configuration requires an explicit edit destination in Setup.".into()),
+        recovery: Some("Remembering saves only this model choice, so `bcode` opens straight into it next time. Nothing has been sent yet.".into()),
     }).await?;
     match outcome {
         bcode_tui::QuickOnboardingOutcome::Selected(0) => Ok(true),

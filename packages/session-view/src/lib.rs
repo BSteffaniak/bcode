@@ -5079,9 +5079,9 @@ impl SessionView {
         }
         self.usage_cost_revision = summary.cost_revision;
         self.usage_checkpoint = summary.through_sequence;
-        // Display-only native harness usage is not part of the daemon summary; keep it.
-        self.usage_by_request
-            .retain(|key, _| key.starts_with(external_projection::EXTERNAL_USAGE_KEY_PREFIX));
+        // The checkpointed summary covers every usage contribution, including native harness
+        // usage, so locally observed request entries are superseded rather than added.
+        self.usage_by_request.clear();
         self.unattributed_metered_tokens = summary.cumulative_metered_tokens;
         self.snapshot.runtime.cumulative_metered_tokens = summary.cumulative_metered_tokens;
         self.snapshot.runtime.cost = bcode_session_view_models::SessionCostSummary {
@@ -5093,16 +5093,6 @@ impl SessionView {
             observed_usage_count: summary.observed_usage_count,
         };
         self.unattributed_cost = self.snapshot.runtime.cost.clone();
-        for retained in self.usage_by_request.values() {
-            if let Some(tokens) = retained.metered_total_tokens() {
-                self.snapshot.runtime.cumulative_metered_tokens = self
-                    .snapshot
-                    .runtime
-                    .cumulative_metered_tokens
-                    .saturating_add(u64::from(tokens));
-            }
-            self.snapshot.runtime.cost.observe(retained);
-        }
         self.snapshot.runtime.latest_usage = summary.latest_usage;
         self.bump_revision();
     }
@@ -17921,7 +17911,9 @@ fn model_to_display_selection(model: &str) -> Option<String> {
     }
 }
 
-fn derive_session_title_from_prompt(prompt: &str) -> String {
+/// The display title a first prompt gives an untitled session.
+#[must_use]
+pub fn derive_session_title_from_prompt(prompt: &str) -> String {
     let title = prompt
         .split_whitespace()
         .take(8)

@@ -163,6 +163,10 @@ impl StreamState {
                 return Err(HarnessFailure::Uncertain);
             }
         }
+        let (staged, unacknowledged, hydrating) = self.normalizer.pump_state();
+        tracing::trace!(target: "bcode_claude_code_plugin", staged, unacknowledged, hydrating,
+            retention_pending = self.retention.pending(), queued = self.observations.len(),
+            acknowledged = acknowledged.len(), gap = self.gap, "observe advanced");
         Ok(())
     }
 

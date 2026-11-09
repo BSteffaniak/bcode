@@ -303,20 +303,9 @@ fn project_operation(
             builder.observe_instance(instance);
             builder.projection.capabilities = Some((**capabilities).clone());
         }
-        Record::TransportReleased { .. } => {
-            let text = format!(
-                "{} process released. History stays readable; nothing was resent.",
-                builder.label()
-            );
-            builder.notice(text);
-        }
-        Record::RecoveryPrepared { .. } => {
-            let text = format!(
-                "Reconnecting to {}. Earlier messages are not resent.",
-                builder.label()
-            );
-            builder.notice(text);
-        }
+        // Process lifecycle is plumbing: a released process resumes transparently when the
+        // conversation is reopened, so neither event belongs in the transcript.
+        Record::TransportReleased { .. } | Record::RecoveryPrepared { .. } => {}
         Record::DeliveryClaimed { request } => {
             builder.observe_instance(&request.instance);
             if let ExternalHarnessRequestKind::Submit { submission, .. } = &request.kind {
@@ -351,7 +340,6 @@ fn project_completion(
         Response::Prepared(prepared)
         | Response::Reconciled(HarnessReconciliation::KnownPrepared { prepared, .. }) => {
             builder.observe_generation(prepared.generation);
-            builder.notice(format!("{label} is ready. Send a message to start."));
         }
         Response::Reconciled(HarnessReconciliation::Uncertain) => builder.notice(format!(
             "{label} could not confirm whether the last request arrived. It was not resent."
@@ -533,24 +521,12 @@ fn push_content_effect(
             is_error: *is_error,
             truncated: *truncated,
         },
-        HarnessObservationKind::Usage {
-            input_tokens,
-            output_tokens,
-            cache_read_input_tokens,
-            cache_creation_input_tokens,
-            total_cost_micros,
-            ..
-        } => ExternalEffect::Usage(Box::new(display_usage(
-            generation,
-            observation_id,
-            NativeUsage {
-                input: *input_tokens,
-                output: *output_tokens,
-                cache_read: *cache_read_input_tokens,
-                cache_creation: *cache_creation_input_tokens,
-                cost_micros: *total_cost_micros,
-            },
-        ))),
+        HarnessObservationKind::Usage { .. } => {
+            let Some(usage) = bcode_session_models::native_harness_usage(observation) else {
+                return true;
+            };
+            ExternalEffect::Usage(Box::new(usage))
+        }
         _ => return false,
     };
     effects.push(effect);
@@ -561,52 +537,6 @@ fn push_content_effect(
 #[must_use]
 pub fn external_tool_call_id(generation: u64, native_tool_id: &str) -> String {
     format!("external:{generation}:{native_tool_id}")
-}
-
-#[derive(Clone, Copy)]
-struct NativeUsage {
-    input: u64,
-    output: u64,
-    cache_read: u64,
-    cache_creation: u64,
-    cost_micros: Option<u64>,
-}
-
-fn saturating_u32(value: u64) -> u32 {
-    u32::try_from(value).unwrap_or(u32::MAX)
-}
-
-/// Request-key prefix of display-only native harness usage. The daemon's usage summary never
-/// includes these entries, so summary refreshes must keep them.
-pub(crate) const EXTERNAL_USAGE_KEY_PREFIX: &str = "external:";
-
-fn display_usage(generation: u64, observation_id: &str, usage: NativeUsage) -> SessionTokenUsage {
-    // Bcode input totals include cache subsets; native counters report them separately.
-    let input = usage
-        .input
-        .saturating_add(usage.cache_read)
-        .saturating_add(usage.cache_creation);
-    SessionTokenUsage {
-        request_id: Some(format!(
-            "{EXTERNAL_USAGE_KEY_PREFIX}{generation}:{observation_id}"
-        )),
-        observation_id: Some(observation_id.to_owned()),
-        terminal: true,
-        input_tokens: Some(saturating_u32(input)),
-        output_tokens: Some(saturating_u32(usage.output)),
-        cached_input_tokens: Some(saturating_u32(usage.cache_read)),
-        cache_write_input_tokens: Some(saturating_u32(usage.cache_creation)),
-        cost: usage.cost_micros.map(|total_micros| {
-            bcode_session_models::SessionCostEstimate::Estimated {
-                currency: "USD".to_owned(),
-                total_micros,
-                components: Vec::new(),
-                source: "native harness report".to_owned(),
-                revision: None,
-            }
-        }),
-        ..SessionTokenUsage::default()
-    }
 }
 
 fn excerpt(text: &str) -> String {

@@ -3070,6 +3070,34 @@ impl ServerState {
         interaction_operations::resolve_exchanges_without_consumers(self).await;
     }
 
+    /// A live interactive client that may authorize ingestion for `session_id`: a client
+    /// attached to the session, otherwise `preferred` while it is still connected.
+    ///
+    /// Requests may arrive on short-lived connections, so an attachment's long-lived
+    /// ingestion follows the session's attached clients rather than the requesting connection.
+    pub(crate) async fn managed_ingestion_caller(
+        &self,
+        session_id: SessionId,
+        preferred: ClientId,
+    ) -> Option<ClientId> {
+        // Never hold both locks at once, matching the other attached-client readers; the
+        // collection is what releases the first lock before the second is taken.
+        #[allow(clippy::needless_collect)]
+        let attached = self
+            .attached_client_sessions
+            .lock()
+            .await
+            .iter()
+            .filter(|(_, attached)| **attached == session_id)
+            .map(|(client, _)| *client)
+            .collect::<Vec<_>>();
+        let contexts = self.client_runtime_contexts.lock().await;
+        attached
+            .into_iter()
+            .find(|client| contexts.contains_key(client))
+            .or_else(|| contexts.contains_key(&preferred).then_some(preferred))
+    }
+
     async fn client_runtime_context(&self, client_id: ClientId) -> Option<ClientRuntimeContext> {
         self.client_runtime_contexts
             .lock()
@@ -3967,6 +3995,35 @@ impl ServerState {
         clear_all_live_state(self);
         let _ = self.shutdown.send(());
     }
+}
+
+/// Treat a termination or hangup signal (for example system shutdown or logout) like an explicit
+/// stop, so managed native sessions are released and can resume after the next start.
+fn start_termination_signal_watcher(state: &Arc<ServerState>) {
+    #[cfg(unix)]
+    {
+        use tokio::signal::unix::{SignalKind, signal};
+        let state = Arc::downgrade(state);
+        let (Ok(mut terminate), Ok(mut hangup)) = (
+            signal(SignalKind::terminate()),
+            signal(SignalKind::hangup()),
+        ) else {
+            tracing::warn!(target: "bcode_server::shutdown", "termination signal handling unavailable");
+            return;
+        };
+        tokio::spawn(async move {
+            tokio::select! {
+                _ = terminate.recv() => {}
+                _ = hangup.recv() => {}
+            }
+            if let Some(state) = state.upgrade() {
+                tracing::info!(target: "bcode_server::shutdown", "termination signal received; shutting down");
+                state.request_shutdown();
+            }
+        });
+    }
+    #[cfg(not(unix))]
+    let _ = state;
 }
 
 fn catalog_status_to_ipc(status: CatalogLoadStatus) -> SessionCatalogStatus {
@@ -5477,6 +5534,7 @@ async fn run_constructed_server_inner(
             .start_idle_shutdown_watcher(Duration::from_secs(daemon.idle_shutdown_after_secs))
             .await;
     }
+    start_termination_signal_watcher(&state);
     let phase = bcode_metrics::startup::phase("server.agent_registration");
     warn_on_unregistered_agent_ids(&state, configured_agent_ids).await;
     phase.finish();
@@ -32740,10 +32798,18 @@ async fn invocation_service_routes(
         advertised: bcode_tool::ToolInvocationServiceRoute {
             route_id: bcode_ipc::harness::MANAGED_SESSION_INTERFACE_ID.to_owned(),
             interface_id: bcode_ipc::harness::MANAGED_SESSION_INTERFACE_ID.to_owned(),
-            operations: ["start", "inspect", "followup", "respond", "interrupt"]
-                .into_iter()
-                .map(str::to_owned)
-                .collect(),
+            operations: [
+                "start",
+                "inspect",
+                "followup",
+                "respond",
+                "interrupt",
+                bcode_harness_models::MANAGED_DELEGATION_BINDING_OPERATION,
+                bcode_harness_models::MANAGED_DELEGATION_HISTORY_OPERATION,
+            ]
+            .into_iter()
+            .map(str::to_owned)
+            .collect(),
         },
         target_plugin_id: None,
         payload_overlay: serde_json::Value::Null,

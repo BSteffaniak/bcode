@@ -13,15 +13,51 @@ const MAX_TRACKED_MESSAGES: usize = 32;
 /// Upper bound on a native-reported cost (USD) converted to micros.
 const MAX_REPORTED_COST_USD: f64 = 1_000_000.0;
 
-/// Running content-block numbering per native message.
+/// Per-kind block numbering per native message.
 ///
 /// Native stream-json emits one assistant frame per content block, all sharing the API
-/// `message.id`; numbering frames in arrival order reproduces the API content-block index
-/// that partial `stream_event` frames use, so durable and live identities agree.
+/// `message.id`, but not every streamed block yields a durable frame. Segments therefore
+/// number text and reasoning blocks separately (`<message.id>:t<n>`, `<message.id>:r<n>`);
+/// partial `stream_event` frames are numbered the same way, so durable and live agree.
 #[derive(Default)]
 pub struct BlockNumbering {
-    messages: VecDeque<(String, usize)>,
+    messages: VecDeque<(String, BlockCounts)>,
 }
+
+/// Next ordinal for each segment kind within one native message.
+#[derive(Default, Clone, Copy)]
+pub struct BlockCounts {
+    text: usize,
+    reasoning: usize,
+}
+
+impl BlockCounts {
+    pub const fn new() -> Self {
+        Self {
+            text: 0,
+            reasoning: 0,
+        }
+    }
+
+    /// Allocate the next segment identity of `kind` within `message_id`.
+    pub fn next(&mut self, message_id: &str, kind: SegmentKind) -> String {
+        let (prefix, counter) = match kind {
+            SegmentKind::Text => ('t', &mut self.text),
+            SegmentKind::Reasoning => ('r', &mut self.reasoning),
+        };
+        let ordinal = *counter;
+        *counter = counter.saturating_add(1);
+        format!("{message_id}:{prefix}{ordinal}")
+    }
+}
+
+/// Live-presentable block kinds; other blocks never carry segment identity.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SegmentKind {
+    Text,
+    Reasoning,
+}
+
 impl BlockNumbering {
     pub const fn new() -> Self {
         Self {
@@ -29,18 +65,18 @@ impl BlockNumbering {
         }
     }
 
-    /// Reserve `count` consecutive block indices for `message_id`; returns the first.
-    pub fn reserve(&mut self, message_id: &str, count: usize) -> usize {
-        if let Some((_, next)) = self.messages.iter_mut().find(|(id, _)| id == message_id) {
-            let first = *next;
-            *next = next.saturating_add(count);
-            return first;
+    /// Allocate the next segment identity of `kind` within `message_id`.
+    pub fn next(&mut self, message_id: &str, kind: SegmentKind) -> String {
+        if let Some((_, counts)) = self.messages.iter_mut().find(|(id, _)| id == message_id) {
+            return counts.next(message_id, kind);
         }
         if self.messages.len() >= MAX_TRACKED_MESSAGES {
             self.messages.pop_front();
         }
-        self.messages.push_back((message_id.to_owned(), count));
-        0
+        let mut counts = BlockCounts::default();
+        let segment = counts.next(message_id, kind);
+        self.messages.push_back((message_id.to_owned(), counts));
+        segment
     }
 }
 
@@ -118,9 +154,16 @@ fn tool_output(content: Option<&Value>) -> (String, bool) {
         Some(Value::String(text)) => output.push_str(text),
         Some(Value::Array(blocks)) => {
             for block in blocks {
+                let reference;
                 let part = match block.get("type").and_then(Value::as_str) {
                     Some("text") => block.get("text").and_then(Value::as_str).unwrap_or(""),
                     Some("image") => "[image]",
+                    // Tool search loads tool definitions by reference; show which tools.
+                    Some("tool_reference") => {
+                        let name = block.get("tool_name").and_then(Value::as_str);
+                        reference = format!("[tool: {}]", name.unwrap_or("unknown"));
+                        reference.as_str()
+                    }
                     Some(_) => "[unsupported content]",
                     None => continue,
                 };
@@ -135,7 +178,9 @@ fn tool_output(content: Option<&Value>) -> (String, bool) {
         }
         _ => {}
     }
-    truncate_display(&output, MAX_HARNESS_TEXT_BYTES)
+    // Native file reads number lines as `N<TAB>text`. Terminals have no portable tab
+    // rendering, so display text uses a fixed indent instead of a raw tab.
+    truncate_display(&output.replace('\t', "    "), MAX_HARNESS_TEXT_BYTES)
 }
 
 /// Portable usage counters from a native result frame, when it reports usage.

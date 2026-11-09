@@ -4,14 +4,15 @@ use std::collections::{BTreeMap, VecDeque};
 use std::io::{BufRead, BufReader, Read, Write};
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
-use std::sync::{Arc, Mutex, mpsc};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Condvar, Mutex, mpsc};
 use std::thread;
 use std::time::{Duration, Instant};
 use zeroize::Zeroize as _;
 
 const MAX_FRAME: usize = 1024 * 1024;
 const MAX_PENDING: usize = 32;
-const MAX_EVENTS: usize = 256;
+const MAX_EVENTS: usize = 1024;
 const MAX_EVENT_BYTES: usize = 4 * MAX_FRAME;
 
 /// Sanitized native failure; never contains raw process output or input.
@@ -72,6 +73,76 @@ impl Launch {
         command
     }
 }
+/// Change counter signalled whenever native evidence arrives or the transport closes, so a
+/// bounded observe wait can return without polling.
+#[derive(Default)]
+pub(crate) struct WakeInner {
+    changes: Mutex<u64>,
+    signal: Condvar,
+}
+/// Shared wake handle for one native transport.
+pub(crate) type Wake = Arc<WakeInner>;
+impl WakeInner {
+    fn notify(&self) {
+        if let Ok(mut changes) = self.changes.lock() {
+            *changes = changes.wrapping_add(1);
+            self.signal.notify_all();
+        }
+    }
+    /// Current change count.
+    pub(crate) fn seen(&self) -> u64 {
+        self.changes.lock().map_or(0, |changes| *changes)
+    }
+    /// Wait until the count differs from `seen` or `timeout` elapses; true when changed.
+    pub(crate) fn wait_changed(&self, seen: u64, timeout: Duration) -> bool {
+        let Ok(changes) = self.changes.lock() else {
+            return true;
+        };
+        self.signal
+            .wait_timeout_while(changes, timeout, |changes| *changes == seen)
+            .map_or(true, |(changes, _)| *changes != seen)
+    }
+}
+
+/// Transport readiness for a waiting observer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Readiness {
+    /// Nothing queued.
+    Idle,
+    /// Only streaming deltas are queued; a short coalescing wait is allowed.
+    DeltasOnly,
+    /// Durable evidence, a callback, a gap or closure is ready.
+    Ready,
+}
+
+/// Notifications presented only as transient live text; consecutive frames coalesce.
+fn is_live_delta(method: &str) -> bool {
+    matches!(
+        method,
+        "item/agentMessage/delta" | "item/reasoning/summaryTextDelta"
+    )
+}
+
+/// Notifications the adapter interprets. Everything else (output deltas duplicated by item
+/// completion, diffs, rate limits, warnings, MCP status, realtime) is dropped at the reader
+/// so it cannot exhaust the bounded queue. Server requests are never dropped.
+fn interpreted_notification(method: &str) -> bool {
+    is_live_delta(method)
+        || matches!(
+            method,
+            "thread/started"
+                | "thread/status/changed"
+                | "thread/tokenUsage/updated"
+                | "turn/started"
+                | "turn/completed"
+                | "item/started"
+                | "item/completed"
+                | "serverRequest/resolved"
+                | "remoteControl/status/changed"
+                | "account/login/completed"
+        )
+}
+
 struct State {
     pending: BTreeMap<u64, mpsc::SyncSender<Result<Value, CodexError>>>,
     events: VecDeque<Value>,
@@ -81,6 +152,7 @@ struct State {
     write_deadline: Option<Instant>,
     local_only: bool,
     fresh_thread: Option<String>,
+    wake: Wake,
 }
 struct Frame {
     bytes: Vec<u8>,
@@ -99,6 +171,8 @@ pub(crate) struct AppServer {
     next_id: u64,
     timeout: Duration,
     version: String,
+    wake: Wake,
+    reaped: Arc<AtomicBool>,
 }
 impl AppServer {
     pub(crate) fn spawn(launch: &Launch) -> Result<Self, CodexError> {
@@ -123,6 +197,7 @@ impl AppServer {
         let stdin = child.stdin.take().ok_or(CodexError::Disconnected)?;
         let stdout = child.stdout.take().ok_or(CodexError::Disconnected)?;
         let stderr = child.stderr.take().ok_or(CodexError::Disconnected)?;
+        let wake = Wake::default();
         let state = Arc::new(Mutex::new(State {
             pending: BTreeMap::new(),
             events: VecDeque::new(),
@@ -132,10 +207,12 @@ impl AppServer {
             write_deadline: None,
             local_only: false,
             fresh_thread: None,
+            wake: Arc::clone(&wake),
         }));
         // Own/reap the child outside the invocation thread. Drop/cancellation never waits on wait().
         let monitor = Arc::clone(&state);
-        supervise_child(child, monitor);
+        let reaped = Arc::new(AtomicBool::new(false));
+        supervise_child(child, monitor, Arc::clone(&reaped));
         let (writer, receiver) = mpsc::sync_channel::<Frame>(MAX_PENDING);
         let write_state = Arc::clone(&state);
         thread::spawn(move || {
@@ -173,6 +250,8 @@ impl AppServer {
             next_id: 1,
             timeout: launch.timeout,
             version,
+            wake,
+            reaped,
         })
     }
 
@@ -314,6 +393,33 @@ impl AppServer {
         }
         Ok((events, state.gap, state.closed))
     }
+    /// Wake handle signalled on native evidence or closure.
+    pub(crate) fn wake(&self) -> Wake {
+        Arc::clone(&self.wake)
+    }
+    /// Physical reap flag, set only after the supervisor waited on the exited child.
+    pub(crate) fn reap_flag(&self) -> Arc<AtomicBool> {
+        Arc::clone(&self.reaped)
+    }
+    /// Whether queued native input is ready for an observer.
+    pub(crate) fn readiness(&self) -> Readiness {
+        let Ok(state) = self.state.lock() else {
+            return Readiness::Ready;
+        };
+        if state.gap || state.closed {
+            return Readiness::Ready;
+        }
+        if state.events.is_empty() {
+            return Readiness::Idle;
+        }
+        if state.events.iter().all(|event| {
+            event.get("id").is_none() && event["method"].as_str().is_some_and(is_live_delta)
+        }) {
+            Readiness::DeltasOnly
+        } else {
+            Readiness::Ready
+        }
+    }
     pub(crate) fn health(&self) -> Result<(bool, bool), CodexError> {
         let state = self.state.lock().map_err(|_| CodexError::Disconnected)?;
         Ok((state.gap, state.closed))
@@ -328,7 +434,11 @@ impl Drop for AppServer {
     }
 }
 
-fn supervise_child(mut child: std::process::Child, monitor: Arc<Mutex<State>>) {
+fn supervise_child(
+    mut child: std::process::Child,
+    monitor: Arc<Mutex<State>>,
+    reaped: Arc<AtomicBool>,
+) {
     thread::spawn(move || {
         loop {
             let closed = monitor.lock().map_or(true, |mut state| {
@@ -342,14 +452,23 @@ fn supervise_child(mut child: std::process::Child, monitor: Arc<Mutex<State>>) {
             });
             if closed {
                 let _ = child.kill();
-                let _ = child.wait();
+                if child.wait().is_ok() {
+                    reaped.store(true, Ordering::SeqCst);
+                }
                 break;
             }
-            if matches!(child.try_wait(), Ok(None)) {
-                thread::sleep(Duration::from_millis(5));
-            } else {
-                disconnect(&monitor);
-                break;
+            match child.try_wait() {
+                Ok(None) => thread::sleep(Duration::from_millis(5)),
+                Ok(Some(_)) => {
+                    // try_wait reaped the exited child.
+                    reaped.store(true, Ordering::SeqCst);
+                    disconnect(&monitor);
+                    break;
+                }
+                Err(_) => {
+                    disconnect(&monitor);
+                    break;
+                }
             }
         }
     });
@@ -379,7 +498,7 @@ fn drain_stdout(stdout: std::process::ChildStdout, read_state: Arc<Mutex<State>>
 
 // Pinned CLI declares version at the TOP LEVEL; app-server does not propagate it.
 // Probe has no provider request, login, or session creation. Output and waiting are bounded.
-fn probe_version(launch: &Launch) -> Result<String, CodexError> {
+pub(crate) fn probe_version(launch: &Launch) -> Result<String, CodexError> {
     let mut child = launch
         .command()
         .arg("--version")
@@ -427,15 +546,19 @@ fn probe_version(launch: &Launch) -> Result<String, CodexError> {
     let version = output
         .strip_prefix("codex-cli ")
         .ok_or(CodexError::Unsupported)?;
-    if version.is_empty()
-        || version.len() > 128
-        || !version
-            .bytes()
-            .all(|b| b.is_ascii_alphanumeric() || b".-+".contains(&b))
-    {
+    if !well_formed_version(version) {
         return Err(CodexError::Unsupported);
     }
     Ok(version.to_owned())
+}
+
+/// Whether `version` has the bounded shape of a probed `codex --version` value.
+pub(crate) fn well_formed_version(version: &str) -> bool {
+    !version.is_empty()
+        && version.len() <= 128
+        && version
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b".-+".contains(&b))
 }
 
 pub(crate) fn wipe_value(value: &mut Value) {
@@ -461,6 +584,7 @@ fn disconnect(state: &Mutex<State>) {
 }
 fn fail_closed(state: &mut State) {
     state.closed = true;
+    state.wake.notify();
     for (_, sender) in std::mem::take(&mut state.pending) {
         let _ = sender.try_send(Err(CodexError::Uncertain));
     }
@@ -519,6 +643,15 @@ fn receive(state: &Mutex<State>, mut value: Value) {
         wipe_value(&mut value);
         return;
     }
+    let method = value["method"].as_str().unwrap_or_default().to_owned();
+    if value.get("id").is_none() && !interpreted_notification(&method) {
+        wipe_value(&mut value);
+        return;
+    }
+    if value.get("id").is_none() && is_live_delta(&method) && coalesce_delta(&mut state, &value) {
+        state.wake.notify();
+        return;
+    }
     let bytes = value.to_string().len();
     if state.events.len() >= MAX_EVENTS || state.event_bytes.saturating_add(bytes) > MAX_EVENT_BYTES
     {
@@ -531,6 +664,40 @@ fn receive(state: &Mutex<State>, mut value: Value) {
     }
     state.event_bytes += bytes;
     state.events.push_back(value);
+    state.wake.notify();
+}
+
+/// Append a delta to the immediately preceding queued delta of the same item and part.
+/// Ordering is preserved: only adjacent frames merge.
+fn coalesce_delta(state: &mut State, value: &Value) -> bool {
+    let Some(delta) = value["params"]["delta"].as_str() else {
+        return false;
+    };
+    let event_bytes = state.event_bytes;
+    let Some(last) = state.events.back_mut() else {
+        return false;
+    };
+    if last.get("id").is_some()
+        || last["method"] != value["method"]
+        || last["params"]["threadId"] != value["params"]["threadId"]
+        || last["params"]["itemId"] != value["params"]["itemId"]
+        || last["params"]["summaryIndex"] != value["params"]["summaryIndex"]
+        || event_bytes.saturating_add(delta.len()) > MAX_EVENT_BYTES
+    {
+        return false;
+    }
+    let Some(Value::String(text)) = last
+        .get_mut("params")
+        .and_then(|params| params.get_mut("delta"))
+    else {
+        return false;
+    };
+    if text.len().saturating_add(delta.len()) > MAX_FRAME / 2 {
+        return false;
+    }
+    text.push_str(delta);
+    state.event_bytes += delta.len();
+    true
 }
 fn read_frame(reader: &mut impl BufRead) -> Result<Option<Vec<u8>>, CodexError> {
     let mut frame = Vec::new();
@@ -583,6 +750,7 @@ mod tests {
             write_deadline: None,
             local_only: true,
             fresh_thread: Some("fresh".to_owned()),
+            wake: Wake::default(),
         });
         receive(
             &state,
@@ -605,6 +773,7 @@ mod tests {
             write_deadline: None,
             local_only: true,
             fresh_thread: Some("fresh".to_owned()),
+            wake: Wake::default(),
         });
         receive(
             &state,
@@ -627,6 +796,7 @@ mod tests {
             write_deadline: None,
             local_only: false,
             fresh_thread: None,
+            wake: Wake::default(),
         });
         for _ in 0..=MAX_EVENTS {
             receive(

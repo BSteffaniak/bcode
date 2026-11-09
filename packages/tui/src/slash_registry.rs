@@ -37,6 +37,8 @@ pub enum BuiltinCommandId {
     CancelRuntime,
     Runtime,
     Permissions,
+    /// Leave Bcode, like the exit key.
+    Exit,
 }
 
 /// Resolved host-owned slash command.
@@ -103,6 +105,14 @@ const BUILTIN_COMMANDS: &[BuiltinCommandSpec] = &[
                 "/native history",
                 "Read bounded canonical native history; /native respond answers a native request"
             ),
+        ],
+    },
+    BuiltinCommandSpec {
+        id: BuiltinCommandId::Exit,
+        names: &["exit", "quit"],
+        completions: &[
+            completion!("/exit", "Exit Bcode"),
+            completion!("/quit", "Exit Bcode"),
         ],
     },
     BuiltinCommandSpec {

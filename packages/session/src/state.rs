@@ -380,6 +380,18 @@ impl SessionState {
                     }
                 }
             }
+            kind @ SessionEventKind::ExternalHarnessOperation { .. } => {
+                if let Some(text) = crate::managed_submission_text(kind) {
+                    self.has_user_message = true;
+                    if self.summary.derived_title.is_none() {
+                        self.summary.derived_title = Some(title_from_first_prompt(text));
+                        if self.summary.explicit_name.is_none() {
+                            self.summary.name.clone_from(&self.summary.derived_title);
+                            self.summary.title_source = SessionTitleSource::FirstUserMessage;
+                        }
+                    }
+                }
+            }
             SessionEventKind::WorkingDirectoryChanged {
                 new_working_directory,
                 ..

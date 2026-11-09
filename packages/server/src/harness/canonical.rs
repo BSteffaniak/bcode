@@ -473,7 +473,10 @@ impl CanonicalHarnessStore {
         let state = self.state()?;
         crate::session_operations::require_selected_location(&state, session_id)
             .await
-            .map_err(|_| ManagedHarnessError::StaleOwner)?;
+            .map_err(|_| {
+                tracing::debug!(target: "bcode_server::harness", stage = "current_owner_location", "managed owner lookup rejected");
+                ManagedHarnessError::StaleOwner
+            })?;
         let snapshot = state
             .sessions
             .session_external_harness_state(session_id)
@@ -483,6 +486,9 @@ impl CanonicalHarnessStore {
         if snapshot.owner.daemon_id != state.daemon_status.instance_id
             || snapshot.owner.artifact_id != state.daemon_status.build_fingerprint
         {
+            tracing::debug!(target: "bcode_server::harness", stage = "current_owner_foreign",
+                daemon = snapshot.owner.daemon_id == state.daemon_status.instance_id,
+                "managed owner lookup rejected");
             return Err(ManagedHarnessError::StaleOwner);
         }
         let mut owner = Self::owner_from_snapshot(session_id, &snapshot)?;
@@ -492,11 +498,19 @@ impl CanonicalHarnessStore {
             .as_ref()
             .ok_or(ManagedHarnessError::StaleOwner)?
             .to_string();
-        Self::local_owner(&state, &owner)?;
+        Self::local_owner(&state, &owner).inspect_err(|_| {
+            tracing::debug!(target: "bcode_server::harness", stage = "current_owner_local", "managed owner lookup rejected");
+        })?;
         drop(state);
-        let _hold = self.acquire(&owner).await?;
-        let selected = self.selected(&owner).await?;
-        Self::validate_owner_observation(&snapshot, &selected)?;
+        let _hold = self.acquire(&owner).await.inspect_err(|error| {
+            tracing::debug!(target: "bcode_server::harness", stage = "current_owner_acquire", category = %error, "managed owner lookup rejected");
+        })?;
+        let selected = self.selected(&owner).await.inspect_err(|error| {
+            tracing::debug!(target: "bcode_server::harness", stage = "current_owner_selected", category = %error, "managed owner lookup rejected");
+        })?;
+        Self::validate_owner_observation(&snapshot, &selected).inspect_err(|_| {
+            tracing::debug!(target: "bcode_server::harness", stage = "current_owner_observation", "managed owner lookup rejected");
+        })?;
         Ok(owner)
     }
 
@@ -518,6 +532,25 @@ impl CanonicalHarnessStore {
             None if current.target.is_none() && current.binding == before.binding => Ok(()),
             None => Err(ManagedHarnessError::StaleOwner),
         }
+    }
+
+    /// The live owner a persisted snapshot names when it belongs to this daemon.
+    ///
+    /// Durable ownership records the build fingerprint while live owners use the executable
+    /// artifact identity; translate only an exact local daemon and build, never a foreign one.
+    pub(super) fn live_owner_from_snapshot(
+        state: &crate::ServerState,
+        session_id: SessionId,
+        snapshot: &bcode_session_models::external_harness::ExternalHarnessState,
+    ) -> Result<HarnessOwner, ManagedHarnessError> {
+        let mut owner = Self::owner_from_snapshot(session_id, snapshot)?;
+        if snapshot.owner.daemon_id == state.daemon_status.instance_id
+            && snapshot.owner.artifact_id == state.daemon_status.build_fingerprint
+            && let Some(artifact) = state.daemon_status.artifact_id.as_ref()
+        {
+            owner.artifact_id = artifact.to_string();
+        }
+        Ok(owner)
     }
 
     pub(super) fn owner_from_snapshot(
@@ -598,11 +631,23 @@ impl CanonicalHarnessStore {
         crate::session_operations::require_selected_location(&state, owner.session_id)
             .await
             .map_err(|_| ManagedHarnessError::StaleOwner)?;
-        state
-            .sessions
-            .external_harness_state(&self.durable(owner)?)
-            .await
-            .map_err(|_| ManagedHarnessError::Storage)
+        let durable = self.durable(owner)?;
+        let sessions = state.sessions.clone();
+        drop(state);
+        match sessions.external_harness_state(&durable).await {
+            Ok(selected) => Ok(selected),
+            // Another generation or daemon owns the session (for example after a restart):
+            // report a stale owner so attached clients recover instead of retrying storage.
+            Err(_) => match sessions
+                .session_external_harness_state(owner.session_id)
+                .await
+            {
+                Ok(Some(current)) if current.owner != durable => {
+                    Err(ManagedHarnessError::StaleOwner)
+                }
+                _ => Err(ManagedHarnessError::Storage),
+            },
+        }
     }
 }
 

@@ -932,6 +932,11 @@ async fn run_managed_chat_bound<W: Write + Send>(
             app: {
                 let mut app = BmuxApp::new_with_history(Some(session_id), &[], &[], false);
                 app.set_managed_execution(session_id);
+                app.set_managed_label(
+                    bcode_session_view::external_projection::harness_display_label(
+                        &binding.instance.plugin_id,
+                    ),
+                );
                 if let Ok(rules) = structure_rules {
                     app.apply_user_structure_rules(rules);
                 }

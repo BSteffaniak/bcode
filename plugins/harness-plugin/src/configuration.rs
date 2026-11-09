@@ -132,7 +132,7 @@ impl PrepareCandidateSetupRequest {
             .map_err(|_| "invalid setup instance")?;
         let instance = &self.setup.instance;
         if instance.plugin_id != self.candidate.plugin_id
-            || instance.executable != self.candidate.executable.canonical_path
+            || instance.executable != self.candidate.executable.invocation()
             || instance.config_namespace != self.candidate.config_namespace
             || instance.auth.custody != self.candidate.custody
             || !matches!(
@@ -274,6 +274,11 @@ impl InstanceDefinition {
 
 fn catalog(context: &NativeServiceContext) -> Result<InstanceCatalog, ServiceResponse> {
     catalog_from_config(&context.config.config)
+}
+
+/// Resolve the enabled instance catalog from plugin configuration without native inspection.
+pub(crate) fn catalog_value(config: &serde_json::Value) -> Result<InstanceCatalog, ()> {
+    catalog_from_config(config).map_err(drop)
 }
 
 fn catalog_from_config(config: &serde_json::Value) -> Result<InstanceCatalog, ServiceResponse> {

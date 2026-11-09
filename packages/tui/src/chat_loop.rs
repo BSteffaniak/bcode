@@ -33,6 +33,9 @@ use super::{
     slash_palette, slash_palette_render, thinking_dialog_render, timeline_dialog_render,
 };
 
+/// Recent Markdown items examined for a missing exact projection on each frame.
+const MARKDOWN_PROJECTION_LOOKBACK: usize = 8;
+
 const DRAFT_SAVE_DEBOUNCE: Duration = Duration::from_millis(900);
 #[derive(Debug, Clone)]
 pub struct DraftAutosave {
@@ -3131,23 +3134,48 @@ impl ChatLoopState {
     }
 
     fn request_latest_markdown_projection(&mut self, chat: &ActiveChat, width: u16) {
-        let Some(item) = chat
+        // Recent messages without an exact projection come first, newest first: their text is
+        // final once replaced, and a later item (for example live tool activity whose options
+        // change every frame) must not keep a finalized reply painted from its superseded
+        // streaming projection. Otherwise the newest Markdown item of any kind.
+        use super::transcript::{TranscriptItem, TranscriptItemKind};
+        fn missing<'a>(
+            app: &super::app::BmuxApp,
+            item: &'a TranscriptItem,
+            width: u16,
+        ) -> Option<(
+            &'a TranscriptItem,
+            bcode_markdown_render::MarkdownRenderOptions,
+        )> {
+            let options = render::markdown_render_options(app, item, width);
+            (!app
+                .transcript_markdown_cache()
+                .contains(item.id().get(), item.revision(), &options))
+            .then_some((item, options))
+        }
+        let mut recent = chat
             .app
             .transcript()
             .iter()
             .rev()
-            .find(|item| item.text_format() == bcode_session_view_models::TextFormat::Markdown)
+            .filter(|item| item.text_format() == bcode_session_view_models::TextFormat::Markdown)
+            .take(MARKDOWN_PROJECTION_LOOKBACK)
+            .peekable();
+        let newest = recent.peek().copied();
+        let Some((item, options)) = recent
+            .filter(|item| {
+                matches!(
+                    item.kind(),
+                    TranscriptItemKind::AssistantMessage
+                        | TranscriptItemKind::ReasoningMessage
+                        | TranscriptItemKind::UserMessage
+                )
+            })
+            .find_map(|item| missing(&chat.app, item, width))
+            .or_else(|| newest.and_then(|item| missing(&chat.app, item, width)))
         else {
             return;
         };
-        let options = render::markdown_render_options(&chat.app, item, width);
-        if chat
-            .app
-            .transcript_markdown_cache()
-            .contains(item.id().get(), item.revision(), &options)
-        {
-            return;
-        }
         if self
             .markdown_projection
             .latest_requested()
@@ -4375,8 +4403,10 @@ pub fn apply_effect_result(
         TuiEffectResult::CancelTurn { session_id, result } => {
             if chat.app.managed_execution_session() == Some(session_id) {
                 match result {
-                    Ok(_) => chat.app.set_status("Native interruption acknowledged; foreground/background settlement is still observed independently".into()),
-                    Err(error) => report_nonfatal_client_error(chat, "Native interruption failed", &error),
+                    Ok(_) => chat.app.set_status("Interrupted".into()),
+                    Err(error) => {
+                        report_nonfatal_client_error(chat, "Native interruption failed", &error);
+                    }
                 }
             } else {
                 apply_cancel_turn_result(chat, loop_state, session_id, result);
@@ -4644,8 +4674,12 @@ fn apply_session_status_result(
             .set_status(format!("Session status unavailable: {error}"));
         return;
     }
-    chat.app
-        .set_status(format!("model: {model_text}; active skills: {skill_count}"));
+    // A managed conversation's model belongs to its native executor (shown in the header);
+    // Bcode's provider model and skills do not apply to it.
+    if chat.app.managed_execution_session().is_none() {
+        chat.app
+            .set_status(format!("model: {model_text}; active skills: {skill_count}"));
+    }
 }
 
 fn apply_agent_catalog_result(
@@ -5328,6 +5362,7 @@ fn apply_root_slash_command_outcome(
         SlashCommandOutcome::PickSession => {
             loop_state.open_session_picker(chat);
         }
+        SlashCommandOutcome::Exit => chat.app.request_exit(),
         SlashCommandOutcome::OpenChildMonitor => {
             chat.app.open_child_panel();
             if let Some(session_id) = chat.attached_session_id() {
@@ -5450,21 +5485,22 @@ fn apply_managed_composer_receipt(
                     .set_status("Native receipt mismatch; retained unresolved input".into());
                 return;
             }
-            if !matches!(
-                receipt.state,
-                bcode_harness_models::HarnessDeliveryState::Uncertain
-                    | bcode_harness_models::HarnessDeliveryState::DeliveryAttempted
-            ) {
+            // A completed write is delivered input: the canonical submission item now shows it
+            // and the adapter's retained receipt refuses duplicate delivery. Only an uncertain
+            // outcome keeps the exact attempt for an explicit retry.
+            if receipt.state == bcode_harness_models::HarnessDeliveryState::Uncertain {
+                format!(
+                    "Delivery to the native session is uncertain; /native retry {} resends the same attempt",
+                    receipt.submission_id
+                )
+            } else {
                 chat.app.acknowledge_managed_composer(submission_id);
                 chat.app
                     .managed_composer
                     .requests
                     .remove(&receipt.submission_id);
+                "Sent".to_owned()
             }
-            format!(
-                "Native delivery {:?}; not assignment completion. Uncertain input: /native retry {} (same attempt)",
-                receipt.state, receipt.submission_id
-            )
         }
         ExternalHarnessResponseKind::Failure(failure) => format!(
             "Native delivery {failure:?}; request retained. /native retry {}",
@@ -8025,7 +8061,7 @@ mod scheduler_tests {
                 .iter()
                 .any(|pending| pending.id() == &identity)
         );
-        assert!(chat.app.status().contains("Uncertain"));
+        assert!(chat.app.status().contains("uncertain"));
         assert_eq!(
             chat.pending_effects.queued_effect_count(),
             0,

@@ -8,9 +8,34 @@ description  = "Native Codex app-server managed session backend"
 interface_id = "bcode.harness/v3"
 name         = "Codex managed sessions"
 
+[[services]]
+class        = "query"
+description  = "Bounded non-mutating installed Codex CLI candidates with native account readiness"
+interface_id = "bcode.harness.candidates/v1"
+name         = "Codex setup candidates"
+
+[[services]]
+class        = "service"
+description  = "Native model/list discovery and exact selected thread start"
+interface_id = "bcode.harness.models/v1"
+name         = "Codex model selection"
+
+[[services]]
+class        = "service"
+description  = "Exact thread resume preflight and physical app-server release evidence; Close acknowledgement alone never proves release"
+interface_id = "bcode.harness.recovery/v1"
+name         = "Codex recovery evidence"
+
+[[services]]
+class        = "query"
+description  = "Namespace-bound client-terminal codex login plan; declaration is not readiness or permission"
+interface_id = "bcode.harness.terminal-auth/v1"
+name         = "Codex native terminal login preparation"
+
 [concurrency]
-max  = 1
-type = "limited"
+# Operations serialize on retained plugin state; only a waiting observe releases that lock
+# while it waits for native output.
+type = "concurrent"
 
 [runtime]
 abi_version  = 5

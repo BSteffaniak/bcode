@@ -14,6 +14,8 @@ ready = False
 local_only = False
 first_input = True
 terminal_inventory = []
+turn_count = 0
+current_turn = "turn-1"
 
 def emit(value):
     print(json.dumps(value), flush=True)
@@ -22,8 +24,13 @@ def result(request, value):
     emit({"id": request["id"], "result": value})
 
 def turn(status):
-    return {"id": "turn-1", "status": status, "items": [],
+    return {"id": current_turn, "status": status, "items": [],
             "error": {"message": "sensitive native error", "codexErrorInfo": "other"} if status == "failed" else None}
+
+def marker(text="result-fixture-end", item_id="marker"):
+    # A completed commentary message is durable display text; deltas are live-only.
+    emit({"method": "item/completed", "params": {"threadId": "native-thread", "turnId": current_turn,
+          "item": {"type": "agentMessage", "id": item_id, "text": text, "phase": "commentary"}}})
 
 def completed(status="completed"):
     emit({"method": "turn/completed", "params": {"threadId": "native-thread", "turn": turn(status)}})
@@ -35,7 +42,7 @@ for line in sys.stdin:
     with open("methods.jsonl", "a", encoding="utf-8") as log:
         log.write(json.dumps({"method": method, "expectedTurnId": params.get("expectedTurnId"),
                               "callback": request.get("id") if method is None else None,
-                              "turnId": params.get("turnId"),
+                              "turnId": params.get("turnId"), "threadId": params.get("threadId"),
                               "result": request.get("result"),
                               "success": request.get("result", {}).get("success")}) + "\n")
     if method == "initialize":
@@ -94,9 +101,15 @@ for line in sys.stdin:
     elif method in ("turn/start", "turn/steer"):
         text = params["input"][0]["text"]
         if method == "turn/start":
-            if not local_only or not first_input:
+            if not local_only:
+                sys.exit(9)
+            if not first_input and os.path.exists("later-start-forbidden"):
                 sys.exit(9)
             first_input = False
+            turn_count += 1
+            current_turn = f"turn-{turn_count}"
+        if method == "turn/steer" and turn_count == 0:
+            turn_count = 1  # The fixture's first (steered) turn is turn-1.
         if method == "turn/steer" and params.get("expectedTurnId") != "turn-1":
             emit({"id": request["id"], "error": {"code": -32600, "message": "expected turn mismatch"}})
             continue
@@ -140,7 +153,7 @@ for line in sys.stdin:
                 item_event("item/started", command)
             continue
         if text == "overflow":
-            for index in range(300):
+            for index in range(1100):
                 emit({"id": 100 + index, "method": "item/tool/requestUserInput", "params": {
                     "threadId": "native-thread", "turnId": "turn-1", "questions": []}})
         if text.startswith("terminal-"):
@@ -166,8 +179,7 @@ for line in sys.stdin:
             emit({"method": "turn/completed", "params": {"threadId": thread_id, "turn": native_turn}})
             if status == "duplicate":
                 emit({"method": "turn/completed", "params": {"threadId": thread_id, "turn": native_turn}})
-            emit({"method": "item/agentMessage/delta", "params": {
-                "threadId": "native-thread", "turnId": "turn-1", "itemId": "marker", "delta": "result-fixture-end"}})
+            marker()
             continue
         if text.startswith("result-"):
             emit({"method": "item/agentMessage/delta", "params": {
@@ -209,9 +221,7 @@ for line in sys.stdin:
                 emit({"method": item_method, "params": item_params})
             if text not in ("result-held", "result-late", "result-oversized", "result-malformed"):
                 completed("interrupted" if text == "result-interrupted" else "failed" if text == "result-failed" else "completed")
-            emit({"method": "item/agentMessage/delta", "params": {
-                "threadId": "native-thread", "turnId": "turn-1", "itemId": "marker",
-                "delta": "result-fixture-end"}})
+            marker()
             continue
         if text in ("approval", "question", "multi-question", "duplicate-question", "secret-question", "resolved-question", "foreign-resolved-question", "assistance", "dynamic", "foreign"):
             callback_method = "item/commandExecution/requestApproval"
@@ -234,7 +244,9 @@ for line in sys.stdin:
                 emit({"method": "serverRequest/resolved", "params": {
                     "threadId": "unrelated-thread" if text == "foreign-resolved-question" else "native-thread",
                     "requestId": 91}})
-        emit({"method": "item/agentMessage/delta", "params": {"threadId": "native-thread", "turnId": "turn-1", "delta": "fixture text"}})
+        emit({"method": "item/agentMessage/delta", "params": {"threadId": "native-thread", "turnId": current_turn, "itemId": "fixture-text", "delta": "fixture "}})
+        emit({"method": "item/agentMessage/delta", "params": {"threadId": "native-thread", "turnId": current_turn, "itemId": "fixture-text", "delta": "text"}})
+        marker("fixture text", "fixture-text")
         if text not in ("approval", "question", "multi-question", "duplicate-question", "secret-question", "resolved-question", "foreign-resolved-question", "assistance", "dynamic"):
             completed(text if text in ("failed", "interrupted") else "completed")
     elif method == "thread/backgroundTerminals/list":

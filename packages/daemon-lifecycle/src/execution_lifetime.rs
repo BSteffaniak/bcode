@@ -327,12 +327,38 @@ fn try_lock_evidence(file: &File) -> Result<(), fs::TryLockError> {
     }
 }
 
+/// The artifact of an exact instance whose published execution lifetime has been released.
+///
+/// For callers that know a dead daemon's instance identity but not its artifact. Instance
+/// identities are never reused, so the evidence file names one lifetime; any missing, corrupt,
+/// foreign-location or still-locked evidence yields `None`.
+#[must_use]
+pub fn released_execution_lifetime_artifact(
+    root: &Path,
+    instance_id: &str,
+    state_location_id: &str,
+) -> Option<String> {
+    match observe_lifetime(root, instance_id, None, state_location_id) {
+        Ok((ExecutionLifetimeStatus::Released, artifact)) => Some(artifact),
+        _ => None,
+    }
+}
+
 fn observe(
     root: &Path,
     instance: &str,
     artifact: &str,
     location: &str,
 ) -> io::Result<ExecutionLifetimeStatus> {
+    observe_lifetime(root, instance, Some(artifact), location).map(|(status, _)| status)
+}
+
+fn observe_lifetime(
+    root: &Path,
+    instance: &str,
+    artifact: Option<&str>,
+    location: &str,
+) -> io::Result<(ExecutionLifetimeStatus, String)> {
     let root = directory(root, false)?;
     let path = evidence_path(&root, instance);
     let metadata = fs::symlink_metadata(&path)?;
@@ -355,14 +381,15 @@ fn observe(
     let evidence: Evidence = serde_json::from_slice(&bytes).map_err(|_| invalid())?;
     if evidence.version != VERSION
         || evidence.instance_id != instance
-        || evidence.artifact_id != artifact
+        || artifact.is_some_and(|artifact| evidence.artifact_id != artifact)
         || evidence.state_location_id != location
     {
         return Err(invalid());
     }
-    match try_lock_evidence(&file) {
-        Ok(()) => Ok(ExecutionLifetimeStatus::Released),
-        Err(fs::TryLockError::WouldBlock) => Ok(ExecutionLifetimeStatus::Live),
-        Err(fs::TryLockError::Error(error)) => Err(error),
-    }
+    let status = match try_lock_evidence(&file) {
+        Ok(()) => ExecutionLifetimeStatus::Released,
+        Err(fs::TryLockError::WouldBlock) => ExecutionLifetimeStatus::Live,
+        Err(fs::TryLockError::Error(error)) => return Err(error),
+    };
+    Ok((status, evidence.artifact_id))
 }

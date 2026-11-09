@@ -1026,6 +1026,32 @@ impl BcodeRuntimeModel {
         &mut self,
         stroke: bmux_keyboard::KeyStroke,
     ) -> super::invalidation::UiInvalidation {
+        // Ctrl+C on a managed approval stops the native turn: the request is denied and the
+        // turn interrupted together, instead of leaving the native agent waiting.
+        let interrupt = stroke.key == bmux_keyboard::KeyCode::Char('c')
+            && stroke.modifiers.ctrl
+            && self
+                .loop_state
+                .permission_dialog
+                .as_ref()
+                .is_some_and(|dialog| {
+                    matches!(
+                        dialog.origin(),
+                        super::permission_dialog::PermissionOrigin::Managed { .. }
+                    )
+                });
+        if interrupt {
+            if let Some(super::permission_dialog::PermissionDialogOutcome::Resolve(resolution)) =
+                self.loop_state
+                    .permission_dialog
+                    .as_mut()
+                    .map(|dialog| dialog.handle_action(super::keymap::BmuxAction::PermissionDeny))
+            {
+                self.queue_permission_resolution(resolution);
+            }
+            super::chat_loop::start_cancel_turn(&mut self.chat, &mut self.loop_state);
+            return super::invalidation::UiInvalidation::Structural;
+        }
         let Some(action) = self
             .settings
             .keymap()

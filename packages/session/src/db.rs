@@ -4004,6 +4004,10 @@ impl SessionDb {
             }
             for row in rows {
                 cursor = required_string(&row, "request_key")?;
+                // Vendor-reported native harness costs are authoritative facts, not valuations.
+                if bcode_session_models::is_native_harness_usage_key(&cursor) {
+                    continue;
+                }
                 let mut previous: SessionTokenUsage =
                     serde_json::from_str(&required_string(&row, "usage_json")?)?;
                 previous.cost = optional_string(&row, "cost_json")
@@ -4082,6 +4086,10 @@ impl SessionDb {
             }
             for row in rows {
                 cursor = required_string(&row, "request_key")?;
+                // Native harness usage has no provider billing evidence to renormalize.
+                if bcode_session_models::is_native_harness_usage_key(&cursor) {
+                    continue;
+                }
                 let sequence = required_i64(&row, "event_seq")?.cast_unsigned();
                 let usage: SessionTokenUsage =
                     serde_json::from_str(&required_string(&row, "usage_json")?)?;
@@ -7118,6 +7126,7 @@ async fn project_event(
     }
     crate::milestone::project(db, event).await?;
     crate::db_managed_tool::project(db, event).await?;
+    project_native_harness_usage(db, event).await?;
     match &event.kind {
         SessionEventKind::SessionCreated {
             name,
@@ -7556,9 +7565,47 @@ async fn project_event(
                 .execute(db)
                 .await?;
         }
+        kind @ SessionEventKind::ExternalHarnessOperation { .. } => {
+            if let Some(text) = crate::managed_submission_text(kind) {
+                project_managed_submission(db, event, text).await?;
+            }
+        }
         _ => {}
     }
 
+    Ok(())
+}
+
+/// Managed input joins input history and names an untitled session, like a user message.
+/// The canonical submission stays in the managed operation; no transcript row is added.
+async fn project_managed_submission(
+    db: &dyn Database,
+    event: &SessionEvent,
+    text: &str,
+) -> Result<(), DatabaseError> {
+    db.insert("input_messages")
+        .value("input_seq", seq_to_value(event.sequence))
+        .value("event_seq", seq_to_value(event.sequence))
+        .value("created_at_ms", seq_to_value(event_created_at_ms(event)))
+        .value("text", text.to_owned())
+        .execute(db)
+        .await?;
+    if db
+        .select("session_state")
+        .columns(&["derived_title"])
+        .where_eq("session_id", event.session_id.to_string())
+        .execute_first(db)
+        .await?
+        .as_ref()
+        .and_then(|row| optional_string(row, "derived_title"))
+        .is_none()
+    {
+        db.update("session_state")
+            .value("derived_title", crate::title_from_first_prompt(text))
+            .where_eq("session_id", event.session_id.to_string())
+            .execute(db)
+            .await?;
+    }
     Ok(())
 }
 
@@ -7732,6 +7779,80 @@ async fn project_session_usage(
         .value("summary_json", serde_json::to_string(&summary)?)
         .execute(db)
         .await?;
+    Ok(())
+}
+
+/// Fold vendor-reported native harness usage into the request-keyed usage projection.
+///
+/// Each native usage observation is one immutable terminal request contribution keyed by its
+/// generation-scoped observation identity. Its vendor-reported cost (or absence of cost) is
+/// recorded as-is and never valued by a pricing catalog. An identical redelivery is idempotent;
+/// a conflicting observation for an existing identity is rejected.
+async fn project_native_harness_usage(
+    db: &dyn Database,
+    event: &SessionEvent,
+) -> SessionDbResult<()> {
+    let contributions = bcode_session_models::native_harness_usage_in_event(&event.kind);
+    if contributions.is_empty() {
+        return Ok(());
+    }
+    let invalid = |column: String| SessionDbError::InvalidRow { column };
+    let mut summary = read_session_usage_summary(db).await?;
+    let mut changed = false;
+    for usage in contributions {
+        usage.validate().map_err(invalid)?;
+        let Some(key) = usage.request_id.clone() else {
+            return Err(invalid(
+                "native harness usage requires a request key".into(),
+            ));
+        };
+        if let Some(row) = db
+            .select("session_usage_requests")
+            .columns(&["usage_json", "cost_json"])
+            .where_eq("request_key", key.clone())
+            .execute_first(db)
+            .await?
+        {
+            let mut previous: SessionTokenUsage =
+                serde_json::from_str(&required_string(&row, "usage_json")?)?;
+            previous.cost = optional_string(&row, "cost_json")
+                .map(|json| serde_json::from_str(&json))
+                .transpose()?;
+            if previous == usage {
+                continue;
+            }
+            return Err(invalid(
+                "session_usage: conflicting native harness usage observation".into(),
+            ));
+        }
+        crate::usage::replace(&mut summary, None, &usage)
+            .map_err(|message| invalid(format!("session_usage: {message}")))?;
+        let mut facts = usage.clone();
+        facts.cost = None;
+        db.insert("session_usage_requests")
+            .value("request_key", key)
+            .value("usage_json", serde_json::to_string(&facts)?)
+            .value(
+                "cost_json",
+                usage.cost.as_ref().map(serde_json::to_string).transpose()?,
+            )
+            .value(
+                "first_observed_at_ms",
+                DatabaseValue::Int64(i64::try_from(event.timestamp_ms).unwrap_or(i64::MAX)),
+            )
+            .value("event_seq", seq_to_value(event.sequence))
+            .execute(db)
+            .await?;
+        changed = true;
+    }
+    if changed {
+        db.upsert("session_usage_projection")
+            .unique(&["projection_id"])
+            .value("projection_id", DatabaseValue::Int32(1))
+            .value("summary_json", serde_json::to_string(&summary)?)
+            .execute(db)
+            .await?;
+    }
     Ok(())
 }
 

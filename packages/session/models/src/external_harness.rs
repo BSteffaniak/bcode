@@ -708,11 +708,24 @@ impl ExternalHarnessTransportRelease {
 #[serde(deny_unknown_fields)]
 pub struct ExternalHarnessRecovery {
     pub previous_owner: ExternalHarnessOwner,
+    /// The canonical event the recovery follows: the previous owner's release, or for an
+    /// abandoned transport its last canonical harness event.
     pub release_event_sequence: u64,
+    /// Transport end evidence. For an abandoned transport it is reconstructed: the previous
+    /// daemon's released execution lifetime with [`ABANDONED_TRANSPORT_EVIDENCE`] markers.
     pub release: ExternalHarnessTransportRelease,
     pub capabilities: HarnessCapabilities,
     pub resume_request: ExternalHarnessRequest,
+    /// The previous daemon ended without releasing the native transport (for example it was
+    /// killed). Its execution lifetime is proven released by the recovering daemon and its
+    /// native child cannot outlive it; no previous input is replayed.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub abandoned: bool,
 }
+
+/// Marker carried as `close_request_id` and `reap_id` by an abandoned transport's
+/// reconstructed release evidence; no native Close or reap ever produced it.
+pub const ABANDONED_TRANSPORT_EVIDENCE: &str = "daemon-lifetime-released";
 impl ExternalHarnessRecovery {
     /// Validate the exact next generation and retained native identity.
     /// # Errors
@@ -738,6 +751,13 @@ impl ExternalHarnessRecovery {
         let Some(binding) = &open.resume else {
             return Err("recovery cannot create a native session".into());
         };
+        let markers = [&self.release.close_request_id, &self.release.reap_id]
+            .iter()
+            .filter(|value| value.as_str() == ABANDONED_TRANSPORT_EVIDENCE)
+            .count();
+        if (self.abandoned && markers != 2) || (!self.abandoned && markers != 0) {
+            return Err("recovery evidence does not match its transport end".into());
+        }
         let mut expected = self.release.binding.clone();
         expected.generation = owner.generation;
         if self.release_event_sequence == 0

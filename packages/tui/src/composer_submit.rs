@@ -235,6 +235,9 @@ pub fn trailing_exclusion(size: bmux_tui::geometry::Size) -> u16 {
     }
 }
 
+/// Composer prompt shown while the draft is empty, unless an executor names itself.
+pub const DEFAULT_PLACEHOLDER: &str = "Ask Bcode…";
+
 /// Presentation policy for the native composer and its submission controls.
 #[derive(Clone, Copy)]
 pub struct ComposerPresentation {
@@ -251,6 +254,7 @@ pub fn panel<'a>(
     policy: &'a TextInputPolicy,
     submit: &'a ComposerSubmit,
     presentation: ComposerPresentation,
+    placeholder: &'a str,
 ) -> impl Component + 'a {
     let ComposerPresentation {
         theme,
@@ -275,7 +279,7 @@ pub fn panel<'a>(
         .vertical(bmux_tui::composition::VerticalAlignment::End);
     let editor = TextInputComponent::new("composer.editor", state, policy)
         .trailing_exclusion(exclusion)
-        .placeholder("Ask Bcode…", theme.muted)
+        .placeholder(placeholder, theme.muted)
         .style(theme.text)
         .selection_style(theme.selection)
         .focused(focused);
@@ -430,6 +434,7 @@ mod tests {
                     enabled: !text.trim().is_empty(),
                     size: composer.size(),
                 },
+                DEFAULT_PLACEHOLDER,
             );
             let layout = panel.layout(Constraints::tight(composer.size()), &mut LayoutCx::new());
             submit.record_layout(&layout, composer);
@@ -594,6 +599,7 @@ mod tests {
                 enabled: true,
                 size,
             },
+            DEFAULT_PLACEHOLDER,
         );
         let layout = component.layout(Constraints::tight(size), &mut LayoutCx::new());
         let editor = layout
@@ -635,6 +641,7 @@ mod tests {
                     enabled: true,
                     size,
                 },
+                DEFAULT_PLACEHOLDER,
             );
             let layout = component.layout(Constraints::tight(size), &mut LayoutCx::new());
             let mut buffer = Buffer::empty(Rect::new(0, 0, size.width, size.height));

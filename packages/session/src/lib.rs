@@ -3547,6 +3547,25 @@ fn normalize_working_directory(path: &Path) -> PathBuf {
     path.canonicalize().unwrap_or_else(|_| path.to_path_buf())
 }
 
+/// Text the user sent to a managed native executor, recorded when its delivery is claimed.
+///
+/// Managed input never becomes a `UserMessage`, so titles and input history read it here.
+fn managed_submission_text(kind: &SessionEventKind) -> Option<&str> {
+    use bcode_session_models::external_harness::{
+        ExternalHarnessOperationRecord, ExternalHarnessRequestKind,
+    };
+    let SessionEventKind::ExternalHarnessOperation { operation } = kind else {
+        return None;
+    };
+    let ExternalHarnessOperationRecord::DeliveryClaimed { request } = &operation.record else {
+        return None;
+    };
+    match &request.kind {
+        ExternalHarnessRequestKind::Submit { submission, .. } => Some(&submission.text),
+        _ => None,
+    }
+}
+
 fn title_from_first_prompt(prompt: &str) -> String {
     let first_content_line = prompt
         .lines()

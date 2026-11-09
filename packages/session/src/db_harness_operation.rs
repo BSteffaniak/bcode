@@ -711,10 +711,10 @@ async fn inventory_directory(
     let event = inventory_canonical_event(db, owner.session_id, sequence).await?;
     let op = operation(&event)?;
     if op.owner != *owner {
-        // Only a released immediately preceding generation can seed an empty new
-        // directory. This computes commitments, not authority: transactional recovery
-        // validation still compares the exact release and current configuration.
-        if matches!(&op.record, R::TransportReleased { .. })
+        // Only the immediately preceding generation of another daemon (released, or abandoned
+        // by a dead daemon) can seed an empty new directory. This computes commitments, not
+        // authority: transactional recovery validation still checks the exact transfer.
+        if !matches!(&op.record, R::RecoveryPrepared { .. })
             && op.owner.session_id == owner.session_id
             && op.owner.generation.checked_add(1) == Some(owner.generation)
             && op.owner.daemon_id != owner.daemon_id
@@ -3360,25 +3360,37 @@ async fn validate_recovery_prepared(
         .await?
         .ok_or_else(invalid)?;
     let tail_op = operation(&tail)?;
-    let R::TransportReleased { release } = &tail_op.record else {
-        return Err(invalid());
-    };
-    if tail_op.owner != recovery.previous_owner
-        || tail.sequence != recovery.release_event_sequence
-        || release != &recovery.release
-    {
-        return Err(invalid());
-    }
     let released = latest(
         db,
         op.owner.session_id,
         "transport_release",
         &format!("generation:{}", recovery.previous_owner.generation),
     )
-    .await?
-    .ok_or_else(invalid)?;
-    if released.sequence != tail.sequence {
-        return Err(invalid());
+    .await?;
+    if recovery.abandoned {
+        // No release exists: the recovering daemon proved the previous daemon's lifetime
+        // ended. The recovery must follow the exact canonical tail, written by that owner.
+        if released.is_some()
+            || tail_op.owner != recovery.previous_owner
+            || tail.sequence != recovery.release_event_sequence
+            || matches!(
+                tail_op.record,
+                R::TransportReleased { .. } | R::RecoveryPrepared { .. }
+            )
+        {
+            return Err(invalid());
+        }
+    } else {
+        let R::TransportReleased { release } = &tail_op.record else {
+            return Err(invalid());
+        };
+        if tail_op.owner != recovery.previous_owner
+            || tail.sequence != recovery.release_event_sequence
+            || release != &recovery.release
+            || released.ok_or_else(invalid)?.sequence != tail.sequence
+        {
+            return Err(invalid());
+        }
     }
     let previous = state_in_prefix(db, &recovery.previous_owner, Some(sequence))
         .await?
@@ -4416,6 +4428,42 @@ impl SessionDb {
         Ok(result)
     }
 
+    /// The canonical tail an abandoned transport's recovery would follow: the exact current
+    /// owner's last harness event when no release exists. Observation only; the caller must
+    /// prove the owner's daemon lifetime ended before recovering from it.
+    /// # Errors
+    /// Rejects stale owners, incompatible indexes and concurrent changes; never scans history.
+    pub(crate) async fn harness_abandonment_point(
+        &self,
+        owner: &ExternalHarnessOwner,
+    ) -> SessionDbResult<Option<u64>> {
+        super::external_backend::external_index_ready(&**self.db).await?;
+        let before = last_sequence(&**self.db).await?;
+        state(&**self.db, owner).await?.ok_or_else(invalid)?;
+        let tail = canonical_harness_tail(&**self.db, owner.session_id, None)
+            .await?
+            .ok_or_else(invalid)?;
+        let tail_op = operation(&tail)?;
+        let released = latest(
+            &**self.db,
+            owner.session_id,
+            "transport_release",
+            &format!("generation:{}", owner.generation),
+        )
+        .await?;
+        let point = (tail_op.owner == *owner
+            && released.is_none()
+            && !matches!(
+                tail_op.record,
+                R::TransportReleased { .. } | R::RecoveryPrepared { .. }
+            ))
+        .then_some(tail.sequence);
+        if last_sequence(&**self.db).await? != before {
+            return Err(invalid());
+        }
+        Ok(point)
+    }
+
     pub(crate) async fn harness_binding_event(&self) -> SessionDbResult<Option<SessionEvent>> {
         super::external_backend::external_index_ready(&**self.db).await?;
         let Some(event) = latest(&**self.db, self.session_id, "binding", "current").await? else {
@@ -4441,6 +4489,19 @@ impl SessionDb {
         }
         Ok(Some(event))
     }
+    /// Read one bounded page of canonical normalized history.
+    ///
+    /// A page aggregates observations across consecutive canonical observation-page events, in
+    /// stored order, until `limit` observations, the response byte budget, the scanned-event
+    /// bound or the scanned-payload budget is reached. Events without observations are skipped
+    /// but still advance the cursor. The returned `h1:<event_seq>:<offset>` cursor resumes
+    /// exactly, including in the middle of an event; cursors from earlier single-event pages use
+    /// the same format and remain valid.
+    ///
+    /// `next_after` is always present. It differs from the request cursor whenever the page
+    /// scanned stored history, even when no observations were returned (for example a window of
+    /// only empty events). The reader has caught up with stored history only when a page returns
+    /// a `next_after` equal to the cursor it sent; zero observations alone is not end-of-history.
     pub(crate) async fn harness_history(
         &self,
         after: Option<String>,
@@ -4459,47 +4520,85 @@ impl SessionDb {
             .where_eq("evidence_kind", KIND)
             .where_gte("event_seq", seq_to_value(sequence))
             .sort("event_seq", SortDirection::Asc)
-            .limit(2)
+            .limit(HISTORY_PAGE_MAX_EVENTS + 1)
             .execute(&**self.db)
             .await?;
-        let unknown = HarnessExecutionStatus {
-            connectivity: HarnessConnectivity::Unknown,
-            activity: HarnessActivity::Unknown,
-            attention: HarnessAttention::Unknown,
-            continuation: HarnessContinuation::Unknown,
-            completeness: HarnessCompleteness::Unknown,
+        let mut page = HarnessObservationPage {
+            live: Vec::new(),
+            retention: None,
+            hydration_requests: Vec::new(),
+            inventory_page: None,
+            observations: Vec::new(),
+            next_after: Some(format!("h1:{sequence}:{offset}")),
+            completeness: HarnessCompleteness::Complete,
+            status: HarnessExecutionStatus {
+                connectivity: HarnessConnectivity::Unknown,
+                activity: HarnessActivity::Unknown,
+                attention: HarnessAttention::Unknown,
+                continuation: HarnessContinuation::Unknown,
+                completeness: HarnessCompleteness::Unknown,
+            },
         };
-        let Some(row) = rows.first() else {
-            return Ok(HarnessObservationPage {
-                live: Vec::new(),
-                retention: None,
-                hydration_requests: Vec::new(),
-                inventory_page: None,
-                observations: vec![],
-                next_after: Some(format!("h1:{sequence}:{offset}")),
-                completeness: HarnessCompleteness::Complete,
-                status: unknown,
-            });
-        };
-        let seq = required_non_negative_u64(row, "event_seq")?;
-        let lengths = self
-            .db
-            .select("events")
-            .project_as(
-                switchy::database::query::byte_length(switchy::database::query::identifier(
-                    "payload",
-                )),
-                "bytes",
-            )
-            .where_eq("event_seq", seq_to_value(seq))
-            .limit(1)
-            .execute(&**self.db)
-            .await?;
-        if required_non_negative_u64(lengths.first().ok_or_else(invalid)?, "bytes")?
-            > (MAX_HARNESS_WIRE_BYTES * 6 + 4096) as u64
-        {
-            return Err(invalid());
+        let limit = usize::from(limit);
+        let mut seen = std::collections::BTreeSet::new();
+        let mut wire_bytes = 0_usize;
+        let mut scanned_bytes = 0_u64;
+        let mut more = false;
+        for (index, row) in rows.iter().enumerate() {
+            if index >= HISTORY_PAGE_MAX_EVENTS || page.observations.len() >= limit {
+                more = true;
+                break;
+            }
+            let seq = required_non_negative_u64(row, "event_seq")?;
+            let payload_bytes = self.harness_history_payload_bytes(seq).await?;
+            if payload_bytes > HISTORY_EVENT_MAX_PAYLOAD_BYTES {
+                return Err(invalid());
+            }
+            // The first event is always read so every page makes progress.
+            if index > 0 && scanned_bytes + payload_bytes > HISTORY_PAGE_MAX_SCANNED_BYTES {
+                more = true;
+                break;
+            }
+            scanned_bytes += payload_bytes;
+            let stored = self.harness_history_event(seq).await?;
+            let start = if seq == sequence { offset } else { 0 };
+            if start > stored.observations.len() {
+                return Err(invalid());
+            }
+            page.status = stored.status.clone();
+            page.completeness = stored.completeness;
+            let mut end = start;
+            while end < stored.observations.len() && page.observations.len() < limit {
+                let observation = &stored.observations[end];
+                let bytes = serde_json::to_vec(observation)
+                    .map_err(|_| invalid())?
+                    .len()
+                    + 1;
+                // At least one observation is always returned so every page makes progress.
+                if !page.observations.is_empty()
+                    && (wire_bytes + bytes > HISTORY_PAGE_MAX_OBSERVATION_BYTES
+                        || seen.contains(&observation.observation_id))
+                {
+                    break;
+                }
+                seen.insert(observation.observation_id.clone());
+                wire_bytes += bytes;
+                page.observations.push(observation.clone());
+                end += 1;
+            }
+            if end < stored.observations.len() {
+                page.next_after = Some(format!("h1:{seq}:{end}"));
+                more = true;
+                break;
+            }
+            page.next_after = Some(format!("h1:{}:0", seq.checked_add(1).ok_or_else(invalid)?));
         }
+        if more {
+            page.completeness = HarnessCompleteness::Partial;
+        }
+        Ok(page.clone())
+    }
+    async fn harness_history_event(&self, seq: u64) -> SessionDbResult<HarnessObservationPage> {
         let events = self
             .db
             .select("events")
@@ -4514,31 +4613,23 @@ impl SessionDb {
         else {
             return Err(invalid());
         };
-        let start = if seq == sequence { offset } else { 0 };
-        if start > page.observations.len() {
-            return Err(invalid());
-        }
-        let end = (start + usize::from(limit)).min(page.observations.len());
-        let observations = page.observations[start..end].to_vec();
-        let next_after = Some(if end < page.observations.len() {
-            format!("h1:{seq}:{end}")
-        } else {
-            format!("h1:{}:0", seq.checked_add(1).ok_or_else(invalid)?)
-        });
-        Ok(HarnessObservationPage {
-            live: Vec::new(),
-            retention: None,
-            hydration_requests: Vec::new(),
-            inventory_page: None,
-            observations,
-            next_after,
-            completeness: if end < page.observations.len() || rows.len() > 1 {
-                HarnessCompleteness::Partial
-            } else {
-                page.completeness
-            },
-            status: page.status.clone(),
-        })
+        Ok(page.clone())
+    }
+    async fn harness_history_payload_bytes(&self, seq: u64) -> SessionDbResult<u64> {
+        let lengths = self
+            .db
+            .select("events")
+            .project_as(
+                switchy::database::query::byte_length(switchy::database::query::identifier(
+                    "payload",
+                )),
+                "bytes",
+            )
+            .where_eq("event_seq", seq_to_value(seq))
+            .limit(1)
+            .execute(&**self.db)
+            .await?;
+        required_non_negative_u64(lengths.first().ok_or_else(invalid)?, "bytes")
     }
     pub(crate) async fn harness_state(
         &self,
@@ -4788,6 +4879,15 @@ async fn validate_page(
     validate_page_observations(db, op, current, page).await?;
     Ok(())
 }
+
+/// Maximum canonical events scanned for one history page; empty events count toward it.
+const HISTORY_PAGE_MAX_EVENTS: usize = MAX_HARNESS_OBSERVATIONS;
+/// Maximum stored payload of one canonical observation-page event read by history.
+const HISTORY_EVENT_MAX_PAYLOAD_BYTES: u64 = (MAX_HARNESS_WIRE_BYTES * 6 + 4096) as u64;
+/// Total stored payload read for one history page after its first event.
+const HISTORY_PAGE_MAX_SCANNED_BYTES: u64 = (MAX_HARNESS_WIRE_BYTES * 8) as u64;
+/// Serialized observation budget leaving room for the page envelope within the wire bound.
+const HISTORY_PAGE_MAX_OBSERVATION_BYTES: usize = MAX_HARNESS_WIRE_BYTES - 64 * 1024;
 
 fn history_position(after: Option<String>) -> SessionDbResult<(u64, usize)> {
     Ok(if let Some(cursor) = after {
@@ -5563,6 +5663,7 @@ mod migration_key_tests {
             previous_owner: owner,
             release_event_sequence: 7,
             release,
+            abandoned: false,
             capabilities: recovery_test_capabilities(),
             resume_request: ExternalHarnessRequest::from_request(
                 &bcode_harness_models::HarnessRequest {

@@ -93,6 +93,10 @@ pub enum HarnessCommand {
         request: PathBuf,
     },
     /// Read bounded canonical history even when the plugin is disabled/offline.
+    ///
+    /// Each page holds up to `--limit` observations across stored events. Pass the returned
+    /// `next_after` as `--after` to continue; an empty page may still advance the cursor, and
+    /// history is caught up only when the returned `next_after` equals `--after`.
     History {
         session_id: bcode_session_models::SessionId,
         #[arg(long)]

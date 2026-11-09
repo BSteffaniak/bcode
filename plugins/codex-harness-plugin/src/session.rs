@@ -33,6 +33,9 @@ enum InventoryState {
 }
 
 /// One admitted native thread owner. Create only after host permission and ownership checks.
+// Each flag is an independent native fact (uncertainty, gap, construction permit, resumed
+// idle); folding them into a state machine would conflate distinct evidence.
+#[allow(clippy::struct_excessive_bools)]
 pub struct CodexSession {
     server: AppServer,
     binding: HarnessSessionBinding,
@@ -47,7 +50,6 @@ pub struct CodexSession {
     observation_gap: bool,
     status: HarnessExecutionStatus,
     assistance_grant: Option<HarnessAssistanceGrant>,
-    pending_terminal: Option<HarnessObservation>,
     pending_acceptance: Option<HarnessObservation>,
     last_terminal_turn: Option<String>,
     fresh_first_input: bool,
@@ -61,6 +63,15 @@ pub struct CodexSession {
     inventory_page: Option<bcode_harness_models::HarnessInventoryPage>,
     resolved_native: BTreeSet<bcode_harness_models::HarnessNativeReference>,
     inventory_response: Option<Value>,
+    display: crate::display::Display,
+    /// Normalized observations beyond the current page limit, delivered first next page.
+    overflow: VecDeque<HarnessObservation>,
+    /// The thread was resumed idle; the first later `NextTurn` needs no observed completion.
+    resumed_idle: bool,
+    /// Native model reported for this thread (start/resume response or accepted setting).
+    model: Option<String>,
+    /// Native sandbox policy reported at open, restored when leaving accept-edits mode.
+    base_sandbox: Value,
 }
 
 const fn unknown_status() -> HarnessExecutionStatus {
@@ -111,7 +122,31 @@ impl CodexSession {
         key: Option<&str>,
         assistance_grant: Option<&HarnessAssistanceGrant>,
     ) -> Result<Self, CodexError> {
-        Self::open_configured(launch, binding, resume, key, assistance_grant, false)
+        Self::open_configured(launch, binding, resume, key, assistance_grant, false, None)
+    }
+
+    /// Open with an explicit native model selection passed to `thread/start` or
+    /// `thread/resume`. The native response reports the effective model ([`Self::model`]).
+    ///
+    /// # Errors
+    /// Same as [`Self::open_admitted`]; an invalid model identity is rejected before launch.
+    pub fn open_with_model(
+        launch: &Launch,
+        binding: HarnessSessionBinding,
+        resume: bool,
+        key: Option<&str>,
+        assistance_grant: Option<&HarnessAssistanceGrant>,
+        model: Option<&str>,
+    ) -> Result<Self, CodexError> {
+        if model.is_some_and(|model| {
+            model.is_empty()
+                || model.len() > MAX_HARNESS_ID_BYTES
+                || model.trim() != model
+                || model.chars().any(char::is_control)
+        }) {
+            return Err(CodexError::Bounds);
+        }
+        Self::open_configured(launch, binding, resume, key, assistance_grant, false, model)
     }
 
     /// Open a fresh, ephemeral ChatGPT-subscription thread with restricted native execution.
@@ -132,7 +167,7 @@ impl CodexSession {
         if launch.ephemeral_credentials {
             return Err(CodexError::Configuration);
         }
-        Self::open_configured(launch, binding, false, None, None, true)
+        Self::open_configured(launch, binding, false, None, None, true, None)
     }
 
     fn open_configured(
@@ -142,6 +177,7 @@ impl CodexSession {
         key: Option<&str>,
         assistance_grant: Option<&HarnessAssistanceGrant>,
         ephemeral: bool,
+        model: Option<&str>,
     ) -> Result<Self, CodexError> {
         if let Some(grant) = assistance_grant {
             grant.validate().map_err(|_| CodexError::Stale)?;
@@ -158,28 +194,51 @@ impl CodexSession {
         }
         let mut server = AppServer::spawn(launch)?;
         let observed_version = server.initialize(launch)?;
-        if resume && binding.native_version != observed_version {
-            return Err(CodexError::Unsupported);
+        if resume {
+            // The installed CLI may have been upgraded since the thread was bound. Native
+            // `thread/resume` reads the persisted thread from `CODEX_HOME` by exact id, so the
+            // probed version need not match. The resumed binding keeps its recorded version as
+            // evidence, so the opened binding equals the host's exact resume binding and no
+            // conflicting binding confirmation is ever emitted.
+            if !crate::recovery::resumable_version(&binding.native_version, None) {
+                return Err(CodexError::Unsupported);
+            }
+        } else {
+            binding.native_version = observed_version;
         }
-        binding.native_version = observed_version;
         Self::verify_delegation_disabled(&mut server, launch)?;
         Self::deliver_vault_key(&mut server, launch, key)?;
         // New thread has no live writer besides our private stdio. Remote control is a
         // separate native input route, so positively disable/verify it before creation.
         server.require_local_only()?;
         let result = if resume {
-            server.call(
-                "thread/resume",
-                json!({"threadId":binding.native_session_id,"excludeTurns":true}),
-            )?
+            let mut params = json!({"threadId":binding.native_session_id,"excludeTurns":true,
+                "cwd":launch.working_directory});
+            if let Some(model) = model {
+                params["model"] = json!(model);
+            }
+            server.call("thread/resume", params)?
         } else if ephemeral {
             Self::start_ephemeral(&mut server, launch)?
         } else {
-            server.call("thread/start", json!({"cwd":launch.working_directory,"approvalPolicy":"untrusted","daybreakEnabled":false,
+            let mut params = json!({"cwd":launch.working_directory,"approvalPolicy":"untrusted","daybreakEnabled":false,
                 "dynamicTools":if assistance_grant.is_some() { json!([{"type":"function","name":"bcode_parent_assistance",
                     "description":"Ask the owning Bcode session for assistance; not a tool execution permission",
-                    "inputSchema":{"type":"object","properties":{"question":{"type":"string"}},"required":["question"],"additionalProperties":false}}]) } else { json!([]) }}))?
+                    "inputSchema":{"type":"object","properties":{"question":{"type":"string"}},"required":["question"],"additionalProperties":false}}]) } else { json!([]) }});
+            if let Some(model) = model {
+                params["model"] = json!(model);
+            }
+            server.call("thread/start", params)?
         };
+        // A resumed thread admits its first new turn only when native reports it idle.
+        let resumed_idle = resume && result["thread"]["status"]["type"].as_str() == Some("idle");
+        let native_model = result["model"]
+            .as_str()
+            .filter(|model| !model.is_empty() && model.len() <= MAX_HARNESS_ID_BYTES)
+            .map(str::to_owned);
+        let mut display = crate::display::Display::default();
+        display.set_model(native_model.as_deref());
+        let base_sandbox = result["sandbox"].clone();
         if !resume
             && (result["thread"]["status"]["type"].as_str() != Some("idle")
                 || (!ephemeral && result["thread"]["daybreakEnabled"].as_bool() != Some(false))
@@ -205,7 +264,6 @@ impl CodexSession {
             observation_gap: false,
             status: unknown_status(),
             assistance_grant: assistance_grant.cloned(),
-            pending_terminal: None,
             pending_acceptance: None,
             last_terminal_turn: None,
             fresh_first_input: !resume,
@@ -219,6 +277,11 @@ impl CodexSession {
             inventory_page: None,
             resolved_native: BTreeSet::new(),
             inventory_response: None,
+            display,
+            overflow: VecDeque::new(),
+            resumed_idle,
+            model: native_model,
+            base_sandbox,
         })
     }
 
@@ -395,7 +458,10 @@ impl CodexSession {
             && !self.fresh_first_input
             && !self.uncertain_submission
             && !self.observation_gap
+            && !self.next_turn_admissible()
         {
+            // The previous native turn is still running, awaiting a callback, or its
+            // completion has not been observed yet. Steering names the expected turn instead.
             return Err(CodexError::Unsupported);
         }
         if self.pending_acceptance.is_some() {
@@ -427,7 +493,17 @@ impl CodexSession {
                     json!({"threadId":self.binding.native_session_id,"input":input}),
                 )
             }
-            HarnessPlacement::NextTurn => return Err(CodexError::Unsupported),
+            HarnessPlacement::NextTurn => {
+                // Foreground admission, not settlement: the previous accepted turn's native
+                // completion was observed (or the thread was resumed idle), no callback is
+                // pending and no acceptance is undelivered. Background work keeps its own
+                // retained evidence and still fences strict completion boundaries.
+                self.resumed_idle = false;
+                (
+                    "turn/start",
+                    json!({"threadId":self.binding.native_session_id,"input":input}),
+                )
+            }
             HarnessPlacement::Steer {
                 expected_native_turn_id,
             } => {
@@ -448,6 +524,15 @@ impl CodexSession {
         let receipt = self.record_submission_ack(submission, method, request_id, &result)?;
         self.last_submission = Some((submission.clone(), receipt.clone()));
         Ok(receipt)
+    }
+
+    /// Whether a later `NextTurn` may start: the previous native turn's completion was
+    /// observed (or the thread was resumed idle), and nothing is active or pending.
+    fn next_turn_admissible(&self) -> bool {
+        self.active_turn.is_none()
+            && self.pending_acceptance.is_none()
+            && self.callbacks.is_empty()
+            && (self.last_terminal_turn.is_some() || self.resumed_idle)
     }
 
     fn record_submission_ack(
@@ -554,6 +639,95 @@ impl CodexSession {
         result.map(|_| ())
     }
 
+    /// Native model reported for this thread, if known.
+    #[must_use]
+    pub fn model(&self) -> Option<&str> {
+        self.model.as_deref()
+    }
+
+    /// Apply a native setting for subsequent turns through `thread/settings/update`.
+    ///
+    /// Model changes pass the native model key unchanged. Permission modes map to native
+    /// approval/sandbox/collaboration settings: `Default` restores the opening approval
+    /// policy (`untrusted`) and sandbox, `AcceptEdits` selects `on-request` approval with a
+    /// workspace-write sandbox, and `Plan` selects native plan collaboration mode.
+    /// Acknowledgment is not proof of native effect; an uncertain call is never replayed.
+    ///
+    /// # Errors
+    /// Rejects stale or uncertain transport, plan mode without a known native model, and
+    /// native rejection (for example an unknown model key).
+    pub fn configure(
+        &mut self,
+        setting: &bcode_harness_models::HarnessSessionSetting,
+    ) -> Result<(), CodexError> {
+        use bcode_harness_models::{HarnessPermissionMode, HarnessSessionSetting};
+        let (gap, closed) = self.server.health()?;
+        if self.observation_gap || self.uncertain_submission || gap || closed {
+            return Err(CodexError::Uncertain);
+        }
+        let thread = self.binding.native_session_id.clone();
+        let collaboration = |mode: &str, model: Option<&str>| {
+            model.map(|model| {
+                json!({"mode":mode,"settings":{"model":model,"reasoning_effort":null,
+                    "developer_instructions":null}})
+            })
+        };
+        let mut params = json!({"threadId": thread});
+        match setting {
+            HarnessSessionSetting::Model { model_id } => {
+                params["model"] = json!(model_id);
+            }
+            HarnessSessionSetting::PermissionMode { mode } => {
+                let model = self.model.as_deref();
+                match mode {
+                    HarnessPermissionMode::Default | HarnessPermissionMode::Plan => {
+                        params["approvalPolicy"] = json!("untrusted");
+                        if self.base_sandbox.is_object() {
+                            params["sandboxPolicy"] = self.base_sandbox.clone();
+                        }
+                        let kind = if *mode == HarnessPermissionMode::Plan {
+                            "plan"
+                        } else {
+                            "default"
+                        };
+                        match collaboration(kind, model) {
+                            Some(value) => params["collaborationMode"] = value,
+                            None if *mode == HarnessPermissionMode::Plan => {
+                                return Err(CodexError::Unsupported);
+                            }
+                            None => {}
+                        }
+                    }
+                    HarnessPermissionMode::AcceptEdits => {
+                        params["approvalPolicy"] = json!("on-request");
+                        params["sandboxPolicy"] = json!({"type":"workspaceWrite",
+                            "writableRoots":[],"networkAccess":false,
+                            "excludeTmpdirEnvVar":false,"excludeSlashTmp":false});
+                        if let Some(value) = collaboration("default", model) {
+                            params["collaborationMode"] = value;
+                        }
+                    }
+                }
+            }
+        }
+        match self.server.call("thread/settings/update", params) {
+            Ok(_) => {
+                if let HarnessSessionSetting::Model { model_id } = setting {
+                    self.model = Some(model_id.clone());
+                    self.display.set_model(Some(model_id));
+                }
+                Ok(())
+            }
+            Err(CodexError::Rejected) => Err(CodexError::Rejected),
+            Err(error) => {
+                // Unknown native effect: fence later mutations rather than guess.
+                self.observation_gap = true;
+                self.server.fence();
+                Err(error)
+            }
+        }
+    }
+
     /// Interrupt only the currently observed native turn; never guess a turn after reconnection.
     ///
     /// # Errors
@@ -609,16 +783,15 @@ impl CodexSession {
             return Ok((vec![acceptance], HarnessCompleteness::Partial));
         }
         if self.execution_observation_gap()? {
+            self.overflow.clear();
             return Ok((Vec::new(), HarnessCompleteness::Gap));
         }
-        if self.pending_terminal.is_some() {
-            let (gap, closed) = self.server.health()?;
-            if gap || closed {
-                self.pending_terminal = None;
-                self.observation_gap = true;
-            } else if let Some(terminal) = self.pending_terminal.take() {
-                return Ok((vec![terminal], HarnessCompleteness::Partial));
-            }
+        if !self.overflow.is_empty() {
+            let count = self.overflow.len().min(limit);
+            return Ok((
+                self.overflow.drain(..count).collect(),
+                HarnessCompleteness::Partial,
+            ));
         }
         if let Some(observation) = self.pending_execution.pop_front() {
             return Ok((vec![observation], HarnessCompleteness::Partial));
@@ -636,30 +809,77 @@ impl CodexSession {
         self.observe_native_events(limit)
     }
 
+    /// Whether the next observe has something to deliver without waiting for native output.
+    /// Transport readiness is checked separately so a waiting caller can sleep on its wake.
+    #[must_use]
+    pub(crate) fn locally_ready(&self) -> bool {
+        self.pending_acceptance.is_some()
+            || !self.overflow.is_empty()
+            || !self.pending_execution.is_empty()
+            || !self.waiting_native.is_empty()
+            || self.observation_gap
+            || self.display.live_near_capacity()
+    }
+
+    /// Whether only transient live text is waiting.
+    #[must_use]
+    pub fn live_pending(&self) -> bool {
+        self.display.live_pending()
+    }
+
+    /// Take transient live updates for the page being built. Never retained.
+    pub fn take_live(&mut self) -> Vec<bcode_harness_models::HarnessLiveUpdate> {
+        self.display.take_live()
+    }
+
+    /// Transport-level wake handle for bounded observe waits.
+    pub(crate) fn transport_wake(&self) -> crate::transport::Wake {
+        self.server.wake()
+    }
+
+    /// Whether queued native input is ready for an observer.
+    pub(crate) fn transport_readiness(&self) -> crate::transport::Readiness {
+        self.server.readiness()
+    }
+
+    /// Flag set once the native process has been physically reaped after transport release.
+    pub(crate) fn reap_flag(&self) -> std::sync::Arc<std::sync::atomic::AtomicBool> {
+        self.server.reap_flag()
+    }
+
     fn observe_native_events(
         &mut self,
         limit: usize,
     ) -> Result<(Vec<HarnessObservation>, HarnessCompleteness), CodexError> {
-        let (events, gap, closed) = if let Some(event) = self.waiting_native.pop_front() {
-            (vec![event], false, false)
-        } else {
-            self.server.events(if self.retention.enabled() {
-                1
-            } else {
-                (limit / 2).max(1)
-            })?
-        };
-        if gap || closed {
-            self.observation_gap = true;
-            self.callbacks.clear();
-            self.status.connectivity = HarnessConnectivity::Disconnected;
-            self.status.completeness = HarnessCompleteness::Gap;
-            return Ok((Vec::new(), HarnessCompleteness::Gap));
-        }
         let mut observations = Vec::new();
-        for event in events {
+        // Bound native work per page: deltas yield no observations but still cost a read.
+        for _ in 0..256 {
+            if observations.len() >= limit || self.display.live_near_capacity() {
+                break;
+            }
+            let event = if let Some(event) = self.waiting_native.pop_front() {
+                event
+            } else {
+                let (mut events, gap, closed) = self.server.events(1)?;
+                if gap || closed {
+                    if !observations.is_empty() {
+                        // Deliver what was normalized; the next page reports the gap.
+                        break;
+                    }
+                    self.observation_gap = true;
+                    self.callbacks.clear();
+                    self.display.clear();
+                    self.status.connectivity = HarnessConnectivity::Disconnected;
+                    self.status.completeness = HarnessCompleteness::Gap;
+                    return Ok((Vec::new(), HarnessCompleteness::Gap));
+                }
+                let Some(event) = events.pop() else {
+                    break;
+                };
+                event
+            };
             if !self.native_hydration_ready(&event)? {
-                self.waiting_native.push_back(event);
+                self.waiting_native.push_front(event);
                 break;
             }
             let terminal_turn = if !self.observation_gap
@@ -676,8 +896,7 @@ impl CodexSession {
                 None
             };
             match self.normalize(&event) {
-                Ok(Some(observation)) => observations.push(observation),
-                Ok(None) => {}
+                Ok(normalized) => observations.extend(normalized),
                 Err(error) => {
                     self.observation_gap = true;
                     self.callbacks.clear();
@@ -687,16 +906,14 @@ impl CodexSession {
                 }
             }
             if let Some(turn_id) = terminal_turn {
-                let terminal = self.terminal_observation(&event, turn_id)?;
-                if observations.len() < limit {
-                    observations.push(terminal);
-                } else {
-                    self.pending_terminal = Some(terminal);
-                }
+                observations.push(self.terminal_observation(&event, turn_id)?);
                 // Native task completion records live background-terminal counts;
                 // it does not close those processes. Neither completed, interrupted
                 // nor failed proves quiescence. Do not synthesize Settlement here.
             }
+        }
+        if observations.len() > limit {
+            self.overflow.extend(observations.split_off(limit));
         }
         if observations.is_empty()
             && !self.observation_gap
@@ -704,10 +921,8 @@ impl CodexSession {
         {
             observations.push(observation);
         }
-        let completeness = if gap || self.observation_gap {
+        let completeness = if self.observation_gap {
             HarnessCompleteness::Gap
-        } else if closed {
-            HarnessCompleteness::Unknown
         } else {
             HarnessCompleteness::Partial
         };
@@ -776,6 +991,14 @@ impl CodexSession {
                     self.resolved_native.insert(reply.reference);
                 }
                 Resolution::Absent => {
+                    self.resolved_native.insert(reply.reference);
+                }
+                // The canonical store never resolves single native items; retrying would
+                // wait forever. An unresolvable item is treated as new native work.
+                Resolution::Unavailable
+                    if reply.reference.kind
+                        == bcode_harness_models::HarnessNativeReferenceKind::Item =>
+                {
                     self.resolved_native.insert(reply.reference);
                 }
                 Resolution::Unavailable => {
@@ -853,10 +1076,13 @@ impl CodexSession {
                     }
                 }
             }
+            // Work items of a turn this connection accepted are new native work, never
+            // earlier canonical history; only items of untracked turns need a lookup.
             if matches!(
                 item["type"].as_str(),
                 Some("commandExecution" | "mcpToolCall" | "dynamicToolCall")
-            ) {
+            ) && !turn.is_some_and(|id| self.execution.tracks_turn(id))
+            {
                 if let Some(id) = item["processId"].as_str() {
                     if !self.execution.has_native_work(id) {
                         references.push(Reference {
@@ -1073,7 +1299,7 @@ impl CodexSession {
         self.status.clone()
     }
 
-    fn normalize(&mut self, event: &Value) -> Result<Option<HarnessObservation>, CodexError> {
+    fn normalize(&mut self, event: &Value) -> Result<Vec<HarnessObservation>, CodexError> {
         let method = event["method"].as_str().ok_or(CodexError::Protocol)?;
         let params = &event["params"];
         // Cross-thread notifications cannot attach evidence or approval authority to this owner.
@@ -1081,18 +1307,102 @@ impl CodexSession {
             && params["threadId"].as_str() != Some(self.binding.native_session_id.as_str())
         {
             self.server.send(json!({"id":event["id"],"error":{"code":-32600,"message":"Callback does not match owned thread"}}))?;
-            return Ok(None);
+            return Ok(Vec::new());
         }
         if params
             .get("threadId")
             .and_then(Value::as_str)
             .is_some_and(|id| id != self.binding.native_session_id)
         {
-            return Ok(None);
+            return Ok(Vec::new());
         }
+        if self.absorb_transient(event, method, params)? {
+            return Ok(Vec::new());
+        }
+        if matches!(method, "turn/started" | "turn/completed")
+            && params["threadId"].as_str() != Some(self.binding.native_session_id.as_str())
+        {
+            return Ok(Vec::new());
+        }
+        self.retain_execution_event(event)?;
+        self.retain_file_change_diff(method, params)?;
+        if method == "thread/started" {
+            if params["thread"]["id"].as_str() != Some(self.binding.native_session_id.as_str()) {
+                return Ok(Vec::new());
+            }
+            self.status.connectivity = HarnessConnectivity::Connected;
+        }
+        if !self.update_native_turn(method, params)? {
+            return Ok(Vec::new());
+        }
+        if !params["threadId"].is_string() && method != "thread/started" {
+            return Ok(Vec::new());
+        }
+        let kinds = if let Some(native_id) = event.get("id") {
+            self.sequence = self.sequence.checked_add(1).ok_or(CodexError::Bounds)?;
+            let observation_id = format!(
+                "codex:{}:{}:{}",
+                self.binding.generation, self.observation_epoch, self.sequence
+            );
+            self.normalize_callback(method, params, native_id, &observation_id)?
+                .map(|kind| vec![(observation_id, kind)])
+                .unwrap_or_default()
+        } else {
+            let mut kinds = Vec::new();
+            for kind in self.normalize_notification(method, params)? {
+                self.sequence = self.sequence.checked_add(1).ok_or(CodexError::Bounds)?;
+                kinds.push((
+                    format!(
+                        "codex:{}:{}:{}",
+                        self.binding.generation, self.observation_epoch, self.sequence
+                    ),
+                    kind,
+                ));
+            }
+            kinds
+        };
+        let native_correlations = native_correlations(params);
+        let mut observations = Vec::new();
+        for (observation_id, kind) in kinds {
+            let completeness = if matches!(
+                kind,
+                HarnessObservationKind::Result { .. }
+                    | HarnessObservationKind::Text { .. }
+                    | HarnessObservationKind::Reasoning { .. }
+                    | HarnessObservationKind::Tool { .. }
+                    | HarnessObservationKind::ToolResult { .. }
+                    | HarnessObservationKind::Usage { .. }
+            ) {
+                HarnessCompleteness::Complete
+            } else {
+                HarnessCompleteness::Partial
+            };
+            let observation = HarnessObservation {
+                observation_id,
+                session_id: self.binding.session_id.clone(),
+                generation: self.binding.generation,
+                native_correlations: native_correlations.clone(),
+                kind,
+                completeness,
+            };
+            observation.validate().map_err(|_| CodexError::Bounds)?;
+            observations.push(observation);
+        }
+        Ok(observations)
+    }
+
+    /// Absorb notifications that only change transient state: callback resolution, streaming
+    /// deltas and usage counters. Returns true when the event yields no observation.
+    fn absorb_transient(
+        &mut self,
+        event: &Value,
+        method: &str,
+        params: &Value,
+    ) -> Result<bool, CodexError> {
+        let owned = params["threadId"].as_str() == Some(self.binding.native_session_id.as_str());
         if method == "serverRequest/resolved" {
-            if params["threadId"].as_str() != Some(self.binding.native_session_id.as_str()) {
-                return Ok(None);
+            if !owned {
+                return Ok(true);
             }
             let native_id = params.get("requestId").ok_or(CodexError::Protocol)?;
             if !native_id.is_string() && !native_id.is_i64() {
@@ -1103,74 +1413,27 @@ impl CodexSession {
             if self.callbacks.is_empty() {
                 self.status.attention = HarnessAttention::None;
             }
-            return Ok(None);
+            return Ok(true);
         }
-        if matches!(method, "turn/started" | "turn/completed")
-            && params["threadId"].as_str() != Some(self.binding.native_session_id.as_str())
-        {
-            return Ok(None);
+        if event.get("id").is_some() {
+            return Ok(false);
         }
-        self.retain_execution_event(event)?;
-        self.retain_file_change_diff(method, params)?;
-        if method == "thread/started" {
-            if params["thread"]["id"].as_str() != Some(self.binding.native_session_id.as_str()) {
-                return Ok(None);
+        // Streaming deltas and usage counters are transient display state, not evidence.
+        match method {
+            "item/agentMessage/delta" | "item/reasoning/summaryTextDelta" => {
+                if owned {
+                    self.display.delta(method, params);
+                }
+                Ok(true)
             }
-            self.status.connectivity = HarnessConnectivity::Connected;
+            "thread/tokenUsage/updated" => {
+                if owned {
+                    self.display.token_usage(params);
+                }
+                Ok(true)
+            }
+            _ => Ok(false),
         }
-        if !self.update_native_turn(method, params)? {
-            return Ok(None);
-        }
-        if !params["threadId"].is_string() && method != "thread/started" {
-            return Ok(None);
-        }
-        self.sequence = self.sequence.checked_add(1).ok_or(CodexError::Bounds)?;
-        let observation_id = format!(
-            "codex:{}:{}:{}",
-            self.binding.generation, self.observation_epoch, self.sequence
-        );
-        let kind = if let Some(native_id) = event.get("id") {
-            let Some(kind) = self.normalize_callback(method, params, native_id, &observation_id)?
-            else {
-                return Ok(None);
-            };
-            kind
-        } else {
-            let Some(kind) = self.normalize_notification(method, params)? else {
-                return Ok(None);
-            };
-            kind
-        };
-        let mut native_correlations = Vec::new();
-        for value in [
-            params["turnId"]
-                .as_str()
-                .or_else(|| params["turn"]["id"].as_str()),
-            params["itemId"]
-                .as_str()
-                .or_else(|| params["item"]["id"].as_str()),
-            params["callId"].as_str(),
-        ]
-        .into_iter()
-        .flatten()
-        {
-            native_correlations.push(value.to_owned());
-        }
-        let completeness = if matches!(kind, HarnessObservationKind::Result { .. }) {
-            HarnessCompleteness::Complete
-        } else {
-            HarnessCompleteness::Partial
-        };
-        let observation = HarnessObservation {
-            observation_id,
-            session_id: self.binding.session_id.clone(),
-            generation: self.binding.generation,
-            native_correlations,
-            kind,
-            completeness,
-        };
-        observation.validate().map_err(|_| CodexError::Bounds)?;
-        Ok(Some(observation))
     }
 
     // False skips stale turn evidence; errors retain the same pre-normalization fence.
@@ -1375,6 +1638,90 @@ impl CodexSession {
         Ok(Some((kind, prompt)))
     }
 
+    /// Readable approval scope; the exact native operation (command or retained diff) is the
+    /// bounded input preview, and file approval still requires that retained diff.
+    fn interaction_scope(
+        &self,
+        method: &str,
+        params: &Value,
+        kind: HarnessInteractionKind,
+    ) -> Result<String, CodexError> {
+        Ok(if method == "item/fileChange/requestApproval" {
+            let changes = self
+                .file_changes
+                .get(params["itemId"].as_str().ok_or(CodexError::Protocol)?)
+                .ok_or(CodexError::Unsupported)?;
+            let paths = serde_json::from_str::<Value>(changes)
+                .ok()
+                .and_then(|changes| {
+                    changes.as_array().map(|changes| {
+                        changes
+                            .iter()
+                            .filter_map(|change| change["path"].as_str())
+                            .take(16)
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    })
+                })
+                .unwrap_or_default();
+            crate::display::truncate_display(
+                &format!("Apply file changes: {paths}"),
+                bcode_harness_models::MAX_HARNESS_PREVIEW_BYTES,
+            )
+            .0
+        } else if kind == HarnessInteractionKind::Approval {
+            params["reason"]
+                .as_str()
+                .filter(|reason| !reason.trim().is_empty())
+                .map_or_else(
+                    || "Run a shell command".to_owned(),
+                    |reason| {
+                        crate::display::truncate_display(
+                            reason,
+                            bcode_harness_models::MAX_HARNESS_PREVIEW_BYTES,
+                        )
+                        .0
+                    },
+                )
+        } else {
+            "Native Codex callback; no Bcode tool dispatch".to_owned()
+        })
+    }
+
+    /// Native tool name and bounded preview for an approval callback.
+    fn approval_details(
+        &self,
+        method: &str,
+        params: &Value,
+        kind: HarnessInteractionKind,
+    ) -> (Option<String>, Option<String>) {
+        if kind == HarnessInteractionKind::Approval {
+            let diff = params["itemId"]
+                .as_str()
+                .and_then(|id| self.file_changes.get(id))
+                .and_then(|changes| serde_json::from_str::<Value>(changes).ok())
+                .map(|changes| {
+                    changes
+                        .as_array()
+                        .into_iter()
+                        .flatten()
+                        .map(|change| {
+                            format!(
+                                "{}\n{}",
+                                change["path"].as_str().unwrap_or("(unknown path)"),
+                                change["diff"].as_str().unwrap_or("")
+                            )
+                        })
+                        .collect::<Vec<_>>()
+                        .join("\n")
+                });
+            let (name, preview) = crate::display::approval_display(method, params, diff.as_deref());
+            (Some(name), preview)
+        } else {
+            (None, None)
+        }
+    }
+
     fn callback_interaction(
         &self,
         method: &str,
@@ -1401,9 +1748,10 @@ impl CodexSession {
                 .collect::<Vec<_>>()
                 .join("\n")
         });
+        let (tool_name, input_preview) = self.approval_details(method, params, kind);
         let interaction = HarnessInteraction {
-            input_preview: None,
-            tool_name: None,
+            input_preview,
+            tool_name,
             request_id: request_id.to_owned(),
             session_id: self.binding.session_id.clone(),
             generation: self.binding.generation,
@@ -1416,19 +1764,7 @@ impl CodexSession {
             } else {
                 question_text.unwrap_or_else(|| prompt.to_owned())
             },
-            scope: if method == "item/fileChange/requestApproval" {
-                self.file_changes
-                    .get(params["itemId"].as_str().ok_or(CodexError::Protocol)?)
-                    .cloned()
-                    .ok_or(CodexError::Unsupported)?
-            } else if kind == HarnessInteractionKind::Approval {
-                // Include native operation identity/diff rather than grant blind approval.
-                serde_json::to_string(&json!({"command":params["command"],"cwd":params["cwd"],
-                        "reason":params["reason"],"changes":params["changes"],"itemId":params["itemId"]}))
-                        .map_err(|_| CodexError::Protocol)?
-            } else {
-                "Native Codex callback; no Bcode tool dispatch".to_owned()
-            },
+            scope: self.interaction_scope(method, params, kind)?,
             choices: if question_ids.len() == 1 {
                 params["questions"][0]["options"]
                     .as_array()
@@ -1454,20 +1790,9 @@ impl CodexSession {
     }
 
     fn completed_agent_message(
-        &self,
+        &mut self,
         params: &Value,
-    ) -> Result<Option<HarnessObservationKind>, CodexError> {
-        let turn_id = params["turnId"].as_str();
-        if self.observation_gap
-            || self.uncertain_submission
-            || self.active_turn.is_none()
-            || turn_id != self.active_turn.as_deref()
-            || turn_id != self.accepted_turn.as_deref()
-        {
-            // A completed item cannot adopt an unaccepted turn or revive a terminal
-            // turn. Wrong/missing correlation never supplies workflow output.
-            return Ok(None);
-        }
+    ) -> Result<Vec<HarnessObservationKind>, CodexError> {
         let item = &params["item"];
         let item_id = item["id"].as_str().ok_or(CodexError::Protocol)?;
         if item_id.is_empty()
@@ -1482,52 +1807,36 @@ impl CodexSession {
             // Never truncate an authoritative result into a different answer.
             return Err(CodexError::Bounds);
         }
-        if item["phase"].as_str() == Some("final_answer") {
-            Ok(Some(HarnessObservationKind::Result {
+        // Display content: segmented assistant text replacing the live stream in place.
+        let mut kinds = vec![self.display.agent_message(item_id, text)];
+        let turn_id = params["turnId"].as_str();
+        if !self.observation_gap
+            && !self.uncertain_submission
+            && self.active_turn.is_some()
+            && turn_id == self.active_turn.as_deref()
+            && turn_id == self.accepted_turn.as_deref()
+            && item["phase"].as_str() == Some("final_answer")
+        {
+            // A completed item cannot adopt an unaccepted turn or revive a terminal
+            // turn. Commentary and unknown phases remain display content only.
+            kinds.push(HarnessObservationKind::Result {
                 text: text.to_owned(),
-            }))
-        } else {
-            // Item completion is not turn completion. Commentary, partial answers
-            // and legacy/unknown phases remain display content, never final output.
-            Ok(Some(HarnessObservationKind::Text {
-                segment_id: None,
-                text: text.to_owned(),
-            }))
+            });
         }
+        Ok(kinds)
     }
 
     fn normalize_notification(
         &mut self,
         method: &str,
         params: &Value,
-    ) -> Result<Option<HarnessObservationKind>, CodexError> {
+    ) -> Result<Vec<HarnessObservationKind>, CodexError> {
         let kind = match method {
-            "item/agentMessage/delta" => HarnessObservationKind::Text {
-                segment_id: None,
-                text: params["delta"]
-                    .as_str()
-                    .ok_or(CodexError::Protocol)?
-                    .to_owned(),
-            },
             "item/started" | "item/completed" => {
                 let item = &params["item"];
                 match item["type"].as_str() {
                     Some("agentMessage") if method == "item/completed" => {
                         return self.completed_agent_message(params);
-                    }
-                    Some("commandExecution" | "fileChange" | "mcpToolCall" | "dynamicToolCall") => {
-                        HarnessObservationKind::Tool {
-                            input_json: None,
-                            native_tool_id: item["id"]
-                                .as_str()
-                                .ok_or(CodexError::Protocol)?
-                                .to_owned(),
-                            name: item["type"]
-                                .as_str()
-                                .ok_or(CodexError::Protocol)?
-                                .to_owned(),
-                            status: method.to_owned(),
-                        }
                     }
                     Some("collabAgentToolCall") => {
                         // Delegation has its own lifecycle/unknown coverage. It does not
@@ -1541,7 +1850,8 @@ impl CodexSession {
                             status: method.to_owned(),
                         }
                     }
-                    _ => return Ok(None),
+                    _ if method == "item/started" => return Ok(self.display.item_started(item)),
+                    _ => return Ok(self.display.item_completed(item)),
                 }
             }
             "turn/started" => {
@@ -1555,7 +1865,15 @@ impl CodexSession {
                     status: self.status.clone(),
                 }
             }
-            "turn/completed" => self.completed_turn_kind(params)?,
+            "turn/completed" => {
+                let mut kinds: Vec<_> = self
+                    .display
+                    .turn_usage(&params["turn"])
+                    .into_iter()
+                    .collect();
+                kinds.push(self.completed_turn_kind(params)?);
+                return Ok(kinds);
+            }
             "thread/started" | "thread/status/changed" => {
                 let status = if method == "thread/started" {
                     &params["thread"]["status"]
@@ -1573,9 +1891,9 @@ impl CodexSession {
                 }
             }
             // Ignore unsupported vendor payloads rather than persist unsanitized protocol dumps.
-            _ => return Ok(None),
+            _ => return Ok(Vec::new()),
         };
-        Ok(Some(kind))
+        Ok(vec![kind])
     }
 
     fn completed_turn_kind(
@@ -1595,10 +1913,11 @@ impl CodexSession {
                 _ => return Err(CodexError::Protocol),
             };
             if params["turn"]["status"] == "failed" {
-                // Native error.message may contain credentials; retain category only.
+                // Native error.message may contain credentials; retain a closed category only.
+                let (code, message) = turn_failure(&params["turn"]["error"]);
                 HarnessObservationKind::Diagnostic {
-                    code: "native_turn_failed".to_owned(),
-                    message: "Codex native turn failed; native error details withheld".to_owned(),
+                    code: code.to_owned(),
+                    message: message.to_owned(),
                 }
             } else {
                 HarnessObservationKind::Status {
@@ -1701,4 +2020,68 @@ impl CodexSession {
         self.server
             .send(json!({"id":callback.native_id,"result":result}))
     }
+}
+
+/// Closed-vocabulary failure category for a failed native turn; native text is withheld.
+fn turn_failure(error: &Value) -> (&'static str, &'static str) {
+    let info = &error["codexErrorInfo"];
+    let category = info.as_str().or_else(|| {
+        info.as_object()
+            .and_then(|object| object.keys().next().map(String::as_str))
+    });
+    let unauthorized = error["message"]
+        .as_str()
+        .is_some_and(|message| message.contains("(401)") || message.contains("unauthorized"));
+    match category {
+        Some("unauthorized") => (
+            "native_unauthorized",
+            "Codex sign-in is missing, expired or revoked; run `codex login` and try again",
+        ),
+        _ if unauthorized => (
+            "native_unauthorized",
+            "Codex sign-in is missing, expired or revoked; run `codex login` and try again",
+        ),
+        Some("usageLimitExceeded" | "sessionBudgetExceeded") => (
+            "native_usage_limit",
+            "Codex usage limit reached; native error details withheld",
+        ),
+        Some("rateLimitExceeded" | "serverOverloaded" | "flexUnavailable") => (
+            "native_rate_limited",
+            "Codex is rate limited or overloaded; try again shortly",
+        ),
+        Some("contextWindowExceeded") => (
+            "native_context_window",
+            "Codex context window exceeded; start a new conversation or compact",
+        ),
+        Some(
+            "httpConnectionFailed"
+            | "responseStreamConnectionFailed"
+            | "responseStreamDisconnected"
+            | "responseTooManyFailedAttempts",
+        ) => (
+            "native_connection_failed",
+            "Codex could not reach its model service; native error details withheld",
+        ),
+        _ => (
+            "native_turn_failed",
+            "Codex native turn failed; native error details withheld",
+        ),
+    }
+}
+
+/// Native turn, item and call identities correlated with a normalized observation.
+fn native_correlations(params: &Value) -> Vec<String> {
+    [
+        params["turnId"]
+            .as_str()
+            .or_else(|| params["turn"]["id"].as_str()),
+        params["itemId"]
+            .as_str()
+            .or_else(|| params["item"]["id"].as_str()),
+        params["callId"].as_str(),
+    ]
+    .into_iter()
+    .flatten()
+    .map(str::to_owned)
+    .collect()
 }

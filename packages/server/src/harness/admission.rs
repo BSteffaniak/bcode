@@ -126,15 +126,7 @@ impl CanonicalManagedAdmission {
         {
             return Err(ManagedHarnessError::StaleOwner);
         }
-        let retained = state
-            .sessions
-            .session_external_harness_transport_release(&snapshot.owner)
-            .await
-            .map_err(|_| ManagedHarnessError::Storage)?
-            .ok_or(ManagedHarnessError::Conflict)?;
-        if retained != (recovery.release_event_sequence, recovery.release.clone()) {
-            return Err(ManagedHarnessError::Conflict);
-        }
+        verify_recovery_evidence(&state, &snapshot.owner, &recovery).await?;
         self.store.verify_recovery_lifetime(&recovery.release)?;
         validate_resume(
             recovery
@@ -397,7 +389,10 @@ impl CanonicalManagedAdmission {
         }
         let selected = self
             .auth_read_selection(caller, session_id, instance_id)
-            .await?;
+            .await
+            .inspect_err(|error| {
+                tracing::debug!(stage = "auth_status_selection", category = %error, "managed harness admission rejected");
+            })?;
         let transport = {
             let state = self.store.state()?;
             super::HarnessPluginTransport::with_view(
@@ -430,12 +425,26 @@ impl CanonicalManagedAdmission {
             )
             .await?
         } else {
-            transport.inspect_auth_readonly(&selected.instance).await?
+            transport
+                .inspect_auth_readonly(&selected.instance)
+                .await
+                .inspect_err(|error| {
+                    tracing::debug!(stage = "auth_status_inspection", category = %error, "managed harness admission rejected");
+                })?
         };
         let current = self
             .auth_read_selection(caller, session_id, instance_id)
-            .await?;
-        if current != selected {
+            .await
+            .inspect_err(|error| {
+                tracing::debug!(stage = "auth_status_reselection", category = %error, "managed harness admission rejected");
+            })?;
+        // Read-only readiness depends only on which owner and instance were inspected; the
+        // poll cursor, binding confirmation and capabilities advance concurrently with it.
+        if current.owner != selected.owner || current.instance != selected.instance {
+            tracing::debug!(
+                stage = "auth_status_selection_changed",
+                "managed harness admission rejected"
+            );
             return Err(ManagedHarnessError::StaleOwner);
         }
         Ok(inspected)
@@ -456,6 +465,10 @@ impl CanonicalManagedAdmission {
             .await
             .map_err(|_| ManagedHarnessError::Storage)?;
         if canonical_directory(&summary.working_directory).await? != cwd {
+            tracing::debug!(
+                stage = "auth_read_workspace",
+                "managed harness admission rejected"
+            );
             return Err(ManagedHarnessError::StaleOwner);
         }
         let selected = state
@@ -705,8 +718,17 @@ impl CanonicalManagedAdmission {
                     .map_err(|_| ManagedHarnessError::StaleOwner)?
                     .get(&(*session_id, invocation_id.clone()))
                     .is_some_and(|entry| entry.producer_plugin_id == *plugin_id);
-                if !active || (!creating && *session_id != target) {
+                if !active {
                     return Err(ManagedHarnessError::StaleOwner);
+                }
+                if !creating && *session_id != target {
+                    // Delegated control: only the active authenticated invocation of the
+                    // target's immutable canonical parent may address an existing managed
+                    // child. Naming a parent in a request never grants this; the caller's
+                    // own session must be the recorded parent, the child must already be a
+                    // managed session, and each mutation still passes tool permission policy
+                    // plus canonical ownership, generation and retained-target admission.
+                    Self::delegated_child(&state, *session_id, target).await?;
                 }
                 state
                     .sessions
@@ -717,6 +739,62 @@ impl CanonicalManagedAdmission {
             }
         };
         canonical_directory(&cwd).await
+    }
+
+    /// Require `child` to be an existing managed session whose immutable canonical parent is
+    /// `parent`. This is a precondition for delegated invocation control, not authority alone.
+    async fn delegated_child(
+        state: &crate::ServerState,
+        parent: SessionId,
+        child: SessionId,
+    ) -> Result<(), ManagedHarnessError> {
+        let summary = state
+            .sessions
+            .session_summary(child)
+            .await
+            .map_err(|_| ManagedHarnessError::StaleOwner)?;
+        if summary.parent_id != Some(parent) {
+            return Err(ManagedHarnessError::StaleOwner);
+        }
+        state
+            .sessions
+            .session_external_harness_state(child)
+            .await
+            .map_err(|_| ManagedHarnessError::Storage)?
+            .ok_or(ManagedHarnessError::StaleOwner)?;
+        Ok(())
+    }
+
+    /// Authorize an invocation-scoped read of a delegated child's retained routing evidence.
+    ///
+    /// The caller must be the active authenticated invocation of the child's immutable
+    /// canonical parent, in the same canonical workspace. Reads grant no mutation authority.
+    /// # Errors
+    /// Rejects non-invocation callers, inactive invocations, non-children, unmanaged sessions,
+    /// workspace mismatches and unavailable canonical state.
+    pub async fn authorize_delegated_read(
+        &self,
+        caller: &ManagedCaller,
+        child: SessionId,
+    ) -> Result<(), ManagedHarnessError> {
+        let ManagedCaller::Invocation { session_id, .. } = caller else {
+            return Err(ManagedHarnessError::Unsupported);
+        };
+        if *session_id == child {
+            return Err(ManagedHarnessError::StaleOwner);
+        }
+        let cwd = self.authorize(caller, child, false).await?;
+        let state = self.store.state()?;
+        let summary = state
+            .sessions
+            .session_summary(child)
+            .await
+            .map_err(|_| ManagedHarnessError::Storage)?;
+        drop(state);
+        if canonical_directory(&summary.working_directory).await? != cwd {
+            return Err(ManagedHarnessError::StaleOwner);
+        }
+        Ok(())
     }
 
     fn daemon_owner(
@@ -1057,11 +1135,40 @@ impl CanonicalManagedAdmission {
     }
 }
 
+/// The recovery follows the exact retained release, or for an abandoned transport the exact
+/// unchanged canonical tail of its dead owner.
+async fn verify_recovery_evidence(
+    state: &crate::ServerState,
+    previous: &bcode_session_models::ExternalHarnessOwner,
+    recovery: &bcode_session_models::external_harness::ExternalHarnessRecovery,
+) -> Result<(), ManagedHarnessError> {
+    if recovery.abandoned {
+        let point = state
+            .sessions
+            .session_external_harness_abandonment_point(previous)
+            .await
+            .map_err(|_| ManagedHarnessError::Storage)?;
+        return (point == Some(recovery.release_event_sequence))
+            .then_some(())
+            .ok_or(ManagedHarnessError::Conflict);
+    }
+    let retained = state
+        .sessions
+        .session_external_harness_transport_release(previous)
+        .await
+        .map_err(|_| ManagedHarnessError::Storage)?
+        .ok_or(ManagedHarnessError::Conflict)?;
+    (retained == (recovery.release_event_sequence, recovery.release.clone()))
+        .then_some(())
+        .ok_or(ManagedHarnessError::Conflict)
+}
+
 pub(super) fn validate_retained_target(
     selected: &bcode_session_models::external_harness::ExternalHarnessState,
     supplied: &bcode_harness_models::HarnessSessionTarget,
 ) -> Result<(), ManagedHarnessError> {
-    use bcode_harness_models::HarnessSessionTarget;
+    use bcode_harness_models::{HarnessModelsRequestKind, HarnessSessionTarget};
+    use bcode_session_models::external_harness::ExternalHarnessRequestKind;
     if selected.target.as_ref() == Some(supplied) {
         return Ok(());
     }
@@ -1075,10 +1182,18 @@ pub(super) fn validate_retained_target(
     supplied
         .validate_confirmation(&prepared.open_id, binding)
         .map_err(|_| ManagedHarnessError::Conflict)?;
-    if !matches!(selected.prepared_open.as_ref().map(|request| &request.kind),
-        Some(bcode_session_models::external_harness::ExternalHarnessRequestKind::Open(open))
-            if open.open_id == prepared.open_id)
-    {
+    // Either open family may have prepared the target: a legacy open or a selected-model open.
+    let retained_open_id = match selected.prepared_open.as_ref().map(|request| &request.kind) {
+        Some(ExternalHarnessRequestKind::Open(open)) => Some(open.open_id.as_str()),
+        Some(ExternalHarnessRequestKind::OpenSelected(selected_open)) => {
+            match &selected_open.request.kind {
+                HarnessModelsRequestKind::OpenSelected { open, .. } => Some(open.open_id.as_str()),
+                HarnessModelsRequestKind::DiscoverModels => None,
+            }
+        }
+        _ => None,
+    };
+    if retained_open_id != Some(prepared.open_id.as_str()) {
         return Err(ManagedHarnessError::Conflict);
     }
     Ok(())
@@ -1269,6 +1384,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::too_many_lines)] // One fixture exercised across every open family.
     fn retained_target_allows_only_confirmation_of_the_same_prepared_open() {
         use bcode_harness_models::{
             HarnessPreparedSession, HarnessSessionBinding, HarnessSessionTarget,
@@ -1351,6 +1467,27 @@ mod tests {
             assert!(validate_retained_target(&selected, &prepared).is_err());
         }
         selected.target = original;
+        // A selected-model open prepares the target just like a legacy open.
+        let HarnessRequestKind::Open(open) = &call.harness.kind else {
+            unreachable!()
+        };
+        selected.prepared_open = Some(
+            bcode_session_models::external_harness::ExternalHarnessRequest::from_models_request(
+                &bcode_harness_models::HarnessModelsRequest {
+                    schema_version: HARNESS_SCHEMA_VERSION,
+                    request_id: open.open_id.clone(),
+                    instance: call.harness.instance.clone(),
+                    kind: bcode_harness_models::HarnessModelsRequestKind::OpenSelected {
+                        open: Box::new(open.clone()),
+                        selection: bcode_harness_models::HarnessModelSelection {
+                            model_id: "default".into(),
+                        },
+                    },
+                },
+            )
+            .unwrap(),
+        );
+        assert_eq!(validate_retained_target(&selected, &prepared), Ok(()));
         selected.prepared_open = None;
         assert_eq!(
             validate_retained_target(&selected, &prepared),
@@ -1506,6 +1643,55 @@ mod credential_admission_tests {
                     .is_err()
             );
         }
+        drop(admission);
+        drop(state);
+    }
+
+    #[tokio::test]
+    async fn delegated_reads_require_an_active_invocation_of_the_canonical_parent() {
+        let state = Arc::new(crate::tests::test_server_state(
+            crate::SessionManager::default(),
+        ));
+        let admission = CanonicalManagedAdmission::new(CanonicalHarnessStore::new(&state));
+        let parent = SessionId::new();
+        let child = SessionId::new();
+        // Clients and workflows use their own admission routes, never delegated control.
+        for caller in [
+            ManagedCaller::Client(bcode_session_models::ClientId::new()),
+            ManagedCaller::Workflow {
+                run_id: "run".into(),
+                dispatch_identity: "dispatch".into(),
+                session_id: parent,
+                plugin_id: "bcode.harness".into(),
+            },
+        ] {
+            assert_eq!(
+                admission.authorize_delegated_read(&caller, child).await,
+                Err(ManagedHarnessError::Unsupported)
+            );
+        }
+        // An invocation never addresses itself through the delegated route.
+        let own = ManagedCaller::Invocation {
+            session_id: child,
+            plugin_id: "bcode.harness".into(),
+            invocation_id: "call".into(),
+        };
+        assert_eq!(
+            admission.authorize_delegated_read(&own, child).await,
+            Err(ManagedHarnessError::StaleOwner)
+        );
+        // Strings alone grant nothing: an unregistered invocation naming any parent fails.
+        let unregistered = ManagedCaller::Invocation {
+            session_id: parent,
+            plugin_id: "bcode.harness".into(),
+            invocation_id: "unregistered".into(),
+        };
+        assert!(
+            admission
+                .authorize_delegated_read(&unregistered, child)
+                .await
+                .is_err()
+        );
         drop(admission);
         drop(state);
     }

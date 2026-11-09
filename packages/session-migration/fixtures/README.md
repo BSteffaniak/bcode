@@ -32,6 +32,16 @@ native usage observations, text segment and tool input display metadata, interac
 metadata, and configuration requests. Historical inputs at schema 57 or earlier that carry any
 of these are rejected rather than guessed. Recovery records remain unpublished at schema 58.
 
+## Writer-26 native usage projection catch-up
+
+Writer 26 shares current event schema 58 and persisted native harness usage observations without
+folding them into the session usage projection. Writer 27 makes that projection required, so the
+explicit `session-writer-epoch-26-to-27` edge preserves canonical payloads and rebuilds every
+current projection; native usage then joins the usage totals. Like writers 20 through 22 (which
+shared then-current schema 55), writer 26 has no separate schema fixture: every lifecycle-matrix
+fixture declares writer 26 as a source, and the session-domain migration-target test reconstructs
+a writer-26 store with native usage and verifies the caught-up totals after reopen.
+
 ## Confirmed schema-28 incident family
 
 Read-only inspection of the retained epoch-2 backup for incident session

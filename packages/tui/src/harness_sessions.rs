@@ -101,6 +101,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::too_many_lines)] // One lifecycle journey: running, coverage loss, then finished.
     fn terminal_reply_keeps_background_and_late_continuation_visible_without_controls() {
         use bcode_harness_models::{
             HarnessAttemptIdentity, HarnessCompleteness, HarnessExecutionEvent,
@@ -173,8 +174,8 @@ mod tests {
                 .summary()
                 .contains("Reply complete + 2 background")
         );
-        // Lifecycle evidence adds no transcript rows; the status line keeps it visible.
-        assert!(app.status().contains("1 continuation pending"));
+        // Lifecycle evidence adds no transcript rows; live work stays visible in the status.
+        assert_eq!(app.status(), "3 background tasks running");
         app.absorb_session_event(&coverage_loss_event(session_id));
         assert!(
             app.session_view_snapshot()
@@ -197,6 +198,55 @@ mod tests {
             app.session_view_snapshot().execution_lifecycle.submissions[0]
                 .native_id
                 .is_none()
+        );
+        // Once the work reports terminal states, the status line stops claiming it runs.
+        let finished = |id: &str| HarnessExecutionEvent::BackgroundWork {
+            work_id: id.into(),
+            native_task_id: None,
+            origin: Some(origin.clone()),
+            parent_work_id: None,
+            work_kind: HarnessWorkKind::Subagent,
+            label: "界 task".into(),
+            state: HarnessWorkState::Completed,
+            notification: HarnessNotificationState::Observed,
+        };
+        let done = [
+            finished("one"),
+            finished("two"),
+            HarnessExecutionEvent::Continuation {
+                continuation_id: "later".into(),
+                origin: Some(origin.clone()),
+                source_work_id: Some("one".into()),
+                native_turn_id: None,
+                state: HarnessWorkState::Completed,
+                output: None,
+            },
+        ];
+        for (index, execution) in done.into_iter().enumerate() {
+            let sequence = u64::try_from(index).unwrap() + 6;
+            app.absorb_session_event(&SessionEvent {
+                schema_version: CURRENT_SESSION_EVENT_SCHEMA_VERSION,
+                session_id,
+                sequence,
+                timestamp_ms: sequence,
+                provenance: None,
+                kind: SessionEventKind::ExternalObservationRecorded {
+                    version: 1,
+                    observation: Box::new(HarnessObservation {
+                        observation_id: format!("finished-{index}"),
+                        session_id: session_id.to_string(),
+                        generation: 3,
+                        native_correlations: vec![],
+                        completeness: HarnessCompleteness::Complete,
+                        kind: HarnessObservationKind::Execution { event: execution },
+                    }),
+                },
+            });
+        }
+        assert!(
+            !app.status().contains("background task"),
+            "{}",
+            app.status()
         );
         drop(app);
     }

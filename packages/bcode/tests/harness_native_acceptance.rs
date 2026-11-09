@@ -362,3 +362,173 @@ fn native_cli_two_turns_and_offline_canonical_history() {
         "history must survive daemon restart with the adapter disabled"
     );
 }
+
+/// Submit one next-turn input against `target` at `generation`.
+fn submit(cli: &LiveCli, target: &Value, generation: u64, serial: u8, text: &str) {
+    let submission = format!("journey-submission-{serial}");
+    let attempt = format!("00000000-0000-4000-9000-{serial:012}");
+    let receipt = cli.call(
+        "send",
+        &submission,
+        &json!({"operation":"submit","request":{
+        "target":target,"submission":{"submission_id":submission,"attempt_id":attempt,
+        "session_id":SESSION,"generation":generation,"text":text,
+        "placement":{"kind":"next_turn"}}}}),
+    );
+    assert_eq!(receipt["submission_id"], submission);
+}
+
+/// Observe until the native turn settles with a result, approving every native tool request.
+/// Returns the concatenated durable assistant text and the model native usage reported.
+fn drive_approving(
+    cli: &LiveCli,
+    target: &mut Value,
+    after: &mut Option<String>,
+) -> (String, Option<String>) {
+    let deadline = Instant::now() + Duration::from_secs(240);
+    let mut text = String::new();
+    let mut model = None;
+    let (mut result, mut approvals) = (false, 0_u8);
+    loop {
+        assert!(
+            Instant::now() < deadline,
+            "live journey turn did not settle"
+        );
+        let page = cli.call(
+            "observe",
+            "journey-observe",
+            &json!({"operation":"observe","request":{
+            "target":target,"after":after,"limit":64,"wait_millis":5000}}),
+        );
+        *after = page["next_after"].as_str().map(str::to_owned);
+        for observation in page["observations"].as_array().unwrap() {
+            let kind = &observation["kind"];
+            match kind["kind"].as_str().unwrap() {
+                "binding_confirmed" => {
+                    *target = json!({"state":"confirmed","session":kind["binding"]});
+                }
+                "text" => text.push_str(kind["text"].as_str().unwrap()),
+                "result" => result = true,
+                "usage" => model = kind["model"].as_str().map(str::to_owned),
+                "interaction" if kind["interaction"]["kind"] == "approval" => {
+                    approvals += 1;
+                    let interaction = &kind["interaction"];
+                    let response_id = format!("journey-approval-{approvals}");
+                    cli.call(
+                        "respond",
+                        &response_id,
+                        &json!({"operation":"respond","request":{"target":target,
+                        "response":{"response_id":response_id,
+                            "request_id":interaction["request_id"],
+                            "session_id":interaction["session_id"],
+                            "generation":interaction["generation"],
+                            "value":{"kind":"approval","approved":true}}}}),
+                    );
+                }
+                _ => {}
+            }
+        }
+        if result && page["status"]["activity"] == "settled" {
+            return (text, model);
+        }
+    }
+}
+
+/// The interactive journey on the real native executor through the daemon application:
+/// selected-model open, a turn with a native approval, a mid-session model switch, a graceful
+/// daemon restart, recovery of the same native conversation, and context kept across it.
+#[test]
+#[ignore = "uses existing native Claude subscription; explicit live-run authorization required"]
+fn native_journey_approves_switches_model_and_resumes_after_restart() {
+    let cli = LiveCli::new();
+    cli.run(&["server", "start"]);
+    let note = cli.root.path().join("note.txt");
+    std::fs::write(&note, "alpha\n").unwrap();
+    let catalog = cli.application(
+        "models",
+        &json!({
+            "request_id":"journey-catalog", "instances":[cli.instance], "provider_plugin_id":null,
+        }),
+    );
+    let model = catalog["models"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|entry| entry["native_model_id"] == "sonnet")
+        .or_else(|| catalog["models"].as_array().unwrap().first())
+        .unwrap()
+        .clone();
+    let selection = json!({"model_id":model["model"]["model_id"],
+        "route":model["route"], "account_reference":model["account_reference"]});
+    let started = cli.application(
+        "start-selected",
+        &json!({
+            "selection":selection,"instance":cli.instance,
+            "open":{"open_id":"journey-open","session_id":SESSION,"generation":1,
+                "working_directory":cli.root.path(),"resume":null},"parent_session_id":null,
+        }),
+    );
+    let mut target = started["response"]["kind"]["response"]["target"].clone();
+    let mut after = None;
+
+    submit(
+        &cli,
+        &target,
+        1,
+        1,
+        "Remember the code word MANGO. Use the Edit tool to change alpha to beta in note.txt, \
+         then reply with DONE.",
+    );
+    let (first, _) = drive_approving(&cli, &mut target, &mut after);
+    assert!(first.contains("DONE"), "first turn text: {first}");
+    assert_eq!(std::fs::read_to_string(&note).unwrap().trim(), "beta");
+
+    let switched = cli.call(
+        "configure",
+        "journey-model",
+        &json!({"operation":"configure","request":{"target":target,
+            "mutation_id":"journey-model","setting":{"kind":"model","model_id":"haiku"}}}),
+    );
+    assert_eq!(switched["mutation_id"], "journey-model");
+    submit(&cli, &target, 1, 2, "Reply with the single word OK.");
+    let (_, model) = drive_approving(&cli, &mut target, &mut after);
+    assert!(
+        model
+            .as_deref()
+            .is_some_and(|model| model.contains("haiku")),
+        "native usage after the switch reports {model:?}"
+    );
+
+    cli.run(&["server", "stop"]);
+    cli.run(&["server", "start"]);
+    let recovered: Value = serde_json::from_str(&cli.run(&[
+        "harness",
+        "recover",
+        SESSION,
+        "--instance",
+        "live-claude",
+        "--generation",
+        "1",
+        "--recovery-id",
+        "journey-recover",
+    ]))
+    .unwrap();
+    assert_eq!(recovered["kind"]["kind"], "opened", "{recovered}");
+    let binding = recovered["kind"]["response"].clone();
+    assert_eq!(binding["generation"], 2);
+    assert_eq!(
+        binding["native_session_id"], target["session"]["native_session_id"],
+        "recovery resumes the exact native conversation"
+    );
+    let mut resumed = json!({"state":"confirmed","session":binding});
+    let mut resumed_after = None;
+    submit(
+        &cli,
+        &resumed,
+        2,
+        3,
+        "What code word did I ask you to remember? Answer with the word only.",
+    );
+    let (third, _) = drive_approving(&cli, &mut resumed, &mut resumed_after);
+    assert!(third.contains("MANGO"), "resumed context: {third}");
+}

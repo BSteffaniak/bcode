@@ -125,6 +125,24 @@ impl SessionManager {
         Ok(db.harness_transport_release(owner).await?)
     }
 
+    /// The canonical tail an abandoned transport's recovery would follow, when the exact
+    /// current owner never released it. No lifetime proof, native effect or history scan.
+    /// # Errors
+    /// Rejects stale owners, damaged locators, missing storage and concurrent changes.
+    pub async fn session_external_harness_abandonment_point(
+        &self,
+        owner: &ExternalHarnessOwner,
+    ) -> Result<Option<u64>, SessionError> {
+        owner.validate().map_err(SessionError::EventSerialization)?;
+        let gate = self.session_load_gate(owner.session_id).await;
+        let _guard = gate.lock().await;
+        let store = self.store.as_ref().ok_or_else(mismatch)?;
+        let db =
+            crate::db::SessionDb::open_existing_turso_in_root(owner.session_id, &store.root_path())
+                .await?;
+        Ok(db.harness_abandonment_point(owner).await?)
+    }
+
     /// Read one bounded, revision-pinned lifecycle inventory page without native execution.
     /// The caller supplies the exact inspected owner; no ownership or completion is inferred.
     /// # Errors

@@ -2,7 +2,7 @@
 //!
 //! Live updates are presentation hints only: never retained, never part of the observation
 //! digest, and superseded by the durable `Text`/`Reasoning` observation with the same
-//! segment identity (`<message.id>:<content block index>`). Under pressure updates are
+//! segment identity (`<message.id>:t<n>` / `<message.id>:r<n>`, numbered per kind). Under pressure updates are
 //! dropped rather than queued; durable text stays authoritative.
 #[cfg(test)]
 #[path = "live_tests.rs"]
@@ -23,6 +23,8 @@ const MAX_LIVE_BLOCKS: usize = 64;
 
 struct Block {
     stream: HarnessLiveStream,
+    /// Per-kind segment identity shared with the durable observation.
+    segment_id: String,
     /// Running UTF-8 byte offset of the next append within the segment's live text.
     offset: u64,
     /// An append was dropped; later appends would be non-contiguous, so suppress them.
@@ -33,6 +35,7 @@ struct Block {
 #[derive(Default)]
 pub struct LiveBuffer {
     message_id: Option<String>,
+    counts: crate::normalize::display::BlockCounts,
     blocks: BTreeMap<u64, Block>,
     pending: VecDeque<HarnessLiveUpdate>,
     bytes: usize,
@@ -42,6 +45,7 @@ impl LiveBuffer {
     pub const fn new() -> Self {
         Self {
             message_id: None,
+            counts: crate::normalize::display::BlockCounts::new(),
             blocks: BTreeMap::new(),
             pending: VecDeque::new(),
             bytes: 0,
@@ -68,6 +72,7 @@ impl LiveBuffer {
     /// Forget all stream state, for example after the native connection is lost.
     pub fn clear(&mut self) {
         self.message_id = None;
+        self.counts = crate::normalize::display::BlockCounts::new();
         self.blocks.clear();
         self.pending.clear();
         self.bytes = 0;
@@ -89,6 +94,7 @@ impl LiveBuffer {
         match event.get("type").and_then(Value::as_str) {
             Some("message_start") => {
                 self.blocks.clear();
+                self.counts = crate::normalize::display::BlockCounts::new();
                 self.message_id = event
                     .pointer("/message/id")
                     .and_then(Value::as_str)
@@ -117,10 +123,20 @@ impl LiveBuffer {
                 if !self.blocks.contains_key(&index) && self.blocks.len() >= MAX_LIVE_BLOCKS {
                     return;
                 }
+                let Some(message_id) = &self.message_id else {
+                    return;
+                };
+                let kind = if stream == HarnessLiveStream::Text {
+                    crate::normalize::display::SegmentKind::Text
+                } else {
+                    crate::normalize::display::SegmentKind::Reasoning
+                };
+                let segment_id = self.counts.next(message_id, kind);
                 self.blocks.insert(
                     index,
                     Block {
                         stream,
+                        segment_id,
                         offset: 0,
                         dropped: false,
                     },
@@ -154,9 +170,6 @@ impl LiveBuffer {
         if text.is_empty() {
             return;
         }
-        let Some(message_id) = &self.message_id else {
-            return;
-        };
         // Offsets are only meaningful from an observed block start.
         let Some(block) = self.blocks.get_mut(&index) else {
             return;
@@ -164,7 +177,7 @@ impl LiveBuffer {
         if block.stream != stream {
             return;
         }
-        let segment_id = format!("{message_id}:{index}");
+        let segment_id = block.segment_id.clone();
         let mut rest = text;
         while !rest.is_empty() {
             let chunk = prefix_at_char_boundary(rest, MAX_UPDATE_TEXT);
@@ -214,7 +227,7 @@ impl LiveBuffer {
     }
 }
 
-/// Native message identities used as segment prefixes; leaves room for `:<index>`.
+/// Native message identities used as segment prefixes; leaves room for `:t<n>`/`:r<n>`.
 pub fn valid_message_id(id: &str) -> bool {
     !id.is_empty()
         && id.len() <= MAX_HARNESS_ID_BYTES - 24

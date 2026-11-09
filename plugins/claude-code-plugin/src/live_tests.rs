@@ -36,13 +36,13 @@ fn deltas_coalesce_with_running_offsets_and_segment_identity() {
     assert!(!buffer.is_pending());
     assert_eq!(updates.len(), 2);
     assert_eq!(updates[0].stream, HarnessLiveStream::Reasoning);
-    assert_eq!(updates[0].segment_id, "msg_1:0");
+    assert_eq!(updates[0].segment_id, "msg_1:r0");
     assert_eq!(
         (updates[0].offset, updates[0].text.as_str()),
         (0, "Let me think")
     );
     assert_eq!(updates[1].stream, HarnessLiveStream::Text);
-    assert_eq!(updates[1].segment_id, "msg_1:1");
+    assert_eq!(updates[1].segment_id, "msg_1:t0");
     assert_eq!((updates[1].offset, updates[1].text.as_str()), (0, "Héllo"));
     assert!(bcode_harness_models::validate_live_updates(&updates).is_ok());
     // Offered updates are not repeated; later appends continue at the byte offset.
@@ -81,7 +81,7 @@ fn unstarted_blocks_subagents_and_tool_input_are_not_presented() {
     delta(&mut buffer, 0, "text_delta", "text", "ok");
     let updates = buffer.take();
     assert_eq!(updates.len(), 1);
-    assert_eq!(updates[0].segment_id, "msg_2:0");
+    assert_eq!(updates[0].segment_id, "msg_2:t0");
 }
 
 #[test]
@@ -162,5 +162,24 @@ fn near_capacity_reports_before_updates_would_be_dropped() {
     assert!(
         !buffer.near_capacity(),
         "offering the page frees the window"
+    );
+}
+
+#[test]
+fn text_after_an_unfinalized_thinking_block_keeps_the_durable_segment() {
+    // Natively, an empty thinking block streams but yields no durable reasoning frame; the
+    // following text must still be the message's first text segment on both sides.
+    let mut buffer = LiveBuffer::default();
+    start(&mut buffer, "msg_4");
+    block(&mut buffer, 0, "thinking");
+    block(&mut buffer, 1, "text");
+    delta(&mut buffer, 1, "text_delta", "text", "Final answer");
+    let updates = buffer.take();
+    assert_eq!(updates.len(), 1);
+    assert_eq!(updates[0].segment_id, "msg_4:t0");
+    let mut numbering = crate::normalize::display::BlockNumbering::new();
+    assert_eq!(
+        numbering.next("msg_4", crate::normalize::display::SegmentKind::Text),
+        updates[0].segment_id
     );
 }

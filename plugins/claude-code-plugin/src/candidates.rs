@@ -166,8 +166,11 @@ fn executable_identity(
     };
     #[cfg(not(unix))]
     let file_key = None;
+    let invocation = path.to_str().ok_or(HarnessFailure::Policy)?;
+    let canonical_path: String = canonical.to_str().ok_or(HarnessFailure::Policy)?.into();
     Ok(Some(HarnessCandidateExecutableIdentity {
-        canonical_path: canonical.to_str().ok_or(HarnessFailure::Policy)?.into(),
+        invocation_path: (invocation != canonical_path).then(|| invocation.to_owned()),
+        canonical_path,
         byte_len: metadata.len(),
         modified_unix_nanos: metadata
             .modified()
@@ -202,7 +205,8 @@ async fn discover(
     let (executables, mut complete) = search_candidates(&input, executable_identity);
     let mut candidates = Vec::new();
     for identity in executables {
-        let executable = PathBuf::from(&identity.canonical_path);
+        // Probe through the same path the configured instance will invoke.
+        let executable = PathBuf::from(identity.invocation());
         let Ok(version) =
             bcode_claude_code::installed_version(&executable, &input.home, &input.environment)
                 .await
@@ -280,7 +284,7 @@ fn prepare_from_discovery(
     let instance = HarnessInstance {
         instance_id: request.instance_id.clone(),
         plugin_id: PLUGIN_ID.into(),
-        executable: candidate.executable.canonical_path.clone(),
+        executable: candidate.executable.invocation().to_owned(),
         config_namespace: candidate.config_namespace.clone(),
         auth: bcode_harness_models::HarnessAuthBinding {
             provider_id: "claude-code".into(),
@@ -430,9 +434,38 @@ impl PluginState {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    #[test]
+    fn profile_symlinks_are_invoked_while_identity_stays_canonical() {
+        use std::os::unix::fs::PermissionsExt;
+        let root = tempfile::tempdir().unwrap();
+        let store = root.path().join("store-1.0/bin");
+        let profile = root.path().join("profile/bin");
+        std::fs::create_dir_all(&store).unwrap();
+        std::fs::create_dir_all(&profile).unwrap();
+        let target = store.join("claude");
+        std::fs::write(&target, "#!/bin/sh\n").unwrap();
+        std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o755)).unwrap();
+        std::os::unix::fs::symlink(&target, profile.join("claude")).unwrap();
+        let identity = executable_identity(&profile.join("claude"))
+            .unwrap()
+            .unwrap();
+        let canonical = std::fs::canonicalize(&target).unwrap();
+        assert_eq!(identity.canonical_path, canonical.to_str().unwrap());
+        // An update replaces the store target; the profile entry stays the same.
+        assert_eq!(
+            identity.invocation(),
+            profile.join("claude").to_str().unwrap()
+        );
+        let direct = executable_identity(&canonical).unwrap().unwrap();
+        assert_eq!(direct.invocation_path, None);
+        assert_eq!(direct.invocation(), direct.canonical_path);
+    }
     fn identity(path: &str) -> HarnessCandidateExecutableIdentity {
         HarnessCandidateExecutableIdentity {
             canonical_path: path.into(),
+            invocation_path: None,
             byte_len: 42,
             modified_unix_nanos: None,
             file_key: Some("1:2".into()),

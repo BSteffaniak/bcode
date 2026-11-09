@@ -4,7 +4,7 @@
 //! tool outputs leave only through the bounded projections in `normalize_display.rs`, as
 //! untrusted display content that never dispatches or authorizes a Bcode tool.
 #[path = "normalize_display.rs"]
-mod display;
+pub mod display;
 #[path = "normalizer_retention.rs"]
 mod retention;
 
@@ -346,9 +346,14 @@ impl Normalizer {
         self.turn_id.as_ref().map_or_else(
             || vec![
                 HarnessObservationKind::Status { status: status(&Settlement::Settled) },
-                HarnessObservationKind::Diagnostic {
-                    code: "settlement_turn_unavailable".into(),
-                    message: "Native settled state observed without a native turn correlation; no turn settlement synthesized".into(),
+                // Retained evidence for workflow settlement, not a user-facing notice: an
+                // ordinary turn always settles this way until turn correlation is verified.
+                HarnessObservationKind::Vendor {
+                    namespace: "claude_code.settlement".into(),
+                    detail: serde_json::json!({
+                        "code": "settlement_turn_unavailable",
+                        "message": "Native settled state observed without a native turn correlation; no turn settlement synthesized",
+                    }),
                 },
             ],
             |native_turn_id| vec![HarnessObservationKind::Settlement {
@@ -373,33 +378,34 @@ impl Normalizer {
             if content.len() > MAX_HARNESS_ITEMS {
                 return None;
             }
-            let first = message_id.map(|id| self.blocks.reserve(id, content.len()));
-            for (position, block) in content.iter().enumerate() {
-                let segment_id = message_id
-                    .zip(first)
-                    .map(|(id, first)| format!("{id}:{}", first + position));
+            for block in content {
+                let mut segment = |kind| message_id.map(|id| self.blocks.next(id, kind));
                 match block.get("type").and_then(Value::as_str) {
                     Some("text") => {
                         // Oversized text is truncated rather than dropped, so the segment is
                         // still finalized and supersedes its live stream.
                         let text = block.get("text").and_then(Value::as_str)?;
                         kinds.push(HarnessObservationKind::Text {
-                            segment_id,
+                            segment_id: segment(display::SegmentKind::Text),
                             text: display::truncate_display(text, MAX_HARNESS_TEXT_BYTES).0,
                         });
                     }
                     Some("thinking") => {
                         // The native signature is opaque verification material, never shown.
                         let thinking = block.get("thinking").and_then(Value::as_str)?;
-                        kinds.push(HarnessObservationKind::Reasoning {
-                            segment_id,
-                            text: display::truncate_display(thinking, MAX_HARNESS_TEXT_BYTES).0,
-                            opaque: false,
-                        });
+                        let segment_id = segment(display::SegmentKind::Reasoning);
+                        // Summaries may be omitted natively; an empty block has nothing to show.
+                        if !thinking.is_empty() {
+                            kinds.push(HarnessObservationKind::Reasoning {
+                                segment_id,
+                                text: display::truncate_display(thinking, MAX_HARNESS_TEXT_BYTES).0,
+                                opaque: false,
+                            });
+                        }
                     }
                     Some("redacted_thinking") => {
                         kinds.push(HarnessObservationKind::Reasoning {
-                            segment_id,
+                            segment_id: segment(display::SegmentKind::Reasoning),
                             text: String::new(),
                             opaque: true,
                         });
@@ -480,10 +486,9 @@ impl Normalizer {
                     session_id: self.target.session_id().to_owned(),
                     generation: self.target.generation(),
                     kind: HarnessInteractionKind::Approval,
-                    prompt: format!("Allow native Claude tool {tool_name}?"),
-                    scope: format!(
-                        "Native tool {tool_name}; the input preview is untrusted display only and is not dispatched as a Bcode tool"
-                    ),
+                    prompt: format!("Allow Claude Code to use {tool_name}?"),
+                    // The preview is untrusted display content; Claude Code runs the tool itself.
+                    scope: format!("Claude Code runs {tool_name} itself once you approve"),
                     choices: Vec::new(),
                 };
                 return interaction.validate().ok().map(|()| interaction);
