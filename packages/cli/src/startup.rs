@@ -431,6 +431,7 @@ fn managed_start_call(
     Ok(call)
 }
 
+#[cfg(test)]
 fn managed_started_session(
     response: &bcode_harness_models::HarnessServiceResponse,
     session_id: bcode_session_models::SessionId,

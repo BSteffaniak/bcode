@@ -413,8 +413,7 @@ pub fn intercept_slash_outcome(
             start_configure(chat, loop_state, setting);
         }
         SlashCommandOutcome::PickModel => {
-            chat.replace_effect(TuiEffect::LoadManagedModels);
-            chat.app.set_status("loading native models…".to_owned());
+            super::chat_loop::request_execution_picker(chat, loop_state);
         }
         SlashCommandOutcome::ReviewPermissions => {
             loop_state.managed_interactions.review_again();
@@ -449,7 +448,9 @@ mod tests {
         ActiveChat {
             app,
             agents: super::super::session_flow::AgentCatalog::default(),
-            attachment: super::super::session_flow::ChatSessionAttachment::Draft,
+            attachment: super::super::session_flow::ChatSessionAttachment::Attached {
+                session_id: owner,
+            },
             event_sender,
             event_receiver,
             event_task: None,
@@ -645,10 +646,11 @@ mod tests {
             intercept_slash_outcome(&mut chat, &mut loop_state, SlashCommandOutcome::PickModel)
                 .is_none()
         );
-        assert!(matches!(
-            &drained(&mut chat)[..],
-            [TuiEffect::LoadManagedModels]
-        ));
+        assert!(drained(&mut chat).is_empty());
+        assert_eq!(
+            loop_state.execution_picker.as_ref().unwrap().session_id,
+            Some(owner)
+        );
         cycle_permission_mode(&mut chat, &mut loop_state);
         let effects = drained(&mut chat);
         let [

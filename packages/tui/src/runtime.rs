@@ -23,29 +23,11 @@ use super::{TuiError, chat_loop, history_flow, root_program, session_flow};
 pub async fn run_event_loop<W: Write + Send>(
     terminal: &mut Terminal<&mut W>,
     session_id: Option<SessionId>,
-) -> Result<(), TuiError> {
+) -> Result<Option<crate::ExecutionPickerRequest>, TuiError> {
     Box::pin(run_event_loop_with_startup(
         terminal,
         session_id,
         StartupTuiAction::None,
-    ))
-    .await
-}
-
-/// Attach to a session and run the active chat loop with caller-provided static bundled plugins.
-#[allow(clippy::future_not_send)]
-pub async fn run_event_loop_with_static_bundled<W: Write + Send>(
-    terminal: &mut Terminal<&mut W>,
-    session_id: Option<SessionId>,
-    static_plugins: &[bcode_plugin::StaticBundledPlugin],
-    launch_options: super::TuiLaunchOptions,
-) -> Result<(), TuiError> {
-    Box::pin(run_event_loop_with_startup_and_static_bundled(
-        terminal,
-        session_id,
-        StartupTuiAction::None,
-        static_plugins,
-        launch_options,
     ))
     .await
 }
@@ -56,7 +38,7 @@ pub async fn run_event_loop_with_startup<W: Write + Send>(
     terminal: &mut Terminal<&mut W>,
     session_id: Option<SessionId>,
     startup_action: StartupTuiAction,
-) -> Result<(), TuiError> {
+) -> Result<Option<crate::ExecutionPickerRequest>, TuiError> {
     Box::pin(run_event_loop_with_startup_and_static_bundled(
         terminal,
         session_id,
@@ -152,7 +134,7 @@ pub async fn run_event_loop_with_startup_and_static_bundled<W: Write + Send>(
     startup_action: StartupTuiAction,
     static_plugins: &[bcode_plugin::StaticBundledPlugin],
     launch_options: super::TuiLaunchOptions,
-) -> Result<(), TuiError> {
+) -> Result<Option<crate::ExecutionPickerRequest>, TuiError> {
     let connection = prepare_connection(session_id).await?;
     Box::pin(run_prepared_chat(
         terminal,
@@ -194,7 +176,7 @@ pub async fn run_prepared_chat<W: Write + Send>(
     startup_action: StartupTuiAction,
     static_plugins: &[bcode_plugin::StaticBundledPlugin],
     launch_options: super::TuiLaunchOptions,
-) -> Result<(), TuiError> {
+) -> Result<Option<crate::ExecutionPickerRequest>, TuiError> {
     let PreparedConnection {
         session_id,
         publisher,
@@ -270,7 +252,8 @@ pub async fn run_prepared_chat_with_presentation<W: Write + Send>(
     presentation: PreparedPresentation,
     static_plugins: &[bcode_plugin::StaticBundledPlugin],
     launch_options: super::TuiLaunchOptions,
-) -> Result<(), TuiError> {
+    draft: Option<String>,
+) -> Result<Option<crate::ExecutionPickerRequest>, TuiError> {
     let mut initialized = initialize_tui_with_presentation(
         terminal.area(),
         connection.session_id,
@@ -278,6 +261,9 @@ pub async fn run_prepared_chat_with_presentation<W: Write + Send>(
         launch_options,
         presentation,
     );
+    if let Some(draft) = draft {
+        initialized.chat.app.replace_composer_with(&draft);
+    }
     if let Some(warning) = connection.warning {
         initialized.chat.app.set_status(warning);
     }
@@ -547,6 +533,9 @@ impl super::TerminalShell {
                     generation = next;
                     status = Some(next_status);
                 }
+                ManagedJourneyStep::End(ManagedJourneyEnd::ExecutionPicker(request)) => {
+                    return Box::pin(self.run_execution_selection(request, plugins, options)).await;
+                }
                 ManagedJourneyStep::End(ManagedJourneyEnd::Closed) => return Ok(()),
                 ManagedJourneyStep::End(ManagedJourneyEnd::Failed(message)) => {
                     self.show_error_without_retry(&message).await?;
@@ -586,6 +575,8 @@ impl super::TerminalShell {
 
 /// Why a managed root returned control to its journey.
 pub enum ManagedChatExit {
+    /// Open the shared execution picker after attachment teardown.
+    ExecutionPicker(crate::ExecutionPickerRequest),
     /// The user closed the conversation.
     Closed,
     /// Explicit `/auth login`: the journey hands the terminal to the native login flow.
@@ -623,6 +614,8 @@ pub enum ManagedJourneyStep {
 
 /// How a managed journey ends.
 pub enum ManagedJourneyEnd {
+    /// Open the shared execution picker after attachment teardown.
+    ExecutionPicker(crate::ExecutionPickerRequest),
     /// The user closed the conversation.
     Closed,
     /// Explicit native login handoff requested.
@@ -683,6 +676,9 @@ pub async fn next_managed_step(
     budget: &mut ManagedReentryBudget,
 ) -> ManagedJourneyStep {
     match exit {
+        ManagedChatExit::ExecutionPicker(request) => {
+            ManagedJourneyStep::End(ManagedJourneyEnd::ExecutionPicker(request))
+        }
         ManagedChatExit::Closed => ManagedJourneyStep::End(ManagedJourneyEnd::Closed),
         ManagedChatExit::AuthRequested(commands) => {
             ManagedJourneyStep::End(ManagedJourneyEnd::Auth(commands))
@@ -750,7 +746,7 @@ async fn run_managed_reopen<W: Write + Send>(
     let mut status = None;
     loop {
         let window = history_flow::initial_transcript_window_request(terminal.area());
-        let (connection, attached, binding) = match prepare_managed_reattachment(
+        let (connection, mut attached, binding) = match prepare_managed_reattachment(
             bcode_client::ManagedSessionClient::default_endpoint(),
             request.session_id,
             &request.instance_id,
@@ -771,6 +767,9 @@ async fn run_managed_reopen<W: Write + Send>(
                 )));
             }
         };
+        if let Some(draft) = &request.draft {
+            attached.draft = Some(draft.clone());
+        }
         let exit = Box::pin(run_managed_chat_bound(
             terminal,
             connection,
@@ -990,6 +989,7 @@ async fn run_managed_chat_bound<W: Write + Send>(
     };
     let outcome = finish_managed_attachment(run.await, commands.detach_commands()).await?;
     Ok(match outcome {
+        ManagedRootOutcome::ExecutionPicker(request) => ManagedChatExit::ExecutionPicker(request),
         ManagedRootOutcome::Closed => ManagedChatExit::Closed,
         ManagedRootOutcome::Auth => ManagedChatExit::AuthRequested(commands),
         ManagedRootOutcome::Exit(ManagedExitRequest::Reattach) => ManagedChatExit::Reattach,
@@ -1004,8 +1004,9 @@ async fn run_managed_chat_bound<W: Write + Send>(
 }
 
 /// How a managed root runtime stopped.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 enum ManagedRootOutcome {
+    ExecutionPicker(crate::ExecutionPickerRequest),
     Closed,
     Auth,
     Exit(ManagedExitRequest),
@@ -1013,7 +1014,7 @@ enum ManagedRootOutcome {
 
 impl ManagedRootOutcome {
     /// Outcomes that need the command handle after the root stopped.
-    const fn retains_commands(self) -> bool {
+    const fn retains_commands(&self) -> bool {
         matches!(self, Self::Auth | Self::Exit(ManagedExitRequest::Recover))
     }
 }
@@ -1053,8 +1054,10 @@ where
     };
     Box::pin(async move {
         // run owns the model and drains input/accepted operations before reentry.
-        let model = run.await?;
-        let outcome = if model.chat.app.managed_auth_requested() {
+        let mut model = run.await?;
+        let outcome = if let Some(request) = model.loop_state.execution_picker.take() {
+            ManagedRootOutcome::ExecutionPicker(request)
+        } else if model.chat.app.managed_auth_requested() {
             ManagedRootOutcome::Auth
         } else {
             model
@@ -1074,14 +1077,14 @@ async fn run_root<W: Write + Send>(
     initialized: InitializedTui,
     startup_action: StartupTuiAction,
     publisher: Option<super::resurrection::Publisher>,
-) -> Result<(), TuiError> {
+) -> Result<Option<crate::ExecutionPickerRequest>, TuiError> {
     let static_plugins = initialized.settings.static_plugins().to_vec();
     let launch_options = initialized.settings.launch_options();
     let mut initialized = initialized;
     let mut startup_action = startup_action;
     let mut publisher = publisher;
     loop {
-        let Some(request) = run_root_runtime(
+        let navigation = run_root_runtime(
             terminal,
             Box::pin(build_root_model(
                 initialized,
@@ -1090,9 +1093,11 @@ async fn run_root<W: Write + Send>(
             ))
             .await?,
         )
-        .await?
-        else {
-            return Ok(());
+        .await?;
+        let request = match navigation {
+            RootNavigation::ExecutionPicker(request) => return Ok(Some(request)),
+            RootNavigation::Managed(Some(request)) => request,
+            RootNavigation::Managed(None) => return Ok(None),
         };
         // The ordinary root found a managed binding: continue in the sealed managed route.
         let end = Box::pin(run_managed_reopen(
@@ -1103,7 +1108,8 @@ async fn run_root<W: Write + Send>(
         ))
         .await?;
         let next_session = match end {
-            ManagedJourneyEnd::Closed | ManagedJourneyEnd::Auth(_) => return Ok(()),
+            ManagedJourneyEnd::Closed | ManagedJourneyEnd::Auth(_) => return Ok(None),
+            ManagedJourneyEnd::ExecutionPicker(request) => return Ok(Some(request)),
             ManagedJourneyEnd::Navigate(target) => target,
             ManagedJourneyEnd::Failed(message) => {
                 initialized =
@@ -1147,17 +1153,28 @@ async fn build_root_model(
     Ok(model)
 }
 
+enum RootNavigation {
+    Managed(Option<chat_loop::ManagedOpenRequest>),
+    ExecutionPicker(crate::ExecutionPickerRequest),
+}
+
 // Construct the runtime and its run future outside the startup coroutine. Merely
 // boxing `run_root` would leave these large by-value temporaries in its poll frame.
 fn run_root_runtime<W: Write>(
     terminal: &mut Terminal<&mut W>,
     model: root_program::BcodeRuntimeModel,
-) -> impl std::future::Future<Output = Result<Option<chat_loop::ManagedOpenRequest>, TuiError>> {
+) -> impl std::future::Future<Output = Result<RootNavigation, TuiError>> {
     let (runtime, handle) = root_program::runtime(terminal, model);
     let run = Box::pin(root_program::run(runtime, handle));
     async move {
         let mut model = run.await?;
-        Ok(model.loop_state.take_managed_open())
+        Ok(
+            if let Some(request) = model.loop_state.execution_picker.take() {
+                RootNavigation::ExecutionPicker(request)
+            } else {
+                RootNavigation::Managed(model.loop_state.take_managed_open())
+            },
+        )
     }
 }
 
@@ -1176,6 +1193,14 @@ mod managed_reattach_tests {
             (
                 false,
                 ManagedRootOutcome::Exit(ManagedExitRequest::Navigate(None)),
+            ),
+            (
+                false,
+                ManagedRootOutcome::ExecutionPicker(crate::ExecutionPickerRequest {
+                    session_id: Some(SessionId::new()),
+                    draft: "retained".into(),
+                    working_directory: "/workspace".into(),
+                }),
             ),
             (true, ManagedRootOutcome::Closed),
         ] {
@@ -1207,7 +1232,7 @@ mod managed_reattach_tests {
             ManagedRootOutcome::Auth,
             ManagedRootOutcome::Exit(ManagedExitRequest::Recover),
         ] {
-            let result = finish_managed_attachment(Ok(outcome), async {
+            let result = finish_managed_attachment(Ok(outcome.clone()), async {
                 panic!("auth handoff and recovery must retain their command channel");
             })
             .await;

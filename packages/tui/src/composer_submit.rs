@@ -799,6 +799,7 @@ mod tests {
                 enabled: false,
                 size: area.size(),
             },
+            "",
         );
         let layout = panel.layout(Constraints::tight(area.size()), &mut LayoutCx::new());
         let editor = layout

@@ -31,7 +31,10 @@ pub(crate) mod cursor_blink;
 pub(crate) mod daemon_issue;
 pub(crate) mod effects;
 pub mod eval_launcher;
+mod execution_flow;
 mod execution_picker;
+mod native_setup;
+pub use execution_flow::{ExecutionPickerRequest, run_native_setup_in_shell};
 pub(crate) mod exit_state;
 pub(crate) mod filtered_list;
 pub(crate) mod foreground;
@@ -525,7 +528,7 @@ pub async fn run_plugin_surface(
 ) -> Result<(), TuiError> {
     let repo = resolved_surface_repo_path(&surface_kind, repo_path)?;
     if surface_kind == "ralph-home" {
-        return run_ralph_home(repo).await;
+        return Box::pin(run_ralph_home(repo)).await;
     }
     if surface_kind == "code-review" {
         if let Some(target) = options.get("target") {
@@ -584,25 +587,14 @@ fn resolved_surface_repo_path(
 /// Returns I/O or plugin service errors.
 #[allow(clippy::future_not_send)]
 pub async fn run_ralph_home(repo_path: std::path::PathBuf) -> Result<(), TuiError> {
-    let stdout = io::stdout();
-    let mut guard = CrosstermTerminalGuard::enter(stdout)?;
-    let result = {
-        let mut terminal = Terminal::new(
-            guard.writer_mut().ok_or_else(|| {
-                std::io::Error::other("terminal guard writer unavailable after entering terminal")
-            })?,
-            terminal_area()?,
-        );
-        Box::pin(runtime::run_event_loop_with_startup_and_static_bundled(
-            &mut terminal,
-            None,
-            startup_action::StartupTuiAction::OpenRalphHome { repo_path },
-            &static_bundled_plugins(),
-            TuiLaunchOptions::default(),
-        ))
-        .await
-    };
-    terminal_finalization_result(result, guard.leave().map(|_| ()).map_err(Into::into))
+    let mut shell = TerminalShell::enter()?;
+    let result = Box::pin(shell.run_plugin_surface(
+        "ralph-home".into(),
+        Some(repo_path),
+        std::collections::BTreeMap::new(),
+    ))
+    .await;
+    terminal_finalization_result(result, shell.finish())
 }
 
 /// Launch-scoped defaults copied into every turn admitted by this TUI.
@@ -682,42 +674,11 @@ pub async fn run_with_static_bundled_and_options(
     launch_options: TuiLaunchOptions,
 ) -> Result<(), TuiError> {
     set_build_info(build_info);
-    let stdout = io::stdout();
-    let mut guard = CrosstermTerminalGuard::enter(stdout)
-        .map_err(|error| io::Error::new(error.kind(), format!("entering terminal: {error}")))?;
-    let result = {
-        let mut terminal = Terminal::new(
-            guard.writer_mut().ok_or_else(|| {
-                std::io::Error::other("terminal guard writer unavailable after entering terminal")
-            })?,
-            terminal_area().map_err(|error| {
-                io::Error::new(
-                    error.kind(),
-                    format!("reading terminal dimensions: {error}"),
-                )
-            })?,
-        );
-        Box::pin(runtime::run_event_loop_with_static_bundled(
-            &mut terminal,
-            session_id,
-            static_plugins,
-            launch_options,
-        ))
-        .await
-        .map_err(|error| match error {
-            TuiError::Io(error) => {
-                io::Error::new(error.kind(), format!("running chat runtime: {error}")).into()
-            }
-            error => error,
-        })
-    };
-
-    terminal_finalization_result(
-        result,
-        guard.leave().map(|_| ()).map_err(|error| {
-            io::Error::new(error.kind(), format!("leaving chat terminal: {error}")).into()
-        }),
-    )
+    let mut shell = TerminalShell::enter()?;
+    let result = shell
+        .run_chat(session_id, static_plugins, launch_options)
+        .await;
+    terminal_finalization_result(result, shell.finish())
 }
 
 /// Run the full-screen review home/picker.

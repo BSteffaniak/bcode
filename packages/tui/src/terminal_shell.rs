@@ -151,8 +151,41 @@ impl TerminalShell {
         plugins: &[bcode_plugin::StaticBundledPlugin],
         options: TuiLaunchOptions,
     ) -> Result<(), TuiError> {
-        let result = self.run_chat_screen(session_id, plugins, options).await;
-        complete_runtime_screen(&mut self.handoff_blocked, result)
+        self.run_chat_with_draft(session_id, plugins, options, None)
+            .await
+    }
+
+    #[allow(clippy::future_not_send)]
+    pub(crate) async fn run_chat_with_draft(
+        &mut self,
+        session_id: Option<bcode_session_models::SessionId>,
+        plugins: &[bcode_plugin::StaticBundledPlugin],
+        options: TuiLaunchOptions,
+        mut draft: Option<String>,
+    ) -> Result<(), TuiError> {
+        let mut session_id = session_id;
+        loop {
+            let result = self
+                .run_chat_screen(session_id, plugins, options, draft.take())
+                .await;
+            let request = complete_runtime_screen(&mut self.handoff_blocked, result)?;
+            let Some(request) = request else {
+                return Ok(());
+            };
+            session_id = match Box::pin(self.select_execution(&request)).await {
+                Ok(target) => target,
+                Err(error) => {
+                    self.show_error_without_retry(&format!("Could not select execution backend: {error}. No fallback was selected; returning to your conversation.")).await?;
+                    request.session_id
+                }
+            };
+            if session_id == request.session_id {
+                draft = Some(request.draft);
+            }
+            if self.stop_requested() {
+                return Ok(());
+            }
+        }
     }
 
     #[allow(clippy::future_not_send)]
@@ -161,7 +194,8 @@ impl TerminalShell {
         session_id: Option<bcode_session_models::SessionId>,
         plugins: &[bcode_plugin::StaticBundledPlugin],
         options: TuiLaunchOptions,
-    ) -> Result<(), TuiError> {
+        draft: Option<String>,
+    ) -> Result<Option<crate::ExecutionPickerRequest>, TuiError> {
         let Some(connection) = self
             .wait(
                 "Connecting to the session…",
@@ -169,10 +203,10 @@ impl TerminalShell {
             )
             .await?
         else {
-            return Ok(());
+            return Ok(None);
         };
         if self.stop_requested() {
-            return Ok(());
+            return Ok(None);
         }
         let Some(presentation) = self
             .wait(
@@ -181,10 +215,10 @@ impl TerminalShell {
             )
             .await?
         else {
-            return Ok(());
+            return Ok(None);
         };
         if self.stop_requested() {
-            return Ok(());
+            return Ok(None);
         }
         Box::pin(crate::runtime::run_prepared_chat_with_presentation(
             &mut self.terminal()?,
@@ -192,6 +226,7 @@ impl TerminalShell {
             presentation,
             plugins,
             options,
+            draft,
         ))
         .await
     }
@@ -276,14 +311,7 @@ impl TerminalShell {
         let mut budget = crate::runtime::ManagedReentryBudget::default();
         let mut status = None;
         loop {
-            if bcode_config::encode_effective_config(&bcode_config::load_config()?)?
-                != expected_config
-            {
-                return Err(io::Error::other(
-                    "Managed configuration changed during auth recovery; reattach explicitly",
-                )
-                .into());
-            }
+            require_unchanged_config(&expected_config)?;
             let request =
                 crate::history_flow::initial_transcript_window_request(self.terminal()?.area());
             let Some((connection, attached)) =
@@ -295,9 +323,7 @@ impl TerminalShell {
                 return Ok(());
             }
             let binding = connection.binding().await?;
-            if let Some(expected) = &selected_target {
-                validate_selected_attachment(expected, &binding.target)?;
-            }
+            validate_selected_target(selected_target.as_ref(), &binding.target)?;
             let claim = (binding.instance, binding.target.generation());
             if expected_binding
                 .as_ref()
@@ -343,6 +369,11 @@ impl TerminalShell {
                         expected_binding = expected_binding.map(|(instance, _)| (instance, next));
                     }
                     status = Some(next_status);
+                }
+                crate::runtime::ManagedJourneyStep::End(
+                    crate::runtime::ManagedJourneyEnd::ExecutionPicker(request),
+                ) => {
+                    return Box::pin(self.run_execution_selection(request, plugins, options)).await;
                 }
                 crate::runtime::ManagedJourneyStep::End(
                     crate::runtime::ManagedJourneyEnd::Closed,
@@ -480,12 +511,21 @@ impl TerminalShell {
                 }
             }
             "ralph-home" => {
-                Box::pin(crate::runtime::run_event_loop_with_startup(
+                let request = Box::pin(crate::runtime::run_event_loop_with_startup(
                     &mut self.terminal()?,
                     None,
                     crate::startup_action::StartupTuiAction::OpenRalphHome { repo_path: repo },
                 ))
-                .await
+                .await?;
+                if let Some(request) = request {
+                    Box::pin(self.run_execution_selection(
+                        request,
+                        &[],
+                        TuiLaunchOptions::default(),
+                    ))
+                    .await?;
+                }
+                Ok(())
             }
             "eval-run-picker" => {
                 Box::pin(crate::eval_launcher::run_picker(
@@ -986,6 +1026,26 @@ fn paint_text<W: std::io::Write>(
             );
         }
     })?;
+    Ok(())
+}
+
+fn validate_selected_target(
+    expected: Option<&bcode_harness_models::HarnessSessionTarget>,
+    actual: &bcode_harness_models::HarnessSessionTarget,
+) -> Result<(), TuiError> {
+    if let Some(expected) = expected {
+        validate_selected_attachment(expected, actual)?;
+    }
+    Ok(())
+}
+
+fn require_unchanged_config(expected: &str) -> Result<(), TuiError> {
+    if bcode_config::encode_effective_config(&bcode_config::load_config()?)? != expected {
+        return Err(io::Error::other(
+            "Managed configuration changed during auth recovery; reattach explicitly",
+        )
+        .into());
+    }
     Ok(())
 }
 

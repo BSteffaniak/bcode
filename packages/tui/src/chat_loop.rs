@@ -269,6 +269,8 @@ pub struct ManagedOpenRequest {
     pub instance_id: String,
     /// Ownership generation observed by the binding lookup.
     pub generation: u64,
+    /// Ephemeral composer retained when returning from execution selection.
+    pub draft: Option<String>,
 }
 
 pub struct RootModelPicker {
@@ -359,6 +361,7 @@ pub struct ChatLoopState {
     pub(super) managed_model_selectors: std::collections::BTreeMap<String, String>,
     pub(super) managed_configure_in_flight: Option<String>,
     managed_open: Option<ManagedOpenRequest>,
+    pub(crate) execution_picker: Option<crate::ExecutionPickerRequest>,
     viewport_input_task: Option<tokio::task::JoinHandle<()>>,
     viewport_input_connection:
         std::sync::Arc<tokio::sync::Mutex<Option<bcode_client::ClientConnection>>>,
@@ -464,6 +467,7 @@ impl ChatLoopState {
             managed_model_selectors: std::collections::BTreeMap::new(),
             managed_configure_in_flight: None,
             managed_open: None,
+            execution_picker: None,
             foreground_client,
             passive_client: passive_client.cloned(),
             viewport_input_task: None,
@@ -4463,6 +4467,7 @@ pub fn apply_effect_result(
                 session_id,
                 instance_id: binding.instance.instance_id.clone(),
                 generation: binding.target.generation(),
+                draft: Some(chat.app.composer().text().to_owned()),
             });
             chat.app
                 .set_status("Opening the managed conversation…".to_owned());
@@ -5320,8 +5325,7 @@ fn apply_root_slash_command_outcome(
             chat.app.set_status("theme catalog shown".to_owned());
         }
         SlashCommandOutcome::PickModel => {
-            chat.replace_effect(TuiEffect::LoadModelProviders);
-            chat.app.set_status("loading model providers…".to_owned());
+            request_execution_picker(chat, loop_state);
         }
         SlashCommandOutcome::PickSkill => {
             chat.replace_effect(TuiEffect::LoadSkillPicker);
@@ -9027,4 +9031,41 @@ mod transcript_overlay_tests {
                 .is_some()
         );
     }
+}
+
+/// Yield the terminal only after foreground work finishes.
+pub fn request_execution_picker(chat: &mut ActiveChat, state: &mut ChatLoopState) {
+    if !matches!(chat.app.activity(), super::activity::ActivityState::Idle)
+        || (chat.app.managed_execution_session().is_some() && !chat.app.managed_input_ready())
+        || !chat.app.pending_external_interactions().is_empty()
+    {
+        chat.app
+            .set_status("Wait for the current turn to finish before changing model/backend".into());
+        return;
+    }
+    if bcode_config::load_config()
+        .is_ok_and(|config| config.plugins.disabled.contains("bcode.harness"))
+    {
+        chat.replace_effect(if chat.app.managed_execution_session().is_some() {
+            TuiEffect::LoadManagedModels
+        } else {
+            TuiEffect::LoadModelProviders
+        });
+        return;
+    }
+    let Ok(working_directory) = chat
+        .app
+        .working_directory()
+        .map(std::path::Path::to_path_buf)
+        .map_or_else(std::env::current_dir, Ok)
+    else {
+        chat.app
+            .set_status("Workspace unavailable; execution selection was not opened".into());
+        return;
+    };
+    state.execution_picker = Some(crate::ExecutionPickerRequest {
+        session_id: chat.attached_session_id(),
+        draft: chat.app.composer().text().to_owned(),
+        working_directory,
+    });
 }

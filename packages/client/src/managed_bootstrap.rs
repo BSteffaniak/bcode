@@ -148,6 +148,20 @@ impl ManagedSessionClient {
         Ok(response)
     }
 
+    /// List enabled provider identities for execution discovery without materializing model credentials.
+    /// # Errors
+    /// Returns application or transport failures; never performs provider requests.
+    pub async fn model_provider_ids(&self) -> Result<Vec<String>, ClientError> {
+        Ok(self
+            .inner
+            .plugin_services()
+            .await?
+            .into_iter()
+            .filter(|service| service.interface_id == bcode_model::MODEL_PROVIDER_INTERFACE_ID)
+            .map(|service| service.plugin_id)
+            .collect())
+    }
+
     /// Discover exact execution members without materializing an unrelated provider account.
     /// Native advertisements retain unknown entitlement/readiness unless independently proven.
     /// # Errors

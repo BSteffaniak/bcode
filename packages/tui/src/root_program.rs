@@ -4880,6 +4880,7 @@ impl bmux_tui_runtime::Program for BcodeRuntimeModel {
             || self.chat.app.should_exit()
             || self.chat.app.managed_exit_request().is_some()
             || self.loop_state.managed_open_requested()
+            || self.loop_state.execution_picker.is_some()
         {
             update = update.merge(bmux_tui_runtime::Update::exit());
         }

@@ -427,6 +427,7 @@ fn build_info() -> &'static bcode_build_info::BuildInfo {
 /// # Errors
 ///
 /// Returns an error when the requested command fails.
+#[allow(clippy::future_not_send)] // Interactive screens retain foreground terminal ownership.
 pub async fn run(build_info: bcode_build_info::BuildInfo) -> Result<(), CliError> {
     run_with_static_bundled(build_info, Vec::new()).await
 }
@@ -471,6 +472,7 @@ fn initialize_process_executables() -> Result<(), CliError> {
 ///
 /// # Panics
 /// Panics when CLI startup is initialized more than once in one process.
+#[allow(clippy::future_not_send)] // Interactive screens retain foreground terminal ownership.
 pub async fn run_with_static_bundled(
     artifact_build_info: bcode_build_info::BuildInfo,
     static_plugins: Vec<bcode_plugin::StaticBundledPlugin>,
@@ -550,7 +552,7 @@ pub async fn run_with_static_bundled(
             }) => {
                 let repo_path = resolve_surface_repo_path(repo_path)?;
                 let surface: std::pin::Pin<
-                    Box<dyn std::future::Future<Output = Result<(), CliError>> + Send>,
+                    Box<dyn std::future::Future<Output = Result<(), CliError>>>,
                 > = Box::pin(run_plugin_surface_in_shell(
                     surface_kind,
                     repo_path,

@@ -452,6 +452,21 @@ shows live native work: a submitted foreground turn without a terminal result, u
 authoritative settlement, or nonterminal background work or continuations. Idle managed
 sessions may still stop; they remain recoverable.
 
+## Selecting a backend from an open conversation
+
+`/model` opens the execution picker from ordinary and managed conversations. It lists
+provider and configured native models with their backend/account identity. The picker's
+setup/sign-in action uses the same native installation review and login journey as startup;
+it remains reachable while discovery is pending or fails. Discovery never sends a test prompt.
+
+Selection uses the central execution resolver. Provider model changes retain ordinary
+sessions; native model changes on the exact attached instance use native configuration.
+Crossing backends creates a new conversation in the current workspace without copying
+history or changing the startup default. The previous conversation remains in Sessions.
+Selection is unavailable until the current turn and pending native interactions finish.
+Cancellation and errors return to the originating conversation without provider fallback;
+uncertain starts must be inspected in Sessions before another creation attempt.
+
 ## TUI managed chat parity
 
 The TUI presents a managed conversation in the same root UI as a native Bcode chat. The
@@ -478,9 +493,10 @@ policy lives in `packages/tui/src/managed_controls.rs`; transitions in
   client. Submission, interruption, responses, configuration and model execution never use
   it. Opening another session or starting a new one ends the managed root and continues in
   the ordinary route, which reroutes managed sessions back to managed reattachment.
-* **Native settings.** `/model`, `/models` and the model picker list the attached
-  instance's advertised execution models and switch through `managed_session_configure`
-  with `HarnessSessionSetting::Model` (the native selector). `/plan` selects
+* **Native settings.** `/model` and `/models` open the shared execution picker. Choosing
+  another advertised model on the exact attached instance switches through
+  `managed_session_configure` with `HarnessSessionSetting::Model` (the native selector);
+  choosing another backend opens a new conversation. `/plan` selects
   `PermissionMode::Plan`, `/build` selects `Default`, `/agent plan|build|accept-edits`
   selects explicitly, and the agent-cycle key cycles Default → AcceptEdits → Plan. Each
   change uses a fresh mutation identity; at most one is in flight and ambiguous outcomes

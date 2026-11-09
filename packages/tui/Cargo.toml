@@ -24,6 +24,7 @@ bcode_ipc = { workspace = true }
 bcode_markdown_render = { workspace = true }
 bcode_metrics = { workspace = true }
 bcode_model = { workspace = true }
+bcode_model_catalog = { workspace = true }
 bcode_plugin = { workspace = true }
 bcode_plugin_sdk = { workspace = true, features = ["tui"] }
 bcode_presentation_policy = { workspace = true }
