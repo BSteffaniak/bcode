@@ -1,7 +1,7 @@
 //! Process-local rows (spec section 3.3, LR1–LR7): pending submissions and notices the host
 //! owns, reduced through the same update path as content changes.
 
-use std::time::Instant;
+use web_time::Instant;
 
 use bcode_session_view_models::TranscriptChanges;
 

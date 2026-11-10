@@ -24,7 +24,7 @@ bcode_hyperchad_ui = { workspace = true }
 bcode_ipc = { workspace = true }
 bcode_plugin_sdk = { workspace = true }
 bcode_session_models = { workspace = true }
-bcode_session_view = { workspace = true }
+bcode_session_view = { workspace = true, features = ["client"] }
 bcode_session_view_models = { workspace = true }
 bcode_tool = { workspace = true }
 hyperchad = { workspace = true, features = [

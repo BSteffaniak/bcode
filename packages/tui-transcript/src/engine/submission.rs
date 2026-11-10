@@ -5,7 +5,7 @@
 //! tail window is loaded first and the reveal applies once it is incorporated (T27). Staged
 //! submissions never reach the engine (C8).
 
-use std::time::Instant;
+use web_time::Instant;
 
 use crate::navigation::{NavInput, RemovedUnits};
 use crate::units::UnitKey;
@@ -29,7 +29,7 @@ impl TranscriptEngine {
 
 #[cfg(test)]
 mod tests {
-    use std::time::Instant;
+    use web_time::Instant;
 
     use bcode_session_models::{
         ClientId, SessionEvent, SessionEventKind, SessionId, TurnAdmissionMetadata,

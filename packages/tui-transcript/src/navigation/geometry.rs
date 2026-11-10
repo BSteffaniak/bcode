@@ -3,7 +3,7 @@
 //! Every row here is computed from the keyed position and the current measured index on
 //! demand; nothing is stored across inputs.
 
-use std::time::Instant;
+use web_time::Instant;
 
 use bmux_tui_components::virtual_list::{self as vl, anchor_at_offset};
 

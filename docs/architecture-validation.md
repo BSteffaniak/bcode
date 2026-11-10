@@ -22,6 +22,10 @@ dev-only edges, includes build edges, and reports a dependency path for each vio
 * Minimal app and CLI profiles exclude heavyweight optional implementations; distribution and
   web-enabled profiles include their intended implementations.
 * The bundled-plugin registry without features excludes search backends.
+* The transcript engine (`bcode_tui_transcript`) and the browser surface (`bcode_tui_web` with
+  `wasm`) resolve without the daemon client, plugin hosting or provider authentication, so both
+  compile for `wasm32-unknown-unknown`. `bcode_session_view` gates its daemon-backed helpers behind
+  its `client` feature, which only native hosts enable.
 * The `app` profile excludes the git client (`bcode_git_ui`); `distribution` includes it.
 * The standalone `bcode-git` binary excludes plugin hosting, configuration, the main TUI, client,
   server, session, agent runtime, model and HTTP crates.

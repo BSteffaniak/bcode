@@ -8,7 +8,8 @@
 //! reservation cannot cause its own visibility (C19). Frame preparation only copies the stored
 //! decision. Activity code never emits navigation (N9).
 
-use std::time::{Duration, Instant};
+use std::time::Duration;
+use web_time::Instant;
 
 use crate::units::Units;
 use crate::viewport::{ViewportFrame, ViewportGeometry};
@@ -241,7 +242,8 @@ impl LatestBar {
 
 #[cfg(test)]
 mod tests {
-    use std::time::{Duration, Instant};
+    use std::time::Duration;
+    use web_time::Instant;
 
     use super::{LatestActivity, LatestBar, LatestBarState, MAX_ACTIVITY_BURST};
     use crate::viewport::ViewportGeometry;

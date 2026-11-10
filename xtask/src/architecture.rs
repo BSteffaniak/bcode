@@ -407,6 +407,22 @@ const FEATURE_PROFILES: &[FeatureProfile] = &[
         &[],
     ),
     (
+        // The transcript engine and browser surface compile for wasm32: without the
+        // `client` feature, session-view leaves daemon transport and plugin hosting out.
+        "bcode_tui_transcript",
+        "packages/tui-transcript",
+        "",
+        &["bcode_session_view"],
+        &["bcode_client", "bcode_plugin_sdk", "bcode_provider_auth"],
+    ),
+    (
+        "bcode_tui_web",
+        "packages/tui-web",
+        "wasm",
+        &["bcode_tui_transcript", "bmux_web_renderer"],
+        &["bcode_client", "bcode_plugin_sdk", "bcode_provider_auth"],
+    ),
+    (
         "bcode_bundled_plugins",
         "packages/bundled-plugins",
         "",

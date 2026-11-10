@@ -2,7 +2,7 @@
 //! retained layouts, logical endpoints resolved from them, the copied source text, and the
 //! selection surviving scrolling (C34, BMUX 13).
 
-use std::time::Instant;
+use web_time::Instant;
 
 use bcode_session_models::{
     ClientId, SessionEvent, SessionEventKind, SessionId, TurnAdmissionMetadata,

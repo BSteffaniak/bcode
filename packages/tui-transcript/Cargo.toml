@@ -22,6 +22,7 @@ bcode_tui_theme           = { workspace = true }
 bmux_tui                  = { workspace = true }
 bmux_tui_components       = { workspace = true, features = ["resident-window", "virtual-list"] }
 serde_json                = { workspace = true }
+web-time                  = { workspace = true }
 
 [dev-dependencies]
 proptest = { workspace = true }

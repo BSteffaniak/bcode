@@ -14,9 +14,10 @@ pub mod interaction;
 pub mod interaction_application;
 pub mod milestones;
 pub mod settled_turn;
+/// Human-friendly path presentation helpers.
+pub use bcode_path_display as path;
 /// Portable contributor-owned action declarations.
 pub use bcode_plugin_models::keymap;
-pub mod path;
 #[doc(hidden)]
 pub mod static_lifecycle;
 #[cfg(feature = "tui")]

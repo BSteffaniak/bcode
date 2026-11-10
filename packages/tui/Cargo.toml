@@ -34,7 +34,7 @@ bcode_ralph = { workspace = true }
 bcode_ralph_models = { workspace = true }
 bcode_session_models = { workspace = true }
 bcode_session_search = { workspace = true }
-bcode_session_view = { workspace = true }
+bcode_session_view = { workspace = true, features = ["client"] }
 bcode_session_view_models = { workspace = true }
 bcode_settings = { workspace = true }
 bcode_skill_models = { workspace = true }

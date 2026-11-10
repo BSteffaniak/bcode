@@ -16,7 +16,8 @@ mod tests;
 pub use facts::{Correspondence, NoUnitFacts, RemovedUnits, UnitFacts, UnitRole};
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::time::{Duration, Instant};
+use std::time::Duration;
+use web_time::Instant;
 
 use bcode_session_view_models::TranscriptChanges;
 use bmux_tui::style::Easing;

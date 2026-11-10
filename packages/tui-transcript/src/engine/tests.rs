@@ -1,7 +1,8 @@
 //! Engine façade tests: attach, incorporation order (W3/N11), timers, frames and stale
 //! requests, observed through prepared frames and painted rows.
 
-use std::time::{Duration, Instant};
+use std::time::Duration;
+use web_time::Instant;
 
 use bcode_session_models::{
     ClientId, SessionEvent, SessionEventKind, SessionId, TurnAdmissionMetadata,

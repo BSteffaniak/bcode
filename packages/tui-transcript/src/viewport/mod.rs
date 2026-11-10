@@ -520,7 +520,8 @@ mod splice_tests;
 
 #[cfg(test)]
 mod tests {
-    use std::time::{Duration, Instant};
+    use std::time::Duration;
+    use web_time::Instant;
 
     use bcode_session_view_models::TranscriptViewItemId;
     use bmux_tui::style::Easing;

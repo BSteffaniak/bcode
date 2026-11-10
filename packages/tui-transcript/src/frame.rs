@@ -4,7 +4,7 @@
 //! clock (BMUX 8): one instant sampled per presentation and handed to every layout and paint
 //! context of the frame.
 
-use std::time::Instant;
+use web_time::Instant;
 
 use bmux_tui::clock::PresentationClock;
 

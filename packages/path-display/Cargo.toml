@@ -1,0 +1,15 @@
+[package]
+authors     = { workspace = true }
+categories  = ["development-tools"]
+description = "Bounded, working-directory-relative path presentation for Bcode"
+edition     = { workspace = true }
+keywords    = ["bcode", "path", "display"]
+license     = { workspace = true }
+name        = "bcode_path_display"
+readme      = { workspace = true }
+repository  = { workspace = true }
+version     = { workspace = true }
+
+[features]
+default          = []
+fail-on-warnings = []

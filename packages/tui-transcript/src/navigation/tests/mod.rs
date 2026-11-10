@@ -4,7 +4,8 @@ mod properties;
 mod transitions;
 
 use std::collections::BTreeMap;
-use std::time::{Duration, Instant};
+use std::time::Duration;
+use web_time::Instant;
 
 use bcode_session_view_models::{TranscriptChange, TranscriptChanges, TranscriptViewItemId};
 use bmux_tui_components::virtual_list::{

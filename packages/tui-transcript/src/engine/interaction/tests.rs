@@ -1,6 +1,7 @@
 //! Focus (section 6) and latest-bar (F6, C18–C21) behavior through the engine façade.
 
-use std::time::{Duration, Instant};
+use std::time::Duration;
+use web_time::Instant;
 
 use bcode_presentation_policy::models::Disclosure;
 use bcode_session_models::{

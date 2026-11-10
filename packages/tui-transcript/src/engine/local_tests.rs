@@ -1,6 +1,7 @@
 //! Process-local rows (LR1–LR7) observed through prepared and painted frames.
 
-use std::time::{Duration, Instant};
+use std::time::Duration;
+use web_time::Instant;
 
 use bcode_session_models::{
     ClientId, SessionEvent, SessionEventKind, SessionId, TurnAdmissionMetadata,

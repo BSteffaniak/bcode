@@ -7,7 +7,7 @@
 //! the new state for the host to apply. External destinations, session links and the Mermaid
 //! source view are host concerns ([`MarkdownActivation`]).
 
-use std::time::Instant;
+use web_time::Instant;
 
 use bcode_markdown_render::MarkdownContributionKind;
 use bmux_tui::component::LogicalRect;

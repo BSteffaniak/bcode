@@ -1,7 +1,7 @@
 //! Transcript tooling through the engine façade: bulk disclosure, detail cycling, inspection,
 //! per-tool defaults, inline shell expansion and inline interaction reservations.
 
-use std::time::Instant;
+use web_time::Instant;
 
 use bcode_presentation_policy::models::{Disclosure, LayerSource, PresentationRule, UnitKind};
 use bcode_session_models::{

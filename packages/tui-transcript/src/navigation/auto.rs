@@ -17,7 +17,7 @@
 //! A content input inspects only the units after the last admitted unit and the deferred
 //! segments, never the whole resident window (D11).
 
-use std::time::Instant;
+use web_time::Instant;
 
 use super::{NavInput, NavMode, NavState, NavTimer, NavView, UnitRole};
 use crate::units::UnitKey;

@@ -6,7 +6,7 @@
 //! without it they apply to every resident unit and group. Every change goes through the
 //! structure resolver and one content update, so anchors keep the reading position (P1, U2).
 
-use std::time::Instant;
+use web_time::Instant;
 
 use bcode_presentation_policy::models::{Disclosure, PresentationRule, UnitKind};
 use bcode_session_view_models::TranscriptChanges;

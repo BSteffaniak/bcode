@@ -7,9 +7,10 @@
 //! This crate owns the application of durable and live session events into semantic view state that
 //! terminal, web, and future renderers can consume without inheriting terminal layout concerns.
 
-#[cfg(test)]
+#[cfg(all(test, feature = "client"))]
 mod queue_tests;
 
+#[cfg(feature = "client")]
 mod actions;
 pub mod child_activity;
 pub mod child_attention;
@@ -20,11 +21,12 @@ pub mod external_projection;
 mod external_reducer;
 pub mod navigation;
 pub mod presentation;
+mod queue_refresh;
 pub mod window_ops;
 
-pub use actions::{
-    execute_session_view_action, hydrate_submission_queue, submission_queue_needs_refresh,
-};
+#[cfg(feature = "client")]
+pub use actions::{execute_session_view_action, hydrate_submission_queue};
+pub use queue_refresh::submission_queue_needs_refresh;
 
 use bcode_session_models::{
     SessionEvent, SessionEventKind, SessionId, SessionLiveEvent, SessionLiveEventKind,
@@ -39,8 +41,9 @@ use bcode_session_view_models::{
     TranscriptViewItem, TranscriptViewItemId, TranscriptViewItemKind, TurnOutputLocation,
 };
 use std::collections::{BTreeMap, BTreeSet};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 use unicode_segmentation::UnicodeSegmentation;
+use web_time::Instant;
 
 #[derive(Clone, Copy)]
 enum StreamAdmission {
@@ -1187,10 +1190,10 @@ fn stage_path_display(
     use bcode_session_view_models::retention::{
         ObservationRetentionExceeded, ObservationRetentionUsage,
     };
-    let displayed = bcode_plugin_sdk::path::display_bounded(
+    let displayed = bcode_path_display::display_bounded(
         path,
         cwd,
-        bcode_plugin_sdk::path::PathDisplayLimits {
+        bcode_path_display::PathDisplayLimits {
             scalar_capacity_bytes: limits.scalar_capacity_bytes,
             collection_entries: limits.collection_entries,
             value_nodes: limits.value_nodes,
@@ -1213,7 +1216,7 @@ fn stage_path_display(
         },
     )
     .map_err(|_| ObservationRetentionExceeded)?;
-    let bcode_plugin_sdk::path::BoundedPathDisplay {
+    let bcode_path_display::BoundedPathDisplay {
         output,
         admission: (mut admitted, peak),
     } = displayed;
@@ -1605,9 +1608,11 @@ struct ToolInvocationAggregate {
     terminal_status: Option<ToolInvocationViewStatus>,
     request_draft: Option<ToolRequestDraftView>,
     terminal_request_draft: Option<(u64, u64)>,
-    presentations:
-        BTreeMap<bcode_tool::ToolPresentationIdentity, bcode_tool::ToolPresentationUpdate>,
-    presentation_scope: bcode_tool::ToolPresentationUpdateScope,
+    presentations: BTreeMap<
+        bcode_tool_models::ToolPresentationIdentity,
+        bcode_tool_models::ToolPresentationUpdate,
+    >,
+    presentation_scope: bcode_tool_models::ToolPresentationUpdateScope,
 }
 
 impl ToolInvocationAggregate {
@@ -1896,7 +1901,7 @@ fn rich_tool_owns_key(key: &str, id: &str) -> bool {
 }
 
 fn inspect_presentation_fences(
-    presentation_scope: &bcode_tool::ToolPresentationUpdateScope,
+    presentation_scope: &bcode_tool_models::ToolPresentationUpdateScope,
     usage: &mut bcode_session_view_models::retention::ObservationRetentionUsage,
     limits: bcode_session_view_models::retention::ObservationRetentionLimits,
 ) -> Result<(), bcode_session_view_models::retention::ObservationRetentionExceeded> {
@@ -1916,8 +1921,8 @@ fn inspect_presentation_fences(
             limits,
         )?;
         match identity {
-            bcode_tool::ToolPresentationIdentity::Primary => {}
-            bcode_tool::ToolPresentationIdentity::Supplemental { item_id } => {
+            bcode_tool_models::ToolPresentationIdentity::Primary => {}
+            bcode_tool_models::ToolPresentationIdentity::Supplemental { item_id } => {
                 usage.try_add(ObservationRetentionUsage::string(item_id, 5), limits)?;
             }
         }
@@ -3325,13 +3330,13 @@ mod text_update_retention_tests {
             argument_bytes: 2,
             truncated: false,
         };
-        let presentation = |identity| bcode_tool::ToolPresentationUpdate {
+        let presentation = |identity| bcode_tool_models::ToolPresentationUpdate {
             invocation_id: "call".into(),
             producer_id: "plugin".into(),
             generation: 0,
             revision: 1,
             identity,
-            retention: bcode_tool::ToolPresentationRetention::RetainLatest,
+            retention: bcode_tool_models::ToolPresentationRetention::RetainLatest,
             schema: "card".into(),
             schema_version: 1,
             artifact: None,
@@ -3340,10 +3345,10 @@ mod text_update_retention_tests {
         for kind in [
             SessionLiveEventKind::ToolRequestDraft { event: draft },
             SessionLiveEventKind::ToolPresentationUpdated {
-                update: presentation(bcode_tool::ToolPresentationIdentity::Primary),
+                update: presentation(bcode_tool_models::ToolPresentationIdentity::Primary),
             },
             SessionLiveEventKind::ToolPresentationUpdated {
-                update: presentation(bcode_tool::ToolPresentationIdentity::Supplemental {
+                update: presentation(bcode_tool_models::ToolPresentationIdentity::Supplemental {
                     item_id: "details".into(),
                 }),
             },
@@ -4907,8 +4912,8 @@ impl SessionView {
             for (identity, presentation) in presentations {
                 // The identity is retained independently from the update.
                 match identity {
-                    bcode_tool::ToolPresentationIdentity::Primary => {}
-                    bcode_tool::ToolPresentationIdentity::Supplemental { item_id } => {
+                    bcode_tool_models::ToolPresentationIdentity::Primary => {}
+                    bcode_tool_models::ToolPresentationIdentity::Supplemental { item_id } => {
                         usage.try_add(ObservationRetentionUsage::string(item_id, 4), limits)?;
                     }
                 }
@@ -4985,8 +4990,8 @@ impl SessionView {
     pub fn presentation_update(
         &self,
         invocation_id: &str,
-        identity: &bcode_tool::ToolPresentationIdentity,
-    ) -> Option<&bcode_tool::ToolPresentationUpdate> {
+        identity: &bcode_tool_models::ToolPresentationIdentity,
+    ) -> Option<&bcode_tool_models::ToolPresentationUpdate> {
         self.tool_invocations
             .get(invocation_id)
             .and_then(|aggregate| aggregate.presentations.get(identity))
@@ -5922,15 +5927,15 @@ impl SessionView {
 
     fn project_presentation_bounded(
         &mut self,
-        update: &bcode_tool::ToolPresentationUpdate,
+        update: &bcode_tool_models::ToolPresentationUpdate,
         next: &mut bcode_session_view_models::retention::ObservationRetentionUsage,
         limits: bcode_session_view_models::retention::ObservationRetentionLimits,
     ) -> Result<(), bcode_session_view_models::retention::ObservationRetentionExceeded> {
         match &update.identity {
-            bcode_tool::ToolPresentationIdentity::Primary => {
+            bcode_tool_models::ToolPresentationIdentity::Primary => {
                 self.project_primary_bounded(update, next, limits)
             }
-            bcode_tool::ToolPresentationIdentity::Supplemental { item_id } => {
+            bcode_tool_models::ToolPresentationIdentity::Supplemental { item_id } => {
                 self.project_supplemental_bounded(update, item_id, next, limits)
             }
         }
@@ -5938,7 +5943,7 @@ impl SessionView {
 
     fn project_primary_bounded(
         &mut self,
-        update: &bcode_tool::ToolPresentationUpdate,
+        update: &bcode_tool_models::ToolPresentationUpdate,
         next: &mut bcode_session_view_models::retention::ObservationRetentionUsage,
         limits: bcode_session_view_models::retention::ObservationRetentionLimits,
     ) -> Result<(), bcode_session_view_models::retention::ObservationRetentionExceeded> {
@@ -6008,7 +6013,7 @@ impl SessionView {
     }
     fn project_supplemental_bounded(
         &mut self,
-        update: &bcode_tool::ToolPresentationUpdate,
+        update: &bcode_tool_models::ToolPresentationUpdate,
         item_id: &str,
         next: &mut bcode_session_view_models::retention::ObservationRetentionUsage,
         limits: bcode_session_view_models::retention::ObservationRetentionLimits,
@@ -6031,7 +6036,9 @@ impl SessionView {
             schema: owned.schema,
             schema_version: owned.schema_version,
             operation: bcode_session_models::ToolContributionOperation::Upsert,
-            persistence: if owned.retention == bcode_tool::ToolPresentationRetention::RetainLatest {
+            persistence: if owned.retention
+                == bcode_tool_models::ToolPresentationRetention::RetainLatest
+            {
                 bcode_session_models::ToolContributionPersistence::Durable
             } else {
                 bcode_session_models::ToolContributionPersistence::Transient
@@ -8538,10 +8545,10 @@ impl SessionView {
             .working_directory
             .as_ref()
             .ok_or(ObservationRetentionExceeded)?;
-        let displayed = bcode_plugin_sdk::path::display_bounded(
+        let displayed = bcode_path_display::display_bounded(
             state_dir,
             cwd,
-            bcode_plugin_sdk::path::PathDisplayLimits {
+            bcode_path_display::PathDisplayLimits {
                 scalar_capacity_bytes: limits.scalar_capacity_bytes,
                 collection_entries: limits.collection_entries,
                 value_nodes: limits.value_nodes,
@@ -8566,7 +8573,7 @@ impl SessionView {
         .map_err(|_| ObservationRetentionExceeded)?;
         // The returned admission owner holds the complete temporary peak. All
         // temporary path buffers are already dropped by display_bounded.
-        let bcode_plugin_sdk::path::BoundedPathDisplay {
+        let bcode_path_display::BoundedPathDisplay {
             output,
             admission: (mut next, peak),
         } = displayed;
@@ -10892,7 +10899,8 @@ impl SessionView {
                     .entry(record.invocation_id.clone())
                     .or_default();
                 if let Some(presentation) = record.presentation.as_ref()
-                    && presentation.retention == bcode_tool::ToolPresentationRetention::RetainLatest
+                    && presentation.retention
+                        == bcode_tool_models::ToolPresentationRetention::RetainLatest
                 {
                     let replace = aggregate
                         .presentations
@@ -11273,10 +11281,8 @@ impl SessionView {
                 ..
             } => {
                 let state_dir = self.snapshot.working_directory.as_ref().map_or_else(
-                    || bcode_plugin_sdk::path::display_from_current_dir(state_dir),
-                    |working_directory| {
-                        bcode_plugin_sdk::path::display(state_dir, working_directory)
-                    },
+                    || bcode_path_display::display_from_current_dir(state_dir),
+                    |working_directory| bcode_path_display::display(state_dir, working_directory),
                 );
                 self.push_item(
                     TranscriptViewItemId::event(event.sequence),
@@ -13123,7 +13129,7 @@ impl SessionView {
 
     fn reduce_presentation_bounded(
         &mut self,
-        update: &bcode_tool::ToolPresentationUpdate,
+        update: &bcode_tool_models::ToolPresentationUpdate,
         next: &mut bcode_session_view_models::retention::ObservationRetentionUsage,
         limits: bcode_session_view_models::retention::ObservationRetentionLimits,
     ) -> Result<(), bcode_session_view_models::retention::ObservationRetentionExceeded> {
@@ -13146,15 +13152,17 @@ impl SessionView {
             },
             limits,
         )?;
-        if let bcode_tool::ToolPresentationIdentity::Supplemental { item_id } = &update.identity {
+        if let bcode_tool_models::ToolPresentationIdentity::Supplemental { item_id } =
+            &update.identity
+        {
             next.try_add(ObservationRetentionUsage::string(item_id, 5), limits)?;
         }
         let identity = match &update.identity {
-            bcode_tool::ToolPresentationIdentity::Primary => {
-                bcode_tool::ToolPresentationIdentity::Primary
+            bcode_tool_models::ToolPresentationIdentity::Primary => {
+                bcode_tool_models::ToolPresentationIdentity::Primary
             }
-            bcode_tool::ToolPresentationIdentity::Supplemental { item_id } => {
-                bcode_tool::ToolPresentationIdentity::Supplemental {
+            bcode_tool_models::ToolPresentationIdentity::Supplemental { item_id } => {
+                bcode_tool_models::ToolPresentationIdentity::Supplemental {
                     item_id: next.try_clone_string(item_id, 4, limits)?,
                 }
             }
@@ -13166,8 +13174,8 @@ impl SessionView {
         {
             Ok(()) => {}
             Err(
-                bcode_tool::ToolPresentationUpdateError::TooLarge { .. }
-                | bcode_tool::ToolPresentationUpdateError::Encode(_),
+                bcode_tool_models::ToolPresentationUpdateError::TooLarge { .. }
+                | bcode_tool_models::ToolPresentationUpdateError::Encode(_),
             ) => {
                 return Err(bcode_session_view_models::retention::ObservationRetentionExceeded);
             }
@@ -13699,7 +13707,7 @@ impl SessionView {
             .transpose()?;
         if let Some(update) = aggregate
             .presentations
-            .get(&bcode_tool::ToolPresentationIdentity::Primary)
+            .get(&bcode_tool_models::ToolPresentationIdentity::Primary)
         {
             let owned = clone_admitted(update, next, limits, |value| {
                 bcode_session_models::retention_events::inspect_tool_presentation(value, &limits)
@@ -13964,7 +13972,7 @@ impl SessionView {
             return Ok(());
         }
         if let Some(update) = &record.presentation
-            && update.retention == bcode_tool::ToolPresentationRetention::RetainLatest
+            && update.retention == bcode_tool_models::ToolPresentationRetention::RetainLatest
             && aggregate
                 .presentations
                 .get(&update.identity)
@@ -13976,11 +13984,11 @@ impl SessionView {
                 bcode_session_models::retention_events::inspect_tool_presentation(value, &limits)
             })?;
             let identity = match &update.identity {
-                bcode_tool::ToolPresentationIdentity::Primary => {
-                    bcode_tool::ToolPresentationIdentity::Primary
+                bcode_tool_models::ToolPresentationIdentity::Primary => {
+                    bcode_tool_models::ToolPresentationIdentity::Primary
                 }
-                bcode_tool::ToolPresentationIdentity::Supplemental { item_id } => {
-                    bcode_tool::ToolPresentationIdentity::Supplemental {
+                bcode_tool_models::ToolPresentationIdentity::Supplemental { item_id } => {
+                    bcode_tool_models::ToolPresentationIdentity::Supplemental {
                         item_id: next.try_clone_string(item_id, 4, limits)?,
                     }
                 }
@@ -14112,10 +14120,11 @@ impl SessionView {
         aggregate.presentation_scope.close();
         let mut removed = false;
         for (identity, update) in &aggregate.presentations {
-            if update.retention != bcode_tool::ToolPresentationRetention::ActiveOnly {
+            if update.retention != bcode_tool_models::ToolPresentationRetention::ActiveOnly {
                 continue;
             }
-            if let bcode_tool::ToolPresentationIdentity::Supplemental { item_id } = identity {
+            if let bcode_tool_models::ToolPresentationIdentity::Supplemental { item_id } = identity
+            {
                 let item_id = format_observation_text(
                     format_args!("tool:{id}:supplemental:{item_id}"),
                     next,
@@ -14131,7 +14140,7 @@ impl SessionView {
             }
         }
         aggregate.presentations.retain(|_, update| {
-            update.retention == bcode_tool::ToolPresentationRetention::RetainLatest
+            update.retention == bcode_tool_models::ToolPresentationRetention::RetainLatest
         });
         if removed {
             self.snapshot.transcript.revision = self.snapshot.transcript.revision.saturating_add(1);
@@ -15279,7 +15288,7 @@ impl SessionView {
     }
 
     #[allow(clippy::too_many_lines)] // One state-machine handler keeps generation/revision/offset transitions atomic.
-    fn apply_presentation_update(&mut self, update: &bcode_tool::ToolPresentationUpdate) {
+    fn apply_presentation_update(&mut self, update: &bcode_tool_models::ToolPresentationUpdate) {
         if self
             .tool_invocations
             .get(&update.invocation_id)
@@ -15303,7 +15312,7 @@ impl SessionView {
             .insert(update.identity.clone(), update.clone());
         if matches!(
             update.identity,
-            bcode_tool::ToolPresentationIdentity::Primary
+            bcode_tool_models::ToolPresentationIdentity::Primary
         ) {
             let presentation = self.current_primary_presentation(&update.invocation_id);
             if let Some(tool) = self.snapshot.tools.get_mut(&update.invocation_id) {
@@ -15335,7 +15344,7 @@ impl SessionView {
                 self.upsert_tool_item(&update.invocation_id, 0, None);
                 return;
             }
-        } else if let bcode_tool::ToolPresentationIdentity::Supplemental { item_id } =
+        } else if let bcode_tool_models::ToolPresentationIdentity::Supplemental { item_id } =
             &update.identity
         {
             let id = TranscriptViewItemId::tool_supplemental(&update.invocation_id, item_id);
@@ -16350,18 +16359,18 @@ impl SessionView {
             .presentations
             .iter()
             .filter_map(|(identity, update)| {
-                (update.retention == bcode_tool::ToolPresentationRetention::ActiveOnly)
+                (update.retention == bcode_tool_models::ToolPresentationRetention::ActiveOnly)
                     .then_some(identity)
             })
             .filter_map(|identity| match identity {
-                bcode_tool::ToolPresentationIdentity::Primary => None,
-                bcode_tool::ToolPresentationIdentity::Supplemental { item_id } => Some(
+                bcode_tool_models::ToolPresentationIdentity::Primary => None,
+                bcode_tool_models::ToolPresentationIdentity::Supplemental { item_id } => Some(
                     TranscriptViewItemId::tool_supplemental(invocation_id, item_id),
                 ),
             })
             .collect::<BTreeSet<_>>();
         aggregate.presentations.retain(|_, update| {
-            update.retention == bcode_tool::ToolPresentationRetention::RetainLatest
+            update.retention == bcode_tool_models::ToolPresentationRetention::RetainLatest
         });
         if active_supplementals.is_empty() {
             return;
@@ -16385,7 +16394,7 @@ impl SessionView {
             .and_then(|aggregate| {
                 aggregate
                     .presentations
-                    .get(&bcode_tool::ToolPresentationIdentity::Primary)
+                    .get(&bcode_tool_models::ToolPresentationIdentity::Primary)
             })
             .map(Into::into)
     }
@@ -17298,11 +17307,11 @@ impl SessionView {
 }
 
 fn presentation_update_contribution(
-    update: &bcode_tool::ToolPresentationUpdate,
+    update: &bcode_tool_models::ToolPresentationUpdate,
 ) -> bcode_session_models::ToolContributionEvent {
     let contribution_id = match &update.identity {
-        bcode_tool::ToolPresentationIdentity::Primary => "primary".to_owned(),
-        bcode_tool::ToolPresentationIdentity::Supplemental { item_id } => item_id.clone(),
+        bcode_tool_models::ToolPresentationIdentity::Primary => "primary".to_owned(),
+        bcode_tool_models::ToolPresentationIdentity::Supplemental { item_id } => item_id.clone(),
     };
     bcode_session_models::ToolContributionEvent {
         invocation_id: update.invocation_id.clone(),
@@ -17313,10 +17322,10 @@ fn presentation_update_contribution(
         schema_version: update.schema_version,
         operation: bcode_session_models::ToolContributionOperation::Upsert,
         persistence: match update.retention {
-            bcode_tool::ToolPresentationRetention::RetainLatest => {
+            bcode_tool_models::ToolPresentationRetention::RetainLatest => {
                 bcode_session_models::ToolContributionPersistence::Durable
             }
-            bcode_tool::ToolPresentationRetention::ActiveOnly => {
+            bcode_tool_models::ToolPresentationRetention::ActiveOnly => {
                 bcode_session_models::ToolContributionPersistence::Transient
             }
         },
@@ -17359,7 +17368,7 @@ fn working_directory_changed_message(
     old_working_directory: &std::path::Path,
     new_working_directory: &std::path::Path,
 ) -> String {
-    use bcode_plugin_sdk::path::display;
+    use bcode_path_display::display;
 
     format!(
         "Working directory changed from `{}` to `{}`. Treat prior file/path assumptions as possibly stale unless reconfirmed.",
@@ -24033,13 +24042,13 @@ mod tests {
         view.apply_live_event(&SessionLiveEvent {
             session_id,
             kind: SessionLiveEventKind::ToolPresentationUpdated {
-                update: bcode_tool::ToolPresentationUpdate {
+                update: bcode_tool_models::ToolPresentationUpdate {
                     invocation_id: "call-presentation".to_owned(),
                     producer_id: "test.plugin".to_owned(),
                     generation: 0,
                     revision: 4,
-                    identity: bcode_tool::ToolPresentationIdentity::Primary,
-                    retention: bcode_tool::ToolPresentationRetention::RetainLatest,
+                    identity: bcode_tool_models::ToolPresentationIdentity::Primary,
+                    retention: bcode_tool_models::ToolPresentationRetention::RetainLatest,
                     schema: "test.presentation".to_owned(),
                     schema_version: 1,
                     artifact: None,
@@ -24061,7 +24070,7 @@ mod tests {
         assert_eq!(
             view.presentation_update(
                 "call-presentation",
-                &bcode_tool::ToolPresentationIdentity::Primary,
+                &bcode_tool_models::ToolPresentationIdentity::Primary,
             )
             .map(|update| (update.revision, update.payload.clone())),
             Some((4, serde_json::json!({"status": "current"})))
@@ -24093,13 +24102,13 @@ mod tests {
         let update = |revision| SessionLiveEvent {
             session_id,
             kind: SessionLiveEventKind::ToolPresentationUpdated {
-                update: bcode_tool::ToolPresentationUpdate {
+                update: bcode_tool_models::ToolPresentationUpdate {
                     invocation_id: "call-active".to_owned(),
                     producer_id: "test.plugin".to_owned(),
                     generation: 0,
                     revision,
-                    identity: bcode_tool::ToolPresentationIdentity::Primary,
-                    retention: bcode_tool::ToolPresentationRetention::RetainLatest,
+                    identity: bcode_tool_models::ToolPresentationIdentity::Primary,
+                    retention: bcode_tool_models::ToolPresentationRetention::RetainLatest,
                     schema: "test.presentation".to_owned(),
                     schema_version: 1,
                     artifact: None,
@@ -24955,15 +24964,15 @@ mod tests {
         view.apply_live_event(&SessionLiveEvent {
             session_id,
             kind: SessionLiveEventKind::ToolPresentationUpdated {
-                update: bcode_tool::ToolPresentationUpdate {
+                update: bcode_tool_models::ToolPresentationUpdate {
                     invocation_id: "call-1".to_owned(),
                     producer_id: "test.plugin".to_owned(),
                     generation: 0,
                     revision: 1,
-                    identity: bcode_tool::ToolPresentationIdentity::Supplemental {
+                    identity: bcode_tool_models::ToolPresentationIdentity::Supplemental {
                         item_id: "details".to_owned(),
                     },
-                    retention: bcode_tool::ToolPresentationRetention::RetainLatest,
+                    retention: bcode_tool_models::ToolPresentationRetention::RetainLatest,
                     schema: "test.details".to_owned(),
                     schema_version: 1,
                     artifact: None,
@@ -25054,13 +25063,13 @@ mod tests {
         view.apply_live_event(&SessionLiveEvent {
             session_id,
             kind: SessionLiveEventKind::ToolPresentationUpdated {
-                update: bcode_tool::ToolPresentationUpdate {
+                update: bcode_tool_models::ToolPresentationUpdate {
                     invocation_id: "call-1".to_owned(),
                     producer_id: "test.plugin".to_owned(),
                     generation: 0,
                     revision: 1,
-                    identity: bcode_tool::ToolPresentationIdentity::Primary,
-                    retention: bcode_tool::ToolPresentationRetention::RetainLatest,
+                    identity: bcode_tool_models::ToolPresentationIdentity::Primary,
+                    retention: bcode_tool_models::ToolPresentationRetention::RetainLatest,
                     schema: "test.presentation".to_owned(),
                     schema_version: 1,
                     artifact: None,
@@ -25101,13 +25110,13 @@ mod tests {
         let update = |revision, schema: &str| SessionLiveEvent {
             session_id,
             kind: SessionLiveEventKind::ToolPresentationUpdated {
-                update: bcode_tool::ToolPresentationUpdate {
+                update: bcode_tool_models::ToolPresentationUpdate {
                     invocation_id: "call-1".to_owned(),
                     producer_id: "test.plugin".to_owned(),
                     generation: 0,
                     revision,
-                    identity: bcode_tool::ToolPresentationIdentity::Primary,
-                    retention: bcode_tool::ToolPresentationRetention::RetainLatest,
+                    identity: bcode_tool_models::ToolPresentationIdentity::Primary,
+                    retention: bcode_tool_models::ToolPresentationRetention::RetainLatest,
                     schema: schema.to_owned(),
                     schema_version: 1,
                     artifact: None,
@@ -25168,15 +25177,15 @@ mod tests {
         view.apply_live_event(&SessionLiveEvent {
             session_id,
             kind: SessionLiveEventKind::ToolPresentationUpdated {
-                update: bcode_tool::ToolPresentationUpdate {
+                update: bcode_tool_models::ToolPresentationUpdate {
                     invocation_id: "call-1".to_owned(),
                     producer_id: "test.plugin".to_owned(),
                     generation: 0,
                     revision: 1,
-                    identity: bcode_tool::ToolPresentationIdentity::Supplemental {
+                    identity: bcode_tool_models::ToolPresentationIdentity::Supplemental {
                         item_id: "details".to_owned(),
                     },
-                    retention: bcode_tool::ToolPresentationRetention::RetainLatest,
+                    retention: bcode_tool_models::ToolPresentationRetention::RetainLatest,
                     schema: "test.details".to_owned(),
                     schema_version: 1,
                     artifact: None,
@@ -25231,12 +25240,12 @@ mod tests {
     #[test]
     fn presentation_updates_are_monotonic_and_terminal_closure_is_absorbing() {
         let session_id = SessionId::new();
-        let update = |revision, retention| bcode_tool::ToolPresentationUpdate {
+        let update = |revision, retention| bcode_tool_models::ToolPresentationUpdate {
             invocation_id: "call-1".to_owned(),
             producer_id: "test.plugin".to_owned(),
             generation: 0,
             revision,
-            identity: bcode_tool::ToolPresentationIdentity::Primary,
+            identity: bcode_tool_models::ToolPresentationIdentity::Primary,
             retention,
             schema: "test.presentation".to_owned(),
             schema_version: 1,
@@ -25250,15 +25259,18 @@ mod tests {
         let mut view = SessionView::new();
         view.apply_live_event(&live(update(
             1,
-            bcode_tool::ToolPresentationRetention::RetainLatest,
+            bcode_tool_models::ToolPresentationRetention::RetainLatest,
         )));
         view.apply_live_event(&live(update(
             1,
-            bcode_tool::ToolPresentationRetention::RetainLatest,
+            bcode_tool_models::ToolPresentationRetention::RetainLatest,
         )));
         assert_eq!(
-            view.presentation_update("call-1", &bcode_tool::ToolPresentationIdentity::Primary)
-                .map(|update| update.revision),
+            view.presentation_update(
+                "call-1",
+                &bcode_tool_models::ToolPresentationIdentity::Primary
+            )
+            .map(|update| update.revision),
             Some(1)
         );
         view.apply_event(&event(
@@ -25276,11 +25288,14 @@ mod tests {
         ));
         view.apply_live_event(&live(update(
             2,
-            bcode_tool::ToolPresentationRetention::RetainLatest,
+            bcode_tool_models::ToolPresentationRetention::RetainLatest,
         )));
         assert_eq!(
-            view.presentation_update("call-1", &bcode_tool::ToolPresentationIdentity::Primary)
-                .map(|update| update.revision),
+            view.presentation_update(
+                "call-1",
+                &bcode_tool_models::ToolPresentationIdentity::Primary
+            )
+            .map(|update| update.revision),
             Some(1)
         );
     }
@@ -25288,13 +25303,13 @@ mod tests {
     #[test]
     fn terminal_checkpoint_wins_reconnect_races_without_mixed_live_state() {
         let session_id = SessionId::new();
-        let update = |revision| bcode_tool::ToolPresentationUpdate {
+        let update = |revision| bcode_tool_models::ToolPresentationUpdate {
             invocation_id: "call-race".to_owned(),
             producer_id: "test.plugin".to_owned(),
             generation: 0,
             revision,
-            identity: bcode_tool::ToolPresentationIdentity::Primary,
-            retention: bcode_tool::ToolPresentationRetention::RetainLatest,
+            identity: bcode_tool_models::ToolPresentationIdentity::Primary,
+            retention: bcode_tool_models::ToolPresentationRetention::RetainLatest,
             schema: "test.presentation".to_owned(),
             schema_version: 1,
             artifact: None,
@@ -25364,13 +25379,13 @@ mod tests {
     #[test]
     fn active_only_presentation_is_removed_at_terminal_closure() {
         let session_id = SessionId::new();
-        let update = bcode_tool::ToolPresentationUpdate {
+        let update = bcode_tool_models::ToolPresentationUpdate {
             invocation_id: "call-1".to_owned(),
             producer_id: "test.plugin".to_owned(),
             generation: 0,
             revision: 1,
-            identity: bcode_tool::ToolPresentationIdentity::Primary,
-            retention: bcode_tool::ToolPresentationRetention::ActiveOnly,
+            identity: bcode_tool_models::ToolPresentationIdentity::Primary,
+            retention: bcode_tool_models::ToolPresentationRetention::ActiveOnly,
             schema: "test.presentation".to_owned(),
             schema_version: 1,
             artifact: None,
@@ -25406,8 +25421,11 @@ mod tests {
             },
         ));
         assert!(
-            view.presentation_update("call-1", &bcode_tool::ToolPresentationIdentity::Primary)
-                .is_none()
+            view.presentation_update(
+                "call-1",
+                &bcode_tool_models::ToolPresentationIdentity::Primary
+            )
+            .is_none()
         );
         let primary_id = TranscriptViewItemId::tool("call-1");
         assert_eq!(
@@ -25434,12 +25452,12 @@ mod tests {
     #[test]
     fn supplemental_active_only_is_removed_while_retained_supplemental_survives_closure() {
         let session_id = SessionId::new();
-        let update = |item_id: &str, retention| bcode_tool::ToolPresentationUpdate {
+        let update = |item_id: &str, retention| bcode_tool_models::ToolPresentationUpdate {
             invocation_id: "call-1".to_owned(),
             producer_id: "test.plugin".to_owned(),
             generation: 0,
             revision: 1,
-            identity: bcode_tool::ToolPresentationIdentity::Supplemental {
+            identity: bcode_tool_models::ToolPresentationIdentity::Supplemental {
                 item_id: item_id.to_owned(),
             },
             retention,
@@ -25463,9 +25481,12 @@ mod tests {
         for update in [
             update(
                 "retained",
-                bcode_tool::ToolPresentationRetention::RetainLatest,
+                bcode_tool_models::ToolPresentationRetention::RetainLatest,
             ),
-            update("active", bcode_tool::ToolPresentationRetention::ActiveOnly),
+            update(
+                "active",
+                bcode_tool_models::ToolPresentationRetention::ActiveOnly,
+            ),
         ] {
             view.apply_live_event(&SessionLiveEvent {
                 session_id,
@@ -25498,7 +25519,7 @@ mod tests {
         assert!(
             view.presentation_update(
                 "call-1",
-                &bcode_tool::ToolPresentationIdentity::Supplemental {
+                &bcode_tool_models::ToolPresentationIdentity::Supplemental {
                     item_id: "active".to_owned(),
                 },
             )
@@ -26558,13 +26579,13 @@ mod tests {
         view.apply_live_event(&SessionLiveEvent {
             session_id,
             kind: SessionLiveEventKind::ToolPresentationUpdated {
-                update: bcode_tool::ToolPresentationUpdate {
+                update: bcode_tool_models::ToolPresentationUpdate {
                     invocation_id: "call-1".to_owned(),
                     producer_id: "test.plugin".to_owned(),
                     generation: 0,
                     revision: 1,
-                    identity: bcode_tool::ToolPresentationIdentity::Primary,
-                    retention: bcode_tool::ToolPresentationRetention::RetainLatest,
+                    identity: bcode_tool_models::ToolPresentationIdentity::Primary,
+                    retention: bcode_tool_models::ToolPresentationRetention::RetainLatest,
                     schema: "test.presentation".to_owned(),
                     schema_version: 1,
                     artifact: None,
@@ -26576,8 +26597,11 @@ mod tests {
         assert_eq!(view.snapshot().tools["call-1"], terminal);
         assert!(view.snapshot().active_invocations.is_empty());
         assert!(
-            view.presentation_update("call-1", &bcode_tool::ToolPresentationIdentity::Primary)
-                .is_none()
+            view.presentation_update(
+                "call-1",
+                &bcode_tool_models::ToolPresentationIdentity::Primary
+            )
+            .is_none()
         );
     }
 

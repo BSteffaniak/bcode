@@ -7,7 +7,8 @@
 //! Observations are painted rows and engine state; [`TranscriptEngine::window_work`] proves
 //! paging never rebuilds the window.
 
-use std::time::{Duration, Instant};
+use std::time::Duration;
+use web_time::Instant;
 
 use bcode_session_models::{
     ClientId, SessionEvent, SessionEventKind, SessionId, TurnAdmissionMetadata,

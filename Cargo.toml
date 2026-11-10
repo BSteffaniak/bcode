@@ -1,5 +1,6 @@
 [workspace]
 members = [
+    "packages/path-display",
     "packages/harness/models",
     "packages/claude-code",
     "plugins/claude-code-plugin",
@@ -295,6 +296,7 @@ bcode_pi_session_import_plugin          = { version = "0.0.1-alpha.0", default-f
 bcode_plugin                            = { version = "0.0.1-alpha.0", default-features = false, path = "packages/plugin" }
 bcode_plugin_config                     = { version = "0.0.1-alpha.0", default-features = false, path = "packages/plugin-config" }
 bcode_plugin_models                     = { version = "0.0.1-alpha.0", default-features = false, path = "packages/plugin/models" }
+bcode_path_display                      = { version = "0.0.1-alpha.0", default-features = false, path = "packages/path-display" }
 bcode_plugin_sdk                        = { version = "0.0.1-alpha.0", default-features = false, path = "packages/plugin-sdk" }
 bcode_presentation_policy               = { version = "0.0.1-alpha.0", default-features = false, path = "packages/presentation-policy" }
 bcode_presentation_policy_models        = { version = "0.0.1-alpha.0", default-features = false, path = "packages/presentation-policy/models" }

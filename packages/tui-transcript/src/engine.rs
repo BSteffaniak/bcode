@@ -14,7 +14,7 @@
 //! the frame (CK3).
 
 use std::collections::BTreeMap;
-use std::time::Instant;
+use web_time::Instant;
 
 use bcode_session_view::SessionView;
 use bcode_session_view_models::{TranscriptChanges, TranscriptViewItem};

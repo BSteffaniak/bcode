@@ -9,7 +9,7 @@
 
 use std::cmp::Ordering;
 use std::ops::Range;
-use std::time::Instant;
+use web_time::Instant;
 
 use bmux_tui::geometry::Rect;
 use bmux_tui::paint::PaintCx;

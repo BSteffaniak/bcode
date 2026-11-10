@@ -6,7 +6,7 @@
 //! runtime timer and incorporates released text as a content change of the streaming units,
 //! like a live delta (W3 order). It reads no clock: every call carries its time.
 
-use std::time::Instant;
+use web_time::Instant;
 
 use bcode_session_view_models::StreamingPresentationPolicy;
 
@@ -55,7 +55,8 @@ impl TranscriptEngine {
 
 #[cfg(test)]
 mod tests {
-    use std::time::{Duration, Instant};
+    use std::time::Duration;
+    use web_time::Instant;
 
     use bcode_session_models::{
         ClientId, SessionEvent, SessionEventKind, SessionId, SessionLiveEvent,

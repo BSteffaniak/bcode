@@ -2,7 +2,8 @@
 //! reveal through the focus reveal, click focus, `<details>` state as a unit-scoped render
 //! input, footnote jumps with return targets and `#fragment` navigation.
 
-use std::time::{Duration, Instant};
+use std::time::Duration;
+use web_time::Instant;
 
 use bcode_markdown_render::{MarkdownContributionKind, MarkdownDestination};
 use bcode_session_models::{

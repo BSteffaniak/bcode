@@ -473,7 +473,7 @@ pub struct PaintInputs<'a> {
 
 #[cfg(test)]
 mod tests {
-    use std::time::Instant;
+    use web_time::Instant;
 
     use super::*;
     use crate::units::structure::{ResolvedUnitPresentation, StructureResolver};
